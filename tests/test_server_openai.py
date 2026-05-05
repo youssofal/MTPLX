@@ -1,4 +1,5 @@
 from concurrent.futures import Future
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -287,6 +288,223 @@ def test_invalid_generation_mode_returns_400():
 
     assert response.status_code == 400
     assert response.json()["detail"] == "generation_mode must be 'mtp' or 'ar'"
+
+
+class CaptureTokenizer:
+    def __init__(self):
+        self.calls: list[tuple[list[dict[str, object]], dict[str, object]]] = []
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.calls.append((messages, kwargs))
+        return [1, 2, 3]
+
+    def encode(self, text):
+        return [ord(char) for char in str(text)]
+
+
+def _tool_schema():
+    return {
+        "type": "function",
+        "function": {
+            "name": "session_status",
+            "description": "Show the current agent session status.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _fake_generation(text: str):
+    return {
+        "text": text,
+        "tokens": [4],
+        "stats": {
+            "generation_mode": "ar",
+            "mtp_depth": 0,
+            "completion_tokens": 1,
+        },
+        "prompt_tokens": 3,
+        "completion_tokens": 1,
+        "finish_reason": "stop",
+    }
+
+
+def test_chat_tools_are_passed_to_qwen_template_and_disable_default_thinking(monkeypatch):
+    state = _fake_state()
+    state.runtime.tokenizer = CaptureTokenizer()
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(openai, "_run_generation", lambda *_args, **_kwargs: _fake_generation("ok"))
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [{"role": "user", "content": "Use the tool."}],
+            "tools": [_tool_schema()],
+            "tool_choice": "auto",
+            "max_tokens": 8,
+        },
+    )
+
+    assert response.status_code == 200
+    _messages, kwargs = state.runtime.tokenizer.calls[0]
+    assert kwargs["tools"] == [_tool_schema()]
+    assert kwargs["enable_thinking"] is False
+
+
+def test_chat_template_preserves_assistant_tool_calls_and_tool_results():
+    tokenizer = CaptureTokenizer()
+
+    openai._encode_messages(
+        tokenizer,
+        [
+            openai.ChatMessage(
+                role="assistant",
+                content=None,
+                tool_calls=[
+                    {
+                        "id": "call_test",
+                        "type": "function",
+                        "function": {
+                            "name": "session_status",
+                            "arguments": "{}",
+                        },
+                    }
+                ],
+            ),
+            openai.ChatMessage(
+                role="tool",
+                tool_call_id="call_test",
+                content='{"status":"ok"}',
+            ),
+        ],
+        enable_thinking=False,
+        add_generation_prompt=False,
+    )
+
+    messages, _kwargs = tokenizer.calls[0]
+    assert messages[0]["role"] == "assistant"
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == {}
+    assert messages[1]["role"] == "tool"
+    assert messages[1]["tool_call_id"] == "call_test"
+
+
+def test_chat_tool_xml_returns_openai_tool_calls_nonstream(monkeypatch):
+    client = TestClient(create_app(_fake_state()))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(
+        openai,
+        "_run_generation",
+        lambda *_args, **_kwargs: _fake_generation(
+            "<tool_call>\n<function=session_status>\n</function>\n</tool_call>"
+        ),
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [{"role": "user", "content": "Status."}],
+            "tools": [_tool_schema()],
+            "tool_choice": "auto",
+            "max_tokens": 16,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    choice = payload["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["content"] is None
+    assert choice["message"]["tool_calls"][0]["function"] == {
+        "name": "session_status",
+        "arguments": "{}",
+    }
+    assert "<tool_call>" not in json.dumps(payload)
+
+
+def test_chat_tool_json_returns_openai_tool_calls_nonstream(monkeypatch):
+    client = TestClient(create_app(_fake_state()))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(
+        openai,
+        "_run_generation",
+        lambda *_args, **_kwargs: _fake_generation(
+            '<tool_call>{"name":"session_status","arguments":{}}</tool_call>'
+        ),
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [{"role": "user", "content": "Status."}],
+            "tools": [_tool_schema()],
+            "tool_choice": "auto",
+            "max_tokens": 16,
+        },
+    )
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["tool_calls"][0]["function"]["arguments"] == "{}"
+
+
+def test_chat_stream_tool_calls_emit_delta_tool_calls(monkeypatch):
+    client = TestClient(create_app(_fake_state()))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(
+        openai,
+        "_run_generation",
+        lambda *_args, **_kwargs: _fake_generation(
+            "<tool_call>\n<function=session_status>\n</function>\n</tool_call>"
+        ),
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [{"role": "user", "content": "Status."}],
+            "tools": [_tool_schema()],
+            "tool_choice": "auto",
+            "stream": True,
+            "max_tokens": 16,
+        },
+    )
+
+    assert response.status_code == 200
+    assert '"tool_calls"' in response.text
+    assert '"finish_reason": "tool_calls"' in response.text
+    assert "<tool_call>" not in response.text
+
+
+def test_chat_tools_malformed_tool_call_returns_422(monkeypatch):
+    client = TestClient(create_app(_fake_state()))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(
+        openai,
+        "_run_generation",
+        lambda *_args, **_kwargs: _fake_generation("<tool_call>not json</tool_call>"),
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [{"role": "user", "content": "Status."}],
+            "tools": [_tool_schema()],
+            "tool_choice": "auto",
+            "max_tokens": 16,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"].startswith("malformed tool_call")
 
 
 def test_server_state_emits_startup_progress(monkeypatch, capsys):

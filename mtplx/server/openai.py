@@ -297,6 +297,9 @@ class ChatMessage(BaseModel):
 
     role: str
     content: Any = ""
+    name: str | None = None
+    tool_call_id: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -313,6 +316,9 @@ class ChatCompletionRequest(BaseModel):
     seed: int | None = None
     enable_thinking: bool | None = None
     stream: bool = False
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: Any = None
+    parallel_tool_calls: bool | None = None
 
 
 class CompletionRequest(BaseModel):
@@ -931,6 +937,272 @@ def _strip_assistant_history_baggage(text: str) -> str:
     return text.strip()
 
 
+_TOOL_CALL_BLOCK_RE = re.compile(
+    r"<tool_call>\s*(.*?)\s*</tool_call>",
+    re.IGNORECASE | re.DOTALL,
+)
+_TOOL_FUNCTION_BLOCK_RE = re.compile(
+    r"^\s*<function=([^>\s]+)>\s*(.*?)\s*</function>\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_TOOL_PARAMETER_BLOCK_RE = re.compile(
+    r"<parameter=([^>\s]+)>\s*(.*?)\s*</parameter>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _tool_protocol_error(message: str) -> HTTPException:
+    return HTTPException(status_code=422, detail=f"malformed tool_call: {message}")
+
+
+def _tool_spec_name(tool: dict[str, Any]) -> str | None:
+    function = tool.get("function")
+    if isinstance(function, dict):
+        name = function.get("name")
+    else:
+        name = tool.get("name")
+    if name is None:
+        return None
+    text = str(name).strip()
+    return text or None
+
+
+def _normalize_tool_specs(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    if not tools:
+        return []
+    normalized: list[dict[str, Any]] = []
+    for index, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            raise HTTPException(status_code=400, detail=f"tools[{index}] must be an object")
+        if not _tool_spec_name(tool):
+            raise HTTPException(
+                status_code=400,
+                detail=f"tools[{index}] must include a function name",
+            )
+        normalized.append(tool)
+    return normalized
+
+
+def _tool_choice_disables_tools(tool_choice: Any) -> bool:
+    if tool_choice is None:
+        return False
+    if isinstance(tool_choice, str):
+        return tool_choice.strip().lower() == "none"
+    if isinstance(tool_choice, dict):
+        value = tool_choice.get("type") or tool_choice.get("mode")
+        return isinstance(value, str) and value.strip().lower() == "none"
+    return False
+
+
+def _validate_tool_choice(tool_specs: list[dict[str, Any]], tool_choice: Any) -> None:
+    if not tool_specs or not isinstance(tool_choice, dict):
+        return
+    if str(tool_choice.get("type") or "").lower() != "function":
+        return
+    function = tool_choice.get("function")
+    if not isinstance(function, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="tool_choice function must include a function object",
+        )
+    requested = str(function.get("name") or "").strip()
+    if not requested:
+        raise HTTPException(
+            status_code=400,
+            detail="tool_choice function must include a name",
+        )
+    known = {_tool_spec_name(tool) for tool in tool_specs}
+    if requested not in known:
+        raise HTTPException(
+            status_code=400,
+            detail=f"tool_choice requested unknown tool '{requested}'",
+        )
+
+
+def _tools_active_for_request(
+    tools: list[dict[str, Any]],
+    tool_choice: Any,
+) -> bool:
+    if not tools:
+        return False
+    if _tool_choice_disables_tools(tool_choice):
+        return False
+    _validate_tool_choice(tools, tool_choice)
+    return True
+
+
+def _json_object_string(value: Any, *, context: str) -> str:
+    if value is None:
+        parsed: Any = {}
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            parsed = {}
+        else:
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise _tool_protocol_error(f"{context} arguments are not valid JSON") from exc
+    else:
+        parsed = value
+    if not isinstance(parsed, dict):
+        raise _tool_protocol_error(f"{context} arguments must be a JSON object")
+    return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+
+
+def _decode_tool_parameter_value(value: str) -> Any:
+    text = value.strip()
+    if not text:
+        return ""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
+def _parse_json_tool_call(block: str) -> tuple[str, Any] | None:
+    try:
+        payload = json.loads(block)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        raise _tool_protocol_error("JSON tool_call payload must be an object")
+    function = payload.get("function")
+    if isinstance(function, dict):
+        name = function.get("name")
+        arguments = function.get("arguments", {})
+    else:
+        name = payload.get("name")
+        arguments = payload.get("arguments", {})
+    name_text = str(name or "").strip()
+    if not name_text:
+        raise _tool_protocol_error("JSON tool_call is missing a function name")
+    return name_text, arguments
+
+
+def _parse_xml_tool_call(block: str) -> tuple[str, Any] | None:
+    match = _TOOL_FUNCTION_BLOCK_RE.match(block)
+    if match is None:
+        return None
+    name = match.group(1).strip()
+    body = match.group(2)
+    arguments: dict[str, Any] = {}
+    consumed: list[tuple[int, int]] = []
+    for param_match in _TOOL_PARAMETER_BLOCK_RE.finditer(body):
+        param_name = param_match.group(1).strip()
+        if not param_name:
+            raise _tool_protocol_error(f"tool '{name}' contains an empty parameter name")
+        arguments[param_name] = _decode_tool_parameter_value(param_match.group(2))
+        consumed.append(param_match.span())
+    if consumed:
+        residue_parts: list[str] = []
+        cursor = 0
+        for start, end in consumed:
+            residue_parts.append(body[cursor:start])
+            cursor = end
+        residue_parts.append(body[cursor:])
+        residue = "".join(residue_parts).strip()
+        if residue:
+            raise _tool_protocol_error(f"tool '{name}' contains text outside parameters")
+    elif body.strip():
+        raise _tool_protocol_error(f"tool '{name}' contains unwrapped parameter text")
+    return name, arguments
+
+
+def _parse_generated_tool_calls(
+    text: str,
+    *,
+    tools: list[dict[str, Any]],
+) -> list[dict[str, Any]] | None:
+    if not tools:
+        return None
+    lowered = text.lower()
+    if "<tool_call" not in lowered and "</tool_call>" not in lowered:
+        return None
+    blocks = list(_TOOL_CALL_BLOCK_RE.finditer(text))
+    if not blocks:
+        raise _tool_protocol_error("unclosed <tool_call> block")
+    residue = _TOOL_CALL_BLOCK_RE.sub("", text)
+    if "<tool_call" in residue.lower() or "</tool_call>" in residue.lower():
+        raise _tool_protocol_error("nested or unmatched <tool_call> block")
+    known = {name for tool in tools if (name := _tool_spec_name(tool))}
+    calls: list[dict[str, Any]] = []
+    for index, block_match in enumerate(blocks):
+        block = block_match.group(1).strip()
+        parsed = _parse_json_tool_call(block)
+        if parsed is None:
+            parsed = _parse_xml_tool_call(block)
+        if parsed is None:
+            raise _tool_protocol_error("unsupported tool_call payload format")
+        name, arguments = parsed
+        if name not in known:
+            raise _tool_protocol_error(f"unknown tool '{name}'")
+        calls.append(
+            {
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": _json_object_string(
+                        arguments,
+                        context=f"tool_call[{index}]",
+                    ),
+                },
+            }
+        )
+    return calls
+
+
+def _template_tool_call(tool_call: dict[str, Any]) -> dict[str, Any]:
+    function = tool_call.get("function")
+    if isinstance(function, dict):
+        name = str(function.get("name") or "").strip()
+        arguments = function.get("arguments", {})
+    else:
+        name = str(tool_call.get("name") or "").strip()
+        arguments = tool_call.get("arguments", {})
+    if not name:
+        raise HTTPException(status_code=400, detail="assistant tool_call is missing a name")
+    arguments_text = _json_object_string(arguments, context=f"assistant tool_call '{name}'")
+    normalized = {
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": json.loads(arguments_text),
+        },
+    }
+    call_id = tool_call.get("id")
+    if call_id:
+        normalized["id"] = str(call_id)
+    return normalized
+
+
+def _message_to_template_dict(
+    message: ChatMessage,
+    *,
+    strip_assistant_reasoning_history: bool,
+) -> dict[str, Any] | None:
+    if not message.role:
+        return None
+    content = _content_to_text(message.content)
+    if message.role == "assistant":
+        content = (
+            _strip_assistant_history_baggage(content)
+            if strip_assistant_reasoning_history
+            else _normalize_openwebui_reasoning_details(_strip_stats_footer(content)).strip()
+        )
+    item: dict[str, Any] = {"role": message.role, "content": content}
+    if message.name:
+        item["name"] = message.name
+    if message.tool_call_id:
+        item["tool_call_id"] = message.tool_call_id
+    if message.tool_calls:
+        item["tool_calls"] = [_template_tool_call(call) for call in message.tool_calls]
+    if content or message.role == "tool" or message.tool_calls:
+        return item
+    return None
+
+
 def _encode_messages(
     tokenizer: Any,
     messages: list[ChatMessage],
@@ -938,44 +1210,66 @@ def _encode_messages(
     enable_thinking: bool,
     strip_assistant_reasoning_history: bool = False,
     add_generation_prompt: bool = True,
+    tools: list[dict[str, Any]] | None = None,
 ) -> list[int]:
-    normalized: list[dict[str, str]] = []
+    normalized: list[dict[str, Any]] = []
     for message in messages:
-        if not message.role:
-            continue
-        content = _content_to_text(message.content)
-        if message.role == "assistant":
-            content = (
-                _strip_assistant_history_baggage(content)
-                if strip_assistant_reasoning_history
-                else _normalize_openwebui_reasoning_details(_strip_stats_footer(content)).strip()
-            )
-        if content:
-            normalized.append({"role": message.role, "content": content})
+        item = _message_to_template_dict(
+            message,
+            strip_assistant_reasoning_history=strip_assistant_reasoning_history,
+        )
+        if item is not None:
+            normalized.append(item)
     if not normalized:
         normalized = [{"role": "user", "content": ""}]
+    template_kwargs: dict[str, Any] = {
+        "tokenize": True,
+        "add_generation_prompt": add_generation_prompt,
+        "enable_thinking": enable_thinking,
+        "preserve_thinking": not strip_assistant_reasoning_history,
+    }
+    if tools:
+        template_kwargs["tools"] = tools
     try:
         return list(
-                tokenizer.apply_chat_template(
-                    normalized,
-                    tokenize=True,
-                    add_generation_prompt=add_generation_prompt,
-                    enable_thinking=enable_thinking,
-                    preserve_thinking=not strip_assistant_reasoning_history,
-                )
+            tokenizer.apply_chat_template(
+                normalized,
+                **template_kwargs,
             )
+        )
     except TypeError:
         try:
+            fallback_kwargs: dict[str, Any] = {
+                "tokenize": True,
+                "add_generation_prompt": add_generation_prompt,
+            }
+            if tools:
+                fallback_kwargs["tools"] = tools
             return list(
                 tokenizer.apply_chat_template(
                     normalized,
-                    tokenize=True,
-                    add_generation_prompt=add_generation_prompt,
+                    **fallback_kwargs,
                 )
             )
-        except Exception:
+        except TypeError as exc:
+            if tools:
+                raise HTTPException(
+                    status_code=500,
+                    detail="tokenizer chat template does not support tool schemas",
+                ) from exc
+        except Exception as exc:
+            if tools:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"tokenizer chat template failed with tool schemas: {exc}",
+                ) from exc
             pass
-    except Exception:
+    except Exception as exc:
+        if tools:
+            raise HTTPException(
+                status_code=500,
+                detail=f"tokenizer chat template failed with tool schemas: {exc}",
+            ) from exc
         pass
     prompt = "\n".join(f"{item['role']}: {item['content']}" for item in normalized)
     if add_generation_prompt:
@@ -1499,13 +1793,18 @@ def _store_retokenized_history_snapshot(
     session_id: str | None,
     messages: list[ChatMessage],
     assistant_content: str,
+    assistant_tool_calls: list[dict[str, Any]] | None = None,
     thinking_enabled: bool,
     policy_fingerprint: str,
 ) -> dict[str, Any]:
     if session_id is None:
         return {"stored": False, "reason": "no_session_id"}
     history_messages = list(messages) + [
-        ChatMessage(role="assistant", content=assistant_content),
+        ChatMessage(
+            role="assistant",
+            content=assistant_content,
+            tool_calls=assistant_tool_calls,
+        ),
     ]
     encoded_with_sentinel = _encode_messages(
         state.runtime.tokenizer,
@@ -3809,6 +4108,8 @@ def create_app(state: ServerState) -> FastAPI:
             headers.get("x-mtplx-cache-mode", "").lower() in {"bypass", "stateless", "off"}
             or str(metadata.get("cache_mode", "")).lower() in {"bypass", "stateless", "off"}
         )
+        tool_specs = _normalize_tool_specs(request.tools)
+        tools_active = _tools_active_for_request(tool_specs, request.tool_choice)
         background = is_background_request(
             messages=request.messages,
             max_tokens=request.max_tokens,
@@ -3833,6 +4134,8 @@ def create_app(state: ServerState) -> FastAPI:
                 },
             )
         thinking_enabled = _thinking_enabled_for_request(state, request)
+        if tools_active and request.enable_thinking is None:
+            thinking_enabled = False
         request_generation_mode = _request_generation_mode_for_generation(state, request)
         request_depth = _request_depth_for_generation(
             state,
@@ -3844,6 +4147,7 @@ def create_app(state: ServerState) -> FastAPI:
             request.messages,
             enable_thinking=thinking_enabled,
             strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
+            tools=tool_specs if tools_active else None,
         )
         current_system_hash = system_prompt_hash(request.messages)
         if current_system_hash is not None and not background:
@@ -3893,6 +4197,214 @@ def create_app(state: ServerState) -> FastAPI:
         model = request.model or state.model_id
         response_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
+
+        def run_generation_for_response() -> dict[str, Any]:
+            if session is None:
+                return _run_generation(
+                    state,
+                    prompt_ids,
+                    max_tokens=request.max_tokens,
+                    temperature=request.temperature,
+                    top_p=request.top_p,
+                    top_k=request.top_k,
+                    seed=request.seed,
+                    generation_mode=request_generation_mode,
+                    depth=request_depth,
+                    session_id=session_id,
+                    cache_miss_reason=cache_miss_reason,
+                    session_restore_mode=session_restore_mode,
+                    session_bank=None if background or cache_bypass else state.sessions.bank,
+                    session_template_hash=state.template_hash,
+                    session_draft_head_identity=state.draft_head_identity,
+                    session_policy_fingerprint=policy_fingerprint,
+                    background_request=background,
+                    request_observability=request_observability,
+                )
+            with session.in_flight_generation():
+                generated_result = _run_generation(
+                    state,
+                    prompt_ids,
+                    max_tokens=request.max_tokens,
+                    temperature=request.temperature,
+                    top_p=request.top_p,
+                    top_k=request.top_k,
+                    seed=request.seed,
+                    generation_mode=request_generation_mode,
+                    depth=request_depth,
+                    session_id=session_id,
+                    cache_miss_reason=cache_miss_reason,
+                    session_restore_mode=session_restore_mode,
+                    session_bank=state.sessions.bank,
+                    session_template_hash=state.template_hash,
+                    session_draft_head_identity=state.draft_head_identity,
+                    session_policy_fingerprint=policy_fingerprint,
+                    request_observability=request_observability,
+                )
+                session.commit(
+                    prompt_ids=prompt_ids,
+                    generated_ids=generated_result["tokens"],
+                    finish_reason=generated_result.get("finish_reason", "stop"),
+                )
+                return generated_result
+
+        async def store_postcommit_snapshot(
+            generated: dict[str, Any],
+            *,
+            assistant_content: str,
+            assistant_tool_calls: list[dict[str, Any]] | None = None,
+        ) -> None:
+            if session is None:
+                return
+            loop = asyncio.get_running_loop()
+            if state.args.session_postcommit_mode == "async":
+                generated["stats"]["session_postcommit_snapshot"] = {
+                    "stored": False,
+                    "mode": "async_pending",
+                }
+
+                def async_postcommit() -> None:
+                    try:
+                        _store_retokenized_history_snapshot(
+                            state,
+                            session_id=session_id,
+                            messages=request.messages,
+                            assistant_content=assistant_content,
+                            assistant_tool_calls=assistant_tool_calls,
+                            thinking_enabled=thinking_enabled,
+                            policy_fingerprint=policy_fingerprint,
+                        )
+                    except BaseException as exc:
+                        print(
+                            f"[mtplx] async session postcommit failed: {exc!r}",
+                            flush=True,
+                        )
+
+                state.generation_executor.submit(async_postcommit)
+                return
+            postcommit = await loop.run_in_executor(
+                state.generation_executor,
+                lambda: _store_retokenized_history_snapshot(
+                    state,
+                    session_id=session_id,
+                    messages=request.messages,
+                    assistant_content=assistant_content,
+                    assistant_tool_calls=assistant_tool_calls,
+                    thinking_enabled=thinking_enabled,
+                    policy_fingerprint=policy_fingerprint,
+                ),
+            )
+            generated["stats"]["session_postcommit_snapshot"] = postcommit
+
+        if request.stream and tools_active:
+            async def tool_event_stream():
+                def stream_chunk(
+                    *,
+                    delta: dict[str, Any],
+                    finish_reason: str | None = None,
+                    usage: dict[str, int] | None = None,
+                    mtplx_stats: dict[str, Any] | None = None,
+                ) -> str:
+                    payload: dict[str, Any] = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": delta,
+                                "finish_reason": finish_reason,
+                            }
+                        ],
+                    }
+                    if usage is not None:
+                        payload["usage"] = usage
+                    if mtplx_stats is not None:
+                        payload["mtplx_stats"] = mtplx_stats
+                    return f"data: {json.dumps(payload)}\n\n"
+
+                def stream_error(exc: BaseException) -> str:
+                    if isinstance(exc, HTTPException):
+                        message = str(exc.detail)
+                        error_type = str(exc.status_code)
+                        status_code = exc.status_code
+                    else:
+                        message = str(exc)
+                        error_type = type(exc).__name__
+                        status_code = 500
+                    payload = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+                        "error": {
+                            "message": message,
+                            "type": error_type,
+                            "status_code": status_code,
+                        },
+                    }
+                    return f"data: {json.dumps(payload)}\n\n"
+
+                yield stream_chunk(delta={"role": "assistant"})
+                loop = asyncio.get_running_loop()
+                try:
+                    generated = await loop.run_in_executor(
+                        state.generation_executor,
+                        run_generation_for_response,
+                    )
+                    tool_calls = _parse_generated_tool_calls(
+                        str(generated["text"]),
+                        tools=tool_specs,
+                    )
+                    if tool_calls:
+                        generated["finish_reason"] = "tool_calls"
+                        await store_postcommit_snapshot(
+                            generated,
+                            assistant_content="",
+                            assistant_tool_calls=tool_calls,
+                        )
+                        yield stream_chunk(
+                            delta={
+                                "tool_calls": [
+                                    {"index": index, **tool_call}
+                                    for index, tool_call in enumerate(tool_calls)
+                                ]
+                            }
+                        )
+                        finish_reason = "tool_calls"
+                    else:
+                        display_text = _display_text(
+                            state,
+                            generated,
+                            thinking_enabled=thinking_enabled,
+                        )
+                        await store_postcommit_snapshot(
+                            generated,
+                            assistant_content=display_text,
+                        )
+                        if display_text:
+                            yield stream_chunk(delta={"content": display_text})
+                        finish_reason = generated.get("finish_reason", "stop")
+                except EngineSessionBusy as exc:
+                    yield stream_error(HTTPException(status_code=409, detail=str(exc)))
+                    yield "data: [DONE]\n\n"
+                    return
+                except BaseException as exc:
+                    yield stream_error(exc)
+                    yield "data: [DONE]\n\n"
+                    return
+
+                yield stream_chunk(
+                    delta={},
+                    finish_reason=finish_reason,
+                    usage=_usage_payload(generated),
+                    mtplx_stats=_public_mtplx_stats(generated),
+                )
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(tool_event_stream(), media_type="text/event-stream")
+
         if request.stream:
             async def event_stream():
                 first = {
@@ -4275,53 +4787,7 @@ def create_app(state: ServerState) -> FastAPI:
             return StreamingResponse(event_stream(), media_type="text/event-stream")
 
         def run_nonstream_generation() -> dict[str, Any]:
-            if session is None:
-                return _run_generation(
-                    state,
-                    prompt_ids,
-                    max_tokens=request.max_tokens,
-                    temperature=request.temperature,
-                    top_p=request.top_p,
-                    top_k=request.top_k,
-                    seed=request.seed,
-                    generation_mode=request_generation_mode,
-                    depth=request_depth,
-                    session_id=session_id,
-                    cache_miss_reason=cache_miss_reason,
-                    session_restore_mode=session_restore_mode,
-                    session_bank=None if background or cache_bypass else state.sessions.bank,
-                    session_template_hash=state.template_hash,
-                    session_draft_head_identity=state.draft_head_identity,
-                    session_policy_fingerprint=policy_fingerprint,
-                    background_request=background,
-                    request_observability=request_observability,
-                )
-            with session.in_flight_generation():
-                generated_result = _run_generation(
-                    state,
-                    prompt_ids,
-                    max_tokens=request.max_tokens,
-                    temperature=request.temperature,
-                    top_p=request.top_p,
-                    top_k=request.top_k,
-                    seed=request.seed,
-                    generation_mode=request_generation_mode,
-                    depth=request_depth,
-                    session_id=session_id,
-                    cache_miss_reason=cache_miss_reason,
-                    session_restore_mode=session_restore_mode,
-                    session_bank=state.sessions.bank,
-                    session_template_hash=state.template_hash,
-                    session_draft_head_identity=state.draft_head_identity,
-                    session_policy_fingerprint=policy_fingerprint,
-                    request_observability=request_observability,
-                )
-                session.commit(
-                    prompt_ids=prompt_ids,
-                    generated_ids=generated_result["tokens"],
-                    finish_reason=generated_result.get("finish_reason", "stop"),
-                )
-                return generated_result
+            return run_generation_for_response()
 
         loop = asyncio.get_running_loop()
         try:
@@ -4331,49 +4797,36 @@ def create_app(state: ServerState) -> FastAPI:
             )
         except EngineSessionBusy as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        display_text = _display_text(
-            state,
-            generated,
-            thinking_enabled=thinking_enabled,
+        tool_calls = (
+            _parse_generated_tool_calls(str(generated["text"]), tools=tool_specs)
+            if tools_active
+            else None
         )
-        if session is not None:
-            if state.args.session_postcommit_mode == "async":
-                generated["stats"]["session_postcommit_snapshot"] = {
-                    "stored": False,
-                    "mode": "async_pending",
-                }
-
-                def async_nonstream_postcommit() -> None:
-                    try:
-                        _store_retokenized_history_snapshot(
-                            state,
-                            session_id=session_id,
-                            messages=request.messages,
-                            assistant_content=display_text,
-                            thinking_enabled=thinking_enabled,
-                            policy_fingerprint=policy_fingerprint,
-                        )
-                    except BaseException as exc:
-                        print(
-                            f"[mtplx] async session postcommit failed: {exc!r}",
-                            flush=True,
-                        )
-
-                state.generation_executor.submit(async_nonstream_postcommit)
-            else:
-                postcommit = await loop.run_in_executor(
-                    state.generation_executor,
-                    lambda: _store_retokenized_history_snapshot(
-                        state,
-                        session_id=session_id,
-                        messages=request.messages,
-                        assistant_content=display_text,
-                        thinking_enabled=thinking_enabled,
-                        policy_fingerprint=policy_fingerprint,
-                    ),
-                )
-                generated["stats"]["session_postcommit_snapshot"] = postcommit
-        message: dict[str, str] = {"role": "assistant", "content": display_text}
+        if tool_calls:
+            generated["finish_reason"] = "tool_calls"
+            await store_postcommit_snapshot(
+                generated,
+                assistant_content="",
+                assistant_tool_calls=tool_calls,
+            )
+            message: dict[str, Any] = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": tool_calls,
+            }
+            finish_reason = "tool_calls"
+        else:
+            display_text = _display_text(
+                state,
+                generated,
+                thinking_enabled=thinking_enabled,
+            )
+            await store_postcommit_snapshot(
+                generated,
+                assistant_content=display_text,
+            )
+            message = {"role": "assistant", "content": display_text}
+            finish_reason = generated.get("finish_reason", "stop")
         return JSONResponse(
             {
                 "id": response_id,
@@ -4384,7 +4837,7 @@ def create_app(state: ServerState) -> FastAPI:
                     {
                         "index": 0,
                         "message": message,
-                        "finish_reason": "stop",
+                        "finish_reason": finish_reason,
                     }
                 ],
                 "usage": _usage_payload(generated),
