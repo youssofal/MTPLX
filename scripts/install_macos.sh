@@ -133,10 +133,13 @@ if [ "${MTPLX_SKIP_GLOBAL_LAUNCHER:-0}" != "1" ]; then
     global_bin=""
   fi
 
-  if [ -n "$global_bin" ] && [ -w "$global_bin" ]; then
-    cp "$launcher" "$global_bin/mtplx"
-    chmod 755 "$global_bin/mtplx"
-    global_launcher="$global_bin/mtplx"
+  if [ -n "$global_bin" ]; then
+    if cp "$launcher" "$global_bin/mtplx" 2>/dev/null && chmod 755 "$global_bin/mtplx" 2>/dev/null; then
+      global_launcher="$global_bin/mtplx"
+    else
+      echo "Note: could not write to $global_bin (permission denied). Skipping global launcher."
+      echo "      You can rerun with sudo or set MTPLX_SKIP_GLOBAL_LAUNCHER=1 to silence this."
+    fi
   fi
 fi
 
