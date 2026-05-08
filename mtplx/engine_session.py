@@ -168,6 +168,7 @@ class EngineSession:
         self.last_cache_miss_reason: str | None = CacheMissReason.NEW_SESSION.value
         self.last_restore_mode: str = "cold"
         self.bytes_estimate = 0
+        self.revision = 0
         self._lock = Lock()
 
     @property
@@ -212,6 +213,7 @@ class EngineSession:
         self.last_commit_s = time.time()
         self.last_finish_reason = finish_reason
         self.bytes_estimate = int(nbytes)
+        self.revision += 1
         self._record_interval_boundaries(tokens)
         self.add_boundary(boundary_kind, tokens, nbytes=nbytes)
         return EngineSessionCommit(True, "committed", self.prefix_len)
@@ -260,6 +262,7 @@ class EngineSession:
             "last_access_s": self.last_access_s,
             "last_commit_s": self.last_commit_s,
             "last_finish_reason": self.last_finish_reason,
+            "revision": self.revision,
             "in_flight": self.in_flight,
             "in_flight_started_s": self.in_flight_started_s,
             "last_cache_miss_reason": self.last_cache_miss_reason,

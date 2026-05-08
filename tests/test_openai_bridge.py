@@ -346,13 +346,14 @@ def test_idle_async_postcommit_attempts_commit_for_tool_call_responses(
     assert '"stored": true' in log
 
 
-def test_idle_async_postcommit_abandons_when_foreground_stays_busy(
+def test_idle_async_postcommit_abandons_when_model_lock_stays_busy(
     capsys, monkeypatch
 ):
-    """If the foreground never goes idle, the async commit must abandon
-    rather than block forever."""
+    """If the model lock never frees, the async commit must abandon
+    rather than block forever. The loop now drives the non-blocking acquire
+    inside `_store_retokenized_history_snapshot` as the correctness gate."""
     state = _postcommit_state()
-    state.has_foreground = lambda: True  # always busy
+    state.has_foreground = lambda: True  # intentionally ignored by this path
 
     # Make the wait short so the test stays fast.
     monkeypatch.setattr(
@@ -362,15 +363,19 @@ def test_idle_async_postcommit_abandons_when_foreground_stays_busy(
         "mtplx.server.openai._IDLE_POSTCOMMIT_POLL_INTERVAL_S", 0.05
     )
 
-    called = []
+    called: list[dict] = []
 
-    def should_not_be_called(state, **kwargs):
+    def fake_store_lock_busy(state, **kwargs):
         called.append(kwargs)
-        return {"stored": True}
+        return {
+            "stored": False,
+            "mode": "retokenized_history",
+            "reason": "model_lock_busy_before_retokenized_commit",
+        }
 
     monkeypatch.setattr(
         "mtplx.server.openai._store_retokenized_history_snapshot",
-        should_not_be_called,
+        fake_store_lock_busy,
     )
 
     pending = _schedule_idle_postcommit_snapshot(
@@ -384,10 +389,10 @@ def test_idle_async_postcommit_abandons_when_foreground_stays_busy(
     )
 
     assert pending["mode"] == "async_pending"
-    assert called == []
+    assert called, "loop must attempt the non-blocking commit before abandoning"
     log = capsys.readouterr().out
     assert "abandoned_foreground_busy" in log
-    assert "foreground_busy_past_deadline" in log
+    assert "model_lock_busy_past_deadline" in log
 
 
 def test_server_security_requires_api_key_for_non_localhost_bind():

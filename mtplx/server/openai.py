@@ -24,7 +24,6 @@ import sys
 import time
 import uuid
 import webbrowser
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict, is_dataclass
 from enum import Enum
@@ -48,6 +47,7 @@ from mtplx.adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
 from mtplx.attention_context import attention_phase
 from mtplx.cache_state import snapshot_cache
 from mtplx.mtp_patch import MTPContract
+from mtplx.model_scheduler import ModelWorkScheduler
 from mtplx.sampling import SamplerConfig
 from mtplx.profiles import (
     DEFAULT_PROFILE_NAME,
@@ -511,6 +511,12 @@ class ServerState:
         self.lock = Lock()
         self.foreground_lock = Lock()
         self.foreground_active = 0
+        self.model_scheduler = ModelWorkScheduler(name="mtplx-model")
+        # Compatibility shim for older tests/helpers that expect an executor
+        # with submit()/shutdown(). New serving code uses model_scheduler
+        # explicitly for foreground-vs-idle admission.
+        self.generation_executor = self.model_scheduler
+        self.postcommit_executor = None
         self.rate_limiter = _RateLimiter(args.rate_limit)
         self.profile = get_profile(args.profile)
         runtime_label = {
@@ -560,14 +566,19 @@ class ServerState:
         _startup_line("      Model load in progress (this may take a minute).")
         load_heartbeat = _startup_heartbeat("Model still loading")
         try:
-            self.runtime = load(
-                args.model, mtp=bool(args.load_mtp), contract=MTPContract()
-            )
+            self.runtime = self.model_scheduler.submit_foreground(
+                load,
+                args.model,
+                mtp=bool(args.load_mtp),
+                contract=MTPContract(),
+                batch_key="startup.load",
+            ).result()
         except BaseException as exc:
             elapsed_s = time.perf_counter() - started
             _startup_line(
                 f"[5/6] Model load failed after {elapsed_s:.1f}s: {type(exc).__name__}: {exc}"
             )
+            self.model_scheduler.shutdown(wait=False, cancel_futures=True)
             raise
         finally:
             load_heartbeat.set()
@@ -575,14 +586,34 @@ class ServerState:
         _startup_line(f"[5/6] Model loaded in {self.load_time_s:.1f}s")
         _startup_line("[5/6] Installing native-MTP draft head")
         self.draft_lm_head = (
-            _install_draft_lm_head(
+            self.model_scheduler.submit_foreground(
+                _install_draft_lm_head,
                 self.runtime,
                 bits=args.draft_lm_head_bits,
                 group_size=args.draft_lm_head_group_size,
                 mode=args.draft_lm_head_mode,
-            )
+                batch_key="startup.draft_head",
+            ).result()
             if self.runtime.mtp_enabled
             else {"installed": False, "reason": "mtp_disabled"}
+        )
+        self.draft_head_identity = (
+            self.model_scheduler.submit_foreground(
+                _draft_head_identity,
+                self.runtime,
+                batch_key="startup.draft_head_identity",
+            ).result()
+            if self.runtime.mtp_enabled
+            else None
+        )
+        self.template_hash = (
+            self.model_scheduler.submit_foreground(
+                _template_hash,
+                self.runtime.tokenizer,
+                batch_key="startup.template_hash",
+            ).result()
+            if self.runtime is not None
+            else None
         )
         self.draft_sampler = (
             SamplerConfig(
@@ -593,8 +624,6 @@ class ServerState:
             if args.draft_temperature is not None
             else None
         )
-        self.draft_head_identity = _draft_head_identity(self.runtime)
-        self.template_hash = _template_hash(self.runtime.tokenizer)
         self.context_window = (
             int(args.context_window)
             if int(args.context_window) > 0
@@ -609,14 +638,6 @@ class ServerState:
         self.last_request_at: float = 0.0
         self.requests_completed: int = 0
         self.main_system_prompt_hash: str | None = None
-        self.generation_executor = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="mtplx-generation",
-        )
-        self.postcommit_executor = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="mtplx-postcommit",
-        )
         self.warmup_status = _run_startup_warmup(self)
 
     def begin_foreground(self) -> None:
@@ -635,6 +656,47 @@ class ServerState:
     def foreground_count(self) -> int:
         with self.foreground_lock:
             return int(self.foreground_active)
+
+
+def _submit_foreground_model_work(
+    state: Any,
+    fn: Callable[..., Any],
+    *args: Any,
+    batch_key: str | None = None,
+    **kwargs: Any,
+) -> Any:
+    scheduler = getattr(state, "model_scheduler", None)
+    if scheduler is not None and hasattr(scheduler, "submit_foreground"):
+        return scheduler.submit_foreground(fn, *args, batch_key=batch_key, **kwargs)
+    executor = getattr(state, "generation_executor", None)
+    if executor is None:
+        raise RuntimeError("state has no model work executor")
+    return executor.submit(fn, *args, **kwargs)
+
+
+def _submit_idle_postcommit_model_work(
+    state: Any,
+    fn: Callable[..., Any],
+    *args: Any,
+    batch_key: str | None = None,
+    **kwargs: Any,
+) -> Any:
+    scheduler = getattr(state, "model_scheduler", None)
+    if scheduler is not None and hasattr(scheduler, "submit_idle_postcommit"):
+        return scheduler.submit_idle_postcommit(fn, *args, batch_key=batch_key, **kwargs)
+    executor = getattr(state, "postcommit_executor", None)
+    if executor is None:
+        executor = getattr(state, "generation_executor", None)
+    if executor is None:
+        raise RuntimeError("state has no idle postcommit executor")
+    return executor.submit(fn, *args, **kwargs)
+
+
+def _foreground_model_work_pending(state: Any) -> bool:
+    scheduler = getattr(state, "model_scheduler", None)
+    if scheduler is not None and hasattr(scheduler, "has_foreground_pending"):
+        return bool(scheduler.has_foreground_pending())
+    return False
 
 
 LOCALHOST_BINDS = {"", "127.0.0.1", "::1", "localhost"}
@@ -2222,6 +2284,7 @@ def _store_retokenized_history_snapshot(
     thinking_enabled: bool,
     policy_fingerprint: str,
     acquire_model_lock_blocking: bool = True,
+    tool_specs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if session_id is None:
         return {"stored": False, "reason": "no_session_id"}
@@ -2238,6 +2301,7 @@ def _store_retokenized_history_snapshot(
         enable_thinking=thinking_enabled,
         strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
         add_generation_prompt=False,
+        tools=tool_specs,
     )
     history_ids = encoded_with_sentinel
     if not history_ids:
@@ -2310,6 +2374,7 @@ def _history_ids_for_postcommit(
     assistant_content: str,
     assistant_tool_calls: list[dict[str, Any]] | None,
     thinking_enabled: bool,
+    tool_specs: list[dict[str, Any]] | None = None,
 ) -> list[int]:
     history_messages = list(messages) + [
         ChatMessage(
@@ -2324,6 +2389,7 @@ def _history_ids_for_postcommit(
         enable_thinking=thinking_enabled,
         strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
         add_generation_prompt=False,
+        tools=tool_specs,
     )
 
 
@@ -2336,6 +2402,7 @@ def _generation_final_postcommit_compatibility(
     assistant_content: str,
     assistant_tool_calls: list[dict[str, Any]] | None = None,
     thinking_enabled: bool,
+    tool_specs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if assistant_tool_calls:
         return {
@@ -2387,6 +2454,7 @@ def _generation_final_postcommit_compatibility(
         assistant_content=assistant_content,
         assistant_tool_calls=assistant_tool_calls,
         thinking_enabled=thinking_enabled,
+        tool_specs=tool_specs,
     )
     if history_ids == final_token_ids:
         return {
@@ -2432,6 +2500,7 @@ def _store_generation_final_history_snapshot(
     assistant_tool_calls: list[dict[str, Any]] | None = None,
     thinking_enabled: bool,
     policy_fingerprint: str,
+    tool_specs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if session_id is None:
         return {"stored": False, "mode": "unsafe", "reason": "no_session_id"}
@@ -2444,6 +2513,7 @@ def _store_generation_final_history_snapshot(
         assistant_content=assistant_content,
         assistant_tool_calls=assistant_tool_calls,
         thinking_enabled=thinking_enabled,
+        tool_specs=tool_specs,
     )
     if not bool(compatibility.get("safe")):
         return {
@@ -2520,6 +2590,9 @@ def _schedule_idle_postcommit_snapshot(
     thinking_enabled: bool,
     policy_fingerprint: str,
     unsafe_reason: str,
+    tool_specs: list[dict[str, Any]] | None = None,
+    session: Any | None = None,
+    expected_session_revision: int | None = None,
 ) -> dict[str, Any]:
     """Schedule a background SessionBank commit for a response the
     generation-final compatibility check rejected as unsafe (most commonly
@@ -2529,10 +2602,10 @@ def _schedule_idle_postcommit_snapshot(
     The retokenized-history path canonicalises tool_call responses into the
     exact prefix the next request will send, so the commit is safe - it just
     must not run on the request thread (would extend stream latency). This
-    function dispatches that work to the postcommit executor, where it waits
-    for the foreground to go idle and then runs the synchronous retokenized
-    commit. If the foreground stays busy past the deadline we abandon, since
-    a later commit would race the next turn's prefill.
+    function dispatches that work to the low-priority model scheduler lane.
+    The scheduler admits it only after foreground work drains; the job then
+    rechecks that no newer foreground is queued and that the session did not
+    advance before it builds a new cache.
     """
     pending = {
         "stored": False,
@@ -2564,39 +2637,66 @@ def _schedule_idle_postcommit_snapshot(
     def async_postcommit() -> None:
         deadline = time.monotonic() + _IDLE_POSTCOMMIT_MAX_WAIT_S
         try:
-            # Wait for the foreground request to release the model. We poll
-            # both the foreground flag and the model lock; if either is held
-            # the next prefill is imminent or already running and committing
-            # now would either stall it or race it. We bound the wait so a
-            # back-pressured server never accumulates a backlog of stale
-            # commit work.
-            while state.has_foreground() or state.lock.locked():
+            while True:
+                observed_revision = (
+                    getattr(session, "revision", None) if session is not None else None
+                )
+                if (
+                    expected_session_revision is not None
+                    and observed_revision is not None
+                    and int(observed_revision) != int(expected_session_revision)
+                ):
+                    _log(
+                        {
+                            "stored": False,
+                            "mode": "abandoned_stale",
+                            "reason": "stale_session_revision",
+                            "expected_session_revision": int(
+                                expected_session_revision
+                            ),
+                            "observed_session_revision": int(observed_revision),
+                        }
+                    )
+                    return
+                if _foreground_model_work_pending(state):
+                    _log(
+                        {
+                            "stored": False,
+                            "mode": "abandoned_foreground_busy",
+                            "reason": "foreground_pending_before_postcommit",
+                        }
+                    )
+                    return
+                postcommit = _store_retokenized_history_snapshot(
+                    state,
+                    session_id=session_id,
+                    messages=messages,
+                    assistant_content=assistant_content,
+                    assistant_tool_calls=assistant_tool_calls,
+                    thinking_enabled=thinking_enabled,
+                    policy_fingerprint=policy_fingerprint,
+                    acquire_model_lock_blocking=False,
+                    tool_specs=tool_specs,
+                )
+                if postcommit.get("stored"):
+                    _log(postcommit)
+                    return
+                if (
+                    postcommit.get("reason")
+                    != "model_lock_busy_before_retokenized_commit"
+                ):
+                    _log(postcommit)
+                    return
                 if time.monotonic() >= deadline:
                     _log(
                         {
                             "stored": False,
                             "mode": "abandoned_foreground_busy",
-                            "reason": "foreground_busy_past_deadline",
+                            "reason": "model_lock_busy_past_deadline",
                         }
                     )
                     return
                 time.sleep(_IDLE_POSTCOMMIT_POLL_INTERVAL_S)
-
-            # Foreground is idle. Run the canonical retokenized commit with a
-            # non-blocking lock acquire, so a foreground request that wins the
-            # race after the idle check is never delayed by background cache
-            # maintenance.
-            postcommit = _store_retokenized_history_snapshot(
-                state,
-                session_id=session_id,
-                messages=messages,
-                assistant_content=assistant_content,
-                assistant_tool_calls=assistant_tool_calls,
-                thinking_enabled=thinking_enabled,
-                policy_fingerprint=policy_fingerprint,
-                acquire_model_lock_blocking=False,
-            )
-            _log(postcommit)
         except BaseException as exc:
             _log(
                 {
@@ -2606,10 +2706,11 @@ def _schedule_idle_postcommit_snapshot(
                 }
             )
 
-    executor = getattr(state, "postcommit_executor", None)
-    if executor is None:
-        executor = state.generation_executor
-    executor.submit(async_postcommit)
+    _submit_idle_postcommit_model_work(
+        state,
+        async_postcommit,
+        batch_key=f"postcommit:{session_id or 'stateless'}",
+    )
     return pending
 
 
@@ -3034,16 +3135,20 @@ def _run_startup_warmup(state: ServerState) -> dict[str, Any]:
     warmup_heartbeat = _startup_heartbeat("warmup still running", interval_s=5.0)
     try:
         prompt_ids = _encode_prompt(state.runtime.tokenizer, "MTPLX warmup.")
-        generated = _run_generation(
+        generated = _submit_foreground_model_work(
             state,
-            prompt_ids,
-            max_tokens=warmup_tokens,
-            temperature=state.args.temperature,
-            top_p=state.args.top_p,
-            top_k=state.args.top_k,
-            seed=0,
-            request_observability={"warmup": True},
-        )
+            lambda: _run_generation(
+                state,
+                prompt_ids,
+                max_tokens=warmup_tokens,
+                temperature=state.args.temperature,
+                top_p=state.args.top_p,
+                top_k=state.args.top_k,
+                seed=0,
+                request_observability={"warmup": True},
+            ),
+            batch_key="startup.warmup",
+        ).result()
     except BaseException as exc:
         status.update(
             {
@@ -4800,10 +4905,16 @@ def create_app(state: ServerState) -> FastAPI:
         try:
             yield
         finally:
-            postcommit_executor = getattr(state, "postcommit_executor", None)
-            if postcommit_executor is not None:
-                postcommit_executor.shutdown(wait=False, cancel_futures=True)
-            state.generation_executor.shutdown(wait=False, cancel_futures=True)
+            scheduler = getattr(state, "model_scheduler", None)
+            if scheduler is not None:
+                scheduler.shutdown(wait=False, cancel_futures=True)
+            else:
+                postcommit_executor = getattr(state, "postcommit_executor", None)
+                generation_executor = getattr(state, "generation_executor", None)
+                if postcommit_executor is not None:
+                    postcommit_executor.shutdown(wait=False, cancel_futures=True)
+                if generation_executor is not None:
+                    generation_executor.shutdown(wait=False, cancel_futures=True)
 
     app = FastAPI(title="MTPLX OpenAI-compatible server", lifespan=lifespan)
     app.state.mtplx = state
@@ -5176,7 +5287,11 @@ def create_app(state: ServerState) -> FastAPI:
             metadata=metadata,
             main_system_hash=state.main_system_prompt_hash,
         )
-        if background and (state.has_foreground() or state.lock.locked()):
+        if background and (
+            state.has_foreground()
+            or state.lock.locked()
+            or _foreground_model_work_pending(state)
+        ):
             return JSONResponse(
                 status_code=503,
                 headers={"Retry-After": "1"},
@@ -5328,6 +5443,7 @@ def create_app(state: ServerState) -> FastAPI:
                 assistant_content=assistant_content,
                 assistant_tool_calls=assistant_tool_calls,
                 thinking_enabled=thinking_enabled,
+                tool_specs=tool_specs if tools_active else None,
             )
             if compatibility.get("safe"):
                 generated["stats"]["session_postcommit_snapshot"] = {
@@ -5360,20 +5476,26 @@ def create_app(state: ServerState) -> FastAPI:
                         thinking_enabled=thinking_enabled,
                         policy_fingerprint=policy_fingerprint,
                         unsafe_reason=unsafe_reason,
+                        tool_specs=tool_specs if tools_active else None,
+                        session=session,
+                        expected_session_revision=getattr(session, "revision", None),
                     )
                 )
                 return
-            loop = asyncio.get_running_loop()
-            postcommit = await loop.run_in_executor(
-                state.generation_executor,
-                lambda: _store_retokenized_history_snapshot(
+            postcommit = await asyncio.wrap_future(
+                _submit_foreground_model_work(
                     state,
-                    session_id=session_id,
-                    messages=request.messages,
-                    assistant_content=assistant_content,
-                    assistant_tool_calls=assistant_tool_calls,
-                    thinking_enabled=thinking_enabled,
-                    policy_fingerprint=policy_fingerprint,
+                    lambda: _store_retokenized_history_snapshot(
+                        state,
+                        session_id=session_id,
+                        messages=request.messages,
+                        assistant_content=assistant_content,
+                        assistant_tool_calls=assistant_tool_calls,
+                        thinking_enabled=thinking_enabled,
+                        policy_fingerprint=policy_fingerprint,
+                        tool_specs=tool_specs if tools_active else None,
+                    ),
+                    batch_key=f"postcommit.inline:{session_id or 'stateless'}",
                 ),
             )
             generated["stats"]["session_postcommit_snapshot"] = postcommit
@@ -5516,6 +5638,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             assistant_tool_calls=assistant_tool_calls,
                                             thinking_enabled=thinking_enabled,
                                             policy_fingerprint=policy_fingerprint,
+                                            tool_specs=tool_specs if tools_active else None,
                                         )
                                     else:
                                         postcommit = _store_generation_final_history_snapshot(
@@ -5528,6 +5651,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             assistant_tool_calls=assistant_tool_calls,
                                             thinking_enabled=thinking_enabled,
                                             policy_fingerprint=policy_fingerprint,
+                                            tool_specs=tool_specs if tools_active else None,
                                         )
                                         if not postcommit.get("stored"):
                                             generated["stats"][
@@ -5578,7 +5702,11 @@ def create_app(state: ServerState) -> FastAPI:
                     else:
                         queue.put(("done", generated))
 
-                generation_future = state.generation_executor.submit(worker)
+                generation_future = _submit_foreground_model_work(
+                    state,
+                    worker,
+                    batch_key="chat.stream",
+                )
 
                 def delta_payload_chunk(delta: dict[str, Any]) -> str:
                     payload = {
@@ -5876,6 +6004,11 @@ def create_app(state: ServerState) -> FastAPI:
                                         unsafe_reason=str(
                                             postcommit.get("reason") or "unsafe_history"
                                         ),
+                                        tool_specs=tool_specs if tools_active else None,
+                                        session=session,
+                                        expected_session_revision=getattr(
+                                            session, "revision", None
+                                        ),
                                     )
                                 else:
                                     yield mark_sse_sent(
@@ -5967,11 +6100,13 @@ def create_app(state: ServerState) -> FastAPI:
         def run_nonstream_generation() -> dict[str, Any]:
             return run_generation_for_response()
 
-        loop = asyncio.get_running_loop()
         try:
-            generated = await loop.run_in_executor(
-                state.generation_executor,
-                run_nonstream_generation,
+            generated = await asyncio.wrap_future(
+                _submit_foreground_model_work(
+                    state,
+                    run_nonstream_generation,
+                    batch_key="chat.nonstream",
+                )
             )
         except EngineSessionBusy as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -6066,16 +6201,22 @@ def create_app(state: ServerState) -> FastAPI:
             request,
             generation_mode=request_generation_mode,
         )
-        generated = _run_generation(
-            state,
-            prompt_ids,
-            max_tokens=request.max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            top_k=request.top_k,
-            seed=request.seed,
-            generation_mode=request_generation_mode,
-            depth=request_depth,
+        generated = await asyncio.wrap_future(
+            _submit_foreground_model_work(
+                state,
+                lambda: _run_generation(
+                    state,
+                    prompt_ids,
+                    max_tokens=request.max_tokens,
+                    temperature=request.temperature,
+                    top_p=request.top_p,
+                    top_k=request.top_k,
+                    seed=request.seed,
+                    generation_mode=request_generation_mode,
+                    depth=request_depth,
+                ),
+                batch_key="completion",
+            )
         )
         model = request.model or state.model_id
         response_id = f"cmpl-{uuid.uuid4().hex}"
