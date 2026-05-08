@@ -1559,6 +1559,49 @@ def _message_to_template_dict(
     return None
 
 
+def _coerce_token_ids(encoded: Any) -> list[int]:
+    """Normalize tokenizer outputs to a plain token-id list.
+
+    HF slow tokenizers, fast tokenizers, and mlx-lm's TokenizerWrapper do not
+    all return the same shape from apply_chat_template(). SessionBank prefix
+    comparisons must never depend on that wrapper detail.
+    """
+    if encoded is None:
+        return []
+    if hasattr(encoded, "ids"):
+        return [int(token) for token in getattr(encoded, "ids")]
+    if hasattr(encoded, "tolist"):
+        return _coerce_token_ids(encoded.tolist())
+    if isinstance(encoded, dict):
+        if "input_ids" in encoded:
+            return _coerce_token_ids(encoded["input_ids"])
+        return []
+    if isinstance(encoded, (list, tuple)):
+        tokens: list[int] = []
+        for item in encoded:
+            if isinstance(item, int):
+                tokens.append(int(item))
+            elif hasattr(item, "ids") or hasattr(item, "tolist") or isinstance(
+                item, (list, tuple, dict)
+            ):
+                tokens.extend(_coerce_token_ids(item))
+            else:
+                tokens.append(int(item))
+        return tokens
+    return [int(encoded)]
+
+
+def _encode_rendered_chat_text(tokenizer: Any, text: str) -> list[int]:
+    try:
+        return _coerce_token_ids(tokenizer.encode(text, add_special_tokens=False))
+    except TypeError:
+        return _coerce_token_ids(tokenizer.encode(text))
+
+
+def _encode_plain_text(tokenizer: Any, text: str) -> list[int]:
+    return _coerce_token_ids(tokenizer.encode(text))
+
+
 def _encode_messages(
     tokenizer: Any,
     messages: list[ChatMessage],
@@ -1587,7 +1630,7 @@ def _encode_messages(
     if tools:
         template_kwargs["tools"] = tools
     try:
-        return list(
+        return _coerce_token_ids(
             tokenizer.apply_chat_template(
                 normalized,
                 **template_kwargs,
@@ -1601,7 +1644,7 @@ def _encode_messages(
             }
             if tools:
                 fallback_kwargs["tools"] = tools
-            return list(
+            return _coerce_token_ids(
                 tokenizer.apply_chat_template(
                     normalized,
                     **fallback_kwargs,
@@ -1626,11 +1669,129 @@ def _encode_messages(
                 status_code=500,
                 detail=f"tokenizer chat template failed with tool schemas: {exc}",
             ) from exc
-        pass
+            pass
     prompt = "\n".join(f"{item['role']}: {item['content']}" for item in normalized)
     if add_generation_prompt:
         prompt += "\nassistant:"
-    return list(tokenizer.encode(prompt))
+    return _encode_rendered_chat_text(tokenizer, prompt)
+
+
+def _render_messages_for_postcommit(
+    tokenizer: Any,
+    normalized: list[dict[str, Any]],
+    *,
+    enable_thinking: bool,
+    tools: list[dict[str, Any]] | None,
+) -> str | None:
+    template_kwargs: dict[str, Any] = {
+        "tokenize": False,
+        "add_generation_prompt": False,
+        "enable_thinking": enable_thinking,
+        "preserve_thinking": True,
+    }
+    if tools:
+        template_kwargs["tools"] = tools
+    try:
+        rendered = tokenizer.apply_chat_template(normalized, **template_kwargs)
+    except TypeError:
+        fallback_kwargs: dict[str, Any] = {
+            "tokenize": False,
+            "add_generation_prompt": False,
+        }
+        if tools:
+            fallback_kwargs["tools"] = tools
+        try:
+            rendered = tokenizer.apply_chat_template(normalized, **fallback_kwargs)
+        except Exception:
+            return None
+    except Exception:
+        return None
+    return rendered if isinstance(rendered, str) else None
+
+
+_POSTCOMMIT_SENTINEL_CONTENT = "__MTPLX_POSTCOMMIT_SENTINEL_4f02c7d2__"
+
+
+def _sentinel_next_turn_start(
+    rendered: str,
+    *,
+    sentinel_role: str,
+    sentinel_content: str = _POSTCOMMIT_SENTINEL_CONTENT,
+) -> int | None:
+    sentinel_at = rendered.find(sentinel_content)
+    if sentinel_at < 0:
+        return None
+    role = sentinel_role
+    role_title = role[:1].upper() + role[1:]
+    markers = [
+        f"<|im_start|>{role}\n",
+        f"<|im_start|>{role}\r\n",
+        f"<|start_header_id|>{role}<|end_header_id|>\n\n",
+        f"\n### {role_title}:\n",
+        f"\n{role}:",
+        f"\n{role_title}:",
+        f"{role}:",
+        f"{role_title}:",
+    ]
+    candidates = [
+        idx
+        for marker in markers
+        if (idx := rendered.rfind(marker, 0, sentinel_at)) >= 0
+    ]
+    if not candidates:
+        return None
+    return max(candidates)
+
+
+def _postcommit_next_turn_prefix_ids(
+    tokenizer: Any,
+    history_messages: list[ChatMessage],
+    *,
+    enable_thinking: bool,
+    strip_assistant_reasoning_history: bool,
+    tools: list[dict[str, Any]] | None,
+    assistant_tool_calls: list[dict[str, Any]] | None,
+) -> list[int] | None:
+    sentinel_role = "user"
+    sentinel_message = ChatMessage(role="user", content=_POSTCOMMIT_SENTINEL_CONTENT)
+    if assistant_tool_calls:
+        first_tool_call = assistant_tool_calls[0] if assistant_tool_calls else {}
+        sentinel_role = "tool"
+        sentinel_message = ChatMessage(
+            role="tool",
+            content=_POSTCOMMIT_SENTINEL_CONTENT,
+            tool_call_id=str(first_tool_call.get("id") or "call_mtplx_postcommit"),
+        )
+
+    normalized: list[dict[str, Any]] = []
+    for message in [*history_messages, sentinel_message]:
+        item = _message_to_template_dict(
+            message,
+            strip_assistant_reasoning_history=strip_assistant_reasoning_history,
+        )
+        if item is not None:
+            normalized.append(item)
+    if not normalized:
+        return None
+
+    rendered = _render_messages_for_postcommit(
+        tokenizer,
+        normalized,
+        enable_thinking=enable_thinking,
+        tools=tools,
+    )
+    if not rendered:
+        return None
+    turn_start = _sentinel_next_turn_start(
+        rendered,
+        sentinel_role=sentinel_role,
+    )
+    if turn_start is None:
+        return None
+    prefix_text = rendered[:turn_start]
+    if not prefix_text:
+        return None
+    return _encode_rendered_chat_text(tokenizer, prefix_text)
 
 
 def _encode_prompt(
@@ -1639,12 +1800,15 @@ def _encode_prompt(
     if prompt is None:
         return []
     if isinstance(prompt, str):
-        return list(tokenizer.encode(prompt))
+        return _encode_plain_text(tokenizer, prompt)
     if isinstance(prompt, list) and all(isinstance(item, int) for item in prompt):
         return [int(item) for item in prompt]
     if isinstance(prompt, list):
-        return list(tokenizer.encode("\n".join(str(item) for item in prompt)))
-    return list(tokenizer.encode(str(prompt)))
+        return _encode_plain_text(
+            tokenizer,
+            "\n".join(str(item) for item in prompt),
+        )
+    return _encode_plain_text(tokenizer, str(prompt))
 
 
 def _count_text_tokens(tokenizer: Any, text: str) -> int:
@@ -2288,22 +2452,14 @@ def _store_retokenized_history_snapshot(
 ) -> dict[str, Any]:
     if session_id is None:
         return {"stored": False, "reason": "no_session_id"}
-    history_messages = list(messages) + [
-        ChatMessage(
-            role="assistant",
-            content=assistant_content,
-            tool_calls=assistant_tool_calls,
-        ),
-    ]
-    encoded_with_sentinel = _encode_messages(
-        state.runtime.tokenizer,
-        history_messages,
-        enable_thinking=thinking_enabled,
-        strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
-        add_generation_prompt=False,
-        tools=tool_specs,
+    history_ids = _history_ids_for_postcommit(
+        state,
+        messages=messages,
+        assistant_content=assistant_content,
+        assistant_tool_calls=assistant_tool_calls,
+        thinking_enabled=thinking_enabled,
+        tool_specs=tool_specs,
     )
-    history_ids = encoded_with_sentinel
     if not history_ids:
         return {"stored": False, "reason": "empty_boundary_prefix"}
     started = time.perf_counter()
@@ -2383,6 +2539,16 @@ def _history_ids_for_postcommit(
             tool_calls=assistant_tool_calls,
         ),
     ]
+    next_turn_prefix_ids = _postcommit_next_turn_prefix_ids(
+        state.runtime.tokenizer,
+        history_messages,
+        enable_thinking=thinking_enabled,
+        strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
+        tools=tool_specs,
+        assistant_tool_calls=assistant_tool_calls,
+    )
+    if next_turn_prefix_ids:
+        return next_turn_prefix_ids
     return _encode_messages(
         state.runtime.tokenizer,
         history_messages,

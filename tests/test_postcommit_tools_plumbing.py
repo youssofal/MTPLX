@@ -31,6 +31,7 @@ from mtplx.server import openai
 from mtplx.server.openai import (
     ChatMessage,
     _encode_messages,
+    _generation_final_postcommit_compatibility,
     _history_ids_for_postcommit,
     _schedule_idle_postcommit_snapshot,
     _store_retokenized_history_snapshot,
@@ -86,6 +87,58 @@ class ToolAwareTokenizer:
 
     def decode(self, tokens, **_kwargs):
         return "".join(chr(int(t)) for t in tokens)
+
+
+class TerminalThinkingTokenizer(ToolAwareTokenizer):
+    """Mimic Qwen no-thinking history encoding.
+
+    Qwen's template emits the empty think block for a terminal assistant
+    message, but not when that same assistant message is followed by the
+    next user/tool turn. A postcommit snapshot built from the terminal
+    assistant rendering can never be a prefix of turn 2.
+    """
+
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize,
+        add_generation_prompt,
+        enable_thinking=False,
+        tools=None,
+        **_kwargs,
+    ):
+        text = ""
+        if tools:
+            tool_lines = ["<tools>"]
+            for spec in tools:
+                fn = spec.get("function") or spec
+                name = fn.get("name") or spec.get("name") or "fn"
+                tool_lines.append(f"<tool name={name}/>")
+            tool_lines.append("</tools>")
+            text += "\n".join(tool_lines) + "\n"
+        rendered_messages: list[str] = []
+        last_idx = len(messages) - 1
+        for idx, message in enumerate(messages):
+            content = message.get("content") or ""
+            if (
+                message["role"] == "assistant"
+                and idx == last_idx
+                and not add_generation_prompt
+                and not enable_thinking
+            ):
+                content = "<think>\n\n</think>\n\n" + content
+            rendered_messages.append(
+                f"<|im_start|>{message['role']}\n{content}<|im_end|>"
+            )
+        text += "\n".join(rendered_messages)
+        if text:
+            text += "\n"
+        if add_generation_prompt:
+            text += "<|im_start|>assistant\n"
+            if not enable_thinking:
+                text += "<think>\n\n</think>\n\n"
+        return _ids(text) if tokenize else text
 
 
 class RecordingBank:
@@ -203,6 +256,84 @@ def test_history_ids_with_tools_is_strict_prefix_of_next_prompt():
         "stored history snapshot must be a strict token prefix of the "
         "next-turn prompt; otherwise SessionBank lookups will diverge"
     )
+
+
+def test_history_ids_use_next_turn_prefix_for_qwen_terminal_thinking_template():
+    """Qwen no-thinking mode renders a terminal assistant differently from
+    an assistant followed by the next turn. Store the next-turn prefix, not
+    the unreachable terminal rendering.
+    """
+    state = _postcommit_state(tokenizer=TerminalThinkingTokenizer())
+    messages = [
+        ChatMessage(role="system", content="You are concise."),
+        ChatMessage(role="user", content="Say OK."),
+    ]
+    assistant_content = "OK"
+
+    history_ids = _history_ids_for_postcommit(
+        state,
+        messages=messages,
+        assistant_content=assistant_content,
+        assistant_tool_calls=None,
+        thinking_enabled=False,
+        tool_specs=_TOOL_SPECS,
+    )
+    next_messages = list(messages) + [
+        ChatMessage(role="assistant", content=assistant_content),
+        ChatMessage(role="user", content="Now say DONE."),
+    ]
+    next_prompt_ids = _encode_messages(
+        state.runtime.tokenizer,
+        next_messages,
+        enable_thinking=False,
+        tools=_TOOL_SPECS,
+    )
+    terminal_ids = _encode_messages(
+        state.runtime.tokenizer,
+        list(messages) + [ChatMessage(role="assistant", content=assistant_content)],
+        enable_thinking=False,
+        add_generation_prompt=False,
+        tools=_TOOL_SPECS,
+    )
+
+    assert next_prompt_ids[: len(history_ids)] == history_ids
+    assert next_prompt_ids[: len(terminal_ids)] != terminal_ids
+
+
+def test_generation_final_rejects_unreachable_qwen_terminal_thinking_prefix():
+    state = _postcommit_state(tokenizer=TerminalThinkingTokenizer())
+    messages = [
+        ChatMessage(role="system", content="You are concise."),
+        ChatMessage(role="user", content="Say OK."),
+    ]
+    prompt_ids = _encode_messages(
+        state.runtime.tokenizer,
+        messages,
+        enable_thinking=False,
+        tools=_TOOL_SPECS,
+    )
+    generated_tokens = _ids("OK")
+    generated = {
+        "tokens": generated_tokens,
+        "_final_state": SimpleNamespace(
+            generated_token_ids=tuple(generated_tokens),
+            safe_to_commit=True,
+        ),
+    }
+
+    compatibility = _generation_final_postcommit_compatibility(
+        state,
+        prompt_ids=prompt_ids,
+        generated=generated,
+        messages=messages,
+        assistant_content="OK",
+        assistant_tool_calls=None,
+        thinking_enabled=False,
+        tool_specs=_TOOL_SPECS,
+    )
+
+    assert compatibility["safe"] is False
+    assert compatibility["reason"] == "retokenized_history_mismatch"
 
 
 def test_history_ids_without_tools_diverges_from_next_prompt_with_tools():

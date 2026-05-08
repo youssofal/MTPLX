@@ -13,8 +13,8 @@
 #   1. Starts a unique session_id (one per run).
 #   2. Issues turn 1 with a `tools=[...]` array and a simple user message.
 #   3. Sleeps to let the async postcommit settle.
-#   4. Issues turn 2 with the same tools, a synthetic assistant tool_call
-#      reply, plus a new user message.
+#   4. Replays the actual assistant message from turn 1, then issues turn 2
+#      with the same tools plus a new user message.
 #   5. Parses the SSE stream for the final chunk's `mtplx_stats` and
 #      reports PASS if `cached_tokens > 0`, FAIL otherwise.
 #
@@ -81,36 +81,6 @@ TURN1_PAYLOAD=$(cat <<EOF
 EOF
 )
 
-TURN2_PAYLOAD=$(cat <<EOF
-{
-  "model": "auto",
-  "stream": true,
-  "max_tokens": 128,
-  "enable_thinking": false,
-  "tools": ${TOOLS_JSON},
-  "messages": [
-    {"role": "system", "content": "You are a helpful coding agent."},
-    {"role": "user", "content": "Find any references to 'session_bank' in the repo."},
-    {
-      "role": "assistant",
-      "content": "",
-      "tool_calls": [{
-        "id": "call_1",
-        "type": "function",
-        "function": {"name": "grep", "arguments": "{\"pattern\":\"session_bank\"}"}
-      }]
-    },
-    {
-      "role": "tool",
-      "tool_call_id": "call_1",
-      "content": "mtplx/session_bank.py:1:class SessionBank: ..."
-    },
-    {"role": "user", "content": "Now read the first matching file."}
-  ]
-}
-EOF
-)
-
 TMPDIR_SMOKE=$(mktemp -d)
 trap 'rm -rf "${TMPDIR_SMOKE}"' EXIT
 
@@ -127,6 +97,56 @@ echo "[smoke] turn 1 SSE bytes: $(wc -c < "${TMPDIR_SMOKE}/turn1.sse")"
 # Pull the session_postcommit_snapshot from turn 1 (best-effort).
 PC1=$(grep -o '"session_postcommit_snapshot":[^}]*}' "${TMPDIR_SMOKE}/turn1.sse" | tail -1 || true)
 echo "[smoke] turn 1 postcommit: ${PC1:-<not present>}"
+
+ASSISTANT_MSG_JSON=$("${PYTHON:-python3}" - "${TMPDIR_SMOKE}/turn1.sse" <<'PY'
+import json
+import sys
+
+content_parts = []
+for raw in open(sys.argv[1], encoding="utf-8"):
+    if not raw.startswith("data: "):
+        continue
+    data = raw[len("data: "):].strip()
+    if not data or data == "[DONE]":
+        continue
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError:
+        continue
+    choices = payload.get("choices") or []
+    if not choices:
+        continue
+    delta = choices[0].get("delta") or {}
+    content = delta.get("content")
+    if content:
+        content_parts.append(str(content))
+
+print(
+    json.dumps(
+        {"role": "assistant", "content": "".join(content_parts)},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+)
+PY
+)
+
+TURN2_PAYLOAD=$(cat <<EOF
+{
+  "model": "auto",
+  "stream": true,
+  "max_tokens": 128,
+  "enable_thinking": false,
+  "tools": ${TOOLS_JSON},
+  "messages": [
+    {"role": "system", "content": "You are a helpful coding agent."},
+    {"role": "user", "content": "Find any references to 'session_bank' in the repo."},
+    ${ASSISTANT_MSG_JSON},
+    {"role": "user", "content": "Now read the first matching file."}
+  ]
+}
+EOF
+)
 
 echo "[smoke] sleeping ${SLEEP_S}s for async postcommit to settle..."
 sleep "${SLEEP_S}"
