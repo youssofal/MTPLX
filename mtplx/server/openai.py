@@ -1300,6 +1300,10 @@ class _ToolAwareContentStreamTranslator:
     """Translate streamed assistant text into OpenAI tool-call deltas when needed."""
 
     _START_MARKER = "<tool_call"
+    # If the model generates more than this many bytes in tool mode without
+    # producing a valid, complete tool-call block we assume it is hallucinating
+    # an agent session and fall back to emitting the content as plain text.
+    _TOOL_BUFFER_LIMIT = 16_384
 
     def __init__(
         self,
@@ -1317,6 +1321,13 @@ class _ToolAwareContentStreamTranslator:
     @property
     def has_tool_calls(self) -> bool:
         return bool(self.tool_calls)
+
+    def _bail_to_content(self) -> list[dict[str, Any]]:
+        """Abandon tool mode and flush the buffer as plain content."""
+        content = self._pending
+        self._pending = ""
+        self._mode = "content"
+        return [{"content": content}] if content else []
 
     def feed(self, field: str, text: str) -> list[dict[str, Any]]:
         if not text:
@@ -1363,15 +1374,40 @@ class _ToolAwareContentStreamTranslator:
         return []
 
     def _tool_deltas_if_complete(self, *, final: bool) -> list[dict[str, Any]]:
+        lowered = self._pending.lower()
+
         if not final:
-            return []
-        tool_calls = _parse_generated_tool_calls(self._pending, tools=self._tools)
+            # Check buffer limit — if the model has generated too much without
+            # closing a valid tool-call block, it is probably hallucinating.
+            if len(self._pending) > self._TOOL_BUFFER_LIMIT:
+                return self._bail_to_content()
+            # Check whether we have at least one complete block to try parsing.
+            if "</tool_call>" not in lowered:
+                return []
+            # We have a closing tag — but the model may still be generating more
+            # tool calls.  Only attempt a parse when no partial block is open at
+            # the tail (i.e. the last </tool_call> comes after the last <tool_call).
+            last_close = lowered.rfind("</tool_call>")
+            last_open = lowered.rfind("<tool_call", last_close)
+            if last_open >= 0:
+                # There is a <tool_call that was opened after the last close —
+                # the model is still generating another block, keep buffering
+                # (but still subject to the size limit above).
+                return []
+
+        # Attempt to parse.  Any protocol error (unknown tool, bad format,
+        # unclosed block, etc.) means the model produced something we cannot
+        # turn into a structured tool call — fall back to content.
+        try:
+            tool_calls = _parse_generated_tool_calls(
+                self._pending, tools=self._tools
+            )
+        except HTTPException:
+            return self._bail_to_content()
+
         if not tool_calls:
             if final:
-                content = self._pending
-                self._pending = ""
-                self._mode = "content"
-                return [{"content": content}]
+                return self._bail_to_content()
             return []
         self.tool_calls = tool_calls
         self._pending = ""
@@ -5918,11 +5954,18 @@ def create_app(state: ServerState) -> FastAPI:
             )
         except EngineSessionBusy as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        tool_calls = (
-            _parse_generated_tool_calls(str(generated["text"]), tools=tool_specs)
-            if tools_active
-            else None
-        )
+        try:
+            tool_calls = (
+                _parse_generated_tool_calls(
+                    str(generated["text"]), tools=tool_specs
+                )
+                if tools_active
+                else None
+            )
+        except HTTPException:
+            # Model produced tool-call-like markup that could not be parsed
+            # (unknown tool names, malformed blocks, etc.) — treat as content.
+            tool_calls = None
         if tool_calls:
             generated["finish_reason"] = "tool_calls"
             await store_postcommit_snapshot(

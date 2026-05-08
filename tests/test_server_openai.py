@@ -1098,7 +1098,8 @@ def test_chat_stream_emits_heartbeat_during_alive_silence(monkeypatch):
     assert "data: [DONE]" in response.text
 
 
-def test_chat_tools_malformed_tool_call_returns_422(monkeypatch):
+def test_chat_tools_malformed_tool_call_falls_back_to_content(monkeypatch):
+    """Malformed tool-call markup should fall back to plain content, not 422."""
     client = TestClient(create_app(_fake_state()))
     monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
     monkeypatch.setattr(
@@ -1118,8 +1119,10 @@ def test_chat_tools_malformed_tool_call_returns_422(monkeypatch):
         },
     )
 
-    assert response.status_code == 422
-    assert response.json()["detail"].startswith("malformed tool_call")
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] != "tool_calls"
+    assert choice["message"]["content"] is not None
 
 
 def test_server_state_emits_startup_progress(monkeypatch, capsys):
