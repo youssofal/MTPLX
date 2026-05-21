@@ -294,3 +294,28 @@ def test_public_model_id_for_ref_maps_unknown_local_name_to_sanitized_id():
         public_model_id_for_ref("/tmp/My Custom Local Model!")
         == "my-custom-local-model"
     )
+
+
+def test_public_model_id_for_ref_third_party_q4_q8_keeps_folder_name(tmp_path):
+    # Regression: a third-party Qwen3.6-35B-A3B build with the same Q4-weights/
+    # Q8-head config layout as the Qwen3.6-27B Quality artifact must not be
+    # served as `mtplx-qwen36-27b-optimized-quality`.
+    model = tmp_path / "Qwen3.6-35B-A3B-4bit-MTPLX-Optimized-Speed"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "quantization": {
+                    "bits": 4,
+                    "language_model.model.layers.0.mlp.down_proj": {"bits": 8},
+                    "language_model.model.layers.0.linear_attn.in_proj_qkv": {"bits": 8},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        public_model_id_for_ref(model)
+        == "qwen3.6-35b-a3b-4bit-mtplx-optimized-speed"
+    )

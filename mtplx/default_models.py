@@ -209,6 +209,16 @@ def _public_model_id_from_metadata(path: Path) -> str | None:
             if inferred:
                 return inferred
 
+    # The config.json quantization layout (Q4 weights with a Q8 head, flat Q8,
+    # etc.) is shared by many MLX builds, so it can only distinguish the
+    # Qwen3.6-27B MTPLX Speed/Quality split — not the model family. Skip this
+    # refinement for folders that don't already identify as a Qwen3.6-27B MTPLX
+    # artifact; otherwise a third-party model like
+    # `Qwen3.6-35B-A3B-4bit-MTPLX-Optimized-Speed` would silently be served as
+    # `mtplx-qwen36-27b-optimized-quality`.
+    if _public_model_id_from_name(str(path)) is None:
+        return None
+
     config = _read_json(path / "config.json")
     quantization = config.get("quantization") or config.get("quantization_config")
     if isinstance(quantization, dict):
