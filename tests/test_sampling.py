@@ -76,3 +76,44 @@ def test_sparse_distribution_sampling_returns_original_token_ids():
         vocab_size=12,
     )
     assert sample_from_distribution(dist, np.random.default_rng(0)) == 11
+
+
+def test_sparse_distribution_fallback_on_zero_or_nan_mass():
+    # Test fallback in constructor when probs has zero sum
+    dist_zero = SparseDistribution(
+        token_ids=np.array([1, 2]),
+        probs=np.array([0.0, 0.0]),
+        vocab_size=5,
+    )
+    assert dist_zero.probs.sum() == 1.0
+    assert dist_zero.token_ids.tolist() == [1]
+
+    # Test fallback in constructor when probs has nan value
+    dist_nan = SparseDistribution(
+        token_ids=np.array([3, 4]),
+        probs=np.array([np.nan, 1.0]),
+        vocab_size=5,
+    )
+    assert dist_nan.probs.sum() == 1.0
+    assert dist_nan.token_ids.tolist() == [3]
+
+
+def test_residual_distribution_nan_robustness():
+    # Test residual_distribution robustness against NaN values
+    target = SparseDistribution(
+        token_ids=np.array([1, 2]),
+        probs=np.array([0.2, 0.8]),
+        vocab_size=5,
+    )
+    draft = SparseDistribution(
+        token_ids=np.array([1, 2]),
+        probs=np.array([0.8, 0.2]),
+        vocab_size=5,
+    )
+    # Mock probability to return NaN for one token
+    from unittest.mock import patch
+    original_probability = SparseDistribution.probability
+    with patch.object(SparseDistribution, "probability", lambda self, token_id: np.nan if token_id == 1 else original_probability(self, token_id)):
+        res = residual_distribution(target, draft)
+        # Should gracefully return target because NaN is checked/handled
+        assert isinstance(res, SparseDistribution)
