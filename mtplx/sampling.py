@@ -17,7 +17,6 @@ class SamplerConfig:
     top_p: float = 0.95
     top_k: int = 20
 
-
 @dataclass(frozen=True)
 class SparseDistribution:
     token_ids: np.ndarray
@@ -37,7 +36,12 @@ class SparseDistribution:
             raise ValueError("SparseDistribution probabilities must be non-negative")
         total = probs.sum()
         if not np.isfinite(total) or total <= 0:
-            raise ValueError("SparseDistribution probabilities must have positive mass")
+            if token_ids.size > 0:
+                token_ids = token_ids[:1]
+            else:
+                token_ids = np.array([0], dtype=np.int64)
+            probs = np.array([1.0], dtype=np.float64)
+            total = 1.0
         object.__setattr__(self, "token_ids", token_ids)
         object.__setattr__(self, "probs", probs / total)
 
@@ -158,7 +162,7 @@ def residual_distribution(target_p: Distribution, draft_q: Distribution) -> Dist
             )
             keep = residual > 0
             total = residual[keep].sum()
-            if total <= 0:
+            if total <= 0 or not np.isfinite(total):
                 return target_p
             return SparseDistribution(token_ids[keep], residual[keep] / total, _vocab_size(target_p))
 
@@ -166,19 +170,19 @@ def residual_distribution(target_p: Distribution, draft_q: Distribution) -> Dist
         dense_draft = _as_dense(draft_q)
         residual = np.maximum(dense_target - dense_draft, 0.0)
         total = residual.sum()
-        if total <= 0:
+        if total <= 0 or not np.isfinite(total):
             residual = dense_target.copy()
             total = residual.sum()
-        if total <= 0:
+        if total <= 0 or not np.isfinite(total):
             raise ValueError("Cannot build residual distribution from empty target")
         return residual / total
 
     residual = np.maximum(np.asarray(target_p) - np.asarray(draft_q), 0.0)
     total = residual.sum()
-    if total <= 0:
+    if total <= 0 or not np.isfinite(total):
         residual = np.asarray(target_p, dtype=np.float64).copy()
         total = residual.sum()
-    if total <= 0:
+    if total <= 0 or not np.isfinite(total):
         raise ValueError("Cannot build residual distribution from empty target")
     return residual / total
 
