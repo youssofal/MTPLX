@@ -48,6 +48,59 @@ def is_mtp_key(key: str) -> bool:
     return any(text.startswith(prefix) for prefix in MTP_KEY_PREFIXES)
 
 
+def _num_mtp_layers(config: dict[str, Any]) -> int:
+    tcfg = text_config(config)
+    return int(
+        tcfg.get("mtp_num_hidden_layers")
+        or tcfg.get("num_nextn_predict_layers")
+        or config.get("num_nextn_predict_layers")
+        or 0
+    )
+
+
+def _moe_mtp_expected_key_set(config: dict[str, Any]) -> tuple[set[str], int, str]:
+    """Expected MTP keys for a Qwen3.5-MoE (bf16) MTP head.
+
+    The MoE MTP layer mirrors a Qwen3.5-MoE decoder layer: full self-attention
+    plus a SparseMoeBlock (router ``gate`` + ``num_experts`` per-expert MLPs and
+    a ``shared_expert`` / ``shared_expert_gate``). Experts are stored one tensor
+    per expert in the sidecar, so the expected count scales with ``num_experts``
+    instead of the dense head's fixed 15.
+    """
+    tcfg = text_config(config)
+    num_experts = int(tcfg.get("num_experts") or 0)
+    n_layers = max(_num_mtp_layers(config), 1)
+    keys: set[str] = {
+        "mtp.fc.weight",
+        "mtp.norm.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+    }
+    for li in range(n_layers):
+        base = f"mtp.layers.{li}"
+        keys.update(
+            {
+                f"{base}.input_layernorm.weight",
+                f"{base}.post_attention_layernorm.weight",
+                f"{base}.self_attn.q_proj.weight",
+                f"{base}.self_attn.k_proj.weight",
+                f"{base}.self_attn.v_proj.weight",
+                f"{base}.self_attn.o_proj.weight",
+                f"{base}.self_attn.q_norm.weight",
+                f"{base}.self_attn.k_norm.weight",
+                f"{base}.mlp.gate.weight",
+                f"{base}.mlp.shared_expert.gate_proj.weight",
+                f"{base}.mlp.shared_expert.up_proj.weight",
+                f"{base}.mlp.shared_expert.down_proj.weight",
+                f"{base}.mlp.shared_expert_gate.weight",
+            }
+        )
+        for e in range(num_experts):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                keys.add(f"{base}.mlp.experts.{e}.{proj}.weight")
+    return keys, len(keys), "bf16-moe"
+
+
 def _mtp_expected_key_set(
     config: dict[str, Any],
     *,
@@ -55,6 +108,8 @@ def _mtp_expected_key_set(
 ) -> tuple[set[str], int, str]:
     mtp_quant = config.get("mtplx_mtp_quantization", {})
     prequantized = isinstance(mtp_quant, dict) and bool(mtp_quant.get("prequantized"))
+    if not prequantized and int(text_config(config).get("num_experts") or 0) > 0:
+        return _moe_mtp_expected_key_set(config)
     quant_policy = str(mtp_quant.get("policy") or "") if isinstance(mtp_quant, dict) else ""
     normalized = {normalize_mtp_key(key) for key in keys}
     if prequantized and quant_policy == "all":

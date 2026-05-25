@@ -246,6 +246,66 @@ def test_all_prequantized_mtp_sidecar_accepts_quantized_fc_tensors(tmp_path):
     assert result.compatibility["recommended_profile"] == "performance-cold"
 
 
+def test_qwen3_5_moe_mtp_sidecar_passes_moe_tensor_gate(tmp_path):
+    num_experts = 4
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                "model_type": "qwen3_5_moe",
+                "text_config": {
+                    "model_type": "qwen3_5_moe_text",
+                    "mtp_num_hidden_layers": 1,
+                    "num_experts": num_experts,
+                    "hidden_size": 256,
+                    "num_hidden_layers": 8,
+                    "vocab_size": 1000,
+                },
+                "mlx_lm_extra_tensors": {"mtp_file": "mtp.safetensors"},
+            }
+        )
+    )
+    base = "mtp.layers.0"
+    keys = {
+        "mtp.fc.weight",
+        "mtp.norm.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+        f"{base}.input_layernorm.weight",
+        f"{base}.post_attention_layernorm.weight",
+        f"{base}.self_attn.q_proj.weight",
+        f"{base}.self_attn.k_proj.weight",
+        f"{base}.self_attn.v_proj.weight",
+        f"{base}.self_attn.o_proj.weight",
+        f"{base}.self_attn.q_norm.weight",
+        f"{base}.self_attn.k_norm.weight",
+        f"{base}.mlp.gate.weight",
+        f"{base}.mlp.shared_expert.gate_proj.weight",
+        f"{base}.mlp.shared_expert.up_proj.weight",
+        f"{base}.mlp.shared_expert.down_proj.weight",
+        f"{base}.mlp.shared_expert_gate.weight",
+    }
+    for e in range(num_experts):
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            keys.add(f"{base}.mlp.experts.{e}.{proj}.weight")
+    save_file(
+        {key: np.ones((1,), dtype=np.float32) for key in keys},
+        tmp_path / "mtp.safetensors",
+    )
+
+    result = inspect_model(tmp_path)
+    assert result.mtp is not None
+    assert result.mtp.sidecar_format == "bf16-moe"
+    # 4 global + 13 per-layer structural + 3 projections per expert.
+    assert result.mtp.tensor_count == 4 + 13 + 3 * num_experts
+    assert result.mtp.missing_expected_keys == ()
+    assert result.mtp.extra_keys == ()
+    assert result.mtp.passes_tensor_gate is True
+    assert result.passes_primary_gate is True
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["arch_id"] == "qwen3-next-mtp"
+
+
 def test_qwen_mtp_without_runtime_contract_is_family_runnable(monkeypatch, tmp_path):
     from mtplx import artifacts
     from mtplx.artifacts import MTPInspection

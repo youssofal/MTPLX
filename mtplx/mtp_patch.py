@@ -113,6 +113,45 @@ def _quantize_mtp_module(mtp: Any, contract: MTPContract) -> None:
     nn.quantize(mtp, class_predicate=predicate)
 
 
+def _stack_mtp_moe_experts(
+    weights: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """Stack per-expert MTP MLP weights into SwitchGLU (``switch_mlp``) layout.
+
+    Qwen3.5-MoE ships an MoE MTP head whose experts are stored one tensor per
+    expert (``layers.{i}.mlp.experts.{e}.{proj}.{leaf}``), but mlx-lm's
+    ``SparseMoeBlock`` expects a single stacked tensor per projection
+    (``layers.{i}.mlp.switch_mlp.{proj}.{leaf}`` of shape ``[num_experts, ...]``).
+    This mirrors the stacking mlx-lm performs for the main decoder layers.
+
+    No-op for dense MTP heads (``num_experts <= 0`` or no per-expert keys), so
+    the existing Qwen3-Next dense path is unaffected.
+    """
+    tcfg = text_config(config)
+    num_experts = int(tcfg.get("num_experts") or 0)
+    if num_experts <= 0:
+        return weights
+
+    import mlx.core as mx
+
+    n_layers = max(_num_mtp_layers(config), 1)
+    for li in range(n_layers):
+        prefix = f"layers.{li}.mlp"
+        if f"{prefix}.experts.0.gate_proj.weight" not in weights:
+            continue
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            for leaf in ("weight", "scales", "biases"):
+                if f"{prefix}.experts.0.{proj}.{leaf}" not in weights:
+                    continue
+                stacked = [
+                    weights.pop(f"{prefix}.experts.{e}.{proj}.{leaf}")
+                    for e in range(num_experts)
+                ]
+                weights[f"{prefix}.switch_mlp.{proj}.{leaf}"] = mx.stack(stacked, axis=0)
+    return weights
+
+
 def _finalize_mtp_weights(
     raw_mtp: dict[str, Any],
     config: dict[str, Any],
@@ -137,7 +176,7 @@ def _finalize_mtp_weights(
             if value.ndim == 1 and any(key.endswith(suffix) for suffix in _RMSNORM_SUFFIXES):
                 if float(value.mean().item()) < 0.5:
                     weights[key] = value + 1.0
-        return weights
+        return _stack_mtp_moe_experts(weights, config)
 
     weights: dict[str, Any] = {}
     processed: set[str] = set()
@@ -165,7 +204,7 @@ def _finalize_mtp_weights(
         if value.ndim == 1 and any(key.endswith(suffix) for suffix in _RMSNORM_SUFFIXES):
             if float(value.mean().item()) < 0.5:
                 weights[key] = value + 1.0
-    return weights
+    return _stack_mtp_moe_experts(weights, config)
 
 
 def _strip_mtp_namespace(key: str) -> str:
