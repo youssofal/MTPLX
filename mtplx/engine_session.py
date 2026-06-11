@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import secrets
 import subprocess
 import sys
 import time
@@ -178,6 +179,13 @@ def token_hash_short(token_ids: list[int] | tuple[int, ...]) -> str:
 
 def hash_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+IMPLICIT_SESSION_SOURCES = frozenset({"longest_prefix", "pending_postcommit_near_prefix"})
+
+
+def _new_anon_session_id() -> str:
+    return f"anon-{secrets.token_hex(8)}"
 
 
 def common_prefix_len(left: list[int] | tuple[int, ...], right: list[int] | tuple[int, ...]) -> int:
@@ -666,20 +674,28 @@ class EngineSession:
         record.mark_finished(outcome)
         return outcome
 
-    @contextmanager
-    def in_flight_generation(self) -> Iterator["EngineSession"]:
+    def try_begin_generation(self) -> bool:
         if not self._lock.acquire(blocking=False):
-            raise EngineSessionBusy(f"session {self.session_id} is already in flight")
+            return False
         self.in_flight = True
         self.in_flight_started_s = time.time()
         self.touch()
+        return True
+
+    def end_generation(self) -> None:
+        self.in_flight = False
+        self.in_flight_started_s = None
+        self.touch()
+        self._lock.release()
+
+    @contextmanager
+    def in_flight_generation(self) -> Iterator["EngineSession"]:
+        if not self.try_begin_generation():
+            raise EngineSessionBusy(f"session {self.session_id} is already in flight")
         try:
             yield self
         finally:
-            self.in_flight = False
-            self.in_flight_started_s = None
-            self.touch()
-            self._lock.release()
+            self.end_generation()
 
     def commit(
         self,
@@ -980,7 +996,7 @@ class EngineSessionManager:
             self.last_prefix_diagnostic = self._prefix_diagnostic(prompt_ids)
         else:
             self.last_prefix_diagnostic = None
-        return f"anon-{hash_text(str(time.time_ns()))}", "new"
+        return _new_anon_session_id(), "new"
 
     def get_or_create(self, session_id: str) -> EngineSession:
         with self._lock:
@@ -991,10 +1007,36 @@ class EngineSessionManager:
             session.touch()
             return session
 
+    def _sessions_snapshot(self) -> list[EngineSession]:
+        with self._lock:
+            return list(self._sessions.values())
+
+    @contextmanager
+    def generation_slot(
+        self,
+        session: EngineSession,
+        *,
+        source: str | None = None,
+    ) -> Iterator[EngineSession]:
+        acquired = session
+        if not session.try_begin_generation():
+            if str(source or "") not in IMPLICIT_SESSION_SOURCES:
+                raise EngineSessionBusy(
+                    f"session {session.session_id} is already in flight"
+                )
+            while True:
+                acquired = self.get_or_create(_new_anon_session_id())
+                if acquired.try_begin_generation():
+                    break
+        try:
+            yield acquired
+        finally:
+            acquired.end_generation()
+
     def longest_prefix_session(self, token_ids: list[int] | tuple[int, ...]) -> EngineSession | None:
         tokens = tuple(int(token) for token in token_ids)
         best: EngineSession | None = None
-        for session in self._sessions.values():
+        for session in self._sessions_snapshot():
             prefix = session.committed_token_ids
             if not prefix:
                 continue
@@ -1029,7 +1071,7 @@ class EngineSessionManager:
         best_matched = 0
         block_size = _prefix_block_size()
         block_min_match = max(block_size, _block_prefix_min_match_tokens())
-        for session in self._sessions.values():
+        for session in self._sessions_snapshot():
             if not session.has_pending_postcommit():
                 continue
             prefix = session.committed_token_ids
@@ -1066,7 +1108,7 @@ class EngineSessionManager:
         tokens = tuple(int(token) for token in token_ids)
         best: EngineSession | None = None
         best_len = 0
-        for session in self._sessions.values():
+        for session in self._sessions_snapshot():
             prefix = session.committed_token_ids
             if not prefix:
                 continue
@@ -1155,7 +1197,7 @@ class EngineSessionManager:
     def list_sessions(self) -> dict[str, Any]:
         self.evict_stale()
         sessions = sorted(
-            (session.to_admin_dict() for session in self._sessions.values()),
+            (session.to_admin_dict() for session in self._sessions_snapshot()),
             key=lambda row: row["last_access_s"],
             reverse=True,
         )

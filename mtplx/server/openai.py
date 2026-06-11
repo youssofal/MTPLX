@@ -19068,6 +19068,19 @@ def create_app(state: ServerState) -> FastAPI:
                             nonstream_stop_monitor.matched_stop or ""
                         )
 
+        def adopt_forked_session(acquired_session: Any) -> None:
+            nonlocal session, session_id, session_keep_live_ref
+            if acquired_session is session:
+                return
+            session = acquired_session
+            session_id = session.session_id
+            session_keep_live_ref = False
+            request_observability["request_session_forked_busy"] = True
+            request_observability["request_session_keep_live_ref"] = False
+            request_observability["request_session_keep_live_ref_reason"] = (
+                "forked_busy_session"
+            )
+
         def run_generation_for_response() -> dict[str, Any]:
             if session is None:
                 return attach_response_observability(
@@ -19102,7 +19115,10 @@ def create_app(state: ServerState) -> FastAPI:
                         streaming_response=False,
                     )
                 )
-            with session.in_flight_generation():
+            with state.sessions.generation_slot(
+                session, source=session_source
+            ) as acquired_session:
+                adopt_forked_session(acquired_session)
                 generated_result = _run_generation_dispatched(
                     state,
                     prompt_ids,
@@ -20138,7 +20154,10 @@ def create_app(state: ServerState) -> FastAPI:
                                 generated
                             )
                         else:
-                            with session.in_flight_generation():
+                            with state.sessions.generation_slot(
+                                session, source=session_source
+                            ) as acquired_session:
+                                adopt_forked_session(acquired_session)
                                 generated = _run_generation_dispatched(
                                     state,
                                     prompt_ids,
