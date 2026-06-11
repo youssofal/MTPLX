@@ -23,7 +23,7 @@ jobs:
   build-artifacts:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v6.0.3
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
       - name: Validate PyPI publish ref
