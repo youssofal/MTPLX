@@ -23457,6 +23457,8 @@ def main(argv: list[str] | None = None) -> None:
             _startup_line(
                 "warning: --launch-hermes was set but no Hermes command was provided."
             )
+    import uvicorn as _uvicorn_mod
+    _uvicorn_mod.Server.handle_exit = lambda self, sig, frame: os._exit(0)
     uvicorn.run(
         app, host=args.host, port=args.port, log_level="warning", access_log=False
     )
