@@ -21,6 +21,12 @@ from .state import (
     preset_config,
 )
 
+# Upper bound on how many finished RequestState objects the scheduler keeps
+# around for deduplication. The monotonic ``finished_total`` counter tracks the
+# true count, so a long-running server does not accumulate every finished
+# request forever.
+_DEFAULT_MAX_FINISHED_RETAINED = 4096
+
 
 @dataclass(frozen=True)
 class BatchSchedulerConfig:
@@ -151,7 +157,11 @@ class MTPContinuousScheduler:
         self.prefill: deque[RequestState] = deque()
         self.decode_ready: deque[RequestState] = deque()
         self.postcommit: deque[RequestState] = deque()
-        self.finished: list[RequestState] = []
+        # Keyed by request_id so deduplication is O(1) and retention is bounded
+        # (see ``_record_finished``). ``finished_total`` keeps the true count.
+        self.finished: dict[str, RequestState] = {}
+        self.finished_total = 0
+        self.max_finished_retained = _DEFAULT_MAX_FINISHED_RETAINED
         self.stats = BatchSchedulerStats()
 
     def submit(self, request: RequestState) -> None:
@@ -208,7 +218,8 @@ class MTPContinuousScheduler:
             "prefill": len(self.prefill),
             "decode_ready": len(self.decode_ready),
             "postcommit": len(self.postcommit),
-            "finished": len(self.finished),
+            "finished": self.finished_total,
+            "finished_retained": len(self.finished),
             "requests": [request.to_dict() for request in self.active.values()],
         }
 
@@ -227,7 +238,7 @@ class MTPContinuousScheduler:
             request = self.waiting.popleft()
             if request.cancel_event.is_set():
                 request.cancel()
-                self.finished.append(request)
+                self._record_finished(request)
                 continue
             decision = self.admission.decide(
                 request,
@@ -318,8 +329,26 @@ class MTPContinuousScheduler:
             self.stats.failed += 1
         else:
             self.stats.completed += 1
-        if not any(existing is request for existing in self.finished):
-            self.finished.append(request)
+        self._record_finished(request)
+
+    def _record_finished(self, request: RequestState) -> None:
+        """Record a request as finished, exactly once.
+
+        A request can reach a terminal state through either the normal finish
+        path or cancellation draining, so this must be idempotent. Keying the
+        finished set by ``request_id`` makes the dedup check O(1) instead of the
+        former O(n) identity scan over every previously finished request (which
+        made a long-running session O(n**2) in the number of requests). The set
+        is bounded so retained state does not grow without limit; the monotonic
+        ``finished_total`` counter still reflects the true count.
+        """
+        if request.request_id in self.finished:
+            return
+        self.finished_total += 1
+        self.finished[request.request_id] = request
+        while len(self.finished) > self.max_finished_retained:
+            oldest_id = next(iter(self.finished))
+            del self.finished[oldest_id]
 
     def _purge_terminal_queues(self) -> None:
         self.prefill = deque(request for request in self.prefill if not request.is_terminal)

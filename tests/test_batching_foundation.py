@@ -171,3 +171,43 @@ def test_cooperative_scheduler_cancellation_finishes_once():
     assert request.phase == RequestPhase.CANCELLED
     assert len(scheduler.finished) == 1
     assert scheduler.snapshot()["stats"]["cancelled"] == 1
+
+
+def test_finished_tracking_is_bounded_but_total_is_exact():
+    hooks = FakeHooks()
+    config = BatchSchedulerConfig(
+        mode=SchedulerMode.AR_BATCH,
+        preset=SchedulerPreset.AGENT,
+        max_active_requests=4,
+        decode_batch_max=4,
+        prefill_chunk_tokens=8,
+    )
+    scheduler = MTPContinuousScheduler(config=config, hooks=hooks)
+    scheduler.max_finished_retained = 8
+
+    total = 50
+    for i in range(total):
+        scheduler.submit(RequestState(f"r{i}", prompt_ids=[i, i + 1], max_tokens=1))
+    scheduler.run_until_idle()
+
+    # Retained finished state stays bounded instead of growing with every
+    # request, but the reported total remains exact.
+    assert len(scheduler.finished) <= 8
+    assert scheduler.finished_total == total
+    snapshot = scheduler.snapshot()
+    assert snapshot["finished"] == total
+    assert snapshot["finished_retained"] <= 8
+
+
+def test_record_finished_is_idempotent_per_request():
+    hooks = FakeHooks()
+    config = BatchSchedulerConfig(mode=SchedulerMode.SERIAL, preset=SchedulerPreset.LATENCY)
+    scheduler = MTPContinuousScheduler(config=config, hooks=hooks)
+    request = RequestState("r1", prompt_ids=[1, 2], max_tokens=1)
+
+    scheduler._record_finished(request)
+    scheduler._record_finished(request)
+
+    assert scheduler.finished_total == 1
+    assert len(scheduler.finished) == 1
+    assert scheduler.snapshot()["finished"] == 1
