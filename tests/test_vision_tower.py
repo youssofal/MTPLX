@@ -8,9 +8,10 @@ import json
 import mlx.core as mx
 import numpy as np
 import pytest
+from mlx.utils import tree_flatten
 from PIL import Image
 
-from mtplx.vision import vision_spec_for_model_dir
+from mtplx.vision import load_vision_tower, vision_spec_for_model_dir
 from mtplx.vision.processing import (
     MAX_IMAGE_BYTES,
     decode_image,
@@ -208,6 +209,89 @@ def test_vision_spec_populated(tmp_path):
     assert spec.patch_size == 16
     assert spec.temporal_patch_size == 2
     assert spec.out_hidden_size == 5120
+
+
+# --- qwen3_5_moe checkpoints store the vision tower under model.visual.*
+#     rather than vision_tower.* ----------------------------------------------
+
+_QWEN3_5_MOE_VISION_CONFIG = {
+    "model_type": "qwen3_5_moe",
+    "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+    "image_token_id": 248056,
+    "video_token_id": 248057,
+    "vision_start_token_id": 248053,
+    "vision_end_token_id": 248054,
+    "vision_config": {
+        "model_type": "qwen3_5_moe_vision",
+        "deepstack_visual_indexes": [],
+        "depth": 2,
+        "hidden_size": 32,
+        "intermediate_size": 64,
+        "out_hidden_size": 32,
+        "num_heads": 2,
+        "patch_size": 16,
+        "spatial_merge_size": 2,
+        "temporal_patch_size": 2,
+        "in_channels": 3,
+        "num_position_embeddings": 16,
+    },
+}
+
+
+def _write_qwen3_5_moe_fixture(model_dir, *, weights: bool) -> None:
+    """Write a qwen3_5_moe-style model dir: config.json + index (+ shards).
+
+    Vision weights are written under ``model.visual.*`` as HF's
+    Qwen3_5MoeForConditionalGeneration layout stores them, so the loader
+    must recognise that prefix rather than only ``vision_tower.*``.
+    """
+    (model_dir / "config.json").write_text(json.dumps(_QWEN3_5_MOE_VISION_CONFIG))
+    if not weights:
+        # Index-only fixture: one vision tensor + one text tensor is enough
+        # to exercise prefix detection.
+        weight_map = {
+            "model.visual.pos_embed.weight": "model.safetensors",
+            "model.embed_tokens.weight": "model.safetensors",
+        }
+        (model_dir / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": weight_map})
+        )
+        return
+
+    tower = Qwen3VLVisionTower(
+        Qwen3VLVisionConfig.from_dict(_QWEN3_5_MOE_VISION_CONFIG["vision_config"])
+    )
+    # Re-prefix every tower parameter to the HF model.visual.* layout.
+    raw = {f"model.visual.{path}": v for path, v in tree_flatten(tower.parameters())}
+    # A non-vision tensor so the shard isn't vision-only.
+    raw["model.embed_tokens.weight"] = mx.zeros((10, 32), dtype=mx.float16)
+    mx.save_safetensors(str(model_dir / "model.safetensors"), raw)
+    weight_map = {key: "model.safetensors" for key in raw}
+    (model_dir / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map})
+    )
+
+
+def test_vision_spec_detects_model_visual_prefix(tmp_path):
+    """A qwen3_5_moe index with model.visual.* keys must resolve to a spec."""
+    _write_qwen3_5_moe_fixture(tmp_path, weights=False)
+    spec = vision_spec_for_model_dir(tmp_path)
+    assert spec is not None
+    assert spec.image_token_id == 248056
+    assert spec.out_hidden_size == 32
+
+
+def test_load_vision_tower_loads_model_visual_prefix(tmp_path):
+    """load_vision_tower must load a model.visual.* checkpoint end-to-end."""
+    _write_qwen3_5_moe_fixture(tmp_path, weights=True)
+    tower = load_vision_tower(tmp_path)
+    pixel_values, grid_thw = preprocess_images(
+        [_random_image(96, 64)], TINY_PREPROCESSOR_CONFIG
+    )
+    embeddings, _ = tower(pixel_values, grid_thw)
+    mx.eval(embeddings)
+    assert embeddings.shape == (6, 32)
+    assert np.isfinite(np.array(embeddings, copy=False)).all()
 
 
 # --- splice window helpers (MTP history alignment, issue #103) --------------

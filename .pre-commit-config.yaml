@@ -1,0 +1,10 @@
+repos:
+  - repo: local
+    hooks:
+      - id: comment-block-limit
+        name: comment block ≤3 lines
+        description: Fail on 4+ consecutive comment lines (# or //).
+        entry: ./scripts/check-comment-blocks.sh
+        language: system
+        types: [text]
+        pass_filenames: true

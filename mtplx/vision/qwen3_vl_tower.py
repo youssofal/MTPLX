@@ -23,9 +23,22 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 
-VISION_TOWER_PREFIX = "vision_tower."
-
 _FUSED_SDPA_DIMS = (64, 80, 128)
+
+# Vision tower weights ship under ``vision_tower.*`` (mlx-vlm qwen3_5/3_6
+# layout) or ``model.visual.*`` (HF Qwen3_5MoeForConditionalGeneration).
+_VISION_PREFIXES = ("vision_tower.", "model.visual.")
+
+
+def resolve_vision_prefix(weight_map: dict) -> str | None:
+    """Return the checkpoint prefix the vision tower weights live under, or
+    ``None`` when the index carries no vision tower tensors (a text-only
+    checkpoint whose config.json merely inherits the architecture template).
+    """
+    for prefix in _VISION_PREFIXES:
+        if any(key.startswith(prefix) for key in weight_map):
+            return prefix
+    return None
 
 
 @dataclass
@@ -284,21 +297,21 @@ class Qwen3VLVisionTower(nn.Module):
 
         index = json.loads((model_dir / "model.safetensors.index.json").read_text())
         weight_map: dict[str, str] = index["weight_map"]
+        prefix = resolve_vision_prefix(weight_map)
+        if prefix is None:
+            raise ValueError(
+                f"{model_dir} has no vision tower tensors "
+                f"(neither vision_tower.* nor model.visual.*)"
+            )
         shards = sorted(
-            {
-                shard
-                for key, shard in weight_map.items()
-                if key.startswith(VISION_TOWER_PREFIX)
-            }
+            {shard for key, shard in weight_map.items() if key.startswith(prefix)}
         )
-        if not shards:
-            raise ValueError(f"{model_dir} has no vision_tower.* tensors")
 
         weights: dict[str, mx.array] = {}
         for shard in shards:
             for key, value in mx.load(str(model_dir / shard)).items():
-                if key.startswith(VISION_TOWER_PREFIX):
-                    weights[key[len(VISION_TOWER_PREFIX) :]] = value
+                if key.startswith(prefix):
+                    weights[key[len(prefix) :]] = value
 
         conv_key = "patch_embed.proj.weight"
         if conv_key in weights and not _conv_weight_in_mlx_layout(weights[conv_key]):
