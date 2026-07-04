@@ -6886,3 +6886,31 @@ def test_model_gate_error_lines_render_for_every_tier():
         lines = _model_gate_error_lines(inspection)
         assert lines, tier
         assert any("try:" in line for line in lines), (tier, lines)
+
+
+def test_ui_pretty_path_is_importable():
+    # Regression: ``mtplx.ui`` must export ``pretty_path``. The dashboard
+    # handoff does ``from mtplx.ui import pretty_path``, but the symbol lived
+    # in ``onboarding`` as ``_pretty_path`` and was never re-exported, so the
+    # import raised ImportError.
+    from mtplx import ui
+    from mtplx.ui import pretty_path
+
+    assert "pretty_path" in ui.__all__
+    assert pretty_path is ui.onboarding._pretty_path
+    # Behaves like the underlying helper: collapse $HOME, pass HF refs through.
+    assert pretty_path("Youssofal/Qwen3.6-27B") == "Youssofal/Qwen3.6-27B"
+    assert pretty_path(str(Path.home() / "models" / "x")) == "~/models/x"
+
+
+def test_quickstart_dashboard_handoff_does_not_crash(capsys):
+    # Regression: ``mtplx start`` reached the dashboard handoff and crashed on
+    # ``from mtplx.ui import pretty_path``. Drive the handoff directly and
+    # assert it prints the loading line with the model path instead of raising.
+    args = SimpleNamespace(host="127.0.0.1", port=8000)
+    public._quickstart_print_dashboard_handoff(
+        args, runtime_model=str(Path.home() / ".mtplx" / "models" / "demo")
+    )
+    out = capsys.readouterr().out
+    assert "Loading model: ~/.mtplx/models/demo" in out
+    assert "Dashboard URL:" in out

@@ -21,4 +21,17 @@ __all__ = [
     "render_startup_panel",
     "ChatPrinter",
     "ModelLoadProgress",
+    "pretty_path",
 ]
+
+
+def __getattr__(name: str):
+    # ``pretty_path`` lives in ``onboarding`` as ``_pretty_path``. Re-export it
+    # lazily so command handlers can ``from mtplx.ui import pretty_path``
+    # without eagerly importing the onboarding dependency chain on every
+    # ``mtplx.ui`` import (this package must stay import-cheap for fresh venvs).
+    if name == "pretty_path":
+        from .onboarding import _pretty_path
+
+        return _pretty_path
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
