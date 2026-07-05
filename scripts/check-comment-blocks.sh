@@ -32,9 +32,16 @@ check_file() {
     return 0
 }
 
-for f in "$@"; do
-    [ -f "$f" ] || continue
-    check_file "$f" || status=1
-done
+if [ $# -eq 0 ]; then
+    while IFS= read -r f; do
+        [ -f "$f" ] || continue
+        check_file "$f" || status=1
+    done
+else
+    for f in "$@"; do
+        [ -f "$f" ] || continue
+        check_file "$f" || status=1
+    done
+fi
 
 exit $status
