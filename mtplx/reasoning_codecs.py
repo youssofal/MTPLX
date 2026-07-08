@@ -409,7 +409,14 @@ class QwenThinkingContentStreamSplitter(ReasoningContentStreamSplitter):
 
     def _drain(self, *, final: bool) -> list[tuple[str, str]]:
         chunks: list[tuple[str, str]] = []
-        keep = max(len(QWEN_THINK_OPEN), len(QWEN_THINK_CLOSE)) - 1
+        # Hold back enough trailing bytes to cover the longest reasoning tag
+        # (e.g. "</reasoning>"); using only the "<think>"/"</think>" lengths
+        # let a longer alias tag split across chunks leak into visible content.
+        # Mirrors _drain_disabled's window.
+        keep = max(
+            max(len(name) for name in QWEN_STYLE_REASONING_TAG_NAMES) + len("</>"),
+            16,
+        )
         while self._pending:
             if self._inside_thinking:
                 close_match = QWEN_STYLE_REASONING_CLOSE_RE.search(self._pending)
