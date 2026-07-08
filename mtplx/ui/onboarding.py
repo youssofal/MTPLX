@@ -1143,9 +1143,23 @@ def screen_mode() -> tuple[str, bool]:
     return "sustained", False
 
 
-def screen_interface() -> str:
+def _surface_url(host: str, port: int, *, path: str = "") -> str:
+    raw_host = str(host or "").strip()
+    base = local_url_for_bind(raw_host, int(port), path=path)
+    if is_wildcard_bind(raw_host):
+        return f"{bind_label(raw_host, int(port))} · local {base}"
+    return base
+
+
+def screen_interface(
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> str:
     """Return the target string (``openwebui``, ``terminal``, ``pi``, ``opencode``, ``swival``, or ``dashboard``)."""
 
+    chat_url = _surface_url(host, port)
+    dashboard_url = _surface_url(host, port, path="/dashboard")
     _step_panel(
         step=3,
         total=3,
@@ -1153,7 +1167,7 @@ def screen_interface() -> str:
         options=[
             (
                 "1",
-                "Web UI [browser at http://127.0.0.1:8000/]",
+                f"Web UI [browser at {chat_url}/]",
                 "Markdown rendering · live tokens-per-second · inference settings sidebar.",
             ),
             (
@@ -1178,7 +1192,7 @@ def screen_interface() -> str:
             ),
             (
                 "6",
-                "Live Dashboard [browser at http://127.0.0.1:8000/dashboard]",
+                f"Live Dashboard [browser at {dashboard_url}]",
                 "Live TPS gauge · acceptance · cache · memory · fans · request log. Drive load from any client (Web UI, Pi, OpenCode, hippo).",
             ),
         ],
@@ -1204,7 +1218,13 @@ def screen_interface() -> str:
 DASHBOARD_COMPANION_TARGETS = ("openwebui", "pi", "opencode", "swival", "hermes")
 
 
-def screen_dashboard_companion(target: str, *, default: bool = False) -> bool:
+def screen_dashboard_companion(
+    target: str,
+    *,
+    default: bool = False,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> bool:
     """Offer to open the live Dashboard alongside the chosen client.
 
     Returns True iff the user picks "Yes". Only call this for targets in
@@ -1214,6 +1234,7 @@ def screen_dashboard_companion(target: str, *, default: bool = False) -> bool:
 
     if target not in DASHBOARD_COMPANION_TARGETS:
         return False
+    dashboard_url = _surface_url(host, port, path="/dashboard")
     _step_panel(
         step=4,
         total=4,
@@ -1221,7 +1242,7 @@ def screen_dashboard_companion(target: str, *, default: bool = False) -> bool:
         options=[
             (
                 "1",
-                "Yes [opens http://127.0.0.1:8000/dashboard in a second tab]",
+                f"Yes [opens {dashboard_url} in a second tab]",
                 "Live TPS gauge, acceptance, cache, memory, fans, request log. "
                 "Updates in real time while your chosen client drives load.",
             ),
@@ -1302,6 +1323,8 @@ def run_onboarding_screens(
     *,
     configured_model: str | None = None,
     open_dashboard_override: bool | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
 ) -> dict:
     """Walk all three screens and return the chosen state dict.
 
@@ -1324,7 +1347,7 @@ def run_onboarding_screens(
     if max_mode and not ensure_thermal_control_installed():
         profile = "sustained"
         max_mode = False
-    target = screen_interface()
+    target = screen_interface(host=host, port=port)
     # Only ask about the dashboard companion for targets that spawn a
     # server (openwebui/pi/opencode/swival). Terminal runs in-process with
     # no server, "dashboard" already opens the dashboard, so neither
@@ -1332,7 +1355,7 @@ def run_onboarding_screens(
     if open_dashboard_override is not None:
         open_dashboard = bool(open_dashboard_override) and target in DASHBOARD_COMPANION_TARGETS
     else:
-        open_dashboard = screen_dashboard_companion(target)
+        open_dashboard = screen_dashboard_companion(target, host=host, port=port)
     state = {
         "model": model,
         "profile": profile,
@@ -1374,7 +1397,9 @@ def run_serve_onboarding_screens(
     # "Open browser chat too" branch. For "API server only" we skip the
     # question (the user wanted minimal UI).
     open_dashboard = (
-        screen_dashboard_companion(target) if target == "openwebui" else False
+        screen_dashboard_companion(target, host=host, port=port)
+        if target == "openwebui"
+        else False
     )
     state = {
         "model": model,
@@ -1741,6 +1766,8 @@ def run_quickstart_flow(
     fresh: bool = False,
     configured_model: str | None = None,
     open_dashboard_override: bool | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
 ) -> dict | None:
     """Decide between attach, 'same as last time', or fresh onboarding.
 
@@ -1811,6 +1838,8 @@ def run_quickstart_flow(
         choice = run_onboarding_screens(
             configured_model=configured_model,
             open_dashboard_override=open_dashboard_override,
+            host=host,
+            port=port,
         )
         save_state(choice)
         _print_summary(choice)

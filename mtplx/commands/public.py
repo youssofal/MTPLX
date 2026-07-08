@@ -11982,6 +11982,8 @@ def cmd_quickstart_public(args: Any) -> int:
             fresh=fresh,
             configured_model=configured_model,
             open_dashboard_override=explicit_open_dashboard,
+            host=str(getattr(args, "host", "127.0.0.1")),
+            port=int(getattr(args, "port", 8000)),
         )
         if choice is None:
             _quickstart_line("aborted")

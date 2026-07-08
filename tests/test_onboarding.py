@@ -86,6 +86,47 @@ def test_run_onboarding_screens_with_stubbed_input(monkeypatch, capsys):
     assert state["open_dashboard"] is False
 
 
+def test_screen_interface_uses_requested_port(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def fake_step_panel(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(onboarding, "_step_panel", fake_step_panel)
+    monkeypatch.setattr(builtins, "input", lambda _prompt="": "1")
+
+    target = onboarding.screen_interface(host="127.0.0.1", port=8765)
+
+    assert target == "openwebui"
+    options = captured["options"]
+    rendered = " ".join(str(item) for option in options for item in option)
+    assert "http://127.0.0.1:8765/" in rendered
+    assert "http://127.0.0.1:8000/" not in rendered
+
+
+def test_screen_dashboard_companion_uses_requested_port(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def fake_step_panel(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(onboarding, "_step_panel", fake_step_panel)
+    monkeypatch.setattr(builtins, "input", lambda _prompt="": "1")
+
+    assert (
+        onboarding.screen_dashboard_companion(
+            "openwebui",
+            host="127.0.0.1",
+            port=8765,
+        )
+        is True
+    )
+    options = captured["options"]
+    rendered = " ".join(str(item) for option in options for item in option)
+    assert "http://127.0.0.1:8765/dashboard" in rendered
+    assert "http://127.0.0.1:8000/dashboard" not in rendered
+
+
 def test_run_onboarding_screens_uses_fp16_default_when_policy_selects_it(monkeypatch):
     monkeypatch.setenv("MTPLX_DEFAULT_MODEL_VARIANT", "fp16")
     # 4 answers: model + mode + interface (openwebui) + dashboard companion.
@@ -670,12 +711,16 @@ def test_start_invokes_onboarding_when_no_explicit_flags(tmp_path, monkeypatch):
         fresh: bool = False,
         configured_model: str | None = None,
         open_dashboard_override: bool | None = None,
+        host: str = "127.0.0.1",
+        port: int = 8000,
     ):
         invocations.append(
             {
                 "fresh": fresh,
                 "configured_model": configured_model,
                 "open_dashboard_override": open_dashboard_override,
+                "host": host,
+                "port": port,
             }
         )
         return {
@@ -762,6 +807,8 @@ def test_start_invokes_onboarding_when_no_explicit_flags(tmp_path, monkeypatch):
     assert rc == 0
     assert len(invocations) == 1
     assert invocations[0]["configured_model"] == "/some/configured/path"
+    assert invocations[0]["host"] == "127.0.0.1"
+    assert invocations[0]["port"] == 8000
     assert args._onboarded is True
     assert args.model == "mtplx/onboarded"
 
