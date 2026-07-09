@@ -6150,6 +6150,11 @@ def generate_mtpk(
     ccopy_min_ext = context_copy_min_ext()
     if ccopy_active:
         ccopy_index = NgramIndex(context_copy_ng_min(), context_copy_ng_max())
+        # Prompt-lookup semantics: the index covers the PROMPT only. Matches into
+        # the model's own generated text (self-repetition) have weak continuation
+        # predictiveness and sit below verify break-even (measured on math/boilerplate
+        # workloads); grounded re-emission always matches into the prompt.
+        ccopy_index.sync(prompt_ids)
     while len(tokens) < max_tokens:
         repetition_result = _trim_repeated_suffix(tokens, repetition_config)
         if repetition_result is not None:
@@ -6291,7 +6296,6 @@ def generate_mtpk(
         # ---- context-copy round: verbatim block from context, no MTP compute this cycle ----
         if ccopy_active and cycle_depth >= 1 and len(tokens) >= ccopy_suspend_until:
             _cc_hist = prompt_ids + tokens
-            ccopy_index.sync(_cc_hist)
             _cc_pos, _cc_ext = ccopy_index.find(_cc_hist)
             if _cc_pos is not None and _cc_ext >= ccopy_min_ext:
                 _cc_klen = block_for_ext(_cc_ext, ccopy_k)
