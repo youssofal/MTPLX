@@ -6132,9 +6132,9 @@ def generate_mtpk(
 
     step = 0
     # ---- context-copy (prompt-lookup) drafting: opt-in, greedy, capture_commit only ----
-    from .context_copy import (NgramIndex, context_copy_block_k, context_copy_enabled,
-                               context_copy_min_ext, context_copy_ng_max,
-                               context_copy_ng_min)
+    from .context_copy import (NgramIndex, block_for_ext, context_copy_block_k,
+                               context_copy_enabled, context_copy_min_ext,
+                               context_copy_ng_max, context_copy_ng_min)
     ccopy_active = (
         context_copy_enabled()
         and sampler.temperature <= 0
@@ -6291,7 +6291,8 @@ def generate_mtpk(
             ccopy_index.sync(_cc_hist)
             _cc_pos, _cc_ext = ccopy_index.find(_cc_hist)
             if _cc_pos is not None and _cc_ext >= ccopy_min_ext:
-                _cc_block = [int(t) for t in _cc_hist[_cc_pos:_cc_pos + ccopy_k]]
+                _cc_klen = block_for_ext(_cc_ext, ccopy_k)
+                _cc_block = [int(t) for t in _cc_hist[_cc_pos:_cc_pos + _cc_klen]]
                 _cc_block = _cc_block[: max(1, max_tokens - len(tokens))]
                 _cc_T = 1 + len(_cc_block)
                 started_forward = time.perf_counter()

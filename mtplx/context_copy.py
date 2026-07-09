@@ -1,6 +1,6 @@
 """Context-copy (prompt-lookup) speculative drafting for the MTP decode loop.
 
-Opt-in via MTPLX_CONTEXT_COPY=1. When the tail of (prompt + generated) tokens matches an
+Always on (kill switch: MTPLX_CONTEXT_COPY=0). When the tail of (prompt + generated) tokens matches an
 earlier n-gram, the continuation block is proposed verbatim (uncapped, K up to
 MTPLX_CONTEXT_COPY_K) and verified in one forward through the existing capture_commit
 verify path — no MTP-head compute for that round. When there is no match, the normal MTP
@@ -15,7 +15,9 @@ import os
 
 
 def context_copy_enabled() -> bool:
-    return (os.environ.get("MTPLX_CONTEXT_COPY") or "").strip() in {"1", "true", "on"}
+    """Context-copy is part of the engine (always on). MTPLX_CONTEXT_COPY=0 is an
+    emergency kill switch only; there is no opt-in flag."""
+    return (os.environ.get("MTPLX_CONTEXT_COPY") or "").strip() not in {"0", "false", "off"}
 
 
 def context_copy_block_k() -> int:
@@ -41,13 +43,23 @@ def context_copy_ng_max() -> int:
 
 def context_copy_min_ext() -> int:
     """Minimum backward match extension (beyond ng_min) required to fire a copy round.
-    Short, ng_min-only matches are common in novel generation (loops, boilerplate) and
-    have low acceptance — those rounds should stay with the MTP head. Default 2 =
-    require an (ng_min+2)-token suffix match before copying."""
+    Default 0: weak matches are allowed but propose only a SHORT block (see
+    block_for_ext), so a wrong incidental match wastes little."""
     try:
-        return max(0, int(os.environ.get("MTPLX_CONTEXT_COPY_MINEXT") or 2))
+        return max(0, int(os.environ.get("MTPLX_CONTEXT_COPY_MINEXT") or 0))
     except ValueError:
-        return 2
+        return 0
+
+
+# Confidence ladder: block length by backward match extension (0..ng_max-ng_min).
+# A longer suffix match earns a longer copy block; weak matches stay cheap.
+# Same schedule validated in the standalone prompt-lookup work (K_LADDER).
+_BLOCK_LADDER = (8, 12, 16, 24, 32)
+
+
+def block_for_ext(ext: int, k_cap: int) -> int:
+    idx = max(0, min(int(ext), len(_BLOCK_LADDER) - 1))
+    return min(_BLOCK_LADDER[idx], max(4, k_cap))
 
 
 class NgramIndex:
