@@ -6142,6 +6142,9 @@ def generate_mtpk(
     )
     ccopy_rounds = ccopy_drafted = ccopy_accepted = 0
     ccopy_ema, ccopy_seen, ccopy_suspend_until = 0.5, 0, 0
+    ccopy_backoff = 64   # doubles on each suspension (self-repetitive novel text would
+                         # otherwise re-trigger copy rounds after every backoff and pay
+                         # the probe cost recurrently); a paying round resets it.
     ccopy_index = None
     ccopy_k = context_copy_block_k()
     ccopy_min_ext = context_copy_min_ext()
@@ -6332,10 +6335,14 @@ def generate_mtpk(
                 ccopy_accepted += _cc_nacc
                 ccopy_ema = 0.7 * ccopy_ema + 0.3 * (_cc_nacc / len(_cc_block))
                 ccopy_seen += 1
+                if _cc_nacc / len(_cc_block) >= 0.5:
+                    ccopy_backoff = 64          # copy is paying again: full retry rate
                 if ccopy_seen >= 4 and ccopy_ema < 0.35:
                     # acceptance collapsed (novel region with incidental repeats):
-                    # suspend copy rounds and let the MTP head work; retry later
-                    ccopy_suspend_until = len(tokens) + 64
+                    # suspend copy rounds and let the MTP head work; retry with
+                    # exponential backoff so recurring probes stay cheap
+                    ccopy_suspend_until = len(tokens) + ccopy_backoff
+                    ccopy_backoff = min(ccopy_backoff * 2, 4096)
                     ccopy_ema, ccopy_seen = 0.5, 0
                 event["context_copy"] = {
                     "block": len(_cc_block),
