@@ -1,22 +1,25 @@
 """Context-copy (prompt-lookup) speculative drafting for the MTP decode loop.
 
-Always on (kill switch: MTPLX_CONTEXT_COPY=0). When the tail of (prompt + generated) tokens matches an
-earlier n-gram, the continuation block is proposed verbatim (uncapped, K up to
-MTPLX_CONTEXT_COPY_K) and verified in one forward through the existing capture_commit
-verify path — no MTP-head compute for that round. When there is no match, the normal MTP
-round runs unchanged. Greedy (temperature<=0) only for now.
+Enabled by default; MTPLX_CONTEXT_COPY set to 0, false, or off disables it. When the
+tail of the generated stream matches an n-gram that occurs in the PROMPT, the prompt
+continuation is proposed verbatim as a block (up to MTPLX_CONTEXT_COPY_K tokens, with
+shorter blocks for weaker matches) and verified in one forward pass through the
+existing capture-commit verify path, so the MTP head is skipped for that cycle. When
+there is no match, the normal MTP round runs unchanged. Active only for greedy
+decoding (temperature <= 0) without repetition penalties; a temperature path via
+sample-and-match verification is a possible follow-up.
 
-Rationale: MTP heads draft novel tokens well (~2x ceiling at depth<=3) but cannot open a
-long verbatim window; on grounded/agentic workloads (code edits, file re-emission, RAG)
-most output already exists in context, where block-copy verification reaches 4-8x.
-The two mechanisms compose: copy when a match exists, MTP otherwise.
+Rationale: MTP heads draft novel tokens well but commit at most mtp_depth tokens per
+step, and they cannot open a long verbatim window. On grounded workloads (code edits,
+file re-emission, RAG) most of the output already exists in the prompt, where a copy
+block can commit far more per verify call (see the benchmarks in the pull request).
+The two mechanisms compose: copy when a prompt match exists, MTP otherwise.
 """
 import os
 
 
 def context_copy_enabled() -> bool:
-    """Context-copy is part of the engine (always on). MTPLX_CONTEXT_COPY=0 is an
-    emergency kill switch only; there is no opt-in flag."""
+    """Enabled by default. MTPLX_CONTEXT_COPY set to 0, false, or off disables it."""
     return (os.environ.get("MTPLX_CONTEXT_COPY") or "").strip() not in {"0", "false", "off"}
 
 
@@ -52,8 +55,8 @@ def context_copy_min_ext() -> int:
 
 
 # Confidence ladder: block length by backward match extension (0..ng_max-ng_min).
-# A longer suffix match earns a longer copy block; weak matches stay cheap.
-# Same schedule validated in the standalone prompt-lookup work (K_LADDER).
+# A longer suffix match earns a longer copy block, so a weak match only ever
+# risks a short, cheap verify while a strong match copies a full window.
 _BLOCK_LADDER = (8, 12, 16, 24, 32)
 
 
@@ -63,7 +66,7 @@ def block_for_ext(ext: int, k_cap: int) -> int:
 
 
 class NgramIndex:
-    """Incremental ng_min-gram index over the token history: gram -> continuation
+    """ng_min-gram index, built once over the prompt at setup: gram -> continuation
     positions. find() is O(candidates) instead of an O(L) backward scan, which
     keeps the proposer off the CPU-bound path at 16-32K contexts."""
 
