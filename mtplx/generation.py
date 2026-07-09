@@ -6131,6 +6131,22 @@ def generate_mtpk(
             token_callback(new_tokens)
 
     step = 0
+    # ---- context-copy (prompt-lookup) drafting: opt-in, greedy, capture_commit only ----
+    from .context_copy import (NgramIndex, context_copy_block_k, context_copy_enabled,
+                               context_copy_min_ext, context_copy_ng_max,
+                               context_copy_ng_min)
+    ccopy_active = (
+        context_copy_enabled()
+        and sampler.temperature <= 0
+        and verify_strategy in {"capture_commit", "graphbank_capture_commit"}
+    )
+    ccopy_rounds = ccopy_drafted = ccopy_accepted = 0
+    ccopy_ema, ccopy_seen, ccopy_suspend_until = 0.5, 0, 0
+    ccopy_index = None
+    ccopy_k = context_copy_block_k()
+    ccopy_min_ext = context_copy_min_ext()
+    if ccopy_active:
+        ccopy_index = NgramIndex(context_copy_ng_min(), context_copy_ng_max())
     while len(tokens) < max_tokens:
         repetition_result = _trim_repeated_suffix(tokens, repetition_config)
         if repetition_result is not None:
@@ -6269,6 +6285,81 @@ def generate_mtpk(
         trace_current_mtp_cache = (
             mtp_cache if mtp_cache is not None else mtp_history_cache
         )
+        # ---- context-copy round: verbatim block from context, no MTP compute this cycle ----
+        if ccopy_active and cycle_depth >= 1 and len(tokens) >= ccopy_suspend_until:
+            _cc_hist = prompt_ids + tokens
+            ccopy_index.sync(_cc_hist)
+            _cc_pos, _cc_ext = ccopy_index.find(_cc_hist)
+            if _cc_pos is not None and _cc_ext >= ccopy_min_ext:
+                _cc_block = [int(t) for t in _cc_hist[_cc_pos:_cc_pos + ccopy_k]]
+                _cc_block = _cc_block[: max(1, max_tokens - len(tokens))]
+                _cc_T = 1 + len(_cc_block)
+                started_forward = time.perf_counter()
+                with attention_phase("decode_verify"):
+                    _cc_logits, _cc_hidden, _cc_captures = rt.forward_ar_capture(
+                        mx.array([[primary] + _cc_block]),
+                        cache=cache,
+                        return_hidden=True,
+                        hidden_variant=base_hidden_variant,
+                        capture_backend=verify_core_backend,
+                    )
+                _cc_g = [int(x) for x in mx.argmax(_cc_logits[0], axis=-1).tolist()]
+                elapsed_verify = time.perf_counter() - started_forward
+                verify_forward_time += elapsed_verify
+                verify_time += elapsed_verify
+                target_time += elapsed_verify
+                verify_calls += 1
+                _cc_nacc = 0
+                for _cc_d, _cc_t in zip(_cc_block, _cc_g):
+                    if _cc_d == _cc_t:
+                        _cc_nacc += 1
+                    else:
+                        break
+                _cc_m = _cc_nacc + 1
+                if _cc_nacc < len(_cc_block):
+                    from .gdn_capture import commit_captured_prefix
+                    started_commit = time.perf_counter()
+                    _cc_ok = commit_captured_prefix(
+                        cache, _cc_captures, keep_tokens=_cc_m, verified_tokens=_cc_T,
+                    )
+                    capture_commit_time += time.perf_counter() - started_commit
+                    if not _cc_ok:
+                        raise RuntimeError("context-copy: capture commit failed")
+                tokens.extend(_cc_block[:_cc_nacc])
+                ccopy_rounds += 1
+                ccopy_drafted += len(_cc_block)
+                ccopy_accepted += _cc_nacc
+                ccopy_ema = 0.7 * ccopy_ema + 0.3 * (_cc_nacc / len(_cc_block))
+                ccopy_seen += 1
+                if ccopy_seen >= 4 and ccopy_ema < 0.35:
+                    # acceptance collapsed (novel region with incidental repeats):
+                    # suspend copy rounds and let the MTP head work; retry later
+                    ccopy_suspend_until = len(tokens) + 64
+                    ccopy_ema, ccopy_seen = 0.5, 0
+                event["context_copy"] = {
+                    "block": len(_cc_block),
+                    "accepted": _cc_nacc,
+                    "extension": int(_cc_ext),
+                    "time_s": float(elapsed_verify),
+                }
+                if _mtp_history_uses_committed_cache(mtp_history_policy) and _cc_nacc > 0:
+                    _cc_committed_toks = [primary] + _cc_block[:_cc_nacc]
+                    draft_time += append_mtp_history(
+                        mtp_cache,
+                        _cc_hidden[:, : len(_cc_committed_toks) - 1, :],
+                        _cc_committed_toks[1:],
+                    )
+                logits = _cc_logits[:, _cc_m - 1, :]
+                hidden = _cc_hidden[:, _cc_m - 1:_cc_m, :]
+                events.append(event)
+                _cc_stop = next((i for i, t in enumerate(_cc_block[:_cc_nacc])
+                                 if _is_stop(int(t), stop_token_ids)), None)
+                if _cc_stop is not None:
+                    del tokens[len(tokens) - _cc_nacc + _cc_stop + 1:]
+                    break
+                emit_new_tokens()
+                step += 1
+                continue
         draft_hidden = hidden
         next_token = primary
 
