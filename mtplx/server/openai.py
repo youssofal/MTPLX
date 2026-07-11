@@ -32,6 +32,7 @@ import time
 import urllib.parse
 import uuid
 import webbrowser
+from collections import Counter
 from concurrent.futures import Future
 from contextlib import asynccontextmanager, contextmanager, nullcontext, suppress
 from dataclasses import asdict, dataclass, is_dataclass
@@ -1868,12 +1869,13 @@ class _BatchedARGenerationService:
     def _make_sampler(self, job: _BatchedARJob) -> Callable[[Any], Any]:
         import mlx.core as mx
 
-        if float(job.sampler.temperature) <= 0:
-            return lambda logprobs: mx.argmax(logprobs, axis=-1)
-        if not job.seed_is_explicit and not (
+        penalties_active = bool(
             float(getattr(job.sampler, "presence_penalty", 0.0) or 0.0)
             or float(getattr(job.sampler, "frequency_penalty", 0.0) or 0.0)
-        ):
+        )
+        if float(job.sampler.temperature) <= 0 and not penalties_active:
+            return lambda logprobs: mx.argmax(logprobs, axis=-1)
+        if not job.seed_is_explicit and not penalties_active:
             # Fast path: mlx-lm's fused GPU sampler. The numpy fallback below
             # synchronizes the full logits row to the CPU for every decode
             # step of every active sequence, which serializes the whole batch
@@ -1887,10 +1889,27 @@ class _BatchedARGenerationService:
                 top_k=int(getattr(job.sampler, "top_k", 0) or 0),
             )
         rng = np.random.default_rng(job.seed)
+        # Penalty counts must come from what THIS sampler emitted, not from
+        # job.tokens: mlx-lm's BatchGenerator is pipelined and samples t_k in
+        # the same GenerationBatch._step() that returns t_(k-1) to the pump, so
+        # job.tokens (appended in emit_token, after generator.next() returns) is
+        # always one token stale here and would leave the token just emitted
+        # unpenalized at its first opportunity. This sampler is bound to exactly
+        # one sequence and sees every token it generates, which reproduces
+        # generate_ar's per-position Counter(tokens).
+        counts: Counter[int] = Counter()
 
         def sample_one(logprobs: Any) -> Any:
-            token, _distribution = _sample_from_logits(logprobs[0], job.sampler, rng)
-            return mx.array([int(token)])
+            token, _distribution = _sample_from_logits(
+                logprobs[0],
+                job.sampler,
+                rng,
+                token_counts=counts if penalties_active else None,
+            )
+            token = int(token)
+            if penalties_active:
+                counts[token] += 1
+            return mx.array([token])
 
         return sample_one
 

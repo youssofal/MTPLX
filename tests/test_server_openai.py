@@ -604,6 +604,136 @@ def test_ar_batch_detects_nonmergeable_history_cache_entries():
     )
 
 
+def _ar_batch_serial_reference(sampler, steps, *, seed):
+    """Per-position reference: the serial generate_ar penalty loop.
+
+    Mirrors generate_ar -- Counter(tokens) is built from the completion so far
+    and the sampled token is appended only afterwards.
+    """
+    from collections import Counter
+
+    import mlx.core as mx
+    import numpy as np
+
+    from mtplx.generation import _sample_from_logits
+
+    rng = np.random.default_rng(seed)
+    tokens: list[int] = []
+    for _ in range(steps):
+        token, _ = _sample_from_logits(
+            mx.array(_AR_BATCH_STUB_LOGITS),
+            sampler,
+            rng,
+            token_counts=Counter(tokens)
+            if (sampler.presence_penalty or sampler.frequency_penalty)
+            else None,
+        )
+        tokens.append(int(token))
+    return tokens
+
+
+# Token 7 leads runner-up token 3 by exactly 1.0, so any penalty above 1.0 flips
+# the argmax on the token's second occurrence -- and only if the count is current.
+_AR_BATCH_STUB_LOGITS = [0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 5.0]
+
+
+@pytest.mark.parametrize(
+    "temperature,presence_penalty,frequency_penalty",
+    [
+        (0.0, 1.5, 0.0),
+        (0.0, 0.0, 0.6),
+        (0.8, 1.5, 0.0),
+    ],
+)
+def test_ar_batch_sampler_penalties_match_serial_generate_ar_per_position(
+    temperature, presence_penalty, frequency_penalty
+):
+    """ar_batch penalties must be per-position identical to serial generate_ar.
+
+    This drives the real mlx-lm BatchGenerator and the real pump append order
+    (openai.py: generator.next() -> job.emit_token), because that is the only
+    way to catch BOTH defects this guards:
+
+      1. penalties were a no-op on the ar_batch lane entirely (temp<=0
+         short-circuited to a bare mx.argmax; the numpy path never forwarded
+         token_counts), and
+      2. sourcing the counts from job.tokens is one token stale -- mlx-lm
+         samples t_k in the same _step() that returns t_(k-1) -- so the token
+         just emitted escapes its penalty at the one position it matters most.
+
+    Calling the sampler closure in isolation cannot see (2); only the round trip
+    through BatchGenerator + the pump's append-after-next() ordering can.
+    """
+    pytest.importorskip("mlx_lm.generate")
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx_lm.generate import BatchGenerator
+
+    from mtplx.sampling import SamplerConfig
+
+    steps = 8
+    seed = 1234
+    sampler = SamplerConfig(
+        temperature=temperature,
+        top_p=1.0,
+        top_k=0,
+        presence_penalty=presence_penalty,
+        frequency_penalty=frequency_penalty,
+    )
+    expected = _ar_batch_serial_reference(sampler, steps, seed=seed)
+
+    class _StubModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = [nn.Identity()]
+
+        def __call__(self, inputs, cache=None):
+            batch, length = inputs.shape
+            row = mx.array(_AR_BATCH_STUB_LOGITS)
+            return mx.broadcast_to(row, (batch, length, len(_AR_BATCH_STUB_LOGITS)))
+
+    service = object.__new__(openai._BatchedARGenerationService)
+    job = SimpleNamespace(sampler=sampler, seed=seed, seed_is_explicit=True, tokens=[])
+
+    # max_tokens is left above `steps` so the stub never hits mlx-lm's terminal
+    # cache extraction; the pump loop below stops the run instead.
+    generator = BatchGenerator(_StubModel(), max_tokens=steps + 5)
+    generator.insert(
+        [[1]],
+        max_tokens=[steps + 5],
+        samplers=[service._make_sampler(job)],
+    )
+    while len(job.tokens) < steps:
+        _prompt_responses, generation_responses = generator.next()
+        for response in generation_responses:
+            job.tokens.append(int(response.token))  # mirrors job.emit_token
+
+    assert job.tokens == expected
+
+
+def test_ar_batch_greedy_sampler_without_penalties_stays_on_fused_argmax():
+    """Control: with no penalty the greedy short-circuit must survive untouched.
+
+    Proves the flip in the test above is the penalty, not the plumbing, and pins
+    the fast path that penalized requests are deliberately diverted away from.
+    """
+    pytest.importorskip("mlx_lm.generate")
+    import mlx.core as mx
+
+    from mtplx.sampling import SamplerConfig
+
+    service = object.__new__(openai._BatchedARGenerationService)
+    job = SimpleNamespace(
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=0),
+        seed=1234,
+        seed_is_explicit=False,
+        tokens=[7, 7, 7],
+    )
+    sampler = service._make_sampler(job)
+    logprobs = mx.array([_AR_BATCH_STUB_LOGITS])
+    assert int(sampler(logprobs)[0].item()) == 7
+
+
 def test_long_prompt_commits_prompt_prefix_when_ssd_cache_is_enabled():
     state = SimpleNamespace(
         session_bank_cold_tier=SimpleNamespace(enabled=True, min_prefix_tokens=512)
