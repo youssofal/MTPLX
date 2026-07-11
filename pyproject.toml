@@ -14,7 +14,7 @@ authors = [{name = "Youssof Altoukhi", email = "business@youssofal.com"}]
 dependencies = [
   "fastapi>=0.136",
   "huggingface-hub>=0.36",
-  "mlx>=0.31,<0.32; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "mlx>=0.31,<0.33; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "mlx-lm>=0.31,<0.32; sys_platform == 'darwin' and platform_machine == 'arm64'",
   # transformers 5.13.0 changed AutoTokenizer.register to require a config
   # class as the key; mlx-lm 0.31.x still registers by name
