@@ -9431,6 +9431,107 @@ def test_chat_stream_tool_call_preamble_is_stored_for_postcommit(monkeypatch):
         }
 
 
+def test_chat_stream_hermes_suppresses_tool_call_preamble(monkeypatch):
+    state = _fake_streaming_session_state()
+    state.args.stream_interval = 1
+    state.args.enable_thinking = False
+    monkeypatch.setattr(
+        openai,
+        "_run_generation",
+        _fake_streaming_generation(
+            "search\n\nMac Studio M4 Max\n\n"
+            "<tool_call>\n<function=session_status>\n</function>\n</tool_call>"
+        ),
+    )
+
+    with TestClient(create_app(state)) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"x-mtplx-client": "hermes"},
+            json={
+                "messages": [{"role": "user", "content": "Status."}],
+                "tools": [_tool_schema()],
+                "tool_choice": "auto",
+                "stream": True,
+                "max_tokens": 64,
+                "enable_thinking": False,
+            },
+        )
+
+    assert response.status_code == 200
+    payloads = _stream_payloads(response.text)
+    assert any(
+        payload["choices"][0]["delta"].get("tool_calls") for payload in payloads
+    )
+    assert not any(
+        payload["choices"][0]["delta"].get("content") for payload in payloads
+    )
+    assert any(
+        payload["choices"][0].get("finish_reason") == "tool_calls"
+        for payload in payloads
+    )
+
+
+def test_chat_stream_hermes_defers_content_until_native_tool_extraction(monkeypatch):
+    state = _fake_streaming_session_state()
+    state.args.stream_interval = 1
+    state.args.enable_thinking = False
+    monkeypatch.setattr(
+        openai,
+        "_run_generation",
+        _fake_streaming_generation("search\n\nMac Studio M4 Max\n\n"),
+    )
+    monkeypatch.setattr(
+        openai,
+        "omlx_extract_tool_calls_with_thinking",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            cleaned_text="",
+            cleaned_thinking="",
+            tool_calls=[
+                {
+                    "id": "call_fact_store",
+                    "type": "function",
+                    "function": {
+                        "name": "session_status",
+                        "arguments": "{}",
+                    },
+                }
+            ],
+            parser_source="native",
+            status="parsed",
+            malformed_reason=None,
+            raw_tool_markup_suppressed=True,
+        ),
+    )
+
+    with TestClient(create_app(state)) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"x-mtplx-client": "hermes"},
+            json={
+                "messages": [{"role": "user", "content": "Status."}],
+                "tools": [_tool_schema()],
+                "tool_choice": "auto",
+                "stream": True,
+                "max_tokens": 64,
+                "enable_thinking": False,
+            },
+        )
+
+    assert response.status_code == 200
+    payloads = _stream_payloads(response.text)
+    assert any(
+        payload["choices"][0]["delta"].get("tool_calls") for payload in payloads
+    )
+    assert not any(
+        payload["choices"][0]["delta"].get("content") for payload in payloads
+    )
+    assert any(
+        payload["choices"][0].get("finish_reason") == "tool_calls"
+        for payload in payloads
+    )
+
+
 def test_chat_stream_tool_call_postcommit_strips_reasoning_content(monkeypatch):
     state = _fake_streaming_session_state()
     state.args.stream_interval = 1

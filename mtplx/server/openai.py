@@ -6472,11 +6472,13 @@ class _ToolAwareContentStreamTranslator:
         argument_chunk_chars: int,
         tokenizer: Any | None = None,
         repair_unclosed_complete: bool = True,
+        suppress_tool_call_preamble: bool = False,
     ) -> None:
         self._tools = tools
         self._argument_chunk_chars = max(1, int(argument_chunk_chars))
         self._tokenizer = tokenizer
         self._repair_unclosed_complete = bool(repair_unclosed_complete)
+        self._suppress_tool_call_preamble = bool(suppress_tool_call_preamble)
         self._marker_pairs = _tool_marker_pairs_from_tokenizer(tokenizer)
         self._pending = ""
         self._trailing = ""
@@ -6488,6 +6490,7 @@ class _ToolAwareContentStreamTranslator:
         self._suppress_remaining_tool_text = False
         self._emitted_tool_deltas = False
         self._suppressed_tool_markup = False
+        self._deferred_content = ""
 
     @property
     def has_tool_calls(self) -> bool:
@@ -6556,6 +6559,10 @@ class _ToolAwareContentStreamTranslator:
         self._mode = "done"
         self._suppress_remaining_tool_text = True
         if emitted_tool_deltas or self.tool_calls:
+            self._deferred_content = ""
+            return []
+        if self._suppress_tool_call_preamble:
+            self._deferred_content += visible_text
             return []
         return [{"content": visible_text}] if visible_text else []
 
@@ -6563,7 +6570,27 @@ class _ToolAwareContentStreamTranslator:
         visible_text = _strip_orphan_tool_control_markup(text)
         if visible_text != text:
             self._suppressed_tool_markup = True
+        if self._suppress_tool_call_preamble:
+            self._deferred_content += visible_text
+            return []
         return [{"content": visible_text}] if visible_text else []
+
+    def _flush_deferred_content(self) -> list[dict[str, Any]]:
+        content = self._deferred_content
+        self._deferred_content = ""
+        return [{"content": content}] if content else []
+
+    def resolve_deferred_content(
+        self,
+        *,
+        has_tool_calls: bool,
+    ) -> list[dict[str, Any]]:
+        if not self._suppress_tool_call_preamble:
+            return []
+        if has_tool_calls:
+            self._deferred_content = ""
+            return []
+        return self._flush_deferred_content()
 
     def feed(self, field: str, text: str) -> list[dict[str, Any]]:
         if not text:
@@ -6760,10 +6787,18 @@ class _ToolAwareContentStreamTranslator:
             return max(keep, len(text) - bracket_idx)
         return min(keep, 128)
 
-    def finish(self) -> list[dict[str, Any]]:
+    def finish(
+        self,
+        *,
+        defer_content_resolution: bool = False,
+    ) -> list[dict[str, Any]]:
         if self._mode == "tool":
             return self._tool_deltas_if_complete(final=True)
         if self._mode == "done":
+            if self._suppress_tool_call_preamble and self.tool_calls:
+                self._deferred_content = ""
+                self._trailing = ""
+                return []
             if self._suppress_remaining_tool_text:
                 self._trailing = ""
                 return []
@@ -6786,13 +6821,23 @@ class _ToolAwareContentStreamTranslator:
                 self._trailing = ""
                 self._mode = "content"
                 return self._content_delta(trailing)
-            return []
+            if defer_content_resolution and self._suppress_tool_call_preamble:
+                return []
+            return self._flush_deferred_content()
         if self._pending:
             content = self._pending
             self._pending = ""
             self._mode = "content"
-            return self._content_delta(content)
-        return []
+            deltas = self._content_delta(content)
+            if (
+                self._suppress_tool_call_preamble
+                and not defer_content_resolution
+            ):
+                deltas.extend(self._flush_deferred_content())
+            return deltas
+        if defer_content_resolution and self._suppress_tool_call_preamble:
+            return []
+        return self._flush_deferred_content()
 
     def _tool_deltas_if_complete(self, *, final: bool) -> list[dict[str, Any]]:
         if self._tool_parser is None:
@@ -6821,6 +6866,8 @@ class _ToolAwareContentStreamTranslator:
                 )
             if self._tool_parser.tool_calls:
                 self.tool_calls = (self.tool_calls or []) + self._tool_parser.tool_calls
+                if self._suppress_tool_call_preamble:
+                    self._deferred_content = ""
                 remaining = getattr(self._tool_parser, "remaining_text", "")
                 self._tool_parser = None
                 if not remaining:
@@ -6862,6 +6909,8 @@ class _ToolAwareContentStreamTranslator:
                 deltas.extend(final_deltas)
             if self._tool_parser.tool_calls:
                 self.tool_calls = (self.tool_calls or []) + self._tool_parser.tool_calls
+                if self._suppress_tool_call_preamble:
+                    self._deferred_content = ""
                 remaining = getattr(self._tool_parser, "remaining_text", "")
                 self._tool_parser = None
                 if not remaining:
@@ -6899,6 +6948,8 @@ class _ToolAwareContentStreamTranslator:
             self._tool_parser = None
             if buffered.tool_calls:
                 self.tool_calls = (self.tool_calls or []) + buffered.tool_calls
+                if self._suppress_tool_call_preamble:
+                    self._deferred_content = ""
                 self._mode = "done"
                 if any(delta.get("tool_calls") for delta in buffered_deltas):
                     self._emitted_tool_deltas = True
@@ -6933,6 +6984,8 @@ class _ToolAwareContentStreamTranslator:
         self._tool_parser = None
         if buffered.tool_calls:
             self.tool_calls = (self.tool_calls or []) + buffered.tool_calls
+            if self._suppress_tool_call_preamble:
+                self._deferred_content = ""
             self._mode = "done"
             return buffered_deltas
         if buffered.fallback_reason:
@@ -12922,6 +12975,15 @@ def _is_opencode_client(
 ) -> bool:
     client_hint = str(_request_client_hint_from_headers(headers, metadata) or "")
     return "opencode" in client_hint
+
+
+def _is_hermes_client(
+    *,
+    headers: Mapping[str, str],
+    metadata: Mapping[str, Any],
+) -> bool:
+    client_hint = str(_request_client_hint_from_headers(headers, metadata) or "")
+    return "hermes" in client_hint
 
 
 def _request_tool_prompt_mode_override(
@@ -20741,6 +20803,10 @@ def create_app(state: ServerState) -> FastAPI:
                         repair_unclosed_complete=(
                             str(raw_request.url.path or "") != "/v1/messages"
                         ),
+                        suppress_tool_call_preamble=_is_hermes_client(
+                            headers=headers,
+                            metadata=metadata,
+                        ),
                     )
                     # Forced final-answer turns stream sanitized visible text
                     # through the buffered marker path; the tool-call
@@ -22149,14 +22215,19 @@ def create_app(state: ServerState) -> FastAPI:
                         )
                     return chunks
 
-                def finish_translated_stream_chunks() -> list[str]:
+                def finish_translated_stream_chunks(
+                    *,
+                    defer_content_resolution: bool = False,
+                ) -> list[str]:
                     nonlocal streamed_assistant_tool_calls
                     nonlocal streamed_tool_deltas_emitted
                     chunks: list[str] = []
                     if early_tool_cancel_used and streamed_assistant_tool_calls:
                         return chunks
                     if content_tool_translator is not None:
-                        for delta in content_tool_translator.finish():
+                        for delta in content_tool_translator.finish(
+                            defer_content_resolution=defer_content_resolution,
+                        ):
                             if not delta:
                                 continue
                             if "content" in delta or "reasoning_content" in delta:
@@ -22543,7 +22614,9 @@ def create_app(state: ServerState) -> FastAPI:
                                             monitor_stop=False,
                                         ):
                                             yield mark_sse_sent(chunk)
-                                for chunk in finish_translated_stream_chunks():
+                                for chunk in finish_translated_stream_chunks(
+                                    defer_content_resolution=True,
+                                ):
                                     yield mark_sse_sent(chunk)
                             raw_generated_text = _strip_mtplx_internal_continuation_markers(
                                 _strip_generated_chat_template_sentinels(
@@ -22575,6 +22648,14 @@ def create_app(state: ServerState) -> FastAPI:
                             assistant_tool_calls = streamed_assistant_tool_calls or (
                                 extraction.tool_calls if extraction is not None else None
                             )
+                            if content_tool_translator is not None:
+                                for delta in (
+                                    content_tool_translator.resolve_deferred_content(
+                                        has_tool_calls=bool(assistant_tool_calls),
+                                    )
+                                ):
+                                    remember_stream_delta(delta)
+                                    yield mark_sse_sent(delta_payload_chunk(delta))
                             stats = generated.setdefault("stats", {})
                             stats["openai_bridge_mode"] = "omlx_style"
                             stats["legacy_bridge_used"] = False

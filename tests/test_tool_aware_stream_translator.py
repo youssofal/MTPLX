@@ -123,11 +123,12 @@ OPENCODE_QUESTIONS_TOOL_SPECS = [
 ]
 
 
-def _make(*, tools=TOOL_SPECS, tokenizer=None):
+def _make(*, tools=TOOL_SPECS, tokenizer=None, suppress_tool_call_preamble=False):
     return _ToolAwareContentStreamTranslator(
         tools=tools,
         argument_chunk_chars=64,
         tokenizer=tokenizer,
+        suppress_tool_call_preamble=suppress_tool_call_preamble,
     )
 
 
@@ -256,6 +257,33 @@ def test_mixed_text_then_tool_call_streamed_in_pieces():
     all_deltas.extend(t.finish())
     assert t.has_tool_calls is True
     assert any("tool_calls" in d for d in all_deltas)
+
+
+def test_hermes_mode_suppresses_preamble_when_turn_contains_tool_calls():
+    """Hermes renders streamed content immediately, so internal tool-plan labels
+    must not be emitted as visible text alongside structured tool calls."""
+    t = _make(suppress_tool_call_preamble=True)
+
+    assert t.feed("content", "search\n\nMac Studio M4 Max\n\n") == []
+    out = t.feed(
+        "content",
+        "<tool_call>\n<function=lookup>\n"
+        "<parameter=q>\nMac Studio M4 Max\n</parameter>\n"
+        "</function>\n</tool_call>",
+    )
+    out.extend(t.finish())
+
+    assert t.has_tool_calls is True
+    assert any("tool_calls" in delta for delta in out)
+    assert _content_text(out) == ""
+
+
+def test_hermes_mode_releases_buffer_for_genuine_text_only_turn():
+    t = _make(suppress_tool_call_preamble=True)
+
+    assert t.feed("content", "A normal ") == []
+    assert t.feed("content", "answer.") == []
+    assert t.finish() == [{"content": "A normal answer."}]
 
 
 def test_partial_marker_held_across_chunks_in_content_mode():
