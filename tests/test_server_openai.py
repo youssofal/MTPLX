@@ -604,6 +604,74 @@ def test_ar_batch_detects_nonmergeable_history_cache_entries():
     )
 
 
+def _ar_batch_sample_once(job) -> int:
+    """Run one decode step of the ar_batch sampler for ``job`` and return the token.
+
+    Mirrors how ``BatchGenerator`` calls the per-job sampler: a single-row
+    ``[1, vocab]`` logits batch in, one token id out. Token 0 leads token 1 by
+    exactly 1.0, so a presence_penalty of 2.0 (5.0 -> 3.0) flips the winner to
+    token 1 once token 0 has appeared in the completion.
+    """
+    mx = pytest.importorskip("mlx.core")
+    service = object.__new__(openai._BatchedARGenerationService)
+    sampler = service._make_sampler(job)
+    logits = mx.array([[5.0, 4.0, 0.0, 0.0]])
+    return int(sampler(logits)[0])
+
+
+def test_ar_batch_sampler_applies_penalty_in_hot_sampling_path():
+    # temperature > 0 with a penalty set routes through ``sample_one``. top_k=1
+    # collapses the (penalized) distribution to a deterministic argmax, so the
+    # completion token counts are the only thing that can move the result.
+    from mtplx.sampling import SamplerConfig
+
+    cfg = SamplerConfig(temperature=1.0, top_p=1.0, top_k=1, presence_penalty=2.0)
+    seen = SimpleNamespace(sampler=cfg, seed=0, seed_is_explicit=True, tokens=[0, 0, 0])
+    unseen = SimpleNamespace(sampler=cfg, seed=0, seed_is_explicit=True, tokens=[])
+
+    # token 0 already emitted -> penalty demotes it below token 1.
+    assert _ar_batch_sample_once(seen) == 1
+    # nothing emitted yet -> penalty is a no-op, token 0 still wins.
+    assert _ar_batch_sample_once(unseen) == 0
+
+
+def test_ar_batch_sampler_applies_penalty_in_greedy_path():
+    # temperature <= 0 is greedy, but a penalty must still be honoured before
+    # the argmax (the serial/MTP paths do). The seen token is demoted below its
+    # rival exactly as in the hot path.
+    from mtplx.sampling import SamplerConfig
+
+    cfg = SamplerConfig(temperature=0.0, top_p=1.0, top_k=0, presence_penalty=2.0)
+    seen = SimpleNamespace(sampler=cfg, seed=0, seed_is_explicit=False, tokens=[0, 0, 0])
+    unseen = SimpleNamespace(sampler=cfg, seed=0, seed_is_explicit=False, tokens=[])
+
+    assert _ar_batch_sample_once(seen) == 1
+    assert _ar_batch_sample_once(unseen) == 0
+
+
+def test_ar_batch_sampler_penalty_free_paths_are_unchanged():
+    # With no penalty set, both the greedy and the temperature>0 fast paths must
+    # keep their prior byte-identical argmax behaviour (token 0 wins), so the
+    # penalty wiring cannot regress the common no-penalty case.
+    from mtplx.sampling import SamplerConfig
+
+    greedy = SimpleNamespace(
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=0),
+        seed=0,
+        seed_is_explicit=False,
+        tokens=[0, 0, 0],
+    )
+    hot = SimpleNamespace(
+        sampler=SamplerConfig(temperature=1.0, top_p=1.0, top_k=1),
+        seed=0,
+        seed_is_explicit=False,
+        tokens=[0, 0, 0],
+    )
+
+    assert _ar_batch_sample_once(greedy) == 0
+    assert _ar_batch_sample_once(hot) == 0
+
+
 def test_long_prompt_commits_prompt_prefix_when_ssd_cache_is_enabled():
     state = SimpleNamespace(
         session_bank_cold_tier=SimpleNamespace(enabled=True, min_prefix_tokens=512)
