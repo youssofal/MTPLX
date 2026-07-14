@@ -1896,7 +1896,9 @@ class _BatchedARGenerationService:
         # always one token stale here and would leave the token just emitted
         # unpenalized at its first opportunity. This sampler is bound to exactly
         # one sequence and sees every token it generates, which reproduces
-        # generate_ar's per-position Counter(tokens).
+        # generate_ar's per-position Counter(tokens). That same pipelining also
+        # samples one token past the last delivered one; it is counted here but
+        # never read, because the row leaves the batch in the same next().
         counts: Counter[int] = Counter()
 
         def sample_one(logprobs: Any) -> Any:

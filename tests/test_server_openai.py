@@ -734,6 +734,92 @@ def test_ar_batch_greedy_sampler_without_penalties_stays_on_fused_argmax():
     assert int(sampler(logprobs)[0].item()) == 7
 
 
+def test_ar_batch_sampler_stays_bound_to_its_own_sequence_when_a_row_finishes():
+    """A row finishing mid-batch must not shift its penalty counts onto another.
+
+    Each sampler owns a private counter, so correctness rests on mlx-lm keeping
+    `samplers` index-aligned with `uids` when it compacts a finished sequence out
+    of the batch (GenerationBatch.filter). That is an mlx-lm implementation
+    detail, not an API contract -- if a version bump ever broke the alignment,
+    one request's penalty histogram would silently start driving another's
+    tokens. The single-sequence test above cannot see that; this one can.
+
+    The two rows use DIFFERENT penalty kinds (presence vs frequency), which
+    produce different token streams from the same logits, and the short row is
+    given a smaller max_tokens so it terminates first and forces the compaction.
+    The survivor must still reproduce its own serial reference.
+    """
+    pytest.importorskip("mlx_lm.generate")
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx_lm.generate import BatchGenerator
+
+    from mtplx.sampling import SamplerConfig
+
+    seed = 1234
+    short_steps, long_steps = 3, 9
+    short_sampler = SamplerConfig(
+        temperature=0.0, top_p=1.0, top_k=0, presence_penalty=1.5
+    )
+    long_sampler = SamplerConfig(
+        temperature=0.0, top_p=1.0, top_k=0, frequency_penalty=0.6
+    )
+    expected_long = _ar_batch_serial_reference(long_sampler, long_steps, seed=seed)
+
+    class _Layer(nn.Module):
+        pass
+
+    class _StubModel(nn.Module):
+        """Constant-logit stub that still writes KV entries.
+
+        Unlike the single-sequence test, a row terminates here, so mlx-lm runs
+        cache.filter() on the compaction -- which needs real cache state.
+        """
+
+        def __init__(self):
+            super().__init__()
+            self.layers = [_Layer()]
+
+        def __call__(self, inputs, cache=None):
+            batch, length = inputs.shape
+            for entry in cache or ():
+                if entry is not None:
+                    keys = mx.zeros((batch, 2, length, 4))
+                    entry.update_and_fetch(keys, keys)
+            row = mx.array(_AR_BATCH_STUB_LOGITS)
+            return mx.broadcast_to(row, (batch, length, len(_AR_BATCH_STUB_LOGITS)))
+
+    service = object.__new__(openai._BatchedARGenerationService)
+    short_job = SimpleNamespace(
+        sampler=short_sampler, seed=seed, seed_is_explicit=True, tokens=[]
+    )
+    long_job = SimpleNamespace(
+        sampler=long_sampler, seed=seed, seed_is_explicit=True, tokens=[]
+    )
+
+    generator = BatchGenerator(_StubModel(), max_tokens=long_steps)
+    uids = generator.insert(
+        [[1], [1]],
+        max_tokens=[short_steps, long_steps],
+        samplers=[
+            service._make_sampler(short_job),
+            service._make_sampler(long_job),
+        ],
+    )
+    by_uid = {int(uids[0]): short_job, int(uids[1]): long_job}
+
+    while len(long_job.tokens) < long_steps:
+        _prompt_responses, generation_responses = generator.next()
+        for response in generation_responses:
+            by_uid[int(response.uid)].tokens.append(int(response.token))
+
+    # The short row terminated (and was compacted out) well before the long one.
+    assert len(short_job.tokens) == short_steps
+    assert short_job.tokens != long_job.tokens
+    # The survivor kept its OWN frequency-penalty histogram across the compaction.
+    assert long_job.tokens == expected_long
+
+
 def test_long_prompt_commits_prompt_prefix_when_ssd_cache_is_enabled():
     state = SimpleNamespace(
         session_bank_cold_tier=SimpleNamespace(enabled=True, min_prefix_tokens=512)
