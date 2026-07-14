@@ -408,7 +408,7 @@ def _write_modelopt_config(
 
     quantization: dict[str, Any] = dict(NVFP4_QUANT_PARAMS)
     for module_path in sorted(quantized_modules):
-        if ".linear_attn." in module_path:
+        if ".linear_attn." in module_path or ".self_attn." in module_path:
             quantization[module_path] = {"bits": 8, "group_size": 32, "mode": "affine"}
         else:
             quantization[module_path] = dict(NVFP4_QUANT_PARAMS)

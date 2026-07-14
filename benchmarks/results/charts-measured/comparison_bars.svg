@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="500" viewBox="0 0 600 500">
+<rect width="100%" height="100%" fill="white"/>
+<defs><pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" stroke="black" stroke-width="2"/></pattern></defs>
+<text x="300.00" y="22" font-family="serif" font-size="14" text-anchor="middle">Decode tok/s (decode tok s median)</text>
+<rect x="72" y="36" width="504" height="376" fill="none" stroke="black" stroke-width="1"/>
+<line x1="68" y1="412.00" x2="72" y2="412.00" stroke="black" stroke-width="1"/>
+<text x="64" y="416.00" font-family="serif" font-size="11" text-anchor="end">0.0</text>
+<line x1="68" y1="336.80" x2="72" y2="336.80" stroke="black" stroke-width="1"/>
+<text x="64" y="340.80" font-family="serif" font-size="11" text-anchor="end">4.7</text>
+<line x1="68" y1="261.60" x2="72" y2="261.60" stroke="black" stroke-width="1"/>
+<text x="64" y="265.60" font-family="serif" font-size="11" text-anchor="end">9.3</text>
+<line x1="68" y1="186.40" x2="72" y2="186.40" stroke="black" stroke-width="1"/>
+<text x="64" y="190.40" font-family="serif" font-size="11" text-anchor="end">14.0</text>
+<line x1="68" y1="111.20" x2="72" y2="111.20" stroke="black" stroke-width="1"/>
+<text x="64" y="115.20" font-family="serif" font-size="11" text-anchor="end">18.7</text>
+<line x1="68" y1="36.00" x2="72" y2="36.00" stroke="black" stroke-width="1"/>
+<text x="64" y="40.00" font-family="serif" font-size="11" text-anchor="end">23.4</text>
+<rect x="72.00" y="236.51" width="56.00" height="175.49" fill="black" stroke="black" stroke-width="1"/>
+<text x="100.00" y="428" font-family="serif" font-size="10" text-anchor="middle">affine_ar</text>
+<text x="100.00" y="232.51" font-family="serif" font-size="10" text-anchor="middle">10.9</text>
+<rect x="136.00" y="144.81" width="56.00" height="267.19" fill="url(#hatch)" stroke="black" stroke-width="1"/>
+<text x="164.00" y="428" font-family="serif" font-size="10" text-anchor="middle">affine_mtp_d1</text>
+<text x="164.00" y="140.81" font-family="serif" font-size="10" text-anchor="middle">16.6</text>
+<rect x="200.00" y="84.60" width="56.00" height="327.40" fill="black" stroke="black" stroke-width="1"/>
+<text x="228.00" y="428" font-family="serif" font-size="10" text-anchor="middle">affine_mtp_d2</text>
+<text x="228.00" y="80.60" font-family="serif" font-size="10" text-anchor="middle">20.3</text>
+<rect x="264.00" y="36.00" width="56.00" height="376.00" fill="url(#hatch)" stroke="black" stroke-width="1"/>
+<text x="292.00" y="428" font-family="serif" font-size="10" text-anchor="middle">affine_mtp_d3</text>
+<text x="292.00" y="32.00" font-family="serif" font-size="10" text-anchor="middle">23.4</text>
+<rect x="328.00" y="277.29" width="56.00" height="134.71" fill="black" stroke="black" stroke-width="1"/>
+<text x="356.00" y="428" font-family="serif" font-size="10" text-anchor="middle">nvfp4_ar</text>
+<text x="356.00" y="273.29" font-family="serif" font-size="10" text-anchor="middle">8.4</text>
+<rect x="392.00" y="338.42" width="56.00" height="73.58" fill="url(#hatch)" stroke="black" stroke-width="1"/>
+<text x="420.00" y="428" font-family="serif" font-size="10" text-anchor="middle">nvfp4_mtp_d1</text>
+<text x="420.00" y="334.42" font-family="serif" font-size="10" text-anchor="middle">4.6</text>
+<rect x="456.00" y="355.45" width="56.00" height="56.55" fill="black" stroke="black" stroke-width="1"/>
+<text x="484.00" y="428" font-family="serif" font-size="10" text-anchor="middle">nvfp4_mtp_d2</text>
+<text x="484.00" y="351.45" font-family="serif" font-size="10" text-anchor="middle">3.5</text>
+<rect x="520.00" y="367.41" width="56.00" height="44.59" fill="url(#hatch)" stroke="black" stroke-width="1"/>
+<text x="548.00" y="428" font-family="serif" font-size="10" text-anchor="middle">nvfp4_mtp_d3</text>
+<text x="548.00" y="363.41" font-family="serif" font-size="10" text-anchor="middle">2.8</text>
+</svg>

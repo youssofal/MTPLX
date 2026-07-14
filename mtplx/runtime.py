@@ -336,9 +336,17 @@ def load(
         tokenizer = _load_tokenizer_resilient(path, config)
         model, _loaded_config = load_model(path)
     else:
-        from mlx_lm.utils import load as mlx_lm_load
+        from .modelopt_nvfp4_load import (
+            is_modelopt_nvfp4_native_config,
+            load_modelopt_nvfp4_artifact,
+        )
 
-        model, tokenizer = mlx_lm_load(str(path))
+        if is_modelopt_nvfp4_native_config(config):
+            model, tokenizer, _loaded_config = load_modelopt_nvfp4_artifact(path)
+        else:
+            from mlx_lm.utils import load as mlx_lm_load
+
+            model, tokenizer = mlx_lm_load(str(path))
     runtime_metadata = _load_runtime_metadata(path)
     contract = (
         (contract or MTPContract())

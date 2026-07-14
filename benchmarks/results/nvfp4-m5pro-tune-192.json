@@ -1,0 +1,1013 @@
+{
+  "action": "tune",
+  "artifacts": {
+    "root": "/Users/jonathangadeaharder/projects/MTPLX-nvfp4/outputs/cli/tune/tune-20260714-082950",
+    "summary": "/Users/jonathangadeaharder/projects/MTPLX-nvfp4/benchmarks/results/nvfp4-m5pro-tune-192.json"
+  },
+  "backend": {
+    "custom_qmv_or_qmm_env": {},
+    "mlx_core_path": "/Users/jonathangadeaharder/projects/MTPLX-nvfp4/.venv/lib/python3.14/site-packages/mlx/core.cpython-314-darwin.so",
+    "mlx_lm_version": "0.31.3",
+    "mlx_version": "0.31.2",
+    "optional_fast_mlx_fork": {
+      "commit_matches": true,
+      "expected_commit": "68cf2fdd",
+      "expected_path_fragment": "mlx-mtplx-0.31.2-qmm",
+      "observed_commit": null,
+      "ok": false,
+      "path": "/Users/jonathangadeaharder/projects/MTPLX-nvfp4/.venv/lib/python3.14/site-packages/mlx/core.cpython-314-darwin.so",
+      "path_active": false,
+      "version": "0.31.2"
+    },
+    "optional_fast_mlx_fork_active": false,
+    "stock_mlx_likely": true
+  },
+  "best": null,
+  "best_multiplier": {
+    "acceptance_collapsed": [
+      {
+        "acceptance_by_depth": [
+          0.0
+        ],
+        "depth": 1,
+        "mode": "D1",
+        "multiplier_vs_ar": 0.5462313474208789,
+        "quality_passed": true,
+        "tok_s": 4.570625909773914
+      },
+      {
+        "acceptance_by_depth": [
+          0.0,
+          0.0
+        ],
+        "depth": 2,
+        "mode": "D2",
+        "multiplier_vs_ar": 0.4197742659553011,
+        "quality_passed": true,
+        "tok_s": 3.5124881523016893
+      },
+      {
+        "acceptance_by_depth": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "depth": 3,
+        "mode": "D3",
+        "multiplier_vs_ar": 0.3310206589655404,
+        "quality_passed": true,
+        "tok_s": 2.7698366409801958
+      }
+    ],
+    "ar_tok_s": 8.367564277214912,
+    "available": true,
+    "failure_reasons": [
+      "mtp_acceptance_collapsed",
+      "no_mtp_depth_beat_ar"
+    ],
+    "quality_rejected": [],
+    "verdict": "mtp_acceptance_collapsed",
+    "winner": null
+  },
+  "control_field": "depth",
+  "diagnostics": {
+    "fans_pinned": true,
+    "model_source_notes": [],
+    "telemetry_enabled": false,
+    "telemetry_env": "MTPLX_BENCH_TUNE_TELEMETRY"
+  },
+  "fans_pinned": true,
+  "hardware": {
+    "arm64": 1,
+    "chip": "Apple M5 Pro",
+    "chip_family": "Apple M5 Pro",
+    "efficiency_cores": 12,
+    "hw_model": "Mac17,9",
+    "logical_cpu": 18,
+    "machine": "arm64",
+    "macos_build": "25F84",
+    "macos_version": "26.5.2",
+    "memory_gib": 64.0,
+    "perf_cores": 6,
+    "physical_cpu": 18,
+    "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "system": "Darwin"
+  },
+  "model": "/Users/jonathangadeaharder/.mtplx/models/nvidia--Qwen3.6-27B-NVFP4-mlx-native",
+  "profile": "performance-cold",
+  "results": [
+    {
+      "artifact": "/Users/jonathangadeaharder/projects/MTPLX-nvfp4/outputs/cli/tune/tune-20260714-082950/ar.json",
+      "candidate": "ar",
+      "command": [
+        "/Users/jonathangadeaharder/projects/MTPLX-nvfp4/.venv/bin/python",
+        "-m",
+        "mtplx.cli",
+        "tune",
+        "--_candidate",
+        "ar",
+        "--_candidate-output",
+        "/Users/jonathangadeaharder/projects/MTPLX-nvfp4/outputs/cli/tune/tune-20260714-082950/ar.json",
+        "--model",
+        "/Users/jonathangadeaharder/.mtplx/models/nvidia--Qwen3.6-27B-NVFP4-mlx-native",
+        "--max-tokens",
+        "192",
+        "--limit",
+        "1",
+        "--seed",
+        "0",
+        "--depths",
+        "1,2,3",
+        "--yes",
+        "--cache-dir",
+        "/Users/jonathangadeaharder/.mtplx/models",
+        "--mtp-cache-policy",
+        "persistent",
+        "--mtp-history-policy",
+        "committed",
+        "--temperature",
+        "0.6",
+        "--top-p",
+        "0.95",
+        "--top-k",
+        "20"
+      ],
+      "control_field": "depth",
+      "decode_elapsed_s": 22.94574545699288,
+      "decode_tok_s": 8.367564277214912,
+      "depth": null,
+      "draft_block_size": null,
+      "elapsed_s": 27.870619541005,
+      "end_to_end_tok_s": 6.888974955060385,
+      "finish_reasons": {
+        "length": 1
+      },
+      "generated_tokens": 192,
+      "generation_window_s": 31.70559597015381,
+      "generation_windows": [
+        {
+          "duration_s": 31.70559597015381,
+          "end": 1784010628.802325,
+          "start": 1784010597.096729
+        }
+      ],
+      "hit_token_budget": true,
+      "hit_token_budget_count": 1,
+      "mode": "AR",
+      "multiplier_vs_ar": 1.0,
+      "prompt_eval_time_s": 4.924874084012117,
+      "quality_failure_validations": [],
+      "quality_inconclusive_validations": [
+        {
+          "detail": "unclosed delimiter(s): ((",
+          "name": "balanced_delimiters",
+          "row_index": 0
+        }
+      ],
+      "quality_passed": true,
+      "returncode": 0,
+      "stdout": "/Users/jonathangadeaharder/projects/MTPLX-nvfp4/outputs/cli/tune/tune-20260714-082950/ar.log",
+      "tok_s": 8.367564277214912,
+      "validations_passed": 1,
+      "validations_total": 2,
+      "verify_ms_per_call": null
+    },
+    {
+      "acceptance_by_depth": [
+        0.0
+      ],
+      "acceptance_percent_by_depth": [
+        0.0
+      ],
+      "accepted_by_depth": [
+        0
+      ],
+      "artifact": "/Users/jonathangadeaharder/projects/MTPLX-nvfp4/outputs/cli/tune/tune-20260714-082950/d1.json",
+      "candidate": "1",
+      "command": [
+        "/Users/jonathangadeaharder/projects/MTPLX-nvfp4/.venv/bin/python",
+        "-m",
+        "mtplx.cli",
+        "tune",
+        "--_candidate",
+        "1",
+        "--_candidate-output",
+        "/Users/jonathangadeaharder/projects/MTPLX-nvfp4/outputs/cli/tune/tune-20260714-082950/d1.json",
+        "--model",
+        "/Users/jonathangadeaharder/.mtplx/models/nvidia--Qwen3.6-27B-NVFP4-mlx-native",
+        "--max-tokens",
+        "192",
+        "--limit",
+        "1",
+        "--seed",
+        "0",
+        "--depths",
+        "1,2,3",
+        "--yes",
+        "--cache-dir",
+        "/Users/jonathangadeaharder/.mtplx/models",
+        "--mtp-cache-policy",
+        "persistent",
+        "--mtp-history-policy",
+        "committed",
+        "--temperature",
+        "0.6",
+        "--top-p",
+        "0.95",
+        "--top-k",
+        "20"
+      ],
+      "control_field": "depth",
+      "decode_elapsed_s": 42.00737574900268,
+      "decode_tok_s": 4.570625909773914,
+      "depth": 1,
+      "draft_block_size": null,
+      "drafted_by_depth": [
+        191
+      ],
+      "elapsed_s": 46.62927829101682,
+      "end_to_end_tok_s": 4.117584638597956,
+      "finish_reasons": {
+        "length": 1
+      },
+      "generated_tokens": 192,
+      "generation_window_s": 46.77303385734558,
+      "generation_windows": [
+        {
+          "duration_s": 46.77303385734558,
+          "end": 1784010703.2052128,
+          "start": 1784010656.432179
+        }
+      ],
+      "hit_token_budget": true,
+      "hit_token_budget_count": 1,
+      "mean_accept_probability_by_depth": [
+        0.0
+      ],
+      "mode": "D1",
+      "multiplier_vs_ar": 0.5462313474208789,
+      "prompt_eval_time_s": 4.621902542014141,
+      "quality_failure_validations": [],
+      "quality_inconclusive_validations": [],
+      "quality_passed": true,
+      "returncode": 0,
+      "stdout": "/Users/jonathangadeaharder/projects/MTPLX-nvfp4/outputs/cli/tune/tune-20260714-082950/d1.log",
+      "tok_s": 4.570625909773914,
+      "validations_passed": 2,
+      "validations_total": 2,
+      "verify_calls": 191,
+      "verify_eval_ms_per_call": 165.200145737023,
+      "verify_forward_ms_per_call": 4.626654224873749,
+      "verify_hidden_eval_ms_per_call": 159.5902986495685,
+      "verify_ms_per_call": 169.82679996189677,
+      "verify_time_s": 32.43691879272228
+    },
+    {
+      "acceptance_by_depth": [
+        0.0,
+        0.0
+      ],
+      "acceptance_percent_by_depth": [
+        0.0,
+        0.0
+      ],
+      "accepted_by_depth": [
+        0,
+        0
+      ],
+      "artifact": "/Users/jonathangadeaharder/projects/MTPLX-nvfp4/outputs/cli/tune/tune-20260714-082950/d2.json",
+      "candidate": "2",
+      "command": [
+        "/Users/jonathangadeaharder/projects/MTPLX-nvfp4/.venv/bin/python",
+        "-m",
+        "mtplx.cli",
+        "tune",
+        "--_candidate",
+        "2",
+        "--_candidate-output",
+        "/Users/jonathangadeaharder/projects/MTPLX-nvfp4/outputs/cli/tune/tune-20260714-082950/d2.json",
+        "--model",
+        "/Users/jonathangadeaharder/.mtplx/models/nvidia--Qwen3.6-27B-NVFP4-mlx-native",
+        "--max-tokens",
+        "192",
+        "--limit",
+        "1",
+        "--seed",
+        "0",
+        "--depths",
+        "1,2,3",
+        "--yes",
+        "--cache-dir",
+        "/Users/jonathangadeaharder/.mtplx/models",
+        "--mtp-cache-policy",
+        "persistent",
+        "--mtp-history-policy",
+        "committed",
+        "--temperature",
+        "0.6",
+        "--top-p",
+        "0.95",
+        "--top-k",
+        "20"
+      ],
+      "control_field": "depth",
+      "decode_elapsed_s": 54.66210608402616,
+      "decode_tok_s": 3.5124881523016893,
+      "depth": 2,
+      "draft_block_size": null,
+      "drafted_by_depth": [
+        191,
+        190
+      ],
+      "elapsed_s": 58.661466709017986,
+      "end_to_end_tok_s": 3.273017378723058,
+      "finish_reasons": {
+        "length": 1
+      },
+      "generated_tokens": 192,
+      "generation_window_s": 58.688008069992065,
+      "generation_windows": [
+        {
+          "duration_s": 58.688008069992065,
+          "end": 1784010773.965893,
+          "start": 1784010715.277885
+        }
+      ],
+      "hit_token_budget": true,
+      "hit_token_budget_count": 1,
+      "mean_accept_probability_by_depth": [
+        0.0,
+        0.0
+      ],
+      "mode": "D2",
+      "multiplier_vs_ar": 0.4197742659553011,
+      "prompt_eval_time_s": 3.999360624991823,
+      "quality_failure_validations": [],
+      "quality_inconclusive_validations": [],
+      "quality_passed": true,
+      "returncode": 0,
+      "stdout": "/Users/jonathangadeaharder/projects/MTPLX-nvfp4/outputs/cli/tune/tune-20260714-082950/d2.log",
+      "tok_s": 3.5124881523016893,
+      "validations_passed": 2,
+      "validations_total": 2,
+      "verify_calls": 191,
+      "verify_eval_ms_per_call": 208.47545942021608,
+      "verify_forward_ms_per_call": 5.672630937453067,
+      "verify_hidden_eval_ms_per_call": 200.9559821254264,
+      "verify_ms_per_call": 214.14809035766913,
+      "verify_time_s": 40.902285258314805
+    },
+    {
+      "acceptance_by_depth": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "acceptance_percent_by_depth": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "accepted_by_depth": [
+        0,
+        0,
+        0
+      ],
+      "artifact": "/Users/jonathangadeaharder/projects/MTPLX-nvfp4/outputs/cli/tune/tune-20260714-082950/d3.json",
+      "candidate": "3",
+      "command": [
+        "/Users/jonathangadeaharder/projects/MTPLX-nvfp4/.venv/bin/python",
+        "-m",
+        "mtplx.cli",
+        "tune",
+        "--_candidate",
+        "3",
+        "--_candidate-output",
+        "/Users/jonathangadeaharder/projects/MTPLX-nvfp4/outputs/cli/tune/tune-20260714-082950/d3.json",
+        "--model",
+        "/Users/jonathangadeaharder/.mtplx/models/nvidia--Qwen3.6-27B-NVFP4-mlx-native",
+        "--max-tokens",
+        "192",
+        "--limit",
+        "1",
+        "--seed",
+        "0",
+        "--depths",
+        "1,2,3",
+        "--yes",
+        "--cache-dir",
+        "/Users/jonathangadeaharder/.mtplx/models",
+        "--mtp-cache-policy",
+        "persistent",
+        "--mtp-history-policy",
+        "committed",
+        "--temperature",
+        "0.6",
+        "--top-p",
+        "0.95",
+        "--top-k",
+        "20"
+      ],
+      "control_field": "depth",
+      "decode_elapsed_s": 69.31816741800867,
+      "decode_tok_s": 2.7698366409801958,
+      "depth": 3,
+      "draft_block_size": null,
+      "drafted_by_depth": [
+        191,
+        190,
+        189
+      ],
+      "elapsed_s": 73.46721808399889,
+      "end_to_end_tok_s": 2.6134105116172552,
+      "finish_reasons": {
+        "length": 1
+      },
+      "generated_tokens": 192,
+      "generation_window_s": 73.57660293579102,
+      "generation_windows": [
+        {
+          "duration_s": 73.57660293579102,
+          "end": 1784010862.127347,
+          "start": 1784010788.550744
+        }
+      ],
+      "hit_token_budget": true,
+      "hit_token_budget_count": 1,
+      "mean_accept_probability_by_depth": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "mode": "D3",
+      "multiplier_vs_ar": 0.3310206589655404,
+      "prompt_eval_time_s": 4.149050665990217,
+      "quality_failure_validations": [],
+      "quality_inconclusive_validations": [],
+      "quality_passed": true,
+      "returncode": 0,
+      "stdout": "/Users/jonathangadeaharder/projects/MTPLX-nvfp4/outputs/cli/tune/tune-20260714-082950/d3.log",
+      "tok_s": 2.7698366409801958,
+      "validations_passed": 2,
+      "validations_total": 2,
+      "verify_calls": 191,
+      "verify_eval_ms_per_call": 259.7058717330859,
+      "verify_forward_ms_per_call": 6.03425654117018,
+      "verify_hidden_eval_ms_per_call": 249.3265543290882,
+      "verify_ms_per_call": 265.7401282742561,
+      "verify_time_s": 50.756364500382915
+    }
+  ],
+  "run_id": "tune-20260714-082950",
+  "save_skipped_reason": "no MTP depth beat AR",
+  "saved": false,
+  "settings": {
+    "base_hidden_variant": null,
+    "candidate_settle_s": 5.0,
+    "concat_order": null,
+    "control_field": "depth",
+    "depths": "1,2,3",
+    "draft_temperature": null,
+    "draft_top_k": null,
+    "draft_top_p": null,
+    "limit": 1,
+    "max_tokens": 192,
+    "mtp_cache_policy": "persistent",
+    "mtp_hidden_variant": null,
+    "mtp_history_policy": "committed",
+    "profile": "performance-cold",
+    "seed": 0,
+    "suite": "cold-long-code-192",
+    "temperature": 0.6,
+    "thinking": "disabled",
+    "tie_prefer_deeper_within_pct": 2.0,
+    "top_k": 20,
+    "top_p": 0.95
+  },
+  "software": {
+    "git_branch": "feature/nvfp4-mtplx-benchmark",
+    "git_status": "## feature/nvfp4-mtplx-benchmark...origin/feature/nvfp4-mtplx-benchmark\n M mtplx/modelopt_nvfp4.py\n M mtplx/runtime.py\n?? benchmarks/results/nvfp4-m5pro-tune-192.json\n?? mtplx/modelopt_nvfp4_load.py\n?? tests/test_modelopt_nvfp4_load.py",
+    "mlx_lm_version": "0.31.3",
+    "mlx_version": "0.31.2",
+    "mtplx_version": "1.0.4",
+    "numpy_version": "2.4.4",
+    "python_executable": "/Users/jonathangadeaharder/projects/MTPLX-nvfp4/.venv/bin/python",
+    "python_version": "3.14.4 (main, Apr 14 2026, 14:46:33) [Clang 22.1.3 ]"
+  },
+  "state_key": "717aa550c7eb85ac29c6f08470df4655649d14e4a97ee4197661bfcc4e288399",
+  "state_path": "/Users/jonathangadeaharder/.mtplx/tuning.json",
+  "suite": "cold-long-code-192",
+  "thermal": {
+    "enabled": true,
+    "recovery": {
+      "recovered": false,
+      "stale_pid": null,
+      "still_running": false
+    },
+    "restore": {
+      "after": {
+        "actual_max_rpm": 7841,
+        "actual_min_rpm": 7832,
+        "capacity_max_rpm": 7826,
+        "capacity_min_rpm": 7826,
+        "fans": [
+          {
+            "actual_rpm": 7832,
+            "max_capacity_rpm": 7826,
+            "mode": "auto",
+            "raw": {
+              "actual_rpm": 7832,
+              "index": 0,
+              "max_rpm": 7826,
+              "min_rpm": 2317,
+              "mode": "auto",
+              "target_rpm": 7826
+            },
+            "rpm": 7832,
+            "target_rpm": 7826
+          },
+          {
+            "actual_rpm": 7841,
+            "max_capacity_rpm": 7826,
+            "mode": "auto",
+            "raw": {
+              "actual_rpm": 7841,
+              "index": 1,
+              "max_rpm": 7826,
+              "min_rpm": 2317,
+              "mode": "auto",
+              "target_rpm": 7826
+            },
+            "rpm": 7841,
+            "target_rpm": 7826
+          }
+        ],
+        "max_rpm": 7841,
+        "min_rpm": 7832,
+        "ok": true,
+        "raw": {
+          "attempts": [
+            {
+              "command": [
+                "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+                "status"
+              ],
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "{\n  \"fans\" : [\n    {\n      \"actual_rpm\" : 7832,\n      \"index\" : 0,\n      \"max_rpm\" : 7826,\n      \"min_rpm\" : 2317,\n      \"mode\" : \"auto\",\n      \"target_rpm\" : 7826\n    },\n    {\n      \"actual_rpm\" : 7841,\n      \"index\" : 1,\n      \"max_rpm\" : 7826,\n      \"min_rpm\" : 2317,\n      \"mode\" : \"auto\",\n      \"target_rpm\" : 7826\n    }\n  ],\n  \"temperatures\" : {\n    \"TAOL\" : 31.9,\n    \"TB0T\" : 40.2,\n    \"TCHP\" : 54.5,\n    \"TCMb\" : 82.6,\n    \"TG0B\" : 40.2,\n    \"TG0H\" : 40,\n    \"TG0V\" : 40.2,\n    \"TH0x\" : 45.1,\n    \"TMVR\" : 62.5,\n    \"TPDX\" : 76,\n    \"TRDX\" : 67.6,\n    \"TS0P\" : 62.5,\n    \"Tg0j\" : 73.5,\n    \"Tm08\" : 71.7,\n    \"Tp04\" : 74.8,\n    \"Tp08\" : 75.3,\n    \"Tp0C\" : 76.8,\n    \"Tp0G\" : 75,\n    \"Tp0X\" : 75.7\n  }\n}"
+            }
+          ],
+          "detection": {
+            "available": true,
+            "clock_anchor_enabled": false,
+            "clock_anchor_policy": "explicit experimental only; never used for product claims",
+            "instructions": "Install ThermalForge and ensure the thermalforge CLI is on PATH.",
+            "selected": {
+              "kind": "thermalforge",
+              "path": "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+              "version": {
+                "command": [
+                  "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+                  "--version"
+                ],
+                "ok": true,
+                "returncode": 0,
+                "stderr": "",
+                "stdout": "0.1.0"
+              }
+            },
+            "tools": [
+              {
+                "kind": "thermalforge",
+                "path": "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+                "version": {
+                  "command": [
+                    "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+                    "--version"
+                  ],
+                  "ok": true,
+                  "returncode": 0,
+                  "stderr": "",
+                  "stdout": "0.1.0"
+                }
+              }
+            ]
+          },
+          "ok": true,
+          "status": {
+            "command": [
+              "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+              "status"
+            ],
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "{\n  \"fans\" : [\n    {\n      \"actual_rpm\" : 7832,\n      \"index\" : 0,\n      \"max_rpm\" : 7826,\n      \"min_rpm\" : 2317,\n      \"mode\" : \"auto\",\n      \"target_rpm\" : 7826\n    },\n    {\n      \"actual_rpm\" : 7841,\n      \"index\" : 1,\n      \"max_rpm\" : 7826,\n      \"min_rpm\" : 2317,\n      \"mode\" : \"auto\",\n      \"target_rpm\" : 7826\n    }\n  ],\n  \"temperatures\" : {\n    \"TAOL\" : 31.9,\n    \"TB0T\" : 40.2,\n    \"TCHP\" : 54.5,\n    \"TCMb\" : 82.6,\n    \"TG0B\" : 40.2,\n    \"TG0H\" : 40,\n    \"TG0V\" : 40.2,\n    \"TH0x\" : 45.1,\n    \"TMVR\" : 62.5,\n    \"TPDX\" : 76,\n    \"TRDX\" : 67.6,\n    \"TS0P\" : 62.5,\n    \"Tg0j\" : 73.5,\n    \"Tm08\" : 71.7,\n    \"Tp04\" : 74.8,\n    \"Tp08\" : 75.3,\n    \"Tp0C\" : 76.8,\n    \"Tp0G\" : 75,\n    \"Tp0X\" : 75.7\n  }\n}"
+          }
+        },
+        "target_max_rpm": 7826,
+        "target_min_rpm": 7826
+      },
+      "message": "fan profile restored",
+      "ok": true,
+      "profile": "silent",
+      "set_result": {
+        "attempts": [
+          {
+            "command": [
+              "sudo",
+              "-n",
+              "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+              "auto"
+            ],
+            "ok": true,
+            "returncode": 0,
+            "stderr": "No matching processes were found",
+            "stdout": "Fans reset to Apple defaults"
+          }
+        ],
+        "command": [
+          "sudo",
+          "-n",
+          "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+          "auto"
+        ],
+        "detection": {
+          "available": true,
+          "clock_anchor_enabled": false,
+          "clock_anchor_policy": "explicit experimental only; never used for product claims",
+          "instructions": "Install ThermalForge and ensure the thermalforge CLI is on PATH.",
+          "selected": {
+            "kind": "thermalforge",
+            "path": "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+            "version": {
+              "command": [
+                "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+                "--version"
+              ],
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0.1.0"
+            }
+          },
+          "tools": [
+            {
+              "kind": "thermalforge",
+              "path": "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+              "version": {
+                "command": [
+                  "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+                  "--version"
+                ],
+                "ok": true,
+                "returncode": 0,
+                "stderr": "",
+                "stdout": "0.1.0"
+              }
+            }
+          ]
+        },
+        "dry_run": false,
+        "ok": true,
+        "profile": "silent"
+      }
+    },
+    "start": {
+      "attempts": [
+        {
+          "command": [
+            "sudo",
+            "-n",
+            "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+            "max"
+          ],
+          "ok": true,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": "Fan 0: 6516 RPM \u2192 max (7826 RPM)\nFan 1: 7027 RPM \u2192 max (7826 RPM)"
+        }
+      ],
+      "command": [
+        "sudo",
+        "-n",
+        "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+        "max"
+      ],
+      "detection": {
+        "available": true,
+        "clock_anchor_enabled": false,
+        "clock_anchor_policy": "explicit experimental only; never used for product claims",
+        "instructions": "Install ThermalForge and ensure the thermalforge CLI is on PATH.",
+        "selected": {
+          "kind": "thermalforge",
+          "path": "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+          "version": {
+            "command": [
+              "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+              "--version"
+            ],
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0.1.0"
+          }
+        },
+        "tools": [
+          {
+            "kind": "thermalforge",
+            "path": "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+            "version": {
+              "command": [
+                "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+                "--version"
+              ],
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0.1.0"
+            }
+          }
+        ]
+      },
+      "dry_run": false,
+      "ok": true,
+      "profile": "performance"
+    },
+    "verified": {
+      "after": {
+        "actual_max_rpm": 7682,
+        "actual_min_rpm": 7674,
+        "capacity_max_rpm": 7826,
+        "capacity_min_rpm": 7826,
+        "fans": [
+          {
+            "actual_rpm": 7682,
+            "max_capacity_rpm": 7826,
+            "mode": "manual",
+            "raw": {
+              "actual_rpm": 7682,
+              "index": 0,
+              "max_rpm": 7826,
+              "min_rpm": 2317,
+              "mode": "manual",
+              "target_rpm": 7826
+            },
+            "rpm": 7682,
+            "target_rpm": 7826
+          },
+          {
+            "actual_rpm": 7674,
+            "max_capacity_rpm": 7826,
+            "mode": "manual",
+            "raw": {
+              "actual_rpm": 7674,
+              "index": 1,
+              "max_rpm": 7826,
+              "min_rpm": 2317,
+              "mode": "manual",
+              "target_rpm": 7826
+            },
+            "rpm": 7674,
+            "target_rpm": 7826
+          }
+        ],
+        "max_rpm": 7682,
+        "min_rpm": 7674,
+        "ok": true,
+        "raw": {
+          "attempts": [
+            {
+              "command": [
+                "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+                "status"
+              ],
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "{\n  \"fans\" : [\n    {\n      \"actual_rpm\" : 7682,\n      \"index\" : 0,\n      \"max_rpm\" : 7826,\n      \"min_rpm\" : 2317,\n      \"mode\" : \"manual\",\n      \"target_rpm\" : 7826\n    },\n    {\n      \"actual_rpm\" : 7674,\n      \"index\" : 1,\n      \"max_rpm\" : 7826,\n      \"min_rpm\" : 2317,\n      \"mode\" : \"manual\",\n      \"target_rpm\" : 7826\n    }\n  ],\n  \"temperatures\" : {\n    \"TAOL\" : 31.9,\n    \"TB0T\" : 38.5,\n    \"TCHP\" : 51.2,\n    \"TCMb\" : 84.8,\n    \"TG0B\" : 38.5,\n    \"TG0H\" : 38,\n    \"TG0V\" : 38.5,\n    \"TH0x\" : 48.4,\n    \"TMVR\" : 61.4,\n    \"TPDX\" : 77.1,\n    \"TRDX\" : 60.1,\n    \"TS0P\" : 59,\n    \"Tg0j\" : 67.6,\n    \"Tm08\" : 68.7,\n    \"Tp04\" : 76.6,\n    \"Tp08\" : 76.7,\n    \"Tp0C\" : 79.7,\n    \"Tp0G\" : 76.3,\n    \"Tp0X\" : 76.9\n  }\n}"
+            }
+          ],
+          "detection": {
+            "available": true,
+            "clock_anchor_enabled": false,
+            "clock_anchor_policy": "explicit experimental only; never used for product claims",
+            "instructions": "Install ThermalForge and ensure the thermalforge CLI is on PATH.",
+            "selected": {
+              "kind": "thermalforge",
+              "path": "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+              "version": {
+                "command": [
+                  "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+                  "--version"
+                ],
+                "ok": true,
+                "returncode": 0,
+                "stderr": "",
+                "stdout": "0.1.0"
+              }
+            },
+            "tools": [
+              {
+                "kind": "thermalforge",
+                "path": "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+                "version": {
+                  "command": [
+                    "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+                    "--version"
+                  ],
+                  "ok": true,
+                  "returncode": 0,
+                  "stderr": "",
+                  "stdout": "0.1.0"
+                }
+              }
+            ]
+          },
+          "ok": true,
+          "status": {
+            "command": [
+              "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+              "status"
+            ],
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "{\n  \"fans\" : [\n    {\n      \"actual_rpm\" : 7682,\n      \"index\" : 0,\n      \"max_rpm\" : 7826,\n      \"min_rpm\" : 2317,\n      \"mode\" : \"manual\",\n      \"target_rpm\" : 7826\n    },\n    {\n      \"actual_rpm\" : 7674,\n      \"index\" : 1,\n      \"max_rpm\" : 7826,\n      \"min_rpm\" : 2317,\n      \"mode\" : \"manual\",\n      \"target_rpm\" : 7826\n    }\n  ],\n  \"temperatures\" : {\n    \"TAOL\" : 31.9,\n    \"TB0T\" : 38.5,\n    \"TCHP\" : 51.2,\n    \"TCMb\" : 84.8,\n    \"TG0B\" : 38.5,\n    \"TG0H\" : 38,\n    \"TG0V\" : 38.5,\n    \"TH0x\" : 48.4,\n    \"TMVR\" : 61.4,\n    \"TPDX\" : 77.1,\n    \"TRDX\" : 60.1,\n    \"TS0P\" : 59,\n    \"Tg0j\" : 67.6,\n    \"Tm08\" : 68.7,\n    \"Tp04\" : 76.6,\n    \"Tp08\" : 76.7,\n    \"Tp0C\" : 79.7,\n    \"Tp0G\" : 76.3,\n    \"Tp0X\" : 76.9\n  }\n}"
+          }
+        },
+        "target_max_rpm": 7826,
+        "target_min_rpm": 7826
+      },
+      "baseline": {
+        "actual_max_rpm": 7027,
+        "actual_min_rpm": 6516,
+        "capacity_max_rpm": 7826,
+        "capacity_min_rpm": 7826,
+        "fans": [
+          {
+            "actual_rpm": 6516,
+            "max_capacity_rpm": 7826,
+            "mode": "auto",
+            "raw": {
+              "actual_rpm": 6516,
+              "index": 0,
+              "max_rpm": 7826,
+              "min_rpm": 2317,
+              "mode": "auto",
+              "target_rpm": 6509
+            },
+            "rpm": 6516,
+            "target_rpm": 6509
+          },
+          {
+            "actual_rpm": 7027,
+            "max_capacity_rpm": 7826,
+            "mode": "auto",
+            "raw": {
+              "actual_rpm": 7027,
+              "index": 1,
+              "max_rpm": 7826,
+              "min_rpm": 2317,
+              "mode": "auto",
+              "target_rpm": 7029
+            },
+            "rpm": 7027,
+            "target_rpm": 7029
+          }
+        ],
+        "max_rpm": 7027,
+        "min_rpm": 6516,
+        "ok": true,
+        "raw": {
+          "attempts": [
+            {
+              "command": [
+                "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+                "status"
+              ],
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "{\n  \"fans\" : [\n    {\n      \"actual_rpm\" : 6516,\n      \"index\" : 0,\n      \"max_rpm\" : 7826,\n      \"min_rpm\" : 2317,\n      \"mode\" : \"auto\",\n      \"target_rpm\" : 6509\n    },\n    {\n      \"actual_rpm\" : 7027,\n      \"index\" : 1,\n      \"max_rpm\" : 7826,\n      \"min_rpm\" : 2317,\n      \"mode\" : \"auto\",\n      \"target_rpm\" : 7029\n    }\n  ],\n  \"temperatures\" : {\n    \"TAOL\" : 31.9,\n    \"TB0T\" : 38.5,\n    \"TCHP\" : 51.2,\n    \"TCMb\" : 83.9,\n    \"TG0B\" : 38.5,\n    \"TG0H\" : 38,\n    \"TG0V\" : 38.5,\n    \"TH0x\" : 48.5,\n    \"TMVR\" : 62.1,\n    \"TPDX\" : 75.5,\n    \"TRDX\" : 60.4,\n    \"TS0P\" : 59.4,\n    \"Tg0j\" : 67.9,\n    \"Tm08\" : 68.9,\n    \"Tp04\" : 75.9,\n    \"Tp08\" : 76.1,\n    \"Tp0C\" : 78.7,\n    \"Tp0G\" : 75.7,\n    \"Tp0X\" : 76.1\n  }\n}"
+            }
+          ],
+          "detection": {
+            "available": true,
+            "clock_anchor_enabled": false,
+            "clock_anchor_policy": "explicit experimental only; never used for product claims",
+            "instructions": "Install ThermalForge and ensure the thermalforge CLI is on PATH.",
+            "selected": {
+              "kind": "thermalforge",
+              "path": "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+              "version": {
+                "command": [
+                  "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+                  "--version"
+                ],
+                "ok": true,
+                "returncode": 0,
+                "stderr": "",
+                "stdout": "0.1.0"
+              }
+            },
+            "tools": [
+              {
+                "kind": "thermalforge",
+                "path": "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+                "version": {
+                  "command": [
+                    "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+                    "--version"
+                  ],
+                  "ok": true,
+                  "returncode": 0,
+                  "stderr": "",
+                  "stdout": "0.1.0"
+                }
+              }
+            ]
+          },
+          "ok": true,
+          "status": {
+            "command": [
+              "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+              "status"
+            ],
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "{\n  \"fans\" : [\n    {\n      \"actual_rpm\" : 6516,\n      \"index\" : 0,\n      \"max_rpm\" : 7826,\n      \"min_rpm\" : 2317,\n      \"mode\" : \"auto\",\n      \"target_rpm\" : 6509\n    },\n    {\n      \"actual_rpm\" : 7027,\n      \"index\" : 1,\n      \"max_rpm\" : 7826,\n      \"min_rpm\" : 2317,\n      \"mode\" : \"auto\",\n      \"target_rpm\" : 7029\n    }\n  ],\n  \"temperatures\" : {\n    \"TAOL\" : 31.9,\n    \"TB0T\" : 38.5,\n    \"TCHP\" : 51.2,\n    \"TCMb\" : 83.9,\n    \"TG0B\" : 38.5,\n    \"TG0H\" : 38,\n    \"TG0V\" : 38.5,\n    \"TH0x\" : 48.5,\n    \"TMVR\" : 62.1,\n    \"TPDX\" : 75.5,\n    \"TRDX\" : 60.4,\n    \"TS0P\" : 59.4,\n    \"Tg0j\" : 67.9,\n    \"Tm08\" : 68.9,\n    \"Tp04\" : 75.9,\n    \"Tp08\" : 76.1,\n    \"Tp0C\" : 78.7,\n    \"Tp0G\" : 75.7,\n    \"Tp0X\" : 76.1\n  }\n}"
+          }
+        },
+        "target_max_rpm": 7029,
+        "target_min_rpm": 6509
+      },
+      "message": "fans ramped to max (actual 7674-7682 RPM; target 7826 RPM)",
+      "ok": true,
+      "profile": "performance",
+      "set_result": {
+        "attempts": [
+          {
+            "command": [
+              "sudo",
+              "-n",
+              "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+              "max"
+            ],
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "Fan 0: 6516 RPM \u2192 max (7826 RPM)\nFan 1: 7027 RPM \u2192 max (7826 RPM)"
+          }
+        ],
+        "command": [
+          "sudo",
+          "-n",
+          "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+          "max"
+        ],
+        "detection": {
+          "available": true,
+          "clock_anchor_enabled": false,
+          "clock_anchor_policy": "explicit experimental only; never used for product claims",
+          "instructions": "Install ThermalForge and ensure the thermalforge CLI is on PATH.",
+          "selected": {
+            "kind": "thermalforge",
+            "path": "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+            "version": {
+              "command": [
+                "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+                "--version"
+              ],
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0.1.0"
+            }
+          },
+          "tools": [
+            {
+              "kind": "thermalforge",
+              "path": "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+              "version": {
+                "command": [
+                  "/Users/jonathangadeaharder/.mtplx/bin/thermalforge",
+                  "--version"
+                ],
+                "ok": true,
+                "returncode": 0,
+                "stderr": "",
+                "stdout": "0.1.0"
+              }
+            }
+          ]
+        },
+        "dry_run": false,
+        "ok": true,
+        "profile": "performance"
+      }
+    }
+  }
+}
