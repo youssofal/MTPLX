@@ -87,16 +87,23 @@ def convert_compressed_tensors_awq_to_mlx(
     index = _load_json(source_path / "model.safetensors.index.json")
     weight_map = index.get("weight_map")
     if not isinstance(weight_map, dict):
-        raise ValueError("compressed-tensors source is missing model.safetensors weight_map")
+        raise ValueError(
+            "compressed-tensors source is missing model.safetensors weight_map"
+        )
     weight_map = {str(key): str(value) for key, value in weight_map.items()}
     source_files = sorted(set(weight_map.values()))
     source_config = _load_json(source_path / "config.json")
     quant_params = _quant_params_from_config(source_config)
-    if packed_format == "nvfp4":
+    if packed_format in {"nvfp4", "nvfp4_native"}:
         quant_params = {
             "bits": int(target_bits or 4),
-            "group_size": int(target_group_size or 64),
-            "mode": str(target_mode or "affine"),
+            "group_size": int(
+                target_group_size or (16 if packed_format == "nvfp4_native" else 64)
+            ),
+            "mode": str(
+                target_mode
+                or ("nvfp4" if packed_format == "nvfp4_native" else "affine")
+            ),
         }
     key_mapper = _key_mapper_for_config(source_config)
     num_experts = num_experts_from_config(source_config)
@@ -132,7 +139,10 @@ def convert_compressed_tensors_awq_to_mlx(
                     continue
                 if key.endswith(".weight_packed"):
                     prefix = key[: -len(".weight_packed")]
-                    if packed_format == "nvfp4":
+                    if packed_format == "nvfp4_native":
+                        packed = _convert_nvfp4_native(prefix, reader)
+                        source_label = f"nvfp4_native_{_quant_group(prefix)}"
+                    elif packed_format == "nvfp4":
                         packed = _convert_nvfp4(
                             prefix,
                             reader,
@@ -223,7 +233,9 @@ def convert_compressed_tensors_awq_to_mlx(
                     )
                     source_counts[f"plain_{_quant_group(out_key)}"] += 1
                 except Exception as exc:
-                    raise RuntimeError(f"failed to convert {filename}:{key}: {exc}") from exc
+                    raise RuntimeError(
+                        f"failed to convert {filename}:{key}: {exc}"
+                    ) from exc
 
         stacked_main = main_experts.flush_complete()
         out.update(stacked_main)
@@ -321,16 +333,20 @@ def convert_compressed_tensors_awq_to_mlx(
         stats=stats,
         audit=audit,
         source_format_label=(
-            "compressed-tensors-nvfp4-w4a16"
+            "compressed-tensors-nvfp4-native-w4a16"
+            if packed_format == "nvfp4_native"
+            else "compressed-tensors-nvfp4-w4a16"
             if packed_format == "nvfp4"
             else "compressed-tensors-awq"
         ),
         policy_name=(
-            "forge-compressed-tensors-nvfp4-w4a16"
+            "forge-compressed-tensors-nvfp4-native-w4a16"
+            if packed_format == "nvfp4_native"
+            else "forge-compressed-tensors-nvfp4-w4a16"
             if packed_format == "nvfp4"
             else "forge-compressed-tensors-awq"
         ),
-        awq_calibrated=packed_format != "nvfp4",
+        awq_calibrated=packed_format not in {"nvfp4", "nvfp4_native"},
     )
     _write_readme(
         output_path,
@@ -339,7 +355,9 @@ def convert_compressed_tensors_awq_to_mlx(
         stats=stats,
         audit=audit,
         source_format_label=(
-            "compressed-tensors NVFP4 W4A16"
+            "compressed-tensors NVFP4 native W4A16"
+            if packed_format == "nvfp4_native"
+            else "compressed-tensors NVFP4 W4A16"
             if packed_format == "nvfp4"
             else "compressed-tensors AWQ"
         ),
@@ -354,7 +372,7 @@ def convert_compressed_tensors_awq_to_mlx(
     }
 
 
-def convert_compressed_tensors_nvfp4_to_mlx(
+def convert_compressed_tensors_nvfp4_requant_affine_to_mlx(
     source_path: Path,
     output_path: Path,
     *,
@@ -368,9 +386,8 @@ def convert_compressed_tensors_nvfp4_to_mlx(
     """Convert compressed-tensors NVFP4 W4A16 weights to MLX affine.
 
     NVFP4 stores FP4 payloads plus FP8 block scales and an inverse global
-    scale. MLX does not expose this as a native linear format here, so Forge
-    dequantizes each packed module and requantizes it into MLX's affine INT4
-    representation before the normal AR/MTP verifier is allowed to bless it.
+    scale. This fallback path dequantizes each packed module and requantizes
+    it into MLX's affine INT4 representation.
     """
 
     return convert_compressed_tensors_awq_to_mlx(
@@ -383,6 +400,54 @@ def convert_compressed_tensors_nvfp4_to_mlx(
         target_bits=target_bits,
         target_group_size=target_group_size,
         target_mode=target_mode,
+    )
+
+
+def convert_compressed_tensors_nvfp4_to_mlx(
+    source_path: Path,
+    output_path: Path,
+    *,
+    source_repo: str,
+    source_sha: str | None = None,
+    progress_callback: ProgressCallback | None = None,
+    target_bits: int = 4,
+    target_group_size: int = 64,
+    target_mode: str = "affine",
+) -> dict[str, Any]:
+    """Backward-compatible alias for the affine requantization fallback."""
+
+    return convert_compressed_tensors_nvfp4_requant_affine_to_mlx(
+        source_path,
+        output_path,
+        source_repo=source_repo,
+        source_sha=source_sha,
+        progress_callback=progress_callback,
+        target_bits=target_bits,
+        target_group_size=target_group_size,
+        target_mode=target_mode,
+    )
+
+
+def convert_compressed_tensors_nvfp4_native_to_mlx(
+    source_path: Path,
+    output_path: Path,
+    *,
+    source_repo: str,
+    source_sha: str | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    """Convert compressed-tensors NVFP4 W4A16 weights to native MLX nvfp4."""
+
+    return convert_compressed_tensors_awq_to_mlx(
+        source_path,
+        output_path,
+        source_repo=source_repo,
+        source_sha=source_sha,
+        progress_callback=progress_callback,
+        packed_format="nvfp4_native",
+        target_bits=4,
+        target_group_size=16,
+        target_mode="nvfp4",
     )
 
 
@@ -412,7 +477,9 @@ class _TensorReader:
             try:
                 from safetensors import safe_open
             except Exception as exc:
-                raise RuntimeError(f"safetensors is required for compressed-tensors Forge: {exc}") from exc
+                raise RuntimeError(
+                    f"safetensors is required for compressed-tensors Forge: {exc}"
+                ) from exc
             handle = self.stack.enter_context(
                 safe_open(str(self.source_path / filename), framework="mlx")
             )
@@ -465,7 +532,9 @@ class _TensorReader:
         try:
             import numpy as np
         except Exception as exc:
-            raise RuntimeError(f"numpy is required to read BF16 safetensors: {exc}") from exc
+            raise RuntimeError(
+                f"numpy is required to read BF16 safetensors: {exc}"
+            ) from exc
 
         header_len, _ = self._header(filename)
         shape = tuple(int(dim) for dim in metadata.get("shape") or ())
@@ -509,6 +578,95 @@ def _convert_packed(prefix: str, reader: _TensorReader) -> dict[str, mx.array]:
     else:
         out[f"{prefix}.biases"] = -8 * scale
     return out
+
+
+def pack_nvfp4_weight_bytes_to_mlx(packed: mx.array) -> mx.array:
+    if packed.ndim < 1:
+        raise ValueError("NVFP4 packed weights must have at least one dimension")
+    tail = int(packed.shape[-1])
+    if tail % 4 != 0:
+        raise ValueError(
+            f"NVFP4 packed tail dimension must be divisible by 4, got {tail}"
+        )
+    grouped = packed.astype(mx.uint32).reshape(*packed.shape[:-1], tail // 4, 4)
+    shifts = mx.arange(4, dtype=mx.uint32) * 8
+    return mx.sum(grouped << shifts, axis=-1).astype(mx.uint32)
+
+
+def repack_nvfp4_block_scales_to_mlx(scale: mx.array) -> mx.array:
+    return scale.astype(mx.uint8)
+
+
+def global_scale_w_from_inverse_tensor(inverse_scale: mx.array) -> mx.array:
+    inv = inverse_scale.astype(mx.float32).reshape(-1)
+    return (1.0 / mx.max(inv)).reshape(1)
+
+
+def convert_fp8_weight_to_q8_0(
+    weight: mx.array, *, group_size: int = 32
+) -> dict[str, mx.array]:
+    dense = weight.astype(mx.float16)
+    qweight, qscales, qbiases = mx.quantize(
+        dense,
+        group_size=int(group_size),
+        bits=8,
+        mode="affine",
+    )
+    return {
+        "weight": qweight,
+        "scales": qscales,
+        "biases": qbiases,
+    }
+
+
+def _convert_nvfp4_native(prefix: str, reader: _TensorReader) -> dict[str, mx.array]:
+    packed = reader.tensor(f"{prefix}.weight_packed").astype(mx.uint8)
+    scale = _read_f8_e4m3_tensor_as_u8(reader, f"{prefix}.weight_scale")
+    out = {
+        f"{prefix}.weight": pack_nvfp4_weight_bytes_to_mlx(packed),
+        f"{prefix}.scales": repack_nvfp4_block_scales_to_mlx(scale),
+    }
+    for global_key in (f"{prefix}.weight_global_scale", f"{prefix}.weight_scale_2"):
+        try:
+            inverse = reader.tensor(global_key).astype(mx.float32)
+        except KeyError:
+            continue
+        out[f"{prefix}.global_scale_w"] = global_scale_w_from_inverse_tensor(inverse)
+        break
+    for input_key in (f"{prefix}.input_global_scale", f"{prefix}.input_scale"):
+        try:
+            out[f"{prefix}.input_scale"] = (
+                reader.tensor(input_key).astype(mx.float32).reshape(1)
+            )
+        except KeyError:
+            continue
+        break
+    return out
+
+
+def _read_f8_e4m3_tensor_as_u8(reader: _TensorReader, key: str) -> mx.array:
+    raw, metadata = reader.raw_tensor(key)
+    shape = tuple(int(dim) for dim in metadata.get("shape") or ())
+    if metadata.get("dtype") == "F8_E4M3":
+        try:
+            import numpy as np
+        except Exception as exc:
+            raise RuntimeError(
+                f"numpy is required to read F8_E4M3 safetensors: {exc}"
+            ) from exc
+        byte_values = np.frombuffer(raw, dtype=np.uint8)
+        expected = math.prod(shape)
+        if byte_values.size != expected:
+            raise ValueError(
+                f"{key} byte size {byte_values.size} does not match shape {shape}"
+            )
+        return mx.array(byte_values.reshape(shape), dtype=mx.uint8)
+    tensor = reader.tensor(key)
+    if tensor.dtype == mx.uint8:
+        return tensor
+    raise ValueError(
+        f"{key} must be raw F8_E4M3 or uint8 for native NVFP4 repack, got {tensor.dtype}"
+    )
 
 
 def _convert_nvfp4(
@@ -567,7 +725,9 @@ def _unpack_nvfp4_e2m1(packed: mx.array) -> mx.array:
     )
     low = mx.take(table, packed & 0xF)
     high = mx.take(table, (packed >> 4) & 0xF)
-    return mx.stack([low, high], axis=-1).reshape(*packed.shape[:-1], packed.shape[-1] * 2)
+    return mx.stack([low, high], axis=-1).reshape(
+        *packed.shape[:-1], packed.shape[-1] * 2
+    )
 
 
 def _read_f8_e4m3_tensor(reader: _TensorReader, key: str) -> mx.array:
@@ -577,13 +737,17 @@ def _read_f8_e4m3_tensor(reader: _TensorReader, key: str) -> mx.array:
     try:
         import numpy as np
     except Exception as exc:
-        raise RuntimeError(f"numpy is required to read F8_E4M3 safetensors: {exc}") from exc
+        raise RuntimeError(
+            f"numpy is required to read F8_E4M3 safetensors: {exc}"
+        ) from exc
 
     shape = tuple(int(dim) for dim in metadata.get("shape") or ())
     byte_values = np.frombuffer(raw, dtype=np.uint8)
     expected = math.prod(shape)
     if byte_values.size != expected:
-        raise ValueError(f"{key} byte size {byte_values.size} does not match shape {shape}")
+        raise ValueError(
+            f"{key} byte size {byte_values.size} does not match shape {shape}"
+        )
     values = _decode_e4m3fn(byte_values).reshape(shape)
     return mx.array(values, dtype=mx.float32)
 
@@ -731,7 +895,7 @@ def _quantized_module_prefixes(weights: dict[str, mx.array]) -> set[str]:
         if not key.endswith(".weight"):
             continue
         prefix = key[: -len(".weight")]
-        if f"{prefix}.scales" in weights and f"{prefix}.biases" in weights:
+        if f"{prefix}.scales" in weights:
             modules.add(prefix)
     return modules
 
@@ -741,9 +905,13 @@ def sanitize_plain_weight(key: str, value: mx.array) -> mx.array:
         value = value.moveaxis(2, 1)
     if value.ndim == 1:
         if key.startswith("mtp."):
-            if any(key.endswith(suffix) for suffix in MTP_RMSNORM_ALWAYS_SHIFT_SUFFIXES):
+            if any(
+                key.endswith(suffix) for suffix in MTP_RMSNORM_ALWAYS_SHIFT_SUFFIXES
+            ):
                 value = value + 1.0
-            elif any(key.endswith(suffix) for suffix in MTP_RMSNORM_SHIFT_IF_LOW_SUFFIXES):
+            elif any(
+                key.endswith(suffix) for suffix in MTP_RMSNORM_SHIFT_IF_LOW_SUFFIXES
+            ):
                 if float(value.mean().item()) < 0.5:
                     value = value + 1.0
         elif any(key.endswith(suffix) for suffix in MAIN_RMSNORM_SHIFT_SUFFIXES):
@@ -756,7 +924,11 @@ def _sanitize_plain_weight(key: str, value: mx.array) -> mx.array:
 
 
 def _quant_params_from_config(config: dict[str, Any]) -> dict[str, Any]:
-    quant = config.get("quantization_config") or text_config(config).get("quantization_config") or {}
+    quant = (
+        config.get("quantization_config")
+        or text_config(config).get("quantization_config")
+        or {}
+    )
     if isinstance(quant, dict):
         bits = quant.get("bits")
         group_size = quant.get("group_size")
@@ -802,7 +974,9 @@ def _write_config(
         final_config["text_config"] = tcfg
     final_config["library_name"] = "mlx"
     final_config.setdefault("language_model_only", False)
-    if "vision_config" in final_config and isinstance(final_config["vision_config"], dict):
+    if "vision_config" in final_config and isinstance(
+        final_config["vision_config"], dict
+    ):
         vision_config = dict(final_config["vision_config"])
         if vision_config.get("model_type") == "qwen3_5_vision":
             vision_config["model_type"] = "qwen3_5"
@@ -930,7 +1104,9 @@ def _audit_conversion(
     ):
         problems.append("missing lm_head.weight")
     if mtp_quantized_modules and not mtp_weights:
-        problems.append("MTP quantized modules were detected but mtp.safetensors is empty")
+        problems.append(
+            "MTP quantized modules were detected but mtp.safetensors is empty"
+        )
     return {
         "passed": not problems,
         "problems": problems,
@@ -943,7 +1119,9 @@ def _audit_conversion(
             sorted(Counter(_quant_group(path) for path in quantized_modules).items())
         ),
         "mtp_module_groups": dict(
-            sorted(Counter(_quant_group(path) for path in mtp_quantized_modules).items())
+            sorted(
+                Counter(_quant_group(path) for path in mtp_quantized_modules).items()
+            )
         ),
     }
 
@@ -967,7 +1145,9 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def _emit(callback: ProgressCallback | None, payload: dict[str, Any]) -> None:

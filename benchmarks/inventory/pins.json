@@ -1,0 +1,32 @@
+{
+  "hardware": {
+    "model": "MacBook Pro M5 Pro",
+    "memory_gb": 64
+  },
+  "forks": {
+    "mlx": {
+      "path": "/Users/jonathangadeaharder/projects/mlx-nvfp4",
+      "commit": "8d8b0541226cc613636c81014b277886c1c7d34f"
+    },
+    "mtplx": {
+      "path": "/Users/jonathangadeaharder/projects/MTPLX-nvfp4",
+      "commit": "43c8f96dc6f4209114bcc9e6d91351ccb78f0fbc"
+    }
+  },
+  "models": {
+    "nvidia/Qwen3.6-27B-NVFP4": {
+      "tensor_count": 2194,
+      "mtp_tensor_count": 15,
+      "format": "modelopt",
+      "tensor_suffixes": [
+        ".weight",
+        ".weight_scale",
+        ".weight_scale_2",
+        ".input_scale"
+      ]
+    },
+    "Brooooooklyn/Qwen3.6-27B-NVFP4-mlx": {
+      "role": "reference_mlx_artifact"
+    }
+  }
+}

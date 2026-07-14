@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="500" viewBox="0 0 600 500">
+<rect width="100%" height="100%" fill="white"/>
+<text x="300.00" y="22" font-family="serif" font-size="14" text-anchor="middle">Context curve (decode tok/s)</text>
+<rect x="72" y="36" width="504" height="376" fill="none" stroke="black" stroke-width="1"/>
+</svg>

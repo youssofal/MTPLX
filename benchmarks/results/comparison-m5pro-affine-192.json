@@ -1,0 +1,126 @@
+{
+  "sampler_profile": "mtplx-optimized",
+  "protocol": {
+    "max_tokens": 192,
+    "measured_runs": 1,
+    "warmups": 0,
+    "fans_pinned": true
+  },
+  "reference_lines": [
+    {
+      "label": "Blog RTX 5090 NVFP4 MTP D3 (unverified prompt)",
+      "decode_tok_s": 45.0,
+      "source": "Benjamin Behringer blog"
+    }
+  ],
+  "lanes": [
+    {
+      "lane": "affine_ar",
+      "quantization_family": "affine",
+      "generation_mode": "ar",
+      "mtp_depth": 0,
+      "decode_tok_s": 10.900116686325681,
+      "decode_tok_s_median": 10.900116686325681,
+      "generated_tokens": 192,
+      "prompt_tokens": 27,
+      "model_path": "/Users/jonathangadeaharder/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed",
+      "hardware": {
+        "arm64": 1,
+        "chip": "Apple M5 Pro",
+        "chip_family": "Apple M5 Pro",
+        "efficiency_cores": 12,
+        "hw_model": "Mac17,9",
+        "logical_cpu": 18,
+        "machine": "arm64",
+        "macos_build": "25F84",
+        "macos_version": "26.5.2",
+        "memory_gib": 64.0,
+        "perf_cores": 6,
+        "physical_cpu": 18,
+        "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+        "system": "Darwin"
+      }
+    },
+    {
+      "lane": "affine_mtp_d1",
+      "quantization_family": "affine",
+      "generation_mode": "mtp",
+      "mtp_depth": 1,
+      "decode_tok_s": 16.596065260455205,
+      "decode_tok_s_median": 16.596065260455205,
+      "generated_tokens": 192,
+      "prompt_tokens": 27,
+      "model_path": "/Users/jonathangadeaharder/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed",
+      "hardware": {
+        "arm64": 1,
+        "chip": "Apple M5 Pro",
+        "chip_family": "Apple M5 Pro",
+        "efficiency_cores": 12,
+        "hw_model": "Mac17,9",
+        "logical_cpu": 18,
+        "machine": "arm64",
+        "macos_build": "25F84",
+        "macos_version": "26.5.2",
+        "memory_gib": 64.0,
+        "perf_cores": 6,
+        "physical_cpu": 18,
+        "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+        "system": "Darwin"
+      }
+    },
+    {
+      "lane": "affine_mtp_d2",
+      "quantization_family": "affine",
+      "generation_mode": "mtp",
+      "mtp_depth": 2,
+      "decode_tok_s": 20.33594818628815,
+      "decode_tok_s_median": 20.33594818628815,
+      "generated_tokens": 192,
+      "prompt_tokens": 27,
+      "model_path": "/Users/jonathangadeaharder/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed",
+      "hardware": {
+        "arm64": 1,
+        "chip": "Apple M5 Pro",
+        "chip_family": "Apple M5 Pro",
+        "efficiency_cores": 12,
+        "hw_model": "Mac17,9",
+        "logical_cpu": 18,
+        "machine": "arm64",
+        "macos_build": "25F84",
+        "macos_version": "26.5.2",
+        "memory_gib": 64.0,
+        "perf_cores": 6,
+        "physical_cpu": 18,
+        "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+        "system": "Darwin"
+      }
+    },
+    {
+      "lane": "affine_mtp_d3",
+      "quantization_family": "affine",
+      "generation_mode": "mtp",
+      "mtp_depth": 3,
+      "decode_tok_s": 23.354727848207055,
+      "decode_tok_s_median": 23.354727848207055,
+      "generated_tokens": 192,
+      "prompt_tokens": 27,
+      "model_path": "/Users/jonathangadeaharder/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed",
+      "hardware": {
+        "arm64": 1,
+        "chip": "Apple M5 Pro",
+        "chip_family": "Apple M5 Pro",
+        "efficiency_cores": 12,
+        "hw_model": "Mac17,9",
+        "logical_cpu": 18,
+        "machine": "arm64",
+        "macos_build": "25F84",
+        "macos_version": "26.5.2",
+        "memory_gib": 64.0,
+        "perf_cores": 6,
+        "physical_cpu": 18,
+        "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+        "system": "Darwin"
+      }
+    }
+  ]
+}

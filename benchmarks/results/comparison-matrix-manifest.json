@@ -1,0 +1,210 @@
+{
+  "action": "bench comparison matrix",
+  "lanes": [
+    {
+      "acceptance_by_depth": [],
+      "correction_count": null,
+      "decode_tok_s": null,
+      "end_to_end_tok_s": null,
+      "error": "manifest_only_no_inference",
+      "generated_tokens": 0,
+      "generation_mode": "ar",
+      "lane": "affine_ar",
+      "model_path": "/Users/jonathangadeaharder/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed",
+      "mtp_depth": 0,
+      "peak_memory_bytes": null,
+      "prefill_tok_s": null,
+      "prompt_tokens": 512,
+      "quantization_family": "affine",
+      "ttft_s": null
+    },
+    {
+      "acceptance_by_depth": [
+        null
+      ],
+      "correction_count": null,
+      "decode_tok_s": null,
+      "end_to_end_tok_s": null,
+      "error": "manifest_only_no_inference",
+      "generated_tokens": 0,
+      "generation_mode": "mtp",
+      "lane": "affine_mtp_d1",
+      "model_path": "/Users/jonathangadeaharder/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed",
+      "mtp_depth": 1,
+      "peak_memory_bytes": null,
+      "prefill_tok_s": null,
+      "prompt_tokens": 512,
+      "quantization_family": "affine",
+      "ttft_s": null
+    },
+    {
+      "acceptance_by_depth": [
+        null,
+        null
+      ],
+      "correction_count": null,
+      "decode_tok_s": null,
+      "end_to_end_tok_s": null,
+      "error": "manifest_only_no_inference",
+      "generated_tokens": 0,
+      "generation_mode": "mtp",
+      "lane": "affine_mtp_d2",
+      "model_path": "/Users/jonathangadeaharder/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed",
+      "mtp_depth": 2,
+      "peak_memory_bytes": null,
+      "prefill_tok_s": null,
+      "prompt_tokens": 512,
+      "quantization_family": "affine",
+      "ttft_s": null
+    },
+    {
+      "acceptance_by_depth": [
+        null,
+        null,
+        null
+      ],
+      "correction_count": null,
+      "decode_tok_s": null,
+      "end_to_end_tok_s": null,
+      "error": "manifest_only_no_inference",
+      "generated_tokens": 0,
+      "generation_mode": "mtp",
+      "lane": "affine_mtp_d3",
+      "model_path": "/Users/jonathangadeaharder/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed",
+      "mtp_depth": 3,
+      "peak_memory_bytes": null,
+      "prefill_tok_s": null,
+      "prompt_tokens": 512,
+      "quantization_family": "affine",
+      "ttft_s": null
+    },
+    {
+      "acceptance_by_depth": [],
+      "correction_count": null,
+      "decode_tok_s": null,
+      "end_to_end_tok_s": null,
+      "error": "manifest_only_no_inference",
+      "generated_tokens": 0,
+      "generation_mode": "ar",
+      "lane": "nvfp4_ar",
+      "model_path": "Brooooooklyn/Qwen3.6-27B-NVFP4-mlx",
+      "mtp_depth": 0,
+      "peak_memory_bytes": null,
+      "prefill_tok_s": null,
+      "prompt_tokens": 512,
+      "quantization_family": "nvfp4",
+      "ttft_s": null
+    },
+    {
+      "acceptance_by_depth": [
+        null
+      ],
+      "correction_count": null,
+      "decode_tok_s": null,
+      "end_to_end_tok_s": null,
+      "error": "manifest_only_no_inference",
+      "generated_tokens": 0,
+      "generation_mode": "mtp",
+      "lane": "nvfp4_mtp_d1",
+      "model_path": "Brooooooklyn/Qwen3.6-27B-NVFP4-mlx",
+      "mtp_depth": 1,
+      "peak_memory_bytes": null,
+      "prefill_tok_s": null,
+      "prompt_tokens": 512,
+      "quantization_family": "nvfp4",
+      "ttft_s": null
+    },
+    {
+      "acceptance_by_depth": [
+        null,
+        null
+      ],
+      "correction_count": null,
+      "decode_tok_s": null,
+      "end_to_end_tok_s": null,
+      "error": "manifest_only_no_inference",
+      "generated_tokens": 0,
+      "generation_mode": "mtp",
+      "lane": "nvfp4_mtp_d2",
+      "model_path": "Brooooooklyn/Qwen3.6-27B-NVFP4-mlx",
+      "mtp_depth": 2,
+      "peak_memory_bytes": null,
+      "prefill_tok_s": null,
+      "prompt_tokens": 512,
+      "quantization_family": "nvfp4",
+      "ttft_s": null
+    },
+    {
+      "acceptance_by_depth": [
+        null,
+        null,
+        null
+      ],
+      "correction_count": null,
+      "decode_tok_s": null,
+      "end_to_end_tok_s": null,
+      "error": "manifest_only_no_inference",
+      "generated_tokens": 0,
+      "generation_mode": "mtp",
+      "lane": "nvfp4_mtp_d3",
+      "model_path": "Brooooooklyn/Qwen3.6-27B-NVFP4-mlx",
+      "mtp_depth": 3,
+      "peak_memory_bytes": null,
+      "prefill_tok_s": null,
+      "prompt_tokens": 512,
+      "quantization_family": "nvfp4",
+      "ttft_s": null
+    }
+  ],
+  "pins": {
+    "forks": {
+      "mlx": {
+        "commit": "8d8b0541226cc613636c81014b277886c1c7d34f",
+        "path": "/Users/jonathangadeaharder/projects/mlx-nvfp4"
+      },
+      "mtplx": {
+        "commit": "43c8f96dc6f4209114bcc9e6d91351ccb78f0fbc",
+        "path": "/Users/jonathangadeaharder/projects/MTPLX-nvfp4"
+      }
+    },
+    "hardware": {
+      "memory_gb": 64,
+      "model": "MacBook Pro M5 Pro"
+    },
+    "models": {
+      "Brooooooklyn/Qwen3.6-27B-NVFP4-mlx": {
+        "role": "reference_mlx_artifact"
+      },
+      "nvidia/Qwen3.6-27B-NVFP4": {
+        "format": "modelopt",
+        "mtp_tensor_count": 15,
+        "tensor_count": 2194,
+        "tensor_suffixes": [
+          ".weight",
+          ".weight_scale",
+          ".weight_scale_2",
+          ".input_scale"
+        ]
+      }
+    }
+  },
+  "problems": [],
+  "protocol": {
+    "dry_run": false,
+    "manifest_only": true,
+    "max_tokens": 128,
+    "measured_runs": 10,
+    "prompt_tokens": 512,
+    "seed": 42,
+    "warmups": 2
+  },
+  "sampler": {
+    "draft_temperature": 0.7,
+    "enable_thinking": false,
+    "temperature": 0.6,
+    "top_k": 20,
+    "top_p": 0.95
+  },
+  "sampler_profile": "mtplx-optimized",
+  "valid": true
+}

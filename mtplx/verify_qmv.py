@@ -16,6 +16,46 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
+def is_nvfp4_eligible(module: Any) -> bool:
+    """Return whether a QuantizedLinear uses native MLX nvfp4 (group size 16)."""
+    if not isinstance(module, nn.QuantizedLinear):
+        return False
+    if int(getattr(module, "bits", 0) or 0) != 4:
+        return False
+    if int(getattr(module, "group_size", 0) or 0) != 16:
+        return False
+    if str(getattr(module, "mode", "")) != "nvfp4":
+        return False
+    if getattr(module, "scales", None) is None:
+        return False
+    return True
+
+
+def nvfp4_stock_matmul(
+    x: mx.array,
+    module: nn.QuantizedLinear,
+) -> mx.array:
+    """Route nvfp4 modules through stock ``mx.quantized_matmul``."""
+    if not is_nvfp4_eligible(module):
+        return module(x)
+    if len(x.shape) < 2 or x.dtype not in (mx.bfloat16, mx.float16):
+        return module(x)
+
+    kwargs: dict[str, Any] = {
+        "transpose": True,
+        "group_size": int(module.group_size),
+        "bits": int(module.bits),
+        "mode": str(module.mode),
+    }
+    global_scale_w = module.get("global_scale_w") if hasattr(module, "get") else None
+    if global_scale_w is not None:
+        kwargs["global_scale_w"] = global_scale_w
+    out = mx.quantized_matmul(x, module.weight, module.scales, **kwargs)
+    if "bias" in module:
+        out = out + module["bias"]
+    return out
+
+
 def is_multi3_qmv4_eligible(module: Any) -> bool:
     """Return whether a QuantizedLinear can use the experimental M=3 qmv path."""
     if not isinstance(module, nn.QuantizedLinear):
@@ -35,19 +75,32 @@ def is_multi3_qmv4_eligible(module: Any) -> bool:
 
 def is_smalln_pair_qmv4_eligible(left: Any, right: Any) -> bool:
     """Return whether two tiny-N affine int4 linears can use the pair kernel."""
-    if not (isinstance(left, nn.QuantizedLinear) and isinstance(right, nn.QuantizedLinear)):
+    if not (
+        isinstance(left, nn.QuantizedLinear) and isinstance(right, nn.QuantizedLinear)
+    ):
         return False
-    if int(getattr(left, "bits", 0) or 0) != 4 or int(getattr(right, "bits", 0) or 0) != 4:
+    if (
+        int(getattr(left, "bits", 0) or 0) != 4
+        or int(getattr(right, "bits", 0) or 0) != 4
+    ):
         return False
-    if int(getattr(left, "group_size", 0) or 0) != int(getattr(right, "group_size", 0) or 0):
+    if int(getattr(left, "group_size", 0) or 0) != int(
+        getattr(right, "group_size", 0) or 0
+    ):
         return False
     if int(getattr(left, "group_size", 0) or 0) not in {32, 64, 128}:
         return False
-    if str(getattr(left, "mode", "affine")) != "affine" or str(getattr(right, "mode", "affine")) != "affine":
+    if (
+        str(getattr(left, "mode", "affine")) != "affine"
+        or str(getattr(right, "mode", "affine")) != "affine"
+    ):
         return False
     if getattr(left, "biases", None) is None or getattr(right, "biases", None) is None:
         return False
-    if left.weight.shape != right.weight.shape or left.scales.shape != right.scales.shape:
+    if (
+        left.weight.shape != right.weight.shape
+        or left.scales.shape != right.scales.shape
+    ):
         return False
     k = int(left.weight.shape[1]) * 8
     n = int(left.weight.shape[0])
@@ -200,6 +253,8 @@ def multi3_qmv4_matmul(
     Falls back to the module for unsupported shapes so callers can wire it into
     probes without risking invalid runtime behavior.
     """
+    if is_nvfp4_eligible(module):
+        return nvfp4_stock_matmul(x, module)
     if not is_multi3_qmv4_eligible(module):
         return module(x)
     if len(x.shape) < 2 or int(x.shape[-2]) != 3:
@@ -617,7 +672,9 @@ def multi3_dual_qmv4_matmul(
     up_module: nn.QuantizedLinear,
 ) -> tuple[mx.array, mx.array]:
     """Compute MLP gate/up projections together for M=3 VerifyCore probes."""
-    if not (is_multi3_qmv4_eligible(gate_module) and is_multi3_qmv4_eligible(up_module)):
+    if not (
+        is_multi3_qmv4_eligible(gate_module) and is_multi3_qmv4_eligible(up_module)
+    ):
         return gate_module(x), up_module(x)
     if gate_module.weight.shape != up_module.weight.shape:
         return gate_module(x), up_module(x)
@@ -836,7 +893,9 @@ def multi3_parallel_dual_qmv4_matmul(
     up_module: nn.QuantizedLinear,
 ) -> tuple[mx.array, mx.array]:
     """Compute MLP gate/up with one dispatch and parallel simdgroup halves."""
-    if not (is_multi3_qmv4_eligible(gate_module) and is_multi3_qmv4_eligible(up_module)):
+    if not (
+        is_multi3_qmv4_eligible(gate_module) and is_multi3_qmv4_eligible(up_module)
+    ):
         return gate_module(x), up_module(x)
     if gate_module.weight.shape != up_module.weight.shape:
         return gate_module(x), up_module(x)
@@ -1066,8 +1125,10 @@ def multi3_swiglu_down_qmv4_matmul(
     module: nn.QuantizedLinear,
 ) -> mx.array:
     """Compute ``module(nn.silu(gate) * up)`` with fused activation input."""
+
     def fallback() -> mx.array:
         return module(nn.silu(gate) * up)
+
     if gate.shape != up.shape:
         return fallback()
     if not is_multi3_qmv4_eligible(module):
@@ -1219,6 +1280,8 @@ def stocklike_qmv4_matmul(
     module: nn.QuantizedLinear,
 ) -> mx.array:
     """Probe kernel matching MLX qmv-fast tiling for exactness diagnosis."""
+    if is_nvfp4_eligible(module):
+        return nvfp4_stock_matmul(x, module)
     if not is_multi3_qmv4_eligible(module):
         return module(x)
     if len(x.shape) < 2 or x.dtype not in (mx.bfloat16, mx.float16):

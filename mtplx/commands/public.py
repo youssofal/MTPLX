@@ -275,13 +275,10 @@ def _detect_total_ram_bytes_for_opencode_defaults() -> int | None:
 def _opencode_memory_env_defaults() -> dict[str, str]:
     total_ram = _detect_total_ram_bytes_for_opencode_defaults()
     high_memory = (
-        total_ram is not None
-        and total_ram >= _OPENCODE_HIGH_MEMORY_THRESHOLD_BYTES
+        total_ram is not None and total_ram >= _OPENCODE_HIGH_MEMORY_THRESHOLD_BYTES
     )
     max_bytes = _OPENCODE_HIGH_MEMORY_MAX_BYTES if high_memory else "8G"
-    per_session_bytes = (
-        _OPENCODE_HIGH_MEMORY_PER_SESSION_BYTES if high_memory else "4G"
-    )
+    per_session_bytes = _OPENCODE_HIGH_MEMORY_PER_SESSION_BYTES if high_memory else "4G"
     max_entries = (
         _OPENCODE_HIGH_MEMORY_MAX_ENTRIES
         if high_memory
@@ -349,12 +346,16 @@ def _runtime_env_with_external_overrides(runtime_env: dict[str, str]) -> dict[st
 
 
 def _model_runtime_contract(inspection: dict[str, Any]) -> dict[str, Any] | None:
-    compatibility = inspection.get("compatibility") if isinstance(inspection, dict) else None
+    compatibility = (
+        inspection.get("compatibility") if isinstance(inspection, dict) else None
+    )
     if isinstance(compatibility, dict):
         contract = compatibility.get("runtime_contract")
         if isinstance(contract, dict):
             return contract
-    contract = inspection.get("runtime_contract") if isinstance(inspection, dict) else None
+    contract = (
+        inspection.get("runtime_contract") if isinstance(inspection, dict) else None
+    )
     return contract if isinstance(contract, dict) else None
 
 
@@ -436,11 +437,7 @@ def _model_gate(
                 file=sys.stderr,
             )
         return inspection, None
-    if (
-        unsafe_force_unverified
-        and yes
-        and tier == TIER_ARCH_COMPATIBLE_UNVERIFIED
-    ):
+    if unsafe_force_unverified and yes and tier == TIER_ARCH_COMPATIBLE_UNVERIFIED:
         print(
             "WARNING: attempting an architecture-compatible but unverified MTPLX "
             "model; startup will continue and the loader result is authoritative.",
@@ -597,9 +594,9 @@ def _looks_like_gemma4_model_ref(value: Any) -> bool:
 
 
 def _public_depth_ceiling(args: Any) -> int:
-    if _looks_like_gemma4_model_ref(getattr(args, "model", None)) or _looks_like_gemma4_model_ref(
-        getattr(args, "model_id", None)
-    ):
+    if _looks_like_gemma4_model_ref(
+        getattr(args, "model", None)
+    ) or _looks_like_gemma4_model_ref(getattr(args, "model_id", None)):
         return MAX_GEMMA4_SPECULATIVE_DEPTH
     return MAX_PUBLIC_SPECULATIVE_DEPTH
 
@@ -837,10 +834,9 @@ def _apply_qwen36_35b_optimized_speed_defaults(args: Any, model_id: str) -> None
     # draft-sampler resolution treats them like requested values while
     # user-typed flags still win.
     args._injected_default_flags = injected
-    if (
-        "chat-template-profile" not in cli_flags
-        and getattr(args, "chat_template_profile", None) in (None, "local_qwen36")
-    ):
+    if "chat-template-profile" not in cli_flags and getattr(
+        args, "chat_template_profile", None
+    ) in (None, "local_qwen36"):
         args.chat_template_profile = "local_qwen36"
 
 
@@ -895,10 +891,9 @@ def _apply_backend_serve_defaults(args: Any, inspection: dict[str, Any]) -> None
     reasoning = descriptor.reasoning_codec
     if "reasoning" not in cli_flags and getattr(args, "reasoning", None) is None:
         args.reasoning = reasoning.default_mode if reasoning.supported else "off"
-    if (
-        "reasoning-parser" not in cli_flags
-        and getattr(args, "reasoning_parser", None) in (None, "qwen3")
-    ):
+    if "reasoning-parser" not in cli_flags and getattr(
+        args, "reasoning_parser", None
+    ) in (None, "qwen3"):
         args.reasoning_parser = descriptor.reasoning_codec.parser
     if (
         "reasoning-effort" not in cli_flags
@@ -928,16 +923,15 @@ def _apply_backend_serve_defaults(args: Any, inspection: dict[str, Any]) -> None
         and getattr(args, "depth", None) in (None, 3)
     ):
         args.depth = descriptor.draft_semantics.default
-    if (
-        "draft-temperature" not in cli_flags
-        and getattr(args, "draft_temperature", None) in (None, 0.6)
-    ):
+    if "draft-temperature" not in cli_flags and getattr(
+        args, "draft_temperature", None
+    ) in (None, 0.6):
         args.draft_temperature = sampler["temperature"]
     if "draft-top-p" not in cli_flags and getattr(args, "draft_top_p", None) is None:
         args.draft_top_p = sampler["top_p"]
-    if (
-        "draft-top-k" not in cli_flags
-        and getattr(args, "draft_top_k", None) in (None, 20)
+    if "draft-top-k" not in cli_flags and getattr(args, "draft_top_k", None) in (
+        None,
+        20,
     ):
         args.draft_top_k = sampler["top_k"]
     if (
@@ -1118,7 +1112,10 @@ def _preserve_thinking_policy(args: Any) -> str:
 
 def _pi_preserve_thinking_policy(args: Any) -> str:
     cli_flags = getattr(args, "_cli_flags", set()) or set()
-    if "preserve-thinking" in cli_flags or "strip-assistant-reasoning-history" in cli_flags:
+    if (
+        "preserve-thinking" in cli_flags
+        or "strip-assistant-reasoning-history" in cli_flags
+    ):
         return _preserve_thinking_policy(args)
     return "off"
 
@@ -1404,7 +1401,9 @@ def _pi_doctor_report(args: Any) -> dict[str, Any]:
         first = models[0]
         model_config = first if isinstance(first, dict) else None
     configured_model_id = (
-        str(model_config.get("id")) if isinstance(model_config, dict) and model_config.get("id") else None
+        str(model_config.get("id"))
+        if isinstance(model_config, dict) and model_config.get("id")
+        else None
     )
     model_ref = pi_model_ref(configured_model_id) if configured_model_id else None
     base_url = str(provider.get("baseUrl") or "") if isinstance(provider, dict) else ""
@@ -1469,7 +1468,9 @@ def _pi_doctor_report(args: Any) -> dict[str, Any]:
         "transport_headers": headers,
         "mtplx_client_header_configured": headers.get("x-mtplx-client") == "pi",
         "reasoning_enabled": (
-            bool(model_config.get("reasoning")) if isinstance(model_config, dict) else False
+            bool(model_config.get("reasoning"))
+            if isinstance(model_config, dict)
+            else False
         ),
         "has_hidden_max_tokens": "maxTokens" in json.dumps(model_config or {}),
         "expected_start_command": "mtplx start pi --port 8000 --profile sustained --max",
@@ -1655,7 +1656,9 @@ def _depth_sweep_native60(
             draft_temperature=(
                 None if draft_sampler is None else float(draft_sampler["temperature"])
             ),
-            draft_top_p=None if draft_sampler is None else float(draft_sampler["top_p"]),
+            draft_top_p=None
+            if draft_sampler is None
+            else float(draft_sampler["top_p"]),
             draft_top_k=None if draft_sampler is None else int(draft_sampler["top_k"]),
         )
     finally:
@@ -1800,7 +1803,11 @@ def cmd_doctor(args: Any) -> int:
             )
             print(
                 "  MTPLX client header: "
-                + ("ready" if opencode.get("mtplx_client_header_configured") else "missing")
+                + (
+                    "ready"
+                    if opencode.get("mtplx_client_header_configured")
+                    else "missing"
+                )
             )
             if opencode.get("stale_model_warning"):
                 print(f"  warning: {opencode.get('stale_model_warning')}")
@@ -1808,7 +1815,9 @@ def cmd_doctor(args: Any) -> int:
             pi = report["pi"]
             print("Pi:")
             print(f"  config: {pi.get('config_path')}")
-            print(f"  provider: {'present' if pi.get('provider_present') else 'missing'}")
+            print(
+                f"  provider: {'present' if pi.get('provider_present') else 'missing'}"
+            )
             print(f"  model: {pi.get('model_ref') or 'missing'}")
             if pi.get("model_matches_live_server") is True:
                 print("  model sync: ok")
@@ -1986,8 +1995,7 @@ def cmd_stop_public(args: Any) -> int:
     reason_lines = {
         "no_server": [f"No MTPLX server is listening on port {port}."],
         "not_mtplx": [
-            f"Port {port} is in use, but not by an MTPLX server. "
-            "Not touching it."
+            f"Port {port} is in use, but not by an MTPLX server. Not touching it."
         ],
         "no_pid": [
             f"The MTPLX server on port {port} does not report a pid; "
@@ -2062,9 +2070,7 @@ def cmd_settings_public(args: Any) -> int:
             print("usage: mtplx settings set key=value [key=value ...]")
             print("example: mtplx settings set depth=2 reasoning=off")
         return 2
-    response = _http_post_json(
-        base + "/v1/mtplx/settings", update, timeout=10.0
-    )
+    response = _http_post_json(base + "/v1/mtplx/settings", update, timeout=10.0)
     if response.get("ok"):
         body = response.get("json") or {}
         applied = body.get("applied") or {}
@@ -2098,14 +2104,10 @@ def cmd_settings_public(args: Any) -> int:
             )
             return 2
         if kind == "unknown_settings":
-            print(
-                "error: unknown settings: " + ", ".join(str(key) for key in keys)
-            )
+            print("error: unknown settings: " + ", ".join(str(key) for key in keys))
             supported = detail.get("supported") or []
             if supported:
-                print(
-                    "supported: " + ", ".join(str(key) for key in supported)
-                )
+                print("supported: " + ", ".join(str(key) for key in supported))
             return 2
     if isinstance(detail, str) and detail:
         print(f"error: {detail}")
@@ -2142,9 +2144,7 @@ def _format_aime_grid(per_question: list[dict[str, Any]]) -> list[str]:
     for row in per_question:
         idx = int(row.get("idx") or 0)
         status = str(row.get("status") or "")
-        marks[idx] = (
-            "✓" if status == "correct" else "·" if status == "skipped" else "✗"
-        )
+        marks[idx] = "✓" if status == "correct" else "·" if status == "skipped" else "✗"
     if not marks:
         return []
     highest = max(marks)
@@ -2319,7 +2319,9 @@ def _tune_requested_model(args: Any) -> str:
             return str(configured_model)
         try:
             selection = select_default_model()
-            model = getattr(selection, "model", None) or getattr(selection, "hf_model", None)
+            model = getattr(selection, "model", None) or getattr(
+                selection, "hf_model", None
+            )
             if model:
                 return str(model)
         except Exception:
@@ -2424,7 +2426,9 @@ def _fast_mtplx_tune_inspection(model: str) -> dict[str, Any] | None:
             (runtime or {}).get("recommended_profile") or DEFAULT_PROFILE_NAME
         ),
         "runtime_contract": runtime_contract,
-        "runtime_contract_path": str(runtime_path) if runtime_path is not None else None,
+        "runtime_contract_path": str(runtime_path)
+        if runtime_path is not None
+        else None,
         "runtime_compatibility": "native",
         "support_level": "mtplx-fast-tune",
     }
@@ -2439,7 +2443,9 @@ def _fast_mtplx_tune_inspection(model: str) -> dict[str, Any] | None:
         "recommended_backend": descriptor.backend_id,
         "recommended_profile": compatibility["recommended_profile"],
         "runtime_contract": runtime_contract,
-        "runtime_contract_path": str(runtime_path) if runtime_path is not None else None,
+        "runtime_contract_path": str(runtime_path)
+        if runtime_path is not None
+        else None,
         "compatibility": compatibility,
     }
 
@@ -2558,7 +2564,9 @@ def _parse_tune_candidate_values(
             value = int(part)
         except ValueError as exc:
             if field == "draft_block_size":
-                raise ValueError("Gemma tune blocks must be integers from 2 to 8") from exc
+                raise ValueError(
+                    "Gemma tune blocks must be integers from 2 to 8"
+                ) from exc
             raise ValueError("tune depths must be integers from 1 to 3") from exc
         if field == "draft_block_size":
             if value < 2 or value > 8:
@@ -2916,7 +2924,9 @@ def _cmd_tune_candidate(args: Any) -> int:
         value = int(candidate)
         if control_field == "draft_block_size":
             if value < 2 or value > 8:
-                return _tune_error("Gemma tune blocks must be between 2 and 8", json_output=True)
+                return _tune_error(
+                    "Gemma tune blocks must be between 2 and 8", json_output=True
+                )
         elif value < 1 or value > MAX_PUBLIC_SPECULATIVE_DEPTH:
             return _tune_error("tune depths must be between 1 and 3", json_output=True)
     profile = get_profile("performance-cold")
@@ -2971,7 +2981,9 @@ def _cmd_tune_candidate(args: Any) -> int:
         base_hidden_variant=getattr(args, "base_hidden_variant", None),
         concat_order=getattr(args, "concat_order", None),
         mtp_cache_policy=str(getattr(args, "mtp_cache_policy", None) or "persistent"),
-        mtp_history_policy=str(getattr(args, "mtp_history_policy", None) or "committed"),
+        mtp_history_policy=str(
+            getattr(args, "mtp_history_policy", None) or "committed"
+        ),
         compare_ar=candidate == "ar",
         ar_only=candidate == "ar",
         gemma4_draft_block_size=(
@@ -3125,8 +3137,12 @@ def _tune_settings(
             if getattr(args, "concat_order", None)
             else None
         ),
-        "mtp_cache_policy": str(getattr(args, "mtp_cache_policy", None) or "persistent"),
-        "mtp_history_policy": str(getattr(args, "mtp_history_policy", None) or "committed"),
+        "mtp_cache_policy": str(
+            getattr(args, "mtp_cache_policy", None) or "persistent"
+        ),
+        "mtp_history_policy": str(
+            getattr(args, "mtp_history_policy", None) or "committed"
+        ),
         "draft_temperature": getattr(args, "draft_temperature", None),
         "draft_top_p": getattr(args, "draft_top_p", None),
         "draft_top_k": getattr(args, "draft_top_k", None),
@@ -3252,11 +3268,14 @@ def _tune_dry_run_payload(
     commands = []
     for candidate in ["ar", *[str(depth) for depth in depths]]:
         candidate_output = output_root / (
-            _tune_candidate_file_stem(candidate, settings.get("control_field")) + ".json"
+            _tune_candidate_file_stem(candidate, settings.get("control_field"))
+            + ".json"
         )
         commands.append(
             {
-                "candidate": _tune_candidate_label(candidate, settings.get("control_field")),
+                "candidate": _tune_candidate_label(
+                    candidate, settings.get("control_field")
+                ),
                 "command": _tune_candidate_command(
                     args,
                     candidate=candidate,
@@ -3948,7 +3967,9 @@ def _tune_candidate_label(candidate: str, control_field: str | None = "depth") -
     return f"D{candidate}"
 
 
-def _tune_candidate_file_stem(candidate: str, control_field: str | None = "depth") -> str:
+def _tune_candidate_file_stem(
+    candidate: str, control_field: str | None = "depth"
+) -> str:
     if candidate == "ar":
         return "ar"
     if str(control_field or "depth") == "draft_block_size":
@@ -3977,7 +3998,9 @@ def _row_finish_reason_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def _row_hit_token_budget_count(rows: list[dict[str, Any]]) -> int:
-    return sum(1 for row in rows if isinstance(row, dict) and row.get("hit_token_budget"))
+    return sum(
+        1 for row in rows if isinstance(row, dict) and row.get("hit_token_budget")
+    )
 
 
 def _tune_candidate_summary(
@@ -3995,7 +4018,9 @@ def _tune_candidate_summary(
         "mode": label,
         "depth": candidate_value,
         "control_field": control_field,
-        "draft_block_size": candidate_value if control_field == "draft_block_size" else None,
+        "draft_block_size": candidate_value
+        if control_field == "draft_block_size"
+        else None,
         "candidate": candidate,
         "returncode": returncode,
         "artifact": str(path),
@@ -4345,17 +4370,17 @@ def _best_multiplier_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         if raw_winner is not None
         else None,
         "quality_rejected": [
-                {
-                    "mode": row.get("mode"),
-                    "depth": row.get("depth"),
-                    "tok_s": row.get("tok_s"),
-                    "multiplier_vs_ar": row.get("multiplier_vs_ar"),
-                    "hit_token_budget": row.get("hit_token_budget"),
-                    "hit_token_budget_count": row.get("hit_token_budget_count"),
-                    "finish_reasons": row.get("finish_reasons"),
-                }
-                for row in quality_rejected
-            ],
+            {
+                "mode": row.get("mode"),
+                "depth": row.get("depth"),
+                "tok_s": row.get("tok_s"),
+                "multiplier_vs_ar": row.get("multiplier_vs_ar"),
+                "hit_token_budget": row.get("hit_token_budget"),
+                "hit_token_budget_count": row.get("hit_token_budget_count"),
+                "finish_reasons": row.get("finish_reasons"),
+            }
+            for row in quality_rejected
+        ],
         "acceptance_collapsed": acceptance_collapsed,
         "failure_reasons": _tune_failure_reasons(
             annotated,
@@ -4568,7 +4593,9 @@ def _print_tune_human(payload: dict[str, Any], *, verbose: bool = False) -> None
             print("No MTP depth beat AR on this run")
     if payload.get("saved") and best:
         control_field = str(payload.get("control_field") or "").strip()
-        control_label = "draft block" if control_field == "draft_block_size" else "depth"
+        control_label = (
+            "draft block" if control_field == "draft_block_size" else "depth"
+        )
         print(
             f"Saved: Web UI starts will use {control_label} {best.get('depth')} for this model."
         )
@@ -5273,7 +5300,9 @@ def _bench_suite_is_quick(args: Any) -> bool:
     return bool(getattr(args, "quick", False))
 
 
-def _client_contract_task(label: str, client: str, *, max_tokens: int) -> dict[str, Any]:
+def _client_contract_task(
+    label: str, client: str, *, max_tokens: int
+) -> dict[str, Any]:
     return {
         "label": label,
         "suite": "flappy",
@@ -5350,7 +5379,11 @@ def _quick_suite_tasks(args: Any) -> list[dict[str, Any]]:
 
 
 def _bench_suite_tasks(args: Any) -> list[dict[str, Any]]:
-    return _quick_suite_tasks(args) if _bench_suite_is_quick(args) else _nightly_tasks(args)
+    return (
+        _quick_suite_tasks(args)
+        if _bench_suite_is_quick(args)
+        else _nightly_tasks(args)
+    )
 
 
 def _bench_suite_exactness_contexts(args: Any) -> str:
@@ -5358,7 +5391,10 @@ def _bench_suite_exactness_contexts(args: Any) -> str:
         getattr(args, "nightly_exactness_contexts", BENCH_SUITE_FULL_EXACTNESS_CONTEXTS)
         or BENCH_SUITE_FULL_EXACTNESS_CONTEXTS
     )
-    if _bench_suite_is_quick(args) and configured == BENCH_SUITE_FULL_EXACTNESS_CONTEXTS:
+    if (
+        _bench_suite_is_quick(args)
+        and configured == BENCH_SUITE_FULL_EXACTNESS_CONTEXTS
+    ):
         return BENCH_SUITE_QUICK_EXACTNESS_CONTEXTS
     return configured
 
@@ -5419,7 +5455,8 @@ def _bench_suite_task_gates(
         )
     if "late_verify_ms_le" in warn:
         gates["late_verify_ms_le_warn_floor"] = bool(
-            late_verify_ms is not None and late_verify_ms <= float(warn["late_verify_ms_le"])
+            late_verify_ms is not None
+            and late_verify_ms <= float(warn["late_verify_ms_le"])
         )
     return gates
 
@@ -5458,9 +5495,7 @@ def _cmd_bench_nightly(args: Any) -> int:
     run_id = args.run_id or f"{default_prefix}-{time.strftime('%Y%m%d-%H%M%S')}"
     tasks = _bench_suite_tasks(args)
     default_root = Path(
-        "outputs/cli/suite"
-        if action_name == "bench suite"
-        else "outputs/cli/nightly"
+        "outputs/cli/suite" if action_name == "bench suite" else "outputs/cli/nightly"
     )
     output = Path(args.output or default_root / run_id / "summary.json")
     task_root = Path(args.output_dir or output.parent)
@@ -5833,6 +5868,28 @@ def _cmd_bench_compare_envelopes(args: Any) -> int:
 
 
 def _cmd_bench_compare(args: Any) -> int:
+    if getattr(args, "matrix", False):
+        from mtplx.benchmarks.runners.comparison_matrix import (
+            run_comparison_matrix,
+            write_comparison_matrix,
+        )
+
+        payload = run_comparison_matrix(
+            affine_model=getattr(args, "affine_model", None),
+            nvfp4_model=getattr(args, "nvfp4_model", None),
+            model=getattr(args, "model", None),
+            sampler_profile_name=getattr(args, "sampler_profile", "mtplx-optimized"),
+            prompt_tokens=512,
+            max_tokens=int(getattr(args, "max_tokens", 512) or 512),
+            seed=int(getattr(args, "seed", 42) or 42),
+            dry_run=bool(getattr(args, "dry_run", False)),
+            manifest_only=bool(getattr(args, "manifest_only", False)),
+        )
+        output = getattr(args, "output", None)
+        if output:
+            write_comparison_matrix(output, payload)
+        _print(payload)
+        return 0 if payload.get("valid", True) else EXIT_STRICT_GATE
     if getattr(args, "before", None) or getattr(args, "after", None):
         return _cmd_bench_compare_envelopes(args)
     models = args.models or []
@@ -7130,9 +7187,7 @@ def cmd_dashboard_public(args: Any) -> int:
 
     health = _http_json(health_url, timeout=timeout)
     server_up = bool(
-        isinstance(health, dict)
-        and "error" not in health
-        and health.get("ok")
+        isinstance(health, dict) and "error" not in health and health.get("ok")
     )
 
     payload: dict[str, Any] = {
@@ -7146,14 +7201,10 @@ def cmd_dashboard_public(args: Any) -> int:
     if server_up:
         payload["model"] = health.get("model")
         profile = health.get("profile")
-        payload["profile"] = (
-            profile.get("name") if isinstance(profile, dict) else None
-        )
+        payload["profile"] = profile.get("name") if isinstance(profile, dict) else None
     else:
         payload["error"] = "MTPLX server is not reachable"
-        payload["detail"] = (
-            health.get("error") if isinstance(health, dict) else None
-        )
+        payload["detail"] = health.get("error") if isinstance(health, dict) else None
 
     if json_output:
         _print(payload)
@@ -7237,9 +7288,7 @@ def _active_mlx_fork_status(
                 break
     path_active = expected_fragment in str(path)
     commit_matches = expected_commit is None or commit in {None, expected_commit}
-    ok = path_active and (
-        expected_commit is None or commit in {None, expected_commit}
-    )
+    ok = path_active and (expected_commit is None or commit in {None, expected_commit})
     return {
         "ok": ok,
         "path_active": path_active,
@@ -7328,9 +7377,7 @@ def _prepend_pythonpath(env: dict[str, str], path: Path) -> None:
     parts = [part for part in existing.split(os.pathsep) if part]
     if path_text in parts:
         return
-    env["PYTHONPATH"] = (
-        path_text if not existing else path_text + os.pathsep + existing
-    )
+    env["PYTHONPATH"] = path_text if not existing else path_text + os.pathsep + existing
 
 
 def _apple_hardware_context() -> dict[str, Any]:
@@ -7731,22 +7778,34 @@ def _model_ref_from_public_model_id(model_id: str | None) -> str | None:
         Path(QUALITY_HF_MODEL_ID).name.lower(): QUALITY_HF_MODEL_ID,
         QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID.lower(): QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
         QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID.lower(): QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
-        Path(QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID).name.lower(): QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
+        Path(
+            QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID
+        ).name.lower(): QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
         QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID.lower(): QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
         QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID.lower(): QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
-        Path(QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID).name.lower(): QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+        Path(
+            QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID
+        ).name.lower(): QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
         QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID.lower(): QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
         QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID.lower(): QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
-        Path(QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID).name.lower(): QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
+        Path(
+            QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID
+        ).name.lower(): QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
         QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID.lower(): QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
         QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID.lower(): QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
-        Path(QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID).name.lower(): QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
+        Path(
+            QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID
+        ).name.lower(): QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
         QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID.lower(): QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID,
         QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID.lower(): QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID,
-        Path(QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID).name.lower(): QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID,
+        Path(
+            QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID
+        ).name.lower(): QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID,
         QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID.lower(): QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID,
         QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID.lower(): QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID,
-        Path(QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID).name.lower(): QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID,
+        Path(
+            QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID
+        ).name.lower(): QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID,
         "qwen3.6-35b-a3b-mtplx-official4-cyankiwimtp-cleanrecipe": QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
     }
     for candidate in lookup_keys:
@@ -7821,11 +7880,15 @@ def cmd_serve_public(args: Any) -> int:
         if getattr(args, "json", False):
             _print(payload)
         else:
-            print("error: --api-key or --api-key-file is required when --host is not localhost")
+            print(
+                "error: --api-key or --api-key-file is required when --host is not localhost"
+            )
             print(f"host: {getattr(args, 'host', None)}")
             server_command = _server_command_name(args)
             print(f"try: mtplx {server_command} --host 127.0.0.1")
-            print(f"try: mtplx {server_command} --host 0.0.0.0 --api-key-file ~/.mtplx/api-key")
+            print(
+                f"try: mtplx {server_command} --host 0.0.0.0 --api-key-file ~/.mtplx/api-key"
+            )
         return 2
     cli_flags = getattr(args, "_cli_flags", set()) or set()
     _apply_model_id_as_model_default(
@@ -7866,7 +7929,10 @@ def cmd_serve_public(args: Any) -> int:
         return depth_error
     generation_mode = _generation_mode_from_args(args)
     fan_mode = _fan_mode_from_args(args)
-    if generation_mode == GENERATION_MODE_MTP and getattr(args, "load_mtp", True) is False:
+    if (
+        generation_mode == GENERATION_MODE_MTP
+        and getattr(args, "load_mtp", True) is False
+    ):
         _print_serve_start_line("error: --generation-mode mtp requires --load-mtp")
         _print_serve_start_line("try: mtplx serve --generation-mode ar --no-load-mtp")
         return 2
@@ -7988,7 +8054,11 @@ def cmd_serve_public(args: Any) -> int:
             health = _http_json(base + "/health", timeout=1.5, api_key=api_key)
             if health.get("ok"):
                 command = str(getattr(args, "hermes_launch_command", "") or "").strip()
-                model_id = health.get("model") or getattr(args, "model_id", None) or DEFAULT_PUBLIC_MODEL_ID
+                model_id = (
+                    health.get("model")
+                    or getattr(args, "model_id", None)
+                    or DEFAULT_PUBLIC_MODEL_ID
+                )
                 _print_serve_start_line("MTPLX is already running.")
                 _print_serve_start_line(f"OpenAI API Base URL: {base}/v1")
                 _print_serve_start_line(f"Hermes model: {model_id}")
@@ -8178,7 +8248,10 @@ def cmd_serve_public(args: Any) -> int:
         "--verify-strategy",
         str(getattr(args, "verify_strategy", "capture_commit") or "capture_commit"),
         "--verify-core",
-        str(getattr(args, "verify_core", "linear-gdn-from-conv-tape") or "linear-gdn-from-conv-tape"),
+        str(
+            getattr(args, "verify_core", "linear-gdn-from-conv-tape")
+            or "linear-gdn-from-conv-tape"
+        ),
         "--draft-lm-head-bits",
         str(draft_lm_head["bits"]),
         "--draft-lm-head-group-size",
@@ -8336,7 +8409,9 @@ def cmd_serve_public(args: Any) -> int:
         cmd.append("--server-console")
     if bool(getattr(args, "quickstart_hermes", False)):
         cmd.extend(["--launch-hermes", "--server-console"])
-        hermes_launch_command = str(getattr(args, "hermes_launch_command", "") or "").strip()
+        hermes_launch_command = str(
+            getattr(args, "hermes_launch_command", "") or ""
+        ).strip()
         if hermes_launch_command:
             cmd.extend(["--hermes-launch-command", hermes_launch_command])
     if bool(getattr(args, "stock_ar", False)):
@@ -8612,7 +8687,9 @@ def _run_server_child_with_app_parent_watchdog(
                 if _pid_is_alive(app_parent_pid):
                     continue
                 triggered[0] = True
-                _safe_serve_watchdog_log("[mtplx] app parent exited; stopping app-owned daemon.")
+                _safe_serve_watchdog_log(
+                    "[mtplx] app parent exited; stopping app-owned daemon."
+                )
                 _terminate_server_child(proc, grace_s=shutdown_grace_s)
                 return
 
@@ -9817,7 +9894,9 @@ def _batching_command_suffix(args: Any) -> str:
             parts.extend(["--ssd-session-cache-dir", shlex.quote(str(ssd_dir))])
         ssd_max_size = getattr(args, "ssd_session_cache_max_size", None)
         if ssd_max_size:
-            parts.extend(["--ssd-session-cache-max-size", shlex.quote(str(ssd_max_size))])
+            parts.extend(
+                ["--ssd-session-cache-max-size", shlex.quote(str(ssd_max_size))]
+            )
         ssd_min_prefix = getattr(args, "ssd_session_cache_min_prefix_tokens", None)
         if ssd_min_prefix is not None:
             parts.extend(
@@ -9826,9 +9905,7 @@ def _batching_command_suffix(args: Any) -> str:
                     shlex.quote(str(ssd_min_prefix)),
                 ]
             )
-    paged_kv_quantization = str(
-        getattr(args, "paged_kv_quantization", "off") or "off"
-    )
+    paged_kv_quantization = str(getattr(args, "paged_kv_quantization", "off") or "off")
     if paged_kv_quantization != "off":
         parts.extend(["--paged-kv-quantization", shlex.quote(paged_kv_quantization)])
     return (" " + " ".join(parts)) if parts else ""
@@ -10179,7 +10256,9 @@ def _bridge_prompt_command_suffix(args: Any) -> str:
         parts.extend(["--tool-prompt-mode", shlex.quote(str(tool_prompt_mode))])
     chat_template_profile = getattr(args, "chat_template_profile", None)
     if chat_template_profile:
-        parts.extend(["--chat-template-profile", shlex.quote(str(chat_template_profile))])
+        parts.extend(
+            ["--chat-template-profile", shlex.quote(str(chat_template_profile))]
+        )
     chat_template_path = getattr(args, "chat_template_path", None)
     if chat_template_path:
         parts.extend(["--chat-template-path", shlex.quote(str(chat_template_path))])
@@ -10365,8 +10444,7 @@ def _quickstart_opencode_payload(
     enable_thinking = reasoning_mode != "off"
     cli_flags = getattr(args, "_cli_flags", set()) or set()
     default_tool_prompt_mode = str(
-        OPENCODE_FAIR_BATCHING_DEFAULTS.get("tool_prompt_mode")
-        or "hybrid"
+        OPENCODE_FAIR_BATCHING_DEFAULTS.get("tool_prompt_mode") or "hybrid"
     )
     tool_prompt_mode = (
         str(
@@ -10399,7 +10477,9 @@ def _quickstart_opencode_payload(
         if inspection is not None
         else None
     )
-    draft_sampler_source = "model_contract_or_profile" if draft_sampler is not None else None
+    draft_sampler_source = (
+        "model_contract_or_profile" if draft_sampler is not None else None
+    )
     draft_sampler_override = _explicit_draft_sampler_override(args, draft_sampler)
     if draft_sampler_override is not None:
         draft_sampler = draft_sampler_override
@@ -10978,8 +11058,7 @@ def _apply_opencode_memory_env_defaults(env: dict[str, str]) -> None:
 def _apply_hermes_memory_env_defaults(env: dict[str, str]) -> None:
     total_ram = _detect_total_ram_bytes_for_opencode_defaults()
     high_memory = (
-        total_ram is not None
-        and total_ram >= _OPENCODE_HIGH_MEMORY_THRESHOLD_BYTES
+        total_ram is not None and total_ram >= _OPENCODE_HIGH_MEMORY_THRESHOLD_BYTES
     )
     env.setdefault("MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE", "async_per_head")
     env.setdefault("MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_CONTEXT", "32768")
@@ -10988,7 +11067,9 @@ def _apply_hermes_memory_env_defaults(env: dict[str, str]) -> None:
     env.setdefault("MTPLX_SESSION_BLOCK_PREFIX_RESTORE", "1")
     env.setdefault(
         "MTPLX_SESSION_BANK_MAX_ENTRIES",
-        _OPENCODE_HIGH_MEMORY_MAX_ENTRIES if high_memory else _OPENCODE_DEFAULT_MAX_ENTRIES,
+        _OPENCODE_HIGH_MEMORY_MAX_ENTRIES
+        if high_memory
+        else _OPENCODE_DEFAULT_MAX_ENTRIES,
     )
     env.setdefault(
         "MTPLX_SESSION_BANK_MAX_BYTES",
@@ -11008,7 +11089,9 @@ def _apply_hermes_memory_env_defaults(env: dict[str, str]) -> None:
     env.setdefault("MTPLX_ACTIVE_READ_INSPECTION_MULTI_FILE_LINE_MAX_CHARS", "120")
     env.setdefault("MTPLX_READ_ONLY_INSPECTION_FORCE_ANSWER_AFTER_TOOLS", "12")
     env.setdefault("MTPLX_TOOL_PROMPT_MODE", "hybrid")
-    env.setdefault("MTPLX_CHAT_TEMPLATE_PROFILE", OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT)
+    env.setdefault(
+        "MTPLX_CHAT_TEMPLATE_PROFILE", OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT
+    )
     env.setdefault("MTPLX_CLIENT", "hermes")
 
 
@@ -11118,8 +11201,7 @@ def _quickstart_run_opencode(
     model_id = _quickstart_served_model_id(args, runtime_model)
     cli_flags = getattr(args, "_cli_flags", set()) or set()
     default_tool_prompt_mode = str(
-        OPENCODE_FAIR_BATCHING_DEFAULTS.get("tool_prompt_mode")
-        or "hybrid"
+        OPENCODE_FAIR_BATCHING_DEFAULTS.get("tool_prompt_mode") or "hybrid"
     )
     opencode_tool_prompt_mode = (
         str(
@@ -11544,9 +11626,7 @@ def _terminal_chat_attach_guard(args: Any, *, runtime_model: str) -> int | None:
     _quickstart_line(f"Stopping the server on port {daemon.port}...")
     result = stop_daemon(daemon.host, daemon.port)
     if not result.get("ok"):
-        _quickstart_line(
-            f"error: could not stop the server ({result.get('reason')})"
-        )
+        _quickstart_line(f"error: could not stop the server ({result.get('reason')})")
         return 1
     _quickstart_line("Server stopped.")
     return None
@@ -12012,7 +12092,11 @@ def cmd_quickstart_public(args: Any) -> int:
         # has no fan controller, offer to auto-install before MTPLX boots
         # rather than silently dumping the JSON warning later.
         fan_mode = _fan_mode_from_args(args)
-        if (has_explicit_max or has_explicit_fan_mode) and fan_mode == FAN_MODE_MAX and is_tty:
+        if (
+            (has_explicit_max or has_explicit_fan_mode)
+            and fan_mode == FAN_MODE_MAX
+            and is_tty
+        ):
             from mtplx.thermal import detect_thermal_control
 
             detection = detect_thermal_control()
@@ -12305,7 +12389,9 @@ def cmd_quickstart_public(args: Any) -> int:
                     json_output=bool(getattr(args, "json", False)),
                 )
                 return gate_exit
-            profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
+            profile = get_profile(
+                getattr(args, "profile", None) or DEFAULT_PROFILE_NAME
+            )
             _apply_model_contract_depth_default(args, inspection, profile)
             _apply_backend_serve_defaults(args, inspection)
             _quickstart_apply_tuned_depth(
@@ -13401,13 +13487,26 @@ def cmd_config_public(args: Any) -> int:
         "ar_batch",
         "mtp_cohort_experimental",
     }:
-        raise SystemExit("scheduler_mode must be serial, cooperative, ar_batch, or mtp_cohort_experimental")
-    if key == "batching_preset" and value not in {"solo", "latency", "agent", "throughput"}:
+        raise SystemExit(
+            "scheduler_mode must be serial, cooperative, ar_batch, or mtp_cohort_experimental"
+        )
+    if key == "batching_preset" and value not in {
+        "solo",
+        "latency",
+        "agent",
+        "throughput",
+    }:
         raise SystemExit("batching_preset must be solo, latency, agent, or throughput")
     if key == "ssd_session_cache" and value not in {"off", "on", "write-only"}:
         raise SystemExit("ssd_session_cache must be off, on, or write-only")
-    if key == "ram_session_cache_policy" and value not in {"target-default", "minimal", "bounded"}:
-        raise SystemExit("ram_session_cache_policy must be target-default, minimal, or bounded")
+    if key == "ram_session_cache_policy" and value not in {
+        "target-default",
+        "minimal",
+        "bounded",
+    }:
+        raise SystemExit(
+            "ram_session_cache_policy must be target-default, minimal, or bounded"
+        )
     if key == "reasoning" and value not in {"auto", "on", "off"}:
         raise SystemExit("reasoning must be auto, on, or off")
     if key == "reasoning_effort" and value not in {"auto", "low", "medium", "high"}:
