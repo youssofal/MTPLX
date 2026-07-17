@@ -1889,18 +1889,29 @@ class _BatchedARGenerationService:
                 top_k=int(getattr(job.sampler, "top_k", 0) or 0),
             )
         rng = np.random.default_rng(job.seed)
+        # Closure-local completion-token histogram. Each sampler is bound to one
+        # sequence and is invoked once per decode step, so counts is updated the
+        # instant a token is produced — before the NEXT sample is drawn. This
+        # avoids the one-step staleness of reading job.tokens at sample time:
+        # emit_token runs after generator.next() returns, but the sampler runs
+        # one step ahead inside next() (mlx-lm's one-step-lookahead pipeline),
+        # so job.tokens is missing the token generated immediately before —
+        # precisely the token a loop-breaking penalty most needs to see. Keeping
+        # the histogram in the closure makes the penalty see that token,
+        # matching the serial generate_ar path's Counter(tokens). Per-sampler
+        # scope also means no cross-request count leakage: mlx-lm keeps
+        # samplers index-aligned with uids across filter()/extend().
+        counts: Counter = Counter()
 
         def sample_one(logprobs: Any) -> Any:
-            # Presence/frequency penalties subtract against the completion tokens
-            # emitted so far for THIS job. ``job.tokens`` holds exactly those
-            # (emit_token appends after the pump samples), so Counter(job.tokens)
-            # mirrors the serial/MTP paths; without it the penalty has nothing to
-            # subtract against and silently no-ops (issue #156).
-            token_counts = Counter(job.tokens) if penalties_active else None
             token, _distribution = _sample_from_logits(
-                logprobs[0], job.sampler, rng, token_counts=token_counts
+                logprobs[0], job.sampler, rng,
+                token_counts=counts if penalties_active else None,
             )
-            return mx.array([int(token)])
+            token = int(token)
+            if penalties_active:
+                counts[token] += 1
+            return mx.array([token])
 
         return sample_one
 
