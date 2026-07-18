@@ -1566,6 +1566,21 @@ class GenerationStats:
     bonus_tokens: int = 0
     correction_tokens: int = 0
     verify_calls: int = 0
+    # Context-copy (prompt-lookup) drafting. Counters are cumulative per
+    # generation; the per-round detail stays in events. accepted_tokens counts
+    # verified matches (_cc_nacc), which can exceed emitted tokens when a stop
+    # token truncates the accepted block. suspended/backoff_tokens are gauges
+    # of the end-of-generation state, suspensions counts entries into backoff.
+    context_copy_active: bool = False
+    context_copy_probes: int = 0
+    context_copy_rounds: int = 0
+    context_copy_drafted_tokens: int = 0
+    context_copy_accepted_blocks: int = 0
+    context_copy_accepted_tokens: int = 0
+    context_copy_suspensions: int = 0
+    context_copy_suspended: bool = False
+    context_copy_backoff_tokens: int = 0
+    context_copy_disabled_reason: str | None = None
     graphbank: dict[str, object] = field(default_factory=dict)
     reject_path_counts: dict[str, int] = field(default_factory=dict)
     repair_time_by_reject_depth_s: dict[str, float] = field(default_factory=dict)
@@ -6144,6 +6159,8 @@ def generate_mtpk(
         and verify_strategy in {"capture_commit", "graphbank_capture_commit"}
     )
     ccopy_rounds = ccopy_drafted = ccopy_accepted = 0
+    ccopy_probes = ccopy_blocks_accepted = ccopy_suspensions = 0
+    ccopy_disabled_reason = None
     ccopy_ema, ccopy_seen, ccopy_suspend_until = 0.5, 0, 0
     ccopy_backoff = 64   # doubles on each suspension (self-repetitive novel text would
                          # otherwise re-trigger copy rounds after every backoff and pay
@@ -6299,6 +6316,7 @@ def generate_mtpk(
         # ---- context-copy round: verbatim block from context, no MTP compute this cycle ----
         if ccopy_active and cycle_depth >= 1 and len(tokens) >= ccopy_suspend_until:
             _cc_hist = prompt_ids + tokens
+            ccopy_probes += 1
             _cc_pos, _cc_ext = ccopy_index.find(_cc_hist)
             if _cc_pos is not None and _cc_ext >= ccopy_min_ext:
                 _cc_klen = block_for_ext(_cc_ext, ccopy_k)
@@ -6365,6 +6383,7 @@ def generate_mtpk(
                     logits = _cc_l2[:, -1, :]
                     hidden = _cc_h2[:, -1:, :]
                     ccopy_active = False
+                    ccopy_disabled_reason = "no_per_position_commit"
                     event["context_copy"] = {"disabled": "no_per_position_commit"}
                     append_event(event)
                     continue
@@ -6377,6 +6396,8 @@ def generate_mtpk(
                 ccopy_rounds += 1
                 ccopy_drafted += len(_cc_block)
                 ccopy_accepted += _cc_nacc
+                if _cc_nacc:
+                    ccopy_blocks_accepted += 1
                 ccopy_ema = 0.7 * ccopy_ema + 0.3 * (_cc_nacc / len(_cc_block))
                 ccopy_seen += 1
                 if _cc_nacc / len(_cc_block) >= 0.5:
@@ -6388,6 +6409,7 @@ def generate_mtpk(
                     ccopy_suspend_until = len(tokens) + ccopy_backoff
                     ccopy_backoff = min(ccopy_backoff * 2, 4096)
                     ccopy_ema, ccopy_seen = 0.5, 0
+                    ccopy_suspensions += 1
                 event["context_copy"] = {
                     "block": len(_cc_block),
                     "accepted": _cc_nacc,
@@ -7921,6 +7943,16 @@ def generate_mtpk(
         bonus_tokens=bonus_tokens,
         correction_tokens=correction_tokens,
         verify_calls=verify_calls,
+        context_copy_active=bool(ccopy_active),
+        context_copy_probes=ccopy_probes,
+        context_copy_rounds=ccopy_rounds,
+        context_copy_drafted_tokens=ccopy_drafted,
+        context_copy_accepted_blocks=ccopy_blocks_accepted,
+        context_copy_accepted_tokens=ccopy_accepted,
+        context_copy_suspensions=ccopy_suspensions,
+        context_copy_suspended=len(tokens) < ccopy_suspend_until,
+        context_copy_backoff_tokens=ccopy_backoff if ccopy_index is not None else 0,
+        context_copy_disabled_reason=ccopy_disabled_reason,
         graphbank={
             **(graphbank.to_dict() if graphbank is not None else {}),
             **(

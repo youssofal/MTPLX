@@ -12761,6 +12761,18 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "mean_accept_probability_by_depth",
     "correction_tokens",
     "bonus_tokens",
+    # Context-copy (prompt-lookup) drafting counters. Cumulative per
+    # generation; suspended/backoff_tokens are end-of-generation gauges.
+    "context_copy_active",
+    "context_copy_probes",
+    "context_copy_rounds",
+    "context_copy_drafted_tokens",
+    "context_copy_accepted_blocks",
+    "context_copy_accepted_tokens",
+    "context_copy_suspensions",
+    "context_copy_suspended",
+    "context_copy_backoff_tokens",
+    "context_copy_disabled_reason",
     "verify_time_s",
     "draft_time_s",
     "accept_time_s",
