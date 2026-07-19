@@ -433,7 +433,8 @@ def _heal_raw_delta_mtp_norms(weights: dict[str, Any]) -> dict[str, Any]:
 def _infer_prequantized_group_size(weights: dict[str, Any], bits: int | None) -> int | None:
     if bits is None or bits <= 0:
         return None
-    values_per_word = max(1, 32 // int(bits))
+    bits_int = int(bits)
+    values_per_word = max(1, 32 // bits_int)
     inferred: set[int] = set()
     for key, weight in weights.items():
         if not key.endswith(".weight"):
@@ -452,7 +453,13 @@ def _infer_prequantized_group_size(weights: dict[str, Any], bits: int | None) ->
         scale_groups = int(scales_shape[-1])
         if packed_cols <= 0 or scale_groups <= 0:
             continue
-        expanded_cols = packed_cols * values_per_word
+        if 32 % bits_int == 0:
+            expanded_cols = packed_cols * values_per_word
+        else:
+            total_bits = packed_cols * 32
+            if total_bits % bits_int != 0:
+                continue
+            expanded_cols = total_bits // bits_int
         if expanded_cols % scale_groups == 0:
             inferred.add(expanded_cols // scale_groups)
     if len(inferred) == 1:
