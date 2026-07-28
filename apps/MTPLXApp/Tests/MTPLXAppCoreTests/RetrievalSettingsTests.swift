@@ -206,3 +206,27 @@ final class RetrievalStatusTests: XCTestCase {
         XCTAssertTrue(status.models.isEmpty)
     }
 }
+
+extension RetrievalStatusTests {
+    func testTokenAndErrorCountersDecode() throws {
+        let status = try JSONDecoder().decode(RetrievalStatus.self, from: Data("""
+        {"enabled": true, "models": [{"id":"e1","role":"embedding","requests":2,
+          "items":5,"tokens":140,"errors":1,"lastError":"FileNotFoundError: missing"}]}
+        """.utf8))
+        let model = try XCTUnwrap(status.models.first)
+        XCTAssertEqual(model.tokens, 140)
+        XCTAssertEqual(model.errors, 1)
+        XCTAssertTrue(model.hasFailed)
+        XCTAssertEqual(model.lastError, "FileNotFoundError: missing")
+    }
+
+    func testAModelThatOnlyEverFailedIsNotReportedAsIdle() throws {
+        let status = try JSONDecoder().decode(RetrievalStatus.self, from: Data("""
+        {"enabled": true, "models": [{"id":"broken","role":"embedding","loaded":false,
+          "requests":0,"errors":3,"lastError":"boom"}]}
+        """.utf8))
+        let model = try XCTUnwrap(status.models.first)
+        XCTAssertTrue(model.hasFailed)
+        XCTAssertFalse(model.hasBeenUsed)
+    }
+}

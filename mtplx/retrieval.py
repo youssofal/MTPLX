@@ -26,6 +26,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import OrderedDict
+from contextlib import contextmanager
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -69,22 +70,33 @@ class RetrievalStats:
 
     requests: int = 0
     items: int = 0
+    tokens: int = 0
+    errors: int = 0
     compute_seconds: float = 0.0
     load_seconds: float = 0.0
     last_used_s: float | None = None
     last_error: str | None = None
 
-    def record(self, *, items: int, seconds: float) -> None:
+    def record(self, *, items: int, tokens: int, seconds: float) -> None:
         self.requests += 1
         self.items += items
+        self.tokens += tokens
         self.compute_seconds += seconds
         self.last_used_s = time.time()
         self.last_error = None
+
+    def record_error(self, error: BaseException) -> None:
+        """Remember a failure so a broken model is not displayed as merely idle."""
+        self.errors += 1
+        self.last_used_s = time.time()
+        self.last_error = f"{type(error).__name__}: {error}"[:400]
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "requests": self.requests,
             "items": self.items,
+            "tokens": self.tokens,
+            "errors": self.errors,
             "computeSeconds": round(self.compute_seconds, 4),
             "loadSeconds": round(self.load_seconds, 3),
             "lastUsedS": self.last_used_s,
@@ -164,6 +176,10 @@ class _Backend:
         self.path = path
         self.lock = threading.RLock()
         self.load_seconds = 0.0
+        # Requests currently holding this backend. Evicting a pinned backend
+        # would unload weights another thread is about to use, which then
+        # reloads them — leaving two copies live while only one is counted.
+        self.users = 0
         self._model: Any = None
         self._tokenizer: Any = None
 
@@ -202,8 +218,9 @@ class _Backend:
 class RetrievalRegistry:
     """Serves every configured embedding and reranking model.
 
-    Backends are keyed by resolved path so one model registered under several
-    served ids — or under both roles — occupies memory once.
+    Backends are keyed by resolved filesystem path, so one model registered
+    under several served ids, under both roles, or under both a Hugging Face id
+    and the local path it resolves to occupies memory once.
     """
 
     def __init__(self, *, max_resident: int = DEFAULT_MAX_RESIDENT, cache_dir: str | Path | None = None) -> None:
@@ -213,6 +230,7 @@ class RetrievalRegistry:
         self._backends: dict[str, _Backend] = {}
         self._resident: OrderedDict[str, None] = OrderedDict()
         self._stats: dict[tuple[Role, str], RetrievalStats] = {}
+        self._keys: dict[str, str] = {}
         self._lock = threading.RLock()
 
     # ── registration ────────────────────────────────────────────────
@@ -243,7 +261,11 @@ class RetrievalRegistry:
         entries: list[dict[str, Any]] = []
         with self._lock:
             for (role, served_id), spec in sorted(self._specs.items()):
-                backend = self._backends.get(spec.model_ref)
+                # Look the backend up by its resolved key, the same one used
+                # for residency — the raw reference would miss a backend shared
+                # with another alias.
+                key = self._keys.get(spec.model_ref)
+                backend = self._backends.get(key) if key else None
                 stats = self._stats.get((role, served_id)) or RetrievalStats()
                 if backend is not None and backend.load_seconds:
                     stats.load_seconds = backend.load_seconds
@@ -253,7 +275,7 @@ class RetrievalRegistry:
                         "role": role,
                         "model_ref": spec.model_ref,
                         "loaded": bool(backend is not None and backend.loaded),
-                        "resident": spec.model_ref in self._resident,
+                        "resident": bool(key and key in self._resident),
                         "max_tokens": spec.max_tokens,
                         "batch_size": spec.effective_batch_size(),
                         **stats.to_dict(),
@@ -287,30 +309,64 @@ class RetrievalRegistry:
         served = ", ".join(spec.served_id for spec in candidates)
         raise RetrievalError(f"unknown {role} model {requested!r}; served: {served}")
 
-    def _backend(self, spec: RetrievalSpec) -> _Backend:
-        with self._lock:
-            backend = self._backends.get(spec.model_ref)
-            if backend is None:
-                from .hf_loader import resolve_model_path
+    def _backend_key(self, spec: RetrievalSpec) -> str:
+        """Return the canonical residency key for a spec: its resolved path.
 
-                path = resolve_model_path(spec.model_ref, cache_dir=self.cache_dir)
-                backend = _Backend(spec.model_ref, path)
-                self._backends[spec.model_ref] = backend
-            # A slot is reserved on acquisition, not on completed load. Two
-            # first-use requests for different models run concurrently, and
-            # loading happens outside this lock: if residency counted only
-            # finished loads, each request would see the other as absent, skip
-            # eviction, and both models would end up resident — the cap would
-            # be silently exceeded exactly when memory is tightest.
-            self._resident[spec.model_ref] = None
-            self._resident.move_to_end(spec.model_ref)
-            while len(self._resident) > self.max_resident:
-                oldest = next(iter(self._resident))
-                if oldest == spec.model_ref:
+        Keying by the raw reference would give a Hugging Face id and the local
+        path it resolves to two separate backends, loading the same weights
+        twice and counting them twice against the cap — the opposite of the
+        one-model-two-roles guarantee.
+        """
+        cached = self._keys.get(spec.model_ref)
+        if cached is not None:
+            return cached
+        from .hf_loader import resolve_model_path
+
+        path = resolve_model_path(spec.model_ref, cache_dir=self.cache_dir)
+        key = str(Path(path).resolve())
+        with self._lock:
+            self._keys[spec.model_ref] = key
+        return key
+
+    @contextmanager
+    def _acquire(self, spec: RetrievalSpec):
+        """Yield a backend pinned for the whole load-and-inference lifetime.
+
+        Reserving a slot is not enough on its own: a request that has left this
+        method but not yet finished still holds its weights, so evicting them
+        frees nothing and forces a reload. Only unpinned backends are evicted;
+        when every resident backend is busy the cap is briefly exceeded rather
+        than unloading a model that is in use.
+        """
+        key = self._backend_key(spec)
+        with self._lock:
+            backend = self._backends.get(key)
+            if backend is None:
+                backend = _Backend(spec.model_ref, Path(key))
+                self._backends[key] = backend
+            backend.users += 1
+            self._resident[key] = None
+            self._resident.move_to_end(key)
+            for candidate in list(self._resident):
+                if len(self._resident) <= self.max_resident:
                     break
-                self._backends[oldest].unload()
-                self._resident.pop(oldest, None)
-        return backend
+                if candidate == key:
+                    continue
+                victim = self._backends[candidate]
+                if victim.users:
+                    continue
+                victim.unload()
+                self._resident.pop(candidate, None)
+        try:
+            yield backend
+        finally:
+            with self._lock:
+                backend.users = max(0, backend.users - 1)
+
+    def _backend(self, spec: RetrievalSpec) -> _Backend:
+        """Acquire without pinning — for tests and introspection only."""
+        with self._acquire(spec) as backend:
+            return backend
 
     def unload_all(self) -> None:
         """Drop every resident retrieval model."""
@@ -328,52 +384,61 @@ class RetrievalRegistry:
         *,
         model: str | None = None,
         instruction: str | None = None,
-    ) -> tuple[list[list[float]], RetrievalSpec]:
-        """Embed texts in input order, returning vectors and the spec used."""
+    ) -> tuple[list[list[float]], RetrievalSpec, int]:
+        """Embed texts in order, returning vectors, the spec used and token count."""
         spec = self._spec("embedding", model)
         if not texts:
-            return [], spec
+            return [], spec, 0
         stats = self._stats_for(spec)
-        backend = self._backend(spec)
-        model_obj, tokenizer = backend.ensure_loaded()
-        # Started after the load so a cold first request does not report the
-        # weight load as inference latency — that would make a fast model look
-        # ten times slower than it is. Load cost is reported separately.
-        started = time.time()
-        effective_instruction = instruction if instruction is not None else spec.instruction
-        prepared = [
-            QUERY_INSTRUCTION_TEMPLATE.format(instruction=effective_instruction, text=text)
-            if effective_instruction
-            else text
-            for text in texts
-        ]
-        pad_id = backend.pad_id(tokenizer)
-        vectors: list[list[float]] = []
-        batch = spec.effective_batch_size()
-        import mlx.core as mx
+        try:
+            with self._acquire(spec) as backend:
+                model_obj, tokenizer = backend.ensure_loaded()
+                effective_instruction = instruction if instruction is not None else spec.instruction
+                prepared = [
+                    QUERY_INSTRUCTION_TEMPLATE.format(instruction=effective_instruction, text=text)
+                    if effective_instruction
+                    else text
+                    for text in texts
+                ]
+                pad_id = backend.pad_id(tokenizer)
+                # Started after the load so a cold first request does not report
+                # the weight load as inference latency — that would make a fast
+                # model look ten times slower than it is. Load cost is reported
+                # separately.
+                started = time.time()
+                vectors: list[list[float]] = []
+                tokens = 0
+                batch = spec.effective_batch_size()
+                import mlx.core as mx
 
-        with backend.lock:
-            for start in range(0, len(prepared), batch):
-                chunk = prepared[start : start + batch]
-                sequences = [self._encode_embedding(tokenizer, text, spec, pad_id) for text in chunk]
-                inputs, lengths = _right_padded(sequences, pad_id)
-                hidden = model_obj.model(inputs)
-                if spec.pooling == "mean":
-                    pooled = mx.stack(
-                        [hidden[row, :length, :].mean(axis=0) for row, length in enumerate(lengths)]
-                    )
-                else:
-                    pooled = mx.stack(
-                        [hidden[row, length - 1, :] for row, length in enumerate(lengths)]
-                    )
-                pooled = pooled.astype(mx.float32)
-                normalised = pooled / mx.linalg.norm(pooled, axis=-1, keepdims=True)
-                mx.eval(normalised)
-                vectors.extend(normalised.tolist())
-                del hidden, pooled, normalised
-                mx.clear_cache()
-        stats.record(items=len(texts), seconds=time.time() - started)
-        return vectors, spec
+                with backend.lock:
+                    for start in range(0, len(prepared), batch):
+                        chunk = prepared[start : start + batch]
+                        sequences = [
+                            self._encode_embedding(tokenizer, text, spec, pad_id) for text in chunk
+                        ]
+                        tokens += sum(len(sequence) for sequence in sequences)
+                        inputs, lengths = _right_padded(sequences, pad_id)
+                        hidden = model_obj.model(inputs)
+                        if spec.pooling == "mean":
+                            pooled = mx.stack(
+                                [hidden[row, :length, :].mean(axis=0) for row, length in enumerate(lengths)]
+                            )
+                        else:
+                            pooled = mx.stack(
+                                [hidden[row, length - 1, :] for row, length in enumerate(lengths)]
+                            )
+                        pooled = pooled.astype(mx.float32)
+                        normalised = pooled / mx.linalg.norm(pooled, axis=-1, keepdims=True)
+                        mx.eval(normalised)
+                        vectors.extend(normalised.tolist())
+                        del hidden, pooled, normalised
+                        mx.clear_cache()
+        except BaseException as error:
+            stats.record_error(error)
+            raise
+        stats.record(items=len(texts), tokens=tokens, seconds=time.time() - started)
+        return vectors, spec, tokens
 
     def _encode_embedding(
         self, tokenizer: Any, text: str, spec: RetrievalSpec, pad_id: int
@@ -390,56 +455,59 @@ class RetrievalRegistry:
         *,
         model: str | None = None,
         instruction: str | None = None,
-    ) -> tuple[list[float], RetrievalSpec]:
-        """Score documents against a query, returning scores in input order."""
+    ) -> tuple[list[float], RetrievalSpec, int]:
+        """Score documents in order, returning scores, the spec used and tokens."""
         spec = self._spec("rerank", model)
         if not documents:
-            return [], spec
+            return [], spec, 0
         stats = self._stats_for(spec)
-        backend = self._backend(spec)
-        model_obj, tokenizer = backend.ensure_loaded()
-        # Started after the load so a cold first request does not report the
-        # weight load as inference latency — that would make a fast model look
-        # ten times slower than it is. Load cost is reported separately.
-        started = time.time()
-        effective_instruction = (
-            instruction or spec.instruction or RERANK_DEFAULT_INSTRUCTION
-        )
-        yes_id = tokenizer.convert_tokens_to_ids("yes")
-        no_id = tokenizer.convert_tokens_to_ids("no")
-        if yes_id is None or no_id is None:
-            raise RetrievalError(
-                f"{spec.served_id} has no yes/no tokens; it is not a Qwen-style reranker"
-            )
-        pad_id = backend.pad_id(tokenizer)
-        scores: list[float] = []
-        batch = spec.effective_batch_size()
-        import mlx.core as mx
-
-        with backend.lock:
-            for start in range(0, len(documents), batch):
-                chunk = documents[start : start + batch]
-                sequences = [
-                    self._encode_rerank(tokenizer, query, document, effective_instruction, spec)
-                    for document in chunk
-                ]
-                inputs, lengths = _right_padded(sequences, pad_id)
-                logits = model_obj(inputs)
-                pairs = mx.stack(
-                    [
-                        mx.stack(
-                            [logits[row, length - 1, no_id], logits[row, length - 1, yes_id]]
-                        )
-                        for row, length in enumerate(lengths)
-                    ]
+        try:
+            with self._acquire(spec) as backend:
+                model_obj, tokenizer = backend.ensure_loaded()
+                effective_instruction = (
+                    instruction or spec.instruction or RERANK_DEFAULT_INSTRUCTION
                 )
-                probabilities = mx.softmax(pairs.astype(mx.float32), axis=-1)[:, 1]
-                mx.eval(probabilities)
-                scores.extend(float(value) for value in probabilities.tolist())
-                del logits, pairs, probabilities
-                mx.clear_cache()
-        stats.record(items=len(documents), seconds=time.time() - started)
-        return scores, spec
+                yes_id = tokenizer.convert_tokens_to_ids("yes")
+                no_id = tokenizer.convert_tokens_to_ids("no")
+                if yes_id is None or no_id is None:
+                    raise RetrievalError(
+                        f"{spec.served_id} has no yes/no tokens; it is not a Qwen-style reranker"
+                    )
+                pad_id = backend.pad_id(tokenizer)
+                started = time.time()
+                scores: list[float] = []
+                tokens = 0
+                batch = spec.effective_batch_size()
+                import mlx.core as mx
+
+                with backend.lock:
+                    for start in range(0, len(documents), batch):
+                        chunk = documents[start : start + batch]
+                        sequences = [
+                            self._encode_rerank(tokenizer, query, document, effective_instruction, spec)
+                            for document in chunk
+                        ]
+                        tokens += sum(len(sequence) for sequence in sequences)
+                        inputs, lengths = _right_padded(sequences, pad_id)
+                        logits = model_obj(inputs)
+                        pairs = mx.stack(
+                            [
+                                mx.stack(
+                                    [logits[row, length - 1, no_id], logits[row, length - 1, yes_id]]
+                                )
+                                for row, length in enumerate(lengths)
+                            ]
+                        )
+                        probabilities = mx.softmax(pairs.astype(mx.float32), axis=-1)[:, 1]
+                        mx.eval(probabilities)
+                        scores.extend(float(value) for value in probabilities.tolist())
+                        del logits, pairs, probabilities
+                        mx.clear_cache()
+        except BaseException as error:
+            stats.record_error(error)
+            raise
+        stats.record(items=len(documents), tokens=tokens, seconds=time.time() - started)
+        return scores, spec, tokens
 
     def _encode_rerank(
         self,

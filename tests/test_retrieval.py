@@ -142,7 +142,7 @@ def test_a_slot_is_reserved_before_the_weights_finish_loading(monkeypatch):
     registry._backend(registry._spec("embedding", "a"))
     registry._backend(registry._spec("embedding", "b"))
 
-    assert list(registry.status()["resident"]) == ["org/b"]
+    assert list(registry.status()["resident"]) == ["/models/b"]
 
 
 def test_resident_models_are_evicted_beyond_the_cap(monkeypatch):
@@ -160,9 +160,9 @@ def test_resident_models_are_evicted_beyond_the_cap(monkeypatch):
         # Pretend the weights loaded so the cap has something to evict.
         backend._model = object()
         backend._tokenizer = object()
-        backend.unload = lambda ref=backend.model_ref: unloaded.append(ref)  # type: ignore[method-assign]
+        backend.unload = lambda ref=str(backend.path): unloaded.append(ref)  # type: ignore[method-assign]
 
-    assert unloaded == ["org/e0", "org/e1"]
+    assert unloaded == ["/models/e0", "/models/e1"]
 
 
 def test_descriptors_expose_role_and_load_state():
@@ -225,8 +225,8 @@ def test_stats_start_empty_so_an_unused_model_is_visible_as_unused():
 
 def test_stats_derive_throughput_and_latency():
     stats = RetrievalStats()
-    stats.record(items=8, seconds=2.0)
-    stats.record(items=2, seconds=2.0)
+    stats.record(items=8, tokens=80, seconds=2.0)
+    stats.record(items=2, tokens=20, seconds=2.0)
     payload = stats.to_dict()
     assert payload["requests"] == 2
     assert payload["items"] == 10
@@ -238,7 +238,7 @@ def test_stats_derive_throughput_and_latency():
 def test_descriptors_report_load_state_and_counters_per_role():
     registry = _registry()
     registry._stats_for(RetrievalSpec("embed-a", "org/embed-a", "embedding")).record(
-        items=3, seconds=1.5
+        items=3, tokens=30, seconds=1.5
     )
     descriptors = {(e["role"], e["id"]): e for e in registry.descriptors()}
 
@@ -268,7 +268,7 @@ def test_load_time_is_not_counted_as_inference_latency(monkeypatch):
     backend._tokenizer = object()
 
     stats = registry._stats_for(spec)
-    stats.record(items=5, seconds=0.4)
+    stats.record(items=5, tokens=50, seconds=0.4)
     payload = {entry["id"]: entry for entry in registry.descriptors()}["slow-load"]
 
     assert payload["loadSeconds"] == 9.0
@@ -313,11 +313,11 @@ class _StubRegistry:
 
     def embed(self, texts, *, model=None, instruction=None):
         self.embed_calls.append({"texts": texts, "model": model, "instruction": instruction})
-        return [[0.5, 0.5] for _ in texts], RetrievalSpec("e1", "org/e1", "embedding")
+        return [[0.5, 0.5] for _ in texts], RetrievalSpec("e1", "org/e1", "embedding"), 7 * len(texts)
 
     def rerank(self, query, documents, *, model=None, instruction=None):
         scores = [float(len(document)) for document in documents]
-        return scores, RetrievalSpec("r1", "org/r1", "rerank")
+        return scores, RetrievalSpec("r1", "org/r1", "rerank"), 11 * len(documents)
 
 
 def _client(registry=None) -> TestClient:
@@ -468,3 +468,109 @@ def test_snapshot_always_carries_a_retrieval_section():
     configured = _client(_StubRegistry()).get("/v1/mtplx/snapshot").json()
     assert configured["retrieval"]["enabled"] is True
     assert {m["id"] for m in configured["retrieval"]["models"]} == {"e1", "r1"}
+
+
+# ---- review round 2 -------------------------------------------------------
+
+
+def _fixed_resolver(monkeypatch, mapping=None):
+    """Resolve refs to paths, optionally collapsing several refs onto one."""
+    def resolve(ref, cache_dir=None):
+        if mapping and str(ref) in mapping:
+            return Path(mapping[str(ref)])
+        return Path("/models") / str(ref).rsplit("/", 1)[-1]
+
+    monkeypatch.setattr("mtplx.hf_loader.resolve_model_path", resolve)
+
+
+def test_two_references_to_one_directory_share_a_backend(monkeypatch):
+    """A Hugging Face id and its local path must not load the weights twice."""
+    _fixed_resolver(
+        monkeypatch,
+        {"org/model": "/models/model", "/models/model": "/models/model"},
+    )
+    registry = RetrievalRegistry()
+    remote = RetrievalSpec("remote", "org/model", "embedding")
+    local = RetrievalSpec("local", "/models/model", "embedding")
+    registry.register(remote)
+    registry.register(local)
+
+    with registry._acquire(remote) as first, registry._acquire(local) as second:
+        assert first is second
+    assert list(registry.status()["resident"]) == ["/models/model"]
+
+
+def test_a_backend_in_use_is_never_evicted(monkeypatch):
+    """Unloading weights another request holds frees nothing and forces a reload."""
+    _fixed_resolver(monkeypatch)
+    registry = RetrievalRegistry(max_resident=1)
+    first = RetrievalSpec("a", "org/a", "embedding")
+    second = RetrievalSpec("b", "org/b", "embedding")
+    registry.register(first)
+    registry.register(second)
+
+    with registry._acquire(first) as pinned:
+        pinned._model = object()
+        with registry._acquire(second):
+            # The cap is briefly exceeded rather than pulling weights out from
+            # under the in-flight request.
+            assert pinned.loaded is True
+            assert set(registry.status()["resident"]) == {"/models/a", "/models/b"}
+
+
+def test_an_idle_backend_is_evicted_once_it_is_released(monkeypatch):
+    _fixed_resolver(monkeypatch)
+    registry = RetrievalRegistry(max_resident=1)
+    first = RetrievalSpec("a", "org/a", "embedding")
+    second = RetrievalSpec("b", "org/b", "embedding")
+    registry.register(first)
+    registry.register(second)
+
+    with registry._acquire(first) as backend:
+        backend._model = object()
+    assert backend.users == 0
+
+    with registry._acquire(second):
+        assert backend.loaded is False
+    assert list(registry.status()["resident"]) == ["/models/b"]
+
+
+def test_a_failed_request_is_recorded_so_the_model_is_not_shown_as_idle(monkeypatch):
+    """Without this the dashboard's error row could never appear."""
+    def explode(ref, cache_dir=None):
+        raise FileNotFoundError("Model org/missing is not cached")
+
+    monkeypatch.setattr("mtplx.hf_loader.resolve_model_path", explode)
+    registry = RetrievalRegistry()
+    registry.register(RetrievalSpec("broken", "org/missing", "embedding"))
+
+    with pytest.raises(FileNotFoundError):
+        registry.embed(["text"])
+
+    entry = {e["id"]: e for e in registry.descriptors()}["broken"]
+    assert entry["errors"] == 1
+    assert "FileNotFoundError" in entry["lastError"]
+    assert entry["requests"] == 0
+
+
+def test_a_successful_request_clears_a_previous_error():
+    stats = RetrievalStats()
+    stats.record_error(ValueError("boom"))
+    assert stats.last_error is not None
+    stats.record(items=1, tokens=4, seconds=0.1)
+    assert stats.last_error is None
+    assert stats.errors == 1
+
+
+def test_embeddings_report_real_token_usage():
+    response = _client(_StubRegistry()).post("/v1/embeddings", json={"input": ["a", "b"]})
+    usage = response.json()["usage"]
+    assert usage["prompt_tokens"] == 14
+    assert usage["total_tokens"] == 14
+
+
+def test_rerank_reports_real_token_usage():
+    response = _client(_StubRegistry()).post(
+        "/v1/rerank", json={"query": "q", "documents": ["a", "b", "c"]}
+    )
+    assert response.json()["usage"]["total_tokens"] == 33

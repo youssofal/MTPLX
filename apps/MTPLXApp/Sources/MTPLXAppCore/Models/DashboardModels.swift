@@ -1156,6 +1156,8 @@ public struct RetrievalModelStatus: Codable, Equatable, Sendable, Identifiable {
     public var batchSize: Int
     public var requests: Int
     public var items: Int
+    public var tokens: Int
+    public var errors: Int
     public var computeSeconds: Double
     public var loadSeconds: Double
     public var lastUsedS: Double?
@@ -1167,6 +1169,8 @@ public struct RetrievalModelStatus: Codable, Equatable, Sendable, Identifiable {
     /// different states a user needs to tell apart at a glance.
     public var isEmbedding: Bool { role == "embedding" }
     public var hasBeenUsed: Bool { requests > 0 }
+    /// A model that only ever failed must not read as merely idle.
+    public var hasFailed: Bool { errors > 0 }
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -1178,6 +1182,8 @@ public struct RetrievalModelStatus: Codable, Equatable, Sendable, Identifiable {
         case batchSize = "batch_size"
         case requests
         case items
+        case tokens
+        case errors
         case computeSeconds = "computeSeconds"
         case loadSeconds = "loadSeconds"
         case lastUsedS = "lastUsedS"
@@ -1197,6 +1203,8 @@ public struct RetrievalModelStatus: Codable, Equatable, Sendable, Identifiable {
         batchSize = try container.decodeIfPresent(Int.self, forKey: .batchSize) ?? 0
         requests = try container.decodeIfPresent(Int.self, forKey: .requests) ?? 0
         items = try container.decodeIfPresent(Int.self, forKey: .items) ?? 0
+        tokens = try container.decodeIfPresent(Int.self, forKey: .tokens) ?? 0
+        errors = try container.decodeIfPresent(Int.self, forKey: .errors) ?? 0
         computeSeconds = try container.decodeIfPresent(Double.self, forKey: .computeSeconds) ?? 0
         loadSeconds = try container.decodeIfPresent(Double.self, forKey: .loadSeconds) ?? 0
         lastUsedS = try container.decodeIfPresent(Double.self, forKey: .lastUsedS)
@@ -1215,6 +1223,8 @@ public struct RetrievalModelStatus: Codable, Equatable, Sendable, Identifiable {
         batchSize: Int = 0,
         requests: Int = 0,
         items: Int = 0,
+        tokens: Int = 0,
+        errors: Int = 0,
         computeSeconds: Double = 0,
         loadSeconds: Double = 0,
         lastUsedS: Double? = nil,
@@ -1231,6 +1241,8 @@ public struct RetrievalModelStatus: Codable, Equatable, Sendable, Identifiable {
         self.batchSize = batchSize
         self.requests = requests
         self.items = items
+        self.tokens = tokens
+        self.errors = errors
         self.computeSeconds = computeSeconds
         self.loadSeconds = loadSeconds
         self.lastUsedS = lastUsedS

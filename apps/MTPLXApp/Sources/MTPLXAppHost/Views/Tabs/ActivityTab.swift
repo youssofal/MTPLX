@@ -778,16 +778,19 @@ struct ActivityTab: View {
     }
 
     private func retrievalStateLabel(_ model: RetrievalModelStatus) -> String {
+        if model.hasFailed && !model.hasBeenUsed { return "failing" }
         if !model.loaded { return "idle" }
         return model.hasBeenUsed ? "ready" : "loaded"
     }
 
     private func retrievalStateSymbol(_ model: RetrievalModelStatus) -> String {
-        model.loaded ? "checkmark.circle.fill" : "moon.zzz"
+        if model.hasFailed && !model.hasBeenUsed { return "exclamationmark.triangle.fill" }
+        return model.loaded ? "checkmark.circle.fill" : "moon.zzz"
     }
 
     private func retrievalStateTint(_ model: RetrievalModelStatus) -> Color {
-        model.loaded ? Color.mtplxSuccess : .secondary
+        if model.hasFailed && !model.hasBeenUsed { return Color.mtplxDanger }
+        return model.loaded ? Color.mtplxSuccess : .secondary
     }
 
     private func retrievalThroughputText(_ model: RetrievalModelStatus) -> String {
@@ -813,7 +816,7 @@ struct ActivityTab: View {
                 : "no work yet"
         }
         let unit = model.isEmbedding ? "texts" : "documents"
-        var text = "\(model.requests) requests · \(model.items) \(unit)"
+        var text = "\(model.requests) requests · \(model.items) \(unit) · \(model.tokens) tokens"
         if model.loadSeconds > 0 {
             text += String(format: " · loaded in %.1f s", model.loadSeconds)
         }

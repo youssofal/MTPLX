@@ -20988,7 +20988,7 @@ def create_app(state: ServerState) -> FastAPI:
                 ),
             )
         try:
-            vectors, spec = await asyncio.to_thread(
+            vectors, spec, prompt_tokens = await asyncio.to_thread(
                 retrieval.embed,
                 texts,
                 model=request.model,
@@ -21007,7 +21007,9 @@ def create_app(state: ServerState) -> FastAPI:
                 for index, vector in enumerate(vectors)
             ],
             "model": spec.served_id,
-            "usage": {"prompt_tokens": 0, "total_tokens": 0},
+            # Real counts: clients use these for accounting and rate limits, so
+            # a fixed zero silently corrupts every retrieval total.
+            "usage": {"prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens},
         }
 
     @app.post("/v1/rerank")
@@ -21022,7 +21024,7 @@ def create_app(state: ServerState) -> FastAPI:
             raise HTTPException(status_code=400, detail="query must be a non-empty string")
         documents = _as_text_list(request.documents, field="documents")
         try:
-            scores, spec = await asyncio.to_thread(
+            scores, spec, prompt_tokens = await asyncio.to_thread(
                 retrieval.rerank,
                 str(request.query),
                 documents,
@@ -21044,7 +21046,7 @@ def create_app(state: ServerState) -> FastAPI:
             "id": f"rerank-{int(time.time() * 1000)}",
             "model": spec.served_id,
             "results": results,
-            "usage": {"total_tokens": 0},
+            "usage": {"total_tokens": prompt_tokens},
         }
 
     @app.post("/v1/chat/completions")
