@@ -290,6 +290,43 @@ def _lark_string(text: str) -> str:
     return json.dumps(text)
 
 
+_THINK_PRELUDE_DEFAULT_MAX_CHARS = 4000
+
+def _think_prelude_max_chars() -> int:
+    """Character cap on the reasoning segment that precedes constrained output.
+
+    The think prelude exists because Qwen-style templates open ``<think>`` inside
+    the generation prompt, so generation starts mid-reasoning and the grammar must
+    allow the model back out (see #186). That prelude was unbounded free text, which
+    makes one failure mode *legal*: a model that never emits ``</think>`` stays inside
+    the prelude and fills ``max_tokens`` with prose, returning no document at all.
+    Reported symptom on the tool-call side in #196 ("the content channel fills with
+    the model's reasoning narration ... until finish: length, no tool call emitted").
+
+    Bounding the prelude regex makes the grammar itself force the close. Because the
+    bound is carried by the sampling-time token mask rather than by scheduler state,
+    it cannot go stale under speculative decoding -- the failure mode that silently
+    disabled vLLM's thinking budget whenever MTP was on, fixed only in vLLM 0.21.0.
+
+    ``MTPLX_THINK_PRELUDE_MAX_CHARS=0`` restores the previous unbounded behaviour.
+    """
+    raw = os.environ.get("MTPLX_THINK_PRELUDE_MAX_CHARS")
+    if raw is None or raw.strip() == "":
+        return _THINK_PRELUDE_DEFAULT_MAX_CHARS
+    try:
+        value = int(raw)
+    except ValueError:
+        return _THINK_PRELUDE_DEFAULT_MAX_CHARS
+    return value if value > 0 else 0
+
+
+def _prelude_terminal(max_chars: int) -> str:
+    """The prelude's own terminal, so bounding it never touches tail/free text."""
+    if max_chars <= 0:
+        return "PRELUDE_TEXT: /(.|\\n)*/\n"
+    return f"PRELUDE_TEXT: /(.|\\n){{0,{max_chars}}}/\n"
+
+
 def _tool_call_lark_grammar(
     functions: list[tuple[str, dict[str, Any]]],
     *,
@@ -317,7 +354,10 @@ def _tool_call_lark_grammar(
     # The optional prelude closes a thinking block the chat template opened
     # inside the generation prompt (Qwen renders `<|im_start|>assistant\n
     # <think>\n`, so generation begins mid-think and must be allowed out).
-    prelude = "prelude: TAG_TEXT </think>\n" if include_think else ""
+    prelude = "prelude: PRELUDE_TEXT </think>\n" if include_think else ""
+    prelude_terminal = (
+        _prelude_terminal(_think_prelude_max_chars()) if include_think else ""
+    )
     start = "start: prelude? (seg)* tail\n" if include_think else "start: (seg)* tail\n"
     return (
         "%llguidance {}\n"
@@ -325,6 +365,7 @@ def _tool_call_lark_grammar(
         f"{prelude}"
         "tail: TAG_TEXT\n"
         "TAG_TEXT: /(.|\\n)*/\n"
+        f"{prelude_terminal}"
         f"{seg}\n"
     )
 
@@ -437,7 +478,11 @@ def _canonical_schema_json(schema: dict[str, Any]) -> str:
 
 
 def _cached_grammar_for_schema(schema_json: str, *, think_prelude: bool = False) -> str:
-    key = f"{LLGUIDANCE_VERSION}:think={int(think_prelude)}:{schema_json}"
+    prelude_max = _think_prelude_max_chars() if think_prelude else 0
+    key = (
+        f"{LLGUIDANCE_VERSION}:think={int(think_prelude)}"
+        f":pmax={prelude_max}:{schema_json}"
+    )
     with _CACHE_LOCK:
         cached = _GRAMMAR_CACHE.get(key)
         if cached is not None:
@@ -448,8 +493,8 @@ def _cached_grammar_for_schema(schema_json: str, *, think_prelude: bool = False)
             grammar = (
                 "%llguidance {}\n"
                 "start: prelude? doc\n"
-                "prelude: TAG_TEXT </think>\n"
-                "TAG_TEXT: /(.|\\n)*/\n"
+                "prelude: PRELUDE_TEXT </think>\n"
+                f"{_prelude_terminal(prelude_max)}"
                 f"doc: %json {schema_json}\n"
             )
         else:
