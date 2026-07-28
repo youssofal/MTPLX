@@ -1146,6 +1146,132 @@ public struct HealthPayload: Codable, Equatable, Sendable {
     }
 }
 
+public struct RetrievalModelStatus: Codable, Equatable, Sendable, Identifiable {
+    public var id: String
+    public var role: String
+    public var modelRef: String
+    public var loaded: Bool
+    public var resident: Bool
+    public var maxTokens: Int
+    public var batchSize: Int
+    public var requests: Int
+    public var items: Int
+    public var computeSeconds: Double
+    public var loadSeconds: Double
+    public var lastUsedS: Double?
+    public var lastError: String?
+    public var itemsPerSecond: Double?
+    public var avgLatencyMs: Double?
+
+    /// Retrieval models load on first request, so "configured" and "ready" are
+    /// different states a user needs to tell apart at a glance.
+    public var isEmbedding: Bool { role == "embedding" }
+    public var hasBeenUsed: Bool { requests > 0 }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case role
+        case modelRef = "model_ref"
+        case loaded
+        case resident
+        case maxTokens = "max_tokens"
+        case batchSize = "batch_size"
+        case requests
+        case items
+        case computeSeconds = "computeSeconds"
+        case loadSeconds = "loadSeconds"
+        case lastUsedS = "lastUsedS"
+        case lastError = "lastError"
+        case itemsPerSecond = "itemsPerSecond"
+        case avgLatencyMs = "avgLatencyMs"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        role = try container.decodeIfPresent(String.self, forKey: .role) ?? "embedding"
+        modelRef = try container.decodeIfPresent(String.self, forKey: .modelRef) ?? id
+        loaded = try container.decodeIfPresent(Bool.self, forKey: .loaded) ?? false
+        resident = try container.decodeIfPresent(Bool.self, forKey: .resident) ?? false
+        maxTokens = try container.decodeIfPresent(Int.self, forKey: .maxTokens) ?? 0
+        batchSize = try container.decodeIfPresent(Int.self, forKey: .batchSize) ?? 0
+        requests = try container.decodeIfPresent(Int.self, forKey: .requests) ?? 0
+        items = try container.decodeIfPresent(Int.self, forKey: .items) ?? 0
+        computeSeconds = try container.decodeIfPresent(Double.self, forKey: .computeSeconds) ?? 0
+        loadSeconds = try container.decodeIfPresent(Double.self, forKey: .loadSeconds) ?? 0
+        lastUsedS = try container.decodeIfPresent(Double.self, forKey: .lastUsedS)
+        lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
+        itemsPerSecond = try container.decodeIfPresent(Double.self, forKey: .itemsPerSecond)
+        avgLatencyMs = try container.decodeIfPresent(Double.self, forKey: .avgLatencyMs)
+    }
+
+    public init(
+        id: String,
+        role: String,
+        modelRef: String = "",
+        loaded: Bool = false,
+        resident: Bool = false,
+        maxTokens: Int = 0,
+        batchSize: Int = 0,
+        requests: Int = 0,
+        items: Int = 0,
+        computeSeconds: Double = 0,
+        loadSeconds: Double = 0,
+        lastUsedS: Double? = nil,
+        lastError: String? = nil,
+        itemsPerSecond: Double? = nil,
+        avgLatencyMs: Double? = nil
+    ) {
+        self.id = id
+        self.role = role
+        self.modelRef = modelRef
+        self.loaded = loaded
+        self.resident = resident
+        self.maxTokens = maxTokens
+        self.batchSize = batchSize
+        self.requests = requests
+        self.items = items
+        self.computeSeconds = computeSeconds
+        self.loadSeconds = loadSeconds
+        self.lastUsedS = lastUsedS
+        self.lastError = lastError
+        self.itemsPerSecond = itemsPerSecond
+        self.avgLatencyMs = avgLatencyMs
+    }
+}
+
+public struct RetrievalStatus: Codable, Equatable, Sendable {
+    public var enabled: Bool
+    public var maxResident: Int
+    public var resident: [String]
+    public var models: [RetrievalModelStatus]
+
+    public var embedders: [RetrievalModelStatus] { models.filter { $0.role == "embedding" } }
+    public var rerankers: [RetrievalModelStatus] { models.filter { $0.role == "rerank" } }
+
+    enum CodingKeys: String, CodingKey {
+        case enabled
+        case maxResident = "max_resident"
+        case resident
+        case models
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        maxResident = try container.decodeIfPresent(Int.self, forKey: .maxResident) ?? 0
+        resident = try container.decodeIfPresent([String].self, forKey: .resident) ?? []
+        models = try container.decodeIfPresent([RetrievalModelStatus].self, forKey: .models) ?? []
+    }
+
+    public init(enabled: Bool = false, maxResident: Int = 0, resident: [String] = [], models: [RetrievalModelStatus] = []) {
+        self.enabled = enabled
+        self.maxResident = maxResident
+        self.resident = resident
+        self.models = models
+    }
+}
+
 public struct DashboardSnapshot: Codable, Equatable, Sendable {
     public var ts: Double
     public var modelId: String
@@ -1166,6 +1292,9 @@ public struct DashboardSnapshot: Codable, Equatable, Sendable {
     public var scheduler: DynamicObject?
     public var machine: MachineInfo
     public var uptimeS: Double
+    /// Absent on daemons built before retrieval shipped, so it decodes to a
+    /// disabled status rather than failing the whole snapshot.
+    public var retrieval: RetrievalStatus?
 
     enum CodingKeys: String, CodingKey {
         case ts
@@ -1187,6 +1316,7 @@ public struct DashboardSnapshot: Codable, Equatable, Sendable {
         case scheduler
         case machine
         case uptimeS = "uptime_s"
+        case retrieval
     }
 }
 

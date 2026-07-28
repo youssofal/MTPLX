@@ -51,6 +51,9 @@ struct ActivityTab: View {
                         }
                         recentRequestsCard(recent: recent)
                         speedTruthCard(latest: backend.latest)
+                        if let retrieval = backend.snapshot?.retrieval, retrieval.enabled {
+                            retrievalCard(retrieval)
+                        }
                         cacheSummaryCard(sessions: sessions, sessionBank: sessionBank)
                         cacheTruthCard(latest: backend.latest, sessionBank: sessionBank)
                         bankCard(sessionBank: sessionBank)
@@ -705,6 +708,116 @@ struct ActivityTab: View {
                 }
             }
         }
+    }
+
+    // MARK: - Retrieval
+
+    /// Retrieval models load on first request, so a configured model that has
+    /// never been asked anything is a normal state — not an error, and not
+    /// "working" either. The card distinguishes the three cases explicitly
+    /// instead of leaving the user to guess whether the setting took effect.
+    private func retrievalCard(_ retrieval: RetrievalStatus) -> some View {
+        let loaded = retrieval.models.filter(\.loaded).count
+        return Card(
+            "Retrieval",
+            subtitle: "Embedding and reranking served by this daemon."
+        ) {
+            PillBadge(
+                text: "\(loaded)/\(retrieval.models.count) loaded",
+                systemImage: loaded > 0 ? "checkmark.circle.fill" : "moon.zzz",
+                tint: loaded > 0 ? Color.mtplxSuccess : .secondary,
+                emphasized: loaded > 0
+            )
+        } content: {
+            VStack(alignment: .leading, spacing: 12) {
+                ForEach(retrieval.models) { model in
+                    retrievalModelRow(model)
+                }
+                if retrieval.maxResident > 0 {
+                    truthRow(
+                        "Resident cap",
+                        "\(retrieval.resident.count) of \(retrieval.maxResident) slots in use",
+                        systemImage: "memorychip",
+                        tint: .secondary
+                    )
+                }
+            }
+        }
+    }
+
+    private func retrievalModelRow(_ model: RetrievalModelStatus) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: model.isEmbedding ? "square.grid.3x3.topleft.filled" : "arrow.up.arrow.down")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(model.loaded ? Color.mtplxSuccess : Color.secondary)
+                Text(model.id)
+                    .font(.system(.callout, design: .rounded).weight(.semibold))
+                    .textSelection(.enabled)
+                PillBadge(text: model.isEmbedding ? "embeddings" : "rerank", tint: .secondary)
+                Spacer(minLength: 0)
+                PillBadge(
+                    text: retrievalStateLabel(model),
+                    systemImage: retrievalStateSymbol(model),
+                    tint: retrievalStateTint(model),
+                    emphasized: model.loaded
+                )
+            }
+            truthRow(
+                "Throughput",
+                retrievalThroughputText(model),
+                systemImage: "speedometer",
+                tint: model.hasBeenUsed ? Color.mtplxSuccess : .secondary
+            )
+            truthRow("Work", retrievalWorkText(model), systemImage: "sum", tint: .secondary)
+            if let error = model.lastError {
+                truthRow("Last error", error, systemImage: "exclamationmark.triangle.fill", tint: Color.mtplxDanger)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func retrievalStateLabel(_ model: RetrievalModelStatus) -> String {
+        if !model.loaded { return "idle" }
+        return model.hasBeenUsed ? "ready" : "loaded"
+    }
+
+    private func retrievalStateSymbol(_ model: RetrievalModelStatus) -> String {
+        model.loaded ? "checkmark.circle.fill" : "moon.zzz"
+    }
+
+    private func retrievalStateTint(_ model: RetrievalModelStatus) -> Color {
+        model.loaded ? Color.mtplxSuccess : .secondary
+    }
+
+    private func retrievalThroughputText(_ model: RetrievalModelStatus) -> String {
+        guard model.hasBeenUsed else {
+            return model.loaded
+                ? "loaded, no requests yet"
+                : "not loaded — loads on first request"
+        }
+        var parts: [String] = []
+        if let rate = model.itemsPerSecond {
+            parts.append(String(format: "%.1f %@/s", rate, model.isEmbedding ? "texts" : "docs"))
+        }
+        if let latency = model.avgLatencyMs {
+            parts.append(String(format: "%.0f ms avg", latency))
+        }
+        return parts.isEmpty ? "—" : parts.joined(separator: " · ")
+    }
+
+    private func retrievalWorkText(_ model: RetrievalModelStatus) -> String {
+        guard model.hasBeenUsed else {
+            return model.loadSeconds > 0
+                ? String(format: "loaded in %.1f s", model.loadSeconds)
+                : "no work yet"
+        }
+        let unit = model.isEmbedding ? "texts" : "documents"
+        var text = "\(model.requests) requests · \(model.items) \(unit)"
+        if model.loadSeconds > 0 {
+            text += String(format: " · loaded in %.1f s", model.loadSeconds)
+        }
+        return text
     }
 
     private func truthRow(

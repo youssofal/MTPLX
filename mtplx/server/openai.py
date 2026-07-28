@@ -12372,9 +12372,13 @@ def _mtplx_dashboard_snapshot(state: "ServerState") -> dict[str, Any]:
             "error": str(exc),
         }
         bank_dict = {}
+    retrieval = getattr(state, "retrieval", None)
     return {
         "ts": time.time(),
         "model_id": state.model_id,
+        # Always present, so a client can tell "no retrieval configured" apart
+        # from "this build has no retrieval support".
+        "retrieval": retrieval.status() if retrieval is not None else {"enabled": False, "models": []},
         "profile": state.profile.to_dict()
         if hasattr(state.profile, "to_dict")
         else {"name": getattr(state.profile, "name", "unknown")},

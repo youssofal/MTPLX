@@ -24,6 +24,7 @@ registering the same reference as an embedder and as a reranker loads it once.
 from __future__ import annotations
 
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -55,6 +56,50 @@ RERANK_DEFAULT_INSTRUCTION = (
 
 class RetrievalError(RuntimeError):
     """Raised when a retrieval request cannot be served."""
+
+
+@dataclass
+class RetrievalStats:
+    """Live counters for one served retrieval model.
+
+    Configuration without observability is a guess: these make it visible
+    whether a configured model ever loaded, whether it is being used, and what
+    it costs per item.
+    """
+
+    requests: int = 0
+    items: int = 0
+    compute_seconds: float = 0.0
+    load_seconds: float = 0.0
+    last_used_s: float | None = None
+    last_error: str | None = None
+
+    def record(self, *, items: int, seconds: float) -> None:
+        self.requests += 1
+        self.items += items
+        self.compute_seconds += seconds
+        self.last_used_s = time.time()
+        self.last_error = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "requests": self.requests,
+            "items": self.items,
+            "computeSeconds": round(self.compute_seconds, 4),
+            "loadSeconds": round(self.load_seconds, 3),
+            "lastUsedS": self.last_used_s,
+            "lastError": self.last_error,
+            "itemsPerSecond": (
+                round(self.items / self.compute_seconds, 2)
+                if self.compute_seconds > 0
+                else None
+            ),
+            "avgLatencyMs": (
+                round(1000.0 * self.compute_seconds / self.requests, 1)
+                if self.requests
+                else None
+            ),
+        }
 
 
 @dataclass(frozen=True)
@@ -118,6 +163,7 @@ class _Backend:
         self.model_ref = model_ref
         self.path = path
         self.lock = threading.RLock()
+        self.load_seconds = 0.0
         self._model: Any = None
         self._tokenizer: Any = None
 
@@ -130,7 +176,9 @@ class _Backend:
             if self._model is None:
                 from mlx_lm import load
 
+                started = time.time()
                 self._model, self._tokenizer = load(str(self.path))
+                self.load_seconds = time.time() - started
             return self._model, self._tokenizer
 
     def unload(self) -> None:
@@ -164,6 +212,7 @@ class RetrievalRegistry:
         self._specs: dict[tuple[Role, str], RetrievalSpec] = {}
         self._backends: dict[str, _Backend] = {}
         self._resident: OrderedDict[str, None] = OrderedDict()
+        self._stats: dict[tuple[Role, str], RetrievalStats] = {}
         self._lock = threading.RLock()
 
     # ── registration ────────────────────────────────────────────────
@@ -181,6 +230,10 @@ class RetrievalRegistry:
     def enabled(self) -> bool:
         return bool(self._specs)
 
+    def _stats_for(self, spec: RetrievalSpec) -> RetrievalStats:
+        with self._lock:
+            return self._stats.setdefault((spec.role, spec.served_id), RetrievalStats())
+
     def specs_for_role(self, role: Role) -> list[RetrievalSpec]:
         with self._lock:
             return [spec for (spec_role, _), spec in sorted(self._specs.items()) if spec_role == role]
@@ -191,13 +244,19 @@ class RetrievalRegistry:
         with self._lock:
             for (role, served_id), spec in sorted(self._specs.items()):
                 backend = self._backends.get(spec.model_ref)
+                stats = self._stats.get((role, served_id)) or RetrievalStats()
+                if backend is not None and backend.load_seconds:
+                    stats.load_seconds = backend.load_seconds
                 entries.append(
                     {
                         "id": served_id,
                         "role": role,
                         "model_ref": spec.model_ref,
                         "loaded": bool(backend is not None and backend.loaded),
+                        "resident": spec.model_ref in self._resident,
                         "max_tokens": spec.max_tokens,
+                        "batch_size": spec.effective_batch_size(),
+                        **stats.to_dict(),
                     }
                 )
         return entries
@@ -274,8 +333,13 @@ class RetrievalRegistry:
         spec = self._spec("embedding", model)
         if not texts:
             return [], spec
+        stats = self._stats_for(spec)
         backend = self._backend(spec)
         model_obj, tokenizer = backend.ensure_loaded()
+        # Started after the load so a cold first request does not report the
+        # weight load as inference latency — that would make a fast model look
+        # ten times slower than it is. Load cost is reported separately.
+        started = time.time()
         effective_instruction = instruction if instruction is not None else spec.instruction
         prepared = [
             QUERY_INSTRUCTION_TEMPLATE.format(instruction=effective_instruction, text=text)
@@ -308,6 +372,7 @@ class RetrievalRegistry:
                 vectors.extend(normalised.tolist())
                 del hidden, pooled, normalised
                 mx.clear_cache()
+        stats.record(items=len(texts), seconds=time.time() - started)
         return vectors, spec
 
     def _encode_embedding(
@@ -330,8 +395,13 @@ class RetrievalRegistry:
         spec = self._spec("rerank", model)
         if not documents:
             return [], spec
+        stats = self._stats_for(spec)
         backend = self._backend(spec)
         model_obj, tokenizer = backend.ensure_loaded()
+        # Started after the load so a cold first request does not report the
+        # weight load as inference latency — that would make a fast model look
+        # ten times slower than it is. Load cost is reported separately.
+        started = time.time()
         effective_instruction = (
             instruction or spec.instruction or RERANK_DEFAULT_INSTRUCTION
         )
@@ -368,6 +438,7 @@ class RetrievalRegistry:
                 scores.extend(float(value) for value in probabilities.tolist())
                 del logits, pairs, probabilities
                 mx.clear_cache()
+        stats.record(items=len(documents), seconds=time.time() - started)
         return scores, spec
 
     def _encode_rerank(

@@ -16,6 +16,7 @@ import pytest
 
 from mtplx.retrieval import (
     RetrievalError,
+    RetrievalStats,
     RetrievalRegistry,
     RetrievalSpec,
     default_served_id,
@@ -210,6 +211,86 @@ def test_registry_from_args_falls_back_to_the_cli_cache_dir():
     assert registry_from_args(args).cache_dir == "/custom/cli"
 
 
+# ---- metrics --------------------------------------------------------------
+
+
+def test_stats_start_empty_so_an_unused_model_is_visible_as_unused():
+    stats = RetrievalStats()
+    payload = stats.to_dict()
+    assert payload["requests"] == 0
+    assert payload["itemsPerSecond"] is None
+    assert payload["avgLatencyMs"] is None
+    assert payload["lastUsedS"] is None
+
+
+def test_stats_derive_throughput_and_latency():
+    stats = RetrievalStats()
+    stats.record(items=8, seconds=2.0)
+    stats.record(items=2, seconds=2.0)
+    payload = stats.to_dict()
+    assert payload["requests"] == 2
+    assert payload["items"] == 10
+    assert payload["itemsPerSecond"] == 2.5      # 10 items / 4.0s
+    assert payload["avgLatencyMs"] == 2000.0     # 4.0s over 2 requests
+    assert payload["lastUsedS"] is not None
+
+
+def test_descriptors_report_load_state_and_counters_per_role():
+    registry = _registry()
+    registry._stats_for(RetrievalSpec("embed-a", "org/embed-a", "embedding")).record(
+        items=3, seconds=1.5
+    )
+    descriptors = {(e["role"], e["id"]): e for e in registry.descriptors()}
+
+    embedding = descriptors[("embedding", "embed-a")]
+    assert embedding["requests"] == 1
+    assert embedding["items"] == 3
+    assert embedding["loaded"] is False
+    assert embedding["resident"] is False
+
+    # Counters are per role, so reranking a document must not be attributed to
+    # the embedder — even when both roles share one set of weights.
+    assert descriptors[("rerank", "rank-a")]["requests"] == 0
+
+
+def test_load_time_is_not_counted_as_inference_latency(monkeypatch):
+    """A cold first request must not make a fast model look ten times slower."""
+    monkeypatch.setattr(
+        "mtplx.hf_loader.resolve_model_path",
+        lambda ref, cache_dir=None: Path("/models") / str(ref).rsplit("/", 1)[-1],
+    )
+    registry = RetrievalRegistry()
+    spec = RetrievalSpec("slow-load", "org/slow-load", "embedding")
+    registry.register(spec)
+    backend = registry._backend(spec)
+    backend.load_seconds = 9.0
+    backend._model = object()
+    backend._tokenizer = object()
+
+    stats = registry._stats_for(spec)
+    stats.record(items=5, seconds=0.4)
+    payload = {entry["id"]: entry for entry in registry.descriptors()}["slow-load"]
+
+    assert payload["loadSeconds"] == 9.0
+    assert payload["computeSeconds"] == 0.4
+    assert payload["avgLatencyMs"] == 400.0
+
+
+def test_status_reports_the_cap_and_the_resident_set():
+    registry = _registry()
+    status = registry.status()
+    assert status["enabled"] is True
+    assert status["max_resident"] == registry.max_resident
+    assert status["resident"] == []
+    assert {entry["id"] for entry in status["models"]} == {"embed-a", "rank-a"}
+
+
+def test_status_of_a_chat_only_daemon_is_explicitly_disabled():
+    status = RetrievalRegistry().status()
+    assert status["enabled"] is False
+    assert status["models"] == []
+
+
 # ---- HTTP contract --------------------------------------------------------
 
 
@@ -226,6 +307,9 @@ class _StubRegistry:
             {"id": "e1", "role": "embedding", "model_ref": "org/e1", "loaded": True, "max_tokens": 8192},
             {"id": "r1", "role": "rerank", "model_ref": "org/r1", "loaded": False, "max_tokens": 8192},
         ]
+
+    def status(self):
+        return {"enabled": True, "max_resident": 2, "resident": ["org/e1"], "models": self.descriptors()}
 
     def embed(self, texts, *, model=None, instruction=None):
         self.embed_calls.append({"texts": texts, "model": model, "instruction": instruction})
@@ -374,3 +458,13 @@ def test_unknown_retrieval_model_is_reported_as_not_found():
     response = _client(_Strict()).post("/v1/embeddings", json={"model": "nope", "input": "a"})
     assert response.status_code == 404
     assert "unknown embedding model" in response.json()["error"]["message"]
+
+
+def test_snapshot_always_carries_a_retrieval_section():
+    """The dashboard must distinguish "not configured" from "not supported"."""
+    payload = _client().get("/v1/mtplx/snapshot").json()
+    assert payload["retrieval"]["enabled"] is False
+
+    configured = _client(_StubRegistry()).get("/v1/mtplx/snapshot").json()
+    assert configured["retrieval"]["enabled"] is True
+    assert {m["id"] for m in configured["retrieval"]["models"]} == {"e1", "r1"}

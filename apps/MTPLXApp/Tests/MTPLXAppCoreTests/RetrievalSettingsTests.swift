@@ -140,3 +140,69 @@ final class RetrievalSettingsTests: XCTestCase {
         XCTAssertEqual(command.arguments[index + 1], "1")
     }
 }
+
+/// The settings are only useful if their effect is observable: these cover the
+/// status the dashboard renders, including the states a user most needs to tell
+/// apart — configured but never loaded, loaded but unused, and actually working.
+final class RetrievalStatusTests: XCTestCase {
+    private func decodeStatus(_ json: String) throws -> RetrievalStatus {
+        try JSONDecoder().decode(RetrievalStatus.self, from: Data(json.utf8))
+    }
+
+    func testStatusDecodesModelsWithMetrics() throws {
+        let status = try decodeStatus("""
+        {"enabled": true, "max_resident": 2, "resident": ["org/e"],
+         "models": [{"id":"e1","role":"embedding","model_ref":"org/e","loaded":true,
+                     "resident":true,"max_tokens":8192,"batch_size":8,
+                     "requests":3,"items":12,"computeSeconds":2.0,"loadSeconds":4.5,
+                     "lastUsedS":1785000000.0,"itemsPerSecond":6.0,"avgLatencyMs":666.7}]}
+        """)
+        XCTAssertTrue(status.enabled)
+        XCTAssertEqual(status.maxResident, 2)
+        XCTAssertEqual(status.resident, ["org/e"])
+
+        let model = try XCTUnwrap(status.models.first)
+        XCTAssertEqual(model.id, "e1")
+        XCTAssertTrue(model.isEmbedding)
+        XCTAssertTrue(model.loaded)
+        XCTAssertTrue(model.hasBeenUsed)
+        XCTAssertEqual(model.items, 12)
+        XCTAssertEqual(model.itemsPerSecond, 6.0)
+        XCTAssertEqual(model.loadSeconds, 4.5)
+    }
+
+    func testConfiguredButNeverLoadedModelIsNotReportedAsWorking() throws {
+        let status = try decodeStatus("""
+        {"enabled": true, "models": [{"id":"e1","role":"embedding","loaded":false}]}
+        """)
+        let model = try XCTUnwrap(status.models.first)
+        XCTAssertFalse(model.loaded)
+        XCTAssertFalse(model.hasBeenUsed)
+    }
+
+    func testRolesAreSplitForDisplay() throws {
+        let status = try decodeStatus("""
+        {"enabled": true, "models": [
+          {"id":"e1","role":"embedding"}, {"id":"r1","role":"rerank"}]}
+        """)
+        XCTAssertEqual(status.embedders.map(\.id), ["e1"])
+        XCTAssertEqual(status.rerankers.map(\.id), ["r1"])
+    }
+
+    func testMissingFieldsFallBackInsteadOfFailingTheWholeSnapshot() throws {
+        // A daemon predating any given metric must still render.
+        let status = try decodeStatus("""
+        {"enabled": true, "models": [{"id":"e1"}]}
+        """)
+        let model = try XCTUnwrap(status.models.first)
+        XCTAssertEqual(model.role, "embedding")
+        XCTAssertEqual(model.requests, 0)
+        XCTAssertNil(model.itemsPerSecond)
+    }
+
+    func testChatOnlyDaemonDecodesAsDisabled() throws {
+        let status = try decodeStatus("{\"enabled\": false, \"models\": []}")
+        XCTAssertFalse(status.enabled)
+        XCTAssertTrue(status.models.isEmpty)
+    }
+}
