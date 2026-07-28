@@ -2115,6 +2115,32 @@ def build_parser() -> argparse.ArgumentParser:
     quickstart_server_p.add_argument("--host", default="127.0.0.1")
     quickstart_server_p.add_argument("--port", type=int, default=8000)
     quickstart_server_p.add_argument("--model-id", default=DEFAULT_PUBLIC_MODEL_ID, help="Served OpenAI model id; defaults to the loaded artifact identity")
+    quickstart_server_p.add_argument(
+        "--embedding-model",
+        action="append",
+        default=[],
+        metavar="REF[=SERVED_ID]",
+        help="Serve REF on /v1/embeddings (repeatable). Loaded on first request.",
+    )
+    quickstart_server_p.add_argument(
+        "--reranker-model",
+        action="append",
+        default=[],
+        metavar="REF[=SERVED_ID]",
+        help="Serve REF on /v1/rerank (repeatable). The same REF in both roles loads once.",
+    )
+    quickstart_server_p.add_argument(
+        "--retrieval-max-resident",
+        type=int,
+        default=2,
+        help="How many retrieval models stay in memory; least-recently-used are unloaded",
+    )
+    quickstart_server_p.add_argument(
+        "--retrieval-max-tokens",
+        type=int,
+        default=0,
+        help="Truncate retrieval inputs to this many tokens (0 = per-model default)",
+    )
     quickstart_server_p.add_argument("--dry-run", action="store_true", help="Preview the server launch command without loading MLX")
     quickstart_server_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON for --dry-run and errors")
     quickstart_server_p.add_argument("--depth", type=int, default=3)
@@ -2639,6 +2665,32 @@ def build_parser() -> argparse.ArgumentParser:
     _add_preserve_thinking_arg(serve_p)
     _add_bridge_prompt_args(serve_p)
     serve_p.add_argument("--model-id", default=DEFAULT_PUBLIC_MODEL_ID, help="Served OpenAI model id; defaults to the loaded artifact identity")
+    serve_p.add_argument(
+        "--embedding-model",
+        action="append",
+        default=[],
+        metavar="REF[=SERVED_ID]",
+        help="Serve REF on /v1/embeddings (repeatable). Loaded on first request.",
+    )
+    serve_p.add_argument(
+        "--reranker-model",
+        action="append",
+        default=[],
+        metavar="REF[=SERVED_ID]",
+        help="Serve REF on /v1/rerank (repeatable). The same REF in both roles loads once.",
+    )
+    serve_p.add_argument(
+        "--retrieval-max-resident",
+        type=int,
+        default=2,
+        help="How many retrieval models stay in memory; least-recently-used are unloaded",
+    )
+    serve_p.add_argument(
+        "--retrieval-max-tokens",
+        type=int,
+        default=0,
+        help="Truncate retrieval inputs to this many tokens (0 = per-model default)",
+    )
     serve_p.add_argument(
         "--no-stats-footer",
         action="store_false",

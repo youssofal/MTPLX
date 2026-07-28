@@ -62,6 +62,12 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
     public var batchWaitMs: Double?
     public var prefillChunkTokens: Int?
     public var experimentalMTPCohorts: Bool
+    /// Models served on /v1/embeddings, as `REF` or `REF=SERVED_ID`.
+    public var embeddingModels: [String]
+    /// Models served on /v1/rerank. The same REF in both roles loads once.
+    public var rerankerModels: [String]
+    /// How many retrieval models stay resident before the oldest is unloaded.
+    public var retrievalMaxResident: Int
     public var ramSessionCachePolicy: String
     public var ramSessionBlockPrefixRestore: Bool
     public var ramSessionCacheMaxEntries: Int
@@ -195,6 +201,9 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         batchWaitMs: Double? = nil,
         prefillChunkTokens: Int? = nil,
         experimentalMTPCohorts: Bool = false,
+        embeddingModels: [String] = [],
+        rerankerModels: [String] = [],
+        retrievalMaxResident: Int = 2,
         ramSessionCachePolicy: String = "target-default",
         ramSessionBlockPrefixRestore: Bool = true,
         ramSessionCacheMaxEntries: Int = 8,
@@ -258,6 +267,9 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         self.batchWaitMs = batchWaitMs
         self.prefillChunkTokens = prefillChunkTokens
         self.experimentalMTPCohorts = experimentalMTPCohorts
+        self.embeddingModels = embeddingModels
+        self.rerankerModels = rerankerModels
+        self.retrievalMaxResident = retrievalMaxResident
         self.ramSessionCachePolicy = ramSessionCachePolicy
         self.ramSessionBlockPrefixRestore = ramSessionBlockPrefixRestore
         self.ramSessionCacheMaxEntries = ramSessionCacheMaxEntries
@@ -443,6 +455,9 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         case batchWaitMs = "batch_wait_ms"
         case prefillChunkTokens = "prefill_chunk_tokens"
         case experimentalMTPCohorts = "experimental_mtp_cohorts"
+        case embeddingModels = "embedding_models"
+        case rerankerModels = "reranker_models"
+        case retrievalMaxResident = "retrieval_max_resident"
         case ramSessionCachePolicy = "ram_session_cache_policy"
         case ramSessionBlockPrefixRestore = "ram_session_block_prefix_restore"
         case ramSessionCacheMaxEntries = "ram_session_cache_max_entries"
@@ -512,6 +527,9 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         batchWaitMs = try container.decodeIfPresent(Double.self, forKey: .batchWaitMs)
         prefillChunkTokens = try container.decodeIfPresent(Int.self, forKey: .prefillChunkTokens)
         experimentalMTPCohorts = try container.decodeIfPresent(Bool.self, forKey: .experimentalMTPCohorts) ?? defaults.experimentalMTPCohorts
+        embeddingModels = try container.decodeIfPresent([String].self, forKey: .embeddingModels) ?? defaults.embeddingModels
+        rerankerModels = try container.decodeIfPresent([String].self, forKey: .rerankerModels) ?? defaults.rerankerModels
+        retrievalMaxResident = try container.decodeIfPresent(Int.self, forKey: .retrievalMaxResident) ?? defaults.retrievalMaxResident
         ramSessionCachePolicy = try container.decodeIfPresent(String.self, forKey: .ramSessionCachePolicy) ?? defaults.ramSessionCachePolicy
         ramSessionBlockPrefixRestore = try container.decodeIfPresent(Bool.self, forKey: .ramSessionBlockPrefixRestore) ?? defaults.ramSessionBlockPrefixRestore
         ramSessionCacheMaxEntries = try container.decodeIfPresent(Int.self, forKey: .ramSessionCacheMaxEntries) ?? defaults.ramSessionCacheMaxEntries

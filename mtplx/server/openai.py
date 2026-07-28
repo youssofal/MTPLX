@@ -92,6 +92,7 @@ from mtplx.gemma4_pair import (
     resolve_gemma4_pair_paths,
 )
 from mtplx.model_scheduler import ModelWorkScheduler
+from mtplx.retrieval import RetrievalError
 from mtplx.sampling import SamplerConfig
 from mtplx.profiles import (
     DEFAULT_HF_MODEL_ID,
@@ -1041,6 +1042,28 @@ class CompletionRequest(BaseModel):
     stream: bool = False
 
 
+class EmbeddingsRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    model: str | None = None
+    input: str | list[str] | None = None
+    encoding_format: str | None = None
+    # Qwen3-Embedding scores queries better when they carry a task instruction,
+    # while stored documents must stay raw — so this is per request, not global.
+    instruction: str | None = None
+
+
+class RerankRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    model: str | None = None
+    query: str | None = None
+    documents: list[str] | None = None
+    top_n: int | None = None
+    return_documents: bool = False
+    instruction: str | None = None
+
+
 class AnthropicMessage(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -1613,6 +1636,11 @@ class ServerState:
             raise ValueError(str(exc)) from exc
         apply_paged_kv_quantization_env(args.paged_kv_quantization)
         self.model_id = args.model_id
+        # Retrieval models are independent of the MTP generation path: they are
+        # loaded on first use and may be absent entirely.
+        from mtplx.retrieval import registry_from_args
+
+        self.retrieval = registry_from_args(args)
         self.started_at_s = time.time()
         self.lock = Lock()
         self.foreground_lock = Lock()
@@ -19514,6 +19542,17 @@ def _start_server_console(state: ServerState) -> None:
     thread.start()
 
 
+def _as_text_list(value: Any, *, field: str) -> list[str]:
+    """Coerce an OpenAI-style text field into a list of strings."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return list(value)
+    raise HTTPException(
+        status_code=400, detail=f"{field} must be a string or a list of strings"
+    )
+
+
 def create_app(state: ServerState) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -20886,19 +20925,97 @@ def create_app(state: ServerState) -> FastAPI:
     @app.get("/v1/models")
     def list_models() -> dict[str, Any]:
         now = int(time.time())
+        entries: list[dict[str, Any]] = [
+            {
+                "id": state.model_id,
+                "object": "model",
+                "created": now,
+                "owned_by": "mtplx",
+                "capability": "chat",
+                "context_length": state.context_window,
+                "max_context_length": state.context_window,
+                "max_model_len": state.context_window,
+            }
+        ]
+        retrieval = getattr(state, "retrieval", None)
+        if retrieval is not None:
+            for descriptor in retrieval.descriptors():
+                entries.append(
+                    {
+                        "id": descriptor["id"],
+                        "object": "model",
+                        "created": now,
+                        "owned_by": "mtplx",
+                        "capability": descriptor["role"],
+                        "root": descriptor["model_ref"],
+                        "max_model_len": descriptor["max_tokens"],
+                    }
+                )
+        return {"object": "list", "data": entries}
+
+    @app.post("/v1/embeddings")
+    async def embeddings(request: EmbeddingsRequest) -> dict[str, Any]:
+        retrieval = getattr(state, "retrieval", None)
+        if retrieval is None or not retrieval.enabled:
+            raise HTTPException(
+                status_code=404,
+                detail="no embedding model is configured; start MTPLX with --embedding-model",
+            )
+        texts = _as_text_list(request.input, field="input")
+        try:
+            vectors, spec = await asyncio.to_thread(
+                retrieval.embed,
+                texts,
+                model=request.model,
+                instruction=request.instruction,
+            )
+        except RetrievalError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {
             "object": "list",
             "data": [
-                {
-                    "id": state.model_id,
-                    "object": "model",
-                    "created": now,
-                    "owned_by": "mtplx",
-                    "context_length": state.context_window,
-                    "max_context_length": state.context_window,
-                    "max_model_len": state.context_window,
-                }
+                {"object": "embedding", "index": index, "embedding": vector}
+                for index, vector in enumerate(vectors)
             ],
+            "model": spec.served_id,
+            "usage": {"prompt_tokens": 0, "total_tokens": 0},
+        }
+
+    @app.post("/v1/rerank")
+    async def rerank(request: RerankRequest) -> dict[str, Any]:
+        retrieval = getattr(state, "retrieval", None)
+        if retrieval is None or not retrieval.enabled:
+            raise HTTPException(
+                status_code=404,
+                detail="no reranking model is configured; start MTPLX with --reranker-model",
+            )
+        if not request.query or not str(request.query).strip():
+            raise HTTPException(status_code=400, detail="query must be a non-empty string")
+        documents = _as_text_list(request.documents, field="documents")
+        try:
+            scores, spec = await asyncio.to_thread(
+                retrieval.rerank,
+                str(request.query),
+                documents,
+                model=request.model,
+                instruction=request.instruction,
+            )
+        except RetrievalError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        ranked = sorted(enumerate(scores), key=lambda item: item[1], reverse=True)
+        if request.top_n is not None and int(request.top_n) > 0:
+            ranked = ranked[: int(request.top_n)]
+        results: list[dict[str, Any]] = []
+        for index, score in ranked:
+            entry: dict[str, Any] = {"index": index, "relevance_score": score}
+            if request.return_documents:
+                entry["document"] = {"text": documents[index]}
+            results.append(entry)
+        return {
+            "id": f"rerank-{int(time.time() * 1000)}",
+            "model": spec.served_id,
+            "results": results,
+            "usage": {"total_tokens": 0},
         }
 
     @app.post("/v1/chat/completions")
@@ -25625,6 +25742,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         postcommit_default = "async"
     parser.add_argument("--model", default=DEFAULT_HF_MODEL_ID)
     parser.add_argument("--model-id", default="mtplx-qwen36-27b-native-mtp")
+    parser.add_argument(
+        "--embedding-model",
+        action="append",
+        default=[],
+        metavar="REF[=SERVED_ID]",
+        help="Serve REF on /v1/embeddings (repeatable); loaded on first request",
+    )
+    parser.add_argument(
+        "--reranker-model",
+        action="append",
+        default=[],
+        metavar="REF[=SERVED_ID]",
+        help="Serve REF on /v1/rerank (repeatable); the same REF in both roles loads once",
+    )
+    parser.add_argument(
+        "--retrieval-max-resident",
+        type=int,
+        default=2,
+        help="How many retrieval models stay in memory; least-recently-used are unloaded",
+    )
+    parser.add_argument(
+        "--retrieval-max-tokens",
+        type=int,
+        default=0,
+        help="Truncate retrieval inputs to this many tokens (0 = per-model default)",
+    )
     parser.add_argument("--backend-id", default="qwen3_next", help=argparse.SUPPRESS)
     parser.add_argument(
         "--assistant-model",

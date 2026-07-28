@@ -252,6 +252,19 @@ public struct MTPLXCommandBuilder: Sendable {
         if configuration.experimentalMTPCohorts {
             arguments.append("--experimental-mtp-cohorts")
         }
+        // Retrieval models are additive: no flag means the endpoints answer 404
+        // and the chat runtime behaves exactly as before.
+        for reference in configuration.embeddingModels where !reference.trimmingCharacters(in: .whitespaces).isEmpty {
+            arguments.append(contentsOf: ["--embedding-model", reference])
+        }
+        for reference in configuration.rerankerModels where !reference.trimmingCharacters(in: .whitespaces).isEmpty {
+            arguments.append(contentsOf: ["--reranker-model", reference])
+        }
+        if !configuration.embeddingModels.isEmpty || !configuration.rerankerModels.isEmpty {
+            arguments.append(contentsOf: [
+                "--retrieval-max-resident", String(max(1, configuration.retrievalMaxResident)),
+            ])
+        }
         // Always pass the resolved SSD mode, including "off". Omitting
         // the flag delegates the decision to the serve CLI default,
         // which flipped from off to on in 2.0.0 (kvcache-v2) — turning

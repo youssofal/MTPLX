@@ -29,6 +29,7 @@ struct SettingsTab: View {
                 ramCacheCard
                 kvQuantCard
                 ssdCacheCard
+                retrievalCard
                 restartRequiredCard
                 hermesToolTruthCard
                 thermalCard
@@ -850,6 +851,88 @@ struct SettingsTab: View {
     }
 
     // MARK: - Restart-required
+
+    // MARK: - Retrieval (embeddings + reranking)
+    //
+    // Maps to: embeddingModels, rerankerModels, retrievalMaxResident. Purely
+    // additive — with nothing configured the endpoints answer 404 and the chat
+    // runtime is untouched. Restart-required, because the served set is built
+    // when the daemon starts.
+
+    /// Bridge the stored string list to a multi-line text field.
+    ///
+    /// Splitting on newlines and commas means a pasted `a, b` works as well as
+    /// one-per-line, and blank lines are dropped rather than becoming empty
+    /// model references.
+    private func modelListBinding(
+        _ keyPath: WritableKeyPath<MTPLXAppConfiguration, [String]>
+    ) -> Binding<String> {
+        Binding(
+            get: { draftConfig[keyPath: keyPath].joined(separator: "\n") },
+            set: { newValue in
+                draftConfig[keyPath: keyPath] = newValue
+                    .split(whereSeparator: { $0 == "\n" || $0 == "," })
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty }
+            }
+        )
+    }
+
+    @ViewBuilder
+    private var retrievalCard: some View {
+        Card(
+            "Retrieval endpoints",
+            subtitle: "Serve embeddings and reranking from this daemon. Leave empty to keep MTPLX chat-only."
+        ) {
+            VStack(alignment: .leading, spacing: 10) {
+                FormRow(
+                    label: "Embedding models",
+                    caption: "One per line — a Hugging Face id or local path, optionally REF=served-id. Serves /v1/embeddings."
+                ) {
+                    TextField(
+                        "mlx-community/Qwen3-Embedding-8B-4bit-DWQ",
+                        text: modelListBinding(\.embeddingModels),
+                        axis: .vertical
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(.callout, design: .monospaced))
+                    .lineLimit(2...6)
+                }
+
+                Divider().overlay(Brand.separator)
+
+                FormRow(
+                    label: "Reranker models",
+                    caption: "Serves /v1/rerank. Listing the same reference here and above loads one copy of the weights for both roles."
+                ) {
+                    TextField(
+                        "vserifsaglam/Qwen3-Reranker-4B-4bit-MLX",
+                        text: modelListBinding(\.rerankerModels),
+                        axis: .vertical
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(.callout, design: .monospaced))
+                    .lineLimit(2...6)
+                }
+
+                Divider().overlay(Brand.separator)
+
+                FormRow(
+                    label: "Models kept resident",
+                    caption: "Retrieval models load on first request. Beyond this count the least recently used one is unloaded."
+                ) {
+                    Stepper(
+                        value: $draftConfig.retrievalMaxResident,
+                        in: 1...8
+                    ) {
+                        Text("\(draftConfig.retrievalMaxResident)")
+                            .font(.system(.callout, design: .monospaced))
+                    }
+                    .frame(maxWidth: 160, alignment: .leading)
+                }
+            }
+        }
+    }
 
     @ViewBuilder
     private var restartRequiredCard: some View {

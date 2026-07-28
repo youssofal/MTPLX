@@ -8444,6 +8444,20 @@ def cmd_serve_public(args: Any) -> int:
         value = getattr(args, attr, None)
         if value is not None:
             cmd.extend([flag, str(value)])
+    # Retrieval models. The server runs as a subprocess with an explicitly
+    # rebuilt argv, so anything not forwarded here never reaches it — the
+    # endpoints would stay unconfigured on every path but a bare `mtplx serve`.
+    for flag, attr in (("--embedding-model", "embedding_model"), ("--reranker-model", "reranker_model")):
+        for reference in getattr(args, attr, None) or []:
+            if str(reference).strip():
+                cmd.extend([flag, str(reference)])
+    for flag, attr in (
+        ("--retrieval-max-resident", "retrieval_max_resident"),
+        ("--retrieval-max-tokens", "retrieval_max_tokens"),
+    ):
+        value = getattr(args, attr, None)
+        if value:
+            cmd.extend([flag, str(value)])
     context_window = getattr(args, "context_window", None)
     if context_window is not None:
         cmd.extend(["--context-window", str(context_window)])
@@ -11334,6 +11348,13 @@ def _with_server_policy_args(target: Any, source: Any) -> Any:
     setattr(target, "_cli_flags", getattr(source, "_cli_flags", set()) or set())
     _with_batching_args(target, source)
     for attr, default in (
+        # Retrieval models: quickstart builds its serve namespace field by
+        # field, so without forwarding these the endpoints would silently stay
+        # unconfigured on every path except a bare `mtplx serve`.
+        ("embedding_model", []),
+        ("reranker_model", []),
+        ("retrieval_max_resident", 2),
+        ("retrieval_max_tokens", 0),
         ("api_key_file", None),
         ("api_key_source", "none"),
         ("default_presence_penalty", 0.0),

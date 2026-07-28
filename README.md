@@ -61,7 +61,7 @@ The official catalog lives on Hugging Face under [Youssofal](https://huggingface
 
 ## The server
 
-`mtplx start` (or the app's play button) serves an OpenAI-compatible API on `127.0.0.1:8000`: `/v1/chat/completions`, `/v1/completions`, `/v1/models`, plus an Anthropic-compatible `/v1/messages` with streaming, tool calls in both styles, `/health`, and `/metrics`. Claude Code, Cline, Continue, Open WebUI, curl, the openai and anthropic Python clients: if it speaks the API, it works. The app and CLI share one server, so `mtplx start` attaches to the app's running model instead of loading a second copy.
+`mtplx start` (or the app's play button) serves an OpenAI-compatible API on `127.0.0.1:8000`: `/v1/chat/completions`, `/v1/completions`, `/v1/models`, the optional `/v1/embeddings` and `/v1/rerank` (see below), plus an Anthropic-compatible `/v1/messages` with streaming, tool calls in both styles, `/health`, and `/metrics`. Claude Code, Cline, Continue, Open WebUI, curl, the openai and anthropic Python clients: if it speaks the API, it works. The app and CLI share one server, so `mtplx start` attaches to the app's running model instead of loading a second copy.
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
@@ -70,6 +70,30 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 ```
 
 Sessions survive: a warm-prefix session bank keeps multi-turn chats fast, and an optional SSD cache restores sessions near-instantly across restarts.
+
+### Embeddings and reranking
+
+The same daemon can serve retrieval models, so a RAG or agent-memory setup does not need a second inference server beside MTPLX. Point it at any MLX embedding or reranker model — Hugging Face id or local path, optionally with a `REF=served-id` alias:
+
+```bash
+mtplx serve \
+  --embedding-model mlx-community/Qwen3-Embedding-8B-4bit-DWQ \
+  --reranker-model vserifsaglam/Qwen3-Reranker-4B-4bit-MLX
+```
+
+```bash
+curl http://127.0.0.1:8000/v1/embeddings \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen3-Embedding-8B-4bit-DWQ","input":["hello","world"]}'
+
+curl http://127.0.0.1:8000/v1/rerank \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"where is the cache?","documents":["the cache lives in ~/.mtplx","unrelated text"]}'
+```
+
+Both flags repeat, so several models can be served at once and picked per request via `"model"`. Listing the same reference as both an embedder and a reranker loads **one** copy of the weights and serves both roles from it. Retrieval models load on first request and are capped by `--retrieval-max-resident` (default 2), which unloads the least recently used one beyond the cap — an unused endpoint costs nothing. `/v1/models` labels every entry with a `capability` of `chat`, `embedding`, or `rerank`.
+
+These models do not go through the MTP path, and that is deliberate: multi-token prediction makes *next-token* decoding cheaper, which means nothing for a model that returns a vector instead of a token stream. Configure them in the app under Settings → Retrieval endpoints, or persist them in `~/.mtplx/config.toml` as `embedding_models` and `reranker_models`. With nothing configured the endpoints answer 404 and chat behaves exactly as before.
 
 Sampler controls cover `temperature`, `top_p`, `top_k`, and the OpenAI penalty pair `presence_penalty` / `frequency_penalty` — per request, as server defaults (`--default-presence-penalty` / `--default-frequency-penalty` on `start`/`serve`/`quickstart`), or live via `mtplx settings set` and the app's Presence Penalty dial. Penalties default to 0, which is an exact no-op that preserves MTP exactness. Qwen's guidance: leave them at 0 for coding and agent work; ~0.5–1.5 presence penalty helps creative writing or when a model loops on itself.
 

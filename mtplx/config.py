@@ -51,6 +51,9 @@ CONFIG_VALUE_KEYS = (
     "top_p",
     "top_k",
     "api_key_file",
+    "embedding_models",
+    "reranker_models",
+    "retrieval_max_resident",
 )
 
 
@@ -86,6 +89,9 @@ class UserConfig:
     top_p: float | None = None
     top_k: int | None = None
     api_key_file: str | None = None
+    embedding_models: tuple[str, ...] = ()
+    reranker_models: tuple[str, ...] = ()
+    retrieval_max_resident: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -158,6 +164,9 @@ def load_user_config(path: str | Path | None = None) -> UserConfig:
         top_p=_float_or_none(data.get("top_p")),
         top_k=_int_or_none(data.get("top_k")),
         api_key_file=_str_or_none(data.get("api_key_file")),
+        embedding_models=_str_tuple(data.get("embedding_models")),
+        reranker_models=_str_tuple(data.get("reranker_models")),
+        retrieval_max_resident=_int_or_none(data.get("retrieval_max_resident")),
     )
 
 
@@ -236,6 +245,9 @@ _RUNTIME_DEFAULTS: dict[str, tuple[str, tuple[str, ...]]] = {
     "batch_wait_ms": ("batch_wait_ms", ("batch-wait-ms",)),
     "prefill_chunk_tokens": ("prefill_chunk_tokens", ("prefill-chunk-tokens",)),
     "experimental_mtp_cohorts": ("experimental_mtp_cohorts", ("experimental-mtp-cohorts",)),
+    "embedding_models": ("embedding_model", ("embedding-model",)),
+    "reranker_models": ("reranker_model", ("reranker-model",)),
+    "retrieval_max_resident": ("retrieval_max_resident", ("retrieval-max-resident",)),
     "ssd_session_cache": ("ssd_session_cache", ("ssd-session-cache",)),
     "ssd_session_cache_dir": ("ssd_session_cache_dir", ("ssd-session-cache-dir",)),
     "ssd_session_cache_max_size": ("ssd_session_cache_max_size", ("ssd-session-cache-max-size",)),
@@ -265,6 +277,15 @@ def _apply_runtime_defaults(args: Any, config: UserConfig) -> None:
         value = getattr(config, config_key, None)
         if value is not None:
             setattr(args, attr, value)
+
+
+def _str_tuple(value: Any) -> tuple[str, ...]:
+    """Read a config list of model references, tolerating a bare string."""
+    if value in (None, ""):
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    return tuple(str(item) for item in value if str(item).strip())
 
 
 def _str_or_none(value: Any) -> str | None:
