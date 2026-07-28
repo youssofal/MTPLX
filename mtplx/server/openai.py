@@ -28,6 +28,7 @@ import re
 import secrets
 import socket
 import subprocess
+import struct
 import sys
 import time
 import urllib.parse
@@ -19542,6 +19543,17 @@ def _start_server_console(state: ServerState) -> None:
     thread.start()
 
 
+def _encoded_embedding(vector: list[float], encoding_format: str) -> Any:
+    """Return a vector in the representation the client asked for.
+
+    OpenAI's ``base64`` format is the raw float32 buffer, little-endian, which
+    is what clients decode with ``numpy.frombuffer(..., dtype="float32")``.
+    """
+    if encoding_format != "base64":
+        return vector
+    return base64.b64encode(struct.pack(f"<{len(vector)}f", *vector)).decode("ascii")
+
+
 def _as_text_list(value: Any, *, field: str) -> list[str]:
     """Coerce an OpenAI-style text field into a list of strings."""
     if isinstance(value, str):
@@ -20962,6 +20974,15 @@ def create_app(state: ServerState) -> FastAPI:
                 detail="no embedding model is configured; start MTPLX with --embedding-model",
             )
         texts = _as_text_list(request.input, field="input")
+        encoding_format = str(request.encoding_format or "float").lower()
+        if encoding_format not in {"float", "base64"}:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"unsupported encoding_format {request.encoding_format!r}; "
+                    "expected 'float' or 'base64'"
+                ),
+            )
         try:
             vectors, spec = await asyncio.to_thread(
                 retrieval.embed,
@@ -20974,7 +20995,11 @@ def create_app(state: ServerState) -> FastAPI:
         return {
             "object": "list",
             "data": [
-                {"object": "embedding", "index": index, "embedding": vector}
+                {
+                    "object": "embedding",
+                    "index": index,
+                    "embedding": _encoded_embedding(vector, encoding_format),
+                }
                 for index, vector in enumerate(vectors)
             ],
             "model": spec.served_id,
@@ -25767,6 +25792,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=0,
         help="Truncate retrieval inputs to this many tokens (0 = per-model default)",
+    )
+    parser.add_argument(
+        "--retrieval-cache-dir",
+        default=None,
+        help="Model cache directory used to resolve retrieval references",
     )
     parser.add_argument("--backend-id", default="qwen3_next", help=argparse.SUPPRESS)
     parser.add_argument(

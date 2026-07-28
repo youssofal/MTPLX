@@ -122,6 +122,28 @@ def test_one_reference_in_both_roles_shares_a_single_backend(monkeypatch):
     assert embedding_backend is rerank_backend
 
 
+def test_a_slot_is_reserved_before_the_weights_finish_loading(monkeypatch):
+    """Regression: concurrent first-use requests must not both stay resident.
+
+    Loading happens outside the registry lock. If residency counted only
+    finished loads, two requests for different models would each see the other
+    as absent, skip eviction, and blow the cap exactly when memory is tightest.
+    """
+    monkeypatch.setattr(
+        "mtplx.hf_loader.resolve_model_path",
+        lambda ref, cache_dir=None: Path("/models") / str(ref).rsplit("/", 1)[-1],
+    )
+    registry = RetrievalRegistry(max_resident=1)
+    registry.register(RetrievalSpec("a", "org/a", "embedding"))
+    registry.register(RetrievalSpec("b", "org/b", "embedding"))
+
+    # Acquire A but never mark it loaded, as an in-flight load would look.
+    registry._backend(registry._spec("embedding", "a"))
+    registry._backend(registry._spec("embedding", "b"))
+
+    assert list(registry.status()["resident"]) == ["org/b"]
+
+
 def test_resident_models_are_evicted_beyond_the_cap(monkeypatch):
     monkeypatch.setattr(
         "mtplx.hf_loader.resolve_model_path",
@@ -166,6 +188,26 @@ def test_registry_from_args_reads_repeatable_flags():
 
 def test_registry_from_args_without_any_flags_is_disabled():
     assert not registry_from_args(SimpleNamespace()).enabled
+
+
+def test_registry_from_args_prefers_the_forwarded_retrieval_cache_dir():
+    """The server subprocess carries no cache dir of its own.
+
+    The chat model arrives pre-resolved, so without this the retrieval models
+    would silently look in the default cache and miss a custom --cache-dir.
+    """
+    args = SimpleNamespace(
+        embedding_model=["org/embed"],
+        retrieval_cache_dir="/custom/retrieval",
+        cache_dir="/custom/cli",
+        model_dir="/custom/setup",
+    )
+    assert registry_from_args(args).cache_dir == "/custom/retrieval"
+
+
+def test_registry_from_args_falls_back_to_the_cli_cache_dir():
+    args = SimpleNamespace(embedding_model=["org/embed"], cache_dir="/custom/cli")
+    assert registry_from_args(args).cache_dir == "/custom/cli"
 
 
 # ---- HTTP contract --------------------------------------------------------
@@ -242,6 +284,35 @@ def test_embeddings_returns_openai_shape_in_input_order():
     assert payload["data"][0]["embedding"] == [0.5, 0.5]
     assert payload["model"] == "e1"
     assert registry.embed_calls[0]["texts"] == ["a", "b"]
+
+
+def test_embeddings_honour_base64_encoding_format():
+    """A client that asks for base64 must not silently receive float arrays."""
+    import base64
+    import struct
+
+    response = _client(_StubRegistry()).post(
+        "/v1/embeddings", json={"input": "a", "encoding_format": "base64"}
+    )
+    payload = response.json()
+    assert response.status_code == 200
+    encoded = payload["data"][0]["embedding"]
+    assert isinstance(encoded, str)
+    decoded = struct.unpack("<2f", base64.b64decode(encoded))
+    assert [round(value, 4) for value in decoded] == [0.5, 0.5]
+
+
+def test_embeddings_default_to_float_vectors():
+    response = _client(_StubRegistry()).post("/v1/embeddings", json={"input": "a"})
+    assert response.json()["data"][0]["embedding"] == [0.5, 0.5]
+
+
+def test_embeddings_reject_an_unknown_encoding_format():
+    response = _client(_StubRegistry()).post(
+        "/v1/embeddings", json={"input": "a", "encoding_format": "float16"}
+    )
+    assert response.status_code == 400
+    assert "encoding_format" in response.json()["error"]["message"]
 
 
 def test_embeddings_accepts_a_bare_string_input():

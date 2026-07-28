@@ -237,18 +237,18 @@ class RetrievalRegistry:
                 path = resolve_model_path(spec.model_ref, cache_dir=self.cache_dir)
                 backend = _Backend(spec.model_ref, path)
                 self._backends[spec.model_ref] = backend
+            # A slot is reserved on acquisition, not on completed load. Two
+            # first-use requests for different models run concurrently, and
+            # loading happens outside this lock: if residency counted only
+            # finished loads, each request would see the other as absent, skip
+            # eviction, and both models would end up resident — the cap would
+            # be silently exceeded exactly when memory is tightest.
             self._resident[spec.model_ref] = None
             self._resident.move_to_end(spec.model_ref)
-            # The incoming model is about to occupy a slot but is not loaded
-            # yet, so it must not be counted — otherwise the cap admits one
-            # model too many.
-            others = [
-                ref
-                for ref in self._resident
-                if ref != spec.model_ref and self._backends[ref].loaded
-            ]
-            while len(others) >= self.max_resident:
-                oldest = others.pop(0)
+            while len(self._resident) > self.max_resident:
+                oldest = next(iter(self._resident))
+                if oldest == spec.model_ref:
+                    break
                 self._backends[oldest].unload()
                 self._resident.pop(oldest, None)
         return backend
@@ -396,9 +396,19 @@ def registry_from_args(args: Any) -> RetrievalRegistry:
     Unknown attributes are tolerated so callers that construct a bare namespace
     (tests, embedded use) do not have to populate every retrieval flag.
     """
+    # The chat model is resolved to an absolute path before the server
+    # subprocess starts, so that process carries no cache directory of its own.
+    # Retrieval references stay symbolic and are resolved here, which means the
+    # directory has to be threaded through explicitly or a model pulled into a
+    # custom --cache-dir is invisible despite being on disk.
+    cache_dir = (
+        getattr(args, "retrieval_cache_dir", None)
+        or getattr(args, "cache_dir", None)
+        or getattr(args, "model_dir", None)
+    )
     registry = RetrievalRegistry(
         max_resident=int(getattr(args, "retrieval_max_resident", DEFAULT_MAX_RESIDENT) or DEFAULT_MAX_RESIDENT),
-        cache_dir=getattr(args, "model_dir", None),
+        cache_dir=cache_dir,
     )
     for role, attribute in (("embedding", "embedding_model"), ("rerank", "reranker_model")):
         for value in getattr(args, attribute, None) or []:

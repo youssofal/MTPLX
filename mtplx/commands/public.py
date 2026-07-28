@@ -8458,6 +8458,15 @@ def cmd_serve_public(args: Any) -> int:
         value = getattr(args, attr, None)
         if value:
             cmd.extend([flag, str(value)])
+    # The chat model is already an absolute path by this point, but retrieval
+    # references are resolved inside the server, which has no cache directory
+    # of its own — so a model pulled into a custom --cache-dir would not be
+    # found unless the directory travels with them.
+    retrieval_cache_dir = getattr(args, "cache_dir", None)
+    if retrieval_cache_dir and (
+        getattr(args, "embedding_model", None) or getattr(args, "reranker_model", None)
+    ):
+        cmd.extend(["--retrieval-cache-dir", str(retrieval_cache_dir)])
     context_window = getattr(args, "context_window", None)
     if context_window is not None:
         cmd.extend(["--context-window", str(context_window)])
