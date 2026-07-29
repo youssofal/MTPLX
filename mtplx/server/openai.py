@@ -12594,6 +12594,24 @@ async def _memory_pressure_loop(
                             else "memory_pressure_warning"
                         ),
                     )
+                if level >= 4:
+                    # Under CRITICAL, shedding the buffer pool is not enough:
+                    # retrieval weights are whole GB and reload in seconds, so
+                    # they are the cheapest large thing to give back. Idle-only
+                    # (threshold 0 means "not pinned"), so an in-flight request
+                    # never loses its model.
+                    retrieval = getattr(state, "retrieval", None)
+                    if retrieval is not None and retrieval.enabled:
+                        try:
+                            released = await asyncio.to_thread(retrieval.unload_idle, 0)
+                            if released["unloaded"]:
+                                _LOG.info(
+                                    "memory pressure released %d retrieval model(s), %.2f GB",
+                                    len(released["unloaded"]),
+                                    released["freed_bytes"] / (1024**3),
+                                )
+                        except Exception as exc:
+                            _LOG.warning("retrieval pressure release: %s", exc)
                 if evicted or level >= 4:
                     try:
                         import mlx.core as _mx

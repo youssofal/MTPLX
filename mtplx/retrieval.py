@@ -436,9 +436,16 @@ class RetrievalRegistry:
         show it. A backend inside an in-flight request is never a candidate:
         its pin count is checked under the same lock that hands it out.
         """
-        threshold = self.idle_timeout_s if older_than_s is None else float(older_than_s)
-        if threshold <= 0:
-            return {"unloaded": [], "freed_bytes": 0}
+        # An omitted threshold means "use the configured timeout", where 0
+        # disables idle release. An explicit threshold is always honoured,
+        # including 0 — that is how the memory-pressure guard asks for every
+        # unpinned model regardless of how recently it was used.
+        if older_than_s is None:
+            if self.idle_timeout_s <= 0:
+                return {"unloaded": [], "freed_bytes": 0}
+            threshold = self.idle_timeout_s
+        else:
+            threshold = max(0.0, float(older_than_s))
         now = time.time()
         victims: list[_Backend] = []
         with self._lock:
@@ -446,7 +453,7 @@ class RetrievalRegistry:
                 backend = self._backends.get(key)
                 if backend is None or not backend.loaded or backend.users:
                     continue
-                if now - backend.last_used_s < threshold:
+                if threshold > 0 and now - backend.last_used_s < threshold:
                     continue
                 victims.append(backend)
                 self._resident.pop(key, None)

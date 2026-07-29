@@ -700,3 +700,28 @@ def test_status_and_descriptors_expose_the_idle_state(monkeypatch):
 def test_idle_seconds_is_absent_for_an_unloaded_model():
     entry = {e["id"]: e for e in _registry().descriptors()}["embed-a"]
     assert entry["idleSeconds"] is None
+
+
+def test_pressure_release_ignores_the_idle_timeout_but_not_pinning(monkeypatch):
+    """Under memory pressure any unpinned model is fair game, idle or not."""
+    _fixed_resolver(monkeypatch)
+    registry = RetrievalRegistry(idle_timeout_s=0)  # idle release disabled
+    spec = RetrievalSpec("a", "org/a", "embedding")
+    registry.register(spec)
+    backend = _loaded_backend(registry, spec, idle_for=0, weight_bytes=3_000_000_000)
+
+    # threshold 0 is what the pressure guard passes: just-used but unpinned.
+    released = registry.unload_idle(0)
+    assert released["freed_bytes"] == 3_000_000_000
+    assert backend.loaded is False
+
+
+def test_pressure_release_still_spares_a_pinned_model(monkeypatch):
+    _fixed_resolver(monkeypatch)
+    registry = RetrievalRegistry()
+    spec = RetrievalSpec("a", "org/a", "embedding")
+    registry.register(spec)
+    with registry._acquire(spec) as backend:
+        backend._model = object()
+        assert registry.unload_idle(0)["unloaded"] == []
+        assert backend.loaded is True
