@@ -1157,6 +1157,9 @@ public struct RetrievalModelStatus: Codable, Equatable, Sendable, Identifiable {
     public var resident: Bool
     public var maxTokens: Int
     public var batchSize: Int
+    /// Shard size on disk. MLX holds weights in unified memory that never
+    /// shows up in process RSS, so this is the only honest attribution.
+    public var weightBytes: Int
     public var requests: Int
     public var items: Int
     public var tokens: Int
@@ -1187,6 +1190,7 @@ public struct RetrievalModelStatus: Codable, Equatable, Sendable, Identifiable {
         case resident
         case maxTokens = "max_tokens"
         case batchSize = "batch_size"
+        case weightBytes = "weightBytes"
         case requests
         case items
         case tokens
@@ -1208,6 +1212,7 @@ public struct RetrievalModelStatus: Codable, Equatable, Sendable, Identifiable {
         resident = try container.decodeIfPresent(Bool.self, forKey: .resident) ?? false
         maxTokens = try container.decodeIfPresent(Int.self, forKey: .maxTokens) ?? 0
         batchSize = try container.decodeIfPresent(Int.self, forKey: .batchSize) ?? 0
+        weightBytes = try container.decodeIfPresent(Int.self, forKey: .weightBytes) ?? 0
         requests = try container.decodeIfPresent(Int.self, forKey: .requests) ?? 0
         items = try container.decodeIfPresent(Int.self, forKey: .items) ?? 0
         tokens = try container.decodeIfPresent(Int.self, forKey: .tokens) ?? 0
@@ -1228,6 +1233,7 @@ public struct RetrievalModelStatus: Codable, Equatable, Sendable, Identifiable {
         resident: Bool = false,
         maxTokens: Int = 0,
         batchSize: Int = 0,
+        weightBytes: Int = 0,
         requests: Int = 0,
         items: Int = 0,
         tokens: Int = 0,
@@ -1246,6 +1252,7 @@ public struct RetrievalModelStatus: Codable, Equatable, Sendable, Identifiable {
         self.resident = resident
         self.maxTokens = maxTokens
         self.batchSize = batchSize
+        self.weightBytes = weightBytes
         self.requests = requests
         self.items = items
         self.tokens = tokens
@@ -1263,6 +1270,8 @@ public struct RetrievalStatus: Codable, Equatable, Sendable {
     public var enabled: Bool
     public var maxResident: Int
     public var resident: [String]
+    /// Weights currently held by retrieval models, counted once per backend.
+    public var residentBytes: Int
     public var models: [RetrievalModelStatus]
 
     public var embedders: [RetrievalModelStatus] { models.filter { $0.role == "embedding" } }
@@ -1272,6 +1281,7 @@ public struct RetrievalStatus: Codable, Equatable, Sendable {
         case enabled
         case maxResident = "max_resident"
         case resident
+        case residentBytes = "resident_bytes"
         case models
     }
 
@@ -1280,13 +1290,15 @@ public struct RetrievalStatus: Codable, Equatable, Sendable {
         enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
         maxResident = try container.decodeIfPresent(Int.self, forKey: .maxResident) ?? 0
         resident = try container.decodeIfPresent([String].self, forKey: .resident) ?? []
+        residentBytes = try container.decodeIfPresent(Int.self, forKey: .residentBytes) ?? 0
         models = try container.decodeIfPresent([RetrievalModelStatus].self, forKey: .models) ?? []
     }
 
-    public init(enabled: Bool = false, maxResident: Int = 0, resident: [String] = [], models: [RetrievalModelStatus] = []) {
+    public init(enabled: Bool = false, maxResident: Int = 0, resident: [String] = [], residentBytes: Int = 0, models: [RetrievalModelStatus] = []) {
         self.enabled = enabled
         self.maxResident = maxResident
         self.resident = resident
+        self.residentBytes = residentBytes
         self.models = models
     }
 }

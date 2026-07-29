@@ -597,3 +597,26 @@ def test_the_cap_is_restored_once_overlapping_requests_finish(monkeypatch):
     assert len(resident) == 1
     assert resident == ["/models/b"]
     assert a.loaded is False
+
+
+def test_resident_bytes_counts_a_shared_backend_once(monkeypatch):
+    """One reference in both roles occupies its weights once, not twice."""
+    _fixed_resolver(monkeypatch, {"org/dual": "/models/dual"})
+    registry = RetrievalRegistry()
+    registry.register(RetrievalSpec("dual", "org/dual", "embedding"))
+    registry.register(RetrievalSpec("dual", "org/dual", "rerank"))
+
+    with registry._acquire(RetrievalSpec("dual", "org/dual", "embedding")) as backend:
+        backend._model = object()
+        backend.weight_bytes = 4_000_000_000
+
+    status = registry.status()
+    assert status["resident_bytes"] == 4_000_000_000
+    assert len(status["models"]) == 2
+
+
+def test_resident_bytes_excludes_unloaded_models(monkeypatch):
+    _fixed_resolver(monkeypatch)
+    registry = RetrievalRegistry()
+    registry.register(RetrievalSpec("a", "org/a", "embedding"))
+    assert registry.status()["resident_bytes"] == 0

@@ -229,6 +229,16 @@ struct SystemTab: View {
                     MetricRow(label: "Session cache (RAM)", value: Format.bytes(mem?.sessionBankBytes ?? 0))
                     MetricRow(label: "Generation working set", value: Format.bytes(mem?.generationWorkingBytes ?? 0))
                 }
+                // Retrieval weights are not part of the chat model's shard
+                // total, so without this row several GB would be unattributed.
+                if let retrieval = snapshot?.retrieval, retrieval.enabled {
+                    MetricRow(
+                        label: "Retrieval models",
+                        value: retrieval.residentBytes > 0
+                            ? Format.bytes(retrieval.residentBytes)
+                            : "none loaded"
+                    )
+                }
                 MetricRow(label: "Active (total in use)", value: Format.bytes(mem?.activeMemoryBytes))
                 MetricRow(label: "Reusable buffer pool", value: Format.bytes(mem?.cacheMemoryBytes))
                 MetricRow(

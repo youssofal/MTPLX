@@ -248,3 +248,21 @@ extension RetrievalStatusTests {
         XCTAssertEqual(status.rerankers.first?.requests, 5)
     }
 }
+
+extension RetrievalStatusTests {
+    func testResidentBytesDecodeForMemoryAttribution() throws {
+        let status = try JSONDecoder().decode(RetrievalStatus.self, from: Data("""
+        {"enabled": true, "resident_bytes": 6000000000,
+         "models": [{"id":"e1","role":"embedding","weightBytes":4000000000}]}
+        """.utf8))
+        XCTAssertEqual(status.residentBytes, 6_000_000_000)
+        XCTAssertEqual(status.models.first?.weightBytes, 4_000_000_000)
+    }
+
+    func testMissingResidentBytesDefaultsToZeroRatherThanFailing() throws {
+        let status = try JSONDecoder().decode(RetrievalStatus.self, from: Data("""
+        {"enabled": true, "models": []}
+        """.utf8))
+        XCTAssertEqual(status.residentBytes, 0)
+    }
+}

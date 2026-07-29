@@ -158,6 +158,23 @@ def default_served_id(model_ref: str) -> str:
     return str(model_ref).rstrip("/").rsplit("/", 1)[-1]
 
 
+def _weight_bytes(path: Path) -> int:
+    """Sum the shard sizes of a model directory.
+
+    MLX holds weights in unified memory that never appears in the process RSS,
+    so file size is the only honest attribution available — the same basis
+    MTPLX already uses for the chat model.
+    """
+    try:
+        return sum(
+            item.stat().st_size
+            for item in Path(path).glob("*.safetensors")
+            if item.is_file()
+        )
+    except OSError:
+        return 0
+
+
 def _right_padded(sequences: list[list[int]], pad_id: int) -> tuple[Any, list[int]]:
     """Pad token sequences on the right and report their true lengths."""
     import mlx.core as mx
@@ -176,6 +193,7 @@ class _Backend:
         self.path = path
         self.lock = threading.RLock()
         self.load_seconds = 0.0
+        self.weight_bytes = 0
         # Requests currently holding this backend. Evicting a pinned backend
         # would unload weights another thread is about to use, which then
         # reloads them — leaving two copies live while only one is counted.
@@ -195,6 +213,7 @@ class _Backend:
                 started = time.time()
                 self._model, self._tokenizer = load(str(self.path))
                 self.load_seconds = time.time() - started
+                self.weight_bytes = _weight_bytes(self.path)
             return self._model, self._tokenizer
 
     def unload(self) -> None:
@@ -275,6 +294,7 @@ class RetrievalRegistry:
                         "role": role,
                         "model_ref": spec.model_ref,
                         "loaded": bool(backend is not None and backend.loaded),
+                        "weightBytes": backend.weight_bytes if backend is not None else 0,
                         "resident": bool(key and key in self._resident),
                         "max_tokens": spec.max_tokens,
                         "batch_size": spec.effective_batch_size(),
@@ -287,11 +307,21 @@ class RetrievalRegistry:
         """Return a snapshot for diagnostics and the dashboard."""
         with self._lock:
             resident = list(self._resident.keys())
+        models = self.descriptors()
+        with self._lock:
+            # Sum per backend, not per served id: one model serving both roles
+            # occupies its weights once and must not be counted twice.
+            resident_bytes = sum(
+                backend.weight_bytes
+                for key, backend in self._backends.items()
+                if key in self._resident and backend.loaded
+            )
         return {
             "enabled": self.enabled,
             "max_resident": self.max_resident,
             "resident": resident,
-            "models": self.descriptors(),
+            "resident_bytes": resident_bytes,
+            "models": models,
         }
 
     # ── resolution ──────────────────────────────────────────────────
