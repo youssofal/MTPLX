@@ -347,21 +347,34 @@ class RetrievalRegistry:
             backend.users += 1
             self._resident[key] = None
             self._resident.move_to_end(key)
-            for candidate in list(self._resident):
-                if len(self._resident) <= self.max_resident:
-                    break
-                if candidate == key:
-                    continue
-                victim = self._backends[candidate]
-                if victim.users:
-                    continue
-                victim.unload()
-                self._resident.pop(candidate, None)
+            self._evict_locked()
         try:
             yield backend
         finally:
             with self._lock:
                 backend.users = max(0, backend.users - 1)
+                # Overlapping requests can legitimately push past the cap while
+                # every backend is pinned. Without retrying here the surplus
+                # would stay loaded until some later request happened to
+                # trigger eviction — several GB held for no reason.
+                self._evict_locked()
+
+    def _evict_locked(self) -> None:
+        """Unload unpinned backends until the cap holds. Caller holds the lock.
+
+        Oldest first, and never the most recently used entry: that is the one
+        just acquired or just released, and dropping it would evict the newest
+        model whenever an older one happens to be pinned — the opposite of LRU.
+        """
+        candidates = list(self._resident)[:-1]
+        for candidate in candidates:
+            if len(self._resident) <= self.max_resident:
+                break
+            victim = self._backends[candidate]
+            if victim.users:
+                continue
+            victim.unload()
+            self._resident.pop(candidate, None)
 
     def _backend(self, spec: RetrievalSpec) -> _Backend:
         """Acquire without pinning — for tests and introspection only."""

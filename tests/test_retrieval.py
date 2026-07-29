@@ -574,3 +574,26 @@ def test_rerank_reports_real_token_usage():
         "/v1/rerank", json={"query": "q", "documents": ["a", "b", "c"]}
     )
     assert response.json()["usage"]["total_tokens"] == 33
+
+
+def test_the_cap_is_restored_once_overlapping_requests_finish(monkeypatch):
+    """Surplus from concurrent pins must not stay loaded until the next request."""
+    _fixed_resolver(monkeypatch)
+    registry = RetrievalRegistry(max_resident=1)
+    first = RetrievalSpec("a", "org/a", "embedding")
+    second = RetrievalSpec("b", "org/b", "embedding")
+    registry.register(first)
+    registry.register(second)
+
+    with registry._acquire(first) as a:
+        a._model = object()
+        with registry._acquire(second) as b:
+            b._model = object()
+            # Both pinned: exceeding the cap here is the deliberate trade-off.
+            assert len(registry.status()["resident"]) == 2
+
+    # Once the pins are gone the cap must hold again without further traffic.
+    resident = registry.status()["resident"]
+    assert len(resident) == 1
+    assert resident == ["/models/b"]
+    assert a.loaded is False

@@ -1147,7 +1147,10 @@ public struct HealthPayload: Codable, Equatable, Sendable {
 }
 
 public struct RetrievalModelStatus: Codable, Equatable, Sendable, Identifiable {
-    public var id: String
+    /// The id clients pass as `"model"`. Not unique on its own: one reference
+    /// serving both roles is the supported shared-backend case and appears
+    /// twice under the same served id.
+    public var servedId: String
     public var role: String
     public var modelRef: String
     public var loaded: Bool
@@ -1167,13 +1170,17 @@ public struct RetrievalModelStatus: Codable, Equatable, Sendable, Identifiable {
 
     /// Retrieval models load on first request, so "configured" and "ready" are
     /// different states a user needs to tell apart at a glance.
+    /// Composite identity, so a reference registered as both embedder and
+    /// reranker yields two distinct rows instead of colliding in a ForEach.
+    public var id: String { "\(role):\(servedId)" }
+
     public var isEmbedding: Bool { role == "embedding" }
     public var hasBeenUsed: Bool { requests > 0 }
     /// A model that only ever failed must not read as merely idle.
     public var hasFailed: Bool { errors > 0 }
 
     enum CodingKeys: String, CodingKey {
-        case id
+        case servedId = "id"
         case role
         case modelRef = "model_ref"
         case loaded
@@ -1194,9 +1201,9 @@ public struct RetrievalModelStatus: Codable, Equatable, Sendable, Identifiable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        id = try container.decode(String.self, forKey: .id)
+        servedId = try container.decode(String.self, forKey: .servedId)
         role = try container.decodeIfPresent(String.self, forKey: .role) ?? "embedding"
-        modelRef = try container.decodeIfPresent(String.self, forKey: .modelRef) ?? id
+        modelRef = try container.decodeIfPresent(String.self, forKey: .modelRef) ?? servedId
         loaded = try container.decodeIfPresent(Bool.self, forKey: .loaded) ?? false
         resident = try container.decodeIfPresent(Bool.self, forKey: .resident) ?? false
         maxTokens = try container.decodeIfPresent(Int.self, forKey: .maxTokens) ?? 0
@@ -1214,7 +1221,7 @@ public struct RetrievalModelStatus: Codable, Equatable, Sendable, Identifiable {
     }
 
     public init(
-        id: String,
+        servedId: String,
         role: String,
         modelRef: String = "",
         loaded: Bool = false,
@@ -1232,7 +1239,7 @@ public struct RetrievalModelStatus: Codable, Equatable, Sendable, Identifiable {
         itemsPerSecond: Double? = nil,
         avgLatencyMs: Double? = nil
     ) {
-        self.id = id
+        self.servedId = servedId
         self.role = role
         self.modelRef = modelRef
         self.loaded = loaded

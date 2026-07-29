@@ -751,7 +751,7 @@ struct ActivityTab: View {
                 Image(systemName: model.isEmbedding ? "square.grid.3x3.topleft.filled" : "arrow.up.arrow.down")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(model.loaded ? Color.mtplxSuccess : Color.secondary)
-                Text(model.id)
+                Text(model.servedId)
                     .font(.system(.callout, design: .rounded).weight(.semibold))
                     .textSelection(.enabled)
                 PillBadge(text: model.isEmbedding ? "embeddings" : "rerank", tint: .secondary)

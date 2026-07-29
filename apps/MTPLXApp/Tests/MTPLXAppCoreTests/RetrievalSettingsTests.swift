@@ -162,7 +162,7 @@ final class RetrievalStatusTests: XCTestCase {
         XCTAssertEqual(status.resident, ["org/e"])
 
         let model = try XCTUnwrap(status.models.first)
-        XCTAssertEqual(model.id, "e1")
+        XCTAssertEqual(model.servedId, "e1")
         XCTAssertTrue(model.isEmbedding)
         XCTAssertTrue(model.loaded)
         XCTAssertTrue(model.hasBeenUsed)
@@ -185,8 +185,8 @@ final class RetrievalStatusTests: XCTestCase {
         {"enabled": true, "models": [
           {"id":"e1","role":"embedding"}, {"id":"r1","role":"rerank"}]}
         """)
-        XCTAssertEqual(status.embedders.map(\.id), ["e1"])
-        XCTAssertEqual(status.rerankers.map(\.id), ["r1"])
+        XCTAssertEqual(status.embedders.map(\.servedId), ["e1"])
+        XCTAssertEqual(status.rerankers.map(\.servedId), ["r1"])
     }
 
     func testMissingFieldsFallBackInsteadOfFailingTheWholeSnapshot() throws {
@@ -228,5 +228,23 @@ extension RetrievalStatusTests {
         let model = try XCTUnwrap(status.models.first)
         XCTAssertTrue(model.hasFailed)
         XCTAssertFalse(model.hasBeenUsed)
+    }
+}
+
+
+extension RetrievalStatusTests {
+    func testOneReferenceInBothRolesYieldsTwoDistinctRows() throws {
+        // The shared-backend case this feature advertises: same served id,
+        // two roles. Colliding identities would drop or duplicate a row.
+        let status = try JSONDecoder().decode(RetrievalStatus.self, from: Data("""
+        {"enabled": true, "models": [
+          {"id":"dual","role":"embedding","requests":2},
+          {"id":"dual","role":"rerank","requests":5}]}
+        """.utf8))
+        XCTAssertEqual(status.models.count, 2)
+        XCTAssertEqual(Set(status.models.map(\.id)).count, 2)
+        XCTAssertEqual(status.models.map(\.servedId), ["dual", "dual"])
+        XCTAssertEqual(status.embedders.first?.requests, 2)
+        XCTAssertEqual(status.rerankers.first?.requests, 5)
     }
 }
