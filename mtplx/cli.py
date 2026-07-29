@@ -2136,6 +2136,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="How many retrieval models stay in memory; least-recently-used are unloaded",
     )
     quickstart_server_p.add_argument(
+        "--retrieval-idle-timeout",
+        type=float,
+        default=0.0,
+        help="Unload retrieval models after this many idle seconds (0 = never)",
+    )
+    quickstart_server_p.add_argument(
         "--retrieval-max-tokens",
         type=int,
         default=0,
@@ -2684,6 +2690,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=2,
         help="How many retrieval models stay in memory; least-recently-used are unloaded",
+    )
+    serve_p.add_argument(
+        "--retrieval-idle-timeout",
+        type=float,
+        default=0.0,
+        help="Unload retrieval models after this many idle seconds (0 = never)",
     )
     serve_p.add_argument(
         "--retrieval-max-tokens",

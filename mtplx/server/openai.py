@@ -12512,6 +12512,40 @@ class _MemoryPressureGuard:
             self.prev_level = level
 
 
+async def _retrieval_idle_loop(
+    state: "ServerState", *, interval_s: float = 30.0
+) -> None:
+    """Release idle retrieval weights, then archive the session bank.
+
+    Started only when a timeout is configured. Never raises into the server:
+    a watcher that can kill the daemon is worse than one that misses a cycle.
+    """
+    retrieval = getattr(state, "retrieval", None)
+    if retrieval is None or retrieval.idle_timeout_s <= 0:
+        return
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            released = await asyncio.to_thread(retrieval.unload_idle)
+            if released["unloaded"]:
+                _LOG.info(
+                    "retrieval idle release: %d model(s), %.2f GB",
+                    len(released["unloaded"]),
+                    released["freed_bytes"] / (1024**3),
+                )
+                # Only once nothing is resident: archiving while a retrieval
+                # model is still serving would trade one cost for another.
+                if not retrieval.status()["resident"]:
+                    try:
+                        await asyncio.to_thread(state.sessions.archive_cold_tier)
+                    except Exception as exc:
+                        _LOG.warning("session bank archive failed: %s", exc)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _LOG.warning("retrieval idle watcher: %s", exc)
+
+
 async def _memory_pressure_loop(
     state: "ServerState", *, interval_s: float = 10.0
 ) -> None:
@@ -19583,6 +19617,9 @@ def create_app(state: ServerState) -> FastAPI:
             bg_tasks.append(asyncio.create_task(_thermal_poll_loop(state)))
         if _memory_pressure_guard_enabled():
             bg_tasks.append(asyncio.create_task(_memory_pressure_loop(state)))
+        retrieval = getattr(state, "retrieval", None)
+        if retrieval is not None and retrieval.idle_timeout_s > 0:
+            bg_tasks.append(asyncio.create_task(_retrieval_idle_loop(state)))
         try:
             yield
         finally:
@@ -25798,6 +25835,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=0,
         help="Truncate retrieval inputs to this many tokens (0 = per-model default)",
+    )
+    parser.add_argument(
+        "--retrieval-idle-timeout",
+        type=float,
+        default=0.0,
+        help="Unload retrieval models after this many idle seconds (0 = never)",
     )
     parser.add_argument(
         "--retrieval-cache-dir",

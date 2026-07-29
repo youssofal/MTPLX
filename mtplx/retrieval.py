@@ -194,6 +194,7 @@ class _Backend:
         self.lock = threading.RLock()
         self.load_seconds = 0.0
         self.weight_bytes = 0
+        self.last_used_s = time.time()
         # Requests currently holding this backend. Evicting a pinned backend
         # would unload weights another thread is about to use, which then
         # reloads them — leaving two copies live while only one is counted.
@@ -242,9 +243,18 @@ class RetrievalRegistry:
     and the local path it resolves to occupies memory once.
     """
 
-    def __init__(self, *, max_resident: int = DEFAULT_MAX_RESIDENT, cache_dir: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        max_resident: int = DEFAULT_MAX_RESIDENT,
+        cache_dir: str | Path | None = None,
+        idle_timeout_s: float = 0.0,
+    ) -> None:
         self.max_resident = max(1, int(max_resident))
         self.cache_dir = cache_dir
+        # 0 disables idle release entirely, which keeps a daemon that never
+        # configured a timeout behaving exactly as before.
+        self.idle_timeout_s = max(0.0, float(idle_timeout_s))
         self._specs: dict[tuple[Role, str], RetrievalSpec] = {}
         self._backends: dict[str, _Backend] = {}
         self._resident: OrderedDict[str, None] = OrderedDict()
@@ -278,6 +288,7 @@ class RetrievalRegistry:
     def descriptors(self) -> list[dict[str, Any]]:
         """Describe every served retrieval model for ``/v1/models``."""
         entries: list[dict[str, Any]] = []
+        now = time.time()
         with self._lock:
             for (role, served_id), spec in sorted(self._specs.items()):
                 # Look the backend up by its resolved key, the same one used
@@ -295,6 +306,11 @@ class RetrievalRegistry:
                         "model_ref": spec.model_ref,
                         "loaded": bool(backend is not None and backend.loaded),
                         "weightBytes": backend.weight_bytes if backend is not None else 0,
+                        "idleSeconds": (
+                            round(now - backend.last_used_s, 1)
+                            if backend is not None and backend.loaded
+                            else None
+                        ),
                         "resident": bool(key and key in self._resident),
                         "max_tokens": spec.max_tokens,
                         "batch_size": spec.effective_batch_size(),
@@ -319,6 +335,7 @@ class RetrievalRegistry:
         return {
             "enabled": self.enabled,
             "max_resident": self.max_resident,
+            "idle_timeout_s": self.idle_timeout_s,
             "resident": resident,
             "resident_bytes": resident_bytes,
             "models": models,
@@ -383,6 +400,7 @@ class RetrievalRegistry:
         finally:
             with self._lock:
                 backend.users = max(0, backend.users - 1)
+                backend.last_used_s = time.time()
                 # Overlapping requests can legitimately push past the cap while
                 # every backend is pinned. Without retrying here the surplus
                 # would stay loaded until some later request happened to
@@ -410,6 +428,35 @@ class RetrievalRegistry:
         """Acquire without pinning — for tests and introspection only."""
         with self._acquire(spec) as backend:
             return backend
+
+    def unload_idle(self, older_than_s: float | None = None) -> dict[str, Any]:
+        """Unload loaded, unpinned backends idle for longer than the threshold.
+
+        Returns what was freed so the caller can log it and the dashboard can
+        show it. A backend inside an in-flight request is never a candidate:
+        its pin count is checked under the same lock that hands it out.
+        """
+        threshold = self.idle_timeout_s if older_than_s is None else float(older_than_s)
+        if threshold <= 0:
+            return {"unloaded": [], "freed_bytes": 0}
+        now = time.time()
+        victims: list[_Backend] = []
+        with self._lock:
+            for key in list(self._resident):
+                backend = self._backends.get(key)
+                if backend is None or not backend.loaded or backend.users:
+                    continue
+                if now - backend.last_used_s < threshold:
+                    continue
+                victims.append(backend)
+                self._resident.pop(key, None)
+        freed = 0
+        unloaded: list[str] = []
+        for backend in victims:
+            freed += backend.weight_bytes
+            unloaded.append(str(backend.path))
+            backend.unload()
+        return {"unloaded": unloaded, "freed_bytes": freed}
 
     def unload_all(self) -> None:
         """Drop every resident retrieval model."""
@@ -591,6 +638,7 @@ def registry_from_args(args: Any) -> RetrievalRegistry:
     registry = RetrievalRegistry(
         max_resident=int(getattr(args, "retrieval_max_resident", DEFAULT_MAX_RESIDENT) or DEFAULT_MAX_RESIDENT),
         cache_dir=cache_dir,
+        idle_timeout_s=float(getattr(args, "retrieval_idle_timeout", 0) or 0),
     )
     for role, attribute in (("embedding", "embedding_model"), ("rerank", "reranker_model")):
         for value in getattr(args, attribute, None) or []:

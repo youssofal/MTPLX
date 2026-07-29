@@ -68,6 +68,8 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
     public var rerankerModels: [String]
     /// How many retrieval models stay resident before the oldest is unloaded.
     public var retrievalMaxResident: Int
+    /// Seconds of inactivity before retrieval weights are released; 0 = never.
+    public var retrievalIdleTimeout: Double
     public var ramSessionCachePolicy: String
     public var ramSessionBlockPrefixRestore: Bool
     public var ramSessionCacheMaxEntries: Int
@@ -204,6 +206,7 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         embeddingModels: [String] = [],
         rerankerModels: [String] = [],
         retrievalMaxResident: Int = 2,
+        retrievalIdleTimeout: Double = 0,
         ramSessionCachePolicy: String = "target-default",
         ramSessionBlockPrefixRestore: Bool = true,
         ramSessionCacheMaxEntries: Int = 8,
@@ -270,6 +273,7 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         self.embeddingModels = embeddingModels
         self.rerankerModels = rerankerModels
         self.retrievalMaxResident = retrievalMaxResident
+        self.retrievalIdleTimeout = retrievalIdleTimeout
         self.ramSessionCachePolicy = ramSessionCachePolicy
         self.ramSessionBlockPrefixRestore = ramSessionBlockPrefixRestore
         self.ramSessionCacheMaxEntries = ramSessionCacheMaxEntries
@@ -458,6 +462,7 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         case embeddingModels = "embedding_models"
         case rerankerModels = "reranker_models"
         case retrievalMaxResident = "retrieval_max_resident"
+        case retrievalIdleTimeout = "retrieval_idle_timeout"
         case ramSessionCachePolicy = "ram_session_cache_policy"
         case ramSessionBlockPrefixRestore = "ram_session_block_prefix_restore"
         case ramSessionCacheMaxEntries = "ram_session_cache_max_entries"
@@ -530,6 +535,7 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         embeddingModels = try container.decodeIfPresent([String].self, forKey: .embeddingModels) ?? defaults.embeddingModels
         rerankerModels = try container.decodeIfPresent([String].self, forKey: .rerankerModels) ?? defaults.rerankerModels
         retrievalMaxResident = try container.decodeIfPresent(Int.self, forKey: .retrievalMaxResident) ?? defaults.retrievalMaxResident
+        retrievalIdleTimeout = try container.decodeIfPresent(Double.self, forKey: .retrievalIdleTimeout) ?? defaults.retrievalIdleTimeout
         ramSessionCachePolicy = try container.decodeIfPresent(String.self, forKey: .ramSessionCachePolicy) ?? defaults.ramSessionCachePolicy
         ramSessionBlockPrefixRestore = try container.decodeIfPresent(Bool.self, forKey: .ramSessionBlockPrefixRestore) ?? defaults.ramSessionBlockPrefixRestore
         ramSessionCacheMaxEntries = try container.decodeIfPresent(Int.self, forKey: .ramSessionCacheMaxEntries) ?? defaults.ramSessionCacheMaxEntries

@@ -620,3 +620,83 @@ def test_resident_bytes_excludes_unloaded_models(monkeypatch):
     registry = RetrievalRegistry()
     registry.register(RetrievalSpec("a", "org/a", "embedding"))
     assert registry.status()["resident_bytes"] == 0
+
+
+# ---- idle standby ---------------------------------------------------------
+
+
+def _loaded_backend(registry, spec, *, idle_for=0.0, weight_bytes=1_000_000_000):
+    import time as _time
+    with registry._acquire(spec) as backend:
+        backend._model = object()
+        backend.weight_bytes = weight_bytes
+    backend.last_used_s = _time.time() - idle_for
+    return backend
+
+
+def test_idle_release_is_off_by_default(monkeypatch):
+    """A daemon without a configured timeout must behave exactly as before."""
+    _fixed_resolver(monkeypatch)
+    registry = RetrievalRegistry()
+    spec = RetrievalSpec("a", "org/a", "embedding")
+    registry.register(spec)
+    backend = _loaded_backend(registry, spec, idle_for=99_999)
+
+    assert registry.unload_idle() == {"unloaded": [], "freed_bytes": 0}
+    assert backend.loaded is True
+
+
+def test_idle_models_are_unloaded_and_freed_bytes_reported(monkeypatch):
+    _fixed_resolver(monkeypatch)
+    registry = RetrievalRegistry(idle_timeout_s=60)
+    spec = RetrievalSpec("a", "org/a", "embedding")
+    registry.register(spec)
+    backend = _loaded_backend(registry, spec, idle_for=120, weight_bytes=4_000_000_000)
+
+    released = registry.unload_idle()
+    assert released["freed_bytes"] == 4_000_000_000
+    assert released["unloaded"] == ["/models/a"]
+    assert backend.loaded is False
+    assert registry.status()["resident"] == []
+
+
+def test_a_recently_used_model_survives(monkeypatch):
+    _fixed_resolver(monkeypatch)
+    registry = RetrievalRegistry(idle_timeout_s=600)
+    spec = RetrievalSpec("a", "org/a", "embedding")
+    registry.register(spec)
+    backend = _loaded_backend(registry, spec, idle_for=5)
+
+    assert registry.unload_idle()["unloaded"] == []
+    assert backend.loaded is True
+
+
+def test_a_model_in_use_is_never_released_by_the_watcher(monkeypatch):
+    """The watcher must not pull weights out of an in-flight request."""
+    _fixed_resolver(monkeypatch)
+    registry = RetrievalRegistry(idle_timeout_s=1)
+    spec = RetrievalSpec("a", "org/a", "embedding")
+    registry.register(spec)
+    with registry._acquire(spec) as backend:
+        backend._model = object()
+        backend.last_used_s = 0  # ancient, but pinned
+        assert registry.unload_idle()["unloaded"] == []
+        assert backend.loaded is True
+
+
+def test_status_and_descriptors_expose_the_idle_state(monkeypatch):
+    _fixed_resolver(monkeypatch)
+    registry = RetrievalRegistry(idle_timeout_s=300)
+    spec = RetrievalSpec("a", "org/a", "embedding")
+    registry.register(spec)
+    _loaded_backend(registry, spec, idle_for=42)
+
+    status = registry.status()
+    assert status["idle_timeout_s"] == 300
+    entry = {e["id"]: e for e in status["models"]}["a"]
+    assert entry["idleSeconds"] >= 42
+
+
+def test_idle_seconds_is_absent_for_an_unloaded_model():
+    entry = {e["id"]: e for e in _registry().descriptors()}["embed-a"]
+    assert entry["idleSeconds"] is None

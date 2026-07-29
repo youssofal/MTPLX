@@ -264,6 +264,11 @@ public struct MTPLXCommandBuilder: Sendable {
             arguments.append(contentsOf: [
                 "--retrieval-max-resident", String(max(1, configuration.retrievalMaxResident)),
             ])
+            if configuration.retrievalIdleTimeout > 0 {
+                arguments.append(contentsOf: [
+                    "--retrieval-idle-timeout", String(configuration.retrievalIdleTimeout),
+                ])
+            }
         }
         // Always pass the resolved SSD mode, including "off". Omitting
         // the flag delegates the decision to the serve CLI default,

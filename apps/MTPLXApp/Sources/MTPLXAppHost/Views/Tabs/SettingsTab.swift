@@ -918,6 +918,24 @@ struct SettingsTab: View {
                 Divider().overlay(Brand.separator)
 
                 FormRow(
+                    label: "Release when idle",
+                    caption: "Minutes of inactivity before retrieval weights are unloaded. 0 keeps them resident; they reload on the next request."
+                ) {
+                    TextField(
+                        "0",
+                        value: Binding(
+                            get: { draftConfig.retrievalIdleTimeout / 60 },
+                            set: { draftConfig.retrievalIdleTimeout = max(0, $0) * 60 }
+                        ),
+                        format: .number.precision(.fractionLength(0))
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 90)
+                }
+
+                Divider().overlay(Brand.separator)
+
+                FormRow(
                     label: "Models kept resident",
                     caption: "Retrieval models load on first request. Beyond this count the least recently used one is unloaded."
                 ) {

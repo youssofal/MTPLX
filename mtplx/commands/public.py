@@ -8454,6 +8454,7 @@ def cmd_serve_public(args: Any) -> int:
     for flag, attr in (
         ("--retrieval-max-resident", "retrieval_max_resident"),
         ("--retrieval-max-tokens", "retrieval_max_tokens"),
+        ("--retrieval-idle-timeout", "retrieval_idle_timeout"),
     ):
         value = getattr(args, attr, None)
         if value:
@@ -11364,6 +11365,7 @@ def _with_server_policy_args(target: Any, source: Any) -> Any:
         ("reranker_model", []),
         ("retrieval_max_resident", 2),
         ("retrieval_max_tokens", 0),
+        ("retrieval_idle_timeout", 0.0),
         ("api_key_file", None),
         ("api_key_source", "none"),
         ("default_presence_penalty", 0.0),
