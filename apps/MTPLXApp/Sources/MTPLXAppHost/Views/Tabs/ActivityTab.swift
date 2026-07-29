@@ -43,6 +43,9 @@ struct ActivityTab: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
                         inFlightCard(requests: inFlight)
+                        if let retrieval = backend.snapshot?.retrieval, retrieval.enabled {
+                            retrievalCard(retrieval)
+                        }
                         if let notice = backend.clientHandoffNotice {
                             clientHandoffCard(notice)
                         }
@@ -51,9 +54,6 @@ struct ActivityTab: View {
                         }
                         recentRequestsCard(recent: recent)
                         speedTruthCard(latest: backend.latest)
-                        if let retrieval = backend.snapshot?.retrieval, retrieval.enabled {
-                            retrievalCard(retrieval)
-                        }
                         cacheSummaryCard(sessions: sessions, sessionBank: sessionBank)
                         cacheTruthCard(latest: backend.latest, sessionBank: sessionBank)
                         bankCard(sessionBank: sessionBank)
