@@ -39,6 +39,15 @@ DEFAULT_EMBEDDING_BATCH = 8
 DEFAULT_RERANK_BATCH = 4
 DEFAULT_MAX_RESIDENT = 2
 
+# A padded batch costs rows * longest-row token positions no matter how short
+# its other rows are, so the batch size alone is the wrong unit: it is generous
+# where batching does not pay and stingy where it does. Measured on a 4-bit
+# Qwen3-Embedding-8B, long sequences gain nothing from batching (~950 ms each at
+# 853 tokens, whether run alone or eight at a time) while short ones gain about
+# threefold. Capping the product instead lets short texts pack densely and drops
+# long ones into batches of their own; 2048 keeps a batch under a second.
+BATCH_TOKEN_BUDGET = 2048
+
 EOD_TOKEN = "<|endoftext|>"
 QUERY_INSTRUCTION_TEMPLATE = "Instruct: {instruction}\nQuery: {text}"
 
@@ -183,6 +192,41 @@ def _right_padded(sequences: list[list[int]], pad_id: int) -> tuple[Any, list[in
     width = max(lengths)
     padded = [sequence + [pad_id] * (width - len(sequence)) for sequence in sequences]
     return mx.array(padded), lengths
+
+
+def _plan_batches(lengths: list[int], max_rows: int) -> list[list[int]]:
+    """Group sequence indices into batches that are cheap to pad.
+
+    Every row of a batch is padded out to the longest row in it, so the model
+    pays ``rows * width`` token positions no matter how short the other rows
+    are. Grouping similar lengths together is what keeps that product close to
+    the work actually asked for.
+
+    Args:
+        lengths: token count of each sequence, in caller order.
+        max_rows: the configured batch size — a batch may never exceed it.
+
+    Returns:
+        Batches of indices into ``lengths``. Every index appears exactly once;
+        the caller scatters results back into input order, so the grouping here
+        is free to reorder.
+    """
+    order = sorted(range(len(lengths)), key=lambda index: lengths[index])
+    batches: list[list[int]] = []
+    current: list[int] = []
+    for index in order:
+        # Ascending order means the incoming sequence is always the widest, so
+        # it alone decides what the batch will be padded to.
+        width = lengths[index]
+        if current and (
+            len(current) >= max_rows or width * (len(current) + 1) > BATCH_TOKEN_BUDGET
+        ):
+            batches.append(current)
+            current = []
+        current.append(index)
+    if current:
+        batches.append(current)
+    return batches
 
 
 class _Backend:
@@ -503,19 +547,26 @@ class RetrievalRegistry:
                 # model look ten times slower than it is. Load cost is reported
                 # separately.
                 started = time.time()
-                vectors: list[list[float]] = []
-                tokens = 0
-                batch = spec.effective_batch_size()
                 import mlx.core as mx
 
                 with backend.lock:
-                    for start in range(0, len(prepared), batch):
-                        chunk = prepared[start : start + batch]
-                        sequences = [
-                            self._encode_embedding(tokenizer, text, spec, pad_id) for text in chunk
-                        ]
-                        tokens += sum(len(sequence) for sequence in sequences)
-                        inputs, lengths = _right_padded(sequences, pad_id)
+                    # Tokenise everything before batching. A batch costs
+                    # rows * longest-row token positions, so the lengths have to
+                    # be known before the batch boundaries can be drawn — a
+                    # single long text dragged into a batch of short ones used to
+                    # cost as much as eight long ones.
+                    sequences = [
+                        self._encode_embedding(tokenizer, text, spec, pad_id) for text in prepared
+                    ]
+                    tokens = sum(len(sequence) for sequence in sequences)
+                    vectors: list[list[float]] = [[] for _ in sequences]
+                    plan = _plan_batches(
+                        [len(sequence) for sequence in sequences], spec.effective_batch_size()
+                    )
+                    for group in plan:
+                        inputs, lengths = _right_padded(
+                            [sequences[index] for index in group], pad_id
+                        )
                         hidden = model_obj.model(inputs)
                         if spec.pooling == "mean":
                             pooled = mx.stack(
@@ -528,7 +579,10 @@ class RetrievalRegistry:
                         pooled = pooled.astype(mx.float32)
                         normalised = pooled / mx.linalg.norm(pooled, axis=-1, keepdims=True)
                         mx.eval(normalised)
-                        vectors.extend(normalised.tolist())
+                        # Scatter, not extend: the plan is free to reorder, so
+                        # the caller's order is restored here.
+                        for index, vector in zip(group, normalised.tolist()):
+                            vectors[index] = vector
                         del hidden, pooled, normalised
                         mx.clear_cache()
         except BaseException as error:
@@ -572,20 +626,25 @@ class RetrievalRegistry:
                     )
                 pad_id = backend.pad_id(tokenizer)
                 started = time.time()
-                scores: list[float] = []
-                tokens = 0
-                batch = spec.effective_batch_size()
                 import mlx.core as mx
 
                 with backend.lock:
-                    for start in range(0, len(documents), batch):
-                        chunk = documents[start : start + batch]
-                        sequences = [
-                            self._encode_rerank(tokenizer, query, document, effective_instruction, spec)
-                            for document in chunk
-                        ]
-                        tokens += sum(len(sequence) for sequence in sequences)
-                        inputs, lengths = _right_padded(sequences, pad_id)
+                    # Same padding trap as embed(), and tighter here: every row
+                    # carries the query as well as its document, so one long
+                    # document inflates the whole batch.
+                    sequences = [
+                        self._encode_rerank(tokenizer, query, document, effective_instruction, spec)
+                        for document in documents
+                    ]
+                    tokens = sum(len(sequence) for sequence in sequences)
+                    scores: list[float] = [0.0] * len(sequences)
+                    plan = _plan_batches(
+                        [len(sequence) for sequence in sequences], spec.effective_batch_size()
+                    )
+                    for group in plan:
+                        inputs, lengths = _right_padded(
+                            [sequences[index] for index in group], pad_id
+                        )
                         logits = model_obj(inputs)
                         pairs = mx.stack(
                             [
@@ -597,7 +656,10 @@ class RetrievalRegistry:
                         )
                         probabilities = mx.softmax(pairs.astype(mx.float32), axis=-1)[:, 1]
                         mx.eval(probabilities)
-                        scores.extend(float(value) for value in probabilities.tolist())
+                        # Scatter, not extend: the plan reorders by length, and
+                        # callers rank by index against their own document list.
+                        for index, value in zip(group, probabilities.tolist()):
+                            scores[index] = float(value)
                         del logits, pairs, probabilities
                         mx.clear_cache()
         except BaseException as error:

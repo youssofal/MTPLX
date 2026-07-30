@@ -15,10 +15,12 @@ from types import SimpleNamespace
 import pytest
 
 from mtplx.retrieval import (
+    BATCH_TOKEN_BUDGET,
     RetrievalError,
     RetrievalStats,
     RetrievalRegistry,
     RetrievalSpec,
+    _plan_batches,
     default_served_id,
     parse_model_flag,
     registry_from_args,
@@ -64,6 +66,60 @@ def test_parse_model_flag_rejects_empty_sides():
 
 def test_default_served_id_strips_trailing_slash():
     assert default_served_id("org/name/") == "name"
+
+
+# ---- batch planning -------------------------------------------------------
+
+
+def test_plan_batches_keeps_every_sequence_exactly_once():
+    lengths = [5, 900, 7, 4, 1200, 6, 8, 3]
+    plan = _plan_batches(lengths, max_rows=8)
+    assert sorted(index for batch in plan for index in batch) == list(range(len(lengths)))
+
+
+def test_plan_batches_never_exceeds_the_configured_batch_size():
+    plan = _plan_batches([4] * 20, max_rows=8)
+    assert [len(batch) for batch in plan] == [8, 8, 4]
+
+
+def test_plan_batches_isolates_a_long_sequence_from_short_ones():
+    """The measured worst case: one long text used to drag seven short ones up.
+
+    Both used to land in a single batch padded to the long one, costing eight
+    times the long text alone. They must now be planned apart.
+    """
+    plan = _plan_batches([900] + [8] * 7, max_rows=8)
+    long_batch = next(batch for batch in plan if 0 in batch)
+
+    assert long_batch == [0]
+    assert sorted(index for batch in plan if batch is not long_batch for index in batch) == [
+        1, 2, 3, 4, 5, 6, 7
+    ]
+
+
+def test_plan_batches_packs_short_sequences_densely():
+    """Short texts are where batching actually pays, so they must not be split."""
+    plan = _plan_batches([8] * 8, max_rows=8)
+    assert len(plan) == 1
+
+
+def test_plan_batches_respects_the_token_budget():
+    lengths = [300] * 8
+    plan = _plan_batches(lengths, max_rows=8)
+    for batch in plan:
+        width = max(lengths[index] for index in batch)
+        assert width * len(batch) <= BATCH_TOKEN_BUDGET
+
+
+def test_plan_batches_still_places_a_sequence_larger_than_the_budget():
+    """A single oversized text has nowhere else to go — it must not be dropped."""
+    plan = _plan_batches([BATCH_TOKEN_BUDGET * 3, 4], max_rows=8)
+    assert sorted(index for batch in plan for index in batch) == [0, 1]
+    assert [0] in plan
+
+
+def test_plan_batches_handles_an_empty_request():
+    assert _plan_batches([], max_rows=8) == []
 
 
 # ---- registry -------------------------------------------------------------
@@ -289,6 +345,153 @@ def test_status_of_a_chat_only_daemon_is_explicitly_disabled():
     status = RetrievalRegistry().status()
     assert status["enabled"] is False
     assert status["models"] == []
+
+
+# ---- batching through a real forward pass ---------------------------------
+
+
+class _IdentityTokenizer:
+    """Encodes a text as its own marker id, repeated to the length it asks for.
+
+    Texts are written as ``"<marker>x<count>"``, which makes both the identity
+    and the length of every sequence readable straight off the vectors.
+    """
+
+    def encode(self, text: str, add_special_tokens: bool = True) -> list[int]:
+        marker, _, count = text.partition("x")
+        return [int(marker)] * int(count)
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        return 0
+
+
+class _EchoModel:
+    """Returns hidden states that carry the input ids through unchanged.
+
+    With mean pooling this makes the expected vector computable in plain
+    Python, so a batch that reordered its rows — or that pooled over padding
+    instead of the true length — cannot pass.
+    """
+
+    def model(self, inputs):
+        import mlx.core as mx
+
+        values = inputs.astype(mx.float32)
+        return mx.stack([values, mx.ones_like(values)], axis=-1)
+
+
+def _expected_vector(marker: int, count: int) -> tuple[float, float]:
+    # _encode_embedding appends the pad token, so the sequence is `count`
+    # copies of the marker followed by one zero, and the true length is
+    # count + 1. Padding beyond that must not enter the mean.
+    mean = marker * count / (count + 1)
+    norm = (mean**2 + 1.0) ** 0.5
+    return mean / norm, 1.0 / norm
+
+
+def _echo_registry(monkeypatch) -> tuple[RetrievalRegistry, RetrievalSpec]:
+    monkeypatch.setattr(
+        "mtplx.hf_loader.resolve_model_path",
+        lambda ref, cache_dir=None: Path("/models") / str(ref).rsplit("/", 1)[-1],
+    )
+    registry = RetrievalRegistry()
+    spec = RetrievalSpec("echo", "org/echo", "embedding", pooling="mean")
+    registry.register(spec)
+    backend = registry._backend(spec)
+    backend._model = _EchoModel()
+    backend._tokenizer = _IdentityTokenizer()
+    return registry, spec
+
+
+def test_embedding_returns_vectors_in_input_order_despite_reordered_batches(monkeypatch):
+    """Sorting by length is an optimisation, so it must be invisible to callers."""
+    pytest.importorskip("mlx.core")
+    registry, _spec = _echo_registry(monkeypatch)
+
+    # Deliberately interleaved so that planning by length has to reorder, and
+    # so the batches do not fall on the input's own boundaries.
+    requested = [(1, 900), (2, 4), (3, 700), (4, 6), (5, 5), (6, 850), (7, 3), (8, 7)]
+    texts = [f"{marker}x{count}" for marker, count in requested]
+
+    vectors, _used, tokens = registry.embed(texts)
+
+    assert len(vectors) == len(texts)
+    assert tokens == sum(count + 1 for _marker, count in requested)
+    for vector, (marker, count) in zip(vectors, requested):
+        expected = _expected_vector(marker, count)
+        assert vector[0] == pytest.approx(expected[0], rel=1e-4)
+        assert vector[1] == pytest.approx(expected[1], rel=1e-4)
+
+
+def test_embedding_of_a_single_text_is_unaffected_by_planning(monkeypatch):
+    pytest.importorskip("mlx.core")
+    registry, _spec = _echo_registry(monkeypatch)
+
+    vectors, _used, _tokens = registry.embed(["42x10"])
+
+    expected = _expected_vector(42, 10)
+    assert vectors[0][0] == pytest.approx(expected[0], rel=1e-4)
+
+
+def test_a_short_text_embeds_the_same_alone_as_beside_a_long_one(monkeypatch):
+    """Padding must not change a vector — that was the bug behind the slowdown."""
+    pytest.importorskip("mlx.core")
+    registry, _spec = _echo_registry(monkeypatch)
+
+    alone, _used, _tokens = registry.embed(["7x3"])
+    beside, _used, _tokens = registry.embed(["9x900", "7x3"])
+
+    assert beside[1][0] == pytest.approx(alone[0][0], rel=1e-4)
+    assert beside[1][1] == pytest.approx(alone[0][1], rel=1e-4)
+
+
+class _MarkerRerankTokenizer:
+    """Reads the document marker back out of the assembled rerank prompt."""
+
+    def encode(self, text: str, add_special_tokens: bool = True) -> list[int]:
+        marker, _, count = text.rpartition("<Document>: ")[2].partition("x")
+        if not count:
+            return []  # the fixed prefix and suffix contribute nothing
+        return [int(marker)] * int(count)
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        return {"no": 0, "yes": 1}.get(token, 0)
+
+
+class _EchoReranker:
+    """Scores a row from its last real token, so padding cannot go unnoticed."""
+
+    def __call__(self, inputs):
+        import mlx.core as mx
+
+        values = inputs.astype(mx.float32)
+        return mx.stack([mx.zeros_like(values), values], axis=-1)
+
+
+def test_reranking_returns_scores_in_document_order_despite_reordered_batches(monkeypatch):
+    """The route ranks by index into the caller's list, so a swap is silent."""
+    pytest.importorskip("mlx.core")
+    import math
+
+    monkeypatch.setattr(
+        "mtplx.hf_loader.resolve_model_path",
+        lambda ref, cache_dir=None: Path("/models") / str(ref).rsplit("/", 1)[-1],
+    )
+    registry = RetrievalRegistry()
+    spec = RetrievalSpec("echo-rank", "org/echo-rank", "rerank")
+    registry.register(spec)
+    backend = registry._backend(spec)
+    backend._model = _EchoReranker()
+    backend._tokenizer = _MarkerRerankTokenizer()
+
+    requested = [(2, 900), (5, 4), (1, 700), (4, 6), (3, 800), (6, 5)]
+    documents = [f"{marker}x{count}" for marker, count in requested]
+
+    scores, _used, _tokens = registry.rerank("does it match", documents)
+
+    assert len(scores) == len(documents)
+    for score, (marker, _count) in zip(scores, requested):
+        assert score == pytest.approx(1.0 / (1.0 + math.exp(-marker)), rel=1e-4)
 
 
 # ---- HTTP contract --------------------------------------------------------
