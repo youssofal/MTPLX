@@ -1086,3 +1086,37 @@ def test_batched_decode_rows_are_independent() -> None:
 
     assert mixed_rows[0] == duplicated_rows[0]
     assert duplicated_rows[0] == duplicated_rows[1]
+
+
+def test_laguna_load_attaches_the_fused_install_report(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The server's [laguna-fused] startup receipt reads this attribute."""
+
+    from mtplx import runtime
+    from mtplx.models import laguna_fused
+
+    target_config = _target_laguna_config()
+    fused_report = [{"path": "fused_gate_up", "layers_converted": 47}]
+
+    class _StubLagunaRuntime:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(runtime, "load_config", lambda path: target_config)
+    monkeypatch.setattr(
+        runtime, "_preflight_laguna_system_memory", lambda config: None
+    )
+    monkeypatch.setattr(
+        runtime, "_load_base_model", lambda path, config: (object(), object())
+    )
+    monkeypatch.setattr(runtime, "_load_runtime_metadata", lambda path: None)
+    monkeypatch.setattr(
+        laguna_fused, "install_from_env", lambda model: list(fused_report)
+    )
+    monkeypatch.setattr(runtime, "LagunaARRuntime", _StubLagunaRuntime)
+
+    loaded = runtime.load(tmp_path, mtp=False)
+
+    assert isinstance(loaded, _StubLagunaRuntime)
+    assert loaded.laguna_fused_report == fused_report

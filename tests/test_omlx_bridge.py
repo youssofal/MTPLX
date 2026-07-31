@@ -290,3 +290,45 @@ def test_omlx_native_branch_keeps_blank_body_no_arg_call():
     )
     assert extraction.status == "parsed"
     assert json.loads(extraction.tool_calls[0]["function"]["arguments"]) == {}
+
+
+def test_omlx_tool_parser_accepts_poolside_arg_pairs():
+    extraction = parse_tool_calls(
+        "I'll list the files.<tool_call>list_files"
+        "<arg_key>path</arg_key><arg_value>src</arg_value></tool_call>",
+        tokenizer=None,
+        tools=[{"type": "function", "function": {"name": "list_files"}}],
+    )
+
+    assert extraction.status == "parsed"
+    assert json.loads(extraction.tool_calls[0]["function"]["arguments"]) == {
+        "path": "src"
+    }
+    assert extraction.cleaned_text == "I'll list the files."
+
+
+def test_omlx_tool_parser_poolside_residue_stays_content():
+    text = (
+        "<tool_call>foo<arg_key>k</arg_key><arg_value>v</arg_value>"
+        "garbage</tool_call>"
+    )
+    extraction = parse_tool_calls(
+        text,
+        tokenizer=None,
+        tools=[{"type": "function", "function": {"name": "foo"}}],
+    )
+
+    assert extraction.status == "malformed_as_content"
+    assert extraction.tool_calls is None
+
+
+def test_omlx_tool_parser_passes_unknown_tool_name_through():
+    extraction = parse_tool_calls(
+        "<tool_call>task_progress<arg_key>steps</arg_key>"
+        "<arg_value>plan</arg_value></tool_call>",
+        tokenizer=None,
+        tools=[{"type": "function", "function": {"name": "list_files"}}],
+    )
+
+    assert extraction.status == "parsed"
+    assert extraction.tool_calls[0]["function"]["name"] == "task_progress"

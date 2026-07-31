@@ -232,18 +232,31 @@ def gate_long_output_decay(
             ),
         },
     ]
-    result = client.chat(msgs, max_tokens=max_tokens)
-    progress = result["progress"]
-    total_chars = progress[-1][1] if progress else 0
-    if len(progress) < 100 or total_chars < 4000:
-        report["long_output_decay"] = {
-            "pass": False,
-            "reason": (
-                f"too little streamed content ({len(progress)} chunks, "
-                f"{total_chars} chars)"
-            ),
-        }
-        return False
+    # The model occasionally answers this prompt with a short "I am ready to
+    # proceed" preamble and a clean stop (temperature variance, seen 2026-07-31
+    # at healthy 52 tok/s). That is insufficient DATA for a decay measurement,
+    # not a decay failure — retry once with a fresh request before failing so
+    # a one-in-N conversational flake cannot abort a release run.
+    attempts = 0
+    while True:
+        attempts += 1
+        result = client.chat(msgs, max_tokens=max_tokens)
+        progress = result["progress"]
+        total_chars = progress[-1][1] if progress else 0
+        if len(progress) >= 100 and total_chars >= 4000:
+            break
+        if attempts >= 2:
+            report["long_output_decay"] = {
+                "pass": False,
+                "reason": (
+                    f"too little streamed content ({len(progress)} chunks, "
+                    f"{total_chars} chars) in {attempts} attempts"
+                ),
+            }
+            return False
+        report.setdefault("long_output_decay_retries", []).append(
+            {"chunks": len(progress), "chars": total_chars}
+        )
     # Content throughput (chars/s) per output quintile: SSE chunk cadence is
     # pinned by the stream interval, so chunk rate is blind to decode decay —
     # a slowing decoder produces the same chunk rate with thinner chunks.

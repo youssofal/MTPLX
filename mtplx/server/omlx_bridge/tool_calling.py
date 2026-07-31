@@ -243,6 +243,47 @@ def _parse_xml_tool_calls(text: str) -> tuple[str, list[dict[str, Any]] | None, 
                 break
             calls.append(_tool_call(name, params))
             continue
+        # Poolside dialect: `name<arg_key>k</arg_key><arg_value>v</arg_value>...`
+        # (the Laguna family's native emission; same contract as the strict
+        # parser in openai.py — every non-pair byte after the name is residue
+        # and marks the call malformed rather than silently dropping args).
+        poolside_match = re.match(r"\s*([A-Za-z_][\w.-]*)", content)
+        if poolside_match:
+            poolside_name = poolside_match.group(1)
+            body = content[poolside_match.end():]
+            pairs = list(
+                re.finditer(
+                    r"<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>\s*(.*?)\s*</arg_value>",
+                    body,
+                    re.DOTALL,
+                )
+            )
+            if pairs:
+                params = {}
+                residue_parts = []
+                cursor = 0
+                valid = True
+                for pair in pairs:
+                    key = pair.group(1).strip()
+                    if not key or key in params:
+                        valid = False
+                        break
+                    value = pair.group(2).strip()
+                    try:
+                        params[key] = json.loads(value)
+                    except (TypeError, ValueError):
+                        params[key] = value
+                    residue_parts.append(body[cursor:pair.start()])
+                    cursor = pair.end()
+                residue_parts.append(body[cursor:])
+                if valid and not "".join(residue_parts).strip():
+                    calls.append(_tool_call(poolside_name, params))
+                    continue
+                malformed_reason = (
+                    f"tool '{poolside_name}' contains malformed Poolside arguments"
+                )
+                calls = []
+                break
         malformed_reason = "unrecognized <tool_call> payload"
     if not calls:
         return text, None, malformed_reason
@@ -433,8 +474,10 @@ def parse_tool_calls(
         cleaned, calls, malformed = _parse_xml_tool_calls(cleaned_text)
         filtered_calls = _filter_known_tools(calls, tools)
         if calls and not filtered_calls and tools:
-            first_name = calls[0].get("function", {}).get("name", "unknown")
-            malformed = f"unknown tool '{first_name}'"
+            # OpenAI passes unknown-named calls through; the client owns the
+            # rejection (and answers the model, letting it self-correct).
+            # Degrading the whole turn to prose costs the agent a strike.
+            filtered_calls = calls
         if filtered_calls:
             return ToolCallExtraction(
                 cleaned_text=cleaned,

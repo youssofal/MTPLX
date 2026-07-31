@@ -348,6 +348,26 @@ def test_startup_urls_distinguish_wildcard_bind_from_local_url():
     assert openai._startup_openai_base_url(args) == "http://127.0.0.1:8000/v1"
 
 
+def test_laguna_fused_startup_line_carries_the_engagement_receipt():
+    runtime = SimpleNamespace(
+        laguna_fused_report=[{"path": "fused_gate_up", "layers_converted": 47}]
+    )
+
+    line = openai._laguna_fused_startup_line(runtime)
+
+    assert line is not None
+    assert "[laguna-fused]" in line
+    assert json.loads(line.split("[laguna-fused] ", 1)[1]) == runtime.laguna_fused_report
+
+
+def test_laguna_fused_startup_line_stays_silent_without_a_report():
+    assert openai._laguna_fused_startup_line(SimpleNamespace()) is None
+    assert (
+        openai._laguna_fused_startup_line(SimpleNamespace(laguna_fused_report=[]))
+        is None
+    )
+
+
 def test_chat_request_accepts_ai_sdk_camel_sampler_aliases():
     request = openai.ChatCompletionRequest.model_validate(
         {
@@ -10082,7 +10102,7 @@ def test_chat_tools_malformed_tool_call_drops_punctuation_only_visible_fallback(
     assert stats["raw_tool_markup_suppressed"] is True
 
 
-def test_chat_tools_unknown_generated_tool_falls_back_to_content(monkeypatch):
+def test_chat_tools_unknown_generated_tool_passes_through(monkeypatch):
     state = _fake_state()
     state.args.stats_footer = False
     client = TestClient(create_app(state))
@@ -10109,18 +10129,25 @@ def test_chat_tools_unknown_generated_tool_falls_back_to_content(monkeypatch):
         },
     )
 
+    # A name outside the request's tools list is still delivered as a real tool call:
+    # the OpenAI surface leaves the rejection to the client, which answers the model and
+    # lets it self-correct. Degrading the turn to prose instead makes agent clients count
+    # a consecutive-mistake strike (three fails the task), so this must NOT fall back.
     assert response.status_code == 200
     choice = response.json()["choices"][0]
-    assert choice["finish_reason"] == "stop"
-    assert choice["message"]["content"] == ""
-    assert "tool_calls" not in choice["message"]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["content"] is None
+    calls = choice["message"]["tool_calls"]
+    assert [c["function"]["name"] for c in calls] == ["Agent"]
+    assert json.loads(calls[0]["function"]["arguments"]) == {"description": "List files"}
     stats = response.json()["mtplx_stats"]
-    assert stats["tool_parse_fallback"] is True
-    assert stats["tool_parse_fallback_kind"] == "unknown_tool_name"
-    assert "unknown tool 'Agent'" in stats["tool_parse_fallback_reason"]
+    assert stats["tool_parse_status"] == "parsed"
+    assert stats["tool_calls_emitted"] == 1
+    assert stats["raw_tool_markup_suppressed"] is True
+    assert "tool_parse_fallback_kind" not in stats
 
 
-def test_chat_stream_unknown_generated_tool_falls_back_to_content(monkeypatch):
+def test_chat_stream_unknown_generated_tool_passes_through(monkeypatch):
     state = _fake_state()
     state.args.stream_interval = 1
     state.args.stats_footer = False
@@ -10150,15 +10177,27 @@ def test_chat_stream_unknown_generated_tool_falls_back_to_content(monkeypatch):
     streamed_content = "".join(
         payload["choices"][0]["delta"].get("content", "") for payload in payloads
     )
+    # Streaming carries the same contract as the buffered path: an unknown name is
+    # delivered as incremental tool_calls deltas, never degraded to prose (see the
+    # non-stream sibling for why the fallback would cost the client a mistake strike).
     assert streamed_content == ""
-    assert not any(
-        payload["choices"][0]["delta"].get("tool_calls") for payload in payloads
+    deltas = [
+        payload["choices"][0]["delta"]["tool_calls"]
+        for payload in payloads
+        if payload["choices"][0]["delta"].get("tool_calls")
+    ]
+    assert deltas, "unknown tool must still stream as tool_calls"
+    assert deltas[0][0]["function"]["name"] == "task"
+    streamed_args = "".join(
+        chunk[0]["function"].get("arguments", "") for chunk in deltas
     )
+    assert json.loads(streamed_args) == {"description": "List files"}
     final = [payload for payload in payloads if payload["choices"][0]["finish_reason"]]
-    assert final[-1]["choices"][0]["finish_reason"] == "stop"
+    assert final[-1]["choices"][0]["finish_reason"] == "tool_calls"
     stats = final[-1]["mtplx_stats"]
-    assert stats["tool_parse_fallback"] is True
-    assert stats["tool_parse_fallback_kind"] == "unknown_tool_name"
+    assert stats["tool_calls_emitted"] == 1
+    assert stats["raw_tool_markup_suppressed"] is True
+    assert "tool_parse_fallback_kind" not in stats
     assert "data: [DONE]" in response.text
 
 

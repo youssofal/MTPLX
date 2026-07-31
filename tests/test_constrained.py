@@ -644,3 +644,96 @@ def test_masked_row_through_real_sparse_topk_sampler():
     greedy = SamplerConfig(temperature=0.0, top_p=1.0, top_k=0)
     token, _ = _sample_from_logits(mx.array(row), greedy, rng)
     assert token == 3
+
+
+# --- bounded think prelude (the unbounded prelude is a legal runaway) -------
+
+
+def _schema_json():
+    return json.dumps(
+        {
+            "type": "object",
+            "properties": {"a": {"type": "number"}},
+            "required": ["a"],
+            "additionalProperties": False,
+        }
+    )
+
+
+def _prelude_line(grammar):
+    return next(
+        line for line in grammar.splitlines() if line.startswith("PRELUDE_TEXT")
+    )
+
+
+def test_think_prelude_is_bounded_by_default(monkeypatch):
+    from mtplx.constrained import _cached_grammar_for_schema
+
+    monkeypatch.delenv("MTPLX_THINK_PRELUDE_MAX_CHARS", raising=False)
+    grammar = _cached_grammar_for_schema(_schema_json(), think_prelude=True)
+    assert _prelude_line(grammar) == r"PRELUDE_TEXT: /(.|\n){0,4000}/"
+
+
+def test_think_prelude_bound_is_configurable_and_disableable(monkeypatch):
+    from mtplx.constrained import _cached_grammar_for_schema
+
+    monkeypatch.setenv("MTPLX_THINK_PRELUDE_MAX_CHARS", "600")
+    assert (
+        _prelude_line(_cached_grammar_for_schema(_schema_json(), think_prelude=True))
+        == r"PRELUDE_TEXT: /(.|\n){0,600}/"
+    )
+
+    # 0 restores the previous unbounded behaviour verbatim.
+    monkeypatch.setenv("MTPLX_THINK_PRELUDE_MAX_CHARS", "0")
+    assert (
+        _prelude_line(_cached_grammar_for_schema(_schema_json(), think_prelude=True))
+        == r"PRELUDE_TEXT: /(.|\n)*/"
+    )
+
+
+def test_prelude_bound_participates_in_the_grammar_cache_key(monkeypatch):
+    """Without this the second bound would silently reuse the first grammar."""
+    from mtplx.constrained import _cached_grammar_for_schema
+
+    monkeypatch.setenv("MTPLX_THINK_PRELUDE_MAX_CHARS", "600")
+    first = _cached_grammar_for_schema(_schema_json(), think_prelude=True)
+    monkeypatch.setenv("MTPLX_THINK_PRELUDE_MAX_CHARS", "1200")
+    second = _cached_grammar_for_schema(_schema_json(), think_prelude=True)
+    assert first != second
+
+
+def test_tool_call_prelude_bounded_but_tail_stays_free(monkeypatch):
+    """The cap must not leak into the assistant's visible answer."""
+    from mtplx.constrained import _tool_call_lark_grammar
+
+    monkeypatch.delenv("MTPLX_THINK_PRELUDE_MAX_CHARS", raising=False)
+    grammar = _tool_call_lark_grammar(
+        [("write_file", json.loads(_schema_json()))], include_think=True
+    )
+    assert _prelude_line(grammar) == r"PRELUDE_TEXT: /(.|\n){0,4000}/"
+    assert r"TAG_TEXT: /(.|\n)*/" in grammar  # tail/free text unchanged
+    assert "tail: TAG_TEXT" in grammar
+
+
+def test_no_prelude_terminal_when_thinking_is_off(monkeypatch):
+    from mtplx.constrained import _tool_call_lark_grammar
+
+    monkeypatch.delenv("MTPLX_THINK_PRELUDE_MAX_CHARS", raising=False)
+    grammar = _tool_call_lark_grammar(
+        [("write_file", json.loads(_schema_json()))], include_think=False
+    )
+    assert "PRELUDE_TEXT" not in grammar
+
+
+@pytest.mark.parametrize("bound", ["4000", "600", "0"])
+def test_bounded_prelude_grammars_compile(monkeypatch, bound):
+    from mtplx.constrained import _cached_grammar_for_schema, _tool_call_lark_grammar
+
+    monkeypatch.setenv("MTPLX_THINK_PRELUDE_MAX_CHARS", bound)
+    for grammar in (
+        _cached_grammar_for_schema(_schema_json(), think_prelude=True),
+        _tool_call_lark_grammar(
+            [("write_file", json.loads(_schema_json()))], include_think=True
+        ),
+    ):
+        assert not llguidance.LLMatcher.validate_grammar(grammar)

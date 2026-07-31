@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 @testable import MTPLXAppCore
 
@@ -9,6 +10,7 @@ final class HuggingFaceProbeForgeTests: XCTestCase {
     ///
     ///   /<repo>/resolve/main/mtplx_runtime.json
     ///   /<repo>/resolve/main/config.json
+    ///   /api/models/<repo>?expand=config&expand=sha
     ///   /api/models/<repo>/tree/main
     ///
     /// Missing entries return 404; throwing entries simulate network
@@ -206,6 +208,65 @@ final class HuggingFaceProbeForgeTests: XCTestCase {
         let probe = HuggingFaceProbe(runner: fake.runner())
         let result = await probe.forgeProbe(repo: "nonexistent/repo")
         XCTAssertEqual(result.verdict, .probeFailed)
+    }
+
+    func testForgeProbeFallsBackToModelAPIWhenLargeHy3ConfigTimesOut() async {
+        let fake = FakeRunner()
+        let repo = "philipjohnbasile/hy3-demolition-mlx-reap25-v1-mtp"
+        fake.errors.insert(
+            "https://huggingface.co/\(repo)/resolve/main/config.json"
+        )
+        fake.install(
+            url: "https://huggingface.co/api/models/\(repo)?expand=config&expand=sha",
+            body: """
+            {
+              "sha": "ac84bc50a90acdcbbffc632877f60be4b7efdddf",
+              "config": {
+                "model_type": "hy_v3"
+              }
+            }
+            """
+        )
+        fake.install(
+            url: "https://huggingface.co/\(repo)/resolve/ac84bc50a90acdcbbffc632877f60be4b7efdddf/config.json",
+            body: """
+            {
+              "model_type": "hy_v3",
+              "num_nextn_predict_layers": 1,
+              "quantization": {
+                "bits": 4,
+                "group_size": 64
+              }
+            }
+            """
+        )
+        fake.install(
+            url: "https://huggingface.co/api/models/\(repo)/tree/main",
+            body: "[]"
+        )
+
+        let probe = HuggingFaceProbe(runner: fake.runner())
+        let result = await probe.forgeProbe(repo: repo)
+
+        XCTAssertEqual(result.verdict, .forgeable)
+        XCTAssertEqual(result.sourceFormat, .mlxAffine)
+        XCTAssertEqual(result.hfRepo, repo)
+        XCTAssertNil(result.diagnostic)
+    }
+
+    func testForgeProbePreservesRawFetchDiagnosticWhenAPIFallbackAlsoFails() async {
+        let fake = FakeRunner()
+        let repo = "someone/flaky-model"
+        fake.errors.insert(
+            "https://huggingface.co/\(repo)/resolve/main/config.json"
+        )
+
+        let probe = HuggingFaceProbe(runner: fake.runner())
+        let result = await probe.forgeProbe(repo: repo)
+
+        XCTAssertEqual(result.verdict, .probeFailed)
+        XCTAssertEqual(result.message, "Couldn't fetch config.json.")
+        XCTAssertEqual(result.diagnostic, URLError(.notConnectedToInternet).localizedDescription)
     }
 
     // MARK: - classifySourceFormat unit (config-only, no IO)

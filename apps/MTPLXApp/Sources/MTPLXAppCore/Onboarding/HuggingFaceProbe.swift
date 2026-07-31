@@ -204,7 +204,15 @@ public struct HuggingFaceProbe: Sendable {
     /// object. `nil` on any failure — callers treat these fetches as
     /// best-effort signals, never hard errors.
     private func fetchRepoJSON(repo: String, path: String) async -> [String: Any]? {
-        guard let url = URL(string: "\(endpointBase)/\(repo)/resolve/main/\(path)") else {
+        await fetchRepoJSON(repo: repo, revision: "main", path: path)
+    }
+
+    private func fetchRepoJSON(
+        repo: String,
+        revision: String,
+        path: String
+    ) async -> [String: Any]? {
+        guard let url = URL(string: "\(endpointBase)/\(repo)/resolve/\(revision)/\(path)") else {
             return nil
         }
         do {
@@ -276,6 +284,14 @@ public struct HuggingFaceProbe: Sendable {
     }
 
     // MARK: - Step 1: GET <endpoint>/<repo>/resolve/main/config.json
+    //
+    // The Hub's raw-file route can occasionally stall long enough to
+    // trip URLSession's short onboarding timeout, especially for
+    // generated MLX configs with large per-tensor quantization maps.
+    // On transport errors, transient HTTP failures, or malformed raw
+    // responses, fall back to the model API's `config` expansion. The
+    // raw file remains authoritative and auth/404 handling stays
+    // unchanged.
 
     private func fetchConfig(repo: String) async -> ConfigOutcome {
         guard let url = URL(string: "\(endpointBase)/\(repo)/resolve/main/config.json") else {
@@ -307,6 +323,9 @@ public struct HuggingFaceProbe: Sendable {
                 // instead of claiming the repo does not exist.
                 return .failed(await classifyMissingConfig(repo: repo))
             default:
+                if let config = await fetchConfigFromModelAPI(repo: repo) {
+                    return .ok(config)
+                }
                 return .failed(OtherModelProbe(
                     verdict: .probeFailed,
                     hfRepo: repo,
@@ -315,6 +334,9 @@ public struct HuggingFaceProbe: Sendable {
                 ))
             }
             guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
+                if let config = await fetchConfigFromModelAPI(repo: repo) {
+                    return .ok(config)
+                }
                 return .failed(OtherModelProbe(
                     verdict: .probeFailed,
                     hfRepo: repo,
@@ -324,6 +346,9 @@ public struct HuggingFaceProbe: Sendable {
             }
             return .ok(json)
         } catch {
+            if let config = await fetchConfigFromModelAPI(repo: repo) {
+                return .ok(config)
+            }
             return .failed(OtherModelProbe(
                 verdict: .probeFailed,
                 hfRepo: repo,
@@ -331,6 +356,47 @@ public struct HuggingFaceProbe: Sendable {
                 diagnostic: error.localizedDescription
             ))
         }
+    }
+
+    /// Uses Hugging Face's compact model metadata to recover from a
+    /// raw-file failure. The indexed config is accepted only when it
+    /// carries a positive MTP marker; the Hub intentionally omits many
+    /// model-specific fields from that representation, so treating its
+    /// absence as "no MTP" would create a false negative. Prefer the
+    /// returned immutable revision to retry the complete raw config,
+    /// retaining the indexed config only as a last positive signal.
+    /// Failures return nil so the caller preserves the original raw-file
+    /// diagnostic.
+    private func fetchConfigFromModelAPI(repo: String) async -> [String: Any]? {
+        guard var components = URLComponents(string: "\(endpointBase)/api/models/\(repo)") else {
+            return nil
+        }
+        components.queryItems = [
+            URLQueryItem(name: "expand", value: "config"),
+            URLQueryItem(name: "expand", value: "sha"),
+        ]
+        guard let url = components.url else { return nil }
+        guard let (status, body) = try? await runner(url, "GET"), status == 200 else {
+            return nil
+        }
+        guard let metadata = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
+            return nil
+        }
+        let indexedConfig = (metadata["config"] as? [String: Any]) ?? [:]
+
+        if let revision = metadata["sha"] as? String,
+           !revision.isEmpty,
+           revision.unicodeScalars.allSatisfy({
+               CharacterSet.alphanumerics.contains($0)
+           }),
+           let config = await fetchRepoJSON(
+               repo: repo,
+               revision: revision,
+               path: "config.json"
+           ) {
+            return config
+        }
+        return Self.configDeclaresMTP(indexedConfig) ? indexedConfig : nil
     }
 
     // MARK: - Missing-config triage
@@ -554,7 +620,11 @@ public struct HuggingFaceProbe: Sendable {
     public static func defaultRunner(_ url: URL, _ method: String) async throws -> (Int, Data) {
         var request = URLRequest(url: url)
         request.httpMethod = method
-        request.timeoutInterval = 12
+        // Generated MLX configs can exceed 500 KB because they carry
+        // per-tensor quantization maps. Twelve seconds produced false
+        // "Unknown format" failures on otherwise public, forgeable
+        // repos; keep the probe bounded but allow slow Hub responses.
+        request.timeoutInterval = 30
         // Hugging Face honors a User-Agent and uses it to gate scraping
         // heuristics. Identify ourselves clearly so a probe failure is
         // traceable in HF logs back to MTPLX.

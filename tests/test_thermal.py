@@ -49,9 +49,23 @@ _FAKE_THERMALFORGE_DETECTION = {
 }
 
 
+_AUTO_SUMMARY = {
+    "ok": True,
+    "fans": [
+        {
+            "mode": "auto",
+            "target_rpm": 2317,
+            "actual_rpm": 2320,
+            "max_capacity_rpm": 7826,
+        }
+    ],
+}
+
+
 def test_set_thermal_profile_silent_prefers_daemon_socket(monkeypatch):
     """The fan reset goes through the daemon socket (no sudo, no app-kill) and
-    does not fall back to the `auto` CLI when the socket accepts it."""
+    does not fall back to the `auto` CLI when the socket accepts it AND the
+    fan rows verify back on the auto curve (#201)."""
     monkeypatch.setattr(thermal, "detect_thermal_control", lambda: _FAKE_THERMALFORGE_DETECTION)
 
     sent: list[str] = []
@@ -61,6 +75,7 @@ def test_set_thermal_profile_silent_prefers_daemon_socket(monkeypatch):
         return {"ok": True, "response": "ok", "command": ["<thermalforge-daemon-socket>", command]}
 
     monkeypatch.setattr(thermal, "_daemon_socket_send", fake_socket)
+    monkeypatch.setattr(thermal, "fan_summary", lambda: _AUTO_SUMMARY)
 
     def no_cli(command, *, timeout_s=None, cwd=None):
         raise AssertionError(f"CLI should not run when the socket handles it: {command}")
@@ -72,6 +87,58 @@ def test_set_thermal_profile_silent_prefers_daemon_socket(monkeypatch):
     assert result["ok"] is True
     assert sent == ["auto"]
     assert result["command"] == ["<thermalforge-daemon-socket>", "auto"]
+    assert result["attempts"][0]["verified"] is True
+
+
+def test_set_thermal_profile_silent_socket_ack_without_effect_falls_back_to_cli(monkeypatch):
+    """#201 regression guard: a daemon that replies ok but leaves the fans
+    pinned must not be trusted — the same call falls through to the CLI
+    candidates instead of reporting a restore that never happened."""
+    monkeypatch.setattr(thermal, "detect_thermal_control", lambda: _FAKE_THERMALFORGE_DETECTION)
+    monkeypatch.setattr(
+        thermal,
+        "_daemon_socket_send",
+        lambda command, *, timeout_s=3.0: {
+            "ok": True,
+            "response": "ok",
+            "command": ["<thermalforge-daemon-socket>", command],
+        },
+    )
+    # Fans stay ramped no matter what the daemon claims.
+    monkeypatch.setattr(thermal, "fan_summary", lambda: _RAMPED_SUMMARY)
+    monkeypatch.setattr(thermal, "time", _FastTime())
+
+    ran: list[list[str]] = []
+
+    def fake_run(command, *, timeout_s=None, cwd=None):
+        ran.append(command)
+        return {"command": command, "returncode": 0, "ok": True, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(thermal, "_run_probe", fake_run)
+
+    result = thermal.set_thermal_profile("silent")
+
+    assert result["ok"] is True
+    assert result["attempts"][0]["verified"] is False
+    assert ran and ran[0][-1] == "auto"
+
+
+class _FastTime:
+    """time shim: monotonic advances 1s per call so bounded verify loops
+    exhaust instantly and sleep is a no-op."""
+
+    def __init__(self) -> None:
+        self._now = 0.0
+
+    def monotonic(self) -> float:
+        self._now += 1.0
+        return self._now
+
+    def time(self) -> float:
+        return self.monotonic()
+
+    def sleep(self, _s: float) -> None:
+        return None
 
 
 def test_set_thermal_profile_silent_falls_back_to_cli_without_daemon(monkeypatch):
@@ -252,6 +319,113 @@ def test_smart_fan_controller_detach_never_touches_hardware(monkeypatch):
 
     _time.sleep(0.2)
     assert calls == ["performance"]
+
+
+def _wait_until(predicate, timeout_s=5.0, interval_s=0.02):
+    import time as _time
+
+    deadline = _time.monotonic() + timeout_s
+    while _time.monotonic() < deadline:
+        if predicate():
+            return True
+        _time.sleep(interval_s)
+    return predicate()
+
+
+def test_smart_fan_restore_retries_with_backoff_until_verified(monkeypatch):
+    """#201: a restore that fails verification must be retried until the
+    fans actually come back to auto — not marked restored and forgotten
+    while the hardware stays pinned at max."""
+    calls: list[str] = []
+    monkeypatch.setattr(thermal, "check_and_recover_stale_max", lambda: None)
+    monkeypatch.setattr(thermal, "set_thermal_profile", lambda profile: (
+        calls.append(profile) or {"ok": True, "profile": profile}
+    ))
+    monkeypatch.setattr(thermal, "fan_summary", lambda: _RAMPED_SUMMARY)
+    monkeypatch.setattr(thermal, "_clear_max_marker", lambda: None)
+
+    restore_results = [
+        {"ok": False, "message": "socket ack without effect"},
+        {"ok": False, "message": "socket ack without effect"},
+        {"ok": True, "profile": "silent"},
+    ]
+    restore_calls: list[int] = []
+
+    def fake_cleanup():
+        restore_calls.append(1)
+        return restore_results.pop(0)
+
+    monkeypatch.setattr(thermal, "install_max_lifecycle_hooks", lambda: fake_cleanup)
+    monkeypatch.setattr(
+        thermal, "restore_thermal_profile_verified", lambda **_kw: fake_cleanup()
+    )
+    monkeypatch.setattr(
+        thermal.SmartFanController, "_RESTORE_RETRY_BACKOFF_S", (0.05, 0.05, 0.05, 0.05)
+    )
+
+    controller = thermal.SmartFanController(restore_delay_s=0)
+    controller.begin_request("req")
+    assert controller.wait_for_ramp(5.0) is True
+    controller.end_request("req", wait_for_restore=True)
+
+    # First restore failed; the worker must keep retrying on its own with
+    # backoff until the third attempt verifies.
+    assert _wait_until(lambda: len(restore_calls) >= 3)
+    assert _wait_until(lambda: controller.status()["restore_verified"] is True)
+    status = controller.status()
+    assert status["restore_failures"] == 0
+    assert status["commanded_max"] is False
+    controller._shutdown = True
+
+
+def test_smart_fan_stale_lease_reconciler_drops_leaked_leases(monkeypatch):
+    """#201: a lease held while the engine is continuously idle is a leak
+    from a wedged request path — it must be dropped and fans restored
+    instead of pinning the fans forever."""
+    calls: list[str] = []
+    _patch_smart_fan_hardware(monkeypatch, calls)
+    monkeypatch.setattr(thermal.SmartFanController, "_ACTIVITY_POLL_INTERVAL_S", 0.05)
+    monkeypatch.setenv("MTPLX_SMART_FAN_STALE_LEASE_S", "0.2")
+
+    controller = thermal.SmartFanController(
+        restore_delay_s=0, activity_probe=lambda: False
+    )
+    controller.begin_request("leaked-lease")
+    assert controller.wait_for_ramp(5.0) is True
+
+    # Never end_request: the reconciler must clear it once the probe has
+    # reported the engine idle past the stale window.
+    assert _wait_until(lambda: controller.status()["active_count"] == 0)
+    assert _wait_until(lambda: "auto" in calls)
+    status = controller.status()
+    assert status["stale_leases_reconciled"] == 1
+    assert status["commanded_max"] is False
+    controller._shutdown = True
+
+
+def test_smart_fan_stale_lease_reconciler_never_fires_while_engine_busy(monkeypatch):
+    """The reconciler must not drop leases while the activity probe reports
+    model work — a long legitimate generation keeps its fan boost."""
+    calls: list[str] = []
+    _patch_smart_fan_hardware(monkeypatch, calls)
+    monkeypatch.setattr(thermal.SmartFanController, "_ACTIVITY_POLL_INTERVAL_S", 0.02)
+    monkeypatch.setenv("MTPLX_SMART_FAN_STALE_LEASE_S", "0.1")
+
+    controller = thermal.SmartFanController(
+        restore_delay_s=0, activity_probe=lambda: True
+    )
+    controller.begin_request("long-generation")
+    assert controller.wait_for_ramp(5.0) is True
+
+    import time as _time
+
+    _time.sleep(0.5)
+    status = controller.status()
+    assert status["active_count"] == 1
+    assert status["stale_leases_reconciled"] == 0
+    assert status["commanded_max"] is True
+    controller.end_request("long-generation", wait_for_restore=True)
+    controller._shutdown = True
 
 
 def test_thermalforge_profile_candidates_match_real_cli():

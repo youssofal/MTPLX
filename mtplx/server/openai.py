@@ -307,8 +307,15 @@ STREAM_SILENCE_WARN_INTERVAL_S = 60.0
 STREAM_STALL_DEADLINE_S = float(
     os.environ.get("MTPLX_STREAM_STALL_DEADLINE_S") or 300.0
 )
-STREAM_HIDDEN_TOOL_GUARD_TOKENS = 2048
-STREAM_HIDDEN_TOOL_GUARD_S = 30.0
+# Runaway-hidden-generation backstop. Native-tool agent workloads stream
+# multi-thousand-token arguments (whole files) as legitimate hidden text, so
+# the ceilings are env-tunable; the defaults keep the original chat-UX guard.
+STREAM_HIDDEN_TOOL_GUARD_TOKENS = int(
+    os.environ.get("MTPLX_STREAM_HIDDEN_TOOL_GUARD_TOKENS", "2048")
+)
+STREAM_HIDDEN_TOOL_GUARD_S = float(
+    os.environ.get("MTPLX_STREAM_HIDDEN_TOOL_GUARD_S", "30")
+)
 STREAM_TOOL_CALL_FINISH_GRACE_S = 0.05
 TOOL_PROTOCOL_BOUNDARY_GRACE_S = 0.05
 _REASONING_DETAILS_RE = re.compile(
@@ -1099,6 +1106,15 @@ def _startup_line(text: str = "") -> None:
     _safe_stdout_print(text)
 
 
+def _laguna_fused_startup_line(runtime: Any) -> str | None:
+    """Engagement receipt for the env-gated fused stack (grep: [laguna-fused])."""
+
+    report = getattr(runtime, "laguna_fused_report", None)
+    if not report:
+        return None
+    return "[5/6] [laguna-fused] " + json.dumps(report, ensure_ascii=False)
+
+
 def _startup_server_url(args: argparse.Namespace) -> str:
     return local_url_for_bind(
         str(getattr(args, "host", "127.0.0.1")),
@@ -1787,6 +1803,9 @@ class ServerState:
             _startup_line(
                 f"[5/6] {self.backend_descriptor.display_name} drafter is active"
             )
+        fused_line = _laguna_fused_startup_line(self.runtime)
+        if fused_line:
+            _startup_line(fused_line)
         if self.backend_descriptor.uses_draft_lm_head and self.runtime.mtp_enabled:
             self.draft_lm_head = self.model_scheduler.submit_foreground(
                 _install_draft_lm_head,
@@ -1915,7 +1934,8 @@ class ServerState:
         from mtplx.thermal import SmartFanController
 
         self.smart_fans = SmartFanController(
-            log=lambda line: LOGGER.info("%s", line)
+            log=lambda line: LOGGER.info("%s", line),
+            activity_probe=self._smart_fan_activity_probe,
         )
         # Dashboard primitives: pub/sub bus, in-flight registry, 5-min rolling
         # TPS window, lifetime counters, prefill history. Created before
@@ -1924,6 +1944,29 @@ class ServerState:
         self.dashboard = DashboardState()
         self.ar_batch_service = _BatchedARGenerationService(self)
         self.warmup_status = _run_startup_warmup(self)
+
+    def _smart_fan_activity_probe(self) -> bool:
+        """True while any model work is executing, queued, or recently active.
+
+        Feeds the SmartFanController stale-lease reconciler (#201). Covers
+        every legitimate work state: foreground generation (begin/end_foreground
+        wraps dispatch on all paths including the AR batch service), scheduler
+        queues and the executing item of either lane (foreground + idle
+        postcommit), and a short recency window so back-to-back agent turns
+        never look idle between requests.
+        """
+        if self.has_foreground():
+            return True
+        scheduler = getattr(self, "model_scheduler", None)
+        if scheduler is not None and hasattr(scheduler, "any_pending_or_active"):
+            try:
+                if scheduler.any_pending_or_active():
+                    return True
+            except BaseException:
+                return True
+        last_started = float(getattr(self, "last_request_started_at", 0.0) or 0.0)
+        last_finished = float(getattr(self, "last_request_at", 0.0) or 0.0)
+        return (time.time() - max(last_started, last_finished)) < 30.0
 
     def begin_foreground(self) -> None:
         with self.foreground_lock:
@@ -6382,6 +6425,137 @@ def _parse_poolside_tool_call(block: str) -> tuple[str, Any] | None:
     return name, arguments
 
 
+def _scan_bracket_tool_call(
+    text: str,
+    start: int,
+) -> tuple[int, str, Any] | None:
+    """Balanced-scan one `[Calling tool: name({...})]` block at `start`.
+
+    The JSON object is walked with string/escape awareness, so `}` or `)]`
+    sequences inside argument strings (a JS file body, a task_progress
+    checklist) cannot end the block early — the failure mode of the
+    non-greedy regex this replaces. Returns (end_exclusive, name, arguments)
+    for a complete block, or None when no complete well-formed block starts
+    at `start`.
+    """
+    match = re.compile(
+        r"\[(?:Calling tool|Tool call):\s*([A-Za-z_][\w.-]*)\s*\(",
+        re.IGNORECASE,
+    ).match(text, start)
+    if match is None:
+        return None
+    name = match.group(1)
+    i = match.end()
+    tail = re.compile(r"\s*\)\s*\]").match(text, i)
+    if tail is not None:
+        return tail.end(), name, {}
+    if i >= len(text) or text[i] != "{":
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    j = i
+    while j < len(text):
+        ch = text[j]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                j += 1
+                break
+        j += 1
+    if depth != 0:
+        return None
+    close = re.compile(r"\s*\)\s*\]").match(text, j)
+    if close is None:
+        return None
+    try:
+        arguments = json.loads(text[i:j])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(arguments, dict):
+        return None
+    return close.end(), name, arguments
+
+
+def _classify_bracket_tool_call(text: str, start: int) -> str:
+    """Classify the bracket block starting at `start` (which sits on a full
+    `[Calling tool:`/`[Tool call:` prefix).
+
+    'complete'   — a well-formed call the scanner can extract now.
+    'incomplete' — the available text ends inside a structurally consistent
+                   block; more chunks may complete it (streaming: buffer).
+    'invalid'    — the structure is already broken with text to spare (e.g. a
+                   dangling prefix in prose); never a call, leave it to the
+                   content path and its prefix sanitizer.
+    """
+    if _scan_bracket_tool_call(text, start) is not None:
+        return "complete"
+    tail = text[start:]
+    head = re.match(
+        r"\[(?:Calling tool|Tool call):\s*[A-Za-z_][\w.-]*\s*\(",
+        tail,
+        re.IGNORECASE,
+    )
+    if head is None:
+        after_prefix = re.sub(
+            r"^\[(?:Calling tool|Tool call):",
+            "",
+            tail,
+            flags=re.IGNORECASE,
+        )
+        if re.fullmatch(r"\s*(?:[A-Za-z_][\w.-]*)?\s*\(?", after_prefix):
+            return "incomplete"
+        return "invalid"
+    i = start + head.end()
+    if i >= len(text):
+        return "incomplete"
+    if text[i] != "{":
+        return (
+            "incomplete"
+            if re.fullmatch(r"\s*\)?\s*\]?", text[i:])
+            else "invalid"
+        )
+    depth = 0
+    in_string = False
+    escaped = False
+    j = i
+    while j < len(text):
+        ch = text[j]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                j += 1
+                break
+        j += 1
+    if depth != 0:
+        return "incomplete"
+    # Object closed but the scanner rejected it: either the `)]` close is
+    # still arriving, or the payload is truly malformed.
+    return "incomplete" if re.fullmatch(r"\s*\)?\s*", text[j:]) else "invalid"
+
+
 def _tool_marker_pairs_from_tokenizer(tokenizer: Any | None) -> list[tuple[str, str]]:
     if tokenizer is None:
         return []
@@ -6413,19 +6587,33 @@ def _iter_generated_tool_call_envelopes(
         )
         for match in pattern.finditer(text):
             envelopes.append((match.start(), match.end(), match.group(1).strip(), None))
-    for match in _BRACKET_TOOL_CALL_RE.finditer(text):
-        name = match.group(1).strip()
-        raw_args = (match.group(2) or "").strip()
-        if raw_args:
-            try:
-                arguments: Any = json.loads(raw_args)
-            except json.JSONDecodeError as exc:
-                raise _tool_protocol_error(
-                    f"bracket tool_call '{name}' arguments are not valid JSON"
-                ) from exc
-        else:
-            arguments = {}
-        envelopes.append((match.start(), match.end(), "", (name, arguments)))
+    # Bracket dialect (`[Calling tool: name({...})]`) via the balanced scanner:
+    # the old non-greedy regex ended the block at the first `})]`, which any
+    # code-file argument contains inside a string, so large bracket calls
+    # always failed JSON decode and fell back to prose.
+    search_from = 0
+    lowered_text = text.lower()
+    while True:
+        candidates = [
+            idx
+            for idx in (
+                lowered_text.find(prefix.lower(), search_from)
+                for prefix in _BRACKET_TOOL_PREFIXES
+            )
+            if idx >= 0
+        ]
+        if not candidates:
+            break
+        found = min(candidates)
+        scanned = _scan_bracket_tool_call(text, found)
+        if scanned is None:
+            # Unterminated or malformed: not an envelope — the text stays
+            # visible content, same terminal state as the old decode error.
+            search_from = found + 1
+            continue
+        end, name, arguments = scanned
+        envelopes.append((found, end, "", (name, arguments)))
+        search_from = end
     envelopes.sort(key=lambda item: item[0])
     for previous, current in zip(envelopes, envelopes[1:]):
         if current[0] < previous[1]:
@@ -6544,23 +6732,28 @@ def _parse_generated_tool_calls(
             raise _tool_protocol_error("unsupported tool_call payload format")
         name, arguments = parsed
         canonical_name = _canonical_tool_name_for_model_output(name, tools)
-        if canonical_name is None:
-            raise _tool_protocol_error(f"unknown tool '{name}'")
         arguments_value = _json_object_value(
             arguments,
             context=f"tool_call[{index}]",
         )
-        arguments_value = _normalize_tool_arguments_for_schema(
-            tool_name=canonical_name,
-            arguments=arguments_value,
-            tools=tools,
-        )
-        _validate_tool_arguments_for_schema(
-            tool_name=canonical_name,
-            arguments=arguments_value,
-            tools=tools,
-            context=f"tool_call[{index}]",
-        )
+        if canonical_name is None:
+            # OpenAI-compatible pass-through: surface the call under its raw
+            # name and let the client own the unknown-tool rejection (the
+            # client answers the model, which self-corrects). There is no
+            # schema to normalize or validate against.
+            canonical_name = str(name)
+        else:
+            arguments_value = _normalize_tool_arguments_for_schema(
+                tool_name=canonical_name,
+                arguments=arguments_value,
+                tools=tools,
+            )
+            _validate_tool_arguments_for_schema(
+                tool_name=canonical_name,
+                arguments=arguments_value,
+                tools=tools,
+                context=f"tool_call[{index}]",
+            )
         calls.append(
             {
                 "id": f"call_{uuid.uuid4().hex[:24]}",
@@ -6870,8 +7063,8 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
                     self._tools,
                 )
                 if canonical_name is None:
-                    self._fallback_reason = f"unknown tool '{name}'"
-                    return deltas
+                    # Pass-through: the client owns unknown-tool rejection.
+                    canonical_name = name
                 self._name = canonical_name
                 self._started = True
                 self._buf = self._buf[function_end + 1 :]
@@ -7300,12 +7493,16 @@ class _ToolAwareContentStreamTranslator:
         for prefix in _BRACKET_TOOL_PREFIXES:
             bracket_idx = lowered.find(prefix.lower())
             while bracket_idx >= 0:
-                candidate = text[bracket_idx:]
-                if _BRACKET_TOOL_CALL_RE.match(candidate):
+                # The old gate demanded a complete regex match mid-stream and
+                # skipped ahead on any early `]` (present in every
+                # task_progress checklist), so bracket-call text streamed to
+                # the client as content AND the finish-time rescue emitted the
+                # same call — a double delivery that also taught the model its
+                # drift dialect was accepted. Buffer on complete AND
+                # still-completing blocks; only structurally-dead prefixes
+                # stay on the content path for the prefix sanitizer.
+                if _classify_bracket_tool_call(text, bracket_idx) != "invalid":
                     candidates.append(bracket_idx)
-                    break
-                close_idx = candidate.find("]")
-                if close_idx < 0:
                     break
                 bracket_idx = lowered.find(prefix.lower(), bracket_idx + 1)
         for start_marker, _end_marker in self._marker_pairs:

@@ -139,6 +139,17 @@ class ModelWorkScheduler:
         with self._condition:
             return bool(self._foreground) or self._active_kind == "foreground"
 
+    def any_pending_or_active(self) -> bool:
+        """True while the owner thread is executing or has queued work of any
+        kind (foreground or idle postcommit). Used as the model-activity
+        signal for the smart-fan stale-lease reconciler."""
+        with self._condition:
+            return (
+                bool(self._foreground)
+                or bool(self._idle)
+                or self._active_kind is not None
+            )
+
     def stats(self) -> dict[str, Any]:
         with self._condition:
             active_run_s = (

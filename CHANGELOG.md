@@ -33,6 +33,65 @@ All notable user-facing changes to MTPLX. The format is based on
   for every served model, and the settings are configurable from the macOS app
   and persist in `~/.mtplx/config.toml` as `embedding_models`,
   `reranker_models`, and `retrieval_max_resident`.
+## [2.4.0] - 2026-07-31
+
+The 35B speed release: the 35B-A3B MoE gets a compiled decode stack and
+continuous batched serving, the 2.3.0 fan regression is root-caused and
+fixed, tool calling gets another round of contract hardening, and
+structured output can no longer be eaten by an unbounded reasoning
+prelude. Four community contributors landed code in this release.
+
+### Added
+
+- 35B-A3B compiled decode stack: target-prefix compiled route, whole-MoE
+  fusion, GDN post-conv fusion, and a row-owned router (David Tai, #174).
+- Continuous batched serving for the A3B lane: fixed-shape cohorts,
+  ragged KV, fold-in repair, and AR row-packing (David Tai, #200).
+- Laguna S-2.1 support (exact-pin oQ4e, AR-only) with an app catalog
+  entry, plus a Poolside `arg_key`/`arg_value` tool-call dialect parser
+  (David Tai, #195).
+- Hy3 295B full-residency lane and generic MTP draft-contract hardening
+  whose loud recurrent-cache failure also caught a real bug on the Qwen
+  lane (David Tai, #208).
+- `/health` now reports smart-fan restore state (`restore_verified`,
+  `restore_failures`, `stale_leases_reconciled`) so stuck-fan reports
+  are diagnosable from the field (#201).
+
+### Fixed
+
+- Fans no longer stay pinned at max after a request ends (#201). A
+  failed fan restore was logged once and then treated as restored, so
+  the hardware stayed ramped while the server believed it was clean;
+  restores now verify the fan rows are back on the Apple auto curve and
+  retry with backoff until they are. The ThermalForge daemon-socket
+  restore path no longer trusts the daemon's "ok" reply without
+  verifying, and falls back to the CLI in the same call. A stale-lease
+  watchdog drops any fan lease held while the engine has been
+  continuously idle (default 120s, `MTPLX_SMART_FAN_STALE_LEASE_S`).
+- A generation cut by `max_tokens` mid-tool-call now reports
+  `finish_reason: "length"` instead of `"tool_calls"`, so agent clients
+  continue the turn instead of executing a truncated call (#196, #197
+  layers one and two).
+- The think-splitter no longer leaks reasoning into visible content when
+  the text contains bare `function=` or `parameter=` strings (#196/#197
+  companion fix).
+- Streaming tool-call parsing handles bracket-style dialects with a
+  balanced string/escape-aware scanner, buffers incomplete calls instead
+  of double-delivering them, and passes through calls to undeclared
+  tools per the OpenAI contract instead of dropping them (David Tai,
+  #195).
+- Constrained generation bounds the `<think>` prelude at 4000 characters
+  (`MTPLX_THINK_PRELUDE_MAX_CHARS`, 0 restores unbounded), so an
+  unclosed think block can no longer consume the entire token budget and
+  return no document (Jozef Kristek, #213).
+- Forge model probes recover from slow Hugging Face config responses:
+  30s timeout, pinned-SHA retry, positive-MTP-only indexed acceptance,
+  and revision-string validation (Philip John Basile, #210).
+
+### Changed
+
+- Dependency bumps: pillow 12.3.0, actions/checkout 7.0.1,
+  actions/setup-python 7.0.0, pypa/gh-action-pypi-publish 1.14.1.
 
 ## [2.3.0] - 2026-07-21
 
