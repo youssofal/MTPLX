@@ -20,6 +20,10 @@ from mtplx.retrieval import (
     RetrievalStats,
     RetrievalRegistry,
     RetrievalSpec,
+    _JinaEmbedBackend,
+    _JinaRerankBackend,
+    _is_jina_embedding_checkpoint,
+    _is_jina_reranker_checkpoint,
     _plan_batches,
     default_served_id,
     parse_model_flag,
@@ -66,6 +70,113 @@ def test_parse_model_flag_rejects_empty_sides():
 
 def test_default_served_id_strips_trailing_slash():
     assert default_served_id("org/name/") == "name"
+
+
+# ---- jina backend detection and dispatch -----------------------------------
+
+
+def test_jina_embedding_checkpoint_is_detected_by_its_own_loader_files(tmp_path):
+    (tmp_path / "utils.py").write_text("# stand-in for jina's loader")
+    (tmp_path / "model.py").write_text("# stand-in for jina's model code")
+    assert _is_jina_embedding_checkpoint(tmp_path) is True
+
+
+def test_a_qwen_checkpoint_is_not_mistaken_for_jina_embedding(tmp_path):
+    (tmp_path / "config.json").write_text("{}")
+    assert _is_jina_embedding_checkpoint(tmp_path) is False
+
+
+def test_jina_reranker_checkpoint_is_detected_by_its_projector_head(tmp_path):
+    (tmp_path / "rerank.py").write_text("# stand-in for jina's rerank wrapper")
+    (tmp_path / "projector.safetensors").write_bytes(b"")
+    assert _is_jina_reranker_checkpoint(tmp_path) is True
+
+
+def test_a_qwen_checkpoint_is_not_mistaken_for_jina_reranker(tmp_path):
+    (tmp_path / "config.json").write_text("{}")
+    assert _is_jina_reranker_checkpoint(tmp_path) is False
+
+
+def _jina_embedding_registry(tmp_path, monkeypatch):
+    (tmp_path / "utils.py").write_text("")
+    (tmp_path / "model.py").write_text("")
+    monkeypatch.setattr("mtplx.hf_loader.resolve_model_path", lambda ref, cache_dir=None: tmp_path)
+    registry = RetrievalRegistry()
+    spec = RetrievalSpec("jina-embed", "org/jina-embed", "embedding")
+    registry.register(spec)
+    return registry, spec
+
+
+def _jina_reranker_registry(tmp_path, monkeypatch):
+    (tmp_path / "rerank.py").write_text("")
+    (tmp_path / "projector.safetensors").write_bytes(b"")
+    monkeypatch.setattr("mtplx.hf_loader.resolve_model_path", lambda ref, cache_dir=None: tmp_path)
+    registry = RetrievalRegistry()
+    spec = RetrievalSpec("jina-rerank", "org/jina-rerank", "rerank")
+    registry.register(spec)
+    return registry, spec
+
+
+def test_a_jina_embedding_checkpoint_gets_the_jina_backend(tmp_path, monkeypatch):
+    registry, spec = _jina_embedding_registry(tmp_path, monkeypatch)
+    with registry._acquire(spec) as backend:
+        assert isinstance(backend, _JinaEmbedBackend)
+
+
+def test_a_jina_reranker_checkpoint_gets_the_jina_backend(tmp_path, monkeypatch):
+    registry, spec = _jina_reranker_registry(tmp_path, monkeypatch)
+    with registry._acquire(spec) as backend:
+        assert isinstance(backend, _JinaRerankBackend)
+
+
+def test_embed_dispatches_to_the_jina_backend_without_touching_the_qwen_path(tmp_path, monkeypatch):
+    """A jina backend has no tokenizer or pad_id, so embed() must not call them."""
+    registry, _spec = _jina_embedding_registry(tmp_path, monkeypatch)
+    monkeypatch.setattr(_JinaEmbedBackend, "ensure_loaded", lambda self: None)
+    monkeypatch.setattr(
+        _JinaEmbedBackend,
+        "embed",
+        lambda self, texts, *, instruction: ([[0.5, 0.5] for _ in texts], 3),
+    )
+
+    vectors, spec, tokens = registry.embed(["evas multiple sklerose"])
+
+    assert vectors == [[0.5, 0.5]]
+    assert tokens == 3
+    assert spec.served_id == "jina-embed"
+
+
+def test_embed_passes_the_instruction_through_to_the_jina_backend(tmp_path, monkeypatch):
+    registry, _spec = _jina_embedding_registry(tmp_path, monkeypatch)
+    monkeypatch.setattr(_JinaEmbedBackend, "ensure_loaded", lambda self: None)
+    seen = {}
+
+    def fake_embed(self, texts, *, instruction):
+        seen["instruction"] = instruction
+        return [[0.0] for _ in texts], 0
+
+    monkeypatch.setattr(_JinaEmbedBackend, "embed", fake_embed)
+
+    registry.embed(["query text"], instruction="retrieve the answering memory")
+
+    assert seen["instruction"] == "retrieve the answering memory"
+
+
+def test_rerank_dispatches_to_the_jina_backend_without_touching_the_qwen_path(tmp_path, monkeypatch):
+    """A jina reranker has no yes/no logits, so rerank() must not look for them."""
+    registry, _spec = _jina_reranker_registry(tmp_path, monkeypatch)
+    monkeypatch.setattr(_JinaRerankBackend, "ensure_loaded", lambda self: None)
+    monkeypatch.setattr(
+        _JinaRerankBackend,
+        "score",
+        lambda self, query, documents, *, instruction: ([0.1, 0.9], 5),
+    )
+
+    scores, spec, tokens = registry.rerank("query", ["doc-a", "doc-b"])
+
+    assert scores == [0.1, 0.9]
+    assert tokens == 5
+    assert spec.served_id == "jina-rerank"
 
 
 # ---- batch planning -------------------------------------------------------

@@ -229,6 +229,184 @@ def _plan_batches(lengths: list[int], max_rows: int) -> list[list[int]]:
     return batches
 
 
+def _load_sibling_module(directory: Path, filename: str, name: str) -> Any:
+    """Import a module that ships beside a checkpoint, without touching sys.path.
+
+    jina distributes its MLX inference code inside the model repository rather
+    than as an installable package. Loading it by file location keeps it out
+    of the global module namespace, so two checkpoints that both ship a
+    ``model.py`` cannot shadow each other.
+    """
+    import importlib.util
+
+    path = Path(directory) / filename
+    if not path.is_file():
+        raise FileNotFoundError(f"{filename} not found in {directory}")
+    spec = importlib.util.spec_from_file_location(name, str(path))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _is_jina_embedding_checkpoint(path: Path) -> bool:
+    """jina-embeddings-v5 ships its own model.py/utils.py; mlx_lm cannot load it."""
+    return (path / "utils.py").is_file() and (path / "model.py").is_file()
+
+
+def _is_jina_reranker_checkpoint(path: Path) -> bool:
+    """jina-reranker-v3.5 scores through a projector head, not yes/no logits."""
+    return (path / "rerank.py").is_file() and (path / "projector.safetensors").is_file()
+
+
+class _JinaEmbedBackend:
+    """jina-embeddings-v5 backend using the model's own asymmetric task types.
+
+    Qwen3-Embedding expresses the query/passage asymmetry through an
+    instruction prefix; jina expresses it by swapping a LoRA adapter. The
+    ``embed`` signature matches that of the Qwen3 path — an instruction means
+    "this is a question" — so ``RetrievalRegistry`` does not need to know
+    which model answered.
+    """
+
+    def __init__(self, model_ref: str, path: Path) -> None:
+        self.model_ref = model_ref
+        self.path = path
+        self.lock = threading.RLock()
+        self.load_seconds = 0.0
+        self.weight_bytes = 0
+        self.last_used_s = time.time()
+        self.users = 0
+        self._model: Any = None
+
+    @property
+    def loaded(self) -> bool:
+        return self._model is not None
+
+    def ensure_loaded(self) -> Any:
+        with self.lock:
+            if self._model is None:
+                started = time.time()
+                utils = _load_sibling_module(self.path, "utils.py", "jina_v5_utils")
+                model = utils.load_model(str(self.path))
+                model.switch_task("retrieval")
+                self._model = model
+                self.load_seconds = time.time() - started
+                self.weight_bytes = _weight_bytes(self.path)
+            return self._model
+
+    def unload(self) -> None:
+        with self.lock:
+            self._model = None
+        try:
+            import mlx.core as mx
+
+            mx.clear_cache()
+        except Exception:
+            pass
+
+    def embed(self, texts: list[str], *, instruction: str | None) -> tuple[list[list[float]], int]:
+        """Embed texts in input order, returning vectors and the true token count."""
+        import mlx.core as mx
+
+        model = self.ensure_loaded()
+        task_type = "retrieval.query" if instruction else "retrieval.passage"
+        tokens = sum(len(model.tokenizer.encode(text, add_special_tokens=False).ids) for text in texts)
+        vectors: list[list[float]] = []
+        with self.lock:
+            encoded = model.encode(texts, task_type=task_type)
+            stacked = encoded if isinstance(encoded, mx.array) else mx.stack(list(encoded))
+            pooled = stacked.astype(mx.float32)
+            normalised = pooled / mx.linalg.norm(pooled, axis=-1, keepdims=True)
+            mx.eval(normalised)
+            vectors = normalised.tolist()
+            del encoded, stacked, pooled, normalised
+            mx.clear_cache()
+        return vectors, tokens
+
+
+class _JinaRerankBackend:
+    """jina-reranker-v3.5 backend, scoring a whole candidate list in one pass.
+
+    Qwen3-Reranker judges one query/document pair per row, so N candidates
+    cost N sequences. jina is listwise: the query and up to ``block_size``
+    documents share a single forward pass — measured on real recalls, 50
+    candidates took ~1.0 s here against ~18.7 s for the Qwen3 4B.
+    """
+
+    def __init__(self, model_ref: str, path: Path) -> None:
+        self.model_ref = model_ref
+        self.path = path
+        self.lock = threading.RLock()
+        self.load_seconds = 0.0
+        self.weight_bytes = 0
+        self.last_used_s = time.time()
+        self.users = 0
+        self._model: Any = None
+
+    @property
+    def loaded(self) -> bool:
+        return self._model is not None
+
+    def ensure_loaded(self) -> Any:
+        with self.lock:
+            if self._model is None:
+                import sys
+
+                started = time.time()
+                # rerank.py does `import modeling`, a bare name that only
+                # resolves if the checkpoint directory is importable.
+                # Registering the module under that name first satisfies it
+                # without putting the directory on sys.path, where it would
+                # shadow anything else named `modeling`.
+                modeling = _load_sibling_module(self.path, "modeling.py", "modeling")
+                previous = sys.modules.get("modeling")
+                sys.modules["modeling"] = modeling
+                try:
+                    rerank_module = _load_sibling_module(
+                        self.path, "rerank.py", "jina_v35_rerank"
+                    )
+                finally:
+                    if previous is None:
+                        sys.modules.pop("modeling", None)
+                    else:
+                        sys.modules["modeling"] = previous
+                self._model = rerank_module.MLXReranker(str(self.path))
+                self.load_seconds = time.time() - started
+                self.weight_bytes = _weight_bytes(self.path)
+            return self._model
+
+    def unload(self) -> None:
+        with self.lock:
+            self._model = None
+        try:
+            import mlx.core as mx
+
+            mx.clear_cache()
+        except Exception:
+            pass
+
+    def score(self, query: str, documents: list[str], *, instruction: str) -> tuple[list[float], int]:
+        """Return a relevance probability per document, in input order, plus token count.
+
+        ``instruction`` is accepted for interface parity and ignored: jina
+        encodes the ranking task in its projector head rather than in a prompt.
+        """
+        model = self.ensure_loaded()
+        tokens = len(model.tokenizer.encode(query, add_special_tokens=False).ids)
+        tokens += sum(
+            len(model.tokenizer.encode(document, add_special_tokens=False).ids)
+            for document in documents
+        )
+        scores = [0.0] * len(documents)
+        with self.lock:
+            results = model.rerank(query, documents)
+        for entry in results:
+            scores[int(entry["index"])] = float(entry["relevance_score"])
+        return scores, tokens
+
+
 class _Backend:
     """One set of weights, loaded lazily and shared across served ids."""
 
@@ -433,7 +611,16 @@ class RetrievalRegistry:
         with self._lock:
             backend = self._backends.get(key)
             if backend is None:
-                backend = _Backend(spec.model_ref, Path(key))
+                # Which loader a checkpoint needs is read from the checkpoint
+                # itself, so pointing a spec at a jina repository is all that
+                # is required — no separate flag or served-id convention.
+                path = Path(key)
+                if spec.role == "embedding" and _is_jina_embedding_checkpoint(path):
+                    backend = _JinaEmbedBackend(spec.model_ref, path)
+                elif spec.role == "rerank" and _is_jina_reranker_checkpoint(path):
+                    backend = _JinaRerankBackend(spec.model_ref, path)
+                else:
+                    backend = _Backend(spec.model_ref, path)
                 self._backends[key] = backend
             backend.users += 1
             self._resident[key] = None
@@ -531,8 +718,23 @@ class RetrievalRegistry:
         if not texts:
             return [], spec, 0
         stats = self._stats_for(spec)
+        started = time.time()
         try:
             with self._acquire(spec) as backend:
+                if isinstance(backend, _JinaEmbedBackend):
+                    # jina expresses the query/passage asymmetry through an
+                    # adapter switch rather than a prompt, so it skips the
+                    # tokenize/pad/pool path entirely — that path assumes a
+                    # tokenizer object and yes/no-style logits that jina does
+                    # not expose.
+                    backend.ensure_loaded()
+                    started = time.time()  # after load, same accounting as the Qwen path
+                    effective_instruction = (
+                        instruction if instruction is not None else spec.instruction
+                    )
+                    vectors, tokens = backend.embed(texts, instruction=effective_instruction)
+                    stats.record(items=len(texts), tokens=tokens, seconds=time.time() - started)
+                    return vectors, spec, tokens
                 model_obj, tokenizer = backend.ensure_loaded()
                 effective_instruction = instruction if instruction is not None else spec.instruction
                 prepared = [
@@ -614,6 +816,20 @@ class RetrievalRegistry:
         stats = self._stats_for(spec)
         try:
             with self._acquire(spec) as backend:
+                if isinstance(backend, _JinaRerankBackend):
+                    # jina scores the whole candidate list in one listwise
+                    # pass through a projector head, so it has no yes/no
+                    # logits to read and skips the tokenize/pad loop entirely.
+                    backend.ensure_loaded()
+                    started = time.time()  # after load, same accounting as the Qwen path
+                    effective_instruction = (
+                        instruction or spec.instruction or RERANK_DEFAULT_INSTRUCTION
+                    )
+                    scores, tokens = backend.score(
+                        query, documents, instruction=effective_instruction
+                    )
+                    stats.record(items=len(documents), tokens=tokens, seconds=time.time() - started)
+                    return scores, spec, tokens
                 model_obj, tokenizer = backend.ensure_loaded()
                 effective_instruction = (
                     instruction or spec.instruction or RERANK_DEFAULT_INSTRUCTION
