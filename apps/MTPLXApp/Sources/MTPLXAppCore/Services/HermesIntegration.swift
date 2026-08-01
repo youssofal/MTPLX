@@ -422,6 +422,9 @@ public struct HermesIntegration: Sendable {
             : Self.localAPIKey
         var processEnvironment = launchEnvironment(configuration: configuration)
         processEnvironment.removeValue(forKey: "HERMES_HOME")
+        for key in Self.messagingBridgeKeys {
+            processEnvironment.removeValue(forKey: key)
+        }
         processEnvironment["CUSTOM_BASE_URL"] = baseURL
         processEnvironment["OPENAI_BASE_URL"] = baseURL
         processEnvironment["OPENAI_API_KEY"] = apiKey
@@ -952,7 +955,8 @@ public struct HermesIntegration: Sendable {
             return nil
         }
         let document = parseTopLevelBlocks(configText)
-        guard let modelBlock = document.blocks.first(where: { $0.keyName == "model" }) else {
+        let modelBlocks = document.blocks.filter { $0.keyName == "model" }
+        guard modelBlocks.count == 1, let modelBlock = modelBlocks.first else {
             return nil
         }
         var values: [String: String] = [:]
@@ -974,8 +978,10 @@ public struct HermesIntegration: Sendable {
 
         let envURL = profileURL.appendingPathComponent(".env")
         let envText = try? String(contentsOf: envURL, encoding: .utf8)
+        let customBaseURLs = envText.map { dotenvValues("CUSTOM_BASE_URL", in: $0) } ?? []
+        guard customBaseURLs.count <= 1 else { return nil }
         let baseURL = values["base_url"]
-            ?? envText.flatMap { dotenvValue("CUSTOM_BASE_URL", in: $0) }
+            ?? customBaseURLs.first
         guard let baseURL, !baseURL.isEmpty else { return nil }
         return HermesEffectiveProfileConfiguration(
             provider: provider,
@@ -997,6 +1003,27 @@ public struct HermesIntegration: Sendable {
         }
         guard !value.isEmpty, !value.hasPrefix("["), !value.hasPrefix("{") else { return nil }
         return value
+    }
+
+    private static func dotenvValues(_ key: String, in text: String) -> [String] {
+        text.split(whereSeparator: \.isNewline).compactMap { rawLine in
+            var line = String(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty, !line.hasPrefix("#") else { return nil }
+            if line.hasPrefix("export ") {
+                line = String(line.dropFirst("export ".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            guard let equals = line.firstIndex(of: "="), String(line[..<equals]) == key else {
+                return nil
+            }
+            var value = String(line[line.index(after: equals)...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if (value.hasPrefix("\"") && value.hasSuffix("\""))
+                || (value.hasPrefix("'") && value.hasSuffix("'")) {
+                value = String(value.dropFirst().dropLast())
+            }
+            return value
+        }
     }
 
     private static func isValidEmbeddedLaunchID(_ value: String) -> Bool {

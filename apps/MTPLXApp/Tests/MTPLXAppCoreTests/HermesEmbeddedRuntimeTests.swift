@@ -70,6 +70,50 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
         XCTAssertFalse(spec.arguments.contains("-p"))
     }
 
+    func testEmbeddedLaunchDoesNotInheritRootMessagingCredentials() throws {
+        try """
+        TELEGRAM_BOT_TOKEN=root-telegram-token
+        TELEGRAM_ALLOWED_USERS=123456
+        DISCORD_BOT_TOKEN=root-discord-token
+        SLACK_BOT_TOKEN=root-slack-token
+        SIGNAL_ACCOUNT=root-signal-account
+        """.write(
+            to: hermesHome.appendingPathComponent(".env"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let credentialedIntegration = HermesIntegration(
+            hermesHome: hermesHome,
+            executablePath: "/usr/bin/true",
+            environment: [
+                "HOME": root.path,
+                "PATH": "/usr/bin:/bin",
+                "HERMES_HOME": "/inherited/hermes-home",
+                "TELEGRAM_BOT_TOKEN": "root-telegram-token",
+                "TELEGRAM_ALLOWED_USERS": "123456",
+                "DISCORD_BOT_TOKEN": "root-discord-token",
+                "SLACK_BOT_TOKEN": "root-slack-token",
+                "SIGNAL_ACCOUNT": "root-signal-account",
+            ]
+        )
+
+        let spec = try credentialedIntegration.serveLaunchSpec(
+            profile: HermesProfile(name: "default", path: hermesHome.path, isDefault: true),
+            configuration: configuration,
+            token: "test-session-token",
+            launchID: "fedcba9876543210",
+            parentPID: 4242
+        )
+
+        for key in [
+            "TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_USERS", "DISCORD_BOT_TOKEN",
+            "SLACK_BOT_TOKEN", "SIGNAL_ACCOUNT",
+        ] {
+            XCTAssertNil(spec.environment[key], "Embedded child must not receive \(key)")
+        }
+    }
+
     func testServeLaunchSpecRejectsNonHexOrWrongLengthLaunchID() {
         XCTAssertThrowsError(
             try integration.serveLaunchSpec(
@@ -109,10 +153,39 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
         }
     }
 
-    private func makeProfile(named name: String, config: String) throws -> URL {
+    func testProfileRoutingRejectsDuplicateModelBlocksAndRoutingKeys() throws {
+        let duplicateModel = HermesProfile(
+            name: "duplicate-model",
+            path: try makeProfile(
+                named: "duplicate-model",
+                config: mtplxConfig() + "\n" + mtplxConfig()
+            ).path,
+            isDefault: false
+        )
+        let duplicateBaseURL = HermesProfile(
+            name: "duplicate-base-url",
+            path: try makeProfile(
+                named: "duplicate-base-url",
+                config: "model:\n  default: current-model\n  provider: custom\n",
+                env: "CUSTOM_BASE_URL=http://127.0.0.1:18080/v1\nCUSTOM_BASE_URL=http://127.0.0.1:18080/v1\n"
+            ).path,
+            isDefault: false
+        )
+
+        for profile in [duplicateModel, duplicateBaseURL] {
+            guard case .unavailable = integration.routingState(for: profile, configuration: configuration) else {
+                return XCTFail("Duplicate routing configuration must fail closed")
+            }
+        }
+    }
+
+    private func makeProfile(named name: String, config: String, env: String? = nil) throws -> URL {
         let profile = hermesHome.appendingPathComponent("profiles/\(name)", isDirectory: true)
         try FileManager.default.createDirectory(at: profile, withIntermediateDirectories: true)
         try config.write(to: profile.appendingPathComponent("config.yaml"), atomically: true, encoding: .utf8)
+        if let env {
+            try env.write(to: profile.appendingPathComponent(".env"), atomically: true, encoding: .utf8)
+        }
         return profile
     }
 
