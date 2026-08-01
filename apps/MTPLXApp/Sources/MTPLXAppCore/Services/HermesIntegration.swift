@@ -396,6 +396,83 @@ public struct HermesIntegration: Sendable {
         return env
     }
 
+    /// Builds the environment and argument vector for a dashboard server that
+    /// belongs only to this app process. It does not launch the process.
+    public func serveLaunchSpec(
+        profile: HermesProfile,
+        configuration: MTPLXAppConfiguration,
+        token: String,
+        launchID: String,
+        parentPID: Int32
+    ) throws -> HermesServeLaunchSpec {
+        guard Self.isValidEmbeddedLaunchID(launchID) else {
+            throw HermesIntegrationError.launchFailed("invalid embedded launch identifier")
+        }
+        guard let executableURL = resolveExecutable() else {
+            throw HermesIntegrationError.executableNotFound
+        }
+
+        let modelID = OpenCodeIntegration.modelID(for: configuration.model)
+        let baseURL = OpenCodeIntegration.baseURLString(
+            host: configuration.host,
+            port: configuration.port
+        )
+        let apiKey = configuration.apiKey?.isEmpty == false
+            ? configuration.apiKey!
+            : Self.localAPIKey
+        var processEnvironment = launchEnvironment(configuration: configuration)
+        processEnvironment.removeValue(forKey: "HERMES_HOME")
+        processEnvironment["CUSTOM_BASE_URL"] = baseURL
+        processEnvironment["OPENAI_BASE_URL"] = baseURL
+        processEnvironment["OPENAI_API_KEY"] = apiKey
+        processEnvironment["HERMES_MODEL"] = modelID
+        processEnvironment["HERMES_INFERENCE_MODEL"] = modelID
+        processEnvironment["HERMES_INFERENCE_PROVIDER"] = "custom"
+        processEnvironment["HERMES_DASHBOARD_SESSION_TOKEN"] = token
+        processEnvironment["HERMES_SESSION_PLATFORM"] = "mtplx-app"
+        processEnvironment["MTPLX_HERMES_LAUNCH_ID"] = launchID
+        processEnvironment["MTPLX_HERMES_PARENT_PID"] = String(parentPID)
+
+        var arguments: [String] = []
+        if !profile.isDefault {
+            arguments += ["-p", profile.name]
+        }
+        arguments += [
+            "serve", "--isolated", "--host", "127.0.0.1",
+            "--port", "0", "--ssh-owner-nonce", launchID,
+        ]
+        return HermesServeLaunchSpec(
+            executableURL: executableURL,
+            arguments: arguments,
+            environment: processEnvironment,
+            token: token,
+            launchID: launchID,
+            parentPID: parentPID
+        )
+    }
+
+    /// Routes profiles without writing to them. An unavailable profile is
+    /// intentionally kept distinct from a readable, user-managed profile.
+    public func routingState(
+        for profile: HermesProfile,
+        configuration: MTPLXAppConfiguration
+    ) -> HermesProfileRoutingState {
+        guard let effective = Self.effectiveProfileConfiguration(at: URL(fileURLWithPath: profile.path)) else {
+            return .unavailable("Profile configuration is unavailable.")
+        }
+        let expectedBaseURL = OpenCodeIntegration.baseURLString(
+            host: configuration.host,
+            port: configuration.port
+        )
+        let expectedModelID = OpenCodeIntegration.modelID(for: configuration.model)
+        if effective.provider == "custom"
+            && effective.baseURL == expectedBaseURL
+            && effective.modelReference == expectedModelID {
+            return .mtplx
+        }
+        return .external
+    }
+
     @discardableResult
     public func sync(configuration: MTPLXAppConfiguration) throws -> HermesConfigResult {
         let modelID = OpenCodeIntegration.modelID(for: configuration.model)
@@ -855,6 +932,75 @@ public struct HermesIntegration: Sendable {
             index += 1
         }
         return candidate
+    }
+
+    private struct HermesEffectiveProfileConfiguration {
+        let provider: String
+        let baseURL: String
+        let modelReference: String
+    }
+
+    /// Reads only the routing fields from a profile. This deliberately does
+    /// not try to repair malformed user configuration: callers need a stable
+    /// unavailable state instead of silently treating a broken profile as an
+    /// external one.
+    private static func effectiveProfileConfiguration(
+        at profileURL: URL
+    ) -> HermesEffectiveProfileConfiguration? {
+        let configURL = profileURL.appendingPathComponent("config.yaml")
+        guard let configText = try? String(contentsOf: configURL, encoding: .utf8) else {
+            return nil
+        }
+        let document = parseTopLevelBlocks(configText)
+        guard let modelBlock = document.blocks.first(where: { $0.keyName == "model" }) else {
+            return nil
+        }
+        var values: [String: String] = [:]
+        for child in directChildBlocks(of: modelBlock) {
+            guard
+                values[child.key] == nil,
+                let value = yamlScalarValue(in: child.lines.first ?? "")
+            else {
+                return nil
+            }
+            values[child.key] = value
+        }
+        guard
+            let provider = values["provider"], !provider.isEmpty,
+            let modelReference = values["default"], !modelReference.isEmpty
+        else {
+            return nil
+        }
+
+        let envURL = profileURL.appendingPathComponent(".env")
+        let envText = try? String(contentsOf: envURL, encoding: .utf8)
+        let baseURL = values["base_url"]
+            ?? envText.flatMap { dotenvValue("CUSTOM_BASE_URL", in: $0) }
+        guard let baseURL, !baseURL.isEmpty else { return nil }
+        return HermesEffectiveProfileConfiguration(
+            provider: provider,
+            baseURL: baseURL,
+            modelReference: modelReference
+        )
+    }
+
+    private static func yamlScalarValue(in line: String) -> String? {
+        guard let colon = line.firstIndex(of: ":") else { return nil }
+        var value = String(line[line.index(after: colon)...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+        if value.hasPrefix("\"") || value.hasPrefix("'") {
+            guard value.count >= 2, value.first == value.last else { return nil }
+            value = String(value.dropFirst().dropLast())
+        } else if let commentStart = value.firstIndex(of: "#") {
+            value = String(value[..<commentStart]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard !value.isEmpty, !value.hasPrefix("["), !value.hasPrefix("{") else { return nil }
+        return value
+    }
+
+    private static func isValidEmbeddedLaunchID(_ value: String) -> Bool {
+        value.range(of: "^[0-9a-f]{16}$", options: .regularExpression) != nil
     }
 
     private static func configYAML(
