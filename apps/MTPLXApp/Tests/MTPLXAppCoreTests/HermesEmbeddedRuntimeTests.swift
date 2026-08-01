@@ -81,8 +81,8 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
         try FileManager.default.createDirectory(at: registry.deletingLastPathComponent(), withIntermediateDirectories: true)
         try """
         {"entries":[
-          {"session_id":"ours","surface":"mtplx-app","pid":7001,"start_time":10},
-          {"session_id":"telegram","surface":"telegram","pid":7002,"start_time":20}
+          {"lease_id":"lease-ours","session_id":"ours","surface":"mtplx-app","pid":7001,"process_start_time":10.0,"started_at":100.0},
+          {"lease_id":"lease-telegram","session_id":"telegram","surface":"telegram","pid":7002,"process_start_time":20.0,"started_at":200.0}
         ]}
         """.write(to: registry, atomically: true, encoding: .utf8)
 
@@ -101,6 +101,22 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
         XCTAssertEqual(inspector.ownership(registryURL: registry, sessionID: "idle", ownedSidecarPID: 7001), .ready)
     }
 
+    func testActiveSessionRegistryRejectsLegacyStartTimeSchema() throws {
+        let registry = root.appendingPathComponent("active_sessions.json")
+        try """
+        {"entries":[
+          {"session_id":"saved","surface":"telegram","pid":7001,"start_time":10.0}
+        ]}
+        """.write(to: registry, atomically: true, encoding: .utf8)
+
+        let inspector = HermesActiveSessionRegistryInspector(processIdentity: { _ in .live(startedAt: 10) })
+
+        XCTAssertEqual(
+            inspector.ownership(registryURL: registry, sessionID: "saved", ownedSidecarPID: nil),
+            .unknown("Session activity could not be inspected.")
+        )
+    }
+
     func testActiveSessionRegistryFailsClosedForMalformedOrUninspectableEntries() throws {
         let registry = root.appendingPathComponent("active_sessions.json")
         try "{not json".write(to: registry, atomically: true, encoding: .utf8)
@@ -113,8 +129,7 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
         XCTAssertEqual(
             HermesActiveSessionRegistryInspector(
                 processIdentity: { _ in .unknown },
-                readData: { _ in throw CocoaError(.fileReadNoPermission) },
-                fileExists: { _ in true }
+                readData: { _ in throw CocoaError(.fileReadNoPermission) }
             ).ownership(registryURL: registry, sessionID: "saved", ownedSidecarPID: nil),
             .unknown("Session activity could not be inspected.")
         )
@@ -124,8 +139,8 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
         let registry = root.appendingPathComponent("active_sessions.json")
         try """
         {"entries":[
-          {"session_id":"dead","surface":"telegram","pid":7001,"start_time":10},
-          {"session_id":"reused","surface":"telegram","pid":7002,"start_time":10}
+          {"lease_id":"lease-dead","session_id":"dead","surface":"telegram","pid":7001,"process_start_time":10.0,"started_at":100.0},
+          {"lease_id":"lease-reused","session_id":"reused","surface":"telegram","pid":7002,"process_start_time":10.0,"started_at":100.0}
         ]}
         """.write(to: registry, atomically: true, encoding: .utf8)
         let inspector = HermesActiveSessionRegistryInspector(
@@ -134,6 +149,61 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
 
         XCTAssertEqual(inspector.ownership(registryURL: registry, sessionID: "dead", ownedSidecarPID: nil), .ready)
         XCTAssertEqual(inspector.ownership(registryURL: registry, sessionID: "reused", ownedSidecarPID: nil), .ready)
+    }
+
+    func testActiveSessionRegistryRequiresNativeStartTimePrecisionAndOneLiveEntry() throws {
+        let registry = root.appendingPathComponent("active_sessions.json")
+        try """
+        {"entries":[
+          {"lease_id":"lease-close","session_id":"close","surface":"telegram","pid":7001,"process_start_time":10.0,"started_at":100.0},
+          {"lease_id":"lease-edge","session_id":"edge","surface":"telegram","pid":7002,"process_start_time":20.0,"started_at":100.0},
+          {"lease_id":"lease-first","session_id":"conflict","surface":"telegram","pid":7003,"process_start_time":30.0,"started_at":100.0},
+          {"lease_id":"lease-second","session_id":"conflict","surface":"desktop","pid":7004,"process_start_time":40.0,"started_at":100.0}
+        ]}
+        """.write(to: registry, atomically: true, encoding: .utf8)
+        let inspector = HermesActiveSessionRegistryInspector(
+            processIdentity: { pid in
+                switch pid {
+                case 7001: return .live(startedAt: 10.0009)
+                case 7002: return .live(startedAt: 20.001)
+                case 7003: return .live(startedAt: 30)
+                case 7004: return .live(startedAt: 40)
+                default: return .dead
+                }
+            }
+        )
+
+        XCTAssertEqual(inspector.ownership(registryURL: registry, sessionID: "close", ownedSidecarPID: nil), .external(surface: "telegram"))
+        XCTAssertEqual(inspector.ownership(registryURL: registry, sessionID: "edge", ownedSidecarPID: nil), .ready)
+        XCTAssertEqual(
+            inspector.ownership(registryURL: registry, sessionID: "conflict", ownedSidecarPID: nil),
+            .unknown("Session activity could not be inspected.")
+        )
+    }
+
+    func testActiveSessionRegistryTreatsOnlyVerifiedNotFoundAsReady() throws {
+        let registry = root.appendingPathComponent("active_sessions.json")
+        let notFound = HermesActiveSessionRegistryInspector(
+            processIdentity: { _ in .unknown },
+            readData: { _ in throw CocoaError(.fileNoSuchFile) }
+        )
+        let unreadable = HermesActiveSessionRegistryInspector(
+            processIdentity: { _ in .unknown },
+            readData: { _ in throw CocoaError(.fileReadNoPermission) }
+        )
+
+        XCTAssertEqual(notFound.ownership(registryURL: registry, sessionID: "saved", ownedSidecarPID: nil), .ready)
+        XCTAssertEqual(
+            unreadable.ownership(registryURL: registry, sessionID: "saved", ownedSidecarPID: nil),
+            .unknown("Session activity could not be inspected.")
+        )
+
+        try FileManager.default.createDirectory(at: registry, withIntermediateDirectories: true)
+        XCTAssertEqual(
+            HermesActiveSessionRegistryInspector(processIdentity: { _ in .unknown })
+                .ownership(registryURL: registry, sessionID: "saved", ownedSidecarPID: nil),
+            .unknown("Session activity could not be inspected.")
+        )
     }
 
     func testIntegrationTreatsMissingProfileRegistryAsReady() throws {

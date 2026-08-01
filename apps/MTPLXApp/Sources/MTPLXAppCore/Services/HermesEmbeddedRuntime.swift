@@ -330,16 +330,13 @@ public struct HermesActiveSessionRegistryInspector: @unchecked Sendable {
 
     private let processIdentity: ProcessIdentity
     private let readData: @Sendable (URL) throws -> Data
-    private let fileExists: @Sendable (URL) -> Bool
 
     public init(
         processIdentity: @escaping ProcessIdentity = HermesActiveSessionRegistryInspector.liveProcessIdentity,
-        readData: @escaping @Sendable (URL) throws -> Data = { try Data(contentsOf: $0) },
-        fileExists: @escaping @Sendable (URL) -> Bool = { FileManager.default.fileExists(atPath: $0.path) }
+        readData: @escaping @Sendable (URL) throws -> Data = { try Data(contentsOf: $0) }
     ) {
         self.processIdentity = processIdentity
         self.readData = readData
-        self.fileExists = fileExists
     }
 
     public func ownership(
@@ -350,11 +347,17 @@ public struct HermesActiveSessionRegistryInspector: @unchecked Sendable {
         guard !sessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return .unknown(Self.inspectionUnavailableReason)
         }
-        guard fileExists(registryURL) else { return .ready }
+        let data: Data
+        do {
+            data = try readData(registryURL)
+        } catch {
+            if Self.isNotFound(error) { return .ready }
+            return .unknown(Self.inspectionUnavailableReason)
+        }
 
         let entries: [Entry]
         do {
-            entries = try JSONDecoder().decode(Registry.self, from: readData(registryURL)).entries
+            entries = try JSONDecoder().decode(Registry.self, from: data).entries
         } catch {
             return .unknown(Self.inspectionUnavailableReason)
         }
@@ -372,7 +375,7 @@ public struct HermesActiveSessionRegistryInspector: @unchecked Sendable {
             case .live(let processStart):
                 // A live PID without the recorded start identity is a reused
                 // PID, not an active Hermes writer for this session.
-                guard abs(processStart - entry.startedAt) < 1 else { continue }
+                guard abs(processStart - entry.startedAt) < 0.001 else { continue }
                 liveEntries.append(entry)
             }
         }
@@ -388,6 +391,14 @@ public struct HermesActiveSessionRegistryInspector: @unchecked Sendable {
     }
 
     private static let inspectionUnavailableReason = "Session activity could not be inspected."
+
+    private static func isNotFound(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        return (nsError.domain == NSCocoaErrorDomain
+            && (nsError.code == CocoaError.Code.fileNoSuchFile.rawValue
+                || nsError.code == CocoaError.Code.fileReadNoSuchFile.rawValue))
+            || (nsError.domain == NSPOSIXErrorDomain && nsError.code == ENOENT)
+    }
 
     private static func sanitizedSurface(_ surface: String) -> String {
         let trimmed = surface.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -413,7 +424,7 @@ public struct HermesActiveSessionRegistryInspector: @unchecked Sendable {
             case sessionID = "session_id"
             case surface
             case pid
-            case startedAt = "start_time"
+            case startedAt = "process_start_time"
         }
 
         init(from decoder: Decoder) throws {
