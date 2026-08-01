@@ -714,7 +714,7 @@ public final class HermesAgentStore: ObservableObject {
         if reconnectingBlockedApprovalPipeline {
             // The failed transport was already torn down; only a completed
             // fresh sidecar/client handshake may reopen approval handling.
-            if pendingRequest?.kind == .approval { pendingRequest = nil }
+            pendingRequest = nil
             clearAutoApprovalLifecycle()
         }
         gatewayReady = true
@@ -764,8 +764,49 @@ public final class HermesAgentStore: ObservableObject {
         client expectedClient: any HermesGatewayClientProtocol,
         sidecar expectedSidecar: any HermesSidecarControlling
     ) -> Bool {
-        guard gatewayGeneration == generation,
-              let client,
+        guard ownsGateway(generation: generation, client: expectedClient, sidecar: expectedSidecar) else { return false }
+        if shouldRetainApprovalRecovery(for: expectedClient) {
+            retainBlockedApprovalRecovery()
+        } else {
+            disposePendingRequestLifecycle()
+        }
+        return releaseOwnedTransport(client: expectedClient, sidecar: expectedSidecar)
+    }
+
+    private func ownsGateway(
+        generation: Int,
+        client expectedClient: any HermesGatewayClientProtocol,
+        sidecar expectedSidecar: any HermesSidecarControlling
+    ) -> Bool {
+        gatewayGeneration == generation
+            && client.map { ObjectIdentifier($0) == ObjectIdentifier(expectedClient) } ?? false
+            && sidecar.map { ObjectIdentifier($0) == ObjectIdentifier(expectedSidecar) } ?? false
+    }
+
+    /// A URLSession transport first resumes outstanding RPC continuations and
+    /// then calls `onDisconnect` on this actor. Preserve the approval head here
+    /// because the resumed task cannot safely recover after transport release.
+    private func shouldRetainApprovalRecovery(for expectedClient: any HermesGatewayClientProtocol) -> Bool {
+        guard let client, ObjectIdentifier(client) == ObjectIdentifier(expectedClient) else { return false }
+        if approvalPipelineBlocked { return true }
+        guard let lease = pendingResponseLease,
+              lease.kind == .approval,
+              lease.operation.generation == gatewayGeneration,
+              lease.operation.clientIdentity == ObjectIdentifier(expectedClient)
+        else { return false }
+        return inboxHeadMatches(
+            id: lease.id,
+            kind: .approval,
+            operation: lease.operation,
+            sessionID: lease.sessionID
+        )
+    }
+
+    private func releaseOwnedTransport(
+        client expectedClient: any HermesGatewayClientProtocol,
+        sidecar expectedSidecar: any HermesSidecarControlling
+    ) -> Bool {
+        guard let client,
               ObjectIdentifier(client) == ObjectIdentifier(expectedClient),
               let sidecar,
               ObjectIdentifier(sidecar) == ObjectIdentifier(expectedSidecar)
@@ -776,12 +817,15 @@ public final class HermesAgentStore: ObservableObject {
         sidecarConfigurationSignature = nil
         gatewayReady = false
         endStreaming()
-        pendingRequest = nil
-        pendingResponseLease = nil
-        clearAutoApprovalLifecycle()
         expectedClient.close()
         expectedSidecar.stop()
         return true
+    }
+
+    private func disposePendingRequestLifecycle() {
+        pendingRequest = nil
+        pendingResponseLease = nil
+        clearAutoApprovalLifecycle()
     }
 
     private func tearDownGateway(clearSession: Bool) {
@@ -1174,25 +1218,33 @@ public final class HermesAgentStore: ObservableObject {
 
     private func blockApprovalPipeline(afterAmbiguousResponseFor lease: PendingRequestLease) {
         guard inboxHeadMatches(id: lease.id, kind: .approval, operation: lease.operation, sessionID: lease.sessionID) else { return }
-        pendingRequest = nil
-        if let head = pendingRequestInbox.first { projectInboxHead(head) }
-        approvalPipelineBlocked = true
-        pendingResponseLease = nil
-        messages.append(HermesTranscriptMessage(
-            role: .system,
-            text: "Approval delivery is unknown. Reconnect Hermes before responding again."
-        ))
+        retainBlockedApprovalRecovery()
         forceApprovalTransportReset()
     }
 
     private func blockApprovalPipelineForOverflow() {
         guard !approvalPipelineBlocked else { return }
-        approvalPipelineBlocked = true
-        messages.append(HermesTranscriptMessage(
-            role: .system,
-            text: "Too many approval requests are pending. Reconnect Hermes before responding again."
-        ))
+        retainBlockedApprovalRecovery()
         forceApprovalTransportReset()
+    }
+
+    /// Atomically make the retained FIFO head actionable before releasing a
+    /// transport whose approval delivery is ambiguous (or whose inbox overflowed).
+    private func retainBlockedApprovalRecovery() {
+        let wasBlocked = approvalPipelineBlocked
+        approvalPipelineBlocked = true
+        pendingResponseLease = nil
+        if let head = pendingRequestInbox.first,
+           pendingRequest?.id != head.request.id || pendingRequest?.kind != head.request.kind {
+            pendingRequest = nil
+            projectInboxHead(head)
+        }
+        if !wasBlocked {
+            messages.append(HermesTranscriptMessage(
+                role: .system,
+                text: "Hermes approval recovery is required. Reconnect before responding again."
+            ))
+        }
     }
 
     private func inboxHeadMatches(
@@ -1211,14 +1263,16 @@ public final class HermesAgentStore: ObservableObject {
 
     private func forceApprovalTransportReset() {
         gatewayGeneration += 1
-        gatewayReady = false
-        client?.close()
-        client = nil
-        sidecar?.stop()
-        sidecar = nil
+        let closingClient = client
+        let stoppingSidecar = sidecar
+        self.client = nil
+        self.sidecar = nil
         sidecarProfileName = nil
         sidecarConfigurationSignature = nil
+        gatewayReady = false
         endStreaming()
+        closingClient?.close()
+        stoppingSidecar?.stop()
     }
 
     private func retireAutoApprovalFingerprint(

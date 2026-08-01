@@ -416,6 +416,128 @@ final class HermesAgentStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testTransportTerminationRetainsApprovalHeadBeforeOldResponseFailureRuns() async throws {
+        configuration.hermesAutoApprove = false
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        client.suspendedMethods = ["approval.respond"]
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("A")]))
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("B")]))
+
+        let response = Task { await store.respondToPendingRequest(value: "once") }
+        await waitUntil { client.calls.filter { $0.method == "approval.respond" }.count == 1 }
+        client.terminatePendingCallsThenDisconnect("transport lost")
+
+        XCTAssertTrue(store.approvalPipelineBlocked)
+        XCTAssertEqual(store.pendingRequest?.prompt, "A")
+        XCTAssertEqual(client.calls.filter { $0.method == "approval.respond" }.count, 1)
+        XCTAssertTrue(client.didClose)
+        XCTAssertEqual(runtime.sidecars.first?.stopCount, 1)
+        XCTAssertEqual(store.messages.filter { $0.text.contains("approval recovery") }.count, 1)
+
+        await response.value
+        XCTAssertTrue(store.approvalPipelineBlocked)
+        XCTAssertEqual(store.pendingRequest?.prompt, "A")
+        XCTAssertEqual(client.calls.filter { $0.method == "approval.respond" }.count, 1)
+        XCTAssertEqual(runtime.sidecars.first?.stopCount, 1)
+        XCTAssertEqual(store.messages.filter { $0.text.contains("approval recovery") }.count, 1)
+    }
+
+    @MainActor
+    func testBlockedApprovalSurvivesPreReadyReconnectUntilFreshHandshakeSucceeds() async throws {
+        configuration.hermesAutoApprove = false
+        let runtime = FakeHermesEmbeddedRuntime()
+        let first = FakeHermesGatewayClient(readyImmediately: true)
+        let second = FakeHermesGatewayClient()
+        let third = FakeHermesGatewayClient(readyImmediately: true)
+        first.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        first.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        first.suspendedMethods = ["approval.respond"]
+        second.resultByMethod["session.list"] = .object(["sessions": .array([])])
+        third.resultByMethod["session.list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [first, second, third])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        first.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("A")]))
+        let response = Task { await store.respondToPendingRequest(value: "once") }
+        await waitUntil { first.calls.contains { $0.method == "approval.respond" } }
+        first.terminatePendingCallsThenDisconnect("transport lost")
+        await response.value
+
+        let reconnect = Task { await store.loadSessions(profile: bernd, configuration: configuration) }
+        await waitUntil { second.hasDisconnectHandler }
+        XCTAssertTrue(store.approvalPipelineBlocked)
+        XCTAssertEqual(store.pendingRequest?.prompt, "A")
+
+        second.disconnect("reconnect lost before ready")
+        await reconnect.value
+        XCTAssertTrue(store.approvalPipelineBlocked)
+        XCTAssertEqual(store.pendingRequest?.prompt, "A")
+
+        await store.loadSessions(profile: bernd, configuration: configuration)
+        XCTAssertFalse(store.approvalPipelineBlocked)
+        XCTAssertNil(store.pendingRequest)
+    }
+
+    @MainActor
+    func testAutoApprovalOverflowProjectsSuspendedHeadBeforeExactOnceTeardown() async throws {
+        configuration.hermesAutoApprove = true
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        client.suspendedMethods = ["approval.respond"]
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("A")]))
+        await waitUntil { client.calls.filter { $0.method == "approval.respond" }.count == 1 }
+
+        for index in 1...64 {
+            switch index % 3 {
+            case 0:
+                client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("approval-\(index)")]))
+            case 1:
+                client.emit(.init(type: "clarify.request", sessionID: "live-1", payload: [
+                    "request_id": .string("clarify-\(index)"), "question": .string("Q\(index)?"),
+                ]))
+            default:
+                client.emit(.init(type: "secret.request", sessionID: "live-1", payload: [
+                    "request_id": .string("secret-\(index)"), "prompt": .string("S\(index)?"),
+                ]))
+            }
+        }
+
+        XCTAssertTrue(store.approvalPipelineBlocked)
+        XCTAssertEqual(store.pendingRequest?.prompt, "A")
+        XCTAssertEqual(client.calls.filter { $0.method == "approval.respond" }.count, 1)
+        XCTAssertTrue(client.didClose)
+        XCTAssertEqual(runtime.sidecars.first?.stopCount, 1)
+    }
+
+    @MainActor
+    func testOrdinaryDisconnectStillClearsNonApprovalPendingRequests() async throws {
+        configuration.hermesAutoApprove = false
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        client.emit(.init(type: "clarify.request", sessionID: "live-1", payload: ["request_id": .string("clarify"), "question": .string("Q?")]))
+        client.emit(.init(type: "sudo.request", sessionID: "live-1", payload: ["request_id": .string("sudo"), "prompt": .string("S?")]))
+        client.emit(.init(type: "secret.request", sessionID: "live-1", payload: ["request_id": .string("secret"), "prompt": .string("Secret?")]))
+
+        client.disconnect("transport lost")
+
+        XCTAssertNil(store.pendingRequest)
+        XCTAssertFalse(store.approvalPipelineBlocked)
+        XCTAssertEqual(runtime.sidecars.first?.stopCount, 1)
+    }
+
+    @MainActor
     func testAutoApprovalFailureKeepsUnknownHeadAndRetainsLaterFIFOEntries() async throws {
         configuration.hermesAutoApprove = true
         let runtime = FakeHermesEmbeddedRuntime()
@@ -1473,5 +1595,16 @@ private final class FakeHermesGatewayClient: HermesGatewayClientProtocol {
     func failCall(method: String) {
         let waiters = callWaiters.removeValue(forKey: method) ?? []
         waiters.forEach { $0.resume(throwing: HermesGatewayClientError.disconnected) }
+    }
+
+    /// Matches URLSessionHermesGatewayClient's termination order: fail RPCs,
+    /// then synchronously notify its owner during the same termination turn.
+    func terminatePendingCallsThenDisconnect(_ message: String) {
+        let waiters = callWaiters
+        callWaiters.removeAll()
+        for methodWaiters in waiters.values {
+            methodWaiters.forEach { $0.resume(throwing: HermesGatewayClientError.disconnected) }
+        }
+        onDisconnect?(message)
     }
 }
