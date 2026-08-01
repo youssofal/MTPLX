@@ -1120,8 +1120,28 @@ class CompiledVerifyBank:
         self.speculative_headroom = (
             self.max_verify_len if self.request_max_tokens is not None else 0
         )
+        # The request budget can only TIGHTEN the reserve, never raise it
+        # past the env ceiling. Server requests default max_tokens to the
+        # whole remaining context window (~262k on a 256k model), and
+        # granting that verbatim made every request materialize a
+        # multi-gigabyte KV reserve across all promoted leaves at first
+        # promotion: +17 GB active / 44 GB peak, decode opening at ~13 tok/s
+        # for the first ~150 tokens of every turn, and 8.8x commit cost
+        # (2.4.0 short-turn regression, root-caused 2026-07-31). A bounded
+        # grant restores the growth-demotion contract below: agent-length
+        # rounds run fully compiled, longer generations demote to eager for
+        # the request remainder (measured flat vs eager-only). Explicit
+        # small budgets still reserve exactly budget + one speculative
+        # window; raise MTPLX_COMPILED_VERIFY_GROWTH_RESERVE to widen the
+        # ceiling for known-budget batch runs.
         self.growth_reserve_tokens = (
-            self.request_max_tokens + self.speculative_headroom
+            min(
+                self.request_max_tokens + self.speculative_headroom,
+                max(
+                    _compiled_verify_growth_reserve(),
+                    self.max_verify_len,
+                ),
+            )
             if self.request_max_tokens is not None
             else _compiled_verify_growth_reserve()
         )
@@ -1134,8 +1154,11 @@ class CompiledVerifyBank:
             )
         self.permanent_eager = False
         if not parity and not parity2 and not _compiled_verify_bits_gate_ok(runtime):
-            # Per-model promotion gate: only 4-bit affine trunks measured a
-            # win; q8 (Optimized-Quality) measured -15/-18% and stays eager.
+            # Per-model promotion gate: 4-bit and 8-bit affine trunks engage
+            # (both parity2-validated; q8's early -15/-18% reading predated
+            # the 2.4.0 compiled stack — measured 2026-07-31: q8 304/304
+            # compiled, 0 fallbacks, 41.3 tok/s at league parity). Unmeasured
+            # quantizations (e.g. the 6-bit 9B) stay eager.
             self.permanent_eager = True
         self._capture_accepts_backend = _accepts_capture_backend(runtime)
         self._compiled: dict[tuple[int, str, int], Any] = {}

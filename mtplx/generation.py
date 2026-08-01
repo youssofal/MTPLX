@@ -6890,6 +6890,10 @@ def generate_mtpk(
         # continuation predictiveness and can cost more to verify than they commit,
         # while grounded re-emission matches into the prompt (see the PR benchmarks).
         ccopy_index.sync(prompt_ids)
+    # Cost-model depth policy: cycle wall-time measured by the loop itself
+    # (first observe gets the span since loop entry, later ones the span
+    # since the previous observe) — real cycle cost, not inter-request gaps.
+    _policy_cycle_started = time.perf_counter()
     while len(tokens) < max_tokens:
         repetition_result = _trim_repeated_suffix(tokens, repetition_config)
         if repetition_result is not None:
@@ -8576,9 +8580,17 @@ def generate_mtpk(
 
         event["accepted_depths"] = accepted_count
         if adaptive_policy is not None:
+            _policy_now = time.perf_counter()
+            _policy_kwargs: dict[str, float] = {}
+            if getattr(adaptive_policy, "accepts_cycle_ms", False):
+                _policy_kwargs["cycle_ms"] = (
+                    _policy_now - _policy_cycle_started
+                ) * 1000.0
+            _policy_cycle_started = _policy_now
             event["policy"] = adaptive_policy.observe(
                 attempted_depth=max(1, len(draft_tokens)),
                 accepted_depths=accepted_count,
+                **_policy_kwargs,
             )
 
         if online_hidden_enabled and draft_hidden_for_update:

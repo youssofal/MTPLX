@@ -621,7 +621,7 @@ SCHEDULER_MODE_CHOICES = (
     "mtp_cohort_experimental",
 )
 BATCHING_PRESET_CHOICES = ("solo", "latency", "agent", "throughput")
-ADAPTIVE_POLICY_CHOICES = ("none", "streak", "expected_value")
+ADAPTIVE_POLICY_CHOICES = ("none", "streak", "expected_value", "cost")
 
 
 def _add_batching_args(parser: argparse.ArgumentParser) -> None:

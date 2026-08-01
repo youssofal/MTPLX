@@ -100,6 +100,9 @@ public final class ChatViewModel: ObservableObject {
     @Published public private(set) var streamingPhase: StreamingPhase = .idle
     public let streamingReasoningDocument = StreamingDocumentStore(mode: .plainLines)
     public let streamingContentDocument = StreamingDocumentStore(mode: .plainLines)
+    /// Frontend streaming-performance instrumentation (inert unless
+    /// MTPLX_UI_PERF / MTPLX_AIME_DIAGNOSTICS is set at launch).
+    public let uiPerfProbe = UIStreamPerfProbe()
     @Published public private(set) var hasStreamingReasoning: Bool = false
     @Published public private(set) var hasStreamingContent: Bool = false
     @Published public private(set) var handoffAssistantMessageID: UUID?
@@ -185,6 +188,7 @@ public final class ChatViewModel: ObservableObject {
     private var roundReasoningStartOffset: Int = 0
     private var streamingReasoningBuffer = ""
     private var streamingContentBuffer = ""
+    private var decodeWindowSamples: [(t: Double, tokens: Double)] = []
     private var streamFlushTask: Task<Void, Never>?
     private var lastLiveDecodeUpdateAt: Date = .distantPast
     // Paint token-sized SSE deltas near display refresh. Live chat stays plain
@@ -426,6 +430,7 @@ public final class ChatViewModel: ObservableObject {
         streamGeneration &+= 1
         let generation = streamGeneration
         isStreaming = true
+        uiPerfProbe.turnStarted()
         streamingPhase = reasoningEnabledProvider() == false ? .generating : .thinking
         streamingReasoningDocument.reset()
         streamingContentDocument.reset()
@@ -447,6 +452,7 @@ public final class ChatViewModel: ObservableObject {
         streamingContentBuffer = ""
         leakedThinkingSplitter.reset()
         lastLiveDecodeUpdateAt = .distantPast
+        decodeWindowSamples = []
         startStreamFlushLoop(generation: generation)
 
         // Take a snapshot of the request shape so the loop is reentrant.
@@ -709,8 +715,10 @@ public final class ChatViewModel: ObservableObject {
         case .role:
             break
         case .reasoningDelta(let fragment):
+            uiPerfProbe.chunkArrived(bytes: fragment.utf8.count)
             appendStreamingReasoning(fragment)
         case .contentDelta(let fragment):
+            uiPerfProbe.chunkArrived(bytes: fragment.utf8.count)
             let split = leakedThinkingSplitter.feed(fragment)
             appendStreamingReasoning(split.reasoning)
             appendStreamingContent(split.content)
@@ -743,7 +751,7 @@ public final class ChatViewModel: ObservableObject {
             // Backstop: the 16 ms flush loop is the cadence; this bound
             // guarantees the live viewport can never lag more than ~1KB
             // behind the stream even if that task stalls.
-            flushStreamingBuffers()
+            flushStreamingBuffers(drainCompletely: false)
         }
         if streamingContent.isEmpty, streamingPhase != .thinking {
             streamingPhase = .thinking
@@ -755,7 +763,7 @@ public final class ChatViewModel: ObservableObject {
         let wasEmpty = streamingContent.isEmpty
         streamingContentBuffer.append(fragment)
         if !wasEmpty, streamingContentBuffer.count > Self.streamBufferFlushBackstop {
-            flushStreamingBuffers()
+            flushStreamingBuffers(drainCompletely: false)
         }
         if wasEmpty {
             hasStreamingContent = true
@@ -773,13 +781,57 @@ public final class ChatViewModel: ObservableObject {
     }
 
     private func updateChatDecodeReading(from frame: ChatProgressFrame) {
-        guard let value = Self.chatDecodeTokS(from: frame) else { return }
+        recordDecodeWindowSample(from: frame)
+        guard let value = liveDecodeValue(from: frame) else { return }
         let now = Date()
         guard chatDecodeReading == .absent
             || now.timeIntervalSince(lastLiveDecodeUpdateAt) >= Self.liveDecodeUpdateInterval
         else { return }
         lastLiveDecodeUpdateAt = now
         chatDecodeReading = .live(value)
+    }
+
+    // MARK: Live decode window (2026-07-31 founder: "it says 50 but it
+    // looks like 30 — are you sure it's not average?")
+    //
+    // It was: the live chip showed tokens/decode-elapsed since turn
+    // start, so once long-context decay sets in, the average reads high
+    // (a 10k-token turn that started at 55 tok/s and is now doing 35
+    // averages ~48). The chip now shows a sliding ~5 s window computed
+    // from progress-frame token counts, so mid-generation it tracks
+    // what the stream is doing NOW. The held reading after completion
+    // stays the full-turn cumulative — the honest summary number. The
+    // 0.5 s display latch in ChatHeaderView still smooths the strobe.
+    private static let decodeWindowSpanS = 5.0
+
+    private func recordDecodeWindowSample(from frame: ChatProgressFrame) {
+        guard let tokens = frame.completionTokens.map(Double.init)
+            ?? frame.raw.values["completion_tokens"]?.doubleValue,
+            tokens > 0
+        else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        if let last = decodeWindowSamples.last, tokens < last.tokens {
+            // Token count went backwards: a new tool round started a
+            // fresh request. Restart the window rather than mixing.
+            decodeWindowSamples = []
+        }
+        decodeWindowSamples.append((t: now, tokens: tokens))
+        while let first = decodeWindowSamples.first,
+              now - first.t > Self.decodeWindowSpanS {
+            decodeWindowSamples.removeFirst()
+        }
+    }
+
+    private func liveDecodeValue(from frame: ChatProgressFrame) -> Double? {
+        if let first = decodeWindowSamples.first,
+           let last = decodeWindowSamples.last,
+           last.t - first.t >= 1.2,
+           last.tokens > first.tokens {
+            let rate = (last.tokens - first.tokens) / (last.t - first.t)
+            if rate.isFinite, rate > 0 { return rate }
+        }
+        // Early in the turn (window not yet meaningful): cumulative.
+        return Self.chatDecodeTokS(from: frame)
     }
 
     private func updateChatDecodeReading(from stats: ChatStreamStats?) {
@@ -905,19 +957,91 @@ public final class ChatViewModel: ObservableObject {
 
     private func flushStreamingBuffersIfCurrent(generation: Int) {
         guard generation == streamGeneration else { return }
-        flushStreamingBuffers()
+        flushStreamingBuffers(drainCompletely: false)
     }
 
-    private func flushStreamingBuffers() {
+    // MARK: Typewriter pacing (2026-07-31 founder: "I like it when I can
+    // see every individual character typing")
+    //
+    // The 16 ms flush loop used to drain the WHOLE arrival buffer each
+    // tick, so any main-thread hiccup turned into a multi-word paste —
+    // the "vomits five words at a time" feel. Paced mode reveals a
+    // bounded slice per tick instead: at steady state (~180 chars/s
+    // arriving) that is ~3 characters every 16 ms — indistinguishable
+    // from per-character typing — and after a stall the backlog drains
+    // geometrically (quarter per tick) so catch-up looks like fast
+    // typing, not a paste. Bounded latency: steady-state lag is ~70 ms,
+    // and backlogs over 4 KB drain whole. Lifecycle flushes (finalize,
+    // cancel, error, tool-round handoff) always drain completely —
+    // `drainCompletely` defaults to true so only the 16 ms loop and the
+    // mid-event backstop opt into pacing. `MTPLX_STREAM_TYPEWRITER=0`
+    // restores the old drain-everything behavior.
+    private static let typewriterPacingEnabled: Bool = {
+        switch ProcessInfo.processInfo.environment["MTPLX_STREAM_TYPEWRITER"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "0", "false", "off", "no": return false
+        default: return true
+        }
+    }()
+    private static let typewriterHardDrainCharacters = 4_096
+    private static let typewriterMinRevealCharacters = 3
+
+    private static func pacedCut(_ buffer: String) -> (reveal: String, rest: String) {
+        let count = buffer.count
+        guard count > typewriterMinRevealCharacters,
+              count <= typewriterHardDrainCharacters
+        else { return (buffer, "") }
+        let reveal = max(typewriterMinRevealCharacters, count / 4)
+        guard reveal < count else { return (buffer, "") }
+        let cut = buffer.index(buffer.startIndex, offsetBy: reveal)
+        return (String(buffer[..<cut]), String(buffer[cut...]))
+    }
+
+    private func flushStreamingBuffers(drainCompletely: Bool = true) {
+        let paced = Self.typewriterPacingEnabled && !drainCompletely
+        var drainedBytes = 0
+        let probeEnabled = uiPerfProbe.enabled
+        let applyStarted = probeEnabled
+            ? ProcessInfo.processInfo.systemUptime
+            : 0
         if !streamingReasoningBuffer.isEmpty {
-            let delta = streamingReasoningBuffer
-            streamingReasoningBuffer = ""
+            let delta: String
+            if paced {
+                let cut = Self.pacedCut(streamingReasoningBuffer)
+                delta = cut.reveal
+                streamingReasoningBuffer = cut.rest
+            } else {
+                delta = streamingReasoningBuffer
+                streamingReasoningBuffer = ""
+            }
+            drainedBytes += delta.utf8.count
             streamingReasoningDocument.append(delta)
         }
         if !streamingContentBuffer.isEmpty {
-            let delta = streamingContentBuffer
-            streamingContentBuffer = ""
+            let delta: String
+            if paced {
+                let cut = Self.pacedCut(streamingContentBuffer)
+                delta = cut.reveal
+                streamingContentBuffer = cut.rest
+            } else {
+                delta = streamingContentBuffer
+                streamingContentBuffer = ""
+            }
+            drainedBytes += delta.utf8.count
             streamingContentDocument.append(delta)
+        }
+        if probeEnabled, drainedBytes > 0 {
+            let applyMs = (ProcessInfo.processInfo.systemUptime - applyStarted) * 1000
+            uiPerfProbe.flushApplied(
+                drainedBytes: drainedBytes,
+                applyMs: applyMs,
+                blocksAfter: streamingContentDocument.blocks.count
+                    + streamingReasoningDocument.blocks.count,
+                linesFinalizedTotal: streamingContentDocument.liveFinalizedCount
+                    + streamingReasoningDocument.liveFinalizedCount,
+                mergesTotal: streamingContentDocument.liveSegmentMergeCount
+                    + streamingReasoningDocument.liveSegmentMergeCount
+            )
         }
     }
 
@@ -1038,6 +1162,7 @@ public final class ChatViewModel: ObservableObject {
     private func finalizeAssistantTurnUI() {
         flushStreamingBuffers()
         stopStreamFlushLoop()
+        uiPerfProbe.turnEnded(requestId: currentRequestId)
         isStreaming = false
         streamingPhase = .idle
         currentRequestId = nil
@@ -1116,6 +1241,7 @@ public final class ChatViewModel: ObservableObject {
     // MARK: - Glue
 
     private func clearStreamingState() {
+        uiPerfProbe.turnEnded(requestId: currentRequestId)
         isStreaming = false
         streamingPhase = .idle
         stopStreamFlushLoop()

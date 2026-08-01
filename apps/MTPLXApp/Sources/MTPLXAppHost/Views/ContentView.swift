@@ -27,7 +27,13 @@ struct ContentView: View {
         // Allow the window to shrink to a thin bar. The dashboard reflows
         // (gauge shrinks, tiles wrap) below the old 1080×720 floor; tabs
         // are scroll views, so they degrade gracefully when narrow.
+        // WindowSizingTuner enforces the same floor via
+        // `window.contentMinSize` while turning OFF the hosting view's
+        // content-derived extrema (the streaming minSize storm); this
+        // .frame stays as the source of truth for the floor value and
+        // as the fallback when the tuner is disabled.
         .frame(minWidth: 420, minHeight: 540)
+        .background(WindowSizingTuner())
         .sheet(isPresented: $router.logsSheetPresented) {
             LogsSheet()
                 .environmentObject(backend)

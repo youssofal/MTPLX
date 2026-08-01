@@ -33,6 +33,56 @@ All notable user-facing changes to MTPLX. The format is based on
   for every served model, and the settings are configurable from the macOS app
   and persist in `~/.mtplx/config.toml` as `embedding_models`,
   `reranker_models`, and `retrieval_max_resident`.
+## [2.4.1] - 2026-08-01
+
+The smooth-streaming release: the app's chat render path is overhauled
+(no more freeze-then-catch-up stutter, scroll bounce, or plain-text code
+blocks — real syntax coloring, live code cards, tables, and actual math
+notation), and the 2.4.0 short-turn regression is fixed.
+
+### Added
+
+- Live syntax coloring for code blocks (12 languages + generic) from a
+  freeze-time lexer that colors each line exactly once; streaming cost
+  is O(new text), never O(document).
+- Streaming code card: an open fence renders as a live card with
+  colored lines and flips once to its settled form at close.
+- Pipe tables render as real tables; math renders as real notation
+  (Unicode super/subscripts, stacked matrices and fractions, inline
+  conversion instead of dollar-sign leaks).
+- Typewriter pacing for streamed text with geometric catch-up and a
+  hard drain bound (`MTPLX_STREAM_TYPEWRITER=0` to disable), and a live
+  tok/s chip computed over a sliding ~5 s window.
+- Performance mode is a true kill switch: plain text only, through both
+  the streaming and settled render paths.
+- Opt-in per-request capture for bit-exact failure replay:
+  `MTPLX_REQUEST_CAPTURE_DIR=<dir>` persists each request's
+  reproduction envelope at dispatch time (#196/#197, third layer).
+- Opt-in frontend stream-performance probe (`MTPLX_UI_PERF=1`, HUD via
+  `MTPLX_UI_PERF_HUD=1`) with a per-turn JSONL trace joinable to engine
+  stats by request id.
+- Experimental: cost-model speculative-depth policy
+  (`--adaptive-policy cost`) and blocked-sequential GDN prefill
+  (`MTPLX_GDN_BLOCKED_PREFILL=1`). Defaults unchanged.
+
+### Fixed
+
+- 2.4.0 short-turn regression: the compiled-verify path could reserve
+  KV budget above the configured ceiling, taxing short requests with
+  setup work they never used; the reserve is now clamped.
+- Warming prefills yield to real traffic within one small chunk instead
+  of delaying a freshly arrived request.
+- Derivative model artifacts whose names extend a first-party model
+  name are served under their own id, not the flagship's — the health
+  payload, OpenAI `model` field, and app model chip now report the
+  artifact actually loaded.
+- Streaming render: line-segment coalescing keeps realized view count
+  bounded on long answers; the bottom-pin scroll correction runs in the
+  same display cycle as layout so the streaming bubble can no longer
+  visibly bounce; a per-display-cycle window-sizing walk that floored
+  every update at ~50 ms is removed (`MTPLX_APP_SIZING_TUNER=0`
+  restores it).
+
 ## [2.4.0] - 2026-07-31
 
 The 35B speed release: the 35B-A3B MoE gets a compiled decode stack and

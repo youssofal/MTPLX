@@ -250,3 +250,254 @@ class ExpectedValueDepthPolicy:
             prob_term = 2.0 * _clamp(float(top1_prob), 0.0, 1.0) - 1.0
         raw = 1.0 + self.confidence_weight * (0.75 * margin_term + 0.25 * prob_term)
         return _clamp(raw, 0.25, 1.75)
+
+
+class CostModelDepthPolicy:
+    """Cost-model adaptive depth: maximize expected committed tokens per
+    wall-clock cycle, not acceptance streaks.
+
+    Ported from omlx's ``_DepthController`` (jundot/omlx v0.5.4rc1,
+    omlx/patches/mlx_lm_mtp/batch_generator.py) with the depth-0
+    park/exit machinery deliberately left out for now (our 27B lanes
+    always profit from speculation; the escape hatch matters for
+    head_dim-512/MoE models and can come later). Their measured design
+    decisions preserved verbatim:
+
+    - ``score(d) = (1 + p1 + p1 p2 + ...) / t_est(d)``.
+    - Acceptance is a token-domain EMA (a property of model/content);
+      cost is a wall-clock-horizon EMA (tracks context growth, thermal
+      state, and external GPU load at constant real-time responsiveness)
+      with a one-off-spike damp.
+    - The marginal cost of an extra verify row is the measured slope
+      between the cheapest and priciest measured depths, not a constant.
+    - Probes are bidirectional and staleness-directed, duty-bounded to
+      ~15% of cycles: re-measuring a SHALLOWER rival is what breaks the
+      depth-2 lock omlx measured (stale-high t[1] hides depth 1 forever).
+    - The cost EMA is per-cycle, NOT staleness-age-weighted: omlx
+      measured age-weighting worse (probe-burst noise injected straight
+      into the decision; prose re-over-drafted 1.6%).
+
+    Drop-in for the ``AdaptiveDepthPolicy`` interface: ``current_depth``
+    plus ``observe(attempted_depth=, accepted_depths=)``. Cycle cost is
+    self-timed as the wall interval between observe calls (one observe
+    per verify cycle), which deliberately includes the loop's host
+    bookkeeping — that tax is part of the real cost of running a cycle.
+    """
+
+    ALPHA = 0.08
+    TAU_MS = 400.0
+    PROBE_PERIOD_MS = 1000.0
+    PROBE_PERIOD_MAX_MS = 5000.0
+    PROBE_LEN = 4
+    PROBE_DUTY = 0.15
+    PROBE_MARGIN = 1.15
+    SPIKE_RATIO = 2.0
+    SPIKE_DAMP = 0.25
+    MARGINAL_MS = 7.0
+    HYSTERESIS = 1.03
+    # Ignore absurd inter-observe gaps (queue waits, tool round-trips in
+    # agent serving): a "cycle" above this is not a cycle measurement.
+    MAX_CYCLE_MS = 5000.0
+    # The generation loop passes its own measured cycle wall-time when it
+    # sees this flag; the self-timed inter-observe fallback stays for
+    # callers that do not.
+    accepts_cycle_ms = True
+
+    def __init__(
+        self,
+        max_depth: int,
+        min_depth: int = 1,
+        marginal_ms: float | None = None,
+    ) -> None:
+        if max_depth < 1:
+            raise ValueError("max_depth must be >= 1")
+        self.max_depth = int(max_depth)
+        self.min_depth = max(1, min(int(min_depth), self.max_depth))
+        if marginal_ms:
+            self.MARGINAL_MS = float(marginal_ms)
+        self.current_depth = self.max_depth
+        self.p = [0.6] * self.max_depth
+        self.t: dict[int, float] = {}
+        self.t_age: dict[int, float] = {}
+        self.cycles = 0
+        self.probe_left = 0
+        self._ms_probe = 0.0
+        self._ms_explore = 0.0
+        self._warmup = list(range(self.max_depth, self.min_depth - 1, -1))
+        self._last_observe_s: float | None = None
+
+    # -- cost bookkeeping --------------------------------------------------
+
+    def _time_alpha(self, cycle_ms: float) -> float:
+        return 1.0 - math.exp(-max(0.0, float(cycle_ms)) / self.TAU_MS)
+
+    def _update_time(self, used: int, cycle_ms: float) -> None:
+        prev = self.t.get(used)
+        if prev is None:
+            self.t[used] = cycle_ms
+            return
+        if self._warmup:
+            self.t[used] = min(prev, cycle_ms)
+            return
+        a = self._time_alpha(cycle_ms)
+        if cycle_ms > self.SPIKE_RATIO * prev:
+            a *= self.SPIKE_DAMP
+        self.t[used] = (1.0 - a) * prev + a * cycle_ms
+
+    def _marginal_est(self) -> float:
+        if len(self.t) >= 2:
+            depths = sorted(self.t)
+            lo, hi = depths[0], depths[-1]
+            if hi > lo:
+                slope = (self.t[hi] - self.t[lo]) / (hi - lo)
+                if slope > 0.0:
+                    return slope
+        return self.MARGINAL_MS
+
+    def _t_est(self, d: int) -> float:
+        if d in self.t:
+            return self.t[d]
+        if not self.t:
+            return 30.0 + self.MARGINAL_MS * d
+        ref = min(self.t, key=lambda x: abs(x - d))
+        return max(1e-3, self.t[ref] + self._marginal_est() * (d - ref))
+
+    def _score(self, d: int) -> float:
+        expected = 1.0
+        run = 1.0
+        for j in range(d):
+            run *= self.p[j]
+            expected += run
+        return expected / max(1e-6, self._t_est(d))
+
+    # -- selection ---------------------------------------------------------
+
+    def _depths(self) -> list[int]:
+        return list(range(self.min_depth, self.max_depth + 1))
+
+    def _best(self) -> int:
+        cur_score = self._score(self.current_depth)
+        best_d, best_score = self.current_depth, cur_score
+        for d in self._depths():
+            s = self._score(d)
+            if s > best_score:
+                best_d, best_score = d, s
+        if best_d != self.current_depth and best_score < cur_score * self.HYSTERESIS:
+            return self.current_depth
+        return best_d
+
+    def _best_rival(self) -> int | None:
+        best = self._score(self.current_depth)
+        if best <= 0.0:
+            return self._most_stale()
+        rival, rival_score = None, 0.0
+        for d in self._depths():
+            if d == self.current_depth:
+                continue
+            s = self._score(d)
+            if s > rival_score:
+                rival, rival_score = d, s
+        if rival is not None and rival_score * self.PROBE_MARGIN >= best:
+            return rival
+        return None
+
+    def _most_stale(self) -> int | None:
+        candidates = [d for d in self._depths() if d != self.current_depth]
+        if not candidates:
+            return None
+        never = [d for d in candidates if d not in self.t]
+        if never:
+            return never[0]
+        return max(candidates, key=lambda d: self.t_age.get(d, 0.0))
+
+    # -- the drop-in interface ---------------------------------------------
+
+    def observe(
+        self,
+        *,
+        attempted_depth: int,
+        accepted_depths: int,
+        cycle_ms: float | None = None,
+    ) -> dict:
+        import time as _time
+
+        now = _time.perf_counter()
+        if cycle_ms is None and self._last_observe_s is not None:
+            cycle_ms = (now - self._last_observe_s) * 1000.0
+        if cycle_ms is not None and (cycle_ms > self.MAX_CYCLE_MS or cycle_ms <= 0.0):
+            cycle_ms = None
+        self._last_observe_s = now
+
+        self.cycles += 1
+        used = max(1, min(int(attempted_depth), self.max_depth))
+        accepted = max(0, min(int(accepted_depths), used))
+        previous_depth = self.current_depth
+
+        a = self.ALPHA
+        for j in range(used):
+            hit = 1.0 if j < accepted else 0.0
+            self.p[j] = (1.0 - a) * self.p[j] + a * hit
+            if j >= accepted:
+                break
+
+        if cycle_ms is not None:
+            self._update_time(used, cycle_ms)
+            for d in list(self.t_age):
+                self.t_age[d] += cycle_ms
+            self.t_age[used] = 0.0
+            self._ms_probe += cycle_ms
+            self._ms_explore += cycle_ms
+
+        action = "hold"
+        if self._warmup:
+            # A warmup slot is consumed only once its depth has a real cost
+            # sample; the very first observe has no prior timestamp to diff
+            # against, so that cycle repeats its depth instead of advancing.
+            if cycle_ms is not None and used == self._warmup[0]:
+                self._warmup.pop(0)
+            if self._warmup:
+                self.current_depth = self._warmup[0]
+                action = "warmup"
+            else:
+                self.current_depth = self._best()
+                self._ms_probe = 0.0
+                action = "warmup_done"
+        elif self.probe_left > 0:
+            self.probe_left -= 1
+            if self.probe_left == 0:
+                self.current_depth = self._best()
+                self._ms_probe = 0.0
+                action = "probe_done"
+            else:
+                action = "probing"
+        else:
+            self.current_depth = self._best()
+            if self.current_depth != previous_depth:
+                action = (
+                    "increase" if self.current_depth > previous_depth else "decrease"
+                )
+            if self.max_depth > self.min_depth and cycle_ms is not None:
+                period = max(
+                    self.PROBE_PERIOD_MS,
+                    self.PROBE_LEN * cycle_ms / self.PROBE_DUTY,
+                )
+                if self._ms_probe >= period:
+                    explore_due = self._ms_explore >= max(
+                        self.PROBE_PERIOD_MAX_MS, 2.0 * period
+                    )
+                    target = self._most_stale() if explore_due else self._best_rival()
+                    if target is not None:
+                        self.current_depth = target
+                        self.probe_left = self.PROBE_LEN
+                        self._ms_probe = 0.0
+                        if explore_due:
+                            self._ms_explore = 0.0
+                        action = "probe"
+
+        return {
+            "previous_depth": previous_depth,
+            "attempted_depth": used,
+            "accepted_depths": accepted,
+            "next_depth": self.current_depth,
+            "action": action,
+        }

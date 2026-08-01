@@ -112,6 +112,7 @@ from mtplx.runtime_options import (
     resolve_api_key,
 )
 from mtplx.draft_lm_head import _install_draft_lm_head
+from mtplx import request_capture
 from mtplx.fan_mode import (
     FAN_MODE_CHOICES,
     FAN_MODE_DEFAULT,
@@ -14465,6 +14466,10 @@ def _adaptive_config(
                 "decrease_after": int(args.adaptive_decrease_after),
             }
         )
+    elif policy == "cost":
+        config["marginal_ms_prior"] = float(
+            getattr(args, "adaptive_cost_marginal_ms", 7.0) or 7.0
+        )
     elif policy == "expected_value":
         configured_base_depth = max(1, int(args.adaptive_ev_base_depth))
         effective_base_depth = max(
@@ -14519,6 +14524,17 @@ def _make_adaptive_policy(
             start_depth=int(args.adaptive_start_depth),
             increase_after=int(args.adaptive_increase_after),
             decrease_after=int(args.adaptive_decrease_after),
+        )
+    if policy == "cost":
+        from mtplx.adaptive import CostModelDepthPolicy
+
+        return CostModelDepthPolicy(
+            max_depth=effective_max_depth,
+            min_depth=effective_min_depth,
+            marginal_ms=float(
+                getattr(args, "adaptive_cost_marginal_ms", 0.0) or 0.0
+            )
+            or None,
         )
     if policy == "expected_value":
         effective_base_depth = max(
@@ -15789,6 +15805,18 @@ def _finalize_batched_ar_generation(
                 ensure_ascii=False,
             )
         )
+    if request_capture.capture_dir():
+        request_capture.capture_outcome(
+            (request_observability or {}).get("request_id"),
+            {
+                "scheduler_lane": "ar_batch",
+                "completion_tokens": completion_tokens,
+                "finish_reason": generated.get("finish_reason"),
+                "resolved_seed": stats.get("server_seed"),
+                "tok_s": round(float(generated.get("tok_s") or 0.0), 3),
+                **request_capture.clip_text_head_tail(generated.get("text") or ""),
+            },
+        )
     return generated
 
 
@@ -15907,6 +15935,44 @@ def _run_generation_dispatched(
     if response_id:
         request_observability_for_lane.setdefault("request_id", response_id)
     kwargs["request_observability"] = request_observability_for_lane
+    if request_capture.capture_dir() and not bool(
+        request_observability_for_lane.get("warmup")
+    ):
+        # Dispatch-time capture (#196/#197 third layer): persisted BEFORE any
+        # token is generated so a hung or early-stopped agent turn still
+        # leaves its bit-exact reproduction envelope on disk.
+        request_capture.capture_request(
+            request_observability_for_lane.get("request_id") or response_id,
+            {
+                "model_id": str(
+                    getattr(state.args, "model_id", None)
+                    or getattr(state, "model_id", None)
+                    or ""
+                ),
+                "prompt_len": len(prompt_ids),
+                "prompt_token_ids": [int(t) for t in prompt_ids],
+                "max_tokens": kwargs.get("max_tokens"),
+                "temperature": kwargs.get("temperature"),
+                "top_p": kwargs.get("top_p"),
+                "top_k": kwargs.get("top_k"),
+                "presence_penalty": kwargs.get("presence_penalty"),
+                "frequency_penalty": kwargs.get("frequency_penalty"),
+                "requested_seed": kwargs.get("seed"),
+                "generation_mode": str(effective_mode),
+                "depth": kwargs.get("depth"),
+                "session_id": kwargs.get("session_id"),
+                "session_restore_mode": kwargs.get("session_restore_mode"),
+                "has_constraint": kwargs.get("constraint_spec") is not None,
+                "tokenizer_template_hash": str(
+                    getattr(state, "main_system_prompt_hash", None) or ""
+                ),
+                "observability": {
+                    k: v
+                    for k, v in request_observability_for_lane.items()
+                    if isinstance(v, (str, int, float, bool))
+                },
+            },
+        )
     history_bypass_reason = _ar_batch_history_bypass_reason(
         request_observability_for_lane
     )
@@ -16075,6 +16141,7 @@ def _run_generation(
     streaming_response: bool | None = None,
     vision_splice: Any | None = None,
     constraint_spec: Any | None = None,
+    prefill_chunk_tokens: int | None = None,
 ) -> dict[str, Any]:
     response_max, sampler, generation_limits = _generation_params(
         state,
@@ -16187,7 +16254,14 @@ def _run_generation(
                 max_new_tokens=response_max,
                 mtp_depth=effective_depth,
             )
-            prefill_chunk_tokens = getattr(state.args, "prefill_chunk_tokens", None)
+            # Callers may tighten the prefill chunk for this generation
+            # (warming runs use a small chunk so their foreground-yield
+            # abort — checked once per chunk — fires fast); the serve-wide
+            # setting stays the default for real requests.
+            if prefill_chunk_tokens is None:
+                prefill_chunk_tokens = getattr(
+                    state.args, "prefill_chunk_tokens", None
+                )
             with _temporary_env(
                 dynamic_kv_reservation["env"]
             ), prefill_chunk_size_override(prefill_chunk_tokens):
@@ -16589,6 +16663,20 @@ def _run_generation(
                 ensure_ascii=False,
             )
         )
+    if request_capture.capture_dir():
+        request_capture.capture_outcome(
+            (request_observability or {}).get("request_id"),
+            {
+                "scheduler_lane": "serial",
+                "completion_tokens": last["completion_tokens"],
+                "finish_reason": last.get("finish_reason"),
+                "resolved_seed": last["stats"].get("server_seed"),
+                "attempts": last["stats"].get("server_attempts"),
+                "blank_retries": last["stats"].get("server_blank_retries"),
+                "tok_s": round(float(last["tok_s"]), 3),
+                **request_capture.clip_text_head_tail(last.get("text") or ""),
+            },
+        )
     return last
 
 
@@ -16819,6 +16907,18 @@ class _BackgroundWarmup:
         else:
             self._finish()
 
+    # Warming prefills must yield to real traffic quickly: the
+    # foreground-yield abort only fires once per prefill chunk, and the
+    # serve-wide 2048-token chunk holds the model lock ~3s per chunk on
+    # the 27B — a request arriving mid-warmup stalled exactly that long
+    # (measured 3.1-3.3s mid-turn freezes on the first turns of a fresh
+    # serve, 2026-07-31). A 256-token warming chunk bounds the wait to
+    # ~0.4s and lets preempted steps resume instead of burning the
+    # resubmit budget and abandoning. Passed as a _run_generation kwarg:
+    # the generation applies its own prefill_chunk_size_override
+    # internally, so an outer ContextVar wrapper would be clobbered.
+    WARMUP_PREFILL_CHUNK_TOKENS = 256
+
     def _ladder_generation(self, context_tokens: int) -> dict[str, Any]:
         repeats = context_tokens // max(1, len(self.prompt_ids)) + 1
         prompt_ids = (list(self.prompt_ids) * repeats)[:context_tokens]
@@ -16832,6 +16932,7 @@ class _BackgroundWarmup:
             seed=0,
             request_observability={"warmup": True, "warmup_background": True},
             cancel_event=_ForegroundYield(self.state),
+            prefill_chunk_tokens=self.WARMUP_PREFILL_CHUNK_TOKENS,
         )
 
     def _finish(self, abandoned: bool = False) -> None:
@@ -26256,7 +26357,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--adaptive-policy",
-        choices=["none", "streak", "expected_value"],
+        choices=["none", "streak", "expected_value", "cost"],
         default="none",
         help="Optional per-request native-MTP depth policy. Exact sampler semantics remain unchanged.",
     )

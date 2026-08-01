@@ -82,12 +82,19 @@ struct ChatConversationView: View {
                         }
                     },
                     onScroll: { distanceToBottom, isUserInitiated in
+                        viewModel.uiPerfProbe.scrollTick(
+                            distanceToBottom: distanceToBottom,
+                            userInitiated: isUserInitiated
+                        )
                         performScrollActions(
                             policy.didScroll(
                                 distanceToBottom: distanceToBottom,
                                 isUserInitiated: isUserInitiated
                             )
                         )
+                    },
+                    onDocumentFrameChanged: {
+                        synchronousBottomPinIfNeeded()
                     }
                 )
             )
@@ -139,6 +146,28 @@ struct ChatConversationView: View {
             autoScrollTask = nil
             deferredScrollTask = nil
             finishScrollRepairTask = nil
+        }
+    }
+
+    // MARK: Synchronous bottom pin (2026-07-31 sawtooth fix)
+    //
+    // The founder's clip showed the streaming bubble's bottom edge
+    // oscillating at ~6 Hz with ±34 px amplitude: content grows in the
+    // flush's layout pass, but the scroll correction ran in an async
+    // Task gated to a 24/50 ms cadence — so for one-to-three frames the
+    // document was taller with the viewport unmoved (new line renders
+    // low), then the deferred task yanked it back up. This handler runs
+    // inside the document view's frameDidChange notification, i.e. in
+    // the SAME layout pass that grew the content: the clip origin moves
+    // with the growth and a grown-but-unscrolled frame never reaches
+    // the screen. No @State is touched here (the notification fires
+    // during AppKit layout); the cadenced path stays as a safety net
+    // and simply no-ops once the pin has already glued the bottom.
+    private func synchronousBottomPinIfNeeded() {
+        guard viewModel.isStreaming,
+              policy.shouldAutoScrollForStreamingUpdate else { return }
+        if scrollDriver.scrollToBottom(animated: false) {
+            viewModel.uiPerfProbe.scrollPinned()
         }
     }
 
@@ -600,9 +629,14 @@ private struct HiddenTranscriptSummaryView: View {
 private struct ChatConversationScrollObserverView: NSViewRepresentable {
     let onScrollViewResolved: @MainActor (NSScrollView?) -> Void
     let onScroll: @MainActor (CGFloat, Bool) -> Void
+    let onDocumentFrameChanged: @MainActor () -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onScrollViewResolved: onScrollViewResolved, onScroll: onScroll)
+        Coordinator(
+            onScrollViewResolved: onScrollViewResolved,
+            onScroll: onScroll,
+            onDocumentFrameChanged: onDocumentFrameChanged
+        )
     }
 
     func makeNSView(context: Context) -> HostView {
@@ -614,6 +648,7 @@ private struct ChatConversationScrollObserverView: NSViewRepresentable {
     func updateNSView(_ nsView: HostView, context: Context) {
         context.coordinator.onScrollViewResolved = onScrollViewResolved
         context.coordinator.onScroll = onScroll
+        context.coordinator.onDocumentFrameChanged = onDocumentFrameChanged
         nsView.coordinator = context.coordinator
         DispatchQueue.main.async {
             context.coordinator.attachIfNeeded(from: nsView)
@@ -628,18 +663,22 @@ private struct ChatConversationScrollObserverView: NSViewRepresentable {
     final class Coordinator: NSObject {
         var onScrollViewResolved: @MainActor (NSScrollView?) -> Void
         var onScroll: @MainActor (CGFloat, Bool) -> Void
+        var onDocumentFrameChanged: @MainActor () -> Void
         weak var scrollView: NSScrollView?
         private var boundsObserver: NSObjectProtocol?
+        private var documentFrameObserver: NSObjectProtocol?
         private var liveScrollStartObserver: NSObjectProtocol?
         private var liveScrollEndObserver: NSObjectProtocol?
         private var isUserLiveScrolling = false
 
         init(
             onScrollViewResolved: @escaping @MainActor (NSScrollView?) -> Void,
-            onScroll: @escaping @MainActor (CGFloat, Bool) -> Void
+            onScroll: @escaping @MainActor (CGFloat, Bool) -> Void,
+            onDocumentFrameChanged: @escaping @MainActor () -> Void
         ) {
             self.onScrollViewResolved = onScrollViewResolved
             self.onScroll = onScroll
+            self.onDocumentFrameChanged = onDocumentFrameChanged
         }
 
         func attachIfNeeded(from hostView: HostView) {
@@ -688,11 +727,35 @@ private struct ChatConversationScrollObserverView: NSViewRepresentable {
                     )
                 }
             }
+            if let documentView = resolvedScrollView.documentView {
+                // queue: nil ⇒ the block runs SYNCHRONOUSLY on the
+                // posting thread. Frame changes post on the main thread
+                // during layout, which is the whole point: the bottom
+                // pin runs in the same display cycle that grew the
+                // content, so no grown-but-unscrolled frame is ever
+                // presented (the founder's ±34 px 6 Hz sawtooth).
+                documentView.postsFrameChangedNotifications = true
+                documentFrameObserver = NotificationCenter.default.addObserver(
+                    forName: NSView.frameDidChangeNotification,
+                    object: documentView,
+                    queue: nil
+                ) { [weak hostView] _ in
+                    guard Thread.isMainThread else { return }
+                    MainActor.assumeIsolated {
+                        guard let coordinator = hostView?.coordinator,
+                              !coordinator.isUserLiveScrolling else { return }
+                        coordinator.onDocumentFrameChanged()
+                    }
+                }
+            }
         }
 
         func detach() {
             if let boundsObserver {
                 NotificationCenter.default.removeObserver(boundsObserver)
+            }
+            if let documentFrameObserver {
+                NotificationCenter.default.removeObserver(documentFrameObserver)
             }
             if let liveScrollStartObserver {
                 NotificationCenter.default.removeObserver(liveScrollStartObserver)
@@ -701,6 +764,7 @@ private struct ChatConversationScrollObserverView: NSViewRepresentable {
                 NotificationCenter.default.removeObserver(liveScrollEndObserver)
             }
             boundsObserver = nil
+            documentFrameObserver = nil
             liveScrollStartObserver = nil
             liveScrollEndObserver = nil
             isUserLiveScrolling = false

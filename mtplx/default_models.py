@@ -254,71 +254,113 @@ def _sanitize_public_model_id(value: str) -> str:
     return lowered or DEFAULT_PUBLIC_MODEL_ID
 
 
+def _ref_name_components(text: str) -> set[str]:
+    """Complete artifact-name components of a model ref, lowered.
+
+    A ref names its artifact as a whole path component (local dirs), an
+    HF repo id ("org/name" — also derived from adjacent components and
+    from HF cache dirs "models--org--name"), or the bare ref string.
+    First-party names are matched against these with EQUALITY: substring
+    matching against the whole ref claimed derivative artifacts whose
+    folder name merely CONTAINS a first-party name (…-V3-RC, …-V2) as
+    the first-party id — the served id, health payload, and app model
+    chip then all lied about which model was loaded (reported live
+    2026-07-31; same class as issue #57 / PR #77).
+    """
+
+    lowered = text.strip().replace("\\", "/").lower()
+    parts = [part for part in lowered.split("/") if part]
+    components = set(parts)
+    components.add(lowered)
+    for left, right in zip(parts, parts[1:]):
+        components.add(f"{left}/{right}")
+    for part in parts:
+        if "--" not in part:
+            continue
+        # "--" joins org/name segments in both HF cache dirs
+        # (models--org--name) and first-party local dir names
+        # (Youssofal--Name): expose the terminal name and the org/name
+        # pair as components of their own.
+        segments = [seg for seg in part.split("--") if seg]
+        if not segments:
+            continue
+        components.add(segments[-1])
+        if len(segments) >= 2:
+            components.add(f"{segments[-2]}/{segments[-1]}")
+    return components
+
+
 def _public_model_id_from_name(value: str) -> str | None:
     """Map exact first-party names (public ids, HF repo ids, released
     folder names) to their canonical public ids.
 
-    Every pattern here is a complete first-party artifact name. Loose
-    family matches (e.g. any "qwen3.6-35b-a3b" + "mtplx" string) claimed
-    third-party builds as first-party artifacts and were removed in July
-    2026 (issue #57 / PR #77 class): a name that merely resembles the
-    family now falls through to the sanitized artifact name.
+    Every pattern here is a complete first-party artifact name, compared
+    for EQUALITY against the ref's name components (never substrings of
+    the whole ref). Loose family matches were removed in July 2026
+    (issue #57 / PR #77 class), and substring matches were removed
+    2026-07-31 after a derivative folder (…-Optimized-Speed-V3-RC) was
+    served under the flagship id: any name that merely resembles or
+    extends a first-party artifact falls through to the sanitized
+    artifact name.
     """
 
     text = value.strip()
     if not text:
         return None
     lowered = text.replace("\\", "/").lower()
-    if QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID in lowered:
+    components = _ref_name_components(text)
+    if QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID in components:
         return QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID
-    if QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID in lowered:
+    if QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID in components:
         return QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
-    if QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID.lower() in lowered:
+    if QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID.lower() in components:
         return QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID
-    if QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID.lower() in lowered:
+    if QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID.lower() in components:
         return QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
-    if "qwen3.5-9b-mtplx-optimized-speed-fp16" in lowered:
+    if "qwen3.5-9b-mtplx-optimized-speed-fp16" in components:
         return QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID
-    if "qwen3.5-9b-mtplx-optimized-speed" in lowered:
+    if "qwen3.5-9b-mtplx-optimized-speed" in components:
         return QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
-    if "qwen3.5-9b-mtplx-speed-6bit" in lowered:
-        # Exact released artifact family: Qwen-Qwen3.5-9B-MTPLX-Speed-6bit-*.
+    if any("qwen3.5-9b-mtplx-speed-6bit" in part for part in components):
+        # Deliberate wildcard family (released artifacts are named
+        # Qwen-Qwen3.5-9B-MTPLX-Speed-6bit-<suffix>): containment is
+        # per-component, so it can no longer match across path pieces.
         return QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
-    if QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID in lowered:
+    if QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID in components:
         return QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID
-    if QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID in lowered:
+    if QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID in components:
         return QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID
-    if QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID.lower() in lowered:
+    if QWEN36_35B_OPTIMIZED_BALANCE_FP16_HF_MODEL_ID.lower() in components:
         return QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID
-    if QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID.lower() in lowered:
+    if QWEN36_35B_OPTIMIZED_BALANCE_HF_MODEL_ID.lower() in components:
         return QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID
-    if "qwen3.6-35b-a3b-mtplx-optimized-balance-fp16" in lowered:
+    if "qwen3.6-35b-a3b-mtplx-optimized-balance-fp16" in components:
         return QWEN36_35B_OPTIMIZED_BALANCE_FP16_PUBLIC_MODEL_ID
-    if "qwen3.6-35b-a3b-mtplx-optimized-balance" in lowered:
+    if "qwen3.6-35b-a3b-mtplx-optimized-balance" in components:
         return QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID
-    if QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID in lowered:
+    if QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID in components:
         return QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID
-    if QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID in lowered:
+    if QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID in components:
         return QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
-    if QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID.lower() in lowered:
+    if QWEN36_35B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID.lower() in components:
         return QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID
-    if QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID.lower() in lowered:
+    if QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID.lower() in components:
         return QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
-    if "qwen3.6-35b-a3b-mtplx-optimized-speed-fp16" in lowered:
+    if "qwen3.6-35b-a3b-mtplx-optimized-speed-fp16" in components:
         return QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID
-    if "qwen3.6-35b-a3b-mtplx-optimized-speed" in lowered:
+    if "qwen3.6-35b-a3b-mtplx-optimized-speed" in components:
         return QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
-    if "qwen3.6-35b-a3b-mtplx-official4-cyankiwimtp-cleanrecipe" in lowered:
+    if "qwen3.6-35b-a3b-mtplx-official4-cyankiwimtp-cleanrecipe" in components:
         # First-party local research build of the released 35B speed
         # artifact (listed in _OPTIMIZED_35B_SPEED_LOCAL_CANDIDATES).
         return QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
-    if "qwen3.6-27b-mtplx-optimized-quality-fp16" in lowered:
+    if "qwen3.6-27b-mtplx-optimized-quality-fp16" in components:
         return QUALITY_FP16_PUBLIC_MODEL_ID
-    if "qwen3.6-27b-mtplx-optimized-quality" in lowered:
+    if "qwen3.6-27b-mtplx-optimized-quality" in components:
         return QUALITY_PUBLIC_MODEL_ID
-    if "qwen3.6-27b-mtplx-optimized-speed-fp16" in lowered:
+    if "qwen3.6-27b-mtplx-optimized-speed-fp16" in components:
         return DEFAULT_FP16_PUBLIC_MODEL_ID
-    if "qwen3.6-27b-mtplx-optimized-speed" in lowered:
+    if "qwen3.6-27b-mtplx-optimized-speed" in components:
         return DEFAULT_PUBLIC_MODEL_ID
     legacy_names = {
         "qwen3.6-27b-mtplx-optimized",

@@ -249,9 +249,50 @@ def test_optimized_quality_routes_fp16_sibling_on_legacy_silicon(monkeypatch):
             "/Users/example/models/Qwen3.6-27B-MTPLX-Optimized",
             LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
         ),
+        # HF repo id given directly, and the HF cache-dir path shape the
+        # resolver historically needed substring matching for — both must
+        # keep mapping to the first-party id under component equality.
+        (
+            "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed",
+            DEFAULT_PUBLIC_MODEL_ID,
+        ),
+        (
+            "/Users/example/.cache/huggingface/hub/"
+            "models--Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed/"
+            "snapshots/abc1234def",
+            DEFAULT_PUBLIC_MODEL_ID,
+        ),
     ],
 )
 def test_public_model_id_for_ref_maps_known_local_names(model_ref, expected):
+    assert public_model_id_for_ref(model_ref) == expected
+
+
+@pytest.mark.parametrize(
+    ("model_ref", "expected"),
+    [
+        # A derivative artifact whose folder name EXTENDS a first-party
+        # name must serve under its own identity, not the flagship's:
+        # substring matching made a V3-RC build report itself as
+        # mtplx-qwen36-27b-optimized-speed (health payload + app model
+        # chip both lied, reported live 2026-07-31).
+        (
+            "/Users/example/models/Qwen3.6-27B-MTPLX-Optimized-Speed-V3-RC",
+            "qwen3.6-27b-mtplx-optimized-speed-v3-rc",
+        ),
+        (
+            "/Users/example/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Quality-V2",
+            "youssofal-qwen3.6-27b-mtplx-optimized-quality-v2",
+        ),
+        (
+            "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-V3-RC",
+            "qwen3.6-27b-mtplx-optimized-speed-v3-rc",
+        ),
+    ],
+)
+def test_public_model_id_for_ref_refuses_derivative_name_collisions(
+    model_ref, expected
+):
     assert public_model_id_for_ref(model_ref) == expected
 
 

@@ -653,6 +653,14 @@ def load(
         if nax_env_enabled():
             nax_report = install_nax_qlinear_patch()
             logger.info("[nax-verify] %s", nax_report)
+        from .kernels.gdn_blocked_prefill import (
+            blocked_prefill_env_enabled,
+            install_gdn_blocked_prefill_patch,
+        )
+
+        if blocked_prefill_env_enabled():
+            gdn_prefill_report = install_gdn_blocked_prefill_patch()
+            logger.info("[gdn-blocked-prefill] %s", gdn_prefill_report)
         from .qwen_row_owned_router import (
             install_qwen_row_owned_routers,
             prepare_qwen_row_owned_routers,

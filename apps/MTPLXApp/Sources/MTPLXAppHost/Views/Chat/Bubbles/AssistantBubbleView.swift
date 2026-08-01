@@ -18,6 +18,7 @@ import MTPLXAppCore
 // the tail side; large 14pt elsewhere).
 
 struct AssistantBubbleView: View {
+    @EnvironmentObject private var backend: MTPLXBackendStore
     let group: AssistantTurnGroup
     private let message: ChatMessage
     private let combinedReasoning: String
@@ -123,7 +124,11 @@ struct AssistantBubbleView: View {
                                 onExpand: { expandedLongReply = true }
                             )
                         } else {
-                            AssistantMarkdownView(message.visibleContent, isStreaming: false)
+                            AssistantMarkdownView(
+                                message.visibleContent,
+                                isStreaming: false,
+                                plainTextOnly: backend.configuration.performanceLock
+                            )
                         }
                     }
                         .frame(maxWidth: 576, alignment: .leading)

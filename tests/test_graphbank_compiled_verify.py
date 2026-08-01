@@ -569,34 +569,74 @@ def test_to_dict_exposes_stats_and_buckets():
     assert isinstance(data["buckets"], dict)
 
 
-def test_request_reserve_keeps_1024_outputs_compiled_and_parity_exact(monkeypatch):
-    """A known 1024-token request must not hit the legacy 512-token cliff."""
+class _ExactKVRuntime:
+    V = 5
 
-    class ExactKVRuntime:
-        V = 5
+    def forward_ar_capture(
+        self,
+        input_ids,
+        cache=None,
+        return_hidden=False,
+        hidden_variant=None,
+        capture_backend=None,
+    ):
+        del hidden_variant, capture_backend
+        hidden = input_ids.astype(mx.float32)[..., None]
+        kv = hidden[:, None, :, :]
+        cache[0].update_and_fetch(kv, kv)
+        logits = mx.concatenate((hidden, hidden + 1.0), axis=-1)
+        if return_hidden:
+            return logits, hidden, {}
+        return logits, {}
 
-        def forward_ar_capture(
-            self,
-            input_ids,
-            cache=None,
-            return_hidden=False,
-            hidden_variant=None,
-            capture_backend=None,
-        ):
-            del hidden_variant, capture_backend
-            hidden = input_ids.astype(mx.float32)[..., None]
-            kv = hidden[:, None, :, :]
-            cache[0].update_and_fetch(kv, kv)
-            logits = mx.concatenate((hidden, hidden + 1.0), axis=-1)
-            if return_hidden:
-                return logits, hidden, {}
-            return logits, {}
+
+def test_request_budget_below_ceiling_reserves_exact_budget(monkeypatch):
+    """A small explicit budget tightens the grant below the env ceiling."""
 
     monkeypatch.setenv("MTPLX_COMPILED_VERIFY_PREWARM", "0")
-    rt = ExactKVRuntime()
+    rt = _ExactKVRuntime()
     cache = [KVCache()]
     rt.forward_ar_capture(mx.array([[0, 1, 2]]), cache=cache)
-    bank = CompiledVerifyBank(rt, request_max_tokens=1024, parity=True)
+    bank = CompiledVerifyBank(rt, request_max_tokens=200, parity=True)
+    assert bank.growth_reserve_tokens == 206  # budget + one speculative window
+
+    for token_index in range(200):
+        bank.forward_ar_capture(
+            mx.array([[token_index % rt.V]]),
+            cache=cache,
+            return_hidden=True,
+        )
+
+    stats = bank.to_dict()
+    assert stats["request_max_tokens"] == 200
+    assert stats["speculative_headroom"] == bank.max_verify_len == 6
+    assert stats["compiled_calls"] == 200
+    assert stats["fallback_calls"] == 0
+    assert stats["growth_demotions"] == 0
+    assert stats["parity_failures"] == 0
+    assert isinstance(cache[0], TensorOffsetKVCache)
+    assert cache[0].size() == 203
+    # Grant = 3 prompt + 206 reserve, rounded to one 256-token step — not
+    # the 512-token env default, and nowhere near the request ceiling bug.
+    assert int(cache[0].keys.shape[2]) == 256
+
+
+def test_unbounded_request_budget_clamps_to_env_ceiling_and_demotes(monkeypatch):
+    """Server-default budgets (whole context window) must not size the grant.
+
+    2.4.0 regression receipt: max_tokens defaulted to ~262k and every
+    request materialized a multi-gigabyte KV reserve at first promotion
+    (44 GB peak, ~13 tok/s turn opens). The grant clamps to the env
+    ceiling; a request that outgrows it demotes to eager for the request
+    remainder (the 2026-07-03 contract) and stays exact.
+    """
+
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_PREWARM", "0")
+    rt = _ExactKVRuntime()
+    cache = [KVCache()]
+    rt.forward_ar_capture(mx.array([[0, 1, 2]]), cache=cache)
+    bank = CompiledVerifyBank(rt, request_max_tokens=262_133, parity=True)
+    assert bank.growth_reserve_tokens == 512  # env ceiling, not the budget
 
     for token_index in range(1024):
         bank.forward_ar_capture(
@@ -606,13 +646,40 @@ def test_request_reserve_keeps_1024_outputs_compiled_and_parity_exact(monkeypatc
         )
 
     stats = bank.to_dict()
-    assert stats["request_max_tokens"] == 1024
-    assert stats["speculative_headroom"] == bank.max_verify_len == 6
+    assert stats["request_max_tokens"] == 262_133
+    assert stats["calls"] == 1024
+    assert stats["growth_demotions"] == 1
+    assert stats["fallback_reasons"].get("growth_budget_exhausted", 0) > 0
+    assert stats["compiled_calls"] + stats["fallback_calls"] == 1024
+    assert stats["parity_failures"] == 0
+    # Demoted back to stock entries; the eager path finished the request.
+    assert type(cache[0]) is KVCache
+    assert cache[0].offset == 1027
+
+
+def test_env_reserve_raises_ceiling_for_known_budget_runs(monkeypatch):
+    """A known 1024-token request must not hit the 512-token cliff when the
+    operator widens the ceiling — the original PR #174 win, now env-gated."""
+
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_PREWARM", "0")
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_GROWTH_RESERVE", "2048")
+    rt = _ExactKVRuntime()
+    cache = [KVCache()]
+    rt.forward_ar_capture(mx.array([[0, 1, 2]]), cache=cache)
+    bank = CompiledVerifyBank(rt, request_max_tokens=1024, parity=True)
+    assert bank.growth_reserve_tokens == 1030  # min(budget + window, env)
+
+    for token_index in range(1024):
+        bank.forward_ar_capture(
+            mx.array([[token_index % rt.V]]),
+            cache=cache,
+            return_hidden=True,
+        )
+
+    stats = bank.to_dict()
     assert stats["compiled_calls"] == 1024
     assert stats["fallback_calls"] == 0
-    assert stats["fallback_reasons"] == {}
     assert stats["growth_demotions"] == 0
-    assert stats["parity_checks"] == 1024
     assert stats["parity_failures"] == 0
     assert isinstance(cache[0], TensorOffsetKVCache)
     assert cache[0].size() == 1027

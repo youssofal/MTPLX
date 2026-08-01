@@ -27,6 +27,7 @@ import MTPLXAppCore
 
 struct StreamingAssistantView: View {
     @ObservedObject var viewModel: ChatViewModel
+    @EnvironmentObject private var backend: MTPLXBackendStore
 
     /// The open well. Auto-follows `streamingPhase`; chip taps can
     /// override until the next phase change reasserts the live tool.
@@ -69,7 +70,8 @@ struct StreamingAssistantView: View {
                 HStack(alignment: .top, spacing: 0) {
                     StreamingAssistantMarkdownView(
                         document: viewModel.streamingContentDocument,
-                        fallbackText: viewModel.streamingContent
+                        fallbackText: viewModel.streamingContent,
+                        plainTextOnly: backend.configuration.performanceLock
                     )
                     .frame(maxWidth: 576, alignment: .leading)
                     .padding(.horizontal, 14)
