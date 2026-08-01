@@ -138,12 +138,16 @@ enum HermesOrphanSidecarScanner {
         processes: [HermesSidecarProcessSnapshot],
         livePIDs: Set<Int32>
     ) -> [Int32] {
-        let processesByPID = Dictionary(uniqueKeysWithValues: processes.map { ($0.pid, $0) })
+        let processesByPID = Dictionary(grouping: processes, by: \.pid)
+        let recordsByPID = Dictionary(grouping: records, by: \.pid)
         return records.compactMap { record in
             guard record.pid > 1,
                   record.parentPID > 1,
                   !livePIDs.contains(record.parentPID),
-                  let process = processesByPID[record.pid],
+                  recordsByPID[record.pid]?.count == 1,
+                  let snapshots = processesByPID[record.pid],
+                  snapshots.count == 1,
+                  let process = snapshots.first,
                   isExactOwnedSidecar(process, record: record)
             else { return nil }
             return record.pid
@@ -161,10 +165,22 @@ enum HermesOrphanSidecarScanner {
               process.argv0 == record.argv0,
               process.arguments == record.arguments
         else { return false }
-        let profilePrefix = record.profileName == "default" ? [] : ["-p", record.profileName]
-        return record.arguments == profilePrefix + [
+        return hasCanonicalArguments(
+            record.arguments,
+            profileName: record.profileName,
+            launchID: record.launchID
+        )
+    }
+
+    static func hasCanonicalArguments(
+        _ arguments: [String],
+        profileName: String,
+        launchID: String
+    ) -> Bool {
+        let profilePrefix = profileName == "default" ? [] : ["-p", profileName]
+        return arguments == profilePrefix + [
             "serve", "--isolated", "--host", "127.0.0.1",
-            "--port", "0", "--ssh-owner-nonce", record.launchID,
+            "--port", "0", "--ssh-owner-nonce", launchID,
         ]
     }
 }

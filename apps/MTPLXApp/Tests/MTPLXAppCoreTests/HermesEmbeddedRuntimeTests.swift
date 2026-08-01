@@ -207,6 +207,7 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
             environment: [
                 "HOME": root.path,
                 "PATH": "/usr/bin:/bin",
+                "MTPLX_FIXTURE_ENV_FILE": environmentCaptureURL.path,
             ],
             sidecarRuntimeDirectory: sidecarRuntimeDirectory
         )
@@ -241,6 +242,35 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: envURL), envBefore)
     }
 
+    func testExecWrapperRecordsVerifiedPostLaunchIdentity() async throws {
+        let environmentCaptureURL = root.appendingPathComponent("wrapper-environment.txt")
+        let fixture = try makeExecWrapperFixture(environmentCaptureURL: environmentCaptureURL)
+        let wrapperIntegration = HermesIntegration(
+            hermesHome: hermesHome,
+            executablePath: fixture.wrapper.path,
+            environment: [
+                "HOME": root.path,
+                "PATH": "/usr/bin:/bin",
+                "MTPLX_FIXTURE_ENV_FILE": environmentCaptureURL.path,
+            ],
+            sidecarRuntimeDirectory: sidecarRuntimeDirectory
+        )
+
+        let sidecar = try await wrapperIntegration.startEmbeddedSidecar(
+            profile: HermesProfile(name: "default", path: hermesHome.path, isDefault: true),
+            configuration: configuration
+        )
+        defer { sidecar.stop() }
+        let record = try JSONDecoder().decode(
+            HermesSidecarOwnershipRecord.self,
+            from: Data(contentsOf: sidecar.ownershipRecordURL)
+        )
+
+        XCTAssertEqual(record.executablePath, fixture.binary.standardizedFileURL.resolvingSymlinksInPath().path)
+        XCTAssertEqual(record.argv0, fixture.binary.path)
+        XCTAssertEqual(Array(record.arguments.suffix(6)), ["--host", "127.0.0.1", "--port", "0", "--ssh-owner-nonce", record.launchID])
+    }
+
     func testStartupFailureRedactsTokenSplitAcrossStderrWrites() async throws {
         let tokenCaptureURL = root.appendingPathComponent("split-token.txt")
         let fixture = try makeSplitSecretFailureFixture(tokenCaptureURL: tokenCaptureURL)
@@ -267,6 +297,40 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
             XCTAssertFalse(diagnostic.contains(token))
             XCTAssertFalse(diagnostic.contains(String(token.prefix(20))))
             XCTAssertFalse(diagnostic.contains(String(token.suffix(20))))
+        }
+    }
+
+    func testStartupFailureRedactsShortSecretSplitAcrossStderrWrites() async throws {
+        let secretCaptureURL = root.appendingPathComponent("short-secret.txt")
+        let fixture = try makeShortSplitSecretFailureFixture(secretCaptureURL: secretCaptureURL)
+        let shortSecretConfiguration = MTPLXAppConfiguration(
+            model: "/models/current-model",
+            host: "127.0.0.1",
+            port: 18080,
+            apiKey: "qq"
+        )
+        let failingIntegration = HermesIntegration(
+            hermesHome: hermesHome,
+            executablePath: fixture.path,
+            environment: [
+                "HOME": root.path,
+                "PATH": "/usr/bin:/bin",
+                "MTPLX_FIXTURE_SECRET_FILE": secretCaptureURL.path,
+            ],
+            sidecarRuntimeDirectory: sidecarRuntimeDirectory
+        )
+
+        do {
+            _ = try await failingIntegration.startEmbeddedSidecar(
+                profile: HermesProfile(name: "default", path: hermesHome.path, isDefault: true),
+                configuration: shortSecretConfiguration
+            )
+            XCTFail("The fixture exits before readiness and must fail startup")
+        } catch {
+            let diagnostic = error.localizedDescription
+            XCTAssertEqual(try String(contentsOf: secretCaptureURL, encoding: .utf8), "qq")
+            XCTAssertFalse(diagnostic.contains("qq"))
+            XCTAssertFalse(diagnostic.contains("q"))
         }
     }
 
@@ -329,6 +393,37 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
         XCTAssertEqual(HermesOrphanSidecarScanner.orphanPIDs(records: [record], processes: [wrongArgv0], livePIDs: []), [])
     }
 
+    func testOrphanCleanupFailsClosedForDuplicatePIDRecords() {
+        let first = HermesSidecarOwnershipRecord(
+            launchID: "1111111111111111",
+            pid: 7101,
+            parentPID: 8001,
+            profileName: "one",
+            createdAt: .now,
+            executablePath: "/usr/local/bin/hermes",
+            arguments: ["-p", "one", "serve", "--isolated", "--host", "127.0.0.1", "--port", "0", "--ssh-owner-nonce", "1111111111111111"]
+        )
+        let conflicting = HermesSidecarOwnershipRecord(
+            launchID: "2222222222222222",
+            pid: 7101,
+            parentPID: 8002,
+            profileName: "two",
+            createdAt: .now,
+            executablePath: "/usr/local/bin/hermes",
+            arguments: ["-p", "two", "serve", "--isolated", "--host", "127.0.0.1", "--port", "0", "--ssh-owner-nonce", "2222222222222222"]
+        )
+        let process = HermesSidecarProcessSnapshot(
+            pid: 7101,
+            executablePath: "/usr/local/bin/hermes",
+            arguments: first.arguments
+        )
+
+        XCTAssertEqual(
+            HermesOrphanSidecarScanner.orphanPIDs(records: [first, conflicting], processes: [process, process], livePIDs: []),
+            []
+        )
+    }
+
     private func makeProfile(named name: String, config: String, env: String? = nil) throws -> URL {
         let profile = hermesHome.appendingPathComponent("profiles/\(name)", isDirectory: true)
         try FileManager.default.createDirectory(at: profile, withIntermediateDirectories: true)
@@ -349,22 +444,75 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
     }
 
     private func makeSidecarFixture(environmentCaptureURL: URL) throws -> URL {
-        let fixture = root.appendingPathComponent("hermes-fixture.sh")
+        _ = environmentCaptureURL
+        return try makeSidecarBinary()
+    }
+
+    private func makeExecWrapperFixture(environmentCaptureURL: URL) throws -> (wrapper: URL, binary: URL) {
+        let binary = try makeSidecarBinary()
+        let wrapper = root.appendingPathComponent("hermes-exec-wrapper.sh")
         let script = """
         #!/bin/sh
-        if [ -n \"$HERMES_DASHBOARD_SESSION_TOKEN\" ]; then
-          printf 'HERMES_DASHBOARD_SESSION_TOKEN=present\\n' > \"\(environmentCaptureURL.path)\"
-        fi
-        if [ -n \"$OPENAI_API_KEY\" ]; then
-          printf 'OPENAI_API_KEY=present\\n' >> \"\(environmentCaptureURL.path)\"
-        fi
-        printf 'HERMES_BACKEND_READY port=45123\\n'
-        trap 'exit 0' TERM INT
-        while :; do sleep 1; done
+        exec "\(binary.path)" "$@"
         """
-        try script.write(to: fixture, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fixture.path)
-        return fixture
+        try script.write(to: wrapper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: wrapper.path)
+        _ = environmentCaptureURL
+        return (wrapper, binary)
+    }
+
+    private func makeSidecarBinary() throws -> URL {
+        let source = root.appendingPathComponent("hermes-sidecar-fixture.c")
+        let binary = root.appendingPathComponent("hermes-sidecar-fixture")
+        let code = """
+        #include <signal.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+        #include <unistd.h>
+
+        static volatile sig_atomic_t running = 1;
+        static void stop(int signal) { (void)signal; running = 0; }
+
+        int main(void) {
+            const char *capture = getenv("MTPLX_FIXTURE_ENV_FILE");
+            if (capture != NULL) {
+                FILE *file = fopen(capture, "w");
+                if (file != NULL) {
+                    if (getenv("HERMES_DASHBOARD_SESSION_TOKEN") != NULL) {
+                        fputs("HERMES_DASHBOARD_SESSION_TOKEN=present\\n", file);
+                    }
+                    if (getenv("OPENAI_API_KEY") != NULL) {
+                        fputs("OPENAI_API_KEY=present\\n", file);
+                    }
+                    fclose(file);
+                }
+            }
+            fputs("HERMES_BACKEND_READY port=45123\\n", stdout);
+            fflush(stdout);
+            signal(SIGTERM, stop);
+            signal(SIGINT, stop);
+            while (running) { pause(); }
+            return 0;
+        }
+        """
+        try code.write(to: source, atomically: true, encoding: .utf8)
+        let compiler = Process()
+        compiler.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        compiler.arguments = ["clang", source.path, "-o", binary.path]
+        let output = Pipe()
+        compiler.standardOutput = output
+        compiler.standardError = output
+        let watchdog = SubprocessWatchdog(compiler)
+        try compiler.run()
+        let drain = SubprocessPipeDrain(output, capacity: 65_536)
+        guard watchdog.wait(for: compiler, timeout: 20), compiler.terminationStatus == 0 else {
+            drain.join(timeout: 1)
+            throw NSError(domain: "HermesEmbeddedRuntimeTests", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "Could not compile sidecar fixture: \(drain.snapshot())",
+            ])
+        }
+        drain.join(timeout: 1)
+        return binary
     }
 
     private func makeSplitSecretFailureFixture(tokenCaptureURL: URL) throws -> URL {
@@ -379,6 +527,22 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
         """
         try script.write(to: fixture, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fixture.path)
+        return fixture
+    }
+
+    private func makeShortSplitSecretFailureFixture(secretCaptureURL: URL) throws -> URL {
+        let fixture = root.appendingPathComponent("hermes-short-secret-fixture.sh")
+        let script = """
+        #!/bin/sh
+        secret="$OPENAI_API_KEY"
+        printf '%s' "$secret" > "$MTPLX_FIXTURE_SECRET_FILE"
+        printf '%s' "${secret%?}" >&2
+        printf '%s\\n' "${secret#?}" >&2
+        exit 1
+        """
+        try script.write(to: fixture, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fixture.path)
+        _ = secretCaptureURL
         return fixture
     }
 }

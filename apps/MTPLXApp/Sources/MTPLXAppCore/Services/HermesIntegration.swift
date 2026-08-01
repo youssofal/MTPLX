@@ -959,14 +959,26 @@ public struct HermesIntegration: Sendable {
 
             let recordURL = sidecarRuntimeDirectory
                 .appendingPathComponent("\(spec.launchID).json", isDirectory: false)
+            guard let identity = Self.processSnapshot(pid: process.processIdentifier),
+                  identity.arguments == spec.arguments,
+                  HermesOrphanSidecarScanner.hasCanonicalArguments(
+                      spec.arguments,
+                      profileName: profile.name,
+                      launchID: spec.launchID
+                  )
+            else {
+                throw HermesIntegrationError.launchFailed(
+                    Self.startupDiagnostic("Hermes process identity could not be verified.", stderrTail: stderrTail)
+                )
+            }
             let record = HermesSidecarOwnershipRecord(
                 launchID: spec.launchID,
                 pid: process.processIdentifier,
                 parentPID: spec.parentPID,
                 profileName: profile.name,
                 createdAt: Date(),
-                executablePath: Self.canonicalExecutablePath(spec.executableURL),
-                argv0: spec.executableURL.path,
+                executablePath: identity.executablePath,
+                argv0: identity.argv0,
                 arguments: spec.arguments
             )
             do {
@@ -1911,7 +1923,7 @@ public struct HermesIntegration: Sendable {
 
     private static func stderrSecrets(for spec: HermesServeLaunchSpec) -> [String] {
         Array(Set(spec.environment.values + [spec.token]))
-            .filter { $0.count >= 4 }
+            .filter { !$0.isEmpty }
     }
 
     private static func startupDiagnostic(_ summary: String, stderrTail: SubprocessTailBuffer) -> String {
