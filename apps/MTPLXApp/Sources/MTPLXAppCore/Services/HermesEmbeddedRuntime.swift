@@ -45,22 +45,74 @@ public struct HermesSidecarOwnershipRecord: Codable, Equatable, Sendable {
     public let parentPID: Int32
     public let profileName: String
     public let createdAt: Date
+    public let executablePath: String
+    public let argv0: String
+    public let arguments: [String]
 
-    public init(launchID: String, pid: Int32, parentPID: Int32, profileName: String, createdAt: Date) {
+    public init(
+        launchID: String,
+        pid: Int32,
+        parentPID: Int32,
+        profileName: String,
+        createdAt: Date,
+        executablePath: String = "",
+        argv0: String? = nil,
+        arguments: [String] = []
+    ) {
         self.launchID = launchID
         self.pid = pid
         self.parentPID = parentPID
         self.profileName = profileName
         self.createdAt = createdAt
+        self.executablePath = executablePath
+        self.argv0 = argv0 ?? executablePath
+        self.arguments = arguments
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case launchID, pid, parentPID, profileName, createdAt, executablePath, argv0, arguments
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        launchID = try container.decode(String.self, forKey: .launchID)
+        pid = try container.decode(Int32.self, forKey: .pid)
+        parentPID = try container.decode(Int32.self, forKey: .parentPID)
+        profileName = try container.decode(String.self, forKey: .profileName)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        executablePath = try container.decodeIfPresent(String.self, forKey: .executablePath) ?? ""
+        argv0 = try container.decodeIfPresent(String.self, forKey: .argv0) ?? executablePath
+        arguments = try container.decodeIfPresent([String].self, forKey: .arguments) ?? []
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(launchID, forKey: .launchID)
+        try container.encode(pid, forKey: .pid)
+        try container.encode(parentPID, forKey: .parentPID)
+        try container.encode(profileName, forKey: .profileName)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encode(executablePath, forKey: .executablePath)
+        try container.encode(argv0, forKey: .argv0)
+        try container.encode(arguments, forKey: .arguments)
     }
 }
 
 public struct HermesSidecarProcessSnapshot: Equatable, Sendable {
     public let pid: Int32
+    public let executablePath: String
+    public let argv0: String
     public let arguments: [String]
 
-    public init(pid: Int32, arguments: [String]) {
+    public init(
+        pid: Int32,
+        executablePath: String = "",
+        argv0: String? = nil,
+        arguments: [String]
+    ) {
         self.pid = pid
+        self.executablePath = executablePath
+        self.argv0 = argv0 ?? executablePath
         self.arguments = arguments
     }
 }
@@ -78,8 +130,8 @@ enum HermesBackendReadyParser {
 
 /// Pure command matching used by orphan recovery.  It intentionally does not
 /// attempt to infer ownership from a generic Hermes command: a persisted MTPLX
-/// record, exact PID, dead recorded parent, and the two exact argument pairs
-/// are all required before the caller sends a signal.
+/// record, exact PID, dead recorded parent, canonical executable, and complete
+/// argument vector are all required before the caller sends a signal.
 enum HermesOrphanSidecarScanner {
     static func orphanPIDs(
         records: [HermesSidecarOwnershipRecord],
@@ -92,7 +144,7 @@ enum HermesOrphanSidecarScanner {
                   record.parentPID > 1,
                   !livePIDs.contains(record.parentPID),
                   let process = processesByPID[record.pid],
-                  isExactOwnedSidecar(process, launchID: record.launchID)
+                  isExactOwnedSidecar(process, record: record)
             else { return nil }
             return record.pid
         }
@@ -101,20 +153,85 @@ enum HermesOrphanSidecarScanner {
 
     static func isExactOwnedSidecar(
         _ process: HermesSidecarProcessSnapshot,
-        launchID: String
+        record: HermesSidecarOwnershipRecord
     ) -> Bool {
-        let arguments = process.arguments
-        guard let serveIndex = arguments.firstIndex(of: "serve"),
-              arguments.indices.contains(serveIndex + 1),
-              arguments[serveIndex + 1] == "--isolated",
-              arguments.filter({ $0 == "serve" }).count == 1,
-              arguments.filter({ $0 == "--isolated" }).count == 1,
-              let markerIndex = arguments.firstIndex(of: "--ssh-owner-nonce"),
-              arguments.indices.contains(markerIndex + 1),
-              arguments[markerIndex + 1] == launchID,
-              arguments.filter({ $0 == "--ssh-owner-nonce" }).count == 1
+        guard !record.executablePath.isEmpty,
+              process.executablePath == record.executablePath,
+              !record.argv0.isEmpty,
+              process.argv0 == record.argv0,
+              process.arguments == record.arguments
         else { return false }
-        return true
+        let profilePrefix = record.profileName == "default" ? [] : ["-p", record.profileName]
+        return record.arguments == profilePrefix + [
+            "serve", "--isolated", "--host", "127.0.0.1",
+            "--port", "0", "--ssh-owner-nonce", record.launchID,
+        ]
+    }
+}
+
+/// Redacts secrets while bytes arrive from stderr.  It never emits a suffix
+/// that could still be the beginning of a secret, so a token split across pipe
+/// callbacks cannot enter the diagnostic tail as separate visible fragments.
+final class HermesStreamingSecretRedactor: @unchecked Sendable {
+    private let lock = NSLock()
+    private let secrets: [Data]
+    private var pending = Data()
+    private let replacement = Data("[redacted]".utf8)
+
+    init(secrets: [String]) {
+        self.secrets = Array(Set(secrets.filter { !$0.isEmpty })).map { Data($0.utf8) }
+    }
+
+    func redact(_ chunk: Data) -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        pending.append(chunk)
+        var output = Data()
+        while true {
+            if let match = earliestSecretMatch(in: pending) {
+                output.append(contentsOf: pending[..<match.lowerBound])
+                output.append(replacement)
+                pending.removeSubrange(..<match.upperBound)
+                continue
+            }
+            let retainedCount = longestSecretPrefixSuffix(in: pending)
+            let emittedCount = pending.count - retainedCount
+            if emittedCount > 0 {
+                output.append(contentsOf: pending.prefix(emittedCount))
+                pending.removeFirst(emittedCount)
+            }
+            return output
+        }
+    }
+
+    private func earliestSecretMatch(in data: Data) -> Range<Data.Index>? {
+        secrets.reduce(nil) { current, secret in
+            guard let candidate = data.range(of: secret) else { return current }
+            guard let current else { return candidate }
+            if candidate.lowerBound < current.lowerBound { return candidate }
+            if candidate.lowerBound == current.lowerBound,
+               data.distance(from: candidate.lowerBound, to: candidate.upperBound)
+                    > data.distance(from: current.lowerBound, to: current.upperBound) {
+                return candidate
+            }
+            return current
+        }
+    }
+
+    private func longestSecretPrefixSuffix(in data: Data) -> Int {
+        guard !data.isEmpty else { return 0 }
+        var best = 0
+        for secret in secrets where secret.count > 1 {
+            let maximum = min(secret.count - 1, data.count)
+            guard maximum > best else { continue }
+            for length in stride(from: maximum, through: best + 1, by: -1) {
+                if Array(data.suffix(length)) == Array(secret.prefix(length)) {
+                    best = length
+                    break
+                }
+            }
+        }
+        return best
     }
 }
 

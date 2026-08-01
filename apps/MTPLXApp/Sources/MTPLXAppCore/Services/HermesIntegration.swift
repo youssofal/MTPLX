@@ -193,19 +193,24 @@ public final class HermesSidecar: HermesSidecarControlling, @unchecked Sendable 
     public var isRunning: Bool { process.isRunning }
 
     public func stop() {
-        defer {
-            outputPipes.forEach { $0.fileHandleForReading.readabilityHandler = nil }
-            try? FileManager.default.removeItem(at: ownershipRecordURL)
-        }
-        guard process.isRunning else { return }
-        process.terminate()
-        let deadline = Date().addingTimeInterval(2)
-        while process.isRunning && Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.05)
-        }
         if process.isRunning {
-            kill(process.processIdentifier, SIGKILL)
+            process.terminate()
+            let termDeadline = Date().addingTimeInterval(2)
+            while process.isRunning && Date() < termDeadline {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            if process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+                let killDeadline = Date().addingTimeInterval(0.5)
+                while process.isRunning && Date() < killDeadline {
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+            }
         }
+        // Do not lose the recovery record while the child might still exist.
+        guard !process.isRunning else { return }
+        outputPipes.forEach { $0.fileHandleForReading.readabilityHandler = nil }
+        try? FileManager.default.removeItem(at: ownershipRecordURL)
     }
 }
 
@@ -876,7 +881,9 @@ public struct HermesIntegration: Sendable {
 
             let readiness = HermesSidecarReadiness()
             let stderrTail = SubprocessTailBuffer(capacity: 4_096)
-            let redact = Self.stderrRedactor(for: spec)
+            let stderrRedactor = HermesStreamingSecretRedactor(
+                secrets: Self.stderrSecrets(for: spec)
+            )
             stdout.fileHandleForReading.readabilityHandler = { handle in
                 let chunk = handle.availableData
                 if chunk.isEmpty {
@@ -890,7 +897,7 @@ public struct HermesIntegration: Sendable {
                 if chunk.isEmpty {
                     handle.readabilityHandler = nil
                 } else {
-                    stderrTail.append(Data(redact(String(decoding: chunk, as: UTF8.self)).utf8))
+                    stderrTail.append(stderrRedactor.redact(chunk))
                 }
             }
 
@@ -957,7 +964,10 @@ public struct HermesIntegration: Sendable {
                 pid: process.processIdentifier,
                 parentPID: spec.parentPID,
                 profileName: profile.name,
-                createdAt: Date()
+                createdAt: Date(),
+                executablePath: Self.canonicalExecutablePath(spec.executableURL),
+                argv0: spec.executableURL.path,
+                arguments: spec.arguments
             )
             do {
                 try Self.writeOwnershipRecord(record, to: recordURL)
@@ -986,39 +996,50 @@ public struct HermesIntegration: Sendable {
         let records = Self.readOwnershipRecords(in: sidecarRuntimeDirectory)
         var liveRecords: [(URL, HermesSidecarOwnershipRecord, HermesSidecarProcessSnapshot)] = []
         for (url, record) in records {
-            guard let snapshot = Self.processSnapshot(pid: record.pid) else {
+            switch Self.pidLiveness(record.pid) {
+            case .dead:
                 try? FileManager.default.removeItem(at: url)
+            case .alive:
+                // Inspection failure is not evidence of death or ownership.
+                guard let snapshot = Self.processSnapshot(pid: record.pid) else { continue }
+                liveRecords.append((url, record, snapshot))
+            case .unknown:
                 continue
             }
-            liveRecords.append((url, record, snapshot))
         }
 
         let candidatePIDs = Set(HermesOrphanSidecarScanner.orphanPIDs(
             records: liveRecords.map(\.1),
             processes: liveRecords.map(\.2),
-            livePIDs: Set(liveRecords.map(\.1.parentPID).filter(Self.isPIDAlive))
+            livePIDs: Set(liveRecords.map(\.1.parentPID).filter { Self.pidLiveness($0) == .alive })
         ))
         var reaped: [Int32] = []
         for (url, record, _) in liveRecords where candidatePIDs.contains(record.pid) {
             // Re-read immediately before TERM.  PID reuse or a changed command
             // must turn cleanup into a no-op rather than an accidental kill.
-            guard !Self.isPIDAlive(record.parentPID),
+            guard Self.pidLiveness(record.parentPID) == .dead,
+                  Self.pidLiveness(record.pid) == .alive,
                   let beforeTERM = Self.processSnapshot(pid: record.pid),
-                  HermesOrphanSidecarScanner.isExactOwnedSidecar(beforeTERM, launchID: record.launchID)
+                  HermesOrphanSidecarScanner.isExactOwnedSidecar(beforeTERM, record: record)
             else { continue }
             _ = kill(record.pid, SIGTERM)
             let deadline = Date().addingTimeInterval(2)
-            while Self.isPIDAlive(record.pid) && Date() < deadline {
+            while Self.pidLiveness(record.pid) == .alive && Date() < deadline {
                 Thread.sleep(forTimeInterval: 0.05)
             }
-            if Self.isPIDAlive(record.pid) {
-                guard !Self.isPIDAlive(record.parentPID),
+            if Self.pidLiveness(record.pid) == .alive {
+                guard Self.pidLiveness(record.parentPID) == .dead,
+                      Self.pidLiveness(record.pid) == .alive,
                       let beforeKILL = Self.processSnapshot(pid: record.pid),
-                      HermesOrphanSidecarScanner.isExactOwnedSidecar(beforeKILL, launchID: record.launchID)
+                      HermesOrphanSidecarScanner.isExactOwnedSidecar(beforeKILL, record: record)
                 else { continue }
                 _ = kill(record.pid, SIGKILL)
             }
-            if !Self.isPIDAlive(record.pid) {
+            let killDeadline = Date().addingTimeInterval(0.5)
+            while Self.pidLiveness(record.pid) == .alive && Date() < killDeadline {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            if Self.pidLiveness(record.pid) == .dead {
                 try? FileManager.default.removeItem(at: url)
                 reaped.append(record.pid)
             }
@@ -1888,15 +1909,9 @@ public struct HermesIntegration: Sendable {
             .joined()
     }
 
-    private static func stderrRedactor(for spec: HermesServeLaunchSpec) -> @Sendable (String) -> String {
-        let values = Set(spec.environment.values + [spec.token])
+    private static func stderrSecrets(for spec: HermesServeLaunchSpec) -> [String] {
+        Array(Set(spec.environment.values + [spec.token]))
             .filter { $0.count >= 4 }
-            .sorted { $0.count > $1.count }
-        return { text in
-            values.reduce(text) { partial, value in
-                partial.replacingOccurrences(of: value, with: "[redacted]")
-            }
-        }
     }
 
     private static func startupDiagnostic(_ summary: String, stderrTail: SubprocessTailBuffer) -> String {
@@ -1950,43 +1965,65 @@ public struct HermesIntegration: Sendable {
         }
     }
 
-    private static func isPIDAlive(_ pid: Int32) -> Bool {
-        guard pid > 1 else { return false }
-        if kill(pid, 0) == 0 { return true }
-        return errno == EPERM
+    private enum PIDLiveness: Equatable {
+        case alive
+        case dead
+        case unknown
+    }
+
+    private static func pidLiveness(_ pid: Int32) -> PIDLiveness {
+        guard pid > 1 else { return .dead }
+        if kill(pid, 0) == 0 { return .alive }
+        switch errno {
+        case ESRCH: return .dead
+        case EPERM: return .alive
+        default: return .unknown
+        }
     }
 
     private static func processSnapshot(pid: Int32) -> HermesSidecarProcessSnapshot? {
         guard pid > 1 else { return nil }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/ps")
-        process.arguments = ["-p", String(pid), "-o", "pid=,command="]
-        let output = Pipe()
-        process.standardOutput = output
-        process.standardError = Pipe()
-        let watchdog = SubprocessWatchdog(process)
-        do {
-            try process.run()
-        } catch {
+        var mib = [CTL_KERN, KERN_PROCARGS2, pid]
+        var byteCount = 0
+        guard sysctl(&mib, u_int(mib.count), nil, &byteCount, nil, 0) == 0,
+              byteCount > MemoryLayout<Int32>.size
+        else { return nil }
+        var bytes = [UInt8](repeating: 0, count: byteCount)
+        guard sysctl(&mib, u_int(mib.count), &bytes, &byteCount, nil, 0) == 0 else {
             return nil
         }
-        let drain = SubprocessPipeDrain(output, capacity: 16_384)
-        guard watchdog.wait(for: process, timeout: 2, terminateGrace: 0.2, killGrace: 0.2) else {
-            drain.join(timeout: 0.2)
-            return nil
+        let data = Data(bytes.prefix(byteCount))
+        guard data.count > MemoryLayout<Int32>.size else { return nil }
+        let argc = data.withUnsafeBytes { $0.loadUnaligned(as: Int32.self) }
+        guard argc > 0 else { return nil }
+        var offset = MemoryLayout<Int32>.size
+        guard let executable = Self.nulTerminatedString(in: data, offset: &offset) else { return nil }
+        while offset < data.count, data[offset] == 0 { offset += 1 }
+        var arguments: [String] = []
+        for _ in 0..<argc {
+            guard let argument = Self.nulTerminatedString(in: data, offset: &offset) else { return nil }
+            arguments.append(argument)
         }
-        drain.join(timeout: 0.2)
-        guard process.terminationStatus == 0,
-              let row = drain.snapshot().split(separator: "\n").first
+        guard !arguments.isEmpty else { return nil }
+        return HermesSidecarProcessSnapshot(
+            pid: pid,
+            executablePath: Self.canonicalExecutablePath(URL(fileURLWithPath: executable)),
+            argv0: arguments[0],
+            arguments: Array(arguments.dropFirst())
+        )
+    }
+
+    private static func nulTerminatedString(in data: Data, offset: inout Int) -> String? {
+        guard offset < data.count,
+              let terminator = data[offset...].firstIndex(of: 0)
         else { return nil }
-        let text = String(row).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let separator = text.firstIndex(where: { $0.isWhitespace }),
-              Int32(text[..<separator]) == pid
-        else { return nil }
-        let command = text[separator...].trimmingCharacters(in: .whitespacesAndNewlines)
-        let parts = command.split(whereSeparator: { $0.isWhitespace }).map(String.init)
-        guard parts.count > 1 else { return nil }
-        return HermesSidecarProcessSnapshot(pid: pid, arguments: Array(parts.dropFirst()))
+        let value = String(decoding: data[offset..<terminator], as: UTF8.self)
+        offset = terminator + 1
+        return value
+    }
+
+    private static func canonicalExecutablePath(_ url: URL) -> String {
+        url.standardizedFileURL.resolvingSymlinksInPath().path
     }
 
     public func sessionOwnership(

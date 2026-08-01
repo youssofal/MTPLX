@@ -241,18 +241,47 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: envURL), envBefore)
     }
 
+    func testStartupFailureRedactsTokenSplitAcrossStderrWrites() async throws {
+        let tokenCaptureURL = root.appendingPathComponent("split-token.txt")
+        let fixture = try makeSplitSecretFailureFixture(tokenCaptureURL: tokenCaptureURL)
+        let failingIntegration = HermesIntegration(
+            hermesHome: hermesHome,
+            executablePath: fixture.path,
+            environment: [
+                "HOME": root.path,
+                "PATH": "/usr/bin:/bin",
+                "MTPLX_FIXTURE_TOKEN_FILE": tokenCaptureURL.path,
+            ],
+            sidecarRuntimeDirectory: sidecarRuntimeDirectory
+        )
+
+        do {
+            _ = try await failingIntegration.startEmbeddedSidecar(
+                profile: HermesProfile(name: "default", path: hermesHome.path, isDefault: true),
+                configuration: configuration
+            )
+            XCTFail("The fixture exits before readiness and must fail startup")
+        } catch {
+            let diagnostic = error.localizedDescription
+            let token = try String(contentsOf: tokenCaptureURL, encoding: .utf8)
+            XCTAssertFalse(diagnostic.contains(token))
+            XCTAssertFalse(diagnostic.contains(String(token.prefix(20))))
+            XCTAssertFalse(diagnostic.contains(String(token.suffix(20))))
+        }
+    }
+
     func testOrphanCleanupRequiresExactMarkerCommandAndDeadParent() {
         let records = [
-            HermesSidecarOwnershipRecord(launchID: "1111111111111111", pid: 7101, parentPID: 8001, profileName: "one", createdAt: .now),
-            HermesSidecarOwnershipRecord(launchID: "2222222222222222", pid: 7102, parentPID: 8002, profileName: "two", createdAt: .now),
-            HermesSidecarOwnershipRecord(launchID: "3333333333333333", pid: 7103, parentPID: 8003, profileName: "three", createdAt: .now),
-            HermesSidecarOwnershipRecord(launchID: "4444444444444444", pid: 7104, parentPID: 9001, profileName: "four", createdAt: .now),
+            HermesSidecarOwnershipRecord(launchID: "1111111111111111", pid: 7101, parentPID: 8001, profileName: "one", createdAt: .now, executablePath: "/usr/local/bin/hermes", arguments: ["-p", "one", "serve", "--isolated", "--host", "127.0.0.1", "--port", "0", "--ssh-owner-nonce", "1111111111111111"]),
+            HermesSidecarOwnershipRecord(launchID: "2222222222222222", pid: 7102, parentPID: 8002, profileName: "two", createdAt: .now, executablePath: "/usr/local/bin/hermes", arguments: ["-p", "two", "serve", "--isolated", "--host", "127.0.0.1", "--port", "0", "--ssh-owner-nonce", "2222222222222222"]),
+            HermesSidecarOwnershipRecord(launchID: "3333333333333333", pid: 7103, parentPID: 8003, profileName: "three", createdAt: .now, executablePath: "/usr/local/bin/hermes", arguments: ["-p", "three", "serve", "--isolated", "--host", "127.0.0.1", "--port", "0", "--ssh-owner-nonce", "3333333333333333"]),
+            HermesSidecarOwnershipRecord(launchID: "4444444444444444", pid: 7104, parentPID: 9001, profileName: "four", createdAt: .now, executablePath: "/usr/local/bin/hermes", arguments: ["-p", "four", "serve", "--isolated", "--host", "127.0.0.1", "--port", "0", "--ssh-owner-nonce", "4444444444444444"]),
         ]
         let processes = [
-            HermesSidecarProcessSnapshot(pid: 7101, arguments: ["-p", "one", "serve", "--isolated", "--host", "127.0.0.1", "--port", "0", "--ssh-owner-nonce", "1111111111111111"]),
-            HermesSidecarProcessSnapshot(pid: 7102, arguments: ["serve", "--host", "127.0.0.1", "--port", "0"]),
-            HermesSidecarProcessSnapshot(pid: 7103, arguments: ["serve", "--isolated", "--ssh-owner-nonce", "wrong-marker"]),
-            HermesSidecarProcessSnapshot(pid: 7104, arguments: ["serve", "--isolated", "--ssh-owner-nonce", "4444444444444444"]),
+            HermesSidecarProcessSnapshot(pid: 7101, executablePath: "/usr/local/bin/hermes", arguments: ["-p", "one", "serve", "--isolated", "--host", "127.0.0.1", "--port", "0", "--ssh-owner-nonce", "1111111111111111"]),
+            HermesSidecarProcessSnapshot(pid: 7102, executablePath: "/usr/local/bin/hermes", arguments: ["serve", "--host", "127.0.0.1", "--port", "0"]),
+            HermesSidecarProcessSnapshot(pid: 7103, executablePath: "/usr/local/bin/hermes", arguments: ["-p", "three", "serve", "--isolated", "--host", "127.0.0.1", "--port", "0", "--ssh-owner-nonce", "wrong-marker"]),
+            HermesSidecarProcessSnapshot(pid: 7104, executablePath: "/usr/local/bin/hermes", arguments: ["-p", "four", "serve", "--isolated", "--host", "127.0.0.1", "--port", "0", "--ssh-owner-nonce", "4444444444444444"]),
         ]
 
         let killed = HermesOrphanSidecarScanner.orphanPIDs(
@@ -265,6 +294,39 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
         XCTAssertFalse(killed.contains(7102))
         XCTAssertFalse(killed.contains(7103))
         XCTAssertFalse(killed.contains(7104))
+    }
+
+    func testOrphanCleanupRejectsExecutableOrFullArgumentMismatch() {
+        let arguments = ["-p", "one", "serve", "--isolated", "--host", "127.0.0.1", "--port", "0", "--ssh-owner-nonce", "1111111111111111"]
+        let record = HermesSidecarOwnershipRecord(
+            launchID: "1111111111111111",
+            pid: 7101,
+            parentPID: 8001,
+            profileName: "one",
+            createdAt: .now,
+            executablePath: "/usr/local/bin/hermes",
+            arguments: arguments
+        )
+        let wrongExecutable = HermesSidecarProcessSnapshot(
+            pid: 7101,
+            executablePath: "/usr/local/bin/not-hermes",
+            arguments: arguments
+        )
+        let extraArgument = HermesSidecarProcessSnapshot(
+            pid: 7101,
+            executablePath: "/usr/local/bin/hermes",
+            arguments: arguments + ["--unexpected"]
+        )
+        let wrongArgv0 = HermesSidecarProcessSnapshot(
+            pid: 7101,
+            executablePath: "/usr/local/bin/hermes",
+            argv0: "/tmp/not-the-recorded-hermes",
+            arguments: arguments
+        )
+
+        XCTAssertEqual(HermesOrphanSidecarScanner.orphanPIDs(records: [record], processes: [wrongExecutable], livePIDs: []), [])
+        XCTAssertEqual(HermesOrphanSidecarScanner.orphanPIDs(records: [record], processes: [extraArgument], livePIDs: []), [])
+        XCTAssertEqual(HermesOrphanSidecarScanner.orphanPIDs(records: [record], processes: [wrongArgv0], livePIDs: []), [])
     }
 
     private func makeProfile(named name: String, config: String, env: String? = nil) throws -> URL {
@@ -299,6 +361,21 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
         printf 'HERMES_BACKEND_READY port=45123\\n'
         trap 'exit 0' TERM INT
         while :; do sleep 1; done
+        """
+        try script.write(to: fixture, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fixture.path)
+        return fixture
+    }
+
+    private func makeSplitSecretFailureFixture(tokenCaptureURL: URL) throws -> URL {
+        let fixture = root.appendingPathComponent("hermes-split-secret-fixture.sh")
+        let script = """
+        #!/bin/sh
+        token="$HERMES_DASHBOARD_SESSION_TOKEN"
+        printf '%s' "$token" > "$MTPLX_FIXTURE_TOKEN_FILE"
+        printf '%s' "${token%????????????????????}" >&2
+        printf '%s\\n' "${token#???????????????????????}" >&2
+        exit 1
         """
         try script.write(to: fixture, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fixture.path)
