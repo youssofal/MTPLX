@@ -1053,10 +1053,7 @@ struct HermesPanel: View {
 
     private func remember(_ reference: HermesSessionReference) {
         var config = backend.configuration
-        config.lastLaunchTarget = LaunchTarget.hermes.rawValue
-        config.lastHermesProfile = reference.profileName
-        config.lastHermesSessionID = reference.sessionID
-        config.lastHermesSessionTitle = reference.title
+        config.rememberEmbeddedHermesSession(reference)
         try? backend.saveSettings(config)
     }
 

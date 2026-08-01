@@ -306,6 +306,15 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         self.hfEndpoint = hfEndpoint
     }
 
+    /// Records the app-owned embedded Hermes session to offer on the next
+    /// overlay visit. This deliberately leaves the generic daemon launch
+    /// target alone: embedded Hermes is not a `mtplx start hermes` handoff.
+    public mutating func rememberEmbeddedHermesSession(_ reference: HermesSessionReference) {
+        lastHermesProfile = reference.profileName
+        lastHermesSessionID = reference.sessionID
+        lastHermesSessionTitle = reference.title
+    }
+
     /// Fresh installs must be portable. Installed local copies are discovered
     /// by the model catalog; the default configuration should never point at
     /// a developer machine path.

@@ -3705,6 +3705,28 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(backend.settingsURL, expected)
     }
 
+    func testRememberingEmbeddedHermesSessionPreservesExistingLaunchTarget() {
+        var configuration = MTPLXAppConfiguration(
+            lastLaunchTarget: LaunchTarget.openCode.rawValue,
+            lastHermesProfile: "old-profile",
+            lastHermesSessionID: "old-session",
+            lastHermesSessionTitle: "Old agent"
+        )
+
+        configuration.rememberEmbeddedHermesSession(
+            HermesSessionReference(
+                profileName: "bernd",
+                sessionID: "session-123",
+                title: "Fix the app"
+            )
+        )
+
+        XCTAssertEqual(configuration.lastLaunchTarget, LaunchTarget.openCode.rawValue)
+        XCTAssertEqual(configuration.lastHermesProfile, "bernd")
+        XCTAssertEqual(configuration.lastHermesSessionID, "session-123")
+        XCTAssertEqual(configuration.lastHermesSessionTitle, "Fix the app")
+    }
+
     func testAppConfigurationPersistsHermesResumeState() throws {
         let url = temporaryDirectory().appendingPathComponent("settings.json")
         let store = MTPLXSettingsStore(settingsURL: url)
