@@ -362,6 +362,11 @@ public enum HermesSessionOwnership: Equatable, Sendable {
     case ready
     case ownedByMTPLX
     case external(surface: String)
+    /// The registry itself could not be read. Hermes creates this file lazily,
+    /// so a just-created local session may use a narrowly scoped store lease.
+    case registryUnavailable(String)
+    /// The registry was readable but its contents or process ownership could
+    /// not be proven. This state must always remain fail-closed.
     case unknown(String)
 }
 
@@ -376,6 +381,7 @@ public enum HermesSessionActivityState: Equatable, Sendable {
         case .ready: self = .ready
         case .ownedByMTPLX: self = .runningInMTPLX
         case .external(let surface): self = .externallyActive(surface: surface)
+        case .registryUnavailable(let reason): self = .ownershipUnknown(reason)
         case .unknown(let reason): self = .ownershipUnknown(reason)
         }
     }
@@ -419,7 +425,7 @@ public struct HermesActiveSessionRegistryInspector: @unchecked Sendable {
         do {
             data = try readData(registryURL)
         } catch {
-            return .unknown(Self.inspectionUnavailableReason)
+            return .registryUnavailable(Self.inspectionUnavailableReason)
         }
 
         let entries: [Entry]

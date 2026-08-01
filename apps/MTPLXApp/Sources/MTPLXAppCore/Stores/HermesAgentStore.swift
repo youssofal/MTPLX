@@ -148,6 +148,9 @@ public final class HermesAgentStore: ObservableObject {
     /// Separates installation/profile discovery from gateway generations so a
     /// cancelled overlay task cannot republish state after `stop()`.
     private var lifecycleGeneration = 0
+    /// Invalidates session-selection tasks even when they share the same
+    /// already-connected sidecar/client generation.
+    private var sessionSelectionGeneration = 0
     private var gatewayGeneration = 0
     private var didReapOrphanedSidecars = false
     private var hermesAutoApprove = false
@@ -176,6 +179,7 @@ public final class HermesAgentStore: ObservableObject {
         let sessionID: String
         let sessionKey: String
         let operation: GatewayOperation
+        let selectionGeneration: Int
     }
 
     private struct PendingRequestLease {
@@ -241,42 +245,42 @@ public final class HermesAgentStore: ObservableObject {
     }
 
     public func prepare(configuration: MTPLXAppConfiguration) async {
-        invalidateFreshSessionLease()
+        let selectionGeneration = beginSessionSelection()
         lifecycleGeneration += 1
         let generation = lifecycleGeneration
         // A later explicit prepare is a new overlay lifetime. `stop()`
         // invalidates the old generation but must not poison this one.
         shuttingDown = false
-        guard isCurrentPrepare(generation) else { return }
+        guard isCurrentPrepare(generation, selectionGeneration: selectionGeneration) else { return }
         connectionState = .checkingInstall
-        guard isCurrentPrepare(generation) else { return }
+        guard isCurrentPrepare(generation, selectionGeneration: selectionGeneration) else { return }
         gatewayRepairMessage = nil
-        guard isCurrentPrepare(generation) else { return }
+        guard isCurrentPrepare(generation, selectionGeneration: selectionGeneration) else { return }
         if !didReapOrphanedSidecars {
             _ = embeddedRuntime.reapOrphanedEmbeddedSidecars()
             didReapOrphanedSidecars = true
         }
         let status = await integration.installStatus()
-        guard isCurrentPrepare(generation) else { return }
+        guard isCurrentPrepare(generation, selectionGeneration: selectionGeneration) else { return }
         installStatus = status
-        guard isCurrentPrepare(generation) else { return }
+        guard isCurrentPrepare(generation, selectionGeneration: selectionGeneration) else { return }
         terminalAgentRunning = integration.hasLaunchedTerminalAgent()
-        guard isCurrentPrepare(generation) else { return }
+        guard isCurrentPrepare(generation, selectionGeneration: selectionGeneration) else { return }
         profiles = integration.discoverProfiles()
-        guard isCurrentPrepare(generation) else { return }
+        guard isCurrentPrepare(generation, selectionGeneration: selectionGeneration) else { return }
         profileRoutingStates = Dictionary(
             uniqueKeysWithValues: profiles.map { profile in
                 (profile.id, embeddedRuntime.routingState(for: profile, configuration: configuration))
             }
         )
-        guard isCurrentPrepare(generation) else { return }
+        guard isCurrentPrepare(generation, selectionGeneration: selectionGeneration) else { return }
         if let remembered = configuration.lastHermesProfile,
            let profile = profiles.first(where: { $0.name == remembered }) {
             selectedProfile = profile
         } else if selectedProfile == nil {
             selectedProfile = profiles.first
         }
-        guard isCurrentPrepare(generation) else { return }
+        guard isCurrentPrepare(generation, selectionGeneration: selectionGeneration) else { return }
         switch status.kind {
         case .ready:
             connectionState = .idle
@@ -328,6 +332,7 @@ public final class HermesAgentStore: ObservableObject {
         profile: HermesProfile,
         configuration: MTPLXAppConfiguration
     ) async {
+        let selectionGeneration = beginSessionSelection()
         var operation: GatewayOperation?
         do {
             operation = try await ensureGateway(
@@ -335,13 +340,22 @@ public final class HermesAgentStore: ObservableObject {
                 configuration: configuration,
                 preserveBlockedApprovalRecovery: preservesBlockedApprovalRecovery(for: profile)
             )
-            guard let operation, isCurrent(operation) else { return }
+            guard let operation,
+                  isCurrent(operation),
+                  isCurrentSessionSelection(selectionGeneration)
+            else { return }
             let result = try await rpc(operation, method: "session.list", params: ["limit": .number(200)])
-            guard isCurrent(operation) else { return }
+            guard isCurrent(operation),
+                  isCurrentSessionSelection(selectionGeneration)
+            else { return }
             sessions = sessionsWithActivity(Self.parseSessions(result), profile: profile)
             connectionState = .connected
         } catch {
-            guard let operation, isCurrent(operation), !shuttingDown else { return }
+            guard let operation,
+                  isCurrent(operation),
+                  isCurrentSessionSelection(selectionGeneration),
+                  !shuttingDown
+            else { return }
             sessions = []
             connectionState = .failed(Self.message(for: error))
         }
@@ -354,24 +368,30 @@ public final class HermesAgentStore: ObservableObject {
     ) async throws -> HermesSessionReference {
         // A new agent selection is an explicit session boundary. Do not let a
         // prior fresh-session lease survive if creation fails or is cancelled.
-        invalidateFreshSessionLease()
+        let selectionGeneration = beginSessionSelection()
         let operation = try await ensureGateway(
             profile: profile,
             configuration: configuration,
             preserveBlockedApprovalRecovery: false
         )
-        guard isCurrent(operation) else {
+        guard isCurrent(operation),
+              isCurrentSessionSelection(selectionGeneration)
+        else {
             throw HermesGatewayClientError.disconnected
         }
         let result = try await rpc(operation, method: "session.create", params: ["cols": .number(100)])
-        guard isCurrent(operation) else {
+        guard isCurrent(operation),
+              isCurrentSessionSelection(selectionGeneration)
+        else {
             throw CancellationError()
         }
         guard let sessionID = result.objectValue?["session_id"]?.stringValue else {
             throw HermesGatewayClientError.malformedResponse
         }
         let sessionKey = (try? await liveSessionKey(for: sessionID, operation: operation)) ?? sessionID
-        guard isCurrent(operation) else {
+        guard isCurrent(operation),
+              isCurrentSessionSelection(selectionGeneration)
+        else {
             throw CancellationError()
         }
         activeSessionID = sessionID
@@ -385,7 +405,8 @@ public final class HermesAgentStore: ObservableObject {
         freshSessionLease = FreshSessionLease(
             sessionID: sessionID,
             sessionKey: sessionKey,
-            operation: operation
+            operation: operation,
+            selectionGeneration: selectionGeneration
         )
         applyActiveOwnership(.ready)
         connectionState = .connected
@@ -403,13 +424,15 @@ public final class HermesAgentStore: ObservableObject {
         configuration: MTPLXAppConfiguration
     ) async throws -> HermesSessionReference {
         // Saved/native sessions never inherit the new-session exception.
-        invalidateFreshSessionLease()
+        let selectionGeneration = beginSessionSelection()
         let operation = try await ensureGateway(
             profile: profile,
             configuration: configuration,
             preserveBlockedApprovalRecovery: preservesBlockedApprovalRecovery(for: profile, savedSessionID: session.id)
         )
-        guard isCurrent(operation) else {
+        guard isCurrent(operation),
+              isCurrentSessionSelection(selectionGeneration)
+        else {
             throw HermesGatewayClientError.disconnected
         }
         sessions = sessionsWithActivity(sessions, profile: profile)
@@ -421,7 +444,9 @@ public final class HermesAgentStore: ObservableObject {
                 "cols": .number(100),
             ]
         )
-        guard isCurrent(operation) else {
+        guard isCurrent(operation),
+              isCurrentSessionSelection(selectionGeneration)
+        else {
             throw CancellationError()
         }
         try applyResumedSession(
@@ -606,6 +631,7 @@ public final class HermesAgentStore: ObservableObject {
 
     public func stop() async {
         shuttingDown = true
+        _ = beginSessionSelection()
         lifecycleGeneration += 1
         tearDownGateway(clearSession: true)
         activeSessionID = nil
@@ -626,6 +652,7 @@ public final class HermesAgentStore: ObservableObject {
     /// reopens the selected persisted session without discarding the locally
     /// visible transcript while transport recovery is in progress.
     public func reconnect(configuration: MTPLXAppConfiguration) async throws {
+        let selectionGeneration = beginSessionSelection()
         guard let profile = selectedProfile else { throw HermesGatewayClientError.disconnected }
         let savedSessionID = activeSessionKey ?? activeSessionID ?? configuration.lastHermesSessionID
         let title = activeSessionTitle ?? configuration.lastHermesSessionTitle
@@ -635,14 +662,18 @@ public final class HermesAgentStore: ObservableObject {
             preserveSession: true,
             preserveBlockedApprovalRecovery: preservesBlockedApprovalRecovery(for: profile)
         )
-        guard isCurrent(operation) else { throw CancellationError() }
+        guard isCurrent(operation),
+              isCurrentSessionSelection(selectionGeneration)
+        else { throw CancellationError() }
         guard let savedSessionID else { return }
         let result = try await rpc(
             operation,
             method: "session.resume",
             params: ["session_id": .string(savedSessionID), "cols": .number(100)]
         )
-        guard isCurrent(operation) else {
+        guard isCurrent(operation),
+              isCurrentSessionSelection(selectionGeneration)
+        else {
             throw CancellationError()
         }
         try applyResumedSession(
@@ -801,8 +832,11 @@ public final class HermesAgentStore: ObservableObject {
         )
     }
 
-    private func isCurrentPrepare(_ generation: Int) -> Bool {
-        !Task.isCancelled && lifecycleGeneration == generation && !shuttingDown
+    private func isCurrentPrepare(_ generation: Int, selectionGeneration: Int) -> Bool {
+        !Task.isCancelled
+            && lifecycleGeneration == generation
+            && isCurrentSessionSelection(selectionGeneration)
+            && !shuttingDown
     }
 
     private func rpc(
@@ -986,7 +1020,7 @@ public final class HermesAgentStore: ObservableObject {
         } else {
             resolved = primary
         }
-        if case .unknown = resolved,
+        if case .registryUnavailable = resolved,
            hasFreshSessionLease(for: profile) {
             // `session.create` allocated this exact session through the
             // currently-owned sidecar. A missing lazy registry must not block
@@ -1003,6 +1037,7 @@ public final class HermesAgentStore: ObservableObject {
               activeSessionID == lease.sessionID,
               activeSessionKey == lease.sessionKey,
               profile.id == lease.operation.profileID,
+              isCurrentSessionSelection(lease.selectionGeneration),
               isCurrent(lease.operation, sessionID: lease.sessionID)
         else { return false }
         return true
@@ -1010,6 +1045,17 @@ public final class HermesAgentStore: ObservableObject {
 
     private func invalidateFreshSessionLease() {
         freshSessionLease = nil
+    }
+
+    @discardableResult
+    private func beginSessionSelection() -> Int {
+        sessionSelectionGeneration += 1
+        invalidateFreshSessionLease()
+        return sessionSelectionGeneration
+    }
+
+    private func isCurrentSessionSelection(_ generation: Int) -> Bool {
+        !Task.isCancelled && sessionSelectionGeneration == generation
     }
 
     private func ownership(for sessionID: String, profile: HermesProfile) -> HermesSessionOwnership {
@@ -1024,10 +1070,12 @@ public final class HermesAgentStore: ObservableObject {
         _ first: HermesSessionOwnership,
         _ second: HermesSessionOwnership
     ) -> HermesSessionOwnership {
-        if case .unknown = first { return first }
-        if case .unknown = second { return second }
         if case .external = first { return first }
         if case .external = second { return second }
+        if case .unknown = first { return first }
+        if case .unknown = second { return second }
+        if case .registryUnavailable = first { return first }
+        if case .registryUnavailable = second { return second }
         if case .ownedByMTPLX = first { return first }
         return second
     }
@@ -1041,7 +1089,7 @@ public final class HermesAgentStore: ObservableObject {
         case .external:
             activeSessionWritable = false
             readOnlyReason = "This session is active in another Hermes surface."
-        case .unknown(let reason):
+        case .registryUnavailable(let reason), .unknown(let reason):
             activeSessionWritable = false
             readOnlyReason = reason
         }

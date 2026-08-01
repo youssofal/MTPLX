@@ -131,7 +131,7 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
                 processIdentity: { _ in .unknown },
                 readData: { _ in throw CocoaError(.fileReadNoPermission) }
             ).ownership(registryURL: registry, sessionID: "saved", ownedSidecarPID: nil),
-            .unknown("Session activity could not be inspected.")
+            .registryUnavailable("Session activity could not be inspected.")
         )
     }
 
@@ -149,6 +149,22 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
 
         XCTAssertEqual(inspector.ownership(registryURL: registry, sessionID: "dead", ownedSidecarPID: nil), .ready)
         XCTAssertEqual(inspector.ownership(registryURL: registry, sessionID: "reused", ownedSidecarPID: nil), .ready)
+    }
+
+    func testActiveSessionRegistryKeepsUnknownProcessIdentityFailClosed() throws {
+        let registry = root.appendingPathComponent("active_sessions.json")
+        try """
+        {"entries":[
+          {"lease_id":"lease-unknown","session_id":"saved","surface":"telegram","pid":7001,"process_start_time":10.0,"started_at":100.0}
+        ]}
+        """.write(to: registry, atomically: true, encoding: .utf8)
+
+        let inspector = HermesActiveSessionRegistryInspector(processIdentity: { _ in .unknown })
+
+        XCTAssertEqual(
+            inspector.ownership(registryURL: registry, sessionID: "saved", ownedSidecarPID: 7001),
+            .unknown("Session activity could not be inspected.")
+        )
     }
 
     func testActiveSessionRegistryRequiresNativeStartTimePrecisionAndOneLiveEntry() throws {
@@ -194,18 +210,18 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
 
         XCTAssertEqual(
             notFound.ownership(registryURL: registry, sessionID: "saved", ownedSidecarPID: nil),
-            .unknown("Session activity could not be inspected.")
+            .registryUnavailable("Session activity could not be inspected.")
         )
         XCTAssertEqual(
             unreadable.ownership(registryURL: registry, sessionID: "saved", ownedSidecarPID: nil),
-            .unknown("Session activity could not be inspected.")
+            .registryUnavailable("Session activity could not be inspected.")
         )
 
         try FileManager.default.createDirectory(at: registry, withIntermediateDirectories: true)
         XCTAssertEqual(
             HermesActiveSessionRegistryInspector(processIdentity: { _ in .unknown })
                 .ownership(registryURL: registry, sessionID: "saved", ownedSidecarPID: nil),
-            .unknown("Session activity could not be inspected.")
+            .registryUnavailable("Session activity could not be inspected.")
         )
     }
 
@@ -224,7 +240,7 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
                 sessionID: "saved",
                 ownedSidecarPID: nil
             ),
-            .unknown("Session activity could not be inspected.")
+            .registryUnavailable("Session activity could not be inspected.")
         )
     }
 
