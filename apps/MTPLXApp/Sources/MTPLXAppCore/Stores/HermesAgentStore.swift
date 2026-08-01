@@ -151,6 +151,7 @@ public final class HermesAgentStore: ObservableObject {
     private var pendingResponseLease: PendingRequestLease?
     private var pendingRequestInbox: [PendingRequestInboxEntry] = []
     private var retiredAutoApprovalFingerprints: [RetiredAutoApprovalFingerprint] = []
+    private var blockedApprovalRecovery: BlockedApprovalRecovery?
     private let monotonicClock: @Sendable () -> TimeInterval
     private static let pendingRequestInboxLimit = 64
     private static let retiredApprovalFingerprintLimit = 64
@@ -182,6 +183,14 @@ public final class HermesAgentStore: ObservableObject {
         let operation: GatewayOperation
         let retiredAt: TimeInterval
     }
+
+    private struct BlockedApprovalRecovery {
+        let profileID: String
+        let sessionID: String
+    }
+
+    /// Test-only safe observability for FIFO retention; request content remains private.
+    var pendingRequestInboxCount: Int { pendingRequestInbox.count }
 
     public init(
         integration: HermesIntegration,
@@ -287,10 +296,13 @@ public final class HermesAgentStore: ObservableObject {
         profile: HermesProfile,
         configuration: MTPLXAppConfiguration
     ) async {
-        selectedProfile = profile
         var operation: GatewayOperation?
         do {
-            operation = try await ensureGateway(profile: profile, configuration: configuration)
+            operation = try await ensureGateway(
+                profile: profile,
+                configuration: configuration,
+                preserveBlockedApprovalRecovery: preservesBlockedApprovalRecovery(for: profile)
+            )
             guard let operation, isCurrent(operation) else { return }
             let result = try await rpc(operation, method: "session.list", params: ["limit": .number(200)])
             guard isCurrent(operation) else { return }
@@ -308,8 +320,11 @@ public final class HermesAgentStore: ObservableObject {
         profile: HermesProfile,
         configuration: MTPLXAppConfiguration
     ) async throws -> HermesSessionReference {
-        selectedProfile = profile
-        let operation = try await ensureGateway(profile: profile, configuration: configuration)
+        let operation = try await ensureGateway(
+            profile: profile,
+            configuration: configuration,
+            preserveBlockedApprovalRecovery: false
+        )
         guard isCurrent(operation) else {
             throw HermesGatewayClientError.disconnected
         }
@@ -347,8 +362,11 @@ public final class HermesAgentStore: ObservableObject {
         profile: HermesProfile,
         configuration: MTPLXAppConfiguration
     ) async throws -> HermesSessionReference {
-        selectedProfile = profile
-        let operation = try await ensureGateway(profile: profile, configuration: configuration)
+        let operation = try await ensureGateway(
+            profile: profile,
+            configuration: configuration,
+            preserveBlockedApprovalRecovery: preservesBlockedApprovalRecovery(for: profile, savedSessionID: session.id)
+        )
         guard isCurrent(operation) else {
             throw HermesGatewayClientError.disconnected
         }
@@ -537,8 +555,8 @@ public final class HermesAgentStore: ObservableObject {
                     (profile.id, embeddedRuntime.routingState(for: profile, configuration: configuration))
                 }
             )
-            selectedProfile = profiles.first(where: { $0.name == profile.name }) ?? profile
-            await loadSessions(profile: selectedProfile ?? profile, configuration: configuration)
+            let selected = profiles.first(where: { $0.name == profile.name }) ?? profile
+            await loadSessions(profile: selected, configuration: configuration)
         } catch {
             connectionState = .failed(Self.message(for: error))
         }
@@ -568,7 +586,12 @@ public final class HermesAgentStore: ObservableObject {
         guard let profile = selectedProfile else { throw HermesGatewayClientError.disconnected }
         let savedSessionID = activeSessionKey ?? activeSessionID ?? configuration.lastHermesSessionID
         let title = activeSessionTitle ?? configuration.lastHermesSessionTitle
-        let operation = try await ensureGateway(profile: profile, configuration: configuration, preserveSession: true)
+        let operation = try await ensureGateway(
+            profile: profile,
+            configuration: configuration,
+            preserveSession: true,
+            preserveBlockedApprovalRecovery: preservesBlockedApprovalRecovery(for: profile)
+        )
         guard isCurrent(operation) else { throw CancellationError() }
         guard let savedSessionID else { return }
         let result = try await rpc(
@@ -595,7 +618,8 @@ public final class HermesAgentStore: ObservableObject {
     private func ensureGateway(
         profile: HermesProfile,
         configuration: MTPLXAppConfiguration,
-        preserveSession: Bool = false
+        preserveSession: Bool = false,
+        preserveBlockedApprovalRecovery: Bool = false
     ) async throws -> GatewayOperation {
         hermesAutoApprove = configuration.hermesAutoApprove
         let signature = Self.configurationSignature(configuration)
@@ -609,10 +633,15 @@ public final class HermesAgentStore: ObservableObject {
             }
             return operation
         }
+        let reconnectingBlockedApprovalPipeline = approvalPipelineBlocked && preserveBlockedApprovalRecovery
+        if approvalPipelineBlocked && !reconnectingBlockedApprovalPipeline {
+            // An explicit profile/session boundary must discard old recovery
+            // before the new profile is published or a sidecar is started.
+            disposePendingRequestLifecycle()
+        }
         let reuseSidecar = sidecarProfileName == profile.name
             && sidecarConfigurationSignature == signature
             && sidecar?.isRunning == true
-        let reconnectingBlockedApprovalPipeline = approvalPipelineBlocked
         shuttingDown = true
         gatewayGeneration += 1
         let generation = gatewayGeneration
@@ -788,7 +817,7 @@ public final class HermesAgentStore: ObservableObject {
     /// because the resumed task cannot safely recover after transport release.
     private func shouldRetainApprovalRecovery(for expectedClient: any HermesGatewayClientProtocol) -> Bool {
         guard let client, ObjectIdentifier(client) == ObjectIdentifier(expectedClient) else { return false }
-        if approvalPipelineBlocked { return true }
+        if approvalPipelineBlocked { return blockedApprovalRecovery != nil }
         guard let lease = pendingResponseLease,
               lease.kind == .approval,
               lease.operation.generation == gatewayGeneration,
@@ -1234,6 +1263,12 @@ public final class HermesAgentStore: ObservableObject {
         let wasBlocked = approvalPipelineBlocked
         approvalPipelineBlocked = true
         pendingResponseLease = nil
+        if let head = pendingRequestInbox.first {
+            blockedApprovalRecovery = BlockedApprovalRecovery(
+                profileID: head.operation.profileID,
+                sessionID: head.sessionID
+            )
+        }
         if let head = pendingRequestInbox.first,
            pendingRequest?.id != head.request.id || pendingRequest?.kind != head.request.kind {
             pendingRequest = nil
@@ -1317,6 +1352,22 @@ public final class HermesAgentStore: ObservableObject {
         pendingRequestInbox = []
         retiredAutoApprovalFingerprints = []
         approvalPipelineBlocked = false
+        blockedApprovalRecovery = nil
+    }
+
+    private func preservesBlockedApprovalRecovery(
+        for profile: HermesProfile,
+        savedSessionID: String? = nil
+    ) -> Bool {
+        guard approvalPipelineBlocked,
+              let blockedApprovalRecovery,
+              blockedApprovalRecovery.profileID == profile.id
+        else { return false }
+        if let savedSessionID {
+            return savedSessionID == blockedApprovalRecovery.sessionID
+                || savedSessionID == activeSessionKey
+        }
+        return blockedApprovalRecovery.sessionID == activeSessionID
     }
 
     private func recordGenericEventError() {

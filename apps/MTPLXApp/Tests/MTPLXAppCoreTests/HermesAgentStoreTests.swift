@@ -73,7 +73,7 @@ final class HermesAgentStoreTests: XCTestCase {
         await store.loadSessions(profile: bernd, configuration: configuration)
         await store.loadSessions(profile: researcher, configuration: configuration)
 
-        XCTAssertTrue(firstClient.didClose)
+        XCTAssertEqual(firstClient.closeCount, 1)
         XCTAssertEqual(runtime.sidecars[0].stopCount, 1)
         XCTAssertEqual(runtime.sidecars[1].stopCount, 0)
         XCTAssertEqual(store.selectedProfile?.name, "researcher")
@@ -408,7 +408,7 @@ final class HermesAgentStoreTests: XCTestCase {
         XCTAssertEqual(store.pendingRequest?.prompt, "A")
         await store.respondToPendingRequest(value: "deny")
         XCTAssertEqual(first.calls.filter { $0.method == "approval.respond" }.count, 1)
-        XCTAssertTrue(first.didClose)
+        XCTAssertEqual(first.closeCount, 1)
         XCTAssertEqual(runtime.sidecars.first?.stopCount, 1)
         _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
         XCTAssertFalse(store.approvalPipelineBlocked)
@@ -434,15 +434,18 @@ final class HermesAgentStoreTests: XCTestCase {
 
         XCTAssertTrue(store.approvalPipelineBlocked)
         XCTAssertEqual(store.pendingRequest?.prompt, "A")
+        XCTAssertEqual(store.pendingRequestInboxCount, 2)
         XCTAssertEqual(client.calls.filter { $0.method == "approval.respond" }.count, 1)
-        XCTAssertTrue(client.didClose)
+        XCTAssertEqual(client.closeCount, 1)
         XCTAssertEqual(runtime.sidecars.first?.stopCount, 1)
         XCTAssertEqual(store.messages.filter { $0.text.contains("approval recovery") }.count, 1)
 
         await response.value
         XCTAssertTrue(store.approvalPipelineBlocked)
         XCTAssertEqual(store.pendingRequest?.prompt, "A")
+        XCTAssertEqual(store.pendingRequestInboxCount, 2)
         XCTAssertEqual(client.calls.filter { $0.method == "approval.respond" }.count, 1)
+        XCTAssertEqual(client.closeCount, 1)
         XCTAssertEqual(runtime.sidecars.first?.stopCount, 1)
         XCTAssertEqual(store.messages.filter { $0.text.contains("approval recovery") }.count, 1)
     }
@@ -512,8 +515,9 @@ final class HermesAgentStoreTests: XCTestCase {
 
         XCTAssertTrue(store.approvalPipelineBlocked)
         XCTAssertEqual(store.pendingRequest?.prompt, "A")
+        XCTAssertEqual(store.pendingRequestInboxCount, 64)
         XCTAssertEqual(client.calls.filter { $0.method == "approval.respond" }.count, 1)
-        XCTAssertTrue(client.didClose)
+        XCTAssertEqual(client.closeCount, 1)
         XCTAssertEqual(runtime.sidecars.first?.stopCount, 1)
     }
 
@@ -535,6 +539,71 @@ final class HermesAgentStoreTests: XCTestCase {
         XCTAssertNil(store.pendingRequest)
         XCTAssertFalse(store.approvalPipelineBlocked)
         XCTAssertEqual(runtime.sidecars.first?.stopCount, 1)
+    }
+
+    @MainActor
+    func testFailedPreReadyProfileSwitchClearsBlockedApprovalBeforePublishingNewProfile() async throws {
+        configuration.hermesAutoApprove = false
+        let runtime = FakeHermesEmbeddedRuntime()
+        let first = FakeHermesGatewayClient(readyImmediately: true)
+        let second = FakeHermesGatewayClient()
+        first.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        first.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        first.suspendedMethods = ["approval.respond"]
+        let store = makeStore(runtime: runtime, clients: [first, second])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        first.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("A")]))
+        let response = Task { await store.respondToPendingRequest(value: "once") }
+        await waitUntil { first.calls.contains { $0.method == "approval.respond" } }
+        first.terminatePendingCallsThenDisconnect("transport lost")
+        await response.value
+
+        let switchProfile = Task { await store.loadSessions(profile: researcher, configuration: configuration) }
+        await waitUntil { second.hasDisconnectHandler }
+        XCTAssertEqual(store.selectedProfile?.name, "researcher")
+        XCTAssertFalse(store.approvalPipelineBlocked)
+        XCTAssertNil(store.pendingRequest)
+        XCTAssertEqual(store.pendingRequestInboxCount, 0)
+
+        second.disconnect("researcher not ready")
+        await switchProfile.value
+        XCTAssertFalse(store.approvalPipelineBlocked)
+        XCTAssertNil(store.pendingRequest)
+    }
+
+    @MainActor
+    func testFailedPreReadyDifferentSessionSwitchClearsBlockedApproval() async throws {
+        configuration.hermesAutoApprove = false
+        let runtime = FakeHermesEmbeddedRuntime()
+        let first = FakeHermesGatewayClient(readyImmediately: true)
+        let second = FakeHermesGatewayClient()
+        first.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        first.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        first.suspendedMethods = ["approval.respond"]
+        let store = makeStore(runtime: runtime, clients: [first, second])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        first.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("A")]))
+        let response = Task { await store.respondToPendingRequest(value: "once") }
+        await waitUntil { first.calls.contains { $0.method == "approval.respond" } }
+        first.terminatePendingCallsThenDisconnect("transport lost")
+        await response.value
+
+        let saved = HermesSavedSession(id: "saved-2", title: "Other", preview: "", startedAt: 0, messageCount: 0, source: "")
+        let switchSession = Task { try await store.resume(saved, profile: bernd, configuration: configuration) }
+        await waitUntil { second.hasDisconnectHandler }
+        XCTAssertFalse(store.approvalPipelineBlocked)
+        XCTAssertNil(store.pendingRequest)
+        XCTAssertEqual(store.pendingRequestInboxCount, 0)
+
+        second.disconnect("session not ready")
+        do {
+            _ = try await switchSession.value
+            XCTFail("Pre-ready session switch must fail")
+        } catch {
+            // Expected: no fresh client reached gateway.ready.
+        }
+        XCTAssertFalse(store.approvalPipelineBlocked)
+        XCTAssertNil(store.pendingRequest)
     }
 
     @MainActor
@@ -1277,7 +1346,7 @@ final class HermesAgentStoreTests: XCTestCase {
 
         XCTAssertEqual(store.activeSessionID, "new-live")
         XCTAssertEqual(store.activeReference?.sessionID, "saved")
-        XCTAssertTrue(slowReconnect.didClose)
+        XCTAssertEqual(slowReconnect.closeCount, 1)
         XCTAssertEqual(runtime.startCount, 2)
     }
 
@@ -1527,7 +1596,7 @@ private final class FakeHermesGatewayClient: HermesGatewayClientProtocol {
     var onDisconnect: ((String) -> Void)?
     var resultByMethod: [String: JSONValue] = [:]
     private(set) var calls: [Call] = []
-    private(set) var didClose = false
+    private(set) var closeCount = 0
     private var ready = false
     private var readinessWaiters: [CheckedContinuation<Void, Error>] = []
     var suspendedMethods: Set<String> = []
@@ -1556,7 +1625,7 @@ private final class FakeHermesGatewayClient: HermesGatewayClientProtocol {
     }
 
     func close() {
-        didClose = true
+        closeCount += 1
         readinessWaiters.forEach { $0.resume(throwing: HermesGatewayClientError.disconnected) }
         readinessWaiters.removeAll()
     }
