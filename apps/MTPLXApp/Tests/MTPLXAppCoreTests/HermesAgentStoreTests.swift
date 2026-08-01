@@ -607,6 +607,75 @@ final class HermesAgentStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testConsecutiveFailedPreReadySameProfileRecoveriesRetainBlockedFIFOUntilSuccess() async throws {
+        configuration.hermesAutoApprove = false
+        let runtime = FakeHermesEmbeddedRuntime()
+        let first = FakeHermesGatewayClient(readyImmediately: true)
+        let second = FakeHermesGatewayClient()
+        let third = FakeHermesGatewayClient()
+        let fourth = FakeHermesGatewayClient(readyImmediately: true)
+        first.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        first.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        first.suspendedMethods = ["approval.respond"]
+        fourth.resultByMethod["session.list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [first, second, third, fourth])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        first.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("A")]))
+        first.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("B")]))
+        let response = Task { await store.respondToPendingRequest(value: "once") }
+        await waitUntil { first.calls.contains { $0.method == "approval.respond" } }
+        first.terminatePendingCallsThenDisconnect("transport lost")
+        await response.value
+
+        for failedClient in [second, third] {
+            let reconnect = Task { await store.loadSessions(profile: bernd, configuration: configuration) }
+            await waitUntil { failedClient.hasDisconnectHandler }
+            failedClient.disconnect("same profile not ready")
+            await reconnect.value
+            XCTAssertTrue(store.approvalPipelineBlocked)
+            XCTAssertEqual(store.pendingRequest?.prompt, "A")
+            XCTAssertEqual(store.pendingRequestInboxCount, 2)
+        }
+
+        await store.loadSessions(profile: bernd, configuration: configuration)
+        XCTAssertFalse(store.approvalPipelineBlocked)
+        XCTAssertNil(store.pendingRequest)
+        XCTAssertEqual(store.pendingRequestInboxCount, 0)
+    }
+
+    @MainActor
+    func testConsecutiveSameProfileSidecarStartFailuresRetainBlockedFIFOUntilSuccess() async throws {
+        configuration.hermesAutoApprove = false
+        let runtime = FakeHermesEmbeddedRuntime()
+        let first = FakeHermesGatewayClient(readyImmediately: true)
+        let second = FakeHermesGatewayClient(readyImmediately: true)
+        first.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        first.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        first.suspendedMethods = ["approval.respond"]
+        second.resultByMethod["session.list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [first, second])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        first.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("A")]))
+        first.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("B")]))
+        let response = Task { await store.respondToPendingRequest(value: "once") }
+        await waitUntil { first.calls.contains { $0.method == "approval.respond" } }
+        first.terminatePendingCallsThenDisconnect("transport lost")
+        await response.value
+
+        runtime.startFailuresRemaining = 2
+        await store.loadSessions(profile: bernd, configuration: configuration)
+        await store.loadSessions(profile: bernd, configuration: configuration)
+        XCTAssertTrue(store.approvalPipelineBlocked)
+        XCTAssertEqual(store.pendingRequest?.prompt, "A")
+        XCTAssertEqual(store.pendingRequestInboxCount, 2)
+
+        await store.loadSessions(profile: bernd, configuration: configuration)
+        XCTAssertFalse(store.approvalPipelineBlocked)
+        XCTAssertNil(store.pendingRequest)
+        XCTAssertEqual(store.pendingRequestInboxCount, 0)
+    }
+
+    @MainActor
     func testAutoApprovalFailureKeepsUnknownHeadAndRetainsLaterFIFOEntries() async throws {
         configuration.hermesAutoApprove = true
         let runtime = FakeHermesEmbeddedRuntime()
@@ -1530,6 +1599,7 @@ private final class FakeHermesEmbeddedRuntime: HermesEmbeddedRuntime, @unchecked
     var routingByProfile: [String: HermesProfileRoutingState] = [:]
     var ownershipBySession: [String: HermesSessionOwnership] = [:]
     var startCount = 0
+    var startFailuresRemaining = 0
     var reapCount = 0
     private(set) var sidecars: [FakeHermesSidecar] = []
 
@@ -1541,6 +1611,10 @@ private final class FakeHermesEmbeddedRuntime: HermesEmbeddedRuntime, @unchecked
         profile: HermesProfile,
         configuration: MTPLXAppConfiguration
     ) async throws -> any HermesSidecarControlling {
+        if startFailuresRemaining > 0 {
+            startFailuresRemaining -= 1
+            throw FakeHermesRuntimeError.startFailed
+        }
         startCount += 1
         let sidecar = FakeHermesSidecar(index: startCount)
         sidecars.append(sidecar)
@@ -1564,6 +1638,10 @@ private final class FakeHermesEmbeddedRuntime: HermesEmbeddedRuntime, @unchecked
     func discardStoppedSidecars() {
         sidecars.removeAll { !$0.isRunning }
     }
+}
+
+private enum FakeHermesRuntimeError: Error {
+    case startFailed
 }
 
 private final class FakeHermesSidecar: HermesSidecarControlling, @unchecked Sendable {

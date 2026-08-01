@@ -186,7 +186,8 @@ public final class HermesAgentStore: ObservableObject {
 
     private struct BlockedApprovalRecovery {
         let profileID: String
-        let sessionID: String
+        let nativeSessionID: String
+        let savedSessionID: String?
     }
 
     /// Test-only safe observability for FIFO retention; request content remains private.
@@ -1263,10 +1264,11 @@ public final class HermesAgentStore: ObservableObject {
         let wasBlocked = approvalPipelineBlocked
         approvalPipelineBlocked = true
         pendingResponseLease = nil
-        if let head = pendingRequestInbox.first {
+        if blockedApprovalRecovery == nil, let head = pendingRequestInbox.first {
             blockedApprovalRecovery = BlockedApprovalRecovery(
                 profileID: head.operation.profileID,
-                sessionID: head.sessionID
+                nativeSessionID: head.sessionID,
+                savedSessionID: activeSessionKey
             )
         }
         if let head = pendingRequestInbox.first,
@@ -1364,10 +1366,13 @@ public final class HermesAgentStore: ObservableObject {
               blockedApprovalRecovery.profileID == profile.id
         else { return false }
         if let savedSessionID {
-            return savedSessionID == blockedApprovalRecovery.sessionID
-                || savedSessionID == activeSessionKey
+            return savedSessionID == blockedApprovalRecovery.nativeSessionID
+                || savedSessionID == blockedApprovalRecovery.savedSessionID
         }
-        return blockedApprovalRecovery.sessionID == activeSessionID
+        // `loadSessions` and `reconnect` express same-profile recovery without
+        // an explicit session transition. Do not depend on transient active
+        // session fields, which failed attempts intentionally clear.
+        return true
     }
 
     private func recordGenericEventError() {
