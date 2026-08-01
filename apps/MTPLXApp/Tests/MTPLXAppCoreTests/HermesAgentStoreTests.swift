@@ -287,6 +287,86 @@ final class HermesAgentStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testUnifiedInboxKeepsApprovalAheadOfLaterClarification() async throws {
+        configuration.hermesAutoApprove = false
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("A")]))
+        client.emit(.init(type: "clarify.request", sessionID: "live-1", payload: ["request_id": .string("B"), "question": .string("B?")]))
+        XCTAssertEqual(store.pendingRequest?.kind, .approval)
+        XCTAssertEqual(store.pendingRequest?.prompt, "A")
+        await store.respondToPendingRequest(value: "deny")
+        XCTAssertEqual(store.pendingRequest?.id, "B")
+        await store.respondToPendingRequest(value: "answer")
+        XCTAssertEqual(client.calls.suffix(2).map(\.method), ["approval.respond", "clarify.respond"])
+    }
+
+    @MainActor
+    func testUnifiedInboxDefersAutoApprovalUntilEarlierClarificationResolves() async throws {
+        configuration.hermesAutoApprove = true
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        client.emit(.init(type: "clarify.request", sessionID: "live-1", payload: ["request_id": .string("B"), "question": .string("B?")]))
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("A")]))
+        XCTAssertEqual(store.pendingRequest?.id, "B")
+        XCTAssertFalse(client.calls.contains { $0.method == "approval.respond" })
+        await store.respondToPendingRequest(value: "answer")
+        await waitUntil { client.calls.contains { $0.method == "approval.respond" } }
+        XCTAssertEqual(client.calls.last?.params["choice"], .string("once"))
+    }
+
+    @MainActor
+    func testUnifiedInboxAutoApprovalThenClarificationDoesNotOverwriteHead() async throws {
+        configuration.hermesAutoApprove = true
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        client.suspendedMethods = ["approval.respond"]
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("A")]))
+        await waitUntil { client.calls.contains { $0.method == "approval.respond" } }
+        client.emit(.init(type: "clarify.request", sessionID: "live-1", payload: ["request_id": .string("B"), "question": .string("B?")]))
+        XCTAssertNil(store.pendingRequest)
+        client.finishCall(method: "approval.respond")
+        client.suspendedMethods = []
+        await waitUntil { store.pendingRequest?.id == "B" }
+    }
+
+    @MainActor
+    func testUnifiedInboxPreservesMixedArrivalOrderAndQueuedExpiry() async throws {
+        configuration.hermesAutoApprove = false
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("A")]))
+        client.emit(.init(type: "clarify.request", sessionID: "live-1", payload: ["request_id": .string("B"), "question": .string("B?")]))
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("C")]))
+        client.emit(.init(type: "secret.request", sessionID: "live-1", payload: ["request_id": .string("D"), "prompt": .string("D?")]))
+        XCTAssertEqual(store.pendingRequest?.prompt, "A")
+        await store.respondToPendingRequest(value: "deny")
+        XCTAssertEqual(store.pendingRequest?.id, "B")
+        await store.respondToPendingRequest(value: "answer")
+        XCTAssertEqual(store.pendingRequest?.prompt, "C")
+        client.emit(.init(type: "secret.expire", sessionID: "live-1", payload: ["request_id": .string("D")]))
+        await store.respondToPendingRequest(value: "deny")
+        XCTAssertNil(store.pendingRequest)
+        XCTAssertEqual(client.calls.suffix(3).map(\.method), ["approval.respond", "clarify.respond", "approval.respond"])
+    }
+
+    @MainActor
     func testIdenticalManualApprovalRequestsRemainDistinctFIFOEntries() async throws {
         configuration.hermesAutoApprove = false
         let runtime = FakeHermesEmbeddedRuntime()
@@ -347,7 +427,7 @@ final class HermesAgentStoreTests: XCTestCase {
         _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
         client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("A")]))
         await waitUntil { client.calls.filter { $0.method == "approval.respond" }.count == 1 }
-        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("B")]))
+        client.emit(.init(type: "clarify.request", sessionID: "live-1", payload: ["request_id": .string("B"), "question": .string("B?")]))
         client.failCall(method: "approval.respond")
         await waitUntil { store.approvalPipelineBlocked }
         XCTAssertEqual(store.pendingRequest?.prompt, "A")
@@ -367,7 +447,13 @@ final class HermesAgentStoreTests: XCTestCase {
         let store = makeStore(runtime: runtime, clients: [client])
         _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
         for index in 0...64 {
-            client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("A\(index)")]))
+            if index.isMultiple(of: 2) {
+                client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("A\(index)")]))
+            } else {
+                client.emit(.init(type: "clarify.request", sessionID: "live-1", payload: [
+                    "request_id": .string("clarify-\(index)"), "question": .string("Q\(index)?"),
+                ]))
+            }
         }
         client.emit(.init(type: "approval.expire", sessionID: "live-1", payload: [:]))
         XCTAssertTrue(store.approvalPipelineBlocked)
