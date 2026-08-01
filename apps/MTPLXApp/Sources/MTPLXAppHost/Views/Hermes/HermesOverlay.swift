@@ -970,6 +970,7 @@ struct HermesPanel: View {
             localError = "This Hermes profile is unavailable."
             return
         }
+        rememberProfileSelection(profile)
         guard await ensureDaemonReady() else { return }
         await hermes.loadSessions(profile: profile, configuration: backend.configuration)
     }
@@ -1054,6 +1055,12 @@ struct HermesPanel: View {
     private func remember(_ reference: HermesSessionReference) {
         var config = backend.configuration
         config.rememberEmbeddedHermesSession(reference)
+        try? backend.saveSettings(config)
+    }
+
+    private func rememberProfileSelection(_ profile: HermesProfile) {
+        var config = backend.configuration
+        config.rememberHermesProfileSelection(profile.name)
         try? backend.saveSettings(config)
     }
 

@@ -1180,7 +1180,7 @@ public struct HermesIntegration: Sendable {
 
     private struct HermesEffectiveProfileConfiguration {
         let provider: String
-        let baseURL: String
+        let baseURL: String?
         let modelReference: String
     }
 
@@ -1223,7 +1223,7 @@ public struct HermesIntegration: Sendable {
         guard customBaseURLs.count <= 1 else { return nil }
         let baseURL = values["base_url"]
             ?? customBaseURLs.first
-        guard let baseURL, !baseURL.isEmpty else { return nil }
+        if let baseURL, baseURL.isEmpty { return nil }
         return HermesEffectiveProfileConfiguration(
             provider: provider,
             baseURL: baseURL,

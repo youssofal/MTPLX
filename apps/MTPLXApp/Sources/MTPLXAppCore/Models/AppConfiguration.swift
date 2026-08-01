@@ -315,6 +315,17 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         lastHermesSessionTitle = reference.title
     }
 
+    /// Persists profile-only navigation independently from the generic launch
+    /// target. A session belongs to its profile, so crossing that boundary
+    /// must discard the old resume identity while reselecting the same profile
+    /// keeps its remembered session intact.
+    public mutating func rememberHermesProfileSelection(_ profileName: String) {
+        guard lastHermesProfile != profileName else { return }
+        lastHermesProfile = profileName
+        lastHermesSessionID = nil
+        lastHermesSessionTitle = nil
+    }
+
     /// Fresh installs must be portable. Installed local copies are discovered
     /// by the model catalog; the default configuration should never point at
     /// a developer machine path.

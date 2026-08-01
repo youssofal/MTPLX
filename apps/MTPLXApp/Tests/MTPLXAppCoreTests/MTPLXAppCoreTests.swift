@@ -3727,6 +3727,26 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(configuration.lastHermesSessionTitle, "Fix the app")
     }
 
+    func testRememberingHermesProfileSelectionClearsOnlyCrossProfileSessionState() {
+        var configuration = MTPLXAppConfiguration(
+            lastLaunchTarget: LaunchTarget.openCode.rawValue,
+            lastHermesProfile: "bernd",
+            lastHermesSessionID: "session-123",
+            lastHermesSessionTitle: "Fix the app"
+        )
+
+        configuration.rememberHermesProfileSelection("bernd")
+        XCTAssertEqual(configuration.lastHermesSessionID, "session-123")
+        XCTAssertEqual(configuration.lastHermesSessionTitle, "Fix the app")
+
+        configuration.rememberHermesProfileSelection("researcher")
+
+        XCTAssertEqual(configuration.lastLaunchTarget, LaunchTarget.openCode.rawValue)
+        XCTAssertEqual(configuration.lastHermesProfile, "researcher")
+        XCTAssertNil(configuration.lastHermesSessionID)
+        XCTAssertNil(configuration.lastHermesSessionTitle)
+    }
+
     func testAppConfigurationPersistsHermesResumeState() throws {
         let url = temporaryDirectory().appendingPathComponent("settings.json")
         let store = MTPLXSettingsStore(settingsURL: url)

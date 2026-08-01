@@ -310,7 +310,7 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
             name: "external",
             path: try makeProfile(
                 named: "external",
-                config: "model:\n  default: external-model\n  provider: anthropic\n  base_url: https://api.example.test/v1\n"
+                config: "model:\n  default: openrouter/cloud-model\n  provider: openrouter\n"
             ).path,
             isDefault: false
         )
@@ -345,8 +345,47 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
             ).path,
             isDefault: false
         )
+        let duplicateProvider = HermesProfile(
+            name: "duplicate-provider",
+            path: try makeProfile(
+                named: "duplicate-provider",
+                config: "model:\n  default: openrouter/cloud-model\n  provider: openrouter\n  provider: anthropic\n"
+            ).path,
+            isDefault: false
+        )
+        let missingProvider = HermesProfile(
+            name: "missing-provider",
+            path: try makeProfile(
+                named: "missing-provider",
+                config: "model:\n  default: openrouter/cloud-model\n"
+            ).path,
+            isDefault: false
+        )
+        let missingDefault = HermesProfile(
+            name: "missing-default",
+            path: try makeProfile(
+                named: "missing-default",
+                config: "model:\n  provider: openrouter\n"
+            ).path,
+            isDefault: false
+        )
+        let malformedBaseURL = HermesProfile(
+            name: "malformed-base-url",
+            path: try makeProfile(
+                named: "malformed-base-url",
+                config: "model:\n  default: openrouter/cloud-model\n  provider: openrouter\n  base_url:\n"
+            ).path,
+            isDefault: false
+        )
 
-        for profile in [duplicateModel, duplicateBaseURL] {
+        for profile in [
+            duplicateModel,
+            duplicateBaseURL,
+            duplicateProvider,
+            missingProvider,
+            missingDefault,
+            malformedBaseURL,
+        ] {
             guard case .unavailable = integration.routingState(for: profile, configuration: configuration) else {
                 return XCTFail("Duplicate routing configuration must fail closed")
             }
