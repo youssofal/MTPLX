@@ -206,6 +206,171 @@ final class HermesAgentStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testLateSameProfileLoadCannotOverwriteNewerConfigurationGeneration() async {
+        let runtime = FakeHermesEmbeddedRuntime()
+        let firstClient = FakeHermesGatewayClient(readyImmediately: true)
+        let secondClient = FakeHermesGatewayClient(readyImmediately: true)
+        firstClient.suspendedMethods = ["session.list"]
+        firstClient.resultByMethod["session.list"] = sessionsResult(id: "old", title: "Old")
+        secondClient.resultByMethod["session.list"] = sessionsResult(id: "new", title: "New")
+        let store = makeStore(runtime: runtime, clients: [firstClient, secondClient])
+
+        let oldLoad = Task { await store.loadSessions(profile: bernd, configuration: configuration) }
+        await waitUntil { firstClient.calls.contains(where: { $0.method == "session.list" }) }
+        await store.loadSessions(profile: bernd, configuration: alternateConfiguration())
+        firstClient.finishCall(method: "session.list")
+        await oldLoad.value
+
+        XCTAssertEqual(store.sessions.map(\.id), ["new"])
+        XCTAssertEqual(store.connectionState, .connected)
+    }
+
+    @MainActor
+    func testLateSameProfileCreateCannotOverwriteNewerConfigurationGeneration() async {
+        let runtime = FakeHermesEmbeddedRuntime()
+        let firstClient = FakeHermesGatewayClient(readyImmediately: true)
+        let secondClient = FakeHermesGatewayClient(readyImmediately: true)
+        firstClient.suspendedMethods = ["session.create"]
+        firstClient.resultByMethod["session.create"] = .object(["session_id": .string("obsolete")])
+        secondClient.resultByMethod["session.list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [firstClient, secondClient])
+
+        let create = Task { try await store.startNewAgent(profile: bernd, configuration: configuration) }
+        await waitUntil { firstClient.calls.contains(where: { $0.method == "session.create" }) }
+        await store.loadSessions(profile: bernd, configuration: alternateConfiguration())
+        firstClient.finishCall(method: "session.create")
+
+        await assertCancellation(create)
+        XCTAssertNil(store.activeSessionID)
+        XCTAssertEqual(store.connectionState, .connected)
+    }
+
+    @MainActor
+    func testLateSameProfileResumeCannotOverwriteNewerConfigurationGeneration() async {
+        let runtime = FakeHermesEmbeddedRuntime()
+        let firstClient = FakeHermesGatewayClient(readyImmediately: true)
+        let secondClient = FakeHermesGatewayClient(readyImmediately: true)
+        firstClient.suspendedMethods = ["session.resume"]
+        firstClient.resultByMethod["session.resume"] = resumeResult(liveID: "obsolete-live", savedID: "obsolete-saved")
+        secondClient.resultByMethod["session.list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [firstClient, secondClient])
+        let saved = HermesSavedSession(id: "obsolete-saved", title: "Old", preview: "", startedAt: 0, messageCount: 1, source: "")
+
+        let resume = Task { try await store.resume(saved, profile: bernd, configuration: configuration) }
+        await waitUntil { firstClient.calls.contains(where: { $0.method == "session.resume" }) }
+        await store.loadSessions(profile: bernd, configuration: alternateConfiguration())
+        firstClient.finishCall(method: "session.resume")
+
+        await assertCancellation(resume)
+        XCTAssertNil(store.activeSessionID)
+        XCTAssertEqual(store.messages, [])
+    }
+
+    @MainActor
+    func testConcurrentReconnectKeepsOnlyNewestSameProfileGeneration() async throws {
+        let runtime = FakeHermesEmbeddedRuntime()
+        let initial = FakeHermesGatewayClient(readyImmediately: true)
+        let slowReconnect = FakeHermesGatewayClient()
+        let newestReconnect = FakeHermesGatewayClient(readyImmediately: true)
+        initial.resultByMethod["session.resume"] = resumeResult(liveID: "initial-live", savedID: "saved")
+        newestReconnect.resultByMethod["session.resume"] = resumeResult(liveID: "new-live", savedID: "saved")
+        let store = makeStore(runtime: runtime, clients: [initial, slowReconnect, newestReconnect])
+        let saved = HermesSavedSession(id: "saved", title: "Saved", preview: "", startedAt: 0, messageCount: 1, source: "")
+        _ = try await store.resume(saved, profile: bernd, configuration: configuration)
+        initial.disconnect("transport lost")
+
+        let olderReconnect = Task { try await store.reconnect(configuration: configuration) }
+        await waitUntil { runtime.startCount == 2 }
+        let newerReconnect = Task { try await store.reconnect(configuration: configuration) }
+        try await newerReconnect.value
+        await assertCancellation(olderReconnect)
+
+        XCTAssertEqual(store.activeSessionID, "new-live")
+        XCTAssertEqual(store.activeReference?.sessionID, "saved")
+        XCTAssertTrue(slowReconnect.didClose)
+        XCTAssertEqual(runtime.startCount, 2)
+    }
+
+    @MainActor
+    func testGatewayReadyEventDoesNotExposeStoreBeforeConnectReturns() async {
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient()
+        client.resultByMethod["session.list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [client])
+
+        let load = Task { await store.loadSessions(profile: bernd, configuration: configuration) }
+        await waitUntil { client.hasEventHandler }
+        client.emitReadyEventWithoutCompletingConnect()
+        await Task.yield()
+
+        XCTAssertFalse(store.gatewayReady)
+        XCTAssertEqual(store.connectionState, .starting)
+        XCTAssertEqual(client.calls, [])
+
+        client.completeReadyConnect()
+        await load.value
+        XCTAssertTrue(store.gatewayReady)
+    }
+
+    @MainActor
+    func testDisconnectBeforeReadyStopsOwnedSidecarExactlyOnce() async {
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient()
+        let store = makeStore(runtime: runtime, clients: [client])
+
+        let load = Task { await store.loadSessions(profile: bernd, configuration: configuration) }
+        await waitUntil { client.hasDisconnectHandler }
+        client.disconnect("transport lost")
+        await load.value
+
+        XCTAssertEqual(runtime.sidecars[0].stopCount, 1)
+    }
+
+    @MainActor
+    func testLatePromptFailureCannotAppendErrorToNewProfileTranscript() async throws {
+        let runtime = FakeHermesEmbeddedRuntime()
+        let firstClient = FakeHermesGatewayClient(readyImmediately: true)
+        let secondClient = FakeHermesGatewayClient(readyImmediately: true)
+        firstClient.resultByMethod["session.create"] = .object(["session_id": .string("old-live")])
+        firstClient.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        firstClient.suspendedMethods = ["prompt.submit"]
+        secondClient.resultByMethod["session.list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [firstClient, secondClient])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+
+        let send = Task { await store.send("old prompt") }
+        await waitUntil { firstClient.calls.contains(where: { $0.method == "prompt.submit" }) }
+        await store.loadSessions(profile: researcher, configuration: configuration)
+        firstClient.failCall(method: "prompt.submit")
+        await send.value
+
+        XCTAssertEqual(store.messages, [])
+        XCTAssertFalse(store.isStreaming)
+    }
+
+    @MainActor
+    func testLateInterruptFailureCannotAppendErrorToNewProfileTranscript() async throws {
+        let runtime = FakeHermesEmbeddedRuntime()
+        let firstClient = FakeHermesGatewayClient(readyImmediately: true)
+        let secondClient = FakeHermesGatewayClient(readyImmediately: true)
+        firstClient.resultByMethod["session.create"] = .object(["session_id": .string("old-live")])
+        firstClient.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        firstClient.suspendedMethods = ["session.interrupt"]
+        secondClient.resultByMethod["session.list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [firstClient, secondClient])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+
+        let interrupt = Task { await store.interrupt() }
+        await waitUntil { firstClient.calls.contains(where: { $0.method == "session.interrupt" }) }
+        await store.loadSessions(profile: researcher, configuration: configuration)
+        firstClient.failCall(method: "session.interrupt")
+        await interrupt.value
+
+        XCTAssertEqual(store.messages, [])
+        XCTAssertFalse(store.isStreaming)
+    }
+
+    @MainActor
     func testPrepareReapsOnceAndPublishesProfileRouting() async {
         let runtime = FakeHermesEmbeddedRuntime()
         runtime.routingByProfile = ["default": .mtplx, "bernd": .external, "researcher": .unavailable("invalid")]
@@ -249,6 +414,46 @@ final class HermesAgentStoreTests: XCTestCase {
             await Task.yield()
         }
         XCTAssertTrue(condition())
+    }
+
+    @MainActor
+    private func alternateConfiguration() -> MTPLXAppConfiguration {
+        var copy = configuration!
+        copy.port += 1
+        return copy
+    }
+
+    @MainActor
+    private func sessionsResult(id: String, title: String) -> JSONValue {
+        .object(["sessions": .array([.object([
+            "id": .string(id),
+            "title": .string(title),
+            "preview": .string(""),
+            "started_at": .number(0),
+            "message_count": .number(0),
+            "source": .string(""),
+        ])])])
+    }
+
+    @MainActor
+    private func resumeResult(liveID: String, savedID: String) -> JSONValue {
+        .object([
+            "session_id": .string(liveID),
+            "resumed": .string(savedID),
+            "messages": .array([]),
+        ])
+    }
+
+    @MainActor
+    private func assertCancellation<T>(_ task: Task<T, Error>) async {
+        do {
+            _ = try await task.value
+            XCTFail("Expected stale task cancellation")
+        } catch is CancellationError {
+            // Expected: a newer generation owns store state.
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
     }
 }
 
@@ -323,6 +528,9 @@ private final class FakeHermesGatewayClient: HermesGatewayClientProtocol {
     var suspendedMethods: Set<String> = []
     private var callWaiters: [String: [CheckedContinuation<JSONValue, Error>]] = [:]
 
+    var hasEventHandler: Bool { onEvent != nil }
+    var hasDisconnectHandler: Bool { onDisconnect != nil }
+
     init(readyImmediately: Bool = false) {
         ready = readyImmediately
     }
@@ -355,6 +563,16 @@ private final class FakeHermesGatewayClient: HermesGatewayClientProtocol {
         readinessWaiters.removeAll()
     }
 
+    func emitReadyEventWithoutCompletingConnect() {
+        ready = true
+        onEvent?(HermesGatewayEvent(type: "gateway.ready", sessionID: nil, payload: [:]))
+    }
+
+    func completeReadyConnect() {
+        readinessWaiters.forEach { $0.resume() }
+        readinessWaiters.removeAll()
+    }
+
     func disconnect(_ message: String) {
         onDisconnect?(message)
     }
@@ -363,5 +581,10 @@ private final class FakeHermesGatewayClient: HermesGatewayClientProtocol {
         let value = resultByMethod[method] ?? .object([:])
         let waiters = callWaiters.removeValue(forKey: method) ?? []
         waiters.forEach { $0.resume(returning: value) }
+    }
+
+    func failCall(method: String) {
+        let waiters = callWaiters.removeValue(forKey: method) ?? []
+        waiters.forEach { $0.resume(throwing: HermesGatewayClientError.disconnected) }
     }
 }

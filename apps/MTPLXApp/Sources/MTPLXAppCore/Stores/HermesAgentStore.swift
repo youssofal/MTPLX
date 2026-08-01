@@ -117,6 +117,12 @@ public final class HermesAgentStore: ObservableObject {
     private var gatewayGeneration = 0
     private var didReapOrphanedSidecars = false
 
+    private struct GatewayOperation {
+        let generation: Int
+        let profileID: String
+        let clientIdentity: ObjectIdentifier
+    }
+
     public init(
         integration: HermesIntegration,
         embeddedRuntime: any HermesEmbeddedRuntime,
@@ -220,15 +226,16 @@ public final class HermesAgentStore: ObservableObject {
         configuration: MTPLXAppConfiguration
     ) async {
         selectedProfile = profile
+        var operation: GatewayOperation?
         do {
-            try await ensureGateway(profile: profile, configuration: configuration)
-            guard isCurrentProfile(profile) else { return }
-            let result = try await rpc("session.list", params: ["limit": .number(200)])
-            guard isCurrentProfile(profile), gatewayReady else { return }
+            operation = try await ensureGateway(profile: profile, configuration: configuration)
+            guard let operation, isCurrent(operation) else { return }
+            let result = try await rpc(operation, method: "session.list", params: ["limit": .number(200)])
+            guard isCurrent(operation) else { return }
             sessions = Self.parseSessions(result)
             connectionState = .connected
         } catch {
-            guard isCurrentProfile(profile), !shuttingDown else { return }
+            guard let operation, isCurrent(operation), !shuttingDown else { return }
             sessions = []
             connectionState = .failed(Self.message(for: error))
         }
@@ -240,19 +247,19 @@ public final class HermesAgentStore: ObservableObject {
         configuration: MTPLXAppConfiguration
     ) async throws -> HermesSessionReference {
         selectedProfile = profile
-        try await ensureGateway(profile: profile, configuration: configuration)
-        guard isCurrentProfile(profile), gatewayReady else {
+        let operation = try await ensureGateway(profile: profile, configuration: configuration)
+        guard isCurrent(operation) else {
             throw HermesGatewayClientError.disconnected
         }
-        let result = try await rpc("session.create", params: ["cols": .number(100)])
-        guard isCurrentProfile(profile), gatewayReady else {
+        let result = try await rpc(operation, method: "session.create", params: ["cols": .number(100)])
+        guard isCurrent(operation) else {
             throw CancellationError()
         }
         guard let sessionID = result.objectValue?["session_id"]?.stringValue else {
             throw HermesGatewayClientError.malformedResponse
         }
-        let sessionKey = (try? await liveSessionKey(for: sessionID)) ?? sessionID
-        guard isCurrentProfile(profile), gatewayReady else {
+        let sessionKey = (try? await liveSessionKey(for: sessionID, operation: operation)) ?? sessionID
+        guard isCurrent(operation) else {
             throw CancellationError()
         }
         activeSessionID = sessionID
@@ -275,18 +282,19 @@ public final class HermesAgentStore: ObservableObject {
         configuration: MTPLXAppConfiguration
     ) async throws -> HermesSessionReference {
         selectedProfile = profile
-        try await ensureGateway(profile: profile, configuration: configuration)
-        guard isCurrentProfile(profile), gatewayReady else {
+        let operation = try await ensureGateway(profile: profile, configuration: configuration)
+        guard isCurrent(operation) else {
             throw HermesGatewayClientError.disconnected
         }
         let result = try await rpc(
-            "session.resume",
+            operation,
+            method: "session.resume",
             params: [
                 "session_id": .string(session.id),
                 "cols": .number(100),
             ]
         )
-        guard isCurrentProfile(profile), gatewayReady else {
+        guard isCurrent(operation) else {
             throw CancellationError()
         }
         try applyResumedSession(
@@ -328,18 +336,25 @@ public final class HermesAgentStore: ObservableObject {
 
     public func send(_ rawText: String) async {
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, let sessionID = activeSessionID, gatewayReady, !isStreaming else { return }
+        guard !text.isEmpty,
+              let sessionID = activeSessionID,
+              let profile = selectedProfile,
+              let operation = currentOperation(for: profile),
+              !isStreaming
+        else { return }
         messages.append(HermesTranscriptMessage(role: .user, text: text))
         isStreaming = true
         do {
             _ = try await rpc(
-                "prompt.submit",
+                operation,
+                method: "prompt.submit",
                 params: [
                     "session_id": .string(sessionID),
                     "text": .string(text),
                 ]
             )
         } catch {
+            guard isCurrent(operation, sessionID: sessionID) else { return }
             isStreaming = false
             messages.append(
                 HermesTranscriptMessage(
@@ -351,14 +366,19 @@ public final class HermesAgentStore: ObservableObject {
     }
 
     public func interrupt() async {
-        guard let sessionID = activeSessionID, gatewayReady else { return }
+        guard let sessionID = activeSessionID,
+              let profile = selectedProfile,
+              let operation = currentOperation(for: profile)
+        else { return }
         do {
-            _ = try await rpc("session.interrupt", params: ["session_id": .string(sessionID)])
+            _ = try await rpc(operation, method: "session.interrupt", params: ["session_id": .string(sessionID)])
         } catch {
+            guard isCurrent(operation, sessionID: sessionID) else { return }
             messages.append(
                 HermesTranscriptMessage(role: .system, text: Self.message(for: error))
             )
         }
+        guard isCurrent(operation, sessionID: sessionID) else { return }
         isStreaming = false
     }
 
@@ -398,13 +418,15 @@ public final class HermesAgentStore: ObservableObject {
         guard let profile = selectedProfile else { throw HermesGatewayClientError.disconnected }
         let savedSessionID = activeSessionKey ?? activeSessionID ?? configuration.lastHermesSessionID
         let title = activeSessionTitle ?? configuration.lastHermesSessionTitle
-        try await ensureGateway(profile: profile, configuration: configuration, preserveSession: true)
+        let operation = try await ensureGateway(profile: profile, configuration: configuration, preserveSession: true)
+        guard isCurrent(operation) else { throw CancellationError() }
         guard let savedSessionID else { return }
         let result = try await rpc(
-            "session.resume",
+            operation,
+            method: "session.resume",
             params: ["session_id": .string(savedSessionID), "cols": .number(100)]
         )
-        guard isCurrentProfile(profile), gatewayReady else {
+        guard isCurrent(operation) else {
             throw CancellationError()
         }
         try applyResumedSession(
@@ -423,14 +445,17 @@ public final class HermesAgentStore: ObservableObject {
         profile: HermesProfile,
         configuration: MTPLXAppConfiguration,
         preserveSession: Bool = false
-    ) async throws {
+    ) async throws -> GatewayOperation {
         let signature = Self.configurationSignature(configuration)
         if sidecarProfileName == profile.name,
            sidecarConfigurationSignature == signature,
            sidecar?.isRunning == true,
            client != nil,
            gatewayReady {
-            return
+            guard let operation = currentOperation(for: profile) else {
+                throw HermesGatewayClientError.disconnected
+            }
+            return operation
         }
         let reuseSidecar = sidecarProfileName == profile.name
             && sidecarConfigurationSignature == signature
@@ -452,19 +477,26 @@ public final class HermesAgentStore: ObservableObject {
                 activeSessionTitle = nil
                 messages = []
                 toolTraces = []
+                isStreaming = false
             }
         }
         gatewayReady = false
         shuttingDown = false
         connectionState = .starting
         let nextSidecar: any HermesSidecarControlling
-        if let sidecar, reuseSidecar {
-            nextSidecar = sidecar
-        } else {
-            nextSidecar = try await embeddedRuntime.startEmbeddedSidecar(
-                profile: profile,
-                configuration: configuration
-            )
+        do {
+            if let sidecar, reuseSidecar {
+                nextSidecar = sidecar
+            } else {
+                nextSidecar = try await embeddedRuntime.startEmbeddedSidecar(
+                    profile: profile,
+                    configuration: configuration
+                )
+            }
+        } catch {
+            guard generation == gatewayGeneration, !shuttingDown else { throw CancellationError() }
+            connectionState = .failed(Self.message(for: error))
+            throw error
         }
         guard generation == gatewayGeneration, !shuttingDown else {
             if !reuseSidecar { nextSidecar.stop() }
@@ -480,15 +512,13 @@ public final class HermesAgentStore: ObservableObject {
                   self.gatewayGeneration == generation,
                   !self.shuttingDown
             else { return }
-            self.gatewayReady = false
-            self.client?.close()
-            self.client = nil
-            self.sidecar?.stop()
-            self.sidecar = nil
-            self.sidecarProfileName = nil
-            self.sidecarConfigurationSignature = nil
-            self.isStreaming = false
-            self.connectionState = .failed(message)
+            if self.releaseGatewayIfOwned(
+                generation: generation,
+                client: nextClient,
+                sidecar: nextSidecar
+            ) {
+                self.connectionState = .failed(message)
+            }
         }
         sidecar = nextSidecar
         sidecarProfileName = profile.name
@@ -499,32 +529,77 @@ public final class HermesAgentStore: ObservableObject {
             try await nextClient.connectAndWaitUntilReady(timeoutSeconds: 10)
         } catch {
             guard generation == gatewayGeneration, !shuttingDown else { throw CancellationError() }
-            nextClient.close()
-            if sidecar === nextSidecar { sidecar = nil }
-            nextSidecar.stop()
-            sidecarProfileName = nil
-            sidecarConfigurationSignature = nil
-            gatewayReady = false
+            if releaseGatewayIfOwned(generation: generation, client: nextClient, sidecar: nextSidecar) {
+                connectionState = .failed(Self.message(for: error))
+            }
             throw error
         }
         guard generation == gatewayGeneration, !shuttingDown else {
-            nextClient.close()
-            if !reuseSidecar { nextSidecar.stop() }
+            _ = releaseGatewayIfOwned(generation: generation, client: nextClient, sidecar: nextSidecar)
             throw CancellationError()
         }
         gatewayReady = true
         connectionState = .connected
+        return GatewayOperation(
+            generation: generation,
+            profileID: profile.id,
+            clientIdentity: ObjectIdentifier(nextClient)
+        )
     }
 
-    private func rpc(_ method: String, params: [String: JSONValue] = [:]) async throws -> JSONValue {
-        guard gatewayReady, let client else {
+    private func rpc(
+        _ operation: GatewayOperation,
+        method: String,
+        params: [String: JSONValue] = [:]
+    ) async throws -> JSONValue {
+        guard isCurrent(operation), let client else {
             throw HermesGatewayClientError.disconnected
         }
         return try await client.call(method: method, params: params)
     }
 
-    private func isCurrentProfile(_ profile: HermesProfile) -> Bool {
-        selectedProfile?.id == profile.id
+    private func currentOperation(for profile: HermesProfile) -> GatewayOperation? {
+        guard gatewayReady,
+              selectedProfile?.id == profile.id,
+              let client
+        else { return nil }
+        return GatewayOperation(
+            generation: gatewayGeneration,
+            profileID: profile.id,
+            clientIdentity: ObjectIdentifier(client)
+        )
+    }
+
+    private func isCurrent(_ operation: GatewayOperation, sessionID: String? = nil) -> Bool {
+        guard gatewayReady,
+              gatewayGeneration == operation.generation,
+              selectedProfile?.id == operation.profileID,
+              let client,
+              ObjectIdentifier(client) == operation.clientIdentity
+        else { return false }
+        return sessionID.map { $0 == activeSessionID } ?? true
+    }
+
+    private func releaseGatewayIfOwned(
+        generation: Int,
+        client expectedClient: any HermesGatewayClientProtocol,
+        sidecar expectedSidecar: any HermesSidecarControlling
+    ) -> Bool {
+        guard gatewayGeneration == generation,
+              let client,
+              ObjectIdentifier(client) == ObjectIdentifier(expectedClient),
+              let sidecar,
+              ObjectIdentifier(sidecar) == ObjectIdentifier(expectedSidecar)
+        else { return false }
+        self.client = nil
+        self.sidecar = nil
+        sidecarProfileName = nil
+        sidecarConfigurationSignature = nil
+        gatewayReady = false
+        isStreaming = false
+        expectedClient.close()
+        expectedSidecar.stop()
+        return true
     }
 
     private func tearDownGateway(clearSession: Bool) {
@@ -563,9 +638,10 @@ public final class HermesAgentStore: ObservableObject {
         connectionState = .connected
     }
 
-    private func liveSessionKey(for sessionID: String) async throws -> String? {
+    private func liveSessionKey(for sessionID: String, operation: GatewayOperation) async throws -> String? {
         let result = try await rpc(
-            "session.active_list",
+            operation,
+            method: "session.active_list",
             params: ["current_session_id": .string(sessionID)]
         )
         guard let rows = result.objectValue?["sessions"]?.arrayValue else { return nil }
@@ -580,7 +656,6 @@ public final class HermesAgentStore: ObservableObject {
 
     private func handle(_ event: HermesGatewayEvent) {
         if event.type == "gateway.ready" {
-            gatewayReady = true
             return
         }
         if let activeSessionID,
@@ -636,10 +711,14 @@ public final class HermesAgentStore: ObservableObject {
                     detail: "Auto-approved by MTPLX Hermes mode."
                 )
             )
-            if let sessionID = activeSessionID {
-                Task {
-                    _ = try? await rpc(
-                        "approval.respond",
+            if let sessionID = activeSessionID,
+               let profile = selectedProfile,
+               let operation = currentOperation(for: profile) {
+                Task { [weak self] in
+                    guard let self, self.isCurrent(operation, sessionID: sessionID) else { return }
+                    _ = try? await self.rpc(
+                        operation,
+                        method: "approval.respond",
                         params: [
                             "session_id": .string(sessionID),
                             "choice": .string("allow"),
@@ -703,9 +782,14 @@ public final class HermesAgentStore: ObservableObject {
             )
         }
         isStreaming = false
-        if let activeSessionID {
-            Task {
-                activeSessionKey = (try? await liveSessionKey(for: activeSessionID)) ?? activeSessionKey
+        if let activeSessionID,
+           let profile = selectedProfile,
+           let operation = currentOperation(for: profile) {
+            Task { [weak self] in
+                guard let self else { return }
+                let key = try? await self.liveSessionKey(for: activeSessionID, operation: operation)
+                guard self.isCurrent(operation, sessionID: activeSessionID) else { return }
+                self.activeSessionKey = key ?? self.activeSessionKey
             }
         }
     }
