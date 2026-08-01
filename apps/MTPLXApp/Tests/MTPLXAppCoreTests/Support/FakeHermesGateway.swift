@@ -92,6 +92,26 @@ final class FakeHermesGateway: @unchecked Sendable {
         queue.async { self.sendText("not-json") }
     }
 
+    func sendResult(id: Int, result: JSONValue = .null) {
+        queue.async {
+            self.sendJSON([
+                "jsonrpc": .string("2.0"),
+                "id": .number(Double(id)),
+                "result": result,
+            ])
+        }
+    }
+
+    func sendRPCError(id: Int) {
+        queue.async {
+            self.sendJSON([
+                "jsonrpc": .string("2.0"),
+                "id": .number(Double(id)),
+                "error": .object(["message": .string("fixture failure")]),
+            ])
+        }
+    }
+
     func disconnect() {
         queue.async {
             self.connection?.cancel()

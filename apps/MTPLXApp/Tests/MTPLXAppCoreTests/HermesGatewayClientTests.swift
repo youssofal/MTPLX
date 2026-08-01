@@ -138,6 +138,112 @@ final class HermesGatewayClientTests: XCTestCase {
         client.close()
     }
 
+    func testUnknownResponseIDTerminatesPendingRequest() async throws {
+        let backend = try FakeHermesGateway(eventsOnConnect: [.gatewayReady])
+        let client = URLSessionHermesGatewayClient(url: backend.webSocketURL(token: UUID().uuidString))
+        defer { client.close() }
+        try await client.connectAndWaitUntilReady(timeoutSeconds: 1)
+        let completed = expectation(description: "pending request fails")
+        var observed: Error?
+        Task {
+            do {
+                _ = try await client.call(method: "wrong-id", params: [:])
+            } catch {
+                observed = error
+                completed.fulfill()
+            }
+        }
+
+        await eventually { backend.hasReceivedRequest(named: "wrong-id") }
+        backend.sendResult(id: 99)
+        await fulfillment(of: [completed], timeout: 0.5)
+        XCTAssertEqual(observed as? HermesGatewayClientError, .malformedResponse)
+    }
+
+    func testLateDuplicateOfRetiredIDDoesNotTerminateNewPendingRequest() async throws {
+        let backend = try FakeHermesGateway(eventsOnConnect: [.gatewayReady])
+        let client = URLSessionHermesGatewayClient(url: backend.webSocketURL(token: UUID().uuidString))
+        defer { client.close() }
+        try await client.connectAndWaitUntilReady(timeoutSeconds: 1)
+
+        let first = Task { try await client.call(method: "first", params: [:]) }
+        await eventually { backend.hasReceivedRequest(named: "first") }
+        backend.sendResult(id: 1, result: .string("first"))
+        let firstValue = try await first.value
+        XCTAssertEqual(firstValue, .string("first"))
+
+        let second = Task { try await client.call(method: "second", params: [:]) }
+        await eventually { backend.hasReceivedRequest(named: "second") }
+        backend.sendResult(id: 1, result: .string("late duplicate"))
+        try await Task.sleep(for: .milliseconds(25))
+        backend.sendResult(id: 2, result: .string("second"))
+        let secondValue = try await second.value
+        XCTAssertEqual(secondValue, .string("second"))
+    }
+
+    func testLateDuplicateOfFailedRetiredIDDoesNotTerminateNewPendingRequest() async throws {
+        let backend = try FakeHermesGateway(eventsOnConnect: [.gatewayReady])
+        let client = URLSessionHermesGatewayClient(url: backend.webSocketURL(token: UUID().uuidString))
+        defer { client.close() }
+        try await client.connectAndWaitUntilReady(timeoutSeconds: 1)
+
+        let first = Task { try await client.call(method: "first-error", params: [:]) }
+        await eventually { backend.hasReceivedRequest(named: "first-error") }
+        backend.sendRPCError(id: 1)
+        do {
+            _ = try await first.value
+            XCTFail("Expected RPC error")
+        } catch {
+            XCTAssertEqual(error as? HermesGatewayClientError, .rpcError)
+        }
+
+        let second = Task { try await client.call(method: "second-after-error", params: [:]) }
+        await eventually { backend.hasReceivedRequest(named: "second-after-error") }
+        backend.sendRPCError(id: 1)
+        try await Task.sleep(for: .milliseconds(25))
+        backend.sendResult(id: 2, result: .string("second"))
+        let secondValue = try await second.value
+        XCTAssertEqual(secondValue, .string("second"))
+    }
+
+    func testUnknownResponseIDTerminatesAllConcurrentPendingRequests() async throws {
+        let backend = try FakeHermesGateway(eventsOnConnect: [.gatewayReady])
+        let client = URLSessionHermesGatewayClient(url: backend.webSocketURL(token: UUID().uuidString))
+        defer { client.close() }
+        try await client.connectAndWaitUntilReady(timeoutSeconds: 1)
+        let completed = expectation(description: "both pending requests fail")
+        completed.expectedFulfillmentCount = 2
+        var observed: [HermesGatewayClientError] = []
+        Task {
+            do {
+                _ = try await client.call(method: "concurrent-a", params: [:])
+            } catch let error as HermesGatewayClientError {
+                observed.append(error)
+                completed.fulfill()
+            } catch {
+                XCTFail("Unexpected error type")
+            }
+        }
+        Task {
+            do {
+                _ = try await client.call(method: "concurrent-b", params: [:])
+            } catch let error as HermesGatewayClientError {
+                observed.append(error)
+                completed.fulfill()
+            } catch {
+                XCTFail("Unexpected error type")
+            }
+        }
+
+        await eventually {
+            backend.hasReceivedRequest(named: "concurrent-a") &&
+                backend.hasReceivedRequest(named: "concurrent-b")
+        }
+        backend.sendResult(id: 99)
+        await fulfillment(of: [completed], timeout: 0.5)
+        XCTAssertEqual(observed, [.malformedResponse, .malformedResponse])
+    }
+
     func testAuthenticatedQueryIsSentWithoutSurfacingItInErrors() async throws {
         let backend = try FakeHermesGateway(eventsOnConnect: [.gatewayReady])
         let client = URLSessionHermesGatewayClient(url: backend.webSocketURL(token: UUID().uuidString))

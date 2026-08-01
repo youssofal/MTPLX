@@ -44,9 +44,12 @@ public typealias HermesGatewayClientFactory = @MainActor (URL) -> any HermesGate
 /// JSON-RPC transport for the ephemeral, authenticated loopback sidecar.
 @MainActor
 public final class URLSessionHermesGatewayClient: HermesGatewayClientProtocol {
+    private static let retiredIDLimit = 256
     private let task: URLSessionWebSocketTask
     private var nextID = 1
     private var pending: [Int: CheckedContinuation<JSONValue, Error>] = [:]
+    private var retiredIDs: Set<Int> = []
+    private var retiredIDOrder: [Int] = []
     private var readinessWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
     private var readinessTimeouts: [UUID: Task<Void, Never>] = [:]
     private var started = false
@@ -170,6 +173,11 @@ public final class URLSessionHermesGatewayClient: HermesGatewayClientProtocol {
                     terminate(error: .malformedResponse, notify: true)
                     return
                 }
+                guard !retiredIDs.contains(id) else { return }
+                guard pending[id] != nil else {
+                    terminate(error: .malformedResponse, notify: true)
+                    return
+                }
                 failPendingRequest(id, error: .rpcError)
                 return
             }
@@ -177,7 +185,13 @@ public final class URLSessionHermesGatewayClient: HermesGatewayClientProtocol {
                 terminate(error: .malformedResponse, notify: true)
                 return
             }
-            pending.removeValue(forKey: id)?.resume(returning: result)
+            guard !retiredIDs.contains(id) else { return }
+            guard let continuation = pending.removeValue(forKey: id) else {
+                terminate(error: .malformedResponse, notify: true)
+                return
+            }
+            retireRPCID(id)
+            continuation.resume(returning: result)
             return
         }
 
@@ -229,7 +243,17 @@ public final class URLSessionHermesGatewayClient: HermesGatewayClientProtocol {
     }
 
     private func failPendingRequest(_ id: Int, error: HermesGatewayClientError) {
-        pending.removeValue(forKey: id)?.resume(throwing: error)
+        guard let continuation = pending.removeValue(forKey: id) else { return }
+        retireRPCID(id)
+        continuation.resume(throwing: error)
+    }
+
+    private func retireRPCID(_ id: Int) {
+        guard retiredIDs.insert(id).inserted else { return }
+        retiredIDOrder.append(id)
+        if retiredIDOrder.count > Self.retiredIDLimit {
+            retiredIDs.remove(retiredIDOrder.removeFirst())
+        }
     }
 
     private func terminate(error: HermesGatewayClientError, notify: Bool) {
