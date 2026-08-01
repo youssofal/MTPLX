@@ -166,22 +166,37 @@ public enum HermesIntegrationError: Error, Equatable, LocalizedError {
     }
 }
 
-public final class HermesSidecar: @unchecked Sendable {
+public final class HermesSidecar: HermesSidecarControlling, @unchecked Sendable {
     public let process: Process
     public let port: Int
-    public let token: String
     public let dashboardURL: URL
     public let webSocketURL: URL
+    public let ownershipRecordURL: URL
+    private let outputPipes: [Pipe]
 
-    init(process: Process, port: Int, token: String) {
+    init(
+        process: Process,
+        port: Int,
+        token: String,
+        ownershipRecordURL: URL,
+        outputPipes: [Pipe]
+    ) {
         self.process = process
         self.port = port
-        self.token = token
         self.dashboardURL = URL(string: "http://127.0.0.1:\(port)/")!
         self.webSocketURL = URL(string: "ws://127.0.0.1:\(port)/api/ws?token=\(token)")!
+        self.ownershipRecordURL = ownershipRecordURL
+        self.outputPipes = outputPipes
     }
 
+    public var processIdentifier: Int32 { process.processIdentifier }
+    public var isRunning: Bool { process.isRunning }
+
     public func stop() {
+        defer {
+            outputPipes.forEach { $0.fileHandleForReading.readabilityHandler = nil }
+            try? FileManager.default.removeItem(at: ownershipRecordURL)
+        }
         guard process.isRunning else { return }
         process.terminate()
         let deadline = Date().addingTimeInterval(2)
@@ -226,6 +241,9 @@ public struct HermesIntegration: Sendable {
     /// (`{"profile": "<name>"}`, validated by their renderer's
     /// PROFILE_NAME_RE; the desktop persists its own selection thereafter).
     public let activeProfileURL: URL
+    /// Runtime-only MTPLX ownership records for isolated embedded children.
+    /// This is deliberately outside every Hermes profile directory.
+    public let sidecarRuntimeDirectory: URL
     /// Test seam: bypass bootstrap-layout + LaunchServices discovery.
     public let desktopApplicationOverride: URL?
 
@@ -239,6 +257,8 @@ public struct HermesIntegration: Sendable {
         activeProfileURL: URL = URL(fileURLWithPath: NSHomeDirectory())
             .appendingPathComponent("Library/Application Support/Hermes")
             .appendingPathComponent("active-profile.json"),
+        sidecarRuntimeDirectory: URL = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent(".mtplx/hermes-sidecars", isDirectory: true),
         desktopApplicationOverride: URL? = nil
     ) {
         self.hermesHome = hermesHome
@@ -246,6 +266,7 @@ public struct HermesIntegration: Sendable {
         self.environment = environment
         self.terminalCommandURL = terminalCommandURL
         self.activeProfileURL = activeProfileURL
+        self.sidecarRuntimeDirectory = sidecarRuntimeDirectory
         self.desktopApplicationOverride = desktopApplicationOverride
     }
 
@@ -816,11 +837,193 @@ public struct HermesIntegration: Sendable {
         profile: HermesProfile,
         configuration: MTPLXAppConfiguration
     ) async throws -> HermesSidecar {
-        _ = profile
-        _ = configuration
-        throw HermesIntegrationError.incompatible(
-            "This Hermes build exposes CLI chat and ACP, not the dashboard WebSocket surface."
-        )
+        guard let sidecar = try await startEmbeddedSidecar(
+            profile: profile,
+            configuration: configuration
+        ) as? HermesSidecar else {
+            throw HermesIntegrationError.launchFailed("embedded sidecar controller was unavailable")
+        }
+        return sidecar
+    }
+
+    /// Launches one process-local, loopback-only Hermes backend.  Nothing in
+    /// this path calls `sync(configuration:)`: selected profiles remain byte
+    /// for byte user-owned while their child receives the MTPLX route only in
+    /// its environment.
+    public func startEmbeddedSidecar(
+        profile: HermesProfile,
+        configuration: MTPLXAppConfiguration
+    ) async throws -> any HermesSidecarControlling {
+        try await Task.detached(priority: .userInitiated) { [self] in
+            let token = Self.randomURLSafeToken(byteCount: 32)
+            let launchID = Self.randomLaunchID()
+            let spec = try serveLaunchSpec(
+                profile: profile,
+                configuration: configuration,
+                token: token,
+                launchID: launchID,
+                parentPID: getpid()
+            )
+
+            let process = Process()
+            process.executableURL = spec.executableURL
+            process.arguments = spec.arguments
+            process.environment = spec.environment
+            let stdout = Pipe()
+            let stderr = Pipe()
+            process.standardOutput = stdout
+            process.standardError = stderr
+
+            let readiness = HermesSidecarReadiness()
+            let stderrTail = SubprocessTailBuffer(capacity: 4_096)
+            let redact = Self.stderrRedactor(for: spec)
+            stdout.fileHandleForReading.readabilityHandler = { handle in
+                let chunk = handle.availableData
+                if chunk.isEmpty {
+                    handle.readabilityHandler = nil
+                } else {
+                    readiness.consume(chunk)
+                }
+            }
+            stderr.fileHandleForReading.readabilityHandler = { handle in
+                let chunk = handle.availableData
+                if chunk.isEmpty {
+                    handle.readabilityHandler = nil
+                } else {
+                    stderrTail.append(Data(redact(String(decoding: chunk, as: UTF8.self)).utf8))
+                }
+            }
+
+            var launched = false
+            defer {
+                if launched {
+                    stdout.fileHandleForReading.readabilityHandler = nil
+                    stderr.fileHandleForReading.readabilityHandler = nil
+                    if process.isRunning {
+                        Self.stopChild(process)
+                    }
+                }
+            }
+
+            do {
+                try process.run()
+                launched = true
+            } catch {
+                throw HermesIntegrationError.launchFailed("could not launch isolated Hermes sidecar")
+            }
+
+            let deadline = Date().addingTimeInterval(15)
+            var port: Int?
+            while Date() < deadline {
+                let result = readiness.result()
+                if result.malformed {
+                    throw HermesIntegrationError.launchFailed(
+                        Self.startupDiagnostic("Hermes emitted an invalid readiness sentinel.", stderrTail: stderrTail)
+                    )
+                }
+                if let readyPort = result.port {
+                    port = readyPort
+                    break
+                }
+                if !process.isRunning {
+                    // A just-exited child can race its final stdout callback.
+                    try await Task.sleep(for: .milliseconds(50))
+                    let final = readiness.result()
+                    if final.malformed {
+                        throw HermesIntegrationError.launchFailed(
+                            Self.startupDiagnostic("Hermes emitted an invalid readiness sentinel.", stderrTail: stderrTail)
+                        )
+                    }
+                    if let readyPort = final.port {
+                        port = readyPort
+                        break
+                    }
+                    throw HermesIntegrationError.launchFailed(
+                        Self.startupDiagnostic("Hermes exited before it became ready.", stderrTail: stderrTail)
+                    )
+                }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            guard let port else {
+                throw HermesIntegrationError.launchFailed(
+                    Self.startupDiagnostic("Hermes did not become ready within 15 seconds.", stderrTail: stderrTail)
+                )
+            }
+
+            let recordURL = sidecarRuntimeDirectory
+                .appendingPathComponent("\(spec.launchID).json", isDirectory: false)
+            let record = HermesSidecarOwnershipRecord(
+                launchID: spec.launchID,
+                pid: process.processIdentifier,
+                parentPID: spec.parentPID,
+                profileName: profile.name,
+                createdAt: Date()
+            )
+            do {
+                try Self.writeOwnershipRecord(record, to: recordURL)
+            } catch {
+                throw HermesIntegrationError.launchFailed(
+                    Self.startupDiagnostic("Could not record isolated Hermes ownership.", stderrTail: stderrTail)
+                )
+            }
+
+            launched = false
+            return HermesSidecar(
+                process: process,
+                port: port,
+                token: token,
+                ownershipRecordURL: recordURL,
+                outputPipes: [stdout, stderr]
+            )
+        }.value
+    }
+
+    /// Removes only dead records and sidecars that can be proven to be ours at
+    /// the instant of signalling.  A generic Hermes Desktop/TUI/gateway never
+    /// has a record plus this exact marker, so it remains read-only here.
+    @discardableResult
+    public func reapOrphanedEmbeddedSidecars() -> [Int32] {
+        let records = Self.readOwnershipRecords(in: sidecarRuntimeDirectory)
+        var liveRecords: [(URL, HermesSidecarOwnershipRecord, HermesSidecarProcessSnapshot)] = []
+        for (url, record) in records {
+            guard let snapshot = Self.processSnapshot(pid: record.pid) else {
+                try? FileManager.default.removeItem(at: url)
+                continue
+            }
+            liveRecords.append((url, record, snapshot))
+        }
+
+        let candidatePIDs = Set(HermesOrphanSidecarScanner.orphanPIDs(
+            records: liveRecords.map(\.1),
+            processes: liveRecords.map(\.2),
+            livePIDs: Set(liveRecords.map(\.1.parentPID).filter(Self.isPIDAlive))
+        ))
+        var reaped: [Int32] = []
+        for (url, record, _) in liveRecords where candidatePIDs.contains(record.pid) {
+            // Re-read immediately before TERM.  PID reuse or a changed command
+            // must turn cleanup into a no-op rather than an accidental kill.
+            guard !Self.isPIDAlive(record.parentPID),
+                  let beforeTERM = Self.processSnapshot(pid: record.pid),
+                  HermesOrphanSidecarScanner.isExactOwnedSidecar(beforeTERM, launchID: record.launchID)
+            else { continue }
+            _ = kill(record.pid, SIGTERM)
+            let deadline = Date().addingTimeInterval(2)
+            while Self.isPIDAlive(record.pid) && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            if Self.isPIDAlive(record.pid) {
+                guard !Self.isPIDAlive(record.parentPID),
+                      let beforeKILL = Self.processSnapshot(pid: record.pid),
+                      HermesOrphanSidecarScanner.isExactOwnedSidecar(beforeKILL, launchID: record.launchID)
+                else { continue }
+                _ = kill(record.pid, SIGKILL)
+            }
+            if !Self.isPIDAlive(record.pid) {
+                try? FileManager.default.removeItem(at: url)
+                reaped.append(record.pid)
+            }
+        }
+        return reaped.sorted()
     }
 
     public func createProfile(named rawName: String) async throws -> HermesProfile {
@@ -1671,6 +1874,134 @@ public struct HermesIntegration: Sendable {
         throw HermesIntegrationError.dashboardTokenTimeout
     }
 
+    private static func randomURLSafeToken(byteCount: Int) -> String {
+        let data = Data((0..<byteCount).map { _ in UInt8.random(in: .min ... .max) })
+        return data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    private static func randomLaunchID() -> String {
+        Data((0..<8).map { _ in UInt8.random(in: .min ... .max) })
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
+    private static func stderrRedactor(for spec: HermesServeLaunchSpec) -> @Sendable (String) -> String {
+        let values = Set(spec.environment.values + [spec.token])
+            .filter { $0.count >= 4 }
+            .sorted { $0.count > $1.count }
+        return { text in
+            values.reduce(text) { partial, value in
+                partial.replacingOccurrences(of: value, with: "[redacted]")
+            }
+        }
+    }
+
+    private static func startupDiagnostic(_ summary: String, stderrTail: SubprocessTailBuffer) -> String {
+        let tail = stderrTail.snapshot()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return tail.isEmpty ? summary : "\(summary) \(tail)"
+    }
+
+    private static func stopChild(_ process: Process) {
+        guard process.isRunning else { return }
+        process.terminate()
+        let deadline = Date().addingTimeInterval(2)
+        while process.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        if process.isRunning {
+            kill(process.processIdentifier, SIGKILL)
+        }
+    }
+
+    private static func writeOwnershipRecord(
+        _ record: HermesSidecarOwnershipRecord,
+        to recordURL: URL
+    ) throws {
+        let directory = recordURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        let data = try JSONEncoder().encode(record)
+        try data.write(to: recordURL, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: recordURL.path)
+    }
+
+    private static func readOwnershipRecords(
+        in directory: URL
+    ) -> [(URL, HermesSidecarOwnershipRecord)] {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+        let decoder = JSONDecoder()
+        return files.compactMap { url in
+            guard url.pathExtension == "json",
+                  let data = try? Data(contentsOf: url),
+                  let record = try? decoder.decode(HermesSidecarOwnershipRecord.self, from: data),
+                  isValidEmbeddedLaunchID(record.launchID),
+                  record.pid > 1,
+                  record.parentPID > 1
+            else { return nil }
+            return (url, record)
+        }
+    }
+
+    private static func isPIDAlive(_ pid: Int32) -> Bool {
+        guard pid > 1 else { return false }
+        if kill(pid, 0) == 0 { return true }
+        return errno == EPERM
+    }
+
+    private static func processSnapshot(pid: Int32) -> HermesSidecarProcessSnapshot? {
+        guard pid > 1 else { return nil }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-p", String(pid), "-o", "pid=,command="]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = Pipe()
+        let watchdog = SubprocessWatchdog(process)
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+        let drain = SubprocessPipeDrain(output, capacity: 16_384)
+        guard watchdog.wait(for: process, timeout: 2, terminateGrace: 0.2, killGrace: 0.2) else {
+            drain.join(timeout: 0.2)
+            return nil
+        }
+        drain.join(timeout: 0.2)
+        guard process.terminationStatus == 0,
+              let row = drain.snapshot().split(separator: "\n").first
+        else { return nil }
+        let text = String(row).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let separator = text.firstIndex(where: { $0.isWhitespace }),
+              Int32(text[..<separator]) == pid
+        else { return nil }
+        let command = text[separator...].trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = command.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        guard parts.count > 1 else { return nil }
+        return HermesSidecarProcessSnapshot(pid: pid, arguments: Array(parts.dropFirst()))
+    }
+
+    public func sessionOwnership(
+        profile: HermesProfile,
+        sessionID: String,
+        ownedSidecarPID: Int32?
+    ) -> HermesSessionOwnership {
+        _ = profile
+        _ = sessionID
+        _ = ownedSidecarPID
+        // Task 5 replaces this conservative placeholder with Hermes' native
+        // active-session registry.  Until then, no session is assumed writable.
+        return .unavailable("Session ownership is unavailable.")
+    }
+
     private func runAndCapture(
         executableURL: URL,
         arguments: [String],
@@ -1907,3 +2238,5 @@ public struct HermesIntegration: Sendable {
         return Int(UInt16(bigEndian: addr.sin_port))
     }
 }
+
+extension HermesIntegration: HermesEmbeddedRuntime {}
