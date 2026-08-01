@@ -289,6 +289,20 @@ final class HermesGatewayClientTests: XCTestCase {
         await eventually { backend.peerWasDisconnected() }
     }
 
+    func testDeinitClosesStartedSocketAfterClientDeallocation() async throws {
+        let backend = try FakeHermesGateway(eventsOnConnect: [.gatewayReady])
+        weak var weakClient: URLSessionHermesGatewayClient?
+
+        do {
+            let client = URLSessionHermesGatewayClient(url: backend.webSocketURL(token: UUID().uuidString))
+            weakClient = client
+            try await client.connectAndWaitUntilReady(timeoutSeconds: 1)
+        }
+
+        await eventually { weakClient == nil }
+        await eventually { backend.peerWasDisconnected() }
+    }
+
     func testAuthenticatedQueryIsSentWithoutSurfacingItInErrors() async throws {
         let backend = try FakeHermesGateway(eventsOnConnect: [.gatewayReady])
         let client = URLSessionHermesGatewayClient(url: backend.webSocketURL(token: UUID().uuidString))

@@ -71,6 +71,10 @@ public final class URLSessionHermesGatewayClient: HermesGatewayClientProtocol {
         nextID = startingRequestID
     }
 
+    deinit {
+        task.cancel(with: .goingAway, reason: nil)
+    }
+
     /// Compatibility for the pre-readiness store lifecycle. New callers wait.
     public func connect() {
         startIfNeeded()
