@@ -87,149 +87,6 @@ public struct HermesSavedSession: Identifiable, Equatable, Sendable {
     }
 }
 
-private struct HermesGatewayEvent: Sendable {
-    let type: String
-    let sessionID: String?
-    let payload: [String: JSONValue]
-}
-
-public enum HermesGatewayClientError: Error, LocalizedError {
-    case disconnected
-    case malformedResponse
-    case rpcError(String)
-    case sendFailed(String)
-
-    public var errorDescription: String? {
-        switch self {
-        case .disconnected:
-            return "Hermes gateway disconnected."
-        case .malformedResponse:
-            return "Hermes returned a malformed response."
-        case .rpcError(let message):
-            return message
-        case .sendFailed(let message):
-            return "Hermes request could not be sent: \(message)"
-        }
-    }
-}
-
-@MainActor
-private final class HermesGatewayClient {
-    private let task: URLSessionWebSocketTask
-    private var nextID: Int = 1
-    private var pending: [Int: CheckedContinuation<JSONValue, Error>] = [:]
-    var onEvent: ((HermesGatewayEvent) -> Void)?
-    var onDisconnect: ((String) -> Void)?
-
-    init(url: URL) {
-        task = URLSession.shared.webSocketTask(with: url)
-    }
-
-    func connect() {
-        task.resume()
-        receiveNext()
-    }
-
-    func close() {
-        for (_, continuation) in pending {
-            continuation.resume(throwing: HermesGatewayClientError.disconnected)
-        }
-        pending.removeAll()
-        task.cancel(with: .goingAway, reason: nil)
-    }
-
-    func call(method: String, params: [String: JSONValue] = [:]) async throws -> JSONValue {
-        let id = nextID
-        nextID += 1
-        let request: [String: JSONValue] = [
-            "jsonrpc": .string("2.0"),
-            "id": .number(Double(id)),
-            "method": .string(method),
-            "params": .object(params),
-        ]
-        let data = try JSONEncoder().encode(request)
-        guard let text = String(data: data, encoding: .utf8) else {
-            throw HermesGatewayClientError.malformedResponse
-        }
-        return try await withCheckedThrowingContinuation { continuation in
-            pending[id] = continuation
-            task.send(.string(text)) { [weak self] error in
-                guard let error else { return }
-                Task { @MainActor in
-                    guard let self else { return }
-                    self.pending.removeValue(forKey: id)?
-                        .resume(throwing: HermesGatewayClientError.sendFailed(error.localizedDescription))
-                }
-            }
-        }
-    }
-
-    private func receiveNext() {
-        task.receive { [weak self] result in
-            Task { @MainActor in
-                guard let self else { return }
-                switch result {
-                case .success(let message):
-                    self.handle(message)
-                    self.receiveNext()
-                case .failure(let error):
-                    for (_, continuation) in self.pending {
-                        continuation.resume(throwing: HermesGatewayClientError.disconnected)
-                    }
-                    self.pending.removeAll()
-                    self.onDisconnect?(error.localizedDescription)
-                }
-            }
-        }
-    }
-
-    private func handle(_ message: URLSessionWebSocketTask.Message) {
-        let text: String?
-        switch message {
-        case .string(let raw):
-            text = raw
-        case .data(let data):
-            text = String(data: data, encoding: .utf8)
-        @unknown default:
-            text = nil
-        }
-        guard let text,
-              let data = text.data(using: .utf8),
-              let root = try? JSONDecoder().decode([String: JSONValue].self, from: data)
-        else {
-            return
-        }
-
-        if let id = root["id"]?.intValue {
-            let continuation = pending.removeValue(forKey: id)
-            if let error = root["error"]?.objectValue {
-                continuation?.resume(
-                    throwing: HermesGatewayClientError.rpcError(
-                        error["message"]?.stringValue ?? "Hermes RPC failed."
-                    )
-                )
-            } else {
-                continuation?.resume(returning: root["result"] ?? .null)
-            }
-            return
-        }
-
-        guard root["method"]?.stringValue == "event",
-              let params = root["params"]?.objectValue,
-              let type = params["type"]?.stringValue
-        else {
-            return
-        }
-        onEvent?(
-            HermesGatewayEvent(
-                type: type,
-                sessionID: params["session_id"]?.stringValue,
-                payload: params["payload"]?.objectValue ?? [:]
-            )
-        )
-    }
-}
-
 @MainActor
 public final class HermesAgentStore: ObservableObject {
     @Published public private(set) var connectionState: HermesConnectionState = .idle
@@ -252,7 +109,7 @@ public final class HermesAgentStore: ObservableObject {
     private var sidecar: HermesSidecar?
     private var sidecarProfileName: String?
     private var sidecarConfigurationSignature: String?
-    private var client: HermesGatewayClient?
+    private var client: URLSessionHermesGatewayClient?
     private var shuttingDown = false
     private var gatewayGeneration = 0
 
@@ -412,7 +269,7 @@ public final class HermesAgentStore: ObservableObject {
               let sessionID = configuration.lastHermesSessionID,
               let profile = profiles.first(where: { $0.name == profileName })
         else {
-            throw HermesGatewayClientError.rpcError("No previous Hermes agent is saved.")
+            throw HermesGatewayClientError.rpcError
         }
         let session = HermesSavedSession(
             id: sessionID,
@@ -520,7 +377,7 @@ public final class HermesAgentStore: ObservableObject {
             profile: profile,
             configuration: configuration
         )
-        let nextClient = HermesGatewayClient(url: nextSidecar.webSocketURL)
+        let nextClient = URLSessionHermesGatewayClient(url: nextSidecar.webSocketURL)
         nextClient.onEvent = { [weak self] event in
             self?.handle(event)
         }
