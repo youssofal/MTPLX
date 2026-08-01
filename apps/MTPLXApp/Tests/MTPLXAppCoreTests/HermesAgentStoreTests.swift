@@ -351,6 +351,98 @@ final class HermesAgentStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testDuplicateAutoApproveEventsIssueOneOnceRPC() async throws {
+        configuration.hermesAutoApprove = true
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        client.suspendedMethods = ["approval.respond"]
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        let event = HermesGatewayEvent(type: "approval.request", sessionID: "live-1", payload: [
+            "command": .string("git status"),
+            "choices": .array([.string("once"), .string("deny")]),
+        ])
+
+        client.emit(event)
+        client.emit(event)
+        await waitUntil { client.calls.contains(where: { $0.method == "approval.respond" }) }
+
+        XCTAssertEqual(client.calls.filter { $0.method == "approval.respond" }.count, 1)
+        XCTAssertEqual(client.calls.last?.params["choice"], .string("once"))
+        XCTAssertNil(client.calls.last?.params["all"])
+        client.finishCall(method: "approval.respond")
+    }
+
+    @MainActor
+    func testLaterAutoApprovalCanRespondAfterEarlierLeaseCompletes() async throws {
+        configuration.hermesAutoApprove = true
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        client.suspendedMethods = ["approval.respond"]
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("first")]))
+        await waitUntil { client.calls.filter { $0.method == "approval.respond" }.count == 1 }
+        client.finishCall(method: "approval.respond")
+        for _ in 0..<8 { await Task.yield() }
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("later")]))
+        await waitUntil { client.calls.filter { $0.method == "approval.respond" }.count == 2 }
+        client.finishCall(method: "approval.respond")
+    }
+
+    @MainActor
+    func testAutoApprovalTakeoverPreventsRPC() async throws {
+        configuration.hermesAutoApprove = true
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        runtime.ownershipBySession["live-1"] = .external(surface: "telegram")
+
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("git status")]))
+        await Task.yield()
+
+        XCTAssertFalse(client.calls.contains(where: { $0.method == "approval.respond" }))
+        XCTAssertFalse(store.activeSessionWritable)
+    }
+
+    @MainActor
+    func testStaleAutoApprovalCompletionCannotReleaseNewGenerationLease() async throws {
+        configuration.hermesAutoApprove = true
+        let runtime = FakeHermesEmbeddedRuntime()
+        let firstClient = FakeHermesGatewayClient(readyImmediately: true)
+        let secondClient = FakeHermesGatewayClient(readyImmediately: true)
+        firstClient.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        firstClient.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        secondClient.resultByMethod["session.create"] = .object(["session_id": .string("live-2")])
+        secondClient.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        firstClient.suspendedMethods = ["approval.respond"]
+        secondClient.suspendedMethods = ["approval.respond"]
+        let store = makeStore(runtime: runtime, clients: [firstClient, secondClient])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        firstClient.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("old")]))
+        await waitUntil { firstClient.calls.contains(where: { $0.method == "approval.respond" }) }
+
+        firstClient.disconnect("transport lost")
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        secondClient.emit(.init(type: "approval.request", sessionID: "live-2", payload: ["command": .string("new")]))
+        await waitUntil { secondClient.calls.contains(where: { $0.method == "approval.respond" }) }
+        firstClient.finishCall(method: "approval.respond")
+        for _ in 0..<8 { await Task.yield() }
+        secondClient.emit(.init(type: "approval.request", sessionID: "live-2", payload: ["command": .string("new")]))
+
+        XCTAssertEqual(secondClient.calls.filter { $0.method == "approval.respond" }.count, 1)
+        secondClient.finishCall(method: "approval.respond")
+    }
+
+    @MainActor
     func testClarificationResponseAndMatchingExpiryUseNativeRequestID() async throws {
         configuration.hermesAutoApprove = false
         let runtime = FakeHermesEmbeddedRuntime()

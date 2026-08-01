@@ -424,7 +424,7 @@ public final class HermesAgentStore: ObservableObject {
             sessionID: sessionID,
             operation: operation
         )
-        pendingResponseLease = lease
+        guard reservePendingResponseLease(lease) else { return }
         defer { releasePendingResponseLease(lease) }
         let method: String
         let params: [String: JSONValue]
@@ -947,9 +947,17 @@ public final class HermesAgentStore: ObservableObject {
         else { return }
 
         if hermesAutoApprove {
+            let lease = PendingRequestLease(
+                id: Self.autoApprovalRequestID(sessionID: sessionID, payload: payload),
+                kind: .approval,
+                sessionID: sessionID,
+                operation: operation
+            )
+            guard reservePendingResponseLease(lease) else { return }
             Task { [weak self] in
-                guard let self,
-                      self.hermesAutoApprove,
+                guard let self else { return }
+                defer { self.releasePendingResponseLease(lease) }
+                guard self.hermesAutoApprove,
                       self.refreshActiveOwnership(),
                       self.isCurrent(operation, sessionID: sessionID)
                 else { return }
@@ -1040,6 +1048,12 @@ public final class HermesAgentStore: ObservableObject {
               activeLease.operation.clientIdentity == lease.operation.clientIdentity
         else { return }
         pendingResponseLease = nil
+    }
+
+    private func reservePendingResponseLease(_ lease: PendingRequestLease) -> Bool {
+        guard pendingResponseLease == nil else { return false }
+        pendingResponseLease = lease
+        return true
     }
 
     private func recordGenericEventError() {
@@ -1187,6 +1201,18 @@ public final class HermesAgentStore: ObservableObject {
 
     private static func choices(from payload: [String: JSONValue]) -> [String] {
         payload["choices"]?.arrayValue?.compactMap(\.stringValue) ?? []
+    }
+
+    private static func autoApprovalRequestID(sessionID: String, payload: [String: JSONValue]) -> String {
+        var hasher = Hasher()
+        hasher.combine(sessionID)
+        for key in ["command", "description", "pattern_key"] {
+            hasher.combine(payload[key]?.stringValue ?? "")
+        }
+        for choice in choices(from: payload) {
+            hasher.combine(choice)
+        }
+        return "auto-approval-\(hasher.finalize())"
     }
 
     private static func pendingToolName(for kind: HermesPendingRequestKind) -> String {
