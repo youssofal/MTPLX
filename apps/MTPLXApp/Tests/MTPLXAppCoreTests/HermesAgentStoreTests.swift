@@ -1517,6 +1517,52 @@ final class HermesAgentStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testStoppedOrCancelledPrepareCannotRepublishAfterDelayedInstallStatus() async throws {
+        let script = root.appendingPathComponent("delayed-hermes")
+        let source = """
+        #!/bin/sh
+        sleep 0.2
+        case \"$1\" in
+          --version) echo \"Hermes 0.19.1\" ;;
+          gateway) echo \"running\" ;;
+          chat) echo \"--query --source\" ;;
+        esac
+        """
+        try source.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        let delayedIntegration = HermesIntegration(
+            hermesHome: root.appendingPathComponent(".hermes", isDirectory: true),
+            executablePath: script.path,
+            environment: ["HOME": root.path, "PATH": "/usr/bin:/bin"],
+            sidecarRuntimeDirectory: root.appendingPathComponent("sidecars", isDirectory: true)
+        )
+        let runtime = FakeHermesEmbeddedRuntime()
+        let store = HermesAgentStore(
+            integration: delayedIntegration,
+            embeddedRuntime: runtime,
+            clientFactory: { _ in FakeHermesGatewayClient(readyImmediately: true) }
+        )
+
+        let cancelledPrepare = Task { await store.prepare(configuration: self.configuration) }
+        await waitUntil { store.connectionState == .checkingInstall }
+        cancelledPrepare.cancel()
+        await store.stop()
+        await cancelledPrepare.value
+
+        XCTAssertNil(store.installStatus)
+        XCTAssertTrue(store.profiles.isEmpty)
+        XCTAssertNil(store.selectedProfile)
+        XCTAssertEqual(store.connectionState, .idle)
+
+        await store.prepare(configuration: configuration)
+
+        XCTAssertNotNil(store.installStatus)
+        XCTAssertFalse(store.profiles.isEmpty)
+        XCTAssertEqual(store.selectedProfile?.name, "default")
+        XCTAssertEqual(store.connectionState, .idle)
+    }
+
+    @MainActor
     private func makeStore(
         runtime: FakeHermesEmbeddedRuntime,
         clients: [FakeHermesGatewayClient],

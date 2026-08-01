@@ -91,6 +91,7 @@ struct HermesPanel: View {
 
     @State private var composerText = ""
     @State private var pendingResponseText = ""
+    @State private var pendingSubmissionID: String?
     @State private var createProfileName = ""
     @State private var creatingProfile = false
     @State private var localError: String?
@@ -760,16 +761,18 @@ struct HermesPanel: View {
             HStack(spacing: 8) {
                 ForEach(request.choices.filter { $0.lowercased() != "deny" }, id: \.self) { choice in
                     Button(choice.capitalized) {
-                        Task { await hermes.respondToPendingRequest(value: choice) }
+                        Task { await submitPendingRequest(request, value: choice) }
                     }
                     .buttonStyle(.borderedProminent)
+                    .disabled(!pendingRequestActionsEnabled(request))
                     .help("Allow this Hermes action: \(choice)")
                     .accessibilityLabel("Allow action: \(choice)")
                 }
                 Button("Deny") {
-                    Task { await hermes.denyPendingApproval() }
+                    Task { await submitPendingRequest(request, value: "deny", isDenial: true) }
                 }
                 .buttonStyle(.bordered)
+                .disabled(!pendingRequestActionsEnabled(request))
                 .help("Deny this Hermes action")
                 .accessibilityLabel("Deny Hermes action")
             }
@@ -777,19 +780,22 @@ struct HermesPanel: View {
             pendingTextResponse(
                 label: "Clarification",
                 placeholder: "Type your answer",
-                sensitive: false
+                sensitive: false,
+                request: request
             )
         case .sudo:
             pendingTextResponse(
                 label: "Sudo password",
                 placeholder: "Enter password",
-                sensitive: true
+                sensitive: true,
+                request: request
             )
         case .secret:
             pendingTextResponse(
                 label: "Secret",
                 placeholder: "Enter secret",
-                sensitive: true
+                sensitive: true,
+                request: request
             )
         }
     }
@@ -798,33 +804,68 @@ struct HermesPanel: View {
     private func pendingTextResponse(
         label: String,
         placeholder: String,
-        sensitive: Bool
+        sensitive: Bool,
+        request: HermesPendingRequest
     ) -> some View {
         HStack(spacing: 8) {
             if sensitive {
                 SecureField(placeholder, text: $pendingResponseText)
                     .textFieldStyle(.roundedBorder)
+                    .disabled(!pendingRequestActionsEnabled(request))
                     .accessibilityLabel(label)
             } else {
                 TextField(placeholder, text: $pendingResponseText)
                     .textFieldStyle(.roundedBorder)
+                    .disabled(!pendingRequestActionsEnabled(request))
                     .accessibilityLabel(label)
             }
             Button("Submit") {
-                submitPendingTextResponse()
+                submitPendingTextResponse(request)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(pendingResponseText.isEmpty)
+            .disabled(pendingResponseText.isEmpty || !pendingRequestActionsEnabled(request))
             .keyboardShortcut(.defaultAction)
             .help("Submit \(label.lowercased()) to Hermes")
             .accessibilityLabel("Submit \(label.lowercased())")
         }
     }
 
-    private func submitPendingTextResponse() {
+    private func submitPendingTextResponse(_ request: HermesPendingRequest) {
+        guard pendingRequestActionsEnabled(request) else { return }
         let value = pendingResponseText
         pendingResponseText = ""
-        Task { await hermes.respondToPendingRequest(value: value) }
+        Task { await submitPendingRequest(request, value: value) }
+    }
+
+    private func pendingRequestActionsEnabled(_ request: HermesPendingRequest) -> Bool {
+        pendingSubmissionID == nil
+            && hermes.pendingRequest?.id == request.id
+            && hermes.pendingRequest?.kind == request.kind
+            && hermes.activeSessionWritable
+            && hermes.gatewayReady
+            && !hermes.approvalPipelineBlocked
+    }
+
+    private func submitPendingRequest(
+        _ request: HermesPendingRequest,
+        value: String,
+        isDenial: Bool = false
+    ) async {
+        guard pendingRequestActionsEnabled(request) else { return }
+        let submissionID = request.id
+        pendingSubmissionID = submissionID
+        defer {
+            // A completion from an old request must never mutate the state of
+            // a newer card. Its ID is the local submission lifecycle token.
+            if pendingSubmissionID == submissionID {
+                pendingSubmissionID = nil
+            }
+        }
+        if isDenial {
+            await hermes.denyPendingApproval()
+        } else {
+            await hermes.respondToPendingRequest(value: value)
+        }
     }
 
     private var emptyTranscript: some View {

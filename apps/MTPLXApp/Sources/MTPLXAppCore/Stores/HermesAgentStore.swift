@@ -145,6 +145,9 @@ public final class HermesAgentStore: ObservableObject {
     private var sidecarConfigurationSignature: String?
     private var client: (any HermesGatewayClientProtocol)?
     private var shuttingDown = false
+    /// Separates installation/profile discovery from gateway generations so a
+    /// cancelled overlay task cannot republish state after `stop()`.
+    private var lifecycleGeneration = 0
     private var gatewayGeneration = 0
     private var didReapOrphanedSidecars = false
     private var hermesAutoApprove = false
@@ -225,27 +228,41 @@ public final class HermesAgentStore: ObservableObject {
     }
 
     public func prepare(configuration: MTPLXAppConfiguration) async {
+        lifecycleGeneration += 1
+        let generation = lifecycleGeneration
+        // A later explicit prepare is a new overlay lifetime. `stop()`
+        // invalidates the old generation but must not poison this one.
+        shuttingDown = false
+        guard isCurrentPrepare(generation) else { return }
         connectionState = .checkingInstall
+        guard isCurrentPrepare(generation) else { return }
         gatewayRepairMessage = nil
+        guard isCurrentPrepare(generation) else { return }
         if !didReapOrphanedSidecars {
             _ = embeddedRuntime.reapOrphanedEmbeddedSidecars()
             didReapOrphanedSidecars = true
         }
         let status = await integration.installStatus()
+        guard isCurrentPrepare(generation) else { return }
         installStatus = status
+        guard isCurrentPrepare(generation) else { return }
         terminalAgentRunning = integration.hasLaunchedTerminalAgent()
+        guard isCurrentPrepare(generation) else { return }
         profiles = integration.discoverProfiles()
+        guard isCurrentPrepare(generation) else { return }
         profileRoutingStates = Dictionary(
             uniqueKeysWithValues: profiles.map { profile in
                 (profile.id, embeddedRuntime.routingState(for: profile, configuration: configuration))
             }
         )
+        guard isCurrentPrepare(generation) else { return }
         if let remembered = configuration.lastHermesProfile,
            let profile = profiles.first(where: { $0.name == remembered }) {
             selectedProfile = profile
         } else if selectedProfile == nil {
             selectedProfile = profiles.first
         }
+        guard isCurrentPrepare(generation) else { return }
         switch status.kind {
         case .ready:
             connectionState = .idle
@@ -565,6 +582,7 @@ public final class HermesAgentStore: ObservableObject {
 
     public func stop() async {
         shuttingDown = true
+        lifecycleGeneration += 1
         tearDownGateway(clearSession: true)
         activeSessionID = nil
         activeSessionKey = nil
@@ -754,6 +772,10 @@ public final class HermesAgentStore: ObservableObject {
             profileID: profile.id,
             clientIdentity: ObjectIdentifier(nextClient)
         )
+    }
+
+    private func isCurrentPrepare(_ generation: Int) -> Bool {
+        !Task.isCancelled && lifecycleGeneration == generation && !shuttingDown
     }
 
     private func rpc(
