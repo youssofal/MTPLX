@@ -423,6 +423,149 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
         XCTAssertEqual(Array(record.arguments.suffix(6)), ["--host", "127.0.0.1", "--port", "0", "--ssh-owner-nonce", record.launchID])
     }
 
+    func testConsoleScriptPrefixStartsAndRecordsFullVerifiedPostLaunchIdentity() async throws {
+        let fixture = try makeConsoleScriptLauncherFixture()
+        let consoleIntegration = HermesIntegration(
+            hermesHome: hermesHome,
+            executablePath: fixture.launcher.path,
+            environment: ["HOME": root.path, "PATH": "/usr/bin:/bin"],
+            sidecarRuntimeDirectory: sidecarRuntimeDirectory
+        )
+
+        let sidecar = try await consoleIntegration.startEmbeddedSidecar(
+            profile: HermesProfile(name: "default", path: hermesHome.path, isDefault: true),
+            configuration: configuration
+        )
+        defer { sidecar.stop() }
+        let record = try JSONDecoder().decode(
+            HermesSidecarOwnershipRecord.self,
+            from: Data(contentsOf: sidecar.ownershipRecordURL)
+        )
+
+        XCTAssertEqual(record.executablePath, fixture.interpreter.standardizedFileURL.resolvingSymlinksInPath().path)
+        XCTAssertEqual(record.argv0, fixture.interpreter.path)
+        XCTAssertEqual(record.arguments.first, fixture.consoleScript.standardizedFileURL.resolvingSymlinksInPath().path)
+        XCTAssertEqual(Array(record.arguments.dropFirst()), [
+            "serve", "--isolated", "--host", "127.0.0.1",
+            "--port", "0", "--ssh-owner-nonce", record.launchID,
+        ])
+    }
+
+    func testConsoleEntrypointPrefixRejectsUnexpectedArgumentsAndUnsafePaths() throws {
+        let fixture = try makeConsoleScriptLauncherFixture()
+        let launchID = "1111111111111111"
+        let canonical = [
+            "serve", "--isolated", "--host", "127.0.0.1",
+            "--port", "0", "--ssh-owner-nonce", launchID,
+        ]
+        let valid = [fixture.consoleScript.standardizedFileURL.resolvingSymlinksInPath().path] + canonical
+
+        XCTAssertTrue(HermesOrphanSidecarScanner.hasVerifiedArguments(
+            valid,
+            profileName: "default",
+            launchID: launchID
+        ))
+        XCTAssertFalse(HermesOrphanSidecarScanner.hasVerifiedArguments(
+            [fixture.consoleScript.path, "--unexpected"] + canonical,
+            profileName: "default",
+            launchID: launchID
+        ))
+        XCTAssertFalse(HermesOrphanSidecarScanner.hasVerifiedArguments(
+            [fixture.consoleScript.path] + canonical + ["--unexpected"],
+            profileName: "default",
+            launchID: launchID
+        ))
+        let wrongBasename = fixture.consoleScript.deletingLastPathComponent().appendingPathComponent("not-hermes")
+        try FileManager.default.copyItem(at: fixture.consoleScript, to: wrongBasename)
+        XCTAssertFalse(HermesOrphanSidecarScanner.hasVerifiedArguments(
+            [wrongBasename.path] + canonical,
+            profileName: "default",
+            launchID: launchID
+        ))
+        XCTAssertFalse(HermesOrphanSidecarScanner.hasVerifiedArguments(
+            ["relative/hermes"] + canonical,
+            profileName: "default",
+            launchID: launchID
+        ))
+
+        let identity = HermesSidecarProcessSnapshot(
+            pid: 7101,
+            executablePath: fixture.interpreter.standardizedFileURL.resolvingSymlinksInPath().path,
+            argv0: fixture.interpreter.path,
+            arguments: valid
+        )
+        let spec = HermesServeLaunchSpec(
+            executableURL: fixture.launcher,
+            arguments: canonical,
+            environment: [:],
+            token: "test-token",
+            launchID: launchID,
+            parentPID: 8001
+        )
+        XCTAssertTrue(HermesOrphanSidecarScanner.isVerifiedPostLaunchIdentity(
+            identity,
+            spec: spec,
+            profileName: "default",
+            hermesHome: hermesHome
+        ))
+        let outsideEntrypoint = root.appendingPathComponent("outside/hermes")
+        try FileManager.default.createDirectory(at: outsideEntrypoint.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: fixture.consoleScript, to: outsideEntrypoint)
+        XCTAssertFalse(HermesOrphanSidecarScanner.isVerifiedPostLaunchIdentity(
+            HermesSidecarProcessSnapshot(
+                pid: 7101,
+                executablePath: identity.executablePath,
+                argv0: identity.argv0,
+                arguments: [outsideEntrypoint.path] + canonical
+            ),
+            spec: spec,
+            profileName: "default",
+            hermesHome: hermesHome
+        ))
+    }
+
+    func testConsoleScriptOrphanScannerRequiresExactRecordAndRejectsGenericNearMiss() throws {
+        let fixture = try makeConsoleScriptLauncherFixture()
+        let launchID = "1111111111111111"
+        let arguments = [fixture.consoleScript.standardizedFileURL.resolvingSymlinksInPath().path,
+            "serve", "--isolated", "--host", "127.0.0.1",
+            "--port", "0", "--ssh-owner-nonce", launchID,
+        ]
+        let record = HermesSidecarOwnershipRecord(
+            launchID: launchID,
+            pid: 7101,
+            parentPID: 8001,
+            profileName: "default",
+            createdAt: .now,
+            executablePath: fixture.interpreter.standardizedFileURL.resolvingSymlinksInPath().path,
+            argv0: fixture.interpreter.path,
+            arguments: arguments
+        )
+        let exact = HermesSidecarProcessSnapshot(
+            pid: 7101,
+            executablePath: record.executablePath,
+            argv0: record.argv0,
+            arguments: record.arguments
+        )
+        let genericNearMiss = HermesSidecarProcessSnapshot(
+            pid: 7101,
+            executablePath: record.executablePath,
+            argv0: record.argv0,
+            arguments: Array(record.arguments.dropFirst())
+        )
+
+        XCTAssertEqual(HermesOrphanSidecarScanner.orphanPIDs(
+            records: [record],
+            processes: [exact],
+            livePIDs: []
+        ), [7101])
+        XCTAssertEqual(HermesOrphanSidecarScanner.orphanPIDs(
+            records: [record],
+            processes: [genericNearMiss],
+            livePIDs: []
+        ), [])
+    }
+
     func testStartupFailureRedactsTokenSplitAcrossStderrWrites() async throws {
         let tokenCaptureURL = root.appendingPathComponent("split-token.txt")
         let fixture = try makeSplitSecretFailureFixture(tokenCaptureURL: tokenCaptureURL)
@@ -611,6 +754,49 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: wrapper.path)
         _ = environmentCaptureURL
         return (wrapper, binary)
+    }
+
+    private func makeConsoleScriptLauncherFixture() throws -> (launcher: URL, interpreter: URL, consoleScript: URL) {
+        let interpreter = try makeSidecarBinary()
+        let consoleDirectory = hermesHome
+            .appendingPathComponent("hermes-agent/venv/bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: consoleDirectory, withIntermediateDirectories: true)
+        let consoleScript = consoleDirectory.appendingPathComponent("hermes")
+        try "#!/bin/sh\n# Hermes console entrypoint fixture\n".write(
+            to: consoleScript,
+            atomically: true,
+            encoding: .utf8
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: consoleScript.path)
+
+        let source = root.appendingPathComponent("console-script-launcher.c")
+        let launcher = root.appendingPathComponent("console-script-launcher")
+        let code = """
+        #include <stdlib.h>
+        #include <unistd.h>
+
+        int main(int argc, char **argv) {
+            char **arguments = calloc((size_t)argc + 2, sizeof(char *));
+            if (arguments == NULL) return 2;
+            arguments[0] = \"\(interpreter.path)\";
+            arguments[1] = \"\(consoleScript.path)\";
+            for (int index = 1; index < argc; index++) arguments[index + 1] = argv[index];
+            execv(arguments[0], arguments);
+            return 3;
+        }
+        """
+        try code.write(to: source, atomically: true, encoding: .utf8)
+        let compiler = Process()
+        compiler.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        compiler.arguments = ["clang", source.path, "-o", launcher.path]
+        try compiler.run()
+        compiler.waitUntilExit()
+        guard compiler.terminationStatus == 0 else {
+            throw NSError(domain: "HermesEmbeddedRuntimeTests", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "Could not compile console-script launcher fixture.",
+            ])
+        }
+        return (launcher, interpreter, consoleScript)
     }
 
     private func makeSidecarBinary() throws -> URL {

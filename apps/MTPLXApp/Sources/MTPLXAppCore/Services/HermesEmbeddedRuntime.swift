@@ -128,10 +128,11 @@ enum HermesBackendReadyParser {
     }
 }
 
-/// Pure command matching used by orphan recovery.  It intentionally does not
-/// attempt to infer ownership from a generic Hermes command: a persisted MTPLX
-/// record, exact PID, dead recorded parent, canonical executable, and complete
-/// argument vector are all required before the caller sends a signal.
+/// Command and process-identity matching used by isolated sidecar startup and
+/// orphan recovery. It intentionally does not infer ownership from a generic
+/// Hermes command: a persisted MTPLX record, exact PID, dead recorded parent,
+/// canonical executable, and complete argument vector are all required before
+/// the caller sends a signal.
 enum HermesOrphanSidecarScanner {
     static func orphanPIDs(
         records: [HermesSidecarOwnershipRecord],
@@ -165,11 +166,54 @@ enum HermesOrphanSidecarScanner {
               process.argv0 == record.argv0,
               process.arguments == record.arguments
         else { return false }
-        return hasCanonicalArguments(
+        return hasVerifiedArguments(
             record.arguments,
             profileName: record.profileName,
             launchID: record.launchID
         )
+    }
+
+    /// The normal binary form has exactly the launch spec. Python console
+    /// scripts are the sole supported exception: KERN_PROCARGS2 exposes the
+    /// script as the one argument between the interpreter argv0 and the exact
+    /// spec. No other prefix, suffix, or flag is accepted.
+    static func hasVerifiedArguments(
+        _ arguments: [String],
+        profileName: String,
+        launchID: String
+    ) -> Bool {
+        if hasCanonicalArguments(arguments, profileName: profileName, launchID: launchID) {
+            return true
+        }
+        guard arguments.count == canonicalArgumentCount(profileName: profileName) + 1,
+              let entrypoint = arguments.first,
+              isTrustedConsoleEntrypoint(entrypoint)
+        else { return false }
+        return hasCanonicalArguments(
+            Array(arguments.dropFirst()),
+            profileName: profileName,
+            launchID: launchID
+        )
+    }
+
+    /// Startup has stronger evidence than recovery: the console entrypoint
+    /// must also be contained in the selected Hermes installation. This keeps
+    /// an arbitrary local `hermes` script from becoming an ownership record.
+    static func isVerifiedPostLaunchIdentity(
+        _ process: HermesSidecarProcessSnapshot,
+        spec: HermesServeLaunchSpec,
+        profileName: String,
+        hermesHome: URL
+    ) -> Bool {
+        guard !process.executablePath.isEmpty,
+              !process.argv0.isEmpty,
+              hasCanonicalArguments(spec.arguments, profileName: profileName, launchID: spec.launchID),
+              hasVerifiedArguments(process.arguments, profileName: profileName, launchID: spec.launchID)
+        else { return false }
+
+        guard process.arguments != spec.arguments else { return true }
+        guard let entrypoint = process.arguments.first else { return false }
+        return isPath(entrypoint, containedIn: hermesHome)
     }
 
     static func hasCanonicalArguments(
@@ -182,6 +226,30 @@ enum HermesOrphanSidecarScanner {
             "serve", "--isolated", "--host", "127.0.0.1",
             "--port", "0", "--ssh-owner-nonce", launchID,
         ]
+    }
+
+    private static func canonicalArgumentCount(profileName: String) -> Int {
+        (profileName == "default" ? 0 : 2) + 8
+    }
+
+    private static func isTrustedConsoleEntrypoint(_ path: String) -> Bool {
+        guard path.hasPrefix("/") else { return false }
+        let url = URL(fileURLWithPath: path)
+        let canonical = url.standardizedFileURL.resolvingSymlinksInPath()
+        guard canonical.path == path,
+              canonical.lastPathComponent == "hermes",
+              FileManager.default.isReadableFile(atPath: canonical.path),
+              FileManager.default.isExecutableFile(atPath: canonical.path),
+              let attributes = try? FileManager.default.attributesOfItem(atPath: canonical.path),
+              attributes[.type] as? FileAttributeType == .typeRegular
+        else { return false }
+        return true
+    }
+
+    private static func isPath(_ path: String, containedIn directory: URL) -> Bool {
+        let canonicalPath = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
+        let canonicalDirectory = directory.standardizedFileURL.resolvingSymlinksInPath().path
+        return canonicalPath.hasPrefix(canonicalDirectory + "/")
     }
 }
 

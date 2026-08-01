@@ -965,11 +965,11 @@ public struct HermesIntegration: Sendable {
             let recordURL = sidecarRuntimeDirectory
                 .appendingPathComponent("\(spec.launchID).json", isDirectory: false)
             guard let identity = Self.processSnapshot(pid: process.processIdentifier),
-                  identity.arguments == spec.arguments,
-                  HermesOrphanSidecarScanner.hasCanonicalArguments(
-                      spec.arguments,
+                  HermesOrphanSidecarScanner.isVerifiedPostLaunchIdentity(
+                      identity,
+                      spec: spec,
                       profileName: profile.name,
-                      launchID: spec.launchID
+                      hermesHome: hermesHome
                   )
             else {
                 throw HermesIntegrationError.launchFailed(
@@ -984,7 +984,7 @@ public struct HermesIntegration: Sendable {
                 createdAt: Date(),
                 executablePath: identity.executablePath,
                 argv0: identity.argv0,
-                arguments: spec.arguments
+                arguments: identity.arguments
             )
             do {
                 try Self.writeOwnershipRecord(record, to: recordURL)
