@@ -269,6 +269,134 @@ final class HermesAgentStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testManualApprovalFIFOMapsAThenBToNativeHeads() async throws {
+        configuration.hermesAutoApprove = false
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("A")]))
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("B")]))
+        XCTAssertEqual(store.pendingRequest?.prompt, "A")
+        await store.respondToPendingRequest(value: "deny")
+        XCTAssertEqual(store.pendingRequest?.prompt, "B")
+        await store.respondToPendingRequest(value: "once")
+        XCTAssertEqual(client.calls.filter { $0.method == "approval.respond" }.map { $0.params["choice"] }, [.string("deny"), .string("once")])
+    }
+
+    @MainActor
+    func testIdenticalManualApprovalRequestsRemainDistinctFIFOEntries() async throws {
+        configuration.hermesAutoApprove = false
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        let event = HermesGatewayEvent(type: "approval.request", sessionID: "live-1", payload: ["command": .string("same")])
+        client.emit(event); client.emit(event)
+        let firstID = store.pendingRequest?.id
+        await store.respondToPendingRequest(value: "deny")
+        XCTAssertEqual(store.pendingRequest?.prompt, "same")
+        XCTAssertNotEqual(store.pendingRequest?.id, firstID)
+        await store.respondToPendingRequest(value: "deny")
+        XCTAssertEqual(client.calls.filter { $0.method == "approval.respond" }.count, 2)
+    }
+
+    @MainActor
+    func testApprovalResponseFailureKeepsHeadAndBlocksUntilFreshSidecar() async throws {
+        configuration.hermesAutoApprove = false
+        let runtime = FakeHermesEmbeddedRuntime()
+        let first = FakeHermesGatewayClient(readyImmediately: true)
+        let second = FakeHermesGatewayClient(readyImmediately: true)
+        for client in [first, second] {
+            client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+            client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        }
+        let store = makeStore(runtime: runtime, clients: [first, second])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        first.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("A")]))
+        first.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("B")]))
+        first.suspendedMethods = ["approval.respond"]
+        let answer = Task { await store.respondToPendingRequest(value: "once") }
+        await waitUntil { first.calls.contains { $0.method == "approval.respond" } }
+        first.failCall(method: "approval.respond")
+        await answer.value
+        XCTAssertTrue(store.approvalPipelineBlocked)
+        XCTAssertEqual(store.pendingRequest?.prompt, "A")
+        await store.respondToPendingRequest(value: "deny")
+        XCTAssertEqual(first.calls.filter { $0.method == "approval.respond" }.count, 1)
+        XCTAssertTrue(first.didClose)
+        XCTAssertEqual(runtime.sidecars.first?.stopCount, 1)
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        XCTAssertFalse(store.approvalPipelineBlocked)
+        XCTAssertNil(store.pendingRequest)
+    }
+
+    @MainActor
+    func testAutoApprovalFailureKeepsUnknownHeadAndRetainsLaterFIFOEntries() async throws {
+        configuration.hermesAutoApprove = true
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        client.suspendedMethods = ["approval.respond"]
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("A")]))
+        await waitUntil { client.calls.filter { $0.method == "approval.respond" }.count == 1 }
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("B")]))
+        client.failCall(method: "approval.respond")
+        await waitUntil { store.approvalPipelineBlocked }
+        XCTAssertEqual(store.pendingRequest?.prompt, "A")
+        XCTAssertEqual(client.calls.filter { $0.method == "approval.respond" }.count, 1)
+        // A lifecycle reset is required before B may ever become actionable.
+        await store.respondToPendingRequest(value: "deny")
+        XCTAssertEqual(client.calls.filter { $0.method == "approval.respond" }.count, 1)
+    }
+
+    @MainActor
+    func testApprovalExpireIsIgnoredAndQueueOverflowFailsClosedWithoutRPC() async throws {
+        configuration.hermesAutoApprove = false
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        for index in 0...64 {
+            client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("A\(index)")]))
+        }
+        client.emit(.init(type: "approval.expire", sessionID: "live-1", payload: [:]))
+        XCTAssertTrue(store.approvalPipelineBlocked)
+        XCTAssertEqual(store.pendingRequest?.prompt, "A0")
+        XCTAssertFalse(client.calls.contains { $0.method == "approval.respond" })
+    }
+
+    @MainActor
+    func testRetiredApprovalFingerprintUsesInjectedMonotonicClock() async throws {
+        configuration.hermesAutoApprove = true
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        let clock = TestMonotonicClock(now: 100)
+        let store = makeStore(runtime: runtime, clients: [client], monotonicClock: { clock.now })
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        let event = HermesGatewayEvent(type: "approval.request", sessionID: "live-1", payload: ["command": .string("A")])
+        client.emit(event)
+        await waitUntil { client.calls.filter { $0.method == "approval.respond" }.count == 1 }
+        client.emit(event)
+        XCTAssertEqual(store.pendingRequest?.prompt, "A")
+        await store.respondToPendingRequest(value: "deny")
+        clock.now += 31
+        client.emit(event)
+        await waitUntil { client.calls.filter { $0.method == "approval.respond" }.count == 3 }
+    }
+
+    @MainActor
     func testPendingApprovalPausesComposerAndDeniesWithNativeChoice() async throws {
         configuration.hermesAutoApprove = false
         let runtime = FakeHermesEmbeddedRuntime()
@@ -1045,7 +1173,8 @@ final class HermesAgentStoreTests: XCTestCase {
     @MainActor
     private func makeStore(
         runtime: FakeHermesEmbeddedRuntime,
-        clients: [FakeHermesGatewayClient]
+        clients: [FakeHermesGatewayClient],
+        monotonicClock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
     ) -> HermesAgentStore {
         var remaining = clients
         return HermesAgentStore(
@@ -1054,7 +1183,8 @@ final class HermesAgentStoreTests: XCTestCase {
             clientFactory: { _ in
                 guard !remaining.isEmpty else { fatalError("Missing fake client") }
                 return remaining.removeFirst()
-            }
+            },
+            monotonicClock: monotonicClock
         )
     }
 
@@ -1108,6 +1238,14 @@ final class HermesAgentStoreTests: XCTestCase {
         } catch {
             XCTFail("Unexpected error: \(error)")
         }
+    }
+}
+
+private final class TestMonotonicClock: @unchecked Sendable {
+    var now: TimeInterval
+
+    init(now: TimeInterval) {
+        self.now = now
     }
 }
 

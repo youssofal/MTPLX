@@ -129,6 +129,9 @@ public final class HermesAgentStore: ObservableObject {
     @Published public private(set) var readOnlyReason: String?
     @Published public private(set) var isStreaming: Bool = false
     @Published public private(set) var pendingRequest: HermesPendingRequest?
+    /// An approval response may have reached Hermes even when its RPC fails.
+    /// Keep the local FIFO closed until a fresh owned sidecar is connected.
+    @Published public private(set) var approvalPipelineBlocked = false
     @Published public private(set) var gatewayReady: Bool = false
     @Published public private(set) var gatewayRepairInFlight: Bool = false
     @Published public private(set) var gatewayRepairMessage: String?
@@ -146,8 +149,11 @@ public final class HermesAgentStore: ObservableObject {
     private var didReapOrphanedSidecars = false
     private var hermesAutoApprove = false
     private var pendingResponseLease: PendingRequestLease?
-    private var queuedAutoApprovals: [QueuedAutoApproval] = []
+    private var approvalQueue: [QueuedAutoApproval] = []
     private var retiredAutoApprovalFingerprints: [RetiredAutoApprovalFingerprint] = []
+    private let monotonicClock: @Sendable () -> TimeInterval
+    private static let approvalQueueLimit = 64
+    private static let retiredApprovalFingerprintLimit = 64
 
     private struct GatewayOperation {
         let generation: Int
@@ -169,23 +175,26 @@ public final class HermesAgentStore: ObservableObject {
         let operation: GatewayOperation
         let prompt: String
         let choices: [String]
+        let autoEligible: Bool
     }
 
     private struct RetiredAutoApprovalFingerprint {
         let fingerprint: String
         let sessionID: String
         let operation: GatewayOperation
-        let retiredAt: Date
+        let retiredAt: TimeInterval
     }
 
     public init(
         integration: HermesIntegration,
         embeddedRuntime: any HermesEmbeddedRuntime,
-        clientFactory: @escaping HermesGatewayClientFactory
+        clientFactory: @escaping HermesGatewayClientFactory,
+        monotonicClock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
     ) {
         self.integration = integration
         self.embeddedRuntime = embeddedRuntime
         self.clientFactory = clientFactory
+        self.monotonicClock = monotonicClock
     }
 
     public convenience init(integration: HermesIntegration = HermesIntegration()) {
@@ -434,7 +443,8 @@ public final class HermesAgentStore: ObservableObject {
               let profile = selectedProfile,
               let operation = currentOperation(for: profile),
               refreshActiveOwnership(),
-              pendingResponseLease == nil
+              pendingResponseLease == nil,
+              !(pendingRequest.kind == .approval && approvalPipelineBlocked)
         else { return }
 
         let lease = PendingRequestLease(
@@ -443,14 +453,9 @@ public final class HermesAgentStore: ObservableObject {
             sessionID: sessionID,
             operation: operation
         )
-        let completesQueuedAutoApproval = pendingRequest.kind == .approval
-            && pendingRequest.id.hasPrefix("queued-auto-approval-")
         guard reservePendingResponseLease(lease) else { return }
         defer {
             releasePendingResponseLease(lease)
-            if completesQueuedAutoApproval {
-                presentNextQueuedAutoApprovalIfPossible()
-            }
         }
         let method: String
         let params: [String: JSONValue]
@@ -487,13 +492,21 @@ public final class HermesAgentStore: ObservableObject {
                   self.pendingRequest?.id == lease.id,
                   self.pendingRequest?.kind == lease.kind
             else { return }
-            self.pendingRequest = nil
+            if lease.kind == .approval {
+                self.completeApprovalHead(lease)
+            } else {
+                self.pendingRequest = nil
+            }
         } catch {
             guard isCurrent(lease.operation, sessionID: lease.sessionID),
                   self.pendingRequest?.id == lease.id,
                   self.pendingRequest?.kind == lease.kind
             else { return }
-            messages.append(HermesTranscriptMessage(role: .system, text: "Hermes could not accept the requested response."))
+            if lease.kind == .approval {
+                blockApprovalPipeline(afterAmbiguousResponseFor: lease)
+            } else {
+                messages.append(HermesTranscriptMessage(role: .system, text: "Hermes could not accept the requested response."))
+            }
         }
     }
 
@@ -604,13 +617,16 @@ public final class HermesAgentStore: ObservableObject {
         let reuseSidecar = sidecarProfileName == profile.name
             && sidecarConfigurationSignature == signature
             && sidecar?.isRunning == true
+        let reconnectingBlockedApprovalPipeline = approvalPipelineBlocked
         shuttingDown = true
         gatewayGeneration += 1
         let generation = gatewayGeneration
         client?.close()
         client = nil
         pendingResponseLease = nil
-        clearAutoApprovalLifecycle()
+        if !reconnectingBlockedApprovalPipeline {
+            clearAutoApprovalLifecycle()
+        }
         if !reuseSidecar {
             sidecar?.stop()
             sidecar = nil
@@ -625,9 +641,13 @@ public final class HermesAgentStore: ObservableObject {
                 messages = []
                 toolTraces = []
                 endStreaming()
-                pendingRequest = nil
+                if !reconnectingBlockedApprovalPipeline {
+                    pendingRequest = nil
+                }
                 pendingResponseLease = nil
-                clearAutoApprovalLifecycle()
+                if !reconnectingBlockedApprovalPipeline {
+                    clearAutoApprovalLifecycle()
+                }
             }
         }
         gatewayReady = false
@@ -695,6 +715,12 @@ public final class HermesAgentStore: ObservableObject {
         guard generation == gatewayGeneration, !shuttingDown else {
             _ = releaseGatewayIfOwned(generation: generation, client: nextClient, sidecar: nextSidecar)
             throw CancellationError()
+        }
+        if reconnectingBlockedApprovalPipeline {
+            // The failed transport was already torn down; only a completed
+            // fresh sidecar/client handshake may reopen approval handling.
+            if pendingRequest?.kind == .approval { pendingRequest = nil }
+            clearAutoApprovalLifecycle()
         }
         gatewayReady = true
         connectionState = .connected
@@ -954,7 +980,8 @@ public final class HermesAgentStore: ObservableObject {
         case "secret.request":
             setPendingRequest(kind: .secret, payload: event.payload)
         case "approval.expire":
-            expirePendingRequest(kind: .approval, payload: event.payload)
+            // Hermes does not emit approval expiry. Keep synthetic FIFO state.
+            break
         case "clarify.expire":
             expirePendingRequest(kind: .clarification, payload: event.payload)
         case "sudo.expire":
@@ -978,81 +1005,30 @@ public final class HermesAgentStore: ObservableObject {
               isCurrent(operation, sessionID: sessionID)
         else { return }
 
-        if hermesAutoApprove {
-            let queuedApproval = QueuedAutoApproval(
-                id: "queued-auto-approval-\(UUID().uuidString)",
-                fingerprint: Self.autoApprovalRequestID(sessionID: sessionID, payload: payload),
+        let fingerprint = Self.autoApprovalRequestID(sessionID: sessionID, payload: payload)
+        let safeAutoHead = hermesAutoApprove
+            && approvalQueue.isEmpty
+            && pendingRequest == nil
+            && pendingResponseLease == nil
+            && !approvalPipelineBlocked
+            && !isRetiredAutoApprovalFingerprint(fingerprint, for: operation, sessionID: sessionID)
+            && refreshActiveOwnership()
+        guard approvalQueue.count < Self.approvalQueueLimit else {
+            blockApprovalPipelineForOverflow()
+            return
+        }
+        approvalQueue.append(
+            QueuedAutoApproval(
+                id: "approval-\(UUID().uuidString)",
+                fingerprint: fingerprint,
                 sessionID: sessionID,
                 operation: operation,
                 prompt: payload["command"]?.stringValue ?? "Hermes requires approval.",
-                choices: Self.choices(from: payload)
-            )
-            guard refreshActiveOwnership() else {
-                enqueueAutoApprovalForManualResponse(queuedApproval)
-                return
-            }
-            guard pendingRequest == nil,
-                  pendingResponseLease == nil,
-                  !isRetiredAutoApprovalFingerprint(queuedApproval.fingerprint, for: operation, sessionID: sessionID)
-            else {
-                enqueueAutoApprovalForManualResponse(queuedApproval)
-                return
-            }
-            let lease = PendingRequestLease(
-                id: queuedApproval.id,
-                kind: .approval,
-                sessionID: sessionID,
-                operation: operation
-            )
-            guard reservePendingResponseLease(lease) else { return }
-            Task { [weak self] in
-                guard let self else { return }
-                defer {
-                    self.releasePendingResponseLease(lease)
-                    self.presentNextQueuedAutoApprovalIfPossible()
-                }
-                guard self.hermesAutoApprove,
-                      self.refreshActiveOwnership(),
-                      self.isCurrent(operation, sessionID: sessionID)
-                else { return }
-                do {
-                    _ = try await self.rpc(
-                        operation,
-                        method: "approval.respond",
-                        params: [
-                            "session_id": .string(sessionID),
-                            "choice": .string("once"),
-                        ]
-                    )
-                    guard self.isCurrent(operation, sessionID: sessionID) else { return }
-                    self.retireAutoApprovalFingerprint(queuedApproval.fingerprint, for: operation, sessionID: sessionID)
-                } catch {
-                    guard self.isCurrent(operation, sessionID: sessionID) else { return }
-                    self.messages.append(
-                        HermesTranscriptMessage(role: .system, text: "Hermes could not accept the requested response.")
-                    )
-                }
-            }
-            return
-        }
-
-        let requestID = payload["request_id"]?.stringValue ?? "approval-\(UUID().uuidString)"
-        if pendingRequest?.id != requestID || pendingRequest?.kind != .approval {
-            pendingResponseLease = nil
-        }
-        pendingRequest = HermesPendingRequest(
-            id: requestID,
-            kind: .approval,
-            prompt: payload["command"]?.stringValue ?? "Hermes requires approval.",
-            choices: Self.choices(from: payload)
-        )
-        toolTraces.append(
-            HermesToolTrace(
-                name: "Approval",
-                status: .approval,
-                detail: payload["command"]?.stringValue ?? "Approval required."
+                choices: Self.choices(from: payload),
+                autoEligible: safeAutoHead
             )
         )
+        processApprovalQueueIfPossible()
     }
 
     private func setPendingRequest(kind: HermesPendingRequestKind, payload: [String: JSONValue]) {
@@ -1087,14 +1063,6 @@ public final class HermesAgentStore: ObservableObject {
     }
 
     private func expirePendingRequest(kind: HermesPendingRequestKind, payload: [String: JSONValue]) {
-        if kind == .approval,
-           payload["request_id"]?.stringValue == nil,
-           pendingRequest?.id.hasPrefix("queued-auto-approval-") == true {
-            pendingRequest = nil
-            pendingResponseLease = nil
-            presentNextQueuedAutoApprovalIfPossible()
-            return
-        }
         guard let requestID = payload["request_id"]?.stringValue,
               pendingRequest?.id == requestID,
               pendingRequest?.kind == kind
@@ -1112,6 +1080,9 @@ public final class HermesAgentStore: ObservableObject {
               activeLease.operation.clientIdentity == lease.operation.clientIdentity
         else { return }
         pendingResponseLease = nil
+        if lease.kind == .approval {
+            processApprovalQueueIfPossible()
+        }
     }
 
     private func reservePendingResponseLease(_ lease: PendingRequestLease) -> Bool {
@@ -1120,32 +1091,96 @@ public final class HermesAgentStore: ObservableObject {
         return true
     }
 
-    private func enqueueAutoApprovalForManualResponse(_ approval: QueuedAutoApproval) {
-        queuedAutoApprovals.append(approval)
-        presentNextQueuedAutoApprovalIfPossible()
-    }
-
-    private func presentNextQueuedAutoApprovalIfPossible() {
-        guard pendingRequest == nil,
+    private func processApprovalQueueIfPossible() {
+        guard !approvalPipelineBlocked,
               pendingResponseLease == nil,
-              let approval = queuedAutoApprovals.first,
+              let approval = approvalQueue.first,
               isCurrent(approval.operation, sessionID: approval.sessionID)
         else { return }
-        _ = refreshActiveOwnership()
-        queuedAutoApprovals.removeFirst()
-        pendingRequest = HermesPendingRequest(
-            id: approval.id,
-            kind: .approval,
-            prompt: approval.prompt,
-            choices: approval.choices
-        )
-        toolTraces.append(
-            HermesToolTrace(
-                name: "Approval",
-                status: .approval,
-                detail: approval.prompt
+        if approval.autoEligible, pendingRequest == nil, hermesAutoApprove, refreshActiveOwnership() {
+            let lease = PendingRequestLease(
+                id: approval.id, kind: .approval, sessionID: approval.sessionID, operation: approval.operation
             )
+            guard reservePendingResponseLease(lease) else { return }
+            Task { [weak self] in
+                guard let self else { return }
+                defer { self.releasePendingResponseLease(lease) }
+                guard self.isCurrent(lease.operation, sessionID: lease.sessionID),
+                      self.refreshActiveOwnership()
+                else { return }
+                do {
+                    _ = try await self.rpc(
+                        lease.operation,
+                        method: "approval.respond",
+                        params: ["session_id": .string(lease.sessionID), "choice": .string("once")]
+                    )
+                    guard self.isCurrent(lease.operation, sessionID: lease.sessionID) else { return }
+                    self.completeApprovalHead(lease)
+                } catch {
+                    guard self.isCurrent(lease.operation, sessionID: lease.sessionID) else { return }
+                    self.blockApprovalPipeline(afterAmbiguousResponseFor: lease)
+                }
+            }
+            return
+        }
+        guard pendingRequest == nil else { return }
+        presentManualApproval(approval)
+    }
+
+    private func presentManualApproval(_ approval: QueuedAutoApproval) {
+        _ = refreshActiveOwnership()
+        pendingRequest = HermesPendingRequest(
+            id: approval.id, kind: .approval, prompt: approval.prompt, choices: approval.choices
         )
+        toolTraces.append(HermesToolTrace(name: "Approval", status: .approval, detail: approval.prompt))
+    }
+
+    private func completeApprovalHead(_ lease: PendingRequestLease) {
+        guard let head = approvalQueue.first,
+              head.id == lease.id,
+              head.sessionID == lease.sessionID,
+              head.operation.generation == lease.operation.generation,
+              head.operation.clientIdentity == lease.operation.clientIdentity
+        else { return }
+        approvalQueue.removeFirst()
+        retireAutoApprovalFingerprint(head.fingerprint, for: lease.operation, sessionID: lease.sessionID)
+        if pendingRequest?.id == lease.id, pendingRequest?.kind == .approval { pendingRequest = nil }
+        processApprovalQueueIfPossible()
+    }
+
+    private func blockApprovalPipeline(afterAmbiguousResponseFor lease: PendingRequestLease) {
+        guard approvalQueue.first?.id == lease.id else { return }
+        pendingRequest = nil
+        if let head = approvalQueue.first { presentManualApproval(head) }
+        approvalPipelineBlocked = true
+        pendingResponseLease = nil
+        messages.append(HermesTranscriptMessage(
+            role: .system,
+            text: "Approval delivery is unknown. Reconnect Hermes before responding again."
+        ))
+        forceApprovalTransportReset()
+    }
+
+    private func blockApprovalPipelineForOverflow() {
+        guard !approvalPipelineBlocked else { return }
+        approvalPipelineBlocked = true
+        messages.append(HermesTranscriptMessage(
+            role: .system,
+            text: "Too many approval requests are pending. Reconnect Hermes before responding again."
+        ))
+        forceApprovalTransportReset()
+    }
+
+    private func forceApprovalTransportReset() {
+        gatewayGeneration += 1
+        gatewayReady = false
+        client?.close()
+        client = nil
+        sidecar?.stop()
+        sidecar = nil
+        sidecarProfileName = nil
+        sidecarConfigurationSignature = nil
+        endStreaming()
     }
 
     private func retireAutoApprovalFingerprint(
@@ -1159,11 +1194,11 @@ public final class HermesAgentStore: ObservableObject {
                 fingerprint: fingerprint,
                 sessionID: sessionID,
                 operation: operation,
-                retiredAt: Date()
+                retiredAt: monotonicClock()
             )
         )
-        if retiredAutoApprovalFingerprints.count > 16 {
-            retiredAutoApprovalFingerprints.removeFirst(retiredAutoApprovalFingerprints.count - 16)
+        if retiredAutoApprovalFingerprints.count > Self.retiredApprovalFingerprintLimit {
+            retiredAutoApprovalFingerprints.removeFirst(retiredAutoApprovalFingerprints.count - Self.retiredApprovalFingerprintLimit)
         }
     }
 
@@ -1182,13 +1217,14 @@ public final class HermesAgentStore: ObservableObject {
     }
 
     private func pruneRetiredAutoApprovalFingerprints() {
-        let cutoff = Date().addingTimeInterval(-30)
+        let cutoff = monotonicClock() - 30
         retiredAutoApprovalFingerprints.removeAll { $0.retiredAt < cutoff }
     }
 
     private func clearAutoApprovalLifecycle() {
-        queuedAutoApprovals = []
+        approvalQueue = []
         retiredAutoApprovalFingerprints = []
+        approvalPipelineBlocked = false
     }
 
     private func recordGenericEventError() {
