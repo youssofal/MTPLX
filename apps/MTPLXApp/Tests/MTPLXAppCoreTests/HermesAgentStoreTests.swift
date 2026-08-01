@@ -202,6 +202,47 @@ final class HermesAgentStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testTerminalCompletionErrorNeverSurfacesRawPayload() async throws {
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        let rawTerminalDetail = UUID().uuidString
+
+        client.emit(.init(type: "message.start", sessionID: "live-1", payload: [:]))
+        client.emit(.init(type: "message.complete", sessionID: "live-1", payload: [
+            "status": .string("error"),
+            "text": .string(rawTerminalDetail),
+            "error": .string(rawTerminalDetail),
+        ]))
+
+        XCTAssertEqual(store.messages.last?.role, .system)
+        XCTAssertEqual(store.messages.last?.text, "Hermes reported an error.")
+        XCTAssertFalse(store.messages.contains(where: { $0.text == rawTerminalDetail }))
+        XCTAssertFalse(store.toolTraces.contains(where: { $0.detail == rawTerminalDetail }))
+        XCTAssertFalse(store.isStreaming)
+    }
+
+    @MainActor
+    func testReasoningAvailableAddsThoughtTraceWithoutPersistingVerboseMetadata() async throws {
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+
+        client.emit(.init(type: "reasoning.available", sessionID: "live-1", payload: [
+            "text": .string("checked state"),
+            "verbose": .bool(true),
+        ]))
+
+        XCTAssertTrue(store.toolTraces.contains(where: { $0.name == "Thought" && $0.detail == "checked state" }))
+    }
+
+    @MainActor
     func testAskFirstSurfacesApprovalAndRespondsWithSelectedChoice() async throws {
         configuration.hermesAutoApprove = false
         let runtime = FakeHermesEmbeddedRuntime()
@@ -244,6 +285,49 @@ final class HermesAgentStoreTests: XCTestCase {
         XCTAssertFalse(client.calls.contains(where: { $0.method == "prompt.submit" }))
         XCTAssertEqual(client.calls.last?.method, "approval.respond")
         XCTAssertEqual(client.calls.last?.params["choice"], .string("deny"))
+    }
+
+    @MainActor
+    func testOwnershipTakeoverBeforePendingResponsePreventsRPC() async throws {
+        configuration.hermesAutoApprove = false
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("git status")]))
+
+        runtime.ownershipBySession["live-1"] = .external(surface: "telegram")
+        await store.respondToPendingRequest(value: "once")
+
+        XCTAssertFalse(client.calls.contains(where: { $0.method == "approval.respond" }))
+        XCTAssertEqual(store.pendingRequest?.kind, .approval)
+        XCTAssertFalse(store.activeSessionWritable)
+    }
+
+    @MainActor
+    func testConcurrentApprovalResponsesIssueOnlyOneRPC() async throws {
+        configuration.hermesAutoApprove = false
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        client.suspendedMethods = ["approval.respond"]
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("git status")]))
+
+        let first = Task { await store.respondToPendingRequest(value: "once") }
+        await waitUntil { client.calls.contains(where: { $0.method == "approval.respond" }) }
+        let second = Task { await store.respondToPendingRequest(value: "once") }
+        await Task.yield()
+        XCTAssertEqual(client.calls.filter { $0.method == "approval.respond" }.count, 1)
+        client.finishCall(method: "approval.respond")
+        await first.value
+        await second.value
+
+        XCTAssertNil(store.pendingRequest)
     }
 
     @MainActor

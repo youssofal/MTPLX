@@ -145,6 +145,7 @@ public final class HermesAgentStore: ObservableObject {
     private var gatewayGeneration = 0
     private var didReapOrphanedSidecars = false
     private var hermesAutoApprove = false
+    private var pendingResponseLease: PendingRequestLease?
 
     private struct GatewayOperation {
         let generation: Int
@@ -413,7 +414,8 @@ public final class HermesAgentStore: ObservableObject {
               let sessionID = activeSessionID,
               let profile = selectedProfile,
               let operation = currentOperation(for: profile),
-              activeSessionWritable
+              refreshActiveOwnership(),
+              pendingResponseLease == nil
         else { return }
 
         let lease = PendingRequestLease(
@@ -422,6 +424,8 @@ public final class HermesAgentStore: ObservableObject {
             sessionID: sessionID,
             operation: operation
         )
+        pendingResponseLease = lease
+        defer { releasePendingResponseLease(lease) }
         let method: String
         let params: [String: JSONValue]
         switch lease.kind {
@@ -517,6 +521,7 @@ public final class HermesAgentStore: ObservableObject {
         messages = []
         toolTraces = []
         pendingRequest = nil
+        pendingResponseLease = nil
         terminalAgentRunning = integration.hasLaunchedTerminalAgent()
         connectionState = .idle
     }
@@ -592,6 +597,7 @@ public final class HermesAgentStore: ObservableObject {
                 toolTraces = []
                 endStreaming()
                 pendingRequest = nil
+                pendingResponseLease = nil
             }
         }
         gatewayReady = false
@@ -720,6 +726,7 @@ public final class HermesAgentStore: ObservableObject {
         gatewayReady = false
         endStreaming()
         pendingRequest = nil
+        pendingResponseLease = nil
         expectedClient.close()
         expectedSidecar.stop()
         return true
@@ -736,6 +743,7 @@ public final class HermesAgentStore: ObservableObject {
         gatewayReady = false
         endStreaming()
         pendingRequest = nil
+        pendingResponseLease = nil
         if clearSession {
             activeSessionID = nil
             activeSessionKey = nil
@@ -758,6 +766,7 @@ public final class HermesAgentStore: ObservableObject {
         activeSessionTitle = title
         endStreaming()
         pendingRequest = nil
+        pendingResponseLease = nil
         if !preserveVisibleTranscript || messages.isEmpty {
             messages = Self.parseMessages(object["messages"])
         }
@@ -873,11 +882,15 @@ public final class HermesAgentStore: ObservableObject {
         case "message.delta":
             appendAssistantDelta(event.payload["text"]?.stringValue ?? "")
         case "message.complete":
-            completeAssistantMessage(
-                text: event.payload["text"]?.stringValue,
-                reasoning: event.payload["reasoning"]?.stringValue
-            )
-        case "reasoning.delta", "thinking.delta":
+            if event.payload["status"]?.stringValue == "error" {
+                recordGenericEventError()
+            } else {
+                completeAssistantMessage(
+                    text: event.payload["text"]?.stringValue,
+                    reasoning: event.payload["reasoning"]?.stringValue
+                )
+            }
+        case "reasoning.available", "reasoning.delta", "thinking.delta":
             appendReasoningDelta(event.payload["text"]?.stringValue ?? "")
         case "tool.start":
             toolTraces.append(
@@ -916,13 +929,7 @@ public final class HermesAgentStore: ObservableObject {
         case "secret.expire":
             expirePendingRequest(kind: .secret, payload: event.payload)
         case "error":
-            messages.append(
-                HermesTranscriptMessage(
-                    role: .system,
-                    text: "Hermes reported an error."
-                )
-            )
-            endStreaming()
+            recordGenericEventError()
         case "session.info":
             if let key = event.payload["session_key"]?.stringValue {
                 activeSessionKey = key
@@ -966,6 +973,9 @@ public final class HermesAgentStore: ObservableObject {
         }
 
         let requestID = payload["request_id"]?.stringValue ?? "approval-\(UUID().uuidString)"
+        if pendingRequest?.id != requestID || pendingRequest?.kind != .approval {
+            pendingResponseLease = nil
+        }
         pendingRequest = HermesPendingRequest(
             id: requestID,
             kind: .approval,
@@ -983,6 +993,9 @@ public final class HermesAgentStore: ObservableObject {
 
     private func setPendingRequest(kind: HermesPendingRequestKind, payload: [String: JSONValue]) {
         guard let requestID = payload["request_id"]?.stringValue, !requestID.isEmpty else { return }
+        if pendingRequest?.id != requestID || pendingRequest?.kind != kind {
+            pendingResponseLease = nil
+        }
         let prompt: String
         switch kind {
         case .approval:
@@ -1015,6 +1028,23 @@ public final class HermesAgentStore: ObservableObject {
               pendingRequest?.kind == kind
         else { return }
         pendingRequest = nil
+        pendingResponseLease = nil
+    }
+
+    private func releasePendingResponseLease(_ lease: PendingRequestLease) {
+        guard let activeLease = pendingResponseLease,
+              activeLease.id == lease.id,
+              activeLease.kind == lease.kind,
+              activeLease.sessionID == lease.sessionID,
+              activeLease.operation.generation == lease.operation.generation,
+              activeLease.operation.clientIdentity == lease.operation.clientIdentity
+        else { return }
+        pendingResponseLease = nil
+    }
+
+    private func recordGenericEventError() {
+        endStreaming()
+        messages.append(HermesTranscriptMessage(role: .system, text: "Hermes reported an error."))
     }
 
     private func endStreaming() {
