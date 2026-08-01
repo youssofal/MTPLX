@@ -180,6 +180,236 @@ final class HermesAgentStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testStreamingReasoningToolsAndCompletionUpdateTranscript() async throws {
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+
+        client.emit(.init(type: "message.start", sessionID: "live-1", payload: [:]))
+        client.emit(.init(type: "message.delta", sessionID: "live-1", payload: ["text": .string("Hel")]))
+        client.emit(.init(type: "tool.start", sessionID: "live-1", payload: ["name": .string("terminal")]))
+        client.emit(.init(type: "message.complete", sessionID: "live-1", payload: [
+            "text": .string("Hello"),
+            "reasoning": .string("checked state"),
+        ]))
+
+        XCTAssertEqual(store.messages.last?.text, "Hello")
+        XCTAssertTrue(store.toolTraces.contains(where: { $0.name == "Thought" }))
+        XCTAssertFalse(store.isStreaming)
+    }
+
+    @MainActor
+    func testAskFirstSurfacesApprovalAndRespondsWithSelectedChoice() async throws {
+        configuration.hermesAutoApprove = false
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: [
+            "command": .string("git status"),
+            "choices": .array([.string("once"), .string("deny")]),
+        ]))
+
+        XCTAssertEqual(store.pendingRequest?.kind, .approval)
+        XCTAssertEqual(store.pendingRequest?.choices, ["once", "deny"])
+        await store.respondToPendingRequest(value: "once")
+        XCTAssertEqual(client.calls.last?.method, "approval.respond")
+        XCTAssertEqual(client.calls.last?.params, [
+            "session_id": .string("live-1"),
+            "choice": .string("once"),
+        ])
+        XCTAssertNil(store.pendingRequest)
+    }
+
+    @MainActor
+    func testPendingApprovalPausesComposerAndDeniesWithNativeChoice() async throws {
+        configuration.hermesAutoApprove = false
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("git status")]))
+        await store.send("must remain paused")
+        await store.denyPendingApproval()
+
+        XCTAssertFalse(client.calls.contains(where: { $0.method == "prompt.submit" }))
+        XCTAssertEqual(client.calls.last?.method, "approval.respond")
+        XCTAssertEqual(client.calls.last?.params["choice"], .string("deny"))
+    }
+
+    @MainActor
+    func testConfiguredAutoApproveRespondsOnceWithoutPersistentScope() async throws {
+        configuration.hermesAutoApprove = true
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("git status")]))
+        await waitUntil { client.calls.contains(where: { $0.method == "approval.respond" }) }
+
+        let response = try XCTUnwrap(client.calls.last(where: { $0.method == "approval.respond" }))
+        XCTAssertEqual(response.params["session_id"], .string("live-1"))
+        XCTAssertEqual(response.params["choice"], .string("once"))
+        XCTAssertNil(response.params["all"])
+        XCTAssertNil(store.pendingRequest)
+    }
+
+    @MainActor
+    func testClarificationResponseAndMatchingExpiryUseNativeRequestID() async throws {
+        configuration.hermesAutoApprove = false
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+
+        client.emit(.init(type: "clarify.request", sessionID: "live-1", payload: [
+            "request_id": .string("clarify-1"),
+            "question": .string("Which target?"),
+            "choices": .array([.string("A"), .string("B")]),
+        ]))
+        client.emit(.init(type: "clarify.expire", sessionID: "live-1", payload: ["request_id": .string("stale")]))
+        XCTAssertEqual(store.pendingRequest?.id, "clarify-1")
+
+        await store.respondToPendingRequest(value: "B")
+        XCTAssertEqual(client.calls.last?.method, "clarify.respond")
+        XCTAssertEqual(client.calls.last?.params, [
+            "request_id": .string("clarify-1"),
+            "answer": .string("B"),
+        ])
+        XCTAssertNil(store.pendingRequest)
+
+        client.emit(.init(type: "clarify.request", sessionID: "live-1", payload: [
+            "request_id": .string("clarify-2"),
+            "question": .string("Again?"),
+        ]))
+        client.emit(.init(type: "clarify.expire", sessionID: "live-1", payload: ["request_id": .string("clarify-2")]))
+        XCTAssertNil(store.pendingRequest)
+    }
+
+    @MainActor
+    func testSudoAndSecretResponsesUseNativeFieldsWithoutPersistingInput() async throws {
+        configuration.hermesAutoApprove = false
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+
+        client.emit(.init(type: "sudo.request", sessionID: "live-1", payload: ["request_id": .string("sudo-1")]))
+        let sudoInput = UUID().uuidString
+        await store.respondToPendingRequest(value: sudoInput)
+        XCTAssertEqual(client.calls.last?.method, "sudo.respond")
+        XCTAssertEqual(client.calls.last?.params["request_id"], .string("sudo-1"))
+        XCTAssertEqual(client.calls.last?.params["password"], .string(sudoInput))
+
+        client.emit(.init(type: "secret.request", sessionID: "live-1", payload: [
+            "request_id": .string("secret-1"),
+            "prompt": .string("Credential requested"),
+        ]))
+        let secretInput = UUID().uuidString
+        await store.respondToPendingRequest(value: secretInput)
+        XCTAssertEqual(client.calls.last?.method, "secret.respond")
+        XCTAssertEqual(client.calls.last?.params["request_id"], .string("secret-1"))
+        XCTAssertEqual(client.calls.last?.params["value"], .string(secretInput))
+        XCTAssertFalse(store.messages.contains(where: { $0.text == sudoInput || $0.text == secretInput }))
+    }
+
+    @MainActor
+    func testExpiredOrSupersededRequestCannotClearNewerPromptAfterResponseReturns() async throws {
+        configuration.hermesAutoApprove = false
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        client.suspendedMethods = ["clarify.respond"]
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+
+        client.emit(.init(type: "clarify.request", sessionID: "live-1", payload: [
+            "request_id": .string("clarify-old"), "question": .string("Old prompt?"),
+        ]))
+        let response = Task { await store.respondToPendingRequest(value: "old") }
+        await waitUntil { client.calls.contains(where: { $0.method == "clarify.respond" }) }
+        client.emit(.init(type: "clarify.expire", sessionID: "live-1", payload: ["request_id": .string("clarify-old")]))
+        client.emit(.init(type: "clarify.request", sessionID: "live-1", payload: [
+            "request_id": .string("clarify-new"), "question": .string("New prompt?"),
+        ]))
+        client.finishCall(method: "clarify.respond")
+        await response.value
+
+        XCTAssertEqual(store.pendingRequest?.id, "clarify-new")
+    }
+
+    @MainActor
+    func testErrorDisconnectAndSessionSwitchClearStreamingAndPendingState() async throws {
+        configuration.hermesAutoApprove = false
+        let runtime = FakeHermesEmbeddedRuntime()
+        let firstClient = FakeHermesGatewayClient(readyImmediately: true)
+        let secondClient = FakeHermesGatewayClient(readyImmediately: true)
+        firstClient.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        firstClient.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        secondClient.resultByMethod["session.list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [firstClient, secondClient])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+
+        firstClient.emit(.init(type: "message.start", sessionID: "live-1", payload: [:]))
+        firstClient.emit(.init(type: "clarify.request", sessionID: "live-1", payload: [
+            "request_id": .string("clarify-1"), "question": .string("Continue?"),
+        ]))
+        firstClient.emit(.init(type: "error", sessionID: "live-1", payload: ["message": .string("turn failed")]))
+        XCTAssertFalse(store.isStreaming)
+        XCTAssertNotNil(store.pendingRequest)
+
+        firstClient.disconnect("transport lost")
+        XCTAssertFalse(store.isStreaming)
+        XCTAssertNil(store.pendingRequest)
+
+        await store.loadSessions(profile: researcher, configuration: configuration)
+        XCTAssertFalse(store.isStreaming)
+        XCTAssertNil(store.pendingRequest)
+    }
+
+    @MainActor
+    func testEventsFromNonActiveSessionAndRetiredClientAreIgnored() async throws {
+        configuration.hermesAutoApprove = false
+        let runtime = FakeHermesEmbeddedRuntime()
+        let firstClient = FakeHermesGatewayClient(readyImmediately: true)
+        let secondClient = FakeHermesGatewayClient(readyImmediately: true)
+        firstClient.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        firstClient.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        secondClient.resultByMethod["session.list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [firstClient, secondClient])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+
+        firstClient.emit(.init(type: "message.delta", sessionID: "other-live", payload: ["text": .string("ignored")]))
+        firstClient.emit(.init(type: "clarify.request", sessionID: "other-live", payload: [
+            "request_id": .string("other-request"), "question": .string("ignored"),
+        ]))
+        XCTAssertEqual(store.messages, [])
+        XCTAssertNil(store.pendingRequest)
+
+        await store.loadSessions(profile: researcher, configuration: configuration)
+        firstClient.emit(.init(type: "message.delta", sessionID: "live-1", payload: ["text": .string("retired")]))
+        XCTAssertEqual(store.messages, [])
+        XCTAssertNil(store.pendingRequest)
+    }
+
+    @MainActor
     func testExternalSessionRemainsReadableButCannotSubmitOrInterrupt() async throws {
         let runtime = FakeHermesEmbeddedRuntime()
         runtime.ownershipBySession["saved-external"] = .external(surface: "telegram")
@@ -684,6 +914,10 @@ private final class FakeHermesGatewayClient: HermesGatewayClientProtocol {
 
     func disconnect(_ message: String) {
         onDisconnect?(message)
+    }
+
+    func emit(_ event: HermesGatewayEvent) {
+        onEvent?(event)
     }
 
     func finishCall(method: String) {

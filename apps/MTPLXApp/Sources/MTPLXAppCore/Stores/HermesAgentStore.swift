@@ -62,6 +62,27 @@ public struct HermesToolTrace: Identifiable, Equatable, Sendable {
     }
 }
 
+public enum HermesPendingRequestKind: Equatable, Sendable {
+    case approval
+    case clarification
+    case sudo
+    case secret
+}
+
+public struct HermesPendingRequest: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let kind: HermesPendingRequestKind
+    public let prompt: String
+    public let choices: [String]
+
+    public init(id: String, kind: HermesPendingRequestKind, prompt: String, choices: [String]) {
+        self.id = id
+        self.kind = kind
+        self.prompt = prompt
+        self.choices = choices
+    }
+}
+
 public struct HermesSavedSession: Identifiable, Equatable, Sendable {
     public let id: String
     public let title: String
@@ -107,6 +128,7 @@ public final class HermesAgentStore: ObservableObject {
     @Published public private(set) var activeSessionWritable = false
     @Published public private(set) var readOnlyReason: String?
     @Published public private(set) var isStreaming: Bool = false
+    @Published public private(set) var pendingRequest: HermesPendingRequest?
     @Published public private(set) var gatewayReady: Bool = false
     @Published public private(set) var gatewayRepairInFlight: Bool = false
     @Published public private(set) var gatewayRepairMessage: String?
@@ -122,11 +144,19 @@ public final class HermesAgentStore: ObservableObject {
     private var shuttingDown = false
     private var gatewayGeneration = 0
     private var didReapOrphanedSidecars = false
+    private var hermesAutoApprove = false
 
     private struct GatewayOperation {
         let generation: Int
         let profileID: String
         let clientIdentity: ObjectIdentifier
+    }
+
+    private struct PendingRequestLease {
+        let id: String
+        let kind: HermesPendingRequestKind
+        let sessionID: String
+        let operation: GatewayOperation
     }
 
     public init(
@@ -272,6 +302,8 @@ public final class HermesAgentStore: ObservableObject {
         activeSessionTitle = "New Hermes Agent"
         messages = []
         toolTraces = []
+        endStreaming()
+        pendingRequest = nil
         activeSessionKey = sessionKey
         applyActiveOwnership(.ready)
         connectionState = .connected
@@ -349,7 +381,8 @@ public final class HermesAgentStore: ObservableObject {
               let sessionID = activeSessionID,
               let profile = selectedProfile,
               let operation = currentOperation(for: profile),
-              !isStreaming
+              !isStreaming,
+              pendingRequest == nil
         else { return }
         guard refreshActiveOwnership() else { return }
         messages.append(HermesTranscriptMessage(role: .user, text: text))
@@ -365,7 +398,7 @@ public final class HermesAgentStore: ObservableObject {
             )
         } catch {
             guard isCurrent(operation, sessionID: sessionID) else { return }
-            isStreaming = false
+            endStreaming()
             messages.append(
                 HermesTranscriptMessage(
                     role: .system,
@@ -373,6 +406,70 @@ public final class HermesAgentStore: ObservableObject {
                 )
             )
         }
+    }
+
+    public func respondToPendingRequest(value: String) async {
+        guard let pendingRequest,
+              let sessionID = activeSessionID,
+              let profile = selectedProfile,
+              let operation = currentOperation(for: profile),
+              activeSessionWritable
+        else { return }
+
+        let lease = PendingRequestLease(
+            id: pendingRequest.id,
+            kind: pendingRequest.kind,
+            sessionID: sessionID,
+            operation: operation
+        )
+        let method: String
+        let params: [String: JSONValue]
+        switch lease.kind {
+        case .approval:
+            method = "approval.respond"
+            params = [
+                "session_id": .string(sessionID),
+                "choice": .string(value),
+            ]
+        case .clarification:
+            method = "clarify.respond"
+            params = [
+                "request_id": .string(lease.id),
+                "answer": .string(value),
+            ]
+        case .sudo:
+            method = "sudo.respond"
+            params = [
+                "request_id": .string(lease.id),
+                "password": .string(value),
+            ]
+        case .secret:
+            method = "secret.respond"
+            params = [
+                "request_id": .string(lease.id),
+                "value": .string(value),
+            ]
+        }
+
+        do {
+            _ = try await rpc(operation, method: method, params: params)
+            guard isCurrent(lease.operation, sessionID: lease.sessionID),
+                  self.pendingRequest?.id == lease.id,
+                  self.pendingRequest?.kind == lease.kind
+            else { return }
+            self.pendingRequest = nil
+        } catch {
+            guard isCurrent(lease.operation, sessionID: lease.sessionID),
+                  self.pendingRequest?.id == lease.id,
+                  self.pendingRequest?.kind == lease.kind
+            else { return }
+            messages.append(HermesTranscriptMessage(role: .system, text: "Hermes could not accept the requested response."))
+        }
+    }
+
+    public func denyPendingApproval() async {
+        guard pendingRequest?.kind == .approval else { return }
+        await respondToPendingRequest(value: "deny")
     }
 
     public func interrupt() async {
@@ -390,7 +487,7 @@ public final class HermesAgentStore: ObservableObject {
             )
         }
         guard isCurrent(operation, sessionID: sessionID) else { return }
-        isStreaming = false
+        endStreaming()
     }
 
     public func createProfile(named name: String, configuration: MTPLXAppConfiguration) async {
@@ -419,6 +516,7 @@ public final class HermesAgentStore: ObservableObject {
         sessions = []
         messages = []
         toolTraces = []
+        pendingRequest = nil
         terminalAgentRunning = integration.hasLaunchedTerminalAgent()
         connectionState = .idle
     }
@@ -459,6 +557,7 @@ public final class HermesAgentStore: ObservableObject {
         configuration: MTPLXAppConfiguration,
         preserveSession: Bool = false
     ) async throws -> GatewayOperation {
+        hermesAutoApprove = configuration.hermesAutoApprove
         let signature = Self.configurationSignature(configuration)
         if sidecarProfileName == profile.name,
            sidecarConfigurationSignature == signature,
@@ -491,7 +590,8 @@ public final class HermesAgentStore: ObservableObject {
                 applyActiveOwnership(.ready)
                 messages = []
                 toolTraces = []
-                isStreaming = false
+                endStreaming()
+                pendingRequest = nil
             }
         }
         gatewayReady = false
@@ -517,8 +617,14 @@ public final class HermesAgentStore: ObservableObject {
             throw CancellationError()
         }
         let nextClient = clientFactory(nextSidecar.webSocketURL)
-        nextClient.onEvent = { [weak self] event in
-            guard let self, self.gatewayGeneration == generation, !self.shuttingDown else { return }
+        nextClient.onEvent = { [weak self, weak nextClient] event in
+            guard let self,
+                  let nextClient,
+                  self.gatewayGeneration == generation,
+                  !self.shuttingDown,
+                  let currentClient = self.client,
+                  ObjectIdentifier(currentClient) == ObjectIdentifier(nextClient)
+            else { return }
             self.handle(event)
         }
         nextClient.onDisconnect = { [weak self, weak nextClient, weak nextSidecar] message in
@@ -612,7 +718,8 @@ public final class HermesAgentStore: ObservableObject {
         sidecarProfileName = nil
         sidecarConfigurationSignature = nil
         gatewayReady = false
-        isStreaming = false
+        endStreaming()
+        pendingRequest = nil
         expectedClient.close()
         expectedSidecar.stop()
         return true
@@ -627,7 +734,8 @@ public final class HermesAgentStore: ObservableObject {
         sidecarProfileName = nil
         sidecarConfigurationSignature = nil
         gatewayReady = false
-        isStreaming = false
+        endStreaming()
+        pendingRequest = nil
         if clearSession {
             activeSessionID = nil
             activeSessionKey = nil
@@ -648,6 +756,8 @@ public final class HermesAgentStore: ObservableObject {
         activeSessionID = sessionID
         activeSessionKey = object["resumed"]?.stringValue ?? savedSessionID
         activeSessionTitle = title
+        endStreaming()
+        pendingRequest = nil
         if !preserveVisibleTranscript || messages.isEmpty {
             messages = Self.parseMessages(object["messages"])
         }
@@ -746,11 +856,7 @@ public final class HermesAgentStore: ObservableObject {
         if event.type == "gateway.ready" {
             return
         }
-        if let activeSessionID,
-           let eventSessionID = event.sessionID,
-           eventSessionID != activeSessionID {
-            return
-        }
+        guard let activeSessionID, event.sessionID == activeSessionID else { return }
 
         switch event.type {
         case "message.start":
@@ -771,6 +877,8 @@ public final class HermesAgentStore: ObservableObject {
                 text: event.payload["text"]?.stringValue,
                 reasoning: event.payload["reasoning"]?.stringValue
             )
+        case "reasoning.delta", "thinking.delta":
+            appendReasoningDelta(event.payload["text"]?.stringValue ?? "")
         case "tool.start":
             toolTraces.append(
                 HermesToolTrace(
@@ -792,51 +900,127 @@ public final class HermesAgentStore: ObservableObject {
                 detail: Self.toolDetail(from: event.payload)
             )
         case "approval.request":
-            toolTraces.append(
-                HermesToolTrace(
-                    name: "Approval",
-                    status: .approval,
-                    detail: "Auto-approved by MTPLX Hermes mode."
-                )
-            )
-            if let sessionID = activeSessionID,
-               let profile = selectedProfile,
-               let operation = currentOperation(for: profile) {
-                Task { [weak self] in
-                    guard let self, self.isCurrent(operation, sessionID: sessionID) else { return }
-                    _ = try? await self.rpc(
-                        operation,
-                        method: "approval.respond",
-                        params: [
-                            "session_id": .string(sessionID),
-                            "choice": .string("allow"),
-                            "all": .bool(true),
-                        ]
-                    )
-                }
-            }
-        case "clarify.request", "sudo.request", "secret.request":
-            toolTraces.append(
-                HermesToolTrace(
-                    name: event.type.replacingOccurrences(of: ".request", with: ""),
-                    status: .waiting,
-                    detail: Self.toolDetail(from: event.payload)
-                )
-            )
+            handleApprovalRequest(event.payload, sessionID: activeSessionID)
+        case "clarify.request":
+            setPendingRequest(kind: .clarification, payload: event.payload)
+        case "sudo.request":
+            setPendingRequest(kind: .sudo, payload: event.payload)
+        case "secret.request":
+            setPendingRequest(kind: .secret, payload: event.payload)
+        case "approval.expire":
+            expirePendingRequest(kind: .approval, payload: event.payload)
+        case "clarify.expire":
+            expirePendingRequest(kind: .clarification, payload: event.payload)
+        case "sudo.expire":
+            expirePendingRequest(kind: .sudo, payload: event.payload)
+        case "secret.expire":
+            expirePendingRequest(kind: .secret, payload: event.payload)
         case "error":
             messages.append(
                 HermesTranscriptMessage(
                     role: .system,
-                    text: event.payload["message"]?.stringValue ?? "Hermes reported an error."
+                    text: "Hermes reported an error."
                 )
             )
-            isStreaming = false
+            endStreaming()
         case "session.info":
             if let key = event.payload["session_key"]?.stringValue {
                 activeSessionKey = key
             }
         default:
             break
+        }
+    }
+
+    private func handleApprovalRequest(_ payload: [String: JSONValue], sessionID: String) {
+        guard let profile = selectedProfile,
+              let operation = currentOperation(for: profile),
+              isCurrent(operation, sessionID: sessionID),
+              refreshActiveOwnership()
+        else { return }
+
+        if hermesAutoApprove {
+            Task { [weak self] in
+                guard let self,
+                      self.hermesAutoApprove,
+                      self.refreshActiveOwnership(),
+                      self.isCurrent(operation, sessionID: sessionID)
+                else { return }
+                do {
+                    _ = try await self.rpc(
+                        operation,
+                        method: "approval.respond",
+                        params: [
+                            "session_id": .string(sessionID),
+                            "choice": .string("once"),
+                        ]
+                    )
+                } catch {
+                    guard self.isCurrent(operation, sessionID: sessionID) else { return }
+                    self.messages.append(
+                        HermesTranscriptMessage(role: .system, text: "Hermes could not accept the requested response.")
+                    )
+                }
+            }
+            return
+        }
+
+        let requestID = payload["request_id"]?.stringValue ?? "approval-\(UUID().uuidString)"
+        pendingRequest = HermesPendingRequest(
+            id: requestID,
+            kind: .approval,
+            prompt: payload["command"]?.stringValue ?? "Hermes requires approval.",
+            choices: Self.choices(from: payload)
+        )
+        toolTraces.append(
+            HermesToolTrace(
+                name: "Approval",
+                status: .approval,
+                detail: payload["command"]?.stringValue ?? "Approval required."
+            )
+        )
+    }
+
+    private func setPendingRequest(kind: HermesPendingRequestKind, payload: [String: JSONValue]) {
+        guard let requestID = payload["request_id"]?.stringValue, !requestID.isEmpty else { return }
+        let prompt: String
+        switch kind {
+        case .approval:
+            prompt = payload["command"]?.stringValue ?? "Hermes requires approval."
+        case .clarification:
+            prompt = payload["question"]?.stringValue ?? "Hermes needs clarification."
+        case .sudo:
+            prompt = payload["prompt"]?.stringValue ?? "Hermes requires sudo authentication."
+        case .secret:
+            prompt = payload["prompt"]?.stringValue ?? "Hermes requires a secret."
+        }
+        pendingRequest = HermesPendingRequest(
+            id: requestID,
+            kind: kind,
+            prompt: prompt,
+            choices: Self.choices(from: payload)
+        )
+        toolTraces.append(
+            HermesToolTrace(
+                name: Self.pendingToolName(for: kind),
+                status: .waiting,
+                detail: prompt
+            )
+        )
+    }
+
+    private func expirePendingRequest(kind: HermesPendingRequestKind, payload: [String: JSONValue]) {
+        guard let requestID = payload["request_id"]?.stringValue,
+              pendingRequest?.id == requestID,
+              pendingRequest?.kind == kind
+        else { return }
+        pendingRequest = nil
+    }
+
+    private func endStreaming() {
+        isStreaming = false
+        if messages.last?.role == .assistant, messages.last?.isStreaming == true {
+            messages[messages.count - 1].isStreaming = false
         }
     }
 
@@ -852,11 +1036,25 @@ public final class HermesAgentStore: ObservableObject {
         isStreaming = true
     }
 
+    private func appendReasoningDelta(_ delta: String) {
+        guard !delta.isEmpty else { return }
+        if let index = toolTraces.lastIndex(where: { $0.name == "Thought" && $0.status == .running }) {
+            toolTraces[index].detail += delta
+        } else {
+            toolTraces.append(HermesToolTrace(name: "Thought", status: .running, detail: delta))
+        }
+    }
+
     private func completeAssistantMessage(text: String?, reasoning: String?) {
         if let reasoning, !reasoning.isEmpty {
-            toolTraces.append(
-                HermesToolTrace(name: "Thought", status: .complete, detail: reasoning)
-            )
+            if let index = toolTraces.lastIndex(where: { $0.name == "Thought" && $0.status == .running }) {
+                toolTraces[index].detail = reasoning
+                toolTraces[index].status = .complete
+            } else {
+                toolTraces.append(HermesToolTrace(name: "Thought", status: .complete, detail: reasoning))
+            }
+        } else if let index = toolTraces.lastIndex(where: { $0.name == "Thought" && $0.status == .running }) {
+            toolTraces[index].status = .complete
         }
         let finalText = text ?? ""
         if messages.last?.role == .assistant {
@@ -869,7 +1067,7 @@ public final class HermesAgentStore: ObservableObject {
                 HermesTranscriptMessage(role: .assistant, text: finalText, isStreaming: false)
             )
         }
-        isStreaming = false
+        endStreaming()
         if let activeSessionID,
            let profile = selectedProfile,
            let operation = currentOperation(for: profile) {
@@ -955,6 +1153,19 @@ public final class HermesAgentStore: ObservableObject {
             ?? payload["tool"]?.stringValue
             ?? payload["command"]?.stringValue
             ?? "Tool"
+    }
+
+    private static func choices(from payload: [String: JSONValue]) -> [String] {
+        payload["choices"]?.arrayValue?.compactMap(\.stringValue) ?? []
+    }
+
+    private static func pendingToolName(for kind: HermesPendingRequestKind) -> String {
+        switch kind {
+        case .approval: "Approval"
+        case .clarification: "Clarification"
+        case .sudo: "Sudo"
+        case .secret: "Secret"
+        }
     }
 
     private static func toolDetail(from payload: [String: JSONValue]) -> String {
