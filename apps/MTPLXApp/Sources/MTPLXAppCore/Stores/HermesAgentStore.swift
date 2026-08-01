@@ -146,6 +146,8 @@ public final class HermesAgentStore: ObservableObject {
     private var didReapOrphanedSidecars = false
     private var hermesAutoApprove = false
     private var pendingResponseLease: PendingRequestLease?
+    private var queuedAutoApprovals: [QueuedAutoApproval] = []
+    private var retiredAutoApprovalFingerprints: [RetiredAutoApprovalFingerprint] = []
 
     private struct GatewayOperation {
         let generation: Int
@@ -158,6 +160,22 @@ public final class HermesAgentStore: ObservableObject {
         let kind: HermesPendingRequestKind
         let sessionID: String
         let operation: GatewayOperation
+    }
+
+    private struct QueuedAutoApproval {
+        let id: String
+        let fingerprint: String
+        let sessionID: String
+        let operation: GatewayOperation
+        let prompt: String
+        let choices: [String]
+    }
+
+    private struct RetiredAutoApprovalFingerprint {
+        let fingerprint: String
+        let sessionID: String
+        let operation: GatewayOperation
+        let retiredAt: Date
     }
 
     public init(
@@ -305,6 +323,7 @@ public final class HermesAgentStore: ObservableObject {
         toolTraces = []
         endStreaming()
         pendingRequest = nil
+        clearAutoApprovalLifecycle()
         activeSessionKey = sessionKey
         applyActiveOwnership(.ready)
         connectionState = .connected
@@ -424,8 +443,15 @@ public final class HermesAgentStore: ObservableObject {
             sessionID: sessionID,
             operation: operation
         )
+        let completesQueuedAutoApproval = pendingRequest.kind == .approval
+            && pendingRequest.id.hasPrefix("queued-auto-approval-")
         guard reservePendingResponseLease(lease) else { return }
-        defer { releasePendingResponseLease(lease) }
+        defer {
+            releasePendingResponseLease(lease)
+            if completesQueuedAutoApproval {
+                presentNextQueuedAutoApprovalIfPossible()
+            }
+        }
         let method: String
         let params: [String: JSONValue]
         switch lease.kind {
@@ -522,6 +548,7 @@ public final class HermesAgentStore: ObservableObject {
         toolTraces = []
         pendingRequest = nil
         pendingResponseLease = nil
+        clearAutoApprovalLifecycle()
         terminalAgentRunning = integration.hasLaunchedTerminalAgent()
         connectionState = .idle
     }
@@ -582,6 +609,8 @@ public final class HermesAgentStore: ObservableObject {
         let generation = gatewayGeneration
         client?.close()
         client = nil
+        pendingResponseLease = nil
+        clearAutoApprovalLifecycle()
         if !reuseSidecar {
             sidecar?.stop()
             sidecar = nil
@@ -598,6 +627,7 @@ public final class HermesAgentStore: ObservableObject {
                 endStreaming()
                 pendingRequest = nil
                 pendingResponseLease = nil
+                clearAutoApprovalLifecycle()
             }
         }
         gatewayReady = false
@@ -727,6 +757,7 @@ public final class HermesAgentStore: ObservableObject {
         endStreaming()
         pendingRequest = nil
         pendingResponseLease = nil
+        clearAutoApprovalLifecycle()
         expectedClient.close()
         expectedSidecar.stop()
         return true
@@ -744,6 +775,7 @@ public final class HermesAgentStore: ObservableObject {
         endStreaming()
         pendingRequest = nil
         pendingResponseLease = nil
+        clearAutoApprovalLifecycle()
         if clearSession {
             activeSessionID = nil
             activeSessionKey = nil
@@ -767,6 +799,7 @@ public final class HermesAgentStore: ObservableObject {
         endStreaming()
         pendingRequest = nil
         pendingResponseLease = nil
+        clearAutoApprovalLifecycle()
         if !preserveVisibleTranscript || messages.isEmpty {
             messages = Self.parseMessages(object["messages"])
         }
@@ -942,13 +975,31 @@ public final class HermesAgentStore: ObservableObject {
     private func handleApprovalRequest(_ payload: [String: JSONValue], sessionID: String) {
         guard let profile = selectedProfile,
               let operation = currentOperation(for: profile),
-              isCurrent(operation, sessionID: sessionID),
-              refreshActiveOwnership()
+              isCurrent(operation, sessionID: sessionID)
         else { return }
 
         if hermesAutoApprove {
+            let queuedApproval = QueuedAutoApproval(
+                id: "queued-auto-approval-\(UUID().uuidString)",
+                fingerprint: Self.autoApprovalRequestID(sessionID: sessionID, payload: payload),
+                sessionID: sessionID,
+                operation: operation,
+                prompt: payload["command"]?.stringValue ?? "Hermes requires approval.",
+                choices: Self.choices(from: payload)
+            )
+            guard refreshActiveOwnership() else {
+                enqueueAutoApprovalForManualResponse(queuedApproval)
+                return
+            }
+            guard pendingRequest == nil,
+                  pendingResponseLease == nil,
+                  !isRetiredAutoApprovalFingerprint(queuedApproval.fingerprint, for: operation, sessionID: sessionID)
+            else {
+                enqueueAutoApprovalForManualResponse(queuedApproval)
+                return
+            }
             let lease = PendingRequestLease(
-                id: Self.autoApprovalRequestID(sessionID: sessionID, payload: payload),
+                id: queuedApproval.id,
                 kind: .approval,
                 sessionID: sessionID,
                 operation: operation
@@ -956,7 +1007,10 @@ public final class HermesAgentStore: ObservableObject {
             guard reservePendingResponseLease(lease) else { return }
             Task { [weak self] in
                 guard let self else { return }
-                defer { self.releasePendingResponseLease(lease) }
+                defer {
+                    self.releasePendingResponseLease(lease)
+                    self.presentNextQueuedAutoApprovalIfPossible()
+                }
                 guard self.hermesAutoApprove,
                       self.refreshActiveOwnership(),
                       self.isCurrent(operation, sessionID: sessionID)
@@ -970,6 +1024,8 @@ public final class HermesAgentStore: ObservableObject {
                             "choice": .string("once"),
                         ]
                     )
+                    guard self.isCurrent(operation, sessionID: sessionID) else { return }
+                    self.retireAutoApprovalFingerprint(queuedApproval.fingerprint, for: operation, sessionID: sessionID)
                 } catch {
                     guard self.isCurrent(operation, sessionID: sessionID) else { return }
                     self.messages.append(
@@ -1031,6 +1087,14 @@ public final class HermesAgentStore: ObservableObject {
     }
 
     private func expirePendingRequest(kind: HermesPendingRequestKind, payload: [String: JSONValue]) {
+        if kind == .approval,
+           payload["request_id"]?.stringValue == nil,
+           pendingRequest?.id.hasPrefix("queued-auto-approval-") == true {
+            pendingRequest = nil
+            pendingResponseLease = nil
+            presentNextQueuedAutoApprovalIfPossible()
+            return
+        }
         guard let requestID = payload["request_id"]?.stringValue,
               pendingRequest?.id == requestID,
               pendingRequest?.kind == kind
@@ -1054,6 +1118,77 @@ public final class HermesAgentStore: ObservableObject {
         guard pendingResponseLease == nil else { return false }
         pendingResponseLease = lease
         return true
+    }
+
+    private func enqueueAutoApprovalForManualResponse(_ approval: QueuedAutoApproval) {
+        queuedAutoApprovals.append(approval)
+        presentNextQueuedAutoApprovalIfPossible()
+    }
+
+    private func presentNextQueuedAutoApprovalIfPossible() {
+        guard pendingRequest == nil,
+              pendingResponseLease == nil,
+              let approval = queuedAutoApprovals.first,
+              isCurrent(approval.operation, sessionID: approval.sessionID)
+        else { return }
+        _ = refreshActiveOwnership()
+        queuedAutoApprovals.removeFirst()
+        pendingRequest = HermesPendingRequest(
+            id: approval.id,
+            kind: .approval,
+            prompt: approval.prompt,
+            choices: approval.choices
+        )
+        toolTraces.append(
+            HermesToolTrace(
+                name: "Approval",
+                status: .approval,
+                detail: approval.prompt
+            )
+        )
+    }
+
+    private func retireAutoApprovalFingerprint(
+        _ fingerprint: String,
+        for operation: GatewayOperation,
+        sessionID: String
+    ) {
+        pruneRetiredAutoApprovalFingerprints()
+        retiredAutoApprovalFingerprints.append(
+            RetiredAutoApprovalFingerprint(
+                fingerprint: fingerprint,
+                sessionID: sessionID,
+                operation: operation,
+                retiredAt: Date()
+            )
+        )
+        if retiredAutoApprovalFingerprints.count > 16 {
+            retiredAutoApprovalFingerprints.removeFirst(retiredAutoApprovalFingerprints.count - 16)
+        }
+    }
+
+    private func isRetiredAutoApprovalFingerprint(
+        _ fingerprint: String,
+        for operation: GatewayOperation,
+        sessionID: String
+    ) -> Bool {
+        pruneRetiredAutoApprovalFingerprints()
+        return retiredAutoApprovalFingerprints.contains {
+            $0.fingerprint == fingerprint
+                && $0.sessionID == sessionID
+                && $0.operation.generation == operation.generation
+                && $0.operation.clientIdentity == operation.clientIdentity
+        }
+    }
+
+    private func pruneRetiredAutoApprovalFingerprints() {
+        let cutoff = Date().addingTimeInterval(-30)
+        retiredAutoApprovalFingerprints.removeAll { $0.retiredAt < cutoff }
+    }
+
+    private func clearAutoApprovalLifecycle() {
+        queuedAutoApprovals = []
+        retiredAutoApprovalFingerprints = []
     }
 
     private func recordGenericEventError() {

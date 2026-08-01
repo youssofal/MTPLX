@@ -373,6 +373,150 @@ final class HermesAgentStoreTests: XCTestCase {
         XCTAssertEqual(client.calls.last?.params["choice"], .string("once"))
         XCTAssertNil(client.calls.last?.params["all"])
         client.finishCall(method: "approval.respond")
+        client.suspendedMethods = []
+
+        await waitUntil { store.pendingRequest?.kind == .approval }
+        XCTAssertEqual(store.pendingRequest?.prompt, "git status")
+        await store.respondToPendingRequest(value: "deny")
+        XCTAssertEqual(
+            client.calls.filter { $0.method == "approval.respond" }.map { $0.params["choice"] },
+            [.string("once"), .string("deny")]
+        )
+        XCTAssertNil(store.pendingRequest)
+    }
+
+    @MainActor
+    func testQueuedAutoApprovalsDowngradeToManualFIFO() async throws {
+        configuration.hermesAutoApprove = true
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        client.suspendedMethods = ["approval.respond"]
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("A")]))
+        await waitUntil { client.calls.filter { $0.method == "approval.respond" }.count == 1 }
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("B")]))
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("C")]))
+        XCTAssertEqual(client.calls.filter { $0.method == "approval.respond" }.count, 1)
+
+        client.finishCall(method: "approval.respond")
+        client.suspendedMethods = []
+        await waitUntil { store.pendingRequest?.prompt == "B" }
+        await store.respondToPendingRequest(value: "deny")
+        await waitUntil { store.pendingRequest?.prompt == "C" }
+        await store.respondToPendingRequest(value: "once")
+
+        XCTAssertEqual(
+            client.calls.filter { $0.method == "approval.respond" }.map { $0.params["choice"] },
+            [.string("once"), .string("deny"), .string("once")]
+        )
+        XCTAssertNil(store.pendingRequest)
+    }
+
+    @MainActor
+    func testLateDuplicateOfAutoApprovedRequestDowngradesToManual() async throws {
+        configuration.hermesAutoApprove = true
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        let event = HermesGatewayEvent(type: "approval.request", sessionID: "live-1", payload: ["command": .string("git status")])
+
+        client.emit(event)
+        await waitUntil { client.calls.filter { $0.method == "approval.respond" }.count == 1 }
+        for _ in 0..<8 { await Task.yield() }
+        client.emit(event)
+
+        await waitUntil { store.pendingRequest?.kind == .approval }
+        XCTAssertEqual(client.calls.filter { $0.method == "approval.respond" }.count, 1)
+        XCTAssertEqual(store.pendingRequest?.prompt, "git status")
+        await store.respondToPendingRequest(value: "deny")
+        XCTAssertEqual(client.calls.filter { $0.method == "approval.respond" }.count, 2)
+    }
+
+    @MainActor
+    func testQueuedAutoApprovalTakeoverRemainsManualAndReadOnly() async throws {
+        configuration.hermesAutoApprove = true
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        client.suspendedMethods = ["approval.respond"]
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("A")]))
+        await waitUntil { client.calls.filter { $0.method == "approval.respond" }.count == 1 }
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("B")]))
+        runtime.ownershipBySession["live-1"] = .external(surface: "telegram")
+        client.finishCall(method: "approval.respond")
+
+        await waitUntil { store.pendingRequest?.prompt == "B" }
+        XCTAssertFalse(store.activeSessionWritable)
+        await store.respondToPendingRequest(value: "deny")
+        XCTAssertFalse(store.activeSessionWritable)
+        XCTAssertEqual(client.calls.filter { $0.method == "approval.respond" }.count, 1)
+    }
+
+    @MainActor
+    func testDisconnectClearsQueuedAutoApprovals() async throws {
+        configuration.hermesAutoApprove = true
+        let runtime = FakeHermesEmbeddedRuntime()
+        let firstClient = FakeHermesGatewayClient(readyImmediately: true)
+        let secondClient = FakeHermesGatewayClient(readyImmediately: true)
+        firstClient.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        firstClient.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        firstClient.suspendedMethods = ["approval.respond"]
+        secondClient.resultByMethod["session.create"] = .object(["session_id": .string("live-2")])
+        secondClient.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [firstClient, secondClient])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        firstClient.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("A")]))
+        await waitUntil { firstClient.calls.filter { $0.method == "approval.respond" }.count == 1 }
+        firstClient.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("B")]))
+
+        firstClient.disconnect("transport lost")
+        firstClient.finishCall(method: "approval.respond")
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        for _ in 0..<8 { await Task.yield() }
+
+        XCTAssertNil(store.pendingRequest)
+        XCTAssertFalse(secondClient.calls.contains(where: { $0.method == "approval.respond" }))
+    }
+
+    @MainActor
+    func testExpiryDuringQueuedManualResponseAdvancesFIFO() async throws {
+        configuration.hermesAutoApprove = true
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("live-1")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        client.suspendedMethods = ["approval.respond"]
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("A")]))
+        await waitUntil { client.calls.filter { $0.method == "approval.respond" }.count == 1 }
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("B")]))
+        client.emit(.init(type: "approval.request", sessionID: "live-1", payload: ["command": .string("C")]))
+        client.finishCall(method: "approval.respond")
+        client.suspendedMethods = []
+        await waitUntil { store.pendingRequest?.prompt == "B" }
+
+        client.suspendedMethods = ["approval.respond"]
+        let response = Task { await store.respondToPendingRequest(value: "deny") }
+        await waitUntil { client.calls.filter { $0.method == "approval.respond" }.count == 2 }
+        client.emit(.init(type: "approval.expire", sessionID: "live-1", payload: [:]))
+        client.finishCall(method: "approval.respond")
+        client.suspendedMethods = []
+        await response.value
+
+        await waitUntil { store.pendingRequest?.prompt == "C" }
+        await store.respondToPendingRequest(value: "once")
+        XCTAssertNil(store.pendingRequest)
     }
 
     @MainActor
