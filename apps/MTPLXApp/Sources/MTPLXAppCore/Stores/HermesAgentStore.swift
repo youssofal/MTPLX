@@ -69,6 +69,7 @@ public struct HermesSavedSession: Identifiable, Equatable, Sendable {
     public let startedAt: Double
     public let messageCount: Int
     public let source: String
+    public let activity: HermesSessionActivityState
 
     public init(
         id: String,
@@ -76,7 +77,8 @@ public struct HermesSavedSession: Identifiable, Equatable, Sendable {
         preview: String,
         startedAt: Double,
         messageCount: Int,
-        source: String
+        source: String,
+        activity: HermesSessionActivityState = .ready
     ) {
         self.id = id
         self.title = title
@@ -84,6 +86,7 @@ public struct HermesSavedSession: Identifiable, Equatable, Sendable {
         self.startedAt = startedAt
         self.messageCount = messageCount
         self.source = source
+        self.activity = activity
     }
 }
 
@@ -100,6 +103,9 @@ public final class HermesAgentStore: ObservableObject {
     @Published public private(set) var activeSessionID: String?
     @Published public private(set) var activeSessionKey: String?
     @Published public private(set) var activeSessionTitle: String?
+    @Published public private(set) var activeSessionActivity: HermesSessionActivityState = .ready
+    @Published public private(set) var activeSessionWritable = false
+    @Published public private(set) var readOnlyReason: String?
     @Published public private(set) var isStreaming: Bool = false
     @Published public private(set) var gatewayReady: Bool = false
     @Published public private(set) var gatewayRepairInFlight: Bool = false
@@ -232,7 +238,7 @@ public final class HermesAgentStore: ObservableObject {
             guard let operation, isCurrent(operation) else { return }
             let result = try await rpc(operation, method: "session.list", params: ["limit": .number(200)])
             guard isCurrent(operation) else { return }
-            sessions = Self.parseSessions(result)
+            sessions = sessionsWithActivity(Self.parseSessions(result), profile: profile)
             connectionState = .connected
         } catch {
             guard let operation, isCurrent(operation), !shuttingDown else { return }
@@ -267,6 +273,7 @@ public final class HermesAgentStore: ObservableObject {
         messages = []
         toolTraces = []
         activeSessionKey = sessionKey
+        applyActiveOwnership(.ready)
         connectionState = .connected
         return HermesSessionReference(
             profileName: profile.name,
@@ -286,6 +293,7 @@ public final class HermesAgentStore: ObservableObject {
         guard isCurrent(operation) else {
             throw HermesGatewayClientError.disconnected
         }
+        sessions = sessionsWithActivity(sessions, profile: profile)
         let result = try await rpc(
             operation,
             method: "session.resume",
@@ -303,6 +311,7 @@ public final class HermesAgentStore: ObservableObject {
             title: session.title.isEmpty ? session.preview : session.title,
             preserveVisibleTranscript: false
         )
+        _ = refreshActiveOwnership()
         return HermesSessionReference(
             profileName: profile.name,
             sessionID: activeSessionKey ?? session.id,
@@ -342,6 +351,7 @@ public final class HermesAgentStore: ObservableObject {
               let operation = currentOperation(for: profile),
               !isStreaming
         else { return }
+        guard refreshActiveOwnership() else { return }
         messages.append(HermesTranscriptMessage(role: .user, text: text))
         isStreaming = true
         do {
@@ -370,6 +380,7 @@ public final class HermesAgentStore: ObservableObject {
               let profile = selectedProfile,
               let operation = currentOperation(for: profile)
         else { return }
+        guard refreshActiveOwnership() else { return }
         do {
             _ = try await rpc(operation, method: "session.interrupt", params: ["session_id": .string(sessionID)])
         } catch {
@@ -404,6 +415,7 @@ public final class HermesAgentStore: ObservableObject {
         activeSessionID = nil
         activeSessionKey = nil
         activeSessionTitle = nil
+        applyActiveOwnership(.ready)
         sessions = []
         messages = []
         toolTraces = []
@@ -435,6 +447,7 @@ public final class HermesAgentStore: ObservableObject {
             title: title,
             preserveVisibleTranscript: true
         )
+        _ = refreshActiveOwnership()
     }
 
     public func refreshTerminalAgentState() {
@@ -475,6 +488,7 @@ public final class HermesAgentStore: ObservableObject {
                 activeSessionID = nil
                 activeSessionKey = nil
                 activeSessionTitle = nil
+                applyActiveOwnership(.ready)
                 messages = []
                 toolTraces = []
                 isStreaming = false
@@ -618,6 +632,7 @@ public final class HermesAgentStore: ObservableObject {
             activeSessionID = nil
             activeSessionKey = nil
             activeSessionTitle = nil
+            applyActiveOwnership(.ready)
         }
     }
 
@@ -638,6 +653,77 @@ public final class HermesAgentStore: ObservableObject {
         }
         toolTraces = []
         connectionState = .connected
+    }
+
+    private func sessionsWithActivity(
+        _ sessions: [HermesSavedSession],
+        profile: HermesProfile
+    ) -> [HermesSavedSession] {
+        sessions.map { session in
+            HermesSavedSession(
+                id: session.id,
+                title: session.title,
+                preview: session.preview,
+                startedAt: session.startedAt,
+                messageCount: session.messageCount,
+                source: session.source,
+                activity: HermesSessionActivityState(ownership: ownership(for: session.id, profile: profile))
+            )
+        }
+    }
+
+    @discardableResult
+    private func refreshActiveOwnership() -> Bool {
+        guard let profile = selectedProfile,
+              let sessionID = activeSessionKey ?? activeSessionID
+        else {
+            applyActiveOwnership(.ready)
+            return false
+        }
+        let primary = ownership(for: sessionID, profile: profile)
+        let resolved: HermesSessionOwnership
+        if let liveID = activeSessionID, liveID != sessionID {
+            resolved = mostRestrictive(primary, ownership(for: liveID, profile: profile))
+        } else {
+            resolved = primary
+        }
+        applyActiveOwnership(resolved)
+        return activeSessionWritable
+    }
+
+    private func ownership(for sessionID: String, profile: HermesProfile) -> HermesSessionOwnership {
+        embeddedRuntime.sessionOwnership(
+            profile: profile,
+            sessionID: sessionID,
+            ownedSidecarPID: sidecar?.processIdentifier
+        )
+    }
+
+    private func mostRestrictive(
+        _ first: HermesSessionOwnership,
+        _ second: HermesSessionOwnership
+    ) -> HermesSessionOwnership {
+        if case .unknown = first { return first }
+        if case .unknown = second { return second }
+        if case .external = first { return first }
+        if case .external = second { return second }
+        if case .ownedByMTPLX = first { return first }
+        return second
+    }
+
+    private func applyActiveOwnership(_ ownership: HermesSessionOwnership) {
+        activeSessionActivity = HermesSessionActivityState(ownership: ownership)
+        switch ownership {
+        case .ready, .ownedByMTPLX:
+            activeSessionWritable = activeSessionID != nil
+            readOnlyReason = nil
+        case .external:
+            activeSessionWritable = false
+            readOnlyReason = "This session is active in another Hermes surface."
+        case .unknown(let reason):
+            activeSessionWritable = false
+            readOnlyReason = reason
+        }
     }
 
     private func liveSessionKey(for sessionID: String, operation: GatewayOperation) async throws -> String? {

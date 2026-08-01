@@ -291,9 +291,156 @@ final class HermesSidecarReadiness: @unchecked Sendable {
 }
 
 public enum HermesSessionOwnership: Equatable, Sendable {
-    case appOwned
-    case external
-    case unavailable(String)
+    case ready
+    case ownedByMTPLX
+    case external(surface: String)
+    case unknown(String)
+}
+
+public enum HermesSessionActivityState: Equatable, Sendable {
+    case ready
+    case runningInMTPLX
+    case externallyActive(surface: String)
+    case ownershipUnknown(String)
+
+    init(ownership: HermesSessionOwnership) {
+        switch ownership {
+        case .ready: self = .ready
+        case .ownedByMTPLX: self = .runningInMTPLX
+        case .external(let surface): self = .externallyActive(surface: surface)
+        case .unknown(let reason): self = .ownershipUnknown(reason)
+        }
+    }
+}
+
+/// Process observations used only to decide whether an active-session entry is
+/// still trustworthy.  The inspector never signals a process and never writes
+/// the Hermes registry.
+public enum HermesSessionProcessIdentity: Equatable, Sendable {
+    case live(startedAt: TimeInterval)
+    case dead
+    case unknown
+}
+
+/// Read-only, fail-closed parser for Hermes' per-profile active-session
+/// registry.  Its process probe is injected so registry semantics can be
+/// verified without probing real processes in tests.
+public struct HermesActiveSessionRegistryInspector: @unchecked Sendable {
+    public typealias ProcessIdentity = @Sendable (Int32) -> HermesSessionProcessIdentity
+
+    private let processIdentity: ProcessIdentity
+    private let readData: @Sendable (URL) throws -> Data
+    private let fileExists: @Sendable (URL) -> Bool
+
+    public init(
+        processIdentity: @escaping ProcessIdentity = HermesActiveSessionRegistryInspector.liveProcessIdentity,
+        readData: @escaping @Sendable (URL) throws -> Data = { try Data(contentsOf: $0) },
+        fileExists: @escaping @Sendable (URL) -> Bool = { FileManager.default.fileExists(atPath: $0.path) }
+    ) {
+        self.processIdentity = processIdentity
+        self.readData = readData
+        self.fileExists = fileExists
+    }
+
+    public func ownership(
+        registryURL: URL,
+        sessionID: String,
+        ownedSidecarPID: Int32?
+    ) -> HermesSessionOwnership {
+        guard !sessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .unknown(Self.inspectionUnavailableReason)
+        }
+        guard fileExists(registryURL) else { return .ready }
+
+        let entries: [Entry]
+        do {
+            entries = try JSONDecoder().decode(Registry.self, from: readData(registryURL)).entries
+        } catch {
+            return .unknown(Self.inspectionUnavailableReason)
+        }
+
+        let matching = entries.filter { $0.sessionID == sessionID }
+        guard !matching.isEmpty else { return .ready }
+
+        var liveEntries: [Entry] = []
+        for entry in matching {
+            switch processIdentity(entry.pid) {
+            case .dead:
+                continue
+            case .unknown:
+                return .unknown(Self.inspectionUnavailableReason)
+            case .live(let processStart):
+                // A live PID without the recorded start identity is a reused
+                // PID, not an active Hermes writer for this session.
+                guard abs(processStart - entry.startedAt) < 1 else { continue }
+                liveEntries.append(entry)
+            }
+        }
+
+        guard liveEntries.count <= 1 else {
+            return .unknown(Self.inspectionUnavailableReason)
+        }
+        guard let entry = liveEntries.first else { return .ready }
+        if entry.pid == ownedSidecarPID {
+            return .ownedByMTPLX
+        }
+        return .external(surface: Self.sanitizedSurface(entry.surface))
+    }
+
+    private static let inspectionUnavailableReason = "Session activity could not be inspected."
+
+    private static func sanitizedSurface(_ surface: String) -> String {
+        let trimmed = surface.trimmingCharacters(in: .whitespacesAndNewlines)
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: " -_"))
+        guard !trimmed.isEmpty,
+              trimmed.unicodeScalars.allSatisfy(allowed.contains),
+              trimmed.count <= 40
+        else { return "another Hermes surface" }
+        return trimmed
+    }
+
+    private struct Registry: Decodable {
+        let entries: [Entry]
+    }
+
+    private struct Entry: Decodable {
+        let sessionID: String
+        let surface: String
+        let pid: Int32
+        let startedAt: TimeInterval
+
+        private enum CodingKeys: String, CodingKey {
+            case sessionID = "session_id"
+            case surface
+            case pid
+            case startedAt = "start_time"
+        }
+
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            sessionID = try values.decode(String.self, forKey: .sessionID)
+            surface = try values.decode(String.self, forKey: .surface)
+            pid = try values.decode(Int32.self, forKey: .pid)
+            startedAt = try values.decode(TimeInterval.self, forKey: .startedAt)
+            guard !sessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  pid > 1,
+                  startedAt.isFinite,
+                  startedAt > 0
+            else { throw DecodingError.dataCorruptedError(forKey: .sessionID, in: values, debugDescription: "Invalid active session entry.") }
+        }
+    }
+
+    public static func liveProcessIdentity(_ pid: Int32) -> HermesSessionProcessIdentity {
+        guard pid > 1 else { return .dead }
+        if kill(pid, 0) != 0 {
+            return errno == ESRCH ? .dead : .unknown
+        }
+        var info = proc_bsdinfo()
+        let byteCount = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size))
+        guard byteCount == MemoryLayout<proc_bsdinfo>.size else { return .unknown }
+        let startedAt = TimeInterval(info.pbi_start_tvsec) + TimeInterval(info.pbi_start_tvusec) / 1_000_000
+        return startedAt > 0 ? .live(startedAt: startedAt) : .unknown
+    }
 }
 
 public protocol HermesEmbeddedRuntime: Sendable {

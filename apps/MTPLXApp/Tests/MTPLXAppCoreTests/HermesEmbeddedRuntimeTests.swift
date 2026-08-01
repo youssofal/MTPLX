@@ -73,6 +73,88 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
         XCTAssertFalse(spec.arguments.contains("-p"))
     }
 
+    func testActiveSessionRegistryMapsLiveOwnedAndExternalSessions() throws {
+        let profile = try makeProfile(named: "bernd", config: mtplxConfig())
+        let registry = profile
+            .appendingPathComponent("runtime", isDirectory: true)
+            .appendingPathComponent("active_sessions.json")
+        try FileManager.default.createDirectory(at: registry.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try """
+        {"entries":[
+          {"session_id":"ours","surface":"mtplx-app","pid":7001,"start_time":10},
+          {"session_id":"telegram","surface":"telegram","pid":7002,"start_time":20}
+        ]}
+        """.write(to: registry, atomically: true, encoding: .utf8)
+
+        let inspector = HermesActiveSessionRegistryInspector(
+            processIdentity: { pid in
+                switch pid {
+                case 7001: return .live(startedAt: 10)
+                case 7002: return .live(startedAt: 20)
+                default: return .dead
+                }
+            }
+        )
+
+        XCTAssertEqual(inspector.ownership(registryURL: registry, sessionID: "ours", ownedSidecarPID: 7001), .ownedByMTPLX)
+        XCTAssertEqual(inspector.ownership(registryURL: registry, sessionID: "telegram", ownedSidecarPID: 7001), .external(surface: "telegram"))
+        XCTAssertEqual(inspector.ownership(registryURL: registry, sessionID: "idle", ownedSidecarPID: 7001), .ready)
+    }
+
+    func testActiveSessionRegistryFailsClosedForMalformedOrUninspectableEntries() throws {
+        let registry = root.appendingPathComponent("active_sessions.json")
+        try "{not json".write(to: registry, atomically: true, encoding: .utf8)
+        let inspector = HermesActiveSessionRegistryInspector(processIdentity: { _ in .unknown })
+
+        XCTAssertEqual(
+            inspector.ownership(registryURL: registry, sessionID: "saved", ownedSidecarPID: nil),
+            .unknown("Session activity could not be inspected.")
+        )
+        XCTAssertEqual(
+            HermesActiveSessionRegistryInspector(
+                processIdentity: { _ in .unknown },
+                readData: { _ in throw CocoaError(.fileReadNoPermission) },
+                fileExists: { _ in true }
+            ).ownership(registryURL: registry, sessionID: "saved", ownedSidecarPID: nil),
+            .unknown("Session activity could not be inspected.")
+        )
+    }
+
+    func testActiveSessionRegistryIgnoresDeadAndPIDReusedEntries() throws {
+        let registry = root.appendingPathComponent("active_sessions.json")
+        try """
+        {"entries":[
+          {"session_id":"dead","surface":"telegram","pid":7001,"start_time":10},
+          {"session_id":"reused","surface":"telegram","pid":7002,"start_time":10}
+        ]}
+        """.write(to: registry, atomically: true, encoding: .utf8)
+        let inspector = HermesActiveSessionRegistryInspector(
+            processIdentity: { pid in pid == 7001 ? .dead : .live(startedAt: 20) }
+        )
+
+        XCTAssertEqual(inspector.ownership(registryURL: registry, sessionID: "dead", ownedSidecarPID: nil), .ready)
+        XCTAssertEqual(inspector.ownership(registryURL: registry, sessionID: "reused", ownedSidecarPID: nil), .ready)
+    }
+
+    func testIntegrationTreatsMissingProfileRegistryAsReady() throws {
+        let profile = try makeProfile(named: "bernd", config: mtplxConfig())
+        let integration = HermesIntegration(
+            hermesHome: hermesHome,
+            executablePath: "/usr/bin/true",
+            environment: [:],
+            activeSessionRegistryInspector: HermesActiveSessionRegistryInspector(processIdentity: { _ in .unknown })
+        )
+
+        XCTAssertEqual(
+            integration.sessionOwnership(
+                profile: HermesProfile(name: "bernd", path: profile.path, isDefault: false),
+                sessionID: "saved",
+                ownedSidecarPID: nil
+            ),
+            .ready
+        )
+    }
+
     func testEmbeddedLaunchDoesNotInheritRootMessagingCredentials() throws {
         try """
         TELEGRAM_BOT_TOKEN=root-telegram-token

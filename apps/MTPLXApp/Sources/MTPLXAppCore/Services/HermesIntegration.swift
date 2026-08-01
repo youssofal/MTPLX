@@ -251,6 +251,9 @@ public struct HermesIntegration: Sendable {
     public let sidecarRuntimeDirectory: URL
     /// Test seam: bypass bootstrap-layout + LaunchServices discovery.
     public let desktopApplicationOverride: URL?
+    /// Read-only inspector for Hermes' profile-local active-session registry.
+    /// Injected solely to make process-identity uncertainty testable.
+    public let activeSessionRegistryInspector: HermesActiveSessionRegistryInspector
 
     public init(
         hermesHome: URL = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".hermes", isDirectory: true),
@@ -264,7 +267,8 @@ public struct HermesIntegration: Sendable {
             .appendingPathComponent("active-profile.json"),
         sidecarRuntimeDirectory: URL = URL(fileURLWithPath: NSHomeDirectory())
             .appendingPathComponent(".mtplx/hermes-sidecars", isDirectory: true),
-        desktopApplicationOverride: URL? = nil
+        desktopApplicationOverride: URL? = nil,
+        activeSessionRegistryInspector: HermesActiveSessionRegistryInspector = .init()
     ) {
         self.hermesHome = hermesHome
         self.executablePath = executablePath
@@ -273,6 +277,7 @@ public struct HermesIntegration: Sendable {
         self.activeProfileURL = activeProfileURL
         self.sidecarRuntimeDirectory = sidecarRuntimeDirectory
         self.desktopApplicationOverride = desktopApplicationOverride
+        self.activeSessionRegistryInspector = activeSessionRegistryInspector
     }
 
     public func discoverProfiles() -> [HermesProfile] {
@@ -2043,12 +2048,13 @@ public struct HermesIntegration: Sendable {
         sessionID: String,
         ownedSidecarPID: Int32?
     ) -> HermesSessionOwnership {
-        _ = profile
-        _ = sessionID
-        _ = ownedSidecarPID
-        // Task 5 replaces this conservative placeholder with Hermes' native
-        // active-session registry.  Until then, no session is assumed writable.
-        return .unavailable("Session ownership is unavailable.")
+        activeSessionRegistryInspector.ownership(
+            registryURL: URL(fileURLWithPath: profile.path, isDirectory: true)
+                .appendingPathComponent("runtime", isDirectory: true)
+                .appendingPathComponent("active_sessions.json", isDirectory: false),
+            sessionID: sessionID,
+            ownedSidecarPID: ownedSidecarPID
+        )
     }
 
     private func runAndCapture(

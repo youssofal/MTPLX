@@ -180,6 +180,73 @@ final class HermesAgentStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testExternalSessionRemainsReadableButCannotSubmitOrInterrupt() async throws {
+        let runtime = FakeHermesEmbeddedRuntime()
+        runtime.ownershipBySession["saved-external"] = .external(surface: "telegram")
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.resume"] = .object([
+            "session_id": .string("live-external"),
+            "resumed": .string("saved-external"),
+            "messages": .array([.object(["role": .string("assistant"), "text": .string("Existing reply")])]),
+        ])
+        let store = makeStore(runtime: runtime, clients: [client])
+        let session = HermesSavedSession(
+            id: "saved-external", title: "External", preview: "", startedAt: 0, messageCount: 1, source: ""
+        )
+
+        _ = try await store.resume(session, profile: bernd, configuration: configuration)
+        await store.send("must not leave MTPLX")
+        await store.interrupt()
+
+        XCTAssertEqual(store.messages.map(\.text), ["Existing reply"])
+        XCTAssertFalse(store.activeSessionWritable)
+        XCTAssertEqual(store.activeSessionActivity, .externallyActive(surface: "telegram"))
+        XCTAssertNotNil(store.readOnlyReason)
+        XCTAssertFalse(client.calls.contains(where: { $0.method == "prompt.submit" || $0.method == "session.interrupt" }))
+    }
+
+    @MainActor
+    func testSendRechecksOwnershipImmediatelyBeforeSubmit() async throws {
+        let runtime = FakeHermesEmbeddedRuntime()
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.resume"] = resumeResult(liveID: "live-1", savedID: "saved-1")
+        let store = makeStore(runtime: runtime, clients: [client])
+        _ = try await store.resume(
+            HermesSavedSession(id: "saved-1", title: "Saved", preview: "", startedAt: 0, messageCount: 0, source: ""),
+            profile: bernd,
+            configuration: configuration
+        )
+        XCTAssertTrue(store.activeSessionWritable)
+
+        runtime.ownershipBySession["saved-1"] = .external(surface: "telegram")
+        await store.send("race check")
+
+        XCTAssertFalse(store.activeSessionWritable)
+        XCTAssertEqual(store.activeSessionActivity, .externallyActive(surface: "telegram"))
+        XCTAssertFalse(client.calls.contains(where: { $0.method == "prompt.submit" }))
+        XCTAssertEqual(store.messages, [])
+    }
+
+    @MainActor
+    func testListActivityAndDifferentSessionConcurrencyDoNotBlockFreshSession() async throws {
+        let runtime = FakeHermesEmbeddedRuntime()
+        runtime.ownershipBySession["telegram-session"] = .external(surface: "telegram")
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.list"] = sessionsResult(id: "telegram-session", title: "Telegram")
+        client.resultByMethod["session.create"] = .object(["session_id": .string("fresh-live")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [client])
+
+        await store.loadSessions(profile: bernd, configuration: configuration)
+        XCTAssertEqual(store.sessions.first?.activity, .externallyActive(surface: "telegram"))
+
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        XCTAssertTrue(store.activeSessionWritable)
+        await store.send("new session is independent")
+        XCTAssertTrue(client.calls.contains(where: { $0.method == "prompt.submit" }))
+    }
+
+    @MainActor
     func testReconnectPreservesVisibleTranscriptAndResumesSelectedSession() async throws {
         let runtime = FakeHermesEmbeddedRuntime()
         let firstClient = FakeHermesGatewayClient(readyImmediately: true)
@@ -496,6 +563,7 @@ final class HermesAgentStoreTests: XCTestCase {
 
 private final class FakeHermesEmbeddedRuntime: HermesEmbeddedRuntime, @unchecked Sendable {
     var routingByProfile: [String: HermesProfileRoutingState] = [:]
+    var ownershipBySession: [String: HermesSessionOwnership] = [:]
     var startCount = 0
     var reapCount = 0
     private(set) var sidecars: [FakeHermesSidecar] = []
@@ -519,7 +587,7 @@ private final class FakeHermesEmbeddedRuntime: HermesEmbeddedRuntime, @unchecked
         sessionID: String,
         ownedSidecarPID: Int32?
     ) -> HermesSessionOwnership {
-        .appOwned
+        ownershipBySession[sessionID] ?? .ready
     }
 
     @discardableResult
