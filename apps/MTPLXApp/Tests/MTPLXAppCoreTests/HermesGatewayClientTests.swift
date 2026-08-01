@@ -135,6 +135,7 @@ final class HermesGatewayClientTests: XCTestCase {
                 return XCTFail("Expected malformed response")
             }
         }
+        await eventually { backend.peerWasDisconnected() }
         client.close()
     }
 
@@ -158,6 +159,7 @@ final class HermesGatewayClientTests: XCTestCase {
         backend.sendResult(id: 99)
         await fulfillment(of: [completed], timeout: 0.5)
         XCTAssertEqual(observed as? HermesGatewayClientError, .malformedResponse)
+        await eventually { backend.peerWasDisconnected() }
     }
 
     func testLateDuplicateOfRetiredIDDoesNotTerminateNewPendingRequest() async throws {
@@ -244,6 +246,49 @@ final class HermesGatewayClientTests: XCTestCase {
         XCTAssertEqual(observed, [.malformedResponse, .malformedResponse])
     }
 
+    func testUnsupportedResponseIDsFailClosedWithoutTrapping() async throws {
+        for responseID: JSONValue in [
+            .number(-1),
+            .number(1.5),
+            .number(9_007_199_254_740_992),
+            .number(9_223_372_036_854_775_808),
+        ] {
+            try await assertMalformedResponseID(responseID)
+        }
+    }
+
+    func testRequestIDExhaustionFailsClosedWithoutReusingID() async throws {
+        let maxSafeID = 9_007_199_254_740_991
+        let backend = try FakeHermesGateway(eventsOnConnect: [.gatewayReady])
+        let client = URLSessionHermesGatewayClient(
+            url: backend.webSocketURL(token: UUID().uuidString),
+            startingRequestID: maxSafeID
+        )
+        defer { client.close() }
+        try await client.connectAndWaitUntilReady(timeoutSeconds: 1)
+
+        let finalRequest = Task { try await client.call(method: "last-safe-id", params: [:]) }
+        await eventually { backend.hasReceivedRequest(named: "last-safe-id") }
+        backend.sendResult(id: maxSafeID, result: .string("final"))
+        let finalValue = try await finalRequest.value
+        XCTAssertEqual(finalValue, .string("final"))
+
+        let completed = expectation(description: "request ID exhaustion")
+        var observed: Error?
+        Task {
+            do {
+                _ = try await client.call(method: "after-id-exhaustion", params: [:])
+            } catch {
+                observed = error
+                completed.fulfill()
+            }
+        }
+        await fulfillment(of: [completed], timeout: 0.5)
+        XCTAssertEqual(observed as? HermesGatewayClientError, .requestIDExhausted)
+        XCTAssertFalse(backend.hasReceivedRequest(named: "after-id-exhaustion"))
+        await eventually { backend.peerWasDisconnected() }
+    }
+
     func testAuthenticatedQueryIsSentWithoutSurfacingItInErrors() async throws {
         let backend = try FakeHermesGateway(eventsOnConnect: [.gatewayReady])
         let client = URLSessionHermesGatewayClient(url: backend.webSocketURL(token: UUID().uuidString))
@@ -274,5 +319,27 @@ final class HermesGatewayClientTests: XCTestCase {
         } catch {
             handler(error)
         }
+    }
+
+    private func assertMalformedResponseID(_ responseID: JSONValue) async throws {
+        let backend = try FakeHermesGateway(eventsOnConnect: [.gatewayReady])
+        let client = URLSessionHermesGatewayClient(url: backend.webSocketURL(token: UUID().uuidString))
+        defer { client.close() }
+        try await client.connectAndWaitUntilReady(timeoutSeconds: 1)
+        let completed = expectation(description: "invalid ID fails pending request")
+        var observed: Error?
+        Task {
+            do {
+                _ = try await client.call(method: "invalid-id", params: [:])
+            } catch {
+                observed = error
+                completed.fulfill()
+            }
+        }
+        await eventually { backend.hasReceivedRequest(named: "invalid-id") }
+        backend.sendResult(id: responseID)
+        await fulfillment(of: [completed], timeout: 0.5)
+        XCTAssertEqual(observed as? HermesGatewayClientError, .malformedResponse)
+        await eventually { backend.peerWasDisconnected() }
     }
 }

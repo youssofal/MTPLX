@@ -18,6 +18,7 @@ public enum HermesGatewayClientError: Error, LocalizedError, Equatable {
     case readinessTimedOut
     case rpcError
     case sendFailed
+    case requestIDExhausted
 
     public var errorDescription: String? {
         switch self {
@@ -26,6 +27,7 @@ public enum HermesGatewayClientError: Error, LocalizedError, Equatable {
         case .readinessTimedOut: "Hermes gateway did not become ready in time."
         case .rpcError: "Hermes RPC request failed."
         case .sendFailed: "Hermes request could not be sent."
+        case .requestIDExhausted: "Hermes request ID space is exhausted."
         }
     }
 }
@@ -45,6 +47,7 @@ public typealias HermesGatewayClientFactory = @MainActor (URL) -> any HermesGate
 @MainActor
 public final class URLSessionHermesGatewayClient: HermesGatewayClientProtocol {
     private static let retiredIDLimit = 256
+    private static let maxSafeJSONRPCID = 9_007_199_254_740_991
     private let task: URLSessionWebSocketTask
     private var nextID = 1
     private var pending: [Int: CheckedContinuation<JSONValue, Error>] = [:]
@@ -61,6 +64,11 @@ public final class URLSessionHermesGatewayClient: HermesGatewayClientProtocol {
 
     public init(url: URL, session: URLSession = .shared) {
         task = session.webSocketTask(with: url)
+    }
+
+    init(url: URL, startingRequestID: Int, session: URLSession = .shared) {
+        task = session.webSocketTask(with: url)
+        nextID = startingRequestID
     }
 
     /// Compatibility for the pre-readiness store lifecycle. New callers wait.
@@ -94,6 +102,10 @@ public final class URLSessionHermesGatewayClient: HermesGatewayClientProtocol {
 
     public func call(method: String, params: [String: JSONValue] = [:]) async throws -> JSONValue {
         guard started, !terminated else { throw HermesGatewayClientError.disconnected }
+        guard (0...Self.maxSafeJSONRPCID).contains(nextID) else {
+            terminate(error: .requestIDExhausted, notify: true)
+            throw HermesGatewayClientError.requestIDExhausted
+        }
         let id = nextID
         nextID += 1
         let request: [String: JSONValue] = [
@@ -123,7 +135,6 @@ public final class URLSessionHermesGatewayClient: HermesGatewayClientProtocol {
 
     public func close() {
         terminate(error: .disconnected, notify: false)
-        task.cancel(with: .goingAway, reason: nil)
     }
 
     private func startIfNeeded() {
@@ -214,11 +225,11 @@ public final class URLSessionHermesGatewayClient: HermesGatewayClientProtocol {
     private func rpcID(_ value: JSONValue?) -> Int? {
         guard case .number(let number) = value,
               number.isFinite,
-              number.rounded() == number,
               number >= 0,
-              number <= Double(Int.max)
+              number <= Double(Self.maxSafeJSONRPCID),
+              let id = Int(exactly: number)
         else { return nil }
-        return Int(number)
+        return id
     }
 
     private func object(from value: JSONValue?) -> [String: JSONValue]? {
@@ -259,6 +270,7 @@ public final class URLSessionHermesGatewayClient: HermesGatewayClientProtocol {
     private func terminate(error: HermesGatewayClientError, notify: Bool) {
         guard !terminated else { return }
         terminated = true
+        task.cancel(with: .goingAway, reason: nil)
         let rpcWaiters = pending
         pending.removeAll()
         let readyWaiters = readinessWaiters

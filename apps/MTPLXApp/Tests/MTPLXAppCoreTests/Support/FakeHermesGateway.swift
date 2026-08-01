@@ -22,6 +22,7 @@ final class FakeHermesGateway: @unchecked Sendable {
     private var rpcErrors: Set<String> = []
     private var receivedMethods: [String] = []
     private var authenticated = false
+    private var peerDisconnected = false
     private let eventsOnConnect: [EventOnConnect]
 
     init(eventsOnConnect: [EventOnConnect]) throws {
@@ -93,10 +94,14 @@ final class FakeHermesGateway: @unchecked Sendable {
     }
 
     func sendResult(id: Int, result: JSONValue = .null) {
+        sendResult(id: .number(Double(id)), result: result)
+    }
+
+    func sendResult(id: JSONValue, result: JSONValue = .null) {
         queue.async {
             self.sendJSON([
                 "jsonrpc": .string("2.0"),
-                "id": .number(Double(id)),
+                "id": id,
                 "result": result,
             ])
         }
@@ -127,12 +132,26 @@ final class FakeHermesGateway: @unchecked Sendable {
         queue.sync { authenticated }
     }
 
+    func peerWasDisconnected() -> Bool {
+        queue.sync { peerDisconnected }
+    }
+
     private func accept(_ connection: NWConnection) {
         self.connection?.cancel()
         self.connection = connection
         handshakeBuffer.removeAll(keepingCapacity: true)
         frameBuffer.removeAll(keepingCapacity: true)
         handshakeComplete = false
+        peerDisconnected = false
+        connection.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .cancelled, .failed:
+                guard let gateway = self else { return }
+                gateway.queue.async { gateway.peerDisconnected = true }
+            default:
+                break
+            }
+        }
         connection.start(queue: queue)
         receiveNext()
     }
@@ -141,7 +160,10 @@ final class FakeHermesGateway: @unchecked Sendable {
         connection?.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
             guard let self else { return }
             self.queue.async {
-                guard error == nil, !isComplete else { return }
+                guard error == nil, !isComplete else {
+                    self.peerDisconnected = true
+                    return
+                }
                 if let data {
                     self.process(data)
                 }
