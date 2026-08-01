@@ -419,7 +419,6 @@ public struct HermesActiveSessionRegistryInspector: @unchecked Sendable {
         do {
             data = try readData(registryURL)
         } catch {
-            if Self.isNotFound(error) { return .ready }
             return .unknown(Self.inspectionUnavailableReason)
         }
 
@@ -459,14 +458,6 @@ public struct HermesActiveSessionRegistryInspector: @unchecked Sendable {
     }
 
     private static let inspectionUnavailableReason = "Session activity could not be inspected."
-
-    private static func isNotFound(_ error: Error) -> Bool {
-        let nsError = error as NSError
-        return (nsError.domain == NSCocoaErrorDomain
-            && (nsError.code == CocoaError.Code.fileNoSuchFile.rawValue
-                || nsError.code == CocoaError.Code.fileReadNoSuchFile.rawValue))
-            || (nsError.domain == NSPOSIXErrorDomain && nsError.code == ENOENT)
-    }
 
     private static func sanitizedSurface(_ surface: String) -> String {
         let trimmed = surface.trimmingCharacters(in: .whitespacesAndNewlines)

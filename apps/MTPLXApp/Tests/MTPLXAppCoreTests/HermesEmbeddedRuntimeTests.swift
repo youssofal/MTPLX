@@ -181,7 +181,7 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
         )
     }
 
-    func testActiveSessionRegistryTreatsOnlyVerifiedNotFoundAsReady() throws {
+    func testActiveSessionRegistryFailsClosedWhenRegistryCannotBeRead() throws {
         let registry = root.appendingPathComponent("active_sessions.json")
         let notFound = HermesActiveSessionRegistryInspector(
             processIdentity: { _ in .unknown },
@@ -192,7 +192,10 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
             readData: { _ in throw CocoaError(.fileReadNoPermission) }
         )
 
-        XCTAssertEqual(notFound.ownership(registryURL: registry, sessionID: "saved", ownedSidecarPID: nil), .ready)
+        XCTAssertEqual(
+            notFound.ownership(registryURL: registry, sessionID: "saved", ownedSidecarPID: nil),
+            .unknown("Session activity could not be inspected.")
+        )
         XCTAssertEqual(
             unreadable.ownership(registryURL: registry, sessionID: "saved", ownedSidecarPID: nil),
             .unknown("Session activity could not be inspected.")
@@ -206,7 +209,7 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
         )
     }
 
-    func testIntegrationTreatsMissingProfileRegistryAsReady() throws {
+    func testIntegrationFailsClosedWhenProfileRegistryIsMissing() throws {
         let profile = try makeProfile(named: "bernd", config: mtplxConfig())
         let integration = HermesIntegration(
             hermesHome: hermesHome,
@@ -221,7 +224,7 @@ final class HermesEmbeddedRuntimeTests: XCTestCase {
                 sessionID: "saved",
                 ownedSidecarPID: nil
             ),
-            .ready
+            .unknown("Session activity could not be inspected.")
         )
     }
 
