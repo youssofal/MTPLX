@@ -1,7 +1,7 @@
 # Embedded Hermes Agent Selection
 
 Date: 2026-08-01
-Status: Conversational design approved; written specification awaiting review
+Status: Approved
 
 ## Objective
 
