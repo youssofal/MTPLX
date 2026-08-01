@@ -80,6 +80,43 @@ final class HermesAgentStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testReleasedDisconnectCallbacksDoNotRetainOldClientsOrSidecars() async {
+        let runtime = FakeHermesEmbeddedRuntime()
+        var firstClient: FakeHermesGatewayClient? = FakeHermesGatewayClient(readyImmediately: true)
+        var secondClient: FakeHermesGatewayClient? = FakeHermesGatewayClient(readyImmediately: true)
+        let thirdClient = FakeHermesGatewayClient(readyImmediately: true)
+        firstClient!.resultByMethod["session.list"] = .object(["sessions": .array([])])
+        secondClient!.resultByMethod["session.list"] = .object(["sessions": .array([])])
+        thirdClient.resultByMethod["session.list"] = .object(["sessions": .array([])])
+        weak var releasedFirstClient = firstClient
+        weak var releasedSecondClient = secondClient
+        let store = makeStore(runtime: runtime, clients: [firstClient!, secondClient!, thirdClient])
+
+        await store.loadSessions(profile: bernd, configuration: configuration)
+        weak var releasedFirstSidecar = runtime.sidecars[0]
+        await store.loadSessions(profile: researcher, configuration: configuration)
+
+        firstClient!.disconnect("late first disconnect")
+        XCTAssertEqual(store.selectedProfile?.name, "researcher")
+        XCTAssertEqual(store.connectionState, .connected)
+
+        weak var releasedSecondSidecar = runtime.sidecars[1]
+        await store.loadSessions(profile: bernd, configuration: alternateConfiguration())
+        secondClient!.disconnect("late second disconnect")
+        XCTAssertEqual(store.selectedProfile?.name, "bernd")
+        XCTAssertEqual(store.connectionState, .connected)
+
+        runtime.discardStoppedSidecars()
+        firstClient = nil
+        secondClient = nil
+
+        XCTAssertNil(releasedFirstClient)
+        XCTAssertNil(releasedSecondClient)
+        XCTAssertNil(releasedFirstSidecar)
+        XCTAssertNil(releasedSecondSidecar)
+    }
+
+    @MainActor
     func testNativeSessionRPCsRestoreTranscriptAndRememberedSession() async throws {
         let runtime = FakeHermesEmbeddedRuntime()
         let client = FakeHermesGatewayClient(readyImmediately: true)
@@ -489,6 +526,10 @@ private final class FakeHermesEmbeddedRuntime: HermesEmbeddedRuntime, @unchecked
     func reapOrphanedEmbeddedSidecars() -> [Int32] {
         reapCount += 1
         return []
+    }
+
+    func discardStoppedSidecars() {
+        sidecars.removeAll { !$0.isRunning }
     }
 }
 

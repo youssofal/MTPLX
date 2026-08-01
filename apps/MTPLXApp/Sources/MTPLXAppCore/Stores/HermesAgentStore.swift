@@ -507,8 +507,10 @@ public final class HermesAgentStore: ObservableObject {
             guard let self, self.gatewayGeneration == generation, !self.shuttingDown else { return }
             self.handle(event)
         }
-        nextClient.onDisconnect = { [weak self] message in
+        nextClient.onDisconnect = { [weak self, weak nextClient, weak nextSidecar] message in
             guard let self,
+                  let nextClient,
+                  let nextSidecar,
                   self.gatewayGeneration == generation,
                   !self.shuttingDown
             else { return }
