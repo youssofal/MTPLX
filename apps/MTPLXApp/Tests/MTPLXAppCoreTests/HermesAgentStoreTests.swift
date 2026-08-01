@@ -88,19 +88,19 @@ final class HermesAgentStoreTests: XCTestCase {
         firstClient!.resultByMethod["session.list"] = .object(["sessions": .array([])])
         secondClient!.resultByMethod["session.list"] = .object(["sessions": .array([])])
         thirdClient.resultByMethod["session.list"] = .object(["sessions": .array([])])
-        weak var releasedFirstClient = firstClient
-        weak var releasedSecondClient = secondClient
+        weak let releasedFirstClient = firstClient
+        weak let releasedSecondClient = secondClient
         let store = makeStore(runtime: runtime, clients: [firstClient!, secondClient!, thirdClient])
 
         await store.loadSessions(profile: bernd, configuration: configuration)
-        weak var releasedFirstSidecar = runtime.sidecars[0]
+        weak let releasedFirstSidecar = runtime.sidecars[0]
         await store.loadSessions(profile: researcher, configuration: configuration)
 
         firstClient!.disconnect("late first disconnect")
         XCTAssertEqual(store.selectedProfile?.name, "researcher")
         XCTAssertEqual(store.connectionState, .connected)
 
-        weak var releasedSecondSidecar = runtime.sidecars[1]
+        weak let releasedSecondSidecar = runtime.sidecars[1]
         await store.loadSessions(profile: bernd, configuration: alternateConfiguration())
         secondClient!.disconnect("late second disconnect")
         XCTAssertEqual(store.selectedProfile?.name, "bernd")
