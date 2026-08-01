@@ -180,6 +180,93 @@ final class HermesAgentStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testFreshMTPLXSessionCanSubmitMultiplePromptsWhenOwnershipRegistryIsUnavailable() async throws {
+        let runtime = FakeHermesEmbeddedRuntime()
+        runtime.ownershipBySession["fresh-live"] = .unknown("Session activity could not be inspected.")
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("fresh-live")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [client])
+
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        await store.send("first prompt")
+        client.emit(.init(type: "message.complete", sessionID: "fresh-live", payload: ["text": .string("first reply")]))
+        await store.send("second prompt")
+
+        XCTAssertEqual(
+            client.calls.filter { $0.method == "prompt.submit" }.map(\.params),
+            [
+                ["session_id": .string("fresh-live"), "text": .string("first prompt")],
+                ["session_id": .string("fresh-live"), "text": .string("second prompt")],
+            ]
+        )
+        XCTAssertTrue(store.activeSessionWritable)
+        XCTAssertNil(store.readOnlyReason)
+    }
+
+    @MainActor
+    func testMissingOwnershipRegistryKeepsSavedSessionReadOnlyAfterFreshSessionSwitch() async throws {
+        let runtime = FakeHermesEmbeddedRuntime()
+        runtime.ownershipBySession["fresh-live"] = .unknown("Session activity could not be inspected.")
+        runtime.ownershipBySession["saved-session"] = .unknown("Session activity could not be inspected.")
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("fresh-live")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        client.resultByMethod["session.resume"] = resumeResult(liveID: "saved-live", savedID: "saved-session")
+        let store = makeStore(runtime: runtime, clients: [client])
+
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        await store.send("fresh session is allowed")
+        client.emit(.init(type: "message.complete", sessionID: "fresh-live", payload: ["text": .string("done")]))
+
+        _ = try await store.resume(
+            HermesSavedSession(id: "saved-session", title: "Saved", preview: "", startedAt: 0, messageCount: 1, source: ""),
+            profile: bernd,
+            configuration: configuration
+        )
+        await store.send("saved session must remain blocked")
+
+        XCTAssertEqual(client.calls.filter { $0.method == "prompt.submit" }.count, 1)
+        XCTAssertFalse(store.activeSessionWritable)
+        XCTAssertEqual(store.activeSessionActivity, .ownershipUnknown("Session activity could not be inspected."))
+        XCTAssertNotNil(store.readOnlyReason)
+    }
+
+    @MainActor
+    func testFreshSessionExceptionNeverOverridesExplicitExternalOwnership() async throws {
+        let runtime = FakeHermesEmbeddedRuntime()
+        runtime.ownershipBySession["fresh-live"] = .external(surface: "telegram")
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("fresh-live")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [client])
+
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        await store.send("must not bypass explicit ownership")
+
+        XCTAssertFalse(store.activeSessionWritable)
+        XCTAssertEqual(store.activeSessionActivity, .externallyActive(surface: "telegram"))
+        XCTAssertFalse(client.calls.contains(where: { $0.method == "prompt.submit" }))
+    }
+
+    @MainActor
+    func testPrepareInvalidatesFreshSessionRegistryException() async throws {
+        let runtime = FakeHermesEmbeddedRuntime()
+        runtime.ownershipBySession["fresh-live"] = .unknown("Session activity could not be inspected.")
+        let client = FakeHermesGatewayClient(readyImmediately: true)
+        client.resultByMethod["session.create"] = .object(["session_id": .string("fresh-live")])
+        client.resultByMethod["session.active_list"] = .object(["sessions": .array([])])
+        let store = makeStore(runtime: runtime, clients: [client])
+
+        _ = try await store.startNewAgent(profile: bernd, configuration: configuration)
+        await store.prepare(configuration: configuration)
+        await store.send("must not survive a new overlay lifecycle")
+
+        XCTAssertFalse(store.activeSessionWritable)
+        XCTAssertFalse(client.calls.contains(where: { $0.method == "prompt.submit" }))
+    }
+
+    @MainActor
     func testStreamingReasoningToolsAndCompletionUpdateTranscript() async throws {
         let runtime = FakeHermesEmbeddedRuntime()
         let client = FakeHermesGatewayClient(readyImmediately: true)

@@ -152,6 +152,7 @@ public final class HermesAgentStore: ObservableObject {
     private var didReapOrphanedSidecars = false
     private var hermesAutoApprove = false
     private var pendingResponseLease: PendingRequestLease?
+    private var freshSessionLease: FreshSessionLease?
     private var pendingRequestInbox: [PendingRequestInboxEntry] = []
     private var retiredAutoApprovalFingerprints: [RetiredAutoApprovalFingerprint] = []
     private var blockedApprovalRecovery: BlockedApprovalRecovery?
@@ -163,6 +164,18 @@ public final class HermesAgentStore: ObservableObject {
         let generation: Int
         let profileID: String
         let clientIdentity: ObjectIdentifier
+    }
+
+    /// A session ID returned by `session.create` through this store's current
+    /// owned sidecar. Hermes may create `active_sessions.json` lazily, so the
+    /// first ownership read can be unavailable even though this exact session
+    /// did not exist before MTPLX created it. This lease is deliberately local
+    /// to one gateway/session lifecycle; it is never persisted or reused for a
+    /// resumed session.
+    private struct FreshSessionLease {
+        let sessionID: String
+        let sessionKey: String
+        let operation: GatewayOperation
     }
 
     private struct PendingRequestLease {
@@ -228,6 +241,7 @@ public final class HermesAgentStore: ObservableObject {
     }
 
     public func prepare(configuration: MTPLXAppConfiguration) async {
+        invalidateFreshSessionLease()
         lifecycleGeneration += 1
         let generation = lifecycleGeneration
         // A later explicit prepare is a new overlay lifetime. `stop()`
@@ -338,6 +352,9 @@ public final class HermesAgentStore: ObservableObject {
         profile: HermesProfile,
         configuration: MTPLXAppConfiguration
     ) async throws -> HermesSessionReference {
+        // A new agent selection is an explicit session boundary. Do not let a
+        // prior fresh-session lease survive if creation fails or is cancelled.
+        invalidateFreshSessionLease()
         let operation = try await ensureGateway(
             profile: profile,
             configuration: configuration,
@@ -365,6 +382,11 @@ public final class HermesAgentStore: ObservableObject {
         pendingRequest = nil
         clearAutoApprovalLifecycle()
         activeSessionKey = sessionKey
+        freshSessionLease = FreshSessionLease(
+            sessionID: sessionID,
+            sessionKey: sessionKey,
+            operation: operation
+        )
         applyActiveOwnership(.ready)
         connectionState = .connected
         return HermesSessionReference(
@@ -380,6 +402,8 @@ public final class HermesAgentStore: ObservableObject {
         profile: HermesProfile,
         configuration: MTPLXAppConfiguration
     ) async throws -> HermesSessionReference {
+        // Saved/native sessions never inherit the new-session exception.
+        invalidateFreshSessionLease()
         let operation = try await ensureGateway(
             profile: profile,
             configuration: configuration,
@@ -652,6 +676,9 @@ public final class HermesAgentStore: ObservableObject {
             }
             return operation
         }
+        // Replacing the sidecar/client ends any local proof that a fresh
+        // session remains exclusive to this store.
+        invalidateFreshSessionLease()
         let reconnectingBlockedApprovalPipeline = approvalPipelineBlocked && preserveBlockedApprovalRecovery
         if approvalPipelineBlocked && !reconnectingBlockedApprovalPipeline {
             // An explicit profile/session boundary must discard old recovery
@@ -867,6 +894,7 @@ public final class HermesAgentStore: ObservableObject {
         self.sidecar = nil
         sidecarProfileName = nil
         sidecarConfigurationSignature = nil
+        invalidateFreshSessionLease()
         gatewayReady = false
         endStreaming()
         expectedClient.close()
@@ -888,6 +916,7 @@ public final class HermesAgentStore: ObservableObject {
         sidecar = nil
         sidecarProfileName = nil
         sidecarConfigurationSignature = nil
+        invalidateFreshSessionLease()
         gatewayReady = false
         endStreaming()
         pendingRequest = nil
@@ -912,6 +941,7 @@ public final class HermesAgentStore: ObservableObject {
         else { throw HermesGatewayClientError.malformedResponse }
         activeSessionID = sessionID
         activeSessionKey = object["resumed"]?.stringValue ?? savedSessionID
+        invalidateFreshSessionLease()
         activeSessionTitle = title
         endStreaming()
         pendingRequest = nil
@@ -950,14 +980,36 @@ public final class HermesAgentStore: ObservableObject {
             return false
         }
         let primary = ownership(for: sessionID, profile: profile)
-        let resolved: HermesSessionOwnership
+        var resolved: HermesSessionOwnership
         if let liveID = activeSessionID, liveID != sessionID {
             resolved = mostRestrictive(primary, ownership(for: liveID, profile: profile))
         } else {
             resolved = primary
         }
+        if case .unknown = resolved,
+           hasFreshSessionLease(for: profile) {
+            // `session.create` allocated this exact session through the
+            // currently-owned sidecar. A missing lazy registry must not block
+            // its own prompts, but explicit external activity remains more
+            // restrictive above and is never overridden here.
+            resolved = .ownedByMTPLX
+        }
         applyActiveOwnership(resolved)
         return activeSessionWritable
+    }
+
+    private func hasFreshSessionLease(for profile: HermesProfile) -> Bool {
+        guard let lease = freshSessionLease,
+              activeSessionID == lease.sessionID,
+              activeSessionKey == lease.sessionKey,
+              profile.id == lease.operation.profileID,
+              isCurrent(lease.operation, sessionID: lease.sessionID)
+        else { return false }
+        return true
+    }
+
+    private func invalidateFreshSessionLease() {
+        freshSessionLease = nil
     }
 
     private func ownership(for sessionID: String, profile: HermesProfile) -> HermesSessionOwnership {
