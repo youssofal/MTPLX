@@ -393,6 +393,10 @@ public struct HermesIntegration: Sendable {
         env["OPENAI_API_KEY"] = apiKey
         env["HERMES_MODEL"] = modelID
         env["HERMES_INFERENCE_MODEL"] = modelID
+        // Hermes gives a profile's persisted model.provider precedence over
+        // HERMES_INFERENCE_PROVIDER.  MTPLX must use the explicit TUI override
+        // so an embedded launch never inherits (for example) openai-codex.
+        env["HERMES_TUI_PROVIDER"] = "custom"
         env["HERMES_INFERENCE_PROVIDER"] = "custom"
         env["HERMES_MTPLX_REASONING"] = reasoning
         env["HERMES_MTPLX_SHOW_REASONING"] = reasoning == "off" ? "0" : "1"
@@ -461,6 +465,7 @@ public struct HermesIntegration: Sendable {
         processEnvironment["OPENAI_API_KEY"] = apiKey
         processEnvironment["HERMES_MODEL"] = modelID
         processEnvironment["HERMES_INFERENCE_MODEL"] = modelID
+        processEnvironment["HERMES_TUI_PROVIDER"] = "custom"
         processEnvironment["HERMES_INFERENCE_PROVIDER"] = "custom"
         processEnvironment["HERMES_DASHBOARD_SESSION_TOKEN"] = token
         processEnvironment["HERMES_SESSION_PLATFORM"] = "mtplx-app"
@@ -1489,6 +1494,7 @@ public struct HermesIntegration: Sendable {
         OPENAI_API_KEY=\(dotenvQuote(apiKey))
         HERMES_MODEL=\(dotenvQuote(modelID))
         HERMES_INFERENCE_MODEL=\(dotenvQuote(modelID))
+        HERMES_TUI_PROVIDER=custom
         HERMES_INFERENCE_PROVIDER=custom
         HERMES_MTPLX_REASONING=\(dotenvQuote(reasoning))
         HERMES_MTPLX_SHOW_REASONING=\(reasoning == "off" ? "0" : "1")
@@ -1617,6 +1623,7 @@ public struct HermesIntegration: Sendable {
         export OPENAI_API_KEY=\(Self.shellQuote(env["OPENAI_API_KEY"] ?? ""))
         export HERMES_MODEL=\(Self.shellQuote(env["HERMES_MODEL"] ?? ""))
         export HERMES_INFERENCE_MODEL=\(Self.shellQuote(env["HERMES_INFERENCE_MODEL"] ?? ""))
+        export HERMES_TUI_PROVIDER=custom
         export HERMES_INFERENCE_PROVIDER=custom
         export HERMES_YOLO_MODE=\(Self.shellQuote(env["HERMES_YOLO_MODE"] ?? "1"))
         export HERMES_MTPLX_TOOLSETS=\(Self.shellQuote(env["HERMES_MTPLX_TOOLSETS"] ?? Self.codingToolsets))
