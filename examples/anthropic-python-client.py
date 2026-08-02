@@ -5,7 +5,7 @@ from anthropic import Anthropic
 
 client = Anthropic(
     api_key="local",
-    base_url="http://127.0.0.1:8000/v1",
+    base_url="http://127.0.0.1:8000",
 )
 
 message = client.messages.create(

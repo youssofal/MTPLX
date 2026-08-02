@@ -1,6 +1,6 @@
 # Install MTPLX
 
-MTPLX is early production software for Apple Silicon Macs.
+MTPLX is production software for Apple Silicon Macs, distributed via pip, Homebrew, and a signed DMG.
 
 ## Requirements
 
@@ -41,7 +41,7 @@ python -m pip install -e ".[dev,server]"
 
 `mtplx --help`, `mtplx doctor`, `mtplx inspect`, and `mtplx init` are designed to work even before MLX is installed. Generation and serving require MLX and a verified model.
 
-The v0.1 default dependency path uses vanilla `mlx`. The opt-in `performance-cold` profile may require the MTPLX MLX fork until the custom-kernel work is upstreamed or extracted.
+MTPLX runs on stock PyPI MLX; no fork is required for any profile (the legacy `--strict-mlx-fork-assert` flag is a deprecated no-op).
 
 ## Optional Thermal Tools
 

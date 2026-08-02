@@ -1,6 +1,6 @@
 # Server
 
-The v0.1 server target is OpenAI-compatible local serving, with Anthropic
+The server target is OpenAI-compatible local serving, with Anthropic
 Messages compatibility available for coding harness smoke tests.
 
 ```bash
@@ -40,11 +40,14 @@ That helper disables Open WebUI's Ollama probe and background task generations
 so MTPLX only serves visible chat turns by default.
 
 For Anthropic Messages-compatible clients, point the client base URL at the
-same local server root:
+bare server root — no `/v1` suffix:
 
 ```text
-http://127.0.0.1:8000/v1
+http://127.0.0.1:8000
 ```
+
+The Anthropic SDK appends `/v1/messages` itself; a `/v1` base would request
+`/v1/v1/messages`, which is not a registered route.
 
 ## Android Studio
 

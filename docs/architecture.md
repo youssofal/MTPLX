@@ -20,4 +20,4 @@ flowchart TB
     server --> backend
 ```
 
-The speculative sampler should remain backend-agnostic. Backends provide proposal and verification mechanics for a specific model family.
+The speculative sampler should remain backend-agnostic. Backends provide proposal and verification mechanics for a specific model family. The backend node above stands for the whole family set — Qwen3-Next (the promoted default), DeepSeek MTP, DeepSeek-V4, GLM, Hy-V3, MiMo, Nemotron-H, Step3.5, and Gemma4, plus the Laguna AR-only route.

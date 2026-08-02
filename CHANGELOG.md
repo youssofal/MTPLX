@@ -33,6 +33,108 @@ All notable user-facing changes to MTPLX. The format is based on
   for every served model, and the settings are configurable from the macOS app
   and persist in `~/.mtplx/config.toml` as `embedding_models`,
   `reranker_models`, and `retrieval_max_resident`.
+
+## [2.4.2] - 2026-08-02
+
+The agentic-cache release: the session cache stops losing warm state
+mid-run, tool-turn commits stop being ghosts, every serve keeps a durable
+per-request trail by default, an experimental DeepSeek-V4-Flash backend
+lands, and the documentation now matches the code everywhere it was
+audited.
+
+### Added
+
+- DeepSeek-V4-Flash: experimental native AR backend
+  (`model_type: deepseek_v4`) — Hyper-Connections, compressed sparse
+  attention, hash-routed MoE, grouped output-LoRA — loading the
+  mlx-community checkpoints directly, with an optional single-block MTP
+  speculative lane when the checkpoint carries `mtp.0.*` weights
+  (spec == AR gated; K=1-3 measured up to 2.28x on the 2bit-DQ build).
+  MTP-declaring checkpoints that ship no draft weights degrade to AR
+  with a clear message instead of failing at bind. Thanks @davidtai
+  (#216).
+- Request log, default on: every serve writes numeric/hash per-request
+  telemetry to `~/.mtplx/logs/request-log-<port>.jsonl` (64 MB x 4
+  rotation; no prompt or completion content; disable with
+  `MTPLX_REQUEST_LOG_JSONL=off`). Pairs with 2.4.1's opt-in bit-exact
+  request capture to make agent-session incidents diagnosable after the
+  fact (#196/#197). New helpers: `scripts/gauntlet_scoreboard.py`
+  per-session summarizer, `scripts/oc_tap.py` recording proxy and
+  `scripts/oc_tap_diff.py` request-mutation analyzer for content-level
+  wire truth.
+- Session bank, active-session eviction protection: sessions that
+  touched the bank within `MTPLX_SESSION_BANK_ACTIVE_PIN_TTL_S`
+  (default 600 s) are eviction-last, so cross-session pressure evicts
+  idle victims instead of the session that is mid-run.
+- Session bank, newest-K per-session snapshot retention
+  (`MTPLX_SESSION_BANK_PER_SESSION_MAX_ENTRIES`, default 3): divergent
+  per-turn sibling snapshots no longer accumulate unreclaimed.
+  `/health` now reports active sessions, the pin TTL, and recent
+  evictions.
+- Postcommit foreground grace (`MTPLX_POSTCOMMIT_FOREGROUND_GRACE_S`,
+  default 2 s): a nearly-finished background cache commit lands instead
+  of being preempted by the next fast agent-loop request.
+- Session identity honors `x-session-affinity` / `x-session-id` request
+  headers (OpenCode sends these per request), ending cross-request
+  identity churn on that client.
+
+### Fixed
+
+- Tool-turn "ghost re-prefills": the tool-rewrite async commit rendered
+  a canonical history that matched neither the generation nor the next
+  prompt, burning full-history re-forwards (26.8 s observed) without
+  ever storing. It is disabled pending a byte-proven canonical render
+  (`MTPLX_IDLE_POSTCOMMIT_TOOL_REWRITE` re-enables);
+  store-on-prefill and block salvage cover the lane.
+- The bridge's convergence guard now states explicitly that editing and
+  verification tools remain allowed and that its restriction covers
+  only the current reply — a model read the old wording as a
+  session-wide tool ban and stalled an entire session.
+- `mtplx profile thermal`, `profile eval-attribution`,
+  `profile dispatch --trace`, and `thermal fanmax-run` invoked
+  research-workspace scripts that are not part of the distribution, and
+  `--dry-run` printed those phantom paths as runnable commands. They
+  now report availability honestly (exit 2, machine-readable
+  `available: false`) and run the real script when present.
+- `mtplx doctor`: Python floor corrected to 3.11 (matching
+  `requires-python`); remediation texts no longer tell end users to
+  edit source constants or to move a healthy server off its port;
+  `--port` is documented and, when passed explicitly, aims the server
+  connectivity checks.
+- Session-bank near-prefix restores on backends with bounded rollback
+  (DeepSeek-V4) pre-check `max_rollback` and fall back to a cold
+  prefill instead of raising (#216).
+- Help surfaces match their own parsers: the onboarding help no longer
+  promises a Turbo wizard choice that does not exist (Turbo
+  auto-selects for the quantized flagships), `--strict-cold` names the
+  enforced 59 tok/s gate, `--open-dashboard` opens alongside the chosen
+  client (as it always did), and the command reference teaches
+  `mtplx <command> --help`, which also works for multi-word commands.
+
+### Documentation
+
+- Full truth sweep: ~450 documentation claims reconciled against the
+  code across 27 files. Highlights: INSTALL.md no longer references an
+  MLX fork removed in 2.0.0; turbo-verify.md no longer calls the
+  shipped default "experimental, off by default" nor excludes the
+  6-bit lane that ships; the Anthropic base-URL instruction (docs and
+  the canonical example) no longer 404s; `/metrics` no longer claims a
+  Prometheus mode that never existed; the README modes table shows
+  Turbo as the default for the quantized 27B/9B flagships; the Laguna
+  memory requirement states the real ~85.3 GiB preflight gate;
+  version-era staleness ("v0.1", "preview", v0.3.x runbook pins) is
+  cleared; historical release notes gain bracketed corrections where
+  they documented commands that never worked. Thanks
+  @PhilipJohnBasile for #218 (removed the unsupported MTP-sidecar
+  graft guidance; seeded by #215).
+- Dependency-record correction: the transformers pin has been
+  `<5.14,!=5.13.0` since shortly after 2.0.0; the changelog never
+  recorded the relaxation from `<5.13`.
+
+### Dependencies
+
+- pypa/gh-action-pypi-publish 1.14.1 -> 1.14.2 (#217).
+
 ## [2.4.1] - 2026-08-01
 
 The smooth-streaming release: the app's chat render path is overhauled
@@ -755,4 +857,17 @@ working as one product. Full notes:
   completions, and Anthropic `stop_sequences`) and `/v1/completions`
   streams tokens as they are generated with real finish reasons.
 
-[1.0.0]: https://github.com/youssofal/mtplx/releases/tag/v1.0.0
+[2.4.2]: https://github.com/youssofal/MTPLX/releases/tag/v2.4.2
+[2.4.1]: https://github.com/youssofal/MTPLX/releases/tag/v2.4.1
+[2.4.0]: https://github.com/youssofal/MTPLX/releases/tag/v2.4.0
+[2.3.0]: https://github.com/youssofal/MTPLX/releases/tag/v2.3.0
+[2.2.0]: https://github.com/youssofal/MTPLX/releases/tag/v2.2.0
+[2.1.0]: https://github.com/youssofal/MTPLX/releases/tag/v2.1.0
+[2.0.2]: https://github.com/youssofal/MTPLX/releases/tag/v2.0.2
+[2.0.1]: https://github.com/youssofal/MTPLX/releases/tag/v2.0.1
+[2.0.0]: https://github.com/youssofal/MTPLX/releases/tag/v2.0.0
+[1.0.4]: https://github.com/youssofal/MTPLX/releases/tag/v1.0.4
+[1.0.3]: https://github.com/youssofal/MTPLX/releases/tag/v1.0.3
+[1.0.2]: https://github.com/youssofal/MTPLX/releases/tag/v1.0.2
+[1.0.1]: https://github.com/youssofal/MTPLX/releases/tag/v1.0.1
+[1.0.0]: https://github.com/youssofal/MTPLX/releases/tag/v1.0.0

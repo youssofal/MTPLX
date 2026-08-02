@@ -8,4 +8,4 @@ Use this folder for implementation notes that are specific to the MTPLX runtime:
 - Correct stochastic speculative sampling notes.
 - Verify-ratio and GDN kernel notes.
 
-Current default runtime target: `models/Qwen3.6-27B-MTPLX-GDN8-Speed4`. Treat flat 4-bit community artifacts as controls only.
+Current default runtime target: `models/Qwen3.6-27B-MTPLX-Optimized-Speed`. Treat flat 4-bit community artifacts as controls only.

@@ -550,8 +550,10 @@ def _model_gate_error_lines(inspection: dict[str, Any]) -> list[str]:
         )
     if runtime_compatibility == "missing-mtp-weights":
         lines.append(
-            "fix: choose a model with real MTP weights, or graft an MTP sidecar "
-            "into this base model."
+            "fix: use a complete model with matching MTP weights, or build and "
+            "verify one from its original source with mtplx forge. MTPLX does not "
+            "attach arbitrary sidecars because config/tensor checks cannot prove "
+            "their trunk lineage."
         )
     elif compatibility.get("tier") == TIER_ARCH_COMPATIBLE_UNVERIFIED:
         lines.append(
@@ -1971,6 +1973,12 @@ def _build_doctor_report(args: Any) -> dict[str, Any]:
         model_cache=getattr(args, "model_cache", None),
         include_startup_default_model="model-cache" not in cli_flags,
         deep=bool(getattr(args, "deep", False)),
+        # An explicit --port aims the server checks; the bare default (8008)
+        # exists for the topic bridges and must not move the server probe off
+        # the shipped :8000 default.
+        server_port=(
+            int(getattr(args, "port", 8000)) if "port" in cli_flags else 8000
+        ),
         mlx_info=env.get("mlx") if isinstance(env.get("mlx"), dict) else None,
         thermal_control=thermal_control,
         server_dependencies=server_deps if getattr(args, "deep", False) else None,
@@ -6996,7 +7004,10 @@ def _cmd_qa_exactness(args: Any) -> int:
                 print(f"detail: {stripped[:240]}")
                 break
     print(f"output: {output}")
-    print("try: mtplx qa exactness --exactness-attention-impl mlx_vector_paged")
+    print(
+        "try: a different --exactness-attention-impl "
+        "(run `mtplx qa exactness --help` for the choices)"
+    )
     return EXIT_EXACTNESS
 
 
@@ -7070,15 +7081,48 @@ def cmd_profile_public(args: Any) -> int:
     raise SystemExit(f"unknown profile action: {args.profile_action}")
 
 
+def _research_script(name: str) -> Path | None:
+    """Resolve a research-workspace helper script, or None when not shipped.
+
+    Several diagnostic subcommands drive scripts that live in the MTPLX
+    research workspace and are not part of the distributed package (a wheel
+    install has no scripts/ tree at all). Resolving through this check keeps
+    those commands honest: run the real script, or say exactly why not —
+    never hand python3 a phantom path.
+    """
+    candidate = repo_root() / "scripts" / name
+    return candidate if candidate.is_file() else None
+
+
+def _research_script_unavailable(action: str, script: str) -> int:
+    _print(
+        {
+            "action": action,
+            "available": False,
+            "reason": (
+                f"scripts/{script} is a research-workspace tool and is not "
+                "included in this installation"
+            ),
+            "hint": "Run from an MTPLX source checkout that provides this script.",
+        }
+    )
+    return 2
+
+
 def _cmd_profile_dispatch(args: Any) -> int:
+    trace_script = _research_script("analyze_metal_command_trace.py")
     if args.trace:
+        if trace_script is None:
+            return _research_script_unavailable(
+                "profile dispatch --trace", "analyze_metal_command_trace.py"
+            )
         out_dir = Path(args.output_dir or "outputs/cli/dispatch") / time.strftime(
             "%Y%m%d-%H%M%S"
         )
         proc = subprocess.run(
             [
                 sys.executable,
-                str(repo_root() / "scripts" / "analyze_metal_command_trace.py"),
+                str(trace_script),
                 args.trace,
                 "--out-dir",
                 str(out_dir),
@@ -7095,16 +7139,27 @@ def _cmd_profile_dispatch(args: Any) -> int:
             "suite": args.suite,
             "max_tokens": args.max_tokens,
             "implemented_capture": False,
-            "next": "Run with --trace PATH to analyze an existing MLX Metal command trace.",
+            "next": (
+                "Run with --trace PATH to analyze an existing MLX Metal command trace."
+                if trace_script is not None
+                else "Trace analysis needs the research-workspace script "
+                "scripts/analyze_metal_command_trace.py, which is not included "
+                "in this installation."
+            ),
         }
     )
     return 0
 
 
 def _cmd_profile_thermal(args: Any) -> int:
+    script = _research_script("run_flappy_smc_thermal_diagnostics.py")
+    if script is None:
+        return _research_script_unavailable(
+            "profile thermal", "run_flappy_smc_thermal_diagnostics.py"
+        )
     cmd = [
         sys.executable,
-        str(repo_root() / "scripts" / "run_flappy_smc_thermal_diagnostics.py"),
+        str(script),
         "--model",
         args.model,
         "--run-id",
@@ -7249,9 +7304,14 @@ def _cmd_profile_eval_attribution(args: Any) -> int:
             / f"eval-attribution-{time.strftime('%Y%m%d-%H%M%S')}.json"
         )
     )
+    script = _research_script("probe_eval_attribution.py")
+    if script is None:
+        return _research_script_unavailable(
+            "profile eval-attribution", "probe_eval_attribution.py"
+        )
     cmd = [
         sys.executable,
-        str(repo_root() / "scripts" / "probe_eval_attribution.py"),
+        str(script),
         "--model",
         args.model,
         "--prefix-tokens",
@@ -7333,9 +7393,14 @@ def cmd_thermal_public(args: Any) -> int:
         run_id,
         "--fanmax",
     ]
+    script = _research_script("run_fanmax_command.py")
+    if script is None:
+        return _research_script_unavailable(
+            "thermal fanmax-run", "run_fanmax_command.py"
+        )
     cmd = [
         sys.executable,
-        str(repo_root() / "scripts" / "run_fanmax_command.py"),
+        str(script),
         "--output-dir",
         args.output_dir or "outputs/cli/fanmax",
         "--",

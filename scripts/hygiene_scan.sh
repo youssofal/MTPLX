@@ -76,6 +76,13 @@ record_model_artifact() {
     apps/MTPLXApp/Sources/MTPLXAppCore/Resources/*|./apps/MTPLXApp/Sources/MTPLXAppCore/Resources/*)
       return 0
       ;;
+    # The deepseek_v4 parity suite gates the whole forward against a 2.3 MB
+    # deterministic golden (toy dims, float32 arrays, no pickled objects) —
+    # a test fixture, not a checkpoint. Exempted by exact path; everything
+    # else under tests/ stays forbidden.
+    tests/fixtures/deepseek_v4_parity_golden.npz|./tests/fixtures/deepseek_v4_parity_golden.npz)
+      return 0
+      ;;
   esac
   case "$path" in
     *.safetensors|*.gguf|*.mlx|*.bin|*.npz|*.npy)

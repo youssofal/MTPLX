@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .artifacts import inspect_model, load_config
+from .artifacts import inspect_model, load_config, mtp_weights_present_on_disk
 from .mtp_adapters import (
     install_saved_mtp_lora_adapter,
     merge_installed_mtp_lora_adapters,
@@ -592,6 +592,10 @@ def load(
                 "[proj-quant] requantized %d trunk *_proj modules to %s",
                 len(touched), proj_requant,
             )
+    if str((config or {}).get("model_type") or "").lower() == "deepseek_v4":
+        from .models.deepseek_v4 import configure_deepseek_v4_moe_tail
+
+        configure_deepseek_v4_moe_tail(model, config)
     runtime_metadata = _load_runtime_metadata(path)
     contract = (
         (contract or MTPContract())
@@ -606,9 +610,21 @@ def load(
         from .nemotron_h_mtp_patch import inject_nemotron_h_mtp_support, is_nemotron_h_mtp_config
         from .step3p5_mtp_patch import inject_step3p5_mtp_support
         from .hy_v3_mtp_patch import inject_hy_v3_mtp_support, is_hy_v3_mtp_config
+        from .models.deepseek_v4 import (
+            inject_deepseek_v4_mtp_support,
+            is_deepseek_v4_mtp_config,
+        )
         from .qwen3_5_mtp_patch import inject_qwen3_5_mtp_support
 
-        if is_nemotron_h_mtp_config(config):
+        if is_deepseek_v4_mtp_config(config):
+            # Native draft head: the block binds through the ordinary load path
+            # and the model already carries the runtime surface, so this only
+            # publishes it. Placed ahead of is_deepseek_mtp_config defensively --
+            # that predicate keys on model_type in {deepseek_v3, deepseek_v32,
+            # glm_moe_dsa}, so it cannot match a deepseek_v4 config today, but it
+            # is the arm that would build a V3 head if the sets ever overlap.
+            mtp_enabled = inject_deepseek_v4_mtp_support(model, path, config, contract)
+        elif is_nemotron_h_mtp_config(config):
             mtp_enabled = inject_nemotron_h_mtp_support(model, path, config, contract)
         elif is_mimo_mtp_config(config):
             mtp_enabled = inject_mimo_mtp_support(model, path, config, contract)
@@ -624,8 +640,22 @@ def load(
             mtp_enabled = inject_deepseek_mtp_support(model, path, config, contract)
         else:
             mtp_enabled = inject_mtp_support(model, path, config, contract)
-        if not mtp_enabled or not validate_mtp_support(model):
+        if mtp_enabled:
+            if not validate_mtp_support(model):
+                raise RuntimeError(f"MTP injection failed for {path}")
+        elif mtp_weights_present_on_disk(path, config):
+            # MTP weights ship with the model but injection could not use
+            # them: a genuine failure the operator should see.
             raise RuntimeError(f"MTP injection failed for {path}")
+        else:
+            # The config declares MTP layers but no MTP weights are present on
+            # disk (e.g. a quant conversion that dropped the draft head).
+            # Degrade to autoregressive rather than failing the load.
+            logger.warning(
+                "[MTP] %s declares MTP layer(s) but ships no MTP weights; "
+                "serving autoregressive (no speculative draft head).",
+                path,
+            )
     compiled_target_factory = None
     whole_moe_plan = None
     selfcheck_report = None
@@ -787,6 +817,10 @@ def _is_laguna_s_2_1_mlx_4bit_config(config: dict[str, Any]) -> bool:
 def _model_classes_for_config(config: dict[str, Any]) -> tuple[type, type] | None:
     """Return MTPLX-owned model classes for architectures missing in mlx-lm."""
 
+    if str(config.get("model_type") or "").lower() == "deepseek_v4":
+        from .models.deepseek_v4 import Model, ModelArgs
+
+        return Model, ModelArgs
     if not _is_laguna_s_2_1_mlx_4bit_config(config):
         return None
     from .models.laguna import Model, ModelArgs

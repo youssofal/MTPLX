@@ -313,6 +313,62 @@ def expected_mtp_file(model_dir: Path | str, config: dict[str, Any] | None = Non
     return model_path / "mtp.safetensors"
 
 
+def mtp_weights_present_on_disk(
+    model_dir: Path | str, config: dict[str, Any] | None = None
+) -> bool:
+    """Whether a model that declares MTP layers actually ships MTP weights.
+
+    A conversion can declare ``num_nextn_predict_layers`` in the config while
+    dropping the MTP weights themselves (e.g. the DeepSeek-V4-Flash 2bit-DQ
+    build). The runtime uses this probe to tell that benign case (config field
+    only -> degrade to autoregressive) apart from a genuine injection failure
+    (weights present but unusable -> raise).
+
+    Conservative by design: it only returns ``False`` when it can *positively*
+    confirm absence via a shard index that carries no MTP-shaped keys under any
+    known naming convention. A sidecar file, a missing/unreadable index, or any
+    ambiguity returns ``True`` so the existing injection + validation path runs
+    unchanged and a real detection bug on an MTP-bearing model still surfaces.
+    """
+    model_path = Path(model_dir)
+    config = config if config is not None else load_config(model_path)
+
+    # 1. Explicit MTP sidecar file (Qwen/GLM/hy3 external draft head).
+    if expected_mtp_file(model_path, config).exists():
+        return True
+
+    index_path = model_path / "model.safetensors.index.json"
+    if not index_path.exists():
+        # No index to inspect: cannot prove absence, preserve legacy behavior.
+        return True
+    try:
+        weight_map = json.loads(index_path.read_text(encoding="utf-8")).get(
+            "weight_map", {}
+        )
+    except Exception:
+        return True
+    keys = [str(k) for k in weight_map]
+
+    # 2. Namespaced embedded MTP weights ("mtp.*" / "language_model.mtp.*").
+    if any(is_mtp_key(k) for k in keys):
+        return True
+
+    # 3. DeepSeek-style trailing MTP decoder layer(s) appended after the trunk:
+    #    model.layers.{num_hidden_layers + i}.*
+    start = int(
+        text_config(config).get("num_hidden_layers")
+        or config.get("num_hidden_layers")
+        or 0
+    )
+    count = _num_mtp_layers(config)
+    if start and count:
+        wanted = tuple(f"model.layers.{start + i}." for i in range(count))
+        if any(k.startswith(wanted) for k in keys):
+            return True
+
+    return False
+
+
 @dataclass(frozen=True)
 class TensorInfo:
     key: str

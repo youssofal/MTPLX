@@ -18,8 +18,8 @@ python3 -m pip install -U mtplx
 The GitHub release wheel remains available for reproducible installs:
 
 ```bash
-gh release download v0.3.0 --repo youssofal/mtplx --pattern 'mtplx-0.3.0-py3-none-any.whl'
-python3 -m pip install ./mtplx-0.3.0-py3-none-any.whl
+gh release download --repo youssofal/mtplx --pattern '*.whl'   # latest tagged release
+python3 -m pip install ./mtplx-*-py3-none-any.whl
 ```
 
 The commands above are no-MLX-safe except generation and serving. A missing MLX runtime should appear in `doctor` as an actionable dependency issue, not a traceback.
@@ -40,7 +40,9 @@ MTP runtime stays loaded, so terminal chat can use `/mtp off`, `/mtp on`, and
 construction because there is no MTP head to retain.
 
 The Laguna download is pinned automatically. It needs about 64.13 GB of disk
-space and at least 96 GiB unified memory; 128 GiB is recommended. Its default
+space, and the runtime's admission gate requires ≈85.3 GiB of unified memory
+(weights plus runtime headroom and a 16 GiB system reserve) — in practice a
+96 GB Mac, with 128 GB comfortable. Its default
 context and maximum response are 32,768 tokens. A larger explicit server
 context is accepted only when it fits the active Metal resident-memory cap.
 

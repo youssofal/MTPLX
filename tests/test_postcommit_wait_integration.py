@@ -265,6 +265,10 @@ def test_wait_times_out_when_postcommit_hangs(monkeypatch: pytest.MonkeyPatch) -
 def test_running_idle_postcommit_yields_to_queued_foreground(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Strict immediate-yield semantics (2026-07-02 starvation guard) are
+    # preserved behind grace=0; the default bounded grace is covered by
+    # test_running_idle_postcommit_finishes_within_foreground_grace below.
+    monkeypatch.setenv("MTPLX_POSTCOMMIT_FOREGROUND_GRACE_S", "0")
     scheduler = openai.ModelWorkScheduler(name="postcommit-yield-test", idle_grace_s=0.0)
     state = SimpleNamespace(
         lock=threading.Lock(),
@@ -492,3 +496,61 @@ def test_common_prefix_reuse_requires_threshold() -> None:
 
     assert source == "new"
     assert session_id != "sess-short"
+
+
+def test_running_idle_postcommit_finishes_within_foreground_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 2026-08-01: in real agent loops the next request arrives within ~0.5s,
+    # which preempted every tool-turn commit and forced a 2-4k-token salvage
+    # re-prefill per turn. A short commit now finishes inside the bounded
+    # grace even with foreground queued; the foreground still runs right
+    # after (delay bounded by the grace, not unbounded starvation).
+    monkeypatch.setenv("MTPLX_POSTCOMMIT_FOREGROUND_GRACE_S", "5")
+    scheduler = openai.ModelWorkScheduler(name="postcommit-grace-test", idle_grace_s=0.0)
+    state = SimpleNamespace(
+        lock=threading.Lock(),
+        has_foreground=lambda: False,
+        generation_executor=scheduler,
+        postcommit_executor=None,
+        model_scheduler=scheduler,
+        args=SimpleNamespace(server_console=True),
+    )
+    session = EngineSession("sess-grace")
+    started = threading.Event()
+    outcomes: list[dict] = []
+
+    def fake_store(*_args, **kwargs):
+        started.set()
+        abort_check = kwargs["abort_check"]
+        deadline = time.monotonic() + 0.4
+        while time.monotonic() < deadline:
+            if abort_check():
+                outcome = {
+                    "stored": False,
+                    "mode": "aborted",
+                    "reason": kwargs["abort_reason"](),
+                }
+                outcomes.append(outcome)
+                return outcome
+            time.sleep(0.01)
+        outcome = {"stored": True, "mode": "retokenized_history"}
+        outcomes.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(openai, "_store_retokenized_history_snapshot", fake_store)
+    monkeypatch.setattr(openai, "_server_console_enabled", lambda _state: True)
+
+    try:
+        openai._schedule_idle_postcommit_snapshot(state, **_kwargs(session=session))
+        assert started.wait(timeout=2.0)
+
+        foreground_ran = threading.Event()
+        foreground = scheduler.submit_foreground(lambda: foreground_ran.set())
+        foreground.result(timeout=5.0)
+
+        assert foreground_ran.is_set()
+        assert outcomes
+        assert outcomes[-1] == {"stored": True, "mode": "retokenized_history"}
+    finally:
+        scheduler.shutdown(wait=True, cancel_futures=True)

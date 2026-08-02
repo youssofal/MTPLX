@@ -1,6 +1,6 @@
 # MTP Forge — Backend CLI + Provenance Contract
 
-This document is the single source of truth between the MTPLX macOS app (frontend, lives under `apps/MTPLXApp/`) and the Python implementation of the `mtplx forge` CLI subcommand family (backend). It is the spec the frontend was written against — it does not describe what exists today (those CLIs do not yet exist), it describes what the frontend expects when invoked.
+This document is the single source of truth between the MTPLX macOS app (frontend, lives under `apps/MTPLXApp/`) and the Python implementation of the `mtplx forge` CLI subcommand family (backend). It is the spec the frontend was written against — originally authored ahead of the backend; the `mtplx forge` subcommand family now ships (probe, build, discover, publish, inspect, verify, cancel), and this document remains the contract reference both sides are held to.
 
 If the spec changes, this file is the place to amend it. The frontend's Swift wrappers (`ForgeBuilder.swift`, `HFPublisher.swift`, `ForgeDiscoveryService.swift`, `HuggingFaceProbe.forgeProbe`) all parse against the shapes documented below.
 
@@ -22,13 +22,13 @@ All commands are subcommands of `mtplx forge`. The frontend resolves the `mtplx`
 | `forge inspect <path> --json` | Dump a local artifact's `mtplx_runtime.json`. | optional V1 | reserved |
 | `forge cancel <run_id>` | Best-effort SIGTERM of an in-flight `build` or `publish`. | optional | belt-and-braces for crashed-frontend recovery |
 
-### Universal flags
+### Shared flags (per-subcommand, not universal)
 
-Where applicable, every long-running subcommand accepts:
+- `--out <output-dir>` — root directory; required on `build` and `publish`, optional on `verify`. Frontend always passes `$TMPDIR/mtplx-forge` (build) or `$TMPDIR/mtplx-forge-publish` (publish).
+- `--run-id <id>` — required on `build` and `publish`, optional on `verify`. Frontend-generated UUID prefix (`mtplx-forge-` / `mtplx-forge-publish-` + 8 hex chars). The combined run dir is `<output-dir>/<run-id>/`.
+- `--max` — pin fans at max via the existing ThermalForge integration; `build` and `verify` only (`publish` takes no `--max`). Build always passes this when the user opted in.
 
-- `--out <output-dir>` — root directory; frontend always passes `$TMPDIR/mtplx-forge` (build) or `$TMPDIR/mtplx-forge-publish` (publish).
-- `--run-id <id>` — frontend-generated UUID prefix (`mtplx-forge-` / `mtplx-forge-publish-` + 8 hex chars). The combined run dir is `<output-dir>/<run-id>/`.
-- `--max` — pin fans at max via the existing ThermalForge integration. Build always passes this when the user opted in.
+`probe`, `inspect`, and `cancel` take none of these flags.
 
 ### Argv-only secrets
 
@@ -50,6 +50,7 @@ Frontend polls each known file every 500 ms via `FileManager.fileExists` + a `JS
 ├── convert.json      # progress (0..1), label? ("to_mlx" | "quantize_body"), finished
 ├── calibrate.json    # progress (0..1), label? ("extract_mtp" | "requantize_mtp" | "pack_sidecar"), finished, loss?, ppl?
 ├── verify.json       # { rows: [ { depth, tok_s, multiplier_vs_ar, acceptance_by_position, verify_time_s } ] }
+├── build_outcome.json # phase, verdict, failure_reasons, message, diagnostic?, verify_rows, speed_evidence, ar_tok_s?, best_mtp_* , architecture_id?
 ├── brand.json        # { branded_name, runtime_metadata: { …full mtplx_runtime.json shape… } }
 └── forge.json        # { local_path, runtime_metadata: { …final mtplx_runtime.json… } }
 ```
@@ -166,19 +167,19 @@ On SIGINT / SIGTERM the backend should:
 
 ### Backend-not-available detection
 
-When the user is on a pre-Forge MTPLX install, argparse exits with code 2 and prints `argument: invalid choice 'forge'`. The frontend matches this exact pattern in stderr and surfaces a clean "Forge backend not available" empty state. Don't change the exit code or the error string without updating the matchers in `ForgeBuilder.swift:227` and `HFPublisher.swift:170`.
+When the user is on a pre-Forge MTPLX install, argparse exits with code 2 and prints `argument: invalid choice 'forge'`. The frontend matches this exact pattern in stderr and surfaces a clean "Forge backend not available" empty state. Don't change the exit code or the error string without updating the invalid-choice matchers in `ForgeBuilder.swift` / `HFPublisher.swift` / `ForgeDiscoveryService.swift`.
 
 ---
 
 ## 3. `mtplx_runtime.json` schema
 
-The runtime metadata schema is **additive**. Every existing field stays in place (verified verbatim against `/Users/youssof/Documents/MTPLX/models/Qwen3.6-27B-MTPLX-GDN8-Speed4-CyanKiwiMTP/mtplx_runtime.json` and `/Users/youssof/Documents/MTPLX/models/Qwen3.6-27B-MTPLX-Flat4-CyanKiwiMTP/mtplx_runtime.json`). Forge **adds** a `forge_provenance` block and reuses the existing `speed_evidence` / `sampler` / `verified_on` blocks for verification numbers.
+The runtime metadata schema is **additive**. Every existing field stays in place (verified verbatim against `<build-machine>/MTPLX/models/Qwen3.6-27B-MTPLX-GDN8-Speed4-CyanKiwiMTP/mtplx_runtime.json` and `<build-machine>/MTPLX/models/Qwen3.6-27B-MTPLX-Flat4-CyanKiwiMTP/mtplx_runtime.json` — historical build-machine references kept as the verification record, not shipped paths). Forge **adds** a `forge_provenance` block and reuses the existing `speed_evidence` / `sampler` / `verified_on` blocks for verification numbers.
 
 ### Verified existing spine (do not rename)
 
 ```jsonc
 {
-  "mtplx_version": "0.1.0-preview",
+  "mtplx_version": "2.4.2",
   "arch_id": "qwen3-next-mtp",
   "mtp_depth_max": 3,
   "recommended_profile": "performance-cold",   // or "stable"
@@ -217,7 +218,7 @@ The runtime metadata schema is **additive**. Every existing field stays in place
       "mtp_source_path": "/..."
     },
     "forged_at": "2026-05-25T22:45:00+0100",     // ISO 8601 string (matches verified_on.timestamp convention)
-    "mtplx_version": "1.0.0",
+    "mtplx_version": "2.4.2",
     "forged_locally": true,
     "published_to_hf": null                      // or the nested object below
   }
@@ -280,10 +281,11 @@ Backend behaviour:
 
 ## 5. Reference pipelines (don't start from scratch)
 
-For the build pipeline, generalise the existing one-off scripts:
+For the build pipeline, generalise the existing one-off scripts (the paths
+below are historical build-machine references, not shipped package paths):
 
-- `/Users/youssof/Documents/MTPLX/scripts/build_flat4_cyankiwi_mtp_requant.py` — the 27B requant path that built `Qwen3.6-27B-MTPLX-Optimized-Speed`. Handles the MLX-affine → MLX-affine requantisation case (body bits picker, MTP sidecar repack, runtime_metadata write, trunk symlink). Forge's bf16Native / mlxAffine / mlxAffineWithMtp source-format paths all collapse to variations of this script.
-- (To be written) **35B compressed-tensors AWQ → MLX-affine** — genuinely new work. The existing 35B artifacts (`/Users/youssof/Documents/MTPLX/models/Qwen3.6-35B-A3B-MTPLX-Official-4bit-*`) already pass the MoE MTP gate (commits `939b537`, `9f5b7be`, `739415b`) so the runtime side is ready; only the conversion is missing.
+- `<build-machine>/MTPLX/scripts/build_flat4_cyankiwi_mtp_requant.py` — the 27B requant path that built `Qwen3.6-27B-MTPLX-Optimized-Speed`. Handles the MLX-affine → MLX-affine requantisation case (body bits picker, MTP sidecar repack, runtime_metadata write, trunk symlink). Forge's bf16Native / mlxAffine / mlxAffineWithMtp source-format paths all collapse to variations of this script.
+- (To be written) **35B compressed-tensors AWQ → MLX-affine** — genuinely new work. The existing 35B artifacts (`<build-machine>/MTPLX/models/Qwen3.6-35B-A3B-MTPLX-Official-4bit-*`) already pass the MoE MTP gate (commits `939b537`, `9f5b7be`, `739415b`) so the runtime side is ready; only the conversion is missing.
 
 ---
 
@@ -292,7 +294,8 @@ For the build pipeline, generalise the existing one-off scripts:
 Quantising MTP weights collapses MoE acceptance to **5-11%** (vs 79-85% with BF16 MTP). The frontend's PlanStage defaults `mtp_policy: keep_bf16` and surfaces a loud warning chip + checkbox if the user overrides to `requantize`. The backend MUST refuse a build whose recipe has `mtp_policy: requantize` UNLESS `--allow-degraded-mtp` is passed:
 
 ```bash
-mtplx forge build cyankiwi/X --recipe '{"mtp_policy":"requantize",...}'
+mtplx forge build --repo cyankiwi/X --out "$TMPDIR/mtplx-forge" --run-id mtplx-forge-01234567 \
+  --branded-name X-MTPLX-Speed --recipe '{"mtp_policy":"requantize",...}'
 # exits non-zero with: "MTP policy 'requantize' degrades acceptance; pass --allow-degraded-mtp to confirm"
 ```
 

@@ -18,6 +18,7 @@ from mtplx.generation import (
     _prefill_chunk_size,
     _prefill_committed_mtp_history_streaming,
     _sustained_prefill_layout,
+    _trim_cache_to_offset,
     generate_ar,
     generate_mtpk,
     restore_or_prefill_prompt_state,
@@ -143,6 +144,39 @@ class OffsetCache:
         self.offset -= n
         self.trimmed.append(n)
         return n
+
+
+def test_trim_cache_to_offset_preflights_all_bounded_entries_atomically():
+    from mtplx.models.deepseek_v4 import DeepseekV4Cache
+
+    first = DeepseekV4Cache(
+        window_size=16,
+        compress_ratio=0,
+        head_dim=8,
+        rollback_capacity=10,
+    )
+    second = DeepseekV4Cache(
+        window_size=16,
+        compress_ratio=0,
+        head_dim=8,
+        rollback_capacity=2,
+    )
+    first.offset = second.offset = 10
+    assert first.max_rollback == 10
+    assert second.max_rollback == 2
+
+    assert _trim_cache_to_offset([first, second], 5) is False
+    assert [first.offset, second.offset] == [10, 10]
+
+
+def test_trim_cache_to_offset_rejects_zero_delta_entry_without_trim_atomically():
+    first = OffsetCache()
+    first.offset = 10
+    second = SimpleNamespace(offset=5, trim=None)
+
+    assert _trim_cache_to_offset([first, second], 5) is False
+    assert first.offset == 10
+    assert first.trimmed == []
 
 
 class RejectingTinyMTPModel(AcceptingTinyMTPModel):

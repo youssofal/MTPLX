@@ -55,9 +55,11 @@ On a 16 GB M4 Mac mini, tuning the 9B model lands on depth 1: 14.4 tok/s baselin
 
 <img src="docs/assets/readme/app-forge.jpg" alt="Forge verifying a freshly built MTP model" width="100%" />
 
-Forge takes a Hugging Face repo and turns it into an MTPLX-ready MTP model: convert to MLX, train the MTP adapter, verify that the result is actually faster and still exact, and publish back to the Hub if you want to share it. The honest part matters: Forge measures before and after on your hardware and shows you the verdict ("Depth 1 is fastest: 227.1 to 296.1, 1.30x") rather than assuming the adapter helped. Available in the app and as `mtplx forge`.
+Forge takes a Hugging Face repo and turns it into an MTPLX-ready MTP model: convert to MLX, train the MTP adapter, verify that the result is actually faster and still exact, and publish back to the Hub if you want to share it. The honest part matters: Forge measures before and after on your hardware and shows you the verdict ("Depth 1 is fastest: 227.1 to 296.1, 1.30x") rather than assuming the adapter helped. Available in the app and as `mtplx forge` subcommands.
 
-The official catalog lives on Hugging Face under [Youssofal](https://huggingface.co/Youssofal): Qwen 3.5 (4B, 9B), Qwen 3.6 (27B, 35B MoE) in speed, balance, and quality builds, plus Gemma 4. The app recommends from these based on your hardware.
+MTPLX does not support attaching a separately supplied MTP sidecar to an arbitrary MLX trunk. Matching architecture fields, tensor shapes, or provenance labels cannot prove that the head was trained against those exact trunk weights. Use a complete model that already includes its matching MTP weights, or use Forge to build and verify an artifact from its original source checkpoint.
+
+The official catalog lives on Hugging Face under [Youssofal](https://huggingface.co/Youssofal): Qwen 3.5 (4B, 9B), Qwen 3.6 (27B, 35B MoE) in speed and quality builds (the 35B MoE adds a balance build), plus Gemma 4. The app recommends from these based on your hardware.
 
 ## The server
 
@@ -69,7 +71,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model":"mtplx","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
-Sessions survive: a warm-prefix session bank keeps multi-turn chats fast, and an optional SSD cache restores sessions near-instantly across restarts.
+Sessions survive: a warm-prefix session bank keeps multi-turn chats fast, and a default-on SSD session cache restores sessions near-instantly across restarts (disable with `--ssd-session-cache off`).
 
 ### Embeddings and reranking
 
@@ -107,20 +109,21 @@ mtplx pull <hf-repo>       # download a model safely
 mtplx models               # what is cached, sizes, validation
 mtplx inspect <model>      # compatibility report before anything runs
 mtplx tune --retune        # measure AR vs D1/D2/D3 on your Mac
-mtplx forge                # build, verify, and publish MTP models
+mtplx forge --help         # build, verify, and publish MTP models (probe/build/publish/verify subcommands)
 mtplx bench aime --quick   # run the AIME benchmark from the terminal
 mtplx doctor               # install and integration health
 mtplx max --install        # fan control (one sudo prompt, crash-safe)
 mtplx settings get/set     # read or change live server settings
 ```
 
-Every command takes `--json` and `--help`. The CLI works without MLX installed for everything that does not need a model, so `doctor` and `inspect` run on any machine.
+Every command takes `--help`, and most inspection/diagnostic commands take `--json`. The CLI works without MLX installed for everything that does not need a model, so `doctor` and `inspect` run on any machine.
 
 ## Modes
 
 | Mode | What it does | When |
 |---|---|---|
-| **Sustained** | Default. Long-context MTP path with chunked prefill and request-sized KV | Everyday use, big files, 16K-200K prompts |
+| **Turbo** | NAX verify kernels + compiled verify; the default for the quantized 27B and 9B flagship models | Picked automatically for those models |
+| **Sustained** | Default for all other models. Long-context MTP path with chunked prefill and request-sized KV | Everyday use, big files, 16K-200K prompts |
 | **Sustained Max** | Sustained with fans pinned at 100% | Long work where you want maximum cooling |
 | **Burst** | Legacy short-context benchmark lane, loud | Short prompts and benchmarks only |
 
@@ -128,7 +131,7 @@ Fan-backed modes restore your fans to automatic if MTPLX dies for any reason, in
 
 ## Compatibility, honestly
 
-`mtplx inspect` classifies models before anything runs: verified, architecture-compatible but unverified, AR-only, incompatible architecture, or no MTP heads at all. Unverified models refuse to run unless you explicitly force them. There are no silent fallbacks: if MTPLX cannot run a model correctly, it tells you instead of running it badly.
+`mtplx inspect` classifies models before anything runs: verified, family-compatible but unverified, architecture-compatible but unverified, AR-only, incompatible architecture, or no MTP heads at all. Unverified models load with an explicit unverified label. There are no silent fallbacks: if MTPLX cannot run a model correctly, it tells you instead of running it badly.
 
 [Laguna-S-2.1 oQ4e](https://huggingface.co/mlx-community/Laguna-S-2.1-oQ4e) is supported through its exact MLX architecture in target-only AR mode:
 
@@ -144,8 +147,10 @@ MTPLX pins that model to revision
 tokenizer, generation config, special tokens map, and Poolside chat template
 before admitting it. The checkpoint has no native MTP head, so an MTP launch is
 rejected before weights load instead of falling back during execution. The
-weights occupy 59.72 GiB (64.13 GB); use a Mac with at least 96 GiB unified
-memory (128 GiB is recommended). MTPLX defaults Laguna to a 32,768-token context
+weights occupy 59.72 GiB, a 64.13 GB snapshot on disk. The launch preflight
+requires about 85 GiB of unified memory (weights, runtime headroom, and a
+16 GiB system reserve) — in practice a 96 GB Mac; 128 GB is
+comfortable. MTPLX defaults Laguna to a 32,768-token context
 and response cap, and checks larger explicit server contexts against the active
 Metal memory cap.
 

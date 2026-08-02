@@ -100,6 +100,10 @@ def test_inspect_model_reads_qwen_mtp_config_without_weights(tmp_path):
     assert result.compatibility["unsafe_force_required"] is False
     assert "mtplx_runtime.json is optional metadata" in result.compatibility["message"]
     assert "missing MTP weights" in result.compatibility["message"]
+    assert "complete model" in result.compatibility["message"]
+    assert "original source with Forge" in result.compatibility["message"]
+    assert "cannot safely attach an arbitrary sidecar" in result.compatibility["message"]
+    assert "graft an MTP sidecar" not in result.compatibility["message"]
 
 
 def test_qwen3_5_text_subtype_can_pass_primary_gate_when_mtp_is_valid(monkeypatch, tmp_path):
@@ -1558,7 +1562,9 @@ def test_gemma4_pair_subfolder_reports_bundle_required(tmp_path):
     [
         ("DeepseekV32ForCausalLM", "deepseek_v32", "deepseek-v3-mtp"),
         ("GlmMoeDsaForCausalLM", "glm_moe_dsa", "glm-moe-dsa-mtp"),
-        ("DeepseekV4ForCausalLM", "deepseek_v4", "deepseek-v4-mtp"),
+        # deepseek_v4 now has a native MLX AR backend (arch_id "deepseek-v4"),
+        # so it is no longer a backend-pending arch — covered by
+        # test_deepseek_v4_routes_to_supported_ar_backend below.
         ("Glm4MoeLiteForCausalLM", "glm4_moe_lite", "glm4-moe-lite-mtp"),
         ("GlmOcrForCausalLM", "glm_ocr", "glm-ocr-mtp"),
         ("MiniMaxM2ForCausalLM", "minimax_m2", "minimax-m2-mtp"),
@@ -1614,6 +1620,52 @@ def test_big_mtp_architecture_markers_are_recognized_backend_pending(
     )
     assert result.compatibility["runtime_compatibility"] == expected_runtime
     assert result.compatibility["mtp_supported"] == "recognized"
+
+
+def test_deepseek_v4_routes_to_supported_ar_backend(tmp_path):
+    # The mlx-community DeepSeek-V4-Flash conversion drops the MTP block, so the
+    # artifact is a target-only AR model handled by the native deepseek_v4 MLX
+    # loader (arch_id "deepseek-v4").
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["DeepseekV4ForCausalLM"],
+                "model_type": "deepseek_v4",
+                "num_hidden_layers": 43,
+                "quantization": {"group_size": 64, "bits": 4, "mode": "affine"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["arch_id"] == "deepseek-v4"
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["tier"] == "AR-only"
+    assert result.compatibility["recommended_backend"] == "deepseek_v4"
+    assert result.compatibility["mtp_supported"] == "no"
+
+
+def test_deepseek_v4_mtp_split_stays_backend_pending(tmp_path):
+    # An MTP-split V4 checkpoint (vLLM layout) still has no runnable MTP backend;
+    # it must keep detecting as the pending deepseek-v4-mtp arch, not get captured
+    # by the AR "deepseek-v4" entry (the substring-alias hazard).
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["DeepseekV4MTPForCausalLM"],
+                "model_type": "deepseek_v4_mtp",
+                "num_nextn_predict_layers": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["arch_id"] == "deepseek-v4-mtp"
+    assert result.compatibility["can_run"] is False
 
 
 def test_recognized_non_qwen_runtime_contract_stays_backend_pending(tmp_path):

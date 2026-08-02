@@ -1176,6 +1176,13 @@ class EngineSessionManager:
         }
         for key in (
             "x-mtplx-session-id",
+            # OpenCode's V1 request path stamps both of these with its own
+            # session id on every request (session/llm/request.ts). Trusting
+            # the client's stable id beats prompt-prefix inference when the
+            # client rewrites history mid-loop (2026-08-01 live session:
+            # on-wire prompt shrank at r4/r8/r9 and prefix identity churned).
+            "x-session-affinity",
+            "x-session-id",
             "x-openwebui-chat-id",
             "x-openwebui-user-id",
         ):

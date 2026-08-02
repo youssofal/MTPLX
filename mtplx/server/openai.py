@@ -5179,7 +5179,11 @@ def _mtplx_pi_convergence_user_instruction_text() -> str:
         "context now. Use the evidence already gathered to edit, verify, or "
         "finish. The next response must not be another broad read/grep/find/ls "
         "or inspection-only shell command; only one narrow line-range refresh "
-        "is allowed when it is necessary to make the edit apply."
+        "is allowed when it is necessary to make the edit apply. Editing and "
+        "verification tools (edit/write/patch, or shell commands that run "
+        "tests or the build) remain fully allowed and are the expected next "
+        "step — this restriction covers broad inspection only, and it applies "
+        "to this reply only, not to the rest of the session."
     )
 
 
@@ -10565,12 +10569,49 @@ def _count_text_tokens(tokenizer: Any, text: str) -> int:
 _REQUEST_LOG_LOCK = threading.Lock()
 
 
+_REQUEST_LOG_MAX_BYTES = 64 * 1024 * 1024
+_REQUEST_LOG_KEEP_GENERATIONS = 4
+
+
 def _request_log_path(state: "ServerState") -> str | None:
     raw = getattr(state.args, "request_log_jsonl", None) or os.environ.get(
         "MTPLX_REQUEST_LOG_JSONL"
     )
     raw = str(raw or "").strip()
-    return raw or None
+    if raw.lower() in {"0", "off", "false", "no", "none", "disabled"}:
+        return None
+    if raw:
+        return raw
+    # Default ON: agent-session incidents cannot be diagnosed after the fact
+    # without a durable per-request trail. Records are numeric/hash telemetry
+    # only — no prompt or completion content — size-capped by rotation below,
+    # and disabled with MTPLX_REQUEST_LOG_JSONL=off. Per-port files so
+    # parallel serves never interleave. Live forensics repeatedly stalled on
+    # the 15-entry RAM ring; this keeps the durable trail by default.
+    try:
+        port = int(getattr(state.args, "port", 0) or 0)
+        log_dir = os.path.join(os.path.expanduser("~"), ".mtplx", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        return os.path.join(log_dir, f"request-log-{port}.jsonl")
+    except Exception:
+        return None
+
+
+def _rotate_request_log_if_needed(path: str) -> None:
+    """Cascade path -> .1 -> .2 ... keeping a bounded on-disk history."""
+    try:
+        if os.path.getsize(path) < _REQUEST_LOG_MAX_BYTES:
+            return
+    except OSError:
+        return
+    try:
+        for gen in range(_REQUEST_LOG_KEEP_GENERATIONS - 1, 0, -1):
+            older = f"{path}.{gen}"
+            if os.path.exists(older):
+                os.replace(older, f"{path}.{gen + 1}")
+        os.replace(path, f"{path}.1")
+    except OSError:
+        pass
 
 
 def _record_request_metrics(state: "ServerState", record: dict[str, Any]) -> None:
@@ -10596,6 +10637,7 @@ def _record_request_metrics(state: "ServerState", record: dict[str, Any]) -> Non
             default=str,
         )
         with _REQUEST_LOG_LOCK:
+            _rotate_request_log_if_needed(path)
             with open(path, "a", encoding="utf-8") as sink:
                 sink.write(line + "\n")
     except Exception:
@@ -15165,6 +15207,30 @@ _IDLE_POSTCOMMIT_MAX_WAIT_S = 30.0
 _IDLE_POSTCOMMIT_POLL_INTERVAL_S = 0.25
 
 
+def _idle_postcommit_foreground_grace_s() -> float:
+    """Bounded window during which a running postcommit finishes despite a
+    queued foreground request.
+
+    2026-08-01 live gauntlet receipts: in a real OpenCode tool loop the next
+    request arrives within ~0.5s of the previous response, so EVERY
+    tool_call_history_rewrite postcommit was preempted
+    (foreground_preempted_postcommit x6 in one 8-turn run) and every
+    tool-turn paid a 2-4k-token block-salvage re-prefill instead (3-7s of
+    TTFT). The commit itself starts from the live cache and typically
+    finishes well under this grace, so letting it win delays the queued
+    request by at most the grace while removing the far larger salvage.
+    0 restores strict immediate-yield (the 2026-07-02 starvation semantics,
+    still guarded as bounded by this cap in the yield test).
+    """
+    raw = os.environ.get("MTPLX_POSTCOMMIT_FOREGROUND_GRACE_S")
+    if raw is None or not str(raw).strip():
+        return 2.0
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return 2.0
+
+
 def _schedule_idle_postcommit_snapshot(
     state: ServerState,
     *,
@@ -15195,6 +15261,23 @@ def _schedule_idle_postcommit_snapshot(
     rechecks that no newer foreground is queued and that the session did not
     advance before it builds a new cache.
     """
+    if unsafe_reason == "tool_call_history_rewrite" and str(
+        os.environ.get("MTPLX_IDLE_POSTCOMMIT_TOOL_REWRITE", "1")
+    ).strip().lower() in {"0", "false", "off", "no"}:
+        # 2026-08-01 gauntlet: on the OpenCode hybrid tool lane this commit's
+        # canonical retokenization matched NEITHER the generation stream NOR
+        # the next request's bytes (its own bank lookup found ~no prefix), so
+        # it re-forwarded the full 27-29k history in the gap, never stored
+        # (aborted on the next request, one after 26.8s of GPU), and the
+        # foreground grace then delayed the queued request for doomed work.
+        # This is the "postcommit ghost re-prefill" pathology. Kill switch until
+        # the hybrid-lane canonical rendering is byte-proven against real
+        # next-turn prompts; store-on-prefill + block salvage remain.
+        return {
+            "stored": False,
+            "mode": "disabled",
+            "reason": "tool_rewrite_postcommit_disabled",
+        }
     pending = {
         "stored": False,
         "mode": "async_pending",
@@ -15255,10 +15338,24 @@ def _schedule_idle_postcommit_snapshot(
             and int(observed) != int(expected_session_revision)
         )
 
+    # Foreground pressure only aborts the commit after the bounded grace
+    # (anchored when the job actually starts); explicit aborts and stale
+    # session revisions stay immediate.
+    grace_s = _idle_postcommit_foreground_grace_s()
+    job_started_holder: dict[str, float] = {}
+
+    def _foreground_pressure_past_grace() -> bool:
+        if not _foreground_model_work_pending(state):
+            return False
+        started_at = job_started_holder.get("t")
+        if started_at is None:
+            return True
+        return (time.monotonic() - started_at) > grace_s
+
     def _postcommit_abort_reason() -> str:
         if _stale_session_revision():
             return "stale_session_revision"
-        if abort_event.is_set() or _foreground_model_work_pending(state):
+        if abort_event.is_set() or _foreground_pressure_past_grace():
             return "foreground_preempted_postcommit"
         return "postcommit_abort_requested"
 
@@ -15266,7 +15363,7 @@ def _schedule_idle_postcommit_snapshot(
         return bool(
             abort_event.is_set()
             or _stale_session_revision()
-            or _foreground_model_work_pending(state)
+            or _foreground_pressure_past_grace()
         )
 
     # The postcommit re-prefills the conversation at full GPU load after the
@@ -15282,6 +15379,7 @@ def _schedule_idle_postcommit_snapshot(
 
     def async_postcommit() -> None:
         deadline = time.monotonic() + _IDLE_POSTCOMMIT_MAX_WAIT_S
+        job_started_holder["t"] = time.monotonic()
         record = pending_record_holder.get("record")
         if record is not None and hasattr(record, "mark_started"):
             try:
@@ -15302,13 +15400,16 @@ def _schedule_idle_postcommit_snapshot(
                         }
                     )
                     return
-                if abort_event.is_set() or _foreground_model_work_pending(state):
-                    # Yield to queued foreground: return to free the single
-                    # model worker (a sleep+retry here would starve the
-                    # foreground request behind us — regression caught by
+                if abort_event.is_set() or _foreground_pressure_past_grace():
+                    # Yield to queued foreground once the bounded grace is
+                    # spent: return to free the single model worker (an
+                    # unbounded sleep+retry here would starve the foreground
+                    # request behind us — regression caught by
                     # test_running_idle_postcommit_yields_to_queued_foreground,
-                    # 2026-07-02). Warming the next agent turn is handled by
-                    # store-on-prefill instead, which needs no idle gap.
+                    # 2026-07-02; the grace keeps the delay bounded while
+                    # letting agent-loop tool-turn commits actually land —
+                    # 2026-08-01 gauntlet receipts). Store-on-prefill remains
+                    # the fallback warmer when the commit loses.
                     _log(
                         {
                             "stored": False,
@@ -26479,9 +26580,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help=(
             "Append every per-request telemetry record (the dashboard "
-            "'recent' schema) as one JSON line to this path. The durable "
+            "'recent' schema; numeric/hash fields only, no prompt or "
+            "completion content) as one JSON line to this path. The durable "
             "twin of the 100-entry RAM ring; scripts/session_forensics.py "
-            "reads it. Env: MTPLX_REQUEST_LOG_JSONL."
+            "reads it. Default: ON at ~/.mtplx/logs/request-log-<port>.jsonl "
+            "with 64MB x4 rotation; pass 'off' (or set "
+            "MTPLX_REQUEST_LOG_JSONL=off) to disable. Env: "
+            "MTPLX_REQUEST_LOG_JSONL."
         ),
     )
     parser.add_argument(
@@ -26642,8 +26747,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--open-dashboard",
         action="store_true",
         help=(
-            "Open the live MTPLX dashboard (/dashboard) after startup "
-            "instead of the chat UI."
+            "Open the live MTPLX dashboard (/dashboard) after startup, "
+            "alongside any client UI selected by --open-browser."
         ),
     )
     parser.add_argument(

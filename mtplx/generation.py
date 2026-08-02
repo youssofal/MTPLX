@@ -2321,16 +2321,22 @@ def _trim_cache_to_offset(cache: Any, offset: int) -> bool:
     target = max(0, int(offset))
     if not cache:
         return target == 0
+    trims: list[tuple[Callable[[int], Any], int]] = []
     for entry in cache:
         current = int(getattr(entry, "offset", target) or 0)
         if current < target:
             return False
         delta = current - target
-        if delta <= 0:
-            continue
         trim = getattr(entry, "trim", None)
         if not callable(trim):
             return False
+        if delta <= 0:
+            continue
+        max_rollback = getattr(entry, "max_rollback", None)
+        if max_rollback is not None and delta > int(max_rollback):
+            return False
+        trims.append((trim, delta))
+    for trim, delta in trims:
         trimmed = int(trim(delta))
         if trimmed != delta:
             return False
