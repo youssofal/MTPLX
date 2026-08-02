@@ -629,7 +629,7 @@ struct HermesPanel: View {
                                     .stroke(Brand.separatorStrong, lineWidth: 1)
                             )
                     )
-                    .disabled(!hermes.activeSessionWritable || !hermes.gatewayReady || hermes.pendingRequest != nil)
+                    .disabled(!composerAcceptsInput)
                     .accessibilityLabel("Message Hermes")
                 Button {
                     Task { await send() }
@@ -653,10 +653,21 @@ struct HermesPanel: View {
 
     private var canSend: Bool {
         if hermes.isStreaming { return true }
-        return hermes.activeSessionWritable
-            && hermes.gatewayReady
-            && hermes.pendingRequest == nil
+        return composerAcceptsInput
             && !composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// A selected profile is enough to begin composing. If no agent is active
+    /// yet, `send()` creates one before submitting the first prompt. Existing
+    /// sessions still have to pass the ownership checks in `HermesAgentStore`.
+    private var composerAcceptsInput: Bool {
+        HermesComposerPolicy.acceptsInput(
+            gatewayReady: hermes.gatewayReady,
+            hasPendingRequest: hermes.pendingRequest != nil,
+            activeSessionWritable: hermes.activeSessionWritable,
+            hasActiveSession: hermes.activeSessionID != nil,
+            hasAvailableProfile: hermes.selectedProfile.map { !profileUnavailable($0) } ?? false
+        )
     }
 
     private var composerBackground: some View {
@@ -673,6 +684,8 @@ struct HermesPanel: View {
         if !hermes.gatewayReady { return "Hermes is not connected yet." }
         if hermes.pendingRequest != nil { return "Respond to the pending Hermes request first." }
         if hermes.readOnlyReason != nil { return "This session is read-only. Create a new agent to continue." }
+        if hermes.activeSessionID == nil, hermes.selectedProfile == nil { return "Select a Hermes profile first." }
+        if hermes.activeSessionID == nil { return "Enter a message to start a new Hermes agent." }
         if composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "Enter a message to send." }
         return "A writable Hermes agent is required."
     }
@@ -986,21 +999,28 @@ struct HermesPanel: View {
     }
 
     private func startNew() async {
-        guard let profile = hermes.selectedProfile else { return }
+        _ = await startNewIfPossible()
+    }
+
+    @discardableResult
+    private func startNewIfPossible() async -> Bool {
+        guard let profile = hermes.selectedProfile else { return false }
         localError = nil
         guard !profileUnavailable(profile) else {
             localError = "This Hermes profile is unavailable."
-            return
+            return false
         }
-        guard await ensureDaemonReady() else { return }
+        guard await ensureDaemonReady() else { return false }
         do {
             let reference = try await hermes.startNewAgent(
                 profile: profile,
                 configuration: backend.configuration
             )
             remember(reference)
+            return true
         } catch {
             localError = "Hermes could not create a new agent. Try again."
+            return false
         }
     }
 
@@ -1048,6 +1068,13 @@ struct HermesPanel: View {
             return
         }
         let text = composerText
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        if !hermes.activeSessionWritable {
+            guard hermes.activeSessionID == nil,
+                  await startNewIfPossible()
+            else { return }
+        }
+        guard hermes.activeSessionWritable, hermes.gatewayReady else { return }
         composerText = ""
         await hermes.send(text)
     }
