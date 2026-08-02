@@ -1509,6 +1509,14 @@ private struct TargetPreset {
                 processEnvironment: processEnvironment
             )
             env["MTPLX_CLIENT"] = "hermes"
+            // Hermes persists the authoritative transcript itself. Keep a
+            // bounded RAM acceleration tier for several profiles while the
+            // SSD session bank retains older snapshots; inheriting OpenCode's
+            // auto budget allowed one long Hermes tool session to pin six
+            // multi-GiB KV frontiers and slow unrelated short generations.
+            env["MTPLX_SESSION_BANK_MAX_ENTRIES"] = "6"
+            env["MTPLX_SESSION_BANK_MAX_BYTES"] = "8G"
+            env["MTPLX_SESSION_BANK_PER_SESSION_BYTES"] = "3G"
             return TargetPreset(
                 schedulerMode: "serial",
                 batchingPreset: "latency",

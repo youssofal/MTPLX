@@ -1606,7 +1606,9 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertTrue(command.arguments.containsInOrder(["--app-launch-id", "hermes-launch"]))
         XCTAssertEqual(command.environment["MTPLX_CLIENT"], "hermes")
         XCTAssertEqual(command.environment["MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE"], "async_per_head")
-        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_MAX_ENTRIES"], "32")
+        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_MAX_ENTRIES"], "6")
+        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_MAX_BYTES"], "8G")
+        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_PER_SESSION_BYTES"], "3G")
     }
 
     func testCommandBuilderBenchmarkPresetStartsSoloBenchmarkDaemon() throws {
