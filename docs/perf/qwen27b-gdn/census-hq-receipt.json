@@ -1,0 +1,15 @@
+{
+ "impl": "headquarter",
+ "decode_window_monotonic_ns": [
+  78524521147333,
+  78525607526833
+ ],
+ "generated_tokens": 48,
+ "decode_elapsed_s": 0.9407742499897722,
+ "decode_tok_s": 51.02180464709981,
+ "accepted_drafts": 27,
+ "drafted_tokens": 59,
+ "tokens_sha16": "ebb1bde5f6a56e1f",
+ "census_sink": "/Users/davidtai/projects/OpenSourceWTF/bench/qwen27b/q27b-census-hq-20260726-083437.jsonl",
+ "mlx_version": "0.32.1"
+}

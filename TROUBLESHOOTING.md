@@ -18,11 +18,11 @@ Run:
 mtplx inspect model --model /path/or/repo --json
 ```
 
-The model must be Tier 1 verified for normal v0.1 runs. Architecture-compatible unverified models require an explicit unsafe override and cannot be used for release claims.
+The model must be `verified` tier for the default path (`mtplx inspect` prints the tier). Architecture-compatible unverified models load with an explicit unverified label and cannot be used for release claims.
 
 ## Slow Long Responses
 
-This is a known v0.1 caveat. Use the benchmark output and profile name when filing an issue. Do not compare `--max` diagnostic runs against no-fan product claims.
+This is a known caveat. Use the benchmark output and profile name when filing an issue. Do not compare `--max` diagnostic runs against no-fan product claims.
 
 ## Model Repeats Itself / Loops
 

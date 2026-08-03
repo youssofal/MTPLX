@@ -76,12 +76,12 @@ NATIVE_MTP_60_MODEL = DEFAULT_MODEL_ID
 
 
 PUBLIC_COMMANDS = (
-    ("start", "Interactive setup → chat (model · mode · web/CLI/Pi/OpenCode/Swival)"),
-    ("tune", "Find the fastest AR/D1/D2/D3 depth for this Mac"),
+    ("start", "Interactive setup → chat (model · mode · web/CLI/Pi/OpenCode/Swival/Hermes/Dashboard)"),
+    ("tune", "Find the fastest AR/MTP draft depth for this Mac (AR, D1-D8)"),
     ("help", "Detailed help; `help commands` / `help flags` / `help <name>`"),
     ("setup", "Prepare config and the model cache"),
     ("quickstart", "Run the local OpenAI/Anthropic server"),
-    ("connect", "Copy settings for Open WebUI or Claude Code"),
+    ("connect", "Copy settings for Open WebUI, Claude Code, OpenCode, or Swival"),
     ("ask", "Ask the verified local model once"),
     ("status", "Check install, model, and integration health"),
     ("stop", "Stop the MTPLX daemon answering on a port"),
@@ -96,7 +96,7 @@ ADVANCED_COMMANDS = {
     "Benchmark and QA": (
         ("bench *", "Nightly gates, no-fan runs, envelope compare"),
         ("qa *", "Exactness and distribution gates"),
-        ("profile *", "Dispatch, thermal, compile, and eval attribution"),
+        ("profile *", "Compile audit; dispatch/thermal/eval-attribution need the research workspace"),
     ),
     "Support": (
         ("doctor --deep", "Deep install and integration checks"),
@@ -241,7 +241,7 @@ On later runs it offers "same as last time?" so the chat is one keypress away.
 
 What gets asked:
   1. Model — your configured model, the verified default, custom HF, or local
-  2. Mode  — Sustained, Turbo, Sustained Max, or Burst (Stable remains available via --profile safe)
+  2. Mode  — Sustained, Sustained Max, or Burst (Turbo auto-selects for the quantized flagships; Stable remains available via --profile safe)
   3. Where — Web UI (default), terminal CLI, Pi, OpenCode Desktop, Swival, or Hermes
 
 Power-user shortcuts (any of these skip the onboarding wizard):
@@ -277,7 +277,9 @@ Inside terminal chat:
   /mtp off         Switch the next turn to target-only AR generation
   /mtp on          Switch the next turn back to MTP without reloading
   /stats           Print the last response stats again
-  /speed           Run a 192-token comparison sample
+  /speed           Run a 192-token speed sample
+  /reasoning on|off|auto
+                   Control reasoning for the next turns
   /exit            Quit
 
 Aliases:
@@ -287,6 +289,8 @@ Aliases:
   `opencode`, `oc`      -> OpenCode Desktop coding-agent connection
   `swival`, `sv`        -> Swival generic-provider connection
   `hermes`              -> Hermes Agent with terminal/file/web/browser/messaging tools
+  `dashboard`, `live`   -> live engine dashboard
+  (hyphenated forms like `open-webui`, `open-code`, `hermes-agent` also work)
 """
 
 
@@ -335,7 +339,7 @@ def _format_verbose_help() -> str:
 
 {_heading("Help subtopics")}
 
-  mtplx help commands         Every command across the consumer + advanced surface
+  mtplx help commands         The consumer + advanced command reference (`help flags` lists every flag)
   mtplx help flags            Every flag, grouped by command
   mtplx help advanced         Benchmarks, QA, publishing, and kernel tools
   mtplx help <command>        Detailed flags for one command (argparse view)
@@ -364,7 +368,7 @@ def _format_commands_help() -> str:
 {public_lines}
 
 """ + "\n".join(advanced_sections) + f"""
-  {_muted("Run `mtplx help <command>` for flags on any command above.")}
+  {_muted("Run `mtplx <command> --help` for flags on any command above (works for multi-word commands too).")}
 """
 
 
@@ -2224,7 +2228,16 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_p.add_argument("topic", nargs="?", choices=["opencode", "pi", "android-studio"], help="Optional focused doctor target")
     doctor_p.add_argument("--project-root", default=".")
     doctor_p.add_argument("--host", default="127.0.0.1")
-    doctor_p.add_argument("--port", type=int, default=8008)
+    doctor_p.add_argument(
+        "--port",
+        type=int,
+        default=8008,
+        help=(
+            "Port for the topic bridge checks (opencode/pi/android-studio; "
+            "default 8008). When passed explicitly it also aims the MTPLX "
+            "server checks, which otherwise probe the shipped default :8000."
+        ),
+    )
     doctor_p.add_argument("--base-url")
     doctor_p.add_argument("--smc-path", default=os.environ.get("MTPLX_SMC_PATH") or shutil.which("smc") or "")
     doctor_p.add_argument("--sovereign-path", default=os.environ.get("MTPLX_SOVEREIGN_PATH") or shutil.which("sovereign") or "")
@@ -2756,7 +2769,7 @@ def build_parser() -> argparse.ArgumentParser:
         ],
     )
     bench_p.add_argument("--strict", action="store_true", help="Run clean-preflight before profile benchmarks")
-    bench_p.add_argument("--strict-cold", action="store_true", help="Enforce cold 55 tok/s regression gate")
+    bench_p.add_argument("--strict-cold", action="store_true", help="Enforce the cold 59 tok/s regression gate")
     bench_p.add_argument("--no-fanmax", action="store_true", help="Mark run as no-fan product candidate")
     bench_p.add_argument("--fanmax", action="store_true", help="Mark run as fan-controlled diagnostic")
     bench_p.add_argument("--max", action="store_true", dest="fanmax", help="Alias for --fanmax")

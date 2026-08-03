@@ -38,7 +38,9 @@ QWEN_STYLE_REASONING_OPEN_RE = re.compile(
     re.IGNORECASE,
 )
 QWEN_STYLE_REASONING_CLOSE_RE = re.compile(
-    rf"</\s*(?:{_QWEN_STYLE_TAG_NAME_PATTERN})\s*>",
+    # \b[^>\n]* tolerates suffixed spellings such as Hy3's </think:opensource>
+    # (single special tokens whose text carries an :opensource suffix).
+    rf"</\s*(?:{_QWEN_STYLE_TAG_NAME_PATTERN})\b[^>\n]*>",
     re.IGNORECASE,
 )
 QWEN_STYLE_REASONING_CONTROL_RE = re.compile(
@@ -47,8 +49,18 @@ QWEN_STYLE_REASONING_CONTROL_RE = re.compile(
 )
 QWEN_STYLE_REASONING_BLOCK_RE = re.compile(
     rf"<\s*(?:{_QWEN_STYLE_TAG_NAME_PATTERN})\b[^>\n]*>"
-    rf".*?</\s*(?:{_QWEN_STYLE_TAG_NAME_PATTERN})\s*>",
+    rf".*?</\s*(?:{_QWEN_STYLE_TAG_NAME_PATTERN})\b[^>\n]*>",
     re.IGNORECASE | re.DOTALL,
+)
+
+# Streaming holdback: never emit the tail of the pending buffer while it could
+# still be the prefix of an unfinished reasoning tag. Must cover the longest
+# concrete spelling including suffixed forms ("</reasoning:opensource>" — Hy3
+# renames its chat tokens with an :opensource suffix at the same ids).
+STREAM_TAG_HOLDBACK = max(
+    max(len(name) for name in QWEN_STYLE_REASONING_TAG_NAMES)
+    + len("</:opensource>"),
+    32,
 )
 
 
@@ -126,7 +138,7 @@ def split_qwen_reasoning_text(
 
     content = re.sub(
         rf"<\s*(?:{_QWEN_STYLE_TAG_NAME_PATTERN})\b[^>\n]*>"
-        rf"(.*?)</\s*(?:{_QWEN_STYLE_TAG_NAME_PATTERN})\s*>",
+        rf"(.*?)</\s*(?:{_QWEN_STYLE_TAG_NAME_PATTERN})\b[^>\n]*>",
         _capture,
         raw,
         flags=re.IGNORECASE | re.DOTALL,
@@ -353,10 +365,7 @@ class QwenThinkingContentStreamSplitter(ReasoningContentStreamSplitter):
 
     def _drain_disabled(self, *, final: bool) -> list[tuple[str, str]]:
         chunks: list[tuple[str, str]] = []
-        keep = max(
-            max(len(name) for name in QWEN_STYLE_REASONING_TAG_NAMES) + len("</>"),
-            16,
-        )
+        keep = STREAM_TAG_HOLDBACK
         initial_hold = 384
         while self._pending:
             if self._disabled_inside_reasoning:
@@ -413,10 +422,7 @@ class QwenThinkingContentStreamSplitter(ReasoningContentStreamSplitter):
         # (e.g. "</reasoning>"); using only the "<think>"/"</think>" lengths
         # let a longer alias tag split across chunks leak into visible content.
         # Mirrors _drain_disabled's window.
-        keep = max(
-            max(len(name) for name in QWEN_STYLE_REASONING_TAG_NAMES) + len("</>"),
-            16,
-        )
+        keep = STREAM_TAG_HOLDBACK
         while self._pending:
             if self._inside_thinking:
                 close_match = QWEN_STYLE_REASONING_CLOSE_RE.search(self._pending)

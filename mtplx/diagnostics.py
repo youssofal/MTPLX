@@ -29,12 +29,12 @@ GIB = 1024**3
 DEFAULT_SPEED_MODEL_SIZE_BYTES = 16_430_000_000
 MIN_RECOMMENDED_MEMORY_BYTES = 48 * GIB
 SUPPORT_MACOS_MAJOR = 14
-SUPPORT_PYTHON = (3, 10)
+SUPPORT_PYTHON = (3, 11)
 SUPPORT_MATRIX = {
     "supported": {
         "platform": "Apple Silicon arm64 Mac",
         "macos": ">= 14.0",
-        "python": "native arm64 Python >= 3.10",
+        "python": "native arm64 Python >= 3.11",
         "docker": "Docker Desktop current plus previous two macOS major releases",
         "default_model": DEFAULT_HF_MODEL_ID,
         "default_profile": DEFAULT_PROFILE_NAME,
@@ -286,8 +286,8 @@ def build_diagnostic_checks(
             "pass" if python_ok else "fail",
             "error",
             host["python_version"],
-            "Python >= 3.10",
-            "Install Python 3.10 or newer.",
+            "Python >= 3.11",
+            "Install Python 3.11 or newer.",
             DOCS["mlx"],
         )
     )
@@ -395,7 +395,7 @@ def build_diagnostic_checks(
             "error",
             DEFAULT_HF_MODEL_ID,
             "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed",
-            "Update DEFAULT_HF_MODEL_ID to the published optimized-speed repo.",
+            "Pull the default model, or pass --model to serve a different one.",
             "https://huggingface.co/Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed",
             f"mtplx pull {DEFAULT_HF_MODEL_ID}",
         )
@@ -504,7 +504,8 @@ def build_diagnostic_checks(
             "warning",
             {"host": "127.0.0.1", "port": server_port, "open": _port_open("127.0.0.1", server_port)},
             "port free before starting mtplx serve, or already a healthy MTPLX server",
-            f"Use --port {server_port + 1} or stop the existing process.",
+            "A healthy MTPLX server already on this port is fine to keep using; "
+            f"if something else holds it, stop that process or use --port {server_port + 1}.",
         )
     )
     if deep:
@@ -517,7 +518,7 @@ def build_diagnostic_checks(
                 models_probe,
                 "running MTPLX server exposes /v1/models",
                 "Start the server or choose the correct port.",
-                "docs/server.md",
+                "https://github.com/youssofal/MTPLX/blob/main/docs/server.md",
                 f"curl http://127.0.0.1:{server_port}/v1/models",
             )
         )
@@ -540,8 +541,8 @@ def build_diagnostic_checks(
                     "error",
                     ok,
                     f"{name} installed",
-                    "Install MTPLX with server extras.",
-                    command='python3 -m pip install "mtplx[server]"',
+                    "Reinstall mtplx (fastapi and uvicorn ship as base dependencies).",
+                    command="python3 -m pip install --force-reinstall mtplx",
                 )
             )
     thermal = thermal_control or {}
@@ -594,6 +595,7 @@ def build_diagnostics_payload(
     model_cache: str | Path | None = None,
     include_startup_default_model: bool = True,
     deep: bool = False,
+    server_port: int = 8000,
     mlx_info: dict[str, Any] | None = None,
     thermal_control: dict[str, Any] | None = None,
     server_dependencies: dict[str, bool] | None = None,
@@ -602,6 +604,7 @@ def build_diagnostics_payload(
         model_cache=model_cache,
         include_startup_default_model=include_startup_default_model,
         deep=deep,
+        server_port=server_port,
         mlx_info=mlx_info,
         thermal_control=thermal_control,
         server_dependencies=server_dependencies,

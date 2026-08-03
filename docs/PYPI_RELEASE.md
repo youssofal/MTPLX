@@ -28,14 +28,14 @@ The environment name matters. PyPI checks it against the GitHub OIDC token, so
 `pypi` on PyPI must match the `environment: pypi` job in
 `.github/workflows/release.yml`.
 
-## Publish v0.3.4
+## Publish a release (vX.Y.Z)
 
 After the version bump and release tag exist, run:
 
 ```bash
 gh workflow run release.yml \
   --repo youssofal/MTPLX \
-  -f ref=v0.3.4 \
+  -f ref=vX.Y.Z \
   -f publish_to_pypi=true
 ```
 
@@ -55,7 +55,7 @@ python3 -m venv /tmp/mtplx-pypi-verify
 /tmp/mtplx-pypi-verify/bin/mtplx help
 ```
 
-v0.3.4 is a stable PyPI release and should install without `--pre` once it is
+A stable vX.Y.Z release should install without `--pre` once it is
 explicitly published.
 
 ## Release guardrails

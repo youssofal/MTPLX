@@ -558,6 +558,60 @@ def test_qwen_xml_opening_marker_split_after_preamble_no_leak():
     assert json.loads(t.tool_calls[0]["function"]["arguments"]) == {"q": "scene"}
 
 
+def test_hy3_suffixed_native_parallel_calls_stream_without_markup():
+    t = _make(tools=OPENCODE_READ_TOOL_SPECS + OPENCODE_SHELL_TOOL_SPECS)
+    text = (
+        "I'll inspect both. <tool_calls:opensource>\n"
+        "<tool_call:opensource>read<tool_sep:opensource>\n"
+        "<arg_key:opensource>filePath</arg_key:opensource>\n"
+        "<arg_value:opensource>/tmp/brief.md</arg_value:opensource>\n"
+        "</tool_call:opensource>\n"
+        "<tool_call:opensource>bash<tool_sep:opensource>\n"
+        "<arg_key:opensource>command</arg_key:opensource>\n"
+        "<arg_value:opensource>ls -la</arg_value:opensource>\n"
+        "<arg_key:opensource>description</arg_key:opensource>\n"
+        "<arg_value:opensource>List project files</arg_value:opensource>\n"
+        "</tool_call:opensource>\n"
+        "</tool_calls:opensource>"
+    )
+    out = _feed_in_chunks(t, text, [1] * len(text))
+
+    content = _content_text(out)
+    assert content == "I'll inspect both. "
+    _assert_no_tool_markup_leaked(content)
+    assert t.tool_parser_dialect == "suffixed_native"
+    assert t.tool_calls is not None
+    assert [call["function"]["name"] for call in t.tool_calls] == ["read", "bash"]
+    assert [
+        json.loads(call["function"]["arguments"]) for call in t.tool_calls
+    ] == [
+        {"filePath": "/tmp/brief.md"},
+        {"command": "ls -la", "description": "List project files"},
+    ]
+
+
+def test_hy3_suffixed_native_write_preserves_json_shaped_string():
+    t = _make(tools=OPENCODE_WRITE_TOOL_SPECS)
+    text = (
+        "<tool_calls:opensource>"
+        "<tool_call:opensource>write<tool_sep:opensource>"
+        "<arg_key:opensource>filePath</arg_key:opensource>"
+        "<arg_value:opensource>config.json</arg_value:opensource>"
+        "<arg_key:opensource>content</arg_key:opensource>"
+        '<arg_value:opensource>{"enabled":true}</arg_value:opensource>'
+        "</tool_call:opensource>"
+        "</tool_calls:opensource>"
+    )
+    out = _feed_in_chunks(t, text, [7] * ((len(text) // 7) + 1))
+
+    assert t.tool_calls is not None
+    assert json.loads(_argument_text(out)) == {
+        "filePath": "config.json",
+        "content": '{"enabled":true}',
+    }
+    assert _content_text(out) == ""
+
+
 def test_opencode_style_long_write_arguments_stream_without_raw_xml():
     """OpenCode-style write(filePath, content) args can be large and chunked."""
     t = _make(tools=OPENCODE_WRITE_TOOL_SPECS)

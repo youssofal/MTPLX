@@ -1,6 +1,6 @@
 # API
 
-MTPLX v0.1 targets OpenAI-compatible local serving first.
+MTPLX targets OpenAI-compatible local serving first.
 
 ## `GET /health`
 
@@ -9,7 +9,7 @@ The payload includes `generation_mode`, `load_mtp`, `mtp_enabled`, `depth`, `api
 
 ## `GET /metrics`
 
-Reports runtime KPIs as JSON or Prometheus-style text, depending on server configuration.
+Returns a JSON snapshot of runtime KPIs: `latest` (most recent turn), `recent` (last 32 turns), and `tool_parse_counters`.
 
 ## `GET /v1/models`
 
@@ -38,10 +38,11 @@ Supported now:
 - `system` as text or text content blocks
 - `messages[].content` as text or text/tool-result content blocks
 - `max_tokens`, `temperature`, `top_p`, and `top_k`
+- `tools`, `tool_choice`, `stop_sequences`, and `thinking`
 - `stream=false`
 - `stream=true` server-sent events with `message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, and `message_stop`
 
-Current streaming note: Qwen reasoning deltas are exposed as text deltas until the Anthropic thinking-block mapping is validated against real Claude Code / OpenCode clients.
+Streaming note: Qwen reasoning maps to Anthropic thinking blocks — a `content_block_start` with content-block type `thinking`, then `thinking_delta` events, with answer text resuming in a separate text block.
 
 Examples:
 

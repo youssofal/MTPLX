@@ -1,0 +1,8 @@
+incumbent    T=1 layers=48 iters=60:    16.42 us/call    0.788 ms/iter
+headquarter  T=1 layers=48 iters=60:    14.49 us/call    0.696 ms/iter
+incumbent    T=1 layers=48 iters=60:    13.73 us/call    0.659 ms/iter
+headquarter  T=1 layers=48 iters=60:    13.07 us/call    0.627 ms/iter
+incumbent    T=4 layers=48 iters=60:    12.98 us/call    0.623 ms/iter
+headquarter  T=4 layers=48 iters=60:    13.01 us/call    0.625 ms/iter
+incumbent    T=4 layers=48 iters=60:    12.95 us/call    0.622 ms/iter
+headquarter  T=4 layers=48 iters=60:    12.85 us/call    0.617 ms/iter

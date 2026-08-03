@@ -12,18 +12,14 @@ from typing import Any
 
 from .constants import (
     EXPECTED_ALL_PREQUANTIZED_MTP_KEYS,
-    EXPECTED_ALL_PREQUANTIZED_MTP_TENSOR_COUNT,
     EXPECTED_MTP_KEYS,
-    EXPECTED_PREQUANTIZED_MTP_KEYS,
-    EXPECTED_PREQUANTIZED_MTP_TENSOR_COUNT,
     EXPECTED_MTP_TENSOR_COUNT,
+    EXPECTED_PREQUANTIZED_MTP_KEYS,
     EXPECTED_QWEN_MOE_MTP_KEYS,
-    EXPECTED_QWEN_MOE_MTP_TENSOR_COUNT,
     EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS,
-    EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_TENSOR_COUNT,
     EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS,
-    EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_TENSOR_COUNT,
     MULTIMODAL_SIDECARS,
+    expand_mtp_layer_keys,
 )
 from .models.laguna_config import (
     LAGUNA_S_2_1_REPO_ID,
@@ -194,6 +190,13 @@ def _mtp_expected_key_set(
     prequantized = isinstance(mtp_quant, dict) and bool(mtp_quant.get("prequantized"))
     quant_policy = str(mtp_quant.get("policy") or "") if isinstance(mtp_quant, dict) else ""
     normalized = {normalize_mtp_key(key) for key in keys}
+    # Every named key set below is the canonical depth-1 template; checkpoints
+    # declaring mtp_num_hidden_layers > 1 replicate the layer keys per index.
+    n_layers = max(_num_mtp_layers(config), 1)
+
+    def _expanded(base: tuple[str, ...]) -> set[str]:
+        return expand_mtp_layer_keys(base, n_layers)
+
     if _is_qwen_moe_mtp_layout(config, normalized):
         if any(".mlp.switch_mlp." in key for key in normalized):
             has_prequantized_aux = any(
@@ -202,7 +205,7 @@ def _mtp_expected_key_set(
             )
             if prequantized or has_prequantized_aux:
                 expected = _expected_prequantized_keys_for_present_aux(
-                    set(EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS),
+                    _expanded(EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS),
                     normalized,
                 )
                 return (
@@ -210,9 +213,10 @@ def _mtp_expected_key_set(
                     len(expected),
                     "prequantized-mlx-affine-qwen-moe-switch-mlx",
                 )
+            expected = _expanded(EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS)
             return (
-                set(EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS),
-                EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_TENSOR_COUNT,
+                expected,
+                len(expected),
                 "bf16-qwen-moe-switch-mlx",
             )
         if _has_numbered_moe_experts(normalized):
@@ -224,42 +228,47 @@ def _mtp_expected_key_set(
                 config,
                 prequantized=prequantized or has_prequantized_aux,
             )
-        if prequantized or normalized == set(EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS):
+        if prequantized or normalized == _expanded(EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS):
+            expected = _expanded(EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS)
             return (
-                set(EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS),
-                EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_TENSOR_COUNT,
+                expected,
+                len(expected),
                 "prequantized-mlx-affine-qwen-moe",
             )
+        expected = _expanded(EXPECTED_QWEN_MOE_MTP_KEYS)
         return (
-            set(EXPECTED_QWEN_MOE_MTP_KEYS),
-            EXPECTED_QWEN_MOE_MTP_TENSOR_COUNT,
+            expected,
+            len(expected),
             "bf16-qwen-moe",
         )
     if prequantized and quant_policy == "all":
+        expected = _expanded(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS)
         return (
-            set(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS),
-            EXPECTED_ALL_PREQUANTIZED_MTP_TENSOR_COUNT,
+            expected,
+            len(expected),
             "prequantized-mlx-affine",
         )
     if prequantized:
+        expected = _expanded(EXPECTED_PREQUANTIZED_MTP_KEYS)
         return (
-            set(EXPECTED_PREQUANTIZED_MTP_KEYS),
-            EXPECTED_PREQUANTIZED_MTP_TENSOR_COUNT,
+            expected,
+            len(expected),
             "prequantized-mlx-affine",
         )
-    if normalized == set(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS):
+    if normalized == _expanded(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS):
         return (
-            set(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS),
-            EXPECTED_ALL_PREQUANTIZED_MTP_TENSOR_COUNT,
+            set(normalized),
+            len(normalized),
             "prequantized-mlx-affine",
         )
-    if normalized == set(EXPECTED_PREQUANTIZED_MTP_KEYS):
+    if normalized == _expanded(EXPECTED_PREQUANTIZED_MTP_KEYS):
         return (
-            set(EXPECTED_PREQUANTIZED_MTP_KEYS),
-            EXPECTED_PREQUANTIZED_MTP_TENSOR_COUNT,
+            set(normalized),
+            len(normalized),
             "prequantized-mlx-affine",
         )
-    return set(EXPECTED_MTP_KEYS), EXPECTED_MTP_TENSOR_COUNT, "bf16"
+    expected = _expanded(EXPECTED_MTP_KEYS)
+    return expected, len(expected), "bf16"
 
 
 def _observed_sidecar_format(sidecar_format: str, tensors: tuple[TensorInfo, ...]) -> str:
@@ -311,6 +320,62 @@ def expected_mtp_file(model_dir: Path | str, config: dict[str, Any] | None = Non
         if candidate.exists():
             return candidate
     return model_path / "mtp.safetensors"
+
+
+def mtp_weights_present_on_disk(
+    model_dir: Path | str, config: dict[str, Any] | None = None
+) -> bool:
+    """Whether a model that declares MTP layers actually ships MTP weights.
+
+    A conversion can declare ``num_nextn_predict_layers`` in the config while
+    dropping the MTP weights themselves (e.g. the DeepSeek-V4-Flash 2bit-DQ
+    build). The runtime uses this probe to tell that benign case (config field
+    only -> degrade to autoregressive) apart from a genuine injection failure
+    (weights present but unusable -> raise).
+
+    Conservative by design: it only returns ``False`` when it can *positively*
+    confirm absence via a shard index that carries no MTP-shaped keys under any
+    known naming convention. A sidecar file, a missing/unreadable index, or any
+    ambiguity returns ``True`` so the existing injection + validation path runs
+    unchanged and a real detection bug on an MTP-bearing model still surfaces.
+    """
+    model_path = Path(model_dir)
+    config = config if config is not None else load_config(model_path)
+
+    # 1. Explicit MTP sidecar file (Qwen/GLM/hy3 external draft head).
+    if expected_mtp_file(model_path, config).exists():
+        return True
+
+    index_path = model_path / "model.safetensors.index.json"
+    if not index_path.exists():
+        # No index to inspect: cannot prove absence, preserve legacy behavior.
+        return True
+    try:
+        weight_map = json.loads(index_path.read_text(encoding="utf-8")).get(
+            "weight_map", {}
+        )
+    except Exception:
+        return True
+    keys = [str(k) for k in weight_map]
+
+    # 2. Namespaced embedded MTP weights ("mtp.*" / "language_model.mtp.*").
+    if any(is_mtp_key(k) for k in keys):
+        return True
+
+    # 3. DeepSeek-style trailing MTP decoder layer(s) appended after the trunk:
+    #    model.layers.{num_hidden_layers + i}.*
+    start = int(
+        text_config(config).get("num_hidden_layers")
+        or config.get("num_hidden_layers")
+        or 0
+    )
+    count = _num_mtp_layers(config)
+    if start and count:
+        wanted = tuple(f"model.layers.{start + i}." for i in range(count))
+        if any(k.startswith(wanted) for k in keys):
+            return True
+
+    return False
 
 
 @dataclass(frozen=True)

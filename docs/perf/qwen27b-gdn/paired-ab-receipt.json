@@ -1,0 +1,30 @@
+{
+ "K2": {
+  "deltas_pct": [
+   -1.567,
+   1.043,
+   0.552,
+   0.585,
+   1.974,
+   0.317
+  ],
+  "mean_pct": 0.484,
+  "spread_pct": 3.541,
+  "hq_wins": "5/6",
+  "confirmed_improvement": false
+ },
+ "K3": {
+  "deltas_pct": [
+   0.814,
+   0.736,
+   0.845,
+   1.122,
+   1.12,
+   0.608
+  ],
+  "mean_pct": 0.874,
+  "spread_pct": 0.514,
+  "hq_wins": "6/6",
+  "confirmed_improvement": true
+ }
+}

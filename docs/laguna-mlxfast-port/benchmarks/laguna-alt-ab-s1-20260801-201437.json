@@ -1,0 +1,115 @@
+{
+ "label": "s1",
+ "alt_configs": [
+  "",
+  "d1_residual_router"
+ ],
+ "alt_scheds": [
+  "sync",
+  "async"
+ ],
+ "env": {
+  "MTPLX_LAGUNA_FUSED_GATE_UP": "1",
+  "MTPLX_LAGUNA_FUSED_SHARED_GATE_UP": "1",
+  "MTPLX_LAGUNA_KERNEL_ROUTER": "1",
+  "MTPLX_LAGUNA_KERNEL_ATTN_GATE": "1",
+  "MTPLX_LAGUNA_KERNEL_QK_ROPE": "1",
+  "MTPLX_LAGUNA_KERNEL_COMBINE": "1",
+  "MTPLX_LAGUNA_KERNEL_ROUTER_GEMV": "1",
+  "MTPLX_LAGUNA_FIXED_M2_ROUTER": "1"
+ },
+ "context_tokens": 1024,
+ "decode_tokens": 96,
+ "warmup_tokens": 8,
+ "cells": [
+  {
+   "lane": "reference",
+   "compiled": true,
+   "cap": 2048,
+   "decode_tokens": 96,
+   "warmup_tokens": 8,
+   "ms_per_step": 14.862,
+   "per_request_tokps": 67.29,
+   "peak_bytes": 65193201820,
+   "peak_gib": 60.72,
+   "token_digest": "9098436fbc29879b"
+  },
+  {
+   "lane": "alt[stock|sync]",
+   "compiled": true,
+   "cap": 2048,
+   "sched": "sync",
+   "packed_kv": false,
+   "alt_config": [],
+   "decode_tokens": 96,
+   "warmup_tokens": 8,
+   "ms_per_step": 14.81,
+   "per_request_tokps": 67.52,
+   "peak_bytes": 65193210511,
+   "peak_gib": 60.72,
+   "token_digest": "9098436fbc29879b"
+  },
+  {
+   "lane": "alt[stock|async]",
+   "compiled": true,
+   "cap": 2048,
+   "sched": "async",
+   "packed_kv": false,
+   "alt_config": [],
+   "decode_tokens": 96,
+   "warmup_tokens": 8,
+   "ms_per_step": 14.243,
+   "per_request_tokps": 70.21,
+   "peak_bytes": 65193210511,
+   "peak_gib": 60.72,
+   "token_digest": "9098436fbc29879b"
+  },
+  {
+   "lane": "alt[d1_residual_router|sync]",
+   "compiled": true,
+   "cap": 2048,
+   "sched": "sync",
+   "packed_kv": false,
+   "alt_config": [
+    "d1_residual_router"
+   ],
+   "decode_tokens": 96,
+   "warmup_tokens": 8,
+   "ms_per_step": 14.734,
+   "per_request_tokps": 67.87,
+   "peak_bytes": 65193210511,
+   "peak_gib": 60.72,
+   "token_digest": "9098436fbc29879b"
+  },
+  {
+   "lane": "alt[d1_residual_router|async]",
+   "compiled": true,
+   "cap": 2048,
+   "sched": "async",
+   "packed_kv": false,
+   "alt_config": [
+    "d1_residual_router"
+   ],
+   "decode_tokens": 96,
+   "warmup_tokens": 8,
+   "ms_per_step": 14.051,
+   "per_request_tokps": 71.17,
+   "peak_bytes": 65193219239,
+   "peak_gib": 60.72,
+   "token_digest": "9098436fbc29879b"
+  }
+ ],
+ "digests": {
+  "reference": "9098436fbc29879b",
+  "alt[stock|sync]": "9098436fbc29879b",
+  "alt[stock|async]": "9098436fbc29879b",
+  "alt[d1_residual_router|sync]": "9098436fbc29879b",
+  "alt[d1_residual_router|async]": "9098436fbc29879b"
+ },
+ "digest_match": {
+  "alt[stock|sync]": true,
+  "alt[stock|async]": true,
+  "alt[d1_residual_router|sync]": true,
+  "alt[d1_residual_router|async]": true
+ }
+}

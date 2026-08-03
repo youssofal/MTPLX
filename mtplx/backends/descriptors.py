@@ -570,6 +570,48 @@ GLM_MTP_DESCRIPTOR = BackendDescriptor(
 )
 
 
+HY_V3_MTP_DESCRIPTOR = BackendDescriptor(
+    backend_id="hy_v3_mtp",
+    architecture_id="hy-v3-mtp",
+    model_family="hy",
+    display_name="Hy3 native MTP",
+    artifact_layout="single_mlx_folder_native_mtp",
+    runtime_capabilities=NATIVE_CONTRACT_DESCRIPTOR.runtime_capabilities,
+    # Official Tencent inference settings (tencent/Hy3 generation_config.json):
+    # temperature 0.9, top_p 1.0, top_k disabled. Do NOT inherit the Qwen
+    # 0.6/0.95/20 coding sampler; Hy3's CoT measurably degrades at greedy/cold
+    # settings (community reports on the release thread).
+    sampler_defaults=SamplerDefaults(temperature=0.9, top_p=1.0, top_k=0),
+    # Hy3 emits <think:opensource>...</think:opensource> (suffixed single
+    # tokens). The qwen3-style splitter handles suffixed spellings.
+    reasoning_codec=ReasoningCodec(
+        parser="qwen3",
+        display_name="Hy3 think tags",
+        default_mode="auto",
+    ),
+    draft_semantics=NATIVE_CONTRACT_DESCRIPTOR.draft_semantics,
+    uses_external_assistant=False,
+    uses_draft_lm_head=True,
+    hidden_variant="pre_norm",
+    tune_policy=TunePolicy(
+        supported=False,
+        unsupported_reason="Tune is supported for Qwen 3.5, Qwen 3.6, and Gemma 4 MTPLX models only.",
+    ),
+    kv_quant_policy=KVQuantPolicy(
+        supported=False,
+        disabled_reason="KV quantization is not supported for Hy3.",
+    ),
+    validation_status="experimental_contract_gated",
+    status="experimental_contract_gated",
+    notes=(
+        "Single appended NextN MoE layer (depth 1); 192-expert sigmoid top-8 "
+        "routing with expert bias; draft input eh_proj(concat[enorm(embedding), "
+        "hnorm(pre-final-norm hidden)]).",
+        "Official sampler: temperature 0.9, top_p 1.0, top_k off.",
+    ),
+)
+
+
 GEMMA4_TARGET_DISTRIBUTION_POLICY = TargetDistributionPolicy(
     modes=("gemma4_target_prefix_exact",),
     default_mode="gemma4_target_prefix_exact",
@@ -695,6 +737,7 @@ DESCRIPTORS_BY_BACKEND_ID: dict[str, BackendDescriptor] = {
     STEP3P5_MTP_DESCRIPTOR.backend_id: STEP3P5_MTP_DESCRIPTOR,
     DEEPSEEK_MTP_DESCRIPTOR.backend_id: DEEPSEEK_MTP_DESCRIPTOR,
     GLM_MTP_DESCRIPTOR.backend_id: GLM_MTP_DESCRIPTOR,
+    HY_V3_MTP_DESCRIPTOR.backend_id: HY_V3_MTP_DESCRIPTOR,
     "mimo_mtp": NATIVE_CONTRACT_DESCRIPTOR,
     "nemotron_h_mtp": NATIVE_CONTRACT_DESCRIPTOR,
 }

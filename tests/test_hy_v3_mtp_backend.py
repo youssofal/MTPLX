@@ -1,15 +1,16 @@
 """Regression tests for the hy_v3 MTP backend (audit-driven).
 
-mlx-lm ships models/hy_v3.py on main but not in any release yet (latest is
-0.31.3, checked 2026-07-11); the backend is inert until it lands, so these
-tests skip rather than break collection on released mlx-lm.
+MTPLX now vendors the MTP-capable model class (mtplx/vendored_hy_v3.py) and
+registers it as ``mlx_lm.models.hy_v3`` via install_hy_v3_model_shim(), so
+these tests run on released mlx-lm instead of skipping.
 """
 import pytest
 
-hy_v3 = pytest.importorskip(
-    "mlx_lm.models.hy_v3",
-    reason="mlx-lm does not ship models/hy_v3 yet (unreleased upstream)",
-)
+from mtplx.hy_v3_mtp_patch import install_hy_v3_model_shim
+
+install_hy_v3_model_shim()
+
+import mlx_lm.models.hy_v3 as hy_v3
 
 import mlx.core as mx
 from pathlib import Path
@@ -101,3 +102,66 @@ def test_ar_only_export_raises_clearly():
         assert "no MTP submodule" in str(e) or "AR-only" in str(e)
     else:
         raise AssertionError("expected RuntimeError on AR-only export")
+
+
+def test_hy_v3_descriptor_official_sampler():
+    from mtplx.backends.descriptors import descriptor_for_backend_id
+
+    d = descriptor_for_backend_id("hy_v3_mtp")
+    assert d.backend_id == "hy_v3_mtp"
+    assert d.sampler_defaults.to_dict() == {
+        "temperature": 0.9,
+        "top_p": 1.0,
+        "top_k": 0,
+    }
+    assert d.reasoning_codec.parser == "qwen3"
+
+
+def test_hy_v3_suffixed_think_tags_split():
+    from mtplx.reasoning_codecs import (
+        QwenThinkingContentStreamSplitter,
+        split_qwen_reasoning_text,
+    )
+
+    text = "<think:opensource>hidden plan</think:opensource>visible answer"
+    parts = split_qwen_reasoning_text(text, thinking_enabled=True)
+    assert parts.reasoning == "hidden plan"
+    assert parts.content == "visible answer"
+
+    # streaming: the close tag split across chunk boundaries must not leak
+    sp = QwenThinkingContentStreamSplitter(thinking_enabled=True)
+    outs = []
+    for piece in (
+        "deep thought",
+        "s</think:opensou",
+        "rce>final code with a long enough visible tail to flush the holdback",
+    ):
+        outs += sp.feed(piece)
+    outs += sp.finish()
+    reasoning = "".join(t for f, t in outs if f == "reasoning_content")
+    content = "".join(t for f, t in outs if f == "content")
+    assert "final code" in content
+    assert "opensou" not in content and "rce>" not in content
+    assert "deep thoughts" in reasoning
+
+
+def test_hy_v3_model_declared_sampler_defaults(tmp_path):
+    import json
+
+    from mtplx.server.openai import _model_declared_sampler_defaults
+
+    model = tmp_path / "hy3"
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps({"model_type": "hy_v3"}))
+    (model / "generation_config.json").write_text(
+        json.dumps({"temperature": 0.9, "top_p": 1, "top_k": -1})
+    )
+    assert _model_declared_sampler_defaults(str(model)) == {
+        "temperature": 0.9,
+        "top_p": 1.0,
+        "top_k": 0,
+    }
+
+    # non-hy_v3 models keep project defaults untouched
+    (model / "config.json").write_text(json.dumps({"model_type": "qwen3_next"}))
+    assert _model_declared_sampler_defaults(str(model)) is None

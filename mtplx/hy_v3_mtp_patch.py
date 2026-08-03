@@ -28,12 +28,51 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 _TOP_LEVEL_MTP_PARTS = ("enorm", "hnorm", "eh_proj", "final_layernorm")
+
+
+def is_hy_v3_config(config: dict[str, Any]) -> bool:
+    """True for any hy_v3 checkpoint (with or without the MTP head)."""
+    model_type = str(config.get("model_type", "")).lower()
+    architectures = [str(a) for a in config.get("architectures") or []]
+    return model_type == "hy_v3" or any(
+        a in ("HyV3ForCausalLM", "HYV3ForCausalLM") for a in architectures
+    )
+
+
+def install_hy_v3_model_shim() -> None:
+    """Make ``mlx_lm.models.hy_v3`` importable on released mlx-lm.
+
+    No released mlx-lm ships a hy_v3 model class (ml-explore/mlx-lm#1211 is
+    open; the MTP surface lives only in the #1485 stack). Register the vendored
+    class so ``mlx_lm.utils.load`` can build the model. If a future upstream
+    module exists AND exposes the MTP surface (``predict_next_tokens``), prefer
+    it; a base-only upstream (which strips MTP in sanitize) is overridden, as
+    it would silently drop the head this backend exists to use. Idempotent.
+    """
+    name = "mlx_lm.models.hy_v3"
+    mod = sys.modules.get(name)
+    if mod is not None and hasattr(getattr(mod, "Model", None), "predict_next_tokens"):
+        return
+    if mod is None:
+        try:
+            import importlib
+
+            mod = importlib.import_module(name)
+        except ImportError:
+            mod = None
+    if mod is not None and hasattr(getattr(mod, "Model", None), "predict_next_tokens"):
+        return
+    from . import vendored_hy_v3
+
+    sys.modules[name] = vendored_hy_v3
+    logger.info("[Hy3] vendored hy_v3 model class registered as %s", name)
 
 
 def is_hy_v3_mtp_config(config: dict[str, Any]) -> bool:
@@ -172,6 +211,37 @@ def _quantize_grafted_mtp(
     )
 
 
+def _checkpoint_carries_mtp_tensors(
+    model_path: Path, config: dict[str, Any], model: Any = None
+) -> bool:
+    """True when the checkpoint ships draft tensors in either hy_v3 layout.
+
+    Key-name scan only (index json when present, safetensors headers
+    otherwise) — never materializes tensors, so it is cheap even on the
+    295B artifact.
+    """
+    prefixes = (_spec_layer_prefix(config, model), "model.mtp.", "mtp.")
+    index_path = model_path / "model.safetensors.index.json"
+    if index_path.exists():
+        try:
+            weight_map = json.loads(index_path.read_text()).get("weight_map", {})
+        except (OSError, ValueError):
+            weight_map = {}
+        if weight_map:
+            return any(str(key).startswith(prefixes) for key in weight_map)
+    try:
+        from safetensors import safe_open
+
+        for file in sorted(model_path.glob("model*.safetensors")):
+            with safe_open(str(file), framework="np") as handle:
+                if any(str(key).startswith(prefixes) for key in handle.keys()):
+                    return True
+        return False
+    except Exception:
+        # Header scan unavailable: fall back to the graft loader's reader.
+        return bool(_load_appended_layer_weights(model_path, config, model))
+
+
 def inject_hy_v3_mtp_support(
     model: Any,
     path: Path,
@@ -181,8 +251,10 @@ def inject_hy_v3_mtp_support(
     """Install the MTPLX draft surface on an already-loaded hy_v3 model.
 
     Returns True when the model exposes a usable MTP head. Raises if the
-    config promises MTP but neither a native ``model.mtp`` submodule nor
-    appended-layer checkpoint tensors exist (an AR-only export).
+    config promises MTP but the checkpoint carries no draft tensors (an
+    AR-only export) — including when the loaded model class constructs a
+    native ``model.mtp`` submodule unconditionally (the vendored class
+    does), where a randomly initialized head must never pass as usable.
     """
     if not is_hy_v3_mtp_config(config):
         return False
@@ -195,6 +267,14 @@ def inject_hy_v3_mtp_support(
 
     path = Path(path)
     native = getattr(model, "mtp", None) is not None
+    if native and not _checkpoint_carries_mtp_tensors(path, config, model):
+        raise RuntimeError(
+            f"{path}: config declares num_nextn_predict_layers="
+            f"{config.get('num_nextn_predict_layers')} but the checkpoint "
+            f"carries no {_spec_layer_prefix(config, model)}* or model.mtp.* "
+            "tensors — an AR-only export; the model class's constructed MTP "
+            "submodule is uninitialized and must not serve as a draft head."
+        )
     grafted = None
     if not native:
         weights = _load_appended_layer_weights(path, config, model)

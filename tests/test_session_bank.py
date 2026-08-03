@@ -506,3 +506,76 @@ def test_eviction_log_is_bounded_for_daemon_lifetime():
     assert len(bank.eviction_log) == 256
     # Newest entry survives at the tail; the oldest 44 fell off the front.
     assert bank.eviction_log[-1]["reason"] == "skipped_oversized_snapshot"
+
+
+def test_cross_session_eviction_prefers_idle_sessions_over_active_ones():
+    # 2026-07-31 live incident: cross-session LRU pressure evicted a
+    # mid-run coding session's warm entry, forcing an 85.6k-token full
+    # re-prefill on its next turn. Sessions that touched the bank within
+    # the active-pin TTL are eviction-last under cross-session pressure.
+    bank = SessionBank(max_entries=8, max_bytes=1000, per_session_max_bytes=1000)
+    runtime = SimpleNamespace(model_path=Path("models/example"), mtp_enabled=True)
+    bank.put(
+        runtime=runtime, token_ids=[1, 2, 3], cache=[], logits=None,
+        hidden=None, session_id="idle", nbytes_override=400,
+    )
+    bank.put(
+        runtime=runtime, token_ids=[9, 9, 9], cache=[], logits=None,
+        hidden=None, session_id="active", nbytes_override=400,
+    )
+    # The idle session went stale past the TTL; rig last_access so pure LRU
+    # would pick the ACTIVE session's entry — the preference must override.
+    bank._session_last_active["idle"] -= bank.active_pin_ttl_s + 1.0
+    for entry in bank._entries.values():
+        entry.last_access_s = 0.0 if entry.session_id == "active" else 1e12
+    bank.put(
+        runtime=runtime, token_ids=[5, 5, 5], cache=[], logits=None,
+        hidden=None, session_id="trigger", nbytes_override=400,
+    )
+    survivors = {entry.session_id for entry in bank._entries.values()}
+    assert survivors == {"active", "trigger"}
+    assert bank.eviction_log[-1]["session_id"] == "idle"
+    assert bank.eviction_log[-1]["session_active"] is False
+
+
+def test_active_session_over_its_own_budget_still_self_evicts():
+    # Per-session budget enforcement is self-inflicted pressure: an active
+    # session exceeding its own cap sheds its oldest entries even while
+    # pinned, keeping the newest (protected) snapshot.
+    bank = SessionBank(max_entries=8, max_bytes=10_000, per_session_max_bytes=500)
+    runtime = SimpleNamespace(model_path=Path("models/example"), mtp_enabled=True)
+    bank.put(
+        runtime=runtime, token_ids=[1, 2], cache=[], logits=None,
+        hidden=None, session_id="live", nbytes_override=300,
+    )
+    bank.put(
+        runtime=runtime, token_ids=[7, 7, 7], cache=[], logits=None,
+        hidden=None, session_id="live", nbytes_override=300,
+    )
+    lens = sorted(entry.prefix_len for entry in bank._entries.values())
+    assert lens == [3]
+    assert bank.eviction_log[-1]["session_id"] == "live"
+
+
+def test_per_session_entry_retention_bounds_divergent_siblings():
+    # 2026-08-01 live leak: divergent same-session tails are not strict
+    # prefixes, so supersede never fires and one agent session accumulated
+    # 5 near-duplicate multi-GB snapshots. Newest-K retention bounds it.
+    bank = SessionBank(max_entries=16, max_bytes=10_000, per_session_max_bytes=10_000)
+    runtime = SimpleNamespace(model_path=Path("models/example"), mtp_enabled=True)
+    for i in range(5):
+        bank.put(
+            runtime=runtime, token_ids=[7, 7, 100 + i], cache=[], logits=None,
+            hidden=None, session_id="agent", nbytes_override=100,
+        )
+    survivors = sorted(e.token_ids[-1] for e in bank._entries.values())
+    assert len(survivors) == bank.per_session_max_entries == 3
+    assert 104 in survivors  # newest always kept
+    assert bank.eviction_log[-1]["reason"] == "session_entry_retention"
+    # Other sessions unaffected by one session's churn.
+    bank.put(
+        runtime=runtime, token_ids=[9, 9, 9], cache=[], logits=None,
+        hidden=None, session_id="other", nbytes_override=100,
+    )
+    assert sum(1 for e in bank._entries.values() if e.session_id == "other") == 1
+    assert sum(1 for e in bank._entries.values() if e.session_id == "agent") == 3

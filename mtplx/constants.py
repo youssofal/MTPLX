@@ -184,6 +184,29 @@ EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_TENSOR_COUNT = len(
     EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS
 )
 
+_MTP_LAYER_KEY_MARKER = "mtp.layers.0."
+
+
+def expand_mtp_layer_keys(keys: tuple[str, ...] | set[str], n_layers: int) -> set[str]:
+    """Expand a depth-1 MTP key template across ``n_layers`` draft layers.
+
+    Every expected-key set in this module describes the canonical
+    single-layer (``mtp.layers.0.*``) head. Upstream checkpoints may declare
+    ``mtp_num_hidden_layers > 1`` (the config key is N-generic in the vLLM
+    reference contract); their weight layout replicates the per-layer
+    template at each index. Identity for ``n_layers <= 1``.
+    """
+    n = max(int(n_layers), 1)
+    expanded: set[str] = set()
+    for key in keys:
+        if _MTP_LAYER_KEY_MARKER in key:
+            for index in range(n):
+                expanded.add(key.replace(_MTP_LAYER_KEY_MARKER, f"mtp.layers.{index}.", 1))
+        else:
+            expanded.add(key)
+    return expanded
+
+
 MULTIMODAL_SIDECARS = (
     "preprocessor_config.json",
     "processor_config.json",

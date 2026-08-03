@@ -1,3 +1,5 @@
+*(v0.1-era research snapshot — see docs/releases/ for the current state.)*
+
 # Native MTP On MLX
 
 MTPLX explores the built-in MTP heads in Qwen3-Next models on Apple Silicon.

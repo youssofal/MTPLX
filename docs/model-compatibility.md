@@ -5,9 +5,9 @@ MTPLX separates detection from support.
 | Tier | Meaning | Default behavior |
 |---|---|---|
 | Verified | `mtplx_runtime.json` exists and matches the expected contract | Run |
-| Architecture-compatible, unverified | Qwen3-Next MTP markers exist, but no MTPLX contract | Refuse unless explicitly forced |
+| Architecture-compatible, unverified | Qwen3-Next MTP markers exist, but no MTPLX contract | Loads and runs, labeled unverified (regenerate provenance to clear the label) |
 | AR-only | An exact architecture-specific AR loader is installed, but the checkpoint has no MTP head | Run only with target-only AR selected |
-| Incompatible architecture | MTP markers exist for an unsupported architecture | Exit with roadmap pointer |
+| Incompatible architecture | MTP markers exist for an unsupported architecture | Exit with roadmap pointer; experimental contract-gated backends exist for several of these families (DeepSeek V3/V4, GLM, MiMo, Nemotron-H, Step3.5, Hy-V3) |
 | No MTP | No MTP head detected | Exit with a clear message |
 
 The AR-only tier is narrow by design. It currently recognizes the exact

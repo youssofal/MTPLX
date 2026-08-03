@@ -1,0 +1,54 @@
+{
+ "label": "baseline",
+ "lanes": [
+  "reference",
+  "alt"
+ ],
+ "alt_config": "",
+ "env": {
+  "MTPLX_LAGUNA_FUSED_GATE_UP": "1",
+  "MTPLX_LAGUNA_FUSED_SHARED_GATE_UP": "1",
+  "MTPLX_LAGUNA_KERNEL_ROUTER": "1",
+  "MTPLX_LAGUNA_KERNEL_ATTN_GATE": "1",
+  "MTPLX_LAGUNA_KERNEL_QK_ROPE": "1",
+  "MTPLX_LAGUNA_KERNEL_COMBINE": "1",
+  "MTPLX_LAGUNA_KERNEL_ROUTER_GEMV": "1",
+  "MTPLX_LAGUNA_FIXED_M2_ROUTER": "1"
+ },
+ "context_tokens": 1024,
+ "decode_tokens": 96,
+ "warmup_tokens": 8,
+ "cells": [
+  {
+   "lane": "reference",
+   "compiled": true,
+   "cap": 2048,
+   "decode_tokens": 96,
+   "warmup_tokens": 8,
+   "ms_per_step": 14.86,
+   "per_request_tokps": 67.3,
+   "peak_bytes": 65193201820,
+   "peak_gib": 60.72,
+   "token_digest": "9098436fbc29879b"
+  },
+  {
+   "lane": "alt",
+   "compiled": true,
+   "cap": 2048,
+   "packed_kv": false,
+   "alt_config": [],
+   "decode_tokens": 96,
+   "warmup_tokens": 8,
+   "ms_per_step": 14.872,
+   "per_request_tokps": 67.24,
+   "peak_bytes": 65193210371,
+   "peak_gib": 60.72,
+   "token_digest": "9098436fbc29879b"
+  }
+ ],
+ "digests": {
+  "reference": "9098436fbc29879b",
+  "alt": "9098436fbc29879b"
+ },
+ "digest_match": true
+}

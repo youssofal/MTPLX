@@ -1,0 +1,553 @@
+launching batch runner over 13 checks in one flock window (background)
+=== batch check runner | label=port-checks-all | uid=501 | 08:13:30 ===
+=== 13 check script(s) queued ===
+    - /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/laguna-s21-mlxfast-kernels/scratchpad_qk_yarn_check.py
+    - /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/laguna-s21-mlxfast-kernels/scratchpad_qk_rope_sliding_check.py
+    - /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/laguna-s21-mlxfast-kernels/scratchpad_gated_oproj_check.py
+    - /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/laguna-s21-mlxfast-kernels/scratchpad_qkvg_check.py
+    - /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/laguna-s21-mlxfast-kernels/scratchpad_router_topk_check.py
+    - /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/laguna-s21-mlxfast-kernels/scratchpad_moe_combine_check.py
+    - /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/laguna-s21-mlxfast-kernels/scratchpad_moe_shared_check.py
+    - /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/laguna-s21-mlxfast-kernels/scratchpad_moe_merged_check.py
+    - /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/laguna-s21-mlxfast-kernels/scratchpad_dense_mlp_check.py
+    - /private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/c9919a00-4c3e-4ca4-bce9-298f46559aad/scratchpad/scratchpad_prefill_qk_rope_check.py
+    - /private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/c9919a00-4c3e-4ca4-bce9-298f46559aad/scratchpad/scratchpad_prefill_router_check.py
+    - /private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/c9919a00-4c3e-4ca4-bce9-298f46559aad/scratchpad/scratchpad_prefill_moe_combine_check.py
+    - /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/laguna-s21-mlxfast-kernels/scratchpad_steel_attn_check.py
+=== waiting for GPU flock (up to 1800s; another agent may hold it) ===
+=== GPU flock ACQUIRED ===
++ launchctl bootout gui/501/com.tea.qwen
+[rc=0]
+=== qwen UNLOADED ===
+
+=========== CHECK: /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/laguna-s21-mlxfast-kernels/scratchpad_qk_yarn_check.py ===========
+device: Device(gpu, 0)
+S-2.1 full-attn: q_heads=48 kv_heads=8 head_dim=128 rot_dims=64 mscale=1.4852030263919618
+YarnRoPE.mscale=1.4852030263919618  freqs.size=32
+
+== correctness (offset=0) ==
+    challenge-port q vs stock                    exact=True  allclose=True  max|d|=0.000e+00
+    challenge-port k vs stock                    exact=True  allclose=True  max|d|=0.000e+00
+    (MTPLX kernel eligible=True)
+    MTPLX kernel  q vs stock                     exact=True  allclose=True  max|d|=0.000e+00
+    MTPLX kernel  k vs stock                     exact=True  allclose=True  max|d|=0.000e+00
+    challenge-port q vs MTPLX                    exact=True  allclose=True  max|d|=0.000e+00
+
+== correctness (offset=1) ==
+    challenge-port q vs stock                    exact=True  allclose=True  max|d|=0.000e+00
+    challenge-port k vs stock                    exact=True  allclose=True  max|d|=0.000e+00
+    (MTPLX kernel eligible=True)
+    MTPLX kernel  q vs stock                     exact=True  allclose=True  max|d|=0.000e+00
+    MTPLX kernel  k vs stock                     exact=True  allclose=True  max|d|=0.000e+00
+    challenge-port q vs MTPLX                    exact=True  allclose=True  max|d|=0.000e+00
+
+== correctness (offset=137) ==
+    challenge-port q vs stock                    exact=True  allclose=True  max|d|=0.000e+00
+    challenge-port k vs stock                    exact=True  allclose=True  max|d|=0.000e+00
+    (MTPLX kernel eligible=True)
+    MTPLX kernel  q vs stock                     exact=True  allclose=True  max|d|=0.000e+00
+    MTPLX kernel  k vs stock                     exact=True  allclose=True  max|d|=0.000e+00
+    challenge-port q vs MTPLX                    exact=True  allclose=True  max|d|=0.000e+00
+
+== correctness (offset=4095) ==
+    challenge-port q vs stock                    exact=True  allclose=True  max|d|=0.000e+00
+    challenge-port k vs stock                    exact=True  allclose=True  max|d|=0.000e+00
+    (MTPLX kernel eligible=True)
+    MTPLX kernel  q vs stock                     exact=True  allclose=True  max|d|=0.000e+00
+    MTPLX kernel  k vs stock                     exact=True  allclose=True  max|d|=0.000e+00
+    challenge-port q vs MTPLX                    exact=True  allclose=True  max|d|=0.000e+00
+
+== timing (offset=137, n=400, us/call) ==
+  [chained] port    25.82 | mtplx    24.34 | stock    19.57  <- decode predictor
+  [queued ] port     8.57 | mtplx     7.50 | stock    24.52
+  [eager  ] port   173.34 | mtplx   164.09 | stock   166.18
+
+NOTE: judge speedup on the CHAINED lane (B=1 serial decode link). The port and MTPLX kernel replace ~6 stock dispatches with 1; expect allclose (<= ~1 bf16 ULP in the rotary region), not bit-exact, vs mx.fast.rope. Confirm greedy-token parity in the model before shipping.
+=== scratchpad_qk_yarn_check.py -> OK (1.0s) ===
+
+=========== CHECK: /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/laguna-s21-mlxfast-kernels/scratchpad_qk_rope_sliding_check.py ===========
+device: Device(gpu, 0)
+S-2.1 sliding: q_heads=72 kv_heads=8 head_dim=128 rot_dims=128 theta=10000.0
+
+== correctness (offset=0) ==
+    challenge-port q vs stock                    exact=True  allclose=True  max|d|=0.000e+00
+    challenge-port k vs stock                    exact=True  allclose=True  max|d|=0.000e+00
+    (MTPLX kernel eligible=True)
+    MTPLX kernel  q vs stock                     exact=True  allclose=True  max|d|=0.000e+00
+    MTPLX kernel  k vs stock                     exact=True  allclose=True  max|d|=0.000e+00
+    challenge-port q vs MTPLX                    exact=True  allclose=True  max|d|=0.000e+00
+
+== correctness (offset=1) ==
+    challenge-port q vs stock                    exact=True  allclose=True  max|d|=0.000e+00
+    challenge-port k vs stock                    exact=True  allclose=True  max|d|=0.000e+00
+    (MTPLX kernel eligible=True)
+    MTPLX kernel  q vs stock                     exact=True  allclose=True  max|d|=0.000e+00
+    MTPLX kernel  k vs stock                     exact=True  allclose=True  max|d|=0.000e+00
+    challenge-port q vs MTPLX                    exact=True  allclose=True  max|d|=0.000e+00
+
+== correctness (offset=137) ==
+    challenge-port q vs stock                    exact=True  allclose=True  max|d|=0.000e+00
+    challenge-port k vs stock                    exact=True  allclose=True  max|d|=0.000e+00
+    (MTPLX kernel eligible=True)
+    MTPLX kernel  q vs stock                     exact=True  allclose=True  max|d|=0.000e+00
+    MTPLX kernel  k vs stock                     exact=True  allclose=True  max|d|=0.000e+00
+    challenge-port q vs MTPLX                    exact=True  allclose=True  max|d|=0.000e+00
+
+== correctness (offset=511) ==
+    challenge-port q vs stock                    exact=True  allclose=True  max|d|=0.000e+00
+    challenge-port k vs stock                    exact=True  allclose=True  max|d|=0.000e+00
+    (MTPLX kernel eligible=True)
+    MTPLX kernel  q vs stock                     exact=True  allclose=True  max|d|=0.000e+00
+    MTPLX kernel  k vs stock                     exact=True  allclose=True  max|d|=0.000e+00
+    challenge-port q vs MTPLX                    exact=True  allclose=True  max|d|=0.000e+00
+
+== timing (offset=137, n=400, us/call) ==
+  [chained] port    17.01 | mtplx    15.11 | stock     5.73  <- decode predictor
+  [queued ] port    10.02 | mtplx     7.17 | stock     7.61
+  [eager  ] port   167.75 | mtplx   165.88 | stock   161.60
+
+NOTE: judge speedup on the CHAINED lane. The port replaces 4 stock dispatches with 1; expect allclose (<= ~1 bf16 ULP rotary), not bit-exact, vs mx.fast.rope. Confirm greedy-token parity in the model.
+=== scratchpad_qk_rope_sliding_check.py -> OK (0.9s) ===
+
+=========== CHECK: /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/laguna-s21-mlxfast-kernels/scratchpad_gated_oproj_check.py ===========
+device: Device(gpu, 0)
+S-2.1 gated o_proj: hidden=3072 head_dim=128 gs=64 bits in (5,8)
+
+== correctness (n_heads=48, bits=8, in_vec=6144) ==
+    challenge-port vs stock                      exact=False allclose=True  max|d|=6.104e-05
+    MTPLX gate+qmm vs stock                      exact=True  allclose=True  max|d|=0.000e+00
+    challenge-port vs MTPLX                      exact=False allclose=True  max|d|=6.104e-05
+
+== correctness (n_heads=72, bits=5, in_vec=9216) ==
+    challenge-port vs stock                      exact=False allclose=False max|d|=9.180e-02
+    MTPLX gate+qmm vs stock                      exact=True  allclose=True  max|d|=0.000e+00
+    challenge-port vs MTPLX                      exact=False allclose=False max|d|=9.180e-02
+
+== correctness (n_heads=48, bits=5, in_vec=6144) ==
+    challenge-port vs stock                      exact=False allclose=False max|d|=7.812e-02
+    MTPLX gate+qmm vs stock                      exact=True  allclose=True  max|d|=0.000e+00
+    challenge-port vs MTPLX                      exact=False allclose=False max|d|=7.812e-02
+
+== correctness (n_heads=72, bits=8, in_vec=9216) ==
+    challenge-port vs stock                      exact=False allclose=True  max|d|=6.104e-05
+    MTPLX gate+qmm vs stock                      exact=True  allclose=True  max|d|=0.000e+00
+    challenge-port vs MTPLX                      exact=False allclose=True  max|d|=6.104e-05
+
+== timing (n_heads=48, bits=8, n=300, us/call) ==
+  [chained] port   252.73 | mtplx    40.98 | stock    40.36  <- decode predictor
+  [queued ] port    78.63 | mtplx    24.53 | stock    25.88
+  [eager  ] port   425.64 | mtplx   186.81 | stock   188.48
+
+== timing (n_heads=72, bits=5, n=300, us/call) ==
+  [chained] port   390.98 | mtplx    41.57 | stock    40.37  <- decode predictor
+  [queued ] port   149.97 | mtplx    24.19 | stock    25.92
+  [eager  ] port   553.42 | mtplx   186.65 | stock   194.31
+
+NOTE: the port fuses softplus + gate product + affine GEMV into ONE dispatch vs the stock 2-dispatch tail (gate kernel + quantized_matmul). The projection is FP32-accumulate (allclose to quantized_matmul, not bit-exact). Judge the CHAINED lane and confirm greedy-token parity.
+=== scratchpad_gated_oproj_check.py -> OK (1.6s) ===
+
+=========== CHECK: /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/laguna-s21-mlxfast-kernels/scratchpad_qkvg_check.py ===========
+mlx 0.31.2  device=Device(gpu, 0)  warmup=10 iters=200
+
+=== full_attention layer: n_heads=48, bits=8, rows_per_thread=8 ===
+  shapes [(1, 1, 6144), (1, 1, 1024), (1, 1, 1024), (1, 1, 48)]: OK
+  q: vs stock max=3.906e-03 allclose(2e-2)=True | vs ref max=7.812e-03 allclose(1e-2)=True | range=10.56
+  k: vs stock max=0.000e+00 allclose(2e-2)=True | vs ref max=3.906e-03 allclose(1e-2)=True | range=8.56
+  v: vs stock max=0.000e+00 allclose(2e-2)=True | vs ref max=0.000e+00 allclose(1e-2)=True | range=10.25
+  g: vs stock max=0.000e+00 allclose(2e-2)=True | vs ref max=0.000e+00 allclose(1e-2)=True | range=5.72
+  allclose: OK
+  queued lane: fused 0.0570 ms | stock 0.0304 ms | speedup 0.534x   <-- decision lane
+  eager  lane: fused 0.2604 ms | stock 0.2008 ms | speedup 0.771x
+
+=== sliding_attention layer: n_heads=72, bits=5, rows_per_thread=8 ===
+  shapes [(1, 1, 9216), (1, 1, 1024), (1, 1, 1024), (1, 1, 72)]: OK
+  q: vs stock max=1.074e-01 allclose(2e-2)=False | vs ref max=6.104e-05 allclose(1e-2)=True | range=11.31
+  k: vs stock max=9.375e-02 allclose(2e-2)=False | vs ref max=0.000e+00 allclose(1e-2)=True | range=11.25
+  v: vs stock max=9.375e-02 allclose(2e-2)=False | vs ref max=0.000e+00 allclose(1e-2)=True | range=10.25
+  g: vs stock max=7.031e-02 allclose(2e-2)=False | vs ref max=0.000e+00 allclose(1e-2)=True | range=6.88
+Traceback (most recent call last):
+  File "/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/laguna-s21-mlxfast-kernels/scratchpad_qkvg_check.py", line 171, in <module>
+    main()
+  File "/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/laguna-s21-mlxfast-kernels/scratchpad_qkvg_check.py", line 166, in main
+    bench("sliding_attention layer", *build_layer(n_heads=72, bits=5))
+  File "/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/laguna-s21-mlxfast-kernels/scratchpad_qkvg_check.py", line 145, in bench
+    correctness(spec, hidden, norm_weight, banks)
+  File "/Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/laguna-s21-mlxfast-kernels/scratchpad_qkvg_check.py", line 105, in correctness
+    assert ok, "allclose FAILED -- inspect the per-projection diffs above"
+           ^^
+AssertionError: allclose FAILED -- inspect the per-projection diffs above
+=== scratchpad_qkvg_check.py -> rc=1 (0.6s) ===
+
+=========== CHECK: /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/laguna-s21-mlxfast-kernels/scratchpad_router_topk_check.py ===========
+device: Device(gpu, 0)
+S-2.1 router: experts=256 top_k=10 norm=True scale=2.5
+
+== selection parity (rows=1, 64 draws) ==
+  bitonic: 0 set-flips vs argpartition | max|dw| matched = 0.000e+00
+  mtplx  : 0 set-flips vs argpartition | max|dw| matched = 8.941e-08
+
+== selection parity (rows=4, 64 draws) ==
+  bitonic: 0 set-flips vs argpartition | max|dw| matched = 0.000e+00
+  mtplx  : 0 set-flips vs argpartition | max|dw| matched = 8.941e-08
+
+== timing (rows=1, n=300, us/call) ==
+  [chained] bitonic   30.53 | mtplx   21.20 | stock   27.22  <- decode predictor
+  [queued ] bitonic    5.82 | mtplx    4.67 | stock   13.09
+  [eager  ] bitonic  166.99 | mtplx  169.57 | stock  174.53
+
+== timing (rows=4, n=300, us/call) ==
+  [chained] bitonic   14.93 | mtplx   21.17 | stock   28.32  <- decode predictor
+  [queued ] bitonic    5.83 | mtplx    5.19 | stock   13.70
+  [eager  ] bitonic  166.25 | mtplx  168.22 | stock  173.91
+
+NOTE: router selection is a us-scale epilogue over 256 floats; it is NOT the decode bottleneck (the compute-bound expert GEMM is). Expect the bitonic to land near the MTPLX selector and stock -- the ceiling here is tiny. Judge on the CHAINED lane.
+=== scratchpad_router_topk_check.py -> OK (0.9s) ===
+
+=========== CHECK: /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/laguna-s21-mlxfast-kernels/scratchpad_moe_combine_check.py ===========
+device: Device(gpu, 0)
+S-2.1 combine: top_k=10 hidden=3072 scale(pre-baked)=2.5
+
+== correctness (rows=1) ==
+  challenge-port combine vs stock            exact=True  allclose=True  max|d|=0.000e+00
+  MTPLX installed combine vs stock           exact=True  allclose=True  max|d|=0.000e+00
+  challenge-port vs MTPLX                    exact=True  allclose=True  max|d|=0.000e+00
+  challenge-port combine+residual vs stock+res exact=True  allclose=True  max|d|=0.000e+00
+
+== correctness (rows=512) ==
+  challenge-port combine vs stock            exact=True  allclose=True  max|d|=0.000e+00
+  MTPLX installed combine vs stock           exact=True  allclose=True  max|d|=0.000e+00
+  challenge-port vs MTPLX                    exact=True  allclose=True  max|d|=0.000e+00
+  challenge-port combine+residual vs stock+res exact=True  allclose=True  max|d|=0.000e+00
+
+== timing (rows=1, n=300, us/call) ==
+  [chained] port    16.21 | mtplx    11.26 | stock    14.25  <- decode predictor
+  [queued ] port     5.84 | mtplx     5.92 | stock     8.03
+  [eager  ] port   162.74 | mtplx   158.18 | stock   168.68
+  -- residual-fusing variant (rows=1) --
+  [chained] port combine+residual     6.87 us/call
+
+== timing (rows=512, n=300, us/call) ==
+  [chained] port    90.24 | mtplx    65.73 | stock   216.54  <- decode predictor
+  [queued ] port    41.63 | mtplx    41.41 | stock   197.33
+  [eager  ] port   200.99 | mtplx   201.02 | stock   362.63
+  -- residual-fusing variant (rows=512) --
+  [chained] port combine+residual    45.44 us/call
+
+NOTE: the combine is a us-scale elementwise/reduce epilogue, NOT the decode bottleneck (the compute-bound expert GEMM is). The port folds the shared add (and optionally residual) into one dispatch; the ceiling is the ~2 removed dispatches. Judge on the CHAINED lane. The residual variant needs the decoder layer to pass the residual in.
+=== scratchpad_moe_combine_check.py -> OK (1.3s) ===
+
+=========== CHECK: /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/laguna-s21-mlxfast-kernels/scratchpad_moe_shared_check.py ===========
+device=Device(gpu, 0)  E=256  hidden=3072 shared_inter=1024  bits=8 gs=128
+
+[rows=1] eligible=True shape=(1, 3072) dropin==kernel=True  -> PASS
+    kernel vs reference : abs 5.215e-07  rel 1.250e-06
+    kernel vs stock     : abs 4.992e-07  rel 1.196e-06
+    reference vs stock  : abs 1.341e-07  rel 3.213e-07
+    queued  kernel 0.0218 ms  stock 0.0152 ms  speedup x0.699  (verdict lane)
+    eager   kernel 0.5211 ms  stock 0.1825 ms  speedup x0.350
+
+[rows=2] eligible=True shape=(2, 3072) dropin==kernel=True  -> PASS
+    kernel vs reference : abs 7.705e-04  rel 1.548e-03
+    kernel vs stock     : abs 7.153e-07  rel 1.435e-06
+    reference vs stock  : abs 7.700e-04  rel 1.545e-03
+    queued  kernel 0.0305 ms  stock 0.0157 ms  speedup x0.515  (verdict lane)
+    eager   kernel 0.5215 ms  stock 0.1872 ms  speedup x0.359
+
+[rows=4] eligible=True shape=(4, 3072) dropin==kernel=True  -> PASS
+    kernel vs reference : abs 5.933e-04  rel 1.315e-03
+    kernel vs stock     : abs 6.631e-07  rel 1.468e-06
+    reference vs stock  : abs 5.933e-04  rel 1.313e-03
+    queued  kernel 0.0487 ms  stock 0.0248 ms  speedup x0.510  (verdict lane)
+    eager   kernel 0.5205 ms  stock 0.1987 ms  speedup x0.382
+
+[rows=8] eligible=True shape=(8, 3072) dropin==kernel=True  -> PASS
+    kernel vs reference : abs 6.740e-04  rel 1.561e-03
+    kernel vs stock     : abs 7.302e-07  rel 1.689e-06
+    reference vs stock  : abs 6.742e-04  rel 1.559e-03
+    queued  kernel 0.0851 ms  stock 0.0431 ms  speedup x0.507  (verdict lane)
+    eager   kernel 0.5152 ms  stock 0.2225 ms  speedup x0.432
+
+CORRECTNESS: ALL PASS
+=== scratchpad_moe_shared_check.py -> OK (1.7s) ===
+
+=========== CHECK: /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/laguna-s21-mlxfast-kernels/scratchpad_moe_merged_check.py ===========
+device=Device(gpu, 0)  E=256  hidden=3072  moe_inter=1024 shared_inter=1024  top_k=10 slots=11
+
+[rows=1] eligible=True slots=(1, 11, 3072) dropin==merged=True  -> PASS
+    combined kernel vs reference : abs 7.749e-07  rel 1.702e-06
+    combined kernel vs stock     : abs 7.749e-07  rel 1.702e-06
+    combined reference vs stock  : abs 1.788e-07  rel 3.927e-07
+    per-slot kernel vs reference : abs 6.296e-07  rel 1.912e-06
+    queued  merged 0.2321 ms  stock 0.1113 ms  speedup x0.480  (verdict lane)
+    eager   merged 0.6024 ms  stock 0.3016 ms  speedup x0.501
+
+[rows=2] eligible=True slots=(2, 11, 3072) dropin==merged=True  -> PASS
+    combined kernel vs reference : abs 5.904e-04  rel 1.196e-03
+    combined kernel vs stock     : abs 9.239e-07  rel 1.870e-06
+    combined reference vs stock  : abs 5.901e-04  rel 1.195e-03
+    per-slot kernel vs reference : abs 5.905e-04  rel 1.522e-03
+    queued  merged 0.2916 ms  stock 0.1644 ms  speedup x0.564  (verdict lane)
+    eager   merged 0.6523 ms  stock 0.4110 ms  speedup x0.630
+
+[rows=4] eligible=True slots=(4, 11, 3072) dropin==merged=True  -> PASS
+    combined kernel vs reference : abs 6.081e-04  rel 1.070e-03
+    combined kernel vs stock     : abs 8.643e-07  rel 1.519e-06
+    combined reference vs stock  : abs 6.082e-04  rel 1.069e-03
+    per-slot kernel vs reference : abs 6.080e-04  rel 1.344e-03
+    queued  merged 0.4886 ms  stock 0.3181 ms  speedup x0.651  (verdict lane)
+    eager   merged 0.7959 ms  stock 0.5795 ms  speedup x0.728
+
+[rows=8] eligible=True slots=(8, 11, 3072) dropin==merged=True  -> PASS
+    combined kernel vs reference : abs 6.738e-04  rel 1.212e-03
+    combined kernel vs stock     : abs 8.792e-07  rel 1.580e-06
+    combined reference vs stock  : abs 6.740e-04  rel 1.211e-03
+    per-slot kernel vs reference : abs 6.738e-04  rel 1.623e-03
+    queued  merged 1.0044 ms  stock 0.6376 ms  speedup x0.635  (verdict lane)
+    eager   merged 1.3442 ms  stock 0.9493 ms  speedup x0.706
+
+CORRECTNESS: ALL PASS
+=== scratchpad_moe_merged_check.py -> OK (3.1s) ===
+
+=========== CHECK: /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/laguna-s21-mlxfast-kernels/scratchpad_dense_mlp_check.py ===========
+device: Device(gpu, 0)
+
+output absmax (stock) = 1.0620e-02
+fused vs reference : max=1.526e-05 mean=5.239e-08  (want tight: same fp32-accumulate math)
+fused vs stock     : max=1.259e-04 mean=2.803e-05  (qmm gap; Metal qmm is fp32 so much tighter than CPU's ~1%)
+allclose(fused, reference, atol~1%output): True
+
+queued-lane timing over 300 iters:
+  stock MLP      : 0.0884 ms/tok
+  fused kernel   : 0.4290 ms/tok
+  speedup (stock/fused) = 0.206x
+
+Reminder: layer 0 is 1 of 48 layers (~2% of decode). A win here is
+bounded by that share, and the token-exact gate is NOT tested here.
+=== scratchpad_dense_mlp_check.py -> OK (0.4s) ===
+
+=========== CHECK: /private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/c9919a00-4c3e-4ca4-bce9-298f46559aad/scratchpad/scratchpad_prefill_qk_rope_check.py ===========
+
+=== P1 FULL/yarn : B=1 T=1024 q_heads=48 ===
+PASS P1 FULL/yarn kernel eligible
+Traceback (most recent call last):
+  File "/private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/c9919a00-4c3e-4ca4-bce9-298f46559aad/scratchpad/scratchpad_prefill_qk_rope_check.py", line 84, in <module>
+    mx.eval(kq, kk, sq, sk)
+RuntimeError: [metal::Device] Unable to build metal library from source
+mlx/backend/metal/kernels/utils.h:472:14: error: declaration of 'T' shadows template parameter
+        uint T = uint(seq_len);
+             ^
+mlx/backend/metal/kernels/utils.h:453:24: note: template parameter is declared here
+    template <typename T>
+                       ^
+mlx/backend/metal/kernels/utils.h:488:22: error: unknown type name 'T'
+        const device T* src = (is_q ? q_in : k_in) + in_base;
+                     ^
+mlx/backend/metal/kernels/utils.h:489:22: error: unknown type name 'T'
+        const device T* w = is_q ? q_w : k_w;
+                     ^
+mlx/backend/metal/kernels/utils.h:490:16: error: unknown type name 'T'
+        device T* dst = (is_q ? q_out : k_out) + out_base;
+               ^
+mlx/backend/metal/kernels/utils.h:519:18: error: expected ';' after expression
+                T v1 = w[p] * static_cast<T>(src[p] * inv);
+                 ^
+                 ;
+mlx/backend/metal/kernels/utils.h:519:19: error: use of undeclared identifier 'v1'
+                T v1 = w[p] * static_cast<T>(src[p] * inv);
+                  ^
+mlx/backend/metal/kernels/utils.h:519:43: error: unknown type name 'T'
+                T v1 = w[p] * static_cast<T>(src[p] * inv);
+                                          ^
+mlx/backend/metal/kernels/utils.h:520:18: error: expected ';' after expression
+                T v2 = w[p + uint(HALF_ROT)] *
+                 ^
+                 ;
+mlx/backend/metal/kernels/utils.h:520:19: error: use of undeclared identifier 'v2'
+                T v2 = w[p + uint(HALF_ROT)] *
+                  ^
+mlx/backend/metal/kernels/utils.h:521:33: error: unknown type name 'T'
+                    static_cast<T>(src[p + uint(HALF_ROT)] * inv);
+                                ^
+mlx/backend/metal/kernels/utils.h:523:21: error: use of undeclared identifier 'v1'
+                    v1 = static_cast<T>(MSCALE_F) * v1;
+                    ^
+mlx/backend/metal/kernels/utils.h:523:38: error: unknown type name 'T'
+                    v1 = static_cast<T>(MSCALE_F) * v1;
+                                     ^
+mlx/backend/metal/kernels/utils.h:523:53: error: use of undeclared identifier 'v1'
+                    v1 = static_cast<T>(MSCALE_F) * v1;
+                                                    ^
+mlx/backend/metal/kernels/utils.h:524:21: error: use of undeclared identifier 'v2'
+                    v2 = static_cast<T>(MSCALE_F) * v2;
+                    ^
+mlx/backend/metal/kernels/utils.h:524:38: error: unknown type name 'T'
+                    v2 = static_cast<T>(MSCALE_F) * v2;
+                                     ^
+mlx/backend/metal/kernels/utils.h:524:53: error: use of undeclared identifier 'v2'
+                    v2 = static_cast<T>(MSCALE_F) * v2;
+                                                    ^
+mlx/backend/metal/kernels/utils.h:526:47: error: use of undeclared identifier 'v1'
+                float x1 = static_cast<float>(v1);
+                                              ^
+mlx/backend/metal/kernels/utils.h:527:47: error: use of undeclared identifier 'v2'
+                float x2 = static_cast<float>(v2);
+                                              ^
+mlx/backend/metal/kernels/utils.h:528:38: error: unknown type name 'T'
+                dst[p] = static_cast<T>(x1 * costheta - x2 * sintheta);
+                                     ^
+mlx/backend/metal/kernels/utils.h:530:33: error: unknown type name 'T'
+                    static_cast<T>(x1 * sintheta + x2 * costheta);
+                                ^
+mlx/backend/metal/kernels/utils.h:548:18: error: expected ';' after expression
+                T v1 = w[p] * static_cast<T>(src[p] * inv);
+                 ^
+                 ;
+mlx/backend/metal/kernels/utils.h:548:19: error: use of undeclared identifier 'v1'
+                T v1 = w[p] * static_cast<T>(src[p] * inv);
+                  ^
+mlx/backend/metal/kernels/utils.h:548:43: error: unknown type name 'T'
+                T v1 = w[p] * static_cast<T>(src[p] * inv);
+                                          ^
+mlx/backend/metal/kernels/utils.h:549:18: error: expected ';' after expression
+                T v2 = w[p + uint(HALF_ROT)] *
+                 ^
+                 ;
+mlx/backend/metal/kernels/utils.h:549:19: error: use of undeclared identifier 'v2'
+                T v2 = w[p + uint(HALF_ROT)] *
+                  ^
+mlx/backend/metal/kernels/utils.h:550:33: error: unknown type name 'T'
+                    static_cast<T>(src[p + uint(HALF_ROT)] * inv);
+                                ^
+mlx/backend/metal/kernels/utils.h:552:21: error: use of undeclared identifier 'v1'
+                    v1 = static_cast<T>(MSCALE_F) * v1;
+                    ^
+mlx/backend/metal/kernels/utils.h:552:38: error: unknown type name 'T'
+                    v1 = static_cast<T>(MSCALE_F) * v1;
+                                     ^
+mlx/backend/metal/kernels/utils.h:552:53: error: use of undeclared identifier 'v1'
+                    v1 = static_cast<T>(MSCALE_F) * v1;
+                                                    ^
+mlx/backend/metal/kernels/utils.h:553:21: error: use of undeclared identifier 'v2'
+                    v2 = static_cast<T>(MSCALE_F) * v2;
+                    ^
+mlx/backend/metal/kernels/utils.h:553:38: error: unknown type name 'T'
+                    v2 = static_cast<T>(MSCALE_F) * v2;
+                                     ^
+mlx/backend/metal/kernels/utils.h:553:53: error: use of undeclared identifier 'v2'
+                    v2 = static_cast<T>(MSCALE_F) * v2;
+                                                    ^
+mlx/backend/metal/kernels/utils.h:555:47: error: use of undeclared identifier 'v1'
+                float x1 = static_cast<float>(v1);
+                                              ^
+mlx/backend/metal/kernels/utils.h:556:47: error: use of undeclared identifier 'v2'
+                float x2 = static_cast<float>(v2);
+                                              ^
+mlx/backend/metal/kernels/utils.h:557:38: error: unknown type name 'T'
+                dst[p] = static_cast<T>(x1 * costheta - x2 * sintheta);
+                                     ^
+mlx/backend/metal/kernels/utils.h:559:33: error: unknown type name 'T'
+                    static_cast<T>(x1 * sintheta + x2 * costheta);
+                                ^
+mlx/backend/metal/kernels/utils.h:565:47: error: unknown type name 'T'
+                dst[tt] = w[tt] * static_cast<T>(src[tt] * inv);
+                                              ^
+mlx/backend/metal/kernels/utils.h:519:17: warning: expression result unused [-Wunused-value]
+                T v1 = w[p] * static_cast<T>(src[p] * inv);
+                ^
+mlx/backend/metal/kernels/utils.h:520:17: warning: expression result unused [-Wunused-value]
+                T v2 = w[p + uint(HALF_ROT)] *
+                ^
+mlx/backend/metal/kernels/utils.h:548:17: warning: expression result unused [-Wunused-value]
+                T v1 = w[p] * static_cast<T>(src[p] * inv);
+                ^
+mlx/backend/metal/kernels/utils.h:549:17: warning: expression result unused [-Wunused-value]
+                T v2 = w[p + uint(HALF_ROT)] *
+                ^
+
+
+=== scratchpad_prefill_qk_rope_check.py -> rc=1 (0.6s) ===
+
+=========== CHECK: /private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/c9919a00-4c3e-4ca4-bce9-298f46559aad/scratchpad/scratchpad_prefill_router_check.py ===========
+
+=== P3 M=1024 experts=256 top_k=10 ===
+PASS P3 M=1024 kernel eligible
+PASS P3 M=1024 selection set-parity (flips)  flips=0/1024
+PASS P3 M=1024 normalized weights match on agreeing tokens  maxabs=2.98e-08
+  timing  kernel queued=0.254ms percall=0.363ms
+  timing  stock  queued=0.067ms percall=0.224ms
+  speedup(queued)=0.266x  speedup(percall)=0.617x
+
+=== P3 M=10240 experts=256 top_k=10 ===
+PASS P3 M=10240 kernel eligible
+PASS P3 M=10240 selection set-parity (flips)  flips=0/10240
+PASS P3 M=10240 normalized weights match on agreeing tokens  maxabs=3.73e-08
+  timing  kernel queued=0.480ms percall=0.699ms
+  timing  stock  queued=0.490ms percall=0.454ms
+  speedup(queued)=1.021x  speedup(percall)=0.649x
+
+P3 ALL CHECKS PASSED
+=== scratchpad_prefill_router_check.py -> OK (0.3s) ===
+
+=========== CHECK: /private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/c9919a00-4c3e-4ca4-bce9-298f46559aad/scratchpad/scratchpad_prefill_moe_combine_check.py ===========
+
+=== P5 M=1024 top_k=10 hidden=3072 routed_scaling=2.5 ===
+PASS P5 M=1024 kernel eligible
+PASS P5 M=1024 kernel==stock  maxabs=0.000e+00 bitexact=1.00000
+PASS P5 M=1024 output shape [1024,3072]
+  timing  kernel queued=0.163ms percall=0.361ms
+  timing  stock  queued=0.774ms percall=0.579ms
+  speedup(queued)=4.745x  speedup(percall)=1.603x
+
+P5 ALL CHECKS PASSED
+=== scratchpad_prefill_moe_combine_check.py -> OK (0.2s) ===
+
+=========== CHECK: /Users/davidtai/projects/OpenSourceWTF/mtplx-hy3-ssd/.worktrees/laguna-s21-mlxfast-kernels/scratchpad_steel_attn_check.py ===========
+device=Device(gpu, 0)  head_dim=128  scale=0.088388
+
+[full_attention   | ctx=1024 | hq=48 hk=8 gqa=6 window=0] shape=(1, 48, 1024, 128) -> PASS
+    kernel vs stock       : abs 7.812e-03  rel 2.392e-03
+    stock  vs fp32 ref    : abs 1.562e-02  rel 4.785e-03
+    kernel vs fp32 ref    : abs 1.562e-02  rel 4.785e-03
+    queued  kernel   5.2896 ms  stock   0.2749 ms  ratio(stock/kernel) x0.052  (verdict lane)
+    eager   kernel   5.6086 ms  stock   0.4905 ms  ratio(stock/kernel) x0.087
+
+[full_attention   | ctx=8192 | hq=48 hk=8 gqa=6 window=0] shape=(1, 48, 8192, 128) -> FAIL
+    kernel vs stock       : abs 1.562e-02  rel 4.651e-03
+    queued  kernel 326.8345 ms  stock  18.2512 ms  ratio(stock/kernel) x0.056  (verdict lane)
+    eager   kernel 336.8416 ms  stock  20.1594 ms  ratio(stock/kernel) x0.060
+
+[sliding_attention | ctx=1024 | hq=72 hk=8 gqa=9 window=512] shape=(1, 72, 1024, 128) -> PASS
+    kernel vs stock       : abs 1.562e-02  rel 4.464e-03
+    stock  vs fp32 ref    : abs 1.562e-02  rel 4.464e-03
+    kernel vs fp32 ref    : abs 1.562e-02  rel 4.464e-03
+    queued  kernel   6.4219 ms  stock   1.0484 ms  ratio(stock/kernel) x0.163  (verdict lane)
+    eager   kernel   6.7541 ms  stock   1.2191 ms  ratio(stock/kernel) x0.181
+
+[sliding_attention | ctx=8192 | hq=72 hk=8 gqa=9 window=512] shape=(1, 72, 8192, 128) -> FAIL
+    kernel vs stock       : abs 1.562e-02  rel 4.167e-03
+    queued  kernel  67.9319 ms  stock  67.2622 ms  ratio(stock/kernel) x0.990  (verdict lane)
+    eager   kernel  67.8547 ms  stock  64.2500 ms  ratio(stock/kernel) x0.947
+
+CORRECTNESS: FAIL
+Timing ratios >1 mean the port beats stock; <1 mean it loses (expected at prefill -- see the header).
+=== scratchpad_steel_attn_check.py -> OK (35.6s) ===
+
+=== reloading qwen ===
++ launchctl bootstrap gui/501 /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist
+[rc=0]
+=== qwen reload requested (loads async) ===
+
+=== SUMMARY ===
+        OK  scratchpad_qk_yarn_check.py
+        OK  scratchpad_qk_rope_sliding_check.py
+        OK  scratchpad_gated_oproj_check.py
+      rc=1  scratchpad_qkvg_check.py
+        OK  scratchpad_router_topk_check.py
+        OK  scratchpad_moe_combine_check.py
+        OK  scratchpad_moe_shared_check.py
+        OK  scratchpad_moe_merged_check.py
+        OK  scratchpad_dense_mlp_check.py
+      rc=1  scratchpad_prefill_qk_rope_check.py
+        OK  scratchpad_prefill_router_check.py
+        OK  scratchpad_prefill_moe_combine_check.py
+        OK  scratchpad_steel_attn_check.py

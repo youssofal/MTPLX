@@ -33,13 +33,14 @@ Default URL: <http://127.0.0.1:8000/dashboard>.
   accept / repair / snapshot / capture-commit / rollback, drafted/verify
   ratio, correction-vs-bonus tile, decode-vs-request tok/s, and the
   vs-vLLM oracle panel (only renders when Qwen3.6-27B is loaded).
-- **Cache** — 8-slot SessionBank grid with per-slot session-id, prefix
+- **Cache** — 24-slot SessionBank grid with per-slot session-id, prefix
   len, hits, bytes, age, and a one-click evict button; eviction-reason
   histogram with `CacheMissReason`-aware tooltips (POLICY_MISMATCH,
   TEMPLATE_MISMATCH, etc.); cumulative cached tokens; cache hit rate;
   prefill tok/s sparkline; TTFT distribution; context utilization bar.
-- **Memory** — hardware banner (chip from `sysctl hw.model`, unified
-  memory bytes, profile, context window); MLX active + cache + peak +
+- **Memory** — hardware banner (chip from `sysctl machdep.cpu.brand_string`,
+  machine model from `hw.model`, unified memory bytes, profile, context
+  window); MLX active + cache + peak +
   headroom stacked bar with peak tick.
 - **Thermal** — twin fan rings (only when `--enable-thermal-poll` is
   on); Universal Thermal Rule banner when a request is in flight and
@@ -68,7 +69,7 @@ Default URL: <http://127.0.0.1:8000/dashboard>.
 
 Four themes baked in: **hippo** (default, dark mint), **river** (cool
 blue), **light** (bright for projector demos), **mono** (paranoid
-contrast). Cycle with `T`. Persists in `localStorage["mtplx.dashboard.theme"]`.
+contrast). Cycle with `t`. Persists in `localStorage["mtplx.dashboard.theme"]`.
 
 ## Keyboard shortcuts
 
@@ -99,7 +100,7 @@ subscribes via `GET /v1/mtplx/metrics/stream` (SSE, 200 ms snapshot
 cadence interleaved with bus events) and polls `/metrics`,
 `/admin/sessions`, and `/v1/mtplx/prefill_history` for tabular state.
 Same origin, same port, same process. Built bundle ships inside the
-wheel via `package_data` so `pip install mtplx` is enough.
+wheel via `[tool.setuptools.package-data]` so `pip install mtplx` is enough.
 
 ## New HTTP endpoints
 
@@ -112,14 +113,14 @@ wheel via `package_data` so `pip install mtplx` is enough.
 | `/v1/mtplx/settings`                  | POST   | Mutate the small whitelisted surface of `state.args`; rejects restart-required keys.    |
 | `/v1/mtplx/cancel/{request_id}`       | POST   | Sets the in-flight handle's `cancel_event` (best-effort, one-token-batch worst case).   |
 
-`/health` gains two fields: `machine_model` (`sysctl hw.model`) and
-`unified_memory_bytes` (`sysctl hw.memsize`), both cached after first
-lookup.
+`/health` gains three fields: `chip` (`sysctl machdep.cpu.brand_string`),
+`machine_model` (`sysctl hw.model`), and `unified_memory_bytes`
+(`sysctl hw.memsize`), all cached after first lookup.
 
 ## What is *not* mutable from the dashboard
 
 `profile`, `model`, `host`, `port`, `load_mtp`, `verify_core`,
-`verify_strategy`, `generation_mode`, `context_window`, `api_key`.
+`verify_strategy`, `context_window`, `api_key`.
 These require a model/runtime reload. The Settings tab shows a
 "restart required" card with the exact CLI command and a copy button
 instead of pretending to hot-swap.
@@ -144,4 +145,4 @@ bun run build      # outputs into ../mtplx/dashboard/_static/
 ```
 
 The bundle is ~280 KB gzipped and ships in the wheel via
-`pyproject.toml` `package_data` so end users do not need bun.
+the `pyproject.toml` `[tool.setuptools.package-data]` table so end users do not need bun.

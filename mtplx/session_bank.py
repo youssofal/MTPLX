@@ -72,6 +72,48 @@ DEFAULT_PER_SESSION_MAX_BYTES = 8 * GIB
 DEFAULT_IDLE_TTL_S = 60 * 60
 DEFAULT_PREFIX_BLOCK_SIZE = 256
 DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS = 512
+DEFAULT_ACTIVE_SESSION_PIN_TTL_S = 600.0
+DEFAULT_PER_SESSION_MAX_ENTRIES = 3
+
+
+def _per_session_max_entries() -> int:
+    """Retention cap on RAM entries per session (count, not bytes).
+
+    2026-08-01 live leak: agent turns whose canonical transcripts diverge
+    mid-stream (scoped thinking / tool-call rendering) bank one ~1.7GB
+    sibling per turn that is NOT a strict prefix of the next — supersede
+    never fires, so one OpenCode session accumulated 5 near-duplicate
+    snapshots (8.8GB) inside its byte budget and allocator pressure added
+    25-40ms/tick to every verify call. Newest-K retention bounds that while
+    keeping a couple of older boundary entries for divergent restores.
+    0 disables (byte budgets alone).
+    """
+    raw = os.environ.get("MTPLX_SESSION_BANK_PER_SESSION_MAX_ENTRIES")
+    if raw is None or not str(raw).strip():
+        return DEFAULT_PER_SESSION_MAX_ENTRIES
+    try:
+        return max(0, int(str(raw).strip()))
+    except (TypeError, ValueError):
+        return DEFAULT_PER_SESSION_MAX_ENTRIES
+
+
+def _active_session_pin_ttl_s() -> float:
+    """Sessions that touched the bank within this window are eviction-last.
+
+    2026-07-31 live incident: a long coding session's warm entry was
+    LRU-evicted by cross-session pressure mid-run, forcing an 85.6k-token
+    full re-prefill on the very next turn. Recently-active sessions are
+    exactly the ones about to be extended, so cross-session eviction now
+    prefers idle victims. Activity-TTL rather than explicit pin/unpin so a
+    cancelled or crashed request can never leak a pin. 0 disables.
+    """
+    raw = os.environ.get("MTPLX_SESSION_BANK_ACTIVE_PIN_TTL_S")
+    if raw is None or not str(raw).strip():
+        return DEFAULT_ACTIVE_SESSION_PIN_TTL_S
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return DEFAULT_ACTIVE_SESSION_PIN_TTL_S
 
 
 class CacheMissReason(str, Enum):
@@ -346,6 +388,9 @@ class SessionBank:
         # health snapshots only ever read the newest entries, so an unbounded
         # list is pure retention on long-running agent servers.
         self.eviction_log: deque[dict[str, Any]] = deque(maxlen=256)
+        self.active_pin_ttl_s = _active_session_pin_ttl_s()
+        self._session_last_active: dict[str, float] = {}
+        self.per_session_max_entries = _per_session_max_entries()
         self.cold_tier = cold_tier
         # Optional idle-lane dispatcher for SSD cold-tier enqueues. Post-#169
         # put_entry encodes the full-KV payload at enqueue time, so calling it
@@ -364,6 +409,27 @@ class SessionBank:
     @property
     def total_nbytes(self) -> int:
         return sum(entry.nbytes for entry in self._entries.values())
+
+    def _touch_session(self, session_id: str | None) -> None:
+        if not session_id or self.active_pin_ttl_s <= 0:
+            return
+        now = time.monotonic()
+        self._session_last_active[str(session_id)] = now
+        if len(self._session_last_active) > 512:
+            cutoff = now - self.active_pin_ttl_s
+            self._session_last_active = {
+                sid: ts
+                for sid, ts in self._session_last_active.items()
+                if ts >= cutoff
+            }
+
+    def _active_session_ids(self) -> set[str]:
+        if self.active_pin_ttl_s <= 0 or not self._session_last_active:
+            return set()
+        cutoff = time.monotonic() - self.active_pin_ttl_s
+        return {
+            sid for sid, ts in self._session_last_active.items() if ts >= cutoff
+        }
 
     def put(
         self,
@@ -395,6 +461,7 @@ class SessionBank:
             raise ValueError("trunk and MTP snapshots must share the same commit boundary")
         self.last_put_nbytes = 0
         self.last_put_skipped_oversized_snapshot = False
+        self._touch_session(session_id)
         cache_has_recurrent = any(not _is_trimmable(entry) for entry in (cache or []))
         normalized_boundaries = sorted(
             (
@@ -640,6 +707,7 @@ class SessionBank:
             raise ValueError("trunk and MTP snapshots must share the same commit boundary")
         self.last_put_nbytes = 0
         self.last_put_skipped_oversized_snapshot = False
+        self._touch_session(session_id)
         computed_nbytes = (
             _snapshot_nbytes(cache_snapshot)
             + _tree_nbytes(logits)
@@ -968,6 +1036,7 @@ class SessionBank:
             raise ValueError("mode must be 'clone', 'reference', or 'reference_lease'")
         self.last_miss_reason = None
         self._purge_expired()
+        self._touch_session(session_id)
 
         def cold_fallback() -> SessionBankRestore | None:
             return self._restore_cold(
@@ -1267,6 +1336,9 @@ class SessionBank:
             "last_restore_source": self.last_restore_source,
             "last_ssd_restore_s": self.last_ssd_restore_s,
             "last_prefix_diagnostic": self.last_prefix_diagnostic,
+            "active_pin_ttl_s": self.active_pin_ttl_s,
+            "active_sessions": sorted(self._active_session_ids()),
+            "recent_evictions": list(self.eviction_log)[-8:],
             "cold_tier": (
                 self.cold_tier.stats()
                 if self.cold_tier is not None and hasattr(self.cold_tier, "stats")
@@ -1553,6 +1625,37 @@ class SessionBank:
         ]
         for entry in victims:
             self._evict_entry(entry, reason="superseded_by_longer_prefix")
+        self._enforce_session_entry_retention(
+            container.session_id, protected_tokens=tokens
+        )
+
+    def _enforce_session_entry_retention(
+        self, session_id: str | None, *, protected_tokens: tuple[int, ...]
+    ) -> None:
+        """Keep only the newest-K RAM entries for a session (see
+        _per_session_max_entries). Live-reference leases are exempt: they are
+        consumed by their first restore and carry no snapshot bytes to shed.
+        """
+        cap = self.per_session_max_entries
+        if not session_id or cap <= 0:
+            return
+        entries = [
+            entry
+            for entry in self._entries.values()
+            if entry.session_id == session_id and not entry.live_ref_only
+        ]
+        if len(entries) <= cap:
+            return
+        entries.sort(
+            key=lambda entry: (
+                entry.token_ids == protected_tokens,
+                entry.last_access_s,
+                entry.created_at_s,
+            ),
+            reverse=True,
+        )
+        for entry in entries[cap:]:
+            self._evict_entry(entry, reason="session_entry_retention")
 
     def _evict_if_needed(self, *, protected_tokens: tuple[int, ...] | None = None) -> None:
         while True:
@@ -1564,6 +1667,7 @@ class SessionBank:
                 if self._session_nbytes(entry.session_id) > self.per_session_max_bytes
             }
             reason: str | None = None
+            over_budget_only = False
             candidates = list(self._entries.values())
             if len(self._entries) > self.max_entries:
                 reason = CacheMissReason.EVICTED.value
@@ -1571,6 +1675,7 @@ class SessionBank:
                 reason = CacheMissReason.EVICTED.value
             elif session_over_budget:
                 reason = CacheMissReason.EVICTED.value
+                over_budget_only = True
                 candidates = [
                     entry
                     for entry in candidates
@@ -1595,6 +1700,21 @@ class SessionBank:
                     self._evict_entry(entry, reason=reason or CacheMissReason.EVICTED.value)
                     continue
                 return
+            if not over_budget_only:
+                # Cross-session pressure prefers idle victims: a session that
+                # touched the bank within the active-pin TTL is mid-run, and
+                # evicting it forces a full re-prefill on its very next turn
+                # (the 2026-07-31 85.6k live incident). A session over its own
+                # per-session budget still self-evicts oldest-first above.
+                active = self._active_session_ids()
+                if active:
+                    idle = [
+                        entry
+                        for entry in candidates
+                        if entry.session_id not in active
+                    ]
+                    if idle:
+                        candidates = idle
             victim = min(
                 candidates,
                 key=lambda entry: (entry.last_access_s, -entry.nbytes, entry.created_at_s),
@@ -1611,10 +1731,19 @@ class SessionBank:
 
         evicted = 0
         target = max(0, int(target_bytes))
+        active = self._active_session_ids()
         while self._entries and self.total_nbytes > target:
             victim = min(
                 self._entries.values(),
-                key=lambda entry: (entry.last_access_s, -entry.nbytes, entry.created_at_s),
+                # Real memory pressure may take anything, but active sessions
+                # go last so the responder doesn't force a mid-run re-prefill
+                # while idle entries were available.
+                key=lambda entry: (
+                    entry.session_id in active,
+                    entry.last_access_s,
+                    -entry.nbytes,
+                    entry.created_at_s,
+                ),
             )
             before = len(self._entries)
             self._evict_entry(victim, reason=reason)
@@ -1644,6 +1773,10 @@ class SessionBank:
                 "token_hash": entry.token_hash,
                 "nbytes": entry.nbytes,
                 "last_access_s": entry.last_access_s,
+                "session_active": bool(
+                    entry.session_id
+                    and entry.session_id in self._active_session_ids()
+                ),
             }
         )
 
