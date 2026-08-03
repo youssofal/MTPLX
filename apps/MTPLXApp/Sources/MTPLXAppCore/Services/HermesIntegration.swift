@@ -1226,7 +1226,10 @@ public struct HermesIntegration: Sendable {
         let envText = try? String(contentsOf: envURL, encoding: .utf8)
         let customBaseURLs = envText.map { dotenvValues("CUSTOM_BASE_URL", in: $0) } ?? []
         guard customBaseURLs.count <= 1 else { return nil }
-        let baseURL = values["base_url"]
+        // An explicitly empty `base_url: ''` means "no custom endpoint", the
+        // same as omitting the key — it must not fail the whole profile.
+        let configuredBaseURL = values["base_url"].flatMap { $0.isEmpty ? nil : $0 }
+        let baseURL = configuredBaseURL
             ?? customBaseURLs.first
         if let baseURL, baseURL.isEmpty { return nil }
         return HermesEffectiveProfileConfiguration(
@@ -1241,13 +1244,19 @@ public struct HermesIntegration: Sendable {
         var value = String(line[line.index(after: colon)...])
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return nil }
+        var wasQuoted = false
         if value.hasPrefix("\"") || value.hasPrefix("'") {
             guard value.count >= 2, value.first == value.last else { return nil }
             value = String(value.dropFirst().dropLast())
+            wasQuoted = true
         } else if let commentStart = value.firstIndex(of: "#") {
             value = String(value[..<commentStart]).trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        guard !value.isEmpty, !value.hasPrefix("["), !value.hasPrefix("{") else { return nil }
+        // An explicitly quoted empty scalar ('' or "") is valid YAML that the
+        // Hermes CLI itself writes (for example `base_url: ''` on provider
+        // profiles without a custom endpoint); only unquoted empties and
+        // collections stay unreadable here.
+        guard wasQuoted || !value.isEmpty, !value.hasPrefix("["), !value.hasPrefix("{") else { return nil }
         return value
     }
 

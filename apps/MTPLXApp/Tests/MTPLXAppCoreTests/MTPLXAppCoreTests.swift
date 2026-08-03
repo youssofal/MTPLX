@@ -2670,6 +2670,52 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(integration.discoverProfiles().map(\.name), ["default", "mtplx", "research"])
     }
 
+    // The Hermes CLI writes `base_url: ''` for provider profiles without a
+    // custom endpoint (for example openai-codex). The routing parser used to
+    // reject the quoted empty scalar and mark the whole profile unavailable,
+    // which disabled it in the profile picker and hid its sessions.
+    func testRoutingStateToleratesExplicitlyEmptyBaseURL() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let hermesHome = root.appendingPathComponent("hermes", isDirectory: true)
+        let profileURL = hermesHome
+            .appendingPathComponent("profiles", isDirectory: true)
+            .appendingPathComponent("bernd", isDirectory: true)
+        try FileManager.default.createDirectory(at: profileURL, withIntermediateDirectories: true)
+        try """
+        model:
+          provider: openai-codex
+          default: gpt-5.6-sol
+          base_url: ''
+        """.write(to: profileURL.appendingPathComponent("config.yaml"), atomically: true, encoding: .utf8)
+
+        let integration = HermesIntegration(
+            hermesHome: hermesHome,
+            environment: [
+                "HOME": root.path,
+                "PATH": "/usr/bin:/bin",
+            ],
+            terminalCommandURL: root.appendingPathComponent(".mtplx").appendingPathComponent("open-hermes.command")
+        )
+        let profile = HermesProfile(name: "bernd", path: profileURL.path, isDefault: false)
+        let state = integration.routingState(
+            for: profile,
+            configuration: MTPLXAppConfiguration(
+                model: "/models/Qwen3.6-27B-MTPLX-Optimized-Speed",
+                host: "127.0.0.1",
+                port: 8123,
+                apiKey: "",
+                hermesWorkspacePath: root.path
+            )
+        )
+        guard case .external = state else {
+            XCTFail("expected .external for explicitly empty base_url, got \(state)")
+            return
+        }
+    }
+
     // Issue #131: the app regenerated the Hermes profile config from its
     // template on every launch, silently dropping every top-level section
     // it does not own (memory/providers/delegation/…) and user-added child
