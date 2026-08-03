@@ -61,6 +61,39 @@ def test_omlx_tool_parser_tries_qwen_xml_and_normalizes_arguments():
     assert json.loads(arguments) == {"a": 1, "b": 2}
 
 
+def test_omlx_tool_parser_accepts_hy3_suffixed_native_protocol():
+    extraction = parse_tool_calls(
+        "<tool_calls:opensource>"
+        "<tool_call:opensource>read<tool_sep:opensource>"
+        "<arg_key:opensource>filePath</arg_key:opensource>"
+        "<arg_value:opensource>/tmp/brief.md</arg_value:opensource>"
+        "</tool_call:opensource>"
+        "</tool_calls:opensource>",
+        tokenizer=None,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"filePath": {"type": "string"}},
+                        "required": ["filePath"],
+                    },
+                },
+            }
+        ],
+    )
+
+    assert extraction.status == "parsed"
+    assert extraction.parser_source == "suffixed_native"
+    assert extraction.cleaned_text == ""
+    assert extraction.tool_calls[0]["function"]["name"] == "read"
+    assert json.loads(extraction.tool_calls[0]["function"]["arguments"]) == {
+        "filePath": "/tmp/brief.md"
+    }
+
+
 def test_omlx_tool_parser_accepts_opencode_drifted_json_shapes():
     tools = [{"type": "function", "function": {"name": "read"}}]
     samples = [

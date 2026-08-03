@@ -307,6 +307,14 @@ def _opencode_memory_env_defaults() -> dict[str, str]:
         else _OPENCODE_DEFAULT_MAX_ENTRIES
     )
     return {
+        # Long-context decode route (>=32k): same keys the app's
+        # codingAgentRuntimeEnvironment and the CLI hermes lane already set —
+        # the OpenCode CLI lane missing them was surface drift (2026-08-03
+        # parity audit), not intent.
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "async_per_head",
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_CONTEXT": "32768",
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MIN_Q": "3",
+        "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_MAX_Q": "5",
         "MTPLX_SESSION_BLOCK_PREFIX_RESTORE": "1",
         "MTPLX_SESSION_BANK_MAX_ENTRIES": max_entries,
         # "auto" = the engine budgets half the RAM surplus left after the
@@ -997,7 +1005,13 @@ def _resolved_default_profile_name(args: Any, model: str | None = None) -> str:
 
 
 def _apply_qwen36_35b_optimized_speed_defaults(args: Any, model_id: str) -> None:
-    if model_id != QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID:
+    # The -FP16 sibling shares the byte-identical INT packs and the measured
+    # launch defaults; the app's substring detection already applied them to
+    # it while this exact-id gate skipped it (2026-08-03 parity audit).
+    if model_id not in {
+        QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
+        QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
+    }:
         return
     cli_flags = getattr(args, "_cli_flags", set()) or set()
     injected = set(getattr(args, "_injected_default_flags", set()) or set())
@@ -1359,12 +1373,19 @@ def _pi_preserve_thinking_policy(args: Any) -> str:
 
 
 def _apply_pi_history_budget_env_defaults(env: dict[str, str]) -> None:
+    """Pi lane = the shared coding-agent engine block + Pi history budgets.
+
+    Mirrors the app's composition exactly (codingAgentRuntimeEnvironment then
+    the Pi-specific overrides in MTPLXCommandBuilder.swift). Before the
+    2026-08-03 parity audit the CLI Pi lane carried only the history keys —
+    no session bank, SDPA route, postcommit wait, or frontier flags — and
+    three of its values (96/16/150) diverged from the app-lane numbers
+    (72/8/120) every app Pi user already runs; unified to the app values.
+    """
+    _apply_opencode_memory_env_defaults(env)
     env.setdefault("MTPLX_TOOL_RESULT_COMPACT_THRESHOLD_CHARS", "1200")
     env.setdefault("MTPLX_ACTIVE_READ_INSPECTION_COMPACT_MAX_LINES", "32")
     env.setdefault("MTPLX_ACTIVE_READ_INSPECTION_LINE_MAX_CHARS", "180")
-    env.setdefault("MTPLX_ACTIVE_READ_INSPECTION_TOTAL_MAX_LINES", "96")
-    env.setdefault("MTPLX_ACTIVE_READ_INSPECTION_MIN_LINES_PER_FILE", "16")
-    env.setdefault("MTPLX_ACTIVE_READ_INSPECTION_MULTI_FILE_LINE_MAX_CHARS", "150")
     env.setdefault("MTPLX_ACTIVE_TOOL_RESULT_COMPACT_MAX_LINES", "32")
     env.setdefault("MTPLX_ACTIVE_TOOL_RESULT_LINE_MAX_CHARS", "220")
 
@@ -12616,7 +12637,11 @@ def cmd_quickstart_public(args: Any) -> int:
             "target": target,
             "model": model,
             "cache_dir": cache_dir,
-            "profile": getattr(args, "profile", DEFAULT_PROFILE_NAME),
+            # Display the profile the launch will actually resolve (per-model
+            # turbo rewrite included) — the raw parser default here made the
+            # dry-run advertise "sustained" for the turbo-default flagships
+            # (the 2026-07-16 stale-display bug class, on one more surface).
+            "profile": _resolved_default_profile_name(args, model),
             "generation_mode": _generation_mode_from_args(args),
             "max": bool(getattr(args, "max", False)),
             "download_if_missing": download,

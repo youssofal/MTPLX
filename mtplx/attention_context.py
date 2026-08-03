@@ -13,10 +13,19 @@ VALID_ATTENTION_PHASES = {
     "postcommit",
     "unknown",
 }
+VALID_MODEL_FORWARD_KINDS = {
+    "target_verify",
+    "repair",
+    "other",
+}
 
 _ATTENTION_PHASE: ContextVar[str] = ContextVar(
     "mtplx_attention_phase",
     default="unknown",
+)
+_MODEL_FORWARD_KIND: ContextVar[str] = ContextVar(
+    "mtplx_model_forward_kind",
+    default="other",
 )
 
 
@@ -29,6 +38,15 @@ def current_attention_phase() -> str:
     return normalize_attention_phase(_ATTENTION_PHASE.get())
 
 
+def normalize_model_forward_kind(kind: str | None) -> str:
+    value = (kind or "other").strip().lower()
+    return value if value in VALID_MODEL_FORWARD_KINDS else "other"
+
+
+def current_model_forward_kind() -> str:
+    return normalize_model_forward_kind(_MODEL_FORWARD_KIND.get())
+
+
 @contextmanager
 def attention_phase(phase: str | None) -> Iterator[None]:
     token = _ATTENTION_PHASE.set(normalize_attention_phase(phase))
@@ -36,3 +54,14 @@ def attention_phase(phase: str | None) -> Iterator[None]:
         yield
     finally:
         _ATTENTION_PHASE.reset(token)
+
+
+@contextmanager
+def model_forward_kind(kind: str | None) -> Iterator[None]:
+    """Identify whether one decode-verify-phase target call verifies or repairs."""
+
+    token = _MODEL_FORWARD_KIND.set(normalize_model_forward_kind(kind))
+    try:
+        yield
+    finally:
+        _MODEL_FORWARD_KIND.reset(token)

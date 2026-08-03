@@ -25,6 +25,7 @@ from mtplx.constants import (
     EXPECTED_PREQUANTIZED_MTP_KEYS,
     EXPECTED_QWEN_MOE_MTP_KEYS,
     EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS,
+    expand_mtp_layer_keys,
 )
 from mtplx.default_models import (
     DefaultModelSelection,
@@ -260,20 +261,30 @@ def _scan_for_models(
 
 
 def _expected_embedded_mtp_keys(config: dict[str, Any]) -> set[str]:
+    tcfg = config.get("text_config", config) if isinstance(config, dict) else {}
+    n_layers = max(
+        int(
+            tcfg.get("mtp_num_hidden_layers")
+            or tcfg.get("num_nextn_predict_layers")
+            or config.get("num_nextn_predict_layers")
+            or 0
+        ),
+        1,
+    )
     if _is_qwen_moe_mtp_config(config):
         mtp_quant = config.get("mtplx_mtp_quantization", {})
         prequantized = isinstance(mtp_quant, dict) and bool(mtp_quant.get("prequantized"))
         if prequantized:
-            return set(EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS)
-        return set(EXPECTED_QWEN_MOE_MTP_KEYS)
+            return expand_mtp_layer_keys(EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS, n_layers)
+        return expand_mtp_layer_keys(EXPECTED_QWEN_MOE_MTP_KEYS, n_layers)
     mtp_quant = config.get("mtplx_mtp_quantization", {})
     prequantized = isinstance(mtp_quant, dict) and bool(mtp_quant.get("prequantized"))
     quant_policy = str(mtp_quant.get("policy") or "") if isinstance(mtp_quant, dict) else ""
     if prequantized and quant_policy == "all":
-        return set(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS)
+        return expand_mtp_layer_keys(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS, n_layers)
     if prequantized:
-        return set(EXPECTED_PREQUANTIZED_MTP_KEYS)
-    return set(EXPECTED_MTP_KEYS)
+        return expand_mtp_layer_keys(EXPECTED_PREQUANTIZED_MTP_KEYS, n_layers)
+    return expand_mtp_layer_keys(EXPECTED_MTP_KEYS, n_layers)
 
 
 def _is_qwen_moe_mtp_config(config: dict[str, Any]) -> bool:

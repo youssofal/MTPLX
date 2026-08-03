@@ -1,0 +1,33 @@
+=== batch check runner | label=p5-d1free-sweep | uid=501 | 18:43:54 ===
+=== 1 check script(s) queued ===
+    - /private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/c9919a00-4c3e-4ca4-bce9-298f46559aad/scratchpad/laguna_p5_prefill_sweep.py
+=== waiting for GPU flock (up to 1800s; another agent may hold it) ===
+=== GPU flock ACQUIRED ===
++ launchctl bootout gui/501/com.tea.qwen
+[rc=0]
+=== qwen UNLOADED ===
+
+=========== CHECK: /private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/c9919a00-4c3e-4ca4-bce9-298f46559aad/scratchpad/laguna_p5_prefill_sweep.py ===========
+=== P5 prefill sweep | sizes=[1024, 8192, 16384, 32768] reps=2 ===
+[tokenizer] AutoTokenizer parse failed ('original_max_position_embeddings'); using tokenizer.json fallback
+install_from_env: [{'path': 'fused_gate_up', 'layers_converted': 0}, {'path': 'kernel_router', 'layers_affected': 47}, {'path': 'kernel_router_gemv', 'layers_packed': 47, 'layers_skipped': 0, 'skip_reasons': [], 'weight_dtypes': ['mlx.core.bfloat16'], 'kernel_engaged': True}, {'path': 'kernel_attn_gate', 'layers_affected': 48}, {'path': 'kernel_qk_rope', 'layers_covered': 48, 'layers_skipped': 0}, {'path': 'kernel_moe_combine', 'layers_affected': 47}, {'path': 'fused_shared_gate_up', 'layers_converted': 0}]
+[ctx=1024] ref=1564.1 p5=1563.3 d1+p5=1433.5 tok/s | P5-vs-REF=1.000x | digest=MATCH (r=340 p5=340 d1p5=340) | peak=60.6GiB
+[ctx=8192] ref=1275.7 p5=1298.1 d1+p5=1207.1 tok/s | P5-vs-REF=1.018x | digest=MATCH (r=6185 p5=6185 d1p5=6185) | peak=62.6GiB
+[ctx=16384] ref=904.2 p5=905.9 d1+p5=877.7 tok/s | P5-vs-REF=1.002x | digest=MATCH (r=340 p5=340 d1p5=340) | peak=65.1GiB
+[ctx=32768] ref=491.9 p5=510.8 d1+p5=546.1 tok/s | P5-vs-REF=1.039x | digest=MATCH (r=6185 p5=6185 d1p5=6185) | peak=70.3GiB
+
+=== SWEEP SUMMARY (P5 prefill MoE-combine, D1-free vs reference) ===
+    ctx       ref        p5     d1+p5  P5/ref   digest  peakGiB
+   1024    1564.1    1563.3    1433.5   1.000    MATCH     60.6
+   8192    1275.7    1298.1    1207.1   1.018    MATCH     62.6
+  16384     904.2     905.9     877.7   1.002    MATCH     65.1
+  32768     491.9     510.8     546.1   1.039    MATCH     70.3
+=== laguna_p5_prefill_sweep.py -> OK (834.8s) ===
+
+=== reloading qwen ===
++ launchctl bootstrap gui/501 /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist
+[rc=0]
+=== qwen reload requested (loads async) ===
+
+=== SUMMARY ===
+        OK  laguna_p5_prefill_sweep.py

@@ -1,0 +1,60 @@
+=== batch check runner | label=p1-fix-retest | uid=501 | 08:20:53 ===
+=== 2 check script(s) queued ===
+    - /private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/c9919a00-4c3e-4ca4-bce9-298f46559aad/scratchpad/scratchpad_prefill_qk_rope_check.py
+    - /private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/c9919a00-4c3e-4ca4-bce9-298f46559aad/scratchpad/scratchpad_prefill_moe_combine_check.py
+=== waiting for GPU flock (up to 1800s; another agent may hold it) ===
+=== GPU flock ACQUIRED ===
++ launchctl bootout gui/501/com.tea.qwen
+[rc=0]
+=== qwen UNLOADED ===
+
+=========== CHECK: /private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/c9919a00-4c3e-4ca4-bce9-298f46559aad/scratchpad/scratchpad_prefill_qk_rope_check.py ===========
+
+=== P1 FULL/yarn : B=1 T=1024 q_heads=48 ===
+PASS P1 FULL/yarn kernel eligible
+PASS P1 FULL/yarn q off=0 kernel==stock  maxabs=0.000e+00 bitexact=1.0000
+PASS P1 FULL/yarn k off=0 kernel==stock  maxabs=0.000e+00 bitexact=1.0000
+PASS P1 FULL/yarn off=0 kernel all-rows-distinct
+PASS P1 FULL/yarn q off=400 kernel==stock  maxabs=0.000e+00 bitexact=1.0000
+PASS P1 FULL/yarn k off=400 kernel==stock  maxabs=0.000e+00 bitexact=1.0000
+PASS P1 FULL/yarn off=400 kernel all-rows-distinct
+  timing  kernel queued=0.214ms percall=0.400ms
+  timing  stock  queued=0.317ms percall=0.403ms
+  speedup(queued)=1.479x  speedup(percall)=1.009x
+
+=== P1 SLIDING/base : B=1 T=1024 q_heads=72 ===
+PASS P1 SLIDING/base kernel eligible
+PASS P1 SLIDING/base q off=0 kernel==stock  maxabs=0.000e+00 bitexact=1.0000
+PASS P1 SLIDING/base k off=0 kernel==stock  maxabs=0.000e+00 bitexact=1.0000
+PASS P1 SLIDING/base off=0 kernel all-rows-distinct
+PASS P1 SLIDING/base q off=400 kernel==stock  maxabs=0.000e+00 bitexact=1.0000
+PASS P1 SLIDING/base k off=400 kernel==stock  maxabs=0.000e+00 bitexact=1.0000
+PASS P1 SLIDING/base off=400 kernel all-rows-distinct
+  timing  kernel queued=0.242ms percall=0.304ms
+  timing  stock  queued=0.231ms percall=0.327ms
+  speedup(queued)=0.955x  speedup(percall)=1.079x
+
+P1 ALL CHECKS PASSED
+=== scratchpad_prefill_qk_rope_check.py -> OK (0.7s) ===
+
+=========== CHECK: /private/tmp/claude-501/-Users-davidtai-projects-OpenSourceWTF/c9919a00-4c3e-4ca4-bce9-298f46559aad/scratchpad/scratchpad_prefill_moe_combine_check.py ===========
+
+=== P5 M=1024 top_k=10 hidden=3072 routed_scaling=2.5 ===
+PASS P5 M=1024 kernel eligible
+PASS P5 M=1024 kernel==stock  maxabs=0.000e+00 bitexact=1.00000
+PASS P5 M=1024 output shape [1024,3072]
+  timing  kernel queued=0.146ms percall=0.329ms
+  timing  stock  queued=0.745ms percall=0.588ms
+  speedup(queued)=5.100x  speedup(percall)=1.785x
+
+P5 ALL CHECKS PASSED
+=== scratchpad_prefill_moe_combine_check.py -> OK (0.2s) ===
+
+=== reloading qwen ===
++ launchctl bootstrap gui/501 /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist
+[rc=0]
+=== qwen reload requested (loads async) ===
+
+=== SUMMARY ===
+        OK  scratchpad_prefill_qk_rope_check.py
+        OK  scratchpad_prefill_moe_combine_check.py

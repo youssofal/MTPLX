@@ -16,6 +16,7 @@ from .constants import (
     EXPECTED_PREQUANTIZED_MTP_KEYS,
     EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS,
     EXPECTED_QWEN_MOE_SWITCH_MLP_PREQUANTIZED_MTP_KEYS,
+    expand_mtp_layer_keys,
 )
 from .expert_layout import num_experts_from_config, stack_numbered_experts
 
@@ -634,13 +635,20 @@ def _mtp_contract_for_weight_keys(
     normalized = {normalize_mtp_key(key) for key in keys}
     if contract.mtp_prequantized:
         return contract
-    if normalized == set(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS):
+    # The named key sets are depth-1 templates; expand per the declared layer
+    # count so N-layer sidecars are recognized identically.
+    n_layers = max(_num_mtp_layers(config), 1)
+    if normalized == expand_mtp_layer_keys(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS, n_layers):
         policy = "all"
-    elif normalized == set(EXPECTED_QWEN_MOE_SWITCH_MLP_PREQUANTIZED_MTP_KEYS):
+    elif normalized == expand_mtp_layer_keys(
+        EXPECTED_QWEN_MOE_SWITCH_MLP_PREQUANTIZED_MTP_KEYS, n_layers
+    ):
         policy = "all"
-    elif normalized == set(EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS):
+    elif normalized == expand_mtp_layer_keys(
+        EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS, n_layers
+    ):
         policy = "cyankiwi"
-    elif normalized == set(EXPECTED_PREQUANTIZED_MTP_KEYS):
+    elif normalized == expand_mtp_layer_keys(EXPECTED_PREQUANTIZED_MTP_KEYS, n_layers):
         policy = "cyankiwi"
     else:
         return contract
@@ -1032,15 +1040,28 @@ def inject_mtp_support(
             parts = [e, h] if order == "embedding_hidden" else [h, e]
             x = self.mtp.fc(mx.concatenate(parts, axis=-1))
             fc_hidden = x
-            layer_cache = mtp_cache[0] if mtp_cache else None
-            mask = create_attention_mask(x, layer_cache)
-            x = self._mtp_full_attention_layer(
-                self.mtp.layers[0],
-                x,
-                mask=mask,
-                cache=layer_cache,
-                position_offset=position_offset,
-            )
+            num_draft_layers = len(self.mtp.layers)
+            if mtp_cache:
+                if len(mtp_cache) < num_draft_layers:
+                    raise ValueError(
+                        "MTP cache carries "
+                        f"{len(mtp_cache)} entries for {num_draft_layers} draft "
+                        "layers; rebuild it with make_mtp_cache()"
+                    )
+                layer_caches = mtp_cache
+            else:
+                layer_caches = [None] * num_draft_layers
+            # All draft-layer caches advance in lockstep, so the mask derived
+            # from the first layer's cache offset is valid for every layer.
+            mask = create_attention_mask(x, layer_caches[0])
+            for mtp_layer, layer_cache in zip(self.mtp.layers, layer_caches):
+                x = self._mtp_full_attention_layer(
+                    mtp_layer,
+                    x,
+                    mask=mask,
+                    cache=layer_cache,
+                    position_offset=position_offset,
+                )
             pre_norm = x
             post_norm = self.mtp.norm(x)
             hidden = self._mixed_hidden(

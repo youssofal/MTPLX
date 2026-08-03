@@ -272,6 +272,7 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from typing import List, Optional
 
 import mlx.core as mx
@@ -982,6 +983,402 @@ class _DerivedCache:
         self.src = src
         self.value = value
         return value
+
+
+class _UninstalledGatherOLora:
+    """Fail-closed placeholder used until post-load route installation."""
+
+    __slots__ = ()
+
+    def __call__(self, _o: mx.array) -> mx.array:
+        raise RuntimeError(
+            "gather_qmm o-LoRA was selected but its post-load route was not installed"
+        )
+
+
+def _o_lora_linear_logical_weight_shape(linear) -> tuple[int, ...]:
+    """Return ``[output, input]`` without materializing a quantized weight."""
+
+    weight_shape = tuple(getattr(getattr(linear, "weight", None), "shape", ()))
+    if len(weight_shape) != 2:
+        return ()
+    if not isinstance(linear, nn.QuantizedLinear):
+        return weight_shape
+    try:
+        bits = int(linear.bits)
+        group_size = int(linear.group_size)
+        scales_shape = tuple(linear.scales.shape)
+    except (AttributeError, TypeError, ValueError):
+        return ()
+    packed_divisor = 32 // bits if bits > 0 and 32 % bits == 0 else 0
+    if not packed_divisor or group_size <= 0 or len(scales_shape) != 2:
+        return ()
+    packed_logical = (weight_shape[0], weight_shape[1] * packed_divisor)
+    scales_logical = (scales_shape[0], scales_shape[1] * group_size)
+    return packed_logical if packed_logical == scales_logical else ()
+
+
+class _DirectGatherOLora:
+    """Prevalidated direct gather route; execution performs no eligibility lookup."""
+
+    __slots__ = (
+        "biases",
+        "bits",
+        "group_size",
+        "groups",
+        "mode",
+        "per_group_input",
+        "rank",
+        "scales",
+        "weight",
+        "wo_b",
+    )
+
+    def __init__(self, attention: "DeepseekV4Attention", quant: tuple) -> None:
+        weight, scales, biases, group_size, bits, mode = quant
+        groups = int(attention.n_groups)
+        rank = int(attention.o_lora_rank)
+        per_group_input = int(
+            attention.n_heads * attention.head_dim // attention.n_groups
+        )
+        output_rows = groups * rank
+        if groups <= 0 or rank <= 0 or per_group_input <= 0:
+            raise ValueError("gather_qmm o-LoRA geometry must be positive")
+        if per_group_input % int(group_size):
+            raise ValueError(
+                "gather_qmm o-LoRA input width is not divisible by group_size"
+            )
+        packed_divisor = 32 // int(bits) if int(bits) and 32 % int(bits) == 0 else 0
+        if not packed_divisor:
+            raise ValueError(f"gather_qmm o-LoRA has unsupported bits={bits!r}")
+        expected_weight = (output_rows, per_group_input // packed_divisor)
+        expected_scales = (output_rows, per_group_input // int(group_size))
+        if tuple(weight.shape) != expected_weight:
+            raise ValueError(
+                f"gather_qmm o-LoRA packed weight shape {tuple(weight.shape)} "
+                f"does not match {expected_weight}"
+            )
+        if tuple(scales.shape) != expected_scales:
+            raise ValueError(
+                f"gather_qmm o-LoRA scale shape {tuple(scales.shape)} "
+                f"does not match {expected_scales}"
+            )
+        if biases is not None and tuple(biases.shape) != expected_scales:
+            raise ValueError(
+                f"gather_qmm o-LoRA bias shape {tuple(biases.shape)} "
+                f"does not match {expected_scales}"
+            )
+        expected_wo_b = (int(attention.dim), output_rows)
+        if _o_lora_linear_logical_weight_shape(attention.wo_b) != expected_wo_b:
+            raise ValueError("gather_qmm o-LoRA wo_b input geometry is invalid")
+        self.groups = groups
+        self.rank = rank
+        self.per_group_input = per_group_input
+        self.weight = weight.reshape(groups, rank, -1)
+        self.scales = scales.reshape(groups, rank, -1)
+        self.biases = (
+            None if biases is None else biases.reshape(groups, rank, -1)
+        )
+        self.group_size = int(group_size)
+        self.bits = int(bits)
+        self.mode = mode
+        self.wo_b = attention.wo_b
+
+    def __call__(self, o: mx.array) -> mx.array:
+        batch, sequence, _ = o.shape
+        rows = batch * sequence
+        x = o.reshape(rows, self.groups, self.per_group_input).swapaxes(0, 1)
+        out = mx.gather_qmm(
+            x,
+            self.weight,
+            self.scales,
+            self.biases,
+            transpose=True,
+            group_size=self.group_size,
+            bits=self.bits,
+            mode=self.mode,
+        )
+        return self.wo_b(
+            out.swapaxes(0, 1).reshape(
+                batch, sequence, self.groups * self.rank
+            )
+        )
+
+
+class _DirectGatherOLoraWideM4:
+    """Construction-bound M4-wide body route plus explicit stock-width routes.
+
+    The canonical body stores eight output-LoRA matrices.  At physical M4 the
+    wide entry point owns a threadgroup per stored group and streams one packed
+    weight / scale / bias row through all four verifier rows.  Other physical
+    widths are deliberately the already-qualified :class:`_DirectGatherOLora`
+    route; width is the only value that varies at execution and this is routing,
+    not an eligibility check or a fallback.
+    """
+
+    __slots__ = ("m4", "stock")
+
+    def __init__(
+        self,
+        attention: "DeepseekV4Attention",
+        quant: tuple,
+        *,
+        activation_dtype,
+    ) -> None:
+        if activation_dtype != mx.bfloat16:
+            raise ValueError(
+                "M4-wide gather o-LoRA activation/output dtype must be bfloat16"
+            )
+        self.stock = _DirectGatherOLora(attention, quant)
+        self.m4 = _GatherQMMWideM4OLora(
+            attention, quant, activation_dtype=activation_dtype
+        )
+
+    def __call__(self, o: mx.array) -> mx.array:
+        batch, sequence, _ = o.shape
+        if batch * sequence == 4:
+            return self.m4(o)
+        return self.stock(o)
+
+
+class _GatherQMMWideM4OLora:
+    """Fixed ``[8, 4, 4096]`` gathered affine-Q4 projection.
+
+    The source is derived for the actual o-LoRA packing, not copied from a
+    topology match: logical group ``g`` reads activation ``[row, g, :]`` and
+    weight/scale/bias bank ``rhs_ids[g]``.  Every packed nibble is affine
+    dequantized once before accumulating all four rows, matching the stock Q4
+    association and its eight-lane K ownership.  A construction self-check
+    against ``mx.gather_qmm`` is required before this route is published.
+    """
+
+    __slots__ = (
+        "biases",
+        "bits",
+        "group_ids",
+        "group_size",
+        "groups",
+        "kernel",
+        "mode",
+        "per_group_input",
+        "rank",
+        "scales",
+        "weight",
+        "wo_b",
+    )
+
+    def __init__(
+        self,
+        attention: "DeepseekV4Attention",
+        quant: tuple,
+        *,
+        activation_dtype,
+    ) -> None:
+        weight, scales, biases, group_size, bits, mode = quant
+        if activation_dtype != mx.bfloat16:
+            raise ValueError(
+                "M4-wide gather o-LoRA activation/output dtype must be bfloat16"
+            )
+        if getattr(weight, "dtype", None) != mx.uint32:
+            raise ValueError("M4-wide gather o-LoRA packed weight dtype must be uint32")
+        if getattr(scales, "dtype", None) != mx.bfloat16:
+            raise ValueError("M4-wide gather o-LoRA scales dtype must be bfloat16")
+        if biases is None or getattr(biases, "dtype", None) != mx.bfloat16:
+            raise ValueError("M4-wide gather o-LoRA biases dtype must be bfloat16")
+        groups = int(attention.n_groups)
+        rank = int(attention.o_lora_rank)
+        per_group_input = int(
+            attention.n_heads * attention.head_dim // attention.n_groups
+        )
+        if (groups, rank, per_group_input, int(group_size), int(bits), mode) != (
+            8,
+            1024,
+            4096,
+            64,
+            4,
+            "affine",
+        ):
+            raise ValueError("M4-wide gather o-LoRA requires canonical body geometry")
+        if tuple(weight.shape) != (groups * rank, 512):
+            raise ValueError("M4-wide gather o-LoRA packed weight layout changed")
+        if tuple(scales.shape) != (groups * rank, 64):
+            raise ValueError("M4-wide gather o-LoRA scale layout changed")
+        if tuple(biases.shape) != (groups * rank, 64):
+            raise ValueError("M4-wide gather o-LoRA bias layout changed")
+        self.groups = groups
+        self.rank = rank
+        self.per_group_input = per_group_input
+        self.weight = weight.reshape(groups, rank, -1)
+        self.scales = scales.reshape(groups, rank, -1)
+        self.biases = biases.reshape(groups, rank, -1)
+        self.group_size = int(group_size)
+        self.bits = int(bits)
+        self.mode = mode
+        self.group_ids = mx.arange(groups, dtype=mx.uint32)
+        self.wo_b = attention.wo_b
+        self.kernel = _gather_qmm_wide_m4_olora_kernel()
+
+    def grouped(self, o_rows: mx.array, rhs_ids: mx.array) -> mx.array:
+        """Project exactly four row-major o-LoRA rows with selected group banks."""
+        (out,) = self.kernel(
+            inputs=[
+                o_rows,
+                self.weight,
+                self.scales,
+                self.biases,
+                rhs_ids,
+            ],
+            template=[("T", mx.bfloat16)],
+            grid=(32, 256, 8),
+            threadgroup=(32, 2, 1),
+            output_shapes=[(8, 4, 1024)],
+            output_dtypes=[mx.bfloat16],
+        )
+        return out
+
+    def __call__(self, o: mx.array) -> mx.array:
+        batch, sequence, _ = o.shape
+        rows = o.reshape(4, self.groups, self.per_group_input)
+        out = self.grouped(rows, self.group_ids)
+        return self.wo_b(
+            out.swapaxes(0, 1).reshape(batch, sequence, self.groups * self.rank)
+        )
+
+
+@lru_cache(maxsize=1)
+def _gather_qmm_wide_m4_olora_kernel():
+    """Build the exact-shape gathered wide kernel at installation, never decode."""
+
+    source = """
+        using namespace metal;
+        constexpr int M = 4;
+        constexpr int GROUPS = 8;
+        constexpr int K = 4096;
+        constexpr int N = 1024;
+        constexpr int GS = 64;
+        constexpr int K_LANES = 8;
+        constexpr int RESULTS_PER_SIMDGROUP = 32 / K_LANES;
+        constexpr int NUM_SIMDGROUPS = 2;
+        constexpr int ROWS_PER_TG = RESULTS_PER_SIMDGROUP * NUM_SIMDGROUPS;
+        constexpr int SUB = 8;
+
+        uint lane = thread_index_in_simdgroup;
+        uint simd_gid = simdgroup_index_in_threadgroup;
+        uint tg_n = threadgroup_position_in_grid.y;
+        uint lhs_group = threadgroup_position_in_grid.z;
+        short k_lane = short(lane % K_LANES);
+        short sg_row = short(lane / K_LANES);
+        int out_row = int(tg_n) * ROWS_PER_TG
+            + RESULTS_PER_SIMDGROUP * int(simd_gid) + int(sg_row);
+        int row = min(out_row, N - 1);
+        int rhs_group = int(rhs_ids[lhs_group]);
+        int K_by_gs = K / GS;
+        int K_bytes = K / 2;
+        const device uint8_t* wrow = (const device uint8_t*)w
+            + (rhs_group * N + row) * K_bytes;
+        const device T* srow = scales + (rhs_group * N + row) * K_by_gs;
+        const device T* brow = biases + (rhs_group * N + row) * K_by_gs;
+
+        float result[M] = {0.0f};
+        for (int g = int(k_lane); g < K_by_gs; g += K_LANES) {
+            float scale = float(srow[g]);
+            float bias = float(brow[g]);
+            float scaled_hi = scale / 16.0f;
+            _Pragma("unroll")
+            for (int sc = 0; sc < GS / SUB; ++sc) {
+                int k0 = g * GS + sc * SUB;
+                const device uint8_t* wc = wrow + k0 / 2;
+                float w_dq[SUB];
+                w_dq[0] = scale * float(wc[0] & 0x0f) + bias;
+                w_dq[1] = scaled_hi * float(wc[0] & 0xf0) + bias;
+                w_dq[2] = scale * float(wc[1] & 0x0f) + bias;
+                w_dq[3] = scaled_hi * float(wc[1] & 0xf0) + bias;
+                w_dq[4] = scale * float(wc[2] & 0x0f) + bias;
+                w_dq[5] = scaled_hi * float(wc[2] & 0xf0) + bias;
+                w_dq[6] = scale * float(wc[3] & 0x0f) + bias;
+                w_dq[7] = scaled_hi * float(wc[3] & 0xf0) + bias;
+                _Pragma("unroll")
+                for (int v = 0; v < M; ++v) {
+                    const device T* xc = x + (v * GROUPS + int(lhs_group)) * K + k0;
+                    float acc = 0.0f;
+                    _Pragma("unroll")
+                    for (int i = 0; i < SUB; ++i) {
+                        acc += float(xc[i]) * w_dq[i];
+                    }
+                    result[v] += acc;
+                }
+            }
+        }
+        _Pragma("unroll")
+        for (int v = 0; v < M; ++v) {
+            result[v] += simd_shuffle_down(result[v], 4);
+            result[v] += simd_shuffle_down(result[v], 2);
+            result[v] += simd_shuffle_down(result[v], 1);
+        }
+        if (k_lane == 0 && out_row < N) {
+            _Pragma("unroll")
+            for (int v = 0; v < M; ++v) {
+                y[(int(lhs_group) * M + v) * N + out_row] = T(result[v]);
+            }
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="mtplx_dsv4_olora_gather_qmv_wide_m4_q4_g64",
+        input_names=["x", "w", "scales", "biases", "rhs_ids"],
+        output_names=["y"],
+        source=source,
+    )
+
+
+class _DirectDenseOLora:
+    """Prebound dense grouped matmul with no storage/cache decision at execution."""
+
+    __slots__ = ("groups", "per_group_input", "rank", "weight", "wo_b")
+
+    def __init__(self, attention: "DeepseekV4Attention", weight: mx.array) -> None:
+        self.groups = int(attention.n_groups)
+        self.rank = int(attention.o_lora_rank)
+        self.per_group_input = int(
+            attention.n_heads * attention.head_dim // attention.n_groups
+        )
+        self.weight = weight.reshape(
+            self.groups, self.rank, self.per_group_input
+        )
+        self.wo_b = attention.wo_b
+
+    def __call__(self, o: mx.array) -> mx.array:
+        batch, sequence, _ = o.shape
+        grouped = o.reshape(
+            batch, sequence, self.groups, self.per_group_input
+        )
+        out = mx.einsum("bsgp,grp->bsgr", grouped, self.weight)
+        return self.wo_b(out.reshape(batch, sequence, self.groups * self.rank))
+
+
+class _DirectCachedOLora(_DirectDenseOLora):
+    """Known quantized body storage, dequantized and captured exactly once."""
+
+    __slots__ = ()
+
+    def __init__(self, attention: "DeepseekV4Attention", quant: tuple) -> None:
+        weight, scales, biases, group_size, bits, mode = quant
+        dense = mx.dequantize(
+            weight,
+            scales,
+            biases,
+            group_size=group_size,
+            bits=bits,
+            mode=mode,
+        )
+        super().__init__(attention, dense)
+        mx.eval(self.weight)
+        attention._wo_a_cache.put((weight, scales, biases), self.weight)
+
+
+class _DirectDenseMTPOLora(_DirectDenseOLora):
+    """Known dense-BF16 MTP stock math, captured without a quantized lookup."""
+
+    __slots__ = ()
 
 
 @dataclass
@@ -2376,6 +2773,11 @@ class DeepseekV4Attention(nn.Module):
         # are plain (non-array) attributes, so neither reaches the weight tree.
         self.o_lora_mode = _o_lora_mode_from_env()
         self._wo_a_cache = _DerivedCache()
+        self._o_lora_impl = (
+            _UninstalledGatherOLora()
+            if self.o_lora_mode == "gather_qmm"
+            else self._o_lora_dense
+        )
         # How _attend forms the score block (see _ATTN_MODES).
         self.attn_mode = _attn_mode_from_env()
 
@@ -2463,54 +2865,36 @@ class DeepseekV4Attention(nn.Module):
             return dense
         return self._wo_a_cache.put(src, dense)
 
-    def _o_lora_gather_qmm(self, o: mx.array) -> mx.array:
-        """Grouped o-LoRA as a quantised block-diagonal matmul (arm b).
+    def install_o_lora_route(self, mode: str | None = None) -> dict:
+        """Validate and bind one o-LoRA route at an installation boundary."""
+        selected = self.o_lora_mode if mode is None else str(mode)
+        if selected not in _O_LORA_MODES:
+            raise ValueError(f"unsupported o-LoRA route {selected!r}")
+        if selected == "gather_qmm":
+            quant = self._wo_a_quant()
+            if quant is None:
+                raise ValueError(
+                    "gather_qmm o-LoRA requires a quantized wo_a; dense fallback "
+                    "is forbidden"
+                )
+            installed = _DirectGatherOLora(self, quant)
+            direct = True
+        else:
+            installed = self._o_lora_dense
+            direct = False
+        self.o_lora_mode = selected
+        self._o_lora_impl = installed
+        return {
+            "mode": selected,
+            "direct": direct,
+            "groups": int(self.n_groups),
+            "rank": int(self.o_lora_rank),
+            "per_group_input": int(
+                self.n_heads * self.head_dim // self.n_groups
+            ),
+        }
 
-        The ``o_groups`` LoRA groups are ``o_groups`` independent ``[r, per]``
-        matrices, so the projection is one :func:`mx.gather_qmm` over a leading
-        group axis — every row visits every group, and nothing dense is ever
-        materialised.  The reference flags exactly this as the optimisation it did
-        not take ("wo_a is FP8 in checkpoint; could do FP8 einsum here for better
-        perf, but using BF16 for simplicity", model.py L538-539).
-
-        **Calling convention.**  ``x`` must carry the row axis in the *batch* dims
-        with the matmul rows in the last two, i.e. ``[g, rows, per] -> [g, rows,
-        r]``; a flat ``[rows, per]`` broadcasts instead and silently does ``g``
-        times the work while still producing usable-looking numbers.  This box's
-        ledger has been bitten by that twice, which is why the output shape is
-        checked here rather than assumed.
-
-        **Not bit-identical** to :meth:`_wo_a_grouped` + einsum: the quantised
-        kernel dequantises inside the accumulation, so the products are summed in
-        a different order.  Gated on tolerance + argmax stability, default off.
-        """
-        b, s, _ = o.shape
-        g = self.n_groups
-        r = self.o_lora_rank
-        per = self.n_heads * self.head_dim // g
-        w, scales, biases, group_size, bits, mode = self._wo_a_quant()
-        rows = b * s
-        # [b, s, g*per] -> [g, rows, per]: group g owns o's g-th per-wide chunk.
-        x = o.reshape(rows, g, per).swapaxes(0, 1)
-        out = mx.gather_qmm(
-            x,
-            w.reshape(g, r, -1),
-            scales.reshape(g, r, -1),
-            None if biases is None else biases.reshape(g, r, -1),
-            transpose=True,
-            group_size=group_size,
-            bits=bits,
-            mode=mode,
-        )
-        if tuple(out.shape) != (g, rows, r):
-            raise AssertionError(
-                "gather_qmm o-LoRA shape contract broken: expected "
-                f"{(g, rows, r)}, got {tuple(out.shape)} — an x of shape "
-                f"{tuple(x.shape)} was broadcast instead of batched"
-            )
-        return self.wo_b(out.swapaxes(0, 1).reshape(b, s, g * r))
-
-    def _o_lora(self, o: mx.array) -> mx.array:
+    def _o_lora_dense(self, o: mx.array) -> mx.array:
         """Grouped output-LoRA (reference model.py L536-542).
 
         ``o``: ``[b, s, n_heads*head_dim]`` -> reshape ``[b, s, n_groups, per]``;
@@ -2519,8 +2903,6 @@ class DeepseekV4Attention(nn.Module):
 
         See :data:`_O_LORA_MODES` for the three ways ``wo_a`` gets there.
         """
-        if self.o_lora_mode == "gather_qmm" and self._wo_a_quant() is not None:
-            return self._o_lora_gather_qmm(o)
         b, s, _ = o.shape
         g = self.n_groups
         per = self.n_heads * self.head_dim // g
@@ -2531,6 +2913,10 @@ class DeepseekV4Attention(nn.Module):
         out = mx.einsum("bsgp,grp->bsgr", og, w)
         out = out.reshape(b, s, g * r)
         return self.wo_b(out)
+
+    def _o_lora(self, o: mx.array) -> mx.array:
+        """Execute the prebound route with no enabled-path eligibility branch."""
+        return self._o_lora_impl(o)
 
     def _attn_mask(
         self,
@@ -3121,6 +3507,10 @@ class Model(nn.Module):
             DeepseekV4MTP(args, args.num_hidden_layers + i)
             for i in range(max(int(args.num_nextn_predict_layers or 0), 0))
         ]
+        # Construction-time performance installers may replace this with a
+        # typed phase/width router.  The stock callable is explicit and direct;
+        # decoder layers never probe candidate eligibility or fall back.
+        self._target_hc_hidden_route = self.model.hc_hidden
 
     def __call__(
         self,
@@ -3160,7 +3550,7 @@ class Model(nn.Module):
                 "the DeepSeek-V4 backend does not support input_embeddings "
                 "(no vision splice path)"
             )
-        h = self.model.hc_hidden(inputs, cache)
+        h = self._target_hc_hidden_route(inputs, cache)
         logits = None
         if emit_logits:
             source = h
@@ -3389,6 +3779,490 @@ class MTPHead(nn.Module):
     def __init__(self, blocks):
         super().__init__()
         self.layers = list(blocks)
+
+
+_O_LORA_BODY_COUNT = 43
+_O_LORA_MTP_COUNT = 1
+_O_LORA_WO_A_LOGICAL_SHAPE = (8192, 4096)
+_O_LORA_WO_A_PACKED_SHAPE = (8192, 512)
+_O_LORA_WO_A_QUANT_AUX_SHAPE = (8192, 64)
+_O_LORA_BODY_WO_B_LOGICAL_SHAPE = (4096, 8192)
+_O_LORA_BODY_WO_B_PACKED_SHAPE = (4096, 1024)
+_O_LORA_BODY_WO_B_QUANT_AUX_SHAPE = (4096, 128)
+_O_LORA_MTP_WO_B_SHAPE = (4096, 8192)
+_O_LORA_ATTENTION_GEOMETRY = {
+    "n_groups": 8,
+    "o_lora_rank": 1024,
+    "n_heads": 64,
+    "head_dim": 512,
+    "dim": 4096,
+    "input_width": 32768,
+    "per_group_input": 4096,
+    "grouped_output_width": 8192,
+}
+_O_LORA_QUANT_FIELDS = ("scales", "biases", "bits", "group_size", "mode")
+_CANONICAL_O_LORA_STORAGE_CONTRACT = {
+    "body": {
+        "count": 43,
+        "attention_geometry": _O_LORA_ATTENTION_GEOMETRY,
+        "wo_a": {
+            "class": "QuantizedLinear",
+            "logical_weight_shape": list(_O_LORA_WO_A_LOGICAL_SHAPE),
+            "packed_weight": {
+                "shape": list(_O_LORA_WO_A_PACKED_SHAPE),
+                "dtype": "uint32",
+            },
+            "scales": {
+                "shape": list(_O_LORA_WO_A_QUANT_AUX_SHAPE),
+                "dtype": "bfloat16",
+            },
+            "biases": {
+                "shape": list(_O_LORA_WO_A_QUANT_AUX_SHAPE),
+                "dtype": "bfloat16",
+            },
+            "bits": 4,
+            "group_size": 64,
+            "mode": "affine",
+            "additive_bias": None,
+        },
+        "wo_b": {
+            "class": "QuantizedLinear",
+            "logical_weight_shape": list(_O_LORA_BODY_WO_B_LOGICAL_SHAPE),
+            "packed_weight": {
+                "shape": list(_O_LORA_BODY_WO_B_PACKED_SHAPE),
+                "dtype": "uint32",
+            },
+            "scales": {
+                "shape": list(_O_LORA_BODY_WO_B_QUANT_AUX_SHAPE),
+                "dtype": "bfloat16",
+            },
+            "biases": {
+                "shape": list(_O_LORA_BODY_WO_B_QUANT_AUX_SHAPE),
+                "dtype": "bfloat16",
+            },
+            "bits": 4,
+            "group_size": 64,
+            "mode": "affine",
+            "additive_bias": None,
+        },
+    },
+    "mtp": {
+        "count": 1,
+        "wo_a": {
+            "class": "Linear",
+            "weight": {
+                "shape": list(_O_LORA_WO_A_LOGICAL_SHAPE),
+                "dtype": "bfloat16",
+            },
+            "additive_bias": None,
+            "no_quant_metadata": True,
+            "absent_quant_fields": list(_O_LORA_QUANT_FIELDS),
+        },
+        "wo_b": {
+            "class": "Linear",
+            "weight": {
+                "shape": list(_O_LORA_MTP_WO_B_SHAPE),
+                "dtype": "bfloat16",
+            },
+            "additive_bias": None,
+            "no_quant_metadata": True,
+            "absent_quant_fields": list(_O_LORA_QUANT_FIELDS),
+        },
+    },
+}
+
+
+def _require_o_lora_array(
+    value, *, label: str, shape: tuple[int, int], dtype
+) -> None:
+    if tuple(getattr(value, "shape", ())) != shape:
+        raise ValueError(
+            f"{label} shape {tuple(getattr(value, 'shape', ()))} does not match {shape}"
+        )
+    if getattr(value, "dtype", None) != dtype:
+        raise ValueError(f"{label} dtype is not {dtype}")
+
+
+def _require_canonical_quantized_linear(
+    linear, *, label: str, logical_shape: tuple[int, int]
+) -> tuple:
+    """Validate exact Q4 storage and derive its logical shape two ways."""
+
+    if not isinstance(linear, nn.QuantizedLinear):
+        raise ValueError(f"{label} must be QuantizedLinear")
+    for attribute, expected in (
+        ("bits", 4),
+        ("group_size", 64),
+        ("mode", "affine"),
+    ):
+        observed = getattr(linear, attribute, None)
+        if observed != expected:
+            raise ValueError(
+                f"{label} {attribute}={observed!r}, expected {expected!r}"
+            )
+
+    weight = getattr(linear, "weight", None)
+    scales = getattr(linear, "scales", None)
+    biases = getattr(linear, "biases", None)
+    weight_shape = tuple(getattr(weight, "shape", ()))
+    scales_shape = tuple(getattr(scales, "shape", ()))
+    biases_shape = tuple(getattr(biases, "shape", ()))
+    if len(weight_shape) != 2:
+        raise ValueError(f"{label} packed weight shape {weight_shape} is not rank 2")
+    if len(scales_shape) != 2:
+        raise ValueError(f"{label} scales shape {scales_shape} is not rank 2")
+
+    packed_divisor = 32 // int(linear.bits)
+    packed_logical = (weight_shape[0], weight_shape[1] * packed_divisor)
+    scales_logical = (
+        scales_shape[0],
+        scales_shape[1] * int(linear.group_size),
+    )
+    expected_output, expected_input = logical_shape
+    if packed_logical[0] != expected_output:
+        raise ValueError(
+            f"{label} packed weight shape {weight_shape} has logical output "
+            f"{packed_logical[0]}, expected {expected_output}"
+        )
+    if packed_logical[1] != expected_input:
+        raise ValueError(
+            f"{label} packed weight shape {weight_shape} has logical input "
+            f"{packed_logical[1]}, expected {expected_input}"
+        )
+    if scales_logical[0] != expected_output:
+        raise ValueError(
+            f"{label} scales shape {scales_shape} has logical output "
+            f"{scales_logical[0]}, expected {expected_output}"
+        )
+    if scales_logical[1] != expected_input:
+        raise ValueError(
+            f"{label} scales shape {scales_shape} has logical input "
+            f"{scales_logical[1]}, expected {expected_input}"
+        )
+    if getattr(weight, "dtype", None) != mx.uint32:
+        raise ValueError(f"{label} packed weight dtype is not {mx.uint32}")
+    if getattr(scales, "dtype", None) != mx.bfloat16:
+        raise ValueError(f"{label} scales dtype is not {mx.bfloat16}")
+    if biases_shape != scales_shape:
+        raise ValueError(
+            f"{label} biases shape {biases_shape} does not match scales shape "
+            f"{scales_shape}"
+        )
+    if getattr(biases, "dtype", None) != mx.bfloat16:
+        raise ValueError(f"{label} biases dtype is not {mx.bfloat16}")
+    if getattr(linear, "bias", None) is not None:
+        raise ValueError(f"{label} additive bias must be absent")
+    return (
+        weight,
+        scales,
+        biases,
+        linear.group_size,
+        linear.bits,
+        linear.mode,
+    )
+
+
+def _require_canonical_dense_linear(
+    linear, *, label: str, shape: tuple[int, int]
+):
+    if not isinstance(linear, nn.Linear) or isinstance(linear, nn.QuantizedLinear):
+        raise ValueError(f"{label} must be a dense nn.Linear, not QuantizedLinear")
+    weight = getattr(linear, "weight", None)
+    _require_o_lora_array(
+        weight,
+        label=f"{label} weight",
+        shape=shape,
+        dtype=mx.bfloat16,
+    )
+    if getattr(linear, "bias", None) is not None:
+        raise ValueError(f"{label} additive bias must be absent")
+    accidental = [
+        attribute
+        for attribute in _O_LORA_QUANT_FIELDS
+        if hasattr(linear, attribute)
+    ]
+    if accidental:
+        raise ValueError(
+            f"{label} must not expose quantized metadata: " + ", ".join(accidental)
+        )
+    return weight
+
+
+def _validate_canonical_o_lora_topology(trunk, mtp) -> tuple[list[tuple], mx.array]:
+    """Fail before timing unless this exact mixed checkpoint layout is loaded.
+
+    The 43 body modules are affine Q4 storage and may take the direct gather
+    route.  The one MTP module is intentionally a dense BF16 linear and must
+    remain an explicit stock route; treating it as an eligible gather module
+    would turn a checkpoint-layout fact into a hot-path fallback.
+    """
+    if len(trunk) != _O_LORA_BODY_COUNT:
+        raise ValueError(f"expected 43 body o-LoRA modules, found {len(trunk)}")
+    if len(mtp) != _O_LORA_MTP_COUNT:
+        raise ValueError(f"expected exactly one MTP o-LoRA module, found {len(mtp)}")
+
+    body_quant = []
+    for index, attention in enumerate(trunk):
+        wo_a = getattr(attention, "wo_a", None)
+        wo_a_label = f"body {index} wo_a"
+        for attribute in ("n_groups", "o_lora_rank", "n_heads", "head_dim", "dim"):
+            observed = getattr(attention, attribute, None)
+            expected = _O_LORA_ATTENTION_GEOMETRY[attribute]
+            if observed != expected:
+                raise ValueError(
+                    f"body {index} attention {attribute}={observed!r}, "
+                    f"expected {expected}"
+                )
+        input_width = int(attention.n_heads) * int(attention.head_dim)
+        per_group_input = input_width // int(attention.n_groups)
+        grouped_output_width = int(attention.n_groups) * int(attention.o_lora_rank)
+        derived_geometry = {
+            "input_width": input_width,
+            "per_group_input": per_group_input,
+            "grouped_output_width": grouped_output_width,
+        }
+        for attribute, observed in derived_geometry.items():
+            expected = _O_LORA_ATTENTION_GEOMETRY[attribute]
+            if observed != expected:
+                raise ValueError(
+                    f"body {index} attention {attribute}={observed}, expected {expected}"
+                )
+        body_quant.append(
+            _require_canonical_quantized_linear(
+                wo_a,
+                label=wo_a_label,
+                logical_shape=_O_LORA_WO_A_LOGICAL_SHAPE,
+            )
+        )
+        _require_canonical_quantized_linear(
+            getattr(attention, "wo_b", None),
+            label=f"body {index} wo_b",
+            logical_shape=(int(attention.dim), grouped_output_width),
+        )
+
+    mtp_weight = _require_canonical_dense_linear(
+        getattr(mtp[0], "wo_a", None),
+        label="MTP wo_a",
+        shape=_O_LORA_WO_A_LOGICAL_SHAPE,
+    )
+    _require_canonical_dense_linear(
+        getattr(mtp[0], "wo_b", None),
+        label="MTP wo_b",
+        shape=_O_LORA_MTP_WO_B_SHAPE,
+    )
+    return body_quant, mtp_weight
+
+
+def _require_bf16_body_activation_output(model):
+    """Reify the actual trunk activation dtype before installing the M4 route."""
+    trunk = getattr(model, "model", None)
+    embedding = getattr(trunk, "embed_tokens", None)
+    if embedding is None or not callable(embedding):
+        raise ValueError(
+            "M4-wide gather o-LoRA requires a callable trunk embedding output"
+        )
+    try:
+        output = embedding(mx.zeros((1, 1), dtype=mx.int32))
+    except Exception as exc:
+        raise ValueError(
+            "M4-wide gather o-LoRA could not reify the trunk embedding output"
+        ) from exc
+    expected_shape = (1, 1, _O_LORA_ATTENTION_GEOMETRY["dim"])
+    if tuple(getattr(output, "shape", ())) != expected_shape:
+        raise ValueError(
+            "M4-wide gather o-LoRA embedding output shape "
+            f"{tuple(getattr(output, 'shape', ()))} does not match {expected_shape}"
+        )
+    if getattr(output, "dtype", None) != mx.bfloat16:
+        raise ValueError(
+            "M4-wide gather o-LoRA embedding output dtype must be bfloat16"
+        )
+    return mx.bfloat16
+
+
+def _validate_gather_qmm_wide_m4_body_routes(
+    body_routes: list[_DirectGatherOLoraWideM4],
+) -> None:
+    """Prove exact M4 gathered algebra before binding any body route.
+
+    The sentinel layers span the first, a hash-layer boundary, and the final
+    body module.  Identity, reordered-distinct, and repeated RHS IDs prove the
+    custom group-bank lookup has the same meaning as ``gather_qmm``; production
+    uses the authenticated identity IDs held by each installed route.
+    """
+
+    if len(body_routes) != _O_LORA_BODY_COUNT:
+        raise ValueError("M4-wide gather self-check lacks the 43 body routes")
+    rhs_cases = (
+        ("identity", (0, 1, 2, 3, 4, 5, 6, 7)),
+        ("distinct_reordered", (7, 3, 5, 1, 6, 0, 4, 2)),
+        ("repeated", (7, 0, 7, 3, 3, 5, 1, 0)),
+    )
+    for layer_index in (0, 3, 42):
+        route = body_routes[layer_index].m4
+        base = mx.arange(4 * 8 * 4096, dtype=mx.float32).reshape(4, 8, 4096)
+        probe = ((base % 29.0) - 14.0).astype(mx.bfloat16) / 8.0
+        gathered_x = probe.swapaxes(0, 1)
+        for case_name, ids in rhs_cases:
+            rhs_ids = mx.array(ids, dtype=mx.uint32)
+            stock = mx.gather_qmm(
+                gathered_x,
+                route.weight,
+                route.scales,
+                route.biases,
+                lhs_indices=route.group_ids,
+                rhs_indices=rhs_ids,
+                transpose=True,
+                group_size=route.group_size,
+                bits=route.bits,
+                mode=route.mode,
+            )
+            wide = route.grouped(probe, rhs_ids)
+            mx.eval(stock, wide)
+            exact = bool(mx.array_equal(stock, wide).item())
+            if (
+                tuple(stock.shape) != (8, 4, 1024)
+                or tuple(wide.shape) != (8, 4, 1024)
+                or stock.dtype != mx.bfloat16
+                or wide.dtype != mx.bfloat16
+                or stock.dtype != wide.dtype
+                or not exact
+            ):
+                raise ValueError(
+                    "M4-wide gather self-check diverged at body "
+                    f"layer {layer_index} ({case_name})"
+                )
+
+
+def install_deepseek_v4_o_lora_routes(
+    model, mode: str | None = None, *, canonical_mixed_route: bool = False
+) -> dict:
+    """Install the canonical 43-Q4-body/one-dense-MTP o-LoRA route.
+
+    Validation and binding are construction-time only.  The direct candidate
+    binds gather on body modules and binds MTP to its stock dense callable;
+    neither branch has a runtime eligibility check or fallback.
+    """
+    trunk = [layer.attn for layer in model.layers]
+    mtp = [block.attn for block in model.mtp_blocks]
+    selected = (
+        str(mode)
+        if mode is not None
+        else _o_lora_mode_from_env()
+    )
+    if selected not in _O_LORA_MODES:
+        raise ValueError(f"unsupported o-LoRA route {selected!r}")
+    if not canonical_mixed_route:
+        reports = [attention.install_o_lora_route(selected) for attention in trunk + mtp]
+        return {
+            "mode": selected,
+            "module_count": len(reports),
+            "trunk_module_count": len(trunk),
+            "mtp_module_count": len(mtp),
+            "all_direct": bool(reports) and all(report["direct"] for report in reports),
+            "all_mode_matches": bool(reports)
+            and all(report["mode"] == selected for report in reports),
+            "modules": reports,
+        }
+    if selected not in {"cached", "gather_qmm"}:
+        raise ValueError(
+            "canonical mixed o-LoRA route supports only cached or gather_qmm"
+        )
+    if selected == "gather_qmm" and _FP32_ACTIVATIONS:
+        raise ValueError(
+            "M4-wide gather o-LoRA requires DeepSeek-V4-Flash BF16 activation "
+            "storage; MTPLX_DSV4_FP32_ACTIVATIONS is an explicit stock A/B arm"
+        )
+    body_quant, mtp_weight = _validate_canonical_o_lora_topology(trunk, mtp)
+    activation_dtype = (
+        _require_bf16_body_activation_output(model)
+        if selected == "gather_qmm"
+        else None
+    )
+    body_route_type = (
+        _DirectGatherOLoraWideM4
+        if selected == "gather_qmm"
+        else _DirectCachedOLora
+    )
+    if selected == "gather_qmm":
+        body_impls = [
+            body_route_type(
+                attention, quant, activation_dtype=activation_dtype
+            )
+            for attention, quant in zip(trunk, body_quant)
+        ]
+    else:
+        body_impls = [
+            body_route_type(attention, quant)
+            for attention, quant in zip(trunk, body_quant)
+        ]
+    if selected == "gather_qmm":
+        _validate_gather_qmm_wide_m4_body_routes(body_impls)
+    mtp_impls = [_DirectDenseMTPOLora(mtp[0], mtp_weight)]
+    for attention, installed in zip(trunk, body_impls):
+        attention.o_lora_mode = selected
+        attention._o_lora_impl = installed
+    # Dense MTP is always explicitly installed stock.  In the candidate arm this
+    # is deliberately not a fallback from gather_qmm.
+    for attention, installed in zip(mtp, mtp_impls):
+        attention.o_lora_mode = "cached"
+        attention._o_lora_impl = installed
+    body_reports = [
+        {
+            "mode": selected,
+            "direct": selected == "gather_qmm",
+            "callable": type(installed).__name__,
+        }
+        for installed in body_impls
+    ]
+    mtp_reports = [
+        {
+            "mode": "cached",
+            "direct": False,
+            "callable": type(installed).__name__,
+        }
+        for installed in mtp_impls
+    ]
+    reports = body_reports + mtp_reports
+    route_objects = body_impls + mtp_impls
+    callable_census = {
+        "body_route_objects": len(body_impls),
+        "body_route_kind": (
+            "gather_qmm_m4_wide_direct"
+            if selected == "gather_qmm"
+            else "cached_direct"
+        ),
+        "body_callable_class": body_route_type.__name__,
+        "mtp_route_objects": len(mtp_impls),
+        "mtp_route_kind": "dense_bf16_stock_direct",
+        "mtp_callable_class": _DirectDenseMTPOLora.__name__,
+        "total_route_objects": len(route_objects),
+        "unique_route_objects": len({id(installed) for installed in route_objects}),
+        "mtp_distinct_type": bool(body_impls and mtp_impls)
+        and type(mtp_impls[0]) is not type(body_impls[0]),
+    }
+    return {
+        "mode": selected,
+        "module_count": len(reports),
+        "trunk_module_count": len(trunk),
+        "mtp_module_count": len(mtp),
+        "body_direct": sum(report["direct"] for report in body_reports),
+        "mtp_stock": sum(
+            report["mode"] == "cached" and not report["direct"]
+            for report in mtp_reports
+        ),
+        "body_all_mode_matches": bool(body_reports)
+        and all(report["mode"] == selected for report in body_reports),
+        "route_plan_matches": bool(body_reports and mtp_reports)
+        and all(report["mode"] == selected for report in body_reports)
+        and all(
+            report["mode"] == "cached" and not report["direct"]
+            for report in mtp_reports
+        ),
+        "storage_contract": _CANONICAL_O_LORA_STORAGE_CONTRACT,
+        "callable_census": callable_census,
+        "modules": reports,
+    }
 
 
 def is_deepseek_v4_mtp_config(config: dict) -> bool:

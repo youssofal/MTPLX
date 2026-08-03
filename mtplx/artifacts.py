@@ -12,18 +12,14 @@ from typing import Any
 
 from .constants import (
     EXPECTED_ALL_PREQUANTIZED_MTP_KEYS,
-    EXPECTED_ALL_PREQUANTIZED_MTP_TENSOR_COUNT,
     EXPECTED_MTP_KEYS,
-    EXPECTED_PREQUANTIZED_MTP_KEYS,
-    EXPECTED_PREQUANTIZED_MTP_TENSOR_COUNT,
     EXPECTED_MTP_TENSOR_COUNT,
+    EXPECTED_PREQUANTIZED_MTP_KEYS,
     EXPECTED_QWEN_MOE_MTP_KEYS,
-    EXPECTED_QWEN_MOE_MTP_TENSOR_COUNT,
     EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS,
-    EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_TENSOR_COUNT,
     EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS,
-    EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_TENSOR_COUNT,
     MULTIMODAL_SIDECARS,
+    expand_mtp_layer_keys,
 )
 from .models.laguna_config import (
     LAGUNA_S_2_1_REPO_ID,
@@ -194,6 +190,13 @@ def _mtp_expected_key_set(
     prequantized = isinstance(mtp_quant, dict) and bool(mtp_quant.get("prequantized"))
     quant_policy = str(mtp_quant.get("policy") or "") if isinstance(mtp_quant, dict) else ""
     normalized = {normalize_mtp_key(key) for key in keys}
+    # Every named key set below is the canonical depth-1 template; checkpoints
+    # declaring mtp_num_hidden_layers > 1 replicate the layer keys per index.
+    n_layers = max(_num_mtp_layers(config), 1)
+
+    def _expanded(base: tuple[str, ...]) -> set[str]:
+        return expand_mtp_layer_keys(base, n_layers)
+
     if _is_qwen_moe_mtp_layout(config, normalized):
         if any(".mlp.switch_mlp." in key for key in normalized):
             has_prequantized_aux = any(
@@ -202,7 +205,7 @@ def _mtp_expected_key_set(
             )
             if prequantized or has_prequantized_aux:
                 expected = _expected_prequantized_keys_for_present_aux(
-                    set(EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS),
+                    _expanded(EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS),
                     normalized,
                 )
                 return (
@@ -210,9 +213,10 @@ def _mtp_expected_key_set(
                     len(expected),
                     "prequantized-mlx-affine-qwen-moe-switch-mlx",
                 )
+            expected = _expanded(EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS)
             return (
-                set(EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS),
-                EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_TENSOR_COUNT,
+                expected,
+                len(expected),
                 "bf16-qwen-moe-switch-mlx",
             )
         if _has_numbered_moe_experts(normalized):
@@ -224,42 +228,47 @@ def _mtp_expected_key_set(
                 config,
                 prequantized=prequantized or has_prequantized_aux,
             )
-        if prequantized or normalized == set(EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS):
+        if prequantized or normalized == _expanded(EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS):
+            expected = _expanded(EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS)
             return (
-                set(EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_KEYS),
-                EXPECTED_QWEN_MOE_PREQUANTIZED_MTP_TENSOR_COUNT,
+                expected,
+                len(expected),
                 "prequantized-mlx-affine-qwen-moe",
             )
+        expected = _expanded(EXPECTED_QWEN_MOE_MTP_KEYS)
         return (
-            set(EXPECTED_QWEN_MOE_MTP_KEYS),
-            EXPECTED_QWEN_MOE_MTP_TENSOR_COUNT,
+            expected,
+            len(expected),
             "bf16-qwen-moe",
         )
     if prequantized and quant_policy == "all":
+        expected = _expanded(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS)
         return (
-            set(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS),
-            EXPECTED_ALL_PREQUANTIZED_MTP_TENSOR_COUNT,
+            expected,
+            len(expected),
             "prequantized-mlx-affine",
         )
     if prequantized:
+        expected = _expanded(EXPECTED_PREQUANTIZED_MTP_KEYS)
         return (
-            set(EXPECTED_PREQUANTIZED_MTP_KEYS),
-            EXPECTED_PREQUANTIZED_MTP_TENSOR_COUNT,
+            expected,
+            len(expected),
             "prequantized-mlx-affine",
         )
-    if normalized == set(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS):
+    if normalized == _expanded(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS):
         return (
-            set(EXPECTED_ALL_PREQUANTIZED_MTP_KEYS),
-            EXPECTED_ALL_PREQUANTIZED_MTP_TENSOR_COUNT,
+            set(normalized),
+            len(normalized),
             "prequantized-mlx-affine",
         )
-    if normalized == set(EXPECTED_PREQUANTIZED_MTP_KEYS):
+    if normalized == _expanded(EXPECTED_PREQUANTIZED_MTP_KEYS):
         return (
-            set(EXPECTED_PREQUANTIZED_MTP_KEYS),
-            EXPECTED_PREQUANTIZED_MTP_TENSOR_COUNT,
+            set(normalized),
+            len(normalized),
             "prequantized-mlx-affine",
         )
-    return set(EXPECTED_MTP_KEYS), EXPECTED_MTP_TENSOR_COUNT, "bf16"
+    expected = _expanded(EXPECTED_MTP_KEYS)
+    return expected, len(expected), "bf16"
 
 
 def _observed_sidecar_format(sidecar_format: str, tensors: tuple[TensorInfo, ...]) -> str:

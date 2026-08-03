@@ -30,7 +30,10 @@ from .a3b_compiled_target_prefix import (
 )
 from .a3b_whole_moe import validate_a3b_whole_moe_request
 from .adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
-from .attention_context import attention_phase
+from .attention_context import attention_phase, model_forward_kind
+from .deepseek_v4_adaptive_width import (
+    validate_installed_deepseek_v4_adaptive_width_policy,
+)
 from .progress_heartbeat import tick as _owner_progress_tick
 from .cache_state import (
     detach_array_leaf,
@@ -3681,6 +3684,22 @@ def _sample_from_logits(
     return sample_from_distribution(probs, rng), probs
 
 
+def _greedy_draft_token_and_top2(logits: mx.array) -> tuple[int, float, float]:
+    """Materialize one greedy token and its FP32 top-two values together."""
+
+    row = (
+        logits[:, -1, :][0]
+        if logits.ndim == 3
+        else logits.reshape(-1)
+    ).astype(mx.float32)
+    token_id = mx.argmax(row, axis=-1)
+    top2_values = mx.topk(row, k=2)
+    _eval(token_id, top2_values)
+    token = int(np.asarray(token_id).reshape(-1)[0])
+    top2 = np.asarray(top2_values, dtype=np.float32).reshape(-1)
+    return token, float(top2[-1]), float(top2[-2])
+
+
 def _sample_draft_from_logits(
     logits: mx.array,
     config: SamplerConfig,
@@ -3695,6 +3714,83 @@ def _sample_draft_from_logits(
     if not need_distribution:
         return token, None
     return token, SparseDistribution.one_hot(token, int(logits.shape[-1]))
+
+
+def _fixed_width_draft_reader(
+    draft_logits: mx.array,
+    config: SamplerConfig,
+    rng: np.random.Generator,
+    *,
+    need_distribution: bool,
+) -> tuple[int, np.ndarray | SparseDistribution | None, bool]:
+    token, distribution = _sample_draft_from_logits(
+        draft_logits[:, -1, :][0],
+        config,
+        rng,
+        need_distribution=need_distribution,
+    )
+    return token, distribution, False
+
+
+def _adaptive_tail_k1_draft_reader(
+    draft_logits: mx.array,
+    config: SamplerConfig,
+    rng: np.random.Generator,
+    *,
+    need_distribution: bool,
+) -> tuple[int, np.ndarray | SparseDistribution | None, bool]:
+    token, distribution = _sample_draft_from_logits(
+        draft_logits[:, -1, :][0],
+        config,
+        rng,
+        need_distribution=need_distribution,
+    )
+    return token, distribution, False
+
+
+def _adaptive_tail_k2_draft_reader(
+    draft_logits: mx.array,
+    config: SamplerConfig,
+    rng: np.random.Generator,
+    *,
+    need_distribution: bool,
+) -> tuple[int, np.ndarray | SparseDistribution | None, bool]:
+    token, distribution = _sample_draft_from_logits(
+        draft_logits[:, -1, :][0],
+        config,
+        rng,
+        need_distribution=need_distribution,
+    )
+    return token, distribution, False
+
+
+def _adaptive_full_k3_draft_reader(
+    draft_logits: mx.array,
+    config: SamplerConfig,
+    rng: np.random.Generator,
+    *,
+    depth_index: int,
+    need_distribution: bool,
+    decision_margins: list[float],
+    margin_stops: tuple[Callable[[float], bool], Callable[[float], bool]],
+) -> tuple[int, np.ndarray | SparseDistribution | None, bool]:
+    if depth_index < 2:
+        token, top1, top2 = _greedy_draft_token_and_top2(draft_logits)
+        margin = float(top1 - top2)
+        decision_margins.append(margin)
+        distribution = (
+            SparseDistribution.one_hot(token, int(draft_logits.shape[-1]))
+            if need_distribution
+            else None
+        )
+        return token, distribution, margin_stops[depth_index](margin)
+    token, distribution = _sample_draft_from_logits(
+        draft_logits[:, -1, :][0],
+        config,
+        rng,
+        need_distribution=need_distribution,
+    )
+    return token, distribution, False
 
 
 def _env_scaled_draft_sampler(
@@ -5474,7 +5570,10 @@ def generate_mtp1(
             continue
 
         started = time.perf_counter()
-        with attention_phase("decode_verify"):
+        with (
+            attention_phase("decode_verify"),
+            model_forward_kind("target_verify"),
+        ):
             if graphbank is not None:
                 verify_logits, verify_hidden = graphbank.forward_ar(
                     mx.array([[primary, draft_token]]),
@@ -5565,7 +5664,10 @@ def generate_mtp1(
             rollback_time += elapsed_rollback
             _add_timing(event, "rollback", elapsed_rollback)
             started = time.perf_counter()
-            with attention_phase("decode_verify"):
+            with (
+                attention_phase("decode_verify"),
+                model_forward_kind("repair"),
+            ):
                 logits_next, hidden_next = rt.forward_ar(
                     mx.array([[primary]]),
                     cache=cache,
@@ -5749,6 +5851,7 @@ def generate_mtpk(
     thinking_guard: ThinkingGuardConfig | None = None,
     vision_splice: Any | None = None,
     constraint: Any | None = None,
+    adaptive_width_policy: Any | None = None,
 ) -> GenerationOutput:
     """Generate with a fixed native-MTP depth.
 
@@ -5893,6 +5996,48 @@ def generate_mtpk(
     _loop_guard_config = loop_guard_config_from_env(
         bool(loop_guard), tokenizer=getattr(rt, "tokenizer", None)
     )
+    if adaptive_width_policy is not None:
+        if adaptive_policy is not None:
+            raise ValueError(
+                "adaptive width policy cannot be combined with another adaptive policy"
+            )
+        if draft_margin_threshold is not None:
+            raise ValueError(
+                "adaptive width policy cannot be combined with draft_margin_threshold"
+            )
+        incompatible_features = {
+            "draft_core": draft_core != "stock",
+            "mtp_corrector": mtp_corrector is not None,
+            "online_hidden_corrector": online_hidden_corrector_alpha != 0.0,
+            "online_correction_cache": online_correction_cache,
+            "prompt_correction_cache": prompt_correction_cache,
+            "adapter_ensemble_q": adapter_ensemble_q,
+            "mtp_topk_reranker": mtp_topk_reranker is not None,
+            "session_bank": session_bank is not None,
+            "vision_splice": vision_splice is not None,
+            "constraint": constraint is not None,
+            "loop_guard": _loop_guard_config.enabled,
+            "thinking_guard": thinking_guard is not None,
+            "compiled_verify": compiled_verify_mode() != "off",
+        }
+        selected_features = [
+            name for name, selected in incompatible_features.items() if selected
+        ]
+        if selected_features:
+            raise ValueError(
+                "adaptive width policy requires its fixed canonical lane; "
+                f"incompatible features: {selected_features}"
+            )
+        validate_installed_deepseek_v4_adaptive_width_policy(
+            adaptive_width_policy,
+            rt,
+            sampler=sampler,
+            draft_sampler=draft_sampler,
+            speculative_depth=speculative_depth,
+            verify_strategy=verify_strategy,
+            verify_core=verify_core,
+            mtp_history_policy=mtp_history_policy,
+        )
     if bool(getattr(rt, "a3b_whole_moe_installed", False)):
         os.environ["MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS"] = str(len(prompt_ids))
         whole_moe_prefill_layout = _sustained_prefill_layout()
@@ -5942,6 +6087,123 @@ def generate_mtpk(
     )
 
     rng = np.random.default_rng(seed)
+
+    def _default_cycle_draft_reader(
+        draft_logits: mx.array,
+        *,
+        depth_index: int,
+        need_distribution: bool,
+        decision_margins: list[float],
+    ) -> tuple[int, np.ndarray | SparseDistribution | None, bool]:
+        del depth_index, decision_margins
+        return _fixed_width_draft_reader(
+            draft_logits,
+            draft_sampler,
+            rng,
+            need_distribution=need_distribution,
+        )
+
+    if adaptive_width_policy is None:
+        adaptive_width_cycle_readers = (_default_cycle_draft_reader,) * max(
+            1, int(speculative_depth)
+        )
+        capture_forward_routes = (rt.forward_ar_capture,) * max(
+            1, int(speculative_depth)
+        )
+
+        def record_adaptive_width_event(
+            event: dict[str, Any],
+            *,
+            cycle_depth: int,
+            decision_margins: list[float],
+            selected_draft_depth: int,
+        ) -> None:
+            del event, cycle_depth, decision_margins, selected_draft_depth
+
+    else:
+        adaptive_width_margin_stops = (
+            adaptive_width_policy.stop_after_d1,
+            adaptive_width_policy.stop_after_d2,
+        )
+        adaptive_width_d1_threshold = float(
+            adaptive_width_policy.d1_margin_threshold
+        )
+        adaptive_width_d2_threshold = float(
+            adaptive_width_policy.d2_margin_threshold
+        )
+        adaptive_width_max_depth = int(adaptive_width_policy.max_speculative_depth)
+        capture_forward_routes = adaptive_width_policy.target_routes
+
+        def adaptive_tail_k1_reader(
+            draft_logits: mx.array,
+            *,
+            depth_index: int,
+            need_distribution: bool,
+            decision_margins: list[float],
+        ) -> tuple[int, np.ndarray | SparseDistribution | None, bool]:
+            del depth_index, decision_margins
+            return _adaptive_tail_k1_draft_reader(
+                draft_logits,
+                draft_sampler,
+                rng,
+                need_distribution=need_distribution,
+            )
+
+        def adaptive_tail_k2_reader(
+            draft_logits: mx.array,
+            *,
+            depth_index: int,
+            need_distribution: bool,
+            decision_margins: list[float],
+        ) -> tuple[int, np.ndarray | SparseDistribution | None, bool]:
+            del depth_index, decision_margins
+            return _adaptive_tail_k2_draft_reader(
+                draft_logits,
+                draft_sampler,
+                rng,
+                need_distribution=need_distribution,
+            )
+
+        def adaptive_full_k3_reader(
+            draft_logits: mx.array,
+            *,
+            depth_index: int,
+            need_distribution: bool,
+            decision_margins: list[float],
+        ) -> tuple[int, np.ndarray | SparseDistribution | None, bool]:
+            return _adaptive_full_k3_draft_reader(
+                draft_logits,
+                draft_sampler,
+                rng,
+                depth_index=depth_index,
+                need_distribution=need_distribution,
+                decision_margins=decision_margins,
+                margin_stops=adaptive_width_margin_stops,
+            )
+
+        adaptive_width_cycle_readers = (
+            adaptive_tail_k1_reader,
+            adaptive_tail_k2_reader,
+            adaptive_full_k3_reader,
+        )
+
+        def record_adaptive_width_event(
+            event: dict[str, Any],
+            *,
+            cycle_depth: int,
+            decision_margins: list[float],
+            selected_draft_depth: int,
+        ) -> None:
+            event["adaptive_width_policy"] = {
+                "kind": "deepseek_v4_preregistered_max_k3",
+                "eligible_full_k3": cycle_depth == adaptive_width_max_depth,
+                "d1_margin_threshold": adaptive_width_d1_threshold,
+                "d2_margin_threshold": adaptive_width_d2_threshold,
+                "decision_margins": list(decision_margins),
+                "selected_draft_depth": selected_draft_depth,
+                "target_rows": selected_draft_depth + 1,
+            }
+
     if mtp_corrector is not None:
         corrector_variant = getattr(mtp_corrector, "hidden_variant", mtp_hidden_variant)
         if corrector_variant != mtp_hidden_variant:
@@ -7064,6 +7326,8 @@ def generate_mtpk(
             break
 
         cycle_depth = min(planned_depth, max_tokens - len(tokens))
+        cycle_draft_reader = adaptive_width_cycle_readers[cycle_depth - 1]
+        adaptive_width_decision_margins: list[float] = []
         draft_tokens: list[int | None] = []
         draft_probs: list[np.ndarray | None] = []
         draft_cache_keys: list[tuple[int, ...]] = []
@@ -7742,6 +8006,7 @@ def generate_mtpk(
                 )
             )
             reranker_info = None
+            adaptive_width_stop = False
             cached_token = (
                 correction_cache.get(cache_key) if cache_enabled_for_depth else None
             )
@@ -7822,13 +8087,16 @@ def generate_mtpk(
                             ),
                         )
                 else:
-                    draft_token, draft_q = _sample_draft_from_logits(
-                        draft_logits[:, -1, :][0],
-                        draft_sampler,
-                        rng,
-                        need_distribution=(
-                            sampler.temperature > 0 and not target_prefix_verify
-                        ),
+                    need_draft_distribution = (
+                        sampler.temperature > 0 and not target_prefix_verify
+                    )
+                    draft_token, draft_q, adaptive_width_stop = (
+                        cycle_draft_reader(
+                            draft_logits,
+                            depth_index=depth_index,
+                            need_distribution=need_draft_distribution,
+                            decision_margins=adaptive_width_decision_margins,
+                        )
                     )
             elapsed_draft = time.perf_counter() - started
             draft_time += elapsed_draft
@@ -7938,6 +8206,9 @@ def generate_mtpk(
             if online_draft_event is not None:
                 draft_event["online_hidden_corrector"] = online_draft_event
             event["drafts"].append(draft_event)
+            if adaptive_width_stop:
+                event["gated_stop_depth"] = depth_index + 1
+                break
             if adaptive_policy is not None and hasattr(
                 adaptive_policy, "should_continue_after_draft"
             ):
@@ -7951,6 +8222,13 @@ def generate_mtpk(
                     event["gated_stop_depth"] = depth_index + 1
                     event["policy_stop"] = policy_continue
                     break
+
+        record_adaptive_width_event(
+            event,
+            cycle_depth=cycle_depth,
+            decision_margins=adaptive_width_decision_margins,
+            selected_draft_depth=len(draft_tokens),
+        )
 
         before_verify = None
         if a3b_target_prefix_route is None:
@@ -8035,7 +8313,10 @@ def generate_mtpk(
         set_native_mlp_context(len(tokens))
         started_forward = time.perf_counter()
         captures = None
-        with attention_phase("decode_verify"):
+        with (
+            attention_phase("decode_verify"),
+            model_forward_kind("target_verify"),
+        ):
             if verify_strategy in {"capture_commit", "graphbank_capture_commit"}:
                 if compiled_verify_bank is not None:
                     verify_logits, verify_hidden, captures = (
@@ -8056,7 +8337,8 @@ def generate_mtpk(
                         )
                     )
                 else:
-                    verify_logits, verify_hidden, captures = rt.forward_ar_capture(
+                    capture_forward = capture_forward_routes[len(draft_tokens) - 1]
+                    verify_logits, verify_hidden, captures = capture_forward(
                         verify_input_array,
                         cache=cache,
                         return_hidden=True,
@@ -9049,7 +9331,10 @@ def generate_mtpk(
             rollback_time += elapsed_rollback
             _add_timing(event, "rollback", elapsed_rollback)
             started = time.perf_counter()
-            with attention_phase("decode_verify"):
+            with (
+                attention_phase("decode_verify"),
+                model_forward_kind("repair"),
+            ):
                 if generic_compiled_target_prefix and compiled_verify_bank is not None:
                     repair_logits, repair_hidden, _repair_captures = (
                         compiled_verify_bank.forward_ar_capture(

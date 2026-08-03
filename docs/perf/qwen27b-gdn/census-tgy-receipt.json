@@ -1,0 +1,15 @@
+{
+ "impl": "tgy-incumbent",
+ "decode_window_monotonic_ns": [
+  78521340652250,
+  78522441157750
+ ],
+ "generated_tokens": 48,
+ "decode_elapsed_s": 0.9545611650100909,
+ "decode_tok_s": 50.2848866677837,
+ "accepted_drafts": 27,
+ "drafted_tokens": 59,
+ "tokens_sha16": "ebb1bde5f6a56e1f",
+ "census_sink": "/Users/davidtai/projects/OpenSourceWTF/bench/qwen27b/q27b-census-tgy-20260726-083437.jsonl",
+ "mlx_version": "0.32.1"
+}

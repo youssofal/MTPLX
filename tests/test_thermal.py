@@ -1,5 +1,6 @@
 from mtplx import thermal
 import subprocess
+import time as _time
 
 import pytest
 
@@ -1262,3 +1263,168 @@ def test_install_always_restores_fans_even_when_verification_fails(monkeypatch, 
     # Critical: even though verification failed, we restored fans.
     assert "silent" in restored, restored
     thermal.detect_thermal_control.cache_clear()
+
+
+# -- heat-soak release hold (#227) ------------------------------------------
+
+
+def _wait_for(predicate, timeout_s: float = 5.0) -> bool:
+    deadline = _time.monotonic() + timeout_s
+    while _time.monotonic() < deadline:
+        if predicate():
+            return True
+        _time.sleep(0.01)
+    return False
+
+
+def _patch_soak_probe(monkeypatch, temps):
+    """soc_temperature_c stub returning readings from ``temps`` (last repeats)."""
+    sequence = list(temps)
+
+    def fake_probe():
+        value = sequence.pop(0) if len(sequence) > 1 else sequence[0]
+        if value is None:
+            return {"ok": False, "celsius": None, "sensor": None}
+        return {"ok": True, "celsius": float(value), "sensor": "TCMb"}
+
+    monkeypatch.setattr(thermal, "soc_temperature_c", fake_probe)
+    monkeypatch.setattr(thermal.SmartFanController, "_SOAK_PROBE_INTERVAL_S", 0.01)
+
+
+def test_smart_fan_soak_hold_keeps_max_until_cooled(monkeypatch):
+    calls: list[str] = []
+    _patch_smart_fan_hardware(monkeypatch, calls)
+    _patch_soak_probe(monkeypatch, [92.0, 91.0, 60.0])
+
+    controller = thermal.SmartFanController(restore_delay_s=0)
+    controller.begin_request("burst")
+    assert controller.wait_for_ramp(5.0) is True
+
+    controller.end_request("burst")
+
+    assert _wait_for(lambda: "auto" in calls), controller.status()
+    status = controller.status()
+    assert status["soak_holds"] >= 1
+    assert status["soak_release_reason"] == "cooled"
+    assert status["soak_last_temp_c"] == 60.0
+
+
+def test_smart_fan_soak_hold_cap_bounds_the_pin(monkeypatch):
+    calls: list[str] = []
+    _patch_smart_fan_hardware(monkeypatch, calls)
+    _patch_soak_probe(monkeypatch, [95.0])
+    monkeypatch.setenv("MTPLX_SMART_FAN_SOAK_HOLD_CAP_S", "0.2")
+
+    controller = thermal.SmartFanController(restore_delay_s=0)
+    controller.begin_request("burst")
+    assert controller.wait_for_ramp(5.0) is True
+
+    controller.end_request("burst")
+
+    # The die never cools, but the cap guarantees the fans come back.
+    assert _wait_for(lambda: "auto" in calls), controller.status()
+    assert controller.status()["soak_release_reason"] == "hold_cap"
+
+
+def test_smart_fan_soak_probe_failure_falls_back_to_legacy_restore(monkeypatch):
+    calls: list[str] = []
+    _patch_smart_fan_hardware(monkeypatch, calls)
+    _patch_soak_probe(monkeypatch, [None])
+
+    controller = thermal.SmartFanController(restore_delay_s=0)
+    controller.begin_request("burst")
+    assert controller.wait_for_ramp(5.0) is True
+
+    controller.end_request("burst")
+
+    assert _wait_for(lambda: "auto" in calls), controller.status()
+    status = controller.status()
+    assert status["soak_holds"] == 0
+    assert status["soak_release_reason"] is None
+
+
+def test_smart_fan_soak_disabled_by_env_restores_immediately(monkeypatch):
+    calls: list[str] = []
+    _patch_smart_fan_hardware(monkeypatch, calls)
+    probes: list[str] = []
+
+    def fake_probe():
+        probes.append("probe")
+        return {"ok": True, "celsius": 99.0, "sensor": "TCMb"}
+
+    monkeypatch.setattr(thermal, "soc_temperature_c", fake_probe)
+    monkeypatch.setenv("MTPLX_SMART_FAN_SOAK_RELEASE_C", "0")
+
+    controller = thermal.SmartFanController(restore_delay_s=0)
+    controller.begin_request("burst")
+    assert controller.wait_for_ramp(5.0) is True
+
+    controller.end_request("burst", wait_for_restore=True)
+
+    assert calls == ["performance", "auto"]
+    assert probes == []
+
+
+def test_smart_fan_wait_for_restore_bypasses_soak_hold(monkeypatch):
+    calls: list[str] = []
+    _patch_smart_fan_hardware(monkeypatch, calls)
+    _patch_soak_probe(monkeypatch, [95.0])
+
+    controller = thermal.SmartFanController(restore_delay_s=0)
+    controller.begin_request("bench")
+    assert controller.wait_for_ramp(5.0) is True
+
+    # Bench lanes and shutdown paths must not sit behind a hot-die hold.
+    controller.end_request("bench", wait_for_restore=True)
+
+    assert calls == ["performance", "auto"]
+
+
+def _patch_status_temperatures(monkeypatch, temperatures):
+    import json as _json
+
+    monkeypatch.setattr(
+        thermal,
+        "thermal_status",
+        lambda: {
+            "ok": True,
+            "status": {"stdout": _json.dumps({"fans": [], "temperatures": temperatures})},
+        },
+    )
+
+
+def test_soc_temperature_prefers_hottest_cpu_die_sensor(monkeypatch):
+    _patch_status_temperatures(
+        monkeypatch,
+        {"TCMb": 91.8, "TCDX": 60.9, "TB0T": 35.8, "Tp0C": 99.0},
+    )
+
+    reading = thermal.soc_temperature_c()
+
+    assert reading["ok"] is True
+    assert reading["sensor"] == "TCMb"
+    assert reading["celsius"] == 91.8
+
+
+def test_soc_temperature_filters_sentinel_values_and_falls_back(monkeypatch):
+    _patch_status_temperatures(monkeypatch, {"TCMb": 0.0, "Tp0C": 61.7})
+
+    reading = thermal.soc_temperature_c()
+
+    assert reading["ok"] is True
+    assert reading["sensor"] == "Tp0C"
+
+
+def test_soc_temperature_pinned_sensor_env(monkeypatch):
+    _patch_status_temperatures(monkeypatch, {"TCMb": 91.8, "TCDX": 60.9})
+    monkeypatch.setenv("MTPLX_SMART_FAN_SOAK_SENSOR", "TCDX")
+
+    reading = thermal.soc_temperature_c()
+
+    assert reading == {"ok": True, "celsius": 60.9, "sensor": "TCDX"}
+
+
+def test_soc_temperature_without_temperature_data_is_not_ok(monkeypatch):
+    _patch_status_temperatures(monkeypatch, {})
+
+    assert thermal.soc_temperature_c()["ok"] is False

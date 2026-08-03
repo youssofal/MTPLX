@@ -15,7 +15,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .artifacts import inspect_model, load_config, mtp_weights_present_on_disk
+from .artifacts import (
+    inspect_model,
+    load_config,
+    mtp_weights_present_on_disk,
+    text_config,
+)
 from .mtp_adapters import (
     install_saved_mtp_lora_adapter,
     merge_installed_mtp_lora_adapters,
@@ -86,6 +91,9 @@ class MTPLXRuntime:
     mtp_adapter_path: Path | None = None
     mtp_adapter_metadata: dict[str, Any] | None = None
     mtp_adapter_merge_report: dict[str, Any] | None = None
+    deepseek_v4_o_lora_report: dict[str, Any] | None = None
+    deepseek_v4_attn_proj_wide_m3_report: dict[str, Any] | None = None
+    deepseek_v4_attention_island_report: dict[str, Any] | None = None
     a3b_compiled_target_prefix_factory: A3BCompiledTargetPrefixFactory | None = None
     a3b_whole_moe_installed: bool = False
     _a3b_whole_moe_request_preflights: dict[str, dict[str, Any]] = field(
@@ -483,6 +491,73 @@ class LagunaARRuntime(MTPLXRuntime):
         return False
 
 
+# HF class name (as declared in config ``architectures``) -> mlx-lm module
+# implementing it. Extend this table only with verified schema-compatible
+# pairs; an architecture absent here keeps the fail-loud unknown-model_type
+# behavior.
+_ARCHITECTURE_DECLARED_MODULES = {
+    "Qwen3_5ForConditionalGeneration": "qwen3_5",
+    "Qwen3_5ForCausalLM": "qwen3_5",
+    "Qwen3_5TextForCausalLM": "qwen3_5",
+    "Qwen3_5MoeForConditionalGeneration": "qwen3_5_moe",
+    "Qwen3_5MoeForCausalLM": "qwen3_5_moe",
+    "Qwen3_5MoeTextForCausalLM": "qwen3_5_moe",
+}
+
+
+def _install_architectures_declared_module_alias(config: dict[str, Any]) -> bool:
+    """Alias ``mlx_lm.models.<model_type>`` to the module implementing the
+    checkpoint's declared ``architectures`` class, when mlx-lm has no module
+    for the model_type itself.
+
+    ``mlx_lm.utils.load`` resolves the model class from ``model_type`` alone,
+    so a schema-compatible checkpoint under a fresh model_type string (the
+    Qwen3.6 -> "qwen3_5" precedent, expected again for Qwen3.8) would
+    hard-fail even though the checkpoint itself names the implementing class.
+    This honors that declaration — transformers' own class resolution works
+    the same way — and logs loudly so an alias load is never silent.
+    Returns True when an alias was installed.
+    """
+    import importlib
+    import importlib.util
+
+    tcfg = text_config(config)
+    model_type = str(config.get("model_type") or tcfg.get("model_type") or "").strip()
+    if not model_type:
+        return False
+    alias_name = f"mlx_lm.models.{model_type}"
+    if alias_name in sys.modules:
+        return False
+    try:
+        if importlib.util.find_spec(alias_name) is not None:
+            return False  # mlx-lm knows this model_type natively
+    except (ImportError, ValueError):
+        return False
+    architectures: list[str] = []
+    for source in (config, tcfg):
+        raw = source.get("architectures")
+        if isinstance(raw, list):
+            architectures.extend(str(item) for item in raw)
+    for arch in architectures:
+        target = _ARCHITECTURE_DECLARED_MODULES.get(arch)
+        if target is None:
+            continue
+        try:
+            module = importlib.import_module(f"mlx_lm.models.{target}")
+        except ImportError:
+            continue
+        sys.modules[alias_name] = module
+        logger.warning(
+            "[model-alias] model_type %r has no mlx-lm module; loading via the "
+            "checkpoint's declared architecture %s (mlx_lm.models.%s)",
+            model_type,
+            arch,
+            target,
+        )
+        return True
+    return False
+
+
 def load(
     model_path: Path | str,
     *,
@@ -566,6 +641,20 @@ def load(
     if is_qwen3_5_mtp_config(config):
         install_qwen3_5_mtp_trunk_shim()
 
+    # hy_v3 has no model class in any released mlx-lm; register the vendored
+    # one (kept MTP head) before mlx_lm.utils.load resolves the model type.
+    from .hy_v3_mtp_patch import install_hy_v3_model_shim, is_hy_v3_config
+
+    if is_hy_v3_config(config):
+        install_hy_v3_model_shim()
+
+    # A checkpoint whose model_type has no mlx-lm module may still declare the
+    # implementing class in ``architectures`` — new Qwen generations reuse the
+    # qwen3_5 schema under fresh model_type strings (Qwen3.6 shipped as
+    # qwen3_5; vLLM loads Qwen3.8-Max FP8 through the same classes). Honor the
+    # checkpoint's own declaration instead of hard-failing the load.
+    _install_architectures_declared_module_alias(config)
+
     if is_step3p5_mtp_config(config):
         from mlx_lm.utils import load_model
 
@@ -592,10 +681,27 @@ def load(
                 "[proj-quant] requantized %d trunk *_proj modules to %s",
                 len(touched), proj_requant,
             )
+    deepseek_v4_attn_proj_wide_m3_report = None
     if str((config or {}).get("model_type") or "").lower() == "deepseek_v4":
         from .models.deepseek_v4 import configure_deepseek_v4_moe_tail
 
         configure_deepseek_v4_moe_tail(model, config)
+        from .deepseek_v4_attn_proj_wide_m3 import (
+            deepseek_v4_attn_proj_wide_m3_enabled,
+        )
+
+        if deepseek_v4_attn_proj_wide_m3_enabled():
+            from .deepseek_v4_attn_proj_wide_m3 import (
+                install_deepseek_v4_attn_proj_wide_m3,
+            )
+
+            deepseek_v4_attn_proj_wide_m3_report = (
+                install_deepseek_v4_attn_proj_wide_m3(model, config)
+            )
+            logger.info(
+                "[deepseek-v4-attn-proj-wide-m3] %s",
+                deepseek_v4_attn_proj_wide_m3_report,
+            )
     runtime_metadata = _load_runtime_metadata(path)
     contract = (
         (contract or MTPContract())
@@ -754,6 +860,50 @@ def load(
             adapter_merge_report = merge_installed_mtp_lora_adapters(model)
     elif merge_mtp_adapter:
         raise RuntimeError("merge_mtp_adapter requires mtp_adapter")
+    deepseek_v4_o_lora_report = None
+    deepseek_v4_attention_island_report = None
+    if str(config.get("model_type") or "").lower() == "deepseek_v4":
+        from .models.deepseek_v4 import (
+            _o_lora_mode_from_env,
+            install_deepseek_v4_o_lora_routes,
+        )
+
+        selected_o_lora_mode = _o_lora_mode_from_env()
+        # The canonical mixed route hard-validates the exact DeepSeek-V4-Flash
+        # topology (43 body layers, rank-1024 Q4/g64 wo_a/wo_b, one dense-BF16
+        # MTP block) and refuses anything else. That strictness is correct for
+        # the explicit gather_qmm opt-in, but the default "cached" mode must
+        # keep loading every DSV4 MTP artifact (8-bit/bf16 user conversions,
+        # other group sizes) exactly as v2.4.2 did via the per-module dense
+        # route — which is bit-identical on the canonical artifact anyway
+        # (test_cached_dequant_is_bit_identical).
+        canonical_mixed_route = bool(
+            mtp_enabled and selected_o_lora_mode == "gather_qmm"
+        )
+        if not mtp_enabled:
+            # An artifact that declared but did not ship MTP weights already
+            # degraded to AR above. It has no dense MTP module to validate or
+            # route, so bind the trunk's explicit stock/cached construction.
+            selected_o_lora_mode = "cached"
+        deepseek_v4_o_lora_report = install_deepseek_v4_o_lora_routes(
+            model,
+            mode=selected_o_lora_mode,
+            canonical_mixed_route=canonical_mixed_route,
+        )
+        logger.info("[deepseek-v4-o-lora] %s", deepseek_v4_o_lora_report)
+        from .deepseek_v4_attention_island import (
+            deepseek_v4_attention_island_enabled,
+            install_deepseek_v4_attention_island,
+        )
+
+        if deepseek_v4_attention_island_enabled():
+            deepseek_v4_attention_island_report = (
+                install_deepseek_v4_attention_island(model, config)
+            )
+            logger.info(
+                "[deepseek-v4-attention-island] %s",
+                deepseek_v4_attention_island_report,
+            )
     fused_report: list[dict[str, Any]] = []
     if _is_laguna_s_2_1_mlx_4bit_config(config):
         # Env-gated fused decode paths (MTPLX_LAGUNA_*): with no switches set
@@ -779,6 +929,9 @@ def load(
         mtp_adapter_path=adapter_path,
         mtp_adapter_metadata=adapter_metadata,
         mtp_adapter_merge_report=adapter_merge_report,
+        deepseek_v4_o_lora_report=deepseek_v4_o_lora_report,
+        deepseek_v4_attn_proj_wide_m3_report=deepseek_v4_attn_proj_wide_m3_report,
+        deepseek_v4_attention_island_report=deepseek_v4_attention_island_report,
         a3b_compiled_target_prefix_factory=compiled_target_factory,
         a3b_whole_moe_installed=False,
     )

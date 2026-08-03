@@ -321,6 +321,159 @@ def _parse_namespaced_tool_calls(text: str) -> tuple[str, list[dict[str, Any]] |
     return cleaned, calls
 
 
+_SUFFIXED_TOOL_CALL_RE = re.compile(
+    r"<tool_call(?P<suffix>:[A-Za-z_][\w.-]*)>"
+    r"\s*(?P<body>.*?)\s*"
+    r"</tool_call(?P=suffix)>",
+    re.DOTALL,
+)
+_SUFFIXED_TOOL_CALLS_RE = re.compile(
+    r"<tool_calls(?P<suffix>:[A-Za-z_][\w.-]*)>"
+    r"\s*(?P<body>.*?)\s*"
+    r"</tool_calls(?P=suffix)>",
+    re.DOTALL,
+)
+
+
+def _tool_parameter_schema(
+    tools: list[dict[str, Any]] | None,
+    *,
+    tool_name: str,
+    parameter_name: str,
+) -> dict[str, Any] | None:
+    for tool in tools or []:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        if not isinstance(function, dict):
+            continue
+        if str(function.get("name") or "") != tool_name:
+            continue
+        parameters = function.get("parameters")
+        properties = (
+            parameters.get("properties") if isinstance(parameters, dict) else None
+        )
+        schema = (
+            properties.get(parameter_name) if isinstance(properties, dict) else None
+        )
+        return schema if isinstance(schema, dict) else None
+    return None
+
+
+def _decode_suffixed_argument(
+    value: str,
+    *,
+    schema: dict[str, Any] | None,
+) -> Any:
+    text = value.strip()
+    schema_type = schema.get("type") if isinstance(schema, dict) else None
+    schema_types = (
+        {schema_type}
+        if isinstance(schema_type, str)
+        else {str(item) for item in schema_type}
+        if isinstance(schema_type, list)
+        else set()
+    )
+    if schema_types and schema_types <= {"string", "null"}:
+        return text
+    try:
+        return json.loads(text)
+    except (TypeError, ValueError):
+        return text
+
+
+def _parse_suffixed_native_tool_calls(
+    text: str,
+    tools: list[dict[str, Any]] | None,
+) -> tuple[str, list[dict[str, Any]] | None, str | None]:
+    """Parse Hy3-style suffix-token tool calls.
+
+    Hy3's official tokenizer uses special tokens such as
+    ``<tool_call:opensource>`` and an argument-key/value protocol instead of
+    Qwen's ``<function=>`` XML. Treat the suffix as an opaque protocol
+    namespace so future tokenizer revisions using the same grammar work
+    without a model-name check.
+    """
+
+    calls: list[dict[str, Any]] = []
+    malformed_reason: str | None = None
+    matches = list(_SUFFIXED_TOOL_CALL_RE.finditer(text or ""))
+    for index, match in enumerate(matches):
+        suffix = match.group("suffix")
+        body = match.group("body").strip()
+        separator = f"<tool_sep{suffix}>"
+        if separator not in body:
+            malformed_reason = (
+                f"suffixed tool_call[{index}] is missing its tool separator"
+            )
+            calls = []
+            break
+        raw_name, raw_arguments = body.split(separator, 1)
+        name = raw_name.strip()
+        if not name:
+            malformed_reason = f"suffixed tool_call[{index}] is missing a name"
+            calls = []
+            break
+
+        key_open = re.escape(f"<arg_key{suffix}>")
+        key_close = re.escape(f"</arg_key{suffix}>")
+        value_open = re.escape(f"<arg_value{suffix}>")
+        value_close = re.escape(f"</arg_value{suffix}>")
+        argument_re = re.compile(
+            key_open
+            + r"\s*(?P<key>.*?)\s*"
+            + key_close
+            + r"\s*"
+            + value_open
+            + r"\s*(?P<value>.*?)\s*"
+            + value_close,
+            re.DOTALL,
+        )
+        arguments: dict[str, Any] = {}
+        consumed: list[tuple[int, int]] = []
+        for argument in argument_re.finditer(raw_arguments):
+            key = argument.group("key").strip()
+            if not key:
+                malformed_reason = (
+                    f"suffixed tool_call[{index}] contains an empty argument key"
+                )
+                calls = []
+                break
+            arguments[key] = _decode_suffixed_argument(
+                argument.group("value"),
+                schema=_tool_parameter_schema(
+                    tools,
+                    tool_name=name,
+                    parameter_name=key,
+                ),
+            )
+            consumed.append(argument.span())
+        if malformed_reason:
+            break
+
+        residue_parts: list[str] = []
+        cursor = 0
+        for start, end in consumed:
+            residue_parts.append(raw_arguments[cursor:start])
+            cursor = end
+        residue_parts.append(raw_arguments[cursor:])
+        if "".join(residue_parts).strip():
+            malformed_reason = (
+                f"suffixed tool_call[{index}] contains text outside arguments"
+            )
+            calls = []
+            break
+        calls.append(_tool_call(name, arguments))
+
+    if not calls:
+        return text, None, malformed_reason
+    calls = _filter_known_tools(calls, tools) or []
+    if not calls:
+        return text, None, "suffixed tool calls named no declared tool"
+
+    cleaned = _SUFFIXED_TOOL_CALLS_RE.sub("", text or "")
+    cleaned = _SUFFIXED_TOOL_CALL_RE.sub("", cleaned)
+    return cleaned.strip(), calls, None
+
+
 def _parse_bracket_tool_calls(text: str) -> tuple[str, list[dict[str, Any]] | None]:
     calls: list[dict[str, Any]] = []
     pattern = r"\[(?:Calling tool|Tool call):\s*([A-Za-z_][\w.-]*)(?:\(({.*?})\))?\]"
@@ -391,6 +544,30 @@ def parse_tool_calls(
         marker in (text or "")
         for marker in ("<tool_call", "</tool_call>", "[Calling tool:", "[Tool call:")
     )
+
+    if re.search(r"<tool_calls?:[A-Za-z_][\w.-]*>", cleaned_text):
+        cleaned, calls, malformed = _parse_suffixed_native_tool_calls(
+            cleaned_text,
+            tools,
+        )
+        if calls:
+            return ToolCallExtraction(
+                cleaned_text=cleaned,
+                tool_calls=calls,
+                cleaned_thinking="",
+                parser_source="suffixed_native",
+                status="parsed",
+                raw_tool_markup_suppressed=True,
+            )
+        return ToolCallExtraction(
+            cleaned_text=cleaned_text,
+            tool_calls=None,
+            cleaned_thinking="",
+            parser_source="suffixed_native",
+            status="malformed_as_content",
+            malformed_reason=malformed or "unclosed or invalid suffixed tool call",
+            raw_tool_markup_suppressed=False,
+        )
 
     if tokenizer is not None and getattr(tokenizer, "has_tool_calling", False):
         start = getattr(tokenizer, "tool_call_start", None)
@@ -589,6 +766,12 @@ class ToolCallStreamFilter:
             else:
                 self._suppress_after_markers.append(str(start))
         self._namespaced_open_re = re.compile(r"<([A-Za-z_][\w.-]*):tool_call>")
+        self._suffixed_calls_open_re = re.compile(
+            r"<tool_calls(?P<suffix>:[A-Za-z_][\w.-]*)>"
+        )
+        self._suffixed_call_open_re = re.compile(
+            r"<tool_call(?P<suffix>:[A-Za-z_][\w.-]*)>"
+        )
         self._bracket_prefixes = ["[Calling tool:", "[Tool call:"]
         self._bracket_call_re = re.compile(
             r"^\[(?:Calling tool|Tool call):\s*([A-Za-z_][\w.-]*)(?:\(({.*?})\))?\]",
@@ -608,6 +791,24 @@ class ToolCallStreamFilter:
         if match := self._namespaced_open_re.search(text):
             namespace = match.group(1)
             starts.append((match.start(), len(match.group(0)), f"</{namespace}:tool_call>"))
+        if match := self._suffixed_calls_open_re.search(text):
+            suffix = match.group("suffix")
+            starts.append(
+                (
+                    match.start(),
+                    len(match.group(0)),
+                    f"</tool_calls{suffix}>",
+                )
+            )
+        if match := self._suffixed_call_open_re.search(text):
+            suffix = match.group("suffix")
+            starts.append(
+                (
+                    match.start(),
+                    len(match.group(0)),
+                    f"</tool_call{suffix}>",
+                )
+            )
         for prefix in self._bracket_prefixes:
             index = text.find(prefix)
             while index >= 0:
@@ -645,6 +846,17 @@ class ToolCallStreamFilter:
             and "tool_call".startswith(suffix)
         )
 
+    @staticmethod
+    def _could_be_partial_suffixed_open(candidate: str) -> bool:
+        if not candidate.startswith("<") or ">" in candidate:
+            return False
+        lowered = candidate.lower()
+        return (
+            "<tool_calls:".startswith(lowered)
+            or "<tool_call:".startswith(lowered)
+            or bool(re.match(r"^<tool_calls?:[A-Za-z_][\w.-]*$", candidate))
+        )
+
     def _partial_suffix_len(self, text: str) -> int:
         keep = 0
         for marker, _close in self._marker_pairs:
@@ -653,7 +865,9 @@ class ToolCallStreamFilter:
             keep = max(keep, self._partial_prefix_len(text, marker))
         if (last_lt := text.rfind("<")) >= 0:
             candidate = text[last_lt:]
-            if self._could_be_partial_namespaced_open(candidate):
+            if self._could_be_partial_namespaced_open(
+                candidate
+            ) or self._could_be_partial_suffixed_open(candidate):
                 keep = max(keep, len(candidate))
         for prefix in self._bracket_prefixes:
             keep = max(keep, self._partial_prefix_len(text, prefix))

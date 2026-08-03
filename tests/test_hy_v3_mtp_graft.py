@@ -152,6 +152,13 @@ def test_quantized_overrides_are_honored(tmp_path):
     cfg = _config(quantization={**quant, **overrides})
     _write_checkpoint(tmp_path, tensors, cfg)
     model = hy_v3.Model(_args())
+    # This test pins the GRAFT lane's quantize contract. The vendored model
+    # class constructs a native MTPBlock unconditionally (its real flow loads
+    # + quantizes via mlx_lm.load_model), which would bypass the graft path;
+    # drop it so the injector builds the head from the checkpoint like the
+    # released (sanitizing) class forces it to.
+    if getattr(model, "mtp", None) is not None:
+        model.mtp = None
     assert inject_hy_v3_mtp_support(model, tmp_path, cfg, None)
     assert isinstance(model.mtp.layer.self_attn.q_proj, nn.QuantizedLinear)
     assert model.mtp.layer.self_attn.q_proj.bits == 8

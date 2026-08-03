@@ -129,7 +129,7 @@ def _tokens(seq_len, batch=1, seed=1234):
 
 def _set_mode(model, mode):
     for layer in model.layers:
-        layer.attn.o_lora_mode = mode
+        layer.attn.install_o_lora_route(mode)
 
 
 def _decode(model, ids, prompt_len):
@@ -165,7 +165,9 @@ def test_unknown_mode_is_rejected_loudly(monkeypatch):
 def test_attention_picks_the_mode_up_at_construction(monkeypatch):
     monkeypatch.setenv("MTPLX_DSV4_O_LORA", "gather_qmm")
     _, model = _seeded_model()
-    assert [l.attn.o_lora_mode for l in model.layers] == ["gather_qmm"] * len(RATIOS)
+    assert [layer.attn.o_lora_mode for layer in model.layers] == [
+        "gather_qmm"
+    ] * len(RATIOS)
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +186,7 @@ def test_cached_dequant_is_bit_identical():
     _set_mode(model, "dequant")
     ref = model(ids)
     mx.eval(ref)
-    assert all(l.attn._wo_a_cache.value is None for l in model.layers), (
+    assert all(layer.attn._wo_a_cache.value is None for layer in model.layers), (
         "the dequant arm must not populate the cache, or it is not a control")
 
     _set_mode(model, "cached")
@@ -192,7 +194,7 @@ def test_cached_dequant_is_bit_identical():
     second = model(ids)         # serves from cache
     mx.eval(first, second)
 
-    assert all(l.attn._wo_a_cache.value is not None for l in model.layers), (
+    assert all(layer.attn._wo_a_cache.value is not None for layer in model.layers), (
         "cache never populated — the gate would be vacuous")
     assert mx.array_equal(ref, first), "cached first call is not bit-identical"
     assert mx.array_equal(ref, second), "cached cache-hit call is not bit-identical"
@@ -219,9 +221,9 @@ def test_cache_is_reused_not_rebuilt():
     ids = _tokens(20)
     _set_mode(model, "cached")
     model(ids)
-    held = [l.attn._wo_a_cache.value for l in model.layers]
+    held = [layer.attn._wo_a_cache.value for layer in model.layers]
     model(ids)
-    again = [l.attn._wo_a_cache.value for l in model.layers]
+    again = [layer.attn._wo_a_cache.value for layer in model.layers]
     assert all(a is b for a, b in zip(held, again))
 
 
@@ -232,7 +234,7 @@ def test_cache_is_invalidated_when_the_weights_are_rebound():
     ids = _tokens(20)
     _set_mode(model, "cached")
     model(ids)
-    stale = [l.attn._wo_a_cache.value for l in model.layers]
+    stale = [layer.attn._wo_a_cache.value for layer in model.layers]
 
     # Rebind scales only — the packed weight object stays the same, which is
     # exactly what a dtype cast or a partial reload does.
@@ -245,7 +247,7 @@ def test_cache_is_invalidated_when_the_weights_are_rebound():
     ref = model(ids)
     mx.eval(got, ref)
     assert mx.array_equal(ref, got), "stale dense cache served after a weight rebind"
-    fresh = [l.attn._wo_a_cache.value for l in model.layers]
+    fresh = [layer.attn._wo_a_cache.value for layer in model.layers]
     assert all(a is not b for a, b in zip(stale, fresh))
 
 
@@ -265,21 +267,20 @@ def test_cache_never_reaches_the_weight_tree():
     model.load_weights(tree_flatten(model.parameters()), strict=True)
 
 
-def test_unquantised_wo_a_is_untouched_by_the_cache():
-    """The M2/parity path has a plain nn.Linear: nothing to dequantise, nothing
-    cached, and all three modes agree bit-for-bit."""
+def test_unquantised_wo_a_rejects_gather_at_installation():
+    """An enabled gather route cannot silently execute the dense implementation."""
     _, model = _seeded_model()
     ids = _tokens(20)
     outs = []
-    for mode in D._O_LORA_MODES:
+    for mode in ("cached", "dequant"):
         _set_mode(model, mode)
         out = model(ids)
         mx.eval(out)
         outs.append(out)
-    assert all(l.attn._wo_a_cache.value is None for l in model.layers)
+    with pytest.raises(ValueError, match="quantized"):
+        _set_mode(model, "gather_qmm")
+    assert all(layer.attn._wo_a_cache.value is None for layer in model.layers)
     assert mx.array_equal(outs[0], outs[1])
-    assert mx.array_equal(outs[0], outs[2]), (
-        "gather_qmm must fall back to the dense path when wo_a is not quantised")
 
 
 # ---------------------------------------------------------------------------
@@ -311,17 +312,60 @@ def test_gather_qmm_calling_convention_shapes():
         assert rel < 1e-3, f"rows={rows} grouped qmm rel={rel:.3e}"
 
 
-def test_gather_qmm_output_shape_is_checked_not_assumed(monkeypatch):
-    """The ledger trap: a broadcast instead of a batched call still returns usable
-    numbers.  The guard has to fire, so it is tested by forcing a wrong shape."""
+def test_gather_qmm_is_prebound_and_never_rechecks_or_falls_back(monkeypatch):
     _, model = _quantized_model()
     attn = model.layers[0].attn
     o = mx.random.normal((1, 3, N_HEADS * HEAD_DIM))
+    receipt = attn.install_o_lora_route("gather_qmm")
+    assert receipt["direct"] is True
+    installed = attn._o_lora_impl
     monkeypatch.setattr(
-        D.mx, "gather_qmm", lambda *a, **k: mx.zeros((3, O_GROUPS, O_RANK))
+        attn,
+        "_wo_a_quant",
+        lambda: (_ for _ in ()).throw(AssertionError("hot eligibility lookup")),
     )
-    with pytest.raises(AssertionError, match="shape contract"):
-        attn._o_lora_gather_qmm(o)
+    got = attn._o_lora(o)
+    mx.eval(got)
+    assert attn._o_lora_impl is installed
+    assert tuple(got.shape) == (1, 3, DIM)
+
+
+def test_gather_route_preserves_and_calls_a_real_quantized_wo_b():
+    _, model = _seeded_model(o_lora_rank=16)
+    nn.quantize(
+        model,
+        group_size=GROUP_SIZE,
+        bits=BITS,
+        class_predicate=lambda path, _module: path.endswith(
+            ("attn.wo_a", "attn.wo_b")
+        ),
+    )
+    mx.eval(model.parameters())
+    attn = model.layers[0].attn
+    assert isinstance(attn.wo_a, nn.QuantizedLinear)
+    assert isinstance(attn.wo_b, nn.QuantizedLinear)
+    stock_wo_b = attn.wo_b
+    assert getattr(stock_wo_b, "bias", None) is None
+    stock_storage = (
+        stock_wo_b.weight,
+        stock_wo_b.scales,
+        stock_wo_b.biases,
+        stock_wo_b.bits,
+        stock_wo_b.group_size,
+        stock_wo_b.mode,
+    )
+    assert D._o_lora_linear_logical_weight_shape(stock_wo_b) == (DIM, 32)
+
+    receipt = attn.install_o_lora_route("gather_qmm")
+    assert receipt["direct"] is True
+    assert attn._o_lora_impl.wo_b is stock_wo_b
+    result = attn._o_lora(mx.random.normal((1, 3, N_HEADS * HEAD_DIM)))
+    mx.eval(result)
+    assert tuple(result.shape) == (1, 3, DIM)
+    assert stock_wo_b.weight is stock_storage[0]
+    assert stock_wo_b.scales is stock_storage[1]
+    assert stock_wo_b.biases is stock_storage[2]
+    assert (stock_wo_b.bits, stock_wo_b.group_size, stock_wo_b.mode) == stock_storage[3:]
 
 
 def test_gather_qmm_matches_the_cached_arm_within_tolerance():
@@ -365,9 +409,9 @@ def test_gather_qmm_precision_drops_at_bf16_and_that_is_arm_bs_open_risk():
     mx.random.seed(3)
     o = (mx.random.normal((1, 140, N_HEADS * HEAD_DIM)) * 0.5).astype(mx.bfloat16)
 
-    attn.o_lora_mode = "cached"
+    attn.install_o_lora_route("cached")
     ref = attn._o_lora(o)
-    attn.o_lora_mode = "gather_qmm"
+    attn.install_o_lora_route("gather_qmm")
     got = attn._o_lora(o)
     mx.eval(ref, got)
     assert ref.dtype == got.dtype == mx.bfloat16
@@ -413,12 +457,558 @@ def _quantized_mtp_model(seed=0):
 
 
 def _attentions(model):
-    return [l.attn for l in model.layers] + [b.attn for b in model.mtp_blocks]
+    return [layer.attn for layer in model.layers] + [
+        block.attn for block in model.mtp_blocks
+    ]
 
 
 def _set_mode_everywhere(model, mode):
     for attn in _attentions(model):
-        attn.o_lora_mode = mode
+        attn.install_o_lora_route(mode)
+
+
+class _O_LoraArrayMeta:
+    def __init__(self, shape, dtype):
+        self.shape = shape
+        self.dtype = dtype
+
+    def reshape(self, *shape):
+        shape = tuple(shape)
+        if shape.count(-1) > 1:
+            raise ValueError("only one inferred reshape dimension is supported")
+        if -1 in shape:
+            known = int(
+                np.prod([dimension for dimension in shape if dimension != -1])
+            )
+            total = int(np.prod(self.shape))
+            shape = tuple(
+                total // known if dimension == -1 else dimension
+                for dimension in shape
+            )
+        return _O_LoraArrayMeta(shape, self.dtype)
+
+
+class _CanonicalEmbedding:
+    def __init__(self, output_dtype):
+        self.output_dtype = output_dtype
+
+    def __call__(self, input_ids):
+        return _O_LoraArrayMeta((*input_ids.shape, 4096), self.output_dtype)
+
+
+class _CanonicalQuantizedLinear:
+    pass
+
+
+class _CanonicalDenseLinear:
+    pass
+
+
+class _CanonicalBodyWOA(_CanonicalQuantizedLinear):
+    def __init__(self):
+        self.weight = _O_LoraArrayMeta((8192, 512), mx.uint32)
+        self.scales = _O_LoraArrayMeta((8192, 64), mx.bfloat16)
+        self.biases = _O_LoraArrayMeta((8192, 64), mx.bfloat16)
+        self.bits = 4
+        self.group_size = 64
+        self.mode = "affine"
+        self.bias = None
+
+
+class _CanonicalBodyWOB(_CanonicalQuantizedLinear):
+    def __init__(self):
+        self.weight = _O_LoraArrayMeta((4096, 1024), mx.uint32)
+        self.scales = _O_LoraArrayMeta((4096, 128), mx.bfloat16)
+        self.biases = _O_LoraArrayMeta((4096, 128), mx.bfloat16)
+        self.bits = 4
+        self.group_size = 64
+        self.mode = "affine"
+        self.bias = None
+
+
+class _CanonicalMTPWOA(_CanonicalDenseLinear):
+    def __init__(self):
+        self.weight = _O_LoraArrayMeta((8192, 4096), mx.bfloat16)
+        self.bias = None
+
+
+class _CanonicalMTPWOB(_CanonicalDenseLinear):
+    def __init__(self):
+        self.weight = _O_LoraArrayMeta((4096, 8192), mx.bfloat16)
+        self.bias = None
+
+
+class _RouteFakeAttention:
+    def __init__(self, wo_a, wo_b):
+        self.wo_a = wo_a
+        self.wo_b = wo_b
+        self.n_groups = 8
+        self.o_lora_rank = 1024
+        self.n_heads = 64
+        self.head_dim = 512
+        self.dim = 4096
+        self.o_lora_mode = None
+        self._o_lora_impl = None
+
+
+class _RouteBox:
+    def __init__(self, wo_a, wo_b):
+        self.attn = _RouteFakeAttention(wo_a, wo_b)
+
+
+def _canonical_route_model(
+    *, body_count=43, mtp_count=1, activation_dtype=mx.bfloat16
+):
+    class FakeModel:
+        def __init__(self):
+            self.model = type(
+                "_CanonicalTrunk",
+                (),
+                {"embed_tokens": _CanonicalEmbedding(activation_dtype)},
+            )()
+            self.layers = [
+                _RouteBox(_CanonicalBodyWOA(), _CanonicalBodyWOB())
+                for _ in range(body_count)
+            ]
+            self.mtp_blocks = [
+                _RouteBox(_CanonicalMTPWOA(), _CanonicalMTPWOB())
+                for _ in range(mtp_count)
+            ]
+
+    return FakeModel()
+
+
+class _FakeCachedBodyRoute:
+    def __init__(self, attention, quant):
+        self.attention = attention
+        self.quant = quant
+        self.wo_b = attention.wo_b
+
+
+class _FakeGatherBodyRoute:
+    def __init__(self, attention, quant):
+        self.attention = attention
+        self.quant = quant
+        self.wo_b = attention.wo_b
+
+
+class _FakeDenseMTPRoute:
+    def __init__(self, attention, weight):
+        self.attention = attention
+        self.weight = weight
+        self.wo_b = attention.wo_b
+
+
+_FakeCachedBodyRoute.__name__ = "_DirectCachedOLora"
+_FakeGatherBodyRoute.__name__ = "_DirectGatherOLora"
+_FakeDenseMTPRoute.__name__ = "_DirectDenseMTPOLora"
+
+
+class _FakeGatherWideM4BodyRoute:
+    def __init__(self, attention, quant, *, activation_dtype):
+        self.attention = attention
+        self.quant = quant
+        self.activation_dtype = activation_dtype
+        self.wo_b = attention.wo_b
+
+
+_FakeGatherWideM4BodyRoute.__name__ = "_DirectGatherOLoraWideM4"
+
+
+def _patch_canonical_route_types(monkeypatch):
+    monkeypatch.setattr(D.nn, "QuantizedLinear", _CanonicalQuantizedLinear)
+    monkeypatch.setattr(D.nn, "Linear", _CanonicalDenseLinear)
+    monkeypatch.setattr(D, "_DirectCachedOLora", _FakeCachedBodyRoute)
+    monkeypatch.setattr(D, "_DirectGatherOLora", _FakeGatherBodyRoute)
+    monkeypatch.setattr(D, "_DirectGatherOLoraWideM4", _FakeGatherWideM4BodyRoute)
+    monkeypatch.setattr(D, "_DirectDenseMTPOLora", _FakeDenseMTPRoute)
+    monkeypatch.setattr(D, "_validate_gather_qmm_wide_m4_body_routes", lambda _body: None)
+
+
+def test_model_installer_prebinds_only_body_m4_wide_and_keeps_mtp_stock(monkeypatch):
+    """The M4-wide candidate is an authenticated body route, never MTP.
+
+    The production callable owns the fixed ``[8, 4, 4096]`` gathered input and
+    selects its direct wide entry point only for physical M4.  This construction
+    test locks the boundary: all 43 quantized body modules receive that route,
+    while the dense MTP module remains the explicitly prebound stock callable.
+    """
+    _patch_canonical_route_types(monkeypatch)
+    model = _canonical_route_model()
+
+    report = D.install_deepseek_v4_o_lora_routes(
+        model, mode="gather_qmm", canonical_mixed_route=True
+    )
+
+    assert all(
+        isinstance(box.attn._o_lora_impl, _FakeGatherWideM4BodyRoute)
+        for box in model.layers
+    )
+    assert isinstance(model.mtp_blocks[0].attn._o_lora_impl, _FakeDenseMTPRoute)
+    assert report["callable_census"]["body_route_kind"] == "gather_qmm_m4_wide_direct"
+    assert report["callable_census"]["body_callable_class"] == "_DirectGatherOLoraWideM4"
+    assert report["callable_census"]["mtp_route_kind"] == "dense_bf16_stock_direct"
+
+
+def test_model_installer_selfchecks_the_real_weight_sentinels_before_publish(monkeypatch):
+    """Layer 0/3/42 parity is a construction gate, not decode instrumentation."""
+    _patch_canonical_route_types(monkeypatch)
+    model = _canonical_route_model()
+    checked = []
+    monkeypatch.setattr(
+        D,
+        "_validate_gather_qmm_wide_m4_body_routes",
+        lambda body: checked.extend(body),
+        raising=False,
+    )
+
+    D.install_deepseek_v4_o_lora_routes(
+        model, mode="gather_qmm", canonical_mixed_route=True
+    )
+
+    assert len(checked) == 43
+    assert all(isinstance(route, _FakeGatherWideM4BodyRoute) for route in checked)
+
+
+def test_m4_wide_installer_rejects_the_fp32_activation_ab_arm(monkeypatch):
+    _patch_canonical_route_types(monkeypatch)
+    monkeypatch.setattr(D, "_FP32_ACTIVATIONS", True)
+    model = _canonical_route_model()
+
+    with pytest.raises(ValueError, match="BF16 activation storage"):
+        D.install_deepseek_v4_o_lora_routes(
+            model, mode="gather_qmm", canonical_mixed_route=True
+        )
+
+    assert all(box.attn._o_lora_impl is None for box in model.layers + model.mtp_blocks)
+
+
+def test_m4_wide_installer_rejects_non_bf16_body_activation_output(monkeypatch):
+    _patch_canonical_route_types(monkeypatch)
+    model = _canonical_route_model(activation_dtype=mx.float16)
+
+    with pytest.raises(ValueError, match="embedding output dtype.*bfloat16"):
+        D.install_deepseek_v4_o_lora_routes(
+            model, mode="gather_qmm", canonical_mixed_route=True
+        )
+
+    assert all(box.attn._o_lora_impl is None for box in model.layers + model.mtp_blocks)
+
+
+def _canonical_body_quant(attention):
+    wo_a = attention.wo_a
+    return (
+        wo_a.weight,
+        wo_a.scales,
+        wo_a.biases,
+        wo_a.group_size,
+        wo_a.bits,
+        wo_a.mode,
+    )
+
+
+def test_m4_wide_concrete_route_binds_bf16_kernel_aux_and_output(monkeypatch):
+    """The real route fixes one BF16 Metal type at construction, not from input."""
+    definition = {}
+    launch = {}
+
+    def fake_metal_kernel(**kwargs):
+        definition.update(kwargs)
+
+        def run(**kwargs):
+            launch.update(kwargs)
+            output = _O_LoraArrayMeta(
+                kwargs["output_shapes"][0], kwargs["output_dtypes"][0]
+            )
+            return (output,)
+
+        return run
+
+    monkeypatch.setattr(D.nn, "QuantizedLinear", _CanonicalQuantizedLinear)
+    monkeypatch.setattr(D.mx.fast, "metal_kernel", fake_metal_kernel)
+    kernel = D._gather_qmm_wide_m4_olora_kernel.__wrapped__()
+    monkeypatch.setattr(D, "_gather_qmm_wide_m4_olora_kernel", lambda: kernel)
+    monkeypatch.setattr(
+        D.mx,
+        "arange",
+        lambda size, *, dtype: _O_LoraArrayMeta((size,), dtype),
+    )
+    attention = _RouteFakeAttention(_CanonicalBodyWOA(), _CanonicalBodyWOB())
+
+    route = D._DirectGatherOLoraWideM4(
+        attention,
+        _canonical_body_quant(attention),
+        activation_dtype=mx.bfloat16,
+    )
+    output = route.m4.grouped(
+        _O_LoraArrayMeta((4, 8, 4096), mx.bfloat16),
+        _O_LoraArrayMeta((8,), mx.uint32),
+    )
+
+    assert type(route) is D._DirectGatherOLoraWideM4
+    assert "const device T* srow = scales" in definition["source"]
+    assert "const device T* brow = biases" in definition["source"]
+    assert launch["template"] == [("T", mx.bfloat16)]
+    assert launch["output_dtypes"] == [mx.bfloat16]
+    assert route.m4.weight.shape == (8, 1024, 512)
+    assert route.m4.scales.shape == (8, 1024, 64)
+    assert route.m4.biases.shape == (8, 1024, 64)
+    assert output.dtype == mx.bfloat16
+
+
+@pytest.mark.parametrize("field", ["scales", "biases"])
+def test_m4_wide_concrete_route_rejects_non_bf16_aux(monkeypatch, field):
+    monkeypatch.setattr(D.nn, "QuantizedLinear", _CanonicalQuantizedLinear)
+    attention = _RouteFakeAttention(_CanonicalBodyWOA(), _CanonicalBodyWOB())
+    setattr(attention.wo_a, field, _O_LoraArrayMeta((8192, 64), mx.float16))
+
+    with pytest.raises(ValueError, match=f"{field} dtype.*bfloat16"):
+        D._DirectGatherOLoraWideM4(
+            attention,
+            _canonical_body_quant(attention),
+            activation_dtype=mx.bfloat16,
+        )
+
+
+def test_m4_wide_concrete_route_rejects_non_bf16_activation_contract(monkeypatch):
+    monkeypatch.setattr(D.nn, "QuantizedLinear", _CanonicalQuantizedLinear)
+    attention = _RouteFakeAttention(_CanonicalBodyWOA(), _CanonicalBodyWOB())
+
+    with pytest.raises(ValueError, match="activation/output dtype.*bfloat16"):
+        D._DirectGatherOLoraWideM4(
+            attention,
+            _canonical_body_quant(attention),
+            activation_dtype=mx.float16,
+        )
+
+
+def test_m4_wide_route_dispatches_only_the_physical_four_row_body_shape():
+    """M is runtime routing; AR/M1 and non-M4 verifies retain stock gather."""
+    calls = []
+
+    class _Input:
+        def __init__(self, batch, sequence):
+            self.shape = (batch, sequence, 32768)
+
+    def stock(value):
+        calls.append(("stock", value.shape[:2]))
+        return "stock"
+
+    def wide(value):
+        calls.append(("wide", value.shape[:2]))
+        return "wide"
+
+    route = object.__new__(D._DirectGatherOLoraWideM4)
+    route.stock = stock
+    route.m4 = wide
+
+    assert route(_Input(1, 1)) == "stock"
+    assert route(_Input(1, 3)) == "stock"
+    assert route(_Input(2, 2)) == "wide"
+    assert route(_Input(1, 5)) == "stock"
+    assert calls == [
+        ("stock", (1, 1)),
+        ("stock", (1, 3)),
+        ("wide", (2, 2)),
+        ("stock", (1, 5)),
+    ]
+
+
+def test_model_installer_prebinds_43_body_gathers_and_explicit_mtp_stock(monkeypatch):
+    _patch_canonical_route_types(monkeypatch)
+    model = _canonical_route_model()
+    original_body_wo_b = [box.attn.wo_b for box in model.layers]
+    original_mtp_wo_b = model.mtp_blocks[0].attn.wo_b
+    report = D.install_deepseek_v4_o_lora_routes(
+        model, mode="gather_qmm", canonical_mixed_route=True
+    )
+    body = [box.attn for box in model.layers]
+    mtp = model.mtp_blocks[0].attn
+    assert report["trunk_module_count"] == 43
+    assert report["mtp_module_count"] == 1
+    assert report["module_count"] == 44
+    assert report["body_direct"] == 43
+    assert report["mtp_stock"] == 1
+    assert all(
+        isinstance(attention._o_lora_impl, _FakeGatherWideM4BodyRoute)
+        for attention in body
+    )
+    assert isinstance(mtp._o_lora_impl, _FakeDenseMTPRoute)
+    assert all(
+        attention._o_lora_impl.wo_b is original
+        for attention, original in zip(body, original_body_wo_b)
+    )
+    assert mtp._o_lora_impl.wo_b is original_mtp_wo_b
+    assert report["callable_census"] == {
+        "body_route_objects": 43,
+        "body_route_kind": "gather_qmm_m4_wide_direct",
+        "body_callable_class": "_DirectGatherOLoraWideM4",
+        "mtp_route_objects": 1,
+        "mtp_route_kind": "dense_bf16_stock_direct",
+        "mtp_callable_class": "_DirectDenseMTPOLora",
+        "total_route_objects": 44,
+        "unique_route_objects": 44,
+        "mtp_distinct_type": True,
+    }
+    assert report["storage_contract"] == D._CANONICAL_O_LORA_STORAGE_CONTRACT
+    assert report["storage_contract"]["body"]["wo_b"] == {
+        "class": "QuantizedLinear",
+        "logical_weight_shape": [4096, 8192],
+        "packed_weight": {"shape": [4096, 1024], "dtype": "uint32"},
+        "scales": {"shape": [4096, 128], "dtype": "bfloat16"},
+        "biases": {"shape": [4096, 128], "dtype": "bfloat16"},
+        "bits": 4,
+        "group_size": 64,
+        "mode": "affine",
+        "additive_bias": None,
+    }
+    assert report["storage_contract"]["mtp"]["wo_a"]["weight"] == {
+        "shape": [8192, 4096],
+        "dtype": "bfloat16",
+    }
+    assert report["storage_contract"]["mtp"]["wo_b"]["weight"] == {
+        "shape": [4096, 8192],
+        "dtype": "bfloat16",
+    }
+
+
+def _mutate_body_wo_b_logical_output(model):
+    wo_b = model.layers[0].attn.wo_b
+    wo_b.weight.shape = (4095, 1024)
+    wo_b.scales.shape = (4095, 128)
+    wo_b.biases.shape = (4095, 128)
+
+
+def _mutate_body_wo_b_logical_input(model):
+    wo_b = model.layers[0].attn.wo_b
+    wo_b.weight.shape = (4096, 1016)
+    wo_b.scales.shape = (4096, 127)
+    wo_b.biases.shape = (4096, 127)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    (
+        (lambda model: model.layers.pop(), "expected 43 body"),
+        (lambda model: setattr(model.layers[0].attn, "wo_a", _CanonicalMTPWOA()), "body 0"),
+        (lambda model: setattr(model.layers[0].attn.wo_a.weight, "dtype", mx.bfloat16), "weight dtype"),
+        (lambda model: setattr(model.layers[0].attn.wo_a.weight, "shape", (8192, 513)), "weight shape"),
+        (lambda model: setattr(model.layers[0].attn.wo_a.scales, "dtype", mx.float32), "scales dtype"),
+        (lambda model: setattr(model.layers[0].attn.wo_a.biases, "shape", (8192, 63)), "biases shape"),
+        (lambda model: setattr(model.layers[0].attn.wo_a.biases, "dtype", mx.float32), "biases dtype"),
+        (lambda model: setattr(model.layers[0].attn.wo_a, "bits", 8), "bits"),
+        (lambda model: setattr(model.layers[0].attn.wo_a, "group_size", 32), "group_size"),
+        (lambda model: setattr(model.layers[0].attn.wo_a, "mode", "mxfp4"), "mode"),
+        (lambda model: setattr(model.layers[0].attn, "n_groups", 4), "n_groups"),
+        (lambda model: setattr(model.layers[0].attn, "o_lora_rank", 512), "o_lora_rank"),
+        (lambda model: setattr(model.layers[0].attn, "n_heads", 32), "n_heads"),
+        (lambda model: setattr(model.layers[0].attn, "head_dim", 256), "head_dim"),
+        (lambda model: setattr(model.layers[0].attn, "dim", 2048), "dim"),
+        (lambda model: setattr(model.layers[0].attn, "wo_b", _CanonicalMTPWOB()), "body 0 wo_b"),
+        (lambda model: setattr(model.layers[0].attn.wo_b.weight, "shape", (4096, 1023)), "wo_b.*weight.*shape"),
+        (lambda model: setattr(model.layers[0].attn.wo_b.weight, "dtype", mx.bfloat16), "wo_b.*weight.*dtype"),
+        (lambda model: setattr(model.layers[0].attn.wo_b.scales, "shape", (4096, 127)), "wo_b.*scales.*shape"),
+        (lambda model: setattr(model.layers[0].attn.wo_b.scales, "dtype", mx.float32), "wo_b.*scales.*dtype"),
+        (lambda model: setattr(model.layers[0].attn.wo_b.biases, "shape", (4096, 127)), "wo_b.*biases.*shape"),
+        (lambda model: setattr(model.layers[0].attn.wo_b.biases, "dtype", mx.float32), "wo_b.*biases.*dtype"),
+        (lambda model: setattr(model.layers[0].attn.wo_b, "bits", 8), "wo_b.*bits"),
+        (lambda model: setattr(model.layers[0].attn.wo_b, "group_size", 32), "wo_b.*group_size"),
+        (lambda model: setattr(model.layers[0].attn.wo_b, "mode", "mxfp4"), "wo_b.*mode"),
+        (lambda model: setattr(model.layers[0].attn.wo_b, "bias", _O_LoraArrayMeta((4096,), mx.bfloat16)), "wo_b.*additive bias"),
+        (_mutate_body_wo_b_logical_output, "wo_b.*logical output"),
+        (_mutate_body_wo_b_logical_input, "wo_b.*logical input"),
+        (lambda model: setattr(model.mtp_blocks[0].attn, "wo_a", _CanonicalBodyWOA()), "MTP"),
+        (lambda model: setattr(model.mtp_blocks[0].attn.wo_a.weight, "dtype", mx.float32), "MTP wo_a weight dtype"),
+        (lambda model: setattr(model.mtp_blocks[0].attn.wo_a.weight, "shape", (8192, 4095)), "MTP wo_a weight shape"),
+        (lambda model: setattr(model.mtp_blocks[0].attn.wo_a, "bias", _O_LoraArrayMeta((8192,), mx.bfloat16)), "MTP wo_a additive bias"),
+        (lambda model: setattr(model.mtp_blocks[0].attn, "wo_b", _CanonicalBodyWOB()), "MTP wo_b"),
+        (lambda model: setattr(model.mtp_blocks[0].attn.wo_b.weight, "dtype", mx.float32), "MTP wo_b weight dtype"),
+        (lambda model: setattr(model.mtp_blocks[0].attn.wo_b.weight, "shape", (4096, 8191)), "MTP wo_b weight shape"),
+        (lambda model: setattr(model.mtp_blocks[0].attn.wo_b, "bias", _O_LoraArrayMeta((4096,), mx.bfloat16)), "MTP wo_b additive bias"),
+        (lambda model: model.mtp_blocks.pop(), "expected exactly one MTP"),
+    ),
+)
+def test_model_installer_rejects_noncanonical_mixed_storage(monkeypatch, mutate, match):
+    _patch_canonical_route_types(monkeypatch)
+    model = _canonical_route_model()
+    mutate(model)
+    with pytest.raises(ValueError, match=match):
+        D.install_deepseek_v4_o_lora_routes(
+            model, mode="gather_qmm", canonical_mixed_route=True
+        )
+    assert all(box.attn._o_lora_impl is None for box in model.layers + model.mtp_blocks)
+
+
+def test_model_installer_rejects_mtp_quant_metadata(monkeypatch):
+    _patch_canonical_route_types(monkeypatch)
+    model = _canonical_route_model()
+    model.mtp_blocks[0].attn.wo_a.scales = _O_LoraArrayMeta((8192, 64), mx.bfloat16)
+    with pytest.raises(ValueError, match="must not expose quantized metadata"):
+        D.install_deepseek_v4_o_lora_routes(
+            model, mode="gather_qmm", canonical_mixed_route=True
+        )
+    assert all(box.attn._o_lora_impl is None for box in model.layers + model.mtp_blocks)
+
+
+def test_geometry_failure_binds_no_partial_route(monkeypatch):
+    _patch_canonical_route_types(monkeypatch)
+    model = _canonical_route_model()
+    model.layers[-1].attn.wo_b.weight.shape = (4096, 1023)
+    with pytest.raises(ValueError, match="wo_b.*weight.*shape"):
+        D.install_deepseek_v4_o_lora_routes(
+            model, mode="gather_qmm", canonical_mixed_route=True
+        )
+    assert all(box.attn._o_lora_impl is None for box in model.layers + model.mtp_blocks)
+
+
+def test_model_installer_routes_cached_after_validating_mixed_topology(monkeypatch):
+    _patch_canonical_route_types(monkeypatch)
+    model = _canonical_route_model()
+    report = D.install_deepseek_v4_o_lora_routes(
+        model, mode="cached", canonical_mixed_route=True
+    )
+    assert report["body_direct"] == 0
+    assert report["mtp_stock"] == 1
+    assert all(
+        isinstance(box.attn._o_lora_impl, _FakeCachedBodyRoute)
+        for box in model.layers
+    )
+    assert isinstance(model.mtp_blocks[0].attn._o_lora_impl, _FakeDenseMTPRoute)
+    assert report["callable_census"]["body_route_kind"] == "cached_direct"
+
+
+def test_prebound_body_and_mtp_routes_never_recheck_quant_metadata(monkeypatch):
+    _, quantized = _quantized_model()
+    body = quantized.layers[0].attn
+    quant = body._wo_a_quant()
+    body_cached = D._DirectCachedOLora(body, quant)
+    body_gather = D._DirectGatherOLora(body, quant)
+
+    _, dense = _seeded_model(num_nextn_predict_layers=1)
+    mtp = dense.mtp_blocks[0].attn
+    mtp_stock = D._DirectDenseMTPOLora(mtp, mtp.wo_a.weight)
+    monkeypatch.setattr(
+        body,
+        "_wo_a_quant",
+        lambda: (_ for _ in ()).throw(AssertionError("body hot metadata check")),
+    )
+    monkeypatch.setattr(
+        mtp,
+        "_wo_a_quant",
+        lambda: (_ for _ in ()).throw(AssertionError("MTP hot metadata check")),
+    )
+
+    body_input = mx.random.normal((1, 3, N_HEADS * HEAD_DIM))
+    mtp_input = mx.random.normal((1, 3, N_HEADS * HEAD_DIM))
+    body._o_lora_impl = body_cached
+    cached_output = body._o_lora(body_input)
+    body._o_lora_impl = body_gather
+    gather_output = body._o_lora(body_input)
+    mtp._o_lora_impl = mtp_stock
+    mtp_output = mtp._o_lora(mtp_input)
+    outputs = [cached_output, gather_output, mtp_output]
+    mx.eval(*outputs)
+    assert all(tuple(output.shape) == (1, 3, DIM) for output in outputs)
 
 
 def _mtp_inputs(args, seq=9, seed=7):
