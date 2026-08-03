@@ -4,7 +4,7 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [2.6.0] - 2026-08-03
+## [2.5.1] - 2026-08-03
 
 Optimized Speed V2 is now the recommended Qwen 3.6 27B model for coding on
 modern Macs with enough unified memory. It gives users a much higher-quality
@@ -912,7 +912,7 @@ working as one product. Full notes:
   completions, and Anthropic `stop_sequences`) and `/v1/completions`
   streams tokens as they are generated with real finish reasons.
 
-[2.6.0]: https://github.com/youssofal/MTPLX/releases/tag/v2.6.0
+[2.5.1]: https://github.com/youssofal/MTPLX/releases/tag/v2.5.1
 [2.5.0]: https://github.com/youssofal/MTPLX/releases/tag/v2.5.0
 [2.4.2]: https://github.com/youssofal/MTPLX/releases/tag/v2.4.2
 [2.4.1]: https://github.com/youssofal/MTPLX/releases/tag/v2.4.1
