@@ -769,6 +769,8 @@ private struct RecommendedModelRow: Identifiable, Sendable {
         switch catalogID {
         case "qwen35-9b-optimized-speed", "qwen35-9b-optimized-speed-fp16":
             return .qwen9B
+        case "optimized-speed-v2":
+            return .qwen27SpeedV2
         case "optimized-speed", "optimized-speed-fp16":
             return .qwen27Speed
         case "qwen36-35b-a3b-optimized-speed", "qwen36-35b-a3b-optimized-speed-fp16":
@@ -797,7 +799,15 @@ private struct RecommendedModelRow: Identifiable, Sendable {
         modelID: "optimized-speed",
         logo: .qwen,
         title: "Qwen 3.6 27B Optimized Speed",
-        detail: "4-bit quantization. Fast and smart."
+        detail: "Smaller 4-bit model. A little faster for short chats."
+    )
+
+    static let qwen27SpeedV2 = RecommendedModelRow(
+        choice: .curatedSpeedV2,
+        modelID: "optimized-speed-v2",
+        logo: .qwen,
+        title: "Qwen 3.6 27B Optimized Speed V2",
+        detail: "Much higher quality for coding. Dynamic 4-bit hybrid quantization keeps hand-tuned sensitive parts at up to 16-bit. Faster on long agent tasks, slightly larger, and a little slower for short chats."
     )
 
     static let qwen35Speed = RecommendedModelRow(

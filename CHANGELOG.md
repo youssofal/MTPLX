@@ -4,6 +4,31 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [2.6.0] - 2026-08-03
+
+Optimized Speed V2 is now the recommended Qwen 3.6 27B model for coding on
+modern Macs with enough unified memory. It gives users a much higher-quality
+coding model while keeping the original, smaller Optimized Speed model one row
+below it.
+
+### Added
+
+- Optimized Speed V2 is a first-class model in onboarding, the app catalog,
+  CLI defaults, quickstart, downloads, served model identity, and OpenCode
+  setup.
+- The model is published as a dynamic 4-bit hybrid quant with hand-tuned
+  sensitive parts kept at up to 16-bit. It is faster on longer agent tasks,
+  slightly larger, and a little slower for short chats.
+- RAM-aware defaults recommend V2 first on modern Macs with at least 32 GiB of
+  detected memory. Smaller Macs keep the existing 9B and 4B recommendations.
+
+### Compatibility
+
+- The original Optimized Speed model remains fully supported and appears
+  directly below V2 wherever the machine can run both.
+- Runtime kernels, sampler defaults, cache behavior, and speculative depth are
+  unchanged from 2.5.0.
+
 ## [2.5.0] - 2026-08-03
 
 The next-model release: MTPLX can load new architecture aliases without a
@@ -887,6 +912,7 @@ working as one product. Full notes:
   completions, and Anthropic `stop_sequences`) and `/v1/completions`
   streams tokens as they are generated with real finish reasons.
 
+[2.6.0]: https://github.com/youssofal/MTPLX/releases/tag/v2.6.0
 [2.5.0]: https://github.com/youssofal/MTPLX/releases/tag/v2.5.0
 [2.4.2]: https://github.com/youssofal/MTPLX/releases/tag/v2.4.2
 [2.4.1]: https://github.com/youssofal/MTPLX/releases/tag/v2.4.1

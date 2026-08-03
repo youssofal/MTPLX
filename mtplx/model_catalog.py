@@ -120,9 +120,27 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         ),
     ),
     CatalogModel(
+        id="optimized-speed-v2",
+        display_name="Qwen 3.6 27B Optimized Speed V2",
+        detail=(
+            "Much higher quality for coding. Dynamic 4-bit hybrid quantization "
+            "keeps hand-tuned sensitive parts at up to 16-bit. Faster on long "
+            "agent tasks, slightly larger, and a little slower for short chats."
+        ),
+        hf_model_id="Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-V2",
+        size_bytes=19_887_448_095,
+        peak_memory_gib=21.5,
+        recommended_tiers=frozenset({MODERN_TIER}),
+        aliases=(
+            "mtplx-qwen36-27b-optimized-speed-v2",
+            "Qwen3.6 27B Optimized Speed V2",
+            "Optimized Speed V2",
+        ),
+    ),
+    CatalogModel(
         id="optimized-speed",
         display_name="Qwen 3.6 27B Optimized Speed",
-        detail="4-bit quantization. Fast and smart.",
+        detail="Smaller 4-bit model. A little faster for short chats.",
         hf_model_id="Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed",
         size_bytes=16_106_127_360,
         peak_memory_gib=17.0,
@@ -275,6 +293,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
 # Mirrors `modernTopRecommendationIDs` in MTPLXModelOption.swift: the
 # fallback matrix when hardware is unknown.
 _MODERN_TOP_RECOMMENDATION_IDS = (
+    "optimized-speed-v2",
     "optimized-speed",
     "optimized-quality",
     "qwen36-35b-a3b-optimized-speed",
@@ -342,16 +361,20 @@ def recommended_catalog_ids(
     if chip_tier == LEGACY_TIER:
         small = "qwen35-9b-optimized-speed-fp16"
         speed27 = "optimized-speed-fp16"
+        speed27_v2 = None
         speed35 = "qwen36-35b-a3b-optimized-speed-fp16"
         balance35 = "qwen36-35b-a3b-optimized-balance-fp16"
         quality27 = "optimized-quality-fp16"
     else:
         small = "qwen35-9b-optimized-speed"
         speed27 = "optimized-speed"
+        speed27_v2 = "optimized-speed-v2"
         speed35 = "qwen36-35b-a3b-optimized-speed"
         balance35 = "qwen36-35b-a3b-optimized-balance"
         quality27 = "optimized-quality"
     if memory_gib is None or memory_gib <= 0:
+        if chip_tier == LEGACY_TIER:
+            return [speed27, quality27, speed35, balance35, "gemma4-optimized-speed", small]
         return list(_MODERN_TOP_RECOMMENDATION_IDS)
     # The rebuilt 4B pair leads the sub-16GB tiers and trails every larger
     # modern tier so it stays discoverable as the fast-small pick. No fp16
@@ -366,15 +389,19 @@ def recommended_catalog_ids(
     if memory_gib < 32:
         return [small, *tiny_ids]
     if memory_gib < 48:
+        if speed27_v2 is None:
+            return [small, speed27, "gemma4-optimized-speed", speed35, quality27]
         return [
-            small,
+            speed27_v2,
             speed27,
+            small,
             "gemma4-optimized-speed",
             speed35,
             quality27,
             *tiny_ids,
         ]
     return [
+        *([speed27_v2] if speed27_v2 else []),
         speed27,
         quality27,
         speed35,

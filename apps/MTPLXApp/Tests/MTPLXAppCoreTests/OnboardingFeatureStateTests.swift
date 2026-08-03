@@ -75,7 +75,9 @@ final class OnboardingFeatureStateTests: XCTestCase {
     }
 
     func testModelPickCuratedAlwaysResolves() {
-        var s = OnboardingFeatureState(step: .modelPick, pick: .curatedSpeed)
+        var s = OnboardingFeatureState(step: .modelPick, pick: .curatedSpeedV2)
+        XCTAssertTrue(s.canAdvance, "Curated Speed V2 always resolves to a catalog entry")
+        s.pick = .curatedSpeed
         XCTAssertTrue(s.canAdvance, "Curated Speed always resolves to a catalog entry")
         s.pick = .curatedQwen35FourBit
         XCTAssertTrue(s.canAdvance, "Curated Qwen 4B always resolves to a catalog entry")
@@ -188,6 +190,19 @@ final class OnboardingFeatureStateTests: XCTestCase {
         )
         let s = OnboardingFeatureState(hardware: m5, pick: .curatedSpeed)
         XCTAssertEqual(s.resolvedModel?.id, "optimized-speed")
+    }
+
+    func testResolvedModelKeepsSpeedV2DistinctFromV1() {
+        let m5 = DetectedHardware(
+            chipName: "Apple M5 Max",
+            appleSiliconGeneration: "m5",
+            unifiedMemoryBytes: 64 * 1_073_741_824
+        )
+        let v2 = OnboardingFeatureState(hardware: m5, pick: .curatedSpeedV2)
+        let v1 = OnboardingFeatureState(hardware: m5, pick: .curatedSpeed)
+
+        XCTAssertEqual(v2.resolvedModel?.id, "optimized-speed-v2")
+        XCTAssertEqual(v1.resolvedModel?.id, "optimized-speed")
     }
 
     func testResolvedModelForQualityRoutesToFP16OnLegacyApple() {

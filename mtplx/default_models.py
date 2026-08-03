@@ -18,6 +18,10 @@ from mtplx.profiles import (
     DEFAULT_MODEL_ID,
     DEFAULT_PUBLIC_MODEL_ID,
     LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
+    OPTIMIZED_SPEED_V1_HF_MODEL_ID,
+    OPTIMIZED_SPEED_V1_PUBLIC_MODEL_ID,
+    OPTIMIZED_SPEED_V2_HF_MODEL_ID,
+    OPTIMIZED_SPEED_V2_PUBLIC_MODEL_ID,
     QUALITY_FP16_HF_MODEL_ID,
     QUALITY_FP16_PUBLIC_MODEL_ID,
     QUALITY_HF_MODEL_ID,
@@ -47,12 +51,28 @@ _NEWER_APPLE_SPEED_GENERATIONS = frozenset({"m3", "m4", "m5"})
 # default routes to the 9B artifact instead. Mirrors the app's <32 GiB
 # recommendation tier (model_catalog.recommended_catalog_ids).
 SMALL_DEFAULT_MEMORY_FLOOR_GIB = 32.0
-QWEN35_9B_SPEED_DESCRIPTION = "Q6 small-Mac artifact"
-OPTIMIZED_SPEED_LABEL = "Qwen3.6 27B MTPLX Optimized Speed"
-OPTIMIZED_SPEED_DESCRIPTION = "Q4 target with Q4 MTP sidecar"
+# V2 peaks at about 21.5 GiB, leaving practical headroom on a 32 GiB Mac.
+OPTIMIZED_SPEED_V2_MEMORY_FLOOR_GIB = 32.0
+QWEN35_9B_SPEED_DESCRIPTION = "Compact 6-bit model for smaller Macs"
+OPTIMIZED_SPEED_V1_LABEL = "Qwen 3.6 27B Optimized Speed"
+OPTIMIZED_SPEED_V1_DESCRIPTION = "Smaller 4-bit model that is a little faster for short chats"
+OPTIMIZED_SPEED_V2_LABEL = "Qwen 3.6 27B Optimized Speed V2"
+OPTIMIZED_SPEED_V2_DESCRIPTION = (
+    "Much higher quality for coding, with dynamic 4-bit hybrid quantization "
+    "and hand-tuned sensitive parts kept at up to 16-bit. Faster on long "
+    "agent tasks, slightly larger, and a little slower for short chats"
+)
+# Backward-compatible names used by integrations that mean the current default.
+OPTIMIZED_SPEED_LABEL = OPTIMIZED_SPEED_V2_LABEL
+OPTIMIZED_SPEED_DESCRIPTION = OPTIMIZED_SPEED_V2_DESCRIPTION
 OPTIMIZED_QUALITY_LABEL = "Qwen3.6 27B MTPLX Optimized Quality"
 OPTIMIZED_QUALITY_DESCRIPTION = "Flat8 target with INT8 MTP sidecar"
-_OPTIMIZED_SPEED_LOCAL_CANDIDATES = (
+_OPTIMIZED_SPEED_V2_LOCAL_CANDIDATES = (
+    "~/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed-V2",
+    "~/Documents/MTPLX/models/Qwen3.6-27B-MTPLX-Optimized-Speed-V2",
+    "~/Documents/MTPLX/hf-staging/Qwen3.6-27B-MTPLX-Optimized-Speed-V2",
+)
+_OPTIMIZED_SPEED_V1_LOCAL_CANDIDATES = (
     "~/Documents/MTPLX/models/Qwen3.6-27B-MTPLX-Optimized-Speed",
     "~/.mtplx/hf-upload/Qwen3.6-27B-MTPLX-Optimized-Speed",
     "~/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed",
@@ -73,8 +93,8 @@ _OPTIMIZED_35B_SPEED_LOCAL_CANDIDATES = (
 )
 _VERIFIED_DEFAULT_LOCAL_NAMES = frozenset(
     {
-        "Qwen3.6-27B-MTPLX-Optimized-Speed",
-        "Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed",
+        "Qwen3.6-27B-MTPLX-Optimized-Speed-V2",
+        "Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed-V2",
         "Qwen3.6-27B-MTPLX-Optimized-Speed-FP16",
         "Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed-FP16",
     }
@@ -102,11 +122,13 @@ class DefaultModelSelection:
             return "Qwen3.5 9B Optimized Speed"
         if self.variant == "fp16":
             return "Qwen3.6 27B Optimized Speed FP16"
-        return OPTIMIZED_SPEED_LABEL
+        if self.hf_model == OPTIMIZED_SPEED_V1_HF_MODEL_ID:
+            return OPTIMIZED_SPEED_V1_LABEL
+        return OPTIMIZED_SPEED_V2_LABEL
 
     @property
     def label(self) -> str:
-        return f"{self.hf_model}  ·  {self.precision}  ·  {self.reason}"
+        return f"{self.display_name}. {self.precision}. {self.reason}."
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -162,19 +184,38 @@ def _complete_local_model_ref(candidates: tuple[str, ...]) -> str | None:
     return None
 
 
-def optimized_speed_model_ref() -> str:
+def _optimized_speed_model_ref(
+    *, hf_model_id: str, local_candidates: tuple[str, ...]
+) -> str:
     env_ref = str(os.environ.get(SPEED_MODEL_ENV) or "").strip()
     candidates: tuple[str, ...]
     if env_ref:
         if _env_ref_disabled(env_ref):
-            return DEFAULT_HF_MODEL_ID
+            return hf_model_id
         else:
-            candidates = (env_ref, *_OPTIMIZED_SPEED_LOCAL_CANDIDATES)
+            candidates = (env_ref, *local_candidates)
     else:
-        candidates = _OPTIMIZED_SPEED_LOCAL_CANDIDATES
-    repo_local = str((_repo_root() / DEFAULT_RUNTIME_MODEL_DIR).resolve())
-    local = _complete_local_model_ref((*candidates, repo_local))
-    return local or DEFAULT_HF_MODEL_ID
+        candidates = local_candidates
+    local = _complete_local_model_ref(candidates)
+    return local or hf_model_id
+
+
+def optimized_speed_model_ref() -> str:
+    """Resolve the current V2 coding default without relabeling a V1 folder."""
+
+    return _optimized_speed_model_ref(
+        hf_model_id=OPTIMIZED_SPEED_V2_HF_MODEL_ID,
+        local_candidates=_OPTIMIZED_SPEED_V2_LOCAL_CANDIDATES,
+    )
+
+
+def optimized_speed_v1_model_ref() -> str:
+    """Resolve the original smaller speed model for lower-memory Macs."""
+
+    return _optimized_speed_model_ref(
+        hf_model_id=OPTIMIZED_SPEED_V1_HF_MODEL_ID,
+        local_candidates=_OPTIMIZED_SPEED_V1_LOCAL_CANDIDATES,
+    )
 
 
 def optimized_quality_model_ref(
@@ -358,10 +399,20 @@ def _public_model_id_from_name(value: str) -> str | None:
         return QUALITY_FP16_PUBLIC_MODEL_ID
     if "qwen3.6-27b-mtplx-optimized-quality" in components:
         return QUALITY_PUBLIC_MODEL_ID
+    if OPTIMIZED_SPEED_V2_PUBLIC_MODEL_ID in components:
+        return OPTIMIZED_SPEED_V2_PUBLIC_MODEL_ID
+    if OPTIMIZED_SPEED_V2_HF_MODEL_ID.lower() in components:
+        return OPTIMIZED_SPEED_V2_PUBLIC_MODEL_ID
+    if "qwen3.6-27b-mtplx-optimized-speed-v2" in components:
+        return OPTIMIZED_SPEED_V2_PUBLIC_MODEL_ID
     if "qwen3.6-27b-mtplx-optimized-speed-fp16" in components:
         return DEFAULT_FP16_PUBLIC_MODEL_ID
+    if OPTIMIZED_SPEED_V1_PUBLIC_MODEL_ID in components:
+        return OPTIMIZED_SPEED_V1_PUBLIC_MODEL_ID
+    if OPTIMIZED_SPEED_V1_HF_MODEL_ID.lower() in components:
+        return OPTIMIZED_SPEED_V1_PUBLIC_MODEL_ID
     if "qwen3.6-27b-mtplx-optimized-speed" in components:
-        return DEFAULT_PUBLIC_MODEL_ID
+        return OPTIMIZED_SPEED_V1_PUBLIC_MODEL_ID
     legacy_names = {
         "qwen3.6-27b-mtplx-optimized",
         "youssofal--qwen3.6-27b-mtplx-optimized",
@@ -449,11 +500,9 @@ def select_default_model(
     """Select the verified default model for this machine.
 
     Auto policy is intentionally simple and visible:
-    M1/M2 -> FP16, M3/M4/M5/unknown -> quantized Optimized Speed, and
-    machines under 32 GiB of unified memory route to the 9B artifact in the
-    selected precision (the 27B default cannot load safely there). Memory is
-    only consulted when known: callers passing a hardware mapping without
-    ``memory_gib`` keep the pure generation-based policy.
+    M1/M2 -> FP16, under 32 GiB -> 9B, and modern Macs with at least 32 GiB
+    -> Optimized Speed V2. When memory is unknown, modern Apple Silicon gets
+    V2.
     """
 
     env_value = variant_override if variant_override is not None else os.environ.get(DEFAULT_MODEL_VARIANT_ENV)
@@ -494,6 +543,14 @@ def select_default_model(
     route_small = (
         memory_gib is not None and memory_gib < SMALL_DEFAULT_MEMORY_FLOOR_GIB
     )
+    use_v2 = (
+        variant == "speed"
+        and generation not in _LEGACY_APPLE_FP16_GENERATIONS
+        and (
+            memory_gib is None
+            or memory_gib >= OPTIMIZED_SPEED_V2_MEMORY_FLOOR_GIB
+        )
+    )
     if route_small:
         # The variant override still controls precision; memory routing only
         # changes the model size, mirroring the app's <32 GiB tier.
@@ -512,10 +569,21 @@ def select_default_model(
         model = DEFAULT_FP16_HF_MODEL_ID
         hf_model = DEFAULT_FP16_HF_MODEL_ID
         precision = "FP16"
-    else:
+    elif use_v2:
         model = optimized_speed_model_ref()
-        hf_model = DEFAULT_HF_MODEL_ID
-        precision = OPTIMIZED_SPEED_DESCRIPTION
+        hf_model = OPTIMIZED_SPEED_V2_HF_MODEL_ID
+        precision = OPTIMIZED_SPEED_V2_DESCRIPTION
+        if model != hf_model:
+            reason = f"{reason}; installed locally"
+    else:
+        model = optimized_speed_v1_model_ref()
+        hf_model = OPTIMIZED_SPEED_V1_HF_MODEL_ID
+        precision = OPTIMIZED_SPEED_V1_DESCRIPTION
+        if memory_gib is not None:
+            reason = (
+                f"{reason}; selected the smaller model for "
+                f"{memory_gib:.0f} GiB unified memory"
+            )
         if model != hf_model:
             reason = f"{reason}; installed locally"
     return DefaultModelSelection(

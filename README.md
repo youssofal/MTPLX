@@ -20,6 +20,12 @@ There is no second draft model eating your RAM, and no greedy shortcut that quie
 
 **The Mac app** is the easiest way in. Download the DMG at [mtplx.com](https://mtplx.com/download), drag it to Applications, and the app takes care of everything else: it checks your hardware, recommends a model that actually fits your memory, downloads it, sets up its own Python engine (no Homebrew needed), installs fan control, puts `mtplx` on your PATH, and then measures your machine to pick the fastest decoding depth.
 
+**Recommended for coding:** Qwen 3.6 27B Optimized Speed V2 is a dynamic
+4-bit hybrid with hand-tuned sensitive parts kept at up to 16-bit. It is much
+higher quality than the original Optimized Speed model and faster on long agent
+tasks. It is slightly larger and a little slower for short chats. The original
+model remains available directly below it in the app and CLI.
+
 **The CLI** on its own:
 
 ```bash
@@ -29,7 +35,9 @@ mtplx start
 
 or `python3 -m pip install mtplx` if you prefer pip. All releases are listed at [mtplx.com/releases](https://mtplx.com/releases/).
 
-Requirements: Apple Silicon (M1 or newer), macOS 14+. 16 GB of memory runs the 4B and 9B models comfortably; 27B wants 32 GB and up. The app checks this for you before recommending anything.
+Requirements: Apple Silicon (M1 or newer), macOS 14+. 16 GB of memory runs the
+4B and 9B models comfortably. Optimized Speed V2 is recommended on modern Macs
+with 32 GB or more. The app and CLI check this before recommending anything.
 
 ## The app
 

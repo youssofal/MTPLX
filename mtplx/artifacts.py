@@ -32,10 +32,12 @@ from .models.laguna_config import (
 from .profiles import (
     DEFAULT_FP16_HF_MODEL_ID,
     DEFAULT_FP16_PUBLIC_MODEL_ID,
-    DEFAULT_HF_MODEL_ID,
-    DEFAULT_PUBLIC_MODEL_ID,
     LEGACY_OPTIMIZED_HF_MODEL_ID,
     LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
+    OPTIMIZED_SPEED_V1_HF_MODEL_ID,
+    OPTIMIZED_SPEED_V1_PUBLIC_MODEL_ID,
+    OPTIMIZED_SPEED_V2_HF_MODEL_ID,
+    OPTIMIZED_SPEED_V2_PUBLIC_MODEL_ID,
     QUALITY_FP16_HF_MODEL_ID,
     QUALITY_FP16_PUBLIC_MODEL_ID,
     QUALITY_HF_MODEL_ID,
@@ -60,7 +62,8 @@ _KNOWN_PUBLIC_MODEL_ALIASES = {
     # their first-party repos. Explicit ids only — consistent with the July
     # 2026 contract-match-only identity stance (#57): pasting the id the
     # server displayed into `mtplx serve/run/pull --model` must work.
-    DEFAULT_PUBLIC_MODEL_ID: DEFAULT_HF_MODEL_ID,
+    OPTIMIZED_SPEED_V2_PUBLIC_MODEL_ID: OPTIMIZED_SPEED_V2_HF_MODEL_ID,
+    OPTIMIZED_SPEED_V1_PUBLIC_MODEL_ID: OPTIMIZED_SPEED_V1_HF_MODEL_ID,
     DEFAULT_FP16_PUBLIC_MODEL_ID: DEFAULT_FP16_HF_MODEL_ID,
     QUALITY_PUBLIC_MODEL_ID: QUALITY_HF_MODEL_ID,
     QUALITY_FP16_PUBLIC_MODEL_ID: QUALITY_FP16_HF_MODEL_ID,
@@ -74,7 +77,8 @@ _KNOWN_PUBLIC_MODEL_ALIASES = {
     # Artifact-basename aliases (folder-name style).
     "qwen3.5-9b-mtplx-optimized-speed": QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
     "qwen3.5-9b-mtplx-optimized-speed-fp16": QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
-    "qwen3.6-27b-mtplx-optimized-speed": DEFAULT_HF_MODEL_ID,
+    "qwen3.6-27b-mtplx-optimized-speed-v2": OPTIMIZED_SPEED_V2_HF_MODEL_ID,
+    "qwen3.6-27b-mtplx-optimized-speed": OPTIMIZED_SPEED_V1_HF_MODEL_ID,
     "qwen3.6-27b-mtplx-optimized": LEGACY_OPTIMIZED_HF_MODEL_ID,
     "qwen3.6-27b-mtplx-optimized-speed-fp16": DEFAULT_FP16_HF_MODEL_ID,
     "qwen3.6-27b-mtplx-optimized-quality": QUALITY_HF_MODEL_ID,

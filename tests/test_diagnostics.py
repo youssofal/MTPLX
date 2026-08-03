@@ -36,7 +36,7 @@ def test_diagnostics_payload_has_production_checks(tmp_path) -> None:
     )
 
     assert payload["support_matrix"]["supported"]["default_model"] == (
-        "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed"
+        "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-V2"
     )
     assert payload["support_matrix"]["supported"]["default_profile"] == "sustained"
     ids = {check["id"] for check in payload["checks"]}
@@ -61,7 +61,7 @@ def test_default_repo_check_rejects_stale_public_namespace(tmp_path) -> None:
     check = next(item for item in payload["checks"] if item["id"] == "model.default_repo")
 
     assert check["status"] == "pass"
-    assert check["observed"] == "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed"
+    assert check["observed"] == "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-V2"
     assert not check["observed"].startswith("mtplx/")
 
 

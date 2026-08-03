@@ -618,13 +618,20 @@ class SessionBankColdTier:
                 usage["managed_file_bytes"] = managed_file_bytes
                 usage["managed_disk_bytes"] = managed_disk_bytes
             stats.update(usage)
+            # Pair a cached filesystem scan with the manifest total captured
+            # in that same snapshot. Mixing stale filesystem bytes with the
+            # live manifest row creates phantom orphan bytes while the next
+            # asynchronous scan is pending.
+            manifest_bytes_at_scan = int(
+                usage.get("manifest_physical_bytes_at_scan", row[2])
+            )
             stats["untracked_file_bytes"] = max(
                 0,
-                managed_file_bytes - database_file_bytes - int(row[2]),
+                managed_file_bytes - database_file_bytes - manifest_bytes_at_scan,
             )
             stats["untracked_disk_bytes"] = max(
                 0,
-                managed_disk_bytes - database_disk_bytes - int(row[2]),
+                managed_disk_bytes - database_disk_bytes - manifest_bytes_at_scan,
             )
             stats["orphan_cleanup_running"] = self._orphan_cleanup_is_running()
             if (
@@ -640,12 +647,18 @@ class SessionBankColdTier:
         return stats
 
     def flush(self, *, timeout_s: float = 30.0) -> bool:
-        deadline = time.time() + max(0.0, float(timeout_s))
-        while time.time() < deadline:
-            if self._queue.empty():
-                return True
-            time.sleep(0.05)
-        return self._queue.empty()
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        # ``Queue.empty()`` becomes true as soon as the writer dequeues an
+        # item, before that item has reached disk or updated the manifest.
+        # Wait on Queue's task accounting instead so a successful flush means
+        # every accepted write has actually finished.
+        with self._queue.all_tasks_done:
+            while self._queue.unfinished_tasks:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._queue.all_tasks_done.wait(timeout=remaining)
+        return True
 
     def cancel_pending(self) -> int:
         """Drop queued writes without encoding them.
@@ -1617,9 +1630,21 @@ class SessionBankColdTier:
                 self._disk_usage_scan_running = False
 
     def _refresh_disk_usage_now(self) -> dict[str, int | float]:
-        usage = self._scan_managed_disk_usage()
-        with self._disk_usage_lock:
-            self._disk_usage_cache = dict(usage)
+        # The writer mutates entry directories, blobs, and the manifest as one
+        # logical transaction under ``_base_lock``. Scanning without the same
+        # lock could cache a half-written view as fresh, making disk telemetry
+        # briefly report phantom untracked bytes and potentially trigger an
+        # unnecessary orphan cleanup. The scan already runs off the hot path;
+        # waiting for the current write keeps the snapshot coherent.
+        with self._base_lock:
+            manifest_bytes_at_scan = self._current_bytes()
+            usage = self._scan_managed_disk_usage()
+            usage["manifest_physical_bytes_at_scan"] = manifest_bytes_at_scan
+            # Keep the writer excluded until the coherent snapshot has been
+            # installed. Otherwise a write can invalidate the old cache in
+            # the gap and this older scan can overwrite it as fresh.
+            with self._disk_usage_lock:
+                self._disk_usage_cache = dict(usage)
         return dict(usage)
 
     @staticmethod
@@ -1629,6 +1654,7 @@ class SessionBankColdTier:
             "managed_disk_bytes": 0,
             "database_file_bytes": 0,
             "database_disk_bytes": 0,
+            "manifest_physical_bytes_at_scan": 0,
             "managed_file_count": 0,
             "managed_dir_count": 0,
             "disk_usage_scan_s": 0.0,

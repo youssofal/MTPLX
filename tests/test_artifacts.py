@@ -2395,14 +2395,25 @@ def test_served_public_ids_resolve_to_first_party_repos():
     """
     from mtplx.artifacts import _hf_repo_id_from_ref
     from mtplx.profiles import (
-        DEFAULT_HF_MODEL_ID,
+        OPTIMIZED_SPEED_V1_HF_MODEL_ID,
+        OPTIMIZED_SPEED_V2_HF_MODEL_ID,
         QUALITY_HF_MODEL_ID,
         QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
         QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
     )
 
-    assert _hf_repo_id_from_ref("mtplx-qwen36-27b-optimized-speed") == DEFAULT_HF_MODEL_ID
-    assert _hf_repo_id_from_ref("MTPLX-Qwen36-27B-Optimized-Speed") == DEFAULT_HF_MODEL_ID
+    assert (
+        _hf_repo_id_from_ref("mtplx-qwen36-27b-optimized-speed-v2")
+        == OPTIMIZED_SPEED_V2_HF_MODEL_ID
+    )
+    assert (
+        _hf_repo_id_from_ref("mtplx-qwen36-27b-optimized-speed")
+        == OPTIMIZED_SPEED_V1_HF_MODEL_ID
+    )
+    assert (
+        _hf_repo_id_from_ref("MTPLX-Qwen36-27B-Optimized-Speed")
+        == OPTIMIZED_SPEED_V1_HF_MODEL_ID
+    )
     assert _hf_repo_id_from_ref("mtplx-qwen36-27b-optimized-quality") == QUALITY_HF_MODEL_ID
     assert (
         _hf_repo_id_from_ref("mtplx-qwen35-9b-optimized-speed")

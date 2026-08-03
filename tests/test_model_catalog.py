@@ -35,12 +35,12 @@ from mtplx.profiles import (
 )
 
 
-def test_catalog_has_fourteen_unique_entries():
+def test_catalog_has_fifteen_unique_entries():
     ids = [model.id for model in OFFICIAL_CATALOG]
-    assert len(ids) == 14
-    assert len(set(ids)) == 14
+    assert len(ids) == 15
+    assert len(set(ids)) == 15
     hf_ids = [model.hf_model_id for model in OFFICIAL_CATALOG]
-    assert len(set(hf_ids)) == 14
+    assert len(set(hf_ids)) == 15
 
 
 def test_catalog_matches_swift_official_catalog():
@@ -111,15 +111,21 @@ def test_recommended_ids_mirror_app_ram_tiers():
         "qwen35-4b-optimized-quality",
     ]
     assert recommended_catalog_ids(memory_gib=36, chip_tier=MODERN_TIER) == [
-        "qwen35-9b-optimized-speed",
+        "optimized-speed-v2",
         "optimized-speed",
+        "qwen35-9b-optimized-speed",
         "gemma4-optimized-speed",
         "qwen36-35b-a3b-optimized-speed",
         "optimized-quality",
         "qwen35-4b-optimized-speed",
         "qwen35-4b-optimized-quality",
     ]
+    assert recommended_catalog_ids(memory_gib=32, chip_tier=MODERN_TIER)[:2] == [
+        "optimized-speed-v2",
+        "optimized-speed",
+    ]
     assert recommended_catalog_ids(memory_gib=64, chip_tier=MODERN_TIER) == [
+        "optimized-speed-v2",
         "optimized-speed",
         "optimized-quality",
         "qwen36-35b-a3b-optimized-speed",
@@ -151,6 +157,7 @@ def test_recommended_ids_mirror_app_ram_tiers():
     assert recommended_catalog_ids(
         memory_gib=None, chip_tier=MODERN_TIER
     ) == [
+        "optimized-speed-v2",
         "optimized-speed",
         "optimized-quality",
         "qwen36-35b-a3b-optimized-speed",
@@ -173,7 +180,7 @@ def test_recommended_models_filter_by_peak_memory():
         "qwen35-4b-optimized-quality",
     ]
     default = default_catalog_model(memory_gib=64, chip_tier=MODERN_TIER)
-    assert default is not None and default.id == "optimized-speed"
+    assert default is not None and default.id == "optimized-speed-v2"
 
 
 def test_feasibility_verdicts_mirror_app_rules():
@@ -214,8 +221,10 @@ def test_feasibility_verdicts_mirror_app_rules():
 
 def test_catalog_model_matching_accepts_ids_repos_cache_dirs_and_aliases():
     speed = catalog_model_with_id("optimized-speed")
+    speed_v2 = catalog_model_with_id("optimized-speed-v2")
     assert catalog_model_matching("optimized-speed") == speed
-    assert catalog_model_matching(DEFAULT_HF_MODEL_ID) == speed
+    assert catalog_model_matching(DEFAULT_HF_MODEL_ID) == speed_v2
+    assert catalog_model_matching("optimized-speed-v2") == speed_v2
     assert (
         catalog_model_matching("Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed")
         == speed
@@ -227,6 +236,10 @@ def test_catalog_model_matching_accepts_ids_repos_cache_dirs_and_aliases():
         == speed
     )
     assert catalog_model_matching("mtplx-qwen36-27b-optimized-speed") == speed
+    assert (
+        catalog_model_matching("mtplx-qwen36-27b-optimized-speed-v2")
+        == speed_v2
+    )
     assert catalog_model_matching("someone/custom-model") is None
     assert catalog_model_matching("") is None
     assert catalog_model_matching(None) is None
@@ -366,6 +379,21 @@ def test_select_default_model_keeps_27b_with_enough_memory(monkeypatch):
     )
     assert selection.model == DEFAULT_HF_MODEL_ID
     assert "9B" not in selection.reason
+
+
+def test_select_default_model_uses_v2_at_32_gib_and_above(monkeypatch):
+    monkeypatch.delenv("MTPLX_DEFAULT_MODEL_VARIANT", raising=False)
+    monkeypatch.setenv("MTPLX_OPTIMIZED_SPEED_MODEL", "off")
+
+    base_hardware = {
+        "chip": "Apple M4 Max",
+        "apple_silicon_generation": "m4",
+    }
+    at_32 = select_default_model(hardware={**base_hardware, "memory_gib": 32.0})
+    at_36 = select_default_model(hardware={**base_hardware, "memory_gib": 36.0})
+
+    assert at_32.model == DEFAULT_HF_MODEL_ID
+    assert at_36.model == DEFAULT_HF_MODEL_ID
 
 
 def test_select_default_model_without_memory_keeps_generation_policy(monkeypatch):

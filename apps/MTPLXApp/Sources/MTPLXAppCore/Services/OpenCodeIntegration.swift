@@ -262,6 +262,9 @@ public struct OpenCodeIntegration: Sendable {
         {
             return "qwen3.5-4b-mtplx-optimized-speed"
         }
+        if lower.contains("qwen") && lower.contains("optimized-speed-v2") {
+            return "mtplx-qwen36-27b-optimized-speed-v2"
+        }
         if lower.contains("qwen") && lower.contains("optimized-speed-fp16") {
             return "mtplx-qwen36-27b-optimized-speed-fp16"
         }

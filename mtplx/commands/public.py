@@ -84,6 +84,10 @@ from mtplx.profiles import (
     DEFAULT_PUBLIC_MODEL_ID,
     LEGACY_OPTIMIZED_HF_MODEL_ID,
     LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
+    OPTIMIZED_SPEED_V1_HF_MODEL_ID,
+    OPTIMIZED_SPEED_V1_PUBLIC_MODEL_ID,
+    OPTIMIZED_SPEED_V2_HF_MODEL_ID,
+    OPTIMIZED_SPEED_V2_PUBLIC_MODEL_ID,
     QUALITY_FP16_HF_MODEL_ID,
     QUALITY_FP16_PUBLIC_MODEL_ID,
     QUALITY_HF_MODEL_ID,
@@ -926,7 +930,8 @@ def _apply_model_contract_depth_default(
 # Gemma, and third-party artifacts keep the sustained default.
 _TURBO_DEFAULT_PUBLIC_MODEL_IDS = frozenset(
     {
-        DEFAULT_PUBLIC_MODEL_ID,  # 27B Optimized-Speed (flat 4-bit)
+        DEFAULT_PUBLIC_MODEL_ID,  # 27B Optimized Speed V2 (hybrid 4-bit)
+        OPTIMIZED_SPEED_V1_PUBLIC_MODEL_ID,  # original 27B Optimized Speed
         QUALITY_PUBLIC_MODEL_ID,  # 27B Optimized-Quality (8-bit)
         LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,  # 27B Optimized (gdn8 hybrid, 8/4-bit)
         # 27B Speed-FP16 (INT4/g64 weights, fp16 activations — the M1/M2
@@ -8046,6 +8051,12 @@ def _model_ref_from_public_model_id(model_id: str | None) -> str | None:
         DEFAULT_HF_MODEL_ID.lower(): DEFAULT_HF_MODEL_ID,
         DEFAULT_MODEL_ID.lower(): DEFAULT_HF_MODEL_ID,
         Path(DEFAULT_HF_MODEL_ID).name.lower(): DEFAULT_HF_MODEL_ID,
+        OPTIMIZED_SPEED_V1_PUBLIC_MODEL_ID.lower(): OPTIMIZED_SPEED_V1_HF_MODEL_ID,
+        OPTIMIZED_SPEED_V1_HF_MODEL_ID.lower(): OPTIMIZED_SPEED_V1_HF_MODEL_ID,
+        Path(OPTIMIZED_SPEED_V1_HF_MODEL_ID).name.lower(): OPTIMIZED_SPEED_V1_HF_MODEL_ID,
+        OPTIMIZED_SPEED_V2_PUBLIC_MODEL_ID.lower(): OPTIMIZED_SPEED_V2_HF_MODEL_ID,
+        OPTIMIZED_SPEED_V2_HF_MODEL_ID.lower(): OPTIMIZED_SPEED_V2_HF_MODEL_ID,
+        Path(OPTIMIZED_SPEED_V2_HF_MODEL_ID).name.lower(): OPTIMIZED_SPEED_V2_HF_MODEL_ID,
         DEFAULT_FP16_PUBLIC_MODEL_ID.lower(): DEFAULT_FP16_HF_MODEL_ID,
         DEFAULT_FP16_HF_MODEL_ID.lower(): DEFAULT_FP16_HF_MODEL_ID,
         Path(DEFAULT_FP16_HF_MODEL_ID).name.lower(): DEFAULT_FP16_HF_MODEL_ID,

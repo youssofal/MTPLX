@@ -33,6 +33,7 @@ public enum ModelPickChoice: Equatable, Sendable, Hashable {
     case none
     case curatedQwen35FourBit
     case curatedQwen35NineBSpeed
+    case curatedSpeedV2
     case curatedSpeed
     case curatedQwen35BSpeed
     case curatedQwen35BBalance
@@ -174,6 +175,8 @@ public struct OnboardingFeatureState: Equatable, Sendable {
             let useFP16 = hardware?.tier == .legacyApple
             let id = useFP16 ? "qwen35-9b-optimized-speed-fp16" : "qwen35-9b-optimized-speed"
             return catalog.first { $0.id == id }
+        case .curatedSpeedV2:
+            return catalog.first { $0.id == "optimized-speed-v2" }
         case .curatedSpeed:
             let useFP16 = hardware?.tier == .legacyApple
             let id = useFP16 ? "optimized-speed-fp16" : "optimized-speed"
@@ -209,6 +212,7 @@ public struct OnboardingFeatureState: Equatable, Sendable {
             return nil
         case .curatedQwen35FourBit,
              .curatedQwen35NineBSpeed,
+             .curatedSpeedV2,
              .curatedSpeed,
              .curatedQwen35BSpeed,
              .curatedQwen35BBalance,
@@ -290,6 +294,7 @@ public struct OnboardingFeatureState: Equatable, Sendable {
                 return false
             case .curatedQwen35FourBit,
                  .curatedQwen35NineBSpeed,
+                 .curatedSpeedV2,
                  .curatedSpeed,
                  .curatedQwen35BSpeed,
                  .curatedQwen35BBalance,

@@ -404,10 +404,30 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
             recommendedFor: [.legacyApple]
         ),
         MTPLXModelOption(
+            id: "optimized-speed-v2",
+            displayName: "Qwen 3.6 27B Optimized Speed V2",
+            shortName: "Qwen 3.6 27B Optimized Speed V2",
+            detail: "Much higher quality for coding. Dynamic 4-bit hybrid quantization keeps hand-tuned sensitive parts at up to 16-bit. Faster on long agent tasks, slightly larger, and a little slower for short chats.",
+            hfModelID: "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-V2",
+            localCandidates: [
+                "~/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed-V2",
+                "~/Documents/MTPLX/models/Qwen3.6-27B-MTPLX-Optimized-Speed-V2",
+                "~/Documents/MTPLX/hf-staging/Qwen3.6-27B-MTPLX-Optimized-Speed-V2",
+            ],
+            aliases: [
+                "mtplx-qwen36-27b-optimized-speed-v2",
+                "Qwen3.6 27B Optimized Speed V2",
+                "Optimized Speed V2",
+            ],
+            sizeBytes: 19_887_448_095,
+            peakMemoryGiB: 21.5,
+            recommendedFor: [.modernApple]
+        ),
+        MTPLXModelOption(
             id: "optimized-speed",
             displayName: "Qwen 3.6 27B Optimized Speed",
             shortName: "Qwen 3.6 27B Optimized Speed",
-            detail: "4-bit quantization. Fast and smart.",
+            detail: "Smaller 4-bit model. A little faster for short chats.",
             hfModelID: "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed",
             localCandidates: [
                 "~/Documents/MTPLX/models/Qwen3.6-27B-MTPLX-Optimized-Speed",
@@ -677,6 +697,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 memoryGiB: hardware.unifiedMemoryGiB,
                 small: "qwen35-9b-optimized-speed-fp16",
                 speed27: "optimized-speed-fp16",
+                speed27V2: nil,
                 speed35: "qwen36-35b-a3b-optimized-speed-fp16",
                 balance35: "qwen36-35b-a3b-optimized-balance-fp16",
                 quality27: "optimized-quality-fp16"
@@ -690,6 +711,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 memoryGiB: hardware.unifiedMemoryGiB,
                 small: "qwen35-9b-optimized-speed",
                 speed27: "optimized-speed",
+                speed27V2: "optimized-speed-v2",
                 speed35: "qwen36-35b-a3b-optimized-speed",
                 balance35: "qwen36-35b-a3b-optimized-balance",
                 quality27: "optimized-quality"
@@ -708,6 +730,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
     }
 
     private static let modernTopRecommendationIDs = [
+        "optimized-speed-v2",
         "optimized-speed",
         "optimized-quality",
         "qwen36-35b-a3b-optimized-speed",
@@ -720,6 +743,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         memoryGiB: Double,
         small: String,
         speed27: String,
+        speed27V2: String?,
         speed35: String,
         balance35: String,
         quality27: String
@@ -728,9 +752,13 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
             return [small]
         }
         if memoryGiB < 48 {
-            return [small, speed27, "gemma4-optimized-speed", speed35, quality27]
+            guard let speed27V2 else {
+                return [small, speed27, "gemma4-optimized-speed", speed35, quality27]
+            }
+            return [speed27V2, speed27, small, "gemma4-optimized-speed", speed35, quality27]
         }
-        return [speed27, quality27, speed35, balance35, "gemma4-optimized-speed", small]
+        return (speed27V2.map { [$0] } ?? [])
+            + [speed27, quality27, speed35, balance35, "gemma4-optimized-speed", small]
     }
 
     private static func optionWithID(_ id: String) -> MTPLXModelOption? {

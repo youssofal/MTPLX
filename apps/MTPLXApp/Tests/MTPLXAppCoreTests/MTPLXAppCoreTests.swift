@@ -3159,7 +3159,7 @@ final class MTPLXAppCoreTests: XCTestCase {
     func testDefaultAppModelIsPortableHuggingFaceReference() throws {
         let model = MTPLXAppConfiguration.defaultLocalModelPath()
 
-        XCTAssertEqual(model, "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed")
+        XCTAssertEqual(model, "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-V2")
         XCTAssertFalse(model.contains("/Users/"))
         XCTAssertFalse(model.contains("Documents/MTPLX"))
     }
@@ -3412,8 +3412,9 @@ final class MTPLXAppCoreTests: XCTestCase {
         ).map(\.id)
 
         XCTAssertEqual(ids, [
-            "qwen35-9b-optimized-speed",
+            "optimized-speed-v2",
             "optimized-speed",
+            "qwen35-9b-optimized-speed",
             "gemma4-optimized-speed",
             "qwen36-35b-a3b-optimized-speed",
             "optimized-quality",
@@ -3422,6 +3423,21 @@ final class MTPLXAppCoreTests: XCTestCase {
         ])
         XCTAssertFalse(ids.contains { $0.hasSuffix("-fp16") })
         XCTAssertFalse(ids.contains { $0.contains("step") })
+    }
+
+    func testFreshModern36GiBCatalogLeadsWithOptimizedSpeedV2() throws {
+        let m5 = DetectedHardware(
+            chipName: "Apple M5 Pro",
+            appleSiliconGeneration: "m5",
+            unifiedMemoryBytes: 36 * 1_073_741_824
+        )
+
+        let ids = MTPLXModelOption.hardwareAwareOfficialCatalog(
+            hardware: m5,
+            includeInstalledOverrides: false
+        ).map(\.id)
+
+        XCTAssertEqual(Array(ids.prefix(2)), ["optimized-speed-v2", "optimized-speed"])
     }
 
     func testFreshModernLargeMemoryCatalogUnlocksBalanceWithoutFP16Siblings() throws {
@@ -3437,6 +3453,7 @@ final class MTPLXAppCoreTests: XCTestCase {
         ).map(\.id)
 
         XCTAssertEqual(ids, [
+            "optimized-speed-v2",
             "optimized-speed",
             "optimized-quality",
             "qwen36-35b-a3b-optimized-speed",
