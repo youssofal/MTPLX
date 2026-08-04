@@ -4,6 +4,40 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [2.5.2] - 2026-08-04
+
+Hotfix for a long-response slowdown that shipped in 2.5.1 with Optimized
+Speed V2 as the recommended coding model.
+
+### Fixed
+
+- Long single responses no longer slow down and stutter partway through. The
+  compiled verifier hands generation to the eager path after its growth
+  reserve is exhausted, and that handoff carried unfinished GPU work into the
+  rest of the response. Every later token paid for the old work, so decode
+  throughput fell steadily on responses past a few thousand tokens. The
+  reported 12,000-token response opened at 59 tokens per second and
+  ended near 30. With the fix, the same seeded generation no longer
+  decays: the closing windows now run as fast as or faster than the
+  early ones.
+- The handoff now settles all cache and recurrent state exactly once at the
+  ownership boundary and releases the compiled references before eager
+  decoding continues. Handoff telemetry is exposed in the compiled verifier
+  stats.
+
+### Changed
+
+- The minimum MLX version is now 0.32. Fresh installs already resolved MLX
+  0.32.0; existing runtime environments could stay on 0.31.2 indefinitely
+  because dependency upgrades only run when the declared floor requires
+  them. Long-generation runs consistently read faster on the 0.32 stack,
+  and existing installs now converge to what new installs already run.
+
+### Compatibility
+
+- Model catalogs, defaults, sampler settings, memory policy, and the 2.5.1
+  V2 recommendation are unchanged.
+
 ## [2.5.1] - 2026-08-03
 
 Optimized Speed V2 is now the recommended Qwen 3.6 27B model for coding on

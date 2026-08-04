@@ -8,7 +8,7 @@ authors:
 repository-code: "https://github.com/youssofal/mtplx"
 url: "https://github.com/youssofal/mtplx"
 license: Apache-2.0
-version: 2.5.1
+version: 2.5.2
 abstract: "Native MTP speculative decoding for Qwen3-Next on Apple Silicon, using built-in MTP heads with math-correct rejection sampling and an OpenAI/Anthropic-compatible serving surface."
 keywords:
   - speculative decoding
