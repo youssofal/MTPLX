@@ -17468,6 +17468,53 @@ def _usage_payload(generated: dict[str, Any]) -> dict[str, Any]:
     return usage
 
 
+def _build_timings(generated: dict[str, Any]) -> dict[str, Any]:
+    stats = generated.get("stats") or {}
+    prompt_n = int(generated.get("prompt_tokens") or 0)
+    predicted_n = int(generated.get("completion_tokens") or 0)
+
+    # Prompt (prefill) timing – derive from target_forward_time_s if needed
+    if "prompt_eval_time_s" in stats:
+        prompt_s = float(stats.get("prompt_eval_time_s") or 0.0)
+    else:
+        target_forward_time_s = float(stats.get("target_forward_time_s") or 0.0)
+        verify_time_s = float(stats.get("verify_time_s") or 0.0)
+        repair_time_s = float(stats.get("repair_time_s") or 0.0)
+        prompt_s = max(
+            0.0, target_forward_time_s - verify_time_s - repair_time_s
+        )
+
+    # Decode (predict) timing – total elapsed minus prefill minus cache restore
+    elapsed_s = float(stats.get("elapsed_s") or 0.0)
+    cache_restore_time_s = max(
+        float(stats.get("cache_restore_time_s") or 0.0),
+        float(stats.get("ssd_restore_s") or 0.0),
+    )
+    decode_s = max(0.0, elapsed_s - prompt_s - cache_restore_time_s)
+
+    prompt_per_second = (
+        prompt_n / prompt_s if prompt_s > 0 else 0.0
+    )
+    predicted_per_second = (
+        predicted_n / decode_s if decode_s > 0 else 0.0
+    )
+
+    draft_n = int(stats.get("drafted_tokens") or 0)
+    draft_n_accepted = int(stats.get("accepted_drafts") or 0)
+
+    return {
+        "prompt_n": prompt_n,
+        "predicted_n": predicted_n,
+        "prompt_ms": round(prompt_s * 1000, 3),
+        "predicted_ms": round(decode_s * 1000, 3),
+        "prompt_per_second": round(prompt_per_second, 3),
+        "predicted_per_second": round(predicted_per_second, 3),
+        "draft_n": draft_n,
+        "draft_n_accepted": draft_n_accepted,
+    }
+
+
+
 def _strip_generated_chat_template_sentinels(text: str) -> str:
     if not text:
         return ""
@@ -25168,6 +25215,7 @@ def create_app(state: ServerState) -> FastAPI:
                     ],
                     "usage": _usage_payload(generated),
                     "mtplx_stats": _public_mtplx_stats(generated),
+                    "timings": _build_timings(generated),
                 }
                 yield mark_sse_sent(f"data: {json.dumps(done)}\n\n")
                 yield mark_sse_sent("data: [DONE]\n\n")
@@ -25260,6 +25308,7 @@ def create_app(state: ServerState) -> FastAPI:
                     ],
                     "usage": _usage_payload(stop_generated),
                     "mtplx_stats": _public_mtplx_stats(stop_generated),
+                    "timings": _build_timings(stop_generated),
                 }
             )
         except _StreamCancelled as exc:
@@ -25459,6 +25508,7 @@ def create_app(state: ServerState) -> FastAPI:
                 ],
                 "usage": _usage_payload(generated),
                 "mtplx_stats": _public_mtplx_stats(generated),
+                "timings": _build_timings(generated),
             }
         )
 
@@ -25866,6 +25916,7 @@ def create_app(state: ServerState) -> FastAPI:
                     ],
                     "usage": _usage_payload(generated),
                     "mtplx_stats": _public_mtplx_stats(generated),
+                    "timings": _build_timings(generated),
                 }
                 yield f"data: {json.dumps(final_payload)}\n\n"
                 yield "data: [DONE]\n\n"
@@ -25972,6 +26023,7 @@ def create_app(state: ServerState) -> FastAPI:
                 ],
                 "usage": _usage_payload(generated),
                 "mtplx_stats": _public_mtplx_stats(generated),
+                "timings": _build_timings(generated),
             }
         )
 
