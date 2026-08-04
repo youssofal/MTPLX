@@ -963,7 +963,7 @@ def _compiled_verify_growth_reserve() -> int:
     Sized so a typical agent tool round (40-500 generated tokens) completes
     inside one stable leaf shape: one trace per (length, capacity) class,
     zero mid-round retraces. Long generations exceed the grant and demote to
-    eager for the request remainder, which measured flat vs eager-only.
+    eager for the request remainder.
     """
 
     raw = str(os.environ.get("MTPLX_COMPILED_VERIFY_GROWTH_RESERVE", "512")).strip()
@@ -1191,6 +1191,9 @@ class CompiledVerifyBank:
             "parity2_divergent_calls": 0,
             "parity2_first_divergence": None,
             "growth_demotions": 0,
+            "growth_handoff_materializations": 0,
+            "growth_handoff_state_leaves": 0,
+            "growth_handoff_materialize_time_s": 0.0,
         }
 
     # -- public API ---------------------------------------------------------
@@ -1516,6 +1519,49 @@ class CompiledVerifyBank:
             pass
         return _finish()
 
+    def _materialize_growth_handoff_state(self, cache: Any) -> int:
+        """Settle compiled state before the eager tail takes ownership.
+
+        Compiled dispatch schedules every output asynchronously. Merely
+        replacing the tensor-offset cache containers leaves their KV and
+        recurrent leaves attached to that deferred graph. The eager tail then
+        inherits the compiled dependency chain, so long generations pay the
+        old work through later verify-output evaluations instead of crossing a
+        clean ownership boundary.
+
+        Growth demotion is a once-per-request transition. Evaluate the current
+        state exactly once here, while the compiled state spec is still valid,
+        then let ``demote`` replace the containers and release compiled refs.
+        """
+        state = self._read_state_leaves(cache)
+        if state is None:
+            raise RuntimeError(
+                "compiled verify growth handoff has incomplete cache state"
+            )
+        leaves: list[mx.array] = []
+        seen: set[int] = set()
+        for leaf in state:
+            if not isinstance(leaf, mx.array):
+                continue
+            identity = id(leaf)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            leaves.append(leaf)
+        started = time.perf_counter()
+        if leaves:
+            mx.eval(*leaves)
+        self.stats["growth_handoff_materializations"] = (
+            int(self.stats.get("growth_handoff_materializations", 0)) + 1
+        )
+        self.stats["growth_handoff_state_leaves"] = (
+            int(self.stats.get("growth_handoff_state_leaves", 0)) + len(leaves)
+        )
+        self.stats["growth_handoff_materialize_time_s"] = float(
+            self.stats.get("growth_handoff_materialize_time_s", 0.0)
+        ) + (time.perf_counter() - started)
+        return len(leaves)
+
     def demote(self, cache: Any) -> int:
         """Restore stock containers for every tensor-offset adapter in place.
 
@@ -1540,6 +1586,8 @@ class CompiledVerifyBank:
             self.stats["demotions"] += count
             # Container identity changed; compiled closures bound the old
             # shadow, which no longer mirrors the cache list.
+            self._clear_shadow_leaf_refs()
+            self._held_state_refs.clear()
             self._shadow = None
             self._shadow_signature = None
             self._spec = None
@@ -1620,6 +1668,7 @@ class CompiledVerifyBank:
                 self.stats["growth_demotions"] = (
                     int(self.stats.get("growth_demotions", 0)) + 1
                 )
+                self._materialize_growth_handoff_state(cache)
                 self.demote(cache)
                 return "growth_budget_exhausted"
         if failures:

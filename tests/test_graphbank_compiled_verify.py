@@ -649,12 +649,57 @@ def test_unbounded_request_budget_clamps_to_env_ceiling_and_demotes(monkeypatch)
     assert stats["request_max_tokens"] == 262_133
     assert stats["calls"] == 1024
     assert stats["growth_demotions"] == 1
+    assert stats["growth_handoff_materializations"] == 1
+    assert stats["growth_handoff_state_leaves"] == 3
+    assert stats["growth_handoff_materialize_time_s"] >= 0.0
     assert stats["fallback_reasons"].get("growth_budget_exhausted", 0) > 0
     assert stats["compiled_calls"] + stats["fallback_calls"] == 1024
     assert stats["parity_failures"] == 0
     # Demoted back to stock entries; the eager path finished the request.
     assert type(cache[0]) is KVCache
     assert cache[0].offset == 1027
+
+
+def test_growth_handoff_settles_hybrid_state_and_releases_compiled_refs(monkeypatch):
+    """Growth demotion must hand eager mode evaluated, independently owned state."""
+
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_PREWARM", "0")
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_GROWTH_RESERVE", "6")
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_BOUNDARY", "none")
+    rt = ToyHybridRuntime()
+    cache = rt.make_cache()
+    cache[1].step = 4
+    rt.forward_ar_capture(mx.array([[0, 1, 2]]), cache=cache, return_hidden=True)
+    bank = CompiledVerifyBank(rt, request_max_tokens=262_133)
+
+    real_eval = mx.eval
+    evaluated_batch_sizes: list[int] = []
+
+    def recording_eval(*leaves):
+        evaluated_batch_sizes.append(len(leaves))
+        return real_eval(*leaves)
+
+    monkeypatch.setattr(mx, "eval", recording_eval)
+    for token_index in range(16):
+        logits, hidden, _ = bank.forward_ar_capture(
+            mx.array([[token_index % rt.V]]),
+            cache=cache,
+            return_hidden=True,
+        )
+        mx.eval(logits, hidden)
+
+    stats = bank.to_dict()
+    assert stats["growth_demotions"] == 1
+    assert stats["growth_handoff_materializations"] == 1
+    # Two recurrent leaves plus dense K, V, and tensor offset.
+    assert stats["growth_handoff_state_leaves"] == 5
+    assert 5 in evaluated_batch_sizes
+    assert type(cache[1]) is KVCache
+    assert cache[1].offset == 19
+    assert bank._held_state_refs == []
+    assert bank._shadow is None
+    assert bank._spec is None
+    assert bank._compiled == {}
 
 
 def test_env_reserve_raises_ceiling_for_known_budget_runs(monkeypatch):
