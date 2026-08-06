@@ -33,7 +33,7 @@ def test_sustained_profile_sets_v015_memory_env_without_decode_state_flags():
     assert info["profile_type"] == "sustained"
     assert env["MTPLX_SUSTAINED_PREFILL"] == "1"
     assert env["MTPLX_PREFILL_CHUNK_SIZE"] == "auto"
-    assert env["MTPLX_PREFILL_CHUNK_SIZE_DENSE"] == "2048"
+    assert env["MTPLX_PREFILL_CHUNK_SIZE_DENSE"] == "4096"
     assert env["MTPLX_PREFILL_CHUNK_SIZE_REPAGE"] == "2048"
     assert env["MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS"] == "0"
     assert env["MTPLX_DYNAMIC_PAGED_KV"] == "1"

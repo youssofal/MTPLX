@@ -905,7 +905,7 @@ def _local_profile_env(profile: str, base_env: dict[str, str]) -> tuple[dict[str
                 "MTPLX_SUSTAINED_PREFILL_LAYOUT": "auto",
                 "MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT": "131072",
                 "MTPLX_PREFILL_CHUNK_SIZE": "auto",
-                "MTPLX_PREFILL_CHUNK_SIZE_DENSE": "2048",
+                "MTPLX_PREFILL_CHUNK_SIZE_DENSE": "4096",
                 "MTPLX_PREFILL_CHUNK_SIZE_REPAGE": "2048",
                 "MTPLX_DEFER_VERIFY_HIDDEN_EVAL": "auto",
                 "MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS": "0",
