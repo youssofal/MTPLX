@@ -87,3 +87,67 @@ def test_cross_session_yield_env_gate(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setenv("MTPLX_POSTCOMMIT_CROSS_SESSION_YIELD", "1")
     assert openai._postcommit_cross_session_yield_enabled() is True
+
+
+# ---------------------------------------------------------------------------
+# /v1/completions request path (2.5.3 pre-merge correction): the sessionless
+# endpoint sweeps ALL pending commits, and a sweep failure SURFACES exactly
+# like the chat path — no silent swallow.
+
+def _completions_app_state(monkeypatch, sweep):
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    from test_server_openai import _fake_generation, _fake_state  # noqa: PLC0415
+
+    state = _fake_state()
+    monkeypatch.setattr(
+        state.sessions,
+        "abort_cross_session_postcommits",
+        sweep,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        openai, "_run_generation", lambda *a, **k: _fake_generation("ok")
+    )
+    return state
+
+
+def test_completions_admission_sweeps_all_sessions(monkeypatch):
+    from fastapi.testclient import TestClient  # noqa: PLC0415
+
+    from mtplx.server.openai import create_app  # noqa: PLC0415
+
+    calls: list[object] = []
+
+    def sweep(*, except_session_id, reason="cross_session_foreground_preempted"):
+        calls.append(except_session_id)
+        return {"count": 0, "sessions": [], "reason": reason}
+
+    state = _completions_app_state(monkeypatch, sweep)
+    client = TestClient(create_app(state))
+    r = client.post("/v1/completions", json={"prompt": [1, 2, 3], "max_tokens": 4})
+    assert r.status_code == 200
+    assert calls == [None]  # sessionless: every pending commit is foreign
+
+    # env kill switch: no sweep call
+    calls.clear()
+    monkeypatch.setenv("MTPLX_POSTCOMMIT_CROSS_SESSION_YIELD", "0")
+    r = client.post("/v1/completions", json={"prompt": [1, 2, 3], "max_tokens": 4})
+    assert r.status_code == 200
+    assert calls == []
+
+
+def test_completions_sweep_failure_surfaces_not_swallowed(monkeypatch):
+    from fastapi.testclient import TestClient  # noqa: PLC0415
+
+    from mtplx.server.openai import create_app  # noqa: PLC0415
+
+    def sweep(**_kw):
+        raise RuntimeError("sweep exploded")
+
+    state = _completions_app_state(monkeypatch, sweep)
+    client = TestClient(create_app(state), raise_server_exceptions=False)
+    r = client.post("/v1/completions", json={"prompt": [1, 2, 3], "max_tokens": 4})
+    # Surfaces through the sanitized 500 handler — the request does NOT
+    # proceed as if the sweep succeeded (parity with the chat path).
+    assert r.status_code == 500

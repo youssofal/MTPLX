@@ -25892,17 +25892,19 @@ def create_app(state: ServerState) -> FastAPI:
             raise HTTPException(status_code=400, detail="prompt must not be empty")
         # Same admission-time yield as chat: a completions request holds no
         # session, so every pending idle commit is a stranger's — none can
-        # help this request and any can stall it.
+        # help this request and any can stall it. Failures surface exactly
+        # like the chat path's sweep: no swallowing.
+        completions_cross_yield: dict[str, Any] | None = None
         _completions_sweep = getattr(
             getattr(state, "sessions", None),
             "abort_cross_session_postcommits",
             None,
         )
         if _completions_sweep is not None and _postcommit_cross_session_yield_enabled():
-            try:
-                await asyncio.to_thread(_completions_sweep, except_session_id=None)
-            except Exception:
-                pass
+            completions_cross_yield = await asyncio.to_thread(
+                _completions_sweep,
+                except_session_id=None,
+            )
         request_generation_mode = _request_generation_mode_for_generation(
             state,
             request,
@@ -25946,6 +25948,10 @@ def create_app(state: ServerState) -> FastAPI:
             ),
             "client_controls_allowed": bool(client_controls_allowed),
         }
+        if completions_cross_yield is not None:
+            request_observability["postcommit_cross_session_yield"] = (
+                completions_cross_yield
+            )
         if not client_controls_allowed:
             ignored_fields = _ignored_client_control_fields(request)
             if ignored_fields:
