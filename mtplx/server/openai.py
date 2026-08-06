@@ -17553,6 +17553,32 @@ def _decode_timing(stats: dict[str, Any]) -> tuple[float, float]:
     return generated_tokens / decode_elapsed_s, decode_elapsed_s
 
 
+def _stats_footer_allowed(
+    state: ServerState,
+    headers: Mapping[str, str],
+    metadata: Mapping[str, Any],
+) -> bool:
+    """Visible TPS footer only on MTPLX-owned surfaces.
+
+    The footer is server-injected prose inside `content`. On MTPLX-owned
+    chat surfaces (browser chat, app, terminal chat — identified by the
+    managed client hint) it is a product feature. On the OpenAI/Anthropic
+    compat API it corrupts model output for every downstream consumer:
+    agents parse it as answer text, temp-0 byte-equality breaks (the
+    footer's own tok/s digits differ per run), usage excludes its tokens
+    (wire>usage mismatch), and its flush gap deflates externally measured
+    tok/s. 2026-08-05 receipts: outputs/mlxserve-showdown-20260805.
+
+    MTPLX_STATS_FOOTER_SCOPE=all restores the old always-on behavior.
+    """
+    if not getattr(state.args, "stats_footer", False):
+        return False
+    scope = str(os.environ.get("MTPLX_STATS_FOOTER_SCOPE", "owned")).strip().lower()
+    if scope == "all":
+        return True
+    return _app_managed_client_hint(headers, metadata) is not None
+
+
 def _stats_footer_text(state: ServerState, generated: dict[str, Any]) -> str:
     if not state.args.stats_footer:
         return ""
@@ -18413,6 +18439,7 @@ def _display_text(
     generated: dict[str, Any],
     *,
     thinking_enabled: bool = False,
+    footer_allowed: bool | None = None,
 ) -> str:
     raw_text = str(generated["text"])
     text = (
@@ -18424,7 +18451,9 @@ def _display_text(
         if state.args.normalize_thinking_tags
         else raw_text
     )
-    if not state.args.stats_footer:
+    if footer_allowed is None:
+        footer_allowed = bool(state.args.stats_footer)
+    if not footer_allowed:
         return text
     footer = _stats_footer_text(state, generated)
     if not footer:
@@ -18439,6 +18468,7 @@ def _nonstream_chat_message_parts(
     *,
     thinking_enabled: bool,
     suppress_visible_reasoning: bool = False,
+    footer_allowed: bool | None = None,
 ) -> tuple[str, str]:
     raw_text = _strip_generated_chat_template_sentinels(
         str(generated.get("text") or "")
@@ -18523,7 +18553,9 @@ def _nonstream_chat_message_parts(
     display_text = _strip_mtplx_internal_continuation_markers(display_text)
     if suppress_visible_reasoning:
         reasoning_text = ""
-    if not getattr(state.args, "stats_footer", False):
+    if footer_allowed is None:
+        footer_allowed = bool(getattr(state.args, "stats_footer", False))
+    if not footer_allowed:
         return display_text, reasoning_text
     footer = _stats_footer_text(state, generated)
     if not footer:
@@ -25095,7 +25127,11 @@ def create_app(state: ServerState) -> FastAPI:
                                 state.last_metrics[-1]["reasoning_reentries"] = (
                                     splitter.reentry_count
                                 )
-                            footer = _stats_footer_text(state, generated)
+                            footer = (
+                                _stats_footer_text(state, generated)
+                                if _stats_footer_allowed(state, headers, metadata)
+                                else ""
+                            )
                             if footer and not assistant_tool_calls:
                                 # The footer is server-injected, not model
                                 # output: bypass stop monitoring so a stop
@@ -25536,6 +25572,7 @@ def create_app(state: ServerState) -> FastAPI:
                     generated,
                     thinking_enabled=thinking_enabled,
                     suppress_visible_reasoning=suppress_visible_reasoning,
+                    footer_allowed=_stats_footer_allowed(state, headers, metadata),
                 )
                 if extraction is None:
                     # No tools were declared on this request, so any tool-call
@@ -25982,7 +26019,7 @@ def create_app(state: ServerState) -> FastAPI:
                 else:
                     footer = (
                         _stats_footer_text(state, generated)
-                        if state.args.stats_footer
+                        if _stats_footer_allowed(state, headers, metadata)
                         else ""
                     )
                     if footer:
@@ -26093,7 +26130,11 @@ def create_app(state: ServerState) -> FastAPI:
                 generated.setdefault("stats", {})["stop_sequence_hit"] = True
                 generated["stats"]["stop_sequence_matched"] = matched_stop
         generated.setdefault("stats", {})["finish_reason"] = finish_reason
-        display_text = _display_text(state, generated)
+        display_text = _display_text(
+            state,
+            generated,
+            footer_allowed=_stats_footer_allowed(state, headers, metadata),
+        )
         return JSONResponse(
             {
                 "id": response_id,
