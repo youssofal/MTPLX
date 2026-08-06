@@ -8,8 +8,7 @@ All notable user-facing changes to MTPLX. The format is based on
 
 Small release. A day of head-to-head benchmarking against another engine
 turned up a set of real latency bugs in our agent lane and a few places
-where the API surface misled external tools. All of them are fixed here,
-plus one measured prefill speedup.
+where the API surface misled external tools. All of them are fixed here.
 
 ### Fixed
 
@@ -56,12 +55,6 @@ plus one measured prefill speedup.
   server-owned exactly as before, so curated agent sampling is untouched.
   This closes the "temperature is ignored" class of report (#241).
   (`MTPLX_CLIENT_CONTROLS_DEFAULT=hints` restores the old policy.)
-- Dense prefill now runs in 4096-token chunks instead of 2048. Measured on
-  an M5 Max with thermals controlled: prompt processing is 41-58% faster at
-  8k-token prompts and 33-38% faster at 32k, taking 32k time-to-first-token
-  from 76s to 56s. Contexts past 128k keep the 2048-token repage chunk,
-  which avoids a measured +14GB peak-memory cost on that path. Both remain
-  overridable (`MTPLX_PREFILL_CHUNK_SIZE_DENSE`, `_REPAGE`).
 - Temperature-0 requests now run the draft sampler greedy as well, so the
   speculative window matches the target's argmax choices more often:
   depth-2 acceptance rose from .526 to .590 in our runs.
