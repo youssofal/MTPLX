@@ -37,7 +37,7 @@ import webbrowser
 from collections import Counter, OrderedDict
 from concurrent.futures import Future
 from contextlib import asynccontextmanager, contextmanager, nullcontext, suppress
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from enum import Enum
 from pathlib import Path
 from queue import Empty, Queue
@@ -16541,6 +16541,43 @@ def _run_generation_dispatched(
     ).result()
 
 
+def _couple_draft_sampler_to_greedy_target(
+    draft_sampler: Any,
+    *,
+    explicit_draft_sampler: bool,
+    target_temperature: float | None,
+    request_observability: dict[str, Any] | None = None,
+) -> Any:
+    """Force greedy drafts when the target samples greedily.
+
+    Greedy target + sampled draft collapses acceptance to "did the sampled
+    draft hit argmax" (measured [79/65/42]% by depth on the 27B vs
+    [91/83/67]% at temp 0.6 — 2026-08-05 showdown receipts). A greedy
+    target's OUTPUT is draft-independent, so coupling the draft to greedy
+    only raises acceptance; it cannot change generated text. An explicitly
+    provided draft sampler is always respected. Env off-switch:
+    MTPLX_GREEDY_DRAFT_COUPLING=off.
+    """
+    if (
+        explicit_draft_sampler
+        or draft_sampler is None
+        or target_temperature is None
+        or float(target_temperature) > 0.0
+        or float(getattr(draft_sampler, "temperature", 0.0)) <= 0.0
+    ):
+        return draft_sampler
+    if str(os.environ.get("MTPLX_GREEDY_DRAFT_COUPLING", "on")).strip().lower() in (
+        "off",
+        "0",
+        "false",
+        "no",
+    ):
+        return draft_sampler
+    if request_observability is not None:
+        request_observability["draft_sampler_greedy_coupled"] = True
+    return replace(draft_sampler, temperature=0.0)
+
+
 def _run_generation(
     state: ServerState,
     prompt_ids: list[int],
@@ -16596,7 +16633,12 @@ def _run_generation(
         prompt_ids=prompt_ids,
         request_observability=request_observability,
     )
-    effective_draft_sampler = draft_sampler if draft_sampler is not None else state.draft_sampler
+    effective_draft_sampler = _couple_draft_sampler_to_greedy_target(
+        draft_sampler if draft_sampler is not None else state.draft_sampler,
+        explicit_draft_sampler=draft_sampler is not None,
+        target_temperature=temperature,
+        request_observability=request_observability,
+    )
     effective_mode = _normalize_generation_mode(
         generation_mode,
         default=getattr(state.args, "generation_mode", "mtp"),
