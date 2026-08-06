@@ -69,6 +69,9 @@ setup, run:
 mtplx doctor android-studio --port 8008
 ```
 
-Use `--no-stats-footer` for Open WebUI, Claude Code, OpenCode, and other
-clients that treat assistant content as the only user-visible answer. Metrics
+Since 2.5.3 the stats footer only appears on MTPLX-owned surfaces (the app
+and the built-in browser chat); API clients such as Open WebUI, Claude Code,
+and OpenCode never receive it, so no flag is needed for them.
+`--no-stats-footer` still turns it off everywhere, and
+`MTPLX_STATS_FOOTER_SCOPE=all` restores the pre-2.5.3 behavior. Metrics
 remain available at `/metrics`.
