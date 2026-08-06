@@ -32,6 +32,7 @@ import sys
 import time
 import urllib.parse
 import uuid
+import weakref
 import webbrowser
 from collections import Counter, OrderedDict
 from concurrent.futures import Future
@@ -78,6 +79,7 @@ from mtplx.backends.descriptors import (
 )
 from mtplx.backends.registry import load_runtime_contract
 from mtplx.batching import BatchSchedulerConfig, SchedulerMode, SchedulerPreset
+from mtplx.chat_encode_cache import GLOBAL_CHAT_ENCODE_CACHE, ChatEncodeCache
 from mtplx.chat_encoding import encode_chat_messages, is_gemma4_tokenizer
 from mtplx.constrained import (
     ResponseFormatError,
@@ -10406,7 +10408,129 @@ def _encode_generation_compatible_tool_history(
     return _encode_rendered_chat_text_segmented(tokenizer, rendered, boundaries)
 
 
+_CHAT_ENCODE_TOKENIZER_IDS: "weakref.WeakKeyDictionary[Any, str]" = (
+    weakref.WeakKeyDictionary()
+)
+_CHAT_ENCODE_TOKENIZER_IDS_LOCK = threading.Lock()
+
+
+def _chat_encode_tokenizer_key(tokenizer: Any) -> str | None:
+    """Identity component of the encode-cache key.
+
+    Two parts, both required for correctness:
+    - a per-INSTANCE uuid (weakref registry): two tokenizers with identical
+      templates but different vocabs must never share entries;
+    - the current template hash, computed EVERY call: template swaps on a
+      live tokenizer (chat_template_profile application) must change the key
+      immediately — no memoized value to go stale.
+    Returns None (→ caller skips caching) for non-weakref-able tokenizers.
+    """
+    try:
+        with _CHAT_ENCODE_TOKENIZER_IDS_LOCK:
+            uid = _CHAT_ENCODE_TOKENIZER_IDS.get(tokenizer)
+            if uid is None:
+                uid = uuid.uuid4().hex[:12]
+                _CHAT_ENCODE_TOKENIZER_IDS[tokenizer] = uid
+    except TypeError:
+        return None
+    template = getattr(tokenizer, "chat_template", None) or ""
+    tmpl_sha = hashlib.sha256(
+        str(template).encode("utf-8", errors="surrogatepass")
+    ).hexdigest()[:16]
+    return f"{type(tokenizer).__name__}:{uid}:{tmpl_sha}"
+
+
 def _encode_messages(
+    tokenizer: Any,
+    messages: list[ChatMessage],
+    *,
+    enable_thinking: bool,
+    reasoning_effort: str | None = None,
+    strip_assistant_reasoning_history: bool = False,
+    scoped_reasoning_history: bool = False,
+    add_generation_prompt: bool = True,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: Any = None,
+    tool_prompt_mode: str = _TOOL_PROMPT_MODE_HYBRID,
+    template_observability: dict[str, Any] | None = None,
+) -> list[int]:
+    """Memoizing front for :func:`_encode_messages_uncached`.
+
+    Exact-match only: the key covers every argument that affects the rendered
+    prompt, so a hit is byte-identical by construction. Agent clients resend
+    the full transcript every turn — without this, the whole Jinja render +
+    BPE tokenize re-runs per request and lands in TTFT.
+    """
+    if not GLOBAL_CHAT_ENCODE_CACHE.enabled():
+        return _encode_messages_uncached(
+            tokenizer,
+            messages,
+            enable_thinking=enable_thinking,
+            reasoning_effort=reasoning_effort,
+            strip_assistant_reasoning_history=strip_assistant_reasoning_history,
+            scoped_reasoning_history=scoped_reasoning_history,
+            add_generation_prompt=add_generation_prompt,
+            tools=tools,
+            tool_choice=tool_choice,
+            tool_prompt_mode=tool_prompt_mode,
+            template_observability=template_observability,
+        )
+    try:
+        tokenizer_key = _chat_encode_tokenizer_key(tokenizer)
+        if tokenizer_key is None:
+            key = None
+        else:
+            payload = {
+                "messages": [
+                    m.model_dump(exclude_none=True) if hasattr(m, "model_dump") else m
+                    for m in messages
+                ],
+                "enable_thinking": bool(enable_thinking),
+                "reasoning_effort": reasoning_effort,
+                "strip": bool(strip_assistant_reasoning_history),
+                "scoped": bool(scoped_reasoning_history),
+                "gen_prompt": bool(add_generation_prompt),
+                "tools": tools,
+                "tool_choice": tool_choice,
+                "tool_prompt_mode": tool_prompt_mode,
+            }
+            key = ChatEncodeCache.make_key(
+                tokenizer_key=tokenizer_key,
+                payload=payload,
+            )
+    except Exception:
+        key = None
+    if key is not None:
+        cached = GLOBAL_CHAT_ENCODE_CACHE.get(key)
+        if cached is not None:
+            ids, stored_observability = cached
+            if template_observability is not None:
+                template_observability.update(stored_observability)
+                template_observability["chat_encode_cache"] = "hit"
+            return ids
+    fresh_observability: dict[str, Any] = {}
+    ids = _encode_messages_uncached(
+        tokenizer,
+        messages,
+        enable_thinking=enable_thinking,
+        reasoning_effort=reasoning_effort,
+        strip_assistant_reasoning_history=strip_assistant_reasoning_history,
+        scoped_reasoning_history=scoped_reasoning_history,
+        add_generation_prompt=add_generation_prompt,
+        tools=tools,
+        tool_choice=tool_choice,
+        tool_prompt_mode=tool_prompt_mode,
+        template_observability=fresh_observability,
+    )
+    if key is not None:
+        GLOBAL_CHAT_ENCODE_CACHE.put(key, ids, fresh_observability)
+    if template_observability is not None:
+        template_observability.update(fresh_observability)
+        template_observability["chat_encode_cache"] = "miss"
+    return ids
+
+
+def _encode_messages_uncached(
     tokenizer: Any,
     messages: list[ChatMessage],
     *,
@@ -17464,6 +17588,15 @@ def _usage_payload(generated: dict[str, Any]) -> dict[str, Any]:
         # instead of parsing the mtplx_stats extension block.
         usage["prompt_tokens_details"] = {
             "cached_tokens": max(0, min(int(cached), prompt_tokens))
+        }
+    reasoning = stats.get("reasoning_tokens")
+    if reasoning is not None:
+        # OpenAI-standard split so external clients/benchmarks can separate
+        # thinking from visible output instead of guessing from the stream
+        # (external tools were dividing visible tokens by thinking+visible
+        # wall time and under-reading the decoder).
+        usage["completion_tokens_details"] = {
+            "reasoning_tokens": max(0, min(int(reasoning), completion_tokens))
         }
     return usage
 
