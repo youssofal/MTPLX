@@ -152,6 +152,8 @@ def test_chat_request_penalties_reach_generation_when_controls_allowed(monkeypat
 
 
 def test_chat_request_penalties_ignored_without_client_controls(monkeypatch):
+    # Pre-2.5.3 'hints' policy, kept selectable via env.
+    monkeypatch.setenv("MTPLX_CLIENT_CONTROLS_DEFAULT", "hints")
     captured: dict[str, object] = {}
     client = TestClient(create_app(_fake_state()))
     monkeypatch.setattr(openai, "_encode_messages", lambda *_a, **_k: [1, 2, 3])

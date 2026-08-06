@@ -1990,6 +1990,8 @@ def test_chat_generation_mode_request_override_routes_mtp_depth(monkeypatch):
 
 
 def test_chat_request_controls_are_server_owned_without_override(monkeypatch):
+    # Pre-2.5.3 'hints' policy, kept selectable via env.
+    monkeypatch.setenv("MTPLX_CLIENT_CONTROLS_DEFAULT", "hints")
     captured: dict[str, object] = {}
     state = _fake_state()
     state.runtime.tokenizer = CaptureTokenizer()
@@ -2900,6 +2902,9 @@ def test_invalid_generation_mode_returns_400():
 
 
 def test_completion_request_controls_are_server_owned_without_override(monkeypatch):
+    # Pre-2.5.3 'hints' policy, kept selectable via env: server owns controls
+    # unless the caller opts in per-request.
+    monkeypatch.setenv("MTPLX_CLIENT_CONTROLS_DEFAULT", "hints")
     captured: dict[str, object] = {}
     client = TestClient(create_app(_fake_state()))
 
@@ -4489,6 +4494,10 @@ def test_step_reasoning_off_strips_orphan_thinks_close_stream(monkeypatch):
 
 
 def test_settings_reasoning_mode_is_used_by_next_qwen_request(monkeypatch):
+    # Under 'hints' (pre-2.5.3 policy) live settings beat anonymous body
+    # params; under the 2.5.3 'honor' default an explicit body param wins
+    # per-request (covered by the honor-default test below).
+    monkeypatch.setenv("MTPLX_CLIENT_CONTROLS_DEFAULT", "hints")
     captured: dict[str, object] = {}
     state = _fake_state(api_key="mtplx-local")
     state.runtime.tokenizer = CaptureTokenizer()
@@ -4529,6 +4538,43 @@ def test_settings_reasoning_mode_is_used_by_next_qwen_request(monkeypatch):
     assert captured["request_observability"]["client_control_fields_ignored"] == [
         "enable_thinking"
     ]
+
+
+def test_honor_default_applies_anonymous_temperature_and_thinking(monkeypatch):
+    # 2.5.3 default: anonymous clients get OpenAI semantics — explicit body
+    # params apply (issue #241). Managed surfaces stay server-owned (covered
+    # by test_default_keeps_managed_surfaces_server_owned).
+    monkeypatch.delenv("MTPLX_CLIENT_CONTROLS_DEFAULT", raising=False)
+    captured: dict[str, object] = {}
+    state = _fake_state()
+    state.runtime.tokenizer = CaptureTokenizer()
+    client = TestClient(create_app(state))
+
+    def fake_run_generation(_state, _prompt_ids, **kwargs):
+        captured.update(kwargs)
+        return _fake_generation("ok")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+            "max_tokens": 8,
+            "temperature": 0.0,
+            "enable_thinking": False,
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["temperature"] == 0.0
+    _messages, tok_kwargs = state.runtime.tokenizer.calls[0]
+    assert tok_kwargs["enable_thinking"] is False
+    stats = captured["request_observability"]
+    assert stats["client_controls_allowed"] is True
+    assert stats.get("client_control_fields_ignored", []) == []
 
 
 def test_pi_tool_result_empty_template_sentinel_retries_final_answer(monkeypatch):

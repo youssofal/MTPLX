@@ -11354,22 +11354,24 @@ def _app_managed_client_hint(
 def _client_controls_default() -> str:
     """Policy for ANONYMOUS (non-managed) clients' request controls.
 
-    'hints'  — legacy/current default: temperature/top_p/enable_thinking in
-               the body are observability hints unless the caller opts in via
-               X-MTPLX-Allow-Client-Controls. MTPLX launch settings rule.
-    'honor'  — OpenAI-API semantics: explicit body params from anonymous
+    'honor'  — default since 2.5.3: OpenAI-API semantics. Explicit body
+               params (temperature/top_p/enable_thinking) from anonymous
                clients are applied. Managed MTPLX surfaces (app/browser/
                OpenCode hints) are ALWAYS server-owned either way — agent
                lanes keep the curated sampler policy.
+    'hints'  — pre-2.5.3 behavior: anonymous body params are observability
+               hints unless the caller opts in per-request via
+               X-MTPLX-Allow-Client-Controls. MTPLX launch settings rule.
+               Restore with MTPLX_CLIENT_CONTROLS_DEFAULT=hints.
 
-    DEFAULT UNCHANGED ('hints'): flipping generation-policy defaults is a
-    founder decision. 2026-08-05 receipts for that decision: an external
-    benchmarker sent temperature:0, was silently served the 0.6 coding
-    sampler, and published 'MTPLX does not respect temp=0'. Env:
-    MTPLX_CLIENT_CONTROLS_DEFAULT=honor.
+    Why the flip (2026-08-05/06 receipts, issue #241): external tools send
+    temperature:0 expecting OpenAI semantics, were silently served the 0.6
+    coding sampler, and published 'MTPLX does not respect temp=0'. Honoring
+    explicit anonymous params is the API-contract behavior; server ownership
+    remains intact everywhere MTPLX manages the client.
     """
-    value = str(os.environ.get("MTPLX_CLIENT_CONTROLS_DEFAULT", "hints")).strip().lower()
-    return "honor" if value == "honor" else "hints"
+    value = str(os.environ.get("MTPLX_CLIENT_CONTROLS_DEFAULT", "honor")).strip().lower()
+    return "hints" if value == "hints" else "honor"
 
 
 def _client_controls_allowed(
