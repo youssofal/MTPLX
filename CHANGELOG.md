@@ -25,17 +25,15 @@ plus one measured prefill speedup.
   keeps the short grace it always had, so streaming tool-call turns still
   resolve their prefix instead of re-prefilling.
   (`MTPLX_POSTCOMMIT_CROSS_SESSION_YIELD=0` restores the old behavior.)
-- The first response after a warm session restore starts much sooner in
-  turbo. The compiled verifier's first round on a restored cache had to
-  grow and copy the entire restored context before it could run, which put
-  warm time-to-first-token at 365-961ms where the plain path took
-  117-210ms. After a large restore the first round now runs on the eager
-  path and the copy happens one round later, off the first-token clock.
 - Repeat requests skip prompt re-encoding. Rendering and tokenizing a long
   chat transcript costs 77-92ms per request; an exact-match cache now
-  returns it in under a millisecond. Combined with the two fixes above,
+  returns it in under a millisecond. Combined with the yield fix above,
   warm follow-up latency in our gate runs went from a 194-961ms band to a
-  steady 65-74ms.
+  steady 65-74ms, and clean-room warm restores measure 2-3ms server-side.
+  (A related opt-in knob,
+  `MTPLX_COMPILED_VERIFY_POST_RESTORE_EAGER_ROUNDS`, can route the first
+  verify round after a very large restore through the eager path; it ships
+  off by default.)
 - API responses no longer end with the "MTPLX TPS" stats footer. External
   tools counted it as model output, which added ~430ms to their timing
   windows, made token counts disagree with `usage`, and broke output

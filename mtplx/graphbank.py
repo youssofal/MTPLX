@@ -974,17 +974,23 @@ def _compiled_verify_growth_reserve() -> int:
 
 
 def _post_restore_eager_rounds() -> int:
-    """Verify rounds routed eager after a large session-bank restore.
+    """Verify rounds routed eager after a large session-bank restore (opt-in).
 
     A restored cache (clone or bank reference lease) arrives with exact-size
-    KV buffers, so the first compiled-route promotion must ensure_capacity ->
-    mx.concatenate the ENTIRE restored KV per full-attention layer: an
-    O(context-bytes) copy paid synchronously inside the first verify round
-    (measured 2026-08-05: turbo warm TTFT 365-961ms vs sustained/eager
-    117-210ms on the same restore). Live sessions never pay it — demote()
-    hands the padded buffers back, so re-promotion is a capacity no-op.
-    Deferring the first round(s) to eager moves the copy off the TTFT path;
-    the promotion still happens, one round later, mid-stream.
+    KV buffers, so the first compiled-route promotion ensure_capacity ->
+    mx.concatenate's the restored KV per full-attention layer before the
+    round can run. Deferring the first round(s) to eager moves that copy off
+    the TTFT path; promotion happens one round later, mid-stream.
+
+    DEFAULT 0 (off). Clean-room A/B 2026-08-06 (4k restore, fresh server):
+    the promotion copy measured sub-milliseconds at 4k context (the 08-05
+    turbo warm anomaly was dominated by first-shape-in-process compile
+    traces plus postcommit stacking, not the copy), while the deferral's
+    eager->compiled transition introduced one novel verify-shape trace
+    (~100-200ms once per process). Net: no receipt that the deferral helps
+    at agent-scale contexts, one measured cost. The copy grows linearly
+    with restored context (~2 GB at 32k), so the lever may still pay at
+    16k+ restores — enable via env and gate before flipping any default.
     """
 
     raw = os.environ.get(
@@ -994,8 +1000,8 @@ def _post_restore_eager_rounds() -> int:
         try:
             return max(0, int(raw))
         except (TypeError, ValueError):
-            return 1
-    return 1
+            return 0
+    return 0
 
 
 def _post_restore_min_tokens() -> int:

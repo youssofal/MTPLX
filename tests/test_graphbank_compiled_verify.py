@@ -501,7 +501,8 @@ def test_quantized_paged_entries_fall_back(monkeypatch):
     assert cache[0] is quantized  # never promoted, never densified
 
 
-def test_post_restore_warmup_defers_first_round_then_promotes():
+def test_post_restore_warmup_defers_first_round_then_promotes(monkeypatch):
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_POST_RESTORE_EAGER_ROUNDS", "1")
     rt = ToyHybridRuntime()
     bank = CompiledVerifyBank(rt, restored_tokens=4096)
     cache = _prefill(rt, [0, 1, 2])
@@ -518,7 +519,8 @@ def test_post_restore_warmup_defers_first_round_then_promotes():
     assert bank.stats["fallback_calls"] == 1
 
 
-def test_post_restore_warmup_needs_min_restored_tokens():
+def test_post_restore_warmup_needs_min_restored_tokens(monkeypatch):
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_POST_RESTORE_EAGER_ROUNDS", "1")
     rt = ToyHybridRuntime()
     bank = CompiledVerifyBank(rt, restored_tokens=512)  # below the 2048 floor
     cache = _prefill(rt, [0, 1, 2])
@@ -548,8 +550,14 @@ def test_post_restore_warmup_env_rounds_and_kill_switch(monkeypatch):
     assert "post_restore_warmup" not in bank2.stats["fallback_reasons"]
     assert bank2.stats["compiled_calls"] == 1
 
+    # Default (no env) is OFF: the deferral is opt-in pending a 16k+ restore
+    # receipt (see _post_restore_eager_rounds docstring).
+    monkeypatch.delenv("MTPLX_COMPILED_VERIFY_POST_RESTORE_EAGER_ROUNDS", raising=False)
+    assert CompiledVerifyBank(rt2, restored_tokens=100_000)._post_restore_eager_remaining == 0
 
-def test_post_restore_warmup_disabled_under_parity_modes():
+
+def test_post_restore_warmup_disabled_under_parity_modes(monkeypatch):
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_POST_RESTORE_EAGER_ROUNDS", "1")
     rt = ToyHybridRuntime()
     # Parity harnesses must keep full compiled coverage from round 1.
     assert (
