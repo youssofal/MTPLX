@@ -11351,6 +11351,27 @@ def _app_managed_client_hint(
     return None
 
 
+def _client_controls_default() -> str:
+    """Policy for ANONYMOUS (non-managed) clients' request controls.
+
+    'hints'  — legacy/current default: temperature/top_p/enable_thinking in
+               the body are observability hints unless the caller opts in via
+               X-MTPLX-Allow-Client-Controls. MTPLX launch settings rule.
+    'honor'  — OpenAI-API semantics: explicit body params from anonymous
+               clients are applied. Managed MTPLX surfaces (app/browser/
+               OpenCode hints) are ALWAYS server-owned either way — agent
+               lanes keep the curated sampler policy.
+
+    DEFAULT UNCHANGED ('hints'): flipping generation-policy defaults is a
+    founder decision. 2026-08-05 receipts for that decision: an external
+    benchmarker sent temperature:0, was silently served the 0.6 coding
+    sampler, and published 'MTPLX does not respect temp=0'. Env:
+    MTPLX_CLIENT_CONTROLS_DEFAULT=honor.
+    """
+    value = str(os.environ.get("MTPLX_CLIENT_CONTROLS_DEFAULT", "hints")).strip().lower()
+    return "honor" if value == "honor" else "hints"
+
+
 def _client_controls_allowed(
     headers: Mapping[str, str],
     metadata: Mapping[str, Any],
@@ -11363,7 +11384,9 @@ def _client_controls_allowed(
         or metadata.get("allow_client_controls")
         or metadata.get("mtplx_allow_client_controls")
     )
-    return _truthy_control_value(value)
+    if _truthy_control_value(value):
+        return True
+    return _client_controls_default() == "honor"
 
 
 def _ignored_client_control_fields(request: BaseModel) -> list[str]:
