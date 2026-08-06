@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mtplx"
-version = "2.5.2"
+version = "2.5.3"
 description = "Native MTP speculative decoding for Qwen3-Next on Apple Silicon."
 readme = "README.md"
 requires-python = ">=3.11"
