@@ -57,6 +57,34 @@ def test_managed_client_hint_keeps_footer(monkeypatch):
     assert STATS_FOOTER_MARKER in _content(r)
 
 
+def test_managed_agent_clients_get_no_footer(monkeypatch):
+    """opencode/pi/hermes/openwebui are MANAGED but parse assistant content
+    programmatically — the exact consumer class footer scoping protects.
+    Regression for the 2.5.3 pre-ship review F3: the first scoping pass
+    admitted every managed hint, so OpenCode still received the footer."""
+    state = _footer_state()
+    monkeypatch.setattr(openai_mod, "_run_generation", lambda *a, **k: _fake_generation("ok"))
+    client = TestClient(create_app(state))
+    for hint in ("opencode", "pi", "hermes", "openwebui"):
+        r = _post_chat(client, headers={"x-mtplx-client": hint})
+        assert r.status_code == 200
+        assert STATS_FOOTER_MARKER not in _content(r), hint
+    # UA-sniffed OpenCode (no explicit header) must also stay footer-free.
+    r = _post_chat(client, headers={"user-agent": "opencode/1.14.48"})
+    assert r.status_code == 200
+    assert STATS_FOOTER_MARKER not in _content(r)
+
+
+def test_app_ui_hints_keep_footer(monkeypatch):
+    state = _footer_state()
+    monkeypatch.setattr(openai_mod, "_run_generation", lambda *a, **k: _fake_generation("ok"))
+    client = TestClient(create_app(state))
+    for hint in ("mtplx-app", "mtplxapp", "mtplx"):
+        r = _post_chat(client, headers={"x-mtplx-client": hint})
+        assert r.status_code == 200
+        assert STATS_FOOTER_MARKER in _content(r), hint
+
+
 def test_scope_all_env_restores_legacy_behavior(monkeypatch):
     state = _footer_state()
     monkeypatch.setenv("MTPLX_STATS_FOOTER_SCOPE", "all")

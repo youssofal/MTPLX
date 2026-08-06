@@ -23,6 +23,7 @@ import html
 import json
 import threading
 import logging
+import math
 import os
 import re
 import secrets
@@ -10493,6 +10494,13 @@ def _encode_messages(
                 "tools": tools,
                 "tool_choice": tool_choice,
                 "tool_prompt_mode": tool_prompt_mode,
+                # The rendered prompt embeds the current date (tool contract's
+                # _current_date_line; strftime_now-style templates). Without a
+                # date component, an exact repeat across local midnight would
+                # be served yesterday's render until eviction. Day granularity
+                # matches the render's own granularity: at worst the whole
+                # cache turns over once per day, which is the correct outcome.
+                "render_day": time.strftime("%Y-%m-%d"),
             }
             key = ChatEncodeCache.make_key(
                 tokenizer_key=tokenizer_key,
@@ -11372,6 +11380,28 @@ def _client_controls_default() -> str:
     """
     value = str(os.environ.get("MTPLX_CLIENT_CONTROLS_DEFAULT", "honor")).strip().lower()
     return "hints" if value == "hints" else "honor"
+
+
+def _reject_non_finite_sampler_controls(request: BaseModel) -> None:
+    """400 on NaN/Infinity sampler params instead of a deep per-request 500.
+
+    Honored-by-default body params (2.5.3) mean a JSON `NaN` temperature
+    would otherwise reach the softmax and die mid-generation. Only called
+    when controls are actually applied, so hints-mode requests keep their
+    old accept-and-ignore behavior.
+    """
+    for name in ("temperature", "top_p", "presence_penalty", "frequency_penalty"):
+        value = getattr(request, name, None)
+        if value is None:
+            continue
+        try:
+            finite = math.isfinite(float(value))
+        except (TypeError, ValueError):
+            finite = False
+        if not finite:
+            raise HTTPException(
+                status_code=400, detail=f"{name} must be a finite number"
+            )
 
 
 def _client_controls_allowed(
@@ -17636,21 +17666,32 @@ def _decode_timing(stats: dict[str, Any]) -> tuple[float, float]:
     return generated_tokens / decode_elapsed_s, decode_elapsed_s
 
 
+_MTPLX_FOOTER_UI_HINTS = {
+    # Product UI surfaces where a human reads the chat directly. Managed
+    # AGENT clients (opencode, pi, hermes, openwebui) are deliberately NOT
+    # here: they parse assistant content programmatically, which is exactly
+    # the consumer class the footer scoping protects.
+    "chat",
+    "mtplx",
+    "mtplx_app",
+    "mtplxapp",
+}
+
+
 def _stats_footer_allowed(
     state: ServerState,
     headers: Mapping[str, str],
     metadata: Mapping[str, Any],
 ) -> bool:
-    """Visible TPS footer only on MTPLX-owned surfaces.
+    """Visible TPS footer only on MTPLX product UI surfaces.
 
-    The footer is server-injected prose inside `content`. On MTPLX-owned
-    chat surfaces (browser chat, app, terminal chat — identified by the
-    managed client hint) it is a product feature. On the OpenAI/Anthropic
-    compat API it corrupts model output for every downstream consumer:
-    agents parse it as answer text, temp-0 byte-equality breaks (the
-    footer's own tok/s digits differ per run), usage excludes its tokens
-    (wire>usage mismatch), and its flush gap deflates externally measured
-    tok/s. 2026-08-05 receipts: outputs/mlxserve-showdown-20260805.
+    The footer is server-injected prose inside `content`. In the app and
+    browser chat it is a product feature a human reads. Everywhere else —
+    the OpenAI/Anthropic compat API and every agent client, managed or not —
+    it corrupts model output: agents parse it as answer text, temp-0
+    byte-equality breaks (the footer's own tok/s digits differ per run),
+    usage excludes its tokens (wire>usage mismatch), and its flush gap
+    deflates externally measured tok/s.
 
     MTPLX_STATS_FOOTER_SCOPE=all restores the old always-on behavior.
     """
@@ -17659,7 +17700,10 @@ def _stats_footer_allowed(
     scope = str(os.environ.get("MTPLX_STATS_FOOTER_SCOPE", "owned")).strip().lower()
     if scope == "all":
         return True
-    return _app_managed_client_hint(headers, metadata) is not None
+    hint = _app_managed_client_hint(headers, metadata)
+    if hint is None:
+        return False
+    return hint in _MTPLX_FOOTER_UI_HINTS or hint.startswith("mtplx_")
 
 
 def _stats_footer_text(state: ServerState, generated: dict[str, Any]) -> str:
@@ -22582,6 +22626,8 @@ def create_app(state: ServerState) -> FastAPI:
         request_observability["request_commit_prompt_prefix"] = bool(
             commit_prompt_prefix
         )
+        if client_controls_allowed:
+            _reject_non_finite_sampler_controls(request)
         sampler_temperature = request.temperature if client_controls_allowed else None
         sampler_top_p = request.top_p if client_controls_allowed else None
         sampler_top_k = request.top_k if client_controls_allowed else None
@@ -25844,6 +25890,19 @@ def create_app(state: ServerState) -> FastAPI:
             # surface as a 500 with a Python exception string — external
             # endpoint-discovery probes printed it as "python errors".
             raise HTTPException(status_code=400, detail="prompt must not be empty")
+        # Same admission-time yield as chat: a completions request holds no
+        # session, so every pending idle commit is a stranger's — none can
+        # help this request and any can stall it.
+        _completions_sweep = getattr(
+            getattr(state, "sessions", None),
+            "abort_cross_session_postcommits",
+            None,
+        )
+        if _completions_sweep is not None and _postcommit_cross_session_yield_enabled():
+            try:
+                await asyncio.to_thread(_completions_sweep, except_session_id=None)
+            except Exception:
+                pass
         request_generation_mode = _request_generation_mode_for_generation(
             state,
             request,
@@ -25861,6 +25920,8 @@ def create_app(state: ServerState) -> FastAPI:
             request_depth=request_depth,
             prompt_tokens=len(prompt_ids),
         )
+        if client_controls_allowed:
+            _reject_non_finite_sampler_controls(request)
         sampler_temperature = request.temperature if client_controls_allowed else None
         sampler_top_p = request.top_p if client_controls_allowed else None
         sampler_top_k = request.top_k if client_controls_allowed else None

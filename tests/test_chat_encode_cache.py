@@ -95,8 +95,6 @@ def test_template_change_invalidates(monkeypatch):
     # simulate a template swap (startup profile application does this);
     # the per-tokenizer memoized key must not leak across templates
     tok.chat_template = "{{ messages }}v2"
-    if hasattr(tok, "_mtplx_encode_cache_key"):
-        delattr(tok, "_mtplx_encode_cache_key")
     _encode_messages(tok, _messages(), enable_thinking=True)
     assert server.GLOBAL_CHAT_ENCODE_CACHE.stats()["misses"] == 2
 
@@ -121,3 +119,26 @@ def test_lru_bound(monkeypatch):
             enable_thinking=True,
         )
     assert cache.stats()["entries"] == 2
+
+
+def test_render_day_is_part_of_the_key(monkeypatch):
+    """The rendered prompt embeds the current date (tool contract's date
+    line, strftime_now templates). An exact repeat across local midnight
+    must MISS and re-render — regression for the 2.5.3 pre-ship review F2
+    (day-1 token ids were served on day 2 until eviction)."""
+    cache = _fresh_cache(monkeypatch)
+    tok = CountingTokenizer()
+    _encode_messages(tok, _messages(), enable_thinking=True)
+    _encode_messages(tok, _messages(), enable_thinking=True)
+    assert cache.stats() == {"entries": 1, "hits": 1, "misses": 1}
+
+    real_strftime = server.time.strftime
+
+    def next_day(fmt, *args):
+        if fmt == "%Y-%m-%d" and not args:
+            return "2099-01-02"
+        return real_strftime(fmt, *args)
+
+    monkeypatch.setattr(server.time, "strftime", next_day)
+    _encode_messages(tok, _messages(), enable_thinking=True)
+    assert cache.stats()["misses"] == 2  # midnight rollover re-rendered

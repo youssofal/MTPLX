@@ -696,7 +696,7 @@ def _prefill_chunk_size() -> int:
     if raw == "auto":
         layout = _sustained_prefill_layout()
         if layout == "contiguous_dense_decode":
-            return max(1, _env_int("MTPLX_PREFILL_CHUNK_SIZE_DENSE", 4096))
+            return max(1, _env_int("MTPLX_PREFILL_CHUNK_SIZE_DENSE", 2048))
         return max(1, _env_int("MTPLX_PREFILL_CHUNK_SIZE_REPAGE", 2048))
     try:
         return max(1, int(raw))

@@ -87,3 +87,23 @@ def test_debug_env_restores_detail(monkeypatch):
     )
     assert r.status_code == 500
     assert "RuntimeError" in r.text
+
+
+def test_non_finite_sampler_controls_get_400():
+    """Honored-by-default controls (2.5.3): a JSON NaN temperature must be
+    a clean 400 at the boundary, not a 500 from the softmax mid-request."""
+    client = _client(_generation_ready_state())
+    for field in ("temperature", "top_p", "presence_penalty", "frequency_penalty"):
+        r = client.post(
+            "/v1/chat/completions",
+            headers={
+                "x-mtplx-cache-mode": "bypass",
+                "content-type": "application/json",
+            },
+            content=(
+                '{"messages":[{"role":"user","content":"hi"}],'
+                f'"max_tokens":4,"{field}":NaN}}'
+            ),
+        )
+        assert r.status_code == 400, (field, r.status_code, r.text[:200])
+        assert "finite" in r.text
