@@ -204,17 +204,9 @@ SUSTAINED_PREFILL_ENV = {
     "MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT": "131072",
     # MTPLX_PREFILL_CHUNK_SIZE is retained as a legacy single-knob fallback:
     # if set to a numeric value it overrides BOTH paths. "auto" resolves to
-    # the per-layout defaults below.
-    # DENSE 4096 over the old 2048: measured 2026-08-05 temp-gated on M5 Max,
-    # +41-58% prefill at an 8k prompt (675-772 vs 478-490 tok/s) and +33-38%
-    # at 32k (TTFT 76s -> 56s); 8192 loses to 4096 at both rungs. The earlier
-    # 2026-05-11 "2048 wins" verdict predates die-temp-gated benching.
-    # REPAGE stays 2048: the >128k repage lane measured +14.3 GB peak (+38%)
-    # at 4096 (tools/bench/prefill-chunk-split-128k-2026-05-09.md) — a memory
-    # pillar regression on 96 GB and smaller Macs. Chunking is layout-only on
-    # the prefill path and both knobs stay user-overridable.
+    # the per-layout defaults below, which intentionally match in product mode.
     "MTPLX_PREFILL_CHUNK_SIZE": "auto",
-    "MTPLX_PREFILL_CHUNK_SIZE_DENSE": "4096",
+    "MTPLX_PREFILL_CHUNK_SIZE_DENSE": "2048",
     "MTPLX_PREFILL_CHUNK_SIZE_REPAGE": "2048",
     "MTPLX_PREFILL_CHUNK_CACHE_CLEANUP": "1",
     "MTPLX_PREFILL_CHUNK_CACHE_CLEANUP_EVERY": "auto",
