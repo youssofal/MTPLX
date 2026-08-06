@@ -25747,6 +25747,11 @@ def create_app(state: ServerState) -> FastAPI:
         metadata = raw_metadata if isinstance(raw_metadata, Mapping) else {}
         client_controls_allowed = _client_controls_allowed(headers, metadata)
         prompt_ids = _encode_prompt(state.runtime.tokenizer, request.prompt)
+        if not prompt_ids:
+            # An empty body used to fall through into generation machinery and
+            # surface as a 500 with a Python exception string — external
+            # endpoint-discovery probes printed it as "python errors".
+            raise HTTPException(status_code=400, detail="prompt must not be empty")
         request_generation_mode = _request_generation_mode_for_generation(
             state,
             request,
@@ -26218,15 +26223,35 @@ def create_app(state: ServerState) -> FastAPI:
         )
 
     @app.exception_handler(Exception)
-    async def unhandled_exception(_request: Request, exc: Exception) -> JSONResponse:
+    async def unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
         _record_tool_parse_event(state, event="openai_error_response")
         request_id = uuid.uuid4().hex[:12]
+        # Full detail belongs in the server log, not the wire: exception
+        # class + repr in client bodies got quoted verbatim by external
+        # endpoint probes as "MTPLX python errors" (2026-08-05 showdown).
+        logging.getLogger("mtplx.server").exception(
+            "unhandled server error request_id=%s path=%s: %s",
+            request_id,
+            getattr(getattr(request, "url", None), "path", "?"),
+            exc,
+        )
+        if str(os.environ.get("MTPLX_DEBUG_ERRORS", "")).strip().lower() in (
+            "1",
+            "true",
+            "on",
+        ):
+            message = f"{type(exc).__name__}: {exc} (request_id={request_id})"
+        else:
+            message = (
+                "internal server error; see the MTPLX server log "
+                f"(request_id={request_id})"
+            )
         return JSONResponse(
             status_code=500,
             content=_openai_error_content(
-                f"{type(exc).__name__}: {exc} (request_id={request_id})",
+                message,
                 status_code=500,
-                code=type(exc).__name__,
+                code="internal_error",
             ),
         )
 
