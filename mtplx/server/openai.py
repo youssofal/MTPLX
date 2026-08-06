@@ -15540,6 +15540,22 @@ _IDLE_POSTCOMMIT_MAX_WAIT_S = 30.0
 _IDLE_POSTCOMMIT_POLL_INTERVAL_S = 0.25
 
 
+def _postcommit_cross_session_yield_enabled() -> bool:
+    """Abort OTHER sessions' pending idle postcommits at request admission.
+
+    The foreground grace below is a same-session bargain (wait <=grace for
+    a commit that saves THIS session a 2-4k salvage re-prefill). It was
+    silently taxing cross-session traffic too — a stranger's request paid
+    the commit's remaining runtime in TTFT plus its bandwidth residue in
+    decode (2026-08-05 showdown receipts). Default on; set
+    MTPLX_POSTCOMMIT_CROSS_SESSION_YIELD=0 to restore the old behavior.
+    """
+    raw = str(
+        os.environ.get("MTPLX_POSTCOMMIT_CROSS_SESSION_YIELD", "1")
+    ).strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
 def _idle_postcommit_foreground_grace_s() -> float:
     """Bounded window during which a running postcommit finishes despite a
     queued foreground request.
@@ -22932,6 +22948,38 @@ def create_app(state: ServerState) -> FastAPI:
         # the session lock is acquired. Set MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S
         # explicitly to restore the blocking wait.
         postcommit_wait_outcome: dict[str, Any] | None = None
+        _cross_session_sweep = getattr(
+            getattr(state, "sessions", None),
+            "abort_cross_session_postcommits",
+            None,
+        )
+        if _cross_session_sweep is not None and _postcommit_cross_session_yield_enabled():
+            # A foreign session's idle commit cannot help THIS request —
+            # only the same-session grace below has a payoff. Abort all
+            # cross-session pending commits so this request never pays a
+            # stranger's 0.5-3.5GB retokenized_history job (2026-08-05
+            # showdown: tight-cadence multi-session traffic lost 30-50%
+            # decode + the job's runtime in TTFT to exactly this).
+            cross_yield = await asyncio.to_thread(
+                _cross_session_sweep,
+                except_session_id=session_id,
+            )
+            if cross_yield is not None:
+                request_observability["postcommit_cross_session_yield"] = (
+                    cross_yield
+                )
+                if not _server_console_enabled(state):
+                    try:
+                        _safe_stdout_print(
+                            "[mtplx] postcommit cross-session yield "
+                            + json.dumps(
+                                {"admitting_session_id": session_id, **cross_yield},
+                                sort_keys=True,
+                                default=str,
+                            )
+                        )
+                    except BaseException:
+                        pass
         if session is not None:
             postcommit_wait_outcome = await asyncio.to_thread(
                 session.resolve_pending_postcommit_for_request

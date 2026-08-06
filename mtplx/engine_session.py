@@ -1262,6 +1262,47 @@ class EngineSessionManager:
         with self._lock:
             return list(self._sessions.values())
 
+    def abort_cross_session_postcommits(
+        self,
+        *,
+        except_session_id: str | None,
+        reason: str = "cross_session_foreground_preempted",
+    ) -> dict[str, Any] | None:
+        """Abort every OTHER session's pending idle postcommit.
+
+        The idle postcommit's foreground grace exists so a SAME-session
+        follow-up request can profit from the commit it is waiting on
+        (agent tool loops: losing that commit costs a 2-4k block-salvage
+        re-prefill). A request from a DIFFERENT session gains nothing from
+        someone else's commit — it just pays the commit's runtime and its
+        memory-bandwidth residue (2026-08-05 showdown receipts: 0.5-3.5GB
+        retokenized_history jobs finishing inside the 2s grace taxed the
+        next request's TTFT by the job's remaining runtime and degraded
+        its decode ~30-50% at <2s cadence). Called at request admission,
+        off the scheduler-owner thread. Best-effort: a job past its last
+        abort check still completes; that window is a few hundred ms.
+        """
+        aborted: list[str] = []
+        for other in self._sessions_snapshot():
+            session_id = getattr(other, "session_id", None)
+            if except_session_id is not None and session_id == except_session_id:
+                continue
+            try:
+                if not other.has_pending_postcommit():
+                    continue
+                outcome = other.abort_pending_postcommit(reason)
+                if outcome.get("aborted"):
+                    aborted.append(str(session_id))
+            except BaseException:
+                continue
+        if not aborted:
+            return None
+        return {
+            "count": len(aborted),
+            "sessions": aborted[:8],
+            "reason": reason,
+        }
+
     @contextmanager
     def generation_slot(
         self,
