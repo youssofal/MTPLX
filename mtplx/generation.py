@@ -696,7 +696,7 @@ def _prefill_chunk_size() -> int:
     if raw == "auto":
         layout = _sustained_prefill_layout()
         if layout == "contiguous_dense_decode":
-            return max(1, _env_int("MTPLX_PREFILL_CHUNK_SIZE_DENSE", 2048))
+            return max(1, _env_int("MTPLX_PREFILL_CHUNK_SIZE_DENSE", 4096))
         return max(1, _env_int("MTPLX_PREFILL_CHUNK_SIZE_REPAGE", 2048))
     try:
         return max(1, int(raw))
@@ -6366,6 +6366,11 @@ def generate_mtpk(
             capture_backend=verify_core_backend,
             parity=_compiled_verify_mode == "parity",
             parity2=_compiled_verify_mode == "parity2",
+            # Warm restores hand this generation exact-size KV buffers; the
+            # bank defers its first round(s) to eager so the O(context)
+            # promotion copy lands after TTFT, not inside it. cached_tokens
+            # is 0 on cold prompts and the restored prefix length on hits.
+            restored_tokens=int(getattr(prompt_state, "cached_tokens", 0) or 0),
         )
         if _compiled_verify_mode != "off"
         and (

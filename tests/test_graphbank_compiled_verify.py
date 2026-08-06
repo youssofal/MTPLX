@@ -501,6 +501,71 @@ def test_quantized_paged_entries_fall_back(monkeypatch):
     assert cache[0] is quantized  # never promoted, never densified
 
 
+def test_post_restore_warmup_defers_first_round_then_promotes():
+    rt = ToyHybridRuntime()
+    bank = CompiledVerifyBank(rt, restored_tokens=4096)
+    cache = _prefill(rt, [0, 1, 2])
+
+    bank.forward_ar_capture(mx.array([VERIFY_WINDOWS[0]]), cache=cache)
+    assert bank.stats["fallback_reasons"]["post_restore_warmup"] == 1
+    assert bank.stats["compiled_calls"] == 0
+    # The deferred round must leave the cache unpromoted: the whole point is
+    # skipping the O(context) ensure_capacity copy on the TTFT round.
+    assert bank.stats["promoted"] == 0
+
+    bank.forward_ar_capture(mx.array([VERIFY_WINDOWS[1]]), cache=cache)
+    assert bank.stats["compiled_calls"] == 1
+    assert bank.stats["fallback_calls"] == 1
+
+
+def test_post_restore_warmup_needs_min_restored_tokens():
+    rt = ToyHybridRuntime()
+    bank = CompiledVerifyBank(rt, restored_tokens=512)  # below the 2048 floor
+    cache = _prefill(rt, [0, 1, 2])
+
+    bank.forward_ar_capture(mx.array([VERIFY_WINDOWS[0]]), cache=cache)
+    assert "post_restore_warmup" not in bank.stats["fallback_reasons"]
+    assert bank.stats["compiled_calls"] == 1
+
+
+def test_post_restore_warmup_env_rounds_and_kill_switch(monkeypatch):
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_POST_RESTORE_EAGER_ROUNDS", "2")
+    rt = ToyHybridRuntime()
+    bank = CompiledVerifyBank(rt, restored_tokens=100_000)
+    cache = _prefill(rt, [0, 1, 2])
+    for window in VERIFY_WINDOWS[:2]:
+        bank.forward_ar_capture(mx.array([window]), cache=cache)
+    assert bank.stats["fallback_reasons"]["post_restore_warmup"] == 2
+    assert bank.stats["compiled_calls"] == 0
+    bank.forward_ar_capture(mx.array([VERIFY_WINDOWS[2]]), cache=cache)
+    assert bank.stats["compiled_calls"] == 1
+
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_POST_RESTORE_EAGER_ROUNDS", "0")
+    rt2 = ToyHybridRuntime()
+    bank2 = CompiledVerifyBank(rt2, restored_tokens=100_000)
+    cache2 = _prefill(rt2, [0, 1, 2])
+    bank2.forward_ar_capture(mx.array([VERIFY_WINDOWS[0]]), cache=cache2)
+    assert "post_restore_warmup" not in bank2.stats["fallback_reasons"]
+    assert bank2.stats["compiled_calls"] == 1
+
+
+def test_post_restore_warmup_disabled_under_parity_modes():
+    rt = ToyHybridRuntime()
+    # Parity harnesses must keep full compiled coverage from round 1.
+    assert (
+        CompiledVerifyBank(
+            rt, parity=True, restored_tokens=100_000
+        )._post_restore_eager_remaining
+        == 0
+    )
+    assert (
+        CompiledVerifyBank(
+            rt, parity2=True, restored_tokens=100_000
+        )._post_restore_eager_remaining
+        == 0
+    )
+
+
 def test_permanent_eager_after_three_repeated_failures():
     rt = ToyHybridRuntime()
     bank = CompiledVerifyBank(rt)

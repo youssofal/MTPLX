@@ -973,6 +973,50 @@ def _compiled_verify_growth_reserve() -> int:
         return 512
 
 
+def _post_restore_eager_rounds() -> int:
+    """Verify rounds routed eager after a large session-bank restore.
+
+    A restored cache (clone or bank reference lease) arrives with exact-size
+    KV buffers, so the first compiled-route promotion must ensure_capacity ->
+    mx.concatenate the ENTIRE restored KV per full-attention layer: an
+    O(context-bytes) copy paid synchronously inside the first verify round
+    (measured 2026-08-05: turbo warm TTFT 365-961ms vs sustained/eager
+    117-210ms on the same restore). Live sessions never pay it — demote()
+    hands the padded buffers back, so re-promotion is a capacity no-op.
+    Deferring the first round(s) to eager moves the copy off the TTFT path;
+    the promotion still happens, one round later, mid-stream.
+    """
+
+    raw = os.environ.get(
+        "MTPLX_COMPILED_VERIFY_POST_RESTORE_EAGER_ROUNDS", ""
+    ).strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 1
+    return 1
+
+
+def _post_restore_min_tokens() -> int:
+    """Restored-prefix size below which the post-restore deferral stays off.
+
+    Small restores copy little (a 512-token prefix is ~tens of MB across the
+    full-attention layers); the deferral only earns its round for mid/long
+    contexts where the concatenate cost is user-visible.
+    """
+
+    raw = os.environ.get(
+        "MTPLX_COMPILED_VERIFY_POST_RESTORE_MIN_TOKENS", ""
+    ).strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 2048
+    return 2048
+
+
 def _runtime_trunk_quant_bits(runtime: Any) -> int | None:
     """Bits of the first quantized trunk projection, or None if unquantized.
 
@@ -1108,6 +1152,7 @@ class CompiledVerifyBank:
         capture_backend: str | None = None,
         parity: bool = False,
         parity2: bool = False,
+        restored_tokens: int = 0,
     ) -> None:
         self.runtime = runtime
         if max_verify_len is None:
@@ -1176,6 +1221,19 @@ class CompiledVerifyBank:
         # callers without a request budget retain the legacy env reserve.
         self._growth_demoted = False
         self._dense_capacity_grant: dict[int, int] | None = None
+        # Post-restore warmup: a session-bank restore hands this generation
+        # exact-size KV buffers, so the first promotion concatenate-copies the
+        # whole restored context (see _post_restore_eager_rounds). Parity
+        # modes keep full compiled coverage for the exactness harnesses.
+        self._post_restore_eager_remaining = (
+            _post_restore_eager_rounds()
+            if (
+                int(restored_tokens or 0) >= _post_restore_min_tokens()
+                and not parity
+                and not parity2
+            )
+            else 0
+        )
         self.stats: dict[str, Any] = {
             "calls": 0,
             "compiled_calls": 0,
@@ -1435,7 +1493,9 @@ class CompiledVerifyBank:
         if self.permanent_eager:
             report["skipped"].append("permanent_eager")
             return _finish()
-        reason = self._fallback_reason(input_ids, cache, True)
+        reason = self._fallback_reason(
+            input_ids, cache, True, consume_post_restore=False
+        )
         if reason is not None:
             report["skipped"].append(reason)
             return _finish()
@@ -1621,7 +1681,14 @@ class CompiledVerifyBank:
 
     # -- dispatch preconditions ----------------------------------------------
 
-    def _fallback_reason(self, input_ids, cache, return_hidden: bool) -> str | None:
+    def _fallback_reason(
+        self,
+        input_ids,
+        cache,
+        return_hidden: bool,
+        *,
+        consume_post_restore: bool = True,
+    ) -> str | None:
         if self.permanent_eager:
             return "permanent_eager"
         if not return_hidden:
@@ -1648,6 +1715,15 @@ class CompiledVerifyBank:
             # Cache was demoted back to stock entries when the growth budget
             # tripped; the plain eager path owns the rest of this request.
             return "growth_budget_exhausted"
+        if self._post_restore_eager_remaining > 0:
+            # Keep the restored cache unpromoted for the first round(s) so the
+            # O(context) ensure_capacity copy lands after the first token is
+            # already on the wire, not inside warm TTFT. Non-consuming probes
+            # (prewarm eligibility) must not tick the counter — and must still
+            # skip, or the probe itself would promote and pay the copy.
+            if consume_post_restore:
+                self._post_restore_eager_remaining -= 1
+            return "post_restore_warmup"
         promoted, failures = promote_kv_cache_offsets(
             cache,
             reserve_tokens=length,
