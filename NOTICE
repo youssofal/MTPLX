@@ -24,3 +24,15 @@ licensed under the Apache License 2.0. See mtplx/nax_verify.py for details.
 This product includes the Apache-2.0 licensed MLX implementation for
 Laguna-S-2.1 from PipeNetwork, Copyright 2026 PipeNetwork, under
 mtplx/models/laguna.py.
+
+This product includes a Metal matvec kernel (escha_qmv) ported from
+dusterbloom/higgs's ESCHA_QMV_KERNEL, courtesy of dusterbloom
+(https://github.com/dusterbloom/higgs, also https://dusterbloom.github.io/).
+See mtplx/eschamoe.py for details.
+
+This product's int8 non-expert matvec (mtplx/int8_linear.py) adapts the
+threadgroup tiling of the fast_qmv kernel from dusterbloom/higgs
+(https://github.com/dusterbloom/higgs,
+crates/higgs-models/src/metal_kernel.rs), retargeted from 1-bit affine packing
+to per-output-channel-symmetric int8; the Int8Linear wrapper and loader wiring
+are original. See mtplx/int8_linear.py for the borrowed-vs-changed breakdown.

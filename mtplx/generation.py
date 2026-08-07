@@ -4984,6 +4984,100 @@ def _append_mtp_history(
     return time.perf_counter() - started
 
 
+def _ar_async_pipeline_enabled() -> bool:
+    """Opt-in gate for the async-eval single-stream AR decode pipeline.
+
+    Default OFF (fail-closed): the synchronous per-token loop stays
+    byte-identical to what shipped.  Set ``MTPLX_AR_ASYNC_PIPELINE`` truthy to
+    engage the ``generate_step``-style pipeline (host graph-encode of step N+1
+    overlaps GPU compute of step N) for the greedy, guard-free serving path.
+    """
+    return _env_truthy("MTPLX_AR_ASYNC_PIPELINE")
+
+
+def _ar_sampler_is_greedy(sampler: SamplerConfig) -> bool:
+    """True iff the sampler reduces to pure greedy argmax with no host penalties.
+
+    The async pipeline keeps the token-feedback loop ON DEVICE (argmax) so it is
+    bit-identical to the synchronous greedy path ONLY when sampling is argmax
+    with no presence/frequency penalty — those need host-side token counts,
+    which would reintroduce the per-step host->device dependency the pipeline
+    exists to remove.
+    """
+    return (
+        float(sampler.temperature) <= 0.0
+        and float(sampler.presence_penalty or 0.0) == 0.0
+        and float(sampler.frequency_penalty or 0.0) == 0.0
+    )
+
+
+def _run_greedy_ar_async(
+    rt: MTPLXRuntime,
+    cache: Any,
+    logits: mx.array,
+    *,
+    max_tokens: int,
+    stop_token_ids: set[int],
+    on_token: Callable[[int, int], None],
+) -> tuple[int, float, float, float]:
+    """Async-eval-pipelined greedy single-stream AR decode over ``rt.forward_ar``.
+
+    Mirrors mlx-lm ``generate_step``: each step's forward + on-device argmax are
+    built and handed to :func:`mx.async_eval` BEFORE the current token is
+    materialized with ``.item()``, so the host graph-encode of step N+1 overlaps
+    the GPU compute of step N — the ~21% batch=1 host-encode gap the synchronous
+    per-token loop leaves on the table.  ``async_eval`` changes ONLY *when* the
+    host blocks, never the values, so the committed token sequence is
+    bit-identical to the synchronous greedy argmax loop.
+
+    ``logits`` is the ``[1, V]`` last-position logits from prefill.  ``on_token``
+    is called ``(step, token)`` for every committed token so the caller keeps its
+    emit/trace/events bookkeeping.  Returns
+    ``(verify_calls, decode_time_s, forward_graph_time_s, eval_time_s)``.
+    """
+    verify_calls = 0
+    forward_graph_s = 0.0
+    eval_s = 0.0
+    decode_started = time.perf_counter()
+
+    # First token from the prefill logits: on-device argmax, bit-identical to the
+    # synchronous greedy ``int(mx.argmax(logits[0], -1).item())`` (argmax over the
+    # same [V] values yields the same index).
+    y = mx.argmax(logits, axis=-1)  # [1]
+    mx.async_eval(y)
+    step = 0
+    next_y: mx.array | None = None
+    while True:
+        # Submit the NEXT step's forward + argmax (kick the GPU) unless this is
+        # the final token.  Doing this BEFORE reading the current token is the
+        # whole point: the host then races ahead (reads this token, builds step
+        # N+2's graph next iteration) while the GPU runs the step just submitted.
+        if step + 1 < max_tokens:
+            fwd_started = time.perf_counter()
+            with attention_phase("ar_decode"):
+                next_logits = rt.forward_ar(
+                    y.reshape(1, 1), cache=cache, return_hidden=False
+                )[:, -1, :]
+            next_y = mx.argmax(next_logits, axis=-1)  # [1]
+            mx.async_eval(next_y)
+            forward_graph_s += time.perf_counter() - fwd_started
+            verify_calls += 1
+        else:
+            next_y = None
+        # Materialize the CURRENT token (the host blocks here, but the GPU is
+        # already busy on the step submitted just above).
+        eval_started = time.perf_counter()
+        token = int(y.item())
+        eval_s += time.perf_counter() - eval_started
+        on_token(step, token)
+        if step + 1 >= max_tokens or _is_stop(token, stop_token_ids):
+            break
+        y = next_y  # type: ignore[assignment]
+        step += 1
+    decode_s = time.perf_counter() - decode_started
+    return verify_calls, decode_s, forward_graph_s, eval_s
+
+
 def generate_ar(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
@@ -5207,6 +5301,130 @@ def generate_ar(
             token_callback([int(token)])
         emit_trace()
 
+    def _finalize() -> GenerationOutput:
+        """Assemble the AR GenerationOutput/stats from the decode accumulators.
+
+        Shared verbatim by the synchronous loop and the async pipeline; both
+        populate the same locals (``tokens``, ``events``, ``verify_calls``,
+        ``target_*_time``, ``repetition_result``), so the stats are identical.
+        """
+        elapsed = time.perf_counter() - started_all
+        emit_trace(force=True, final=True)
+        stats = GenerationStats(
+            mode="ar",
+            generated_tokens=len(tokens),
+            elapsed_s=elapsed,
+            **_generation_rate_fields(
+                generated_tokens=len(tokens),
+                elapsed_s=elapsed,
+                prompt_eval_time_s=prompt_eval_time,
+            ),
+            target_forward_time_s=prompt_eval_time + target_decode_time,
+            prompt_eval_time_s=prompt_eval_time,
+            prompt_tps=(
+                len(prompt_ids) / prompt_eval_time if prompt_eval_time > 0 else 0.0
+            ),
+            prompt_target_prefill_time_s=prompt_eval_time,
+            prompt_target_prefill_tok_s=(
+                len(prompt_ids) / prompt_eval_time if prompt_eval_time > 0 else 0.0
+            ),
+            verify_time_s=target_decode_time,
+            verify_forward_time_s=target_forward_graph_time,
+            verify_eval_time_s=target_eval_time,
+            verify_joint_eval_time_s=target_eval_time,
+            verify_calls=verify_calls,
+            peak_memory_bytes=mx.get_peak_memory(),
+            repetition_stop_triggered=repetition_result is not None,
+            repetition_stop_reason=(
+                "exact_repeated_token_suffix"
+                if repetition_result is not None
+                else None
+            ),
+            repetition_stop_block_tokens=(
+                0 if repetition_result is None else repetition_result.block_tokens
+            ),
+            repetition_stop_repeats=(
+                0 if repetition_result is None else repetition_result.repeats
+            ),
+            repetition_stop_trimmed_tokens=(
+                0 if repetition_result is None else repetition_result.repeated_tokens
+            ),
+            repetition_stop_raw_tokens=(
+                0
+                if repetition_result is None
+                else len(tokens) + repetition_result.repeated_tokens
+            ),
+            loop_guard=(_loop_guard.summary() if _loop_guard is not None else {}),
+            thinking_guard=(
+                _thinking_guard.summary() if _thinking_guard is not None else {}
+            ),
+            decode_trace_path=str(trace.path) if trace.path is not None else None,
+            decode_trace_run_id=trace.run_id if trace.enabled else None,
+            constraint_active=constraint is not None,
+            constraint_completed=(
+                constraint.completed if constraint is not None else None
+            ),
+            constraint_masked_steps=(
+                constraint.masked_steps if constraint is not None else 0
+            ),
+            constraint_mask_time_s=(
+                constraint.mask_time_s if constraint is not None else 0.0
+            ),
+            events=events,
+        )
+        _attach_runtime_diagnostics(
+            stats,
+            rt,
+            counter_start,
+            ar_return_hidden=ar_return_hidden,
+        )
+        finish_reason = _finish_reason_from_tokens(
+            tokens,
+            stop_token_ids=stop_token_ids,
+            max_tokens=max_tokens,
+        )
+        return GenerationOutput(
+            tokens=tokens,
+            text=_decode(rt.tokenizer, _strip_terminal_stop(tokens, stop_token_ids)),
+            stats=stats,
+            finish_reason=finish_reason,
+        )
+
+    # Opt-in async-eval pipeline (MTPLX_AR_ASYNC_PIPELINE).  Engages ONLY for the
+    # greedy, guard-free serving path where the token-feedback loop can stay
+    # on-device (argmax) — the one case where async scheduling is provably
+    # bit-identical to the synchronous loop below.  Every host-feedback feature
+    # (constraint grammar, loop/thinking guards, repetition trim, sampled/penalty
+    # decoding, ar_return_hidden diagnostics) forces the synchronous path.
+    if (
+        _ar_async_pipeline_enabled()
+        and not ar_return_hidden
+        and constraint is None
+        and _loop_guard is None
+        and _thinking_guard is None
+        and not repetition_stop
+        and _ar_sampler_is_greedy(sampler)
+    ):
+        def _on_token(step: int, token: int) -> None:
+            tokens.append(token)
+            emit_token(token)
+            events.append({"step": step, "token": token})
+
+        (
+            verify_calls,
+            target_decode_time,
+            target_forward_graph_time,
+            target_eval_time,
+        ) = _run_greedy_ar_async(
+            rt,
+            cache,
+            logits,
+            max_tokens=max_tokens,
+            stop_token_ids=stop_token_ids,
+            on_token=_on_token,
+        )
+        return _finalize()
+
     for step in range(max_tokens):
         if _loop_guard is not None:
             _guard_transition = _loop_guard.observe(tokens)
@@ -5311,83 +5529,7 @@ def generate_ar(
         verify_calls += 1
         logits = logits_next[:, -1, :]
 
-    elapsed = time.perf_counter() - started_all
-    emit_trace(force=True, final=True)
-    stats = GenerationStats(
-        mode="ar",
-        generated_tokens=len(tokens),
-        elapsed_s=elapsed,
-        **_generation_rate_fields(
-            generated_tokens=len(tokens),
-            elapsed_s=elapsed,
-            prompt_eval_time_s=prompt_eval_time,
-        ),
-        target_forward_time_s=prompt_eval_time + target_decode_time,
-        prompt_eval_time_s=prompt_eval_time,
-        prompt_tps=(
-            len(prompt_ids) / prompt_eval_time if prompt_eval_time > 0 else 0.0
-        ),
-        prompt_target_prefill_time_s=prompt_eval_time,
-        prompt_target_prefill_tok_s=(
-            len(prompt_ids) / prompt_eval_time if prompt_eval_time > 0 else 0.0
-        ),
-        verify_time_s=target_decode_time,
-        verify_forward_time_s=target_forward_graph_time,
-        verify_eval_time_s=target_eval_time,
-        verify_joint_eval_time_s=target_eval_time,
-        verify_calls=verify_calls,
-        peak_memory_bytes=mx.get_peak_memory(),
-        repetition_stop_triggered=repetition_result is not None,
-        repetition_stop_reason=(
-            "exact_repeated_token_suffix" if repetition_result is not None else None
-        ),
-        repetition_stop_block_tokens=(
-            0 if repetition_result is None else repetition_result.block_tokens
-        ),
-        repetition_stop_repeats=(
-            0 if repetition_result is None else repetition_result.repeats
-        ),
-        repetition_stop_trimmed_tokens=(
-            0 if repetition_result is None else repetition_result.repeated_tokens
-        ),
-        repetition_stop_raw_tokens=(
-            0
-            if repetition_result is None
-            else len(tokens) + repetition_result.repeated_tokens
-        ),
-        loop_guard=(_loop_guard.summary() if _loop_guard is not None else {}),
-        thinking_guard=(
-            _thinking_guard.summary() if _thinking_guard is not None else {}
-        ),
-        decode_trace_path=str(trace.path) if trace.path is not None else None,
-        decode_trace_run_id=trace.run_id if trace.enabled else None,
-        constraint_active=constraint is not None,
-        constraint_completed=(constraint.completed if constraint is not None else None),
-        constraint_masked_steps=(
-            constraint.masked_steps if constraint is not None else 0
-        ),
-        constraint_mask_time_s=(
-            constraint.mask_time_s if constraint is not None else 0.0
-        ),
-        events=events,
-    )
-    _attach_runtime_diagnostics(
-        stats,
-        rt,
-        counter_start,
-        ar_return_hidden=ar_return_hidden,
-    )
-    finish_reason = _finish_reason_from_tokens(
-        tokens,
-        stop_token_ids=stop_token_ids,
-        max_tokens=max_tokens,
-    )
-    return GenerationOutput(
-        tokens=tokens,
-        text=_decode(rt.tokenizer, _strip_terminal_stop(tokens, stop_token_ids)),
-        stats=stats,
-        finish_reason=finish_reason,
-    )
+    return _finalize()
 
 
 def generate_mtp1(

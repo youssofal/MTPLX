@@ -720,7 +720,10 @@ def load(
             inject_deepseek_v4_mtp_support,
             is_deepseek_v4_mtp_config,
         )
-        from .qwen3_5_mtp_patch import inject_qwen3_5_mtp_support
+        from .qwen3_5_mtp_patch import (
+            inject_qwen3_5_mtp_support,
+            is_escha_qwen3_5_mtp,
+        )
 
         if is_deepseek_v4_mtp_config(config):
             # Native draft head: the block binds through the ordinary load path
@@ -740,7 +743,9 @@ def load(
             mtp_enabled = inject_step3p5_mtp_support(model, path, config, contract)
         elif is_hy_v3_mtp_config(config):
             mtp_enabled = inject_hy_v3_mtp_support(model, path, config, contract)
-        elif is_qwen3_5_mtp_config(config):
+        elif is_qwen3_5_mtp_config(config) or is_escha_qwen3_5_mtp(config, path):
+            # qwen3_5_mtp head, or Escha-W2 (qwen3_5_moe 2-bit trunk whose MTP head borrows the
+            # trunk's eschamoe experts) — same head, injected by the same function.
             mtp_enabled = inject_qwen3_5_mtp_support(model, path, config, contract)
         elif is_deepseek_mtp_config(config):
             mtp_enabled = inject_deepseek_mtp_support(model, path, config, contract)
@@ -765,9 +770,19 @@ def load(
     compiled_target_factory = None
     whole_moe_plan = None
     selfcheck_report = None
+    from .escha_load import is_escha_checkpoint
+
+    escha = is_escha_checkpoint(path, config)
+    if escha:
+        # Escha's eschamoe (2-bit) experts + int8 non-experts ARE the optimized MoE/MLP path;
+        # the standard-A3B serving opts below (native_mlp / moe_packed_projections / whole_moe /
+        # row_owned_router / compiled_target_prefix) all assume dense-affine SwitchGLU + Linear
+        # and do not apply. The plain qwen3_5_moe forward + mtplx caches + batched_decode still
+        # drive it (forward_ar / make_cache come from the runtime class, not this block).
+        logger.info("[escha] serving via eschamoe/int8 path; skipping standard-A3B MoE/MLP opts")
     # Laguna skips the qwen3-next kernel stack entirely; its own env-gated
     # fused lanes install right before runtime construction below.
-    if not _is_laguna_s_2_1_mlx_4bit_config(config):
+    if not _is_laguna_s_2_1_mlx_4bit_config(config) and not escha:
         from .attention_split import configure_split_full_attention
         from .moe_packed_projections import (
             configure_moe_packed_projections,
@@ -982,6 +997,12 @@ def _model_classes_for_config(config: dict[str, Any]) -> tuple[type, type] | Non
 
 
 def _load_base_model(path: Path, config: dict[str, Any]) -> tuple[Any, Any]:
+    from .escha_load import is_escha_checkpoint, load_escha_model
+
+    if is_escha_checkpoint(path, config):
+        # EschaLabs Qwen3.6-A3B-Escha-W2: qwen3_5_moe trunk with eschamoe 2-bit experts +
+        # int8 non-experts. Returns an ordinary qwen3_5_moe model the runtime drives unchanged.
+        return load_escha_model(path, config)
     if (
         config.get("architectures") == ["LagunaForCausalLM"]
         and str(config.get("model_type") or "").lower() == "laguna"

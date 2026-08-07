@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,24 @@ from .artifacts import expected_mtp_file, text_config
 logger = logging.getLogger(__name__)
 
 QWEN3_5_MTP_MODEL_TYPES = {"qwen3_5_mtp"}
+
+# Which trunk layer's eschamoe experts the Escha MTP draft head borrows (its own predictor ships
+# no routed experts). Layer-robust in the acceptance sweep; 20 was best. Env-overridable for A/B.
+ESCHA_MTP_SHARE_LAYER = int(os.environ.get("ESCHA_MTP_SHARE_LAYER", "20"))
+
+
+def is_escha_qwen3_5_mtp(config: dict[str, Any], model_path: Path | str) -> bool:
+    """True for an Escha-W2 checkpoint (qwen3_5_moe 2-bit trunk) that ships an MTP predictor.
+
+    Distinct from :func:`is_qwen3_5_mtp_config` (model_type ``qwen3_5_mtp``): Escha keeps
+    model_type ``qwen3_5_moe`` and its MTP head omits routed experts, so it takes the borrow-
+    trunk-experts path in :func:`inject_qwen3_5_mtp_support`.
+    """
+    if int(text_config(config).get("mtp_num_hidden_layers", 0) or 0) <= 0:
+        return False
+    from .escha_load import is_escha_checkpoint
+
+    return is_escha_checkpoint(Path(model_path), config)
 
 
 def _model_type(config: dict[str, Any]) -> str:
@@ -233,10 +252,13 @@ def inject_qwen3_5_mtp_support(
     from mlx_lm.models.cache import KVCache
     from mlx_lm.models.qwen3_5 import TextModelArgs
 
-    if not is_qwen3_5_mtp_config(config):
-        return False
+    from .mtp_patch import _text_model
 
     model_path = Path(model_path)
+    escha = is_escha_qwen3_5_mtp(config, model_path)
+    if not is_qwen3_5_mtp_config(config) and not escha:
+        return False
+
     tcfg = text_config(config)
     args = TextModelArgs.from_dict(tcfg)
 
@@ -245,21 +267,46 @@ def inject_qwen3_5_mtp_support(
         logger.warning("[Qwen3.5 MTP inject] no mtp.* weights found in %s", model_path)
         return False
 
+    if escha:
+        # Escha stores RMSNorm weights as (w-1); shift every head norm +1 (the trunk gets this
+        # from mlx-lm sanitize, but the raw mtp.* norms loaded here do not).
+        weights = {
+            k: (v + 1.0 if ("norm" in k and getattr(v, "ndim", 0) == 1) else v)
+            for k, v in weights.items()
+        }
+
+    # Operate at the qwen3_5 *TextModel* level (``.model`` inner trunk + ``.lm_head``), which is
+    # what ``_text_model`` returns and what ``validate_mtp_support`` inspects. For the standard
+    # mlx-lm outer ``qwen3_5_moe.Model`` this is ``model.language_model``; for a bare TextModel it
+    # is ``model`` itself. The MTP surface lives here so ``.mtp`` sits where validate looks, and a
+    # thin delegating wrapper (below) re-exposes it on the outer model the runtime actually holds.
+    text_model = _text_model(model)
+
     mtp = _make_qwen3_5_mtp_module(args)
-    _quantize_like_trunk(mtp, config, contract)
-    _validate_load_coverage(mtp, weights)
-    mtp.load_weights(list(weights.items()), strict=True)
+    if escha:
+        # Escha's MTP predictor ships NO routed experts (17 fp16 tensors): load only the shipped
+        # non-expert weights and BORROW the trunk's eschamoe experts for the head's 256-way router.
+        mtp.load_weights(list(weights.items()), strict=False)
+        mtp.layers[0].mlp.switch_mlp = (
+            text_model.model.layers[ESCHA_MTP_SHARE_LAYER].mlp.switch_mlp
+        )
+        logger.info("[Qwen3.5 MTP inject] escha head: borrow trunk layer %d experts, %d tensors",
+                    ESCHA_MTP_SHARE_LAYER, len(weights))
+    else:
+        _quantize_like_trunk(mtp, config, contract)
+        _validate_load_coverage(mtp, weights)
+        mtp.load_weights(list(weights.items()), strict=True)
     mx.eval(mtp.parameters())
 
-    model.mtp = mtp
-    model._mtplx_hidden_variant = "pre_norm"
-    model._mtplx_concat_order = "embedding_hidden"
+    text_model.mtp = mtp
+    text_model._mtplx_hidden_variant = "pre_norm"
+    text_model._mtplx_concat_order = "embedding_hidden"
 
-    original_class = model.__class__
+    original_text_class = text_model.__class__
 
-    class _MTPLXQwen35Model(original_class):
+    class _MTPLXQwen35TextModel(original_text_class):
         def _lm_logits(self, h):
-            lm = getattr(self.language_model, "lm_head", None)
+            lm = getattr(self, "lm_head", None)
             if lm is not None:
                 return lm(h)
             return self.model.embed_tokens.as_linear(h)
@@ -280,7 +327,7 @@ def inject_qwen3_5_mtp_support(
             # Expose the pre-final-norm residual stream: Qwen3_5TextModel applies
             # ``self.norm`` before returning, so temporarily swap it for identity
             # (avoids re-running the hybrid linear/full attention layer loop).
-            inner = self.model  # Qwen3_5TextModel (outer Model.model property)
+            inner = self.model  # Qwen3_5TextModel (the inner trunk)
             real_norm = inner.norm
             try:
                 inner.norm = lambda x: x
@@ -341,7 +388,45 @@ def inject_qwen3_5_mtp_support(
         def make_mtp_cache(self):
             return [KVCache()]
 
-    model.__class__ = _MTPLXQwen35Model
+    text_model.__class__ = _MTPLXQwen35TextModel
+
+    # The runtime holds the outer model (``self.model`` in MTPLXRuntime). When that is the mlx-lm
+    # ``qwen3_5_moe.Model`` wrapper, re-expose the MTP surface on it by delegating to the patched
+    # TextModel — same pattern as the generic ``inject_mtp_support``.
+    if getattr(model, "language_model", None) is text_model:
+        model.mtp = mtp
+        original_outer_class = model.__class__
+
+        class _MTPLXQwen35OuterModel(original_outer_class):
+            def __call__(
+                self,
+                inputs,
+                cache=None,
+                return_hidden: bool = False,
+                input_embeddings=None,
+                hidden_variant: str | None = None,
+                **kwargs,
+            ):
+                return self.language_model(
+                    inputs,
+                    cache=cache,
+                    return_hidden=return_hidden,
+                    input_embeddings=input_embeddings,
+                    hidden_variant=hidden_variant,
+                    **kwargs,
+                )
+
+            def mtp_forward(self, *args, **kwargs):
+                return self.language_model.mtp_forward(*args, **kwargs)
+
+            def mtp_update_cache(self, *args, **kwargs):
+                return self.language_model.mtp_update_cache(*args, **kwargs)
+
+            def make_mtp_cache(self):
+                return self.language_model.make_mtp_cache()
+
+        model.__class__ = _MTPLXQwen35OuterModel
+
     logger.info(
         "[Qwen3.5 MTP inject] native head bound (depth 1, %d tensors) for %s",
         len(weights),

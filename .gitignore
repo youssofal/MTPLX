@@ -32,6 +32,9 @@ benchmark_outputs/
 !apps/MTPLXApp/Sources/MTPLXAppCore/Resources/
 !apps/MTPLXApp/Sources/MTPLXAppCore/Resources/StepAdapters/
 !apps/MTPLXApp/Sources/MTPLXAppCore/Resources/StepAdapters/*.npz
+# eschamoe native 2-bit decode: gather tables + tiny vendor-golden test fixture
+!mtplx/eschamoe_gather.npz
+!tests/fixtures/eschamoe_mini.npz
 *.npy
 *.jsonl
 !mtplx/benchmarks/prompts/*.jsonl
