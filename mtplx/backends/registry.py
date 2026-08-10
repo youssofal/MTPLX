@@ -137,6 +137,33 @@ ARCHITECTURE_CATALOG: dict[str, ArchitectureSupport] = {
             "with mtp=False."
         ),
     ),
+    "muse-glimmer-ar": ArchitectureSupport(
+        arch_id="muse-glimmer-ar",
+        display_name="Muse-Glimmer-30B text tower (MLX)",
+        family="muse_glimmer",
+        backend="muse_glimmer_ar",
+        support_level="experimental-native-ar-only",
+        runtime_compatibility="native-ar-only",
+        can_run_verified=True,
+        aliases=(
+            "muse_glimmer",
+            "muse_glimmer_text",
+            "MuseGlimmerForConditionalGeneration",
+        ),
+        config_markers=(),
+        family_gate="none",
+        references=(
+            "https://huggingface.co/meta-models/Muse-Glimmer-30B",
+            "https://github.com/ggml-org/llama.cpp/blob/master/src/models/muse-glimmer.cpp",
+        ),
+        notes=(
+            "Target-only AR runtime for the Muse-Glimmer text tower (Gemma-family: "
+            "sigmoid gated attention, parameter-free QK-norm with qk_scale_factor, "
+            "NoPE on the global layers, sandwich norms, final-logit softcap). Loaded "
+            "via the vendored mlx_lm model class registered by muse_glimmer_patch; "
+            "no native MTP head, so it runs mtp=False like any AR checkpoint."
+        ),
+    ),
     "qwen3-next-mtp": ArchitectureSupport(
         arch_id="qwen3-next-mtp",
         display_name="Qwen3.6 / Qwen3-Next / Qwen3.5 MTP",
@@ -1078,6 +1105,10 @@ def _passes_family_runtime_gate(arch_id: str, inspection: Any, tensor_gate: bool
             _text(getattr(inspection, "model_type", None)) == "gemma4_pair"
             and isinstance(getattr(inspection, "gemma4_pair", None), dict)
         )
+    if arch_id == "muse-glimmer-ar":
+        # Plain target-only AR text tower; the vendored mlx_lm loader handles it
+        # like any dense AR checkpoint, so recognition is sufficient.
+        return True
     return False
 
 
