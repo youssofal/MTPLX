@@ -11654,11 +11654,14 @@ def _request_depth_for_generation(
             None,
         )
         if default_value is None:
-            default_value = getattr(
-                state.args,
-                "depth",
-                descriptor.draft_semantics.default,
-            )
+            if descriptor.draft_semantics.request_field == "depth":
+                default_value = getattr(
+                    state.args,
+                    "depth",
+                    descriptor.draft_semantics.default,
+                )
+            else:
+                default_value = descriptor.draft_semantics.default
         return descriptor.draft_semantics.clamp(default_value)
     try:
         depth = int(value)
@@ -16105,6 +16108,15 @@ def _skipped_idle_postcommit_snapshot(
             "stored": False,
             "mode": "skipped",
             "reason": "gemma4_retokenized_postcommit_unsupported",
+            "unsafe_reason": unsafe_reason,
+            "assistant_tool_calls": len(assistant_tool_calls or []),
+            "prompt_prefix_len": int(prompt_prefix_len or 0),
+        }
+    if backend_id == "dflash":
+        return {
+            "stored": False,
+            "mode": "skipped",
+            "reason": "dflash_retokenized_postcommit_unsupported",
             "unsafe_reason": unsafe_reason,
             "assistant_tool_calls": len(assistant_tool_calls or []),
             "prompt_prefix_len": int(prompt_prefix_len or 0),

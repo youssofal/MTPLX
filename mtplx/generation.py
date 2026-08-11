@@ -6162,6 +6162,19 @@ def generate_mtpk(
             repetition_stop=repetition_stop,
             requested_speculative_depth=requested_block_size,
         )
+    if getattr(rt, "backend_id", None) == "dflash":
+        from .backends.dflash import generate_dflash
+
+        return generate_dflash(
+            rt,
+            prompt_ids,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            speculative_depth=int(speculative_depth or 0),
+            stop_token_ids=stop_token_ids,
+            token_callback=token_callback,
+            seed=seed,
+        )
     if not rt.mtp_enabled:
         raise RuntimeError("generate_mtpk requires an MTP-enabled runtime")
     base_hidden_variant = _resolve_runtime_base_hidden_variant(rt, base_hidden_variant)

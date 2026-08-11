@@ -617,6 +617,20 @@ def load(
             runtime.bundle_path = path
             return runtime
         path = Path(gemma4_pair["target_model"])
+
+    from .dflash_pair import resolve_dflash_pair_paths
+
+    dflash_pair = resolve_dflash_pair_paths(path)
+    if dflash_pair is not None:
+        if mtp:
+            from .backends.dflash import load_dflash_runtime
+
+            runtime = load_dflash_runtime(str(path))
+            runtime.model_path = path
+            runtime.path = path
+            runtime.bundle_path = path
+            return runtime
+        path = Path(dflash_pair["target_model"])
     config = load_config(path)
     from .a3b_whole_moe import validate_a3b_whole_moe_load_options
 
@@ -647,6 +661,16 @@ def load(
 
     if is_hy_v3_config(config):
         install_hy_v3_model_shim()
+
+    # muse_glimmer has no model class in any released mlx-lm; register the
+    # vendored text-tower class before mlx_lm.utils.load resolves the type.
+    from .muse_glimmer_patch import (
+        install_muse_glimmer_model_shim,
+        is_muse_glimmer_config,
+    )
+
+    if is_muse_glimmer_config(config):
+        install_muse_glimmer_model_shim()
 
     # A checkpoint whose model_type has no mlx-lm module may still declare the
     # implementing class in ``architectures`` — new Qwen generations reuse the

@@ -471,6 +471,7 @@ class ModelInspection:
     backend_status: str | None = None
     backend_artifact: dict[str, Any] | None = None
     gemma4_pair: dict[str, Any] | None = None
+    dflash_pair: dict[str, Any] | None = None
 
     @property
     def passes_primary_gate(self) -> bool:
@@ -517,6 +518,7 @@ class ModelInspection:
             "backend_status": self.backend_status,
             "backend_artifact": self.backend_artifact,
             "gemma4_pair": self.gemma4_pair,
+            "dflash_pair": self.dflash_pair,
             "mtp_supported": self.compatibility.get("mtp_supported"),
             "mtp_arch": self.compatibility.get("arch_id"),
             "recommended_backend": self.compatibility.get("recommended_backend"),
@@ -1109,6 +1111,60 @@ def inspect_model(model_dir: Path | str) -> ModelInspection:
     if repo_id is not None:
         return _inspect_hf_model(repo_id)
     model_path = Path(model_dir)
+    try:
+        from .dflash_pair import dflash_pair_inspection, resolve_dflash_pair_paths
+    except Exception:
+        dflash_pair = None
+    else:
+        dflash_pair = resolve_dflash_pair_paths(model_path)
+    if dflash_pair is not None:
+        payload = dflash_pair_inspection(
+            model_ref=str(model_path),
+            bundle_root=dflash_pair["bundle_root"],
+            target_model=dflash_pair["target_model"],
+            drafter_model=dflash_pair["drafter_model"],
+            metadata=dflash_pair["metadata"],
+        )
+        target_config = load_config(dflash_pair["target_model"])
+        tcfg = text_config(target_config)
+        target_quant = (
+            target_config.get("quantization")
+            or target_config.get("quantization_config")
+            or tcfg.get("quantization")
+            or tcfg.get("quantization_config")
+            or {}
+        )
+        return ModelInspection(
+            model_dir=str(model_path),
+            source="local",
+            config_exists=True,
+            architecture=str(payload.get("architecture") or "DFlashDrafterPair"),
+            model_type=str(payload.get("model_type") or "dflash_pair"),
+            mtp_num_hidden_layers=1,
+            hidden_size=tcfg.get("hidden_size"),
+            num_hidden_layers=tcfg.get("num_hidden_layers"),
+            vocab_size=tcfg.get("vocab_size"),
+            num_experts=tcfg.get("n_routed_experts") or tcfg.get("num_experts"),
+            num_experts_per_tok=tcfg.get("num_experts_per_tok"),
+            mtp_pattern="dflash-pair",
+            quantization=target_quant,
+            sidecars={name: False for name in MULTIMODAL_SIDECARS},
+            model_files=tuple(
+                sorted(
+                    path.name
+                    for path in Path(dflash_pair["target_model"]).glob(
+                        "model*.safetensors"
+                    )
+                )
+            ),
+            runtime_model=payload.get("runtime_model"),
+            dflash_pair=payload.get("dflash_pair")
+            if isinstance(payload.get("dflash_pair"), dict)
+            else None,
+            compatibility=payload.get("compatibility")
+            if isinstance(payload.get("compatibility"), dict)
+            else {},
+        )
     try:
         from .gemma4_pair import gemma4_pair_inspection, resolve_gemma4_pair_paths
     except Exception:

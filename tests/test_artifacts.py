@@ -1546,6 +1546,58 @@ def test_gemma4_pair_bundle_inspects_as_assistant_runtime(tmp_path):
     assert result.gemma4_pair["assistant_model"].endswith("/assistant")
 
 
+def test_dflash_pair_bundle_inspects_as_native_runtime(tmp_path):
+    target = tmp_path / "target"
+    drafter = tmp_path / "drafter"
+    target.mkdir()
+    drafter.mkdir()
+    (tmp_path / "dflash_pair.json").write_text(
+        json.dumps(
+            {
+                "backend": "dflash",
+                "layout": {"target": "target", "drafter": "drafter"},
+                "benchmark": {"best_block_size": 8},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (target / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["NemotronHForCausalLM"],
+                "model_type": "nemotron_h",
+                "hidden_size": 2688,
+                "num_hidden_layers": 52,
+                "vocab_size": 131072,
+                "n_routed_experts": 128,
+                "num_experts_per_tok": 6,
+                "quantization": {"group_size": 64, "bits": 4, "mode": "affine"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (drafter / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["DFlashDraftModel"],
+                "model_type": "qwen3",
+                "target_layer_ids": [1, 5, 19, 29, 41, 51],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.model_type == "dflash_pair"
+    assert result.architecture == "DFlashDrafterPair"
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["recommended_backend"] == "dflash"
+    assert result.compatibility["runtime_compatibility"] == "drafter-pair-native"
+    assert result.dflash_pair["target_model"].endswith("/target")
+    assert result.dflash_pair["drafter_model"].endswith("/drafter")
+
+
 def test_gemma4_pair_subfolder_reports_bundle_required(tmp_path):
     bundle = _write_gemma4_pair_bundle(tmp_path)
 

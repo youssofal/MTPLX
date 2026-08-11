@@ -729,11 +729,63 @@ GEMMA4_ASSISTANT_DESCRIPTOR = BackendDescriptor(
 )
 
 
+DFLASH_DESCRIPTOR = BackendDescriptor(
+    backend_id="dflash",
+    architecture_id="dflash-drafter-pair",
+    model_family="dflash",
+    display_name="DFlash external drafter",
+    artifact_layout="dflash_pair_bundle",
+    runtime_capabilities=(
+        "target_logits",
+        "external_dflash_drafter",
+        "target_prefix_greedy_verification",
+        "requires_generation_thread_affinity",
+    ),
+    sampler_defaults=SamplerDefaults(temperature=0.0, top_p=1.0, top_k=0),
+    reasoning_codec=ReasoningCodec(
+        parser="none",
+        display_name="Tokenizer-native text",
+        default_mode="off",
+        supported=False,
+    ),
+    draft_semantics=DraftSemantics(
+        request_field="speculative_depth",
+        display_label="DFlash block",
+        default=8,
+        minimum=2,
+        maximum=8,
+        unit="block",
+    ),
+    uses_external_assistant=True,
+    uses_draft_lm_head=False,
+    hidden_variant="dflash_aux_taps",
+    mtp_history_policy="dflash_context_kv",
+    tune_policy=TunePolicy(
+        supported=False,
+        unsupported_reason="DFlash block tuning has not been wired to mtplx tune.",
+    ),
+    kv_quant_policy=KVQuantPolicy(
+        supported=False,
+        disabled_reason="KV quantization is not validated for DFlash hybrid caches.",
+    ),
+    context_window_policy=ContextWindowPolicy(
+        maximum=1_048_576,
+        default=131_072,
+        source="dflash_target_config",
+    ),
+    validation_status="runtime_runnable_qa_pending",
+    status="runtime_runnable_qa_pending",
+    profile_policy="backend-aware-sustained",
+    notes=("DFlash currently exposes exact greedy target-prefix verification.",),
+)
+
+
 DESCRIPTORS_BY_BACKEND_ID: dict[str, BackendDescriptor] = {
     QWEN3_NEXT_DESCRIPTOR.backend_id: QWEN3_NEXT_DESCRIPTOR,
     LAGUNA_AR_DESCRIPTOR.backend_id: LAGUNA_AR_DESCRIPTOR,
     NATIVE_CONTRACT_DESCRIPTOR.backend_id: NATIVE_CONTRACT_DESCRIPTOR,
     GEMMA4_ASSISTANT_DESCRIPTOR.backend_id: GEMMA4_ASSISTANT_DESCRIPTOR,
+    DFLASH_DESCRIPTOR.backend_id: DFLASH_DESCRIPTOR,
     STEP3P5_MTP_DESCRIPTOR.backend_id: STEP3P5_MTP_DESCRIPTOR,
     DEEPSEEK_MTP_DESCRIPTOR.backend_id: DEEPSEEK_MTP_DESCRIPTOR,
     GLM_MTP_DESCRIPTOR.backend_id: GLM_MTP_DESCRIPTOR,
