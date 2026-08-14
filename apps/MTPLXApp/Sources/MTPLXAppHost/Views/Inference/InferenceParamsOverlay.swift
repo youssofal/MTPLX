@@ -661,6 +661,14 @@ struct InferenceParamsOverlay: View {
     private var depthMax: Int {
         max(depthMin, compatibleSettings?.depthMax ?? draftControl?.maximum ?? 3)
     }
+    /// A slider needs at least two distinct values; SwiftUI's
+    /// `Normalizing` traps on a zero-width interval. Unsupported models
+    /// and descriptors whose minimum equals maximum must not construct
+    /// a `Slider` at all — `.disabled` is applied too late to help.
+    private var depthSliderRange: ClosedRange<Int>? {
+        guard draftControlSupported, depthMax > depthMin else { return nil }
+        return depthMin...depthMax
+    }
     private var depthDefault: Int {
         min(depthMax, max(depthMin, draftControl?.defaultValue ?? depthMax))
     }
@@ -692,25 +700,38 @@ struct InferenceParamsOverlay: View {
             // draft blocks 2-8) is no longer clamped to Qwen's D1-D3. Each
             // detent is a real structural change to the speculative-decode
             // pipeline, so the haptic stays a firm `.levelChange`.
-            paramSlider(
-                title: draftControl?.displayLabel ?? "Depth",
-                value: Binding(
-                    get: { Double(depth) },
-                    set: {
-                        guard draftControlSupported else { return }
-                        depth = Int($0.rounded())
-                    }
-                ),
-                range: Double(depthMin)...Double(depthMax),
-                step: 1,
-                valueText: { v in
-                    Text(draftValueLabel(for: Int(v.rounded())))
-                },
-                hapticPattern: .levelChange,
-                onCommit: { if draftControlSupported { commitLiveSettings() } }
-            )
-            .disabled(!draftControlSupported)
-            if !draftControlSupported {
+            if let sliderRange = depthSliderRange {
+                paramSlider(
+                    title: draftControl?.displayLabel ?? "Depth",
+                    value: Binding(
+                        get: { Double(depth) },
+                        set: {
+                            guard draftControlSupported else { return }
+                            depth = Int($0.rounded())
+                        }
+                    ),
+                    range: Double(sliderRange.lowerBound)...Double(sliderRange.upperBound),
+                    step: 1,
+                    valueText: { v in
+                        Text(draftValueLabel(for: Int(v.rounded())))
+                    },
+                    hapticPattern: .levelChange,
+                    onCommit: { if draftControlSupported { commitLiveSettings() } }
+                )
+            } else if draftControlSupported {
+                // Supported but only one valid value — show it, don't
+                // build a degenerate slider.
+                HStack {
+                    Text(draftControl?.displayLabel ?? "Depth")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Brand.typeBody)
+                    Spacer()
+                    Text(draftValueLabel(for: depthMin))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(Brand.typeSecondary)
+                        .monospacedDigit()
+                }
+            } else {
                 Text("Draft control is not available for this model.")
                     .font(.caption2)
                     .foregroundStyle(Brand.warning)
