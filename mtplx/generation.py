@@ -156,7 +156,9 @@ def _resolve_runtime_base_hidden_variant(
     requested: str | None,
 ) -> str:
     if requested in {None, "auto", "contract"}:
-        return str(getattr(rt.contract, "base_hidden_variant", "post_norm") or "post_norm")
+        return str(
+            getattr(rt.contract, "base_hidden_variant", "post_norm") or "post_norm"
+        )
     return str(requested)
 
 
@@ -1981,8 +1983,7 @@ def _detect_repeated_token_suffix(
         repeats = 1
         cursor = token_count - block_tokens
         while (
-            cursor >= block_tokens
-            and tokens[cursor - block_tokens : cursor] == block
+            cursor >= block_tokens and tokens[cursor - block_tokens : cursor] == block
         ):
             repeats += 1
             cursor -= block_tokens
@@ -2116,9 +2117,7 @@ def _prefill_restored_prompt_suffix(
                 else None
             )
             cumulative_tok_s = (
-                float(new_done) / elapsed
-                if elapsed > 0.0 and new_done > 0
-                else None
+                float(new_done) / elapsed if elapsed > 0.0 and new_done > 0 else None
             )
             chunk_callback(
                 {
@@ -2213,9 +2212,7 @@ def _prefill_restored_prompt_suffix(
                 [int(token) for token in suffix[1:]],
                 window_start=1,
             )
-        target_forward_time += _maybe_repage_target_prefill_cache(
-            rt, restored.cache
-        )
+        target_forward_time += _maybe_repage_target_prefill_cache(rt, restored.cache)
         _check_splice_consumed()
         return (
             suffix_logits[:, -1, :],
@@ -2224,9 +2221,8 @@ def _prefill_restored_prompt_suffix(
             mtp_history_time,
         )
 
-    capture_boundaries = (
-        gdn_boundary_sink is not None
-        and _cache_has_recurrent_entries(restored.cache)
+    capture_boundaries = gdn_boundary_sink is not None and _cache_has_recurrent_entries(
+        restored.cache
     )
     if len(suffix) > 1:
         body = suffix[:-1]
@@ -2293,9 +2289,7 @@ def _prefill_restored_prompt_suffix(
                     cached_tokens + end,
                     restored.cache,
                     hidden_last=(
-                        hidden_chunk[:, -1:, :]
-                        if hidden_chunk is not None
-                        else None
+                        hidden_chunk[:, -1:, :] if hidden_chunk is not None else None
                     ),
                 )
             if hidden_chunk is not None:
@@ -2686,8 +2680,7 @@ def _restore_near_prefix_prompt_state(
             cache_restore_time_s = time.perf_counter() - restore_started
         if prefix_restore is None:
             _near_debug(
-                "restore_failed:"
-                + str(getattr(session_bank, "last_miss_reason", None))
+                "restore_failed:" + str(getattr(session_bank, "last_miss_reason", None))
             )
             continue
         _near_debug("served")
@@ -2728,22 +2721,22 @@ def _restore_near_prefix_prompt_state(
             )
         if committed_history_required and mtp_history_cache is None:
             continue
-        if (
-            boundary_restore
-            and committed_history_required
-            and boundary_hidden is None
-        ):
+        if boundary_restore and committed_history_required and boundary_hidden is None:
             # Without the boundary's hidden state the committed MTP history
             # cannot resume exactly at b; running a seed forward instead would
             # advance the recurrent state twice. Fail closed to the next
             # candidate (or cold).
             continue
         cache_source = str(getattr(entry, "cache_source", "ram") or "ram")
-        ssd_cache_hit = bool(getattr(entry, "ssd_cache_hit", False)) or cache_source == "ssd"
+        ssd_cache_hit = (
+            bool(getattr(entry, "ssd_cache_hit", False)) or cache_source == "ssd"
+        )
         ssd_restore_s = float(getattr(entry, "ssd_restore_s", 0.0) or 0.0)
         ssd_cached_tokens = restore_point if ssd_cache_hit else 0
         total_cache_restore_time_s = (
-            cache_restore_time_s + ssd_restore_s if ssd_cache_hit else cache_restore_time_s
+            cache_restore_time_s + ssd_restore_s
+            if ssd_cache_hit
+            else cache_restore_time_s
         )
 
         _check_postcommit_abort(abort_check)
@@ -2773,7 +2766,9 @@ def _restore_near_prefix_prompt_state(
             repair_time = time.perf_counter() - started
         _check_postcommit_abort(abort_check)
         restore_kind_base = (
-            "block_prefix" if int(entry.prefix_len) - matched > max_gap else "near_prefix"
+            "block_prefix"
+            if int(entry.prefix_len) - matched > max_gap
+            else "near_prefix"
         )
         if restore_point < matched:
             restore_kind_base = f"{restore_kind_base}_boundary"
@@ -2847,9 +2842,7 @@ def _restore_near_prefix_prompt_state(
                 restore_served=served_truth,
             )
         suffix_boundary_sink: list[tuple[int, Any, Any]] | None = (
-            list(inherited_boundaries)
-            if _gdn_boundary_capture_enabled()
-            else None
+            list(inherited_boundaries) if _gdn_boundary_capture_enabled() else None
         )
         suffix_logits, suffix_hidden, suffix_time, mtp_history_time = (
             _prefill_restored_prompt_suffix(
@@ -2974,7 +2967,10 @@ def _thin_gdn_boundary_records(
     newest = ordered[-1]
     oldest = ordered[0]
     newest_pos = int(newest[0])
-    kept: dict[int, tuple[int, Any, Any]] = {int(newest[0]): newest, int(oldest[0]): oldest}
+    kept: dict[int, tuple[int, Any, Any]] = {
+        int(newest[0]): newest,
+        int(oldest[0]): oldest,
+    }
     # Walk from the tail toward the head (distance from newest increasing).
     # Keep the first record past each doubling floor — one keeper per
     # distance scale, geometric spacing by construction regardless of how
@@ -3029,9 +3025,7 @@ def _capture_gdn_boundary(
         hidden_leaf = None
         if hidden_last is not None:
             hidden_leaf = detach_array_leaf(hidden_last, mode="contiguous_eval")
-        sink.append(
-            (int(tokens_done), snapshot_untrimmable_cache(cache), hidden_leaf)
-        )
+        sink.append((int(tokens_done), snapshot_untrimmable_cache(cache), hidden_leaf))
         cap = _gdn_boundary_max_count()
         if len(sink) > cap:
             sink[:] = _thin_gdn_boundary_records(sink, cap)
@@ -3143,7 +3137,9 @@ def _store_on_prefill_min_suffix() -> int:
         return 1024
 
 
-def _debug_prefix_divergence(rt: MTPLXRuntime, prompt_ids: list[int], session_bank: Any) -> None:
+def _debug_prefix_divergence(
+    rt: MTPLXRuntime, prompt_ids: list[int], session_bank: Any
+) -> None:
     """Env-gated diagnostic: report where the prompt diverges from each bank entry.
 
     For every bank entry that shares a non-trivial prefix with the incoming
@@ -3184,9 +3180,9 @@ def _debug_prefix_divergence(rt: MTPLXRuntime, prompt_ids: list[int], session_ba
                 f"[mtplx] prefix-diverge: entry_len={entry_len} matched={matched} "
                 f"prompt_len={len(prompt)}\n"
                 f"  entry [{lo}:{matched + 40}]: "
-                f"{_decode(toks[lo:matched + 40])!r}\n"
+                f"{_decode(toks[lo : matched + 40])!r}\n"
                 f"  prompt[{lo}:{matched + 40}]: "
-                f"{_decode(prompt[lo:matched + 40])!r}",
+                f"{_decode(prompt[lo : matched + 40])!r}",
                 file=sys.stderr,
             )
     except Exception as exc:  # diagnostic only - never break the request
@@ -3341,7 +3337,9 @@ def restore_or_prefill_prompt_state(
             put_timing: dict[str, object] = {}
             entry = session_bank.put(
                 runtime=rt,
-                token_ids=list(bank_key_ids if bank_key_ids is not None else prompt_ids),
+                token_ids=list(
+                    bank_key_ids if bank_key_ids is not None else prompt_ids
+                ),
                 cache=state.trunk_cache,
                 logits=state.logits,
                 hidden=state.hidden,
@@ -3354,7 +3352,9 @@ def restore_or_prefill_prompt_state(
                 policy_fingerprint=policy_fingerprint,
                 mtp_history_snapshot=mtp_snapshot,
                 snapshot_epoch=len(prompt_ids),
-                mtp_snapshot_epoch=len(prompt_ids) if mtp_snapshot is not None else None,
+                mtp_snapshot_epoch=len(prompt_ids)
+                if mtp_snapshot is not None
+                else None,
                 gdn_boundaries=list(getattr(state, "gdn_boundaries", None) or []),
                 timing_out=put_timing,
             )
@@ -3402,7 +3402,9 @@ def restore_or_prefill_prompt_state(
                     "new_prefill_tokens": new_tokens,
                     "elapsed_s": elapsed,
                     "prompt_eval_time_s": compute_elapsed,
-                    "prefill_tok_s": compute_tok_s if compute_tok_s is not None else wall_tok_s,
+                    "prefill_tok_s": compute_tok_s
+                    if compute_tok_s is not None
+                    else wall_tok_s,
                     "prefill_compute_tok_s": compute_tok_s,
                     "prefill_wall_tok_s": wall_tok_s,
                     "cache_hit": bool(state.cache_hit),
@@ -3438,9 +3440,7 @@ def restore_or_prefill_prompt_state(
             if callable(longest_prefix):
                 exact_entry = longest_prefix(bank_match_ids)
                 if exact_entry is not None:
-                    exact_prefix_len = int(
-                        getattr(exact_entry, "prefix_len", 0) or 0
-                    )
+                    exact_prefix_len = int(getattr(exact_entry, "prefix_len", 0) or 0)
         except Exception:
             exact_prefix_len = 0
 
@@ -3498,9 +3498,7 @@ def restore_or_prefill_prompt_state(
                 chunk_callback=prefill_callback,
                 chunk_started_s=prefill_started_s,
                 matched_ceiling=(
-                    vision_restore_spans[0][0]
-                    if vision_restore_spans
-                    else None
+                    vision_restore_spans[0][0] if vision_restore_spans else None
                 ),
                 cache_factory=restore_cache_factory,
             )
@@ -3557,30 +3555,34 @@ def restore_or_prefill_prompt_state(
                     flush=True,
                 )
             if not suffix:
-                repage_time = _maybe_repage_target_prefill_cache(
-                    rt, restored.cache
+                repage_time = _maybe_repage_target_prefill_cache(rt, restored.cache)
+                return _emit_prefill_complete(
+                    PromptState(
+                        trunk_cache=restored.cache,
+                        logits=restored.logits,
+                        hidden=restored.hidden,
+                        committed_mtp_cache=restored.mtp_history_cache,
+                        token_prefix=tuple(int(token) for token in prompt_ids),
+                        prompt_eval_time_s=repage_time,
+                        cache_restore_time_s=restore_elapsed_s,
+                        mtp_history_policy=mtp_history_policy,
+                        mtp_history_window_tokens=mtp_history_window_tokens,
+                        cached_tokens=restored.entry.prefix_len,
+                        suffix_tokens=0,
+                        cache_hit=True,
+                        cache_source=getattr(restored, "cache_source", "ram"),
+                        ssd_cache_hit=bool(getattr(restored, "ssd_cache_hit", False)),
+                        ssd_cached_tokens=int(
+                            getattr(restored, "ssd_cached_tokens", 0) or 0
+                        ),
+                        ssd_restore_s=float(
+                            getattr(restored, "ssd_restore_s", 0.0) or 0.0
+                        ),
+                        restore_mode=restored.restore_mode,
+                        gdn_boundaries=inherited_boundaries,
+                        restore_served=exact_served,
+                    )
                 )
-                return _emit_prefill_complete(PromptState(
-                    trunk_cache=restored.cache,
-                    logits=restored.logits,
-                    hidden=restored.hidden,
-                    committed_mtp_cache=restored.mtp_history_cache,
-                    token_prefix=tuple(int(token) for token in prompt_ids),
-                    prompt_eval_time_s=repage_time,
-                    cache_restore_time_s=restore_elapsed_s,
-                    mtp_history_policy=mtp_history_policy,
-                    mtp_history_window_tokens=mtp_history_window_tokens,
-                    cached_tokens=restored.entry.prefix_len,
-                    suffix_tokens=0,
-                    cache_hit=True,
-                    cache_source=getattr(restored, "cache_source", "ram"),
-                    ssd_cache_hit=bool(getattr(restored, "ssd_cache_hit", False)),
-                    ssd_cached_tokens=int(getattr(restored, "ssd_cached_tokens", 0) or 0),
-                    ssd_restore_s=float(getattr(restored, "ssd_restore_s", 0.0) or 0.0),
-                    restore_mode=restored.restore_mode,
-                    gdn_boundaries=inherited_boundaries,
-                    restore_served=exact_served,
-                ))
 
             _check_postcommit_abort(abort_check)
             _emit_prefill_restore_progress(
@@ -3591,9 +3593,7 @@ def restore_or_prefill_prompt_state(
                 started_s=prefill_started_s,
                 cache_source=getattr(restored, "cache_source", "ram"),
                 ssd_cache_hit=bool(getattr(restored, "ssd_cache_hit", False)),
-                ssd_cached_tokens=int(
-                    getattr(restored, "ssd_cached_tokens", 0) or 0
-                ),
+                ssd_cached_tokens=int(getattr(restored, "ssd_cached_tokens", 0) or 0),
                 ssd_restore_s=float(getattr(restored, "ssd_restore_s", 0.0) or 0.0),
                 ssd_suffix_tokens=len(suffix),
             )
@@ -3632,32 +3632,36 @@ def restore_or_prefill_prompt_state(
                     stable_prefix_len=stable_prefix_len,
                 )
             )
-            return _emit_prefill_complete(PromptState(
-                trunk_cache=restored.cache,
-                logits=suffix_logits,
-                hidden=suffix_hidden,
-                committed_mtp_cache=restored.mtp_history_cache,
-                token_prefix=tuple(int(token) for token in prompt_ids),
-                prompt_eval_time_s=suffix_time + mtp_history_time,
-                prompt_mtp_history_time_s=mtp_history_time,
-                cache_restore_time_s=restore_elapsed_s,
-                mtp_history_policy=mtp_history_policy,
-                mtp_history_window_tokens=mtp_history_window_tokens,
-                cached_tokens=restored.entry.prefix_len,
-                suffix_tokens=len(suffix),
-                cache_hit=True,
-                cache_source=getattr(restored, "cache_source", "ram"),
-                ssd_cache_hit=bool(getattr(restored, "ssd_cache_hit", False)),
-                ssd_cached_tokens=int(getattr(restored, "ssd_cached_tokens", 0) or 0),
-                ssd_restore_s=float(getattr(restored, "ssd_restore_s", 0.0) or 0.0),
-                restore_mode=restored.restore_mode,
-                gdn_boundaries=(
-                    suffix_boundary_sink
-                    if suffix_boundary_sink is not None
-                    else inherited_boundaries
-                ),
-                restore_served=exact_served,
-            ))
+            return _emit_prefill_complete(
+                PromptState(
+                    trunk_cache=restored.cache,
+                    logits=suffix_logits,
+                    hidden=suffix_hidden,
+                    committed_mtp_cache=restored.mtp_history_cache,
+                    token_prefix=tuple(int(token) for token in prompt_ids),
+                    prompt_eval_time_s=suffix_time + mtp_history_time,
+                    prompt_mtp_history_time_s=mtp_history_time,
+                    cache_restore_time_s=restore_elapsed_s,
+                    mtp_history_policy=mtp_history_policy,
+                    mtp_history_window_tokens=mtp_history_window_tokens,
+                    cached_tokens=restored.entry.prefix_len,
+                    suffix_tokens=len(suffix),
+                    cache_hit=True,
+                    cache_source=getattr(restored, "cache_source", "ram"),
+                    ssd_cache_hit=bool(getattr(restored, "ssd_cache_hit", False)),
+                    ssd_cached_tokens=int(
+                        getattr(restored, "ssd_cached_tokens", 0) or 0
+                    ),
+                    ssd_restore_s=float(getattr(restored, "ssd_restore_s", 0.0) or 0.0),
+                    restore_mode=restored.restore_mode,
+                    gdn_boundaries=(
+                        suffix_boundary_sink
+                        if suffix_boundary_sink is not None
+                        else inherited_boundaries
+                    ),
+                    restore_served=exact_served,
+                )
+            )
 
         near_prompt_state = _restore_near_prefix_prompt_state(
             rt,
@@ -3747,7 +3751,9 @@ def restore_or_prefill_prompt_state(
                     keep = min(len(history_token_ids), mtp_history_window_tokens)
                     dropped = len(history_token_ids) - keep
                     mtp_history_position_base = (
-                        dropped + 1 if mtp_position_mode == "absolute" else max(0, dropped)
+                        dropped + 1
+                        if mtp_position_mode == "absolute"
+                        else max(0, dropped)
                     )
                     history_token_ids = history_token_ids[-keep:]
                     history_hidden = history_hidden[:, -keep:, :]
@@ -3756,7 +3762,9 @@ def restore_or_prefill_prompt_state(
                 if vision_splice is not None:
                     pad_id = vision_splice.image_pad_token_id
                     rows_before = sum(
-                        1 for token in prompt_ids[:history_window_start] if token == pad_id
+                        1
+                        for token in prompt_ids[:history_window_start]
+                        if token == pad_id
                     )
                     if any(token == pad_id for token in history_token_ids):
                         from mtplx.vision.splice import spliced_embeddings_for_window
@@ -3776,7 +3784,8 @@ def restore_or_prefill_prompt_state(
                     mtp_hidden_variant=mtp_hidden_variant,
                     position_offset=(
                         mtp_history_position_base
-                        if mtp_position_mode == "absolute" or mtp_history_policy == "last_window"
+                        if mtp_position_mode == "absolute"
+                        or mtp_history_policy == "last_window"
                         else None
                     ),
                     input_embeddings=history_embeddings,
@@ -3804,23 +3813,25 @@ def restore_or_prefill_prompt_state(
             stable_prefix_len=stable_prefix_len,
         )
         prompt_eval_time = target_time
-    return _emit_prefill_complete(PromptState(
-        trunk_cache=cache,
-        logits=logits,
-        hidden=hidden,
-        committed_mtp_cache=mtp_history_cache,
-        token_prefix=tuple(int(token) for token in prompt_ids),
-        prompt_eval_time_s=prompt_eval_time,
-        prompt_mtp_history_time_s=prompt_history_time,
-        mtp_history_policy=mtp_history_policy,
-        mtp_history_window_tokens=mtp_history_window_tokens,
-        mtp_history_position_base=mtp_history_position_base,
-        suffix_tokens=len(prompt_ids),
-        cache_miss_reason=getattr(session_bank, "last_miss_reason", None)
-        if session_bank is not None
-        else None,
-        gdn_boundaries=list(gdn_boundary_sink or []),
-    ))
+    return _emit_prefill_complete(
+        PromptState(
+            trunk_cache=cache,
+            logits=logits,
+            hidden=hidden,
+            committed_mtp_cache=mtp_history_cache,
+            token_prefix=tuple(int(token) for token in prompt_ids),
+            prompt_eval_time_s=prompt_eval_time,
+            prompt_mtp_history_time_s=prompt_history_time,
+            mtp_history_policy=mtp_history_policy,
+            mtp_history_window_tokens=mtp_history_window_tokens,
+            mtp_history_position_base=mtp_history_position_base,
+            suffix_tokens=len(prompt_ids),
+            cache_miss_reason=getattr(session_bank, "last_miss_reason", None)
+            if session_bank is not None
+            else None,
+            gdn_boundaries=list(gdn_boundary_sink or []),
+        )
+    )
 
 
 def _decode(tokenizer, tokens: list[int]) -> str:
@@ -3954,11 +3965,9 @@ def _sample_from_logits(
 def _greedy_draft_token_and_top2(logits: mx.array) -> tuple[int, float, float]:
     """Materialize one greedy token and its FP32 top-two values together."""
 
-    row = (
-        logits[:, -1, :][0]
-        if logits.ndim == 3
-        else logits.reshape(-1)
-    ).astype(mx.float32)
+    row = (logits[:, -1, :][0] if logits.ndim == 3 else logits.reshape(-1)).astype(
+        mx.float32
+    )
     token_id = mx.argmax(row, axis=-1)
     top2_values = mx.topk(row, k=2)
     _eval(token_id, top2_values)
@@ -4424,9 +4433,9 @@ def _make_device_draft_core(
                 )
                 cdf = mx.cumsum(q_norm, axis=-1)
                 u = mx.random.uniform(key=level_keys[level - 1])
-                pick = mx.minimum(
-                    (cdf <= u).sum(), int(top_idx.shape[0]) - 1
-                ).astype(mx.int32)
+                pick = mx.minimum((cdf <= u).sum(), int(top_idx.shape[0]) - 1).astype(
+                    mx.int32
+                )
                 next_tok = top_idx[pick].reshape(1, 1)
                 q_ids.append(top_idx)
                 q_probs.append(q_norm)
@@ -4528,8 +4537,8 @@ def _prefill(
     cache = _make_target_prefill_cache(rt)
     target_forward_time = 0.0
     final_logits_only = _final_logits_prefill_enabled()
-    capture_boundaries = (
-        gdn_boundary_sink is not None and _cache_has_recurrent_entries(cache)
+    capture_boundaries = gdn_boundary_sink is not None and _cache_has_recurrent_entries(
+        cache
     )
 
     if len(prompt_ids) > 1:
@@ -4633,8 +4642,8 @@ def _prefill_committed_mtp_history_streaming(
     target_forward_time = 0.0
     prompt_history_time = 0.0
     final_logits_only = _final_logits_prefill_enabled()
-    capture_boundaries = (
-        gdn_boundary_sink is not None and _cache_has_recurrent_entries(cache)
+    capture_boundaries = gdn_boundary_sink is not None and _cache_has_recurrent_entries(
+        cache
     )
     body = prompt_ids[:-1]
     history_start_token_index = 1
@@ -4644,7 +4653,9 @@ def _prefill_committed_mtp_history_streaming(
         window = max(1, int(history_window_tokens))
         history_start_token_index = max(1, len(prompt_ids) - window)
         mtp_history_position_base = (
-            history_start_token_index if use_absolute_positions else max(0, history_start_token_index - 1)
+            history_start_token_index
+            if use_absolute_positions
+            else max(0, history_start_token_index - 1)
         )
 
     cursor = 0
@@ -4677,9 +4688,7 @@ def _prefill_committed_mtp_history_streaming(
             chunk_size=prefill_chunk_size,
         )
         if capture_boundaries
-        else _iter_prefill_chunk_spans(
-            len(body), chunk_size=prefill_chunk_size
-        )
+        else _iter_prefill_chunk_spans(len(body), chunk_size=prefill_chunk_size)
     )
     for start, end in mtp_streaming_spans:
         _check_postcommit_abort(abort_check)
@@ -4727,14 +4736,14 @@ def _prefill_committed_mtp_history_streaming(
         if chunk_callback is not None:
             try:
                 now = time.perf_counter()
-                phase_start = chunk_started_s if chunk_started_s is not None else started
+                phase_start = (
+                    chunk_started_s if chunk_started_s is not None else started
+                )
                 chunk_elapsed = max(0.0, now - started)
                 elapsed = max(0.0, now - phase_start)
                 tokens_done = int(cursor + chunk_len)
                 chunk_tok_s = (
-                    float(chunk_len) / chunk_elapsed
-                    if chunk_elapsed > 0.0
-                    else None
+                    float(chunk_len) / chunk_elapsed if chunk_elapsed > 0.0 else None
                 )
                 cumulative_tok_s = (
                     float(tokens_done) / elapsed
@@ -4777,10 +4786,7 @@ def _prefill_committed_mtp_history_streaming(
                 if vision_splice is not None and pad_prefix_counts is not None:
                     window_start = token_start_index + slice_start
                     window_end = window_start + len(sliced_token_ids)
-                    if (
-                        pad_prefix_counts[window_end]
-                        > pad_prefix_counts[window_start]
-                    ):
+                    if pad_prefix_counts[window_end] > pad_prefix_counts[window_start]:
                         from mtplx.vision.splice import (
                             spliced_embeddings_for_window,
                         )
@@ -4810,9 +4816,7 @@ def _prefill_committed_mtp_history_streaming(
                 )
                 _check_postcommit_abort(abort_check)
         cursor += chunk_len
-        boundary_hidden = (
-            hidden_chunk[:, -1:, :] if hidden_chunk is not None else None
-        )
+        boundary_hidden = hidden_chunk[:, -1:, :] if hidden_chunk is not None else None
         del hidden_chunk
         del logits_chunk
         target_forward_time += _prefill_chunk_cache_cleanup(rt)
@@ -5126,11 +5130,7 @@ def generate_ar(
     if prefill_callback is not None:
         try:
             elapsed = max(0.0, time.perf_counter() - prefill_started_s)
-            tok_s = (
-                (len(prompt_ids) / elapsed)
-                if elapsed > 0 and prompt_ids
-                else None
-            )
+            tok_s = (len(prompt_ids) / elapsed) if elapsed > 0 and prompt_ids else None
             prefill_callback(
                 {
                     "phase": "completed",
@@ -5299,9 +5299,8 @@ def generate_ar(
                         },
                     }
                 )
-        _steer_active = (
-            (_loop_guard is not None and _loop_guard.armed)
-            or (_thinking_guard is not None and _thinking_guard.steering_active)
+        _steer_active = (_loop_guard is not None and _loop_guard.armed) or (
+            _thinking_guard is not None and _thinking_guard.steering_active
         )
         logits_row = logits[0]
         if constraint is not None:
@@ -6198,7 +6197,9 @@ def generate_mtpk(
     if getattr(rt, "backend_id", None) == "gemma4_assistant":
         from .backends.gemma4_assistant import generate_gemma4_assistant
 
-        runtime_block_size = int(getattr(getattr(rt, "config", None), "draft_block_size", 0) or 0)
+        runtime_block_size = int(
+            getattr(getattr(rt, "config", None), "draft_block_size", 0) or 0
+        )
         requested_block_size = int(speculative_depth or 0)
         effective_block_size = (
             runtime_block_size
@@ -6226,6 +6227,129 @@ def generate_mtpk(
             prefill_callback=prefill_callback,
             repetition_stop=repetition_stop,
             requested_speculative_depth=requested_block_size,
+        )
+    block_speculative_backend = getattr(rt, "block_speculative_backend", None)
+    if block_speculative_backend is not None:
+        session_state_requested = bool(
+            session_bank is not None
+            or capture_final_state
+            or commit_prompt_state_to_bank
+            or commit_prompt_state_keep_live_ref
+        )
+        unsupported = [
+            label
+            for selected, label in (
+                (base_hidden_variant is not None, "base hidden variant"),
+                (mtp_hidden_variant is not None, "MTP hidden variant"),
+                (mtp_cache_policy != "persistent", "mtp_cache_policy"),
+                (mtp_history_policy != "cycle", "mtp_history_policy"),
+                (draft_margin_threshold is not None, "draft margin threshold"),
+                (min_speculative_depth != 1, "minimum speculative depth"),
+                (verify_strategy != "batched", "verify strategy"),
+                (verify_core != "stock", "verify core"),
+                (draft_core != "stock", "draft core"),
+                (mtp_corrector is not None, "MTP corrector"),
+                (adaptive_policy is not None, "adaptive policy"),
+                (
+                    online_hidden_corrector_alpha != 0.0,
+                    "online hidden corrector",
+                ),
+                (online_hidden_corrector_decay != 0.8, "online corrector decay"),
+                (online_hidden_corrector_warmup != 1, "online corrector warmup"),
+                (
+                    online_hidden_corrector_max_feed_depth is not None,
+                    "online corrector feed depth",
+                ),
+                (online_hidden_corrector_key != "global", "online corrector key"),
+                (online_correction_cache, "online correction cache"),
+                (
+                    online_correction_cache_min_depth != 1,
+                    "online correction cache depth",
+                ),
+                (
+                    online_correction_cache_key != "local_prefix",
+                    "online correction cache key",
+                ),
+                (prompt_correction_cache, "prompt correction cache"),
+                (
+                    prompt_correction_cache_min_depth != 2,
+                    "prompt correction cache depth",
+                ),
+                (adapter_ensemble_q, "adapter ensemble"),
+                (adapter_ensemble_epsilon != 0.5, "adapter ensemble epsilon"),
+                (adapter_ensemble_min_depth != 2, "adapter ensemble depth"),
+                (mtp_topk_reranker is not None, "MTP top-k reranker"),
+                (session_bank is not None, "session bank"),
+                (session_state_requested and session_id is not None, "session id"),
+                (
+                    session_state_requested and session_restore_mode != "clone",
+                    "session restore mode",
+                ),
+                (
+                    session_state_requested and session_template_hash is not None,
+                    "session template hash",
+                ),
+                (
+                    session_state_requested and session_draft_head_identity is not None,
+                    "session draft-head identity",
+                ),
+                (
+                    session_state_requested and session_policy_fingerprint is not None,
+                    "session policy fingerprint",
+                ),
+                (capture_final_state, "final state capture"),
+                (commit_prompt_state_to_bank, "prompt state bank commit"),
+                (
+                    commit_prompt_state_keep_live_ref,
+                    "prompt state live reference",
+                ),
+                (trace_label is not None, "decode trace label"),
+                (trace_metadata is not None, "decode trace metadata"),
+                (
+                    bool(
+                        getattr(
+                            rt,
+                            "block_speculative_decode_trace_requested",
+                            False,
+                        )
+                    ),
+                    "decode trace output",
+                ),
+                (repetition_stop, "repetition stop"),
+                (loop_guard, "loop guard"),
+                (thinking_guard is not None, "thinking guard"),
+                (vision_splice is not None, "vision input"),
+                (constraint is not None, "constrained decoding"),
+                (adaptive_width_policy is not None, "adaptive width policy"),
+            )
+            if selected
+        ]
+        if unsupported:
+            backend_id = str(
+                getattr(block_speculative_backend, "backend_id", "native block backend")
+            )
+            raise ValueError(
+                f"{backend_id} does not yet support: {', '.join(unsupported)}"
+            )
+        from .native_block_speculation import generate_native_block_speculative
+
+        return generate_native_block_speculative(
+            rt,
+            block_speculative_backend,
+            prompt_ids,
+            abort_check=abort_check,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            speculative_depth=speculative_depth,
+            seed=seed,
+            stop_token_ids=stop_token_ids,
+            draft_sampler=draft_sampler,
+            token_callback=token_callback,
+            prefill_callback=prefill_callback,
+            constraint=constraint,
+            vision_splice=vision_splice,
+            adaptive_policy=adaptive_policy,
+            adaptive_width_policy=adaptive_width_policy,
         )
     if not rt.mtp_enabled:
         raise RuntimeError("generate_mtpk requires an MTP-enabled runtime")
@@ -6316,6 +6440,7 @@ def generate_mtpk(
     from .context_copy import (
         context_copy_target_prefix_enabled as _cc_tp_enabled_early,
     )
+
     _penalty_bearing_request = bool(sampler.presence_penalty) or bool(
         sampler.frequency_penalty
     )
@@ -6472,12 +6597,8 @@ def generate_mtpk(
             adaptive_width_policy.stop_after_d1,
             adaptive_width_policy.stop_after_d2,
         )
-        adaptive_width_d1_threshold = float(
-            adaptive_width_policy.d1_margin_threshold
-        )
-        adaptive_width_d2_threshold = float(
-            adaptive_width_policy.d2_margin_threshold
-        )
+        adaptive_width_d1_threshold = float(adaptive_width_policy.d1_margin_threshold)
+        adaptive_width_d2_threshold = float(adaptive_width_policy.d2_margin_threshold)
         adaptive_width_max_depth = int(adaptive_width_policy.max_speculative_depth)
         capture_forward_routes = adaptive_width_policy.target_routes
 
@@ -6771,7 +6892,9 @@ def generate_mtpk(
     # every verified MTP position by its growing in-block prefix (per-position /
     # vLLM-exact). Counts are rebuilt from `tokens` at each sample point — simple
     # and drift-proof; an incremental counter is a documented perf follow-up.
-    _penalties_active = bool(sampler.presence_penalty) or bool(sampler.frequency_penalty)
+    _penalties_active = bool(sampler.presence_penalty) or bool(
+        sampler.frequency_penalty
+    )
     # Loop Guard: loop-armed DRY-style steering (see mtplx/loop_guard.py).
     # Disarmed = zero distribution impact (identity transform, fast paths kept).
     # Armed = target distributions get sparse anti-cycle penalties per position;
@@ -6890,7 +7013,9 @@ def generate_mtpk(
         int(
             position_base_env
             if position_base_env is not None
-            else (len(prompt_state.token_prefix) if mtp_position_mode == "absolute" else 0)
+            else (
+                len(prompt_state.token_prefix) if mtp_position_mode == "absolute" else 0
+            )
         ),
     )
     # Validate env spelling before a long generation starts.
@@ -6904,7 +7029,9 @@ def generate_mtpk(
 
     def mtp_position_offset_for_cache(mtp_cache) -> int | None:
         position_base = mtp_position_base
-        if mtp_cache is mtp_history_cache and _mtp_history_uses_committed_cache(mtp_history_policy):
+        if mtp_cache is mtp_history_cache and _mtp_history_uses_committed_cache(
+            mtp_history_policy
+        ):
             position_base = mtp_history_position_base
         return _mtp_position_offset(
             _mtp_cache_offset(mtp_cache),
@@ -7476,10 +7603,17 @@ def generate_mtpk(
     # ---- context-copy (prompt-lookup) drafting: always on (kill switch
     # MTPLX_CONTEXT_COPY=0); any temperature, no repetition penalties, on
     # capture-commit verify strategies ----
-    from .context_copy import (NgramIndex, block_for_ext, context_copy_block_k,
-                               context_copy_enabled, context_copy_min_ext,
-                               context_copy_ng_max, context_copy_ng_min,
-                               context_copy_target_prefix_enabled)
+    from .context_copy import (
+        NgramIndex,
+        block_for_ext,
+        context_copy_block_k,
+        context_copy_enabled,
+        context_copy_min_ext,
+        context_copy_ng_max,
+        context_copy_ng_min,
+        context_copy_target_prefix_enabled,
+    )
+
     # Temperature is supported through the same probability-ratio acceptance
     # as the MTP path: the copy block is a point-mass proposal, so a copied
     # token is accepted with the target's own shaped probability and a
@@ -7492,7 +7626,10 @@ def generate_mtpk(
     # depth-1 draft; block rounds stay capture_commit-only -- their T+1-row
     # forwards are not AR-exact).  With whole-MoE installed the compiled
     # route is kept and the flag is inert, recorded via disabled_reason.
-    _ccopy_capture_lane = verify_strategy in {"capture_commit", "graphbank_capture_commit"}
+    _ccopy_capture_lane = verify_strategy in {
+        "capture_commit",
+        "graphbank_capture_commit",
+    }
     _ccopy_tp_requested = (
         context_copy_target_prefix_enabled() and verify_strategy == "target_prefix"
     )
@@ -7502,7 +7639,10 @@ def generate_mtpk(
     ccopy_active = (
         context_copy_enabled()
         and not _penalties_active
-        and (_ccopy_capture_lane or (_ccopy_tp_requested and not _ccopy_whole_moe_conflict))
+        and (
+            _ccopy_capture_lane
+            or (_ccopy_tp_requested and not _ccopy_whole_moe_conflict)
+        )
     )
     ccopy_rounds = ccopy_drafted = ccopy_accepted = 0
     ccopy_probes = ccopy_blocks_accepted = ccopy_suspensions = 0
@@ -7513,9 +7653,9 @@ def generate_mtpk(
         # excludes draft substitution.  The compiled route is kept.
         ccopy_disabled_reason = "whole_moe_keeps_compiled_route"
     ccopy_ema, ccopy_seen, ccopy_suspend_until = 0.5, 0, 0
-    ccopy_backoff = 64   # doubles on each suspension (self-repetitive novel text would
-                         # otherwise re-trigger copy rounds after every backoff and pay
-                         # the probe cost recurrently); a paying round resets it.
+    ccopy_backoff = 64  # doubles on each suspension (self-repetitive novel text would
+    # otherwise re-trigger copy rounds after every backoff and pay
+    # the probe cost recurrently); a paying round resets it.
     # Draft-source streak state (target_prefix takeover lane): the copy match
     # feeds the depth-1 DRAFT instead of a block round, so every forward stays
     # on the lane's proven 2-row verify geometry -- bit-exact by construction.
@@ -7636,9 +7776,7 @@ def generate_mtpk(
                 sampler,
                 rng,
                 token_counts=Counter(tokens) if _penalties_active else None,
-                penalty_overlay=(
-                    _steer_overlay(tokens) if _steer_active else None
-                ),
+                penalty_overlay=(_steer_overlay(tokens) if _steer_active else None),
             )
             if first_primary_sample_time_s == 0.0:
                 # First primary token sampled: any lazy tail forced by
@@ -7833,7 +7971,7 @@ def generate_mtpk(
             _cc_block: list[int] = []
             if _cc_pos is not None and _cc_ext >= ccopy_min_ext:
                 _cc_klen = block_for_ext(_cc_ext, ccopy_k)
-                _cc_block = [int(t) for t in prompt_ids[_cc_pos:_cc_pos + _cc_klen]]
+                _cc_block = [int(t) for t in prompt_ids[_cc_pos : _cc_pos + _cc_klen]]
                 _cc_block = _cc_block[: max(1, max_tokens - len(tokens))]
                 if constraint is not None:
                     # Truncate the copy proposal at the first grammar-illegal
@@ -7923,9 +8061,13 @@ def generate_mtpk(
                 _cc_ok = True
                 if _cc_nacc < len(_cc_block):
                     from .gdn_capture import commit_captured_prefix
+
                     started_commit = time.perf_counter()
                     _cc_ok = commit_captured_prefix(
-                        cache, _cc_captures, keep_tokens=_cc_m, verified_tokens=_cc_T,
+                        cache,
+                        _cc_captures,
+                        keep_tokens=_cc_m,
+                        verified_tokens=_cc_T,
                     )
                     capture_commit_time += time.perf_counter() - started_commit
                 if not _cc_ok:
@@ -7959,15 +8101,25 @@ def generate_mtpk(
                     continue
                 _cc_round_pos = len(tokens)
                 _cc_acc = _cc_block[:_cc_nacc]
-                _cc_stop_idx = next((i for i, t in enumerate(_cc_acc)
-                                     if _is_stop(int(t), stop_token_ids)), None)
+                _cc_stop_idx = next(
+                    (
+                        i
+                        for i, t in enumerate(_cc_acc)
+                        if _is_stop(int(t), stop_token_ids)
+                    ),
+                    None,
+                )
                 if _cc_stop_idx is not None:
-                    _cc_acc = _cc_acc[:_cc_stop_idx + 1]
+                    _cc_acc = _cc_acc[: _cc_stop_idx + 1]
                 tokens.extend(_cc_acc)
                 _cc_finished = _cc_stop_idx is not None
-                if constraint is not None and _cc_correction is not None and (
-                    constraint.validate_prefix([*_cc_acc, int(_cc_correction)])
-                    != len(_cc_acc) + 1
+                if (
+                    constraint is not None
+                    and _cc_correction is not None
+                    and (
+                        constraint.validate_prefix([*_cc_acc, int(_cc_correction)])
+                        != len(_cc_acc) + 1
+                    )
                 ):
                     # Grammar-illegal residual: drop it; the next cycle's
                     # masked primary resamples the position, which preserves
@@ -7992,7 +8144,7 @@ def generate_mtpk(
                 ccopy_ema = 0.7 * ccopy_ema + 0.3 * (_cc_nacc / len(_cc_block))
                 ccopy_seen += 1
                 if _cc_nacc / len(_cc_block) >= 0.5:
-                    ccopy_backoff = 64          # copy is paying again: full retry rate
+                    ccopy_backoff = 64  # copy is paying again: full retry rate
                 if ccopy_seen >= 4 and ccopy_ema < 0.35:
                     # acceptance collapsed (novel region with incidental repeats):
                     # suspend copy rounds and let the MTP head work; retry with
@@ -8019,7 +8171,10 @@ def generate_mtpk(
                 # Committed-history MTP caches pair every committed token with the
                 # hidden state of the token before it, including (previous hidden,
                 # primary), which the drafting path would normally have added.
-                if _mtp_history_uses_committed_cache(mtp_history_policy) and mtp_cache is not None:
+                if (
+                    _mtp_history_uses_committed_cache(mtp_history_policy)
+                    and mtp_cache is not None
+                ):
                     _cc_committed_toks = [primary] + _cc_acc
                     _cc_hiddens = mx.concatenate(
                         [hidden, _cc_hidden[:, : len(_cc_acc), :]], axis=1
@@ -8028,7 +8183,7 @@ def generate_mtpk(
                         mtp_cache, _cc_hiddens, _cc_committed_toks
                     )
                 logits = _cc_logits[:, _cc_m - 1, :]
-                hidden = _cc_hidden[:, _cc_m - 1:_cc_m, :]
+                hidden = _cc_hidden[:, _cc_m - 1 : _cc_m, :]
                 append_event(event)
                 emit_new_tokens()
                 if _cc_finished:
@@ -8227,8 +8382,11 @@ def generate_mtpk(
                     ):
                         stored = device_core["state_signature"]
                         diffs = [
-                            (i, stored[i] if i < len(stored) else None,
-                             live_signature[i] if i < len(live_signature) else None)
+                            (
+                                i,
+                                stored[i] if i < len(stored) else None,
+                                live_signature[i] if i < len(live_signature) else None,
+                            )
                             for i in range(max(len(stored), len(live_signature)))
                             if (stored[i] if i < len(stored) else None)
                             != (live_signature[i] if i < len(live_signature) else None)
@@ -8277,9 +8435,7 @@ def generate_mtpk(
                     for depth_index, (draft_token, draft_q) in enumerate(
                         zip(core_tokens, core_qs)
                     ):
-                        draft_probs.append(
-                            draft_q if sampler.temperature > 0 else None
-                        )
+                        draft_probs.append(draft_q if sampler.temperature > 0 else None)
                         drafted += 1
                         drafted_by_depth[depth_index] += 1
                         event["drafts"].append(
@@ -8496,13 +8652,11 @@ def generate_mtpk(
                     need_draft_distribution = (
                         sampler.temperature > 0 and not target_prefix_verify
                     )
-                    draft_token, draft_q, adaptive_width_stop = (
-                        cycle_draft_reader(
-                            draft_logits,
-                            depth_index=depth_index,
-                            need_distribution=need_draft_distribution,
-                            decision_margins=adaptive_width_decision_margins,
-                        )
+                    draft_token, draft_q, adaptive_width_stop = cycle_draft_reader(
+                        draft_logits,
+                        depth_index=depth_index,
+                        need_distribution=need_draft_distribution,
+                        decision_margins=adaptive_width_decision_margins,
                     )
             elapsed_draft = time.perf_counter() - started
             draft_time += elapsed_draft
@@ -8664,9 +8818,7 @@ def generate_mtpk(
             bonus_distribution_row_needed = (
                 not omit_speculative_bonus and len(tokens) + 1 < max_tokens
             )
-            target_distribution_rows_needed = 1 + int(
-                bonus_distribution_row_needed
-            )
+            target_distribution_rows_needed = 1 + int(bonus_distribution_row_needed)
             verified_token_count = 2
             verify_input_array = mx.concatenate(
                 (mx.array([[primary]]), device_draft_token.reshape(1, 1)),
@@ -8841,17 +8993,13 @@ def generate_mtpk(
                 _guarded_rows = []
                 for _row_index in range(int(target_distribution_rows)):
                     _row = target_distribution_logits[:, _row_index, :].reshape(-1)
-                    _row_overlay = _steer_overlay(
-                        [*tokens, *draft_tokens[:_row_index]]
-                    )
+                    _row_overlay = _steer_overlay([*tokens, *draft_tokens[:_row_index]])
                     if _row_overlay:
                         _row = apply_penalties_mlx(
                             _row, None, penalty_overlay=_row_overlay
                         )
                     _guarded_rows.append(_row)
-                target_distribution_logits = mx.stack(_guarded_rows, axis=0)[
-                    None, ...
-                ]
+                target_distribution_logits = mx.stack(_guarded_rows, axis=0)[None, ...]
             sampled_target_ids = sample_token_ids_from_mlx_logits(
                 target_distribution_logits,
                 sampler,
@@ -9026,7 +9174,10 @@ def generate_mtpk(
                     target_distribution_logits,
                     sampler,
                 )
-            if target_distribution_batch is not None or target_distributions is not None:
+            if (
+                target_distribution_batch is not None
+                or target_distributions is not None
+            ):
                 target_distribution_materialized_rows += int(target_distribution_rows)
                 target_distribution_materialized_windows += 1
                 event["target_distribution_materialized"] = {
@@ -9232,10 +9383,7 @@ def generate_mtpk(
                 event["drafts"][depth_index]["online_correction_cache"][
                     "stored_token"
                 ] = cached_target
-            if (
-                sampler.temperature > 0
-                or a3b_target_prefix_route is not None
-            ) and (
+            if (sampler.temperature > 0 or a3b_target_prefix_route is not None) and (
                 constraint is None
                 or constraint.validate_prefix(
                     [*draft_tokens[:depth_index], int(correction)]
@@ -9421,9 +9569,8 @@ def generate_mtpk(
                     continue
                 started_bonus = time.perf_counter()
                 bonus_target_distribution_time = 0.0
-                if (
-                    target_prefix_tokens is not None
-                    and len(target_prefix_tokens) > len(draft_tokens)
+                if target_prefix_tokens is not None and len(target_prefix_tokens) > len(
+                    draft_tokens
                 ):
                     bonus = int(target_prefix_tokens[len(draft_tokens)])
                 elif target_distribution_batch is not None and not lazy_bonus_verify:
@@ -9449,9 +9596,7 @@ def generate_mtpk(
                         rng,
                         token_counts=Counter(tokens) if _penalties_active else None,
                         penalty_overlay=(
-                            _steer_overlay(tokens)
-                            if _steer_active
-                            else None
+                            _steer_overlay(tokens) if _steer_active else None
                         ),
                     )
                     if sampler.temperature > 0:
@@ -9462,7 +9607,9 @@ def generate_mtpk(
                             target_distribution_materialized_windows += 1
                             lazy_target_distribution_window_counted = True
                         target_distribution_materialized_rows += 1
-                        verify_target_distribution_time += bonus_target_distribution_time
+                        verify_target_distribution_time += (
+                            bonus_target_distribution_time
+                        )
                         verify_logits_eval_time += bonus_target_distribution_time
                         verify_eval_time += bonus_target_distribution_time
                         verify_time += bonus_target_distribution_time
@@ -9472,7 +9619,9 @@ def generate_mtpk(
                             materialized.get("mode", "")
                         ).startswith("lazy"):
                             materialized["mode"] = "lazy_accept_bonus_path"
-                            materialized["rows"] = int(materialized.get("rows") or 0) + 1
+                            materialized["rows"] = (
+                                int(materialized.get("rows") or 0) + 1
+                            )
                             materialized["time_s"] = float(
                                 materialized.get("time_s") or 0.0
                             ) + float(bonus_target_distribution_time)
@@ -9491,7 +9640,9 @@ def generate_mtpk(
                         )
                 elapsed_bonus = max(
                     0.0,
-                    time.perf_counter() - started_bonus - bonus_target_distribution_time,
+                    time.perf_counter()
+                    - started_bonus
+                    - bonus_target_distribution_time,
                 )
                 bonus_time += elapsed_bonus
                 _add_timing(event, "bonus_sample", elapsed_bonus)
@@ -9911,9 +10062,7 @@ def generate_mtpk(
     stats = GenerationStats(
         mode="mtpk",
         constraint_active=constraint is not None,
-        constraint_completed=(
-            constraint.completed if constraint is not None else None
-        ),
+        constraint_completed=(constraint.completed if constraint is not None else None),
         constraint_masked_steps=(
             constraint.masked_steps if constraint is not None else 0
         ),
@@ -9978,7 +10127,9 @@ def generate_mtpk(
         ssd_cache_hit=prompt_state.ssd_cache_hit,
         ssd_cached_tokens=prompt_state.ssd_cached_tokens,
         ssd_restore_s=prompt_state.ssd_restore_s,
-        ssd_suffix_tokens=prompt_state.suffix_tokens if prompt_state.ssd_cache_hit else 0,
+        ssd_suffix_tokens=prompt_state.suffix_tokens
+        if prompt_state.ssd_cache_hit
+        else 0,
         cache_miss_reason=prompt_state.cache_miss_reason,
         session_restore_mode=prompt_state.restore_mode,
         session_prompt_prefix_bank_commit=prompt_prefix_bank_commit,

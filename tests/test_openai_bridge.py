@@ -193,12 +193,19 @@ def test_server_parse_args_exposes_product_flags():
     assert args.reasoning_parser == "none"
     assert args.warmup_tokens == 4
     assert args.session_postcommit_mode == "async"
+    assert args.session_cache_mode == "on"
     validate_server_security_args(args)
 
     stock = parse_args(["--stock-ar"])
     assert stock.stock_ar is True
     assert stock.generation_mode == "ar"
     assert stock.load_mtp is False
+
+
+def test_server_parse_args_accepts_construction_time_session_cache_disable():
+    args = parse_args(["--session-cache-mode", "off"])
+
+    assert args.session_cache_mode == "off"
 
 
 def test_generation_final_postcommit_exact_stores_final_state_without_retokenized_prefill():

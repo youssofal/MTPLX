@@ -1,0 +1,33 @@
+{
+  "candidate_label": "com.tea.deepseek-v4-0731.candidate",
+  "candidate_port": 8081,
+  "encoding_repository": "deepseek-ai/DeepSeek-V4-Flash-0731",
+  "encoding_source_revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
+  "encoding_manifest_sha256": "6758dfda8a39afdd00d907606c42c1a268289c463351b9628ac07f4f916d7d0a",
+  "encoding_assets": {
+    "encoding_dsv4.py": "abc0d26120250dda0ae077dc64aa28836026e61e970854aaeb792445e6a0dde6",
+    "tests/test_input_1.json": "10e0c074c977c3a80daab758af28219c6b1c2bd7f3f5cf2890c84b361cc32897",
+    "tests/test_input_2.json": "c44ae0db20fafff38a6021e8068d7ed6e28605d76cafd20be80b03398509f447",
+    "tests/test_input_3.json": "37bf8ef95e0411ea5f411be0b02fbafec7363438b6ccefddca0c52ec9aeaf69a",
+    "tests/test_input_4.json": "c45bbd0a1b7a2f75033d8db4ba74ee5b7653bd01114045a52f79d3b387663465",
+    "tests/test_output_1.txt": "9b366d9d2eac842a6e890594aac0b58648e5623717202b33497afadf03e26540",
+    "tests/test_output_2.txt": "ca66b01a1ac3a204bb032c928fb607d4877171e998a50f7f89f39fa821b75665",
+    "tests/test_output_3.txt": "b3b1cd8748b7b90d3c6be6da3f786f12e4d70be073bd445ea162dfad4dc01a64",
+    "tests/test_output_4.txt": "60e1643840ba9e4aeede450feb7b0498fa66ee24e4a939d48855ce04ec6fc375"
+  },
+  "model_path": "/Users/davidtai/models/DeepSeek-V4-Flash-0731-oQ2e-mtp",
+  "model_config_sha256": "6d0297a4329d55dccf3cd48fd168efea8044996245195d518a9e8aaa14906d3e",
+  "model_index_sha256": "9edcd0db7e6b8f0b8e02978d73c30083b2aa64c2e3a8fd77d3b776a4efb4bc91",
+  "model_tokenizer_config_sha256": "6ac8c8dc065ed118161d02dd532749ae3f52c243deac27872134fae2f50d8547",
+  "artifact_validator_commit": "bbf02944aab3e17be754ba3c88d6aad3c488d10d",
+  "artifact_validator_path": "scripts/deepseek_v4_0731_artifact_check.py",
+  "artifact_validator_blob_sha256": "672e3bafa8381c5264960d065730d9894b12f832eeb358922e0dd703042ac67b",
+  "worktree": "/Users/davidtai/projects/OpenSourceWTF/.worktrees/dsv4-0731-service",
+  "reviewed_ref": "refs/tags/mtplx-dsv4-0731-reviewed",
+  "trusted_python": "/Users/davidtai/projects/OpenSourceWTF/.worktrees/dsv4-0731-service/.venv/bin/python",
+  "trusted_python_target": "/Users/davidtai/.local/share/uv/python/cpython-3.12-macos-aarch64-none/bin/python3.12",
+  "trusted_python_sha256": "96793b100c947cdc81a38e8fb8c9c1889abccda9840ce1bef58d372bf3f2c263",
+  "candidate_entry_sha256": "35b268195eba1af59028f96dd5e6b474d76dcc42844e610743c48a55771d2268",
+  "candidate_plist_sha256": "93eac0d4eaac491c7f2f1d3a293ba38a3144ade59ee3afdf52b35cc9ec9bb101",
+  "served_model_id": "deepseek-v4-0731-candidate"
+}

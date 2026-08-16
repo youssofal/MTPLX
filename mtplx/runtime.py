@@ -10,7 +10,7 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -32,6 +32,72 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .a3b_compiled_target_prefix import A3BCompiledTargetPrefixFactory
+    from .native_block_speculation import NativeBlockSpeculativeBackend
+
+
+DEEPSEEK_V4_DSPARK_BACKEND_ID = "deepseek_v4_dspark_0731"
+
+
+def build_mtpk_request_kwargs(
+    rt: Any,
+    *,
+    common: Mapping[str, Any],
+    legacy_defaults: Mapping[str, Any],
+    explicit_legacy: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build one request while preserving explicit DSpark incompatibilities."""
+    request = dict(common)
+    backend = getattr(rt, "block_speculative_backend", None)
+    if getattr(backend, "backend_id", None) == DEEPSEEK_V4_DSPARK_BACKEND_ID:
+        request.update(explicit_legacy or {})
+    else:
+        request.update(legacy_defaults)
+    return request
+
+
+def _snapshot_deepseek_v4_o_lora_routes(model: Any) -> tuple[tuple[Any, str, Any], ...]:
+    """Capture every trunk and DSpark route before explicit K2 publication."""
+
+    attentions = tuple(layer.attn for layer in model.layers) + tuple(
+        block.attn for block in model.mtp_blocks
+    )
+    try:
+        return tuple(
+            (attention, str(attention.o_lora_mode), attention._o_lora_impl)
+            for attention in attentions
+        )
+    except AttributeError as exc:
+        raise ValueError("DeepSeek-V4-0731 K2 o-LoRA ownership is incomplete") from exc
+
+
+def _restore_deepseek_v4_o_lora_routes(
+    state: tuple[tuple[Any, str, Any], ...] | None,
+) -> list[Exception]:
+    failures: list[Exception] = []
+    for attention, mode, implementation in state or ():
+        try:
+            attention.o_lora_mode = mode
+        except Exception as exc:
+            failures.append(exc)
+        try:
+            attention._o_lora_impl = implementation
+        except Exception as exc:
+            failures.append(exc)
+    return failures
+
+
+def _rollback_deepseek_v4_0731_k2(
+    prepared: tuple[Any, ...] | None,
+    o_lora_state: tuple[tuple[Any, str, Any], ...] | None,
+) -> list[Exception]:
+    failures: list[Exception] = []
+    for route_bank in reversed(prepared or ()):
+        try:
+            route_bank.restore()
+        except Exception as exc:
+            failures.append(exc)
+    failures.extend(_restore_deepseek_v4_o_lora_routes(o_lora_state))
+    return failures
 
 
 def _detect_total_system_memory_bytes() -> int | None:
@@ -94,6 +160,10 @@ class MTPLXRuntime:
     deepseek_v4_o_lora_report: dict[str, Any] | None = None
     deepseek_v4_attn_proj_wide_m3_report: dict[str, Any] | None = None
     deepseek_v4_attention_island_report: dict[str, Any] | None = None
+    deepseek_v4_dspark_enabled: bool = False
+    deepseek_v4_0731_k2_receipt: dict[str, Any] | None = None
+    block_speculative_backend: NativeBlockSpeculativeBackend | None = None
+    block_speculative_decode_trace_requested: bool = False
     a3b_compiled_target_prefix_factory: A3BCompiledTargetPrefixFactory | None = None
     a3b_whole_moe_installed: bool = False
     qwen_row_owned_router_report: dict[str, Any] = field(default_factory=dict)
@@ -102,15 +172,21 @@ class MTPLXRuntime:
         init=False,
         repr=False,
     )
-    _a3b_whole_moe_request_geometry_keys: dict[
-        tuple[int, str, str], str
-    ] = field(default_factory=dict, init=False, repr=False)
+    _a3b_whole_moe_request_geometry_keys: dict[tuple[int, str, str], str] = field(
+        default_factory=dict, init=False, repr=False
+    )
     diagnostic_counters: dict[str, int] = field(default_factory=dict)
-    _forward_ar_supports_emit_logits: bool | None = field(default=None, init=False, repr=False)
-    _forward_ar_supports_logits_keep: bool | None = field(default=None, init=False, repr=False)
+    _forward_ar_supports_emit_logits: bool | None = field(
+        default=None, init=False, repr=False
+    )
+    _forward_ar_supports_logits_keep: bool | None = field(
+        default=None, init=False, repr=False
+    )
 
     def _count(self, key: str, amount: int = 1) -> None:
-        self.diagnostic_counters[key] = int(self.diagnostic_counters.get(key, 0)) + int(amount)
+        self.diagnostic_counters[key] = int(self.diagnostic_counters.get(key, 0)) + int(
+            amount
+        )
 
     @staticmethod
     def _sequence_len(input_ids: Any) -> int:
@@ -162,7 +238,9 @@ class MTPLXRuntime:
         logits_keep: int | None = None,
         input_embeddings=None,
     ):
-        self._count("forward_ar_hidden_calls" if return_hidden else "forward_ar_plain_calls")
+        self._count(
+            "forward_ar_hidden_calls" if return_hidden else "forward_ar_plain_calls"
+        )
         if not self.mtp_enabled and return_hidden:
             raise RuntimeError("return_hidden requires an MTP-patched runtime")
         if input_embeddings is not None and not self.mtp_enabled:
@@ -206,9 +284,7 @@ class MTPLXRuntime:
             # unprimed cache: seeding the compiled graph from its None KV
             # leaves throws, and its shape differs from a single-token decode
             # step, forcing a retrace. Prefill stays eager.
-            compiled = (
-                self._compiled_ar_forward(cache) if sequence_len == 1 else None
-            )
+            compiled = self._compiled_ar_forward(cache) if sequence_len == 1 else None
             if compiled is not None:
                 # Engagement proof: arm A (flag off) must report 0 here,
                 # arm B (on) > 0 — the A/B credits nothing without it.
@@ -343,7 +419,9 @@ class MTPLXRuntime:
             else str(mtp_hidden_variant)
         )
         resolved_concat_order = (
-            self.contract.concat_order if concat_order in {None, "auto", "contract"} else concat_order
+            self.contract.concat_order
+            if concat_order in {None, "auto", "contract"}
+            else concat_order
         )
         with mtp_adapter_depth(self.model, mtp_depth):
             kwargs = {
@@ -380,7 +458,9 @@ class MTPLXRuntime:
             else str(mtp_hidden_variant)
         )
         resolved_concat_order = (
-            self.contract.concat_order if concat_order in {None, "auto", "contract"} else concat_order
+            self.contract.concat_order
+            if concat_order in {None, "auto", "contract"}
+            else concat_order
         )
         update = getattr(self.model, "mtp_update_cache", None)
         if update is not None:
@@ -570,6 +650,8 @@ def load(
     gemma4_target_distribution_mode: str | None = None,
     proj_quant: str | None = None,
     proj_requant: str | None = None,
+    deepseek_v4_0731_k2: bool = False,
+    deepseek_v4_0731_depth: int | None = None,
 ) -> MTPLXRuntime:
     """Load an MLX model and optionally inject native MTP support.
 
@@ -579,7 +661,25 @@ def load(
     to the trunk only, before MTP injection, so a draft head's precision is
     never reduced.
     """
+    if deepseek_v4_0731_k2 and not mtp:
+        raise ValueError("DeepSeek-V4-0731 K2 construction requires mtp=True")
+    selected_0731_depth = (
+        2 if deepseek_v4_0731_depth is None else int(deepseek_v4_0731_depth)
+    )
+    if deepseek_v4_0731_k2 and selected_0731_depth not in {1, 2, 3}:
+        raise ValueError("DeepSeek-V4-0731 optimized depth must be 1, 2, or 3")
     path = Path(model_path)
+    k2_config = None
+    if deepseek_v4_0731_k2:
+        from .deepseek_v4_0731_full_install import (
+            validate_full_0731_dspark_artifact,
+        )
+
+        k2_config = load_config(path)
+        # This validates config/index bytes, source revision, topology, and the
+        # exact DSpark manifest before any paired or ordinary loader can
+        # construct a model.
+        validate_full_0731_dspark_artifact(path, k2_config)
     from .gemma4_pair import resolve_gemma4_pair_paths
 
     gemma4_pair = resolve_gemma4_pair_paths(path)
@@ -592,9 +692,7 @@ def load(
             )
 
             metadata = gemma4_pair["metadata"]
-            benchmark = (
-                metadata.get("benchmark") if isinstance(metadata, dict) else {}
-            )
+            benchmark = metadata.get("benchmark") if isinstance(metadata, dict) else {}
             draft_block_size = DEFAULT_DRAFT_BLOCK_SIZE
             if isinstance(benchmark, dict):
                 try:
@@ -618,7 +716,7 @@ def load(
             runtime.bundle_path = path
             return runtime
         path = Path(gemma4_pair["target_model"])
-    config = load_config(path)
+    config = k2_config if k2_config is not None else load_config(path)
     from .a3b_whole_moe import validate_a3b_whole_moe_load_options
 
     validate_a3b_whole_moe_load_options(
@@ -661,6 +759,11 @@ def load(
 
         tokenizer = _load_tokenizer_resilient(path, config)
         model, _loaded_config = load_model(path)
+    elif deepseek_v4_0731_k2:
+        from .models.deepseek_v4 import deepseek_v4_0731_k2_construction
+
+        with deepseek_v4_0731_k2_construction():
+            model, tokenizer = _load_base_model(path, config)
     else:
         model, tokenizer = _load_base_model(path, config)
     import os as _os
@@ -674,16 +777,21 @@ def load(
             touched = quantize_projections(model, proj_quant)
             logger.info(
                 "[proj-quant] quantized %d trunk *_proj modules to %s",
-                len(touched), proj_quant,
+                len(touched),
+                proj_quant,
             )
         if proj_requant:
             touched = requantize_projections(model, proj_requant)
             logger.info(
                 "[proj-quant] requantized %d trunk *_proj modules to %s",
-                len(touched), proj_requant,
+                len(touched),
+                proj_requant,
             )
     deepseek_v4_attn_proj_wide_m3_report = None
-    if str((config or {}).get("model_type") or "").lower() == "deepseek_v4":
+    if (
+        str((config or {}).get("model_type") or "").lower() == "deepseek_v4"
+        and not deepseek_v4_0731_k2
+    ):
         from .models.deepseek_v4 import configure_deepseek_v4_moe_tail
 
         configure_deepseek_v4_moe_tail(model, config)
@@ -710,20 +818,38 @@ def load(
         .with_config_defaults(config)
     )
     mtp_enabled = False
+    block_speculative_backend = None
     if mtp:
-        from .deepseek_mtp_patch import inject_deepseek_mtp_support, is_deepseek_mtp_config
+        from .deepseek_mtp_patch import (
+            inject_deepseek_mtp_support,
+            is_deepseek_mtp_config,
+        )
         from .glm_mtp_patch import inject_glm_mtp_support, is_glm_mtp_config
         from .mimo_mtp_patch import inject_mimo_mtp_support, is_mimo_mtp_config
-        from .nemotron_h_mtp_patch import inject_nemotron_h_mtp_support, is_nemotron_h_mtp_config
+        from .nemotron_h_mtp_patch import (
+            inject_nemotron_h_mtp_support,
+            is_nemotron_h_mtp_config,
+        )
         from .step3p5_mtp_patch import inject_step3p5_mtp_support
         from .hy_v3_mtp_patch import inject_hy_v3_mtp_support, is_hy_v3_mtp_config
         from .models.deepseek_v4 import (
+            _config_has_dspark_signature,
             inject_deepseek_v4_mtp_support,
             is_deepseek_v4_mtp_config,
         )
         from .qwen3_5_mtp_patch import inject_qwen3_5_mtp_support
 
-        if is_deepseek_v4_mtp_config(config):
+        if _config_has_dspark_signature(config):
+            if not deepseek_v4_0731_k2:
+                from .deepseek_v4_dspark_generation import DeepseekV4DSparkBackend
+
+                # The 0731 artifact owns a fixed three-stage proposer rather than
+                # the preview model's reusable one-block MTP head. Bind every
+                # callable and ownership invariant once, before the runtime is
+                # published; this route never enters legacy MTP validation.
+                block_speculative_backend = DeepseekV4DSparkBackend.bind(model)
+            mtp_enabled = True
+        elif is_deepseek_v4_mtp_config(config):
             # Native draft head: the block binds through the ordinary load path
             # and the model already carries the runtime surface, so this only
             # publishes it. Placed ahead of is_deepseek_mtp_config defensively --
@@ -747,22 +873,23 @@ def load(
             mtp_enabled = inject_deepseek_mtp_support(model, path, config, contract)
         else:
             mtp_enabled = inject_mtp_support(model, path, config, contract)
-        if mtp_enabled:
-            if not validate_mtp_support(model):
+        if block_speculative_backend is None and not deepseek_v4_0731_k2:
+            if mtp_enabled:
+                if not validate_mtp_support(model):
+                    raise RuntimeError(f"MTP injection failed for {path}")
+            elif mtp_weights_present_on_disk(path, config):
+                # MTP weights ship with the model but injection could not use
+                # them: a genuine failure the operator should see.
                 raise RuntimeError(f"MTP injection failed for {path}")
-        elif mtp_weights_present_on_disk(path, config):
-            # MTP weights ship with the model but injection could not use
-            # them: a genuine failure the operator should see.
-            raise RuntimeError(f"MTP injection failed for {path}")
-        else:
-            # The config declares MTP layers but no MTP weights are present on
-            # disk (e.g. a quant conversion that dropped the draft head).
-            # Degrade to autoregressive rather than failing the load.
-            logger.warning(
-                "[MTP] %s declares MTP layer(s) but ships no MTP weights; "
-                "serving autoregressive (no speculative draft head).",
-                path,
-            )
+            else:
+                # The config declares MTP layers but no MTP weights are present on
+                # disk (e.g. a quant conversion that dropped the draft head).
+                # Degrade to autoregressive rather than failing the load.
+                logger.warning(
+                    "[MTP] %s declares MTP layer(s) but ships no MTP weights; "
+                    "serving autoregressive (no speculative draft head).",
+                    path,
+                )
     compiled_target_factory = None
     whole_moe_plan = None
     selfcheck_report = None
@@ -840,7 +967,9 @@ def load(
                 "whole-MoE target M2 requires the accepted row-owned router/combine route"
             )
         if router_plan is not None:
-            router_report = install_qwen_row_owned_routers(router_plan, selfcheck_report)
+            router_report = install_qwen_row_owned_routers(
+                router_plan, selfcheck_report
+            )
             logger.info("[qwen-row-owned-router] %s", router_report)
         if whole_moe_plan is not None:
             selfcheck_report = run_a3b_whole_moe_selfcheck(
@@ -848,9 +977,7 @@ def load(
                 selfcheck_report,
             )
         if postconv_plan is not None:
-            postconv_factory = install_a3b_gdn_postconv(
-                postconv_plan, selfcheck_report
-            )
+            postconv_factory = install_a3b_gdn_postconv(postconv_plan, selfcheck_report)
             from .gdn_capture import gdn_postconv_stats
 
             logger.info("[a3b-gdn-postconv] %s", gdn_postconv_stats())
@@ -872,13 +999,23 @@ def load(
         raise RuntimeError("merge_mtp_adapter requires mtp_adapter")
     deepseek_v4_o_lora_report = None
     deepseek_v4_attention_island_report = None
+    k2_o_lora_state = None
     if str(config.get("model_type") or "").lower() == "deepseek_v4":
         from .models.deepseek_v4 import (
             _o_lora_mode_from_env,
             install_deepseek_v4_o_lora_routes,
         )
 
-        selected_o_lora_mode = _o_lora_mode_from_env()
+        selected_o_lora_mode = (
+            "gather_qmm" if deepseek_v4_0731_k2 else _o_lora_mode_from_env()
+        )
+        if deepseek_v4_0731_k2:
+            # Snapshot every owner before the reversible construction transaction.
+            # The fused WOB preparer requires the installed gather route to own
+            # the same stock wo_b object, so gather publication happens first,
+            # while the model is still private to load(), and rolls back on any
+            # later preparation or publication failure.
+            k2_o_lora_state = _snapshot_deepseek_v4_o_lora_routes(model)
         # The canonical mixed route hard-validates the exact DeepSeek-V4-Flash
         # topology (43 body layers, rank-1024 Q4/g64 wo_a/wo_b, one dense-BF16
         # MTP block) and refuses anything else. That strictness is correct for
@@ -888,27 +1025,31 @@ def load(
         # route — which is bit-identical on the canonical artifact anyway
         # (test_cached_dequant_is_bit_identical).
         canonical_mixed_route = bool(
-            mtp_enabled and selected_o_lora_mode == "gather_qmm"
+            mtp_enabled
+            and block_speculative_backend is None
+            and not deepseek_v4_0731_k2
+            and selected_o_lora_mode == "gather_qmm"
         )
         if not mtp_enabled:
             # An artifact that declared but did not ship MTP weights already
             # degraded to AR above. It has no dense MTP module to validate or
             # route, so bind the trunk's explicit stock/cached construction.
             selected_o_lora_mode = "cached"
-        deepseek_v4_o_lora_report = install_deepseek_v4_o_lora_routes(
-            model,
-            mode=selected_o_lora_mode,
-            canonical_mixed_route=canonical_mixed_route,
-        )
-        logger.info("[deepseek-v4-o-lora] %s", deepseek_v4_o_lora_report)
+        if not deepseek_v4_0731_k2:
+            deepseek_v4_o_lora_report = install_deepseek_v4_o_lora_routes(
+                model,
+                mode=selected_o_lora_mode,
+                canonical_mixed_route=canonical_mixed_route,
+            )
+            logger.info("[deepseek-v4-o-lora] %s", deepseek_v4_o_lora_report)
         from .deepseek_v4_attention_island import (
             deepseek_v4_attention_island_enabled,
             install_deepseek_v4_attention_island,
         )
 
-        if deepseek_v4_attention_island_enabled():
-            deepseek_v4_attention_island_report = (
-                install_deepseek_v4_attention_island(model, config)
+        if not deepseek_v4_0731_k2 and deepseek_v4_attention_island_enabled():
+            deepseek_v4_attention_island_report = install_deepseek_v4_attention_island(
+                model, config
             )
             logger.info(
                 "[deepseek-v4-attention-island] %s",
@@ -925,27 +1066,101 @@ def load(
         fused_report = _laguna_install_fused(model)
         if fused_report:
             logger.info("[laguna-fused] %s", fused_report)
+    deepseek_v4_0731_k2_receipt = None
+    k2_prepared = None
+    if deepseek_v4_0731_k2:
+        from .deepseek_v4_0731_dspark_ffn import (
+            prepare_dspark_q3_packed_gate_up_m5,
+        )
+        from .deepseek_v4_0731_full_install import (
+            prepare_full_0731_dspark_compiled_tail_q2_pair,
+        )
+        from .deepseek_v4_0731_m3_wob import prepare_wob_m3
+        from .deepseek_v4_0731_m3_wqb_qnorm_rope import prepare_wqb_qhead_m3
+        from .deepseek_v4_dspark_generation import DeepseekV4DSparkBackend
+
+        try:
+            deepseek_v4_o_lora_report = install_deepseek_v4_o_lora_routes(
+                model,
+                mode="gather_qmm",
+                canonical_mixed_route=False,
+            )
+            logger.info("[deepseek-v4-o-lora] %s", deepseek_v4_o_lora_report)
+            target_prepared = prepare_full_0731_dspark_compiled_tail_q2_pair(
+                model,
+                config,
+                path,
+                prepare_wqb_qhead=prepare_wqb_qhead_m3,
+                prepare_wob=prepare_wob_m3,
+            )
+            ffn_prepared = prepare_dspark_q3_packed_gate_up_m5(model)
+            k2_prepared = (target_prepared, ffn_prepared)
+            target_prepared.publish()
+            ffn_prepared.publish()
+            block_speculative_backend = DeepseekV4DSparkBackend.bind(
+                model,
+                supported_depths=(selected_0731_depth,),
+            )
+        except Exception as failure:
+            rollback_failures = _rollback_deepseek_v4_0731_k2(
+                k2_prepared,
+                k2_o_lora_state,
+            )
+            if rollback_failures:
+                raise ExceptionGroup(
+                    "DeepSeek-V4-0731 K2 publication and rollback failed",
+                    [failure, *rollback_failures],
+                ) from failure
+            raise
+        deepseek_v4_0731_k2_receipt = {
+            "target_protocol": (
+                "primary_plus_two_drafts_physical_m3"
+                if selected_0731_depth == 2
+                else f"primary_plus_{selected_0731_depth}_drafts_native_m{selected_0731_depth + 1}"
+            ),
+            "selected_depth": selected_0731_depth,
+            "exact_vs_serial_greedy": False,
+            "target": target_prepared.receipt,
+            "dspark_ffn": ffn_prepared.receipt,
+        }
     runtime_class = (
-        LagunaARRuntime
-        if _is_laguna_s_2_1_mlx_4bit_config(config)
-        else MTPLXRuntime
+        LagunaARRuntime if _is_laguna_s_2_1_mlx_4bit_config(config) else MTPLXRuntime
     )
-    runtime = runtime_class(
-        model,
-        tokenizer,
-        path,
-        mtp_enabled,
-        contract,
-        mtp_adapter_path=adapter_path,
-        mtp_adapter_metadata=adapter_metadata,
-        mtp_adapter_merge_report=adapter_merge_report,
-        deepseek_v4_o_lora_report=deepseek_v4_o_lora_report,
-        deepseek_v4_attn_proj_wide_m3_report=deepseek_v4_attn_proj_wide_m3_report,
-        deepseek_v4_attention_island_report=deepseek_v4_attention_island_report,
-        a3b_compiled_target_prefix_factory=compiled_target_factory,
-        a3b_whole_moe_installed=False,
-        qwen_row_owned_router_report=router_report,
-    )
+    try:
+        runtime = runtime_class(
+            model,
+            tokenizer,
+            path,
+            mtp_enabled,
+            contract,
+            mtp_adapter_path=adapter_path,
+            mtp_adapter_metadata=adapter_metadata,
+            mtp_adapter_merge_report=adapter_merge_report,
+            deepseek_v4_o_lora_report=deepseek_v4_o_lora_report,
+            deepseek_v4_attn_proj_wide_m3_report=deepseek_v4_attn_proj_wide_m3_report,
+            deepseek_v4_attention_island_report=deepseek_v4_attention_island_report,
+            deepseek_v4_dspark_enabled=block_speculative_backend is not None,
+            deepseek_v4_0731_k2_receipt=deepseek_v4_0731_k2_receipt,
+            block_speculative_backend=block_speculative_backend,
+            block_speculative_decode_trace_requested=bool(
+                block_speculative_backend is not None
+                and os.environ.get("MTPLX_DECODE_TRACE_JSONL")
+            ),
+            a3b_compiled_target_prefix_factory=compiled_target_factory,
+            a3b_whole_moe_installed=False,
+            qwen_row_owned_router_report=router_report,
+        )
+    except Exception as failure:
+        rollback_failures = _rollback_deepseek_v4_0731_k2(
+            k2_prepared,
+            k2_o_lora_state,
+        )
+        if rollback_failures:
+            raise ExceptionGroup(
+                "DeepSeek-V4-0731 K2 runtime publication and rollback failed",
+                [failure, *rollback_failures],
+            ) from failure
+        raise
     if whole_moe_plan is not None:
         if compiled_target_factory is None:
             from .a3b_whole_moe import A3BWholeMoeConfigError
@@ -1100,10 +1315,18 @@ def _load_tokenizer_resilient(model_path: Path, config: dict[str, Any]) -> Any:
     from transformers import PreTrainedTokenizerFast
 
     tcfg_path = model_path / "tokenizer_config.json"
-    tcfg = json.loads(tcfg_path.read_text(encoding="utf-8")) if tcfg_path.exists() else {}
+    tcfg = (
+        json.loads(tcfg_path.read_text(encoding="utf-8")) if tcfg_path.exists() else {}
+    )
     passthrough = {
         key: tcfg[key]
-        for key in ("bos_token", "eos_token", "pad_token", "unk_token", "additional_special_tokens")
+        for key in (
+            "bos_token",
+            "eos_token",
+            "pad_token",
+            "unk_token",
+            "additional_special_tokens",
+        )
         if key in tcfg
     }
     hf_tokenizer = PreTrainedTokenizerFast(
@@ -1158,10 +1381,7 @@ def _mtp_alias_load_path(path: Path, config: dict[str, Any] | None) -> Path:
     import importlib.util
 
     def _mlx_lm_has(model_type_name: str) -> bool:
-        return (
-            importlib.util.find_spec(f"mlx_lm.models.{model_type_name}")
-            is not None
-        )
+        return importlib.util.find_spec(f"mlx_lm.models.{model_type_name}") is not None
 
     if _mlx_lm_has(model_type) or not _mlx_lm_has(base_type):
         return path

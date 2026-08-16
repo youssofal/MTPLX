@@ -312,6 +312,35 @@ def test_gather_qmm_calling_convention_shapes():
         assert rel < 1e-3, f"rows={rows} grouped qmm rel={rel:.3e}"
 
 
+def test_gather_qmm_accepts_mlx_bitstream_packed_q6_rows():
+    """Q6 packs 16 values across three uint32 words, not 32//bits per word."""
+    _, model = _seeded_model(o_lora_rank=16)
+    nn.quantize(
+        model,
+        group_size=32,
+        bits=6,
+        class_predicate=lambda path, _module: path.endswith(
+            ("attn.wo_a", "attn.wo_b")
+        ),
+    )
+    mx.eval(model.parameters())
+    attn = model.layers[0].attn
+    assert tuple(attn.wo_a.weight.shape) == (32, 6)
+    assert D._o_lora_linear_logical_weight_shape(attn.wo_a) == (32, 32)
+    assert D._o_lora_linear_logical_weight_shape(attn.wo_b) == (32, 32)
+    o = mx.sin(mx.arange(N_HEADS * HEAD_DIM, dtype=mx.float32) * 0.017)
+    o = o.reshape(1, 1, -1).astype(mx.bfloat16)
+    want = attn._o_lora_dense(o)
+
+    receipt = attn.install_o_lora_route("gather_qmm")
+    got = attn._o_lora(o)
+    mx.eval(want, got)
+
+    assert receipt["direct"] is True
+    assert tuple(got.shape) == tuple(want.shape)
+    assert float(mx.max(mx.abs(got - want))) <= 0.125
+
+
 def test_gather_qmm_is_prebound_and_never_rechecks_or_falls_back(monkeypatch):
     _, model = _quantized_model()
     attn = model.layers[0].attn

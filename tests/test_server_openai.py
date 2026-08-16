@@ -675,6 +675,86 @@ def test_serial_mtp_health_never_labels_queued_requests_as_ar():
     assert openai._use_live_ar_batch(state, effective_mode="mtp") == (False, None)
 
 
+def test_server_parser_accepts_explicit_0731_k2_construction_option():
+    default = parse_args(["--warmup-tokens", "0"])
+    selected = parse_args(
+        [
+            "--warmup-tokens",
+            "0",
+            "--deepseek-v4-0731-k2",
+            "--depth",
+            "2",
+        ]
+    )
+
+    assert default.deepseek_v4_0731_k2 is False
+    assert selected.deepseek_v4_0731_k2 is True
+    assert "deepseek-v4-0731-k2" in selected._cli_flags
+    assert "depth" in selected._cli_flags
+
+
+def test_server_parser_accepts_optimized_0731_k3_construction_option():
+    selected = parse_args(
+        [
+            "--warmup-tokens",
+            "0",
+            "--deepseek-v4-0731-optimized",
+            "--depth",
+            "3",
+        ]
+    )
+
+    assert selected.deepseek_v4_0731_optimized is True
+    assert "deepseek-v4-0731-optimized" in selected._cli_flags
+    openai._validate_deepseek_v4_0731_entrypoint(selected)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--deepseek-v4-0731-k2"],
+        ["--deepseek-v4-0731-k2", "--depth", "3"],
+        ["--deepseek-v4-0731-k2", "--depth", "2", "--no-load-mtp"],
+        ["--deepseek-v4-0731-k2", "--depth", "2", "--generation-mode", "ar"],
+    ],
+)
+def test_server_rejects_invalid_0731_k2_selection_before_load(monkeypatch, argv):
+    monkeypatch.setattr(
+        openai,
+        "load",
+        lambda *_args, **_kwargs: pytest.fail("invalid K2 selection reached load"),
+    )
+    args = parse_args(["--warmup-tokens", "0", *argv])
+
+    with pytest.raises(ValueError, match="DeepSeek-V4-0731 K2"):
+        openai.ServerState(args)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--deepseek-v4-0731-optimized"],
+        ["--deepseek-v4-0731-optimized", "--depth", "4"],
+        ["--deepseek-v4-0731-optimized", "--depth", "3", "--no-load-mtp"],
+        ["--deepseek-v4-0731-optimized", "--depth", "3", "--generation-mode", "ar"],
+    ],
+)
+def test_server_rejects_invalid_0731_optimized_selection_before_load(
+    monkeypatch, argv
+):
+    monkeypatch.setattr(
+        openai,
+        "load",
+        lambda *_args, **_kwargs: pytest.fail(
+            "invalid optimized 0731 selection reached load"
+        ),
+    )
+    args = parse_args(["--warmup-tokens", "0", *argv])
+
+    with pytest.raises(ValueError, match="DeepSeek-V4-0731 optimized"):
+        openai.ServerState(args)
+
+
 def test_server_parser_resolves_api_key_file_before_env(monkeypatch, tmp_path):
     api_key_file = tmp_path / "api-key"
     api_key_file.write_text("file-secret\n", encoding="utf-8")
@@ -1614,12 +1694,14 @@ def test_vision_splice_kwargs_always_match_callee_signatures():
     import ast
 
     import mtplx.generation
+    import mtplx.native_block_speculation
     import mtplx.runtime
     import mtplx.vision.splice
 
     sources = [
         Path(openai.__file__),
         Path(mtplx.generation.__file__),
+        Path(mtplx.native_block_speculation.__file__),
         Path(mtplx.runtime.__file__),
         Path(mtplx.vision.splice.__file__),
     ]
@@ -1780,6 +1862,7 @@ def _fake_state(*, api_key: str | None = None, rate_limit: int = 0):
         warmup_status={"enabled": False, "ran": False, "tokens": 0},
         last_metrics=[{"tok_s": 12.5, "accept_rate": 0.75}],
         rate_limiter=_RateLimiter(rate_limit),
+        session_cache_bypass=openai._dynamic_session_cache_bypass,
         sessions=SimpleNamespace(
             list_sessions=lambda: {"sessions": [], "count": 0, "session_bank": {}},
             clear_session=lambda session_id: {"cleared": session_id},
@@ -3514,6 +3597,60 @@ def test_nonstream_unsafe_mtp_schedules_async_postcommit_in_default_mode(
     assert scheduled[0]["unsafe_reason"] == "missing_generation_final_state"
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_global_session_cache_off_uses_stateless_path_without_postcommit(
+    monkeypatch, stream
+):
+    state = _fake_streaming_session_state()
+    state.args.session_cache_mode = "off"
+    state.session_cache_bypass = openai._global_stateless_session_cache_bypass
+    state.sessions = openai._StatelessSessionRoute()
+    generated_calls: list[dict] = []
+
+    def fake_schedule(*_args, **_kwargs):
+        raise AssertionError("stateless requests must not schedule postcommit")
+
+    def fake_run_generation(_state, prompt_ids, **kwargs):
+        generated_calls.append(kwargs)
+        tokens = [ord("O"), ord("K")]
+        callback = kwargs.get("token_callback")
+        if callback is not None:
+            callback(tokens)
+        return {
+            "text": "OK",
+            "tokens": tokens,
+            "stats": {
+                "generation_mode": kwargs["generation_mode"],
+                "mtp_depth": kwargs["depth"],
+                "completion_tokens": 2,
+            },
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": 2,
+            "finish_reason": "stop",
+            "_final_state": None,
+        }
+
+    monkeypatch.setattr(openai, "_schedule_idle_postcommit_snapshot", fake_schedule)
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+
+    with TestClient(create_app(state)) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"x-mtplx-session-id": "must-not-create-session"},
+            json={
+                "messages": [{"role": "user", "content": "Say OK"}],
+                "enable_thinking": False,
+                "stream": stream,
+                "max_tokens": 4,
+            },
+        )
+
+    assert response.status_code == 200
+    assert generated_calls[0]["session_bank"] is None
+    assert state.sessions.list_sessions()["sessions"] == []
+    assert "session_postcommit_snapshot" not in response.text
+
+
 def test_streaming_ar_schedules_async_postcommit_in_default_mode(monkeypatch):
     state = _fake_streaming_session_state()
     scheduled: list[dict] = []
@@ -4767,6 +4904,167 @@ def test_tool_requests_enable_prompt_prefix_bank_commit(monkeypatch):
 
     assert captured["commit_prompt_state_to_bank"] is True
     assert captured["commit_prompt_state_keep_live_ref"] is False
+
+
+def test_run_generation_dspark_omits_implicit_legacy_request_state(monkeypatch):
+    state = _fake_streaming_session_state()
+    state.draft_sampler = None
+    state.requests_completed = 0
+    state.args._cli_flags = set()
+    state.runtime.block_speculative_backend = SimpleNamespace(
+        backend_id="deepseek_v4_dspark_0731"
+    )
+    state.runtime.block_speculative_decode_trace_requested = False
+    captured: dict[str, object] = {}
+
+    def fake_generate_mtpk(*_args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            tokens=[],
+            text="",
+            stats=SimpleNamespace(
+                to_dict=lambda: {
+                    "prompt_eval_time_s": 0.0,
+                    "generated_tokens": 0,
+                    "elapsed_s": 0.0,
+                    "tok_s": 0.0,
+                }
+            ),
+            final_state=None,
+        )
+
+    monkeypatch.setattr(openai, "generate_mtpk", fake_generate_mtpk)
+    openai._run_generation(
+        state,
+        [1, 2, 3],
+        max_tokens=1,
+        temperature=0.0,
+        top_p=1.0,
+        top_k=0,
+        seed=0,
+        generation_mode="mtp",
+        depth=2,
+        resolved_mtp_depth=2,
+        session_id="implicit-session",
+        session_bank=None,
+        request_observability={"request_mtp_depth_explicit": True},
+    )
+
+    assert captured["speculative_depth"] == 2
+    for legacy_key in (
+        "mtp_hidden_variant",
+        "mtp_history_policy",
+        "verify_strategy",
+        "verify_core",
+        "trace_label",
+        "trace_metadata",
+    ):
+        assert legacy_key not in captured
+    assert captured["session_bank"] is None
+    assert captured["capture_final_state"] is False
+
+
+def test_run_generation_dspark_preserves_explicit_unsupported_policies(monkeypatch):
+    state = _fake_streaming_session_state()
+    state.draft_sampler = None
+    state.requests_completed = 0
+    state.args._cli_flags = {"depth", "verify-strategy", "ssd-session-cache"}
+    state.runtime.block_speculative_backend = SimpleNamespace(
+        backend_id="deepseek_v4_dspark_0731"
+    )
+    state.runtime.block_speculative_decode_trace_requested = True
+    captured: dict[str, object] = {}
+
+    def fake_generate_mtpk(*_args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            tokens=[],
+            text="",
+            stats=SimpleNamespace(
+                to_dict=lambda: {
+                    "prompt_eval_time_s": 0.0,
+                    "generated_tokens": 0,
+                    "elapsed_s": 0.0,
+                    "tok_s": 0.0,
+                }
+            ),
+            final_state=None,
+        )
+
+    monkeypatch.setattr(openai, "generate_mtpk", fake_generate_mtpk)
+    openai._run_generation(
+        state,
+        [1, 2, 3],
+        max_tokens=1,
+        temperature=0.0,
+        top_p=1.0,
+        top_k=0,
+        seed=0,
+        generation_mode="mtp",
+        depth=3,
+        session_id="explicit-session",
+        session_bank=state.sessions.bank,
+        request_observability={"request_mtp_depth_explicit": True},
+    )
+
+    assert captured["speculative_depth"] == 3
+    assert captured["verify_strategy"] == "capture_commit"
+    assert captured["session_bank"] is state.sessions.bank
+    assert captured["capture_final_state"] is True
+    assert "trace_label" not in captured
+    assert "trace_metadata" not in captured
+    assert state.runtime.block_speculative_decode_trace_requested is True
+
+
+def test_run_generation_dspark_preserves_nondefault_policies_without_cli_flags(
+    monkeypatch,
+):
+    state = _fake_streaming_session_state()
+    state.draft_sampler = None
+    state.requests_completed = 0
+    state.args._cli_flags = set()
+    state.args.verify_strategy = "sequential"
+    state.args.verify_core = "stock"
+    state.args.draft_core = "nax"
+    state.runtime.block_speculative_backend = SimpleNamespace(
+        backend_id="deepseek_v4_dspark_0731"
+    )
+    captured: dict[str, object] = {}
+
+    def fake_generate_mtpk(*_args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            tokens=[],
+            text="",
+            stats=SimpleNamespace(
+                to_dict=lambda: {
+                    "prompt_eval_time_s": 0.0,
+                    "generated_tokens": 0,
+                    "elapsed_s": 0.0,
+                    "tok_s": 0.0,
+                }
+            ),
+            final_state=None,
+        )
+
+    monkeypatch.setattr(openai, "generate_mtpk", fake_generate_mtpk)
+    openai._run_generation(
+        state,
+        [1, 2, 3],
+        max_tokens=1,
+        temperature=0.0,
+        top_p=1.0,
+        top_k=0,
+        seed=0,
+        generation_mode="mtp",
+        depth=2,
+        resolved_mtp_depth=2,
+        session_bank=None,
+    )
+
+    assert captured["verify_strategy"] == "sequential"
+    assert captured["verify_core"] == "stock"
+    assert captured["draft_core"] == "nax"
 
 
 def test_run_generation_depth1_clamps_expected_value_policy(monkeypatch):
@@ -11428,6 +11726,53 @@ def test_server_state_emits_startup_progress(monkeypatch, capsys):
     assert state.context_window == 32768
 
 
+def test_server_state_session_cache_off_installs_stateless_route_without_bank_construction(
+    monkeypatch,
+):
+    """The global stateless lane is fixed at construction, never per request."""
+    monkeypatch.setattr(openai, "apply_profile_env", lambda _profile, **_kwargs: None)
+    monkeypatch.setattr(openai, "profile_env_status", lambda _profile, **_kwargs: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
+    monkeypatch.setattr(
+        openai, "_configure_mlx_cache_limit", lambda _args: {"configured": False}
+    )
+    monkeypatch.setattr(
+        openai,
+        "load",
+        lambda model, mtp, contract, **_kwargs: SimpleNamespace(
+            model_path=Path(model), mtp_enabled=mtp, tokenizer=SimpleNamespace()
+        ),
+    )
+    monkeypatch.setattr(
+        openai, "_install_draft_lm_head", lambda *_args, **_kwargs: {"installed": True}
+    )
+    monkeypatch.setattr(openai, "_draft_head_identity", lambda _runtime: "draft-head")
+    monkeypatch.setattr(openai, "_template_hash", lambda _tokenizer: "template")
+    monkeypatch.setattr(
+        openai, "_resolve_context_window", lambda _tokenizer, _model: 32768
+    )
+    monkeypatch.setattr(
+        openai,
+        "EngineSessionManager",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not construct manager")),
+    )
+    monkeypatch.setattr(
+        openai,
+        "_session_bank_cold_tier_from_args",
+        lambda _args: (_ for _ in ()).throw(AssertionError("must not construct cold tier")),
+    )
+
+    state = openai.ServerState(
+        parse_args(["--model", "models/example", "--warmup-tokens", "0", "--session-cache-mode", "off"])
+    )
+
+    assert isinstance(state.sessions, openai._StatelessSessionRoute)
+    assert state.session_cache_bypass is openai._global_stateless_session_cache_bypass
+    del state.args.session_cache_mode
+    assert state.session_cache_bypass({}, {}) is True
+
+
 def test_server_state_applies_clear_cache_every_after_profile(monkeypatch):
     captured: dict[str, dict[str, str]] = {}
 
@@ -11567,6 +11912,78 @@ def test_server_state_passes_step_adapter_quant_contract_to_load(monkeypatch):
         == "outputs/adapters/c4-mtp-adapter-20260603-134243-r4.npz"
     )
     assert captured["kwargs"]["merge_mtp_adapter"] is True
+
+
+def test_server_state_passes_0731_k2_option_to_runtime_load(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(openai, "apply_profile_env", lambda _profile, **_kwargs: None)
+    monkeypatch.setattr(openai, "profile_env_status", lambda _profile, **_kwargs: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
+    monkeypatch.setattr(
+        openai,
+        "_configure_mlx_cache_limit",
+        lambda _args: {"configured": False},
+    )
+
+    def stop_after_load(model, mtp, contract, **kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("stop after load")
+
+    monkeypatch.setattr(openai, "load", stop_after_load)
+    args = parse_args(
+        [
+            "--model",
+            "models/DeepSeek-V4-Flash-0731",
+            "--warmup-tokens",
+            "0",
+            "--deepseek-v4-0731-k2",
+            "--depth",
+            "2",
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="stop after load"):
+        openai.ServerState(args)
+
+    assert captured["deepseek_v4_0731_k2"] is True
+    assert captured["deepseek_v4_0731_depth"] == 2
+
+
+def test_server_state_maps_0731_optimized_k3_to_runtime_installer(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(openai, "apply_profile_env", lambda _profile, **_kwargs: None)
+    monkeypatch.setattr(openai, "profile_env_status", lambda _profile, **_kwargs: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
+    monkeypatch.setattr(
+        openai,
+        "_configure_mlx_cache_limit",
+        lambda _args: {"configured": False},
+    )
+
+    def stop_after_load(model, mtp, contract, **kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("stop after load")
+
+    monkeypatch.setattr(openai, "load", stop_after_load)
+    args = parse_args(
+        [
+            "--model",
+            "models/DeepSeek-V4-Flash-0731",
+            "--warmup-tokens",
+            "0",
+            "--deepseek-v4-0731-optimized",
+            "--depth",
+            "3",
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="stop after load"):
+        openai.ServerState(args)
+
+    assert captured["deepseek_v4_0731_k2"] is True
+    assert captured["deepseek_v4_0731_depth"] == 3
 
 
 def test_normalize_stop_sequences_accepts_string_list_and_caps_at_four():

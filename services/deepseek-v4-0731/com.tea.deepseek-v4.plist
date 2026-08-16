@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tea.deepseek-v4</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/davidtai/projects/OpenSourceWTF/.worktrees/dsv4-0731-prod/services/deepseek-v4-0731/launch_production.sh</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>15</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/davidtai/Library/Logs/com.tea.deepseek-v4.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/davidtai/Library/Logs/com.tea.deepseek-v4.log</string>
+</dict>
+</plist>

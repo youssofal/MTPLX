@@ -1068,7 +1068,9 @@ def test_serve_dry_run_prefers_contract_draft_sampler_over_internal_defaults(
     assert payload["profile"] == "sustained"
 
 
-def _serve_dry_run_payload_for_model(monkeypatch, capsys, model_dir, extra_args=()):
+def _serve_dry_run_payload_for_model(
+    monkeypatch, capsys, model_dir, extra_args=(), expected_code=0
+):
     """Drive `mtplx serve --dry-run --json` against a stubbed local model."""
 
     runtime_contract = {
@@ -1104,8 +1106,153 @@ def _serve_dry_run_payload_for_model(monkeypatch, capsys, model_dir, extra_args=
     args.dry_run = True
     args.json = True
     code = public.cmd_serve_public(args)
-    assert code == 0
+    assert code == expected_code
     return json.loads(capsys.readouterr().out)
+
+
+def test_serve_dspark_forwards_explicit_depth_two_without_legacy_defaults(
+    monkeypatch, tmp_path, capsys
+):
+    model_dir = tmp_path / "DeepSeek-V4-0731"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps({"model_type": "deepseek_v4", "dspark_block_size": 5})
+    )
+
+    payload = _serve_dry_run_payload_for_model(
+        monkeypatch,
+        capsys,
+        model_dir,
+        extra_args=("--depth", "2"),
+    )
+
+    command = payload["server_command"]
+    assert "--depth 2" in command
+    assert "--verify-strategy" not in command
+    assert "--verify-core" not in command
+    assert "--deepseek-v4-0731-k2" not in command
+
+
+def test_serve_forwards_explicit_0731_k2_construction_option(
+    monkeypatch, tmp_path, capsys
+):
+    model_dir = tmp_path / "DeepSeek-V4-0731"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps({"model_type": "deepseek_v4", "dspark_block_size": 5})
+    )
+
+    payload = _serve_dry_run_payload_for_model(
+        monkeypatch,
+        capsys,
+        model_dir,
+        extra_args=("--deepseek-v4-0731-k2", "--depth", "2"),
+    )
+
+    command = payload["server_command"]
+    assert "--deepseek-v4-0731-k2" in command
+    assert "--depth 2" in command
+
+
+def test_serve_forwards_explicit_0731_optimized_construction_option(
+    monkeypatch, tmp_path, capsys
+):
+    model_dir = tmp_path / "DeepSeek-V4-0731"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps({"model_type": "deepseek_v4", "dspark_block_size": 5})
+    )
+
+    payload = _serve_dry_run_payload_for_model(
+        monkeypatch,
+        capsys,
+        model_dir,
+        extra_args=("--deepseek-v4-0731-optimized", "--depth", "3"),
+    )
+
+    command = payload["server_command"]
+    assert "--deepseek-v4-0731-optimized" in command
+    assert "--depth 3" in command
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ("--deepseek-v4-0731-optimized",),
+        ("--deepseek-v4-0731-optimized", "--depth", "3", "--no-load-mtp"),
+        (
+            "--deepseek-v4-0731-optimized",
+            "--depth",
+            "3",
+            "--generation-mode",
+            "ar",
+        ),
+    ],
+)
+def test_serve_rejects_invalid_0731_optimized_entrypoint_selection(
+    monkeypatch, tmp_path, capsys, extra_args
+):
+    model_dir = tmp_path / "DeepSeek-V4-0731"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps({"model_type": "deepseek_v4", "dspark_block_size": 5})
+    )
+
+    payload = _serve_dry_run_payload_for_model(
+        monkeypatch,
+        capsys,
+        model_dir,
+        extra_args=extra_args,
+        expected_code=2,
+    )
+
+    assert "DeepSeek-V4-0731 optimized" in payload["error"]
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ("--deepseek-v4-0731-k2",),
+        ("--deepseek-v4-0731-k2", "--depth", "3"),
+        ("--deepseek-v4-0731-k2", "--depth", "2", "--no-load-mtp"),
+        ("--deepseek-v4-0731-k2", "--depth", "2", "--generation-mode", "ar"),
+    ],
+)
+def test_serve_rejects_invalid_0731_k2_entrypoint_selection(
+    monkeypatch, tmp_path, capsys, extra_args
+):
+    model_dir = tmp_path / "DeepSeek-V4-0731"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps({"model_type": "deepseek_v4", "dspark_block_size": 5})
+    )
+
+    payload = _serve_dry_run_payload_for_model(
+        monkeypatch,
+        capsys,
+        model_dir,
+        extra_args=extra_args,
+        expected_code=2,
+    )
+
+    assert "DeepSeek-V4-0731 K2" in payload["error"]
+
+
+def test_serve_dspark_rejects_implicit_or_non_k2_depth(monkeypatch, tmp_path, capsys):
+    model_dir = tmp_path / "DeepSeek-V4-0731"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps({"model_type": "deepseek_v4", "dspark_block_size": 5})
+    )
+
+    payload = _serve_dry_run_payload_for_model(
+        monkeypatch,
+        capsys,
+        model_dir,
+        expected_code=2,
+    )
+
+    assert "explicit --depth 2" in payload["error"]
 
 
 def test_serve_defaults_quantized_27b_flagships_to_turbo(monkeypatch, tmp_path, capsys):
@@ -1632,6 +1779,12 @@ def test_one_shot_max_uses_verified_max_session(monkeypatch):
 
     fake_runtime = ModuleType("mtplx.runtime")
     fake_runtime.load = lambda *a, **kw: SimpleNamespace(tokenizer=object())
+    fake_runtime.build_mtpk_request_kwargs = (
+        lambda _rt, *, common, legacy_defaults, explicit_legacy=None: {
+            **common,
+            **legacy_defaults,
+        }
+    )
     fake_schema = ModuleType("mtplx.benchmarks.schema")
     fake_schema.PromptCase = lambda **kw: SimpleNamespace(**kw)
     fake_schema.encode_prompt_case = lambda *a, **kw: [1, 2, 3]
@@ -2585,6 +2738,123 @@ def test_quickstart_generation_default_uses_remaining_model_context(
     assert payload["stats"]["max_tokens"] == 88
     assert payload["stats"]["remaining_context_tokens"] == 88
     assert payload["stats"]["reasoning"] == "on"
+
+
+def test_quickstart_dspark_uses_fixed_k2_without_legacy_request_defaults(
+    monkeypatch, tmp_path
+):
+    captured: dict[str, object] = {}
+
+    class TinyTokenizer:
+        model_max_length = 100
+
+        def apply_chat_template(self, *_args, **_kwargs):
+            return [1, 2, 3]
+
+    fake_generation = ModuleType("mtplx.generation")
+
+    def fake_generate_mtpk(*_args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            text="ok",
+            stats=SimpleNamespace(
+                generated_tokens=1,
+                speculative_depth=kwargs["speculative_depth"],
+                requested_speculative_depth=kwargs["speculative_depth"],
+                tok_s=1.0,
+                elapsed_s=1.0,
+                prompt_eval_time_s=0.0,
+                verify_time_s=0.0,
+                target_forward_time_s=1.0,
+                repair_time_s=0.0,
+                draft_time_s=0.0,
+                verify_calls=0,
+                accepted_by_depth=[],
+                drafted_by_depth=[],
+                correction_tokens=0,
+                bonus_tokens=0,
+            ),
+        )
+
+    fake_generation.generate_mtpk = fake_generate_mtpk
+    fake_generation.generate_ar = fake_generate_mtpk
+    fake_sampling = ModuleType("mtplx.sampling")
+    fake_sampling.SamplerConfig = lambda **kwargs: SimpleNamespace(**kwargs)
+    monkeypatch.setitem(sys.modules, "mtplx.generation", fake_generation)
+    monkeypatch.setitem(sys.modules, "mtplx.sampling", fake_sampling)
+
+    args = SimpleNamespace(
+        system=None,
+        max_tokens=1,
+        temperature=0.0,
+        top_p=1.0,
+        top_k=0,
+        depth=2,
+        seed=0,
+        _cli_flags={"depth"},
+    )
+    rt = SimpleNamespace(
+        tokenizer=TinyTokenizer(),
+        model_path=tmp_path,
+        block_speculative_backend=SimpleNamespace(backend_id="deepseek_v4_dspark_0731"),
+    )
+
+    public._quickstart_generate(
+        rt=rt,
+        inspection={},
+        profile=SimpleNamespace(to_dict=lambda: {"name": "stable"}),
+        args=args,
+        prompt="hello",
+        history=[],
+        turn_index=0,
+    )
+
+    assert captured["speculative_depth"] == 2
+    for legacy_key in (
+        "mtp_hidden_variant",
+        "mtp_history_policy",
+        "verify_strategy",
+        "verify_core",
+    ):
+        assert legacy_key not in captured
+
+    args.depth = 3
+    args._cli_flags = {"depth", "verify-strategy"}
+    captured.clear()
+    public._quickstart_generate(
+        rt=rt,
+        inspection={},
+        profile=SimpleNamespace(to_dict=lambda: {"name": "stable"}),
+        args=args,
+        prompt="hello",
+        history=[],
+        turn_index=0,
+    )
+    assert captured["speculative_depth"] == 3
+    assert captured["verify_strategy"] == "capture_commit"
+
+    args.depth = 2
+    args._cli_flags = {"depth"}
+    args.mtp_hidden_variant = "contract"
+    args.mtp_history_policy = "cycle"
+    args.verify_strategy = "sequential"
+    args.verify_core = "stock"
+    args.draft_core = "nax"
+    captured.clear()
+    public._quickstart_generate(
+        rt=rt,
+        inspection={},
+        profile=SimpleNamespace(to_dict=lambda: {"name": "stable"}),
+        args=args,
+        prompt="hello",
+        history=[],
+        turn_index=0,
+    )
+    assert captured["mtp_hidden_variant"] == "contract"
+    assert captured["mtp_history_policy"] == "cycle"
+    assert captured["verify_strategy"] == "sequential"
+    assert captured["verify_core"] == "stock"
+    assert captured["draft_core"] == "nax"
 
 
 def test_quickstart_generation_no_mtp_uses_ar(monkeypatch, tmp_path):

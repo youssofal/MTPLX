@@ -657,6 +657,25 @@ def _add_mtp_toggle_args(parser: argparse.ArgumentParser) -> None:
             "where live switching is supported."
         ),
     )
+    parser.add_argument(
+        "--deepseek-v4-0731-k2",
+        action="store_true",
+        help=(
+            "Select the construction-bound DeepSeek-V4-Flash-0731 physical-M3 "
+            "DSpark K2 stack. This faster lane is not token-exact against serial "
+            "greedy AR. Requires explicit --depth 2 and MTP."
+        ),
+    )
+    parser.add_argument(
+        "--deepseek-v4-0731-optimized",
+        action="store_true",
+        help=(
+            "Select the construction-bound DeepSeek-V4-Flash-0731 optimized "
+            "DSpark stack for an explicit depth from 1 through 3. K2 uses the "
+            "measured physical-M3 target route; K1 and K3 use the native target "
+            "shape route. This lane is not token-exact against serial greedy AR."
+        ),
+    )
 
 
 SCHEDULER_MODE_CHOICES = (
@@ -2381,7 +2400,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     quickstart_server_p.add_argument("--host", default="127.0.0.1")
     quickstart_server_p.add_argument("--port", type=int, default=8000)
-    quickstart_server_p.add_argument("--model-id", default=DEFAULT_PUBLIC_MODEL_ID, help="Served OpenAI model id; defaults to the loaded artifact identity")
+    quickstart_server_p.add_argument(
+        "--model-id",
+        default=DEFAULT_PUBLIC_MODEL_ID,
+        help="Served OpenAI model id; defaults to the loaded artifact identity",
+    )
     quickstart_server_p.add_argument(
         "--embedding-model",
         action="append",
@@ -2422,8 +2445,16 @@ def build_parser() -> argparse.ArgumentParser:
             "(jina-style model.py/rerank.py) to execute it; off by default"
         ),
     )
-    quickstart_server_p.add_argument("--dry-run", action="store_true", help="Preview the server launch command without loading MLX")
-    quickstart_server_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON for --dry-run and errors")
+    quickstart_server_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview the server launch command without loading MLX",
+    )
+    quickstart_server_p.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON for --dry-run and errors",
+    )
     quickstart_server_p.add_argument("--depth", type=int, default=3)
     _add_mtp_toggle_args(quickstart_server_p)
     quickstart_server_p.add_argument(

@@ -271,9 +271,11 @@ from __future__ import annotations
 
 import math
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
-from typing import List, Optional
+from typing import Iterator, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -286,11 +288,7 @@ from mtplx.attention_context import current_attention_phase
 # Default per-layer compress ratios for DeepSeek-V4-Flash (43 body layers; the
 # 44th entry is the dropped MTP layer).  0 = pure sliding-window; 4 = overlapping
 # compressor + indexer; 128 = non-overlapping compressor + strided index.
-_DEFAULT_COMPRESS_RATIOS = (
-    [0, 0]
-    + [4, 128] * 20
-    + [4, 0]
-)
+_DEFAULT_COMPRESS_RATIOS = [0, 0] + [4, 128] * 20 + [4, 0]
 
 # How many token positions a :class:`DeepseekV4Cache` can un-decode (``trim``).
 # Speculative decode only ever rewinds the rejected tail of one verify batch, so
@@ -336,8 +334,7 @@ def _o_lora_mode_from_env() -> str:
         return "cached"
     if raw not in _O_LORA_MODES:
         raise ValueError(
-            "MTPLX_DSV4_O_LORA must be one of "
-            f"{', '.join(_O_LORA_MODES)}; got {raw!r}"
+            f"MTPLX_DSV4_O_LORA must be one of {', '.join(_O_LORA_MODES)}; got {raw!r}"
         )
     return raw
 
@@ -368,8 +365,7 @@ def _attn_mode_from_env() -> str:
         return "fused"
     if raw not in _ATTN_MODES:
         raise ValueError(
-            "MTPLX_DSV4_ATTN must be one of "
-            f"{', '.join(_ATTN_MODES)}; got {raw!r}"
+            f"MTPLX_DSV4_ATTN must be one of {', '.join(_ATTN_MODES)}; got {raw!r}"
         )
     return raw
 
@@ -431,6 +427,25 @@ _HC_COMPILE_MAX_ROWS = 32
 #: flipped on the moment that window confirms tok/s.  Read from
 #: ``MTPLX_DSV4_SINKHORN_KERNEL`` at import; tests set the module attribute.
 _SINKHORN_KERNEL = _env_flag("MTPLX_DSV4_SINKHORN_KERNEL", False)
+
+# The retained 0731 K2 stack is selected by an explicit runtime construction
+# option. A context-local selector keeps that request out of ambient process
+# policy and confines it to the model constructors invoked by one ``load``.
+_DEEPSEEK_V4_0731_K2_CONSTRUCTION: ContextVar[bool] = ContextVar(
+    "deepseek_v4_0731_k2_construction",
+    default=False,
+)
+
+
+@contextmanager
+def deepseek_v4_0731_k2_construction() -> Iterator[None]:
+    """Select the pinned Sinkhorn route for one model construction only."""
+
+    token = _DEEPSEEK_V4_0731_K2_CONSTRUCTION.set(True)
+    try:
+        yield
+    finally:
+        _DEEPSEEK_V4_0731_K2_CONSTRUCTION.reset(token)
 
 
 #: Escape hatch restoring the pre-fix all-fp32 activation path (rope output,
@@ -654,14 +669,12 @@ def _validate_loaded_moe_tail_contract(model, config: dict) -> dict:
     layers = list(getattr(model, "layers", ()))
     if len(layers) != _MOE_TAIL_BODY_LAYERS:
         raise ValueError(
-            "MTPLX_DSV4_MOE_TAIL requires exactly 43 body layers; "
-            f"got {len(layers)}"
+            f"MTPLX_DSV4_MOE_TAIL requires exactly 43 body layers; got {len(layers)}"
         )
     mtp_blocks = list(getattr(model, "mtp_blocks", ()))
     if len(mtp_blocks) != _MOE_TAIL_MTP_BLOCKS:
         raise ValueError(
-            "MTPLX_DSV4_MOE_TAIL requires exactly one MTP block; "
-            f"got {len(mtp_blocks)}"
+            f"MTPLX_DSV4_MOE_TAIL requires exactly one MTP block; got {len(mtp_blocks)}"
         )
     args = getattr(model, "args", None)
     if args is None:
@@ -729,7 +742,11 @@ def _validate_loaded_moe_tail_contract(model, config: dict) -> dict:
             "up_proj": ((256, 2048, 256), (256, 2048, 64), 64),
             "down_proj": ((256, 4096, 128), (256, 4096, 32), 64),
         }
-        for projection, (weight_shape, scale_shape, group_size) in routed_contract.items():
+        for projection, (
+            weight_shape,
+            scale_shape,
+            group_size,
+        ) in routed_contract.items():
             stem = f"model.layers.{layer_id}.ffn.switch_mlp.{projection}"
             expected_spec = {
                 "bits": 2,
@@ -857,7 +874,9 @@ def _moe_tail_metal_kernel():
     return _MOE_TAIL_KERNEL
 
 
-def _moe_tail_apply(kernel, routed: mx.array, weights: mx.array, shared: mx.array) -> mx.array:
+def _moe_tail_apply(
+    kernel, routed: mx.array, weights: mx.array, shared: mx.array
+) -> mx.array:
     """Dispatch the precompiled fixed tail; ``rows`` is the only varying value."""
     rows = int(routed.shape[0])
     n_elements = rows * _MOE_TAIL_HIDDEN
@@ -883,19 +902,23 @@ def _verify_moe_tail_exact(kernel) -> None:
         return
     for rows in (1, 4):
         n = rows * _MOE_TAIL_TOPK * _MOE_TAIL_HIDDEN
-        routed = ((mx.arange(n, dtype=mx.float32) % 29 - 14) / 7).reshape(
-            rows, _MOE_TAIL_TOPK, _MOE_TAIL_HIDDEN
-        ).astype(mx.bfloat16)
-        weights = ((mx.arange(rows * _MOE_TAIL_TOPK, dtype=mx.float32) % 13 - 6) / 5)
+        routed = (
+            ((mx.arange(n, dtype=mx.float32) % 29 - 14) / 7)
+            .reshape(rows, _MOE_TAIL_TOPK, _MOE_TAIL_HIDDEN)
+            .astype(mx.bfloat16)
+        )
+        weights = (mx.arange(rows * _MOE_TAIL_TOPK, dtype=mx.float32) % 13 - 6) / 5
         weights = weights.reshape(rows, _MOE_TAIL_TOPK).astype(mx.bfloat16)
-        shared = ((mx.arange(rows * _MOE_TAIL_HIDDEN, dtype=mx.float32) % 31 - 15) / 11)
+        shared = (mx.arange(rows * _MOE_TAIL_HIDDEN, dtype=mx.float32) % 31 - 15) / 11
         shared = shared.reshape(rows, _MOE_TAIL_HIDDEN).astype(mx.bfloat16)
         stock = _stock_moe_tail_combine(routed, weights, shared)
         fused = _moe_tail_apply(kernel, routed, weights, shared)
         mx.eval(stock, fused)
         if not mx.array_equal(stock, fused):
             max_abs = float(
-                mx.max(mx.abs(stock.astype(mx.float32) - fused.astype(mx.float32))).item()
+                mx.max(
+                    mx.abs(stock.astype(mx.float32) - fused.astype(mx.float32))
+                ).item()
             )
             raise RuntimeError(
                 "MTPLX_DSV4_MOE_TAIL failed exact Metal self-check at "
@@ -1010,10 +1033,12 @@ def _o_lora_linear_logical_weight_shape(linear) -> tuple[int, ...]:
         scales_shape = tuple(linear.scales.shape)
     except (AttributeError, TypeError, ValueError):
         return ()
-    packed_divisor = 32 // bits if bits > 0 and 32 % bits == 0 else 0
-    if not packed_divisor or group_size <= 0 or len(scales_shape) != 2:
+    if bits not in {2, 3, 4, 6, 8} or group_size <= 0 or len(scales_shape) != 2:
         return ()
-    packed_logical = (weight_shape[0], weight_shape[1] * packed_divisor)
+    packed_bits = weight_shape[1] * 32
+    if packed_bits % bits:
+        return ()
+    packed_logical = (weight_shape[0], packed_bits // bits)
     scales_logical = (scales_shape[0], scales_shape[1] * group_size)
     return packed_logical if packed_logical == scales_logical else ()
 
@@ -1048,10 +1073,15 @@ class _DirectGatherOLora:
             raise ValueError(
                 "gather_qmm o-LoRA input width is not divisible by group_size"
             )
-        packed_divisor = 32 // int(bits) if int(bits) and 32 % int(bits) == 0 else 0
-        if not packed_divisor:
+        bits = int(bits)
+        if bits not in {2, 3, 4, 6, 8}:
             raise ValueError(f"gather_qmm o-LoRA has unsupported bits={bits!r}")
-        expected_weight = (output_rows, per_group_input // packed_divisor)
+        packed_row_bits = per_group_input * bits
+        if packed_row_bits % 32:
+            raise ValueError(
+                "gather_qmm o-LoRA logical input does not end on a packed word"
+            )
+        expected_weight = (output_rows, packed_row_bits // 32)
         expected_scales = (output_rows, per_group_input // int(group_size))
         if tuple(weight.shape) != expected_weight:
             raise ValueError(
@@ -1076,9 +1106,7 @@ class _DirectGatherOLora:
         self.per_group_input = per_group_input
         self.weight = weight.reshape(groups, rank, -1)
         self.scales = scales.reshape(groups, rank, -1)
-        self.biases = (
-            None if biases is None else biases.reshape(groups, rank, -1)
-        )
+        self.biases = None if biases is None else biases.reshape(groups, rank, -1)
         self.group_size = int(group_size)
         self.bits = int(bits)
         self.mode = mode
@@ -1099,9 +1127,7 @@ class _DirectGatherOLora:
             mode=self.mode,
         )
         return self.wo_b(
-            out.swapaxes(0, 1).reshape(
-                batch, sequence, self.groups * self.rank
-            )
+            out.swapaxes(0, 1).reshape(batch, sequence, self.groups * self.rank)
         )
 
 
@@ -1341,16 +1367,12 @@ class _DirectDenseOLora:
         self.per_group_input = int(
             attention.n_heads * attention.head_dim // attention.n_groups
         )
-        self.weight = weight.reshape(
-            self.groups, self.rank, self.per_group_input
-        )
+        self.weight = weight.reshape(self.groups, self.rank, self.per_group_input)
         self.wo_b = attention.wo_b
 
     def __call__(self, o: mx.array) -> mx.array:
         batch, sequence, _ = o.shape
-        grouped = o.reshape(
-            batch, sequence, self.groups, self.per_group_input
-        )
+        grouped = o.reshape(batch, sequence, self.groups, self.per_group_input)
         out = mx.einsum("bsgp,grp->bsgr", grouped, self.weight)
         return self.wo_b(out.reshape(batch, sequence, self.groups * self.rank))
 
@@ -1379,6 +1401,14 @@ class _DirectDenseMTPOLora(_DirectDenseOLora):
     """Known dense-BF16 MTP stock math, captured without a quantized lookup."""
 
     __slots__ = ()
+
+
+_DSPARK_MANIFEST_KEYS = (
+    "dspark_block_size",
+    "dspark_noise_token_id",
+    "dspark_target_layer_ids",
+    "dspark_markov_rank",
+)
 
 
 @dataclass
@@ -1412,7 +1442,9 @@ class ModelArgs(BaseModelArgs):
     index_n_heads: int = 64
     index_head_dim: int = 128
     index_topk: int = 512
-    compress_ratios: List[int] = field(default_factory=lambda: list(_DEFAULT_COMPRESS_RATIOS))
+    compress_ratios: List[int] = field(
+        default_factory=lambda: list(_DEFAULT_COMPRESS_RATIOS)
+    )
     compress_rope_theta: float = 160000.0
     # hyper-connections
     hc_mult: int = 4
@@ -1434,6 +1466,26 @@ class ModelArgs(BaseModelArgs):
     # upstream as ``mtp.0.*``; a conversion that drops it leaves this field at 1
     # while shipping no weights, which :meth:`Model.sanitize` detects and honours.
     num_nextn_predict_layers: int = 0
+    temperature: float = 1.0
+    # DeepSeek-V4-Flash-0731's DSpark draft is not the legacy one-layer MTP
+    # block above.  These fields are deliberately separate: the manifest selects
+    # one installed implementation at construction, never in the decode path.
+    # ``None`` preserves whether the artifact actually carried a DSpark field.
+    # This lets construction distinguish an absent legacy field from an explicit
+    # corrupt value such as ``dspark_block_size: 0``.
+    dspark_block_size: Optional[int] = None
+    dspark_noise_token_id: Optional[int] = None
+    dspark_target_layer_ids: Optional[List[int]] = None
+    dspark_markov_rank: Optional[int] = None
+    _dspark_signature_present: bool = field(default=False, init=False, repr=False)
+
+    @classmethod
+    def from_dict(cls, params):
+        args = super().from_dict(params)
+        args._dspark_signature_present = any(
+            key in params for key in _DSPARK_MANIFEST_KEYS
+        )
+        return args
 
     def __post_init__(self):
         # Accept the HF rope_scaling block and mirror it into the flat YaRN fields
@@ -1472,9 +1524,12 @@ def _yarn_inv_freq(
     half = dim // 2
     freqs = 1.0 / (base ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim))
     if original_seq_len and original_seq_len > 0:
+
         def correction_dim(num_rot):
-            return dim * math.log(original_seq_len / (num_rot * 2 * math.pi)) / (
-                2 * math.log(base)
+            return (
+                dim
+                * math.log(original_seq_len / (num_rot * 2 * math.pi))
+                / (2 * math.log(base))
             )
 
         low = max(math.floor(correction_dim(beta_fast)), 0)
@@ -1511,7 +1566,7 @@ def _hadamard_rotate(x: mx.array) -> mx.array:
         b = y[:, :, 1]
         y = mx.stack([a + b, a - b], axis=2).reshape(-1, n)
         stride *= 2
-    return (y * (n ** -0.5)).reshape(x.shape)
+    return (y * (n**-0.5)).reshape(x.shape)
 
 
 def _topk_mask(key: mx.array, k_row: mx.array, k_max: int) -> mx.array:
@@ -1538,11 +1593,13 @@ def _topk_mask(key: mx.array, k_row: mx.array, k_max: int) -> mx.array:
     else:
         ranked = mx.sort(mx.topk(key, k_max, axis=-1), axis=-1)[..., ::-1]
     kth = mx.clip(k_row - 1, 0, ranked.shape[-1] - 1)
-    thr = mx.take_along_axis(ranked, kth, axis=-1)          # k_row-th largest
+    thr = mx.take_along_axis(ranked, kth, axis=-1)  # k_row-th largest
     gt = key > thr
     eq = key == thr
     n_gt = mx.sum(gt.astype(mx.int32), axis=-1, keepdims=True)
-    tie_rank = mx.cumsum(eq.astype(mx.int32), axis=-1) - 1  # rank among equals, index order
+    tie_rank = (
+        mx.cumsum(eq.astype(mx.int32), axis=-1) - 1
+    )  # rank among equals, index order
     return gt | (eq & (tie_rank < (k_row - n_gt)))
 
 
@@ -1576,6 +1633,33 @@ def _apply_interleaved_rope(x: mx.array, cos: mx.array, sin: mx.array) -> mx.arr
     return out.reshape(shape).astype(out_dtype)
 
 
+def _q_head_norm_rope_stock(
+    q: mx.array,
+    cos: mx.array,
+    sin: mx.array,
+    *,
+    eps: float,
+    rope_dim: int,
+) -> mx.array:
+    """The stock per-head Q normalization and interleaved-RoPE graph."""
+    out_dtype = _store_dtype(q.dtype)
+    q = q * mx.rsqrt(
+        mx.mean(mx.square(q.astype(mx.float32)), axis=-1, keepdims=True) + eps
+    )
+    q = q.astype(out_dtype)
+    return mx.concatenate(
+        [
+            q[..., :-rope_dim],
+            _apply_interleaved_rope(
+                q[..., -rope_dim:],
+                cos[None, :, None, :],
+                sin[None, :, None, :],
+            ),
+        ],
+        axis=-1,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Hyper-Connections
 # ---------------------------------------------------------------------------
@@ -1588,11 +1672,11 @@ def _sinkhorn_ops(comb: mx.array, iters: int, eps: float) -> mx.array:
     the path both :func:`hc_split_sinkhorn` and :func:`_hc_pre_impl` take when the
     kernel is off; it is exactly the loop these two functions used to inline.
     """
-    comb = mx.softmax(comb, axis=-1) + eps                       # row-softmax
-    comb = comb / (comb.sum(axis=-2, keepdims=True) + eps)       # column normalise
+    comb = mx.softmax(comb, axis=-1) + eps  # row-softmax
+    comb = comb / (comb.sum(axis=-2, keepdims=True) + eps)  # column normalise
     for _ in range(iters - 1):
-        comb = comb / (comb.sum(axis=-1, keepdims=True) + eps)   # row normalise
-        comb = comb / (comb.sum(axis=-2, keepdims=True) + eps)   # column normalise
+        comb = comb / (comb.sum(axis=-1, keepdims=True) + eps)  # row normalise
+        comb = comb / (comb.sum(axis=-2, keepdims=True) + eps)  # column normalise
     return comb
 
 
@@ -1716,12 +1800,18 @@ def _install_sinkhorn_normaliser(hc: int, iters: int, eps: float):
     geometry fails here, before measured generation, instead of silently taking a
     differently-shaped kernel or falling back.
     """
+
     def stock(comb: mx.array) -> mx.array:
         return _sinkhorn_ops(comb, iters, eps)
 
-    if not _SINKHORN_KERNEL:
+    explicit_0731_k2 = _DEEPSEEK_V4_0731_K2_CONSTRUCTION.get()
+    if not (explicit_0731_k2 or _SINKHORN_KERNEL):
         return False, stock
     if not mx.metal.is_available() or mx.default_device() != mx.gpu:
+        if explicit_0731_k2:
+            raise ValueError(
+                "DeepSeek-V4-0731 K2 construction requires an MLX Metal GPU"
+            )
         return False, stock
     if (hc, iters, eps) != (4, 20, 1e-6):
         raise ValueError(
@@ -1764,7 +1854,9 @@ def hc_split_sinkhorn(
     return pre, post, comb
 
 
-def _hc_pre_impl(x, fn_t, base, scale_vec, hc: int, iters: int, eps: float, normalise=None):
+def _hc_pre_impl(
+    x, fn_t, base, scale_vec, hc: int, iters: int, eps: float, normalise=None
+):
     """:meth:`HyperConnection.pre` as one pure function of arrays.
 
     Identical arithmetic to ``_mixes`` + :func:`hc_split_sinkhorn` + the weighted
@@ -1797,8 +1889,10 @@ def _hc_pre_impl(x, fn_t, base, scale_vec, hc: int, iters: int, eps: float, norm
     post = 2.0 * mx.sigmoid(t[..., hc : 2 * hc])
     comb = t[..., 2 * hc :].reshape(*t.shape[:-1], hc, hc)  # [..., j, k]
     if normalise is None:
+
         def normalise(c):
             return _sinkhorn_ops(c, iters, eps)
+
     comb = normalise(comb)
 
     y = mx.sum(pre[..., None] * xf, axis=-2)  # [..., dim]
@@ -1810,8 +1904,8 @@ def _hc_post_impl(x, residual, post, comb):
     dtype = x.dtype
     xf = x.astype(mx.float32)
     rf = residual.astype(mx.float32)
-    term = post[..., None] * xf[..., None, :]           # [..., hc, dim]
-    mixed = mx.einsum("...jk,...jd->...kd", comb, rf)   # sum_j comb[j,k] res[j]
+    term = post[..., None] * xf[..., None, :]  # [..., hc, dim]
+    mixed = mx.einsum("...jk,...jd->...kd", comb, rf)  # sum_j comb[j,k] res[j]
     return (term + mixed).astype(dtype)
 
 
@@ -1852,16 +1946,16 @@ def _hc_compiled(kind: str, *consts):
                 hc, iters, eps, sinkhorn_kernel = consts
 
             if sinkhorn_kernel:
+
                 def normalise(comb):
                     return _sinkhorn_kernel_apply(comb, hc, iters, eps)
             else:
+
                 def normalise(comb):
                     return _sinkhorn_ops(comb, iters, eps)
 
             def impl(x, fn_t, base, scale_vec):
-                return _hc_pre_impl(
-                    x, fn_t, base, scale_vec, hc, iters, eps, normalise
-                )
+                return _hc_pre_impl(x, fn_t, base, scale_vec, hc, iters, eps, normalise)
         elif kind == "post":
             impl = _hc_post_impl
         elif kind == "head":
@@ -1977,6 +2071,7 @@ class HyperConnection(nn.Module):
         impl = _hc_compiled("post") if _hc_use_compile(residual) else _hc_post_impl
         return impl(x, residual, post, comb)
 
+
 class HeadHC(nn.Module):
     """Final head hyper-connection collapse (``ParallelHead.hc_head``, model.py L728).
 
@@ -2063,8 +2158,12 @@ class Compressor(nn.Module):
         # Compressor rope uses the compress theta + YaRN (reference passes the
         # compressor its own freqs_cis; window w gets position w*ratio).
         self._inv_freq = _yarn_inv_freq(
-            self.rope_head_dim, args.compress_rope_theta, args.original_seq_len,
-            args.rope_factor, args.beta_fast, args.beta_slow,
+            self.rope_head_dim,
+            args.compress_rope_theta,
+            args.original_seq_len,
+            args.rope_factor,
+            args.beta_fast,
+            args.beta_slow,
         )
 
     def _overlap_transform(
@@ -2083,14 +2182,16 @@ class Compressor(nn.Module):
         """
         b, nwin, r, _ = t.shape
         d = self.head_dim
-        cur = t[..., d:]                       # [b, nwin, ratio, d]  (current, d: half)
-        prev_half = t[..., :d]                 # [b, nwin, ratio, d]  (:d half)
+        cur = t[..., d:]  # [b, nwin, ratio, d]  (current, d: half)
+        prev_half = t[..., :d]  # [b, nwin, ratio, d]  (:d half)
         if prev is None:
             seed = mx.full((b, 1, r, d), value, dtype=t.dtype)
         else:
-            seed = prev[..., :d][:, None]      # [b, 1, ratio, d]
-        prev_shift = mx.concatenate([seed, prev_half[:, :-1]], axis=1)  # w -> window w-1
-        return mx.concatenate([prev_shift, cur], axis=2)          # [b, nwin, 2*ratio, d]
+            seed = prev[..., :d][:, None]  # [b, 1, ratio, d]
+        prev_shift = mx.concatenate(
+            [seed, prev_half[:, :-1]], axis=1
+        )  # w -> window w-1
+        return mx.concatenate([prev_shift, cur], axis=2)  # [b, nwin, 2*ratio, d]
 
     def _pool(
         self, kv: mx.array, score: mx.array, first_window: int, out_dtype
@@ -2112,9 +2213,11 @@ class Compressor(nn.Module):
         """
         nwin = kv.shape[1]
         rd = self.rope_head_dim
-        pooled = mx.sum(kv * mx.softmax(score, axis=2), axis=2)            # [b, nwin, d]
+        pooled = mx.sum(kv * mx.softmax(score, axis=2), axis=2)  # [b, nwin, d]
         pooled = self.norm(pooled.astype(out_dtype))
-        win_pos = (mx.arange(nwin, dtype=mx.float32) + float(first_window)) * self.compress_ratio
+        win_pos = (
+            mx.arange(nwin, dtype=mx.float32) + float(first_window)
+        ) * self.compress_ratio
         ang = win_pos[:, None] * self._inv_freq[None, :]
         cos, sin = mx.cos(ang), mx.sin(ang)
         head = pooled[..., :-rd]
@@ -2137,10 +2240,12 @@ class Compressor(nn.Module):
         if nwin == 0:
             return mx.zeros((b, 0, d), dtype=out_dtype)
         xf = x.astype(mx.float32)
-        kv = self.wkv(xf)[:, :cutoff].reshape(b, nwin, ratio, -1)          # [b,nwin,ratio,coff*d]
+        kv = self.wkv(xf)[:, :cutoff].reshape(
+            b, nwin, ratio, -1
+        )  # [b,nwin,ratio,coff*d]
         score = self.wgate(xf)[:, :cutoff].reshape(b, nwin, ratio, -1) + self.ape
         if self.overlap:
-            kv = self._overlap_transform(kv, 0.0)                          # [b,nwin,2*ratio,d]
+            kv = self._overlap_transform(kv, 0.0)  # [b,nwin,2*ratio,d]
             score = self._overlap_transform(score, float("-inf"))
         return self._pool(kv, score, 0, out_dtype)
 
@@ -2166,8 +2271,8 @@ class Compressor(nn.Module):
         d = self.head_dim
         out_dtype = _store_dtype(x.dtype)
         xf = x.astype(mx.float32)
-        kv_rows = self.wkv(xf)                                   # [b, s, coff*d]
-        ape_idx = (mx.arange(s) + offset) % ratio                # slot of each token
+        kv_rows = self.wkv(xf)  # [b, s, coff*d]
+        ape_idx = (mx.arange(s) + offset) % ratio  # slot of each token
         score_rows = self.wgate(xf) + self.ape[ape_idx]
         # Rollback journal: the projected rows are per-position pure functions, so
         # keeping the most recent few is all a rewind needs to rebuild the frontier
@@ -2190,7 +2295,7 @@ class Compressor(nn.Module):
                 score_slots = self._overlap_transform(
                     score_w, float("-inf"), state.prev_score
                 )
-                state.prev_kv = kv_w[:, -1]                      # [b, ratio, coff*d]
+                state.prev_kv = kv_w[:, -1]  # [b, ratio, coff*d]
                 state.prev_score = score_w[:, -1]
             else:
                 kv_slots, score_slots = kv_w, score_w
@@ -2249,15 +2354,21 @@ class Indexer(nn.Module):
         self.index_topk = args.index_topk
         self.compress_ratio = compress_ratio
         self.q_lora_rank = args.q_lora_rank
-        self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
+        self.wq_b = nn.Linear(
+            self.q_lora_rank, self.n_heads * self.head_dim, bias=False
+        )
         self.weights_proj = nn.Linear(self.dim, self.n_heads, bias=False)
-        self.softmax_scale = self.head_dim ** -0.5
+        self.softmax_scale = self.head_dim**-0.5
         self.compressor = Compressor(args, compress_ratio, self.head_dim, rotate=True)
         # The reference hands the indexer the *attention layer's* freqs_cis
         # (model.py L494); on a ratio-4 layer that is compress_rope_theta + YaRN.
         self._inv_freq = _yarn_inv_freq(
-            self.rope_head_dim, args.compress_rope_theta, args.original_seq_len,
-            args.rope_factor, args.beta_fast, args.beta_slow,
+            self.rope_head_dim,
+            args.compress_rope_theta,
+            args.original_seq_len,
+            args.rope_factor,
+            args.beta_fast,
+            args.beta_slow,
         )
 
     def scores(
@@ -2288,8 +2399,8 @@ class Indexer(nn.Module):
         )
         q = _hadamard_rotate(q.astype(mx.float32))
         weights = self.weights_proj(x).astype(mx.float32) * (
-            self.softmax_scale * self.n_heads ** -0.5
-        )                                                        # [b, s, n_heads]
+            self.softmax_scale * self.n_heads**-0.5
+        )  # [b, s, n_heads]
         score = mx.einsum("bshd,btd->bsht", q, rows.astype(mx.float32))
         return mx.sum(mx.maximum(score, 0.0) * weights[..., None], axis=2)  # [b,s,t]
 
@@ -2304,7 +2415,9 @@ class Indexer(nn.Module):
 
         # Causality: window c holds tokens [c*ratio, (c+1)*ratio), so query p may use
         # it once p has completed it — the same rule the dense mask uses.
-        causal = (mx.arange(n_comp)[None, :] < ((positions[:, None] + 1) // ratio))[None]
+        causal = (mx.arange(n_comp)[None, :] < ((positions[:, None] + 1) // ratio))[
+            None
+        ]
         key = mx.where(causal, score, mx.array(-float("inf"), mx.float32))
         k_row = mx.minimum(
             mx.sum(causal.astype(mx.int32), axis=-1, keepdims=True), self.index_topk
@@ -2358,11 +2471,11 @@ class CompressorState:
             if self.ratio <= 0
             else (2 if self.overlap else 1) * self.ratio + self.rollback_capacity
         )
-        self.cur_kv: Optional[mx.array] = None      # [b, offset % ratio, coff*head_dim]
-        self.cur_score: Optional[mx.array] = None   # same, post-``ape``
-        self.prev_kv: Optional[mx.array] = None     # [b, ratio, coff*head_dim] (overlap)
+        self.cur_kv: Optional[mx.array] = None  # [b, offset % ratio, coff*head_dim]
+        self.cur_score: Optional[mx.array] = None  # same, post-``ape``
+        self.prev_kv: Optional[mx.array] = None  # [b, ratio, coff*head_dim] (overlap)
         self.prev_score: Optional[mx.array] = None
-        self.tail_kv: Optional[mx.array] = None     # [b, <=rollback_rows, coff*head_dim]
+        self.tail_kv: Optional[mx.array] = None  # [b, <=rollback_rows, coff*head_dim]
         self.tail_score: Optional[mx.array] = None
         self.n_emitted = 0
 
@@ -2380,15 +2493,17 @@ class CompressorState:
         """Append this step's freshly projected rows to the bounded journal."""
         if self.rollback_rows <= 0 or kv.shape[1] == 0:
             return
-        self.tail_kv = kv if self.tail_kv is None else mx.concatenate(
-            [self.tail_kv, kv], axis=1
+        self.tail_kv = (
+            kv if self.tail_kv is None else mx.concatenate([self.tail_kv, kv], axis=1)
         )
-        self.tail_score = score if self.tail_score is None else mx.concatenate(
-            [self.tail_score, score], axis=1
+        self.tail_score = (
+            score
+            if self.tail_score is None
+            else mx.concatenate([self.tail_score, score], axis=1)
         )
         if self.tail_kv.shape[1] > self.rollback_rows:
-            self.tail_kv = self.tail_kv[:, -self.rollback_rows:]
-            self.tail_score = self.tail_score[:, -self.rollback_rows:]
+            self.tail_kv = self.tail_kv[:, -self.rollback_rows :]
+            self.tail_score = self.tail_score[:, -self.rollback_rows :]
 
     def rollback(self, n: int, new_offset: int) -> None:
         """Rewind ``n`` token positions; ``new_offset`` is the resulting offset.
@@ -2420,12 +2535,12 @@ class CompressorState:
             self.tail_kv = self.tail_kv[:, :kept]
             self.tail_score = self.tail_score[:, :kept]
         self.n_emitted = int(new_offset) // self.ratio
-        self.cur_kv = None if r == 0 else self.tail_kv[:, kept - r:]
-        self.cur_score = None if r == 0 else self.tail_score[:, kept - r:]
+        self.cur_kv = None if r == 0 else self.tail_kv[:, kept - r :]
+        self.cur_score = None if r == 0 else self.tail_score[:, kept - r :]
         if self.overlap and self.n_emitted > 0:
             lo = kept - r - self.ratio
-            self.prev_kv = self.tail_kv[:, lo: lo + self.ratio]
-            self.prev_score = self.tail_score[:, lo: lo + self.ratio]
+            self.prev_kv = self.tail_kv[:, lo : lo + self.ratio]
+            self.prev_score = self.tail_score[:, lo : lo + self.ratio]
         else:
             self.prev_kv = None
             self.prev_score = None
@@ -2492,8 +2607,8 @@ class DeepseekV4Cache:
         self.head_dim = int(head_dim)
         self.rollback_capacity = max(0, int(rollback_capacity))
         self.offset = 0
-        self.window: Optional[mx.array] = None      # [b, L, head_dim]
-        self.window_start = 0                       # abs position of window[:, 0]
+        self.window: Optional[mx.array] = None  # [b, L, head_dim]
+        self.window_start = 0  # abs position of window[:, 0]
         self.compressed: Optional[mx.array] = None  # [b, n_comp, head_dim]
         overlap = self.compress_ratio == 4
         self.comp = CompressorState(
@@ -2515,7 +2630,9 @@ class DeepseekV4Cache:
 
     @property
     def n_index_compressed(self) -> int:
-        return 0 if self.index_compressed is None else int(self.index_compressed.shape[1])
+        return (
+            0 if self.index_compressed is None else int(self.index_compressed.shape[1])
+        )
 
     def update_window(self, kv: mx.array):
         """Append ``kv`` (positions ``offset..offset+s-1``) and return the rows this
@@ -2752,12 +2869,14 @@ class DeepseekV4Attention(nn.Module):
         self.window_size = args.window_size
         self.eps = args.rms_norm_eps
         self.compress_ratio = args.compress_ratios[layer_id]
-        self.softmax_scale = self.head_dim ** -0.5
+        self.softmax_scale = self.head_dim**-0.5
 
         self.attn_sink = mx.zeros((self.n_heads,))
         self.wq_a = nn.Linear(self.dim, self.q_lora_rank, bias=False)
         self.q_norm = nn.RMSNorm(self.q_lora_rank, eps=self.eps)
-        self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
+        self.wq_b = nn.Linear(
+            self.q_lora_rank, self.n_heads * self.head_dim, bias=False
+        )
         self.wkv = nn.Linear(self.dim, self.head_dim, bias=False)
         self.kv_norm = nn.RMSNorm(self.head_dim, eps=self.eps)
         # o-LoRA: grouped down-projection (block matmul) then a dense up-projection.
@@ -2790,17 +2909,48 @@ class DeepseekV4Attention(nn.Module):
         # ratio==0 layers use base rope_theta with no YaRN.
         if self.compress_ratio:
             inv = _yarn_inv_freq(
-                self.rope_head_dim, args.compress_rope_theta, args.original_seq_len,
-                args.rope_factor, args.beta_fast, args.beta_slow,
+                self.rope_head_dim,
+                args.compress_rope_theta,
+                args.original_seq_len,
+                args.rope_factor,
+                args.beta_fast,
+                args.beta_slow,
             )
         else:
             inv = _yarn_inv_freq(self.rope_head_dim, args.rope_theta, 0, 1.0, 32, 1)
         self._inv_freq = inv  # [rope_head_dim//2]
+        self._q_head_norm_rope_route = self._q_head_norm_rope_stock
+        self._q_projection_qhead_route = self._q_projection_qhead_stock
 
     def _rope_tables(self, positions: mx.array):
         # positions: [L] -> cos/sin [L, rope_head_dim//2]
         ang = positions[:, None].astype(mx.float32) * self._inv_freq[None, :]
         return mx.cos(ang), mx.sin(ang)
+
+    def _q_head_norm_rope_stock(
+        self,
+        q: mx.array,
+        cos: mx.array,
+        sin: mx.array,
+    ) -> mx.array:
+        return _q_head_norm_rope_stock(
+            q,
+            cos,
+            sin,
+            eps=self.eps,
+            rope_dim=self.rope_head_dim,
+        )
+
+    def _q_projection_qhead_stock(
+        self,
+        qr: mx.array,
+        cos: mx.array,
+        sin: mx.array,
+    ) -> mx.array:
+        """Project Q then run the currently installed phase-specific post route."""
+        batch, sequence, _ = qr.shape
+        q = self.wq_b(qr).reshape(batch, sequence, self.n_heads, self.head_dim)
+        return self._q_head_norm_rope_route(q, cos, sin)
 
     def _wo_a_quant(self):
         """``wo_a``'s quantised tensors + format, or ``None`` when it is dense.
@@ -2889,9 +3039,7 @@ class DeepseekV4Attention(nn.Module):
             "direct": direct,
             "groups": int(self.n_groups),
             "rank": int(self.o_lora_rank),
-            "per_group_input": int(
-                self.n_heads * self.head_dim // self.n_groups
-            ),
+            "per_group_input": int(self.n_heads * self.head_dim // self.n_groups),
         }
 
     def _o_lora_dense(self, o: mx.array) -> mx.array:
@@ -2950,7 +3098,7 @@ class DeepseekV4Attention(nn.Module):
         if kv_pos is not None:
             i = q_pos[:, None]
             j = kv_pos[None, :]
-            parts.append(((j <= i) & (j > i - self.window_size))[None])   # [1, s, n_win]
+            parts.append(((j <= i) & (j > i - self.window_size))[None])  # [1, s, n_win]
         elif n_win:
             parts.append(mx.ones((1, s, n_win), dtype=mx.bool_))
         if n_comp:
@@ -3077,18 +3225,16 @@ class DeepseekV4Attention(nn.Module):
         cos, sin = self._rope_tables(positions)
 
         qr = self.q_norm(self.wq_a(x))
-        q = self.wq_b(qr).reshape(b, s, self.n_heads, self.head_dim)
-        # per-head RMS-like normalisation (no learned weight), reference L498
-        q = q * mx.rsqrt(mx.mean(mx.square(q.astype(mx.float32)), axis=-1, keepdims=True) + self.eps)
-        q = q.astype(x.dtype)
-        q = mx.concatenate(
-            [q[..., :-rd], _apply_interleaved_rope(q[..., -rd:], cos[None, :, None, :], sin[None, :, None, :])],
-            axis=-1,
-        )
+        q = self._q_projection_qhead_route(qr, cos, sin)
 
         kv = self.kv_norm(self.wkv(x))  # [b, s, head_dim] (single shared KV — MQA)
         kv = mx.concatenate(
-            [kv[..., :-rd], _apply_interleaved_rope(kv[..., -rd:], cos[None, :, :], sin[None, :, :])],
+            [
+                kv[..., :-rd],
+                _apply_interleaved_rope(
+                    kv[..., -rd:], cos[None, :, :], sin[None, :, :]
+                ),
+            ],
             axis=-1,
         )
 
@@ -3102,7 +3248,9 @@ class DeepseekV4Attention(nn.Module):
                 kvc = self.compressor(x)  # [b, n_comp, head_dim]
                 n_comp = kvc.shape[1]
                 if n_comp:
-                    full_kv = mx.concatenate([kv, kvc], axis=1)  # [b, s+n_comp, head_dim]
+                    full_kv = mx.concatenate(
+                        [kv, kvc], axis=1
+                    )  # [b, s+n_comp, head_dim]
                     if self._indexer_active(n_comp):
                         # No cache to keep, so the indexer's compressor only runs when
                         # its rows are actually about to be scored.
@@ -3123,8 +3271,10 @@ class DeepseekV4Attention(nn.Module):
             win_kv, win_start = cache.update_window(kv)
             n_comp = cache.n_compressed
             n_win = int(win_kv.shape[1])
-            full_kv = win_kv if not n_comp else mx.concatenate(
-                [win_kv, cache.compressed], axis=1
+            full_kv = (
+                win_kv
+                if not n_comp
+                else mx.concatenate([win_kv, cache.compressed], axis=1)
             )
             if self._indexer_active(n_comp):
                 assert cache.n_index_compressed == n_comp, (
@@ -3135,23 +3285,28 @@ class DeepseekV4Attention(nn.Module):
             # s == 1: update_window already dropped every row outside the query's
             # window, so that half needs no mask (the compressed half still does once
             # the indexer is filtering).
-            kv_pos = None if s == 1 else mx.arange(
-                win_start, win_start + win_kv.shape[1]
+            kv_pos = (
+                None if s == 1 else mx.arange(win_start, win_start + win_kv.shape[1])
             )
             cache.advance(s)
 
-        q_t = q.transpose(0, 2, 1, 3)          # [b, h, s, head_dim]
+        q_t = q.transpose(0, 2, 1, 3)  # [b, h, s, head_dim]
         # ``full_kv`` is [b, s+n_comp, head_dim] and shared over heads (MQA).
         # q and the KV block always carry the same dtype (both follow x, or both
         # follow the fp32 escape hatch), so either one names the score dtype.
         add = self._attn_mask(
             positions, kv_pos, n_win, n_comp, ratio, q_t.dtype, comp_sel=comp_sel
         )
-        o = self._attend(q_t, full_kv, add)     # [b, h, s, head_dim]
-        o = o.transpose(0, 2, 1, 3)            # [b, s, h, head_dim]
+        o = self._attend(q_t, full_kv, add)  # [b, h, s, head_dim]
+        o = o.transpose(0, 2, 1, 3)  # [b, s, h, head_dim]
         # de-rotate the tail dims (reference L534, inverse rope)
         o = mx.concatenate(
-            [o[..., :-rd], _apply_interleaved_rope(o[..., -rd:], cos[None, :, None, :], -sin[None, :, None, :])],
+            [
+                o[..., :-rd],
+                _apply_interleaved_rope(
+                    o[..., -rd:], cos[None, :, None, :], -sin[None, :, None, :]
+                ),
+            ],
             axis=-1,
         )
         o = o.reshape(b, s, self.n_heads * self.head_dim)
@@ -3226,8 +3381,8 @@ class ClampedSwiGLU(SwiGLU):
 
     def __call__(self, x: mx.array, gate: mx.array) -> mx.array:
         if self.limit > 0:
-            x = mx.clip(x, -self.limit, self.limit)      # up:   two-sided
-            gate = mx.minimum(gate, self.limit)          # gate: upper tail only
+            x = mx.clip(x, -self.limit, self.limit)  # up:   two-sided
+            gate = mx.minimum(gate, self.limit)  # gate: upper tail only
         return super().__call__(x, gate)
 
 
@@ -3274,7 +3429,9 @@ class MoEGate(nn.Module):
             indices = self.tid2eid[input_ids.reshape(-1)]  # [n, topk]
         else:
             biased = scores + self.e_score_correction_bias
-            indices = mx.argpartition(-biased, kth=self.topk - 1, axis=-1)[..., : self.topk]
+            indices = mx.argpartition(-biased, kth=self.topk - 1, axis=-1)[
+                ..., : self.topk
+            ]
         weights = mx.take_along_axis(scores, indices, axis=-1)
         if self.score_func != "softmax":
             weights = weights / (mx.sum(weights, axis=-1, keepdims=True))
@@ -3443,12 +3600,579 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
         sibling appended-layer backends make (GLM's modulo-into-layers, Hy3's
         single NextN layer reused at every depth).
         """
-        e = self.enorm(embed_tokens(input_ids))          # [b, s, dim]
-        x = self.hnorm(h)                                # [b, s, hc, dim]
+        e = self.enorm(embed_tokens(input_ids))  # [b, s, dim]
+        x = self.hnorm(h)  # [b, s, hc, dim]
         x = self.e_proj(e)[:, :, None, :] + self.h_proj(x)
         x = super().__call__(x, mask=None, cache=cache, input_ids=input_ids)
         logits = lm_head(self.norm(self.hc_head(x)))
         return (logits, x) if return_hidden else logits
+
+
+# DSpark arithmetic below is transcribed from the official dedicated repository,
+# not inferred from the earlier preview-MTP implementation:
+# https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-DSpark/blob/aa22cb07426656189b2573b8e77a9b7333b8ae0f/inference/model.py
+# The cited line numbers refer to that exact immutable source revision.
+def get_dspark_topk_idxs(
+    window_size: int, batch_size: int, block_size: int, start_pos: int
+) -> mx.array:
+    """Exact 0731 DSpark visibility matrix (official model.py L744-747)."""
+    if int(start_pos) <= 0:
+        raise ValueError("DSpark decode visibility requires start_pos > 0")
+    main = mx.arange(min(int(window_size), int(start_pos) + 1), dtype=mx.int32)
+    draft = int(window_size) + mx.arange(int(block_size), dtype=mx.int32)
+    row = mx.concatenate([main, draft])
+    return mx.broadcast_to(
+        row[None, None, :], (int(batch_size), int(block_size), row.shape[0])
+    )
+
+
+class DeepseekV4DSparkCache:
+    """Stage-owned fixed ring used by official ``DSparkAttention``."""
+
+    def __init__(self, window_size: int, head_dim: int):
+        self.window_size = int(window_size)
+        self.head_dim = int(head_dim)
+        self.ring: Optional[mx.array] = None
+        self.prefill_length = 0
+
+    def prefill(self, main_kv: mx.array) -> None:
+        b, seqlen, d = main_kv.shape
+        if d != self.head_dim:
+            raise ValueError("DSpark cache head dimension mismatch")
+        win = self.window_size
+        if seqlen <= win:
+            pad = mx.zeros((b, win - seqlen, d), dtype=main_kv.dtype)
+            self.ring = mx.concatenate([main_kv, pad], axis=1)
+        else:
+            last = main_kv[:, -win:]
+            cutoff = seqlen % win
+            self.ring = (
+                last
+                if cutoff == 0
+                else mx.concatenate(
+                    [last[:, win - cutoff :], last[:, : win - cutoff]], axis=1
+                )
+            )
+        self.prefill_length = int(seqlen)
+
+    def commit_main(self, start_pos: int, main_kv: mx.array) -> None:
+        """Commit consecutive authoritative target rows into the fixed ring."""
+        if self.ring is None:
+            raise RuntimeError("DSpark decode requires attention-only prefill first")
+        if main_kv.ndim != 3 or main_kv.shape[0] != self.ring.shape[0]:
+            raise ValueError("DSpark committed main KV must match the ring batch")
+        rows = int(main_kv.shape[1])
+        if rows <= 0 or rows > self.window_size:
+            raise ValueError("DSpark committed main KV width is outside its ring")
+        index = int(start_pos) % self.window_size
+        first = min(rows, self.window_size - index)
+        ring = mx.concatenate(
+            [
+                self.ring[:, :index],
+                main_kv[:, :first],
+                self.ring[:, index + first :],
+            ],
+            axis=1,
+        )
+        remaining = rows - first
+        if remaining:
+            ring = mx.concatenate([main_kv[:, first:], ring[:, remaining:]], axis=1)
+        self.ring = ring
+
+    def replace_main(self, start_pos: int, main_kv: mx.array) -> None:
+        """Compatibility name for the one-row official proposal update."""
+        if int(main_kv.shape[1]) != 1:
+            raise ValueError("DSpark decode replaces exactly one current-main KV")
+        self.commit_main(start_pos, main_kv)
+
+
+class DeepseekV4DSparkAttention(DeepseekV4Attention):
+    """Official 0731 DSpark attention, distinct from trunk CSA attention."""
+
+    def __init__(self, args: ModelArgs, layer_id: int):
+        super().__init__(args, layer_id)
+        if self.compress_ratio != 0:
+            raise ValueError("DSpark attention requires compress_ratio=0")
+
+    def _kv(self, x: mx.array, positions: mx.array) -> mx.array:
+        rd = self.rope_head_dim
+        cos, sin = self._rope_tables(positions)
+        kv = self.kv_norm(self.wkv(x))
+        return mx.concatenate(
+            [
+                kv[..., :-rd],
+                _apply_interleaved_rope(kv[..., -rd:], cos[None], sin[None]),
+            ],
+            axis=-1,
+        )
+
+    def __call__(
+        self,
+        x: mx.array,
+        *,
+        start_pos: int,
+        main_x: mx.array,
+        cache: DeepseekV4DSparkCache,
+    ) -> mx.array:
+        b, main_len, _ = main_x.shape
+        main_pos = mx.arange(int(start_pos), int(start_pos) + main_len)
+        main_kv = self._kv(main_x, main_pos)
+        if int(start_pos) == 0:
+            cache.prefill(main_kv)
+            return x
+
+        if int(x.shape[1]) != _DSPARK_BLOCK_SIZE:
+            raise ValueError("DSpark decode requires one complete five-token block")
+        cache.replace_main(start_pos, main_kv)
+        block = int(x.shape[1])
+        positions = mx.arange(
+            int(start_pos) + main_len, int(start_pos) + main_len + block
+        )
+        cos, sin = self._rope_tables(positions)
+        rd = self.rope_head_dim
+
+        qr = self.q_norm(self.wq_a(x))
+        q = self.wq_b(qr).reshape(b, block, self.n_heads, self.head_dim)
+        q = q * mx.rsqrt(
+            mx.mean(mx.square(q.astype(mx.float32)), axis=-1, keepdims=True) + self.eps
+        )
+        q = q.astype(x.dtype)
+        q = mx.concatenate(
+            [
+                q[..., :-rd],
+                _apply_interleaved_rope(
+                    q[..., -rd:], cos[None, :, None], sin[None, :, None]
+                ),
+            ],
+            axis=-1,
+        )
+        draft_kv = self._kv(x, positions)
+        full_kv = mx.concatenate([cache.ring, draft_kv], axis=1)
+        topk = get_dspark_topk_idxs(self.window_size, b, block, start_pos)
+        # Every row has the same official index vector.  Slice once; the query
+        # dimension is still fully retained in q.
+        visible_kv = full_kv[:, topk[0, 0]]
+        o = self._attend(q.transpose(0, 2, 1, 3), visible_kv, None)
+        o = o.transpose(0, 2, 1, 3)
+        o = mx.concatenate(
+            [
+                o[..., :-rd],
+                _apply_interleaved_rope(
+                    o[..., -rd:], cos[None, :, None], -sin[None, :, None]
+                ),
+            ],
+            axis=-1,
+        )
+        return self._o_lora(o.reshape(b, block, self.n_heads * self.head_dim))
+
+
+class DSparkMarkovHead(nn.Module):
+    """The 0731 sequential token-id bias, kept separate from the lm head."""
+
+    def __init__(self, vocab_size: int, rank: int):
+        super().__init__()
+        self.markov_w1 = nn.Embedding(vocab_size, rank)
+        self.markov_w2 = nn.Linear(rank, vocab_size, bias=False)
+
+    def __call__(self, token_ids: mx.array) -> Tuple[mx.array, mx.array]:
+        embed = self.markov_w1(token_ids)
+        return self.markov_w2(embed), embed
+
+
+class DSparkConfidenceHead(nn.Module):
+    """DSpark's fp32 confidence projection (not a vocabulary-logit head)."""
+
+    def __init__(self, hidden_size: int, markov_rank: int):
+        super().__init__()
+        self.proj = nn.Linear(hidden_size + markov_rank, 1, bias=False)
+
+    def __call__(self, hidden: mx.array, markov_embed: mx.array) -> mx.array:
+        x = mx.concatenate([hidden, markov_embed], axis=-1).astype(mx.float32)
+        # MLX stores Linear's parameters at the module dtype.  Cast both here so
+        # the confidence contract remains fp32 even when the model is bf16.
+        return (x @ self.proj.weight.astype(mx.float32).T).squeeze(-1)
+
+
+class DeepseekV4DSparkStage(DeepseekV4DecoderLayer):
+    """One of the three native 0731 DSpark stages.
+
+    Prefill writes this stage's attention cache only, as the upstream
+    ``DSparkBlock.forward`` does at ``start_pos == 0``.  Decode takes the normal
+    HC-attention-MoE block path.  The cache is supplied by its owning stage; no
+    stage ever borrows a trunk or sibling cache.
+    """
+
+    def __init__(self, args: ModelArgs, stage_id: int):
+        layer_id = args.num_hidden_layers + stage_id
+        ratios = list(args.compress_ratios)
+        if len(ratios) <= layer_id:
+            ratios.extend([0] * (layer_id + 1 - len(ratios)))
+            args = replace(args, compress_ratios=ratios)
+        super().__init__(args, layer_id)
+        self.attn = DeepseekV4DSparkAttention(args, layer_id)
+        self.stage_id = int(stage_id)
+        self.block_size = int(args.dspark_block_size)
+        self.noise_token_id = int(args.dspark_noise_token_id)
+        self.main_proj = None
+        self.main_norm = None
+        self.norm = None
+        self.hc_head = None
+        self.markov_head = None
+        self.confidence_head = None
+        if stage_id == 0:
+            self.main_proj = nn.Linear(
+                args.hidden_size * len(args.dspark_target_layer_ids),
+                args.hidden_size,
+                bias=False,
+            )
+            self.main_norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        if stage_id == _DSPARK_STAGE_COUNT - 1:
+            self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+            self.hc_head = HeadHC(args.hidden_size, args.hc_mult, args.hc_eps)
+            self.markov_head = DSparkMarkovHead(
+                args.vocab_size, args.dspark_markov_rank
+            )
+            self.confidence_head = DSparkConfidenceHead(
+                args.hidden_size, args.dspark_markov_rank
+            )
+
+    def fuse_main(self, main_hidden: mx.array) -> mx.array:
+        if self.main_proj is None or self.main_norm is None:
+            raise RuntimeError("DSpark main fusion belongs exclusively to stage 0")
+        return self.main_norm(self.main_proj(main_hidden))
+
+    def prefill(self, h: mx.array, cache, main_x: mx.array) -> mx.array:
+        """Populate only this stage's attention cache; do not run its MoE."""
+        # The stage has a pure sliding-window cache in the 0731 manifest.  The
+        # cache is deliberately built from stage 0's projected target state on
+        # every stage, matching DSparkAttention's ``main_x`` prefill operand.
+        # The attention result is discarded: upstream prefill exists to seed KV
+        # state, and DSpark's draft output is produced on decode.
+        self.attn(h, start_pos=0, main_x=main_x, cache=cache)
+        return h
+
+    def __call__(
+        self,
+        h: mx.array,
+        *,
+        start_pos: int,
+        cache=None,
+        input_ids=None,
+        main_x=None,
+    ) -> mx.array:
+        if int(start_pos) == 0:
+            if main_x is None:
+                raise ValueError("DSpark prefill requires stage-0 main_x")
+            return self.prefill(h, cache, main_x)
+        residual = h
+        x, post, comb = self.attn_hc.pre(h)
+        x = self.attn_norm(x)
+        x = self.attn(x, start_pos=start_pos, main_x=main_x, cache=cache)
+        h = self.attn_hc.post(x, residual, post, comb)
+        residual = h
+        x, post, comb = self.ffn_hc.pre(h)
+        x = self.ffn_norm(x)
+        x = self.ffn(x, input_ids=input_ids)
+        return self.ffn_hc.post(x, residual, post, comb)
+
+
+_DSPARK_STAGE_COUNT = 3
+_DSPARK_BLOCK_SIZE = 5
+_DSPARK_NOISE_TOKEN_ID = 128799
+_DSPARK_TARGET_LAYER_IDS = (40, 41, 42)
+_DSPARK_MARKOV_RANK = 256
+
+
+def _has_dspark_signature(args: ModelArgs) -> bool:
+    """Whether any 0731-only manifest value is present, complete or corrupt."""
+    return bool(args._dspark_signature_present) or any(
+        value is not None
+        for value in (
+            args.dspark_block_size,
+            args.dspark_noise_token_id,
+            args.dspark_target_layer_ids,
+            args.dspark_markov_rank,
+        )
+    )
+
+
+def _config_has_dspark_signature(config: dict) -> bool:
+    config = config or {}
+    return any(key in config for key in _DSPARK_MANIFEST_KEYS)
+
+
+def _validate_dspark_manifest(args: ModelArgs) -> None:
+    """Fail before installation if this is not the exact 0731 DSpark artifact."""
+    if int(args.dspark_block_size or 0) != _DSPARK_BLOCK_SIZE:
+        raise ValueError("DSpark-0731 requires dspark_block_size=5")
+    if int(args.num_nextn_predict_layers) != 1:
+        raise ValueError("DSpark-0731 requires num_nextn_predict_layers=1")
+    if int(args.dspark_noise_token_id or 0) != _DSPARK_NOISE_TOKEN_ID:
+        raise ValueError("DSpark-0731 requires dspark_noise_token_id=128799")
+    if (
+        tuple(int(x) for x in (args.dspark_target_layer_ids or ()))
+        != _DSPARK_TARGET_LAYER_IDS
+    ):
+        raise ValueError("DSpark-0731 requires target taps (40, 41, 42)")
+    if args.num_hidden_layers <= _DSPARK_TARGET_LAYER_IDS[-1]:
+        raise ValueError("DSpark-0731 target taps are absent from this trunk")
+    if args.vocab_size <= _DSPARK_NOISE_TOKEN_ID:
+        raise ValueError("DSpark-0731 vocabulary omits its noise token")
+    if int(args.dspark_markov_rank or 0) != _DSPARK_MARKOV_RANK:
+        raise ValueError("DSpark-0731 requires dspark_markov_rank=256")
+    ratios = list(args.compress_ratios)
+    for layer_id in range(
+        args.num_hidden_layers, args.num_hidden_layers + _DSPARK_STAGE_COUNT
+    ):
+        if layer_id < len(ratios) and int(ratios[layer_id]) != 0:
+            raise ValueError("DSpark-0731 stages require uncompressed attention")
+
+
+def _sample_dspark_token(
+    logits: mx.array, temperature: float, *, greedy: bool = False, key=None
+) -> mx.array:
+    """Official Gumbel-max sampler plus an explicit canonical greedy control."""
+    temperature = float(temperature)
+    if greedy or temperature == 0.0:
+        return mx.argmax(logits, axis=-1)
+    scaled = logits / max(temperature, 1e-5)
+    uniform = mx.random.uniform(shape=scaled.shape, key=key)
+    uniform = mx.clip(uniform, 1e-30, 1.0 - mx.finfo(mx.float32).eps)
+    gumbel = -mx.log(-mx.log(uniform))
+    return mx.argmax(scaled.astype(mx.float32) + gumbel, axis=-1)
+
+
+class DeepseekV4DSpark:
+    """Installed 0731 DSpark layer set; intentionally not generation routing."""
+
+    def __init__(self, args: ModelArgs):
+        _validate_dspark_manifest(args)
+        self.args = args
+        self.block_size = _DSPARK_BLOCK_SIZE
+        self.noise_token_id = _DSPARK_NOISE_TOKEN_ID
+        self.target_layer_ids = _DSPARK_TARGET_LAYER_IDS
+        self.stages = [
+            DeepseekV4DSparkStage(args, i) for i in range(_DSPARK_STAGE_COUNT)
+        ]
+
+    def draft_input_ids(self, target_ids: mx.array) -> mx.array:
+        if target_ids.ndim != 1:
+            raise ValueError("DSpark target ids must be a [batch] tensor")
+        noise = mx.full(
+            (target_ids.shape[0], self.block_size),
+            self.noise_token_id,
+            dtype=target_ids.dtype,
+        )
+        return mx.concatenate([target_ids[:, None], noise[:, 1:]], axis=1)
+
+    def make_cache(self) -> list:
+        return [
+            DeepseekV4DSparkCache(
+                window_size=stage.attn.window_size,
+                head_dim=stage.attn.head_dim,
+            )
+            for stage in self.stages
+        ]
+
+    def prefill(self, main_hidden: mx.array, caches) -> None:
+        """Seed all three stage rings from the authoritative prompt taps."""
+        if len(caches) != _DSPARK_STAGE_COUNT:
+            raise ValueError("DSpark requires one cache owned by each stage")
+        main_x = self.stages[0].fuse_main(main_hidden)
+        # At start_pos=0 DSparkAttention reads only main_x. Passing a narrow
+        # view avoids constructing the five noise-token embeddings discarded by
+        # the official attention-only prefill branch.
+        ignored = main_x[:, :1]
+        for stage, cache in zip(self.stages, caches):
+            stage.attn(
+                ignored,
+                start_pos=0,
+                main_x=main_x,
+                cache=cache,
+            )
+
+    def commit_main(self, main_hidden: mx.array, caches, *, start_pos: int) -> None:
+        """Commit only the target-verified proposal prefix to every stage ring."""
+        if len(caches) != _DSPARK_STAGE_COUNT:
+            raise ValueError("DSpark requires one cache owned by each stage")
+        if int(main_hidden.shape[1]) <= 0:
+            return
+        main_x = self.stages[0].fuse_main(main_hidden)
+        positions = mx.arange(int(start_pos), int(start_pos) + int(main_x.shape[1]))
+        for stage, cache in zip(self.stages, caches):
+            cache.commit_main(start_pos, stage.attn._kv(main_x, positions))
+
+    def finish(
+        self,
+        logits: mx.array,
+        hidden: mx.array,
+        target_ids: mx.array,
+        *,
+        greedy: bool = False,
+        key=None,
+    ) -> Tuple[mx.array, mx.array, mx.array]:
+        """Apply the sequential Markov recurrence and return fp32 confidence."""
+        final = self.stages[-1]
+        if final.markov_head is None or final.confidence_head is None:
+            raise RuntimeError("DSpark final stage is missing its output heads")
+        if logits.shape[1] != self.block_size or hidden.shape[1] != self.block_size:
+            raise ValueError("DSpark finish requires exactly one five-token block")
+        output_ids = [target_ids]
+        biased_rows = []
+        markov_embeds = []
+        previous = target_ids
+        keys = (
+            [None] * self.block_size
+            if key is None
+            else list(mx.random.split(key, self.block_size))
+        )
+        for i in range(self.block_size):
+            bias, markov_embed = final.markov_head(previous)
+            row = logits[:, i] + bias
+            biased_rows.append(row)
+            markov_embeds.append(markov_embed)
+            previous = _sample_dspark_token(
+                row, self.args.temperature, greedy=greedy, key=keys[i]
+            ).astype(target_ids.dtype)
+            output_ids.append(previous)
+        confidence = final.confidence_head(hidden, mx.stack(markov_embeds, axis=1))
+        return (mx.stack(output_ids, axis=1), mx.stack(biased_rows, axis=1), confidence)
+
+    def finish_ids(
+        self,
+        logits: mx.array,
+        target_ids: mx.array,
+        *,
+        width: int,
+        forced_first_token_ids: mx.array | None = None,
+    ) -> mx.array:
+        """Return a greedy proposal prefix without unused heads or rows.
+
+        ``forced_first_token_ids`` installs the target-owned primary at row zero
+        and uses it to seed the sequential Markov bias for the genuinely future
+        rows. The neural DSpark rows remain the same fixed parallel block; only
+        the token-id recurrence stops asking the drafter to overrule a token the
+        target has already sampled.
+        """
+        width = int(width)
+        if width < 1 or width > self.block_size:
+            raise ValueError("DSpark ids-only width must be between one and five")
+        if int(logits.shape[1]) != width:
+            raise ValueError("DSpark ids-only logits must match proposal width")
+        final = self.stages[-1]
+        if final.markov_head is None:
+            raise RuntimeError("DSpark final stage is missing its Markov head")
+        output_ids = [target_ids]
+        if forced_first_token_ids is None:
+            previous = target_ids
+            first_row = 0
+        else:
+            if forced_first_token_ids.shape != target_ids.shape:
+                raise ValueError("forced DSpark primary must match target id shape")
+            previous = forced_first_token_ids.astype(target_ids.dtype)
+            output_ids.append(previous)
+            first_row = 1
+        for index in range(first_row, width):
+            bias, _markov_embed = final.markov_head(previous)
+            previous = mx.argmax(logits[:, index] + bias, axis=-1).astype(
+                target_ids.dtype
+            )
+            output_ids.append(previous)
+        return mx.stack(output_ids, axis=1)
+
+    def forward(
+        self,
+        main_hidden: mx.array,
+        target_ids: mx.array,
+        embed_tokens: nn.Module,
+        lm_head: nn.Module,
+        caches=None,
+        *,
+        start_pos: int,
+        greedy: bool = False,
+        key=None,
+        ids_only_width: int | None = None,
+        forced_first_token_ids: mx.array | None = None,
+    ):
+        """Execute the three-stage 0731 layer without generation integration.
+
+        ``main_hidden`` is the target route's already-concatenated HC means.
+        ``start_pos == 0`` is the sole prefill signal: all three stages only write
+        their attention caches and return no draft output.  Positive positions run
+        all three full HC-attention-MoE stages.
+        """
+        if caches is None:
+            caches = self.make_cache()
+        if len(caches) != _DSPARK_STAGE_COUNT:
+            raise ValueError(
+                "DSpark requires one cache owned by each of its three stages"
+            )
+        main_x = self.stages[0].fuse_main(main_hidden)
+        ids = self.draft_input_ids(target_ids)
+        h = embed_tokens(ids)
+        h = mx.broadcast_to(
+            h[:, :, None, :], (*h.shape[:2], self.args.hc_mult, h.shape[-1])
+        )
+        for stage, cache in zip(self.stages, caches):
+            h = stage(
+                h,
+                start_pos=start_pos,
+                cache=cache,
+                input_ids=ids,
+                main_x=main_x,
+            )
+        if int(start_pos) == 0:
+            return None
+        final = self.stages[-1]
+        if final.hc_head is None or final.norm is None:
+            raise RuntimeError("DSpark final stage is missing its shared-head route")
+        collapsed = final.hc_head(h)
+        if ids_only_width is not None:
+            width = int(ids_only_width)
+            if width < 1 or width > self.block_size:
+                raise ValueError("DSpark ids-only width must be between one and five")
+            logits = lm_head(final.norm(collapsed[:, :width]))
+            if forced_first_token_ids is None:
+                return self.finish_ids(logits, target_ids, width=width)
+            return self.finish_ids(
+                logits,
+                target_ids,
+                width=width,
+                forced_first_token_ids=forced_first_token_ids,
+            )
+        logits = lm_head(final.norm(collapsed))
+        return self.finish(logits, collapsed, target_ids, greedy=greedy, key=key)
+
+
+class _LegacyTargetRoute:
+    """Installed target route for pre-0731 checkpoints."""
+
+    def __call__(self, owner, inputs: mx.array, cache):
+        h = owner._target_hc_hidden_route(inputs, cache)
+        return h, h
+
+
+class _DSparkTargetRoute:
+    """Installed target route that captures the three HC-collapsed tap means."""
+
+    def __call__(self, owner, inputs: mx.array, cache):
+        h = owner.model.embed_tokens(inputs)
+        h = mx.broadcast_to(
+            h[:, :, None, :], (*h.shape[:2], owner.args.hc_mult, h.shape[-1])
+        )
+        if cache is None:
+            cache = [None] * len(owner.model.layers)
+        taps = []
+        wanted = owner._dspark.target_layer_ids
+        for layer_id, (layer, layer_cache) in enumerate(zip(owner.model.layers, cache)):
+            h = layer(h, mask=None, cache=layer_cache, input_ids=inputs)
+            if layer_id in wanted:
+                # This is intentionally inside the layer loop: DSpark consumes
+                # the HC mean from the exact post-layer state, not a later state.
+                taps.append(mx.mean(h, axis=2))
+        if len(taps) != _DSPARK_STAGE_COUNT:
+            raise RuntimeError("DSpark target route did not observe every required tap")
+        return h, mx.concatenate(taps, axis=-1)
 
 
 class DeepseekV4Model(nn.Module):
@@ -3503,10 +4227,24 @@ class Model(nn.Module):
         # Reference ``Transformer.mtp`` (model.py L789-793): a top-level list, so
         # the parameter paths are ``mtp.{i}.*`` — exactly the upstream checkpoint's
         # names.  Dropped again by :meth:`sanitize` if the weights are not there.
-        self.mtp = [
-            DeepseekV4MTP(args, args.num_hidden_layers + i)
-            for i in range(max(int(args.num_nextn_predict_layers or 0), 0))
-        ]
+        # A DSpark manifest installs a different, typed target route and exactly
+        # three owned stage objects.  Do not even construct the legacy preview-MTP
+        # type for that artifact: the manifest selects one representation once.
+        if _has_dspark_signature(args):
+            self._dspark = DeepseekV4DSpark(args)
+            # Preserve the checkpoint's upstream ``mtp.{stage}.*`` namespace.
+            # `_dspark` is the installed type/control surface, while this list is
+            # the only registered parameter owner.
+            self.mtp = self._dspark.stages
+        else:
+            self._dspark = None
+            self.mtp = [
+                DeepseekV4MTP(args, args.num_hidden_layers + i)
+                for i in range(max(int(args.num_nextn_predict_layers or 0), 0))
+            ]
+        self._target_hidden_route = (
+            _DSparkTargetRoute() if self._dspark else _LegacyTargetRoute()
+        )
         # Construction-time performance installers may replace this with a
         # typed phase/width router.  The stock callable is explicit and direct;
         # decoder layers never probe candidate eligibility or fall back.
@@ -3550,16 +4288,16 @@ class Model(nn.Module):
                 "the DeepSeek-V4 backend does not support input_embeddings "
                 "(no vision splice path)"
             )
-        h = self._target_hc_hidden_route(inputs, cache)
+        h, exposed_hidden = self._target_hidden_route(self, inputs, cache)
         logits = None
         if emit_logits:
             source = h
             if logits_keep is not None:
-                source = h[:, -max(1, int(logits_keep)):]
+                source = h[:, -max(1, int(logits_keep)) :]
             logits = self.logits_from_hc_hidden(source)
         if not return_hidden:
             return logits
-        return logits, h
+        return logits, exposed_hidden
 
     @property
     def layers(self):
@@ -3583,11 +4321,43 @@ class Model(nn.Module):
 
     @property
     def has_mtp(self) -> bool:
-        return bool(self.mtp_blocks)
+        # DSpark has its own five-token output protocol and has deliberately not
+        # been connected to the generic preview-MTP generation path yet.
+        return self._dspark is None and bool(self.mtp_blocks)
 
     def hc_hidden(self, inputs: mx.array, cache=None) -> mx.array:
         """Trunk forward stopping at the pre-head state the MTP block consumes."""
         return self.model.hc_hidden(inputs, cache)
+
+    def _collect_dspark_taps(
+        self, h: mx.array, *, start_layer: int = 0, cache=None, input_ids=None
+    ) -> mx.array:
+        """Collect DSpark's post-layer HC means, primarily for exactness gates.
+
+        The installed target route above uses the same operation during a real
+        forward.  Keeping this small helper makes the boundary observable without
+        creating a second model-forward implementation for tests or loaders.
+        """
+        if self._dspark is None:
+            raise RuntimeError("DSpark taps requested from a legacy V4 model")
+        if cache is None:
+            cache = [None] * len(self.model.layers)
+        taps = []
+        wanted = self._dspark.target_layer_ids
+        for layer_id in range(int(start_layer), len(self.model.layers)):
+            h = self.model.layers[layer_id](
+                h, mask=None, cache=cache[layer_id], input_ids=input_ids
+            )
+            if layer_id in wanted:
+                taps.append(mx.mean(h, axis=2))
+        if len(taps) != _DSPARK_STAGE_COUNT:
+            raise RuntimeError("DSpark target tap collection was incomplete")
+        return mx.concatenate(taps, axis=-1)
+
+    def make_dspark_cache(self):
+        if self._dspark is None:
+            raise RuntimeError("this checkpoint does not install DSpark")
+        return self._dspark.make_cache()
 
     def logits_from_hc_hidden(self, h: mx.array) -> mx.array:
         """``[b, s, hc, dim]`` -> target logits; the other half of :meth:`hc_hidden`.
@@ -3635,6 +4405,8 @@ class Model(nn.Module):
         RoPE at the wrong absolute position instead of failing.
         """
         blocks = self.mtp_blocks
+        if self._dspark is not None:
+            raise RuntimeError("DSpark-0731 generation routing is not installed")
         if not blocks:
             raise RuntimeError("this checkpoint ships no MTP block")
         if isinstance(cache, (list, tuple)):
@@ -3741,6 +4513,63 @@ class Model(nn.Module):
         ``load_weights(strict=True)`` still sees an exact match instead of 58
         spurious "missing" keys.
         """
+        # Official PyTorch HC tensors are flat fields; the MLX modules group the
+        # same three arrays under their installed HC objects.  Translate once at
+        # the load boundary for both trunk and DSpark blocks.
+        hc_suffixes = {
+            ".hc_attn_fn": ".attn_hc.fn",
+            ".hc_attn_base": ".attn_hc.base",
+            ".hc_attn_scale": ".attn_hc.scale",
+            ".hc_ffn_fn": ".ffn_hc.fn",
+            ".hc_ffn_base": ".ffn_hc.base",
+            ".hc_ffn_scale": ".ffn_hc.scale",
+            ".hc_head_fn": ".hc_head.fn",
+            ".hc_head_base": ".hc_head.base",
+            ".hc_head_scale": ".hc_head.scale",
+        }
+        translated = {}
+        for key, value in weights.items():
+            target = str(key)
+            for source_suffix, target_suffix in hc_suffixes.items():
+                if target.endswith(source_suffix):
+                    target = target[: -len(source_suffix)] + target_suffix
+                    break
+            # Flash-0731 preserves o-LoRA's explicit group axis in storage:
+            #   [o_groups, o_lora_rank, packed_input]
+            # QuantizedLinear owns the identical row-major matrix as
+            #   [o_groups * o_lora_rank, packed_input].
+            # Collapse the two logical row axes once at load; the byte order and
+            # therefore the group/rank ownership are unchanged. Older exports
+            # already use the 2-D form and pass through untouched.
+            if (
+                (target.startswith("model.layers.") or target.startswith("mtp."))
+                and any(
+                    target.endswith(f".attn.wo_a.{field}")
+                    for field in ("weight", "scales", "biases")
+                )
+                and value.ndim == 3
+            ):
+                expected = (self.args.o_groups, self.args.o_lora_rank)
+                if tuple(value.shape[:2]) != expected:
+                    raise ValueError(
+                        f"invalid grouped 0731 o-LoRA storage for {target}: "
+                        f"expected leading axes {expected}, got {tuple(value.shape)}"
+                    )
+                value = value.reshape(expected[0] * expected[1], value.shape[-1])
+            translated[target] = value
+        weights = translated
+        if self._dspark is not None:
+            missing = [
+                stage_id
+                for stage_id in range(_DSPARK_STAGE_COUNT)
+                if not any(str(k).startswith(f"mtp.{stage_id}.") for k in weights)
+            ]
+            if missing:
+                raise ValueError(
+                    "DSpark-0731 checkpoint is missing required stage tensors: "
+                    + ", ".join(f"mtp.{stage_id}.*" for stage_id in missing)
+                )
+            return weights
         if self.mtp_blocks and not any(str(k).startswith("mtp.") for k in weights):
             self.mtp = []
         return weights
@@ -3872,9 +4701,7 @@ _CANONICAL_O_LORA_STORAGE_CONTRACT = {
 }
 
 
-def _require_o_lora_array(
-    value, *, label: str, shape: tuple[int, int], dtype
-) -> None:
+def _require_o_lora_array(value, *, label: str, shape: tuple[int, int], dtype) -> None:
     if tuple(getattr(value, "shape", ())) != shape:
         raise ValueError(
             f"{label} shape {tuple(getattr(value, 'shape', ()))} does not match {shape}"
@@ -3897,9 +4724,7 @@ def _require_canonical_quantized_linear(
     ):
         observed = getattr(linear, attribute, None)
         if observed != expected:
-            raise ValueError(
-                f"{label} {attribute}={observed!r}, expected {expected!r}"
-            )
+            raise ValueError(f"{label} {attribute}={observed!r}, expected {expected!r}")
 
     weight = getattr(linear, "weight", None)
     scales = getattr(linear, "scales", None)
@@ -3962,9 +4787,7 @@ def _require_canonical_quantized_linear(
     )
 
 
-def _require_canonical_dense_linear(
-    linear, *, label: str, shape: tuple[int, int]
-):
+def _require_canonical_dense_linear(linear, *, label: str, shape: tuple[int, int]):
     if not isinstance(linear, nn.Linear) or isinstance(linear, nn.QuantizedLinear):
         raise ValueError(f"{label} must be a dense nn.Linear, not QuantizedLinear")
     weight = getattr(linear, "weight", None)
@@ -3977,9 +4800,7 @@ def _require_canonical_dense_linear(
     if getattr(linear, "bias", None) is not None:
         raise ValueError(f"{label} additive bias must be absent")
     accidental = [
-        attribute
-        for attribute in _O_LORA_QUANT_FIELDS
-        if hasattr(linear, attribute)
+        attribute for attribute in _O_LORA_QUANT_FIELDS if hasattr(linear, attribute)
     ]
     if accidental:
         raise ValueError(
@@ -4145,15 +4966,13 @@ def install_deepseek_v4_o_lora_routes(
     """
     trunk = [layer.attn for layer in model.layers]
     mtp = [block.attn for block in model.mtp_blocks]
-    selected = (
-        str(mode)
-        if mode is not None
-        else _o_lora_mode_from_env()
-    )
+    selected = str(mode) if mode is not None else _o_lora_mode_from_env()
     if selected not in _O_LORA_MODES:
         raise ValueError(f"unsupported o-LoRA route {selected!r}")
     if not canonical_mixed_route:
-        reports = [attention.install_o_lora_route(selected) for attention in trunk + mtp]
+        reports = [
+            attention.install_o_lora_route(selected) for attention in trunk + mtp
+        ]
         return {
             "mode": selected,
             "module_count": len(reports),
@@ -4180,15 +4999,11 @@ def install_deepseek_v4_o_lora_routes(
         else None
     )
     body_route_type = (
-        _DirectGatherOLoraWideM4
-        if selected == "gather_qmm"
-        else _DirectCachedOLora
+        _DirectGatherOLoraWideM4 if selected == "gather_qmm" else _DirectCachedOLora
     )
     if selected == "gather_qmm":
         body_impls = [
-            body_route_type(
-                attention, quant, activation_dtype=activation_dtype
-            )
+            body_route_type(attention, quant, activation_dtype=activation_dtype)
             for attention, quant in zip(trunk, body_quant)
         ]
     else:
@@ -4228,9 +5043,7 @@ def install_deepseek_v4_o_lora_routes(
     callable_census = {
         "body_route_objects": len(body_impls),
         "body_route_kind": (
-            "gather_qmm_m4_wide_direct"
-            if selected == "gather_qmm"
-            else "cached_direct"
+            "gather_qmm_m4_wide_direct" if selected == "gather_qmm" else "cached_direct"
         ),
         "body_callable_class": body_route_type.__name__,
         "mtp_route_objects": len(mtp_impls),
@@ -4272,6 +5085,11 @@ def is_deepseek_v4_mtp_config(config: dict) -> bool:
     mlx-community conversions declare the layer and ship no tensors, which is what
     the runtime's degrade-to-autoregressive branch exists for).
     """
+    if _config_has_dspark_signature(config or {}):
+        # 0731 uses the same num_nextn_predict_layers=1 marker as preview MTP but
+        # has a different three-stage protocol.  It must wait for its dedicated
+        # runtime route instead of being injected into the legacy adapter.
+        return False
     model_type = str((config or {}).get("model_type") or "").lower()
     architectures = [str(a) for a in (config or {}).get("architectures") or []]
     if model_type != "deepseek_v4" and not any(

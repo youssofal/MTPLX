@@ -28,7 +28,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-from mtplx.artifacts import inspect_model
+from mtplx.artifacts import inspect_model, load_config
 from mtplx.benchmarks.validators.basic import (
     summarize_benchmark_quality,
     validate_balanced_delimiters,
@@ -686,6 +686,56 @@ def _validate_public_depth(args: Any, *, printer=print) -> int | None:
         return 2
     args.depth = depth
     return None
+
+
+def _deepseek_v4_0731_entrypoint_error(args: Any) -> dict[str, str] | None:
+    """Reject an invalid optimized selection before public model construction."""
+
+    legacy_k2 = bool(getattr(args, "deepseek_v4_0731_k2", False))
+    optimized = bool(getattr(args, "deepseek_v4_0731_optimized", False))
+    if not (legacy_k2 or optimized):
+        return None
+    if legacy_k2 and optimized:
+        return {
+            "error": "DeepSeek-V4-0731 optimized selection accepts one entrypoint flag",
+            "detail": "Choose either the legacy K2 flag or the depth-selectable flag.",
+        }
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    depth = int(getattr(args, "depth", 3))
+    if legacy_k2 and ("depth" not in cli_flags or depth != 2):
+        return {
+            "error": "DeepSeek-V4-0731 K2 requires explicit --depth 2",
+            "detail": "The selected construction owns exactly two future drafts.",
+        }
+    if optimized and ("depth" not in cli_flags or depth not in {1, 2, 3}):
+        return {
+            "error": "DeepSeek-V4-0731 optimized requires explicit --depth 1, 2, or 3",
+            "detail": "The selected construction binds one fixed depth before loading.",
+        }
+    if (
+        _generation_mode_from_args(args) != GENERATION_MODE_MTP
+        or getattr(args, "load_mtp", True) is False
+        or bool(getattr(args, "no_mtp", False))
+    ):
+        label = "K2" if legacy_k2 else "optimized"
+        return {
+            "error": f"DeepSeek-V4-0731 {label} requires MTP generation",
+            "detail": "Remove target-only AR or --no-load-mtp/--no-mtp options.",
+        }
+    return None
+
+
+def _runtime_load_kwargs(args: Any) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "mtp": getattr(args, "load_mtp", True) is not False,
+    }
+    legacy_k2 = bool(getattr(args, "deepseek_v4_0731_k2", False))
+    optimized = bool(getattr(args, "deepseek_v4_0731_optimized", False))
+    if legacy_k2 or optimized:
+        kwargs["deepseek_v4_0731_k2"] = True
+    if optimized:
+        kwargs["deepseek_v4_0731_depth"] = int(args.depth)
+    return kwargs
 
 
 def _normalize_generation_mode(value: Any) -> str:
@@ -8528,6 +8578,14 @@ def cmd_serve_public(args: Any) -> int:
     if depth_error is not None:
         return depth_error
     generation_mode = _generation_mode_from_args(args)
+    k2_error = _deepseek_v4_0731_entrypoint_error(args)
+    if k2_error is not None:
+        _print_command_error(
+            k2_error,
+            command=_server_command_name(args),
+            json_output=bool(getattr(args, "json", False)),
+        )
+        return 2
     fan_mode = _fan_mode_from_args(args)
     if (
         generation_mode == GENERATION_MODE_MTP
@@ -8800,6 +8858,14 @@ def cmd_serve_public(args: Any) -> int:
     _apply_backend_serve_defaults(args, inspection)
     _apply_qwen36_35b_optimized_speed_defaults(args, model_id)
     backend_descriptor = descriptor_from_inspection(inspection)
+    from mtplx.models.deepseek_v4 import _config_has_dspark_signature
+
+    try:
+        dspark_request_defaults = _config_has_dspark_signature(
+            load_config(runtime_model)
+        )
+    except (FileNotFoundError, OSError, ValueError):
+        dspark_request_defaults = False
     draft_lm_head = _model_draft_lm_head_spec(inspection, profile) or {
         "bits": 4,
         "group_size": 64,
@@ -8809,8 +8875,52 @@ def cmd_serve_public(args: Any) -> int:
     draft_sampler_override = _explicit_draft_sampler_override(args, draft_sampler)
     if draft_sampler_override is not None:
         draft_sampler = draft_sampler_override
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    if (
+        dspark_request_defaults
+        and not bool(getattr(args, "deepseek_v4_0731_optimized", False))
+        and ("depth" not in cli_flags or int(args.depth) != 2)
+    ):
+        _print_command_error(
+            {
+                "error": "DeepSeek-V4-0731 DSpark requires explicit --depth 2",
+                "detail": (
+                    "The installed proposer supports exactly two future drafts; "
+                    "other depths are not silently coerced."
+                ),
+            },
+            command=_server_command_name(args),
+            json_output=bool(getattr(args, "json", False)),
+        )
+        return 2
     if not quiet_json:
         _print_serve_handoff(args, runtime_model, profile.name)
+    depth_args = (
+        ["--depth", str(args.depth)]
+        if not dspark_request_defaults or "depth" in cli_flags or int(args.depth) != 3
+        else []
+    )
+    verify_strategy = str(
+        getattr(args, "verify_strategy", "capture_commit") or "capture_commit"
+    )
+    verify_strategy_args = (
+        ["--verify-strategy", verify_strategy]
+        if not dspark_request_defaults
+        or "verify-strategy" in cli_flags
+        or verify_strategy != "capture_commit"
+        else []
+    )
+    verify_core = str(
+        getattr(args, "verify_core", "linear-gdn-from-conv-tape")
+        or "linear-gdn-from-conv-tape"
+    )
+    verify_core_args = (
+        ["--verify-core", verify_core]
+        if not dspark_request_defaults
+        or "verify-core" in cli_flags
+        or verify_core != "linear-gdn-from-conv-tape"
+        else []
+    )
     cmd = [
         sys.executable,
         "-m",
@@ -8823,8 +8933,7 @@ def cmd_serve_public(args: Any) -> int:
         args.host,
         "--port",
         str(args.port),
-        "--depth",
-        str(args.depth),
+        *depth_args,
         "--generation-mode",
         generation_mode,
         "--profile",
@@ -8835,13 +8944,8 @@ def cmd_serve_public(args: Any) -> int:
         _pi_preserve_thinking_policy(args)
         if bool(getattr(args, "quickstart_pi", False))
         else _preserve_thinking_policy(args),
-        "--verify-strategy",
-        str(getattr(args, "verify_strategy", "capture_commit") or "capture_commit"),
-        "--verify-core",
-        str(
-            getattr(args, "verify_core", "linear-gdn-from-conv-tape")
-            or "linear-gdn-from-conv-tape"
-        ),
+        *verify_strategy_args,
+        *verify_core_args,
         "--draft-lm-head-bits",
         str(draft_lm_head["bits"]),
         "--draft-lm-head-group-size",
@@ -8867,6 +8971,10 @@ def cmd_serve_public(args: Any) -> int:
         "--fan-mode",
         fan_mode,
     ]
+    if bool(getattr(args, "deepseek_v4_0731_k2", False)):
+        cmd.append("--deepseek-v4-0731-k2")
+    if bool(getattr(args, "deepseek_v4_0731_optimized", False)):
+        cmd.append("--deepseek-v4-0731-optimized")
     for attr, flag in (
         ("max_active_requests", "--max-active-requests"),
         ("decode_batch_max", "--decode-batch-max"),
@@ -8879,7 +8987,10 @@ def cmd_serve_public(args: Any) -> int:
     # Retrieval models. The server runs as a subprocess with an explicitly
     # rebuilt argv, so anything not forwarded here never reaches it — the
     # endpoints would stay unconfigured on every path but a bare `mtplx serve`.
-    for flag, attr in (("--embedding-model", "embedding_model"), ("--reranker-model", "reranker_model")):
+    for flag, attr in (
+        ("--embedding-model", "embedding_model"),
+        ("--reranker-model", "reranker_model"),
+    ):
         for reference in getattr(args, attr, None) or []:
             if str(reference).strip():
                 cmd.extend([flag, str(reference)])
@@ -9482,6 +9593,9 @@ def _generate_one_shot_public(
     profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
     apply_profile_env(profile.name)
     generation_mode = _generation_mode_from_args(args)
+    k2_error = _deepseek_v4_0731_entrypoint_error(args)
+    if k2_error is not None:
+        return 2, k2_error, []
     draft_lm_head = (
         _model_draft_lm_head_spec(inspection, profile)
         if generation_mode == GENERATION_MODE_MTP
@@ -9520,7 +9634,7 @@ def _generate_one_shot_public(
     from mtplx.sampling import SamplerConfig
 
     try:
-        rt = load(runtime_model, mtp=getattr(args, "load_mtp", True) is not False)
+        rt = load(runtime_model, **_runtime_load_kwargs(args))
         draft_report = None
         if (
             draft_lm_head is not None
@@ -9589,20 +9703,17 @@ def _generate_one_shot_public(
                     seed=args.seed,
                 )
             else:
-                out = generate_mtpk(
+                request_kwargs = _public_mtpk_request_kwargs(
                     rt,
-                    prompt_ids,
+                    args,
                     max_tokens=max_tokens_value,
                     sampler=sampler,
                     draft_sampler=_draft_sampler_from_spec(draft_sampler),
                     speculative_depth=args.depth,
                     seed=args.seed,
-                    mtp_hidden_variant="post_norm",
                     mtp_cache_policy="persistent",
-                    mtp_history_policy="committed",
-                    verify_strategy="capture_commit",
-                    verify_core="linear-gdn-from-conv-tape",
                 )
+                out = generate_mtpk(rt, prompt_ids, **request_kwargs)
         finally:
             if smart_fans is not None and smart_request_id is not None:
                 smart_fans.end_request(smart_request_id, wait_for_restore=True)
@@ -10225,6 +10336,62 @@ class _QuickstartTerminalStreamer:
             print(f"{self._label}:")
 
 
+def _public_mtpk_request_kwargs(
+    rt: Any,
+    args: Any,
+    **common: Any,
+) -> dict[str, Any]:
+    from mtplx.runtime import build_mtpk_request_kwargs
+
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    explicit_legacy = {}
+    for flag, key, value, baseline in (
+        (
+            "mtp-hidden-variant",
+            "mtp_hidden_variant",
+            getattr(args, "mtp_hidden_variant", "post_norm"),
+            "post_norm",
+        ),
+        (
+            "mtp-history-policy",
+            "mtp_history_policy",
+            getattr(args, "mtp_history_policy", "committed"),
+            "committed",
+        ),
+        (
+            "verify-strategy",
+            "verify_strategy",
+            getattr(args, "verify_strategy", "capture_commit"),
+            "capture_commit",
+        ),
+        (
+            "verify-core",
+            "verify_core",
+            getattr(args, "verify_core", "linear-gdn-from-conv-tape"),
+            "linear-gdn-from-conv-tape",
+        ),
+        (
+            "draft-core",
+            "draft_core",
+            getattr(args, "draft_core", "stock"),
+            "stock",
+        ),
+    ):
+        if flag in cli_flags or value != baseline:
+            explicit_legacy[key] = value
+    return build_mtpk_request_kwargs(
+        rt,
+        common=common,
+        legacy_defaults={
+            "mtp_hidden_variant": "post_norm",
+            "mtp_history_policy": "committed",
+            "verify_strategy": "capture_commit",
+            "verify_core": "linear-gdn-from-conv-tape",
+        },
+        explicit_legacy=explicit_legacy,
+    )
+
+
 def _quickstart_stats_line(payload: dict[str, Any]) -> str:
     stats = payload.get("stats") or {}
     generated_tokens = int(stats.get("generated_tokens") or 0)
@@ -10376,21 +10543,18 @@ def _quickstart_generate(
                 token_callback=record_tokens,
             )
         else:
-            out = generate_mtpk(
+            request_kwargs = _public_mtpk_request_kwargs(
                 rt,
-                prompt_ids,
+                args,
                 max_tokens=max_tokens_value,
                 sampler=sampler,
                 draft_sampler=_draft_sampler_from_spec(draft_sampler),
                 speculative_depth=int(getattr(args, "depth", 3)),
                 seed=seed,
-                mtp_hidden_variant="post_norm",
                 mtp_cache_policy="persistent",
-                mtp_history_policy="committed",
-                verify_strategy="capture_commit",
-                verify_core="linear-gdn-from-conv-tape",
                 token_callback=record_tokens,
             )
+            out = generate_mtpk(rt, prompt_ids, **request_kwargs)
     finally:
         if smart_fans is not None and smart_request_id is not None:
             smart_fans.end_request(smart_request_id, wait_for_restore=False)
@@ -11818,6 +11982,8 @@ def _with_server_policy_args(target: Any, source: Any) -> Any:
         ("retrieval_trust_remote_code", False),
         ("api_key_file", None),
         ("api_key_source", "none"),
+        ("deepseek_v4_0731_k2", False),
+        ("deepseek_v4_0731_optimized", False),
         ("default_presence_penalty", 0.0),
         ("default_frequency_penalty", 0.0),
         ("paged_kv_quantization", "off"),
@@ -12477,6 +12643,14 @@ def _quickstart_run_terminal_chat_body(
     profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
     apply_profile_env(profile.name)
     generation_mode = _generation_mode_from_args(args)
+    k2_error = _deepseek_v4_0731_entrypoint_error(args)
+    if k2_error is not None:
+        _print_command_error(
+            k2_error,
+            command="start",
+            json_output=bool(getattr(args, "json", False)),
+        )
+        return 2
     draft_lm_head = (
         _model_draft_lm_head_spec(inspection, profile)
         if getattr(args, "load_mtp", True) is not False
@@ -12523,7 +12697,7 @@ def _quickstart_run_terminal_chat_body(
     quiet_progress = not sys.stdout.isatty()
     with ModelLoadProgress("Loading model", quiet=quiet_progress) as progress:
         progress.set_subtitle(f"profile {profile.name}")
-        rt = load(runtime_model, mtp=getattr(args, "load_mtp", True) is not False)
+        rt = load(runtime_model, **_runtime_load_kwargs(args))
         progress.set_subtitle("ready")
     _quickstart_line(f"Model ready in {time.perf_counter() - started:.1f}s")
     _quickstart_line(f"Generation mode: {_generation_mode_label(generation_mode)}")

@@ -33,11 +33,23 @@ def _rate_by_depth(accepted: list[int], drafted: list[int]) -> list[float | None
     return [(a / d if d else None) for a, d in zip(accepted, drafted)]
 
 
+def _cycle_count(events: list[dict], verify_calls: int) -> int:
+    return len(events) or max(0, int(verify_calls))
+
+
+def _active_memory_bytes() -> int:
+    import mlx.core as mx
+
+    return int(mx.get_active_memory())
+
+
 def _token_budget(max_tokens: int, case_max_tokens: int) -> int:
     return min(int(max_tokens), int(case_max_tokens))
 
 
-def _hit_token_budget(generated_tokens: int, token_budget: int, finish_reason: str | None) -> bool:
+def _hit_token_budget(
+    generated_tokens: int, token_budget: int, finish_reason: str | None
+) -> bool:
     if finish_reason == "length":
         return True
     return int(generated_tokens) >= int(token_budget)
@@ -111,6 +123,7 @@ def run_mtp_depth_sweep(
     draft_lm_head_bits: int | None = None,
     draft_lm_head_group_size: int = 64,
     draft_lm_head_mode: str = "affine",
+    deepseek_v4_0731_k2: bool = False,
 ) -> dict[str, Any]:
     contract_kwargs: dict[str, Any] = {
         "mtp_quant_bits": mtp_quant_bits,
@@ -130,11 +143,18 @@ def run_mtp_depth_sweep(
         mtp_adapter=mtp_adapter_path,
         merge_mtp_adapter=merge_mtp_adapter,
         gemma4_draft_block_size=gemma4_draft_block_size,
+        deepseek_v4_0731_k2=deepseek_v4_0731_k2,
     )
+    load_active_memory_bytes = _active_memory_bytes()
     contract = getattr(rt, "contract", None)
     is_gemma4_assistant = getattr(rt, "backend_id", None) == "gemma4_assistant"
-    resolved_base_hidden_variant = str(getattr(contract, "base_hidden_variant", "gemma4_assistant"))
-    resolved_mtp_hidden_variant = str(getattr(contract, "hidden_variant", "gemma4_assistant"))
+    is_native_block_backend = getattr(rt, "block_speculative_backend", None) is not None
+    resolved_base_hidden_variant = str(
+        getattr(contract, "base_hidden_variant", "gemma4_assistant")
+    )
+    resolved_mtp_hidden_variant = str(
+        getattr(contract, "hidden_variant", "gemma4_assistant")
+    )
     resolved_concat_order = str(getattr(contract, "concat_order", "assistant_pair"))
     draft_lm_head_report: dict[str, Any] | None = None
     if draft_lm_head_bits is not None and not is_gemma4_assistant:
@@ -203,6 +223,7 @@ def run_mtp_depth_sweep(
                 seed=seed + index,
             )
             generation_ended_at = time.time()
+            active_memory_bytes = _active_memory_bytes()
             validations = [
                 asdict(validation)
                 for validation in validate_benchmark_output(
@@ -226,12 +247,22 @@ def run_mtp_depth_sweep(
                         ar.finish_reason,
                     ),
                     "generated_tokens": ar.stats.generated_tokens,
+                    "prompt_tokens": len(ids),
                     "elapsed_s": ar.stats.elapsed_s,
                     "tok_s": ar.stats.tok_s,
                     "decode_tok_s": ar.stats.decode_tok_s,
                     "decode_elapsed_s": ar.stats.decode_elapsed_s,
                     "end_to_end_tok_s": ar.stats.end_to_end_tok_s,
                     "prompt_eval_time_s": ar.stats.prompt_eval_time_s,
+                    "prompt_tps": ar.stats.prompt_tps,
+                    "prompt_target_prefill_tok_s": (
+                        ar.stats.prompt_target_prefill_tok_s
+                    ),
+                    "active_memory_bytes": active_memory_bytes,
+                    "active_memory_growth_bytes": (
+                        active_memory_bytes - load_active_memory_bytes
+                    ),
+                    "peak_memory_bytes": ar.stats.peak_memory_bytes,
                     "tokens": ar.tokens,
                     "text": ar.text,
                     "validations": validations,
@@ -251,8 +282,12 @@ def run_mtp_depth_sweep(
                 sampler=sampler,
                 speculative_depth=depth,
                 seed=seed + index,
-                base_hidden_variant=resolved_base_hidden_variant,
-                mtp_hidden_variant=resolved_mtp_hidden_variant,
+                base_hidden_variant=(
+                    None if is_native_block_backend else resolved_base_hidden_variant
+                ),
+                mtp_hidden_variant=(
+                    None if is_native_block_backend else resolved_mtp_hidden_variant
+                ),
                 mtp_cache_policy=mtp_cache_policy,
                 mtp_history_policy=mtp_history_policy,
                 draft_sampler=draft_sampler,
@@ -278,6 +313,7 @@ def run_mtp_depth_sweep(
                 mtp_topk_reranker=mtp_topk_reranker,
             )
             generation_ended_at = time.time()
+            active_memory_bytes = _active_memory_bytes()
             validations = [
                 asdict(validation)
                 for validation in validate_benchmark_output(
@@ -287,6 +323,7 @@ def run_mtp_depth_sweep(
                 )
             ]
             ar_row = ar_rows[index] if compare_ar else None
+            cycles = _cycle_count(out.stats.events, out.stats.verify_calls)
             rows.append(
                 {
                     "prompt_id": case.id,
@@ -303,12 +340,21 @@ def run_mtp_depth_sweep(
                         out.finish_reason,
                     ),
                     "generated_tokens": out.stats.generated_tokens,
+                    "prompt_tokens": len(ids),
                     "elapsed_s": out.stats.elapsed_s,
                     "tok_s": out.stats.tok_s,
                     "decode_tok_s": out.stats.decode_tok_s,
                     "decode_elapsed_s": out.stats.decode_elapsed_s,
                     "end_to_end_tok_s": out.stats.end_to_end_tok_s,
                     "prompt_eval_time_s": out.stats.prompt_eval_time_s,
+                    "prompt_tps": out.stats.prompt_tps,
+                    "prompt_target_prefill_tok_s": (
+                        out.stats.prompt_target_prefill_tok_s
+                    ),
+                    "active_memory_bytes": active_memory_bytes,
+                    "active_memory_growth_bytes": (
+                        active_memory_bytes - load_active_memory_bytes
+                    ),
                     "ar_tok_s": ar_row["tok_s"] if ar_row is not None else None,
                     "ar_decode_tok_s": ar_row["decode_tok_s"]
                     if ar_row is not None
@@ -344,7 +390,7 @@ def run_mtp_depth_sweep(
                         out.stats.drafted_by_depth,
                     ),
                     "mean_accepted_drafts_per_cycle": (
-                        out.stats.accepted_drafts / max(1, len(out.stats.events))
+                        out.stats.accepted_drafts / max(1, cycles)
                     ),
                     "acceptance_rate": (
                         out.stats.accepted_drafts / out.stats.drafted_tokens
@@ -392,7 +438,9 @@ def run_mtp_depth_sweep(
 
         validations = [v for row in rows for v in row["validations"]]
         finish_reasons = _finish_reason_counts(rows)
-        accepted_by_depth = _sum_lists([row["accepted_by_depth"] for row in rows], depth)
+        accepted_by_depth = _sum_lists(
+            [row["accepted_by_depth"] for row in rows], depth
+        )
         drafted_by_depth = _sum_lists([row["drafted_by_depth"] for row in rows], depth)
         accept_probability_sum_by_depth = _sum_float_lists(
             [row["accept_probability_sum_by_depth"] for row in rows],
@@ -408,12 +456,8 @@ def run_mtp_depth_sweep(
         target_distribution_windows = sum(
             row["target_distribution_materialized_windows"] for row in rows
         )
-        lazy_bonus_verify_calls = sum(
-            row["lazy_bonus_verify_calls"] for row in rows
-        )
-        lazy_bonus_commit_time_s = sum(
-            row["lazy_bonus_commit_time_s"] for row in rows
-        )
+        lazy_bonus_verify_calls = sum(row["lazy_bonus_verify_calls"] for row in rows)
+        lazy_bonus_commit_time_s = sum(row["lazy_bonus_commit_time_s"] for row in rows)
         depth_results.append(
             {
                 "depth": depth,
@@ -512,9 +556,7 @@ def run_mtp_depth_sweep(
                     "verify_target_distribution_time_s": (
                         verify_target_distribution_time_s
                     ),
-                    "target_distribution_materialized_rows": (
-                        target_distribution_rows
-                    ),
+                    "target_distribution_materialized_rows": (target_distribution_rows),
                     "target_distribution_materialized_windows": (
                         target_distribution_windows
                     ),
@@ -593,6 +635,12 @@ def run_mtp_depth_sweep(
                     "peak_memory_bytes": max(
                         [row["peak_memory_bytes"] for row in rows] or [0]
                     ),
+                    "active_memory_bytes": max(
+                        [row["active_memory_bytes"] for row in rows] or [0]
+                    ),
+                    "active_memory_growth_bytes": max(
+                        [row["active_memory_growth_bytes"] for row in rows] or [0]
+                    ),
                     "speed_model": _speed_model_summary(rows),
                 },
             }
@@ -600,6 +648,8 @@ def run_mtp_depth_sweep(
 
     return {
         "model_path": str(model_path),
+        "load_active_memory_bytes": load_active_memory_bytes,
+        "deepseek_v4_0731_k2": deepseek_v4_0731_k2,
         "prompt_suite": str(prompt_suite),
         "sampler": asdict(sampler),
         "draft_sampler": asdict(draft_sampler),

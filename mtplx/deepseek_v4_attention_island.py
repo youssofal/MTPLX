@@ -20,6 +20,8 @@ from typing import Any, Callable
 import mlx.core as mx
 
 from .attention_context import current_attention_phase, current_model_forward_kind
+from .deepseek_v4_0731_moe import DeepseekV40731PackedQ2SwitchGLU
+from .moe_packed_projections import PackedSwitchGLU
 from .models import deepseek_v4 as D
 
 
@@ -52,9 +54,7 @@ class _Projection:
     input_dim: int
 
 
-def _projection_contract(
-    module: Any, label: str, *, expected_bits: int
-) -> _Projection:
+def _projection_contract(module: Any, label: str, *, expected_bits: int) -> _Projection:
     """Validate one stock affine projection once and bind its array leaves."""
 
     weight = getattr(module, "weight", None)
@@ -115,9 +115,7 @@ def _qmm(x: mx.array, projection: _Projection) -> mx.array:
     )
 
 
-def _gather_qmm(
-    x: mx.array, indices: mx.array, projection: _Projection
-) -> mx.array:
+def _gather_qmm(x: mx.array, indices: mx.array, projection: _Projection) -> mx.array:
     return mx.gather_qmm(
         x,
         projection.weight,
@@ -159,9 +157,7 @@ def _route(
         indices = mx.argpartition(-biased, kth=topk - 1, axis=-1)[..., :topk]
     route_weights = mx.take_along_axis(scores, indices, axis=-1)
     if score_func != "softmax":
-        route_weights = route_weights / mx.sum(
-            route_weights, axis=-1, keepdims=True
-        )
+        route_weights = route_weights / mx.sum(route_weights, axis=-1, keepdims=True)
     return indices, route_weights * route_scale
 
 
@@ -169,40 +165,43 @@ def _moe(
     x: mx.array,
     indices: mx.array,
     route_weights: mx.array,
-    routed_gate: _Projection,
-    routed_up: _Projection,
+    routed_gate: _Projection | None,
+    routed_up: _Projection | None,
     routed_down: _Projection,
     shared_gate: _Projection,
     shared_up: _Projection,
     shared_down: _Projection,
     *,
+    routed_gate_up: _Projection | None,
+    routed_combine: Callable | None,
     routed_limit: float,
     shared_limit: float,
 ) -> mx.array:
     """Stock unsorted Q2/Q4 arithmetic for the production top-6 tiny-M shape."""
 
     gathered_x = mx.expand_dims(x, (-2, -3))
-    up = _gather_qmm(gathered_x, indices, routed_up)
-    gate = _gather_qmm(gathered_x, indices, routed_gate)
+    if routed_gate_up is None:
+        up = _gather_qmm(gathered_x, indices, routed_up)  # type: ignore[arg-type]
+        gate = _gather_qmm(gathered_x, indices, routed_gate)  # type: ignore[arg-type]
+    else:
+        packed = _gather_qmm(gathered_x, indices, routed_gate_up)
+        gate, up = mx.split(packed, [routed_gate_up.output_dim // 2], axis=-1)
     if routed_limit > 0:
         up = mx.clip(up, -routed_limit, routed_limit)
         gate = mx.minimum(gate, routed_limit)
     routed = _gather_qmm(D.nn.silu(gate) * up, indices, routed_down)
     routed = routed.squeeze(-2)
-    routed = (
-        routed * route_weights[..., None].astype(routed.dtype)
-    ).sum(axis=-2)
+    if routed_combine is None:
+        routed = (routed * route_weights[..., None].astype(routed.dtype)).sum(axis=-2)
+    else:
+        routed = routed_combine(routed, route_weights)
 
     shared_gate_out = _qmm(x, shared_gate)
     shared_up_out = _qmm(x, shared_up)
     if shared_limit > 0:
-        shared_up_out = mx.clip(
-            shared_up_out, -shared_limit, shared_limit
-        )
+        shared_up_out = mx.clip(shared_up_out, -shared_limit, shared_limit)
         shared_gate_out = mx.minimum(shared_gate_out, shared_limit)
-    shared = _qmm(
-        D.nn.silu(shared_gate_out) * shared_up_out, shared_down
-    )
+    shared = _qmm(D.nn.silu(shared_gate_out) * shared_up_out, shared_down)
     return routed + shared
 
 
@@ -218,13 +217,15 @@ def _island_impl(
     norm_weight: mx.array,
     router_weight: mx.array,
     router_auxiliary: mx.array,
-    routed_gate: _Projection,
-    routed_up: _Projection,
+    routed_gate: _Projection | None,
+    routed_up: _Projection | None,
     routed_down: _Projection,
     shared_gate: _Projection,
     shared_up: _Projection,
     shared_down: _Projection,
     *,
+    routed_gate_up: _Projection | None,
+    routed_combine: Callable | None,
     hc: int,
     iters: int,
     hc_eps: float,
@@ -283,6 +284,8 @@ def _island_impl(
         shared_gate,
         shared_up,
         shared_down,
+        routed_gate_up=routed_gate_up,
+        routed_combine=routed_combine,
         routed_limit=routed_limit,
         shared_limit=shared_limit,
     ).reshape(shape)
@@ -296,8 +299,10 @@ def _attention_island_tape(
     *,
     width: int,
     hash_router: bool,
-    routed_gate: _Projection,
-    routed_up: _Projection,
+    routed_gate: _Projection | None,
+    routed_up: _Projection | None,
+    routed_gate_up: _Projection | None,
+    routed_combine: Callable | None,
     routed_down: _Projection,
     shared_gate: _Projection,
     shared_up: _Projection,
@@ -313,17 +318,29 @@ def _attention_island_tape(
     routed_limit: float,
     shared_limit: float,
 ) -> Callable:
+    paired = routed_gate_up is not None
+    if paired:
+        effective_gate = effective_up = effective_pair = routed_gate_up
+    else:
+        assert routed_gate is not None and routed_up is not None
+        effective_gate = routed_gate
+        effective_up = routed_up
+        # Preserve one compiled signature; this final leaf is unused when stock.
+        effective_pair = routed_gate
     projections = (
-        routed_gate,
-        routed_up,
+        effective_gate,
+        effective_up,
         routed_down,
         shared_gate,
         shared_up,
         shared_down,
+        effective_pair,
     )
     key = (
         int(width),
         bool(hash_router),
+        paired,
+        routed_combine is not None,
         tuple((p.bits, p.group_size) for p in projections),
         int(hc),
         int(iters),
@@ -374,6 +391,9 @@ def _attention_island_tape(
         sd_weight,
         sd_scales,
         sd_biases,
+        rgu_weight,
+        rgu_scales,
+        rgu_biases,
     ):
         arrays = (
             (rg_weight, rg_scales, rg_biases),
@@ -382,11 +402,13 @@ def _attention_island_tape(
             (sg_weight, sg_scales, sg_biases),
             (su_weight, su_scales, su_biases),
             (sd_weight, sd_scales, sd_biases),
+            (rgu_weight, rgu_scales, rgu_biases),
         )
         bound = tuple(
             _Projection(*leaves, *spec)
             for leaves, spec in zip(arrays, specs, strict=True)
         )
+        brg, bru, brd, bsg, bsu, bsd, brgu = bound
         return _island_impl(
             attn_out,
             attn_residual,
@@ -399,7 +421,14 @@ def _attention_island_tape(
             norm_weight,
             router_weight,
             router_auxiliary,
-            *bound,
+            None if paired else brg,
+            None if paired else bru,
+            brd,
+            bsg,
+            bsu,
+            bsd,
+            routed_gate_up=brgu if paired else None,
+            routed_combine=routed_combine,
             hc=hc,
             iters=iters,
             hc_eps=hc_eps,
@@ -438,54 +467,103 @@ class _BoundAttentionIslandLayer:
 
 
 def _bind_attention_island_layer(
-    layer: D.DeepseekV4DecoderLayer, *, width: int
+    layer: D.DeepseekV4DecoderLayer,
+    *,
+    width: int,
+    allowed_widths: tuple[int, ...] = _WIDTHS,
+    shared_bits: int = 4,
+    routed_pair: bool = False,
+    routed_combine: Callable | None = None,
+    routed_switch: Any | None = None,
 ) -> _BoundAttentionIslandLayer:
     """Validate and bind one layer; its hot call performs no discovery."""
 
-    if int(width) not in _WIDTHS:
+    if int(width) not in allowed_widths:
         raise AttentionIslandError(f"unsupported verifier width {width}")
+    if int(shared_bits) not in {4, 8}:
+        raise AttentionIslandError(f"unsupported shared-expert bits {shared_bits}")
     if type(layer) is not D.DeepseekV4DecoderLayer:
         raise AttentionIslandError("requires an exact DeepseekV4DecoderLayer")
     ffn = layer.ffn
     if type(ffn) is not D.DeepseekV4MoE:
         raise AttentionIslandError("requires the stock DeepSeek-V4 MoE topology")
-    switch = ffn.switch_mlp
+    switch = ffn.switch_mlp if routed_switch is None else routed_switch
     shared = ffn.shared_experts
+    if routed_pair:
+        if not isinstance(
+            switch,
+            (DeepseekV40731PackedQ2SwitchGLU, PackedSwitchGLU),
+        ):
+            raise AttentionIslandError("requires the packed routed Q2 topology")
+    elif isinstance(switch, PackedSwitchGLU):
+        raise AttentionIslandError("requires the stock routed Q2 topology")
     if type(switch.activation) is not D.ClampedSwiGLU:
         raise AttentionIslandError("requires the exact clamped SwiGLU activation")
-    projections = tuple(
-        _projection_contract(module, label, expected_bits=bits)
-        for module, label, bits in (
-            (switch.gate_proj, "routed gate", 2),
-            (switch.up_proj, "routed up", 2),
-            (switch.down_proj, "routed down", 2),
-            (shared.gate_proj, "shared gate", 4),
-            (shared.up_proj, "shared up", 4),
-            (shared.down_proj, "shared down", 4),
+    if routed_pair:
+        rgu = _projection_contract(
+            switch.gate_up_proj,
+            "packed routed gate/up",
+            expected_bits=2,
+        )
+        rd = _projection_contract(switch.down_proj, "routed down", expected_bits=2)
+        if int(switch._split_at) * 2 != rgu.output_dim:
+            raise AttentionIslandError("packed routed gate/up split is inconsistent")
+        rg = ru = None
+        input_dim = rgu.input_dim
+        intermediate = int(switch._split_at)
+        effective_routed = (rgu, rgu, rd, rgu)
+    else:
+        rg, ru, rd = tuple(
+            _projection_contract(module, label, expected_bits=2)
+            for module, label in (
+                (switch.gate_proj, "routed gate"),
+                (switch.up_proj, "routed up"),
+                (switch.down_proj, "routed down"),
+            )
+        )
+        rgu = None
+        input_dim = rg.input_dim
+        intermediate = rg.output_dim
+        effective_routed = (rg, ru, rd, rg)
+    sg, su, sd = tuple(
+        _projection_contract(module, label, expected_bits=int(shared_bits))
+        for module, label in (
+            (shared.gate_proj, "shared gate"),
+            (shared.up_proj, "shared up"),
+            (shared.down_proj, "shared down"),
         )
     )
-    rg, ru, rd, sg, su, sd = projections
     if (
-        rg.input_dim != ru.input_dim
-        or rg.output_dim != ru.output_dim
-        or rd.input_dim != rg.output_dim
-        or rd.output_dim != rg.input_dim
-        or sg.input_dim != rg.input_dim
+        (
+            not routed_pair
+            and (rg.input_dim != ru.input_dim or rg.output_dim != ru.output_dim)
+        )
+        or rd.input_dim != intermediate
+        or rd.output_dim != input_dim
+        or sg.input_dim != input_dim
         or sg.output_dim != su.output_dim
-        or su.input_dim != rg.input_dim
+        or su.input_dim != input_dim
         or sd.input_dim != sg.output_dim
-        or sd.output_dim != rg.input_dim
+        or sd.output_dim != input_dim
     ):
         raise AttentionIslandError("routed/shared projection geometry is inconsistent")
     hc = layer.ffn_hc
     fn_t, base, scale_vec = hc._static()
     router = ffn.gate
+    if routed_combine is not None and (
+        int(width) != 1 or int(router.topk) != 6 or rd.output_dim != 4096
+    ):
+        raise AttentionIslandError(
+            "row-owned combine requires the exact AR M1/top-6/hidden-4096 route"
+        )
     auxiliary = router.tid2eid if router.hash else router.e_score_correction_bias
     tape = _attention_island_tape(
         width=width,
         hash_router=bool(router.hash),
         routed_gate=rg,
         routed_up=ru,
+        routed_gate_up=rgu,
+        routed_combine=routed_combine,
         routed_down=rd,
         shared_gate=sg,
         shared_up=su,
@@ -508,7 +586,11 @@ def _bind_attention_island_layer(
         layer.ffn_norm.weight,
         router.weight,
         auxiliary,
-        *(leaf for p in projections for leaf in (p.weight, p.scales, p.biases)),
+        *(
+            leaf
+            for p in effective_routed[:3] + (sg, su, sd, effective_routed[3])
+            for leaf in (p.weight, p.scales, p.biases)
+        ),
     )
     return _BoundAttentionIslandLayer(tape, leaves, width)
 
@@ -583,7 +665,10 @@ def select_deepseek_v4_attention_island_arm(model: Any, enabled: bool) -> None:
     """Select a preinstalled bracket arm outside measured generation."""
 
     selector = getattr(model, "_mtplx_dsv4_attention_island_selector", None)
-    if type(selector) is not _AttentionIslandArmSelector or selector._model is not model:
+    if (
+        type(selector) is not _AttentionIslandArmSelector
+        or selector._model is not model
+    ):
         raise AttentionIslandError("attention-island arm selector is not installed")
     selector.select(enabled)
 
@@ -627,6 +712,11 @@ def install_deepseek_v4_attention_island(
 ) -> dict[str, Any]:
     """Validate the canonical checkpoint, prebind nine tapes, and install."""
 
+    if getattr(model, "_dspark", None) is not None:
+        raise AttentionIslandError(
+            "DSpark requires tap-aware attention-island support; refusing to "
+            "install a target route that its tap collector would bypass"
+        )
     _validate_model(model, config)
     stock = getattr(model, "_target_hc_hidden_route", model.model.hc_hidden)
     bound_by_width: dict[int, _BoundWidthBody] = {}

@@ -100,7 +100,9 @@ def _checked_attestation(
     )
     if (
         attestation.get("schema_version") != 1
-        or any(isinstance(value, bool) or not isinstance(value, int) for value in integers)
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) for value in integers
+        )
         or not _valid_digest(attestation.get("nonce_sha256"))
     ):
         raise RuntimeError("repository guard attestation receipt is malformed")
@@ -110,7 +112,10 @@ def _checked_attestation(
         raise RuntimeError("repository guard attestation expiry is malformed")
     lock_path = attestation.get("lock_path")
     resolved_lock = expected_lock.resolve(strict=True)
-    if not isinstance(lock_path, str) or Path(lock_path).resolve(strict=True) != resolved_lock:
+    if (
+        not isinstance(lock_path, str)
+        or Path(lock_path).resolve(strict=True) != resolved_lock
+    ):
         raise RuntimeError(
             f"guard attested {lock_path!r}, expected lock {str(expected_lock)!r}"
         )
@@ -225,7 +230,9 @@ def load_verified_guard_window(
     try:
         document = json.loads(encoded)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise RuntimeError(f"verified guard window receipt is malformed: {error}") from error
+        raise RuntimeError(
+            f"verified guard window receipt is malformed: {error}"
+        ) from error
     if not isinstance(document, dict) or _canonical_json(document) != encoded:
         raise RuntimeError("verified guard window receipt is not canonical")
     attestation = document.get("attestation")

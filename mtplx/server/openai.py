@@ -230,7 +230,7 @@ try:
         is_background_request,
         system_prompt_hash,
     )
-    from mtplx.runtime import load
+    from mtplx.runtime import build_mtpk_request_kwargs, load
     from mtplx.session_bank import CacheMissReason, common_prefix_len
     from mtplx.cache_state import restore_cache, snapshot_cache
 
@@ -256,6 +256,7 @@ except Exception as exc:
     restore_cache = _missing_runtime
     snapshot_cache = _missing_runtime
     load = _missing_runtime
+    build_mtpk_request_kwargs = _missing_runtime
 
     class PostcommitAbort(RuntimeError):
         pass
@@ -1821,9 +1822,94 @@ def _validate_mtp_batch_settings(args: argparse.Namespace) -> None:
     _require_mlx_lm_arrays_cache_fix()
 
 
+def _validate_deepseek_v4_0731_entrypoint(args: argparse.Namespace) -> None:
+    legacy_k2 = bool(getattr(args, "deepseek_v4_0731_k2", False))
+    optimized = bool(getattr(args, "deepseek_v4_0731_optimized", False))
+    if not (legacy_k2 or optimized):
+        return
+    if legacy_k2 and optimized:
+        raise ValueError(
+            "DeepSeek-V4-0731 optimized selection accepts only one entrypoint flag"
+        )
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    depth = int(getattr(args, "depth", 3))
+    if legacy_k2 and ("depth" not in cli_flags or depth != 2):
+        raise ValueError(
+            "DeepSeek-V4-0731 K2 requires explicit --depth 2 before model load"
+        )
+    if optimized and ("depth" not in cli_flags or depth not in {1, 2, 3}):
+        raise ValueError(
+            "DeepSeek-V4-0731 optimized requires explicit --depth 1, 2, or 3 "
+            "before model load"
+        )
+    if (
+        getattr(args, "load_mtp", True) is False
+        or str(getattr(args, "generation_mode", "mtp")) != "mtp"
+        or bool(getattr(args, "stock_ar", False))
+    ):
+        label = "K2" if legacy_k2 else "optimized"
+        raise ValueError(f"DeepSeek-V4-0731 {label} requires MTP generation")
+
+
+def _global_stateless_session_cache_bypass(
+    _headers: Mapping[str, str], _metadata: Mapping[str, Any]
+) -> bool:
+    """Construction-installed session route for a globally stateless server."""
+    return True
+
+
+def _dynamic_session_cache_bypass(
+    headers: Mapping[str, str], metadata: Mapping[str, Any]
+) -> bool:
+    """Per-request escape hatch for the normal, constructed SessionBank lane."""
+    return (
+        headers.get("x-mtplx-cache-mode", "").lower()
+        in {"bypass", "stateless", "off"}
+        or str(metadata.get("cache_mode", "")).lower()
+        in {"bypass", "stateless", "off"}
+    )
+
+
+class _StatelessSessionRoute:
+    """Admin-compatible no-op session route; deliberately owns no bank."""
+
+    bank = None
+    last_prefix_diagnostic = None
+
+    @staticmethod
+    def resolve_session_id(**_kwargs: Any) -> tuple[None, str]:
+        return None, "stateless"
+
+    @staticmethod
+    def get_or_create(_session_id: str | None) -> None:
+        return None
+
+    @staticmethod
+    @contextmanager
+    def generation_slot(session: Any, **_kwargs: Any) -> Iterable[Any]:
+        yield session
+
+    @staticmethod
+    def list_sessions() -> dict[str, Any]:
+        return {"sessions": [], "count": 0, "session_bank": {}}
+
+    @staticmethod
+    def clear_session(session_id: str) -> dict[str, Any]:
+        return {"session_id": session_id, "cleared": False, "reason": "stateless"}
+
+    @staticmethod
+    def clear_all() -> dict[str, Any]:
+        return {"cleared": 0, "reason": "stateless"}
+
+    @staticmethod
+    def archive_cold_tier() -> dict[str, Any]:
+        return {"archived": False, "reason": "stateless"}
+
+
 class ServerState:
     def __init__(self, args: argparse.Namespace) -> None:
         _validate_mtp_batch_settings(args)
+        _validate_deepseek_v4_0731_entrypoint(args)
         self.args = args
         try:
             args.paged_kv_quantization = normalize_paged_kv_quantization(
@@ -1945,6 +2031,12 @@ class ServerState:
         )
         _startup_line("      Model load in progress (this may take a minute).")
         load_heartbeat = _startup_heartbeat("Model still loading")
+        construction_options = {}
+        if bool(getattr(args, "deepseek_v4_0731_k2", False)) or bool(
+            getattr(args, "deepseek_v4_0731_optimized", False)
+        ):
+            construction_options["deepseek_v4_0731_k2"] = True
+            construction_options["deepseek_v4_0731_depth"] = int(args.depth)
         try:
             self.runtime = self.model_scheduler.submit_foreground(
                 load,
@@ -1962,6 +2054,7 @@ class ServerState:
                     args,
                     startup_backend,
                 ),
+                **construction_options,
                 batch_key="startup.load",
             ).result()
         except BaseException as exc:
@@ -2132,52 +2225,55 @@ class ServerState:
         # The paged KV pool clamps geometric growth to this window (#150);
         # env is the plumbing because cache_state has no server handle.
         os.environ["MTPLX_CONTEXT_WINDOW_TOKENS"] = str(int(self.context_window))
-        self.session_bank_cold_tier = _session_bank_cold_tier_from_args(args)
-        from mtplx.engine_session import model_weights_bytes as _model_weights_bytes
+        if args.session_cache_mode == "off":
+            # Install a route rather than a request-time condition. This lane
+            # never owns a SessionBank, manager, cold tier, or postcommit work.
+            self.session_cache_bypass = _global_stateless_session_cache_bypass
+            self.session_bank_cold_tier = None
+            self.sessions = _StatelessSessionRoute()
+        else:
+            self.session_cache_bypass = _dynamic_session_cache_bypass
+            self.session_bank_cold_tier = _session_bank_cold_tier_from_args(args)
+            from mtplx.engine_session import model_weights_bytes as _model_weights_bytes
 
-        self.sessions = EngineSessionManager(
-            cold_tier=self.session_bank_cold_tier,
-            model_weights_bytes=_model_weights_bytes(
-                getattr(self.runtime, "model_path", None)
-            ),
-        )
-        # Keep the SSD cold-tier encode (full-KV byte conversion; post-#169
-        # it runs at enqueue, never on the writer thread) off request and
-        # stream tails: dispatch it to the scheduler's idle lane, where it
-        # reads the immutable bank entry on the model owner thread.
-        _bank = getattr(self.sessions, "bank", None)
-        if _bank is not None and hasattr(_bank, "cold_enqueue_dispatch"):
-            _scheduler = self.model_scheduler
-            if getattr(_scheduler, "SUPPORTS_IDLE_PERSISTENCE", False):
-                # Durability band: cold encodes must never displace the
-                # canonical postcommit whose entry anchors the next turn's
-                # restore (2026-08-06 causal probe: FIFO idle ordering cost
-                # 0.66-1.17s per warm agent turn). Explicit capability
-                # check; legacy schedulers keep the idle-postcommit lane.
-                _bank.cold_enqueue_dispatch = lambda job: (
-                    _scheduler.submit_idle_persistence(
-                        job,
-                        batch_key="ssd.cold_enqueue",
-                        coalesce_key=getattr(job, "coalesce_key", None),
-                    )
-                )
-            else:
-                _bank.cold_enqueue_dispatch = lambda job: (
-                    _scheduler.submit_idle_postcommit(job, batch_key="ssd.cold_enqueue")
-                )
-        # Foreground-yield wiring (2026-08-07): the cold tier's encode runs
-        # on the model-owner thread and its writer thread moves GBs through
-        # unified memory — both must stand down while a request is queued or
-        # running (encode aborts between tensor evals and re-dispatches;
-        # writer pauses between entry writes). Without this the SSD write of
-        # each fresh postcommit entry overlapped the next turn: -30% decode
-        # + 0.66-0.75 s unattributed prompt-state wall (gate254-c4s).
-        if self.session_bank_cold_tier is not None and hasattr(
-            self.model_scheduler, "foreground_busy"
-        ):
-            self.session_bank_cold_tier.foreground_busy = (
-                self.model_scheduler.foreground_busy
+            self.sessions = EngineSessionManager(
+                cold_tier=self.session_bank_cold_tier,
+                model_weights_bytes=_model_weights_bytes(
+                    getattr(self.runtime, "model_path", None)
+                ),
             )
+            # Keep the SSD cold-tier encode (full-KV byte conversion; post-#169
+            # it runs at enqueue, never on the writer thread) off request and
+            # stream tails: dispatch it to the scheduler's idle lane, where it
+            # reads the immutable bank entry on the model owner thread.
+            _bank = getattr(self.sessions, "bank", None)
+            if _bank is not None and hasattr(_bank, "cold_enqueue_dispatch"):
+                _scheduler = self.model_scheduler
+                if getattr(_scheduler, "SUPPORTS_IDLE_PERSISTENCE", False):
+                    _bank.cold_enqueue_dispatch = lambda job: (
+                        _scheduler.submit_idle_persistence(
+                            job,
+                            batch_key="ssd.cold_enqueue",
+                            coalesce_key=getattr(job, "coalesce_key", None),
+                        )
+                    )
+                else:
+                    _bank.cold_enqueue_dispatch = lambda job: (
+                        _scheduler.submit_idle_postcommit(
+                            job, batch_key="ssd.cold_enqueue"
+                        )
+                    )
+            # Foreground-yield wiring (2026-08-07): the cold tier's encode runs
+            # on the model-owner thread and its writer thread moves GBs through
+            # unified memory — both must stand down while a request is queued or
+            # running (encode aborts between tensor evals and re-dispatches;
+            # writer pauses between entry writes).
+            if self.session_bank_cold_tier is not None and hasattr(
+                self.model_scheduler, "foreground_busy"
+            ):
+                self.session_bank_cold_tier.foreground_busy = (
+                    self.model_scheduler.foreground_busy
+                )
         self.last_metrics: list[dict[str, Any]] = []
         self.tool_parse_counters = {key: 0 for key in _TOOL_PARSE_COUNTER_KEYS}
         # Activity timestamps used by the parent-process thermal watchdog to
@@ -2866,7 +2962,9 @@ class _BatchedARGenerationService:
                 self._active[int(uid)] = job
             self._condition.notify_all()
 
-    def _commit_prompt_boundary(self, job: _BatchedARJob, generator: Any, uid: int) -> None:
+    def _commit_prompt_boundary(
+        self, job: _BatchedARJob, generator: Any, uid: int
+    ) -> None:
         """Store a batched row's PROMPT-ONLY state at its first generation step.
 
         At the first response, the step that produced token 1 has just
@@ -13809,7 +13907,9 @@ def _mtplx_dashboard_snapshot(state: "ServerState") -> dict[str, Any]:
         "model_id": state.model_id,
         # Always present, so a client can tell "no retrieval configured" apart
         # from "this build has no retrieval support".
-        "retrieval": retrieval.status() if retrieval is not None else {"enabled": False, "models": []},
+        "retrieval": retrieval.status()
+        if retrieval is not None
+        else {"enabled": False, "models": []},
         "profile": state.profile.to_dict()
         if hasattr(state.profile, "to_dict")
         else {"name": getattr(state.profile, "name", "unknown")},
@@ -17487,7 +17587,10 @@ def _build_mtp_batch_session_hooks(
         outcome: dict[str, Any] = {"hit": False}
         started = time.perf_counter()
         try:
-            if len(tokens) <= min_restore_tokens or not _boundary_true_restore_enabled():
+            if (
+                len(tokens) <= min_restore_tokens
+                or not _boundary_true_restore_enabled()
+            ):
                 return None
             candidates = candidates_fn(
                 tokens,
@@ -17500,9 +17603,7 @@ def _build_mtp_batch_session_hooks(
                 policy_fingerprint=policy_fingerprint,
                 min_restore_tokens=min_restore_tokens,
             )
-            for entry, matched in sorted(
-                candidates, key=lambda item: -int(item[1])
-            ):
+            for entry, matched in sorted(candidates, key=lambda item: -int(item[1])):
                 restored = restore_fn(
                     rt,
                     entry,
@@ -17558,9 +17659,7 @@ def _build_mtp_batch_session_hooks(
             outcome["error"] = f"{type(exc).__name__}: {exc}"
             return None
         finally:
-            outcome.setdefault(
-                "restore_s", round(time.perf_counter() - started, 6)
-            )
+            outcome.setdefault("restore_s", round(time.perf_counter() - started, 6))
             request_observability["mtp_batch_session_restore"] = outcome
 
     def session_commit(
@@ -17686,8 +17785,7 @@ def _run_mtp_batch_generation_dispatched(
             ),
             "mtp_disabled_reason": None,
             "mtp_batch_session_cache_bypass": (
-                kwargs.get("session_bank") is not None
-                and session_restore_hook is None
+                kwargs.get("session_bank") is not None and session_restore_hook is None
             ),
         }
     )
@@ -18226,6 +18324,37 @@ def _run_generation(
         "generation_mode": effective_mode,
         **(request_observability or {}),
     }
+    cli_flags = getattr(state.args, "_cli_flags", set()) or set()
+    explicit_legacy = {}
+    for flag, key, value, baseline in (
+        (
+            "verify-strategy",
+            "verify_strategy",
+            state.args.verify_strategy,
+            "capture_commit",
+        ),
+        (
+            "verify-core",
+            "verify_core",
+            state.args.verify_core,
+            "linear-gdn-from-conv-tape",
+        ),
+    ):
+        if flag in cli_flags or value != baseline:
+            explicit_legacy[key] = value
+    selected_legacy_kwargs = build_mtpk_request_kwargs(
+        state.runtime,
+        common={},
+        legacy_defaults={
+            "mtp_hidden_variant": "post_norm",
+            "mtp_history_policy": "committed",
+            "verify_strategy": state.args.verify_strategy,
+            "verify_core": state.args.verify_core,
+            "trace_label": trace_label,
+            "trace_metadata": trace_metadata,
+        },
+        explicit_legacy=explicit_legacy,
+    )
     for attempt in range(max_attempts):
         generation_seed, seed_is_explicit = _resolve_seed(state, seed)
         lock_started = time.perf_counter()
@@ -18315,40 +18444,34 @@ def _run_generation(
                         # Retries and tool-loop redispatches replay the
                         # full prompt, so the image rows must rewind.
                         vision_splice.reset()
-                    out = generate_mtpk(
-                        state.runtime,
-                        prompt_ids,
-                        constraint=constraint,
-                        vision_splice=vision_splice,
-                        abort_check=(
+                    request_kwargs = {
+                        "constraint": constraint,
+                        "vision_splice": vision_splice,
+                        "abort_check": (
                             (lambda: bool(cancel_event.is_set()))
                             if cancel_event is not None
                             else None
                         ),
-                        max_tokens=response_max,
-                        sampler=sampler,
-                        draft_sampler=effective_draft_sampler,
-                        speculative_depth=effective_depth,
-                        seed=generation_seed,
-                        mtp_hidden_variant="post_norm",
-                        mtp_cache_policy="persistent",
-                        mtp_history_policy="committed",
-                        verify_strategy=state.args.verify_strategy,
-                        verify_core=state.args.verify_core,
-                        draft_core=str(
+                        "max_tokens": response_max,
+                        "sampler": sampler,
+                        "draft_sampler": effective_draft_sampler,
+                        "speculative_depth": effective_depth,
+                        "seed": generation_seed,
+                        "mtp_cache_policy": "persistent",
+                        "draft_core": str(
                             getattr(state.args, "draft_core", None) or "stock"
                         ),
-                        token_callback=record_tokens,
-                        session_bank=session_bank,
-                        session_id=session_id,
-                        session_restore_mode=_session_bank_restore_mode(
+                        "token_callback": record_tokens,
+                        "session_bank": session_bank,
+                        "session_id": session_id,
+                        "session_restore_mode": _session_bank_restore_mode(
                             session_restore_mode
                         ),
-                        session_template_hash=session_template_hash,
-                        session_draft_head_identity=session_draft_head_identity,
-                        session_policy_fingerprint=session_policy_fingerprint,
-                        capture_final_state=session_bank is not None,
-                        commit_prompt_state_to_bank=(
+                        "session_template_hash": session_template_hash,
+                        "session_draft_head_identity": session_draft_head_identity,
+                        "session_policy_fingerprint": session_policy_fingerprint,
+                        "capture_final_state": session_bank is not None,
+                        "commit_prompt_state_to_bank": (
                             commit_prompt_prefix_to_bank
                             and session_bank is not None
                             and session_id is not None
@@ -18356,45 +18479,45 @@ def _run_generation(
                         # Prompt-prefix commits happen before decode mutates
                         # the same KV/MTP cache objects. They must snapshot or
                         # skip, not live-lease the mutable prompt cache.
-                        commit_prompt_state_keep_live_ref=False,
-                        trace_label=trace_label,
-                        trace_metadata=trace_metadata,
-                        prefill_callback=prefill_callback,
-                        adaptive_policy=adaptive_policy,
-                        repetition_stop=uncapped_repetition_stop,
-                        loop_guard=_loop_guard_enabled(),
-                        thinking_guard=thinking_guard_config,
-                        online_correction_cache=bool(
+                        "commit_prompt_state_keep_live_ref": False,
+                        "prefill_callback": prefill_callback,
+                        "adaptive_policy": adaptive_policy,
+                        "repetition_stop": uncapped_repetition_stop,
+                        "loop_guard": _loop_guard_enabled(),
+                        "thinking_guard": thinking_guard_config,
+                        "online_correction_cache": bool(
                             state.args.online_correction_cache
                         ),
-                        online_correction_cache_min_depth=int(
+                        "online_correction_cache_min_depth": int(
                             state.args.online_correction_cache_min_depth
                         ),
-                        online_correction_cache_key=str(
+                        "online_correction_cache_key": str(
                             state.args.online_correction_cache_key
                         ),
-                        prompt_correction_cache=bool(
+                        "prompt_correction_cache": bool(
                             state.args.prompt_correction_cache
                         ),
-                        prompt_correction_cache_min_depth=int(
+                        "prompt_correction_cache_min_depth": int(
                             state.args.prompt_correction_cache_min_depth
                         ),
-                        online_hidden_corrector_alpha=float(
+                        "online_hidden_corrector_alpha": float(
                             state.args.online_hidden_corrector_alpha
                         ),
-                        online_hidden_corrector_decay=float(
+                        "online_hidden_corrector_decay": float(
                             state.args.online_hidden_corrector_decay
                         ),
-                        online_hidden_corrector_warmup=int(
+                        "online_hidden_corrector_warmup": int(
                             state.args.online_hidden_corrector_warmup
                         ),
-                        online_hidden_corrector_max_feed_depth=(
+                        "online_hidden_corrector_max_feed_depth": (
                             state.args.online_hidden_corrector_max_feed_depth
                         ),
-                        online_hidden_corrector_key=str(
+                        "online_hidden_corrector_key": str(
                             state.args.online_hidden_corrector_key
                         ),
-                    )
+                        **selected_legacy_kwargs,
+                    }
+                    out = generate_mtpk(state.runtime, prompt_ids, **request_kwargs)
         except PostcommitAbort:
             # abort_check tripped inside the prefill: the client disconnected
             # mid-prompt-processing. Reuse the exact cancellation path client
@@ -23619,7 +23742,9 @@ def create_app(state: ServerState) -> FastAPI:
                 detail="no reranking model is configured; start MTPLX with --reranker-model",
             )
         if not request.query or not str(request.query).strip():
-            raise HTTPException(status_code=400, detail="query must be a non-empty string")
+            raise HTTPException(
+                status_code=400, detail="query must be a non-empty string"
+            )
         documents = _as_text_list(request.documents, field="documents")
         try:
             scores, spec, prompt_tokens = await asyncio.to_thread(
@@ -23700,15 +23825,7 @@ def create_app(state: ServerState) -> FastAPI:
                 created=created,
                 request_max_tokens=request_max_tokens,
             )
-        cache_bypass = headers.get("x-mtplx-cache-mode", "").lower() in {
-            "bypass",
-            "stateless",
-            "off",
-        } or str(metadata.get("cache_mode", "")).lower() in {
-            "bypass",
-            "stateless",
-            "off",
-        }
+        cache_bypass = state.session_cache_bypass(headers, metadata)
         opencode_client = _is_opencode_client(headers=headers, metadata=metadata)
         requested_tool_specs = _normalize_tool_specs(request.tools)
         tool_specs = _filter_tool_specs_for_request(
@@ -26374,9 +26491,7 @@ def create_app(state: ServerState) -> FastAPI:
                             stream_orphan_tool_markup_suppressed = True
                         remainder = guard.take_orphan_remainder()
                         if remainder:
-                            deferred_orphan_stream_remainders.append(
-                                (field, remainder)
-                            )
+                            deferred_orphan_stream_remainders.append((field, remainder))
                         if not flushed:
                             continue
                         chunks.extend(
@@ -28806,6 +28921,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-wait-ms", type=float)
     parser.add_argument("--prefill-chunk-tokens", type=int)
     parser.add_argument(
+        "--session-cache-mode",
+        choices=["on", "off"],
+        default="on",
+        help=(
+            "Construction-time SessionBank policy. 'off' forces every request "
+            "through the existing stateless cold-prefill path and disables "
+            "session postcommit work."
+        ),
+    )
+    parser.add_argument(
         "--experimental-mtp-cohorts",
         action="store_true",
         help="Expose future batched-MTP verify cohorts as experimental; off by default.",
@@ -28879,6 +29004,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Load and inject the native MTP sidecar. Disable only for stock AR diagnostics.",
     )
     parser.add_argument("--depth", type=int, default=3)
+    parser.add_argument(
+        "--deepseek-v4-0731-k2",
+        action="store_true",
+        help=(
+            "Select the exact construction-bound DeepSeek-V4-Flash-0731 "
+            "DSpark K2 stack. Requires explicit --depth 2 and MTP."
+        ),
+    )
+    parser.add_argument(
+        "--deepseek-v4-0731-optimized",
+        action="store_true",
+        help=(
+            "Select the construction-bound DeepSeek-V4-Flash-0731 optimized "
+            "DSpark stack at an explicit depth from 1 through 3."
+        ),
+    )
     parser.add_argument(
         "--max-response-tokens",
         "--max-tokens",

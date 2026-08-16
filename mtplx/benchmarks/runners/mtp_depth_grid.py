@@ -52,10 +52,7 @@ def _mean_present(values: list[float | None]) -> float | None:
 
 
 def _rate_by_depth(accepted: list[int], drafted: list[int]) -> list[float | None]:
-    return [
-        (a / d if d else None)
-        for a, d in zip(accepted, drafted)
-    ]
+    return [(a / d if d else None) for a, d in zip(accepted, drafted)]
 
 
 def _sum_lists(values: list[list[int]], length: int) -> list[int]:
@@ -64,6 +61,10 @@ def _sum_lists(values: list[list[int]], length: int) -> list[int]:
         for index, item in enumerate(value[:length]):
             totals[index] += int(item)
     return totals
+
+
+def _cycle_count(events: list[dict], verify_calls: int) -> int:
+    return len(events) or max(0, int(verify_calls))
 
 
 def run_mtp_depth_policy_grid(
@@ -178,7 +179,7 @@ def run_mtp_depth_policy_grid(
                 validations = [asdict(validate_no_degenerate_loop(out.text))]
                 if case.category == "json_tool":
                     validations.append(asdict(validate_json_text(out.text.strip())))
-                cycles = len(out.stats.events)
+                cycles = _cycle_count(out.stats.events, out.stats.verify_calls)
                 ar_row = ar_rows[index] if compare_ar else None
                 row: dict[str, Any] = {
                     "prompt_id": case.id,
@@ -249,18 +250,30 @@ def run_mtp_depth_policy_grid(
                     "rows": rows,
                     "summary": {
                         "prompts": len(rows),
-                        "generated_tokens": sum(row["generated_tokens"] for row in rows),
-                        "mean_tok_s": statistics.mean([row["tok_s"] for row in rows]) if rows else 0.0,
-                        "mean_ar_tok_s": _mean_present([row["ar_tok_s"] for row in rows]),
-                        "mean_speedup_vs_ar": _mean_present([row["speedup_vs_ar"] for row in rows]),
-                        "mean_model_path_tok_s": _mean_present([row["model_path_tok_s"] for row in rows]),
+                        "generated_tokens": sum(
+                            row["generated_tokens"] for row in rows
+                        ),
+                        "mean_tok_s": statistics.mean([row["tok_s"] for row in rows])
+                        if rows
+                        else 0.0,
+                        "mean_ar_tok_s": _mean_present(
+                            [row["ar_tok_s"] for row in rows]
+                        ),
+                        "mean_speedup_vs_ar": _mean_present(
+                            [row["speedup_vs_ar"] for row in rows]
+                        ),
+                        "mean_model_path_tok_s": _mean_present(
+                            [row["model_path_tok_s"] for row in rows]
+                        ),
                         "cycles": sum(row["cycles"] for row in rows),
                         "accepted_drafts": sum(row["accepted_drafts"] for row in rows),
                         "rejected_drafts": sum(row["rejected_drafts"] for row in rows),
                         "drafted_tokens": sum(row["drafted_tokens"] for row in rows),
                         "accepted_by_depth": accepted_by_depth,
                         "drafted_by_depth": drafted_by_depth,
-                        "acceptance_by_depth": _rate_by_depth(accepted_by_depth, drafted_by_depth),
+                        "acceptance_by_depth": _rate_by_depth(
+                            accepted_by_depth, drafted_by_depth
+                        ),
                         "accepted_drafts_per_cycle": (
                             sum(row["accepted_drafts"] for row in rows)
                             / max(1, sum(row["cycles"] for row in rows))
@@ -277,17 +290,24 @@ def run_mtp_depth_policy_grid(
                         ),
                         "verify_time_s": sum(row["verify_time_s"] for row in rows),
                         "draft_time_s": sum(row["draft_time_s"] for row in rows),
-                        "target_forward_time_s": sum(row["target_forward_time_s"] for row in rows),
-                        "validations_passed": sum(1 for v in validations if v["passed"]),
+                        "target_forward_time_s": sum(
+                            row["target_forward_time_s"] for row in rows
+                        ),
+                        "validations_passed": sum(
+                            1 for v in validations if v["passed"]
+                        ),
                         "validations_total": len(validations),
-                        "peak_memory_bytes": max([row["peak_memory_bytes"] for row in rows] or [0]),
+                        "peak_memory_bytes": max(
+                            [row["peak_memory_bytes"] for row in rows] or [0]
+                        ),
                     },
                 }
             )
 
     results.sort(
         key=lambda item: (
-            item["summary"]["validations_passed"] == item["summary"]["validations_total"],
+            item["summary"]["validations_passed"]
+            == item["summary"]["validations_total"],
             item["summary"]["mean_tok_s"],
         ),
         reverse=True,
@@ -306,9 +326,13 @@ def run_mtp_depth_policy_grid(
         "mtp_cache_policy": mtp_cache_policy,
         "mtp_history_policy": mtp_history_policy,
         "verify_strategy": verify_strategy,
-        "mtp_corrector_path": str(mtp_corrector_path) if mtp_corrector_path is not None else None,
+        "mtp_corrector_path": str(mtp_corrector_path)
+        if mtp_corrector_path is not None
+        else None,
         "mtp_corrector_blend": mtp_corrector_blend,
-        "mtp_corrector_kind": getattr(mtp_corrector, "kind", None) if mtp_corrector is not None else None,
+        "mtp_corrector_kind": getattr(mtp_corrector, "kind", None)
+        if mtp_corrector is not None
+        else None,
         "thresholds": threshold_values,
         "min_depths": min_depth_values,
         "ar_rows": ar_rows,
