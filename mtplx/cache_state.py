@@ -1074,6 +1074,9 @@ class VllmMetalPagedKVCache:
 
             cfg = self.kv_quant_config
             bits = int(cfg.bits)
+            # q8 stores one signed code per element; the sub-byte widths (q6,
+            # q4) store an unsigned bit-packed row whose width comes from
+            # packed_dim -- q6 is 3 bytes per 4 values, q4 is 1 byte per 2.
             cache_dtype = mx.int8 if bits == 8 else mx.uint8
             self.key_cache = mx.zeros(
                 (

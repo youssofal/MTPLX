@@ -517,7 +517,7 @@ struct SettingsTab: View {
                 FormRow(
                     label: "Quantization",
                     caption: supported
-                        ? "Off is the speed path. q8 saves memory when the selected model supports it; q4 is experimental."
+                        ? "Off is the speed path. q8 saves memory when the selected model supports it; q6 and q4 save more and are experimental."
                         : policy.disabledReason ?? "KV quantization is not supported for this model."
                 ) {
                     Picker("Quantization", selection: kvQuantSelectionBinding(policy)) {
@@ -553,6 +553,8 @@ struct SettingsTab: View {
         switch kvQuantSelectionBinding(policy).wrappedValue {
         case "q8":
             return "Stores KV in int8 with per-token scales. Use it when memory matters more than 20k decode speed."
+        case "q6":
+            return "Packs KV into 6-bit codes, four per three bytes, with per-token scales; between q8 and q4 on both memory and precision."
         case "q4":
             return "Packs KV into 4-bit nibbles with per-token scales; keep as an experiment until measured."
         default:
@@ -1301,7 +1303,7 @@ struct SettingsTab: View {
         case "qwen3_5", "qwen3_6", "qwen3_8":
             return KVQuantPolicy(
                 supported: true,
-                modes: ["off", "q8", "q4"],
+                modes: ["off", "q8", "q6", "q4"],
                 restartRequired: true,
                 proofLevel: "qwen_only"
             )

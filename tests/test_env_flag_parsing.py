@@ -138,6 +138,11 @@ def test_block_prefix_restore_cold_tier_defaults_on(monkeypatch) -> None:
         ("int8", "q8"),
         ("q8_0", "q8"),
         ("q8", "q8"),
+        ("6", "q6"),
+        ("6bit", "q6"),
+        ("uint6", "q6"),
+        ("int6", "q6"),
+        ("q6", "q6"),
         ("4", "q4"),
         ("uint4", "q4"),
         ("q4", "q4"),
@@ -183,6 +188,32 @@ def test_paged_kv_quant_rejects_an_unknown_mode(monkeypatch) -> None:
     monkeypatch.delenv("MTPLX_VLLM_METAL_PAGED_KV_QUANT", raising=False)
     with pytest.raises(ValueError, match="unsupported paged KV quantization"):
         config_from_env()
+
+
+@pytest.mark.parametrize(
+    "var", ["MTPLX_VLLM_METAL_PAGED_KV_QUANT", "MTPLX_PAGED_KV_QUANT"]
+)
+def test_q6_reaches_the_cache_config_through_either_env_var(monkeypatch, var: str) -> None:
+    from mtplx.kv_quant import config_from_env
+
+    monkeypatch.delenv("MTPLX_VLLM_METAL_PAGED_KV_QUANT", raising=False)
+    monkeypatch.delenv("MTPLX_PAGED_KV_QUANT", raising=False)
+    monkeypatch.setenv(var, "q6")
+
+    config = config_from_env()
+    assert config is not None
+    assert config.normalized_mode == "q6"
+    # The bit width has to follow the mode, or q6 would allocate q8 pages.
+    assert config.bits == 6
+
+
+def test_paged_kv_quantization_env_pair_carries_q6() -> None:
+    from mtplx.runtime_options import paged_kv_quantization_env
+
+    assert paged_kv_quantization_env("6bit") == {
+        "MTPLX_VLLM_METAL_PAGED_KV_QUANT": "q6",
+        "MTPLX_PAGED_KV_QUANT": "q6",
+    }
 
 
 # ---------------------------------------------------------------------------
