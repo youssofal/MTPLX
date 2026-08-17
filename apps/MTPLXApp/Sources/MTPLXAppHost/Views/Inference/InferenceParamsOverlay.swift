@@ -63,6 +63,9 @@ struct InferenceParamsOverlay: View {
     // turn, "on" always reasons, "off" suppresses reasoning entirely.
     // Mirrors the wire field `MutableSettings.reasoning`.
     @State private var reasoningMode: String = "auto"
+    // NOTE: the Profile picker deliberately has no @State of its own —
+    // see `activeProfile`, which derives the selection from the drafts
+    // above so the sliders are always the single source of truth.
     @State private var reasoningEffort: String = "auto"
     @State private var fanMode: String = MTPLXFanMode.smart.rawValue
 
@@ -174,18 +177,20 @@ struct InferenceParamsOverlay: View {
                 VStack(alignment: .leading, spacing: 0) {
                     performanceModeRow
                     sectionDivider(precedesRow: 2)
-                    samplingSection
+                    profileSection
                     sectionDivider(precedesRow: 3)
-                    reasoningSection
+                    samplingSection
                     sectionDivider(precedesRow: 4)
-                    fanModeSection
+                    reasoningSection
                     sectionDivider(precedesRow: 5)
-                    depthSection
+                    fanModeSection
                     sectionDivider(precedesRow: 6)
-                    prefillSection
+                    depthSection
                     sectionDivider(precedesRow: 7)
-                    contextWindowSection
+                    prefillSection
                     sectionDivider(precedesRow: 8)
+                    contextWindowSection
+                    sectionDivider(precedesRow: 9)
                     kvQuantizationSection
                 }
                 .padding(.bottom, 6)
@@ -239,8 +244,31 @@ struct InferenceParamsOverlay: View {
     }
 
     @ViewBuilder
-    private var samplingSection: some View {
+    private var profileSection: some View {
         InferenceSection(visible: rowsVisibleCount > 1) {
+            sectionHeader("PROFILE")
+            Picker("Profile", selection: Binding(
+                get: { activeProfile.rawValue },
+                set: { applyProfile(SamplingProfile(rawValue: $0) ?? .custom) }
+            )) {
+                Text("Thinking").tag(SamplingProfile.thinking.rawValue)
+                Text("Instruct").tag(SamplingProfile.instruct.rawValue)
+                Text("Coding").tag(SamplingProfile.coding.rawValue)
+                Text("Custom").tag(SamplingProfile.custom.rawValue)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .controlHoverLift(motionEnabled: motionEnabled)
+            Text(activeProfile.hint)
+                .font(.caption2)
+                .foregroundStyle(Brand.typeTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    @ViewBuilder
+    private var samplingSection: some View {
+        InferenceSection(visible: rowsVisibleCount > 2) {
             sectionHeader("SAMPLING")
             paramSlider(
                 title: "Temperature",
@@ -304,7 +332,7 @@ struct InferenceParamsOverlay: View {
 
     @ViewBuilder
     private var reasoningSection: some View {
-        InferenceSection(visible: rowsVisibleCount > 2) {
+        InferenceSection(visible: rowsVisibleCount > 3) {
             sectionHeader("REASONING")
             Picker("Reasoning", selection: Binding(
                 get: { reasoningMode },
@@ -347,7 +375,7 @@ struct InferenceParamsOverlay: View {
 
     @ViewBuilder
     private var fanModeSection: some View {
-        InferenceSection(visible: rowsVisibleCount > 3) {
+        InferenceSection(visible: rowsVisibleCount > 4) {
             sectionHeader("FAN MODE")
             Picker("Fan Mode", selection: Binding(
                 get: { fanMode },
@@ -709,7 +737,7 @@ struct InferenceParamsOverlay: View {
 
     @ViewBuilder
     private var depthSection: some View {
-        InferenceSection(visible: rowsVisibleCount > 4) {
+        InferenceSection(visible: rowsVisibleCount > 5) {
             sectionHeader(draftControl?.displayLabel?.uppercased() ?? "MTP HEADS")
             // Range/label/unit come from the loaded backend's draft-control
             // descriptor, so a model with more MTP heads (e.g. Gemma's
@@ -758,7 +786,7 @@ struct InferenceParamsOverlay: View {
 
     @ViewBuilder
     private var prefillSection: some View {
-        InferenceSection(visible: rowsVisibleCount > 5) {
+        InferenceSection(visible: rowsVisibleCount > 6) {
             sectionHeader("PREFILL", hint: "next request")
             paramSlider(
                 title: "Batch step size",
@@ -780,7 +808,7 @@ struct InferenceParamsOverlay: View {
 
     @ViewBuilder
     private var contextWindowSection: some View {
-        InferenceSection(visible: rowsVisibleCount > 6) {
+        InferenceSection(visible: rowsVisibleCount > 7) {
             sectionHeader("CONTEXT WINDOW", hint: "restart")
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
@@ -927,7 +955,7 @@ struct InferenceParamsOverlay: View {
 
     @ViewBuilder
     private var kvQuantizationSection: some View {
-        InferenceSection(visible: rowsVisibleCount > 7) {
+        InferenceSection(visible: rowsVisibleCount > 8) {
             sectionHeader("KV QUANTIZATION", hint: "restart")
             Picker("KV quantization", selection: Binding(
                 get: { kvQuantization },
@@ -1087,6 +1115,97 @@ struct InferenceParamsOverlay: View {
             .opacity(visible ? 1 : 0)
     }
 
+    // MARK: - Profile presets
+    //
+    // A Profile is a two-knob shorthand: temperature + reasoning. Those
+    // are the only things that differ between the named profiles, so
+    // they are the only things a profile writes. Top P / Top K /
+    // Presence Penalty are deliberately left alone — whatever the model
+    // and the user already have stays put.
+    //
+    // The selection is *derived* from the live drafts rather than stored
+    // in its own @State. That is what makes "the moment the user moves a
+    // slider it becomes Custom" fall out for free: nothing to invalidate,
+    // and the picker can never claim a profile whose values are no longer
+    // on screen. The three named profiles have distinct (temperature,
+    // reasoning) pairs, so the derivation is unambiguous.
+    //
+    // Nothing here disables a control. Every slider stays draggable at
+    // all times, including while a named profile is selected.
+
+    private enum SamplingProfile: String {
+        case thinking
+        case instruct
+        case coding
+        case custom
+
+        /// Temperature this profile pins, or nil for `.custom`, which
+        /// pins nothing.
+        var temperature: Double? {
+            switch self {
+            case .thinking: return 1.0
+            case .instruct: return 0.6
+            case .coding: return 0.6
+            case .custom: return nil
+            }
+        }
+
+        /// Reasoning mode this profile pins, or nil for `.custom`.
+        var reasoningMode: String? {
+            switch self {
+            case .thinking: return "on"
+            case .instruct: return "off"
+            case .coding: return "on"
+            case .custom: return nil
+            }
+        }
+
+        var hint: String {
+            switch self {
+            case .thinking: return "Temperature 1.00, reasoning on. The model's own recommended sampling for extended thinking."
+            case .instruct: return "Temperature 0.60, reasoning off. Direct answers with no thinking pass."
+            case .coding: return "Temperature 0.60, reasoning on. Same sampling as Instruct, but the model thinks first."
+            case .custom: return "Your own values. Pick a profile to overwrite temperature and reasoning."
+            }
+        }
+
+        static let named: [SamplingProfile] = [.thinking, .instruct, .coding]
+    }
+
+    /// Which profile the current drafts correspond to, or `.custom` when
+    /// they match none. Recomputed on every draft change, which is what
+    /// switches the picker to Custom the instant a slider moves.
+    private var activeProfile: SamplingProfile {
+        SamplingProfile.named.first { profile in
+            guard
+                let profileTemperature = profile.temperature,
+                let profileReasoning = profile.reasoningMode
+            else { return false }
+            // Temperature is a Double driven by a 0.05-step slider, so
+            // compare with a tolerance well under one step rather than
+            // with ==.
+            return abs(temperature - profileTemperature) < 0.001
+                && reasoningMode == profileReasoning
+        } ?? .custom
+    }
+
+    /// Apply a profile's two knobs and commit them. Selecting `.custom`
+    /// is a deliberate no-op: "Custom" describes values the user already
+    /// owns, so there is nothing for it to write.
+    private func applyProfile(_ profile: SamplingProfile) {
+        guard let profileTemperature = profile.temperature else { return }
+
+        temperature = clampTemperature(profileTemperature)
+        commitLiveSettings()
+
+        // Models without a reasoning control keep whatever the daemon
+        // reports; a profile must not fabricate a mode the model cannot
+        // honour. Temperature still applies.
+        guard reasoningSupported, let profileReasoning = profile.reasoningMode else { return }
+        reasoningMode = profileReasoning
+        commitReasoning()
+    }
+
     private var performanceLockBinding: Binding<Bool> {
         Binding(
             get: { backend.configuration.performanceLock },
@@ -1226,7 +1345,7 @@ struct InferenceParamsOverlay: View {
 
         OverlayChoreography.runEnter(
             motionEnabled: motionEnabled,
-            rowCount: 8,
+            rowCount: 9,
             borderProgress: $borderProgress,
             headerVisible: $headerVisible,
             rowsVisibleCount: $rowsVisibleCount
