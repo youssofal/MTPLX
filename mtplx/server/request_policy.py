@@ -654,6 +654,9 @@ def resolve_request_policy(
         metadata=metadata,
         tools_active=tools_active,
         backend=srv._backend_descriptor(state),
+        prefers_parallel_tool_calls=srv._request_prefers_parallel_tool_calls(
+            request
+        ),
     )
     template_tool_prompt_mode = tool_prompt_mode
     if chat and read_only_force_answer_contract_active and tools_active:
@@ -677,6 +680,9 @@ def resolve_request_policy(
             metadata=metadata,
             tools_active=True,
             backend=srv._backend_descriptor(state),
+            prefers_parallel_tool_calls=srv._request_prefers_parallel_tool_calls(
+                request
+            ),
         )
     if not chat:
         return RequestPolicy(

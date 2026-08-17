@@ -8530,6 +8530,7 @@ def test_opencode_agent_tool_client_uses_compact_prompt_mode(monkeypatch):
             ],
             "tools": [_bash_tool_schema(), _named_tool_schema("read"), _tool_schema()],
             "tool_choice": "auto",
+            "parallel_tool_calls": True,
             "max_tokens": 32,
         },
     )
@@ -8662,6 +8663,143 @@ def test_agent_tool_clients_repair_native_launch_mode_to_hybrid(legacy_rewrites,
         == "compact_tool_contract:schema_free:v1"
     )
     assert "tool_prompt_mode=hybrid" in seen["session_policy_fingerprint"]
+
+
+@pytest.mark.parametrize("client_hint", ["pi", "hermes"])
+def test_agent_tool_clients_use_native_mode_for_declared_parallel_requests(
+    monkeypatch, client_hint
+):
+    seen: dict[str, object] = {}
+    state = _fake_state()
+    foreground = ForegroundState()
+    state.lock = foreground.lock
+    state.has_foreground = foreground.has_foreground
+    state.runtime.tokenizer = CaptureTokenizer()
+    state.args.stats_footer = False
+    state.args.tool_prompt_mode = "native"
+    client = TestClient(create_app(state))
+
+    def fake_run_generation(*_args, **kwargs):
+        seen["request_observability"] = dict(kwargs["request_observability"])
+        seen["session_policy_fingerprint"] = kwargs["session_policy_fingerprint"]
+        return _fake_generation("Done")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass", "x-mtplx-client": client_hint},
+        json={
+            "messages": [
+                {"role": "system", "content": "You are a coding agent."},
+                {
+                    "role": "user",
+                    "content": "Read package.json and pyproject.toml.",
+                },
+            ],
+            "tools": [_named_tool_schema("read")],
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+            "max_tokens": 32,
+        },
+    )
+
+    assert response.status_code == 200
+    _messages, kwargs = state.runtime.tokenizer.calls[0]
+    stats = seen["request_observability"]
+    assert "tools" in kwargs
+    assert stats["tool_prompt_mode"] == "native"
+    assert stats["tool_prompt_mode_source"] == f"client:{client_hint}:parallel"
+    assert stats["tool_prompt_mode_client_repaired"] is False
+    assert stats["tool_contract_active"] is False
+    assert "tool_prompt_mode=native" in seen["session_policy_fingerprint"]
+
+
+@pytest.mark.parametrize("client_hint", ["pi", "hermes"])
+@pytest.mark.parametrize("parallel_tool_calls", [False, None])
+def test_parallel_opt_out_keeps_agent_client_hybrid_mode(
+    monkeypatch, client_hint, parallel_tool_calls
+):
+    seen: dict[str, object] = {}
+    state = _fake_state()
+    foreground = ForegroundState()
+    state.lock = foreground.lock
+    state.has_foreground = foreground.has_foreground
+    state.runtime.tokenizer = CaptureTokenizer()
+    state.args.stats_footer = False
+    state.args.tool_prompt_mode = "native"
+    client = TestClient(create_app(state))
+
+    def fake_run_generation(*_args, **kwargs):
+        seen["request_observability"] = dict(kwargs["request_observability"])
+        return _fake_generation("Done")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+    request = {
+        "messages": [
+            {"role": "system", "content": "You are a coding agent."},
+            {
+                "role": "user",
+                "content": "Read package.json and pyproject.toml in parallel.",
+            },
+        ],
+        "tools": [_named_tool_schema("read")],
+        "tool_choice": "auto",
+        "max_tokens": 32,
+    }
+    if parallel_tool_calls is not None:
+        request["parallel_tool_calls"] = parallel_tool_calls
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass", "x-mtplx-client": client_hint},
+        json=request,
+    )
+
+    assert response.status_code == 200
+    stats = seen["request_observability"]
+    assert stats["tool_prompt_mode"] == "hybrid"
+    assert stats["tool_prompt_mode_source"] == f"client:{client_hint}"
+    assert stats["tool_contract_active"] is True
+
+
+def test_declared_parallel_request_keeps_explicit_tool_prompt_mode_override(
+    monkeypatch,
+):
+    seen: dict[str, object] = {}
+    state = _fake_state()
+    foreground = ForegroundState()
+    state.lock = foreground.lock
+    state.has_foreground = foreground.has_foreground
+    state.runtime.tokenizer = CaptureTokenizer()
+    state.args.stats_footer = False
+    state.args.tool_prompt_mode = "native"
+    client = TestClient(create_app(state))
+
+    def fake_run_generation(*_args, **kwargs):
+        seen["request_observability"] = dict(kwargs["request_observability"])
+        return _fake_generation("Done")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+    response = client.post(
+        "/v1/chat/completions",
+        headers={
+            "x-mtplx-cache-mode": "bypass",
+            "x-mtplx-client": "hermes",
+            "x-mtplx-tool-prompt-mode": "hybrid",
+        },
+        json={
+            "messages": [{"role": "user", "content": "Read both files."}],
+            "tools": [_named_tool_schema("read")],
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+            "max_tokens": 32,
+        },
+    )
+
+    assert response.status_code == 200
+    stats = seen["request_observability"]
+    assert stats["tool_prompt_mode"] == "hybrid"
+    assert stats["tool_prompt_mode_source"] == "request"
+    assert stats["tool_contract_active"] is True
 
 
 def test_launch_client_env_labels_headerless_hermes(monkeypatch):
