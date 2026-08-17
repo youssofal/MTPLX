@@ -46,6 +46,24 @@ def test_predicate_unmatched_module_uses_body() -> None:
     assert predicate("language_model.model.layers.5.self_attn.q_proj", None) is True
 
 
+def test_predicate_quantize_false_preserves_source_precision() -> None:
+    recipe = {
+        "body_mode": "affine",
+        "module_overrides": [
+            {
+                "suffix": "linear_attn.in_proj_a",
+                "quantize": False,
+            }
+        ],
+    }
+    predicate = build_predicate(recipe)
+    assert (
+        predicate("language_model.model.layers.5.linear_attn.in_proj_a", None)
+        is False
+    )
+    assert predicate("language_model.model.layers.5.mlp.gate_proj", None) is True
+
+
 def test_predicate_prefix_agnostic() -> None:
     predicate = build_predicate(SPEED_RECIPE)
     assert predicate("model.layers.3.linear_attn.out_proj", None) == {

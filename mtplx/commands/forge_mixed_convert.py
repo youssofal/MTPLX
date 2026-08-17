@@ -10,7 +10,9 @@ params (``True`` from the predicate).
 
 The predicate is called by ``mlx_lm.utils.quantize_model`` with
 ``(path, module)``; returning a dict routes those params to ``to_quantized``
-and records the per-module entry in ``config["quantization"]``.
+and records the per-module entry in ``config["quantization"]``. An override
+with ``"quantize": false`` returns ``False`` so sensitive modules remain in
+their source precision.
 """
 
 from __future__ import annotations
@@ -18,7 +20,6 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import sys
 from typing import Any, Callable
 
 _LAYER_INDEX_RE = re.compile(r"\.layers\.(\d+)\.")
@@ -26,7 +27,9 @@ _LAYER_INDEX_RE = re.compile(r"\.layers\.(\d+)\.")
 
 def build_predicate(recipe: dict[str, Any]) -> Callable[[str, Any], bool | dict[str, Any]]:
     body_mode = str(recipe.get("body_mode") or "affine")
-    overrides: list[tuple[str, frozenset[int] | None, dict[str, Any]]] = []
+    overrides: list[
+        tuple[str, frozenset[int] | None, bool | dict[str, Any]]
+    ] = []
     for entry in recipe.get("module_overrides") or []:
         if not isinstance(entry, dict):
             raise SystemExit("module_overrides entries must be objects")
@@ -37,11 +40,15 @@ def build_predicate(recipe: dict[str, Any]) -> Callable[[str, Any], bool | dict[
         layer_set = (
             frozenset(int(index) for index in raw_layers) if raw_layers is not None else None
         )
-        params = {
-            "bits": int(entry.get("bits") or 8),
-            "group_size": int(entry.get("group_size") or 64),
-            "mode": str(entry.get("mode") or body_mode),
-        }
+        params: bool | dict[str, Any]
+        if entry.get("quantize") is False:
+            params = False
+        else:
+            params = {
+                "bits": int(entry.get("bits") or 8),
+                "group_size": int(entry.get("group_size") or 64),
+                "mode": str(entry.get("mode") or body_mode),
+            }
         overrides.append((suffix, layer_set, params))
 
     def predicate(path: str, module: Any) -> bool | dict[str, Any]:
@@ -53,7 +60,7 @@ def build_predicate(recipe: dict[str, Any]) -> Callable[[str, Any], bool | dict[
                 match = _LAYER_INDEX_RE.search(path)
                 if match is None or int(match.group(1)) not in layer_set:
                     continue
-            return dict(params)
+            return dict(params) if isinstance(params, dict) else params
         return True
 
     return predicate
