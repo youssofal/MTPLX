@@ -1434,6 +1434,53 @@ struct SettingsTab: View {
             }
         } content: {
             VStack(alignment: .leading, spacing: 4) {
+                FormRow(
+                    label: "Profile",
+                    caption: "Default profile for the embedded Hermes agent. Changing profiles clears a remembered session from the previous profile."
+                ) {
+                    if hermes.profiles.isEmpty {
+                        Text("No profiles found")
+                            .font(.callout)
+                            .foregroundStyle(Brand.typeSecondary)
+                    } else {
+                        HStack(spacing: 8) {
+                            Picker("Hermes profile", selection: hermesProfileSelectionBinding) {
+                                if let missingName = missingHermesProfileName {
+                                    Text("\(missingName) (Missing)")
+                                        .tag(missingName)
+                                        .disabled(true)
+                                }
+                                ForEach(hermes.profiles) { profile in
+                                    Text(profile.isDefault ? "Default" : profile.name)
+                                        .tag(profile.name)
+                                        .disabled(hermesProfileUnavailable(profile))
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            .labelsHidden()
+                            .frame(maxWidth: 220, alignment: .leading)
+
+                            if let profile = configuredHermesProfile {
+                                PillBadge(
+                                    text: hermesRouteLabel(for: profile),
+                                    systemImage: hermesProfileUnavailable(profile)
+                                        ? "exclamationmark.triangle.fill"
+                                        : "checkmark.circle.fill",
+                                    tint: hermesRouteColor(for: profile)
+                                )
+                            } else if missingHermesProfileName != nil {
+                                PillBadge(
+                                    text: "Missing",
+                                    systemImage: "exclamationmark.triangle.fill",
+                                    tint: Brand.warning
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Divider().overlay(Brand.separator)
+
                 if let status = hermes.installStatus {
                     FormRow(label: "Tools") {
                         statusText(status.enabledToolsets.joined(separator: ", "))
@@ -1494,6 +1541,85 @@ struct SettingsTab: View {
                     }
                 }
             }
+        }
+    }
+
+    private var configuredHermesProfile: HermesProfile? {
+        if let remembered = draftConfig.lastHermesProfile {
+            return hermes.profiles.first(where: { $0.name == remembered })
+        }
+        if let selected = hermes.selectedProfile,
+           let discovered = hermes.profiles.first(where: { $0.id == selected.id }) {
+            return discovered
+        }
+        return hermes.profiles.first
+    }
+
+    private var missingHermesProfileName: String? {
+        guard let remembered = draftConfig.lastHermesProfile,
+              !hermes.profiles.contains(where: { $0.name == remembered })
+        else { return nil }
+        return remembered
+    }
+
+    private var hermesProfileSelectionBinding: Binding<String> {
+        Binding(
+            get: {
+                configuredHermesProfile?.name
+                    ?? draftConfig.lastHermesProfile
+                    ?? "default"
+            },
+            set: { profileName in
+                persistHermesProfileSelection(profileName)
+            }
+        )
+    }
+
+    private func persistHermesProfileSelection(_ profileName: String) {
+        guard let profile = hermes.profiles.first(where: { $0.name == profileName }),
+              !hermesProfileUnavailable(profile)
+        else { return }
+
+        // Persist only the Hermes selection. Other unsaved Settings edits stay
+        // in `draftConfig` until the user explicitly applies them.
+        var persisted = backend.configuration
+        persisted.rememberHermesProfileSelection(profile.name)
+        do {
+            try backend.saveSettings(persisted)
+            draftConfig.lastHermesProfile = persisted.lastHermesProfile
+            draftConfig.lastHermesSessionID = persisted.lastHermesSessionID
+            draftConfig.lastHermesSessionTitle = persisted.lastHermesSessionTitle
+            lastSyncedConfig = persisted
+            Task { await hermes.prepare(configuration: persisted) }
+        } catch {
+            lastSaveError = "Hermes profile could not be saved: \(error)"
+        }
+    }
+
+    private func hermesProfileUnavailable(_ profile: HermesProfile) -> Bool {
+        if case .unavailable = hermes.profileRoutingStates[profile.id] { return true }
+        return false
+    }
+
+    private func hermesRouteLabel(for profile: HermesProfile) -> String {
+        switch hermes.profileRoutingStates[profile.id] ?? .external {
+        case .mtplx:
+            return "MTPLX"
+        case .external:
+            return "External"
+        case .unavailable:
+            return "Unavailable"
+        }
+    }
+
+    private func hermesRouteColor(for profile: HermesProfile) -> Color {
+        switch hermes.profileRoutingStates[profile.id] ?? .external {
+        case .mtplx:
+            return Brand.success
+        case .external:
+            return Brand.typeSecondary
+        case .unavailable:
+            return Brand.warning
         }
     }
 

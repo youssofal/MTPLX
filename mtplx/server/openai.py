@@ -14290,11 +14290,20 @@ def _session_keep_live_refs_for_request(
     session_source: str | None,
     session_id: str | None,
     tool_names: list[str] | tuple[str, ...] | None = None,
+    client_hint: str | None = None,
 ) -> bool:
     if os.environ.get(
         "MTPLX_SESSIONBANK_LIVE_REFS_FOR_IMPLICIT_SESSIONS", ""
     ).strip().lower() in {"1", "true", "yes", "on"}:
         return True
+    # Hermes owns the durable conversation transcript and MTPLX's SSD tier
+    # already preserves cloneable prompt snapshots.  Retaining the live KV
+    # containers as well lets one long tool session fill every RAM-bank slot;
+    # live-ref entries are intentionally ineligible for prefix superseding, so
+    # the footprint then survives into unrelated short requests.  OpenCode's
+    # explicit live-frontier policy below remains unchanged.
+    if "hermes" in str(client_hint or "").strip().lower():
+        return False
     source = str(session_source or "")
     if source.startswith("header.") or source.startswith("metadata."):
         return True
@@ -24400,6 +24409,7 @@ def create_app(state: ServerState) -> FastAPI:
             session_source=session_source,
             session_id=session_id,
             tool_names=_tool_names(tool_specs) if tools_active else None,
+            client_hint=request_observability.get("request_client_hint"),
         )
         live_frontier_policy = "none"
         if agent_transcript_tools_active:
@@ -24422,6 +24432,14 @@ def create_app(state: ServerState) -> FastAPI:
                 request_observability["request_session_keep_live_ref_reason"] = (
                     "opencode_tool_snapshot_only"
                 )
+        elif (
+            _is_hermes_client(headers=headers, metadata=metadata)
+            and agent_transcript_tools_active
+        ):
+            live_frontier_policy = "hermes_snapshot_only"
+            request_observability["request_session_keep_live_ref_reason"] = (
+                "hermes_tool_snapshot_only"
+            )
         request_observability["request_session_keep_live_ref"] = bool(
             session_keep_live_ref
         )

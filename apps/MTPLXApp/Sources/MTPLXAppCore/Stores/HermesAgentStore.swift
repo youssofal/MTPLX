@@ -62,6 +62,27 @@ public struct HermesToolTrace: Identifiable, Equatable, Sendable {
     }
 }
 
+public enum HermesPendingRequestKind: Equatable, Sendable {
+    case approval
+    case clarification
+    case sudo
+    case secret
+}
+
+public struct HermesPendingRequest: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let kind: HermesPendingRequestKind
+    public let prompt: String
+    public let choices: [String]
+
+    public init(id: String, kind: HermesPendingRequestKind, prompt: String, choices: [String]) {
+        self.id = id
+        self.kind = kind
+        self.prompt = prompt
+        self.choices = choices
+    }
+}
+
 public struct HermesSavedSession: Identifiable, Equatable, Sendable {
     public let id: String
     public let title: String
@@ -69,6 +90,7 @@ public struct HermesSavedSession: Identifiable, Equatable, Sendable {
     public let startedAt: Double
     public let messageCount: Int
     public let source: String
+    public let activity: HermesSessionActivityState
 
     public init(
         id: String,
@@ -76,7 +98,8 @@ public struct HermesSavedSession: Identifiable, Equatable, Sendable {
         preview: String,
         startedAt: Double,
         messageCount: Int,
-        source: String
+        source: String,
+        activity: HermesSessionActivityState = .ready
     ) {
         self.id = id
         self.title = title
@@ -84,149 +107,7 @@ public struct HermesSavedSession: Identifiable, Equatable, Sendable {
         self.startedAt = startedAt
         self.messageCount = messageCount
         self.source = source
-    }
-}
-
-private struct HermesGatewayEvent: Sendable {
-    let type: String
-    let sessionID: String?
-    let payload: [String: JSONValue]
-}
-
-public enum HermesGatewayClientError: Error, LocalizedError {
-    case disconnected
-    case malformedResponse
-    case rpcError(String)
-    case sendFailed(String)
-
-    public var errorDescription: String? {
-        switch self {
-        case .disconnected:
-            return "Hermes gateway disconnected."
-        case .malformedResponse:
-            return "Hermes returned a malformed response."
-        case .rpcError(let message):
-            return message
-        case .sendFailed(let message):
-            return "Hermes request could not be sent: \(message)"
-        }
-    }
-}
-
-@MainActor
-private final class HermesGatewayClient {
-    private let task: URLSessionWebSocketTask
-    private var nextID: Int = 1
-    private var pending: [Int: CheckedContinuation<JSONValue, Error>] = [:]
-    var onEvent: ((HermesGatewayEvent) -> Void)?
-    var onDisconnect: ((String) -> Void)?
-
-    init(url: URL) {
-        task = URLSession.shared.webSocketTask(with: url)
-    }
-
-    func connect() {
-        task.resume()
-        receiveNext()
-    }
-
-    func close() {
-        for (_, continuation) in pending {
-            continuation.resume(throwing: HermesGatewayClientError.disconnected)
-        }
-        pending.removeAll()
-        task.cancel(with: .goingAway, reason: nil)
-    }
-
-    func call(method: String, params: [String: JSONValue] = [:]) async throws -> JSONValue {
-        let id = nextID
-        nextID += 1
-        let request: [String: JSONValue] = [
-            "jsonrpc": .string("2.0"),
-            "id": .number(Double(id)),
-            "method": .string(method),
-            "params": .object(params),
-        ]
-        let data = try JSONEncoder().encode(request)
-        guard let text = String(data: data, encoding: .utf8) else {
-            throw HermesGatewayClientError.malformedResponse
-        }
-        return try await withCheckedThrowingContinuation { continuation in
-            pending[id] = continuation
-            task.send(.string(text)) { [weak self] error in
-                guard let error else { return }
-                Task { @MainActor in
-                    guard let self else { return }
-                    self.pending.removeValue(forKey: id)?
-                        .resume(throwing: HermesGatewayClientError.sendFailed(error.localizedDescription))
-                }
-            }
-        }
-    }
-
-    private func receiveNext() {
-        task.receive { [weak self] result in
-            Task { @MainActor in
-                guard let self else { return }
-                switch result {
-                case .success(let message):
-                    self.handle(message)
-                    self.receiveNext()
-                case .failure(let error):
-                    for (_, continuation) in self.pending {
-                        continuation.resume(throwing: HermesGatewayClientError.disconnected)
-                    }
-                    self.pending.removeAll()
-                    self.onDisconnect?(error.localizedDescription)
-                }
-            }
-        }
-    }
-
-    private func handle(_ message: URLSessionWebSocketTask.Message) {
-        let text: String?
-        switch message {
-        case .string(let raw):
-            text = raw
-        case .data(let data):
-            text = String(data: data, encoding: .utf8)
-        @unknown default:
-            text = nil
-        }
-        guard let text,
-              let data = text.data(using: .utf8),
-              let root = try? JSONDecoder().decode([String: JSONValue].self, from: data)
-        else {
-            return
-        }
-
-        if let id = root["id"]?.intValue {
-            let continuation = pending.removeValue(forKey: id)
-            if let error = root["error"]?.objectValue {
-                continuation?.resume(
-                    throwing: HermesGatewayClientError.rpcError(
-                        error["message"]?.stringValue ?? "Hermes RPC failed."
-                    )
-                )
-            } else {
-                continuation?.resume(returning: root["result"] ?? .null)
-            }
-            return
-        }
-
-        guard root["method"]?.stringValue == "event",
-              let params = root["params"]?.objectValue,
-              let type = params["type"]?.stringValue
-        else {
-            return
-        }
-        onEvent?(
-            HermesGatewayEvent(
-                type: type,
-                sessionID: params["session_id"]?.stringValue,
-                payload: params["payload"]?.objectValue ?? [:]
-            )
-        )
+        self.activity = activity
     }
 }
 
@@ -235,6 +116,7 @@ public final class HermesAgentStore: ObservableObject {
     @Published public private(set) var connectionState: HermesConnectionState = .idle
     @Published public private(set) var installStatus: HermesInstallStatus?
     @Published public private(set) var profiles: [HermesProfile] = []
+    @Published public private(set) var profileRoutingStates: [String: HermesProfileRoutingState] = [:]
     @Published public private(set) var selectedProfile: HermesProfile?
     @Published public private(set) var sessions: [HermesSavedSession] = []
     @Published public private(set) var messages: [HermesTranscriptMessage] = []
@@ -242,22 +124,113 @@ public final class HermesAgentStore: ObservableObject {
     @Published public private(set) var activeSessionID: String?
     @Published public private(set) var activeSessionKey: String?
     @Published public private(set) var activeSessionTitle: String?
+    @Published public private(set) var activeSessionActivity: HermesSessionActivityState = .ready
+    @Published public private(set) var activeSessionWritable = false
+    @Published public private(set) var readOnlyReason: String?
     @Published public private(set) var isStreaming: Bool = false
+    @Published public private(set) var pendingRequest: HermesPendingRequest?
+    /// An approval response may have reached Hermes even when its RPC fails.
+    /// Keep the local FIFO closed until a fresh owned sidecar is connected.
+    @Published public private(set) var approvalPipelineBlocked = false
     @Published public private(set) var gatewayReady: Bool = false
     @Published public private(set) var gatewayRepairInFlight: Bool = false
     @Published public private(set) var gatewayRepairMessage: String?
     @Published public private(set) var terminalAgentRunning: Bool = false
 
     private let integration: HermesIntegration
-    private var sidecar: HermesSidecar?
+    private let embeddedRuntime: any HermesEmbeddedRuntime
+    private let clientFactory: HermesGatewayClientFactory
+    private var sidecar: (any HermesSidecarControlling)?
     private var sidecarProfileName: String?
     private var sidecarConfigurationSignature: String?
-    private var client: HermesGatewayClient?
+    private var client: (any HermesGatewayClientProtocol)?
     private var shuttingDown = false
+    /// Separates installation/profile discovery from gateway generations so a
+    /// cancelled overlay task cannot republish state after `stop()`.
+    private var lifecycleGeneration = 0
+    /// Invalidates session-selection tasks even when they share the same
+    /// already-connected sidecar/client generation.
+    private var sessionSelectionGeneration = 0
     private var gatewayGeneration = 0
+    private var didReapOrphanedSidecars = false
+    private var hermesAutoApprove = false
+    private var pendingResponseLease: PendingRequestLease?
+    private var freshSessionLease: FreshSessionLease?
+    private var pendingRequestInbox: [PendingRequestInboxEntry] = []
+    private var retiredAutoApprovalFingerprints: [RetiredAutoApprovalFingerprint] = []
+    private var blockedApprovalRecovery: BlockedApprovalRecovery?
+    private let monotonicClock: @Sendable () -> TimeInterval
+    private static let pendingRequestInboxLimit = 64
+    private static let retiredApprovalFingerprintLimit = 64
 
-    public init(integration: HermesIntegration = HermesIntegration()) {
+    private struct GatewayOperation {
+        let generation: Int
+        let profileID: String
+        let clientIdentity: ObjectIdentifier
+    }
+
+    /// A session ID returned by `session.create` through this store's current
+    /// owned sidecar. Hermes may create `active_sessions.json` lazily, so the
+    /// first ownership read can be unavailable even though this exact session
+    /// did not exist before MTPLX created it. This lease is deliberately local
+    /// to one gateway/session lifecycle; it is never persisted or reused for a
+    /// resumed session.
+    private struct FreshSessionLease {
+        let sessionID: String
+        let sessionKey: String
+        let operation: GatewayOperation
+        let selectionGeneration: Int
+    }
+
+    private struct PendingRequestLease {
+        let id: String
+        let kind: HermesPendingRequestKind
+        let sessionID: String
+        let operation: GatewayOperation
+    }
+
+    private struct PendingRequestInboxEntry {
+        let request: HermesPendingRequest
+        let sessionID: String
+        let operation: GatewayOperation
+        let approvalFingerprint: String?
+        let approvalAutoEligible: Bool
+    }
+
+    private struct RetiredAutoApprovalFingerprint {
+        let fingerprint: String
+        let sessionID: String
+        let operation: GatewayOperation
+        let retiredAt: TimeInterval
+    }
+
+    private struct BlockedApprovalRecovery {
+        let profileID: String
+        let nativeSessionID: String
+        let savedSessionID: String?
+    }
+
+    /// Test-only safe observability for FIFO retention; request content remains private.
+    var pendingRequestInboxCount: Int { pendingRequestInbox.count }
+
+    public init(
+        integration: HermesIntegration,
+        embeddedRuntime: any HermesEmbeddedRuntime,
+        clientFactory: @escaping HermesGatewayClientFactory,
+        monotonicClock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+    ) {
         self.integration = integration
+        self.embeddedRuntime = embeddedRuntime
+        self.clientFactory = clientFactory
+        self.monotonicClock = monotonicClock
+    }
+
+    public convenience init(integration: HermesIntegration = HermesIntegration()) {
+        self.init(
+            integration: integration,
+            embeddedRuntime: integration,
+            clientFactory: { URLSessionHermesGatewayClient(url: $0) }
+        )
     }
 
     public var activeReference: HermesSessionReference? {
@@ -272,18 +245,42 @@ public final class HermesAgentStore: ObservableObject {
     }
 
     public func prepare(configuration: MTPLXAppConfiguration) async {
+        let selectionGeneration = beginSessionSelection()
+        lifecycleGeneration += 1
+        let generation = lifecycleGeneration
+        // A later explicit prepare is a new overlay lifetime. `stop()`
+        // invalidates the old generation but must not poison this one.
+        shuttingDown = false
+        guard isCurrentPrepare(generation, selectionGeneration: selectionGeneration) else { return }
         connectionState = .checkingInstall
+        guard isCurrentPrepare(generation, selectionGeneration: selectionGeneration) else { return }
         gatewayRepairMessage = nil
+        guard isCurrentPrepare(generation, selectionGeneration: selectionGeneration) else { return }
+        if !didReapOrphanedSidecars {
+            _ = embeddedRuntime.reapOrphanedEmbeddedSidecars()
+            didReapOrphanedSidecars = true
+        }
         let status = await integration.installStatus()
+        guard isCurrentPrepare(generation, selectionGeneration: selectionGeneration) else { return }
         installStatus = status
+        guard isCurrentPrepare(generation, selectionGeneration: selectionGeneration) else { return }
         terminalAgentRunning = integration.hasLaunchedTerminalAgent()
+        guard isCurrentPrepare(generation, selectionGeneration: selectionGeneration) else { return }
         profiles = integration.discoverProfiles()
+        guard isCurrentPrepare(generation, selectionGeneration: selectionGeneration) else { return }
+        profileRoutingStates = Dictionary(
+            uniqueKeysWithValues: profiles.map { profile in
+                (profile.id, embeddedRuntime.routingState(for: profile, configuration: configuration))
+            }
+        )
+        guard isCurrentPrepare(generation, selectionGeneration: selectionGeneration) else { return }
         if let remembered = configuration.lastHermesProfile,
            let profile = profiles.first(where: { $0.name == remembered }) {
             selectedProfile = profile
         } else if selectedProfile == nil {
             selectedProfile = profiles.first
         }
+        guard isCurrentPrepare(generation, selectionGeneration: selectionGeneration) else { return }
         switch status.kind {
         case .ready:
             connectionState = .idle
@@ -335,13 +332,30 @@ public final class HermesAgentStore: ObservableObject {
         profile: HermesProfile,
         configuration: MTPLXAppConfiguration
     ) async {
-        selectedProfile = profile
+        let selectionGeneration = beginSessionSelection()
+        var operation: GatewayOperation?
         do {
-            try await ensureGateway(profile: profile, configuration: configuration)
-            let result = try await rpc("session.list", params: ["limit": .number(200)])
-            sessions = Self.parseSessions(result)
+            operation = try await ensureGateway(
+                profile: profile,
+                configuration: configuration,
+                preserveBlockedApprovalRecovery: preservesBlockedApprovalRecovery(for: profile)
+            )
+            guard let operation,
+                  isCurrent(operation),
+                  isCurrentSessionSelection(selectionGeneration)
+            else { return }
+            let result = try await rpc(operation, method: "session.list", params: ["limit": .number(200)])
+            guard isCurrent(operation),
+                  isCurrentSessionSelection(selectionGeneration)
+            else { return }
+            sessions = sessionsWithActivity(Self.parseSessions(result), profile: profile)
             connectionState = .connected
         } catch {
+            guard let operation,
+                  isCurrent(operation),
+                  isCurrentSessionSelection(selectionGeneration),
+                  !shuttingDown
+            else { return }
             sessions = []
             connectionState = .failed(Self.message(for: error))
         }
@@ -352,17 +366,49 @@ public final class HermesAgentStore: ObservableObject {
         profile: HermesProfile,
         configuration: MTPLXAppConfiguration
     ) async throws -> HermesSessionReference {
-        selectedProfile = profile
-        try await ensureGateway(profile: profile, configuration: configuration)
-        let result = try await rpc("session.create", params: ["cols": .number(100)])
+        // A new agent selection is an explicit session boundary. Do not let a
+        // prior fresh-session lease survive if creation fails or is cancelled.
+        let selectionGeneration = beginSessionSelection()
+        let operation = try await ensureGateway(
+            profile: profile,
+            configuration: configuration,
+            preserveBlockedApprovalRecovery: false
+        )
+        guard isCurrent(operation),
+              isCurrentSessionSelection(selectionGeneration)
+        else {
+            throw HermesGatewayClientError.disconnected
+        }
+        let result = try await rpc(operation, method: "session.create", params: ["cols": .number(100)])
+        guard isCurrent(operation),
+              isCurrentSessionSelection(selectionGeneration)
+        else {
+            throw CancellationError()
+        }
         guard let sessionID = result.objectValue?["session_id"]?.stringValue else {
             throw HermesGatewayClientError.malformedResponse
+        }
+        let sessionKey = (try? await liveSessionKey(for: sessionID, operation: operation)) ?? sessionID
+        guard isCurrent(operation),
+              isCurrentSessionSelection(selectionGeneration)
+        else {
+            throw CancellationError()
         }
         activeSessionID = sessionID
         activeSessionTitle = "New Hermes Agent"
         messages = []
         toolTraces = []
-        activeSessionKey = (try? await liveSessionKey(for: sessionID)) ?? sessionID
+        endStreaming()
+        pendingRequest = nil
+        clearAutoApprovalLifecycle()
+        activeSessionKey = sessionKey
+        freshSessionLease = FreshSessionLease(
+            sessionID: sessionID,
+            sessionKey: sessionKey,
+            operation: operation,
+            selectionGeneration: selectionGeneration
+        )
+        applyActiveOwnership(.ready)
         connectionState = .connected
         return HermesSessionReference(
             profileName: profile.name,
@@ -377,26 +423,39 @@ public final class HermesAgentStore: ObservableObject {
         profile: HermesProfile,
         configuration: MTPLXAppConfiguration
     ) async throws -> HermesSessionReference {
-        selectedProfile = profile
-        try await ensureGateway(profile: profile, configuration: configuration)
+        // Saved/native sessions never inherit the new-session exception.
+        let selectionGeneration = beginSessionSelection()
+        let operation = try await ensureGateway(
+            profile: profile,
+            configuration: configuration,
+            preserveBlockedApprovalRecovery: preservesBlockedApprovalRecovery(for: profile, savedSessionID: session.id)
+        )
+        guard isCurrent(operation),
+              isCurrentSessionSelection(selectionGeneration)
+        else {
+            throw HermesGatewayClientError.disconnected
+        }
+        sessions = sessionsWithActivity(sessions, profile: profile)
         let result = try await rpc(
-            "session.resume",
+            operation,
+            method: "session.resume",
             params: [
                 "session_id": .string(session.id),
                 "cols": .number(100),
             ]
         )
-        guard let object = result.objectValue,
-              let sessionID = object["session_id"]?.stringValue
+        guard isCurrent(operation),
+              isCurrentSessionSelection(selectionGeneration)
         else {
-            throw HermesGatewayClientError.malformedResponse
+            throw CancellationError()
         }
-        activeSessionID = sessionID
-        activeSessionKey = object["resumed"]?.stringValue ?? session.id
-        activeSessionTitle = session.title.isEmpty ? session.preview : session.title
-        messages = Self.parseMessages(object["messages"])
-        toolTraces = []
-        connectionState = .connected
+        try applyResumedSession(
+            result,
+            savedSessionID: session.id,
+            title: session.title.isEmpty ? session.preview : session.title,
+            preserveVisibleTranscript: false
+        )
+        _ = refreshActiveOwnership()
         return HermesSessionReference(
             profileName: profile.name,
             sessionID: activeSessionKey ?? session.id,
@@ -410,9 +469,12 @@ public final class HermesAgentStore: ObservableObject {
     ) async throws -> HermesSessionReference {
         guard let profileName = configuration.lastHermesProfile,
               let sessionID = configuration.lastHermesSessionID,
-              let profile = profiles.first(where: { $0.name == profileName })
+              let profile = (
+                profiles.first(where: { $0.name == profileName })
+                    ?? selectedProfile.flatMap { $0.name == profileName ? $0 : nil }
+              )
         else {
-            throw HermesGatewayClientError.rpcError("No previous Hermes agent is saved.")
+            throw HermesGatewayClientError.rpcError
         }
         let session = HermesSavedSession(
             id: sessionID,
@@ -427,19 +489,28 @@ public final class HermesAgentStore: ObservableObject {
 
     public func send(_ rawText: String) async {
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, let sessionID = activeSessionID, !isStreaming else { return }
+        guard !text.isEmpty,
+              let sessionID = activeSessionID,
+              let profile = selectedProfile,
+              let operation = currentOperation(for: profile),
+              !isStreaming,
+              pendingRequest == nil
+        else { return }
+        guard refreshActiveOwnership() else { return }
         messages.append(HermesTranscriptMessage(role: .user, text: text))
         isStreaming = true
         do {
             _ = try await rpc(
-                "prompt.submit",
+                operation,
+                method: "prompt.submit",
                 params: [
                     "session_id": .string(sessionID),
                     "text": .string(text),
                 ]
             )
         } catch {
-            isStreaming = false
+            guard isCurrent(operation, sessionID: sessionID) else { return }
+            endStreaming()
             messages.append(
                 HermesTranscriptMessage(
                     role: .system,
@@ -449,24 +520,110 @@ public final class HermesAgentStore: ObservableObject {
         }
     }
 
-    public func interrupt() async {
-        guard let sessionID = activeSessionID else { return }
+    public func respondToPendingRequest(value: String) async {
+        guard let pendingRequest,
+              let sessionID = activeSessionID,
+              let profile = selectedProfile,
+              let operation = currentOperation(for: profile),
+              refreshActiveOwnership(),
+              pendingResponseLease == nil,
+              !approvalPipelineBlocked,
+              inboxHeadMatches(id: pendingRequest.id, kind: pendingRequest.kind, operation: operation, sessionID: sessionID)
+        else { return }
+
+        let lease = PendingRequestLease(
+            id: pendingRequest.id,
+            kind: pendingRequest.kind,
+            sessionID: sessionID,
+            operation: operation
+        )
+        guard reservePendingResponseLease(lease) else { return }
+        defer {
+            releasePendingResponseLease(lease)
+        }
+        let method: String
+        let params: [String: JSONValue]
+        switch lease.kind {
+        case .approval:
+            method = "approval.respond"
+            params = [
+                "session_id": .string(sessionID),
+                "choice": .string(value),
+            ]
+        case .clarification:
+            method = "clarify.respond"
+            params = [
+                "request_id": .string(lease.id),
+                "answer": .string(value),
+            ]
+        case .sudo:
+            method = "sudo.respond"
+            params = [
+                "request_id": .string(lease.id),
+                "password": .string(value),
+            ]
+        case .secret:
+            method = "secret.respond"
+            params = [
+                "request_id": .string(lease.id),
+                "value": .string(value),
+            ]
+        }
+
         do {
-            _ = try await rpc("session.interrupt", params: ["session_id": .string(sessionID)])
+            _ = try await rpc(operation, method: method, params: params)
+            guard isCurrent(lease.operation, sessionID: lease.sessionID),
+                  self.pendingRequest?.id == lease.id,
+                  self.pendingRequest?.kind == lease.kind
+            else { return }
+            self.completeInboxHead(lease)
         } catch {
+            guard isCurrent(lease.operation, sessionID: lease.sessionID),
+                  self.pendingRequest?.id == lease.id,
+                  self.pendingRequest?.kind == lease.kind
+            else { return }
+            if lease.kind == .approval {
+                blockApprovalPipeline(afterAmbiguousResponseFor: lease)
+            } else {
+                messages.append(HermesTranscriptMessage(role: .system, text: "Hermes could not accept the requested response."))
+            }
+        }
+    }
+
+    public func denyPendingApproval() async {
+        guard pendingRequest?.kind == .approval else { return }
+        await respondToPendingRequest(value: "deny")
+    }
+
+    public func interrupt() async {
+        guard let sessionID = activeSessionID,
+              let profile = selectedProfile,
+              let operation = currentOperation(for: profile)
+        else { return }
+        guard refreshActiveOwnership() else { return }
+        do {
+            _ = try await rpc(operation, method: "session.interrupt", params: ["session_id": .string(sessionID)])
+        } catch {
+            guard isCurrent(operation, sessionID: sessionID) else { return }
             messages.append(
                 HermesTranscriptMessage(role: .system, text: Self.message(for: error))
             )
         }
-        isStreaming = false
+        guard isCurrent(operation, sessionID: sessionID) else { return }
+        endStreaming()
     }
 
     public func createProfile(named name: String, configuration: MTPLXAppConfiguration) async {
         do {
             let profile = try await integration.createProfile(named: name)
             profiles = integration.discoverProfiles()
-            selectedProfile = profiles.first(where: { $0.name == profile.name }) ?? profile
-            await loadSessions(profile: selectedProfile ?? profile, configuration: configuration)
+            profileRoutingStates = Dictionary(
+                uniqueKeysWithValues: profiles.map { profile in
+                    (profile.id, embeddedRuntime.routingState(for: profile, configuration: configuration))
+                }
+            )
+            let selected = profiles.first(where: { $0.name == profile.name }) ?? profile
+            await loadSessions(profile: selected, configuration: configuration)
         } catch {
             connectionState = .failed(Self.message(for: error))
         }
@@ -474,18 +631,58 @@ public final class HermesAgentStore: ObservableObject {
 
     public func stop() async {
         shuttingDown = true
-        gatewayGeneration += 1
-        client?.close()
-        client = nil
-        sidecar?.stop()
-        sidecar = nil
-        sidecarProfileName = nil
-        sidecarConfigurationSignature = nil
-        gatewayReady = false
-        isStreaming = false
+        _ = beginSessionSelection()
+        lifecycleGeneration += 1
+        tearDownGateway(clearSession: true)
         activeSessionID = nil
+        activeSessionKey = nil
+        activeSessionTitle = nil
+        applyActiveOwnership(.ready)
+        sessions = []
+        messages = []
+        toolTraces = []
+        pendingRequest = nil
+        pendingResponseLease = nil
+        clearAutoApprovalLifecycle()
         terminalAgentRunning = integration.hasLaunchedTerminalAgent()
         connectionState = .idle
+    }
+
+    /// Re-establishes the embedded sidecar for the selected profile and
+    /// reopens the selected persisted session without discarding the locally
+    /// visible transcript while transport recovery is in progress.
+    public func reconnect(configuration: MTPLXAppConfiguration) async throws {
+        let selectionGeneration = beginSessionSelection()
+        guard let profile = selectedProfile else { throw HermesGatewayClientError.disconnected }
+        let savedSessionID = activeSessionKey ?? activeSessionID ?? configuration.lastHermesSessionID
+        let title = activeSessionTitle ?? configuration.lastHermesSessionTitle
+        let operation = try await ensureGateway(
+            profile: profile,
+            configuration: configuration,
+            preserveSession: true,
+            preserveBlockedApprovalRecovery: preservesBlockedApprovalRecovery(for: profile)
+        )
+        guard isCurrent(operation),
+              isCurrentSessionSelection(selectionGeneration)
+        else { throw CancellationError() }
+        guard let savedSessionID else { return }
+        let result = try await rpc(
+            operation,
+            method: "session.resume",
+            params: ["session_id": .string(savedSessionID), "cols": .number(100)]
+        )
+        guard isCurrent(operation),
+              isCurrentSessionSelection(selectionGeneration)
+        else {
+            throw CancellationError()
+        }
+        try applyResumedSession(
+            result,
+            savedSessionID: savedSessionID,
+            title: title,
+            preserveVisibleTranscript: true
+        )
+        _ = refreshActiveOwnership()
     }
 
     public func refreshTerminalAgentState() {
@@ -494,17 +691,258 @@ public final class HermesAgentStore: ObservableObject {
 
     private func ensureGateway(
         profile: HermesProfile,
-        configuration: MTPLXAppConfiguration
-    ) async throws {
+        configuration: MTPLXAppConfiguration,
+        preserveSession: Bool = false,
+        preserveBlockedApprovalRecovery: Bool = false
+    ) async throws -> GatewayOperation {
+        hermesAutoApprove = configuration.hermesAutoApprove
         let signature = Self.configurationSignature(configuration)
-        if selectedProfile?.name == profile.name,
-           sidecarProfileName == profile.name,
+        if sidecarProfileName == profile.name,
            sidecarConfigurationSignature == signature,
-           sidecar?.process.isRunning == true,
-           client != nil {
-            return
+           sidecar?.isRunning == true,
+           client != nil,
+           gatewayReady {
+            guard let operation = currentOperation(for: profile) else {
+                throw HermesGatewayClientError.disconnected
+            }
+            return operation
         }
+        // Replacing the sidecar/client ends any local proof that a fresh
+        // session remains exclusive to this store.
+        invalidateFreshSessionLease()
+        let reconnectingBlockedApprovalPipeline = approvalPipelineBlocked && preserveBlockedApprovalRecovery
+        if approvalPipelineBlocked && !reconnectingBlockedApprovalPipeline {
+            // An explicit profile/session boundary must discard old recovery
+            // before the new profile is published or a sidecar is started.
+            disposePendingRequestLifecycle()
+        }
+        let reuseSidecar = sidecarProfileName == profile.name
+            && sidecarConfigurationSignature == signature
+            && sidecar?.isRunning == true
         shuttingDown = true
+        gatewayGeneration += 1
+        let generation = gatewayGeneration
+        client?.close()
+        client = nil
+        pendingResponseLease = nil
+        if !reconnectingBlockedApprovalPipeline {
+            clearAutoApprovalLifecycle()
+        }
+        if !reuseSidecar {
+            sidecar?.stop()
+            sidecar = nil
+            sidecarProfileName = nil
+            sidecarConfigurationSignature = nil
+            if !preserveSession {
+                sessions = []
+                activeSessionID = nil
+                activeSessionKey = nil
+                activeSessionTitle = nil
+                applyActiveOwnership(.ready)
+                messages = []
+                toolTraces = []
+                endStreaming()
+                if !reconnectingBlockedApprovalPipeline {
+                    pendingRequest = nil
+                }
+                pendingResponseLease = nil
+                if !reconnectingBlockedApprovalPipeline {
+                    clearAutoApprovalLifecycle()
+                }
+            }
+        }
+        gatewayReady = false
+        shuttingDown = false
+        connectionState = .starting
+        let nextSidecar: any HermesSidecarControlling
+        do {
+            if let sidecar, reuseSidecar {
+                nextSidecar = sidecar
+            } else {
+                nextSidecar = try await embeddedRuntime.startEmbeddedSidecar(
+                    profile: profile,
+                    configuration: configuration
+                )
+            }
+        } catch {
+            guard generation == gatewayGeneration, !shuttingDown else { throw CancellationError() }
+            connectionState = .failed(Self.message(for: error))
+            throw error
+        }
+        guard generation == gatewayGeneration, !shuttingDown else {
+            if !reuseSidecar { nextSidecar.stop() }
+            throw CancellationError()
+        }
+        let nextClient = clientFactory(nextSidecar.webSocketURL)
+        nextClient.onEvent = { [weak self, weak nextClient] event in
+            guard let self,
+                  let nextClient,
+                  self.gatewayGeneration == generation,
+                  !self.shuttingDown,
+                  let currentClient = self.client,
+                  ObjectIdentifier(currentClient) == ObjectIdentifier(nextClient)
+            else { return }
+            self.handle(event)
+        }
+        nextClient.onDisconnect = { [weak self, weak nextClient, weak nextSidecar] message in
+            guard let self,
+                  let nextClient,
+                  let nextSidecar,
+                  self.gatewayGeneration == generation,
+                  !self.shuttingDown
+            else { return }
+            if self.releaseGatewayIfOwned(
+                generation: generation,
+                client: nextClient,
+                sidecar: nextSidecar
+            ) {
+                self.connectionState = .failed(message)
+            }
+        }
+        sidecar = nextSidecar
+        sidecarProfileName = profile.name
+        sidecarConfigurationSignature = signature
+        client = nextClient
+        selectedProfile = profile
+        do {
+            try await nextClient.connectAndWaitUntilReady(timeoutSeconds: 10)
+        } catch {
+            guard generation == gatewayGeneration, !shuttingDown else { throw CancellationError() }
+            if releaseGatewayIfOwned(generation: generation, client: nextClient, sidecar: nextSidecar) {
+                connectionState = .failed(Self.message(for: error))
+            }
+            throw error
+        }
+        guard generation == gatewayGeneration, !shuttingDown else {
+            _ = releaseGatewayIfOwned(generation: generation, client: nextClient, sidecar: nextSidecar)
+            throw CancellationError()
+        }
+        if reconnectingBlockedApprovalPipeline {
+            // The failed transport was already torn down; only a completed
+            // fresh sidecar/client handshake may reopen approval handling.
+            pendingRequest = nil
+            clearAutoApprovalLifecycle()
+        }
+        gatewayReady = true
+        connectionState = .connected
+        return GatewayOperation(
+            generation: generation,
+            profileID: profile.id,
+            clientIdentity: ObjectIdentifier(nextClient)
+        )
+    }
+
+    private func isCurrentPrepare(_ generation: Int, selectionGeneration: Int) -> Bool {
+        !Task.isCancelled
+            && lifecycleGeneration == generation
+            && isCurrentSessionSelection(selectionGeneration)
+            && !shuttingDown
+    }
+
+    private func rpc(
+        _ operation: GatewayOperation,
+        method: String,
+        params: [String: JSONValue] = [:]
+    ) async throws -> JSONValue {
+        guard isCurrent(operation), let client else {
+            throw HermesGatewayClientError.disconnected
+        }
+        return try await client.call(method: method, params: params)
+    }
+
+    private func currentOperation(for profile: HermesProfile) -> GatewayOperation? {
+        guard gatewayReady,
+              selectedProfile?.id == profile.id,
+              let client
+        else { return nil }
+        return GatewayOperation(
+            generation: gatewayGeneration,
+            profileID: profile.id,
+            clientIdentity: ObjectIdentifier(client)
+        )
+    }
+
+    private func isCurrent(_ operation: GatewayOperation, sessionID: String? = nil) -> Bool {
+        guard gatewayReady,
+              gatewayGeneration == operation.generation,
+              selectedProfile?.id == operation.profileID,
+              let client,
+              ObjectIdentifier(client) == operation.clientIdentity
+        else { return false }
+        return sessionID.map { $0 == activeSessionID } ?? true
+    }
+
+    private func releaseGatewayIfOwned(
+        generation: Int,
+        client expectedClient: any HermesGatewayClientProtocol,
+        sidecar expectedSidecar: any HermesSidecarControlling
+    ) -> Bool {
+        guard ownsGateway(generation: generation, client: expectedClient, sidecar: expectedSidecar) else { return false }
+        if shouldRetainApprovalRecovery(for: expectedClient) {
+            retainBlockedApprovalRecovery()
+        } else {
+            disposePendingRequestLifecycle()
+        }
+        return releaseOwnedTransport(client: expectedClient, sidecar: expectedSidecar)
+    }
+
+    private func ownsGateway(
+        generation: Int,
+        client expectedClient: any HermesGatewayClientProtocol,
+        sidecar expectedSidecar: any HermesSidecarControlling
+    ) -> Bool {
+        gatewayGeneration == generation
+            && client.map { ObjectIdentifier($0) == ObjectIdentifier(expectedClient) } ?? false
+            && sidecar.map { ObjectIdentifier($0) == ObjectIdentifier(expectedSidecar) } ?? false
+    }
+
+    /// A URLSession transport first resumes outstanding RPC continuations and
+    /// then calls `onDisconnect` on this actor. Preserve the approval head here
+    /// because the resumed task cannot safely recover after transport release.
+    private func shouldRetainApprovalRecovery(for expectedClient: any HermesGatewayClientProtocol) -> Bool {
+        guard let client, ObjectIdentifier(client) == ObjectIdentifier(expectedClient) else { return false }
+        if approvalPipelineBlocked { return blockedApprovalRecovery != nil }
+        guard let lease = pendingResponseLease,
+              lease.kind == .approval,
+              lease.operation.generation == gatewayGeneration,
+              lease.operation.clientIdentity == ObjectIdentifier(expectedClient)
+        else { return false }
+        return inboxHeadMatches(
+            id: lease.id,
+            kind: .approval,
+            operation: lease.operation,
+            sessionID: lease.sessionID
+        )
+    }
+
+    private func releaseOwnedTransport(
+        client expectedClient: any HermesGatewayClientProtocol,
+        sidecar expectedSidecar: any HermesSidecarControlling
+    ) -> Bool {
+        guard let client,
+              ObjectIdentifier(client) == ObjectIdentifier(expectedClient),
+              let sidecar,
+              ObjectIdentifier(sidecar) == ObjectIdentifier(expectedSidecar)
+        else { return false }
+        self.client = nil
+        self.sidecar = nil
+        sidecarProfileName = nil
+        sidecarConfigurationSignature = nil
+        invalidateFreshSessionLease()
+        gatewayReady = false
+        endStreaming()
+        expectedClient.close()
+        expectedSidecar.stop()
+        return true
+    }
+
+    private func disposePendingRequestLifecycle() {
+        pendingRequest = nil
+        pendingResponseLease = nil
+        clearAutoApprovalLifecycle()
+    }
+
+    private func tearDownGateway(clearSession: Bool) {
         gatewayGeneration += 1
         client?.close()
         client = nil
@@ -512,44 +950,155 @@ public final class HermesAgentStore: ObservableObject {
         sidecar = nil
         sidecarProfileName = nil
         sidecarConfigurationSignature = nil
+        invalidateFreshSessionLease()
         gatewayReady = false
-        let generation = gatewayGeneration
-        shuttingDown = false
-        connectionState = .starting
-        let nextSidecar = try await integration.startDashboard(
-            profile: profile,
-            configuration: configuration
-        )
-        let nextClient = HermesGatewayClient(url: nextSidecar.webSocketURL)
-        nextClient.onEvent = { [weak self] event in
-            self?.handle(event)
+        endStreaming()
+        pendingRequest = nil
+        pendingResponseLease = nil
+        clearAutoApprovalLifecycle()
+        if clearSession {
+            activeSessionID = nil
+            activeSessionKey = nil
+            activeSessionTitle = nil
+            applyActiveOwnership(.ready)
         }
-        nextClient.onDisconnect = { [weak self] message in
-            guard let self,
-                  self.gatewayGeneration == generation,
-                  !self.shuttingDown
-            else { return }
-            self.connectionState = .failed(message)
+    }
+
+    private func applyResumedSession(
+        _ result: JSONValue,
+        savedSessionID: String,
+        title: String?,
+        preserveVisibleTranscript: Bool
+    ) throws {
+        guard let object = result.objectValue,
+              let sessionID = object["session_id"]?.stringValue
+        else { throw HermesGatewayClientError.malformedResponse }
+        activeSessionID = sessionID
+        activeSessionKey = object["resumed"]?.stringValue ?? savedSessionID
+        invalidateFreshSessionLease()
+        activeSessionTitle = title
+        endStreaming()
+        pendingRequest = nil
+        pendingResponseLease = nil
+        clearAutoApprovalLifecycle()
+        if !preserveVisibleTranscript || messages.isEmpty {
+            messages = Self.parseMessages(object["messages"])
         }
-        sidecar = nextSidecar
-        sidecarProfileName = profile.name
-        sidecarConfigurationSignature = signature
-        client = nextClient
-        selectedProfile = profile
-        nextClient.connect()
+        toolTraces = []
         connectionState = .connected
     }
 
-    private func rpc(_ method: String, params: [String: JSONValue] = [:]) async throws -> JSONValue {
-        guard let client else {
-            throw HermesGatewayClientError.disconnected
+    private func sessionsWithActivity(
+        _ sessions: [HermesSavedSession],
+        profile: HermesProfile
+    ) -> [HermesSavedSession] {
+        sessions.map { session in
+            HermesSavedSession(
+                id: session.id,
+                title: session.title,
+                preview: session.preview,
+                startedAt: session.startedAt,
+                messageCount: session.messageCount,
+                source: session.source,
+                activity: HermesSessionActivityState(ownership: ownership(for: session.id, profile: profile))
+            )
         }
-        return try await client.call(method: method, params: params)
     }
 
-    private func liveSessionKey(for sessionID: String) async throws -> String? {
+    @discardableResult
+    private func refreshActiveOwnership() -> Bool {
+        guard let profile = selectedProfile,
+              let sessionID = activeSessionKey ?? activeSessionID
+        else {
+            applyActiveOwnership(.ready)
+            return false
+        }
+        let primary = ownership(for: sessionID, profile: profile)
+        var resolved: HermesSessionOwnership
+        if let liveID = activeSessionID, liveID != sessionID {
+            resolved = mostRestrictive(primary, ownership(for: liveID, profile: profile))
+        } else {
+            resolved = primary
+        }
+        if case .registryUnavailable = resolved,
+           hasFreshSessionLease(for: profile) {
+            // `session.create` allocated this exact session through the
+            // currently-owned sidecar. A missing lazy registry must not block
+            // its own prompts, but explicit external activity remains more
+            // restrictive above and is never overridden here.
+            resolved = .ownedByMTPLX
+        }
+        applyActiveOwnership(resolved)
+        return activeSessionWritable
+    }
+
+    private func hasFreshSessionLease(for profile: HermesProfile) -> Bool {
+        guard let lease = freshSessionLease,
+              activeSessionID == lease.sessionID,
+              activeSessionKey == lease.sessionKey,
+              profile.id == lease.operation.profileID,
+              isCurrentSessionSelection(lease.selectionGeneration),
+              isCurrent(lease.operation, sessionID: lease.sessionID)
+        else { return false }
+        return true
+    }
+
+    private func invalidateFreshSessionLease() {
+        freshSessionLease = nil
+    }
+
+    @discardableResult
+    private func beginSessionSelection() -> Int {
+        sessionSelectionGeneration += 1
+        invalidateFreshSessionLease()
+        return sessionSelectionGeneration
+    }
+
+    private func isCurrentSessionSelection(_ generation: Int) -> Bool {
+        !Task.isCancelled && sessionSelectionGeneration == generation
+    }
+
+    private func ownership(for sessionID: String, profile: HermesProfile) -> HermesSessionOwnership {
+        embeddedRuntime.sessionOwnership(
+            profile: profile,
+            sessionID: sessionID,
+            ownedSidecarPID: sidecar?.processIdentifier
+        )
+    }
+
+    private func mostRestrictive(
+        _ first: HermesSessionOwnership,
+        _ second: HermesSessionOwnership
+    ) -> HermesSessionOwnership {
+        if case .external = first { return first }
+        if case .external = second { return second }
+        if case .unknown = first { return first }
+        if case .unknown = second { return second }
+        if case .registryUnavailable = first { return first }
+        if case .registryUnavailable = second { return second }
+        if case .ownedByMTPLX = first { return first }
+        return second
+    }
+
+    private func applyActiveOwnership(_ ownership: HermesSessionOwnership) {
+        activeSessionActivity = HermesSessionActivityState(ownership: ownership)
+        switch ownership {
+        case .ready, .ownedByMTPLX:
+            activeSessionWritable = activeSessionID != nil
+            readOnlyReason = nil
+        case .external:
+            activeSessionWritable = false
+            readOnlyReason = "This session is active in another Hermes surface."
+        case .registryUnavailable(let reason), .unknown(let reason):
+            activeSessionWritable = false
+            readOnlyReason = reason
+        }
+    }
+
+    private func liveSessionKey(for sessionID: String, operation: GatewayOperation) async throws -> String? {
         let result = try await rpc(
-            "session.active_list",
+            operation,
+            method: "session.active_list",
             params: ["current_session_id": .string(sessionID)]
         )
         guard let rows = result.objectValue?["sessions"]?.arrayValue else { return nil }
@@ -564,14 +1113,9 @@ public final class HermesAgentStore: ObservableObject {
 
     private func handle(_ event: HermesGatewayEvent) {
         if event.type == "gateway.ready" {
-            gatewayReady = true
             return
         }
-        if let activeSessionID,
-           let eventSessionID = event.sessionID,
-           eventSessionID != activeSessionID {
-            return
-        }
+        guard let activeSessionID, event.sessionID == activeSessionID else { return }
 
         switch event.type {
         case "message.start":
@@ -588,10 +1132,16 @@ public final class HermesAgentStore: ObservableObject {
         case "message.delta":
             appendAssistantDelta(event.payload["text"]?.stringValue ?? "")
         case "message.complete":
-            completeAssistantMessage(
-                text: event.payload["text"]?.stringValue,
-                reasoning: event.payload["reasoning"]?.stringValue
-            )
+            if event.payload["status"]?.stringValue == "error" {
+                recordGenericEventError()
+            } else {
+                completeAssistantMessage(
+                    text: event.payload["text"]?.stringValue,
+                    reasoning: event.payload["reasoning"]?.stringValue
+                )
+            }
+        case "reasoning.available", "reasoning.delta", "thinking.delta":
+            appendReasoningDelta(event.payload["text"]?.stringValue ?? "")
         case "tool.start":
             toolTraces.append(
                 HermesToolTrace(
@@ -613,47 +1163,349 @@ public final class HermesAgentStore: ObservableObject {
                 detail: Self.toolDetail(from: event.payload)
             )
         case "approval.request":
-            toolTraces.append(
-                HermesToolTrace(
-                    name: "Approval",
-                    status: .approval,
-                    detail: "Auto-approved by MTPLX Hermes mode."
-                )
-            )
-            if let sessionID = activeSessionID {
-                Task {
-                    _ = try? await rpc(
-                        "approval.respond",
-                        params: [
-                            "session_id": .string(sessionID),
-                            "choice": .string("allow"),
-                            "all": .bool(true),
-                        ]
-                    )
-                }
-            }
-        case "clarify.request", "sudo.request", "secret.request":
-            toolTraces.append(
-                HermesToolTrace(
-                    name: event.type.replacingOccurrences(of: ".request", with: ""),
-                    status: .waiting,
-                    detail: Self.toolDetail(from: event.payload)
-                )
-            )
+            handleApprovalRequest(event.payload, sessionID: activeSessionID)
+        case "clarify.request":
+            setPendingRequest(kind: .clarification, payload: event.payload)
+        case "sudo.request":
+            setPendingRequest(kind: .sudo, payload: event.payload)
+        case "secret.request":
+            setPendingRequest(kind: .secret, payload: event.payload)
+        case "approval.expire":
+            // Hermes does not emit approval expiry. Keep synthetic FIFO state.
+            break
+        case "clarify.expire":
+            expirePendingRequest(kind: .clarification, payload: event.payload)
+        case "sudo.expire":
+            expirePendingRequest(kind: .sudo, payload: event.payload)
+        case "secret.expire":
+            expirePendingRequest(kind: .secret, payload: event.payload)
         case "error":
-            messages.append(
-                HermesTranscriptMessage(
-                    role: .system,
-                    text: event.payload["message"]?.stringValue ?? "Hermes reported an error."
-                )
-            )
-            isStreaming = false
+            recordGenericEventError()
         case "session.info":
             if let key = event.payload["session_key"]?.stringValue {
                 activeSessionKey = key
             }
         default:
             break
+        }
+    }
+
+    private func handleApprovalRequest(_ payload: [String: JSONValue], sessionID: String) {
+        guard let profile = selectedProfile,
+              let operation = currentOperation(for: profile),
+              isCurrent(operation, sessionID: sessionID)
+        else { return }
+
+        let fingerprint = Self.autoApprovalRequestID(sessionID: sessionID, payload: payload)
+        let hasEarlierApproval = pendingRequestInbox.contains { $0.request.kind == .approval }
+        let autoEligible = hermesAutoApprove
+            && !hasEarlierApproval
+            && !approvalPipelineBlocked
+            && !isRetiredAutoApprovalFingerprint(fingerprint, for: operation, sessionID: sessionID)
+        enqueuePendingRequest(
+            HermesPendingRequest(
+                id: "approval-\(UUID().uuidString)",
+                kind: .approval,
+                prompt: payload["command"]?.stringValue ?? "Hermes requires approval.",
+                choices: Self.choices(from: payload)
+            ),
+            sessionID: sessionID,
+            operation: operation,
+            approvalFingerprint: fingerprint,
+            approvalAutoEligible: autoEligible
+        )
+    }
+
+    private func setPendingRequest(kind: HermesPendingRequestKind, payload: [String: JSONValue]) {
+        guard let requestID = payload["request_id"]?.stringValue, !requestID.isEmpty else { return }
+        let prompt: String
+        switch kind {
+        case .approval:
+            prompt = payload["command"]?.stringValue ?? "Hermes requires approval."
+        case .clarification:
+            prompt = payload["question"]?.stringValue ?? "Hermes needs clarification."
+        case .sudo:
+            prompt = payload["prompt"]?.stringValue ?? "Hermes requires sudo authentication."
+        case .secret:
+            prompt = payload["prompt"]?.stringValue ?? "Hermes requires a secret."
+        }
+        guard let profile = selectedProfile,
+              let operation = currentOperation(for: profile),
+              let sessionID = activeSessionID,
+              isCurrent(operation, sessionID: sessionID)
+        else { return }
+        enqueuePendingRequest(
+            HermesPendingRequest(id: requestID, kind: kind, prompt: prompt, choices: Self.choices(from: payload)),
+            sessionID: sessionID,
+            operation: operation,
+            approvalFingerprint: nil,
+            approvalAutoEligible: false
+        )
+    }
+
+    private func expirePendingRequest(kind: HermesPendingRequestKind, payload: [String: JSONValue]) {
+        guard let requestID = payload["request_id"]?.stringValue,
+              let index = pendingRequestInbox.firstIndex(where: {
+                  $0.request.id == requestID && $0.request.kind == kind
+              })
+        else { return }
+        let expired = pendingRequestInbox.remove(at: index)
+        if pendingRequest?.id == expired.request.id, pendingRequest?.kind == expired.request.kind {
+            pendingRequest = nil
+        }
+        processNextPendingRequest()
+    }
+
+    private func releasePendingResponseLease(_ lease: PendingRequestLease) {
+        guard let activeLease = pendingResponseLease,
+              activeLease.id == lease.id,
+              activeLease.kind == lease.kind,
+              activeLease.sessionID == lease.sessionID,
+              activeLease.operation.generation == lease.operation.generation,
+              activeLease.operation.clientIdentity == lease.operation.clientIdentity
+        else { return }
+        pendingResponseLease = nil
+        processNextPendingRequest()
+    }
+
+    private func reservePendingResponseLease(_ lease: PendingRequestLease) -> Bool {
+        guard pendingResponseLease == nil else { return false }
+        pendingResponseLease = lease
+        return true
+    }
+
+    private func enqueuePendingRequest(
+        _ request: HermesPendingRequest,
+        sessionID: String,
+        operation: GatewayOperation,
+        approvalFingerprint: String?,
+        approvalAutoEligible: Bool
+    ) {
+        guard pendingRequestInbox.count < Self.pendingRequestInboxLimit else {
+            blockApprovalPipelineForOverflow()
+            return
+        }
+        pendingRequestInbox.append(
+            PendingRequestInboxEntry(
+                request: request,
+                sessionID: sessionID,
+                operation: operation,
+                approvalFingerprint: approvalFingerprint,
+                approvalAutoEligible: approvalAutoEligible
+            )
+        )
+        processNextPendingRequest()
+    }
+
+    private func processNextPendingRequest() {
+        guard pendingResponseLease == nil,
+              let entry = pendingRequestInbox.first,
+              isCurrent(entry.operation, sessionID: entry.sessionID)
+        else { return }
+        guard entry.request.kind == .approval else {
+            projectInboxHead(entry)
+            return
+        }
+        guard !approvalPipelineBlocked else {
+            projectInboxHead(entry)
+            return
+        }
+        if entry.approvalAutoEligible, pendingRequest == nil, hermesAutoApprove, refreshActiveOwnership() {
+            let lease = PendingRequestLease(
+                id: entry.request.id, kind: .approval, sessionID: entry.sessionID, operation: entry.operation
+            )
+            guard reservePendingResponseLease(lease) else { return }
+            Task { [weak self] in
+                guard let self else { return }
+                defer { self.releasePendingResponseLease(lease) }
+                guard self.isCurrent(lease.operation, sessionID: lease.sessionID),
+                      self.refreshActiveOwnership()
+                else { return }
+                do {
+                    _ = try await self.rpc(
+                        lease.operation,
+                        method: "approval.respond",
+                        params: ["session_id": .string(lease.sessionID), "choice": .string("once")]
+                    )
+                    guard self.isCurrent(lease.operation, sessionID: lease.sessionID) else { return }
+                    self.completeInboxHead(lease)
+                } catch {
+                    guard self.isCurrent(lease.operation, sessionID: lease.sessionID) else { return }
+                    self.blockApprovalPipeline(afterAmbiguousResponseFor: lease)
+                }
+            }
+            return
+        }
+        projectInboxHead(entry)
+    }
+
+    private func projectInboxHead(_ entry: PendingRequestInboxEntry) {
+        guard pendingRequest == nil else { return }
+        if entry.request.kind == .approval { _ = refreshActiveOwnership() }
+        pendingRequest = entry.request
+        toolTraces.append(
+            HermesToolTrace(
+                name: Self.pendingToolName(for: entry.request.kind),
+                status: entry.request.kind == .approval ? .approval : .waiting,
+                detail: entry.request.prompt
+            )
+        )
+    }
+
+    private func completeInboxHead(_ lease: PendingRequestLease) {
+        guard let head = pendingRequestInbox.first,
+              head.request.id == lease.id,
+              head.request.kind == lease.kind,
+              head.sessionID == lease.sessionID,
+              head.operation.generation == lease.operation.generation,
+              head.operation.clientIdentity == lease.operation.clientIdentity
+        else { return }
+        pendingRequestInbox.removeFirst()
+        if let fingerprint = head.approvalFingerprint {
+            retireAutoApprovalFingerprint(fingerprint, for: lease.operation, sessionID: lease.sessionID)
+        }
+        if pendingRequest?.id == lease.id, pendingRequest?.kind == lease.kind { pendingRequest = nil }
+        processNextPendingRequest()
+    }
+
+    private func blockApprovalPipeline(afterAmbiguousResponseFor lease: PendingRequestLease) {
+        guard inboxHeadMatches(id: lease.id, kind: .approval, operation: lease.operation, sessionID: lease.sessionID) else { return }
+        retainBlockedApprovalRecovery()
+        forceApprovalTransportReset()
+    }
+
+    private func blockApprovalPipelineForOverflow() {
+        guard !approvalPipelineBlocked else { return }
+        retainBlockedApprovalRecovery()
+        forceApprovalTransportReset()
+    }
+
+    /// Atomically make the retained FIFO head actionable before releasing a
+    /// transport whose approval delivery is ambiguous (or whose inbox overflowed).
+    private func retainBlockedApprovalRecovery() {
+        let wasBlocked = approvalPipelineBlocked
+        approvalPipelineBlocked = true
+        pendingResponseLease = nil
+        if blockedApprovalRecovery == nil, let head = pendingRequestInbox.first {
+            blockedApprovalRecovery = BlockedApprovalRecovery(
+                profileID: head.operation.profileID,
+                nativeSessionID: head.sessionID,
+                savedSessionID: activeSessionKey
+            )
+        }
+        if let head = pendingRequestInbox.first,
+           pendingRequest?.id != head.request.id || pendingRequest?.kind != head.request.kind {
+            pendingRequest = nil
+            projectInboxHead(head)
+        }
+        if !wasBlocked {
+            messages.append(HermesTranscriptMessage(
+                role: .system,
+                text: "Hermes approval recovery is required. Reconnect before responding again."
+            ))
+        }
+    }
+
+    private func inboxHeadMatches(
+        id: String,
+        kind: HermesPendingRequestKind,
+        operation: GatewayOperation,
+        sessionID: String
+    ) -> Bool {
+        guard let head = pendingRequestInbox.first else { return false }
+        return head.request.id == id
+            && head.request.kind == kind
+            && head.sessionID == sessionID
+            && head.operation.generation == operation.generation
+            && head.operation.clientIdentity == operation.clientIdentity
+    }
+
+    private func forceApprovalTransportReset() {
+        gatewayGeneration += 1
+        let closingClient = client
+        let stoppingSidecar = sidecar
+        self.client = nil
+        self.sidecar = nil
+        sidecarProfileName = nil
+        sidecarConfigurationSignature = nil
+        gatewayReady = false
+        endStreaming()
+        closingClient?.close()
+        stoppingSidecar?.stop()
+    }
+
+    private func retireAutoApprovalFingerprint(
+        _ fingerprint: String,
+        for operation: GatewayOperation,
+        sessionID: String
+    ) {
+        pruneRetiredAutoApprovalFingerprints()
+        retiredAutoApprovalFingerprints.append(
+            RetiredAutoApprovalFingerprint(
+                fingerprint: fingerprint,
+                sessionID: sessionID,
+                operation: operation,
+                retiredAt: monotonicClock()
+            )
+        )
+        if retiredAutoApprovalFingerprints.count > Self.retiredApprovalFingerprintLimit {
+            retiredAutoApprovalFingerprints.removeFirst(retiredAutoApprovalFingerprints.count - Self.retiredApprovalFingerprintLimit)
+        }
+    }
+
+    private func isRetiredAutoApprovalFingerprint(
+        _ fingerprint: String,
+        for operation: GatewayOperation,
+        sessionID: String
+    ) -> Bool {
+        pruneRetiredAutoApprovalFingerprints()
+        return retiredAutoApprovalFingerprints.contains {
+            $0.fingerprint == fingerprint
+                && $0.sessionID == sessionID
+                && $0.operation.generation == operation.generation
+                && $0.operation.clientIdentity == operation.clientIdentity
+        }
+    }
+
+    private func pruneRetiredAutoApprovalFingerprints() {
+        let cutoff = monotonicClock() - 30
+        retiredAutoApprovalFingerprints.removeAll { $0.retiredAt < cutoff }
+    }
+
+    private func clearAutoApprovalLifecycle() {
+        pendingRequestInbox = []
+        retiredAutoApprovalFingerprints = []
+        approvalPipelineBlocked = false
+        blockedApprovalRecovery = nil
+    }
+
+    private func preservesBlockedApprovalRecovery(
+        for profile: HermesProfile,
+        savedSessionID: String? = nil
+    ) -> Bool {
+        guard approvalPipelineBlocked,
+              let blockedApprovalRecovery,
+              blockedApprovalRecovery.profileID == profile.id
+        else { return false }
+        if let savedSessionID {
+            return savedSessionID == blockedApprovalRecovery.nativeSessionID
+                || savedSessionID == blockedApprovalRecovery.savedSessionID
+        }
+        // `loadSessions` and `reconnect` express same-profile recovery without
+        // an explicit session transition. Do not depend on transient active
+        // session fields, which failed attempts intentionally clear.
+        return true
+    }
+
+    private func recordGenericEventError() {
+        endStreaming()
+        messages.append(HermesTranscriptMessage(role: .system, text: "Hermes reported an error."))
+    }
+
+    private func endStreaming() {
+        isStreaming = false
+        if messages.last?.role == .assistant, messages.last?.isStreaming == true {
+            messages[messages.count - 1].isStreaming = false
         }
     }
 
@@ -669,11 +1521,25 @@ public final class HermesAgentStore: ObservableObject {
         isStreaming = true
     }
 
+    private func appendReasoningDelta(_ delta: String) {
+        guard !delta.isEmpty else { return }
+        if let index = toolTraces.lastIndex(where: { $0.name == "Thought" && $0.status == .running }) {
+            toolTraces[index].detail += delta
+        } else {
+            toolTraces.append(HermesToolTrace(name: "Thought", status: .running, detail: delta))
+        }
+    }
+
     private func completeAssistantMessage(text: String?, reasoning: String?) {
         if let reasoning, !reasoning.isEmpty {
-            toolTraces.append(
-                HermesToolTrace(name: "Thought", status: .complete, detail: reasoning)
-            )
+            if let index = toolTraces.lastIndex(where: { $0.name == "Thought" && $0.status == .running }) {
+                toolTraces[index].detail = reasoning
+                toolTraces[index].status = .complete
+            } else {
+                toolTraces.append(HermesToolTrace(name: "Thought", status: .complete, detail: reasoning))
+            }
+        } else if let index = toolTraces.lastIndex(where: { $0.name == "Thought" && $0.status == .running }) {
+            toolTraces[index].status = .complete
         }
         let finalText = text ?? ""
         if messages.last?.role == .assistant {
@@ -686,10 +1552,15 @@ public final class HermesAgentStore: ObservableObject {
                 HermesTranscriptMessage(role: .assistant, text: finalText, isStreaming: false)
             )
         }
-        isStreaming = false
-        if let activeSessionID {
-            Task {
-                activeSessionKey = (try? await liveSessionKey(for: activeSessionID)) ?? activeSessionKey
+        endStreaming()
+        if let activeSessionID,
+           let profile = selectedProfile,
+           let operation = currentOperation(for: profile) {
+            Task { [weak self] in
+                guard let self else { return }
+                let key = try? await self.liveSessionKey(for: activeSessionID, operation: operation)
+                guard self.isCurrent(operation, sessionID: activeSessionID) else { return }
+                self.activeSessionKey = key ?? self.activeSessionKey
             }
         }
     }
@@ -767,6 +1638,31 @@ public final class HermesAgentStore: ObservableObject {
             ?? payload["tool"]?.stringValue
             ?? payload["command"]?.stringValue
             ?? "Tool"
+    }
+
+    private static func choices(from payload: [String: JSONValue]) -> [String] {
+        payload["choices"]?.arrayValue?.compactMap(\.stringValue) ?? []
+    }
+
+    private static func autoApprovalRequestID(sessionID: String, payload: [String: JSONValue]) -> String {
+        var hasher = Hasher()
+        hasher.combine(sessionID)
+        for key in ["command", "description", "pattern_key"] {
+            hasher.combine(payload[key]?.stringValue ?? "")
+        }
+        for choice in choices(from: payload) {
+            hasher.combine(choice)
+        }
+        return "auto-approval-\(hasher.finalize())"
+    }
+
+    private static func pendingToolName(for kind: HermesPendingRequestKind) -> String {
+        switch kind {
+        case .approval: "Approval"
+        case .clarification: "Clarification"
+        case .sudo: "Sudo"
+        case .secret: "Secret"
+        }
     }
 
     private static func toolDetail(from payload: [String: JSONValue]) -> String {

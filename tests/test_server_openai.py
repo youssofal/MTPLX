@@ -1408,8 +1408,26 @@ def test_anonymous_coding_agent_tool_sessions_keep_live_refs(monkeypatch):
             session_source="new",
             session_id="anon-opencode",
             tool_names=["bash", "read", "write"],
+            client_hint="opencode",
         )
         is True
+    )
+
+
+def test_anonymous_hermes_tool_sessions_use_snapshots_not_live_refs(monkeypatch):
+    monkeypatch.delenv(
+        "MTPLX_SESSIONBANK_LIVE_REFS_FOR_IMPLICIT_SESSIONS",
+        raising=False,
+    )
+
+    assert (
+        openai._session_keep_live_refs_for_request(
+            session_source="new",
+            session_id="anon-hermes",
+            tool_names=["bash", "read", "write"],
+            client_hint="hermes",
+        )
+        is False
     )
 
 

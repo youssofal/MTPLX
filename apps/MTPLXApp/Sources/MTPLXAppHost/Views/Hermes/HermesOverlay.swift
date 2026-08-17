@@ -4,6 +4,7 @@ import MTPLXAppCore
 
 struct HermesOverlay: View {
     @EnvironmentObject private var backend: MTPLXBackendStore
+    @EnvironmentObject private var hermes: HermesAgentStore
     let onCollapse: () -> Void
 
     var body: some View {
@@ -12,11 +13,16 @@ struct HermesOverlay: View {
             HermesPanel()
                 .background(Brand.bgOuter)
         }
+        // This is the root lifetime of the overlay, rather than a transient
+        // child view that SwiftUI may recreate while updating the surface.
+        .onDisappear {
+            Task { await hermes.stop() }
+        }
     }
 
     private var closeBar: some View {
         HStack(spacing: 8) {
-            ChatCloseButton(action: onCollapse)
+            ChatCloseButton(action: collapseAndStop)
             Spacer()
             approvalToggle
         }
@@ -31,6 +37,13 @@ struct HermesOverlay: View {
                     alignment: .bottom
                 )
         )
+    }
+
+    private func collapseAndStop() {
+        Task {
+            await hermes.stop()
+            onCollapse()
+        }
     }
 
     /// Auto-approve ("YOLO") toggle. On = Hermes runs its tools without
@@ -77,6 +90,8 @@ struct HermesPanel: View {
     @EnvironmentObject private var router: AppRouter
 
     @State private var composerText = ""
+    @State private var pendingResponseText = ""
+    @State private var pendingSubmissionID: String?
     @State private var createProfileName = ""
     @State private var creatingProfile = false
     @State private var localError: String?
@@ -118,6 +133,9 @@ struct HermesPanel: View {
                 remember(reference)
             }
         }
+        .onChange(of: hermes.pendingRequest?.id) { _, _ in
+            pendingResponseText = ""
+        }
     }
 
     private var sidebar: some View {
@@ -137,8 +155,6 @@ struct HermesPanel: View {
 
             if case .needsSetup = hermes.connectionState {
                 setupBlock
-            } else if !HermesIntegration.nativeDashboardSupported {
-                terminalHandoffBlock
             } else {
                 profileList
                 sessionList
@@ -173,8 +189,8 @@ struct HermesPanel: View {
             Text("Gateway connected")
                 .font(.caption)
                 .foregroundStyle(Brand.success)
-        case .failed(let message):
-            Text(message)
+        case .failed:
+            Text("Hermes connection failed")
                 .font(.caption)
                 .foregroundStyle(Brand.warning)
                 .fixedSize(horizontal: false, vertical: true)
@@ -355,37 +371,6 @@ struct HermesPanel: View {
         }
     }
 
-    private var terminalHandoffBlock: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            sectionLabel("Agent")
-            capabilityRow(
-                "Status",
-                hermes.terminalAgentRunning
-                    ? "Chatting in your Terminal window"
-                    : "Ready to start"
-            )
-            capabilityRow(
-                "Where",
-                "Hermes chats in a Terminal window. This panel shows its tools, messaging, and status."
-            )
-            capabilityRow(
-                "Messaging",
-                "To text Hermes from Telegram, set it up once with Hermes, then check the status above.",
-                color: Brand.typeSecondary
-            )
-        }
-        .padding(12)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Brand.cardSurface.opacity(0.72))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .stroke(Brand.separator, lineWidth: 0.75)
-                )
-        )
-        .padding(.horizontal, 16)
-    }
-
     private func capabilityRow(
         _ label: String,
         _ value: String,
@@ -427,12 +412,20 @@ struct HermesPanel: View {
                                 .truncationMode(.middle)
                         }
                         Spacer(minLength: 0)
+                        Text(routeLabel(for: hermes.profileRoutingStates[profile.id] ?? .external))
+                            .font(.system(size: 9, weight: .heavy, design: .monospaced))
+                            .foregroundStyle(routeColor(for: profile))
                     }
                     .padding(.horizontal, 10)
                     .padding(.vertical, 8)
                     .background(profileSelectionBackground(profile))
                 }
                 .buttonStyle(.plain)
+                .disabled(profileUnavailable(profile))
+                .help(profileUnavailable(profile)
+                    ? "This profile cannot be started safely."
+                    : "Select \(profile.name) profile")
+                .accessibilityLabel("\(profile.name), \(routeLabel(for: hermes.profileRoutingStates[profile.id] ?? .external))")
             }
         }
         .padding(.horizontal, 12)
@@ -454,6 +447,8 @@ struct HermesPanel: View {
                 }
                 .buttonStyle(.plain)
                 .help("New Agent")
+                .accessibilityLabel("Create a new Hermes agent")
+                .disabled(hermes.selectedProfile.map(profileUnavailable) ?? true)
             }
             if hermes.sessions.isEmpty {
                 Text("No saved agents")
@@ -471,6 +466,8 @@ struct HermesPanel: View {
                                 sessionRow(session)
                             }
                             .buttonStyle(.plain)
+                            .help("Resume \(session.title.isEmpty ? "Untitled Agent" : session.title)")
+                            .accessibilityLabel("\(session.title.isEmpty ? "Untitled Agent" : session.title), \(activityLabel(session.activity))")
                         }
                     }
                     .padding(.bottom, 4)
@@ -536,6 +533,14 @@ struct HermesPanel: View {
                     .foregroundStyle(Brand.typeTertiary)
             }
             Spacer()
+            if let profile = hermes.selectedProfile {
+                Text(routeLabel(for: hermes.profileRoutingStates[profile.id] ?? .external))
+                    .font(.system(size: 9, weight: .heavy, design: .monospaced))
+                    .foregroundStyle(routeColor(for: profile))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Capsule().fill(Brand.cardSurface))
+            }
             if let value = backend.headlineDecode.value {
                 Text(String(format: "%.1f tok/s", value))
                     .font(.system(.caption, design: .monospaced).weight(.bold))
@@ -601,77 +606,279 @@ struct HermesPanel: View {
 
     @ViewBuilder
     private var composer: some View {
-        if !HermesIntegration.nativeDashboardSupported {
-            HStack(spacing: 9) {
-                Image(systemName: "terminal")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(Brand.typeSecondary)
-                Text("Hermes is chatting in your Terminal window — this panel shows its status and setup.")
-                    .font(.system(.callout, design: .rounded))
-                    .foregroundStyle(Brand.typeSecondary)
-                Spacer(minLength: 0)
+        if let pendingRequest = hermes.pendingRequest {
+            pendingRequestCard(pendingRequest)
+        } else if case .failed = hermes.connectionState {
+            reconnectBlock
+        } else if let reason = hermes.readOnlyReason {
+            readOnlyComposer(reason: reason)
+        } else {
+            HStack(alignment: .bottom, spacing: 10) {
+                TextEditor(text: $composerText)
+                    .font(.system(.body, design: .rounded))
+                    .foregroundStyle(Brand.typeBody)
+                    .scrollContentBackground(.hidden)
+                    .frame(minHeight: 54, maxHeight: 110)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .fill(Brand.bgInner)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                    .stroke(Brand.separatorStrong, lineWidth: 1)
+                            )
+                    )
+                    .disabled(!composerAcceptsInput)
+                    .accessibilityLabel("Message Hermes")
+                Button {
+                    Task { await send() }
+                } label: {
+                    Image(systemName: hermes.isStreaming ? "stop.fill" : "arrow.up")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 36, height: 36)
+                        .background(Circle().fill(canSend ? Brand.accentChrome : Brand.typeTertiary.opacity(0.45)))
+                }
+                .buttonStyle(.plain)
+                .disabled(!canSend && !hermes.isStreaming)
+                .help(hermes.isStreaming ? "Stop Hermes" : composerDisabledHelp)
+                .accessibilityLabel(hermes.isStreaming ? "Stop Hermes" : "Send message")
             }
             .padding(.horizontal, 24)
-            .padding(.vertical, 14)
-            .background(
-                Brand.bgInner
-                    .overlay(
-                        Rectangle()
-                            .fill(Brand.separator)
-                            .frame(height: Brand.hairline),
-                        alignment: .top
-                    )
-            )
-        } else {
-        HStack(alignment: .bottom, spacing: 10) {
-            TextEditor(text: $composerText)
-                .font(.system(.body, design: .rounded))
-                .foregroundStyle(Brand.typeBody)
-                .scrollContentBackground(.hidden)
-                .frame(minHeight: 54, maxHeight: 110)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 6)
-                .background(
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .fill(Brand.bgInner)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                .stroke(Brand.separatorStrong, lineWidth: 1)
-                        )
-                )
-                .disabled(hermes.activeSessionID == nil || !hermes.gatewayReady)
-            Button {
-                Task { await send() }
-            } label: {
-                Image(systemName: hermes.isStreaming ? "stop.fill" : "arrow.up")
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundStyle(.white)
-                    .frame(width: 36, height: 36)
-                    .background(Circle().fill(canSend ? Brand.accentChrome : Brand.typeTertiary.opacity(0.45)))
-            }
-            .buttonStyle(.plain)
-            .disabled(!canSend && !hermes.isStreaming)
-            .help(hermes.isStreaming ? "Stop" : "Send")
-        }
-        .padding(.horizontal, 24)
-        .padding(.vertical, 16)
-        .background(
-            Brand.bgInner
-                .overlay(
-                    Rectangle()
-                        .fill(Brand.separator)
-                        .frame(height: Brand.hairline),
-                    alignment: .top
-                )
-        )
+            .padding(.vertical, 16)
+            .background(composerBackground)
         }
     }
 
     private var canSend: Bool {
         if hermes.isStreaming { return true }
-        return hermes.activeSessionID != nil
-            && hermes.gatewayReady
+        return composerAcceptsInput
             && !composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// A selected profile is enough to begin composing. If no agent is active
+    /// yet, `send()` creates one before submitting the first prompt. Existing
+    /// sessions still have to pass the ownership checks in `HermesAgentStore`.
+    private var composerAcceptsInput: Bool {
+        HermesComposerPolicy.acceptsInput(
+            gatewayReady: hermes.gatewayReady,
+            hasPendingRequest: hermes.pendingRequest != nil,
+            activeSessionWritable: hermes.activeSessionWritable,
+            hasActiveSession: hermes.activeSessionID != nil,
+            hasAvailableProfile: hermes.selectedProfile.map { !profileUnavailable($0) } ?? false
+        )
+    }
+
+    private var composerBackground: some View {
+        Brand.bgInner
+            .overlay(
+                Rectangle()
+                    .fill(Brand.separator)
+                    .frame(height: Brand.hairline),
+                alignment: .top
+            )
+    }
+
+    private var composerDisabledHelp: String {
+        if !hermes.gatewayReady { return "Hermes is not connected yet." }
+        if hermes.pendingRequest != nil { return "Respond to the pending Hermes request first." }
+        if hermes.readOnlyReason != nil { return "This session is read-only. Create a new agent to continue." }
+        if hermes.activeSessionID == nil, hermes.selectedProfile == nil { return "Select a Hermes profile first." }
+        if hermes.activeSessionID == nil { return "Enter a message to start a new Hermes agent." }
+        if composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "Enter a message to send." }
+        return "A writable Hermes agent is required."
+    }
+
+    private func readOnlyComposer(reason: String) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: "lock.fill")
+                .foregroundStyle(Brand.warning)
+            Text(reason)
+                .font(.callout)
+                .foregroundStyle(Brand.typeSecondary)
+            Spacer(minLength: 0)
+            Button("New Agent") {
+                Task { await startNew() }
+            }
+            .buttonStyle(.bordered)
+            .disabled(hermes.selectedProfile.map(profileUnavailable) ?? true)
+            .help("Create a new writable Hermes agent")
+            .accessibilityLabel("Create a new writable Hermes agent")
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 14)
+        .background(composerBackground)
+    }
+
+    private var reconnectBlock: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "wifi.exclamationmark")
+                .foregroundStyle(Brand.warning)
+            Text("Hermes disconnected. Your transcript is still available.")
+                .font(.callout)
+                .foregroundStyle(Brand.typeSecondary)
+            Spacer(minLength: 0)
+            Button("Reconnect") {
+                Task { await reconnect() }
+            }
+            .buttonStyle(.bordered)
+            .help("Reconnect to the selected Hermes profile")
+            .accessibilityLabel("Reconnect to Hermes")
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 14)
+        .background(composerBackground)
+    }
+
+    @ViewBuilder
+    private func pendingRequestCard(_ request: HermesPendingRequest) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: pendingRequestIcon(request.kind))
+                    .foregroundStyle(Brand.warning)
+                Text(pendingRequestTitle(request.kind))
+                    .font(.system(.callout, design: .rounded).weight(.semibold))
+                    .foregroundStyle(Brand.typeBody)
+            }
+            Text(request.prompt)
+                .font(.callout)
+                .foregroundStyle(Brand.typeSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if hermes.approvalPipelineBlocked {
+                HStack(spacing: 10) {
+                    Text("Approval recovery is required before another response can be sent.")
+                        .font(.caption)
+                        .foregroundStyle(Brand.warning)
+                    Spacer(minLength: 0)
+                    Button("Reconnect") { Task { await reconnect() } }
+                        .buttonStyle(.bordered)
+                        .help("Reconnect before responding to this approval")
+                }
+            } else {
+                pendingRequestControls(request)
+            }
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 14)
+        .background(composerBackground)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Pending \(pendingRequestTitle(request.kind)) request")
+    }
+
+    @ViewBuilder
+    private func pendingRequestControls(_ request: HermesPendingRequest) -> some View {
+        switch request.kind {
+        case .approval:
+            HStack(spacing: 8) {
+                ForEach(request.choices.filter { $0.lowercased() != "deny" }, id: \.self) { choice in
+                    Button(choice.capitalized) {
+                        Task { await submitPendingRequest(request, value: choice) }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!pendingRequestActionsEnabled(request))
+                    .help("Allow this Hermes action: \(choice)")
+                    .accessibilityLabel("Allow action: \(choice)")
+                }
+                Button("Deny") {
+                    Task { await submitPendingRequest(request, value: "deny", isDenial: true) }
+                }
+                .buttonStyle(.bordered)
+                .disabled(!pendingRequestActionsEnabled(request))
+                .help("Deny this Hermes action")
+                .accessibilityLabel("Deny Hermes action")
+            }
+        case .clarification:
+            pendingTextResponse(
+                label: "Clarification",
+                placeholder: "Type your answer",
+                sensitive: false,
+                request: request
+            )
+        case .sudo:
+            pendingTextResponse(
+                label: "Sudo password",
+                placeholder: "Enter password",
+                sensitive: true,
+                request: request
+            )
+        case .secret:
+            pendingTextResponse(
+                label: "Secret",
+                placeholder: "Enter secret",
+                sensitive: true,
+                request: request
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func pendingTextResponse(
+        label: String,
+        placeholder: String,
+        sensitive: Bool,
+        request: HermesPendingRequest
+    ) -> some View {
+        HStack(spacing: 8) {
+            if sensitive {
+                SecureField(placeholder, text: $pendingResponseText)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(!pendingRequestActionsEnabled(request))
+                    .accessibilityLabel(label)
+            } else {
+                TextField(placeholder, text: $pendingResponseText)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(!pendingRequestActionsEnabled(request))
+                    .accessibilityLabel(label)
+            }
+            Button("Submit") {
+                submitPendingTextResponse(request)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(pendingResponseText.isEmpty || !pendingRequestActionsEnabled(request))
+            .keyboardShortcut(.defaultAction)
+            .help("Submit \(label.lowercased()) to Hermes")
+            .accessibilityLabel("Submit \(label.lowercased())")
+        }
+    }
+
+    private func submitPendingTextResponse(_ request: HermesPendingRequest) {
+        guard pendingRequestActionsEnabled(request) else { return }
+        let value = pendingResponseText
+        pendingResponseText = ""
+        Task { await submitPendingRequest(request, value: value) }
+    }
+
+    private func pendingRequestActionsEnabled(_ request: HermesPendingRequest) -> Bool {
+        pendingSubmissionID == nil
+            && hermes.pendingRequest?.id == request.id
+            && hermes.pendingRequest?.kind == request.kind
+            && hermes.activeSessionWritable
+            && hermes.gatewayReady
+            && !hermes.approvalPipelineBlocked
+    }
+
+    private func submitPendingRequest(
+        _ request: HermesPendingRequest,
+        value: String,
+        isDenial: Bool = false
+    ) async {
+        guard pendingRequestActionsEnabled(request) else { return }
+        let submissionID = request.id
+        pendingSubmissionID = submissionID
+        defer {
+            // A completion from an old request must never mutate the state of
+            // a newer card. Its ID is the local submission lifecycle token.
+            if pendingSubmissionID == submissionID {
+                pendingSubmissionID = nil
+            }
+        }
+        if isDenial {
+            await hermes.denyPendingApproval()
+        } else {
+            await hermes.respondToPendingRequest(value: value)
+        }
     }
 
     private var emptyTranscript: some View {
@@ -682,19 +889,19 @@ struct HermesPanel: View {
                     .overlay {
                         Circle().strokeBorder(Brand.accentChrome.opacity(0.30), lineWidth: Brand.hairline)
                     }
-                Image(systemName: "terminal")
+                Image(systemName: "bubble.left.and.bubble.right")
                     .font(.system(size: 26, weight: .semibold))
                     .foregroundStyle(Brand.accentChrome)
             }
             .frame(width: 72, height: 72)
 
-            Text(hermes.terminalAgentRunning ? "Hermes is in your Terminal" : "Start Hermes")
+            Text(hermes.selectedProfile == nil ? "Select a Hermes Profile" : "Start a Hermes Agent")
                 .font(.system(.title3, design: .rounded).weight(.semibold))
                 .foregroundStyle(Brand.typeBody)
 
-            Text(hermes.terminalAgentRunning
-                ? "Your Hermes agent is chatting in a Terminal window. Switch to it to keep going, or open a fresh one."
-                : "Hermes runs in a Terminal window with file, web, browser, and messaging tools. Open it to start chatting.")
+            Text(hermes.selectedProfile == nil
+                ? "Choose a readable profile to load its saved agents."
+                : "Create a new agent or resume a saved one to chat directly in MTPLX.")
                 .font(.callout)
                 .foregroundStyle(Brand.typeSecondary)
                 .multilineTextAlignment(.center)
@@ -702,32 +909,21 @@ struct HermesPanel: View {
                 .frame(maxWidth: 420)
 
             Button {
-                Task { await openTerminal() }
+                Task { await startNew() }
             } label: {
                 HStack(spacing: 8) {
-                    Image(systemName: "arrow.up.forward.app")
+                    Image(systemName: "plus")
                         .font(.system(size: 12, weight: .bold))
-                    Text(hermes.terminalAgentRunning ? "Open a new Terminal" : "Open Hermes in Terminal")
+                    Text("New Agent")
                 }
             }
             .buttonStyle(.mtplxPrimary)
             .padding(.top, 2)
+            .disabled(hermes.selectedProfile.map(profileUnavailable) ?? true)
+            .help(hermes.selectedProfile == nil ? "Select a profile first." : "Create a new Hermes agent")
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
         .padding(40)
-    }
-
-    /// Open (or re-open) Hermes in a Terminal window. When the daemon is
-    /// stopped, starting it with the Hermes target already spawns the
-    /// Terminal handoff, so we just start; when it's already running we
-    /// launch a fresh Terminal directly.
-    private func openTerminal() async {
-        localError = nil
-        if backend.daemonState.kind != .running {
-            guard await ensureDaemonReady() else { return }
-            return
-        }
-        hermes.openTerminal(configuration: backend.configuration)
     }
 
     private var toolTimeline: some View {
@@ -767,7 +963,6 @@ struct HermesPanel: View {
     private func prepare() async {
         await hermes.prepare(configuration: backend.configuration)
         guard case .needsSetup = hermes.connectionState else {
-            guard HermesIntegration.nativeDashboardSupported else { return }
             guard router.hermesLaunchIntent == .resumeLast else {
                 if let profile = hermes.selectedProfile,
                    await ensureDaemonReady() {
@@ -784,32 +979,48 @@ struct HermesPanel: View {
 
     private func selectProfile(_ profile: HermesProfile) async {
         localError = nil
+        guard !profileUnavailable(profile) else {
+            localError = "This Hermes profile is unavailable."
+            return
+        }
+        rememberProfileSelection(profile)
         guard await ensureDaemonReady() else { return }
         await hermes.loadSessions(profile: profile, configuration: backend.configuration)
     }
 
     private func ensureDaemonReady() async -> Bool {
         guard backend.daemonState.kind != .running else { return true }
-        await backend.startDaemon(target: .hermes)
-        if backend.daemonState.kind == .running {
-            return true
+        await backend.startDaemon(target: nil)
+        guard backend.daemonState.kind == .running else {
+            localError = "MTPLX is not ready yet."
+            return false
         }
-        localError = "MTPLX is not ready yet."
-        return false
+        return true
     }
 
     private func startNew() async {
-        guard let profile = hermes.selectedProfile else { return }
+        _ = await startNewIfPossible()
+    }
+
+    @discardableResult
+    private func startNewIfPossible() async -> Bool {
+        guard let profile = hermes.selectedProfile else { return false }
         localError = nil
-        guard await ensureDaemonReady() else { return }
+        guard !profileUnavailable(profile) else {
+            localError = "This Hermes profile is unavailable."
+            return false
+        }
+        guard await ensureDaemonReady() else { return false }
         do {
             let reference = try await hermes.startNewAgent(
                 profile: profile,
                 configuration: backend.configuration
             )
             remember(reference)
+            return true
         } catch {
-            localError = error.localizedDescription
+            localError = "Hermes could not create a new agent. Try again."
+            return false
         }
     }
 
@@ -825,7 +1036,17 @@ struct HermesPanel: View {
             )
             remember(reference)
         } catch {
-            localError = error.localizedDescription
+            localError = "Hermes could not resume this agent. Try again."
+        }
+    }
+
+    private func reconnect() async {
+        localError = nil
+        guard await ensureDaemonReady() else { return }
+        do {
+            try await hermes.reconnect(configuration: backend.configuration)
+        } catch {
+            localError = "Hermes could not reconnect. Try again."
         }
     }
 
@@ -836,7 +1057,7 @@ struct HermesPanel: View {
             let reference = try await hermes.resumeLast(configuration: backend.configuration)
             remember(reference)
         } catch {
-            localError = error.localizedDescription
+            localError = "Hermes could not resume the last agent. Try again."
             router.hermesLaunchIntent = .browse
         }
     }
@@ -847,16 +1068,26 @@ struct HermesPanel: View {
             return
         }
         let text = composerText
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        if !hermes.activeSessionWritable {
+            guard hermes.activeSessionID == nil,
+                  await startNewIfPossible()
+            else { return }
+        }
+        guard hermes.activeSessionWritable, hermes.gatewayReady else { return }
         composerText = ""
         await hermes.send(text)
     }
 
     private func remember(_ reference: HermesSessionReference) {
         var config = backend.configuration
-        config.lastLaunchTarget = LaunchTarget.hermes.rawValue
-        config.lastHermesProfile = reference.profileName
-        config.lastHermesSessionID = reference.sessionID
-        config.lastHermesSessionTitle = reference.title
+        config.rememberEmbeddedHermesSession(reference)
+        try? backend.saveSettings(config)
+    }
+
+    private func rememberProfileSelection(_ profile: HermesProfile) {
+        var config = backend.configuration
+        config.rememberHermesProfileSelection(profile.name)
         try? backend.saveSettings(config)
     }
 
@@ -880,6 +1111,62 @@ struct HermesPanel: View {
             )
     }
 
+    private func profileUnavailable(_ profile: HermesProfile) -> Bool {
+        if case .unavailable = hermes.profileRoutingStates[profile.id] { return true }
+        return false
+    }
+
+    private func routeLabel(for route: HermesProfileRoutingState) -> String {
+        switch route {
+        case .mtplx: "MTPLX"
+        case .external: "External"
+        case .unavailable: "Unavailable"
+        }
+    }
+
+    private func routeColor(for profile: HermesProfile) -> Color {
+        switch hermes.profileRoutingStates[profile.id] ?? .external {
+        case .mtplx: Brand.success
+        case .external: Brand.typeSecondary
+        case .unavailable: Brand.warning
+        }
+    }
+
+    private func activityLabel(_ activity: HermesSessionActivityState) -> String {
+        switch activity {
+        case .ready: "Ready"
+        case .runningInMTPLX: "Running in MTPLX"
+        case .externallyActive: "Externally active"
+        case .ownershipUnknown: "Ownership unknown"
+        }
+    }
+
+    private func activityColor(_ activity: HermesSessionActivityState) -> Color {
+        switch activity {
+        case .ready: Brand.success
+        case .runningInMTPLX: Brand.accentChrome
+        case .externallyActive, .ownershipUnknown: Brand.warning
+        }
+    }
+
+    private func pendingRequestTitle(_ kind: HermesPendingRequestKind) -> String {
+        switch kind {
+        case .approval: "Approval needed"
+        case .clarification: "Clarification needed"
+        case .sudo: "Sudo authentication needed"
+        case .secret: "Secret needed"
+        }
+    }
+
+    private func pendingRequestIcon(_ kind: HermesPendingRequestKind) -> String {
+        switch kind {
+        case .approval: "checkmark.shield"
+        case .clarification: "questionmark.bubble"
+        case .sudo: "lock.shield"
+        case .secret: "key.fill"
+        }
+    }
+
     private func sessionRow(_ session: HermesSavedSession) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
@@ -892,6 +1179,9 @@ struct HermesPanel: View {
                     .font(.system(size: 10, weight: .bold, design: .monospaced))
                     .foregroundStyle(Brand.typeTertiary)
             }
+            Text(activityLabel(session.activity))
+                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                .foregroundStyle(activityColor(session.activity))
             if !session.preview.isEmpty {
                 Text(session.preview)
                     .font(.caption)

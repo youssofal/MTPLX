@@ -1684,7 +1684,9 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertTrue(command.arguments.containsInOrder(["--app-launch-id", "hermes-launch"]))
         XCTAssertEqual(command.environment["MTPLX_CLIENT"], "hermes")
         XCTAssertEqual(command.environment["MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE"], "async_per_head")
-        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_MAX_ENTRIES"], "32")
+        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_MAX_ENTRIES"], "6")
+        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_MAX_BYTES"], "8G")
+        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_PER_SESSION_BYTES"], "3G")
     }
 
     func testCommandBuilderBenchmarkPresetStartsSoloBenchmarkDaemon() throws {
@@ -2664,6 +2666,7 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(environment["OPENAI_API_KEY"], PiIntegration.localAPIKey)
         XCTAssertEqual(environment["HERMES_MODEL"], "mtplx-qwen36-27b-optimized-speed")
         XCTAssertEqual(environment["HERMES_INFERENCE_MODEL"], "mtplx-qwen36-27b-optimized-speed")
+        XCTAssertEqual(environment["HERMES_TUI_PROVIDER"], "custom")
         XCTAssertEqual(environment["HERMES_INFERENCE_PROVIDER"], "custom")
         XCTAssertEqual(environment["HERMES_YOLO_MODE"], "1")
         XCTAssertEqual(environment["HERMES_MTPLX_TOOLSETS"], "terminal,file,web,browser,messaging")
@@ -2744,6 +2747,7 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertTrue(configText.contains("tool_use_enforcement: auto"))
         XCTAssertTrue(configText.contains("cwd: '\(workspace.path)'"))
         XCTAssertTrue(configText.contains("show_reasoning: true"))
+        XCTAssertTrue(envText.contains("HERMES_TUI_PROVIDER=custom"))
         XCTAssertTrue(envText.contains("HERMES_INFERENCE_PROVIDER=custom"))
         XCTAssertTrue(envText.contains("HERMES_MTPLX_REASONING=\"auto\""))
         XCTAssertTrue(envText.contains("HERMES_MTPLX_SHOW_REASONING=1"))
@@ -2774,6 +2778,52 @@ final class MTPLXAppCoreTests: XCTestCase {
         )
         XCTAssertTrue(channelDirectoryText.contains("launch-room"))
         XCTAssertEqual(integration.discoverProfiles().map(\.name), ["default", "mtplx", "research"])
+    }
+
+    // The Hermes CLI writes `base_url: ''` for provider profiles without a
+    // custom endpoint (for example openai-codex). The routing parser used to
+    // reject the quoted empty scalar and mark the whole profile unavailable,
+    // which disabled it in the profile picker and hid its sessions.
+    func testRoutingStateToleratesExplicitlyEmptyBaseURL() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let hermesHome = root.appendingPathComponent("hermes", isDirectory: true)
+        let profileURL = hermesHome
+            .appendingPathComponent("profiles", isDirectory: true)
+            .appendingPathComponent("bernd", isDirectory: true)
+        try FileManager.default.createDirectory(at: profileURL, withIntermediateDirectories: true)
+        try """
+        model:
+          provider: openai-codex
+          default: gpt-5.6-sol
+          base_url: ''
+        """.write(to: profileURL.appendingPathComponent("config.yaml"), atomically: true, encoding: .utf8)
+
+        let integration = HermesIntegration(
+            hermesHome: hermesHome,
+            environment: [
+                "HOME": root.path,
+                "PATH": "/usr/bin:/bin",
+            ],
+            terminalCommandURL: root.appendingPathComponent(".mtplx").appendingPathComponent("open-hermes.command")
+        )
+        let profile = HermesProfile(name: "bernd", path: profileURL.path, isDefault: false)
+        let state = integration.routingState(
+            for: profile,
+            configuration: MTPLXAppConfiguration(
+                model: "/models/Qwen3.6-27B-MTPLX-Optimized-Speed",
+                host: "127.0.0.1",
+                port: 8123,
+                apiKey: "",
+                hermesWorkspacePath: root.path
+            )
+        )
+        guard case .external = state else {
+            XCTFail("expected .external for explicitly empty base_url, got \(state)")
+            return
+        }
     }
 
     // Issue #131: the app regenerated the Hermes profile config from its
@@ -3928,6 +3978,48 @@ final class MTPLXAppCoreTests: XCTestCase {
         )
 
         XCTAssertEqual(backend.settingsURL, expected)
+    }
+
+    func testRememberingEmbeddedHermesSessionPreservesExistingLaunchTarget() {
+        var configuration = MTPLXAppConfiguration(
+            lastLaunchTarget: LaunchTarget.openCode.rawValue,
+            lastHermesProfile: "old-profile",
+            lastHermesSessionID: "old-session",
+            lastHermesSessionTitle: "Old agent"
+        )
+
+        configuration.rememberEmbeddedHermesSession(
+            HermesSessionReference(
+                profileName: "bernd",
+                sessionID: "session-123",
+                title: "Fix the app"
+            )
+        )
+
+        XCTAssertEqual(configuration.lastLaunchTarget, LaunchTarget.openCode.rawValue)
+        XCTAssertEqual(configuration.lastHermesProfile, "bernd")
+        XCTAssertEqual(configuration.lastHermesSessionID, "session-123")
+        XCTAssertEqual(configuration.lastHermesSessionTitle, "Fix the app")
+    }
+
+    func testRememberingHermesProfileSelectionClearsOnlyCrossProfileSessionState() {
+        var configuration = MTPLXAppConfiguration(
+            lastLaunchTarget: LaunchTarget.openCode.rawValue,
+            lastHermesProfile: "bernd",
+            lastHermesSessionID: "session-123",
+            lastHermesSessionTitle: "Fix the app"
+        )
+
+        configuration.rememberHermesProfileSelection("bernd")
+        XCTAssertEqual(configuration.lastHermesSessionID, "session-123")
+        XCTAssertEqual(configuration.lastHermesSessionTitle, "Fix the app")
+
+        configuration.rememberHermesProfileSelection("researcher")
+
+        XCTAssertEqual(configuration.lastLaunchTarget, LaunchTarget.openCode.rawValue)
+        XCTAssertEqual(configuration.lastHermesProfile, "researcher")
+        XCTAssertNil(configuration.lastHermesSessionID)
+        XCTAssertNil(configuration.lastHermesSessionTitle)
     }
 
     func testAppConfigurationPersistsHermesResumeState() throws {
