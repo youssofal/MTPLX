@@ -13,7 +13,7 @@ struct BenchHeaderStat: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(label)
+            Text(label.mtplxLocalized)
                 .font(.system(size: 9, weight: .heavy, design: .monospaced))
                 .tracking(1.4)
                 .foregroundStyle(Brand.typeTertiary)

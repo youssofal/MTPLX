@@ -23,7 +23,7 @@ struct HBarRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text(label)
+                Text(label.mtplxLocalized)
                     .font(.system(.caption, design: .rounded).weight(.bold))
                     .foregroundStyle(Brand.typeBody)
                 Spacer()

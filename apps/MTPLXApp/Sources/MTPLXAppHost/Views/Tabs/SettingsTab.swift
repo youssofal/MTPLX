@@ -522,7 +522,7 @@ struct SettingsTab: View {
                 ) {
                     Picker("Quantization", selection: kvQuantSelectionBinding(policy)) {
                         ForEach(modes, id: \.self) { mode in
-                            Text(Self.kvQuantDisplayLabel(mode)).tag(mode)
+                            Text(Self.kvQuantDisplayLabel(mode).mtplxLocalized).tag(mode)
                         }
                     }
                     .pickerStyle(.segmented)
@@ -536,7 +536,7 @@ struct SettingsTab: View {
                 HStack(spacing: 8) {
                     Image(systemName: "memorychip")
                         .foregroundStyle(Brand.typeSecondary)
-                    Text(kvQuantCaption)
+                    Text(kvQuantCaption.mtplxLocalized)
                         .font(.caption)
                         .foregroundStyle(Brand.typeSecondary)
                     Spacer()
@@ -601,7 +601,12 @@ struct SettingsTab: View {
                         .monospacedDigit()
                         .foregroundStyle(Brand.typeBody)
                     let entries = bank.entries ?? bank.prefixes?.count ?? 0
-                    Text("· \(entries) entr\(entries == 1 ? "y" : "ies")")
+                    Text(
+                        String(
+                            format: (entries == 1 ? "· %d entry" : "· %d entries").mtplxLocalized,
+                            entries
+                        )
+                    )
                         .font(.caption)
                         .foregroundStyle(Brand.typeSecondary)
                     if let maxBytes = bank.maxBytes {
@@ -827,7 +832,12 @@ struct SettingsTab: View {
                             .foregroundStyle(Brand.typeSecondary)
                     }
                     if let entries = cold.entries {
-                        Text("\u{00B7} \(entries) entr\(entries == 1 ? "y" : "ies")")
+                        Text(
+                            String(
+                                format: (entries == 1 ? "· %d entry" : "· %d entries").mtplxLocalized,
+                                entries
+                            )
+                        )
                             .font(.caption)
                             .foregroundStyle(Brand.typeSecondary)
                     }
@@ -957,8 +967,13 @@ struct SettingsTab: View {
         let dirty = settingsDirty
         let running = backend.daemonState.kind == .running || backend.daemonState.kind == .warming
 
-        Card("Restart-Required Settings",
-             subtitle: "Changing these restarts the engine. Changes are saved to \(settingsFilePathHint).") {
+        Card(
+            "Restart-Required Settings",
+            subtitle: String(
+                format: "Changing these restarts the engine. Changes are saved to %@.".mtplxLocalized,
+                settingsFilePathHint
+            )
+        ) {
             HStack(spacing: 8) {
                 if dirty {
                     PillBadge(text: "unsaved", systemImage: "circle.fill", tint: .mtplxWarning, emphasized: true)
@@ -1180,20 +1195,24 @@ struct SettingsTab: View {
             guard draftConfig.automaticDaemonRestart else { return nil }
             switch backend.daemonRestartEligibility {
             case .adoptedPriorSession:
-                return "This adopted prior-session daemon is not protected. Start a fresh daemon."
+                return "This adopted prior-session daemon is not protected. Start a fresh daemon.".mtplxLocalized
             case .currentSessionUnprotected:
-                return "This daemon was launched before restart protection was enabled. Start a fresh daemon."
+                return "This daemon was launched before restart protection was enabled. Start a fresh daemon.".mtplxLocalized
             case .noDaemon, .currentSessionProtected:
                 return nil
             }
         case .scheduled(let attempt, let delay):
-            return "Restart \(attempt) scheduled in \(String(format: "%.1f", delay))s."
+            return String(
+                format: "Restart %d scheduled in %.1fs.".mtplxLocalized,
+                attempt,
+                delay
+            )
         case .restarting(let attempt):
-            return "Restarting MTPLX (attempt \(attempt))."
+            return String(format: "Restarting MTPLX (attempt %d).".mtplxLocalized, attempt)
         case .runningAfterRestart(let attempt):
-            return "Recovered automatically on restart \(attempt)."
+            return String(format: "Recovered automatically on restart %d.".mtplxLocalized, attempt)
         case .exhausted(let attempts, _):
-            return "Automatic recovery stopped after \(attempts) attempts."
+            return String(format: "Automatic recovery stopped after %d attempts.".mtplxLocalized, attempts)
         }
     }
 
@@ -1226,7 +1245,10 @@ struct SettingsTab: View {
         let perfLockMs = bounds?.performanceLockMs ?? 1000
         FormRow(
             label: "Stream cadence",
-            caption: "Performance Lock overrides this to \(perfLockMs) ms."
+            caption: String(
+                format: "Performance Lock overrides this to %d ms.".mtplxLocalized,
+                perfLockMs
+            )
         ) {
             Stepper(
                 value: $draftConfig.streamSnapshotIntervalMs,
@@ -1493,7 +1515,7 @@ struct SettingsTab: View {
                                 Task { await hermes.repairGateway() }
                             } label: {
                                 Label(
-                                    hermes.gatewayRepairInFlight ? "Repairing" : "Repair Gateway",
+                                    (hermes.gatewayRepairInFlight ? "Repairing" : "Repair Gateway").mtplxLocalized,
                                     systemImage: "arrow.triangle.2.circlepath"
                                 )
                             }
@@ -1547,7 +1569,7 @@ struct SettingsTab: View {
         _ value: String,
         color: Color = Brand.typeSecondary
     ) -> some View {
-        Text(value)
+        Text(value.mtplxLocalized)
             .font(.system(.callout, design: .rounded))
             .foregroundStyle(color)
             .textSelection(.enabled)
@@ -1580,7 +1602,7 @@ struct SettingsTab: View {
                 ) {
                     Picker("Fan Mode", selection: fanModeSelectionBinding) {
                         ForEach(MTPLXFanMode.allCases, id: \.self) { mode in
-                            Text(mode.title).tag(mode.rawValue)
+                            Text(mode.title.mtplxLocalized).tag(mode.rawValue)
                         }
                     }
                     .pickerStyle(.segmented)

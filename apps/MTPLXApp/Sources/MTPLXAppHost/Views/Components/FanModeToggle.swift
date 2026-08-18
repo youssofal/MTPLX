@@ -56,7 +56,7 @@ struct FanModeToggle: View {
         Button {
             apply(value)
         } label: {
-            Text(label)
+            Text(label.mtplxLocalized)
                 .font(.system(size: 10, weight: .heavy, design: .monospaced))
                 .tracking(1)
                 .foregroundStyle(active == value ? Brand.bgOuter : Brand.textHighlight)

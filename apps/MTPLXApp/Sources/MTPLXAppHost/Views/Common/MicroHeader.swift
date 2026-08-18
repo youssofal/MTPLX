@@ -21,7 +21,7 @@ struct MicroHeader: View {
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(Brand.typeTertiary)
             }
-            Text(text.uppercased())
+            Text(text.uppercased().mtplxLocalized)
                 .font(.system(size: 10, weight: .heavy, design: .monospaced))
                 .tracking(1.5)
                 .foregroundStyle(Brand.typeTertiary)

@@ -48,7 +48,7 @@ struct BenchPrimaryCTA: View {
         HStack(spacing: 6) {
             Image(systemName: icon)
                 .font(.system(size: 11, weight: .heavy))
-            Text(title)
+            Text(title.mtplxLocalized)
                 .lineLimit(1)
                 .contentTransition(.opacity)
         }

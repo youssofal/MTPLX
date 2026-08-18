@@ -152,7 +152,7 @@ struct ModelPickerOverlay: View {
             Text("Model")
                 .font(.system(.callout, design: .rounded).weight(.semibold))
                 .foregroundStyle(Brand.typeBody)
-            Text(restartHint)
+            Text(restartHint.mtplxLocalized)
                 .font(.caption2)
                 .foregroundStyle(Brand.typeTertiary)
         }
@@ -714,7 +714,7 @@ private struct ModelRowView: View {
                             .truncationMode(.tail)
                         statusBadge
                     }
-                    Text(detail)
+                    Text(detail.mtplxLocalized)
                         .font(.caption2)
                         .foregroundStyle(Brand.typeTertiary)
                         .lineLimit(2)
@@ -792,7 +792,7 @@ private struct ModelRowView: View {
     private var statusBadge: some View {
         let tint = isInstalled ? Brand.accentChrome : Brand.warning
         let label = isInstalled ? "Installed" : "HF"
-        Text(label)
+        Text(label.mtplxLocalized)
             .font(.caption2.weight(.medium))
             .foregroundStyle(tint.opacity(0.9))
             .padding(.horizontal, 7)

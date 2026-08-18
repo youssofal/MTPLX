@@ -80,11 +80,11 @@ private struct RuntimeSetupRowView: View {
             stateIcon
                 .frame(width: 20, height: 20)
             VStack(alignment: .leading, spacing: 3) {
-                Text(row.title)
+                Text(row.title.mtplxLocalized)
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(Brand.typeHi)
                 if !row.detail.isEmpty {
-                    Text(row.detail)
+                    Text(row.detail.mtplxLocalized)
                         .font(.system(size: 11))
                         .foregroundStyle(detailColor)
                         .lineLimit(4)
@@ -107,7 +107,14 @@ private struct RuntimeSetupRowView: View {
                 )
         )
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(row.title): \(accessibilityState). \(row.detail)")
+        .accessibilityLabel(
+            String(
+                format: "%1$@: %2$@. %3$@".mtplxLocalized,
+                row.title.mtplxLocalized,
+                accessibilityState.mtplxLocalized,
+                row.detail.mtplxLocalized
+            )
+        )
     }
 
     @ViewBuilder
@@ -161,11 +168,11 @@ private struct RuntimeSetupRowView: View {
 
     private var accessibilityState: String {
         switch row.state {
-        case .pending: return "pending"
-        case .running: return "in progress"
-        case .done: return "done"
-        case .warning: return "warning"
-        case .failed: return "failed"
+        case .pending: return "Pending"
+        case .running: return "In progress"
+        case .done: return "Done"
+        case .warning: return "Warning"
+        case .failed: return "Failed"
         }
     }
 

@@ -255,7 +255,7 @@ private struct ARBaselineRow: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Text(row.label)
+            Text(row.label.mtplxLocalized)
                 .font(.system(size: 10, weight: .heavy, design: .monospaced))
                 .foregroundStyle(Brand.typeTertiary)
                 .frame(width: 24, alignment: .leading)
@@ -276,7 +276,7 @@ private struct AcceptanceBarRow: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Text(row.label)
+            Text(row.label.mtplxLocalized)
                 .font(.system(size: 10, weight: .heavy, design: .monospaced))
                 .foregroundStyle(row.isWinner ? Brand.typeHi : Brand.typeSecondary)
                 .frame(width: 24, alignment: .leading)

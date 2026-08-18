@@ -205,7 +205,7 @@ struct SystemTab: View {
             Circle()
                 .fill(color)
                 .frame(width: 8, height: 8)
-            Text(label)
+            Text(label.mtplxLocalized)
                 .font(.system(size: 11, weight: .medium, design: .monospaced))
                 .foregroundStyle(Brand.textHighlight.opacity(0.7))
             Text(value)
@@ -423,7 +423,7 @@ struct FanRing: View {
                 }
             }
             VStack(spacing: 4) {
-                Text(label)
+                Text(label.mtplxLocalized)
                     .font(.callout.weight(.semibold))
                     .foregroundStyle(Brand.textHighlight)
                 if let target = targetRpm {

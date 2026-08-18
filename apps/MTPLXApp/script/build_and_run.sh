@@ -279,6 +279,14 @@ if [[ -d "$ROOT/Sources/MTPLXAppHost/Resources/Brands" ]]; then
         /usr/bin/ditto --norsrc "$brand_png" "$BUNDLE_DIR/Contents/Resources/$(basename "$brand_png")"
       done
 fi
+if [[ -d "$ROOT/Sources/MTPLXAppHost/Resources/Localization" ]]; then
+  /usr/bin/find "$ROOT/Sources/MTPLXAppHost/Resources/Localization" -maxdepth 1 -type d -name '*.lproj' -print0 \
+    | while IFS= read -r -d '' localization_dir; do
+        /usr/bin/ditto --norsrc \
+          "$localization_dir" \
+          "$BUNDLE_DIR/Contents/Resources/$(basename "$localization_dir")"
+      done
+fi
 if [[ -d "$ROOT/Sources/MTPLXAppCore/Resources/StepAdapters" ]]; then
   mkdir -p "$BUNDLE_DIR/Contents/Resources/StepAdapters"
   /usr/bin/ditto --norsrc \
@@ -354,6 +362,8 @@ cat > "$BUNDLE_DIR/Contents/Info.plist" <<PLIST
   <string>AppIcon</string>
   <key>CFBundleIdentifier</key>
   <string>$BUNDLE_IDENTIFIER</string>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
   <key>CFBundleName</key>
   <string>$BUNDLE_DISPLAY_NAME</string>
   <key>CFBundlePackageType</key>

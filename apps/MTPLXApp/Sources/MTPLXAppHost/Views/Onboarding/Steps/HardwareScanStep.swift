@@ -102,7 +102,7 @@ struct HardwareScanStep: View {
                 .font(.system(size: 15, weight: .semibold, design: .monospaced))
                 .foregroundStyle(Brand.typeHi)
                 .monospacedDigit()
-            Text(label.uppercased())
+            Text(label.mtplxLocalized.uppercased())
                 .font(.system(size: 9, weight: .heavy, design: .monospaced))
                 .tracking(1.0)
                 .foregroundStyle(Brand.typeTertiary)

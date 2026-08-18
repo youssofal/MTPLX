@@ -260,7 +260,7 @@ struct LaunchOverlay: View {
     @ViewBuilder
     private func endpointRow(label: String, url: String) -> some View {
         HStack(spacing: 8) {
-            Text(label)
+            Text(label.mtplxLocalized)
                 .font(.system(size: 11, weight: .semibold, design: .rounded))
                 .foregroundStyle(Brand.typeSecondary)
                 .frame(width: 64, alignment: .leading)
@@ -392,7 +392,7 @@ private struct LaunchRow: View {
                     .frame(width: 22, height: 18)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
-                        Text(target.title)
+                        Text(target.title.mtplxLocalized)
                             .font(.system(.callout, design: .rounded).weight(.medium))
                             .foregroundStyle(Brand.typeBody)
                         if isLast {
@@ -408,7 +408,7 @@ private struct LaunchRow: View {
                                 )
                         }
                     }
-                    Text(target.tagline)
+                    Text(target.tagline.mtplxLocalized)
                         .font(.caption2)
                         .foregroundStyle(Brand.typeTertiary)
                         .lineLimit(2)

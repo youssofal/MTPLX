@@ -50,12 +50,12 @@ struct Card<Content: View>: View {
                 HStack(alignment: .firstTextBaseline) {
                     VStack(alignment: .leading, spacing: 2) {
                         if let title {
-                            Text(title)
+                            Text(title.mtplxLocalized)
                                 .font(.headline)
                                 .foregroundStyle(.primary)
                         }
                         if let subtitle {
-                            Text(subtitle)
+                            Text(subtitle.mtplxLocalized)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }

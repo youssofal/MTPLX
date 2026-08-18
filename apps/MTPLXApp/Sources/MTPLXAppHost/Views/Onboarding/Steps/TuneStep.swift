@@ -43,7 +43,10 @@ struct TuneStep: View {
 
     private var subtitle: String? {
         if !supportsTune {
-            return "\(modelFamilyLabel) uses its backend defaults for this release."
+            return String(
+                format: "%@ uses its backend defaults for this release.".mtplxLocalized,
+                modelFamilyLabel
+            )
         }
         if let status = orchestrator.tuneStatusMessage {
             return status
@@ -83,7 +86,7 @@ struct TuneStep: View {
             Image(systemName: "checkmark.circle.fill")
                 .font(.system(size: 28, weight: .semibold))
                 .foregroundStyle(Brand.success)
-            Text("\(modelFamilyLabel) is ready.")
+            Text(String(format: "%@ is ready.".mtplxLocalized, modelFamilyLabel))
                 .font(.system(.title3, design: .rounded).weight(.semibold))
                 .foregroundStyle(Brand.typeHi)
             Text("MTPLX will use the model's runtime defaults for this release.")
@@ -145,7 +148,7 @@ struct TuneStep: View {
         HStack(spacing: 14) {
             statusIcon(landed: landed != nil, isRunning: isRunning)
             VStack(alignment: .leading, spacing: 2) {
-                Text(candidate.displayLabel)
+                Text(candidate.displayLabel.mtplxLocalized)
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(Brand.typeHi)
             }
@@ -239,7 +242,7 @@ struct TuneStep: View {
         Button {
             orchestrator.startTune()
         } label: {
-            Label(title, systemImage: "arrow.clockwise")
+            Label(title.mtplxLocalized, systemImage: "arrow.clockwise")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(Brand.typeSecondary)
                 .padding(.horizontal, 9)
@@ -254,7 +257,7 @@ struct TuneStep: View {
                 )
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(title == "Run tuning" ? "Run tuning" : "Rerun tuning")
+        .accessibilityLabel((title == "Run tuning" ? "Run tuning" : "Rerun tuning").mtplxLocalized)
     }
 
     private func centeredResultTags(for result: TuneResult) -> some View {
@@ -355,7 +358,7 @@ struct TuneStep: View {
     /// at 10pt read as a stamp; SF Pro at caption2 reads as the
     /// macOS-native chrome label the result panel needs.
     private func pillTag(_ text: String) -> some View {
-        Text(text)
+        Text(text.mtplxLocalized)
             .font(.caption2.weight(.medium))
             .foregroundStyle(Brand.typeSecondary)
             .padding(.horizontal, 7)

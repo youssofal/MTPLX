@@ -61,26 +61,26 @@ struct DownloadStep: View {
     private var title: String {
         let verb: String
         if orchestrator.downloadProgress?.isComplete == true {
-            verb = "Downloaded"
+            verb = "Downloaded".mtplxLocalized
         } else if orchestrator.isDownloading {
-            verb = "Downloading"
+            verb = "Downloading".mtplxLocalized
         } else {
-            verb = "Download"
+            verb = "Download".mtplxLocalized
         }
         if let shortName = orchestrator.state.resolvedModel?.shortName {
-            return "\(verb) \(shortName)"
+            return "\(verb)：\(shortName)"
         }
         if let repo = orchestrator.state.resolvedRepoID {
-            return "\(verb) \(repo)"
+            return "\(verb)：\(repo)"
         }
-        return "Download"
+        return "Download".mtplxLocalized
     }
 
     private var subtitle: String {
         if let progress = orchestrator.downloadProgress, !progress.destinationPath.isEmpty {
             return progress.destinationPath
         }
-        return "Files land in ~/.mtplx/models. Resume is automatic."
+        return "Files land in ~/.mtplx/models. Resume is automatic.".mtplxLocalized
     }
 
     @ViewBuilder
@@ -140,7 +140,7 @@ struct DownloadStep: View {
                 .foregroundStyle(Brand.typeHi)
                 .monospacedDigit()
             if let total {
-                Text("of \(formatBytesShort(total))")
+                Text(String(format: "of %@".mtplxLocalized, formatBytesShort(total)))
                     .font(.system(size: 12, design: .monospaced))
                     .foregroundStyle(Brand.typeSecondary)
                     .monospacedDigit()
@@ -169,14 +169,17 @@ struct DownloadStep: View {
                 .foregroundStyle(rate > 50_000 ? Brand.typeSecondary : Brand.typeTertiary)
                 .monospacedDigit()
             if stalled == 0, let eta, eta > 0 {
-                Text("ETA \(formatDuration(eta))")
+                Text(String(format: "ETA %@".mtplxLocalized, formatDuration(eta)))
                     .font(.system(size: 11, weight: .medium, design: .monospaced))
                     .foregroundStyle(Brand.typeTertiary)
                     .monospacedDigit()
             }
             if stalled >= 30 {
                 Label(
-                    "Stalled for \(stalled)s, checking Hugging Face…",
+                    String(
+                        format: "Stalled for %ds, checking Hugging Face…".mtplxLocalized,
+                        stalled
+                    ),
                     systemImage: "exclamationmark.triangle.fill"
                 )
                 .font(.caption2)
@@ -226,8 +229,14 @@ struct DownloadStep: View {
     private var footnote: some View {
         let diskFree = orchestrator.freeDiskGiB()
         let text: String = orchestrator.isDownloading
-            ? String(format: "You can stop anytime. %.0f GB free on this Mac.", diskFree)
-            : String(format: "%.0f GB free on this Mac. Resume is automatic.", diskFree)
+            ? String(
+                format: "You can stop anytime. %.0f GB free on this Mac.".mtplxLocalized,
+                diskFree
+            )
+            : String(
+                format: "%.0f GB free on this Mac. Resume is automatic.".mtplxLocalized,
+                diskFree
+            )
         return Text(text)
             .font(.caption2)
             .foregroundStyle(Brand.typeTertiary)
@@ -271,8 +280,8 @@ struct DownloadStep: View {
         let h = total / 3600
         let m = (total % 3600) / 60
         let s = total % 60
-        if h > 0 { return "\(h)h \(m)m" }
-        if m > 0 { return "\(m)m \(s)s" }
-        return "\(s)s"
+        if h > 0 { return String(format: "%dh %dm".mtplxLocalized, h, m) }
+        if m > 0 { return String(format: "%dm %ds".mtplxLocalized, m, s) }
+        return String(format: "%ds".mtplxLocalized, s)
     }
 }

@@ -45,8 +45,8 @@ struct LaunchButton: View {
         }
         .buttonStyle(PremiumPuckStyle())
         .disabled(disabled)
-        .help(helpText)
-        .accessibilityLabel(accessibilityLabel)
+        .help(helpText.mtplxLocalized)
+        .accessibilityLabel(accessibilityLabel.mtplxLocalized)
         .animation(.smooth(duration: 0.25), value: stateKey)
     }
 

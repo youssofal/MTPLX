@@ -104,11 +104,11 @@ struct OnboardingStepContainer<Content: View, Primary: View>: View {
 
     private func header(title: String) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(title)
+            Text(title.mtplxLocalized)
                 .font(.system(.title2, design: .rounded).weight(.semibold))
                 .foregroundStyle(Brand.typeHi)
             if let subtitle, !subtitle.isEmpty {
-                Text(subtitle)
+                Text(subtitle.mtplxLocalized)
                     .font(.system(size: 13))
                     .foregroundStyle(Brand.typeSecondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -155,7 +155,12 @@ struct OnboardingStepContainer<Content: View, Primary: View>: View {
     // MARK: - Progress capsule
 
     private var progressCapsule: some View {
-        VStack(spacing: 8) {
+        let stepProgress = String(
+            format: "Step %d of %d".mtplxLocalized,
+            stepIndex + 1,
+            stepCount
+        )
+        return VStack(spacing: 8) {
             ZStack(alignment: .leading) {
                 Capsule()
                     .fill(Brand.separator.opacity(0.5))
@@ -166,12 +171,12 @@ struct OnboardingStepContainer<Content: View, Primary: View>: View {
                     .animation(.spring(response: 0.45, dampingFraction: 0.85), value: progressFraction)
             }
             .accessibilityHidden(true)
-            Text("Step \(stepIndex + 1) of \(stepCount)")
+            Text(stepProgress)
                 .font(.system(size: 11, weight: .medium, design: .monospaced))
                 .tracking(0.6)
                 .foregroundStyle(Brand.typeTertiary)
                 .contentTransition(.numericText())
-                .accessibilityLabel("Step \(stepIndex + 1) of \(stepCount)")
+                .accessibilityLabel(stepProgress)
         }
     }
 
@@ -208,7 +213,7 @@ struct OnboardingPrimaryButton: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 6) {
-                Text(title)
+                Text(title.mtplxLocalized)
                     .font(.system(size: 13, weight: .semibold))
                     .contentTransition(.opacity)
                 Image(systemName: "arrow.right")
@@ -250,7 +255,7 @@ struct OnboardingPrimaryButton: View {
         }
         .buttonStyle(.plain)
         .disabled(!isEnabled)
-        .accessibilityLabel(title)
+        .accessibilityLabel(title.mtplxLocalized)
         .onHover { hovering in isHovering = hovering && isEnabled }
         // Tracks a real press separately from `.buttonStyle` because
         // `.plain` swallows the in-progress press state we need to

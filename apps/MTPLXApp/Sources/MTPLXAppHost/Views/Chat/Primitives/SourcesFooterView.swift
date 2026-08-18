@@ -51,7 +51,7 @@ struct SourcesFooterView: View {
             HStack(spacing: 6) {
                 Image(systemName: "link")
                     .font(.system(size: 10, weight: .medium))
-                Text("\(sources.count) source\(sources.count == 1 ? "" : "s")")
+                Text(sourceCountLabel)
                     .font(.system(size: 12, weight: .medium, design: .rounded))
                 Image(systemName: "chevron.right")
                     .font(.system(size: 9, weight: .semibold))
@@ -68,10 +68,23 @@ struct SourcesFooterView: View {
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
-        .help(isExpanded ? "Hide sources" : "Show all \(sources.count) sources")
+        .help(isExpanded ? "Hide sources".mtplxLocalized : showAllSourcesLabel)
         .accessibilityLabel(
-            isExpanded ? "Hide sources" : "Show \(sources.count) sources"
+            isExpanded ? "Hide sources".mtplxLocalized : showSourcesLabel
         )
+    }
+
+    private var sourceCountLabel: String {
+        let key = sources.count == 1 ? "%d source" : "%d sources"
+        return String(format: key.mtplxLocalized, sources.count)
+    }
+
+    private var showAllSourcesLabel: String {
+        String(format: "Show all %d sources".mtplxLocalized, sources.count)
+    }
+
+    private var showSourcesLabel: String {
+        String(format: "Show %d sources".mtplxLocalized, sources.count)
     }
 
     private func sourcePill(index: Int, source: SourceRecord) -> some View {
@@ -102,6 +115,12 @@ struct SourcesFooterView: View {
         }
         .buttonStyle(.plain)
         .help(source.title.isEmpty ? source.url : source.title)
-        .accessibilityLabel("Open source \(index): \(source.domain)")
+        .accessibilityLabel(
+            String(
+                format: "Open source %1$d: %2$@".mtplxLocalized,
+                index,
+                source.domain
+            )
+        )
     }
 }

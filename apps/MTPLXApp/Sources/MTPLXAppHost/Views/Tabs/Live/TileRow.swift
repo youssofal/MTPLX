@@ -43,7 +43,7 @@ struct LiveTile: View {
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(Brand.typeTertiary)
                 }
-                Text(label.uppercased())
+                Text(label.mtplxLocalized.uppercased())
                     .font(.system(size: 10, weight: .heavy, design: .monospaced))
                     .tracking(2)
                     .foregroundStyle(Brand.typeTertiary)
@@ -72,7 +72,7 @@ struct LiveTile: View {
             // tile in a TileRow. Without this, caption-less tiles
             // were 18pt shorter than tiles with captions and the row
             // read as a jagged stair-step.
-            Text(caption ?? " ")
+            Text((caption ?? " ").mtplxLocalized)
                 .font(.system(size: 10, weight: .medium, design: .monospaced))
                 .tracking(1)
                 .foregroundStyle(Brand.typeTertiary)

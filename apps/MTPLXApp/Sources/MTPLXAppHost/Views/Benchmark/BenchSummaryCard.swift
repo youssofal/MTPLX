@@ -114,7 +114,7 @@ struct BenchSummaryCard: View {
 
     private func metaRow(label: String, value: String) -> some View {
         HStack(spacing: 10) {
-            Text(label)
+            Text(label.mtplxLocalized)
                 .font(.system(size: 9, weight: .heavy, design: .monospaced))
                 .tracking(1.4)
                 .foregroundStyle(Brand.typeTertiary)

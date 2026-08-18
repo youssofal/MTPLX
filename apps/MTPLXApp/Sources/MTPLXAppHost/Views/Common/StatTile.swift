@@ -24,7 +24,7 @@ struct StatTile: View {
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(Brand.typeTertiary)
                 }
-                Text(label.uppercased())
+                Text(label.uppercased().mtplxLocalized)
                     .font(.system(size: 10, weight: .heavy, design: .monospaced))
                     .tracking(1.5)
                     .foregroundStyle(Brand.typeTertiary)
@@ -48,7 +48,7 @@ struct StatTile: View {
                 }
             }
             if let caption {
-                Text(caption)
+                Text(caption.mtplxLocalized)
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
                     .foregroundStyle(Brand.typeTertiary)
                     .lineLimit(1)

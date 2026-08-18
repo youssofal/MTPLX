@@ -28,11 +28,11 @@ struct FormRow<Content: View>: View {
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(label)
+                Text(label.mtplxLocalized)
                     .font(.system(.callout))
                     .foregroundStyle(Brand.typeBody)
                 if let caption {
-                    Text(caption)
+                    Text(caption.mtplxLocalized)
                         .font(.caption2)
                         .foregroundStyle(Brand.typeTertiary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -57,11 +57,11 @@ struct FormToggleRow: View {
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(label)
+                Text(label.mtplxLocalized)
                     .font(.system(.callout))
                     .foregroundStyle(Brand.typeBody)
                 if let caption {
-                    Text(caption)
+                    Text(caption.mtplxLocalized)
                         .font(.caption2)
                         .foregroundStyle(Brand.typeTertiary)
                         .fixedSize(horizontal: false, vertical: true)

@@ -93,7 +93,7 @@ struct WelcomeStep: View {
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(Brand.typeBody)
                 .accessibilityHidden(true)
-            Text(text)
+            Text(text.mtplxLocalized)
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(Brand.typeHi)
         }

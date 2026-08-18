@@ -646,9 +646,9 @@ struct GaugeView: View {
             if let live = livePrefillTPS { parts.append("\(Format.tps(live)) TPS") }
             if let eta { parts.append("ETA \(Format.duration(eta))") }
             return parts.joined(separator: ", ")
-        case .dim:                  return "MTPLX stopped, tap to start"
+        case .dim:                  return "MTPLX stopped, tap to start".mtplxLocalized
         case .loading(let phase):   return phase.label.lowercased()
-        case .degraded:             return "MTPLX degraded"
+        case .degraded:             return "MTPLX degraded".mtplxLocalized
         }
     }
 }

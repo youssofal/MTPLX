@@ -132,7 +132,7 @@ struct TabBarItem: View {
                     .frame(width: 28, height: 1)
                     .opacity((hovering && !isSelected) ? 1 : 0)
 
-                Text(tab.title)
+                Text(tab.title.mtplxLocalized)
                     .font(.system(size: 11, weight: .semibold, design: .monospaced))
                     .tracking(1.2)
                     .foregroundStyle(labelForeground)
@@ -167,8 +167,8 @@ struct TabBarItem: View {
             motionEnabled ? .easeOut(duration: 0.18) : nil,
             value: hovering
         )
-        .help(tab.title)
-        .accessibilityLabel(tab.title)
+        .help(tab.title.mtplxLocalized)
+        .accessibilityLabel(tab.title.mtplxLocalized)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 

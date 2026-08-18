@@ -19,7 +19,7 @@ struct PillBadge: View {
                 Image(systemName: systemImage)
                     .font(.caption2)
             }
-            Text(text)
+            Text(text.mtplxLocalized)
                 .font(.caption.weight(.medium))
         }
         .foregroundStyle(emphasized ? tint : .primary)

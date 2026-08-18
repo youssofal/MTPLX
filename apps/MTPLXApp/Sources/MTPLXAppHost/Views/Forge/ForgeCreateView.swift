@@ -234,11 +234,11 @@ struct ForgeStageShell<Content: View, Footer: View>: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(title)
+            Text(title.mtplxLocalized)
                 .font(.system(.title2, design: .rounded).weight(.semibold))
                 .foregroundStyle(Brand.typeHi)
             if let subtitle, !subtitle.isEmpty {
-                Text(subtitle)
+                Text(subtitle.mtplxLocalized)
                     .font(.system(size: 13))
                     .foregroundStyle(Brand.typeSecondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -275,6 +275,11 @@ struct ForgeStageShell<Content: View, Footer: View>: View {
     private var progressCapsule: some View {
         let allCases = ForgeStep.allCases
         let stepIndex = allCases.firstIndex(of: step) ?? 0
+        let stepProgress = String(
+            format: "Step %d of %d".mtplxLocalized,
+            stepIndex + 1,
+            allCases.count
+        )
         return VStack(spacing: 8) {
             ZStack(alignment: .leading) {
                 Capsule()
@@ -286,12 +291,12 @@ struct ForgeStageShell<Content: View, Footer: View>: View {
                     .animation(.spring(response: 0.45, dampingFraction: 0.85), value: stepIndex)
             }
             .accessibilityHidden(true)
-            Text("\(progressLabel(for: step))  ·  Step \(stepIndex + 1) of \(allCases.count)")
+            Text("\(progressLabel(for: step).mtplxLocalized)  ·  \(stepProgress)")
                 .font(.system(size: 11, weight: .medium, design: .monospaced))
                 .tracking(0.6)
                 .foregroundStyle(Brand.typeTertiary)
                 .contentTransition(.numericText())
-                .accessibilityLabel("Step \(stepIndex + 1) of \(allCases.count)")
+                .accessibilityLabel(stepProgress)
         }
     }
 
@@ -335,7 +340,7 @@ struct ForgePrimaryButton: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 7) {
-                Text(title)
+                Text(title.mtplxLocalized)
                     .font(.system(size: 13.5, weight: .semibold))
                     .contentTransition(.opacity)
                 if let icon {
@@ -382,7 +387,7 @@ struct ForgePrimaryButton: View {
         }
         .buttonStyle(.plain)
         .disabled(!isEnabled)
-        .accessibilityLabel(title)
+        .accessibilityLabel(title.mtplxLocalized)
         .onHover { hovering in isHovering = hovering && isEnabled }
         .gesture(
             DragGesture(minimumDistance: 0)

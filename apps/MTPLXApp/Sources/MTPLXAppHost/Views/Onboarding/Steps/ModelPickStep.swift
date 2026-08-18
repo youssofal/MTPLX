@@ -260,7 +260,7 @@ struct ModelPickStep: View {
                         }
                     }
 
-                    Text(row.detail)
+                    Text(row.detail.mtplxLocalized)
                         .font(.system(size: 12))
                         .foregroundStyle(Brand.typeSecondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -303,7 +303,7 @@ struct ModelPickStep: View {
     }
 
     private func titleText(_ title: String) -> some View {
-        Text(title)
+        Text(title.mtplxLocalized)
             .font(.system(size: 14, weight: .semibold))
             .foregroundStyle(Brand.typeHi)
             .lineLimit(2)
@@ -518,10 +518,10 @@ struct ModelPickStep: View {
                 ProviderLogoMark(kind: icon, selected: isExpanded)
                     .frame(width: 30, height: 30)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(title)
+                    Text(title.mtplxLocalized)
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(Brand.typeHi)
-                    Text(detail)
+                    Text(detail.mtplxLocalized)
                         .font(.caption2)
                         .foregroundStyle(Brand.typeSecondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -587,7 +587,7 @@ struct ModelPickStep: View {
                 if isBusy {
                     ProgressView().controlSize(.mini)
                 }
-                Text(title)
+                Text(title.mtplxLocalized)
                     .font(.system(size: 12, weight: .semibold))
                     .lineLimit(1)
             }
@@ -712,7 +712,7 @@ struct ModelPickStep: View {
     }
 
     private func badge(_ text: String, color: Color) -> some View {
-        Text(text)
+        Text(text.mtplxLocalized)
             .font(.caption2.weight(.medium))
             .foregroundStyle(color.opacity(0.9))
             .padding(.horizontal, 7)

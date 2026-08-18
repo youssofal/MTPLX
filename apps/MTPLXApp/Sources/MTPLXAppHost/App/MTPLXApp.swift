@@ -318,7 +318,7 @@ struct MTPLXApp: App {
 
             CommandMenu("View") {
                 ForEach(Array(AppTab.allCases.enumerated()), id: \.element.id) { index, tab in
-                    Button(tab.title) {
+                    Button(tab.title.mtplxLocalized) {
                         router.select(tab)
                     }
                     .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: [.command])
@@ -329,7 +329,7 @@ struct MTPLXApp: App {
                 Button("Previous Tab") { router.previousTab() }
                     .keyboardShortcut("[", modifiers: [.command])
                 Divider()
-                Button(router.benchmarkOverlayPresented ? "Close Benchmark" : "Open Benchmark") {
+                Button((router.benchmarkOverlayPresented ? "Close Benchmark" : "Open Benchmark").mtplxLocalized) {
                     if router.benchmarkOverlayPresented {
                         router.closeBenchmark()
                     } else {
@@ -355,7 +355,7 @@ struct MTPLXApp: App {
                     _ = chatViewModel.createNewConversation()
                 }
                 .keyboardShortcut("n", modifiers: [.command])
-                Button(router.chatSidebarCollapsed ? "Show Sidebar" : "Hide Sidebar") {
+                Button((router.chatSidebarCollapsed ? "Show Sidebar" : "Hide Sidebar").mtplxLocalized) {
                     withAnimation(.smooth(duration: 0.22)) {
                         router.chatSidebarCollapsed.toggle()
                     }

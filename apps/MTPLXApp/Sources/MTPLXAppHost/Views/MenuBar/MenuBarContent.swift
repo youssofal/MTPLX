@@ -127,7 +127,7 @@ struct MenuBarContent: View {
             HStack(spacing: 8) {
                 Image(systemName: symbol)
                     .font(.system(size: 11, weight: .semibold))
-                Text(label)
+                Text(label.mtplxLocalized)
                     .font(.system(size: 12, weight: .heavy, design: .monospaced))
                     .tracking(1)
                 Spacer()
@@ -178,7 +178,7 @@ struct MenuBarContent: View {
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(Brand.textHighlight)
                     .frame(width: 18)
-                Text(label)
+                Text(label.mtplxLocalized)
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(Brand.textHighlight)
                 Spacer()

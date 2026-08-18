@@ -14,13 +14,13 @@ struct DaemonStatePill: View {
         return HStack(spacing: 6) {
             stateDot
                 .frame(width: 8, height: 8)
-            Text(kind.label.uppercased())
+            Text(kind.label.mtplxLocalized.uppercased())
                 .font(.system(size: 10, weight: .heavy, design: .monospaced))
                 .tracking(1.5)
             if let detail {
                 Text("·")
                     .foregroundStyle(Brand.textHighlight.opacity(0.4))
-                Text(detail)
+                Text(detail.mtplxLocalized)
                     .font(.caption2)
                     .foregroundStyle(Brand.textHighlight.opacity(0.65))
                     .lineLimit(1)
@@ -37,7 +37,7 @@ struct DaemonStatePill: View {
                 )
         )
         .foregroundStyle(tint)
-        .help(helpText)
+        .help(helpText.mtplxLocalized)
     }
 
     private var tint: Color {
@@ -115,13 +115,13 @@ struct ConnectionDot: View {
                 }
             }
             .frame(width: 14, height: 14)
-            Text(label)
+            Text(label.mtplxLocalized)
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
                 .tracking(0.5)
                 .foregroundStyle(tint.opacity(0.95))
         }
         .onChange(of: stateKey) { _, _ in pulseKey &+= 1 }
-        .help(helpText)
+        .help(helpText.mtplxLocalized)
     }
 
     /// True only when both the daemon is `.running` and the SSE stream

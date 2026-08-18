@@ -120,7 +120,7 @@ struct SourceStage: View {
                             .controlSize(.mini)
                             .tint(Brand.bgOuter)
                     }
-                    Text(orchestrator.isProbing ? "Checking…" : "Check")
+                    Text((orchestrator.isProbing ? "Checking…" : "Check").mtplxLocalized)
                         .font(.system(size: 12, weight: .semibold))
                 }
                 .padding(.horizontal, 14)

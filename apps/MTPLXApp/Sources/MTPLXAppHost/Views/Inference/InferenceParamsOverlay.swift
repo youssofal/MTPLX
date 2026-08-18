@@ -227,7 +227,7 @@ struct InferenceParamsOverlay: View {
             Text("Settings")
                 .font(.system(.callout, design: .rounded).weight(.semibold))
                 .foregroundStyle(Brand.typeBody)
-            Text(modelControls?.displayName ?? fallbackDisplayName)
+            Text((modelControls?.displayName ?? fallbackDisplayName).mtplxLocalized)
                 .font(.caption2)
                 .foregroundStyle(Brand.typeTertiary)
         }
@@ -331,14 +331,14 @@ struct InferenceParamsOverlay: View {
                     }
                 )) {
                     ForEach(reasoningEffortLevels, id: \.self) { effort in
-                        Text(effort.capitalized).tag(effort)
+                        Text(effort.capitalized.mtplxLocalized).tag(effort)
                     }
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .controlHoverLift(motionEnabled: motionEnabled)
             }
-            Text(reasoningStatusCopy)
+            Text(reasoningStatusCopy.mtplxLocalized)
                 .font(.caption2)
                 .foregroundStyle(reasoningSupported ? Brand.typeTertiary : Brand.warning)
                 .fixedSize(horizontal: false, vertical: true)
@@ -357,7 +357,7 @@ struct InferenceParamsOverlay: View {
                 }
             )) {
                 ForEach(MTPLXFanMode.allCases, id: \.self) { mode in
-                    Text(mode.title).tag(mode.rawValue)
+                    Text(mode.title.mtplxLocalized).tag(mode.rawValue)
                 }
             }
             .pickerStyle(.segmented)
@@ -649,10 +649,16 @@ struct InferenceParamsOverlay: View {
     }
     private var reasoningStatusCopy: String {
         guard reasoningSupported else {
-            return "Reasoning is not supported for \(contextWindowModelLabel)."
+            return String(
+                format: "Reasoning is not supported for %@.".mtplxLocalized,
+                contextWindowModelLabel
+            )
         }
         if reasoningEffortSupported && reasoningMode != "off" {
-            return "Reasoning effort: \(reasoningEffort.capitalized)."
+            return String(
+                format: "Reasoning effort: %@.".mtplxLocalized,
+                reasoningEffort.capitalized.mtplxLocalized
+            )
         }
         return Self.reasoningHint(for: reasoningMode)
     }
@@ -738,7 +744,7 @@ struct InferenceParamsOverlay: View {
                 // Supported but only one valid value — show it, don't
                 // build a degenerate slider.
                 HStack {
-                    Text(draftControl?.displayLabel ?? "Depth")
+                    Text((draftControl?.displayLabel ?? "Depth").mtplxLocalized)
                         .font(.system(size: 12))
                         .foregroundStyle(Brand.typeBody)
                     Spacer()
@@ -814,7 +820,13 @@ struct InferenceParamsOverlay: View {
                 }
             }
             contextPresetChips
-            Text("Max for \(contextWindowModelLabel): \(Self.formatTokensVerbose(modelMaxContext)).")
+            Text(
+                String(
+                    format: "Max for %1$@: %2$@.".mtplxLocalized,
+                    contextWindowModelLabel,
+                    Self.formatTokensVerbose(modelMaxContext)
+                )
+            )
                 .font(.caption2)
                 .foregroundStyle(Brand.typeTertiary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -851,7 +863,7 @@ struct InferenceParamsOverlay: View {
     @ViewBuilder
     private func contextChip(label: String, isOn: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Text(label)
+            Text(label.mtplxLocalized)
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
                 .foregroundStyle(isOn ? Brand.bgOuter : Brand.typeBody)
                 .lineLimit(1)
@@ -941,7 +953,7 @@ struct InferenceParamsOverlay: View {
                 }
             )) {
                 ForEach(kvQuantModes, id: \.self) { mode in
-                    Text(Self.kvQuantLabel(mode)).tag(mode)
+                    Text(Self.kvQuantLabel(mode).mtplxLocalized).tag(mode)
                 }
             }
             .pickerStyle(.segmented)
@@ -949,7 +961,7 @@ struct InferenceParamsOverlay: View {
             .controlHoverLift(motionEnabled: motionEnabled)
             .disabled(!kvQuantSupported)
             if !kvQuantSupported {
-                Text(kvQuantPolicy?.disabledReason ?? "KV quantization is not supported for this model.")
+                Text((kvQuantPolicy?.disabledReason ?? "KV quantization is not supported for this model.").mtplxLocalized)
                     .font(.caption2)
                     .foregroundStyle(Brand.warning)
                     .fixedSize(horizontal: false, vertical: true)
@@ -961,7 +973,7 @@ struct InferenceParamsOverlay: View {
     private var applyBar: some View {
         Divider().overlay(Brand.separator)
         HStack(spacing: 8) {
-            Text(applyBarMessage)
+            Text(applyBarMessage.mtplxLocalized)
                 .font(.caption2)
                 .foregroundStyle(Brand.warning)
             Spacer()
@@ -990,12 +1002,16 @@ struct InferenceParamsOverlay: View {
     /// commits silently on slider release, so we don't lie to the user
     /// about it needing an Apply step.
     private var applyBarMessage: String {
-        let restartParts: [String] = [
-            kvDirty ? "KV quantization" : nil,
-            contextWindowDirty ? "context window" : nil,
-        ].compactMap { $0 }
-        let joined = restartParts.joined(separator: " and ")
-        return "Applying \(joined) restarts the engine."
+        switch (kvDirty, contextWindowDirty) {
+        case (true, true):
+            return "Applying KV quantization and context window restarts the engine.".mtplxLocalized
+        case (true, false):
+            return "Applying KV quantization restarts the engine.".mtplxLocalized
+        case (false, true):
+            return "Applying context window restarts the engine.".mtplxLocalized
+        case (false, false):
+            return ""
+        }
     }
 
     // MARK: - Helpers
@@ -1003,12 +1019,12 @@ struct InferenceParamsOverlay: View {
     @ViewBuilder
     private func sectionHeader(_ title: String, hint: String? = nil) -> some View {
         HStack {
-            Text(title)
+            Text(title.mtplxLocalized)
                 .font(.system(size: 10, weight: .heavy, design: .monospaced))
                 .tracking(1.6)
                 .foregroundStyle(Brand.typeSecondary)
             if let hint {
-                Text("\u{00B7} \(hint)")
+                Text("\u{00B7} \(hint.mtplxLocalized)")
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
                     .foregroundStyle(Brand.warning.opacity(0.85))
             }
@@ -1055,7 +1071,7 @@ struct InferenceParamsOverlay: View {
         )
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text(title)
+                Text(title.mtplxLocalized)
                     .font(.system(size: 12))
                     .foregroundStyle(Brand.typeBody)
                 Spacer()

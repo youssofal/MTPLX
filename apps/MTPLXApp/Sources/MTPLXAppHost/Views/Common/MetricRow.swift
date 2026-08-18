@@ -14,7 +14,7 @@ struct MetricRow: View {
 
     var body: some View {
         HStack {
-            Text(label)
+            Text(label.mtplxLocalized)
                 .font(.callout)
                 .foregroundStyle(Brand.typeBody.opacity(0.75))
             Spacer(minLength: 8)

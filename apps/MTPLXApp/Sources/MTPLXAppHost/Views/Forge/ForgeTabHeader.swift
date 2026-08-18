@@ -79,7 +79,7 @@ struct ForgeTabHeader: View {
             HStack(spacing: 5) {
                 Image(systemName: icon)
                     .font(.system(size: 10.5, weight: .semibold))
-                Text(label)
+                Text(label.mtplxLocalized)
                     .font(.system(size: 11.5, weight: .semibold))
             }
             .foregroundStyle(isActive ? Brand.typeHi : Brand.typeSecondary)
@@ -119,7 +119,7 @@ struct ForgeTabHeader: View {
             HStack(spacing: 5) {
                 Image(systemName: isMidBuild ? "arrow.forward" : "plus")
                     .font(.system(size: 10.5, weight: .heavy))
-                Text(isMidBuild ? "Continue build" : "New build")
+                Text((isMidBuild ? "Continue build" : "New build").mtplxLocalized)
                     .font(.system(size: 11.5, weight: .semibold))
                     .lineLimit(1)
             }
@@ -133,8 +133,8 @@ struct ForgeTabHeader: View {
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
-        .help(isMidBuild
+        .help((isMidBuild
               ? "A build is in progress — jump back to it"
-              : "Start a new build")
+              : "Start a new build").mtplxLocalized)
     }
 }

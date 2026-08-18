@@ -168,7 +168,7 @@ struct AcceptanceSection: View {
 
     @ViewBuilder
     private var emptyState: some View {
-        Text(emptyStateText)
+        Text(emptyStateText.mtplxLocalized)
             .font(.callout)
             .foregroundStyle(Brand.textHighlight.opacity(0.6))
             .frame(maxWidth: .infinity, alignment: .leading)

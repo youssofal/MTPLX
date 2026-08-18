@@ -56,7 +56,7 @@ struct LaunchPopover: View {
                     .frame(width: 18)
                 VStack(alignment: .leading, spacing: 1) {
                     HStack(spacing: 6) {
-                        Text(target.title)
+                        Text(target.title.mtplxLocalized)
                             .font(.system(.callout).weight(.medium))
                             .foregroundStyle(.primary)
                         if isLast {
@@ -70,7 +70,7 @@ struct LaunchPopover: View {
                                 )
                         }
                     }
-                    Text(target.tagline)
+                    Text(target.tagline.mtplxLocalized)
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                         .lineLimit(2)
