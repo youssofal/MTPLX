@@ -148,3 +148,76 @@ def test_a_long_batch_cohort_that_settles_evals_keeps_its_fan_boost():
         a3b_mod._eval(mx.array([1]))
         now[0] += 60.0
         assert fan_probe(state) is True, "long batch work must keep its fan boost"
+
+
+# --- Forged progress: an empty pump step is not progress -------------------
+#
+# ``BatchGenerator.next()`` can return two empty response lists: a transient
+# library step, or a pump whose ``_active`` map has desynchronised from the
+# generator. Ticking the owner heartbeat there forges liveness — the pump can
+# spin forever while continuously resetting BOTH the #86 stream stall watchdog
+# and the #201 fan activity probe. Streams get nothing, nothing ever aborts,
+# and the fan leases stay pinned: exactly the failure this branch exists to
+# contain. Only a settled prompt or generation response proves a step ran.
+
+
+class _FakeResponse:
+    def __init__(self, uid: int = 1):
+        self.uid = uid
+
+
+def test_an_empty_ar_pump_step_does_not_advance_the_owner_heartbeat():
+    before = progress_heartbeat.value()
+    openai_mod._owner_settled_pump_step([], [])
+    assert progress_heartbeat.value() == before
+
+
+def test_a_prompt_response_proves_a_settled_pump_step():
+    before = progress_heartbeat.value()
+    openai_mod._owner_settled_pump_step([_FakeResponse()], [])
+    assert progress_heartbeat.value() > before
+
+
+def test_a_generation_response_proves_a_settled_pump_step():
+    before = progress_heartbeat.value()
+    openai_mod._owner_settled_pump_step([], [_FakeResponse()])
+    assert progress_heartbeat.value() > before
+
+
+def test_the_pump_never_ticks_outside_the_proven_step_gate():
+    """Wiring: the pump body must reach the heartbeat only through the gate.
+
+    A bare ``_owner_settled_eval(...)`` anywhere in ``_pump`` ticks
+    unconditionally — ``mx.eval([])`` settles nothing, so the tick would be
+    pure fabrication.
+    """
+
+    pump = _class_tree(openai_mod, "_BatchedARGenerationService")
+    pump_body = next(
+        node
+        for node in ast.walk(pump)
+        if isinstance(node, ast.FunctionDef) and node.name == "_pump"
+    )
+    called = {
+        node.func.id
+        for node in ast.walk(pump_body)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "_owner_settled_eval" not in called
+    assert "_owner_settled_pump_step" in called
+
+
+def test_a_pump_spinning_on_empty_steps_is_eventually_detected_as_stalled():
+    """The regression, end to end on the real probe: a pump that produces no
+    responses must age into a stall rather than pinning the fans forever."""
+
+    now = [0.0]
+    probe = openai_mod._OwnerStallProbe(deadline_s=100.0, clock=lambda: now[0])
+    state = _StubState(stall_probe=probe)
+    fan_probe = openai_mod.ServerState._smart_fan_activity_probe
+
+    assert fan_probe(state) is True
+    for _ in range(8):
+        openai_mod._owner_settled_pump_step([], [])
+        now[0] += 60.0
+    assert fan_probe(state) is False, "an empty-spinning pump must read stalled"
