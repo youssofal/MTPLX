@@ -63,6 +63,7 @@ from typing import Any
 
 import numpy as np
 
+from mtplx.progress_heartbeat import tick as _owner_progress_tick
 from mtplx.sampling import (
     Distribution,
     SamplerConfig,
@@ -111,6 +112,23 @@ PHASE2_REMAINING = (
     "offset, so all prompts must be equal length); dynamic admission/departure "
     "(mtplx/batching scheduler); and a p/q ratio-accept (temperature>0) lane."
 )
+
+
+def _eval(*values: Any) -> None:
+    """Settle owner-thread work AND prove the model owner is alive (#201).
+
+    Mirrors :func:`mtplx.generation._eval`. The smart-fan activity probe and
+    the #86 stream stall watchdog both read "busy" as "the owner progress
+    heartbeat is advancing", so a batch pump that settles evals for minutes
+    without ticking is indistinguishable from a wedge — and would lose its fan
+    leases mid-flight. ``mlx.core`` is imported lazily to keep this module's
+    import cost unchanged.
+    """
+
+    import mlx.core as mx
+
+    mx.eval(*values)
+    _owner_progress_tick()
 
 
 def batched_decode_enabled(environ: dict[str, str] | None = None) -> bool:
@@ -497,7 +515,7 @@ def _argmax_ids(logits_2d: Any) -> list[int]:
     import mlx.core as mx
 
     ids = mx.argmax(logits_2d, axis=-1)
-    mx.eval(ids)
+    _eval(ids)
     return [int(t) for t in ids.tolist()]
 
 
@@ -513,9 +531,8 @@ def _eval_bundle(bundle: Any) -> tuple[list[int], list[int], list[int], list[int
     Build-2).  Kept as a module-level seam so a test can monkeypatch it and count
     exactly one call per cycle.
     """
-    import mlx.core as mx
 
-    mx.eval(bundle)
+    _eval(bundle)
     rows = bundle.tolist()  # [[x0...],[draft...],[x1...],[accept...]]
     return (
         [int(t) for t in rows[0]],
@@ -581,7 +598,7 @@ def _run_ar_loop(
 
     def _read(sub: dict[str, Any]) -> list[int]:
         nonlocal forwards
-        mx.eval(sub["x"])  # THE one blocking sync
+        _eval(sub["x"])  # THE one blocking sync
         forwards += 1
         return [int(t) for t in sub["x"].tolist()]
 
@@ -1126,7 +1143,7 @@ def generate_greedy_batched(
                 cache=cache,
                 return_hidden=True,
             )
-    mx.eval(logits) if hidden is None else mx.eval(logits, hidden)
+    _eval(logits) if hidden is None else _eval(logits, hidden)
     if int(logits.shape[0]) != batch or (
         hidden is not None and int(hidden.shape[0]) != batch
     ):
@@ -1368,7 +1385,7 @@ def generate_greedy_batched(
                     cache=cache,
                     return_hidden=True,
                 )
-            mx.eval(v_logits, v_hidden)
+            _eval(v_logits, v_hidden)
             forwards += 1
             _verify_shape_ok(v_logits, v_hidden)
 
@@ -1387,7 +1404,7 @@ def generate_greedy_batched(
                         cache=cache,
                         return_hidden=True,
                     )
-                mx.eval(r_logits, r_hidden)
+                _eval(r_logits, r_hidden)
                 forwards += 1
                 repair_cycles += 1
                 logits_last = r_logits[:, 1, :]
