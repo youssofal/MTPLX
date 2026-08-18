@@ -88,3 +88,24 @@ def test_depth_sweep_passes_merge_mtp_adapter_to_runtime(monkeypatch, tmp_path) 
     assert result["mtp_adapter_kind"] == "c4_mtp_lora_adapter"
     assert result["mtp_adapter_merged"] is True
     assert result["mtp_adapter_merge_report"] == {"merged": 1, "targets": [{"target": "fc"}]}
+
+
+def test_sum_draft_core_preserves_greedy_confidence_counters() -> None:
+    summary = mtp_depth_sweep._sum_draft_core(
+        [
+            {
+                "requested": "stock",
+                "greedy_confidence_sync_calls": 3,
+                "greedy_confidence_token_reuses": 2,
+            },
+            {
+                "requested": "stock",
+                "greedy_confidence_sync_calls": 4,
+                "greedy_confidence_token_reuses": 4,
+            },
+            {"requested": "stock"},
+        ]
+    )
+
+    assert summary["greedy_confidence_sync_calls"] == 7
+    assert summary["greedy_confidence_token_reuses"] == 6

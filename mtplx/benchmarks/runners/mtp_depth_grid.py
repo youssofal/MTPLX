@@ -8,6 +8,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from mtplx.benchmarks.runners.mtp_depth_sweep import _sum_draft_core
 from mtplx.benchmarks.schema import encode_prompt_case, load_prompt_suite
 from mtplx.benchmarks.validators.basic import (
     validate_json_text,
@@ -217,6 +218,7 @@ def run_mtp_depth_policy_grid(
                     "verify_time_s": out.stats.verify_time_s,
                     "draft_time_s": out.stats.draft_time_s,
                     "target_forward_time_s": out.stats.target_forward_time_s,
+                    "draft_core": out.stats.draft_core,
                     "model_path_tok_s": (
                         out.stats.generated_tokens
                         / (out.stats.target_forward_time_s + out.stats.draft_time_s)
@@ -278,6 +280,9 @@ def run_mtp_depth_policy_grid(
                         "verify_time_s": sum(row["verify_time_s"] for row in rows),
                         "draft_time_s": sum(row["draft_time_s"] for row in rows),
                         "target_forward_time_s": sum(row["target_forward_time_s"] for row in rows),
+                        "draft_core": _sum_draft_core(
+                            [row["draft_core"] for row in rows]
+                        ),
                         "validations_passed": sum(1 for v in validations if v["passed"]),
                         "validations_total": len(validations),
                         "peak_memory_bytes": max([row["peak_memory_bytes"] for row in rows] or [0]),

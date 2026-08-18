@@ -853,6 +853,14 @@ def _sum_draft_core(values: list[dict[str, object]]) -> dict[str, object]:
         "device_d2_compile_time_s": sum(
             float(value.get("device_d2_compile_time_s", 0.0) or 0.0) for value in values
         ),
+        "greedy_confidence_sync_calls": sum(
+            int(value.get("greedy_confidence_sync_calls", 0) or 0)
+            for value in values
+        ),
+        "greedy_confidence_token_reuses": sum(
+            int(value.get("greedy_confidence_token_reuses", 0) or 0)
+            for value in values
+        ),
     }
 
 

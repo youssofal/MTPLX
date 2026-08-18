@@ -8,7 +8,11 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from mtplx.benchmarks.runners.mtp_depth_sweep import _rate_by_depth, _sum_lists
+from mtplx.benchmarks.runners.mtp_depth_sweep import (
+    _rate_by_depth,
+    _sum_draft_core,
+    _sum_lists,
+)
 from mtplx.benchmarks.schema import encode_prompt_case, load_prompt_suite
 from mtplx.benchmarks.validators.basic import (
     validate_json_text,
@@ -223,6 +227,7 @@ def run_mtp_adaptive(
                 "commit_time_s": out.stats.commit_time_s,
                 "capture_commit_time_s": out.stats.capture_commit_time_s,
                 "bonus_time_s": out.stats.bonus_time_s,
+                "draft_core": out.stats.draft_core,
                 "bonus_tokens": out.stats.bonus_tokens,
                 "correction_tokens": out.stats.correction_tokens,
                 "verify_calls": out.stats.verify_calls,
@@ -316,6 +321,7 @@ def run_mtp_adaptive(
             "commit_time_s": sum(row["commit_time_s"] for row in rows),
             "capture_commit_time_s": sum(row["capture_commit_time_s"] for row in rows),
             "bonus_time_s": sum(row["bonus_time_s"] for row in rows),
+            "draft_core": _sum_draft_core([row["draft_core"] for row in rows]),
             "bonus_tokens": sum(row["bonus_tokens"] for row in rows),
             "correction_tokens": sum(row["correction_tokens"] for row in rows),
             "verify_calls": sum(row["verify_calls"] for row in rows),

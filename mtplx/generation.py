@@ -4362,20 +4362,90 @@ def _sample_from_logits(
     return sample_from_distribution(probs, rng), probs
 
 
+def _greedy_draft_token_and_top_values(
+    logits: mx.array,
+    *,
+    topk: int,
+) -> tuple[int, np.ndarray]:
+    """Materialize greedy argmax and FP32 top-k values with one synchronization."""
+
+    row = logits[:, -1, :][0] if logits.ndim == 3 else logits.reshape(-1)
+    # Keep argmax separate because top-k indices need not preserve first-index ties.
+    token_id = mx.argmax(row, axis=-1)
+    k = max(2, min(int(topk), int(row.shape[-1])))
+    top_values = mx.topk(row.astype(mx.float32), k=k)
+    _eval(token_id, top_values)
+    token = int(np.asarray(token_id).reshape(-1)[0])
+    values = np.asarray(top_values, dtype=np.float32).reshape(-1)
+    return token, values
+
+
 def _greedy_draft_token_and_top2(logits: mx.array) -> tuple[int, float, float]:
     """Materialize one greedy token and its FP32 top-two values together."""
 
-    row = (
-        logits[:, -1, :][0]
-        if logits.ndim == 3
-        else logits.reshape(-1)
-    ).astype(mx.float32)
-    token_id = mx.argmax(row, axis=-1)
-    top2_values = mx.topk(row, k=2)
-    _eval(token_id, top2_values)
-    token = int(np.asarray(token_id).reshape(-1)[0])
-    top2 = np.asarray(top2_values, dtype=np.float32).reshape(-1)
+    token, top2 = _greedy_draft_token_and_top_values(logits, topk=2)
     return token, float(top2[-1]), float(top2[-2])
+
+
+def _confidence_metrics_from_top_values(
+    top_values: mx.array | np.ndarray,
+) -> dict[str, float]:
+    values = np.sort(np.asarray(top_values, dtype=np.float32).reshape(-1))
+    if values.size < 2:
+        return {"top2_margin": 0.0, "top1_prob_topk": 1.0, "entropy_topk": 0.0}
+    descending = values[::-1].astype(np.float64)
+    shifted = descending - float(descending[0])
+    exp_values = np.exp(shifted)
+    probabilities = exp_values / float(np.sum(exp_values))
+    entropy = -float(
+        np.sum(probabilities * np.log(np.maximum(probabilities, 1e-30)))
+    )
+    return {
+        "top2_margin": float(values[-1] - values[-2]),
+        "top1_prob_topk": float(probabilities[0]),
+        "entropy_topk": entropy,
+    }
+
+
+def _greedy_draft_token_and_metrics(
+    logits: mx.array,
+    *,
+    need_distribution: bool,
+    topk: int = 8,
+) -> tuple[int, SparseDistribution | None, dict[str, float]]:
+    """Build the greedy proposal and its confidence metrics with one sync."""
+
+    row = logits[:, -1, :][0] if logits.ndim == 3 else logits.reshape(-1)
+    token, top_values = _greedy_draft_token_and_top_values(row, topk=topk)
+    distribution = (
+        SparseDistribution.one_hot(token, int(row.shape[-1]))
+        if need_distribution
+        else None
+    )
+    return token, distribution, _confidence_metrics_from_top_values(top_values)
+
+
+def _can_combine_greedy_draft_read(
+    draft_sampler: SamplerConfig,
+    *,
+    confidence_metrics_required: bool,
+    adaptive_width_policy: Any | None,
+    target_prefix_route: Any | None,
+    correction_cache_enabled: bool,
+    adapter_ensemble_q: bool,
+    mtp_topk_reranker: Any | None,
+) -> bool:
+    """Limit the joint read to greedy opt-in confidence lanes."""
+
+    return bool(
+        confidence_metrics_required
+        and draft_sampler.temperature <= 0
+        and adaptive_width_policy is None
+        and target_prefix_route is None
+        and not correction_cache_enabled
+        and not adapter_ensemble_q
+        and mtp_topk_reranker is None
+    )
 
 
 def _sample_draft_from_logits(
@@ -4897,19 +4967,7 @@ def _draft_confidence_metrics(logits: mx.array, *, topk: int = 8) -> dict[str, f
     k = max(2, min(int(topk), int(logits.shape[-1])))
     top_values = mx.topk(logits.astype(mx.float32), k)
     _eval(top_values)
-    values = np.sort(np.asarray(top_values, dtype=np.float32).reshape(-1))
-    if values.size < 2:
-        return {"top2_margin": 0.0, "top1_prob_topk": 1.0, "entropy_topk": 0.0}
-    descending = values[::-1].astype(np.float64)
-    shifted = descending - float(descending[0])
-    exp_values = np.exp(shifted)
-    probs = exp_values / float(np.sum(exp_values))
-    entropy = -float(np.sum(probs * np.log(np.maximum(probs, 1e-30))))
-    return {
-        "top2_margin": float(values[-1] - values[-2]),
-        "top1_prob_topk": float(probs[0]),
-        "entropy_topk": entropy,
-    }
+    return _confidence_metrics_from_top_values(top_values)
 
 
 def _top2_margin(logits: mx.array) -> float:
@@ -7492,6 +7550,8 @@ def generate_mtpk(
     device_core_compile_time = 0.0
     device_core_calls = 0
     device_core_fallbacks = 0
+    greedy_confidence_sync_calls = 0
+    greedy_confidence_token_reuses = 0
     streamed_token_count = 0
     mtp_history_materialize_every = max(
         0,
@@ -8222,6 +8282,22 @@ def generate_mtpk(
         # continuation predictiveness and can cost more to verify than they commit,
         # while grounded re-emission matches into the prompt (see the PR benchmarks).
         ccopy_index.sync(prompt_ids)
+    wants_policy_metrics = bool(
+        getattr(adaptive_policy, "wants_draft_metrics", False)
+    )
+    combine_greedy_draft_read = _can_combine_greedy_draft_read(
+        draft_sampler,
+        confidence_metrics_required=(
+            draft_margin_threshold is not None or wants_policy_metrics
+        ),
+        adaptive_width_policy=adaptive_width_policy,
+        target_prefix_route=a3b_target_prefix_route,
+        correction_cache_enabled=(
+            online_correction_cache or prompt_correction_cache
+        ),
+        adapter_ensemble_q=adapter_ensemble_q,
+        mtp_topk_reranker=mtp_topk_reranker,
+    )
     # Close the pre-first-token setup span here: everything from the
     # restore/prefill return to this point (prompt-prefix bank commit,
     # graphbank/policy/sampler construction) is setup wall time that
@@ -9190,14 +9266,22 @@ def generate_mtpk(
                     position_offset=draft_position_offset,
                 )
                 draft_logits, draft_hidden_next = draft_result
-            wants_policy_metrics = bool(
-                getattr(adaptive_policy, "wants_draft_metrics", False)
-            )
-            draft_metrics = (
-                _draft_confidence_metrics(draft_logits[:, -1, :][0])
-                if draft_margin_threshold is not None or wants_policy_metrics
-                else {}
-            )
+            prepared_greedy_draft: tuple[int, SparseDistribution | None] | None = None
+            if combine_greedy_draft_read:
+                draft_token, draft_q, draft_metrics = _greedy_draft_token_and_metrics(
+                    draft_logits,
+                    need_distribution=(
+                        sampler.temperature > 0 and not target_prefix_verify
+                    ),
+                )
+                greedy_confidence_sync_calls += 1
+                prepared_greedy_draft = (draft_token, draft_q)
+            else:
+                draft_metrics = (
+                    _draft_confidence_metrics(draft_logits[:, -1, :][0])
+                    if draft_margin_threshold is not None or wants_policy_metrics
+                    else {}
+                )
             margin = draft_metrics.get("top2_margin")
             if (
                 draft_margin_threshold is not None
@@ -9317,14 +9401,16 @@ def generate_mtpk(
                     need_draft_distribution = (
                         sampler.temperature > 0 and not target_prefix_verify
                     )
-                    draft_token, draft_q, adaptive_width_stop = (
-                        cycle_draft_reader(
+                    if prepared_greedy_draft is not None:
+                        draft_token, draft_q = prepared_greedy_draft
+                        greedy_confidence_token_reuses += 1
+                    else:
+                        draft_token, draft_q, adaptive_width_stop = cycle_draft_reader(
                             draft_logits,
                             depth_index=depth_index,
                             need_distribution=need_draft_distribution,
                             decision_margins=adaptive_width_decision_margins,
                         )
-                    )
             elapsed_draft = time.perf_counter() - started
             draft_time += elapsed_draft
             if trace.enabled:
@@ -11064,6 +11150,8 @@ def generate_mtpk(
             "device_calls": device_core_calls,
             "device_fallbacks": device_core_fallbacks,
             "device_compile_time_s": device_core_compile_time,
+            "greedy_confidence_sync_calls": greedy_confidence_sync_calls,
+            "greedy_confidence_token_reuses": greedy_confidence_token_reuses,
         },
         owned_recurrent_state=owned_recurrent_state_stats(cache),
         owned_attn_kv=tail_owned_attention_kv_stats(cache),
