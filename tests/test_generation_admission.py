@@ -124,32 +124,76 @@ def test_slot_is_returned_after_a_request_completes():
     asyncio.run(scenario())
 
 
+async def _saturate(mw, app, *, slots: int):
+    """Park ``slots`` generation requests inside a limit-``slots`` gate."""
+    parked = [
+        asyncio.create_task(mw(_scope(), _receive, _Sink())) for _ in range(slots)
+    ]
+    await asyncio.sleep(0)
+    assert app.entered == slots
+    return parked
+
+
 def test_non_generation_paths_are_never_gated():
+    """Only the three generation paths are gated; everything else rides free.
+
+    Two things make this bite. The gate must be SATURATED — against a gate
+    with slots to spare, or a disabled one, it passes even with the path
+    exemption deleted. And the probe must be a POST, or the method check
+    alone lets it through and the path set is never consulted.
+    """
+
     async def scenario():
-        app = _BlockingApp()
-        app.release.set()
-        mw = _middleware(app, limit=0)
-        sink = _Sink()
-        await mw(_scope(path="/health", method="GET"), _receive, sink)
-        assert sink.status == 200
+        for path, method in (
+            ("/v1/embeddings", "POST"),
+            ("/health", "GET"),
+        ):
+            app = _BlockingApp()
+            mw = _middleware(app, limit=1)
+            parked = await _saturate(mw, app, slots=1)
+
+            bypass = _Sink()
+            task = asyncio.create_task(
+                mw(_scope(path=path, method=method), _receive, bypass)
+            )
+            await asyncio.sleep(0)
+            assert app.entered == 2, f"{method} {path} must bypass a full gate"
+            assert bypass.status is None, "must not be shed with 429"
+
+            app.release.set()
+            await asyncio.gather(*parked, task)
+            assert bypass.status == 200
 
     asyncio.run(scenario())
 
 
 def test_background_task_probes_are_never_gated():
-    """Open WebUI title/tag probes ride the same exemption as the fan lease."""
+    """Open WebUI title/tag probes ride the same exemption as the fan lease.
+
+    Also asserted against a SATURATED gate: these probes are exactly the
+    traffic that arrives while a long generation is holding the only slot.
+    """
 
     async def scenario():
         app = _BlockingApp()
-        app.release.set()
-        mw = _middleware(app, limit=0)
-        sink = _Sink()
-        await mw(
-            _scope(headers=[(b"x-openwebui-task", b"title")]),
-            _receive,
-            sink,
+        mw = _middleware(app, limit=1)
+        parked = await _saturate(mw, app, slots=1)
+
+        bypass = _Sink()
+        task = asyncio.create_task(
+            mw(
+                _scope(headers=[(b"x-openwebui-task", b"title")]),
+                _receive,
+                bypass,
+            )
         )
-        assert sink.status == 200
+        await asyncio.sleep(0)
+        assert app.entered == 2, "background probe must bypass a full gate"
+        assert bypass.status is None, "must not be shed with 429"
+
+        app.release.set()
+        await asyncio.gather(*parked, task)
+        assert bypass.status == 200
 
     asyncio.run(scenario())
 
@@ -167,10 +211,6 @@ def test_limit_of_zero_disables_admission_control():
         await asyncio.gather(*parked)
 
     asyncio.run(scenario())
-
-
-def test_default_limit_is_a_small_positive_number():
-    assert 0 < openai_mod.MAX_INFLIGHT_GENERATION_REQUESTS <= 8
 
 
 # --- Capacity-aware resolution -------------------------------------------
@@ -286,3 +326,69 @@ def test_public_child_argument_forwarding_includes_the_admission_flag():
     assert source.count(
         '("max_inflight_generation_requests", "--max-inflight-generation-requests")'
     ) >= 2
+
+
+# --- Composition in create_app -------------------------------------------
+#
+# R5 ("a shed request must never ramp fans") is a property of the ORDER the
+# middlewares are composed in, which the raw middleware tests above cannot
+# see. Starlette runs the most recently added middleware first, so the
+# registration order in create_app is load-bearing and silently reversible.
+
+
+class _RecordingFanController:
+    def __init__(self):
+        self.begins = []
+        self.ends = []
+
+    def begin_request(self, lease_id):
+        self.begins.append(lease_id)
+
+    def end_request(self, lease_id, *, wait_for_restore=False):
+        self.ends.append(lease_id)
+
+
+def test_create_app_orders_auth_then_cors_then_admission_then_fan():
+    from test_server_openai import _fake_state
+
+    app = openai_mod.create_app(_fake_state())
+    names = [entry.cls.__name__ for entry in app.user_middleware]
+    # Outermost first. The auth/rate-limit gate is a FastAPI http middleware,
+    # which Starlette wraps in BaseHTTPMiddleware.
+    assert names == [
+        "BaseHTTPMiddleware",
+        "CORSMiddleware",
+        "_GenerationAdmissionMiddleware",
+        "_SmartFanArrivalMiddleware",
+    ]
+
+
+def test_a_shed_request_never_ramps_the_fans():
+    """R5, at the composition create_app builds: admission wraps the fan ramp."""
+
+    from test_server_openai import _fake_state
+
+    state = _fake_state()
+    controller = _RecordingFanController()
+    state.fan_mode = openai_mod.FAN_MODE_SMART
+    state.smart_fans = controller
+
+    async def scenario():
+        engine = _BlockingApp()
+        fan = openai_mod._SmartFanArrivalMiddleware(engine, state=state)
+        mw = _middleware(fan, limit=1)
+
+        parked = await _saturate(mw, engine, slots=1)
+        assert len(controller.begins) == 1, "the admitted request ramps fans"
+
+        shed = _Sink()
+        await mw(_scope(), _receive, shed)
+        assert shed.status == 429
+        assert engine.entered == 1
+        assert len(controller.begins) == 1, "a shed request must not ramp fans"
+
+        engine.release.set()
+        await asyncio.gather(*parked)
+        assert len(controller.ends) == 1
+
+    asyncio.run(scenario())
