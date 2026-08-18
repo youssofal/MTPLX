@@ -19267,6 +19267,69 @@ _SMART_FAN_ARRIVAL_PATHS = {
     "/v1/messages",
 }
 
+# Documented physical cohort width of the mtp_batch lane (see
+# ``mtplx/server/mtp_batch.py`` and ``_scheduler_policy_label``). Used only as
+# the fallback when the installed lanes are not yet visible.
+MTP_BATCH_COHORT_WIDTH = 8
+
+
+def _generation_active_capacity(state: Any) -> int:
+    """How many generation requests this server can have ACTIVE at once.
+
+    Serial mode is 1 by construction — the one model-owner thread runs every
+    request to completion — so extra requests queue rather than run. The batch
+    lanes are different: ``ar_batch`` decodes ``decode_batch_max`` rows
+    together, and ``mtp_batch`` seals a fixed-width cohort. A cohort only forms
+    from requests that are simultaneously in flight, so admission must never
+    sit below the width the lane is configured to run.
+    """
+
+    args = getattr(state, "args", None)
+    config = _scheduler_config_from_args(args)
+    if config.mode == SchedulerMode.SERIAL:
+        return 1
+    resolved = config.to_dict()
+    capacity = max(
+        1,
+        int(resolved["max_active_requests"]),
+        int(resolved["decode_batch_max"]),
+    )
+    if config.mode == SchedulerMode.MTP_BATCH:
+        widths = [int(width) for width in (getattr(state, "mtp_batch_lanes", None) or {})]
+        capacity = max(capacity, max(widths) if widths else MTP_BATCH_COHORT_WIDTH)
+    return capacity
+
+
+def _resolve_generation_admission_limit(state: Any) -> int:
+    """Resolve the in-flight generation ceiling for this server.
+
+    An explicitly configured value (CLI flag or
+    ``MTPLX_MAX_INFLIGHT_GENERATION_REQUESTS``) is honoured verbatim, including
+    0 to disable — an operator who asks for a narrow gate gets one.
+
+    Otherwise the default (``MAX_INFLIGHT_GENERATION_REQUESTS``, 4) applies but
+    floors at the scheduler's active capacity. Four is the right WAITING LINE
+    in serial mode (1 executing + 3 queued, R4). Applied unconditionally it
+    would instead cap ACTIVE capacity: on the width-8 mtp_batch lane four
+    requests would be admitted and four would get 429, so a full cohort could
+    never seal — a capability regression, not backpressure.
+    """
+
+    raw = getattr(getattr(state, "args", None), "max_inflight_generation_requests", None)
+    if raw is None:
+        raw = os.environ.get("MTPLX_MAX_INFLIGHT_GENERATION_REQUESTS")
+        raw = raw.strip() if isinstance(raw, str) else raw
+    if raw not in (None, ""):
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            pass
+    if MAX_INFLIGHT_GENERATION_REQUESTS <= 0:
+        return 0
+    return max(
+        MAX_INFLIGHT_GENERATION_REQUESTS, _generation_active_capacity(state)
+    )
+
 
 class _GenerationAdmissionMiddleware:
     """Bound the generation waiting line and shed load with 429.
@@ -24327,14 +24390,7 @@ def create_app(state: ServerState) -> FastAPI:
     # the most recently added first): a shed request must never ramp fans.
     app.add_middleware(
         _GenerationAdmissionMiddleware,
-        max_inflight=int(
-            getattr(
-                state.args,
-                "max_inflight_generation_requests",
-                MAX_INFLIGHT_GENERATION_REQUESTS,
-            )
-            or 0
-        ),
+        max_inflight=_resolve_generation_admission_limit(state),
     )
     app.add_middleware(
         CORSMiddleware,
@@ -31005,12 +31061,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-inflight-generation-requests",
         type=int,
-        default=MAX_INFLIGHT_GENERATION_REQUESTS,
+        default=None,
         help=(
             "Ceiling on generation requests accepted at once. Serial mode runs "
             "one at a time by design, so this bounds the waiting line, not "
             "parallelism; past it the server returns 429 + Retry-After instead "
-            "of queueing without limit. 0 disables."
+            "of queueing without limit. 0 disables. Unset defaults to "
+            f"{MAX_INFLIGHT_GENERATION_REQUESTS}, raised to the scheduler's "
+            "active capacity so a full ar_batch/mtp_batch cohort can still form."
         ),
     )
     parser.add_argument("--max-active-requests", type=int)

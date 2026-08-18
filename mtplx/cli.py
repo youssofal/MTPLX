@@ -696,6 +696,17 @@ def _add_batching_args(parser: argparse.ArgumentParser) -> None:
         default="throughput",
         help="Qwen MTP route: fast B8, balanced B8, or serial B1-exact.",
     )
+    parser.add_argument(
+        "--max-inflight-generation-requests",
+        type=int,
+        default=None,
+        help=(
+            "Ceiling on generation requests accepted at once; past it the "
+            "server sheds with 429 + Retry-After instead of queueing without "
+            "limit. 0 disables. Unset defaults to 4, raised to the "
+            "scheduler's active capacity so a full batch cohort can form."
+        ),
+    )
     parser.add_argument("--max-active-requests", type=_positive_int)
     parser.add_argument("--decode-batch-max", type=_positive_int)
     parser.add_argument("--batch-wait-ms", type=float)
