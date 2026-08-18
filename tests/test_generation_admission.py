@@ -19,6 +19,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+
 import mtplx.server.openai as openai_mod
 
 
@@ -315,17 +317,107 @@ def test_public_serve_parser_leaves_the_limit_unset_by_default():
     assert getattr(args, "max_inflight_generation_requests", "missing") is None
 
 
-def test_public_child_argument_forwarding_includes_the_admission_flag():
-    """The public command spawns the server as a child process; an option it
-    does not forward silently does nothing."""
-    import inspect
+# The public command spawns the server as a child process with an explicitly
+# rebuilt argv, and prints generated `mtplx serve` commands users copy. An
+# option dropped on any of those three paths silently does nothing: operators
+# believe admission is configured while the child applies its own default and
+# hands out 429s (or, at 0, never sheds at all). Counting the flag's text in
+# the module proves none of that — `if value is not None` -> `if value` drops
+# an explicit 0 with the count unchanged. These assert the behaviour, and 0 is
+# a first-class value in every one of them.
+
+
+@pytest.mark.parametrize("configured", ["12", "0"])
+def test_serve_forwards_the_admission_limit_into_the_child_argv(
+    monkeypatch, configured
+):
+    from test_public_cli import _serve_execvpe_harness
+
+    import mtplx.commands.public as public_mod
+    from mtplx.cli import build_parser
+
+    calls = _serve_execvpe_harness(monkeypatch)
+    args = build_parser().parse_args(
+        [
+            "serve",
+            "--model",
+            "/tmp/model",
+            "--yes",
+            "--warmup-tokens",
+            "0",
+            "--max-inflight-generation-requests",
+            configured,
+        ]
+    )
+    args._cli_flags = {
+        "model",
+        "yes",
+        "warmup-tokens",
+        "max-inflight-generation-requests",
+    }
+
+    with pytest.raises(SystemExit):
+        public_mod.cmd_serve_public(args)
+
+    cmd = calls["cmd"]
+    assert "--max-inflight-generation-requests" in cmd
+    assert cmd[cmd.index("--max-inflight-generation-requests") + 1] == configured
+
+
+def test_serve_omits_the_admission_flag_when_the_operator_configured_nothing():
+    """Unset must stay unset so the capacity-aware default can apply."""
+    from test_public_cli import _serve_execvpe_harness  # noqa: F401
+
+    import mtplx.commands.public as public_mod
+    from mtplx.cli import build_parser
+
+    args = build_parser().parse_args(["serve"])
+    suffix = public_mod._batching_command_suffix(args)
+    assert "--max-inflight-generation-requests" not in suffix
+
+
+@pytest.mark.parametrize("configured", [12, 0])
+def test_generated_serve_command_carries_the_admission_limit(configured):
+    import mtplx.commands.public as public_mod
+    from mtplx.cli import build_parser
+
+    args = build_parser().parse_args(["serve"])
+    args.max_inflight_generation_requests = configured
+    parts = public_mod._batching_command_suffix(args).split()
+    assert "--max-inflight-generation-requests" in parts
+    assert parts[parts.index("--max-inflight-generation-requests") + 1] == str(
+        configured
+    )
+
+
+@pytest.mark.parametrize("configured", [12, 0])
+def test_quickstart_hands_the_admission_limit_to_the_serve_args(configured):
+    """quickstart builds a fresh serve namespace; a value lost here means the
+    quickstart path silently runs the default."""
+    from types import SimpleNamespace
 
     import mtplx.commands.public as public_mod
 
-    source = inspect.getsource(public_mod)
-    assert source.count(
-        '("max_inflight_generation_requests", "--max-inflight-generation-requests")'
-    ) >= 2
+    source = SimpleNamespace(max_inflight_generation_requests=configured)
+    target = public_mod._with_batching_args(SimpleNamespace(), source)
+    assert target.max_inflight_generation_requests == configured
+
+
+@pytest.mark.parametrize("configured", [12, 0])
+def test_an_explicit_cli_limit_beats_the_environment(monkeypatch, configured):
+    monkeypatch.setenv("MTPLX_MAX_INFLIGHT_GENERATION_REQUESTS", "7")
+    limit = openai_mod._resolve_generation_admission_limit(
+        _state(max_inflight_generation_requests=configured)
+    )
+    assert limit == configured
+
+
+@pytest.mark.parametrize(("configured", "expected"), [("12", 12), ("0", 0)])
+def test_the_environment_configures_the_limit_when_the_cli_is_silent(
+    monkeypatch, configured, expected
+):
+    monkeypatch.setenv("MTPLX_MAX_INFLIGHT_GENERATION_REQUESTS", configured)
+    assert openai_mod._resolve_generation_admission_limit(_state()) == expected
 
 
 # --- Composition in create_app -------------------------------------------
