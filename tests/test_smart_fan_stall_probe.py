@@ -91,3 +91,77 @@ def test_server_wires_a_real_stall_probe_with_a_positive_deadline():
     assert deadline > 0
     probe = openai_mod._OwnerStallProbe(deadline_s=deadline)
     assert probe.observe(now_s=0.0) is None
+
+
+# --- Rearming across an idle window ---------------------------------------
+#
+# ``_fan_stall_probe`` is a single long-lived instance on ``ServerState``. It
+# is only READ while foreground work exists, so its frozen-since baseline is
+# whatever the last poll of the previous request left behind. After a quiet
+# night the heartbeat has been frozen for hours; without a rearm on the
+# idle-to-active edge the very next request is classified as wedged on its
+# FIRST poll, and the documented budget (FOREGROUND_STALL_DEADLINE_S plus
+# MTPLX_SMART_FAN_STALE_LEASE_S) collapses to the stale-lease window alone.
+# The rearm must fire ONLY on the 0 -> 1 transition: rearming for each extra
+# concurrent request would let a busy server hide a genuinely wedged owner.
+
+
+class _ForegroundStub:
+    """Exactly what ``begin_foreground`` and the fan probe touch."""
+
+    def __init__(self, probe):
+        import threading
+
+        self.foreground_lock = threading.Lock()
+        self.foreground_active = 0
+        self.last_request_started_at = 0.0
+        self.last_request_at = 0.0
+        self.model_scheduler = None
+        self._fan_stall_probe = probe
+
+    def has_foreground(self) -> bool:
+        return self.foreground_active > 0
+
+
+def _begin(state) -> None:
+    openai_mod.ServerState.begin_foreground(state)
+
+
+def test_a_fresh_request_is_not_stalled_by_a_stale_idle_baseline():
+    now = [0.0]
+    probe = openai_mod._OwnerStallProbe(deadline_s=100.0, clock=lambda: now[0])
+    state = _ForegroundStub(probe)
+
+    # A long idle window: no owner work, so no heartbeat ticks at all.
+    now[0] = 500.0
+    _begin(state)
+
+    assert _probe(state) is True, "a just-admitted request must not read wedged"
+
+
+def test_a_second_concurrent_request_does_not_rearm_the_stall_probe():
+    now = [0.0]
+    probe = openai_mod._OwnerStallProbe(deadline_s=100.0, clock=lambda: now[0])
+    state = _ForegroundStub(probe)
+
+    _begin(state)
+    now[0] = 500.0
+    assert _probe(state) is False, "the first request is genuinely wedged"
+
+    _begin(state)  # 1 -> 2: another request arrives behind the wedge
+    assert _probe(state) is False, "a queued arrival must not forge liveness"
+
+
+def test_the_probe_rearms_again_after_the_server_goes_fully_idle():
+    now = [0.0]
+    probe = openai_mod._OwnerStallProbe(deadline_s=100.0, clock=lambda: now[0])
+    state = _ForegroundStub(probe)
+
+    _begin(state)
+    now[0] = 500.0
+    assert _probe(state) is False
+    openai_mod.ServerState.end_foreground(state)
+
+    now[0] = 900.0
+    _begin(state)
+    assert _probe(state) is True
