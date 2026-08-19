@@ -98,6 +98,12 @@ class RequestPolicy:
     # Control ownership.
     client_controls_allowed: bool = True
 
+    # Pass-through for Pi: when True, MTPLX adds none of its own prompt
+    # contracts (tool contract, convergence/no-tool/post-tool/read-only
+    # suffixes, backend language policy). Set from per-request client
+    # detection; the default keeps every non-Pi client byte-identical.
+    disable_prompt_injections: bool = False
+
     # Tool prompt rendering.
     tool_prompt_mode: str | None = None
     template_tool_prompt_mode: str | None = None
@@ -307,6 +313,7 @@ def _resolve_completions_policy(
     srv = _srv()
     observability: dict[str, Any] = {}
     client_controls_allowed = srv._client_controls_allowed(headers, metadata)
+    disable_prompt_injections = srv._is_pi_client(headers=headers, metadata=metadata)
     request_generation_mode = srv._request_generation_mode_for_generation(
         state,
         request,
@@ -365,6 +372,7 @@ def _resolve_completions_policy(
     return RequestPolicy(
         endpoint="completions",
         client_controls_allowed=client_controls_allowed,
+        disable_prompt_injections=disable_prompt_injections,
         request_generation_mode=request_generation_mode,
         request_depth=request_depth,
         effective_request_depth=effective_request_depth,
@@ -422,6 +430,11 @@ def resolve_request_policy(
     observability: dict[str, Any] = {}
 
     opencode_client = srv._is_opencode_client(headers=headers, metadata=metadata)
+    # Pi pass-through: when the client is Pi, MTPLX adds none of its own
+    # prompt injections — Qwen receives exactly what Pi sent. Every
+    # contract below is gated off (kept as dead code, not removed) so the
+    # policy stays readable and the disable is a single observable switch.
+    disable_prompt_injections = srv._is_pi_client(headers=headers, metadata=metadata)
     requested_tool_specs = srv._normalize_tool_specs(request.tools)
     if chat:
         tool_specs = srv._filter_tool_specs_for_request(
@@ -455,6 +468,7 @@ def resolve_request_policy(
     )
     read_only_force_answer_contract_active = bool(
         chat
+        and not disable_prompt_injections
         and srv._request_should_force_answer_for_read_only_inspection(request.messages)
     )
     if read_only_force_answer_contract_active:
@@ -480,6 +494,7 @@ def resolve_request_policy(
             pass
     no_tools_contract_applies = bool(
         chat
+        and not disable_prompt_injections
         and not read_only_force_answer_contract_active
         and srv._should_add_no_tool_contract(
             requested_tools=requested_tool_specs,
@@ -501,6 +516,7 @@ def resolve_request_policy(
     client_controls_allowed = srv._client_controls_allowed(headers, metadata)
     pi_convergence_contract_active = bool(
         chat
+        and not disable_prompt_injections
         and not read_only_force_answer_contract_active
         and not no_tools_contract_active
         and not post_tool_answer_contract_active
@@ -522,8 +538,9 @@ def resolve_request_policy(
         else None
     )
     opencode_prompt_contract_system_prompt = (
+        # Pi pass-through never replaces the client's leading system message.
         srv._opencode_prompt_contract_system_prompt(opencode_prompt_contract_profile)
-        if chat
+        if chat and not disable_prompt_injections
         else None
     )
     opencode_simple_chat_contract_active = False
@@ -540,12 +557,16 @@ def resolve_request_policy(
             request.messages,
             tools_active=tools_active,
         )
-    messages_for_generation, backend_chat_policy_active = (
-        srv._with_backend_chat_policy(
-            state,
-            messages_for_generation,
+    if disable_prompt_injections:
+        # Pi pass-through: no backend language-policy splice either.
+        backend_chat_policy_active = False
+    else:
+        messages_for_generation, backend_chat_policy_active = (
+            srv._with_backend_chat_policy(
+                state,
+                messages_for_generation,
+            )
         )
-    )
     if chat:
         if read_only_force_answer_contract_active:
             messages_for_generation = (
@@ -679,6 +700,7 @@ def resolve_request_policy(
             thinking_enabled=thinking_enabled,
             reasoning_effort=reasoning_effort,
             client_controls_allowed=client_controls_allowed,
+            disable_prompt_injections=disable_prompt_injections,
             tool_prompt_mode=tool_prompt_mode,
             template_tool_prompt_mode=template_tool_prompt_mode,
             tool_prompt_mode_resolution=tool_prompt_mode_resolution,
@@ -712,6 +734,7 @@ def resolve_request_policy(
     observability["request_client_evidence"] = srv._request_client_hint_from_request(
         headers, metadata
     )
+    observability["disable_prompt_injections"] = bool(disable_prompt_injections)
     server_reasoning_mode = getattr(state.args, "reasoning", None)
     if server_reasoning_mode not in {"auto", "on", "off"}:
         server_reasoning_mode = (
@@ -790,6 +813,7 @@ def resolve_request_policy(
             read_only_force_answer_contract_active=read_only_force_answer_contract_active,
             pi_convergence_contract_active=pi_convergence_contract_active,
             post_tool_answer_contract_active=post_tool_answer_contract_active,
+            disable_prompt_injections=disable_prompt_injections,
         )
     )
     observability.update(tool_prompt_mode_resolution)
@@ -864,6 +888,7 @@ def resolve_request_policy(
         reasoning_effort=reasoning_effort,
         aime_visible_working=aime_visible_working,
         client_controls_allowed=client_controls_allowed,
+        disable_prompt_injections=disable_prompt_injections,
         tool_prompt_mode=tool_prompt_mode,
         template_tool_prompt_mode=template_tool_prompt_mode,
         tool_prompt_mode_resolution=tool_prompt_mode_resolution,
