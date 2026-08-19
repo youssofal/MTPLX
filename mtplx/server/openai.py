@@ -20462,7 +20462,14 @@ def _run_generation(
             else (getattr(out, "finish_reason", None) or "stop")
         )
         _record_request_metrics(state, dict(envelope))
-        state.last_request_at = time.time()
+        if not bool((request_observability or {}).get("warmup")):
+            # Warming generations are not user requests: the same filter the
+            # dashboard gauge applies. Stamping this clock from a warm rung
+            # made the ladder defer against its own output (rung 512 finishes,
+            # rung 2560 then waits out a full idle grace) and made /health
+            # report seconds_since_last_request as if a user had just been
+            # served on a daemon nobody has touched.
+            state.last_request_at = time.time()
         state.requests_completed += 1
         _dashboard_record_completion(state, envelope=envelope, stats=stats)
         last = {

@@ -120,6 +120,37 @@ def test_foreground_yield_shim_reads_scheduler_queues():
     assert server._ForegroundYield(state).is_set() is False
 
 
+def _deferral_probe(monkeypatch, state, scheduler):
+    """Run one warmup plan with timers faked; report whether any rung
+    actually generated and what the first step's published state is."""
+    monkeypatch.setenv("MTPLX_WARMUP_LADDER", "16")
+    monkeypatch.setenv("MTPLX_WARMUP_IDLE_GRACE_S", "90")
+    monkeypatch.setattr(server, "_prewarm_gqa_packed_pipelines", lambda: True)
+    generations: list[int] = []
+    monkeypatch.setattr(
+        server,
+        "_run_generation",
+        lambda _state, prompt_ids, **kwargs: generations.append(len(prompt_ids))
+        or {"tok_s": 1.0},
+    )
+    timers: list[tuple[float, object, tuple]] = []
+
+    class FakeTimer:
+        def __init__(self, interval, fn, args=()):
+            timers.append((interval, fn, tuple(args)))
+            self.daemon = False
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(server.threading, "Timer", FakeTimer)
+    status_host: dict = {}
+    warming = server._BackgroundWarmup(state, status_host, [1, 2, 3])
+    warming.submit(0)
+    scheduler.drain()
+    return generations, status_host, timers
+
+
 def test_background_warmup_runs_all_steps_and_publishes_done(monkeypatch):
     scheduler = FakeScheduler()
     state = make_state(scheduler)
@@ -158,31 +189,7 @@ def test_background_warmup_defers_while_foreground_recent(monkeypatch):
     scheduler = FakeScheduler()
     state = make_state(scheduler)
     state.last_request_at = _time.time()  # a response just finished
-    monkeypatch.setenv("MTPLX_WARMUP_LADDER", "16")
-    monkeypatch.setenv("MTPLX_WARMUP_IDLE_GRACE_S", "90")
-    monkeypatch.setattr(server, "_prewarm_gqa_packed_pipelines", lambda: True)
-    generations: list[int] = []
-    monkeypatch.setattr(
-        server,
-        "_run_generation",
-        lambda _state, prompt_ids, **kwargs: generations.append(len(prompt_ids))
-        or {"tok_s": 1.0},
-    )
-    timers: list[tuple[float, object, tuple]] = []
-
-    class FakeTimer:
-        def __init__(self, interval, fn, args=()):
-            timers.append((interval, fn, tuple(args)))
-            self.daemon = False
-
-        def start(self):
-            pass
-
-    monkeypatch.setattr(server.threading, "Timer", FakeTimer)
-    status_host: dict = {}
-    warming = server._BackgroundWarmup(state, status_host, [1, 2, 3])
-    warming.submit(0)
-    scheduler.drain()
+    generations, status_host, timers = _deferral_probe(monkeypatch, state, scheduler)
     # No model work ran; the plan is waiting for idle, budget untouched.
     assert generations == []
     assert status_host["background"]["steps"][0]["state"] == "waiting_idle"
@@ -361,37 +368,6 @@ def test_dashboard_record_completion_skips_warmup_rows():
         stats={},
     )
     assert "lifetime" in calls and "rolling" in calls
-
-
-def _deferral_probe(monkeypatch, state, scheduler):
-    """Run one warmup plan with timers faked; report whether any rung
-    actually generated and what the first step's published state is."""
-    monkeypatch.setenv("MTPLX_WARMUP_LADDER", "16")
-    monkeypatch.setenv("MTPLX_WARMUP_IDLE_GRACE_S", "90")
-    monkeypatch.setattr(server, "_prewarm_gqa_packed_pipelines", lambda: True)
-    generations: list[int] = []
-    monkeypatch.setattr(
-        server,
-        "_run_generation",
-        lambda _state, prompt_ids, **kwargs: generations.append(len(prompt_ids))
-        or {"tok_s": 1.0},
-    )
-    timers: list[tuple[float, object, tuple]] = []
-
-    class FakeTimer:
-        def __init__(self, interval, fn, args=()):
-            timers.append((interval, fn, tuple(args)))
-            self.daemon = False
-
-        def start(self):
-            pass
-
-    monkeypatch.setattr(server.threading, "Timer", FakeTimer)
-    status_host: dict = {}
-    warming = server._BackgroundWarmup(state, status_host, [1, 2, 3])
-    warming.submit(0)
-    scheduler.drain()
-    return generations, status_host, timers
 
 
 def test_background_warmup_defers_while_a_request_is_in_flight(monkeypatch):
