@@ -8519,13 +8519,19 @@ def test_agent_tool_clients_repair_native_launch_mode_to_hybrid(
     rendered = "\n".join(str(message.get("content") or "") for message in messages)
     stats = seen["request_observability"]
     assert [tool["function"]["name"] for tool in kwargs["tools"]] == ["session_status"]
-    assert "MTPLX tool contract:" in rendered
+    if client_hint == "pi":
+        # Pi pass-through: the tool-contract system splice is disabled, so
+        # Qwen sees exactly the tools Pi declared — no MTPLX contract text.
+        assert "MTPLX tool contract:" not in rendered
+        assert stats["tool_contract_active"] is False
+    else:
+        assert "MTPLX tool contract:" in rendered
+        assert stats["tool_contract_active"] is True
     assert stats["tool_prompt_mode"] == "hybrid"
     assert stats["tool_prompt_mode_launch"] == "native"
     assert stats["tool_prompt_mode_client"] == client_hint
     assert stats["tool_prompt_mode_source"] == f"client:{client_hint}"
     assert stats["tool_prompt_mode_client_repaired"] is True
-    assert stats["tool_contract_active"] is True
     assert (
         stats["tool_contract_policy_version"].startswith("soft_schema_contract:")
         or stats["tool_contract_policy_version"]
@@ -9065,39 +9071,29 @@ def test_pi_tool_history_adds_convergence_contract_after_budget(monkeypatch):
     rendered = "\n".join(str(message.get("content") or "") for message in messages)
     stats = seen["request_observability"]
     assert "tools" in kwargs
-    assert "MTPLX Pi convergence turn:" in rendered
-    assert "MTPLX Pi convergence instruction:" in rendered
-    assert "A single targeted read" in rendered
-    assert "only one narrow line-range refresh" in rendered
-    assert messages[-1]["role"] == "user"
-    # PREFIX STABILITY (2026-07-04): the convergence contract activates
-    # MID-SESSION (tool-count budget), so it must never rewrite earlier
-    # transcript bytes — the system message stays untouched and the whole
-    # contract travels in the appended user message. The old system-append
-    # invalidated every banked KV prefix at the transition round.
+    # Pi pass-through: even past the tool-count budget, MTPLX injects none
+    # of its own contracts. Qwen receives exactly what Pi sent — no
+    # convergence suffix, no tool-contract system splice.
+    assert "MTPLX Pi convergence turn:" not in rendered
+    assert "MTPLX Pi convergence instruction:" not in rendered
+    assert "MTPLX tool contract:" not in rendered
+    assert rendered == (
+        "You are Pi.\n"
+        "Inspect this project, implement the safest useful "
+        "change, and run the relevant check.\n"
+        "package.json evidence\n"
+        "src/game.ts evidence"
+    )
+    # Transcript is byte-identical to the request: nothing appended, the
+    # leading system message is untouched.
     assert messages[0]["role"] == "system"
-    assert "MTPLX Pi convergence turn:" not in str(messages[0]["content"])
-    assert "MTPLX Pi convergence turn:" in str(messages[-1]["content"])
-    assert "MTPLX Pi convergence instruction:" in str(messages[-1]["content"])
-    assert stats["request_pi_convergence_contract"] is True
+    assert messages[0]["content"] == "You are Pi."
+    assert messages[-1]["role"] == "tool"
+    assert len(messages) == 4
+    assert stats["request_pi_convergence_contract"] is False
     assert stats["request_pi_convergence_tool_result_count"] == 2
     assert stats["request_pi_convergence_after_tools"] == 2
-    assert stats["pi_convergence_contract_active"] is True
-    assert (
-        stats["request_session_restore_policy"]
-        == "stable_without_transient_pi_convergence"
-    )
-    assert stats["request_session_restore_policy_matches_postcommit"] is True
-    assert stats["request_filtered_tool_names"] == [
-        "bash",
-        "read",
-        "edit",
-        "write",
-        "grep",
-        "find",
-        "ls",
-    ]
-    assert stats["tool_contract_policy_version"].endswith("+pi_convergence:v1")
+    assert stats["pi_convergence_contract_active"] is False
 
 
 def test_filter_tool_specs_preserves_tools_for_loose_simple_chitchat():

@@ -11510,6 +11510,7 @@ def _maybe_canonicalize_committed_reasoning(
     tools: list[dict[str, Any]] | None,
     tool_choice: Any,
     tool_prompt_mode: str,
+    disable_prompt_injections: bool = False,
     template_observability: dict[str, Any],
     request_observability: dict[str, Any] | None = None,
     transcript_stats: Any | None = None,
@@ -11625,6 +11626,7 @@ def _maybe_canonicalize_committed_reasoning(
         tool_prompt_mode=tool_prompt_mode,
         template_observability=canon_observability,
         allow_committed_reasoning=True,
+        disable_prompt_injections=disable_prompt_injections,
     )
     cp_canon = _common_prefix_len(canon_ids, committed)
     outcome["cp_canon"] = int(cp_canon)
@@ -11911,6 +11913,7 @@ def _encode_messages(
     tool_prompt_mode: str = _TOOL_PROMPT_MODE_HYBRID,
     template_observability: dict[str, Any] | None = None,
     allow_committed_reasoning: bool = False,
+    disable_prompt_injections: bool = False,
 ) -> list[int]:
     """Memoizing front for :func:`_encode_messages_uncached`.
 
@@ -11934,6 +11937,7 @@ def _encode_messages(
             tool_prompt_mode=tool_prompt_mode,
             template_observability=template_observability,
             allow_committed_reasoning=allow_committed_reasoning,
+            disable_prompt_injections=disable_prompt_injections,
         )
     try:
         tokenizer_key = _chat_encode_tokenizer_key(tokenizer)
@@ -11955,6 +11959,7 @@ def _encode_messages(
                 "tool_choice": tool_choice,
                 "tool_prompt_mode": tool_prompt_mode,
                 "committed_reasoning": bool(allow_committed_reasoning),
+                "disable_prompt_injections": bool(disable_prompt_injections),
                 # The rendered prompt embeds the current date (tool contract's
                 # burst-pinned _current_date_line; hypothetically also
                 # strftime_now-style templates reading the raw wall clock).
@@ -11997,6 +12002,7 @@ def _encode_messages(
         tool_prompt_mode=tool_prompt_mode,
         template_observability=fresh_observability,
         allow_committed_reasoning=allow_committed_reasoning,
+        disable_prompt_injections=disable_prompt_injections,
     )
     if key is not None:
         GLOBAL_CHAT_ENCODE_CACHE.put(key, ids, fresh_observability)
@@ -12021,6 +12027,7 @@ def _encode_messages_uncached(
     tool_prompt_mode: str = _TOOL_PROMPT_MODE_HYBRID,
     template_observability: dict[str, Any] | None = None,
     allow_committed_reasoning: bool = False,
+    disable_prompt_injections: bool = False,
 ) -> list[int]:
     # Scoped mode keeps reasoning_content on the normalized messages and
     # passes preserve_thinking=False so the template's own rolling checkpoint
@@ -12063,7 +12070,7 @@ def _encode_messages_uncached(
     if not normalized:
         normalized = [{"role": "user", "content": ""}]
     effective_tool_prompt_mode = _normalize_tool_prompt_mode(tool_prompt_mode)
-    if _tool_contract_active_for_mode(
+    if not disable_prompt_injections and _tool_contract_active_for_mode(
         tools_active=bool(tools),
         tool_prompt_mode=effective_tool_prompt_mode,
     ):
@@ -12073,7 +12080,11 @@ def _encode_messages_uncached(
             tool_choice=tool_choice,
             observability=template_observability,
         )
-    elif effective_tool_prompt_mode == _TOOL_PROMPT_MODE_NATIVE and tools:
+    elif (
+        not disable_prompt_injections
+        and effective_tool_prompt_mode == _TOOL_PROMPT_MODE_NATIVE
+        and tools
+    ):
         normalized, native_tail_added = _with_mtplx_native_agent_tail(
             normalized,
             tools=tools,
@@ -12338,9 +12349,10 @@ def _render_messages_for_postcommit(
     preserve_thinking: bool,
     tools: list[dict[str, Any]] | None,
     tool_prompt_mode: str = _TOOL_PROMPT_MODE_HYBRID,
+    disable_prompt_injections: bool = False,
 ) -> str | None:
     effective_tool_prompt_mode = _normalize_tool_prompt_mode(tool_prompt_mode)
-    if _tool_contract_active_for_mode(
+    if not disable_prompt_injections and _tool_contract_active_for_mode(
         tools_active=bool(tools),
         tool_prompt_mode=effective_tool_prompt_mode,
     ):
@@ -12424,6 +12436,7 @@ def _postcommit_next_turn_prefix_ids(
     tools: list[dict[str, Any]] | None,
     assistant_tool_calls: list[dict[str, Any]] | None,
     tool_prompt_mode: str = _TOOL_PROMPT_MODE_HYBRID,
+    disable_prompt_injections: bool = False,
 ) -> list[int] | None:
     # Same echo-carry rule as _encode_messages_uncached: the postcommit
     # prediction must render the exact bytes the next request's encode will,
@@ -12486,6 +12499,7 @@ def _postcommit_next_turn_prefix_ids(
         ),
         tools=tools,
         tool_prompt_mode=tool_prompt_mode,
+        disable_prompt_injections=disable_prompt_injections,
     )
     if not rendered:
         return None
@@ -16968,6 +16982,23 @@ def _is_hermes_client(
     return "hermes" in client_hint
 
 
+def _is_pi_client(
+    *,
+    headers: Mapping[str, str],
+    metadata: Mapping[str, Any],
+) -> bool:
+    """True when the per-request client hint identifies the Pi coding agent.
+
+    Mirrors :func:`_is_opencode_client` / :func:`_is_hermes_client`. Pi's
+    provider config (``mtplx/pi.py``) pins ``x-mtplx-client: pi`` on every
+    request, so the hint is always ``"pi"`` for Pi traffic. This is one
+    switch MTPLX uses to hand Pi a pure pass-through transcript with no
+    MTPLX-authored prompt injections.
+    """
+    client_hint = str(_request_client_hint_from_request(headers, metadata) or "")
+    return "pi" in client_hint
+
+
 def _request_tool_prompt_mode_override(
     *,
     headers: Mapping[str, str],
@@ -17154,6 +17185,7 @@ def _bridge_policy_observability(
     read_only_force_answer_contract_active: bool = False,
     pi_convergence_contract_active: bool = False,
     post_tool_answer_contract_active: bool = False,
+    disable_prompt_injections: bool = False,
 ) -> dict[str, Any]:
     effective_tool_prompt_mode = _normalize_tool_prompt_mode(tool_prompt_mode)
     return {
@@ -17167,9 +17199,12 @@ def _bridge_policy_observability(
             pi_convergence_contract_active=pi_convergence_contract_active,
             post_tool_answer_contract_active=post_tool_answer_contract_active,
         ),
-        "tool_contract_active": _tool_contract_active_for_mode(
-            tools_active=tools_active,
-            tool_prompt_mode=effective_tool_prompt_mode,
+        "tool_contract_active": (
+            not disable_prompt_injections
+            and _tool_contract_active_for_mode(
+                tools_active=tools_active,
+                tool_prompt_mode=effective_tool_prompt_mode,
+            )
         ),
         "no_tools_contract_active": bool(no_tools_contract_active),
         "post_tool_answer_contract_active": bool(post_tool_answer_contract_active),
@@ -17323,6 +17358,7 @@ def _store_retokenized_history_snapshot(
     keep_live_ref: bool = True,
     tool_prompt_mode: str | None = None,
     strip_tool_call_preamble_text: bool = False,
+    disable_prompt_injections: bool = False,
     committed_stream_ids: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     if session_id is None:
@@ -17356,6 +17392,7 @@ def _store_retokenized_history_snapshot(
         tool_specs=tool_specs,
         tool_prompt_mode=tool_prompt_mode,
         strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+        disable_prompt_injections=disable_prompt_injections,
         committed_stream_ids=committed_stream_ids,
     )
     if not history_ids:
@@ -17715,6 +17752,7 @@ def _history_ids_for_postcommit(
     tool_specs: list[dict[str, Any]] | None = None,
     tool_prompt_mode: str | None = None,
     strip_tool_call_preamble_text: bool = False,
+    disable_prompt_injections: bool = False,
     committed_stream_ids: Sequence[int] | None = None,
     session_committed_ids: Sequence[int] | None = None,
 ) -> tuple[list[int], Any]:
@@ -17867,6 +17905,7 @@ def _history_ids_for_postcommit(
         tools=tool_specs,
         assistant_tool_calls=assistant_tool_calls,
         tool_prompt_mode=effective_tool_prompt_mode,
+        disable_prompt_injections=disable_prompt_injections,
     )
     history_ids = next_turn_prefix_ids or _encode_messages(
         state.runtime.tokenizer,
@@ -17883,6 +17922,7 @@ def _history_ids_for_postcommit(
         # server-built copies; without this flag the fallback encode
         # silently drops them and the prefix stops extending the session.
         allow_committed_reasoning=True,
+        disable_prompt_injections=disable_prompt_injections,
     )
     if not postcommit_vision_images or not history_ids:
         return list(history_ids or []), None
@@ -17909,6 +17949,7 @@ def _generation_final_postcommit_compatibility(
     tool_prompt_mode: str | None = None,
     strip_tool_call_preamble_text: bool = False,
     session: Any | None = None,
+    disable_prompt_injections: bool = False,
 ) -> dict[str, Any]:
     # Tool-call turns are no longer refused a priori (the retired
     # "tool_call_history_rewrite" gate): the byte-compare below is the real
@@ -17973,6 +18014,7 @@ def _generation_final_postcommit_compatibility(
         tool_specs=tool_specs,
         tool_prompt_mode=tool_prompt_mode,
         strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+        disable_prompt_injections=disable_prompt_injections,
         # The generation boundary IS the committed stream this snapshot
         # anchors: rendering the history with its think interiors is what
         # lets a thinking turn be token-identical to prompt+generated at
@@ -18057,6 +18099,7 @@ def _store_generation_final_history_snapshot(
     tool_prompt_mode: str | None = None,
     strip_tool_call_preamble_text: bool = False,
     session: Any | None = None,
+    disable_prompt_injections: bool = False,
 ) -> dict[str, Any]:
     if session_id is None:
         return {"stored": False, "mode": "unsafe", "reason": "no_session_id"}
@@ -18084,6 +18127,7 @@ def _store_generation_final_history_snapshot(
         tool_prompt_mode=tool_prompt_mode,
         strip_tool_call_preamble_text=strip_tool_call_preamble_text,
         session=session,
+        disable_prompt_injections=disable_prompt_injections,
     )
     if not bool(compatibility.get("safe")):
         return {
@@ -18208,6 +18252,7 @@ def _schedule_idle_postcommit_snapshot(
     keep_live_ref: bool = True,
     tool_prompt_mode: str | None = None,
     strip_tool_call_preamble_text: bool = False,
+    disable_prompt_injections: bool = False,
     committed_stream_ids: Sequence[int] | None = None,
     retry_count: int = 0,
 ) -> dict[str, Any]:
@@ -18446,6 +18491,7 @@ def _schedule_idle_postcommit_snapshot(
                     keep_live_ref=bool(keep_live_ref),
                     tool_prompt_mode=tool_prompt_mode,
                     strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+                    disable_prompt_injections=disable_prompt_injections,
                     committed_stream_ids=committed_stream_ids,
                 )
                 if postcommit.get("stored"):
@@ -26536,6 +26582,7 @@ def create_app(state: ServerState) -> FastAPI:
             tool_choice=request.tool_choice,
             tool_prompt_mode=template_tool_prompt_mode,
             template_observability=template_observability,
+            disable_prompt_injections=policy.disable_prompt_injections,
         )
         resolved_session_id: str | None = None
         resolved_session_source: str | None = None
@@ -26627,6 +26674,7 @@ def create_app(state: ServerState) -> FastAPI:
                 tools=tool_specs if tools_active else None,
                 tool_choice=request.tool_choice,
                 tool_prompt_mode=template_tool_prompt_mode,
+                disable_prompt_injections=policy.disable_prompt_injections,
                 template_observability=template_observability,
                 # request_observability is bound later in the prologue on
                 # some branches; the outcome rides template_observability,
@@ -27194,6 +27242,7 @@ def create_app(state: ServerState) -> FastAPI:
                 tool_prompt_mode=postcommit_tool_prompt_mode,
                 strip_tool_call_preamble_text=opencode_client,
                 session=session,
+                disable_prompt_injections=policy.disable_prompt_injections,
             )
             if compatibility.get("safe"):
                 generated["stats"]["session_postcommit_snapshot"] = {
@@ -27247,6 +27296,7 @@ def create_app(state: ServerState) -> FastAPI:
                         keep_live_ref=session_keep_live_ref,
                         tool_prompt_mode=postcommit_tool_prompt_mode,
                         strip_tool_call_preamble_text=opencode_client,
+                        disable_prompt_injections=policy.disable_prompt_injections,
                         committed_stream_ids=postcommit_committed_stream,
                     )
                 )
@@ -27267,6 +27317,7 @@ def create_app(state: ServerState) -> FastAPI:
                         keep_live_ref=session_keep_live_ref,
                         tool_prompt_mode=postcommit_tool_prompt_mode,
                         strip_tool_call_preamble_text=opencode_client,
+                        disable_prompt_injections=policy.disable_prompt_injections,
                         committed_stream_ids=postcommit_committed_stream,
                     ),
                     batch_key=f"postcommit.inline:{session_id or 'stateless'}",
@@ -27691,6 +27742,7 @@ def create_app(state: ServerState) -> FastAPI:
                         ),
                         tools=tool_specs,
                         tool_prompt_mode=tool_prompt_mode,
+                        disable_prompt_injections=policy.disable_prompt_injections,
                         template_observability=repair_observability,
                         # Repair re-encodes run on the gate's canonical
                         # messages: without this flag the substituted think
@@ -28025,6 +28077,7 @@ def create_app(state: ServerState) -> FastAPI:
                         ),
                         tools=tool_specs,
                         tool_prompt_mode=tool_prompt_mode,
+                        disable_prompt_injections=policy.disable_prompt_injections,
                         template_observability=repair_observability,
                         # Repair re-encodes run on the gate's canonical
                         # messages: without this flag the substituted think
@@ -28194,6 +28247,7 @@ def create_app(state: ServerState) -> FastAPI:
                         ),
                         tools=None,
                         tool_prompt_mode=tool_prompt_mode,
+                        disable_prompt_injections=policy.disable_prompt_injections,
                         template_observability=repair_observability,
                         # Same committed-reasoning preservation as the other
                         # repair encodes (audit F11 #5).
@@ -28453,6 +28507,7 @@ def create_app(state: ServerState) -> FastAPI:
                                                 keep_live_ref=session_keep_live_ref,
                                                 tool_prompt_mode=postcommit_tool_prompt_mode,
                                                 strip_tool_call_preamble_text=opencode_client,
+                                                disable_prompt_injections=policy.disable_prompt_injections,
                                                 committed_stream_ids=(
                                                     stream_committed_stream
                                                 ),
@@ -28486,6 +28541,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             keep_live_ref=session_keep_live_ref,
                                             tool_prompt_mode=postcommit_tool_prompt_mode,
                                             strip_tool_call_preamble_text=opencode_client,
+                                            disable_prompt_injections=policy.disable_prompt_injections,
                                         )
                                         generated["stats"][
                                             "session_postcommit_snapshot"
@@ -28523,6 +28579,7 @@ def create_app(state: ServerState) -> FastAPI:
                                                     keep_live_ref=session_keep_live_ref,
                                                     tool_prompt_mode=postcommit_tool_prompt_mode,
                                                     strip_tool_call_preamble_text=opencode_client,
+                                                    disable_prompt_injections=policy.disable_prompt_injections,
                                                 )
                                             ),
                                             batch_key=(
@@ -29941,6 +29998,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             keep_live_ref=session_keep_live_ref,
                                             tool_prompt_mode=postcommit_tool_prompt_mode,
                                             strip_tool_call_preamble_text=opencode_client,
+                                            disable_prompt_injections=policy.disable_prompt_injections,
                                             committed_stream_ids=[
                                                 int(token) for token in prompt_ids
                                             ]
@@ -30612,6 +30670,7 @@ def create_app(state: ServerState) -> FastAPI:
             tools=policy.tool_specs if policy.tools_active else None,
             tool_choice=chat_request.tool_choice,
             tool_prompt_mode=policy.tool_prompt_mode,
+            disable_prompt_injections=policy.disable_prompt_injections,
         )
         return {"input_tokens": len(prompt_ids)}
 
