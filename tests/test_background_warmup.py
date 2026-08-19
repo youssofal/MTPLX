@@ -120,11 +120,11 @@ def test_foreground_yield_shim_reads_scheduler_queues():
     assert server._ForegroundYield(state).is_set() is False
 
 
-def _deferral_probe(monkeypatch, state, scheduler):
+def _deferral_probe(monkeypatch, state, scheduler, grace: str = "90"):
     """Run one warmup plan with timers faked; report whether any rung
     actually generated and what the first step's published state is."""
     monkeypatch.setenv("MTPLX_WARMUP_LADDER", "16")
-    monkeypatch.setenv("MTPLX_WARMUP_IDLE_GRACE_S", "90")
+    monkeypatch.setenv("MTPLX_WARMUP_IDLE_GRACE_S", grace)
     monkeypatch.setattr(server, "_prewarm_gqa_packed_pipelines", lambda: True)
     generations: list[int] = []
     monkeypatch.setattr(
@@ -389,6 +389,37 @@ def test_background_warmup_defers_while_a_request_is_in_flight(monkeypatch):
     assert status_host["background"]["steps"][0]["state"] == "waiting_idle"
     assert status_host["background"]["resubmits"] == 0
     assert len(timers) == 1
+
+
+def test_background_warmup_holds_a_live_request_even_at_zero_grace(monkeypatch):
+    """MTPLX_WARMUP_IDLE_GRACE_S=0 drops the between-turns wait, not the
+    live-traffic guard.
+
+    Expressing "busy" as zero quiet made the hold collapse at grace 0
+    (``0.0 < 0.0`` is False), so the one knob an operator reaches for when
+    warm rungs are not running also handed them a request that was still
+    generating -- the exact starvation the guard exists to prevent.
+    """
+    scheduler = FakeScheduler()
+    state = make_state(scheduler)
+    state.last_request_at = 0.0
+    state.foreground_active = 1  # a real request is generating right now
+    generations, status_host, timers = _deferral_probe(
+        monkeypatch, state, scheduler, grace="0"
+    )
+    assert generations == [], "warming generated against a live request at grace 0"
+    assert status_host["background"]["steps"][0]["state"] == "waiting_idle"
+    assert status_host["background"]["resubmits"] == 0
+    assert len(timers) == 1
+    wait_s, fn, args = timers[0]
+    assert wait_s >= 1.0  # _defer_step floors the re-check, never a hot loop
+    # The request finishes and nothing else is queued: zero grace means the
+    # plan runs on the very next admission, with no wait to serve out.
+    state.foreground_active = 0
+    fn(*args)
+    scheduler.drain()
+    assert generations == [16]
+    assert status_host["background"]["state"] == "done"
 
 
 def test_background_warmup_defers_while_foreground_is_queued(monkeypatch):

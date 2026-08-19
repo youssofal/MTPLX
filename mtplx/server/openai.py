@@ -20468,9 +20468,12 @@ def _run_generation(
             # made the ladder defer against its own output (rung 512 finishes,
             # rung 2560 then waits out a full idle grace) and made /health
             # report seconds_since_last_request as if a user had just been
-            # served on a daemon nobody has touched.
+            # served on a daemon nobody has touched. The counter moves with
+            # the clock so the two /health fields cannot disagree, and so the
+            # max-idle watchdog does not read warming as user traffic and
+            # hold the fans at performance.
             state.last_request_at = time.time()
-        state.requests_completed += 1
+            state.requests_completed += 1
         _dashboard_record_completion(state, envelope=envelope, stats=stats)
         last = {
             "text": out.text,
@@ -20698,6 +20701,28 @@ class _BackgroundWarmup:
                 return cls.IDLE_GRACE_S
         return cls.IDLE_GRACE_S
 
+    def _foreground_busy(self) -> bool:
+        """True while a real request is generating or queued for the model.
+
+        Only sound at step admission. The warming generation itself calls
+        ``begin_foreground`` for the whole rung, so ``has_foreground()``
+        reads zero here but non-zero once the rung is running: a caller
+        that re-checked from inside a rung would see warmup's own work as
+        live traffic and defer the ladder forever. That is why the sibling
+        ``_ForegroundYield`` reads the scheduler queues instead — it runs
+        during the rung, this runs before it.
+        """
+        state = self.state
+        try:
+            if state.has_foreground():
+                return True
+        except BaseException:
+            pass
+        try:
+            return bool(_foreground_model_work_pending(state))
+        except BaseException:
+            return False
+
     def _foreground_quiet_for_s(self) -> float:
         # last_request_at is stamped when a request COMPLETES, so a request
         # that has arrived and is still generating leaves it untouched --
@@ -20706,22 +20731,12 @@ class _BackgroundWarmup:
         # That is the post-restart window an operator actually types into
         # (a UI that restarts the engine on a config change is typed into
         # immediately afterwards), so the very first request of a serve was
-        # the one most likely to be warmed over. Model work in flight or
-        # queued is zero quiet; only then does the completion stamp decide.
-        state = self.state
-        try:
-            if state.has_foreground():
-                return 0.0
-        except BaseException:
-            pass
-        try:
-            if _foreground_model_work_pending(state):
-                return 0.0
-        except BaseException:
-            pass
-        last = float(getattr(state, "last_request_at", 0.0) or 0.0)
+        # the one most likely to be warmed over. In-flight and queued work
+        # is _foreground_busy's answer, and it holds the ladder whatever the
+        # grace is; this measures the completion stamp alone.
+        last = float(getattr(self.state, "last_request_at", 0.0) or 0.0)
         if last <= 0.0:
-            # Nothing has ever run and nothing is running: warm immediately.
+            # Nothing has ever completed: no traffic to stay clear of.
             return float("inf")
         return max(0.0, time.time() - last)
 
@@ -20757,10 +20772,15 @@ class _BackgroundWarmup:
             self._finish()
             return
         grace = self._idle_grace_s()
-        quiet = self._foreground_quiet_for_s()
-        if quiet < grace:
-            # Recently-served traffic: hold the plan without burning GPU or
-            # the resubmit budget, and re-check when the grace can be met.
+        busy = self._foreground_busy()
+        quiet = 0.0 if busy else self._foreground_quiet_for_s()
+        if busy or quiet < grace:
+            # Live or recently-served traffic: hold the plan without burning
+            # GPU or the resubmit budget, and re-check when the grace can be
+            # met. Busy is its own branch, not a zero folded into the grace
+            # comparison: MTPLX_WARMUP_IDLE_GRACE_S=0 is how an operator says
+            # "do not wait between turns", and it must not also hand a warm
+            # rung a request that is still generating.
             step = self.steps[index]
             if step.get("state") in ("pending", "yielded", "waiting_idle"):
                 step["state"] = "waiting_idle"
