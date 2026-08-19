@@ -186,37 +186,104 @@ def test_vk_6bit_hexpack_ksplit_matches_stock() -> None:
                 assert diff < 0.05, f"6-bit drift {dtype} gs={gs} M={m}: {diff}"
 
 
-def test_qlinear_patch_routes_6bit_verify_shapes() -> None:
-    """The patch routes 6-bit verify shapes (N >= 2048 floor) through the
-    hexpack kernels and leaves small-N projections on stock."""
+def test_qlinear_patch_routes_6bit_verify_shapes(monkeypatch) -> None:
+    """6-bit verify routing: the m5/m6 hexpack routes are on by default, the
+    m4 route is opt-in, and the N >= 2048 floor plus the prefill exclusion
+    hold for both.
+
+    m4 is opt-in because on applegpu_g15s it is a measured loss on a
+    27B-class trunk with the whole model resident (+20 to +26% against
+    stock), while m5/m6 win 22-35% in the same sweep. See
+    vk_qmm6_m4_enabled and benchmarks/repro_vk_qmm6_m4_route.py.
+    """
     from mtplx import verify_kernels
 
+    monkeypatch.delenv("MTPLX_VK_QMM6_M4", raising=False)
     report = install_nax_qlinear_patch()
     assert report["installed"] is True
-    calls = {"m4": 0}
-    orig = verify_kernels.vk_qmm_m4_ksplit
+    calls = {"m4": 0, "m6": 0}
+    orig4 = verify_kernels.vk_qmm_m4_ksplit
+    orig6 = verify_kernels.vk_qmm_m6_ksplit
 
-    def counting(*a, **k):
+    def counting4(*a, **k):
         calls["m4"] += 1
-        return orig(*a, **k)
+        return orig4(*a, **k)
+
+    def counting6(*a, **k):
+        calls["m6"] += 1
+        return orig6(*a, **k)
 
     from mtplx.attention_context import attention_phase
 
     import mtplx.nax_verify  # noqa: F401  (patch reads through the module)
 
-    verify_kernels.vk_qmm_m4_ksplit = counting
+    verify_kernels.vk_qmm_m4_ksplit = counting4
+    verify_kernels.vk_qmm_m6_ksplit = counting6
     try:
         big = nn.QuantizedLinear(512, 2048, bias=False, group_size=64, bits=6)
         small = nn.QuantizedLinear(512, 256, bias=False, group_size=64, bits=6)
-        x = (mx.random.normal((4, 512), dtype=mx.float32) * 0.5).astype(mx.bfloat16)
+        x4 = (mx.random.normal((4, 512), dtype=mx.float32) * 0.5).astype(mx.bfloat16)
+        x5 = (mx.random.normal((5, 512), dtype=mx.float32) * 0.5).astype(mx.bfloat16)
+        with attention_phase("decode_verify"):
+            mx.eval(big(x4))
+            assert calls["m4"] == 0, "6-bit m4 route must be opt-in"
+            mx.eval(big(x5))
+            assert calls["m6"] == 1, "6-bit m5 verify shape did not route the hexpack kernel"
+            mx.eval(small(x5))
+            assert calls["m6"] == 1, "small-N 6-bit projection must stay stock"
+        with attention_phase("prefill"):
+            mx.eval(big(x5))
+            assert calls["m6"] == 1, "prefill must stay stock"
+
+        # Opt in: the m4 route comes back for hardware where it wins.
+        monkeypatch.setenv("MTPLX_VK_QMM6_M4", "1")
+        with attention_phase("decode_verify"):
+            mx.eval(big(x4))
+            assert calls["m4"] == 1, "MTPLX_VK_QMM6_M4=1 did not restore the m4 route"
+            mx.eval(small(x4))
+            assert calls["m4"] == 1, "small-N must stay stock even when opted in"
+    finally:
+        verify_kernels.vk_qmm_m4_ksplit = orig4
+        verify_kernels.vk_qmm_m6_ksplit = orig6
+        uninstall_nax_qlinear_patch()
+
+
+def test_vk_qmm6_m4_env_flag(monkeypatch) -> None:
+    from mtplx.nax_verify import vk_qmm6_m4_enabled
+
+    monkeypatch.delenv("MTPLX_VK_QMM6_M4", raising=False)
+    assert vk_qmm6_m4_enabled() is False
+    for on in ("1", "true", "on", "yes", " ON "):
+        monkeypatch.setenv("MTPLX_VK_QMM6_M4", on)
+        assert vk_qmm6_m4_enabled() is True
+    for off in ("0", "false", "no", "off", ""):
+        monkeypatch.setenv("MTPLX_VK_QMM6_M4", off)
+        assert vk_qmm6_m4_enabled() is False
+
+
+def test_4bit_m4_route_is_unaffected_by_the_6bit_gate(monkeypatch) -> None:
+    """The regression is 6-bit specific: at 4 bits the m4 split-K route is a
+    measured win (-17% on the same sweep) and must still fire by default."""
+    monkeypatch.delenv("MTPLX_VK_QMM6_M4", raising=False)
+    install_nax_qlinear_patch()
+    import mtplx.nax_verify as nv
+
+    calls = {"n": 0}
+    orig = nv.nax_qmm_m4
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return orig(*a, **k)
+
+    from mtplx.attention_context import attention_phase
+
+    nv.nax_qmm_m4 = counting
+    try:
+        big = nn.QuantizedLinear(5120, 2048, bias=False, group_size=64, bits=4)
+        x = (mx.random.normal((4, 5120), dtype=mx.float32) * 0.5).astype(mx.bfloat16)
         with attention_phase("decode_verify"):
             mx.eval(big(x))
-            assert calls["m4"] == 1, "6-bit verify shape did not route the hexpack kernel"
-            mx.eval(small(x))
-            assert calls["m4"] == 1, "small-N 6-bit projection must stay stock"
-        with attention_phase("prefill"):
-            mx.eval(big(x))
-            assert calls["m4"] == 1, "prefill must stay stock"
+        assert calls["n"] == 1, "4-bit m4 route must be unaffected"
     finally:
-        verify_kernels.vk_qmm_m4_ksplit = orig
+        nv.nax_qmm_m4 = orig
         uninstall_nax_qlinear_patch()

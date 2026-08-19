@@ -35,6 +35,47 @@ def nax_env_enabled() -> bool:
     }
 
 
+def vk_qmm6_m4_enabled() -> bool:
+    """Opt-in for the 6-bit split-K hexpack route at m == 4.
+
+    The m5/m6 6-bit routes are measured wins and stay on. The m == 4 route
+    is off by default because on applegpu_g15s (M3 Max) it is a measured
+    LOSS on a 27B-class trunk, in the regime that matters: with the whole
+    model resident, so every layer's weights stream from DRAM once per
+    forward the way they do in a real decode round, rather than one hot
+    tensor re-timed in a loop.
+
+    Whole-model sweep, Qwen3.8-27B shapes (64 layers + lm_head, 19.37 GiB
+    of 6-bit weights, group_size 64, fp16 activations), every cell
+    re-measured once per round with rounds interleaved, medians of 7 to 9:
+
+        bits=6   m=4   stock 63.3-64.7 ms   hexpack 77.5-82.8 ms   +20 to +30%
+        bits=6   m=5   stock 82.8-87.3 ms   hexpack 67.3-67.7 ms   -19 to -22%
+        bits=6   m=6   stock 131.0-134.5 ms hexpack 74.0-86.2 ms   -35 to -45%
+
+        bits=4   m=4   stock 48.6-54.2 ms   hexpack 40.4-45.0 ms   -17%
+
+    Ranges are across three independent runs of the reproducer; the m=4
+    direction was the same in all three.
+
+    So the regression is specific to 6 bits at m == 4; the 4-bit m4 route
+    is a win and is untouched. The upstream 1.1-2.4x figure was taken on
+    the 9B tier, whose projections are narrow enough that the split-K
+    geometry still pays at four rows; on the 27B's wider projections it
+    does not, and the machine's roofline (379 GB/s, measured) shows stock
+    already at 85% of it at m=4 where the hexpack path reaches 71%.
+
+    Set MTPLX_VK_QMM6_M4=1 to restore the route on hardware where it wins.
+    Reproducer: benchmarks/repro_vk_qmm6_m4_route.py
+    """
+    return str(os.environ.get("MTPLX_VK_QMM6_M4", "")).strip().lower() in {
+        "1",
+        "true",
+        "on",
+        "yes",
+    }
+
+
 @lru_cache(maxsize=1)
 def _nax_hardware_available() -> bool:
     """GPU family + macOS floor. Immutable for the process life — safe to memoize."""
@@ -1010,6 +1051,7 @@ def install_nax_qlinear_patch() -> dict[str, object]:
                 if (
                     m == 4
                     and n >= 2048
+                    and vk_qmm6_m4_enabled()
                     and not lane_disabled("qmm_m4")
                     and vk_eligible_ksplit(m, k, n, bits, group_size, x.dtype)
                 ):
