@@ -20692,9 +20692,29 @@ class _BackgroundWarmup:
         return cls.IDLE_GRACE_S
 
     def _foreground_quiet_for_s(self) -> float:
-        last = float(getattr(self.state, "last_request_at", 0.0) or 0.0)
+        # last_request_at is stamped when a request COMPLETES, so a request
+        # that has arrived and is still generating leaves it untouched --
+        # 0.0 on a daemon that has not finished one yet, which read as
+        # "infinitely quiet" and admitted a warm rung against live traffic.
+        # That is the post-restart window an operator actually types into
+        # (a UI that restarts the engine on a config change is typed into
+        # immediately afterwards), so the very first request of a serve was
+        # the one most likely to be warmed over. Model work in flight or
+        # queued is zero quiet; only then does the completion stamp decide.
+        state = self.state
+        try:
+            if state.has_foreground():
+                return 0.0
+        except BaseException:
+            pass
+        try:
+            if _foreground_model_work_pending(state):
+                return 0.0
+        except BaseException:
+            pass
+        last = float(getattr(state, "last_request_at", 0.0) or 0.0)
         if last <= 0.0:
-            # No request has ever landed (fresh boot): warm immediately.
+            # Nothing has ever run and nothing is running: warm immediately.
             return float("inf")
         return max(0.0, time.time() - last)
 
