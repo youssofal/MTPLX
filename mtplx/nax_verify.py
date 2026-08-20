@@ -45,25 +45,10 @@ def vk_qmm6_m4_enabled() -> bool:
     forward the way they do in a real decode round, rather than one hot
     tensor re-timed in a loop.
 
-    Whole-model sweep, Qwen3.8-27B shapes (64 layers + lm_head, 19.37 GiB
-    of 6-bit weights, group_size 64, fp16 activations), with the production
-    N >= 2048 route floor and Williams-balanced cell order:
-
-        bits=6   m=4   stock 63.3-64.7 ms   hexpack 77.5-82.8 ms   +20 to +30%
-        bits=6   m=5   stock 82.8-87.3 ms   hexpack 67.3-67.7 ms   -19 to -22%
-        bits=6   m=6   stock 131.0-134.5 ms hexpack 74.0-86.2 ms   -35 to -45%
-
-        bits=4   m=4   stock 48.6-54.2 ms   hexpack 40.4-45.0 ms   -17%
-
-    Ranges are across three independent runs of the reproducer; the m=4
-    direction was the same in all three.
-
-    So the regression is specific to 6 bits at m == 4; the 4-bit m4 route
-    is a win and is untouched. The upstream 1.1-2.4x figure was taken on
-    the 9B tier, whose projections are narrow enough that the split-K
-    geometry still pays at four rows; on the 27B's wider projections it
-    does not, and the machine's roofline (379 GB/s, measured) shows stock
-    already at 85% of it at m=4 where the hexpack path reaches 71%.
+    The synthetic whole-stack diagnostic does not currently reproduce the
+    production-trunk loss and is not the basis for this policy. The gate is
+    limited to this one route; the 4-bit m4 and 6-bit m5/m6 routes are
+    untouched.
 
     Set MTPLX_VK_QMM6_M4=1 to restore the route on hardware where it wins.
     Reproducer: benchmarks/repro_vk_qmm6_m4_route.py

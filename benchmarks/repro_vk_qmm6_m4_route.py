@@ -1,4 +1,4 @@
-"""Repro: the 6-bit split-K hexpack route is a LOSS at m == 4 on a 27B trunk.
+"""Diagnostic: compare the 6-bit split-K hexpack route on a 27B linear stack.
 
 Why this benchmark exists, and why it is not the obvious one: timing one
 weight tensor repeatedly in a loop leaves that tensor hot, which flatters
@@ -19,29 +19,28 @@ Recorded measurement provenance:
     Hardware: Apple M3 Max (applegpu_g15s), 64 GB RAM
     OS/runtime: macOS 26.3.1, MLX 0.32.1
     Model: synthetic Qwen3.8-27B linear-stack shapes
-    Quantization: 6-bit and 4-bit affine, group_size=64, fp16 activations
+    Quantization: 6-bit affine, group_size=64, fp16 activations
     Sampler settings: N/A (synthetic kernel sweep)
     Prompt suite: N/A (synthetic kernel sweep)
     Token count: N/A (one full linear-stack sweep per sample)
     Profile: N/A (standalone reproducer)
     Fan mode: automatic; no fan override
     Date: 2026-08-19
-    Measured commit: 32c842935fb2ee6d2a437fadee8f46bd8fdcd4b8
+    Measured commit: f574e5d1da1631a8dcf7435e216457d713c9c56f
 
 Results are the range over three independent runs:
 
-    bits=6  m=4   stock  63.3-64.7 ms   hexpack  77.5-82.8 ms   +20 to +30%  LOSS
-    bits=6  m=5   stock  82.8-87.3 ms   hexpack  67.3-67.7 ms   -19 to -22%  win
-    bits=6  m=6   stock 131.0-134.5 ms  hexpack  74.0-86.2 ms   -35 to -45%  win
-    bits=4  m=4   stock  48.6-54.2 ms   hexpack  40.4-45.0 ms   -17%         win
+    bits=6  m=4   stock 120.6-141.5 ms  hexpack  95.3-103.2 ms  -15 to -33%  win
+    bits=6  m=5   stock 151.1-176.9 ms  hexpack  70.4-75.5 ms   -53 to -57%  win
+    bits=6  m=6   stock 180.2-214.4 ms  hexpack 110.4-117.5 ms  -35 to -49%  win
 
-so the regression is specific to 6 bits at m == 4, which is why
-mtplx.nax_verify.vk_qmm6_m4_enabled gates that route alone and leaves the
-4-bit m4 route and the 6-bit m5/m6 routes untouched.
+The corrected synthetic sweep did not reproduce the observed production-trunk
+loss at m == 4. The route remains opt-in based on that production observation;
+this script is retained as a dispatch and whole-stack diagnostic. The separate
+4-bit dispatcher is outside this reproducer.
 
 Run:
     PYTHONPATH=. python benchmarks/repro_vk_qmm6_m4_route.py 6
-    PYTHONPATH=. python benchmarks/repro_vk_qmm6_m4_route.py 4
 """
 
 import statistics
@@ -143,6 +142,8 @@ def balanced_order(cells, round_index):
 
 def main() -> int:
     bits = int(sys.argv[1]) if len(sys.argv) > 1 else 6
+    if bits != 6:
+        raise SystemExit("this reproducer covers only the production 6-bit dispatcher")
     ms = [int(v) for v in (sys.argv[2] if len(sys.argv) > 2 else "4,5,6").split(",")]
     rounds = int(sys.argv[3]) if len(sys.argv) > 3 else 12
 
@@ -169,17 +170,17 @@ def main() -> int:
 
     print(f"\n{'m':>4}{'stock ms':>11}{'hexpack ms':>13}{'delta':>9}"
           f"{'stock %roof':>13}{'hexpack %roof':>15}")
-    bad = 0
+    losses = 0
     for m in ms:
         s = statistics.median(samples[(m, False)])
         v = statistics.median(samples[(m, True)])
         if m == 4 and bits == 6 and v > s:
-            bad += 1
+            losses += 1
         print(f"{m:>4}{s:>11.2f}{v:>13.2f}{(v / s - 1) * 100:>+8.1f}%"
               f"{100 * floor_ms / s:>12.0f}%{100 * floor_ms / v:>14.0f}%")
     if bits == 6:
-        print("\nm=4 hexpack slower than stock: "
-              f"{'YES (the regression this gate exists for)' if bad else 'no'}")
+        print("\nm=4 hexpack slower than stock in this synthetic sweep: "
+              f"{'YES' if losses else 'no'}")
     return 0
 
 

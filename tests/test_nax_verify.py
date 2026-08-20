@@ -190,11 +190,6 @@ def test_qlinear_patch_routes_6bit_verify_shapes(monkeypatch) -> None:
     """6-bit verify routing: the m5/m6 hexpack routes are on by default, the
     m4 route is opt-in, and the N >= 2048 floor plus the prefill exclusion
     hold for both.
-
-    m4 is opt-in because on applegpu_g15s it is a measured loss on a
-    27B-class trunk with the whole model resident (+20 to +26% against
-    stock), while m5/m6 win 22-35% in the same sweep. See
-    vk_qmm6_m4_enabled and benchmarks/repro_vk_qmm6_m4_route.py.
     """
     from mtplx import verify_kernels
 
@@ -292,8 +287,7 @@ def test_vk_qmm6_benchmark_order_balances_positions_and_carryover() -> None:
 
 
 def test_4bit_m4_route_is_unaffected_by_the_6bit_gate(monkeypatch) -> None:
-    """The regression is 6-bit specific: at 4 bits the m4 split-K route is a
-    measured win (-17% on the same sweep) and must still fire by default."""
+    """The 6-bit m4 gate must not affect the separate 4-bit dispatcher."""
     monkeypatch.delenv("MTPLX_VK_QMM6_M4", raising=False)
     install_nax_qlinear_patch()
     import mtplx.nax_verify as nv
