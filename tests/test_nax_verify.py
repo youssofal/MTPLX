@@ -220,6 +220,7 @@ def test_qlinear_patch_routes_6bit_verify_shapes(monkeypatch) -> None:
         small = nn.QuantizedLinear(512, 256, bias=False, group_size=64, bits=6)
         x4 = (mx.random.normal((4, 512), dtype=mx.float32) * 0.5).astype(mx.bfloat16)
         x5 = (mx.random.normal((5, 512), dtype=mx.float32) * 0.5).astype(mx.bfloat16)
+        x6 = (mx.random.normal((6, 512), dtype=mx.float32) * 0.5).astype(mx.bfloat16)
         with attention_phase("decode_verify"):
             mx.eval(big(x4))
             assert calls["m4"] == 0, "6-bit m4 route must be opt-in"
@@ -230,11 +231,13 @@ def test_qlinear_patch_routes_6bit_verify_shapes(monkeypatch) -> None:
             ), "disabled m4 route must not report a fallback"
             mx.eval(big(x5))
             assert calls["m6"] == 1, "6-bit m5 verify shape did not route the hexpack kernel"
+            mx.eval(big(x6))
+            assert calls["m6"] == 2, "6-bit m6 verify shape did not route the hexpack kernel"
             mx.eval(small(x5))
-            assert calls["m6"] == 1, "small-N 6-bit projection must stay stock"
+            assert calls["m6"] == 2, "small-N 6-bit projection must stay stock"
         with attention_phase("prefill"):
             mx.eval(big(x5))
-            assert calls["m6"] == 1, "prefill must stay stock"
+            assert calls["m6"] == 2, "prefill must stay stock"
 
         # Opt in: the m4 route comes back for hardware where it wins.
         monkeypatch.setenv("MTPLX_VK_QMM6_M4", "1")

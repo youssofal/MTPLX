@@ -36,23 +36,11 @@ def nax_env_enabled() -> bool:
 
 
 def vk_qmm6_m4_enabled() -> bool:
-    """Opt-in for the 6-bit split-K hexpack route at m == 4.
+    """Return whether the 6-bit split-K route may handle ``m == 4``.
 
-    The m5/m6 6-bit routes are measured wins and stay on. The m == 4 route
-    is off by default because on applegpu_g15s (M3 Max) it is a measured
-    LOSS on a 27B-class trunk, in the regime that matters: with the whole
-    model resident, so every layer's weights stream from DRAM once per
-    forward the way they do in a real decode round, rather than one hot
-    tensor re-timed in a loop.
-
-    The synthetic whole-stack diagnostic does not currently reproduce the
-    production-trunk loss and is not the basis for this policy. The gate is
-    limited to this one route; the 4-bit m4 and 6-bit m5/m6 routes are
-    untouched.
-
-    Set MTPLX_VK_QMM6_M4=1 to restore the route on hardware where it wins.
-    Production provenance and separate synthetic diagnostic:
-    benchmarks/repro_vk_qmm6_m4_route.py
+    This exception is deliberately read per call. See ``docs/turbo-verify.md``
+    for the routing contract and ``benchmarks/repro_vk_qmm6_m4_route.py`` for
+    the policy evidence.
     """
     return str(os.environ.get("MTPLX_VK_QMM6_M4", "")).strip().lower() in {
         "1",
