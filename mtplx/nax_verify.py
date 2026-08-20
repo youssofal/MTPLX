@@ -51,7 +51,8 @@ def vk_qmm6_m4_enabled() -> bool:
     untouched.
 
     Set MTPLX_VK_QMM6_M4=1 to restore the route on hardware where it wins.
-    Reproducer: benchmarks/repro_vk_qmm6_m4_route.py
+    Production provenance and separate synthetic diagnostic:
+    benchmarks/repro_vk_qmm6_m4_route.py
     """
     return str(os.environ.get("MTPLX_VK_QMM6_M4", "")).strip().lower() in {
         "1",

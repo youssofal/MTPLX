@@ -15,7 +15,26 @@ order, so every cell occupies every timing position and immediately follows
 every other cell once per complete block. An earlier fixed-order version of
 this benchmark disagreed with itself by 45% on one cell.
 
-Recorded measurement provenance:
+Production-trunk observation provenance (policy basis):
+    Hardware: Apple M3 Max (applegpu_g15s), 64 GB RAM
+    OS/runtime: macOS 26.3, MLX 0.32.1
+    Model: Qwen3.8-27B family trunk
+    Quantization: 6-bit affine, group_size=64
+    Timing: greedy weights-only linear-stack timing
+    Sampler settings: N/A (no sampling; linear-stack timing)
+    Prompt suite: N/A (weights-only timing)
+    Token count: N/A (not a generation benchmark)
+    Profile: N/A (weights-only timing, not a serving profile)
+    Fan mode: automatic
+    Run structure: three independent interleaved runs
+    Date: 2026-08-19
+    Measured commit: 90d8c4b57233b61731269866b13d5af697284d8c
+
+Observed production-trunk result, range across those runs:
+
+    bits=6  m=4   stock 63.3-64.7 ms  hexpack 77.5-82.8 ms  +20 to +30%  LOSS
+
+Synthetic diagnostic provenance:
     Hardware: Apple M3 Max (applegpu_g15s), 64 GB RAM
     OS/runtime: macOS 26.3.1, MLX 0.32.1
     Model: synthetic Qwen3.8-27B linear-stack shapes
@@ -28,16 +47,16 @@ Recorded measurement provenance:
     Date: 2026-08-19
     Measured commit: f574e5d1da1631a8dcf7435e216457d713c9c56f
 
-Results are the range over three independent runs:
+Synthetic diagnostic results, range over three independent runs:
 
     bits=6  m=4   stock 120.6-141.5 ms  hexpack  95.3-103.2 ms  -15 to -33%  win
     bits=6  m=5   stock 151.1-176.9 ms  hexpack  70.4-75.5 ms   -53 to -57%  win
     bits=6  m=6   stock 180.2-214.4 ms  hexpack 110.4-117.5 ms  -35 to -49%  win
 
-The corrected synthetic sweep did not reproduce the observed production-trunk
-loss at m == 4. The route remains opt-in based on that production observation;
-this script is retained as a dispatch and whole-stack diagnostic. The separate
-4-bit dispatcher is outside this reproducer.
+The corrected synthetic sweep did not reproduce the production-trunk result
+above. The route remains opt-in based on the measured production loss; the
+synthetic regime is retained separately as a dispatch and whole-stack
+diagnostic. The 4-bit dispatcher is outside this reproducer.
 
 Run:
     PYTHONPATH=. python benchmarks/repro_vk_qmm6_m4_route.py 6
