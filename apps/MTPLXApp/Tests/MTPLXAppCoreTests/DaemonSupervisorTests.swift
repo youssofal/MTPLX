@@ -2036,3 +2036,80 @@ final class DaemonSupervisorTests: XCTestCase {
         await supervisor.stop()
     }
 }
+
+// MARK: - Fan-ramp grace (2026-08-19 release blockers)
+
+extension DaemonSupervisorTests {
+    private static func healthyUnverifiedRampPayload() throws -> HealthPayload {
+        try JSONDecoder().decode(
+            HealthPayload.self,
+            from: Data(
+                #"""
+                {"ok": true, "model": "test-model", "model_path": "/tmp/test-model",
+                 "generation_mode": "mtp", "load_mtp": true, "mtp_enabled": true,
+                 "depth": 3, "profile": {}, "context_window": 4096,
+                 "active_requests": 0, "reasoning_parser": "qwen3",
+                 "thermal": {"actual_ramp_verified": false}}
+                """#.utf8
+            )
+        )
+    }
+
+    /// The 600 s health budget must never be inherited by the fan-ramp wait:
+    /// a daemon that is already answering /health ok proceeds to ready after
+    /// the bounded grace window instead of spinning out the whole budget and
+    /// being reaped over a fan receipt (the model-swap "Degraded" hang).
+    @MainActor
+    func testHealthyDaemonProceedsAfterFanRampGraceInsteadOfReap() async throws {
+        let payload = try Self.healthyUnverifiedRampPayload()
+        let supervisor = DaemonSupervisor(healthWaitProbe: { _, _ in payload })
+        supervisor.fanRampGraceSeconds = 0.5
+        let started = Date()
+        let ready = try await supervisor.start(
+            command: DaemonCommand(
+                executableURL: URL(fileURLWithPath: "/bin/sh"),
+                arguments: ["-c", "trap 'exit 0' TERM; while :; do sleep 1; done"]
+            ),
+            healthBaseURL: URL(string: "http://127.0.0.1:9")!,
+            probeHealth: true,
+            timeoutSeconds: 30,
+            requireActualFanRamp: true
+        )
+        XCTAssertEqual(ready?.ok, true)
+        XCTAssertLessThan(
+            Date().timeIntervalSince(started),
+            20,
+            "ready must arrive at ramp-grace expiry, not at the health deadline"
+        )
+        XCTAssertTrue(supervisor.isRunning())
+        await supervisor.stop(graceSeconds: 0)
+    }
+
+    /// A health budget shorter than the ramp grace still classifies as
+    /// fanRampTimeout — the timeout taxonomy is unchanged.
+    @MainActor
+    func testFanRampTimeoutStillThrownWhenBudgetShorterThanGrace() async throws {
+        let payload = try Self.healthyUnverifiedRampPayload()
+        let supervisor = DaemonSupervisor(healthWaitProbe: { _, _ in payload })
+        supervisor.fanRampGraceSeconds = 30
+        do {
+            _ = try await supervisor.start(
+                command: DaemonCommand(
+                    executableURL: URL(fileURLWithPath: "/bin/sh"),
+                    arguments: ["-c", "trap 'exit 0' TERM; while :; do sleep 1; done"]
+                ),
+                healthBaseURL: URL(string: "http://127.0.0.1:9")!,
+                probeHealth: true,
+                timeoutSeconds: 1.0,
+                requireActualFanRamp: true
+            )
+            XCTFail("expected fanRampTimeout")
+        } catch let error as DaemonSupervisorError {
+            guard case .fanRampTimeout = error else {
+                XCTFail("expected fanRampTimeout, got \(error)")
+                return
+            }
+        }
+        XCTAssertFalse(supervisor.isRunning())
+    }
+}

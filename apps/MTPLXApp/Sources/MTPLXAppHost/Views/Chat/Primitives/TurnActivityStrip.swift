@@ -1,3 +1,5 @@
+import AppKit
+import Combine
 import SwiftUI
 import MTPLXAppCore
 
@@ -194,69 +196,21 @@ struct SearchActivityWell: View {
 
 enum ThoughtViewportMetrics {
     static let viewportHeight: CGFloat = 72
-    static let lineHeight: CGFloat = 24
-    static let tailCharacterLimit: Int = 512
-    static let wrapColumn: Int = 64
     static let settledMaxHeight: CGFloat = 360
 }
 
-/// Live thought well: the last three streamed lines in a fade-masked
-/// viewport. Observes the reasoning document so token appends repaint
-/// ONLY this view, not the strip around it.
-///
-/// `fallback` is the buffer-INCLUSIVE text (document + unflushed
-/// coalescing buffer) captured at the parent's last render. The tail
-/// reads whichever of the two is longer, so even if the 16 ms flush
-/// loop ever stalls mid-turn, the viewport keeps advancing on parent
-/// repaints instead of freezing on the last flushed state (the
-/// 2026-07-03 "frozen after search→thinking" report).
+/// Live reasoning is one literal append-only text surface. It intentionally
+/// bypasses Markdown and SwiftUI line shaping: the previous three-slot view
+/// rewrapped words, changed each slot's font/inset/opacity, and concatenated a
+/// parent-captured pending suffix with the already-flushed document. That
+/// stale overlap briefly duplicated and reordered text (for example
+/// `offline. L` becoming `Loffline`) before a later repaint corrected it.
 struct StreamingThoughtWell: View {
-    @ObservedObject var document: StreamingDocumentStore
-    /// Unflushed coalescing-buffer text only (small). The old shape
-    /// took the full buffer-INCLUSIVE transcript and grapheme-counted
-    /// both it and the document per revision — two O(answer) walks per
-    /// frame (2026-08-17 field regression). Document + pending is the
-    /// exact live text, so suffixing both sides is byte-for-byte what
-    /// the old max-of-the-two produced, minus the stale-capture case
-    /// (this is fresher: it never drops the buffer when the document
-    /// happens to be longer).
-    var pendingTail: String = ""
-
-    private var tail: String {
-        // Newline-ANCHORED tail, not a character-count suffix. A char
-        // window's start slides forward with every appended token, so
-        // the wrap of lines the user already read recomputed from a
-        // shifted origin — rendered lines visibly rewrote themselves
-        // (founder's 2026-08-18 "characters change after the line is
-        // rendered"). Anchoring the window at the start of the 4th-from-
-        // last physical line makes completed lines immutable: only the
-        // growing last line ever changes. The char cap still bounds
-        // pathological no-newline reasoning; only in that rare case can
-        // the old sliding behavior appear.
-        let cap = ThoughtViewportMetrics.tailCharacterLimit * 2
-        let pending = pendingTail.suffix(cap)
-        let window: String
-        if pending.count >= cap {
-            window = String(pending)
-        } else {
-            window = String(document.rawText.suffix(cap - pending.count)) + pending
-        }
-        var newlines = 0
-        var index = window.endIndex
-        while index > window.startIndex {
-            index = window.index(before: index)
-            if window[index] == "\n" {
-                newlines += 1
-                if newlines == 4 {
-                    return String(window[window.index(after: index)...])
-                }
-            }
-        }
-        return window
-    }
+    let document: StreamingDocumentStore
 
     var body: some View {
-        ThoughtStreamViewport(text: tail)
+        ThoughtStreamViewport(document: document)
+            .frame(height: ThoughtViewportMetrics.viewportHeight)
     }
 }
 
@@ -281,147 +235,101 @@ struct SettledThoughtWell: View {
     }
 }
 
-struct ThoughtStreamViewport: View {
-    let text: String
+private struct ThoughtStreamViewport: NSViewRepresentable {
+    let document: StreamingDocumentStore
 
-    var body: some View {
-        let lineLimit = max(
-            1,
-            Int(ThoughtViewportMetrics.viewportHeight / ThoughtViewportMetrics.lineHeight)
-        )
-        let lines = Self.visibleLines(from: text)
-        let paddedLines =
-            Array(repeating: "", count: max(0, lineLimit - lines.count))
-            + Array(lines.suffix(lineLimit))
+    @MainActor
+    final class Coordinator {
+        private static let highWaterCharacters = 4_096
+        private static let lowWaterCharacters = 2_048
 
-        return VStack(alignment: .leading, spacing: 0) {
-            if lines.isEmpty {
-                Text("Processing…")
-                    .font(.system(size: 12, design: .monospaced))
-                    .foregroundStyle(Brand.typeTertiary)
-                    .frame(
-                        height: ThoughtViewportMetrics.viewportHeight,
-                        alignment: .topLeading
-                    )
-            } else {
-                VStack(alignment: .leading, spacing: 0) {
-                    ForEach(0..<lineLimit, id: \.self) { slot in
-                        let line = paddedLines[slot]
-                        let visualIndex = lineLimit - 1 - slot
-                        Text(line.isEmpty ? " " : line)
-                            .font(.system(
-                                size: Self.fontSize(for: visualIndex),
-                                weight: visualIndex == 0 ? .medium : .regular,
-                                design: .monospaced
-                            ))
-                            .foregroundStyle(
-                                Brand.typeHi.opacity(
-                                    line.isEmpty ? 0 : Self.opacity(for: visualIndex)
-                                )
-                            )
-                            .lineLimit(1)
-                            .padding(.leading, Self.leadingInset(for: visualIndex))
-                            .padding(.trailing, Self.trailingInset(for: visualIndex))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .frame(height: ThoughtViewportMetrics.lineHeight)
-                    }
+        weak var document: StreamingDocumentStore?
+        weak var surface: LiveTailTextSurface?
+        var appliedText = ""
+        var mutationCancellable: AnyCancellable?
+        let textAttributes: [NSAttributedString.Key: Any] = {
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.lineBreakMode = .byCharWrapping
+            paragraph.minimumLineHeight = 24
+            paragraph.maximumLineHeight = 24
+            return [
+                .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
+                .foregroundColor: NSColor.secondaryLabelColor,
+                .paragraphStyle: paragraph,
+            ]
+        }()
+
+        func attach(document: StreamingDocumentStore, surface: LiveTailTextSurface) {
+            let surfaceChanged = self.surface !== surface
+            self.surface = surface
+            if self.document !== document {
+                mutationCancellable?.cancel()
+                self.document = document
+                replace(with: document.recentText(characterLimit: Self.lowWaterCharacters))
+                mutationCancellable = document.mutationPublisher.sink { [weak self] mutation in
+                    self?.apply(mutation)
                 }
-                .frame(height: ThoughtViewportMetrics.viewportHeight, alignment: .bottom)
+            } else if surfaceChanged {
+                replace(with: appliedText)
+            }
+            surface.textDidChange()
+        }
+
+        private func apply(_ mutation: StreamingDocumentStore.Mutation) {
+            switch mutation {
+            case .reset:
+                replace(with: "")
+            case .append(let delta):
+                append(delta)
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .mask(
-            LinearGradient(
-                stops: [
-                    .init(color: .clear, location: 0),
-                    .init(color: .black.opacity(0.9), location: 0.18),
-                    .init(color: .black, location: 0.5),
-                    .init(color: .black.opacity(0.92), location: 0.82),
-                    .init(color: .clear, location: 1),
-                ],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-        )
-    }
 
-    // MARK: Line shaping (ported verbatim)
-
-    private static func visibleLines(from text: String) -> [String] {
-        let lineLimit = Int(
-            ThoughtViewportMetrics.viewportHeight / ThoughtViewportMetrics.lineHeight
-        )
-        // No re-suffix here: the input is already the newline-anchored
-        // window from StreamingThoughtWell. Cutting it again by char
-        // count would reintroduce the sliding origin that rewrote
-        // rendered lines.
-        let words = text.split(whereSeparator: \.isNewline).flatMap { segment -> [String] in
-            let trimmedSegment = segment.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmedSegment.isEmpty else { return [] }
-            let stripped =
-                trimmedSegment
-                .replacingOccurrences(of: "**", with: "")
-                .replacingOccurrences(of: "__", with: "")
-                .replacingOccurrences(of: "*", with: "")
-                .replacingOccurrences(of: "_", with: " ")
-                .replacingOccurrences(of: "###", with: "")
-                .replacingOccurrences(of: "##", with: "")
-                .replacingOccurrences(of: "#", with: "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !stripped.isEmpty else { return [] }
-            return wrapLine(stripped, maxCharacters: ThoughtViewportMetrics.wrapColumn)
-        }
-        return Array(words.suffix(lineLimit))
-    }
-
-    private static func wrapLine(_ text: String, maxCharacters: Int) -> [String] {
-        guard text.count > maxCharacters else { return [text] }
-        var lines: [String] = []
-        var currentLine = ""
-        for word in text.split(whereSeparator: \.isWhitespace) {
-            let candidate = currentLine.isEmpty ? String(word) : "\(currentLine) \(word)"
-            if candidate.count > maxCharacters, !currentLine.isEmpty {
-                lines.append(currentLine)
-                currentLine = String(word)
-            } else {
-                currentLine = candidate
+        private func append(_ delta: String) {
+            guard !delta.isEmpty, let surface else { return }
+            if appliedText.isEmpty {
+                surface.textStorage.setAttributedString(NSAttributedString())
             }
+            appliedText.append(delta)
+            surface.textStorage.append(NSAttributedString(
+                string: delta,
+                attributes: textAttributes
+            ))
+            if appliedText.count > Self.highWaterCharacters {
+                var tail = String(appliedText.suffix(Self.lowWaterCharacters))
+                if let newline = tail.firstIndex(of: "\n") {
+                    tail = String(tail[tail.index(after: newline)...])
+                }
+                replace(with: tail)
+                return
+            }
+            surface.textDidChange()
         }
-        if !currentLine.isEmpty {
-            lines.append(currentLine)
+
+        private func replace(with text: String) {
+            guard let surface else {
+                appliedText = text
+                return
+            }
+            appliedText = text
+            let visible = text.isEmpty ? "Processing…" : text
+            surface.textStorage.setAttributedString(NSAttributedString(
+                string: visible,
+                attributes: textAttributes
+            ))
+            surface.textDidChange()
         }
-        return lines
     }
 
-    private static func opacity(for visualIndex: Int) -> Double {
-        switch visualIndex {
-        case 0: return 0.95
-        case 1: return 0.5
-        default: return 0.3
-        }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> LiveTailTextSurface {
+        let surface = LiveTailTextSurface(frame: .zero)
+        surface.setAccessibilityElement(false)
+        context.coordinator.attach(document: document, surface: surface)
+        return surface
     }
 
-    private static func leadingInset(for visualIndex: Int) -> CGFloat {
-        switch visualIndex {
-        case 0: return 0
-        case 1: return 6
-        default: return 12
-        }
-    }
-
-    private static func trailingInset(for visualIndex: Int) -> CGFloat {
-        switch visualIndex {
-        case 0: return 0
-        case 1: return 10
-        default: return 18
-        }
-    }
-
-    private static func fontSize(for visualIndex: Int) -> CGFloat {
-        switch visualIndex {
-        case 0: return 14
-        case 1: return 13
-        default: return 12
-        }
+    func updateNSView(_ surface: LiveTailTextSurface, context: Context) {
+        context.coordinator.attach(document: document, surface: surface)
     }
 }

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -1074,6 +1075,8 @@ def _cmd_build(args: Any) -> int:
         _saved_verify_rows_reuse_blocker(
             rows,
             existing_runtime,
+            model_path=destination,
+            source_path=source_path,
             require_all_depths=require_all_depths,
         )
         if has_saved_contract or has_legacy_speed_grid
@@ -2912,6 +2915,8 @@ def _saved_verify_rows_reuse_blocker(
     rows: list[dict[str, Any]],
     runtime: dict[str, Any] | None,
     *,
+    model_path: Path,
+    source_path: Path | None = None,
     require_all_depths: bool,
 ) -> str | None:
     if not rows:
@@ -2929,6 +2934,22 @@ def _saved_verify_rows_reuse_blocker(
 
     raw_evidence = runtime.get("speed_evidence") if isinstance(runtime, dict) else None
     if isinstance(raw_evidence, dict):
+        current_fingerprint = _verification_artifact_fingerprint(model_path)
+        saved_fingerprint = raw_evidence.get("artifact_fingerprint")
+        if saved_fingerprint:
+            if current_fingerprint is None:
+                return "current artifact cannot be fingerprinted"
+            if saved_fingerprint != current_fingerprint:
+                return "saved verification belongs to different artifact bytes"
+        elif source_path is not None:
+            source_fingerprint = _verification_artifact_fingerprint(source_path)
+            if (
+                current_fingerprint is not None
+                and source_fingerprint is not None
+                and current_fingerprint != source_fingerprint
+            ):
+                return "artifact changed after unbound saved verification"
+
         raw_verdict = str(raw_evidence.get("verdict") or "").strip()
         if raw_verdict and raw_verdict != "mtp_depth_wins":
             return f"saved speed evidence verdict is {raw_verdict}"
@@ -2936,12 +2957,62 @@ def _saved_verify_rows_reuse_blocker(
         if isinstance(raw_failure_reasons, list) and raw_failure_reasons:
             return "saved speed evidence has failure reasons"
 
+    if _verification_predates_forge(runtime):
+        return "saved verification predates the forged artifact"
+
     evidence = _speed_evidence(_annotate_verify_rows(rows))
     if evidence.get("verdict") != "mtp_depth_wins":
         return f"saved verification verdict is {evidence.get('verdict') or 'unknown'}"
     if evidence.get("failure_reasons"):
         return "saved verification has failure reasons"
     return None
+
+
+def _verification_artifact_fingerprint(model_path: Path) -> str | None:
+    """Bind reusable speed rows to the config and MTP payload they measured."""
+
+    config_path = model_path / "config.json"
+    if not config_path.is_file():
+        return None
+    try:
+        config = _load_json(config_path)
+        mtp_path = artifacts.expected_mtp_file(model_path, config)
+    except Exception:
+        return None
+    if not mtp_path.is_file():
+        return None
+
+    digest = hashlib.sha256()
+    for label, path in (("config.json", config_path), ("mtp", mtp_path)):
+        digest.update(label.encode("utf-8"))
+        digest.update(b"\0")
+        try:
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            return None
+        digest.update(b"\0")
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _verification_predates_forge(runtime: dict[str, Any] | None) -> bool:
+    if not isinstance(runtime, dict):
+        return False
+    verified = runtime.get("verified_on")
+    provenance = runtime.get("forge_provenance")
+    if not isinstance(verified, dict) or not isinstance(provenance, dict):
+        return False
+    verified_at = str(verified.get("timestamp") or "").strip()
+    forged_at = str(provenance.get("forged_at") or "").strip()
+    if not verified_at or not forged_at:
+        return False
+    try:
+        verified_time = datetime.fromisoformat(verified_at.replace("Z", "+00:00"))
+        forged_time = datetime.fromisoformat(forged_at.replace("Z", "+00:00"))
+        return forged_time > verified_time
+    except (TypeError, ValueError):
+        return False
 
 
 def _recommended_profile_stamp(model_path: Path, *, best_depth: int) -> str:
@@ -3011,7 +3082,11 @@ def _stamp_runtime_metadata(
         "model": branded_name,
     }
     metadata.setdefault("exactness_baseline", {})
-    metadata["speed_evidence"] = _speed_evidence(rows)
+    speed_evidence = _speed_evidence(rows)
+    artifact_fingerprint = _verification_artifact_fingerprint(model_path)
+    if artifact_fingerprint is not None:
+        speed_evidence["artifact_fingerprint"] = artifact_fingerprint
+    metadata["speed_evidence"] = speed_evidence
     metadata["mtp_contract"] = dict(mtp_contract)
     if inspection and inspection.mtp is not None:
         metadata["mtp_sidecar"] = inspection.mtp.sidecar_format

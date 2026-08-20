@@ -1411,11 +1411,17 @@ def test_postcommit_render_uses_same_preserve_thinking_policy():
 
 
 def test_incremental_token_decoder_does_not_redecode_cumulative_history():
+    # Guards the cache-reset/print-len contract: newline flushes drop the
+    # cache, later feeds decode only the fresh run, and reassembly stays
+    # byte-exact. (Release cadence itself is covered by
+    # tests/test_stream_visible_cadence.py.)
     decoder = _IncrementalTokenDecoder(TinyTokenizer())
 
     assert decoder.feed(_ids("hello ")) == "hello "
-    assert decoder.feed(_ids("wor")) == ""
-    assert decoder.feed(_ids("ld ")) == "world "
+    assert decoder.feed(_ids("wor")) == "wor"
+    assert decoder.feed(_ids("ld\n")) == "ld\n"
+    assert decoder._token_cache == []
+    assert decoder.feed(_ids("next")) == "next"
     assert decoder.finish() == ""
 
 
@@ -1427,47 +1433,39 @@ def test_incremental_token_decoder_flushes_think_close_without_waiting_for_space
     assert decoder.feed(_ids("Answer ")) == "Answer "
 
 
-def test_incremental_token_decoder_escapes_whitespace_free_hold():
-    # 2026-08-18 stream-cadence fix: a whitespace-free run (table
-    # separator row, long URL, minified code) must not freeze the
-    # visible stream for its full length. Once the held tail passes
-    # _MAX_HOLD_CHARS the decoder flushes, keeping a short tail so a
-    # chunk-split close tag still completes inside the cache.
+def test_incremental_token_decoder_releases_whitespace_free_run_per_token():
+    # Streamwar 2026-08-19: whitespace-free runs (table separator rows,
+    # long URLs, minified code/JSON) froze the visible stream under the
+    # old whitespace-boundary policy — 150-880 ms per line measured on
+    # the shipped build. Every token boundary must now release its text
+    # immediately; nothing may be held back.
     decoder = _IncrementalTokenDecoder(TinyTokenizer())
     run = "|" + "-" * 200
     emitted = []
     for ch in run:
         emitted.append(decoder.feed(_ids(ch)))
-    flushed = "".join(emitted)
-    # It must have flushed something mid-run (no total hold)...
-    assert len(flushed) >= len(run) - decoder._MAX_HOLD_CHARS
-    # ...never emitted more than exists, and finish() restores the rest
-    # byte-for-byte.
-    assert run.startswith(flushed)
-    assert flushed + decoder.finish() == run
+    assert all(piece == ch for piece, ch in zip(emitted, run))
+    assert "".join(emitted) == run
+    assert decoder.finish() == ""
 
 
-def test_incremental_token_decoder_escape_path_cache_stays_bounded():
-    # 2026-08-18 follow-up: the escape path holds _ESCAPE_TAIL_KEEP_CHARS
-    # unflushed, and byte-BPE emits 1-3 chars/token on exactly that
-    # content — a fixed 8-token kept tail could never cover the held
-    # region, so cache truncation silently no-op'd and every feed()
-    # re-decoded a growing cache: O(n^2) on the content the escape
-    # exists to serve. The tail ladder must keep the cache bounded on an
-    # arbitrarily long whitespace-free run.
+def test_incremental_token_decoder_cache_stays_bounded_on_long_line():
+    # One endless line (minified JSON tool arguments) must not regrow the
+    # token cache: 2026-08-18 found truncation silently no-op'ing, making
+    # every feed() re-decode a growing cache — O(n^2) tokenizer work on
+    # the agentic hot path. The tail ladder keeps it bounded.
     decoder = _IncrementalTokenDecoder(TinyTokenizer())
     run = "|" + "-" * 5000
     emitted = []
     for ch in run:
         emitted.append(decoder.feed(_ids(ch)))
-    # Bounded: the cache never exceeds threshold + one escape's worth.
     assert (
         len(decoder._token_cache)
-        <= decoder._CACHE_TRUNCATE_THRESHOLD + decoder._MAX_HOLD_CHARS
+        <= decoder._CACHE_TRUNCATE_THRESHOLD + decoder._CACHE_KEEP_TOKENS
     ), f"cache grew to {len(decoder._token_cache)} tokens"
     flushed = "".join(emitted)
-    assert run.startswith(flushed)
-    assert flushed + decoder.finish() == run
+    assert flushed == run
+    assert decoder.finish() == ""
 
 
 def test_stream_cancellation_metric_records_producer_census():

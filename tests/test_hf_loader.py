@@ -676,3 +676,166 @@ def test_cached_model_is_complete_rejects_pair_bundle_missing_assistant_shard(
     )
 
     assert cached_model_is_complete(bundle) is False
+
+
+# --- pull provenance markers + sha freshness (2.9.0 model updater) ---------
+
+
+def _write_complete_pack(root: Path, name: str = "mtplx--example") -> Path:
+    pack = root / name
+    pack.mkdir(parents=True, exist_ok=True)
+    (pack / "config.json").write_text("{}\n", encoding="utf-8")
+    (pack / "model.safetensors.index.json").write_text(
+        '{"weight_map": {"lm_head.weight": "model-00001-of-00001.safetensors"}}\n',
+        encoding="utf-8",
+    )
+    (pack / "model-00001-of-00001.safetensors").write_bytes(b"weights")
+    return pack
+
+
+def _install_sha_hub(
+    monkeypatch,
+    *,
+    sha: str | None,
+    files: dict[str, tuple[int, str]] | None = None,
+    snapshot_writer=None,
+    captured: dict | None = None,
+):
+    captured = captured if captured is not None else {}
+
+    class FakeHfApi:
+        def model_info(self, **kwargs):
+            captured["model_info_revision"] = kwargs.get("revision")
+            if sha is None:
+                raise RuntimeError("offline")
+            siblings = [
+                SimpleNamespace(rfilename=name, size=size, blob_id=blob)
+                for name, (size, blob) in (files or {}).items()
+            ]
+            return SimpleNamespace(sha=sha, siblings=siblings)
+
+    def fail_snapshot(**_kwargs):
+        raise AssertionError("snapshot_download must not run for this case")
+
+    def snapshot(**kwargs):
+        captured["snapshot_revision"] = kwargs.get("revision")
+        return snapshot_writer(**kwargs)
+
+    hub = SimpleNamespace(
+        HfApi=FakeHfApi,
+        snapshot_download=snapshot if snapshot_writer else fail_snapshot,
+    )
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    return captured
+
+
+def test_pull_model_records_provenance_marker_and_pins_commit(
+    tmp_path: Path, monkeypatch
+):
+    def writer(**kwargs):
+        destination = Path(kwargs["local_dir"])
+        _write_complete_pack(destination.parent, destination.name)
+        return str(destination)
+
+    captured = _install_sha_hub(
+        monkeypatch,
+        sha="commit-aaa",
+        files={"model-00001-of-00001.safetensors": (7, "blob-1")},
+        snapshot_writer=writer,
+    )
+
+    result = pull_model("mtplx/example", cache_dir=tmp_path)
+
+    assert captured["snapshot_revision"] == "commit-aaa"
+    assert result["resolved_sha"] == "commit-aaa"
+    marker = json.loads(
+        (Path(result["path"]) / ".mtplx-source.json").read_text(encoding="utf-8")
+    )
+    assert marker["repo_id"] == "mtplx/example"
+    assert marker["revision"] is None
+    assert marker["resolved_sha"] == "commit-aaa"
+    assert marker["files"]["model-00001-of-00001.safetensors"]["blob_id"] == "blob-1"
+    assert "engine_version" in marker and "pulled_at" in marker
+
+
+def test_pull_model_marker_sha_stale_triggers_sync(tmp_path: Path, monkeypatch):
+    pack = _write_complete_pack(tmp_path)
+    (pack / ".mtplx-source.json").write_text(
+        json.dumps(
+            {"repo_id": "mtplx/example", "revision": None, "resolved_sha": "commit-aaa"}
+        ),
+        encoding="utf-8",
+    )
+
+    def writer(**kwargs):
+        return str(Path(kwargs["local_dir"]))
+
+    captured = _install_sha_hub(
+        monkeypatch,
+        sha="commit-bbb",
+        files={"model-00001-of-00001.safetensors": (7, "blob-2")},
+        snapshot_writer=writer,
+    )
+
+    result = pull_model("mtplx/example", cache_dir=tmp_path)
+
+    assert result["reused_existing"] is False
+    assert captured["snapshot_revision"] == "commit-bbb"
+    marker = json.loads((pack / ".mtplx-source.json").read_text(encoding="utf-8"))
+    assert marker["resolved_sha"] == "commit-bbb"
+
+
+def test_pull_model_marker_sha_current_reuses(tmp_path: Path, monkeypatch):
+    pack = _write_complete_pack(tmp_path)
+    (pack / ".mtplx-source.json").write_text(
+        json.dumps(
+            {"repo_id": "mtplx/example", "revision": None, "resolved_sha": "commit-aaa"}
+        ),
+        encoding="utf-8",
+    )
+    _install_sha_hub(monkeypatch, sha="commit-aaa")
+
+    result = pull_model("mtplx/example", cache_dir=tmp_path)
+
+    assert result["reused_existing"] is True
+    assert result["resolved_sha"] == "commit-aaa"
+
+
+def test_pull_model_marker_sha_offline_errs_on_reuse(tmp_path: Path, monkeypatch):
+    pack = _write_complete_pack(tmp_path)
+    (pack / ".mtplx-source.json").write_text(
+        json.dumps(
+            {"repo_id": "mtplx/example", "revision": None, "resolved_sha": "commit-aaa"}
+        ),
+        encoding="utf-8",
+    )
+    _install_sha_hub(monkeypatch, sha=None)
+
+    result = pull_model("mtplx/example", cache_dir=tmp_path)
+
+    assert result["reused_existing"] is True
+
+
+def test_pull_model_force_sync_skips_reuse(tmp_path: Path, monkeypatch):
+    pack = _write_complete_pack(tmp_path)
+    (pack / ".mtplx-source.json").write_text(
+        json.dumps(
+            {"repo_id": "mtplx/example", "revision": None, "resolved_sha": "commit-aaa"}
+        ),
+        encoding="utf-8",
+    )
+
+    def writer(**kwargs):
+        return str(Path(kwargs["local_dir"]))
+
+    captured = _install_sha_hub(
+        monkeypatch,
+        sha="commit-aaa",
+        files={"model-00001-of-00001.safetensors": (7, "blob-1")},
+        snapshot_writer=writer,
+    )
+
+    result = pull_model("mtplx/example", cache_dir=tmp_path, force_sync=True)
+
+    assert result["reused_existing"] is False
+    assert captured["snapshot_revision"] == "commit-aaa"

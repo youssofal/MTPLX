@@ -53,14 +53,15 @@ final class StreamingPerfRegressionTests: XCTestCase {
         }
     }
 
-    func testBlockCarriesFenceMarkerCount() {
+    func testBlockCarriesCachedRenderMetrics() {
         let block = StreamingDocumentBlock(
             id: 7,
-            text: "a ``` b ``` c",
+            text: "a ```\nb ``` c",
             kind: .plain,
             finalized: true
         )
         XCTAssertEqual(block.fenceMarkerCount, 2)
+        XCTAssertEqual(block.lineCount, 2)
     }
 
     func testBlockClassificationMatchesTextClassification() {
@@ -132,17 +133,29 @@ final class StreamingPerfRegressionTests: XCTestCase {
 
     @MainActor
     func testPacedCutBoundsSingleFrameReveal() {
+        // Even a runaway budget must respect the frame ceiling — the
+        // unbounded whole-drain WAS the "vomit" paste.
         let backlog = String(repeating: "x", count: 10_000)
-        let (reveal, rest) = ChatViewModel.pacedCut(backlog)
+        let (reveal, rest) = ChatViewModel.pacedCut(backlog, budget: 10_000)
         XCTAssertLessThanOrEqual(reveal.count, 256,
             "a stalled-then-recovered stream must catch up as fast typing, not one paste")
         XCTAssertEqual(reveal + rest, backlog, "no bytes may be lost or reordered")
     }
 
     @MainActor
+    func testPacedCutKeepsTypingAliveOnZeroBudget() {
+        // While the arrival-rate EMA warms up the budget can be 0; the
+        // floor keeps characters flowing instead of freezing the reveal.
+        let backlog = String(repeating: "y", count: 100)
+        let (reveal, rest) = ChatViewModel.pacedCut(backlog, budget: 0)
+        XCTAssertEqual(reveal.count, 3)
+        XCTAssertEqual(reveal + rest, backlog)
+    }
+
+    @MainActor
     func testPacedCutDrainsSmallBuffersWhole() {
         let small = "ab"
-        let (reveal, rest) = ChatViewModel.pacedCut(small)
+        let (reveal, rest) = ChatViewModel.pacedCut(small, budget: 0)
         XCTAssertEqual(reveal, small)
         XCTAssertEqual(rest, "")
     }

@@ -41,6 +41,9 @@ final class ChatConversationScrollState {
 
 struct ChatConversationView: View {
     @ObservedObject var viewModel: ChatViewModel
+    let daemonState: DaemonState
+    let startupPhase: DaemonStartupPhase
+    let selectedModel: String
     @State private var scroll = ChatConversationScrollState()
     @State private var scrollDriver = ChatConversationScrollDriver()
     @State private var userScroll = ChatConversationUserScrollState()
@@ -53,7 +56,7 @@ struct ChatConversationView: View {
 
     var body: some View {
         let plan = activeRenderPlan
-        ScrollView(.vertical, showsIndicators: true) {
+        ScrollView(.vertical, showsIndicators: false) {
             // MUST be a plain (non-lazy) VStack. LazyVStack decides
             // which rows to realize from SwiftUI's own scroll-position
             // bookkeeping — but this transcript is scrolled by AppKit
@@ -138,14 +141,15 @@ struct ChatConversationView: View {
         }
         .overlay(alignment: .center) {
             if plan.renderableMessages.isEmpty && !viewModel.isStreaming {
-                ChatConversationEmptyStateView()
+                ChatConversationEmptyStateView(
+                    daemonState: daemonState,
+                    startupPhase: startupPhase,
+                    selectedModel: selectedModel
+                )
             }
         }
         .background(Brand.bgOuter)
         .onReceive(viewModel.streamingContentDocument.revisionPublisher) { _ in
-            scrollToBottom()
-        }
-        .onReceive(viewModel.streamingReasoningDocument.revisionPublisher) { _ in
             scrollToBottom()
         }
         .onChange(of: viewModel.current?.id) { _, _ in
@@ -418,7 +422,9 @@ struct ChatConversationView: View {
 }
 
 private struct ChatConversationEmptyStateView: View {
-    @EnvironmentObject private var backend: MTPLXBackendStore
+    let daemonState: DaemonState
+    let startupPhase: DaemonStartupPhase
+    let selectedModel: String
 
     var body: some View {
         if let startupState {
@@ -429,7 +435,7 @@ private struct ChatConversationEmptyStateView: View {
     }
 
     private var startupState: ChatStartupStatusView.State? {
-        switch backend.daemonState.kind {
+        switch daemonState.kind {
         case .starting, .warming:
             return ChatStartupStatusView.State(
                 title: startupTitle,
@@ -446,7 +452,7 @@ private struct ChatConversationEmptyStateView: View {
     }
 
     private var startupTitle: String {
-        switch backend.startupPhase {
+        switch startupPhase {
         case .launching:
             return "Starting \(selectedModelName)"
         case .waitingForOwnedHealth:
@@ -465,7 +471,7 @@ private struct ChatConversationEmptyStateView: View {
     }
 
     private var startupDetail: String {
-        switch backend.startupPhase {
+        switch startupPhase {
         case .launching:
             return "Starting the local model…"
         case .waitingForOwnedHealth:
@@ -484,12 +490,12 @@ private struct ChatConversationEmptyStateView: View {
     }
 
     private var selectedModelName: String {
-        if let option = MTPLXModelOption.option(matching: backend.configuration.model) {
+        if let option = MTPLXModelOption.option(matching: selectedModel) {
             return option.shortName
         }
-        let expanded = NSString(string: backend.configuration.model).expandingTildeInPath
+        let expanded = NSString(string: selectedModel).expandingTildeInPath
         let last = URL(fileURLWithPath: expanded).lastPathComponent
-        return last.isEmpty ? backend.configuration.model : last
+        return last.isEmpty ? selectedModel : last
     }
 }
 

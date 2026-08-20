@@ -58,6 +58,21 @@ def _effective_model_revision(repo_id: str, revision: str | None) -> str | None:
     return revision
 
 
+def read_source_marker(path: Path) -> dict[str, Any] | None:
+    """Best-effort read of the pull provenance marker (``.mtplx-source.json``).
+
+    Written on every successful pull since 2.9.0; older caches may have no
+    marker (pre-2.9 pulls) or a two-key Laguna pin marker. Callers must treat
+    a missing/short marker as "provenance unknown", never as an error.
+    """
+
+    try:
+        payload = json.loads((path / SOURCE_MARKER_FILE).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _source_marker_matches(
     destination: Path,
     *,
@@ -66,13 +81,12 @@ def _source_marker_matches(
 ) -> bool:
     if repo_id.casefold() != LAGUNA_S_2_1_REPO_ID.casefold():
         return True
-    try:
-        payload = json.loads(
-            (destination / SOURCE_MARKER_FILE).read_text(encoding="utf-8")
-        )
-    except (OSError, UnicodeError, json.JSONDecodeError):
+    payload = read_source_marker(destination)
+    if payload is None:
         return False
-    return payload == {"repo_id": repo_id, "revision": revision}
+    # Subset compare: 2.9.0 markers carry provenance fields (resolved_sha,
+    # pulled_at, files) on top of the original two-key pin payload.
+    return payload.get("repo_id") == repo_id and payload.get("revision") == revision
 
 
 def _write_source_marker(
@@ -80,15 +94,65 @@ def _write_source_marker(
     *,
     repo_id: str,
     revision: str | None,
+    resolved_sha: str | None = None,
+    files: dict[str, dict[str, Any]] | None = None,
 ) -> None:
+    payload: dict[str, Any] = {"repo_id": repo_id, "revision": revision}
+    if resolved_sha:
+        payload["resolved_sha"] = resolved_sha
+        payload["pulled_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        try:
+            from mtplx.version import __version__ as _engine_version
+
+            payload["engine_version"] = _engine_version
+        except Exception:
+            pass
+        if files:
+            payload["files"] = files
     (destination / SOURCE_MARKER_FILE).write_text(
-        json.dumps(
-            {"repo_id": repo_id, "revision": revision},
-            sort_keys=True,
-        )
-        + "\n",
+        json.dumps(payload, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+
+
+def _query_repo_snapshot(
+    repo_id: str, *, revision: str | None = None
+) -> tuple[str | None, dict[str, dict[str, Any]] | None]:
+    """Resolve the remote commit sha and per-file metadata for a repo.
+
+    One API call serves three consumers: freshness (sha compare against the
+    pull marker), download pinning (every file fetched from one commit), and
+    the marker's per-file blob map (exact delta detection on update, even for
+    sidecars like mtp.safetensors that the weight index never lists).
+    Network failures return (None, None) so offline flows keep working.
+    """
+
+    try:
+        from huggingface_hub import HfApi
+
+        info = HfApi().model_info(
+            repo_id=repo_id,
+            revision=revision,
+            files_metadata=True,
+            token=hf_token_for_download(),
+        )
+    except Exception:
+        return None, None
+    sha = getattr(info, "sha", None)
+    files: dict[str, dict[str, Any]] = {}
+    for sibling in getattr(info, "siblings", None) or []:
+        name = getattr(sibling, "rfilename", None) or getattr(sibling, "path", None)
+        if not isinstance(name, str) or not name.strip():
+            continue
+        entry: dict[str, Any] = {}
+        size = getattr(sibling, "size", None)
+        if isinstance(size, int):
+            entry["size"] = size
+        blob_id = getattr(sibling, "blob_id", None)
+        if isinstance(blob_id, str) and blob_id:
+            entry["blob_id"] = blob_id
+        files[name] = entry
+    return (sha if isinstance(sha, str) and sha else None), (files or None)
 
 
 def _validate_pinned_laguna_files(destination: Path, repo_id: str) -> None:
@@ -867,6 +931,8 @@ def pull_model(
     revision: str | None = None,
     progress_callback: DownloadProgressCallback | None = None,
     progress_interval_s: float = 10.0,
+    force_sync: bool = False,
+    destination: Path | None = None,
 ) -> dict[str, Any]:
     repo_id = repo_id_from_model_ref(model_ref)
     if repo_id is None:
@@ -874,18 +940,44 @@ def pull_model(
     revision = _effective_model_revision(repo_id, revision)
     root = model_cache_dir(cache_dir)
     root.mkdir(parents=True, exist_ok=True)
-    destination = cached_model_path(repo_id, cache_dir=root)
+    if destination is None:
+        destination = cached_model_path(repo_id, cache_dir=root)
 
     started_size = directory_size_bytes(destination)
+    marker = read_source_marker(destination)
+    remote_sha: str | None = None
+    remote_files: dict[str, dict[str, Any]] | None = None
+    snapshot_resolved = False
+
+    def _resolve_remote_snapshot() -> None:
+        nonlocal remote_sha, remote_files, snapshot_resolved
+        if not snapshot_resolved:
+            remote_sha, remote_files = _query_repo_snapshot(repo_id, revision=revision)
+            snapshot_resolved = True
+
+    def _fresh_against_remote() -> bool:
+        # A pull is a stated intent to sync. Prefer the exact commit-sha
+        # compare against the pull marker — it sees every changed file,
+        # including sidecars the weight index never lists (mtp.safetensors
+        # head swaps were invisible to the index-only check). Legacy caches
+        # without a sha marker keep the index-byte compare. Network failures
+        # err on reuse so offline pulls keep working.
+        local_sha = (marker or {}).get("resolved_sha")
+        if isinstance(local_sha, str) and local_sha:
+            _resolve_remote_snapshot()
+            return remote_sha is None or remote_sha == local_sha
+        return _local_matches_remote_index(destination, repo_id, revision)
+
     if (
-        destination.exists()
+        not force_sync
+        and destination.exists()
         and _cached_model_ready_for_repo(destination, repo_id)
         and _source_marker_matches(
             destination,
             repo_id=repo_id,
             revision=revision,
         )
-        and _local_matches_remote_index(destination, repo_id, revision)
+        and _fresh_against_remote()
     ):
         resolved = destination
         reused_existing = True
@@ -912,13 +1004,25 @@ def pull_model(
     else:
         reused_existing = False
         resumed_existing = destination.exists() and started_size > 0
-        total_bytes = (
-            LAGUNA_S_2_1_REPO_BYTES
-            if repo_id.casefold() == LAGUNA_S_2_1_REPO_ID.casefold()
-            else _query_repo_total_bytes(repo_id, revision=revision)
-            if progress_callback is not None
-            else None
-        )
+        # Pin the whole download to one resolved commit so every file comes
+        # from the same snapshot even if the repo is pushed to mid-download.
+        _resolve_remote_snapshot()
+        download_revision = revision if revision is not None else remote_sha
+        if repo_id.casefold() == LAGUNA_S_2_1_REPO_ID.casefold():
+            total_bytes: int | None = LAGUNA_S_2_1_REPO_BYTES
+        elif remote_files:
+            total_bytes = (
+                sum(
+                    entry["size"]
+                    for entry in remote_files.values()
+                    if isinstance(entry.get("size"), int) and entry["size"] > 0
+                )
+                or None
+            )
+        elif progress_callback is not None:
+            total_bytes = _query_repo_total_bytes(repo_id, revision=download_revision)
+        else:
+            total_bytes = None
         _require_download_disk_headroom(
             root,
             total_bytes=total_bytes,
@@ -944,7 +1048,7 @@ def pull_model(
             if progress_callback is not None:
                 resolved, total_bytes_from_download = _download_snapshot_with_structured_progress(
                     repo_id=repo_id,
-                    revision=revision,
+                    revision=download_revision,
                     destination=destination,
                     progress_callback=progress_callback,
                     progress_interval_s=progress_interval_s,
@@ -961,7 +1065,7 @@ def pull_model(
                 path = snapshot_download(
                     repo_id=repo_id,
                     repo_type="model",
-                    revision=revision,
+                    revision=download_revision,
                     local_dir=str(destination),
                     token=hf_token_for_download(),
                 )
@@ -987,12 +1091,16 @@ def pull_model(
                 + ", ".join(validation["missing_files"] or [str(validation.get("contract_error"))])
             )
         _validate_pinned_laguna_files(resolved, repo_id)
-        if repo_id.casefold() == LAGUNA_S_2_1_REPO_ID.casefold():
-            _write_source_marker(
-                resolved,
-                repo_id=repo_id,
-                revision=revision,
-            )
+        # Provenance marker on every pull (2.9.0): records the exact commit
+        # and per-file blob map this cache was synced to, so update checks
+        # can compare revisions instead of guessing from the weight index.
+        _write_source_marker(
+            resolved,
+            repo_id=repo_id,
+            revision=revision,
+            resolved_sha=remote_sha,
+            files=remote_files,
+        )
         final_size = directory_size_bytes(resolved)
         _emit_download_progress(
             progress_callback,
@@ -1010,6 +1118,9 @@ def pull_model(
         "path": str(resolved),
         "cache_dir": str(root),
         "revision": revision,
+        "resolved_sha": (
+            (marker or {}).get("resolved_sha") if reused_existing else remote_sha
+        ),
         "reused_existing": reused_existing,
         "resumed_existing": resumed_existing,
         "started_size_bytes": started_size,

@@ -2618,10 +2618,37 @@ def build_parser() -> argparse.ArgumentParser:
     openwebui_docker_p.add_argument("--json", action="store_true")
     openwebui_docker_p.set_defaults(func=cmd_openwebui_public)
 
-    models_p = sub.add_parser("models", help="List locally cached MTPLX models")
+    models_p = sub.add_parser(
+        "models",
+        help="List locally cached MTPLX models; check for and apply pack updates",
+    )
     models_p.add_argument("--cache-dir")
     models_p.add_argument(
         "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    models_p.add_argument(
+        "--check",
+        action="store_true",
+        help="Compare cached packs against published revisions (network)",
+    )
+    models_p.add_argument(
+        "--update",
+        nargs="*",
+        metavar="REPO",
+        default=None,
+        help=(
+            "Update model packs in place (delta download). With no REPO, "
+            "updates every pack that has a newer published revision."
+        ),
+    )
+    models_p.add_argument(
+        "--progress-json",
+        action="store_true",
+        help="With --update: emit pull-style JSON progress events (one per line)",
+    )
+    models_p.add_argument(
+        "--installed-path",
+        help="With one --update REPO: update this exact installed pack directory",
     )
     models_p.set_defaults(func=cmd_list_public)
 

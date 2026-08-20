@@ -45,6 +45,13 @@ struct ComposerInputTextView: NSViewRepresentable {
         textView.isRichText = false
         textView.importsGraphics = false
         textView.allowsUndo = true
+        // macOS 14+ inline predictions arrive as marked text during plain
+        // ASCII typing; the IME publish gate below then never syncs the
+        // binding, canSend stays false, and Return silently does nothing.
+        // A submit-on-Return composer opts out. Real IME composition (CJK,
+        // dead-key accents) is unaffected — its marked text comes from the
+        // input method, not this trait.
+        textView.inlinePredictionType = .no
         textView.font = .systemFont(ofSize: 14)
         textView.textColor = NSColor(Brand.typeHi)
         textView.insertionPointColor = NSColor(Brand.typeHi)
@@ -65,6 +72,9 @@ struct ComposerInputTextView: NSViewRepresentable {
         )
         textView.autoresizingMask = [.width]
         textView.onSubmit = onSubmit
+        textView.onSyncText = { [coordinator = context.coordinator] committed in
+            coordinator.parent.text = committed
+        }
         textView.onFileDrop = onFileDrop
         textView.string = text
         textView.appearance = NSAppearance(named: .darkAqua)
@@ -91,6 +101,9 @@ struct ComposerInputTextView: NSViewRepresentable {
         guard let textView = scrollView.documentView as? ComposerNSTextView else { return }
         context.coordinator.parent = self
         textView.onSubmit = onSubmit
+        textView.onSyncText = { [coordinator = context.coordinator] committed in
+            coordinator.parent.text = committed
+        }
         textView.onFileDrop = onFileDrop
         syncDocumentFrame(for: textView)
         // Never overwrite the text view while an IME composition is in flight:
@@ -195,6 +208,7 @@ struct ComposerInputTextView: NSViewRepresentable {
 
 private final class ComposerNSTextView: NSTextView {
     var onSubmit: (() -> Void)?
+    var onSyncText: ((String) -> Void)?
     var onFileDrop: (([URL]) -> Void)?
 
     override var acceptsFirstResponder: Bool { true }
@@ -209,8 +223,15 @@ private final class ComposerNSTextView: NSTextView {
             let modifiers = NSApp.currentEvent?.modifierFlags
                 .intersection(.deviceIndependentFlagsMask) ?? []
             if modifiers.contains(.shift) {
-                super.doCommand(by: #selector(insertLineBreak(_:)))
+                // insertLineBreak inserts U+2028 (LINE SEPARATOR), which
+                // rides into the sent payload; this inserts a real "\n".
+                super.doCommand(by: #selector(insertNewlineIgnoringFieldEditor(_:)))
             } else {
+                // Sync the authoritative view string into the binding before
+                // submitting: the IME publish gate can leave the binding
+                // stale (marked text at submit time), and a submit that
+                // reads a stale empty binding is silently swallowed.
+                onSyncText?(string)
                 onSubmit?()
             }
             return

@@ -285,6 +285,11 @@ struct ForgeMineView: View {
 
     private func useNow(_ entry: ForgeLocalEntry) {
         var config = backend.configuration
+        config.rememberForgedModel(
+            brandedName: entry.brandedName,
+            localPath: entry.localPath,
+            sizeBytes: entry.sizeOnDisk
+        )
         if let verification = entry.verification {
             config.applyForgeRuntimeDefaults(
                 modelPath: entry.localPath,

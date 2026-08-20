@@ -266,7 +266,10 @@ public final class MTPLXBackendStore: ObservableObject {
         settingsStore.settingsURL
     }
 
-    public private(set) var configuration: MTPLXAppConfiguration
+    // @Published: config-only changes (model swap while stopped, settings
+    // edits without a restart) must invalidate SwiftUI projections — the
+    // picker header label read a stale source indefinitely without this.
+    @Published public private(set) var configuration: MTPLXAppConfiguration
 
     /// Host-supplied hook invoked on the main actor immediately after a
     /// daemon launch reaches `running` for a specific target. The host
@@ -347,7 +350,8 @@ public final class MTPLXBackendStore: ObservableObject {
         beforePostStartRefresh: (@Sendable () async -> Void)? = nil,
         beforeThermalStatusRefresh: (@Sendable () async -> Void)? = nil,
         beforeClientHandoffLaunch: (@Sendable (LaunchTarget) async -> Void)? = nil,
-        openCodeDesktopCanceller: ((MTPLXDesktopHandoffIdentity) -> Bool)? = nil
+        openCodeDesktopCanceller: ((MTPLXDesktopHandoffIdentity) -> Bool)? = nil,
+        modelUpdateChecker: (@Sendable () async throws -> [ModelUpdateInfo])? = nil
     ) {
         self.configuration = configuration
         self.settingsStore = settingsStore
@@ -357,6 +361,7 @@ public final class MTPLXBackendStore: ObservableObject {
         self.piIntegration = piIntegration
         self.hermesIntegration = hermesIntegration
         self.modelDownloader = modelDownloader
+        self.modelUpdateChecker = modelUpdateChecker
         self.autoTuner = autoTuner
         self.runtimeUpdateService = runtimeUpdateService
             ?? MTPLXRuntimeUpdateService(environment: commandBuilder.environment)
@@ -406,11 +411,24 @@ public final class MTPLXBackendStore: ObservableObject {
         _ next: MTPLXAppConfiguration,
         restartIfRunning: Bool = true
     ) async throws {
+        let previousModel = configuration.model
+        let wasDegraded: Bool
+        if case .degraded = daemonState { wasDegraded = true } else { wasDegraded = false }
         let shouldRestart = restartIfRunning && supervisor.isRunning()
         let target = LaunchTarget(rawValue: next.lastLaunchTarget)
         configuration = next
         try settingsStore.save(next)
         supervisor.setAutomaticRestartEnabled(next.automaticDaemonRestart)
+        if !shouldRestart, restartIfRunning, wasDegraded {
+            // Degraded chrome means the user believes MTPLX is (or should
+            // be) running, but the supervisor no longer tracks a process —
+            // silently persisting the new selection and returning left the
+            // app wedged on "Degraded" until a manual Restart. Route the
+            // swap through the full start path: its port preflight adopts
+            // or replaces an orphaned app-owned daemon in place.
+            await startDaemon(target: target)
+            return
+        }
         guard shouldRestart else { return }
         if promptForModelDownloadIfNeeded(
             configuration: next,
@@ -458,6 +476,25 @@ public final class MTPLXBackendStore: ObservableObject {
             healthWatchTask = nil
             connectionState = .connecting
             daemonState = .stopping
+            // The restart's own stop() publishes a terminal snapshot for the
+            // current lifecycle epoch. Claim that epoch first (mirroring
+            // stopDaemon) so passive terminal cleanup can't fire mid-swap —
+            // it was restoring fans to auto and stomping the Stopping chrome
+            // between the old daemon's exit and the new launch.
+            let restartLifecycleEpoch = supervisor.supervisionSnapshot().lifecycleEpoch
+            if restartLifecycleEpoch > 0 {
+                lastTerminalCleanupLifecycleEpoch = max(
+                    lastTerminalCleanupLifecycleEpoch,
+                    restartLifecycleEpoch
+                )
+            }
+            if next.model != previousModel {
+                // New model, new metrics: never render the old daemon's
+                // health/snapshot under the new selection (mirrors
+                // startDaemon's wipe; also lets the header label fall
+                // through to the fresh selection immediately).
+                clearLiveMetricsState()
+            }
             let command = try commandBuilder.buildServeCommand(
                 configuration: next,
                 target: target,
@@ -481,7 +518,11 @@ public final class MTPLXBackendStore: ObservableObject {
             )
             if let startupHealth {
                 health = startupHealth
+                // The daemon was launched with --fan-mode from this exact
+                // configuration; an unverified ramp must not blank the UI
+                // back to the "smart" default the nil mapping implies.
                 currentFanMode = verifiedFanMode(from: startupHealth)
+                    ?? MTPLXFanMode.normalized(next.fanMode).rawValue
                 fanRestoreRequiredOnStop = fanRestoreRequiredOnStop
                     || modeRequiresFanRestore(currentFanMode)
             }
@@ -499,6 +540,20 @@ public final class MTPLXBackendStore: ObservableObject {
         } catch {
             if activeLaunchID == launchID {
                 activeLaunchID = nil
+            }
+            let failedPhase = startupPhase
+            // A failed swap must not leave fans pinned at max with no
+            // daemon running (mirrors the fresh-start failure path).
+            if shouldRestoreFansAfterFailedStartup(phase: failedPhase) {
+                let restored = await restoreFansLocally(
+                    successLog: "fan profile restored after failed model swap"
+                )
+                if !restored {
+                    await supervisor.logs.append(
+                        "fan restore fallback failed after failed model swap",
+                        stream: .system
+                    )
+                }
             }
             let failureDescription = Self.humanizedStartFailure(
                 error,
@@ -674,6 +729,7 @@ public final class MTPLXBackendStore: ObservableObject {
             if let startupHealth {
                 health = startupHealth
                 currentFanMode = verifiedFanMode(from: startupHealth)
+                    ?? MTPLXFanMode.normalized(configuration.fanMode).rawValue
                 fanRestoreRequiredOnStop = fanRestoreRequiredOnStop
                     || modeRequiresFanRestore(currentFanMode)
             }
@@ -1112,11 +1168,150 @@ public final class MTPLXBackendStore: ObservableObject {
         await daemonTeardownTask?.value
     }
 
+    // MARK: - Model-pack updates (Sparkle for models, 2.9.0)
+
+    /// Latest `mtplx models --check` rows. Refreshed on picker open (6 h
+    /// throttle) and on demand; every failure degrades to "no information".
+    @Published public private(set) var modelUpdates: [ModelUpdateInfo] = []
+    /// repo currently being delta-updated, or nil.
+    @Published public private(set) var modelPackUpdatingRepoID: String? = nil
+    /// Human line under the update row ("12.4 MB/s", failure text, ...).
+    @Published public private(set) var modelPackUpdateStatus: String? = nil
+    /// Set when the updated pack is the one the running daemon serves —
+    /// the head swap only applies after a restart.
+    @Published public private(set) var modelPackUpdateNeedsRestart: ModelUpdateInfo? = nil
+    private var lastModelUpdateCheckAt: Date?
+    private var modelPackUpdateTask: Task<Void, Never>?
+    private let modelUpdateChecker: (@Sendable () async throws -> [ModelUpdateInfo])?
+
+    public var availableModelPackUpdates: [ModelUpdateInfo] {
+        modelUpdates.filter(\.isUpdateAvailable)
+    }
+
+    public func refreshModelUpdates(force: Bool = false) async {
+        if !force,
+           let last = lastModelUpdateCheckAt,
+           Date().timeIntervalSince(last) < 6 * 3600 {
+            return
+        }
+        lastModelUpdateCheckAt = Date()
+        do {
+            let rows: [ModelUpdateInfo]
+            if let modelUpdateChecker {
+                rows = try await modelUpdateChecker()
+            } else {
+                rows = try await modelDownloader.checkModelUpdates()
+            }
+            modelUpdates = rows
+        } catch {
+            // Offline or CLI hiccup: keep whatever we knew, never surface
+            // an error for a background freshness check.
+            await supervisor.logs.append(
+                "model update check failed: \(error.localizedDescription)",
+                stream: .system
+            )
+        }
+    }
+
+    /// One-click delta update: rides `mtplx models --update --progress-json`,
+    /// which pins to the published revision, handles legacy cache layouts,
+    /// and skips size-identical files — a re-published MTP head costs the
+    /// head, not the trunk. Serving is untouched until the user restarts.
+    public func updateModelPack(_ update: ModelUpdateInfo) {
+        guard modelPackUpdatingRepoID == nil else { return }
+        modelPackUpdatingRepoID = update.repoID
+        modelPackUpdateStatus = "Preparing…"
+        let downloader = modelDownloader
+        let startedBytes = update.path.map {
+            Self.directorySizeForUpdateProgress(URL(fileURLWithPath: $0))
+        }
+        modelPackUpdateTask = Task { @MainActor [weak self] in
+            let stream = downloader.stream(
+                repo: update.repoID,
+                totalBytes: nil,
+                update: true,
+                sizeProbePath: update.path
+            )
+            var completed = false
+            for await event in stream {
+                guard let self, self.modelPackUpdatingRepoID == update.repoID else { return }
+                switch event {
+                case .started, .status:
+                    break
+                case .progress(let bytesOnDisk, _, let speed, _):
+                    var line = speed > 1024
+                        ? "\(Self.formatUpdateBytes(Int64(speed)))/s"
+                        : "Syncing…"
+                    if let startedBytes, let total = update.updateBytes, total > 0 {
+                        let done = max(0, bytesOnDisk - startedBytes)
+                        let pct = min(100, Int((Double(done) / Double(total)) * 100))
+                        line = "\(pct)% · " + line
+                    }
+                    self.modelPackUpdateStatus = line
+                case .stalled(let seconds):
+                    self.modelPackUpdateStatus = "Stalled for \(seconds)s — still trying"
+                case .complete:
+                    completed = true
+                case .failed(_, let stderrTail):
+                    let tail = stderrTail.split(separator: "\n").last.map(String.init)
+                    self.modelPackUpdateStatus = tail ?? "Update failed"
+                case .cancelled:
+                    self.modelPackUpdateStatus = nil
+                }
+            }
+            guard let self else { return }
+            self.modelPackUpdatingRepoID = nil
+            if completed {
+                self.modelPackUpdateStatus = nil
+                // The running daemon has the old tensors mapped; flag the
+                // restart affordance when the updated pack is the one it
+                // serves (matched on the served model path).
+                let daemonIsLive: Bool
+                switch self.daemonState {
+                case .running, .warming: daemonIsLive = true
+                default: daemonIsLive = false
+                }
+                if daemonIsLive,
+                   let servedPath = self.health?.modelPath,
+                   let updatedPath = update.path,
+                   servedPath == updatedPath || servedPath.hasPrefix(updatedPath + "/") {
+                    self.modelPackUpdateNeedsRestart = update
+                }
+                await self.refreshModelUpdates(force: true)
+            }
+        }
+    }
+
+    /// Restart the running daemon so an updated pack's tensors are loaded.
+    public func restartToApplyModelUpdate() async {
+        modelPackUpdateNeedsRestart = nil
+        try? await applyConfiguration(configuration, restartIfRunning: true)
+    }
+
+    private static func formatUpdateBytes(_ bytes: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: bytes)
+    }
+
+    private static func directorySizeForUpdateProgress(_ url: URL) -> Int64 {
+        (try? FileManager.default.subpathsOfDirectory(atPath: url.path))
+            .map { subpaths in
+                subpaths.reduce(Int64(0)) { sum, subpath in
+                    let full = url.appendingPathComponent(subpath).path
+                    let size = (try? FileManager.default.attributesOfItem(atPath: full)[.size] as? Int64) ?? 0
+                    return sum + (size ?? 0)
+                }
+            } ?? 0
+    }
+
     @discardableResult
     public func ensureDaemonReadyForBenchmark() async throws -> HealthPayload {
         if let existing = try? await apiClient.health(), existing.ok {
             health = existing
             currentFanMode = verifiedFanMode(from: existing)
+                ?? currentFanMode
+                ?? MTPLXFanMode.normalized(configuration.fanMode).rawValue
             fanRestoreRequiredOnStop = fanRestoreRequiredOnStop
                 || modeRequiresFanRestore(currentFanMode)
             try await flushPendingLiveSettingsIfNeeded(target: .benchmark)
@@ -1138,6 +1333,8 @@ public final class MTPLXBackendStore: ObservableObject {
         if let ready = try? await apiClient.health(), ready.ok {
             health = ready
             currentFanMode = verifiedFanMode(from: ready)
+                ?? currentFanMode
+                ?? MTPLXFanMode.normalized(configuration.fanMode).rawValue
             fanRestoreRequiredOnStop = fanRestoreRequiredOnStop
                 || modeRequiresFanRestore(currentFanMode)
             try await flushPendingLiveSettingsIfNeeded(target: .benchmark)
@@ -2149,7 +2346,12 @@ public final class MTPLXBackendStore: ObservableObject {
                 case .healthy(let health) where health.ok:
                     consecutiveMisses = 0
                     self.health = health
+                    // Keep the last-known mode when a probe can't verify:
+                    // blanking here flipped the fan toggle to the "smart"
+                    // nil-default every 3 s on daemons without a receipt.
                     self.currentFanMode = self.verifiedFanMode(from: health)
+                        ?? self.currentFanMode
+                        ?? MTPLXFanMode.normalized(self.configuration.fanMode).rawValue
                     continue
                 case .healthy:
                     // Answered but self-reported not-ok: treat as a miss so a
@@ -3392,7 +3594,15 @@ public final class MTPLXBackendStore: ObservableObject {
     }
 
     private func scheduleLateHealthRecovery(launchID: String, target: LaunchTarget?) {
-        guard supervisor.isRunning() else { return }
+        // Never guard this on supervisor.isRunning(): the failed-start path
+        // reaps the wrapper (nulling the supervisor's process handles)
+        // BEFORE the error reaches the caller that schedules this recovery,
+        // so that guard was false on every scheduling and the whole recovery
+        // was dead code — "Degraded" became terminal. The daemon (or its
+        // orphaned model-server child, which inherits --app-launch-id) can
+        // still come up healthy on the configured port; the wait below is
+        // identity-checked against this launch, so adopting is safe and
+        // probing an empty port is cheap.
         lateHealthRecoveryTask?.cancel()
         lateHealthRecoveryTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -3413,6 +3623,7 @@ public final class MTPLXBackendStore: ObservableObject {
                 guard !Task.isCancelled else { return }
                 self.health = recoveredHealth
                 self.currentFanMode = self.verifiedFanMode(from: recoveredHealth)
+                    ?? MTPLXFanMode.normalized(self.configuration.fanMode).rawValue
                 self.fanRestoreRequiredOnStop = self.fanRestoreRequiredOnStop
                     || self.modeRequiresFanRestore(self.currentFanMode)
                 let lifecycleEpoch = self.supervisor.supervisionSnapshot().lifecycleEpoch

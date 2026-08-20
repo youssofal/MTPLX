@@ -16,7 +16,9 @@ import MTPLXAppCore
 
 struct ChatComposerView: View {
     @ObservedObject var viewModel: ChatViewModel
-    @EnvironmentObject private var backend: MTPLXBackendStore
+    let daemonState: DaemonState
+    let selectedModel: String
+    let visionEnabled: Bool
     @State private var text: String = ""
     @State private var measuredHeight: CGFloat = 48
     @State private var sendButtonHovering = false
@@ -188,11 +190,11 @@ struct ChatComposerView: View {
     }
 
     private var engineCanAcceptMessages: Bool {
-        backend.daemonState.kind == .running
+        daemonState.kind == .running
     }
 
     private var engineStatusText: String? {
-        switch backend.daemonState.kind {
+        switch daemonState.kind {
         case .starting, .warming:
             return "Loading \(selectedModelName)…"
         case .stopping:
@@ -207,12 +209,12 @@ struct ChatComposerView: View {
     }
 
     private var selectedModelName: String {
-        if let option = MTPLXModelOption.option(matching: backend.configuration.model) {
+        if let option = MTPLXModelOption.option(matching: selectedModel) {
             return option.shortName
         }
-        let expanded = NSString(string: backend.configuration.model).expandingTildeInPath
+        let expanded = NSString(string: selectedModel).expandingTildeInPath
         let last = URL(fileURLWithPath: expanded).lastPathComponent
-        return last.isEmpty ? backend.configuration.model : last
+        return last.isEmpty ? selectedModel : last
     }
 
     // MARK: - Actions
@@ -230,7 +232,6 @@ struct ChatComposerView: View {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = true
-        let visionEnabled = backend.health?.vision?.enabled == true
         panel.allowedContentTypes = Self.allowedContentTypes(
             includeImages: visionEnabled
         )

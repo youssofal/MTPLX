@@ -74,19 +74,43 @@ public struct ModelDownloader: Sendable {
     /// fires a `.cancelled` event. Partial bytes survive on disk so
     /// a subsequent run resumes via `huggingface_hub`'s native Range
     /// support.
+    /// Build the CLI invocation for a stream. Updates go through
+    /// `models --update`, which pins to the published revision and handles
+    /// legacy cache layouts; a plain `pull` reuses "fresh-looking" caches
+    /// and silently no-ops on exactly the packs an update targets.
+    static func streamArguments(
+        repo: String,
+        update: Bool,
+        destinationPath: String? = nil
+    ) -> [String] {
+        guard update else { return ["pull", repo, "--progress-json"] }
+        var arguments = ["models", "--update", repo, "--progress-json"]
+        if let destinationPath, !destinationPath.isEmpty {
+            arguments += ["--installed-path", destinationPath]
+        }
+        return arguments
+    }
+
     public func stream(
         repo: String,
         totalBytes: Int64?,
-        extraEnvironment: [String: String] = [:]
+        extraEnvironment: [String: String] = [:],
+        update: Bool = false,
+        sizeProbePath: String? = nil
     ) -> AsyncStream<DownloadEvent> {
         AsyncStream { continuation in
-            let destination = self.cachedModelPath(for: repo)
-            // Make the destination dir up-front so the first poll
-            // returns 0 rather than spuriously matching "exists".
-            try? FileManager.default.createDirectory(
-                at: destination,
-                withIntermediateDirectories: true
-            )
+            let destination = sizeProbePath.map { URL(fileURLWithPath: $0) }
+                ?? self.cachedModelPath(for: repo)
+            // Make the destination dir up-front so the first poll returns 0
+            // rather than spuriously matching "exists". Never for updates:
+            // an empty canonical dir would shadow a populated legacy-layout
+            // pack and turn the delta into a full re-download.
+            if !update {
+                try? FileManager.default.createDirectory(
+                    at: destination,
+                    withIntermediateDirectories: true
+                )
+            }
             let executable: URL
             do {
                 executable = try self.resolveMtplxExecutable { message in
@@ -113,7 +137,11 @@ public struct ModelDownloader: Sendable {
 
             let process = Process()
             process.executableURL = executable
-            process.arguments = ["pull", repo, "--progress-json"]
+            process.arguments = Self.streamArguments(
+                repo: repo,
+                update: update,
+                destinationPath: sizeProbePath
+            )
             // Inherit a sensible PATH so Homebrew installs and wrappers can
             // find their helpers. Apply caller-owned download knobs first,
             // then pin Python's cache location so an override cannot send
@@ -134,7 +162,9 @@ public struct ModelDownloader: Sendable {
             // pumping it back to the UI live (the user doesn't need
             // raw Python progress on a Swift bar).
             let stderrBuffer = StderrTailBuffer(capacity: 2048)
-            let progressState = DownloadProgressJSONState()
+            let progressState = DownloadProgressJSONState(
+                displayBaseBytes: Self.recursiveSize(of: destination)
+            )
             let stdoutLines = LineBuffer()
             errPipe.fileHandleForReading.readabilityHandler = { handle in
                 let chunk = handle.availableData
@@ -282,9 +312,12 @@ public struct ModelDownloader: Sendable {
         state.markStructured()
         let event = rawEvent.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let path = (payload["path"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? destination.path
-        let bytes = int64(payload["size_bytes"])
-            ?? int64(payload["bytes_on_disk"])
-            ?? int64(payload["bytes"])
+        let bytes = state.displayBytes(
+            downloadedBytes: int64(payload["downloaded_bytes"]),
+            fallback: int64(payload["size_bytes"])
+                ?? int64(payload["bytes_on_disk"])
+                ?? int64(payload["bytes"])
+        )
         let total = int64(payload["total_bytes"]) ?? fallbackTotalBytes
 
         switch event {
@@ -418,6 +451,54 @@ public struct ModelDownloader: Sendable {
 
     // MARK: - Executable resolution
 
+    /// Runs `mtplx models --check --json` and decodes the per-pack update
+    /// states. The model-pack counterpart of the Sparkle appcast fetch:
+    /// network access and freshness logic live entirely in the CLI, this
+    /// just shells and decodes. Safe to run while a daemon is serving.
+    public func checkModelUpdates(
+        timeoutSeconds: TimeInterval = 120
+    ) async throws -> [ModelUpdateInfo] {
+        let executable = try resolveMtplxExecutable { _ in }
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = ["models", "--check", "--json"]
+        var env = processEnvironment
+        env["PATH"] = MTPLXCommandBuilder.expandedPATH(environment: processEnvironment)
+        process.environment = MTPLXCommandBuilder.pythonBytecodeSafeEnvironment(
+            environment: env
+        )
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+        try process.run()
+        let watchdog = Task.detached(priority: .utility) {
+            try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
+            if process.isRunning {
+                process.terminate()
+            }
+        }
+        defer { watchdog.cancel() }
+        let stdout = try await Task.detached(priority: .utility) { () -> Data in
+            let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            return data
+        }.value
+        guard process.terminationStatus == 0 else {
+            let stderr = errPipe.fileHandleForReading.readDataToEndOfFile()
+            let tail = String(decoding: stderr.suffix(512), as: UTF8.self)
+            throw NSError(
+                domain: "ModelDownloader",
+                code: Int(process.terminationStatus),
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "model update check exited \(process.terminationStatus): \(tail)"
+                ]
+            )
+        }
+        return try JSONDecoder().decode(ModelUpdateCheckPayload.self, from: stdout).models
+    }
+
     private func resolveMtplxExecutable(
         status: @escaping @Sendable (String) -> Void
     ) throws -> URL {
@@ -455,11 +536,20 @@ private final class ProgressSmoother: @unchecked Sendable {
 }
 
 private final class DownloadProgressJSONState: @unchecked Sendable {
+    private let displayBaseBytes: Int64
     private let lock = NSLock()
     private var structured = false
     private var terminal = false
     private var observedBytes: Int64?
     private var observedTotal: Int64?
+
+    init(displayBaseBytes: Int64) {
+        self.displayBaseBytes = displayBaseBytes
+    }
+
+    func displayBytes(downloadedBytes: Int64?, fallback: Int64?) -> Int64? {
+        downloadedBytes.map { displayBaseBytes + max(0, $0) } ?? fallback
+    }
 
     var sawStructuredEvents: Bool {
         lock.lock()

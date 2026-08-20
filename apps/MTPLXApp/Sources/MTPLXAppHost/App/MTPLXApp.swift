@@ -165,7 +165,7 @@ struct MTPLXApp: App {
 
     var body: some Scene {
         WindowGroup("MTPLX", id: "main") {
-            ContentView()
+            ContentView(backend: backend)
                 .environmentObject(backend)
                 .environmentObject(themeStore)
                 .environmentObject(router)

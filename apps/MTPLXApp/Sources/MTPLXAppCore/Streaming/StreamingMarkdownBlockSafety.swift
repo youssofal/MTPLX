@@ -142,7 +142,9 @@ public enum StreamingMarkdownBlockSafety {
 
     /// A block that is exactly one fence line: optional indent, ```,
     /// optional language tag, nothing else, no embedded newline.
-    static func isFenceLine(_ text: String) -> Bool {
+    /// Public: the live code card's window trim uses it to pick
+    /// merge-stable anchors (fence lines never coalesce).
+    public static func isFenceLine(_ text: String) -> Bool {
         guard !text.contains("\n") else { return false }
         return text.trimmingCharacters(in: .whitespaces).hasPrefix("```")
     }

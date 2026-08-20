@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 import MarkdownUI
 import MTPLXAppCore
@@ -698,52 +699,24 @@ final class StreamingFenceLexChain {
 }
 
 struct StreamingAssistantMarkdownView: View {
-    @ObservedObject var document: StreamingDocumentStore
+    let document: StreamingDocumentStore
     var fallbackText: String = ""
     /// Performance mode: no markdown promotion, no code card, no
     /// syntax coloring — the pure plain-line stream.
     var plainTextOnly: Bool = false
-    @State private var lexChain = StreamingFenceLexChain()
 
     var body: some View {
         Group {
-            // Both stacks below MUST be plain (non-lazy) VStacks. They
-            // live inside the transcript's NSScrollView, whose offset
-            // is driven by AppKit (ChatConversationScrollDriver) — a
-            // lazy container here estimates off-screen heights and
-            // culls rows against a scroll position SwiftUI doesn't
-            // own, which intermittently blanked the whole transcript
-            // mid-stream (2026-08-18). Row cost is already bounded:
-            // every row view is Equatable-cached, so only the growing
-            // tail repaints per flush.
-            if document.blocks.isEmpty {
-                StreamingPlainTextView(text: fallbackText)
-            } else if plainTextOnly {
-                VStack(alignment: .leading, spacing: 0) {
-                    ForEach(document.blocks) { block in
-                        StreamingPlainBlockView(block: block)
-                            .equatable()
-                    }
-                }
+            if plainTextOnly {
+                StreamingPlainDocumentView(
+                    document: document,
+                    fallbackText: fallbackText
+                )
             } else {
-                // Frozen fence-safe blocks render as full markdown ONCE
-                // (Equatable on text, so they never repaint as later
-                // tokens arrive). Fence regions render as a LIVE code
-                // card: the ```lang line becomes the card header, each
-                // frozen interior line is lexed exactly once
-                // (freeze-time highlighting, cached), and the growing
-                // tail line re-lexes only itself. While the fence is
-                // OPEN the card is per-row views — no O(fence) work per
-                // flush; the moment it closes, the region flips once to
-                // the exact settled code card. Per-token cost stays one
-                // linear classify pass + the tail repaint (2026-07-03
-                // contract, extended 2026-07-31).
-                let items = Self.renderItems(for: document.blocks, lexChain: lexChain)
-                VStack(alignment: .leading, spacing: 0) {
-                    ForEach(items) { item in
-                        itemView(item)
-                    }
-                }
+                StreamingRichDocumentView(
+                    document: document,
+                    fallbackText: fallbackText
+                )
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -752,38 +725,21 @@ struct StreamingAssistantMarkdownView: View {
         }
     }
 
-    @ViewBuilder
-    private func itemView(_ item: StreamingRenderItem) -> some View {
-        switch item {
-        case .settled(let block):
-            StreamingSettledBlockView(text: block.text)
-                .equatable()
-        case .plain(let block):
-            StreamingPlainBlockView(block: block)
-                .equatable()
-        case .fenceHeader(let id, let language, _):
-            StreamingCodeCardHeaderView(id: id, language: language)
-                .equatable()
-        case .fenceLine(let block, let language, let entryTag, let isLast):
-            StreamingCodeCardLineView(
-                text: block.text,
-                language: language,
-                entryTag: entryTag,
-                isLast: isLast,
-                blockID: block.id
-            )
-            .equatable()
-        case .closedCode(let id, let language, let code):
-            StreamingClosedCodeCardView(id: id, language: language, code: code)
-                .equatable()
-        }
-    }
-
     /// Groups blocks into render items using the classifier's fence
     /// roles. One linear pass per body evaluation; per-line highlight
     /// states are threaded through the cached lexer (dictionary hits
     /// for every already-frozen line, one real lex for a new line).
+    @MainActor
     static func renderItems(
+        for blocks: [StreamingDocumentBlock],
+        lexChain: StreamingFenceLexChain? = nil
+    ) -> [StreamingRenderItem] {
+        UIStreamPerfProbe.renderTimed(.renderItems, size: blocks.count) {
+            renderItemsBody(for: blocks, lexChain: lexChain)
+        }
+    }
+
+    private static func renderItemsBody(
         for blocks: [StreamingDocumentBlock],
         lexChain: StreamingFenceLexChain? = nil
     ) -> [StreamingRenderItem] {
@@ -820,11 +776,8 @@ struct StreamingAssistantMarkdownView: View {
                         code: interior.map(\.text).joined(separator: "\n")
                     ))
                 } else {
-                    items.append(.fenceHeader(
-                        id: blocks[index].id,
-                        language: language,
-                        label: label
-                    ))
+                    var fragments: [StreamingCodeFragment] = []
+                    fragments.reserveCapacity(max(1, interior.count))
                     // Thread the lex state through the interior,
                     // resuming from the append-only chain cache: frozen
                     // prefix rows cost two Int compares each; only rows
@@ -839,11 +792,9 @@ struct StreamingAssistantMarkdownView: View {
                     var state = MTPLXCodeHighlighter.LexState.none
                     var reusable = lexChain?.entries.count ?? 0
                     for (offset, block) in interior.enumerated() {
-                        items.append(.fenceLine(
+                        fragments.append(StreamingCodeFragment(
                             block: block,
-                            language: language,
-                            entryTag: state.cacheTag,
-                            isLast: offset == interior.count - 1
+                            entryTag: state.cacheTag
                         ))
                         if offset == interior.count - 1 { break }
                         let bytes = block.text.utf8.count
@@ -873,132 +824,699 @@ struct StreamingAssistantMarkdownView: View {
                     if interior.isEmpty {
                         // Header-only card so an empty just-opened fence
                         // still shows its chrome.
-                        items.append(.fenceLine(
+                        fragments.append(StreamingCodeFragment(
                             block: StreamingDocumentBlock(
                                 id: blocks[index].id &+ 1_000_000,
                                 text: "",
                                 kind: .unfinished,
                                 finalized: false
                             ),
-                            language: language,
-                            entryTag: MTPLXCodeHighlighter.LexState.none.cacheTag,
-                            isLast: true
+                            entryTag: MTPLXCodeHighlighter.LexState.none.cacheTag
                         ))
                     }
+                    items.append(.openCode(
+                        id: blocks[index].id,
+                        language: language,
+                        fragments: fragments
+                    ))
                 }
                 index = next
             case .none, .interior, .close, .mixed:
-                if index < classification.settledSafe.count, classification.settledSafe[index] {
-                    items.append(.settled(blocks[index]))
-                } else {
-                    items.append(.plain(blocks[index]))
-                }
+                // Keep prose visually immutable while it streams. Promoting
+                // each completed line from plain Text to MarkdownUI changed
+                // its color, spacing, and height when the following line
+                // arrived — the visible "whole answer flickers every few
+                // lines" regression. The persisted bubble performs the one
+                // Markdown promotion after the response is complete; open
+                // fences still use the incremental highlighted card above.
+                items.append(.plain(blocks[index]))
                 index += 1
             }
         }
         return items
+    }
+
+    @MainActor
+    static func openCodeFragments(
+        in document: StreamingDocumentStore,
+        fenceID: Int,
+        lexChain: StreamingFenceLexChain? = nil
+    ) -> [StreamingCodeFragment]? {
+        for item in renderItems(for: document.blocks, lexChain: lexChain) {
+            if case .openCode(let id, _, let fragments) = item, id == fenceID {
+                return fragments
+            }
+        }
+        return nil
+    }
+}
+
+/// Performance Lock deliberately retains the simple observed SwiftUI path.
+/// It has no syntax/TextKit work, so direct block publication is cheap and
+/// its semantics stay exactly as before.
+private struct StreamingPlainDocumentView: View {
+    @ObservedObject var document: StreamingDocumentStore
+    let fallbackText: String
+
+    var body: some View {
+        if document.blocks.isEmpty {
+            StreamingPlainTextView(text: fallbackText)
+        } else {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(document.blocks) { block in
+                    StreamingPlainBlockView(block: block)
+                        .equatable()
+                }
+            }
+        }
+    }
+}
+
+/// Publishes SwiftUI structure changes only. While an open code fence grows,
+/// its TextKit bridge listens to the document directly; characters no longer
+/// invalidate the entire SwiftUI transcript 30-60 times per second. We still
+/// publish a bounded height ramp for the open fence (six 4-line steps to the
+/// full slot), the one fence-close handoff, and normal prose changes.
+// Internal (not private): the Host flatness tests drive this model and the
+// TextKit viewport directly — they are the O(n^2) tripwires.
+@MainActor
+final class StreamingRichRenderModel: ObservableObject {
+    @Published private(set) var items: [StreamingRenderItem] = []
+
+    /// Revealed-line bucket for the trailing open fence, in 4-line steps
+    /// capped at the count that fills the card's 420 pt slot. This is what
+    /// lets the live code card grow with its content instead of reserving
+    /// the whole empty slot the moment a fence opens (2026-08-19 field
+    /// report: "huge blank space it fills up"). Publishing the BUCKET —
+    /// not the line count — bounds the SwiftUI republish cost to at most
+    /// six transcript relayouts per fence, after which the slot is fixed
+    /// and the transcript sleeps again.
+    @Published private(set) var openFenceLineBucket = 0
+
+    /// Every revision's derivation, unfiltered. The open code card's TextKit
+    /// coordinator pumps its text from this; `items` above only publishes
+    /// structural changes to SwiftUI. One derivation serves both sinks —
+    /// renderItems used to run twice per revision, each pass O(blocks)
+    /// (streamwar 2026-08-19).
+    private(set) var latestItems: [StreamingRenderItem] = []
+    let perRevision = PassthroughSubject<[StreamingRenderItem], Never>()
+
+    private let document: StreamingDocumentStore
+    private let lexChain = StreamingFenceLexChain()
+    private var revisionCancellable: AnyCancellable?
+
+    init(document: StreamingDocumentStore) {
+        self.document = document
+        refresh(force: true)
+        revisionCancellable = document.revisionPublisher.sink { [weak self] _ in
+            self?.refresh()
+        }
+    }
+
+    private func refresh(force: Bool = false) {
+        let next = StreamingAssistantMarkdownView.renderItems(
+            for: document.blocks,
+            lexChain: lexChain
+        )
+        latestItems = next
+        perRevision.send(next)
+        let bucket = Self.openFenceLineBucket(for: next)
+        if bucket != openFenceLineBucket {
+            openFenceLineBucket = bucket
+        }
+        if force || !Self.samePresentation(items, next) {
+            items = next
+        }
+    }
+
+    /// Full slot = 420 pt; the card's height formula is lines * 17 + 22, so
+    /// 24 lines saturate it. Rounding UP to the next 4-line step keeps the
+    /// box at least as tall as its revealed content, so the surface stays
+    /// top-anchored through the whole ramp (no tail-follow flicker between
+    /// steps).
+    static func openFenceLineBucket(for items: [StreamingRenderItem]) -> Int {
+        guard case let .openCode(_, _, fragments)? = items.last else { return 0 }
+        let lines = fragments.reduce(0) { $0 + $1.lineCount }
+        return min(24, ((max(lines, 1) + 3) / 4) * 4)
+    }
+
+    private static func samePresentation(
+        _ lhs: [StreamingRenderItem],
+        _ rhs: [StreamingRenderItem]
+    ) -> Bool {
+        guard lhs.count == rhs.count else { return false }
+        for (old, new) in zip(lhs, rhs) {
+            switch (old, new) {
+            case (.settled(let a), .settled(let b)),
+                 (.plain(let a), .plain(let b)):
+                guard a == b else { return false }
+            case let (.openCode(aID, aLanguage, _),
+                      .openCode(bID, bLanguage, _)):
+                // Fragment growth is deliberately NOT compared: the live
+                // card's text flows through the TextKit coordinator, so
+                // SwiftUI has nothing to re-evaluate while a fence streams
+                // (streamwar 2026-08-19; the old per-line height bucket
+                // forced a full-transcript relayout on each of a fence's
+                // first 24 line boundaries). The card's height ramp flows
+                // through `openFenceLineBucket` instead — a separate
+                // published value that changes at most six times per fence.
+                guard aID == bID, aLanguage == bLanguage else { return false }
+            case let (.closedCode(aID, aLanguage, aCode),
+                      .closedCode(bID, bLanguage, bCode)):
+                guard aID == bID, aLanguage == bLanguage, aCode == bCode else {
+                    return false
+                }
+            default:
+                return false
+            }
+        }
+        return true
+    }
+
+}
+
+private struct StreamingRichDocumentView: View {
+    let document: StreamingDocumentStore
+    let fallbackText: String
+    @StateObject private var renderModel: StreamingRichRenderModel
+
+    init(document: StreamingDocumentStore, fallbackText: String) {
+        self.document = document
+        self.fallbackText = fallbackText
+        _renderModel = StateObject(
+            wrappedValue: StreamingRichRenderModel(document: document)
+        )
+    }
+
+    var body: some View {
+        if renderModel.items.isEmpty {
+            StreamingPlainTextView(text: fallbackText)
+        } else {
+            // This MUST remain a plain VStack. The outer transcript is moved
+            // by an AppKit scroll driver; LazyVStack can cull visible rows
+            // against stale SwiftUI scroll bookkeeping.
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(renderModel.items) { item in
+                    itemView(item)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func itemView(_ item: StreamingRenderItem) -> some View {
+        switch item {
+        case .settled(let block):
+            StreamingSettledBlockView(text: block.text)
+                .equatable()
+        case .plain(let block):
+            StreamingPlainBlockView(block: block)
+                .equatable()
+        case .openCode(let id, let language, _):
+            StreamingOpenCodeCardView(
+                id: id,
+                language: language,
+                lineBucket: renderModel.openFenceLineBucket,
+                document: document,
+                renderModel: renderModel
+            )
+            .equatable()
+        case .closedCode(let id, let language, let code):
+            StreamingClosedCodeCardView(id: id, language: language, code: code)
+                .equatable()
+        }
     }
 }
 
 enum StreamingRenderItem: Identifiable {
     case settled(StreamingDocumentBlock)
     case plain(StreamingDocumentBlock)
-    case fenceHeader(id: Int, language: MTPLXCodeHighlighter.Language, label: String?)
-    case fenceLine(block: StreamingDocumentBlock, language: MTPLXCodeHighlighter.Language, entryTag: String, isLast: Bool)
+    case openCode(id: Int, language: MTPLXCodeHighlighter.Language, fragments: [StreamingCodeFragment])
     case closedCode(id: Int, language: MTPLXCodeHighlighter.Language, code: String)
 
     var id: Int {
         switch self {
         case .settled(let block): return block.id
         case .plain(let block): return block.id
-        case .fenceHeader(let id, _, _): return id
-        case .fenceLine(let block, _, _, _): return block.id
+        case .openCode(let id, _, _): return id
         case .closedCode(let id, _, _): return id
         }
     }
 }
 
-// MARK: Live code card rows
-
-/// Header row of an OPEN streaming fence: language chip + card top
-/// chrome. Equatable on identity+language — renders once per fence.
-private struct StreamingCodeCardHeaderView: View, Equatable {
+struct StreamingCodeFragment: Equatable {
     let id: Int
-    let language: MTPLXCodeHighlighter.Language
+    let text: String
+    let entryTag: String
+    let lineCount: Int
 
-    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.id == rhs.id && lhs.language == rhs.language
-    }
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Text(language == .generic ? "CODE" : language.rawValue.uppercased())
-                .font(.system(size: 9, weight: .heavy, design: .monospaced))
-                .tracking(1.5)
-                .foregroundStyle(Brand.typeTertiary)
-            Spacer(minLength: 12)
-            Text("STREAMING")
-                .font(.system(size: 8, weight: .heavy, design: .monospaced))
-                .tracking(1.2)
-                .foregroundStyle(Brand.typeTertiary.opacity(0.7))
-        }
-        .padding(.horizontal, 12)
-        .padding(.top, 8)
-        .padding(.bottom, 5)
-        .background(Color.white.opacity(0.035))
-        .background(Brand.bgInner)
-        .clipShape(UnevenRoundedRectangle(
-            topLeadingRadius: 10, bottomLeadingRadius: 0,
-            bottomTrailingRadius: 0, topTrailingRadius: 10,
-            style: .continuous
-        ))
-        .padding(.top, 4)
+    init(block: StreamingDocumentBlock, entryTag: String) {
+        id = block.id
+        text = block.text
+        self.entryTag = entryTag
+        lineCount = block.lineCount
     }
 }
 
-/// One code line inside an OPEN streaming fence, syntax-colored via
-/// the freeze-time lexer cache. Equatable on (text, language, entry
-/// state): frozen lines never re-evaluate; only the growing tail line
-/// repaints, re-lexing just itself.
-private struct StreamingCodeCardLineView: View, Equatable {
-    let text: String
+// MARK: Incremental live code card
+
+/// One bounded TextKit surface for an OPEN code fence. SwiftUI owns the
+/// card chrome and height; NSTextStorage owns the growing code. This
+/// keeps the live view hierarchy constant whether the model writes 20
+/// lines or 2,000.
+private struct StreamingOpenCodeCardView: View, Equatable {
+    let id: Int
     let language: MTPLXCodeHighlighter.Language
-    let entryTag: String
-    let isLast: Bool
-    let blockID: Int
+    let lineBucket: Int
+    let document: StreamingDocumentStore
+    let renderModel: StreamingRichRenderModel
 
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.text == rhs.text
+        lhs.id == rhs.id
             && lhs.language == rhs.language
-            && lhs.entryTag == rhs.entryTag
-            && lhs.isLast == rhs.isLast
-            && lhs.blockID == rhs.blockID
+            && lhs.lineBucket == rhs.lineBucket
+            && lhs.document === rhs.document
+            && lhs.renderModel === rhs.renderModel
     }
 
     var body: some View {
-        Text(AttributedString(MTPLXCodeHighlighter.highlightedFragment(
-            text.isEmpty ? " " : text,
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 10) {
+                Text(language == .generic ? "CODE" : language.rawValue.uppercased())
+                    .font(.system(size: 9, weight: .heavy, design: .monospaced))
+                    .tracking(1.5)
+                    .foregroundStyle(Brand.typeTertiary)
+                Spacer(minLength: 12)
+                Text("STREAMING")
+                    .font(.system(size: 8, weight: .heavy, design: .monospaced))
+                    .tracking(1.2)
+                    .foregroundStyle(Brand.typeTertiary.opacity(0.7))
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(
+                        currentCode,
+                        forType: .string
+                    )
+                } label: {
+                    Label("Copy", systemImage: "doc.on.doc")
+                        .font(.system(size: 10, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Brand.typeTertiary)
+                .help("Copy code")
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 8)
+            .padding(.bottom, 5)
+            .background(Color.white.opacity(0.035))
+
+            StreamingCodeTextViewport(
+                renderModel: renderModel,
+                fenceID: id,
+                language: language
+            )
+            .frame(height: viewportHeight)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(
+                "\(language.rawValue) code block, streaming"
+            )
+            .accessibilityHint("Use the Copy button to copy the full code.")
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Brand.bgInner)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(Brand.separator, lineWidth: 0.5)
+                )
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .padding(.top, 4)
+    }
+
+    private var viewportHeight: CGFloat {
+        // Grow with the revealed code in 4-line steps, capped at the full
+        // 420 pt slot. The bucket is published by StreamingRichRenderModel
+        // at most six times per fence, so the transcript relayout cost
+        // stays bounded (the old per-line ramp re-laid the transcript on
+        // each of the first 24 lines; the interim fixed-420 slot showed a
+        // huge blank box for the fence's first seconds — 2026-08-19 field
+        // report). Same formula as the settled card's codeViewportHeight,
+        // so the open -> closed handoff doesn't jump. Content top-anchors
+        // inside the slot (LiveTailTextSurface.anchorsTopWhenShort), and
+        // past the cap the slot is fixed again — zero per-line transcript
+        // relayout for long fences.
+        min(420, max(78, CGFloat(lineBucket) * 17 + 22))
+    }
+
+    @MainActor
+    private var currentCode: String {
+        StreamingAssistantMarkdownView
+            .openCodeFragments(in: document, fenceID: id)?
+            .map(\.text)
+            .joined(separator: "\n") ?? ""
+    }
+}
+
+struct StreamingCodeTextViewport: NSViewRepresentable {
+    let renderModel: StreamingRichRenderModel
+    let fenceID: Int
+    let language: MTPLXCodeHighlighter.Language
+
+    @MainActor
+    final class Coordinator {
+        struct AppliedFragment {
+            let id: Int
+            let text: String
+            let entryTag: String
+            let renderedUTF16Length: Int
+        }
+
+        weak var surface: LiveTailTextSurface?
+        var renderModel: StreamingRichRenderModel?
+        var fenceID: Int?
+        var requestedLanguage: MTPLXCodeHighlighter.Language?
+        var appliedLanguage: MTPLXCodeHighlighter.Language?
+        var applied: [AppliedFragment] = []
+        var itemsCancellable: AnyCancellable?
+
+        func attach(
+            renderModel: StreamingRichRenderModel,
+            fenceID: Int,
+            language: MTPLXCodeHighlighter.Language,
+            surface: LiveTailTextSurface
+        ) {
+            let surfaceChanged = self.surface !== surface
+            self.surface = surface
+            let sameSource = self.renderModel === renderModel
+                && self.fenceID == fenceID
+                && requestedLanguage == language
+            if !sameSource || surfaceChanged {
+                itemsCancellable?.cancel()
+                self.renderModel = renderModel
+                self.fenceID = fenceID
+                requestedLanguage = language
+                appliedLanguage = nil
+                applied.removeAll(keepingCapacity: true)
+                // One derivation per revision: the render model already
+                // derives every revision's items; this sink consumes them
+                // instead of re-running renderItems over all blocks.
+                itemsCancellable = renderModel.perRevision.sink { [weak self] items in
+                    self?.refresh(items: items)
+                }
+            }
+            refresh(items: renderModel.latestItems)
+        }
+
+        private func refresh(items: [StreamingRenderItem]) {
+            guard let surface,
+                  let fenceID,
+                  let language = requestedLanguage else { return }
+            for item in items {
+                guard case .openCode(let id, _, let fragments) = item,
+                      id == fenceID else { continue }
+                UIStreamPerfProbe.renderTimed(.applyRender, size: fragments.count) {
+                    StreamingCodeTextViewport.apply(
+                        fragments: fragments,
+                        language: language,
+                        to: surface,
+                        coordinator: self
+                    )
+                }
+                return
+            }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> LiveTailTextSurface {
+        let surface = LiveTailTextSurface(frame: .zero)
+        surface.contentInsets = NSSize(width: 12, height: 10)
+        surface.anchorsTopWhenShort = true
+        surface.setAccessibilityElement(false)
+        context.coordinator.attach(
+            renderModel: renderModel,
+            fenceID: fenceID,
             language: language,
-            entryTag: entryTag
-        )))
-        .textSelection(.disabled)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .fixedSize(horizontal: false, vertical: true)
-        .padding(.horizontal, 12)
-        .padding(.bottom, isLast ? 10 : 0)
-        .background(Brand.bgInner)
-        .clipShape(UnevenRoundedRectangle(
-            topLeadingRadius: 0, bottomLeadingRadius: isLast ? 10 : 0,
-            bottomTrailingRadius: isLast ? 10 : 0, topTrailingRadius: 0,
-            style: .continuous
-        ))
-        .padding(.bottom, isLast ? 4 : 0)
+            surface: surface
+        )
+        return surface
+    }
+
+    func updateNSView(_ surface: LiveTailTextSurface, context: Context) {
+        context.coordinator.attach(
+            renderModel: renderModel,
+            fenceID: fenceID,
+            language: language,
+            surface: surface
+        )
+    }
+
+    static func apply(
+        fragments allFragments: [StreamingCodeFragment],
+        language: MTPLXCodeHighlighter.Language,
+        to surface: LiveTailTextSurface,
+        coordinator: Coordinator
+    ) {
+        let storage = surface.textStorage
+
+        // Bound TextKit work to a window of the fence tail (streamwar
+        // 2026-08-19, restoring the ebd51228 bound that 37dbd81d deleted).
+        // Without it the storage holds the ENTIRE growing fence behind the
+        // fixed 420 pt viewport and every draw's tail-layout query costs
+        // O(fence) — the measured line-boundary freeze. The window is
+        // anchored on the first already-rendered fragment id, so it only
+        // ever extends or front-trims at existing boundaries; it is never
+        // recomputed from scratch mid-stream (recomputing each frame slid
+        // the window start every line and forced full-window repaints —
+        // the flicker 37dbd81d chased when it removed the bound).
+        let fragments: [StreamingCodeFragment]
+        if coordinator.appliedLanguage == language,
+           let anchorID = coordinator.applied.first?.id,
+           let anchorIndex = allFragments.firstIndex(where: { $0.id == anchorID }) {
+            fragments = Array(allFragments[anchorIndex...])
+        } else {
+            // First attach, language change, or the anchor left the block
+            // list (document reset): render the bounded tail fresh.
+            fragments = Array(Self.visibleTail(in: allFragments))
+            coordinator.applied.removeAll(keepingCapacity: true)
+        }
+
+        // StreamingDocumentStore periodically folds frozen line blocks into
+        // one multiline segment. That changes block structure but not one
+        // byte of rendered code. Reconcile that metadata-only merge before
+        // finding the changed suffix so TextKit keeps its existing glyphs and
+        // colors instead of repainting the whole visible card.
+        if coordinator.appliedLanguage == language {
+            reconcileFrozenMerges(fragments: fragments, coordinator: coordinator)
+        }
+
+        var common = 0
+        if coordinator.appliedLanguage == language {
+            let count = min(coordinator.applied.count, fragments.count)
+            while common < count {
+                let old = coordinator.applied[common]
+                let new = fragments[common]
+                guard old.id == new.id,
+                      old.text == new.text,
+                      old.entryTag == new.entryTag else { break }
+                common += 1
+            }
+        }
+
+        if common == coordinator.applied.count,
+           common == fragments.count,
+           coordinator.appliedLanguage == language {
+            return
+        }
+
+        let unchangedUTF16 = coordinator.applied
+            .prefix(common)
+            .reduce(0) { $0 + $1.renderedUTF16Length }
+        let suffix = NSMutableAttributedString()
+        var nextApplied = Array(coordinator.applied.prefix(common))
+
+        for index in common..<fragments.count {
+            let fragment = fragments[index]
+            let hasSeparator = index > 0
+            if hasSeparator {
+                suffix.append(NSAttributedString(
+                    string: "\n",
+                    attributes: [
+                        .font: MTPLXCodeHighlighter.codeFont,
+                        .foregroundColor: NSColor(calibratedWhite: 0.88, alpha: 1.0),
+                    ]
+                ))
+            }
+            suffix.append(MTPLXCodeHighlighter.highlightedFragment(
+                fragment.text.isEmpty ? " " : fragment.text,
+                language: language,
+                entryTag: fragment.entryTag
+            ))
+            nextApplied.append(Coordinator.AppliedFragment(
+                id: fragment.id,
+                text: fragment.text,
+                entryTag: fragment.entryTag,
+                renderedUTF16Length: (hasSeparator ? 1 : 0)
+                    + (fragment.text.isEmpty ? 1 : fragment.text.utf16.count)
+            ))
+        }
+
+        storage.beginEditing()
+        storage.replaceCharacters(
+            in: NSRange(
+                location: unchangedUTF16,
+                length: max(0, storage.length - unchangedUTF16)
+            ),
+            with: suffix
+        )
+        storage.endEditing()
+        coordinator.appliedLanguage = language
+        coordinator.applied = nextApplied
+        trimRenderedHead(coordinator: coordinator, storage: storage)
+        surface.textDidChange()
+    }
+
+    /// Keep TextKit work bounded even after a 60k-token answer. Two
+    /// viewport-heights of logical lines preserve lexer continuity and make
+    /// wrapped long lines safe, while the full code remains in the document
+    /// store and Copy action.
+    static func visibleTail(
+        in fragments: [StreamingCodeFragment],
+        minimumLines: Int = 48
+    ) -> ArraySlice<StreamingCodeFragment> {
+        var start = fragments.endIndex
+        var lines = 0
+        while start > fragments.startIndex, lines < minimumLines {
+            start = fragments.index(before: start)
+            lines += fragments[start].lineCount
+        }
+        return fragments[start...]
+    }
+
+    /// Slide the rendered window forward by dropping whole leading merged
+    /// segments (and fence lines) once enough lines remain. Only those are
+    /// safe anchors: the store never re-merges a multiline segment and never
+    /// merges a fence line, so the new head's id stays findable in every
+    /// future block list. A recent single line is NOT trimmed — a later
+    /// coalesce could absorb it mid-segment, orphan the anchor, and force a
+    /// full-window repaint (the flicker this design exists to avoid). Head
+    /// deletion never changes the pixels of surviving lines; the surface
+    /// draws bottom-anchored.
+    private static func trimRenderedHead(
+        coordinator: Coordinator,
+        storage: NSTextStorage,
+        minimumLines: Int = 48
+    ) {
+        func lineCount(_ text: String) -> Int {
+            text.utf8.reduce(into: 1) { count, byte in
+                if byte == 0x0A { count += 1 }
+            }
+        }
+        var totalLines = coordinator.applied.reduce(0) { $0 + lineCount($1.text) }
+        var deleteUTF16 = 0
+        while coordinator.applied.count > 1 {
+            let head = coordinator.applied[0]
+            let headIsPermanentBoundary = head.text.contains("\n")
+                || StreamingMarkdownBlockSafety.isFenceLine(head.text)
+            guard headIsPermanentBoundary else { break }
+            let headLines = lineCount(head.text)
+            guard totalLines - headLines >= minimumLines else { break }
+            // The head's stored length excludes a separator; the separator
+            // between it and the next fragment is stored in the NEXT
+            // fragment's length. Delete head + that separator and re-tag
+            // the new head as separator-free.
+            deleteUTF16 += head.renderedUTF16Length + 1
+            coordinator.applied.removeFirst()
+            let newHead = coordinator.applied[0]
+            coordinator.applied[0] = Coordinator.AppliedFragment(
+                id: newHead.id,
+                text: newHead.text,
+                entryTag: newHead.entryTag,
+                renderedUTF16Length: newHead.renderedUTF16Length - 1
+            )
+            totalLines -= headLines
+        }
+        guard deleteUTF16 > 0 else { return }
+        storage.beginEditing()
+        storage.deleteCharacters(
+            in: NSRange(location: 0, length: min(deleteUTF16, storage.length))
+        )
+        storage.endEditing()
+    }
+
+    /// Collapse coordinator metadata when the document store combines a run
+    /// of frozen lines. The attributed storage is already byte-for-byte
+    /// correct, so touching it would only create a flash and needless layout.
+    private static func reconcileFrozenMerges(
+        fragments: [StreamingCodeFragment],
+        coordinator: Coordinator
+    ) {
+        guard !coordinator.applied.isEmpty, !fragments.isEmpty else { return }
+
+        let old = coordinator.applied
+        var normalized: [Coordinator.AppliedFragment] = []
+        normalized.reserveCapacity(fragments.count)
+        var oldIndex = 0
+        var newIndex = 0
+
+        while oldIndex < old.count, newIndex < fragments.count {
+            let previous = old[oldIndex]
+            let current = fragments[newIndex]
+
+            if previous.id == current.id,
+               previous.text == current.text,
+               previous.entryTag == current.entryTag {
+                normalized.append(previous)
+                oldIndex += 1
+                newIndex += 1
+                continue
+            }
+
+            guard previous.id == current.id,
+                  previous.entryTag == current.entryTag,
+                  current.text.contains("\n") else { break }
+
+            var mergedText = ""
+            var mergedUTF16Length = 0
+            var scan = oldIndex
+            var matched = false
+            while scan < old.count {
+                if scan > oldIndex {
+                    mergedText.append("\n")
+                }
+                mergedText.append(old[scan].text)
+                mergedUTF16Length += old[scan].renderedUTF16Length
+
+                if mergedText == current.text {
+                    normalized.append(Coordinator.AppliedFragment(
+                        id: current.id,
+                        text: current.text,
+                        entryTag: current.entryTag,
+                        renderedUTF16Length: mergedUTF16Length
+                    ))
+                    oldIndex = scan + 1
+                    newIndex += 1
+                    matched = true
+                    break
+                }
+                guard current.text.hasPrefix(mergedText) else { break }
+                scan += 1
+            }
+            guard matched else { break }
+        }
+
+        guard oldIndex > 0 else { return }
+        normalized.append(contentsOf: old[oldIndex...])
+        coordinator.applied = normalized
     }
 }
 
 /// A CLOSED fence during streaming: flips once to the exact settled
-/// code card (highlighted NSTextView with horizontal scroll), so the
-/// end-of-turn handoff to the persisted transcript doesn't jump.
+/// code card, so the end-of-turn handoff to the persisted transcript
+/// doesn't jump.
 private struct StreamingClosedCodeCardView: View, Equatable {
     let id: Int
     let language: MTPLXCodeHighlighter.Language
@@ -1258,9 +1776,9 @@ private struct CodeTextViewport: NSViewRepresentable {
         let scrollView = NSScrollView()
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
-        scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = true
-        scrollView.autohidesScrollers = true
+        scrollView.hasVerticalScroller = false
+        scrollView.hasHorizontalScroller = false
+        scrollView.horizontalScrollElasticity = .none
 
         let textView = NSTextView()
         textView.drawsBackground = false
@@ -1271,14 +1789,15 @@ private struct CodeTextViewport: NSViewRepresentable {
         textView.textColor = NSColor(calibratedWhite: 0.88, alpha: 1.0)
         textView.textContainerInset = NSSize(width: 12, height: 10)
         textView.textContainer?.lineFragmentPadding = 0
-        textView.textContainer?.widthTracksTextView = false
+        textView.textContainer?.widthTracksTextView = true
         textView.textContainer?.heightTracksTextView = false
         textView.textContainer?.containerSize = NSSize(
-            width: CGFloat.greatestFiniteMagnitude,
+            width: max(1, scrollView.contentSize.width),
             height: CGFloat.greatestFiniteMagnitude
         )
-        textView.isHorizontallyResizable = true
+        textView.isHorizontallyResizable = false
         textView.isVerticallyResizable = true
+        textView.autoresizingMask = [.width]
         textView.minSize = NSSize(width: 0, height: 0)
         textView.maxSize = NSSize(
             width: CGFloat.greatestFiniteMagnitude,
@@ -1290,6 +1809,7 @@ private struct CodeTextViewport: NSViewRepresentable {
         context.coordinator.appliedHighlighted = highlighted
 
         scrollView.documentView = textView
+        textView.frame = NSRect(origin: .zero, size: scrollView.contentSize)
         return scrollView
     }
 

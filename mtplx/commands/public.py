@@ -1130,7 +1130,11 @@ def _apply_model_default_profile(args: Any, model_id: str) -> bool:
         # config._apply_profile_default). Honor it even when it equals the
         # parser default — config "sustained" used to be silently promoted.
         return False
-    if model_id not in _TURBO_DEFAULT_PUBLIC_MODEL_IDS:
+    model_ref = getattr(args, "model", None)
+    if (
+        model_id not in _TURBO_DEFAULT_PUBLIC_MODEL_IDS
+        and _artifact_recommended_profile(model_ref) != "turbo"
+    ):
         return False
     current = str(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
     if current != DEFAULT_PROFILE_NAME:
@@ -1167,7 +1171,10 @@ def _resolved_default_profile_name(args: Any, model: str | None = None) -> str:
         model_id = _public_model_id_for_args(args, model_ref)
     except Exception:
         return current
-    if model_id in _TURBO_DEFAULT_PUBLIC_MODEL_IDS:
+    if (
+        model_id in _TURBO_DEFAULT_PUBLIC_MODEL_IDS
+        or _artifact_recommended_profile(model_ref) == "turbo"
+    ):
         return "turbo"
     return current
 
@@ -1183,9 +1190,24 @@ def resolved_default_profile_name_for_ref(model_ref: str | Path | None) -> str:
     ``public_model_id_for_ref`` mapping serve-time resolution uses.
     """
 
-    if public_model_id_for_ref(model_ref) in _TURBO_DEFAULT_PUBLIC_MODEL_IDS:
+    if (
+        public_model_id_for_ref(model_ref) in _TURBO_DEFAULT_PUBLIC_MODEL_IDS
+        or _artifact_recommended_profile(model_ref) == "turbo"
+    ):
         return "turbo"
     return DEFAULT_PROFILE_NAME
+
+
+def _artifact_recommended_profile(model_ref: str | Path | None) -> str | None:
+    """Read a local Forge artifact's measured launch profile, if present."""
+
+    if model_ref is None:
+        return None
+    runtime, _ = _local_runtime_metadata(str(model_ref))
+    if not isinstance(runtime, dict):
+        return None
+    profile = str(runtime.get("recommended_profile") or "").strip().lower()
+    return profile if profile in {"stable", "sustained", "turbo"} else None
 
 
 def _apply_qwen36_35b_optimized_speed_defaults(args: Any, model_id: str) -> None:
@@ -3028,6 +3050,8 @@ def _identity_text_parts(value: Any) -> list[str]:
 
 
 def _mtplx_tune_family_from_text(text: str) -> str | None:
+    if any(marker in text for marker in ("qwen3.8", "qwen3_8", "qwen38")):
+        return "qwen3_8"
     if any(marker in text for marker in ("qwen3.6", "qwen3_6", "qwen3-6", "qwen36")):
         return "qwen3_6"
     if any(marker in text for marker in ("qwen3.5", "qwen3_5", "qwen3-5", "qwen35")):
@@ -5607,9 +5631,162 @@ def cmd_pull_public(args: Any) -> int:
     return 0
 
 
+def _cmd_models_check(args: Any) -> int:
+    from mtplx.hf_loader import model_cache_dir
+    from mtplx.model_updates import (
+        ENGINE_VERSION,
+        STATE_UPDATE_AVAILABLE,
+        check_model_updates,
+    )
+
+    rows = check_model_updates(cache_dir=args.cache_dir)
+    stale = [row for row in rows if row.state == STATE_UPDATE_AVAILABLE]
+    payload = {
+        "cache_dir": str(model_cache_dir(args.cache_dir)),
+        "engine_version": ENGINE_VERSION,
+        "updates_available": len(stale),
+        "models": [row.to_dict() for row in rows],
+    }
+    if getattr(args, "json", False):
+        _print(payload)
+        return 0
+    print("MTPLX model updates")
+    print(f"cache: {payload['cache_dir']}")
+    if not rows:
+        print("no tracked models (pull a model to start update tracking)")
+        return 0
+    for row in rows:
+        local = (row.local_revision or "untracked")[:10]
+        remote = (row.remote_revision or "unknown")[:10]
+        line = f"- {row.repo_id}  {row.state}  {local} -> {remote}"
+        if row.update_bytes:
+            line += f"  ({_format_bytes(row.update_bytes)})"
+        print(line)
+        if row.note:
+            print(f"  {row.note}")
+        if row.state == "engine-update-required" and row.min_engine_version:
+            print(f"  requires MTPLX >= {row.min_engine_version}")
+    if stale:
+        print(f"updates available: {len(stale)} — run: mtplx models --update")
+    else:
+        print("all tracked packs are current")
+    return 0
+
+
+def _cmd_models_update(args: Any, targets: list[str]) -> int:
+    from mtplx.model_updates import (
+        STATE_UPDATE_AVAILABLE,
+        check_model_updates,
+        fetch_models_manifest,
+        update_cached_model,
+    )
+
+    json_mode = bool(getattr(args, "json", False))
+    progress_json = bool(getattr(args, "progress_json", False))
+    installed_path = getattr(args, "installed_path", None)
+    downloaded_by_repo: dict[str, int] = {}
+
+    def emit_progress_json(event: dict[str, Any]) -> None:
+        payload = dict(event)
+        event_repo = payload.get("repo_id")
+        if isinstance(event_repo, str):
+            downloaded = downloaded_by_repo.get(event_repo, 0)
+            if payload.get("event") == "progress":
+                downloaded += max(0, int(payload.get("delta_bytes") or 0))
+                downloaded_by_repo[event_repo] = downloaded
+            payload["downloaded_bytes"] = downloaded
+        print(json.dumps(payload, sort_keys=True), flush=True)
+
+    manifest = fetch_models_manifest()
+    if targets:
+        repos = list(dict.fromkeys(targets))
+    else:
+        rows = check_model_updates(cache_dir=args.cache_dir, manifest=manifest)
+        repos = [row.repo_id for row in rows if row.state == STATE_UPDATE_AVAILABLE]
+        if not repos:
+            if progress_json:
+                emit_progress_json({"event": "result", "updated": []})
+            elif json_mode:
+                _print({"updated": [], "message": "all tracked packs are current"})
+            else:
+                print("all tracked packs are current")
+            return 0
+    if installed_path and len(repos) != 1:
+        message = "--installed-path requires exactly one --update REPO"
+        if progress_json:
+            emit_progress_json({"event": "failed", "error": "invalid_request", "message": message})
+        else:
+            print(f"error: {message}", file=sys.stderr)
+        return 2
+    results: list[dict[str, Any]] = []
+    failed = False
+    for repo in repos:
+        callback = None
+        finalize: Callable[[], None] = lambda: None  # noqa: E731
+        if progress_json:
+            # The app's update stream parses the same event schema as
+            # `pull --progress-json`; update_cached_model forwards these
+            # straight from pull_model, so the shapes match by construction.
+            callback = emit_progress_json
+            emit_progress_json({"event": "resolving", "repo_id": repo})
+        elif not json_mode:
+            print(f"updating {repo}")
+            callback, finalize = _rich_download_progress_callback(repo_id=repo)
+        try:
+            result = update_cached_model(
+                repo,
+                cache_dir=args.cache_dir,
+                destination_path=installed_path,
+                manifest=manifest,
+                progress_callback=callback,
+                progress_interval_s=0.4 if callback else 10.0,
+            )
+        except Exception as exc:
+            finalize()
+            failed = True
+            results.append({"repo_id": repo, "error": str(exc)})
+            if progress_json:
+                emit_progress_json(
+                    {
+                        "event": "failed",
+                        "error": "update_failed",
+                        "model": repo,
+                        "message": str(exc),
+                        "detail": str(exc),
+                    }
+                )
+            elif not json_mode:
+                print(f"error: update failed for {repo}: {exc}")
+            continue
+        finalize()
+        row = {
+            "repo_id": result.get("repo_id", repo),
+            "path": result.get("path"),
+            "resolved_sha": result.get("resolved_sha"),
+            "delta_bytes": max(
+                0,
+                int(result.get("size_bytes") or 0)
+                - int(result.get("started_size_bytes") or 0),
+            ),
+        }
+        results.append(row)
+        if progress_json:
+            emit_progress_json({"event": "result", **row})
+        elif not json_mode:
+            print(f"updated {repo} -> {str(result.get('resolved_sha') or 'unknown')[:10]}")
+    if json_mode and not progress_json:
+        _print({"updated": results})
+    return 1 if failed else 0
+
+
 def cmd_list_public(args: Any) -> int:
     from mtplx.hf_loader import list_cached_models, model_cache_dir
 
+    update_targets = getattr(args, "update", None)
+    if update_targets is not None:
+        return _cmd_models_update(args, update_targets)
+    if getattr(args, "check", False):
+        return _cmd_models_check(args)
     models = [row.to_dict() for row in list_cached_models(cache_dir=args.cache_dir)]
     payload = {"cache_dir": str(model_cache_dir(args.cache_dir)), "models": models}
     if getattr(args, "json", False):

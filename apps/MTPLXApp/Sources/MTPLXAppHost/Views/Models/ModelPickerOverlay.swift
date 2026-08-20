@@ -7,11 +7,50 @@ import MTPLXAppCore
 // Top-left model selector. It mirrors the inference popover language:
 // notch, raised surface, monospaced section labels, and row reveal.
 
-struct ModelPickerOverlay: View {
-    @EnvironmentObject private var backend: MTPLXBackendStore
+struct ModelPickerOverlay: View, Equatable {
+    let backend: MTPLXBackendStore
+    let configuration: MTPLXAppConfiguration
+    let daemonState: DaemonState
+    let modelUpdates: [ModelUpdateInfo]
+    let modelPackUpdatingRepoID: String?
+    let modelPackUpdateStatus: String?
+    let modelPackUpdateNeedsRestart: ModelUpdateInfo?
+
     @EnvironmentObject private var themeStore: ThemeStore
 
     @Binding var presented: Bool
+    private let presentedValue: Bool
+
+    init(
+        backend: MTPLXBackendStore,
+        configuration: MTPLXAppConfiguration,
+        daemonState: DaemonState,
+        presented: Binding<Bool>,
+        modelUpdates: [ModelUpdateInfo] = [],
+        modelPackUpdatingRepoID: String? = nil,
+        modelPackUpdateStatus: String? = nil,
+        modelPackUpdateNeedsRestart: ModelUpdateInfo? = nil
+    ) {
+        self.backend = backend
+        self.configuration = configuration
+        self.daemonState = daemonState
+        self.modelUpdates = modelUpdates
+        self.modelPackUpdatingRepoID = modelPackUpdatingRepoID
+        self.modelPackUpdateStatus = modelPackUpdateStatus
+        self.modelPackUpdateNeedsRestart = modelPackUpdateNeedsRestart
+        _presented = presented
+        presentedValue = presented.wrappedValue
+    }
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.presentedValue == rhs.presentedValue
+            && lhs.configuration == rhs.configuration
+            && lhs.daemonState == rhs.daemonState
+            && lhs.modelUpdates == rhs.modelUpdates
+            && lhs.modelPackUpdatingRepoID == rhs.modelPackUpdatingRepoID
+            && lhs.modelPackUpdateStatus == rhs.modelPackUpdateStatus
+            && lhs.modelPackUpdateNeedsRestart == rhs.modelPackUpdateNeedsRestart
+    }
 
     @State private var borderProgress: CGFloat = 0
     @State private var headerVisible: Bool = false
@@ -59,10 +98,10 @@ struct ModelPickerOverlay: View {
             hardwareTask?.cancel()
             hardwareTask = nil
         }
-        .onChange(of: backend.configuration.model) { _, _ in
+        .onChange(of: configuration.model) { _, _ in
             preparePickerRows()
         }
-        .onChange(of: backend.configuration.customModels) { _, _ in
+        .onChange(of: configuration.customModels) { _, _ in
             preparePickerRows()
         }
         .onChange(of: detectedHardware) { _, _ in
@@ -70,6 +109,12 @@ struct ModelPickerOverlay: View {
         }
         .onChange(of: presented) { _, isOn in
             if isOn { runEnterChoreography() } else { runExitChoreography() }
+        }
+        .task(id: presented) {
+            // Opening the picker is the natural moment to look for pack
+            // updates; the store throttles to one network check per 6 h.
+            guard presented else { return }
+            await backend.refreshModelUpdates()
         }
     }
 
@@ -109,6 +154,9 @@ struct ModelPickerOverlay: View {
         let rows = preparedRows
         VStack(alignment: .leading, spacing: 0) {
             header
+            if modelPackUpdateNeedsRestart != nil || !availablePackUpdates.isEmpty {
+                modelUpdatesBanner
+            }
             sectionDivider(precedesRow: 1)
             ScrollView(.vertical, showsIndicators: rows.count > 4) {
                 VStack(alignment: .leading, spacing: 0) {
@@ -161,6 +209,93 @@ struct ModelPickerOverlay: View {
         .padding(.bottom, 8)
         .opacity(headerVisible ? 1 : 0)
         .offset(y: headerVisible ? 0 : -6)
+    }
+
+    private var availablePackUpdates: [ModelUpdateInfo] {
+        modelUpdates.filter(\.isUpdateAvailable)
+    }
+
+    private func updateSizeText(_ update: ModelUpdateInfo) -> String? {
+        guard let bytes = update.updateBytes, bytes > 0 else { return nil }
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: bytes)
+    }
+
+    /// Sparkle-for-models strip: one row per pack with a newer published
+    /// revision, plus the restart affordance once an update has landed for
+    /// the pack the running daemon serves.
+    @ViewBuilder
+    private var modelUpdatesBanner: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let restart = modelPackUpdateNeedsRestart {
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Brand.typeBody)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("\(restart.shortName) updated")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(Brand.typeBody)
+                        Text("Restart MTPLX to load the updated files.")
+                            .font(.caption2)
+                            .foregroundStyle(Brand.typeTertiary)
+                    }
+                    Spacer(minLength: 8)
+                    Button("Restart") {
+                        Task { await backend.restartToApplyModelUpdate() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+            }
+            ForEach(availablePackUpdates.prefix(3)) { update in
+                HStack(spacing: 8) {
+                    Image(systemName: "arrow.down.circle")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Brand.typeBody)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(
+                            updateSizeText(update).map {
+                                "Update available: \(update.shortName) (\($0))"
+                            } ?? "Update available: \(update.shortName)"
+                        )
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Brand.typeBody)
+                        .lineLimit(1)
+                        if let note = update.note, !note.isEmpty {
+                            Text(note)
+                                .font(.caption2)
+                                .foregroundStyle(Brand.typeTertiary)
+                                .lineLimit(2)
+                        }
+                        if modelPackUpdatingRepoID == update.repoID,
+                           let status = modelPackUpdateStatus {
+                            Text(status)
+                                .font(.caption2)
+                                .foregroundStyle(Brand.typeTertiary)
+                                .lineLimit(1)
+                        }
+                    }
+                    Spacer(minLength: 8)
+                    if modelPackUpdatingRepoID == update.repoID {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Button("Update") {
+                            backend.updateModelPack(update)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(modelPackUpdatingRepoID != nil)
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .frame(width: popoverWidth, alignment: .leading)
+        .background(Brand.separatorStrong.opacity(0.18))
     }
 
     @ViewBuilder
@@ -497,14 +632,14 @@ struct ModelPickerOverlay: View {
     }
 
     private var restartRequired: Bool {
-        switch backend.daemonState.kind {
+        switch daemonState.kind {
         case .running: return true
         default: return false
         }
     }
 
     private var isTransitioning: Bool {
-        switch backend.daemonState.kind {
+        switch daemonState.kind {
         case .starting, .warming, .stopping: return true
         default: return false
         }
@@ -521,13 +656,13 @@ struct ModelPickerOverlay: View {
     }
 
     private var motionEnabled: Bool {
-        !backend.configuration.performanceLock && !themeStore.reduceMotionPreference
+        !configuration.performanceLock && !themeStore.reduceMotionPreference
     }
 
     private var catalogSignature: ModelPickerCatalogSignature {
         ModelPickerCatalogSignature(
-            currentModel: backend.configuration.model,
-            customModels: backend.configuration.customModels,
+            currentModel: configuration.model,
+            customModels: configuration.customModels,
             hardware: detectedHardware
         )
     }

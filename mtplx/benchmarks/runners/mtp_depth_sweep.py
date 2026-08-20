@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import statistics
 import time
 from dataclasses import asdict
@@ -41,6 +42,25 @@ def _hit_token_budget(generated_tokens: int, token_budget: int, finish_reason: s
     if finish_reason == "length":
         return True
     return int(generated_tokens) >= int(token_budget)
+
+
+def _warm_generation_tokens() -> int:
+    """Untimed JIT-warm budget per measured configuration (0 disables).
+
+    Each sweep/tune candidate runs in a fresh process, so its first timed
+    generation pays model-load JIT plus every width-shape compile — and deeper
+    depths have MORE shapes to compile, so unwarmed sweeps systematically
+    under-measure them (issue #271's tuned-D2 underfit; mistakes/: single tune
+    rows are order-JIT-confounded; arena law: warm the exact scored
+    expression). The warm runs the same generation path as the timed rows on
+    the first prompt case and is excluded from every timed window.
+    """
+
+    raw = os.environ.get("MTPLX_TUNE_WARM_TOKENS", "48")
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 48
 
 
 def _finish_reason_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
@@ -190,8 +210,21 @@ def run_mtp_depth_sweep(
             )
         )
 
+    warm_tokens = _warm_generation_tokens()
+
     ar_rows: list[dict[str, Any]] = []
     if compare_ar:
+        if warm_tokens and encoded:
+            generate_ar(
+                rt,
+                encoded[0][1],
+                max_tokens=min(
+                    warm_tokens,
+                    _token_budget(max_tokens, encoded[0][0].max_tokens),
+                ),
+                sampler=sampler,
+                seed=seed,
+            )
         for index, (case, ids) in enumerate(encoded):
             token_budget = _token_budget(max_tokens, case.max_tokens)
             generation_started_at = time.time()
@@ -238,8 +271,49 @@ def run_mtp_depth_sweep(
                 }
             )
 
+    mtpk_shared_kwargs: dict[str, Any] = {
+        "sampler": sampler,
+        "base_hidden_variant": resolved_base_hidden_variant,
+        "mtp_hidden_variant": resolved_mtp_hidden_variant,
+        "mtp_cache_policy": mtp_cache_policy,
+        "mtp_history_policy": mtp_history_policy,
+        "draft_sampler": draft_sampler,
+        "draft_margin_threshold": draft_margin_threshold,
+        "min_speculative_depth": min_speculative_depth,
+        "verify_strategy": verify_strategy,
+        "verify_core": verify_core,
+        "draft_core": draft_core,
+        "mtp_corrector": mtp_corrector,
+        "online_hidden_corrector_alpha": online_hidden_corrector_alpha,
+        "online_hidden_corrector_decay": online_hidden_corrector_decay,
+        "online_hidden_corrector_warmup": online_hidden_corrector_warmup,
+        "online_hidden_corrector_max_feed_depth": online_hidden_corrector_max_feed_depth,
+        "online_hidden_corrector_key": online_hidden_corrector_key,
+        "online_correction_cache": online_correction_cache,
+        "online_correction_cache_min_depth": online_correction_cache_min_depth,
+        "online_correction_cache_key": online_correction_cache_key,
+        "prompt_correction_cache": prompt_correction_cache,
+        "prompt_correction_cache_min_depth": prompt_correction_cache_min_depth,
+        "adapter_ensemble_q": adapter_ensemble_q,
+        "adapter_ensemble_epsilon": adapter_ensemble_epsilon,
+        "adapter_ensemble_min_depth": adapter_ensemble_min_depth,
+        "mtp_topk_reranker": mtp_topk_reranker,
+    }
+
     depth_results = []
     for depth in depth_values:
+        if warm_tokens and encoded:
+            generate_mtpk(
+                rt,
+                encoded[0][1],
+                max_tokens=min(
+                    warm_tokens,
+                    _token_budget(max_tokens, encoded[0][0].max_tokens),
+                ),
+                speculative_depth=depth,
+                seed=seed,
+                **mtpk_shared_kwargs,
+            )
         rows = []
         for index, (case, ids) in enumerate(encoded):
             token_budget = _token_budget(max_tokens, case.max_tokens)
@@ -248,34 +322,9 @@ def run_mtp_depth_sweep(
                 rt,
                 ids,
                 max_tokens=token_budget,
-                sampler=sampler,
                 speculative_depth=depth,
                 seed=seed + index,
-                base_hidden_variant=resolved_base_hidden_variant,
-                mtp_hidden_variant=resolved_mtp_hidden_variant,
-                mtp_cache_policy=mtp_cache_policy,
-                mtp_history_policy=mtp_history_policy,
-                draft_sampler=draft_sampler,
-                draft_margin_threshold=draft_margin_threshold,
-                min_speculative_depth=min_speculative_depth,
-                verify_strategy=verify_strategy,
-                verify_core=verify_core,
-                draft_core=draft_core,
-                mtp_corrector=mtp_corrector,
-                online_hidden_corrector_alpha=online_hidden_corrector_alpha,
-                online_hidden_corrector_decay=online_hidden_corrector_decay,
-                online_hidden_corrector_warmup=online_hidden_corrector_warmup,
-                online_hidden_corrector_max_feed_depth=online_hidden_corrector_max_feed_depth,
-                online_hidden_corrector_key=online_hidden_corrector_key,
-                online_correction_cache=online_correction_cache,
-                online_correction_cache_min_depth=online_correction_cache_min_depth,
-                online_correction_cache_key=online_correction_cache_key,
-                prompt_correction_cache=prompt_correction_cache,
-                prompt_correction_cache_min_depth=prompt_correction_cache_min_depth,
-                adapter_ensemble_q=adapter_ensemble_q,
-                adapter_ensemble_epsilon=adapter_ensemble_epsilon,
-                adapter_ensemble_min_depth=adapter_ensemble_min_depth,
-                mtp_topk_reranker=mtp_topk_reranker,
+                **mtpk_shared_kwargs,
             )
             generation_ended_at = time.time()
             validations = [
@@ -605,6 +654,7 @@ def run_mtp_depth_sweep(
         "draft_sampler": asdict(draft_sampler),
         "max_tokens": max_tokens,
         "seed": seed,
+        "warm_generation_tokens": warm_tokens,
         "enable_thinking": enable_thinking,
         "compare_ar": compare_ar,
         "ar_only": ar_only,

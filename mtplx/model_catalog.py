@@ -62,7 +62,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Qwen 3.5 4B Optimized Speed",
         detail="4-bit quantization. Fastest fit for smaller Macs.",
         hf_model_id="Youssofal/Qwen3.5-4B-MTPLX-Optimized-Speed",
-        size_bytes=2_474_027_992,
+        size_bytes=2_567_456_776,
         peak_memory_gib=2.86,
         recommended_tiers=frozenset({MODERN_TIER}),
         aliases=(
@@ -78,7 +78,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Qwen 3.5 4B Optimized Quality",
         detail="8-bit quantization. Highest-fidelity 4B; 2x MTP multiplier.",
         hf_model_id="Youssofal/Qwen3.5-4B-MTPLX-Optimized-Quality",
-        size_bytes=4_576_423_401,
+        size_bytes=4_576_426_401,
         peak_memory_gib=4.75,
         recommended_tiers=frozenset({MODERN_TIER}),
         aliases=(
@@ -93,7 +93,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Qwen 3.5 9B Optimized Speed",
         detail="6-bit quantization. Strong small-Mac speed pick.",
         hf_model_id="Youssofal/Qwen3.5-9B-MTPLX-Optimized-Speed",
-        size_bytes=7_783_037_915,
+        size_bytes=8_695_118_657,
         peak_memory_gib=10.0,
         recommended_tiers=frozenset({MODERN_TIER}),
         aliases=(
@@ -130,7 +130,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         # Exact byte sum of the published HF repo files (2026-08-15 tree API;
         # three trunk shards + bf16 MTP sidecar + restored bf16 vision tower
         # (#263) + tokenizer + card).
-        size_bytes=16_924_164_062,
+        size_bytes=16_313_698_865,
         # Measured 2026-08-14: request-log MLX high-water 19.6 GiB during
         # quiet-window 2.4k-context serving (boot + Flappy arms + rung).
         peak_memory_gib=20.0,
@@ -153,7 +153,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         # Exact byte sum of the published HF repo files (2026-08-15 tree API;
         # module_overrides recipe, 5.807 bits/weight, bf16 MTP sidecar,
         # restored bf16 vision tower (#263)).
-        size_bytes=21_313_949_792,
+        size_bytes=20_703_484_600,
         # Measured 2026-08-14: request-log MLX high-water 24.6 GiB during
         # quiet-window 2.4k-context serving (boot + Flappy arms + rung).
         peak_memory_gib=25.0,
@@ -173,7 +173,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         hf_model_id="Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality",
         # Exact byte sum of the published HF repo files (2026-08-15 tree API;
         # includes the restored bf16 vision tower, #263).
-        size_bytes=30_370_840_073,
+        size_bytes=29_972_712_041,
         # Measured 2026-08-14: request-log MLX high-water 32.9 GiB during
         # quiet-window 2.4k-context serving (boot + Flappy arms + rung).
         peak_memory_gib=33.0,
@@ -198,7 +198,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         hf_model_id="Youssofal/Qwen3.8-27B-MTPLX-Bare-Speed-FP16",
         # Exact byte sum of the published HF repo files (2026-08-15 tree API;
         # includes the restored bf16 vision tower, #263).
-        size_bytes=16_924_647_669,
+        size_bytes=16_314_182_467,
         # Same packs and tensor bytes as the parent; peak carried over.
         peak_memory_gib=20.0,
         recommended_tiers=frozenset({LEGACY_TIER}),
@@ -219,7 +219,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         hf_model_id="Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed-FP16",
         # Exact byte sum of the published HF repo files (2026-08-15 tree API;
         # includes the restored bf16 vision tower, #263).
-        size_bytes=21_314_434_309,
+        size_bytes=20_703_969_110,
         # Same packs and tensor bytes as the parent; peak carried over.
         peak_memory_gib=25.0,
         recommended_tiers=frozenset({LEGACY_TIER}),
@@ -239,7 +239,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         hf_model_id="Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality-FP16",
         # Exact byte sum of the published HF repo files (2026-08-15 tree API;
         # includes the restored bf16 vision tower, #263).
-        size_bytes=30_371_326_040,
+        size_bytes=29_973_197_540,
         # Same packs and tensor bytes as the parent; peak carried over.
         peak_memory_gib=33.0,
         recommended_tiers=frozenset({LEGACY_TIER}),
@@ -258,7 +258,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
             "agent tasks, slightly larger, and a little slower for short chats."
         ),
         hf_model_id="Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-V2",
-        size_bytes=19_887_448_095,
+        size_bytes=19_887_455_619,
         peak_memory_gib=21.5,
         recommended_tiers=frozenset({MODERN_TIER}),
         aliases=(
@@ -272,7 +272,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Qwen 3.6 27B Optimized Speed",
         detail="Smaller 4-bit model. A little faster for short chats.",
         hf_model_id="Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed",
-        size_bytes=16_106_127_360,
+        size_bytes=16_419_081_846,
         peak_memory_gib=17.0,
         recommended_tiers=frozenset({MODERN_TIER}),
         aliases=(
@@ -288,7 +288,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         hf_model_id="Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-FP16",
         # Exact sum of the published HF repo files (2026-07-03 audit); the
         # previous 16-GiB figure was a pre-publish estimate ~0.7 GiB high.
-        size_bytes=16_419_644_370,
+        size_bytes=16_419_644_366,
         peak_memory_gib=17.5,
         recommended_tiers=frozenset({LEGACY_TIER}),
         aliases=(
@@ -302,7 +302,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Qwen 3.6 35B-A3B Optimized Speed",
         detail="4-bit quantization. Blazingly fast and quite smart.",
         hf_model_id="Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed",
-        size_bytes=21_016_117_499,
+        size_bytes=21_014_908_550,
         peak_memory_gib=28.0,
         recommended_tiers=frozenset({MODERN_TIER}),
         aliases=(
@@ -333,7 +333,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Qwen 3.6 35B-A3B Optimized Balance",
         detail="6-bit quantization. Stronger balance of speed and quality.",
         hf_model_id="Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Balance",
-        size_bytes=29_672_250_227,
+        size_bytes=29_671_037_161,
         peak_memory_gib=32.0,
         recommended_tiers=frozenset({MODERN_TIER}),
         aliases=(
@@ -361,7 +361,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Gemma 4 31B Optimized Speed",
         detail="High quality. Moderate speeds.",
         hf_model_id="Youssofal/Gemma4-MTPLX-Optimized-Speed",
-        size_bytes=17_715_675_136,
+        size_bytes=17_715_574_395,
         peak_memory_gib=18.0,
         recommended_tiers=frozenset({MODERN_TIER}),
         aliases=(
@@ -378,7 +378,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Qwen 3.6 27B Optimized Quality",
         detail="Maximum quality. Moderate speeds.",
         hf_model_id="Youssofal/Qwen3.6-27B-MTPLX-Optimized-Quality",
-        size_bytes=30_064_771_072,
+        size_bytes=30_016_961_493,
         peak_memory_gib=27.62,
         recommended_tiers=frozenset({MODERN_TIER}),
         aliases=(
@@ -408,7 +408,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Laguna S-2.1 (community oQ4e)",
         detail="Poolside coding model, mixed-precision 4-bit. AR-only (no MTP head yet).",
         hf_model_id="mlx-community/Laguna-S-2.1-oQ4e",
-        size_bytes=64_129_728_868,
+        size_bytes=64_129_781_104,
         peak_memory_gib=74.0,
         recommended_tiers=frozenset({MODERN_TIER}),
         aliases=(

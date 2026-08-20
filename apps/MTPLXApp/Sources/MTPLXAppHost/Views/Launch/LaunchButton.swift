@@ -22,14 +22,16 @@ import MTPLXAppCore
 // chromeAccent hover halo, press collapse) is identical.
 
 struct LaunchButton: View {
-    @EnvironmentObject private var backend: MTPLXBackendStore
+    let backend: MTPLXBackendStore
+    let daemonState: DaemonState
+
     @EnvironmentObject private var router: AppRouter
     @EnvironmentObject private var stopCoordinator: AppStopCoordinator
 
     var body: some View {
         Button(action: handlePress) {
             Group {
-                if case .stopping = backend.daemonState {
+                if case .stopping = daemonState {
                     ProgressView()
                         .controlSize(.small)
                         .scaleEffect(0.7)
@@ -50,10 +52,10 @@ struct LaunchButton: View {
         .animation(.smooth(duration: 0.25), value: stateKey)
     }
 
-    private var stateKey: String { backend.daemonState.kind.rawValue }
+    private var stateKey: String { daemonState.kind.rawValue }
 
     private var glyphName: String {
-        switch backend.daemonState.kind {
+        switch daemonState.kind {
         case .stopped, .crashed, .degraded: return "play.fill"
         case .starting: return "circle.dotted"
         case .warming: return "hourglass"
@@ -64,12 +66,12 @@ struct LaunchButton: View {
 
     private var disabled: Bool {
         if stopCoordinator.isStoppingEverything { return true }
-        if case .stopping = backend.daemonState { return true }
+        if case .stopping = daemonState { return true }
         return false
     }
 
     private var helpText: String {
-        switch backend.daemonState.kind {
+        switch daemonState.kind {
         case .stopped, .crashed, .degraded:
             return "Pick how you want to use it, then start"
         case .starting: return "Starting — click to cancel"
@@ -80,7 +82,7 @@ struct LaunchButton: View {
     }
 
     private var accessibilityLabel: String {
-        switch backend.daemonState.kind {
+        switch daemonState.kind {
         case .stopped, .crashed, .degraded: return "Start MTPLX"
         case .starting: return "Starting — tap to stop"
         case .warming: return "Loading — tap to stop"
@@ -90,7 +92,7 @@ struct LaunchButton: View {
     }
 
     private func handlePress() {
-        switch backend.daemonState.kind {
+        switch daemonState.kind {
         case .stopped, .crashed, .degraded:
             router.launchPickerPresented.toggle()
         case .starting, .warming, .running:

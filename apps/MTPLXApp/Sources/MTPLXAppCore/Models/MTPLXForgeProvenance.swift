@@ -152,7 +152,47 @@ public struct MTPLXForgeProvenance: Codable, Equatable, Sendable {
 // that pattern (Swift's type system can't prove the dict's deep
 // immutability through `Any`, but the parser owns and freezes it).
 public struct MTPLXRuntimeMetadata: Equatable, @unchecked Sendable {
+    private final class ReadCache: @unchecked Sendable {
+        struct Entry {
+            let modificationDate: Date?
+            let size: UInt64
+            let metadata: MTPLXRuntimeMetadata
+        }
+
+        private let lock = NSLock()
+        private var entries: [String: Entry] = [:]
+
+        func value(for path: String, modificationDate: Date?, size: UInt64) -> MTPLXRuntimeMetadata? {
+            lock.lock()
+            defer { lock.unlock() }
+            guard let entry = entries[path],
+                  entry.modificationDate == modificationDate,
+                  entry.size == size else { return nil }
+            return entry.metadata
+        }
+
+        func store(_ metadata: MTPLXRuntimeMetadata, for path: String, modificationDate: Date?, size: UInt64) {
+            lock.lock()
+            entries[path] = Entry(
+                modificationDate: modificationDate,
+                size: size,
+                metadata: metadata
+            )
+            lock.unlock()
+        }
+
+        func remove(_ path: String) {
+            lock.lock()
+            entries[path] = nil
+            lock.unlock()
+        }
+    }
+
+    private static let readCache = ReadCache()
+
     public var mtplxVersion: String?
+    public var publicModelID: String?
+    public var modelFamily: String?
     public var archId: String?
     public var mtpDepthMax: Int?
     public var recommendedProfile: String?
@@ -168,6 +208,8 @@ public struct MTPLXRuntimeMetadata: Equatable, @unchecked Sendable {
 
     public init(
         mtplxVersion: String? = nil,
+        publicModelID: String? = nil,
+        modelFamily: String? = nil,
         archId: String? = nil,
         mtpDepthMax: Int? = nil,
         recommendedProfile: String? = nil,
@@ -178,6 +220,8 @@ public struct MTPLXRuntimeMetadata: Equatable, @unchecked Sendable {
         rawJSON: [String: Any] = [:]
     ) {
         self.mtplxVersion = mtplxVersion
+        self.publicModelID = publicModelID
+        self.modelFamily = modelFamily
         self.archId = archId
         self.mtpDepthMax = mtpDepthMax
         self.recommendedProfile = recommendedProfile
@@ -190,6 +234,8 @@ public struct MTPLXRuntimeMetadata: Equatable, @unchecked Sendable {
 
     public static func == (lhs: MTPLXRuntimeMetadata, rhs: MTPLXRuntimeMetadata) -> Bool {
         lhs.mtplxVersion == rhs.mtplxVersion
+            && lhs.publicModelID == rhs.publicModelID
+            && lhs.modelFamily == rhs.modelFamily
             && lhs.archId == rhs.archId
             && lhs.mtpDepthMax == rhs.mtpDepthMax
             && lhs.recommendedProfile == rhs.recommendedProfile
@@ -215,6 +261,8 @@ public struct MTPLXRuntimeMetadata: Equatable, @unchecked Sendable {
 
         return MTPLXRuntimeMetadata(
             mtplxVersion: json["mtplx_version"] as? String,
+            publicModelID: json["public_model_id"] as? String,
+            modelFamily: json["model_family"] as? String,
             archId: json["arch_id"] as? String,
             mtpDepthMax: json["mtp_depth_max"] as? Int,
             recommendedProfile: json["recommended_profile"] as? String,
@@ -229,8 +277,28 @@ public struct MTPLXRuntimeMetadata: Equatable, @unchecked Sendable {
     /// Reads + parses a runtime-metadata file from disk. Returns nil
     /// on missing file, IO error, or invalid JSON.
     public static func read(at path: String) -> MTPLXRuntimeMetadata? {
-        guard let data = FileManager.default.contents(atPath: path) else { return nil }
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-        return parse(json)
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path) else {
+            readCache.remove(path)
+            return nil
+        }
+        let modificationDate = attributes[.modificationDate] as? Date
+        let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+        if let cached = readCache.value(
+            for: path,
+            modificationDate: modificationDate,
+            size: size
+        ) {
+            return cached
+        }
+        guard let data = FileManager.default.contents(atPath: path),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let metadata = parse(json) else { return nil }
+        readCache.store(
+            metadata,
+            for: path,
+            modificationDate: modificationDate,
+            size: size
+        )
+        return metadata
     }
 }

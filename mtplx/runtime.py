@@ -965,6 +965,26 @@ def load(
     # The server prints this as its startup engagement receipt; logger.info
     # alone is invisible under `python -m mtplx.server.openai` (no handler).
     runtime.laguna_fused_report = fused_report
+    # Gate on the object that actually runs the layer loop, not the config
+    # string: dense Qwen3.8 loads as plain `qwen3_5`, and mtp_patch shadows
+    # the TextModel class with its own loop — but the layers stay stock
+    # `qwen3_5.DecoderLayer`, which is what the rung wrapper patches.
+    try:
+        from mlx_lm.models import qwen3_5 as _qwen3_5_module
+
+        _inner_text = getattr(
+            getattr(model, "language_model", model), "model", None
+        )
+        if isinstance(_inner_text, _qwen3_5_module.Qwen3_5TextModel):
+            from .packed_concats import install_qwen3_next_packed_concats
+            from .prefill_rungs import install_qwen3_5_prefill_rungs
+
+            # Env-gated (MTPLX_PREFILL_ASYNC_RUNGS); no-op without a stride.
+            install_qwen3_5_prefill_rungs()
+            # Env-gated (MTPLX_PACKED_PROJ_CONCATS); no-op unless enabled.
+            install_qwen3_next_packed_concats(model)
+    except ImportError:
+        pass
     return runtime
 
 

@@ -19,8 +19,11 @@ import MTPLXAppCore
 // it can glide between tabs via `matchedGeometryEffect`.
 
 struct BottomTabBar: View {
+    let inFlightCount: Int
+    let daemonState: DaemonState
+    let performanceLock: Bool
+
     @EnvironmentObject private var router: AppRouter
-    @EnvironmentObject private var backend: MTPLXBackendStore
     @EnvironmentObject private var themeStore: ThemeStore
 
     @Namespace private var tabHighlight
@@ -33,7 +36,7 @@ struct BottomTabBar: View {
                     isSelected: router.selection == tab,
                     badge: badgeCount(for: tab),
                     motionEnabled: !themeStore.reduceMotionPreference
-                        && !backend.configuration.performanceLock,
+                        && !performanceLock,
                     highlight: tabHighlight
                 ) {
                     withAnimation(tabNavigationAnimation) {
@@ -70,11 +73,11 @@ struct BottomTabBar: View {
             // the old Requests tab. Cache pressure deliberately does
             // NOT get a badge — too noisy; users open the tab to look
             // at cache state when they want it.
-            let n = backend.inFlight.count
+            let n = inFlightCount
             return n > 0 ? n : nil
         case .system:
             // Surface a "!" badge when degraded / thermal alarm.
-            switch backend.daemonState.kind {
+            switch daemonState.kind {
             case .degraded, .crashed: return 0
             default: break
             }
@@ -86,7 +89,7 @@ struct BottomTabBar: View {
 
     private var tabNavigationAnimation: Animation? {
         guard !themeStore.reduceMotionPreference,
-              !backend.configuration.performanceLock
+              !performanceLock
         else { return nil }
         return .spring(response: 0.36, dampingFraction: 0.86)
     }

@@ -164,6 +164,10 @@ public final class DaemonSupervisor: @unchecked Sendable {
     private var lifecycleEpoch = 0
     private var recentCrashDates: [Date] = []
     private var automaticRestartEnabled = false
+    /// Bounded wait for fan-ramp verification once /health is already ok.
+    /// A healthy daemon proceeds to ready when this expires — it is never
+    /// reaped over a fan receipt. Overridable for tests.
+    public var fanRampGraceSeconds: TimeInterval = 30
     private var automaticRestartEligible = false
     private var automaticLaunchGeneration: Int?
     // Kept independently from the restart recipe so a Stop that begins just
@@ -1464,6 +1468,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
     ) async throws -> HealthPayload {
         let deadline = Date().addingTimeInterval(timeoutSeconds)
         var sawHealthyWithUnverifiedFan = false
+        var healthyUnverifiedFanSince: Date?
         onPhase?(.waitingForOwnedHealth)
         while Date() < deadline {
             // A cancelled automatic-restart Task must relinquish the Process
@@ -1490,10 +1495,21 @@ public final class DaemonSupervisor: @unchecked Sendable {
                 }
                 if requireActualFanRamp,
                    health.thermal?.actualRampVerified != true {
-                    sawHealthyWithUnverifiedFan = true
-                    onPhase?(.rampingFans)
-                    try await Task.sleep(nanoseconds: 250_000_000)
-                    continue
+                    // A healthy daemon is never held hostage to a fan
+                    // receipt. The full health budget exists for slow model
+                    // loads; inheriting it here wedged model swaps for the
+                    // whole budget when ramp verification couldn't complete,
+                    // then reaped a serving daemon. Give the ramp a bounded
+                    // grace window and proceed — the live thermal UI shows
+                    // the real fan state either way.
+                    let since = healthyUnverifiedFanSince ?? Date()
+                    healthyUnverifiedFanSince = since
+                    if Date().timeIntervalSince(since) < fanRampGraceSeconds {
+                        sawHealthyWithUnverifiedFan = true
+                        onPhase?(.rampingFans)
+                        try await Task.sleep(nanoseconds: 250_000_000)
+                        continue
+                    }
                 }
                 onPhase?(.warming)
                 return health

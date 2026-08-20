@@ -1445,6 +1445,51 @@ def test_build_reuses_legacy_speed_grid_positive_control(tmp_path, monkeypatch):
     assert not (run / "build_outcome.json").exists()
 
 
+def test_saved_verify_rows_are_bound_to_the_forged_artifact(tmp_path):
+    model = tmp_path / "model"
+    _write_qwen_sidecar_fixture(model)
+    runtime = _runtime(depth=3)
+    runtime["speed_evidence"]["artifact_fingerprint"] = (
+        forge._verification_artifact_fingerprint(model)
+    )
+
+    assert (
+        forge._saved_verify_rows_reuse_blocker(
+            _speed_win_rows(),
+            runtime,
+            model_path=model,
+            source_path=model,
+            require_all_depths=True,
+        )
+        is None
+    )
+
+    changed_config = _mtp_config()
+    changed_config["mtplx_mtp_quantization"] = {
+        "policy": "requantize",
+        "bits": 4,
+        "group_size": 64,
+    }
+    _write_json(model / "config.json", changed_config)
+    assert forge._saved_verify_rows_reuse_blocker(
+        _speed_win_rows(),
+        runtime,
+        model_path=model,
+        source_path=model,
+        require_all_depths=True,
+    ) == "saved verification belongs to different artifact bytes"
+
+    runtime["speed_evidence"].pop("artifact_fingerprint")
+    runtime["forge_provenance"] = {"forged_at": "2026-05-27T00:00:00+01:00"}
+    assert forge._saved_verify_rows_reuse_blocker(
+        _speed_win_rows(),
+        runtime,
+        model_path=model,
+        source_path=model,
+        require_all_depths=True,
+    ) == "saved verification predates the forged artifact"
+
+
 def test_build_reverifies_old_runtime_without_mtp_contract(tmp_path, monkeypatch):
     source = tmp_path / "source"
     _write_json(source / "config.json", _mtp_config())

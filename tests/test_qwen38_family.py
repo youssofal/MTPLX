@@ -11,6 +11,8 @@ qwen3_5/qwen3_6 behavior is untouched.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -274,6 +276,33 @@ def test_qwen38_turbo_default_promotion() -> None:
     pinned = SimpleNamespace(profile="sustained", _cli_flags={"profile"})
     assert not _apply_model_default_profile(pinned, QWEN38_BARE_SPEED_PUBLIC_MODEL_ID)
     assert pinned.profile == "sustained"
+
+
+def test_forged_qwen38_artifact_honors_its_profile_and_family(tmp_path: Path) -> None:
+    from mtplx.commands.public import (
+        _apply_model_default_profile,
+        _fast_mtplx_tune_inspection,
+        resolved_default_profile_name_for_ref,
+    )
+
+    model = tmp_path / "3.8 Bare Speed Beta"
+    model.mkdir()
+    (model / "mtplx_runtime.json").write_text(
+        json.dumps(
+            {
+                "arch_id": "qwen3-next-mtp",
+                "public_model_id": "mtplx-qwen38-27b-bare-speed-beta",
+                "recommended_profile": "turbo",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = SimpleNamespace(profile="sustained", model=str(model), _cli_flags=set())
+    assert _apply_model_default_profile(args, "mtplx-qwen38-27b-bare-speed-beta")
+    assert args.profile == "turbo"
+    assert resolved_default_profile_name_for_ref(model) == "turbo"
+    assert _fast_mtplx_tune_inspection(str(model))["model_type"] == "qwen3_8"
 
 
 def test_qwen38_no_silent_sustained_side_doors() -> None:

@@ -38,5 +38,10 @@ let package = Package(
             dependencies: ["MTPLXAppCore"],
             path: "Tests/MTPLXAppCoreTests"
         ),
+        .testTarget(
+            name: "MTPLXAppHostTests",
+            dependencies: ["MTPLXAppHost"],
+            path: "Tests/MTPLXAppHostTests"
+        ),
     ]
 )

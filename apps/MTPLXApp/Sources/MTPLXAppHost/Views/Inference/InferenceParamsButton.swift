@@ -12,7 +12,8 @@ import MTPLXAppCore
 // so the click is delivered to the Button reliably.
 
 struct InferenceParamsButton: View {
-    @EnvironmentObject private var backend: MTPLXBackendStore
+    let performanceLock: Bool
+
     @EnvironmentObject private var router: AppRouter
 
     var body: some View {
@@ -25,13 +26,7 @@ struct InferenceParamsButton: View {
                 .foregroundStyle(Brand.typeHi)
         }
         .buttonStyle(PremiumPuckStyle())
-        .help(active ? "Settings · Performance mode on" : "Settings")
+        .help(performanceLock ? "Settings · Performance mode on" : "Settings")
         .accessibilityLabel("Settings")
-    }
-
-    /// Kept so the help-text can hint Performance Mode is on. Visual
-    /// state stays monochrome regardless.
-    private var active: Bool {
-        backend.configuration.performanceLock
     }
 }

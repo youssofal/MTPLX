@@ -22,6 +22,7 @@ struct BenchHeader: View {
     let startTitle: String
     let startIcon: String
     let startEnabled: Bool
+    let performanceLock: Bool
     /// Rendered content width of the panel, threaded down so the header can
     /// reflow gracefully instead of letting its CTA cluster get crushed and
     /// wrap. The controls (CTAs / settings / close) are rigid; the branding
@@ -58,7 +59,7 @@ struct BenchHeader: View {
                 Spacer(minLength: 12)
             }
             ctaCluster
-            InferenceParamsButton()
+            InferenceParamsButton(performanceLock: performanceLock)
             closeButton
         }
     }

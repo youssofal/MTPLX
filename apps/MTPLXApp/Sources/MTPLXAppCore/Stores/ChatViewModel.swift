@@ -1,6 +1,8 @@
+import AppKit
 import Combine
 import Foundation
 import ImageIO
+import QuartzCore
 import SwiftData
 
 // MARK: - StreamingPhase
@@ -112,7 +114,6 @@ public final class ChatViewModel: ObservableObject {
     /// views that only need "what hasn't reached the document yet" read
     /// these — the full concatenating properties above cost O(answer)
     /// per access and are for turn-boundary persistence only.
-    public var streamingReasoningPending: String { streamingReasoningBuffer }
     public var streamingContentPending: String { streamingContentBuffer }
     public var shouldRenderStreamingAssistant: Bool {
         guard isStreaming else { return false }
@@ -196,11 +197,14 @@ public final class ChatViewModel: ObservableObject {
     private var streamingContentBuffer = ""
     private var decodeWindowSamples: [(t: Double, tokens: Double)] = []
     private var streamFlushTask: Task<Void, Never>?
+    private var streamDisplayLink: CADisplayLink?
+    private let streamDisplayLinkTarget = StreamFlushLinkTarget()
     private var lastLiveDecodeUpdateAt: Date = .distantPast
-    // Paint token-sized SSE deltas near display refresh. Live chat stays plain
-    // text, so this can feel token-by-token without invoking markdown/layout
-    // work for every raw network event.
-    private static let streamFlushInterval: Duration = .milliseconds(16)
+    // Fallback cadence for the headless path only (no attached display,
+    // e.g. unit tests). The live reveal is display-link driven; see
+    // startStreamFlushLoop. At local-model rates (~30-70 tok/s), 32 ms
+    // still reveals characters—not words.
+    private static let streamFlushInterval: Duration = .milliseconds(32)
     /// Hard bound on how far a coalescing buffer may run ahead of its
     /// document if the flush task ever stalls (freeze backstop).
     private static let streamBufferFlushBackstop = 1_024
@@ -773,6 +777,7 @@ public final class ChatViewModel: ObservableObject {
         guard !fragment.isEmpty else { return }
         let wasEmpty = !hasStreamingContent
         streamingContentBuffer.append(fragment)
+        contentArrivedCharsTotal += fragment.count
         if !wasEmpty, streamingContentBuffer.count > Self.streamBufferFlushBackstop {
             flushStreamingBuffers(drainCompletely: false)
         }
@@ -949,6 +954,39 @@ public final class ChatViewModel: ObservableObject {
 
     private func startStreamFlushLoop(generation: Int) {
         stopStreamFlushLoop()
+        contentArrivedCharsTotal = 0
+        lastArrivedCharsTotal = 0
+        revealRateCharsPerSecond = 0
+        lastRevealTickUptime = 0
+        // Reveal on the DISPLAY clock, not a dispatch timer. The 32 ms
+        // Task.sleep loop this replaces was measured slipping 4-9 frame
+        // multiples under decode load (flush-gap p95 140 ms / max 315 ms
+        // while the paint watchdog's display link fired 60 Hz without one
+        // missed tick — 2026-08-19 cache-hit field session): main-queue
+        // timer continuations get coalesced under sustained SoC pressure
+        // and starve outright during scroll-tracking runloop modes, and
+        // every slipped tick reads as freeze-then-multi-line-vomit. A
+        // display link in .common modes wakes exactly once per painted
+        // frame, so reveal cadence and paint cadence cannot drift apart.
+        if let screen = NSScreen.main ?? NSScreen.screens.first {
+            streamDisplayLinkTarget.onTick = { [weak self] in
+                self?.flushStreamingBuffersIfCurrent(generation: generation)
+            }
+            let link = screen.displayLink(
+                target: streamDisplayLinkTarget,
+                selector: #selector(StreamFlushLinkTarget.tick(_:))
+            )
+            // 60 Hz is already finer than the old 32 ms cadence and halves
+            // wakeups on ProMotion panels; the reveal budget uses real dt,
+            // so the system dropping to 30 Hz just scales the per-tick cut.
+            link.preferredFrameRateRange = CAFrameRateRange(
+                minimum: 30, maximum: 60, preferred: 60
+            )
+            link.add(to: .main, forMode: .common)
+            streamDisplayLink = link
+            return
+        }
+        // Headless fallback (no attached display; unit tests).
         streamFlushTask = Task { [weak self] in
             while !Task.isCancelled {
                 do {
@@ -962,6 +1000,9 @@ public final class ChatViewModel: ObservableObject {
     }
 
     private func stopStreamFlushLoop() {
+        streamDisplayLink?.invalidate()
+        streamDisplayLink = nil
+        streamDisplayLinkTarget.onTick = {}
         streamFlushTask?.cancel()
         streamFlushTask = nil
     }
@@ -974,18 +1015,17 @@ public final class ChatViewModel: ObservableObject {
     // MARK: Typewriter pacing (2026-07-31 founder: "I like it when I can
     // see every individual character typing")
     //
-    // The 16 ms flush loop used to drain the WHOLE arrival buffer each
+    // The display-cadenced flush loop used to drain the WHOLE arrival buffer each
     // tick, so any main-thread hiccup turned into a multi-word paste —
     // the "vomits five words at a time" feel. Paced mode reveals a
-    // bounded slice per tick instead: at steady state (~180 chars/s
-    // arriving) that is ~3 characters every 16 ms — indistinguishable
-    // from per-character typing — and after a stall the backlog drains
+    // bounded slice per tick instead: at steady state it reveals a few
+    // characters every 32 ms, and after a stall the backlog drains
     // geometrically (quarter per tick) so catch-up looks like fast
     // typing, not a paste. Bounded latency: steady-state lag is ~70 ms,
     // and backlogs over 4 KB drain whole. Lifecycle flushes (finalize,
     // cancel, error, tool-round handoff) always drain completely —
-    // `drainCompletely` defaults to true so only the 16 ms loop and the
-    // mid-event backstop opt into pacing. `MTPLX_STREAM_TYPEWRITER=0`
+    // `drainCompletely` defaults to true so only the display-link tick and
+    // the mid-event backstop opt into pacing. `MTPLX_STREAM_TYPEWRITER=0`
     // restores the old drain-everything behavior.
     private static let typewriterPacingEnabled: Bool = {
         switch ProcessInfo.processInfo.environment["MTPLX_STREAM_TYPEWRITER"]?
@@ -998,19 +1038,56 @@ public final class ChatViewModel: ObservableObject {
     /// Per-tick reveal ceiling. The old behavior whole-drained any
     /// buffer above 4 KB in a single frame — that WAS the visible
     /// "vomit" paste whenever the main thread hiccuped and a backlog
-    /// built (2026-08-17 field regression). 256 chars × 62 Hz drains a
-    /// worst-case backlog at ~16k chars/s (any catch-up reads as fast
-    /// typing and clears a 4 KB backlog in ~0.26 s), while the stream
-    /// itself produces ~150 chars/s — the cap only shapes recovery.
+    /// built (2026-08-17 field regression). The 256-character ceiling
+    /// still clears a 4 KB recovery backlog in well under a second;
+    /// steady-state streams reveal only a few characters per tick.
     private static let typewriterMaxRevealCharacters = 256
+
+    // Rate-based reveal (streamwar 2026-08-19): the reveal budget tracks
+    // the ARRIVAL rate, not the backlog size. The old quarter-of-backlog
+    // cut made catch-up speed proportional to how far behind the UI was —
+    // after any stall the first ticks pasted up to 256 chars while the
+    // last ticks crawled, which reads as burst-then-crawl rather than
+    // typing. An EMA of arrival chars/s sets the per-tick budget; a
+    // bounded 2x ramp engages only while a real backlog exists, so
+    // recovery looks like the same typing, just briefly faster.
+    private var contentArrivedCharsTotal = 0
+    private var lastArrivedCharsTotal = 0
+    private var revealRateCharsPerSecond: Double = 0
+    private var lastRevealTickUptime: Double = 0
+
+    private func typewriterTickBudget() -> Int {
+        let now = ProcessInfo.processInfo.systemUptime
+        let dt = lastRevealTickUptime > 0
+            ? now - lastRevealTickUptime
+            : 0.032
+        lastRevealTickUptime = now
+        let arrived = contentArrivedCharsTotal - lastArrivedCharsTotal
+        lastArrivedCharsTotal = contentArrivedCharsTotal
+        if arrived > 0, dt > 0 {
+            let instantaneous = Double(arrived) / dt
+            revealRateCharsPerSecond = revealRateCharsPerSecond <= 0
+                ? instantaneous
+                : revealRateCharsPerSecond * 0.8 + instantaneous * 0.2
+        }
+        // Clamp the tick span so a main-thread stall doesn't grant one
+        // giant budget; the backlog ramp below does the catching up.
+        let perTick = revealRateCharsPerSecond * min(dt, 0.1)
+        let backlog = Double(streamingContentBuffer.count)
+        let catchUp = backlog > perTick * 4 ? 2.0 : 1.0
+        return Int((perTick * catchUp).rounded(.up))
+    }
 
     // Internal (not private) so the regression test can pin the reveal
     // ceiling — the unbounded whole-drain WAS the "vomit" paste.
-    static func pacedCut(_ buffer: String) -> (reveal: String, rest: String) {
+    static func pacedCut(
+        _ buffer: String,
+        budget: Int
+    ) -> (reveal: String, rest: String) {
         let count = buffer.count
         guard count > typewriterMinRevealCharacters else { return (buffer, "") }
         let reveal = min(
-            max(typewriterMinRevealCharacters, count / 4),
+            max(typewriterMinRevealCharacters, budget),
             typewriterMaxRevealCharacters
         )
         guard reveal < count else { return (buffer, "") }
@@ -1026,22 +1103,23 @@ public final class ChatViewModel: ObservableObject {
             ? ProcessInfo.processInfo.systemUptime
             : 0
         if !streamingReasoningBuffer.isEmpty {
-            let delta: String
-            if paced {
-                let cut = Self.pacedCut(streamingReasoningBuffer)
-                delta = cut.reveal
-                streamingReasoningBuffer = cut.rest
-            } else {
-                delta = streamingReasoningBuffer
-                streamingReasoningBuffer = ""
-            }
+            // Reasoning is diagnostic plain text, so show the daemon's real
+            // cadence. Quarter-buffer "typewriter" recovery made thought
+            // output alternately crawl and burst even while production was
+            // steady; one display-cadenced drain is ordered and still bounds
+            // paint work to the 32 ms flush loop.
+            let delta = streamingReasoningBuffer
+            streamingReasoningBuffer = ""
             drainedBytes += delta.utf8.count
             streamingReasoningDocument.append(delta)
         }
         if !streamingContentBuffer.isEmpty {
             let delta: String
             if paced {
-                let cut = Self.pacedCut(streamingContentBuffer)
+                let cut = Self.pacedCut(
+                    streamingContentBuffer,
+                    budget: typewriterTickBudget()
+                )
                 delta = cut.reveal
                 streamingContentBuffer = cut.rest
             } else {
@@ -1951,5 +2029,19 @@ private struct ChatThinkingTagSplitter {
             }
         }
         return 0
+    }
+}
+
+/// CADisplayLink requires an NSObject target; ChatViewModel is a plain
+/// ObservableObject. The link retains this target, the closure holds the
+/// view model weakly, and stopStreamFlushLoop's invalidate() releases the
+/// link's retain — no cycles. The link is added to the main runloop, so
+/// the tick always runs on the MainActor.
+@MainActor
+private final class StreamFlushLinkTarget: NSObject {
+    var onTick: () -> Void = {}
+
+    @objc func tick(_ link: CADisplayLink) {
+        onTick()
     }
 }

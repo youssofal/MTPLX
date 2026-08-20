@@ -17,9 +17,13 @@ import MTPLXAppCore
 // so the user reads "MTPLX • Running" as one phrase.
 
 struct TopChromeStrip: View {
-    @EnvironmentObject private var backend: MTPLXBackendStore
+    let backend: MTPLXBackendStore
+    let daemonState: DaemonState
+    let connectionState: MetricsConnectionState
+    let activeModelLabel: String
+    let configuration: MTPLXAppConfiguration
+
     @EnvironmentObject private var router: AppRouter
-    @EnvironmentObject private var themeStore: ThemeStore
 
     var body: some View {
         HStack(alignment: .center, spacing: 12) {
@@ -38,8 +42,8 @@ struct TopChromeStrip: View {
                 WordmarkView(height: 24)
                 HStack(alignment: .center, spacing: 10) {
                     ConnectionDot(
-                        daemonState: backend.daemonState,
-                        connectionState: backend.connectionState
+                        daemonState: daemonState,
+                        connectionState: connectionState
                     )
                     Text("\u{00B7}")
                         .font(.system(size: 11, weight: .regular, design: .monospaced))
@@ -53,7 +57,11 @@ struct TopChromeStrip: View {
                                 .font(.system(size: 11, weight: .medium, design: .monospaced))
                                 .tracking(1)
                                 .lineLimit(1)
-                                .truncationMode(.middle)
+                                // .tail, not .middle: on macOS 26, middle
+                                // truncation on a tracked single-line Text in
+                                // a flexible frame can spin layout at 100%
+                                // CPU (streamwar A7; Settings-click suspect).
+                                .truncationMode(.tail)
                             Image(systemName: "chevron.down")
                                 .font(.system(size: 8, weight: .bold))
                         }
@@ -77,8 +85,13 @@ struct TopChromeStrip: View {
                         try? await backend.refreshSnapshot()
                     }
                 }
-                InferenceParamsButton()
-                LaunchButton()
+                InferenceParamsButton(
+                    performanceLock: configuration.performanceLock
+                )
+                LaunchButton(
+                    backend: backend,
+                    daemonState: daemonState
+                )
             }
         }
         // Top inset is intentionally larger than the bottom inset
@@ -107,15 +120,9 @@ struct TopChromeStrip: View {
     private func modelShort(_ raw: String) -> String {
         let stripped = MTPLXModelOption.displayName(
             for: raw,
-            customModels: backend.configuration.customModels
+            customModels: configuration.customModels
         )
         return stripped.uppercased()
-    }
-
-    private var activeModelLabel: String {
-        backend.health?.model
-            ?? backend.snapshot?.modelId
-            ?? backend.configuration.model
     }
 }
 

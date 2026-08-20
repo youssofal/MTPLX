@@ -1099,6 +1099,7 @@ private enum ModelLaunchFamily {
         // thinking sampler) is the model card's, not the 3.6 coding one.
         if normalized.contains("qwen3.8-27b-mtplx")
             || normalized.contains("qwen38-27b")
+            || MTPLXModelOption.modelFamily(for: model) == "qwen3_8"
         {
             return .qwen38_27B
         }

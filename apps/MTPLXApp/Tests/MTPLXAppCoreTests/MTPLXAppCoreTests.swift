@@ -1247,6 +1247,11 @@ final class MTPLXAppCoreTests: XCTestCase {
             MTPLXModelOption.modelFamily(for: "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-V2"),
             "qwen3_6"
         )
+        XCTAssertNotEqual(
+            MTPLXModelOption.modelFamily(for: "Qwen/Qwen3-8B"),
+            "qwen3_8",
+            "the 8B parameter count must not masquerade as the Qwen 3.8 version"
+        )
         XCTAssertEqual(
             MTPLXCommandBuilder.recommendedProfile(
                 for: "/Users/example/.mtplx/models/Youssofal--Qwen3.8-27B-MTPLX-Bare-Speed"

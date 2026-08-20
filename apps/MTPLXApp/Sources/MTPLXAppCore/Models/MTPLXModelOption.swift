@@ -337,7 +337,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 "Qwen 3.5 4B",
                 "Small Qwen",
             ],
-            sizeBytes: 2_474_027_992,
+            sizeBytes: 2_567_456_776,
             peakMemoryGiB: 2.86,
             recommendedFor: [.modernApple]
         ),
@@ -357,7 +357,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 "Qwen3.5 4B Optimized Quality",
                 "Qwen 3.5 4B Quality",
             ],
-            sizeBytes: 4_576_423_401,
+            sizeBytes: 4_576_426_401,
             peakMemoryGiB: 4.75,
             recommendedFor: [.modernApple]
         ),
@@ -381,7 +381,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 "Qwen 3.5 9B Speed 6-bit",
                 "Qwen 3.5 9B Speed",
             ],
-            sizeBytes: 7_783_037_915,
+            sizeBytes: 8_695_118_657,
             peakMemoryGiB: 10.0,
             recommendedFor: [.modernApple]
         ),
@@ -421,7 +421,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 "Bare Speed",
             ],
             // Exact byte sum of the published HF repo files (2026-08-15 tree API).
-            sizeBytes: 16_924_164_062,
+            sizeBytes: 16_313_698_865,
             // Measured 2026-08-14: request-log MLX high-water 19.6 GiB during
             // quiet-window 2.4k-context serving (boot + Flappy arms + rung).
             peakMemoryGiB: 20.0,
@@ -443,7 +443,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 "Qwen 3.8 Optimized Speed",
             ],
             // Exact byte sum of the published HF repo files (2026-08-15 tree API).
-            sizeBytes: 21_313_949_792,
+            sizeBytes: 20_703_484_600,
             // Measured 2026-08-14: request-log MLX high-water 24.6 GiB during
             // quiet-window 2.4k-context serving (boot + Flappy arms + rung).
             peakMemoryGiB: 25.0,
@@ -465,7 +465,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 "Qwen 3.8 Optimized Quality",
             ],
             // Exact byte sum of the published HF repo files (2026-08-15 tree API).
-            sizeBytes: 30_370_840_073,
+            sizeBytes: 29_972_712_041,
             // Measured 2026-08-14: request-log MLX high-water 32.9 GiB during
             // quiet-window 2.4k-context serving (boot + Flappy arms + rung).
             peakMemoryGiB: 33.0,
@@ -494,7 +494,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 "Bare Speed FP16",
             ],
             // Exact byte sum of the local sibling at build time (2026-08-15).
-            sizeBytes: 16_924_647_669,
+            sizeBytes: 16_314_182_467,
             // Same packs and tensor bytes as the parent; peak carried over.
             peakMemoryGiB: 20.0,
             recommendedFor: [.legacyApple]
@@ -515,7 +515,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 "Qwen 3.8 Optimized Speed FP16",
             ],
             // Exact byte sum of the local sibling at build time (2026-08-15).
-            sizeBytes: 21_314_434_309,
+            sizeBytes: 20_703_969_110,
             // Same packs and tensor bytes as the parent; peak carried over.
             peakMemoryGiB: 25.0,
             recommendedFor: [.legacyApple]
@@ -536,7 +536,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 "Qwen 3.8 Optimized Quality FP16",
             ],
             // Exact byte sum of the local sibling at build time (2026-08-15).
-            sizeBytes: 30_371_326_040,
+            sizeBytes: 29_973_197_540,
             // Same packs and tensor bytes as the parent; peak carried over.
             peakMemoryGiB: 33.0,
             recommendedFor: [.legacyApple]
@@ -557,7 +557,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 "Qwen3.6 27B Optimized Speed V2",
                 "Optimized Speed V2",
             ],
-            sizeBytes: 19_887_448_095,
+            sizeBytes: 19_887_455_619,
             peakMemoryGiB: 21.5,
             recommendedFor: [.modernApple]
         ),
@@ -577,7 +577,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 "Qwen3.6 27B Optimized Speed",
                 "Optimized Speed",
             ],
-            sizeBytes: 16_106_127_360,
+            sizeBytes: 16_419_081_846,
             peakMemoryGiB: 17.0,
             recommendedFor: [.modernApple]
         ),
@@ -597,7 +597,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 "Qwen3.6 27B Optimized Speed FP16",
                 "Optimized Speed FP16",
             ],
-            sizeBytes: 16_419_644_370,
+            sizeBytes: 16_419_644_366,
             peakMemoryGiB: 17.5,
             recommendedFor: [.legacyApple]
         ),
@@ -621,7 +621,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 "Qwen3.6-35B-A3B-MTPLX-Official4-CyanKiwiMTP-CleanRecipe",
                 "Qwen3.6-35B-A3B-MTPLX-Flat4-CyanKiwiMTP-ForgeRepairClean",
             ],
-            sizeBytes: 21_016_117_499,
+            sizeBytes: 21_014_908_550,
             peakMemoryGiB: 28.0,
             recommendedFor: [.modernApple]
         ),
@@ -659,7 +659,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 "Qwen3.6 35B-A3B Optimized Balance",
                 "Qwen3.6 35B Balance",
             ],
-            sizeBytes: 29_672_250_227,
+            sizeBytes: 29_671_037_161,
             peakMemoryGiB: 32.0,
             recommendedFor: [.modernApple]
         ),
@@ -701,7 +701,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 "mtplx/gemma4-mtplx-optimized-speed",
                 "mtplx-gemma4-optimized-speed",
             ],
-            sizeBytes: 17_715_675_136,
+            sizeBytes: 17_715_574_395,
             peakMemoryGiB: 18.0,
             recommendedFor: [.modernApple]
         ),
@@ -721,7 +721,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 "Qwen3.6 27B Optimized Quality",
                 "Optimized Quality",
             ],
-            sizeBytes: 30_064_771_072,
+            sizeBytes: 30_016_961_493,
             peakMemoryGiB: 27.62,
             recommendedFor: [.modernApple]
         ),
@@ -758,7 +758,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 "Laguna S-2.1",
                 "Laguna-S-2.1-oQ4e",
             ],
-            sizeBytes: 64_129_728_868,
+            sizeBytes: 64_129_781_104,
             peakMemoryGiB: 74.0,
             recommendedFor: [.modernApple],
             arOnly: true
@@ -1137,10 +1137,26 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
             if FileManager.default.fileExists(atPath: url.appendingPathComponent("mtplx_pair.json").path) {
                 return "gemma4"
             }
-            if let runtime = MTPLXRuntimeMetadata.read(at: url.appendingPathComponent("mtplx_runtime.json").path),
-               let sourceRepo = runtime.forgeProvenance?.sourceRepo {
-                let sourceFamily = modelFamily(for: sourceRepo)
-                if sourceFamily != "unknown" { return sourceFamily }
+            if let runtime = MTPLXRuntimeMetadata.read(
+                at: url.appendingPathComponent("mtplx_runtime.json").path
+            ) {
+                // Artifact-declared identity outranks its folder name and
+                // the shared qwen3-next architecture id. Forge users are
+                // free to brand a model "Bare Speed Beta"; the stable
+                // public id / family must still expose the Qwen 3.8
+                // reasoning contract without a curated catalog row.
+                let declaredControls = runtime.rawJSON["model_controls"] as? [String: Any]
+                for hint in [
+                    runtime.modelFamily,
+                    stringValue(declaredControls?["model_family"]),
+                    runtime.publicModelID,
+                    stringValue(runtime.rawJSON["served_model_id"]),
+                    stringValue(runtime.rawJSON["model_id"]),
+                    runtime.forgeProvenance?.sourceRepo,
+                ].compactMap({ $0 }) {
+                    let family = modelFamilyFromHint(hint)
+                    if family != "unknown" { return family }
+                }
             }
             return nil
         }
@@ -1198,7 +1214,9 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         ) != nil {
             return "qwen3_8"
         }
-        if normalized.contains("qwen3.5") || normalized.contains("qwen3_5") || normalized.contains("qwen3-5") {
+        if normalized.contains("qwen3.5") || normalized.contains("qwen3_5")
+            || normalized.contains("qwen3-5") || normalized.contains("qwen35")
+        {
             return "qwen3_5"
         }
         if normalized.contains("qwen") { return "qwen3_6" }

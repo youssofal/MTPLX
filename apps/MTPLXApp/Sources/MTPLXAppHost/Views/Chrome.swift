@@ -171,6 +171,17 @@ struct ConnectionDot: View {
 
     private var label: String {
         if isHealthy { return "Running" }
+        // The degraded reason was invisible outside a hover tooltip; users
+        // (and their screenshots) only ever saw the bare word "Degraded".
+        // Surface a capped reason inline; the full text stays in helpText.
+        if case .degraded(let reason) = daemonState {
+            let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty { return "Degraded" }
+            let capped = trimmed.count > 44
+                ? String(trimmed.prefix(44)).trimmingCharacters(in: .whitespaces) + "…"
+                : trimmed
+            return "Degraded — \(capped)"
+        }
         switch daemonState.kind {
         case .running:
             switch connectionState {
@@ -331,7 +342,10 @@ struct DaemonControls: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            LaunchButton()
+            LaunchButton(
+                backend: backend,
+                daemonState: backend.daemonState
+            )
             ControlButton(
                 systemImage: "arrow.clockwise",
                 tint: Brand.accent,

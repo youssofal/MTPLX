@@ -138,6 +138,7 @@ struct BenchmarkOverlay: View {
                 startTitle: startButtonTitle,
                 startIcon: startPending ? "hourglass" : "play.fill",
                 startEnabled: !startPending,
+                performanceLock: backend.configuration.performanceLock,
                 availableWidth: contentWidth,
                 onClose: handleClose,
                 onStart: { startBenchmark(resetFirst: orchestrator.state.isTerminal) },

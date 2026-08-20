@@ -1,5 +1,7 @@
+import AppKit
 import Combine
 import Foundation
+import QuartzCore
 import os
 
 // MARK: - UIStreamPerfProbe
@@ -68,6 +70,12 @@ public final class UIStreamPerfProbe: ObservableObject {
     public let enabled: Bool
     public let showsHUD: Bool
 
+    /// Last-created enabled probe. The render-layer hooks below are called
+    /// from NSView draw/apply paths that hold no reference to the chat view
+    /// model; a weak static bridge wires them without new plumbing. One chat
+    /// view model exists during perf runs, so last-wins is fine.
+    public private(set) static weak var shared: UIStreamPerfProbe?
+
     // MARK: Turn ledger
 
     private struct FlushRecord {
@@ -115,7 +123,9 @@ public final class UIStreamPerfProbe: ObservableObject {
         self.enabled = Self.isEnabled(environment: environment)
         self.showsHUD = enabled && Self.hudEnabled(environment: environment)
         if enabled {
+            Self.shared = self
             startStallMonitor()
+            startPaintWatchdog()
         }
     }
 
@@ -208,6 +218,11 @@ public final class UIStreamPerfProbe: ObservableObject {
         lastFlushAt = nil
         lastLinesTotal = 0
         lastMergesTotal = 0
+        renderDurations = [:]
+        renderTrace = []
+        paintGaps = []
+        paintGapTrace = []
+        startPaintWatchdog()
         AIMEDiagnostics.record("ui_turn_started", fields: [:], force: true)
     }
 
@@ -301,6 +316,175 @@ public final class UIStreamPerfProbe: ObservableObject {
     public func scrollPinned() {
         guard enabled else { return }
         scrollPins += 1
+        os_signpost(.event, log: Self.renderSignpostLog, name: "ScrollPin")
+    }
+
+    // MARK: Render-layer probe (2026-08-19 streamwar)
+    //
+    // Every prior streaming regression shipped green because
+    // instrumentation stopped at the document store: `apply_ms` measured
+    // the string append, not the TextKit layout, glyph draw, or the
+    // frames the window actually painted. These hooks close that gap.
+    // Same contract as the rest of the probe: inert unless
+    // MTPLX_UI_PERF=1, early-return on a stored Bool.
+
+    public enum RenderSite: String, CaseIterable, Sendable {
+        /// `StreamingAssistantMarkdownView.renderItems` — block list ->
+        /// render items derivation (runs per document revision).
+        case renderItems = "render_items"
+        /// `StreamingCodeTextViewport.apply` — fragment diff + attributed
+        /// string build + NSTextStorage mutation for the live code card.
+        case applyRender = "apply_render"
+        /// `LiveTailTextSurface.draw` — TextKit tail layout + glyph draw.
+        case draw = "draw"
+    }
+
+    public static let renderSignpostLog = OSLog(
+        subsystem: "com.mtplx.app", category: "RenderPerf"
+    )
+
+    /// Cached once for the same reason as `AIMEDiagnostics.isEnabled`:
+    /// these wrappers sit on per-frame paths.
+    public static let renderProbeEnabled: Bool = UIStreamPerfProbe.isEnabled()
+
+    /// Time one render-layer site. Zero-cost passthrough when disabled;
+    /// when enabled, emits an os_signpost interval (Instruments) and an
+    /// in-memory sample (JSONL percentiles + slow-event records).
+    /// `size` is the site's work-size proxy (blocks, fragments, or
+    /// storage UTF-16 length) — the O(n) vs O(1) conviction evidence.
+    @MainActor
+    public static func renderTimed<T>(
+        _ site: RenderSite,
+        size: @autoclosure () -> Int = 0,
+        _ body: () -> T
+    ) -> T {
+        guard renderProbeEnabled else { return body() }
+        let signpostID = OSSignpostID(log: renderSignpostLog)
+        let sizeValue = size()
+        os_signpost(
+            .begin,
+            log: renderSignpostLog,
+            name: "Render",
+            signpostID: signpostID,
+            "site=%{public}@ size=%{public}d",
+            site.rawValue,
+            sizeValue
+        )
+        let started = ProcessInfo.processInfo.systemUptime
+        let result = body()
+        let ms = (ProcessInfo.processInfo.systemUptime - started) * 1000
+        os_signpost(
+            .end,
+            log: renderSignpostLog,
+            name: "Render",
+            signpostID: signpostID,
+            "ms=%{public}.3f",
+            ms
+        )
+        shared?.renderEvent(site, ms: ms, size: sizeValue)
+        return result
+    }
+
+    private struct RenderRecord {
+        var t: Double
+        var site: RenderSite
+        var ms: Double
+        var size: Int
+    }
+
+    private var renderDurations: [RenderSite: [Double]] = [:]
+    private var renderTrace: [RenderRecord] = []
+    private var renderSlowLastIdleEmit: [RenderSite: Double] = [:]
+
+    private func renderEvent(_ site: RenderSite, ms: Double, size: Int) {
+        let now = ProcessInfo.processInfo.systemUptime
+        if turnActive {
+            renderDurations[site, default: []].append(ms)
+            // Trace only the events worth plotting; the full distribution
+            // lives in the turn-summary percentiles.
+            if ms >= 4 {
+                renderTrace.append(
+                    RenderRecord(t: now, site: site, ms: ms, size: size)
+                )
+            }
+        }
+        guard ms >= 8 else { return }
+        if !turnActive {
+            guard now - (renderSlowLastIdleEmit[site] ?? 0) >= 5 else { return }
+            renderSlowLastIdleEmit[site] = now
+        }
+        AIMEDiagnostics.record(
+            "ui_render_slow",
+            fields: [
+                "site": .string(site.rawValue),
+                "ms": .double((ms * 100).rounded() / 100),
+                "size": .int(size),
+                "streaming": .bool(turnActive)
+            ],
+            force: true
+        )
+    }
+
+    // MARK: Paint-gap watchdog
+    //
+    // A CADisplayLink on the main run loop. Unlike the 12 ms heartbeat
+    // above (scheduling gaps), this measures the display-frame cadence
+    // the user's eye sees: a late tick means the main thread could not
+    // service a vsync callback — a dropped paint. The frame-rate floor
+    // keeps ProMotion from idling the link so gap math stays trivial.
+
+    private var paintLink: CADisplayLink?
+    private var paintGaps: [Double] = []
+    private var paintGapTrace: [(t: Double, ms: Double)] = []
+    private var lastPaintTick: Double = 0
+    private var lastIdlePaintEmit: Double = 0
+    private static let paintGapRecordMs = 50.0
+
+    private func startPaintWatchdog() {
+        guard paintLink == nil, let screen = NSScreen.main ?? NSScreen.screens.first
+        else { return }
+        // CADisplayLink retains its target; the probe already lives for
+        // the app's lifetime (owned by the chat view model), so the cycle
+        // is moot and the link never needs invalidation.
+        let link = screen.displayLink(target: self, selector: #selector(paintTick(_:)))
+        link.preferredFrameRateRange = CAFrameRateRange(
+            minimum: 30, maximum: 120, preferred: 60
+        )
+        link.add(to: .main, forMode: .common)
+        paintLink = link
+    }
+
+    @objc private func paintTick(_ link: CADisplayLink) {
+        let now = ProcessInfo.processInfo.systemUptime
+        defer { lastPaintTick = now }
+        guard lastPaintTick > 0 else { return }
+        let gapMs = (now - lastPaintTick) * 1000
+        if turnActive {
+            paintGaps.append(gapMs)
+        }
+        guard gapMs >= Self.paintGapRecordMs else { return }
+        if turnActive {
+            paintGapTrace.append((t: now, ms: gapMs))
+        } else {
+            guard now - lastIdlePaintEmit >= 5 else { return }
+            lastIdlePaintEmit = now
+        }
+        os_signpost(
+            .event,
+            log: Self.renderSignpostLog,
+            name: "PaintGap",
+            "ms=%{public}.1f",
+            gapMs
+        )
+        AIMEDiagnostics.record(
+            "ui_paint_gap",
+            fields: [
+                "gap_ms": .double((gapMs * 10).rounded() / 10),
+                "streaming": .bool(turnActive),
+                "turn_chars": .int(turnChars)
+            ],
+            force: true
+        )
     }
 
     public func scrollTick(distanceToBottom: Double, userInitiated: Bool) {
@@ -328,32 +512,45 @@ public final class UIStreamPerfProbe: ObservableObject {
         let flushGaps = flushes.dropFirst().map(\.gapMs)
         let applies = flushes.map(\.applyMs)
         let turnStalls = stalls.filter { $0.streaming }
+        var fields: [String: AIMEDiagnosticValue] = [
+            "request_id": .string(requestId ?? ""),
+            "wall_s": .double((wallS * 100).rounded() / 100),
+            "chunks": .int(chunkCount),
+            "chunk_bytes": .int(chunkBytes),
+            "chunk_gap_ms_p50": .double(Self.percentile(interChunkGaps, 50)),
+            "chunk_gap_ms_p95": .double(Self.percentile(interChunkGaps, 95)),
+            "chunk_gap_ms_max": .double(interChunkGaps.max() ?? 0),
+            "flushes": .int(flushes.count),
+            "flush_gap_ms_p50": .double(Self.percentile(flushGaps, 50)),
+            "flush_gap_ms_p95": .double(Self.percentile(flushGaps, 95)),
+            "flush_gap_ms_max": .double(flushGaps.max() ?? 0),
+            "apply_ms_p50": .double(Self.percentile(applies, 50)),
+            "apply_ms_p95": .double(Self.percentile(applies, 95)),
+            "apply_ms_max": .double(applies.max() ?? 0),
+            "stalls_over_50ms": .int(turnStalls.count),
+            "stall_ms_max": .double(turnStalls.map(\.ms).max() ?? 0),
+            "stall_ms_total": .double(turnStalls.map(\.ms).reduce(0, +)),
+            "scroll_ticks": .int(scrollTicks),
+            "scroll_pins": .int(scrollPins),
+            "lines_finalized": .int(flushes.map(\.linesFinalized).reduce(0, +)),
+            "segment_merges": .int(flushes.map(\.merges).reduce(0, +)),
+            "doc_blocks_final": .int(flushes.last?.blocksAfter ?? 0)
+        ]
+        for site in RenderSite.allCases {
+            let values = renderDurations[site] ?? []
+            fields["\(site.rawValue)_count"] = .int(values.count)
+            fields["\(site.rawValue)_ms_p50"] = .double(Self.percentile(values, 50))
+            fields["\(site.rawValue)_ms_p95"] = .double(Self.percentile(values, 95))
+            fields["\(site.rawValue)_ms_max"] = .double(values.max() ?? 0)
+        }
+        fields["paint_ticks"] = .int(paintGaps.count)
+        fields["paint_gap_ms_p95"] = .double(Self.percentile(paintGaps, 95))
+        fields["paint_gap_ms_max"] = .double(paintGaps.max() ?? 0)
+        fields["paint_gaps_over_50ms"] = .int(paintGaps.filter { $0 >= 50 }.count)
+        fields["paint_gaps_over_100ms"] = .int(paintGaps.filter { $0 >= 100 }.count)
         AIMEDiagnostics.record(
             "ui_turn_render_summary",
-            fields: [
-                "request_id": .string(requestId ?? ""),
-                "wall_s": .double((wallS * 100).rounded() / 100),
-                "chunks": .int(chunkCount),
-                "chunk_bytes": .int(chunkBytes),
-                "chunk_gap_ms_p50": .double(Self.percentile(interChunkGaps, 50)),
-                "chunk_gap_ms_p95": .double(Self.percentile(interChunkGaps, 95)),
-                "chunk_gap_ms_max": .double(interChunkGaps.max() ?? 0),
-                "flushes": .int(flushes.count),
-                "flush_gap_ms_p50": .double(Self.percentile(flushGaps, 50)),
-                "flush_gap_ms_p95": .double(Self.percentile(flushGaps, 95)),
-                "flush_gap_ms_max": .double(flushGaps.max() ?? 0),
-                "apply_ms_p50": .double(Self.percentile(applies, 50)),
-                "apply_ms_p95": .double(Self.percentile(applies, 95)),
-                "apply_ms_max": .double(applies.max() ?? 0),
-                "stalls_over_50ms": .int(turnStalls.count),
-                "stall_ms_max": .double(turnStalls.map(\.ms).max() ?? 0),
-                "stall_ms_total": .double(turnStalls.map(\.ms).reduce(0, +)),
-                "scroll_ticks": .int(scrollTicks),
-                "scroll_pins": .int(scrollPins),
-                "lines_finalized": .int(flushes.map(\.linesFinalized).reduce(0, +)),
-                "segment_merges": .int(flushes.map(\.merges).reduce(0, +)),
-                "doc_blocks_final": .int(flushes.last?.blocksAfter ?? 0)
-            ],
+            fields: fields,
             flushImmediately: true,
             force: true
         )
@@ -366,8 +563,14 @@ public final class UIStreamPerfProbe: ObservableObject {
     private func dumpFlushTrace(requestId: String?) {
         let records = flushes
         let stallRecords = stalls
+        let renderRecords = renderTrace
+        let paintRecords = paintGapTrace
         guard !records.isEmpty else { return }
         let id = requestId ?? "unknown"
+        // Uptime/wall anchor pair: StreamScope joins this trace against the
+        // engine's visible-emit census (wall-clock) using this one line.
+        let anchorUptime = ProcessInfo.processInfo.systemUptime
+        let anchorWall = Date().timeIntervalSince1970
         Task.detached(priority: .utility) {
             let base = FileManager.default.urls(
                 for: .applicationSupportDirectory, in: .userDomainMask
@@ -383,8 +586,14 @@ public final class UIStreamPerfProbe: ObservableObject {
                 .replacingOccurrences(of: ":", with: "")
             let url = dir.appendingPathComponent("uistream-\(stamp).jsonl")
             var lines: [String] = []
-            lines.reserveCapacity(records.count + stallRecords.count + 1)
-            lines.append(#"{"kind":"turn","request_id":"\#(id)"}"#)
+            lines.reserveCapacity(
+                records.count + stallRecords.count
+                    + renderRecords.count + paintRecords.count + 1
+            )
+            lines.append(String(
+                format: #"{"kind":"turn","request_id":"%@","t_uptime":%.4f,"t_wall":%.4f}"#,
+                id, anchorUptime, anchorWall
+            ))
             for r in records {
                 lines.append(String(
                     format: #"{"kind":"flush","t":%.4f,"gap_ms":%.1f,"drained_bytes":%d,"apply_ms":%.2f,"blocks":%d,"lines":%d,"merges":%d}"#,
@@ -396,6 +605,18 @@ public final class UIStreamPerfProbe: ObservableObject {
                 lines.append(String(
                     format: #"{"kind":"stall","t":%.4f,"ms":%.1f,"streaming":%@}"#,
                     s.t, s.ms, s.streaming ? "true" : "false"
+                ))
+            }
+            for r in renderRecords {
+                lines.append(String(
+                    format: #"{"kind":"render","t":%.4f,"site":"%@","ms":%.2f,"size":%d}"#,
+                    r.t, r.site.rawValue, r.ms, r.size
+                ))
+            }
+            for p in paintRecords {
+                lines.append(String(
+                    format: #"{"kind":"paint_gap","t":%.4f,"ms":%.1f}"#,
+                    p.t, p.ms
                 ))
             }
             try? (lines.joined(separator: "\n") + "\n")

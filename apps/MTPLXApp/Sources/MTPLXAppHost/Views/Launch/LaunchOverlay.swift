@@ -18,12 +18,31 @@ import MTPLXAppCore
 // Picking `.other` collapses the row list to a custom-client config
 // form (port + API key + endpoint preview + Start button).
 
-struct LaunchOverlay: View {
-    @EnvironmentObject private var backend: MTPLXBackendStore
+struct LaunchOverlay: View, Equatable {
+    let backend: MTPLXBackendStore
+    let configuration: MTPLXAppConfiguration
+
     @EnvironmentObject private var themeStore: ThemeStore
     @EnvironmentObject private var router: AppRouter
 
     @Binding var presented: Bool
+    private let presentedValue: Bool
+
+    init(
+        backend: MTPLXBackendStore,
+        configuration: MTPLXAppConfiguration,
+        presented: Binding<Bool>
+    ) {
+        self.backend = backend
+        self.configuration = configuration
+        _presented = presented
+        presentedValue = presented.wrappedValue
+    }
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.presentedValue == rhs.presentedValue
+            && lhs.configuration == rhs.configuration
+    }
 
     @State private var borderProgress: CGFloat = 0
     @State private var headerVisible: Bool = false
@@ -55,8 +74,8 @@ struct LaunchOverlay: View {
         .allowsHitTesting(presented)
         .onChange(of: presented) { _, isOn in
             if isOn {
-                customPort = backend.configuration.port
-                customApiKey = backend.configuration.apiKey ?? ""
+                customPort = configuration.port
+                customApiKey = configuration.apiKey ?? ""
                 otherExpanded = false
                 runEnterChoreography()
             } else {
@@ -113,7 +132,7 @@ struct LaunchOverlay: View {
                         target: target,
                         index: idx,
                         visible: rowsVisibleCount > idx,
-                        isLast: backend.configuration.lastLaunchTarget == target.rawValue,
+                        isLast: configuration.lastLaunchTarget == target.rawValue,
                         motionEnabled: motionEnabled,
                         onPick: handlePick
                     )
@@ -304,7 +323,7 @@ struct LaunchOverlay: View {
     // MARK: - Choreography
 
     private var motionEnabled: Bool {
-        !backend.configuration.performanceLock && !themeStore.reduceMotionPreference
+        !configuration.performanceLock && !themeStore.reduceMotionPreference
     }
 
     private func handlePick(_ target: LaunchTarget) {

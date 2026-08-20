@@ -1278,6 +1278,11 @@ struct SettingsTab: View {
 
     private var compatibleStartupControls: ModelControls? {
         guard let controls = backend.health?.startup?.modelControls else { return nil }
+        if let modelRef = controls.modelRef {
+            return MTPLXModelOption.modelsMatch(modelRef, draftConfig.model)
+                ? controls
+                : nil
+        }
         return controls.modelFamily == settingsModelFamily ? controls : nil
     }
 

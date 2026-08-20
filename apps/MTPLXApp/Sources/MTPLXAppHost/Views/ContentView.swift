@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 import MTPLXAppCore
 
@@ -9,10 +10,115 @@ import MTPLXAppCore
 // a state pill in the top strip + an empty-state on the Live tab
 // when nothing is running yet. Start/Stop lives in the top strip.
 
+private struct ContentViewBackendSnapshot: Equatable {
+    let daemonState: DaemonState
+    let connectionState: MetricsConnectionState
+    let startupPhase: DaemonStartupPhase
+    let configuration: MTPLXAppConfiguration
+    let activeModelLabel: String
+    let visionEnabled: Bool
+    let inFlightCount: Int
+    let modelDownloadPresented: Bool
+    let modelDownloadBusy: Bool
+    let inferenceParams: InferenceParamsSnapshot
+    // Pack-update state must live in the projection: the shell renders from
+    // this snapshot only, so any field read off the store directly is frozen
+    // at the last unrelated re-render. On a quiet dashboard that meant the
+    // update banner never appeared and a clicked Update showed no progress.
+    let modelUpdates: [ModelUpdateInfo]
+    let modelPackUpdatingRepoID: String?
+    let modelPackUpdateStatus: String?
+    let modelPackUpdateNeedsRestart: ModelUpdateInfo?
+
+    @MainActor
+    init(backend: MTPLXBackendStore, configuredModelFamily: String) {
+        daemonState = backend.daemonState
+        connectionState = backend.connectionState
+        startupPhase = backend.startupPhase
+        configuration = backend.configuration
+        activeModelLabel = backend.health?.model
+            ?? backend.snapshot?.modelId
+            ?? backend.configuration.model
+        visionEnabled = backend.health?.vision?.enabled == true
+        inFlightCount = backend.inFlight.count
+        modelDownloadPresented = backend.pendingModelDownload != nil
+        modelDownloadBusy = backend.isModelDownloading || backend.isModelTuning
+        inferenceParams = InferenceParamsSnapshot(
+            backend: backend,
+            configuredModelFamily: configuredModelFamily
+        )
+        modelUpdates = backend.modelUpdates
+        modelPackUpdatingRepoID = backend.modelPackUpdatingRepoID
+        modelPackUpdateStatus = backend.modelPackUpdateStatus
+        modelPackUpdateNeedsRestart = backend.modelPackUpdateNeedsRestart
+    }
+}
+
+/// Projects the monolithic backend store onto the handful of values that can
+/// actually change the app shell. Metrics still arrive at full cadence, but
+/// equal projections never invalidate chrome, popovers, or chat scaffolding.
+@MainActor
+private final class ContentViewBackendProjection: ObservableObject {
+    @Published private(set) var snapshot: ContentViewBackendSnapshot
+
+    private weak var backend: MTPLXBackendStore?
+    private var backendCancellable: AnyCancellable?
+    private var refreshPending = false
+    private var familyModel: String
+    private var configuredModelFamily: String
+
+    init(backend: MTPLXBackendStore) {
+        let model = backend.configuration.model
+        let family = MTPLXModelOption.modelFamily(for: model)
+        self.backend = backend
+        familyModel = model
+        configuredModelFamily = family
+        snapshot = ContentViewBackendSnapshot(
+            backend: backend,
+            configuredModelFamily: family
+        )
+        backendCancellable = backend.objectWillChange.sink { [weak self] _ in
+            self?.scheduleRefresh()
+        }
+    }
+
+    private func scheduleRefresh() {
+        guard !refreshPending else { return }
+        refreshPending = true
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self else { return }
+            refreshPending = false
+            guard let backend else { return }
+            let model = backend.configuration.model
+            if model != familyModel {
+                familyModel = model
+                configuredModelFamily = MTPLXModelOption.modelFamily(for: model)
+            }
+            let next = ContentViewBackendSnapshot(
+                backend: backend,
+                configuredModelFamily: configuredModelFamily
+            )
+            if next != snapshot {
+                snapshot = next
+            }
+        }
+    }
+}
+
 struct ContentView: View {
-    @EnvironmentObject private var backend: MTPLXBackendStore
+    private let backend: MTPLXBackendStore
+    @StateObject private var backendProjection: ContentViewBackendProjection
     @EnvironmentObject private var themeStore: ThemeStore
     @EnvironmentObject private var router: AppRouter
+
+    @MainActor
+    init(backend: MTPLXBackendStore) {
+        self.backend = backend
+        _backendProjection = StateObject(
+            wrappedValue: ContentViewBackendProjection(backend: backend)
+        )
+    }
 
     var body: some View {
         Group {
@@ -47,14 +153,14 @@ struct ContentView: View {
             ModelDownloadSheet()
                 .environmentObject(backend)
                 .environmentObject(themeStore)
-                .interactiveDismissDisabled(backend.isModelDownloading || backend.isModelTuning)
+                .interactiveDismissDisabled(backendProjection.snapshot.modelDownloadBusy)
         }
         .appliesBrand()
     }
 
     private var modelDownloadSheetPresented: Binding<Bool> {
         Binding(
-            get: { backend.pendingModelDownload != nil },
+            get: { backendProjection.snapshot.modelDownloadPresented },
             set: { isPresented in
                 if !isPresented {
                     backend.dismissModelDownloadPrompt()
@@ -68,6 +174,7 @@ struct ContentView: View {
     /// chrome / overlay setup.
     @ViewBuilder
     private var appShell: some View {
+        let snapshot = backendProjection.snapshot
         ZStack(alignment: .top) {
             Brand.bgOuter
                 .ignoresSafeArea()
@@ -89,9 +196,15 @@ struct ContentView: View {
                     // `layoutPriority` than the body so SwiftUI always
                     // gives them their intrinsic size first and the body
                     // only ever gets whatever's left over.
-                    TopChromeStrip()
+                    TopChromeStrip(
+                        backend: backend,
+                        daemonState: snapshot.daemonState,
+                        connectionState: snapshot.connectionState,
+                        activeModelLabel: snapshot.activeModelLabel,
+                        configuration: snapshot.configuration
+                    )
                         .layoutPriority(2)
-                    ConnectionIssueBanner(state: backend.connectionState)
+                    ConnectionIssueBanner(state: snapshot.connectionState)
                         .layoutPriority(2)
 
                     // Dashboard + BottomTabBar are rendered for the normal
@@ -107,11 +220,18 @@ struct ContentView: View {
                             .clipped()
 
                         if router.primaryMode == .chat {
-                            ChatOverlay {
+                            ChatOverlay(
+                                daemonState: snapshot.daemonState,
+                                startupPhase: snapshot.startupPhase,
+                                selectedModel: snapshot.configuration.model,
+                                visionEnabled: snapshot.visionEnabled,
+                                performanceLock: snapshot.configuration.performanceLock
+                            ) {
                                 withAnimation(chatOverlayAnimation) {
                                     router.showDashboard()
                                 }
                             }
+                            .equatable()
                             .transition(chatOverlayTransition)
                             .zIndex(1)
                         } else if router.primaryMode == .hermes {
@@ -122,7 +242,7 @@ struct ContentView: View {
                             }
                             .transition(chatOverlayTransition)
                             .zIndex(1)
-                        } else if backend.daemonState.kind == .running {
+                        } else if snapshot.daemonState.kind == .running {
                             // Expand-chat tab only renders when the
                             // daemon is running — chat needs a daemon
                             // to talk to, so a "pull chat up" handle
@@ -152,7 +272,11 @@ struct ContentView: View {
                     .layoutPriority(0)
                     .animation(chatOverlayAnimation, value: chatSlotKey)
 
-                    BottomTabBar()
+                    BottomTabBar(
+                        inFlightCount: snapshot.inFlightCount,
+                        daemonState: snapshot.daemonState,
+                        performanceLock: snapshot.configuration.performanceLock
+                    )
                         .layoutPriority(2)
                 }
 
@@ -161,12 +285,32 @@ struct ContentView: View {
                 // Play-button picker and the inference-params dropdown —
                 // all anchored to the window, not to any particular tab.
                 NewMaxToast()
-                LaunchOverlay(presented: $router.launchPickerPresented)
-                ModelPickerOverlay(presented: $router.modelPickerPresented)
+                LaunchOverlay(
+                    backend: backend,
+                    configuration: snapshot.configuration,
+                    presented: $router.launchPickerPresented
+                )
+                    .equatable()
+                ModelPickerOverlay(
+                    backend: backend,
+                    configuration: snapshot.configuration,
+                    daemonState: snapshot.daemonState,
+                    presented: $router.modelPickerPresented,
+                    modelUpdates: snapshot.modelUpdates,
+                    modelPackUpdatingRepoID: snapshot.modelPackUpdatingRepoID,
+                    modelPackUpdateStatus: snapshot.modelPackUpdateStatus,
+                    modelPackUpdateNeedsRestart: snapshot.modelPackUpdateNeedsRestart
+                )
+                    .equatable()
             }
 
             // Reachable from both the normal shell and the benchmark header.
-            InferenceParamsOverlay(presented: $router.inferenceParamsPresented)
+            InferenceParamsOverlay(
+                backend: backend,
+                snapshot: snapshot.inferenceParams,
+                presented: $router.inferenceParamsPresented
+            )
+                .equatable()
                 .zIndex(20)
         }
         .animation(.smooth(duration: 0.32), value: router.benchmarkOverlayPresented)
@@ -187,7 +331,8 @@ struct ContentView: View {
     /// as a glide rather than a snap; damping 0.86 lands the panel
     /// without overshoot.
     private var chatOverlayAnimation: Animation? {
-        guard !backend.configuration.performanceLock, !themeStore.reduceMotionPreference else {
+        guard !backendProjection.snapshot.configuration.performanceLock,
+              !themeStore.reduceMotionPreference else {
             return nil
         }
         return .spring(response: 0.42, dampingFraction: 0.86)
@@ -201,7 +346,7 @@ struct ContentView: View {
     private var chatSlotKey: String {
         let mode = router.primaryMode == .chat ? "chat" : "dash"
         let surface = router.primaryMode == .hermes ? "hermes" : mode
-        let daemon = backend.daemonState.kind == .running ? "on" : "off"
+        let daemon = backendProjection.snapshot.daemonState.kind == .running ? "on" : "off"
         return "\(surface)|\(daemon)|\(router.expandableSurface.rawValue)"
     }
 
@@ -631,7 +776,9 @@ struct ModelDownloadSheet: View {
                 .font(.system(size: 11.5, design: .monospaced))
                 .foregroundStyle(Brand.typeSecondary)
                 .lineLimit(2)
-                .truncationMode(.middle)
+                // .tail, not .middle: multi-line middle truncation is a
+                // macOS 26 layout-spin trigger (streamwar A7).
+                .truncationMode(.tail)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(maxWidth: .infinity, alignment: .leading)

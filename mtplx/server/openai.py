@@ -155,6 +155,7 @@ from mtplx.reasoning_codecs import (
     QWEN_STYLE_REASONING_CONTROL_RE,
     QWEN_STYLE_REASONING_OPEN_RE,
     QWEN_STYLE_REASONING_TAG_NAMES,
+    STREAM_TAG_HOLDBACK,
     normalize_qwen_thinking_tags,
     normalize_reasoning_tags as normalize_backend_reasoning_tags,
     split_reasoning_text,
@@ -13149,6 +13150,140 @@ def _producer_gap_census(token_times: list[float]) -> dict[str, Any]:
     return census
 
 
+# Visible-emit census (2026-08-19, MTPLX_STREAM_CENSUS=1). The producer
+# census above stamps token COMMIT time — upstream of the incremental
+# decoder — and read zero gaps while the founder's visible stream froze
+# for 500 ms (the decoder was withholding text at whitespace boundaries).
+# This is the other half of the pair: the post-decoder SSE-write timeline
+# the client's eye actually sees. Diagnostic only; inert unless enabled.
+# GIL switch interval for the serving process. The SSE consumer lives on
+# the asyncio event-loop thread; the generation thread's Python-level graph
+# construction holds the GIL in long stretches at high accept rates, so
+# `call_soon_threadsafe` deliveries pile up and the visible stream freezes
+# ~250 ms then dumps ~20 tokens (2026-08-19 cache-hit lumps — the faster
+# the decode, the lumpier the emit). Lowering the switch interval shortens
+# how long the loop thread can be denied the GIL. Diagnostic/experiment
+# gate: unset = CPython default (5 ms). Any change to the default must
+# pass the decode-TPS A/B gate first (AGENTS.md regression rules).
+_raw_switch_ms = os.environ.get("MTPLX_PY_SWITCH_INTERVAL_MS", "").strip()
+if _raw_switch_ms:
+    try:
+        sys.setswitchinterval(max(0.05, float(_raw_switch_ms)) / 1000.0)
+    except (ValueError, OverflowError):
+        pass
+del _raw_switch_ms
+
+_STREAM_CENSUS_DIR: str | None = None
+if str(os.environ.get("MTPLX_STREAM_CENSUS", "")).strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+):
+    _STREAM_CENSUS_DIR = (
+        os.environ.get("MTPLX_STREAM_CENSUS_DIR", "").strip()
+        or "/tmp/mtplx-stream-census"
+    )
+    try:
+        os.makedirs(_STREAM_CENSUS_DIR, exist_ok=True)
+    except OSError:
+        _STREAM_CENSUS_DIR = None
+
+
+def _stream_census_record(
+    response_id: str,
+    chunk: str,
+    queue_age_ms: float | None = None,
+) -> None:
+    """Append one visible-emit record for an SSE write (one JSONL/request).
+
+    Append-per-record keeps the file durable if the process dies and
+    leaves no handle lifecycle to manage. Never raises into serving.
+
+    ``queue_age_ms`` is the residency of the token item this write drains:
+    send-side perf_counter minus the generation thread's enqueue stamp.
+    It is the arbiter between "the worker bursts" and "the event loop is
+    starved" — under GIL starvation the first writes of a drain show the
+    full silence (~250 ms) and the last show ~0 (2026-08-19 cache-hit
+    lumps, Opus audit).
+    """
+    try:
+        t_mono = time.perf_counter()
+        t_wall = time.time()
+        body = chunk[6:].strip() if chunk.startswith("data: ") else chunk.strip()
+        channel = "other"
+        chars = 0
+        if body == "[DONE]":
+            channel = "done"
+        else:
+            payload = json.loads(body)
+            progress = payload.get("mtplx_progress")
+            if isinstance(progress, dict):
+                channel = "heartbeat" if progress.get("heartbeat") else "progress"
+            else:
+                choices = payload.get("choices") or []
+                delta = (choices[0].get("delta") or {}) if choices else {}
+                if delta.get("content"):
+                    channel, chars = "content", len(delta["content"])
+                elif delta.get("reasoning_content"):
+                    channel, chars = "reasoning", len(delta["reasoning_content"])
+                elif delta.get("tool_calls"):
+                    channel = "tool_calls"
+                    chars = sum(
+                        len(((call.get("function") or {}).get("arguments")) or "")
+                        for call in delta["tool_calls"]
+                        if isinstance(call, dict)
+                    )
+                elif delta.get("role"):
+                    channel = "role"
+                elif choices and choices[0].get("finish_reason"):
+                    channel = "finish"
+        record = {
+            "t_mono": t_mono,
+            "t_wall": t_wall,
+            "channel": channel,
+            "chars": chars,
+            "bytes": len(chunk),
+        }
+        if queue_age_ms is not None:
+            record["q_ms"] = round(queue_age_ms, 3)
+        line = json.dumps(record, separators=(",", ":"))
+        path = os.path.join(
+            _STREAM_CENSUS_DIR or "", response_id.replace(":", "_") + ".jsonl"
+        )
+        with open(path, "a", encoding="utf-8") as sink:
+            sink.write(line + "\n")
+    except BaseException:
+        pass
+
+
+def _coalesce_stream_fields(
+    chunks: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    """Merge ADJACENT same-field (field, text) runs into one tuple each.
+
+    At ``stream_interval=1`` every token used to become its own SSE write
+    (~3 visible chars wrapped in ~80 bytes of envelope), and when a GIL-
+    starved event loop finally drained its queue the client paid one
+    main-queue hop per token of backlog (2026-08-19 cache-hit lumps:
+    ~20-token bursts as 20 writes in 0.7 ms). This runs AFTER the
+    reasoning/content splitter, so channel boundaries are preserved by
+    construction — a reasoning→content flip always lands in different
+    tuples and is never merged across. Concatenation per field is the
+    identity: reassembled bytes are unchanged, only write granularity.
+    """
+    if len(chunks) < 2:
+        return chunks
+    merged: list[tuple[str, str]] = [chunks[0]]
+    for field, text in chunks[1:]:
+        last_field, last_text = merged[-1]
+        if last_field == field:
+            merged[-1] = (field, last_text + text)
+        else:
+            merged.append((field, text))
+    return merged
+
+
 def _token_window_rate(token_times: list[float], window: int) -> float | None:
     if len(token_times) < 2:
         return None
@@ -13946,6 +14081,7 @@ DASHBOARD_API_VERSION = 1
 DASHBOARD_SNAPSHOT_INTERVAL_DEFAULT_MS = 200
 DASHBOARD_SNAPSHOT_INTERVAL_MIN_MS = 100
 DASHBOARD_SNAPSHOT_INTERVAL_MAX_MS = 5000
+DASHBOARD_SNAPSHOT_INTERVAL_IDLE_MIN_MS = 1000
 
 
 def _dashboard_snapshot_interval_s(snapshot_interval_ms: int | None) -> float:
@@ -13960,6 +14096,21 @@ def _dashboard_snapshot_interval_s(snapshot_interval_ms: int | None) -> float:
         min(DASHBOARD_SNAPSHOT_INTERVAL_MAX_MS, value),
     )
     return value / 1000.0
+
+
+def _dashboard_snapshot_interval_for_activity_s(
+    requested_interval_s: float,
+    *,
+    active_requests: int,
+) -> float:
+    """Keep live metrics responsive without rebuilding idle snapshots at 10 Hz."""
+
+    if active_requests > 0:
+        return requested_interval_s
+    return max(
+        requested_interval_s,
+        DASHBOARD_SNAPSHOT_INTERVAL_IDLE_MIN_MS / 1000.0,
+    )
 
 
 def _mtplx_app_capabilities() -> dict[str, Any]:
@@ -13994,6 +14145,7 @@ def _mtplx_app_capabilities() -> dict[str, Any]:
             "default_ms": DASHBOARD_SNAPSHOT_INTERVAL_DEFAULT_MS,
             "min_ms": DASHBOARD_SNAPSHOT_INTERVAL_MIN_MS,
             "max_ms": DASHBOARD_SNAPSHOT_INTERVAL_MAX_MS,
+            "idle_min_ms": DASHBOARD_SNAPSHOT_INTERVAL_IDLE_MIN_MS,
             "native_default_ms": 500,
             "performance_lock_ms": 1000,
         },
@@ -21346,25 +21498,26 @@ def _tool_extraction_text_parts(
 class _IncrementalTokenDecoder:
     """Small TextStreamer-style decoder for committed-token SSE streaming.
 
-    The previous bridge decoded the entire generated token buffer after every
-    callback. That is prefix-stable, but it becomes O(n^2) tokenizer work during
-    long reasoning streams. This keeps only the current partial word and flushes
-    finalized text as soon as whitespace or CJK boundaries make it safe.
+    Release policy (streamwar 2026-08-19): emit the newly decoded suffix at
+    EVERY token boundary. The only hold is an incomplete UTF-8 sequence at
+    the tail — byte-level BPE can split one codepoint across tokens, and it
+    decodes as U+FFFD until the remaining bytes arrive.
+
+    This replaced a whitespace-boundary policy (hold until space/newline,
+    64-char force-flush escape releasing all but a 32-char tail). That
+    policy manufactured the "freeze then vomit" stutter on whitespace-poor
+    content — code, markdown tables, minified JSON froze 150-880 ms per
+    line while the producer census read clean (receipts:
+    outputs/streamscope-20260819/baseline/, STREAM_SMOOTHNESS_WAR doc).
+    Chunk-split reasoning close tags and tool-control markers are NOT this
+    class's job: _ThinkingContentStreamSplitter reassembles them from its
+    own partial-prefix holds (verified live path, see
+    _reasoning_control_marker_has_partial_prefix), so the decoder must not
+    duplicate that gating with cadence-destroying holds of its own.
     """
 
     _CACHE_TRUNCATE_THRESHOLD = 96
     _CACHE_KEEP_TOKENS = 8
-    # Max characters the decoder may hold waiting for a whitespace
-    # boundary before force-flushing (2026-08-18). Without this, any
-    # whitespace-free run — a markdown table separator row, a long URL,
-    # minified code, compact JSON — froze the VISIBLE stream for the
-    # run's full length and then landed as one paste ("freeze then
-    # vomit" in code/tables). ~64 chars ≈ 0.3 s at chat decode rates.
-    # The escape keeps a short tail held so a chunk-split reasoning
-    # close tag always completes inside the cache before the close-tag
-    # branch looks for it.
-    _MAX_HOLD_CHARS = 64
-    _ESCAPE_TAIL_KEEP_CHARS = 32
 
     def __init__(self, tokenizer: Any) -> None:
         self._tokenizer = tokenizer
@@ -21395,16 +21548,11 @@ class _IncrementalTokenDecoder:
         if unflushed_chars < 0:
             return
         # The kept tail must decode to at least the unflushed suffix or
-        # truncation is impossible. A fixed 8-token tail met that on
-        # whitespace-flush paths (0–2 unflushed chars) but silently
-        # no-op'd forever on the max-hold escape path, which by design
-        # keeps _ESCAPE_TAIL_KEEP_CHARS unflushed while byte-BPE emits
-        # 1–3 chars per token on exactly the content the escape serves
-        # (table separator rows, URLs, minified code) — so the cache
-        # regrew and every feed() re-decoded it: the O(n^2) this method
-        # exists to prevent (found 2026-08-18). Grow the tail until it
-        # covers the unflushed region; the ladder is bounded by the
-        # truncate threshold, so this stays a handful of small decodes.
+        # truncation is impossible. Under token-boundary release the
+        # unflushed region is at most a trailing incomplete codepoint,
+        # but the ladder is kept: it is the general proof step (grow the
+        # tail until it covers the unflushed region and verifies), and
+        # it is what caught the 2026-08-18 O(n^2) regrowth bug.
         keep = self._CACHE_KEEP_TOKENS
         while True:
             tail = self._token_cache[-keep:]
@@ -21427,41 +21575,23 @@ class _IncrementalTokenDecoder:
         self._token_cache.extend(int(token) for token in tokens)
         text = self._decode(self._token_cache)
         if text.endswith("\n"):
+            # Newline is an exact flush point: drop the cache so the next
+            # line starts a fresh, small decode.
             printable = text[self._print_len :]
             self._token_cache = []
             self._print_len = 0
             return printable
-        if text and self._is_cjk_char(ord(text[-1])):
-            printable = text[self._print_len :]
-            self._print_len += len(printable)
-            self._truncate_decoded_prefix(text)
-            return printable
-        close_match = QWEN_STYLE_REASONING_CLOSE_RE.search(text, self._print_len)
-        if close_match is not None:
-            boundary = close_match.end()
-            printable = text[self._print_len : boundary]
-            self._print_len = boundary
-            self._truncate_decoded_prefix(text)
-            return printable
-
-        boundary = -1
-        for index in range(len(text) - 1, -1, -1):
-            if text[index].isspace():
-                boundary = index + 1
-                break
-        if boundary <= self._print_len:
-            held = len(text) - self._print_len
-            if held >= self._MAX_HOLD_CHARS:
-                boundary = len(text) - self._ESCAPE_TAIL_KEEP_CHARS
-                if boundary <= self._print_len:
-                    return ""
-                printable = text[self._print_len : boundary]
-                self._print_len = boundary
-                self._truncate_decoded_prefix(text)
-                return printable
+        # Hold only a trailing U+FFFD run (an incomplete multi-byte
+        # codepoint still waiting for its continuation bytes). A real
+        # replacement char anywhere else flows through; a held one is
+        # released the moment later tokens resolve or extend past it.
+        end = len(text)
+        while end > self._print_len and text[end - 1] == "\ufffd":
+            end -= 1
+        if end <= self._print_len:
             return ""
-        printable = text[self._print_len : boundary]
-        self._print_len = boundary
+        printable = text[self._print_len : end]
+        self._print_len = end
         self._truncate_decoded_prefix(text)
         return printable
 
@@ -21473,21 +21603,6 @@ class _IncrementalTokenDecoder:
         self._token_cache = []
         self._print_len = 0
         return printable
-
-    @staticmethod
-    def _is_cjk_char(cp: int) -> bool:
-        if (
-            (0x4E00 <= cp <= 0x9FFF)
-            or (0x3400 <= cp <= 0x4DBF)
-            or (0x20000 <= cp <= 0x2A6DF)
-            or (0x2A700 <= cp <= 0x2B73F)
-            or (0x2B740 <= cp <= 0x2B81F)
-            or (0x2B820 <= cp <= 0x2CEAF)
-            or (0xF900 <= cp <= 0xFAFF)
-            or (0x2F800 <= cp <= 0x2FA1F)
-        ):
-            return True
-        return False
 
 
 class _NonDuplicatingTokenDecoder(_IncrementalTokenDecoder):
@@ -21912,6 +22027,11 @@ class _ThinkingContentStreamSplitter:
         markers: list[str] = list(CHAT_TEMPLATE_SENTINEL_MARKERS)
         for name in QWEN_STYLE_REASONING_TAG_NAMES:
             markers.extend((f"<{name}", f"<{name}>", f"</{name}", f"</{name}>"))
+        # Tool-control markers too: without them a token-split "<tool_call"
+        # emitted as "<to..." — too short for the edge-trim's marker branch
+        # to recognize, so the held pre-tool whitespace leaked onto the wire
+        # (found 2026-08-19 when the decoder moved to token-boundary release).
+        markers.extend(cls._TOOL_CONTROL_MARKERS)
         return cls._partial_marker_tail_len(text, markers)
 
     @classmethod
@@ -22093,6 +22213,10 @@ class _ThinkingContentStreamSplitter:
         keep = max(
             tag_keep,
             sentinel_keep,
+            # Covers suffixed spellings ("</reasoning:opensource>") that
+            # outgrow the bare-tag keep; reasoning_codecs sizes this for
+            # exactly that (>= 32).
+            STREAM_TAG_HOLDBACK,
         )
         while self._pending:
             pending_lower = self._pending.lower()
@@ -22170,6 +22294,30 @@ class _ThinkingContentStreamSplitter:
                 continue
 
             open_match = QWEN_STYLE_REASONING_OPEN_RE.search(self._pending)
+            close_match = QWEN_STYLE_REASONING_CLOSE_RE.search(self._pending)
+            pending_tool_index = self._tool_control_marker_index(self._pending)
+            if (
+                close_match is not None
+                and (open_match is None or close_match.start() < open_match.start())
+                and not self._inside_tool_call
+                and (
+                    pending_tool_index < 0
+                    or close_match.start() < pending_tool_index
+                )
+            ):
+                # Orphan reasoning close on the content channel (e.g. a turn
+                # whose <think> opened in a previous message closes after a
+                # tool span). The non-stream cleaner strips it; the stream
+                # used to rely on the whole tag landing inside one chunk for
+                # _clean_generated_assistant_text to catch — a chunk-shape
+                # dependency the token-boundary decoder exposed (2026-08-19).
+                # Drop it split-safely here; the keep tail below holds a
+                # partial tag until it is decidable.
+                before = self._pending[: close_match.start()]
+                if before:
+                    self._append_chunk(chunks, "content", before)
+                self._pending = self._pending[close_match.end() :]
+                continue
             if open_match is None:
                 pending_lower = self._pending.lower()
                 tool_close_index = pending_lower.find(self._TOOL_CALL_CLOSE_MARKER)
@@ -25619,9 +25767,13 @@ def create_app(state: ServerState) -> FastAPI:
                 yield (f"event: snapshot\ndata: {json.dumps(_json_safe(snapshot))}\n\n")
                 last_snapshot_s = time.perf_counter()
                 while True:
+                    effective_interval_s = _dashboard_snapshot_interval_for_activity_s(
+                        snapshot_interval_s,
+                        active_requests=_dashboard_in_flight_count(state),
+                    )
                     timeout_s = max(
                         0.01,
-                        snapshot_interval_s - (time.perf_counter() - last_snapshot_s),
+                        effective_interval_s - (time.perf_counter() - last_snapshot_s),
                     )
                     try:
                         event = await asyncio.wait_for(queue.get(), timeout=timeout_s)
@@ -25631,7 +25783,11 @@ def create_app(state: ServerState) -> FastAPI:
                         )
                     except asyncio.TimeoutError:
                         pass
-                    if (time.perf_counter() - last_snapshot_s) >= snapshot_interval_s:
+                    effective_interval_s = _dashboard_snapshot_interval_for_activity_s(
+                        snapshot_interval_s,
+                        active_requests=_dashboard_in_flight_count(state),
+                    )
+                    if (time.perf_counter() - last_snapshot_s) >= effective_interval_s:
                         snapshot = _mtplx_dashboard_snapshot(state)
                         yield (
                             "event: snapshot\n"
@@ -26859,12 +27015,26 @@ def create_app(state: ServerState) -> FastAPI:
                 stream_started_s = time.perf_counter()
                 last_sse_sent_s = stream_started_s
                 last_token_s: float | None = None
+                # Enqueue stamp of the token item currently being drained
+                # (generation-thread perf_counter). The census subtracts it
+                # to expose queue residency — the direct starvation receipt.
+                latest_token_enqueue_s: float | None = None
                 next_silence_warn_s = stream_started_s + STREAM_SILENCE_WARN_S
                 owner_stall_probe = _OwnerStallProbe(deadline_s=STREAM_STALL_DEADLINE_S)
 
                 def mark_sse_sent(chunk: str) -> str:
                     nonlocal last_sse_sent_s
                     last_sse_sent_s = time.perf_counter()
+                    if _STREAM_CENSUS_DIR is not None:
+                        _stream_census_record(
+                            response_id,
+                            chunk,
+                            queue_age_ms=(
+                                (last_sse_sent_s - latest_token_enqueue_s) * 1000
+                                if latest_token_enqueue_s is not None
+                                else None
+                            ),
+                        )
                     return chunk
 
                 first = {
@@ -28522,7 +28692,10 @@ def create_app(state: ServerState) -> FastAPI:
                             for field, text in splitter.feed(delta)
                             if text
                         )
-                    return chunks
+                    # One committed verify step (or one force-drain) emits
+                    # one write per channel run, not one per token — see
+                    # _coalesce_stream_fields.
+                    return _coalesce_stream_fields(chunks)
 
                 def streamed_history_content() -> str:
                     # Always capture the natural-language portion of the
@@ -28690,6 +28863,7 @@ def create_app(state: ServerState) -> FastAPI:
                             else:
                                 stream_tokens = list(item or [])
                                 token_timestamp_s = time.perf_counter()
+                            latest_token_enqueue_s = token_timestamp_s
                             if stream_tokens:
                                 streamed_token_ids.extend(int(t) for t in stream_tokens)
                                 streamed_token_times.extend(

@@ -53,8 +53,7 @@ struct StreamingAssistantView: View {
                 expandedDetail: $expandedDetail,
                 thoughtWell: {
                     StreamingThoughtWell(
-                        document: viewModel.streamingReasoningDocument,
-                        pendingTail: viewModel.streamingReasoningPending
+                        document: viewModel.streamingReasoningDocument
                     )
                 },
                 searchWell: {

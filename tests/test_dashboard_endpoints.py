@@ -37,9 +37,11 @@ from mtplx.server.openai import (
     DASHBOARD_READ_ONLY_SETTINGS_KEYS,
     DASHBOARD_RESTART_REQUIRED_KEYS,
     DASHBOARD_SNAPSHOT_INTERVAL_DEFAULT_MS,
+    DASHBOARD_SNAPSHOT_INTERVAL_IDLE_MIN_MS,
     DASHBOARD_SNAPSHOT_INTERVAL_MAX_MS,
     DASHBOARD_SNAPSHOT_INTERVAL_MIN_MS,
     PUBLIC_MTPLX_STATS_KEYS,
+    _dashboard_snapshot_interval_for_activity_s,
     _dashboard_snapshot_interval_s,
     create_app,
 )
@@ -615,6 +617,7 @@ def test_app_capabilities_returns_stable_native_backend_contract():
     assert body["snapshot_interval"]["default_ms"] == DASHBOARD_SNAPSHOT_INTERVAL_DEFAULT_MS
     assert body["snapshot_interval"]["min_ms"] == DASHBOARD_SNAPSHOT_INTERVAL_MIN_MS
     assert body["snapshot_interval"]["max_ms"] == DASHBOARD_SNAPSHOT_INTERVAL_MAX_MS
+    assert body["snapshot_interval"]["idle_min_ms"] == DASHBOARD_SNAPSHOT_INTERVAL_IDLE_MIN_MS
     assert body["snapshot_interval"]["native_default_ms"] == 500
     assert body["snapshot_interval"]["performance_lock_ms"] == 1000
 
@@ -657,6 +660,12 @@ def test_metrics_stream_accepts_bounded_snapshot_interval():
     assert _dashboard_snapshot_interval_s(1000) == 1.0
     assert _dashboard_snapshot_interval_s(1) == 0.1
     assert _dashboard_snapshot_interval_s(999_999) == 5.0
+
+
+def test_metrics_stream_relaxes_full_snapshots_only_while_idle():
+    assert _dashboard_snapshot_interval_for_activity_s(0.1, active_requests=1) == 0.1
+    assert _dashboard_snapshot_interval_for_activity_s(0.1, active_requests=0) == 1.0
+    assert _dashboard_snapshot_interval_for_activity_s(2.0, active_requests=0) == 2.0
 
 
 def test_metrics_bus_round_trips_completed_event():

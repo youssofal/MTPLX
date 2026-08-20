@@ -11,6 +11,11 @@ import os
 /// and the active tail block; existing blocks keep their ids and parsed payloads.
 @MainActor
 public final class StreamingDocumentStore: ObservableObject {
+    public enum Mutation: Sendable {
+        case append(String)
+        case reset
+    }
+
     public enum Mode: Equatable, Sendable {
         case plainText
         case plainLines
@@ -35,6 +40,7 @@ public final class StreamingDocumentStore: ObservableObject {
     public let mode: Mode
 
     private let revisionSubject = PassthroughSubject<Int, Never>()
+    private let mutationSubject = PassthroughSubject<Mutation, Never>()
     private var rawTextStorage: String = ""
     private var tailText: String = ""
     private var nextBlockID = 0
@@ -64,6 +70,9 @@ public final class StreamingDocumentStore: ObservableObject {
     public var bottomID: Int? { blocks.last?.id }
     public var revisionPublisher: AnyPublisher<Int, Never> {
         revisionSubject.eraseToAnyPublisher()
+    }
+    public var mutationPublisher: AnyPublisher<Mutation, Never> {
+        mutationSubject.eraseToAnyPublisher()
     }
 
     public func recentText(characterLimit: Int) -> String {
@@ -102,6 +111,7 @@ public final class StreamingDocumentStore: ObservableObject {
         #if DEBUG
         diagnostics = StreamingDocumentDiagnostics()
         #endif
+        mutationSubject.send(.reset)
         revisionSubject.send(revision)
     }
 
@@ -165,7 +175,7 @@ public final class StreamingDocumentStore: ObservableObject {
                 identity: String(describing: mode)
             )
             guard shouldRecord else {
-                advanceRevision()
+                advanceRevision(appended: delta)
                 return
             }
             AIMEDiagnostics.record(
@@ -180,11 +190,12 @@ public final class StreamingDocumentStore: ObservableObject {
                 ]
             )
         }
-        advanceRevision()
+        advanceRevision(appended: delta)
     }
 
-    private func advanceRevision() {
+    private func advanceRevision(appended delta: String) {
         revision += 1
+        mutationSubject.send(.append(delta))
         revisionSubject.send(revision)
     }
 
@@ -972,6 +983,10 @@ public struct StreamingDocumentBlock: Identifiable, Equatable, Sendable {
     /// are value types that are rebuilt (never text-mutated) on change,
     /// so construction is the one place the count can go stale-proof.
     public let fenceMarkerCount: Int
+    /// Visual line count stamped with the block. Streaming renderers use
+    /// this to size a bounded TextKit viewport without rescanning frozen
+    /// code segments on every token.
+    public let lineCount: Int
 
     public init(
         id: Int,
@@ -984,6 +999,9 @@ public struct StreamingDocumentBlock: Identifiable, Equatable, Sendable {
         self.kind = kind
         self.finalized = finalized
         self.fenceMarkerCount = StreamingMarkdownBlockSafety.fenceCount(in: text)
+        self.lineCount = text.utf8.reduce(into: 1) { count, byte in
+            if byte == 0x0A { count += 1 }
+        }
     }
 }
 

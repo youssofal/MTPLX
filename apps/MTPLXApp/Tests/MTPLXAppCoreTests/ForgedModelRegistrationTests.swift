@@ -177,6 +177,38 @@ final class ForgedModelRegistrationTests: XCTestCase {
         XCTAssertEqual(MTPLXModelOption.modelFamily(for: modelDir.path), "qwen3_5")
     }
 
+    func testNeutralForgeNameUsesDeclaredQwen38IdentityAndLaunchDefaults() throws {
+        let modelDir = temporaryDirectory().appendingPathComponent("Bare-Speed-Beta", isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: modelDir) }
+        let runtime = """
+        {
+          "public_model_id": "mtplx-qwen38-27b-bare-speed-beta",
+          "arch_id": "qwen3-next-mtp"
+        }
+        """
+        try runtime.write(
+            to: modelDir.appendingPathComponent("mtplx_runtime.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        XCTAssertEqual(MTPLXModelOption.modelFamily(for: modelDir.path), "qwen3_8")
+
+        let fake = modelDir.appendingPathComponent("mtplx")
+        try "#!/bin/sh\n".write(to: fake, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fake.path)
+        let command = try MTPLXCommandBuilder(environment: ["PATH": modelDir.path])
+            .buildServeCommand(configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: modelDir.path,
+                profile: "auto"
+            ))
+        let temperatureIndex = try XCTUnwrap(command.arguments.firstIndex(of: "--temperature"))
+        XCTAssertEqual(command.arguments[temperatureIndex + 1], "1.0")
+        XCTAssertFalse(command.arguments.contains("--draft-temperature"))
+    }
+
     func testArbitraryForgedNameKeepsTunedDepthCompatible() throws {
         let modelDir = temporaryDirectory().appendingPathComponent("My-Custom-Name-MTPLX", isDirectory: true)
         try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)

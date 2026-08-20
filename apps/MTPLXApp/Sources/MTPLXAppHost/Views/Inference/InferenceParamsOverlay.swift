@@ -41,11 +41,72 @@ import MTPLXAppCore
 // Label and value text never move. Adjacent dials lift independently
 // because each owns its own hover state. No card. No fill. No scale.
 
-struct InferenceParamsOverlay: View {
-    @EnvironmentObject private var backend: MTPLXBackendStore
+struct InferenceParamsSnapshot: Equatable, Sendable {
+    let configuration: MTPLXAppConfiguration
+    let configuredModelFamily: String
+    let settings: MutableSettings?
+    let startupControls: ModelControls?
+    let healthDepth: Int?
+    let healthGenerationMode: String?
+    let healthContextWindow: Int?
+    let dashboardContextWindow: Int?
+    let currentFanMode: String?
+
+    @MainActor
+    init(backend: MTPLXBackendStore, configuredModelFamily: String) {
+        configuration = backend.configuration
+        self.configuredModelFamily = configuredModelFamily
+        settings = backend.settings
+        startupControls = backend.health?.startup?.modelControls
+        healthDepth = backend.health?.depth
+        healthGenerationMode = backend.health?.generationMode
+        healthContextWindow = backend.health?.contextWindow
+        dashboardContextWindow = backend.snapshot?.contextWindow
+        currentFanMode = backend.currentFanMode
+    }
+}
+
+/// SwiftUI can revisit a sibling's body whenever the chat's AppKit bridge
+/// requests a display pass. Keep that cheap outer pass from rebuilding the
+/// entire settings control tree unless one of its actual inputs changed.
+private struct EquatableViewBuilder<Key: Equatable & Sendable, Content: View>: View, Equatable {
+    nonisolated let key: Key
+    let content: () -> Content
+
+    init(key: Key, @ViewBuilder content: @escaping () -> Content) {
+        self.key = key
+        self.content = content
+    }
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.key == rhs.key
+    }
+
+    var body: some View { content() }
+}
+
+struct InferenceParamsOverlay: View, Equatable {
+    let backend: MTPLXBackendStore
+    let snapshot: InferenceParamsSnapshot
     @EnvironmentObject private var themeStore: ThemeStore
 
     @Binding var presented: Bool
+    private let presentedValue: Bool
+
+    init(
+        backend: MTPLXBackendStore,
+        snapshot: InferenceParamsSnapshot,
+        presented: Binding<Bool>
+    ) {
+        self.backend = backend
+        self.snapshot = snapshot
+        _presented = presented
+        presentedValue = presented.wrappedValue
+    }
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.presentedValue == rhs.presentedValue && lhs.snapshot == rhs.snapshot
+    }
 
     @State private var borderProgress: CGFloat = 0
     @State private var headerVisible: Bool = false
@@ -81,6 +142,28 @@ struct InferenceParamsOverlay: View {
     @State private var kvDirty: Bool = false
     @State private var applying: Bool = false
 
+    private struct PopoverRenderKey: Equatable, Sendable {
+        let snapshot: InferenceParamsSnapshot
+        let borderProgress: CGFloat
+        let headerVisible: Bool
+        let rowsVisibleCount: Int
+        let temperature: Double
+        let topP: Double
+        let topK: Int
+        let presencePenalty: Double
+        let depth: Int
+        let reasoningMode: String
+        let reasoningEffort: String
+        let fanMode: String
+        let prefillChunk: Int
+        let contextWindow: Int
+        let contextWindowDirty: Bool
+        let kvQuantization: String
+        let kvDirty: Bool
+        let applying: Bool
+        let reduceMotion: Bool
+    }
+
     private let popoverWidth: CGFloat = 340
     private let cornerRadius: CGFloat = 12
     // Strip layout right→left: [LaunchButton 32pt] · 8pt · [Params
@@ -94,10 +177,13 @@ struct InferenceParamsOverlay: View {
         ZStack(alignment: .topTrailing) {
             backdrop
             if presented {
-                popoverColumn
-                    .padding(.top, topOffset)
-                    .padding(.trailing, rightOffset)
-                    .transition(.identity)
+                EquatableViewBuilder(key: popoverRenderKey) {
+                    popoverColumn
+                        .padding(.top, topOffset)
+                        .padding(.trailing, rightOffset)
+                        .transition(.identity)
+                }
+                .equatable()
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
@@ -112,18 +198,38 @@ struct InferenceParamsOverlay: View {
                 runExitChoreography()
             }
         }
-        .onChange(of: backend.settings) { _, _ in
+        .onChange(of: snapshot.settings) { _, _ in
             guard presented else { return }
             seedDraftsFromCurrentState()
         }
-        .onChange(of: backend.settings?.modelFamily) { _, _ in
+        .onChange(of: snapshot.startupControls) { _, _ in
             guard presented else { return }
             seedDraftsFromCurrentState()
         }
-        .onChange(of: backend.health?.startup?.modelControls?.modelFamily) { _, _ in
-            guard presented else { return }
-            seedDraftsFromCurrentState()
-        }
+    }
+
+    private var popoverRenderKey: PopoverRenderKey {
+        PopoverRenderKey(
+            snapshot: snapshot,
+            borderProgress: borderProgress,
+            headerVisible: headerVisible,
+            rowsVisibleCount: rowsVisibleCount,
+            temperature: temperature,
+            topP: topP,
+            topK: topK,
+            presencePenalty: presencePenalty,
+            depth: depth,
+            reasoningMode: reasoningMode,
+            reasoningEffort: reasoningEffort,
+            fanMode: fanMode,
+            prefillChunk: prefillChunk,
+            contextWindow: contextWindow,
+            contextWindowDirty: contextWindowDirty,
+            kvQuantization: kvQuantization,
+            kvDirty: kvDirty,
+            applying: applying,
+            reduceMotion: themeStore.reduceMotionPreference
+        )
     }
 
     // MARK: - Layers
@@ -371,10 +477,10 @@ struct InferenceParamsOverlay: View {
     /// loaded model — Qwen/Step "MTP off + D1-D3", Gemma "Draft block"
     /// 2-8 — instead of being hardcoded to Qwen's D1-D3.
     private var configuredModelFamily: String {
-        MTPLXModelOption.modelFamily(for: backend.configuration.model)
+        snapshot.configuredModelFamily
     }
     private var compatibleSettings: MutableSettings? {
-        guard let settings = backend.settings else { return nil }
+        guard let settings = snapshot.settings else { return nil }
         let settingsFamily = settings.modelControls?.modelFamily ?? settings.modelFamily
         guard let settingsFamily else {
             return MTPLXModelOption.supportsTune(family: configuredModelFamily) ? settings : nil
@@ -382,7 +488,12 @@ struct InferenceParamsOverlay: View {
         return settingsFamily == configuredModelFamily ? settings : nil
     }
     private var compatibleStartupControls: ModelControls? {
-        guard let controls = backend.health?.startup?.modelControls else { return nil }
+        guard let controls = snapshot.startupControls else { return nil }
+        if let modelRef = controls.modelRef {
+            return MTPLXModelOption.modelsMatch(modelRef, snapshot.configuration.model)
+                ? controls
+                : nil
+        }
         return controls.modelFamily == configuredModelFamily ? controls : nil
     }
     private var modelControls: ModelControls? {
@@ -412,17 +523,17 @@ struct InferenceParamsOverlay: View {
     }
     private var compatibleConfigurationReasoning: String? {
         let family = selectedModelFamily
-        if let storedFamily = backend.configuration.liveSettingsModelFamily,
+        if let storedFamily = snapshot.configuration.liveSettingsModelFamily,
            !storedFamily.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         {
-            return storedFamily == family ? backend.configuration.reasoning : nil
+            return storedFamily == family ? snapshot.configuration.reasoning : nil
         }
-        return MTPLXModelOption.supportsTune(family: family) ? backend.configuration.reasoning : nil
+        return MTPLXModelOption.supportsTune(family: family) ? snapshot.configuration.reasoning : nil
     }
     private var compatibleConfigurationGenerationMode: String? {
         let family = selectedModelFamily
-        let mode = normalizedGenerationMode(backend.configuration.generationMode)
-        if let storedFamily = backend.configuration.liveSettingsModelFamily,
+        let mode = normalizedGenerationMode(snapshot.configuration.generationMode)
+        if let storedFamily = snapshot.configuration.liveSettingsModelFamily,
            !storedFamily.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         {
             return storedFamily == family ? mode : nil
@@ -436,15 +547,15 @@ struct InferenceParamsOverlay: View {
     private var compatibleConfigurationTunedDraftValue: Int? {
         guard let field = draftControl?.requestField else { return nil }
         if field == "depth" {
-            return backend.configuration.compatibleTunedDepth()
+            return snapshot.configuration.compatibleTunedDepth()
         }
-        return backend.configuration.compatibleTunedControlValue(controlField: field)
+        return snapshot.configuration.compatibleTunedControlValue(controlField: field)
     }
     private var defaultGenerationModeForSelectedControl: String {
         depthControlSupportsMtpOff ? "ar" : "mtp"
     }
     private var selectedLaunchTarget: LaunchTarget {
-        LaunchTarget(rawValue: backend.configuration.lastLaunchTarget) ?? .chat
+        LaunchTarget(rawValue: snapshot.configuration.lastLaunchTarget) ?? .chat
     }
     private var launchDefaultReasoning: String? {
         MTPLXCommandBuilder.defaultReasoningMode(for: selectedLaunchTarget)
@@ -1089,7 +1200,7 @@ struct InferenceParamsOverlay: View {
 
     private var performanceLockBinding: Binding<Bool> {
         Binding(
-            get: { backend.configuration.performanceLock },
+            get: { snapshot.configuration.performanceLock },
             set: { newValue in
                 var config = backend.configuration
                 config.performanceLock = newValue
@@ -1218,7 +1329,7 @@ struct InferenceParamsOverlay: View {
     // MARK: - Choreography
 
     private var motionEnabled: Bool {
-        !backend.configuration.performanceLock && !themeStore.reduceMotionPreference
+        !snapshot.configuration.performanceLock && !themeStore.reduceMotionPreference
     }
 
     private func runEnterChoreography() {
@@ -1244,11 +1355,11 @@ struct InferenceParamsOverlay: View {
         topP = clampTopP(settings?.topP ?? samplingDefaults?.topP ?? 0.95)
         topK = clampTopK(settings?.topK ?? samplingDefaults?.topK ?? 20)
         presencePenalty = clampPresencePenalty(settings?.presencePenalty ?? 0)
-        let liveDepth = compatibleStartupControls == nil ? nil : backend.health?.depth
+        let liveDepth = compatibleStartupControls == nil ? nil : snapshot.healthDepth
         let tunedDraftValue = compatibleConfigurationTunedDraftValue
         let generationMode = normalizedGenerationMode(
             settings?.generationMode
-                ?? (compatibleStartupControls == nil ? nil : backend.health?.generationMode)
+                ?? (compatibleStartupControls == nil ? nil : snapshot.healthGenerationMode)
                 ?? compatibleConfigurationGenerationMode
                 ?? (tunedDraftValue == nil ? nil : "mtp")
                 ?? defaultGenerationModeForSelectedControl
@@ -1268,7 +1379,7 @@ struct InferenceParamsOverlay: View {
             settings?.reasoningEffort ?? reasoningPolicy?.defaultEffort
         )
         fanMode = MTPLXFanMode.normalized(
-            backend.currentFanMode ?? backend.configuration.fanMode
+            snapshot.currentFanMode ?? snapshot.configuration.fanMode
         ).rawValue
         prefillChunk = currentPrefillChunk
         contextWindow = currentContextWindow
@@ -1312,15 +1423,15 @@ struct InferenceParamsOverlay: View {
 
     private var currentPrefillChunk: Int {
         compatibleSettings?.prefillChunkTokens
-            ?? backend.configuration.prefillChunkTokens
+            ?? snapshot.configuration.prefillChunkTokens
             ?? 2048
     }
 
     private var currentKVQuantization: String {
         guard kvQuantSupported else { return "off" }
-        switch backend.configuration.pagedKVQuantization {
+        switch snapshot.configuration.pagedKVQuantization {
         case "q8", "q4":
-            return backend.configuration.pagedKVQuantization
+            return snapshot.configuration.pagedKVQuantization
         default:
             return "off"
         }
@@ -1357,12 +1468,12 @@ struct InferenceParamsOverlay: View {
     }
 
     private var compatibleConfigurationContextWindow: Int? {
-        backend.configuration.compatibleContextWindowOverride()
+        snapshot.configuration.compatibleContextWindowOverride()
     }
 
     private var compatibleHealthContextWindow: Int? {
         guard compatibleStartupControls != nil else { return nil }
-        return backend.health?.contextWindow ?? backend.snapshot?.contextWindow
+        return snapshot.healthContextWindow ?? snapshot.dashboardContextWindow
     }
 
     private var contextWindowModelLabel: String {

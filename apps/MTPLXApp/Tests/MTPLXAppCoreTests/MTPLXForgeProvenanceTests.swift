@@ -81,6 +81,17 @@ final class MTPLXForgeProvenanceTests: XCTestCase {
         XCTAssertNotNil(meta.rawJSON["verified_on"])
     }
 
+    func testRuntimeMetadataParsesExplicitModelIdentity() throws {
+        let meta = try XCTUnwrap(MTPLXRuntimeMetadata.parse([
+            "public_model_id": "mtplx-qwen38-27b-bare-speed-beta",
+            "model_family": "qwen3_8",
+            "arch_id": "qwen3-next-mtp",
+        ]))
+
+        XCTAssertEqual(meta.publicModelID, "mtplx-qwen38-27b-bare-speed-beta")
+        XCTAssertEqual(meta.modelFamily, "qwen3_8")
+    }
+
     func testFlat4FixtureParsesWithOptionalFields() throws {
         let data = Self.flat4RuntimeJSON.data(using: .utf8)!
         let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])

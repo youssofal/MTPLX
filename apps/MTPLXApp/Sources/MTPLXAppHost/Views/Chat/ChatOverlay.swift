@@ -1,4 +1,5 @@
 import SwiftUI
+import MTPLXAppCore
 
 // MARK: - ChatOverlay
 //
@@ -13,13 +14,32 @@ import SwiftUI
 // the bottom-centre of the dashboard area when chat is closed
 // so the user can pull the drawer back up.
 
-struct ChatOverlay: View {
+struct ChatOverlay: View, Equatable {
+    let daemonState: DaemonState
+    let startupPhase: DaemonStartupPhase
+    let selectedModel: String
+    let visionEnabled: Bool
+    let performanceLock: Bool
     let onCollapse: () -> Void
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.daemonState == rhs.daemonState
+            && lhs.startupPhase == rhs.startupPhase
+            && lhs.selectedModel == rhs.selectedModel
+            && lhs.visionEnabled == rhs.visionEnabled
+            && lhs.performanceLock == rhs.performanceLock
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             closeBar
-            ChatView()
+            ChatView(
+                daemonState: daemonState,
+                startupPhase: startupPhase,
+                selectedModel: selectedModel,
+                visionEnabled: visionEnabled,
+                performanceLock: performanceLock
+            )
                 .background(Brand.bgOuter)
         }
     }
