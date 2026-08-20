@@ -85,7 +85,12 @@ def test_qlinear_patch_routes_only_verify_shapes() -> None:
 
 
 def test_turbo_profile_carries_nax_env() -> None:
-    from mtplx.profiles import PROFILES, PROFILE_CHOICES, apply_profile_env, restore_profile_env
+    from mtplx.profiles import (
+        PROFILES,
+        PROFILE_CHOICES,
+        apply_profile_env,
+        restore_profile_env,
+    )
     import os
 
     assert "turbo" in PROFILE_CHOICES
@@ -173,15 +178,26 @@ def test_vk_6bit_hexpack_ksplit_matches_stock() -> None:
             w = (mx.random.normal((N, K), dtype=mx.float32) * 0.02).astype(dtype)
             w_q, scales, biases = mx.quantize(w, group_size=gs, bits=6)
             mx.eval(w_q, scales, biases)
-            for m, fn in ((4, vk_qmm_m4_ksplit), (5, vk_qmm_m6_ksplit), (6, vk_qmm_m6_ksplit)):
+            for m, fn in (
+                (4, vk_qmm_m4_ksplit),
+                (5, vk_qmm_m6_ksplit),
+                (6, vk_qmm_m6_ksplit),
+            ):
                 assert vk_eligible_ksplit(m, K, N, 6, gs, dtype)
                 x = (mx.random.normal((m, K), dtype=mx.float32) * 0.5).astype(dtype)
                 y = fn(x, w_q, scales, biases, bits=6, group_size=gs)
                 ref = mx.quantized_matmul(
-                    x, w_q, scales=scales, biases=biases,
-                    transpose=True, group_size=gs, bits=6,
+                    x,
+                    w_q,
+                    scales=scales,
+                    biases=biases,
+                    transpose=True,
+                    group_size=gs,
+                    bits=6,
                 )
-                diff = float(mx.abs(y.astype(mx.float32) - ref.astype(mx.float32)).max())
+                diff = float(
+                    mx.abs(y.astype(mx.float32) - ref.astype(mx.float32)).max()
+                )
                 assert y.shape == (m, N)
                 assert diff < 0.05, f"6-bit drift {dtype} gs={gs} M={m}: {diff}"
 
@@ -230,9 +246,13 @@ def test_qlinear_patch_routes_6bit_verify_shapes(monkeypatch) -> None:
                 == 0
             ), "disabled m4 route must not report a fallback"
             mx.eval(big(x5))
-            assert calls["m6"] == 1, "6-bit m5 verify shape did not route the hexpack kernel"
+            assert calls["m6"] == 1, (
+                "6-bit m5 verify shape did not route the hexpack kernel"
+            )
             mx.eval(big(x6))
-            assert calls["m6"] == 2, "6-bit m6 verify shape did not route the hexpack kernel"
+            assert calls["m6"] == 2, (
+                "6-bit m6 verify shape did not route the hexpack kernel"
+            )
             mx.eval(small(x5))
             assert calls["m6"] == 2, "small-N 6-bit projection must stay stock"
         with attention_phase("prefill"):
@@ -282,9 +302,7 @@ def test_vk_qmm6_benchmark_order_balances_positions_and_carryover() -> None:
         / "benchmarks"
         / "repro_vk_qmm6_m4_route.py"
     )
-    spec = importlib.util.spec_from_file_location(
-        "repro_vk_qmm6_m4_route", module_path
-    )
+    spec = importlib.util.spec_from_file_location("repro_vk_qmm6_m4_route", module_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -293,14 +311,10 @@ def test_vk_qmm6_benchmark_order_balances_positions_and_carryover() -> None:
     cells = list(range(6))
     orders = [balanced_order(cells, round_index) for round_index in range(6)]
     positions = {
-        (position, cell)
-        for order in orders
-        for position, cell in enumerate(order)
+        (position, cell) for order in orders for position, cell in enumerate(order)
     }
     carryovers = {
-        (before, after)
-        for order in orders
-        for before, after in zip(order, order[1:])
+        (before, after) for order in orders for before, after in zip(order, order[1:])
     }
     assert len(positions) == 36
     assert len(carryovers) == 30

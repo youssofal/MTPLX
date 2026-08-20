@@ -757,7 +757,9 @@ def _build_kernel_m6_ksplit_np(group_size: int, dtype: mx.Dtype, *, k_parts: int
     return kernel
 
 
-def m6_ksplit_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> bool:
+def m6_ksplit_eligible(
+    M: int, K: int, N: int, bits: int, group_size: int, dtype
+) -> bool:
     return (
         int(bits) == 4
         and int(group_size) in (32, 64, 128)
@@ -799,7 +801,9 @@ def nax_qmm_m6(
     return y
 
 
-def m8_ksplit_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> bool:
+def m8_ksplit_eligible(
+    M: int, K: int, N: int, bits: int, group_size: int, dtype
+) -> bool:
     return (
         int(bits) == 4
         and int(group_size) in (32, 64, 128)
@@ -854,7 +858,9 @@ def m16_nax_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) 
     )
 
 
-def m4_ksplit_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> bool:
+def m4_ksplit_eligible(
+    M: int, K: int, N: int, bits: int, group_size: int, dtype
+) -> bool:
     return (
         int(bits) == 4
         and int(group_size) in (32, 64, 128)
@@ -963,8 +969,12 @@ def install_nax_qlinear_patch() -> dict[str, object]:
                     # wins isolated 1.34x while split-K thrashes (0.66x) in
                     # the 62k-tiny-threadgroup regime.
                     y = vk_qmm_m4(
-                        x.reshape(m, k), w_q, self["scales"], self["biases"],
-                        bits=8, group_size=group_size,
+                        x.reshape(m, k),
+                        w_q,
+                        self["scales"],
+                        self["biases"],
+                        bits=8,
+                        group_size=group_size,
                     )
                 elif (
                     m == 4
@@ -975,8 +985,12 @@ def install_nax_qlinear_patch() -> dict[str, object]:
                     # loses its isolated 1.3-1.5x to co-residency on the
                     # layer shapes).
                     y = vk_qmm_m4_ksplit(
-                        x.reshape(m, k), w_q, self["scales"], self["biases"],
-                        bits=8, group_size=group_size,
+                        x.reshape(m, k),
+                        w_q,
+                        self["scales"],
+                        self["biases"],
+                        bits=8,
+                        group_size=group_size,
                     )
                 elif (
                     huge_n
@@ -984,16 +998,23 @@ def install_nax_qlinear_patch() -> dict[str, object]:
                     and vk_eligible_m6(m, k, n, bits, group_size, x.dtype)
                 ):
                     y = vk_qmm_m6(
-                        x.reshape(m, k), w_q, self["scales"], self["biases"],
-                        bits=8, group_size=group_size,
+                        x.reshape(m, k),
+                        w_q,
+                        self["scales"],
+                        self["biases"],
+                        bits=8,
+                        group_size=group_size,
                     )
-                elif (
-                    not lane_disabled("qmm_m6")
-                    and vk_eligible_ksplit(m, k, n, bits, group_size, x.dtype)
+                elif not lane_disabled("qmm_m6") and vk_eligible_ksplit(
+                    m, k, n, bits, group_size, x.dtype
                 ):
                     y = vk_qmm_m6_ksplit(
-                        x.reshape(m, k), w_q, self["scales"], self["biases"],
-                        bits=8, group_size=group_size,
+                        x.reshape(m, k),
+                        w_q,
+                        self["scales"],
+                        self["biases"],
+                        bits=8,
+                        group_size=group_size,
                     )
                 if y is not None:
                     y = y.reshape(*x.shape[:-1], n)
@@ -1029,8 +1050,12 @@ def install_nax_qlinear_patch() -> dict[str, object]:
                     and vk_eligible_ksplit(m, k, n, bits, group_size, x.dtype)
                 ):
                     y = vk_qmm_m4_ksplit(
-                        x.reshape(m, k), w_q, self["scales"], self["biases"],
-                        bits=6, group_size=group_size,
+                        x.reshape(m, k),
+                        w_q,
+                        self["scales"],
+                        self["biases"],
+                        bits=6,
+                        group_size=group_size,
                     )
                 elif (
                     5 <= m <= 6
@@ -1039,8 +1064,12 @@ def install_nax_qlinear_patch() -> dict[str, object]:
                     and vk_eligible_ksplit(m, k, n, bits, group_size, x.dtype)
                 ):
                     y = vk_qmm_m6_ksplit(
-                        x.reshape(m, k), w_q, self["scales"], self["biases"],
-                        bits=6, group_size=group_size,
+                        x.reshape(m, k),
+                        w_q,
+                        self["scales"],
+                        self["biases"],
+                        bits=6,
+                        group_size=group_size,
                     )
                 if y is not None:
                     y = y.reshape(*x.shape[:-1], n)
@@ -1064,7 +1093,10 @@ def install_nax_qlinear_patch() -> dict[str, object]:
                 ):
                     # Plain SIMD K-split kernel: no NAX hardware requirement.
                     y = nax_qmm_m4(
-                        x.reshape(m, k), w_q, self["scales"], self["biases"],
+                        x.reshape(m, k),
+                        w_q,
+                        self["scales"],
+                        self["biases"],
                         group_size=group_size,
                     )
                 elif (
@@ -1073,15 +1105,20 @@ def install_nax_qlinear_patch() -> dict[str, object]:
                     and m6_ksplit_eligible(m, k, n, bits, group_size, x.dtype)
                 ):
                     y = nax_qmm_m6(
-                        x.reshape(m, k), w_q, self["scales"], self["biases"],
+                        x.reshape(m, k),
+                        w_q,
+                        self["scales"],
+                        self["biases"],
                         group_size=group_size,
                     )
-                elif (
-                    not lane_disabled("qmm_m16_nax")
-                    and m16_nax_eligible(m, k, n, bits, group_size, x.dtype)
+                elif not lane_disabled("qmm_m16_nax") and m16_nax_eligible(
+                    m, k, n, bits, group_size, x.dtype
                 ):
                     y = nax_qmm_m16(
-                        x.reshape(m, k), w_q, self["scales"], self["biases"],
+                        x.reshape(m, k),
+                        w_q,
+                        self["scales"],
+                        self["biases"],
                         group_size=group_size,
                     )
                 if y is not None:

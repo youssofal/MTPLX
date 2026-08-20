@@ -81,19 +81,31 @@ N_LAYERS, FULL_EVERY = 64, 4
 
 # Qwen3.8-27B: 48 gated-delta-net layers, 16 full-attention layers, one
 # lm_head. Shapes read from the checkpoint's config.json.
-GDN = [("lin.in_proj_qkv", H, 10240), ("lin.in_proj_z", H, 6144),
-       ("lin.out_proj", 6144, H), ("mlp.gate_proj", H, INTER),
-       ("mlp.up_proj", H, INTER), ("mlp.down_proj", INTER, H)]
-FULL = [("attn.q_proj", H, 12288), ("attn.k_proj", H, 1024),
-        ("attn.v_proj", H, 1024), ("attn.o_proj", 6144, H),
-        ("mlp.gate_proj", H, INTER), ("mlp.up_proj", H, INTER),
-        ("mlp.down_proj", INTER, H)]
+GDN = [
+    ("lin.in_proj_qkv", H, 10240),
+    ("lin.in_proj_z", H, 6144),
+    ("lin.out_proj", 6144, H),
+    ("mlp.gate_proj", H, INTER),
+    ("mlp.up_proj", H, INTER),
+    ("mlp.down_proj", INTER, H),
+]
+FULL = [
+    ("attn.q_proj", H, 12288),
+    ("attn.k_proj", H, 1024),
+    ("attn.v_proj", H, 1024),
+    ("attn.o_proj", 6144, H),
+    ("mlp.gate_proj", H, INTER),
+    ("mlp.up_proj", H, INTER),
+    ("mlp.down_proj", INTER, H),
+]
 
 
 def qweights(K, N, bits):
-    return (mx.random.randint(0, 2**31 - 1, (N, K * bits // 32)).astype(mx.uint32),
-            mx.random.normal((N, K // GS), dtype=DT) * 0.01,
-            mx.random.normal((N, K // GS), dtype=DT) * 0.01)
+    return (
+        mx.random.randint(0, 2**31 - 1, (N, K * bits // 32)).astype(mx.uint32),
+        mx.random.normal((N, K // GS), dtype=DT) * 0.01,
+        mx.random.normal((N, K // GS), dtype=DT) * 0.01,
+    )
 
 
 def wbytes(K, N, bits):
@@ -137,8 +149,9 @@ def make_forward(layers, lm, bits, m, use_vk):
         if use_vk and N >= 2048 and vk_eligible_ksplit(m, K, N, bits, GS, DT):
             fn = vk_qmm_m4_ksplit if m == 4 else vk_qmm_m6_ksplit
             return fn(xs[K], wq, sc, bi, bits=bits, group_size=GS)
-        return mx.quantized_matmul(xs[K], wq, sc, bi, transpose=True,
-                                   group_size=GS, bits=bits)
+        return mx.quantized_matmul(
+            xs[K], wq, sc, bi, transpose=True, group_size=GS, bits=bits
+        )
 
     def forward():
         outs = [call(K, N, *t) for layer in layers for K, N, t in layer]
@@ -171,8 +184,10 @@ def main() -> int:
     layers, lm, total = build(bits)
     floor_ms = total / gbs / 1e9 * 1e3
     print(f"device={mx.device_info()['architecture']}  roofline={gbs:.0f} GB/s")
-    print(f"bits={bits}  weights resident={total / 2**30:.2f} GiB  "
-          f"bandwidth floor={floor_ms:.1f} ms/forward  rounds={rounds}")
+    print(
+        f"bits={bits}  weights resident={total / 2**30:.2f} GiB  "
+        f"bandwidth floor={floor_ms:.1f} ms/forward  rounds={rounds}"
+    )
 
     cells = [(m, vk) for m in ms for vk in (False, True)]
     fns = {c: make_forward(layers, lm, bits, c[0], c[1]) for c in cells}
@@ -188,19 +203,25 @@ def main() -> int:
             mx.synchronize()
             samples[c].append((time.perf_counter() - t0) * 1e3)
 
-    print(f"\n{'m':>4}{'stock ms':>11}{'hexpack ms':>13}{'delta':>9}"
-          f"{'stock %roof':>13}{'hexpack %roof':>15}")
+    print(
+        f"\n{'m':>4}{'stock ms':>11}{'hexpack ms':>13}{'delta':>9}"
+        f"{'stock %roof':>13}{'hexpack %roof':>15}"
+    )
     losses = 0
     for m in ms:
         s = statistics.median(samples[(m, False)])
         v = statistics.median(samples[(m, True)])
         if m == 4 and bits == 6 and v > s:
             losses += 1
-        print(f"{m:>4}{s:>11.2f}{v:>13.2f}{(v / s - 1) * 100:>+8.1f}%"
-              f"{100 * floor_ms / s:>12.0f}%{100 * floor_ms / v:>14.0f}%")
+        print(
+            f"{m:>4}{s:>11.2f}{v:>13.2f}{(v / s - 1) * 100:>+8.1f}%"
+            f"{100 * floor_ms / s:>12.0f}%{100 * floor_ms / v:>14.0f}%"
+        )
     if bits == 6:
-        print("\nm=4 hexpack slower than stock in this synthetic sweep: "
-              f"{'YES' if losses else 'no'}")
+        print(
+            "\nm=4 hexpack slower than stock in this synthetic sweep: "
+            f"{'YES' if losses else 'no'}"
+        )
     return 0
 
 
