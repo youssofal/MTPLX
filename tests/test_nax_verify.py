@@ -271,7 +271,24 @@ def test_vk_qmm6_m4_env_flag(monkeypatch) -> None:
 
 
 def test_vk_qmm6_benchmark_order_balances_positions_and_carryover() -> None:
-    from benchmarks.repro_vk_qmm6_m4_route import balanced_order
+    # The reproducer lives in the repo-root benchmarks/ directory, which the
+    # tracked tests/benchmarks package shadows on sys.path under pytest, so it
+    # is loaded by file path rather than as a package import.
+    import importlib.util
+    from pathlib import Path
+
+    module_path = (
+        Path(__file__).resolve().parent.parent
+        / "benchmarks"
+        / "repro_vk_qmm6_m4_route.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "repro_vk_qmm6_m4_route", module_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    balanced_order = module.balanced_order
 
     cells = list(range(6))
     orders = [balanced_order(cells, round_index) for round_index in range(6)]
