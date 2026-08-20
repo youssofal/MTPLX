@@ -12,8 +12,9 @@ stay on stock.
 
 Every (m, kernel) cell is re-measured once per round in a Williams balanced
 order, so every cell occupies every timing position and immediately follows
-every other cell once per complete block. An earlier fixed-order version of
-this benchmark disagreed with itself by 45% on one cell.
+every other cell once per complete block. An earlier fixed-order version
+produced self-inconsistent results on the same cell, larger than the effect
+being measured, which is why rounds are interleaved.
 
 Production-trunk observation provenance (policy basis):
     Hardware: Apple M3 Max (applegpu_g15s), 64 GB RAM
