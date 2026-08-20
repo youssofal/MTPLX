@@ -46,8 +46,8 @@ def vk_qmm6_m4_enabled() -> bool:
     tensor re-timed in a loop.
 
     Whole-model sweep, Qwen3.8-27B shapes (64 layers + lm_head, 19.37 GiB
-    of 6-bit weights, group_size 64, fp16 activations), every cell
-    re-measured once per round with rounds interleaved, medians of 7 to 9:
+    of 6-bit weights, group_size 64, fp16 activations), with the production
+    N >= 2048 route floor and Williams-balanced cell order:
 
         bits=6   m=4   stock 63.3-64.7 ms   hexpack 77.5-82.8 ms   +20 to +30%
         bits=6   m=5   stock 82.8-87.3 ms   hexpack 67.3-67.7 ms   -19 to -22%
@@ -1043,7 +1043,7 @@ def install_nax_qlinear_patch() -> dict[str, object]:
             m = 1
             for d in x.shape[:-1]:
                 m *= int(d)
-            if 4 <= m <= 6:
+            if 4 <= m <= 6 and (m != 4 or vk_qmm6_m4_enabled()):
                 w_q = self["weight"]
                 k = int(x.shape[-1])
                 n = int(w_q.shape[0])
@@ -1051,7 +1051,6 @@ def install_nax_qlinear_patch() -> dict[str, object]:
                 if (
                     m == 4
                     and n >= 2048
-                    and vk_qmm6_m4_enabled()
                     and not lane_disabled("qmm_m4")
                     and vk_eligible_ksplit(m, k, n, bits, group_size, x.dtype)
                 ):

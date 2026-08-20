@@ -215,10 +215,11 @@ def test_qlinear_patch_routes_6bit_verify_shapes(monkeypatch) -> None:
 
     from mtplx.attention_context import attention_phase
 
-    import mtplx.nax_verify  # noqa: F401  (patch reads through the module)
+    import mtplx.nax_verify as nax_verify
 
     verify_kernels.vk_qmm_m4_ksplit = counting4
     verify_kernels.vk_qmm_m6_ksplit = counting6
+    fallback_before = dict(nax_verify.nax_qlinear_fallback_counts)
     try:
         big = nn.QuantizedLinear(512, 2048, bias=False, group_size=64, bits=6)
         small = nn.QuantizedLinear(512, 256, bias=False, group_size=64, bits=6)
@@ -227,6 +228,11 @@ def test_qlinear_patch_routes_6bit_verify_shapes(monkeypatch) -> None:
         with attention_phase("decode_verify"):
             mx.eval(big(x4))
             assert calls["m4"] == 0, "6-bit m4 route must be opt-in"
+            assert (
+                nax_verify.nax_qlinear_fallback_counts.get("b6_m4", 0)
+                - fallback_before.get("b6_m4", 0)
+                == 0
+            ), "disabled m4 route must not report a fallback"
             mx.eval(big(x5))
             assert calls["m6"] == 1, "6-bit m5 verify shape did not route the hexpack kernel"
             mx.eval(small(x5))
@@ -242,6 +248,11 @@ def test_qlinear_patch_routes_6bit_verify_shapes(monkeypatch) -> None:
             assert calls["m4"] == 1, "MTPLX_VK_QMM6_M4=1 did not restore the m4 route"
             mx.eval(small(x4))
             assert calls["m4"] == 1, "small-N must stay stock even when opted in"
+            assert (
+                nax_verify.nax_qlinear_fallback_counts.get("b6_m4", 0)
+                - fallback_before.get("b6_m4", 0)
+                == 1
+            ), "opted-in m4 eligibility failures must report a fallback"
     finally:
         verify_kernels.vk_qmm_m4_ksplit = orig4
         verify_kernels.vk_qmm_m6_ksplit = orig6
@@ -259,6 +270,25 @@ def test_vk_qmm6_m4_env_flag(monkeypatch) -> None:
     for off in ("0", "false", "no", "off", ""):
         monkeypatch.setenv("MTPLX_VK_QMM6_M4", off)
         assert vk_qmm6_m4_enabled() is False
+
+
+def test_vk_qmm6_benchmark_order_balances_positions_and_carryover() -> None:
+    from benchmarks.repro_vk_qmm6_m4_route import balanced_order
+
+    cells = list(range(6))
+    orders = [balanced_order(cells, round_index) for round_index in range(6)]
+    positions = {
+        (position, cell)
+        for order in orders
+        for position, cell in enumerate(order)
+    }
+    carryovers = {
+        (before, after)
+        for order in orders
+        for before, after in zip(order, order[1:])
+    }
+    assert len(positions) == 36
+    assert len(carryovers) == 30
 
 
 def test_4bit_m4_route_is_unaffected_by_the_6bit_gate(monkeypatch) -> None:

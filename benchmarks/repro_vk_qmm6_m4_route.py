@@ -6,15 +6,29 @@ whichever kernel has the better launch geometry. A real decode round touches
 every layer's weights exactly once, so the whole model streams from DRAM.
 This builds the full Qwen3.8-27B linear stack at a chosen bit width and
 sweeps it once per iteration, which reproduces that traffic. Weight VALUES
-are random (timing does not depend on them), so no checkpoint is needed.
+are random (timing does not depend on them), so no checkpoint is needed. The
+hexpack cell uses the production N >= 2048 route floor; smaller projections
+stay on stock.
 
-Every (m, kernel) cell is re-measured once per round with the rounds
-interleaved, so run order and thermal drift cannot ride along with the cell
-index. An earlier fixed-order version of this same benchmark disagreed with
-itself by 45% on one cell for exactly that reason.
+Every (m, kernel) cell is re-measured once per round in a Williams balanced
+order, so every cell occupies every timing position and immediately follows
+every other cell once per complete block. An earlier fixed-order version of
+this benchmark disagreed with itself by 45% on one cell.
 
-Measured on Apple M3 Max (applegpu_g15s), MLX 0.32.1, macOS 26.3, as the
-range over three independent runs:
+Recorded measurement provenance:
+    Hardware: Apple M3 Max (applegpu_g15s), 64 GB RAM
+    OS/runtime: macOS 26.3.1, MLX 0.32.1
+    Model: synthetic Qwen3.8-27B linear-stack shapes
+    Quantization: 6-bit and 4-bit affine, group_size=64, fp16 activations
+    Sampler settings: N/A (synthetic kernel sweep)
+    Prompt suite: N/A (synthetic kernel sweep)
+    Token count: N/A (one full linear-stack sweep per sample)
+    Profile: N/A (standalone reproducer)
+    Fan mode: automatic; no fan override
+    Date: 2026-08-19
+    Measured commit: 32c842935fb2ee6d2a437fadee8f46bd8fdcd4b8
+
+Results are the range over three independent runs:
 
     bits=6  m=4   stock  63.3-64.7 ms   hexpack  77.5-82.8 ms   +20 to +30%  LOSS
     bits=6  m=5   stock  82.8-87.3 ms   hexpack  67.3-67.7 ms   -19 to -22%  win
@@ -101,7 +115,7 @@ def make_forward(layers, lm, bits, m, use_vk):
     mx.eval(list(xs.values()))
 
     def call(K, N, wq, sc, bi):
-        if use_vk and vk_eligible_ksplit(m, K, N, bits, GS, DT):
+        if use_vk and N >= 2048 and vk_eligible_ksplit(m, K, N, bits, GS, DT):
             fn = vk_qmm_m4_ksplit if m == 4 else vk_qmm_m6_ksplit
             return fn(xs[K], wq, sc, bi, bits=bits, group_size=GS)
         return mx.quantized_matmul(xs[K], wq, sc, bi, transpose=True,
@@ -115,10 +129,22 @@ def make_forward(layers, lm, bits, m, use_vk):
     return forward
 
 
+def balanced_order(cells, round_index):
+    count = len(cells)
+    base = [0]
+    for position in range(1, count):
+        if position % 2:
+            base.append((position + 1) // 2)
+        else:
+            base.append(count - position // 2)
+    offset = round_index % count
+    return [cells[(index + offset) % count] for index in base]
+
+
 def main() -> int:
     bits = int(sys.argv[1]) if len(sys.argv) > 1 else 6
     ms = [int(v) for v in (sys.argv[2] if len(sys.argv) > 2 else "4,5,6").split(",")]
-    rounds = int(sys.argv[3]) if len(sys.argv) > 3 else 9
+    rounds = int(sys.argv[3]) if len(sys.argv) > 3 else 12
 
     gbs = roofline()
     layers, lm, total = build(bits)
@@ -134,8 +160,8 @@ def main() -> int:
     mx.synchronize()
 
     samples: dict = {c: [] for c in cells}
-    for _ in range(rounds):
-        for c in cells:               # interleaved: no cell owns a run phase
+    for round_index in range(rounds):
+        for c in balanced_order(cells, round_index):
             t0 = time.perf_counter()
             fns[c]()
             mx.synchronize()
