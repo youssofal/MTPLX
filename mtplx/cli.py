@@ -674,6 +674,21 @@ def _add_bridge_prompt_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_dflash2_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--backend-id",
+        default=None,
+        help="Select the DFlash2 backend explicitly; bundles auto-detect it.",
+    )
+    parser.add_argument(
+        "--draft-block-size",
+        type=_positive_int,
+        help="DFlash2 draft block size; defaults to 5 for DFlash2 bundles.",
+    )
+    parser.add_argument("--dflash2-bundle", help=argparse.SUPPRESS)
+    parser.add_argument("--dflash2-draft-model", help=argparse.SUPPRESS)
+
+
 def _add_mtp_toggle_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--mtp",
@@ -2294,6 +2309,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.0,
     )
     start_flow_p.add_argument("--depth", type=int, default=3)
+    _add_dflash2_args(start_flow_p)
     _add_mtp_toggle_args(start_flow_p)
     start_flow_p.add_argument("--seed", type=int, default=0)
     _add_reasoning_arg(start_flow_p)
@@ -2535,6 +2551,7 @@ def build_parser() -> argparse.ArgumentParser:
     ask_p.add_argument("--top-p", type=float, default=0.95)
     ask_p.add_argument("--top-k", type=int, default=20)
     ask_p.add_argument("--depth", type=int, default=3)
+    _add_dflash2_args(ask_p)
     _add_mtp_toggle_args(ask_p)
     ask_p.add_argument("--seed", type=int, default=0)
     _add_reasoning_arg(ask_p)
@@ -2640,6 +2657,7 @@ def build_parser() -> argparse.ArgumentParser:
     quickstart_server_p.add_argument("--dry-run", action="store_true", help="Preview the server launch command without loading MLX")
     quickstart_server_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON for --dry-run and errors")
     quickstart_server_p.add_argument("--depth", type=int, default=3)
+    _add_dflash2_args(quickstart_server_p)
     _add_mtp_toggle_args(quickstart_server_p)
     quickstart_server_p.add_argument(
         "--api-key",
@@ -3412,6 +3430,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--top-p", type=float, default=0.95)
     run_p.add_argument("--top-k", type=int, default=20)
     run_p.add_argument("--depth", type=int, default=3)
+    _add_dflash2_args(run_p)
     _add_mtp_toggle_args(run_p)
     run_p.add_argument("--seed", type=int, default=0)
     _add_reasoning_arg(run_p)
@@ -3518,6 +3537,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable API-key auth for localhost binds (non-localhost still requires a key)",
     )
     serve_p.add_argument("--depth", type=int, default=3)
+    _add_dflash2_args(serve_p)
     _add_mtp_toggle_args(serve_p)
     serve_p.add_argument(
         "--generation-mode",

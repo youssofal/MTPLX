@@ -16,6 +16,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from mtplx.dflash2_bundle import DFLASH2_ARCH_ID, DFLASH2_BACKEND
+
 
 ASSISTANT_MODEL_ATTRS = ("assistant_model", "gemma_assistant_model")
 TARGET_DISTRIBUTION_MODE_ATTRS = (
@@ -571,6 +573,8 @@ def draft_semantics_for_model(
     descriptor: BackendDescriptor | None = None,
 ) -> DraftSemantics:
     resolved = descriptor or descriptor_from_inspection(inspection)
+    if resolved.backend_id == DFLASH2_BACKEND:
+        return resolved.draft_semantics
     family = model_family_from_inspection(
         inspection,
         model_ref=model_ref,
@@ -581,6 +585,50 @@ def draft_semantics_for_model(
     if family == "qwen4_exp":
         return QWEN4_EXP_DRAFT_SEMANTICS
     return resolved.draft_semantics
+
+
+DFLASH2_DESCRIPTOR = BackendDescriptor(
+    backend_id=DFLASH2_BACKEND,
+    architecture_id=DFLASH2_ARCH_ID,
+    model_family="qwen3_8",
+    display_name="Qwen3.8 DFlash2",
+    artifact_layout="dflash2_bundle",
+    runtime_capabilities=(
+        "target_logits",
+        "external_dflash2_drafter",
+        "exact_speculative_sampling",
+        "dflash2_candidate_selection",
+    ),
+    sampler_defaults=QWEN3_8_SAMPLER_DEFAULTS,
+    reasoning_codec=QWEN3_8_REASONING_CODEC,
+    draft_semantics=DraftSemantics(
+        request_field="draft_block_size",
+        display_label="DFlash2 block",
+        default=5,
+        minimum=1,
+        maximum=8,
+        unit="block",
+    ),
+    uses_external_assistant=True,
+    uses_draft_lm_head=False,
+    hidden_variant="post_norm",
+    tune_policy=TunePolicy(
+        supported=False,
+        supported_families=(),
+        unsupported_reason="Tune is not supported for the external DFlash2 drafter.",
+    ),
+    kv_quant_policy=KVQuantPolicy(
+        supported=False,
+        disabled_reason="KV quantization is not supported for DFlash2.",
+    ),
+    validation_status="artifact_contract_gated",
+    status="artifact_contract_gated",
+    profile_policy="backend-aware-sustained",
+    notes=(
+        "DFlash2 is a separate drafter architecture under dflash2/, not a native mtp.* sidecar.",
+        "The bundle manifest pins target and draft revisions and the Qwen3.8 sampler.",
+    ),
+)
 
 
 LAGUNA_AR_DESCRIPTOR = BackendDescriptor(
@@ -1032,6 +1080,7 @@ GEMMA4_ASSISTANT_DESCRIPTOR = BackendDescriptor(
 
 DESCRIPTORS_BY_BACKEND_ID: dict[str, BackendDescriptor] = {
     QWEN3_NEXT_DESCRIPTOR.backend_id: QWEN3_NEXT_DESCRIPTOR,
+    DFLASH2_DESCRIPTOR.backend_id: DFLASH2_DESCRIPTOR,
     LAGUNA_AR_DESCRIPTOR.backend_id: LAGUNA_AR_DESCRIPTOR,
     MLX_LM_AR_DESCRIPTOR.backend_id: MLX_LM_AR_DESCRIPTOR,
     NATIVE_CONTRACT_DESCRIPTOR.backend_id: NATIVE_CONTRACT_DESCRIPTOR,
@@ -1205,6 +1254,8 @@ def model_family_from_inspection(
         return "qwen4_exp"
     if backend_id == GEMMA4_ASSISTANT_DESCRIPTOR.backend_id or "gemma4" in text or "gemma-4" in text:
         return "gemma4"
+    if backend_id == DFLASH2_BACKEND or DFLASH2_BACKEND in text:
+        return "qwen3_8"
     if backend_id == STEP3P5_MTP_DESCRIPTOR.backend_id or "step3p5" in text or "step3p7" in text or "step-3.7" in text:
         return "step"
     if backend_id == DEEPSEEK_MTP_DESCRIPTOR.backend_id or "deepseek" in text:
@@ -1235,6 +1286,8 @@ def tune_policy_for_model(
         model_ref=model_ref,
         descriptor=descriptor,
     )
+    if descriptor.backend_id == DFLASH2_DESCRIPTOR.backend_id:
+        return descriptor.tune_policy
     if family in {"qwen3_5", "qwen3_6"}:
         return TunePolicy(supported=True)
     if family == "qwen3_8":
@@ -1275,6 +1328,8 @@ def kv_quant_policy_for_model(
         model_ref=model_ref,
         descriptor=descriptor,
     )
+    if descriptor.backend_id == DFLASH2_DESCRIPTOR.backend_id:
+        return descriptor.kv_quant_policy
     if family in {"qwen3_5", "qwen3_6", "qwen3_8"}:
         return QWEN3_NEXT_DESCRIPTOR.kv_quant_policy
     if family == "gemma4":

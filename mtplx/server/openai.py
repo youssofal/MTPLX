@@ -66,6 +66,12 @@ from fastapi.responses import (
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from mtplx import progress_heartbeat
+from mtplx.dflash2_bundle import (
+    DFLASH2_BACKEND as DFLASH2_BACKEND_ID,
+    DFLASH2_DEFAULT_SAMPLER as DFLASH2_SAMPLER_DEFAULTS,
+    DFLASH2_MANIFEST,
+    resolve_dflash2_bundle_paths,
+)
 from mtplx.a3b_mtp_batch import (
     A3B_MTP_BATCH_MAX_CONTEXT_TOKENS,
     A3BMTPBatchCapacityError,
@@ -213,6 +219,18 @@ ADVERTISED_SCHEDULER_MODES = tuple(
 )
 BATCHING_PRESET_CHOICES = tuple(preset.value for preset in SchedulerPreset)
 _STDOUT_LOGGING_BROKEN = False
+
+
+def _dflash2_descriptor() -> Any | None:
+    for module_name in ("mtplx.backends.descriptors", "mtplx.backends.dflash2"):
+        try:
+            module = __import__(module_name, fromlist=["DFLASH2_DESCRIPTOR"])
+            descriptor = getattr(module, "DFLASH2_DESCRIPTOR", None)
+        except (ImportError, AttributeError):
+            continue
+        if descriptor is not None and getattr(descriptor, "backend_id", None) == DFLASH2_BACKEND_ID:
+            return descriptor
+    return None
 
 
 def _safe_stdout_print(*values: Any, **kwargs: Any) -> bool:
@@ -2018,7 +2036,10 @@ def _kernel_selfcheck_health_payload() -> dict[str, Any]:
 
 
 def _backend_descriptor(state: "ServerState") -> BackendDescriptor:
-    descriptor = getattr(state, "backend_descriptor", None)
+    requested = str(getattr(getattr(state, "args", None), "backend_id", "") or "").strip().lower()
+    descriptor = (
+        _dflash2_descriptor() if requested == DFLASH2_BACKEND_ID else None
+    ) or getattr(state, "backend_descriptor", None)
     if descriptor is None:
         descriptor = descriptor_from_runtime(
             getattr(state, "runtime", None),
@@ -2832,6 +2853,16 @@ class ServerState:
         _validate_mtp_batch_settings(args)
         _validate_hyper_settings(args)
         self.args = args
+        requested_backend = str(getattr(args, "backend_id", "") or "").strip().lower()
+        if requested_backend in {"llama.cpp", "llama_cpp", "llamacpp"}:
+            raise ValueError("llama.cpp is not a supported MTPLX backend")
+        if requested_backend == DFLASH2_BACKEND_ID:
+            bundle = resolve_dflash2_bundle_paths(args.model)
+            if bundle is None:
+                raise ValueError("--backend-id dflash2 requires a valid DFlash2 bundle")
+            args.dflash2_bundle = bundle
+            args.dflash2_target_model = bundle.get("target_model")
+            args.dflash2_draft_model = bundle.get("draft_model")
         try:
             args.paged_kv_quantization = normalize_paged_kv_quantization(
                 getattr(args, "paged_kv_quantization", "off")
@@ -3070,6 +3101,11 @@ class ServerState:
         if isinstance(pinned_limit, int) and pinned_limit > 0:
             self.runtime.metal_memory_limit_bytes = int(pinned_limit)
         self.backend_descriptor = descriptor_from_runtime(self.runtime, args)
+        if requested_backend == DFLASH2_BACKEND_ID and getattr(self.runtime, "backend_id", None) != DFLASH2_BACKEND_ID:
+            raise RuntimeError(
+                "DFlash2 was requested but the loaded runtime did not select "
+                "backend_id=dflash2; refusing native-MTP fallback"
+            )
         args.backend_id = self.backend_descriptor.backend_id
         if self.backend_descriptor.uses_draft_lm_head:
             _startup_line("[5/6] Installing native-MTP draft head")
@@ -23832,6 +23868,19 @@ def _run_generation(
     constraint_spec: Any | None = None,
     prefill_chunk_tokens: int | None = None,
 ) -> dict[str, Any]:
+    backend_id = str(
+        getattr(state.runtime, "backend_id", None)
+        or getattr(state.args, "backend_id", None)
+        or ""
+    ).strip().lower()
+    if backend_id == DFLASH2_BACKEND_ID:
+        # DFlash2 can retain the passive request/session identity, but its
+        # runtime cannot export or commit a final KV state.  Leave direct
+        # runtime validation intact by removing the bank only at this server
+        # generation boundary.
+        session_bank = None
+        commit_final_state_to_bank = False
+        commit_prompt_prefix_to_bank = False
     response_max, sampler, generation_limits = _generation_params(
         state,
         prompt_token_count=len(prompt_ids),
@@ -35496,6 +35545,59 @@ def _apply_backend_server_defaults(
     *,
     explicit_flags: set[str],
 ) -> None:
+    requested_backend = str(getattr(args, "backend_id", "") or "").strip().lower()
+    if requested_backend in {"llama.cpp", "llama_cpp", "llamacpp"}:
+        raise ValueError("llama.cpp is not a supported MTPLX backend")
+    dflash2_bundle = None
+    model_ref = str(getattr(args, "model", "") or "")
+    manifest = Path(model_ref).expanduser() / DFLASH2_MANIFEST
+    if requested_backend == DFLASH2_BACKEND_ID or manifest.is_file():
+        dflash2_bundle = resolve_dflash2_bundle_paths(model_ref)
+        if dflash2_bundle is None:
+            raise ValueError("invalid DFlash2 bundle; refusing native-MTP fallback")
+        args.dflash2_bundle = dflash2_bundle
+        args.dflash2_target_model = dflash2_bundle.get("target_model")
+        args.dflash2_draft_model = dflash2_bundle.get("draft_model")
+        target_only = (
+            str(getattr(args, "generation_mode", "mtp") or "mtp").lower() == "ar"
+            or getattr(args, "load_mtp", True) is False
+        )
+        if target_only:
+            args.model = str(dflash2_bundle["target_model"])
+            args.backend_id = "qwen3_next"
+            args.generation_mode = "ar"
+            args.load_mtp = False
+        else:
+            args.backend_id = DFLASH2_BACKEND_ID
+            if not _server_flag_present(explicit_flags, "temperature", "default-temperature"):
+                args.temperature = DFLASH2_SAMPLER_DEFAULTS["temperature"]
+            if not _server_flag_present(explicit_flags, "top-p", "default-top-p"):
+                args.top_p = DFLASH2_SAMPLER_DEFAULTS["top_p"]
+            if not _server_flag_present(explicit_flags, "top-k"):
+                args.top_k = DFLASH2_SAMPLER_DEFAULTS["top_k"]
+            if not _server_flag_present(explicit_flags, "draft-temperature"):
+                args.draft_temperature = DFLASH2_SAMPLER_DEFAULTS["temperature"]
+            if not _server_flag_present(explicit_flags, "draft-top-p"):
+                args.draft_top_p = DFLASH2_SAMPLER_DEFAULTS["top_p"]
+            if not _server_flag_present(explicit_flags, "draft-top-k"):
+                args.draft_top_k = DFLASH2_SAMPLER_DEFAULTS["top_k"]
+            depth_explicit = any(
+                _server_flag_present(explicit_flags, flag)
+                for flag in (
+                    "depth",
+                    "mtp-depth",
+                    "speculative-depth",
+                    "draft-block-size",
+                    "gemma-draft-block-size",
+                )
+            )
+            if not depth_explicit:
+                args.depth = 5
+                args.draft_block_size = 5
+            elif not _server_flag_present(
+                explicit_flags, "draft-block-size", "gemma-draft-block-size"
+            ):
+                args.draft_block_size = int(args.depth)
     if not _server_flag_present(
         explicit_flags, "backend-id"
     ) and _model_ref_is_gemma4_pair(getattr(args, "model", None)):
@@ -35732,6 +35834,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--backend-id", default="qwen3_next", help=argparse.SUPPRESS)
+    parser.add_argument("--dflash2-bundle", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--dflash2-draft-model", default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--assistant-model",
         "--gemma-assistant-model",

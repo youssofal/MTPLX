@@ -509,6 +509,7 @@ class ModelInspection:
     backend_status: str | None = None
     backend_artifact: dict[str, Any] | None = None
     gemma4_pair: dict[str, Any] | None = None
+    dflash2_bundle: dict[str, Any] | None = None
 
     @property
     def passes_primary_gate(self) -> bool:
@@ -555,6 +556,7 @@ class ModelInspection:
             "backend_status": self.backend_status,
             "backend_artifact": self.backend_artifact,
             "gemma4_pair": self.gemma4_pair,
+            "dflash2_bundle": self.dflash2_bundle,
             "mtp_supported": self.compatibility.get("mtp_supported"),
             "mtp_arch": self.compatibility.get("arch_id"),
             "recommended_backend": self.compatibility.get("recommended_backend"),
@@ -1161,6 +1163,61 @@ def inspect_model(model_dir: Path | str) -> ModelInspection:
     if repo_id is not None:
         return _inspect_hf_model(repo_id)
     model_path = Path(model_dir)
+    try:
+        from .dflash2_bundle import (
+            dflash2_bundle_inspection,
+            is_dflash2_bundle_candidate,
+            resolve_dflash2_bundle_paths,
+        )
+    except ImportError:
+        dflash_candidate = False
+        dflash_paths = None
+    else:
+        dflash_candidate = is_dflash2_bundle_candidate(model_path)
+        try:
+            dflash_paths = resolve_dflash2_bundle_paths(model_path)
+        except (OSError, TypeError, ValueError):
+            dflash_paths = None
+    if dflash_candidate:
+        payload = dflash2_bundle_inspection(
+            model_ref=str(model_path),
+            bundle_root=model_path,
+            paths=dflash_paths,
+        )
+        target_path = Path(payload["runtime_model"]) if payload.get("runtime_model") else model_path / "target"
+        try:
+            target_config = load_config(target_path)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            target_config = {}
+        tcfg = text_config(target_config)
+        archs = target_config.get("architectures") or tcfg.get("architectures") or []
+        target_files = tuple(
+            sorted(
+                str(path.relative_to(target_path))
+                for path in target_path.rglob("*.safetensors")
+                if path.is_file()
+            )
+        ) if target_path.is_dir() else ()
+        return ModelInspection(
+            model_dir=str(model_path),
+            source="local",
+            config_exists=bool(target_config),
+            architecture=str(payload.get("architecture") or (archs[0] if archs else "DFlash2Qwen38Bundle")),
+            model_type="dflash2_bundle",
+            mtp_num_hidden_layers=0,
+            hidden_size=tcfg.get("hidden_size"),
+            num_hidden_layers=tcfg.get("num_hidden_layers"),
+            vocab_size=tcfg.get("vocab_size"),
+            quantization=target_config.get("quantization_config") or target_config.get("quantization") or {},
+            sidecars={name: False for name in MULTIMODAL_SIDECARS},
+            model_files=target_files,
+            runtime_model=payload.get("runtime_model"),
+            assistant_model=payload.get("draft_model"),
+            recommended_sampler=payload.get("recommended_sampler"),
+            backend_status="artifact_contract_gated",
+            dflash2_bundle=payload.get("dflash2_bundle"),
+            compatibility=payload.get("compatibility") or {},
+        )
     try:
         from .gemma4_pair import gemma4_pair_inspection, resolve_gemma4_pair_paths
     except Exception:

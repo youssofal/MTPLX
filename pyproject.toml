@@ -74,6 +74,9 @@ Citation = "https://github.com/youssofal/mtplx/blob/main/CITATION.cff"
 competitors = [
   "dflash-mlx==0.1.0",
 ]
+dflash2 = [
+  "dflash==0.1.0",
+]
 server = [
   "fastapi>=0.136",
   "llguidance>=1.7",
