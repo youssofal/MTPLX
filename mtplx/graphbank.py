@@ -1946,6 +1946,24 @@ class CompiledVerifyBank:
 
     def _resolve_bucket(self, cache: Any, length: int) -> int | None:
         """Static paged-attention ceiling for this call, or None on overflow."""
+        # Batched: per-entry size() forces a serial sync after trim/rollback.
+        if str(
+            os.environ.get("MTPLX_BATCH_PAGED_OFFSETS", "1")
+        ).strip().lower() not in {"0", "off", "false", "no"}:
+            paged_offsets = []
+            for spec_idx, spec_kind, _n in self._spec or []:
+                if spec_kind != VERIFY_SPEC_KIND_FULL_ATTN:
+                    continue
+                spec_entry = cache[spec_idx]
+                if not hasattr(spec_entry, "capacity"):
+                    continue
+                entry_state = getattr(spec_entry, "cache", None)
+                if isinstance(entry_state, (list, tuple)) and len(entry_state) > 2:
+                    entry_offset = entry_state[2]
+                    if isinstance(entry_offset, mx.array):
+                        paged_offsets.append(entry_offset)
+            if paged_offsets:
+                mx.eval(*paged_offsets)
         max_needed = 0
         min_capacity: int | None = None
         for idx, kind, _n in self._spec or []:
