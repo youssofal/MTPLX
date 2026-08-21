@@ -3028,12 +3028,19 @@ def forward_with_gdn_capture(
                 h = hidden_states + r
                 mlp_input = layer.post_attention_layernorm(h)
             else:
+                # 512 diverges from the unfused reference above 64 rows; None is exact.
+                _fused_norm_tg_raw = os.environ.get(
+                    "MTPLX_FUSE_POST_NORM_RESIDUAL_TG", ""
+                ).strip()
+                _fused_norm_tg = (
+                    int(_fused_norm_tg_raw) if _fused_norm_tg_raw.isdigit() else None
+                )
                 h, mlp_input = fused_add_rmsnorm(
                     hidden_states,
                     r,
                     layer.post_attention_layernorm.weight,
                     layer.post_attention_layernorm.eps,
-                    threadgroup_size=512,
+                    threadgroup_size=_fused_norm_tg,
                 )
         else:
             h = hidden_states + r
