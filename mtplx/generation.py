@@ -7189,6 +7189,8 @@ def generate_mtpk(
     accept_probability_sum_by_depth = [0.0 for _ in range(speculative_depth)]
     deferred_correction_repairs = 0
     pending_primary: int | None = None
+    _known_primary_next: int | None = None
+    _known_primary_hits = 0
     online_hidden_deltas: dict[object, mx.array] = {}
     online_hidden_update_counts: dict[object, int] = {}
     online_hidden_apply_counts: dict[object, int] = {}
@@ -8015,6 +8017,8 @@ def generate_mtpk(
                 append_event({"step": len(tokens), "constraint_stop": True})
                 break
         primary_already_emitted = pending_primary is not None
+        # Consume and clear: an earlier cycle's row must not reach other logits.
+        _known_primary, _known_primary_next = _known_primary_next, None
         if pending_primary is None:
             primary_row = logits[0]
             if constraint is not None:
@@ -8023,15 +8027,35 @@ def generate_mtpk(
                 # Speculative windows are handled by the legality clamp below
                 # instead of per-row masks (see #186 phase 3).
                 primary_row = constraint.mask_logits_row(primary_row)
-            primary, _ = _sample_from_logits(
-                primary_row,
-                sampler,
-                rng,
-                token_counts=Counter(tokens) if _penalties_active else None,
-                penalty_overlay=(
-                    _steer_overlay(tokens) if _steer_active else None
-                ),
+            _known_primary_usable = (
+                _known_primary is not None
+                and constraint is None
+                and sampler.temperature <= 0
+                and not _penalties_active
+                and not _steer_active
             )
+            if _known_primary_usable and not _env_truthy(
+                "MTPLX_KNOWN_PRIMARY_ASSERT"
+            ):
+                primary = int(_known_primary)
+                _known_primary_hits += 1
+            else:
+                primary, _ = _sample_from_logits(
+                    primary_row,
+                    sampler,
+                    rng,
+                    token_counts=Counter(tokens) if _penalties_active else None,
+                    penalty_overlay=(
+                        _steer_overlay(tokens) if _steer_active else None
+                    ),
+                )
+                if _known_primary_usable:
+                    _known_primary_hits += 1
+                    if int(_known_primary) != int(primary):
+                        raise RuntimeError(
+                            "known-primary self-check failed: published "
+                            f"{int(_known_primary)} != sampled {int(primary)}"
+                        )
             if first_primary_sample_time_s == 0.0:
                 # First primary token sampled: any lazy tail forced by
                 # touching the seed logits has just been paid. Passive read.
@@ -10210,6 +10234,17 @@ def generate_mtpk(
             repair_logits[:, -1, :],
             repair_hidden[:, -1:, :],
         )
+        # Capture/trim commits only: `logits` is verify_logits[:, accepted_count, :].
+        if (
+            (committed_from_capture or committed_from_trim)
+            and rejection_correction is None
+            and constraint is None
+            and _batched_target_tokens is not None
+            and len(_batched_target_tokens) > accepted_count
+            and str(os.environ.get("MTPLX_KNOWN_PRIMARY_CARRYOVER", "1")).strip().lower()
+            not in {"0", "off", "false", "no"}
+        ):
+            _known_primary_next = int(_batched_target_tokens[accepted_count])
         maybe_rebase_decode_state(cache_committed_token_count)
         maybe_eval_state_roots(event, cache_committed_token_count)
         append_event(event)
@@ -10310,6 +10345,12 @@ def generate_mtpk(
             )
 
     emit_trace(force=True, final=True)
+    if _known_primary_hits and _env_truthy("MTPLX_KNOWN_PRIMARY_STATS"):
+        print(
+            f"[mtplx] known-primary cycles: {_known_primary_hits} / {step}",
+            file=sys.stderr,
+            flush=True,
+        )
     compiled_verify_report: dict[str, Any] | None = None
     if a3b_target_prefix_route is not None:
         compiled_verify_report = a3b_target_prefix_route.final_report(
