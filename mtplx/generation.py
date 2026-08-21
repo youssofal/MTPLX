@@ -8699,7 +8699,100 @@ def generate_mtpk(
                     "requested": "device",
                     "reason": "ineligible_contract",
                 }
-        for depth_index in range(0 if used_device_core else cycle_depth):
+        _greedy_chain_used = False
+        if (
+            not used_device_core
+            and cycle_depth > 0
+            and draft_sampler.temperature <= 0
+            and sampler.temperature <= 0
+            and a3b_target_prefix_route is None
+            and _cc_draft_source_token is None
+            and constraint is None
+            and draft_margin_threshold is None
+            and adaptive_policy is None
+            and adaptive_width_policy is None
+            and mtp_corrector is None
+            and mtp_topk_reranker is None
+            and not adapter_ensemble_q
+            and not online_hidden_enabled
+            and not correction_cache_enabled
+            and not online_correction_cache
+            and not prompt_correction_cache
+            and not target_prefix_verify
+            and not _penalties_active
+            and not _steer_active
+            and mtp_cache is not None
+            and mtp_cache_policy == "persistent"
+            and _mtp_history_uses_committed_cache(mtp_history_policy)
+            and str(
+                os.environ.get("MTPLX_GREEDY_DRAFT_CHAIN", "1")
+            ).strip().lower()
+            not in {"0", "off", "false", "no"}
+        ):
+            _chain_started = time.perf_counter()
+            _chain_seed = int(next_token)
+            _chain_tok = mx.array([[_chain_seed]])
+            _chain_hidden = draft_hidden
+            _chain_pending: list[mx.array] = []
+            _chain_offsets: list[int | None] = []
+            for _chain_depth in range(cycle_depth):
+                _chain_offset = mtp_position_offset_for_cache(mtp_cache)
+                _chain_offsets.append(_chain_offset)
+                _chain_logits, _chain_hidden_next = rt.draft_mtp(
+                    _chain_hidden,
+                    _chain_tok,
+                    mtp_cache=mtp_cache,
+                    return_hidden=True,
+                    mtp_hidden_variant=mtp_hidden_variant,
+                    mtp_depth=_chain_depth + 1,
+                    position_offset=_chain_offset,
+                )
+                _chain_arg = mx.argmax(_chain_logits[:, -1, :][0], axis=-1)
+                _chain_pending.append(_chain_arg)
+                _chain_tok = _chain_arg.reshape(1, 1).astype(mx.int32)
+                _chain_hidden = _chain_hidden_next[:, -1:, :]
+                draft_hidden_for_update.append(_chain_hidden)
+            _eval(*_chain_pending, _chain_hidden)
+            _chain_tokens = [int(a.item()) for a in _chain_pending]
+            _chain_elapsed = time.perf_counter() - _chain_started
+            draft_time += _chain_elapsed
+            for _chain_index, _chain_token in enumerate(_chain_tokens):
+                _chain_source = (
+                    _chain_seed
+                    if _chain_index == 0
+                    else _chain_tokens[_chain_index - 1]
+                )
+                draft_hidden_update_keys.append(
+                    (_chain_index + 1, _chain_source)
+                    if online_hidden_corrector_key == "token"
+                    else _chain_index + 1
+                )
+                draft_tokens.append(_chain_token)
+                draft_probs.append(None)
+                drafted += 1
+                drafted_by_depth[_chain_index] += 1
+                _chain_event = {
+                    "depth": _chain_index + 1,
+                    "token": int(_chain_token),
+                    "timing_s": {
+                        "draft": _chain_elapsed
+                        if _chain_index == len(_chain_tokens) - 1
+                        else 0.0
+                    },
+                    "mtp_corrector": None,
+                    "draft_core": "greedy-chain",
+                }
+                if _chain_offsets[_chain_index] is not None:
+                    _chain_event["position_offset"] = int(
+                        _chain_offsets[_chain_index]
+                    )
+                event["drafts"].append(_chain_event)
+            draft_hidden = _chain_hidden
+            next_token = _chain_tokens[-1]
+            _greedy_chain_used = True
+        for depth_index in range(
+            0 if (used_device_core or _greedy_chain_used) else cycle_depth
+        ):
             source_token = int(next_token)
             step_mtp_cache = (
                 mtp_cache if mtp_cache_policy == "persistent" else rt.make_mtp_cache()
