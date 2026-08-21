@@ -9454,6 +9454,30 @@ def generate_mtpk(
             if constraint is not None
             else None
         )
+        _batched_target_tokens: list[int] | None = None
+        if (
+            sampler.temperature <= 0
+            and not _penalties_active
+            and not _steer_active
+            and len(draft_tokens) > 0
+            and int(verify_logits.shape[1]) >= len(draft_tokens)
+            and str(
+                os.environ.get("MTPLX_BATCHED_GREEDY_ACCEPT", "1")
+            ).strip().lower()
+            not in {"0", "off", "false", "no"}
+        ):
+            _batched_rows = len(draft_tokens)
+            if (
+                int(verify_logits.shape[1]) > len(draft_tokens)
+                and str(
+                    os.environ.get("MTPLX_BATCHED_ACCEPT_BONUS_ROW", "1")
+                ).strip().lower()
+                not in {"0", "off", "false", "no"}
+            ):
+                _batched_rows += 1
+            _batched_target_tokens = mx.argmax(
+                verify_logits[0, :_batched_rows, :], axis=-1
+            ).tolist()
         for depth_index, draft_token in enumerate(draft_tokens):
             target_logits_for_draft = verify_logits[:, depth_index, :]
             if _steer_active:
@@ -9471,16 +9495,19 @@ def generate_mtpk(
                 _working_counts.update(draft_tokens[:depth_index])
             target_p_for_cache = None
             if sampler.temperature <= 0:
-                _greedy_row = target_logits_for_draft[0]
-                if _penalties_active or _row_guard_overlay:
-                    _greedy_row = apply_penalties_mlx(
-                        _greedy_row,
-                        _working_counts if _penalties_active else None,
-                        sampler.presence_penalty,
-                        sampler.frequency_penalty,
-                        penalty_overlay=_row_guard_overlay,
-                    )
-                target_token = int(mx.argmax(_greedy_row, axis=-1).item())
+                if _batched_target_tokens is not None:
+                    target_token = int(_batched_target_tokens[depth_index])
+                else:
+                    _greedy_row = target_logits_for_draft[0]
+                    if _penalties_active or _row_guard_overlay:
+                        _greedy_row = apply_penalties_mlx(
+                            _greedy_row,
+                            _working_counts if _penalties_active else None,
+                            sampler.presence_penalty,
+                            sampler.frequency_penalty,
+                            penalty_overlay=_row_guard_overlay,
+                        )
+                    target_token = int(mx.argmax(_greedy_row, axis=-1).item())
                 accepted_now = draft_token == target_token
                 accept_prob = 1.0 if accepted_now else 0.0
                 correction = target_token
@@ -9831,6 +9858,14 @@ def generate_mtpk(
                         target_distributions[len(draft_tokens)],
                         rng,
                     )
+                elif (
+                    _batched_target_tokens is not None
+                    and len(_batched_target_tokens) > len(draft_tokens)
+                    and not lazy_bonus_verify
+                    and not _penalties_active
+                    and not _steer_active
+                ):
+                    bonus = int(_batched_target_tokens[len(draft_tokens)])
                 else:
                     started_bonus_distribution = time.perf_counter()
                     # all-accept bonus: tokens already includes the committed block,
