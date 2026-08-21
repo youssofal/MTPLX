@@ -55,6 +55,10 @@ PROFILE_ENV_USER_OVERRIDE_KEYS = frozenset(
         # config being shipped), not only on profiles that leave the env
         # unset. Same operator-A/B precedent as DONATION/MAX_CONTEXT.
         "MTPLX_COMPILED_VERIFY",
+        # Batched target-distribution lane is dead under the profile
+        # defaults; operators need launch-env A/B (generation.py:9298, :9403).
+        "MTPLX_LAZY_TARGET_DISTRIBUTIONS",
+        "MTPLX_BATCH_TARGET_ARRAYS",
         # Background warmup ladder (F6, 2026-08-16): operators sweep the
         # rung list per machine/benchmark; an explicit env must beat the
         # turbo default below, same precedent as the chunk-size knobs.
