@@ -794,6 +794,15 @@ def load(
         if moe_pack_gate_up_enabled():
             pack_report = configure_moe_packed_projections(model)
             logger.info("[moe-pack] %s", pack_report)
+        # Must run after MTP injection and after load-coverage validation.
+        from .proj_fusion import (
+            configure_fused_projections,
+            fuse_projections_enabled,
+        )
+
+        if fuse_projections_enabled():
+            fuse_report = configure_fused_projections(model)
+            logger.info("[proj-fusion] %s", fuse_report)
         from .nax_verify import install_nax_qlinear_patch, nax_env_enabled
 
         if nax_env_enabled():
