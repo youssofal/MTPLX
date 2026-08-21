@@ -303,6 +303,15 @@ def _install_draft_lm_head(rt: Any, *, bits: int, group_size: int, mode: str) ->
                 group_size=group_size,
                 mode=mode,
             )
+            # opt-in reduced-vocab draft head, active only via MTPLX_DRAFT_VOCAB_IDS
+            try:
+                from .reduced_vocab_draft import (
+                    maybe_wrap_draft_head as _mtplx_ext_wrap,
+                )
+
+                draft_head = _mtplx_ext_wrap(text, draft_head)
+            except Exception:  # pragma: no cover - never fail the load
+                pass
             layer.shared_head_head = draft_head
             reports.append({"layer": idx, **report})
         text._mtplx_step_mtp_draft_shared_heads = {
@@ -345,5 +354,25 @@ def _install_draft_lm_head(rt: Any, *, bits: int, group_size: int, mode: str) ->
         )
     else:
         raise AttributeError("model has no lm_head and does not tie output projection to embeddings")
+    try:
+        from .reduced_vocab_draft import maybe_wrap_draft_head as _mtplx_ext_wrap
+
+        _mtplx_ext_head = _mtplx_ext_wrap(text, draft_head)
+    except Exception as _mtplx_ext_exc:  # pragma: no cover - never fail the load
+        import sys as _mtplx_ext_sys
+
+        print(
+            f"[reduced-vocab] hook failed: {_mtplx_ext_exc!r}",
+            file=_mtplx_ext_sys.stderr,
+            flush=True,
+        )
+        _mtplx_ext_head = draft_head
+    if _mtplx_ext_head is not draft_head:
+        draft_head = _mtplx_ext_head
+        if isinstance(report, dict):
+            report = dict(report)
+            report["reduced_vocab"] = dict(
+                getattr(text, "_mtplx_reduced_vocab", {}) or {}
+            )
     text._mtplx_draft_lm_head = draft_head
     return report
