@@ -10931,12 +10931,13 @@ def _message_to_template_dict(
         )
     item: dict[str, Any] = {"role": message.role, "content": content}
     if include_reasoning_content and message.role == "assistant":
-        # Scoped reasoning history carries the client's structured reasoning
-        # fields through to the chat template so its rolling checkpoint can
-        # keep them inside the active agent round (interleaved-thinking
-        # continuity) and drop them for completed turns. The legacy
-        # preserve/strip modes keep their historical behavior: the field is
-        # dropped here, so `on` stays byte-identical as the rollback path.
+        # Carry the client's structured reasoning fields through to the chat
+        # template in every mode except full strip. Preserve mode renders them
+        # for every assistant turn (full retention — agent/tool clients send
+        # thinking as `reasoning_content`, so without this the model would see
+        # empty think scaffolds); scoped mode lets the template's rolling
+        # checkpoint render them only inside the active agent round
+        # (interleaved-thinking continuity) and drop them for completed turns.
         for key in ("reasoning_content", "reasoning"):
             reasoning = _message_extra(message, key)
             if reasoning:
@@ -11999,7 +12000,11 @@ def _encode_messages_uncached(
     # Scoped mode keeps reasoning_content on the normalized messages and
     # passes preserve_thinking=False so the template's own rolling checkpoint
     # governs: think blocks survive inside the active agent round (after the
-    # last real user query) and are dropped for completed turns.
+    # last real user query) and are dropped for completed turns. Preserve
+    # mode keeps preserve_thinking=True and now ALSO carries the structured
+    # reasoning fields, so every assistant turn renders its real think text
+    # (previously the field was dropped and tool/agent transcripts rendered
+    # empty think scaffolds).
     template_preserve_thinking = (
         not strip_assistant_reasoning_history and not scoped_reasoning_history
     )
@@ -12008,7 +12013,7 @@ def _encode_messages_uncached(
         item = _message_to_template_dict(
             message,
             strip_assistant_reasoning_history=strip_assistant_reasoning_history,
-            include_reasoning_content=scoped_reasoning_history,
+            include_reasoning_content=not strip_assistant_reasoning_history,
             allow_committed_reasoning=allow_committed_reasoning,
         )
         if item is not None:
@@ -12351,7 +12356,7 @@ def _postcommit_next_turn_prefix_ids(
         item = _message_to_template_dict(
             message,
             strip_assistant_reasoning_history=strip_assistant_reasoning_history,
-            include_reasoning_content=scoped_reasoning_history,
+            include_reasoning_content=not strip_assistant_reasoning_history,
             # Postcommit predicts the NEXT turn's render: when this request
             # served canonicalized history (committed-think substitution),
             # the prediction must render the same substituted bytes or the
@@ -12365,7 +12370,7 @@ def _postcommit_next_turn_prefix_ids(
     item = _message_to_template_dict(
         sentinel_message,
         strip_assistant_reasoning_history=strip_assistant_reasoning_history,
-        include_reasoning_content=scoped_reasoning_history,
+        include_reasoning_content=not strip_assistant_reasoning_history,
     )
     if item is not None:
         normalized.append(item)
@@ -24279,14 +24284,19 @@ def _reasoning_history_scoped_active(state: "ServerState") -> bool:
 def _reasoning_history_fingerprint_component(state: "ServerState") -> str:
     """Session-cache identity component for the reasoning-history policy.
 
-    Explicit preserve/strip emit the exact legacy ``strip_reasoning={0|1}``
-    strings so existing users' warm session banks survive this release.
-    Only scoped mints a new component - honest, because its rendered prompt
-    bytes genuinely differ from both legacy modes.
+    Explicit strip keeps the exact legacy ``strip_reasoning=1`` string so
+    existing strip users' warm session banks survive. Scoped and preserve
+    both mint their own component: scoped because its rendered prompt bytes
+    differ from the legacy modes, preserve because it now carries the
+    client's structured ``reasoning_content`` into the template (rendered
+    bytes differ from the legacy empty-scaffold preserve render for
+    tool/agent transcripts).
     """
     mode = _reasoning_history_mode(state)
     if mode == _REASONING_HISTORY_SCOPED:
         return "reasoning_history=scoped"
+    if mode == _REASONING_HISTORY_PRESERVE:
+        return "reasoning_history=preserve"
     return f"strip_reasoning={int(mode == _REASONING_HISTORY_STRIP)}"
 
 

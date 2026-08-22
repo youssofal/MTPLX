@@ -1,25 +1,31 @@
 """Scoped reasoning history - the loop root-cause fix.
 
 Qwen3.6/3.5 chat templates carry a "rolling checkpoint" (``last_query_index``):
-they keep ``<think>`` blocks only for assistant messages after the last real
+they keep `` thinking`` blocks only for assistant messages after the last real
 user query. MTPLX historically forced ``preserve_thinking=True``, overriding
 that checkpoint. Measured legacy behavior (decoded from a live SSD-banked
 loop prompt): structured ``reasoning_content`` history fields were dropped at
 ``_message_to_template_dict`` before the template, so preserve-all rendered an
-EMPTY ``<think>\\n\\n</think>`` scaffold for every completed assistant turn -
+EMPTY `` thinking\\n\\n response`` scaffold for every completed assistant turn -
 off-contract scaffolding the model never saw in training - while inline
-``<think>`` text in replayed content was preserved verbatim across all turns.
+`` thinking`` text in replayed content was preserved verbatim across all turns.
 
-Scoped mode restores Qwen's trained contract in both directions:
+Fix: ``_message_to_template_dict`` now carries the client's structured
+``reasoning_content`` fields through to the template in every mode except full
+strip. Preserve (``on``) therefore renders the REAL think text for every
+assistant turn - no more empty scaffolds - which is what makes agent/tool
+clients (OpenCode/Zed) see their previous thinking. Scoped mode still lets the
+template's rolling checkpoint govern:
 - completed turns render with no think scaffold at all (inline think in
   replayed content is scoped out by the template's own split logic);
 - the active agent round (assistant -> tool -> assistant chains after the
   last real user query) keeps its reasoning, including the structured
   ``reasoning_content`` fields OpenCode sends - the interleaved-thinking
-  continuity every provider preserves, which legacy preserve-all silently
-  dropped.
+  continuity every provider preserves.
 
-``on``/``off`` remain byte-identical to the legacy renderings (rollback path).
+``off`` remains the legacy full-strip render. ``on`` is no longer
+byte-identical to the legacy empty-scaffold render (that is the fix), so both
+``on`` and scoped mint their own session-cache identity components.
 
 The golden rendering tests run against the byte-identical template shipped
 with the Qwen3.6 Optimized Speed/Quality artifacts
@@ -218,15 +224,16 @@ def test_scoped_active_round_matches_preserve_for_inline_reasoning():
 def test_scoped_carries_structured_reasoning_legacy_preserve_dropped():
     """Legacy preserve-all silently DROPPED OpenCode's structured
     reasoning_content fields (measured on a live SSD-banked loop prompt:
-    every history think block rendered empty). Scoped carries them for the
-    active round - strictly more in-round continuity than today's default."""
+    every history think block rendered empty). The fix carries them in
+    preserve mode too - the model sees the real think text, not a scaffold.
+    """
 
     preserve = _render_history(
         _active_round_history(),
         scoped_reasoning_history=False,
     )
-    assert "THINK_ACTIVE_ROUND" not in preserve
-    assert "<think>\n\n</think>" in preserve
+    assert "THINK_ACTIVE_ROUND" in preserve
+    assert " thinking\n\n response" not in preserve
     scoped = _render_history(
         _active_round_history(),
         scoped_reasoning_history=True,
@@ -255,18 +262,18 @@ def test_scoped_scopes_inline_think_history_via_template_split():
     assert "THINK_INLINE_OLD" in preserved
 
 
-def test_preserve_all_keeps_legacy_rendering_including_empty_scaffolds():
-    """`on` keeps today's exact behavior: structured reasoning_content stays
-    dropped and every completed assistant turn gets the empty think scaffold
-    (the measured legacy rendering this mode exists to roll back to)."""
+def test_preserve_all_renders_structured_reasoning_across_completed_turns():
+    """`on` now renders the REAL structured reasoning for every assistant
+    turn - including completed turns - instead of the legacy empty think
+    scaffold (the fix: agent/tool transcripts keep their previous thinking)."""
 
     rendered = _render_history(
         _completed_turn_history(),
         scoped_reasoning_history=False,
     )
-    assert "THINK_TURN_ONE" not in rendered
-    assert "THINK_TURN_TWO" not in rendered
-    assert rendered.count("<think>\n\n</think>") == 2
+    assert "THINK_TURN_ONE" in rendered
+    assert "THINK_TURN_TWO" in rendered
+    assert rendered.count(" thinking\n\n response") == 0
 
 
 def test_preserve_all_keeps_inline_think_across_completed_turns():
@@ -402,31 +409,39 @@ def test_parse_args_accepts_scoped_and_keeps_strip_flag_off():
 
 
 # ---------------------------------------------------------------------------
-# Cache identity: legacy fingerprints pinned, scoped mints a new one
+# Cache identity: strip keeps its legacy fingerprint; scoped and preserve
+# (whose render bytes now carry structured reasoning) mint their own.
 # ---------------------------------------------------------------------------
 
 
-def test_fingerprint_component_pins_legacy_strings_for_on_and_off():
-    # Explicit on/off users must keep their warm session banks: the emitted
-    # component strings are byte-identical to the pre-scoped release.
-    assert (
-        _reasoning_history_fingerprint_component(_state("on", capable=True))
-        == "strip_reasoning=0"
-    )
+def test_fingerprint_component_pins_legacy_strip_and_mints_for_preserve():
+    # Strip keeps its warm session banks: the emitted component string is
+    # byte-identical to the pre-scoped release.
     assert (
         _reasoning_history_fingerprint_component(_state("off", capable=True))
         == "strip_reasoning=1"
     )
+    # Preserve now renders structured reasoning_content (no more empty think
+    # scaffolds), so its bytes differ from the legacy render: mint a fresh
+    # component instead of reusing strip_reasoning=0.
+    assert (
+        _reasoning_history_fingerprint_component(_state("on", capable=True))
+        == "reasoning_history=preserve"
+    )
     assert (
         _reasoning_history_fingerprint_component(_state("auto", capable=False))
-        == "strip_reasoning=0"
+        == "reasoning_history=preserve"
     )
 
 
-def test_fingerprint_component_mints_new_identity_for_scoped_only():
+def test_fingerprint_component_mints_new_identity_for_scoped_and_preserve():
     assert (
         _reasoning_history_fingerprint_component(_state("auto", capable=True))
         == "reasoning_history=scoped"
+    )
+    assert (
+        _reasoning_history_fingerprint_component(_state("on", capable=True))
+        == "reasoning_history=preserve"
     )
 
 
@@ -457,7 +472,7 @@ def _fingerprint_state(policy: str, *, capable: bool):
     )
 
 
-def test_policy_fingerprint_scoped_differs_but_on_matches_legacy():
+def test_policy_fingerprint_scoped_differs_but_preserve_modes_agree():
     scoped = _policy_fingerprint(
         _fingerprint_state("auto", capable=True), thinking_enabled=True
     )
@@ -468,9 +483,9 @@ def test_policy_fingerprint_scoped_differs_but_on_matches_legacy():
         _fingerprint_state("auto", capable=False), thinking_enabled=True
     )
     assert "reasoning_history=scoped" in scoped
-    assert "strip_reasoning=0" in preserve
-    # `on` (and auto on non-checkpoint templates) emits the exact legacy
-    # component so pre-existing warm banks stay valid.
+    assert "reasoning_history=preserve" in preserve
+    # `on` and auto-on-non-checkpoint-templates resolve to the same preserve
+    # mode and share the new preserve component.
     assert preserve == legacy_preserve
     assert scoped != preserve
 
