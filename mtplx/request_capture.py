@@ -116,6 +116,20 @@ def capture_outcome(request_id: str | None, outcome: dict[str, Any]) -> None:
         pass
 
 
+def completion_token_ids(tokens: Any) -> dict[str, Any]:
+    """Exact sampled completion token ids, completing the bit-exact replay
+    envelope: ``prompt_token_ids`` (captured at dispatch) is the input the model
+    conditioned on; this is the output it produced. Unlike the completion text
+    (clipped, and lossy after tool-call/reasoning parsing) these are the raw
+    ids straight off the sampler — what a replay or a distillation/training
+    pipeline needs. Bounded by ``max_tokens``, so no clipping. Never raises."""
+    try:
+        ids = [int(t) for t in (tokens or [])]
+    except (TypeError, ValueError):
+        ids = []
+    return {"completion_token_ids": ids, "completion_token_count": len(ids)}
+
+
 def clip_text_head_tail(text: str, head: int = 2000, tail: int = 2000) -> dict[str, Any]:
     """Store enough text to diagnose early stops without unbounded files —
     the tail is where the failure signature lives."""
