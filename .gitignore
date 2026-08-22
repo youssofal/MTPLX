@@ -43,3 +43,4 @@ benchmark_outputs/
 .webui_secret_key
 .hf-home/
 .claude/
+.serena/

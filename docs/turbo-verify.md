@@ -24,7 +24,12 @@ Measured on M5 Max / Qwen3.6-27B Optimized-Speed, reasoning on, 2026-06-12:
 flappy envelope 55.7 -> 64.5; live server completion 55.0 -> 66.7; 10k-token
 generation 59.5 tok/s sustained. 4-bit, 6-bit, and 8-bit affine layouts are
 supported; the 9B Optimized-Speed 6-bit lane ships via the split-K hexpack
-kernels. MoE (35B-A3B) routes only dense projections: ~neutral.
+kernels. For 6-bit verification, the 5-row and 6-row shapes remain eligible
+for hexpack by default; the 4-row shape stays on stock MLX unless
+`MTPLX_VK_QMM6_M4=1` opts in on hardware where it wins. That switch does not
+affect the 4-bit 4-row route. The production evidence and synthetic diagnostic
+are recorded in `benchmarks/repro_vk_qmm6_m4_route.py`. MoE (35B-A3B) routes
+only dense projections: ~neutral.
 
 Numerics: not bit-exact versus stock kernels (different accumulation order).
 Argmax-identical on all probed positions; at the product sampler
