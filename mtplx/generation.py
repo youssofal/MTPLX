@@ -7569,6 +7569,7 @@ def generate_mtpk(
         nonlocal target_time, draft_time
         nonlocal state_rebase_tokens_since, state_rebase_observed_tokens
         nonlocal state_rebase_events, state_rebase_time_s
+        nonlocal _batched_target_tokens, _known_primary_next
         if state_rebase_every <= 0 or current_tokens <= 0:
             return
         if current_tokens < state_rebase_observed_tokens:
@@ -7606,6 +7607,9 @@ def generate_mtpk(
         hidden = rebased.hidden
         mtp_history_cache = rebased.committed_mtp_cache
         trace_current_mtp_cache = mtp_history_cache
+        # Rows argmaxed from the pre-rebase verify logits are stale now.
+        _batched_target_tokens = None
+        _known_primary_next = None
         target_time += max(
             0.0, rebased.prompt_eval_time_s - rebased.prompt_mtp_history_time_s
         )
