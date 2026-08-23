@@ -108,7 +108,12 @@ class _FusionHub:
             self._key = None
             self._outs = None
             self._served = 0
-            _outs = tuple(mx.split(self.fused(x), self.split_points, axis=-1))
+            # Contiguous copies: a strided view can route downstream kernels
+            # onto a different reduction variant and flip a ULP.
+            _outs = tuple(
+                mx.contiguous(o)
+                for o in mx.split(self.fused(x), self.split_points, axis=-1)
+            )
             self._key = x
             self._outs = _outs
             _STATS["fused_dispatches"] += 1
@@ -360,6 +365,16 @@ def configure_fused_projections(model: Any | None = None) -> dict[str, Any]:
     reset_fused_projection_counters()
 
     if not groups or model is None:
+        return fused_projection_stats()
+
+    if str(os.environ.get("MTPLX_PACKED_PROJ_CONCATS", "")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        # Both features fuse the same projection groups; installing both would
+        # double-fuse and confound any A/B.
+        _STATS["enabled"] = False
+        _STATS["skipped"] += 1
+        _STATS["skip_reasons"].append("refused: MTPLX_PACKED_PROJ_CONCATS is enabled")
         return fused_projection_stats()
 
     max_rows = _default_max_rows()
