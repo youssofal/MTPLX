@@ -946,7 +946,11 @@ def _eval_cache_roots(cache: Any) -> None:
 
 
 def _eval_verify_outputs(
-    verify_logits: mx.array, verify_hidden: mx.array, captures: Any | None = None
+    verify_logits: mx.array,
+    verify_hidden: mx.array,
+    captures: Any | None = None,
+    *,
+    greedy_target_ids: mx.array | None = None,
 ) -> dict[str, float]:
     # Keep capture tensors lazy; commit_captured_prefix materializes only the selected prefix slice.
     timings = {
@@ -954,21 +958,22 @@ def _eval_verify_outputs(
         "verify_hidden_eval_time_s": 0.0,
         "verify_joint_eval_time_s": 0.0,
     }
+    auxiliary = () if greedy_target_ids is None else (greedy_target_ids,)
     if _env_truthy("MTPLX_LAZY_VERIFY_LOGITS"):
         started = time.perf_counter()
-        _eval(verify_hidden, _caller_depth=2)
+        _eval(verify_hidden, *auxiliary, _caller_depth=2)
         timings["verify_hidden_eval_time_s"] += time.perf_counter() - started
         return timings
     if _env_truthy("MTPLX_SPLIT_VERIFY_EVAL"):
         started = time.perf_counter()
-        _eval(verify_logits, _caller_depth=2)
+        _eval(verify_logits, *auxiliary, _caller_depth=2)
         timings["verify_logits_eval_time_s"] += time.perf_counter() - started
         started = time.perf_counter()
         _eval(verify_hidden, _caller_depth=2)
         timings["verify_hidden_eval_time_s"] += time.perf_counter() - started
         return timings
     started = time.perf_counter()
-    _eval(verify_logits, verify_hidden, _caller_depth=2)
+    _eval(verify_logits, verify_hidden, *auxiliary, _caller_depth=2)
     timings["verify_joint_eval_time_s"] += time.perf_counter() - started
     return timings
 
@@ -9254,9 +9259,25 @@ def generate_mtpk(
         target_distribution_batch = None
         target_distributions = None
         target_prefix_tokens: list[int] | None = None
+        greedy_target_ids: mx.array | None = None
+        greedy_target_tokens: list[int] | None = None
         target_distribution_precomputed = False
         elapsed_target_distribution_eval = 0.0
         started_eval = time.perf_counter()
+        if (
+            not target_prefix_verify
+            and sampler.temperature <= 0
+            and not _penalties_active
+            and not _steer_active
+        ):
+            greedy_target_rows = min(
+                int(verify_logits.shape[1]),
+                target_distribution_rows_needed,
+            )
+            greedy_target_ids = sample_token_ids_from_mlx_logits(
+                verify_logits[:, :greedy_target_rows, :],
+                sampler,
+            )
         if target_prefix_verify:
             target_distribution_rows = min(
                 int(verify_logits.shape[1]),
@@ -9328,10 +9349,17 @@ def generate_mtpk(
                 }
             elif captures is not None:
                 verify_eval_timings = _eval_verify_outputs(
-                    verify_logits, verify_hidden, captures
+                    verify_logits,
+                    verify_hidden,
+                    captures,
+                    greedy_target_ids=greedy_target_ids,
                 )
             else:
-                verify_eval_timings = _eval_verify_outputs(verify_logits, verify_hidden)
+                verify_eval_timings = _eval_verify_outputs(
+                    verify_logits,
+                    verify_hidden,
+                    greedy_target_ids=greedy_target_ids,
+                )
         elif (
             defer_verify_hidden_eval
             and sampler.temperature > 0
@@ -9381,10 +9409,21 @@ def generate_mtpk(
             }
         elif captures is not None:
             verify_eval_timings = _eval_verify_outputs(
-                verify_logits, verify_hidden, captures
+                verify_logits,
+                verify_hidden,
+                captures,
+                greedy_target_ids=greedy_target_ids,
             )
         else:
-            verify_eval_timings = _eval_verify_outputs(verify_logits, verify_hidden)
+            verify_eval_timings = _eval_verify_outputs(
+                verify_logits,
+                verify_hidden,
+                greedy_target_ids=greedy_target_ids,
+            )
+        if greedy_target_ids is not None:
+            greedy_target_tokens = [
+                int(token) for token in np.asarray(greedy_target_ids).reshape(-1)
+            ]
         elapsed_verify_eval = time.perf_counter() - started_eval
         eval_attributed = sum(float(value) for value in verify_eval_timings.values())
         elapsed_verify_eval_unattributed = max(
@@ -9511,16 +9550,22 @@ def generate_mtpk(
                 _working_counts.update(draft_tokens[:depth_index])
             target_p_for_cache = None
             if sampler.temperature <= 0:
-                _greedy_row = target_logits_for_draft[0]
-                if _penalties_active or _row_guard_overlay:
-                    _greedy_row = apply_penalties_mlx(
-                        _greedy_row,
-                        _working_counts if _penalties_active else None,
-                        sampler.presence_penalty,
-                        sampler.frequency_penalty,
-                        penalty_overlay=_row_guard_overlay,
-                    )
-                target_token = int(mx.argmax(_greedy_row, axis=-1).item())
+                if (
+                    greedy_target_tokens is not None
+                    and depth_index < len(greedy_target_tokens)
+                ):
+                    target_token = int(greedy_target_tokens[depth_index])
+                else:
+                    _greedy_row = target_logits_for_draft[0]
+                    if _penalties_active or _row_guard_overlay:
+                        _greedy_row = apply_penalties_mlx(
+                            _greedy_row,
+                            _working_counts if _penalties_active else None,
+                            sampler.presence_penalty,
+                            sampler.frequency_penalty,
+                            penalty_overlay=_row_guard_overlay,
+                        )
+                    target_token = int(mx.argmax(_greedy_row, axis=-1).item())
                 accepted_now = draft_token == target_token
                 accept_prob = 1.0 if accepted_now else 0.0
                 correction = target_token
@@ -9858,6 +9903,11 @@ def generate_mtpk(
                     and len(target_prefix_tokens) > len(draft_tokens)
                 ):
                     bonus = int(target_prefix_tokens[len(draft_tokens)])
+                elif (
+                    greedy_target_tokens is not None
+                    and len(greedy_target_tokens) > len(draft_tokens)
+                ):
+                    bonus = int(greedy_target_tokens[len(draft_tokens)])
                 elif target_distribution_batch is not None and not lazy_bonus_verify:
                     bonus = target_distribution_batch.sample(len(draft_tokens), rng)
                 elif (
