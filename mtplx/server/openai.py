@@ -29374,7 +29374,26 @@ def create_app(state: ServerState) -> FastAPI:
                             client_disconnected_now = (
                                 await raw_request.is_disconnected()
                             )
-                            if cancel_event.is_set() or client_disconnected_now:
+                            if (
+                                cancel_event.is_set()
+                                and not early_tool_cancel_used
+                            ) or client_disconnected_now:
+                                # `and not early_tool_cancel_used` because the
+                                # early tool-call cancel below sets the very
+                                # same event and then `continue`s straight back
+                                # into this branch. The worker only observes
+                                # the event once per committed token batch
+                                # (`on_tokens`), so whenever that batch gap
+                                # outlives the 0.25s poll above, the loop read
+                                # its own cancel as a foreign one and killed a
+                                # healthy tool-calling turn. Excluding it keeps
+                                # draining until the worker acknowledges, which
+                                # lands on the `kind == "cancelled"` handler
+                                # and its `early_tool_cancel_used and
+                                # streamed_assistant_tool_calls` terminal
+                                # frame. The completions loop already guards
+                                # its own `stop_hit` cancel this way.
+                                #
                                 # Truthful cancel accounting (#F36): only a
                                 # genuinely dead transport is a client
                                 # disconnect; an explicit server-side cancel
