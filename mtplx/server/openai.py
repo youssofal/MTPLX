@@ -72,6 +72,12 @@ from mtplx.a3b_mtp_batch import (
     _require_mlx_lm_arrays_cache_fix,
     install_a3b_mtp_batch_lane,
 )
+from mtplx.artifacts import load_config
+from mtplx.dense_mtp_batch_lane import (
+    DenseMTPBatchInstallError,
+    install_dense_mtp_batch_lane,
+    model_is_dense_mtp_batch_capable,
+)
 from mtplx.adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
 from mtplx.attention_context import attention_phase
 from mtplx.cache_state import snapshot_cache
@@ -174,6 +180,12 @@ _INERT_FLIGHT = FlightRecorder(None)
 
 def _flight(state: Any) -> FlightRecorder:
     return getattr(state, "flight", None) or _INERT_FLIGHT
+from mtplx.server.dense_mtp_batch import (
+    DenseMTPBatchGenerationService,
+    DenseMTPBatchJob,
+    DenseMTPBatchQueueFull,
+    dense_mtp_batch_compatibility_key,
+)
 from mtplx.server.mtp_batch import (
     MTPBatchFinalizeOwnership,
     MTPBatchGenerationService,
@@ -666,7 +678,36 @@ def _server_runtime_env_overrides(
     )
     scheduler_mode = getattr(args, "scheduler_mode", "serial")
     scheduler_mode = str(getattr(scheduler_mode, "value", scheduler_mode))
-    if scheduler_mode == SchedulerMode.MTP_BATCH.value:
+    if scheduler_mode == SchedulerMode.MTP_BATCH.value and not (
+        _args_serve_dense_mtp_batch(args)
+    ):
+        # These eight are the A3B lane's runtime environment, not mtp_batch's.
+        # Every one of them names or implies the MoE topology: the row-owned
+        # router and its combine tail, the packed MoE gate/up projections, the
+        # whole-MoE fusion switch, the A3B GDN post-conv implementation and its
+        # fusion, and the A3B compiled target prefix.
+        #
+        # Applying them to a DENSE model breaks the server before any lane is
+        # consulted. `MTPLX_QWEN_ROW_OWNED_ROUTER=1` makes
+        # `prepare_qwen_row_owned_routers` run during `runtime.load`, and that
+        # function hard-requires the exact A3B topology (model_type
+        # qwen3_5_moe, 256 experts, 8 per token, hidden 2048, 40 layers), so a
+        # dense qwen3_5 dies at construction with
+        # `QwenRowOwnedRouterConfigError: A3B row-owned router config requires
+        # the exact A3B model topology`.
+        #
+        # This is the real MoE router-receipt gate. Refusing MoE configs in the
+        # dense lane's own install was necessary but not sufficient, because
+        # this fires strictly earlier — at runtime load, before either lane
+        # exists. Selecting `--scheduler-mode mtp_batch` used to mean "you are
+        # the A3B lane" at the environment level; now it means "you are a
+        # batching lane" and the model decides which one.
+        #
+        # The dense lane deliberately inherits NONE of them. That is not
+        # caution, it is provenance: `generate_dense_mtp_batch` was developed,
+        # parity-gated and benched against a plain runtime with none of these
+        # set, so an unset environment is the configuration its correctness
+        # evidence was collected under.
         overrides.update(
             {
                 "MTPLX_A3B_GDN_POSTCONV_IMPL": "headquarter",
@@ -1868,6 +1909,82 @@ def _select_backend_context_window(
     )
 
 
+def _args_serve_dense_mtp_batch(args: argparse.Namespace) -> bool:
+    """Whether ``--scheduler-mode mtp_batch`` means the DENSE lane for these args.
+
+    Runs before the model is constructed, so it reads config.json off the model
+    path in ``args`` rather than asking a runtime. A ref that is not a readable
+    local directory answers False and keeps today's A3B validation exactly as
+    it was, which is the safe direction: the dense lane's own install is the
+    authority and it fails loudly if this guess was generous.
+    """
+
+    model_ref = str(getattr(args, "model", "") or "")
+    if not model_ref:
+        return False
+    try:
+        return model_is_dense_mtp_batch_capable(load_config(model_ref))
+    except (OSError, ValueError, TypeError):
+        # A ref that is not a readable local model directory. Deliberately
+        # narrow: a broad `except Exception` here once swallowed a NameError
+        # and silently disabled the entire dense lane, which presented as "the
+        # lane never installs" with no error anywhere.
+        return False
+
+
+def _dense_batch_env_int(name: str) -> int | None:
+    """An operator-set integer, or None to keep the default.
+
+    Named for its lane, NOT `_env_int`. This module already defines an
+    `_env_int(name, default)` thirty thousand lines further down, and the later
+    definition silently wins at import -- so the first version of this helper
+    was shadowed and every call raised TypeError, which broke server startup
+    outright. Nothing caught it: a duplicate `def` is legal Python, the module
+    imports fine, and no CPU test constructs a ServerState.
+
+    Deliberately strict about its value: a malformed setting raises rather than
+    quietly falling back, because a typo in a queue bound that silently keeps
+    the old value is the failure class this lane has already been bitten by.
+    """
+
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    return int(raw)
+
+
+def _dense_batch_env_float(name: str) -> float | None:
+    """An operator-set float, or None to keep the default. Strict, as above."""
+
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    return float(raw)
+
+
+def _validate_dense_mtp_batch_settings(args: argparse.Namespace) -> None:
+    """The dense lane's startup contract: only what the driver actually needs.
+
+    Three requirements, each traceable to a line in the driver rather than to a
+    captured graph. MTP must be loaded and generation must be in MTP mode
+    because the cycle is draft-then-verify. The decode batch maximum is the
+    cohort width and a width below 2 is not a cohort.
+    """
+
+    if str(getattr(args, "generation_mode", "")) != "mtp":
+        raise DenseMTPBatchInstallError(
+            "dense mtp_batch requires generation_mode=mtp; the cohort lane has "
+            "no autoregressive path"
+        )
+    if not bool(getattr(args, "load_mtp", False)):
+        raise DenseMTPBatchInstallError("dense mtp_batch requires load_mtp=true")
+    width = int(getattr(args, "decode_batch_max", 0) or 0)
+    if width and width < 2:
+        raise DenseMTPBatchInstallError(
+            f"dense mtp_batch requires decode_batch_max >= 2; got {width}"
+        )
+
+
 def _validate_mtp_batch_settings(args: argparse.Namespace) -> None:
     """Reject an invalid fixed-width MTP service before model construction."""
 
@@ -1887,6 +2004,17 @@ def _validate_mtp_batch_settings(args: argparse.Namespace) -> None:
                 f"mtp_batch numerics profile {numerics.value} "
                 "requires scheduler_mode=mtp_batch"
             )
+        return
+    if _args_serve_dense_mtp_batch(args):
+        # The contract below is the A3B lane's, and every clause of it exists
+        # for that lane's compiled fixed-width graph: depth 1 is its T2
+        # geometry, width 8 is its capture shape, the context window is its
+        # installed capacity, and profile/verify_strategy/verify_core name the
+        # route it captured. None of that binds the dense driver, which builds
+        # its shapes from the runtime at call time. Applying the A3B contract
+        # to a dense model would reject every valid dense server at startup.
+        _validate_dense_mtp_batch_settings(args)
+        _require_mlx_lm_arrays_cache_fix()
         return
     required = (
         (str(getattr(args, "generation_mode", "")) == "mtp", "generation_mode=mtp"),
@@ -2155,7 +2283,35 @@ class ServerState:
         self.mtp_batch_lane = None
         self.mtp_batch_lanes: dict[int, Any] = {}
         self.mtp_batch_omit_speculative_bonus = False
-        if scheduler_config.mode == SchedulerMode.MTP_BATCH:
+        # Dense batched-MTP lane (T-204 item 1). `--scheduler-mode mtp_batch`
+        # means the same thing to an operator on both topologies; which lane it
+        # installs is decided here by the served model, not by a second flag.
+        # The two are mutually exclusive: the dense install refuses a MoE
+        # config and the A3B install refuses anything that is not one, so a
+        # model can never end up with both, and the dense lane never consults
+        # the MoE router receipt.
+        self.dense_mtp_batch_lane = None
+        if scheduler_config.mode == SchedulerMode.MTP_BATCH and _serves_dense_mtp_batch(
+            self.runtime
+        ):
+            self.dense_mtp_batch_lane = self.model_scheduler.submit_foreground(
+                install_dense_mtp_batch_lane,
+                self.runtime,
+                cohort_slots=int(
+                    scheduler_config.to_dict()["decode_batch_max"] or 8
+                ),
+                depth=_dense_mtp_batch_depth_from_args(args),
+                max_context_tokens=_dense_mtp_batch_context_cap(args),
+                batch_key="startup.dense_mtp_batch_lane",
+            ).result()
+            _startup_line(
+                "[4/6] dense mtp_batch lane installed: "
+                f"cohort_slots={int(self.dense_mtp_batch_lane.geometry.cohort_slots)} "
+                f"depth={int(self.dense_mtp_batch_lane.geometry.depth)} "
+                f"route={self.dense_mtp_batch_lane.route_id} "
+                f"selfcheck={self.dense_mtp_batch_lane.selfcheck.get('mode')}"
+            )
+        elif scheduler_config.mode == SchedulerMode.MTP_BATCH:
             self.mtp_batch_omit_speculative_bonus = str(
                 os.environ.get("MTPLX_OMIT_SPECULATIVE_BONUS", "")
             ).strip().lower() in {"1", "true", "yes", "on"}
@@ -2368,6 +2524,43 @@ class ServerState:
                 ),
             )
             if self.mtp_batch_lane is not None
+            else None
+        )
+        # The dense cohort service reuses the A3B cohort-owner finalize: it
+        # only reads session_id and request_observability off each job, both of
+        # which DenseMTPBatchJob carries, so there is no reason for a second
+        # copy of the MLX cleanup policy.
+        # T-210: prefix reuse across conversation turns. Bytes, 0 = off.
+        # An env var rather than a CLI flag for now, matching the other dense
+        # lane knobs, and strict about its value: a typo that silently keeps the
+        # old setting is the failure class this lane has already been bitten by.
+        _prefix_bytes = _dense_batch_env_int("MTPLX_DENSE_BATCH_PREFIX_CACHE_BYTES")
+        _prefix_min = _dense_batch_env_int("MTPLX_DENSE_BATCH_PREFIX_MIN_TOKENS")
+        self.dense_mtp_batch_service = (
+            DenseMTPBatchGenerationService(
+                self,
+                lane=self.dense_mtp_batch_lane,
+                prefix_cache_bytes=_prefix_bytes or 0,
+                prefix_cache_min_tokens=_prefix_min or 256,
+                owner_finalize=lambda jobs: _finalize_mtp_batch_cohort_owner(
+                    self, jobs
+                ),
+                batch_wait_s=(
+                    float(scheduler_config.to_dict()["batch_wait_ms"]) / 1000.0
+                ),
+                # Operator settings, via env to match how the rest of the lane
+                # is configured. They must be reachable somehow: a bound that
+                # cannot be set is not a policy, and the defaults (queue = 8
+                # cohorts, no deadline) are starting points, not answers for
+                # any particular traffic mix.
+                max_queue_depth=_dense_batch_env_int(
+                    "MTPLX_DENSE_BATCH_MAX_QUEUE_DEPTH"
+                ),
+                cohort_deadline_s=_dense_batch_env_float(
+                    "MTPLX_DENSE_BATCH_DEADLINE_S"
+                ),
+            )
+            if self.dense_mtp_batch_lane is not None
             else None
         )
         self.warmup_status = _run_startup_warmup(self)
@@ -15213,6 +15406,56 @@ def _mtplx_current_settings(state: "ServerState") -> dict[str, Any]:
     }
 
 
+def _serves_dense_mtp_batch(runtime: Any) -> bool:
+    """True when the served model is the DENSE lane's model.
+
+    Reads the on-disk config rather than probing the loaded module, so the
+    decision is the same one ``install_dense_mtp_batch_lane`` will make and the
+    two cannot disagree. Any failure to read or parse the config answers False,
+    which falls through to the A3B path and its own explicit install error —
+    better than a dense install failing on a model that was never dense.
+    """
+
+    model_path = getattr(runtime, "model_path", None)
+    if model_path is None:
+        return False
+    try:
+        return model_is_dense_mtp_batch_capable(load_config(model_path))
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _dense_mtp_batch_depth_from_args(args: Any) -> int:
+    """Draft depth for the dense lane, from the server's own depth setting.
+
+    The A3B lane is pinned to depth 1 by its compiled T2 geometry. The dense
+    driver has no such pin, so it uses the operator's configured depth; depth 3
+    is the shipped default and the depth every dense-batch measurement was
+    taken at.
+    """
+
+    try:
+        return max(1, int(getattr(args, "depth", 3) or 3))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _dense_mtp_batch_context_cap(args: Any) -> int:
+    """Per-row ``prompt + max_tokens`` bound for the dense lane.
+
+    Unlike the A3B lane this is a policy cap, not a compiled capacity: the
+    dense driver sizes its KV per run. It exists so one very long request
+    cannot size the whole cohort's cache. Honours an explicit
+    ``--context-window`` and otherwise stays generous.
+    """
+
+    try:
+        requested = int(getattr(args, "context_window", 0) or 0)
+    except (TypeError, ValueError):
+        requested = 0
+    return requested if requested > 0 else 262144
+
+
 def _scheduler_config_from_args(args: Any) -> BatchSchedulerConfig:
     mode = str(getattr(args, "scheduler_mode", "serial") or "serial")
     if mode not in SCHEDULER_MODE_CHOICES:
@@ -15236,9 +15479,13 @@ def _scheduler_config_from_args(args: Any) -> BatchSchedulerConfig:
         return BatchSchedulerConfig.from_values(mode="serial", preset="latency")
 
 
-def _scheduler_policy_label(config: BatchSchedulerConfig) -> str:
+def _scheduler_policy_label(
+    config: BatchSchedulerConfig, *, dense: bool = False
+) -> str:
     if config.mode == SchedulerMode.MTP_BATCH:
-        return "fixed_mtp_batch_width_8"
+        # The dense lane's width is an admission cap, not a compiled shape, so
+        # reporting the A3B's "fixed width 8" for it would be a false receipt.
+        return "dense_mtp_batch" if dense else "fixed_mtp_batch_width_8"
     if (
         config.mode in {SchedulerMode.AR_BATCH, SchedulerMode.MTP_COHORT_EXPERIMENTAL}
         and config.preset == SchedulerPreset.AGENT
@@ -15323,7 +15570,39 @@ def _mtplx_scheduler_state(state: "ServerState") -> dict[str, Any]:
             or int(mtp_batch_stats.get("last_real_width") or 0) > 1
         )
     )
-    if b1_exact_serial and mtp_available:
+    dense_mtp_batch_stats: dict[str, Any] = {}
+    dense_mtp_batch_lane = getattr(state, "dense_mtp_batch_lane", None)
+    dense_mtp_batch_service = getattr(state, "dense_mtp_batch_service", None)
+    if dense_mtp_batch_service is not None and hasattr(
+        dense_mtp_batch_service, "snapshot"
+    ):
+        try:
+            dense_mtp_batch_stats = dict(dense_mtp_batch_service.snapshot())
+        except Exception as exc:
+            dense_mtp_batch_stats = {"error": str(exc)}
+    dense_cohort_active = bool(
+        dense_mtp_batch_stats
+        and (
+            int(dense_mtp_batch_stats.get("active") or 0) > 1
+            or int(dense_mtp_batch_stats.get("last_real_width") or 0) > 1
+        )
+    )
+    if dense_mtp_batch_lane is not None and mtp_available:
+        # The dense lane reports its own labels rather than borrowing the A3B
+        # ones: "mtp_batch_width_8" would be a false receipt here, since the
+        # dense cohort width is an admission cap and not a compiled shape.
+        active_lane = (
+            f"dense_mtp_batch_width_{int(dense_mtp_batch_stats.get('last_real_width') or 0)}"
+            if dense_cohort_active
+            else (
+                "dense_mtp_batch_gathering"
+                if active_requests > 1
+                or int(dense_mtp_batch_stats.get("pending") or 0) > 1
+                else "solo_mtp"
+            )
+        )
+        mtp_disabled_reason = None
+    elif b1_exact_serial and mtp_available:
         active_lane = "mtp_batch_b1_exact_serial"
         mtp_disabled_reason = None
     elif mtp_batch_has_cohort and mtp_available:
@@ -15359,12 +15638,45 @@ def _mtplx_scheduler_state(state: "ServerState") -> dict[str, Any]:
     telemetry = dict(scheduler_stats)
     if config.mode == SchedulerMode.MTP_BATCH:
         telemetry.update(mtp_batch_stats)
+        telemetry.update(dense_mtp_batch_stats)
     return {
+        # The dense lane's own receipts. `batch_histogram` inside
+        # `dense_mtp_batch` is the answer to "did it actually batch", which is
+        # the question a concurrency measurement cannot infer from throughput:
+        # "never batched" and "batched and did not help" look identical from
+        # the outside and the first one is a configuration bug.
+        "dense_mtp_batch": dense_mtp_batch_stats,
+        # Hoisted so a reader does not have to know the lane's internal shape
+        # to answer "did continuous batching actually happen". The nested block
+        # above carries the full detail.
+        "dense_mtp_batch_continuous": {
+            key: dense_mtp_batch_stats.get(key)
+            for key in (
+                "refill_admitted_total",
+                "refill_requeued_total",
+                "requests_served_total",
+                "max_requests_in_one_cohort",
+                "continuous_batching_observed",
+            )
+        }
+        if dense_mtp_batch_stats
+        else {},
+        "dense_mtp_batch_route_id": getattr(dense_mtp_batch_lane, "route_id", None),
+        "dense_mtp_batch_config_fingerprint": getattr(
+            dense_mtp_batch_lane, "config_fingerprint", None
+        ),
+        "dense_mtp_batch_selfcheck": dict(
+            getattr(dense_mtp_batch_lane, "selfcheck", {}) or {}
+        ),
         "config": config.to_dict(),
         "mode": config.mode.value,
         "preset": config.preset.value,
         "scheduler_policy": (
-            "serial_b1_exact" if b1_exact_serial else _scheduler_policy_label(config)
+            "serial_b1_exact"
+            if b1_exact_serial
+            else _scheduler_policy_label(
+                config, dense=dense_mtp_batch_lane is not None
+            )
         ),
         "active_lane": active_lane,
         "active_requests": active_requests,
@@ -16699,6 +17011,27 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "live_frontier_unknown_tool_result_count",
     "dynamic_paged_kv",
     "session_prompt_prefix_commit",
+    # Dense batched-MTP lane. These were set on every cohort response and then
+    # stripped here, so no caller could read either one -- while the contract
+    # doc told callers to pin the WIDTH for reproducibility and the service
+    # docstring said the SEED was "reported per request so this is visible
+    # rather than silent". Both claims were false on the wire.
+    #
+    # Safe for every other lane by construction, not by assumption: the filter
+    # above is `if key in stats`, and the only writers of these two keys are in
+    # mtplx/server/dense_mtp_batch.py, so a non-dense response cannot carry
+    # them and its envelope is unchanged.
+    "dense_mtp_batch_cohort_width",
+    # The width a request decoded at is not one number under continuous
+    # admission. `_sealed` is what the cohort opened with, `_peak` is the widest
+    # it ever ran, and `_varied` is the honest answer to whether a single width
+    # applied at all -- which is what contract section 1's "pin the width"
+    # advice actually depends on. Reporting only the sealed width told a
+    # request that ran beside seven others that it ran alone.
+    "dense_mtp_batch_cohort_width_sealed",
+    "dense_mtp_batch_cohort_width_peak",
+    "dense_mtp_batch_cohort_width_varied",
+    "dense_mtp_batch_cohort_seed",
 )
 PUBLIC_POSTCOMMIT_KEYS = (
     "stored",
@@ -19705,6 +20038,174 @@ def _mtp_batch_compatibility_key(
     )
 
 
+def _validate_dense_mtp_batch_request_contract(
+    state: ServerState,
+    prompt_ids: list[int],
+    *,
+    response_max: int,
+    constraint_spec: Any | None,
+    vision_splice: Any | None,
+    background_request: bool,
+) -> None:
+    """Refuse, up front, the requests the dense cohort lane cannot serve.
+
+    Each refusal is a real limitation of the batched driver rather than a
+    policy choice, and each is raised BEFORE the job is enqueued so the caller
+    gets a clear error instead of a cohort-time failure that also takes its
+    cohort-mates' latency with it.
+    """
+
+    if constraint_spec is not None:
+        # Grammar masks live on the serial lanes; the cohort driver's sampling
+        # is one filtered distribution per cycle with no matcher state.
+        raise MTPBatchRequestError("dense mtp_batch does not support response_format")
+    if vision_splice is not None:
+        # The driver prefills from token ids only; there is no path to hand it
+        # spliced image embeddings per row.
+        raise MTPBatchRequestError("dense mtp_batch does not support vision_splice")
+    if background_request:
+        raise MTPBatchRequestError("dense mtp_batch does not support background_request")
+    service = getattr(state, "dense_mtp_batch_service", None)
+    lane = getattr(state, "dense_mtp_batch_lane", None)
+    if service is None or lane is None:
+        raise MTPBatchRequestError(
+            "dense mtp_batch service was not installed at construction"
+        )
+    cap = int(lane.geometry.max_context_tokens)
+    if len(prompt_ids) + int(response_max) > cap:
+        raise A3BMTPBatchCapacityError(
+            f"dense mtp_batch requires prompt_tokens + max_tokens <= {cap}"
+        )
+
+
+def _run_dense_mtp_batch_generation_dispatched(
+    state: ServerState,
+    prompt_ids: list[int],
+    *,
+    response_id: str | None,
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    """Serve one request through the dense batched-MTP cohort lane."""
+
+    service = getattr(state, "dense_mtp_batch_service", None)
+    lane = getattr(state, "dense_mtp_batch_lane", None)
+    if service is None or lane is None:
+        raise MTPBatchRequestError(
+            "dense mtp_batch service was not installed at construction"
+        )
+    response_max, sampler, generation_limits = _generation_params(
+        state,
+        prompt_token_count=len(prompt_ids),
+        max_tokens=kwargs.get("max_tokens"),
+        temperature=kwargs.get("temperature"),
+        top_p=kwargs.get("top_p"),
+        top_k=kwargs.get("top_k"),
+        presence_penalty=kwargs.get("presence_penalty"),
+        frequency_penalty=kwargs.get("frequency_penalty"),
+    )
+    _validate_dense_mtp_batch_request_contract(
+        state,
+        prompt_ids,
+        response_max=response_max,
+        constraint_spec=kwargs.get("constraint_spec"),
+        vision_splice=kwargs.get("vision_splice"),
+        background_request=bool(kwargs.get("background_request")),
+    )
+    generation_seed, _seed_is_explicit = _resolve_seed(state, kwargs.get("seed"))
+    request_observability = dict(kwargs.get("request_observability") or {})
+    solo_kwargs = dict(kwargs)
+    finalize_ownership = solo_kwargs.pop(
+        "mtp_batch_finalize_ownership", MTPBatchFinalizeOwnership()
+    )
+    solo_kwargs["seed"] = generation_seed
+    solo_kwargs["request_observability"] = dict(request_observability)
+    request_observability.update(
+        {
+            "scheduler_lane": "dense_mtp_batch",
+            "scheduler_mode": "mtp_batch",
+            "scheduler_policy": "dense_mtp_batch",
+            "mtp_disabled_reason": None,
+        }
+    )
+    stop_token_ids = _default_stop_tokens(state.runtime.tokenizer)
+    cancel_event = kwargs.get("cancel_event") or Event()
+    job = DenseMTPBatchJob(
+        request_id=response_id or f"densemtpbatch-{uuid.uuid4().hex}",
+        prompt_ids=prompt_ids,
+        max_tokens=response_max,
+        sampler=sampler,
+        seed=generation_seed,
+        stop_token_ids=stop_token_ids,
+        compatibility_key=dense_mtp_batch_compatibility_key(
+            lane, sampler, stop_token_ids
+        ),
+        generation_limits=generation_limits,
+        # A cohort of one falls back to the ordinary solo MTP generation, so a
+        # lone request never pays batching's overhead to get batching's name.
+        solo_runner=lambda _job: _run_generation(state, prompt_ids, **solo_kwargs),
+        cancel_error=lambda item: _StreamCancelled(
+            f"request {item.request_id} cancelled"
+        ),
+        token_callback=kwargs.get("token_callback"),
+        prefill_callback=kwargs.get("prefill_callback"),
+        cancel_event=cancel_event,
+        finalize_ownership=finalize_ownership,
+        request_observability=request_observability,
+        session_id=kwargs.get("session_id"),
+    )
+    smart_fan_lease = _begin_smart_fan_request(
+        state,
+        request_id=_smart_fan_request_id(job.request_id, "densemtpbatch"),
+        request_observability=request_observability,
+    )
+    state.begin_foreground()
+    try:
+        try:
+            future = service.submit(job)
+        except DenseMTPBatchQueueFull as exc:
+            # Backpressure, surfaced as 503 with Retry-After so a client backs
+            # off. The same shape the server already uses to reject background
+            # requests when the model lock is busy.
+            raise HTTPException(
+                status_code=503,
+                detail=str(exc),
+                headers={"Retry-After": "1"},
+            ) from exc
+        scheduler = getattr(state, "model_scheduler", None)
+        if (
+            scheduler is not None
+            and hasattr(scheduler, "is_owner_thread")
+            and scheduler.is_owner_thread()
+            and hasattr(service, "pump_once")
+        ):
+            service.pump_once()
+        generated = future.result()
+    finally:
+        state.end_foreground()
+        _end_smart_fan_request(state, smart_fan_lease)
+    if bool(generated.pop("_dense_mtp_batch_solo", False)):
+        return generated
+    # Sealed-width truth: the request could not know its cohort width when it
+    # was enqueued, and later envelope stages re-apply request_observability
+    # over stats, so copy the sealed values back before finalization.
+    sealed_stats = generated.get("stats") or {}
+    for width_truth_key in (
+        "scheduler_policy",
+        "dense_mtp_batch_real_width",
+        "dense_mtp_batch_route_id",
+        "dense_mtp_batch_left_pad_tokens",
+    ):
+        if width_truth_key in sealed_stats:
+            request_observability[width_truth_key] = sealed_stats[width_truth_key]
+    return _finalize_mtp_batch_generation(
+        state,
+        prompt_ids,
+        generated,
+        session_id=kwargs.get("session_id"),
+        request_observability=request_observability,
+    )
+
+
 def _run_mtp_batch_generation_dispatched(
     state: ServerState,
     prompt_ids: list[int],
@@ -19916,6 +20417,83 @@ _SMART_FAN_ARRIVAL_PATHS = {
     "/v1/completions",
     "/v1/messages",
 }
+
+
+class _AdmissionControlMiddleware:
+    """Refuse with 503 + ``Retry-After`` at the ASGI boundary, under overload.
+
+    The dense lane already bounds its own queue and answers
+    ``DenseMTPBatchQueueFull`` as a 503 with ``Retry-After``. That check is
+    correct but DOWNSTREAM: a connection uvicorn has accepted and not yet
+    dispatched is invisible to it, because the request handler has not run.
+
+    Measured 2026-08-25 on the 27B at 128 concurrent against 8 slots: the
+    guarded queue peaked at 31 of 64 while 128 requests were outstanding. The
+    ~97 in between sat in uvicorn's accept backlog, where no in-process check
+    can see them, and their clients timed out. 464 issued, 288 TimeoutError,
+    **zero** 503s. A client that floods the server got no guidance at all, so
+    it could not tell "busy, retry" from "broken" and could not back off.
+
+    Counting here -- the first point MTPLX sees a request -- closes that gap.
+    Over the limit the answer is an immediate 503 carrying ``Retry-After``,
+    which is the contract the lane already promises, rather than a hang.
+
+    Uvicorn's own ``limit_concurrency`` would also shed load, but its 503
+    carries no ``Retry-After``, so it would satisfy the bound while breaking
+    the contract.
+
+    Observability paths stay exempt. Refusing ``/metrics`` under load would
+    blind the operator exactly when they most need to see what is happening.
+    """
+
+    #: Cheap read-only paths that must answer even while the server sheds load.
+    EXEMPT_PREFIXES = ("/health", "/metrics", "/v1/models")
+
+    def __init__(self, app: Any, state: Any, limit: int) -> None:
+        self.app = app
+        self.state = state
+        self.limit = int(limit)
+        self._in_flight = 0
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if (
+            self.limit <= 0
+            or scope.get("type") != "http"
+            or str(scope.get("path", "")).startswith(self.EXEMPT_PREFIXES)
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        if self._in_flight >= self.limit:
+            # Refused before routing, body parsing, or prompt encoding: the
+            # point of shedding here is that it costs nothing to say no.
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 503,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"retry-after", b"1"),
+                    ],
+                }
+            )
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": (
+                        b'{"error":{"message":"server at capacity; retry after '
+                        b'the interval in Retry-After","type":"overloaded"}}'
+                    ),
+                }
+            )
+            return
+
+        # Single event loop, so a plain counter is safe without a lock.
+        self._in_flight += 1
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            self._in_flight -= 1
 
 
 class _SmartFanArrivalMiddleware:
@@ -20228,6 +20806,13 @@ def _run_generation_dispatched(
             },
         )
     if _use_live_mtp_batch(state, effective_mode=effective_mode):
+        if getattr(state, "dense_mtp_batch_service", None) is not None:
+            return _run_dense_mtp_batch_generation_dispatched(
+                state,
+                prompt_ids,
+                response_id=response_id,
+                kwargs=kwargs,
+            )
         return _run_mtp_batch_generation_dispatched(
             state,
             prompt_ids,
@@ -25078,6 +25663,25 @@ def create_app(state: ServerState) -> FastAPI:
     # (the most recently added Starlette middleware runs first): fans only
     # ramp for requests that passed the API-key and rate-limit gates.
     app.add_middleware(_SmartFanArrivalMiddleware, state=state)
+    # Admission control, registered here so it runs AFTER auth and CORS but
+    # BEFORE the fan ramp and any routing: a request we are going to refuse
+    # should not spin up fans or parse a body. The bound is the lane's own
+    # capacity -- the slots it can decode plus the queue it will hold --
+    # because anything beyond that is a request the server cannot start in a
+    # useful time and should decline rather than let time out (see the
+    # middleware docstring for the measurement that motivated this).
+    _svc = getattr(state, "dense_mtp_batch_service", None)
+    _inflight_limit = _dense_batch_env_int("MTPLX_SERVER_MAX_INFLIGHT")
+    if _inflight_limit is None:
+        _inflight_limit = (
+            int(getattr(_svc, "cohort_slots", 0) or 0)
+            + int(getattr(_svc, "max_queue_depth", 0) or 0)
+            if _svc is not None
+            else 0
+        )
+    app.add_middleware(
+        _AdmissionControlMiddleware, state=state, limit=_inflight_limit
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -26931,16 +27535,33 @@ def create_app(state: ServerState) -> FastAPI:
                 top_p=None,
                 top_k=None,
             )
-            _validate_mtp_batch_request_contract(
-                state,
-                prompt_ids,
-                response_max=response_max,
-                constraint_spec=constraint_spec,
-                vision_splice=vision_splice,
-                background_request=background,
-                depth=request_depth,
-                resolved_mtp_depth=effective_request_depth,
-            )
+            # Preflight the contract of the lane this request will ACTUALLY
+            # reach. Both lanes run under scheduler_mode mtp_batch, and the
+            # A3B contract requires depth=1 because its capture graph is a
+            # fixed T2 geometry. The dense driver has no such pin and serves
+            # at the operator's configured depth, so applying the A3B contract
+            # here rejected every dense request with
+            # "mtp_batch requires depth=1" before dispatch ever ran.
+            if getattr(state, "dense_mtp_batch_service", None) is not None:
+                _validate_dense_mtp_batch_request_contract(
+                    state,
+                    prompt_ids,
+                    response_max=response_max,
+                    constraint_spec=constraint_spec,
+                    vision_splice=vision_splice,
+                    background_request=background,
+                )
+            else:
+                _validate_mtp_batch_request_contract(
+                    state,
+                    prompt_ids,
+                    response_max=response_max,
+                    constraint_spec=constraint_spec,
+                    vision_splice=vision_splice,
+                    background_request=background,
+                    depth=request_depth,
+                    resolved_mtp_depth=effective_request_depth,
+                )
         _reject_prompt_over_context(state, len(prompt_ids))
         current_system_hash = system_prompt_hash(messages_for_generation)
         if current_system_hash is not None and not background:
