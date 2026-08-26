@@ -182,7 +182,7 @@ def test_q6_quantize_shapes_and_dtypes() -> None:
 
     assert q.dtype == mx.uint8
     assert q.shape == (2, 7, 192)
-    assert scale.dtype == mx.float16
+    assert scale.dtype == mx.float32
     assert scale.shape == (2, 7, 1)
 
 
@@ -211,8 +211,8 @@ def test_q6_dequantized_error_stays_within_one_grid_step() -> None:
     assert bool(mx.all(mx.isfinite(back)).item())
 
     # On a scale = max|x| / 31 grid, round-to-nearest contributes half a step
-    # and the fp16 scale round trip adds a small relative term on top, so
-    # bound at well under one step rather than at exactly half of one.
+    # and floating-point evaluation adds a small relative term on top, so
+    # bound at well under one step rather than exactly half of one.
     step = mx.max(mx.abs(x), axis=-1, keepdims=True) / 31.0
     err = mx.abs(back - x)
     assert bool(mx.all(err <= 0.6 * step + 1e-3).item())
@@ -267,14 +267,14 @@ def test_q6_reconstruction_error_lies_between_q4_and_q8() -> None:
 @pytest.mark.parametrize(
     ("bits", "expected_bytes"),
     [
-        # K + V packed rows plus one fp16 scale each, head_dim = 256.
-        (8, 2 * 256 + 4),  # 516
-        (6, 2 * 192 + 4),  # 388
-        (4, 2 * 128 + 4),  # 260
+        # K + V packed rows plus one fp32 scale each, head_dim = 256.
+        (8, 2 * 256 + 8),  # 520
+        (6, 2 * 192 + 8),  # 392
+        (4, 2 * 128 + 8),  # 264
     ],
 )
 def test_calculated_kv_bytes_per_token_per_kv_head(bits: int, expected_bytes: int) -> None:
-    assert 2 * packed_dim(256, bits) + 4 == expected_bytes
+    assert 2 * packed_dim(256, bits) + 8 == expected_bytes
 
 
 def test_fp16_reference_bytes_per_token_per_kv_head() -> None:
@@ -286,7 +286,7 @@ def test_compression_ratio_orders_q4_then_q6_then_q8() -> None:
     r6 = compression_ratio(head_dim=256, bits=6)
     r4 = compression_ratio(head_dim=256, bits=4)
     assert r4 > r6 > r8 > 1.0
-    assert r6 == pytest.approx(1024 / 388)
+    assert r6 == pytest.approx(1024 / 392)
 
 
 def test_calculated_full_cache_size_for_the_qwen3_8_full_attention_layout() -> None:
@@ -299,6 +299,6 @@ def test_calculated_full_cache_size_for_the_qwen3_8_full_attention_layout() -> N
         return gib * bytes_per_token / (1024**3)
 
     assert gibibytes(1024) == pytest.approx(16.0)
-    assert gibibytes(516) == pytest.approx(8.0625)
-    assert gibibytes(388) == pytest.approx(6.0625)
-    assert gibibytes(260) == pytest.approx(4.0625)
+    assert gibibytes(520) == pytest.approx(8.125)
+    assert gibibytes(392) == pytest.approx(6.125)
+    assert gibibytes(264) == pytest.approx(4.125)

@@ -30,7 +30,7 @@ bound changes:
 | `q4` | 7    | 4 bits, packed |
 
 Per row (one token, one KV head): `scale = max(|x|) / qmax`, floored at 1e-6
-by the same minimum-scale guard the existing modes use, stored as one fp16
+by the same minimum-scale guard the existing modes use, stored as one fp32
 value. Values are divided by the scale, rounded, clipped to ±qmax, then
 biased into an unsigned code — `unsigned = q + 32` for q6, giving codes 1..63
 inside a 6-bit field.
@@ -67,9 +67,9 @@ measured process RAM:
 | mode | K | V | scales | total |
 |------|---|---|--------|-------|
 | fp16 | 512 | 512 | — | 1024 B |
-| `q8` | 256 | 256 | 4 | 516 B |
-| `q6` | 192 | 192 | 4 | 388 B |
-| `q4` | 128 | 128 | 4 | 260 B |
+| `q8` | 256 | 256 | 8 | 520 B |
+| `q6` | 192 | 192 | 8 | 392 B |
+| `q4` | 128 | 128 | 8 | 264 B |
 
 For a completely filled 262,144-token Qwen 3.8 full-attention cache — 16
 full-attention layers, 4 KV heads:
@@ -77,9 +77,9 @@ full-attention layers, 4 KV heads:
 | mode | cache |
 |------|-------|
 | fp16 | ~16.00 GiB |
-| `q8` | ~8.0625 GiB |
-| `q6` | ~6.0625 GiB |
-| `q4` | ~4.0625 GiB |
+| `q8` | ~8.125 GiB |
+| `q6` | ~6.125 GiB |
+| `q4` | ~4.125 GiB |
 
 These are storage calculations and are asserted as such in the unit tests.
 They are not a measurement of total process memory, which also carries
