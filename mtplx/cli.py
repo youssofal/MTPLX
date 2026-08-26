@@ -1881,36 +1881,31 @@ def _cmd_mtp_adaptive(args: argparse.Namespace) -> int:
 def _cmd_dflash_mlx_baseline(args: argparse.Namespace) -> int:
     from .benchmarks.runners.competitor_baselines import (
         run_dflash_mlx_baseline,
-        write_competitor_result,
     )
+    from .benchmarks.runners.dflash2_depth_sweep import write_depth_sweep_result
 
     result = run_dflash_mlx_baseline(
         args.model,
         args.draft_model,
-        args.prompts,
-        dflash_source=args.dflash_source,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
         max_tokens=args.max_tokens,
         block_size=args.block_size,
-        seed=args.seed,
-        limit=args.limit,
-        enable_thinking=False if args.disable_thinking else None,
-        draft_sliding_window_size=args.draft_sliding_window_size,
     )
     if args.output:
-        write_competitor_result(args.output, result)
+        write_depth_sweep_result(args.output, result)
     print(json.dumps(result, indent=2, sort_keys=True))
-    if result.get("error"):
-        return 2
-    failures = [
-        v
-        for row in result["rows"]
-        for v in row.get("validations", [])
-        if not v["passed"]
-    ]
-    return 0 if not failures else 2
+    return 0 if result.get("selection") is not None else 2
+
+
+def _cmd_dflash2_depth_sweep(args: argparse.Namespace) -> int:
+    from .benchmarks.runners.dflash2_depth_sweep import (
+        run_cli_sweep,
+        write_depth_sweep_result,
+    )
+
+    result = run_cli_sweep(args, token_count=args.max_tokens)
+    write_depth_sweep_result(args.output, result)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result.get("selection") is not None else 2
 
 
 def _cmd_ddtree_mlx_baseline(args: argparse.Namespace) -> int:
@@ -4875,23 +4870,31 @@ def build_parser() -> argparse.ArgumentParser:
     adaptive_p.set_defaults(func=_cmd_mtp_adaptive)
 
     dflash_p = sub.add_parser(
-        "dflash-mlx-baseline", help="Run official DFlash MLX baseline"
+        "dflash-mlx-baseline", help="Run one stock Qwen3.8 DFlash2 width"
     )
     dflash_p.add_argument("--model", default=default_model)
-    dflash_p.add_argument("--draft-model", default="z-lab/Qwen3.6-27B-DFlash")
-    dflash_p.add_argument("--prompts", default="mtplx/benchmarks/prompts/default.jsonl")
-    dflash_p.add_argument("--dflash-source", default="REFERENCES:TOOLS/dflash")
-    dflash_p.add_argument("--temperature", type=float, default=0.6)
-    dflash_p.add_argument("--top-p", type=float, default=0.95)
-    dflash_p.add_argument("--top-k", type=int, default=20)
-    dflash_p.add_argument("--max-tokens", type=int, default=96)
-    dflash_p.add_argument("--block-size", type=int)
-    dflash_p.add_argument("--seed", type=int, default=0)
-    dflash_p.add_argument("--limit", type=int)
-    dflash_p.add_argument("--disable-thinking", action="store_true")
-    dflash_p.add_argument("--draft-sliding-window-size", type=int)
+    dflash_p.add_argument("--draft-model", default="z-lab/Qwen3.8-27B-DFlash2")
+    dflash_p.add_argument("--temperature", type=float, default=0.0, choices=(0.0,))
+    dflash_p.add_argument("--top-p", type=float, default=1.0, choices=(1.0,))
+    dflash_p.add_argument("--top-k", type=int, default=0, choices=(0,))
+    dflash_p.add_argument("--max-tokens", type=int, default=1024, choices=(1024,))
+    dflash_p.add_argument("--block-size", type=int, default=8, choices=range(1, 9))
     dflash_p.add_argument("--output")
     dflash_p.set_defaults(func=_cmd_dflash_mlx_baseline)
+
+    dflash2_p = sub.add_parser(
+        "dflash2-depth-sweep",
+        help="Run the guarded Qwen3.8 DFlash2 stock width sweep",
+    )
+    dflash2_p.add_argument("--model", default=default_model)
+    dflash2_p.add_argument("--draft-model", default="z-lab/Qwen3.8-27B-DFlash2")
+    dflash2_p.add_argument("--profile", default="turbo", choices=("turbo",))
+    dflash2_p.add_argument("--widths", default="1,2,3,4,5,6,7,8")
+    dflash2_p.add_argument("--repetitions", type=int, default=3)
+    dflash2_p.add_argument("--prompt-tokens", type=int, default=1024, choices=(1024,))
+    dflash2_p.add_argument("--max-tokens", type=int, default=1024, choices=(1024,))
+    dflash2_p.add_argument("--output", required=True)
+    dflash2_p.set_defaults(func=_cmd_dflash2_depth_sweep)
 
     ddtree_p = sub.add_parser("ddtree-mlx-baseline", help="Run DDTree MLX baseline")
     ddtree_p.add_argument("--model", default=default_model)

@@ -68,7 +68,7 @@ Citation = "https://github.com/youssofal/mtplx/blob/main/CITATION.cff"
 
 [project.optional-dependencies]
 competitors = [
-  "dflash-mlx==0.1.0",
+  "dflash-mlx @ git+https://github.com/davidtai/dflash-mlx.git@95a16104c5462793f9f14d2cd0b97b856fb643a1",
 ]
 server = [
   "fastapi>=0.136",

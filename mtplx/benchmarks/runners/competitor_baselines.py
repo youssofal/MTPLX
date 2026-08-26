@@ -19,157 +19,23 @@ from mtplx.benchmarks.validators.basic import (
 def run_dflash_mlx_baseline(
     model_path: Path | str,
     draft_model: str,
-    prompt_suite: Path | str,
     *,
-    dflash_source: Path | str = "REFERENCES:TOOLS/dflash",
-    temperature: float = 0.6,
-    top_p: float = 0.95,
-    top_k: int = 20,
-    max_tokens: int = 96,
-    block_size: int | None = None,
-    seed: int = 0,
-    limit: int | None = None,
-    enable_thinking: bool | None = None,
-    draft_sliding_window_size: int | None = None,
+    max_tokens: int = 1024,
+    block_size: int = 8,
 ) -> dict[str, Any]:
-    _add_source_path(dflash_source)
+    from types import SimpleNamespace
 
-    try:
-        from dflash.model_mlx import load, load_draft, stream_generate
-        from mlx_lm.sample_utils import make_sampler
-    except Exception as exc:  # pragma: no cover - environment/reporting path
-        return _error_result(
-            "dflash_mlx_official",
-            model_path,
-            draft_model,
-            prompt_suite,
-            "import_failed",
-            exc,
-        )
+    from mtplx.benchmarks.runners.dflash2_depth_sweep import run_cli_sweep
 
-    try:
-        draft = load_draft(str(draft_model), sliding_window_size=draft_sliding_window_size)
-        target_model, tokenizer = load(str(model_path))
-    except Exception as exc:
-        return _error_result(
-            "dflash_mlx_official",
-            model_path,
-            draft_model,
-            prompt_suite,
-            "load_failed",
-            exc,
-        )
-
-    sampler = make_sampler(temp=temperature, top_p=top_p, top_k=top_k)
-    rows = []
-    prompts = load_prompt_suite(prompt_suite)
-    if limit is not None:
-        prompts = prompts[:limit]
-
-    for index, case in enumerate(prompts):
-        messages = case.messages or [{"role": "user", "content": case.prompt}]
-        kwargs: dict[str, Any] = {}
-        if enable_thinking is not None:
-            kwargs["enable_thinking"] = enable_thinking
-        prompt = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            **kwargs,
-        )
-
-        chunks = []
-        acceptance_lengths = []
-        final = None
-        try:
-            for response in stream_generate(
-                target_model,
-                draft,
-                tokenizer,
-                prompt,
-                block_size=block_size,
-                max_tokens=min(max_tokens, case.max_tokens),
-                temperature=temperature,
-                sampler=sampler,
-            ):
-                final = response
-                if response.text:
-                    chunks.append(response.text)
-                if response.accepted:
-                    acceptance_lengths.append(int(response.accepted))
-        except Exception as exc:
-            rows.append(
-                {
-                    "prompt_id": case.id,
-                    "category": case.category,
-                    "prompt_sha256": case.prompt_sha256,
-                    "error": repr(exc),
-                    "validations": [],
-                }
-            )
-            continue
-
-        text = "".join(chunks)
-        validations = [asdict(validate_no_degenerate_loop(text))]
-        if case.category == "json_tool":
-            validations.append(asdict(validate_json_text(text.strip())))
-
-        generated_tokens = int(getattr(final, "generation_tokens", 0) or 0)
-        tok_s = float(getattr(final, "generation_tps", 0.0) or 0.0)
-        rows.append(
-            {
-                "prompt_id": case.id,
-                "category": case.category,
-                "prompt_sha256": case.prompt_sha256,
-                "generated_tokens": generated_tokens,
-                "tok_s": tok_s,
-                "acceptance_lengths": acceptance_lengths,
-                "mean_acceptance_length": (
-                    statistics.mean(acceptance_lengths) if acceptance_lengths else None
-                ),
-                "prompt_tps": float(getattr(final, "prompt_tps", 0.0) or 0.0),
-                "peak_memory_gb": float(getattr(final, "peak_memory", 0.0) or 0.0),
-                "finish_reason": getattr(final, "finish_reason", None),
-                "validations": validations,
-                "text": text,
-            }
-        )
-
-    validations = [v for row in rows for v in row.get("validations", [])]
-    successful = [row for row in rows if row.get("tok_s") is not None]
-    return {
-        "backend": "dflash_mlx_official",
-        "model_path": str(model_path),
-        "draft_model": str(draft_model),
-        "prompt_suite": str(prompt_suite),
-        "sampler": {
-            "temperature": temperature,
-            "top_p": top_p,
-            "top_k": top_k,
-            "note": "DFlash MLX uses sampled prefix matching at temperature, not residual-corrected speculative sampling.",
-        },
-        "max_tokens": max_tokens,
-        "block_size": block_size,
-        "seed": seed,
-        "enable_thinking": enable_thinking,
-        "rows": rows,
-        "summary": {
-            "prompts": len(rows),
-            "successful_prompts": len(successful),
-            "generated_tokens": sum(int(row.get("generated_tokens") or 0) for row in rows),
-            "mean_tok_s": (
-                statistics.mean([float(row["tok_s"]) for row in successful])
-                if successful
-                else 0.0
-            ),
-            "mean_acceptance_length": _mean_present(
-                row.get("mean_acceptance_length") for row in successful
-            ),
-            "validations_passed": sum(1 for v in validations if v["passed"]),
-            "validations_total": len(validations),
-            "peak_memory_gb": max([float(row.get("peak_memory_gb") or 0.0) for row in rows] or [0.0]),
-        },
-    }
+    return run_cli_sweep(
+        SimpleNamespace(
+            model=str(model_path),
+            draft_model=str(draft_model),
+            widths=str(block_size),
+            repetitions=1,
+        ),
+        token_count=max_tokens,
+    )
 
 
 def run_ddtree_mlx_baseline(
