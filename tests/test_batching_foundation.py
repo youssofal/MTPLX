@@ -185,6 +185,64 @@ def test_mtp_batch_scheduler_does_not_mark_parallel_decode_as_ar_fallback():
     assert snapshot["stats"]["last_mtp_disabled_reason"] is None
 
 
+def test_experimental_cohort_mode_is_not_reported_as_mtp_disabled():
+    """`mtp_cohort_experimental` is an opt-IN cohort mode, not an absence of one.
+
+    The gate tested only `!= MTP_BATCH`, so the experimental mode -- whose whole
+    purpose is batched MTP decode -- reported speculation as disabled every time
+    it decoded a cohort wider than one.
+    """
+
+    hooks = FakeHooks()
+    config = BatchSchedulerConfig(
+        mode=SchedulerMode.MTP_COHORT_EXPERIMENTAL,
+        preset=SchedulerPreset.THROUGHPUT,
+        max_active_requests=8,
+        decode_batch_max=8,
+        prefill_chunk_tokens=8,
+    )
+    scheduler = MTPContinuousScheduler(config=config, hooks=hooks)
+    scheduler.submit(RequestState("r1", prompt_ids=[1, 2], max_tokens=1))
+    scheduler.submit(RequestState("r2", prompt_ids=[3, 4], max_tokens=1))
+
+    scheduler.run_until_idle()
+
+    snapshot = scheduler.snapshot()
+    assert hooks.decode_batches == [["r1", "r2"]]
+    assert snapshot["stats"]["last_mtp_disabled_reason"] is None
+
+
+def test_the_mtp_disabled_reason_clears_when_it_stops_applying():
+    """It describes the LAST decode batch, so it has to be able to go away.
+
+    The reason was only ever set, never cleared, so one wide cohort in a
+    non-MTP mode made the scheduler report MTP as disabled for the rest of its
+    life -- including after the condition stopped holding. A stale diagnostic
+    that never recovers is worse than none, because it is read as current.
+    """
+
+    hooks = FakeHooks()
+    config = BatchSchedulerConfig(
+        mode=SchedulerMode.AR_BATCH,
+        preset=SchedulerPreset.AGENT,
+        max_active_requests=4,
+        decode_batch_max=2,
+        prefill_chunk_tokens=8,
+    )
+    scheduler = MTPContinuousScheduler(config=config, hooks=hooks)
+    scheduler.submit(RequestState("r1", prompt_ids=[1, 2], max_tokens=1))
+    scheduler.submit(RequestState("r2", prompt_ids=[3, 4], max_tokens=1))
+    scheduler.run_until_idle()
+    assert scheduler.stats.last_mtp_disabled_reason == "batch_size_gt_1"
+
+    # A subsequent SOLO decode batch is not an MTP-disabled situation.
+    scheduler.submit(RequestState("r3", prompt_ids=[5, 6], max_tokens=1))
+    scheduler.run_until_idle()
+    assert scheduler.stats.last_mtp_disabled_reason is None, (
+        "the reason survived the condition that produced it"
+    )
+
+
 def test_cooperative_scheduler_cancellation_finishes_once():
     hooks = FakeHooks()
     config = BatchSchedulerConfig(

@@ -1365,10 +1365,53 @@ def test_refill_requires_foldin_and_cohort() -> None:
             _FakeRuntime(), prompts, max_new_tokens=4,
             reject_mode="foldin", refill_queue=[],
         )
-    with pytest.raises(ValueError, match="length"):
+    with pytest.raises(ValueError, match="at least one token"):
         generate_greedy_batched(
             _FakeRuntime(), prompts, max_new_tokens=4, cohort_slots=4,
-            reject_mode="foldin", refill_queue=[[1, 2]],
+            reject_mode="foldin", refill_queue=[[]],
+        )
+
+
+def test_a_refill_prompt_of_a_different_length_is_served_not_refused() -> None:
+    """The `_admit_rows` padding trap, closed.
+
+    A ragged refill queue used to be refused, with a message telling the caller
+    to "left_pad the whole request set together" -- which is the ONE workaround
+    that must not be used on this trunk, because `left_pad_prompts` folds its
+    pads into the GDN recurrent state with no mask and fails silently. The
+    refusal was loud; the remedy it named was not. Admission now groups joiners
+    by length and prefills each group at its own length, so no pad token ever
+    enters a joining row and there is nothing to left-pad.
+
+    The joiners are three different lengths, none of them the cohort's, so no
+    single shared width could have served them.
+    """
+
+    prompts = _distinct_prompts(2)
+    cohort_len = len(prompts[0])
+    short = [40, 7]
+    long_one = [41, 6, 5, 4, 3]
+    longer = [42, 2, 1, 5, 4, 3, 2]
+    assert len({len(short), len(long_one), len(longer), cohort_len}) == 4
+
+    res = generate_greedy_batched(
+        _FakeRuntime(),
+        prompts,
+        max_new_tokens=4,
+        cohort_slots=4,
+        reject_mode="foldin",
+        refill_queue=[short, long_one, longer],
+    )
+    assert len(res.streams) == 5, "one stream per REQUEST"
+    solo = _reference_single_stream([short, long_one, longer], max_new_tokens=4)
+    for offset, (joiner, expected) in enumerate(
+        zip([short, long_one, longer], solo)
+    ):
+        stream = res.streams[2 + offset]
+        assert stream.prompt_len == len(joiner), stream.index
+        assert stream.tokens == expected, (
+            f"joiner of length {len(joiner)} did not produce its own "
+            "continuation; a pad prefix reached its recurrent state"
         )
 
 

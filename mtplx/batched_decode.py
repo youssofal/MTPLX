@@ -425,13 +425,37 @@ def left_pad_prompts(
 ) -> tuple[list[list[int]], list[int]]:
     """Left-pad a ragged prompt batch to a shared length with ``pad_id``.
 
+    **On a hybrid GDN trunk this is SILENTLY INCORRECT, and it is kept only to
+    reproduce historical results.** Use ``ragged_prompts=True`` on the dense MTP
+    driver, or a ragged refill queue here, for anything whose output matters.
+
+    The reason is specific to the architecture. Attention layers keep an
+    addressable KV cache, so a per-row offset genuinely un-sees a pad prefix.
+    GDN layers keep a RECURRENT state, into which every token this function
+    prepends is folded, and no offset rewinds that -- the contamination is not
+    stored positionally. A padded row's recurrent state entering its first real
+    token is therefore not the zero state, and nothing complains: the model
+    loads, runs, and returns fluent text conditioned on tokens the caller never
+    sent.
+
+    The guard rail for this EXISTS and is simply never switched on.
+    ``create_ssm_mask(h, cache)`` is ``cache.make_mask(N)``, which returns a
+    real per-row mask when ``left_padding`` or ``lengths`` is set on the cache
+    entry, and threads it into ``gated_delta_update`` so a masked position
+    leaves the state untouched. Nothing in this module sets either attribute,
+    so ``make_mask`` returns ``None`` and every pad is folded in. Wiring it up
+    would make padding CORRECT but not FREE: the rectangle is still
+    ``[B, max_len]``, so a short prompt still pays the longest prompt's prefill
+    flops. Prefilling each length group on its own costs neither, which is why
+    that is what both drivers do.
+
     The batch-generic decode cache carries ONE shared offset, so every stream
-    must enter the loop at the same length.  Left-padding keeps each stream's
-    TRUE last token at the final position (so its next-token logits are its own),
-    at the cost of the model attending to the pad prefix — acceptable for the
-    Phase-1 throughput/correctness gate because the single-stream reference is
-    fed the IDENTICAL padded prompt (apples-to-apples; the gate tests batching
-    isolation, not prompt semantics).  Returns ``(padded, true_lengths)``.
+    must enter the loop at the same length; that is the constraint this
+    function was written for.  Left-padding keeps each stream's TRUE last token
+    at the final position, so its next-token logits are its own, which is why
+    the Phase-1 throughput gate could use it: the single-stream reference is fed
+    the IDENTICAL padded prompt, so the gate compares batching isolation and
+    makes no claim about prompt semantics.  Returns ``(padded, true_lengths)``.
     """
     if not prompts:
         raise ValueError("prompts must be non-empty")
@@ -1092,11 +1116,17 @@ def generate_greedy_batched(
                 "refill_queue requires fixed-shape cohort mode (cohort_slots)"
             )
         for q in refill_queue:
-            if len(q) != prompt_len:
-                raise ValueError(
-                    "refill prompts must share the cohort prompt length "
-                    f"({prompt_len}); left_pad the whole request set together"
-                )
+            if len(q) < 1:
+                raise ValueError("each refill prompt needs at least one token")
+        # Refill prompts may differ in length from the cohort and from each
+        # other. Admission groups them by length and prefills each group at its
+        # OWN length, so no pad token ever enters a joining row.
+        #
+        # This used to be an error whose message read "left_pad the whole
+        # request set together", which is the one thing a caller must not do
+        # here: `left_pad_prompts` folds its pads into the GDN recurrent state
+        # with no mask, and fails silently. An error that refuses the safe input
+        # and recommends the unsafe workaround is worse than no check.
     # One entry per REQUEST (non-refill: exactly the initial prompts).
     requests: list[list[int]] = [list(p) for p in slots[:n_real]]
     if refill:
@@ -1222,19 +1252,51 @@ def generate_greedy_batched(
             # (idle pin sits at prompt_len < cap).  prompt_len + max_new + a small
             # lag margin; a tight growth step keeps the frozen cap (= the SDPA key
             # width read EVERY cycle) near that bound, not a 256-step round-up.
-            frozen_cap = prompt_len + max_new_tokens + 16
+            # The TRUE per-slot bound over every request a slot may serve:
+            # a slot admits at offset 0, prefills to that request's length, then
+            # decodes at most max_new more. With ragged refill the longest
+            # request in the whole set sets the bound, not the initial cohort's
+            # length -- sizing it off `prompt_len` alone under-grew the buffer
+            # the moment a joiner was longer than the cohort that sealed.
+            frozen_cap = (
+                max(len(request) for request in requests) + max_new_tokens + 16
+            )
             for rc in ragged_entries:
                 rc.step = 32
                 rc.freeze_capacity(frozen_cap)
-            dummy_row = [int(pad_id)] * prompt_len
             next_req = n_real
 
             def _admit_rows(
                 assign: dict[int, int], ll: Any, hl: Any, flags: list[bool] | None
             ) -> tuple[Any, Any]:
                 """Admit ``assign`` (slot -> request idx) via ONE cohort-shaped
-                ragged prefill; every other row's state/offsets are put back."""
+                ragged prefill; every other row's state/offsets are put back.
+
+                Every request in ``assign`` MUST share a length, and that is
+                what makes the forward's last position each admitted row's own
+                last position. With a shared length there is no padding in any
+                joining row, so nothing is folded into its recurrent state that
+                its caller did not send. Callers with mixed lengths split the
+                assignment by length and call this once per group; see
+                ``admit_fn``.
+
+                The rows that are NOT joining are fed pad tokens because the
+                rectangle has to be full, and that is safe for a different
+                reason: their recurrent state is snapshotted before the forward
+                and masked-restored after it, and their KV offsets are put back,
+                so nothing this forward showed them survives.
+                """
                 nonlocal admission_passes
+                widths = {len(requests[rid]) for rid in assign.values()}
+                if len(widths) > 1:
+                    raise RuntimeError(
+                        "an admission group must share one prompt length; got "
+                        f"{sorted(widths)}. Padding them to a common width would "
+                        "fold pad tokens into the GDN recurrent state, which no "
+                        "offset rewinds and which fails silently"
+                    )
+                width = widths.pop() if widths else prompt_len
+                dummy_row = [int(pad_id)] * width
                 admit_host = [b in assign for b in range(batch)]
                 keep_host = [not m for m in admit_host]
                 admit_dev = mx.array(admit_host)
@@ -1264,7 +1326,7 @@ def generate_greedy_batched(
                         )
                 restore_untrimmable_cache_masked(foldin_cache, pre_state, keep_host)
                 if ragged_entries:
-                    admitted_off = mx.full((batch,), prompt_len, dtype=mx.int32)
+                    admitted_off = mx.full((batch,), width, dtype=mx.int32)
                     for rc, saved in zip(ragged_entries, saved_offsets):
                         rc.offsets = mx.where(
                             admit_dev, admitted_off, saved
@@ -1304,7 +1366,17 @@ def generate_greedy_batched(
                         next_req += 1
                 if not assign:
                     return ll, hl
-                return _admit_rows(assign, ll, hl, flags)
+                # One forward per DISTINCT joiner length. Joiners of the same
+                # length share a forward and amortize the weight read between
+                # them; differing lengths cost a forward each, which is the
+                # price of every row's logits landing on its own last token
+                # instead of on a pad.
+                by_length: dict[int, dict[int, int]] = {}
+                for slot, rid in assign.items():
+                    by_length.setdefault(len(requests[rid]), {})[slot] = rid
+                for length in sorted(by_length):
+                    ll, hl = _admit_rows(by_length[length], ll, hl, flags)
+                return ll, hl
 
             def work_remaining() -> bool:
                 return next_req < len(requests) or not all(done)
@@ -1496,7 +1568,10 @@ def generate_greedy_batched(
     streams = [
         BatchedStreamResult(
             index=r,
-            prompt_len=prompt_len,
+            # The REQUEST's own length. Reporting the cohort's shared length
+            # was harmless while every request had to share it; with a ragged
+            # refill queue it hands a caller another request's prompt length.
+            prompt_len=len(requests[r]),
             tokens=tokens[r],
             finish_reason=str(finish[r]),
             sha=token_sha(tokens[r]),
