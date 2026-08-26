@@ -4,6 +4,15 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`q6` paged KV cache quantization.** Adds an opt-in intermediate 6-bit
+  storage mode between `q8` and `q4`, packing four codes into three bytes.
+  It is available through config, CLI, environment variables, and the app on
+  supported Qwen families. Defaults remain unchanged.
+
 ## [2.9.2] - 2026-08-25
 
 ### Changed
@@ -561,7 +570,6 @@ pulling.
   resume. **Users on ≤2.7.1 should upgrade before pulling repaired repos**;
   a failed pull from an older build is recovered by deleting the corrupt
   `config.json` + `model.safetensors.index.json` and pulling again.
-
 ## [2.7.1] - 2026-08-15
 
 Clears the 2.7.0 known-issues list: `xhigh` is now selectable everywhere it is

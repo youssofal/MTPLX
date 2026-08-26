@@ -699,7 +699,7 @@ struct InferenceParamsOverlay: View, Equatable {
         case "qwen3_5", "qwen3_6", "qwen3_8":
             return KVQuantPolicy(
                 supported: true,
-                modes: ["off", "q8", "q4"],
+                modes: ["off", "q8", "q6", "q4"],
                 restartRequired: true,
                 proofLevel: "qwen_only"
             )
@@ -774,8 +774,8 @@ struct InferenceParamsOverlay: View, Equatable {
         kvQuantPolicy?.supported ?? true
     }
     private var kvQuantModes: [String] {
-        let modes = kvQuantPolicy?.modes.filter { ["off", "q8", "q4"].contains($0) }
-        return (modes?.isEmpty == false) ? modes! : ["off", "q8", "q4"]
+        let modes = kvQuantPolicy?.modes.filter { ["off", "q8", "q6", "q4"].contains($0) }
+        return (modes?.isEmpty == false) ? modes! : ["off", "q8", "q6", "q4"]
     }
     private var depthControlSupportsMtpOff: Bool {
         draftControlSupported
@@ -1407,6 +1407,7 @@ struct InferenceParamsOverlay: View, Equatable {
     private static func kvQuantLabel(_ mode: String) -> String {
         switch mode {
         case "q8": return "q8"
+        case "q6": return "q6"
         case "q4": return "q4"
         default: return "Off"
         }
@@ -1430,7 +1431,7 @@ struct InferenceParamsOverlay: View, Equatable {
     private var currentKVQuantization: String {
         guard kvQuantSupported else { return "off" }
         switch snapshot.configuration.pagedKVQuantization {
-        case "q8", "q4":
+        case "q8", "q6", "q4":
             return snapshot.configuration.pagedKVQuantization
         default:
             return "off"

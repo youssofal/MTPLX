@@ -3182,6 +3182,40 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(command.environment["MTPLX_VLLM_METAL_PAGED_KV_QUANT"], "q8")
     }
 
+    func testCommandBuilderEmitsQ6PagedKVQuantizationEnv() throws {
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
+        let command = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed-FP16",
+                profile: "turbo",
+                pagedKVQuantization: "q6"
+            ),
+            target: .openCode
+        )
+
+        // q6 must survive normalization: an unknown mode falls back to "off"
+        // and exports nothing, which is how a new mode silently disappears.
+        XCTAssertEqual(command.environment["MTPLX_VLLM_METAL_PAGED_KV_QUANT"], "q6")
+    }
+
+    func testCommandBuilderNormalizesQ6Aliases() throws {
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
+        let command = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed-FP16",
+                profile: "turbo",
+                pagedKVQuantization: "int6"
+            ),
+            target: .openCode
+        )
+
+        XCTAssertEqual(command.environment["MTPLX_VLLM_METAL_PAGED_KV_QUANT"], "q6")
+    }
+
     func testOfficialModelCatalogIncludesOptimizedQuality() throws {
         let quality = try XCTUnwrap(
             MTPLXModelOption.option(matching: "mtplx-qwen36-27b-optimized-quality")

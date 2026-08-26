@@ -884,7 +884,7 @@ struct ResolvedDaemonArgs {
 
     private static func modelAllowsPagedKVQuantization(_ model: String) -> Bool {
         // Same qwen3_next attention layout for 3.5 / 3.6 / 3.8; the server's
-        // kv_quant_policy declares q8/q4 supported for all three.
+        // kv_quant_policy declares q8/q6/q4 supported for all three.
         let family = MTPLXModelOption.modelFamily(for: model)
         return family == "qwen3_5" || family == "qwen3_6" || family == "qwen3_8"
     }
@@ -948,6 +948,8 @@ struct ResolvedDaemonArgs {
         switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().replacingOccurrences(of: "-", with: "_") {
         case "q8", "q8_0", "int8":
             return "q8"
+        case "q6", "int6":
+            return "q6"
         case "q4", "q4_0", "int4":
             return "q4"
         default:

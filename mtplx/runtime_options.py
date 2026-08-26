@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Mapping
 
 
-KV_QUANT_MODES = ("off", "q8", "q4")
+KV_QUANT_MODES = ("off", "q8", "q6", "q4")
 
 #: The one boolean vocabulary for MTPLX env flags.
 #:
@@ -149,10 +149,14 @@ def normalize_paged_kv_quantization(value: object | None, *, allow_none: bool = 
     raw = str(value).strip().lower().replace("-", "_")
     if raw in ("", "none", "false", "0", "disabled", "disable"):
         return "off"
-    if raw in ("off", "q8", "q4"):
+    if raw in ("off", "q8", "q6", "q4"):
         return raw
     if raw in ("8", "8bit", "int8", "uint8", "q8_0"):
         return "q8"
+    # q6 is MTPLX's own 4-codes-per-3-bytes packing; the aliases stay limited
+    # to bit-width spellings so no caller reads them as an external Q6 format.
+    if raw in ("6", "6bit", "int6", "uint6"):
+        return "q6"
     if raw in ("4", "4bit", "int4", "uint4", "q4_0"):
         return "q4"
     choices = ", ".join(KV_QUANT_MODES)

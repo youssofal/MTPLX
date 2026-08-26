@@ -6252,6 +6252,41 @@ def test_cli_parses_api_key_file_and_kv_quant_flags():
     assert serve.paged_kv_quantization == "off"
 
 
+def test_cli_parses_q6_kv_quant_flag():
+    parser = build_parser()
+
+    assert (
+        parser.parse_args(["serve", "--kv-quant", "q6"]).paged_kv_quantization == "q6"
+    )
+    # The bit-width alias normalizes at parse time like the q8/q4 spellings do.
+    assert (
+        parser.parse_args(["serve", "--kv-quant", "6bit"]).paged_kv_quantization == "q6"
+    )
+
+
+def test_config_set_accepts_q6_paged_kv_quantization(tmp_path, capsys):
+    config_path = tmp_path / "config.toml"
+
+    code = main(
+        [
+            "config",
+            "set",
+            "paged_kv_quantization",
+            "q6",
+            "--config",
+            str(config_path),
+        ]
+    )
+    assert code == 0
+    capsys.readouterr()
+
+    code = main(["config", "show", "--config", str(config_path), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["paged_kv_quantization"] == "q6"
+
+
 def test_quickstart_dry_run_json_previews_server_without_side_effects(
     monkeypatch, capsys
 ):

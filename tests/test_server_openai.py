@@ -1819,6 +1819,104 @@ def _fake_final_state(tokens):
     )
 
 
+def test_served_chat_completion_really_uses_q6_paged_kv(monkeypatch):
+    """Prove the public serving route reaches q6 storage, not just its flags."""
+    mx = pytest.importorskip("mlx.core")
+    from mtplx.cache_state import (
+        VllmMetalPagedKVCache,
+        configure_tail_owned_attention_kv_cache,
+    )
+
+    class EmptyTrimmableCache:
+        keys = None
+        values = None
+        offset = 0
+        _idx = None
+
+        def is_trimmable(self):
+            return True
+
+        def trim(self, _count):
+            return 0
+
+    class ServedQ6Runtime:
+        mtp_enabled = False
+        model_path = Path("models/q6-serve-proof")
+        backend_id = "qwen3_next"
+
+        def __init__(self):
+            self.tokenizer = StreamingTokenizer()
+            self.created_caches = []
+            self.diagnostic_counters = {}
+            self.contract = SimpleNamespace(base_hidden_variant="post_norm")
+
+        def make_cache(self):
+            cache = [EmptyTrimmableCache()]
+            configure_tail_owned_attention_kv_cache(cache)
+            self.created_caches.append(cache)
+            return cache
+
+        def repage_target_prefill_cache(self, _cache):
+            return False
+
+        def forward_ar(
+            self,
+            input_ids,
+            *,
+            cache,
+            return_hidden=False,
+            hidden_variant=None,
+            emit_logits=True,
+            logits_keep=None,
+            input_embeddings=None,
+        ):
+            del hidden_variant, emit_logits, logits_keep, input_embeddings
+            assert return_hidden is False
+            token_count = int(input_ids.shape[1])
+            keys = mx.arange(token_count * 8, dtype=mx.float32).reshape(
+                1, 1, token_count, 8
+            )
+            cache[0].update_and_fetch(keys, keys + 0.5)
+            # A deterministic one-token response; max_tokens=1 ends the run.
+            return mx.array([[[0.0, 1.0]]], dtype=mx.float32)
+
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN", "1")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_KV_QUANT", "q6")
+    monkeypatch.setenv("MTPLX_PAGED_KV_QUANT", "q6")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_NUM_BLOCKS", "16")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_BLOCK_SIZE", "16")
+
+    state = _fake_streaming_session_state()
+    state.runtime = ServedQ6Runtime()
+    state.args.generation_mode = "ar"
+    state.args.stats_footer = False
+    state.draft_sampler = None
+    state.requests_completed = 0
+
+    with TestClient(create_app(state)) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"x-mtplx-cache-mode": "bypass"},
+            json={
+                "messages": [{"role": "user", "content": "prove q6"}],
+                "max_tokens": 1,
+                "temperature": 0,
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert state.runtime.created_caches, "served generation never created a cache"
+    served_cache = state.runtime.created_caches[0][0]
+    assert isinstance(served_cache, VllmMetalPagedKVCache)
+    assert served_cache.kv_quant is True
+    assert served_cache.kv_quant_config.normalized_mode == "q6"
+    assert served_cache.kv_quant_config.bits == 6
+    assert served_cache.offset > 0
+    assert served_cache.key_cache.dtype == mx.uint8
+    assert served_cache.key_cache.shape[-1] == 6  # 8 values packed at 6 bits.
+    assert served_cache.key_scale_cache is not None
+
+
 def test_mtplx_settings_endpoint_controls_server_reasoning():
     state = _fake_state(api_key="mtplx-local")
     client = TestClient(create_app(state))
@@ -2319,7 +2417,7 @@ def test_openai_server_health_metrics_and_models_fake_state():
     }
     assert health.json()["api_key_required"] is False
     assert health.json()["api_key_source"] == "none"
-    assert health.json()["paged_kv_quantization"] in {"off", "q4", "q8"}
+    assert health.json()["paged_kv_quantization"] in {"off", "q4", "q6", "q8"}
     assert health.json()["warmup"]["ran"] is False
     assert health.json()["startup"]["pid"] > 0
     assert health.json()["startup"]["warmup"]["ran"] is False

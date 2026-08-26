@@ -373,7 +373,7 @@ QWEN3_NEXT_DESCRIPTOR = BackendDescriptor(
     tune_policy=TunePolicy(supported=True),
     kv_quant_policy=KVQuantPolicy(
         supported=True,
-        modes=("off", "q8", "q4"),
+        modes=("off", "q8", "q6", "q4"),
         proof_level="unit_and_runtime_cache_validated",
         disabled_reason=None,
     ),
