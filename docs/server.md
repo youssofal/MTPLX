@@ -10,6 +10,24 @@ mtplx serve --host 127.0.0.1 --port 8000 --no-stats-footer
 See [Concurrency modes](concurrency.md) for scheduler selection, ownership
 rules, and model/backend-specific implementations.
 
+## Serving concurrent requests on a dense Qwen3.5 / Qwen3.8 model
+
+```bash
+mtplx serve --model <path> --scheduler-mode mtp_batch --decode-batch-max 8
+```
+
+`--scheduler-mode mtp_batch` is the only flag that turns it on; the rest are
+already defaults. Several requests then share one pass through the model, a
+request that arrives while a batch is running joins it, and one that finishes
+leaves immediately. `--decode-batch-max` is the batch width and is a maximum,
+not a target — three callers run as a batch of three.
+
+- Operator guide, settings and counters:
+  [dense MTP batch lane](concurrency/dense-mtp-batch.md)
+- **What the lane guarantees and what it does not** — read before depending on
+  reproducibility, seeds, memory or cancellation behaviour:
+  [what this lane promises](dense-mtp-batch-contract.md)
+
 Endpoints:
 
 - `GET /health`
