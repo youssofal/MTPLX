@@ -113,6 +113,60 @@ Sampler controls cover `temperature`, `top_p`, `top_k`, and the OpenAI penalty p
 Concurrent scheduler modes, ownership guarantees, and backend-specific
 implementations are documented in [Concurrency modes](docs/concurrency.md).
 
+## RAMP (this fork only)
+
+This fork adds **RAMP**: a fixed/long block-length policy plus a
+mismatch-tolerant fuzzy re-anchor fallback for MTPLX's built-in context-copy
+(prompt-lookup) drafter, off by default.
+
+**What it changes.** Stock context-copy proposes a short block (8–32 tokens,
+scaled to match confidence) and only fires on an *exact* n-gram match against
+the prompt. RAMP measured two things on real coding-agent workloads:
+
+1. On a bandwidth-bound Apple Silicon machine, the marginal cost of extra
+   verify-pass rows is nearly free until a kernel-selection regime change
+   around ~6 tokens — so a fixed, much longer block (48+ tokens) wins by a
+   wide margin instead of the short ladder.
+2. The exact n-gram key goes dark at every edit divergence in a coding-agent
+   workload (a renamed variable, a small diff). A mismatch-tolerant
+   short-anchor fallback recovers some of that dark window.
+
+**Measured, not estimated** (see `docs/ramp/` for the full evidence trail —
+POC ablations, adversarial reviews, live 128K ground truth):
+
+- **+45.9% to +71.4%** decode throughput on repetitive/edit-shaped
+  coding-agent tasks (real 128K context, temperature-0 output byte-identical
+  to stock on every request tested).
+- **Roughly neutral-to-slightly-negative** on genuinely open-ended,
+  non-repetitive generation (a real code review: RAMP found a usable match on
+  only ~8% of decode steps and ran slightly *slower* than stock). This is
+  exactly why it stays off by default and is scoped to editing/repetitive
+  workloads, not general chat or reasoning.
+
+**Enable it:**
+
+```bash
+MTPLX_RAMP_ENABLED=1 MTPLX_RAMP_BLOCK=48 MTPLX_RAMP_FUZZY=1 mtplx start
+```
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `MTPLX_RAMP_ENABLED` | off | Master switch. Off = byte-identical to stock. |
+| `MTPLX_RAMP_BLOCK` | `48` (when enabled) | Fixed proposal length in tokens. `0` keeps the stock confidence ladder. |
+| `MTPLX_RAMP_FUZZY` | on (when enabled) | Mismatch-tolerant fallback. Only a net win **combined with** a long block — do not enable with a short/zero block. |
+| `MTPLX_RAMP_ANCHOR_LEN` | `3` | Fuzzy anchor length. |
+| `MTPLX_RAMP_MAX_FUZZY_CANDIDATES` | `8` | Fuzzy candidate cap. |
+| `MTPLX_RAMP_SIMILARITY_SPAN` | `24` | Backward-similarity window for ranking fuzzy candidates. |
+
+**Where to point it:** file-edit/refactor/apply-diff agentic coding sessions.
+**Where not to:** open-ended chat, review, or reasoning-heavy sessions — leave
+it off there.
+
+`tests_ramp/verify_ramp_equivalence.py` is a standalone (no pytest) check
+that (a) RAMP-off reduces byte-for-byte to stock and (b) RAMP-on reproduces
+the measured win direction on the three real committed traces in
+`tests_ramp/fixtures/`.
+
 ## CLI quick reference
 
 ```bash
