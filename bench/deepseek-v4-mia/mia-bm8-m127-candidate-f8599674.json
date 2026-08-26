@@ -1,0 +1,234 @@
+{
+  "ar": {
+    "accepted_future_tokens": 0,
+    "decode_time_s": 0.7028611659916351,
+    "decode_tok_s": 8.536536502959118,
+    "drafted_future_tokens": 0,
+    "elapsed_s": 2.139779624994844,
+    "events": [
+      {
+        "step": 0,
+        "token": 313
+      },
+      {
+        "step": 1,
+        "token": 26509
+      },
+      {
+        "step": 2,
+        "token": 3737
+      },
+      {
+        "step": 3,
+        "token": 16
+      },
+      {
+        "step": 4,
+        "token": 21750
+      },
+      {
+        "step": 5,
+        "token": 260
+      }
+    ],
+    "generated_tokens": 6,
+    "milliseconds_per_token": 117.14352766527252,
+    "new_prefill_tokens": 128,
+    "peak_memory_bytes": 102167847019,
+    "peak_memory_kind": "mlx_allocator_peak",
+    "peak_memory_scope": "since_last_mlx_peak_reset",
+    "prefill_tok_s": 89.07951540186465,
+    "prefill_tok_s_token_basis": "new_prefill_tokens",
+    "prompt_time_s": 1.4369184590032091,
+    "prompt_tokens": 128,
+    "token_digest": "ddc35ab77fee202aff41bd7906939ea79d6feb52f36374c69920f37a45a38d0f",
+    "tokens": [
+      313,
+      26509,
+      3737,
+      16,
+      21750,
+      260
+    ]
+  },
+  "arm": "exact-stream",
+  "config_sha256": "39f3a9e158019dc34dd943b64f874cfc43e9e392e6ce9215a56f2e183d661d90",
+  "dflash_requested_revision": "144d8193a781a9ffea2fdfb22a137825e107c892",
+  "dflash_revision": "144d8193a781a9ffea2fdfb22a137825e107c892",
+  "dflash_url": "https://github.com/davidtai/dflash-mlx.git",
+  "dflash_vcs": "git",
+  "draft_artifact_index_sha256": "c0d0e18e8c84fe6f1b7dc6991a4ba5765d1965f21f8892887aa01169fc2ba2b3",
+  "dspark": {
+    "accepted_future_tokens": 5,
+    "decode_time_s": 0.30927766600000006,
+    "decode_tok_s": 19.40004293746836,
+    "drafted_future_tokens": 5,
+    "elapsed_s": 1.761837708,
+    "events": [
+      {
+        "acceptance_first_20_avg": 5.0,
+        "acceptance_history": [
+          5
+        ],
+        "acceptance_last_20_avg": 5.0,
+        "acceptance_ratio": 0.8333333333333334,
+        "accepted_from_draft": 5,
+        "adaptive_block_cycles": 0,
+        "adaptive_block_reductions": 0,
+        "block_tokens": 6,
+        "clear_cache_boundaries": false,
+        "cycles_completed": 1,
+        "draft_sink_size": 0,
+        "draft_window_size": 128,
+        "elapsed_us": 1761837.708,
+        "generated_token_ids": [
+          313,
+          26509,
+          3737,
+          16,
+          21750,
+          260
+        ],
+        "generation_tokens": 6,
+        "hit_kind": "miss",
+        "peak_memory_gb": 102.2419095,
+        "phase_timings_us": {
+          "commit": 0.0,
+          "draft": 0.0,
+          "draft_incremental": 0.0,
+          "draft_prefill": 0.0,
+          "prefill": 1452560.042,
+          "replay": 0.0,
+          "verify": 0.0
+        },
+        "prompt_token_count": 128,
+        "quantize_kv_cache": false,
+        "target_fa_window": 0,
+        "tokens_per_cycle": 6.0,
+        "verify_len_cap": 6
+      }
+    ],
+    "generated_tokens": 6,
+    "milliseconds_per_token": 51.546277666666676,
+    "new_prefill_tokens": 128,
+    "peak_memory_bytes": 102241909500,
+    "peak_memory_kind": "mlx_allocator_peak",
+    "peak_memory_scope": "since_last_mlx_peak_reset",
+    "prefill_tok_s": 88.12028163996543,
+    "prefill_tok_s_token_basis": "new_prefill_tokens",
+    "prompt_time_s": 1.452560042,
+    "prompt_tokens": 128,
+    "token_digest": "ddc35ab77fee202aff41bd7906939ea79d6feb52f36374c69920f37a45a38d0f",
+    "tokens": [
+      313,
+      26509,
+      3737,
+      16,
+      21750,
+      260
+    ]
+  },
+  "dspark_kv": {
+    "mode": "nvfp4_stock432",
+    "record_bytes": 432,
+    "ring_capacity_records": 128,
+    "ring_mode": "nvfp4_stock432_fixed_ring",
+    "stages": 3,
+    "start": 0
+  },
+  "dspark_stages": 3,
+  "engine": "dflash_mlx_0_1_10",
+  "exact": true,
+  "fp32_activations": false,
+  "future_draft_count": 5,
+  "guard_window_id": "c1c601f98956384a51e7007f67a8c36a0e130bf7d8a331c17085204ed01e49f9",
+  "index_sha256": "c0d0e18e8c84fe6f1b7dc6991a4ba5765d1965f21f8892887aa01169fc2ba2b3",
+  "installed_cache_plan": {
+    "context_capacity_tokens": 384000,
+    "max_batch_tokens": 8224,
+    "target_physical_capacity_tokens": 384005
+  },
+  "kind": "deepseek_v4_dspark_dflash2_k5",
+  "load_time_s": 82.08677008299856,
+  "memory": {
+    "mlx": {
+      "after_load": {
+        "active_bytes": 101811541922,
+        "peak_bytes": 103417930085,
+        "peak_scope": "process_lifetime_through_load"
+      },
+      "arm": {
+        "active_bytes_after": 101960688032,
+        "active_bytes_before": 101811541922,
+        "peak_bytes": 102241909500,
+        "peak_bytes_before": 0,
+        "peak_reset_before_arm": true,
+        "peak_scope": "since_explicit_arm_reset"
+      }
+    },
+    "process": {
+      "peak_rss_bytes_after_arm": 12803588096,
+      "peak_rss_bytes_after_load": 12803588096,
+      "peak_rss_scope": "process_lifetime_since_exec"
+    }
+  },
+  "mia_model": "0xSero/deepseek-v4-flash-0731-spark",
+  "mia_model_revision": "22f28d32b9b29b4352eaa380ff8c2c170b2847ab",
+  "mia_runtime_image_digest": "sha256:2e077489a83a0360952828051fe7f7a32c1801e5ce8436d85f7267583d614ff4",
+  "mia_source": "MiaAI-Lab/DeepSeek-v4-Flash-One-DGX-Spark",
+  "mia_source_config_sha256": "b001ec8308044aa11daa0e624f5aea5e5362a63c05879a83a7be046b00eada82",
+  "mia_source_index_sha256": "61af5c0782a8651ef893004e84369d2281a0fc316c8bcefc0bd8f76244224649",
+  "mia_source_revision": "d4ba142bc1d971eb73a911e207e3e963bbb3c455",
+  "mlx_version": "0.32.1",
+  "model": "/Users/davidtai/models/DeepSeek-V4-Flash-0731-spark-MiaAI-tp1",
+  "physical_verify_width": 6,
+  "quality_gate": {
+    "arm_at_divergence": null,
+    "arm_tokens": 6,
+    "baseline_at_divergence": null,
+    "baseline_tokens": 6,
+    "compared_tokens": 6,
+    "divergent_tokens": 0,
+    "enforced": true,
+    "first_divergence_index": null,
+    "pass": true
+  },
+  "request": {
+    "span_tokens": 134
+  },
+  "resident_parameter_bytes": 100171504120,
+  "schema_version": 3,
+  "source_head": "f859967414dd6a92e1fec78bf66908eda5515402",
+  "target_artifact_index_sha256": "b7a450f88c99aee7f6d44ecb127e91e45ab5ccb1a0dad49ca9eabb90b400c304",
+  "target_kv": {
+    "compressed_pages": [
+      {
+        "capacity_records": 96002,
+        "compress_ratio": 4,
+        "layers": 21
+      },
+      {
+        "capacity_records": 3001,
+        "compress_ratio": 128,
+        "layers": 20
+      }
+    ],
+    "indexer_capacity_records": 96002,
+    "indexer_mode": "fp8_e4m3_ue8m0_scale132_paged",
+    "indexer_record_bytes": 132,
+    "layers": 43,
+    "mode": "nvfp4_stock432",
+    "paged_compressed_layers": 41,
+    "paged_indexer_layers": 21,
+    "record_bytes": 432,
+    "start": 0,
+    "window_capacity_records": 8416,
+    "window_mode": "nvfp4_stock432_fixed_window"
+  },
+  "target_taps": [
+    40,
+    41,
+    42
+  ],
+  "timestamp_utc": "2026-08-22T19:47:10Z"
+}

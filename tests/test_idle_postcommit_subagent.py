@@ -35,6 +35,7 @@ def _fake_subagent_state(*, foreground_always: bool = False):
         return True if foreground_always else False
 
     return SimpleNamespace(
+        session_cache_route=openai._GENERIC_SESSION_CACHE_ROUTE,
         lock=foreground_lock,
         has_foreground=has_foreground,
         generation_executor=ThreadPoolExecutor(max_workers=1),

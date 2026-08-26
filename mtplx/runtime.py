@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import hashlib
 import inspect as py_inspect
 import json
@@ -88,6 +89,7 @@ class MTPLXRuntime:
     model_path: Path
     mtp_enabled: bool
     contract: MTPContract
+    backend_id: str | None = None
     mtp_adapter_path: Path | None = None
     mtp_adapter_metadata: dict[str, Any] | None = None
     mtp_adapter_merge_report: dict[str, Any] | None = None
@@ -108,6 +110,33 @@ class MTPLXRuntime:
     diagnostic_counters: dict[str, int] = field(default_factory=dict)
     _forward_ar_supports_emit_logits: bool | None = field(default=None, init=False, repr=False)
     _forward_ar_supports_logits_keep: bool | None = field(default=None, init=False, repr=False)
+    _target_cache_lifecycle_factory: Callable[[], Any] = field(
+        default=nullcontext,
+        init=False,
+        repr=False,
+    )
+    sealed_target_cache_lifecycle: bool = field(
+        default=False,
+        init=False,
+    )
+
+    def __post_init__(self) -> None:
+        if self.backend_id != "deepseek_v4_dspark":
+            return
+        target_model = getattr(self.model, "language_model", self.model)
+        plan = getattr(target_model, "_mia_engine_plan", None)
+        lifecycle = getattr(plan, "target_cache_lifecycle", None)
+        if not callable(lifecycle):
+            raise RuntimeError(
+                "the sealed Mia runtime has no target-cache lifecycle"
+            )
+        self._target_cache_lifecycle_factory = lifecycle
+        self.sealed_target_cache_lifecycle = True
+
+    def target_cache_lifecycle(self):
+        """Return the construction-bound target-cache request scope."""
+
+        return self._target_cache_lifecycle_factory()
 
     def _count(self, key: str, amount: int = 1) -> None:
         self.diagnostic_counters[key] = int(self.diagnostic_counters.get(key, 0)) + int(amount)
@@ -570,6 +599,7 @@ def load(
     gemma4_target_distribution_mode: str | None = None,
     proj_quant: str | None = None,
     proj_requant: str | None = None,
+    dspark: bool = False,
 ) -> MTPLXRuntime:
     """Load an MLX model and optionally inject native MTP support.
 
@@ -619,6 +649,20 @@ def load(
             return runtime
         path = Path(gemma4_pair["target_model"])
     config = load_config(path)
+    exact_mia_dspark = (
+        str(config.get("model_type") or "").lower() == "deepseek_v4"
+        and isinstance(config.get("hybrid_tr3_tail"), dict)
+        and config["hybrid_tr3_tail"].get("format") == "exl3-trellis"
+    )
+    if exact_mia_dspark and not dspark:
+        raise ValueError(
+            "the pinned Mia EXL3 artifact requires the sealed DSpark runtime"
+        )
+    if dspark and not exact_mia_dspark:
+        raise ValueError(
+            "DSpark requires the pinned Mia/Sero split TP1 target and K64 draft; "
+            "generic DeepSeek V4 and the old 2.4-bit artifact are not supported"
+        )
     from .a3b_whole_moe import validate_a3b_whole_moe_load_options
 
     validate_a3b_whole_moe_load_options(
@@ -663,10 +707,31 @@ def load(
         model, _loaded_config = load_model(path)
     else:
         model, tokenizer = _load_base_model(path, config)
+    if dspark:
+        from .deepseek_v4_mia_engine import (
+            MIA_CONTEXT_CAPACITY,
+            MIA_TARGET_PHYSICAL_CAPACITY,
+            MiaDeepseekV4EnginePlan,
+        )
+
+        mia_plan = getattr(model, "_mia_engine_plan", None)
+        if (
+            not isinstance(mia_plan, MiaDeepseekV4EnginePlan)
+            or int(mia_plan.context_capacity_tokens) != MIA_CONTEXT_CAPACITY
+            or int(mia_plan.target_physical_capacity_tokens)
+            != MIA_TARGET_PHYSICAL_CAPACITY
+        ):
+            raise RuntimeError(
+                "the pinned Mia loader did not install its sealed Mia engine plan"
+            )
     import os as _os
 
     proj_quant = proj_quant or _os.environ.get("MTPLX_PROJ_QUANT") or None
     proj_requant = proj_requant or _os.environ.get("MTPLX_PROJ_REQUANT") or None
+    if dspark and (proj_quant or proj_requant):
+        raise ValueError(
+            "the sealed Mia DSpark artifact forbids generic projection quantization"
+        )
     if proj_quant or proj_requant:
         from .proj_quant import quantize_projections, requantize_projections
 
@@ -683,7 +748,10 @@ def load(
                 len(touched), proj_requant,
             )
     deepseek_v4_attn_proj_wide_m3_report = None
-    if str((config or {}).get("model_type") or "").lower() == "deepseek_v4":
+    if (
+        str((config or {}).get("model_type") or "").lower() == "deepseek_v4"
+        and not dspark
+    ):
         from .models.deepseek_v4 import configure_deepseek_v4_moe_tail
 
         configure_deepseek_v4_moe_tail(model, config)
@@ -710,7 +778,7 @@ def load(
         .with_config_defaults(config)
     )
     mtp_enabled = False
-    if mtp:
+    if mtp and not dspark:
         from .deepseek_mtp_patch import inject_deepseek_mtp_support, is_deepseek_mtp_config
         from .glm_mtp_patch import inject_glm_mtp_support, is_glm_mtp_config
         from .mimo_mtp_patch import inject_mimo_mtp_support, is_mimo_mtp_config
@@ -769,7 +837,7 @@ def load(
     router_report: dict[str, Any] = {}
     # Laguna skips the qwen3-next kernel stack entirely; its own env-gated
     # fused lanes install right before runtime construction below.
-    if not _is_laguna_s_2_1_mlx_4bit_config(config):
+    if not dspark and not _is_laguna_s_2_1_mlx_4bit_config(config):
         from .attention_split import configure_split_full_attention
         from .moe_packed_projections import (
             configure_moe_packed_projections,
@@ -881,7 +949,7 @@ def load(
         raise RuntimeError("merge_mtp_adapter requires mtp_adapter")
     deepseek_v4_o_lora_report = None
     deepseek_v4_attention_island_report = None
-    if str(config.get("model_type") or "").lower() == "deepseek_v4":
+    if str(config.get("model_type") or "").lower() == "deepseek_v4" and not dspark:
         from .models.deepseek_v4 import (
             _o_lora_mode_from_env,
             install_deepseek_v4_o_lora_routes,
@@ -945,6 +1013,7 @@ def load(
         path,
         mtp_enabled,
         contract,
+        backend_id="deepseek_v4_dspark" if dspark else None,
         mtp_adapter_path=adapter_path,
         mtp_adapter_metadata=adapter_metadata,
         mtp_adapter_merge_report=adapter_merge_report,
@@ -1028,6 +1097,36 @@ def _load_base_model(path: Path, config: dict[str, Any]) -> tuple[Any, Any]:
         and "model_file" in config
     ):
         raise ValueError("Laguna model_file execution is not permitted")
+    hybrid_tail = config.get("hybrid_tr3_tail")
+    if (
+        str(config.get("model_type") or "").lower() == "deepseek_v4"
+        and isinstance(hybrid_tail, dict)
+        and hybrid_tail.get("format") == "exl3-trellis"
+    ):
+        from .deepseek_v4_exl3 import (
+            _default_mia_dspark_root,
+            load_mia_exl3_dspark_model,
+        )
+        from .deepseek_v4_mia_engine import (
+            revalidate_pinned_mia_tokenizer_files,
+            validate_pinned_mia_artifacts,
+        )
+
+        draft_root = _default_mia_dspark_root(path).resolve()
+        artifact_validation = validate_pinned_mia_artifacts(path, draft_root)
+        tokenizer = _load_tokenizer_resilient(
+            path,
+            artifact_validation.target_config,
+        )
+        revalidate_pinned_mia_tokenizer_files(artifact_validation)
+        return (
+            load_mia_exl3_dspark_model(
+                path,
+                draft_root=draft_root,
+                artifact_validation=artifact_validation,
+            ),
+            tokenizer,
+        )
     model_classes = _model_classes_for_config(config)
     if model_classes is not None:
         from mlx_lm.utils import load_model

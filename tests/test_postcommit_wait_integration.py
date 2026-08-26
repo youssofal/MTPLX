@@ -32,6 +32,7 @@ def _fake_state_with_executor():
     rather than spinning up the real ModelWorkScheduler.
     """
     return SimpleNamespace(
+        session_cache_route=openai._GENERIC_SESSION_CACHE_ROUTE,
         lock=threading.Lock(),
         has_foreground=lambda: False,
         generation_executor=ThreadPoolExecutor(max_workers=1),
@@ -271,6 +272,7 @@ def test_running_idle_postcommit_yields_to_queued_foreground(
     monkeypatch.setenv("MTPLX_POSTCOMMIT_FOREGROUND_GRACE_S", "0")
     scheduler = openai.ModelWorkScheduler(name="postcommit-yield-test", idle_grace_s=0.0)
     state = SimpleNamespace(
+        session_cache_route=openai._GENERIC_SESSION_CACHE_ROUTE,
         lock=threading.Lock(),
         has_foreground=lambda: False,
         generation_executor=scheduler,
@@ -324,6 +326,7 @@ def test_running_idle_postcommit_aborts_when_revision_advances_mid_work(
 ) -> None:
     scheduler = openai.ModelWorkScheduler(name="postcommit-stale-test", idle_grace_s=0.0)
     state = SimpleNamespace(
+        session_cache_route=openai._GENERIC_SESSION_CACHE_ROUTE,
         lock=threading.Lock(),
         has_foreground=lambda: False,
         generation_executor=scheduler,
@@ -407,6 +410,7 @@ def test_postcommit_skips_estimated_oversized_snapshot_before_prefill(
             return SimpleNamespace(prefix_len=117_793, nbytes=8_227_240_960)
 
     state = SimpleNamespace(
+        session_cache_route=openai._GENERIC_SESSION_CACHE_ROUTE,
         sessions=SimpleNamespace(bank=FakeBank()),
     )
     monkeypatch.setattr(
@@ -509,6 +513,7 @@ def test_running_idle_postcommit_finishes_within_foreground_grace(
     monkeypatch.setenv("MTPLX_POSTCOMMIT_FOREGROUND_GRACE_S", "5")
     scheduler = openai.ModelWorkScheduler(name="postcommit-grace-test", idle_grace_s=0.0)
     state = SimpleNamespace(
+        session_cache_route=openai._GENERIC_SESSION_CACHE_ROUTE,
         lock=threading.Lock(),
         has_foreground=lambda: False,
         generation_executor=scheduler,

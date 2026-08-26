@@ -467,7 +467,7 @@ def test_runtime_configures_tail_after_load_and_requant_before_mtp_publish():
     load = runtime_source.index("model, tokenizer = _load_base_model(path, config)")
     requant = runtime_source.index("if proj_quant or proj_requant:", load)
     configure = runtime_source.index("configure_deepseek_v4_moe_tail", requant)
-    publish = runtime_source.index("if mtp:", configure)
+    publish = runtime_source.index("if mtp and not dspark:", configure)
     assert load < requant < configure < publish
 
 

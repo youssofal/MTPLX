@@ -19,6 +19,7 @@ from mtplx.server.openai import (
     AnthropicMessagesRequest,
     ChatMessage,
     STATS_FOOTER_MARKER,
+    _GENERIC_SESSION_CACHE_ROUTE,
     _BROWSER_AUTH_COOKIE,
     _RateLimiter,
     _adaptive_config,
@@ -132,6 +133,7 @@ def _postcommit_state(*, tokenizer=None):
     bank = RecordingBank()
     return SimpleNamespace(
         args=args,
+        session_cache_route=_GENERIC_SESSION_CACHE_ROUTE,
         runtime=SimpleNamespace(
             tokenizer=tokenizer or ChatTemplateTokenizer(),
             model_path="models/test",

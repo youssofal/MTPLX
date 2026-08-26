@@ -1752,9 +1752,14 @@ def _fake_state(*, api_key: str | None = None, rate_limit: int = 0):
     if api_key:
         argv.extend(["--api-key", api_key])
     args = parse_args(argv)
+    backend_descriptor = openai.descriptor_for_backend_id("qwen3_next")
     return SimpleNamespace(
         args=args,
         model_id="mtplx-test-model",
+        backend_descriptor=backend_descriptor,
+        session_cache_route=openai._session_cache_route_for_backend(
+            backend_descriptor
+        ),
         lock=Lock(),
         runtime=SimpleNamespace(
             model_path=Path("models/example"),
@@ -1788,6 +1793,228 @@ def _fake_state(*, api_key: str | None = None, rate_limit: int = 0):
         generation_executor=FakeExecutor(),
         # Dashboard primitives mirror what ServerState.__init__ allocates.
         dashboard=DashboardState(),
+    )
+
+
+def _fake_dspark_state():
+    state = _fake_state()
+    state.args.backend_id = "deepseek_v4_dspark"
+    state.args.generation_mode = "dspark"
+    state.args.depth = 5
+    state.args.temperature = 0.0
+    state.args.top_p = 1.0
+    state.args.top_k = 0
+    state.runtime.backend_id = "deepseek_v4_dspark"
+    state.runtime.mtp_enabled = False
+    state.backend_descriptor = openai.descriptor_for_backend_id(
+        "deepseek_v4_dspark"
+    )
+    state.session_cache_route = openai._session_cache_route_for_backend(
+        state.backend_descriptor
+    )
+    state.deepseek_v4_dflash2_bundle = object()
+    return state
+
+
+def test_dspark_serial_scheduler_dispatches_directly_to_installed_route(
+    monkeypatch,
+) -> None:
+    state = _fake_dspark_state()
+    state.ar_batch_service = SimpleNamespace(
+        submit=lambda _job: pytest.fail("DSpark must not create an AR batch job")
+    )
+    captured = {}
+
+    def fake_run_generation(_state, prompt_ids, **kwargs):
+        captured["prompt_ids"] = prompt_ids
+        captured.update(kwargs)
+        return {"route": "installed_dspark"}
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+
+    assert openai._use_live_ar_batch(state, effective_mode="dspark") == (False, None)
+    generated = openai._run_generation_dispatched(
+        state,
+        [1, 2, 3],
+        batch_key="test.dspark_direct",
+        generation_mode="dspark",
+    )
+
+    assert generated == {"route": "installed_dspark"}
+    assert captured["prompt_ids"] == [1, 2, 3]
+    assert captured["generation_mode"] == "dspark"
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "payload"),
+    [
+        (
+            "/v1/chat/completions",
+            {
+                "messages": [{"role": "user", "content": "Say READY"}],
+                "temperature": 0.6,
+            },
+        ),
+        (
+            "/v1/completions",
+            {"prompt": [1, 2, 3], "top_p": 0.95},
+        ),
+        (
+            "/v1/chat/completions",
+            {
+                "messages": [{"role": "user", "content": "Say READY"}],
+                "presence_penalty": 0.5,
+            },
+        ),
+        (
+            "/v1/completions",
+            {"prompt": [1, 2, 3], "frequency_penalty": -0.5},
+        ),
+    ],
+)
+def test_dspark_rejects_request_sampler_override_before_generation_dispatch(
+    monkeypatch,
+    endpoint: str,
+    payload: dict,
+) -> None:
+    state = _fake_dspark_state()
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(
+        openai,
+        "_run_generation_dispatched",
+        lambda *_args, **_kwargs: pytest.fail(
+            "invalid DSpark sampler reached generation dispatch"
+        ),
+    )
+    client = TestClient(create_app(state))
+
+    response = client.post(
+        endpoint,
+        headers={
+            "x-mtplx-cache-mode": "bypass",
+            "x-mtplx-allow-client-controls": "1",
+        },
+        json={**payload, "max_tokens": 4},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == (
+        "DeepSeek V4 DSpark requests require greedy sampling "
+        "(temperature 0, top_p 1, top_k 0, presence_penalty 0, "
+        "frequency_penalty 0)"
+    )
+
+
+def test_dspark_accepts_exact_zero_penalties_and_seed_at_request_boundary(
+    monkeypatch,
+) -> None:
+    state = _fake_dspark_state()
+    captured = {}
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+
+    def fake_dispatch(_state, prompt_ids, **kwargs):
+        captured.update(kwargs)
+        return {
+            "text": "ok",
+            "tokens": [4],
+            "stats": {
+                "generation_mode": "dspark",
+                "mtp_depth": 5,
+                "completion_tokens": 1,
+            },
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": 1,
+            "finish_reason": "stop",
+        }
+
+    monkeypatch.setattr(openai, "_run_generation_dispatched", fake_dispatch)
+    client = TestClient(create_app(state))
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={
+            "x-mtplx-cache-mode": "bypass",
+            "x-mtplx-allow-client-controls": "1",
+        },
+        json={
+            "messages": [{"role": "user", "content": "Say READY"}],
+            "max_tokens": 4,
+            "temperature": 0,
+            "top_p": 1,
+            "top_k": 0,
+            "presence_penalty": 0,
+            "frequency_penalty": 0,
+            "seed": 17,
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["presence_penalty"] == 0.0
+    assert captured["frequency_penalty"] == 0.0
+    assert captured["seed"] == 17
+
+
+def test_dspark_live_settings_cannot_invalidate_the_sealed_sampler() -> None:
+    state = _fake_dspark_state()
+    client = TestClient(create_app(state))
+
+    response = client.post(
+        "/v1/mtplx/settings",
+        json={"temperature": 0.6},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == (
+        "DeepSeek V4 DSpark settings require greedy sampling "
+        "(temperature 0, top_p 1, top_k 0, presence_penalty 0, "
+        "frequency_penalty 0)"
+    )
+    assert state.args.temperature == 0.0
+    assert state.args.top_p == 1.0
+    assert state.args.top_k == 0
+
+    penalty_response = client.post(
+        "/v1/mtplx/settings",
+        json={"presence_penalty": 0.5},
+    )
+
+    assert penalty_response.status_code == 400
+    assert penalty_response.json()["error"]["message"] == (
+        "DeepSeek V4 DSpark settings require greedy sampling "
+        "(temperature 0, top_p 1, top_k 0, presence_penalty 0, "
+        "frequency_penalty 0)"
+    )
+    assert state.args.default_presence_penalty == 0.0
+    assert state.args.default_frequency_penalty == 0.0
+
+
+def test_dspark_rejects_response_format_constraint_before_generation_dispatch(
+    monkeypatch,
+) -> None:
+    state = _fake_dspark_state()
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(
+        openai,
+        "_run_generation_dispatched",
+        lambda *_args, **_kwargs: pytest.fail(
+            "DSpark response_format reached generation dispatch"
+        ),
+    )
+    client = TestClient(create_app(state))
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [{"role": "user", "content": "Return JSON"}],
+            "max_tokens": 4,
+            "response_format": {"type": "json_object"},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == (
+        "constrained decoding is not supported on the DeepSeek V4 DSpark backend"
     )
 
 
@@ -3791,6 +4018,84 @@ def test_streaming_ar_honors_explicit_inline_postcommit_mode(monkeypatch):
     assert '"generation_mode": "ar"' in response.text
 
 
+def test_dspark_streaming_inline_skips_retokenized_postcommit(monkeypatch):
+    state = _fake_streaming_session_state()
+    state.args.backend_id = "deepseek_v4_dspark"
+    state.args.generation_mode = "dspark"
+    state.args.depth = 5
+    state.args.temperature = 0.0
+    state.args.top_p = 1.0
+    state.args.top_k = 0
+    state.args.session_postcommit_mode = "inline"
+    state.runtime.backend_id = "deepseek_v4_dspark"
+    state.runtime.mtp_enabled = False
+    state.backend_descriptor = openai.descriptor_for_backend_id(
+        "deepseek_v4_dspark"
+    )
+    state.session_cache_route = openai._session_cache_route_for_backend(
+        state.backend_descriptor
+    )
+    state.deepseek_v4_dflash2_bundle = object()
+    observed_session_banks = []
+
+    def fake_run_generation(_state, prompt_ids, **kwargs):
+        observed_session_banks.append(kwargs.get("session_bank"))
+        tokens = [ord("O"), ord("K")]
+        token_callback = kwargs.get("token_callback")
+        if token_callback is not None:
+            token_callback(tokens)
+        return {
+            "text": "OK",
+            "tokens": tokens,
+            "stats": {
+                "generation_mode": "dspark",
+                "mtp_depth": 5,
+                "completion_tokens": 2,
+            },
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": 2,
+            "finish_reason": "stop",
+            "_final_state": None,
+        }
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+    monkeypatch.setattr(
+        openai,
+        "_store_retokenized_history_snapshot",
+        lambda *_args, **_kwargs: pytest.fail(
+            "DSpark entered retokenized postcommit"
+        ),
+    )
+    monkeypatch.setattr(
+        openai,
+        "_schedule_idle_postcommit_snapshot",
+        lambda *_args, **_kwargs: pytest.fail("DSpark scheduled idle postcommit"),
+    )
+
+    with TestClient(create_app(state)) as client:
+        for content in ("Say OK", "Again"):
+            response = client.post(
+                "/v1/chat/completions",
+                headers={"x-mtplx-session-id": "dspark-inline"},
+                json={
+                    "messages": [{"role": "user", "content": content}],
+                    "enable_thinking": False,
+                    "stream": True,
+                    "max_tokens": 4,
+                    "temperature": 0,
+                    "top_p": 1,
+                    "top_k": 0,
+                },
+            )
+            assert response.status_code == 200
+            assert (
+                '"reason": "deepseek_v4_dspark_postcommit_unsupported"'
+                in response.text
+            )
+            assert '"finish_reason": "error"' not in response.text
+    assert observed_session_banks == [None, None]
+
+
 def test_invalid_generation_mode_returns_400():
     client = TestClient(create_app(_fake_state()))
 
@@ -3807,8 +4112,8 @@ def test_invalid_generation_mode_returns_400():
     )
 
     assert response.status_code == 400
-    assert (
-        response.json()["error"]["message"] == "generation_mode must be 'mtp' or 'ar'"
+    assert response.json()["error"]["message"] == (
+        "generation_mode must be 'mtp', 'dspark', or 'ar'"
     )
     assert response.json()["error"]["type"] == "invalid_request_error"
 
@@ -4924,6 +5229,260 @@ def test_tool_requests_enable_prompt_prefix_bank_commit(monkeypatch):
 
     assert captured["commit_prompt_state_to_bank"] is True
     assert captured["commit_prompt_state_keep_live_ref"] is False
+
+
+def _fake_dspark_generation_output(tokens: list[int]):
+    return SimpleNamespace(
+        tokens=tokens,
+        text="".join(chr(token) for token in tokens),
+        stats=SimpleNamespace(
+            to_dict=lambda: {
+                "mode": "dspark",
+                "prompt_eval_time_s": 0.25,
+                "generated_tokens": len(tokens),
+                "elapsed_s": 0.5,
+                "decode_elapsed_s": 0.25,
+                "decode_tok_s": len(tokens) / 0.25,
+                "tok_s": len(tokens) / 0.5,
+            }
+        ),
+        final_state=None,
+        finish_reason="length",
+    )
+
+
+def test_dspark_nonstream_attempt_bypasses_generic_cache_and_token_instrumentation(
+    monkeypatch,
+):
+    state = _fake_streaming_session_state()
+    state.args.generation_mode = "dspark"
+    state.runtime.mtp_enabled = False
+    state.requests_completed = 0
+    calls: list[dict[str, object]] = []
+    runtime_context = SimpleNamespace(
+        runtime=SimpleNamespace(prefill_step_size=1024)
+    )
+    bundle = SimpleNamespace(
+        target_model=SimpleNamespace(
+            _mia_engine_plan=SimpleNamespace(
+                identity="exact-mia-plan",
+                context_capacity_tokens=384_000,
+                target_physical_capacity_tokens=384_005,
+                max_batch_tokens=8_224,
+                max_sequences=1,
+            )
+        ),
+        runtime_context=runtime_context,
+    )
+
+    def run_dspark(observed_bundle, prompt_ids, **kwargs):
+        calls.append(
+            {
+                "bundle": observed_bundle,
+                "prompt_ids": prompt_ids,
+                **kwargs,
+            }
+        )
+        return _fake_dspark_generation_output([ord("O"), ord("K")])
+
+    monkeypatch.setattr(openai, "generate_deepseek_v4_dflash2", run_dspark)
+    (
+        state.deepseek_v4_dspark_attempt,
+        state.deepseek_v4_dspark_cache_ownership,
+    ) = openai._bind_deepseek_v4_dspark_attempt(bundle)
+    monkeypatch.setattr(
+        openai,
+        "_dynamic_paged_kv_reservation",
+        lambda **_kwargs: pytest.fail("DSpark entered generic dynamic KV sizing"),
+    )
+    monkeypatch.setattr(
+        openai,
+        "_temporary_env",
+        lambda *_args, **_kwargs: pytest.fail("DSpark mutated request-local env"),
+    )
+    monkeypatch.setattr(
+        openai,
+        "prefill_chunk_size_override",
+        lambda *_args, **_kwargs: pytest.fail("DSpark entered generic chunk override"),
+    )
+    delivered: list[list[int]] = []
+    cancel_event = Event()
+
+    generated = openai._run_generation(
+        state,
+        [1, 2, 3],
+        max_tokens=2,
+        temperature=0.0,
+        top_p=1.0,
+        top_k=0,
+        seed=None,
+        generation_mode="dspark",
+        depth=5,
+        token_callback=delivered.append,
+        streaming_response=False,
+        cancel_event=cancel_event,
+        prefill_chunk_tokens=256,
+    )
+
+    assert len(calls) == 1
+    observed_call = dict(calls[0])
+    should_cancel = observed_call.pop("should_cancel")
+    assert observed_call == {
+        "bundle": bundle,
+        "prompt_ids": [1, 2, 3],
+        "max_tokens": 2,
+        "token_callback": None,
+        "prefill_step_size": 256,
+        "runtime_context": runtime_context,
+    }
+    assert callable(should_cancel)
+    assert should_cancel() is False
+    cancel_event.set()
+    with pytest.raises(openai._StreamCancelled, match="request cancelled"):
+        should_cancel()
+    assert delivered == []
+    assert "dynamic_paged_kv" not in generated["stats"]
+    assert generated["stats"]["dspark_cache_ownership"] == (
+        state.deepseek_v4_dspark_cache_ownership
+    )
+    assert generated["stats"]["dspark_cache_ownership"] == {
+        "owner": "sealed_mia_engine_plan",
+        "plan_identity": "exact-mia-plan",
+        "context_capacity_tokens": 384_000,
+        "target_physical_capacity_tokens": 384_005,
+        "max_batch_tokens": 8_224,
+        "max_sequences": 1,
+        "prefill_step_tokens": 1024,
+        "target_cache": "persistent_nvfp4_stock432_page_arena",
+        "draft_cache": "persistent_nvfp4_stock432_ring_arena",
+    }
+    assert openai._public_mtplx_stats(generated)["dspark_cache_ownership"] == (
+        state.deepseek_v4_dspark_cache_ownership
+    )
+    assert generated["stats"]["decode_tok_s"] == pytest.approx(8.0)
+
+
+def test_dspark_skips_unsupported_retokenized_postcommit() -> None:
+    route = openai._session_cache_route_for_backend(
+        openai.descriptor_for_backend_id("deepseek_v4_dspark")
+    )
+    state = SimpleNamespace(
+        session_cache_route=route,
+        backend_descriptor=openai.descriptor_for_backend_id("qwen3_next"),
+        runtime=SimpleNamespace(backend_id="qwen3_next"),
+    )
+
+    result = openai._skipped_idle_postcommit_snapshot(
+        state=state,
+        unsafe_reason="missing_generation_final_state",
+        assistant_tool_calls=[{"name": "read"}],
+        prompt_prefix_len=4096,
+    )
+
+    assert result == {
+        "stored": False,
+        "mode": "skipped",
+        "reason": "deepseek_v4_dspark_postcommit_unsupported",
+        "unsafe_reason": "missing_generation_final_state",
+        "assistant_tool_calls": 1,
+        "prompt_prefix_len": 4096,
+    }
+    assert route.generation_bank(SimpleNamespace(bank=object()), bypass=False) is None
+
+
+def test_dspark_direct_retokenized_postcommit_is_rejected_before_model_work() -> None:
+    route = openai._session_cache_route_for_backend(
+        openai.descriptor_for_backend_id("deepseek_v4_dspark")
+    )
+    state = SimpleNamespace(session_cache_route=route)
+
+    result = openai._store_retokenized_history_snapshot(
+        state,
+        session_id="dspark-session",
+        messages=[],
+        assistant_content="answer",
+        thinking_enabled=False,
+        policy_fingerprint="policy",
+    )
+
+    assert result["reason"] == "deepseek_v4_dspark_postcommit_unsupported"
+
+
+def test_dspark_async_retokenized_postcommit_is_rejected_before_submit(
+    monkeypatch,
+) -> None:
+    route = openai._session_cache_route_for_backend(
+        openai.descriptor_for_backend_id("deepseek_v4_dspark")
+    )
+    state = SimpleNamespace(session_cache_route=route)
+    monkeypatch.setattr(
+        openai,
+        "_submit_idle_postcommit_model_work",
+        lambda *_args, **_kwargs: pytest.fail("unsupported DSpark work was submitted"),
+    )
+
+    result = openai._schedule_idle_postcommit_snapshot(
+        state,
+        session_id="dspark-session",
+        messages=[],
+        assistant_content="answer",
+        thinking_enabled=False,
+        policy_fingerprint="policy",
+        unsafe_reason="missing_generation_final_state",
+    )
+
+    assert result["reason"] == "deepseek_v4_dspark_postcommit_unsupported"
+
+
+@pytest.mark.parametrize(
+    ("streaming_response", "token_callback_required"),
+    [(True, False), (False, True)],
+)
+def test_dspark_attempt_keeps_only_delivery_or_monitor_callbacks(
+    monkeypatch,
+    streaming_response: bool,
+    token_callback_required: bool,
+):
+    state = _fake_streaming_session_state()
+    state.args.generation_mode = "dspark"
+    state.runtime.mtp_enabled = False
+    state.requests_completed = 0
+    state.deepseek_v4_dspark_cache_ownership = {
+        "owner": "sealed_mia_engine_plan",
+        "context_capacity_tokens": 384_000,
+    }
+    delivered: list[list[int]] = []
+
+    def run_dspark(_prompt_ids, **kwargs):
+        callback = kwargs["token_callback"]
+        callback([ord("O")])
+        callback([ord("K")])
+        return _fake_dspark_generation_output([ord("O"), ord("K")])
+
+    state.deepseek_v4_dspark_attempt = run_dspark
+    monkeypatch.setattr(
+        openai,
+        "_dynamic_paged_kv_reservation",
+        lambda **_kwargs: pytest.fail("DSpark entered generic dynamic KV sizing"),
+    )
+
+    generated = openai._run_generation(
+        state,
+        [1, 2, 3],
+        max_tokens=2,
+        temperature=0.0,
+        top_p=1.0,
+        top_k=0,
+        seed=None,
+        generation_mode="dspark",
+        depth=5,
+        token_callback=delivered.append,
+        streaming_response=streaming_response,
+        token_callback_required=token_callback_required,
+    )
+
+    assert delivered == [[ord("O")], [ord("K")]]
+    assert generated["completion_tokens"] == 2
 
 
 def test_run_generation_depth1_clamps_expected_value_policy(monkeypatch):
@@ -11854,6 +12413,44 @@ def _monkeypatch_server_state_load(monkeypatch):
     )
 
 
+def test_server_state_dspark_preflights_dflash_before_model_load(monkeypatch):
+    _monkeypatch_server_state_load(monkeypatch)
+    events = []
+
+    def reject_dflash_install():
+        events.append("dflash-preflight")
+        raise RuntimeError("stale DFlash install")
+
+    monkeypatch.setattr(
+        openai,
+        "_preflight_deepseek_v4_dflash2",
+        reject_dflash_install,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        openai,
+        "load",
+        lambda *_args, **_kwargs: pytest.fail(
+            "model load reached before the DFlash identity gate"
+        ),
+    )
+    args = parse_args(
+        [
+            "--model",
+            "models/deepseek-v4",
+            "--generation-mode",
+            "dspark",
+            "--warmup-tokens",
+            "0",
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="stale DFlash install"):
+        openai.ServerState(args)
+
+    assert events == ["dflash-preflight"]
+
+
 def test_server_state_downgrades_kv_quant_for_unsupported_family(monkeypatch):
     """Engine-side policy gate: q8 on a family without a validated KV-quant
     policy must downgrade to off (and scrub the env pair) instead of reaching
@@ -12816,6 +13413,7 @@ def _postcommit_route_state(*, mtp_enabled: bool):
 
     foreground = ForegroundState()
     return SimpleNamespace(
+        session_cache_route=openai._GENERIC_SESSION_CACHE_ROUTE,
         runtime=SimpleNamespace(
             mtp_enabled=mtp_enabled,
             make_mtp_cache=_boom_mtp_cache,

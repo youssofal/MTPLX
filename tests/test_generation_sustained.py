@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
@@ -17,12 +18,14 @@ from mtplx.generation import (
     _prefill_chunk_cache_cleanup_every,
     _prefill_chunk_size,
     _prefill_committed_mtp_history_streaming,
+    _session_restore_cache_factory,
     _sustained_prefill_layout,
     _trim_cache_to_offset,
     generate_ar,
     generate_mtpk,
     restore_or_prefill_prompt_state,
 )
+from mtplx.deepseek_v4_mia_engine import MiaDeepseekV4EnginePlan
 from mtplx.mtp_patch import MTPContract
 from mtplx.profiles import DEFAULT_HF_MODEL_ID
 from mtplx.runtime import MTPLXRuntime
@@ -254,6 +257,10 @@ class TargetOnlyRuntime:
     def repage_target_prefill_cache(self, _cache):
         return False
 
+    @staticmethod
+    def target_cache_lifecycle():
+        return nullcontext()
+
 
 def _runtime(model: TinyModel, *, mtp_enabled: bool = True) -> MTPLXRuntime:
     return MTPLXRuntime(
@@ -263,6 +270,80 @@ def _runtime(model: TinyModel, *, mtp_enabled: bool = True) -> MTPLXRuntime:
         mtp_enabled=mtp_enabled,
         contract=MTPContract(),
     )
+
+
+class _SealedTargetArena:
+    def __init__(self, events: list[str]):
+        self.events = events
+        self.cache: list[object] = []
+        self.leased = False
+
+    def acquire(self, _layers):
+        if self.leased:
+            raise RuntimeError("sealed target cache is already leased")
+        self.leased = True
+        self.events.append("target.acquire")
+        return self.cache
+
+    def release(self, cache):
+        assert cache is self.cache
+        assert self.leased
+        self.leased = False
+        self.events.append("target.release")
+
+    def release_active(self):
+        if self.leased:
+            self.release(self.cache)
+
+
+class _SealedTargetTinyModel(TinyModel):
+    layers = ()
+
+    def __init__(self, plan: MiaDeepseekV4EnginePlan):
+        super().__init__()
+        self._mia_engine_plan = plan
+        self.fail_forward = False
+
+    def make_cache(self):
+        return self._mia_engine_plan.make_target_cache(self.layers)
+
+    def __call__(self, *args, **kwargs):
+        if self.fail_forward:
+            raise RuntimeError("sealed target forward failed")
+        return super().__call__(*args, **kwargs)
+
+
+def _sealed_target_runtime():
+    events: list[str] = []
+    arena = _SealedTargetArena(events)
+    plan = MiaDeepseekV4EnginePlan(
+        context_capacity_tokens=384_000,
+        target_physical_capacity_tokens=384_005,
+        max_batch_tokens=8_224,
+        max_sequences=1,
+        page_geometry=(),
+        workspace_geometry=(),
+        indexer_workspace=None,
+        indexer_rope_table=None,
+        mla_workspace=None,
+        target_cache_arena=arena,
+        prewarm_signatures=(),
+        installed_routes=(),
+        target_artifact="target",
+        draft_artifact="draft",
+        artifact_small_file_sha256=(),
+        identity="sealed-target-test",
+    )
+    model = _SealedTargetTinyModel(plan)
+    runtime = MTPLXRuntime(
+        model=model,
+        tokenizer=TinyTokenizer(),
+        model_path=Path("sealed-target"),
+        mtp_enabled=False,
+        contract=MTPContract(),
+        backend_id="deepseek_v4_dspark",
+    )
+    return runtime, model, plan, arena, events
 
 
 def test_contiguous_then_repage_cache_layout_restores_paged_env(monkeypatch):
@@ -378,6 +459,90 @@ def test_session_restore_uses_prefill_layout_cache_factory(monkeypatch):
     assert captured["cache_factory"] is not None
     assert prompt_state.cache_hit is True
     assert prompt_state.restore_mode == "clone"
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_sealed_mia_session_restore_keeps_runtime_cache_factory(monkeypatch, wrapped):
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL_LAYOUT", "contiguous_dense_decode")
+    target_model = TinyModel()
+    target_model._mia_engine_plan = object()
+    runtime_model = (
+        SimpleNamespace(language_model=target_model) if wrapped else target_model
+    )
+    rt = _runtime(runtime_model, mtp_enabled=True)
+
+    assert _session_restore_cache_factory(rt) is None
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_sealed_mia_prefill_cache_is_never_generically_repaged(monkeypatch, wrapped):
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL_LAYOUT", "contiguous_then_repage")
+    target_model = TinyModel()
+    target_model._mia_engine_plan = object()
+    runtime_model = (
+        SimpleNamespace(language_model=target_model) if wrapped else target_model
+    )
+
+    class Runtime:
+        model = runtime_model
+
+        def repage_target_prefill_cache(self, _cache):
+            raise AssertionError("the sealed Mia cache arena must not be repaged")
+
+    assert _maybe_repage_target_prefill_cache(Runtime(), [object()]) == 0.0
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_sealed_mia_session_restore_integrates_without_factory_or_repage(
+    monkeypatch,
+    wrapped,
+):
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL_LAYOUT", "contiguous_then_repage")
+    target_model = TinyModel()
+    target_model._mia_engine_plan = object()
+    runtime_model = (
+        SimpleNamespace(language_model=target_model) if wrapped else target_model
+    )
+    rt = _runtime(runtime_model, mtp_enabled=True)
+    rt.repage_target_prefill_cache = lambda _cache: pytest.fail(
+        "the sealed Mia cache arena must not be repaged"
+    )
+    prompt_ids = [0, 1, 2, 3, 4]
+    restored_cache = ["sealed-mia-cache"]
+    captured: dict[str, object] = {}
+
+    class Bank:
+        last_miss_reason = None
+
+        def longest_prefix(self, _prompt_ids):
+            return SimpleNamespace(prefix_len=len(prompt_ids))
+
+        def restore(self, _rt, _prompt_ids, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                entry=SimpleNamespace(prefix_len=len(prompt_ids)),
+                cache=restored_cache,
+                logits=mx.zeros((1, 4), dtype=mx.float32),
+                hidden=mx.zeros((1, 1, 2), dtype=mx.float32),
+                mtp_history_cache=None,
+                restore_mode="clone",
+            )
+
+    prompt_state = restore_or_prefill_prompt_state(
+        rt,
+        prompt_ids,
+        mtp_history_policy="cycle",
+        session_bank=Bank(),
+        restore_mode="clone",
+        store_prefix_snapshot=False,
+    )
+
+    assert captured["cache_factory"] is None
+    assert prompt_state.trunk_cache is restored_cache
+    assert prompt_state.cache_hit is True
+    assert prompt_state.suffix_tokens == 0
 
 
 def test_live_frontier_reference_restore_survives_prefill_layout_factory(monkeypatch):
@@ -562,6 +727,106 @@ def test_score_prompt_logprobs_alignment_and_normalization():
         assert by_token[target] == pytest.approx(
             scored["token_logprobs"][index], abs=1e-5
         )
+
+
+def test_sealed_target_ar_dspark_ar_sequence_releases_each_target_lease():
+    runtime, model, plan, arena, events = _sealed_target_runtime()
+    sampler = SamplerConfig(temperature=0.0, top_p=1.0, top_k=4)
+
+    first = generate_ar(
+        runtime,
+        [0],
+        max_tokens=1,
+        sampler=sampler,
+        stop_token_ids=set(),
+    )
+    dspark_cache = plan.make_target_cache(model.layers)
+    plan.release_target_cache(dspark_cache)
+    second = generate_ar(
+        runtime,
+        [0],
+        max_tokens=1,
+        sampler=sampler,
+        stop_token_ids=set(),
+    )
+
+    assert first.tokens == second.tokens == [1]
+    assert arena.leased is False
+    assert events == [
+        "target.acquire",
+        "target.release",
+        "target.acquire",
+        "target.release",
+        "target.acquire",
+        "target.release",
+    ]
+
+
+def test_sealed_target_ar_error_releases_before_next_acquire():
+    runtime, model, plan, arena, events = _sealed_target_runtime()
+
+    def fail_callback(_tokens):
+        raise RuntimeError("consumer failed")
+
+    with pytest.raises(RuntimeError, match="consumer failed"):
+        generate_ar(
+            runtime,
+            [0],
+            max_tokens=1,
+            sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+            stop_token_ids=set(),
+            token_callback=fail_callback,
+        )
+
+    next_cache = plan.make_target_cache(model.layers)
+    plan.release_target_cache(next_cache)
+    assert arena.leased is False
+    assert events == [
+        "target.acquire",
+        "target.release",
+        "target.acquire",
+        "target.release",
+    ]
+
+
+def test_sealed_prompt_scoring_releases_before_dspark_acquire():
+    from mtplx.generation import score_prompt_logprobs
+
+    runtime, model, plan, arena, events = _sealed_target_runtime()
+
+    scored = score_prompt_logprobs(runtime, [0, 1, 2], top_k=4, chunk_size=16)
+    dspark_cache = plan.make_target_cache(model.layers)
+    plan.release_target_cache(dspark_cache)
+
+    assert scored["prompt_tokens"] == 3
+    assert arena.leased is False
+    assert events == [
+        "target.acquire",
+        "target.release",
+        "target.acquire",
+        "target.release",
+    ]
+
+
+def test_sealed_prompt_scoring_error_releases_before_next_acquire():
+    from mtplx.generation import score_prompt_logprobs
+
+    runtime, model, plan, arena, events = _sealed_target_runtime()
+    model.fail_forward = True
+
+    with pytest.raises(RuntimeError, match="sealed target forward failed"):
+        score_prompt_logprobs(runtime, [0, 1], top_k=4, chunk_size=16)
+
+    model.fail_forward = False
+    next_cache = plan.make_target_cache(model.layers)
+    plan.release_target_cache(next_cache)
+    assert arena.leased is False
+    assert events == [
+        "target.acquire",
+        "target.release",
+        "target.acquire",
+        "target.release",
+    ]
 
 
 def test_generate_ar_restores_warm_prefix_from_session_bank():

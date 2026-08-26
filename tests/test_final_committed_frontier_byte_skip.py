@@ -204,6 +204,7 @@ class _ForegroundState:
     def __init__(self, runtime: MTPLXRuntime, bank: SessionBank) -> None:
         self.runtime = runtime
         self.sessions = SimpleNamespace(bank=bank)
+        self.session_cache_route = oa._GENERIC_SESSION_CACHE_ROUTE
         self.lock = threading.Lock()
         self.template_hash = None
         self.draft_head_identity = None

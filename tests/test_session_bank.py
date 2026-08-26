@@ -132,7 +132,7 @@ def test_session_bank_oversized_prompt_prefix_can_use_live_reference_lease():
 def test_session_bank_clone_restore_can_use_custom_cache_factory():
     bank = SessionBank(max_entries=4, max_bytes=1024, per_session_max_bytes=512)
     runtime = SimpleNamespace(model_path=Path("models/example"), mtp_enabled=True)
-    custom_cache = ["prefill-layout-cache"]
+    custom_cache = []
 
     entry = bank.put(
         runtime=runtime,

@@ -676,9 +676,20 @@ def test_vllm_metal_paged_kv_cache_matches_stock_kv_cache_updates_and_trim():
         ),
     ]
 
+    page_pool = None
+    key_pages = None
+    value_pages = None
     for keys, values in chunks:
         stock_k, stock_v = stock.update_and_fetch(keys, values)
         paged_k, paged_v = paged.update_and_fetch(keys, values)
+        if page_pool is None:
+            page_pool = paged.page_pool
+            key_pages = paged.key_cache
+            value_pages = paged.value_cache
+        else:
+            assert paged.page_pool is page_pool
+            assert paged.key_cache is key_pages
+            assert paged.value_cache is value_pages
     mx.eval(stock_k, stock_v, paged_k, paged_v)
 
     assert paged.size() == stock.size() == 8
@@ -698,6 +709,42 @@ def test_vllm_metal_paged_kv_cache_matches_stock_kv_cache_updates_and_trim():
     assert paged.size() == stock.size() == 7
     assert paged_k.tolist() == stock_k.tolist()
     assert paged_v.tolist() == stock_v.tolist()
+
+
+def test_fixed_paged_owner_keeps_capacity_and_maps_tail_slots_directly():
+    from mtplx.paged_cache import PagedCachePlan, PagedCachePool
+
+    plan = PagedCachePlan.contiguous(
+        block_size=4,
+        num_blocks=3,
+        array_names=("records",),
+    )
+    pool = PagedCachePool(plan)
+    pool.bind("records", row_shape=(2,), dtype=mx.uint8)
+    records = pool.buffer("records")
+    block_table = pool.block_table
+
+    pool.write_tail(
+        {"records": mx.arange(10, dtype=mx.uint8).reshape(5, 2)}
+    )
+    pool.trim(2)
+    pool.write_tail(
+        {"records": (100 + mx.arange(4, dtype=mx.uint8)).reshape(2, 2)}
+    )
+    mx.eval(records)
+
+    assert pool.capacity == 12
+    assert pool.offset == 5
+    assert pool.buffer("records") is records
+    assert pool.block_table is block_table
+    assert block_table.tolist() == [0, 1, 2]
+    assert pool.active("records").tolist() == [
+        [0, 1],
+        [2, 3],
+        [4, 5],
+        [100, 101],
+        [102, 103],
+    ]
 
 
 def test_install_vllm_metal_paged_attention_kv_cache_replaces_stock_kv_only(monkeypatch):

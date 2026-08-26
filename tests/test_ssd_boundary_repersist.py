@@ -32,7 +32,7 @@ class FakeRuntime:
     mtp_enabled = True
 
     def make_cache(self):
-        return []
+        return [RecurrentStub()]
 
     def make_mtp_cache(self):
         return []

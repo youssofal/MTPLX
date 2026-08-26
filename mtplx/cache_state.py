@@ -11,6 +11,7 @@ import time
 from typing import Any
 
 from .attention_context import current_attention_phase
+from .paged_cache import PagedCachePlan, PagedCachePool
 
 SUPPORTED_DETACH_MODES = {
     "eval_only",
@@ -810,6 +811,8 @@ class VllmMetalPagedKVCache:
         offset: int = 0,
         turboquant_config: Any | None = None,
         kv_quant_config: Any | None = None,
+        allow_growth: bool | None = None,
+        growth_limit_tokens: int | None = None,
     ) -> None:
         self.block_size = int(block_size)
         self.num_blocks = int(num_blocks)
@@ -819,6 +822,17 @@ class VllmMetalPagedKVCache:
         self.key_scale_cache = None
         self.value_scale_cache = None
         self.key_zero_cache = None
+        self._page_pool: PagedCachePool | None = None
+        self._allow_growth = (
+            _env_truthy("MTPLX_DYNAMIC_PAGED_KV")
+            if allow_growth is None
+            else bool(allow_growth)
+        )
+        self._growth_limit_tokens = (
+            _env_int("MTPLX_CONTEXT_WINDOW_TOKENS", 0)
+            if growth_limit_tokens is None
+            else max(0, int(growth_limit_tokens))
+        )
         self.turboquant_config = turboquant_config
         self.turboquant = turboquant_config is not None
         self.kv_quant_config = kv_quant_config
@@ -914,8 +928,49 @@ class VllmMetalPagedKVCache:
             self.num_blocks if allocated_blocks is None else allocated_blocks
         )
 
+    @property
+    def page_pool(self) -> PagedCachePool | None:
+        return self._page_pool
+
+    def _page_buffers(self) -> dict[str, Any]:
+        buffers = {
+            "key": self.key_cache,
+            "value": self.value_cache,
+            "key_scale": self.key_scale_cache,
+            "value_scale": self.value_scale_cache,
+            "key_zero": self.key_zero_cache,
+        }
+        return {name: value for name, value in buffers.items() if value is not None}
+
+    def _rebuild_page_pool(self) -> None:
+        buffers = self._page_buffers()
+        if not buffers:
+            self._page_pool = None
+            return
+        pool = PagedCachePool(
+            PagedCachePlan.contiguous(
+                block_size=self.block_size,
+                num_blocks=self.num_blocks,
+                array_names=tuple(buffers),
+            ),
+            offset=self.offset,
+        )
+        for name, buffer in buffers.items():
+            pool.bind(
+                name,
+                row_shape=tuple(int(dim) for dim in buffer.shape[2:]),
+                dtype=buffer.dtype,
+                buffer=buffer,
+            )
+        self._page_pool = pool
+
+    def _active_block_table(self, used_blocks: int) -> Any:
+        if self._page_pool is None:
+            raise RuntimeError("paged KV physical owner was not installed")
+        return self._page_pool.block_table[: int(used_blocks)][None, :]
+
     def _grow_to_capacity(self, required_tokens: int) -> bool:
-        if not _env_truthy("MTPLX_DYNAMIC_PAGED_KV"):
+        if not self._allow_growth:
             return False
         allocated_blocks = self.allocated_blocks
         current_blocks = (
@@ -927,7 +982,7 @@ class VllmMetalPagedKVCache:
             int((current_blocks * 3 + 1) // 2),
             int(current_blocks) + 1,
         )
-        window_tokens = _env_int("MTPLX_CONTEXT_WINDOW_TOKENS", 0)
+        window_tokens = int(self._growth_limit_tokens)
         if window_tokens > 0:
             # Geometric growth must not overshoot the serving context window
             # (#150: the 1.5x step at 100k+ ctx allocates GiBs of blocks no
@@ -985,6 +1040,7 @@ class VllmMetalPagedKVCache:
         self.num_blocks = int(grown_blocks)
         self.grow_events += 1
         mx.eval(*grown_arrays)
+        self._rebuild_page_pool()
         return True
 
     def _ensure_allocated(self, keys: Any, values: Any) -> None:
@@ -1000,6 +1056,8 @@ class VllmMetalPagedKVCache:
                     "paged KV cache shape/dtype changed: "
                     f"had {self._shape}/{self._dtypes}, got {shape}/{dtypes}"
                 )
+            if self._page_pool is None:
+                self._rebuild_page_pool()
             return
         # Fresh allocation: any surviving dequant mirror belongs to the
         # previous buffer's contents and must not be served against the new
@@ -1118,6 +1176,7 @@ class VllmMetalPagedKVCache:
             mx.eval(self.key_cache, self.value_cache)
         self._shape = shape
         self._dtypes = dtypes
+        self._rebuild_page_pool()
 
     def _write_tail(self, keys: Any, values: Any) -> None:
         import mlx.core as mx
@@ -1131,7 +1190,12 @@ class VllmMetalPagedKVCache:
                     f"paged KV cache capacity exceeded: {required} > {self.capacity}"
                 )
         started = time.perf_counter()
-        slot_mapping = mx.arange(self.offset, self.offset + steps, dtype=mx.int64)
+        if self._page_pool is None:
+            raise RuntimeError("paged KV physical owner was not installed")
+        physical_blocks, block_offsets = self._page_pool.slot_mapping(
+            self.offset, steps
+        )
+        slot_mapping = physical_blocks * self.block_size + block_offsets
         k_3d = mx.contiguous(keys[0].transpose(1, 0, 2))
         v_3d = mx.contiguous(values[0].transpose(1, 0, 2))
         if self.turboquant:
@@ -1163,20 +1227,13 @@ class VllmMetalPagedKVCache:
                 self.key_scale_cache = None
                 self.value_scale_cache = None
                 self.key_zero_cache = None
+                self._page_pool = None
                 self._shape = None
                 self._dtypes = None
                 self._ensure_allocated(keys, values)
-                flat_k = self.key_cache.reshape(
-                    -1, int(keys.shape[1]), int(keys.shape[3])
-                )
-                flat_v = self.value_cache.reshape(
-                    -1, int(values.shape[1]), int(values.shape[3])
-                )
-                flat_k[slot_mapping] = k_3d
-                flat_v[slot_mapping] = v_3d
-                self.key_cache = flat_k.reshape(self.key_cache.shape)
-                self.value_cache = flat_v.reshape(self.value_cache.shape)
-                self.offset += steps
+                assert self._page_pool is not None
+                self._page_pool.write_tail({"key": k_3d, "value": v_3d})
+                self.offset = self._page_pool.offset
                 self.update_calls += 1
                 self.cache_write_time_s += time.perf_counter() - started
                 return
@@ -1200,6 +1257,9 @@ class VllmMetalPagedKVCache:
                 int(cfg.key_bits),
                 bool(cfg.key_signed),
             )
+            self._page_pool.replace_state(
+                self._page_buffers(), self.offset + steps
+            )
         elif self.kv_quant:
             if self.key_scale_cache is None or self.value_scale_cache is None:
                 raise RuntimeError("paged KV quantization scale caches were not allocated")
@@ -1208,42 +1268,17 @@ class VllmMetalPagedKVCache:
             bits = int(self.kv_quant_config.bits)
             qk, k_scale = quantize_symmetric(k_3d, bits=bits)
             qv, v_scale = quantize_symmetric(v_3d, bits=bits)
-            flat_k = self.key_cache.reshape(
-                -1,
-                int(self.key_cache.shape[2]),
-                int(self.key_cache.shape[3]),
+            self._page_pool.write_tail(
+                {
+                    "key": qk,
+                    "value": qv,
+                    "key_scale": k_scale,
+                    "value_scale": v_scale,
+                }
             )
-            flat_v = self.value_cache.reshape(
-                -1,
-                int(self.value_cache.shape[2]),
-                int(self.value_cache.shape[3]),
-            )
-            flat_ks = self.key_scale_cache.reshape(
-                -1,
-                int(self.key_scale_cache.shape[2]),
-                int(self.key_scale_cache.shape[3]),
-            )
-            flat_vs = self.value_scale_cache.reshape(
-                -1,
-                int(self.value_scale_cache.shape[2]),
-                int(self.value_scale_cache.shape[3]),
-            )
-            flat_k[slot_mapping] = qk
-            flat_v[slot_mapping] = qv
-            flat_ks[slot_mapping] = k_scale
-            flat_vs[slot_mapping] = v_scale
-            self.key_cache = flat_k.reshape(self.key_cache.shape)
-            self.value_cache = flat_v.reshape(self.value_cache.shape)
-            self.key_scale_cache = flat_ks.reshape(self.key_scale_cache.shape)
-            self.value_scale_cache = flat_vs.reshape(self.value_scale_cache.shape)
         else:
-            flat_k = self.key_cache.reshape(-1, int(keys.shape[1]), int(keys.shape[3]))
-            flat_v = self.value_cache.reshape(-1, int(values.shape[1]), int(values.shape[3]))
-            flat_k[slot_mapping] = k_3d
-            flat_v[slot_mapping] = v_3d
-            self.key_cache = flat_k.reshape(self.key_cache.shape)
-            self.value_cache = flat_v.reshape(self.value_cache.shape)
-        self.offset += steps
+            self._page_pool.write_tail({"key": k_3d, "value": v_3d})
+        self.offset = self._page_pool.offset
         self.update_calls += 1
         if self.kv_quant:
             phase = current_attention_phase()
@@ -1263,6 +1298,7 @@ class VllmMetalPagedKVCache:
         self.key_scale_cache = None
         self.value_scale_cache = None
         self.key_zero_cache = None
+        self._page_pool = None
         self._shape = None
         self._dtypes = None
         self.offset = 0
@@ -1869,6 +1905,7 @@ class VllmMetalPagedKVCache:
             self.key_scale_cache = None
             self.value_scale_cache = None
             self.key_zero_cache = None
+            self._page_pool = None
             self.offset = 0
             return
         if self.value_cache is not None:
@@ -1886,6 +1923,7 @@ class VllmMetalPagedKVCache:
             self.key_scale_cache = None
             self.value_scale_cache = None
             self.key_zero_cache = None
+            self._page_pool = None
             self.offset = 0
             return
         if self.key_cache is not None:
@@ -1913,6 +1951,7 @@ class VllmMetalPagedKVCache:
         self.key_scale_cache = None
         self.value_scale_cache = None
         self.key_zero_cache = None
+        self._page_pool = None
         self.offset = 0
         self._shape = None
         self._dtypes = None
@@ -1943,6 +1982,11 @@ class VllmMetalPagedKVCache:
                 f"{offset} > {self.capacity}"
             )
         self.offset = offset
+        # The page pool owns the live logical-to-physical cursor. Rebuild it
+        # over the existing buffers after restoring the validated offset so a
+        # subsequent write starts at the restored position, not the position
+        # at which ``state`` rebuilt the pages.
+        self._rebuild_page_pool()
 
     def is_trimmable(self) -> bool:
         return True
@@ -1950,6 +1994,8 @@ class VllmMetalPagedKVCache:
     def trim(self, n: int) -> int:
         n = min(int(self.offset), int(n))
         self.offset -= n
+        if self._page_pool is not None:
+            self._page_pool.truncate(self.offset)
         if self._dequant_memo is not None:
             # Retracted rows are rewritten via _write_tail before reuse; the
             # mirror prefix below the new offset is still exact.
@@ -2073,7 +2119,7 @@ class VllmMetalPagedKVCache:
             used_blocks = (int(self.offset) + int(self.block_size) - 1) // int(self.block_size)
             if used_blocks <= 0:
                 return bailout("blocks_invalid")
-            block_tables = mx.arange(used_blocks, dtype=mx.int32)[None, :]
+            block_tables = self._active_block_table(used_blocks)
             seq_lens = mx.array([int(self.offset)], dtype=mx.int32)
             cu_seqlens_q = mx.array([0, q_len], dtype=mx.int32)
             partition_size = int(
@@ -2459,7 +2505,7 @@ class VllmMetalPagedKVCache:
         )
         q_3d = mx.contiguous(kernel_queries[0].transpose(1, 0, 2))
         used_blocks = (self.offset + self.block_size - 1) // self.block_size
-        block_tables = mx.arange(used_blocks, dtype=mx.int32)[None, :]
+        block_tables = self._active_block_table(used_blocks)
         seq_lens = mx.array([self.offset], dtype=mx.int32)
         cu_seqlens_q = mx.array([0, q_len], dtype=mx.int32)
         if self.turboquant:
@@ -3905,7 +3951,64 @@ def restore_cache(
     restore_meta_state: bool = True,
     clone_states: bool = True,
 ) -> None:
+    cache_count = len(cache)
+    state_count = len(snapshot.states)
+    meta_count = len(snapshot.meta_states)
+    if cache_count != state_count or cache_count != meta_count:
+        raise ValueError(
+            "cache snapshot length mismatch: "
+            f"cache={cache_count}, states={state_count}, meta_states={meta_count}"
+        )
+
+    atomic_pairs = tuple(
+        (
+            getattr(entry, "prepare_snapshot_restore", None),
+            getattr(entry, "install_snapshot_restore", None),
+        )
+        for entry in cache
+    )
+    if (
+        restore_meta_state
+        and atomic_pairs
+        and all(callable(prepare) and callable(install) for prepare, install in atomic_pairs)
+    ):
+        pairs = tuple(zip(snapshot.states, snapshot.meta_states, strict=True))
+        if all(state is None and meta_state is None for state, meta_state in pairs):
+            return
+        if any(state is None or meta_state is None for state, meta_state in pairs):
+            raise ValueError("atomic cache snapshot requires complete state/meta pairs")
+        prepared = []
+        for entry, (state, meta_state), (prepare, install) in zip(
+            cache,
+            pairs,
+            atomic_pairs,
+            strict=True,
+        ):
+            install_view = not clone_states and _is_trimmable(entry)
+            prepared_state = (
+                _lazy_state_view(state) if install_view else _clone_tree(state)
+            )
+            prepared.append(
+                (install, prepare(prepared_state, _clone_tree(meta_state)))
+            )
+        for install, prepared_pair in prepared:
+            install(prepared_pair)
+        return
+
     for entry, state, meta_state in zip(cache, snapshot.states, snapshot.meta_states):
+        atomic_restore = getattr(entry, "restore_snapshot_state", None)
+        if (
+            state is not None
+            and restore_meta_state
+            and meta_state is not None
+            and callable(atomic_restore)
+        ):
+            install_view = not clone_states and _is_trimmable(entry)
+            prepared_state = (
+                _lazy_state_view(state) if install_view else _clone_tree(state)
+            )
+            atomic_restore(prepared_state, _clone_tree(meta_state))
+            continue
         if state is not None:
             install_view = not clone_states and _is_trimmable(entry)
             _restore_state_preserving_container(entry, state, clone=not install_view)

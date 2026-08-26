@@ -211,6 +211,7 @@ def _postcommit_state(*, tokenizer=None):
     args = parse_args(["--warmup-tokens", "0"])
     bank = RecordingBank()
     return SimpleNamespace(
+        session_cache_route=openai._GENERIC_SESSION_CACHE_ROUTE,
         args=args,
         runtime=SimpleNamespace(
             tokenizer=tokenizer or ToolAwareTokenizer(),
@@ -575,6 +576,7 @@ def _async_state(*, foreground_always: bool = False, tokenizer=None):
     args = parse_args(["--warmup-tokens", "0"])
     bank = RecordingBank()
     return SimpleNamespace(
+        session_cache_route=openai._GENERIC_SESSION_CACHE_ROUTE,
         args=args,
         runtime=SimpleNamespace(
             tokenizer=tokenizer or ToolAwareTokenizer(),

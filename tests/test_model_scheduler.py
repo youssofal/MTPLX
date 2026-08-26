@@ -113,6 +113,7 @@ def test_idle_postcommit_aborts_when_session_revision_is_stale(monkeypatch):
     scheduler = ModelWorkScheduler(name="test-model-scheduler", idle_grace_s=0.02)
     session = SimpleNamespace(revision=0)
     state = SimpleNamespace(
+        session_cache_route=openai._GENERIC_SESSION_CACHE_ROUTE,
         model_scheduler=scheduler,
         generation_executor=scheduler,
         lock=None,

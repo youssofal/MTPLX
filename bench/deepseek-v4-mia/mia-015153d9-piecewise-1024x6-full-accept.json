@@ -1,0 +1,181 @@
+{
+  "acceptance_benchmark_eligible": false,
+  "arm": "dspark",
+  "benchmark_annotation": "Historical one-cycle micro-gate only. The reported decode_tok_s divides six emitted tokens by one physical verification-cycle time and is not sustained decode throughput.",
+  "config_sha256": "39f3a9e158019dc34dd943b64f874cfc43e9e392e6ce9215a56f2e183d661d90",
+  "dflash_requested_revision": "54644e991039110f30140006c892c57734b9311e",
+  "dflash_revision": "54644e991039110f30140006c892c57734b9311e",
+  "dflash_url": "https://github.com/davidtai/dflash-mlx.git",
+  "dflash_vcs": "git",
+  "draft_artifact_index_sha256": "c0d0e18e8c84fe6f1b7dc6991a4ba5765d1965f21f8892887aa01169fc2ba2b3",
+  "dspark": {
+    "accepted_future_tokens": 5,
+    "decode_time_s": 0.1378572500000006,
+    "decode_tok_s": 43.52328223579082,
+    "drafted_future_tokens": 5,
+    "elapsed_s": 5.029921792000001,
+    "events": [
+      {
+        "acceptance_first_20_avg": 5.0,
+        "acceptance_history": [
+          5
+        ],
+        "acceptance_last_20_avg": 5.0,
+        "acceptance_ratio": 0.8333333333333334,
+        "accepted_from_draft": 5,
+        "adaptive_block_cycles": 0,
+        "adaptive_block_reductions": 0,
+        "block_tokens": 6,
+        "clear_cache_boundaries": false,
+        "cycles_completed": 1,
+        "draft_sink_size": 0,
+        "draft_window_size": 128,
+        "elapsed_us": 5029921.792,
+        "generated_token_ids": [
+          396,
+          10340,
+          270,
+          1257,
+          313,
+          26509
+        ],
+        "generation_tokens": 6,
+        "hit_kind": "miss",
+        "peak_memory_gb": 103.815300318,
+        "phase_timings_us": {
+          "commit": 0.0,
+          "draft": 0.0,
+          "draft_incremental": 0.0,
+          "draft_prefill": 0.0,
+          "prefill": 4892064.542,
+          "replay": 0.0,
+          "verify": 0.0
+        },
+        "prompt_token_count": 1024,
+        "quantize_kv_cache": false,
+        "target_fa_window": 0,
+        "tokens_per_cycle": 6.0,
+        "verify_len_cap": 6
+      }
+    ],
+    "generated_tokens": 6,
+    "milliseconds_per_token": 22.97620833333343,
+    "new_prefill_tokens": 1024,
+    "peak_memory_bytes": 103815300318,
+    "peak_memory_kind": "mlx_allocator_peak",
+    "peak_memory_scope": "since_last_mlx_peak_reset",
+    "prefill_tok_s": 209.3185793459223,
+    "prefill_tok_s_token_basis": "new_prefill_tokens",
+    "prompt_time_s": 4.892064542,
+    "prompt_tokens": 1024,
+    "token_digest": "78077ef93fb63a1cd610656debe6c1f901f1b8517792fb20f6dfc947570d1c95",
+    "tokens": [
+      396,
+      10340,
+      270,
+      1257,
+      313,
+      26509
+    ],
+    "ttft_s": 4.924015084019629,
+    "ttft_scope": "request_start_through_first_emitted_token"
+  },
+  "dspark_kv": {
+    "mode": "nvfp4_stock432",
+    "record_bytes": 432,
+    "ring_capacity_records": 128,
+    "ring_mode": "nvfp4_stock432_fixed_ring",
+    "stages": 3,
+    "start": 0
+  },
+  "dspark_stages": 3,
+  "engine": "dflash_mlx_0_1_10",
+  "fp32_activations": false,
+  "future_draft_count": 5,
+  "guard_window_id": "e6ada9b475f7370e8ca531ccb96838e2317fc1648cbf50c0d7459c70f5bda410",
+  "index_sha256": "c0d0e18e8c84fe6f1b7dc6991a4ba5765d1965f21f8892887aa01169fc2ba2b3",
+  "installed_cache_plan": {
+    "context_capacity_tokens": 384000,
+    "max_batch_tokens": 8224,
+    "target_physical_capacity_tokens": 384005
+  },
+  "kind": "deepseek_v4_dspark_dflash2_k5",
+  "load_time_s": 81.71814970800187,
+  "memory": {
+    "mlx": {
+      "after_load": {
+        "active_bytes": 102345304430,
+        "peak_bytes": 104026104165,
+        "peak_scope": "process_lifetime_through_load"
+      },
+      "arm": {
+        "active_bytes_after": 102345304430,
+        "active_bytes_before": 102345304430,
+        "peak_bytes": 103815300318,
+        "peak_bytes_before": 0,
+        "peak_reset_before_arm": true,
+        "peak_scope": "since_explicit_arm_reset"
+      }
+    },
+    "process": {
+      "peak_rss_bytes_after_arm": 12812107776,
+      "peak_rss_bytes_after_load": 12812107776,
+      "peak_rss_scope": "process_lifetime_since_exec"
+    }
+  },
+  "mia_model": "0xSero/deepseek-v4-flash-0731-spark",
+  "mia_model_revision": "22f28d32b9b29b4352eaa380ff8c2c170b2847ab",
+  "mia_runtime_image_digest": "sha256:2e077489a83a0360952828051fe7f7a32c1801e5ce8436d85f7267583d614ff4",
+  "mia_source": "MiaAI-Lab/DeepSeek-v4-Flash-One-DGX-Spark",
+  "mia_source_config_sha256": "b001ec8308044aa11daa0e624f5aea5e5362a63c05879a83a7be046b00eada82",
+  "mia_source_index_sha256": "61af5c0782a8651ef893004e84369d2281a0fc316c8bcefc0bd8f76244224649",
+  "mia_source_revision": "d4ba142bc1d971eb73a911e207e3e963bbb3c455",
+  "mlx_version": "0.32.1",
+  "model": "/Users/davidtai/models/DeepSeek-V4-Flash-0731-spark-MiaAI-tp1",
+  "physical_verify_width": 6,
+  "prompt": {
+    "prompt_actual_tokens": 1024,
+    "prompt_context_tokens": 1024,
+    "prompt_policy": "repeat_hard_truncate"
+  },
+  "prompt_tokens": 1024,
+  "request": {
+    "span_tokens": 1030
+  },
+  "resident_parameter_bytes": 100779678200,
+  "schema_version": 3,
+  "scope": "1024-token prompt plus exactly six generated tokens in one verifier-width-6 cycle; excluded from all sustained benchmark charts and PR performance claims",
+  "source_head": "015153d969b0915ac19a8aa1984e5fdad8ada5d8",
+  "target_artifact_index_sha256": "b7a450f88c99aee7f6d44ecb127e91e45ab5ccb1a0dad49ca9eabb90b400c304",
+  "target_kv": {
+    "compressed_pages": [
+      {
+        "capacity_records": 96002,
+        "compress_ratio": 4,
+        "layers": 21
+      },
+      {
+        "capacity_records": 3001,
+        "compress_ratio": 128,
+        "layers": 20
+      }
+    ],
+    "indexer_capacity_records": 96002,
+    "indexer_mode": "fp8_e4m3_ue8m0_scale132_paged",
+    "indexer_record_bytes": 132,
+    "layers": 43,
+    "mode": "nvfp4_stock432",
+    "paged_compressed_layers": 41,
+    "paged_indexer_layers": 21,
+    "record_bytes": 432,
+    "start": 0,
+    "window_capacity_records": 8416,
+    "window_mode": "nvfp4_stock432_fixed_window"
+  },
+  "target_taps": [
+    40,
+    41,
+    42
+  ],
+  "timestamp_utc": "2026-08-23T21:23:55Z"
+}

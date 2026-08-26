@@ -57,6 +57,7 @@ def _make_state(*, bank: object) -> SimpleNamespace:
 
     args = SimpleNamespace(strip_assistant_reasoning_history=False)
     return SimpleNamespace(
+        session_cache_route=openai._GENERIC_SESSION_CACHE_ROUTE,
         runtime=SimpleNamespace(tokenizer=_Tokenizer(), mtp_enabled=True),
         sessions=SimpleNamespace(bank=bank),
         template_hash="tmpl-abc",

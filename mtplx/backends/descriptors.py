@@ -722,6 +722,70 @@ DEEPSEEK_MTP_DESCRIPTOR = BackendDescriptor(
 )
 
 
+DEEPSEEK_V4_DSPARK_DESCRIPTOR = replace(
+    DEEPSEEK_MTP_DESCRIPTOR,
+    backend_id="deepseek_v4_dspark",
+    architecture_id="deepseek-v4-dspark-dflash2",
+    display_name="DeepSeek V4 DSpark through DFlash2",
+    artifact_layout="split_mia_tp1_target_plus_k64_draft",
+    runtime_capabilities=(
+        "target_logits",
+        "dspark_k5",
+        "dflash2_scheduler",
+        "mia_nvfp4_stock432_target_kv",
+        "mia_nvfp4_stock432_dspark_kv",
+        "fp32_exact_speculative_sampling",
+        "bf16_wide_numerics_reported",
+    ),
+    sampler_defaults=SamplerDefaults(temperature=0.0, top_p=1.0, top_k=0),
+    reasoning_codec=ReasoningCodec(
+        parser="none",
+        display_name="No verified reasoning parser",
+        default_mode="off",
+        supported=False,
+        modes=(),
+        history_policy="visible_content_only",
+    ),
+    draft_semantics=DraftSemantics(
+        request_field="depth",
+        display_label="DSpark future tokens",
+        default=5,
+        minimum=5,
+        maximum=5,
+        unit="depth",
+    ),
+    uses_draft_lm_head=False,
+    hidden_variant="target_taps_40_41_42",
+    mtp_history_policy="cycle",
+    tune_policy=TunePolicy(
+        supported=False,
+        unsupported_reason="DSpark Phase 1 owns one fixed DFlash2 K5 lane.",
+    ),
+    kv_quant_policy=KVQuantPolicy(
+        supported=False,
+        disabled_reason=(
+            "DSpark owns Mia stock432 NVFP4 target and draft K/V from offset zero."
+        ),
+    ),
+    context_window_policy=ContextWindowPolicy(
+        maximum=384_000,
+        default=384_000,
+        source="sealed_mia_engine_plan",
+    ),
+    required_chat_template_profile="tokenizer",
+    allows_chat_template_path=False,
+    validation_status="real_checkpoint_guarded",
+    status="real_checkpoint_guarded",
+    profile_policy="backend-aware-sustained",
+    notes=(
+        "The existing DFlash2 scheduler owns verification and acceptance.",
+        "The artifact is the pinned split Mia/Sero TP1 target plus packaged K64 draft.",
+        "Target and all three DSpark caches use stock432 NVFP4 records from offset zero.",
+        "Default bf16 wide-forward divergence is reported; the fp32 causality gate is exact.",
+    ),
+)
+
+
 GLM_MTP_DESCRIPTOR = BackendDescriptor(
     backend_id="glm_mtp",
     architecture_id="glm4-moe-mtp",
@@ -912,6 +976,7 @@ DESCRIPTORS_BY_BACKEND_ID: dict[str, BackendDescriptor] = {
     GEMMA4_ASSISTANT_DESCRIPTOR.backend_id: GEMMA4_ASSISTANT_DESCRIPTOR,
     STEP3P5_MTP_DESCRIPTOR.backend_id: STEP3P5_MTP_DESCRIPTOR,
     DEEPSEEK_MTP_DESCRIPTOR.backend_id: DEEPSEEK_MTP_DESCRIPTOR,
+    DEEPSEEK_V4_DSPARK_DESCRIPTOR.backend_id: DEEPSEEK_V4_DSPARK_DESCRIPTOR,
     GLM_MTP_DESCRIPTOR.backend_id: GLM_MTP_DESCRIPTOR,
     HY_V3_MTP_DESCRIPTOR.backend_id: HY_V3_MTP_DESCRIPTOR,
     "mimo_mtp": NATIVE_CONTRACT_DESCRIPTOR,
@@ -1091,6 +1156,8 @@ def tune_policy_for_model(
         model_ref=model_ref,
         descriptor=descriptor,
     )
+    if descriptor.backend_id == DEEPSEEK_V4_DSPARK_DESCRIPTOR.backend_id:
+        return descriptor.tune_policy
     if family in {"qwen3_5", "qwen3_6"}:
         return TunePolicy(supported=True)
     if family == "qwen3_8":
@@ -1123,6 +1190,8 @@ def kv_quant_policy_for_model(
         model_ref=model_ref,
         descriptor=descriptor,
     )
+    if descriptor.backend_id == DEEPSEEK_V4_DSPARK_DESCRIPTOR.backend_id:
+        return descriptor.kv_quant_policy
     if family in {"qwen3_5", "qwen3_6", "qwen3_8"}:
         return QWEN3_NEXT_DESCRIPTOR.kv_quant_policy
     if family == "gemma4":
@@ -1167,6 +1236,8 @@ def context_window_policy_for_model(
         model_ref=model_ref,
         descriptor=descriptor,
     )
+    if descriptor.backend_id == DEEPSEEK_V4_DSPARK_DESCRIPTOR.backend_id:
+        return descriptor.context_window_policy
     if family in {"qwen3_5", "qwen3_6", "qwen3_8"}:
         base = QWEN3_NEXT_DESCRIPTOR.context_window_policy
     elif family == "gemma4":
@@ -1193,6 +1264,8 @@ def reasoning_policy_for_model(
         model_ref=model_ref,
         descriptor=descriptor,
     )
+    if descriptor.backend_id == DEEPSEEK_V4_DSPARK_DESCRIPTOR.backend_id:
+        return descriptor.reasoning_codec
     if family == "qwen3_8":
         return QWEN3_8_REASONING_CODEC
     if family in {"qwen3_5", "qwen3_6"}:
@@ -1414,13 +1487,38 @@ def _runtime_is_lfm2(runtime: Any) -> bool:
 
 def descriptor_from_runtime(runtime: Any, args: Any | None = None) -> BackendDescriptor:
     runtime_backend = getattr(runtime, "backend_id", None)
-    if runtime_backend:
+    requested_backend = getattr(args, "backend_id", None) if args is not None else None
+    if runtime_backend == DEEPSEEK_V4_DSPARK_DESCRIPTOR.backend_id:
+        from mtplx.deepseek_v4_mia_engine import (
+            MIA_CONTEXT_CAPACITY,
+            MIA_TARGET_PHYSICAL_CAPACITY,
+            MiaDeepseekV4EnginePlan,
+        )
+
+        plan = getattr(getattr(runtime, "model", None), "_mia_engine_plan", None)
+        if (
+            not isinstance(plan, MiaDeepseekV4EnginePlan)
+            or int(plan.context_capacity_tokens) != MIA_CONTEXT_CAPACITY
+            or int(plan.target_physical_capacity_tokens)
+            != MIA_TARGET_PHYSICAL_CAPACITY
+        ):
+            raise RuntimeError(
+                "deepseek_v4_dspark runtime has no sealed Mia engine plan"
+            )
+        descriptor = DEEPSEEK_V4_DSPARK_DESCRIPTOR
+    elif requested_backend == DEEPSEEK_V4_DSPARK_DESCRIPTOR.backend_id:
+        raise RuntimeError(
+            "sealed DSpark backend requires runtime.backend_id=deepseek_v4_dspark "
+            "and its installed Mia engine plan"
+        )
+    elif runtime_backend:
         descriptor = descriptor_for_backend_id(str(runtime_backend))
     elif bool(getattr(runtime, "gemma4_external_assistant", False)):
         return GEMMA4_ASSISTANT_DESCRIPTOR
     else:
-        backend_id = getattr(args, "backend_id", None) if args is not None else None
-        descriptor = descriptor_for_backend_id(str(backend_id) if backend_id else None)
+        descriptor = descriptor_for_backend_id(
+            str(requested_backend) if requested_backend else None
+        )
     if (
         descriptor.backend_id == MLX_LM_AR_DESCRIPTOR.backend_id
         and _runtime_is_lfm2(runtime)

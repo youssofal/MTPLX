@@ -224,6 +224,28 @@ def build_programming_context(*, minimum_characters: int) -> str:
     return "".join(rendered)
 
 
+def build_unique_programming_context() -> str:
+    """Return one non-repeating pass over the deterministic Python artifacts."""
+
+    rendered = [
+        "You are reviewing a normal Python repository. Read every distinct "
+        "source file, test, configuration, document, and diagnostic below. "
+        "Then implement the final request without changing unrelated behavior."
+    ]
+    for artifact in _artifacts():
+        rendered.append(artifact.render(0))
+    rendered.append(
+        "\n\n# Final user request\n"
+        "Implement a complete Python 3.11 patch for this repository. Repair "
+        "atomic persistence, preserve insertion order, reject duplicate job "
+        "identifiers and invalid limits, keep the JSON schema stable, and use "
+        "only the standard library. Include focused pytest coverage for the "
+        "failure and recovery paths. Return the changed Python files and tests, "
+        "with concise comments only where the invariants are not obvious."
+    )
+    return "".join(rendered)
+
+
 def programming_context_stats(text: str) -> dict[str, object]:
     """Return structural diagnostics used to qualify generated prompt context."""
 
