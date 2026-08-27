@@ -229,6 +229,37 @@ def _install_split_attention_hook(attn: Any) -> bool:
             queries = self.rope(queries)
             keys = self.rope(keys)
 
+        # Ragged-batch 2pass verify attention (dense batched-MTP lane): the
+        # fused vector path is correct-but-slow at this shape (~180 GB/s on
+        # per-row 24k KV streams, measured), and the array-offset ragged lane
+        # fails every other custom path closed. This branch streams K/V
+        # flash-style with PER-ROW causal bounds taken from the ragged cache's
+        # pre-write offsets, no mask tensor is ever materialized. Opt-in via
+        # the instance attr (set by the batched driver); env kill-switch
+        # MTPLX_RAGGED_2PASS=0.
+        if (
+            getattr(self, "_mtplx_ragged_2pass_enabled", False)
+            and cache is not None
+            and not blockwise_enabled
+            and not vllm_metal_paged_enabled
+            and cached_prefix_len is None  # array offsets = the ragged lane
+            and hasattr(cached_prefix_offset, "ndim")
+            and os.environ.get("MTPLX_RAGGED_2PASS", "1").strip().lower()
+            not in {"0", "false", "off", "no"}
+        ):
+            from .kernels.sdpa_2pass import sdpa_2pass_tail_rowoffs_kvshared
+
+            ragged_out = sdpa_2pass_tail_rowoffs_kvshared(
+                queries=queries,
+                keys=keys,
+                values=values,
+                scale=self.scale,
+                offsets=cached_prefix_offset,
+            )
+            if ragged_out is not None:
+                output = ragged_out.transpose(0, 2, 1, 3).reshape(B, L, -1)
+                return self.o_proj(output * mx.sigmoid(gate))
+
         chunk_size = int(getattr(self, "_mtplx_split_full_attention_chunk_size", 1))
         threshold = int(getattr(self, "_mtplx_split_full_attention_threshold", 1024))
         sdpa_2pass_enabled = bool(getattr(self, "_mtplx_sdpa_2pass_enabled", False))
@@ -557,3 +588,17 @@ def configure_split_full_attention(
         stats["layers"] += 1
         stats["exact_gather_layers"] += int(exact_gather_layer)
     return stats
+
+
+def configure_ragged_2pass_attention(model: Any, *, enabled: bool = True) -> int:
+    """Enable the ragged-batch 2pass verify attention on every full-attention
+    trunk layer (dense batched-MTP lane). Installs the split hook if needed and
+    sets both the hook-enable and the ragged-2pass instance flags. Returns the
+    number of attention modules configured."""
+    count = 0
+    for attn in _full_attention_layers(model):
+        _install_split_attention_hook(attn)
+        attn._mtplx_split_full_attention_enabled = True
+        attn._mtplx_ragged_2pass_enabled = bool(enabled)
+        count += 1
+    return count

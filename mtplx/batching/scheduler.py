@@ -135,7 +135,47 @@ class BatchSchedulerStats:
 
 
 class MTPContinuousScheduler:
-    """Cooperative request scheduler ready for stepable generation hooks."""
+    """Cooperative request scheduler ready for stepable generation hooks.
+
+    **This class is not the seam for the dense MTP serving lane, and the name
+    invites the assumption that it is.** Recorded here because the assumption
+    has already cost one session a search, and the fix for that is a paragraph
+    rather than a wiring exercise.
+
+    What it is: a synchronous, single-threaded request state machine. ``step()``
+    admits waiting work, then drives exactly one of prefill / decode-batch /
+    postcommit through :class:`SchedulerHooks`, and the caller loops. It is a
+    complete and tested design *for a decoder you can step*.
+
+    What the dense lane is instead: a model-owner thread, a condition-variable
+    pending queue, and ``generate_dense_mtp_batch`` running a whole cohort
+    internally while pulling new requests from a live queue at every cycle
+    boundary. Its pipelined loop builds cycle N+1's device graph BEFORE cycle
+    N's single host sync, which is where its throughput comes from and which a
+    one-cycle-per-call interface cannot express. Implementing ``decode_step`` as
+    "run the cohort to completion" would satisfy the type and make ``step()`` a
+    single blocking call, reducing this class to a queue wrapper with fewer
+    properties than the one it replaced -- no compatibility keys, no
+    backpressure bound, no seal window.
+
+    So the dense lane's scheduler is
+    :class:`mtplx.server.dense_mtp_batch.DenseMTPBatchGenerationService`, which
+    does admission, eviction, queue bounding and continuous batching, and the
+    gate that decides whether it installs is in ``mtplx/server/openai.py``,
+    keyed on :attr:`SchedulerMode.MTP_BATCH`. Nothing in production constructs
+    this class; its only callers are its own tests.
+
+    Leave it, wire it to a genuinely stepable backend, or delete it -- but do
+    not read the ``SchedulerMode`` check in :meth:`_run_decode_batch` as the
+    switch that turns batched MTP on. It sets a diagnostic string.
+    """
+
+    #: Modes under which batched MTP decode is expected to be available. A
+    #: cohort wider than one in any OTHER mode means speculation was skipped,
+    #: which is what ``last_mtp_disabled_reason`` records.
+    MTP_CAPABLE_MODES = frozenset(
+        {SchedulerMode.MTP_BATCH, SchedulerMode.MTP_COHORT_EXPERIMENTAL}
+    )
 
     def __init__(
         self,
@@ -289,8 +329,20 @@ class MTPContinuousScheduler:
             cohort.append(request)
         if not cohort:
             return
-        if len(cohort) > 1 and self.config.mode != SchedulerMode.MTP_BATCH:
+        if len(cohort) > 1 and self.config.mode not in self.MTP_CAPABLE_MODES:
             self.stats.last_mtp_disabled_reason = "batch_size_gt_1"
+        else:
+            # CLEAR it. The reason is a description of the LAST decode batch,
+            # and without this branch a scheduler that ever ran a wide cohort in
+            # a non-MTP mode reported MTP as disabled for the rest of its life
+            # -- including after the condition stopped holding. A stale
+            # diagnostic that never recovers is worse than no diagnostic,
+            # because it is read as current.
+            #
+            # `MTP_COHORT_EXPERIMENTAL` counts as MTP-capable too: it is the
+            # opt-in cohort mode, so reporting speculation as disabled under it
+            # was simply wrong.
+            self.stats.last_mtp_disabled_reason = None
         self.stats.batch_histogram[len(cohort)] += 1
         results = self.hooks.decode_step(cohort)
         for request, result in zip(cohort, results):

@@ -17,7 +17,7 @@ random-number state, stop state, and logical KV ownership.
 | `serial` | Run one request at a time on the backend's normal generation route; this is the default |
 | `cooperative` | Interleave independently owned request work where the backend supports it |
 | `ar_batch` | Batch target-only autoregressive decode on a compatible backend |
-| `mtp_batch` | Batch native-MTP decode using a model-specific installed MTP lane |
+| `mtp_batch` | Batch native-MTP decode using a model-specific installed MTP lane. On a dense `qwen3_5` model this selects the [dense MTP batch lane](concurrency/dense-mtp-batch.md), which admits requests continuously rather than fixing a batch's membership when it starts. |
 | `mtp_cohort_experimental` | Opt into experimental native-MTP cohort scheduling |
 
 The mode name is generic. It does not define a batch width, speculative depth,
@@ -74,6 +74,10 @@ contract, batch geometry, numerical choices, limitations, and benchmark
 receipts for each installed lane:
 
 - [Qwen3.6 35B A3B fixed B8/K1 MTP lane](concurrency/qwen35b-mtp-batch.md)
+- [Dense MTP batch lane, Qwen3.5 / Qwen3.8 family](concurrency/dense-mtp-batch.md)
+  — continuous admission: requests join a batch already running, and width
+  follows demand in steps of one. Caller-facing guarantees are in
+  [what this lane promises](dense-mtp-batch-contract.md).
 
 This list describes available implementations. It does not redefine the
 generic concurrency modes or imply that future MTP lanes must use the same
