@@ -1,0 +1,31 @@
+This is a robust, well-documented subsystem. The separation of concerns between `hygiene`, `metrics`, `prompts`, `report`, and `runner` is clean, and the defensive checks (e.g., `assert_warm_turn`, `_is_reusable`) show a strong awareness of the specific failure modes in this project (cache poisoning, thermal throttling, silent zeroing).
+
+However, there are a few areas where the "defensive" posture creates hidden coupling or where the bookkeeping could silently mislead if the environment shifts.
+
+### 1. `rafale/bench/runner.py`: The "Stale Result" Check is Too Weak
+
+**Finding:** The `_is_reusable` function in `runner.py` checks if a previous result file is valid by verifying `ac_power`, `power_mode`, and basic config matches (`context`, `mtp_depth`, `ane.enabled`). It does **not** check `prompt_tokens` or `completion_tokens` against the current run's expectations, nor does it verify the `timestamp` or `environment` block against the *current* environment state beyond the power mode.
+
+**Problem:** If you run a baseline cell, then change the model weights (e.g., update the MTPLX model file on disk) but keep the same `RunConfig`, the runner will see the existing JSON file, check `ac_power=True` and `power_mode=High`, and **skip the run**. It will reuse the old numbers. Since the model changed, the old numbers are invalid, but the runner has no way to know this because it doesn't hash the model or check if the `timestamp` is "recent enough" relative to a model change. While the project rules say "one variable at a time," a silent reuse of stale data after a model update is a critical integrity failure.
+
+**Severity:** High. This can lead to committing benchmark results that do not reflect the current model state.
+
+**Suggestion:** Add a `model_hash` or `model_version` field to the `RunConfig` or the result JSON. In `_is_reusable`, verify that the stored `model_hash` matches the current model's hash (or at least the `model_id` string if a hash isn't feasible). Alternatively, require a `--force` flag to re-run if the `timestamp` is older than a certain threshold, or if the `environment` block's `macos_build` or `chip` differs from the current environment.
+
+### 2. `rafale/bench/metrics.py`: `p95` Calculation is Misleading for Small N
+
+**Finding:** The `_p95` function in `metrics.py` uses `idx = int(len(sorted_v) * 0.95)`. For the project's minimum of 5 runs, `int(5 * 0.95) = 4`, which is the index of the **maximum** value. The docstring acknowledges this ("at the project's minimum of 5 runs is literally the max"), but the field is still named `p95` and reported as such in `Stats.to_dict()`.
+
+**Problem:** In `report.py`, the `Stats` object is serialized with a `p95` key. A reader of the JSON might interpret `p95` as the 95th percentile, which implies a tail behavior. For N=5, it is just the max. This is not a bug in the math, but it is a **semantic trap**. If the project later increases the run count to 20, `p95` will suddenly become a different metric (the 19th value), and historical comparisons between N=5 and N=20 cells will be invalid because the `p95` field means different things.
+
+**Severity:** Medium. It risks misleading analysis if run counts change or if the field is misinterpreted.
+
+**Suggestion:** Rename the field to `max` in the `Stats` dataclass and the JSON output, or add a `run_count` field to the `Stats` object so the consumer knows how to interpret `p95`. Better yet, since the hygiene protocol mandates "report median and p95," and N=5 makes p95=max, consider reporting `min`, `max`, and `median` explicitly, and only compute `p95` if N > 10.
+
+### 3. `rafale/bench/prompts.py`: Salt Collision Risk in `_generate_padding`
+
+**Finding:** The `_generate_padding` function uses `salt = run_index * 104_729 + target_context_tokens`. The `run_index` is passed from `runner.py` as `run_idx` (0 to `cell.runs-1`). For warm cells, it uses `run_idx + WARM_RUN_INDEX_OFFSET` (500,000).
+
+**Problem:** The salt is an integer offset into the `metrics` list and the `idx` calculation. If `run_index` is large (e.g., 500,000), `idx = i + salt` becomes very large. The `value` calculation is `((idx * 7 + 13) % 1000) / 10.0`. This is deterministic, but the **divergence** from line 0 depends on the salt. The docstring claims "no two runs within a cell share a prefix." However, if `run_index` is 0 and `target_context_tokens` is 4096, the salt is 4096. If `run_index` is 1 and `target_context_tokens` is 4096, the salt is 104,729 + 4096 = 108,825. The padding lines will be different. But what if `run_index` is 0 and `target_context_tokens` is 4096, and another cell has `run_index` = 1 and `target_context_tokens` = 4096 - 104,729? That's negative, so it's safe. But the real risk is **cross-cell** collision. The docstring says "no tier is ever a prefix of another." This is true because the salt includes `target_context_tokens`. However, if two different cells have the same `target_context_tokens` and the same `run_index`, they will have the same salt. This is intended for reproducibility. But if the `run_index` is not unique across the entire benchmark matrix (e.g., if you run `baseline` and then `stage-a` with the same `run_index`), the prompts will be identical. The `runner.py` uses `run_idx` from 0 to `cell.runs-1` for all cells. So `baseline` run 0 and `stage-a` run 0 will have the **same prompt** if they have the same `context`. This is a **cache poisoning** risk if the server's session cache is not cleared between stages. The `runner.py` does not clear the server cache between cells or stages.
+
+**Severity:** High. If the server's session cache is not cleared, `stage-a` run 0 might hit the cache from `baseline` run 0, leading to

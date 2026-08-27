@@ -1,0 +1,72 @@
+```python
+"""CPU prompt-lookup drafter (plan: Phase 4D).
+
+Coding-agent output copies long spans from context: file edits echo the file,
+identifiers repeat, diffs quote code. When the last `ngram` generated tokens
+match an earlier occurrence in context, propose the tokens that followed it
+as a speculative span for the target model to verify in one forward pass.
+
+Pure Python over token ids — no model, no weights, no DRAM weight traffic.
+The index is append-only, matching the append-only context contract
+(CLAUDE.md rule 6).
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Proposal:
+    """A speculative continuation drawn from an earlier occurrence in context."""
+
+    tokens: tuple[int, ...]
+    source_pos: int  # position in context the span was copied from
+
+
+class NgramSpanDrafter:
+    """Longest-recent-match n-gram proposer over an append-only token stream."""
+
+    def __init__(self, ngram: int = 3, span_cap: int = 16) -> None:
+        if ngram < 1:
+            raise ValueError("ngram must be >= 1")
+        if span_cap < 1:
+            raise ValueError("span_cap must be >= 1")
+        self.ngram = ngram
+        self.span_cap = span_cap
+        self._tokens: list[int] = []
+        # ngram key -> end positions (index just past the ngram), ascending.
+        self._index: defaultdict[tuple[int, ...], list[int]] = defaultdict(list)
+
+    def __len__(self) -> int:
+        return len(self._tokens)
+
+    def extend(self, tokens: list[int] | tuple[int, ...]) -> None:
+        """Append tokens (prompt prefill or accepted output — same stream)."""
+        for tok in tokens:
+            self._tokens.append(tok)
+            if len(self._tokens) >= self.ngram:
+                key = tuple(self._tokens[-self.ngram :])
+                self._index[key].append(len(self._tokens))
+
+    def propose(self, max_tokens: int | None = None) -> Proposal | None:
+        """Propose a continuation copied from the most recent earlier match.
+
+        Returns None when the current suffix has no earlier occurrence — the
+        caller then falls back to MTP (depth 2) for this step.
+        """
+        limit = self.span_cap if max_tokens is None else min(max_tokens, self.span_cap)
+        n = len(self._tokens)
+        if n < self.ngram:
+            return None
+        key = tuple(self._tokens[-self.ngram :])
+        # Most recent occurrence strictly before the current suffix itself.
+        pos = next((p for p in reversed(self._index[key]) if p < n), None)
+        if pos is None:
+            return None
+        span = self._tokens[pos : pos + limit]
+        if not span:
+            return None
+        return Proposal(tokens=tuple(span), source_pos=pos)
+```

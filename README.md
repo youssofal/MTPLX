@@ -2,21 +2,232 @@
 
 <img src="docs/assets/readme/hero.svg" alt="MTPLX" width="100%" />
 
-# Run local LLMs on Apple Silicon, around twice as fast.
+# MTPLX-RAMP
 
-[![PyPI](https://img.shields.io/pypi/v/mtplx?label=PyPI)](https://pypi.org/project/mtplx/)
-[![CI](https://github.com/youssofal/MTPLX/actions/workflows/ci.yml/badge.svg)](https://github.com/youssofal/MTPLX/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![macOS Apple Silicon](https://img.shields.io/badge/macOS-Apple%20Silicon-black?logo=apple)](https://developer.apple.com/metal/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 
 </div>
 
+MTPLX-RAMP is a fork of [MTPLX](https://github.com/youssofal/MTPLX), the
+Apple-Silicon inference server built by
+[Youssof Altoukhi](https://github.com/youssofal) that runs a model's own
+multi-token-prediction heads as an exact speculative decoder. Everything MTPLX
+does, this fork does, unchanged. It adds one feature, off by default: **RAMP**
+("Retrieval-Augmented Multi-token Prediction"), a fixed long-block policy plus a
+mismatch-tolerant fuzzy re-anchor for MTPLX's built-in context-copy
+(prompt-lookup) drafter. RAMP targets one specific bottleneck: when a coding
+agent has to re-emit a file that is already in its prompt with an edit applied,
+the stock drafter proposes short blocks and stops firing at every point where
+the edit diverges from the original. On that workload shape RAMP measured
+**+53.9 % median decode throughput at ~800 tokens of context** and
+**+45.9 % at 128K**. On genuinely open-ended work — reviews, explanations,
+new prose — it measured **between −2.0 % and +1.1 %**, i.e. no benefit, which
+is why it ships off by default and stays scoped to edit-shaped turns.
+
+Everything below the RAMP sections describes stock MTPLX behaviour, which this
+fork inherits as-is.
+
+## What RAMP is
+
+MTPLX already ships a context-copy drafter: when the tail of the generated
+stream matches an n-gram that occurs in the prompt, the prompt's continuation is
+proposed verbatim as a block and verified in one forward pass, so the MTP head
+is skipped for that cycle. Two properties of that drafter limit it on edit
+work:
+
+- **Block length is chosen from a confidence ladder** (`8, 12, 16, 24, 32`
+  tokens, keyed on how far the suffix match extends backwards).
+- **The lookup key is an exact `ng_min`-gram** (6 tokens by default). Any
+  divergence — a renamed identifier, a small diff — makes the key miss.
+
+RAMP changes exactly those two things, inside `mtplx/context_copy.py` and
+nowhere else:
+
+1. **Fixed long block.** `block_for_ext()` returns a fixed length (default 48)
+   instead of the ladder value. The reason is measured, not assumed: extra rows
+   in a verify pass are close to free on a bandwidth-bound machine, so a longer
+   block commits far more tokens per pass even though a larger fraction of each
+   block is rejected. Backward-match extension turned out to be a poor predictor
+   of how long a block should be — better retrieval on the ladder gained
+   +7.0 % offline, while stock retrieval with a fixed 48-token block gained
+   +42.7 %.
+2. **Fuzzy re-anchor fallback.** When the exact index misses, `NgramIndex.find()`
+   falls through to `_RampFuzzyAnchor`, which anchors on a shorter n-gram
+   (default 3 tokens) and ranks candidate positions by backward similarity
+   against the prompt over a 24-token window. A context that diverges in one
+   token can still anchor.
+
+Both live behind `MTPLX_RAMP_ENABLED`. With it unset, `_RampFuzzyAnchor` is
+never even constructed and every path reduces to the upstream code.
+
+The feature needed no engine patch. `generate_mtpk` imports its drafter symbols
+function-locally on every call, so replacing the proposer is a matter of
+rebinding module attributes — a seam confirmed by running a fully patched server,
+not by reading. One trap found by execution: `block_for_ext(ext, k_cap)` clamps
+against `context_copy_block_k()`, whose stock cap of 24 silently re-clamps a
+longer block, so both must move together.
+
+**Where it helps:** file-edit, refactor, and apply-diff turns — output that
+largely already exists verbatim in the context.
+
+**Where it does not:** open-ended chat, code review, explanation, reasoning, and
+new-code generation. On two real open-ended tasks measured at ~24K context,
+RAMP's exact n-gram index produced **zero hits in 1 544 probes**; the dark
+fraction (probes that found nothing at all) was **0.923** on a code review and
+**0.856** on a multi-file explanation. Everything RAMP proposed there came from
+the fuzzy fallback, at 2.5 %–4.5 % block acceptance. The copy path supplies only
+**1.3 %–3.1 % of emitted tokens** on that work in *either* arm, so even a perfect
+proposer could not matter.
+
+## Measured results
+
+Full evidence trail, including the rounds that were wrong and got corrected:
+[`docs/ramp/`](docs/ramp/).
+
+### Throughput
+
+| context | task shape | stock | RAMP (block=48) | delta | source |
+|---|---|---|---|---|---|
+| ~800 tok | mechanical edit (3 cases, 5 reps, interleaved A/B) | 138.2 t/s | 212.6 t/s | **+53.9 %** | `POC-FINDINGS.md` §5 |
+| ~800 tok | same case as the 128K run | 115.93 t/s | 175.44 t/s | **+51.3 %** | decision 008 |
+| ~24K | mechanical control | 102.70 t/s | 116.30 t/s | **+13.2 %** | decision 009, round 2 |
+| ~24K | code review (open-ended) | 31.95 t/s | 31.31 t/s | **−2.0 %** | decision 009, round 2 |
+| ~24K | multi-file explanation (open-ended) | 31.23 t/s | 31.59 t/s | **+1.1 %** | decision 009, round 2 |
+| 128K | mechanical edit | 57.40 t/s | 83.72 t/s | **+45.9 %** | decision 008, round 1 |
+
+The 128K figure is a pooled median over 6 requests per arm (+44.2 % cold on an
+n=1 pair, +46.2 % warm on n=5 per arm, warm relative spreads 3.4 % and 1.7 %).
+The mechanism behind it: RAMP lands 6.6 % more accepted tokens per response
+(618 vs 580) while spending **37 % fewer verify passes** (19 rounds vs 30). Its
+per-block acceptance is *lower* (0.678 vs 0.890) — that is the trade, not a
+defect.
+
+Decision 009's earlier round disagreed in sign on the open-ended cells
+(−6.2 % and −4.5 % against round 2's −2.0 % and +1.1 %). The supported claim is
+therefore **no benefit**, not reliable harm. What both rounds agree on is the
+contrast: the same build, same machine, same round, is worth +11 %–+13 % on the
+mechanical cell and nothing on the open-ended ones.
+
+One observation is recorded without an explanation: RAMP's advantage on its own
+best task is **not monotonic in context length** (+51.3 % at ~800 tokens,
++13.2 % at ~24K, +45.9 % at 128K). No model in this project predicts that.
+
+### Output identity
+
+At ~800 tokens and at 128K, on mechanical edit tasks, temperature-0 output was
+byte-identical between arms — the same sha256 across all 21 requests of the 128K
+A/B, and across every block length tried in both sweeps (16, 24, 32, 48, 64, 96).
+
+**That property does not generalise.** On the two open-ended cells the arms
+produce *different* temperature-0 output, deterministically and reproducibly
+across independent rounds (word-level similarity 0.29 and 0.39). Chasing it down
+found that engine session history moves the output too, within the stock arm
+alone. So the honest statement is not "RAMP corrupts output" but: on this engine,
+temperature-0 output on open-ended prompts is not stable against execution-path
+perturbation of any kind, and byte-identity is only a meaningful gate on
+copy-shaped tasks. The unverified hypothesis is that verify-batch width changes
+reduction shapes and flips argmax on near-ties. No unverified speculative token
+reaches output either way — the target model still verifies every token.
+
+### What was proposed and killed
+
+RAMP was proposed with four mechanisms. Three were measured and rejected in the
+POC ablation (offline replay of real captured traces, aggregated over three
+cases):
+
+| killed mechanism | measured | why it deserved it |
+|---|---|---|
+| index the model's own generated output | **−0.7 %** | the mechanism the name "retrieval-augmented" pointed at; combined with the rest it is actively harmful (+3.0 % with it vs +31.7 % without) |
+| multi-candidate consensus ranking | **+0.0 %** | identical to baseline on every counter — with an exact 6-gram key the candidate set is degenerate, there is nothing to rank |
+| adaptive block length from candidate agreement | **−52.4 %** | achieved the *best* per-block acceptance measured (0.968) and the worst throughput; optimising acceptance rate while shrinking blocks trades the metric that pays for the metric that flatters |
+
+The shipped feature is the narrow survivor. The evidence directory also keeps an
+invalidated block sweep, an invalidated 128K round, an excluded open-ended round,
+and three consecutive long-context modelling rounds that each found a real error
+in the previous one — including a proposed production fix ruled `INVALID_CARD`
+because it would have applied to zero shipped configurations. See
+[`docs/ramp/README.md`](docs/ramp/README.md) for the reading order.
+
+### Known hazards
+
+- **The EMA-suspend guard is live on open-ended work.** The engine suspends
+  drafting when per-block acceptance EMA falls below 0.35. Longer blocks lower
+  that ratio. At 128K on mechanical tasks it never fired (0 suspensions in 23
+  requests); on open-ended work the stock ladder suspends 4–12 times per 4
+  requests and RAMP 16–20. That guard is what limits the damage on the workloads
+  RAMP does not suit. Recorded in
+  [`docs/ramp/006-ramp-ema-guard-hazard-and-block-length.md`](docs/ramp/006-ramp-ema-guard-hazard-and-block-length.md);
+  not fixed.
+- **Block length 48 is pinned on A/B evidence, not on a clean sweep.** The clean
+  32/48/64/96 sweep was aborted under memory-pressure contamination and never
+  re-run. 48 is the best configuration measured, not a proven optimum.
+- **Untested:** 256K context, the append-only agent-harness shape (the real
+  target workload, unmeasured across two decision records), tool-calling loops,
+  concurrent requests, streaming, block lengths other than 48, and `fuzzy=False`.
+- **No power or bandwidth counter data.** `powermetrics` needs root and was never
+  captured.
+
+## Install
+
+RAMP only exists in this fork. The upstream Homebrew tap, the PyPI `mtplx`
+package, and the mtplx.com DMG all install **stock MTPLX without RAMP**. The
+only way to get RAMP is to install from this repository's source.
+
+```bash
+git clone https://github.com/johninthewinter/MTPLX-RAMP.git
+cd MTPLX-RAMP
+python3 -m pip install -e ".[dev,server]"
+mtplx doctor
+```
+
+Requirements are the same as stock MTPLX: Apple Silicon (M1 or newer),
+macOS 14+, Python 3.11+, and enough memory and disk for the model you pick.
+`mtplx doctor` and `mtplx inspect` run without MLX; generation and serving need
+MLX and a verified model.
+
+Then start the server with RAMP enabled:
+
+```bash
+MTPLX_RAMP_ENABLED=1 MTPLX_RAMP_BLOCK=48 MTPLX_RAMP_FUZZY=1 mtplx start
+```
+
+`mtplx serve --port 8000` works the same way if you want the API server without
+the interactive picker. Starting without the environment variables gives you
+stock behaviour.
+
+### RAMP settings
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `MTPLX_RAMP_ENABLED` | off | Master switch. Off = byte-identical to stock; the fuzzy index is not constructed. |
+| `MTPLX_RAMP_BLOCK` | `48` (when enabled) | Fixed proposal length in tokens. `0` keeps the stock confidence ladder. |
+| `MTPLX_RAMP_FUZZY` | on (when enabled) | Mismatch-tolerant fallback. Only a net win **combined with** a long block — measured worse than doing nothing at short block lengths. Do not enable with a short or zero block. |
+| `MTPLX_RAMP_ANCHOR_LEN` | `3` | Fuzzy anchor length in tokens (clamped to at most `ng_min - 1`). |
+| `MTPLX_RAMP_MAX_FUZZY_CANDIDATES` | `8` | Fuzzy candidate cap. |
+| `MTPLX_RAMP_SIMILARITY_SPAN` | `24` | Backward-similarity window for ranking fuzzy candidates. |
+
+`tests_ramp/verify_ramp_equivalence.py` is a standalone check (no pytest) that
+(a) RAMP-off reduces byte-for-byte to stock and (b) RAMP-on reproduces the
+measured win direction on the three real committed traces in
+`tests_ramp/fixtures/`.
+
+---
+
+# MTPLX
+
+The rest of this document describes stock MTPLX, which this fork inherits
+unmodified.
+
 MTPLX is a native Mac app and a command line for running local language models with multi-token prediction. Modern models like Qwen 3.5/3.6/3.8 ship with built-in MTP heads. Almost no runtime uses them. MTPLX does: the model drafts several tokens ahead of itself, verifies each drafted block in a single batched forward pass, and commits tokens through exact rejection sampling with residual correction. Same model, same output distribution, measured 1.6x faster on a 16 GB M4 Mac mini and 2.24x on an M5 Max.
 
 There is no second draft model eating your RAM, and no greedy shortcut that quietly changes what the model would have said at real sampling settings. The acceptance math is the Leviathan and Chen rejection sampling theorem with residual correction, so `temperature=0.6, top_p=0.95` behaves exactly like normal decoding, just faster.
 
 ## Get it
+
+Every install path in this section installs **stock MTPLX, without RAMP**. For
+RAMP, use the source install above.
 
 **The Mac app** is the easiest way in. Download the DMG at [mtplx.com](https://mtplx.com/download), drag it to Applications, and the app takes care of everything else: it checks your hardware, recommends a model that actually fits your memory, downloads it, sets up its own Python engine (no Homebrew needed), installs fan control, puts `mtplx` on your PATH, and then measures your machine to pick the fastest decoding depth.
 
@@ -113,60 +324,6 @@ Sampler controls cover `temperature`, `top_p`, `top_k`, and the OpenAI penalty p
 Concurrent scheduler modes, ownership guarantees, and backend-specific
 implementations are documented in [Concurrency modes](docs/concurrency.md).
 
-## RAMP (this fork only)
-
-This fork adds **RAMP**: a fixed/long block-length policy plus a
-mismatch-tolerant fuzzy re-anchor fallback for MTPLX's built-in context-copy
-(prompt-lookup) drafter, off by default.
-
-**What it changes.** Stock context-copy proposes a short block (8–32 tokens,
-scaled to match confidence) and only fires on an *exact* n-gram match against
-the prompt. RAMP measured two things on real coding-agent workloads:
-
-1. On a bandwidth-bound Apple Silicon machine, the marginal cost of extra
-   verify-pass rows is nearly free until a kernel-selection regime change
-   around ~6 tokens — so a fixed, much longer block (48+ tokens) wins by a
-   wide margin instead of the short ladder.
-2. The exact n-gram key goes dark at every edit divergence in a coding-agent
-   workload (a renamed variable, a small diff). A mismatch-tolerant
-   short-anchor fallback recovers some of that dark window.
-
-**Measured, not estimated** (see `docs/ramp/` for the full evidence trail —
-POC ablations, adversarial reviews, live 128K ground truth):
-
-- **+45.9% to +71.4%** decode throughput on repetitive/edit-shaped
-  coding-agent tasks (real 128K context, temperature-0 output byte-identical
-  to stock on every request tested).
-- **Roughly neutral-to-slightly-negative** on genuinely open-ended,
-  non-repetitive generation (a real code review: RAMP found a usable match on
-  only ~8% of decode steps and ran slightly *slower* than stock). This is
-  exactly why it stays off by default and is scoped to editing/repetitive
-  workloads, not general chat or reasoning.
-
-**Enable it:**
-
-```bash
-MTPLX_RAMP_ENABLED=1 MTPLX_RAMP_BLOCK=48 MTPLX_RAMP_FUZZY=1 mtplx start
-```
-
-| Env var | Default | Meaning |
-|---|---|---|
-| `MTPLX_RAMP_ENABLED` | off | Master switch. Off = byte-identical to stock. |
-| `MTPLX_RAMP_BLOCK` | `48` (when enabled) | Fixed proposal length in tokens. `0` keeps the stock confidence ladder. |
-| `MTPLX_RAMP_FUZZY` | on (when enabled) | Mismatch-tolerant fallback. Only a net win **combined with** a long block — do not enable with a short/zero block. |
-| `MTPLX_RAMP_ANCHOR_LEN` | `3` | Fuzzy anchor length. |
-| `MTPLX_RAMP_MAX_FUZZY_CANDIDATES` | `8` | Fuzzy candidate cap. |
-| `MTPLX_RAMP_SIMILARITY_SPAN` | `24` | Backward-similarity window for ranking fuzzy candidates. |
-
-**Where to point it:** file-edit/refactor/apply-diff agentic coding sessions.
-**Where not to:** open-ended chat, review, or reasoning-heavy sessions — leave
-it off there.
-
-`tests_ramp/verify_ramp_equivalence.py` is a standalone (no pytest) check
-that (a) RAMP-off reduces byte-for-byte to stock and (b) RAMP-on reproduces
-the measured win direction on the three real committed traces in
-`tests_ramp/fixtures/`.
-
 ## CLI quick reference
 
 ```bash
@@ -236,17 +393,46 @@ llama.cpp had MTP at all, and months before it reached the hybrid GDN family.
 The dated record, with a public receipt for every claim, is in
 [HISTORY.md](HISTORY.md) and at [mtplx.com/history](https://mtplx.com/history/).
 
-## License and credit
+## Credit and license
 
-Apache-2.0: use it, modify it, ship it commercially. Keep the license and the [NOTICE](NOTICE) file if you redistribute.
+**This repository is a fork of [MTPLX](https://github.com/youssofal/MTPLX), built
+by [Youssof Altoukhi](https://github.com/youssofal).** All of the inference
+engine, the app, Forge, the server, the tuner, and the MTP speculative decoding
+math are his work. This fork's only addition is RAMP, contained in
+`mtplx/context_copy.py` and marked there with an Apache-2.0 section 4(b)
+modification notice. Bug reports about stock MTPLX behaviour belong upstream, at
+[youssofal/MTPLX/issues](https://github.com/youssofal/MTPLX/issues).
 
-**Attribution is required.** If you ship a product, app, or service that includes or is built on MTPLX, it has to say so inside the product itself, somewhere a user can see it (About screen, credits, settings, shipped docs, or a CLI startup banner):
+Licensed under Apache-2.0. Keep the [LICENSE](LICENSE) and the [NOTICE](NOTICE)
+file if you redistribute.
 
-> Powered by MTPLX
-> https://github.com/youssofal/MTPLX
+**Attribution is required, in-product.** NOTICE, which Apache-2.0 section 4(d)
+carries with every copy, states:
 
-A mention in your repo or on your website does not cover it. The full terms are in [NOTICE](NOTICE), which Apache-2.0 section 4(d) carries with every copy.
+> This NOTICE file is part of the Apache License 2.0 terms for MTPLX (see
+> section 4(d) of the LICENSE). Any product, application, service, or
+> distribution that includes, embeds, or is built on MTPLX, in whole or in
+> part, modified or unmodified, must display the following attribution within
+> the product itself, in a place a user of that product can see (for example an
+> About screen, a credits or acknowledgements screen, a settings or help page,
+> documentation shipped with the product, or the startup banner of a command
+> line tool):
+>
+> ```
+>   Powered by MTPLX
+>   https://github.com/youssofal/mtplx
+> ```
+>
+> Attribution in a source repository, a README, or a marketing page alone does
+> not satisfy this requirement. The words "Powered by MTPLX" must appear
+> in-product. The link is required wherever the display medium supports it.
+>
+> Public benchmarks, articles, and research that use or build on MTPLX should
+> credit "MTPLX by Youssof Altoukhi" with the same link.
+
+This README does not satisfy 4(d) on its own. Any distribution of this fork must
+surface "Powered by MTPLX" and its link inside the product — the CLI startup
+banner and the app's About screen are the two surfaces that need it. That is an
+outstanding engineering task in this fork, tracked separately from this document.
 
 MTPLX builds on [MLX](https://github.com/ml-explore/mlx) and the Qwen and Gemma model families; the speculative sampling math follows Leviathan and Chen (2023). Fan control via [ThermalForge](https://github.com/ProducerGuy/ThermalForge). Model weights remain governed by their upstream licenses.
-
-Built by [Youssof Altoukhi](https://github.com/youssofal). Bug reports and benchmark replications welcome via [Issues](https://github.com/youssofal/MTPLX/issues).

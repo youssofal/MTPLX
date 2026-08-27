@@ -1,0 +1,39 @@
+This is a robust, well-documented subsystem. The separation of concerns between `hygiene`, `metrics`, `prompts`, `report`, and `runner` is clean, and the defensive checks (e.g., `assert_warm_turn`, `_is_reusable`) show a strong awareness of the specific failure modes in this project (cache poisoning, thermal throttling, silent zeroing).
+
+However, there are a few areas where the "defensive" posture creates hidden coupling or where the bookkeeping could silently mislead if the environment shifts.
+
+### 1. `rafale/bench/runner.py`: The "Stale Result" Check is Too Weak
+
+**Finding:** The `_is_reusable` function in `runner.py` checks if a previous result file is valid by verifying `ac_power`, `power_mode`, and basic config matches (`context`, `mtp_depth`, `ane.enabled`). It does **not** check `prompt_tokens` or `completion_tokens` against the current run's expectations, nor does it verify the `timestamp` or `environment` block against the *current* environment state beyond the power mode.
+
+**Problem:** If you run a baseline cell, then change the model weights (e.g., update the MTPLX model file on disk) but keep the same config, and then re-run the stage, `_is_reusable` will return `True` because the config matches and the power mode is still "High". The runner will skip the cell, reusing the old result. This violates the "frozen reference" principle if the model has changed. While the project likely assumes model immutability during a phase, the runner has no way to know if the model binary changed. More subtly, if the `prompt_tokens` count changes due to a tokenizer update or a change in `prompts.py` logic (e.g., changing `_APPROX_TOKENS_PER_LINE`), the old result is still considered "reusable" because the config `context` (target) matches, even though the actual `prompt_tokens` in the old JSON might differ from what the new prompt builder would produce.
+
+**Severity:** High. This can lead to committing benchmark results that do not correspond to the current code/model state, silently invalidating the "frozen reference."
+
+**Suggestion:** Add a check in `_is_reusable` to compare the `prompt_tokens` and `completion_tokens` from the stored JSON against the *expected* values for the current config. Since `prompt_tokens` is deterministic for a given `context` and `run_index` (due to the salted padding), you can compute the expected `prompt_tokens` for `run_index=0` (or the first run) and compare it to the stored value. If they differ, the result is stale. Alternatively, store a hash of the `prompts.py` module or the model path in the result JSON and compare that.
+
+### 2. `rafale/bench/metrics.py`: `effective_new_prefill_tokens` is a Misnomer
+
+**Finding:** The `effective_new_prefill_tokens` property in `RunMetrics` simply returns `self.new_prefill_tokens`. The docstring claims it is "Plan:388's headline Phase 3B metric" and defines it as `len(prompt_ids) - cached_tokens`. However, `new_prefill_tokens` is already defined in `from_response` as `max(prompt_tokens_val - cached_tokens_val, 0)` if the engine doesn't provide it, or the engine's value if it does.
+
+**Problem:** The name `effective_new_prefill_tokens` implies a calculation or an "effective" measure that accounts for something (like replay tokens). But it's just an alias for `new_prefill_tokens`. This is confusing. If the engine reports `new_prefill_tokens` as 0 (e.g., due to a bug or a different definition), `effective_new_prefill_tokens` will also be 0, but the docstring suggests it should be `prompt_tokens - cached_tokens`. The code *does* fall back to `prompt_tokens - cached_tokens` if the engine key is missing, but if the engine key is present and wrong, the "effective" name is misleading.
+
+**Severity:** Medium. It's a bookkeeping clarity issue. It could lead to a developer trusting the "effective" name to mean "the true number of tokens prefilled" when it might just be the engine's (potentially buggy) report.
+
+**Suggestion:** Rename `effective_new_prefill_tokens` to `new_prefill_tokens` and remove the alias, or change the logic so that `effective_new_prefill_tokens` *always* computes `prompt_tokens - cached_tokens` regardless of the engine's report, and keep `new_prefill_tokens` as the raw engine value. This would make the "effective" name meaningful: it's the *derived* truth, while `new_prefill_tokens` is the *reported* value.
+
+### 3. `rafale/bench/prompts.py`: Salt Collision Risk
+
+**Finding:** The salt in `build_prompt` is `run_index * 104_729 + target_context_tokens`. The comment says this ensures "no tier is ever a prefix of another."
+
+**Problem:** The salt is linear in `run_index` and `target_context_tokens`. If `run_index` is large, the salt could overflow or wrap around in a way that causes collisions. More importantly, the salt is added to the *index* of the padding lines, not the content itself. The content is derived from `idx = i + salt`. If two different `(run_index, context)` pairs produce the same `salt` modulo the period of the metric/value generation, the padding will be identical. The period of the metric selection is `len(metrics)` (10), and the value generation is `((idx * 7 + 13) % 1000) / 10.0`. The period of the value is 1000. The period of the timestamp is 1440 (24*60). The LCM of 10, 1000, and 1440 is 7200. If the salt difference between two runs is a multiple of 7200, the padding will be identical. Since `run_index` is multiplied by 104,729, which is not a multiple of 7200, this is unlikely for small `run_index`, but it's a hidden coupling.
+
+**Severity:** Low. It's unlikely to happen in practice with the current `run_index` range, but it's a fragile design.
+
+**Suggestion:** Use a cryptographic hash (e.g., `hashlib.sha256(f"{run_index}:{context}".encode()).digest()`) to generate the salt, ensuring no collisions. This is more robust and removes the hidden coupling to the padding generation period.
+
+### 4. `rafale/bench/runner.py`: `WARM_RUN_INDEX_OFFSET` is a Magic Number
+
+**Finding:** `WARM_RUN_INDEX_OFFSET = 500_000` is used to offset the `run_index` for warm cells to avoid cache poisoning.
+
+**Problem:** This is a magic number with no clear justification. If the cold stages use `run_index
