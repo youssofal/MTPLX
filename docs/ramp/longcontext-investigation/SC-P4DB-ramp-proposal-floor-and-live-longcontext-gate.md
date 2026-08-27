@@ -253,7 +253,7 @@ environment.
 
 Fix step 5's **live** A/B is macOS-only and needs the engine venv at
 `/opt/homebrew/var/mtplx/venv-2.7.1/bin/python` and the model at
-`/Users/misterj/.mtplx/models/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Quality`,
+`~/.mtplx/models/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Quality`,
 neither of which is in git. Both are absolute paths already used by
 `scripts/launch_baseline_server.sh:11-12`, so no symlink is required — but the
 script must **fail loudly if either is absent** rather than silently benchmarking

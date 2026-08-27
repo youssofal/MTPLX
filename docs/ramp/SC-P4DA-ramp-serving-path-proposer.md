@@ -464,7 +464,7 @@ worktree. Both must be provisioned by the operator BEFORE dispatch, not by the
 worker:
 
 1. **`.venv`** — the project interpreter, needed by `make lint` / `make test`.
-   `ln -s /Users/misterj/src/super-duper-disco/.claude/worktrees/phase-0-bench-harness/.venv <worktree>/.venv`
+   `ln -s ~/rafale-project-worktree/.venv <worktree>/.venv`
    **RULE 3.7.4 applies:** a symlinked venv's editable install resolves to
    whichever source was last `pip install -e`'d into it — almost always the main
    repo, NOT this worktree. The worker must run
@@ -766,7 +766,7 @@ Every `file:line` reference to engine source is relative to
 | `mtplx` | 2.7.1 |
 | `mlx-lm` | 0.31.3 |
 | `mlx` | 0.32.0 |
-| Checkpoint | `/Users/misterj/.mtplx/models/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Quality` |
+| Checkpoint | `~/.mtplx/models/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Quality` |
 | Baseline server | `scripts/launch_baseline_server.sh` (decision 001), port 8001 |
 | Card baseline commit | the commit that adds this card |
 

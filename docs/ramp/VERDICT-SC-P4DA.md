@@ -502,7 +502,7 @@ testable before, not after, the implementation work.
 **It is real.** Verified by execution, not by reading the card:
 
 ```
-$ printf '%s' "/Users/misterj/src/super-duper-disco/.claude/worktrees/phase-0-bench-harness" | shasum -a 256
+$ printf '%s' "~/rafale-project-worktree" | shasum -a 256
 eb8c8df358735596d2b95f5b9a1d40beebdf745426a7a804a91b70c439f9650e
 ```
 
@@ -547,7 +547,7 @@ citing this verdict as the judge evidence:
 "$HOME/.claude/hooks/sc-clear-firstfail-lock.sh" \
   --judge-verdict 'Spurious lock: armed by a sed of RULES.md, not a test run. Root cause: sc_ff_is_readonly_inspection_command() omits sed/awk, so documentation text containing "567 passed," matched the sc_ff_has_pytest_summary() fallback. No test was ever executed. Clear and generalise the allowlist.' \
   --judge-evidence 'docs/reviews/2026-08-26-ramp/VERDICT-SC-P4DA.md §6' \
-  '/Users/misterj/src/super-duper-disco/.claude/worktrees/phase-0-bench-harness'
+  '~/rafale-project-worktree'
 ```
 
 **Pre-dispatch sequence:** clear the lock → establish the baseline suite count
