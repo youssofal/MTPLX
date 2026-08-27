@@ -144,6 +144,7 @@ from mtplx.runtime_options import (
     apply_paged_kv_quantization_env,
     block_prefix_restore_enabled,
     canonicalize_flag_tokens,
+    env_bool,
     normalize_paged_kv_quantization,
     resolve_api_key,
 )
@@ -2558,6 +2559,16 @@ class ServerState:
                 ),
                 cohort_deadline_s=_dense_batch_env_float(
                     "MTPLX_DENSE_BATCH_DEADLINE_S"
+                ),
+                # Continuous batching, on by default. Off restores the tuned
+                # solo path for a lone request (_run_sealed), which the
+                # contract offers to an operator whose traffic is serialised.
+                # It was unreachable until this line: nothing passed
+                # `continuous`, so the lane always took its constructor
+                # default and the documented escape hatch could not be opened.
+                # Shared env_bool, not a fourth local spelling table.
+                continuous=env_bool(
+                    "MTPLX_DENSE_BATCH_CONTINUOUS", default=True
                 ),
             )
             if self.dense_mtp_batch_lane is not None
