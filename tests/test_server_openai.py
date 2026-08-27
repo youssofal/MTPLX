@@ -7883,6 +7883,71 @@ def test_tool_contract_stabilizes_tool_schema_with_agent_tail_guardrail(legacy_r
     assert [message["role"] for message in with_contract] == ["system", "user"]
 
 
+def test_tool_contract_keeps_every_tool_name_when_over_budget():
+    # Build enough tools that the joined "Declared tools and schemas" line
+    # exceeds the 1200-char budget, so the fallback path is exercised. The
+    # sentinel `task` sits at the tail: the old raw byte cut dropped it
+    # entirely, which the "never invent ... undeclared tool" clause then read
+    # as "tool missing".
+    tools = []
+    for index in range(20):
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": f"tool_{index}",
+                    "description": "x",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            f"prop_{k}": {"type": "string"} for k in range(8)
+                        },
+                        "required": ["prop_0"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        )
+    tools.append(
+        {
+            "type": "function",
+            "function": {
+                "name": "task",
+                "description": "Launch a subagent task.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "description": {"type": "string"},
+                        "prompt": {"type": "string"},
+                    },
+                    "required": ["description", "prompt"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    )
+
+    # Guard: the joined full signatures must exceed the 1200-char budget, so
+    # the over-budget fallback (the code under test) is actually exercised
+    # rather than the under-budget byte-identical path.
+    full = "; ".join(
+        sig for sig in (openai._tool_signature(t) for t in tools) if sig
+    )
+    assert len(full) > 1200
+
+    text = openai._mtplx_tool_contract_text(tools)
+    marker = "Declared tools and schemas: "
+    start = text.find(marker)
+    end = text.find(". Call only these", start)
+    segment = text[start + len(marker): end]
+
+    # Every declared tool name must survive the budget, including the sentinel
+    # at the tail (the tool the old byte cut dropped).
+    for tool in tools:
+        name = tool["function"]["name"]
+        assert re.search(r"\b" + re.escape(name) + r"\b", segment), name
+
+
 def test_native_tool_prompt_mode_keeps_template_tools_and_adds_agent_tail(legacy_rewrites):
     tokenizer = CaptureTokenizer()
     observability: dict[str, object] = {}

@@ -5688,10 +5688,29 @@ def _mtplx_tool_contract_text(
     tool_choice: Any = None,
 ) -> str:
     signatures = [signature for tool in tools if (signature := _tool_signature(tool))]
-    allowed = "; ".join(signatures) if signatures else "(none)"
+    names = [name for name in (_tool_spec_name(tool) for tool in tools) if name]
     example = _tool_call_example(tools)
+    allowed = "; ".join(signatures) if signatures else "(none)"
     if len(allowed) > 1200:
-        allowed = allowed[:1197].rstrip() + "..."
+        # Name-preserving fallback: the old raw byte cut dropped whole tool
+        # names at the tail, which the "never invent ... undeclared tool"
+        # clause then read as "tool missing". Keep every declared name
+        # visible; only sacrifice per-tool signature detail when the 1200
+        # budget runs out (a bare name still declares the tool).
+        parts: list[str] = []
+        size = 0
+        for index, signature in enumerate(signatures):
+            name = names[index] if index < len(names) else ""
+            for candidate in (signature, name):
+                extra = len(candidate) if not parts else 2 + len(candidate)
+                if size + extra <= 1200:
+                    parts.append(candidate)
+                    size += extra
+                    break
+            else:
+                parts.append(name)
+                size += 2 + len(name)
+        allowed = "; ".join(parts)
     forced_clause = _forced_tool_contract_clause(tool_choice)
     return (
         f"{_MTPLX_TOOL_CONTRACT_SENTINEL} {_current_date_line()} Your "
