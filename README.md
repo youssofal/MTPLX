@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/assets/readme/hero.svg" alt="MTPLX" width="100%" />
+<img src="docs/assets/readme/hero-ramp.svg" alt="RAMP + MTPLX" width="100%" />
 
 # MTPLX-RAMP
 
