@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" preserveAspectRatio="xMidYMid meet" role="img" aria-label="RAMP + MTPLX — Native MTP on Apple Silicon">
+  <defs>
+    <radialGradient id="bg" cx="80%" cy="-10%" r="130%">
+      <stop offset="0%" stop-color="#1a1a20"/>
+      <stop offset="60%" stop-color="#0a0a0d"/>
+      <stop offset="100%" stop-color="#050507"/>
+    </radialGradient>
+    <linearGradient id="chrome" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="14%" stop-color="#f4f4ee"/>
+      <stop offset="32%" stop-color="#cdcdc6"/>
+      <stop offset="48%" stop-color="#5e5e58"/>
+      <stop offset="55%" stop-color="#3a3a36"/>
+      <stop offset="68%" stop-color="#9e9e96"/>
+      <stop offset="86%" stop-color="#e0e0d8"/>
+      <stop offset="100%" stop-color="#7a7a72"/>
+    </linearGradient>
+    <linearGradient id="chromeShine" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.95"/>
+      <stop offset="50%" stop-color="#ffffff" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0.85"/>
+    </linearGradient>
+    <filter id="depth" x="-10%" y="-10%" width="120%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="2" flood-color="#000" flood-opacity="0.7"/>
+      <feDropShadow dx="0" dy="16" stdDeviation="16" flood-color="#000" flood-opacity="0.5"/>
+    </filter>
+  </defs>
+
+  <!-- background -->
+  <rect width="1200" height="360" fill="url(#bg)"/>
+
+  <!-- RAMP + MTPLX wordmark — shared 8-layer extrusion language -->
+  <g font-family="Inter, ui-sans-serif, system-ui, -apple-system" font-weight="900" text-anchor="middle">
+    <!-- RAMP leads the lockup at a substantial, readable scale. -->
+    <g font-size="118" letter-spacing="-4">
+      <text x="270" y="206" fill="#000000">RAMP</text>
+      <text x="270" y="204" fill="#0a0a0c">RAMP</text>
+      <text x="270" y="202" fill="#14141a">RAMP</text>
+      <text x="270" y="200" fill="#1c1c22">RAMP</text>
+      <text x="270" y="198" fill="#26262c">RAMP</text>
+      <text x="270" y="196" fill="#303036">RAMP</text>
+      <text x="270" y="194" fill="#3a3a40">RAMP</text>
+      <text x="270" y="192" fill="#46464c">RAMP</text>
+      <text x="270" y="190" fill="url(#chrome)" stroke="url(#chromeShine)" stroke-width="0.7" filter="url(#depth)">RAMP</text>
+    </g>
+
+    <text x="500" y="201" font-size="38" font-weight="400" letter-spacing="0" fill="#a8a8a0">+</text>
+
+    <g font-size="164" letter-spacing="-10">
+      <text x="835" y="206" fill="#000000">MTPLX</text>
+      <text x="835" y="204" fill="#0a0a0c">MTPLX</text>
+      <text x="835" y="202" fill="#14141a">MTPLX</text>
+      <text x="835" y="200" fill="#1c1c22">MTPLX</text>
+      <text x="835" y="198" fill="#26262c">MTPLX</text>
+      <text x="835" y="196" fill="#303036">MTPLX</text>
+      <text x="835" y="194" fill="#3a3a40">MTPLX</text>
+      <text x="835" y="192" fill="#46464c">MTPLX</text>
+      <text x="835" y="190" fill="url(#chrome)" stroke="url(#chromeShine)" stroke-width="0.7" filter="url(#depth)">MTPLX</text>
+    </g>
+  </g>
+
+  <!-- subtitle -->
+  <line x1="245" y1="262" x2="955" y2="262" stroke="rgba(255,255,255,0.10)" stroke-width="1"/>
+  <text x="600" y="294" text-anchor="middle" font-family="ui-monospace, 'JetBrains Mono', Menlo, monospace" font-size="14" fill="#a8a8a0" letter-spacing="6">NATIVE MTP ON APPLE SILICON · RAMP FORK</text>
+</svg>

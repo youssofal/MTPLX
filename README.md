@@ -39,20 +39,27 @@ work:
 
 - **Block length is chosen from a confidence ladder** (`8, 12, 16, 24, 32`
   tokens, keyed on how far the suffix match extends backwards).
-- **The lookup key is an exact `ng_min`-gram** (6 tokens by default). Any
-  divergence — a renamed identifier, a small diff — makes the key miss.
+- **The lookup key is an exact `ng_min`-gram** (6 tokens by default): only the
+  trailing 6 tokens of the generated stream. A divergence inside that trailing
+  window — a renamed identifier, a small diff right at the cursor — makes the
+  key miss; earlier divergence further back just shortens the backward-match
+  extension without causing a miss.
 
-RAMP changes exactly those two things, inside `mtplx/context_copy.py` and
-nowhere else:
+RAMP changes those two things, plus one supporting change to stay consistent
+with them (widening the block cap so a fixed 48-token block is not silently
+re-clamped by the stock 24-token cap — see the trap noted below), all inside
+`mtplx/context_copy.py` and nowhere else:
 
 1. **Fixed long block.** `block_for_ext()` returns a fixed length (default 48)
-   instead of the ladder value. The reason is measured, not assumed: extra rows
-   in a verify pass are close to free on a bandwidth-bound machine, so a longer
-   block commits far more tokens per pass even though a larger fraction of each
-   block is rejected. Backward-match extension turned out to be a poor predictor
-   of how long a block should be — better retrieval on the ladder gained
-   +7.0 % offline, while stock retrieval with a fixed 48-token block gained
-   +42.7 %.
+   instead of the ladder value. The reason is measured, not assumed: the tiled
+   attention kernel this engine hits at longer blocks reads the KV cache at a
+   cost roughly equivalent to 8-10 single-row passes regardless of block
+   length, not per-row, so a longer block commits far more tokens per pass even
+   though a larger fraction of each block is rejected (marginal cost does rise
+   for very large blocks, it just rises slower than block length). Backward-match
+   extension turned out to be a poor predictor of how long a block should be —
+   better retrieval on the ladder gained +7.0 % offline, while stock retrieval
+   with a fixed 48-token block gained +42.7 %.
 2. **Fuzzy re-anchor fallback.** When the exact index misses, `NgramIndex.find()`
    falls through to `_RampFuzzyAnchor`, which anchors on a shorter n-gram
    (default 3 tokens) and ranks candidate positions by backward similarity
@@ -125,8 +132,10 @@ produce *different* temperature-0 output, deterministically and reproducibly
 across independent rounds (word-level similarity 0.29 and 0.39). Chasing it down
 found that engine session history moves the output too, within the stock arm
 alone. So the honest statement is not "RAMP corrupts output" but: on this engine,
-temperature-0 output on open-ended prompts is not stable against execution-path
-perturbation of any kind, and byte-identity is only a meaningful gate on
+temperature-0 output on open-ended prompts is not stable against the kinds of
+execution-path perturbation actually tested here (RAMP vs. stock, and session-
+history changes within the stock arm alone), and byte-identity is only a
+meaningful gate on
 copy-shaped tasks. The unverified hypothesis is that verify-batch width changes
 reduction shapes and flips argmax on near-ties. No unverified speculative token
 reaches output either way — the target model still verifies every token.
@@ -153,19 +162,27 @@ because it would have applied to zero shipped configurations. See
 ### Known hazards
 
 - **The EMA-suspend guard is live on open-ended work.** The engine suspends
-  drafting when per-block acceptance EMA falls below 0.35. Longer blocks lower
-  that ratio. At 128K on mechanical tasks it never fired (0 suspensions in 23
-  requests); on open-ended work the stock ladder suspends 4–12 times per 4
-  requests and RAMP 16–20. That guard is what limits the damage on the workloads
-  RAMP does not suit. Recorded in
+  drafting when per-block acceptance EMA falls below 0.35, once at least 4
+  context-copy blocks have been seen; a suspension applies backoff and resets
+  the EMA state. Longer blocks lower that ratio. At 128K on the 21 mechanical
+  requests it never fired; on open-ended work the stock ladder suspends 4–12
+  times per 4 requests and RAMP 16–20. That guard is what limits the damage on
+  the workloads RAMP does not suit. Recorded in
   [`docs/ramp/006-ramp-ema-guard-hazard-and-block-length.md`](docs/ramp/006-ramp-ema-guard-hazard-and-block-length.md);
   not fixed.
-- **Block length 48 is pinned on A/B evidence, not on a clean sweep.** The clean
-  32/48/64/96 sweep was aborted under memory-pressure contamination and never
-  re-run. 48 is the best configuration measured, not a proven optimum.
-- **Untested:** 256K context, the append-only agent-harness shape (the real
-  target workload, unmeasured across two decision records), tool-calling loops,
-  concurrent requests, streaming, block lengths other than 48, and `fuzzy=False`.
+- **Block length 48 is pinned on A/B evidence, not on a clean sweep.** Blocks
+  16, 24, 32, 64, and 96 were tried at various points, but the clean 32/48/64/96
+  sweep needed to compare them on equal footing was aborted under
+  memory-pressure contamination and never re-run cleanly. The one offline data
+  point that did survive suggests fixed 64 may beat fixed 48 (+57.5% vs
+  +42.7%), but that was never validated at long context. 48 is the best
+  configuration *cleanly measured end-to-end*, not a proven optimum.
+- **Untested:** any model other than Qwen3.8-27B (MTPLX Optimized Quality) and
+  any machine other than the M5 Max used for every measurement here; 256K
+  context; the append-only agent-harness shape (the real target workload,
+  unmeasured across two decision records); tool-calling loops; concurrent
+  requests; streaming; a clean decision-quality comparison across block
+  lengths other than 48; and `fuzzy=False`.
 - **No power or bandwidth counter data.** `powermetrics` needs root and was never
   captured.
 
@@ -203,9 +220,9 @@ stock behaviour.
 |---|---|---|
 | `MTPLX_RAMP_ENABLED` | off | Master switch. Off = byte-identical to stock; the fuzzy index is not constructed. |
 | `MTPLX_RAMP_BLOCK` | `48` (when enabled) | Fixed proposal length in tokens. `0` keeps the stock confidence ladder. |
-| `MTPLX_RAMP_FUZZY` | on (when enabled) | Mismatch-tolerant fallback. Only a net win **combined with** a long block — measured worse than doing nothing at short block lengths. Do not enable with a short or zero block. |
+| `MTPLX_RAMP_FUZZY` | on (when enabled) | Mismatch-tolerant fallback. Only validated as a net win **combined with** a long block — the short-block combination was only measured in an invalidated, contaminated sweep, so treat it as unverified rather than confirmed-bad. Do not enable with a short or zero block. |
 | `MTPLX_RAMP_ANCHOR_LEN` | `3` | Fuzzy anchor length in tokens (clamped to at most `ng_min - 1`). |
-| `MTPLX_RAMP_MAX_FUZZY_CANDIDATES` | `8` | Fuzzy candidate cap. |
+| `MTPLX_RAMP_MAX_FUZZY_CANDIDATES` | `8` | Ranked candidate cap. The search itself scans up to 8x this many stored positions before ranking down to the cap. |
 | `MTPLX_RAMP_SIMILARITY_SPAN` | `24` | Backward-similarity window for ranking fuzzy candidates. |
 
 `tests_ramp/verify_ramp_equivalence.py` is a standalone check (no pytest) that
@@ -297,7 +314,7 @@ Sessions survive: a warm-prefix session bank keeps multi-turn chats fast, and a 
 
 ### Embeddings and reranking
 
-The same daemon can serve retrieval models, so a RAG or agent-memory setup does not need a second inference server beside MTPLX. Point it at any MLX embedding or reranker model — Hugging Face id or local path, optionally with a `REF=served-id` alias:
+The same daemon can serve retrieval models, so a RAG or agent-memory setup does not need a second inference server beside MTPLX. Point it at an MLX embedding model, or a reranker with a Qwen-style yes/no tokenizer (plus specifically-supported Jina checkpoints) — Hugging Face id or local path, optionally with a `REF=served-id` alias:
 
 ```bash
 mtplx serve \
@@ -406,8 +423,11 @@ modification notice. Bug reports about stock MTPLX behaviour belong upstream, at
 Licensed under Apache-2.0. Keep the [LICENSE](LICENSE) and the [NOTICE](NOTICE)
 file if you redistribute.
 
-**Attribution is required, in-product.** NOTICE, which Apache-2.0 section 4(d)
-carries with every copy, states:
+**Attribution is required, in-product.** This is MTPLX's own NOTICE
+requirement, not something Apache-2.0 mandates on its own — §4(d) only
+requires that redistributions carry the NOTICE file, not that its contents be
+shown in-product. The in-product obligation comes from what this project's
+NOTICE itself says:
 
 > This NOTICE file is part of the Apache License 2.0 terms for MTPLX (see
 > section 4(d) of the LICENSE). Any product, application, service, or
