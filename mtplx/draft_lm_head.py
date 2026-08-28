@@ -5,6 +5,117 @@ from __future__ import annotations
 import time
 from typing import Any
 
+QWEN38_ROW10_PREFIX_COUNT = 98_304
+QWEN38_ROW10_CONTROL_START = 248_044
+QWEN38_ROW10_CONTROL_END = 248_070
+QWEN38_ROW10_PADDED_COUNT = 98_336
+
+
+def _make_compact_quantized_draft_head(
+    module: Any,
+    *,
+    prefix_count: int,
+    control_start: int,
+    control_end: int,
+    padded_count: int,
+) -> tuple[Any, Any, dict[str, Any]]:
+    """Slice an affine head by output row without requantizing its weights."""
+
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    if not isinstance(module, nn.QuantizedLinear):
+        raise TypeError("compact draft vocabulary requires QuantizedLinear")
+    output = int(module.weight.shape[0])
+    if not (0 < prefix_count <= control_start < control_end <= output):
+        raise ValueError("invalid compact draft vocabulary rows")
+    real_rows = int(prefix_count) + int(control_end) - int(control_start)
+    if int(padded_count) < real_rows:
+        raise ValueError("compact padded row count is smaller than real rows")
+    selected = mx.concatenate(
+        (
+            mx.arange(prefix_count, dtype=mx.int32),
+            mx.arange(control_start, control_end, dtype=mx.int32),
+        )
+    )
+    padding = mx.arange(int(padded_count) - real_rows, dtype=mx.int32)
+    packed_rows = mx.concatenate((selected, padding))
+    compact = nn.QuantizedLinear(
+        int(module.weight.shape[1]) * 8,
+        int(padded_count),
+        bias="bias" in module,
+        group_size=int(module.group_size),
+        bits=int(module.bits),
+        mode=str(module.mode),
+    )
+    compact.weight = mx.take(module.weight, packed_rows, axis=0)
+    compact.scales = mx.take(module.scales, packed_rows, axis=0)
+    compact.biases = mx.take(module.biases, packed_rows, axis=0)
+    if "bias" in module:
+        compact.bias = mx.take(module.bias, packed_rows, axis=0)
+    mx.eval(compact.parameters(), selected)
+
+    class _CompactDraftHead(nn.Module):
+        def __init__(self, head: Any, rows: int):
+            super().__init__()
+            self.head = head
+            self.rows = int(rows)
+
+        def __call__(self, x: Any) -> Any:
+            return self.head(x)[..., : self.rows]
+
+    return _CompactDraftHead(compact, real_rows), selected, {
+        "source_rows": output,
+        "real_rows": real_rows,
+        "padded_rows": int(padded_count),
+        "bits": int(module.bits),
+        "group_size": int(module.group_size),
+        "mode": str(module.mode),
+    }
+
+
+def configure_qwen38_row10_compact_head(rt: Any, *, active: bool) -> dict[str, Any]:
+    """Toggle row 10 against the installed full-vocabulary draft-only head."""
+
+    text = _text_model(rt.model)
+    control = getattr(text, "_mtplx_qwen38_row10_control_head", None)
+    if control is None:
+        control = getattr(text, "_mtplx_draft_lm_head", None)
+        if control is None:
+            if active:
+                raise RuntimeError("row 10 requires the installed draft LM head")
+            return {"installed": False, "active": False}
+        text._mtplx_qwen38_row10_control_head = control
+    compact = getattr(text, "_mtplx_qwen38_row10_compact_head", None)
+    report = getattr(text, "_mtplx_qwen38_row10_report", None)
+    token_map = getattr(text, "_mtplx_qwen38_row10_token_map", None)
+    if active and compact is None:
+        compact, token_map, report = _make_compact_quantized_draft_head(
+            control,
+            prefix_count=QWEN38_ROW10_PREFIX_COUNT,
+            control_start=QWEN38_ROW10_CONTROL_START,
+            control_end=QWEN38_ROW10_CONTROL_END,
+            padded_count=QWEN38_ROW10_PADDED_COUNT,
+        )
+        text._mtplx_qwen38_row10_compact_head = compact
+        text._mtplx_qwen38_row10_token_map = token_map
+        text._mtplx_qwen38_row10_report = report
+    if active:
+        text._mtplx_draft_lm_head = compact
+        text._mtplx_draft_token_id_map = token_map
+        text._mtplx_draft_target_vocab_size = QWEN38_ROW10_CONTROL_END + (
+            248_320 - QWEN38_ROW10_CONTROL_END
+        )
+    else:
+        text._mtplx_draft_lm_head = control
+        for name in ("_mtplx_draft_token_id_map", "_mtplx_draft_target_vocab_size"):
+            if hasattr(text, name):
+                delattr(text, name)
+    return {
+        "installed": compact is not None,
+        "active": bool(active),
+        **({} if report is None else dict(report)),
+    }
 
 def normalize_draft_lm_head_spec(
     value: Any,

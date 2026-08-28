@@ -10,7 +10,7 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -32,6 +32,15 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .a3b_compiled_target_prefix import A3BCompiledTargetPrefixFactory
+    from .qwen38_challenge import Qwen38PerformanceProfile, Qwen38RouteSpec
+
+
+@dataclass(frozen=True)
+class MTPHistoryAppendRoute:
+    """Request-bound history append selected before prompt/decode execution."""
+
+    append: Callable[..., Any] | None
+    receipt: dict[str, Any]
 
 
 def _detect_total_system_memory_bytes() -> int | None:
@@ -97,6 +106,8 @@ class MTPLXRuntime:
     a3b_compiled_target_prefix_factory: A3BCompiledTargetPrefixFactory | None = None
     a3b_whole_moe_installed: bool = False
     qwen_row_owned_router_report: dict[str, Any] = field(default_factory=dict)
+    qwen38_route: Qwen38RouteSpec | None = None
+    qwen38_performance_profiles: Mapping[str, Qwen38PerformanceProfile] | None = None
     _a3b_whole_moe_request_preflights: dict[str, dict[str, Any]] = field(
         default_factory=dict,
         init=False,
@@ -108,6 +119,13 @@ class MTPLXRuntime:
     diagnostic_counters: dict[str, int] = field(default_factory=dict)
     _forward_ar_supports_emit_logits: bool | None = field(default=None, init=False, repr=False)
     _forward_ar_supports_logits_keep: bool | None = field(default=None, init=False, repr=False)
+    _forward_ar_capture_gdn: Callable[..., Any] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        from .gdn_capture import bind_stock_gdn_compute_g, forward_with_gdn_capture
+
+        bind_stock_gdn_compute_g(self.model)
+        self._forward_ar_capture_gdn = forward_with_gdn_capture
 
     def _count(self, key: str, amount: int = 1) -> None:
         self.diagnostic_counters[key] = int(self.diagnostic_counters.get(key, 0)) + int(amount)
@@ -294,9 +312,7 @@ class MTPLXRuntime:
             logits = self.forward_ar(input_ids, cache=cache)
             return logits, {}
 
-        from .gdn_capture import forward_with_gdn_capture
-
-        return forward_with_gdn_capture(
+        return self._forward_ar_capture_gdn(
             self.model,
             input_ids,
             cache=cache,
@@ -370,6 +386,7 @@ class MTPLXRuntime:
         mtp_hidden_variant: str | None = None,
         position_offset: int | None = None,
         input_embeddings=None,
+        history_route: MTPHistoryAppendRoute | None = None,
     ):
         if not self.mtp_enabled:
             raise RuntimeError("MTP is not enabled for this runtime")
@@ -382,7 +399,11 @@ class MTPLXRuntime:
         resolved_concat_order = (
             self.contract.concat_order if concat_order in {None, "auto", "contract"} else concat_order
         )
-        update = getattr(self.model, "mtp_update_cache", None)
+        update = (
+            history_route.append
+            if history_route is not None
+            else getattr(self.model, "mtp_update_cache", None)
+        )
         if update is not None:
             try:
                 params = py_inspect.signature(update).parameters
@@ -429,6 +450,46 @@ class MTPLXRuntime:
             position_offset=position_offset,
         )
         return hidden
+
+    def bind_mtp_history_append_route(
+        self,
+        prompt_tokens: int,
+    ) -> MTPHistoryAppendRoute:
+        """Select stock or row-20 once for this request's prompt phase."""
+
+        prompt_tokens = max(0, int(prompt_tokens))
+        stock = getattr(self.model, "mtp_update_cache", None)
+        route = self.qwen38_route
+        if (
+            route is not None
+            and route.history_route_id == "kv_only_history"
+            and prompt_tokens >= int(route.min_context_tokens)
+        ):
+            return MTPHistoryAppendRoute(
+                append=route.bindings.mtp_cache_append,
+                receipt={
+                    "route_id": "kv_only_history",
+                    "prompt_tokens": prompt_tokens,
+                    "row20_engaged": True,
+                    "reason": "min_context_satisfied",
+                },
+            )
+        return MTPHistoryAppendRoute(
+            append=stock,
+            receipt={
+                "route_id": "stock_history",
+                "prompt_tokens": prompt_tokens,
+                "row20_engaged": False,
+                "reason": (
+                    "below_min_context"
+                    if route is not None
+                    and route.history_route_id == "kv_only_history"
+                    else "route_has_no_row20"
+                    if route is not None and route.route_id != "control"
+                    else "control_route"
+                ),
+            },
+        )
 
     def make_cache(self):
         inner = getattr(self.model, "language_model", self.model)
@@ -955,6 +1016,17 @@ def load(
         a3b_whole_moe_installed=False,
         qwen_row_owned_router_report=router_report,
     )
+    from .qwen38_challenge import install_qwen38_route, qwen38_final_route
+
+    qwen38_options = qwen38_final_route()
+    qwen38_route = install_qwen38_route(runtime, config, path, **qwen38_options)
+    if qwen38_route is not None:
+        logger.info(
+            "[qwen38-challenge] route=%s fingerprint=%s selfcheck=%s",
+            qwen38_route.route_id,
+            qwen38_route.fingerprint,
+            qwen38_route.selfcheck_status,
+        )
     if whole_moe_plan is not None:
         if compiled_target_factory is None:
             from .a3b_whole_moe import A3BWholeMoeConfigError

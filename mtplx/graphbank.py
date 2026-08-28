@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import time
 import weakref
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -773,6 +774,7 @@ compiled_verify_status: dict[str, Any] = {
     "flipped_at": None,
     "flip_count": 0,
     "transient_exception_count": 0,
+    "last_exception": None,
 }
 
 _PERMANENT_EAGER_LOGGED: set[str] = set()
@@ -807,13 +809,20 @@ def _record_permanent_eager(reason: str, *, once: bool = False) -> None:
             pass
 
 # Process-global compiled verify callables, keyed by
-# (runtime id, capture backend, state spec, verify length, hidden variant,
-# bucket). The bank is per-generation; without sharing, every request pays a
+# (runtime id, route fingerprint, capture backend, state spec, verify length,
+# hidden variant, bucket). The bank is per-generation; without sharing, every request pays a
 # fresh trace. Values are (compiled_fn, trace_host) where trace_host["bank"]
 # is re-pointed to the live bank before each dispatch so internal retraces
 # (mx.compile re-traces on leaf-shape changes) always use live scratch
 # containers. See CompiledVerifyBank._shared_or_new_verify_step.
 _SHARED_VERIFY_STEPS: dict[tuple, tuple[Any, dict[str, Any]]] = {}
+
+
+def _compiled_verify_route_fingerprint(runtime: Any) -> str:
+    """Separate shared traces whose model-side optimization bindings differ."""
+
+    route = getattr(runtime, "qwen38_route", None)
+    return str(getattr(route, "fingerprint", "") or "")
 
 
 def _prewarm_enabled() -> bool:
@@ -1059,8 +1068,6 @@ _BATCH_PAGED_OFFSETS = _batch_paged_offsets_enabled()
 # MTPLX_GREEDY_TRIO_MAX_CONTEXT fence; requests that never prebind (batch
 # lane) keep the last-set/default value — that lane pays at most the
 # pre-#318 serial-sync behavior, never a correctness change.
-from contextvars import ContextVar
-
 _PAGED_OFFSETS_CONTEXT_OK: ContextVar[bool] = ContextVar(
     "mtplx_paged_offsets_context_ok", default=True
 )
@@ -1569,9 +1576,16 @@ class CompiledVerifyBank:
                     self._held_state_refs.pop(0)
         except Exception as exc:
             self._exception_failures += 1
+            exception_detail = f"{type(exc).__name__}: {exc}"
             compiled_verify_status["transient_exception_count"] = (
                 int(compiled_verify_status.get("transient_exception_count", 0)) + 1
             )
+            compiled_verify_status["last_exception"] = exception_detail
+            if self._exception_failures == 1:
+                print(
+                    "[mtplx] compiled-verify exception: " + exception_detail,
+                    flush=True,
+                )
             if self._exception_failures >= 3:
                 self.permanent_eager = True
                 self.permanent_eager_reason = (
@@ -2136,6 +2150,7 @@ class CompiledVerifyBank:
         spec_sig = tuple(self._spec or [])
         global_key = (
             id(self.runtime),
+            _compiled_verify_route_fingerprint(self.runtime),
             self.capture_backend,
             spec_sig,
             int(length),

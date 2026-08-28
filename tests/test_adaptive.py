@@ -1,6 +1,10 @@
 from types import SimpleNamespace
 
-from mtplx.adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
+from mtplx.adaptive import (
+    AdaptiveDepthPolicy,
+    ExpectedValueDepthPolicy,
+    PositionEMADepthPolicy,
+)
 from mtplx.benchmarks.runners import mtp_adaptive
 
 
@@ -37,6 +41,82 @@ def test_adaptive_policy_holds_on_late_reject():
 
     assert decision["action"] == "hold"
     assert decision["next_depth"] == 4
+
+
+def test_position_ema_policy_matches_row11_initial_schedule():
+    policy = PositionEMADepthPolicy(max_depth=8, depth_cap=4)
+
+    # Source priors 0.85 * 0.98**i and h=0.20 clear every marginal gate
+    # through the row-11 hard cap, independent of the larger offered width.
+    assert policy.current_depth == 4
+    assert policy.position_accept_ema == [
+        0.85 * (0.98**index) for index in range(8)
+    ]
+
+
+def test_position_ema_policy_updates_only_observed_rejection_prefix():
+    policy = PositionEMADepthPolicy(max_depth=8, depth_cap=4)
+    before = list(policy.position_accept_ema)
+
+    result = policy.observe(attempted_depth=4, accepted_depths=2)
+
+    assert policy.position_accept_ema[:2] == [
+        value + 0.15 * (1.0 - value) for value in before[:2]
+    ]
+    assert policy.position_accept_ema[2] == before[2] * 0.85
+    assert policy.position_accept_ema[3:] == before[3:]
+    assert result["next_depth"] == policy.current_depth
+
+
+def test_position_ema_policy_transfers_full_accept_optimism():
+    policy = PositionEMADepthPolicy(max_depth=8, depth_cap=4)
+    before = list(policy.position_accept_ema)
+
+    policy.observe(attempted_depth=2, accepted_depths=2)
+
+    assert policy.position_accept_ema[0] > before[0]
+    assert policy.position_accept_ema[1] > before[1]
+    assert policy.position_accept_ema[2] > before[2]
+    assert policy.position_accept_ema[3:] == before[3:]
+
+
+def test_position_ema_policy_can_choose_true_serial_depth_zero():
+    policy = PositionEMADepthPolicy(max_depth=4, depth_cap=4, min_depth=0)
+    policy.position_accept_ema[0] = 0.19
+
+    policy.recompute_depth()
+
+    assert policy.current_depth == 0
+
+
+def test_position_ema_policy_honors_minimum_depth():
+    policy = PositionEMADepthPolicy(max_depth=3, depth_cap=3, min_depth=2)
+    policy.position_accept_ema[0] = 0.0
+
+    policy.recompute_depth()
+
+    assert policy.current_depth == 2
+    assert policy.allows_depth_zero is False
+
+
+def test_position_ema_policy_probes_after_bounded_serial_cycles():
+    policy = PositionEMADepthPolicy(
+        max_depth=3,
+        depth_cap=3,
+        min_depth=0,
+        serial_probe_interval=3,
+    )
+    policy.position_accept_ema[0] = 0.0
+    policy.recompute_depth()
+
+    first = policy.observe_serial_skip()
+    second = policy.observe_serial_skip()
+    probe = policy.observe_serial_skip()
+
+    assert first["next_depth"] == 0
+    assert second["next_depth"] == 0
+    assert probe["next_depth"] == 1
+    assert probe["action"] == "probe"
 
 
 def test_expected_value_policy_stops_d3_when_ev_fails():

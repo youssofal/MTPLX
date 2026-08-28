@@ -72,7 +72,11 @@ from mtplx.a3b_mtp_batch import (
     _require_mlx_lm_arrays_cache_fix,
     install_a3b_mtp_batch_lane,
 )
-from mtplx.adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
+from mtplx.adaptive import (
+    AdaptiveDepthPolicy,
+    ExpectedValueDepthPolicy,
+    PositionEMADepthPolicy,
+)
 from mtplx.attention_context import attention_phase
 from mtplx.cache_state import snapshot_cache
 from mtplx.mtp_patch import MTPContract
@@ -95,7 +99,7 @@ from mtplx.backends.descriptors import (
     sync_backend_arg_aliases,
     target_distribution_mode_from_args,
 )
-from mtplx.backends.registry import load_runtime_contract
+from mtplx.backends.registry import RuntimeContract, load_runtime_contract
 from mtplx.batching import BatchSchedulerConfig, SchedulerMode, SchedulerPreset
 from mtplx.chat_encode_cache import GLOBAL_CHAT_ENCODE_CACHE, ChatEncodeCache
 from mtplx.chat_encoding import encode_chat_messages, is_gemma4_tokenizer
@@ -650,6 +654,8 @@ def _fast_path_env_status() -> dict[str, dict[str, Any]]:
 def _server_runtime_env_overrides(
     args: argparse.Namespace,
     model_runtime_env_overrides: Mapping[str, str] | None,
+    *,
+    runtime_contract: RuntimeContract | None = None,
 ) -> dict[str, str]:
     overrides = dict(model_runtime_env_overrides or {})
     verify_strategy = (
@@ -684,7 +690,44 @@ def _server_runtime_env_overrides(
         and verify_strategy not in VERIFY_SNAPSHOT_OPTIONAL_STRATEGIES
     ):
         overrides["MTPLX_SKIP_VERIFY_SNAPSHOT"] = "0"
+    if _qwen38_measured_profiles_enabled(args, runtime_contract):
+        overrides.update(
+            {
+                "MLX_MAX_MB_PER_BUFFER": "512",
+                "MLX_MAX_OPS_PER_BUFFER": "50",
+            }
+        )
     return overrides
+
+
+def _qwen38_measured_profiles_enabled(
+    args: argparse.Namespace,
+    runtime_contract: RuntimeContract | None,
+) -> bool:
+    contract_matches = bool(
+        runtime_contract is not None
+        and runtime_contract.arch_id == "qwen3-next-mtp"
+        and int(runtime_contract.mtp_depth_max) == 3
+        and int(getattr(args, "depth", 3) or 3) == 3
+        and str(getattr(args, "generation_mode", "mtp") or "mtp") == "mtp"
+        and bool(getattr(args, "load_mtp", True))
+        and str(getattr(args, "adaptive_policy", "none") or "none")
+        in {"none", "position_ema"}
+    )
+    if not contract_matches:
+        return False
+    model_ref = getattr(args, "model", None)
+    if model_ref is None:
+        return False
+    from mtplx.artifacts import load_config
+    from mtplx.qwen38_challenge import is_qwen38_27b_candidate
+
+    model_path = Path(model_ref)
+    try:
+        config = load_config(model_path)
+    except (OSError, ValueError):
+        return False
+    return is_qwen38_27b_candidate(config, model_path)
 
 
 def _assert_fast_path_env() -> dict[str, dict[str, Any]]:
@@ -723,6 +766,63 @@ def _draft_head_identity(runtime: Any) -> str | None:
         if hasattr(draft_head, name):
             h.update(_array_bytes(getattr(draft_head, name)))
     return h.hexdigest()[:16]
+
+
+def _qwen38_challenge_route_payload(runtime: Any) -> dict[str, Any] | None:
+    from mtplx.qwen38_challenge import qwen38_route_receipt
+
+    receipt = qwen38_route_receipt(getattr(runtime, "qwen38_route", None))
+    if receipt is not None:
+        receipt["feature_receipt"] = dict(
+            getattr(runtime, "qwen38_feature_receipt", {}) or {}
+        )
+    return receipt
+
+
+def _select_qwen38_request_performance_profile(
+    runtime: Any,
+    request_observability: Mapping[str, Any] | None,
+) -> Any | None:
+    """Apply one construction-bound Qwen route before request execution."""
+
+    if getattr(runtime, "qwen38_performance_profiles", None) is None:
+        return None
+    from mtplx.qwen38_challenge import select_qwen38_performance_profile
+
+    effort = str(
+        (request_observability or {}).get("resolved_reasoning_effort") or ""
+    ).strip().lower()
+    return select_qwen38_performance_profile(runtime, effort or None)
+
+
+def _install_qwen38_server_performance_profiles(
+    runtime: Any,
+    config: Mapping[str, Any],
+    model_path: Path,
+    args: argparse.Namespace,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> Mapping[str, Any]:
+    """Install every measured route once after the draft head is available."""
+
+    from mtplx.qwen38_challenge import (
+        install_qwen38_performance_profiles,
+        qwen38_measured_performance_profile_configs,
+    )
+
+    profiles = qwen38_measured_performance_profile_configs(
+        adaptive_policy=str(getattr(args, "adaptive_policy", "none") or "none"),
+        q4_mtp_block=getattr(args, "qwen38_q4_mtp_block", None),
+    )
+    return install_qwen38_performance_profiles(
+        runtime,
+        config,
+        model_path,
+        stock=profiles["stock"],
+        low=profiles["low"],
+        xhigh=profiles["xhigh"],
+        environment=environment,
+    )
 
 
 def _mlx_runtime_status() -> dict[str, Any]:
@@ -2029,6 +2129,7 @@ class ServerState:
             runtime_env_overrides = _server_runtime_env_overrides(
                 args,
                 self.model_runtime_env_overrides,
+                runtime_contract=contract,
             )
             clear_cache_every = getattr(args, "clear_cache_every", None)
             if clear_cache_every is not None:
@@ -2107,6 +2208,19 @@ class ServerState:
         _startup_line(f"[5/6] Model loaded in {self.load_time_s:.1f}s")
         self.backend_descriptor = descriptor_from_runtime(self.runtime, args)
         args.backend_id = self.backend_descriptor.backend_id
+        runtime_contract, runtime_contract_error = load_runtime_contract(args.model)
+        if runtime_contract_error and args.adaptive_policy == "position_ema":
+            raise ValueError(
+                "position_ema requires a valid Qwen3.8 runtime contract: "
+                + runtime_contract_error
+            )
+        self.adaptive_policy_factory = _bind_adaptive_policy_factory(
+            args,
+            model_family=_model_family_for_state(self),
+            backend_descriptor=self.backend_descriptor,
+            runtime_mtp_enabled=bool(self.runtime.mtp_enabled),
+            runtime_contract=runtime_contract,
+        )
         if self.backend_descriptor.uses_draft_lm_head:
             _startup_line("[5/6] Installing native-MTP draft head")
         else:
@@ -2151,6 +2265,28 @@ class ServerState:
             )
         else:
             self.draft_head_identity = None
+        self.qwen38_performance_profiles = None
+        if _qwen38_measured_profiles_enabled(args, runtime_contract):
+            from mtplx.artifacts import load_config
+
+            qwen38_model_path = Path(self.runtime.model_path)
+            qwen38_config = load_config(qwen38_model_path)
+            self.qwen38_performance_profiles = self.model_scheduler.submit_foreground(
+                _install_qwen38_server_performance_profiles,
+                self.runtime,
+                qwen38_config,
+                qwen38_model_path,
+                args,
+                environment=os.environ,
+                batch_key="startup.qwen38_performance_profiles",
+            ).result()
+            _startup_line(
+                "[5/6] Qwen3.8 profiles installed: "
+                + ", ".join(
+                    f"{name}={profile.requested_route_id}"
+                    for name, profile in self.qwen38_performance_profiles.items()
+                )
+            )
         scheduler_config = _scheduler_config_from_args(args)
         self.mtp_batch_lane = None
         self.mtp_batch_lanes: dict[int, Any] = {}
@@ -17142,7 +17278,12 @@ def _policy_fingerprint(
         )
     if normalized_cache_scope and normalized_cache_scope != "stable":
         parts.append(f"cache_scope={normalized_cache_scope}")
-    return ";".join(parts)
+    from mtplx.qwen38_challenge import policy_fingerprint_with_qwen38_route
+
+    return policy_fingerprint_with_qwen38_route(
+        ";".join(parts),
+        getattr(getattr(state, "runtime", None), "qwen38_route", None),
+    )
 
 
 def _session_cache_scope_for_request(
@@ -17408,7 +17549,10 @@ def _adaptive_config(
         1,
         int(max_depth if max_depth is not None else getattr(args, "depth", 3)),
     )
-    configured_min_depth = max(1, int(args.adaptive_min_depth))
+    configured_min_depth = max(
+        0 if policy == "position_ema" else 1,
+        int(args.adaptive_min_depth),
+    )
     effective_min_depth = min(configured_min_depth, effective_max_depth)
     config: dict[str, Any] = {
         "policy": policy,
@@ -17428,6 +17572,12 @@ def _adaptive_config(
     elif policy == "cost":
         config["marginal_ms_prior"] = float(
             getattr(args, "adaptive_cost_marginal_ms", 7.0) or 7.0
+        )
+    elif policy == "position_ema":
+        config["depth_cap"] = min(
+            3,
+            effective_max_depth,
+            max(1, int(getattr(args, "adaptive_position_depth_cap", 4))),
         )
     elif policy == "expected_value":
         configured_base_depth = max(1, int(args.adaptive_ev_base_depth))
@@ -17464,7 +17614,7 @@ def _make_adaptive_policy(
     args: argparse.Namespace,
     *,
     max_depth: int | None = None,
-) -> AdaptiveDepthPolicy | ExpectedValueDepthPolicy | None:
+) -> AdaptiveDepthPolicy | ExpectedValueDepthPolicy | PositionEMADepthPolicy | None:
     policy = str(getattr(args, "adaptive_policy", "none") or "none")
     if policy == "none":
         return None
@@ -17493,6 +17643,10 @@ def _make_adaptive_policy(
             marginal_ms=float(getattr(args, "adaptive_cost_marginal_ms", 0.0) or 0.0)
             or None,
         )
+    if policy == "position_ema":
+        raise ValueError(
+            "position_ema requires the construction-bound Qwen3.8 native-MTP factory"
+        )
     if policy == "expected_value":
         effective_base_depth = max(
             effective_min_depth,
@@ -17517,6 +17671,62 @@ def _make_adaptive_policy(
             exploration_interval=int(args.adaptive_ev_exploration_interval),
         )
     raise ValueError(f"unknown adaptive policy: {policy}")
+
+
+def _bind_adaptive_policy_factory(
+    args: argparse.Namespace,
+    *,
+    model_family: str,
+    backend_descriptor: BackendDescriptor,
+    runtime_mtp_enabled: bool,
+    runtime_contract: RuntimeContract | None,
+) -> Callable[
+    [int],
+    AdaptiveDepthPolicy
+    | ExpectedValueDepthPolicy
+    | PositionEMADepthPolicy
+    | None,
+]:
+    """Validate invariant adaptive routing once, then bind request factories."""
+
+    policy = str(getattr(args, "adaptive_policy", "none") or "none")
+    if policy != "position_ema":
+        return lambda effective_depth: _make_adaptive_policy(
+            args,
+            max_depth=effective_depth,
+        )
+
+    valid_native_qwen38 = (
+        model_family == "qwen3_8"
+        and backend_descriptor.backend_id == "qwen3_next"
+        and backend_descriptor.uses_draft_lm_head
+        and not backend_descriptor.uses_external_assistant
+        and runtime_mtp_enabled
+        and runtime_contract is not None
+        and runtime_contract.arch_id == "qwen3-next-mtp"
+        and int(runtime_contract.mtp_depth_max) == 3
+    )
+    if not valid_native_qwen38:
+        raise ValueError(
+            "position_ema is validated only for a Qwen3.8 native-MTP "
+            "checkpoint with runtime-contract mtp_depth_max=3"
+        )
+
+    configured_min_depth = min(3, max(0, int(args.adaptive_min_depth)))
+    configured_depth_cap = min(
+        3,
+        max(1, int(getattr(args, "adaptive_position_depth_cap", 4))),
+    )
+
+    def make_position_ema(effective_depth: int):
+        installed_depth = min(3, max(1, int(effective_depth)))
+        return PositionEMADepthPolicy(
+            max_depth=installed_depth,
+            depth_cap=min(configured_depth_cap, installed_depth),
+            min_depth=min(configured_min_depth, installed_depth),
+        )
+
+    return make_position_ema
 
 
 def _store_retokenized_history_snapshot(
@@ -20675,6 +20885,8 @@ def _run_generation(
         "generation_mode": effective_mode,
         **(request_observability or {}),
     }
+    selected_performance_profile = None
+    adaptive_policy = None
     for attempt in range(max_attempts):
         generation_seed, seed_is_explicit = _resolve_seed(state, seed)
         lock_started = time.perf_counter()
@@ -20711,6 +20923,19 @@ def _run_generation(
         try:
             if cancel_event is not None and cancel_event.is_set():
                 raise _StreamCancelled("request cancelled before generation")
+            selected_performance_profile = (
+                _select_qwen38_request_performance_profile(
+                    state.runtime,
+                    request_observability,
+                )
+            )
+            if (
+                selected_performance_profile is not None
+                and request_observability is not None
+            ):
+                request_observability["qwen38_performance_profile"] = (
+                    selected_performance_profile.profile_id
+                )
             dynamic_kv_reservation = _dynamic_paged_kv_reservation(
                 prompt_tokens=len(prompt_ids),
                 max_new_tokens=response_max,
@@ -20784,9 +21009,7 @@ def _run_generation(
                         ),
                     )
                 else:
-                    adaptive_policy = _make_adaptive_policy(
-                        state.args, max_depth=effective_depth
-                    )
+                    adaptive_policy = state.adaptive_policy_factory(effective_depth)
                     if vision_splice is not None and vision_splice.cursor:
                         # Retries and tool-loop redispatches replay the
                         # full prompt, so the image rows must rewind.
@@ -20812,7 +21035,9 @@ def _run_generation(
                         verify_strategy=state.args.verify_strategy,
                         verify_core=state.args.verify_core,
                         draft_core=str(
-                            getattr(state.args, "draft_core", None) or "stock"
+                            selected_performance_profile.draft_core
+                            if selected_performance_profile is not None
+                            else getattr(state.args, "draft_core", None) or "stock"
                         ),
                         token_callback=record_tokens,
                         session_bank=session_bank,
@@ -20895,6 +21120,16 @@ def _run_generation(
             completion_tokens=completion_tokens,
             elapsed_s=elapsed_s,
         )
+        qwen38_route = _qwen38_challenge_route_payload(state.runtime)
+        if qwen38_route is not None:
+            qwen38_route["feature_receipt"] = dict(
+                getattr(state.runtime, "qwen38_feature_receipt", {}) or {}
+            )
+            qwen38_route["speculative_depth"] = int(effective_depth)
+            qwen38_route["adaptive_policy_state"] = (
+                "enabled" if adaptive_policy is not None else "disabled"
+            )
+            stats["qwen38_challenge_route"] = qwen38_route
         if effective_mode == "mtp":
             stats["requested_speculative_depth"] = int(requested_depth)
         if session_bank is not None:
@@ -25286,6 +25521,7 @@ def create_app(state: ServerState) -> FastAPI:
             "paged_kv_quantization": _effective_paged_kv_quantization(),
             "paged_kv_quantization_detail": _paged_kv_quantization_detail(),
             "kernel_selfcheck": _kernel_selfcheck_health_payload(),
+            "qwen38_challenge_route": _qwen38_challenge_route_payload(runtime),
             "rate_limit_per_minute": int(state.args.rate_limit),
             "stream_interval": int(state.args.stream_interval),
             "warmup": state.warmup_status,
@@ -32057,14 +32293,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--adaptive-policy",
-        choices=["none", "streak", "expected_value", "cost"],
+        choices=["none", "streak", "expected_value", "cost", "position_ema"],
         default="none",
         help="Optional per-request native-MTP depth policy. Exact sampler semantics remain unchanged.",
+    )
+    parser.add_argument(
+        "--qwen38-q4-mtp-block",
+        type=Path,
+        default=None,
+        help=(
+            "Validated r17 Q4 native-MTP block used by the measured Qwen3.8 "
+            "low profile when --adaptive-policy position_ema is enabled."
+        ),
     )
     parser.add_argument("--adaptive-min-depth", type=int, default=1)
     parser.add_argument("--adaptive-start-depth", type=int, default=1)
     parser.add_argument("--adaptive-increase-after", type=int, default=4)
     parser.add_argument("--adaptive-decrease-after", type=int, default=1)
+    parser.add_argument("--adaptive-position-depth-cap", type=int, default=4)
     parser.add_argument("--adaptive-ev-base-depth", type=int, default=2)
     parser.add_argument(
         "--adaptive-ev-accept-priors",

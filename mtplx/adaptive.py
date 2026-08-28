@@ -252,6 +252,129 @@ class ExpectedValueDepthPolicy:
         return _clamp(raw, 0.25, 1.75)
 
 
+@dataclass
+class PositionEMADepthPolicy:
+    """Per-position marginal-value schedule from challenge row 11.
+
+    ``position_accept_ema[i]`` estimates the conditional probability that
+    draft position ``i`` is accepted after every earlier position was
+    accepted. The chosen depth maximizes expected committed tokens per unit
+    cost using the source's greedy marginal test. Unlike MTPLX's older
+    adaptive controllers, this policy deliberately permits depth zero: when
+    even the first proposal cannot repay one head step, generation takes the
+    target-only serial path for that cycle.
+    """
+
+    max_depth: int
+    depth_cap: int = 4
+    min_depth: int = 0
+    accept_ema_alpha: float = 0.15
+    head_step_cost_ratio: float = 0.20
+    prior: float = 0.85
+    prior_decay: float = 0.98
+    serial_probe_interval: int = 8
+
+    allows_depth_zero: bool = True
+
+    def __post_init__(self) -> None:
+        if self.max_depth < 1:
+            raise ValueError("max_depth must be >= 1")
+        if self.depth_cap < 1:
+            raise ValueError("depth_cap must be >= 1")
+        if self.min_depth < 0:
+            raise ValueError("min_depth must be >= 0")
+        if self.min_depth > self.max_depth:
+            raise ValueError("min_depth must be <= max_depth")
+        if not 0.0 < self.accept_ema_alpha <= 1.0:
+            raise ValueError("accept_ema_alpha must be in (0, 1]")
+        if self.head_step_cost_ratio <= 0.0:
+            raise ValueError("head_step_cost_ratio must be > 0")
+        if self.serial_probe_interval < 1:
+            raise ValueError("serial_probe_interval must be >= 1")
+        self.depth_cap = min(int(self.depth_cap), int(self.max_depth))
+        self.min_depth = int(self.min_depth)
+        self.allows_depth_zero = self.min_depth == 0
+        self.position_accept_ema = [
+            float(self.prior) * (float(self.prior_decay) ** index)
+            for index in range(self.max_depth)
+        ]
+        self._serial_skip_cycles = 0
+        self.current_depth = 0
+        self.recompute_depth()
+
+    def recompute_depth(self) -> int:
+        reach = 1.0
+        expected = 0.0
+        depth = 0
+        h = float(self.head_step_cost_ratio)
+        while depth < self.depth_cap:
+            reach *= self.position_accept_ema[depth]
+            threshold = h * (1.0 + expected) / (1.0 + depth * h)
+            if reach <= threshold:
+                break
+            expected += reach
+            depth += 1
+        self.current_depth = max(self.min_depth, depth)
+        return self.current_depth
+
+    def observe_serial_skip(self) -> dict:
+        """Schedule a bounded D1 probe so a true D0 decision is not absorbing."""
+
+        previous_depth = self.current_depth
+        self._serial_skip_cycles += 1
+        action = "hold"
+        if self._serial_skip_cycles >= self.serial_probe_interval:
+            self._serial_skip_cycles = 0
+            self.current_depth = 1
+            action = "probe"
+        return {
+            "kind": "position_ema",
+            "previous_depth": previous_depth,
+            "attempted_depth": 0,
+            "accepted_depths": 0,
+            "next_depth": self.current_depth,
+            "action": action,
+            "accept_ema": [float(value) for value in self.position_accept_ema],
+        }
+
+    def observe(self, *, attempted_depth: int, accepted_depths: int) -> dict:
+        attempted = max(1, min(int(attempted_depth), self.max_depth))
+        accepted = max(0, min(int(accepted_depths), attempted))
+        previous_depth = self.current_depth
+        self._serial_skip_cycles = 0
+        alpha = float(self.accept_ema_alpha)
+
+        for index in range(accepted):
+            value = self.position_accept_ema[index]
+            self.position_accept_ema[index] = value + alpha * (1.0 - value)
+
+        if accepted < attempted:
+            value = self.position_accept_ema[accepted]
+            self.position_accept_ema[accepted] = value + alpha * (0.0 - value)
+        elif accepted < self.max_depth:
+            # A full round is positive evidence about the first unoffered
+            # position, allowing a hot chain to widen beyond its current cap.
+            value = self.position_accept_ema[accepted]
+            self.position_accept_ema[accepted] = value + alpha * (1.0 - value)
+
+        next_depth = self.recompute_depth()
+        return {
+            "kind": "position_ema",
+            "previous_depth": previous_depth,
+            "attempted_depth": attempted,
+            "accepted_depths": accepted,
+            "next_depth": next_depth,
+            "action": (
+                "increase"
+                if next_depth > previous_depth
+                else "decrease"
+                if next_depth < previous_depth
+                else "hold"
+            ),
+            "accept_ema": [float(value) for value in self.position_accept_ema],
+        }
+
+
 class CostModelDepthPolicy:
     """Cost-model adaptive depth: maximize expected committed tokens per
     wall-clock cycle, not acceptance streaks.

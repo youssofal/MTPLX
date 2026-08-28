@@ -132,7 +132,7 @@ def _tiny_text_model_args():
     )
 
 
-def _write_tiny_two_layer_sidecar(tmp_path, args) -> dict:
+def _write_tiny_mtp_sidecar(tmp_path, args, *, n_layers: int = 2) -> dict:
     """Harvest correctly-shaped weights from real DecoderLayer donors."""
     from mlx_lm.models.qwen3_5 import DecoderLayer
 
@@ -143,13 +143,13 @@ def _write_tiny_two_layer_sidecar(tmp_path, args) -> dict:
         "mtp.pre_fc_norm_hidden.weight": mx.ones((args.hidden_size,)),
         "mtp.pre_fc_norm_embedding.weight": mx.ones((args.hidden_size,)),
     }
-    for index in range(2):
+    for index in range(n_layers):
         donor = DecoderLayer(args, layer_idx=fa_idx)
         for path, value in tree_flatten(donor.parameters()):
             tensors[f"mtp.layers.{index}.{path}"] = value
     mx.save_safetensors(str(tmp_path / "mtp.safetensors"), tensors)
 
-    config = _dense_config(2)
+    config = _dense_config(n_layers)
     config.update(
         {
             "hidden_size": args.hidden_size,
@@ -170,6 +170,10 @@ def _write_tiny_two_layer_sidecar(tmp_path, args) -> dict:
     )
     (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
     return config
+
+
+def _write_tiny_two_layer_sidecar(tmp_path, args) -> dict:
+    return _write_tiny_mtp_sidecar(tmp_path, args, n_layers=2)
 
 
 def test_inject_and_forward_two_layer_mtp_head(tmp_path) -> None:
@@ -202,6 +206,57 @@ def test_inject_and_forward_two_layer_mtp_head(tmp_path) -> None:
     assert all(int(cache.offset) == 4 for cache in mtp_cache)
 
 
+def test_mtp_forward_uses_qwen38_dual_norm_concat_route(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from mlx_lm.models.qwen3_5 import TextModel
+
+    import mtplx.qwen38_challenge_kernels as kernels
+
+    args = _tiny_text_model_args()
+    config = _write_tiny_two_layer_sidecar(tmp_path, args)
+    model = TextModel(args)
+    assert inject_mtp_support(model, tmp_path, config) is True
+    calls: list[tuple[int, int]] = []
+
+    def fused(a, b, a_weight, b_weight, eps):
+        calls.append((int(a.shape[-1]), int(b.shape[-1])))
+        return mx.concatenate((a, b), axis=-1)
+
+    monkeypatch.setattr(kernels, "qwen38_dual_rms_norm_concat", fused)
+    model._mtplx_prepare_mtp_inputs = model._mtplx_prepare_mtp_inputs_dual
+    hidden = mx.random.normal((1, 1, args.hidden_size))
+    tokens = mx.array([[1]])
+    logits = model.mtp_forward(hidden, tokens, mtp_cache=model.make_mtp_cache())
+    mx.eval(logits)
+
+    assert calls == [(args.hidden_size, args.hidden_size)]
+
+
+def test_row24_target_eval_ladder_uses_decode_rungs(tmp_path, monkeypatch) -> None:
+    from mlx_lm.models.qwen3_5 import TextModel
+
+    import mtplx.qwen38_challenge_kernels as kernels
+
+    args = _tiny_text_model_args()
+    config = _write_tiny_mtp_sidecar(tmp_path, args, n_layers=1)
+    model = TextModel(args)
+    assert inject_mtp_support(model, tmp_path, config) is True
+    calls: list[tuple[int, ...]] = []
+    monkeypatch.setattr(
+        kernels,
+        "qwen38_row24_async_eval",
+        lambda value, **_kwargs: calls.append(tuple(value.shape)),
+    )
+    model._mtplx_forward_layers = model._mtplx_forward_layers_row24
+
+    logits = model(mx.array([[1, 2, 3, 4]]))
+    mx.eval(logits)
+
+    assert calls == [(1, 4, args.hidden_size), (1, 4, args.hidden_size)]
+
+
 def test_mtp_cache_length_mismatch_fails_loud(tmp_path) -> None:
     from mlx_lm.models.cache import KVCache
     from mlx_lm.models.qwen3_5 import TextModel
@@ -215,3 +270,65 @@ def test_mtp_cache_length_mismatch_fails_loud(tmp_path) -> None:
     tokens = mx.array([[1]])
     with pytest.raises(ValueError, match="draft"):
         model.mtp_forward(hidden, tokens, mtp_cache=[KVCache()])
+
+
+def test_one_layer_kv_only_history_append_matches_control_cache(tmp_path) -> None:
+    from mlx_lm.models.qwen3_5 import TextModel
+
+    args = _tiny_text_model_args()
+    config = _write_tiny_mtp_sidecar(tmp_path, args, n_layers=1)
+    model = TextModel(args)
+    assert inject_mtp_support(model, tmp_path, config) is True
+
+    hidden = mx.random.normal((1, 4, args.hidden_size))
+    tokens = mx.array([[1, 2, 3, 4]])
+    control_cache = model.make_mtp_cache()
+    control_root = model.mtp_update_cache(hidden, tokens, mtp_cache=control_cache)
+    mx.eval(control_root, *(control_cache[0].state))
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("dead full-layer work ran during K/V-only append")
+
+    layer = model.mtp.layers[0]
+    layer.self_attn.q_proj = forbidden
+    layer.self_attn.o_proj = forbidden
+    layer.mlp = forbidden
+    model.mtp.norm = forbidden
+    candidate_cache = model.make_mtp_cache()
+    candidate_root = model.mtp_update_cache_kv_only_history(
+        hidden,
+        tokens,
+        mtp_cache=candidate_cache,
+    )
+    mx.eval(candidate_root)
+
+    assert candidate_cache[0].offset == control_cache[0].offset == 4
+    for candidate, control in zip(candidate_cache[0].state, control_cache[0].state):
+        assert mx.array_equal(candidate, control).item()
+    assert getattr(layer.self_attn, "_mtplx_qwen38_packed_kv", None) is not None
+
+
+def test_qwen38_kv_only_history_packs_quantized_kv_projection(tmp_path) -> None:
+    from mlx_lm.models.qwen3_5 import TextModel
+
+    args = _tiny_text_model_args()
+    config = _write_tiny_mtp_sidecar(tmp_path, args, n_layers=1)
+    model = TextModel(args)
+    contract = MTPContract(
+        mtp_quant_bits=4,
+        mtp_quant_group_size=32,
+        mtp_quant_policy="all",
+    )
+    assert inject_mtp_support(model, tmp_path, config, contract=contract) is True
+
+    hidden = mx.random.normal((1, 4, args.hidden_size))
+    tokens = mx.array([[1, 2, 3, 4]])
+    cache = model.make_mtp_cache()
+    root = model.mtp_update_cache_kv_only_history(hidden, tokens, mtp_cache=cache)
+    mx.eval(root)
+
+    assert getattr(
+        model.mtp.layers[0].self_attn,
+        "_mtplx_qwen38_packed_kv",
+        None,
+    ) is not None

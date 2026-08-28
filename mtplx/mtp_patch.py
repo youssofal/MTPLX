@@ -202,6 +202,125 @@ class MTPContract:
         return self.with_metadata(metadata, preserve_explicit=preserve_explicit)
 
 
+def install_qwen38_kv_only_history_append(model: Any):
+    """Validate and prebind the exact packed row-20 history append."""
+
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    text = getattr(model, "language_model", model)
+    mtp = getattr(text, "mtp", None)
+    layers = tuple(getattr(mtp, "layers", ()) or ())
+    if len(layers) != 1:
+        raise ValueError("K/V-only history append requires a one-layer MTP head")
+    layer = layers[0]
+    if bool(getattr(layer, "is_linear", True)):
+        raise ValueError("K/V-only history append requires full attention")
+    attention = layer.self_attn
+    if (
+        int(getattr(attention, "num_key_value_heads", 0)) != 4
+        or int(getattr(attention, "head_dim", 0)) != 256
+        or getattr(text, "_mtplx_concat_order", "embedding_hidden")
+        != "embedding_hidden"
+    ):
+        raise ValueError("K/V-only history append has incompatible Qwen 3.8 geometry")
+
+    k_proj = attention.k_proj
+    v_proj = attention.v_proj
+    k_pack_proj = getattr(k_proj, "_mtplx_pack_linear", k_proj)
+    v_pack_proj = getattr(v_proj, "_mtplx_pack_linear", v_proj)
+    if all(isinstance(module, nn.QuantizedLinear) for module in (k_pack_proj, v_pack_proj)):
+        if not (
+            int(k_pack_proj.bits) == int(v_pack_proj.bits)
+            and int(k_pack_proj.group_size) == int(v_pack_proj.group_size)
+            and str(k_pack_proj.mode) == str(v_pack_proj.mode) == "affine"
+            and tuple(k_pack_proj.weight.shape[1:]) == tuple(v_pack_proj.weight.shape[1:])
+            and tuple(k_pack_proj.scales.shape[1:]) == tuple(v_pack_proj.scales.shape[1:])
+            and tuple(k_pack_proj.biases.shape[1:]) == tuple(v_pack_proj.biases.shape[1:])
+        ):
+            raise ValueError("K/V-only history quantized projections are incompatible")
+        packed = (
+            "quantized",
+            mx.concatenate([k_pack_proj.weight, v_pack_proj.weight], axis=0),
+            mx.concatenate([k_pack_proj.scales, v_pack_proj.scales], axis=0),
+            mx.concatenate([k_pack_proj.biases, v_pack_proj.biases], axis=0),
+            int(k_pack_proj.weight.shape[0]),
+            int(k_pack_proj.group_size),
+            int(k_pack_proj.bits),
+            str(k_pack_proj.mode),
+        )
+        mx.eval(*packed[1:4])
+    elif all(isinstance(module, nn.Linear) for module in (k_pack_proj, v_pack_proj)):
+        if not (
+            all("bias" not in module for module in (k_pack_proj, v_pack_proj))
+            and tuple(k_pack_proj.weight.shape[1:]) == tuple(v_pack_proj.weight.shape[1:])
+        ):
+            raise ValueError("K/V-only history dense projections are incompatible")
+        packed = (
+            "dense",
+            mx.concatenate([k_pack_proj.weight, v_pack_proj.weight], axis=0),
+            int(k_pack_proj.weight.shape[0]),
+        )
+        mx.eval(packed[1])
+    else:
+        raise ValueError("K/V-only history requires prepackable K/V projections")
+
+    def append(
+        hidden_states,
+        next_token_ids,
+        mtp_cache=None,
+        concat_order=None,
+        mtp_hidden_variant=None,
+        position_offset=None,
+        input_embeddings=None,
+    ):
+        del concat_order, mtp_hidden_variant
+        input_embeds = (
+            input_embeddings
+            if input_embeddings is not None
+            else text.model.embed_tokens(next_token_ids)
+        )
+        embedding_norm = mtp.pre_fc_norm_embedding(input_embeds)
+        hidden_norm = mtp.pre_fc_norm_hidden(hidden_states)
+        mixed = mtp.fc(mx.concatenate([embedding_norm, hidden_norm], axis=-1))
+        normed = layer.input_layernorm(mixed)
+        batch, length, _ = normed.shape
+        if packed[0] == "quantized":
+            _, weight, scales, biases, split_at, group_size, bits, mode = packed
+            kv = mx.quantized_matmul(
+                normed,
+                weight,
+                scales=scales,
+                biases=biases,
+                transpose=True,
+                group_size=group_size,
+                bits=bits,
+                mode=mode,
+            )
+        else:
+            _, weight, split_at = packed
+            kv = normed @ weight.T
+        keys, values = mx.split(kv, [split_at], axis=-1)
+        keys = attention.k_norm(
+            keys.reshape(batch, length, attention.num_key_value_heads, -1)
+        ).transpose(0, 2, 1, 3)
+        values = values.reshape(
+            batch, length, attention.num_key_value_heads, -1
+        ).transpose(0, 2, 1, 3)
+        layer_cache = mtp_cache[0]
+        rope_offset = (
+            int(position_offset)
+            if position_offset is not None
+            else int(layer_cache.offset)
+        )
+        keys = attention.rope(keys, offset=rope_offset)
+        layer_cache.update_and_fetch(keys, values)
+        return layer_cache.state
+
+    text._mtplx_qwen38_kv_only_history_impl = append
+    return append
+
+
 def _valid_mtp_hidden_variant(value: str) -> bool:
     if value in {"fc", "pre_norm", "post_norm", "embedding", "prev"}:
         return True
@@ -809,6 +928,21 @@ def inject_mtp_support(
         _quantize_mtp_module(mtp, contract)
     mx.eval(mtp.parameters())
 
+    def _stock_explicit_qk(attn, queries, keys, position_offset):
+        queries = attn.q_norm(queries).transpose(0, 2, 1, 3)
+        keys = attn.k_norm(keys).transpose(0, 2, 1, 3)
+        queries = attn.rope(queries, offset=int(position_offset))
+        keys = attn.rope(keys, offset=int(position_offset))
+        return queries, keys
+
+    for mtp_layer in mtp.layers:
+        attention = mtp_layer.self_attn
+        attention._mtplx_prepare_explicit_qk = (
+            lambda queries, keys, position_offset, attention=attention: (
+                _stock_explicit_qk(attention, queries, keys, position_offset)
+            )
+        )
+
     text_model.mtp = mtp
     text_model._mtplx_hidden_variant = contract.hidden_variant
     text_model._mtplx_concat_order = contract.concat_order
@@ -817,6 +951,64 @@ def inject_mtp_support(
     original_text_class = text_model.__class__
 
     class _MTPLXTextModel(original_text_class):
+        def _mtplx_forward_layers_stock(
+            self, hidden_states, cache, fa_mask, ssm_mask
+        ):
+            for layer, layer_cache in zip(self.model.layers, cache):
+                mask = ssm_mask if layer.is_linear else fa_mask
+                hidden_states = layer(hidden_states, mask=mask, cache=layer_cache)
+            return hidden_states
+
+        def _mtplx_forward_layers_ladder(
+            self, hidden_states, cache, fa_mask, ssm_mask, *, prefill_stride
+        ):
+            from .qwen38_challenge_kernels import qwen38_row24_async_eval
+
+            row24_prefill = int(hidden_states.shape[1]) >= 512
+            row24_decode = int(hidden_states.shape[1]) <= 9
+            for layer_index, (layer, layer_cache) in enumerate(
+                zip(self.model.layers, cache)
+            ):
+                mask = ssm_mask if layer.is_linear else fa_mask
+                hidden_states = layer(hidden_states, mask=mask, cache=layer_cache)
+                if (
+                    row24_prefill
+                    and (
+                        layer_index == 0
+                        or layer_index % prefill_stride == prefill_stride - 1
+                    )
+                ) or (
+                    row24_decode
+                    and layer_index in {0, 1, 9, 19, 29, 39, 49, 57}
+                ):
+                    qwen38_row24_async_eval(
+                        hidden_states,
+                        row26=bool(prefill_stride == 3 and row24_prefill),
+                    )
+            return hidden_states
+
+        def _mtplx_forward_layers_row24(
+            self, hidden_states, cache, fa_mask, ssm_mask
+        ):
+            return self._mtplx_forward_layers_ladder(
+                hidden_states,
+                cache,
+                fa_mask,
+                ssm_mask,
+                prefill_stride=4,
+            )
+
+        def _mtplx_forward_layers_row26(
+            self, hidden_states, cache, fa_mask, ssm_mask
+        ):
+            return self._mtplx_forward_layers_ladder(
+                hidden_states,
+                cache,
+                fa_mask,
+                ssm_mask,
+                prefill_stride=3,
+            )
+
         def __call__(
             self,
             inputs,
@@ -835,9 +1027,12 @@ def inject_mtp_support(
 
             fa_mask = create_attention_mask(hidden_states, cache[inner.fa_idx])
             ssm_mask = create_ssm_mask(hidden_states, cache[inner.ssm_idx])
-            for layer, layer_cache in zip(inner.layers, cache):
-                mask = ssm_mask if layer.is_linear else fa_mask
-                hidden_states = layer(hidden_states, mask=mask, cache=layer_cache)
+            hidden_states = self._mtplx_forward_layers(
+                hidden_states,
+                cache,
+                fa_mask,
+                ssm_mask,
+            )
 
             pre_norm = hidden_states
             variant = hidden_variant or getattr(self, "_mtplx_hidden_variant", "post_norm")
@@ -914,12 +1109,10 @@ def inject_mtp_support(
             gate = gate.reshape(B, L, -1)
 
             keys, values = attn.k_proj(normed), attn.v_proj(normed)
-            queries = attn.q_norm(queries).transpose(0, 2, 1, 3)
-            keys = attn.k_norm(keys.reshape(B, L, attn.num_key_value_heads, -1)).transpose(
-                0,
-                2,
-                1,
-                3,
+            queries, keys = attn._mtplx_prepare_explicit_qk(
+                queries,
+                keys.reshape(B, L, attn.num_key_value_heads, -1),
+                int(position_offset),
             )
             values = values.reshape(B, L, attn.num_key_value_heads, -1).transpose(
                 0,
@@ -928,8 +1121,6 @@ def inject_mtp_support(
                 3,
             )
 
-            queries = attn.rope(queries, offset=int(position_offset))
-            keys = attn.rope(keys, offset=int(position_offset))
             paged_mtp_enabled = (
                 os.environ.get("MTPLX_VLLM_METAL_PAGED_MTP_ATTN", "")
                 .strip()
@@ -975,6 +1166,94 @@ def inject_mtp_support(
             h = x + attn.o_proj(output * mx.sigmoid(gate))
             return h + layer.mlp(layer.post_attention_layernorm(h))
 
+        def _mtplx_prepare_mtp_inputs_stock(
+            self, hidden_states, next_token_ids, input_embeddings, order
+        ):
+            input_embeds = (
+                input_embeddings
+                if input_embeddings is not None
+                else self.model.embed_tokens(next_token_ids)
+            )
+            e = self.mtp.pre_fc_norm_embedding(input_embeds)
+            h = self.mtp.pre_fc_norm_hidden(hidden_states)
+            parts = [e, h] if order == "embedding_hidden" else [h, e]
+            return mx.concatenate(parts, axis=-1), input_embeds
+
+        def _mtplx_prepare_mtp_inputs_dual(
+            self, hidden_states, next_token_ids, input_embeddings, order
+        ):
+            if order != "embedding_hidden":
+                return self._mtplx_prepare_mtp_inputs_stock(
+                    hidden_states,
+                    next_token_ids,
+                    input_embeddings,
+                    order,
+                )
+            from .qwen38_challenge_kernels import qwen38_dual_rms_norm_concat
+
+            input_embeds = (
+                input_embeddings
+                if input_embeddings is not None
+                else self.model.embed_tokens(next_token_ids)
+            )
+            embedding_norm = self.mtp.pre_fc_norm_embedding
+            hidden_norm = self.mtp.pre_fc_norm_hidden
+            return (
+                qwen38_dual_rms_norm_concat(
+                    input_embeds,
+                    hidden_states,
+                    embedding_norm.weight,
+                    hidden_norm.weight,
+                    float(embedding_norm.eps),
+                ),
+                input_embeds,
+            )
+
+        def _mtplx_prepare_mtp_inputs_row63(
+            self, hidden_states, next_token_ids, input_embeddings, order
+        ):
+            if input_embeddings is not None or order != "embedding_hidden":
+                return self._mtplx_prepare_mtp_inputs_stock(
+                    hidden_states,
+                    next_token_ids,
+                    input_embeddings,
+                    order,
+                )
+            from .qwen38_challenge_kernels import (
+                qwen38_q8_embedding_dual_rms_norm_concat,
+            )
+
+            embedding_norm = self.mtp.pre_fc_norm_embedding
+            hidden_norm = self.mtp.pre_fc_norm_hidden
+            return (
+                qwen38_q8_embedding_dual_rms_norm_concat(
+                    next_token_ids,
+                    self.model.embed_tokens,
+                    hidden_states,
+                    embedding_norm.weight,
+                    hidden_norm.weight,
+                    float(embedding_norm.eps),
+                ),
+                None,
+            )
+
+        def _mtplx_prepare_mtp_inputs_row63_dual(
+            self, hidden_states, next_token_ids, input_embeddings, order
+        ):
+            if input_embeddings is not None:
+                return self._mtplx_prepare_mtp_inputs_dual(
+                    hidden_states,
+                    next_token_ids,
+                    input_embeddings,
+                    order,
+                )
+            return self._mtplx_prepare_mtp_inputs_row63(
+                hidden_states,
+                next_token_ids,
+                input_embeddings,
+                order,
+            )
+
         def _mtp_core(
             self,
             hidden_states,
@@ -989,16 +1268,14 @@ def inject_mtp_support(
             # Vision prompts: the caller passes the same spliced embedding
             # rows the trunk prefill consumed, so the MTP history sees the
             # image content instead of raw image-pad embeddings (#103).
-            input_embeds = (
-                input_embeddings
-                if input_embeddings is not None
-                else self.model.embed_tokens(next_token_ids)
-            )
-            e = self.mtp.pre_fc_norm_embedding(input_embeds)
-            h = self.mtp.pre_fc_norm_hidden(hidden_states)
             order = concat_order or getattr(self, "_mtplx_concat_order", "embedding_hidden")
-            parts = [e, h] if order == "embedding_hidden" else [h, e]
-            x = self.mtp.fc(mx.concatenate(parts, axis=-1))
+            pre_fc, input_embeds = self._mtplx_prepare_mtp_inputs(
+                hidden_states,
+                next_token_ids,
+                input_embeddings,
+                order,
+            )
+            x = self.mtp.fc(pre_fc)
             fc_hidden = x
             num_draft_layers = len(self.mtp.layers)
             if mtp_cache:
@@ -1093,10 +1370,196 @@ def inject_mtp_support(
             )
             return hidden
 
+        def mtp_update_cache_kv_only_history(
+            self,
+            hidden_states,
+            next_token_ids,
+            mtp_cache=None,
+            concat_order=None,
+            mtp_hidden_variant: str | None = None,
+            position_offset: int | None = None,
+            input_embeddings=None,
+        ):
+            """Append dead committed-history rows through attention K/V only.
+
+            Adapted for MTPLX from the K/V-only history mechanism in the
+            Layr-Labs Qwen 3.8 MLXFast challenge (MIT); see NOTICE.
+            """
+            installed = getattr(self, "_mtplx_qwen38_kv_only_history_impl", None)
+            if installed is not None:
+                return installed(
+                    hidden_states,
+                    next_token_ids,
+                    mtp_cache=mtp_cache,
+                    concat_order=concat_order,
+                    mtp_hidden_variant=mtp_hidden_variant,
+                    position_offset=position_offset,
+                    input_embeddings=input_embeddings,
+                )
+            del mtp_hidden_variant
+            if len(self.mtp.layers) != 1:
+                raise ValueError("K/V-only history append requires a one-layer MTP head")
+            if not mtp_cache or len(mtp_cache) != 1:
+                raise ValueError("K/V-only history append requires exactly one cache")
+            if hidden_states.shape[1] != next_token_ids.shape[1]:
+                raise ValueError("hidden and token history lengths must match")
+
+            input_embeds = (
+                input_embeddings
+                if input_embeddings is not None
+                else self.model.embed_tokens(next_token_ids)
+            )
+            embedding_norm = self.mtp.pre_fc_norm_embedding(input_embeds)
+            hidden_norm = self.mtp.pre_fc_norm_hidden(hidden_states)
+            order = concat_order or getattr(
+                self,
+                "_mtplx_concat_order",
+                "embedding_hidden",
+            )
+            parts = (
+                [embedding_norm, hidden_norm]
+                if order == "embedding_hidden"
+                else [hidden_norm, embedding_norm]
+            )
+            mixed = self.mtp.fc(mx.concatenate(parts, axis=-1))
+
+            layer = self.mtp.layers[0]
+            if layer.is_linear:
+                raise ValueError("K/V-only history append requires full attention")
+            attention = layer.self_attn
+            normed = layer.input_layernorm(mixed)
+            batch, length, _ = normed.shape
+
+            k_proj = attention.k_proj
+            v_proj = attention.v_proj
+            k_pack_proj = getattr(k_proj, "_mtplx_pack_linear", k_proj)
+            v_pack_proj = getattr(v_proj, "_mtplx_pack_linear", v_proj)
+            packed = getattr(attention, "_mtplx_qwen38_packed_kv", None)
+            if packed is None and all(
+                isinstance(module, nn.QuantizedLinear)
+                for module in (k_pack_proj, v_pack_proj)
+            ):
+                compatible = (
+                    int(k_pack_proj.bits) == int(v_pack_proj.bits)
+                    and int(k_pack_proj.group_size) == int(v_pack_proj.group_size)
+                    and str(k_pack_proj.mode) == str(v_pack_proj.mode) == "affine"
+                    and tuple(k_pack_proj.weight.shape[1:])
+                    == tuple(v_pack_proj.weight.shape[1:])
+                    and tuple(k_pack_proj.scales.shape[1:])
+                    == tuple(v_pack_proj.scales.shape[1:])
+                    and tuple(k_pack_proj.biases.shape[1:])
+                    == tuple(v_pack_proj.biases.shape[1:])
+                )
+                if compatible:
+                    packed = (
+                        "quantized",
+                        mx.concatenate(
+                            [k_pack_proj.weight, v_pack_proj.weight], axis=0
+                        ),
+                        mx.concatenate(
+                            [k_pack_proj.scales, v_pack_proj.scales], axis=0
+                        ),
+                        mx.concatenate(
+                            [k_pack_proj.biases, v_pack_proj.biases], axis=0
+                        ),
+                        int(k_pack_proj.weight.shape[0]),
+                        int(k_pack_proj.group_size),
+                        int(k_pack_proj.bits),
+                        str(k_pack_proj.mode),
+                    )
+                    mx.eval(*packed[1:4])
+                    attention._mtplx_qwen38_packed_kv = packed
+            if (
+                packed is None
+                and all(
+                    isinstance(module, nn.Linear)
+                    for module in (k_pack_proj, v_pack_proj)
+                )
+                and all(
+                    "bias" not in module for module in (k_pack_proj, v_pack_proj)
+                )
+                and tuple(k_pack_proj.weight.shape[1:])
+                == tuple(v_pack_proj.weight.shape[1:])
+            ):
+                packed = (
+                    "dense",
+                    mx.concatenate(
+                        [k_pack_proj.weight, v_pack_proj.weight], axis=0
+                    ),
+                    int(k_pack_proj.weight.shape[0]),
+                )
+                mx.eval(packed[1])
+                attention._mtplx_qwen38_packed_kv = packed
+            if packed is not None:
+                if packed[0] == "quantized":
+                    (
+                        _,
+                        weight,
+                        scales,
+                        biases,
+                        split_at,
+                        group_size,
+                        bits,
+                        mode,
+                    ) = packed
+                    kv = mx.quantized_matmul(
+                        normed,
+                        weight,
+                        scales=scales,
+                        biases=biases,
+                        transpose=True,
+                        group_size=group_size,
+                        bits=bits,
+                        mode=mode,
+                    )
+                else:
+                    _, weight, split_at = packed
+                    kv = normed @ weight.T
+                keys, values = mx.split(kv, [split_at], axis=-1)
+                for projection in (k_proj, v_proj):
+                    record_packed = getattr(
+                        projection,
+                        "_mtplx_record_packed_call",
+                        None,
+                    )
+                    if callable(record_packed):
+                        record_packed()
+            else:
+                keys = k_proj(normed)
+                values = v_proj(normed)
+            keys = attention.k_norm(
+                keys.reshape(
+                    batch,
+                    length,
+                    attention.num_key_value_heads,
+                    -1,
+                )
+            ).transpose(0, 2, 1, 3)
+            values = values.reshape(
+                batch,
+                length,
+                attention.num_key_value_heads,
+                -1,
+            ).transpose(0, 2, 1, 3)
+
+            layer_cache = mtp_cache[0]
+            rope_offset = (
+                int(position_offset)
+                if position_offset is not None
+                else int(layer_cache.offset)
+            )
+            keys = attention.rope(keys, offset=rope_offset)
+            layer_cache.update_and_fetch(keys, values)
+            return layer_cache.state
+
         def make_mtp_cache(self):
             return [KVCache() for _ in self.mtp.layers]
 
     text_model.__class__ = _MTPLXTextModel
+    text_model._mtplx_forward_layers = text_model._mtplx_forward_layers_stock
+    text_model._mtplx_prepare_mtp_inputs = (
+        text_model._mtplx_prepare_mtp_inputs_stock
+    )
 
     if hasattr(model, "language_model") and model.language_model is text_model:
         model.mtp = mtp
@@ -1130,6 +1593,12 @@ def inject_mtp_support(
 
             def mtp_update_cache(self, *args, **kwargs):
                 return self.language_model.mtp_update_cache(*args, **kwargs)
+
+            def mtp_update_cache_kv_only_history(self, *args, **kwargs):
+                return self.language_model.mtp_update_cache_kv_only_history(
+                    *args,
+                    **kwargs,
+                )
 
             def make_mtp_cache(self):
                 return self.language_model.make_mtp_cache()

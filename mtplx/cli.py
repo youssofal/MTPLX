@@ -550,6 +550,16 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return parsed
+
+
 def _kv_quant_arg(value: str) -> str:
     try:
         normalized = normalize_paged_kv_quantization(value)
@@ -668,7 +678,13 @@ SCHEDULER_MODE_CHOICES = (
     "mtp_cohort_experimental",
 )
 BATCHING_PRESET_CHOICES = ("solo", "latency", "agent", "throughput")
-ADAPTIVE_POLICY_CHOICES = ("none", "streak", "expected_value", "cost")
+ADAPTIVE_POLICY_CHOICES = (
+    "none",
+    "streak",
+    "expected_value",
+    "cost",
+    "position_ema",
+)
 
 
 def _add_batching_args(parser: argparse.ArgumentParser) -> None:
@@ -769,10 +785,20 @@ def _add_adaptive_args(parser: argparse.ArgumentParser) -> None:
         default="none",
         help="Experimental per-request native-MTP depth policy.",
     )
-    parser.add_argument("--adaptive-min-depth", type=_positive_int, default=1)
+    parser.add_argument(
+        "--qwen38-q4-mtp-block",
+        type=Path,
+        default=None,
+        help=(
+            "Validated r17 Q4 native-MTP block for the measured Qwen3.8 "
+            "position_ema low profile."
+        ),
+    )
+    parser.add_argument("--adaptive-min-depth", type=_nonnegative_int, default=1)
     parser.add_argument("--adaptive-start-depth", type=_positive_int, default=1)
     parser.add_argument("--adaptive-increase-after", type=_positive_int, default=4)
     parser.add_argument("--adaptive-decrease-after", type=_positive_int, default=1)
+    parser.add_argument("--adaptive-position-depth-cap", type=_positive_int, default=4)
     parser.add_argument("--adaptive-ev-base-depth", type=_positive_int, default=2)
     parser.add_argument("--adaptive-ev-accept-priors", default="0.92,0.64,0.32")
     parser.add_argument("--adaptive-ev-draft-cost-s", type=float, default=0.0048)

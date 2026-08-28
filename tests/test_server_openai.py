@@ -12,7 +12,9 @@ import pytest
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
+from mtplx.adaptive import PositionEMADepthPolicy
 from mtplx.backends.gemma4_assistant import _gemma4_draft_position
+from mtplx.backends.registry import RuntimeContract
 from mtplx.profiles import DEFAULT_HF_MODEL_ID, get_profile
 from mtplx.server import openai
 from mtplx.server.openai import _RateLimiter, create_app, parse_args
@@ -28,6 +30,142 @@ def test_server_parser_accepts_native_app_launch_id():
     args = parse_args(["--warmup-tokens", "0", "--app-launch-id", "native-123"])
 
     assert args.app_launch_id == "native-123"
+
+
+def _qwen38_runtime_contract(*, mtp_depth_max: int = 3) -> RuntimeContract:
+    return RuntimeContract(
+        mtplx_version="2.9.2",
+        arch_id="qwen3-next-mtp",
+        mtp_depth_max=mtp_depth_max,
+        recommended_profile="turbo",
+        exactness_baseline={},
+        verified_on={},
+    )
+
+
+def _bind_qwen38_position_ema(args):
+    return openai._bind_adaptive_policy_factory(
+        args,
+        model_family="qwen3_8",
+        backend_descriptor=openai.descriptor_for_backend_id("qwen3_next"),
+        runtime_mtp_enabled=True,
+        runtime_contract=_qwen38_runtime_contract(),
+    )
+
+
+def test_server_binds_position_ema_to_validated_qwen38_native_mtp_d3():
+    args = parse_args(
+        [
+            "--adaptive-policy",
+            "position_ema",
+            "--adaptive-position-depth-cap",
+            "4",
+            "--depth",
+            "8",
+            "--warmup-tokens",
+            "0",
+        ]
+    )
+
+    factory = _bind_qwen38_position_ema(args)
+    policy = factory(8)
+
+    assert policy.max_depth == 3
+    assert policy.depth_cap == 3
+    assert policy.current_depth == 3
+
+
+def test_server_parser_accepts_qwen38_q4_mtp_block_artifact(tmp_path: Path) -> None:
+    artifact = tmp_path / "qwen38-r17-q4.safetensors"
+    args = parse_args(
+        [
+            "--adaptive-policy",
+            "position_ema",
+            "--qwen38-q4-mtp-block",
+            str(artifact),
+            "--warmup-tokens",
+            "0",
+        ]
+    )
+
+    assert args.qwen38_q4_mtp_block == artifact
+
+
+def test_position_ema_policy_cannot_exceed_installed_native_depth() -> None:
+    args = openai.parse_args(
+        [
+            "--model",
+            "model",
+            "--adaptive-policy",
+            "position_ema",
+            "--adaptive-position-depth-cap",
+            "8",
+        ]
+    )
+
+    factory = _bind_qwen38_position_ema(args)
+    policy = factory(3)
+
+    assert isinstance(policy, PositionEMADepthPolicy)
+    assert policy.max_depth == 3
+    assert policy.depth_cap == 3
+    assert factory(3) is not policy
+
+
+@pytest.mark.parametrize(
+    ("model_family", "backend_id", "runtime_mtp_enabled", "mtp_depth_max"),
+    [
+        ("qwen3_6", "qwen3_next", True, 3),
+        ("qwen3_8", "gemma4_assistant", True, 3),
+        ("qwen3_8", "qwen3_next", False, 3),
+        ("qwen3_8", "qwen3_next", True, 4),
+    ],
+)
+def test_position_ema_rejects_unvalidated_runtime_contracts(
+    model_family, backend_id, runtime_mtp_enabled, mtp_depth_max
+):
+    args = openai.parse_args(["--model", "model", "--adaptive-policy", "position_ema"])
+
+    with pytest.raises(ValueError, match="position_ema"):
+        openai._bind_adaptive_policy_factory(
+            args,
+            model_family=model_family,
+            backend_descriptor=openai.descriptor_for_backend_id(backend_id),
+            runtime_mtp_enabled=runtime_mtp_enabled,
+            runtime_contract=_qwen38_runtime_contract(mtp_depth_max=mtp_depth_max),
+        )
+
+
+def test_position_ema_honors_existing_adaptive_min_depth():
+    args = openai.parse_args(
+        [
+            "--model",
+            "model",
+            "--adaptive-policy",
+            "position_ema",
+            "--adaptive-min-depth",
+            "2",
+        ]
+    )
+
+    policy = _bind_qwen38_position_ema(args)(3)
+    policy.position_accept_ema[0] = 0.0
+    policy.recompute_depth()
+
+    assert policy.min_depth == 2
+    assert policy.current_depth == 2
+
+
+def test_omitted_and_explicit_none_adaptive_policy_keep_fixed_depth() -> None:
+    omitted = openai.parse_args(["--model", "model"])
+    explicit_none = openai.parse_args(
+        ["--model", "model", "--adaptive-policy", "none"]
+    )
+
+    assert omitted.adaptive_policy == "none"
+    assert explicit_none.adaptive_policy == "none"
+    assert openai._make_adaptive_policy(omitted, max_depth=3) is None
+    assert openai._make_adaptive_policy(explicit_none, max_depth=3) is None
 
 
 def test_direct_server_parser_exposes_mtp_batch_numerics():
@@ -834,6 +972,142 @@ def test_capture_commit_keeps_fast_snapshot_skip_override():
     )
 
     assert overrides["MTPLX_SKIP_VERIFY_SNAPSHOT"] == "1"
+
+
+def test_qwen38_measured_profiles_prebind_command_buffers_before_model_load(
+    tmp_path: Path,
+):
+    model = tmp_path / "Qwen3.8-27B-MTPLX-Optimized-Speed"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    args = SimpleNamespace(
+        model=str(model),
+        depth=3,
+        adaptive_policy="position_ema",
+        generation_mode="mtp",
+        load_mtp=True,
+        scheduler_mode="serial",
+        verify_strategy="capture_commit",
+    )
+
+    overrides = openai._server_runtime_env_overrides(
+        args,
+        {},
+        runtime_contract=_qwen38_runtime_contract(),
+    )
+
+    assert overrides["MLX_MAX_MB_PER_BUFFER"] == "512"
+    assert overrides["MLX_MAX_OPS_PER_BUFFER"] == "50"
+
+
+def test_qwen38_command_buffers_are_not_applied_to_unmeasured_policies(
+    tmp_path: Path,
+):
+    model = tmp_path / "Qwen3.8-27B-MTPLX-Optimized-Speed"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    args = SimpleNamespace(
+        model=str(model),
+        depth=3,
+        adaptive_policy="streak",
+        generation_mode="mtp",
+        load_mtp=True,
+        scheduler_mode="serial",
+        verify_strategy="capture_commit",
+    )
+
+    overrides = openai._server_runtime_env_overrides(
+        args,
+        {},
+        runtime_contract=_qwen38_runtime_contract(),
+    )
+
+    assert "MLX_MAX_MB_PER_BUFFER" not in overrides
+    assert "MLX_MAX_OPS_PER_BUFFER" not in overrides
+
+
+def test_qwen38_profiles_do_not_install_on_other_qwen3_next_models(
+    tmp_path: Path,
+):
+    model = tmp_path / "Qwen3.6-27B-MTPLX-Optimized-Speed"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    args = SimpleNamespace(
+        model=str(model),
+        depth=3,
+        adaptive_policy="none",
+        generation_mode="mtp",
+        load_mtp=True,
+        scheduler_mode="serial",
+        verify_strategy="capture_commit",
+    )
+
+    overrides = openai._server_runtime_env_overrides(
+        args,
+        {},
+        runtime_contract=_qwen38_runtime_contract(),
+    )
+
+    assert "MLX_MAX_MB_PER_BUFFER" not in overrides
+    assert "MLX_MAX_OPS_PER_BUFFER" not in overrides
+
+
+def test_server_installs_measured_qwen38_profiles_once(monkeypatch, tmp_path: Path):
+    from mtplx import qwen38_challenge
+
+    artifact = tmp_path / "qwen38-r17-q4.safetensors"
+    artifact.write_bytes(b"row17")
+    args = SimpleNamespace(
+        adaptive_policy="position_ema",
+        qwen38_q4_mtp_block=artifact,
+    )
+    runtime = SimpleNamespace()
+    model_path = tmp_path / "model"
+    configs = {
+        "stock": object(),
+        "low": object(),
+        "xhigh": object(),
+    }
+    installed = {"installed": True}
+    calls: list[tuple] = []
+
+    monkeypatch.setattr(
+        qwen38_challenge,
+        "qwen38_measured_performance_profile_configs",
+        lambda **kwargs: calls.append(("configs", kwargs)) or configs,
+    )
+    monkeypatch.setattr(
+        qwen38_challenge,
+        "install_qwen38_performance_profiles",
+        lambda *positional, **keywords: (
+            calls.append(("install", positional, keywords)) or installed
+        ),
+    )
+
+    result = openai._install_qwen38_server_performance_profiles(
+        runtime,
+        {"model_type": "qwen3_5"},
+        model_path,
+        args,
+        environment={
+            "MLX_MAX_MB_PER_BUFFER": "512",
+            "MLX_MAX_OPS_PER_BUFFER": "50",
+        },
+    )
+
+    assert result is installed
+    assert calls[0] == (
+        "configs",
+        {
+            "adaptive_policy": "position_ema",
+            "q4_mtp_block": artifact,
+        },
+    )
+    assert calls[1][0] == "install"
+    assert calls[1][1] == (runtime, {"model_type": "qwen3_5"}, model_path)
+    assert calls[1][2]["stock"] is configs["stock"]
+    assert calls[1][2]["low"] is configs["low"]
+    assert calls[1][2]["xhigh"] is configs["xhigh"]
 
 
 def test_mtp_batch_installs_qwen35b_optimized_kernel_routes_at_construction():
@@ -1752,7 +2026,7 @@ def _fake_state(*, api_key: str | None = None, rate_limit: int = 0):
     if api_key:
         argv.extend(["--api-key", api_key])
     args = parse_args(argv)
-    return SimpleNamespace(
+    state = SimpleNamespace(
         args=args,
         model_id="mtplx-test-model",
         lock=Lock(),
@@ -1789,6 +2063,11 @@ def _fake_state(*, api_key: str | None = None, rate_limit: int = 0):
         # Dashboard primitives mirror what ServerState.__init__ allocates.
         dashboard=DashboardState(),
     )
+    state.adaptive_policy_factory = lambda effective_depth: openai._make_adaptive_policy(
+        state.args,
+        max_depth=effective_depth,
+    )
+    return state
 
 
 def _fake_streaming_session_state():
@@ -1878,6 +2157,43 @@ def test_mtplx_settings_endpoint_controls_server_reasoning():
     )
     assert bogus.status_code == 400
     assert state.args.reasoning_effort == "xhigh"
+
+
+def test_qwen38_performance_profile_selection_uses_resolved_request_effort(
+    monkeypatch,
+) -> None:
+    from mtplx.server import openai
+
+    selected = SimpleNamespace(profile_id="xhigh", draft_core="stock")
+    runtime = SimpleNamespace(qwen38_performance_profiles={"xhigh": selected})
+    calls: list[tuple[object, str]] = []
+
+    monkeypatch.setattr(
+        "mtplx.qwen38_challenge.select_qwen38_performance_profile",
+        lambda received_runtime, effort: (
+            calls.append((received_runtime, effort)) or selected
+        ),
+    )
+
+    result = openai._select_qwen38_request_performance_profile(
+        runtime,
+        {"resolved_reasoning_effort": "xhigh"},
+    )
+
+    assert result is selected
+    assert calls == [(runtime, "xhigh")]
+
+
+def test_qwen38_performance_profile_selection_is_inert_without_registry() -> None:
+    from mtplx.server import openai
+
+    assert (
+        openai._select_qwen38_request_performance_profile(
+            SimpleNamespace(),
+            {"resolved_reasoning_effort": "low"},
+        )
+        is None
+    )
 
 
 def test_mtplx_settings_endpoint_ignores_read_only_descriptor_echoes():

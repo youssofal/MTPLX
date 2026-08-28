@@ -295,8 +295,10 @@ def test_exception_streak_flips_with_reason_and_counts(
     assert status["reason"] == "exception_streak:RuntimeError"
     assert status["flip_count"] == 1
     assert status["transient_exception_count"] == 3
+    assert status["last_exception"] == "RuntimeError: probe"
     assert bank.stats["fallback_reasons"]["exception:RuntimeError"] == 3
     out = capsys.readouterr().out
+    assert out.count("compiled-verify exception: RuntimeError: probe") == 1
     assert out.count("compiled-verify permanent-eager") == 1
 
 

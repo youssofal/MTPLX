@@ -285,6 +285,9 @@ class SessionBankEntry:
     template_hash: str | None = None
     mtp_history_policy: str | None = None
     draft_head_identity: str | None = None
+    # Includes construction-bound route identity (including the Qwen 3.8
+    # challenge route fingerprint) so incompatible kernel/head/policy stacks
+    # fail the existing policy-mismatch restore gate.
     policy_fingerprint: str | None = None
     mtp_history_snapshot: Any | None = None
     snapshot_epoch: int = 0

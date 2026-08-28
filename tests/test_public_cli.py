@@ -5857,6 +5857,82 @@ def test_debug_hotpath_reports_next_kernel_boundary(capsys):
     )
 
 
+def test_serve_forwards_position_ema_without_changing_none_default(monkeypatch):
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(
+        public,
+        "_resolve_runtime_model_path",
+        lambda model, cache_dir=None: (model, None),
+    )
+    monkeypatch.setattr(
+        public,
+        "_model_gate",
+        lambda model, unsafe_force_unverified=False, yes=False: (
+            {"compatibility": {"tier": "verified", "can_run": True, "exit_code": 0}},
+            None,
+        ),
+    )
+    monkeypatch.setattr(public, "_port_is_busy", lambda host, port: False)
+
+    def fake_execvpe(_executable, cmd, _env):
+        commands.append(cmd)
+        raise SystemExit(0)
+
+    monkeypatch.setattr(public.os, "execvpe", fake_execvpe)
+    parser = build_parser()
+    default_args = parser.parse_args(["serve", "--model", "models/example", "--yes"])
+    explicit_none_args = parser.parse_args(
+        [
+            "serve",
+            "--model",
+            "models/example",
+            "--yes",
+            "--adaptive-policy",
+            "none",
+        ]
+    )
+    position_args = parser.parse_args(
+        [
+            "serve",
+            "--model",
+            "models/example",
+            "--yes",
+            "--adaptive-policy",
+            "position_ema",
+            "--adaptive-position-depth-cap",
+            "8",
+            "--adaptive-min-depth",
+            "0",
+            "--qwen38-q4-mtp-block",
+            "artifacts/qwen38-r17.safetensors",
+        ]
+    )
+
+    assert default_args.adaptive_policy == "none"
+    assert explicit_none_args.adaptive_policy == "none"
+    assert position_args.adaptive_policy == "position_ema"
+    assert not hasattr(position_args, "mtp_adaptive")
+
+    for args in (default_args, explicit_none_args, position_args):
+        with pytest.raises(SystemExit, match="0"):
+            public.cmd_serve_public(args)
+
+    assert "--adaptive-policy" not in commands[0]
+    assert "--adaptive-policy" not in commands[1]
+    assert commands[2][commands[2].index("--adaptive-policy") + 1] == "position_ema"
+    assert (
+        commands[2][commands[2].index("--adaptive-position-depth-cap") + 1] == "8"
+    )
+    assert commands[2][commands[2].index("--adaptive-min-depth") + 1] == "0"
+    assert commands[2][commands[2].index("--qwen38-q4-mtp-block") + 1] == (
+        "artifacts/qwen38-r17.safetensors"
+    )
+    assert "--qwen38-q4-mtp-block artifacts/qwen38-r17.safetensors" in (
+        public._adaptive_command_suffix(position_args)
+    )
+
+
 def test_serve_dispatches_packaged_openai_server(monkeypatch, capsys):
     calls = {}
 

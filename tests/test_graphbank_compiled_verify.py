@@ -11,6 +11,7 @@ returning ``(logits, hidden, captures)`` in the standard capture layout.
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import mlx.core as mx
 import numpy as np
@@ -23,11 +24,23 @@ from mtplx.graphbank import (
     CompiledVerifyBank,
     CompiledVerifyParityError,
     TensorOffsetKVCache,
+    _compiled_verify_route_fingerprint,
     build_verify_state_spec,
     compare_verify_outputs,
     compiled_verify_mode,
     promote_kv_cache_offsets,
 )
+
+
+def test_shared_verify_route_key_tracks_qwen38_route_fingerprint() -> None:
+    runtime = SimpleNamespace(
+        qwen38_route=SimpleNamespace(fingerprint="row8-control")
+    )
+
+    assert _compiled_verify_route_fingerprint(runtime) == "row8-control"
+
+    runtime.qwen38_route = SimpleNamespace(fingerprint="row8-gdn-s2")
+    assert _compiled_verify_route_fingerprint(runtime) == "row8-gdn-s2"
 
 
 def _arrays_cache_cls() -> type:

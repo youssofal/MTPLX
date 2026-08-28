@@ -1670,6 +1670,66 @@ def _gdn_input_projections(
     )
 
 
+def configure_qwen38_row18_gdn_decay_memo(
+    model: Any,
+    *,
+    active: bool,
+) -> dict[str, int]:
+    """Materialize row 18's per-layer ``-exp(A_log)`` outside generation."""
+    text_model = getattr(model, "language_model", model)
+    inner = getattr(text_model, "model", text_model)
+    layers = getattr(inner, "layers", None) or []
+    configured = 0
+    active_modules = 0
+    for layer in layers:
+        gdn = getattr(layer, "linear_attn", None)
+        if gdn is None or not hasattr(gdn, "A_log") or not hasattr(gdn, "dt_bias"):
+            continue
+        configured += 1
+        memo = -mx.exp(gdn.A_log.astype(mx.float32)) if active else None
+        if memo is not None:
+            mx.eval(memo)
+            active_modules += 1
+        if memo is None:
+            from mlx_lm.models.gated_delta import compute_g
+
+            gdn._mtplx_compute_g = partial(
+                compute_g,
+                gdn.A_log,
+                dt_bias=gdn.dt_bias,
+            )
+        else:
+            gdn._mtplx_compute_g = lambda a, memo=memo, bias=gdn.dt_bias: mx.exp(
+                memo * nn.softplus(a + bias)
+            )
+    return {
+        "configured_modules": configured,
+        "active_modules": active_modules,
+    }
+
+
+def bind_stock_gdn_compute_g(model: Any) -> int:
+    """Install the stock decay callable once on every constructed GDN module."""
+
+    from mlx_lm.models.gated_delta import compute_g
+
+    text_model = getattr(model, "language_model", model)
+    inner = getattr(text_model, "model", text_model)
+    bound = 0
+    for layer in getattr(inner, "layers", None) or []:
+        gdn = getattr(layer, "linear_attn", None)
+        if gdn is None or not hasattr(gdn, "A_log") or not hasattr(gdn, "dt_bias"):
+            continue
+        if not hasattr(gdn, "_mtplx_compute_g"):
+            gdn._mtplx_compute_g = partial(
+                compute_g,
+                gdn.A_log,
+                dt_bias=gdn.dt_bias,
+            )
+        bound += 1
+    return bound
+
+
 def _stock_conv1d_capture(qkv: mx.array, base_conv_state: mx.array, gdn: Any):
     """Run the exact MLX Conv1d path and capture each linear-prefix state."""
     B, T, _ = qkv.shape
@@ -2579,8 +2639,6 @@ def gdn_forward_with_capture(
     if getattr(gdn, "sharding_group", None) is not None:
         return gdn(inputs, mask=mask, cache=cache), None
 
-    from mlx_lm.models.gated_delta import compute_g
-
     B, S, _ = inputs.shape
     qkv, z, b, a = _gdn_input_projections(gdn, inputs)
     z = z.reshape(B, S, gdn.num_v_heads, gdn.head_v_dim)
@@ -2622,7 +2680,7 @@ def gdn_forward_with_capture(
         out, states = delta_result
     elif backend == "linear_gdn_from_conv_tape":
         beta = mx.sigmoid(b)
-        g = compute_g(gdn.A_log, a, gdn.dt_bias)
+        g = gdn._mtplx_compute_g(a)
         delta_result = _linear_gated_delta_from_conv_tape_capture(
             conv_out,
             g,
@@ -2639,7 +2697,7 @@ def gdn_forward_with_capture(
         "linear_gdn_from_conv_stream_skip0",
     }:
         beta = mx.sigmoid(b)
-        g = compute_g(gdn.A_log, a, gdn.dt_bias)
+        g = gdn._mtplx_compute_g(a)
         capture_start = 1 if backend == "linear_gdn_from_conv_stream_skip0" else 0
         delta_result = _linear_gated_delta_from_conv_stream_capture(
             conv_out,
@@ -2662,7 +2720,7 @@ def gdn_forward_with_capture(
             "on",
         }
         beta = mx.sigmoid(b)
-        g = compute_g(gdn.A_log, a, gdn.dt_bias)
+        g = gdn._mtplx_compute_g(a)
         if use_from_conv:
             delta_result = _linear_gated_delta_from_conv_capture(
                 conv_out, g, beta, state, gdn
@@ -2696,7 +2754,7 @@ def gdn_forward_with_capture(
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
         beta = mx.sigmoid(b)
-        g = compute_g(gdn.A_log, a, gdn.dt_bias)
+        g = gdn._mtplx_compute_g(a)
         delta_result = _linear_gated_delta_final(q, k, v, g, beta, state)
         if delta_result is None:
             return gdn(inputs, mask=mask, cache=cache), None
@@ -2976,6 +3034,86 @@ def _fused_post_norm_tg_override() -> int | None:
     return value if value > 0 else None
 
 
+class _StockBoundaryRoute:
+    def prepare(self, hidden_states, _base, _delta, layer):
+        return hidden_states, layer.input_layernorm(hidden_states)
+
+    def finish(self, hidden_in, residual, hidden_states, layer):
+        if os.environ.get("MTPLX_FUSE_POST_NORM_RESIDUAL", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            from .kernel_selfcheck import lane_disabled
+            from .kernels.fused_norm import fused_add_rmsnorm
+
+            if lane_disabled("fused_add_rmsnorm"):
+                h = hidden_states + residual
+                mlp_input = layer.post_attention_layernorm(h)
+            else:
+                h, mlp_input = fused_add_rmsnorm(
+                    hidden_states,
+                    residual,
+                    layer.post_attention_layernorm.weight,
+                    layer.post_attention_layernorm.eps,
+                    threadgroup_size=(
+                        override
+                        if (override := _fused_post_norm_tg_override()) is not None
+                        else (512 if hidden_states.dtype == mx.bfloat16 else None)
+                    ),
+                )
+        else:
+            h = hidden_states + residual
+            mlp_input = layer.post_attention_layernorm(h)
+        hidden_states = h + layer.mlp(mlp_input)
+        return hidden_states, hidden_states, None
+
+    def eval_roots(self, hidden_states, _base, _delta):
+        return (hidden_states,)
+
+    def finalize(self, hidden_states, _base, _delta):
+        return hidden_states
+
+
+class _Row48BoundaryRoute:
+    def prepare(self, _hidden_states, base, delta, layer):
+        if delta is None:
+            return base, layer.input_layernorm(base)
+        from .kernels.fused_norm import fused_add_rmsnorm
+
+        return fused_add_rmsnorm(
+            base,
+            delta,
+            layer.input_layernorm.weight,
+            layer.input_layernorm.eps,
+            threadgroup_size=1024,
+        )
+
+    def finish(self, hidden_in, residual, _hidden_states, layer):
+        from .kernels.fused_norm import fused_add_rmsnorm
+
+        h, mlp_input = fused_add_rmsnorm(
+            hidden_in,
+            residual,
+            layer.post_attention_layernorm.weight,
+            layer.post_attention_layernorm.eps,
+            threadgroup_size=1024,
+        )
+        delta = layer.mlp(mlp_input)
+        return h, h, delta
+
+    def eval_roots(self, _hidden_states, base, delta):
+        return (base, delta)
+
+    def finalize(self, _hidden_states, base, delta):
+        return base if delta is None else base + delta
+
+
+_STOCK_BOUNDARY_ROUTE = _StockBoundaryRoute()
+_ROW48_BOUNDARY_ROUTE = _Row48BoundaryRoute()
+
+
 def forward_with_gdn_capture(
     model: Any,
     inputs: mx.array,
@@ -2984,6 +3122,7 @@ def forward_with_gdn_capture(
     *,
     hidden_variant: str | None = None,
     capture_backend: str | None = None,
+    boundary_route: Any = _STOCK_BOUNDARY_ROUTE,
 ):
     text_model = getattr(model, "language_model", model)
     inner = text_model.model
@@ -3009,9 +3148,16 @@ def forward_with_gdn_capture(
         and context_len >= max(0, layer_eval_threshold)
     )
 
+    boundary_base = hidden_states
+    boundary_delta = None
     for layer_idx, (layer, layer_cache) in enumerate(zip(inner.layers, cache)):
         mask = ssm_mask if layer.is_linear else fa_mask
-        normed = layer.input_layernorm(hidden_states)
+        hidden_in, normed = boundary_route.prepare(
+            hidden_states,
+            boundary_base,
+            boundary_delta,
+            layer,
+        )
         if layer.is_linear:
             if os.environ.get("MTPLX_ABLATE_LINEAR_ATTN", "").lower() in {
                 "1",
@@ -3035,42 +3181,26 @@ def forward_with_gdn_capture(
                         captures[layer_idx] = capture
         else:
             r = layer.self_attn(normed, mask=mask, cache=layer_cache)
-        if os.environ.get("MTPLX_FUSE_POST_NORM_RESIDUAL", "").lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }:
-            from .kernel_selfcheck import lane_disabled
-            from .kernels.fused_norm import fused_add_rmsnorm
-
-            if lane_disabled("fused_add_rmsnorm"):
-                h = hidden_states + r
-                mlp_input = layer.post_attention_layernorm(h)
-            else:
-                # 512-lane dispatch diverges from the unfused reference at
-                # fp16 above 64 rows (2^15 grid boundary; probed 2026-08-24,
-                # #319). bf16 is bit-exact at 512, so it keeps the tuned
-                # width; fp16 takes the default 1024-lane loop, bit-exact at
-                # every probed shape. MTPLX_FUSE_POST_NORM_RESIDUAL_TG
-                # overrides both for A/B archaeology only.
-                h, mlp_input = fused_add_rmsnorm(
-                    hidden_states,
-                    r,
-                    layer.post_attention_layernorm.weight,
-                    layer.post_attention_layernorm.eps,
-                    threadgroup_size=(
-                        override
-                        if (override := _fused_post_norm_tg_override()) is not None
-                        else (512 if hidden_states.dtype == mx.bfloat16 else None)
-                    ),
-                )
-        else:
-            h = hidden_states + r
-            mlp_input = layer.post_attention_layernorm(h)
-        hidden_states = h + layer.mlp(mlp_input)
+        hidden_states, boundary_base, boundary_delta = boundary_route.finish(
+            hidden_in,
+            r,
+            hidden_states,
+            layer,
+        )
         if layer_eval_enabled and (layer_idx + 1) % layer_eval_every == 0:
-            mx.eval(hidden_states)
+            mx.eval(
+                *boundary_route.eval_roots(
+                    hidden_states,
+                    boundary_base,
+                    boundary_delta,
+                )
+            )
+
+    hidden_states = boundary_route.finalize(
+        hidden_states,
+        boundary_base,
+        boundary_delta,
+    )
 
     pre_norm = hidden_states
     post_norm = inner.norm(hidden_states)
@@ -3083,6 +3213,17 @@ def forward_with_gdn_capture(
         hidden = pre_norm if hidden_variant == "pre_norm" else post_norm
         return logits, hidden, captures
     return logits, captures
+
+
+def configure_qwen38_row48_capture(runtime: Any, *, active: bool) -> dict[str, int]:
+    """Prebind the stock or fused-boundary target capture entrypoint."""
+
+    route = _ROW48_BOUNDARY_ROUTE if active else _STOCK_BOUNDARY_ROUTE
+    runtime._forward_ar_capture_gdn = partial(
+        forward_with_gdn_capture,
+        boundary_route=route,
+    )
+    return {"active": int(active), "construction_bound": 1}
 
 
 def commit_captured_prefix(

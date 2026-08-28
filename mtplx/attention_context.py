@@ -27,6 +27,10 @@ _MODEL_FORWARD_KIND: ContextVar[str] = ContextVar(
     "mtplx_model_forward_kind",
     default="other",
 )
+_REQUEST_PROMPT_TOKENS: ContextVar[int] = ContextVar(
+    "mtplx_request_prompt_tokens",
+    default=0,
+)
 
 
 def normalize_attention_phase(phase: str | None) -> str:
@@ -47,6 +51,10 @@ def current_model_forward_kind() -> str:
     return normalize_model_forward_kind(_MODEL_FORWARD_KIND.get())
 
 
+def current_request_prompt_tokens() -> int:
+    return max(0, int(_REQUEST_PROMPT_TOKENS.get()))
+
+
 @contextmanager
 def attention_phase(phase: str | None) -> Iterator[None]:
     token = _ATTENTION_PHASE.set(normalize_attention_phase(phase))
@@ -65,3 +73,12 @@ def model_forward_kind(kind: str | None) -> Iterator[None]:
         yield
     finally:
         _MODEL_FORWARD_KIND.reset(token)
+
+
+@contextmanager
+def request_prompt_tokens(count: int) -> Iterator[None]:
+    token = _REQUEST_PROMPT_TOKENS.set(max(0, int(count)))
+    try:
+        yield
+    finally:
+        _REQUEST_PROMPT_TOKENS.reset(token)

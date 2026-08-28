@@ -1,0 +1,669 @@
+{
+  "metadata": {
+    "challenge_commit": "eb5eadc7a165047d4321ce883b9ff30894d8bd19",
+    "github_pulls_sha256": "cde510becfca857237f2ea84a7d89b78c4ca3782859f040fb144f018943c5dd4",
+    "schema_version": 1,
+    "snapshot_rendered_date": "2026-08-23",
+    "source_url": "https://www.yukon.org/mlxfast",
+    "threshold_relative_percent": 0.1,
+    "yukon_html_sha256": "746ea1124496b9d17fe4a5302b71c5961f960cb4dd3ed8ff93cd652fc28f2e80"
+  },
+  "rows": [
+    {
+      "ordinal": 1,
+      "pr_number": 2,
+      "score": 0.999210101062914,
+      "source_commit": "b72fa410e8a612a91cd4770635d76d5e9027abc9",
+      "submission_commit": "b72fa410e8a612a91cd4770635d76d5e9027abc9",
+      "submission_id": "95611e60-4f77-473d-9a06-5727fa97d81f"
+    },
+    {
+      "ordinal": 2,
+      "pr_number": 13,
+      "score": 1.23202128947726,
+      "source_commit": "97921a3fc5dd625eab72b446b57c02c16fc0f0c7",
+      "submission_commit": "97921a3fc5dd625eab72b446b57c02c16fc0f0c7",
+      "submission_id": "0f835e36-0744-427e-9d0b-d854bac51e1a"
+    },
+    {
+      "ordinal": 3,
+      "pr_number": 18,
+      "score": 1.25131747135566,
+      "source_commit": "c9e32f70dac811e7de3ca2285aa8c5e3ba8b9bce",
+      "submission_commit": "c9e32f70dac811e7de3ca2285aa8c5e3ba8b9bce",
+      "submission_id": "088f763b-163b-4a5f-a942-6b778ca1fd3e"
+    },
+    {
+      "ordinal": 4,
+      "pr_number": 24,
+      "score": 1.2674197869163,
+      "source_commit": "ec0ba7d9ce42b9685e311fffe6672cef9b5c82e4",
+      "submission_commit": "ec0ba7d9ce42b9685e311fffe6672cef9b5c82e4",
+      "submission_id": "75c8d33b-450a-4122-a916-b637745f2cf1"
+    },
+    {
+      "ordinal": 5,
+      "pr_number": 29,
+      "score": 1.35254285365501,
+      "source_commit": "ab62ceab428a68ab9b1c1014d4b24ab9e72b27d9",
+      "submission_commit": "ab62ceab428a68ab9b1c1014d4b24ab9e72b27d9",
+      "submission_id": "e5051ba4-dde7-4829-90b4-7ff321fc0e25"
+    },
+    {
+      "ordinal": 6,
+      "pr_number": 37,
+      "score": 1.37644688696042,
+      "source_commit": "5c2441b5f08b40b9d2c639cae211bf56359df8da",
+      "submission_commit": "5c2441b5f08b40b9d2c639cae211bf56359df8da",
+      "submission_id": "b71bb354-4aa4-4ea5-b902-b67936205182"
+    },
+    {
+      "ordinal": 7,
+      "pr_number": 38,
+      "score": 1.65763151822117,
+      "source_commit": "fe8829244cd940aa0895f57bdf50e49e83a95ec5",
+      "submission_commit": "55d009c737ed9abbb0f0834fa05146048a1b35b2",
+      "submission_id": "3e8b6f1a-0d16-490d-b233-14adac4527ca"
+    },
+    {
+      "ordinal": 8,
+      "pr_number": 41,
+      "score": 1.95465061755406,
+      "source_commit": "11670086c1b9c3bd2d3d0323f9f6c346b65770f6",
+      "submission_commit": "5ae2e8327e5c8e29b60a8bdf796e7462445c102a",
+      "submission_id": "45c257f1-f249-4fc0-945d-ee330bf9865c"
+    },
+    {
+      "ordinal": 9,
+      "pr_number": 55,
+      "score": 2.08905942685658,
+      "source_commit": "b6c725144b561e29e7eabc83c7431d34f2e55fe8",
+      "submission_commit": "b6c725144b561e29e7eabc83c7431d34f2e55fe8",
+      "submission_id": "84583d41-0417-437f-8482-5663cbddf51a"
+    },
+    {
+      "ordinal": 10,
+      "pr_number": 59,
+      "score": 2.20075603827959,
+      "source_commit": "61936f26547df47fcdf48957115a2b8e9c4d1a37",
+      "submission_commit": "61936f26547df47fcdf48957115a2b8e9c4d1a37",
+      "submission_id": "7b33621c-1d1a-4540-834d-d89c7f402b0f"
+    },
+    {
+      "ordinal": 11,
+      "pr_number": 63,
+      "score": 2.32713386296722,
+      "source_commit": "62174dbbca88380f4f9a7199abd0397d188478c6",
+      "submission_commit": "62174dbbca88380f4f9a7199abd0397d188478c6",
+      "submission_id": "aec00005-e85f-4a92-be34-822123d60b57"
+    },
+    {
+      "ordinal": 12,
+      "pr_number": 70,
+      "score": 2.34637102514751,
+      "source_commit": "09eda55a08b127c2fc44be1b8ce7170476469b8e",
+      "submission_commit": "09eda55a08b127c2fc44be1b8ce7170476469b8e",
+      "submission_id": "06e8c9d4-add5-4052-8ccb-85decf2cb1f6"
+    },
+    {
+      "ordinal": 13,
+      "pr_number": 71,
+      "score": 2.39551435360241,
+      "source_commit": "3e157ad981bb6d68ab86131e9182b159be129461",
+      "submission_commit": "115934e82a46902f19a96440fa96cd99111742be",
+      "submission_id": "55fa8d31-7a40-4390-ba4e-4e906ead1e3d"
+    },
+    {
+      "ordinal": 14,
+      "pr_number": 77,
+      "score": 2.41908291306457,
+      "source_commit": "d819641272812d71108ddcf4343aa41fb565c622",
+      "submission_commit": "d819641272812d71108ddcf4343aa41fb565c622",
+      "submission_id": "daf42d3e-df44-4117-a965-b34882dd999b"
+    },
+    {
+      "ordinal": 15,
+      "pr_number": 95,
+      "score": 2.51003299394665,
+      "source_commit": "08897af24b57e5e11950f5aaa45097b7da5d093d",
+      "submission_commit": "08897af24b57e5e11950f5aaa45097b7da5d093d",
+      "submission_id": "5b656013-a2aa-44bb-bfa1-13471d966063"
+    },
+    {
+      "ordinal": 16,
+      "pr_number": 103,
+      "score": 2.52461046590828,
+      "source_commit": "8f41fa6d4f67e711f25d36fc2650a92d798d749e",
+      "submission_commit": "8f41fa6d4f67e711f25d36fc2650a92d798d749e",
+      "submission_id": "6cb6c963-a793-4f34-987e-94c05182eeea"
+    },
+    {
+      "ordinal": 17,
+      "pr_number": 126,
+      "score": 2.71511824844771,
+      "source_commit": "deb63ad0d1701d9d14cacd34d901ae7c0588c432",
+      "submission_commit": "deb63ad0d1701d9d14cacd34d901ae7c0588c432",
+      "submission_id": "91743270-d5e2-4a8e-b61d-451bde3121e7"
+    },
+    {
+      "ordinal": 18,
+      "pr_number": 135,
+      "score": 2.72743223206268,
+      "source_commit": "b6ce964b16bbb7836480a29e9f5e436bb99a35dd",
+      "submission_commit": "b6ce964b16bbb7836480a29e9f5e436bb99a35dd",
+      "submission_id": "c08eb406-7383-4681-b12f-62e2fc35bf29"
+    },
+    {
+      "ordinal": 19,
+      "pr_number": 160,
+      "score": 2.79668467338649,
+      "source_commit": "1033e1ac519700dad47b8c3d9778a887ebbdd0f8",
+      "submission_commit": "1033e1ac519700dad47b8c3d9778a887ebbdd0f8",
+      "submission_id": "be6b63f5-ab13-4fb1-bdee-cd49ffb5756a"
+    },
+    {
+      "ordinal": 20,
+      "pr_number": 180,
+      "score": 2.82235705090574,
+      "source_commit": "cf350293feb435f17a110e5ab5324dd893fd523c",
+      "submission_commit": "cf350293feb435f17a110e5ab5324dd893fd523c",
+      "submission_id": "a3104b04-715a-4a7e-a58a-8445b68b54a8"
+    },
+    {
+      "ordinal": 21,
+      "pr_number": 186,
+      "score": 2.86531796926132,
+      "source_commit": "4eb54489fb518b2040aa31de5e7344ed908a81d6",
+      "submission_commit": "4eb54489fb518b2040aa31de5e7344ed908a81d6",
+      "submission_id": "9ef7b7f1-7373-43d0-9a60-3a4e885f1198"
+    },
+    {
+      "ordinal": 22,
+      "pr_number": 194,
+      "score": 2.86792937494018,
+      "source_commit": "e3b4531d947cbcab06a2d25929900c022dd9ad1b",
+      "submission_commit": "e3b4531d947cbcab06a2d25929900c022dd9ad1b",
+      "submission_id": "22ce3162-41e8-4d8b-8199-bbbc555e00a6"
+    },
+    {
+      "ordinal": 23,
+      "pr_number": 215,
+      "score": 2.87642940762738,
+      "source_commit": "df404e08fee2ef8681f5bf2d68fe841969788eaf",
+      "submission_commit": "df404e08fee2ef8681f5bf2d68fe841969788eaf",
+      "submission_id": "aa7c3e0c-20d1-4b27-a80c-e622e7880999"
+    },
+    {
+      "ordinal": 24,
+      "pr_number": 234,
+      "score": 2.9042110287045,
+      "source_commit": "7351e62674bc600f0ca148d3a1b0604716a09db6",
+      "submission_commit": "7351e62674bc600f0ca148d3a1b0604716a09db6",
+      "submission_id": "e6c5ef35-0d86-4cec-a5d6-366e2e59cdcd"
+    },
+    {
+      "ordinal": 25,
+      "pr_number": 270,
+      "score": 2.91995482041197,
+      "source_commit": "c7468c565a7cfb8442b6a796bc983579e8d44ebf",
+      "submission_commit": "c7468c565a7cfb8442b6a796bc983579e8d44ebf",
+      "submission_id": "f03469a9-d889-4bca-8061-a4ad3178c7d2"
+    },
+    {
+      "ordinal": 26,
+      "pr_number": 276,
+      "score": 2.92520777238747,
+      "source_commit": "033f622755ac407c31b75f613ad590dbc0976b96",
+      "submission_commit": "bd12edd116e796448c0b740a2c722bb556887255",
+      "submission_id": "12b1c699-febb-4ed6-9b24-c19018e5f006"
+    },
+    {
+      "ordinal": 27,
+      "pr_number": 301,
+      "score": 2.92622493575783,
+      "source_commit": "4aacc534d13b205de6571c39dc63d816de8518e2",
+      "submission_commit": "4aacc534d13b205de6571c39dc63d816de8518e2",
+      "submission_id": "776d7168-e968-40c4-808e-f643ec1953a7"
+    },
+    {
+      "ordinal": 28,
+      "pr_number": 304,
+      "score": 2.93361458783958,
+      "source_commit": "6209702fba83a744eb3deb598905d59978f9e5e7",
+      "submission_commit": "6209702fba83a744eb3deb598905d59978f9e5e7",
+      "submission_id": "d3caa5fe-9aa7-4203-bb96-249aaafb4801"
+    },
+    {
+      "ordinal": 29,
+      "pr_number": 333,
+      "score": 2.93428682708139,
+      "source_commit": "cdb06b7045622fc40c1b336af28892c073ba28a3",
+      "submission_commit": "cdb06b7045622fc40c1b336af28892c073ba28a3",
+      "submission_id": "5c523482-452c-4662-a303-a3b359c81030"
+    },
+    {
+      "ordinal": 30,
+      "pr_number": 350,
+      "score": 2.94661597308114,
+      "source_commit": "32b94cb67d2f3a102a36382d2beb62eee8d99db5",
+      "submission_commit": "32b94cb67d2f3a102a36382d2beb62eee8d99db5",
+      "submission_id": "03dedda8-fc70-4e3e-881f-5384a17af405"
+    },
+    {
+      "ordinal": 31,
+      "pr_number": 364,
+      "score": 2.94818587527148,
+      "source_commit": "d077e68567827e8d926272df2245226d72b889ac",
+      "submission_commit": "d077e68567827e8d926272df2245226d72b889ac",
+      "submission_id": "a451f3b3-20c6-4dcd-9a9f-e7f21d937a58"
+    },
+    {
+      "ordinal": 32,
+      "pr_number": 365,
+      "score": 2.95338624520432,
+      "source_commit": "156b5b75bdfac82ae406487f531fd991e7fdfd30",
+      "submission_commit": "3b3dced4646e6dfe3fe12e94889a3524ae29d976",
+      "submission_id": "ba493f74-c0fe-440a-a956-f77d26232e54"
+    },
+    {
+      "ordinal": 33,
+      "pr_number": 401,
+      "score": 3.00412770189188,
+      "source_commit": "cbdc3a8d5fa9d4ffe035e4847b629fb296234cc6",
+      "submission_commit": "cbdc3a8d5fa9d4ffe035e4847b629fb296234cc6",
+      "submission_id": "febb7e27-935c-4a1a-bee4-d7387950ea2d"
+    },
+    {
+      "ordinal": 34,
+      "pr_number": 405,
+      "score": 3.02460155382533,
+      "source_commit": "79683c633b13c63aa23f112756a9c6b5173705b0",
+      "submission_commit": "dbff7596688471a2ccd121ad1a5002806ef0c6f4",
+      "submission_id": "14b53255-e585-44bd-84d9-37b7b29c0be9"
+    },
+    {
+      "ordinal": 35,
+      "pr_number": 417,
+      "score": 3.0262246145415,
+      "source_commit": "111b7571480670c5c4bcfeb893cb52bd5dc7b7d3",
+      "submission_commit": "111b7571480670c5c4bcfeb893cb52bd5dc7b7d3",
+      "submission_id": "316bd671-e06a-4aaf-a276-8d59f3fedc5d"
+    },
+    {
+      "ordinal": 36,
+      "pr_number": 423,
+      "score": 3.07714439121787,
+      "source_commit": "ed4dfd6b0e95bb1cafb26c694bc247f551d550fe",
+      "submission_commit": "ed4dfd6b0e95bb1cafb26c694bc247f551d550fe",
+      "submission_id": "39fdbf62-60e4-4ab7-bf09-0d1b5a0b618a"
+    },
+    {
+      "ordinal": 37,
+      "pr_number": 428,
+      "score": 3.08168872136616,
+      "source_commit": "be3361b96875beaab17e52f2f054045cb81df882",
+      "submission_commit": "9b9a425fe728adea1634df8778d05d6ae02f97fd",
+      "submission_id": "1d7876fd-d0e7-4e8a-a6dd-432a321084e9"
+    },
+    {
+      "ordinal": 38,
+      "pr_number": 430,
+      "score": 3.10092968921393,
+      "source_commit": "0824e0ec28e54fb28aa27fd248a42644eccc573d",
+      "submission_commit": "3f79c69f9c1db78aa54740502da06de801a44f12",
+      "submission_id": "1235f4ba-0a48-4f9a-a0fa-8c9ed6880fd7"
+    },
+    {
+      "ordinal": 39,
+      "pr_number": 437,
+      "score": 3.11032631631765,
+      "source_commit": "1abe6368a88209e8de9577cec0ef02d659ff2714",
+      "submission_commit": "1abe6368a88209e8de9577cec0ef02d659ff2714",
+      "submission_id": "f9ea43fd-e2b1-453a-b638-b58d2946115c"
+    },
+    {
+      "ordinal": 40,
+      "pr_number": 438,
+      "score": 3.13098700135133,
+      "source_commit": "d1530a409848b82a0a1890141c1483875d1e0173",
+      "submission_commit": "d1530a409848b82a0a1890141c1483875d1e0173",
+      "submission_id": "bd007bc7-e8ab-4919-baf4-d5e90068dd83"
+    },
+    {
+      "ordinal": 41,
+      "pr_number": 450,
+      "score": 3.14642585386152,
+      "source_commit": "0d800b229e9494029eec2bd27b95bc249302e78d",
+      "submission_commit": "0d800b229e9494029eec2bd27b95bc249302e78d",
+      "submission_id": "caec88d4-c566-4d5c-ab80-5ce6e9c9e86d"
+    },
+    {
+      "ordinal": 42,
+      "pr_number": 472,
+      "score": 3.19088426880882,
+      "source_commit": "036fd9ca2a2cac3b51c62a63237bd5d28c024487",
+      "submission_commit": "036fd9ca2a2cac3b51c62a63237bd5d28c024487",
+      "submission_id": "b1e2591b-13f2-4b17-baf1-2956ca9242df"
+    },
+    {
+      "ordinal": 43,
+      "pr_number": 493,
+      "score": 3.19351254799833,
+      "source_commit": "8dabcfb75c19dad6cbf5cc7cf9f26e1bd440a0dd",
+      "submission_commit": "8dabcfb75c19dad6cbf5cc7cf9f26e1bd440a0dd",
+      "submission_id": "824dc272-b560-4dc6-bf6c-42f58944f4cb"
+    },
+    {
+      "ordinal": 44,
+      "pr_number": 503,
+      "score": 3.19580475139646,
+      "source_commit": "12d3756d9e6024c5ac665daa04f219835d3941ee",
+      "submission_commit": "a608303ac33e9780013642e16abd46b5f121335c",
+      "submission_id": "578535f7-95e6-4f95-a34c-281b9dbbbffc"
+    },
+    {
+      "ordinal": 45,
+      "pr_number": 505,
+      "score": 3.20989343755207,
+      "source_commit": "868cde8f985a332c9d6751b1c871316ad8ab8525",
+      "submission_commit": "d56b4a0eb4e52f2fb92540ba5c6ed764176e8d33",
+      "submission_id": "0792c757-e04b-4449-b9a5-e4ab9b64a396"
+    },
+    {
+      "ordinal": 46,
+      "pr_number": 509,
+      "score": 3.21000579584503,
+      "source_commit": "369cc054d44f6247bf4c110c8e834219db5130b9",
+      "submission_commit": "c9d601bc2ade928f1689fc01ebcb71dead87261f",
+      "submission_id": "12864bc1-9c9e-4e3b-8964-e8b9e4da8d31"
+    },
+    {
+      "ordinal": 47,
+      "pr_number": 530,
+      "score": 3.22826053954006,
+      "source_commit": "dccba745af5ba465b27c1683d689f6d5e06e41a0",
+      "submission_commit": "dccba745af5ba465b27c1683d689f6d5e06e41a0",
+      "submission_id": "72ce82dc-f751-485d-a7b3-94ab6471cf87"
+    },
+    {
+      "ordinal": 48,
+      "pr_number": 543,
+      "score": 3.23222998733732,
+      "source_commit": "86fb1f020fc1fddc7e55aceac4761e5054b71dd6",
+      "submission_commit": "7700b85cdd410cf710d96c14616e2886a0f30588",
+      "submission_id": "3a995c2b-3c42-48e8-b982-f36a8abda0e7"
+    },
+    {
+      "ordinal": 49,
+      "pr_number": 553,
+      "score": 3.2341518328631,
+      "source_commit": "474c75013f333f119bdc465d849f23917b195b20",
+      "submission_commit": "e93edb888e9059536c8ae72c54a68dbfea363526",
+      "submission_id": "942e5ab2-1c46-4c50-b7c3-eaf948878ed0"
+    },
+    {
+      "ordinal": 50,
+      "pr_number": 572,
+      "score": 3.24300059379657,
+      "source_commit": "c0e34afd857e9a3db5f9d3eb2430ddb969bfa97b",
+      "submission_commit": "c0e34afd857e9a3db5f9d3eb2430ddb969bfa97b",
+      "submission_id": "4f76de6e-d9cf-4a52-8aa1-57dc4c0e2a16"
+    },
+    {
+      "ordinal": 51,
+      "pr_number": 580,
+      "score": 3.24326223889754,
+      "source_commit": "5068eb8d0bae032faca6e901de398fc732531160",
+      "submission_commit": "0cbaf6a7f76b4e6c0119a56016a0dd7535c6a6a3",
+      "submission_id": "11863aa9-0dc0-4703-b7a4-eacd473810cb"
+    },
+    {
+      "ordinal": 52,
+      "pr_number": 597,
+      "score": 3.24417896624589,
+      "source_commit": "1cb1f43a7246d57af8b96dad468583364779aa73",
+      "submission_commit": "1cb1f43a7246d57af8b96dad468583364779aa73",
+      "submission_id": "b0994092-554a-452c-8d4c-78fecda724b4"
+    },
+    {
+      "ordinal": 53,
+      "pr_number": 600,
+      "score": 3.24929398547457,
+      "source_commit": "0c90733d383f6b987a29682bf9eb9458a6172bfa",
+      "submission_commit": "ef42e043272719d0b9c2c825f73a6eecd7498ee3",
+      "submission_id": "0cd0a6b4-b539-4705-a1c7-cb271c1f9d3b"
+    },
+    {
+      "ordinal": 54,
+      "pr_number": 693,
+      "score": 3.24985583421771,
+      "source_commit": "9e1ff9ec7152a04b753f2efb91c3e559909ea4b9",
+      "submission_commit": "9e1ff9ec7152a04b753f2efb91c3e559909ea4b9",
+      "submission_id": "59b321ee-eb5c-40ec-bb49-5218e4b8cd31"
+    },
+    {
+      "ordinal": 55,
+      "pr_number": 763,
+      "score": 3.25187972017987,
+      "source_commit": "80021bc03e4b270f7dfef5b4425107bfc57b8d70",
+      "submission_commit": "80021bc03e4b270f7dfef5b4425107bfc57b8d70",
+      "submission_id": "9d5569bb-0e58-4548-bf4c-b558654a01b3"
+    },
+    {
+      "ordinal": 56,
+      "pr_number": 788,
+      "score": 3.25238227765803,
+      "source_commit": "bfab0de58d43453e506523707e1720a3485570f4",
+      "submission_commit": "bfab0de58d43453e506523707e1720a3485570f4",
+      "submission_id": "9ad17378-848c-4441-b873-8cdc6177bf51"
+    },
+    {
+      "ordinal": 57,
+      "pr_number": 833,
+      "score": 3.25464079515452,
+      "source_commit": "eb851008f13bf30cbe57338a9fa243febda97836",
+      "submission_commit": "eb851008f13bf30cbe57338a9fa243febda97836",
+      "submission_id": "742cdf67-cd2c-4974-b7c2-dc986d281adc"
+    },
+    {
+      "ordinal": 58,
+      "pr_number": 834,
+      "score": 3.25592232736551,
+      "source_commit": "96f20f872932e3ce2fd36209d36bf81d107dd02d",
+      "submission_commit": "ed68cdc98b3bf36fc0a8e019db868689feab2d8b",
+      "submission_id": "89cbdc02-f689-42f1-b6d8-82a3e19e5161"
+    },
+    {
+      "ordinal": 59,
+      "pr_number": 843,
+      "score": 3.30221310342945,
+      "source_commit": "3e2530aeae217a71cc7cfda9ae40fca9a6a2de44",
+      "submission_commit": "3e2530aeae217a71cc7cfda9ae40fca9a6a2de44",
+      "submission_id": "ead84bba-8ad7-42bb-b6be-9a3385c6cb0a"
+    },
+    {
+      "ordinal": 60,
+      "pr_number": 846,
+      "score": 3.30955572644263,
+      "source_commit": "88578f9295523af1ea9112b6ede6b6c76c7a989b",
+      "submission_commit": "e067257d5f4573b9cdf8d7d5a8e70ceb8fb2102a",
+      "submission_id": "c6af1e24-ff11-4c9e-989c-caad4956694b"
+    },
+    {
+      "ordinal": 61,
+      "pr_number": 866,
+      "score": 3.3189406078251,
+      "source_commit": "8b54ff11c6d686628f6534d7127a261115782757",
+      "submission_commit": "8b54ff11c6d686628f6534d7127a261115782757",
+      "submission_id": "8e83c6b3-4206-419b-9d47-c61ff40a50f3"
+    },
+    {
+      "ordinal": 62,
+      "pr_number": 895,
+      "score": 3.31965392065513,
+      "source_commit": "6ebbff982cdefc9b4104166b3bf182d1c8beb4e4",
+      "submission_commit": "6ebbff982cdefc9b4104166b3bf182d1c8beb4e4",
+      "submission_id": "0dd455f0-dbca-437d-8234-3753e06701d8"
+    },
+    {
+      "ordinal": 63,
+      "pr_number": 911,
+      "score": 3.32529025140785,
+      "source_commit": "61612aa89dc65ecff2a7baf92940f6e8f36af4a8",
+      "submission_commit": "61612aa89dc65ecff2a7baf92940f6e8f36af4a8",
+      "submission_id": "214d92aa-360a-48de-b8d5-2c7b104e0a11"
+    },
+    {
+      "ordinal": 64,
+      "pr_number": 914,
+      "score": 3.32794960796967,
+      "source_commit": "b40c28e95cc7488e798f2c90b4984bf73558ff93",
+      "submission_commit": "d44e9b416689b2f4efe6436266d1a14d91cb8720",
+      "submission_id": "8819b108-e0cb-411f-8c60-e1629523cb49"
+    },
+    {
+      "ordinal": 65,
+      "pr_number": 958,
+      "score": 3.32824628683457,
+      "source_commit": "23ef7556662055c74190abe5b1c5e8a412cd314d",
+      "submission_commit": "23ef7556662055c74190abe5b1c5e8a412cd314d",
+      "submission_id": "f04b102e-b4d4-4354-97eb-760dd900e18d"
+    },
+    {
+      "ordinal": 66,
+      "pr_number": 965,
+      "score": 3.33849825332807,
+      "source_commit": "ca0612472eb56099075bb053f73555d071369c5b",
+      "submission_commit": "ca0612472eb56099075bb053f73555d071369c5b",
+      "submission_id": "276aa2c2-4eee-4ed4-9f5c-ab8e531985ad"
+    },
+    {
+      "ordinal": 67,
+      "pr_number": 968,
+      "score": 3.35025879204714,
+      "source_commit": "41bad1c6f124f8f0c7f324cf60e95cd2c4de2ca6",
+      "submission_commit": "a8d37e2c5209bc4385ccae285ca88c6917d2baae",
+      "submission_id": "51b9bf85-dc66-4c8e-adac-047ed7dd25e8"
+    },
+    {
+      "ordinal": 68,
+      "pr_number": 1028,
+      "score": 3.35206896702495,
+      "source_commit": "1ec3625b43f43d3545c007fe65c51eb107842d12",
+      "submission_commit": "1ec3625b43f43d3545c007fe65c51eb107842d12",
+      "submission_id": "7358c89f-ecd0-411a-a48f-b8d5716f7706"
+    },
+    {
+      "ordinal": 69,
+      "pr_number": 1031,
+      "score": 3.35922017047244,
+      "source_commit": "fac135f222f9c5e67be8e4ddd33396c5723337a1",
+      "submission_commit": "561b0a1482e7a3a917fb9c12eacf15f4fd907eeb",
+      "submission_id": "bc070b7b-c482-4a4a-b9d9-c202c87ee2c6"
+    },
+    {
+      "ordinal": 70,
+      "pr_number": 1063,
+      "score": 3.49065043561149,
+      "source_commit": "6f1cd66fc214d4281b37da335e21077c7e9d7ad5",
+      "submission_commit": "6f1cd66fc214d4281b37da335e21077c7e9d7ad5",
+      "submission_id": "d3c491b5-902f-4f80-8d33-b7938f980d2d"
+    },
+    {
+      "ordinal": 71,
+      "pr_number": 1066,
+      "score": 3.51661723756985,
+      "source_commit": "a0f8588668c603864deffe407f5895b31858414e",
+      "submission_commit": "a0f8588668c603864deffe407f5895b31858414e",
+      "submission_id": "cf79f7df-305e-4ffd-b78f-4f65f5c3b0dd"
+    },
+    {
+      "ordinal": 72,
+      "pr_number": 1071,
+      "score": 3.51845338033139,
+      "source_commit": "c0dbec051c58bccf5435ee1e1e5b01271dc7e179",
+      "submission_commit": "1da2702f3f6628d85769053bbbb3cbe5d003cb5e",
+      "submission_id": "48423d09-19bb-41b2-8c6e-fc07ee032213"
+    },
+    {
+      "ordinal": 73,
+      "pr_number": 1089,
+      "score": 3.51925373965701,
+      "source_commit": "c2e4323166ecd3c3e681ddd9ba97f221b2187c62",
+      "submission_commit": "c2e4323166ecd3c3e681ddd9ba97f221b2187c62",
+      "submission_id": "0b8602e1-99af-468f-924e-8f1e587c95d5"
+    },
+    {
+      "ordinal": 74,
+      "pr_number": 1095,
+      "score": 3.52085227003175,
+      "source_commit": "60d5b34a5ad62296faa9746dccab71e762e4001c",
+      "submission_commit": "fd562cb75bf1be4bafee87824f7a631dfe09b9c7",
+      "submission_id": "623e77af-7a6a-41f0-afab-478037aafbb8"
+    },
+    {
+      "ordinal": 75,
+      "pr_number": 1105,
+      "score": 3.52326653027684,
+      "source_commit": "166e0cadc641e30b17725c1cf59e58b9fdc8e63a",
+      "submission_commit": "166e0cadc641e30b17725c1cf59e58b9fdc8e63a",
+      "submission_id": "dacf7005-48f7-42b1-a09f-ae3287231a51"
+    },
+    {
+      "ordinal": 76,
+      "pr_number": 1107,
+      "score": 3.52509129797624,
+      "source_commit": "d44ad22960039ea2eca6c32806af86195e101ecc",
+      "submission_commit": "d95518f0e3bfcd25038f9276a43e3785b9a902ce",
+      "submission_id": "b6cb0fea-880f-4737-8129-3769e071a808"
+    },
+    {
+      "ordinal": 77,
+      "pr_number": 1117,
+      "score": 3.52686511690287,
+      "source_commit": "c8dbd2dcd2d6ed794faca11cde5be45d6dfc50b3",
+      "submission_commit": "c8dbd2dcd2d6ed794faca11cde5be45d6dfc50b3",
+      "submission_id": "02742bf0-60d6-4f80-8717-aa21f8589e91"
+    },
+    {
+      "ordinal": 78,
+      "pr_number": 1123,
+      "score": 3.68172016051458,
+      "source_commit": "8849fad72cc3a8e1b8ec394c88ac92f5a2d9d480",
+      "submission_commit": "9a6ceabf34970cf3e0516628289573a56b4dcf7b",
+      "submission_id": "ed608e64-8b4d-4784-910e-d8ee11b064f4"
+    },
+    {
+      "ordinal": 79,
+      "pr_number": 1130,
+      "score": 3.69071882618532,
+      "source_commit": "1d66bb36cda1f3b9e97013e9d2cee0b7f7e9d632",
+      "submission_commit": "1d66bb36cda1f3b9e97013e9d2cee0b7f7e9d632",
+      "submission_id": "08b67f12-cf49-46a3-ad38-900afaee5f63"
+    },
+    {
+      "ordinal": 80,
+      "pr_number": 1139,
+      "score": 3.70355221733209,
+      "source_commit": "e8f14c444156521f5799a728da80f57ca0b07edf",
+      "submission_commit": "e8f14c444156521f5799a728da80f57ca0b07edf",
+      "submission_id": "1760479a-29d0-48ba-9a49-0b8e1cffab9e"
+    },
+    {
+      "ordinal": 81,
+      "pr_number": 1150,
+      "score": 3.70576324123463,
+      "source_commit": "1b3ea281a279ae087362f5450a1011ccacc28959",
+      "submission_commit": "1b3ea281a279ae087362f5450a1011ccacc28959",
+      "submission_id": "3ba6ee9d-2367-4456-aafb-92667db5a149"
+    },
+    {
+      "ordinal": 82,
+      "pr_number": 1153,
+      "score": 3.71959722580154,
+      "source_commit": "eb5eadc7a165047d4321ce883b9ff30894d8bd19",
+      "submission_commit": "3ad5bfafe0bc3c4c505c55265d631e7f04d21249",
+      "submission_id": "684821ed-f7b5-48f5-9ce1-df99b59e19b6"
+    }
+  ]
+}

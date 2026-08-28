@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720">
+<rect width="100%" height="100%" fill="#0B1220"/>
+<text x="90" y="44" fill="#F8FAFC" font-size="24" font-family="system-ui" font-weight="700">Qwen3.8 MTP decode throughput — vanity + thinking=low</text>
+<text x="90" y="72" fill="#94A3B8" font-size="14" font-family="system-ui">100-token vanity has no conditioner and stops naturally · thinking rows: 1,024 conditioner and output</text>
+<line x1="90" y1="594.00" x2="1244" y2="594.00" stroke="#233047" stroke-width="1"/>
+<text x="78" y="599.00" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">0</text>
+<line x1="90" y1="556.31" x2="1244" y2="556.31" stroke="#233047" stroke-width="1"/>
+<text x="78" y="561.31" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">10</text>
+<line x1="90" y1="518.62" x2="1244" y2="518.62" stroke="#233047" stroke-width="1"/>
+<text x="78" y="523.62" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">20</text>
+<line x1="90" y1="480.92" x2="1244" y2="480.92" stroke="#233047" stroke-width="1"/>
+<text x="78" y="485.92" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">30</text>
+<line x1="90" y1="443.23" x2="1244" y2="443.23" stroke="#233047" stroke-width="1"/>
+<text x="78" y="448.23" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">40</text>
+<line x1="90" y1="405.54" x2="1244" y2="405.54" stroke="#233047" stroke-width="1"/>
+<text x="78" y="410.54" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">50</text>
+<line x1="90" y1="367.85" x2="1244" y2="367.85" stroke="#233047" stroke-width="1"/>
+<text x="78" y="372.85" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">60</text>
+<line x1="90" y1="330.15" x2="1244" y2="330.15" stroke="#233047" stroke-width="1"/>
+<text x="78" y="335.15" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">70</text>
+<line x1="90" y1="292.46" x2="1244" y2="292.46" stroke="#233047" stroke-width="1"/>
+<text x="78" y="297.46" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">80</text>
+<line x1="90" y1="254.77" x2="1244" y2="254.77" stroke="#233047" stroke-width="1"/>
+<text x="78" y="259.77" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">90</text>
+<line x1="90" y1="217.08" x2="1244" y2="217.08" stroke="#233047" stroke-width="1"/>
+<text x="78" y="222.08" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">100</text>
+<line x1="90" y1="179.38" x2="1244" y2="179.38" stroke="#233047" stroke-width="1"/>
+<text x="78" y="184.38" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">110</text>
+<line x1="90" y1="141.69" x2="1244" y2="141.69" stroke="#233047" stroke-width="1"/>
+<text x="78" y="146.69" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">120</text>
+<line x1="90" y1="104.00" x2="1244" y2="104.00" stroke="#233047" stroke-width="1"/>
+<text x="78" y="109.00" text-anchor="end" fill="#94A3B8" font-size="12" font-family="system-ui">130</text>
+<rect x="106.63" y="149.81" width="35.51" height="444.19" rx="4" fill="#8B95A7" stroke="none" stroke-width="0" data-metric="decode_tok_s" data-context-tokens="100" data-candidate="v2.9.2 fixed K3" data-value="117.8452791224329" data-winner="false"/>
+<rect x="147.14" y="147.72" width="35.51" height="446.28" rx="4" fill="#2E90FA" stroke="none" stroke-width="0" data-metric="decode_tok_s" data-context-tokens="100" data-candidate="Optimized fixed K3" data-value="118.40038235160236" data-winner="false"/>
+<rect x="187.65" y="152.09" width="35.51" height="441.91" rx="4" fill="#12B76A" stroke="none" stroke-width="0" data-metric="decode_tok_s" data-context-tokens="100" data-candidate="Adaptive BF16" data-value="117.24067062067999" data-winner="false"/>
+<rect x="228.15" y="136.61" width="35.51" height="457.39" rx="4" fill="#7A5AF8" stroke="#FDE68A" stroke-width="4" data-metric="decode_tok_s" data-context-tokens="100" data-candidate="Adaptive Q4" data-value="121.34782772719814" data-winner="true"/>
+<rect x="268.66" y="169.91" width="35.51" height="424.09" rx="4" fill="#F79009" stroke="none" stroke-width="0" data-metric="decode_tok_s" data-context-tokens="100" data-candidate="DFlash2" data-value="112.51289698223152" data-winner="false"/>
+<text x="205.40" y="622" text-anchor="middle" fill="#E2E8F0" font-size="14" font-family="system-ui">100</text>
+<rect x="337.43" y="354.42" width="35.51" height="239.58" rx="4" fill="#8B95A7" stroke="none" stroke-width="0" data-metric="decode_tok_s" data-context-tokens="1024" data-candidate="v2.9.2 fixed K3" data-value="63.56214187578141" data-winner="false"/>
+<rect x="377.94" y="361.20" width="35.51" height="232.80" rx="4" fill="#2E90FA" stroke="none" stroke-width="0" data-metric="decode_tok_s" data-context-tokens="1024" data-candidate="Optimized fixed K3" data-value="61.763084884623666" data-winner="false"/>
+<rect x="418.45" y="363.60" width="35.51" height="230.40" rx="4" fill="#12B76A" stroke="none" stroke-width="0" data-metric="decode_tok_s" data-context-tokens="1024" data-candidate="Adaptive BF16" data-value="61.12678575801031" data-winner="false"/>
+<rect x="458.95" y="340.80" width="35.51" height="253.20" rx="4" fill="#7A5AF8" stroke="none" stroke-width="0" data-metric="decode_tok_s" data-context-tokens="1024" data-candidate="Adaptive Q4" data-value="67.17458708928318" data-winner="false"/>
+<rect x="499.46" y="321.09" width="35.51" height="272.91" rx="4" fill="#F79009" stroke="#FDE68A" stroke-width="4" data-metric="decode_tok_s" data-context-tokens="1024" data-candidate="DFlash2" data-value="72.40515009914137" data-winner="true"/>
+<text x="436.20" y="622" text-anchor="middle" fill="#E2E8F0" font-size="14" font-family="system-ui">1K</text>
+<rect x="568.23" y="385.89" width="35.51" height="208.11" rx="4" fill="#8B95A7" stroke="none" stroke-width="0" data-metric="decode_tok_s" data-context-tokens="16384" data-candidate="v2.9.2 fixed K3" data-value="55.21395018342532" data-winner="false"/>
+<rect x="608.74" y="381.35" width="35.51" height="212.65" rx="4" fill="#2E90FA" stroke="none" stroke-width="0" data-metric="decode_tok_s" data-context-tokens="16384" data-candidate="Optimized fixed K3" data-value="56.4167561882758" data-winner="false"/>
+<rect x="649.25" y="384.01" width="35.51" height="209.99" rx="4" fill="#12B76A" stroke="none" stroke-width="0" data-metric="decode_tok_s" data-context-tokens="16384" data-candidate="Adaptive BF16" data-value="55.71106314612001" data-winner="false"/>
+<rect x="689.75" y="373.70" width="35.51" height="220.30" rx="4" fill="#7A5AF8" stroke="none" stroke-width="0" data-metric="decode_tok_s" data-context-tokens="16384" data-candidate="Adaptive Q4" data-value="58.44721630263416" data-winner="false"/>
+<rect x="730.26" y="339.02" width="35.51" height="254.98" rx="4" fill="#F79009" stroke="#FDE68A" stroke-width="4" data-metric="decode_tok_s" data-context-tokens="16384" data-candidate="DFlash2" data-value="67.64651486950491" data-winner="true"/>
+<text x="667.00" y="622" text-anchor="middle" fill="#E2E8F0" font-size="14" font-family="system-ui">16K</text>
+<rect x="799.03" y="439.15" width="35.51" height="154.85" rx="4" fill="#8B95A7" stroke="none" stroke-width="0" data-metric="decode_tok_s" data-context-tokens="65536" data-candidate="v2.9.2 fixed K3" data-value="41.08152857938888" data-winner="false"/>
+<rect x="839.54" y="440.86" width="35.51" height="153.14" rx="4" fill="#2E90FA" stroke="none" stroke-width="0" data-metric="decode_tok_s" data-context-tokens="65536" data-candidate="Optimized fixed K3" data-value="40.62830208602769" data-winner="false"/>
+<rect x="880.05" y="442.25" width="35.51" height="151.75" rx="4" fill="#12B76A" stroke="none" stroke-width="0" data-metric="decode_tok_s" data-context-tokens="65536" data-candidate="Adaptive BF16" data-value="40.25902906367471" data-winner="false"/>
+<rect x="920.55" y="442.31" width="35.51" height="151.69" rx="4" fill="#7A5AF8" stroke="none" stroke-width="0" data-metric="decode_tok_s" data-context-tokens="65536" data-candidate="Adaptive Q4" data-value="40.24508444652579" data-winner="false"/>
+<rect x="961.06" y="391.98" width="35.51" height="202.02" rx="4" fill="#F79009" stroke="#FDE68A" stroke-width="4" data-metric="decode_tok_s" data-context-tokens="65536" data-candidate="DFlash2" data-value="53.596218712009026" data-winner="true"/>
+<text x="897.80" y="622" text-anchor="middle" fill="#E2E8F0" font-size="14" font-family="system-ui">64K</text>
+<rect x="1029.83" y="467.88" width="35.51" height="126.12" rx="4" fill="#8B95A7" stroke="none" stroke-width="0" data-metric="decode_tok_s" data-context-tokens="131072" data-candidate="v2.9.2 fixed K3" data-value="33.460607313579175" data-winner="false"/>
+<rect x="1070.34" y="480.59" width="35.51" height="113.41" rx="4" fill="#2E90FA" stroke="none" stroke-width="0" data-metric="decode_tok_s" data-context-tokens="131072" data-candidate="Optimized fixed K3" data-value="30.089121212635774" data-winner="false"/>
+<rect x="1110.85" y="480.75" width="35.51" height="113.25" rx="4" fill="#12B76A" stroke="none" stroke-width="0" data-metric="decode_tok_s" data-context-tokens="131072" data-candidate="Adaptive BF16" data-value="30.045796114683057" data-winner="false"/>
+<rect x="1151.35" y="486.89" width="35.51" height="107.11" rx="4" fill="#7A5AF8" stroke="none" stroke-width="0" data-metric="decode_tok_s" data-context-tokens="131072" data-candidate="Adaptive Q4" data-value="28.41749692781107" data-winner="false"/>
+<rect x="1191.86" y="448.47" width="35.51" height="145.53" rx="4" fill="#F79009" stroke="#FDE68A" stroke-width="4" data-metric="decode_tok_s" data-context-tokens="131072" data-candidate="DFlash2" data-value="38.61022665175348" data-winner="true"/>
+<text x="1128.60" y="622" text-anchor="middle" fill="#E2E8F0" font-size="14" font-family="system-ui">128K</text>
+<rect x="90" y="650" width="14" height="14" rx="3" fill="#8B95A7"/>
+<text x="112" y="662" fill="#CBD5E1" font-size="13" font-family="system-ui">v2.9.2 fixed K3</text>
+<rect x="310" y="650" width="14" height="14" rx="3" fill="#2E90FA"/>
+<text x="332" y="662" fill="#CBD5E1" font-size="13" font-family="system-ui">Optimized fixed K3</text>
+<rect x="530" y="650" width="14" height="14" rx="3" fill="#12B76A"/>
+<text x="552" y="662" fill="#CBD5E1" font-size="13" font-family="system-ui">Adaptive BF16</text>
+<rect x="750" y="650" width="14" height="14" rx="3" fill="#7A5AF8"/>
+<text x="772" y="662" fill="#CBD5E1" font-size="13" font-family="system-ui">Adaptive Q4</text>
+<rect x="970" y="650" width="14" height="14" rx="3" fill="#F79009"/>
+<text x="992" y="662" fill="#CBD5E1" font-size="13" font-family="system-ui">DFlash2</text>
+</svg>
