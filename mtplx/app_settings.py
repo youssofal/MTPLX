@@ -5,8 +5,8 @@ The app stores its configuration at
 (see ``AppConfiguration.swift`` ``CodingKeys`` — the sync source for the
 field names read here). The CLI never writes this file; it only reads it so
 ``mtplx start`` can offer "same as the MTPLX app" and reuse the app's model,
-port, and API key instead of walking a returning user through onboarding the
-app already completed.
+model directory, port, and API key instead of walking a returning user through
+onboarding the app already completed.
 
 Dates in the file are Apple-epoch (seconds since 2001-01-01); convert with
 ``APPLE_EPOCH_OFFSET_S`` when a Unix timestamp is needed.
@@ -33,6 +33,7 @@ class AppSettings:
 
     path: Path
     model: str | None
+    model_dir: str | None
     host: str | None
     port: int | None
     api_key: str | None
@@ -95,6 +96,7 @@ def read_app_settings(path: str | Path | None = None) -> AppSettings | None:
     return AppSettings(
         path=settings_file,
         model=_clean_str(data.get("model")),
+        model_dir=_clean_str(data.get("model_dir")),
         host=_clean_str(data.get("host")),
         port=_clean_int(data.get("port")),
         api_key=_clean_str(data.get("api_key")),

@@ -37,6 +37,7 @@ struct ModelPickStep: View {
                 ScrollViewReader { proxy in
                     ScrollView(showsIndicators: false) {
                         VStack(spacing: 12) {
+                            downloadLocationRow
                             if preparedRows.isEmpty {
                                 preparingRowsPlaceholder
                             }
@@ -62,6 +63,63 @@ struct ModelPickStep: View {
         }
         .onChange(of: orchestrator.state.hardware) { _, _ in
             prepareRecommendedRows(force: true)
+        }
+        .onChange(of: orchestrator.modelDirectory) { _, _ in
+            prepareRecommendedRows(force: true)
+        }
+    }
+
+    private var downloadLocationRow: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "internaldrive")
+                .foregroundStyle(Brand.typeSecondary)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Model download folder")
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .foregroundStyle(Brand.typeHi)
+                Text(orchestrator.effectiveModelDirectory)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(Brand.typeTertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer(minLength: 8)
+            if !orchestrator.modelDirectory.isEmpty {
+                Button("Default") {
+                    orchestrator.setModelDirectory(nil)
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+            }
+            Button("Choose…") { chooseModelDirectory() }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Brand.cardSurface)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(Brand.separator, lineWidth: 0.5)
+                )
+        )
+    }
+
+    private func chooseModelDirectory() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Use Folder"
+        panel.message = "Choose where MTPLX should download model packs."
+        let current = orchestrator.effectiveModelDirectory
+        if FileManager.default.fileExists(atPath: current) {
+            panel.directoryURL = URL(fileURLWithPath: current, isDirectory: true)
+        }
+        if panel.runModal() == .OK, let url = panel.url {
+            orchestrator.setModelDirectory(url.path)
         }
     }
 
@@ -108,13 +166,20 @@ struct ModelPickStep: View {
 
     private func prepareRecommendedRows(force: Bool = false) {
         let hardware = orchestrator.state.hardware
-        let signature = ModelPickPreparationSignature(hardware: hardware)
+        let modelDirectory = orchestrator.modelDirectory
+        let signature = ModelPickPreparationSignature(
+            hardware: hardware,
+            modelDirectory: modelDirectory
+        )
         guard force || preparedRowsSignature != signature else { return }
 
         prepareRowsTask?.cancel()
         prepareRowsTask = Task { @MainActor in
             let rows = await Task.detached(priority: .userInitiated) {
-                Self.makePreparedRows(for: hardware)
+                Self.makePreparedRows(
+                    for: hardware,
+                    modelDirectory: modelDirectory
+                )
             }.value
 
             guard !Task.isCancelled else { return }
@@ -127,22 +192,33 @@ struct ModelPickStep: View {
         }
     }
 
-    private nonisolated static func makePreparedRows(for hardware: DetectedHardware?) -> [PreparedRecommendedModelRow] {
+    private nonisolated static func makePreparedRows(
+        for hardware: DetectedHardware?,
+        modelDirectory: String?
+    ) -> [PreparedRecommendedModelRow] {
         let rows = RecommendedModelRow.rows(
             for: MTPLXModelOption.recommendedCatalogIDs(for: hardware)
         )
-        let prepared = rows.compactMap { prepare(row: $0, hardware: hardware) }
+        let prepared = rows.compactMap {
+            prepare(row: $0, hardware: hardware, modelDirectory: modelDirectory)
+        }
         let visible = prepared.filter(\.shouldShow)
         return visible.isEmpty ? Array(prepared.prefix(1)) : visible
     }
 
     private nonisolated static func prepare(
         row: RecommendedModelRow,
-        hardware: DetectedHardware?
+        hardware: DetectedHardware?,
+        modelDirectory: String?
     ) -> PreparedRecommendedModelRow? {
         guard let model = model(for: row, hardware: hardware) else { return nil }
-        let isInstalled = model.isInstalled
-        let verdict = Self.verdict(for: model, hardware: hardware, isInstalled: isInstalled)
+        let isInstalled = model.isInstalled(modelDirectory: modelDirectory)
+        let verdict = Self.verdict(
+            for: model,
+            hardware: hardware,
+            isInstalled: isInstalled,
+            modelDirectory: modelDirectory
+        )
         let shouldShow: Bool
         if hardware == nil || isInstalled {
             shouldShow = true
@@ -171,9 +247,12 @@ struct ModelPickStep: View {
     private nonisolated static func verdict(
         for model: MTPLXModelOption,
         hardware: DetectedHardware?,
-        isInstalled: Bool
+        isInstalled: Bool,
+        modelDirectory: String?
     ) -> ModelFeasibilityVerdict {
-        let diskFreeGiB = isInstalled ? Double.greatestFiniteMagnitude : freeDiskGiB()
+        let diskFreeGiB = isInstalled
+            ? Double.greatestFiniteMagnitude
+            : freeDiskGiB(modelDirectory: modelDirectory)
         return ModelFeasibility().evaluate(
             model: model,
             chipTier: hardware?.tier ?? .unknown,
@@ -182,10 +261,11 @@ struct ModelPickStep: View {
         )
     }
 
-    private nonisolated static func freeDiskGiB() -> Double {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let values = try? home.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-        let bytes = values?.volumeAvailableCapacityForImportantUsage ?? 0
+    private nonisolated static func freeDiskGiB(modelDirectory: String?) -> Double {
+        let selected = MTPLXAppConfiguration.normalizedModelDirectory(modelDirectory)
+        let location = selected.map { URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? FileManager.default.homeDirectoryForCurrentUser
+        let bytes = ModelDownloader.availableCapacityBytes(at: location)
         return Double(bytes) / 1_073_741_824.0
     }
 
@@ -735,13 +815,17 @@ private struct ModelPickPreparationSignature: Equatable {
     let memoryBytes: Int64?
     let gpuCoreCount: Int?
     let cpuCoreCount: Int?
+    let modelDirectory: String?
 
-    init(hardware: DetectedHardware?) {
+    init(hardware: DetectedHardware?, modelDirectory: String?) {
         chipName = hardware?.chipName
         appleSiliconGeneration = hardware?.appleSiliconGeneration
         memoryBytes = hardware?.unifiedMemoryBytes
         gpuCoreCount = hardware?.gpuCoreCount
         cpuCoreCount = hardware?.cpuCoreCount
+        self.modelDirectory = MTPLXAppConfiguration.normalizedModelDirectory(
+            modelDirectory
+        )
     }
 }
 

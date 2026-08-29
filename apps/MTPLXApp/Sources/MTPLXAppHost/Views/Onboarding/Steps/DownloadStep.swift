@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import MTPLXAppCore
 
 // MARK: - DownloadStep
@@ -80,7 +81,7 @@ struct DownloadStep: View {
         if let progress = orchestrator.downloadProgress, !progress.destinationPath.isEmpty {
             return progress.destinationPath
         }
-        return "Files land in ~/.mtplx/models. Resume is automatic."
+        return "Files land in \(orchestrator.effectiveModelDirectory). Resume is automatic."
     }
 
     @ViewBuilder
@@ -103,6 +104,10 @@ struct DownloadStep: View {
     @ViewBuilder
     private func body(for orchestrator: OnboardingOrchestrator) -> some View {
         VStack(alignment: .leading, spacing: 14) {
+            if !orchestrator.isDownloading,
+               orchestrator.downloadProgress?.isComplete != true {
+                downloadLocationControl
+            }
             progressBar
             statusRow
             telemetryRow
@@ -111,6 +116,39 @@ struct DownloadStep: View {
             }
             Spacer(minLength: 0)
             footnote
+        }
+    }
+
+    private var downloadLocationControl: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "internaldrive")
+                .foregroundStyle(Brand.typeSecondary)
+            Text(orchestrator.effectiveModelDirectory)
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(Brand.typeSecondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 8)
+            Button("Change…") { chooseModelDirectory() }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+        }
+    }
+
+    private func chooseModelDirectory() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Use Folder"
+        panel.message = "Choose where MTPLX should download model packs."
+        let current = orchestrator.effectiveModelDirectory
+        if FileManager.default.fileExists(atPath: current) {
+            panel.directoryURL = URL(fileURLWithPath: current, isDirectory: true)
+        }
+        if panel.runModal() == .OK, let url = panel.url {
+            orchestrator.setModelDirectory(url.path)
         }
     }
 

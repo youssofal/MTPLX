@@ -90,6 +90,24 @@ def test_state_round_trip(tmp_path, monkeypatch):
         json.load(handle)
 
 
+def test_installed_model_screen_uses_app_model_directory(tmp_path, monkeypatch):
+    cache = tmp_path / "external-models"
+    pair = cache / "paired-bundle"
+    (pair / "target").mkdir(parents=True)
+    (pair / "assistant").mkdir()
+    (pair / "mtplx_pair.json").write_text("{}", encoding="utf-8")
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(
+        json.dumps({"model_dir": str(cache)}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MTPLX_APP_SETTINGS_PATH", str(settings_file))
+
+    installed = onboarding._installed_models_for_screen()
+
+    assert [item.path for item in installed] == [pair]
+
+
 def _pin_modern_64gib(monkeypatch):
     monkeypatch.setattr(
         default_models_module,

@@ -100,7 +100,10 @@ public struct ModelDownloader: Sendable {
     ) -> AsyncStream<DownloadEvent> {
         AsyncStream { continuation in
             let destination = sizeProbePath.map { URL(fileURLWithPath: $0) }
-                ?? self.cachedModelPath(for: repo)
+                ?? self.cachedModelPath(
+                    for: repo,
+                    modelDirectory: extraEnvironment["MTPLX_MODEL_DIR"]
+                )
             // Make the destination dir up-front so the first poll returns 0
             // rather than spuriously matching "exists". Never for updates:
             // an empty canonical dir would shadow a populated legacy-layout
@@ -414,9 +417,15 @@ public struct ModelDownloader: Sendable {
 
     /// Mirrors `mtplx/hf_loader.py:cached_model_path` exactly so the
     /// directory we poll matches the directory `mtplx pull` writes to.
-    public func cachedModelPath(for repo: String) -> URL {
-        let root = modelCacheRoot ?? Self.defaultCacheRoot(env: processEnvironment)
-        let safeName = repo.replacingOccurrences(of: "/", with: "--")
+    public func cachedModelPath(for repo: String, modelDirectory: String? = nil) -> URL {
+        let selectedRoot = MTPLXAppConfiguration.normalizedModelDirectory(modelDirectory)
+            .map { URL(fileURLWithPath: $0, isDirectory: true) }
+        let root = selectedRoot
+            ?? modelCacheRoot
+            ?? Self.defaultCacheRoot(env: processEnvironment)
+        let safeName = repo
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            .replacingOccurrences(of: "/", with: "--")
         return root.appendingPathComponent(safeName, isDirectory: true)
     }
 
@@ -428,6 +437,32 @@ public struct ModelDownloader: Sendable {
         return URL(fileURLWithPath: home)
             .appendingPathComponent(".mtplx", isDirectory: true)
             .appendingPathComponent("models", isDirectory: true)
+    }
+
+    /// Free bytes on the volume that owns a prospective model directory.
+    /// Walk to the nearest existing parent so newly-entered subfolders work,
+    /// and keep a filesystem-attributes fallback for external filesystems
+    /// that do not report Apple's "important usage" capacity value.
+    public static func availableCapacityBytes(at directory: URL) -> Int64 {
+        let fileManager = FileManager.default
+        var location = directory
+        while !fileManager.fileExists(atPath: location.path), location.path != "/" {
+            location.deleteLastPathComponent()
+        }
+        let values = try? location.resourceValues(forKeys: [
+            .volumeAvailableCapacityForImportantUsageKey,
+            .volumeAvailableCapacityKey,
+        ])
+        if let bytes = values?.volumeAvailableCapacityForImportantUsage {
+            return bytes
+        }
+        if let bytes = values?.volumeAvailableCapacity {
+            return Int64(bytes)
+        }
+        let attributes = try? fileManager.attributesOfFileSystem(
+            forPath: location.path
+        )
+        return (attributes?[.systemFreeSize] as? NSNumber)?.int64Value ?? 0
     }
 
     /// Recursive sum of all regular file sizes under `url`. Returns 0
@@ -456,6 +491,7 @@ public struct ModelDownloader: Sendable {
     /// network access and freshness logic live entirely in the CLI, this
     /// just shells and decodes. Safe to run while a daemon is serving.
     public func checkModelUpdates(
+        extraEnvironment: [String: String] = [:],
         timeoutSeconds: TimeInterval = 120
     ) async throws -> [ModelUpdateInfo] {
         let executable = try resolveMtplxExecutable { _ in }
@@ -464,6 +500,7 @@ public struct ModelDownloader: Sendable {
         process.arguments = ["models", "--check", "--json"]
         var env = processEnvironment
         env["PATH"] = MTPLXCommandBuilder.expandedPATH(environment: processEnvironment)
+        env.merge(extraEnvironment) { _, new in new }
         process.environment = MTPLXCommandBuilder.pythonBytecodeSafeEnvironment(
             environment: env
         )

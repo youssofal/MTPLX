@@ -389,6 +389,9 @@ public struct MTPLXCommandBuilder: Sendable {
         if let launchID, !launchID.isEmpty {
             environment["MTPLX_APP_LAUNCH_ID"] = launchID
         }
+        environment.merge(
+            MTPLXAppConfiguration.modelDirectoryEnvironment(configuration.modelDirectory)
+        ) { _, new in new }
         if let mirror = MTPLXAppConfiguration.hfMirrorEnvironment(configuration.hfEndpoint) {
             environment.merge(mirror) { _, new in new }
         }

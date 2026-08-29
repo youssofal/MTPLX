@@ -369,6 +369,7 @@ def test_read_app_settings_parses_snake_case_fields(tmp_path):
         json.dumps(
             {
                 "model": "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed",
+                "model_dir": "/Volumes/AI/MTPLX Models",
                 "host": "127.0.0.1",
                 "port": 8000,
                 "api_key": "mtplx-local",
@@ -383,6 +384,7 @@ def test_read_app_settings_parses_snake_case_fields(tmp_path):
 
     assert settings is not None
     assert settings.model == "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed"
+    assert settings.model_dir == "/Volumes/AI/MTPLX Models"
     assert settings.host == "127.0.0.1"
     assert settings.port == 8000
     assert settings.api_key == "mtplx-local"

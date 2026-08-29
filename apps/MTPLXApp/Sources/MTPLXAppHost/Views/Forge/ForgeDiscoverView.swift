@@ -383,8 +383,11 @@ struct ForgeDiscoverView: View {
     /// registered as a custom model — so the card badge is honest.
     private func isAlreadyInstalled(entry: DiscoveryEntry) -> Bool {
         if let opt = MTPLXModelOption.option(matching: entry.repo) {
-            return opt.isInstalled
+            return opt.isInstalled(
+                modelDirectory: backend.configuration.modelDirectory
+            )
         }
-        return MTPLXModelOption.customHuggingFaceModel(repoID: entry.repo)?.isInstalled ?? false
+        return MTPLXModelOption.customHuggingFaceModel(repoID: entry.repo)?
+            .isInstalled(modelDirectory: backend.configuration.modelDirectory) ?? false
     }
 }

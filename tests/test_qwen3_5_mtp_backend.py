@@ -4,13 +4,16 @@ Hermetic: covers config detection, the trunk-load shim, mtp.* key remapping,
 and arch registration. The full-checkpoint draft-acceptance contract is
 validated during hardware bring-up (see the module docstring), not here.
 """
+import json
 import sys
 
 from mtplx.qwen3_5_mtp_patch import (
+    _candidate_weight_files,
     is_qwen3_5_mtp_config,
     install_qwen3_5_mtp_trunk_shim,
     _strip_mtp_prefix,
 )
+from mtplx.artifacts import expected_mtp_file
 
 
 def test_config_detection_positive():
@@ -18,6 +21,11 @@ def test_config_detection_positive():
     # num_nextn nested under text_config is also honored
     assert is_qwen3_5_mtp_config(
         {"model_type": "qwen3_5_mtp", "text_config": {"num_nextn_predict_layers": 1}}
+    )
+    # Qwen3.8 external-head bundles keep a plain qwen3_5 target and declare
+    # the shared predictor with mtp_num_hidden_layers.
+    assert is_qwen3_5_mtp_config(
+        {"model_type": "qwen3_5", "text_config": {"mtp_num_hidden_layers": 1}}
     )
 
 
@@ -57,6 +65,20 @@ def test_strip_mtp_prefix():
     # trunk weights are not MTP keys
     assert _strip_mtp_prefix("language_model.model.layers.0.self_attn.q_proj.weight") is None
     assert _strip_mtp_prefix("lm_head.weight") is None
+
+
+def test_external_mtp_head_is_resolved_for_target_and_quant_variant(tmp_path):
+    root = tmp_path / "Qwen3.8-External-MTP"
+    variant = root / "6-bit"
+    head = root / "mtp"
+    variant.mkdir(parents=True)
+    head.mkdir()
+    config = {"model_type": "qwen3_5", "text_config": {"mtp_num_hidden_layers": 1}}
+    (variant / "config.json").write_text(json.dumps(config))
+    (head / "model.safetensors").write_bytes(b"fixture")
+
+    assert expected_mtp_file(variant, config) == head / "model.safetensors"
+    assert _candidate_weight_files(variant, config) == [head / "model.safetensors"]
 
 
 def test_arch_registered():

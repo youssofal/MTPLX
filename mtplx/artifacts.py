@@ -343,10 +343,28 @@ def expected_mtp_file(model_dir: Path | str, config: dict[str, Any] | None = Non
     extra = config.get("mlx_lm_extra_tensors", {})
     if isinstance(extra, dict) and extra.get("mtp_file"):
         return model_path / str(extra["mtp_file"])
-    for rel in ("mtp.safetensors", "mtp/weights.safetensors", "model-mtp.safetensors"):
+    for rel in (
+        "mtp.safetensors",
+        "mtp/weights.safetensors",
+        "mtp/model.safetensors",
+        "model-mtp.safetensors",
+    ):
         candidate = model_path / rel
         if candidate.exists():
             return candidate
+    # Some Qwen3.8 distributions keep one shared BF16 draft head next to
+    # several target quantizations: model/{2,4,6,8}-bit + model/mtp. Resolve
+    # that sibling only for configs that explicitly declare an MTP layer.
+    tcfg = text_config(config)
+    declares_mtp = int(
+        tcfg.get("mtp_num_hidden_layers")
+        or tcfg.get("num_nextn_predict_layers")
+        or config.get("num_nextn_predict_layers")
+        or 0
+    ) > 0
+    sibling = model_path.parent / "mtp" / "model.safetensors"
+    if declares_mtp and sibling.exists():
+        return sibling
     return model_path / "mtp.safetensors"
 
 
@@ -578,7 +596,15 @@ def inspect_mtp_tensors(model_dir: Path | str, config: dict[str, Any] | None = N
             extra_keys=(tensor_error,),
         )
 
-    key_set = {normalize_mtp_key(t.key) for t in tensors}
+    external_head = mtp_path.parent.name.casefold() == "mtp"
+    key_set = {
+        (
+            f"mtp.{t.key}"
+            if external_head and not is_mtp_key(t.key)
+            else normalize_mtp_key(t.key)
+        )
+        for t in tensors
+    }
     expected_keys, expected_count, sidecar_format = _mtp_expected_key_set(
         config or {},
         keys=tuple(key_set),

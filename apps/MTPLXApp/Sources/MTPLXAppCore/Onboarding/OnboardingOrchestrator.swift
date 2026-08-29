@@ -37,6 +37,9 @@ public final class OnboardingOrchestrator: ObservableObject {
     /// completion handler carries a valid value into the saved app
     /// configuration.
     @Published public var hfMirrorEndpoint: String = ""
+    /// Optional first-run model storage root. Empty means the standard
+    /// `~/.mtplx/models` location.
+    @Published public var modelDirectory: String = ""
 
     public init(
         hardwareInspector: HardwareInspector = HardwareInspector(),
@@ -118,6 +121,34 @@ public final class OnboardingOrchestrator: ObservableObject {
         tuneResult = nil
         tuneFailure = nil
         tuneCandidatesLanded = [:]
+    }
+
+    public func restoreDownloadPreferences(
+        modelDirectory: String?,
+        hfMirrorEndpoint: String?
+    ) {
+        if self.modelDirectory.isEmpty,
+           let directory = MTPLXAppConfiguration.normalizedModelDirectory(modelDirectory) {
+            self.modelDirectory = directory
+        }
+        if self.hfMirrorEndpoint.isEmpty, let hfMirrorEndpoint {
+            self.hfMirrorEndpoint = hfMirrorEndpoint
+        }
+    }
+
+    public func setModelDirectory(_ directory: String?) {
+        modelDirectory = MTPLXAppConfiguration.normalizedModelDirectory(directory) ?? ""
+        downloadProgress = nil
+        downloadFailure = nil
+    }
+
+    public var effectiveModelDirectory: String {
+        if let selected = MTPLXAppConfiguration.normalizedModelDirectory(modelDirectory) {
+            return selected
+        }
+        return ModelDownloader.defaultCacheRoot(
+            env: ProcessInfo.processInfo.environment
+        ).path
     }
 
     public func acknowledgeOtherWarning() {
@@ -223,7 +254,11 @@ public final class OnboardingOrchestrator: ObservableObject {
     /// method around so onboarding callsites don't have to be
     /// rewritten and the single source of truth is the option type.
     public func isModelInstalled(_ model: MTPLXModelOption) -> Bool {
-        model.isInstalled
+        installedModelPath(for: model) != nil
+    }
+
+    public func installedModelPath(for model: MTPLXModelOption) -> String? {
+        model.installedLocalPath(modelDirectory: modelDirectory)
     }
 
     // MARK: - Feasibility (read-only convenience)
@@ -232,7 +267,9 @@ public final class OnboardingOrchestrator: ObservableObject {
         let hw = state.hardware
         let chipTier = hw?.tier ?? .unknown
         let ramGiB = hw?.unifiedMemoryGiB ?? 0
-        let diskFreeGiB = model.isInstalled ? Double.greatestFiniteMagnitude : freeDiskGiB()
+        let diskFreeGiB = isModelInstalled(model)
+            ? Double.greatestFiniteMagnitude
+            : freeDiskGiB()
         return feasibility.evaluate(
             model: model,
             chipTier: chipTier,
@@ -246,9 +283,11 @@ public final class OnboardingOrchestrator: ObservableObject {
     }
 
     public func freeDiskGiB() -> Double {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let values = try? home.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-        let bytes = values?.volumeAvailableCapacityForImportantUsage ?? 0
+        let location = URL(
+            fileURLWithPath: effectiveModelDirectory,
+            isDirectory: true
+        )
+        let bytes = ModelDownloader.availableCapacityBytes(at: location)
         return Double(bytes) / 1_073_741_824.0
     }
 
@@ -354,7 +393,10 @@ public final class OnboardingOrchestrator: ObservableObject {
         downloadProgress = nil
         isDownloading = true
         let downloader = modelDownloader
-        let extraEnvironment = MTPLXAppConfiguration.hfMirrorEnvironment(hfMirrorEndpoint) ?? [:]
+        let extraEnvironment = MTPLXAppConfiguration.downloadEnvironment(
+            modelDirectory: modelDirectory,
+            hfEndpoint: hfMirrorEndpoint
+        )
         downloadTask?.cancel()
         downloadTask = Task.detached(priority: .userInitiated) { [weak self, downloader, repo, totalBytes, extraEnvironment] in
             for await event in downloader.stream(
@@ -610,7 +652,13 @@ public final class OnboardingOrchestrator: ObservableObject {
     }
 
     private func resolvedTuneModelPath() -> String? {
-        if let local = state.resolvedModel?.installedLocalPath {
+        if let completed = downloadProgress,
+           completed.isComplete,
+           MTPLXModelOption.hasCompleteInstall(at: completed.destinationPath) {
+            return completed.destinationPath
+        }
+        if let model = state.resolvedModel,
+           let local = installedModelPath(for: model) {
             return local
         }
         // The tune subprocess can also resolve an HF id directly via

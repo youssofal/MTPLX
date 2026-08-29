@@ -65,13 +65,22 @@ def _num_mtp_layers(config: dict[str, Any]) -> int:
     return int(
         config.get("num_nextn_predict_layers")
         or tcfg.get("num_nextn_predict_layers")
+        or tcfg.get("mtp_num_hidden_layers")
+        or config.get("mtp_num_hidden_layers")
         or 0
     )
 
 
 def is_qwen3_5_mtp_config(config: dict[str, Any]) -> bool:
     """True for Qwen3.5-MoE configs that declare an appended MTP predictor."""
-    return _model_type(config) in QWEN3_5_MTP_MODEL_TYPES and _num_mtp_layers(config) > 0
+    model_type = _model_type(config)
+    if model_type in QWEN3_5_MTP_MODEL_TYPES:
+        return _num_mtp_layers(config) > 0
+    # Qwen3.8 target + external-head bundles keep the ordinary qwen3_5 trunk
+    # model_type and declare the predictor under text_config. The actual
+    # sidecar presence is checked by the injection path, so an AR-only export
+    # with stale metadata still degrades cleanly instead of being misloaded.
+    return model_type == "qwen3_5" and _num_mtp_layers(config) > 0
 
 
 def install_qwen3_5_mtp_trunk_shim() -> None:
@@ -153,6 +162,11 @@ def _load_mtp_weights(paths: list[Path]) -> dict[str, Any]:
             continue
         for key, value in mx.load(str(path)).items():
             local = _strip_mtp_prefix(key)
+            if local is None and path.parent.name.lower() == "mtp":
+                # Separate Qwen3.8 draft checkpoints store the head module by
+                # itself, so its keys are already local (fc.*, layers.*, ...)
+                # instead of namespaced under mtp.*.
+                local = str(key)
             if local is not None:
                 mapped[local] = value
     return mapped
@@ -242,7 +256,8 @@ def inject_qwen3_5_mtp_support(
     tcfg = text_config(config)
     args = TextModelArgs.from_dict(tcfg)
 
-    weights = _load_mtp_weights(_candidate_weight_files(model_path, config))
+    weight_paths = _candidate_weight_files(model_path, config)
+    weights = _load_mtp_weights(weight_paths)
     if not weights:
         logger.warning("[Qwen3.5 MTP inject] no mtp.* weights found in %s", model_path)
         return False
@@ -261,7 +276,19 @@ def inject_qwen3_5_mtp_support(
     text_model = _text_model(model)
 
     mtp = _make_qwen3_5_mtp_module(args)
-    _quantize_like_trunk(mtp, config, contract)
+    head_config = config
+    for weight_path in weight_paths:
+        if weight_path.parent.name.lower() != "mtp":
+            continue
+        sidecar_config = weight_path.parent / "config.json"
+        try:
+            head_config = json.loads(sidecar_config.read_text(encoding="utf-8"))
+        except Exception:
+            head_config = config
+        break
+    # A shared external head can remain BF16 while the target is 2/4/6/8-bit.
+    # Quantize from the head's own config, not from the target checkpoint.
+    _quantize_like_trunk(mtp, head_config, contract)
     _validate_load_coverage(mtp, weights)
     mtp.load_weights(list(weights.items()), strict=True)
     mx.eval(mtp.parameters())
@@ -319,19 +346,30 @@ def inject_qwen3_5_mtp_support(
             mtp_hidden_variant: str = "pre_norm",
             position_offset: int | None = None,
             mtp_depth: int | None = None,
+            input_embeddings=None,
         ):
             layer_cache = mtp_cache if mtp_cache is not None else cache
             if isinstance(layer_cache, list):
                 layer_cache = layer_cache[0] if layer_cache else None
-            e = self.mtp.pre_fc_norm_embedding(self.model.embed_tokens(next_token_ids))
+            embeddings = (
+                input_embeddings
+                if input_embeddings is not None
+                else self.model.embed_tokens(next_token_ids)
+            )
+            e = self.mtp.pre_fc_norm_embedding(embeddings)
             h = self.mtp.pre_fc_norm_hidden(hidden_states)
             # vLLM/DeepSeek reference concat order is [embedding, hidden].
             mixed = self.mtp.fc(mx.concatenate([e, h], axis=-1))
             mask = create_attention_mask(mixed, layer_cache)
-            hidden = self.mtp.layers[0](mixed, mask=mask, cache=layer_cache)
-            logits = self._lm_logits(self.mtp.norm(hidden))
+            pre_norm = self.mtp.layers[0](mixed, mask=mask, cache=layer_cache)
+            post_norm = self.mtp.norm(pre_norm)
+            logits = self._lm_logits(post_norm)
             if not return_hidden:
                 return logits
+            variant = mtp_hidden_variant or getattr(
+                self, "_mtplx_hidden_variant", "pre_norm"
+            )
+            hidden = pre_norm if variant == "pre_norm" else post_norm
             return logits, hidden
 
         def mtp_update_cache(
@@ -340,8 +378,10 @@ def inject_qwen3_5_mtp_support(
             next_token_ids,
             mtp_cache=None,
             concat_order=None,
+            mtp_hidden_variant: str | None = None,
             position_offset: int | None = None,
             mtp_depth: int | None = None,
+            input_embeddings=None,
         ):
             _logits, hidden = self.mtp_forward(
                 hidden_states,
@@ -349,7 +389,11 @@ def inject_qwen3_5_mtp_support(
                 mtp_cache=mtp_cache,
                 concat_order=concat_order,
                 return_hidden=True,
+                mtp_hidden_variant=mtp_hidden_variant
+                or getattr(self, "_mtplx_hidden_variant", "pre_norm"),
+                position_offset=position_offset,
                 mtp_depth=mtp_depth,
+                input_embeddings=input_embeddings,
             )
             return hidden
 

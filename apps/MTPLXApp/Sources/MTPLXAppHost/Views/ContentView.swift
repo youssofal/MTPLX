@@ -1,4 +1,5 @@
 import Combine
+import AppKit
 import SwiftUI
 import MTPLXAppCore
 
@@ -448,7 +449,11 @@ struct ModelDownloadSheet: View {
     private var details: some View {
         VStack(alignment: .leading, spacing: 10) {
             detailRow(label: "Model", value: pendingTune?.repoID ?? request?.repoID ?? "Unknown")
-            detailRow(label: "Destination", value: pendingTune?.installedPath ?? progress?.destinationPath ?? request?.destinationPath ?? "")
+            if let pendingTune {
+                detailRow(label: "Destination", value: pendingTune.installedPath)
+            } else {
+                downloadDestinationRow
+            }
             if let total = progress?.totalBytes ?? request?.totalBytes {
                 detailRow(label: "Size", value: formatBytesShort(total))
             }
@@ -466,6 +471,55 @@ struct ModelDownloadSheet: View {
                         .stroke(Brand.separator, lineWidth: 0.5)
                 )
         )
+    }
+
+    private var downloadDestinationRow: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Text("DESTINATION")
+                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                .foregroundStyle(Brand.typeTertiary)
+                .frame(width: 92, alignment: .leading)
+            Text(progress?.destinationPath ?? request?.destinationPath ?? "—")
+                .font(.system(size: 11.5, design: .monospaced))
+                .foregroundStyle(Brand.typeSecondary)
+                .lineLimit(2)
+                .truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if backend.configuration.modelDirectory != nil {
+                Button("Default") {
+                    backend.setPendingModelDownloadDirectory(nil)
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+                .disabled(backend.isModelDownloading)
+            }
+            Button("Change…") {
+                chooseModelDirectory()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(backend.isModelDownloading)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func chooseModelDirectory() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Use Folder"
+        panel.message = "Choose where MTPLX should download this model and future model packs."
+        if let destination = request?.destinationPath {
+            let currentRoot = URL(fileURLWithPath: destination).deletingLastPathComponent()
+            if FileManager.default.fileExists(atPath: currentRoot.path) {
+                panel.directoryURL = currentRoot
+            }
+        }
+        if panel.runModal() == .OK, let url = panel.url {
+            backend.setPendingModelDownloadDirectory(url.path)
+        }
     }
 
     private var progressBlock: some View {

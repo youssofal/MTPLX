@@ -18,6 +18,8 @@ struct SettingsTab: View {
     @State private var lastSaveError: String? = nil
     @State private var pendingClearAll = false
     @State private var clearingCache = false
+    @State private var installedModelPaths: [String] = []
+    @State private var showManualModelEntry = false
 
     @EnvironmentObject private var router: AppRouter
 
@@ -26,6 +28,7 @@ struct SettingsTab: View {
             VStack(alignment: .leading, spacing: 16) {
                 appearanceCard
                 performanceCard
+                modelStorageCard
                 ramCacheCard
                 kvQuantCard
                 ssdCacheCard
@@ -47,10 +50,14 @@ struct SettingsTab: View {
         }
         .onAppear {
             syncDrafts()
+            refreshInstalledModels()
             Task { await hermes.prepare(configuration: backend.configuration) }
         }
         .onChange(of: backend.configuration) { _, newConfiguration in
             syncDraftsIfUnedited(newConfiguration)
+        }
+        .onChange(of: draftConfig.modelDirectory) { _, _ in
+            refreshInstalledModels()
         }
         .confirmationDialog(
             "Clear all SessionBank entries?",
@@ -81,6 +88,122 @@ struct SettingsTab: View {
             draftConfig = newConfiguration
             lastSyncedConfig = newConfiguration
         }
+    }
+
+    private func refreshInstalledModels() {
+        installedModelPaths = MTPLXModelOption.installedModelPaths(
+            in: draftConfig.modelDirectory
+        )
+    }
+
+    // MARK: - Model storage
+
+    @ViewBuilder
+    private var modelStorageCard: some View {
+        let selected = MTPLXAppConfiguration.normalizedModelDirectory(
+            draftConfig.modelDirectory
+        )
+        let effective = selected
+            ?? ModelDownloader.defaultCacheRoot(env: ProcessInfo.processInfo.environment).path
+        let dirty = selected != MTPLXAppConfiguration.normalizedModelDirectory(
+            backend.configuration.modelDirectory
+        )
+        Card(
+            "Model Storage",
+            subtitle: "Choose where future LLM downloads are stored. Existing model folders are not moved."
+        ) {
+            HStack(spacing: 8) {
+                if dirty {
+                    PillBadge(
+                        text: "unsaved",
+                        systemImage: "circle.fill",
+                        tint: .mtplxWarning,
+                        emphasized: true
+                    )
+                    Button {
+                        saveAndMaybeRestart(restart: daemonRunning)
+                    } label: {
+                        if isApplying {
+                            ProgressView().controlSize(.mini)
+                        } else {
+                            Label(
+                                daemonRunning ? "Apply + Restart" : "Save",
+                                systemImage: daemonRunning ? "arrow.clockwise" : "checkmark.circle"
+                            )
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(isApplying)
+                }
+            }
+        } content: {
+            VStack(alignment: .leading, spacing: 8) {
+                FormRow(
+                    label: "Download folder",
+                    caption: "The model server and update checker use this folder too."
+                ) {
+                    HStack(spacing: 8) {
+                        Text(effective)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(Brand.typeBody)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Button {
+                            chooseModelStorageDirectory(current: effective)
+                        } label: {
+                            Label("Choose…", systemImage: "folder")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        if selected != nil {
+                            Button("Default") {
+                                draftConfig.modelDirectory = nil
+                            }
+                            .buttonStyle(.borderless)
+                            .controlSize(.small)
+                        }
+                    }
+                }
+
+                Divider().overlay(Brand.separator)
+
+                HStack(spacing: 8) {
+                    Text("Default: ~/.mtplx/models")
+                        .font(.caption2)
+                        .foregroundStyle(Brand.typeTertiary)
+                    Spacer()
+                    if FileManager.default.fileExists(atPath: effective) {
+                        Button("Reveal in Finder") {
+                            NSWorkspace.shared.open(
+                                URL(fileURLWithPath: effective, isDirectory: true)
+                            )
+                        }
+                        .buttonStyle(.borderless)
+                        .controlSize(.small)
+                    }
+                }
+            }
+        }
+    }
+
+    private func chooseModelStorageDirectory(current: String) {
+        #if canImport(AppKit)
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Use Folder"
+        panel.message = "Choose where MTPLX should download and update model packs."
+        if FileManager.default.fileExists(atPath: current) {
+            panel.directoryURL = URL(fileURLWithPath: current, isDirectory: true)
+        }
+        if panel.runModal() == .OK, let url = panel.url {
+            draftConfig.modelDirectory = url.path
+        }
+        #endif
     }
 
     // MARK: - Appearance
@@ -991,10 +1114,61 @@ struct SettingsTab: View {
             // row now uses `FormRow` / `FormToggleRow` so the label
             // column is the same 200pt across every card in the tab.
             VStack(alignment: .leading, spacing: 4) {
-                FormRow(label: "Model") {
-                    TextField("", text: $draftConfig.model)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(.callout, design: .monospaced))
+                FormRow(
+                    label: "Model",
+                    caption: installedModelPaths.isEmpty
+                        ? "No complete models found in the selected Model Storage folder."
+                        : "Choose a complete model from Model Storage. Save to make it active."
+                ) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            Picker("Installed model", selection: installedModelSelection) {
+                                if !installedModelPaths.contains(draftConfig.model) {
+                                    Text("Current · \(modelPickerLabel(for: draftConfig.model))")
+                                        .tag(draftConfig.model)
+                                    if !installedModelPaths.isEmpty {
+                                        Divider()
+                                    }
+                                }
+                                ForEach(installedModelPaths, id: \.self) { path in
+                                    Text(modelPickerLabel(for: path))
+                                        .tag(path)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            .labelsHidden()
+                            .frame(maxWidth: .infinity, alignment: .leading)
+
+                            Button {
+                                refreshInstalledModels()
+                            } label: {
+                                Image(systemName: "arrow.clockwise")
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .help("Refresh installed models")
+
+                            Button {
+                                showManualModelEntry.toggle()
+                            } label: {
+                                Label("Custom…", systemImage: "pencil")
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+
+                        if showManualModelEntry {
+                            TextField("Hugging Face ID or local model path", text: $draftConfig.model)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(.callout, design: .monospaced))
+                        }
+
+                        if !installedModelPaths.isEmpty {
+                            Text("\(installedModelPaths.count) complete model\(installedModelPaths.count == 1 ? "" : "s") found")
+                                .font(.caption2)
+                                .foregroundStyle(Brand.typeTertiary)
+                        }
+                    }
                 }
 
                 FormRow(
@@ -1371,6 +1545,47 @@ struct SettingsTab: View {
         MTPLXModelOption.maxContextWindow(forFamily: settingsModelFamily)
     }
 
+    private var installedModelSelection: Binding<String> {
+        Binding(
+            get: { draftConfig.model },
+            set: { reference in
+                draftConfig.model = reference
+                if MTPLXModelOption.supportsMTP(at: reference) {
+                    draftConfig.generationMode = "mtp"
+                    draftConfig.loadMTP = true
+                } else if MTPLXModelOption.hasCompleteLocalModel(at: reference) {
+                    draftConfig.generationMode = "ar"
+                    draftConfig.loadMTP = false
+                }
+            }
+        )
+    }
+
+    private func modelPickerLabel(for reference: String) -> String {
+        let trimmed = reference.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "Select a model" }
+        let isLocal = trimmed.hasPrefix("/") || trimmed.hasPrefix("~")
+        let baseLabel: String
+        if let option = MTPLXModelOption.option(matching: reference) {
+            baseLabel = option.displayName
+        } else if isLocal {
+            let url = URL(fileURLWithPath: (trimmed as NSString).expandingTildeInPath)
+            let leaf = url.lastPathComponent.replacingOccurrences(of: "--", with: "/")
+            if ["2-bit", "4-bit", "6-bit", "8-bit"].contains(leaf.lowercased()) {
+                baseLabel = "\(url.deletingLastPathComponent().lastPathComponent) / \(leaf)"
+            } else {
+                baseLabel = leaf
+            }
+        } else {
+            baseLabel = trimmed
+        }
+        guard isLocal, MTPLXModelOption.hasCompleteLocalModel(at: reference) else {
+            return baseLabel
+        }
+        let mode = MTPLXModelOption.supportsMTP(at: reference) ? "MTP" : "Baseline"
+        return "\(baseLabel) · \(mode)"
+    }
+
     private var compatibleDraftContextWindow: Int? {
         guard let value = draftConfig.contextWindow, value > 0 else { return nil }
         if let family = draftConfig.contextWindowModelFamily {
@@ -1404,6 +1619,9 @@ struct SettingsTab: View {
 
     private func normalizedConfigurationForSave(_ source: MTPLXAppConfiguration) -> MTPLXAppConfiguration {
         var config = source
+        config.modelDirectory = MTPLXAppConfiguration.normalizedModelDirectory(
+            source.modelDirectory
+        )
         let family = MTPLXModelOption.modelFamily(for: source.model)
         if let value = compatibleContextWindow(in: source, family: family) {
             config.contextWindow = Self.clampContextWindow(
