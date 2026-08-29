@@ -126,9 +126,34 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
     /// the app should attempt the selected complete model and surface
     /// the real startup result.
     public var installedLocalPath: String? {
+        installedLocalPath(modelDirectory: nil)
+    }
+
+    /// Resolve an installed copy from a user-selected model root before the
+    /// catalog's legacy/default candidates. This keeps custom storage fully
+    /// visible to the picker while preserving every existing path fallback.
+    public func installedLocalPath(modelDirectory: String?) -> String? {
         guard Self.localModelScanEnabled else { return nil }
-        for candidate in localCandidates {
+        var candidates: [String] = []
+        let configuredRoot = MTPLXAppConfiguration.normalizedModelDirectory(modelDirectory)
+            ?? MTPLXAppConfiguration.normalizedModelDirectory(
+                ProcessInfo.processInfo.environment["MTPLX_MODEL_DIR"]
+            )
+        if let root = configuredRoot {
+            let safeName = hfModelID
+                .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                .replacingOccurrences(of: "/", with: "--")
+            candidates.append(
+                URL(fileURLWithPath: root, isDirectory: true)
+                    .appendingPathComponent(safeName, isDirectory: true)
+                    .path
+            )
+        }
+        candidates.append(contentsOf: localCandidates)
+        var seen = Set<String>()
+        for candidate in candidates {
             let expanded = Self.expand(candidate)
+            guard seen.insert(expanded).inserted else { continue }
             guard FileManager.default.fileExists(atPath: expanded) else { continue }
             if Self.hasCompleteInstall(at: expanded) {
                 return expanded
@@ -139,6 +164,61 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
 
     public var isInstalled: Bool {
         installedLocalPath != nil
+    }
+
+    public func isInstalled(modelDirectory: String?) -> Bool {
+        installedLocalPath(modelDirectory: modelDirectory) != nil
+    }
+
+    /// Lists complete MTPLX and baseline MLX models below the selected root.
+    /// Supports MTPLX's flat `owner--model`, Hugging Face's `owner/model`, and
+    /// collection variants such as `owner/model/4-bit` without walking an
+    /// unbounded external drive tree.
+    public static func installedModelPaths(in modelDirectory: String?) -> [String] {
+        guard localModelScanEnabled else { return [] }
+        let selectedRoot = MTPLXAppConfiguration.normalizedModelDirectory(modelDirectory)
+            ?? MTPLXAppConfiguration.normalizedModelDirectory(
+                ProcessInfo.processInfo.environment["MTPLX_MODEL_DIR"]
+            )
+        let root = selectedRoot.map { URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+                .appendingPathComponent(".mtplx", isDirectory: true)
+                .appendingPathComponent("models", isDirectory: true)
+        let technicalSubdirectories: Set<String> = ["assistant", "mtp", "target"]
+        var queue: [(url: URL, depth: Int)] = [(root, 0)]
+        var cursor = 0
+        var found: [String] = []
+        var seen = Set<String>()
+
+        while cursor < queue.count {
+            let candidate = queue[cursor]
+            cursor += 1
+            let path = candidate.url.standardizedFileURL.path
+            guard seen.insert(path).inserted else { continue }
+            if hasCompleteLocalModel(at: path) {
+                found.append(path)
+            }
+            guard candidate.depth < 3,
+                  let children = try? FileManager.default.contentsOfDirectory(
+                    at: candidate.url,
+                    includingPropertiesForKeys: [.isDirectoryKey],
+                    options: [.skipsHiddenFiles]
+                  ) else {
+                continue
+            }
+            for child in children {
+                let values = try? child.resourceValues(forKeys: [.isDirectoryKey])
+                guard values?.isDirectory == true,
+                      !technicalSubdirectories.contains(child.lastPathComponent.lowercased()) else {
+                    continue
+                }
+                queue.append((child, candidate.depth + 1))
+            }
+        }
+
+        return found.sorted {
+            $0.localizedStandardCompare($1) == .orderedAscending
+        }
     }
 
     public var modelFamily: String {
@@ -212,6 +292,48 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         }
 
         return Self.hasCompleteWeightSet(at: url)
+    }
+
+    /// True for any complete local model the engine can load. Unlike
+    /// `hasCompleteInstall`, this also accepts ordinary baseline MLX models
+    /// that have no MTPLX runtime metadata or MTP sidecar.
+    public static func hasCompleteLocalModel(at directory: String) -> Bool {
+        let url = URL(fileURLWithPath: directory)
+        if FileManager.default.fileExists(
+            atPath: url.appendingPathComponent("mtplx_pair.json").path
+        ) {
+            return hasCompleteInstall(at: directory)
+        }
+        return hasCompleteModelDirectory(at: url)
+    }
+
+    /// Whether a complete local target has an MTP head MTPLX can load. In
+    /// addition to native MTPLX packs, support Qwen distributions that keep a
+    /// shared head at target/mtp or beside quant variants at ../mtp.
+    public static func supportsMTP(at directory: String) -> Bool {
+        if hasCompleteInstall(at: directory) { return true }
+        guard hasCompleteLocalModel(at: directory) else { return false }
+        let target = URL(fileURLWithPath: directory, isDirectory: true)
+        guard configDeclaresMTP(at: target) else { return false }
+        let headCandidates = [
+            target.appendingPathComponent("mtp", isDirectory: true),
+            target.deletingLastPathComponent().appendingPathComponent("mtp", isDirectory: true),
+        ]
+        return headCandidates.contains(where: hasCompleteModelDirectory(at:))
+    }
+
+    private static func configDeclaresMTP(at directory: URL) -> Bool {
+        let configURL = directory.appendingPathComponent("config.json")
+        guard let data = try? Data(contentsOf: configURL),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return false
+        }
+        let text = json["text_config"] as? [String: Any] ?? json
+        for key in ["mtp_num_hidden_layers", "num_nextn_predict_layers"] {
+            if let value = text[key] as? NSNumber, value.intValue > 0 { return true }
+            if let value = text[key] as? String, (Int(value) ?? 0) > 0 { return true }
+        }
+        return false
     }
 
     private static func hasMTPSidecar(at url: URL) -> Bool {

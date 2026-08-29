@@ -45,6 +45,11 @@ public struct TunedControlRecord: Codable, Equatable, Sendable {
 public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
     public var executablePath: String?
     public var model: String
+    /// Root folder used for downloaded model packs. `nil` keeps the
+    /// portable default (`~/.mtplx/models`). The app passes this to every
+    /// pull/update/serve subprocess as `MTPLX_MODEL_DIR`, matching the CLI's
+    /// existing cache-directory contract.
+    public var modelDirectory: String?
     public var profile: String
     public var host: String
     public var port: Int
@@ -194,6 +199,7 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
     public init(
         executablePath: String? = nil,
         model: String = MTPLXAppConfiguration.defaultLocalModelPath(),
+        modelDirectory: String? = nil,
         profile: String = "auto",
         host: String = "127.0.0.1",
         port: Int = 8000,
@@ -258,6 +264,7 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
     ) {
         self.executablePath = executablePath
         self.model = model
+        self.modelDirectory = Self.normalizedModelDirectory(modelDirectory)
         self.profile = profile
         self.host = host
         self.port = port
@@ -354,6 +361,36 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
             return defaultHermesWorkspacePath()
         }
         return (trimmed as NSString).expandingTildeInPath
+    }
+
+    /// Expand a user-selected model folder into the absolute path handed to
+    /// subprocesses. Blank values deliberately mean "use the default".
+    public static func normalizedModelDirectory(_ raw: String?) -> String? {
+        let trimmed = (raw ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return (trimmed as NSString).expandingTildeInPath
+    }
+
+    /// Environment additions shared by model pulls, update checks, and the
+    /// daemon (which may resolve an HF repo id from the local model cache).
+    public static func modelDirectoryEnvironment(_ raw: String?) -> [String: String] {
+        guard let directory = normalizedModelDirectory(raw) else { return [:] }
+        return ["MTPLX_MODEL_DIR": directory]
+    }
+
+    /// Complete download environment for app-owned subprocesses. Keeping the
+    /// cache and mirror knobs together prevents one download surface from
+    /// silently ignoring the selected model folder.
+    public static func downloadEnvironment(
+        modelDirectory: String?,
+        hfEndpoint: String?
+    ) -> [String: String] {
+        var environment = modelDirectoryEnvironment(modelDirectory)
+        if let mirror = hfMirrorEnvironment(hfEndpoint) {
+            environment.merge(mirror) { _, new in new }
+        }
+        return environment
     }
 
     public mutating func rememberCustomModel(repoID: String) {
@@ -455,6 +492,7 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
     enum CodingKeys: String, CodingKey {
         case executablePath = "executable_path"
         case model
+        case modelDirectory = "model_dir"
         case profile
         case host
         case port
@@ -523,6 +561,9 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         executablePath = try container.decodeIfPresent(String.self, forKey: .executablePath)
         model = try container.decodeIfPresent(String.self, forKey: .model) ?? defaults.model
+        modelDirectory = Self.normalizedModelDirectory(
+            try container.decodeIfPresent(String.self, forKey: .modelDirectory)
+        )
         profile = try container.decodeIfPresent(String.self, forKey: .profile) ?? defaults.profile
         host = try container.decodeIfPresent(String.self, forKey: .host) ?? defaults.host
         port = try container.decodeIfPresent(Int.self, forKey: .port) ?? defaults.port
@@ -680,6 +721,7 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
     /// ("auto", "sustained-max"). "sustained-max" meant sustained plus
     /// pinned fans, so the fan intent survives the profile rewrite.
     public mutating func sanitizeLaunchCriticalFields() {
+        modelDirectory = Self.normalizedModelDirectory(modelDirectory)
         let profileValue = profile.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if profileValue == "sustained-max" || profileValue == "sustained_max" {
             fanMode = MTPLXFanMode.max.rawValue

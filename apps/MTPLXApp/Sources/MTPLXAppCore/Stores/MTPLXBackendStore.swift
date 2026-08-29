@@ -290,6 +290,20 @@ public final class MTPLXBackendStore: ObservableObject {
     private let hermesIntegration: HermesIntegration
     private let modelDownloader: ModelDownloader
     private let autoTuner: AutoTuner
+
+    private var modelDownloadEnvironment: [String: String] {
+        MTPLXAppConfiguration.downloadEnvironment(
+            modelDirectory: configuration.modelDirectory,
+            hfEndpoint: configuration.hfEndpoint
+        )
+    }
+
+    private func cachedModelPath(for repoID: String) -> URL {
+        modelDownloader.cachedModelPath(
+            for: repoID,
+            modelDirectory: configuration.modelDirectory
+        )
+    }
     private let runtimeUpdateService: MTPLXRuntimeUpdateService
     private let localFanRestorer: @Sendable () async -> Bool
     private let fanModeSetter: @Sendable (MTPLXAPIClient, String, Bool, Double?) async throws -> FanModeResponse
@@ -1200,7 +1214,9 @@ public final class MTPLXBackendStore: ObservableObject {
             if let modelUpdateChecker {
                 rows = try await modelUpdateChecker()
             } else {
-                rows = try await modelDownloader.checkModelUpdates()
+                rows = try await modelDownloader.checkModelUpdates(
+                    extraEnvironment: modelDownloadEnvironment
+                )
             }
             modelUpdates = rows
         } catch {
@@ -1226,15 +1242,17 @@ public final class MTPLXBackendStore: ObservableObject {
             Self.directorySizeForUpdateProgress(URL(fileURLWithPath: $0))
         }
         modelPackUpdateTask = Task { @MainActor [weak self] in
+            guard let self else { return }
             let stream = downloader.stream(
                 repo: update.repoID,
                 totalBytes: nil,
+                extraEnvironment: self.modelDownloadEnvironment,
                 update: true,
                 sizeProbePath: update.path
             )
             var completed = false
             for await event in stream {
-                guard let self, self.modelPackUpdatingRepoID == update.repoID else { return }
+                guard self.modelPackUpdatingRepoID == update.repoID else { return }
                 switch event {
                 case .started, .status:
                     break
@@ -1259,7 +1277,6 @@ public final class MTPLXBackendStore: ObservableObject {
                     self.modelPackUpdateStatus = nil
                 }
             }
-            guard let self else { return }
             self.modelPackUpdatingRepoID = nil
             if completed {
                 self.modelPackUpdateStatus = nil
@@ -1372,7 +1389,10 @@ public final class MTPLXBackendStore: ObservableObject {
             ?? MTPLXModelOption.customHuggingFaceModel(repoID: trimmed)
         let target = defaultLaunchTarget(for: configuration)
         let launchAction: PendingModelDownloadLaunchAction = supervisor.isRunning() ? .restart : .start
-        if let installedPath = option?.installedLocalPath {
+        if let option,
+           let installedPath = option.installedLocalPath(
+               modelDirectory: configuration.modelDirectory
+           ) {
             Task { @MainActor [weak self] in
                 do {
                     try await self?.finishModelInstall(
@@ -1399,11 +1419,36 @@ public final class MTPLXBackendStore: ObservableObject {
             target: target,
             launchAction: launchAction,
             totalBytes: resolvedBytes,
-            destinationPath: modelDownloader.cachedModelPath(for: trimmed).path
+            destinationPath: cachedModelPath(for: trimmed).path
         )
         modelDownloadProgress = nil
         modelDownloadFailure = nil
         clearModelTuneState()
+    }
+
+    /// Changes the cache root for the model currently waiting in the download
+    /// confirmation sheet. Persist the choice before rewriting the pending
+    /// destination so the path shown by the UI and the environment used by
+    /// `ModelDownloader` cannot drift apart.
+    public func setPendingModelDownloadDirectory(_ path: String?) {
+        guard var request = pendingModelDownload,
+              !isModelDownloading,
+              !isModelTuning else { return }
+
+        let normalized = MTPLXAppConfiguration.normalizedModelDirectory(path)
+        var next = configuration
+        next.modelDirectory = normalized
+        do {
+            try saveSettings(next)
+        } catch {
+            modelDownloadFailure = "MTPLX couldn't save the selected model folder. \(error.localizedDescription)"
+            return
+        }
+
+        request.destinationPath = cachedModelPath(for: request.repoID).path
+        pendingModelDownload = request
+        modelDownloadProgress = nil
+        modelDownloadFailure = nil
     }
 
     public func cancelModelDownload() {
@@ -1460,8 +1505,7 @@ public final class MTPLXBackendStore: ObservableObject {
         modelDownloadProgress = nil
         isModelDownloading = true
         let downloader = modelDownloader
-        let extraEnvironment =
-            MTPLXAppConfiguration.hfMirrorEnvironment(configuration.hfEndpoint) ?? [:]
+        let extraEnvironment = modelDownloadEnvironment
         modelDownloadTask = Task.detached(priority: .userInitiated) { [weak self, downloader, request, extraEnvironment] in
             for await event in downloader.stream(
                 repo: request.repoID,
@@ -2448,11 +2492,13 @@ public final class MTPLXBackendStore: ObservableObject {
         }
         let selectedPath = NSString(string: configuration.model).expandingTildeInPath
         if FileManager.default.fileExists(atPath: selectedPath),
-           MTPLXModelOption.hasCompleteInstall(at: selectedPath)
+           MTPLXModelOption.hasCompleteLocalModel(at: selectedPath)
         {
             return false
         }
-        if let installedPath = option.installedLocalPath {
+        if let installedPath = option.installedLocalPath(
+            modelDirectory: configuration.modelDirectory
+        ) {
             var next = configuration
             if next.model != installedPath {
                 next.model = installedPath
@@ -2469,7 +2515,7 @@ public final class MTPLXBackendStore: ObservableObject {
             target: target,
             launchAction: launchAction,
             totalBytes: option.sizeBytes > 0 ? option.sizeBytes : nil,
-            destinationPath: modelDownloader.cachedModelPath(for: option.hfModelID).path
+            destinationPath: cachedModelPath(for: option.hfModelID).path
         )
         modelDownloadProgress = nil
         modelDownloadFailure = nil

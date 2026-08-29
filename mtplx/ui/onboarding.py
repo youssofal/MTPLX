@@ -884,9 +884,12 @@ def _installed_models_for_screen() -> list[Any]:
     """Complete installs from the local cache for the 'On this Mac' group."""
 
     try:
+        from mtplx.app_settings import read_app_settings
         from mtplx.model_catalog import scan_installed_models
 
-        return list(scan_installed_models())[:_MAX_INSTALLED_PICKER_ROWS]
+        app_settings = read_app_settings()
+        cache_dir = app_settings.model_dir if app_settings is not None else None
+        return list(scan_installed_models(cache_dir))[:_MAX_INSTALLED_PICKER_ROWS]
     except Exception:
         return []
 

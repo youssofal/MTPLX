@@ -101,6 +101,9 @@ struct ModelPickerOverlay: View, Equatable {
         .onChange(of: configuration.model) { _, _ in
             preparePickerRows()
         }
+        .onChange(of: configuration.modelDirectory) { _, _ in
+            preparePickerRows()
+        }
         .onChange(of: configuration.customModels) { _, _ in
             preparePickerRows()
         }
@@ -662,6 +665,7 @@ struct ModelPickerOverlay: View, Equatable {
     private var catalogSignature: ModelPickerCatalogSignature {
         ModelPickerCatalogSignature(
             currentModel: configuration.model,
+            modelDirectory: configuration.modelDirectory,
             customModels: configuration.customModels,
             hardware: detectedHardware
         )
@@ -695,6 +699,7 @@ struct ModelPickerOverlay: View, Equatable {
         let signature = catalogSignature
         let customModels = signature.customModels
         let currentModel = signature.currentModel
+        let modelDirectory = signature.modelDirectory
         let hardware = signature.hardware
 
         prepareRowsTask?.cancel()
@@ -706,7 +711,11 @@ struct ModelPickerOverlay: View, Equatable {
                     hardware: hardware
                 )
                 .map { option in
-                    ModelPickerPreparedOption(option: option, currentModel: currentModel)
+                    ModelPickerPreparedOption(
+                        option: option,
+                        currentModel: currentModel,
+                        modelDirectory: modelDirectory
+                    )
                 }
             }.value
 
@@ -746,6 +755,7 @@ struct ModelPickerOverlay: View, Equatable {
 
 private struct ModelPickerCatalogSignature: Equatable, Sendable {
     let currentModel: String
+    let modelDirectory: String?
     let customModels: [MTPLXModelOption]
     let hardware: DetectedHardware?
 }
@@ -759,8 +769,10 @@ private struct ModelPickerPreparedOption: Equatable, Identifiable, Sendable {
     let selected: Bool
     let resolvedReference: String
 
-    init(option: MTPLXModelOption, currentModel: String) {
-        let installedLocalPath = option.installedLocalPath
+    init(option: MTPLXModelOption, currentModel: String, modelDirectory: String?) {
+        let installedLocalPath = option.installedLocalPath(
+            modelDirectory: modelDirectory
+        )
 
         self.option = option
         self.id = option.id

@@ -69,6 +69,36 @@ def test_expected_mtp_file_uses_extra_tensor_metadata(tmp_path):
     assert expected_mtp_file(tmp_path, config) == tmp_path / "extra-mtp.safetensors"
 
 
+def test_sibling_external_mtp_head_with_local_keys_passes_tensor_gate(tmp_path):
+    target = tmp_path / "4-bit"
+    target.mkdir()
+    config = {
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "model_type": "qwen3_5",
+        "text_config": {
+            "model_type": "qwen3_5_text",
+            "mtp_num_hidden_layers": 1,
+        },
+    }
+    (target / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    (tmp_path / "mtp").mkdir()
+    save_file(
+        {
+            key.removeprefix("mtp."): np.ones((1,), dtype=np.float32)
+            for key in EXPECTED_MTP_KEYS
+        },
+        tmp_path / "mtp" / "model.safetensors",
+    )
+
+    result = inspect_mtp_tensors(target, config)
+
+    assert result.mtp_file == str(tmp_path / "mtp" / "model.safetensors")
+    assert result.tensor_count == 15
+    assert result.missing_expected_keys == ()
+    assert result.extra_keys == ()
+    assert result.passes_tensor_gate is True
+
+
 def test_inspect_model_reports_missing_config(tmp_path):
     result = inspect_model(tmp_path)
     assert result.config_exists is False

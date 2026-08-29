@@ -28,7 +28,7 @@ raw backend JSON.
 - `BoundedLogStore` keeps daemon logs bounded.
 
 Restart-required app settings live in `MTPLXAppConfiguration`: executable path,
-model, profile, host, port, generation mode, MTP loading, context window, API
+model, model download directory, profile, host, port, generation mode, MTP loading, context window, API
 key, thermal polling, stream cadence, Performance Lock, and launch behavior.
 `MTPLXBackendStore.applyConfiguration(..., restartIfRunning:)` saves those
 settings and restarts the daemon when the current process is running.

@@ -20,6 +20,8 @@ There is no second draft model eating your RAM, and no greedy shortcut that quie
 
 **The Mac app** is the easiest way in. Download the DMG at [mtplx.com](https://mtplx.com/download), drag it to Applications, and the app takes care of everything else: it checks your hardware, recommends a model that actually fits your memory, downloads it, sets up its own Python engine (no Homebrew needed), installs fan control, puts `mtplx` on your PATH, and then measures your machine to pick the fastest decoding depth.
 
+Model packs default to `~/.mtplx/models`. Choose another folder or external drive in the onboarding model picker, or later under **Settings → Model Storage**. The choice applies to new downloads, model updates, and server-side model resolution; existing model folders are not moved. CLI users can make the same choice with `--cache-dir`, `model_dir` in `~/.mtplx/config.toml`, or `MTPLX_MODEL_DIR`.
+
 **Recommended for coding:** Qwen 3.8 27B Optimized Speed is a 4-bit dynamic
 quant with great coding speeds and good quality. Its two siblings sit right
 under it in the app and CLI: Bare Speed (quickest burst chat speeds, lower

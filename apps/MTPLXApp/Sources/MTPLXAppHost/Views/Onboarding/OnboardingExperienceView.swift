@@ -74,6 +74,12 @@ struct OnboardingExperienceView: View {
             }
             return .ignored
         }
+        .onAppear {
+            orchestrator.restoreDownloadPreferences(
+                modelDirectory: backend.configuration.modelDirectory,
+                hfMirrorEndpoint: backend.configuration.hfEndpoint
+            )
+        }
         .onDisappear { orchestrator.cancelAll() }
     }
 
@@ -108,6 +114,9 @@ struct OnboardingExperienceView: View {
         var config = backend.configuration
         config.onboardingCompletedAt = Date()
         config.lastLaunchTarget = LaunchTarget.chat.rawValue
+        config.modelDirectory = MTPLXAppConfiguration.normalizedModelDirectory(
+            orchestrator.modelDirectory
+        )
         if MTPLXAppConfiguration.hfMirrorEnvironment(orchestrator.hfMirrorEndpoint) != nil {
             config.hfEndpoint = orchestrator.hfMirrorEndpoint
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -138,7 +147,15 @@ struct OnboardingExperienceView: View {
                 )
             }
         }
-        if let model = orchestrator.state.resolvedModel {
+        if let downloaded = orchestrator.downloadProgress,
+           downloaded.isComplete,
+           MTPLXModelOption.hasCompleteInstall(at: downloaded.destinationPath) {
+            config.model = downloaded.destinationPath
+            if let repo = orchestrator.state.resolvedRepoID,
+               orchestrator.state.resolvedModel == nil {
+                config.rememberCustomModel(repoID: repo)
+            }
+        } else if let model = orchestrator.state.resolvedModel {
             // Use the local path ONLY when the install completeness
             // check actually succeeds. `installedLocalPath` returns
             // the first candidate dir that EXISTS — a metadata-only
@@ -148,7 +165,7 @@ struct OnboardingExperienceView: View {
             // back to the HF id so the daemon's `resolve_model_path`
             // surfaces a clear "Model not cached. Run: mtplx pull"
             // error instead of a silent failure to load weights.
-            if orchestrator.isModelInstalled(model), let local = model.installedLocalPath {
+            if let local = orchestrator.installedModelPath(for: model) {
                 config.model = local
             } else {
                 config.model = model.hfModelID

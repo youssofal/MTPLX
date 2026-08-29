@@ -903,6 +903,45 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertNil(plain.environment["HF_TOKEN"])
     }
 
+    func testModelDirectoryPersistsAndBuildsDownloadEnvironment() throws {
+        let root = temporaryDirectory().appendingPathComponent("external-models")
+        let configuration = MTPLXAppConfiguration(modelDirectory: root.path)
+        let data = try JSONEncoder().encode(configuration)
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+
+        XCTAssertEqual(json["model_dir"] as? String, root.path)
+
+        let decoded = try JSONDecoder().decode(MTPLXAppConfiguration.self, from: data)
+        XCTAssertEqual(decoded.modelDirectory, root.path)
+        XCTAssertEqual(
+            MTPLXAppConfiguration.downloadEnvironment(
+                modelDirectory: decoded.modelDirectory,
+                hfEndpoint: "https://hf-mirror.com"
+            )["MTPLX_MODEL_DIR"],
+            root.path
+        )
+    }
+
+    func testServeCommandCarriesConfiguredModelDirectory() throws {
+        let fake = try makeExecutable(named: "mtplx")
+        let root = temporaryDirectory().appendingPathComponent("models")
+        let builder = MTPLXCommandBuilder(environment: [
+            "PATH": fake.deletingLastPathComponent().path,
+            "HOME": temporaryDirectory().path,
+        ])
+        let configuration = MTPLXAppConfiguration(
+            model: "Example/Model",
+            modelDirectory: root.path,
+            profile: "sustained"
+        )
+
+        let command = try builder.buildServeCommand(configuration: configuration)
+
+        XCTAssertEqual(command.environment["MTPLX_MODEL_DIR"], root.path)
+    }
+
     func testOnboardingDownloadFailureCopySuggestsMirrorOnlyForNetworkFailures() {
         let blocked = OnboardingOrchestrator.downloadFailureMessage(
             stderrTail: "ConnectionError: HTTPSConnectionPool(host='huggingface.co', port=443): Max retries exceeded",
@@ -3749,6 +3788,78 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertTrue(MTPLXModelOption.hasCompleteInstall(at: model.path))
     }
 
+    func testModelInstallDetectionFindsConfiguredDownloadRoot() throws {
+        unsetenv("MTPLX_APP_DISABLE_LOCAL_MODEL_SCAN")
+        let root = temporaryDirectory().appendingPathComponent("external-models", isDirectory: true)
+        let model = root.appendingPathComponent("Example--Custom-Model", isDirectory: true)
+        try FileManager.default.createDirectory(at: model, withIntermediateDirectories: true)
+        try "{}".write(to: model.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+        try "{}".write(to: model.appendingPathComponent("tokenizer.json"), atomically: true, encoding: .utf8)
+        try "{}".write(to: model.appendingPathComponent("mtplx_runtime.json"), atomically: true, encoding: .utf8)
+        try Data([0]).write(to: model.appendingPathComponent("mtp.safetensors"))
+        try Data([0]).write(to: model.appendingPathComponent("model.safetensors"))
+        let option = MTPLXModelOption(
+            id: "custom",
+            displayName: "Custom",
+            shortName: "Custom",
+            detail: "QA",
+            hfModelID: "Example/Custom-Model",
+            localCandidates: []
+        )
+
+        XCTAssertEqual(
+            option.installedLocalPath(modelDirectory: root.path),
+            model.path
+        )
+        XCTAssertTrue(option.isInstalled(modelDirectory: root.path))
+    }
+
+    func testInstalledModelPathsScansSelectedRootAndSkipsPartialDownloads() throws {
+        unsetenv("MTPLX_APP_DISABLE_LOCAL_MODEL_SCAN")
+        let root = temporaryDirectory().appendingPathComponent("models", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let completeSource = try makeCompleteModel(named: "complete-source")
+        let complete = root.appendingPathComponent("owner--Complete", isDirectory: true)
+        try FileManager.default.moveItem(at: completeSource, to: complete)
+        let nestedOwner = root.appendingPathComponent("nested-owner", isDirectory: true)
+        try FileManager.default.createDirectory(at: nestedOwner, withIntermediateDirectories: true)
+        let nestedSource = try makeCompleteModel(named: "nested-source")
+        let nestedComplete = nestedOwner.appendingPathComponent("NestedComplete", isDirectory: true)
+        try FileManager.default.moveItem(at: nestedSource, to: nestedComplete)
+        let collection = nestedOwner.appendingPathComponent("Collection", isDirectory: true)
+        let baseline = collection.appendingPathComponent("6-bit", isDirectory: true)
+        try FileManager.default.createDirectory(at: baseline, withIntermediateDirectories: true)
+        let externalMTPConfig = "{\"model_type\":\"qwen3_5\",\"text_config\":{\"mtp_num_hidden_layers\":1}}"
+        try externalMTPConfig.write(to: collection.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+        try "{}".write(to: collection.appendingPathComponent("tokenizer.json"), atomically: true, encoding: .utf8)
+        try Data([0]).write(to: collection.appendingPathComponent("model.safetensors"))
+        try externalMTPConfig.write(to: baseline.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+        try "{}".write(to: baseline.appendingPathComponent("tokenizer.json"), atomically: true, encoding: .utf8)
+        try Data([0]).write(to: baseline.appendingPathComponent("model.safetensors"))
+        let externalHead = collection.appendingPathComponent("mtp", isDirectory: true)
+        try FileManager.default.createDirectory(at: externalHead, withIntermediateDirectories: true)
+        try "{}".write(to: externalHead.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+        try "{}".write(to: externalHead.appendingPathComponent("tokenizer.json"), atomically: true, encoding: .utf8)
+        try Data([0]).write(to: externalHead.appendingPathComponent("model.safetensors"))
+        let partial = root.appendingPathComponent("owner--Partial", isDirectory: true)
+        try FileManager.default.createDirectory(at: partial, withIntermediateDirectories: true)
+        try "{}".write(
+            to: partial.appendingPathComponent("config.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        XCTAssertEqual(
+            Set(MTPLXModelOption.installedModelPaths(in: root.path)),
+            Set([complete.path, nestedComplete.path, collection.path, baseline.path])
+        )
+        XCTAssertTrue(MTPLXModelOption.hasCompleteLocalModel(at: baseline.path))
+        XCTAssertFalse(MTPLXModelOption.hasCompleteInstall(at: baseline.path))
+        XCTAssertTrue(MTPLXModelOption.supportsMTP(at: collection.path))
+        XCTAssertTrue(MTPLXModelOption.supportsMTP(at: baseline.path))
+        XCTAssertEqual(MTPLXModelOption.installedModelPaths(in: baseline.path), [baseline.path])
+    }
+
     func testModelInstallDetectionCanBeDisabledForFreshUserQA() throws {
         unsetenv("MTPLX_APP_DISABLE_LOCAL_MODEL_SCAN")
         let root = temporaryDirectory()
@@ -5356,6 +5467,40 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertNil(pending?.totalBytes)
         XCTAssertEqual(
             pending?.destinationPath,
+            cacheRoot.appendingPathComponent("Example--NewModel", isDirectory: true).path
+        )
+    }
+
+    @MainActor
+    func testPendingModelDownloadDirectoryCanChangeBeforeDownload() async throws {
+        let root = temporaryDirectory()
+        let cacheRoot = root.appendingPathComponent("cache", isDirectory: true)
+        let selectedRoot = root.appendingPathComponent("external-models", isDirectory: true)
+        let settingsStore = MTPLXSettingsStore(
+            settingsURL: root.appendingPathComponent("settings.json")
+        )
+        let backend = MTPLXBackendStore(
+            configuration: MTPLXAppConfiguration(model: "Example/NewModel"),
+            settingsStore: settingsStore,
+            modelDownloader: ModelDownloader(modelCacheRoot: cacheRoot)
+        )
+
+        await backend.startDaemon(target: .chat)
+        backend.setPendingModelDownloadDirectory(selectedRoot.path)
+
+        XCTAssertEqual(backend.configuration.modelDirectory, selectedRoot.path)
+        XCTAssertEqual(try settingsStore.load().modelDirectory, selectedRoot.path)
+        XCTAssertEqual(
+            backend.pendingModelDownload?.destinationPath,
+            selectedRoot.appendingPathComponent("Example--NewModel", isDirectory: true).path
+        )
+
+        backend.setPendingModelDownloadDirectory(nil)
+
+        XCTAssertNil(backend.configuration.modelDirectory)
+        XCTAssertNil(try settingsStore.load().modelDirectory)
+        XCTAssertEqual(
+            backend.pendingModelDownload?.destinationPath,
             cacheRoot.appendingPathComponent("Example--NewModel", isDirectory: true).path
         )
     }
@@ -9628,6 +9773,49 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(
             try String(contentsOf: cacheLog, encoding: .utf8),
             root.appendingPathComponent("Library/Caches/MTPLX/PythonBytecode").path
+        )
+    }
+
+    func testModelDownloaderUsesSelectedDirectoryForPathAndSubprocess() async throws {
+        let root = temporaryDirectory()
+        let selected = root.appendingPathComponent("external-models", isDirectory: true)
+        let envLog = root.appendingPathComponent("model-dir.log")
+        let script = try makeExecutable(
+            named: "mtplx",
+            body: """
+            #!/bin/sh
+            printf '%s' "$MTPLX_MODEL_DIR" > "$MTPLX_FAKE_LOG"
+            printf '{"event":"complete","path":"%s/Example--Quality","size_bytes":100,"total_bytes":100}\n' "$MTPLX_MODEL_DIR"
+            """
+        )
+        let downloader = ModelDownloader(
+            processEnvironment: [
+                "HOME": root.path,
+                "MTPLX_FAKE_LOG": envLog.path,
+            ],
+            executableOverride: script
+        )
+        var completedPath: String?
+
+        for await event in downloader.stream(
+            repo: "Example/Quality",
+            totalBytes: 100,
+            extraEnvironment: ["MTPLX_MODEL_DIR": selected.path]
+        ) {
+            if case .complete(_, let path) = event {
+                completedPath = path
+            }
+        }
+
+        let expected = selected.appendingPathComponent("Example--Quality").path
+        XCTAssertEqual(completedPath, expected)
+        XCTAssertEqual(try String(contentsOf: envLog, encoding: .utf8), selected.path)
+        XCTAssertEqual(
+            downloader.cachedModelPath(
+                for: "Example/Quality",
+                modelDirectory: selected.path
+            ).path,
+            expected
         )
     }
 
