@@ -7226,6 +7226,12 @@ def _request_parallel_tool_calls(request: Any) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
+def _request_prefers_parallel_tool_calls(request: Any) -> bool:
+    """Whether the client explicitly enables sibling calls in one turn."""
+
+    return _request_parallel_tool_calls(request) is True
+
+
 def _single_tool_call_stream_policy(
     *,
     parallel_tool_calls: bool | None,
@@ -18500,6 +18506,7 @@ def _tool_prompt_mode_for_request(
     metadata: Mapping[str, Any],
     tools_active: bool,
     backend: BackendDescriptor | None = None,
+    prefers_parallel_tool_calls: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     launch_mode = _tool_prompt_mode_from_args(args)
     requested_mode = _request_tool_prompt_mode_override(
@@ -18539,6 +18546,12 @@ def _tool_prompt_mode_for_request(
     elif tools_active and client_hint == "opencode":
         mode = _TOOL_PROMPT_MODE_COMPACT
         source = "client:opencode"
+    elif tools_active and client_hint is not None and prefers_parallel_tool_calls:
+        # PI and Hermes normally use the richer hybrid contract for agent
+        # choreography. The declarative sibling-call mode is more reliable
+        # with the tokenizer-native template.
+        mode = _TOOL_PROMPT_MODE_NATIVE
+        source = f"client:{client_hint}:parallel"
     elif tools_active and client_hint is not None:
         mode = _TOOL_PROMPT_MODE_HYBRID
         source = f"client:{client_hint}"
