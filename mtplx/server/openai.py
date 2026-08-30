@@ -387,6 +387,30 @@ SSE_KEEPALIVE_MIN_INTERVAL_S = 1.0
 STREAM_STALL_DEADLINE_S = float(
     os.environ.get("MTPLX_STREAM_STALL_DEADLINE_S") or 300.0
 )
+# Smart-fan counterpart of the stream deadline (#201). The stale-lease
+# reconciler only drops leaked fan leases while the activity probe reports the
+# engine idle, and a WEDGED foreground request used to read as busy forever:
+# on 2026-08-18 twenty leases pinned both fans at max for ~15 h behind a single
+# parked request whose client was already dead. This deadline is what lets the
+# probe call that stall "not busy" so the existing restore path can run. Kept
+# below STREAM_STALL_DEADLINE_S because reporting idle only stops *claiming*
+# the fans — it never cancels a request — so it is safe to be eager here.
+# Total time to fan restore is this plus MTPLX_SMART_FAN_STALE_LEASE_S. 0
+# disables (the probe then keeps the pre-#201 presence-only behaviour).
+FOREGROUND_STALL_DEADLINE_S = float(
+    os.environ.get("MTPLX_FOREGROUND_STALL_DEADLINE_S") or 180.0
+)
+# Generation admission ceiling. Serial mode runs one request at a time by
+# design, so this bounds the WAITING LINE, not parallelism: one executing plus
+# a few queued. Past it the server sheds with 429 + Retry-After rather than
+# accepting work it cannot start (2026-08-18: ten queued completions on one
+# 27B model, no cap, no backpressure). 0 disables the gate.
+MAX_INFLIGHT_GENERATION_REQUESTS = int(
+    os.environ.get("MTPLX_MAX_INFLIGHT_GENERATION_REQUESTS") or 4
+)
+GENERATION_RETRY_AFTER_S = float(
+    os.environ.get("MTPLX_GENERATION_RETRY_AFTER_S") or 5.0
+)
 # Runaway-hidden-generation backstop. Native-tool agent workloads stream
 # multi-thousand-token arguments (whole files) as legitimate hidden text, so
 # the ceilings are env-tunable; the defaults keep the original chat-UX guard.
@@ -2832,6 +2856,12 @@ class ServerState:
         self.args.fan_mode = self.fan_mode
         from mtplx.thermal import SmartFanController
 
+        # Read side of the owner progress heartbeat for the fan activity probe
+        # (#201). Separate instance from the per-stream watchdogs so its
+        # baseline is never stolen by a concurrent stream poll.
+        self._fan_stall_probe = _OwnerStallProbe(
+            deadline_s=FOREGROUND_STALL_DEADLINE_S
+        )
         self.smart_fans = SmartFanController(
             log=lambda line: LOGGER.info("%s", line),
             activity_probe=self._smart_fan_activity_probe,
@@ -2868,8 +2898,21 @@ class ServerState:
         queues and the executing item of either lane (foreground + idle
         postcommit), and a short recency window so back-to-back agent turns
         never look idle between requests.
+
+        A registered foreground request is only busy while the owner thread is
+        actually ADVANCING. A wedged request stays registered forever, and
+        treating presence as progress is what let a single parked request pin
+        both fans at max for ~15 h (2026-08-18). The owner progress heartbeat
+        ticks many times per second under any healthy prefill or decode, so a
+        reading frozen past FOREGROUND_STALL_DEADLINE_S means parked, not slow.
+        Reporting idle here does not cancel anything — it only stops claiming
+        the fans, letting the SmartFanController stale-lease reconciler (#201)
+        run its normal restore.
         """
         if self.has_foreground():
+            stall_probe = getattr(self, "_fan_stall_probe", None)
+            if stall_probe is not None and stall_probe.observe() is not None:
+                return False
             return True
         scheduler = getattr(self, "model_scheduler", None)
         if scheduler is not None and hasattr(scheduler, "any_pending_or_active"):
@@ -2884,8 +2927,21 @@ class ServerState:
 
     def begin_foreground(self) -> None:
         with self.foreground_lock:
+            was_idle = self.foreground_active == 0
             self.foreground_active += 1
             self.last_request_started_at = time.time()
+            # Rearm the fan activity probe on the idle -> active edge only.
+            # The probe is a single long-lived instance that is READ only
+            # while foreground work exists, so after a quiet window its
+            # frozen-since baseline is hours old and the next request would
+            # be classified wedged on its FIRST poll — collapsing the
+            # documented FOREGROUND_STALL_DEADLINE_S + stale-lease budget.
+            # Never rearm for additional concurrent requests: a steady
+            # arrival stream would otherwise hide a genuinely wedged owner.
+            if was_idle:
+                probe = getattr(self, "_fan_stall_probe", None)
+                if probe is not None:
+                    probe.rearm()
 
     def end_foreground(self) -> None:
         with self.foreground_lock:
@@ -2950,6 +3006,48 @@ def _session_bank_cold_tier_from_args(args: argparse.Namespace) -> Any | None:
         max_bytes=max_bytes,
         min_prefix_tokens=min_prefix_tokens,
     )
+
+
+def _owner_settled_eval(*values: Any) -> None:
+    """Settle model-owner work AND prove the owner is alive (#201).
+
+    The AR batch pump drives ``mlx_lm``'s ``BatchGenerator``, whose prefill
+    happens inside the library; the only heartbeat this lane had was
+    ``record_batch_step``, which fires solely when a decode step produced
+    generation responses. A long shared-prefix prefill or a prefill-only pump
+    cycle therefore ticked nothing, and the smart-fan activity probe reads
+    "busy" as "the owner heartbeat is advancing" — so healthy width-8 prefill
+    would have read as a wedge and lost its fan leases. Deliberately used only
+    on the owner thread: ticking from a request thread would forge owner
+    liveness and blind the #86 stream stall watchdog.
+    """
+
+    import mlx.core as mx
+
+    mx.eval(*values)
+    progress_heartbeat.tick()
+
+
+def _owner_settled_pump_step(
+    prompt_responses: Any, generation_responses: Any
+) -> None:
+    """Tick owner progress for ONE ``BatchGenerator`` step, only if it ran.
+
+    The library settles its own step values before returning, so there is
+    nothing left for us to ``mx.eval`` — the heartbeat tick is the whole
+    payload, and that makes an unconditional tick pure fabrication.
+    ``next()`` can hand back two empty lists (a transient library step, or a
+    pump whose ``_active`` map has desynchronised from the generator); ticking
+    there lets the pump spin forever while continuously resetting both the #86
+    stream stall watchdog and the #201 fan activity probe — streams starve,
+    nothing aborts, and the fan leases stay pinned. A prompt response (a
+    settled prefill chunk) or a generation response (a settled decode step) is
+    the only proof a step actually completed.
+    """
+
+    if not prompt_responses and not generation_responses:
+        return
+    progress_heartbeat.tick()
 
 
 class _BatchedARJob:
@@ -3336,11 +3434,11 @@ class _BatchedARGenerationService:
                     cache=cache,
                     return_hidden=False,
                 )
-            mx.eval(logits, [entry.state for entry in cache])
+            _owner_settled_eval(logits, [entry.state for entry in cache])
             prefill_s = time.perf_counter() - prefill_started
             snapshot_started = time.perf_counter()
             snapshot = snapshot_cache(cache)
-            mx.eval(snapshot.states, snapshot.meta_states)
+            _owner_settled_eval(snapshot.states, snapshot.meta_states)
             snapshot_s = time.perf_counter() - snapshot_started
         except Exception as exc:
             for job in candidates:
@@ -3753,7 +3851,6 @@ class _BatchedARGenerationService:
                 job.future.set_exception(exc)
 
     def _pump(self) -> None:
-        import mlx.core as mx
         from mlx_lm.generate import BatchGenerator
 
         config = _scheduler_config_from_args(self.state.args)
@@ -3882,7 +3979,7 @@ class _BatchedARGenerationService:
                             self._active.pop(uid, None)
                         self._commit_finished_row(job, response)
                         self._complete_job(job, finish_reason=str(finish_reason))
-                mx.eval([])
+                _owner_settled_pump_step(prompt_responses, generation_responses)
         except BaseException as exc:
             self._fail_all(exc)
             raise
@@ -17017,6 +17114,14 @@ class _OwnerStallProbe:
         self._last_value = progress()
         self._frozen_since_s = clock()
 
+    def rearm(self, now_s: float | None = None) -> None:
+        """Restart the frozen-since window from the current heartbeat.
+
+        Used when a probe that nobody was reading becomes live again, so an
+        idle gap is not charged against the newly arrived work."""
+        self._last_value = self._progress()
+        self._frozen_since_s = self._clock() if now_s is None else now_s
+
     def observe(self, now_s: float | None = None) -> float | None:
         """Return how long the owner has been frozen once past the deadline."""
         if self._deadline_s <= 0:
@@ -21261,6 +21366,152 @@ _SMART_FAN_ARRIVAL_PATHS = {
     "/v1/completions",
     "/v1/messages",
 }
+
+# Documented physical cohort width of the mtp_batch lane (see
+# ``mtplx/server/mtp_batch.py`` and ``_scheduler_policy_label``). Used only as
+# the fallback when the installed lanes are not yet visible.
+MTP_BATCH_COHORT_WIDTH = 8
+
+
+def _generation_active_capacity(state: Any) -> int:
+    """How many generation requests this server can have ACTIVE at once.
+
+    Serial mode is 1 by construction — the one model-owner thread runs every
+    request to completion — so extra requests queue rather than run. The batch
+    lanes are different: ``ar_batch`` decodes ``decode_batch_max`` rows
+    together, and ``mtp_batch`` seals a fixed-width cohort. A cohort only forms
+    from requests that are simultaneously in flight, so admission must never
+    sit below the width the lane is configured to run.
+    """
+
+    args = getattr(state, "args", None)
+    config = _scheduler_config_from_args(args)
+    if config.mode == SchedulerMode.SERIAL:
+        return 1
+    resolved = config.to_dict()
+    capacity = max(
+        1,
+        int(resolved["max_active_requests"]),
+        int(resolved["decode_batch_max"]),
+    )
+    if config.mode == SchedulerMode.MTP_BATCH:
+        widths = [int(width) for width in (getattr(state, "mtp_batch_lanes", None) or {})]
+        capacity = max(capacity, max(widths) if widths else MTP_BATCH_COHORT_WIDTH)
+    return capacity
+
+
+def _resolve_generation_admission_limit(state: Any) -> int:
+    """Resolve the in-flight generation ceiling for this server.
+
+    An explicitly configured value (CLI flag or
+    ``MTPLX_MAX_INFLIGHT_GENERATION_REQUESTS``) is honoured verbatim, including
+    0 to disable — an operator who asks for a narrow gate gets one.
+
+    Otherwise the default (``MAX_INFLIGHT_GENERATION_REQUESTS``, 4) applies but
+    floors at the scheduler's active capacity. Four is the right WAITING LINE
+    in serial mode (1 executing + 3 queued, R4). Applied unconditionally it
+    would instead cap ACTIVE capacity: on the width-8 mtp_batch lane four
+    requests would be admitted and four would get 429, so a full cohort could
+    never seal — a capability regression, not backpressure.
+    """
+
+    raw = getattr(getattr(state, "args", None), "max_inflight_generation_requests", None)
+    if raw is None:
+        raw = os.environ.get("MTPLX_MAX_INFLIGHT_GENERATION_REQUESTS")
+        raw = raw.strip() if isinstance(raw, str) else raw
+    if raw not in (None, ""):
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            pass
+    if MAX_INFLIGHT_GENERATION_REQUESTS <= 0:
+        return 0
+    return max(
+        MAX_INFLIGHT_GENERATION_REQUESTS, _generation_active_capacity(state)
+    )
+
+
+class _GenerationAdmissionMiddleware:
+    """Bound the generation waiting line and shed load with 429.
+
+    Serial mode (the default) runs every request on the one model-owner
+    thread, so concurrency is already 1: extra requests do not run in
+    parallel, they queue. The queue was unbounded — ``ModelScheduler`` uses a
+    bare ``deque()`` and ``--max-active-requests`` has no default — so a
+    client loop could stack arbitrarily many requests the server had no way to
+    start. On 2026-08-18 ten concurrent completions against one 27B model left
+    one executing and nine parked, each pinning a max-fan lease and an HTTP
+    connection with nothing surfacing the backlog.
+
+    Rejecting fast is kinder than queueing forever: a 429 with ``Retry-After``
+    lets well-behaved clients back off, and makes an over-driving client
+    visible immediately instead of silently deepening a queue. The gate sits
+    inside the auth middleware and outside ``_SmartFanArrivalMiddleware`` (see
+    registration order in ``create_app``) so a shed request never ramps fans.
+
+    ``max_inflight <= 0`` disables the gate entirely.
+    """
+
+    def __init__(self, app: Any, *, max_inflight: int) -> None:
+        self.app = app
+        self.max_inflight = int(max_inflight)
+        self._lock = threading.Lock()
+        self._inflight = 0
+        self.rejected = 0
+
+    def _claim(self) -> bool:
+        if self.max_inflight <= 0:
+            return True
+        with self._lock:
+            if self._inflight >= self.max_inflight:
+                self.rejected += 1
+                return False
+            self._inflight += 1
+            return True
+
+    def _release(self) -> None:
+        if self.max_inflight <= 0:
+            return
+        with self._lock:
+            self._inflight = max(0, self._inflight - 1)
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if (
+            scope.get("type") != "http"
+            or scope.get("method") != "POST"
+            or scope.get("path") not in _SMART_FAN_ARRIVAL_PATHS
+            or any(
+                name == b"x-openwebui-task"
+                for name, _value in (scope.get("headers") or [])
+            )
+        ):
+            await self.app(scope, receive, send)
+            return
+        if not self._claim():
+            retry_after = max(1, int(round(GENERATION_RETRY_AFTER_S)))
+            response = JSONResponse(
+                status_code=429,
+                headers={"Retry-After": str(retry_after)},
+                content={
+                    "error": {
+                        "message": (
+                            "server busy: "
+                            f"{self.max_inflight} generation request(s) already "
+                            "in flight on a single-model server. Retry after "
+                            f"{retry_after}s, or raise "
+                            "MTPLX_MAX_INFLIGHT_GENERATION_REQUESTS."
+                        ),
+                        "type": "server_busy",
+                        "code": "server_busy",
+                    }
+                },
+            )
+            await response(scope, receive, send)
+            return
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            self._release()
 
 
 class _SmartFanArrivalMiddleware:
@@ -26562,6 +26813,12 @@ def create_app(state: ServerState) -> FastAPI:
     # (the most recently added Starlette middleware runs first): fans only
     # ramp for requests that passed the API-key and rate-limit gates.
     app.add_middleware(_SmartFanArrivalMiddleware, state=state)
+    # Registered AFTER the fan middleware so it runs BEFORE it (Starlette runs
+    # the most recently added first): a shed request must never ramp fans.
+    app.add_middleware(
+        _GenerationAdmissionMiddleware,
+        max_inflight=_resolve_generation_admission_limit(state),
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -33721,6 +33978,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=MTP_BATCH_NUMERICS_CHOICES,
         default="throughput",
         help="Qwen MTP route: fast B8, balanced B8, or serial B1-exact.",
+    )
+    parser.add_argument(
+        "--max-inflight-generation-requests",
+        type=int,
+        default=None,
+        help=(
+            "Ceiling on generation requests accepted at once. Serial mode runs "
+            "one at a time by design, so this bounds the waiting line, not "
+            "parallelism; past it the server returns 429 + Retry-After instead "
+            "of queueing without limit. 0 disables. Unset defaults to "
+            f"{MAX_INFLIGHT_GENERATION_REQUESTS}, raised to the scheduler's "
+            "active capacity so a full ar_batch/mtp_batch cohort can still form."
+        ),
     )
     parser.add_argument("--max-active-requests", type=int)
     parser.add_argument("--decode-batch-max", type=int)

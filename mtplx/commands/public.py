@@ -9553,6 +9553,7 @@ def cmd_serve_public(args: Any) -> int:
     ]
     for attr, flag in (
         ("max_active_requests", "--max-active-requests"),
+        ("max_inflight_generation_requests", "--max-inflight-generation-requests"),
         ("decode_batch_max", "--decode-batch-max"),
         ("batch_wait_ms", "--batch-wait-ms"),
         ("prefill_chunk_tokens", "--prefill-chunk-tokens"),
@@ -11364,6 +11365,7 @@ def _batching_command_suffix(args: Any) -> str:
         parts.extend(["--batching-preset", shlex.quote(batching_preset)])
     for attr, flag in (
         ("max_active_requests", "--max-active-requests"),
+        ("max_inflight_generation_requests", "--max-inflight-generation-requests"),
         ("decode_batch_max", "--decode-batch-max"),
         ("batch_wait_ms", "--batch-wait-ms"),
         ("prefill_chunk_tokens", "--prefill-chunk-tokens"),
@@ -12738,6 +12740,7 @@ def _with_batching_args(target: Any, source: Any) -> Any:
         ("scheduler_mode", "serial"),
         ("batching_preset", "latency"),
         ("max_active_requests", None),
+        ("max_inflight_generation_requests", None),
         ("decode_batch_max", None),
         ("batch_wait_ms", None),
         ("prefill_chunk_tokens", None),

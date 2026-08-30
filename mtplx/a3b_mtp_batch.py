@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 
 import numpy as np
 import mlx.core as mx
+
 from mlx_lm.models.base import scaled_dot_product_attention
 
 from mtplx.arrays_cache_patch import install_arrays_cache_fix
@@ -52,6 +53,7 @@ from mtplx.fast_sampling import (
     bind_batched_top_k_distributions,
 )
 from mtplx.mtp_batch_numerics import MTPBatchNumerics, normalize_mtp_batch_numerics
+from mtplx.progress_heartbeat import tick as _owner_progress_tick
 from mtplx.ragged_kv_cache import RaggedBatchKVCache
 from mtplx.sampling import (
     SamplerConfig,
@@ -84,6 +86,19 @@ _MTP_BATCH_ATTENTION_ACTIVE: ContextVar[bool] = ContextVar(
     "mtplx_qwen35b_mtp_batch_attention_active",
     default=False,
 )
+
+
+def _eval(*values) -> None:
+    """Settle owner-thread work AND prove the model owner is alive (#201).
+
+    Mirrors :func:`mtplx.generation._eval`. An MTP cohort runs its whole
+    prefill + verify/commit driver as ONE scheduler work item, so without a
+    tick per settled eval a healthy width-8 cohort looks frozen to the smart
+    fan activity probe and loses its fan leases mid-flight.
+    """
+
+    mx.eval(*values)
+    _owner_progress_tick()
 
 
 def _geometry_relative_limit(numerics_profile: object) -> float:
@@ -904,7 +919,7 @@ def _default_selfcheck(lane: InstalledA3BMTPBatchLane, runtime: Any) -> dict[str
             projection_checks.append(
                 mx.all(balanced_projection == reference_projection)
             )
-        mx.eval(*projection_checks)
+        _eval(*projection_checks)
         balanced_l0_qkv_z_b_b1_bitwise = all(
             bool(np.asarray(check).item()) for check in projection_checks
         )
@@ -1043,7 +1058,7 @@ def _default_selfcheck(lane: InstalledA3BMTPBatchLane, runtime: Any) -> dict[str
             mx.all(dedicated_mtp[0].values == reference_mtp[0].values),
         )
     )
-    mx.eval(*prefill_comparisons)
+    _eval(*prefill_comparisons)
     prefill_numerical_parity = bool(
         prefill_offsets_match
         and all(bool(np.asarray(value).item()) for value in prefill_comparisons)
@@ -1097,7 +1112,7 @@ def _default_selfcheck(lane: InstalledA3BMTPBatchLane, runtime: Any) -> dict[str
         )
         for row in range(lane.geometry.cohort_slots)
     ]
-    mx.eval(
+    _eval(
         *empty_draft_errors,
         *empty_draft_reference_max,
         *empty_draft_argmax_comparisons,
@@ -1137,7 +1152,7 @@ def _default_selfcheck(lane: InstalledA3BMTPBatchLane, runtime: Any) -> dict[str
             mtp_cache=isolated_empty_mtp,
         )
     empty_isolation_check = mx.all(batch_empty_draft[1:] == isolated_empty_draft[1:])
-    mx.eval(empty_isolation_check)
+    _eval(empty_isolation_check)
     empty_mtp_row_isolation_parity = bool(np.asarray(empty_isolation_check).item())
     del one_token_prefills, empty_merged_mtp, batch_empty_draft
 
@@ -1237,7 +1252,7 @@ def _default_selfcheck(lane: InstalledA3BMTPBatchLane, runtime: Any) -> dict[str
                     )
                     entry[0] = mx.where(conv_mask, before_conv, entry[0])
                     entry[1] = mx.where(state_mask, before_state, entry[1])
-        mx.eval(verify_logits, verify_hidden)
+        _eval(verify_logits, verify_hidden)
         return verify_input, verify_logits, verify_hidden, captures, row_commit, cache
 
     batch_tokens = [
@@ -1462,7 +1477,7 @@ def _default_selfcheck(lane: InstalledA3BMTPBatchLane, runtime: Any) -> dict[str
     compiled_eager_argmax_check = mx.all(
         mx.argmax(batch_logits, axis=-1) == mx.argmax(eager_logits, axis=-1)
     )
-    mx.eval(
+    _eval(
         *compiled_eager_checks,
         *compiled_eager_attention_offset_checks,
         *compiled_eager_errors,
@@ -1610,7 +1625,7 @@ def _default_selfcheck(lane: InstalledA3BMTPBatchLane, runtime: Any) -> dict[str
             mx.all(reference_next_hidden == installed_next_hidden),
         )
     )
-    mx.eval(*commit_comparisons)
+    _eval(*commit_comparisons)
     mixed_commit_parity = all(
         bool(np.asarray(value).item()) for value in commit_comparisons
     )
@@ -1713,7 +1728,7 @@ def _default_selfcheck(lane: InstalledA3BMTPBatchLane, runtime: Any) -> dict[str
                     ),
                 )
             )
-        mx.eval(
+        _eval(
             *comparisons,
             *row_errors,
             *row_reference_max,
@@ -1844,7 +1859,7 @@ def _default_selfcheck(lane: InstalledA3BMTPBatchLane, runtime: Any) -> dict[str
                 ),
             )
         )
-    mx.eval(*row_isolation_checks)
+    _eval(*row_isolation_checks)
     row_isolation_parity = bool(
         isolation_commit
         and all(bool(np.asarray(value).item()) for value in row_isolation_checks)
@@ -2058,7 +2073,7 @@ def _prefill_qwen35b_batch_request(
                 mtp_cache=mtp_cache,
                 position_offset=None,
             )
-        mx.eval(history_hidden)
+        _eval(history_hidden)
         del history_hidden
     else:
         cache = target_cache_factory()
@@ -2077,7 +2092,7 @@ def _prefill_qwen35b_batch_request(
                     return_hidden=True,
                     hidden_variant="post_norm",
                 )
-            mx.eval(hidden)
+            _eval(hidden)
             _check_postcommit_abort(abort_check)
             history_ids = mx.array(
                 [prompt_ids[chunk_start + 1 : end + 1]], dtype=mx.int32
@@ -2089,7 +2104,7 @@ def _prefill_qwen35b_batch_request(
                     mtp_cache=mtp_cache,
                     position_offset=None,
                 )
-            mx.eval(history_hidden)
+            _eval(history_hidden)
             _capture_gdn_boundary(boundary_sink, end, cache, hidden[:, -1:, :])
             del _logits, hidden, history_hidden
             chunk_index += 1
@@ -2105,7 +2120,7 @@ def _prefill_qwen35b_batch_request(
             return_hidden=True,
             hidden_variant="post_norm",
         )
-    mx.eval(logits, hidden)
+    _eval(logits, hidden)
     _check_postcommit_abort(abort_check)
     return (
         cache,
@@ -2486,7 +2501,7 @@ def _merge_qwen35b_kv_rows(
         offsets=mx.array(offsets, dtype=mx.int32),
     )
     merged._capacity_bound = max(offsets)
-    mx.eval(merged.keys, merged.values, merged.offsets)
+    _eval(merged.keys, merged.values, merged.offsets)
     for source in caches:
         source[layer_idx] = None
     return merged
@@ -2504,7 +2519,7 @@ def _merge_qwen35b_target_caches(caches: list[list[Any]]) -> list[Any]:
         merged = ArraysCache(2)
         merged[0] = mx.concatenate([source[layer_idx][0] for source in caches], axis=0)
         merged[1] = mx.concatenate([source[layer_idx][1] for source in caches], axis=0)
-        mx.eval(merged[0], merged[1])
+        _eval(merged[0], merged[1])
         merged_cache.append(merged)
         for source in caches:
             source[layer_idx] = None
@@ -3054,7 +3069,7 @@ def generate_a3b_mtp_batch(
     mtp_cache = lane.merge_mtp_caches([item[3] for item in prefills])
     logits_last = mx.concatenate([item[1] for item in prefills], axis=0)
     hidden_last = mx.concatenate([item[2] for item in prefills], axis=0)
-    mx.eval(logits_last, hidden_last)
+    _eval(logits_last, hidden_last)
     del prefills
     for request in real:
         if request.on_decode_start is not None:
