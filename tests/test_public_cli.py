@@ -3,12 +3,14 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
 import time
 import tomllib
+import yaml
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -1284,6 +1286,8 @@ def test_start_target_aliases_route_correctly(monkeypatch, tmp_path, capsys):
     assert run("sv")["target"] == "swival"
     assert run("hermes")["target"] == "hermes"
     assert run("hermes-agent")["target"] == "hermes"
+    assert run("dsh")["target"] == "dsh"
+    assert run("deepseek-harness")["target"] == "dsh"
 
 
 def test_start_opencode_dry_run_json_writes_no_hidden_cap(
@@ -1930,6 +1934,97 @@ def test_start_hermes_dry_run_json_matches_native_agent_lane(
     assert not (tmp_path / ".hermes" / "profiles" / "mtplx" / "config.yaml").exists()
 
 
+def test_start_dsh_dry_run_json_registers_provider(monkeypatch, tmp_path, capsys):
+    """Dry run registers the DSH provider in the JSON plan without writing config."""
+    dsh_home = tmp_path / "dsh-home"
+    monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MTPLX_DSH_HOME", str(dsh_home))
+
+    code = main(
+        [
+            "start",
+            "dsh",
+            "--dry-run",
+            "--json",
+            "--model",
+            "models/example",
+            "--yes",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert payload["target"] == "dsh"
+    assert payload["terminal_chat"] is False
+    assert payload["next"] == "mtplx start dsh"
+    assert payload["open_dashboard"] is False
+
+    dsh = payload["dsh"]
+    assert dsh["server_url"] == "http://127.0.0.1:18086"
+    assert dsh["base_url"] == "http://127.0.0.1:18086/v1"
+    assert dsh["api_base_url"] == "http://127.0.0.1:18086/v1"
+    assert dsh["model_id"] == "example"
+    assert dsh["model_ref"] == "mtplx/example"
+    assert dsh["api_key"] == "mtplx-local"
+    assert dsh["launch_command"] == "dsh web"
+    assert dsh["server_console"] is True
+    assert dsh["no_hidden_max_tokens"] is True
+    assert dsh["config_path"] == str(dsh_home / "settings.yaml")
+    assert dsh["credentials_path"] == str(dsh_home / ".credentials.yaml")
+    # Dry run must not write DSH config yet.
+    assert "config_write" not in dsh
+
+    command = dsh["server_command"]
+    assert command.startswith("mtplx start dsh")
+    assert "--host 127.0.0.1" in command
+    assert "--port 18086" in command
+    assert "--model models/example" in command
+    profile_match = re.search(r"--profile (\S+)", command)
+    assert profile_match is not None and profile_match.group(1)
+    # Raw start-parser fan-mode default; a user-chosen mode passes through
+    # (see test_start_client_dry_run_preserves_smart_fan_mode).
+    assert "--fan-mode default" in command
+    assert "--api-key mtplx-local" in command
+    context_match = re.search(r"--context-window (\d+)", command)
+    assert context_match is not None
+    assert dsh["context_window"] == int(context_match.group(1))
+    assert "--scheduler-mode serial" in command
+    assert "--batching-preset latency" in command
+    assert "--ssd-session-cache on" in command
+    assert "--ssd-session-cache-max-size 100GB" in command
+    assert "--ssd-session-cache-min-prefix-tokens 512" in command
+    assert "--temperature 0.6" in command
+    # Start parser default 0.95; there is no DSH latency-default step that
+    # would rewrite top-p to 1.0 (that is Hermes-only).
+    assert "--top-p 0.95" in command
+    assert "--top-k 20" in command
+    assert "--reasoning auto" in command
+    assert "--reasoning-parser qwen3" in command
+    assert "--no-stats" in command
+
+    # No serve-side corrections leak into the plan: DSH has no hermes-style
+    # latency defaults, and the writer emits no draft/tool-prompt/chat-template
+    # flags.
+    for absent in (
+        "--prefill-chunk-tokens",
+        "--adaptive-policy",
+        "--decode-batch-max",
+        "--batch-wait-ms",
+        "--chat-template-profile",
+        "--tool-prompt-mode",
+        "--draft-temperature",
+        "--draft-top-p",
+        "--draft-top-k",
+        "--launch-dsh",
+        "--no-mtp",
+    ):
+        assert absent not in command
+
+    assert not (dsh_home / "settings.yaml").exists()
+    assert not (dsh_home / ".credentials.yaml").exists()
+
+
 def test_start_hermes_live_path_writes_profile_and_handoff(
     monkeypatch,
     tmp_path,
@@ -1992,6 +2087,108 @@ def test_start_hermes_live_path_writes_profile_and_handoff(
     assert 'HERMES_MODEL="example"' in env_text
     assert 'OPENAI_API_KEY="mtplx-local"' in env_text
     assert "Hermes will open automatically" in capsys.readouterr().out
+
+
+def test_start_dsh_live_path_writes_settings_and_handoff(monkeypatch, tmp_path, capsys):
+    """Live start writes DSH settings/credentials and launches the server."""
+    dsh_home = tmp_path / "dsh-home"
+    monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MTPLX_DSH_HOME", str(dsh_home))
+
+    class NonInteractiveStdin:
+        def isatty(self):
+            return False
+
+    class FakeInspection:
+        def to_dict(self):
+            return {
+                "model_dir": "models/example",
+                "compatibility": {"can_run": True, "exit_code": 0},
+                "context_window": 262144,
+            }
+
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(public.sys, "stdin", NonInteractiveStdin())
+    monkeypatch.setattr(
+        public,
+        "_quickstart_resolve_model",
+        lambda *args, **kwargs: ("models/example", {}),
+    )
+    monkeypatch.setattr(
+        public,
+        "_model_gate",
+        lambda *args, **kwargs: (FakeInspection().to_dict(), None),
+    )
+    # dsh is not installed on this box; the start flow hard-requires it.
+    monkeypatch.setattr(
+        public,
+        "_quickstart_require_dsh_cli",
+        lambda *args, **kwargs: True,
+    )
+
+    def fake_serve(args):
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(public, "cmd_serve_public", fake_serve)
+
+    code = main(["start", "dsh", "--model", "models/example", "--yes"])
+
+    assert code == 0
+    serve_args = captured["args"]
+    assert serve_args.quickstart_dsh is True
+    assert serve_args.quickstart_hermes is False
+    assert serve_args.port == 18086
+    assert serve_args.host == "127.0.0.1"
+    assert serve_args.model == "models/example"
+    assert serve_args.api_key == "mtplx-local"
+    assert serve_args.reasoning == "auto"
+    assert serve_args.preserve_thinking == "auto"
+    assert serve_args.reasoning_parser == "qwen3"
+    assert serve_args.stats_footer is False
+    assert serve_args.open_dashboard is False
+    assert serve_args.scheduler_mode == "serial"
+    assert serve_args.batching_preset == "latency"
+    # 2048 prefill is a Hermes latency default; DSH has no such step, so the
+    # serve parser default (None) is preserved.
+    assert serve_args.prefill_chunk_tokens is None
+    assert serve_args.ssd_session_cache == "on"
+    assert not hasattr(serve_args, "launch_dsh")
+
+    settings_path = dsh_home / "settings.yaml"
+    credentials_path = dsh_home / ".credentials.yaml"
+    assert settings_path.exists()
+    assert credentials_path.exists()
+    assert settings_path.stat().st_mode & 0o777 == 0o600
+    assert credentials_path.stat().st_mode & 0o777 == 0o600
+
+    settings = yaml.safe_load(settings_path.read_text(encoding="utf-8"))
+    namespace = settings["llm-pi-ai"]
+    provider = namespace["providers"]["mtplx"]
+    assert provider["displayName"] == "MTPLX"
+    assert provider["apiKeyEnv"] == "MTPLX_API_KEY"
+    assert provider["api"] == "openai-completions"
+    assert provider["baseURL"] == "http://127.0.0.1:18086/v1"
+    assert provider["headers"]["x-mtplx-client"] == "dsh"
+    compat = provider["compat"]
+    assert compat["thinkingFormat"] == "qwen"
+    assert compat["maxTokensField"] == "max_tokens"
+    assert compat["supportsDeveloperRole"] is False
+    assert compat["supportsReasoningEffort"] is True
+    assert provider["models"] == [
+        {"id": "example", "name": "MTPLX example", "contextWindow": 262144}
+    ]
+    # Live launch registers the agent default model; dry run does not.
+    assert namespace["agent-default-model"] == {"provider": "mtplx", "model": "example"}
+
+    credentials = yaml.safe_load(credentials_path.read_text(encoding="utf-8"))
+    assert credentials["refs"]["MTPLX_API_KEY"] == "mtplx-local"
+
+    assert (
+        "DSH will open automatically when MTPLX is ready."
+        in capsys.readouterr().out
+    )
 
 
 def test_terminal_quickstart_max_uses_verified_max_session(monkeypatch):
@@ -2461,6 +2658,8 @@ def test_start_parser_accepts_target_choices():
         "dashboard",
         "live-dashboard",
         "live",
+        "dsh",
+        "deepseek-harness",
     ):
         args = parser.parse_args(["start", target, "--dry-run"])
         assert args.target == target
@@ -3287,6 +3486,7 @@ def test_quickstart_openwebui_dry_run_json(monkeypatch, tmp_path, capsys):
         ("opencode", "opencode"),
         ("swival", "swival"),
         ("hermes", "hermes"),
+        ("dsh", "dsh"),
     ],
 )
 def test_start_client_dry_run_preserves_smart_fan_mode(
@@ -5832,6 +6032,7 @@ def test_product_helper_commands_parse():
     start_opencode = parser.parse_args(["start", "opencode", "--port", "18083"])
     start_swival = parser.parse_args(["start", "swival", "--port", "18084"])
     start_hermes = parser.parse_args(["start", "hermes", "--port", "18085"])
+    start_dsh = parser.parse_args(["start", "dsh", "--port", "18086"])
     start_openwebui_strict = parser.parse_args(
         ["start", "openwebui", "--strict-fast-path"]
     )
@@ -5893,6 +6094,8 @@ def test_product_helper_commands_parse():
     assert start_swival.port == 18084
     assert start_hermes.target == "hermes"
     assert start_hermes.port == 18085
+    assert start_dsh.target == "dsh"
+    assert start_dsh.port == 18086
     assert start_openwebui.strict_fast_path is False
     assert start_openwebui_strict.strict_fast_path is True
     assert quickstart.command == "quickstart"

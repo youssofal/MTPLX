@@ -811,7 +811,7 @@ def _print_welcome() -> None:
     body.append("Three quick questions to get you set up:\n", style="")
     body.append("  1. Which model?\n", style="dim")
     body.append("  2. Which runtime mode?\n", style="dim")
-    body.append("  3. Browser chat, terminal chat, Pi, OpenCode, or Swival?\n\n", style="dim")
+    body.append("  3. Browser chat, terminal chat, Pi, OpenCode, Swival, Hermes, or DSH?\n\n", style="dim")
     body.append("For each step, type the number of your choice and press Enter.", style="italic")
     panel = Panel(
         body,
@@ -1263,7 +1263,7 @@ def screen_interface(
     host: str = "127.0.0.1",
     port: int = 8000,
 ) -> str:
-    """Return the target string (``openwebui``, ``terminal``, ``pi``, ``opencode``, ``swival``, or ``dashboard``)."""
+    """Return the target string (``openwebui``, ``terminal``, ``pi``, ``opencode``, ``swival``, ``dsh``, or ``dashboard``)."""
 
     chat_url = _surface_url(host, port)
     dashboard_url = _surface_url(host, port, path="/dashboard")
@@ -1299,12 +1299,17 @@ def screen_interface(
             ),
             (
                 "6",
+                "Connect to DSH [coding agent]",
+                "Writes DSH's MTPLX provider settings and starts the server, then opens DSH in Terminal.",
+            ),
+            (
+                "7",
                 f"Live Dashboard [browser at {dashboard_url}]",
                 "Live TPS gauge · acceptance · cache · memory · fans · request log. Drive load from any client (Web UI, Pi, OpenCode, hippo).",
             ),
         ],
     )
-    choice = _prompt_choice("Select", ["1", "2", "3", "4", "5", "6"], default="1")
+    choice = _prompt_choice("Select", ["1", "2", "3", "4", "5", "6", "7"], default="1")
     if choice == "1":
         return "openwebui"
     if choice == "2":
@@ -1315,6 +1320,10 @@ def screen_interface(
         return "opencode"
     if choice == "5":
         return "swival"
+    if choice == "6":
+        return "dsh"
+    if choice == "7":
+        return "dashboard"
     return "dashboard"
 
 
@@ -1322,7 +1331,7 @@ def screen_interface(
 # question makes sense. Terminal/CLI runs the model in-process with no
 # server, so the dashboard can't attach. "dashboard" already IS the
 # dashboard target, no point asking again.
-DASHBOARD_COMPANION_TARGETS = ("openwebui", "pi", "opencode", "swival", "hermes")
+DASHBOARD_COMPANION_TARGETS = ("openwebui", "pi", "opencode", "swival", "hermes", "dsh")
 
 
 def screen_dashboard_companion(
@@ -1684,6 +1693,8 @@ def _quickstart_state_is_reusable(last: dict) -> bool:
         "sv",
         "hermes",
         "hermes-agent",
+        "dsh",
+        "deepseek-harness",
         "dashboard",
         "live-dashboard",
         "live",
@@ -2137,6 +2148,8 @@ def interface_label(target: str | None) -> str:
         return "OpenCode Desktop  ·  coding agent"
     if target in ("swival", "sv"):
         return "Swival  ·  coding agent"
+    if target in ("dsh", "deepseek-harness"):
+        return "DSH  ·  DeepSeek Harness agent"
     if target in ("dashboard", "live-dashboard", "live"):
         return "Live Dashboard  ·  browser"
     return target or "?"
