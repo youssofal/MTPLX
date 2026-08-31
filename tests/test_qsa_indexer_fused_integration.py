@@ -87,6 +87,7 @@ def _configure_lanes(
     monkeypatch.setenv("MTPLX_QSA_GATHER_DECODE", "1" if decode_gather else "0")
     monkeypatch.setenv("MTPLX_QSA_GATHER_MIN_CONTEXT", "0")
     monkeypatch.setenv("MTPLX_QSA_GATHER_MAX_ROWS", "8")
+    monkeypatch.setenv("MTPLX_QSA_FLASH_MIN_CONTEXT", "0")
 
 
 def _prime_cache(

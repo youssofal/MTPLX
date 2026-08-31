@@ -302,7 +302,7 @@ def test_sustained_profile_is_native_mtp_long_context_path() -> None:
     assert profile.env_dict()["MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY"] == "off"
     assert profile.env_dict()["MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD"] == "98304"
     assert profile.env_dict()["MTPLX_LONG_CONTEXT_MTP_DEPTH"] == "3"
-    assert profile.env_dict()["MTPLX_MTP_HISTORY_POLICY"] == "committed"
+    assert profile.env_dict()["MTPLX_MTP_HISTORY_POLICY"] == "auto"
     assert profile.env_dict()["MTPLX_LAZY_MTP_HISTORY_APPEND"] == "1"
     assert profile.env_dict()["MTPLX_DROP_EVENTS"] == "1"
     assert profile.env_dict()["MTPLX_SKIP_VERIFY_SNAPSHOT"] == "1"

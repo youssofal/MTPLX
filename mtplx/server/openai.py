@@ -829,6 +829,13 @@ def _server_runtime_env_overrides(
         ):
             if os.environ.get(key) is None:
                 overrides.setdefault(key, "1")
+        if os.environ.get("MTPLX_QSA_FLASH") is None:
+            try:
+                from mtplx.models.qwen4_exp import qsa_prefill_lane_auto_supported
+                if qsa_prefill_lane_auto_supported():
+                    overrides.setdefault("MTPLX_QSA_FLASH", "1")
+            except Exception:
+                pass
         if os.environ.get("MTPLX_NAX_VERIFY") is None:
             # The turbo profile arms the 27B NAX verify patch
             # (MTPLX_NAX_VERIFY=1); on this family it is unmeasured and
@@ -2062,8 +2069,8 @@ def _select_backend_context_window(
     KV actually fits this machine's engine envelope (issue #305: the flat
     model-max default admitted 262k-token prompts on 48 GB Macs, whose KV
     alone exceeds the Metal budget — swap-death, not an error message).
-    It shapes only the DEFAULT: an explicit --context-window always wins,
-    with the plan warning loudly instead of refusing.
+    It shapes only the DEFAULT: an explicit --context-window overrides
+    machine_fit while remaining clamped to the model capability.
     """
     requested_value = int(requested or 0)
     default_value = (
@@ -17691,6 +17698,12 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "rollback_time_s",
     "graphbank",
     "repair_time_by_reject_depth_s",
+    "decode_flash_skip",
+    "decode_dense_mask",
+    "gather_rows",
+    "dense_fallback",
+    "decode_gather",
+    "qsa_prefill_engagement",
     *MAINTENANCE_TIMING_STATS_KEYS,
     "session_cache_hit",
     "session_prompt_prefix_bank_commit",
@@ -18411,6 +18424,16 @@ def _policy_fingerprint(
         f"proposal_cache={json.dumps(proposal_cache, sort_keys=True, separators=(',', ':'))}",
         f"online_hidden={json.dumps(online_hidden, sort_keys=True, separators=(',', ':'))}",
     ]
+    qsa_kv_bits = str(
+        os.environ.get("MTPLX_QSA_KV_BITS")
+        or os.environ.get("MTPLX_KV_QUANT")
+        or "0"
+    ).strip()
+    qsa_pooled_bits = str(os.environ.get("MTPLX_QSA_POOLED_BITS") or "0").strip()
+    if qsa_kv_bits != "0":
+        parts.append(f"qsa_kv_bits={qsa_kv_bits}")
+    if qsa_pooled_bits != "0":
+        parts.append(f"qsa_pooled_bits={qsa_pooled_bits}")
     normalized_cache_scope = str(cache_scope or "").strip()
     mtp_batch_lane = getattr(state, "mtp_batch_lane", None)
     if mtp_batch_lane is not None:
@@ -20096,7 +20119,8 @@ def _reject_prompt_over_context(state: ServerState, prompt_token_count: int) -> 
         )
     plan = getattr(state, "memory_plan", None)
     if (
-        plan is not None
+        os.environ.get("MTPLX_ALLOW_OVERCOMMITTED") not in {"1", "true", "yes", "on"}
+        and plan is not None
         and bool(getattr(plan, "context_overcommitted", False))
         and int(getattr(plan, "context_window_fit", 0) or 0) > 0
         and int(prompt_token_count) >= int(plan.context_window_fit)

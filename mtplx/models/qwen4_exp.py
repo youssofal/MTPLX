@@ -49,8 +49,8 @@ from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.base import BaseModelArgs, create_ssm_mask
-from mlx_lm.models.cache import ArraysCache, KVCache
+from mlx_lm.models.base import BaseModelArgs, create_ssm_mask, quantized_scaled_dot_product_attention
+from mlx_lm.models.cache import ArraysCache, KVCache, QuantizedKVCache
 
 from mtplx.attention_context import vision_rope_state
 from mlx_lm.models.qwen3_5 import GatedDeltaNet as _Qwen3_5GatedDeltaNet
@@ -1165,9 +1165,62 @@ def _qsa_gather_max_rows() -> int:
         return 8
 
 
+def _qsa_flash_min_context() -> int:
+    """Flash-skip decode engages only at/past this KV length (default 16384)."""
+    try:
+        return max(0, int(os.environ.get("MTPLX_QSA_FLASH_MIN_CONTEXT") or 16384))
+    except ValueError:
+        return 16384
+
+
+def _qsa_parallel_indexer_min_context() -> int:
+    """Context threshold past which S=1 decode routes through multi-threadgroup
+    parallel scoring (qsa_indexer_prefill_scores) + Metal topk kernel instead
+    of single-threadgroup serial scan (Item 1)."""
+    try:
+        return max(0, int(os.environ.get("MTPLX_QSA_PARALLEL_INDEXER_MIN_CONTEXT") or 16384))
+    except ValueError:
+        return 16384
+
+
 def _qsa_flash_enabled() -> bool:
     raw = (os.environ.get("MTPLX_QSA_FLASH") or "0").strip().lower()
     return raw in {"1", "true", "yes", "on"}
+
+
+def _qsa_kv_quant_bits() -> Optional[int]:
+    raw = (
+        os.environ.get("MTPLX_QSA_KV_BITS")
+        or os.environ.get("MTPLX_KV_QUANT")
+        or "0"
+    ).strip().lower()
+    if raw in {"8", "q8", "int8", "8bit"}:
+        return 8
+    if raw in {"4", "q4", "int4", "4bit"}:
+        return 4
+    try:
+        val = int(raw)
+        return val if val in (4, 8) else None
+    except ValueError:
+        return None
+
+
+def _qsa_pooled_quant_bits() -> Optional[int]:
+    raw = (
+        os.environ.get("MTPLX_QSA_POOLED_BITS")
+        or os.environ.get("MTPLX_QSA_KV_BITS")
+        or os.environ.get("MTPLX_KV_QUANT")
+        or "0"
+    ).strip().lower()
+    if raw in {"8", "q8", "int8", "8bit"}:
+        return 8
+    if raw in {"4", "q4", "int4", "4bit"}:
+        return 4
+    try:
+        val = int(raw)
+        return val if val in (4, 8) else None
+    except ValueError:
+        return None
 
 
 def _qsa_score_tile_rows() -> int:
@@ -1511,19 +1564,28 @@ class QSACache:
 
     step = 256
 
-    def __init__(self, compress_ratio: int = 4):
-        self.kv = KVCache()
+    def __init__(
+        self,
+        compress_ratio: int = 4,
+        *,
+        kv_bits: Optional[int] = None,
+        kv_group_size: int = 64,
+    ):
+        bits = kv_bits if kv_bits is not None else _qsa_kv_quant_bits()
+        if bits in (4, 8):
+            self.kv = QuantizedKVCache(group_size=kv_group_size, bits=bits)
+        else:
+            self.kv = KVCache()
         self.ratio = max(1, int(compress_ratio))
+        self.pooled_bits = kv_bits if kv_bits is not None else _qsa_pooled_quant_bits()
         self.raw_keys: Optional[mx.array] = None  # [1, cap, index_head_dim]
         self.pooled: Optional[mx.array] = None  # [1, cap_blocks, index_head_dim]
         self.pooled_len = 0  # valid pooled blocks
         # fp32-transposed mirror of ``pooled`` [1, 1, D, cap_blocks], kept in
-        # lockstep by write_pooled. The indexer used to upcast + transpose the
-        # ENTIRE pooled table on every forward of every QSA layer — 33.5 MB
-        # allocated and freed per layer per decoded token at 262K context
-        # (#393 audit). Same values (astype of the same bf16 blocks), so
-        # selection is bit-identical; this is allocation hygiene only.
+        # lockstep by write_pooled. When pooled_bits in (4, 8), stored as
+        # quantized q8/q4 mirror (Item 2) to cut memory bandwidth by 75-87.5%.
         self.pooled_f32_t: Optional[mx.array] = None
+        self.pooled_quant_t: Optional[tuple[mx.array, mx.array, Optional[mx.array]]] = None
         # Host-planned graph buckets can be reserved before the first array
         # write, when dtype/head width are not known yet.  The next write
         # materializes the pending capacity with the actual projected dtype.
@@ -1578,26 +1640,56 @@ class QSACache:
             self.pooled = grown
         self.pooled[:, nb_start:nb_total, :] = blocks
         # Keep the fp32-transposed mirror in lockstep (same capacity). When
-        # the mirror is absent (fresh cache, or dropped by a state restore)
-        # it must seed from the pooled buffer's CONTENT — zeros would blank
-        # every previously valid block's scores (caught by the state
-        # round-trip gate).
-        cap_blocks = self.pooled.shape[1]
-        if self.pooled_f32_t is None:
-            self.pooled_f32_t = mx.swapaxes(self.pooled.astype(mx.float32), 1, 2)[
-                :, None
-            ]
-        elif self.pooled_f32_t.shape[3] < cap_blocks:
-            grown_t = mx.zeros((1, 1, blocks.shape[2], cap_blocks), mx.float32)
-            grown_t[..., : self.pooled_f32_t.shape[3]] = self.pooled_f32_t
-            self.pooled_f32_t = grown_t
-            self.pooled_f32_t[..., nb_start:nb_total] = mx.swapaxes(
-                blocks.astype(mx.float32), 1, 2
-            )[:, None]
+        # pooled_bits in (4, 8), maintain quantized q8/q4 mirror (Item 2)
+        # to cut memory bandwidth by 75-87.5%.
+        if self.pooled_bits in (4, 8):
+            words_per_group = (64 * self.pooled_bits) // 32
+            start_grp = nb_start // 64
+            if self.pooled_quant_t is not None and start_grp > 0:
+                w_prev, s_prev, b_prev = self.pooled_quant_t
+                if s_prev.shape[-1] >= start_grp:
+                    start_block = start_grp * 64
+                    delta = self.pooled[:, start_block:nb_total, :].astype(mx.float32)
+                    delta_t = mx.swapaxes(delta, 1, 2)[:, None]
+                    n_delta = delta_t.shape[-1]
+                    padded_delta = ((n_delta + 63) // 64) * 64
+                    if padded_delta > n_delta:
+                        delta_t = mx.pad(delta_t, [(0, 0), (0, 0), (0, 0), (0, padded_delta - n_delta)])
+                    w_new, s_new, b_new = mx.quantize(delta_t, group_size=64, bits=self.pooled_bits)
+                    w = mx.concatenate([w_prev[..., :start_grp * words_per_group], w_new], axis=-1)
+                    s = mx.concatenate([s_prev[..., :start_grp], s_new], axis=-1)
+                    b = mx.concatenate([b_prev[..., :start_grp], b_new], axis=-1) if b_new is not None and b_prev is not None else None
+                    self.pooled_quant_t = (w, s, b)
+                else:
+                    slice_t = mx.swapaxes(self.pooled[:, :nb_total, :].astype(mx.float32), 1, 2)[:, None]
+                    padded_nb = ((nb_total + 63) // 64) * 64
+                    if padded_nb > nb_total:
+                        slice_t = mx.pad(slice_t, [(0, 0), (0, 0), (0, 0), (0, padded_nb - nb_total)])
+                    self.pooled_quant_t = mx.quantize(slice_t, group_size=64, bits=self.pooled_bits)
+            else:
+                slice_t = mx.swapaxes(self.pooled[:, :nb_total, :].astype(mx.float32), 1, 2)[:, None]
+                padded_nb = ((nb_total + 63) // 64) * 64
+                if padded_nb > nb_total:
+                    slice_t = mx.pad(slice_t, [(0, 0), (0, 0), (0, 0), (0, padded_nb - nb_total)])
+                self.pooled_quant_t = mx.quantize(slice_t, group_size=64, bits=self.pooled_bits)
+            self.pooled_f32_t = None
         else:
-            self.pooled_f32_t[..., nb_start:nb_total] = mx.swapaxes(
-                blocks.astype(mx.float32), 1, 2
-            )[:, None]
+            cap_blocks = self.pooled.shape[1]
+            if self.pooled_f32_t is None:
+                self.pooled_f32_t = mx.swapaxes(self.pooled.astype(mx.float32), 1, 2)[
+                    :, None
+                ]
+            elif self.pooled_f32_t.shape[3] < cap_blocks:
+                grown_t = mx.zeros((1, 1, blocks.shape[2], cap_blocks), mx.float32)
+                grown_t[..., : self.pooled_f32_t.shape[3]] = self.pooled_f32_t
+                self.pooled_f32_t = grown_t
+                self.pooled_f32_t[..., nb_start:nb_total] = mx.swapaxes(
+                    blocks.astype(mx.float32), 1, 2
+                )[:, None]
+            else:
+                self.pooled_f32_t[..., nb_start:nb_total] = mx.swapaxes(
+                    blocks.astype(mx.float32), 1, 2
+                )[:, None]
         self.pooled_len = nb_total
 
     def pooled_f32_view(self, nb: int) -> mx.array:
@@ -1607,11 +1699,39 @@ class QSACache:
         drops it) or a compiled-indexer commit (which replaces ``pooled``
         wholesale and nulls the mirror); otherwise a zero-copy slice of the
         maintained buffer."""
+        if self.pooled_bits in (4, 8):
+            if self.pooled_quant_t is None and self.pooled is not None and self.pooled.shape[1] > 0:
+                nb_val = self.pooled.shape[1]
+                slice_t = mx.swapaxes(self.pooled[:, :nb_val, :].astype(mx.float32), 1, 2)[:, None]
+                padded_nb = ((nb_val + 63) // 64) * 64
+                if padded_nb > nb_val:
+                    slice_t = mx.pad(slice_t, [(0, 0), (0, 0), (0, 0), (0, padded_nb - nb_val)])
+                self.pooled_quant_t = mx.quantize(slice_t, group_size=64, bits=self.pooled_bits)
+            if self.pooled_quant_t is not None:
+                w, s, b = self.pooled_quant_t
+                n_groups = (nb + 63) // 64
+                words_per_group = (64 * self.pooled_bits) // 32
+                w_slice = w[..., :n_groups * words_per_group]
+                s_slice = s[..., :n_groups]
+                b_slice = b[..., :n_groups] if b is not None else None
+                dequant = mx.dequantize(
+                    w_slice,
+                    s_slice,
+                    b_slice,
+                    group_size=64,
+                    bits=self.pooled_bits,
+                )
+                return dequant[..., :nb]
+            return mx.zeros((1, 1, 0, nb), mx.float32)
+
         if self.pooled_f32_t is None or self.pooled_f32_t.shape[3] < nb:
-            self.pooled_f32_t = mx.swapaxes(
-                self.pooled.astype(mx.float32), 1, 2
-            )[:, None]
-        return self.pooled_f32_t[..., :nb]
+            if self.pooled is not None and self.pooled.shape[1] > 0:
+                self.pooled_f32_t = mx.swapaxes(
+                    self.pooled.astype(mx.float32), 1, 2
+                )[:, None]
+        if self.pooled_f32_t is not None:
+            return self.pooled_f32_t[..., :nb]
+        return mx.zeros((1, 1, 0, nb), mx.float32)
 
     def reserve_indexer_capacity(
         self,
@@ -1692,15 +1812,25 @@ class QSACache:
             total += self.raw_keys.nbytes
         if self.pooled is not None:
             total += self.pooled.nbytes
+        if self.pooled_quant_t is not None:
+            for arr in self.pooled_quant_t:
+                if arr is not None:
+                    total += arr.nbytes
+        if self.pooled_f32_t is not None:
+            total += self.pooled_f32_t.nbytes
         return total
 
     @property
     def state(self):
         off = self.kv.offset
-        nb = min(self.pooled_len, off // self.ratio)
+        nb = min(self.pooled_len, off // self.ratio) if off > 0 else self.pooled_len
         raw = None if self.raw_keys is None else self.raw_keys[:, :off, :]
         pooled = None if self.pooled is None or nb == 0 else self.pooled[:, :nb, :]
-        return (*self.kv.state, raw, pooled)
+        try:
+            kv_state = self.kv.state
+        except (TypeError, AttributeError):
+            kv_state = (None, None)
+        return (*kv_state, raw, pooled)
 
     @state.setter
     def state(self, v):
@@ -1711,13 +1841,45 @@ class QSACache:
                 "drop it and re-prefill"
             )
         keys, values, raw, pooled = v
-        self.kv.state = (keys, values)
+        if keys is not None and values is not None:
+            if isinstance(self.kv, QuantizedKVCache):
+                if not (isinstance(keys, tuple) and isinstance(values, tuple)):
+                    raise ValueError(
+                        "Cannot restore dense KV snapshot into QuantizedKVCache; "
+                        "drop snapshot and re-prefill"
+                    )
+            else:
+                if isinstance(keys, tuple) or isinstance(values, tuple):
+                    raise ValueError(
+                        "Cannot restore quantized KV snapshot into dense KVCache; "
+                        "drop snapshot and re-prefill"
+                    )
+            self.kv.state = (keys, values)
+        else:
+            if isinstance(self.kv, QuantizedKVCache):
+                self.kv = QuantizedKVCache(
+                    group_size=self.kv.group_size, bits=self.kv.bits
+                )
+            else:
+                self.kv = KVCache()
         self.raw_keys = raw
         self.pooled = pooled
         self.pooled_len = 0 if pooled is None else pooled.shape[1]
-        # Derived mirror: rebuilt lazily on the first pooled_f32_view read.
-        # Restored snapshots stay 4-leaf — the state contract is unchanged.
-        self.pooled_f32_t = None
+        # Item 5 / Item 2: Seed the mirror directly from restored pooled
+        if self.pooled_bits in (4, 8) and pooled is not None and pooled.shape[1] > 0:
+            nb_val = pooled.shape[1]
+            slice_t = mx.swapaxes(pooled.astype(mx.float32), 1, 2)[:, None]
+            padded_nb = ((nb_val + 63) // 64) * 64
+            if padded_nb > nb_val:
+                slice_t = mx.pad(slice_t, [(0, 0), (0, 0), (0, 0), (0, padded_nb - nb_val)])
+            self.pooled_quant_t = mx.quantize(slice_t, group_size=64, bits=self.pooled_bits)
+            self.pooled_f32_t = None
+        elif pooled is not None and pooled.shape[1] > 0:
+            self.pooled_f32_t = mx.swapaxes(pooled.astype(mx.float32), 1, 2)[:, None]
+            self.pooled_quant_t = None
+        else:
+            self.pooled_f32_t = None
+            self.pooled_quant_t = None
         self._reserved_raw_capacity = 0 if raw is None else int(raw.shape[1])
         self._reserved_pooled_capacity = 0 if pooled is None else int(pooled.shape[1])
 
@@ -1936,7 +2098,7 @@ class QSAIndexer(nn.Module):
         )
         selected = selected & valid  # -inf padding rows never select
 
-        if S == 1 and _qsa_flash_enabled():
+        if S == 1 and _qsa_flash_enabled() and total >= _qsa_flash_min_context():
             # Flash-skip lane (MTPLX_QSA_FLASH): hand attention the sorted
             # selected BLOCK ids + host-side tail bounds; the block-sparse
             # flash kernel iterates exactly that visible set in place — no
@@ -1990,6 +2152,7 @@ class QSAIndexer(nn.Module):
             # tail start, so the lists never double-count a token; invalid
             # slots carry valid=False and are re-pointed at token 0 for the
             # take.
+            _qsa_prefill_count("gather_rows")
             blk_ok = mx.take_along_axis(valid, top_idx.astype(mx.int64), axis=-1)
             tok_blocks = (
                 top_idx.astype(mx.int32)[:, :, None] * self.ratio
@@ -2184,7 +2347,7 @@ class QSAIndexer(nn.Module):
             # Cache maintenance still belongs to the captured indexer even
             # while sparse selection is mathematically the dense causal mask.
             return "update_only"
-        if decode and _qsa_flash_enabled():
+        if decode and _qsa_flash_enabled() and total >= _qsa_flash_min_context():
             return "blocks"
         if not decode and _qsa_large_prefill_enabled(rows, total):
             return "prefill_blocks"
@@ -2332,6 +2495,13 @@ class QSAIndexer(nn.Module):
             and mode != "update_only"
             and mode != "blocks"
             and _qsa_gather_decode_enabled()
+        ):
+            return False
+
+        if (
+            decode
+            and mode == "blocks"
+            and (pos_start + int(source.shape[1])) >= _qsa_parallel_indexer_min_context()
         ):
             return False
 
@@ -2493,16 +2663,28 @@ class QSAIndexer(nn.Module):
         cache.raw_keys = result.raw_keys
         cache.pooled = result.pooled
         cache.pooled_len = logical_blocks
-        # The compiled graph rebuilt ``pooled`` wholesale, so the eager lane's
-        # fp32-transposed mirror is stale; drop it and let pooled_f32_view
-        # rebuild lazily on the next eager read.
-        cache.pooled_f32_t = None
+        # Item 5 / Item 2: Maintain mirror directly from updated pooled
+        if cache.pooled_bits in (4, 8) and result.pooled is not None and result.pooled.shape[1] > 0:
+            nb_val = result.pooled.shape[1]
+            slice_t = mx.swapaxes(result.pooled.astype(mx.float32), 1, 2)[:, None]
+            padded_nb = ((nb_val + 63) // 64) * 64
+            if padded_nb > nb_val:
+                slice_t = mx.pad(slice_t, [(0, 0), (0, 0), (0, 0), (0, padded_nb - nb_val)])
+            cache.pooled_quant_t = mx.quantize(slice_t, group_size=64, bits=cache.pooled_bits)
+            cache.pooled_f32_t = None
+        elif result.pooled is not None and result.pooled.shape[1] > 0:
+            cache.pooled_f32_t = mx.swapaxes(result.pooled.astype(mx.float32), 1, 2)[:, None]
+            cache.pooled_quant_t = None
+        else:
+            cache.pooled_f32_t = None
+            cache.pooled_quant_t = None
 
         if mode == "update_only":
             return None
         if mode == "blocks":
             block_ids, _, _ = result.selection
             tail_start = ((pos_start + 1) // self.ratio) * self.ratio
+            _qsa_prefill_count("decode_flash_skip")
             return ("flash", block_ids[0], tail_start)
         if mode == "prefill_blocks":
             block_ids, block_valid, _ = result.selection
@@ -2510,8 +2692,10 @@ class QSAIndexer(nn.Module):
             return ("flash_prefill", block_ids, block_valid)
         if mode == "row_tokens":
             token_idx, token_ok = result.selection
+            _qsa_prefill_count("gather_rows")
             return ("gather_rows", token_idx, token_ok)
         if mode == "dense_mask":
+            _qsa_prefill_count("decode_dense_mask")
             return result.selection[..., :total]
         raise ValueError(f"unknown compiled QSA indexer mode {mode!r}")
 
@@ -2610,7 +2794,31 @@ class QSAIndexer(nn.Module):
         if not legacy_fused:
             return self._select_eager(q, pos_start, cache, pooled, T)
 
-        if decode and _qsa_flash_enabled():
+        if decode and _qsa_flash_enabled() and T >= _qsa_flash_min_context():
+            # Item 1: Multi-Threadgroup Grid Parallelism for S=1 Indexer Scoring.
+            # At deep context (T >= parallel threshold), route S=1 decode through
+            # multi-threadgroup parallel GEMV/scores + Metal topk kernel instead of
+            # single-threadgroup serial scan.
+            if T >= _qsa_parallel_indexer_min_context() and pooled_backing is not None:
+                from mtplx.kernels.qsa_indexer_prefill import (
+                    qsa_indexer_prefill_scores,
+                    qsa_indexer_prefill_topk_metal,
+                )
+                pooled_t = cache.pooled_f32_view(nb_total)
+                scores = qsa_indexer_prefill_scores(q, pooled_t, head_dim=self.head_dim)
+                block_ids, _, _ = qsa_indexer_prefill_topk_metal(
+                    scores,
+                    pos_start=pos_start,
+                    total_tokens=T,
+                    logical_blocks=nb_total,
+                    block_topk=self.block_topk,
+                    compress_ratio=self.ratio,
+                    mode="blocks",
+                )
+                tail_start = ((pos_start + 1) // self.ratio) * self.ratio
+                _qsa_prefill_count("decode_flash_skip")
+                return ("flash", block_ids[0], tail_start)
+
             block_ids, _, _ = self._select_fused(
                 q,
                 pos_start,
@@ -2628,6 +2836,7 @@ class QSAIndexer(nn.Module):
             and S <= _qsa_gather_max_rows()
             and T >= _qsa_gather_min_context()
         ):
+            _qsa_prefill_count("gather_rows")
             token_idx, token_ok = self._select_fused(
                 q,
                 pos_start,
@@ -2682,11 +2891,14 @@ class QSAIndexer(nn.Module):
 
 def _qsa_rows_gather_attention(
     q: mx.array,
-    k: mx.array,
-    v: mx.array,
+    k: mx.array | tuple[mx.array, mx.array, mx.array | None],
+    v: mx.array | tuple[mx.array, mx.array, mx.array | None],
     token_idx: mx.array,
     token_ok: mx.array,
     scale: float,
+    *,
+    group_size: int = 64,
+    bits: int | None = None,
 ) -> mx.array:
     """Attention over per-row gathered tokens (rows-gather lane).
 
@@ -2705,11 +2917,30 @@ def _qsa_rows_gather_attention(
     visible set.
     """
     B, H, S, D = q.shape
-    H_kv = int(k.shape[1])
     K = int(token_idx.shape[-1])
     flat = token_idx.reshape(-1)
-    k_sel = mx.take(k, flat, axis=2).reshape(1, H_kv, S, K, D)
-    v_sel = mx.take(v, flat, axis=2).reshape(1, H_kv, S, K, D)
+    if bits is not None:
+        kw, ks, kb = k
+        vw, vs, vb = v
+        H_kv = int(kw.shape[1])
+        k_sel = mx.dequantize(
+            mx.take(kw, flat, axis=2),
+            mx.take(ks, flat, axis=2),
+            mx.take(kb, flat, axis=2) if kb is not None else None,
+            group_size=group_size,
+            bits=bits,
+        ).reshape(1, H_kv, S, K, D)
+        v_sel = mx.dequantize(
+            mx.take(vw, flat, axis=2),
+            mx.take(vs, flat, axis=2),
+            mx.take(vb, flat, axis=2) if vb is not None else None,
+            group_size=group_size,
+            bits=bits,
+        ).reshape(1, H_kv, S, K, D)
+    else:
+        H_kv = int(k.shape[1])
+        k_sel = mx.take(k, flat, axis=2).reshape(1, H_kv, S, K, D)
+        v_sel = mx.take(v, flat, axis=2).reshape(1, H_kv, S, K, D)
     neg = mx.array(-mx.inf, dtype=mx.float32)
     if H != H_kv:
         rep = H // H_kv
@@ -2732,8 +2963,8 @@ def _qsa_rows_gather_attention(
 
 def _qsa_prefill_gather_attention(
     q: mx.array,
-    keys: mx.array,
-    values: mx.array,
+    keys: mx.array | tuple[mx.array, mx.array, mx.array | None],
+    values: mx.array | tuple[mx.array, mx.array, mx.array | None],
     block_ids: mx.array,
     block_valid: mx.array,
     *,
@@ -2742,6 +2973,8 @@ def _qsa_prefill_gather_attention(
     compress_ratio: int,
     scale: float,
     tile_rows: int,
+    group_size: int = 64,
+    bits: int | None = None,
 ) -> mx.array:
     """Portable bounded attention over the flash_prefill block contract.
 
@@ -2786,6 +3019,8 @@ def _qsa_prefill_gather_attention(
             token_idx,
             token_ok,
             scale,
+            group_size=group_size,
+            bits=bits,
         )
         mx.eval(out_t)
         outputs.append(out_t)
@@ -2962,7 +3197,8 @@ class Attention(nn.Module):
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
         k, v = cache.kv.update_and_fetch(k, v)
-        T = k.shape[2]
+        is_quant = isinstance(k, tuple)
+        T = k[0].shape[2] if is_quant else k.shape[2]
 
         if vrope is not None:
             # Vision request: QSA sparse selection is bypassed and attention
@@ -2979,36 +3215,86 @@ class Attention(nn.Module):
             # set. Reads the cache BACKING arrays in place at their
             # allocation stride — the :T slice above is non-contiguous, and
             # forcing it contiguous would copy the entire KV.
-            from mtplx.kernels.qsa_flash_skip import qsa_flash_skip
-
             _, blk_idx, tail_start = sel_mask
-            out = qsa_flash_skip(
-                q.reshape(self.n_heads, self.head_dim),
-                cache.kv.keys,
-                cache.kv.values,
-                blk_idx,
-                T,
-                tail_start,
-                self.scale,
-            )
-            out = out.reshape(B, S, -1)
-            return self.o_proj(out * mx.sigmoid(gate))
+            if is_quant:
+                tok_from_blocks = (
+                    blk_idx[:, None] * self.indexer.ratio + mx.arange(self.indexer.ratio, dtype=mx.int32)
+                ).reshape(-1)
+                tail_ids = mx.arange(tail_start, T, dtype=mx.int32)
+                tok_sel = mx.concatenate([tok_from_blocks, tail_ids])
+                kw, ks, kb = cache.kv.keys
+                vw, vs, vb = cache.kv.values
+                k_sel = mx.dequantize(
+                    mx.take(kw, tok_sel, axis=2),
+                    mx.take(ks, tok_sel, axis=2),
+                    mx.take(kb, tok_sel, axis=2) if kb is not None else None,
+                    group_size=cache.kv.group_size,
+                    bits=cache.kv.bits,
+                )
+                v_sel = mx.dequantize(
+                    mx.take(vw, tok_sel, axis=2),
+                    mx.take(vs, tok_sel, axis=2),
+                    mx.take(vb, tok_sel, axis=2) if vb is not None else None,
+                    group_size=cache.kv.group_size,
+                    bits=cache.kv.bits,
+                )
+                out = mx.fast.scaled_dot_product_attention(
+                    q, k_sel, v_sel, scale=self.scale, mask=None
+                )
+                out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
+                return self.o_proj(out * mx.sigmoid(gate))
+            else:
+                from mtplx.kernels.qsa_flash_skip import qsa_flash_skip
+
+                k_mat, v_mat = cache.kv.keys, cache.kv.values
+                out = qsa_flash_skip(
+                    q.reshape(self.n_heads, self.head_dim),
+                    k_mat,
+                    v_mat,
+                    blk_idx,
+                    T,
+                    tail_start,
+                    self.scale,
+                )
+                out = out.reshape(B, S, -1)
+                return self.o_proj(out * mx.sigmoid(gate))
 
         if isinstance(sel_mask, tuple) and sel_mask and sel_mask[0] == "flash_prefill":
             # Large-S prefill consumes compact per-row block selections
             # directly from the full cache backing.  This is the point of the
             # prefill port: no [S,T] selection expansion and no per-row K/V
             # gather on the supported production geometry.
+            _, block_ids, block_valid = sel_mask
+            if is_quant:
+                out = _qsa_prefill_gather_attention(
+                    q,
+                    cache.kv.keys,
+                    cache.kv.values,
+                    block_ids,
+                    block_valid,
+                    pos_start=pos_start,
+                    total_tokens=T,
+                    compress_ratio=self.indexer.ratio,
+                    scale=self.scale,
+                    tile_rows=_qsa_prefill_gather_tile_rows(),
+                    group_size=cache.kv.group_size,
+                    bits=cache.kv.bits,
+                )
+                _qsa_prefill_count("gather_tier")
+                out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
+                return self.o_proj(out * mx.sigmoid(gate))
+
             from mtplx.kernels.qsa_prefill_flash import (
                 qsa_prefill_flash,
                 qsa_prefill_flash_supported,
             )
 
-            _, block_ids, block_valid = sel_mask
+            k_backing = cache.kv.keys
+            v_backing = cache.kv.values
             if _qsa_prefill_flash_attention_enabled(S, T) and qsa_prefill_flash_supported(
                 q,
-                cache.kv.keys,
-                cache.kv.values,
+                k_backing,
+                v_backing,
                 block_ids,
                 block_valid,
                 pos_start=pos_start,
@@ -3017,8 +3303,8 @@ class Attention(nn.Module):
             ):
                 out = qsa_prefill_flash(
                     q,
-                    cache.kv.keys,
-                    cache.kv.values,
+                    k_backing,
+                    v_backing,
                     block_ids,
                     block_valid,
                     pos_start=pos_start,
@@ -3036,8 +3322,8 @@ class Attention(nn.Module):
             if _qsa_prefill_gather_enabled():
                 out = _qsa_prefill_gather_attention(
                     q,
-                    cache.kv.keys,
-                    cache.kv.values,
+                    k_backing,
+                    v_backing,
                     block_ids,
                     block_valid,
                     pos_start=pos_start,
@@ -3068,7 +3354,19 @@ class Attention(nn.Module):
             # through a dense [S, T] mask. See _qsa_rows_gather_attention
             # (adapting community PR #380 by @maceip).
             _, tok_idx, tok_ok = sel_mask
-            out = _qsa_rows_gather_attention(q, k, v, tok_idx, tok_ok, self.scale)
+            if is_quant:
+                out = _qsa_rows_gather_attention(
+                    q,
+                    cache.kv.keys,
+                    cache.kv.values,
+                    tok_idx,
+                    tok_ok,
+                    self.scale,
+                    group_size=cache.kv.group_size,
+                    bits=cache.kv.bits,
+                )
+            else:
+                out = _qsa_rows_gather_attention(q, k, v, tok_idx, tok_ok, self.scale)
             out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
             return self.o_proj(out * mx.sigmoid(gate))
 
@@ -3078,8 +3376,24 @@ class Attention(nn.Module):
             # instead of the full context through a dense bool mask. All
             # gathered tokens are visible, so no mask is needed; the
             # softmax over the same visible set is identical math.
-            k = mx.take(k, sel_mask, axis=2)
-            v = mx.take(v, sel_mask, axis=2)
+            if is_quant:
+                k = mx.dequantize(
+                    mx.take(k[0], sel_mask, axis=2),
+                    mx.take(k[1], sel_mask, axis=2),
+                    mx.take(k[2], sel_mask, axis=2),
+                    group_size=cache.kv.group_size,
+                    bits=cache.kv.bits,
+                )
+                v = mx.dequantize(
+                    mx.take(v[0], sel_mask, axis=2),
+                    mx.take(v[1], sel_mask, axis=2),
+                    mx.take(v[2], sel_mask, axis=2),
+                    group_size=cache.kv.group_size,
+                    bits=cache.kv.bits,
+                )
+            else:
+                k = mx.take(k, sel_mask, axis=2)
+                v = mx.take(v, sel_mask, axis=2)
             mask = None
         elif sel_mask is not None:
             mask = sel_mask
@@ -3090,9 +3404,14 @@ class Attention(nn.Module):
         else:
             mask = None
 
-        out = mx.fast.scaled_dot_product_attention(
-            q, k, v, scale=self.scale, mask=mask
-        )
+        if is_quant and not (sel_mask is not None and sel_mask.ndim == 1):
+            out = quantized_scaled_dot_product_attention(
+                q, k, v, scale=self.scale, mask=mask, group_size=cache.kv.group_size, bits=cache.kv.bits
+            )
+        else:
+            out = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=self.scale, mask=mask
+            )
         out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
         return self.o_proj(out * mx.sigmoid(gate))
 
@@ -3308,15 +3627,21 @@ class _SidecarGather:
         # — and keeps its speed when macOS reclaims the file's page cache
         # under memory pressure. All access is on the single generation
         # thread (stage()/forward); the pread pool only warms pages and
-        # never touches this dict. MTPLX_NGRAM_HOT_MB sizes it
-        # (default 1024; 0 disables).
+        # never touches this dict. MTPLX_NGRAM_HOT_ROWS / MTPLX_NGRAM_HOT_MB
+        # sizes it (default 1024 MB; 0 disables).
         self._hot = OrderedDict()
         self._hot_row_bytes = max(1, sum(rb for _, rb in self._row_meta))
-        try:
-            hot_mb = int(os.environ.get("MTPLX_NGRAM_HOT_MB", "1024"))
-        except ValueError:
-            hot_mb = 1024
-        self._hot_cap_rows = (max(0, hot_mb) * 2**20) // self._hot_row_bytes
+        if os.environ.get("MTPLX_NGRAM_HOT_ROWS"):
+            try:
+                self._hot_cap_rows = max(0, int(os.environ.get("MTPLX_NGRAM_HOT_ROWS") or 0))
+            except ValueError:
+                self._hot_cap_rows = 0
+        else:
+            try:
+                hot_mb = int(os.environ.get("MTPLX_NGRAM_HOT_MB", "1024"))
+            except ValueError:
+                hot_mb = 1024
+            self._hot_cap_rows = (max(0, hot_mb) * 2**20) // self._hot_row_bytes
         self.hot_hits = 0
         self.hot_misses = 0
 
@@ -4114,15 +4439,15 @@ class TextModel(nn.Module):
             emb = self.model.embed_tokens(next_token_ids)
         return self.mtp.fuse_and_run(hidden_states, emb, mtp_cache)
 
-    def make_mtp_cache(self):
-        return [QSACache(self.model.args.indexer_compress_ratio or 4)]
+    def make_mtp_cache(self, kv_bits: Optional[int] = None):
+        return [QSACache(self.model.args.indexer_compress_ratio or 4, kv_bits=kv_bits)]
 
-    def make_cache(self):
+    def make_cache(self, kv_bits: Optional[int] = None):
         ratio = self.model.args.indexer_compress_ratio or 4
         caches = []
         for i, layer in enumerate(self.model.layers):
             if not layer.is_linear:
-                caches.append(QSACache(ratio))
+                caches.append(QSACache(ratio, kv_bits=kv_bits))
             elif "ple" in layer:
                 caches.append(ArraysCache(size=4))
             else:
@@ -4240,8 +4565,8 @@ class Model(nn.Module):
     def layers(self):
         return self.language_model.model.layers
 
-    def make_cache(self):
-        return self.language_model.make_cache()
+    def make_cache(self, kv_bits: Optional[int] = None):
+        return self.language_model.make_cache(kv_bits=kv_bits)
 
     # ---- MTP attach -------------------------------------------------------
 
@@ -4360,7 +4685,8 @@ class Model(nn.Module):
                 continue
             emb = layer.ple.ple_embedding
             table = emb.ngram_embedding
-            if enabled and getattr(table, "_lazy_parts", None) is None:
+            has_residency = getattr(table, "_lazy_parts", None) is not None
+            if enabled and not has_residency:
                 ready = False
                 continue
             emb._stage_disabled = bool(enabled)

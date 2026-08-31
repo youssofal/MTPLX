@@ -32,6 +32,7 @@ def _run(layer, prefill, decodes):
 
 
 def test_flash_parity_past_engage_threshold(attn, monkeypatch):
+    monkeypatch.setenv("MTPLX_QSA_FLASH_MIN_CONTEXT", "0")
     ratio = attn.indexer.ratio
     engage_t = attn.indexer.block_topk * ratio
     T0 = engage_t + 8 * ratio
@@ -69,6 +70,7 @@ def test_flash_parity_past_engage_threshold(attn, monkeypatch):
 
 def test_flash_inactive_below_threshold(attn, monkeypatch):
     monkeypatch.setenv("MTPLX_QSA_FLASH", "1")
+    monkeypatch.setenv("MTPLX_QSA_FLASH_MIN_CONTEXT", "0")
     mx.random.seed(37)
     prefill = (mx.random.normal((1, 64, 2560)) * 0.3).astype(mx.bfloat16)
     step = (mx.random.normal((1, 1, 2560)) * 0.3).astype(mx.bfloat16)
@@ -77,3 +79,26 @@ def test_flash_inactive_below_threshold(attn, monkeypatch):
     sel = attn.indexer(step, cache.offset, cache)
     assert sel is None
     mx.eval(p)
+
+
+def test_flash_fence_defaults():
+    from mtplx.models.qwen4_exp import _qsa_flash_min_context
+    assert _qsa_flash_min_context() == 16384
+
+
+def test_flash_stays_dense_below_min_context(attn, monkeypatch):
+    monkeypatch.setenv("MTPLX_QSA_FLASH", "1")
+    monkeypatch.setenv("MTPLX_QSA_FLASH_MIN_CONTEXT", "16384")
+    ratio = attn.indexer.ratio
+    engage_t = attn.indexer.block_topk * ratio
+    T0 = engage_t + 8 * ratio
+    mx.random.seed(31)
+    prefill = (mx.random.normal((1, T0, 2560)) * 0.3).astype(mx.bfloat16)
+    decodes = [
+        (mx.random.normal((1, 1, 2560)) * 0.3).astype(mx.bfloat16) for _ in range(3)
+    ]
+    cache = QSACache(compress_ratio=attn.indexer.ratio)
+    p = attn(prefill, cache)
+    mx.eval(p)
+    sel = attn.indexer(decodes[0], cache.offset, cache)
+    assert isinstance(sel, mx.array) and sel.ndim == 4, "must stay dense below 16k context"

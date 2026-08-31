@@ -366,12 +366,19 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         "MTPLX_MTP_HISTORY_POLICY",
         "MTPLX_MTP_HISTORY_LAST_WINDOW",
         "MTPLX_MTP_HISTORY_LAST_WINDOW_THRESHOLD",
+        "MTPLX_MTP_HISTORY_DEEP_CAP",
         "MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY",
         "MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD",
         "MTPLX_LONG_CONTEXT_MTP_DEPTH",
         "MTPLX_CLEAR_CACHE_EVERY",
         "MTPLX_COMPILED_VERIFY",
         "MTPLX_COMPILED_VERIFY_MAX_LEN",
+        "MTPLX_COMPILED_VERIFY_MAX_CONTEXT",
+        "MTPLX_QSA_FLASH_MIN_CONTEXT",
+        "MTPLX_QSA_PARALLEL_INDEXER_MIN_CONTEXT",
+        "MTPLX_NGRAM_HOT_ROWS",
+        "MTPLX_QSA_KV_BITS",
+        "MTPLX_QSA_POOLED_BITS",
         "MTPLX_COMPILED_TARGET_PREFIX",
         "MTPLX_FUSE_GDN_POST_CONV",
         "MTPLX_A3B_GDN_POSTCONV_IMPL",
@@ -473,11 +480,9 @@ SUSTAINED_PREFILL_ENV = {
     "MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY": "off",
     "MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD": "98304",
     "MTPLX_LONG_CONTEXT_MTP_DEPTH": "3",
-    # Real OpenCode/Pi app runs showed that the 16k auto flip to an 8k
-    # MTP-history window can crater acceptance and long-context decode speed.
-    # Keep the full committed history in the product path; "auto" remains an
-    # explicit diagnostic override.
-    "MTPLX_MTP_HISTORY_POLICY": "committed",
+    # Context-scaled MTP history policy (Item 6): committed below threshold,
+    # context-widening window above threshold.
+    "MTPLX_MTP_HISTORY_POLICY": "auto",
     "MTPLX_MTP_HISTORY_LAST_WINDOW": "8192",
     "MTPLX_MTP_HISTORY_LAST_WINDOW_THRESHOLD": "16384",
     "MTPLX_DYNAMIC_PAGED_KV": "1",

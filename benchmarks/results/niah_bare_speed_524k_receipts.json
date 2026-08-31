@@ -1,0 +1,112 @@
+[
+  {
+    "context_target": 524288,
+    "needle_position_fraction": 0.1,
+    "needle_position_percent": "10%",
+    "needle": "PASSKEY-E2259B29",
+    "retrieved_content": "The secret passkey for retrieval verification mentioned in the text is **PASSKEY-E2259B29**.",
+    "success": true,
+    "prompt_tokens": 439778,
+    "completion_tokens": 25,
+    "ttft_s": 584.1181892500026,
+    "wall_time_s": 586.238906249986,
+    "prefill_tok_s": 753.1583081367324,
+    "decode_tok_s": 15.661732345086902,
+    "peak_memory_gb": 85.94145526923239,
+    "prefill_route": "contiguous_then_repage"
+  },
+  {
+    "context_target": 524288,
+    "needle_position_fraction": 0.25,
+    "needle_position_percent": "25%",
+    "needle": "PASSKEY-CB187563",
+    "retrieved_content": "The secret passkey for retrieval verification mentioned in the text is **PASSKEY-CB187563**.",
+    "success": true,
+    "prompt_tokens": 439778,
+    "completion_tokens": 25,
+    "ttft_s": 557.8856343330117,
+    "wall_time_s": 559.9206771670142,
+    "prefill_tok_s": 788.6154063569725,
+    "decode_tok_s": 16.103282073505923,
+    "peak_memory_gb": 85.96701391041279,
+    "prefill_route": "contiguous_then_repage"
+  },
+  {
+    "context_target": 524288,
+    "needle_position_fraction": 0.5,
+    "needle_position_percent": "50%",
+    "needle": "PASSKEY-DD7AB1EE",
+    "retrieved_content": "The secret passkey for retrieval verification mentioned in the text is **PASSKEY-DD7AB1EE**.",
+    "success": true,
+    "prompt_tokens": 439775,
+    "completion_tokens": 22,
+    "ttft_s": 563.1868194169947,
+    "wall_time_s": 565.2353458330035,
+    "prefill_tok_s": 781.1237581866623,
+    "decode_tok_s": 14.284255382136864,
+    "peak_memory_gb": 85.96701391041279,
+    "prefill_route": "contiguous_then_repage"
+  },
+  {
+    "context_target": 524288,
+    "needle_position_fraction": 0.75,
+    "needle_position_percent": "75%",
+    "needle": "PASSKEY-F81C0C8C",
+    "retrieved_content": "The secret passkey for retrieval verification mentioned in the text is **PASSKEY-F81C0C8C**.",
+    "success": true,
+    "prompt_tokens": 439778,
+    "completion_tokens": 25,
+    "ttft_s": 591.1026345829596,
+    "wall_time_s": 593.3695557499886,
+    "prefill_tok_s": 744.2013706223463,
+    "decode_tok_s": 14.26923812714462,
+    "peak_memory_gb": 85.9673343449831,
+    "prefill_route": "contiguous_then_repage"
+  },
+  {
+    "context_target": 524288,
+    "needle_position_fraction": 0.9,
+    "needle_position_percent": "90%",
+    "needle": "PASSKEY-DB148C3C",
+    "retrieved_content": "The secret passkey for retrieval verification mentioned in the text is **PASSKEY-DB148C3C**.",
+    "success": true,
+    "prompt_tokens": 439778,
+    "completion_tokens": 25,
+    "ttft_s": 592.6973846670007,
+    "wall_time_s": 594.6881071669632,
+    "prefill_tok_s": 742.226871461895,
+    "decode_tok_s": 16.71547352979969,
+    "peak_memory_gb": 85.9673343449831,
+    "prefill_route": "contiguous_then_repage"
+  },
+  {
+    "context_target": 1048576,
+    "needle_position_fraction": 0.1,
+    "error": "HTTP Error 507: Insufficient Storage",
+    "success": false
+  },
+  {
+    "context_target": 1048576,
+    "needle_position_fraction": 0.25,
+    "error": "HTTP Error 507: Insufficient Storage",
+    "success": false
+  },
+  {
+    "context_target": 1048576,
+    "needle_position_fraction": 0.5,
+    "error": "HTTP Error 507: Insufficient Storage",
+    "success": false
+  },
+  {
+    "context_target": 1048576,
+    "needle_position_fraction": 0.75,
+    "error": "HTTP Error 507: Insufficient Storage",
+    "success": false
+  },
+  {
+    "context_target": 1048576,
+    "needle_position_fraction": 0.9,
+    "error": "HTTP Error 507: Insufficient Storage",
+    "success": false
+  }
+]

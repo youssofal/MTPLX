@@ -32,6 +32,7 @@ def _count_connects(tier, monkeypatch) -> list:
 def test_repeated_stats_polls_reuse_cached_aggregate(tmp_path, monkeypatch):
     tier = _tier(tmp_path)
     try:
+        tier._ensure_disk_usage_snapshot()
         calls = _count_connects(tier, monkeypatch)
         first = tier.stats()
         connects_after_first = len(calls)
@@ -49,6 +50,7 @@ def test_repeated_stats_polls_reuse_cached_aggregate(tmp_path, monkeypatch):
 def test_store_mutation_invalidates_stats_snapshot(tmp_path, monkeypatch):
     tier = _tier(tmp_path)
     try:
+        tier._ensure_disk_usage_snapshot()
         calls = _count_connects(tier, monkeypatch)
         tier.stats()
         baseline = len(calls)

@@ -415,8 +415,19 @@ def _mtp_history_uses_committed_cache(policy: str) -> bool:
     return _normalize_mtp_history_policy(policy) in {"committed", "last_window"}
 
 
-def _mtp_history_last_window_tokens() -> int:
-    return max(1, _env_int("MTPLX_MTP_HISTORY_LAST_WINDOW", 8192))
+def _mtp_history_last_window_tokens(prompt_tokens: int = 0) -> int:
+    base = max(1, _env_int("MTPLX_MTP_HISTORY_LAST_WINDOW", 8192))
+    # Adaptive MTP Window Throttling at Extreme Depths (Item 3):
+    # Cap draft head history window at 16k when context > 262k to keep verification rounds bounded < 5ms.
+    if prompt_tokens > 262144:
+        cap = max(1, _env_int("MTPLX_MTP_HISTORY_DEEP_CAP", 16384))
+        return min(max(base, 16384), cap)
+    # Context-scaled widening window (Item 6): 8k at 16k, 16k at 32k, 32k at 64k+
+    if prompt_tokens >= 65536:
+        return max(base, 32768)
+    if prompt_tokens >= 32768:
+        return max(base, 16384)
+    return base
 
 
 def _resolve_mtp_history_policy(requested_policy: str, prompt_tokens: int) -> str:
@@ -444,17 +455,32 @@ def _runtime_count(rt: MTPLXRuntime, key: str, amount: int = 1) -> None:
 
 
 def _runtime_counter_snapshot(rt: MTPLXRuntime) -> dict[str, int]:
-    return {
+    base = {
         str(key): int(value)
         for key, value in getattr(rt, "diagnostic_counters", {}).items()
     }
+    try:
+        from mtplx.models.qwen4_exp import qsa_prefill_engagement
+
+        for k, v in qsa_prefill_engagement().items():
+            base[f"qsa_{k}"] = int(v)
+    except Exception:
+        pass
+    return base
 
 
 def _runtime_counter_delta(
     rt: MTPLXRuntime,
     before: dict[str, int],
 ) -> dict[str, int]:
-    current = getattr(rt, "diagnostic_counters", {})
+    current = dict(getattr(rt, "diagnostic_counters", {}))
+    try:
+        from mtplx.models.qwen4_exp import qsa_prefill_engagement
+
+        for k, v in qsa_prefill_engagement().items():
+            current[f"qsa_{k}"] = int(v)
+    except Exception:
+        pass
     keys = set(before) | set(current)
     return {
         str(key): int(current.get(key, 0)) - int(before.get(key, 0)) for key in keys
@@ -612,6 +638,20 @@ def _attach_runtime_diagnostics(
     stats.decode_partitioned_paged_calls = int(
         owned_attn.get("decode_partitioned_paged_calls") or 0
     )
+    try:
+        qsa_counts = {
+            k[4:]: int(counters.get(k, 0))
+            for k in counters.keys()
+            if k.startswith("qsa_")
+        }
+        stats.decode_flash_skip = qsa_counts.get("decode_flash_skip", 0)
+        stats.decode_dense_mask = qsa_counts.get("decode_dense_mask", 0)
+        stats.gather_rows = qsa_counts.get("gather_rows", 0)
+        stats.dense_fallback = qsa_counts.get("dense_fallback", 0)
+        stats.decode_gather = qsa_counts.get("decode_gather", 0)
+        stats.qsa_prefill_engagement = qsa_counts
+    except Exception:
+        pass
 
 
 def _sustained_prefill_enabled() -> bool:
@@ -2184,6 +2224,12 @@ class GenerationStats:
     # Fork-EV shadow telemetry aggregate (MTPLX_FORKEV_TELEMETRY); empty dict
     # when the instrument is off. Schema: mtplx/forkev_telemetry.py snapshot().
     forkev: dict[str, object] = field(default_factory=dict)
+    decode_flash_skip: int = 0
+    decode_dense_mask: int = 0
+    gather_rows: int = 0
+    dense_fallback: int = 0
+    decode_gather: int = 0
+    qsa_prefill_engagement: dict[str, int] = field(default_factory=dict)
     events: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -2860,6 +2906,16 @@ def _prefill_restored_prompt_suffix(
     emit_chunk(1, chunk_elapsed, started)
     _check_postcommit_abort(abort_check)
     _check_splice_consumed()
+    if use_committed_mtp and mtp_history_policy == "last_window" and restored.mtp_history_cache:
+        target_win = _mtp_history_last_window_tokens(tokens_total)
+        if target_win > 0:
+            first_entry = restored.mtp_history_cache[0]
+            off = getattr(first_entry, "offset", None)
+            if off is not None and off > target_win:
+                excess = off - target_win
+                for c in restored.mtp_history_cache:
+                    if hasattr(c, "trim"):
+                        c.trim(excess)
     return (
         suffix_logits[:, -1, :],
         suffix_hidden[:, -1:, :] if suffix_hidden is not None else None,
@@ -2962,6 +3018,7 @@ def _entry_matches_restore_lookup(
     mtp_history_policy: str | None,
     draft_head_identity: str | None,
     policy_fingerprint: str | None,
+    prompt_tokens: int | None = None,
 ) -> bool:
     if getattr(entry, "model_path", None) != str(rt.model_path):
         return False
@@ -2980,6 +3037,20 @@ def _entry_matches_restore_lookup(
         if entry_policy != mtp_history_policy:
             committed = {"committed", "last_window"}
             if entry_policy not in committed or mtp_history_policy not in committed:
+                return False
+        if mtp_history_policy == "last_window" and prompt_tokens is not None:
+            req_window = _mtp_history_last_window_tokens(int(prompt_tokens))
+            entry_len = int(
+                getattr(entry, "prefix_len", 0)
+                or getattr(entry, "snapshot_epoch", 0)
+                or len(getattr(entry, "token_ids", ()) or ())
+            )
+            entry_stored_history = (
+                entry_len
+                if entry_policy == "committed"
+                else _mtp_history_last_window_tokens(entry_len)
+            )
+            if req_window > entry_stored_history:
                 return False
     if (
         draft_head_identity is not None
@@ -3120,6 +3191,7 @@ def _restore_near_prefix_prompt_state(
             mtp_history_policy=mtp_history_policy,
             draft_head_identity=draft_head_identity,
             policy_fingerprint=policy_fingerprint,
+            prompt_tokens=len(prompt_ids),
         ):
             _near_debug("identity_mismatch")
             continue
@@ -3853,7 +3925,9 @@ def restore_or_prefill_prompt_state(
         # MTP-enabled runtimes keep their requested committed policy.
         mtp_history_policy = "cycle"
     mtp_history_window_tokens = (
-        _mtp_history_last_window_tokens() if mtp_history_policy == "last_window" else 0
+        _mtp_history_last_window_tokens(len(prompt_ids))
+        if mtp_history_policy == "last_window"
+        else 0
     )
     # Dashboard prefill instrumentation. We fire `phase: "started"` before
     # any restore/prefill work runs (so the UI can flip into prefill mode
@@ -4114,6 +4188,25 @@ def restore_or_prefill_prompt_state(
             cache_factory=restore_cache_factory,
         )
         restore_elapsed_s = time.perf_counter() - restore_started
+        if (
+            restored is not None
+            and mtp_history_policy == "last_window"
+            and restored.mtp_history_cache
+        ):
+            req_window = _mtp_history_last_window_tokens(len(prompt_ids))
+            first_entry = restored.mtp_history_cache[0]
+            actual_history = getattr(first_entry, "offset", None)
+            if actual_history is not None:
+                entry_policy = getattr(restored.entry, "mtp_history_policy", None)
+                if entry_policy == "last_window" and req_window > actual_history:
+                    # Stored history is narrower than required; drop restored and rebuild
+                    restored = None
+                elif actual_history > req_window:
+                    excess = actual_history - req_window
+                    for c in restored.mtp_history_cache:
+                        if hasattr(c, "trim"):
+                            c.trim(excess)
+
         if restored is not None and (
             not _mtp_history_uses_committed_cache(mtp_history_policy)
             or restored.mtp_history_cache is not None

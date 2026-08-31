@@ -1,0 +1,50 @@
+[
+  {
+    "context_target": 16384,
+    "needle_position_fraction": 0.1,
+    "needle_position_percent": "10%",
+    "needle": "PASSKEY-D2E08D99",
+    "retrieved_content": "PASSKEY-D2E08D99",
+    "success": true,
+    "prompt_tokens": 10148,
+    "completion_tokens": 11,
+    "ttft_s": 14.07682770799147,
+    "wall_time_s": 14.461399749969132,
+    "prefill_tok_s": 722.2411554164727,
+    "decode_tok_s": 34.22469179137289,
+    "peak_memory_gb": 72.91861932352185,
+    "prefill_route": "contiguous_dense_decode"
+  },
+  {
+    "context_target": 16384,
+    "needle_position_fraction": 0.5,
+    "needle_position_percent": "50%",
+    "needle": "PASSKEY-C4BCEB20",
+    "retrieved_content": "The secret passkey for retrieval verification mentioned in the text is **PASSKEY-C4BCEB20**.",
+    "success": true,
+    "prompt_tokens": 10147,
+    "completion_tokens": 24,
+    "ttft_s": 17.721877875039354,
+    "wall_time_s": 18.471985500014853,
+    "prefill_tok_s": 573.4903303682423,
+    "decode_tok_s": 34.32428621434423,
+    "peak_memory_gb": 74.40164642035961,
+    "prefill_route": "contiguous_dense_decode"
+  },
+  {
+    "context_target": 16384,
+    "needle_position_fraction": 0.9,
+    "needle_position_percent": "90%",
+    "needle": "PASSKEY-E15172FF",
+    "retrieved_content": "PASSKEY-E15172FF",
+    "success": true,
+    "prompt_tokens": 10147,
+    "completion_tokens": 10,
+    "ttft_s": 13.530419500020798,
+    "wall_time_s": 13.939810416952241,
+    "prefill_tok_s": 447.8045931577012,
+    "decode_tok_s": 28.672088325369746,
+    "peak_memory_gb": 75.56546933576465,
+    "prefill_route": "contiguous_dense_decode"
+  }
+]

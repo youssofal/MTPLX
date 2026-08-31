@@ -94,6 +94,11 @@ RECEIPT_FIELDS = [
     "generation_mode",
     "ttft_s",
     "peak_memory_bytes",
+    "decode_flash_skip",
+    "decode_dense_mask",
+    "gather_rows",
+    "dense_fallback",
+    "decode_gather",
 ]
 
 
