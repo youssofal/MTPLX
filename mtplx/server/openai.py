@@ -4759,14 +4759,22 @@ def _anthropic_usage_from_openai_usage(usage: Any) -> dict[str, int]:
     """
 
     data = usage if isinstance(usage, dict) else {}
+    prompt_tokens = max(0, int(data.get("prompt_tokens") or 0))
+    # OpenAI usage.prompt_tokens is the GRAND TOTAL and prompt_tokens_details.cached_tokens is a
+    # SUBSET of it. Anthropic's input_tokens and cache_read_input_tokens are DISJOINT
+    # (total_input = input_tokens + cache_read_input_tokens + cache_creation_input_tokens). Copying
+    # prompt_tokens straight into input_tokens while also reporting cache_read_input_tokens
+    # double-counts the cached prefix on every hit, so clients that sum the disjoint fields — Claude
+    # Code / Pi context and auto-compaction math — overcount by the prefix size and compact
+    # prematurely. Subtract the cached prefix; clamp defensively against malformed upstream usage.
+    cached_tokens = int((data.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
+    cached_tokens = min(max(0, cached_tokens), prompt_tokens)
     return {
-        "input_tokens": int(data.get("prompt_tokens") or 0),
+        "input_tokens": prompt_tokens - cached_tokens,
         "output_tokens": int(data.get("completion_tokens") or 0),
         # Anthropic-native mirror of the session-cache prefix hit
         # (#121/#144); Claude Code and Pi read this field directly.
-        "cache_read_input_tokens": int(
-            (data.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
-        ),
+        "cache_read_input_tokens": cached_tokens,
     }
 
 

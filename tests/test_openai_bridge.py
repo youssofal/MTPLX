@@ -28,6 +28,7 @@ from mtplx.server.openai import (
     _record_stream_cancellation_metric,
     _anthropic_stream_from_openai_sse,
     _anthropic_to_chat_request,
+    _anthropic_usage_from_openai_usage,
     _IncrementalTokenDecoder,
     _StreamCancelled,
     _ThinkingContentStreamSplitter,
@@ -2665,3 +2666,36 @@ def test_marathon_postcommit_protection_env_resolution(monkeypatch):
     monkeypatch.setenv("MTPLX_POSTCOMMIT_MARATHON_WAIT_S", "-3")
     assert _marathon_postcommit_protect_tokens() == 0
     assert _marathon_postcommit_wait_s() == 30.0
+
+
+def test_anthropic_usage_excludes_cache_read_from_input_tokens():
+    # OpenAI prompt_tokens is the grand total (cached is a subset); Anthropic input_tokens and
+    # cache_read_input_tokens are disjoint. On a prefix-cache hit, input_tokens must be the
+    # non-cached remainder so Claude Code / Pi context + auto-compaction math does not double-count.
+    usage = {
+        "prompt_tokens": 44202,
+        "completion_tokens": 128,
+        "prompt_tokens_details": {"cached_tokens": 42154},
+    }
+    out = _anthropic_usage_from_openai_usage(usage)
+    assert out["cache_read_input_tokens"] == 42154
+    assert out["input_tokens"] == 44202 - 42154  # 2048, not the full 44202
+    assert out["output_tokens"] == 128
+    # disjoint Anthropic fields reconstruct the OpenAI grand total
+    assert out["input_tokens"] + out["cache_read_input_tokens"] == usage["prompt_tokens"]
+
+
+def test_anthropic_usage_no_cache_hit_passes_prompt_through():
+    out = _anthropic_usage_from_openai_usage(
+        {"prompt_tokens": 1000, "completion_tokens": 10}
+    )
+    assert out["input_tokens"] == 1000
+    assert out["cache_read_input_tokens"] == 0
+
+
+def test_anthropic_usage_clamps_cached_over_prompt():
+    out = _anthropic_usage_from_openai_usage(
+        {"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": 999}}
+    )
+    assert out["input_tokens"] == 0
+    assert out["cache_read_input_tokens"] == 100
