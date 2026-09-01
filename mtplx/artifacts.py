@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import urllib.parse
@@ -28,6 +29,13 @@ from .models.laguna_config import (
     LAGUNA_S_2_1_WEIGHT_SHARDS,
     is_laguna_s_2_1_mlx_4bit_config,
     laguna_s_2_1_artifact_integrity_errors,
+)
+from .models.deepseek_v4_target_only_config import (
+    DEEPSEEK_V4_TARGET_ONLY_REPO_ID,
+    DEEPSEEK_V4_TARGET_ONLY_REQUIRED_FILES,
+    DEEPSEEK_V4_TARGET_ONLY_REVISION,
+    deepseek_v4_target_only_artifact_integrity_errors,
+    is_deepseek_v4_target_only_config,
 )
 from .profiles import (
     DEFAULT_FP16_HF_MODEL_ID,
@@ -492,6 +500,8 @@ class ModelInspection:
     num_experts_per_tok: int | None = None
     laguna_s_2_1_mlx_4bit_match: bool = False
     laguna_s_2_1_artifacts_complete: bool = False
+    deepseek_v4_target_only_match: bool = False
+    deepseek_v4_target_only_artifacts_complete: bool = False
     mtp_pattern: str | None = None
     source: str = "local"
     quantization: dict[str, Any] = field(default_factory=dict)
@@ -542,6 +552,8 @@ class ModelInspection:
             "num_experts_per_tok": self.num_experts_per_tok,
             "laguna_s_2_1_mlx_4bit_match": self.laguna_s_2_1_mlx_4bit_match,
             "laguna_s_2_1_artifacts_complete": self.laguna_s_2_1_artifacts_complete,
+            "deepseek_v4_target_only_match": self.deepseek_v4_target_only_match,
+            "deepseek_v4_target_only_artifacts_complete": self.deepseek_v4_target_only_artifacts_complete,
             "quantization": self.quantization,
             "sidecars": self.sidecars,
             "model_files": list(self.model_files),
@@ -972,12 +984,99 @@ def _local_laguna_artifacts_complete(model_path: Path) -> bool:
     return set(weight_map.values()) == set(LAGUNA_S_2_1_WEIGHT_SHARDS)
 
 
-def _inspect_hf_model(repo_id: str) -> ModelInspection:
-    revision = (
-        LAGUNA_S_2_1_REVISION
-        if repo_id.casefold() == LAGUNA_S_2_1_REPO_ID.casefold()
-        else None
+def _remote_deepseek_v4_target_only_artifacts_complete(
+    repo_id: str, files: set[str]
+) -> bool:
+    """Require the complete, immutable public target-only file layout.
+
+    Remote inspection can prove names at the pinned revision. The pull path
+    subsequently verifies every pinned content hash before a local directory is
+    admitted to the external runtime.
+    """
+
+    return bool(
+        repo_id.casefold() == DEEPSEEK_V4_TARGET_ONLY_REPO_ID.casefold()
+        and DEEPSEEK_V4_TARGET_ONLY_REQUIRED_FILES.issubset(files)
     )
+
+
+def _sha256_file(path: Path) -> str:
+    """Hash an artifact without materializing a 100+ GB file in memory."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _local_deepseek_v4_target_only_artifacts_complete(model_path: Path) -> bool:
+    """Admit only an exact pull or the sealed content-identical Gold view."""
+
+    try:
+        source = json.loads(
+            (model_path / ".mtplx-source.json").read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        source = None
+    if (
+        isinstance(source, dict)
+        and source.get("repo_id") == DEEPSEEK_V4_TARGET_ONLY_REPO_ID
+        and source.get("revision") == DEEPSEEK_V4_TARGET_ONLY_REVISION
+    ):
+        return not deepseek_v4_target_only_artifact_integrity_errors(model_path)
+
+    # The original target-only clone view predates MTPLX's source marker.  It
+    # is admissible only when the independently sealed content manifest still
+    # matches every expected file; inode/ctime data deliberately does not
+    # participate because APFS clone materialization changes those fields.
+    seal_path = model_path / ".dsv4-target-only-gold-view-SEAL.json"
+    try:
+        seal_bytes = seal_path.read_bytes()
+        if hashlib.sha256(seal_bytes).hexdigest() != (
+            "50cd20ae84b6c7ebe79c27e08da89c3e419fcde5b529fbd6c47f6387bbf0e79f"
+        ):
+            return False
+        seal = json.loads(seal_bytes)
+        outputs = seal.get("outputs") if isinstance(seal, dict) else None
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(outputs, list):
+        return False
+    expected_names = set(DEEPSEEK_V4_TARGET_ONLY_REQUIRED_FILES) | {"README.md"}
+    observed_names: set[str] = set()
+    for output in outputs:
+        if not isinstance(output, dict):
+            return False
+        name = output.get("logical_path")
+        identity = output.get("path_identity")
+        if (
+            not isinstance(name, str)
+            or name in observed_names
+            or name not in expected_names
+            or not isinstance(identity, dict)
+            or not isinstance(identity.get("sha256"), str)
+        ):
+            return False
+        try:
+            current_sha = _sha256_file(model_path / name)
+        except OSError:
+            return False
+        if current_sha != identity["sha256"]:
+            return False
+        observed_names.add(name)
+    return observed_names == expected_names and not deepseek_v4_target_only_artifact_integrity_errors(
+        model_path, verify_shard_hashes=False
+    )
+
+
+def _inspect_hf_model(repo_id: str) -> ModelInspection:
+    if repo_id.casefold() == LAGUNA_S_2_1_REPO_ID.casefold():
+        revision = LAGUNA_S_2_1_REVISION
+    elif repo_id.casefold() == DEEPSEEK_V4_TARGET_ONLY_REPO_ID.casefold():
+        revision = DEEPSEEK_V4_TARGET_ONLY_REVISION
+    else:
+        revision = None
     revision_kwargs = {"revision": revision} if revision is not None else {}
     files, files_error = _hf_list_repo_files(repo_id, **revision_kwargs)
     config, config_path, config_error = _hf_download_json(
@@ -1105,6 +1204,10 @@ def _inspect_hf_model(repo_id: str) -> ModelInspection:
             repo_id,
             files,
         ),
+        deepseek_v4_target_only_match=is_deepseek_v4_target_only_config(config),
+        deepseek_v4_target_only_artifacts_complete=(
+            _remote_deepseek_v4_target_only_artifacts_complete(repo_id, files)
+        ),
         mtp_pattern=_mtp_pattern_from_config(config),
         quantization=quant,
         sidecars={name: name in files for name in MULTIMODAL_SIDECARS},
@@ -1134,6 +1237,8 @@ def _inspect_hf_model(repo_id: str) -> ModelInspection:
         num_experts_per_tok=inspection.num_experts_per_tok,
         laguna_s_2_1_mlx_4bit_match=inspection.laguna_s_2_1_mlx_4bit_match,
         laguna_s_2_1_artifacts_complete=inspection.laguna_s_2_1_artifacts_complete,
+        deepseek_v4_target_only_match=inspection.deepseek_v4_target_only_match,
+        deepseek_v4_target_only_artifacts_complete=inspection.deepseek_v4_target_only_artifacts_complete,
         mtp_pattern=inspection.mtp_pattern,
         quantization=inspection.quantization,
         sidecars=inspection.sidecars,
@@ -1194,6 +1299,8 @@ def inspect_model(model_dir: Path | str) -> ModelInspection:
             laguna_s_2_1_artifacts_complete=_local_laguna_artifacts_complete(
                 Path(pair["target_model"])
             ),
+            deepseek_v4_target_only_match=False,
+            deepseek_v4_target_only_artifacts_complete=False,
             mtp_pattern="assistant-pair",
             quantization=target_quant,
             sidecars={name: False for name in MULTIMODAL_SIDECARS},
@@ -1267,6 +1374,10 @@ def inspect_model(model_dir: Path | str) -> ModelInspection:
         laguna_s_2_1_artifacts_complete=_local_laguna_artifacts_complete(
             model_path
         ),
+        deepseek_v4_target_only_match=is_deepseek_v4_target_only_config(config),
+        deepseek_v4_target_only_artifacts_complete=(
+            _local_deepseek_v4_target_only_artifacts_complete(model_path)
+        ),
         mtp_pattern=_mtp_pattern_from_config(config),
         quantization=quant,
         sidecars={name: (model_path / name).exists() for name in MULTIMODAL_SIDECARS},
@@ -1291,6 +1402,8 @@ def inspect_model(model_dir: Path | str) -> ModelInspection:
         num_experts_per_tok=inspection.num_experts_per_tok,
         laguna_s_2_1_mlx_4bit_match=inspection.laguna_s_2_1_mlx_4bit_match,
         laguna_s_2_1_artifacts_complete=inspection.laguna_s_2_1_artifacts_complete,
+        deepseek_v4_target_only_match=inspection.deepseek_v4_target_only_match,
+        deepseek_v4_target_only_artifacts_complete=inspection.deepseek_v4_target_only_artifacts_complete,
         mtp_pattern=inspection.mtp_pattern,
         quantization=inspection.quantization,
         sidecars=inspection.sidecars,

@@ -634,6 +634,62 @@ LAGUNA_AR_DESCRIPTOR = BackendDescriptor(
 )
 
 
+DEEPSEEK_V4_MLXSERVE_AR_DESCRIPTOR = BackendDescriptor(
+    backend_id="deepseek_v4_mlxserve_ar",
+    architecture_id="deepseek-v4-mlxserve-ar",
+    model_family="deepseek",
+    display_name="DeepSeek V4 Flash 0731 target-only AR (mlx-serve)",
+    artifact_layout="single_mlx_folder_external_mlx_serve_target_only_ar",
+    runtime_capabilities=("target_logits", "target_only_ar", "external_mlx_serve"),
+    sampler_defaults=SamplerDefaults(temperature=0.6, top_p=0.95, top_k=20),
+    reasoning_codec=ReasoningCodec(
+        parser="none",
+        display_name="DeepSeek V4 native response channels",
+        default_mode="auto",
+        supported=True,
+        modes=("auto", "on", "off"),
+        history_policy="native_mlx_serve",
+        effort_levels=("low", "high", "max"),
+    ),
+    draft_semantics=DraftSemantics(
+        request_field="depth",
+        display_label="Draft depth",
+        default=1,
+        minimum=1,
+        maximum=1,
+        unit="depth",
+    ),
+    uses_external_assistant=False,
+    uses_draft_lm_head=False,
+    tune_policy=TunePolicy(
+        supported=False,
+        supported_families=(),
+        unsupported_reason="This artifact is target-only; it has no MTP or DSpark weights.",
+    ),
+    kv_quant_policy=KVQuantPolicy(
+        supported=False,
+        disabled_reason="The external launch keeps decode-attention quantization disabled.",
+    ),
+    context_window_policy=ContextWindowPolicy(
+        maximum=1_048_576,
+        default=8_192,
+        source="deepseek_v4_flash_0731_target_only_config",
+    ),
+    default_max_response_tokens=32_768,
+    default_tool_prompt_mode="native",
+    required_tool_prompt_mode="native",
+    allows_chat_template_path=False,
+    validation_status="external_runtime_experimental_performance_unapproved",
+    status="external_runtime_experimental_performance_unapproved",
+    profile_policy="external-runtime-owned",
+    notes=(
+        "The checkpoint has no MTP or DSpark weights.",
+        "MTPLX delegates serving to a separately installed mlx-serve binary.",
+        "Representative streaming performance is unapproved; dry runs do not establish a speed claim.",
+    ),
+)
+
+
 MLX_LM_AR_DESCRIPTOR = BackendDescriptor(
     backend_id="mlx_lm_ar",
     architecture_id="mlx-lm-ar-family",
@@ -1033,6 +1089,7 @@ GEMMA4_ASSISTANT_DESCRIPTOR = BackendDescriptor(
 DESCRIPTORS_BY_BACKEND_ID: dict[str, BackendDescriptor] = {
     QWEN3_NEXT_DESCRIPTOR.backend_id: QWEN3_NEXT_DESCRIPTOR,
     LAGUNA_AR_DESCRIPTOR.backend_id: LAGUNA_AR_DESCRIPTOR,
+    DEEPSEEK_V4_MLXSERVE_AR_DESCRIPTOR.backend_id: DEEPSEEK_V4_MLXSERVE_AR_DESCRIPTOR,
     MLX_LM_AR_DESCRIPTOR.backend_id: MLX_LM_AR_DESCRIPTOR,
     NATIVE_CONTRACT_DESCRIPTOR.backend_id: NATIVE_CONTRACT_DESCRIPTOR,
     GEMMA4_ASSISTANT_DESCRIPTOR.backend_id: GEMMA4_ASSISTANT_DESCRIPTOR,
@@ -1230,6 +1287,8 @@ def tune_policy_for_model(
     descriptor: BackendDescriptor | None = None,
 ) -> TunePolicy:
     descriptor = descriptor or descriptor_from_inspection(inspection)
+    if descriptor.backend_id == DEEPSEEK_V4_MLXSERVE_AR_DESCRIPTOR.backend_id:
+        return descriptor.tune_policy
     family = model_family_from_inspection(
         inspection,
         model_ref=model_ref,
@@ -1262,6 +1321,8 @@ def kv_quant_policy_for_model(
     descriptor: BackendDescriptor | None = None,
 ) -> KVQuantPolicy:
     descriptor = descriptor or descriptor_from_inspection(inspection)
+    if descriptor.backend_id == DEEPSEEK_V4_MLXSERVE_AR_DESCRIPTOR.backend_id:
+        return descriptor.kv_quant_policy
     family = model_family_from_inspection(
         inspection,
         model_ref=model_ref,
@@ -1308,6 +1369,10 @@ def context_window_policy_for_model(
     descriptor: BackendDescriptor | None = None,
 ) -> ContextWindowPolicy:
     descriptor = descriptor or descriptor_from_inspection(inspection)
+    if descriptor.backend_id == DEEPSEEK_V4_MLXSERVE_AR_DESCRIPTOR.backend_id:
+        return descriptor.context_window_policy.with_resolved_max(
+            _context_window_from_inspection(inspection)
+        )
     family = model_family_from_inspection(
         inspection,
         model_ref=model_ref,
@@ -1334,6 +1399,8 @@ def reasoning_policy_for_model(
     descriptor: BackendDescriptor | None = None,
 ) -> ReasoningCodec:
     descriptor = descriptor or descriptor_from_inspection(inspection)
+    if descriptor.backend_id == DEEPSEEK_V4_MLXSERVE_AR_DESCRIPTOR.backend_id:
+        return descriptor.reasoning_codec
     family = model_family_from_inspection(
         inspection,
         model_ref=model_ref,

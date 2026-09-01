@@ -133,6 +133,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
         let command: DaemonCommand
         let healthBaseURL: URL
         let apiKey: String?
+        let backendKind: DaemonBackendKind
         let probeHealth: Bool
         let timeoutSeconds: TimeInterval
         let expectedLaunchID: String?
@@ -316,6 +317,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
         command: DaemonCommand,
         healthBaseURL: URL,
         apiKey: String? = nil,
+        backendKind: DaemonBackendKind = .mtplx,
         probeHealth: Bool = true,
         timeoutSeconds: TimeInterval = 300,
         expectedLaunchID: String? = nil,
@@ -328,6 +330,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
                 command: command,
                 healthBaseURL: healthBaseURL,
                 apiKey: apiKey,
+                backendKind: backendKind,
                 probeHealth: probeHealth,
                 timeoutSeconds: timeoutSeconds,
                 expectedLaunchID: expectedLaunchID,
@@ -350,6 +353,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
         let command = launch.command
         let healthBaseURL = launch.healthBaseURL
         let apiKey = launch.apiKey
+        let backendKind = launch.backendKind
         let probeHealth = launch.probeHealth
         let timeoutSeconds = launch.timeoutSeconds
         let expectedLaunchID = launch.expectedLaunchID
@@ -386,13 +390,38 @@ public final class DaemonSupervisor: @unchecked Sendable {
         notifyStatusObserver()
         onPhase?(.launching)
 
-        let existingHealth = probeHealth ? await initialHealthProbe(healthBaseURL, apiKey) : nil
+        let existingHealth: HealthPayload?
+        var externalPortOccupied = false
+        if probeHealth {
+            switch backendKind {
+            case .mtplx:
+                existingHealth = await initialHealthProbe(healthBaseURL, apiKey)
+            case .externalMlxServe:
+                existingHealth = nil
+                let external = ExternalMlxServeAdapter(
+                    baseURL: healthBaseURL,
+                    apiKey: apiKey
+                )
+                if let existing = try? await external.health(), existing.ok {
+                    externalPortOccupied = true
+                }
+            }
+        } else {
+            existingHealth = nil
+        }
         if Task.isCancelled, automaticAttempt != nil {
             await stopCancelledAutomaticLaunchIfCurrent(
                 generation: launchGeneration,
                 lifecycleEpoch: launchLifecycleEpoch
             )
             throw DaemonSupervisorError.launchFailed("automatic restart was cancelled")
+        }
+        if externalPortOccupied {
+            abortUnstartedLaunch(
+                generation: launchGeneration,
+                lifecycleEpoch: launchLifecycleEpoch
+            )
+            throw DaemonSupervisorError.portOccupied(pid: nil, launchID: nil)
         }
         if let existing = existingHealth, existing.ok {
             if adoptExistingAppOwnedDaemon,
@@ -598,6 +627,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
                 readyHealth = try await waitForHealth(
                     baseURL: healthBaseURL,
                     apiKey: apiKey,
+                    backendKind: backendKind,
                     timeoutSeconds: timeoutSeconds,
                     expectedLaunchID: expectedLaunchID,
                     requireActualFanRamp: requireActualFanRamp,
@@ -1199,6 +1229,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
         command: DaemonCommand,
         healthBaseURL: URL,
         apiKey: String? = nil,
+        backendKind: DaemonBackendKind = .mtplx,
         probeHealth: Bool = true,
         timeoutSeconds: TimeInterval = 300,
         expectedLaunchID: String? = nil,
@@ -1211,6 +1242,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
             command: command,
             healthBaseURL: healthBaseURL,
             apiKey: apiKey,
+            backendKind: backendKind,
             probeHealth: probeHealth,
             timeoutSeconds: timeoutSeconds,
             expectedLaunchID: expectedLaunchID,
@@ -1228,14 +1260,17 @@ public final class DaemonSupervisor: @unchecked Sendable {
         requireActualFanRamp: Bool = false,
         onPhase: (@Sendable (DaemonStartupPhase) -> Void)? = nil
     ) async throws -> HealthPayload {
-        let health = try await waitForHealth(
+        guard let health = try await waitForHealth(
             baseURL: healthBaseURL,
             apiKey: apiKey,
+            backendKind: .mtplx,
             timeoutSeconds: timeoutSeconds,
             expectedLaunchID: expectedLaunchID,
             requireActualFanRamp: requireActualFanRamp,
             onPhase: onPhase
-        )
+        ) else {
+            throw DaemonSupervisorError.healthTimeout
+        }
         lock.withLock { state = .running }
         onPhase?(.ready)
         return health
@@ -1461,11 +1496,24 @@ public final class DaemonSupervisor: @unchecked Sendable {
     private func waitForHealth(
         baseURL: URL,
         apiKey: String?,
+        backendKind: DaemonBackendKind,
         timeoutSeconds: TimeInterval,
         expectedLaunchID: String?,
         requireActualFanRamp: Bool,
         onPhase: (@Sendable (DaemonStartupPhase) -> Void)?
-    ) async throws -> HealthPayload {
+    ) async throws -> HealthPayload? {
+        if backendKind == .externalMlxServe {
+            try await waitForExternalMlxServeHealth(
+                baseURL: baseURL,
+                apiKey: apiKey,
+                timeoutSeconds: timeoutSeconds,
+                onPhase: onPhase
+            )
+            // The caller uses its explicit external backend mode for the
+            // post-ready path. Returning a fabricated MTPLX payload here
+            // would invite unsupported sessions/settings/metrics calls.
+            return nil
+        }
         let deadline = Date().addingTimeInterval(timeoutSeconds)
         var sawHealthyWithUnverifiedFan = false
         var healthyUnverifiedFanSince: Date?
@@ -1518,6 +1566,39 @@ public final class DaemonSupervisor: @unchecked Sendable {
         }
         if requireActualFanRamp && sawHealthyWithUnverifiedFan {
             throw DaemonSupervisorError.fanRampTimeout
+        }
+        throw DaemonSupervisorError.healthTimeout
+    }
+
+    private func waitForExternalMlxServeHealth(
+        baseURL: URL,
+        apiKey: String?,
+        timeoutSeconds: TimeInterval,
+        onPhase: (@Sendable (DaemonStartupPhase) -> Void)?
+    ) async throws {
+        // Do not let URLSession's shared-session timeout outlive our launch
+        // deadline. This is still the same raw `/health` contract, with an
+        // isolated bounded probe session that is discarded on every start.
+        let client = ExternalMlxServeAdapter.livenessProbe(baseURL: baseURL, apiKey: apiKey)
+        defer { client.session.finishTasksAndInvalidate() }
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        onPhase?(.waitingForOwnedHealth)
+        while Date() < deadline {
+            // The external endpoint cannot report MTPLX's launch UUID. The
+            // identity guard is instead the Process we just spawned: we only
+            // accept raw health while that exact app-owned wrapper is alive.
+            guard isRunning() else {
+                let tail = await logStore.snapshot().suffix(8).map(\.message).joined(separator: " | ")
+                let detail = tail.isEmpty
+                    ? "external mlx-serve exited before /health became ready"
+                    : "external mlx-serve exited before /health became ready: \(tail)"
+                throw DaemonSupervisorError.launchFailed(detail)
+            }
+            if let health = try? await client.health(), health.ok {
+                onPhase?(.warming)
+                return
+            }
+            try? await Task.sleep(nanoseconds: 250_000_000)
         }
         throw DaemonSupervisorError.healthTimeout
     }

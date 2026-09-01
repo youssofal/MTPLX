@@ -39,6 +39,24 @@ MTP runtime stays loaded, so terminal chat can use `/mtp off`, `/mtp on`, and
 `mlx-community/Laguna-S-2.1-oQ4e` instead install an unloaded AR route at
 construction because there is no MTP head to retain.
 
+For the 128 GB DeepSeek-V4 target-only artifact, install or build `mlx-serve`
+and use the external AR route:
+
+```bash
+mtplx pull philipjohnbasile/DeepSeek-V4-Flash-0731-MLX-M5Max-TargetOnly
+
+MTPLX_MLX_SERVE_BIN=/path/to/mlx-serve \
+mtplx serve \
+  --model philipjohnbasile/DeepSeek-V4-Flash-0731-MLX-M5Max-TargetOnly \
+  --no-mtp --yes
+```
+
+The pull pins revision `ac33e4f3ca3546e6cec104558d42161e15814e33` and admits
+the exact 44-shard publication. MTPLX removes ambient `MLX_SERVE_*` settings,
+uses `MLX_SERVE_WIRED=fit` and a 256 MB cache limit, and leaves the external
+memory preflight on. This is not MTP or DSpark support; representative
+streaming performance is unapproved.
+
 For scheduler selection and backend-specific concurrent implementations, see
 [Concurrency modes](concurrency.md).
 

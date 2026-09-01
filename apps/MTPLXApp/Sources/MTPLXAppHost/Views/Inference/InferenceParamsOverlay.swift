@@ -268,6 +268,7 @@ struct InferenceParamsOverlay: View, Equatable {
     @ViewBuilder
     private var popoverSurface: some View {
         VStack(alignment: .leading, spacing: 0) {
+            if backend.supportsMTPLXLiveControls {
             // Header pinned at the top so the popover always identifies
             // itself; never scrolls away.
             header
@@ -306,6 +307,9 @@ struct InferenceParamsOverlay: View, Equatable {
             if kvDirty || contextWindowDirty {
                 applyBar
             }
+            } else {
+                externalBackendNotice
+            }
         }
         .background(
             ZStack {
@@ -317,6 +321,23 @@ struct InferenceParamsOverlay: View, Equatable {
             }
             .shadow(color: .black.opacity(0.55), radius: 18, x: 0, y: 10)
         )
+    }
+
+    private var externalBackendNotice: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("External mlx-serve backend")
+                .font(.system(.callout, design: .rounded).weight(.semibold))
+                .foregroundStyle(Brand.typeBody)
+            Text("This target-only DeepSeek route is running through mlx-serve. MTPLX live sampling, MTP, DSpark, sessions, metrics, cache, and fan controls are unavailable for this backend.")
+                .font(.caption)
+                .foregroundStyle(Brand.typeSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("The model’s context window and API key are applied when you restart it from Settings.")
+                .font(.caption2)
+                .foregroundStyle(Brand.typeTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(14)
     }
 
     /// Cap on the inner scroll area so the whole popover stays bounded
@@ -777,16 +798,7 @@ struct InferenceParamsOverlay: View, Equatable {
         reasoningPolicy?.supported ?? true
     }
     private var reasoningEffortLevels: [String] {
-        let raw = reasoningPolicy?.effortLevels ?? []
-        var seen = Set<String>()
-        return raw.compactMap { rawLevel in
-            let level = rawLevel.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            guard ["low", "medium", "high", "xhigh"].contains(level), !seen.contains(level) else {
-                return nil
-            }
-            seen.insert(level)
-            return level
-        }
+        Self.reasoningEffortLevels(for: reasoningPolicy)
     }
     private var reasoningEffortSupported: Bool {
         reasoningSupported && !reasoningEffortLevels.isEmpty
@@ -1542,17 +1554,23 @@ struct InferenceParamsOverlay: View, Equatable {
     }
 
     private func normalizedReasoningEffort(_ raw: String?) -> String {
-        let levels = reasoningEffortLevels
-        let fallback = reasoningPolicy?.defaultEffort ?? levels.first ?? "auto"
-        let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        switch value {
-        case .some(let effort) where ["low", "medium", "high", "xhigh"].contains(effort):
-            return levels.contains(effort) ? effort : fallback
-        case "auto":
-            return levels.contains(fallback) ? fallback : levels.first ?? "auto"
-        default:
-            return levels.contains(fallback) ? fallback : levels.first ?? "auto"
-        }
+        Self.normalizedReasoningEffort(raw, policy: reasoningPolicy)
+    }
+
+    nonisolated static func reasoningEffortLevels(for policy: ReasoningPolicy?) -> [String] {
+        ReasoningEffortVocabulary.pickerLevels(policy?.effortLevels)
+    }
+
+    nonisolated static func normalizedReasoningEffort(
+        _ raw: String?,
+        policy: ReasoningPolicy?
+    ) -> String {
+        let levels = reasoningEffortLevels(for: policy)
+        return ReasoningEffortVocabulary.pickerSelection(
+            raw,
+            levels: levels,
+            defaultEffort: policy?.defaultEffort
+        )
     }
 
     // MARK: - Static utilities

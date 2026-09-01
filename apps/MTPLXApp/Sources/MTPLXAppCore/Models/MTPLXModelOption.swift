@@ -2,6 +2,31 @@ import Foundation
 import os
 
 public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
+    // Not included in the recommended catalog: this target-only model needs a
+    // separately installed mlx-serve runtime and 128 GB Apple Silicon. The
+    // command builder still recognizes it so a saved/custom selection cannot
+    // launch as MTP.
+    static let externalAROnlyRepoID =
+        "philipjohnbasile/DeepSeek-V4-Flash-0731-MLX-M5Max-TargetOnly"
+    static let externalAROnlyRevision =
+        "ac33e4f3ca3546e6cec104558d42161e15814e33"
+    /// SHA-256 of `config.json` at `externalAROnlyRevision`. Remote probing
+    /// checks this immutable byte identity; the local bridge independently
+    /// verifies every sidecar and shard hash before it can launch.
+    static let externalAROnlyConfigSHA256 =
+        "ab61e3230f196c6eba04bfa81158dd527a7f356b6d926cc4794907a19f35b75d"
+    private static let externalAROnlyDownloadBytes: Int64 = 103_855_774_263
+    static let externalAROnlyWeightShards = Set(
+        (0...42).map { "model-layer-\($0).safetensors" }
+            + ["model-top.safetensors"]
+    )
+    static let externalAROnlySidecars: Set<String> = [
+        "config.json",
+        "generation_config.json",
+        "model.safetensors.index.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ]
     public var id: String
     public var displayName: String
     public var shortName: String
@@ -93,9 +118,32 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
     /// alias, HF id, or a local path) resolves to a target-only AR model.
     /// Used by the command builder so every app launch path carries the
     /// correct `--no-mtp` shape without each caller re-deriving it.
+    public static func isExternalAROnlyReference(_ reference: String) -> Bool {
+        let trimmed = reference.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        if isCanonicalExternalAROnlyRepoID(trimmed) { return true }
+
+        // A saved local path is permitted only after it proves the same
+        // pinned source/revision/config/closed-shard contract. In
+        // particular, a remote repo that merely reuses this artifact's
+        // basename never switches the app into the external backend.
+        let localURL = URL(fileURLWithPath: Self.expand(trimmed))
+        return FileManager.default.fileExists(atPath: localURL.path)
+            && hasCompleteExternalAROnlyInstall(at: localURL)
+    }
+
+    /// Remote admission is intentionally stricter than a local-path hint:
+    /// only this spelling identifies the public immutable HF artifact. The
+    /// loose basename recognition above is retained solely so a previously
+    /// downloaded local folder can be launched through the safe Python gate.
+    public static func isCanonicalExternalAROnlyRepoID(_ repo: String) -> Bool {
+        repo == externalAROnlyRepoID
+    }
+
     public static func isAROnlyReference(_ reference: String) -> Bool {
         let trimmed = reference.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
+        if isExternalAROnlyReference(trimmed) { return true }
         let lower = trimmed.lowercased()
         for option in MTPLXModelOption.officialCatalog where option.arOnly {
             if option.id.lowercased() == lower { return true }
@@ -200,6 +248,15 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 && Self.hasCompleteModelDirectory(at: assistant)
         }
 
+        // This exact pinned artifact is a deliberately external target-only
+        // route. It has neither an MTPLX runtime contract nor an MTP sidecar,
+        // so accept it only after the closed-shape structural preflight below.
+        // The Python bridge still verifies pinned hashes and mlx-serve's
+        // memory preflight before launch.
+        if Self.isExternalAROnlyTargetCandidate(at: url) {
+            return Self.hasCompleteExternalAROnlyInstall(at: url)
+        }
+
         // Core completeness: a runnable checkpoint needs its config, a
         // tokenizer in any standard form, and every trunk shard.
         // mtplx_runtime.json and the MTP sidecar are MTPLX branding, not
@@ -243,6 +300,128 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
             return []
         }
         return Array(files.keys)
+    }
+
+    private static func hasCompleteExternalAROnlyInstall(at url: URL) -> Bool {
+        let fm = FileManager.default
+        let sourceURL = url.appendingPathComponent(".mtplx-source.json")
+        guard
+            let sourceData = fm.contents(atPath: sourceURL.path),
+            let source = try? JSONSerialization.jsonObject(with: sourceData) as? [String: Any],
+            source["repo_id"] as? String == externalAROnlyRepoID,
+            source["revision"] as? String == externalAROnlyRevision,
+            let configData = fm.contents(atPath: url.appendingPathComponent("config.json").path),
+            let config = try? JSONSerialization.jsonObject(with: configData) as? [String: Any],
+            isExternalAROnlyTargetConfig(config)
+        else {
+            return false
+        }
+
+        for name in externalAROnlySidecars.union(externalAROnlyWeightShards) {
+            guard fm.fileExists(atPath: url.appendingPathComponent(name).path) else {
+                return false
+            }
+        }
+
+        let indexURL = url.appendingPathComponent("model.safetensors.index.json")
+        guard
+            let indexData = fm.contents(atPath: indexURL.path),
+            let index = try? JSONSerialization.jsonObject(with: indexData) as? [String: Any],
+            let weightMap = index["weight_map"] as? [String: String],
+            Set(weightMap.values) == externalAROnlyWeightShards
+        else {
+            return false
+        }
+        // Closed 44-shard shape: an extra root safetensors file is as much a
+        // different artifact as a missing one. Do not accept a mixed folder
+        // merely because the index happens to point at the expected weights.
+        let rootShardNames = (try? fm.contentsOfDirectory(atPath: url.path)) ?? []
+        let actualShards = Set(rootShardNames.filter { $0.hasSuffix(".safetensors") })
+        guard actualShards == externalAROnlyWeightShards else {
+            return false
+        }
+        return true
+    }
+
+    private static func isExternalAROnlyTargetCandidate(at url: URL) -> Bool {
+        let configURL = url.appendingPathComponent("config.json")
+        guard
+            let data = FileManager.default.contents(atPath: configURL.path),
+            let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            return false
+        }
+        return config["architectures"] as? [String] == ["DeepseekV4ForCausalLM"]
+            && config["model_type"] as? String == "deepseek_v4"
+            && config["model_file"] == nil
+    }
+
+    static func isExternalAROnlyTargetConfig(_ config: [String: Any]) -> Bool {
+        guard
+            config["architectures"] as? [String] == ["DeepseekV4ForCausalLM"],
+            config["model_type"] as? String == "deepseek_v4",
+            config["model_file"] == nil
+        else {
+            return false
+        }
+        for (key, expected) in [
+            ("num_hidden_layers", 43),
+            ("hidden_size", 4096),
+            ("num_attention_heads", 64),
+            ("num_key_value_heads", 1),
+            ("head_dim", 512),
+            ("vocab_size", 129_280),
+            ("num_nextn_predict_layers", 0),
+            ("dspark_block_size", 0),
+            ("num_experts_per_tok", 6),
+            ("n_routed_experts", 256),
+        ] {
+            guard (config[key] as? NSNumber)?.intValue == expected else {
+                return false
+            }
+        }
+        guard let quantization = config["quantization"] as? [String: Any],
+              Self.isAffineQuantization(quantization, key: nil, bits: 8, groupSize: 64),
+              Self.isAffineQuantization(quantization, key: "embed", bits: 8, groupSize: 64),
+              Self.isAffineQuantization(quantization, key: "head", bits: 8, groupSize: 64)
+        else {
+            return false
+        }
+        for layer in 0..<43 {
+            let recipe: (Int, Int, Int, Int) = layer < 39
+                ? (2, 3, 2, 128)
+                : (4, 4, 4, 64)
+            for (projection, bits) in zip(["w1", "w2", "w3"], [recipe.0, recipe.1, recipe.2]) {
+                let key = "layers.\(layer).ffn.experts.\(projection)"
+                guard Self.isAffineQuantization(
+                    quantization,
+                    key: key,
+                    bits: bits,
+                    groupSize: recipe.3
+                ) else {
+                    return false
+                }
+            }
+        }
+        return true
+    }
+
+    private static func isAffineQuantization(
+        _ quantization: [String: Any],
+        key: String?,
+        bits: Int,
+        groupSize: Int
+    ) -> Bool {
+        let value: [String: Any]
+        if let key {
+            guard let nested = quantization[key] as? [String: Any] else { return false }
+            value = nested
+        } else {
+            value = quantization
+        }
+        return (value["bits"] as? NSNumber)?.intValue == bits
+            && (value["group_size"] as? NSNumber)?.intValue == groupSize
+            && value["mode"] as? String == "affine"
     }
 
     private static func hasMTPSidecar(at url: URL) -> Bool {
@@ -1034,11 +1213,17 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
             .lowercased()
             .replacingOccurrences(of: "/", with: "--")
             .replacingOccurrences(of: "_", with: "-")
+        // A remote custom model gets the external route only for the exact
+        // canonical owner/repo. Local path admission is handled separately
+        // by `isExternalAROnlyReference` after structural verification.
+        let externalAROnly = isCanonicalExternalAROnlyRepoID(repoID)
         return MTPLXModelOption(
             id: "custom-\(safeID)",
             displayName: repoName,
             shortName: repoName,
-            detail: "Custom Hugging Face model. MTPLX will use MTP when the repo includes a sidecar.",
+            detail: externalAROnly
+                ? "Experimental target-only route. Requires mlx-serve and a 128 GB Apple Silicon Mac; no MTP or DSpark."
+                : "Custom Hugging Face model. MTPLX will use MTP when the repo includes a sidecar.",
             hfModelID: repoID,
             localCandidates: [
                 "~/.mtplx/models/\(repoID.replacingOccurrences(of: "/", with: "--"))",
@@ -1046,7 +1231,9 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 "~/Documents/MTPLX/hf-staging/\(repoName)",
                 "~/Documents/MTPLX/models/hf-release/\(repoName)",
             ],
-            aliases: [repoID]
+            aliases: [repoID],
+            sizeBytes: externalAROnly ? externalAROnlyDownloadBytes : 0,
+            arOnly: externalAROnly
         )
     }
 

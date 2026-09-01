@@ -17,6 +17,10 @@ public enum PortOccupantKind: Equatable, Sendable {
     /// A healthy MTPLX daemon answered `/health`. The supervisor decides
     /// separately whether it is adoptable (app-owned, same model).
     case mtplxServer(HealthPayload)
+    /// A raw native mlx-serve listener for the exact external DeepSeek route.
+    /// It is deliberately distinct from an MTPLX daemon and is never
+    /// adoptable: its health response has no app launch identity.
+    case externalMlxServeServer(ExternalMlxServeHealth)
     /// A live listener rejected the probe with 401/403 — an auth-protected
     /// server (often an MTPLX daemon with a different API key). Provably
     /// alive, never adoptable with the current credentials.
@@ -35,6 +39,7 @@ public enum PortPreflight {
     public static func classify(
         baseURL: URL,
         apiKey: String?,
+        backendKind: DaemonBackendKind = .mtplx,
         timeoutSeconds: TimeInterval = 2
     ) async -> PortOccupantKind {
         let configuration = URLSessionConfiguration.ephemeral
@@ -42,10 +47,17 @@ public enum PortPreflight {
         configuration.timeoutIntervalForResource = timeoutSeconds
         let session = URLSession(configuration: configuration)
         defer { session.finishTasksAndInvalidate() }
-        let client = MTPLXAPIClient(baseURL: baseURL, apiKey: apiKey, session: session)
         do {
-            let health = try await client.health()
-            return health.ok ? .mtplxServer(health) : .foreign
+            switch backendKind {
+            case .mtplx:
+                let client = MTPLXAPIClient(baseURL: baseURL, apiKey: apiKey, session: session)
+                let health = try await client.health()
+                return health.ok ? .mtplxServer(health) : .foreign
+            case .externalMlxServe:
+                let client = ExternalMlxServeAdapter(baseURL: baseURL, apiKey: apiKey, session: session)
+                let health = try await client.health()
+                return health.ok ? .externalMlxServeServer(health) : .foreign
+            }
         } catch let error as URLError {
             switch error.code {
             case .cannotConnectToHost, .cannotFindHost, .networkConnectionLost:

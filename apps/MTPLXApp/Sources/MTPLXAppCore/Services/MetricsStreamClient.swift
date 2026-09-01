@@ -4,6 +4,7 @@ public enum MetricsConnectionState: Equatable, Sendable {
     case idle
     case connecting
     case open
+    case healthyWithoutMetrics
     case reconnecting(Int)
     case failed(String)
 }

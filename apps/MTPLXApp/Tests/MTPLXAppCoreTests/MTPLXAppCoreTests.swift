@@ -1123,6 +1123,45 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertFalse(command.arguments.contains("--open-dashboard"))
     }
 
+    func testCommandBuilderAdmitsExternalDeepSeekTargetOnlyRouteAsAR() throws {
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
+        let model = "philipjohnbasile/DeepSeek-V4-Flash-0731-MLX-M5Max-TargetOnly"
+        let command = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: model,
+                fanMode: "max",
+                lastTunedDepth: 3
+            )
+        )
+
+        XCTAssertTrue(MTPLXModelOption.isExternalAROnlyReference(model))
+        XCTAssertTrue(MTPLXModelOption.isAROnlyReference(model))
+        XCTAssertFalse(MTPLXModelOption.officialCatalog.contains { $0.hfModelID == model })
+        XCTAssertTrue(command.arguments.contains("--no-mtp"))
+        XCTAssertFalse(command.arguments.contains("--depth"))
+        XCTAssertTrue(command.arguments.containsInOrder(["--fan-mode", "default"]))
+        XCTAssertFalse(command.arguments.contains("--require-max-fans"))
+    }
+
+    func testCommandBuilderPreservesDeepSeekMaxReasoningEffort() throws {
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
+        let command = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: "philipjohnbasile/DeepSeek-V4-Flash-0731-MLX-M5Max-TargetOnly",
+                reasoning: "on",
+                reasoningEffort: "max",
+                liveSettingsModelFamily: "deepseek"
+            )
+        )
+
+        XCTAssertTrue(command.arguments.containsInOrder(["--reasoning", "on"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--reasoning-effort", "max"]))
+    }
+
     func testCommandBuilderEmitsRestartRequiredRuntimeSettings() throws {
         let fake = try makeExecutable(named: "mtplx")
         let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
@@ -4062,6 +4101,114 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertTrue(MTPLXModelOption.hasCompleteInstall(at: model.path))
     }
 
+    func testModelInstallDetectionAcceptsOnlyThePinnedDeepSeekTargetOnlyLayout() throws {
+        unsetenv("MTPLX_APP_DISABLE_LOCAL_MODEL_SCAN")
+        let previousHome = getenv("HOME").map { String(cString: $0) }
+        let root = temporaryDirectory()
+        setenv("HOME", root.path, 1)
+        defer {
+            if let previousHome {
+                setenv("HOME", previousHome, 1)
+            } else {
+                unsetenv("HOME")
+            }
+        }
+
+        let repo = "philipjohnbasile/DeepSeek-V4-Flash-0731-MLX-M5Max-TargetOnly"
+        let revision = "ac33e4f3ca3546e6cec104558d42161e15814e33"
+        let model = root.appendingPathComponent(
+            ".mtplx/models/philipjohnbasile--DeepSeek-V4-Flash-0731-MLX-M5Max-TargetOnly",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: model, withIntermediateDirectories: true)
+        let config = Self.externalTargetOnlyConfigFixture()
+        try JSONSerialization.data(withJSONObject: config).write(
+            to: model.appendingPathComponent("config.json")
+        )
+        try """
+        {"repo_id":"\(repo)","revision":"\(revision)"}
+        """.write(
+            to: model.appendingPathComponent(".mtplx-source.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let shards = (0...42).map { "model-layer-\($0).safetensors" }
+            + ["model-top.safetensors"]
+        let sidecars = [
+            "generation_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+        ]
+        for name in sidecars + shards {
+            try Data([0]).write(to: model.appendingPathComponent(name))
+        }
+        let weightMap = Dictionary(uniqueKeysWithValues: shards.enumerated().map {
+            ("weight.\($0.offset)", $0.element)
+        })
+        let index = try JSONSerialization.data(withJSONObject: ["weight_map": weightMap])
+        try index.write(to: model.appendingPathComponent("model.safetensors.index.json"))
+
+        let option = try XCTUnwrap(MTPLXModelOption.customHuggingFaceModel(repoID: repo))
+        XCTAssertTrue(option.arOnly)
+        XCTAssertEqual(option.sizeBytes, 103_855_774_263)
+        XCTAssertTrue(option.detail.contains("mlx-serve"))
+        XCTAssertTrue(MTPLXModelOption.hasCompleteInstall(at: model.path))
+        XCTAssertTrue(MTPLXModelOption.isExternalAROnlyReference(model.path))
+        XCTAssertFalse(
+            MTPLXModelOption.isExternalAROnlyReference(
+                "someone-else/DeepSeek-V4-Flash-0731-MLX-M5Max-TargetOnly"
+            )
+        )
+        XCTAssertEqual(option.installedLocalPath, model.path)
+        XCTAssertEqual(option.resolvedReference, model.path)
+
+        // Every marker is binding: a renamed mirror, an unpinned revision,
+        // a config drift, or a closed-shape violation must not look installed
+        // to the app before the Python bridge performs its full hash gate.
+        try """
+        {"repo_id":"someone-else/DeepSeek-V4-Flash-0731-MLX-M5Max-TargetOnly","revision":"\(revision)"}
+        """.write(
+            to: model.appendingPathComponent(".mtplx-source.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        XCTAssertFalse(MTPLXModelOption.hasCompleteInstall(at: model.path))
+        XCTAssertFalse(MTPLXModelOption.isExternalAROnlyReference(model.path))
+        try """
+        {"repo_id":"\(repo)","revision":"not-the-pinned-revision"}
+        """.write(
+            to: model.appendingPathComponent(".mtplx-source.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        XCTAssertFalse(MTPLXModelOption.hasCompleteInstall(at: model.path))
+        try """
+        {"repo_id":"\(repo)","revision":"\(revision)"}
+        """.write(
+            to: model.appendingPathComponent(".mtplx-source.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        var wrongConfig = config
+        wrongConfig["dspark_block_size"] = 1
+        try JSONSerialization.data(withJSONObject: wrongConfig).write(
+            to: model.appendingPathComponent("config.json")
+        )
+        XCTAssertFalse(MTPLXModelOption.hasCompleteInstall(at: model.path))
+        try JSONSerialization.data(withJSONObject: config).write(
+            to: model.appendingPathComponent("config.json")
+        )
+        try Data([0]).write(to: model.appendingPathComponent("model-extra.safetensors"))
+        XCTAssertFalse(MTPLXModelOption.hasCompleteInstall(at: model.path))
+        try FileManager.default.removeItem(at: model.appendingPathComponent("model-extra.safetensors"))
+
+        try FileManager.default.removeItem(
+            at: model.appendingPathComponent("model-layer-42.safetensors")
+        )
+        XCTAssertFalse(MTPLXModelOption.hasCompleteInstall(at: model.path))
+    }
+
     func testModelInstallDetectionCanBeDisabledForFreshUserQA() throws {
         unsetenv("MTPLX_APP_DISABLE_LOCAL_MODEL_SCAN")
         let root = temporaryDirectory()
@@ -4674,6 +4821,35 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(reloadedBackend.settings?.topK, 32)
         XCTAssertEqual(reloadedBackend.settings?.reasoning, "on")
         XCTAssertEqual(reloadedBackend.settings?.enableThinking, true)
+    }
+
+    @MainActor
+    func testDeepSeekMaxReasoningEffortSurvivesStoreRehydration() throws {
+        let settingsStore = MTPLXSettingsStore(
+            settingsURL: temporaryDirectory().appendingPathComponent("settings.json")
+        )
+        let configuration = MTPLXAppConfiguration(
+            model: "philipjohnbasile/DeepSeek-V4-Flash-0731-MLX-M5Max-TargetOnly",
+            reasoning: "on",
+            reasoningEffort: "max",
+            liveSettingsModelFamily: "deepseek"
+        )
+        let backend = MTPLXBackendStore(
+            configuration: MTPLXAppConfiguration(),
+            settingsStore: settingsStore
+        )
+
+        try backend.saveSettings(configuration)
+        XCTAssertEqual(backend.configuration.reasoningEffort, "max")
+        XCTAssertEqual(backend.settings?.reasoningEffort, "max")
+
+        let reloadedBackend = MTPLXBackendStore(
+            configuration: MTPLXAppConfiguration(),
+            settingsStore: settingsStore
+        )
+        reloadedBackend.loadPersistedSettings()
+        XCTAssertEqual(reloadedBackend.configuration.reasoningEffort, "max")
+        XCTAssertEqual(reloadedBackend.settings?.reasoningEffort, "max")
     }
 
     func testLiveSettingsPatchDoesNotEchoDescriptorFields() throws {
@@ -6072,6 +6248,87 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(storedHealth?.model, "mtplx-test-model")
         XCTAssertEqual(currentFanMode, "max")
         XCTAssertNil(pendingModelDownload)
+    }
+
+    @MainActor
+    func testExternalMlxServeStoreReachesReadyWithoutMTPLXEndpointProbesAndStops() async throws {
+        let root = temporaryDirectory()
+        let model = try Self.makeExternalTargetOnlyModelInstall(in: root)
+        let port = try freeTCPPort()
+        let requestLog = root.appendingPathComponent("external-request-paths.log")
+        let server = try makeExecutable(
+            named: "fake-mtplx-external-mlxserve",
+            body: """
+            #!/bin/sh
+            exec /usr/bin/python3 -u - <<'PY'
+            import json
+            from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+            PORT = \(port)
+            REQUEST_LOG = r'''\(requestLog.path)'''
+
+            class Handler(BaseHTTPRequestHandler):
+                def log_message(self, *_args):
+                    return
+
+                def do_GET(self):
+                    with open(REQUEST_LOG, "a", encoding="utf-8") as handle:
+                        handle.write(self.path + "\\n")
+                    if self.path == "/health":
+                        body = json.dumps({"status": "ok"}).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                    else:
+                        self.send_response(404)
+                        self.end_headers()
+
+            ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+            PY
+            """
+        )
+        let backend = MTPLXBackendStore(
+            configuration: MTPLXAppConfiguration(
+                executablePath: server.path,
+                model: model.path,
+                port: port,
+                fanMode: "max"
+            ),
+            settingsStore: MTPLXSettingsStore(settingsURL: root.appendingPathComponent("settings.json")),
+            localFanRestorer: { true }
+        )
+
+        await backend.startDaemon(target: .chat)
+
+        XCTAssertEqual(backend.daemonState, .running)
+        XCTAssertEqual(backend.startupPhase, .ready)
+        XCTAssertTrue(backend.isExternalMlxServeBackend)
+        XCTAssertFalse(backend.supportsMTPLXLiveControls)
+        XCTAssertEqual(backend.connectionState, .healthyWithoutMetrics)
+        XCTAssertNil(backend.health)
+        XCTAssertNil(backend.capabilities)
+        XCTAssertNil(backend.sessions)
+        XCTAssertNil(backend.settings)
+
+        // Let the external-only watchdog complete one full liveness pass;
+        // it must keep the raw server ready without falling back to MTPLX
+        // capabilities, metrics, sessions, or settings probes.
+        try await Task.sleep(nanoseconds: 3_300_000_000)
+        XCTAssertEqual(backend.daemonState, .running)
+        XCTAssertEqual(backend.connectionState, .healthyWithoutMetrics)
+
+        let paths = try String(contentsOf: requestLog, encoding: .utf8)
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+        XCTAssertFalse(paths.isEmpty)
+        XCTAssertTrue(paths.allSatisfy { $0 == "/health" }, "unexpected MTPLX endpoint(s): \(paths)")
+
+        await backend.stopDaemon()
+        await backend.awaitDaemonTeardown()
+        XCTAssertEqual(backend.daemonState, .stopped)
+        XCTAssertEqual(backend.connectionState, .idle)
     }
 
     func testStopDaemonRestoresFansWhenFanModeCacheIsStale() async throws {
@@ -9443,6 +9700,129 @@ final class MTPLXAppCoreTests: XCTestCase {
         }
     }
 
+    func testDaemonSupervisorAcceptsOwnedRawMlxServeHealthAndStopsIt() async throws {
+        let port = try freeTCPPort()
+        let script = try makeExecutable(
+            named: "fake-raw-mlxserve",
+            body: """
+            #!/bin/sh
+            exec /usr/bin/python3 -u - <<'PY'
+            import json
+            from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+            class Handler(BaseHTTPRequestHandler):
+                def log_message(self, *_args):
+                    return
+                def do_GET(self):
+                    if self.path == "/health":
+                        body = json.dumps({"status": "ok"}).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                    else:
+                        self.send_response(404)
+                        self.end_headers()
+
+            ThreadingHTTPServer(("127.0.0.1", \(port)), Handler).serve_forever()
+            PY
+            """
+        )
+        let supervisor = DaemonSupervisor(logStore: BoundedLogStore(capacity: 8))
+
+        let health = try await supervisor.start(
+            command: DaemonCommand(executableURL: script, arguments: []),
+            healthBaseURL: URL(string: "http://127.0.0.1:\(port)")!,
+            backendKind: .externalMlxServe,
+            probeHealth: true,
+            timeoutSeconds: 5,
+            expectedLaunchID: "not-claimable-by-raw-health"
+        )
+
+        XCTAssertNil(health, "raw mlx-serve must not be fabricated as MTPLX health")
+        XCTAssertTrue(supervisor.isRunning())
+        await supervisor.stop(graceSeconds: 0.1)
+        XCTAssertFalse(supervisor.isRunning())
+    }
+
+    func testExternalMlxServePortOccupantIsNeverAdoptedOrLaunchedOver() async throws {
+        let port = try freeTCPPort()
+        let existing = try makeExecutable(
+            named: "existing-raw-mlxserve",
+            body: """
+            #!/bin/sh
+            exec /usr/bin/python3 -u - <<'PY'
+            import json
+            from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+            class Handler(BaseHTTPRequestHandler):
+                def log_message(self, *_args):
+                    return
+                def do_GET(self):
+                    if self.path == "/health":
+                        body = json.dumps({"status": "ok"}).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                    else:
+                        self.send_response(404)
+                        self.end_headers()
+
+            ThreadingHTTPServer(("127.0.0.1", \(port)), Handler).serve_forever()
+            PY
+            """
+        )
+        let existingProcess = Process()
+        existingProcess.executableURL = existing
+        try existingProcess.run()
+        defer { existingProcess.terminate() }
+
+        let baseURL = URL(string: "http://127.0.0.1:\(port)")!
+        let deadline = Date().addingTimeInterval(5)
+        var occupant: PortOccupantKind = .free
+        while Date() < deadline {
+            occupant = await PortPreflight.classify(
+                baseURL: baseURL,
+                apiKey: nil,
+                backendKind: .externalMlxServe
+            )
+            if case .externalMlxServeServer = occupant {
+                break
+            }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        guard case .externalMlxServeServer(let health) = occupant else {
+            XCTFail("expected raw external listener, got \(occupant)")
+            return
+        }
+        XCTAssertTrue(health.ok)
+
+        let launchMarker = temporaryDirectory().appendingPathComponent("must-not-launch")
+        let launch = try makeExecutable(
+            named: "must-not-replace-raw-mlxserve",
+            body: "#!/bin/sh\necho launched > '\(launchMarker.path)'\nsleep 5\n"
+        )
+        let supervisor = DaemonSupervisor(logStore: BoundedLogStore())
+        do {
+            _ = try await supervisor.start(
+                command: DaemonCommand(executableURL: launch, arguments: []),
+                healthBaseURL: baseURL,
+                backendKind: .externalMlxServe,
+                probeHealth: true,
+                timeoutSeconds: 1
+            )
+            XCTFail("expected portOccupied")
+        } catch DaemonSupervisorError.portOccupied(let pid, let launchID) {
+            XCTAssertNil(pid)
+            XCTAssertNil(launchID)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: launchMarker.path))
+        XCTAssertFalse(supervisor.isRunning())
+    }
+
     func testFakeDaemonHealthProbeAndMetricsStreamSmoke() async throws {
         let port = try freeTCPPort()
         let script = try makeExecutable(
@@ -10743,6 +11123,74 @@ final class MTPLXAppCoreTests: XCTestCase {
             )!
             return (Data(body.utf8), response)
         }
+    }
+
+    /// Structural companion to the immutable DeepSeek V4 target-only config.
+    /// The app uses this signature as a fast local preflight; the Python
+    /// launcher independently checks the exact published file hash.
+    private static func externalTargetOnlyConfigFixture() -> [String: Any] {
+        var quantization: [String: Any] = [
+            "bits": 8,
+            "group_size": 64,
+            "mode": "affine",
+            "embed": ["bits": 8, "group_size": 64, "mode": "affine"],
+            "head": ["bits": 8, "group_size": 64, "mode": "affine"],
+        ]
+        for layer in 0..<43 {
+            let recipe: ([Int], Int) = layer < 39 ? ([2, 3, 2], 128) : ([4, 4, 4], 64)
+            for (projection, bits) in zip(["w1", "w2", "w3"], recipe.0) {
+                quantization["layers.\(layer).ffn.experts.\(projection)"] = [
+                    "bits": bits,
+                    "group_size": recipe.1,
+                    "mode": "affine",
+                ]
+            }
+        }
+        return [
+            "architectures": ["DeepseekV4ForCausalLM"],
+            "model_type": "deepseek_v4",
+            "num_hidden_layers": 43,
+            "hidden_size": 4096,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 1,
+            "head_dim": 512,
+            "vocab_size": 129_280,
+            "num_nextn_predict_layers": 0,
+            "dspark_block_size": 0,
+            "num_experts_per_tok": 6,
+            "n_routed_experts": 256,
+            "quantization": quantization,
+        ]
+    }
+
+    private static func makeExternalTargetOnlyModelInstall(in root: URL) throws -> URL {
+        let model = root.appendingPathComponent(
+            "DeepSeek-V4-Flash-0731-MLX-M5Max-TargetOnly",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: model, withIntermediateDirectories: true)
+        try JSONSerialization.data(withJSONObject: externalTargetOnlyConfigFixture()).write(
+            to: model.appendingPathComponent("config.json")
+        )
+        try """
+        {"repo_id":"philipjohnbasile/DeepSeek-V4-Flash-0731-MLX-M5Max-TargetOnly","revision":"ac33e4f3ca3546e6cec104558d42161e15814e33"}
+        """.write(
+            to: model.appendingPathComponent(".mtplx-source.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let shards = (0...42).map { "model-layer-\($0).safetensors" }
+            + ["model-top.safetensors"]
+        for name in ["generation_config.json", "tokenizer.json", "tokenizer_config.json"] + shards {
+            try Data([0]).write(to: model.appendingPathComponent(name))
+        }
+        let weightMap = Dictionary(uniqueKeysWithValues: shards.enumerated().map {
+            ("weight.\($0.offset)", $0.element)
+        })
+        try JSONSerialization.data(withJSONObject: ["weight_map": weightMap]).write(
+            to: model.appendingPathComponent("model.safetensors.index.json")
+        )
+        return model
     }
 
     private func makeHTTPFixtureScript(

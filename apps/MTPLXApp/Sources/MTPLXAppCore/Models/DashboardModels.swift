@@ -154,6 +154,45 @@ public struct ReasoningPolicy: Codable, Equatable, Sendable {
     }
 }
 
+/// Shared app-side vocabulary for descriptor-provided reasoning effort.
+/// Family policies still own which subset appears for a loaded model.
+public enum ReasoningEffortVocabulary {
+    public static let levels = ["low", "medium", "high", "xhigh", "max"]
+
+    public static func normalizedStoredValue(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return value == "auto" || levels.contains(value) ? value : nil
+    }
+
+    public static func pickerLevels(_ raw: [String]?) -> [String] {
+        var seen = Set<String>()
+        return (raw ?? []).compactMap { rawLevel in
+            let level = rawLevel.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard levels.contains(level), seen.insert(level).inserted else { return nil }
+            return level
+        }
+    }
+
+    public static func pickerSelection(
+        _ raw: String?,
+        levels availableLevels: [String],
+        defaultEffort: String?
+    ) -> String {
+        let fallback = normalizedStoredValue(defaultEffort)
+            .flatMap { availableLevels.contains($0) ? $0 : nil }
+            ?? availableLevels.first
+            ?? "auto"
+        guard let value = normalizedStoredValue(raw),
+              value != "auto",
+              availableLevels.contains(value)
+        else {
+            return fallback
+        }
+        return value
+    }
+}
+
 public struct TunePolicy: Codable, Equatable, Sendable {
     public var supported: Bool
     public var supportedFamilies: [String]

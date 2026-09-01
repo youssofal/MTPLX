@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 // MARK: - HuggingFaceProbe
@@ -26,6 +27,7 @@ public struct HuggingFaceProbe: Sendable {
 
     private let runner: HTTPRunner
     private let endpointBase: String
+    private let externalAROnlyConfigSHA256: String
 
     /// `endpoint` is the user's HF download mirror from Settings
     /// (nil/empty = huggingface.co). The probe must follow it: on
@@ -34,6 +36,19 @@ public struct HuggingFaceProbe: Sendable {
     public init(endpoint: String? = nil, runner: @escaping HTTPRunner = Self.defaultRunner) {
         self.endpointBase = Self.normalizedEndpoint(endpoint)
         self.runner = runner
+        self.externalAROnlyConfigSHA256 = MTPLXModelOption.externalAROnlyConfigSHA256
+    }
+
+    /// Test seam for the remote layout protocol. Production construction
+    /// always uses the immutable published config fingerprint above.
+    init(
+        endpoint: String? = nil,
+        runner: @escaping HTTPRunner,
+        externalAROnlyConfigSHA256: String
+    ) {
+        self.endpointBase = Self.normalizedEndpoint(endpoint)
+        self.runner = runner
+        self.externalAROnlyConfigSHA256 = externalAROnlyConfigSHA256
     }
 
     static func normalizedEndpoint(_ raw: String?) -> String {
@@ -52,6 +67,14 @@ public struct HuggingFaceProbe: Sendable {
                 message: "Paste a Hugging Face repo or link.",
                 diagnostic: "invalid_repo_id"
             )
+        }
+
+        // The external route is intentionally not a name-only exception. A
+        // canonical owner/repo must still prove the immutable revision's
+        // exact config bytes and closed 44-shard tree before the UI permits
+        // the special mlx-serve route.
+        if MTPLXModelOption.isCanonicalExternalAROnlyRepoID(repo) {
+            return await probeExactExternalAROnlyRoute(repo: repo)
         }
 
         let configOutcome = await fetchConfig(repo: repo)
@@ -222,6 +245,59 @@ public struct HuggingFaceProbe: Sendable {
         } catch {
             return nil
         }
+    }
+
+    private func probeExactExternalAROnlyRoute(repo: String) async -> OtherModelProbe {
+        let revision = MTPLXModelOption.externalAROnlyRevision
+        guard let configURL = URL(string: "\(endpointBase)/\(repo)/resolve/\(revision)/config.json"),
+              let treeURL = URL(string: "\(endpointBase)/api/models/\(repo)/tree/\(revision)")
+        else {
+            return externalAROnlyProbeFailure(repo: repo, diagnostic: "url_build_failed")
+        }
+
+        guard let (configStatus, configData) = try? await runner(configURL, "GET"),
+              configStatus == 200,
+              SHA256.hash(data: configData)
+                .map({ String(format: "%02x", $0) })
+                .joined() == externalAROnlyConfigSHA256,
+              let config = try? JSONSerialization.jsonObject(with: configData) as? [String: Any],
+              MTPLXModelOption.isExternalAROnlyTargetConfig(config)
+        else {
+            return externalAROnlyProbeFailure(repo: repo, diagnostic: "pinned_config_mismatch")
+        }
+
+        guard let (treeStatus, treeData) = try? await runner(treeURL, "GET"),
+              treeStatus == 200,
+              let entries = try? JSONSerialization.jsonObject(with: treeData) as? [[String: Any]]
+        else {
+            return externalAROnlyProbeFailure(repo: repo, diagnostic: "pinned_tree_unavailable")
+        }
+
+        let paths = Set(entries.compactMap { $0["path"] as? String })
+        let expectedFiles = MTPLXModelOption.externalAROnlyWeightShards
+            .union(MTPLXModelOption.externalAROnlySidecars)
+        let publishedShards = Set(paths.filter { $0.hasSuffix(".safetensors") })
+        guard expectedFiles.isSubset(of: paths),
+              publishedShards == MTPLXModelOption.externalAROnlyWeightShards
+        else {
+            return externalAROnlyProbeFailure(repo: repo, diagnostic: "closed_44_shard_shape_mismatch")
+        }
+
+        return OtherModelProbe(
+            verdict: .noMTP,
+            hfRepo: repo,
+            message: "Verified pinned target-only AR route: requires a separately installed mlx-serve binary and a 128 GB Apple Silicon Mac. MTP and DSpark are unavailable.",
+            diagnostic: "external_target_only_verified"
+        )
+    }
+
+    private func externalAROnlyProbeFailure(repo: String, diagnostic: String) -> OtherModelProbe {
+        OtherModelProbe(
+            verdict: .probeFailed,
+            hfRepo: repo,
+            message: "The DeepSeek V4 external route no longer matches its pinned immutable artifact. It was not added.",
+            diagnostic: diagnostic
+        )
     }
 
     /// Classify the source artifact's quantization layout from the

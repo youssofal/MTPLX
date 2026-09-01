@@ -69,6 +69,14 @@ from mtplx.backends.registry import (
     TIER_ARCH_COMPATIBLE_UNVERIFIED,
     architecture_catalog,
 )
+from mtplx.backends.deepseek_v4_mlxserve import (
+    BACKEND_ID as DEEPSEEK_V4_MLXSERVE_BACKEND_ID,
+    DeepSeekV4MlxServeError,
+    build_command as build_deepseek_v4_mlxserve_command,
+    child_environment as deepseek_v4_mlxserve_environment,
+    resolve_binary as resolve_deepseek_v4_mlxserve_binary,
+    resolve_working_directory as resolve_deepseek_v4_mlxserve_working_directory,
+)
 from mtplx.backends.descriptors import (
     QWEN3_8_DRAFT_TEMPERATURE,
     descriptor_for_architecture_id,
@@ -773,15 +781,29 @@ def _apply_runtime_compatibility_mode(
             setattr(args, "depth", 0)
         setattr(args, "load_mtp", False)
         return None
-    if runtime_compatibility != "native-ar-only":
+    if runtime_compatibility not in {
+        "native-ar-only",
+        "external-mem-preflight-required",
+    }:
         return None
     if _generation_mode_from_args(args) != GENERATION_MODE_AR:
         # Same founder directive as the missing-head case: target-only AR
         # architectures degrade loudly instead of blocking on --no-mtp.
-        printer(
-            "target-only AR architecture -> mtp_off: serving autoregressive "
-            "(this checkpoint family has no native MTP head)."
-        )
+        if runtime_compatibility == "external-mem-preflight-required":
+            compatibility_note = (
+                "external target-only AR artifact -> mtp_off: delegating to "
+                "mlx-serve after its memory preflight (no MTP or DSpark)."
+            )
+        else:
+            compatibility_note = (
+                "target-only AR architecture -> mtp_off: serving autoregressive "
+                "(this checkpoint family has no native MTP head)."
+            )
+        # JSON dry runs must remain one parseable document, while still
+        # preserving the explicit target-only admission explanation that the
+        # terminal path prints before it changes generation mode.
+        setattr(args, "_runtime_compatibility_note", compatibility_note)
+        printer(compatibility_note)
         _set_generation_mode_on_args(args, GENERATION_MODE_AR)
         setattr(args, "depth", 0)
     setattr(args, "load_mtp", False)
@@ -8861,7 +8883,7 @@ def _redact_command_tokens(cmd: list[str]) -> list[str]:
 def _serve_dry_run_env_delta(env: dict[str, str]) -> dict[str, str]:
     delta: dict[str, str] = {}
     for key, value in sorted(env.items()):
-        if not key.startswith("MTPLX_"):
+        if not key.startswith(("MTPLX_", "MLX_SERVE_")):
             continue
         if os.environ.get(key) == value:
             continue
@@ -8870,6 +8892,109 @@ def _serve_dry_run_env_delta(env: dict[str, str]) -> dict[str, str]:
         else:
             delta[key] = str(value)
     return delta
+
+
+def _deepseek_v4_mlxserve_admission_error(
+    *,
+    dry_run: bool,
+    quiet_json: bool,
+    detail: str,
+) -> int:
+    """Render external-runtime admission failures without corrupting JSON UX."""
+
+    if dry_run and quiet_json:
+        _print(
+            {
+                "ok": False,
+                "dry_run": True,
+                "target": "server",
+                "error": "external_runtime_admission_failed",
+                "backend_id": DEEPSEEK_V4_MLXSERVE_BACKEND_ID,
+                "external_runtime": "mlx-serve",
+                "detail": _redact_secret_value(detail),
+            }
+        )
+    else:
+        _print_serve_start_line(f"error: {detail}")
+    return 2
+
+
+def _serve_deepseek_v4_mlxserve(
+    args: Any,
+    *,
+    runtime_model: str,
+    profile_name: str,
+    model_id: str,
+    generation_mode: str,
+    fan_mode: str,
+    api_key: str | None,
+    dry_run: bool,
+    quiet_json: bool,
+) -> int:
+    """Hand the exact target-only artifact to its external native runtime."""
+
+    if fan_mode != "default":
+        return _deepseek_v4_mlxserve_admission_error(
+            dry_run=dry_run,
+            quiet_json=quiet_json,
+            detail="the external DeepSeek V4 backend currently requires --fan-mode default",
+        )
+    try:
+        binary = resolve_deepseek_v4_mlxserve_binary()
+        cwd = resolve_deepseek_v4_mlxserve_working_directory(binary)
+        child_env = deepseek_v4_mlxserve_environment()
+        command = build_deepseek_v4_mlxserve_command(
+            binary=binary,
+            model=runtime_model,
+            host=str(args.host),
+            port=int(args.port),
+            context_window=getattr(args, "context_window", None),
+            api_key=api_key,
+        )
+    except (DeepSeekV4MlxServeError, OSError, ValueError) as exc:
+        return _deepseek_v4_mlxserve_admission_error(
+            dry_run=dry_run,
+            quiet_json=quiet_json,
+            detail=str(exc),
+        )
+
+    if not quiet_json:
+        _print_serve_handoff(args, runtime_model, profile_name)
+        _print_serve_start_line("[4/6] Backend selected: external mlx-serve target-only AR")
+        _print_serve_start_line("      MTP/DSpark: unavailable for this artifact")
+
+    if dry_run:
+        payload = _serve_dry_run_payload(
+            args,
+            runtime_model=runtime_model,
+            profile_name=profile_name,
+            model_id=model_id,
+            generation_mode=generation_mode,
+            cmd=command,
+            env=child_env,
+        )
+        payload.update(
+            {
+                "backend_id": DEEPSEEK_V4_MLXSERVE_BACKEND_ID,
+                "external_runtime": "mlx-serve",
+                "external_runtime_cwd": str(cwd),
+                "mtp_available": False,
+                "dspark_available": False,
+                "memory_preflight": "required",
+            }
+        )
+        if bool(getattr(args, "json", False)):
+            _print(payload)
+        else:
+            _print_serve_dry_run_human(payload)
+        return 0
+
+    return _run_server_child_with_app_parent_watchdog(
+        command,
+        env=child_env,
+        cwd=cwd,
+        app_parent_pid=_app_parent_pid_from_env(child_env),
+    )
 
 
 def _serve_dry_run_payload(
@@ -8906,6 +9031,9 @@ def _serve_dry_run_payload(
     }
     if bool(getattr(args, "download", False)):
         payload["download_requested"] = True
+    compatibility_note = getattr(args, "_runtime_compatibility_note", None)
+    if isinstance(compatibility_note, str) and compatibility_note:
+        payload["runtime_compatibility_note"] = compatibility_note
     return payload
 
 
@@ -9463,7 +9591,7 @@ def cmd_serve_public(args: Any) -> int:
     mode_exit = _apply_runtime_compatibility_mode(
         args,
         inspection,
-        printer=_print_serve_start_line,
+        printer=(lambda _line: None) if quiet_json else _print_serve_start_line,
     )
     if mode_exit is not None:
         return mode_exit
@@ -9479,6 +9607,18 @@ def cmd_serve_public(args: Any) -> int:
     _apply_backend_serve_defaults(args, inspection)
     _apply_qwen36_35b_optimized_speed_defaults(args, model_id)
     backend_descriptor = descriptor_from_inspection(inspection)
+    if backend_descriptor.backend_id == DEEPSEEK_V4_MLXSERVE_BACKEND_ID:
+        return _serve_deepseek_v4_mlxserve(
+            args,
+            runtime_model=str(runtime_model),
+            profile_name=profile.name,
+            model_id=str(model_id),
+            generation_mode=generation_mode,
+            fan_mode=fan_mode,
+            api_key=api_key,
+            dry_run=dry_run,
+            quiet_json=quiet_json,
+        )
     draft_lm_head = _model_draft_lm_head_spec(inspection, profile) or {
         "bits": 4,
         "group_size": 64,

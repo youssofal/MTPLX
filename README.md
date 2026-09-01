@@ -168,6 +168,30 @@ comfortable. MTPLX defaults Laguna to a 32,768-token context
 and response cap, and checks larger explicit server contexts against the active
 Metal memory cap.
 
+[DeepSeek-V4-Flash-0731 MLX M5 Max Target-Only](https://huggingface.co/philipjohnbasile/DeepSeek-V4-Flash-0731-MLX-M5Max-TargetOnly)
+uses a separate, experimental external runtime route. MTPLX pins the public
+artifact to `ac33e4f3ca3546e6cec104558d42161e15814e33`, admits the exact 44
+weight shards and required sidecars, then delegates serving to a separately
+installed `mlx-serve` executable. This is target-only AR — it has no MTP or
+DSpark weights — and it is not a native MTPLX backend:
+
+```bash
+mtplx pull philipjohnbasile/DeepSeek-V4-Flash-0731-MLX-M5Max-TargetOnly
+
+MTPLX_MLX_SERVE_BIN=/path/to/mlx-serve \
+mtplx serve \
+  --model philipjohnbasile/DeepSeek-V4-Flash-0731-MLX-M5Max-TargetOnly \
+  --no-mtp --host 127.0.0.1 --port 8000 --yes
+```
+
+The route requires a 128 GB Apple Silicon Mac, defaults to an 8,192-token
+context, disables PLD, decode-attention quantization, and vision, and preserves
+the external runtime's memory preflight. MTPLX clears ambient `MLX_SERVE_*`
+settings and launches with `MLX_SERVE_WIRED=fit` plus a 256 MB cache limit;
+set `MTPLX_DSV4_WIRED` only to make an explicit override. Representative
+streaming performance is unapproved, so neither this integration nor its dry
+run output makes a throughput claim.
+
 ## What MTPLX is not
 
 - Not an external-drafter system. The drafter is the target model's own MTP heads.

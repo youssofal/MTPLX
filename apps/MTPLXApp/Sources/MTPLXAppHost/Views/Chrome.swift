@@ -84,7 +84,7 @@ struct DaemonStatePill: View {
 //
 // Single combined daemon + stream pulse that replaces the old "RUNNING"
 // text pill plus the separate "live" dot. Goes green and pulses only
-// when the daemon is fully running AND the SSE metrics stream is open;
+// when the daemon is fully running and its health signal is ready;
 // otherwise it shows the most informative intermediate state (starting,
 // reconnecting, offline) without splitting attention across two widgets.
 struct ConnectionDot: View {
@@ -124,12 +124,14 @@ struct ConnectionDot: View {
         .help(helpText)
     }
 
-    /// True only when both the daemon is `.running` and the SSE stream
-    /// is `.open`. Used to gate the pulse so the indicator never lies
-    /// about health.
+    /// Native backends are healthy when the SSE stream is open. External
+    /// backends use their liveness watchdog because they expose no metrics.
     private var isHealthy: Bool {
-        if case .running = daemonState, case .open = connectionState { return true }
-        return false
+        guard case .running = daemonState else { return false }
+        return switch connectionState {
+        case .open, .healthyWithoutMetrics: true
+        default: false
+        }
     }
 
     /// Equatable proxy so `.onChange` fires only on a meaningful state
@@ -141,6 +143,7 @@ struct ConnectionDot: View {
     private var connectionLabel: String {
         switch connectionState {
         case .open: return "open"
+        case .healthyWithoutMetrics: return "healthy-without-metrics"
         case .connecting: return "connecting"
         case .reconnecting: return "reconnecting"
         case .failed: return "failed"
@@ -186,6 +189,7 @@ struct ConnectionDot: View {
         case .running:
             switch connectionState {
             case .open: return "Running"
+            case .healthyWithoutMetrics: return "Running"
             case .connecting: return "Connecting…"
             case .reconnecting(let n): return "Reconnect #\(n)"
             case .failed: return "Offline"
@@ -201,11 +205,12 @@ struct ConnectionDot: View {
     }
 
     private var helpText: String {
-        if isHealthy { return "Running and ready." }
         switch daemonState {
         case .running:
             switch connectionState {
-            case .open: return "Running."
+            case .open: return "Running and ready."
+            case .healthyWithoutMetrics:
+                return "Running and ready. External backend live stats are unavailable."
             case .connecting: return "Connecting to live stats…"
             case .reconnecting(let n): return "Reconnecting (attempt \(n))."
             case .failed(let msg): return "Live stats offline: \(msg)"

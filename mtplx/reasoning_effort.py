@@ -20,7 +20,7 @@ from typing import Any
 
 
 # Ordered low to high.
-REASONING_EFFORT_LEVELS = ("low", "medium", "high", "xhigh")
+REASONING_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 # "auto" is not a level; it means "use the loaded family's default_effort".
 REASONING_EFFORT_AUTO = "auto"
 REASONING_EFFORT_CHOICES = (REASONING_EFFORT_AUTO, *REASONING_EFFORT_LEVELS)
