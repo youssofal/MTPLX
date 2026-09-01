@@ -1,0 +1,45 @@
+mtplx_qsa_kernels
+=================
+
+This package contains the Qwen4 QSA sparse-GQA Metal attention kernel used by
+MTPLX's `mtplx/kernels/qsa_prefill_direct.py` lane.
+
+PROVENANCE
+
+  Upstream project : oMLX (https://github.com/jundot/omlx)
+  Upstream PR      : #3244 ("Qwen4 QSA direct sparse-GQA main attention")
+  Upstream revision: dc312e6e905e03d21ef0c4a86289cbfa2cf857cc
+  Upstream paths   : omlx/custom_kernels/glm_moe_dsa/csrc/
+                       qwen4_qsa_sparse_gqa.{h,cpp,metal}
+                       kernels/steel_qwen4_qsa_sparse_gqa.h
+                       bindings.cpp (abi_probe + one kernel binding only)
+                       CMakeLists.txt (trimmed to one target)
+
+  Licensed under the Apache License, Version 2.0. See LICENSE.txt.
+  Copyright (c) 2026 OpenAI (steel_qwen4_qsa_sparse_gqa.h).
+
+MTPLX MODIFICATIONS
+
+  * namespace omlx::glm_kernels -> mtplx::qsa_kernels;
+  * Metal library / metallib name "omlx_glm_kernels" -> "mtplx_qsa_kernels";
+  * primitive name OMLXQwen4QSASparseGQAAttention ->
+    MTPLXQwen4QSASparseGQAAttention;
+  * accepted (key_tile, dimension_tile) narrowed to the single packaged
+    specialization (64, 64), for both fp16 and bf16;
+  * only the (64, 64) kernels are instantiated in the .metal file;
+  * static_assert(WM * 32 <= 896) added for the M2/M3 threadgroup ceiling;
+  * bindings reduced to abi_probe, build receipts, and this one kernel.
+
+  The Metal include order in qwen4_qsa_sparse_gqa.metal is unchanged and is
+  load-bearing (Steel's attention header provides Limits).
+
+THIRD-PARTY NOTICES
+
+  MLX (https://github.com/ml-explore/mlx), MIT. The kernel includes MLX's
+  Steel MMA and attention headers from the installed mlx wheel.
+  See MLX_LICENSE.txt.
+
+  mlx-serve, MIT, Copyright 2026 David Dalcu. The 128-bit global K/V staging
+  pattern in steel_qwen4_qsa_sparse_gqa.h is adapted from mlx-serve's
+  `msv_attn_p256` kernel; the attribution comment is preserved verbatim in
+  that header. See MLX_SERVE_LICENSE.txt.

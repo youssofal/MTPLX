@@ -322,6 +322,15 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         "MTPLX_QSA_PREFILL_MIN_CONTEXT",
         "MTPLX_QSA_PREFILL_FLASH_MIN_CONTEXT",
         "MTPLX_QSA_PREFILL_SCORE_MB",
+        # Vendored Steel sparse-GQA consumer of the same block selections
+        # (native_extensions/qsa_kernels, oMLX PR #3244). Default on wherever
+        # the native module is built and ABI-probed; "0" kills only this
+        # consumer. MTPLX_QSA_PREFILL=0 still kills the whole lane. It is the
+        # only fast consumer M3-class GPUs can reach, so it also participates
+        # in the producer auto-gate.
+        "MTPLX_QSA_PREFILL_DIRECT",
+        "MTPLX_QSA_PREFILL_DIRECT_MIN_CONTEXT",
+        "MTPLX_QSA_PREFILL_DIRECT_VALIDATE",
         # Portable gathered-attention tier for the flash_prefill contract:
         # the universal (non-NAX) consumer of the same block selections.
         "MTPLX_QSA_PREFILL_GATHER",

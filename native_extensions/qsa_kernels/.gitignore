@@ -1,0 +1,7 @@
+build/
+*.egg-info/
+mtplx_qsa_kernels/*.so
+mtplx_qsa_kernels/*.dylib
+mtplx_qsa_kernels/*.metallib
+mtplx_qsa_kernels/__pycache__/
+__pycache__/

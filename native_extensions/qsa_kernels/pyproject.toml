@@ -1,0 +1,23 @@
+[build-system]
+# nanobind is pinned EXACTLY, not floated. mlx 0.32.2 was built with
+# nanobind 2.15.0 via FetchContent; an extension built with a different
+# nanobind ABI tag imports and lists every symbol but lands in an isolated
+# NB_DOMAIN, so every mx.array argument is rejected with "incompatible
+# function arguments" (oMLX issue #2139). The abi_probe canary catches that
+# at import, but the pin is what prevents it.
+#
+# mlx is pinned to ONE wheel for the same reason at the C++ level: this
+# extension links MLX's private Primitive ABI and its Steel Metal headers,
+# which carry no compatibility promise across patch releases. A range would
+# let a PEP 517 isolated build resolve a different 0.32.x than the serving
+# venv holds, producing a .so that imports, probes, and then mis-reads a
+# struct. Build it in the SAME venv that will run MTPLX and rebuild after
+# any mlx upgrade; the CMake-baked BUILT_AGAINST_MLX receipt is checked
+# against the imported mlx at readiness and disables the lane on a mismatch.
+requires = [
+  "setuptools>=42",
+  "cmake>=3.27",
+  "mlx==0.32.2",
+  "nanobind==2.15.0",
+]
+build-backend = "setuptools.build_meta"

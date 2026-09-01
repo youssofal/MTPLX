@@ -39,3 +39,11 @@ licensed under the Apache License 2.0. See mtplx/nax_verify.py for details.
 This product includes the Apache-2.0 licensed MLX implementation for
 Laguna-S-2.1 from PipeNetwork, Copyright 2026 PipeNetwork, under
 mtplx/models/laguna.py.
+
+This product includes the Apache-2.0 licensed Qwen4 QSA sparse-GQA Steel
+Metal attention kernel from oMLX (https://github.com/jundot/omlx), PR #3244,
+revision dc312e6e905e03d21ef0c4a86289cbfa2cf857cc, Copyright 2026 OpenAI,
+vendored under native_extensions/qsa_kernels. Its 128-bit K/V staging pattern
+is adapted from mlx-serve's MIT licensed msv_attn_p256 kernel, Copyright 2026
+David Dalcu. See native_extensions/qsa_kernels/mtplx_qsa_kernels/NOTICE for
+the full provenance, the list of MTPLX modifications, and the license set.

@@ -1240,10 +1240,24 @@ def _compiled_qsa_indexer_enabled() -> bool:
 def qsa_prefill_lane_auto_supported() -> bool:
     """Device gate for the auto default: the lane's fast consumer must exist.
 
-    Mirrors the flash kernel's own eligibility (Metal GPU + Metal 4
-    TensorOps). Machines without it would ride the eager selector into the
-    dense-mask reconstruction — pure tax — so auto stays off there until the
-    portable gather tier carries its own receipts on that hardware class.
+    The producer only emits the ``("flash_prefill", ids, valid)`` tuple when
+    this returns True, so it must name EVERY fast consumer of that tuple.
+    Two exist:
+
+    * Metal 4 TensorOps (NAX) machines take ``qsa_prefill_flash`` (M4/M5).
+    * M3-class machines have no G17 tensor units and can never take that
+      kernel, but they can take the vendored Steel sparse-GQA kernel when it
+      is built and probed.
+
+    Machines with neither would ride the eager selector into the dense-mask
+    reconstruction — pure tax — so auto stays off there until the portable
+    gather tier carries its own receipts on that hardware class.
+
+    ``MTPLX_QSA_PREFILL=0`` remains the master kill switch above this, and
+    ``MTPLX_QSA_PREFILL_DIRECT=0`` (honored inside
+    ``qsa_prefill_direct_ready``) removes the direct consumer from this
+    answer, so killing the direct lane on an M3 also disarms the producer
+    instead of leaving it selecting for nobody.
     """
 
     try:
@@ -1255,7 +1269,11 @@ def qsa_prefill_lane_auto_supported() -> bool:
             qsa_indexer_select_nax_available,
         )
 
-        return bool(qsa_indexer_select_nax_available())
+        if bool(qsa_indexer_select_nax_available()):
+            return True
+        from mtplx.kernels.qsa_prefill_direct import qsa_prefill_direct_ready
+
+        return bool(qsa_prefill_direct_ready())
     except Exception:
         return False
 
@@ -1323,6 +1341,25 @@ def _qsa_prefill_flash_min_context() -> int:
         return 32768
 
 
+def _qsa_prefill_direct_min_context() -> int:
+    """Crossover for the vendored Steel sparse-GQA consumer (M3 lane).
+
+    Defaults to the flash consumer's 32768 so the two direct consumers share
+    one story until an operator turns the knob. oMLX measured +11.7% prefill
+    on M3 already at 16K; an M3 Ultra 256GB sequential A/B of this port
+    (2026-09-01) saw the 32k TTFT win with
+    ``MTPLX_QSA_PREFILL_DIRECT_MIN_CONTEXT=2049``.
+    """
+
+    try:
+        return max(
+            2049,
+            int(os.environ.get("MTPLX_QSA_PREFILL_DIRECT_MIN_CONTEXT") or 32768),
+        )
+    except ValueError:
+        return 32768
+
+
 def _qsa_prefill_score_workspace_bytes() -> int:
     """Byte budget for per-head float32 logits plus the reduced score plane."""
 
@@ -1374,6 +1411,15 @@ def _qsa_prefill_flash_attention_enabled(rows: int, total_tokens: int) -> bool:
     )
 
 
+def _qsa_prefill_direct_attention_enabled(rows: int, total_tokens: int) -> bool:
+    """Whether the vendored Steel sparse-GQA consumer may serve this chunk."""
+
+    return (
+        _qsa_large_prefill_enabled(rows, total_tokens)
+        and int(total_tokens) - int(rows) >= _qsa_prefill_direct_min_context()
+    )
+
+
 _QSA_PREFILL_COUNTS: Dict[str, int] = {}
 _QSA_PREFILL_DEBUG_ARMED = False
 
@@ -1384,6 +1430,14 @@ def _qsa_prefill_count(lane: str) -> None:
 
     global _QSA_PREFILL_DEBUG_ARMED
     _QSA_PREFILL_COUNTS[lane] = _QSA_PREFILL_COUNTS.get(lane, 0) + 1
+    receipt = (os.environ.get("MTPLX_QSA_PREFILL_ENGAGEMENT_FILE") or "").strip()
+    if receipt:
+        try:
+            Path(receipt).write_text(
+                json.dumps(dict(_QSA_PREFILL_COUNTS), sort_keys=True) + "\n"
+            )
+        except OSError:
+            pass
     if not _QSA_PREFILL_DEBUG_ARMED:
         _QSA_PREFILL_DEBUG_ARMED = True
         raw = (os.environ.get("MTPLX_QSA_PREFILL_DEBUG") or "0").strip().lower()
@@ -1404,6 +1458,40 @@ def qsa_prefill_engagement() -> Dict[str, int]:
     """Snapshot of per-lane large-prefill engagement counters."""
 
     return dict(_QSA_PREFILL_COUNTS)
+
+
+def _qsa_prefill_dispatch_tier(
+    *,
+    flash_supported,
+    flash_call,
+    direct_supported,
+    direct_call,
+    gather_enabled: bool,
+    gather_call,
+):
+    """Pick the one consumer of the ``("flash_prefill", ids, valid)`` tuple.
+
+    Order is flash (M4/M5 MPP) -> direct (Steel, the M3 lane) -> gather
+    (portable) -> dense. Each predicate is called at most once and only
+    until one answers True. Returns the attention output, or ``None`` to
+    mean "no tier dispatched; rebuild the dense mask". There is no retry:
+    once a tier is entered its failure propagates.
+    """
+
+    if flash_supported():
+        out = flash_call()
+        _qsa_prefill_count("flash_kernel")
+        return out
+    if direct_supported():
+        out = direct_call()
+        _qsa_prefill_count("direct_kernel")
+        return out
+    if gather_enabled:
+        out = gather_call()
+        _qsa_prefill_count("gather_tier")
+        return out
+    _qsa_prefill_count("dense_fallback")
+    return None
 
 
 def _qsa_prefill_gather_enabled() -> bool:
@@ -3051,17 +3139,25 @@ class Attention(nn.Module):
             )
 
             _, block_ids, block_valid = sel_mask
-            if _qsa_prefill_flash_attention_enabled(S, T) and qsa_prefill_flash_supported(
-                q,
-                cache.kv.keys,
-                cache.kv.values,
-                block_ids,
-                block_valid,
-                pos_start=pos_start,
-                total_tokens=T,
-                scale=self.scale,
-            ):
-                out = qsa_prefill_flash(
+
+            def _qsa_flash_supported() -> bool:
+                return bool(
+                    _qsa_prefill_flash_attention_enabled(S, T)
+                ) and bool(
+                    qsa_prefill_flash_supported(
+                        q,
+                        cache.kv.keys,
+                        cache.kv.values,
+                        block_ids,
+                        block_valid,
+                        pos_start=pos_start,
+                        total_tokens=T,
+                        scale=self.scale,
+                    )
+                )
+
+            def _qsa_flash_call():
+                return qsa_prefill_flash(
                     q,
                     cache.kv.keys,
                     cache.kv.values,
@@ -3071,16 +3167,48 @@ class Attention(nn.Module):
                     total_tokens=T,
                     scale=self.scale,
                 )
-                _qsa_prefill_count("flash_kernel")
-                out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
-                return self.o_proj(out * mx.sigmoid(gate))
 
-            # Portable tier (MTPLX_QSA_PREFILL_GATHER): same compact block
-            # contract, bounded gathered attention on any Metal device — the
-            # universal lane for machines without Metal 4 TensorOps. Same
-            # visible set as the dense mask; only reduction order differs.
-            if _qsa_prefill_gather_enabled():
-                out = _qsa_prefill_gather_attention(
+            def _qsa_direct_supported() -> bool:
+                if not _qsa_prefill_direct_attention_enabled(S, T):
+                    return False
+                from mtplx.kernels.qsa_prefill_direct import (
+                    qsa_prefill_direct_supported,
+                )
+
+                return bool(
+                    qsa_prefill_direct_supported(
+                        q,
+                        k,
+                        v,
+                        block_ids,
+                        block_valid,
+                        pos_start=pos_start,
+                        total_tokens=T,
+                        scale=self.scale,
+                        compress_ratio=self.indexer.ratio,
+                        block_topk=self.indexer.block_topk,
+                    )
+                )
+
+            def _qsa_direct_call():
+                from mtplx.kernels.qsa_prefill_direct import qsa_prefill_direct
+
+                out = qsa_prefill_direct(
+                    q,
+                    k,
+                    v,
+                    block_ids,
+                    block_valid,
+                    pos_start=pos_start,
+                    total_tokens=T,
+                    scale=self.scale,
+                    compress_ratio=self.indexer.ratio,
+                    block_topk=self.indexer.block_topk,
+                )
+                return out
+
+            def _qsa_gather_call():
+                return _qsa_prefill_gather_attention(
                     q,
                     cache.kv.keys,
                     cache.kv.values,
@@ -3092,14 +3220,22 @@ class Attention(nn.Module):
                     scale=self.scale,
                     tile_rows=_qsa_prefill_gather_tile_rows(),
                 )
-                _qsa_prefill_count("gather_tier")
+
+            out = _qsa_prefill_dispatch_tier(
+                flash_supported=_qsa_flash_supported,
+                flash_call=_qsa_flash_call,
+                direct_supported=_qsa_direct_supported,
+                direct_call=_qsa_direct_call,
+                gather_enabled=_qsa_prefill_gather_enabled(),
+                gather_call=_qsa_gather_call,
+            )
+            if out is not None:
                 out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
                 return self.o_proj(out * mx.sigmoid(gate))
 
             # Static unsupported geometry falls back exactly.  Once the
             # supported kernel is dispatched, failures propagate instead of
             # being hidden behind a dense retry.
-            _qsa_prefill_count("dense_fallback")
             sel_mask = _qsa_blocks_to_dense_mask(
                 block_ids,
                 block_valid,
