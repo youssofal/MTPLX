@@ -113,3 +113,36 @@ class TestBatchedLoopWiring:
         src = inspect.getsource(gen)
         cut = src.index('if finish_reason != "stop":')
         assert "stop_origin = None" in src[cut : cut + 120]
+
+
+def test_stats_origin_reaches_public_surfaces():
+    """#414 followup: the origin reached GenerationStats but neither the SSE
+    mtplx_stats payload nor the request-log JSONL row, so the release note's
+    "diagnosable from request logs alone" promise was unreadable without a
+    local patch."""
+    from mtplx.server.openai import _metrics_envelope, _public_mtplx_stats
+
+    stats = {"finish_stop_origin": "residual_correction"}
+    # SSE mtplx_stats: quiet-envelope rule — present when a stop named its
+    # commit path, absent on length finishes (None in to_dict()).
+    assert (
+        _public_mtplx_stats({"stats": stats})["finish_stop_origin"]
+        == "residual_correction"
+    )
+    # Request-log JSONL row: nullable like repetition_stop_reason.
+    envelope = _metrics_envelope(
+        stats=stats,
+        prompt_tokens=512,
+        completion_tokens=37,
+        request_elapsed_s=0.5,
+        token_times=[10.0],
+        request_started_s=9.5,
+        lock_wait_time_s=0.0,
+        session_id=None,
+        session_cache_hit=False,
+        cache_miss_reason=None,
+        session_restore_mode="cold",
+        mtp_depth=3,
+        generation_limits={},
+    )
+    assert envelope["finish_stop_origin"] == "residual_correction"
