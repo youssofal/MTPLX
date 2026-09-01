@@ -2523,6 +2523,23 @@ def _gemma4_prefill_prompt(
     )
 
 
+def _clone_gemma4_prompt_cache(
+    runtime: Gemma4AssistantRuntime,
+    cache: list[Any],
+) -> list[Any]:
+    """Retain the pre-decode cache before sliding layers evict its history."""
+
+    from mtplx.cache_state import restore_cache, snapshot_cache_lazy_hybrid
+
+    clone = runtime.make_cache()
+    restore_cache(
+        clone,
+        snapshot_cache_lazy_hybrid(cache),
+        clone_states=False,
+    )
+    return clone
+
+
 def _restore_or_prefill_gemma4_prompt(
     runtime: Gemma4AssistantRuntime,
     prompt_ids: list[int],
@@ -2575,6 +2592,99 @@ def _restore_or_prefill_gemma4_prompt(
         policy_fingerprint=session_policy_fingerprint,
     )
     if restored is None:
+        candidates = getattr(session_bank, "near_prefix_candidates", None)
+        restore_prefix = getattr(session_bank, "restore_entry_prefix_cache", None)
+        if callable(candidates) and callable(restore_prefix):
+            try:
+                near_matches = candidates(
+                    prompt_ids,
+                    model_path=str(runtime.model_path),
+                    mtp_enabled=bool(runtime.mtp_enabled),
+                    hidden_variant="gemma4_pre_norm",
+                    template_hash=session_template_hash,
+                    mtp_history_policy=GEMMA4_SESSION_STATE_POLICY,
+                    draft_head_identity=session_draft_head_identity,
+                    policy_fingerprint=session_policy_fingerprint,
+                )
+            except Exception:
+                near_matches = []
+            for entry, matched in near_matches:
+                matched = int(matched)
+                if (
+                    matched < 2
+                    or matched >= int(getattr(entry, "prefix_len", 0) or 0)
+                    or matched >= len(prompt_ids)
+                    or str(getattr(entry, "model_path", ""))
+                    != str(runtime.model_path)
+                    or bool(getattr(entry, "mtp_enabled", False))
+                    != bool(runtime.mtp_enabled)
+                    or getattr(entry, "hidden_variant", None) != "gemma4_pre_norm"
+                    or (
+                        session_template_hash is not None
+                        and getattr(entry, "template_hash", None)
+                        != session_template_hash
+                    )
+                    or getattr(entry, "mtp_history_policy", None)
+                    != GEMMA4_SESSION_STATE_POLICY
+                    or (
+                        session_draft_head_identity is not None
+                        and getattr(entry, "draft_head_identity", None)
+                        != session_draft_head_identity
+                    )
+                    or (
+                        session_policy_fingerprint is not None
+                        and getattr(entry, "policy_fingerprint", None)
+                        != session_policy_fingerprint
+                    )
+                ):
+                    continue
+                try:
+                    prefix_restore = restore_prefix(
+                        runtime,
+                        entry,
+                        matched,
+                        mode=session_restore_mode,
+                        full_boundary=True,
+                    )
+                except Exception:
+                    prefix_restore = None
+                if prefix_restore is None:
+                    continue
+                boundary_hidden = None
+                if len(prefix_restore) == 5:
+                    cache, _history, storage_mode, restore_point, boundary_hidden = (
+                        prefix_restore
+                    )
+                elif len(prefix_restore) == 4:
+                    cache, _history, storage_mode, restore_point = prefix_restore
+                else:
+                    cache, _history, storage_mode = prefix_restore
+                    restore_point = matched
+                restore_point = int(restore_point)
+                prefill_start = restore_point
+                if prefill_start < 0 or prefill_start >= len(prompt_ids):
+                    continue
+                output, _suffix_elapsed = _gemma4_prefill_prompt(
+                    runtime,
+                    list(prompt_ids[prefill_start:]),
+                    cache=cache,
+                    phase="prefill",
+                )
+                entry.hits += 1
+                entry.last_access_s = time.time()
+                return Gemma4PromptState(
+                    cache=cache,
+                    logits=output.logits[:, -1, :],
+                    hidden=output.hidden[:, -1:, :],
+                    shared_kv_states=output.shared_kv_states,
+                    kv_offset=int(output.cache_offset),
+                    prompt_eval_time_s=time.perf_counter() - started,
+                    cached_tokens=restore_point,
+                    suffix_tokens=len(prompt_ids) - restore_point,
+                    cache_hit=True,
+                    cache_miss_reason=None,
+                    restore_mode=f"block_prefix_{storage_mode}",
+                )
         return cold_prefill(getattr(session_bank, "last_miss_reason", None))
 
     suffix = list(prompt_ids[restored.entry.prefix_len :])
@@ -2715,6 +2825,13 @@ def generate_gemma4_ar(
         except Exception:
             pass
     cache = prompt_state.cache
+    prompt_boundary_cache = (
+        _clone_gemma4_prompt_cache(runtime, cache) if capture_final_state else None
+    )
+    prompt_boundary_extra_state = _gemma4_session_extra_state(
+        shared_kv_states=prompt_state.shared_kv_states,
+        kv_offset=int(prompt_state.kv_offset),
+    )
     logits = prompt_state.logits
     hidden = prompt_state.hidden
     shared_kv_states = prompt_state.shared_kv_states
@@ -2806,6 +2923,10 @@ def generate_gemma4_ar(
             safe_to_commit=not pending_token_needs_commit,
             finish_reason=finish_reason,
             extra_state=extra_state,
+            prompt_boundary_cache=prompt_boundary_cache,
+            prompt_boundary_logits=prompt_state.logits,
+            prompt_boundary_hidden=prompt_state.hidden,
+            prompt_boundary_extra_state=prompt_boundary_extra_state,
         )
     stats = GenerationStats(
         mode="ar",
@@ -2959,6 +3080,13 @@ def generate_gemma4_assistant(
         except Exception:
             pass
     cache = prompt_state.cache
+    prompt_boundary_cache = (
+        _clone_gemma4_prompt_cache(runtime, cache) if capture_final_state else None
+    )
+    prompt_boundary_extra_state = _gemma4_session_extra_state(
+        shared_kv_states=prompt_state.shared_kv_states,
+        kv_offset=int(prompt_state.kv_offset),
+    )
 
     tokens: list[int] = []
     stats_depth = max_block_size if adaptive_draft else block_size
@@ -3332,6 +3460,10 @@ def generate_gemma4_assistant(
                 shared_kv_states=shared_kv_states,
                 kv_offset=int(kv_offset),
             ),
+            prompt_boundary_cache=prompt_boundary_cache,
+            prompt_boundary_logits=prompt_state.logits,
+            prompt_boundary_hidden=prompt_state.hidden,
+            prompt_boundary_extra_state=prompt_boundary_extra_state,
         )
     return GenerationOutput(
         tokens=tokens,

@@ -2466,6 +2466,12 @@ class GenerationFinalState:
     mtp_history_window_tokens: int = 0
     mtp_history_position_base: int = 0
     extra_state: dict[str, Any] | None = None
+    # Optional pre-decode state for backends whose rolling cache cannot safely
+    # reconstruct an earlier prompt boundary from the generated tail.
+    prompt_boundary_cache: list[Any] | None = None
+    prompt_boundary_logits: Any | None = None
+    prompt_boundary_hidden: Any | None = None
+    prompt_boundary_extra_state: dict[str, Any] | None = None
 
 
 def _finish_reason_from_tokens(

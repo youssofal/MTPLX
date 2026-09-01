@@ -1468,6 +1468,7 @@ class SessionBank:
         cache_factory: Callable[[], list[Any]] | None = None,
         mtp_cache_factory: Callable[[], list[Any]] | None = None,
         served_out: dict[str, Any] | None = None,
+        full_boundary: bool = False,
     ) -> tuple[list[Any], list[Any] | None, str] | None:
         """Restore a cached entry to an earlier safe prefix boundary.
 
@@ -1533,13 +1534,12 @@ class SessionBank:
 
         actual_restore_mode = "clone"
         mtp_history_trim_tokens = max(0, int(entry.prefix_len) - restore_point)
-        # Boundary restores land the KV at the full boundary (no seed forward
-        # will run — it would advance recurrent state past the captured
-        # boundary a second time). Non-boundary restores keep the seed-forward
+        # Boundary restores and callers with complete attention-only state land
+        # the KV at the full boundary. Other consumers keep the seed-forward
         # slot semantics.
         trim_to_target = (
             (lambda c: _trim_cache_ref_to_tokens(c, restore_point))
-            if boundary_snapshot is not None
+            if boundary_snapshot is not None or full_boundary
             else (lambda c: _trim_cache_ref_to_prefix(c, restore_point))
         )
         # Passive-probe maintenance splits: CPU-side perf_counter spans only,
