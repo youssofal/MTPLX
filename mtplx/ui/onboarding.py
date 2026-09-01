@@ -1261,7 +1261,7 @@ def _surface_url(host: str, port: int, *, path: str = "") -> str:
 def screen_interface(
     *,
     host: str = "127.0.0.1",
-    port: int = 8000,
+    port: int = 6875,
 ) -> str:
     """Return the target string (``openwebui``, ``terminal``, ``pi``, ``opencode``, ``swival``, or ``dashboard``)."""
 
@@ -1330,7 +1330,7 @@ def screen_dashboard_companion(
     *,
     default: bool = False,
     host: str = "127.0.0.1",
-    port: int = 8000,
+    port: int = 6875,
 ) -> bool:
     """Offer to open the live Dashboard alongside the chosen client.
 
@@ -1392,7 +1392,7 @@ def screen_tuning_offer() -> bool:
 def screen_server_surface(
     *,
     host: str = "127.0.0.1",
-    port: int = 8000,
+    port: int = 6875,
     default_open_browser: bool = False,
 ) -> bool:
     """Return whether the server flow should open the browser chat."""
@@ -1431,7 +1431,7 @@ def run_onboarding_screens(
     configured_model: str | None = None,
     open_dashboard_override: bool | None = None,
     host: str = "127.0.0.1",
-    port: int = 8000,
+    port: int = 6875,
 ) -> dict:
     """Walk all three screens and return the chosen state dict.
 
@@ -1484,7 +1484,7 @@ def run_serve_onboarding_screens(
     *,
     configured_model: str | None = None,
     host: str = "127.0.0.1",
-    port: int = 8000,
+    port: int = 6875,
     default_open_browser: bool = False,
 ) -> dict:
     """Walk the advanced server setup screens and return the chosen state."""
@@ -1935,7 +1935,7 @@ def run_quickstart_flow(
     configured_model: str | None = None,
     open_dashboard_override: bool | None = None,
     host: str = "127.0.0.1",
-    port: int = 8000,
+    port: int = 6875,
 ) -> dict | None:
     """Decide between attach, 'same as last time', or fresh onboarding.
 
@@ -2072,7 +2072,7 @@ def run_serve_flow(
     fresh: bool = False,
     configured_model: str | None = None,
     host: str = "127.0.0.1",
-    port: int = 8000,
+    port: int = 6875,
     default_open_browser: bool = False,
 ) -> dict | None:
     """Interactive setup for bare ``mtplx serve``.

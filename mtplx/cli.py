@@ -2222,7 +2222,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_flow_p.add_argument(
         "--port",
         type=int,
-        default=8000,
+        default=6875,
         help="Server port for `mtplx start`; OpenCode examples use 18083 to avoid browser-chat collisions",
     )
     start_flow_p.add_argument(
@@ -2405,7 +2405,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="key=value pairs for set, e.g. depth=2 reasoning=off",
     )
     settings_p.add_argument("--host", default="127.0.0.1")
-    settings_p.add_argument("--port", type=int, default=8000)
+    settings_p.add_argument("--port", type=int, default=6875)
     settings_p.add_argument(
         "--json", action="store_true", help="Emit machine-readable JSON"
     )
@@ -2501,7 +2501,7 @@ def build_parser() -> argparse.ArgumentParser:
             "add --api-key-file ~/.mtplx/api-key to generate one)"
         ),
     )
-    quickstart_server_p.add_argument("--port", type=int, default=8000)
+    quickstart_server_p.add_argument("--port", type=int, default=6875)
     quickstart_server_p.add_argument("--model-id", default=DEFAULT_PUBLIC_MODEL_ID, help="Served OpenAI model id; defaults to the loaded artifact identity")
     quickstart_server_p.add_argument(
         "--embedding-model",
@@ -2673,7 +2673,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["openwebui", "claude-code", "opencode", "swival"],
     )
     connect_p.add_argument("--host", default="127.0.0.1")
-    connect_p.add_argument("--port", type=int, default=8000)
+    connect_p.add_argument("--port", type=int, default=6875)
     connect_p.add_argument("--model-id", default=DEFAULT_PUBLIC_MODEL_ID)
     connect_p.add_argument("--api-key-env", default="MTPLX_API_KEY")
     connect_p.add_argument(
@@ -2703,7 +2703,7 @@ def build_parser() -> argparse.ArgumentParser:
     openwebui_docker_p = openwebui_sub.add_parser(
         "docker-command", help="Print the production Open WebUI Docker command"
     )
-    openwebui_docker_p.add_argument("--mtplx-port", type=int, default=8000)
+    openwebui_docker_p.add_argument("--mtplx-port", type=int, default=6875)
     openwebui_docker_p.add_argument("--webui-port", type=int, default=3000)
     openwebui_docker_p.add_argument(
         "--single-user",
@@ -3411,7 +3411,7 @@ def build_parser() -> argparse.ArgumentParser:
             "add --api-key-file ~/.mtplx/api-key to generate one)"
         ),
     )
-    serve_p.add_argument("--port", type=int, default=8000)
+    serve_p.add_argument("--port", type=int, default=6875)
     serve_p.add_argument(
         "--no-auth",
         action="store_true",
@@ -4303,7 +4303,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Open the live MTPLX dashboard in the browser (requires a running server)",
     )
     dashboard_p.add_argument("--host", default="127.0.0.1", help="MTPLX server host")
-    dashboard_p.add_argument("--port", type=int, default=8000, help="MTPLX server port")
+    dashboard_p.add_argument("--port", type=int, default=6875, help="MTPLX server port")
     dashboard_p.add_argument(
         "--timeout", type=float, default=2.5, help="Health-probe timeout in seconds"
     )
@@ -4322,7 +4322,7 @@ def build_parser() -> argparse.ArgumentParser:
     for integration_name in ("openwebui", "claude-code", "opencode", "swival"):
         integration_p = integrate_sub.add_parser(integration_name)
         integration_p.add_argument("--host", default="127.0.0.1")
-        integration_p.add_argument("--port", type=int, default=8000)
+        integration_p.add_argument("--port", type=int, default=6875)
         integration_p.add_argument("--model-id", default=DEFAULT_PUBLIC_MODEL_ID)
         integration_p.add_argument("--api-key-env", default="MTPLX_API_KEY")
         integration_p.add_argument(
