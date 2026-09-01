@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from mtplx.hf_loader import cached_model_is_complete, model_cache_dir
+from mtplx.hf_loader import cached_model_is_complete, model_library_roots
 
 MEMORY_SAFETY_FACTOR = 1.5
 DISK_MULTIPLIER = 2.5
@@ -692,6 +692,9 @@ class InstalledModel:
     name: str
     size_bytes: int
     catalog: CatalogModel | None
+    root: Path | None = None
+    root_index: int = 0
+    is_primary: bool = True
 
     @property
     def display_name(self) -> str:
@@ -724,6 +727,8 @@ def _is_complete_install(path: Path) -> bool:
 
 def scan_installed_models(
     cache_dir: str | Path | None = None,
+    *,
+    search_dirs: Iterable[str | Path] | None = None,
 ) -> list[InstalledModel]:
     """Complete installs under the model cache, official catalog first.
 
@@ -732,33 +737,43 @@ def scan_installed_models(
     picker never offers a model that cannot load.
     """
 
-    root = model_cache_dir(cache_dir)
-    if not root.is_dir():
-        return []
     installed: list[InstalledModel] = []
-    for child in sorted(root.iterdir()):
-        if not child.is_dir() or child.name.startswith("."):
+    seen: set[str] = set()
+    for root_index, root in enumerate(
+        model_library_roots(cache_dir, search_dirs=search_dirs)
+    ):
+        if not root.is_dir():
             continue
-        if not _is_complete_install(child):
-            continue
-        installed.append(
-            InstalledModel(
-                path=child,
-                name=child.name,
-                size_bytes=_directory_size_bytes(child),
-                catalog=catalog_model_matching(child.name),
+        for child in sorted(root.iterdir()):
+            if not child.is_dir() or child.name.startswith("."):
+                continue
+            identity = os.path.normcase(str(child.resolve(strict=False)))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if not _is_complete_install(child):
+                continue
+            installed.append(
+                InstalledModel(
+                    path=child,
+                    name=child.name,
+                    size_bytes=_directory_size_bytes(child),
+                    catalog=catalog_model_matching(child.name),
+                    root=root,
+                    root_index=root_index,
+                    is_primary=root_index == 0,
+                )
             )
-        )
 
-    def sort_key(model: InstalledModel) -> tuple[int, int, str]:
+    def sort_key(model: InstalledModel) -> tuple[int, int, int, str]:
         if model.catalog is not None:
             catalog_index = next(
                 index
                 for index, entry in enumerate(OFFICIAL_CATALOG)
                 if entry.id == model.catalog.id
             )
-            return (0, catalog_index, model.name.lower())
-        return (1, 0, model.name.lower())
+            return (0, catalog_index, model.root_index, model.name.lower())
+        return (1, 0, model.root_index, model.name.lower())
 
     return sorted(installed, key=sort_key)
 

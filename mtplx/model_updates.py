@@ -27,11 +27,14 @@ import os
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from mtplx.hf_loader import (
+    RepoFile,
     _query_repo_snapshot,
+    _safe_destination_for_repo_file,
     cached_model_path,
+    model_library_roots,
     model_cache_dir,
     pull_model,
     read_source_marker,
@@ -108,6 +111,9 @@ class ModelUpdateStatus:
     min_engine_version: str | None = None
     update_bytes: int | None = None
     changed_files: tuple[str, ...] = ()
+    root: str | None = None
+    root_index: int = 0
+    is_primary: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -121,6 +127,9 @@ class ModelUpdateStatus:
             "min_engine_version": self.min_engine_version,
             "update_bytes": self.update_bytes,
             "changed_files": list(self.changed_files),
+            "root": self.root or str(Path(self.path).parent),
+            "root_index": self.root_index,
+            "is_primary": self.is_primary,
         }
 
 
@@ -188,13 +197,16 @@ def _diff_against_local_dir(
     total = 0
     sized = True
     for path, entry in remote_files.items():
+        local_path = _safe_destination_for_repo_file(
+            pack_dir, RepoFile(path=path, size_bytes=None)
+        )
         if path.startswith(".") or "/." in path:
             # Git plumbing (.gitattributes): present in listings, not pack
             # content, and not something a sync should trigger on.
             continue
         remote_size = entry.get("size")
         try:
-            local_size: int | None = (pack_dir / path).stat().st_size
+            local_size: int | None = local_path.stat().st_size
         except OSError:
             local_size = None
         if local_size is not None and isinstance(remote_size, int) and local_size == remote_size:
@@ -238,6 +250,7 @@ def _cached_pack_repo_id(path: Path) -> str | None:
 def check_model_updates(
     *,
     cache_dir: str | Path | None = None,
+    search_dirs: Iterable[str | Path] | None = None,
     manifest: dict[str, Any] | None | str = "auto",
     use_hub_fallback: bool = True,
     include_current: bool = True,
@@ -246,81 +259,91 @@ def check_model_updates(
 
     if manifest == "auto":
         manifest = fetch_models_manifest()
-    root = model_cache_dir(cache_dir)
-    if not root.exists():
-        return []
     rows: list[ModelUpdateStatus] = []
-    for child in sorted(root.iterdir()):
-        if not child.is_dir() or child.name.startswith(".") or child.is_symlink():
+    for root_index, root in enumerate(
+        model_library_roots(cache_dir, search_dirs=search_dirs)
+    ):
+        if not root.is_dir():
             continue
-        repo_id = _cached_pack_repo_id(child)
-        if not repo_id:
-            continue
-        marker = read_source_marker(child)
-        local_sha = (marker or {}).get("resolved_sha")
-        local_sha = local_sha if isinstance(local_sha, str) and local_sha else None
+        for child in sorted(root.iterdir()):
+            if not child.is_dir() or child.name.startswith(".") or child.is_symlink():
+                continue
+            repo_id = _cached_pack_repo_id(child)
+            if not repo_id:
+                continue
+            marker = read_source_marker(child)
+            local_sha = (marker or {}).get("resolved_sha")
+            local_sha = local_sha if isinstance(local_sha, str) and local_sha else None
 
-        entry = _manifest_entry(manifest if isinstance(manifest, dict) else None, repo_id)
-        note = None
-        min_engine = None
-        remote_sha: str | None = None
-        remote_files: dict[str, dict[str, Any]] | None = None
-        source = "none"
-        if entry:
-            source = "manifest"
-            revision = entry.get("revision")
-            remote_sha = revision if isinstance(revision, str) and revision else None
-            raw_note = entry.get("note")
-            note = raw_note if isinstance(raw_note, str) else None
-            raw_min = entry.get("min_engine_version")
-            min_engine = raw_min if isinstance(raw_min, str) else None
-        elif use_hub_fallback and local_sha:
-            # Only tracked packs are worth a Hub round-trip without a
-            # manifest entry: untracked ones would report unknown anyway.
-            remote_sha, remote_files = _query_repo_snapshot(repo_id)
-            source = "hub" if remote_sha else "none"
+            entry = _manifest_entry(
+                manifest if isinstance(manifest, dict) else None, repo_id
+            )
+            note = None
+            min_engine = None
+            remote_sha: str | None = None
+            remote_files: dict[str, dict[str, Any]] | None = None
+            source = "none"
+            if entry:
+                source = "manifest"
+                revision = entry.get("revision")
+                remote_sha = revision if isinstance(revision, str) and revision else None
+                raw_note = entry.get("note")
+                note = raw_note if isinstance(raw_note, str) else None
+                raw_min = entry.get("min_engine_version")
+                min_engine = raw_min if isinstance(raw_min, str) else None
+            elif use_hub_fallback and local_sha:
+                # Only tracked packs are worth a Hub round-trip without a
+                # manifest entry: untracked ones would report unknown anyway.
+                remote_sha, remote_files = _query_repo_snapshot(repo_id)
+                source = "hub" if remote_sha else "none"
 
-        update_bytes: int | None = None
-        changed: tuple[str, ...] = ()
-        if entry and not engine_satisfies(min_engine):
-            state = STATE_ENGINE_UPDATE_REQUIRED
-        elif remote_sha and local_sha:
-            state = STATE_CURRENT if remote_sha == local_sha else STATE_UPDATE_AVAILABLE
-            if state == STATE_UPDATE_AVAILABLE:
+            update_bytes: int | None = None
+            changed: tuple[str, ...] = ()
+            if entry and not engine_satisfies(min_engine):
+                state = STATE_ENGINE_UPDATE_REQUIRED
+            elif remote_sha and local_sha:
+                state = (
+                    STATE_CURRENT
+                    if remote_sha == local_sha
+                    else STATE_UPDATE_AVAILABLE
+                )
+                if state == STATE_UPDATE_AVAILABLE:
+                    if remote_files is None:
+                        _, remote_files = _query_repo_snapshot(
+                            repo_id, revision=remote_sha
+                        )
+                    update_bytes, changed = _diff_against_remote(marker, remote_files)
+            elif remote_sha and marker is None:
+                # Pre-2.9 cache: a size diff can prove staleness. Equal sizes
+                # still prove nothing and remain unknown.
                 if remote_files is None:
                     _, remote_files = _query_repo_snapshot(repo_id, revision=remote_sha)
-                update_bytes, changed = _diff_against_remote(marker, remote_files)
-        elif remote_sha and marker is None:
-            # Pre-2.9 cache: no provenance marker was ever written. A size
-            # diff against the blessed revision can still PROVE staleness
-            # (missing or size-changed files) — that is exactly the
-            # mtp.safetensors-invisible-to-the-weight-index trap. Equal
-            # sizes prove nothing and stay "unknown".
-            if remote_files is None:
-                _, remote_files = _query_repo_snapshot(repo_id, revision=remote_sha)
-            update_bytes, changed = _diff_against_local_dir(child, remote_files)
-            state = STATE_UPDATE_AVAILABLE if changed else STATE_UNKNOWN
-        else:
-            # No remote revision (offline / unlisted) or no local provenance:
-            # "unknown" is the only honest answer — never a false "current".
-            state = STATE_UNKNOWN
+                update_bytes, changed = _diff_against_local_dir(child, remote_files)
+                state = STATE_UPDATE_AVAILABLE if changed else STATE_UNKNOWN
+            else:
+                # No remote revision or no local provenance: unknown is the
+                # only honest answer, never a false current result.
+                state = STATE_UNKNOWN
 
-        if state == STATE_CURRENT and not include_current:
-            continue
-        rows.append(
-            ModelUpdateStatus(
-                repo_id=repo_id,
-                path=str(child),
-                state=state,
-                local_revision=local_sha,
-                remote_revision=remote_sha,
-                source=source,
-                note=note,
-                min_engine_version=min_engine,
-                update_bytes=update_bytes,
-                changed_files=changed,
+            if state == STATE_CURRENT and not include_current:
+                continue
+            rows.append(
+                ModelUpdateStatus(
+                    repo_id=repo_id,
+                    path=str(child),
+                    state=state,
+                    local_revision=local_sha,
+                    remote_revision=remote_sha,
+                    source=source,
+                    note=note,
+                    min_engine_version=min_engine,
+                    update_bytes=update_bytes,
+                    changed_files=changed,
+                    root=str(root),
+                    root_index=root_index,
+                    is_primary=root_index == 0,
+                )
             )
-        )
     return rows
 
 
@@ -360,6 +383,10 @@ def update_cached_model(
         destination = Path(destination_path).expanduser().absolute()
         if destination.parent.resolve() != cache_root:
             raise ValueError(f"update path must be a direct child of {cache_root}")
+        if destination.is_symlink():
+            raise ValueError(
+                f"refusing to update through top-level symlink: {destination}"
+            )
         if not destination.is_dir():
             raise FileNotFoundError(f"installed model path does not exist: {destination}")
         installed_repo = _cached_pack_repo_id(destination)
@@ -379,13 +406,23 @@ def update_cached_model(
             bare = cache_root / safe_model_name(repo_id).split("--")[-1]
             if bare.exists():
                 destination = bare
+        if destination.is_symlink():
+            raise ValueError(
+                f"refusing to update through top-level symlink: {destination}"
+            )
     marker = read_source_marker(destination) if destination.exists() else None
     if destination.exists() and isinstance((marker or {}).get("files"), dict):
         remote_sha, remote_files = _query_repo_snapshot(repo_id, revision=target_revision)
         if remote_files:
+            for name in remote_files:
+                _safe_destination_for_repo_file(
+                    destination, RepoFile(path=name, size_bytes=None)
+                )
             _, changed = _diff_against_remote(marker, remote_files)
             for name in changed:
-                stale = destination / name
+                stale = _safe_destination_for_repo_file(
+                    destination, RepoFile(path=name, size_bytes=None)
+                )
                 local_entry = (marker or {}).get("files", {}).get(name)
                 remote_entry = remote_files.get(name) or {}
                 # The pull path already re-fetches size-mismatched files;

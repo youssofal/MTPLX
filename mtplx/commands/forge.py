@@ -86,13 +86,13 @@ class ForgeError(RuntimeError):
         self.code = code
 
 
-def cmd_forge_public(args: Any) -> int:
+def cmd_forge_public(args: Any, *, model_root: str | Path | None = None) -> int:
     action = getattr(args, "forge_action", None)
     try:
         if action == "probe":
             return _cmd_probe(args)
         if action == "build":
-            return _cmd_build(args)
+            return _cmd_build(args, model_root=model_root)
         if action == "discover":
             return _cmd_discover(args)
         if action == "publish":
@@ -1033,7 +1033,7 @@ def _cmd_verify(args: Any) -> int:
     return 0 if rows else 1
 
 
-def _cmd_build(args: Any) -> int:
+def _cmd_build(args: Any, *, model_root: str | Path | None = None) -> int:
     recipe = _read_recipe(args.recipe)
     if getattr(args, "dtype", None):
         recipe["body_dtype"] = str(args.dtype)
@@ -1043,6 +1043,7 @@ def _cmd_build(args: Any) -> int:
     branded_name = _sanitize_branded_name(args.branded_name)
     if not branded_name:
         raise ForgeError("--branded-name cannot be empty", code=2)
+    resolved_model_root = _default_model_root(model_root)
 
     _write_download(run, bytes_on_disk=0, label="starting", finished=False)
 
@@ -1056,11 +1057,19 @@ def _cmd_build(args: Any) -> int:
     if _cancel_requested(args.run_id):
         raise ForgeError("forge cancelled", code=130)
 
-    source_path, source_repo, source_sha = _prepare_source(args.repo, run, probe)
+    source_path, source_repo, source_sha = _prepare_source(
+        args.repo,
+        run,
+        probe,
+        model_root=resolved_model_root,
+    )
     if _cancel_requested(args.run_id):
         raise ForgeError("forge cancelled", code=130)
 
-    destination = _unique_model_dir(branded_name)
+    destination = _unique_model_dir(
+        branded_name,
+        model_root=resolved_model_root,
+    )
     source_format = str(probe.get("source_format") or SOURCE_UNKNOWN)
     _err(f"[forge] source format: {source_format}")
     if source_format in {SOURCE_MLX_AFFINE, SOURCE_MLX_AFFINE_WITH_MTP} or probe.get("already_mtplx"):
@@ -1185,7 +1194,13 @@ def _cmd_build(args: Any) -> int:
     return 0
 
 
-def _prepare_source(source: str, run: Path, probe: dict[str, Any]) -> tuple[Path, str | None, str | None]:
+def _prepare_source(
+    source: str,
+    run: Path,
+    probe: dict[str, Any],
+    *,
+    model_root: str | Path | None = None,
+) -> tuple[Path, str | None, str | None]:
     local, repo_id = _normalize_source(source)
     if local is not None:
         size = directory_size_bytes(local) if local.is_dir() else local.stat().st_size
@@ -1239,6 +1254,7 @@ def _prepare_source(source: str, run: Path, probe: dict[str, Any]) -> tuple[Path
     _err(f"[forge] downloading {repo_id}")
     result = pull_model(
         repo_id,
+        cache_dir=_default_model_root(model_root),
         progress_callback=progress,
         progress_interval_s=2.0,
     )
@@ -3719,7 +3735,11 @@ def _try_hf_runtime(repo_id: str) -> dict[str, Any] | None:
         return None
 
 
-def _default_model_root() -> Path:
+def _default_model_root(model_root: str | Path | None = None) -> Path:
+    if model_root is not None:
+        if isinstance(model_root, str) and not model_root.strip():
+            raise ForgeError("model root cannot be empty", code=2)
+        return Path(model_root).expanduser()
     env = os.environ.get("MTPLX_FORGE_MODEL_ROOT") or os.environ.get("MTPLX_MODEL_DIR")
     if env:
         return Path(env).expanduser()
@@ -3729,14 +3749,16 @@ def _default_model_root() -> Path:
     return Path("~/.mtplx/models").expanduser()
 
 
-def _unique_model_dir(branded_name: str) -> Path:
+def _unique_model_dir(
+    branded_name: str, *, model_root: str | Path | None = None
+) -> Path:
     """Return an unused artifact path without creating the final directory.
 
     `mlx_lm.convert` refuses an output path that already exists, while local
     mirror paths are happy to create their destination on first copy.
     """
 
-    root = _default_model_root()
+    root = _default_model_root(model_root)
     root.mkdir(parents=True, exist_ok=True)
     base = root / branded_name
     if not base.exists():
@@ -3760,6 +3782,7 @@ def _mirror_model_tree(source: Path, destination: Path) -> None:
     if not source.is_dir():
         raise ForgeError(f"source must be a model directory: {source}")
     destination.mkdir(parents=True, exist_ok=False)
+    directory_chain = {_directory_identity(source)}
     for child in source.iterdir():
         target = destination / child.name
         if child.name == "mtplx_runtime.json":
@@ -3767,29 +3790,85 @@ def _mirror_model_tree(source: Path, destination: Path) -> None:
         if child.name == "config.json" and child.is_file():
             _copy_file(child, target)
             continue
-        _mirror_entry(child, target)
+        _mirror_entry(child, target, _directory_chain=directory_chain)
 
 
-def _mirror_entry(source: Path, target: Path) -> None:
-    if source.is_dir() and not source.is_symlink():
+def _directory_identity(path: Path) -> tuple[int, int]:
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        raise ForgeError(f"cannot inspect model directory {path}: {exc}") from exc
+    return int(stat.st_dev), int(stat.st_ino)
+
+
+def _mirror_entry(
+    source: Path,
+    target: Path,
+    *,
+    _directory_chain: set[tuple[int, int]] | None = None,
+) -> None:
+    if source.is_dir():
+        identity = _directory_identity(source)
+        chain = _directory_chain or set()
+        if identity in chain:
+            raise ForgeError(f"model source contains a directory symlink cycle: {source}")
+        child_chain = {*chain, identity}
         target.mkdir(parents=True, exist_ok=True)
         for child in source.iterdir():
-            _mirror_entry(child, target / child.name)
+            _mirror_entry(
+                child,
+                target / child.name,
+                _directory_chain=child_chain,
+            )
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists() or target.is_symlink():
         return
+    _link_or_copy_file(source, target)
+
+
+def _link_or_copy_file(source: Path, target: Path) -> None:
+    """Atomically materialize an immutable payload without durable symlinks."""
+
     try:
-        os.symlink(source.resolve(strict=False), target)
-    except OSError:
-        _copy_file(source, target)
+        resolved = source.resolve(strict=True)
+    except OSError as exc:
+        raise ForgeError(f"cannot resolve model payload {source}: {exc}") from exc
+    if not resolved.is_file():
+        raise ForgeError(f"model payload is not a regular file: {source}")
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        try:
+            os.link(resolved, tmp)
+        except OSError:
+            shutil.copy2(resolved, tmp)
+        os.replace(tmp, target)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _copy_file(source: Path, target: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists() or target.is_symlink():
         return
-    shutil.copy2(source, target)
+    try:
+        resolved = source.resolve(strict=True)
+    except OSError as exc:
+        raise ForgeError(f"cannot resolve model payload {source}: {exc}") from exc
+    if not resolved.is_file():
+        raise ForgeError(f"model payload is not a regular file: {source}")
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        shutil.copy2(resolved, tmp)
+        os.replace(tmp, target)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _read_runtime(path: Path) -> dict[str, Any] | None:

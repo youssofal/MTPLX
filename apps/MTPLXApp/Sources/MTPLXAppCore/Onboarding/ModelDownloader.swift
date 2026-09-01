@@ -81,12 +81,20 @@ public struct ModelDownloader: Sendable {
     static func streamArguments(
         repo: String,
         update: Bool,
-        destinationPath: String? = nil
+        destinationPath: String? = nil,
+        cacheRoot: URL? = nil
     ) -> [String] {
-        guard update else { return ["pull", repo, "--progress-json"] }
-        var arguments = ["models", "--update", repo, "--progress-json"]
-        if let destinationPath, !destinationPath.isEmpty {
+        var arguments: [String]
+        if update {
+            arguments = ["models", "--update", repo, "--progress-json"]
+        } else {
+            arguments = ["pull", repo, "--progress-json"]
+        }
+        if update, let destinationPath, !destinationPath.isEmpty {
             arguments += ["--installed-path", destinationPath]
+        }
+        if let cacheRoot {
+            arguments += ["--cache-dir", cacheRoot.path]
         }
         return arguments
     }
@@ -96,11 +104,15 @@ public struct ModelDownloader: Sendable {
         totalBytes: Int64?,
         extraEnvironment: [String: String] = [:],
         update: Bool = false,
-        sizeProbePath: String? = nil
+        sizeProbePath: String? = nil,
+        cacheRoot: URL? = nil
     ) -> AsyncStream<DownloadEvent> {
-        AsyncStream { continuation in
+        let operationCacheRoot = modelCacheRoot
+            ?? cacheRoot
+            ?? Self.defaultCacheRoot(env: processEnvironment)
+        return AsyncStream<DownloadEvent> { continuation in
             let destination = sizeProbePath.map { URL(fileURLWithPath: $0) }
-                ?? self.cachedModelPath(for: repo)
+                ?? self.cachedModelPath(for: repo, cacheRoot: operationCacheRoot)
             // Make the destination dir up-front so the first poll returns 0
             // rather than spuriously matching "exists". Never for updates:
             // an empty canonical dir would shadow a populated legacy-layout
@@ -140,7 +152,8 @@ public struct ModelDownloader: Sendable {
             process.arguments = Self.streamArguments(
                 repo: repo,
                 update: update,
-                destinationPath: sizeProbePath
+                destinationPath: sizeProbePath,
+                cacheRoot: operationCacheRoot
             )
             // Inherit a sensible PATH so Homebrew installs and wrappers can
             // find their helpers. Apply caller-owned download knobs first,
@@ -415,7 +428,11 @@ public struct ModelDownloader: Sendable {
     /// Mirrors `mtplx/hf_loader.py:cached_model_path` exactly so the
     /// directory we poll matches the directory `mtplx pull` writes to.
     public func cachedModelPath(for repo: String) -> URL {
-        let root = modelCacheRoot ?? Self.defaultCacheRoot(env: processEnvironment)
+        cachedModelPath(for: repo, cacheRoot: nil)
+    }
+
+    public func cachedModelPath(for repo: String, cacheRoot: URL?) -> URL {
+        let root = modelCacheRoot ?? cacheRoot ?? Self.defaultCacheRoot(env: processEnvironment)
         let safeName = repo.replacingOccurrences(of: "/", with: "--")
         return root.appendingPathComponent(safeName, isDirectory: true)
     }
@@ -456,12 +473,24 @@ public struct ModelDownloader: Sendable {
     /// network access and freshness logic live entirely in the CLI, this
     /// just shells and decodes. Safe to run while a daemon is serving.
     public func checkModelUpdates(
+        cacheRoot: URL? = nil,
+        searchRoots: [URL] = [],
         timeoutSeconds: TimeInterval = 120
     ) async throws -> [ModelUpdateInfo] {
+        let operationCacheRoot = modelCacheRoot
+            ?? cacheRoot
+            ?? Self.defaultCacheRoot(env: processEnvironment)
         let executable = try resolveMtplxExecutable { _ in }
         let process = Process()
         process.executableURL = executable
-        process.arguments = ["models", "--check", "--json"]
+        var arguments = [
+            "models", "--check", "--json",
+            "--cache-dir", operationCacheRoot.path,
+        ]
+        for root in searchRoots {
+            arguments += ["--model-search-dir", root.path]
+        }
+        process.arguments = arguments
         var env = processEnvironment
         env["PATH"] = MTPLXCommandBuilder.expandedPATH(environment: processEnvironment)
         process.environment = MTPLXCommandBuilder.pythonBytecodeSafeEnvironment(

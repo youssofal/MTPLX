@@ -3,7 +3,6 @@ from __future__ import annotations
 import io
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -251,6 +250,32 @@ def test_check_model_updates_skips_symlink_overlays(tmp_path, monkeypatch):
     assert [row.repo_id for row in rows] == ["owner/real"]
 
 
+def test_check_model_updates_retains_duplicate_root_identity(tmp_path):
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    marker = {"repo_id": "owner/pack", "resolved_sha": "sha-1"}
+    first = _write_pack(primary, "owner--pack", marker)
+    second = _write_pack(secondary, "owner--pack", marker)
+    manifest = {
+        "schema": 1,
+        "models": {"owner/pack": {"revision": "sha-1"}},
+    }
+
+    rows = check_model_updates(
+        cache_dir=primary,
+        search_dirs=[secondary],
+        manifest=manifest,
+    )
+
+    assert [row.path for row in rows] == [str(first), str(second)]
+    assert [row.root for row in rows] == [
+        str(primary.resolve()),
+        str(secondary.resolve()),
+    ]
+    assert [row.root_index for row in rows] == [0, 1]
+    assert [row.is_primary for row in rows] == [True, False]
+
+
 def test_check_model_updates_legacy_cache_size_diff(tmp_path, monkeypatch):
     # Pre-2.9 caches have no provenance marker at all. A size mismatch (or a
     # file missing locally — the mtp.safetensors trap) proves staleness and
@@ -318,6 +343,16 @@ def test_diff_against_local_dir_unsized_remote_still_flags(tmp_path):
     )
     assert changed == ("mtp.safetensors",)
     assert update_bytes is None  # unsized listing: flag the file, skip the sum
+
+
+def test_diff_against_local_dir_rejects_unsafe_repo_filename(tmp_path):
+    pack = tmp_path / "pack"
+    pack.mkdir()
+
+    with pytest.raises(RuntimeError, match="unsafe file path"):
+        model_updates._diff_against_local_dir(
+            pack, {"../escape": {"size": 1, "blob_id": "bad"}}
+        )
 
 
 # --- update_cached_model --------------------------------------------------
@@ -457,6 +492,61 @@ def test_update_cached_model_targets_exact_stale_path_when_duplicate_is_current(
     assert captured["destination"] == bare
 
 
+def test_update_cached_model_rejects_top_level_symlink(tmp_path, monkeypatch):
+    target = _write_pack(
+        tmp_path / "external",
+        "real-pack",
+        {"repo_id": "owner/pack", "resolved_sha": "sha-old"},
+    )
+    overlay = tmp_path / "owner--pack"
+    overlay.symlink_to(target, target_is_directory=True)
+    monkeypatch.setattr(
+        model_updates, "pull_model", lambda *_args, **_kwargs: pytest.fail("must not pull")
+    )
+
+    with pytest.raises(ValueError, match="top-level symlink"):
+        update_cached_model(
+            "owner/pack",
+            cache_dir=tmp_path,
+            destination_path=overlay,
+            manifest={"schema": 1, "models": {"owner/pack": {"revision": "new"}}},
+        )
+
+
+def test_update_cached_model_rejects_unsafe_changed_filename(tmp_path, monkeypatch):
+    pack = _write_pack(
+        tmp_path,
+        "owner--pack",
+        {
+            "repo_id": "owner/pack",
+            "resolved_sha": "sha-old",
+            "files": {"../escape": {"size": 1, "blob_id": "same"}},
+        },
+    )
+    monkeypatch.setattr(
+        model_updates,
+        "_query_repo_snapshot",
+        lambda *_args, **_kwargs: (
+            "sha-new",
+            {"../escape": {"size": 1, "blob_id": "same"}},
+        ),
+    )
+    monkeypatch.setattr(
+        model_updates, "pull_model", lambda *_args, **_kwargs: pytest.fail("must not pull")
+    )
+
+    with pytest.raises(RuntimeError, match="unsafe file path"):
+        update_cached_model(
+            "owner/pack",
+            cache_dir=tmp_path,
+            destination_path=pack,
+            manifest={
+                "schema": 1,
+                "models": {"owner/pack": {"revision": "sha-new"}},
+            },
+        )
+
+
 def test_cmd_models_update_progress_json_emits_pull_schema(monkeypatch, capsys):
     from types import SimpleNamespace
 
@@ -510,6 +600,63 @@ def test_cmd_models_update_progress_json_emits_pull_schema(monkeypatch, capsys):
     assert events[-1]["resolved_sha"] == "sha-new"
     assert events[-1]["delta_bytes"] == 60
     assert events[-1]["downloaded_bytes"] == 25
+
+
+def test_cmd_models_auto_update_targets_exact_primary_path_only(
+    monkeypatch, capsys
+):
+    from types import SimpleNamespace
+
+    from mtplx.commands import public
+
+    primary = ModelUpdateStatus(
+        repo_id="owner/pack",
+        path="/primary/bare-pack",
+        state=STATE_UPDATE_AVAILABLE,
+        local_revision="old",
+        remote_revision="new",
+        source="manifest",
+        root="/primary",
+        root_index=0,
+        is_primary=True,
+    )
+    secondary = ModelUpdateStatus(
+        repo_id="owner/pack",
+        path="/archive/owner--pack",
+        state=STATE_UPDATE_AVAILABLE,
+        local_revision="older",
+        remote_revision="new",
+        source="manifest",
+        root="/archive",
+        root_index=1,
+        is_primary=False,
+    )
+    monkeypatch.setattr(model_updates, "fetch_models_manifest", lambda: {"schema": 1, "models": {}})
+    monkeypatch.setattr(model_updates, "check_model_updates", lambda **_kwargs: [primary, secondary])
+    calls: list[tuple[str, str | None]] = []
+
+    def fake_update(repo, **kwargs):
+        calls.append((repo, kwargs.get("destination_path")))
+        return {
+            "repo_id": repo,
+            "path": kwargs.get("destination_path"),
+            "resolved_sha": "new",
+            "size_bytes": 10,
+            "started_size_bytes": 9,
+        }
+
+    monkeypatch.setattr(model_updates, "update_cached_model", fake_update)
+    args = SimpleNamespace(
+        cache_dir="/primary",
+        model_search_dirs=["/archive"],
+        json=True,
+        progress_json=False,
+        installed_path=None,
+    )
+
+    assert public._cmd_models_update(args, []) == 0
+    assert calls == [("owner/pack", "/primary/bare-pack")]
+    assert json.loads(capsys.readouterr().out)["updated"][0]["path"] == "/primary/bare-pack"
 
 
 def test_update_cached_model_fresh_pull_lets_pull_model_resolve(tmp_path, monkeypatch):

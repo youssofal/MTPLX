@@ -74,6 +74,9 @@ struct OnboardingExperienceView: View {
             }
             return .ignored
         }
+        .onAppear {
+            orchestrator.configureModelLibrary(backend.configuration.modelLibrary)
+        }
         .onDisappear { orchestrator.cancelAll() }
     }
 
@@ -148,7 +151,8 @@ struct OnboardingExperienceView: View {
             // back to the HF id so the daemon's `resolve_model_path`
             // surfaces a clear "Model not cached. Run: mtplx pull"
             // error instead of a silent failure to load weights.
-            if orchestrator.isModelInstalled(model), let local = model.installedLocalPath {
+            if orchestrator.isModelInstalled(model),
+               let local = orchestrator.installedLocalPath(for: model) {
                 config.model = local
             } else {
                 config.model = model.hfModelID

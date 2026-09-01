@@ -77,7 +77,7 @@ def _stub_quickstart_pipeline(monkeypatch, captured_profiles: list) -> None:
     will run under.
     """
 
-    def fake_resolve_model(model, *, cache_dir, download):
+    def fake_resolve_model(model, *, cache_dir, search_dirs=None, download):
         return FLAGSHIP_RUNTIME_DIR, {"model": model, "downloaded": False}
 
     monkeypatch.setattr(
@@ -123,7 +123,10 @@ def test_wizard_auto_choice_stamps_no_profile_and_resolves_turbo(
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
 
+    flow_calls: list[dict] = []
+
     def fake_flow(**kwargs):
+        flow_calls.append(kwargs)
         return {
             "model": FLAGSHIP_RUNTIME_DIR,
             "profile": onboarding.PROFILE_AUTO,
@@ -138,8 +141,16 @@ def test_wizard_auto_choice_stamps_no_profile_and_resolves_turbo(
 
     from mtplx.commands.public import cmd_quickstart_public
 
-    args = _quickstart_args()
+    args = _quickstart_args(
+        cache_dir=str(tmp_path / "cache"),
+        model_search_dirs=[str(tmp_path / "archive"), str(tmp_path / "shared")],
+    )
     assert cmd_quickstart_public(args) == 0
+    assert flow_calls[0]["cache_dir"] == str(tmp_path / "cache")
+    assert flow_calls[0]["search_dirs"] == [
+        str(tmp_path / "archive"),
+        str(tmp_path / "shared"),
+    ]
     assert "profile" not in args._cli_flags
     assert args.profile == "sustained"  # parser default untouched
     assert captured, "launch never resolved a profile"
@@ -315,7 +326,7 @@ def test_quickstart_download_branch_resolves_launch_rule_profile(
     # prompt fires; the second resolution (download=True) succeeds.
     calls: list[bool] = []
 
-    def fake_resolve_model(model, *, cache_dir, download):
+    def fake_resolve_model(model, *, cache_dir, search_dirs=None, download):
         calls.append(download)
         if len(calls) == 1:
             return None, {}

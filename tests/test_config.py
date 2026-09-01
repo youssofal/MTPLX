@@ -12,6 +12,7 @@ def test_load_user_config_reads_runtime_defaults(tmp_path):
     config.write_text(
         'model = "mtplx/example"\n'
         f'model_dir = "{tmp_path / "models"}"\n'
+        f'model_dirs = ["{tmp_path / "archive"}", "{tmp_path / "external"}"]\n'
         'profile = "exact"\n'
         'thermal_control = "none"\n',
         encoding="utf-8",
@@ -22,6 +23,10 @@ def test_load_user_config_reads_runtime_defaults(tmp_path):
     assert loaded.exists is True
     assert loaded.model == "mtplx/example"
     assert loaded.model_dir == str(tmp_path / "models")
+    assert loaded.model_dirs == (
+        str(tmp_path / "archive"),
+        str(tmp_path / "external"),
+    )
     assert loaded.profile == "exact"
     assert loaded.thermal_control == "none"
 
@@ -96,6 +101,59 @@ def test_apply_user_config_fills_runtime_defaults(tmp_path):
     assert args.cache_dir == str(model_dir)
     assert args.profile == "exact"
     assert args.mtplx_config["path"] == str(config)
+
+
+def test_apply_user_config_fills_and_preserves_model_search_dirs(tmp_path):
+    config = tmp_path / "config.toml"
+    config.write_text(
+        'model_dirs = ["/models/archive", "/models/external"]\n',
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(
+        command="serve",
+        model=str(DEFAULT_RUNTIME_MODEL_DIR),
+        cache_dir=None,
+        model_search_dirs=None,
+        profile=DEFAULT_PROFILE_NAME,
+        _cli_flags=set(),
+    )
+
+    apply_user_config(args, config_path=config)
+    assert args.model_search_dirs == ["/models/archive", "/models/external"]
+
+    args.model_search_dirs = ["/models/explicit"]
+    args._cli_flags = {"model-search-dir"}
+    apply_user_config(args, config_path=config)
+    assert args.model_search_dirs == ["/models/explicit"]
+
+
+def test_apply_user_config_sets_forge_model_root(tmp_path):
+    config = tmp_path / "config.toml"
+    config.write_text(
+        'model_dir = "/models/primary"\n'
+        'model_dirs = ["/models/archive", "/models/external"]\n',
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(command="forge", _cli_flags=set())
+
+    apply_user_config(args, config_path=config)
+
+    assert args.model_root == "/models/primary"
+
+
+def test_apply_user_config_preserves_explicit_forge_model_root(tmp_path):
+    config = tmp_path / "config.toml"
+    config.write_text('model_dir = "/models/config"\n', encoding="utf-8")
+    args = argparse.Namespace(
+        command="forge",
+        forge_action="build",
+        model_root="/models/operation",
+        _cli_flags={"model-root"},
+    )
+
+    apply_user_config(args, config_path=config)
+
+    assert args.model_root == "/models/operation"
 
 
 def test_apply_user_config_ignores_legacy_optimized_speed_default(tmp_path):

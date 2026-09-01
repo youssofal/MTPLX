@@ -26,6 +26,7 @@ import importlib.metadata
 import importlib.util
 import re
 import webbrowser
+from collections.abc import Iterable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -2217,18 +2218,28 @@ def _git_value(args: list[str], *, cwd: Path) -> str | None:
 
 
 def _resolve_runtime_model_path(
-    model: str, *, cache_dir: str | None = None
+    model: str,
+    *,
+    cache_dir: str | None = None,
+    search_dirs: Iterable[str | Path] | None = None,
 ) -> tuple[str, dict[str, Any] | None]:
     from mtplx.hf_loader import resolve_model_path
 
     try:
-        return str(resolve_model_path(model, cache_dir=cache_dir)), None
+        return str(
+            resolve_model_path(model, cache_dir=cache_dir, search_dirs=search_dirs)
+        ), None
     except Exception as exc:
         return model, {
             "error": "model is not available locally",
             "model": model,
             "detail": str(exc),
         }
+
+
+def _model_search_kwargs(args: Any) -> dict[str, Any]:
+    search_dirs = getattr(args, "model_search_dirs", None)
+    return {"search_dirs": search_dirs} if search_dirs else {}
 
 
 def _exactness_profile_kwargs(args: Any) -> dict[str, Any]:
@@ -2452,7 +2463,10 @@ def _build_doctor_report(args: Any) -> dict[str, Any]:
 
     report = {
         "environment": env,
-        "huggingface": hf_cache_report(cache_dir=getattr(args, "model_cache", None)),
+        "huggingface": hf_cache_report(
+            cache_dir=getattr(args, "model_cache", None),
+            search_dirs=getattr(args, "model_search_dirs", None),
+        ),
         "thermal_control": thermal_control,
         "tools": {
             "python": sys.executable,
@@ -2472,6 +2486,7 @@ def _build_doctor_report(args: Any) -> dict[str, Any]:
     cli_flags = getattr(args, "_cli_flags", set()) or set()
     report["diagnostics"] = build_diagnostics_payload(
         model_cache=getattr(args, "model_cache", None),
+        model_search_dirs=getattr(args, "model_search_dirs", None),
         include_startup_default_model="model-cache" not in cli_flags,
         deep=bool(getattr(args, "deep", False)),
         # An explicit --port aims the server checks; the bare default (8008)
@@ -3491,6 +3506,7 @@ def _cmd_tune(
     runtime_model, resolve_error = _resolve_runtime_model_path(
         model,
         cache_dir=getattr(args, "cache_dir", None),
+        **_model_search_kwargs(args),
     )
     if resolve_error is not None:
         return _tune_error(
@@ -3743,6 +3759,7 @@ def _cmd_tune_candidate(args: Any) -> int:
     runtime_model, resolve_error = _resolve_runtime_model_path(
         model,
         cache_dir=getattr(args, "cache_dir", None),
+        **_model_search_kwargs(args),
     )
     if resolve_error is not None:
         _print(resolve_error)
@@ -4142,6 +4159,7 @@ def _tune_state_context_for_args(
     model, resolve_error = _resolve_runtime_model_path(
         _tune_requested_model(args),
         cache_dir=getattr(args, "cache_dir", None),
+        **_model_search_kwargs(args),
     )
     if resolve_error is not None:
         return None
@@ -5754,19 +5772,28 @@ def cmd_pull_public(args: Any) -> int:
 
 
 def _cmd_models_check(args: Any) -> int:
-    from mtplx.hf_loader import model_cache_dir
+    from mtplx.hf_loader import model_library_roots
     from mtplx.model_updates import (
         ENGINE_VERSION,
         STATE_UPDATE_AVAILABLE,
         check_model_updates,
     )
 
-    rows = check_model_updates(cache_dir=args.cache_dir)
+    roots = model_library_roots(
+        args.cache_dir, search_dirs=getattr(args, "model_search_dirs", None)
+    )
+    rows = check_model_updates(
+        cache_dir=args.cache_dir,
+        search_dirs=getattr(args, "model_search_dirs", None),
+    )
     stale = [row for row in rows if row.state == STATE_UPDATE_AVAILABLE]
+    writable_stale = [row for row in stale if row.is_primary]
     payload = {
-        "cache_dir": str(model_cache_dir(args.cache_dir)),
+        "cache_dir": str(roots[0]),
+        "model_roots": [str(root) for root in roots],
         "engine_version": ENGINE_VERSION,
         "updates_available": len(stale),
+        "automatic_updates_available": len(writable_stale),
         "models": [row.to_dict() for row in rows],
     }
     if getattr(args, "json", False):
@@ -5788,8 +5815,13 @@ def _cmd_models_check(args: Any) -> int:
             print(f"  {row.note}")
         if row.state == "engine-update-required" and row.min_engine_version:
             print(f"  requires MTPLX >= {row.min_engine_version}")
-    if stale:
-        print(f"updates available: {len(stale)} — run: mtplx models --update")
+    if writable_stale:
+        print(f"updates available: {len(writable_stale)}; run: mtplx models --update")
+    elif stale:
+        print(
+            "updates exist only in read-only search roots; select one explicitly "
+            "with --cache-dir to update it"
+        )
     else:
         print("all tracked packs are current")
     return 0
@@ -5822,16 +5854,33 @@ def _cmd_models_update(args: Any, targets: list[str]) -> int:
     manifest = fetch_models_manifest()
     if targets:
         repos = list(dict.fromkeys(targets))
+        tasks = [
+            (repo, installed_path if len(repos) == 1 else None) for repo in repos
+        ]
     else:
-        rows = check_model_updates(cache_dir=args.cache_dir, manifest=manifest)
-        repos = [row.repo_id for row in rows if row.state == STATE_UPDATE_AVAILABLE]
-        if not repos:
+        rows = check_model_updates(
+            cache_dir=args.cache_dir,
+            search_dirs=getattr(args, "model_search_dirs", None),
+            manifest=manifest,
+        )
+        tasks = [
+            (row.repo_id, str(row.path))
+            for row in rows
+            if row.state == STATE_UPDATE_AVAILABLE and row.is_primary
+        ]
+        repos = [repo for repo, _path in tasks]
+        if not tasks:
             if progress_json:
                 emit_progress_json({"event": "result", "updated": []})
             elif json_mode:
-                _print({"updated": [], "message": "all tracked packs are current"})
+                _print(
+                    {
+                        "updated": [],
+                        "message": "no updates are available in the writable primary root",
+                    }
+                )
             else:
-                print("all tracked packs are current")
+                print("no updates are available in the writable primary root")
             return 0
     if installed_path and len(repos) != 1:
         message = "--installed-path requires exactly one --update REPO"
@@ -5842,7 +5891,7 @@ def _cmd_models_update(args: Any, targets: list[str]) -> int:
         return 2
     results: list[dict[str, Any]] = []
     failed = False
-    for repo in repos:
+    for repo, destination_path in tasks:
         callback = None
         finalize: Callable[[], None] = lambda: None  # noqa: E731
         if progress_json:
@@ -5858,7 +5907,7 @@ def _cmd_models_update(args: Any, targets: list[str]) -> int:
             result = update_cached_model(
                 repo,
                 cache_dir=args.cache_dir,
-                destination_path=installed_path,
+                destination_path=destination_path,
                 manifest=manifest,
                 progress_callback=callback,
                 progress_interval_s=0.4 if callback else 10.0,
@@ -5902,15 +5951,28 @@ def _cmd_models_update(args: Any, targets: list[str]) -> int:
 
 
 def cmd_list_public(args: Any) -> int:
-    from mtplx.hf_loader import list_cached_models, model_cache_dir
+    from mtplx.hf_loader import list_cached_models, model_library_roots
 
     update_targets = getattr(args, "update", None)
     if update_targets is not None:
         return _cmd_models_update(args, update_targets)
     if getattr(args, "check", False):
         return _cmd_models_check(args)
-    models = [row.to_dict() for row in list_cached_models(cache_dir=args.cache_dir)]
-    payload = {"cache_dir": str(model_cache_dir(args.cache_dir)), "models": models}
+    roots = model_library_roots(
+        args.cache_dir, search_dirs=getattr(args, "model_search_dirs", None)
+    )
+    models = [
+        row.to_dict()
+        for row in list_cached_models(
+            cache_dir=args.cache_dir,
+            search_dirs=getattr(args, "model_search_dirs", None),
+        )
+    ]
+    payload = {
+        "cache_dir": str(roots[0]),
+        "model_roots": [str(root) for root in roots],
+        "models": models,
+    }
     if getattr(args, "json", False):
         _print(payload)
     else:
@@ -5939,13 +6001,19 @@ def cmd_remove_public(args: Any) -> int:
     # traversal ref is refused before we offer to delete anything.
     try:
         repo_id, target = resolve_cached_model_target(
-            args.model, cache_dir=args.cache_dir
+            args.model,
+            cache_dir=args.cache_dir,
+            search_dirs=getattr(args, "model_search_dirs", None),
         )
-    except ValueError as exc:
+    except (OSError, ValueError) as exc:
+        if getattr(args, "json", False):
+            _print({"error": "remove failed", "model": args.model, "detail": str(exc)})
+            return 2
         print(f"mtplx remove: {exc}", file=sys.stderr)
         return 1
-    if target.exists() and not getattr(args, "yes", False):
-        size = _format_bytes(directory_size_bytes(target))
+    if (target.exists() or target.is_symlink()) and not getattr(args, "yes", False):
+        size_bytes = 0 if target.is_symlink() else directory_size_bytes(target)
+        size = _format_bytes(size_bytes)
         if not sys.stdin.isatty():
             print(
                 f"mtplx remove: refusing to delete {target} ({size}) without "
@@ -5961,7 +6029,24 @@ def cmd_remove_public(args: Any) -> int:
         if answer not in {"y", "yes"}:
             print("aborted: nothing was removed")
             return 1
-    result = remove_cached_model(args.model, cache_dir=args.cache_dir)
+    try:
+        result = remove_cached_model(
+            args.model,
+            cache_dir=args.cache_dir,
+            search_dirs=getattr(args, "model_search_dirs", None),
+        )
+    except (OSError, ValueError) as exc:
+        if getattr(args, "json", False):
+            _print(
+                {
+                    "error": "remove failed",
+                    "model": args.model,
+                    "detail": str(exc),
+                }
+            )
+        else:
+            print(f"error: remove failed: {exc}", file=sys.stderr)
+        return 2
     if getattr(args, "json", False):
         _print(result)
     else:
@@ -6047,6 +6132,7 @@ def _cmd_bench_run(args: Any) -> int:
     runtime_model, resolve_error = _resolve_runtime_model_path(
         model,
         cache_dir=getattr(args, "cache_dir", None),
+        **_model_search_kwargs(args),
     )
     if resolve_error is not None:
         _print(resolve_error)
@@ -9167,6 +9253,8 @@ def cmd_serve_public(args: Any) -> int:
 
         choice = run_serve_flow(
             configured_model=getattr(args, "model", None),
+            cache_dir=getattr(args, "cache_dir", None),
+            search_dirs=getattr(args, "model_search_dirs", None),
             host=str(getattr(args, "host", "127.0.0.1")),
             port=int(getattr(args, "port", 8000)),
             default_open_browser=bool(getattr(args, "open_browser", False)),
@@ -9407,6 +9495,7 @@ def cmd_serve_public(args: Any) -> int:
             runtime_model, resolution = _quickstart_resolve_model(
                 args.model,
                 cache_dir=cache_dir,
+                **_model_search_kwargs(args),
                 download=True,
             )
         except KeyboardInterrupt:
@@ -9444,6 +9533,7 @@ def cmd_serve_public(args: Any) -> int:
         runtime_model, resolve_error = _resolve_runtime_model_path(
             args.model,
             cache_dir=cache_dir,
+            **_model_search_kwargs(args),
         )
         if resolve_error is not None:
             _print_command_error(
@@ -9591,6 +9681,9 @@ def cmd_serve_public(args: Any) -> int:
         getattr(args, "embedding_model", None) or getattr(args, "reranker_model", None)
     ):
         cmd.extend(["--retrieval-cache-dir", str(retrieval_cache_dir)])
+    for root in getattr(args, "model_search_dirs", None) or ():
+        if str(root).strip():
+            cmd.extend(["--retrieval-model-root", str(root)])
     context_window = getattr(args, "context_window", None)
     if context_window is not None:
         cmd.extend(["--context-window", str(context_window)])
@@ -10177,6 +10270,7 @@ def _generate_one_shot_public(
     runtime_model, resolve_error = _resolve_runtime_model_path(
         args.model,
         cache_dir=getattr(args, "cache_dir", None),
+        **_model_search_kwargs(args),
     )
     if resolve_error is not None:
         return EXIT_TELEMETRY, resolve_error, []
@@ -10820,11 +10914,16 @@ def _quickstart_choose_model(
 
 
 def _quickstart_resolve_model(
-    model: str, *, cache_dir: str | None, download: bool
+    model: str,
+    *,
+    cache_dir: str | None,
+    search_dirs: Iterable[str | Path] | None = None,
+    download: bool,
 ) -> tuple[str | None, dict[str, Any]]:
-    runtime_model, resolve_error = _resolve_runtime_model_path(
-        model, cache_dir=cache_dir
-    )
+    resolve_kwargs: dict[str, Any] = {"cache_dir": cache_dir}
+    if search_dirs:
+        resolve_kwargs["search_dirs"] = search_dirs
+    runtime_model, resolve_error = _resolve_runtime_model_path(model, **resolve_kwargs)
     if resolve_error is None:
         return runtime_model, {
             "model": model,
@@ -10897,7 +10996,7 @@ def _quickstart_resolve_model(
     finally:
         finalize()
     runtime_model, resolve_error = _resolve_runtime_model_path(
-        download_ref, cache_dir=cache_dir
+        download_ref, **resolve_kwargs
     )
     if resolve_error is not None:
         return None, {
@@ -13814,6 +13913,8 @@ def cmd_quickstart_public(args: Any) -> int:
         choice = run_quickstart_flow(
             fresh=fresh,
             configured_model=configured_model,
+            cache_dir=getattr(args, "cache_dir", None),
+            search_dirs=getattr(args, "model_search_dirs", None),
             open_dashboard_override=explicit_open_dashboard,
             host=str(getattr(args, "host", "127.0.0.1")),
             port=int(getattr(args, "port", 8000)),
@@ -14094,7 +14195,10 @@ def cmd_quickstart_public(args: Any) -> int:
     _quickstart_line(f"[1/4] Checking model: {model}")
     try:
         runtime_model, resolution = _quickstart_resolve_model(
-            model, cache_dir=cache_dir, download=download
+            model,
+            cache_dir=cache_dir,
+            **_model_search_kwargs(args),
+            download=download,
         )
     except KeyboardInterrupt:
         _quickstart_line("download cancelled")
@@ -14145,7 +14249,10 @@ def cmd_quickstart_public(args: Any) -> int:
             if answer in {"", "y", "yes"}:
                 try:
                     runtime_model, resolution = _quickstart_resolve_model(
-                        download_model, cache_dir=cache_dir, download=True
+                        download_model,
+                        cache_dir=cache_dir,
+                        **_model_search_kwargs(args),
+                        download=True,
                     )
                 except KeyboardInterrupt:
                     _quickstart_line("download cancelled")
@@ -15300,6 +15407,16 @@ def cmd_config_public(args: Any) -> int:
             "config set key must be one of: " + ", ".join(CONFIG_VALUE_KEYS)
         )
     value = str(args.value).strip()
+    if key == "model_dirs":
+        try:
+            parsed_model_dirs = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise SystemExit("model_dirs must be a JSON array of directory paths") from exc
+        if not isinstance(parsed_model_dirs, list) or not all(
+            isinstance(item, str) and item.strip() for item in parsed_model_dirs
+        ):
+            raise SystemExit("model_dirs must be a JSON array of directory paths")
+        value = tuple(item.strip() for item in parsed_model_dirs)
     if key == "profile":
         value = resolve_profile_name(value)
     if key == "thermal_control" and value not in {"auto", "none"}:
@@ -15553,7 +15670,10 @@ def cmd_debug_public(args: Any) -> int:
 
     doctor = {
         "environment": env,
-        "huggingface": hf_cache_report(cache_dir=doctor_args.model_cache),
+        "huggingface": hf_cache_report(
+            cache_dir=doctor_args.model_cache,
+            search_dirs=getattr(doctor_args, "model_search_dirs", None),
+        ),
         "thermal_control": detect_thermal_control(),
         "tools": {
             "python": sys.executable,

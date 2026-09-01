@@ -10,7 +10,7 @@ import Foundation
 // reimplements the freshness logic.
 
 public struct ModelUpdateInfo: Codable, Equatable, Sendable, Identifiable {
-    public var id: String { repoID }
+    public var id: String { path ?? repoID }
 
     public let repoID: String
     public let path: String?
@@ -22,9 +22,13 @@ public struct ModelUpdateInfo: Codable, Equatable, Sendable, Identifiable {
     public let minEngineVersion: String?
     public let updateBytes: Int64?
     public let changedFiles: [String]?
+    public let root: String?
+    public let rootIndex: Int?
+    public let isPrimary: Bool?
 
     public var isUpdateAvailable: Bool { state == "update-available" }
     public var requiresEngineUpdate: Bool { state == "engine-update-required" }
+    public var canUpdateInPlace: Bool { isPrimary != false }
 
     /// "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed" -> the pack name.
     public var shortName: String {
@@ -42,6 +46,9 @@ public struct ModelUpdateInfo: Codable, Equatable, Sendable, Identifiable {
         case minEngineVersion = "min_engine_version"
         case updateBytes = "update_bytes"
         case changedFiles = "changed_files"
+        case root
+        case rootIndex = "root_index"
+        case isPrimary = "is_primary"
     }
 
     public init(
@@ -54,7 +61,10 @@ public struct ModelUpdateInfo: Codable, Equatable, Sendable, Identifiable {
         note: String? = nil,
         minEngineVersion: String? = nil,
         updateBytes: Int64? = nil,
-        changedFiles: [String]? = nil
+        changedFiles: [String]? = nil,
+        root: String? = nil,
+        rootIndex: Int? = nil,
+        isPrimary: Bool? = nil
     ) {
         self.repoID = repoID
         self.path = path
@@ -66,6 +76,9 @@ public struct ModelUpdateInfo: Codable, Equatable, Sendable, Identifiable {
         self.minEngineVersion = minEngineVersion
         self.updateBytes = updateBytes
         self.changedFiles = changedFiles
+        self.root = root
+        self.rootIndex = rootIndex
+        self.isPrimary = isPrimary
     }
 }
 

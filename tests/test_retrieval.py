@@ -457,6 +457,36 @@ def test_registry_from_args_falls_back_to_the_cli_cache_dir():
     assert registry_from_args(args).cache_dir == "/custom/cli"
 
 
+def test_registry_from_args_forwards_ordered_model_roots(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def resolve(ref, *, cache_dir=None, search_dirs=None):
+        captured.update(
+            ref=ref,
+            cache_dir=cache_dir,
+            search_dirs=search_dirs,
+        )
+        return Path("/resolved/embed")
+
+    monkeypatch.setattr("mtplx.hf_loader.resolve_model_path", resolve)
+    registry = registry_from_args(
+        SimpleNamespace(
+            embedding_model=["org/embed"],
+            retrieval_cache_dir="/models/primary",
+            retrieval_model_roots=["/models/archive", "/models/external"],
+        )
+    )
+    spec = registry.specs_for_role("embedding")[0]
+
+    registry._backend_key(spec)
+
+    assert captured == {
+        "ref": "org/embed",
+        "cache_dir": "/models/primary",
+        "search_dirs": ("/models/archive", "/models/external"),
+    }
+
+
 # ---- metrics --------------------------------------------------------------
 
 

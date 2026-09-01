@@ -31,7 +31,7 @@ struct PlanStage: View {
     }
 
     private var feasibility: ModelFeasibilityVerdict? {
-        orchestrator.evaluateFeasibility()
+        orchestrator.evaluateFeasibility(modelLibrary: backend.configuration.modelLibrary)
     }
 
     var body: some View {
@@ -84,7 +84,7 @@ struct PlanStage: View {
             }
             Button("Build anyway (memory may run tight)") {
                 syncModelNameToState()
-                orchestrator.startBuild()
+                orchestrator.startBuild(modelLibrary: backend.configuration.modelLibrary)
             }
             Button("Cancel", role: .cancel) {}
         } message: {
@@ -101,7 +101,7 @@ struct PlanStage: View {
             pendingDaemonConfirm = true
             return
         }
-        orchestrator.startBuild()
+        orchestrator.startBuild(modelLibrary: backend.configuration.modelLibrary)
     }
 
     private func pauseDaemonAndForge() {
@@ -109,7 +109,7 @@ struct PlanStage: View {
             await stopCoordinator.stopAll(reason: "forge_pause_daemon")
             await MainActor.run {
                 syncModelNameToState()
-                orchestrator.startBuild()
+                orchestrator.startBuild(modelLibrary: backend.configuration.modelLibrary)
             }
         }
     }
@@ -279,7 +279,7 @@ struct PlanStage: View {
            sizeBytes > 0
         {
             let neededGiB = Double(sizeBytes) / 1_073_741_824.0 * 2.5
-            let freeGiB = orchestrator.freeDiskGiB()
+            let freeGiB = orchestrator.freeDiskGiB(modelLibrary: backend.configuration.modelLibrary)
             if freeGiB < neededGiB {
                 bannerCard(
                     icon: "internaldrive",
@@ -529,11 +529,13 @@ struct PlanStage: View {
     }
 
     private var modelPathPreview: String {
-        "Forge will save ~/Documents/MTPLX/models/\(finalBrandedName)/"
+        "Forge will save \(expandedModelPath)/"
     }
 
     private var expandedModelPath: String {
-        ("~/Documents/MTPLX/models/" + finalBrandedName as NSString).expandingTildeInPath
+        backend.configuration.modelLibrary.primaryDirectory
+            .appendingPathComponent(finalBrandedName, isDirectory: true)
+            .path
     }
 
     private var modelNameCollisionDetected: Bool {
@@ -548,7 +550,9 @@ struct PlanStage: View {
         for i in 1...20 {
             let candidateBase = "\(base)-\(i)"
             let candidateName = ForgeBrandInfo.resolvedBrandedName(userName: candidateBase)
-            let path = ("~/Documents/MTPLX/models/" + candidateName as NSString).expandingTildeInPath
+            let path = backend.configuration.modelLibrary.primaryDirectory
+                .appendingPathComponent(candidateName, isDirectory: true)
+                .path
             if !FileManager.default.fileExists(atPath: path) {
                 return candidateBase
             }

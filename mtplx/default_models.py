@@ -254,10 +254,33 @@ def _env_ref_disabled(value: str | None) -> bool:
 
 
 def _complete_local_model_ref(candidates: tuple[str, ...]) -> str | None:
-    for candidate in candidates:
+    # Configured libraries own discovery precedence. The static candidates
+    # remain as compatibility fallbacks for older Documents and staging
+    # layouts, but their directory names are also probed under every ordered
+    # model root so users can keep the whole collection on one volume.
+    library_candidates: list[str] = []
+    try:
+        from mtplx.hf_loader import model_library_roots
+
+        for root in model_library_roots():
+            for candidate in candidates:
+                name = Path(candidate).expanduser().name
+                if name:
+                    library_candidates.append(str(root / name))
+    except Exception:
+        # Default selection must remain usable on fresh or partially-installed
+        # environments where the cache helper itself cannot be imported.
+        pass
+
+    seen: set[str] = set()
+    for candidate in (*library_candidates, *candidates):
         if not candidate or _env_ref_disabled(candidate):
             continue
         path = Path(candidate).expanduser()
+        key = str(path.resolve(strict=False))
+        if key in seen:
+            continue
+        seen.add(key)
         if _is_complete_local_model(path):
             return str(path)
     return None

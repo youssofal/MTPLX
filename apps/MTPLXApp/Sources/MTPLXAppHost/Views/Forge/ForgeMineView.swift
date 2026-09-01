@@ -278,7 +278,7 @@ struct ForgeMineView: View {
     // MARK: - Actions
 
     private func reload() {
-        let scanner = ForgeLocalIndex()
+        let scanner = ForgeLocalIndex(modelLibrary: backend.configuration.modelLibrary)
         entries = scanner.scan(includingRegistered: backend.configuration.customModels)
         if selectedID == nil { selectedID = entries.first?.id }
     }

@@ -196,6 +196,25 @@ def test_run_onboarding_screens_with_stubbed_input(monkeypatch, capsys):
     assert state["open_dashboard"] is False
 
 
+def test_installed_model_picker_scans_configured_library_roots(monkeypatch, tmp_path):
+    captured: dict[str, object] = {}
+
+    def fake_scan(cache_dir=None, *, search_dirs=None):
+        captured["cache_dir"] = cache_dir
+        captured["search_dirs"] = search_dirs
+        return ["library-model"]
+
+    monkeypatch.setattr("mtplx.model_catalog.scan_installed_models", fake_scan)
+    cache_dir = tmp_path / "cache"
+    search_dirs = [tmp_path / "archive", tmp_path / "shared"]
+
+    assert onboarding._installed_models_for_screen(
+        cache_dir=cache_dir,
+        search_dirs=search_dirs,
+    ) == ["library-model"]
+    assert captured == {"cache_dir": cache_dir, "search_dirs": search_dirs}
+
+
 def test_screen_interface_uses_requested_port(monkeypatch):
     captured: dict[str, object] = {}
 
@@ -842,6 +861,8 @@ def test_start_invokes_onboarding_when_no_explicit_flags(tmp_path, monkeypatch):
         *,
         fresh: bool = False,
         configured_model: str | None = None,
+        cache_dir: str | None = None,
+        search_dirs=None,
         open_dashboard_override: bool | None = None,
         host: str = "127.0.0.1",
         port: int = 8000,
@@ -850,6 +871,8 @@ def test_start_invokes_onboarding_when_no_explicit_flags(tmp_path, monkeypatch):
             {
                 "fresh": fresh,
                 "configured_model": configured_model,
+                "cache_dir": cache_dir,
+                "search_dirs": search_dirs,
                 "open_dashboard_override": open_dashboard_override,
                 "host": host,
                 "port": port,
@@ -877,7 +900,8 @@ def test_start_invokes_onboarding_when_no_explicit_flags(tmp_path, monkeypatch):
         yes=False,
         fresh=False,
         download=False,
-        cache_dir=None,
+        cache_dir=str(tmp_path / "cache"),
+        model_search_dirs=[str(tmp_path / "archive")],
         unsafe_force_unverified=False,
         show_stats=True,
         host="127.0.0.1",
@@ -903,7 +927,7 @@ def test_start_invokes_onboarding_when_no_explicit_flags(tmp_path, monkeypatch):
     )
 
     # Stub the downstream model resolution to avoid hitting MLX.
-    def fake_resolve_model(model, *, cache_dir, download):
+    def fake_resolve_model(model, *, cache_dir, search_dirs=None, download):
         return "/tmp/fake-runtime", {"model": model, "runtime_model": "/tmp/fake-runtime"}
 
     monkeypatch.setattr(
@@ -939,6 +963,8 @@ def test_start_invokes_onboarding_when_no_explicit_flags(tmp_path, monkeypatch):
     assert rc == 0
     assert len(invocations) == 1
     assert invocations[0]["configured_model"] == "/some/configured/path"
+    assert invocations[0]["cache_dir"] == str(tmp_path / "cache")
+    assert invocations[0]["search_dirs"] == [str(tmp_path / "archive")]
     assert invocations[0]["host"] == "127.0.0.1"
     assert invocations[0]["port"] == 8000
     assert args._onboarded is True

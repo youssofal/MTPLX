@@ -6,6 +6,8 @@ from mtplx.diagnostics import (
     required_download_free_bytes,
     write_doctor_bundle,
 )
+from mtplx.hf_loader import safe_model_name
+from mtplx.profiles import DEFAULT_HF_MODEL_ID
 
 
 def _write_minimal_complete_model(path) -> None:
@@ -104,6 +106,27 @@ def test_model_cache_check_honors_explicit_cache_dir_even_with_local_default(
     assert check["status"] == "warn"
     assert check["observed"]["startup_default_model"] is None
     assert check["fix"] == "Download the default model before first run."
+
+
+def test_model_cache_check_finds_complete_default_in_secondary_root(tmp_path) -> None:
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    model = secondary / safe_model_name(DEFAULT_HF_MODEL_ID)
+    _write_minimal_complete_model(model)
+
+    payload = build_diagnostics_payload(
+        model_cache=primary,
+        model_search_dirs=[secondary],
+        include_startup_default_model=False,
+    )
+
+    assert payload["host"]["model_dirs"] == [
+        str(primary.resolve()),
+        str(secondary.resolve()),
+    ]
+    check = next(item for item in payload["checks"] if item["id"] == "model.cache")
+    assert check["status"] == "pass"
+    assert check["observed"]["hf_cache_path"] == str(model)
 
 
 def test_write_doctor_bundle_creates_redacted_zip(tmp_path) -> None:

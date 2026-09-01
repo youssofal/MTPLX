@@ -45,6 +45,7 @@ public final class OnboardingOrchestrator: ObservableObject {
         autoTuner: AutoTuner = AutoTuner(),
         runtimeSetup: RuntimeSetupService = RuntimeSetupService(),
         feasibility: ModelFeasibility = ModelFeasibility(),
+        modelLibrary: ModelLibrary = .default,
         initialState: OnboardingFeatureState = OnboardingFeatureState()
     ) {
         self.hardwareInspector = hardwareInspector
@@ -53,6 +54,7 @@ public final class OnboardingOrchestrator: ObservableObject {
         self.autoTuner = autoTuner
         self.runtimeSetup = runtimeSetup
         self.feasibility = feasibility
+        self.modelLibrary = modelLibrary
         self.state = initialState
         self.runtimeSetupRows = []
         self.isRunningRuntimeSetup = false
@@ -71,6 +73,7 @@ public final class OnboardingOrchestrator: ObservableObject {
     private let autoTuner: AutoTuner
     private let runtimeSetup: RuntimeSetupService
     private let feasibility: ModelFeasibility
+    private var modelLibrary: ModelLibrary
 
     // MARK: - Cancellable task handles
 
@@ -219,7 +222,16 @@ public final class OnboardingOrchestrator: ObservableObject {
     /// method around so onboarding callsites don't have to be
     /// rewritten and the single source of truth is the option type.
     public func isModelInstalled(_ model: MTPLXModelOption) -> Bool {
-        model.isInstalled
+        model.isInstalled(in: modelLibrary)
+    }
+
+    public func installedLocalPath(for model: MTPLXModelOption) -> String? {
+        model.installedLocalPath(in: modelLibrary)
+    }
+
+    public func configureModelLibrary(_ library: ModelLibrary) {
+        guard !isDownloading else { return }
+        modelLibrary = library
     }
 
     // MARK: - Feasibility (read-only convenience)
@@ -228,7 +240,9 @@ public final class OnboardingOrchestrator: ObservableObject {
         let hw = state.hardware
         let chipTier = hw?.tier ?? .unknown
         let ramGiB = hw?.unifiedMemoryGiB ?? 0
-        let diskFreeGiB = model.isInstalled ? Double.greatestFiniteMagnitude : freeDiskGiB()
+        let diskFreeGiB = model.isInstalled(in: modelLibrary)
+            ? Double.greatestFiniteMagnitude
+            : freeDiskGiB()
         return feasibility.evaluate(
             model: model,
             chipTier: chipTier,
@@ -242,8 +256,8 @@ public final class OnboardingOrchestrator: ObservableObject {
     }
 
     public func freeDiskGiB() -> Double {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let values = try? home.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        let volume = modelLibrary.nearestExistingDirectory(to: modelLibrary.primaryDirectory)
+        let values = try? volume.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
         let bytes = values?.volumeAvailableCapacityForImportantUsage ?? 0
         return Double(bytes) / 1_073_741_824.0
     }
@@ -351,13 +365,15 @@ public final class OnboardingOrchestrator: ObservableObject {
         downloadProgress = nil
         isDownloading = true
         let downloader = modelDownloader
+        let cacheRoot = modelLibrary.primaryDirectory
         let extraEnvironment = MTPLXAppConfiguration.hfMirrorEnvironment(hfMirrorEndpoint) ?? [:]
         downloadTask?.cancel()
-        downloadTask = Task.detached(priority: .userInitiated) { [weak self, downloader, repo, totalBytes, extraEnvironment] in
+        downloadTask = Task.detached(priority: .userInitiated) { [weak self, downloader, repo, totalBytes, extraEnvironment, cacheRoot] in
             for await event in downloader.stream(
                 repo: repo,
                 totalBytes: totalBytes,
-                extraEnvironment: extraEnvironment
+                extraEnvironment: extraEnvironment,
+                cacheRoot: cacheRoot
             ) {
                 if Task.isCancelled { break }
                 await MainActor.run {
@@ -607,7 +623,8 @@ public final class OnboardingOrchestrator: ObservableObject {
     }
 
     private func resolvedTuneModelPath() -> String? {
-        if let local = state.resolvedModel?.installedLocalPath {
+        if let model = state.resolvedModel,
+           let local = model.installedLocalPath(in: modelLibrary) {
             return local
         }
         // The tune subprocess can also resolve an HF id directly via

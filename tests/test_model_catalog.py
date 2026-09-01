@@ -371,6 +371,36 @@ def test_scan_installed_models_handles_missing_cache(tmp_path):
     assert scan_installed_models(tmp_path / "does-not-exist") == []
 
 
+def test_scan_installed_models_retains_duplicate_root_identity(tmp_path):
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    name = "acme--custom-model"
+    first = _write_complete_model(primary / name)
+    second = _write_complete_model(secondary / name)
+
+    installed = scan_installed_models(primary, search_dirs=[secondary])
+
+    assert [model.path for model in installed] == [first, second]
+    assert [model.root for model in installed] == [
+        primary.resolve(),
+        secondary.resolve(),
+    ]
+    assert [model.root_index for model in installed] == [0, 1]
+    assert [model.is_primary for model in installed] == [True, False]
+
+
+def test_scan_installed_models_dedupes_physical_aliases(tmp_path):
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    model = _write_complete_model(primary / "acme--custom-model")
+    secondary.mkdir()
+    (secondary / "acme--custom-model").symlink_to(model, target_is_directory=True)
+
+    installed = scan_installed_models(primary, search_dirs=[secondary])
+
+    assert [row.path for row in installed] == [model]
+
+
 def test_read_app_settings_parses_snake_case_fields(tmp_path):
     settings_file = tmp_path / "settings.json"
     settings_file.write_text(

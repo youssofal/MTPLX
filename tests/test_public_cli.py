@@ -1499,7 +1499,7 @@ def test_serve_dry_run_prefers_contract_draft_sampler_over_internal_defaults(
     monkeypatch.setattr(
         public,
         "_resolve_runtime_model_path",
-        lambda model, cache_dir=None: (str(model_dir), None),
+        lambda model, cache_dir=None, search_dirs=None: (str(model_dir), None),
     )
     monkeypatch.setattr(
         public,
@@ -1559,7 +1559,7 @@ def _serve_dry_run_payload_for_model(monkeypatch, capsys, model_dir, extra_args=
     monkeypatch.setattr(
         public,
         "_resolve_runtime_model_path",
-        lambda model, cache_dir=None: (str(model_dir), None),
+        lambda model, cache_dir=None, search_dirs=None: (str(model_dir), None),
     )
     monkeypatch.setattr(
         public,
@@ -1659,12 +1659,18 @@ def test_serve_forwards_retrieval_flags_to_the_server_command(
             "org/embed=e1",
             "--reranker-model",
             "org/rank",
+            "--model-search-dir",
+            "/models/archive",
+            "--model-search-dir",
+            "/models/external",
             "--retrieval-trust-remote-code",
         ),
     )
     command = payload["server_command"]
     assert "--embedding-model org/embed=e1" in command
     assert "--reranker-model org/rank" in command
+    assert "--retrieval-model-root /models/archive" in command
+    assert "--retrieval-model-root /models/external" in command
     assert "--retrieval-trust-remote-code" in command
 
 
@@ -6417,6 +6423,31 @@ def test_config_set_dry_run_uses_selected_path(tmp_path, capsys):
     assert not config.exists()
 
 
+def test_config_set_writes_model_directory_array(tmp_path, capsys):
+    config = tmp_path / "config.toml"
+
+    code = main(
+        [
+            "config",
+            "set",
+            "model_dirs",
+            '["/models/archive", "/models/external"]',
+            "--config",
+            str(config),
+        ]
+    )
+
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["updated"] == {
+        "model_dirs": ["/models/archive", "/models/external"]
+    }
+    assert tomllib.loads(config.read_text(encoding="utf-8"))["model_dirs"] == [
+        "/models/archive",
+        "/models/external",
+    ]
+
+
 def test_debug_hotpath_reports_next_kernel_boundary(capsys):
     code = main(["debug", "hotpath"])
 
@@ -7715,7 +7746,7 @@ def test_bare_serve_invokes_server_onboarding_in_tty(monkeypatch):
     monkeypatch.setattr(
         public,
         "_resolve_runtime_model_path",
-        lambda model, cache_dir=None: (model, None),
+        lambda model, cache_dir=None, search_dirs=None: (model, None),
     )
     monkeypatch.setattr(
         public,
@@ -7748,7 +7779,8 @@ def test_bare_serve_invokes_server_onboarding_in_tty(monkeypatch):
     args = SimpleNamespace(
         command="serve",
         model="models/configured",
-        cache_dir=None,
+        cache_dir="/models/cache",
+        model_search_dirs=["/models/archive", "/models/shared"],
         download=False,
         profile="stable",
         unsafe_force_unverified=False,
@@ -7779,6 +7811,8 @@ def test_bare_serve_invokes_server_onboarding_in_tty(monkeypatch):
 
     assert len(invocations) == 1
     assert invocations[0]["configured_model"] == "models/configured"
+    assert invocations[0]["cache_dir"] == "/models/cache"
+    assert invocations[0]["search_dirs"] == ["/models/archive", "/models/shared"]
     assert invocations[0]["port"] == 8765
     assert args._onboarded is True
     assert args.model == "models/onboarded"
@@ -8442,7 +8476,17 @@ def test_model_cache_commands_parse():
 
     pull_args = parser.parse_args(["pull", "mtplx/example", "--revision", "main"])
     pull_progress_args = parser.parse_args(["pull", "mtplx/example", "--progress-json"])
-    list_args = parser.parse_args(["list", "--cache-dir", "/tmp/mtplx-models"])
+    list_args = parser.parse_args(
+        [
+            "list",
+            "--cache-dir",
+            "/tmp/mtplx-models",
+            "--model-search-dir",
+            "/models/archive",
+            "--model-search-dir",
+            "/models/external",
+        ]
+    )
     remove_args = parser.parse_args(["remove", "mtplx/example", "--missing-ok"])
 
     assert pull_args.command == "pull"
@@ -8451,8 +8495,40 @@ def test_model_cache_commands_parse():
     assert pull_progress_args.progress_json is True
     assert list_args.command == "list"
     assert list_args.cache_dir == "/tmp/mtplx-models"
+    assert list_args.model_search_dirs == ["/models/archive", "/models/external"]
     assert remove_args.command == "remove"
     assert remove_args.missing_ok is True
+
+
+def test_remove_command_reports_multi_root_ambiguity_without_deleting(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    first = primary / "owner--pack"
+    second = secondary / "owner--pack"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+
+    code = main(
+        [
+            "remove",
+            "owner/pack",
+            "--cache-dir",
+            str(primary),
+            "--model-search-dir",
+            str(secondary),
+            "--json",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 2
+    assert payload["error"] == "remove failed"
+    assert "multiple installed copies" in payload["detail"]
+    assert first.is_dir()
+    assert second.is_dir()
 
 
 def test_init_parser_exposes_model_cache_and_profile_options():
@@ -8465,6 +8541,10 @@ def test_init_parser_exposes_model_cache_and_profile_options():
             "mtplx/example",
             "--model-dir",
             "/tmp/mtplx-models",
+            "--model-search-dir",
+            "/models/archive",
+            "--model-search-dir",
+            "/models/external",
             "--profile",
             "exact",
             "--thermal-control",
@@ -8477,10 +8557,100 @@ def test_init_parser_exposes_model_cache_and_profile_options():
     assert args.command == "init"
     assert args.model == "mtplx/example"
     assert args.model_dir == "/tmp/mtplx-models"
+    assert args.model_search_dirs == ["/models/archive", "/models/external"]
     assert args.profile == "exact"
     assert args.thermal_control == "none"
     assert args.download is True
     assert args.write is True
+
+
+def test_init_writes_model_search_dirs_to_config(tmp_path, monkeypatch, capsys):
+    config = tmp_path / "config.toml"
+    monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
+
+    code = main(
+        [
+            "init",
+            "--config",
+            str(config),
+            "--model-dir",
+            str(tmp_path / "primary"),
+            "--model-search-dir",
+            str(tmp_path / "archive"),
+            "--model-search-dir",
+            str(tmp_path / "external"),
+            "--write",
+            "--json",
+        ]
+    )
+
+    assert code == 0
+    assert json.loads(capsys.readouterr().out)["wrote_config"] is True
+    saved = tomllib.loads(config.read_text(encoding="utf-8"))
+    assert saved["model_dir"] == str(tmp_path / "primary")
+    assert saved["model_dirs"] == [
+        str(tmp_path / "archive"),
+        str(tmp_path / "external"),
+    ]
+
+
+def test_forge_uses_persisted_primary_model_root(tmp_path, monkeypatch):
+    import mtplx.commands.forge as forge
+
+    config = tmp_path / "config.toml"
+    primary = tmp_path / "primary"
+    config.write_text(f'model_dir = "{primary}"\n', encoding="utf-8")
+    monkeypatch.setenv("MTPLX_CONFIG", str(config))
+    captured: dict[str, object] = {}
+
+    def fake_handler(args, *, model_root=None):
+        captured["action"] = args.forge_action
+        captured["model_root"] = model_root
+        return 0
+
+    monkeypatch.setattr(forge, "cmd_forge_public", fake_handler)
+
+    assert main(["forge", "probe", "owner/model", "--json"]) == 0
+    assert captured == {"action": "probe", "model_root": str(primary)}
+
+
+def test_forge_build_explicit_model_root_overrides_persisted_root(
+    tmp_path, monkeypatch
+):
+    import mtplx.commands.forge as forge
+
+    config = tmp_path / "config.toml"
+    config.write_text('model_dir = "/models/config"\n', encoding="utf-8")
+    monkeypatch.setenv("MTPLX_CONFIG", str(config))
+    captured: dict[str, object] = {}
+
+    def fake_handler(args, *, model_root=None):
+        captured["model_root"] = model_root
+        return 0
+
+    monkeypatch.setattr(forge, "cmd_forge_public", fake_handler)
+
+    code = main(
+        [
+            "forge",
+            "build",
+            "--repo",
+            "owner/model",
+            "--out",
+            str(tmp_path / "out"),
+            "--run-id",
+            "run",
+            "--recipe",
+            "{}",
+            "--branded-name",
+            "Built",
+            "--model-root",
+            "/models/operation",
+        ]
+    )
+
+    assert code == 0
+    assert captured["model_root"] == "/models/operation"
 
 
 def test_compile_audit_dry_run_is_real_command(capsys):

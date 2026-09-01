@@ -30,6 +30,7 @@ struct SettingsTab: View {
                 kvQuantCard
                 ssdCacheCard
                 retrievalCard
+                modelLibraryCard
                 restartRequiredCard
                 hermesToolTruthCard
                 thermalCard
@@ -1170,6 +1171,140 @@ struct SettingsTab: View {
         }
     }
 
+    @ViewBuilder
+    private var modelLibraryCard: some View {
+        Card(
+            "Model libraries",
+            subtitle: "Downloads and Forge write to the primary folder. Additional folders are searched in order."
+        ) {
+            VStack(alignment: .leading, spacing: 10) {
+                modelDirectoryRow(
+                    title: "Primary",
+                    path: draftConfig.primaryModelDirectory
+                ) {
+                    Button("Choose") { choosePrimaryModelDirectory() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                }
+
+                if !draftConfig.additionalModelDirectories.isEmpty {
+                    Divider().overlay(Brand.separator)
+                }
+
+                ForEach(
+                    Array(draftConfig.additionalModelDirectories.enumerated()),
+                    id: \.offset
+                ) { index, path in
+                    modelDirectoryRow(title: "Additional \(index + 1)", path: path) {
+                        HStack(spacing: 4) {
+                            Button {
+                                moveAdditionalModelDirectory(from: index, by: -1)
+                            } label: {
+                                Image(systemName: "chevron.up")
+                            }
+                            .disabled(index == 0)
+
+                            Button {
+                                moveAdditionalModelDirectory(from: index, by: 1)
+                            } label: {
+                                Image(systemName: "chevron.down")
+                            }
+                            .disabled(index == draftConfig.additionalModelDirectories.count - 1)
+
+                            Button {
+                                draftConfig.additionalModelDirectories.remove(at: index)
+                            } label: {
+                                Image(systemName: "minus.circle")
+                            }
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                }
+
+                Button {
+                    addModelDirectories()
+                } label: {
+                    Label("Add folder", systemImage: "plus")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+        }
+    }
+
+    private func modelDirectoryRow<Trailing: View>(
+        title: String,
+        path: String,
+        @ViewBuilder trailing: () -> Trailing
+    ) -> some View {
+        let url = ModelLibrary.canonicalURL(for: path)
+        let available = ModelLibrary.isAvailable(url)
+        return HStack(alignment: .center, spacing: 10) {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 5) {
+                    Text(title).font(.callout.weight(.medium))
+                    Label(
+                        available ? "Available" : "Unavailable",
+                        systemImage: available ? "checkmark.circle.fill" : "externaldrive.badge.questionmark"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(available ? Brand.success : Brand.warning)
+                }
+                Text(url.path)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(Brand.typeSecondary)
+                    .textSelection(.enabled)
+            }
+            Spacer(minLength: 8)
+            trailing()
+        }
+    }
+
+    private func choosePrimaryModelDirectory() {
+        #if canImport(AppKit)
+        let panel = modelDirectoryPanel(allowsMultipleSelection: false)
+        let current = draftConfig.modelLibrary.primaryDirectory
+        if ModelLibrary.isAvailable(current) {
+            panel.directoryURL = current
+        }
+        if panel.runModal() == .OK, let url = panel.url {
+            draftConfig.setPrimaryModelDirectory(url.path, preservePrevious: true)
+        }
+        #endif
+    }
+
+    private func addModelDirectories() {
+        #if canImport(AppKit)
+        let panel = modelDirectoryPanel(allowsMultipleSelection: true)
+        if panel.runModal() == .OK {
+            draftConfig.addModelDirectories(panel.urls.map(\.path))
+        }
+        #endif
+    }
+
+    #if canImport(AppKit)
+    private func modelDirectoryPanel(allowsMultipleSelection: Bool) -> NSOpenPanel {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = allowsMultipleSelection
+        panel.canCreateDirectories = true
+        panel.prompt = allowsMultipleSelection ? "Add" : "Use"
+        panel.message = allowsMultipleSelection
+            ? "Choose one or more model folders to search."
+            : "Choose the folder for downloads and Forge output."
+        return panel
+    }
+    #endif
+
+    private func moveAdditionalModelDirectory(from index: Int, by offset: Int) {
+        let destination = index + offset
+        guard draftConfig.additionalModelDirectories.indices.contains(index),
+              draftConfig.additionalModelDirectories.indices.contains(destination)
+        else { return }
+        draftConfig.additionalModelDirectories.swapAt(index, destination)
+    }
+
     private var settingsFilePathHint: String {
         backend.settingsURL.path
     }
@@ -1438,6 +1573,7 @@ struct SettingsTab: View {
         } else {
             config.pagedKVQuantization = kvValue
         }
+        config.normalizeModelDirectories()
         return config
     }
 

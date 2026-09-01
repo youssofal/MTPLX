@@ -53,6 +53,53 @@ final class ModelUpdateServiceTests: XCTestCase {
         XCTAssertEqual(row.minEngineVersion, "9.9.9")
     }
 
+    func testDuplicateRepositoriesKeepInstalledPathIdentity() {
+        let first = ModelUpdateInfo(
+            repoID: "owner/pack",
+            path: "/models/one/owner--pack",
+            state: "current"
+        )
+        let second = ModelUpdateInfo(
+            repoID: "owner/pack",
+            path: "/models/two/owner--pack",
+            state: "current"
+        )
+
+        XCTAssertNotEqual(first.id, second.id)
+    }
+
+    func testDiscoveryOnlyUpdateIsNotActionable() {
+        let row = ModelUpdateInfo(
+            repoID: "owner/pack",
+            path: "/archive/owner--pack",
+            state: "update-available",
+            root: "/archive",
+            rootIndex: 1,
+            isPrimary: false
+        )
+
+        XCTAssertTrue(row.isUpdateAvailable)
+        XCTAssertFalse(row.canUpdateInPlace)
+    }
+
+    @MainActor
+    func testDiscoveryOnlyUpdateIsExcludedFromAvailableActions() async {
+        let row = ModelUpdateInfo(
+            repoID: "owner/pack",
+            path: "/archive/owner--pack",
+            state: "update-available",
+            root: "/archive",
+            rootIndex: 1,
+            isPrimary: false
+        )
+        let store = MTPLXBackendStore(modelUpdateChecker: { [row] })
+
+        await store.refreshModelUpdates(force: true)
+
+        XCTAssertEqual(store.modelUpdates, [row])
+        XCTAssertTrue(store.availableModelPackUpdates.isEmpty)
+    }
+
     @MainActor
     func testRefreshModelUpdatesPublishesAndThrottles() async {
         let calls = Counter()

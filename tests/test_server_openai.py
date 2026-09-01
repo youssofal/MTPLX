@@ -30,6 +30,21 @@ def test_server_parser_accepts_native_app_launch_id():
     assert args.app_launch_id == "native-123"
 
 
+def test_server_parser_accepts_ordered_retrieval_model_roots():
+    args = parse_args(
+        [
+            "--warmup-tokens",
+            "0",
+            "--retrieval-model-root",
+            "/models/archive",
+            "--retrieval-model-root",
+            "/models/external",
+        ]
+    )
+
+    assert args.retrieval_model_roots == ["/models/archive", "/models/external"]
+
+
 def test_direct_server_parser_exposes_mtp_batch_numerics():
     args = parse_args(["--mtp-batch-numerics", "b1-exact", "--warmup-tokens", "0"])
 

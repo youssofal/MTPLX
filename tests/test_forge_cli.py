@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import errno
 import io
 import json
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1015,7 +1017,11 @@ def test_build_zero_agreement_contract_still_measures_speed_rows(tmp_path, monke
     monkeypatch.setattr(
         forge,
         "_prepare_source",
-        lambda repo, run, probe: (source, "Qwen/Qwen3.5-9B", "abc123"),
+        lambda repo, run, probe, *, model_root=None: (
+            source,
+            "Qwen/Qwen3.5-9B",
+            "abc123",
+        ),
     )
 
     def fake_mirror(source_path, destination):
@@ -1336,6 +1342,108 @@ def test_discover_network_failure_mentions_hf_unreachable(monkeypatch, capsys):
 
     assert code == 1
     assert "hf_unreachable" in capsys.readouterr().err
+
+
+def test_explicit_model_root_takes_precedence_for_forge_destinations(
+    tmp_path, monkeypatch
+):
+    primary_root = tmp_path / "primary"
+    forge_env_root = tmp_path / "forge-env"
+    legacy_env_root = tmp_path / "legacy-env"
+    monkeypatch.setenv("MTPLX_FORGE_MODEL_ROOT", str(forge_env_root))
+    monkeypatch.setenv("MTPLX_MODEL_DIR", str(legacy_env_root))
+
+    assert forge._default_model_root(primary_root) == primary_root
+    assert forge._unique_model_dir("Fixture", model_root=primary_root) == (
+        primary_root / "Fixture"
+    )
+    assert forge._default_model_root() == forge_env_root
+
+    monkeypatch.delenv("MTPLX_FORGE_MODEL_ROOT")
+    assert forge._default_model_root() == legacy_env_root
+
+
+def test_prepare_hf_source_uses_explicit_model_root_as_pull_cache(
+    tmp_path, monkeypatch
+):
+    primary_root = tmp_path / "primary"
+    monkeypatch.setenv("MTPLX_FORGE_MODEL_ROOT", str(tmp_path / "stale-forge-root"))
+    calls = []
+
+    def fake_pull(repo_id, **kwargs):
+        calls.append((repo_id, kwargs["cache_dir"]))
+        cached = Path(kwargs["cache_dir"]) / "owner--Fixture"
+        cached.mkdir(parents=True)
+        (cached / "config.json").write_text("{}", encoding="utf-8")
+        return {"path": str(cached), "size_bytes": 2}
+
+    monkeypatch.setattr(forge, "pull_model", fake_pull)
+
+    source, repo, revision = forge._prepare_source(
+        "owner/Fixture",
+        tmp_path / "run",
+        {"estimated_size_bytes": 2, "source_sha": "abc123"},
+        model_root=primary_root,
+    )
+
+    assert calls == [("owner/Fixture", primary_root)]
+    assert source == primary_root / "owner--Fixture"
+    assert repo == "owner/Fixture"
+    assert revision == "abc123"
+
+
+def test_mirrored_output_is_self_contained_after_source_removal(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    _write_json(source / "config.json", {"model_type": "fixture"})
+    blob = tmp_path / "cache-blob.safetensors"
+    blob.write_bytes(b"payload")
+    (source / "model.safetensors").symlink_to(blob)
+    nested = source / "tokenizer"
+    nested.mkdir()
+    (nested / "tokenizer.json").write_text('{"version":1}', encoding="utf-8")
+    destination = tmp_path / "destination"
+
+    forge._mirror_model_tree(source, destination)
+
+    payload = destination / "model.safetensors"
+    assert not payload.is_symlink()
+    assert payload.stat().st_ino == blob.stat().st_ino
+    assert not (destination / "config.json").is_symlink()
+    assert not (destination / "tokenizer" / "tokenizer.json").is_symlink()
+
+    shutil.rmtree(source)
+    blob.unlink()
+
+    assert payload.read_bytes() == b"payload"
+    assert (destination / "config.json").read_text(encoding="utf-8")
+    assert (destination / "tokenizer" / "tokenizer.json").read_text(
+        encoding="utf-8"
+    ) == '{"version":1}'
+
+
+def test_mirrored_output_copies_payload_when_hardlink_is_unavailable(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _write_json(source / "config.json", {"model_type": "fixture"})
+    source_payload = source / "model.safetensors"
+    source_payload.write_bytes(b"payload")
+
+    def cross_device_link(*_args, **_kwargs):
+        raise OSError(errno.EXDEV, "cross-device link")
+
+    monkeypatch.setattr(forge.os, "link", cross_device_link)
+    destination = tmp_path / "destination"
+
+    forge._mirror_model_tree(source, destination)
+
+    payload = destination / "model.safetensors"
+    assert not payload.is_symlink()
+    assert payload.read_bytes() == b"payload"
+    assert payload.stat().st_ino != source_payload.stat().st_ino
+    assert not list(destination.rglob(".*.tmp"))
 
 
 def test_build_local_already_mtplx_writes_phase_files_and_runtime(tmp_path, monkeypatch):

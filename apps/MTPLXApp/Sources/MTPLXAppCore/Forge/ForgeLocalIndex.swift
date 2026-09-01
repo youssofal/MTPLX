@@ -27,17 +27,18 @@ import Foundation
 public struct ForgeLocalIndex {
     public init(
         roots: [URL]? = nil,
+        modelLibrary: ModelLibrary = .default,
         fileManager: FileManager = .default
     ) {
         self.fileManager = fileManager
         if let roots {
-            self.roots = roots
+            self.roots = Self.canonicalRoots(roots, fileManager: fileManager)
         } else {
             let home = fileManager.homeDirectoryForCurrentUser
-            self.roots = [
+            self.roots = Self.canonicalRoots(modelLibrary.directories + [
                 home.appendingPathComponent("Documents/MTPLX/models", isDirectory: true),
                 home.appendingPathComponent("Documents/MTPLX/hf-staging", isDirectory: true)
-            ]
+            ], fileManager: fileManager)
         }
     }
 
@@ -65,18 +66,22 @@ public struct ForgeLocalIndex {
 
                 let metadata = MTPLXRuntimeMetadata.read(at: runtimeJSON.path)
                 let isForgedLocal = metadata?.forgeProvenance?.forgedLocally == true
+                let canonicalURL = ModelLibrary.canonicalURL(for: url.path, fileManager: fileManager)
                 let matchedOption = registered.first {
-                    $0.localCandidates.contains(url.path)
+                    $0.localCandidates.contains {
+                        ModelLibrary.canonicalURL(for: $0, fileManager: fileManager).path
+                            == canonicalURL.path
+                    }
                 }
 
                 if isForgedLocal || matchedOption != nil {
-                    if !seen.insert(url.path).inserted { continue }
+                    if !seen.insert(canonicalURL.path).inserted { continue }
                     entries.append(ForgeLocalEntry(
-                        localPath: url.path,
-                        directoryName: url.lastPathComponent,
+                        localPath: canonicalURL.path,
+                        directoryName: canonicalURL.lastPathComponent,
                         metadata: metadata,
                         modelOption: matchedOption,
-                        sizeOnDisk: ModelDownloaderSize.recursive(of: url, fm: fileManager)
+                        sizeOnDisk: ModelDownloaderSize.recursive(of: canonicalURL, fm: fileManager)
                     ))
                 }
             }
@@ -89,22 +94,34 @@ public struct ForgeLocalIndex {
             for candidate in option.localCandidates {
                 let expanded = (candidate as NSString).expandingTildeInPath
                 guard fileManager.fileExists(atPath: expanded) else { continue }
-                if seen.insert(expanded).inserted {
-                    let runtimeJSON = URL(fileURLWithPath: expanded)
+                let canonicalURL = ModelLibrary.canonicalURL(for: expanded, fileManager: fileManager)
+                if seen.insert(canonicalURL.path).inserted {
+                    let runtimeJSON = canonicalURL
                         .appendingPathComponent("mtplx_runtime.json")
                     let metadata = MTPLXRuntimeMetadata.read(at: runtimeJSON.path)
                     entries.append(ForgeLocalEntry(
-                        localPath: expanded,
-                        directoryName: URL(fileURLWithPath: expanded).lastPathComponent,
+                        localPath: canonicalURL.path,
+                        directoryName: canonicalURL.lastPathComponent,
                         metadata: metadata,
                         modelOption: option,
-                        sizeOnDisk: ModelDownloaderSize.recursive(of: URL(fileURLWithPath: expanded), fm: fileManager)
+                        sizeOnDisk: ModelDownloaderSize.recursive(of: canonicalURL, fm: fileManager)
                     ))
                 }
             }
         }
 
         return entries.sorted { ($0.forgedAt ?? .distantPast) > ($1.forgedAt ?? .distantPast) }
+    }
+
+    private static func canonicalRoots(
+        _ roots: [URL],
+        fileManager: FileManager
+    ) -> [URL] {
+        var seen: Set<String> = []
+        return roots.compactMap { root in
+            let canonical = ModelLibrary.canonicalURL(for: root.path, fileManager: fileManager)
+            return seen.insert(canonical.path).inserted ? canonical : nil
+        }
     }
 }
 

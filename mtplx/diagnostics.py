@@ -7,7 +7,6 @@ fresh machines before the runtime stack is installed.
 from __future__ import annotations
 
 import json
-import os
 import platform
 import shutil
 import socket
@@ -19,9 +18,13 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
-from mtplx.hf_loader import cached_model_path, validate_mtplx_model_files
+from mtplx.hf_loader import (
+    cached_model_path,
+    model_library_roots,
+    validate_mtplx_model_files,
+)
 from mtplx.profiles import DEFAULT_HF_MODEL_ID, DEFAULT_PROFILE_NAME
 
 
@@ -180,8 +183,13 @@ def _http_probe(url: str, *, timeout: float = 1.0) -> dict[str, Any]:
         return {"ok": False, "error": repr(exc)}
 
 
-def host_report(*, model_cache: str | Path | None = None) -> dict[str, Any]:
-    cache_root = Path(model_cache or os.environ.get("MTPLX_MODEL_DIR") or "~/.mtplx/models").expanduser()
+def host_report(
+    *,
+    model_cache: str | Path | None = None,
+    model_search_dirs: Iterable[str | Path] | None = None,
+) -> dict[str, Any]:
+    roots = model_library_roots(model_cache, search_dirs=model_search_dirs)
+    cache_root = roots[0]
     macos = _run(["sw_vers", "-productVersion"]) if platform.system() == "Darwin" else {}
     mem_raw = _sysctl("hw.memsize") if platform.system() == "Darwin" else None
     memory_bytes = int(mem_raw) if mem_raw and mem_raw.isdigit() else None
@@ -205,6 +213,7 @@ def host_report(*, model_cache: str | Path | None = None) -> dict[str, Any]:
         "memory_bytes": memory_bytes,
         "memory_gib": round(memory_bytes / GIB, 2) if memory_bytes else None,
         "cache_dir": str(cache_root),
+        "model_dirs": [str(root) for root in roots],
         "disk_free_bytes": disk.free if disk else None,
         "disk_free_gib": round(disk.free / GIB, 2) if disk else None,
     }
@@ -329,6 +338,7 @@ def _port_open(host: str, port: int) -> bool:
 def build_diagnostic_checks(
     *,
     model_cache: str | Path | None = None,
+    model_search_dirs: Iterable[str | Path] | None = None,
     include_startup_default_model: bool = True,
     deep: bool = False,
     server_port: int = 8000,
@@ -337,9 +347,10 @@ def build_diagnostic_checks(
     thermal_control: dict[str, Any] | None = None,
     server_dependencies: dict[str, bool] | None = None,
 ) -> tuple[dict[str, Any], list[DiagnosticCheck]]:
-    host = host_report(model_cache=model_cache)
+    roots = model_library_roots(model_cache, search_dirs=model_search_dirs)
+    host = host_report(model_cache=model_cache, model_search_dirs=model_search_dirs)
     checks: list[DiagnosticCheck] = []
-    cache_root = Path(model_cache or os.environ.get("MTPLX_MODEL_DIR") or "~/.mtplx/models").expanduser()
+    cache_root = roots[0]
     macos_version = host.get("macos_version")
     macos_ok = platform.system() == "Darwin" and bool(macos_version) and _parse_version(str(macos_version)) >= (SUPPORT_MACOS_MAJOR, 0)
     checks.append(
@@ -433,7 +444,19 @@ def build_diagnostic_checks(
         )
     )
     default_cached = cached_model_path(DEFAULT_HF_MODEL_ID, cache_dir=cache_root)
-    default_validation = validate_mtplx_model_files(default_cached) if default_cached.exists() else None
+    default_validation = None
+    for root in roots:
+        candidate = cached_model_path(DEFAULT_HF_MODEL_ID, cache_dir=root)
+        if not candidate.exists():
+            continue
+        validation = validate_mtplx_model_files(candidate)
+        if validation.get("ok"):
+            default_cached = candidate
+            default_validation = validation
+            break
+        if default_validation is None:
+            default_cached = candidate
+            default_validation = validation
     startup_default = _startup_default_model_observed(
         model_cache=model_cache,
         include_startup_default_model=include_startup_default_model,
@@ -676,6 +699,7 @@ def summarize_checks(checks: list[DiagnosticCheck]) -> str:
 def build_diagnostics_payload(
     *,
     model_cache: str | Path | None = None,
+    model_search_dirs: Iterable[str | Path] | None = None,
     include_startup_default_model: bool = True,
     deep: bool = False,
     server_port: int = 8000,
@@ -685,6 +709,7 @@ def build_diagnostics_payload(
 ) -> dict[str, Any]:
     host, checks = build_diagnostic_checks(
         model_cache=model_cache,
+        model_search_dirs=model_search_dirs,
         include_startup_default_model=include_startup_default_model,
         deep=deep,
         server_port=server_port,

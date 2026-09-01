@@ -18,6 +18,8 @@ public struct PendingModelDownload: Identifiable, Equatable, Sendable {
     public var launchAction: PendingModelDownloadLaunchAction
     public var totalBytes: Int64?
     public var destinationPath: String
+    /// Immutable write root captured when the operation is presented.
+    public var cacheRoot: String
 
     public init(
         repoID: String,
@@ -26,9 +28,12 @@ public struct PendingModelDownload: Identifiable, Equatable, Sendable {
         target: LaunchTarget?,
         launchAction: PendingModelDownloadLaunchAction,
         totalBytes: Int64?,
-        destinationPath: String
+        destinationPath: String,
+        cacheRoot: String? = nil
     ) {
-        self.id = "\(repoID)|\(target?.rawValue ?? "default")|\(launchAction.rawValue)"
+        let resolvedRoot = cacheRoot
+            ?? URL(fileURLWithPath: destinationPath).deletingLastPathComponent().path
+        self.id = "\(repoID)|\(resolvedRoot)|\(target?.rawValue ?? "default")|\(launchAction.rawValue)"
         self.repoID = repoID
         self.displayName = displayName
         self.shortName = shortName
@@ -36,6 +41,7 @@ public struct PendingModelDownload: Identifiable, Equatable, Sendable {
         self.launchAction = launchAction
         self.totalBytes = totalBytes
         self.destinationPath = destinationPath
+        self.cacheRoot = resolvedRoot
     }
 }
 
@@ -1235,7 +1241,7 @@ public final class MTPLXBackendStore: ObservableObject {
     private let modelUpdateChecker: (@Sendable () async throws -> [ModelUpdateInfo])?
 
     public var availableModelPackUpdates: [ModelUpdateInfo] {
-        modelUpdates.filter(\.isUpdateAvailable)
+        modelUpdates.filter { $0.isUpdateAvailable && $0.canUpdateInPlace }
     }
 
     public func refreshModelUpdates(force: Bool = false) async {
@@ -1250,7 +1256,11 @@ public final class MTPLXBackendStore: ObservableObject {
             if let modelUpdateChecker {
                 rows = try await modelUpdateChecker()
             } else {
-                rows = try await modelDownloader.checkModelUpdates()
+                let library = configuration.modelLibrary
+                rows = try await modelDownloader.checkModelUpdates(
+                    cacheRoot: library.primaryDirectory,
+                    searchRoots: library.additionalDirectories
+                )
             }
             modelUpdates = rows
         } catch {
@@ -1268,10 +1278,16 @@ public final class MTPLXBackendStore: ObservableObject {
     /// and skips size-identical files — a re-published MTP head costs the
     /// head, not the trunk. Serving is untouched until the user restarts.
     public func updateModelPack(_ update: ModelUpdateInfo) {
-        guard modelPackUpdatingRepoID == nil else { return }
+        guard update.isUpdateAvailable,
+              update.canUpdateInPlace,
+              modelPackUpdatingRepoID == nil
+        else { return }
         modelPackUpdatingRepoID = update.repoID
         modelPackUpdateStatus = "Preparing…"
         let downloader = modelDownloader
+        let cacheRoot = update.path
+            .map { URL(fileURLWithPath: $0).deletingLastPathComponent() }
+            ?? configuration.modelLibrary.primaryDirectory
         let startedBytes = update.path.map {
             Self.directorySizeForUpdateProgress(URL(fileURLWithPath: $0))
         }
@@ -1280,7 +1296,8 @@ public final class MTPLXBackendStore: ObservableObject {
                 repo: update.repoID,
                 totalBytes: nil,
                 update: true,
-                sizeProbePath: update.path
+                sizeProbePath: update.path,
+                cacheRoot: cacheRoot
             )
             var completed = false
             for await event in stream {
@@ -1420,9 +1437,10 @@ public final class MTPLXBackendStore: ObservableObject {
         guard !trimmed.isEmpty, !isModelDownloading, !isModelTuning else { return }
         let option = MTPLXModelOption.option(matching: trimmed)
             ?? MTPLXModelOption.customHuggingFaceModel(repoID: trimmed)
+        let library = configuration.modelLibrary
         let target = defaultLaunchTarget(for: configuration)
         let launchAction: PendingModelDownloadLaunchAction = supervisor.isRunning() ? .restart : .start
-        if let installedPath = option?.installedLocalPath {
+        if let installedPath = option?.installedLocalPath(in: library) {
             Task { @MainActor [weak self] in
                 do {
                     try await self?.finishModelInstall(
@@ -1442,6 +1460,10 @@ public final class MTPLXBackendStore: ObservableObject {
             if let option, option.sizeBytes > 0 { return option.sizeBytes }
             return nil
         }()
+        let destination = modelDownloader.cachedModelPath(
+            for: trimmed,
+            cacheRoot: library.primaryDirectory
+        )
         pendingModelDownload = PendingModelDownload(
             repoID: trimmed,
             displayName: displayName ?? option?.displayName ?? trimmed,
@@ -1449,7 +1471,8 @@ public final class MTPLXBackendStore: ObservableObject {
             target: target,
             launchAction: launchAction,
             totalBytes: resolvedBytes,
-            destinationPath: modelDownloader.cachedModelPath(for: trimmed).path
+            destinationPath: destination.path,
+            cacheRoot: destination.deletingLastPathComponent().path
         )
         modelDownloadProgress = nil
         modelDownloadFailure = nil
@@ -1516,7 +1539,8 @@ public final class MTPLXBackendStore: ObservableObject {
             for await event in downloader.stream(
                 repo: request.repoID,
                 totalBytes: request.totalBytes,
-                extraEnvironment: extraEnvironment
+                extraEnvironment: extraEnvironment,
+                cacheRoot: URL(fileURLWithPath: request.cacheRoot, isDirectory: true)
             ) {
                 if Task.isCancelled { break }
                 await self?.handleModelDownloadEvent(event, request: request)
@@ -2507,7 +2531,8 @@ public final class MTPLXBackendStore: ObservableObject {
         {
             return false
         }
-        if let installedPath = option.installedLocalPath {
+        let library = configuration.modelLibrary
+        if let installedPath = option.installedLocalPath(in: library) {
             var next = configuration
             if next.model != installedPath {
                 next.model = installedPath
@@ -2517,6 +2542,10 @@ public final class MTPLXBackendStore: ObservableObject {
             return false
         }
 
+        let destination = modelDownloader.cachedModelPath(
+            for: option.hfModelID,
+            cacheRoot: library.primaryDirectory
+        )
         pendingModelDownload = PendingModelDownload(
             repoID: option.hfModelID,
             displayName: option.displayName,
@@ -2524,7 +2553,8 @@ public final class MTPLXBackendStore: ObservableObject {
             target: target,
             launchAction: launchAction,
             totalBytes: option.sizeBytes > 0 ? option.sizeBytes : nil,
-            destinationPath: modelDownloader.cachedModelPath(for: option.hfModelID).path
+            destinationPath: destination.path,
+            cacheRoot: destination.deletingLastPathComponent().path
         )
         modelDownloadProgress = nil
         modelDownloadFailure = nil
@@ -2536,7 +2566,8 @@ public final class MTPLXBackendStore: ObservableObject {
     private func downloadableModelOption(for model: String) -> MTPLXModelOption? {
         let rows = MTPLXModelOption.pickerCatalog(
             customModels: configuration.customModels,
-            currentModel: model
+            currentModel: model,
+            modelLibrary: configuration.modelLibrary
         )
         if let match = rows.first(where: { $0.matches(model) }) {
             return match

@@ -26,6 +26,7 @@ LEGACY_DEFAULT_MODEL_REFS = {
 CONFIG_VALUE_KEYS = (
     "model",
     "model_dir",
+    "model_dirs",
     "profile",
     "thermal_control",
     "paged_kv_quantization",
@@ -66,6 +67,7 @@ class UserConfig:
     exists: bool
     model: str | None = None
     model_dir: str | None = None
+    model_dirs: tuple[str, ...] = ()
     profile: str | None = None
     thermal_control: str | None = None
     paged_kv_quantization: str | None = None
@@ -170,6 +172,7 @@ def load_user_config(path: str | Path | None = None) -> UserConfig:
         exists=True,
         model=str(model) if model else None,
         model_dir=str(model_dir) if model_dir else None,
+        model_dirs=_str_tuple(data.get("model_dirs")),
         profile=str(profile) if profile else None,
         thermal_control=str(thermal_control) if thermal_control else None,
         paged_kv_quantization=str(paged_kv_quantization) if paged_kv_quantization else None,
@@ -214,17 +217,25 @@ def apply_user_config(args: Any, *, config_path: str | Path | None = None) -> Us
     if command in RUNTIME_MODEL_COMMANDS:
         _apply_model_default(args, config)
         _apply_cache_default(args, config)
+        _apply_model_search_defaults(args, config)
         _apply_profile_default(args, config)
         _apply_runtime_defaults(args, config)
     elif command == "bench" and getattr(args, "bench_action", None) in {"run", "tune"}:
         _apply_model_default(args, config)
         _apply_cache_default(args, config)
+        _apply_model_search_defaults(args, config)
         _apply_profile_default(args, config)
         _apply_runtime_defaults(args, config)
     elif command in CACHE_COMMANDS:
         _apply_cache_default(args, config)
-    elif command == "doctor" and getattr(args, "model_cache", None) is None and config.model_dir:
-        args.model_cache = config.model_dir
+        _apply_model_search_defaults(args, config)
+    elif command in {"doctor", "report", "status"}:
+        if getattr(args, "model_cache", None) is None and config.model_dir:
+            args.model_cache = config.model_dir
+        _apply_model_search_defaults(args, config)
+    elif command == "forge":
+        if getattr(args, "model_root", None) is None:
+            args.model_root = config.model_dir
     return config
 
 
@@ -253,6 +264,16 @@ def _is_legacy_default_model_ref(model: str) -> bool:
 def _apply_cache_default(args: Any, config: UserConfig) -> None:
     if hasattr(args, "cache_dir") and getattr(args, "cache_dir", None) is None and config.model_dir:
         args.cache_dir = config.model_dir
+
+
+def _apply_model_search_defaults(args: Any, config: UserConfig) -> None:
+    if not hasattr(args, "model_search_dirs"):
+        return
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    if "model-search-dir" in cli_flags:
+        return
+    if config.model_dirs:
+        args.model_search_dirs = list(config.model_dirs)
 
 
 def _apply_profile_default(args: Any, config: UserConfig) -> None:

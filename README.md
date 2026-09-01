@@ -52,6 +52,28 @@ The dashboard shows what your model is doing while it does it: live tokens per s
 
 Chat is native, streams with thinking cards, takes file attachments, and can search the web. One click launches OpenCode, Pi, Hermes, Open WebUI, or anything else that speaks the OpenAI or Anthropic API against your local server. There is also a built-in AIME benchmark runner with fully disclosed, coaching-free prompts, so you can score a model yourself instead of trusting a chart.
 
+### Model libraries
+
+You can keep every model in one folder or configure several ordered folders in
+Settings under Model libraries. The primary folder receives downloads and
+Forge output. Additional folders are discovery roots, so external drives and
+existing collections stay in place. MTPLX remembers unavailable volumes and
+uses the first complete copy it finds in folder order.
+
+The CLI uses the same primary plus additional-root policy:
+
+```toml
+# ~/.mtplx/config.toml
+model_dir = "/Volumes/Models/MTPLX"
+model_dirs = ["/Volumes/Model Archive", "/Users/me/Models"]
+```
+
+`model_dir` is the writable primary root. `model_dirs` are ordered discovery
+roots. You can also repeat `--model-search-dir` on supported commands or set
+`MTPLX_MODEL_DIRS` to a colon-separated path list on macOS and Linux. Pulls and
+Forge builds always write to the primary root. CLI updates and removals in an
+additional root require selecting that root explicitly with `--cache-dir`.
+
 ## Auto-tune
 
 The right draft depth depends on your specific Mac: chip, memory bandwidth, thermals. During onboarding (and any time after), MTPLX runs the real model on your machine at each depth, with fans pinned for clean timing, and keeps autoregressive decoding as the baseline. If an MTP depth beats it, that depth is saved. If nothing beats the baseline, nothing is saved and the app says so. From the terminal it is one command:

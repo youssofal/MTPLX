@@ -499,11 +499,16 @@ class RetrievalRegistry:
         *,
         max_resident: int = DEFAULT_MAX_RESIDENT,
         cache_dir: str | Path | None = None,
+        search_dirs: Iterable[str | Path] | None = None,
         idle_timeout_s: float = 0.0,
         trust_remote_code: bool = False,
     ) -> None:
         self.max_resident = max(1, int(max_resident))
         self.cache_dir = cache_dir
+        # Snapshot discovery roots for this daemon lifecycle. Reordering app
+        # settings later must not silently retarget an already-registered
+        # retrieval model.
+        self.search_dirs = tuple(search_dirs or ())
         # 0 disables idle release entirely, which keeps a daemon that never
         # configured a timeout behaving exactly as before.
         self.idle_timeout_s = max(0.0, float(idle_timeout_s))
@@ -657,7 +662,10 @@ class RetrievalRegistry:
             return cached
         from .hf_loader import resolve_model_path
 
-        path = resolve_model_path(spec.model_ref, cache_dir=self.cache_dir)
+        resolve_kwargs: dict[str, Any] = {"cache_dir": self.cache_dir}
+        if self.search_dirs:
+            resolve_kwargs["search_dirs"] = self.search_dirs
+        path = resolve_model_path(spec.model_ref, **resolve_kwargs)
         key = str(Path(path).resolve())
         with self._lock:
             self._keys[spec.model_ref] = key
@@ -1005,9 +1013,15 @@ def registry_from_args(args: Any) -> RetrievalRegistry:
         or getattr(args, "cache_dir", None)
         or getattr(args, "model_dir", None)
     )
+    search_dirs = (
+        getattr(args, "retrieval_model_roots", None)
+        or getattr(args, "model_search_dirs", None)
+        or ()
+    )
     registry = RetrievalRegistry(
         max_resident=int(getattr(args, "retrieval_max_resident", DEFAULT_MAX_RESIDENT) or DEFAULT_MAX_RESIDENT),
         cache_dir=cache_dir,
+        search_dirs=search_dirs,
         idle_timeout_s=float(getattr(args, "retrieval_idle_timeout", 0) or 0),
         trust_remote_code=bool(getattr(args, "retrieval_trust_remote_code", False)),
     )

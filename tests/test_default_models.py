@@ -10,16 +10,13 @@ from mtplx.default_models import (
     QWEN38_FP16_SUFFIX,
     QWEN38_OPTIMIZED_SPEED_DESCRIPTION,
     QWEN38_OPTIMIZED_SPEED_MODEL_ENV,
-    OPTIMIZED_SPEED_DESCRIPTION,
     OPTIMIZED_SPEED_V2_DESCRIPTION,
     QUALITY_MODEL_ENV,
-    QWEN38_BARE_SPEED_MODEL_ENV,
     SPEED_MODEL_ENV,
     is_verified_default_model_ref,
     optimized_quality_model_ref,
     optimized_speed_model_ref,
     public_model_id_for_ref,
-    qwen38_bare_speed_model_ref,
     qwen38_optimized_speed_model_ref,
     select_default_model,
 )
@@ -40,7 +37,6 @@ from mtplx.profiles import (
     QWEN36_35B_OPTIMIZED_BALANCE_PUBLIC_MODEL_ID,
     QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
     QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
-    QWEN38_BARE_SPEED_HF_MODEL_ID,
     QWEN38_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
     QWEN38_OPTIMIZED_SPEED_HF_MODEL_ID,
     OPTIMIZED_SPEED_V2_HF_MODEL_ID,
@@ -258,6 +254,18 @@ def test_auto_default_prefers_complete_local_qwen38_without_changing_public_defa
     assert selection.hf_model == QWEN38_OPTIMIZED_SPEED_HF_MODEL_ID == DEFAULT_HF_MODEL_ID
     assert selection.variant == "speed"
     assert "installed locally" in selection.reason
+
+
+def test_default_model_discovery_checks_additional_library_roots(tmp_path, monkeypatch):
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    candidate_name = default_models_module._QWEN38_OPTIMIZED_SPEED_LOCAL_CANDIDATES[0]
+    local_qwen38 = _make_complete_model(archive / candidate_name.split("/")[-1])
+    monkeypatch.delenv(QWEN38_OPTIMIZED_SPEED_MODEL_ENV, raising=False)
+    monkeypatch.delenv(SPEED_MODEL_ENV, raising=False)
+    monkeypatch.setenv("MTPLX_MODEL_DIRS", str(archive))
+
+    assert qwen38_optimized_speed_model_ref() == str(local_qwen38)
 
 
 def test_auto_default_prefers_complete_local_qwen38_fp16_on_legacy_silicon(

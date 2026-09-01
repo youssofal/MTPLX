@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 import time
 from types import ModuleType, SimpleNamespace
@@ -10,11 +11,14 @@ from pathlib import Path
 import pytest
 
 from mtplx.hf_loader import (
+    RepoFile,
+    _safe_destination_for_repo_file,
     cached_model_is_complete,
     cached_model_path,
     hf_token_for_download,
     hf_cache_report,
     list_cached_models,
+    model_library_roots,
     pull_model,
     remove_cached_model,
     repo_id_from_model_ref,
@@ -159,6 +163,36 @@ def test_safe_model_name_and_cache_path(tmp_path: Path):
     assert cached_model_path("mtplx/example", cache_dir=tmp_path) == tmp_path / "mtplx--example"
 
 
+def _write_complete_model(root: Path, name: str = "mtplx--example") -> Path:
+    model = root / name
+    model.mkdir(parents=True)
+    (model / "config.json").write_text("{}\n", encoding="utf-8")
+    (model / "model.safetensors").write_bytes(b"weights")
+    return model
+
+
+def test_model_library_roots_are_ordered_canonical_and_deduplicated(
+    tmp_path: Path, monkeypatch
+):
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    third = tmp_path / "third"
+    secondary.mkdir()
+    alias = tmp_path / "secondary-alias"
+    alias.symlink_to(secondary, target_is_directory=True)
+    monkeypatch.setenv("MTPLX_MODEL_DIRS", f"{alias}{os.pathsep}{third}")
+
+    roots = model_library_roots(
+        primary, search_dirs=[secondary, primary, secondary]
+    )
+
+    assert roots == (
+        primary.resolve(),
+        secondary.resolve(),
+        third.resolve(),
+    )
+
+
 def test_resolve_model_path_uses_cache_for_hf_refs(tmp_path: Path):
     cached = tmp_path / "mtplx--example"
     cached.mkdir()
@@ -166,6 +200,31 @@ def test_resolve_model_path_uses_cache_for_hf_refs(tmp_path: Path):
     (cached / "model.safetensors").write_bytes(b"1234")
 
     assert resolve_model_path("mtplx/example", cache_dir=tmp_path) == cached
+
+
+def test_resolve_model_path_uses_first_complete_copy_and_explicit_path_first(
+    tmp_path: Path,
+):
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    third = tmp_path / "third"
+    partial = primary / "mtplx--example"
+    partial.mkdir(parents=True)
+    (partial / "config.json").write_text("{}\n", encoding="utf-8")
+    second_copy = _write_complete_model(secondary)
+    third_copy = _write_complete_model(third)
+
+    assert resolve_model_path(
+        "mtplx/example", cache_dir=primary, search_dirs=[secondary, third]
+    ) == second_copy
+    assert resolve_model_path(
+        str(third_copy), cache_dir=primary, search_dirs=[secondary]
+    ) == third_copy
+
+    (partial / "model.safetensors").write_bytes(b"weights")
+    assert resolve_model_path(
+        "mtplx/example", cache_dir=primary, search_dirs=[secondary, third]
+    ) == partial
 
 
 def test_resolve_model_path_rejects_unpinned_laguna_cache(tmp_path: Path):
@@ -685,6 +744,170 @@ def test_remove_cli_refuses_traversal_even_with_yes(tmp_path: Path, capsys):
     assert home.exists()
     assert (home / "config.toml").exists()
     assert (model / "weights.bin").read_bytes() == b"1234"
+
+
+def test_multi_root_inventory_retains_duplicate_paths_and_root_identity(tmp_path: Path):
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    first = _write_complete_model(primary)
+    second = _write_complete_model(secondary)
+
+    rows = list_cached_models(cache_dir=primary, search_dirs=[secondary])
+
+    assert [row.path for row in rows] == [first, second]
+    assert [row.root for row in rows] == [primary.resolve(), secondary.resolve()]
+    assert [row.root_index for row in rows] == [0, 1]
+    assert [row.is_primary for row in rows] == [True, False]
+
+
+def test_multi_root_inventory_dedupes_physical_aliases(tmp_path: Path):
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    model = _write_complete_model(primary)
+    secondary.mkdir()
+    (secondary / "mtplx--example").symlink_to(model, target_is_directory=True)
+
+    rows = list_cached_models(cache_dir=primary, search_dirs=[secondary])
+
+    assert [row.path for row in rows] == [model]
+
+
+def test_remove_multi_root_is_ambiguous_and_secondary_is_discovery_only(
+    tmp_path: Path,
+):
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    _write_complete_model(primary)
+    secondary_copy = _write_complete_model(secondary)
+
+    with pytest.raises(ValueError, match="multiple installed copies"):
+        remove_cached_model(
+            "mtplx/example", cache_dir=primary, search_dirs=[secondary]
+        )
+
+    (primary / "mtplx--example").rename(primary / "unrelated")
+    with pytest.raises(ValueError, match="discovery-only root"):
+        remove_cached_model(
+            "mtplx/example", cache_dir=primary, search_dirs=[secondary]
+        )
+    result = remove_cached_model("mtplx/example", cache_dir=secondary)
+    assert result["removed"] is True
+    assert not secondary_copy.exists()
+
+
+def test_remove_top_level_symlink_unlinks_without_touching_target(tmp_path: Path):
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    target = _write_complete_model(tmp_path / "external", name="real-model")
+    overlay = primary / "mtplx--example"
+    overlay.symlink_to(target, target_is_directory=True)
+
+    result = remove_cached_model("mtplx/example", cache_dir=primary)
+
+    assert result["removed"] is True
+    assert not overlay.exists()
+    assert target.is_dir()
+    assert (target / "model.safetensors").is_file()
+
+
+@pytest.mark.parametrize("model_ref", [".", "..", "--", "owner--..--model"])
+def test_remove_rejects_paths_that_escape_or_name_the_cache_root(
+    tmp_path: Path, model_ref: str
+):
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    marker = tmp_path / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid cached model reference"):
+        remove_cached_model(model_ref, cache_dir=primary)
+
+    assert primary.is_dir()
+    assert marker.read_text(encoding="utf-8") == "keep"
+
+
+def test_pull_writes_primary_even_when_complete_copy_exists_in_search_root(
+    tmp_path: Path, monkeypatch
+):
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    _write_complete_model(secondary)
+    monkeypatch.setenv("MTPLX_MODEL_DIRS", str(secondary))
+    _install_fake_hub(
+        monkeypatch,
+        {
+            "config.json": b"{}\n",
+            "model.safetensors": b"primary-weights",
+        },
+    )
+
+    result = pull_model(
+        "mtplx/example",
+        cache_dir=primary,
+        progress_callback=lambda _event: None,
+        progress_interval_s=0,
+    )
+
+    assert Path(result["path"]).parent == primary
+    assert (primary / "mtplx--example" / "model.safetensors").read_bytes() == b"primary-weights"
+
+
+def test_pull_rejects_top_level_symlink_destination(tmp_path: Path):
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    target = tmp_path / "target"
+    target.mkdir()
+    overlay = primary / "mtplx--example"
+    overlay.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="top-level symlink"):
+        pull_model("mtplx/example", cache_dir=primary)
+
+
+def test_pull_rejects_unsafe_filename_before_snapshot_write(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(
+        "mtplx.hf_loader._query_repo_snapshot",
+        lambda *_args, **_kwargs: (
+            "sha-new",
+            {"../escape": {"size": 1, "blob_id": "bad"}},
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(
+            snapshot_download=lambda **_kwargs: pytest.fail("must not write")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="unsafe file path"):
+        pull_model("mtplx/example", cache_dir=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "repo_path",
+    ["/tmp/escape", "../escape", "nested/../../escape", r"C:\\escape"],
+)
+def test_repo_file_destination_rejects_absolute_and_parent_paths(
+    tmp_path: Path, repo_path: str
+):
+    with pytest.raises(RuntimeError, match="unsafe file path"):
+        _safe_destination_for_repo_file(
+            tmp_path, RepoFile(path=repo_path, size_bytes=None)
+        )
+
+
+def test_repo_file_destination_rejects_nested_symlink_parent(tmp_path: Path):
+    destination = tmp_path / "model"
+    destination.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (destination / "nested").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="unsafe symlink component"):
+        _safe_destination_for_repo_file(
+            destination, RepoFile(path="nested/file.bin", size_bytes=None)
+        )
 
 
 def test_hf_cache_report_is_no_network(tmp_path: Path, monkeypatch):

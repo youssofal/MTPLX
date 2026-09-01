@@ -275,6 +275,7 @@ public struct ForgeBuilder: Sendable {
         public var outputDir: String
         public var runID: String
         public var maxFans: Bool
+        public var modelDirectory: String
         /// When true, frontend has explicitly acknowledged degraded
         /// MTP warning in PlanStage and the backend is asked to
         /// honour `mtpPolicy == .requantize`.
@@ -287,7 +288,8 @@ public struct ForgeBuilder: Sendable {
             outputDir: String,
             runID: String,
             maxFans: Bool = true,
-            allowDegradedMtp: Bool = false
+            allowDegradedMtp: Bool = false,
+            modelDirectory: String = ModelLibrary.defaultPrimaryDirectory().path
         ) {
             self.sourceRepo = sourceRepo
             self.recipe = recipe
@@ -296,6 +298,7 @@ public struct ForgeBuilder: Sendable {
             self.runID = runID
             self.maxFans = maxFans
             self.allowDegradedMtp = allowDegradedMtp
+            self.modelDirectory = ModelLibrary.canonicalURL(for: modelDirectory).path
         }
     }
 
@@ -371,6 +374,7 @@ public struct ForgeBuilder: Sendable {
                 "--run-id", request.runID,
                 "--recipe", recipeJSON,
                 "--branded-name", request.brandedName,
+                "--model-root", request.modelDirectory,
             ]
             if request.maxFans {
                 arguments.append("--max")
@@ -382,8 +386,11 @@ public struct ForgeBuilder: Sendable {
             let process = Process()
             process.executableURL = executable
             process.arguments = arguments
+            var environment = processEnvironment
+            environment["MTPLX_MODEL_DIR"] = request.modelDirectory
+            environment["MTPLX_FORGE_MODEL_ROOT"] = request.modelDirectory
             process.environment = MTPLXCommandBuilder.pythonBytecodeSafeEnvironment(
-                environment: processEnvironment
+                environment: environment
             )
 
             let errPipe = Pipe()
