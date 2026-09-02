@@ -242,6 +242,17 @@ def inject_mimo_mtp_support(
 
     _quantize_for_loaded_weights(mtp, config, mapped)
     mtp.load_weights(list(mapped.items()), strict=False)
+    if "lm_head.weight" not in mapped:
+        # MiMo shares the trunk output head with the MTP layer, matching
+        # vLLM's mimo_mtp. _MiMOMTP still declares its own lm_head, which is
+        # only ever filled by the trunk-shard path in _candidate_weight_files.
+        # A forged artifact stores the head in mtp.safetensors, and that path
+        # returns the sidecar alone, so lm_head stayed randomly initialised
+        # and load_weights(strict=False) bound it without complaint. Every
+        # contract candidate then scored zero agreement.
+        trunk_head = getattr(model, "lm_head", None)
+        if trunk_head is not None:
+            mtp.lm_head = trunk_head
     mx.eval(mtp.parameters())
 
     original_outer_class = model.__class__
@@ -290,7 +301,10 @@ def inject_mimo_mtp_support(
                 embed_tokens=self.model.embed_tokens,
                 cache=layer_cache,
             )
-            logits = self.mtp.lm_head(hidden)
+            if self.args.tie_word_embeddings:
+                logits = self.model.embed_tokens.as_linear(hidden)
+            else:
+                logits = self.mtp.lm_head(hidden)
             if not return_hidden:
                 return logits
             return logits, hidden
