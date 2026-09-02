@@ -151,6 +151,53 @@ def _num_mtp_layers(config: dict[str, Any]) -> int:
     )
 
 
+def appended_mtp_layer_range(config: dict[str, Any]) -> range:
+    """Layer indices holding an appended-layer MTP head.
+
+    GLM MoE checkpoints ship the MTP head as extra decoder layers starting
+    at ``num_hidden_layers`` (``model.layers.47.*`` for GLM-4.7-Flash),
+    rather than under an ``mtp.`` prefix.  Returns an empty range when the
+    config does not describe that layout.
+    """
+    tcfg = text_config(config)
+    start = int(tcfg.get("num_hidden_layers") or config.get("num_hidden_layers") or 0)
+    count = _num_mtp_layers(config)
+    if start <= 0 or count <= 0:
+        return range(0)
+    return range(start, start + count)
+
+
+def is_mtp_layers_namespace_key(key: str, config: dict[str, Any]) -> bool:
+    """Match an MTP head kept in its own ``model.mtp_layers.N.`` namespace.
+
+    MiMo stores the head neither under an ``mtp.`` prefix nor as an appended
+    decoder layer, but in a separate namespace beside ``model.layers.*``.
+    ``mimo_mtp_patch`` already reads that form, so extraction only has to
+    select the keys; no rewrite is needed.
+    """
+    text = str(key)
+    count = _num_mtp_layers(config)
+    return count > 0 and any(
+        text.startswith(f"model.mtp_layers.{index}.") for index in range(count)
+    )
+
+
+def uses_mtp_layers_namespace(config: dict[str, Any]) -> bool:
+    return _num_mtp_layers(config) > 0
+
+
+def uses_appended_layer_mtp(config: dict[str, Any]) -> bool:
+    return len(appended_mtp_layer_range(config)) > 0
+
+
+def is_appended_layer_mtp_key(key: str, config: dict[str, Any]) -> bool:
+    text = str(key)
+    return any(
+        text.startswith(f"model.layers.{index}.")
+        for index in appended_mtp_layer_range(config)
+    )
+
+
 def _qwen_moe_numbered_expert_keys(
     config: dict[str, Any],
     *,

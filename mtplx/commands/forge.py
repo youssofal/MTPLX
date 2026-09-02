@@ -1636,6 +1636,7 @@ def _ensure_mtp_sidecar(source: Path, destination: Path) -> bool:
         return _extract_embedded_mtp(
             source,
             target,
+            config=config,
             sanitize_values=_should_sanitize_extracted_mtp_weights(config),
         )
     return False
@@ -1660,6 +1661,7 @@ def _extract_embedded_mtp(
     source: Path,
     target: Path,
     *,
+    config: dict[str, Any] | None = None,
     sanitize_values: bool = False,
 ) -> bool:
     index_path = source / "model.safetensors.index.json"
@@ -1669,7 +1671,38 @@ def _extract_embedded_mtp(
     weight_map = index.get("weight_map") if isinstance(index, dict) else None
     if not isinstance(weight_map, dict):
         return False
+
+    if config is None:
+        config_path = source / "config.json"
+        try:
+            config = _load_json(config_path) if config_path.exists() else {}
+        except Exception:
+            config = {}
+
+    # Prefix-keyed heads (Qwen, Gemma) win: their layout is unambiguous and
+    # predates this branch.  Only when no "mtp." key exists do we look for an
+    # appended-layer head (GLM MoE), whose keys stay unnormalised because
+    # glm_mtp_patch derives the local MTP index from the literal
+    # "model.layers.{start+i}." form.
     mtp_keys = [key for key in weight_map if artifacts.is_mtp_key(str(key))]
+    key_transform: Callable[[str], str] | None = artifacts.normalize_mtp_key
+    if not mtp_keys and artifacts.uses_appended_layer_mtp(config):
+        mtp_keys = [
+            key
+            for key in weight_map
+            if artifacts.is_appended_layer_mtp_key(str(key), config)
+        ]
+        key_transform = None
+    if not mtp_keys and artifacts.uses_mtp_layers_namespace(config):
+        # MiMo keeps the head in its own "model.mtp_layers.N." namespace beside
+        # the decoder stack.  mimo_mtp_patch reads that form directly, so the
+        # keys stay unnormalised here too.
+        mtp_keys = [
+            key
+            for key in weight_map
+            if artifacts.is_mtp_layers_namespace_key(str(key), config)
+        ]
+        key_transform = None
     if not mtp_keys:
         return False
 
@@ -1681,7 +1714,7 @@ def _extract_embedded_mtp(
         source,
         by_file,
         target,
-        key_transform=artifacts.normalize_mtp_key,
+        key_transform=key_transform,
         sanitize_values=sanitize_values,
     )
     return True
