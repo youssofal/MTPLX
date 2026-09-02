@@ -662,6 +662,29 @@ def test_normalize_reasoning_effort_accepts_xhigh() -> None:
         srv._normalize_reasoning_effort("ultra")
 
 
+def test_normalize_reasoning_effort_maps_openai_off_values() -> None:
+    """OpenAI's off-ish effort values resolve instead of 400-ing the request.
+
+    Clients hardcode them and do not expose a picker: Cherry Studio's
+    translate pane sends one on every call, so the whole pane failed against
+    a server whose vocabulary starts at `low`. None of them can mean "no
+    reasoning" here -- that is `reasoning: off` or
+    chat_template_kwargs.enable_thinking -- so the lowest level is the
+    closest answer this field can give.
+    """
+
+    from mtplx.reasoning_effort import REASONING_EFFORT_LEVELS
+    from mtplx.server import openai as srv
+
+    lowest = REASONING_EFFORT_LEVELS[0]
+    for alias in ("minimal", "none", "off", "disable", "disabled", "NONE", " none "):
+        assert srv._normalize_reasoning_effort(alias) == lowest, alias
+    for level in REASONING_EFFORT_CHOICES:
+        assert srv._normalize_reasoning_effort(level) == level, level
+    with pytest.raises(ValueError):
+        srv._normalize_reasoning_effort("banana")
+
+
 def test_reasoning_effort_vocabulary_covers_every_family() -> None:
     """No family may advertise a level the writing surfaces would reject.
 
