@@ -142,7 +142,9 @@ struct ComposerInputTextView: NSViewRepresentable {
             width: visibleWidth,
             height: CGFloat.greatestFiniteMagnitude
         )
-        let targetHeight = max(measuredHeight, minHeight)
+        // The document must remain taller than the viewport for long drafts.
+        // Height is measured below; synchronizing the width must not collapse it.
+        let targetHeight = max(textView.frame.height, minHeight)
         if abs(textView.frame.width - visibleWidth) > 0.5
             || abs(textView.frame.height - targetHeight) > 0.5 {
             textView.frame = NSRect(
@@ -160,16 +162,17 @@ struct ComposerInputTextView: NSViewRepresentable {
         layoutManager.ensureLayout(for: textContainer)
         let usedHeight = layoutManager.usedRect(for: textContainer).height
         let contentHeight = usedHeight + textView.textContainerInset.height * 2
-        let clampedHeight = min(max(contentHeight, minHeight), maxHeight)
+        let documentHeight = max(contentHeight, minHeight)
+        let clampedHeight = min(documentHeight, maxHeight)
         let visibleWidth = max(
             textView.enclosingScrollView?.contentSize.width ?? textView.bounds.width,
             1
         )
         if abs(textView.frame.width - visibleWidth) > 0.5
-            || abs(textView.frame.height - clampedHeight) > 0.5 {
+            || abs(textView.frame.height - documentHeight) > 0.5 {
             textView.frame = NSRect(
                 origin: .zero,
-                size: NSSize(width: visibleWidth, height: clampedHeight)
+                size: NSSize(width: visibleWidth, height: documentHeight)
             )
         }
         if abs(measuredHeight - clampedHeight) > 0.5 {
