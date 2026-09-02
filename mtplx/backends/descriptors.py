@@ -1211,6 +1211,14 @@ def model_family_from_inspection(
         return "deepseek"
     if backend_id == GLM_MTP_DESCRIPTOR.backend_id or "glm" in text:
         return "glm"
+    if "mimo" in text:
+        # mimo-mtp has shipped a native backend with can_run_verified since
+        # before this function existed, but no branch here ever returned its
+        # family, so every MiMo artifact resolved to "unknown" and forge build
+        # exited 1 at the tune gate after a successful convert and calibrate.
+        # The marker text carries model_type and arch_id, not just the folder
+        # name, so this reads the artifact rather than guessing from a path.
+        return "mimo"
     if "lfm2" in text:
         return "lfm2"
     family = _explicit_qwen_family_marker(text)
@@ -1250,6 +1258,11 @@ def tune_policy_for_model(
         return GEMMA4_ASSISTANT_DESCRIPTOR.tune_policy
     if family == "step":
         return STEP3P5_MTP_DESCRIPTOR.tune_policy
+    if family == "mimo":
+        # D1 only: mimo_mtp_patch.mtp_forward raises on mtp_depth > 1, and
+        # vLLM's proposer is single-token too, so offering D2+ would advertise
+        # depths the backend refuses.
+        return TunePolicy(supported=True, candidates=("AR", "D1"))
     return TunePolicy(
         supported=False,
         unsupported_reason="Tune is supported for Qwen 3.5, Qwen 3.6, Qwen 3.8, and Gemma 4 MTPLX models only.",
