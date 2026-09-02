@@ -1113,6 +1113,7 @@ def _cmd_build(args: Any) -> int:
 
     existing_runtime = _read_runtime(destination) or _read_runtime(source_path)
     require_all_depths = True
+    verify_depths = _forge_verify_depths(destination)
     rows = _verify_rows_from_runtime(existing_runtime)
     calibration_diagnostic: str | None = None
     has_saved_contract = _runtime_has_mtp_contract(existing_runtime, destination)
@@ -1124,6 +1125,7 @@ def _cmd_build(args: Any) -> int:
             model_path=destination,
             source_path=source_path,
             require_all_depths=require_all_depths,
+            verify_depths=verify_depths,
         )
         if has_saved_contract or has_legacy_speed_grid
         else "missing saved MTP contract"
@@ -1156,7 +1158,9 @@ def _cmd_build(args: Any) -> int:
         )
     if not rows:
         raise ForgeError("verification produced no usable AR/MTP rows")
-    _require_verify_rows(rows, require_all_depths=require_all_depths)
+    _require_verify_rows(
+        rows, require_all_depths=require_all_depths, verify_depths=verify_depths
+    )
     _require_speed_win_or_write_outcome(
         destination,
         run,
@@ -2572,7 +2576,7 @@ def _run_verify(
         "--run-id",
         tune_run_id,
         "--depths",
-        "1,2,3",
+        ",".join(str(depth) for depth in _forge_verify_depths(model_path)),
         "--max-tokens",
         str(max(1, int(max_tokens))),
         "--prompt-suite",
@@ -3142,18 +3146,45 @@ def _annotate_verify_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return annotated
 
 
-def _verify_rows_have_all_depths(rows: list[dict[str, Any]]) -> bool:
-    depths = {int(row.get("depth") or 0) for row in rows if isinstance(row, dict)}
-    return all(depth in depths for depth in (0, 1, 2, 3))
+DEFAULT_FORGE_VERIFY_DEPTHS = (1, 2, 3)
+
+
+def _forge_verify_depths(model_path: Path) -> tuple[int, ...]:
+    """Depths forge asks tune to measure, taken from the model's tune policy.
+
+    Backends do not all reach D3. MiMo drafts one token per step, so a fixed
+    1,2,3 makes tune reject the whole run with "tune depths must be one of 1".
+    """
+    from mtplx.backends.descriptors import tune_policy_for_model
+
+    try:
+        policy = tune_policy_for_model(model_ref=str(model_path))
+    except Exception:
+        return DEFAULT_FORGE_VERIFY_DEPTHS
+    depths = tuple(
+        int(candidate[1:])
+        for candidate in getattr(policy, "candidates", ())
+        if str(candidate).startswith("D") and str(candidate)[1:].isdigit()
+    )
+    return depths or DEFAULT_FORGE_VERIFY_DEPTHS
+
+
+def _verify_rows_have_all_depths(
+    rows: list[dict[str, Any]],
+    depths: tuple[int, ...] = DEFAULT_FORGE_VERIFY_DEPTHS,
+) -> bool:
+    present = {int(row.get("depth") or 0) for row in rows if isinstance(row, dict)}
+    return all(depth in present for depth in (0, *depths))
 
 
 def _require_verify_rows(
     rows: list[dict[str, Any]],
     *,
     require_all_depths: bool = False,
+    verify_depths: tuple[int, ...] = DEFAULT_FORGE_VERIFY_DEPTHS,
 ) -> None:
     depths = {int(row.get("depth") or 0) for row in rows if isinstance(row, dict)}
-    required = (0, 1, 2, 3) if require_all_depths else (0,)
+    required = (0, *verify_depths) if require_all_depths else (0,)
     missing = [depth for depth in required if depth not in depths]
     if missing:
         raise ForgeError(
@@ -3193,11 +3224,13 @@ def _saved_verify_rows_reuse_blocker(
     model_path: Path,
     source_path: Path | None = None,
     require_all_depths: bool,
+    verify_depths: tuple[int, ...] = DEFAULT_FORGE_VERIFY_DEPTHS,
 ) -> str | None:
     if not rows:
         return "missing saved verification rows"
-    if require_all_depths and not _verify_rows_have_all_depths(rows):
-        return "saved verification is missing AR/D1/D2/D3 rows"
+    if require_all_depths and not _verify_rows_have_all_depths(rows, verify_depths):
+        expected = ", ".join(["AR", *(f"D{depth}" for depth in verify_depths)])
+        return f"saved verification is missing {expected} rows"
     if not any(int(row.get("depth") or 0) > 0 for row in rows):
         return "saved verification has no MTP depth rows"
     if any(row.get("hit_token_budget") for row in rows):
