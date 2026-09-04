@@ -5710,13 +5710,15 @@ def cmd_pull_public(args: Any) -> int:
         )
         progress_interval_s = 0.4
     try:
-        result = pull_model(
-            args.model,
-            cache_dir=args.cache_dir,
-            revision=args.revision,
-            progress_callback=callback,
-            progress_interval_s=progress_interval_s,
-        )
+        pull_kwargs = {
+            "cache_dir": args.cache_dir,
+            "revision": args.revision,
+            "progress_callback": callback,
+            "progress_interval_s": progress_interval_s,
+        }
+        if hasattr(args, "download_backend"):
+            pull_kwargs["download_backend"] = args.download_backend
+        result = pull_model(args.model, **pull_kwargs)
     except KeyboardInterrupt:
         finalize()
         if progress_json:

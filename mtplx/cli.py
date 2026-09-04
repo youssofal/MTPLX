@@ -3348,6 +3348,12 @@ def build_parser() -> argparse.ArgumentParser:
     pull_p.add_argument("--cache-dir")
     pull_p.add_argument("--revision")
     pull_p.add_argument(
+        "--download-backend",
+        choices=("auto", "python", "aria2"),
+        default="auto",
+        help="Download engine. auto uses aria2c when installed.",
+    )
+    pull_p.add_argument(
         "--json", action="store_true", help="Emit machine-readable JSON"
     )
     pull_p.add_argument(

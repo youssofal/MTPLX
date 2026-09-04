@@ -8314,12 +8314,19 @@ def test_pull_progress_json_emits_ndjson_events(tmp_path, monkeypatch, capsys):
     import mtplx.hf_loader as hf_loader
 
     def fake_pull_model(
-        model, *, cache_dir, revision, progress_callback, progress_interval_s
+        model,
+        *,
+        cache_dir,
+        revision,
+        progress_callback,
+        progress_interval_s,
+        download_backend,
     ):
         assert model == "mtplx/example"
         assert cache_dir == str(tmp_path)
         assert revision is None
         assert progress_interval_s == 0.4
+        assert download_backend == "auto"
         progress_callback(
             {
                 "event": "start",
