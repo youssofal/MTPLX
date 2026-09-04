@@ -327,3 +327,281 @@ class TestBlockPrefixRestorableEntries:
         assert receipt is not None
         assert receipt["reusable_prefix_tokens"] == 0
         assert bank.cleared_sessions == ["gate"]
+
+
+class _LiveSession:
+    def __init__(self, committed):
+        self.committed_token_ids = tuple(int(t) for t in committed)
+
+
+def _state_with_live(committed, *, near=None, common=None):
+    """Fake EngineSessionManager exposing the resolution ladder: exact
+    containment, then (near, matched) / (common, matched) tuples."""
+    state = _state()
+    live = _LiveSession(committed)
+
+    def longest_prefix_session(token_ids):
+        tokens = tuple(int(t) for t in token_ids)
+        prefix = live.committed_token_ids
+        if prefix and len(prefix) <= len(tokens) and tokens[: len(prefix)] == prefix:
+            return live
+        return None
+
+    state.sessions = SimpleNamespace(
+        longest_prefix_session=longest_prefix_session,
+        pending_near_prefix_session=lambda token_ids: near or (None, 0),
+        best_common_prefix_session=lambda token_ids: common or (None, 0),
+    )
+    return state
+
+
+class TestLiveSessionPrefix:
+    """#447, receipt 2: a warm 212k session whose newest turns were never
+    banked (snapshot commits refused on retokenized-history mismatch) read
+    as a full miss, was cleared as "superseded", and every client retry was
+    a 211,807-token cold miss. The engine's live sessions are the state the
+    request actually reuses; the shed must ask them too."""
+
+    def test_live_prefix_under_the_miss_floor_leaves_the_guard_inert(
+        self, monkeypatch
+    ):
+        _pin_live_stats(monkeypatch, active=92 * GIB, cache=GIB // 2)
+        prompt = list(range(100_000))
+        state = _state_with_live(prompt[:97_000])
+        entry = _Entry(list(range(500_000, 500_040)), "warm", 4 * GIB)
+        bank = _Bank([entry])
+        assert _shed(state, prompt, bank, "warm") is None
+        assert bank.cleared_sessions == []
+        assert entry in bank.entries
+
+    def test_live_prefix_pins_instead_of_clearing(self, monkeypatch):
+        _pin_live_stats(monkeypatch, active=92 * GIB, cache=GIB // 2)
+        prompt = list(range(100_000))
+        state = _state_with_live(prompt[:60_000])
+        entry = _Entry(list(range(500_000, 500_040)), "warm", 4 * GIB)
+        bank = _Bank([entry])
+        receipt = _shed(state, prompt, bank, "warm")
+        assert receipt is not None
+        assert receipt["reusable_prefix_mode"] == "live_session"
+        assert receipt["reusable_prefix_tokens"] == 60_000
+        assert receipt["miss_tokens"] == 40_000
+        assert bank.cleared_sessions == []
+        assert "warm" in bank.touched
+
+    def test_live_prefix_yields_to_the_export(self, monkeypatch):
+        monkeypatch.setenv("MTPLX_PREFILL_ADMISSION_LIVE_PREFIX", "0")
+        _pin_live_stats(monkeypatch, active=92 * GIB, cache=GIB // 2)
+        prompt = list(range(100_000))
+        state = _state_with_live(prompt[:60_000])
+        entry = _Entry(list(range(500_000, 500_040)), "warm", 4 * GIB)
+        bank = _Bank([entry])
+        receipt = _shed(state, prompt, bank, "warm")
+        assert receipt is not None
+        assert receipt["reusable_prefix_mode"] == "none"
+        assert bank.cleared_sessions == ["warm"]
+
+    def test_state_without_sessions_keeps_the_bank_estimate(self, monkeypatch):
+        _pin_live_stats(monkeypatch, active=92 * GIB, cache=GIB // 2)
+        prompt = list(range(100_000))
+        entry = _Entry(list(range(500_000, 500_040)), "warm", 4 * GIB)
+        bank = _Bank([entry])
+        receipt = _shed(_state(), prompt, bank, "warm")
+        assert receipt is not None
+        assert receipt["reusable_prefix_mode"] == "none"
+        assert bank.cleared_sessions == ["warm"]
+
+
+class _ChainBank(_Bank):
+    """Active-protecting bank: shrink_to_bytes honors protect_active the way
+    the real bank does (touched sessions are the active set), and the chain
+    walk keeps each session's longest entry plus the protect_tokens match."""
+
+    def __init__(self, entries):
+        super().__init__(entries)
+        self.chain_calls: list[tuple[int, str]] = []
+
+    def shrink_to_bytes(self, target_bytes, *, reason="", protect_active=False):
+        self.shrink_calls.append((int(target_bytes), reason, protect_active))
+        evicted = 0
+        active = set(self.touched)
+        while self.entries and self.total_nbytes > int(target_bytes):
+            candidates = [
+                e
+                for e in self.entries
+                if not (protect_active and e.session_id in active)
+            ]
+            if not candidates:
+                break
+            self.entries.remove(candidates[0])
+            evicted += 1
+        return evicted
+
+    def shrink_for_admission(self, target_bytes, *, protect_tokens=None, reason=""):
+        self.chain_calls.append((int(target_bytes), reason))
+        protected = set()
+        if protect_tokens:
+            tokens = tuple(int(t) for t in protect_tokens)
+            best, best_common = None, 0
+            for e in self.entries:
+                common = 0
+                for left, right in zip(tokens, e.token_ids):
+                    if left != right:
+                        break
+                    common += 1
+                if common > best_common:
+                    best, best_common = e, common
+            if best is not None:
+                protected.add(id(best))
+        non_terminal = 0
+        while self.entries and self.total_nbytes > int(target_bytes):
+            terminal = {}
+            for e in self.entries:
+                key = e.session_id or ""
+                terminal[key] = max(terminal.get(key, -1), len(e.token_ids))
+            candidates = [
+                e
+                for e in self.entries
+                if id(e) not in protected
+                and len(e.token_ids) < terminal.get(e.session_id or "", -1)
+            ]
+            if not candidates:
+                break
+            self.entries.remove(candidates[0])
+            non_terminal += 1
+        terminals = 0
+        while self.entries and self.total_nbytes > int(target_bytes):
+            candidates = [e for e in self.entries if id(e) not in protected]
+            if not candidates:
+                break
+            self.entries.remove(candidates[0])
+            terminals += 1
+        return non_terminal, terminals
+
+
+class TestChainPrefixEscalation:
+    """#447, receipt 1: 12.6 GiB of a deep session's own sibling snapshots
+    were active-protected, the LRU pass evicted nothing, and a warm turn
+    with a 23k miss died on the sustained-pressure 507."""
+
+    def _fixture(self):
+        prompt = list(range(100_000))
+        exact = _Entry(prompt[:50_000], "deep", 2 * GIB)
+        terminal = _Entry(prompt[:49_000] + list(range(700_000, 711_000)), "deep", 3 * GIB)
+        sibling = _Entry(prompt[:30_000] + list(range(800_000, 800_400)), "deep", 6 * GIB)
+        return prompt, exact, terminal, sibling
+
+    def test_sibling_snapshots_are_walked_when_lru_is_protected(
+        self, monkeypatch
+    ):
+        _pin_live_stats(monkeypatch, active=92 * GIB, cache=GIB // 2)
+        prompt, exact, terminal, sibling = self._fixture()
+        bank = _ChainBank([exact, terminal, sibling])
+        receipt = _shed(_state(), prompt, bank, "deep")
+        assert receipt is not None
+        assert receipt["reusable_prefix_tokens"] == 50_000
+        assert receipt["lru_entries_evicted"] == 0
+        assert receipt["chain_entries_evicted"] == 1
+        assert receipt["terminal_entries_evicted"] == 0
+        assert sibling not in bank.entries
+        assert exact in bank.entries
+        assert terminal in bank.entries
+        assert receipt["bank_bytes_after"] == 5 * GIB
+
+    def test_chain_walk_yields_to_the_export(self, monkeypatch):
+        monkeypatch.setenv("MTPLX_PREFILL_ADMISSION_CHAIN_SHED", "0")
+        _pin_live_stats(monkeypatch, active=92 * GIB, cache=GIB // 2)
+        prompt, exact, terminal, sibling = self._fixture()
+        bank = _ChainBank([exact, terminal, sibling])
+        receipt = _shed(_state(), prompt, bank, "deep")
+        assert receipt is not None
+        assert "chain_entries_evicted" not in receipt
+        assert bank.chain_calls == []
+        assert sibling in bank.entries
+
+    def test_bank_without_the_method_is_tolerated(self, monkeypatch):
+        _pin_live_stats(monkeypatch, active=92 * GIB, cache=GIB // 2)
+        prompt, exact, terminal, sibling = self._fixture()
+        bank = _Bank([exact, terminal, sibling])
+        bank.shrink_to_bytes = lambda *a, **k: 0
+        receipt = _shed(_state(), prompt, bank, "deep")
+        assert receipt is not None
+        assert "chain_entries_evicted" not in receipt
+
+
+class TestLiveSessionLadder:
+    """The resolution ladder: a mutated history (retokenized turns, the
+    #446 fork shape) misses exact containment but is still served by the
+    pending-near-prefix and best-common lookups; the shed's estimate must
+    follow the same ladder or it reads a warm engine as a full miss."""
+
+    def test_pending_near_prefix_serves_the_estimate(self, monkeypatch):
+        _pin_live_stats(monkeypatch, active=92 * GIB, cache=GIB // 2)
+        prompt = list(range(100_000))
+        state = _state_with_live((), near=(_LiveSession(prompt[:60_000]), 60_000))
+        bank = _Bank([])
+        receipt = _shed(state, prompt, bank, "warm")
+        assert receipt is not None
+        assert receipt["reusable_prefix_mode"] == "live_session"
+        expected = srv._block_restorable_prefix_tokens(60_000)
+        assert receipt["reusable_prefix_tokens"] == expected
+        assert bank.cleared_sessions == []
+
+    def test_best_common_serves_the_estimate(self, monkeypatch):
+        _pin_live_stats(monkeypatch, active=92 * GIB, cache=GIB // 2)
+        prompt = list(range(100_000))
+        state = _state_with_live((), common=(_LiveSession(prompt[:60_000]), 60_000))
+        bank = _Bank([])
+        receipt = _shed(state, prompt, bank, "warm")
+        assert receipt is not None
+        assert receipt["reusable_prefix_mode"] == "live_session"
+        assert receipt["reusable_prefix_tokens"] == srv._block_restorable_prefix_tokens(60_000)
+
+    def test_exact_wins_over_the_tolerant_rungs(self, monkeypatch):
+        _pin_live_stats(monkeypatch, active=92 * GIB, cache=GIB // 2)
+        prompt = list(range(100_000))
+        state = _state_with_live(
+            prompt[:60_000], common=(_LiveSession(prompt[:10_000]), 10_000)
+        )
+        bank = _Bank([])
+        receipt = _shed(state, prompt, bank, "warm")
+        assert receipt is not None
+        assert receipt["reusable_prefix_tokens"] == 60_000
+
+    def test_ladder_exceptions_never_cost_the_request(self, monkeypatch):
+        _pin_live_stats(monkeypatch, active=92 * GIB, cache=GIB // 2)
+        prompt = list(range(100_000))
+        state = _state()
+
+        def boom(token_ids):
+            raise RuntimeError("probe blew up")
+
+        state.sessions = SimpleNamespace(
+            longest_prefix_session=boom,
+            pending_near_prefix_session=boom,
+            best_common_prefix_session=boom,
+        )
+        bank = _Bank([])
+        receipt = _shed(state, prompt, bank, "warm")
+        assert receipt is not None
+        assert receipt["reusable_prefix_mode"] == "none"
+
+
+class TestTerminalPhase:
+    """Phase 2 (#447): when non-terminal walking cannot cover the deficit
+    (every fork is its own session's terminal — the post-#446 shape), the
+    walk takes remaining entries rather than letting the request die, but
+    never the entry the imminent prompt restores from."""
+
+    def test_other_terminals_fall_when_siblings_are_not_enough(self, monkeypatch):
+        _pin_live_stats(monkeypatch, active=92 * GIB, cache=GIB // 2)
+        prompt = list(range(100_000))
+        exact = _Entry(prompt[:50_000], "deep", 2 * GIB)
+        fork = _Entry(prompt[:20_000] + list(range(900_000, 950_000)), "fork-session", 6 * GIB)
+        bank = _ChainBank([exact, fork])
+        bank.touched.append("fork-session")  # recently active: LRU pass skips it
+        receipt = _shed(_state(), prompt, bank, "deep")
+        assert receipt is not None
+        assert receipt["chain_entries_evicted"] == 0
+        assert receipt["terminal_entries_evicted"] == 1
+        assert fork not in bank.entries
+        assert exact in bank.entries

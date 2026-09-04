@@ -17435,6 +17435,18 @@ def _prefill_admission_min_miss_tokens() -> int:
         return 4096
 
 
+def _prefill_admission_live_prefix_enabled() -> bool:
+    return os.environ.get(
+        "MTPLX_PREFILL_ADMISSION_LIVE_PREFIX", "1"
+    ).strip().lower() not in {"0", "off", "false", "no"}
+
+
+def _prefill_admission_chain_shed_enabled() -> bool:
+    return os.environ.get(
+        "MTPLX_PREFILL_ADMISSION_CHAIN_SHED", "1"
+    ).strip().lower() not in {"0", "off", "false", "no"}
+
+
 # Same line as _allocator_pressure_level's WARNING edge: at >=97% of the
 # Metal limit the next growth step swaps.
 _PREFILL_ADMISSION_PRESSURE_FRACTION = 0.97
@@ -17555,6 +17567,56 @@ def _prefill_admission_shed(
                 if block_tokens > reused_tokens:
                     reused_tokens = block_tokens
                     reused_mode = "block_prefix"
+        # The bank is not the only holder of reusable state: the engine's
+        # live sessions serve a committed prefix directly (that is what a
+        # warm turn's cached_tokens reads), and a live frontier can be
+        # unbanked — a refused snapshot (retokenized-history mismatch)
+        # banks nothing while the live KV still serves. Estimating from
+        # the bank alone read a warm 212k-token session as a full miss,
+        # cleared its snapshots as "superseded", and every client retry
+        # was then a 211,807-token cold miss that could never be admitted
+        # until a server restart (#447).
+        if _prefill_admission_live_prefix_enabled():
+            sessions = getattr(state, "sessions", None)
+            live_tokens = 0
+            if sessions is not None:
+                # Ask the same ladder session resolution asks (exact, then
+                # pending-postcommit near prefix, then best common prefix),
+                # with the non-exact answers rewound to the block floor the
+                # bank estimate above uses — the reuse a request achieves
+                # is never more optimistic than resolution's own match.
+                try:
+                    exact_fn = getattr(sessions, "longest_prefix_session", None)
+                    live = exact_fn(prompt_ids) if callable(exact_fn) else None
+                    if live is not None:
+                        live_tokens = len(
+                            getattr(live, "committed_token_ids", ()) or ()
+                        )
+                    if live_tokens <= 0:
+                        near_fn = getattr(
+                            sessions, "pending_near_prefix_session", None
+                        )
+                        if callable(near_fn):
+                            near, matched = near_fn(prompt_ids)
+                            if near is not None:
+                                live_tokens = _block_restorable_prefix_tokens(
+                                    int(matched)
+                                )
+                    if live_tokens <= 0:
+                        common_fn = getattr(
+                            sessions, "best_common_prefix_session", None
+                        )
+                        if callable(common_fn):
+                            shared, matched = common_fn(prompt_ids)
+                            if shared is not None:
+                                live_tokens = _block_restorable_prefix_tokens(
+                                    int(matched)
+                                )
+                except Exception:
+                    live_tokens = 0
+            if live_tokens > reused_tokens:
+                reused_tokens = int(live_tokens)
+                reused_mode = "live_session"
         miss_tokens = max(0, prompt_tokens - reused_tokens)
         if miss_tokens < _prefill_admission_min_miss_tokens():
             return None
@@ -17601,6 +17663,38 @@ def _prefill_admission_shed(
                             protect_active=True,
                         )
                     )
+                # Escalation between the protected LRU pass and giving up
+                # (#447): a deep session's sibling snapshots — forked
+                # generations of the same conversation that no put()-time
+                # supersede collapses — are active-protected above, so a
+                # 12.6 GiB bank served a 7 GiB deficit with zero evictions
+                # and the request died on the sustained-pressure 507. Walk
+                # those chain prefixes (never a session's terminal entry,
+                # never the entry this prompt restores from; the SSD cold
+                # tier keeps every eviction restorable) before letting the
+                # prefill start into a projection that crosses the line.
+                if _prefill_admission_chain_shed_enabled():
+                    bank_bytes_now = int(session_bank.total_nbytes)
+                    remaining = deficit - max(
+                        0, bank_bytes_before - bank_bytes_now
+                    )
+                    chain_fn = getattr(
+                        session_bank, "shrink_for_admission", None
+                    )
+                    if (
+                        remaining > 0
+                        and bank_bytes_now > 0
+                        and callable(chain_fn)
+                    ):
+                        chain_evicted, terminal_evicted = chain_fn(
+                            max(0, bank_bytes_now - remaining),
+                            protect_tokens=prompt_ids,
+                            reason="prefill_admission_chain",
+                        )
+                        receipt["chain_entries_evicted"] = int(chain_evicted)
+                        receipt["terminal_entries_evicted"] = int(
+                            terminal_evicted
+                        )
                 receipt["bank_bytes_after"] = int(session_bank.total_nbytes)
             except Exception as exc:
                 receipt["bank_error"] = repr(exc)
