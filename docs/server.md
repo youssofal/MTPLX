@@ -16,6 +16,8 @@ Endpoints:
 - `GET /metrics`
 - `GET /v1/models`
 - `POST /v1/chat/completions`
+- `POST /v1/responses` (Codex Responses compatibility with hosted tools
+  disabled; stateless text + client-executed function/custom/namespace tools)
 - `POST /v1/completions`
 - `POST /v1/messages`
 - `GET /admin/sessions`

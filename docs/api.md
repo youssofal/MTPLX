@@ -29,6 +29,37 @@ or returning a server 500.
 
 Legacy OpenAI completions.
 
+## `POST /v1/responses`
+
+Codex Responses compatibility with hosted tools disabled, through the same
+chat inference path. The adapter is stateless and text-only, supports
+structured text input, instructions, streaming lifecycle events, JSON-schema
+text formats, client-executed function/custom tools, and namespace-grouped
+function tools.
+Namespace tools are flattened only for local chat rendering; returned
+`function_call` items restore the official original `name` plus `namespace`.
+OpenAI Python 2.52's explicit function `tool_choice` selector has only `type`
+and `name`, so it cannot unambiguously qualify a nested namespace function;
+use `auto` or `required` when namespace tools are present. MTPLX rejects an
+ambiguous nested-function selector instead of silently selecting the wrong
+tool.
+
+MTPLX does not execute hosted Responses tools. Requests containing
+`web_search`, `tool_search`, MCP, code-interpreter, or similar hosted tool types
+return `400` naming the unavailable type. `previous_response_id`, background
+jobs, and server-side Response storage are also outside this stateless route;
+send the full conversation and matching tool calls/outputs in `input`.
+Codex 0.146 sends `web_search` in its default Responses request, so that default
+is intentionally rejected unless hosted tools are disabled or removed from the
+client request.
+
+Codex `reasoning.effort: "xhigh"` is accepted as request vocabulary and resolved
+against the loaded model. Qwen 3.8 preserves `xhigh`, Step 3.5 clamps it to
+`high`, and Qwen 3.6 has no effective reasoning-effort tier. Request
+observability records the requested and effective values plus whether the
+request was downgraded. The Responses payload echoes the client's requested
+reasoning configuration.
+
 ## `POST /v1/messages`
 
 Anthropic Messages baseline. Requests are translated into the same internal chat path as `/v1/chat/completions` and returned as Anthropic-shaped message payloads.

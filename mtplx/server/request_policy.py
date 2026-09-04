@@ -29,6 +29,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from mtplx.constants import DEFAULT_TEMPERATURE, DEFAULT_TOP_K, DEFAULT_TOP_P
+from mtplx.reasoning_effort import REASONING_EFFORT_LEVELS
 from mtplx.sampling import SamplerConfig
 
 
@@ -50,6 +51,32 @@ def _srv() -> Any:
     from mtplx.server import openai
 
     return openai
+
+
+def _responses_reasoning_observability(
+    metadata: dict[str, Any], effective_effort: str | None
+) -> dict[str, Any]:
+    """Report Responses effort only after loaded-family policy resolves it."""
+
+    requested_raw = metadata.get("responses_reasoning_effort_requested")
+    if requested_raw is None:
+        return {}
+    requested = str(requested_raw)
+    if requested not in {"auto", *REASONING_EFFORT_LEVELS}:
+        return {}
+    downgraded = False
+    if requested != "auto" and effective_effort != requested:
+        if effective_effort not in REASONING_EFFORT_LEVELS:
+            downgraded = True
+        else:
+            requested_rank = REASONING_EFFORT_LEVELS.index(requested)
+            effective_rank = REASONING_EFFORT_LEVELS.index(effective_effort)
+            downgraded = effective_rank < requested_rank
+    return {
+        "request_responses_reasoning_effort_requested": requested,
+        "request_responses_reasoning_effort_effective": effective_effort,
+        "request_responses_reasoning_effort_downgraded": downgraded,
+    }
 
 
 @dataclass(frozen=True)
@@ -746,6 +773,9 @@ def resolve_request_policy(
     observability["request_reasoning_mode"] = request_reasoning_mode
     observability["request_enable_thinking"] = bool(thinking_enabled)
     observability["request_reasoning_effort"] = reasoning_effort
+    observability.update(
+        _responses_reasoning_observability(metadata, reasoning_effort)
+    )
     observability["request_enable_thinking_override"] = (
         request.enable_thinking is not None and thinking_controls_allowed
     )

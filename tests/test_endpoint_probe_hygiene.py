@@ -49,8 +49,33 @@ def test_malformed_types_get_422_not_500():
 
 def test_unknown_endpoints_are_404():
     client = _client(_generation_ready_state())
-    for path in ("/v1/embeddings", "/v1/responses", "/v1/images/generations"):
+    for path in ("/v1/embeddings", "/v1/images/generations"):
         assert client.post(path, json={}).status_code == 404
+
+
+def test_responses_endpoint_probe_is_registered_without_inference(monkeypatch):
+    inference_called = False
+
+    def unexpected_generation(*_args, **_kwargs):
+        nonlocal inference_called
+        inference_called = True
+        raise AssertionError("empty Responses probe must not reach inference")
+
+    monkeypatch.setattr(openai_mod, "_run_generation", unexpected_generation)
+    response = _client(_generation_ready_state()).post("/v1/responses", json={})
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": {
+            "message": (
+                "Responses API: input must be a non-empty text string or item list"
+            ),
+            "type": "invalid_request_error",
+            "code": "HTTPException",
+            "param": None,
+        }
+    }
+    assert inference_called is False
 
 
 def test_unhandled_errors_hide_python_internals(monkeypatch):

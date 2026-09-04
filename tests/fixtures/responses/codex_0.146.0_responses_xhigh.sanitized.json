@@ -1,0 +1,145 @@
+{
+  "model": "mtplx",
+  "stream": true,
+  "store": false,
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "instructions": "You are a coding agent running in the Codex CLI. Follow the supplied developer and user context.",
+  "input": [
+    {
+      "type": "message",
+      "role": "developer",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "<permissions instructions>Sanitized permissions context.</permissions instructions>"
+        },
+        {
+          "type": "input_text",
+          "text": "<apps_instructions>Sanitized connector context.</apps_instructions>"
+        },
+        {
+          "type": "input_text",
+          "text": "<skills_instructions>Sanitized skills context.</skills_instructions>"
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "# AGENTS.md instructions\n\nSanitized project instructions."
+        },
+        {
+          "type": "input_text",
+          "text": "<environment_context><cwd>/tmp/sanitized-workspace</cwd><shell>zsh</shell></environment_context>"
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Reply with exactly OK."
+        }
+      ]
+    }
+  ],
+  "parallel_tool_calls": false,
+  "tool_choice": "auto",
+  "tools": [
+    {
+      "description": "View a local image file from the filesystem when visual inspection is needed. Use this for images already available on disk.",
+      "name": "view_image",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "description": "Local filesystem path to an image file.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "strict": false,
+      "type": "function"
+    },
+    {
+      "description": "Tools for spawning and managing sub-agents.",
+      "name": "multi_agent_v1",
+      "tools": [
+        {
+          "description": "Close an agent and any open descendants when they are no longer needed, and return the target agent's previous status before shutdown was requested.",
+          "name": "close_agent",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "target": {
+                "description": "Agent id to close (from spawn_agent).",
+                "type": "string"
+              }
+            },
+            "required": [
+              "target"
+            ],
+            "type": "object"
+          },
+          "strict": false,
+          "type": "function"
+        },
+        {
+          "description": "Wait for agents to reach a final status.",
+          "name": "wait_agent",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "targets": {
+                "description": "Agent ids to wait on.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "timeout_ms": {
+                "description": "Timeout in milliseconds.",
+                "type": "number"
+              }
+            },
+            "required": [
+              "targets"
+            ],
+            "type": "object"
+          },
+          "strict": false,
+          "type": "function"
+        }
+      ],
+      "type": "namespace"
+    },
+    {
+      "external_web_access": false,
+      "type": "web_search"
+    }
+  ],
+  "reasoning": {
+    "effort": "xhigh",
+    "summary": "auto"
+  },
+  "prompt_cache_key": "00000000-0000-0000-0000-000000000001",
+  "client_metadata": {
+    "session_id": "00000000-0000-0000-0000-000000000001",
+    "thread_id": "00000000-0000-0000-0000-000000000001",
+    "turn_id": "00000000-0000-0000-0000-000000000002",
+    "x-codex-installation-id": "00000000-0000-0000-0000-000000000003",
+    "x-codex-turn-metadata": "{\"installation_id\":\"00000000-0000-0000-0000-000000000003\",\"session_id\":\"00000000-0000-0000-0000-000000000001\",\"thread_id\":\"00000000-0000-0000-0000-000000000001\",\"turn_id\":\"00000000-0000-0000-0000-000000000002\",\"window_id\":\"00000000-0000-0000-0000-000000000001:0\",\"request_kind\":\"turn\",\"thread_source\":\"user\",\"sandbox\":\"seatbelt\",\"turn_started_at_unix_ms\":0}",
+    "x-codex-window-id": "00000000-0000-0000-0000-000000000001:0"
+  }
+}
