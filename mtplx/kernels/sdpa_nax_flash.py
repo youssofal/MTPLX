@@ -33,6 +33,14 @@ from ..nax_verify import nax_available
 from .sdpa_gqa_packed import _paged_reduce_kernel
 
 nax_flash_bail_counts: dict[str, int] = {}
+# First-use build proof (issue #461): mx.fast.metal_kernel returns lazily,
+# so a Metal library that fails to build (a MetalPerformancePrimitives
+# header missing on an older macOS, a toolchain without Metal 4) surfaces at
+# the caller's mx.eval, outside the try/except below, as a failed request.
+# The first dispatch of each template shape is therefore settled inside the
+# guard; a shape that failed once bails for the life of the process.
+_probe_ok: set[tuple] = set()
+_probe_failed: set[tuple] = set()
 
 _HEADER = r"""
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -422,6 +430,9 @@ def sdpa_nax_flash(
     nthreads = 32 * nsgm * ks
     partial_shape = (bsz, hq, q_len, blocks, d)
     stats_shape = (bsz, hq, q_len, blocks)
+    probe_key = (str(queries.dtype), d, q_len, gqa_factor, ks, qtg)
+    if probe_key in _probe_failed:
+        return _bail("build_failed")
     try:
         partials, sums, maxs = kernel(
             inputs=[queries, keys, values, offset_arr, capacity,
@@ -439,7 +450,12 @@ def sdpa_nax_flash(
             output_shapes=[partial_shape, stats_shape, stats_shape],
             output_dtypes=[queries.dtype, mx.float32, mx.float32],
         )
-    except Exception as exc:  # noqa: BLE001 — dispatch/compile failure => stock fallback
+        if probe_key not in _probe_ok:
+            mx.eval(partials, sums, maxs)
+            _probe_ok.add(probe_key)
+    except Exception as exc:  # noqa: BLE001 — build/dispatch failure => stock fallback
+        if probe_key not in _probe_ok:
+            _probe_failed.add(probe_key)
         return _bail(f"dispatch_failed: {type(exc).__name__}: {str(exc)[:2000]}")
 
     (out,) = reduce_kernel(
