@@ -1558,3 +1558,5 @@
 "Chats cannot be saved right now, so this session's chats will not be kept." = "現在チャットを保存できないため、このセッションのチャットは保持されません。";
 "Unsaved changes" = "未保存の変更";
 "Your edits are kept while you use other tabs. Save them to apply, or revert to the saved values." = "他のタブを使用している間も編集内容は保持されます。適用するには保存し、保存済みの値に戻すには元に戻してください。";
+"Stall watchdog" = "停止監視";
+"Seconds a response may wait on a model that is making no progress before it is cancelled. 0 turns the watchdog off; long prompts and deep reasoning keep reporting progress and are never cut short by this." = "進捗のないモデルを応答が待てる秒数。超えるとキャンセルされます。0 で監視をオフにします。長いプロンプトや深い推論は進捗を報告し続けるため、これで中断されることはありません。";

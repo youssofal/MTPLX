@@ -48,6 +48,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
+
+from mtplx.progress_heartbeat import tick as _owner_progress_tick
 import mlx.nn as nn
 from mlx_lm.models.base import BaseModelArgs, create_ssm_mask
 from mlx_lm.models.cache import ArraysCache, KVCache
@@ -2331,6 +2333,9 @@ class QSAIndexer(nn.Module):
                 :, nb_total - k_eff :
             ]
             mx.eval(top_t)
+            # Each settled tile is owner progress; a 100k+ sparse prefill
+            # otherwise looks frozen to the stream stall watchdog (#448).
+            _owner_progress_tick()
             parts.append(top_t)
         return mx.concatenate(parts, axis=0)
 
@@ -3356,6 +3361,7 @@ def _qsa_prefill_gather_attention(
             _qsa_stock_rows_gather_kv,
         )
         mx.eval(out_t)
+        _owner_progress_tick()
         outputs.append(out_t)
     return outputs[0] if len(outputs) == 1 else mx.concatenate(outputs, axis=2)
 

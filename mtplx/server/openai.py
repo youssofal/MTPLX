@@ -389,9 +389,45 @@ SSE_KEEPALIVE_MIN_INTERVAL_S = 1.0
 # heartbeat many times per second (every settled engine forward and every
 # scheduler item), so only a genuinely parked owner can breach; the default
 # clears even a multi-minute model load. 0 disables.
-STREAM_STALL_DEADLINE_S = float(
-    os.environ.get("MTPLX_STREAM_STALL_DEADLINE_S") or 300.0
+STREAM_STALL_DEADLINE_DEFAULT_S = 300.0
+
+
+def _resolve_stream_stall_deadline_s(raw: str | float | None) -> float:
+    """Seconds a stream may wait on a frozen model owner; 0 turns it off.
+
+    Blank or absent means the default; "0" (the documented off switch) must
+    stay 0 rather than falling through to the default (issue #448).
+    """
+    if raw is None:
+        return STREAM_STALL_DEADLINE_DEFAULT_S
+    text = str(raw).strip()
+    if not text:
+        return STREAM_STALL_DEADLINE_DEFAULT_S
+    try:
+        return max(0.0, float(text))
+    except ValueError:
+        return STREAM_STALL_DEADLINE_DEFAULT_S
+
+
+STREAM_STALL_DEADLINE_S = _resolve_stream_stall_deadline_s(
+    os.environ.get("MTPLX_STREAM_STALL_DEADLINE_S")
 )
+
+
+def set_stream_stall_deadline_s(value: float | None) -> float:
+    """Apply ``--stream-stall-deadline-s`` for this process (issue #448).
+
+    The macOS app launches the daemon from LaunchServices, where a shell
+    ``export`` is invisible, so the deadline is a serve flag the app can pass
+    from its settings. Mirrors the value into the environment so ``/health``,
+    child tools, and the serve log agree on the active deadline.
+    """
+    global STREAM_STALL_DEADLINE_S
+    if value is None:
+        return STREAM_STALL_DEADLINE_S
+    STREAM_STALL_DEADLINE_S = _resolve_stream_stall_deadline_s(value)
+    os.environ["MTPLX_STREAM_STALL_DEADLINE_S"] = repr(STREAM_STALL_DEADLINE_S)
+    return STREAM_STALL_DEADLINE_S
 # Absolute bound on the post-generation commit wait of a streamed response
 # (issue #425, 66duke66). Once decode has finished the client already holds
 # every token; only the terminal frame and [DONE] are missing. The session
@@ -35719,6 +35755,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Unload retrieval models after this many idle seconds (0 = never)",
     )
     parser.add_argument(
+        "--stream-stall-deadline-s",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "Fail a stream whose model owner makes no progress for this many "
+            "seconds (0 = off). Default: $MTPLX_STREAM_STALL_DEADLINE_S or 300. "
+            "Healthy work ticks progress on every prefill chunk and decode "
+            "step, so only a genuinely parked owner reaches the deadline."
+        ),
+    )
+    parser.add_argument(
         "--retrieval-cache-dir",
         default=None,
         help="Model cache directory used to resolve retrieval references",
@@ -36477,6 +36525,7 @@ def _start_aime_parent_watchdog_from_env() -> None:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     validate_server_security_args(args)
+    set_stream_stall_deadline_s(getattr(args, "stream_stall_deadline_s", None))
     _start_aime_parent_watchdog_from_env()
     try:
         state = ServerState(args)

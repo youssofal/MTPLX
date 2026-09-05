@@ -307,6 +307,16 @@ public struct MTPLXCommandBuilder: Sendable {
         if let contextWindow = resolved.contextWindow, contextWindow > 0 {
             arguments.append(contentsOf: ["--context-window", String(contextWindow)])
         }
+        // Issue #448: the stall watchdog deadline is a setting, not a shell
+        // export the GUI-launched daemon can never see. Only a changed value
+        // rides on argv so the daemon's own default stays authoritative.
+        if configuration.streamStallDeadlineSeconds
+            != MTPLXAppConfiguration.defaultStreamStallDeadlineSeconds {
+            arguments.append(contentsOf: [
+                "--stream-stall-deadline-s",
+                Self.formatSeconds(configuration.streamStallDeadlineSeconds),
+            ])
+        }
         // The key never rides on argv: every local process can read a
         // process's arguments through `ps`, and the supervisor writes the
         // launched command line into the Logs pane that users paste into
@@ -677,6 +687,15 @@ public struct MTPLXCommandBuilder: Sendable {
     /// Where the daemon reads its API key from (`--api-key-file`). Kept
     /// beside `settings.json`, which is the durable copy of the key; this
     /// file is a 0600 hand-off to the daemon process only.
+    /// Render a seconds value for argv without a trailing ".0" (0 reads as
+    /// the documented off switch, 120 as 120).
+    static func formatSeconds(_ value: Double) -> String {
+        if value == value.rounded(), abs(value) < 1e15 {
+            return String(Int(value))
+        }
+        return String(value)
+    }
+
     public static func daemonAPIKeyFileURL(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> URL {

@@ -1558,3 +1558,5 @@
 "Chats cannot be saved right now, so this session's chats will not be kept." = "Obrolan tidak dapat disimpan saat ini, jadi obrolan sesi ini tidak akan disimpan.";
 "Unsaved changes" = "Perubahan belum disimpan";
 "Your edits are kept while you use other tabs. Save them to apply, or revert to the saved values." = "Perubahan Anda tetap tersimpan saat Anda menggunakan tab lain. Simpan untuk menerapkannya, atau kembalikan ke nilai yang tersimpan.";
+"Stall watchdog" = "Pengawas macet";
+"Seconds a response may wait on a model that is making no progress before it is cancelled. 0 turns the watchdog off; long prompts and deep reasoning keep reporting progress and are never cut short by this." = "Detik yang boleh ditunggu sebuah respons pada model yang tidak membuat kemajuan sebelum dibatalkan. 0 mematikan pengawas; prompt panjang dan penalaran mendalam terus melaporkan kemajuan dan tidak pernah dipotong olehnya.";

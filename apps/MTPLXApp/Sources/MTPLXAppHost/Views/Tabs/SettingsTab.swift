@@ -322,6 +322,22 @@ struct SettingsTab: View {
                         }
                         Divider().overlay(Brand.separator)
                         FormRow(
+                            label: tr("Stall watchdog"),
+                            caption: tr("Seconds a response may wait on a model that is making no progress before it is cancelled. 0 turns the watchdog off; long prompts and deep reasoning keep reporting progress and are never cut short by this.")
+                        ) {
+                            TextField(
+                                "300",
+                                value: Binding(
+                                    get: { draftConfig.streamStallDeadlineSeconds },
+                                    set: { draftConfig.streamStallDeadlineSeconds = max(0, $0) }
+                                ),
+                                format: .number.precision(.fractionLength(0))
+                            )
+                            .textFieldStyle(.roundedBorder)
+                            .frame(maxWidth: 90)
+                        }
+                        Divider().overlay(Brand.separator)
+                        FormRow(
                             label: tr("HF download mirror"),
                             caption: tr("Hugging Face endpoint for model downloads. Your HF token is never sent to a mirror.")
                         ) {

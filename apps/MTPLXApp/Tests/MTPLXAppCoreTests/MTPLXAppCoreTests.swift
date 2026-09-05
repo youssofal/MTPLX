@@ -1664,6 +1664,62 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertNil(backend.currentFanMode)
     }
 
+    /// Issue #448: the stall watchdog deadline is an app setting that rides
+    /// on argv only when the user changed it; 0 is the documented off switch.
+    func testCommandBuilderPassesStreamStallDeadlineOnlyWhenChanged() throws {
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
+        let untouched = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(executablePath: fake.path, model: "/models/qwen"),
+            target: nil,
+            launchID: "stall-default"
+        )
+        XCTAssertFalse(untouched.arguments.contains("--stream-stall-deadline-s"))
+
+        let disabled = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: "/models/qwen",
+                streamStallDeadlineSeconds: 0
+            ),
+            target: nil,
+            launchID: "stall-off"
+        )
+        XCTAssertTrue(disabled.arguments.containsInOrder(["--stream-stall-deadline-s", "0"]))
+
+        let longer = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: "/models/qwen",
+                streamStallDeadlineSeconds: 900
+            ),
+            target: nil,
+            launchID: "stall-long"
+        )
+        XCTAssertTrue(longer.arguments.containsInOrder(["--stream-stall-deadline-s", "900"]))
+    }
+
+    func testStreamStallDeadlineDecodesWithDefaultAndClampsNegative() throws {
+        let decoder = JSONDecoder()
+        let legacy = try decoder.decode(
+            MTPLXAppConfiguration.self,
+            from: Data(#"{"model":"/models/qwen"}"#.utf8)
+        )
+        XCTAssertEqual(legacy.streamStallDeadlineSeconds, MTPLXAppConfiguration.defaultStreamStallDeadlineSeconds)
+        let negative = try decoder.decode(
+            MTPLXAppConfiguration.self,
+            from: Data(#"{"model":"/models/qwen","stream_stall_deadline_s":-5}"#.utf8)
+        )
+        XCTAssertEqual(negative.streamStallDeadlineSeconds, 0)
+        let roundTrip = try decoder.decode(
+            MTPLXAppConfiguration.self,
+            from: try JSONEncoder().encode(
+                MTPLXAppConfiguration(model: "/models/qwen", streamStallDeadlineSeconds: 0)
+            )
+        )
+        XCTAssertEqual(roundTrip.streamStallDeadlineSeconds, 0)
+    }
+
     func testCommandBuilderOpenCodePresetKeepsMeasuredSamplerButUsesAppReasoning() throws {
         let fake = try makeExecutable(named: "mtplx")
         let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])

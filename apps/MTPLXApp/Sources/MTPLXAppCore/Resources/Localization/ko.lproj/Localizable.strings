@@ -1558,3 +1558,5 @@
 "Chats cannot be saved right now, so this session's chats will not be kept." = "지금은 채팅을 저장할 수 없어 이번 세션의 채팅은 보관되지 않습니다.";
 "Unsaved changes" = "저장되지 않은 변경 사항";
 "Your edits are kept while you use other tabs. Save them to apply, or revert to the saved values." = "다른 탭을 사용하는 동안에도 편집 내용은 유지됩니다. 적용하려면 저장하고, 저장된 값으로 되돌리려면 되돌리기를 누르세요.";
+"Stall watchdog" = "정지 감시";
+"Seconds a response may wait on a model that is making no progress before it is cancelled. 0 turns the watchdog off; long prompts and deep reasoning keep reporting progress and are never cut short by this." = "진행이 없는 모델을 응답이 기다릴 수 있는 시간(초)입니다. 초과하면 취소됩니다. 0이면 감시를 끕니다. 긴 프롬프트와 깊은 추론은 계속 진행을 보고하므로 이 설정으로 중단되지 않습니다.";

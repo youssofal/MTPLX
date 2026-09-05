@@ -1558,3 +1558,5 @@
 "Chats cannot be saved right now, so this session's chats will not be kept." = "Les conversations ne peuvent pas être enregistrées pour le moment ; celles de cette session ne seront pas conservées.";
 "Unsaved changes" = "Modifications non enregistrées";
 "Your edits are kept while you use other tabs. Save them to apply, or revert to the saved values." = "Vos modifications sont conservées pendant que vous utilisez d'autres onglets. Enregistrez-les pour les appliquer, ou revenez aux valeurs enregistrées.";
+"Stall watchdog" = "Chien de garde de blocage";
+"Seconds a response may wait on a model that is making no progress before it is cancelled. 0 turns the watchdog off; long prompts and deep reasoning keep reporting progress and are never cut short by this." = "Secondes pendant lesquelles une réponse peut attendre un modèle sans progrès avant d’être annulée. 0 désactive le chien de garde ; les longs prompts et le raisonnement profond continuent de signaler leur progrès et ne sont jamais coupés par ceci.";
