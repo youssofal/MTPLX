@@ -222,8 +222,32 @@ if [[ "${#NATIVE_WHEELS[@]}" != "1" || ! -f "${NATIVE_WHEELS[0]}" ]]; then
 fi
 NATIVE_RUNTIME_WHEEL="$("$NATIVE_BUILD_VENV/bin/python" \
   "$ROOT/scripts/bundle_native_runtime_wheel.py" "$PYTHON_WHEEL" \
-  "${NATIVE_WHEELS[0]}" --out "$PYTHON_DIST")"
+  "${NATIVE_WHEELS[0]}" --out "$PYTHON_DIST" --codesign-identity "$CODESIGN_IDENTITY")"
 "$PYTOOLS_VENV/bin/python" -m twine check "$NATIVE_RUNTIME_WHEEL"
+
+# Notarization gate: every Mach-O inside the runtime wheel must carry the
+# Developer ID and a secure timestamp. The app's signing pass cannot reach
+# into the wheel, and the notary service rejected 2.11.2's first submission
+# on exactly these two files; catch it here, not after a 20-minute upload.
+NATIVE_CHECK_DIR="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/mtplx-native-wheel-check.XXXXXX")"
+/usr/bin/unzip -q -o "$NATIVE_RUNTIME_WHEEL" -d "$NATIVE_CHECK_DIR"
+NATIVE_SIGNED=0
+while IFS= read -r member; do
+  [[ -n "$member" ]] || continue
+  /usr/bin/codesign --verify --strict "$member"
+  details="$(/usr/bin/codesign -dvvv "$member" 2>&1)"
+  if ! /usr/bin/grep -q 'Authority=Developer ID Application' <<<"$details" \
+     || ! /usr/bin/grep -q '^Timestamp=' <<<"$details"; then
+    echo "error: ${member#"$NATIVE_CHECK_DIR"/} is not Developer ID signed with a secure timestamp; notarization would reject it" >&2
+    exit 1
+  fi
+  NATIVE_SIGNED=$((NATIVE_SIGNED + 1))
+done < <(/usr/bin/find "$NATIVE_CHECK_DIR" \( -name '*.so' -o -name '*.dylib' \) -type f)
+if [[ "$NATIVE_SIGNED" -lt 2 ]]; then
+  echo "error: expected the QSA extension and its kernel library inside $NATIVE_RUNTIME_WHEEL, found $NATIVE_SIGNED signed Mach-O files" >&2
+  exit 1
+fi
+echo "Native runtime wheel: $NATIVE_SIGNED Mach-O members Developer ID signed with secure timestamps"
 
 echo "Building signed MTPLX.app"
 MTPLX_APP_PUBLIC_RELEASE=1 \

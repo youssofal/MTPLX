@@ -11,6 +11,8 @@ from email.policy import compat32
 import hashlib
 import json
 from pathlib import Path
+import subprocess
+import tempfile
 
 from packaging.tags import Tag
 from packaging.requirements import Requirement
@@ -18,11 +20,49 @@ from packaging.utils import parse_wheel_filename
 from wheel.wheelfile import WheelFile
 
 
+def sign_mach_o(name: str, data: bytes, identity: str) -> bytes:
+    """Return the Mach-O member re-signed the way the app bundle signs its binaries.
+
+    Developer ID, hardened runtime and a secure timestamp: the notary service
+    checks every Mach-O it finds inside the bundle, archives included, and
+    rejected 2.11.2's first submission on the two linker-signed kernels here.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        path = Path(scratch) / Path(name).name
+        path.write_bytes(data)
+        subprocess.run(
+            ["/usr/bin/codesign", "--force", "--options", "runtime", "--timestamp",
+             "--sign", identity, str(path)],
+            check=True, capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["/usr/bin/codesign", "--verify", "--strict", str(path)],
+            check=True, capture_output=True, text=True,
+        )
+        shown = subprocess.run(
+            ["/usr/bin/codesign", "-dvvv", str(path)],
+            check=True, capture_output=True, text=True,
+        )
+        details = shown.stdout + shown.stderr
+        if "Authority=Developer ID Application" not in details or "Timestamp=" not in details:
+            raise RuntimeError(
+                f"{name}: signature lacks a Developer ID authority or a secure timestamp\n{details}"
+            )
+        return path.read_bytes()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("runtime", type=Path)
     parser.add_argument("native", type=Path)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--codesign-identity",
+        default=None,
+        help="Sign the native Mach-O members (Developer ID, hardened runtime, secure "
+        "timestamp) before packaging. The app's signing pass cannot reach inside the "
+        "wheel, and notarization rejects linker-signed kernels found there.",
+    )
     args = parser.parse_args()
     name, version, _, core_tags = parse_wheel_filename(args.runtime.name)
     native_name, _, _, native_tags = parse_wheel_filename(args.native.name)
@@ -60,6 +100,8 @@ def main():
                     if name.startswith("/") or ".." in Path(name).parts:
                         raise ValueError(f"Unsafe archive path: {name}")
                     data = archive.read(name)  # WheelFile verifies source RECORD hashes.
+                    if archive is native and args.codesign_identity and name.endswith((".so", ".dylib")):
+                        data = sign_mach_o(name, data, args.codesign_identity)
                     if archive is core and name.endswith(".dist-info/WHEEL"):
                         lines = [line for line in data.decode().splitlines()
                                  if not line.startswith(("Tag:", "Root-Is-Purelib:"))]
