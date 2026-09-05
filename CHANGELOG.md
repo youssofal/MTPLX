@@ -54,6 +54,12 @@ and memory fixes for long agent sessions, and app and CLI repairs.
   'input_layernorm'`, then `KeyError: 'conv_states'`). It resolves the same
   runtime contract as serve and tune, and the legacy capture commit declines
   family-native captures instead of raising. Receipt: 52 tok/s, MTP depth 3.
+- **The app's Hermes profile `.env` keeps a configured reasoning effort on
+  its own line.** With Performance › Reasoning effort set, the app wrote
+  `TERMINAL_CWD="…"HERMES_MTPLX_REASONING_EFFORT="xhigh"` as one statement;
+  Hermes' dotenv parser rejected it ("could not parse statement") on every
+  launch and silently lost both the working directory and the effort. Found
+  by the release harness run through Hermes v0.21.0.
 - **The Hermes profile no longer stamps `terminal.backend: local` (#460).**
   MTPLX wrote it into `~/.hermes/profiles/mtplx/config.yaml` on every
   launch, overriding a Docker sandbox the user had configured; the merge

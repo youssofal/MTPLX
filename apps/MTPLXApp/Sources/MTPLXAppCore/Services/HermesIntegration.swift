@@ -1697,7 +1697,11 @@ public struct HermesIntegration: Sendable {
         TERMINAL_CWD=\(dotenvQuote(workspacePath))
         """
         if let reasoningEffort {
-            text += "HERMES_MTPLX_REASONING_EFFORT=\(dotenvQuote(reasoningEffort))\n"
+            // The literal above ends without a newline: appending straight
+            // onto it fused TERMINAL_CWD and this key into one line, which
+            // Hermes' dotenv parser rejected ("could not parse statement"),
+            // silently dropping both the working directory and the effort.
+            text += "\nHERMES_MTPLX_REASONING_EFFORT=\(dotenvQuote(reasoningEffort))"
         }
         if !bridgeText.isEmpty {
             text += "\n" + bridgeText
