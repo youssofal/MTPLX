@@ -421,6 +421,24 @@ IMPLICIT_SESSION_SOURCES = frozenset(
 _COMMON_PREFIX_REUSE_MIN_TOKENS = 4096
 _COMMON_PREFIX_REUSE_MIN_FRACTION = 0.25
 _COMMON_PREFIX_PROBE_TOKENS = 64
+# Turn-boundary reuse (#446): a live session's committed stream carries the
+# reasoning it streamed, and clients resend the history without it, so a
+# resent conversation's raw common prefix always ends where one of the
+# session's turns started generating. The fraction rule above shrinks that
+# match below its threshold as the conversation grows (22,437 shared tokens
+# passed at 89k and failed at 112k in the #446 chain), forking the identity
+# and dropping the restore to a 2,048-token block. A shared prefix of at
+# least the minimum that lands on a recorded turn prompt length (up to the
+# probe window past it, for templates whose generation-prompt tail the
+# rendered history repeats) is that conversation's own signature at any length.
+_TURN_PROMPT_LENS_MAX = 256
+
+
+def _common_prefix_reuse_threshold(prompt_len: int) -> int:
+    return max(
+        _COMMON_PREFIX_REUSE_MIN_TOKENS,
+        int(int(prompt_len) * _COMMON_PREFIX_REUSE_MIN_FRACTION),
+    )
 
 
 def _new_anon_session_id() -> str:
@@ -843,6 +861,9 @@ class EngineSession:
         self.last_access_s = self.created_at_s
         self.committed_token_ids: tuple[int, ...] = ()
         self.boundaries: list[BoundarySnapshot] = []
+        # Prompt lengths of the turns this session generated from; the
+        # resolver's turn-boundary reuse (#446) reads them.
+        self.turn_prompt_lens: list[int] = []
         self.in_flight = False
         self.in_flight_started_s: float | None = None
         self.last_commit_s: float | None = None
@@ -1357,6 +1378,7 @@ class EngineSession:
         # assistant turn. Aborted/cancelled/error finishes stay refused.
         if finish_reason not in {"stop", "length", "tool_calls"}:
             return EngineSessionCommit(False, f"unsafe_finish:{finish_reason}", self.prefix_len)
+        self.note_turn_prompt_len(len(prompt_ids))
         tokens = tuple(int(token) for token in prompt_ids) + tuple(int(token) for token in generated_ids)
         self.committed_token_ids = tokens
         self.last_commit_s = time.time()
@@ -1403,6 +1425,7 @@ class EngineSession:
                 )
             if len(tokens) == len(current):
                 return EngineSessionCommit(False, "prompt_prefix_unchanged", self.prefix_len)
+        self.note_turn_prompt_len(len(tokens))
         self.committed_token_ids = tokens
         self.last_commit_s = time.time()
         self.last_finish_reason = str(finish_reason)
@@ -1502,6 +1525,29 @@ class EngineSession:
         self.touch()
         return boundary
 
+    def note_turn_prompt_len(self, prompt_len: int) -> None:
+        """Record the prompt length a turn generated from (#446 identity)."""
+        prompt_len = int(prompt_len)
+        if prompt_len <= 0 or prompt_len in self.turn_prompt_lens:
+            return
+        self.turn_prompt_lens.append(prompt_len)
+        overflow = len(self.turn_prompt_lens) - _TURN_PROMPT_LENS_MAX
+        if overflow > 0:
+            del self.turn_prompt_lens[:overflow]
+
+    def turn_boundary_at(self, common_prefix: int) -> int | None:
+        """Turn prompt length that a shared prefix ends on, or None.
+
+        The match may run up to the probe window past the boundary: a chat
+        template can repeat the generation prompt's tail (``<think>``) in the
+        rendered history before the streamed reasoning diverges from it.
+        """
+        common_prefix = int(common_prefix)
+        for prompt_len in reversed(self.turn_prompt_lens):
+            if prompt_len <= common_prefix <= prompt_len + _COMMON_PREFIX_PROBE_TOKENS:
+                return prompt_len
+        return None
+
     def nearest_boundary_at_or_before(self, token_len: int) -> BoundarySnapshot | None:
         candidates = [boundary for boundary in self.boundaries if boundary.token_len <= token_len]
         if not candidates:
@@ -1525,6 +1571,7 @@ class EngineSession:
             "last_commit_s": self.last_commit_s,
             "last_finish_reason": self.last_finish_reason,
             "revision": self.revision,
+            "turn_prompt_lens": list(self.turn_prompt_lens[-8:]),
             "in_flight": self.in_flight,
             "in_flight_started_s": self.in_flight_started_s,
             "last_cache_miss_reason": self.last_cache_miss_reason,
@@ -1766,6 +1813,12 @@ class EngineSessionManager:
                             best.committed_token_ids
                         ),
                         "reason": "common_prefix_reuse",
+                        "reuse_rule": (
+                            "fraction"
+                            if int(matched) >= _common_prefix_reuse_threshold(len(prompt_ids))
+                            else "turn_boundary"
+                        ),
+                        "turn_boundary": best.turn_boundary_at(matched),
                     }
                 )
                 record(diagnostic)
@@ -1917,6 +1970,8 @@ class EngineSessionManager:
         probe = tokens[:_COMMON_PREFIX_PROBE_TOKENS]
         best: EngineSession | None = None
         best_common = 0
+        boundary_best: EngineSession | None = None
+        boundary_common = 0
         for session in self._sessions_snapshot():
             prefix = session.committed_token_ids
             if not prefix:
@@ -1927,12 +1982,20 @@ class EngineSessionManager:
             if common > best_common:
                 best_common = common
                 best = session
-        threshold = max(
-            _COMMON_PREFIX_REUSE_MIN_TOKENS,
-            int(len(tokens) * _COMMON_PREFIX_REUSE_MIN_FRACTION),
-        )
-        if best is not None and best_common >= threshold:
+            if (
+                common >= _COMMON_PREFIX_REUSE_MIN_TOKENS
+                and common > boundary_common
+                and session.turn_boundary_at(common) is not None
+            ):
+                boundary_common = common
+                boundary_best = session
+        if best is not None and best_common >= _common_prefix_reuse_threshold(len(tokens)):
             return best, best_common
+        # The same conversation resent with its history re-rendered (#446):
+        # the shared prefix ends where this session started generating a
+        # turn, whatever fraction of the new prompt that is.
+        if boundary_best is not None:
+            return boundary_best, boundary_common
         return None, 0
 
     def pending_near_prefix_session(
