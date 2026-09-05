@@ -4,6 +4,104 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [2.11.2] - 2026-09-05
+
+A correctness release for every Mac that is not an M5, three session-bank
+and memory fixes for long agent sessions, and app and CLI repairs.
+
+### Fixed
+
+- **27B on M1–M4: the flash-decoding verify route is gated by hardware
+  (#459, #464, #467, #455, #461).** 2.11 turned the route on in turbo without
+  a GPU-family gate. It engages once the KV buffer reaches 8,192 tokens and
+  uses the M5 GPU's tensor units; on M1–M4 GPUs it returned wrong attention
+  (unrelated reasoning, imaginary tasks, mixed languages, no tool calls) and
+  on macOS 15 the kernel failed to build (`MetalPerformancePrimitives.h`
+  not found). The route now runs only on an M5-class GPU on macOS 26.2 or
+  newer; everywhere else the packed-GQA verify kernel 2.10.2 shipped serves,
+  validated at startup. `/health degradation.nax` carries `available`, the
+  `gpu_family_or_os` bail counts and, new, `flash_dispatch_counters` for an
+  engaged route. Rehearsed on an M5 Max with the reporters' 14k and 32k
+  diff-summary prompts: the forced M1–M4 path and the native route both
+  answer correctly; the route counts 66 dispatches with no bails.
+- **AR-only sessions restore again (#465, #455).** A target-only AR runtime
+  (`--no-load-mtp`) banked its postcommit prefix under the `cycle` history
+  policy while every lookup, the prefill store and the cache fingerprint
+  said `committed`, so the bank refused the longest entry with
+  `policy_mismatch` and Hermes or Pi re-prefilled the whole prompt on every
+  top-level turn (14.5k tokens, about two minutes on an M1 Max; the idle
+  stall on an M3 Ultra). One policy per runtime, derived in one place.
+- **The pre-prefill memory guard refuses a prompt that still projects over
+  the memory limit after reclamation (#450).** It had admitted a 136k
+  prompt at 105.4 GB against a 103.1 GB limit after clearing the allocator
+  cache; the reporter's 128 GB Mac kernel-panicked four times. The guard
+  re-projects after every reclamation step and answers with a structured
+  507 before prefill, naming the projection, the limit and the uncached
+  tokens; the engine keeps its sessions. `--allow-swap` keeps the operator's
+  explicit choice; between the warning line and the limit nothing changes.
+- **Later conversations are admitted to the session bank again (#454).**
+  The background-task heuristic (short answer + different system prompt)
+  classified every conversation-continuing short turn as a title job and
+  served it sessionless, so only the first conversation after a restart was
+  banked and every later one re-prefilled at 0 % cache. Only the task shape
+  (system prompt + one user turn) infers a background task now. Reproduced
+  with the reporter's script: sessions two to four went from 0 % to 100 %
+  cached on their third turn.
+- **`mtplx run` and `mtplx chat` work on Flash-Next (#463).** The one-shot
+  path applied only the profile defaults, never the family lanes serve
+  stamps, and crashed in the legacy capture walker
+  (`AttributeError: 'DecoderLayer' object has no attribute
+  'input_layernorm'`, then `KeyError: 'conv_states'`). It resolves the same
+  runtime contract as serve and tune, and the legacy capture commit declines
+  family-native captures instead of raising. Receipt: 52 tok/s, MTP depth 3.
+- **The Hermes profile no longer stamps `terminal.backend: local` (#460).**
+  MTPLX wrote it into `~/.hermes/profiles/mtplx/config.yaml` on every
+  launch, overriding a Docker sandbox the user had configured; the merge
+  keeps what the user set.
+- **The setup wizard measures free space on the model store's volume
+  (#466).** With `~/.mtplx/models` on an external drive (a symlink or
+  `MTPLX_MODEL_DIR`) it read the home volume and refused every catalog
+  model as "insufficient space". The download step and Forge share the fix.
+- **A foreign-looking occupant of the daemon port is re-probed for five
+  seconds before the app moves ports (#409).**
+- **SSD prefix restore reads only the needed prefix and slices the committed
+  MTP history to it (PR #444 by @softpudding).** Fixed verifier capacity is
+  renewed for adaptive depths and copy windows; shared verifier programs are
+  released when a model unloads; completed request banks are released while
+  the shared programs stay.
+- **The memory guard asks the live sessions and the bank for the reusable
+  prefix before projecting, walks chain snapshots before giving up, and
+  reclaims allocator storage before evicting useful snapshots (#447,
+  reported and measured by @nomishbhardwaj).**
+- The expected-value depth policy measures conditional acceptance
+  correctly; prefill pipeline resolution stays out of decode and
+  ineligible chunks; a stale A3B target-prefix test literal.
+
+### Added
+
+- **`--stream-stall-deadline-s` on `mtplx serve` and Performance › Advanced ›
+  Stall watchdog in the app (#448)**, 0 disables; the Flash-Next
+  sparse-prefill loops tick the owner heartbeat so a long page-in is not
+  mistaken for a stall.
+- **The MTP on/off law in the trace economics** for any depth policy: MTP
+  pays when acceptance per drafted token exceeds (cycle cost in AR steps − 1)
+  ÷ drafts per cycle; `mtplx trace` reports `cycle_cost_ar_steps`,
+  `drafts_per_cycle`, `acceptance_margin` and `mtp_pays`.
+- **Traces inspectable across harnesses**: exact Pi joins, retained tool
+  results, prefix diagnostics kept with their request, verifier route costs,
+  new tool content distinguished from reduced prefix reuse.
+- **Forge extracts MTP heads stored outside the `mtp.` prefix (PR #442 by
+  @stooit)**: GLM-4 MoE, GLM-5.3-Flash, DeepSeek-V3.2 and MiMo layouts;
+  MiMo's output head bound instead of random; MiMo reaches tune; forge takes
+  verification depths from the tune policy.
+- **Flash-Next tuning uses the serving family contract (PR #457 by
+  @stooit)** with real draft-cycle means and explicit budgets.
+- **Sparse prefill packaged for the bundled Python with a compatible fallback
+  (#423 by @humanrouter)**, validated through the real app installer.
+- **`--compare-static` fixed-depth baselines for `mtp-adaptive` (PR #276 by
+  @rinaldofesta)**; composer view lookup isolated to the main actor in the
+  app tests (PR #372 by @PhilipJohnBasile).
+
 ## [2.11.1] - 2026-09-03
 
 MTPLX 2.11. The artifact number is 2.11.1 because 2.11.0 was consumed by a
