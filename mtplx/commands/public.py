@@ -11628,7 +11628,11 @@ def _hermes_config_yaml(
         "  tool_use_enforcement: auto\n"
         + effort_line
         + "terminal:\n"
-        "  backend: local\n"
+        # terminal.backend is the user's sandbox choice (local, docker,
+        # ssh, ...), never MTPLX's: hermes defaults it to local when the
+        # key is absent, and the merge keeps a user-set value verbatim
+        # (issue #460: the old hardcoded "local" re-stamped a Docker
+        # sandbox back to the host shell on every launch).
         f"  cwd: {_hermes_yaml_quote(workspace_path)}\n"
         "  timeout: 180\n"
         "  persistent_shell: true\n"

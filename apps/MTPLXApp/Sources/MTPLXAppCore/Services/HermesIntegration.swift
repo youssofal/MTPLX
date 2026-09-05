@@ -1466,7 +1466,10 @@ public struct HermesIntegration: Sendable {
         // server branch (tool contract, managed-thinking carve-out,
         // injected-cap strip) is dead. Reasoning effort must sit under
         // agent: — hermes reads CLI_CONFIG["agent"]["reasoning_effort"]; a
-        // model.reasoning_effort line is silently ignored.
+        // model.reasoning_effort line is silently ignored. terminal.backend
+        // is deliberately absent: it is the user's sandbox choice (hermes
+        // defaults it to local) and the merge preserves a user-set value
+        // (issue #460).
         let effortLine = reasoningEffort.map { "  reasoning_effort: \(yamlQuote($0))\n" } ?? ""
         let showReasoningText = showReasoning ? "true" : "false"
         return """
@@ -1490,7 +1493,6 @@ public struct HermesIntegration: Sendable {
           tool_use_enforcement: auto
         """ + "\n" + effortLine + """
         terminal:
-          backend: local
           cwd: \(yamlQuote(workspacePath))
           timeout: 180
           persistent_shell: true
