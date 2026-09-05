@@ -722,7 +722,7 @@ def test_generation_exact_route_has_fixed_m2_m1_schedule_without_generic_repair(
     # (same env, plus the recurrent-cache loud-failure guard); the invariant —
     # snapshot handling only on the non-compiled route — is unchanged.
     assert snapshot_block.index("if a3b_target_prefix_route is None:") < (
-        snapshot_block.index("if _skip_verify_snapshot():")
+        snapshot_block.index("if _skip_verify_snapshot()")
     )
     assert "verify_logits, verify_hidden, a3b_primary_state = (" in source
     assert draft_sample_start < exact_verify_start < target_sample_start
