@@ -17464,6 +17464,38 @@ def _allocation_failure_http_exception(
     )
 
 
+def _prefill_admission_refusal(
+    state: "ServerState", receipt: Mapping[str, Any]
+) -> HTTPException:
+    """The structured 507 for a prompt the shed could not make fit (#450).
+
+    Raised before prefill, so the engine keeps every resident session and
+    the client gets a real answer instead of a swap spiral or a kernel panic.
+    """
+    gib = float(1024**3)
+    limit = int(receipt.get("limit_bytes") or 0)
+    projected = int(
+        receipt.get("projected_bytes_after") or receipt.get("projected_bytes") or 0
+    )
+    over = max(0, projected - limit)
+    prompt_tokens = int(receipt.get("prompt_tokens") or 0)
+    miss_tokens = int(receipt.get("miss_tokens") or 0)
+    return HTTPException(
+        status_code=507,
+        detail=(
+            "insufficient memory: this prompt projects "
+            f"{projected / gib:.1f} GiB against the engine's {limit / gib:.1f} GiB "
+            f"limit ({over / gib:.1f} GiB over) after the allocator cache and the "
+            f"session bank were reclaimed ({prompt_tokens} prompt tokens, "
+            f"{miss_tokens} not cached). The engine stays up and keeps its "
+            "sessions; this request was refused before prefill instead of "
+            "pushing the Mac into swap. Reduce the prompt, start a new "
+            "conversation, close other apps, or use q8 KV quantization; "
+            "--allow-swap admits it anyway."
+        ),
+    )
+
+
 def _prefill_admission_shed_enabled() -> bool:
     return os.environ.get(
         "MTPLX_PREFILL_ADMISSION_SHED", "1"
@@ -17776,6 +17808,26 @@ def _prefill_admission_shed(
         after = _mlx_memory_stats_live()
         receipt["active_bytes_after"] = int(after.get("active_memory_bytes") or 0)
         receipt["cache_bytes_after"] = int(after.get("cache_memory_bytes") or 0)
+        # #450: admission past the hard limit is not "shed and hope". On a
+        # 128 GB Mac the shed admitted a 136k prompt at a projected 105.4 GB
+        # against a 103.1 GB limit once the allocator cache was cleared, and
+        # nothing downstream stops such a request safely: MLX's limit is
+        # soft, macOS compresses and swaps for minutes, and that machine
+        # kernel-panicked four times before any 507 could fire. When the
+        # projection still crosses the limit after every reclamation step,
+        # mark the receipt refused; the caller answers with the structured
+        # 507 before prefill. --allow-swap (#427) keeps the operator's
+        # explicit past-the-fit choice.
+        projected_after = (
+            int(after.get("active_memory_bytes") or 0)
+            + int(after.get("cache_memory_bytes") or 0)
+            + miss_tokens * per_token
+            + transients
+        )
+        receipt["projected_bytes_after"] = int(projected_after)
+        if projected_after > limit and not bool(getattr(state, "allow_swap", False)):
+            receipt["refused"] = True
+            receipt["refusal_reason"] = "projected_over_limit_after_reclamation"
         _record_guard_event(state, receipt)
         try:
             print("[mtplx] memory guard " + json.dumps(receipt), flush=True)
@@ -24035,6 +24087,8 @@ def _run_generation(
             )
             if admission_shed is not None and request_observability is not None:
                 request_observability["prefill_admission_shed"] = admission_shed
+            if admission_shed is not None and admission_shed.get("refused"):
+                raise _prefill_admission_refusal(state, admission_shed)
             dynamic_kv_reservation = _dynamic_paged_kv_reservation(
                 prompt_tokens=len(prompt_ids),
                 max_new_tokens=response_max,

@@ -619,3 +619,69 @@ class TestTerminalPhase:
         assert receipt["terminal_entries_evicted"] == 1
         assert fork not in bank.entries
         assert exact in bank.entries
+
+
+class TestRefusalPastTheLimit:
+    """#450: a projection still over the hard limit after every reclamation
+    step is refused before prefill (structured 507), never admitted after a
+    cache clear. On the reporter's 128 GB Mac the admitted request pushed
+    wired memory past the kernel's limit and panicked the machine."""
+
+    @staticmethod
+    def _per_token():
+        return KV_PER_TOKEN + AUX_PER_TOKEN
+
+    @staticmethod
+    def _transients():
+        from mtplx.memory_plan import RUNTIME_TRANSIENTS_BYTES
+
+        return int(RUNTIME_TRANSIENTS_BYTES)
+
+    def test_refuses_when_reclamation_cannot_bring_the_projection_under_the_limit(
+        self, monkeypatch
+    ):
+        miss = 60_000
+        # Lands 1 GiB over the limit with nothing left to reclaim.
+        active = LIMIT + GIB - miss * self._per_token() - self._transients()
+        _pin_live_stats(monkeypatch, active=active, cache=0)
+        receipt = _shed(_state(), list(range(miss)), _Bank([]), "pi")
+        assert receipt is not None
+        assert receipt["refused"] is True
+        assert receipt["refusal_reason"] == "projected_over_limit_after_reclamation"
+        assert receipt["projected_bytes_after"] > LIMIT
+
+    def test_admits_between_the_warning_line_and_the_limit(self, monkeypatch):
+        miss = 40_000
+        # Crosses the 0.97 WARNING line by 0.5 GiB but stays 2.4 GiB under the limit.
+        active = int(LIMIT * 0.97) + GIB // 2 - miss * self._per_token() - self._transients()
+        _pin_live_stats(monkeypatch, active=active, cache=0)
+        receipt = _shed(_state(), list(range(miss)), _Bank([]), "pi")
+        assert receipt is not None
+        assert receipt["projected_bytes_after"] <= LIMIT
+        assert "refused" not in receipt
+
+    def test_allow_swap_keeps_the_operator_choice(self, monkeypatch):
+        miss = 60_000
+        active = LIMIT + GIB - miss * self._per_token() - self._transients()
+        _pin_live_stats(monkeypatch, active=active, cache=0)
+        state = _state()
+        state.allow_swap = True
+        receipt = _shed(state, list(range(miss)), _Bank([]), "pi")
+        assert receipt is not None
+        assert "refused" not in receipt
+
+    def test_refusal_is_a_structured_507_with_the_numbers(self):
+        exc = srv._prefill_admission_refusal(
+            _state(),
+            {
+                "limit_bytes": LIMIT,
+                "projected_bytes_after": LIMIT + 2 * GIB,
+                "prompt_tokens": 136_549,
+                "miss_tokens": 136_549,
+            },
+        )
+        assert exc.status_code == 507
+        assert "98.0 GiB" in str(exc.detail)
+        assert "96.0 GiB" in str(exc.detail)
+        assert "refused before prefill" in str(exc.detail)
+        assert "136549" in str(exc.detail)
