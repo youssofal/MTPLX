@@ -47,6 +47,7 @@ final class ComposerReturnToSendTests: XCTestCase {
         return (host, textView)
     }
 
+    @MainActor
     private static func firstTextView(in view: NSView) -> NSTextView? {
         if let textView = view as? NSTextView { return textView }
         for child in view.subviews {
