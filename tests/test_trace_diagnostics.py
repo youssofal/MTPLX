@@ -17,10 +17,32 @@ def test_economics_distinguishes_aggregate_acceptance_from_conditional_probabili
     assert result["tokens_per_verify"] == 2.5
     assert result["speedup_vs_ar"] == 1.25
     assert result["break_even_acceptance"] == pytest.approx(1/3)
+    assert result["cycle_cost_ar_steps"] == pytest.approx(2.0)
+    assert result["drafts_per_cycle"] == 3
+    assert result["fixed_depth"] is True
+    assert result["acceptance_margin"] == pytest.approx(.5 - 1/3)
+    assert result["mtp_pays"] is True
     assert mtp_economics(receipt)["speedup_vs_ar"] is None
-    # A copy route or mixed depths invalidates the fixed-depth threshold.
+    assert mtp_economics(receipt)["break_even_acceptance"] is None
+    # A copy route delivers tokens outside the draft ledger: no threshold.
     assert mtp_economics({**receipt, "context_copy_accepted_tokens": 12}, 50)["break_even_acceptance"] is None
-    assert mtp_economics({**receipt, "drafted_by_depth": [100, 80, 20]}, 50)["break_even_acceptance"] is None
+    # Adaptive depth: the law uses the mean drafts per cycle (2.0 here), so
+    # break-even = (2 - 1) / 2 = 0.5 and 50 % acceptance is exactly the line.
+    adaptive = mtp_economics({**receipt, "drafted_by_depth": [100, 80, 20]}, 50)
+    assert adaptive["fixed_depth"] is False
+    assert adaptive["drafts_per_cycle"] == 2
+    assert adaptive["break_even_acceptance"] == pytest.approx(.5)
+    assert adaptive["acceptance"] == pytest.approx(150 / 200)
+    assert adaptive["mtp_pays"] is True
+    # Real receipts carry a few more verify calls than drafted rows (terminal
+    # and bonus boundaries); the threshold must not vanish for them.
+    real = mtp_economics({**receipt, "verify_calls": 103}, 50)
+    assert real["fixed_depth"] is False
+    assert real["break_even_acceptance"] is not None
+    # A cycle costlier than perfect acceptance can amortize: threshold > 1.
+    slow = mtp_economics({**receipt, "decode_elapsed_s": 9.0}, 50)
+    assert slow["break_even_acceptance"] > 1
+    assert slow["mtp_pays"] is False
     failed = mtp_economics({**receipt, "repetition_stop_triggered": True}, 50)
     assert failed["status"] == "guard_stopped_invalid_quality_sample"
     assert failed["speedup_vs_ar"] is None

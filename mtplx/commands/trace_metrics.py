@@ -18,11 +18,21 @@ def _number(value: Any) -> float | None:
 def mtp_economics(receipt: dict, ar_tok_s: float | None = None) -> dict:
     """Compare actual delivered tokens / full decode time with a matched AR run.
 
-    For fixed depth D, q = accepted / drafted is UNCONDITIONAL across all
-    proposed positions. Away from terminal/bonus boundaries, tokens/round is
-    1 + D*q. Conditional per-position acceptance instead gives
-    1 + p1 + p1*p2 + ...; these two definitions must not be confused.
-    Production conclusions use actual delivered tokens, including overhead.
+    Acceptance here is UNCONDITIONAL: accepted draft tokens over all proposed
+    draft tokens. Conditional per-position acceptance (p1, p1*p2, ...) is a
+    different quantity and must not be confused with it.
+
+    The on/off law. Let r be the cost of one MTP cycle in AR-step units
+    (cycle wall / AR step wall) and D the drafts proposed per cycle; a cycle
+    delivers 1 + D*q tokens at acceptance q, so MTP pays exactly when
+
+        q > (r - 1) / D            (break-even acceptance)
+
+    r comes from this receipt's measured cycle (decode_elapsed_s /
+    verify_calls) against the matched AR rate the caller supplies; D is the
+    receipt's mean drafts per cycle, so the law holds for fixed and adaptive
+    depth alike. Nothing here estimates an AR baseline: without ar_tok_s the
+    speedup and the threshold stay None.
     """
     tokens = _number(receipt.get("completion_tokens"))
     elapsed = _number(receipt.get("decode_elapsed_s"))
@@ -33,9 +43,15 @@ def mtp_economics(receipt: dict, ar_tok_s: float | None = None) -> dict:
     proposed = sum(float(x) for x in drafted)
     verify = _number(receipt.get("verify_time_s"))
     draft = _number(receipt.get("draft_time_s"))
+    acceptance = accepted / proposed if proposed else None
+    drafts_per_cycle = proposed / rounds if proposed and rounds else None
     result: dict[str, Any] = {
         "acceptance_definition": "accepted draft tokens / all proposed draft tokens",
-        "acceptance": accepted / proposed if proposed else None,
+        "acceptance": acceptance,
+        "drafts_per_cycle": drafts_per_cycle,
+        "fixed_depth": bool(
+            rounds and drafted and all(float(n) == rounds for n in drafted)
+        ),
         "tokens_per_verify": tokens / rounds if tokens and rounds else None,
         "decode_ms_per_token": 1000 * elapsed / tokens if elapsed and tokens else None,
         "verify_ms_per_round": (
@@ -46,8 +62,11 @@ def mtp_economics(receipt: dict, ar_tok_s: float | None = None) -> dict:
         ),
         "cycle_ms": 1000 * elapsed / rounds if elapsed and rounds else None,
         "ar_tok_s": ar_tok_s,
+        "cycle_cost_ar_steps": None,
         "speedup_vs_ar": None,
         "break_even_acceptance": None,
+        "acceptance_margin": None,
+        "mtp_pays": None,
         "status": "matched_ar_measurement_required",
     }
     if receipt.get("repetition_stop_triggered"):
@@ -58,11 +77,22 @@ def mtp_economics(receipt: dict, ar_tok_s: float | None = None) -> dict:
     if ar and tokens and elapsed:
         result["speedup_vs_ar"] = (tokens / elapsed) / ar
         result["status"] = "measured_comparison_requires_matched_workload"
-        fixed = rounds and drafted and all(float(n) == rounds for n in drafted)
-        if fixed and not receipt.get("context_copy_accepted_tokens"):
+        if rounds:
+            result["cycle_cost_ar_steps"] = elapsed / rounds * ar
+        if (
+            drafts_per_cycle
+            and rounds
+            and not receipt.get("context_copy_accepted_tokens")
+        ):
             # Do not clamp: >1 means even perfect acceptance cannot amortize
-            # this observed cycle cost; <0 means the cycle is already cheaper.
-            result["break_even_acceptance"] = (elapsed / rounds * ar - 1) / len(drafted)
+            # this observed cycle cost; <0 means the cycle is already cheaper
+            # than an AR step. A copy route delivers tokens outside the draft
+            # ledger, so its receipt has no single acceptance threshold.
+            break_even = (elapsed / rounds * ar - 1) / drafts_per_cycle
+            result["break_even_acceptance"] = break_even
+            if acceptance is not None:
+                result["acceptance_margin"] = acceptance - break_even
+                result["mtp_pays"] = bool(acceptance > break_even)
     return result
 
 
