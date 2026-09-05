@@ -242,10 +242,8 @@ public final class OnboardingOrchestrator: ObservableObject {
     }
 
     public func freeDiskGiB() -> Double {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let values = try? home.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-        let bytes = values?.volumeAvailableCapacityForImportantUsage ?? 0
-        return Double(bytes) / 1_073_741_824.0
+        // The model store's own volume, not the home volume (#466).
+        ModelStoreVolume.freeGiB()
     }
 
     private static func modelFamilyLabel(_ family: String) -> String {
