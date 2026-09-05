@@ -128,6 +128,42 @@ def test_system_prompt_mismatch_still_marks_background():
     )
 
 
+def test_short_answer_turn_with_history_stays_foreground_despite_mismatch():
+    """Issue #454: a second client's conversation with 30-token answers is
+    not a title job once it carries assistant history; it must keep its
+    session and bank entry instead of re-prefilling every turn."""
+    es = _engine_session()
+    main_hash = es.hash_text("main chat system")
+    messages = [
+        {"role": "system", "content": "Assistant S2. filler filler filler"},
+        {"role": "user", "content": "Turn 1: reply with just the number 1."},
+        {"role": "assistant", "content": "1"},
+        {"role": "user", "content": "Turn 2: reply with just the number 2."},
+    ]
+
+    assert (
+        es.is_background_request(
+            messages=messages,
+            max_tokens=30,
+            headers={},
+            metadata={},
+            main_system_hash=main_hash,
+        )
+        is False
+    )
+    # The explicit task markers still win regardless of shape.
+    assert (
+        es.is_background_request(
+            messages=messages,
+            max_tokens=30,
+            headers={},
+            metadata={"task": "title_generation"},
+            main_system_hash=main_hash,
+        )
+        is True
+    )
+
+
 # --- model-aware auto budget (v2, founder memory ruling 2026-07-05) ----------
 
 GIB = 1024**3

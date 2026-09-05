@@ -492,10 +492,18 @@ def is_background_request(
             break
     metadata_task = str(metadata.get("task") or metadata.get("openwebui_task") or "")
     current_system_hash = system_prompt_hash(messages)
+    # A system-prompt mismatch only infers a background task for the task
+    # shape itself: one system prompt plus one user turn, which is what an
+    # unmarked title/tags job looks like. A short-answer turn that continues
+    # a conversation (assistant history present) is foreground work from a
+    # second client and must keep its session — issue #454: every
+    # conversation after the first ran sessionless, re-prefilling every
+    # turn, because its 30-token answers matched this heuristic.
     system_mismatch = (
         main_system_hash is not None
         and current_system_hash is not None
         and current_system_hash != main_system_hash
+        and is_no_history_shape(messages)
     )
     return bool(header_task or metadata_task or system_mismatch)
 
