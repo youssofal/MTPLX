@@ -1006,9 +1006,14 @@ public final class MTPLXBackendStore: ObservableObject {
         target: LaunchTarget?,
         launchID: String
     ) async {
-        let occupant = await PortPreflight.classify(
+        // Issue #409: a foreign-looking occupant is re-probed over the
+        // settle window before the port is moved — a draining MTPLX
+        // daemon (stop/start, or the predecessor of an in-app update)
+        // clears on its own and must never cost the user their port.
+        let occupant = await PortPreflight.classifySettled(
             baseURL: baseURL,
-            apiKey: configuration.apiKey
+            apiKey: configuration.apiKey,
+            settleTimeoutSeconds: portSettleTimeoutSeconds
         )
         let occupantDescription: String
         switch occupant {
@@ -1065,6 +1070,10 @@ public final class MTPLXBackendStore: ObservableObject {
         )
     }
 
+    /// How long a foreign-looking port is re-probed before it is moved
+    /// (issue #409). Tests shorten it; the product keeps the shared default.
+    var portSettleTimeoutSeconds: TimeInterval = PortPreflight.settleTimeoutSeconds
+
     /// Test seam: run the port pre-flight and report the resulting port and
     /// fallback notice as Sendable values.
     func preflightOutcomeForTest(
@@ -1087,9 +1096,10 @@ public final class MTPLXBackendStore: ObservableObject {
         launchID: String
     ) async -> Bool {
         let occupiedPort = configuration.port
-        let occupant = await PortPreflight.classify(
+        let occupant = await PortPreflight.classifySettled(
             baseURL: baseURL,
-            apiKey: configuration.apiKey
+            apiKey: configuration.apiKey,
+            settleTimeoutSeconds: portSettleTimeoutSeconds
         )
         switch occupant {
         case .mtplxServer, .unauthorized, .foreign:

@@ -10559,6 +10559,9 @@ final class MTPLXAppCoreTests: XCTestCase {
             configuration: MTPLXAppConfiguration(port: occupiedPort),
             settingsStore: MTPLXSettingsStore(settingsURL: settingsURL)
         )
+        // A steady foreign listener is still foreign after the settle
+        // window; keep the window short so the test stays fast.
+        await MainActor.run { backend.portSettleTimeoutSeconds = 0.5 }
         let (port, notice) = await backend.preflightOutcomeForTest(
             target: nil,
             launchID: "test-launch"
@@ -10571,6 +10574,34 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertTrue(fallbackNotice.contains("\(port)"), fallbackNotice)
         let persisted = try MTPLXSettingsStore(settingsURL: settingsURL).load()
         XCTAssertEqual(persisted.port, port)
+    }
+
+    /// Issue #409: a foreign-looking occupant that clears inside the settle
+    /// window (our own draining daemon on stop/start, the predecessor of an
+    /// in-app update) must not cost the user the configured port.
+    func testPreflightKeepsConfiguredPortWhenTransientOccupantClears() async throws {
+        let occupiedPort = try freeTCPPort()
+        let garbage = try startGarbageHTTPServer(port: occupiedPort)
+        _ = try await waitForNonFreeClassification(port: occupiedPort)
+        let settingsURL = temporaryDirectory().appendingPathComponent("settings.json")
+
+        let backend = await MTPLXBackendStore(
+            configuration: MTPLXAppConfiguration(port: occupiedPort),
+            settingsStore: MTPLXSettingsStore(settingsURL: settingsURL)
+        )
+        await MainActor.run { backend.portSettleTimeoutSeconds = 5 }
+        Task.detached {
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            garbage.terminate()
+        }
+        let (port, notice) = await backend.preflightOutcomeForTest(
+            target: nil,
+            launchID: "test-launch"
+        )
+
+        XCTAssertEqual(port, occupiedPort)
+        XCTAssertNil(notice)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: settingsURL.path))
     }
 
     func testPreflightMovesPortAwayFromExternalMTPLXServer() async throws {

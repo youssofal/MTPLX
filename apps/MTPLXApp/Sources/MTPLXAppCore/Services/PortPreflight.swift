@@ -68,6 +68,37 @@ public enum PortPreflight {
         }
     }
 
+    /// Issue #409 (app path): a stopping MTPLX daemon keeps its listener
+    /// while it drains, but its `/health` stops answering first, so a plain
+    /// probe reads our own draining server as `.foreign` for those few
+    /// seconds — every stop/start (and the first launch after an in-app
+    /// update, whose predecessor is still draining) then moved the
+    /// configured port to +1. Long enough to cover a normal drain, short
+    /// enough that a genuinely foreign listener does not stall a launch.
+    /// SYNC PAIR: mtplx/daemon_client.py wait_for_port_settle.
+    public static let settleTimeoutSeconds: TimeInterval = 5
+    public static let settlePollSeconds: TimeInterval = 0.25
+
+    /// `classify`, re-probed while the answer is `.foreign` until it settles
+    /// or the window closes. Any other classification is terminal and
+    /// returns immediately. Separates a TRANSIENT occupant (our own draining
+    /// server, a socket in the tail of TIME_WAIT, a listener mid-restart)
+    /// from a STEADY foreign listener that is still there after the window.
+    public static func classifySettled(
+        baseURL: URL,
+        apiKey: String?,
+        settleTimeoutSeconds: TimeInterval = settleTimeoutSeconds,
+        pollSeconds: TimeInterval = settlePollSeconds
+    ) async -> PortOccupantKind {
+        let deadline = Date().addingTimeInterval(max(0, settleTimeoutSeconds))
+        var occupant = await classify(baseURL: baseURL, apiKey: apiKey)
+        while case .foreign = occupant, Date() < deadline {
+            try? await Task.sleep(nanoseconds: UInt64(max(0.01, pollSeconds) * 1_000_000_000))
+            occupant = await classify(baseURL: baseURL, apiKey: apiKey)
+        }
+        return occupant
+    }
+
     /// First port strictly after `port` that the daemon's own bind address
     /// can take. `bindHost` must be the CONFIGURED bind host: a wildcard
     /// daemon needs INADDR_ANY free, which a loopback-only check misses
