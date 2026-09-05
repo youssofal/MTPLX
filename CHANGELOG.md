@@ -6,7 +6,7 @@ All notable user-facing changes to MTPLX. The format is based on
 
 ## [2.11.2] - 2026-09-05
 
-A correctness release for every Mac that is not an M5, three session-bank
+A correctness release for every Mac that is not an M5, four session-bank
 and memory fixes for long agent sessions, and app and CLI repairs.
 
 ### Fixed
@@ -39,6 +39,28 @@ and memory fixes for long agent sessions, and app and CLI repairs.
   507 before prefill, naming the projection, the limit and the uncached
   tokens; the engine keeps its sessions. `--allow-swap` keeps the operator's
   explicit choice; between the warning line and the limit nothing changes.
+- **A deep conversation keeps its session at any length (#446).** A live
+  session's committed stream carries the reasoning it streamed and clients
+  resend the history without it, so from turn 2 on every request's raw
+  shared prefix with its session ends where turn 1 started generating. The
+  resolver accepted that match only as a fraction of the new prompt: 22,437
+  shared tokens passed at 89k (25.06 %) and failed at 112k (20.1 %), the
+  request minted a new anonymous session and block-restored 2,048 tokens of
+  turn 1's snapshot, 105 s of prefill for a turn that had been 24 s (the
+  reporter's 14,336 and 18,432-token remnants at turn 4 or 5, five chains of
+  five; the same line crossed one chain in three on 2.10.x). Sessions now
+  record the prompt length of every turn they generated from, and a shared
+  prefix on one of those boundaries keeps the session whatever fraction of
+  the prompt it is; edited histories keep the fraction rule, and unrelated
+  conversations that share only a long system prompt still diverge before
+  any boundary. The request log's prefix diagnostic names the rule
+  (`reuse_rule`, `turn_boundary`).
+- **The sparse-prefill native wheel is signed for notarization.** Its QSA
+  kernel library and extension module are signed with the Developer ID,
+  hardened runtime and a secure timestamp before they enter the runtime
+  wheel (the app's signing pass cannot reach inside the archive), and the
+  release script verifies every Mach-O in that wheel before submitting the
+  app. The first 2.11.2 submission was rejected on exactly those two files.
 - **Later conversations are admitted to the session bank again (#454).**
   The background-task heuristic (short answer + different system prompt)
   classified every conversation-continuing short turn as a title job and
