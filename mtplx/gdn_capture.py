@@ -3127,6 +3127,13 @@ def commit_captured_prefix(
     capture_index = keep_tokens - 1
     for capture in captures.values():
         if isinstance(capture, dict):
+            if "conv_states" not in capture:
+                # A family-native capture (Flash-Next's fixed-M4 rows keyed by
+                # its own GDN row names, no conv tape) is committed by the
+                # model's own commit_verified_window; this walker only knows
+                # the qwen3-next conv_states/states layout. Decline instead of
+                # raising KeyError so the caller falls through (#463).
+                return False
             capture_start = int(capture.get("capture_start", 0))
             if capture_index - capture_start < 0:
                 return False

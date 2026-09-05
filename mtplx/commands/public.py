@@ -10229,6 +10229,36 @@ def _piped_prompt_text() -> str:
         return ""
 
 
+def _one_shot_runtime_env_overrides(
+    args: Any, runtime_model: str, *, generation_mode: str
+) -> dict[str, str]:
+    """The serve runtime contract for an in-process one-shot run (#463).
+
+    ``mtplx run`` and ``chat`` load the runtime in-process and applied only
+    the profile defaults, so Flash-Next never received the family lanes serve
+    stamps at boot (family capture commit, recurrent-state snapshot kept,
+    fixed-M4 verify). The turbo profile's MTPLX_SKIP_VERIFY_SNAPSHOT=1 then
+    left the pre-verify snapshot empty and the legacy capture walker raised
+    on the hyper-connection layers. Resolve exactly what serve resolves:
+    the pack contract, then the family overrides, with explicit exports kept.
+    """
+    from mtplx.server.openai import (
+        _server_runtime_env_overrides,
+        load_runtime_contract,
+    )
+
+    contract, _error = load_runtime_contract(runtime_model)
+    return _server_runtime_env_overrides(
+        SimpleNamespace(
+            model=runtime_model,
+            generation_mode=generation_mode,
+            verify_strategy=getattr(args, "verify_strategy", None),
+            scheduler_mode=getattr(args, "scheduler_mode", "serial"),
+        ),
+        contract.runtime_env_overrides if contract is not None else {},
+    )
+
+
 def _generate_one_shot_public(
     args: Any, *, command: str
 ) -> tuple[int, dict[str, Any], list[Any]]:
@@ -10292,8 +10322,16 @@ def _generate_one_shot_public(
     # made `mtplx run` silently benchmark the slow profile (2026-08-16
     # redp314 board investigation).
     profile = get_profile(_resolved_default_profile_name(args))
-    apply_profile_env(profile.name)
     generation_mode = _generation_mode_from_args(args)
+    # The same runtime contract serve and tune resolve (#463): the pack's env
+    # overrides plus the family lanes, with serve's precedence over the
+    # profile defaults.
+    apply_profile_env(
+        profile.name,
+        runtime_env_overrides=_one_shot_runtime_env_overrides(
+            args, runtime_model, generation_mode=generation_mode
+        ),
+    )
     draft_lm_head = (
         _model_draft_lm_head_spec(inspection, profile)
         if generation_mode == GENERATION_MODE_MTP
