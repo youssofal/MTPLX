@@ -16570,7 +16570,6 @@ def _health_degradation_payload(state: Any) -> dict[str, Any]:
                 kernel_bails[attr_name] = dict(value)
         if kernel_bails:
             nax["bail_counters"] = kernel_bails
-
     return {
         "compiled_verify": compiled_verify,
         "profile_env_overridden": profile_env_overridden,
@@ -19955,6 +19954,25 @@ def _opencode_launch_default_draft_policy(
         )
 
 
+def _bank_history_policy(state: "ServerState") -> str:
+    """The MTP-history policy every bank store, lookup and fingerprint uses.
+
+    MTP runtimes bank prefixes under ``committed`` (the committed MTP-history
+    cache shape). A target-only AR runtime (``--no-load-mtp``) has no MTP
+    head: generation degrades its prefill to the ``cycle`` path and the
+    postcommit store already banked under ``cycle`` — while the lookups, the
+    prefill store and the policy fingerprint kept saying ``committed``. The
+    bank compares the two strings, so every postcommit entry (the longest
+    prefix, the one the next turn matches) was refused with
+    ``policy_mismatch`` and an AR-only Hermes or Pi session re-prefilled its
+    whole prompt on every top-level turn (#465: 14.5k tokens, ~2 minutes per
+    turn on an M1 Max; the idle stall in #455 on an M3 Ultra). One answer per
+    runtime, derived here, used everywhere.
+    """
+    runtime = getattr(state, "runtime", None)
+    return "committed" if bool(getattr(runtime, "mtp_enabled", True)) else "cycle"
+
+
 def _policy_fingerprint(
     state: ServerState,
     *,
@@ -20019,7 +20037,7 @@ def _policy_fingerprint(
         f"generation_mode={effective_mode}",
         f"depth={effective_depth}",
         "hidden_variant=post_norm",
-        "mtp_history_policy=committed",
+        f"mtp_history_policy={_bank_history_policy(state)}",
         f"draft_head={state.draft_head_identity}",
         f"adaptive={json.dumps(adaptive, sort_keys=True, separators=(',', ':'))}",
         f"proposal_cache={json.dumps(proposal_cache, sort_keys=True, separators=(',', ':'))}",
@@ -20642,8 +20660,9 @@ def _store_retokenized_history_snapshot(
     # postcommit re-prefill through the AR (cycle) path instead: the trunk cache
     # is still banked for next-turn prefix reuse, and the stored policy metadata
     # stays consistent with what the next AR turn looks up. MTP runtimes keep
-    # the committed policy unchanged.
-    history_mtp_policy = "committed" if state.runtime.mtp_enabled else "cycle"
+    # the committed policy unchanged. The lookups and the prefill store derive
+    # the same answer from _bank_history_policy (#465).
+    history_mtp_policy = _bank_history_policy(state)
     try:
         try:
             if _abort_requested():
@@ -21317,7 +21336,7 @@ def _store_generation_final_history_snapshot(
             keep_live_ref=bool(keep_live_ref),
             session_id=session_id,
             template_hash=state.template_hash,
-            mtp_history_policy="committed",
+            mtp_history_policy=_bank_history_policy(state),
             draft_head_identity=state.draft_head_identity,
             policy_fingerprint=policy_fingerprint,
             mtp_history_snapshot=mtp_snapshot,
@@ -22697,7 +22716,7 @@ def _build_mtp_batch_session_hooks(
                 mtp_enabled=True,
                 hidden_variant="post_norm",
                 template_hash=template_hash,
-                mtp_history_policy="committed",
+                mtp_history_policy=_bank_history_policy(state),
                 draft_head_identity=state.draft_head_identity,
                 policy_fingerprint=policy_fingerprint,
                 min_restore_tokens=min_restore_tokens,
@@ -22796,7 +22815,7 @@ def _build_mtp_batch_session_hooks(
                 hidden_variant="post_norm",
                 session_id=session_id,
                 template_hash=template_hash,
-                mtp_history_policy="committed",
+                mtp_history_policy=_bank_history_policy(state),
                 draft_head_identity=state.draft_head_identity,
                 policy_fingerprint=policy_fingerprint,
                 mtp_history_snapshot=mtp_snapshot,
@@ -24144,7 +24163,7 @@ def _run_generation(
                         seed=generation_seed,
                         mtp_hidden_variant="post_norm",
                         mtp_cache_policy="persistent",
-                        mtp_history_policy="committed",
+                        mtp_history_policy=_bank_history_policy(state),
                         verify_strategy=state.args.verify_strategy,
                         verify_core=state.args.verify_core,
                         draft_core=str(
@@ -24291,7 +24310,7 @@ def _run_generation(
                 keep_live_ref=bool(session_keep_live_ref),
                 session_id=session_id,
                 template_hash=session_template_hash,
-                mtp_history_policy="committed",
+                mtp_history_policy=_bank_history_policy(state),
                 draft_head_identity=session_draft_head_identity,
                 policy_fingerprint=session_policy_fingerprint,
                 mtp_history_snapshot=mtp_snapshot,
