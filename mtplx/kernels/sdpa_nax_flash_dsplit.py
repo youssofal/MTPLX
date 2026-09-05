@@ -29,6 +29,9 @@ from .sdpa_gqa_packed import _paged_reduce_kernel
 from .sdpa_nax_flash import _HEADER
 
 nax_flash_dsplit_bail_counts: dict[str, int] = {}
+# Successful dispatches, so /health can show the route engaged (not only
+# its bails) — the one-line receipt the #459 reports needed.
+nax_flash_dsplit_dispatch_counts: dict[str, int] = {}
 # First-use build proof (issue #461): mx.fast.metal_kernel returns lazily,
 # so a Metal library that fails to build (a MetalPerformancePrimitives
 # header missing on an older macOS, a toolchain without Metal 4) surfaces at
@@ -397,4 +400,5 @@ def sdpa_nax_flash_dsplit(
         output_shapes=[(bsz, hq, q_len, d)],
         output_dtypes=[queries.dtype],
     )
+    nax_flash_dsplit_dispatch_counts["dispatched"] = nax_flash_dsplit_dispatch_counts.get("dispatched", 0) + 1
     return out

@@ -496,3 +496,23 @@ def test_health_degradation_lists_profile_env_overrides(monkeypatch):
     assert response.status_code == 200
     overridden = response.json()["degradation"]["profile_env_overridden"]
     assert key in overridden
+
+
+def test_health_nax_block_reports_flash_route_dispatches(monkeypatch):
+    # #459: reporters could only see bails. An engaged route now shows its
+    # dispatch count so an M5 receipt and an M1-M4 receipt read differently.
+    import mtplx.kernels.sdpa_nax_flash as flash
+    import mtplx.kernels.sdpa_nax_flash_dsplit as dsplit
+
+    monkeypatch.setattr(flash, "nax_flash_dispatch_counts", {"dispatched": 7})
+    monkeypatch.setattr(dsplit, "nax_flash_dsplit_dispatch_counts", {"dispatched": 3})
+    state = _fake_state()
+    client = TestClient(create_app(state))
+
+    body = client.get("/health").json()
+
+    nax = body["degradation"]["nax"]
+    assert nax["flash_dispatch_counters"] == {
+        "nax_flash_dispatch_counts": {"dispatched": 7},
+        "nax_flash_dsplit_dispatch_counts": {"dispatched": 3},
+    }

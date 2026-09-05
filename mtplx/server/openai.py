@@ -16570,6 +16570,27 @@ def _health_degradation_payload(state: Any) -> dict[str, Any]:
                 kernel_bails[attr_name] = dict(value)
         if kernel_bails:
             nax["bail_counters"] = kernel_bails
+    # The positive receipt: how often the flash-decoding route actually
+    # dispatched on this GPU. With the hardware gate (#458/#459) an M1-M4
+    # Mac shows zero here and gpu_family_or_os bails above; an M5 shows
+    # the dispatch count climbing once a session passes the 8192-token
+    # KV bucket.
+    flash_dispatches: dict[str, Any] = {}
+    for module_name, attr_name in (
+        ("mtplx.kernels.sdpa_nax_flash", "nax_flash_dispatch_counts"),
+        ("mtplx.kernels.sdpa_nax_flash_dsplit", "nax_flash_dsplit_dispatch_counts"),
+    ):
+        try:
+            from importlib import import_module
+
+            value = getattr(import_module(module_name), attr_name, None)
+        except BaseException:
+            continue
+        if isinstance(value, Mapping):
+            flash_dispatches[attr_name] = dict(value)
+    if flash_dispatches:
+        nax["flash_dispatch_counters"] = flash_dispatches
+
     return {
         "compiled_verify": compiled_verify,
         "profile_env_overridden": profile_env_overridden,
