@@ -573,6 +573,16 @@ def _comma_floats(value: str) -> tuple[float, ...]:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+def _comma_ints(value: str) -> tuple[int, ...]:
+    parts = [part.strip() for part in value.split(",") if part.strip()]
+    if not parts:
+        raise argparse.ArgumentTypeError("expected comma-separated ints")
+    try:
+        return tuple(int(part) for part in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def _positive_int(value: str) -> int:
     try:
         parsed = int(value)
@@ -1989,6 +1999,7 @@ def _cmd_mtp_adaptive(args: argparse.Namespace) -> int:
         limit=args.limit,
         enable_thinking=False if args.disable_thinking else None,
         compare_ar=args.compare_ar,
+        compare_static=args.compare_static,
         mtp_hidden_variant=args.mtp_hidden_variant,
         mtp_cache_policy=args.mtp_cache_policy,
         mtp_history_policy=args.mtp_history_policy,
@@ -5019,6 +5030,12 @@ def build_parser() -> argparse.ArgumentParser:
     adaptive_p.add_argument("--limit", type=int)
     adaptive_p.add_argument("--disable-thinking", action="store_true")
     adaptive_p.add_argument("--compare-ar", action="store_true")
+    adaptive_p.add_argument(
+        "--compare-static",
+        type=_comma_ints,
+        default=(),
+        help="Also run fixed-depth baselines on the same suite, e.g. 2,3",
+    )
     adaptive_p.add_argument("--mtp-hidden-variant", default="post_norm")
     adaptive_p.add_argument(
         "--mtp-cache-policy", choices=["persistent", "fresh"], default="persistent"

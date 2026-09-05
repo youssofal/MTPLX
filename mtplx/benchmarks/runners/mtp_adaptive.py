@@ -58,6 +58,7 @@ def run_mtp_adaptive(
     limit: int | None = None,
     enable_thinking: bool | None = None,
     compare_ar: bool = False,
+    compare_static: tuple[int, ...] = (),
     base_hidden_variant: str | None = None,
     mtp_hidden_variant: str = "post_norm",
     concat_order: str | None = None,
@@ -238,6 +239,66 @@ def run_mtp_adaptive(
             }
         )
 
+    static_rows: dict[str, list[dict[str, Any]]] = {}
+    static_summaries: dict[str, dict[str, Any]] = {}
+    for static_depth in compare_static:
+        depth_rows: list[dict[str, Any]] = []
+        for index, (case, ids) in enumerate(encoded):
+            static_policy = AdaptiveDepthPolicy(
+                max_depth=static_depth,
+                min_depth=static_depth,
+                start_depth=static_depth,
+                increase_after=increase_after,
+                decrease_after=decrease_after,
+            )
+            out = generate_mtpk(
+                rt,
+                ids,
+                max_tokens=min(max_tokens, case.max_tokens),
+                sampler=sampler,
+                speculative_depth=static_depth,
+                seed=seed + index,
+                mtp_hidden_variant=mtp_hidden_variant,
+                mtp_cache_policy=mtp_cache_policy,
+                mtp_history_policy=mtp_history_policy,
+                draft_sampler=draft_sampler,
+                verify_strategy=verify_strategy,
+                verify_core=verify_core,
+                adaptive_policy=static_policy,
+            )
+            depth_rows.append(
+                {
+                    "prompt_id": case.id,
+                    "category": case.category,
+                    "generated_tokens": out.stats.generated_tokens,
+                    "tok_s": out.stats.tok_s,
+                    "tokens": out.tokens,
+                    "accepted_drafts": out.stats.accepted_drafts,
+                    "drafted_tokens": out.stats.drafted_tokens,
+                    "acceptance_by_depth": _rate_by_depth(
+                        out.stats.accepted_by_depth,
+                        out.stats.drafted_by_depth,
+                    ),
+                    "exact_match_vs_adaptive": (
+                        out.tokens == rows[index]["tokens"]
+                        if temperature <= 0
+                        else None
+                    ),
+                }
+            )
+        key = str(static_depth)
+        static_rows[key] = depth_rows
+        static_summaries[key] = {
+            "depth": static_depth,
+            "mean_tok_s": (
+                statistics.mean([row["tok_s"] for row in depth_rows])
+                if depth_rows
+                else 0.0
+            ),
+            "accepted_drafts": sum(row["accepted_drafts"] for row in depth_rows),
+            "drafted_tokens": sum(row["drafted_tokens"] for row in depth_rows),
+        }
+
     validations = [v for row in rows for v in row["validations"]]
     accepted_by_depth = _sum_lists([row["accepted_by_depth"] for row in rows], max_depth)
     drafted_by_depth = _sum_lists([row["drafted_by_depth"] for row in rows], max_depth)
@@ -250,6 +311,7 @@ def run_mtp_adaptive(
         "seed": seed,
         "enable_thinking": enable_thinking,
         "compare_ar": compare_ar,
+        "compare_static": list(compare_static),
         "policy_kind": policy_kind,
         "base_hidden_variant": resolved_base_hidden_variant,
         "mtp_hidden_variant": resolved_mtp_hidden_variant,
@@ -290,6 +352,8 @@ def run_mtp_adaptive(
             "ev_exploration_interval": ev_exploration_interval,
         },
         "ar_rows": ar_rows,
+        "static_rows": static_rows,
+        "static_summaries": static_summaries,
         "rows": rows,
         "summary": {
             "prompts": len(rows),
