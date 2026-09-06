@@ -1875,7 +1875,7 @@ public final class MTPLXBackendStore: ObservableObject {
 
     public func updateLiveSettings(_ next: MutableSettings) async throws {
         let merged = mergedLiveSettingsPatch(next)
-        let livePatch = Self.liveMutableSettingsPatch(from: next)
+        let livePatch = Self.liveSettingsUpdatePatch(from: next)
         // Only the caller's own patch counts as a depth choice; the
         // merged snapshot always carries the daemon's current depth.
         let depthIsExplicitSelection = next.depth != nil
@@ -1920,6 +1920,17 @@ public final class MTPLXBackendStore: ObservableObject {
         if persist && previous != daemonSettings {
             try? persistLiveSettings(daemonSettings)
         }
+    }
+
+    /// The patch a direct live update posts. It is the carried patch plus
+    /// the adaptive depth policy: the policy is live on the daemon that is
+    /// running now, but it is not carried into the next launch (the launch
+    /// arguments own it through `adaptiveDepth`), and a family that owns its
+    /// draft policy rejects the key, so the carry path leaves it out.
+    nonisolated static func liveSettingsUpdatePatch(from settings: MutableSettings) -> MutableSettings {
+        var patch = liveMutableSettingsPatch(from: settings)
+        patch.adaptivePolicy = settings.adaptivePolicy
+        return patch
     }
 
     nonisolated static func liveMutableSettingsPatch(from settings: MutableSettings) -> MutableSettings {

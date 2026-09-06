@@ -217,7 +217,11 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
     /// live through `/v1/mtplx/settings` and passed at launch as an
     /// explicit `--adaptive-policy none`, because the engine injects
     /// `expected_value` for every family that supports the policy.
-    public var adaptiveDepth: Bool
+    /// Adaptive depth switch. `nil` keeps the launch target's own preset
+    /// (Pi and Hermes name the expected-value policy, chat and the other
+    /// targets pass no policy); `true` names the policy at launch;
+    /// `false` passes an explicit `none`.
+    public var adaptiveDepth: Bool?
     public var ramSessionCachePolicy: String
     public var ramSessionBlockPrefixRestore: Bool
     public var ramSessionCacheMaxEntries: Int
@@ -378,7 +382,7 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         retrievalMaxResident: Int = 2,
         retrievalIdleTimeout: Double = 0,
         streamStallDeadlineSeconds: Double = MTPLXAppConfiguration.defaultStreamStallDeadlineSeconds,
-        adaptiveDepth: Bool = true,
+        adaptiveDepth: Bool? = nil,
         ramSessionCachePolicy: String = "target-default",
         ramSessionBlockPrefixRestore: Bool = true,
         ramSessionCacheMaxEntries: Int = 8,
@@ -771,7 +775,7 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         streamStallDeadlineSeconds = max(
             0, field(Double.self, .streamStallDeadlineSeconds) ?? defaults.streamStallDeadlineSeconds
         )
-        adaptiveDepth = field(Bool.self, .adaptiveDepth) ?? defaults.adaptiveDepth
+        adaptiveDepth = field(Bool.self, .adaptiveDepth)
         ramSessionCachePolicy = field(String.self, .ramSessionCachePolicy) ?? defaults.ramSessionCachePolicy
         ramSessionBlockPrefixRestore = field(Bool.self, .ramSessionBlockPrefixRestore) ?? defaults.ramSessionBlockPrefixRestore
         ramSessionCacheMaxEntries = field(Int.self, .ramSessionCacheMaxEntries) ?? defaults.ramSessionCacheMaxEntries

@@ -119,7 +119,7 @@ struct InferenceParamsOverlay: View, Equatable {
     @State private var topK: Int = 20
     @State private var presencePenalty: Double = 0
     @State private var depth: Int = 3
-    @State private var adaptiveDepth: Bool = true
+    @State private var adaptiveDepth: Bool = false
 
     // Reasoning draft — live-mutable. "auto" lets the daemon decide per
     // turn, "on" always reasons, "off" suppresses reasoning entirely.
@@ -1469,6 +1469,7 @@ struct InferenceParamsOverlay: View, Equatable {
         }
         adaptiveDepth = (settings?.adaptivePolicy).map { $0 != "none" }
             ?? snapshot.configuration.adaptiveDepth
+            ?? false
         reasoningMode = normalizedReasoningMode(
             settings?.reasoning
                 ?? compatibleConfigurationReasoning

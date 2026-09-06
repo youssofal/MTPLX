@@ -227,11 +227,14 @@ and app and CLI repairs.
   cache with one 100-byte record per row, checked bit-for-bit, and
   `MTPLX_NGRAM_ROW_FILE` serves from it. Off by default; no speed claim
   until the cold-row measurement exists. `docs/diagnostics/ngram-row-cache.md`.
-- **Adaptive depth switch under Draft depth in the app** (on by default,
-  live, remembered across launches; hidden for a family that owns its own
-  draft policy). Off drafts to the full depth every cycle and passes an
-  explicit `--adaptive-policy none` at launch. `/v1/mtplx/settings`
-  accepts `adaptive_policy` and reports `adaptive_depth_supported`.
+- **Adaptive depth switch under Draft depth in the app.** It shows the
+  daemon's live policy: the Pi and Hermes launches have always named the
+  expected-value policy through their presets, chat and the other targets
+  pass none. A flip applies live and is remembered across launches for
+  every target (the launch then passes an explicit `--adaptive-policy`);
+  the switch is hidden for a family that owns its own draft policy.
+  `/v1/mtplx/settings` accepts `adaptive_policy` and reports
+  `adaptive_depth_supported`.
 - **`mtplx trace --hermes-db <state.db> [--hermes-log <agent.log>]`** joins a
   Hermes session to engine receipts by token counts and completion clock;
   ambiguous joins stay unmatched. Trace charts leave missing samples and

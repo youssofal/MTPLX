@@ -1629,15 +1629,24 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertFalse(configuration.pinFansAtMaxOnStart)
     }
 
-    func testAppConfigurationAdaptiveDepthDefaultsOnAndRoundTrips() throws {
-        XCTAssertTrue(MTPLXAppConfiguration().adaptiveDepth)
+    func testAppConfigurationAdaptiveDepthDefaultsToTargetPresetAndRoundTrips() throws {
+        // Unset keeps each launch target's shipped policy, so a settings
+        // file without the key changes nothing; a choice round-trips.
+        XCTAssertNil(MTPLXAppConfiguration().adaptiveDepth)
         let legacy = try JSONDecoder().decode(MTPLXAppConfiguration.self, from: Data("{}".utf8))
-        XCTAssertTrue(legacy.adaptiveDepth)
-        var configuration = MTPLXAppConfiguration()
-        configuration.adaptiveDepth = false
-        let decoded = try JSONDecoder().decode(
-            MTPLXAppConfiguration.self, from: JSONEncoder().encode(configuration))
-        XCTAssertFalse(decoded.adaptiveDepth)
+        XCTAssertNil(legacy.adaptiveDepth)
+        let unsetRoot = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(MTPLXAppConfiguration()))
+                as? [String: Any]
+        )
+        XCTAssertNil(unsetRoot["adaptive_depth"])
+        for choice in [true, false] {
+            var configuration = MTPLXAppConfiguration()
+            configuration.adaptiveDepth = choice
+            let decoded = try JSONDecoder().decode(
+                MTPLXAppConfiguration.self, from: JSONEncoder().encode(configuration))
+            XCTAssertEqual(decoded.adaptiveDepth, choice)
+        }
     }
 
     func testCommandBuilderPassesExplicitNoneWhenAdaptiveDepthIsOff() throws {
@@ -1651,11 +1660,60 @@ final class MTPLXAppCoreTests: XCTestCase {
         configuration.adaptiveDepth = false
         let command = try builder.buildServeCommand(
             configuration: configuration, target: .hermes, launchID: "hermes-launch")
-        // The engine injects expected_value for every family that supports
-        // the policy, so off must be an explicit flag.
+        // The daemon's default is no policy; off is still explicit so a
+        // launch preset cannot re-enable it.
         XCTAssertTrue(command.arguments.containsInOrder(["--adaptive-policy", "none"]))
         XCTAssertFalse(command.arguments.contains("--adaptive-min-depth"))
         XCTAssertFalse(command.arguments.contains("--adaptive-ev-base-depth"))
+    }
+
+    func testCommandBuilderPassesExpectedValueWhenAdaptiveDepthIsOn() throws {
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: [
+            "PATH": fake.deletingLastPathComponent().path,
+            "MTPLX_APP_TEST_PHYSICAL_MEMORY_BYTES": "137438953472",
+        ])
+        var configuration = MTPLXAppConfiguration(
+            executablePath: fake.path, model: "/models/qwen", profile: "sustained")
+        configuration.adaptiveDepth = true
+        let command = try builder.buildServeCommand(
+            configuration: configuration, target: .hermes, launchID: "hermes-launch")
+        // The daemon starts with no policy, so "on" has to name it at
+        // launch for the switch to survive a relaunch. The Hermes preset
+        // names the policy itself and carries its tuned parameters.
+        XCTAssertTrue(command.arguments.containsInOrder(["--adaptive-policy", "expected_value"]))
+        XCTAssertFalse(command.arguments.containsInOrder(["--adaptive-policy", "none"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--adaptive-min-depth", "1"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--adaptive-ev-base-depth", "2"]))
+
+        // Chat has no preset policy: "on" still names it, without parameters.
+        let chat = try builder.buildServeCommand(
+            configuration: configuration, target: .chat, launchID: "chat-launch")
+        XCTAssertTrue(chat.arguments.containsInOrder(["--adaptive-policy", "expected_value"]))
+        XCTAssertFalse(chat.arguments.contains("--adaptive-min-depth"))
+        XCTAssertFalse(chat.arguments.contains("--adaptive-ev-base-depth"))
+    }
+
+    func testCommandBuilderKeepsTargetPresetPolicyWhenAdaptiveDepthIsUnset() throws {
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: [
+            "PATH": fake.deletingLastPathComponent().path,
+            "MTPLX_APP_TEST_PHYSICAL_MEMORY_BYTES": "137438953472",
+        ])
+        let configuration = MTPLXAppConfiguration(
+            executablePath: fake.path, model: "/models/qwen", profile: "sustained")
+        XCTAssertNil(configuration.adaptiveDepth)
+        // Shipped behavior per target: Hermes and Pi name the policy through
+        // their presets, chat passes no policy at all.
+        let hermes = try builder.buildServeCommand(
+            configuration: configuration, target: .hermes, launchID: "hermes-launch")
+        XCTAssertTrue(hermes.arguments.containsInOrder(["--adaptive-policy", "expected_value"]))
+        let pi = try builder.buildServeCommand(
+            configuration: configuration, target: .pi, launchID: "pi-launch")
+        XCTAssertTrue(pi.arguments.containsInOrder(["--adaptive-policy", "expected_value"]))
+        let chat = try builder.buildServeCommand(
+            configuration: configuration, target: .chat, launchID: "chat-launch")
+        XCTAssertFalse(chat.arguments.contains("--adaptive-policy"))
     }
 
     func testAppConfigurationMigratesLegacyPinnedFansToMax() throws {
@@ -5011,6 +5069,31 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(reloadedBackend.settings?.topK, 32)
         XCTAssertEqual(reloadedBackend.settings?.reasoning, "on")
         XCTAssertEqual(reloadedBackend.settings?.enableThinking, true)
+    }
+
+    func testLiveSettingsUpdatePatchCarriesAdaptivePolicyAndTheCarriedPatchDoesNot() throws {
+        var settings = MutableSettings(depth: 3, temperature: 1.0)
+        settings.adaptivePolicy = "expected_value"
+        settings.adaptiveDepthSupported = true
+
+        let update = MTPLXBackendStore.liveSettingsUpdatePatch(from: settings)
+        let updateRoot = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(update)) as? [String: Any]
+        )
+        // The direct live update names the policy; the daemon builds its
+        // depth policy per request, so the switch applies without a restart.
+        XCTAssertEqual(updateRoot["adaptive_policy"] as? String, "expected_value")
+        XCTAssertEqual(updateRoot["depth"] as? Int, 3)
+        XCTAssertNil(updateRoot["adaptive_depth_supported"])
+
+        let carried = MTPLXBackendStore.liveMutableSettingsPatch(from: settings)
+        let carriedRoot = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(carried)) as? [String: Any]
+        )
+        // The patch carried into the next launch leaves the policy to the
+        // launch arguments: a family that owns its draft policy rejects it.
+        XCTAssertNil(carriedRoot["adaptive_policy"])
+        XCTAssertEqual(carriedRoot["depth"] as? Int, 3)
     }
 
     func testLiveSettingsPatchDoesNotEchoDescriptorFields() throws {

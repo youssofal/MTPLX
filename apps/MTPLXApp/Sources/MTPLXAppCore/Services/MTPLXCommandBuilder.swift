@@ -381,9 +381,9 @@ public struct MTPLXCommandBuilder: Sendable {
         if let reasoningEffort = resolved.reasoningEffort {
             arguments.append(contentsOf: ["--reasoning-effort", reasoningEffort])
         }
-        if !configuration.adaptiveDepth {
-            // The engine injects expected_value for every family that
-            // supports the policy, so "off" has to be said explicitly.
+        if configuration.adaptiveDepth == false {
+            // The daemon's own default is no policy. Off is still said
+            // explicitly so a launch preset cannot re-enable it.
             arguments.append(contentsOf: ["--adaptive-policy", "none"])
         }
         if let adaptivePolicy = resolved.adaptivePolicy, adaptivePolicy != "none" {
@@ -988,7 +988,18 @@ struct ResolvedDaemonArgs {
             : preset.draftTopK
         toolPromptMode = preset.toolPromptMode
         chatTemplateProfile = preset.chatTemplateProfile
-        adaptivePolicy = configuration.adaptiveDepth ? preset.adaptivePolicy : "none"
+        // The daemon starts with no depth policy unless told otherwise, so
+        // "on" has to name the policy at launch to survive a relaunch. Unset
+        // keeps the target's preset: Pi and Hermes name expected_value, the
+        // other targets pass nothing.
+        switch configuration.adaptiveDepth {
+        case .some(false):
+            adaptivePolicy = "none"
+        case .some(true):
+            adaptivePolicy = preset.adaptivePolicy ?? "expected_value"
+        case .none:
+            adaptivePolicy = preset.adaptivePolicy
+        }
         adaptiveMinDepth = preset.adaptiveMinDepth
         adaptiveEVBaseDepth = preset.adaptiveEVBaseDepth
         adaptiveEVWarmupFullDepthCycles = preset.adaptiveEVWarmupFullDepthCycles
