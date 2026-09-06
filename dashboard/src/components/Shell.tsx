@@ -5,6 +5,7 @@ import {
   Database,
   HardDrive,
   Layers,
+  Network,
   Settings,
   Sliders,
   Thermometer,
@@ -24,6 +25,7 @@ export type TabId =
   | "memory"
   | "thermal"
   | "requests"
+  | "systems"
   | "settings";
 
 const TABS: { id: TabId; label: string; icon: typeof Activity }[] = [
@@ -33,6 +35,7 @@ const TABS: { id: TabId; label: string; icon: typeof Activity }[] = [
   { id: "memory", label: "Memory", icon: HardDrive },
   { id: "thermal", label: "Thermal", icon: Thermometer },
   { id: "requests", label: "Requests", icon: Sliders },
+  { id: "systems", label: "Systems", icon: Network },
   { id: "settings", label: "Settings", icon: Settings },
 ];
 

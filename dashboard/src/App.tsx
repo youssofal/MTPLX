@@ -11,6 +11,7 @@ import { RequestsTab } from "./components/RequestsTab";
 import { Shell, type TabId } from "./components/Shell";
 import { SignInGate } from "./components/SignInGate";
 import { SpeculativeTab } from "./components/SpeculativeTab";
+import { SystemsTab } from "./components/SystemsTab";
 import { ThermalTab } from "./components/ThermalTab";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useMetricsStream } from "./hooks/useMetricsStream";
@@ -67,6 +68,8 @@ function DashboardRoot() {
         <ThermalTab />
       ) : active === "requests" ? (
         <RequestsTab />
+      ) : active === "systems" ? (
+        <SystemsTab />
       ) : active === "settings" ? (
         <ControlsSidebar />
       ) : null}

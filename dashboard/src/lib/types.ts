@@ -360,3 +360,24 @@ export type PrefillHistoryPayload = {
   capacity: number;
   history: PrefillRow[];
 };
+
+export type RuntimeSystemState = {
+  available?: boolean;
+  enabled?: boolean;
+  wired?: boolean;
+  [key: string]: unknown;
+};
+
+export type RuntimeSystemContract = {
+  revision: number;
+  updated_at_s: number;
+  status: RuntimeSystemState;
+};
+
+export type RuntimeSystemsPayload = {
+  ts: number;
+  revision: number;
+  updated_at_s: number;
+  system_count: number;
+  systems: Record<string, RuntimeSystemContract>;
+};

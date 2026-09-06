@@ -36,3 +36,12 @@ export function useHealth() {
     refetchOnWindowFocus: false,
   });
 }
+
+export function useRuntimeSystems() {
+  return useQuery({
+    queryKey: ["runtimeSystems"],
+    queryFn: api.getSystems,
+    refetchInterval: 3000,
+    refetchOnWindowFocus: false,
+  });
+}
