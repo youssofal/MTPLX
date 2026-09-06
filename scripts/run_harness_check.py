@@ -4,6 +4,7 @@
 Example: python scripts/run_harness_check.py --out outputs/pi --timeout 1200 -- pi -p "Build a game"
 This bounds the QA process, never the model's output or reasoning budget.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -28,8 +29,13 @@ def main() -> int:
     started = time.time()
     timed_out = False
     with args.out.with_suffix(".log").open("x") as log:
-        child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log,
-                                 stderr=subprocess.STDOUT, start_new_session=True)
+        child = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
         try:
             code = child.wait(timeout=args.timeout)
         except subprocess.TimeoutExpired:
@@ -48,9 +54,14 @@ def main() -> int:
                 os.killpg(child.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-    receipt = dict(command=command, started_at_s=started,
-                   elapsed_s=time.time() - started, exit_code=code,
-                   timed_out=timed_out, process_succeeded=code == 0)
+    receipt = dict(
+        command=command,
+        started_at_s=started,
+        elapsed_s=time.time() - started,
+        exit_code=code,
+        timed_out=timed_out,
+        process_succeeded=code == 0,
+    )
     args.out.with_suffix(".json").write_text(json.dumps(receipt, indent=2) + "\n")
     print(json.dumps(receipt), flush=True)
     return code if code >= 0 else 128 - code

@@ -3978,6 +3978,23 @@ class _SidecarGather:
             self._maps[name] = (mm, info["dtype"])
             itemsize = 4 if info["dtype"] == "U32" else 2
             self._row_meta.append((offset, int(shape[1]) * itemsize))
+        self.row_layout = "planar"
+        row_file = os.environ.get("MTPLX_NGRAM_ROW_FILE")
+        if row_file:
+            from mtplx.ngram_row_layout import open_rows
+
+            row_path = Path(row_file).expanduser()
+            try:
+                maps, record = open_rows(row_path, path, entries)
+                row_fd = os.open(str(row_path), os.O_RDONLY)
+            except Exception:
+                os.close(self._fd)
+                raise
+            os.close(self._fd)
+            self._fd, self._maps, self._row_meta = row_fd, maps, [record]
+            path = row_path
+            self.row_layout = "interleaved"
+            print(f"[qwen4_exp] ngram row layout: interleaved ({record[1]} bytes/row)", flush=True)
         self._pool = None
         self.prefetch_batches = 0
         self.lookahead_batches = 0

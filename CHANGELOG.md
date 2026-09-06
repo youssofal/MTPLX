@@ -6,13 +6,20 @@ All notable user-facing changes to MTPLX. The format is based on
 
 ## [2.11.2] - 2026-09-05
 
-A correctness release for every Mac that is not an M5, four session-bank
-and memory fixes for long agent sessions, and app and CLI repairs.
+- Complete interactive CLI family setup, matching one-shot and server paths.
+- Inherit root Hermes terminal settings when a profile has no explicit backend.
+- Recover from optional native-wheel selector failure using the bundled pure wheel.
+- Correct proposal-cycle accounting and distinguish measured MTP throughput from
+  conditional acceptance estimates; record real harness failures and timeouts.
+
+
+A recovery release with hardware-routing, session-bank, memory-admission,
+app and CLI fixes. Cross-hardware speed measurements remain separate.
 
 ### Fixed
 
 - **27B on M1–M4: the flash-decoding verify route is gated by hardware
-  (#459, #464, #467, #455, #461).** 2.11 turned the route on in turbo without
+  (#459, #464, #467, #461).** 2.11 turned the route on in turbo without
   a GPU-family gate. It engages once the KV buffer reaches 8,192 tokens and
   uses the M5 GPU's tensor units; on M1–M4 GPUs it returned wrong attention
   (unrelated reasoning, imaginary tasks, mixed languages, no tool calls) and
@@ -24,13 +31,13 @@ and memory fixes for long agent sessions, and app and CLI repairs.
   engaged route. Rehearsed on an M5 Max with the reporters' 14k and 32k
   diff-summary prompts: the forced M1–M4 path and the native route both
   answer correctly; the route counts 66 dispatches with no bails.
-- **AR-only sessions restore again (#465, #455).** A target-only AR runtime
+- **AR-only sessions restore again (#465).** A target-only AR runtime
   (`--no-load-mtp`) banked its postcommit prefix under the `cycle` history
   policy while every lookup, the prefill store and the cache fingerprint
   said `committed`, so the bank refused the longest entry with
   `policy_mismatch` and Hermes or Pi re-prefilled the whole prompt on every
-  top-level turn (14.5k tokens, about two minutes on an M1 Max; the idle
-  stall on an M3 Ultra). One policy per runtime, derived in one place.
+  top-level turn. One policy per runtime is now derived in one place.
+  This does not establish that all short-prompt or idle symptoms in #455 are fixed.
 - **The pre-prefill memory guard refuses a prompt that still projects over
   the memory limit after reclamation (#450).** It had admitted a 136k
   prompt at 105.4 GB against a 103.1 GB limit after clearing the allocator
@@ -39,7 +46,7 @@ and memory fixes for long agent sessions, and app and CLI repairs.
   507 before prefill, naming the projection, the limit and the uncached
   tokens; the engine keeps its sessions. `--allow-swap` keeps the operator's
   explicit choice; between the warning line and the limit nothing changes.
-- **A deep conversation keeps its session at any length (#446).** A live
+- **Deep conversations retain their session at recognized turn boundaries (#446).** A live
   session's committed stream carries the reasoning it streamed and clients
   resend the history without it, so from turn 2 on every request's raw
   shared prefix with its session ends where turn 1 started generating. The
@@ -69,7 +76,7 @@ and memory fixes for long agent sessions, and app and CLI repairs.
   (system prompt + one user turn) infers a background task now. Reproduced
   with the reporter's script: sessions two to four went from 0 % to 100 %
   cached on their third turn.
-- **`mtplx run` and `mtplx chat` work on Flash-Next (#463).** The one-shot
+- **CLI entrypoints share the Flash-Next runtime contract (#463).** The one-shot
   path applied only the profile defaults, never the family lanes serve
   stamps, and crashed in the legacy capture walker
   (`AttributeError: 'DecoderLayer' object has no attribute

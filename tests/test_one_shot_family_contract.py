@@ -96,6 +96,7 @@ def test_interactive_cli_applies_family_contract_before_loading(tmp_path, monkey
     from mtplx.server import openai
     from mtplx import runtime
 
+    monkeypatch.setattr(os, "environ", dict(os.environ))
     for key in list(os.environ):
         if key.startswith("MTPLX_"):
             monkeypatch.delenv(key)
