@@ -1,0 +1,38 @@
+{
+  "command": "python scripts/measure_request_capture.py --records 1000",
+  "disabled": {
+    "microseconds_per_record": 0.658,
+    "total_ms": 0.658
+  },
+  "enabled_default_privacy": {
+    "bytes_per_record": 1349.89,
+    "files": 1000,
+    "microseconds_per_record": 595.733,
+    "records_per_second": 1678.604,
+    "total_bytes": 1349890,
+    "total_ms": 595.733
+  },
+  "measured_at_utc": "2026-08-26T04:52:53Z",
+  "measurement_scope": "One dispatch and one completion write per enabled record, plus the same calls with capture disabled. Validation is outside timing.",
+  "payload": {
+    "completion_token_count": 64,
+    "prompt_chars": 736,
+    "prompt_token_count": 256,
+    "response_chars": 400
+  },
+  "platform": {
+    "machine": "arm64",
+    "python": "3.14.6",
+    "system": "Darwin"
+  },
+  "privacy_assertions": {
+    "all_records_completed": true,
+    "file_count_matches": true,
+    "prompt_response_message_and_secret_content_absent": true,
+    "raw_prompt_and_completion_token_ids_absent": true,
+    "token_counts_and_sha256_digests_present": true
+  },
+  "records": 1000,
+  "schema_version": 1,
+  "source_revision": "fe5b5e59a14e0066f3191951483e3a65b9c55592"
+}
