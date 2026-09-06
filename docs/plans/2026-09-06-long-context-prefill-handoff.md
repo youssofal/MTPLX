@@ -181,6 +181,9 @@ is the engine field, never the client wall time.
   `~/.mtplx/config.toml` and fail on any machine whose default model differs. They pass under
   `HOME=$tmp MTPLX_HOME=$tmp/.mtplx`. Pin the environment in those tests.
 
+  *Status 2026-09-06: fixed.* Both halves — see Task 1 Steps 3 and 4 for the mechanism and the
+  narrower `MTPLX_CONFIG` pin that replaced the `HOME` idea.
+
 ## Levers already eliminated — do not re-test
 
 | lever | result | evidence |
@@ -215,6 +218,25 @@ than better: anything that forces repaging low is expected to lose.
 - Create `tests/test_qwen4_prefill_lane.py` — the counter oracle for D2.
 - Create `tests/test_long_context_profile_guard.py` — D1's startup-validation behaviour.
 
+## Known environment state — read before judging any test run here
+
+This checkout's `.venv` was built for 2.9.0 and the rebase moved the tree to 2.11.1, whose
+`pyproject.toml:33` floor is `mlx>=0.32.2` while the venv carries **MLX 0.32.0**. Consequences,
+reproduced identically with and without the D6 fix (worktree at the pre-fix commit: 7 failures both
+ways):
+
+- `tests/test_release_pins.py::test_installed_mlx_meets_the_pyproject_floor` fails by design — its
+  own docstring calls it a venv-drift canary.
+- 6 failures in `tests/test_graphbank_compiled_verify.py` (`CompiledVerifyParityError: compiled
+  verify parity mismatch`, `assert 4 == 0`, `assert 'hidden' == 'logits'`) — same drift, compiled vs
+  eager on an older MLX.
+
+A full `pytest tests/` here therefore ends at **7 failed / ~6,900 passed**, and that is an
+environment fact, not a code regression. **Task 0 Step 2 must build a fresh venv resolved against
+the 2.11.1 pins** (`uv sync`, or `pip install -e ".[dev,server]"` in a new environment) instead of
+reusing this one — otherwise every arm is measured on a runtime the tree does not support, and these
+parity failures will be read as regressions caused by the fix.
+
 ## Tasks
 
 ### Task 0 — Re-baseline on this tree before touching anything
@@ -233,19 +255,34 @@ than better: anything that forces repaging low is expected to lose.
       103 k numbers. If it did, every target in "Acceptance criteria" must be restated from the new
       baseline, not from the 2.11.0 figures.
 
-### Task 1 — D6 first (it unblocks honest CI signal)
+### Task 1 — D6 first (it unblocks honest CI signal) — **DONE 2026-09-06**
 
-- [ ] **Step 1:** write the failing isolation test: run `test_public_cli.py` then
-      `test_generation_sustained.py` in one process and assert green.
-- [ ] **Step 2:** capture the red state (expected: the 5 `test_lazy_*` failures + IndexError at
-      `:747`).
-- [ ] **Step 3:** find the leak (suspect: process-global env or a module-level cache written by
-      the CLI path and never restored). Fix with fixture-scoped restoration, not by reordering
-      files.
-- [ ] **Step 4:** pin `HOME`/`MTPLX_HOME` to `tmp_path` in the two `DEFAULT_HF_MODEL_ID` tests so
-      they stop reading the operator's `~/.mtplx/config.toml`.
-- [ ] **Step 5:** `pytest tests/test_public_cli.py tests/test_generation_sustained.py -q` green;
-      commit.
+- [x] **Step 1:** regression test written as `tests/test_suite_env_isolation.py` — four
+      order-pinned tests asserting (a) a raw `os.environ` write is visible within its own test,
+      (b) it is gone in the next test, (c) `apply_profile_env("stable")` really does write the
+      process env (so this file's premise fails loudly if the CLI path ever stops mutating it), and
+      (d) the six measured leak keys are absent afterwards. Chosen over "run file A then file B and
+      assert green", which cannot be expressed as one test.
+- [x] **Step 2:** red captured before the fix — `test_b` failed on the sentinel, `test_d` on
+      `MTPLX_DROP_EVENTS`, `test_a`/`test_c` passed; the file pair run failed 6 tests.
+- [x] **Step 3:** leak named: `mtplx/profiles.py:953 apply_profile_env()` writes a whole profile
+      dict into `os.environ` when no mapping is passed — by design, that is how the daemon child
+      inherits it — and the one-shot CLI paths never re-apply the `previous` map it returns. Keys
+      observed: `MTPLX_BATCH_TARGET_ARRAYS`, `MTPLX_DROP_EVENTS`, `MTPLX_LAZY_MTP_HISTORY_APPEND`,
+      `MTPLX_LAZY_TARGET_DISTRIBUTIONS`, `MTPLX_LAZY_VERIFY_LOGITS`,
+      `MTPLX_SKIP_VERIFY_SNAPSHOT`. Fix is suite-side (product behaviour is right for a short-lived
+      process): `tests/conftest.py::_hermetic_mtplx_state` now snapshots `os.environ` after its own
+      `setenv` calls and restores it on teardown, covering the raw writes `monkeypatch` cannot see.
+      Not a reorder.
+      Caveat for whoever revisits this: the leak needs the **whole** `test_public_cli.py` collection
+      to appear — that one one-shot test paired with `test_generation_sustained.py` stays green, so
+      verify on the file pair, not on a single test id.
+- [x] **Step 4:** pinned `MTPLX_CONFIG` to the scratch dir rather than `HOME`/`MTPLX_HOME` — the
+      narrower canary (`mtplx/config.py:114` already honours it), and it fixes the two
+      `DEFAULT_HF_MODEL_ID` tests on a machine whose live config names a Flash-Next pack. Verified by
+      running them against the untouched `~/.mtplx/config.toml`.
+- [x] **Step 5:** pair green (72 passed, 1 skipped); new isolation file green; full `tests/` run
+      executed — read "Known environment state" before interpreting its 7 failures.
 
 ### Task 2 — D1 guard: degrade instead of 500
 
