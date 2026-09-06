@@ -557,7 +557,7 @@ final class DaemonSupervisorTests: XCTestCase {
 
     @MainActor
     func testPassiveCleanExitClearsActiveTransportAndConnectionState() async throws {
-        let store = MTPLXBackendStore()
+        let store = MTPLXBackendStore(settingsStore: isolatedSettingsStore())
         let handoffID = UUID()
         let handoffDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent(
@@ -698,6 +698,7 @@ final class DaemonSupervisorTests: XCTestCase {
     func testCrashDuringPostStartHandoffCannotResurrectMetrics() async throws {
         let supervisor = DaemonSupervisor()
         let store = MTPLXBackendStore(
+            settingsStore: isolatedSettingsStore(),
             supervisor: supervisor,
             beforePostStartRefresh: {
                 await supervisor.stop(graceSeconds: 0)
@@ -822,6 +823,7 @@ final class DaemonSupervisorTests: XCTestCase {
         let handoffGate = BeforeRunGate()
         await handoffGate.arm()
         let store = MTPLXBackendStore(
+            settingsStore: isolatedSettingsStore(),
             supervisor: supervisor,
             beforeClientHandoffLaunch: { target in
                 if target == .pi { await handoffGate.waitIfArmed() }
@@ -877,6 +879,7 @@ final class DaemonSupervisorTests: XCTestCase {
         let handoffGate = BeforeRunGate()
         await handoffGate.arm()
         let store = MTPLXBackendStore(
+            settingsStore: isolatedSettingsStore(),
             supervisor: supervisor,
             beforeClientHandoffLaunch: { target in
                 if target == .hermes { await handoffGate.waitIfArmed() }
@@ -927,7 +930,7 @@ final class DaemonSupervisorTests: XCTestCase {
         XCTAssertGreaterThan(current.lifecycleEpoch, olderLifecycle)
         XCTAssertEqual(current.state, .running)
 
-        let store = MTPLXBackendStore(supervisor: supervisor)
+        let store = MTPLXBackendStore(settingsStore: isolatedSettingsStore(), supervisor: supervisor)
         let pi = Process()
         pi.executableURL = URL(fileURLWithPath: "/bin/zsh")
         pi.arguments = ["-c", "exec -a pi /bin/sleep 30"]
@@ -998,6 +1001,7 @@ final class DaemonSupervisorTests: XCTestCase {
         let thermalGate = BeforeRunGate()
         await thermalGate.arm()
         let store = MTPLXBackendStore(
+            settingsStore: isolatedSettingsStore(),
             supervisor: supervisor,
             beforeThermalStatusRefresh: { await thermalGate.waitIfArmed() }
         )
@@ -1029,7 +1033,7 @@ final class DaemonSupervisorTests: XCTestCase {
 
     @MainActor
     func testStorePublishesAdoptedDaemonAsUnprotected() async {
-        let store = MTPLXBackendStore()
+        let store = MTPLXBackendStore(settingsStore: isolatedSettingsStore())
         store.applySupervisorSnapshot(
             DaemonSupervisionSnapshot(
                 revision: 1,
@@ -1046,7 +1050,7 @@ final class DaemonSupervisorTests: XCTestCase {
 
     @MainActor
     func testDisabledAbnormalExitCleansTransportButPreservesCrashState() async {
-        let store = MTPLXBackendStore()
+        let store = MTPLXBackendStore(settingsStore: isolatedSettingsStore())
         store.startMetricsStream()
         XCTAssertTrue(store.hasActiveDaemonTransportForTesting)
 
@@ -1158,7 +1162,7 @@ final class DaemonSupervisorTests: XCTestCase {
 
     @MainActor
     func testExhaustedAutomaticRecoveryCleansTransportButPreservesCircuitBreakerState() async {
-        let store = MTPLXBackendStore()
+        let store = MTPLXBackendStore(settingsStore: isolatedSettingsStore())
         store.startMetricsStream()
         XCTAssertTrue(store.hasActiveDaemonTransportForTesting)
 
@@ -2112,4 +2116,10 @@ extension DaemonSupervisorTests {
         }
         XCTAssertFalse(supervisor.isRunning())
     }
+}
+
+private func isolatedSettingsStore() -> MTPLXSettingsStore {
+    MTPLXSettingsStore(settingsURL: FileManager.default.temporaryDirectory
+        .appendingPathComponent("mtplx-supervisor-test-\(UUID().uuidString)")
+        .appendingPathComponent("settings.json"))
 }
