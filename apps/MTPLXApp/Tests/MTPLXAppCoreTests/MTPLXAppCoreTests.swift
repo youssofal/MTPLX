@@ -1961,6 +1961,33 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertTrue(LaunchTarget.hermes.spawnsDaemon)
     }
 
+    func testLaunchTargetIncludesOMPAgentMode() throws {
+        XCTAssertTrue(LaunchTarget.allCases.contains(.omp))
+        XCTAssertEqual(LaunchTarget.omp.title, "OMP")
+        XCTAssertEqual(LaunchTarget.omp.tagline, "Use Oh My Pi in the terminal.")
+        XCTAssertEqual(LaunchTarget.omp.systemImage, "option")
+        XCTAssertTrue(LaunchTarget.omp.spawnsDaemon)
+    }
+
+    func testCommandBuilderOMPPresetIdentifiesOMPClient() throws {
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: [
+            "PATH": fake.deletingLastPathComponent().path
+        ])
+        let command = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: "/models/qwen",
+                profile: "sustained"
+            ),
+            target: .omp,
+            launchID: "omp-launch"
+        )
+
+        XCTAssertEqual(command.environment["MTPLX_CLIENT"], "omp")
+        XCTAssertTrue(command.arguments.containsInOrder(["--tool-prompt-mode", "hybrid"]))
+    }
+
     func testOpenCodeLaunchCopyIsClear() throws {
         XCTAssertEqual(
             LaunchTarget.openCode.tagline,
@@ -6015,6 +6042,245 @@ final class MTPLXAppCoreTests: XCTestCase {
         )
     }
 
+    func testOMPIntegrationMergesProviderAndWritesVerifiedSchema() throws {
+        let directory = temporaryDirectory()
+        let url = directory.appendingPathComponent("models.yml")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let existing = """
+        # user config stays readable
+        providers:
+          anthropic:
+            apiKey: 'user-secret'
+            custom: true
+          mtplx:
+            baseUrl: 'http://127.0.0.1:7999/v1'
+            customProviderField: keep-me
+            headers:
+              x-user-header: keep-me
+            compat:
+              customCompatField: keep-me
+            models:
+              - id: 'mtplx-qwen36-27b-optimized-speed'
+                name: 'Stale User Name'
+                reasoning: false
+                supportsTools: false
+                input: [text, image]
+                contextWindow: 4096
+                maxTokens: 2048
+                omitMaxOutputTokens: false
+                customModelField: keep-me
+              - id: 'user-added-model'
+                name: 'User Added'
+        userRootField: keep-me
+        """
+        try Data((existing + "\n").utf8).write(to: url)
+        let workspace = directory.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        let configuration = MTPLXAppConfiguration(
+            model: "/models/Qwen3.6-27B-MTPLX-Optimized-Speed",
+            host: "0.0.0.0",
+            port: 18123,
+            contextWindow: 262_144,
+            hermesWorkspacePath: workspace.path
+        )
+
+        let integration = OMPIntegration(configURL: url)
+        let result = try integration.sync(configuration: configuration)
+
+        XCTAssertTrue(result.didChange)
+        XCTAssertEqual(result.baseURL, "http://127.0.0.1:18123/v1")
+        XCTAssertEqual(result.modelReference, "mtplx/mtplx-qwen36-27b-optimized-speed")
+        XCTAssertEqual(
+            result.launchCommand,
+            "omp --model mtplx/mtplx-qwen36-27b-optimized-speed --cwd '\(workspace.path)' "
+                + "--allow-home --append-system-prompt '\(OMPIntegration.agentOperatingHintsURL().path)'"
+        )
+        let backupPath = try XCTUnwrap(result.backupPath)
+        XCTAssertEqual(try String(contentsOfFile: backupPath, encoding: .utf8), existing + "\n")
+
+        let output = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertTrue(output.contains("# user config stays readable"))
+        XCTAssertTrue(output.contains("  anthropic:\n    apiKey: 'user-secret'\n    custom: true"))
+        XCTAssertTrue(output.contains("userRootField: keep-me"))
+        XCTAssertTrue(output.contains("customProviderField: keep-me"))
+        XCTAssertTrue(output.contains("x-user-header: keep-me"))
+        XCTAssertTrue(output.contains("customCompatField: keep-me"))
+        XCTAssertTrue(output.contains("name: \"MTPLX mtplx-qwen36-27b-optimized-speed\""))
+        XCTAssertTrue(output.contains("reasoning: true"))
+        XCTAssertTrue(output.contains("supportsTools: true"))
+        XCTAssertTrue(output.contains("input: [text]"))
+        XCTAssertTrue(output.contains("customModelField: keep-me"))
+        XCTAssertTrue(output.contains("id: 'user-added-model'"))
+        XCTAssertTrue(output.contains("baseUrl: \"http://127.0.0.1:18123/v1\""))
+        XCTAssertTrue(output.contains("api: openai-completions"))
+        XCTAssertTrue(output.contains("apiKey: \"mtplx-local\""))
+        XCTAssertTrue(output.contains("authHeader: true"))
+        XCTAssertTrue(output.contains("x-mtplx-client: omp"))
+        XCTAssertTrue(output.contains("supportsDeveloperRole: false"))
+        XCTAssertTrue(output.contains("supportsReasoningEffort: true"))
+        XCTAssertTrue(output.contains("maxTokensField: max_tokens"))
+        XCTAssertTrue(output.contains("supportsTools: true"))
+        XCTAssertTrue(output.contains("contextWindow: 262144"))
+        XCTAssertTrue(output.contains("maxTokens: 65536"))
+        XCTAssertTrue(output.contains("omitMaxOutputTokens: true"))
+        XCTAssertTrue(output.contains("cacheWrite: 0"))
+
+        let permissions = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? NSNumber
+        )
+        XCTAssertEqual(permissions.intValue & 0o777, 0o600)
+        let backupPermissions = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: backupPath)[.posixPermissions] as? NSNumber
+        )
+        XCTAssertEqual(backupPermissions.intValue & 0o777, 0o600)
+
+        let repeated = try integration.sync(configuration: configuration)
+        XCTAssertFalse(repeated.didChange)
+        XCTAssertNil(repeated.backupPath)
+    }
+
+    func testOMPIntegrationBacksUpInvalidYAMLAndRecovers() throws {
+        let directory = temporaryDirectory()
+        let url = directory.appendingPathComponent("models.yml")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let invalid = "providers:\n\tmtplx:\n    baseUrl: bad\n"
+        try Data(invalid.utf8).write(to: url)
+
+        let result = try OMPIntegration(configURL: url).sync(
+            configuration: MTPLXAppConfiguration(
+                model: "/models/Gemma4-MTPLX-Optimized-Speed",
+                host: "127.0.0.1",
+                port: 18095,
+                contextWindow: nil
+            )
+        )
+
+        XCTAssertTrue(result.didChange)
+        let backupPath = try XCTUnwrap(result.backupPath)
+        XCTAssertTrue(URL(fileURLWithPath: backupPath).lastPathComponent.contains(".invalid-"))
+        XCTAssertEqual(try String(contentsOfFile: backupPath, encoding: .utf8), invalid)
+        let output = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertTrue(output.hasPrefix("providers:\n  mtplx:\n"))
+        XCTAssertTrue(output.contains("id: \"gemma4-mtplx-optimized-speed\""))
+        XCTAssertTrue(output.contains("omitMaxOutputTokens: true"))
+        XCTAssertFalse(output.contains("\t"))
+    }
+
+    func testOMPIntegrationFailsClosedForUnsupportedValidYAML() throws {
+        let configuration = MTPLXAppConfiguration(
+            model: "/models/Gemma4-MTPLX-Optimized-Speed",
+            host: "127.0.0.1",
+            port: 18095
+        )
+        for source in [
+            "providers:\r\n    anthropic:\r\n        apiKey: keep-me\r\n",
+            "providers: {anthropic: {apiKey: keep-me}}\n",
+        ] {
+            let directory = temporaryDirectory()
+            let url = directory.appendingPathComponent("models.yml")
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true
+            )
+            try Data(source.utf8).write(to: url)
+
+            XCTAssertThrowsError(
+                try OMPIntegration(configURL: url).sync(configuration: configuration)
+            )
+            XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), source)
+            let siblings = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+            XCTAssertEqual(siblings, ["models.yml"])
+        }
+    }
+
+    func testOMPIntegrationEscapesDynamicYAMLScalars() throws {
+        let directory = temporaryDirectory()
+        let url = directory.appendingPathComponent("models.yml")
+        let injectedKey = "secret\"\\value#still-secret\nproviders:\n  attacker: {}"
+
+        let integration = OMPIntegration(configURL: url)
+        let configuration = MTPLXAppConfiguration(
+            model: "/models/Qwen3.6-27B-MTPLX-Optimized-Speed",
+            apiKey: injectedKey
+        )
+        let result = try integration.sync(configuration: configuration)
+
+        XCTAssertTrue(result.didChange)
+        let output = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertTrue(
+            output.contains(
+                "apiKey: \"secret\\\"\\\\value#still-secret\\nproviders:\\n  attacker: {}\""
+            )
+        )
+        XCTAssertFalse(output.contains("\n  attacker: {}\n"))
+        XCTAssertFalse(try integration.sync(configuration: configuration).didChange)
+    }
+
+    func testOMPLaunchCommandAndProcessRecognitionAreExact() throws {
+        let workspace = temporaryDirectory()
+            .appendingPathComponent("project with spaces", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        let configuration = MTPLXAppConfiguration(
+            model: "/models/Step-3.7-Flash-MTPLX-step3p5",
+            hermesWorkspacePath: workspace.path
+        )
+
+        XCTAssertEqual(
+            OMPIntegration.resolvedWorkspacePath(configuration: configuration),
+            workspace.path
+        )
+        XCTAssertEqual(
+            OMPIntegration.launchCommand(
+                for: configuration.model,
+                workspacePath: workspace.path
+            ),
+            "omp --model mtplx/step-3.7-flash-mtplx-step3p5 --cwd '\(workspace.path)' "
+                + "--allow-home --append-system-prompt '\(OMPIntegration.agentOperatingHintsURL().path)'"
+        )
+        XCTAssertTrue(
+            OMPIntegration.isOMPAgentCommand(
+                "/opt/homebrew/bin/omp --model mtplx/step-3.7-flash-mtplx-step3p5 --cwd /tmp/project --allow-home"
+            )
+        )
+        XCTAssertTrue(
+            OMPIntegration.isOMPAgentCommand(
+                "/opt/homebrew/bin/node /opt/homebrew/lib/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js --model mtplx/step-3.7-flash-mtplx-step3p5 --cwd /tmp/project"
+            )
+        )
+        XCTAssertTrue(
+            OMPIntegration.isOMPAgentCommand(
+                "/opt/homebrew/bin/node /opt/homebrew/bin/omp --model mtplx/step-3.7-flash-mtplx-step3p5"
+            )
+        )
+        XCTAssertFalse(OMPIntegration.isOMPAgentCommand("omp"))
+        XCTAssertFalse(OMPIntegration.isOMPAgentCommand("omp models"))
+        XCTAssertFalse(
+            OMPIntegration.isOMPAgentCommand(
+                "omp --model anthropic/claude-opus-4-1 --cwd /tmp/project"
+            )
+        )
+        XCTAssertFalse(
+            OMPIntegration.isOMPAgentCommand(
+                "/opt/homebrew/bin/node /tmp/other/cli.js --model mtplx/model"
+            )
+        )
+    }
+
+    @MainActor
+    func testOMPLaunchReportsUnavailableBeforeOpeningTerminalWhenMissing() async {
+        let integration = OMPIntegration(executableResolver: { nil })
+        let result = await integration.launchInTerminal(
+            configuration: MTPLXAppConfiguration(
+                model: "/models/Step-3.7-Flash-MTPLX-step3p5"
+            )
+        )
+
+        XCTAssertEqual(result.action, .unavailable)
+        XCTAssertTrue(result.detail.contains("OMP is not installed"))
+        XCTAssertTrue(result.launchedProcessIDs.isEmpty)
+        XCTAssertNil(result.terminalHandoffLease)
+    }
+
     @MainActor
     func testOpenCodeDesktopReloadReportsUnavailableWhenAppIsMissing() async {
         let integration = OpenCodeIntegration(
@@ -6072,6 +6338,33 @@ final class MTPLXAppCoreTests: XCTestCase {
         )
 
         XCTAssertNil(ClientHandoffNotice.pi(result: result))
+    }
+
+    func testClientHandoffNoticeSurfacesOMPTerminalWithoutAgent() {
+        let result = OMPLaunchResult(
+            action: .launched,
+            command: "omp --model mtplx/qwen3.5-4b-mtplx-optimized-speed",
+            detail: "opened OMP in Terminal for the MTPLX daemon",
+            launchedProcessIDs: []
+        )
+
+        let notice = ClientHandoffNotice.omp(result: result)
+
+        XCTAssertEqual(notice?.target, .omp)
+        XCTAssertEqual(notice?.status, "OMP not detected")
+        XCTAssertTrue(notice?.detail.contains("no OMP agent process") == true)
+        XCTAssertEqual(notice?.isWarning, true)
+    }
+
+    func testClientHandoffNoticeStaysQuietForRunningOMPAgent() {
+        let result = OMPLaunchResult(
+            action: .launched,
+            command: "omp --model mtplx/qwen3.5-4b-mtplx-optimized-speed",
+            detail: "opened OMP in Terminal for the MTPLX daemon",
+            launchedProcessIDs: [12345]
+        )
+
+        XCTAssertNil(ClientHandoffNotice.omp(result: result))
     }
 
     func testClientHandoffNoticeSurfacesHermesUnavailable() {

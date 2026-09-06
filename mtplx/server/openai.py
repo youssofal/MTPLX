@@ -6413,6 +6413,12 @@ _CHAT_TEMPLATE_PROFILES = {
     _CHAT_TEMPLATE_PROFILE_FROGGERIC_V21,
     _CHAT_TEMPLATE_PROFILE_TOKENIZER,
 }
+
+
+def _client_hint_is_omp(client_hint: str | None) -> bool:
+    normalized = str(client_hint or "").strip().lower()
+    normalized = normalized.replace("-", "_").replace(" ", "_")
+    return normalized == "omp"
 _TOOL_PARSE_COUNTER_KEYS = (
     "tool_parse_success",
     "tool_parse_fallback",
@@ -7503,7 +7509,7 @@ def _request_should_add_pi_convergence_contract(
     client_hint = str(
         _request_client_hint_from_request(headers, metadata) or ""
     ).lower()
-    if "pi" not in client_hint:
+    if "pi" not in client_hint and not _client_hint_is_omp(client_hint):
         return False
     limit = _pi_convergence_after_tools()
     if limit <= 0:
@@ -7513,7 +7519,7 @@ def _request_should_add_pi_convergence_contract(
 
 def _mtplx_pi_convergence_contract_text() -> str:
     return (
-        f"{_MTPLX_PI_CONVERGENCE_SENTINEL} this Pi coding task has enough "
+        f"{_MTPLX_PI_CONVERGENCE_SENTINEL} this coding-agent task has enough "
         "tool evidence. The next assistant turn must converge: either emit "
         "one edit/write tool call for the safest useful change, emit one bash "
         "tool call that verifies the chosen change, or give the final answer "
@@ -8221,7 +8227,11 @@ def _single_tool_call_stream_policy(
         # A client that wants the cut declares parallel_tool_calls=false.
         return False
     hint = (client_hint or "").lower()
-    return "pi" in hint or ("opencode" in hint and explicit_single_tool)
+    return (
+        "pi" in hint
+        or _client_hint_is_omp(hint)
+        or ("opencode" in hint and explicit_single_tool)
+    )
 
 
 def _read_only_force_answer_enabled() -> bool:
@@ -14953,6 +14963,7 @@ _MTPLX_MANAGED_CLIENT_HINTS = {
     "mtplxapp",
     "opencode",
     "openwebui",
+    "omp",
     "pi",
 }
 
@@ -20271,6 +20282,8 @@ def _agent_tool_contract_client_hint(
     metadata: Mapping[str, Any],
 ) -> str | None:
     client_hint = str(_request_client_hint_from_request(headers, metadata) or "")
+    if _client_hint_is_omp(client_hint):
+        return "omp"
     for marker in _TOOL_CONTRACT_AGENT_CLIENT_HINTS:
         if marker in client_hint:
             return marker

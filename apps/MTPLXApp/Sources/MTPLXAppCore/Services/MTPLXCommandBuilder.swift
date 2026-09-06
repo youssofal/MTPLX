@@ -1094,7 +1094,7 @@ struct ResolvedDaemonArgs {
         switch target {
         case nil, .chat, .benchmark, .openWebUI:
             return true
-        case .pi, .openCode, .hermes, .other:
+        case .pi, .omp, .openCode, .hermes, .other:
             return false
         }
     }
@@ -1774,7 +1774,7 @@ private struct TargetPreset {
                 batchingPreset: "solo",
                 reasoning: "auto"
             )
-        case .pi:
+        case .pi, .omp:
             // Pi is still a coding-agent surface: its own prompt is
             // shorter than OpenCode's, but tool-history turns can still
             // cross the long-context verify-cost cliff. Give it the
@@ -1794,9 +1794,12 @@ private struct TargetPreset {
             // re-arm those compactors past the engine's passthrough default,
             // and they were rewriting Pi transcripts behind the user's back
             // (#282). Pi now gets the same clean lane as every other client.
-            let piEnv = codingAgentRuntimeEnvironment(
+            var piEnv = codingAgentRuntimeEnvironment(
                 processEnvironment: processEnvironment
             )
+            if target == .omp {
+                piEnv["MTPLX_CLIENT"] = "omp"
+            }
             return TargetPreset(
                 schedulerMode: "ar_batch",
                 batchingPreset: "agent",

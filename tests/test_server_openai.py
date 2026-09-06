@@ -5615,7 +5615,8 @@ def test_step_reasoning_off_closes_template_think_prompt_for_managed_clients(
     assert stats["disabled_thinking_prompt_closed"] is True
 
 
-def test_managed_client_thinking_controls_are_honored(monkeypatch):
+@pytest.mark.parametrize("client_hint", ["opencode", "omp"])
+def test_managed_client_thinking_controls_are_honored(monkeypatch, client_hint):
     """Managed surfaces keep sampler params server-owned, but their thinking
     controls (enable_thinking / reasoning_effort) govern the request — the
     client-side effort picker must actually work (2026-08-21 order)."""
@@ -5638,7 +5639,7 @@ def test_managed_client_thinking_controls_are_honored(monkeypatch):
         "/v1/chat/completions",
         headers={
             "x-mtplx-cache-mode": "bypass",
-            "x-mtplx-client": "opencode",
+            "x-mtplx-client": client_hint,
         },
         json={
             "messages": [{"role": "user", "content": "hi"}],
@@ -8903,9 +8904,9 @@ def test_laguna_opencode_keeps_poolside_native_tool_protocol(monkeypatch):
     assert stats["tool_prompt_mode_client_repaired"] is False
 
 
-@pytest.mark.parametrize("client_hint", ["pi", "hermes"])
-def test_agent_tool_clients_repair_native_launch_mode_to_hybrid(legacy_rewrites, 
-    monkeypatch, client_hint
+@pytest.mark.parametrize("client_hint", ["pi", "omp", "hermes"])
+def test_agent_tool_clients_repair_native_launch_mode_to_hybrid(
+    legacy_rewrites, monkeypatch, client_hint
 ):
     seen: dict[str, object] = {}
     state = _fake_state()
@@ -13394,6 +13395,12 @@ def test_single_tool_call_stream_policy_legacy_hint_sniff(legacy_rewrites):
         parallel_tool_calls=None, client_hint="pi", explicit_single_tool=False
     )
     assert policy(
+        parallel_tool_calls=None, client_hint="omp", explicit_single_tool=False
+    )
+    assert not policy(
+        parallel_tool_calls=None, client_hint="company", explicit_single_tool=False
+    )
+    assert policy(
         parallel_tool_calls=None, client_hint="opencode", explicit_single_tool=True
     )
     assert not policy(
@@ -13791,8 +13798,9 @@ def test_filter_tool_specs_keeps_tools_on_disallow_text_by_default():
     assert openai._filter_tool_specs_for_request(tools, messages) == tools
 
 
-def test_pi_convergence_contract_default_off(monkeypatch):
-    headers = {"x-mtplx-client": "pi"}
+@pytest.mark.parametrize("client_hint", ["pi", "omp"])
+def test_pi_convergence_contract_default_off(monkeypatch, client_hint):
+    headers = {"x-mtplx-client": client_hint}
     messages = [openai.ChatMessage(role="user", content="fix the login bug")]
     messages.extend(
         openai.ChatMessage(
@@ -13819,6 +13827,24 @@ def test_pi_convergence_contract_default_off(monkeypatch):
 
     # off beats the explicit env opt-in.
     monkeypatch.setenv("MTPLX_AGENT_REWRITES", "off")
+    assert not openai._request_should_add_pi_convergence_contract(
+        messages, headers=headers, metadata={}, tools_active=True
+    )
+
+
+def test_omp_client_matching_does_not_capture_company(legacy_rewrites):
+    headers = {"x-mtplx-client": "company"}
+    messages = [openai.ChatMessage(role="user", content="fix the login bug")]
+    messages.extend(
+        openai.ChatMessage(
+            role="tool", tool_call_id=f"call_{index}", content=f"result {index}"
+        )
+        for index in range(20)
+    )
+
+    assert openai._agent_tool_contract_client_hint(
+        headers=headers, metadata={}
+    ) is None
     assert not openai._request_should_add_pi_convergence_contract(
         messages, headers=headers, metadata={}, tools_active=True
     )

@@ -50,7 +50,7 @@ The dashboard shows what your model is doing while it does it: live tokens per s
 
 <img src="docs/assets/readme/app-chat.jpg" alt="Chat streaming with live speed badge" width="100%" />
 
-Chat is native, streams with thinking cards, takes file attachments, and can search the web. One click launches OpenCode, Pi, Hermes, Open WebUI, or anything else that speaks the OpenAI or Anthropic API against your local server. There is also a built-in AIME benchmark runner with fully disclosed, coaching-free prompts, so you can score a model yourself instead of trusting a chart.
+Chat is native, streams with thinking cards, takes file attachments, and can search the web. One click launches OpenCode, Pi, OMP, Hermes, Open WebUI, or anything else that speaks the OpenAI or Anthropic API against your local server. There is also a built-in AIME benchmark runner with fully disclosed, coaching-free prompts, so you can score a model yourself instead of trusting a chart.
 
 ## Auto-tune
 

@@ -375,6 +375,37 @@ final class TerminalHandoffLeaseTests: XCTestCase {
     }
 
     @MainActor
+    func testOMPLeaseIsPresentedAndReapedByExplicitStop() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let handoffID = UUID()
+        let client = try launchSleep(environment: [
+            MTPLXTerminalHandoffLease.environmentVariable: handoffID.uuidString.lowercased()
+        ])
+        defer { stop(client) }
+        let backend = MTPLXBackendStore(
+            configuration: MTPLXAppConfiguration(host: "127.0.0.1", port: 9)
+        )
+        backend.recordLaunchedOMPTerminalHandoffLease(MTPLXTerminalHandoffLease(
+            handoffID: handoffID,
+            processID: Int(client.processIdentifier),
+            cancellationMarkerURL: directory.appendingPathComponent("omp.cancelled")
+        ))
+
+        XCTAssertTrue(backend.ompTerminalAgentRunning)
+        XCTAssertEqual(backend.ompTerminalAgentProcessIDs, [Int(client.processIdentifier)])
+        XCTAssertEqual(backend.terminalHandoffLeaseIDsForTesting, Set([handoffID]))
+
+        await backend.stopDaemon()
+
+        let clientExited = await waitForExit(client)
+        XCTAssertTrue(clientExited)
+        XCTAssertFalse(backend.ompTerminalAgentRunning)
+        XCTAssertTrue(backend.ompTerminalAgentProcessIDs.isEmpty)
+        XCTAssertTrue(backend.terminalHandoffLeaseIDsForTesting.isEmpty)
+    }
+
+    @MainActor
     func testLeaseSurvivesAutomaticRecoveryStatusesThenExplicitStopReapsIt() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
