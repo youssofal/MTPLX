@@ -11476,6 +11476,15 @@ def test_chat_stream_hermes_suppresses_tool_call_preamble(monkeypatch):
     state = _fake_streaming_session_state()
     state.args.stream_interval = 1
     state.args.enable_thinking = False
+    commits = []
+    def capture_final(*_args, **kwargs):
+        commits.append(kwargs)
+        return {"stored": False, "mode": "unsafe", "reason": "tool_call_history_rewrite"}
+    def capture_idle(*_args, **kwargs):
+        commits.append(kwargs)
+        return {"stored": False, "mode": "async_pending"}
+    monkeypatch.setattr(openai, "_store_generation_final_history_snapshot", capture_final)
+    monkeypatch.setattr(openai, "_schedule_idle_postcommit_snapshot", capture_idle)
     monkeypatch.setattr(
         openai,
         "_run_generation",
@@ -11488,7 +11497,7 @@ def test_chat_stream_hermes_suppresses_tool_call_preamble(monkeypatch):
     with TestClient(create_app(state)) as client:
         response = client.post(
             "/v1/chat/completions",
-            headers={"x-mtplx-client": "hermes"},
+            headers={"x-mtplx-client": "hermes", "x-mtplx-session-id": "hermes-preamble"},
             json={
                 "messages": [{"role": "user", "content": "Status."}],
                 "tools": [_tool_schema()],
@@ -11509,6 +11518,10 @@ def test_chat_stream_hermes_suppresses_tool_call_preamble(monkeypatch):
         payload["choices"][0].get("finish_reason") == "tool_calls"
         for payload in payloads
     )
+    assert len(commits) == 2
+    for commit in commits:
+        assert commit["assistant_content"] == ""
+        assert commit["strip_tool_call_preamble_text"] is True
 
 
 def test_chat_stream_hermes_defers_content_until_native_tool_extraction(monkeypatch):

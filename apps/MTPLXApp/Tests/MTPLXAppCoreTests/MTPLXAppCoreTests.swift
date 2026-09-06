@@ -37,6 +37,18 @@ private final class StatusCapture: @unchecked Sendable {
 }
 
 final class MTPLXAppCoreTests: XCTestCase {
+    func testContextIncludesOnlyItsOwnGeneratedTokens() throws {
+        var request = InFlightRequest(requestId: "current", startedS: 0, ageS: 1,
+            sessionId: "session", model: "model", promptPreview: "", promptTokens: 16000,
+            lastProgress: DynamicObject(values: ["completion_tokens": .number(23000)]),
+            prefillState: nil, cancelled: false)
+        XCTAssertEqual(request.contextTokens, 39000)
+        request.lastProgress = DynamicObject()
+        XCTAssertEqual(request.contextTokens, 16000)
+        request.promptTokens = nil
+        XCTAssertNil(request.contextTokens)
+    }
+
     func testReleaseManifestParsesStableUpdateMetadata() throws {
         let data = """
         {

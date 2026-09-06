@@ -20123,6 +20123,12 @@ def _policy_fingerprint(
         f"online_hidden={json.dumps(online_hidden, sort_keys=True, separators=(',', ':'))}",
     ]
     normalized_cache_scope = str(cache_scope or "").strip()
+    if _model_family_for_state(state) == "qwen4_exp":
+        from mtplx.models.qwen4_exp import vision_qsa_enabled
+
+        # Old vision entries used dense attention, including their text
+        # prefixes. They must not seed the corrected sparse model path.
+        parts.append(f"vision_attention=mrope_qsa_v1:{int(vision_qsa_enabled())}")
     mtp_batch_lane = getattr(state, "mtp_batch_lane", None)
     if mtp_batch_lane is not None:
         parts.extend(
@@ -30296,6 +30302,15 @@ def create_app(state: ServerState) -> FastAPI:
         read_only_force_answer_contract_active = (
             policy.read_only_force_answer_contract_active
         )
+        suppress_stream_tool_preamble = bool(
+            request.stream and tools_active and not read_only_force_answer_contract_active
+            and _is_hermes_client(headers=headers, metadata=metadata)
+        )
+        # The cache producer and next-turn reader must normalize exactly what
+        # the wire translator removes. Hermes suppresses these preambles too;
+        # comparing its empty echo to the raw preamble rejected the whole
+        # committed reasoning turn and re-prefilled tens of thousands of tokens.
+        strip_tool_call_preamble_text = opencode_client or suppress_stream_tool_preamble
         no_tools_contract_active = policy.no_tools_contract_active
         post_tool_answer_contract_active = policy.post_tool_answer_contract_active
         pi_convergence_contract_active = policy.pi_convergence_contract_active
@@ -30494,7 +30509,7 @@ def create_app(state: ServerState) -> FastAPI:
                 # some branches; the outcome rides template_observability,
                 # which merges into the request stream downstream.
                 transcript_stats=policy.transcript_stats,
-                strip_tool_call_preamble_text=opencode_client,
+                strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                 session_id=resolved_session_id,
             )
             if _canonicalized is not None:
@@ -31062,7 +31077,7 @@ def create_app(state: ServerState) -> FastAPI:
                 reasoning_effort=reasoning_effort,
                 tool_specs=postcommit_tool_specs,
                 tool_prompt_mode=postcommit_tool_prompt_mode,
-                strip_tool_call_preamble_text=opencode_client,
+                strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                 session=session,
             )
             if compatibility.get("safe"):
@@ -31116,7 +31131,7 @@ def create_app(state: ServerState) -> FastAPI:
                         expected_session_revision=getattr(session, "revision", None),
                         keep_live_ref=session_keep_live_ref,
                         tool_prompt_mode=postcommit_tool_prompt_mode,
-                        strip_tool_call_preamble_text=opencode_client,
+                        strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                         committed_stream_ids=postcommit_committed_stream,
                     )
                 )
@@ -31136,7 +31151,7 @@ def create_app(state: ServerState) -> FastAPI:
                         tool_specs=postcommit_tool_specs,
                         keep_live_ref=session_keep_live_ref,
                         tool_prompt_mode=postcommit_tool_prompt_mode,
-                        strip_tool_call_preamble_text=opencode_client,
+                        strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                         committed_stream_ids=postcommit_committed_stream,
                     ),
                     batch_key=f"postcommit.inline:{session_id or 'stateless'}",
@@ -31357,10 +31372,7 @@ def create_app(state: ServerState) -> FastAPI:
                         repair_unclosed_complete=(
                             str(raw_request.url.path or "") != "/v1/messages"
                         ),
-                        suppress_tool_call_preamble=_is_hermes_client(
-                            headers=headers,
-                            metadata=metadata,
-                        ),
+                        suppress_tool_call_preamble=suppress_stream_tool_preamble,
                     )
                     # Forced final-answer turns stream sanitized visible text
                     # through the buffered marker path; the tool-call
@@ -32333,7 +32345,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     assistant_history_content = str(
                                         commit_state.get("assistant_history_content")
                                         or ""
-                                    ) or (
+                                    ) if "assistant_history_content" in commit_state else (
                                         _normalize_reasoning_tags_for_state(
                                             state,
                                             str(generated["text"]),
@@ -32370,7 +32382,7 @@ def create_app(state: ServerState) -> FastAPI:
                                                 tool_specs=postcommit_tool_specs,
                                                 keep_live_ref=session_keep_live_ref,
                                                 tool_prompt_mode=postcommit_tool_prompt_mode,
-                                                strip_tool_call_preamble_text=opencode_client,
+                                                strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                                                 committed_stream_ids=(
                                                     stream_committed_stream
                                                 ),
@@ -32403,7 +32415,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             tool_specs=postcommit_tool_specs,
                                             keep_live_ref=session_keep_live_ref,
                                             tool_prompt_mode=postcommit_tool_prompt_mode,
-                                            strip_tool_call_preamble_text=opencode_client,
+                                            strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                                         )
                                         generated["stats"][
                                             "session_postcommit_snapshot"
@@ -32440,7 +32452,7 @@ def create_app(state: ServerState) -> FastAPI:
                                                     tool_specs=postcommit_tool_specs,
                                                     keep_live_ref=session_keep_live_ref,
                                                     tool_prompt_mode=postcommit_tool_prompt_mode,
-                                                    strip_tool_call_preamble_text=opencode_client,
+                                                    strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                                                 )
                                             ),
                                             batch_key=(
@@ -34052,7 +34064,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             ),
                                             keep_live_ref=session_keep_live_ref,
                                             tool_prompt_mode=postcommit_tool_prompt_mode,
-                                            strip_tool_call_preamble_text=opencode_client,
+                                            strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                                             committed_stream_ids=[
                                                 int(token) for token in prompt_ids
                                             ]

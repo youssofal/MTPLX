@@ -38,6 +38,9 @@ def _hermetic_mtplx_state(monkeypatch, tmp_path_factory):
         "MTPLX_APP_SETTINGS_PATH", str(isolated / "app-settings.json")
     )
     monkeypatch.setenv("MTPLX_MODEL_DIR", str(isolated / "models"))
+    # Synthetic server requests must not enter a live user's trace history.
+    monkeypatch.setenv("MTPLX_REQUEST_LOG_JSONL", str(isolated / "requests.jsonl"))
+    monkeypatch.setenv("MTPLX_FLIGHT_RECORDER", str(isolated / "flight.jsonl"))
     # The suite must never touch the developer's real OpenCode config. On
     # 2026-09-03 a full `pytest tests/` run rewrote
     # ~/.config/opencode/opencode.json mid-run with a fixture model id

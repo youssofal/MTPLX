@@ -333,6 +333,26 @@ def _mrope_cos_sin(
     return mx.cos(emb), mx.sin(emb)
 
 
+def vision_qsa_enabled() -> bool:
+    return os.environ.get("MTPLX_QWEN4_VISION_QSA", "1") != "0"
+
+
+def _vision_position_cos_sin(positions, inv_freq, axes, scaling=1.0):
+    """Share image positions between attention and its QSA indexer.
+
+    Reference: transformers/models/qwen4_exp/modeling_qwen4_exp.py,
+    Qwen4ExpTextQSAIndexer: pooled keys rotate at each block's FIRST token.
+    Decode positions beyond the prompt use equal axes plus the image delta.
+    """
+    table, delta = vision_rope_state()
+    positions3 = mx.broadcast_to((positions + delta)[None, :], (3, positions.size))
+    if table is not None and table.shape[1]:
+        prompt_positions = mx.take(table, mx.clip(positions, 0, table.shape[1] - 1), axis=1)
+        positions3 = mx.where((positions < table.shape[1])[None, :], prompt_positions, positions3)
+    cos, sin = _mrope_cos_sin(positions3, inv_freq, axes)
+    return cos * scaling, sin * scaling
+
+
 def _apply_partial_rope(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
     """Rotate the first `2 * inv_freq.size` features of the last axis of
     x[..., S, H, D] with per-position tables cos/sin of shape [S, rot]."""
@@ -2141,6 +2161,14 @@ class QSAIndexer(nn.Module):
         # and sanitize-time projection fusion have finalized every weight.
         object.__setattr__(self, "_compiled_indexer_core", None)
         object.__setattr__(self, "_compiled_indexer_parameter_signature", None)
+        self._mrope_axes = (
+            mx.array(_build_mrope_axes(args.mrope_section, args.mrope_interleaved), dtype=mx.int32)
+            if args.mrope_section and sum(args.mrope_section) == int(args.rotary_dim) // 2
+            else None
+        )
+
+    def _uses_vision_positions(self) -> bool:
+        return vision_qsa_enabled() and self._mrope_axes is not None and vision_rope_state() is not None
 
     def _pool_keys_eager(
         self,
@@ -2154,11 +2182,12 @@ class QSAIndexer(nn.Module):
         pooled = mx.mean(fresh.astype(mx.float32), axis=2).astype(fresh.dtype)
         pooled = self.k_layernorm(pooled)
         starts = mx.arange(nb_old, nb_total, dtype=mx.int32) * self.ratio
-        cos, sin = _rope_cos_sin(
-            starts,
-            self._inv_freq,
-            self._rope_attention_scaling,
-        )
+        if self._uses_vision_positions():
+            cos, sin = _vision_position_cos_sin(
+                starts, self._inv_freq, self._mrope_axes, self._rope_attention_scaling,
+            )
+        else:
+            cos, sin = _rope_cos_sin(starts, self._inv_freq, self._rope_attention_scaling)
         return _apply_partial_rope(pooled[:, :, None, :], cos, sin)[:, :, 0, :]
 
     def _prepare_kernel_supported(
@@ -2168,7 +2197,7 @@ class QSAIndexer(nn.Module):
         *,
         expected_ndim: int,
     ) -> bool:
-        if not _fused_qsa_indexer_enabled():
+        if self._uses_vision_positions() or not _fused_qsa_indexer_enabled():
             return False
         from mtplx.kernels.qsa_indexer_prepare import (
             qsa_indexer_prepare_supported,
@@ -2689,6 +2718,12 @@ class QSAIndexer(nn.Module):
         """Stock query preparation kept as the numeric oracle."""
 
         q = self.q_layernorm(q)
+        if self._uses_vision_positions():
+            positions = pos_start + mx.arange(q.shape[1], dtype=mx.int32)
+            cos, sin = _vision_position_cos_sin(
+                positions, self._inv_freq, self._mrope_axes, self._rope_attention_scaling,
+            )
+            return _apply_partial_rope(q, cos, sin)
         if qwen4_opdiet_enabled("rope"):
             cos, sin = _shared_rope_cos_sin_half(
                 pos_start,
@@ -2788,7 +2823,7 @@ class QSAIndexer(nn.Module):
     ) -> bool:
         """Static eligibility check; dispatched graph failures are not hidden."""
 
-        if not (_fused_qsa_indexer_enabled() and _compiled_qsa_indexer_enabled()):
+        if self._uses_vision_positions() or not (_fused_qsa_indexer_enabled() and _compiled_qsa_indexer_enabled()):
             return False
         if not mx.metal.is_available() or mx.default_device() != mx.gpu:
             return False
@@ -3583,14 +3618,9 @@ class Attention(nn.Module):
         k, v = cache.kv.update_and_fetch(k, v)
         T = k.shape[2]
 
-        if vrope is not None:
-            # Vision request: QSA sparse selection is bypassed and attention
-            # runs dense-causal — the reference qwen4_exp implementation
-            # serves multimodal exactly this way (its sparse fast paths
-            # exclude M-RoPE). The indexer above still ran, so the QSA cache
-            # streams (raw/pooled) stay byte-identical with text serving and
-            # bank state keeps one format. Masks key on sequence order,
-            # which remains correct under M-RoPE; only rope reads the axes.
+        if vrope is not None and not vision_qsa_enabled():
+            # Diagnostic rollback only. The reference model applies QSA to
+            # images too; dropping selection changed its attention function.
             sel_mask = None
 
         if isinstance(sel_mask, tuple) and sel_mask and sel_mask[0] == "flash":

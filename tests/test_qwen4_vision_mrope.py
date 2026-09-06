@@ -8,8 +8,8 @@ tests pin the reference semantics (mlx-vlm / transformers Qwen-VL family):
 - interleaved axis layout t@0,3..30 / h@1,4..31 / w@2,5..29
 - position contraction (an image occupies max(t, h/2, w/2) positions)
 - equal-axes tables reduce bit-exactly to plain rope (text safety)
-- under an armed vision scope, QSA sparse selection is bypassed (dense
-  causal — the reference multimodal fallback) and rope reads the table
+- vision retains QSA selection, with the reference M-RoPE positions applied
+  to indexer queries and the first token of each pooled-key block
 """
 
 import mlx.core as mx
@@ -19,6 +19,7 @@ import pytest
 from mtplx.attention_context import vision_rope, vision_rope_state
 from mtplx.models.qwen4_exp import (
     QSACache,
+    QSAIndexer,
     TextArgs,
     _build_mrope_axes,
     _mrope_cos_sin,
@@ -155,13 +156,13 @@ def test_attention_delta_branch_shifts_positions():
     assert shifted.shape == plain.shape
 
 
-def test_attention_vision_scope_bypasses_sparse_selection():
+def test_attention_vision_scope_preserves_sparse_selection():
     attn = _tiny_attention()
 
     class _PoisonIndexer:
         def __call__(self, x, pos_start, cache, qk_rows=None):
-            # A mask that blinds every query to everything except itself —
-            # if selection is honored the output differs wildly from dense.
+            # The official model always intersects attention with this mask,
+            # including vision. Dense attention would change the model.
             S = x.shape[1]
             eye = mx.eye(S, dtype=mx.bool_)[None, None]
             return eye
@@ -175,8 +176,44 @@ def test_attention_vision_scope_bypasses_sparse_selection():
 
     table = mx.broadcast_to(mx.arange(5, dtype=mx.int32)[None, :], (3, 5))
     with vision_rope(table, 0):
-        bypassed = attn(x, QSACache(4))
-    assert mx.array_equal(dense, bypassed).item()
+        vision = attn(x, QSACache(4))
+    assert mx.array_equal(poisoned, vision).item()
+
+
+def test_vision_indexer_query_and_block_start_positions_match_numpy():
+    args = TextArgs(hidden_size=32, head_dim=32, indexer_head_dim=32,
+        indexer_n_heads=2, indexer_kv_heads=1, indexer_compress_ratio=2,
+        rope_parameters={"mrope_interleaved": True, "mrope_section": [2, 1, 1],
+                         "partial_rotary_factor": .25, "rope_theta": 10000000,
+                         "rope_type": "default"})
+    indexer = QSAIndexer(args)
+    rng = np.random.default_rng(607)
+    raw_q = rng.standard_normal((1, 10, 2, 32)).astype(np.float32)
+    raw_k = rng.standard_normal((1, 14, 32)).astype(np.float32)
+    table = np.array([[0,1,2,3,4,4,4,4,6,7,8,9],
+                      [0,1,2,3,4,4,5,5,6,7,8,9],
+                      [0,1,2,3,4,5,4,5,6,7,8,9]], dtype=np.int32)
+    inv = np.asarray(indexer._inv_freq)
+
+    def oracle(values, positions):
+        # Independent reference arithmetic: RMSNorm, then rotate at each
+        # query / pooled-block FIRST position, with equal axes after images.
+        values = values / np.sqrt(np.mean(values * values, axis=-1, keepdims=True) + args.rms_norm_eps)
+        pos3 = np.stack([table[:, p] if p < table.shape[1] else np.full(3, p-2)
+                         for p in positions], axis=1)
+        angles = pos3[[0,1,2,0]].T.astype(np.float32) * inv[None, :]
+        angles = np.concatenate([angles, angles], axis=-1)[None, :, None, :]
+        first = values[..., :8]
+        rotated = np.concatenate([-first[..., 4:], first[..., :4]], axis=-1)
+        return np.concatenate([first*np.cos(angles) + rotated*np.sin(angles), values[..., 8:]], axis=-1)
+
+    with vision_rope(mx.array(table), -2):
+        actual_q = indexer._prepare_queries(mx.array(raw_q), 4)
+        actual_k = indexer._pool_keys_eager(mx.array(raw_k), 0, 7)
+    expected_q = oracle(raw_q, np.arange(4, 14))
+    expected_k = oracle(raw_k.reshape(1,7,2,32).mean(axis=2)[:, :, None], np.arange(0,14,2))[:, :, 0]
+    np.testing.assert_allclose(np.asarray(actual_q), expected_q, rtol=2e-6, atol=2e-6)
+    np.testing.assert_allclose(np.asarray(actual_k), expected_k, rtol=2e-6, atol=2e-6)
 
 
 def test_vision_rope_scope_helper_and_wiring():

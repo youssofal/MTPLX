@@ -8,6 +8,20 @@ from mtplx.commands.trace_clients import load_pi_session
 from mtplx.commands.trace_metrics import mtp_economics, sample_intervals
 
 
+def test_tps_chart_keeps_missing_samples_and_time_gaps_out_of_the_curve():
+    from mtplx.commands.trace_report import _tps_cell
+
+    row = {"sliding": [], "samples": [{"ts": 1}], "decode_tok_s": 25,
+           "status": "ok", "turn": 1, "completion_tokens": 100}
+    assert _tps_cell(row) is None
+    row["samples"] = [{"ts": 1, "tps": 50}, {"ts": 2}, {"ts": 5, "tps": 0}]
+    html = _tps_cell(row)
+    assert "flight samples n=2" in html
+    assert "min 0.0" in html  # A measured zero remains meaningful.
+    curve = html.split('<path d="', 1)[1].split('"', 1)[0]
+    assert curve.count("M") == 2  # An observation gap is not a connecting line.
+
+
 def test_economics_distinguishes_aggregate_acceptance_from_conditional_probability():
     receipt = {"completion_tokens": 250, "decode_elapsed_s": 4.0, "verify_calls": 100,
                "accepted_by_depth": [80, 50, 20], "drafted_by_depth": [100, 100, 100],

@@ -524,6 +524,15 @@ public struct InFlightRequest: Codable, Equatable, Sendable, Identifiable {
     public var prefillState: PrefillState?
     public var cancelled: Bool
 
+    /// The attention context grows during generation, even though the input
+    /// prompt stays fixed. Read this request's counters, never another turn's.
+    public var contextTokens: Int? {
+        guard let promptTokens else { return nil }
+        let generated = lastProgress.values["completion_tokens"]?.intValue
+            ?? lastProgress.values["generated_tokens"]?.intValue ?? 0
+        return max(0, promptTokens) + max(0, generated)
+    }
+
     enum CodingKeys: String, CodingKey {
         case requestId = "request_id"
         case startedS = "started_s"

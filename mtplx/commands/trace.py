@@ -583,7 +583,8 @@ def _turn_row(turn: dict) -> dict:
         "postcommit_wait": {k: pcw.get(k) for k in ("outcome", "elapsed_s", "job_stored", "job_mode", "job_reason") if k in pcw} or None,
         "canon": {k: canon.get(k) for k in ("applied", "cp_raw", "cp_canon", "committed_len", "turns_substituted") if k in canon} or None,
         "request_id": receipt.get("request_id"),
-        "tps_sparkline": _sparkline([float(s.get("tps") or 0) for s in samples], width=24) or None,
+        "tps_sparkline": _sparkline([float(s["tps"]) for s in samples
+                                    if isinstance(s.get("tps"), (int, float))], width=24) or None,
         "receipt_missing": not receipt,
     }
 
@@ -766,10 +767,13 @@ def _cmd_request(args: argparse.Namespace) -> int:
     elif rest:
         print(f"  ({len(rest)} more fields; --all to show)")
     if samples:
-        tps = [float(s.get("tps") or 0) for s in samples]
+        tps = [float(s["tps"]) for s in samples if isinstance(s.get("tps"), (int, float))]
         print("\n  per-second decode (flight recorder)")
-        print(f"    tps  min={min(tps):.1f} mean={sum(tps)/len(tps):.1f} max={max(tps):.1f}  n={len(tps)}s")
-        print(f"    {_sparkline(tps, width=80)}")
+        if tps:
+            print(f"    tps  min={min(tps):.1f} mean={sum(tps)/len(tps):.1f} max={max(tps):.1f}  n={len(tps)} samples")
+            print(f"    {_sparkline(tps, width=80)}")
+        else:
+            print("    no observed TPS values in these samples")
         rc = [int(s.get("rc") or 0) for s in samples]
         if rc and rc[-1]:
             print(f"    reasoning chars {_fmt_tok(rc[-1])} / content chars {_fmt_tok(int(samples[-1].get('cc') or 0))}")

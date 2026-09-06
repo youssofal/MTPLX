@@ -270,14 +270,14 @@ def _accept_overlay(samples: list[dict]) -> tuple[list[tuple[float, float]], flo
 
 def _tps_cell(r: dict) -> str | None:
     sliding = [(lbl, float(v)) for lbl, v in r["sliding"] if v is not None]
-    samples = r["samples"]
+    samples = [s for s in r["samples"] if isinstance(s.get("tps"), (int, float))]
     if not samples and not sliding:
         return None
     w, px0, px1, py0, py1 = 252, 30, 240, 10, 86
     approx = not samples
     if samples:
         ts0 = float(samples[0].get("ts") or 0)
-        pts = [(float(s.get("ts") or 0) - ts0, float(s.get("tps") or 0)) for s in samples]
+        pts = [(float(s.get("ts") or 0) - ts0, float(s["tps"])) for s in samples]
         span = max(pts[-1][0], 1e-9)
     else:
         pts = [(float(i), v) for i, (_, v) in enumerate(sliding)]
@@ -294,7 +294,11 @@ def _tps_cell(r: dict) -> str | None:
         out.append(f'<line x1="{px0}" y1="{ty:.1f}" x2="{px1}" y2="{ty:.1f}" class="grid"/>'
                    f'<text x="{px0 - 4}" y="{ty + 3.5:.1f}" class="ax end">{tv:g}</text>')
     if pts:
-        path = " ".join(f"{'M' if i == 0 else 'L'}{spt(p, v)[0]:.1f},{spt(p, v)[1]:.1f}" for i, (p, v) in enumerate(pts))
+        path = " ".join(
+            f"{'M' if i == 0 or (not approx and p - pts[i-1][0] > 2.5) else 'L'}"
+            f"{spt(p, v)[0]:.1f},{spt(p, v)[1]:.1f}"
+            for i, (p, v) in enumerate(pts)
+        )
         dash = ' stroke-dasharray="5 4"' if approx else ""
         out.append(f'<path d="{path}" fill="none" stroke="{_BLUE}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"{dash}/>')
     if approx:

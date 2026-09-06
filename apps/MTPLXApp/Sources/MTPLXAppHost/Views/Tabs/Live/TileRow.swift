@@ -272,7 +272,7 @@ struct TileRow: View {
     /// a misleading max.
     ///
     /// The "current" signal cascades through the freshest source:
-    ///   1. Any in-flight request's prompt token count.
+    ///   1. Any in-flight request's prompt plus generated token count.
     ///   2. The largest prefix length across active engine sessions
     ///      (covers the read-only "between requests, last chat is
     ///      still loaded" case).
@@ -287,8 +287,8 @@ struct TileRow: View {
     }
 
     private func currentContextTokens() -> Int {
-        if let inFlightPrompt = backend.inFlight.lazy.compactMap(\.promptTokens).max() {
-            return inFlightPrompt
+        if let inFlightContext = backend.inFlight.lazy.compactMap(\.contextTokens).max() {
+            return inFlightContext
         }
         if let sessions = backend.sessions?.sessions, !sessions.isEmpty {
             return sessions.map(\.prefixLen).max() ?? 0
