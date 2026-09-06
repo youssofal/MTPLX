@@ -115,6 +115,11 @@ from mtplx.gemma4_pair import (
     resolve_gemma4_pair_paths,
 )
 from mtplx.model_scheduler import ModelWorkScheduler
+from mtplx.semantic_anchors import (
+    mandatory_semantic_edges,
+    plan_semantic_anchors,
+    render_message_prefixes,
+)
 from mtplx.server.hyper import HYPER_ADMISSION_CAP, HyperAdmissionGate
 from mtplx.reasoning_effort import (
     REASONING_EFFORT_CHOICES,
@@ -13875,6 +13880,193 @@ def _encode_messages(
     return ids
 
 
+def _semantic_anchors_enabled() -> bool:
+    raw = os.environ.get("MTPLX_SEMANTIC_ANCHORS")
+    return str(raw or "").strip().lower() not in {"", "0", "false", "off", "no"}
+
+
+def _semantic_env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    raw = os.environ.get(name)
+    try:
+        value = int(raw) if raw is not None else int(default)
+    except (TypeError, ValueError, OverflowError):
+        value = int(default)
+    return max(int(minimum), value)
+
+
+def _semantic_anchor_candidate_indexes(
+    messages: Sequence[Any],
+    *,
+    limit: int,
+) -> tuple[int, ...]:
+    """Choose a bounded set of complete message prefixes to render exactly."""
+
+    count = len(messages)
+    if count <= 0:
+        return ()
+    cap = max(1, int(limit))
+    preferred: list[int] = []
+
+    instruction_end: int | None = None
+    for index, message in enumerate(messages):
+        role = str(
+            getattr(message, "role", None)
+            or (message.get("role") if isinstance(message, Mapping) else "")
+        ).strip().lower()
+        if role in {"system", "developer"}:
+            instruction_end = index
+            continue
+        break
+    if instruction_end is not None:
+        preferred.append(instruction_end)
+
+    for index, message in enumerate(messages):
+        if hasattr(message, "model_dump"):
+            try:
+                raw = message.model_dump(exclude_none=True)
+            except Exception:
+                raw = {}
+        elif isinstance(message, Mapping):
+            raw = dict(message)
+        else:
+            raw = {}
+        metadata = raw.get("metadata") if isinstance(raw, Mapping) else None
+        if not isinstance(metadata, Mapping):
+            metadata = raw
+        if any(
+            bool(metadata.get(key))
+            for key in (
+                "semantic_anchor",
+                "checkpoint",
+                "compaction_end",
+                "compacted",
+            )
+        ):
+            preferred.append(index)
+
+    recent = list(range(max(0, count - cap * 2), count))
+    # Always render the newest complete message.  Explicit checkpoints and
+    # instruction boundaries may otherwise consume the entire candidate cap,
+    # omitting the pre-tool frontier before exact-prefix validation even runs.
+    ordered: list[int] = [count - 1]
+    for index in [*preferred, *reversed(recent)]:
+        if index not in ordered:
+            ordered.append(index)
+        if len(ordered) >= cap:
+            break
+    return tuple(sorted(ordered))
+
+
+def _plan_request_semantic_anchors(
+    state: Any,
+    *,
+    messages: list[Any],
+    prompt_ids: list[int],
+    enable_thinking: bool,
+    reasoning_effort: str | None,
+    strip_assistant_reasoning_history: bool,
+    scoped_reasoning_history: bool,
+    preserve_reasoning_history: bool,
+    tools: list[dict[str, Any]] | None,
+    tool_choice: Any,
+    tool_prompt_mode: str,
+    cache_available: bool,
+    vision_active: bool,
+    special_prompt_suffix: bool,
+    observability: dict[str, Any],
+) -> None:
+    """Plan exact semantic recurrent-cache boundaries for one request."""
+
+    if not _semantic_anchors_enabled():
+        observability["semantic_anchors_enabled"] = False
+        return
+    observability["semantic_anchors_enabled"] = True
+    if not cache_available:
+        observability["semantic_anchor_status"] = "skipped"
+        observability["semantic_anchor_skip_reason"] = "session_cache_unavailable"
+        return
+    if vision_active:
+        observability["semantic_anchor_status"] = "skipped"
+        observability["semantic_anchor_skip_reason"] = "vision_prompt"
+        return
+    if special_prompt_suffix:
+        observability["semantic_anchor_status"] = "skipped"
+        observability["semantic_anchor_skip_reason"] = "special_prompt_suffix"
+        return
+    if not messages or len(prompt_ids) < 2:
+        observability["semantic_anchor_status"] = "skipped"
+        observability["semantic_anchor_skip_reason"] = "prompt_too_short"
+        return
+
+    candidate_limit = _semantic_env_int(
+        "MTPLX_SEMANTIC_ANCHOR_CANDIDATES",
+        16,
+        minimum=1,
+    )
+    indexes = _semantic_anchor_candidate_indexes(messages, limit=candidate_limit)
+    estimated_bytes = _semantic_env_int(
+        "MTPLX_SEMANTIC_ANCHOR_ESTIMATED_BYTES",
+        0,
+        minimum=0,
+    )
+
+    def _render_prefix(prefix: Sequence[Any]) -> list[int]:
+        return _encode_messages(
+            state.runtime.tokenizer,
+            list(prefix),
+            enable_thinking=enable_thinking,
+            reasoning_effort=reasoning_effort,
+            strip_assistant_reasoning_history=strip_assistant_reasoning_history,
+            scoped_reasoning_history=scoped_reasoning_history,
+            preserve_reasoning_history=preserve_reasoning_history,
+            add_generation_prompt=False,
+            tools=tools,
+            tool_choice=tool_choice,
+            tool_prompt_mode=tool_prompt_mode,
+            template_observability={},
+        )
+
+    try:
+        rendered = render_message_prefixes(
+            messages,
+            _render_prefix,
+            message_indexes=indexes,
+            estimated_checkpoint_bytes=estimated_bytes,
+        )
+        byte_budget_raw = _semantic_env_int(
+            "MTPLX_SEMANTIC_ANCHOR_MAX_BYTES",
+            0,
+            minimum=0,
+        )
+        plan = plan_semantic_anchors(
+            prompt_ids,
+            rendered,
+            template_hash=getattr(state, "template_hash", None),
+            max_anchors=_semantic_env_int(
+                "MTPLX_SEMANTIC_ANCHOR_MAX",
+                8,
+                minimum=1,
+            ),
+            max_checkpoint_bytes=(byte_budget_raw or None),
+            default_checkpoint_bytes=max(1, estimated_bytes),
+            min_token_offset=1,
+        )
+        edges = mandatory_semantic_edges(
+            plan,
+            upper_bound=max(0, len(prompt_ids) - 1),
+        )
+    except Exception as exc:
+        observability["semantic_anchor_status"] = "error"
+        observability["semantic_anchor_error"] = f"{type(exc).__name__}: {exc}"
+        return
+
+    observability.update(plan.to_metrics())
+    observability["semantic_anchor_status"] = "planned"
+    observability["semantic_anchor_candidate_count"] = len(rendered)
+    observability["semantic_anchor_edges"] = list(edges)
+    observability["semantic_anchor_prefill_edges"] = len(edges)
+
+
 def _encode_messages_uncached(
     tokenizer: Any,
     messages: list[ChatMessage],
@@ -20607,6 +20799,7 @@ def _store_retokenized_history_snapshot(
     tool_prompt_mode: str | None = None,
     strip_tool_call_preamble_text: bool = False,
     committed_stream_ids: Sequence[int] | None = None,
+    mandatory_prefix_edges: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     if session_id is None:
         return {"stored": False, "reason": "no_session_id"}
@@ -20839,6 +21032,7 @@ def _store_retokenized_history_snapshot(
                     store_prefix_snapshot=(
                         False if oversized_nbytes_override is not None else None
                     ),
+                    mandatory_prefix_edges=mandatory_prefix_edges,
                 )
             if _abort_requested():
                 raise PostcommitAbort(_abort_reason())
@@ -21506,6 +21700,9 @@ def _store_generation_final_history_snapshot(
             snapshot_epoch=len(token_ids),
             mtp_snapshot_epoch=len(token_ids) if mtp_snapshot is not None else None,
             extra_state=getattr(final_state, "extra_state", None),
+            gdn_boundaries=list(
+                getattr(final_state, "gdn_boundaries", None) or []
+            ),
         )
     finally:
         state.lock.release()
@@ -21594,6 +21791,7 @@ def _schedule_idle_postcommit_snapshot(
     tool_prompt_mode: str | None = None,
     strip_tool_call_preamble_text: bool = False,
     committed_stream_ids: Sequence[int] | None = None,
+    mandatory_prefix_edges: Sequence[int] | None = None,
     retry_count: int = 0,
 ) -> dict[str, Any]:
     """Schedule a background SessionBank commit for a response the
@@ -21770,6 +21968,7 @@ def _schedule_idle_postcommit_snapshot(
                 tool_prompt_mode=tool_prompt_mode,
                 strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                 committed_stream_ids=committed_stream_ids,
+                mandatory_prefix_edges=mandatory_prefix_edges,
                 retry_count=retry_count + 1,
             )
             return True
@@ -21849,6 +22048,7 @@ def _schedule_idle_postcommit_snapshot(
                     tool_prompt_mode=tool_prompt_mode,
                     strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                     committed_stream_ids=committed_stream_ids,
+                    mandatory_prefix_edges=mandatory_prefix_edges,
                 )
                 if postcommit.get("stored"):
                     _log(postcommit)
@@ -23620,6 +23820,9 @@ def _run_generation_dispatched(
         default=getattr(state.args, "generation_mode", "mtp"),
     )
     request_observability_for_lane = dict(kwargs.get("request_observability") or {})
+    semantic_anchor_prefill_required = bool(
+        request_observability_for_lane.get("semantic_anchor_edges")
+    )
     if response_id:
         request_observability_for_lane.setdefault("request_id", response_id)
     kwargs["request_observability"] = request_observability_for_lane
@@ -23661,7 +23864,10 @@ def _run_generation_dispatched(
                 },
             },
         )
-    if _use_live_mtp_batch(state, effective_mode=effective_mode):
+    if (
+        _use_live_mtp_batch(state, effective_mode=effective_mode)
+        and not semantic_anchor_prefill_required
+    ):
         return _run_mtp_batch_generation_dispatched(
             state,
             prompt_ids,
@@ -23671,7 +23877,16 @@ def _run_generation_dispatched(
     history_bypass_reason = _ar_batch_history_bypass_reason(
         request_observability_for_lane
     )
-    if kwargs.get("constraint_spec") is not None:
+    if semantic_anchor_prefill_required:
+        # Batch prefill does not accept mandatory prefix edges. Keep semantic
+        # anchor requests on the serial AR or MTP path until it does.
+        use_ar_batch = False
+        mtp_disabled_reason = None
+        request_observability_for_lane["scheduler_lane"] = "solo_semantic_anchors"
+        request_observability_for_lane["ar_batch_bypass_reason"] = (
+            "semantic_anchors_require_serial_prefill"
+        )
+    elif kwargs.get("constraint_spec") is not None:
         # Grammar masks only exist on the serial lanes; the batched AR
         # pump's per-job samplers carry no matcher state (issue #186 phase 1).
         # MTP itself stays ON for constrained requests (phase 3 composes the
@@ -24488,6 +24703,9 @@ def _run_generation(
                 if mtp_snapshot is not None
                 else None,
                 extra_state=getattr(final_state, "extra_state", None),
+                gdn_boundaries=list(
+                    getattr(final_state, "gdn_boundaries", None) or []
+                ),
             )
             stats["sessionbank_snapshot_bytes"] = int(
                 getattr(session_bank, "last_put_nbytes", 0) or 0
@@ -30863,6 +31081,25 @@ def create_app(state: ServerState) -> FastAPI:
             request_observability["request_model_matches_served_model"] = (
                 requested_model == state.model_id
             )
+        _plan_request_semantic_anchors(
+            state,
+            messages=messages_for_generation,
+            prompt_ids=prompt_ids,
+            enable_thinking=thinking_enabled,
+            reasoning_effort=reasoning_effort,
+            strip_assistant_reasoning_history=(
+                state.args.strip_assistant_reasoning_history
+            ),
+            scoped_reasoning_history=_reasoning_history_scoped_active(state),
+            preserve_reasoning_history=_reasoning_history_preserve_echo_active(state),
+            tools=tool_specs if tools_active else None,
+            tool_choice=request.tool_choice,
+            tool_prompt_mode=template_tool_prompt_mode,
+            cache_available=(session is not None),
+            vision_active=(vision_splice is not None),
+            special_prompt_suffix=bool(aime_visible_working),
+            observability=template_observability,
+        )
         request_observability.update(policy.as_observability())
         request_observability["agent_rewrites"] = _agent_rewrites_mode()
         request_observability["session_cache_scope"] = session_cache_scope
@@ -30876,6 +31113,14 @@ def create_app(state: ServerState) -> FastAPI:
             opencode_tool_history_live_frontier_restore
         )
         request_observability.update(template_observability)
+        if request_observability.get("semantic_anchor_edges"):
+            # Dispatch will use the serial path because the batch drivers do
+            # not accept mandatory semantic edges. Match outer cleanup and
+            # cancellation ownership to the lane that will actually run.
+            defer_mtp_batch_mlx_finalize = False
+            request_observability["mtp_batch_bypass_reason"] = (
+                "semantic_anchors_require_serial_prefill"
+            )
         if template_observability.get("tool_template_fallback"):
             _record_tool_parse_event(state, event="tool_template_fallback")
         if request_observability.get("request_client_hint") == "android_studio":
@@ -31221,6 +31466,9 @@ def create_app(state: ServerState) -> FastAPI:
                         tool_prompt_mode=postcommit_tool_prompt_mode,
                         strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                         committed_stream_ids=postcommit_committed_stream,
+                        mandatory_prefix_edges=request_observability.get(
+                            "semantic_anchor_edges"
+                        ),
                     )
                 )
                 return
@@ -31241,6 +31489,9 @@ def create_app(state: ServerState) -> FastAPI:
                         tool_prompt_mode=postcommit_tool_prompt_mode,
                         strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                         committed_stream_ids=postcommit_committed_stream,
+                        mandatory_prefix_edges=request_observability.get(
+                            "semantic_anchor_edges"
+                        ),
                     ),
                     batch_key=f"postcommit.inline:{session_id or 'stateless'}",
                 ),
@@ -32473,6 +32724,11 @@ def create_app(state: ServerState) -> FastAPI:
                                                 strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                                                 committed_stream_ids=(
                                                     stream_committed_stream
+                                                ),
+                                                mandatory_prefix_edges=(
+                                                    request_observability.get(
+                                                        "semantic_anchor_edges"
+                                                    )
                                                 ),
                                             ),
                                             batch_key=(

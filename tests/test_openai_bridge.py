@@ -55,6 +55,7 @@ from mtplx.server.openai import (
     _request_is_authorized,
     _response_id_from_client_hint,
     _schedule_idle_postcommit_snapshot,
+    _semantic_anchor_candidate_indexes,
     _session_cache_scope_for_request,
     _should_bypass_session_cache_for_opencode_tool_history,
     _should_force_clone_session_cache_for_opencode_tool_history,
@@ -152,7 +153,7 @@ def _postcommit_state(*, tokenizer=None):
     )
 
 
-def _final_state(tokens, *, safe=True):
+def _final_state(tokens, *, safe=True, gdn_boundaries=None):
     return SimpleNamespace(
         final_trunk_cache=["cache"],
         final_logits="logits",
@@ -161,7 +162,25 @@ def _final_state(tokens, *, safe=True):
         generated_token_ids=tuple(tokens),
         safe_to_commit=safe,
         finish_reason="stop",
+        gdn_boundaries=list(gdn_boundaries or []),
     )
+
+
+def test_semantic_anchor_candidates_always_include_latest_message():
+    messages = [
+        {
+            "role": "tool",
+            "content": f"result-{index}",
+            "metadata": {"checkpoint": True},
+        }
+        for index in range(16)
+    ]
+    messages.append({"role": "user", "content": "next tool request"})
+
+    indexes = _semantic_anchor_candidate_indexes(messages, limit=8)
+
+    assert len(indexes) == 8
+    assert indexes[-1] == len(messages) - 1
 
 
 def test_server_parse_args_exposes_product_flags():
@@ -215,9 +234,13 @@ def test_generation_final_postcommit_exact_stores_final_state_without_retokenize
         add_generation_prompt=True,
     )
     generated_tokens = _ids("ok")
+    boundary = (len(prompt_ids) - 2, "snapshot", "hidden")
     generated = {
         "tokens": generated_tokens,
-        "_final_state": _final_state(generated_tokens),
+        "_final_state": _final_state(
+            generated_tokens,
+            gdn_boundaries=[boundary],
+        ),
     }
 
     result = _store_generation_final_history_snapshot(
@@ -235,6 +258,7 @@ def test_generation_final_postcommit_exact_stores_final_state_without_retokenize
     assert result["mode"] == "generation_final_exact"
     assert result["history_suffix_tokens"] == 0
     assert state.sessions.bank.puts[0]["token_ids"] == prompt_ids + generated_tokens
+    assert state.sessions.bank.puts[0]["gdn_boundaries"] == [boundary]
 
 
 def test_generation_final_postcommit_prefix_stores_boundary_and_reports_suffix():

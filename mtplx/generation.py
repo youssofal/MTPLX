@@ -111,6 +111,7 @@ from .runtime_options import (
     qwen4_opdiet_enabled,
 )
 from .route_tape import RouteTape, counter_deltas
+from .semantic_anchors import merge_mandatory_edges
 
 Mode = Literal["ar", "mtp1", "mtpk", "mtpa"]
 VerifyStrategy = Literal[
@@ -128,6 +129,40 @@ _PREFILL_CHUNK_SIZE_OVERRIDE: ContextVar[int | None] = ContextVar(
     "mtplx_prefill_chunk_size_override",
     default=None,
 )
+
+
+def _trace_mandatory_prefix_edges(
+    trace_metadata: Mapping[str, Any] | None,
+    *,
+    prompt_tokens: int,
+) -> tuple[int, ...]:
+    """Read stable and semantic prompt edges from request telemetry."""
+
+    metadata = trace_metadata or {}
+    stable: tuple[int, ...] = ()
+    try:
+        raw_stable = metadata.get("stable_prefix_len")
+        if raw_stable is not None:
+            stable = (int(raw_stable),)
+    except (TypeError, ValueError, OverflowError):
+        stable = ()
+
+    semantic: tuple[int, ...] = ()
+    raw_semantic = metadata.get("semantic_anchor_edges")
+    if isinstance(raw_semantic, (list, tuple, set)):
+        parsed: list[int] = []
+        for raw in raw_semantic:
+            try:
+                parsed.append(int(raw))
+            except (TypeError, ValueError, OverflowError):
+                continue
+        semantic = tuple(parsed)
+
+    return merge_mandatory_edges(
+        stable,
+        semantic,
+        upper_bound=max(0, int(prompt_tokens) - 1),
+    )
 
 
 def reject_non_k1_a3b_whole_moe_request(rt: MTPLXRuntime, *, entrypoint: str) -> None:
@@ -3014,6 +3049,11 @@ class GenerationFinalState:
     mtp_history_window_tokens: int = 0
     mtp_history_position_base: int = 0
     extra_state: dict[str, Any] | None = None
+    # Interior recurrent snapshots captured while prefilling the prompt.
+    # Generation-final bank entries extend that same prompt prefix, so these
+    # boundaries remain valid and must survive when the prompt-only snapshot
+    # was too large to store.
+    gdn_boundaries: list[Any] = field(default_factory=list)
 
 
 def _finish_reason_from_tokens(
@@ -3108,6 +3148,7 @@ def _prefill_restored_prompt_suffix(
     gdn_boundary_sink: list[tuple[int, Any, Any]] | None = None,
     vision_splice: Any | None = None,
     stable_prefix_len: int | None = None,
+    mandatory_prefix_edges: Sequence[int] | None = None,
     plan_ids: Sequence[int] | None = None,
 ) -> tuple[Any, Any, float, float]:
     """Extend a restored SessionBank prefix without one giant suffix forward.
@@ -3298,15 +3339,19 @@ def _prefill_restored_prompt_suffix(
     # the fused single-forward cannot capture interior boundaries, so it
     # defers to the chunked path in that case (same tokens, one extra
     # launch; no re-evaluation).
-    _stable_edge_rel: int | None = None
-    if (
-        stable_prefix_len is not None
-        and gdn_boundary_sink is not None
-        and 0 < int(stable_prefix_len) - int(cached_tokens) < max(0, len(suffix) - 1)
-    ):
-        _stable_edge_rel = int(stable_prefix_len) - int(cached_tokens)
+    _absolute_edges = (
+        merge_mandatory_edges(
+            (stable_prefix_len,) if stable_prefix_len is not None else (),
+            mandatory_prefix_edges,
+            lower_bound=cached_tokens,
+            upper_bound=cached_tokens + max(0, len(suffix) - 1),
+        )
+        if gdn_boundary_sink is not None
+        else ()
+    )
+    _relative_edges = tuple(edge - cached_tokens for edge in _absolute_edges)
     fused_max = _small_suffix_fused_max()
-    if 0 < len(suffix) <= fused_max and _stable_edge_rel is None:
+    if 0 < len(suffix) <= fused_max and not _relative_edges:
         fused_array = mx.array([suffix])
         fused_embeddings = _suffix_chunk_embeddings(fused_array)
         started = time.perf_counter()
@@ -3369,9 +3414,7 @@ def _prefill_restored_prompt_suffix(
             _prefill_spans_with_tail_grid(
                 len(body),
                 tail_interval=_gdn_boundary_tail_interval(),
-                mandatory_edges=(
-                    (_stable_edge_rel,) if _stable_edge_rel is not None else ()
-                ),
+                mandatory_edges=_relative_edges,
             )
             if capture_boundaries
             else _iter_prefill_chunk_spans(len(body))
@@ -3661,6 +3704,7 @@ def _restore_near_prefix_prompt_state(
     chunk_started_s: float | None = None,
     cache_factory: Callable[[], Any] | None = None,
     stable_prefix_len: int | None = None,
+    mandatory_prefix_edges: Sequence[int] | None = None,
     matched_ceiling: int | None = None,
     vision_splice: Any | None = None,
 ) -> PromptState | None:
@@ -4039,6 +4083,7 @@ def _restore_near_prefix_prompt_state(
                 chunk_started_s=chunk_started_s,
                 gdn_boundary_sink=suffix_boundary_sink,
                 stable_prefix_len=stable_prefix_len,
+                mandatory_prefix_edges=mandatory_prefix_edges,
                 vision_splice=vision_splice,
                 # The whole prompt, so the PLE lookahead's worker rebuilds
                 # each suffix chunk's n-gram history from the same tokens the
@@ -4427,6 +4472,7 @@ def restore_or_prefill_prompt_state(
     vision_splice: Any | None = None,
     store_prefix_snapshot: bool | None = None,
     stable_prefix_len: int | None = None,
+    mandatory_prefix_edges: Sequence[int] | None = None,
     capture_hidden: bool | None = None,
 ) -> PromptState:
     """Build the initial prompt state used by MTP-k decode.
@@ -4733,6 +4779,7 @@ def restore_or_prefill_prompt_state(
                 # omitting it here left the hottest tool-round path
                 # block-rounding down ~one 256-token block per round.
                 stable_prefix_len=stable_prefix_len,
+                mandatory_prefix_edges=mandatory_prefix_edges,
             )
             if near_prompt_state is not None:
                 return _emit_prefill_complete(near_prompt_state)
@@ -4860,8 +4907,7 @@ def restore_or_prefill_prompt_state(
                     gdn_boundary_sink=suffix_boundary_sink,
                     vision_splice=vision_splice,
                     stable_prefix_len=stable_prefix_len,
-                    # The whole prompt: see the near-prefix caller above.
-                    plan_ids=prompt_ids,
+                    mandatory_prefix_edges=mandatory_prefix_edges,
                 )
             )
             return _emit_prefill_complete(PromptState(
@@ -4907,6 +4953,7 @@ def restore_or_prefill_prompt_state(
             chunk_started_s=prefill_started_s,
             cache_factory=restore_cache_factory,
             stable_prefix_len=stable_prefix_len,
+            mandatory_prefix_edges=mandatory_prefix_edges,
             matched_ceiling=(
                 vision_restore_spans[0][0] if vision_restore_spans else None
             ),
@@ -4955,6 +5002,7 @@ def restore_or_prefill_prompt_state(
                 chunk_started_s=prefill_started_s,
                 vision_splice=vision_splice,
                 stable_prefix_len=stable_prefix_len,
+                mandatory_prefix_edges=mandatory_prefix_edges,
                 gdn_boundary_sink=gdn_boundary_sink,
             )
             prompt_eval_time = target_time + prompt_history_time
@@ -5037,6 +5085,7 @@ def restore_or_prefill_prompt_state(
             vision_splice=vision_splice,
             gdn_boundary_sink=gdn_boundary_sink,
             stable_prefix_len=stable_prefix_len,
+            mandatory_prefix_edges=mandatory_prefix_edges,
         )
         prompt_eval_time = target_time
     return _emit_prefill_complete(PromptState(
@@ -5957,6 +6006,7 @@ def _prefill(
     vision_splice: Any | None = None,
     gdn_boundary_sink: list[tuple[int, Any]] | None = None,
     stable_prefix_len: int | None = None,
+    mandatory_prefix_edges: Sequence[int] | None = None,
 ):
     _reject_unwired_ple_lookahead("_prefill")
     if not prompt_ids:
@@ -5973,13 +6023,15 @@ def _prefill(
     if len(prompt_ids) > 1:
         body = prompt_ids[:-1]
         body_array = mx.array([body])
-        _cold_edges: tuple[int, ...] = ()
-        if (
-            stable_prefix_len is not None
-            and capture_boundaries
-            and 0 < int(stable_prefix_len) < len(body)
-        ):
-            _cold_edges = (int(stable_prefix_len),)
+        _cold_edges = (
+            merge_mandatory_edges(
+                (stable_prefix_len,) if stable_prefix_len is not None else (),
+                mandatory_prefix_edges,
+                upper_bound=len(body),
+            )
+            if capture_boundaries
+            else ()
+        )
         spans = (
             _prefill_spans_with_tail_grid(
                 len(body),
@@ -6060,6 +6112,7 @@ def _prefill_committed_mtp_history_streaming(
     vision_splice: Any | None = None,
     gdn_boundary_sink: list[tuple[int, Any]] | None = None,
     stable_prefix_len: int | None = None,
+    mandatory_prefix_edges: Sequence[int] | None = None,
     prefill_chunk_size: int | None = None,
 ):
     if not prompt_ids:
@@ -6100,13 +6153,15 @@ def _prefill_committed_mtp_history_streaming(
             pad_prefix_counts.append(
                 pad_prefix_counts[-1] + (1 if token == pad_id else 0)
             )
-    _cold_edges: tuple[int, ...] = ()
-    if (
-        stable_prefix_len is not None
-        and capture_boundaries
-        and 0 < int(stable_prefix_len) < len(body)
-    ):
-        _cold_edges = (int(stable_prefix_len),)
+    _cold_edges = (
+        merge_mandatory_edges(
+            (stable_prefix_len,) if stable_prefix_len is not None else (),
+            mandatory_prefix_edges,
+            upper_bound=len(body),
+        )
+        if capture_boundaries
+        else ()
+    )
     mtp_streaming_spans = (
         _prefill_spans_with_tail_grid(
             len(body),
@@ -6669,6 +6724,10 @@ def generate_ar(
     # mtp_history_policy="cycle" keeps AR requests on the trunk-only path
     # (no MTP history build), including on MTP-enabled runtimes serving
     # --generation-mode ar.
+    mandatory_prefix_edges = _trace_mandatory_prefix_edges(
+        trace_metadata,
+        prompt_tokens=len(prompt_ids),
+    )
     _prompt_state_started = time.perf_counter()
     prompt_state = restore_or_prefill_prompt_state(
         rt,
@@ -6683,6 +6742,7 @@ def generate_ar(
         policy_fingerprint=session_policy_fingerprint,
         prefill_callback=prefill_callback,
         abort_check=abort_check,
+        mandatory_prefix_edges=mandatory_prefix_edges,
         capture_hidden=ar_return_hidden,
     )
     prompt_state_total_time_s = time.perf_counter() - _prompt_state_started
@@ -7162,6 +7222,7 @@ def generate_ar(
                 safe_to_commit=True,
                 finish_reason=finish_reason,
                 mtp_history_policy=prompt_state.mtp_history_policy,
+                gdn_boundaries=list(prompt_state.gdn_boundaries or []),
             )
         except Exception as exc:  # capture only — never lose a finished response
             final_state = None
@@ -8472,8 +8533,12 @@ def generate_mtpk(
         _raw_stable = (trace_metadata or {}).get("stable_prefix_len")
         if _raw_stable is not None:
             _stable_prefix_len = max(0, int(_raw_stable)) or None
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         _stable_prefix_len = None
+    mandatory_prefix_edges = _trace_mandatory_prefix_edges(
+        trace_metadata,
+        prompt_tokens=len(prompt_ids),
+    )
     _prompt_state_started = time.perf_counter()
     prompt_state = restore_or_prefill_prompt_state(
         rt,
@@ -8496,6 +8561,7 @@ def generate_mtpk(
         # 10+ minutes, 2026-07-03).
         abort_check=abort_check,
         stable_prefix_len=_stable_prefix_len,
+        mandatory_prefix_edges=mandatory_prefix_edges,
     )
     prompt_state_total_time_s = time.perf_counter() - _prompt_state_started
     pre_first_token_setup_started = time.perf_counter()
@@ -13374,6 +13440,7 @@ def generate_mtpk(
             # and the bank must hand the next turn a base that matches the
             # committed cache it stores.
             mtp_history_position_base=int(mtp_history_position_base),
+            gdn_boundaries=list(prompt_state.gdn_boundaries or []),
         )
     reject_path_counts, repair_time_by_reject_depth = _reject_repair_breakdown(events)
     _forkev_snapshot: dict[str, object] = {}
