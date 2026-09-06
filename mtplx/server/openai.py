@@ -2208,6 +2208,28 @@ def _open_hermes_later(command: str, *, delay_s: float = 1.0) -> None:
     timer.start()
 
 
+def _open_dsh_later(*, delay_s: float = 1.0) -> None:
+    def open_dsh() -> None:
+        try:
+            from mtplx.dsh import dsh_launch_command, launch_dsh_in_terminal
+
+            result = launch_dsh_in_terminal(dsh_launch_command())
+            if result.get("ok"):
+                _startup_line("DSH opened in Terminal.")
+            else:
+                _startup_line(
+                    f"warning: could not open DSH automatically: {result.get('error')}"
+                )
+                _startup_line(f"run manually: {dsh_launch_command()}")
+        except Exception as exc:
+            _startup_line(f"warning: could not open DSH automatically: {exc}")
+            _startup_line(f"run manually: {dsh_launch_command()}")
+
+    timer = Timer(delay_s, open_dsh)
+    timer.daemon = True
+    timer.start()
+
+
 def _server_console_enabled(state: Any) -> bool:
     return bool(getattr(getattr(state, "args", None), "server_console", False))
 
@@ -29474,6 +29496,7 @@ def create_app(state: ServerState) -> FastAPI:
             "--open-dashboard",
             "--launch-pi",
             "--launch-opencode",
+            "--launch-dsh",
             "--server-console",
         }
         child_args: list[str] = []
@@ -36644,6 +36667,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Open Hermes Agent in Terminal after the MTPLX server is ready.",
     )
     parser.add_argument(
+        "--launch-dsh",
+        action="store_true",
+        help="Open DSH (DeepSeek Harness) in Terminal after the MTPLX server is ready.",
+    )
+    parser.add_argument(
         "--server-console",
         action="store_true",
         help="Accept live server-control commands such as /reasoning and /mtp on stdin.",
@@ -36824,6 +36852,9 @@ def main(argv: list[str] | None = None) -> None:
             _startup_line(
                 "warning: --launch-hermes was set but no Hermes command was provided."
             )
+    if args.launch_dsh:
+        _startup_line("Opening DSH in Terminal...")
+        _open_dsh_later()
     # Main-thread insurance for the mlx 0.32.1 TLS-destructor teardown
     # crash (#303): the owner thread parks (model_scheduler), and the main
     # thread clears its own mlx streams before Py_Finalize.

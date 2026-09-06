@@ -169,6 +169,7 @@ QUICKSTART_TARGETS = {
     "opencode",
     "swival",
     "hermes",
+    "dsh",
     "dashboard",
 }
 HERMES_PROFILE_NAME = "mtplx"
@@ -9437,6 +9438,49 @@ def cmd_serve_public(args: Any) -> int:
                     "Use the existing server, or stop that terminal with Ctrl-C to restart."
                 )
                 return 0
+        if bool(getattr(args, "quickstart_dsh", False)):
+            base = _server_url(
+                str(getattr(args, "host", "127.0.0.1")),
+                int(getattr(args, "port", 8000)),
+            )
+            health = _http_json(base + "/health", timeout=1.5, api_key=api_key)
+            if health.get("ok"):
+                from mtplx.dsh import (
+                    dsh_launch_command,
+                    dsh_model_ref,
+                    launch_dsh_in_terminal,
+                    write_dsh_settings,
+                )
+
+                model_id = (
+                    health.get("model")
+                    or getattr(args, "model_id", None)
+                    or DEFAULT_PUBLIC_MODEL_ID
+                )
+                context_window = int(health.get("context_window") or 262144)
+                # Idempotent re-write (MTPLX-owned keys only) so DSH's
+                # settings track the server that is actually running.
+                write_dsh_settings(
+                    base_url=base + "/v1",
+                    model_id=str(model_id),
+                    context_window=context_window,
+                    write_default_model=True,
+                )
+                _print_serve_start_line("MTPLX is already running.")
+                _print_serve_start_line(f"OpenAI API Base URL: {base}/v1")
+                _print_serve_start_line(f"DSH model: {dsh_model_ref(str(model_id))}")
+                result = launch_dsh_in_terminal(dsh_launch_command())
+                if result.get("ok"):
+                    _print_serve_start_line("Opening DSH in Terminal...")
+                else:
+                    _print_serve_start_line(
+                        f"Could not open DSH automatically: {result.get('error')}"
+                    )
+                    _print_serve_start_line(f"Manual fallback: {dsh_launch_command()}")
+                _print_serve_start_line(
+                    "Use the existing server, or stop that terminal with Ctrl-C to restart."
+                )
+                return 0
         _print_serve_start_line(f"error: port {int(args.port)} is already in use")
         try:
             from mtplx.daemon_client import classify_port_occupant, port_busy_advice
@@ -9819,6 +9863,8 @@ def cmd_serve_public(args: Any) -> int:
         ).strip()
         if hermes_launch_command:
             cmd.extend(["--hermes-launch-command", hermes_launch_command])
+    if bool(getattr(args, "quickstart_dsh", False)):
+        cmd.extend(["--launch-dsh", "--server-console"])
     if bool(getattr(args, "stock_ar", False)):
         cmd.append("--stock-ar")
     elif getattr(args, "load_mtp", True) is False:
@@ -13375,6 +13421,245 @@ def _quickstart_run_hermes(
     return cmd_serve_public(_with_server_policy_args(serve_args, args))
 
 
+def _quickstart_require_dsh_cli(args: Any) -> bool:
+    """Return True when the DSH CLI is available, or install it interactively."""
+
+    if shutil.which("dsh"):
+        return True
+
+    from mtplx.dsh import DSH_NPM_PACKAGE, dsh_install_command
+
+    _quickstart_line()
+    _quickstart_line("[2/3] DSH is not installed")
+    _quickstart_line("      MTPLX has not loaded the model yet.")
+    _quickstart_line(
+        "      Install DSH first, then MTPLX will connect it to the local server."
+    )
+    _quickstart_line()
+    _quickstart_line(f"      Install command: {dsh_install_command()}")
+    _quickstart_line(f"      Then re-run: {_start_invocation(args, ' dsh')}")
+    _quickstart_line()
+
+    if not sys.stdin.isatty():
+        return False
+
+    try:
+        answer = input("  Install DSH now? [Y/n] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        _quickstart_line("aborted")
+        return False
+    if answer not in {"", "y", "yes"}:
+        _quickstart_line(
+            "DSH install skipped. Re-run `mtplx start dsh` after installing DSH."
+        )
+        return False
+
+    npm = shutil.which("npm")
+    if not npm:
+        _quickstart_line(
+            "error: npm is not on PATH, so MTPLX cannot install DSH automatically."
+        )
+        _quickstart_line("Install Node.js/npm, then run:")
+        _quickstart_line(f"  {dsh_install_command()}")
+        return False
+
+    _quickstart_line(f"Running: {dsh_install_command()}")
+    try:
+        result = subprocess.run([npm, "install", "-g", DSH_NPM_PACKAGE], check=False)
+    except KeyboardInterrupt:
+        _quickstart_line("DSH install cancelled.")
+        return False
+    except OSError as exc:
+        _quickstart_line(f"error: DSH install failed to start: {exc}")
+        return False
+    if result.returncode != 0:
+        _quickstart_line(f"error: DSH install failed with exit code {result.returncode}")
+        return False
+    if not shutil.which("dsh"):
+        _quickstart_line("DSH installed, but `dsh` is still not visible on this PATH.")
+        _quickstart_line("Open a new terminal, then run:")
+        _quickstart_line(f"  {_start_invocation(args, ' dsh')}")
+        return False
+    _quickstart_line("DSH installed. Continuing with MTPLX setup.")
+    _quickstart_line()
+    return True
+
+
+def _quickstart_dsh_payload(
+    args: Any,
+    *,
+    write_config: bool = False,
+    inspection: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    from mtplx.dsh import (
+        DSH_LOCAL_API_KEY,
+        dsh_credentials_path,
+        dsh_launch_command,
+        dsh_model_ref,
+        dsh_settings_path,
+        write_dsh_settings,
+    )
+
+    host = str(getattr(args, "host", "127.0.0.1"))
+    port = int(getattr(args, "port", 8000))
+    model_id = _public_model_id_for_args(args, str(getattr(args, "model", "")))
+    server_url = f"http://{_connect_host_for_bind(host)}:{port}"
+    base_url = server_url.rstrip("/") + "/v1"
+    api_key = str(getattr(args, "api_key", None) or DSH_LOCAL_API_KEY)
+    context_window = _inspection_context_window(inspection, args=args)
+    api_key_suffix = _api_key_command_suffix(args) or "--api-key mtplx-local "
+    payload = {
+        "integration": "dsh",
+        "server_url": server_url,
+        "base_url": base_url,
+        "api_base_url": base_url,
+        "model_id": model_id,
+        "model_ref": dsh_model_ref(model_id),
+        "context_window": context_window,
+        "api_key": _api_key_display_value(api_key),
+        "config_path": str(dsh_settings_path()),
+        "credentials_path": str(dsh_credentials_path()),
+        "no_hidden_max_tokens": True,
+        "detected": {
+            "installed": shutil.which("dsh") is not None,
+            "path": shutil.which("dsh"),
+        },
+        "launch_command": dsh_launch_command(),
+        "server_console": True,
+        "server_controls": [
+            "/reasoning on|off|auto|status",
+            "/mtp on|off|status",
+            "/stats",
+            "/help",
+        ],
+        "server_command": (
+            f"mtplx start dsh --host {host} --port {port} "
+            f"--model {shlex.quote(str(getattr(args, 'model', DEFAULT_RUNTIME_MODEL_DIR)))} "
+            f"--profile {_resolved_default_profile_name(args)} "
+            f"{_fan_mode_command_suffix(args)}"
+            f"{'--no-mtp ' if _generation_mode_from_args(args) == GENERATION_MODE_AR else ''}"
+            f"{api_key_suffix}"
+            f"--context-window {context_window} "
+            f"--scheduler-mode {str(getattr(args, 'scheduler_mode', 'serial'))} "
+            f"--batching-preset {str(getattr(args, 'batching_preset', 'latency'))} "
+            f"{_batching_command_suffix(args)} "
+            f"{_adaptive_command_suffix(args)} "
+            f"--temperature {float(getattr(args, 'temperature', 0.6))} "
+            f"--top-p {float(getattr(args, 'top_p', 1.0))} "
+            f"--top-k {int(getattr(args, 'top_k', 20))} "
+            f"--reasoning {_reasoning_mode(args, default='auto')} "
+            f"{_reasoning_command_suffix(args, default='auto', include_mode=False)} --no-stats"
+        ),
+        "dsh_steps": [
+            f"DSH settings: {dsh_settings_path()}",
+            f"OpenAI-compatible API base URL: {base_url}",
+            "MTPLX client header: x-mtplx-client=dsh",
+            f"Run DSH web: {dsh_launch_command()}",
+        ],
+    }
+    if write_config:
+        payload["config_write"] = write_dsh_settings(
+            base_url=base_url,
+            model_id=model_id,
+            api_key=api_key,
+            context_window=context_window,
+            write_default_model=True,
+        )
+    return payload
+
+
+def _quickstart_print_dsh_handoff(
+    args: Any,
+    *,
+    runtime_model: str,
+    dsh: dict[str, Any],
+) -> None:
+    config_write = (
+        dsh.get("config_write") if isinstance(dsh.get("config_write"), dict) else {}
+    )
+    config_path = config_write.get("config_path") or dsh.get("config_path")
+    credentials_path = (
+        config_write.get("credentials_path") or dsh.get("credentials_path")
+    )
+    _quickstart_line("[2/3] Connecting MTPLX to DSH...")
+    _quickstart_line(f"      DSH settings: {config_path}")
+    _quickstart_line(f"      DSH credentials: {credentials_path}")
+    if config_write.get("backup_path"):
+        _quickstart_line(f"      Backed up existing DSH settings: {config_write.get('backup_path')}")
+    if config_write.get("invalid_backup_path"):
+        _quickstart_line(
+            f"      Backed up unreadable old DSH settings: {config_write.get('invalid_backup_path')}"
+        )
+    _quickstart_line(f"      DSH model: {dsh.get('model_ref')}")
+    _quickstart_line(f"      API base URL: {dsh.get('api_base_url')}")
+    _quickstart_line("      MTPLX client header: x-mtplx-client=dsh")
+    _quickstart_line("      Response cap: none hidden by MTPLX")
+    _quickstart_line(f"      Loading model: {runtime_model}")
+    _quickstart_line("      Keep this terminal open for the MTPLX server.")
+    _quickstart_line("      DSH will open automatically when MTPLX is ready.")
+    _quickstart_line(f"      Manual fallback: {dsh.get('launch_command')}")
+    _quickstart_line()
+
+
+def _quickstart_run_dsh(
+    args: Any, *, runtime_model: str, inspection: dict[str, Any]
+) -> int:
+    from mtplx.dsh import DSH_LOCAL_API_KEY
+
+    model_id = _quickstart_served_model_id(args, runtime_model)
+    if not getattr(args, "api_key", None):
+        args.api_key = DSH_LOCAL_API_KEY
+    dsh = _quickstart_dsh_payload(
+        args,
+        write_config=True,
+        inspection=inspection,
+    )
+    _quickstart_print_dsh_handoff(
+        args,
+        runtime_model=runtime_model,
+        dsh=dsh,
+    )
+    serve_args = SimpleNamespace(
+        model=runtime_model,
+        cache_dir=getattr(args, "cache_dir", None),
+        profile=getattr(args, "profile", None) or DEFAULT_PROFILE_NAME,
+        model_id=model_id,
+        unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
+        yes=True,
+        host=str(getattr(args, "host", "127.0.0.1")),
+        port=int(getattr(args, "port", 8000)),
+        api_key=getattr(args, "api_key", None),
+        depth=int(getattr(args, "depth", 3)),
+        no_mtp=bool(getattr(args, "no_mtp", False)),
+        rate_limit=int(getattr(args, "rate_limit", 0)),
+        stream_interval=int(getattr(args, "stream_interval", 1)),
+        warmup_tokens=int(getattr(args, "warmup_tokens", 16)),
+        max_response_tokens=getattr(args, "max_response_tokens", None),
+        temperature=float(getattr(args, "temperature", 0.6)),
+        top_p=float(getattr(args, "top_p", 1.0)),
+        top_k=int(getattr(args, "top_k", 20)),
+        reasoning=getattr(args, "reasoning", "auto"),
+        preserve_thinking=getattr(args, "preserve_thinking", "auto"),
+        reasoning_parser=getattr(args, "reasoning_parser", "qwen3"),
+        reasoning_effort=getattr(args, "reasoning_effort", None),
+        stats_footer=False,
+        strict_warmup=bool(getattr(args, "strict_warmup", False)),
+        quickstart_openwebui=False,
+        quickstart_pi=False,
+        quickstart_opencode=False,
+        quickstart_swival=False,
+        quickstart_hermes=False,
+        quickstart_dsh=True,
+        open_browser=False,
+        open_dashboard=bool(getattr(args, "open_dashboard", False)),
+        enable_thermal_poll=bool(getattr(args, "enable_thermal_poll", False)),
+        fan_mode=getattr(args, "fan_mode", "default"),
+        max=bool(getattr(args, "max", False)),
+        max_idle_min=int(getattr(args, "max_idle_min", 15)),
+    )
+    return cmd_serve_public(_with_server_policy_args(serve_args, args))
+
+
 def _quickstart_print_dashboard_handoff(args: Any, *, runtime_model: str) -> None:
     from mtplx.ui import pretty_path
 
@@ -13443,7 +13728,7 @@ def _quickstart_run_dashboard(
 
 # Targets that spawn a local server and therefore need a usable port.
 _QUICKSTART_SPAWNING_TARGETS = frozenset(
-    {"openwebui", "pi", "opencode", "swival", "hermes", "dashboard"}
+    {"openwebui", "pi", "opencode", "swival", "hermes", "dsh", "dashboard"}
 )
 
 
@@ -14192,6 +14477,8 @@ def cmd_quickstart_public(args: Any) -> int:
         target = "swival"
     elif raw_target in {"hermes", "hermes-agent"}:
         target = "hermes"
+    elif raw_target in {"dsh", "deepseek-harness"}:
+        target = "dsh"
     elif raw_target in {"dashboard", "live-dashboard", "live"}:
         target = "dashboard"
     else:
@@ -14211,6 +14498,8 @@ def cmd_quickstart_public(args: Any) -> int:
         args.port = 18085
     if target == "hermes":
         _apply_hermes_latency_defaults(args)
+    if target == "dsh" and "port" not in cli_flags:
+        args.port = 18086
     if not getattr(args, "dry_run", False):
         _quickstart_autoselect_busy_port(args, target=target, cli_flags=cli_flags)
     depth_error = _validate_public_depth(args, printer=_quickstart_line)
@@ -14256,6 +14545,11 @@ def cmd_quickstart_public(args: Any) -> int:
             if target == "hermes"
             else None
         )
+        dsh = (
+            _quickstart_dsh_payload(args, inspection=dry_run_inspection)
+            if target == "dsh"
+            else None
+        )
         payload = {
             "action": _start_command_name(args),
             "target": target,
@@ -14276,6 +14570,7 @@ def cmd_quickstart_public(args: Any) -> int:
             "opencode": opencode,
             "swival": swival,
             "hermes": hermes,
+            "dsh": dsh,
             # The dashboard target *always* opens the dashboard (that's what
             # it's for). Otherwise honor the explicit user/wizard choice,
             # but only for server-spawning targets — terminal/CLI has no
@@ -14284,7 +14579,7 @@ def cmd_quickstart_public(args: Any) -> int:
                 True
                 if target == "dashboard"
                 else bool(getattr(args, "open_dashboard", False))
-                and target in {"openwebui", "pi", "opencode", "swival", "hermes"}
+                and target in {"openwebui", "pi", "opencode", "swival", "hermes", "dsh"}
             ),
             "enable_thermal_poll": bool(getattr(args, "enable_thermal_poll", False)),
             "stats_visible": bool(getattr(args, "show_stats", True)),
@@ -14299,6 +14594,8 @@ def cmd_quickstart_public(args: Any) -> int:
                 if target == "pi"
                 else _start_invocation(args, " hermes")
                 if target == "hermes"
+                else _start_invocation(args, " dsh")
+                if target == "dsh"
                 else _start_invocation(args, " cli")
             ),
         }
@@ -14346,6 +14643,10 @@ def cmd_quickstart_public(args: Any) -> int:
                 _quickstart_line(
                     f"then: write Hermes profile -> start local server -> run {hermes['launch_command']}"
                 )
+            elif target == "dsh":
+                _quickstart_line(
+                    f"then: write DSH settings -> start local server -> run {dsh['launch_command']}"
+                )
             else:
                 _quickstart_line(
                     "then: load once -> chat in this terminal -> stream output -> show speed stats"
@@ -14353,6 +14654,9 @@ def cmd_quickstart_public(args: Any) -> int:
         return 0
 
     if target == "pi" and not _quickstart_require_pi_cli(args):
+        return 2
+
+    if target == "dsh" and not _quickstart_require_dsh_cli(args):
         return 2
 
     _quickstart_line(f"MTPLX {_start_command_name(args)}")
@@ -14510,6 +14814,11 @@ def cmd_quickstart_public(args: Any) -> int:
                 return _quickstart_run_hermes(
                     args, runtime_model=runtime_model, inspection=inspection
                 )
+            if target == "dsh":
+                args.model = runtime_model
+                return _quickstart_run_dsh(
+                    args, runtime_model=runtime_model, inspection=inspection
+                )
             if target == "dashboard":
                 args.model = runtime_model
                 return _quickstart_run_dashboard(
@@ -14589,6 +14898,11 @@ def cmd_quickstart_public(args: Any) -> int:
     if target == "hermes":
         args.model = runtime_model
         return _quickstart_run_hermes(
+            args, runtime_model=runtime_model, inspection=inspection
+        )
+    if target == "dsh":
+        args.model = runtime_model
+        return _quickstart_run_dsh(
             args, runtime_model=runtime_model, inspection=inspection
         )
     if target == "dashboard":

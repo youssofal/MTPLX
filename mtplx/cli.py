@@ -82,7 +82,7 @@ NATIVE_MTP_60_MODEL = DEFAULT_MODEL_ID
 PUBLIC_COMMANDS = (
     (
         "start",
-        "Interactive setup → chat (model · mode · web/CLI/Pi/OpenCode/Swival/Hermes/Dashboard)",
+        "Interactive setup → chat (model · mode · web/CLI/Pi/OpenCode/Swival/Hermes/DSH/Dashboard)",
     ),
     ("tune", "Find the fastest AR/MTP draft depth for this Mac (AR, D1-D8)"),
     ("help", "Detailed help; `help commands` / `help flags` / `help <name>`"),
@@ -240,6 +240,7 @@ def _format_public_help() -> str:
   mtplx start opencode --port 18083    Configure OpenCode Desktop for MTPLX-owned generation
   mtplx start swival --port 18084      Print Swival generic-provider command
   mtplx start hermes --port 18085      Launch Hermes Agent against MTPLX
+  mtplx start dsh --port 18086         Launch DSH (DeepSeek Harness) against MTPLX
   mtplx quickstart --port 8000         API server only, no chat
 
   {footer}
@@ -286,7 +287,7 @@ On later runs it offers "same as last time?" so the chat is one keypress away.
 What gets asked:
   1. Model — your configured model, the verified default, custom HF, or local
   2. Mode  — Auto (recommended; Turbo auto-selects for the quantized flagships), Sustained, Sustained Max, or Burst (Stable remains available via --profile safe)
-  3. Where — Web UI (default), terminal CLI, Pi, OpenCode Desktop, Swival, or Hermes
+  3. Where — Web UI (default), terminal CLI, Pi, OpenCode Desktop, Swival, Hermes, or DSH
 
 Power-user shortcuts (any of these skip the onboarding wizard):
   mtplx start --fresh                 Walk the onboarding again from scratch
@@ -295,6 +296,7 @@ Power-user shortcuts (any of these skip the onboarding wizard):
   mtplx start opencode --port 18083   Configure OpenCode Desktop for MTPLX-owned generation
   mtplx start swival --port 18084     Serve MTPLX and print the Swival command
   mtplx start hermes --port 18085     Serve MTPLX and open Hermes Agent in Terminal
+  mtplx start dsh --port 18086        Serve MTPLX and open DSH (DeepSeek Harness) in Terminal
   mtplx start --max                   Sustained Max: long-context mode with ThermalForge fan boost
   mtplx start --profile performance-cold --max
                                       Burst: old max-fan lane, max 8K context
@@ -333,8 +335,9 @@ Aliases:
   `opencode`, `oc`      -> OpenCode Desktop coding-agent connection
   `swival`, `sv`        -> Swival generic-provider connection
   `hermes`              -> Hermes Agent with terminal/file/web/browser/messaging tools
+  `dsh`, `deepseek-harness` -> DSH (DeepSeek Harness) agent web UI
   `dashboard`, `live`   -> live engine dashboard
-  (hyphenated forms like `open-webui`, `open-code`, `hermes-agent` also work)
+  (hyphenated forms like `open-webui`, `open-code`, `hermes-agent`, `deepseek-harness` also work)
 """
 
 
@@ -2223,9 +2226,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     start_flow_p = sub.add_parser(
         "start",
-        help="Interactive setup → chat (model · mode · web/CLI/Pi/OpenCode/Swival/Hermes/Dashboard)",
-        usage="mtplx start [cli|web|pi|opencode|swival|hermes|dashboard] [--fresh] [--max] [--profile NAME] [--model PATH_OR_REPO] [--prompt TEXT]",
-        description="Walk through model / mode / surface in three quick steps, then chat. Returning users get a 'same as last time?' prompt. Use --fresh to redo the onboarding, or pass any of --model / --profile / --max / cli|web|pi|opencode|swival|hermes|dashboard to skip it entirely.",
+        help="Interactive setup → chat (model · mode · web/CLI/Pi/OpenCode/Swival/Hermes/DSH/Dashboard)",
+        usage="mtplx start [cli|web|pi|opencode|swival|hermes|dsh|dashboard] [--fresh] [--max] [--profile NAME] [--model PATH_OR_REPO] [--prompt TEXT]",
+        description="Walk through model / mode / surface in three quick steps, then chat. Returning users get a 'same as last time?' prompt. Use --fresh to redo the onboarding, or pass any of --model / --profile / --max / cli|web|pi|opencode|swival|hermes|dsh|dashboard to skip it entirely.",
     )
     start_flow_p.add_argument(
         "target",
@@ -2245,12 +2248,14 @@ def build_parser() -> argparse.ArgumentParser:
             "sv",
             "hermes",
             "hermes-agent",
+            "dsh",
+            "deepseek-harness",
             "dashboard",
             "live-dashboard",
             "live",
         ],
         default=None,
-        help="Web chat, terminal chat, Pi, OpenCode Desktop, Swival, Hermes Agent, or the live MTPLX Dashboard. Without this argument, MTPLX runs an interactive onboarding (or the 'same as last time?' prompt) on first run.",
+        help="Web chat, terminal chat, Pi, OpenCode Desktop, Swival, Hermes Agent, DSH, or the live MTPLX Dashboard. Without this argument, MTPLX runs an interactive onboarding (or the 'same as last time?' prompt) on first run.",
     )
     start_flow_p.add_argument(
         "--fresh",
@@ -2399,7 +2404,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Open the live MTPLX dashboard alongside the chosen client "
-            "(openwebui/pi/opencode/swival/hermes). Skips the wizard's dashboard "
+            "(openwebui/pi/opencode/swival/hermes/dsh). Skips the wizard's dashboard "
             "companion prompt when set. Use --no-open-dashboard to force off."
         ),
     )

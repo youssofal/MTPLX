@@ -341,13 +341,26 @@ def test_run_onboarding_terminal_skips_dashboard_companion(monkeypatch):
 
 def test_run_onboarding_dashboard_target_skips_companion(monkeypatch):
     """Picking 'Live Dashboard' as the target skips the companion prompt."""
-    answers = iter(["1", "1", "6"])
+    # Live Dashboard is option 7 now that DSH takes option 6.
+    answers = iter(["1", "1", "7"])
     monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
 
     state = onboarding.run_onboarding_screens()
 
     assert state["target"] == "dashboard"
     # The companion question is only for non-dashboard server targets.
+    assert state["open_dashboard"] is False
+
+
+def test_run_onboarding_dsh_target_asks_companion(monkeypatch):
+    """Picking 'Connect to DSH' (option 6) asks the dashboard companion."""
+    # 4 answers: model, mode, interface (DSH=6), companion (No=2).
+    answers = iter(["1", "1", "6", "2"])
+    monkeypatch.setattr(builtins, "input", lambda _prompt="": next(answers))
+
+    state = onboarding.run_onboarding_screens()
+
+    assert state["target"] == "dsh"
     assert state["open_dashboard"] is False
 
 
