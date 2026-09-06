@@ -114,6 +114,7 @@ from mtplx.gemma4_pair import (
     is_gemma4_pair_repo_id,
     resolve_gemma4_pair_paths,
 )
+from mtplx.expert_locality import install_expert_locality_instrumentation
 from mtplx.model_scheduler import ModelWorkScheduler
 from mtplx.server.hyper import HYPER_ADMISSION_CAP, HyperAdmissionGate
 from mtplx.reasoning_effort import (
@@ -3100,9 +3101,23 @@ class ServerState:
             load_heartbeat.set()
         self.load_time_s = time.perf_counter() - started
         _startup_line(f"[5/6] Model loaded in {self.load_time_s:.1f}s")
-        # The fixed-M4 lane's per-request memory gate measures against the
-        # same allocator ceiling the prefill admission shed uses
-        # (generation._metal_memory_limit_bytes).
+        try:
+            self.expert_locality_install_report = (
+                self.model_scheduler.submit_foreground(
+                    install_expert_locality_instrumentation,
+                    self.runtime,
+                    batch_key="startup.expert_locality",
+                ).result()
+            )
+        except Exception as exc:
+            self.expert_locality_install_report = {
+                "enabled": bool(os.environ.get("MTPLX_EXPERT_LOCALITY")),
+                "installed": False,
+                "instrumented_modules": 0,
+                "reason": "startup_install_failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            LOGGER.warning("expert-locality instrumentation: %s", exc)
         pinned_limit = self.metal_memory_caps.get("memory_limit_bytes")
         if isinstance(pinned_limit, int) and pinned_limit > 0:
             self.runtime.metal_memory_limit_bytes = int(pinned_limit)
