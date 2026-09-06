@@ -11699,6 +11699,8 @@ def _hermes_config_yaml(
         f"  cwd: {_hermes_yaml_quote(workspace_path)}\n"
         "  timeout: 180\n"
         "  persistent_shell: true\n"
+        "compression:\n"
+        "  tool_image_retention: until_compaction\n"
         "display:\n"
         "  streaming: true\n"
         "  show_reasoning: true\n"

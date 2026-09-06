@@ -21096,6 +21096,17 @@ def _history_ids_for_postcommit(
                         strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                     )
                 )
+                if _reasoning_history_preserve_echo_active(state) and history_messages:
+                    # An older rewritten/interrupted turn can close the
+                    # history substitution walk. This response is owned by
+                    # this request: match its own visible/tool body before
+                    # carrying its reasoning, independently of older turns.
+                    # Full snapshot compatibility still compares every token.
+                    current, _ = _substitute_committed_reasoning_messages(
+                        history_messages[-1:], committed_turns[-1:],
+                        strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+                    )
+                    history_messages[-1:] = current
                 substitution_walked = True
     if not substitution_walked:
         history_messages = [

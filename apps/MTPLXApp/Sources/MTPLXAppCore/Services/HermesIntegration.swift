@@ -1528,6 +1528,8 @@ public struct HermesIntegration: Sendable {
           cwd: \(yamlQuote(workspacePath))
           timeout: 180
           persistent_shell: true
+        compression:
+          tool_image_retention: until_compaction
         display:
           streaming: true
           show_reasoning: \(showReasoningText)

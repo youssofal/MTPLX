@@ -8,6 +8,7 @@ def test_profile_advertises_current_vision_and_replays_reasoning():
     vision = public._hermes_config_yaml(**args, vision=True)
     assert "supports_vision: true" in vision
     assert "reasoning_echo: true" in vision
+    assert "tool_image_retention: until_compaction" in vision
     text = public._hermes_merged_config_yaml(vision, public._hermes_config_yaml(**args, vision=False))
     assert "supports_vision: false" in text
     assert "supports_vision: true" not in text

@@ -38,6 +38,7 @@ final class HermesExecutionPolicyTests: XCTestCase {
                 _ = try integration.sync(configuration: configuration)
                 let text = try String(contentsOf: profile, encoding: .utf8)
                 XCTAssertTrue(text.contains("  backend: \(backend ?? "docker")\n"))
+                XCTAssertTrue(text.contains("compression:\n  tool_image_retention: until_compaction\n"))
                 XCTAssertFalse(text.contains("providers:"))
                 if backend == nil {
                     XCTAssertTrue(text.contains("  docker_image: example/coding:test\n"))

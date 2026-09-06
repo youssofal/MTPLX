@@ -193,6 +193,30 @@ def test_postcommit_without_committed_stream_keeps_legacy_bytes(tok, monkeypatch
     )
 
 
+def test_current_reasoning_survives_an_older_history_mismatch(tok, monkeypatch):
+    monkeypatch.setattr(oa, "_reasoning_history_scoped_active", lambda state: False)
+    monkeypatch.setattr(oa, "_reasoning_history_preserve_echo_active", lambda state: True)
+    monkeypatch.setattr(oa, "_reasoning_effort_for_state", lambda *a, **kw: "medium")
+    original = [SYSTEM, U1, {"role": "assistant", "content": "old answer"}, U2]
+    prompt = _encode(tok, original)
+    generated = oa._encode_rendered_chat_text(tok, f"{THINK}\n</think>\n\n{ANSWER}<|im_end|>\n")
+    rewritten = [SYSTEM, U1, {"role": "assistant", "content": "interrupted turn"}, U2]
+    ids, _ = oa._history_ids_for_postcommit(
+        _postcommit_state(tok),
+        messages=oa.ChatCompletionRequest(model="m", messages=rewritten).messages,
+        assistant_content=ANSWER, assistant_tool_calls=None,
+        thinking_enabled=True, reasoning_effort="medium", tool_prompt_mode="hybrid",
+        committed_stream_ids=prompt + generated,
+    )
+    rendered = tok.decode(ids)
+    assert THINK in rendered
+    assert "interrupted turn" in rendered
+    assert "old answer" not in rendered
+    # Carrying the current thought must not pretend the rewritten history
+    # is compatible with the original generation's KV state.
+    assert ids[:len(prompt)] != prompt
+
+
 def test_postcommit_kill_switch_inert(tok, monkeypatch):
     """MTPLX_COMMITTED_THINK_CANONICALIZATION=off must make the postcommit
     producer byte-identical to the legacy render even when the committed
