@@ -1,15 +1,18 @@
 """No-model tests for the frozen-transcript measurement contract."""
+
 import argparse
 import copy
 import importlib.util
 import json
-from pathlib import Path
 import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
-MODULE = Path(__file__).resolve().parents[1] / "scripts" / "bench_semantic_anchor_replay.py"
+MODULE = (
+    Path(__file__).resolve().parents[1] / "scripts" / "bench_semantic_anchor_replay.py"
+)
 spec = importlib.util.spec_from_file_location("semantic_anchor_replay", MODULE)
 bench = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bench)
@@ -19,9 +22,19 @@ def events(text="OK", cached=3):
     return [
         {"choices": [{"index": 0, "delta": {"role": "assistant"}}]},
         {"choices": [{"index": 0, "delta": {"reasoning_content": "think"}}]},
-        {"choices": [{"index": 0, "delta": {"content": text}, "finish_reason": "stop"}]},
-        {"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 3,
-                                    "prompt_tokens_details": {"cached_tokens": cached}}},
+        {
+            "choices": [
+                {"index": 0, "delta": {"content": text}, "finish_reason": "stop"}
+            ]
+        },
+        {
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 3,
+                "prompt_tokens_details": {"cached_tokens": cached},
+            },
+        },
     ]
 
 
@@ -32,9 +45,11 @@ def measured():
 
 def receipt(enabled=False):
     row = measured()
-    return {"manifest": {"anchors_enabled": enabled, "server_commit": "same"},
-            "transcript_sha256": "same",
-            "turns": [{"turn": i, "request_sha256": str(i), **row} for i in range(2)]}
+    return {
+        "manifest": {"anchors_enabled": enabled, "server_commit": "same"},
+        "transcript_sha256": "same",
+        "turns": [{"turn": i, "request_sha256": str(i), **row} for i in range(2)],
+    }
 
 
 class MeasurementTests(unittest.TestCase):
@@ -64,9 +79,15 @@ class MeasurementTests(unittest.TestCase):
 
     def test_tool_only_output_is_measured_without_visible_text(self):
         data = events()
-        data[1]["choices"][0]["delta"] = {"tool_calls": [
-            {"index": 0, "id": "random", "function": {"name": "read", "arguments": "{}"}}
-        ]}
+        data[1]["choices"][0]["delta"] = {
+            "tool_calls": [
+                {
+                    "index": 0,
+                    "id": "random",
+                    "function": {"name": "read", "arguments": "{}"},
+                }
+            ]
+        }
         data[2]["choices"][0] = {"index": 0, "delta": {}, "finish_reason": "tool_calls"}
         one = bench.measure(data, 0)
         data[1]["choices"][0]["delta"]["tool_calls"][0]["id"] = "different"
@@ -78,13 +99,24 @@ class MeasurementTests(unittest.TestCase):
         split = events()
         split[2]["choices"][0]["delta"]["content"] = "O"
         split.insert(3, {"choices": [{"index": 0, "delta": {"content": "K"}}]})
-        self.assertEqual(bench.measure(split, 0)["output_sha256"], measured()["output_sha256"])
+        self.assertEqual(
+            bench.measure(split, 0)["output_sha256"], measured()["output_sha256"]
+        )
 
     def test_sse_comments_multiline_and_done(self):
-        payloads = list(bench.sse_payloads([
-            b": keepalive\n", b"\n", b'data: {"choices":\n', b"data: []}\n", b"\n",
-            b"data: [DONE]\n", b"\n",
-        ]))
+        payloads = list(
+            bench.sse_payloads(
+                [
+                    b": keepalive\n",
+                    b"\n",
+                    b'data: {"choices":\n',
+                    b"data: []}\n",
+                    b"\n",
+                    b"data: [DONE]\n",
+                    b"\n",
+                ]
+            )
+        )
         self.assertEqual(payloads, [{"choices": []}])
 
     def test_truncated_stream_is_rejected(self):
@@ -105,10 +137,20 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(pair["turns"][1]["ttft_generated_delta_s"], -1.0)
 
     def test_comparison_rejects_drift(self):
-        for target, key in (("manifest", "server_commit"), ("root", "transcript_sha256"),
-                            ("turn", "request_sha256"), ("turn", "prompt_tokens")):
+        for target, key in (
+            ("manifest", "server_commit"),
+            ("root", "transcript_sha256"),
+            ("turn", "request_sha256"),
+            ("turn", "prompt_tokens"),
+        ):
             off, on = receipt(), receipt(True)
-            obj = on if target == "root" else on["manifest"] if target == "manifest" else on["turns"][1]
+            obj = (
+                on
+                if target == "root"
+                else on["manifest"]
+                if target == "manifest"
+                else on["turns"][1]
+            )
             obj[key] = "different"
             with self.subTest(key=key), self.assertRaises(ValueError):
                 bench.compare(off, on)
@@ -135,33 +177,71 @@ class MeasurementTests(unittest.TestCase):
 
     def test_frozen_requests_are_sent_without_generated_history_injection(self):
         captured = []
+
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):
                 pass
+
             def do_POST(self):
-                captured.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
-                response = b"".join(b"data: " + bench.canonical(item) + b"\n\n" for item in events(cached=0 if len(captured) == 1 else 3)) + b"data: [DONE]\n\n"
+                captured.append(
+                    json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                )
+                response = (
+                    b"".join(
+                        b"data: " + bench.canonical(item) + b"\n\n"
+                        for item in events(cached=0 if len(captured) == 1 else 3)
+                    )
+                    + b"data: [DONE]\n\n"
+                )
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Content-Length", str(len(response)))
                 self.end_headers()
                 self.wfile.write(response)
+
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         worker = threading.Thread(target=server.serve_forever, daemon=True)
         worker.start()
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
-                body = {"model": "test", "temperature": 0, "max_tokens": 8,
-                        "messages": [{"role": "user", "content": "fixed"}]}
-                manifest = {key: "test" for key in ("server_commit", "model", "model_revision",
-                             "tokenizer_revision", "mlx_version", "hardware", "server_settings")}
+                body = {
+                    "model": "test",
+                    "temperature": 0,
+                    "max_tokens": 8,
+                    "messages": [{"role": "user", "content": "fixed"}],
+                }
+                manifest = {
+                    key: "test"
+                    for key in (
+                        "server_commit",
+                        "model",
+                        "model_revision",
+                        "tokenizer_revision",
+                        "mlx_version",
+                        "hardware",
+                        "server_settings",
+                    )
+                }
                 manifest["anchors_enabled"] = False
                 (root / "manifest.json").write_text(json.dumps(manifest))
-                (root / "transcript.json").write_text(json.dumps({"session_id": "fixed-session", "requests": [body, copy.deepcopy(body)]}))
-                result = bench.run(argparse.Namespace(base_url=f"http://127.0.0.1:{server.server_port}",
-                    manifest=str(root / "manifest.json"), transcript=str(root / "transcript.json"),
-                    timeout_s=2, api_key_env=None))
+                (root / "transcript.json").write_text(
+                    json.dumps(
+                        {
+                            "session_id": "fixed-session",
+                            "requests": [body, copy.deepcopy(body)],
+                        }
+                    )
+                )
+                result = bench.run(
+                    argparse.Namespace(
+                        base_url=f"http://127.0.0.1:{server.server_port}",
+                        manifest=str(root / "manifest.json"),
+                        transcript=str(root / "transcript.json"),
+                        timeout_s=2,
+                        api_key_env=None,
+                    )
+                )
                 self.assertEqual(len(result["turns"]), 2)
                 self.assertEqual(captured[0], captured[1])
                 self.assertEqual(captured[0]["messages"], body["messages"])
