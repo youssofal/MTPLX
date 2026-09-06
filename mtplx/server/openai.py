@@ -151,6 +151,7 @@ from mtplx.full_stack_env import (
     resolve_disable_lanes,
     warn_unknown_family_keys,
 )
+from mtplx import qwen4_aux_lanes
 from mtplx.full_stack_selfcheck import (
     format_marker_lines,
     markers_from_runtime,
@@ -929,6 +930,25 @@ def _server_runtime_env_overrides(
         for key, value in retained_defaults.items():
             overrides.setdefault(key, value)
         record_defaults_applied(retained_defaults)
+        # ---- the two stacked auxiliary decode lanes, ON by default --------
+        # ple_cached_aux (cached async PLE, needs the native ple_cpu_rows
+        # extension) and qsa_pooled_rowsel (fixed-M4 pooled-key rowsel, stock
+        # MLX). Armed the same way -- setdefault behind this served-config
+        # predicate -- so an operator export is the off switch and
+        # --disable-optimization <lane> / MTPLX_FABLE_DISABLE name them too.
+        # Kept out of the retained 44-key stack so the battery counts do not
+        # move; the install sites (mtplx/runtime.py) self-gate and, for the
+        # cached lane, decline with a printed reason if the extension is not
+        # built.
+        aux_disabled = qwen4_aux_lanes.resolve_disabled(
+            os.environ, extra=getattr(args, "disable_optimization", None) or ()
+        )
+        aux_defaults = qwen4_aux_lanes.default_env(
+            os.environ, disabled_lanes=aux_disabled
+        )
+        for key, value in aux_defaults.items():
+            overrides.setdefault(key, value)
+        qwen4_aux_lanes.record_defaults_applied(aux_defaults)
         if os.environ.get("MTPLX_NAX_VERIFY") is None:
             # The turbo profile arms the 27B NAX verify patch
             # (MTPLX_NAX_VERIFY=1); on this family it is unmeasured and
@@ -1806,6 +1826,11 @@ _ENGAGEMENT_REPORT_ATTRS: tuple[tuple[str, str], ...] = (
     # logs itself. Adding it here changes no lane's output.
     ("qwen4_hc_m4", "qwen4_hc_m4_report"),
     ("laguna_fused", "laguna_fused_report"),
+    # The two stacked auxiliary lanes (mtplx.qwen4_aux_lanes). Each install
+    # site in mtplx/runtime.py sets a plain dict once at model load; a missing
+    # attribute means the lane was off, declined, or not this family.
+    ("ple_cached_aux", "ple_cached_aux_report"),
+    ("qsa_pooled_rowsel", "qsa_pooled_rowsel_report"),
 )
 
 
@@ -1839,6 +1864,18 @@ def _engagement_reports_payload(state: Any) -> dict[str, Any]:
         )
     except Exception:
         payload["fable_defaults"] = None
+    # The stacked auxiliary lanes report their own armed/off state beside
+    # fable_defaults, in the same shape. Read live for the same reason.
+    try:
+        _st_args = getattr(state, "args", None)
+        payload["aux_lane_defaults"] = qwen4_aux_lanes.defaults_report(
+            disabled_lanes=qwen4_aux_lanes.resolve_disabled(
+                extra=getattr(_st_args, "disable_optimization", None) or ()
+            ),
+            model_gate=_serve_shape(state),
+        )
+    except Exception:
+        payload["aux_lane_defaults"] = None
     payload["unknown_family_env_keys"] = list(
         getattr(state, "unknown_family_env_keys", []) or []
     )
@@ -34537,13 +34574,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="disable_optimization",
         action="append",
         metavar="LANE",
-        choices=(*LANES, "all"),
+        choices=(*LANES, *qwen4_aux_lanes.LANES, "all"),
         default=None,
         help=(
-            "Leave one retained-stack optimization unarmed on a Qwen3.8 "
-            "Flash-Next serve (repeatable). 'all' runs the stock path. Same "
-            f"switch as {DISABLE_ENV}=<lane,...>; the two compose. Lanes: "
-            + ", ".join(LANES)
+            "Leave one retained-stack or stacked optimization unarmed on a "
+            "Qwen3.8 Flash-Next serve (repeatable). 'all' runs the stock path. "
+            f"Same switch as {DISABLE_ENV}=<lane,...>; the two compose. Lanes: "
+            + ", ".join((*LANES, *qwen4_aux_lanes.LANES))
         ),
     )
     parser.add_argument("--host", default="127.0.0.1")

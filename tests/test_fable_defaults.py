@@ -518,7 +518,7 @@ def test_the_server_exposes_the_disable_flag() -> None:
     assert '"--disable-optimization",' in SERVER_SOURCE
     assert 'dest="disable_optimization",' in SERVER_SOURCE
     assert 'action="append",' in SERVER_SOURCE
-    assert 'choices=(*LANES, "all"),' in SERVER_SOURCE
+    assert 'choices=(*LANES, *qwen4_aux_lanes.LANES, "all"),' in SERVER_SOURCE
 
 
 def test_the_serve_wrapper_forwards_the_flag() -> None:

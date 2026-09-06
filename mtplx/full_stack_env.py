@@ -1344,6 +1344,55 @@ KEY_LANE: dict[str, str] = {
     key: lane for lane, keys in LANE_KEYS.items() for key in keys
 }
 
+#: Lanes that are armed OUTSIDE this registry's measured 44-key stack but that
+#: the operator turns off with the SAME two switches (``--disable-optimization``
+#: and ``MTPLX_FABLE_DISABLE``). A stacked lane (e.g. the cached-PLE and pooled-rowsel auxiliary
+#: lanes in ``mtplx.qwen4_aux_lanes``) registers its
+#: lane->keys here at import so :func:`parse_disable_lanes` accepts its name and
+#: ``all`` expands to it -- WITHOUT joining ``FULL_STACK_KEYS``, so the measured
+#: stack counts, the committed flag files and the full-stack self-check are
+#: unchanged. ``fable_default_env`` still stamps only ``FULL_STACK_PROFILE_ENV``,
+#: so a stacked lane owns its own defaults; this registry only shares the
+#: operator's off switch.
+_EXTRA_LANE_KEYS: dict[str, tuple[str, ...]] = {}
+
+
+def register_extra_lanes(mapping: Mapping[str, Iterable[str]]) -> None:
+    """Register stacked-lane names for the shared opt-out switches.
+
+    Idempotent: re-registering the same lane with the same keys is a no-op.
+    A name that collides with a measured-stack lane, or a re-registration with
+    different keys, raises -- the two registries must not disagree.
+    """
+
+    for lane, keys in mapping.items():
+        keys_tuple = tuple(keys)
+        if lane in LANE_KEYS:
+            raise ValueError(
+                f"lane {lane!r} is already a measured-stack lane; "
+                "extra lanes must use a distinct name"
+            )
+        existing = _EXTRA_LANE_KEYS.get(lane)
+        if existing is not None and existing != keys_tuple:
+            raise ValueError(
+                f"lane {lane!r} is already registered with different keys"
+            )
+        _EXTRA_LANE_KEYS[lane] = keys_tuple
+
+
+def _all_lane_keys() -> dict[str, tuple[str, ...]]:
+    """Measured-stack lanes plus any registered stacked lanes."""
+
+    merged = dict(LANE_KEYS)
+    merged.update(_EXTRA_LANE_KEYS)
+    return merged
+
+
+def all_lanes() -> tuple[str, ...]:
+    """Every lane name the opt-out switches accept, in registration order."""
+
+    return tuple(LANE_KEYS) + tuple(_EXTRA_LANE_KEYS)
+
 #: The one reserved lane name: every lane at once, i.e. the stock path.
 DISABLE_ALL = "all"
 
@@ -1385,19 +1434,29 @@ def parse_disable_lanes(raw: str | Iterable[str] | None) -> frozenset[str]:
     tokens = [token for token in tokens if token]
     if not tokens:
         return frozenset()
+    measured = set(LANES)
+    extra = set(_EXTRA_LANE_KEYS)
     if DISABLE_ALL in tokens:
+        # ``all`` here means every MEASURED lane, i.e. the retained stock path.
+        # A registered stacked lane owns its own ``all`` handling (it resolves
+        # the same token against its own registry), so this function stays
+        # measured-only and ``parse_disable_lanes("all") == frozenset(LANES)``
+        # holds however many stacked lanes are registered.
         return frozenset(LANES)
-    unknown = sorted(set(tokens) - set(LANES))
+    unknown = sorted(set(tokens) - measured - extra)
     if unknown:
         raise ValueError(
             f"unknown optimization lane(s) {', '.join(unknown)}; expected a "
-            f"comma list from: {', '.join(LANES)}, or {DISABLE_ALL!r}"
+            f"comma list from: {', '.join(all_lanes())}, or {DISABLE_ALL!r}"
         )
-    return frozenset(tokens)
+    # A registered stacked-lane token is accepted (so the shared switch does not
+    # raise) but is NOT returned here: its keys are not in FULL_STACK_PROFILE_ENV
+    # and its owner turns it off from its own registry.
+    return frozenset(token for token in tokens if token in measured)
 
 
 def disabled_keys(lanes: Iterable[str]) -> frozenset[str]:
-    """Every key belonging to the named lanes."""
+    """Every measured-stack key belonging to the named lanes."""
 
     resolved = parse_disable_lanes(list(lanes))
     return frozenset(

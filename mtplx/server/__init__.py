@@ -22,6 +22,14 @@ from __future__ import annotations
 
 from ..full_stack_env import stamp_import_time_defaults as _stamp_early
 
+# Register the stacked auxiliary lane names (mtplx.qwen4_aux_lanes) with
+# full_stack_env BEFORE the early stamp reads --disable-optimization /
+# MTPLX_FABLE_DISABLE below, so an operator who turns one of those lanes off in
+# the same command does not make the early stamp discard the whole disable list
+# (parse_disable_lanes would otherwise reject the unknown name). The import is
+# MLX-free and only populates the extra-lane table.
+from .. import qwen4_aux_lanes as _qwen4_aux_lanes  # noqa: F401
+
 __all__ = ["openai"]
 
 #: What the early stamp actually put in place, for the receipt the server

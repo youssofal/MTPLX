@@ -473,6 +473,15 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         # is built: the entries document WHY a key is overridable, the spread
         # guarantees the set is COMPLETE.
         *_FULL_STACK_PROFILE_KEYS,
+        # The two stacked auxiliary decode lanes (mtplx.qwen4_aux_lanes). The
+        # server DEFAULTS both for a served Flash-Next pack through its own
+        # runtime overrides, which apply_profile_env normalizes against this
+        # allowlist before a weight is read -- so, like the retained stack keys
+        # above, a key the server can arm must be listed here or the boot-time
+        # validator refuses it. Listing them also lets a model contract or an
+        # A/B window pin or turn one off.
+        "MTPLX_FABLE_PLE_CACHED_AUX",
+        "MTPLX_FABLE_QSA_POOLED_ROWSEL",
     }
 )
 

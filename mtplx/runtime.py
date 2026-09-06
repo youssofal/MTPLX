@@ -1111,6 +1111,69 @@ def load(
             runtime.qwen4_fixed_verify_report = qwen4_verify_report
             logger.info("[qwen4-fixed-M4-verify] %s", qwen4_verify_report)
             _print_install_receipt("qwen4-fixed-M4-verify", qwen4_verify_report)
+            # ---- stacked auxiliary lane: cached async PLE -------------------
+            # Wraps the fixed-M4 compiled-verify aux builder (set just above) so
+            # the auxiliary PLE plane is produced outside the compiled verifier
+            # via mx.async_eval. Exact by construction (stock owner-side cache
+            # preserved). Needs the native ple_cpu_rows extension; declines with
+            # a printed reason when it is not built, and serves stock. Any other
+            # failure (a contract miss) escapes and fails the load, keeping the
+            # exactness contract unhealthy-on-failure.
+            from .qwen4_aux_lanes import (
+                ple_cached_aux_enabled,
+                qsa_pooled_rowsel_enabled,
+            )
+
+            if ple_cached_aux_enabled():
+                from .native import (
+                    load_ple_cpu_rows_extension,
+                    ple_cpu_rows_unavailable_reason,
+                )
+
+                decline = ple_cpu_rows_unavailable_reason()
+                if decline is not None:
+                    ple_cached_aux_report = {
+                        "lane": "ple_cached_aux",
+                        "status": "declined",
+                        "reason": decline,
+                    }
+                else:
+                    from .ple_cached_aux import (
+                        PENDING_LIMIT,
+                        install_fixed_m4_cached_aux_builder,
+                    )
+
+                    native_module = load_ple_cpu_rows_extension()
+                    installation = install_fixed_m4_cached_aux_builder(
+                        runtime, native_module=native_module
+                    )
+                    runtime._ple_cached_aux_installation = installation
+                    ple_cached_aux_report = {
+                        "lane": "ple_cached_aux",
+                        "status": "installed",
+                        "variant": "async_aux",
+                        "pending_limit": PENDING_LIMIT,
+                        "native_ext": getattr(native_module, "__file__", None),
+                    }
+                runtime.ple_cached_aux_report = ple_cached_aux_report
+                logger.info("[fable] ple_cached_aux %s", ple_cached_aux_report)
+                _print_install_receipt("fable", ple_cached_aux_report)
+            # ---- stacked auxiliary lane: fixed-M4 pooled-key rowsel ---------
+            # Rebinds the twelve QSA indexers' pooled-key preparation to the
+            # construction-bound rowsel method, sharing one inv_freq object.
+            # Exact by construction; contract failures escape (unhealthy).
+            if qsa_pooled_rowsel_enabled():
+                from .qsa_pooled_rowsel import install_fixed_m4_pool
+
+                pool_report = install_fixed_m4_pool(runtime)
+                qsa_pooled_rowsel_report = {
+                    "lane": "qsa_pooled_rowsel",
+                    "status": "installed",
+                    **pool_report,
+                }
+                runtime.qsa_pooled_rowsel_report = qsa_pooled_rowsel_report
+                logger.info("[fable] qsa_pooled_rowsel %s", qsa_pooled_rowsel_report)
+                _print_install_receipt("fable", qsa_pooled_rowsel_report)
         from .qwen4_m4_stage3 import (
             install_qwen4_m4_stage3,
             qwen4_m4_stage3_flags,

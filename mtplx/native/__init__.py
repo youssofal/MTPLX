@@ -714,3 +714,131 @@ def qsa_sparse_gqa_decode(
     if stream is None:
         return extension.qsa_sparse_gqa_decode(*args)
     return extension.qsa_sparse_gqa_decode(*args, stream=stream)
+
+
+# ---------------------------------------------------------------------------
+# CPU-stream PLE row staging extension (mtplx_native_ple_cpu_rows)
+# ---------------------------------------------------------------------------
+#
+# The cached async PLE lane (mtplx/ple_cached_aux.py) needs a second built
+# extension: the CPU-stream sidecar row producer in
+# native_extensions/ple_cpu_rows. It is loaded exactly the way the QSA kernel
+# above is -- its package directory is put on sys.path and imported -- and the
+# same nanobind/mlx ABI check applies, because it too casts mx::array.
+
+#: The API the cached lane requires from the extension.
+_PLE_CPU_ROWS_REQUIRED = (
+    "install_cached_sidecar_provider",
+    "compute_cached_row_ids",
+    "make_cached_sidecar_rows",
+    "drain_cached_completions",
+)
+
+
+def _ple_cpu_rows_extension_path() -> Path:
+    return (
+        Path(__file__).resolve().parents[2]
+        / "native_extensions"
+        / "ple_cpu_rows"
+    )
+
+
+@lru_cache(maxsize=1)
+def _ple_cpu_rows_abi_mismatch() -> str | None:
+    """nanobind-vs-mlx.core ABI reason for the PLE extension, or ``None``.
+
+    Same failure mode as :func:`_nanobind_abi_mismatch`: a matching build and
+    import that still cannot cast an ``mx::array``. Named here so the reason is
+    printed rather than surfacing as a bare ``TypeError`` at first call.
+    """
+
+    ours = sorted(_ple_cpu_rows_extension_path().glob(
+        "mtplx_native_ple_cpu_rows/_ext*.so"
+    ))
+    if not ours:
+        return None
+    core = sorted(Path(mx.__file__).parent.glob("core*.so")) if mx.__file__ else []
+    if not core:
+        return None
+    ext_version = _nanobind_internals_version(ours[0])
+    mlx_version = _nanobind_internals_version(core[0])
+    if ext_version is None or mlx_version is None or ext_version == mlx_version:
+        return None
+    return (
+        f"the built PLE extension uses nanobind internals v{ext_version} but "
+        f"mlx.core uses v{mlx_version}, so it cannot resolve mlx::core::array "
+        "and every call raises TypeError; rebuild it with "
+        "-DMTPLX_NANOBIND_DIR set to a nanobind whose src/nb_abi.h says "
+        f"NB_INTERNALS_VERSION {mlx_version}"
+    )
+
+
+@lru_cache(maxsize=1)
+def _load_ple_cpu_rows_extension() -> Any:
+    """Import the built PLE extension, or return the import/ABI error."""
+
+    native_path = str(_ple_cpu_rows_extension_path())
+    if native_path not in sys.path:
+        sys.path.insert(0, native_path)
+    try:
+        import mtplx_native_ple_cpu_rows  # noqa: PLC0415
+    except Exception as exc:  # pragma: no cover - depends on build state
+        return exc
+    mismatch = _ple_cpu_rows_abi_mismatch()
+    if mismatch is not None:  # pragma: no cover - depends on build state
+        return RuntimeError(mismatch)
+    missing = [
+        name
+        for name in _PLE_CPU_ROWS_REQUIRED
+        if not callable(getattr(mtplx_native_ple_cpu_rows, name, None))
+    ]
+    if missing:  # pragma: no cover - depends on build state
+        return RuntimeError(
+            "the built PLE extension lacks required callables: "
+            + ", ".join(missing)
+        )
+    return mtplx_native_ple_cpu_rows
+
+
+def native_ple_cpu_rows_available() -> bool:
+    """True when the built PLE extension imports and exposes its cached API."""
+
+    return not isinstance(_load_ple_cpu_rows_extension(), Exception)
+
+
+def ple_cpu_rows_unavailable_reason() -> str | None:
+    """The reason the PLE extension cannot be used, or ``None`` when it can.
+
+    A short, printable string for the cached PLE lane's graceful decline when
+    the extension has not been built.
+    """
+
+    loaded = _load_ple_cpu_rows_extension()
+    if not isinstance(loaded, Exception):
+        return None
+    if isinstance(loaded, ModuleNotFoundError):
+        return (
+            "native_extensions/ple_cpu_rows is not built "
+            "(run scripts/fable/setup_over100_venv.sh)"
+        )
+    return f"{type(loaded).__name__}: {loaded}"
+
+
+def load_ple_cpu_rows_extension() -> Any:
+    """Return the imported PLE extension module, raising the stored error.
+
+    The cached PLE lane calls :func:`ple_cpu_rows_unavailable_reason` first and
+    declines when it is not ``None``; this is the accessor for the armed path.
+    """
+
+    loaded = _load_ple_cpu_rows_extension()
+    if isinstance(loaded, Exception):
+        raise loaded
+    return loaded
+
+
+__all__ += [
+    "native_ple_cpu_rows_available",
+    "ple_cpu_rows_unavailable_reason",
+    "load_ple_cpu_rows_extension",
+]
