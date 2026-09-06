@@ -146,7 +146,6 @@ struct TileRow: View {
         let liveRolling = hasRealRequest ? rolling : nil
         let liveLatest = hasRealRequest ? latest : nil
         let liveSmoothed = hasRealRequest ? smoothed : SmoothedMetrics()
-        let liveSnapshot = hasRealRequest ? snapshot : nil
 
         // `lifted` is true only once the daemon has actually reached
         // `.running` — `.starting` and `.warming` keep the row flat
@@ -206,10 +205,10 @@ struct TileRow: View {
             ),
             TileSpec(
                 label: tr("Avg Prefill"),
-                value: avgPrefillValue(snapshot: liveSnapshot, latest: liveLatest),
+                value: Format.tps(snapshot?.prefillRates?.averageTokS),
                 unit: "TPS",
                 systemImage: "gauge.with.dots.needle.bottom.50percent",
-                caption: avgPrefillCaption(snapshot: liveSnapshot, latest: liveLatest),
+                caption: snapshot?.prefillRates?.peakTokS.map { tr("peak %@", Format.tps($0)) },
                 liftIndex: 4
             ),
         ]
@@ -386,39 +385,4 @@ struct TileRow: View {
         return base
     }
 
-    // MARK: Average prefill tile
-    //
-    // Replaces the old "Depth" tile, which only echoed the depth the
-    // user already set in Settings. Prefill throughput is the metric
-    // the user actually cares about here: how fast the model ingests
-    // the prompt. The headline is work / compute time across recent
-    // completed requests; the caption shows the peak so a single fast
-    // cache-warm read doesn't read as the steady rate.
-
-    private func avgPrefillValue(snapshot: DashboardSnapshot?, latest: MetricsLatest?) -> String {
-        let rows = snapshot?.recent ?? []
-        guard let rate = MetricsLatest.aggregatePrefillRate(rows.isEmpty ? [latest].compactMap { $0 } : rows)
-        else { return "—" }
-        return Format.tps(rate)
-    }
-
-    private func avgPrefillCaption(snapshot: DashboardSnapshot?, latest: MetricsLatest?) -> String? {
-        let samples = prefillSamples(snapshot: snapshot, latest: latest)
-        guard let peak = samples.max() else { return nil }
-        return tr("peak %@", Format.tps(peak))
-    }
-
-    /// Positive, finite prefill-rate samples from recent completed
-    /// requests, falling back to the freshest single reading when the
-    /// recent buffer is empty.
-    private func prefillSamples(snapshot: DashboardSnapshot?, latest: MetricsLatest?) -> [Double] {
-        let recent = (snapshot?.recent ?? [])
-            .compactMap(\.prefillTokS)
-            .filter { $0 > 0 && $0.isFinite }
-        if !recent.isEmpty { return recent }
-        if let single = latest?.prefillTokS, single > 0, single.isFinite {
-            return [single]
-        }
-        return []
-    }
 }

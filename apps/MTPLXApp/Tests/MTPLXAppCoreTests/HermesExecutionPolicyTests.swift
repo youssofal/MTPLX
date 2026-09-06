@@ -3,7 +3,7 @@ import XCTest
 @testable import MTPLXAppCore
 
 final class HermesExecutionPolicyTests: XCTestCase {
-    func testVisionMetadataAndWeightedPrefill() throws {
+    func testVisionMetadata() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try "{\"vision_config\":{}}".write(to: directory.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
@@ -11,9 +11,6 @@ final class HermesExecutionPolicyTests: XCTestCase {
         try "{\"weight_map\":{\"model.visual.patch_embed.proj.weight\":\"model-1.safetensors\"}}".write(
             to: directory.appendingPathComponent("model.safetensors.index.json"), atomically: true, encoding: .utf8)
         XCTAssertTrue(MTPLXModelOption.supportsVision(model: directory.path))
-        let rows = [MetricsLatest(values: ["new_prefill_tokens": .number(30000), "prefill_compute_tok_s": .number(600)]),
-                    MetricsLatest(values: ["new_prefill_tokens": .number(100), "prefill_compute_tok_s": .number(200)])]
-        XCTAssertEqual(try XCTUnwrap(MetricsLatest.aggregatePrefillRate(rows)), 30100 / 50.5, accuracy: 0.0001)
     }
     func testSyncInheritsRootExecutionPolicyAndPreservesProfileChoice() throws {
         for backend in [nil, "local", "ssh"] as [String?] {

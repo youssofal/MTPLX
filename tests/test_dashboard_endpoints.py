@@ -29,6 +29,7 @@ from mtplx.benchmarks.runners.aime import AIMEProblem
 from mtplx.server import openai
 from mtplx.server.dashboard_state import (
     InFlightHandle,
+    PrefillHistory,
     ProgressEventGate,
     RollingMetrics,
 )
@@ -974,6 +975,38 @@ def test_dashboard_prefill_chunk_exposes_live_and_cumulative_rates():
     assert handle.prefill_state["cumulative_prefill_tok_s"] == 256.0
     assert handle.prefill_state["prefill_wall_tok_s"] == 256.0
     assert handle.prefill_state["live_prefill_tok_s"] == 512.0
+
+
+def test_prefill_card_summarizes_live_work_without_polling_duplicates():
+    state = _fake_state()
+    state.dashboard.in_flight.register(InFlightHandle(
+        request_id="prefill-card", cancel_event=Event(), started_s=time.time(),
+    ))
+    for size, seconds in [(2048, 1.0), (4096, 3.0)]:
+        openai._dashboard_publish_prefill(
+            state, request_id="prefill-card", session_id="session",
+            payload={"phase": "chunk", "chunk_size": size,
+                     "chunk_elapsed_s": seconds, "tokens_done": 106144,
+                     "cached_tokens": 100000, "elapsed_s": 15.0},
+        )
+    # Non-compute phases and repeated reads cannot inflate work or dilute it
+    # with cache restoration, MTP history, queueing or the model's output.
+    openai._dashboard_publish_prefill(
+        state, request_id="prefill-card", session_id="session",
+        payload={"phase": "completed", "prefill_tok_s": 400, "elapsed_s": 20.0},
+    )
+    first = openai._mtplx_dashboard_snapshot(state)["prefill_rates"]
+    assert first == openai._mtplx_dashboard_snapshot(state)["prefill_rates"]
+    assert first == {"tokens": 6144, "compute_time_s": 4.0,
+                     "peak_tok_s": 2048.0, "samples": 2, "capacity": 100}
+
+
+def test_prefill_chunk_window_is_bounded_and_ignores_invalid_samples():
+    history = PrefillHistory(capacity=2)
+    for size, seconds in [(100, 1), (200, 1), (300, 1), (1, 0), (1, float("nan"))]:
+        history.record_chunk(size, seconds)
+    assert history.rates() == {"tokens": 500, "compute_time_s": 2,
+                              "peak_tok_s": 300, "samples": 2, "capacity": 2}
 
 
 def test_dashboard_prompt_preview_truncates_long_messages():

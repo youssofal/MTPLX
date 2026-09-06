@@ -16042,6 +16042,14 @@ def _dashboard_publish_prefill(
         enriched["session_id"] = session_id
         # Live tok/s during chunked prefill (completion provides its own).
         if enriched.get("phase") == "chunk":
+            # Use exactly the measured work shown by the live gauge. A
+            # completed request's prompt timer also includes MTP history and
+            # other setup; averaging it is not an average of live prefill.
+            if dashboard.in_flight.get(request_id) is not None:
+                dashboard.prefill_history.record_chunk(
+                    int(enriched.get("chunk_size") or 0),
+                    float(enriched.get("chunk_elapsed_s") or 0.0),
+                )
             tokens_done = float(enriched.get("tokens_done") or 0)
             elapsed = float(enriched.get("elapsed_s") or 0)
             if tokens_done > 0 and elapsed > 0:
@@ -17328,6 +17336,7 @@ def _mtplx_dashboard_snapshot(state: "ServerState") -> dict[str, Any]:
         "in_flight": dashboard.in_flight.snapshot(),
         "latest": state.last_metrics[-1] if state.last_metrics else None,
         "recent": state.last_metrics[-32:],
+        "prefill_rates": dashboard.prefill_history.rates(),
         "rolling": dashboard.rolling.snapshot(),
         "lifetime": dashboard.lifetime.snapshot(),
         "sessions": sessions_dict,

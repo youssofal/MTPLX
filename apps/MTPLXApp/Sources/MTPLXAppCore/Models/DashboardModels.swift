@@ -659,19 +659,6 @@ public struct MetricsLatest: Codable, Equatable, Sendable {
 
     public var decodeTokS: Double? { values["decode_tok_s"]?.doubleValue }
     public var prefillTokS: Double? { values["prefill_tok_s"]?.doubleValue }
-    /// Aggregate work / aggregate compute time. Averaging per-request rates
-    /// gives a 50-token tool result the same weight as a 30K cold prompt.
-    public static func aggregatePrefillRate(_ rows: [MetricsLatest]) -> Double? {
-        var tokens = 0.0, seconds = 0.0
-        for row in rows {
-            guard let count = row.values["new_prefill_tokens"]?.doubleValue,
-                  let rate = row.values["prefill_compute_tok_s"]?.doubleValue ?? row.prefillTokS,
-                  count > 0, count.isFinite, rate > 0, rate.isFinite else { continue }
-            tokens += count
-            seconds += count / rate
-        }
-        return seconds > 0 ? tokens / seconds : nil
-    }
     public var ttftS: Double? { values["ttft_s"]?.doubleValue }
     public var sessionId: String? { values["session_id"]?.stringValue }
     public var cacheSource: String? { values["cache_source"]?.stringValue }
@@ -1376,6 +1363,7 @@ public struct DashboardSnapshot: Codable, Equatable, Sendable {
     public var inFlight: [InFlightRequest]
     public var latest: MetricsLatest?
     public var recent: [MetricsLatest]
+    public var prefillRates: PrefillRateSummary?
     public var rolling: RollingMetrics
     public var lifetime: LifetimeSnapshot
     public var sessions: SessionsPayload
@@ -1418,6 +1406,7 @@ public struct DashboardSnapshot: Codable, Equatable, Sendable {
         case inFlight = "in_flight"
         case latest
         case recent
+        case prefillRates = "prefill_rates"
         case rolling
         case lifetime
         case sessions
@@ -1454,6 +1443,25 @@ public struct MemoryGuardEvent: Codable, Equatable, Sendable {
     /// clears the allocator cache even at zero evictions).
     public var didShed: Bool {
         (bankEntriesEvicted ?? 0) > 0 || action == "allocation_failure_shed"
+    }
+}
+
+/// The same measured chunks as the live prefill dial, aggregated by compute
+/// time. Waiting, cache restore and MTP history have separate latency receipts.
+public struct PrefillRateSummary: Codable, Equatable, Sendable {
+    public var tokens: Int
+    public var computeTimeS: Double
+    public var peakTokS: Double?
+
+    public var averageTokS: Double? {
+        guard tokens > 0, computeTimeS.isFinite, computeTimeS > 0 else { return nil }
+        return Double(tokens) / computeTimeS
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case tokens
+        case computeTimeS = "compute_time_s"
+        case peakTokS = "peak_tok_s"
     }
 }
 

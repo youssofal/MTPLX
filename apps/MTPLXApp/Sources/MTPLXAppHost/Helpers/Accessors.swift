@@ -250,11 +250,15 @@ extension PrefillState {
     /// returns `nil` and the gauge falls back to the percent + tokens
     /// caption.
     ///
-    /// Source preference: cumulative (`tokens_done / elapsed_s`,
-    /// converges to truth) → completion envelope `prefill_tok_s` →
-    /// `live_prefill_tok_s` (server-merged live rate) → per-chunk
-    /// (most spike-prone on cached restores, last resort).
+    /// Measured chunk work is the live speed, independent of earlier setup
+    /// and cache restore. The dial's scale must not reject a genuine rate
+    /// above its last tick. Retain the legacy filter only for unmeasured rates.
     func sanePrefillTokS(maxAxis: Double = 1500) -> Double? {
+        if let count = chunkSize, count > 0,
+           let elapsed = chunkElapsedS, elapsed.isFinite, elapsed > 0 {
+            let rate = Double(count) / elapsed
+            if rate.isFinite { return rate }
+        }
         // 1.2× the dial leaves a little headroom for legitimate
         // over-shoots without admitting the tokens-as-rate artefacts.
         let ceiling = maxAxis * 1.2
@@ -266,10 +270,10 @@ extension PrefillState {
             return value
         }
 
-        return sane(cumulativePrefillTokS)
-            ?? sane(prefillTokS)
-            ?? sane(livePrefillTokS)
+        return sane(livePrefillTokS)
             ?? sane(chunkPrefillTokS)
+            ?? sane(cumulativePrefillTokS)
+            ?? sane(prefillTokS)
     }
 
     var etaSeconds: Double? {

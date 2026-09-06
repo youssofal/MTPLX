@@ -21,6 +21,7 @@ worst one frame of stale visualization, which is acceptable.
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
 import time
 from collections import OrderedDict, deque
@@ -461,7 +462,27 @@ class PrefillHistory:
     def __init__(self, *, capacity: int = 100) -> None:
         self._capacity = int(capacity)
         self._rows: deque[dict[str, Any]] = deque(maxlen=self._capacity)
+        # Producer-side samples: polling/SSE consumers must not count the
+        # same chunk again. Keep actual compute separate from restore/setup.
+        self._chunks: deque[tuple[int, float]] = deque(maxlen=self._capacity)
         self._lock = threading.Lock()
+
+    def record_chunk(self, tokens: int, elapsed_s: float) -> None:
+        if tokens <= 0 or not math.isfinite(elapsed_s) or elapsed_s <= 0:
+            return
+        with self._lock:
+            self._chunks.append((tokens, elapsed_s))
+
+    def rates(self) -> dict[str, Any]:
+        with self._lock:
+            chunks = list(self._chunks)
+        return {
+            "tokens": sum(tokens for tokens, _ in chunks),
+            "compute_time_s": sum(seconds for _, seconds in chunks),
+            "peak_tok_s": max((tokens / seconds for tokens, seconds in chunks), default=None),
+            "samples": len(chunks),
+            "capacity": self._capacity,
+        }
 
     def append(self, row: dict[str, Any]) -> None:
         with self._lock:
