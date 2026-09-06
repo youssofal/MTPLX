@@ -4,13 +4,76 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [2.11.2] - 2026-09-05
+## [2.11.2] - 2026-09-06
 
-A correctness release for every Mac that is not an M5, four session-bank
-and memory fixes for long agent sessions, and app and CLI repairs.
+A correctness release for every Mac that is not an M5, seven session-bank
+and memory fixes for long agent sessions, native vision for Flash-Next in
+Hermes, OpenCode and Pi, a verifier-depth fix for Flash-Next agent turns,
+and app and CLI repairs.
 
 ### Fixed
 
+- **Flash-Next multimodal requests keep QSA sparse attention.** Image-bearing
+  requests ran dense causal attention on the belief that the reference does;
+  Qwen's reference applies the sparse indexer to multimodal input with
+  image-aware M-RoPE positions on the indexer's queries and pooled
+  block-start keys. The engine follows it, checked against an independent
+  position oracle. A 54k image conversation went from about 19 tok/s and a
+  128 GiB allocator peak to a 92 GiB peak with turns completing at 43k–74k.
+  Dense-path vision cache entries are not reused. Image-bearing turns still
+  decode on the eager verifier (33–50 tok/s here versus 54–61 text-only);
+  `MTPLX_QWEN4_VISION_QSA=0` is a diagnostic rollback.
+- **Hermes, OpenCode and Pi advertise image input from the pack's metadata.**
+  All three registered the model as text-only, so Hermes routed screenshots
+  through its auxiliary Analyze Image tool as separate requests and OpenCode
+  and Pi could not attach an image. The app and `mtplx` probe `config.json`
+  and the weight index (`vision_config` plus a vision-tower weight), never
+  the model name; existing text-only entries are upgraded; `/v1/models`
+  carries `supports_vision` and `modalities`.
+- **A warm vision turn is admitted as warm.** The pre-prefill guard compared
+  raw image-pad tokens against content-keyed snapshots, projected a warm turn
+  as a full miss, shed the snapshot it needed and could refuse with a 507.
+  Admission uses the content-keyed identity restore uses; an anonymous image
+  turn rejoins the session owning the matching snapshot
+  (`session_source: vision_bank_prefix`); different pixels never adopt an
+  older image's state.
+- **A longer bank entry no longer erases a shorter exact prefix it cannot
+  restore.** Flash-Next recurrent checkpoints sit on 2,048-token boundaries
+  and the exact prompt end is not one, so the generation-final entry
+  superseded the exact prompt entry and the next tool turn restored 2,048
+  tokens and re-prefilled 31k. A longer entry replaces a shorter one only
+  when it carries every restore point the shorter one supplies.
+- **Hermes history matches the committed stream.** The profile enables
+  `reasoning_echo`, so Hermes sends its reasoning back (the next tool turn
+  reused 15,754 of 16,005 tokens); the cache producer, canonicalization and
+  next-turn comparison strip the tool-call preamble the way Hermes' wire
+  does, an intentionally empty visible answer stays empty, and a response's
+  own reasoning survives an older interrupted turn. The Hermes profile also
+  requests `compression.tool_image_retention: until_compaction`, which needs
+  a Hermes change that is not upstream yet; current Hermes versions ignore
+  the key.
+- **The Flash-Next expected-value depth policy measures draft and verify
+  cost per depth** when the compiled fixed-M4 verifier is engaged, instead of
+  assuming a shorter eager draft is cheaper than compiled depth 3; it leaves
+  one-time compilation out of the estimate and re-probes both depths. The
+  rehearsal's 15k coding turn went from about 11 % to 90–96 % of cycles on
+  the compiled route and from 41–47 to 56–59 tok/s (machine in use, not a
+  quiet A/B). `MTPLX_ADAPTIVE_VERIFY_COST_FEEDBACK=0` restores the prior.
+- **The prefill gauge and the Avg Prefill card measure the same chunk work.**
+  The card averaged completed-request rates (a cached follow-up counted like
+  a full prompt; setup counted as prefill: 422 shown for a 1,040 tok/s
+  prompt) and the gauge preferred a setup-diluted cumulative rate (296 for a
+  1,613 tok/s chunk). Both read measured chunks now; the card averages the
+  last 100 and shows their peak, recorded once per chunk server-side.
+- **Latency receipts are complete**: `ttft_s` includes admission and
+  pending-history waits (a 39 s history-rebuild wait had vanished), decode
+  tok/s uses the generator's decode time instead of charging prompt setup to
+  decode twice, the context tile grows with the answer, and the verify
+  waterfall shows the first live request.
+- **App and Python test suites leave the user's files alone**: the
+  daemon-supervisor tests overwrote the saved model and onboarding choices
+  through the real settings file; synthetic Python requests entered the real
+  request log and flight recorder.
 - **27B on M1–M4: the flash-decoding verify route is gated by hardware
   (#459, #464, #467, #461).** 2.11 turned the route on in turbo without
   a GPU-family gate. It engages once the KV buffer reaches 8,192 tokens and
@@ -159,6 +222,10 @@ and memory fixes for long agent sessions, and app and CLI repairs.
   cache with one 100-byte record per row, checked bit-for-bit, and
   `MTPLX_NGRAM_ROW_FILE` serves from it. Off by default; no speed claim
   until the cold-row measurement exists. `docs/diagnostics/ngram-row-cache.md`.
+- **`mtplx trace --hermes-db <state.db> [--hermes-log <agent.log>]`** joins a
+  Hermes session to engine receipts by token counts and completion clock;
+  ambiguous joins stay unmatched. Trace charts leave missing samples and
+  observation gaps out of the curve.
 - **`scripts/run_harness_check.py`** runs an agent CLI with the real exit
   code recorded and a timeout counted as a failure.
 - **Traces inspectable across harnesses**: exact Pi joins, retained tool
