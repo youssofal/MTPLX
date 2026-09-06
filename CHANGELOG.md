@@ -6,19 +6,8 @@ All notable user-facing changes to MTPLX. The format is based on
 
 ## [2.11.2] - 2026-09-05
 
-- Complete interactive CLI family setup, matching one-shot and server paths.
-- Keep terminal-chat reasoning in its own history field so follow-ups do not
-  receive duplicate thinking delimiters.
-- Validate the final Python answer in the CLI, accepting a complete code fence
-  and keeping reasoning out of the syntax check.
-- Inherit root Hermes terminal settings when a profile has no explicit backend.
-- Recover from optional native-wheel selector failure using the bundled pure wheel.
-- Correct proposal-cycle accounting and distinguish measured MTP throughput from
-  conditional acceptance estimates; record real harness failures and timeouts.
-
-
-A recovery release with hardware-routing, session-bank, memory-admission,
-app and CLI fixes. Cross-hardware speed measurements remain separate.
+A correctness release for every Mac that is not an M5, four session-bank
+and memory fixes for long agent sessions, and app and CLI repairs.
 
 ### Fixed
 
@@ -34,14 +23,19 @@ app and CLI fixes. Cross-hardware speed measurements remain separate.
   `gpu_family_or_os` bail counts and, new, `flash_dispatch_counters` for an
   engaged route. Rehearsed on an M5 Max with the reporters' 14k and 32k
   diff-summary prompts: the forced M1–M4 path and the native route both
-  answer correctly; the route counts 66 dispatches with no bails.
+  answer correctly; the route counts 66 dispatches with no bails. Item 3
+  of #455 (incoherent output with MTP on, through Pi on an M3 Ultra)
+  matches the route's engagement point and is not yet confirmed from that
+  machine; #455's AR slowdown is not explained by this change.
 - **AR-only sessions restore again (#465).** A target-only AR runtime
   (`--no-load-mtp`) banked its postcommit prefix under the `cycle` history
   policy while every lookup, the prefill store and the cache fingerprint
   said `committed`, so the bank refused the longest entry with
   `policy_mismatch` and Hermes or Pi re-prefilled the whole prompt on every
-  top-level turn. One policy per runtime is now derived in one place.
-  This does not establish that all short-prompt or idle symptoms in #455 are fixed.
+  top-level turn (14.5k tokens, about two minutes on an M1 Max). One policy
+  per runtime is now derived in one place. The 90–116 s first turn after
+  idle in #455 runs the same configuration on an M3 Ultra: the same
+  mechanism on paper, unconfirmed from that machine.
 - **The pre-prefill memory guard refuses a prompt that still projects over
   the memory limit after reclamation (#450).** It had admitted a 136k
   prompt at 105.4 GB against a 103.1 GB limit after clearing the allocator
@@ -80,13 +74,30 @@ app and CLI fixes. Cross-hardware speed measurements remain separate.
   (system prompt + one user turn) infers a background task now. Reproduced
   with the reporter's script: sessions two to four went from 0 % to 100 %
   cached on their third turn.
-- **CLI entrypoints share the Flash-Next runtime contract (#463).** The one-shot
-  path applied only the profile defaults, never the family lanes serve
+- **`mtplx run`, `mtplx ask` and one-shot `mtplx chat` work on Flash-Next
+  (#463).** The one-shot path applied only the profile defaults, never the family lanes serve
   stamps, and crashed in the legacy capture walker
   (`AttributeError: 'DecoderLayer' object has no attribute
   'input_layernorm'`, then `KeyError: 'conv_states'`). It resolves the same
   runtime contract as serve and tune, and the legacy capture commit declines
   family-native captures instead of raising. Receipt: 52 tok/s, MTP depth 3.
+- **The interactive terminal chat resolves the same contract.** The REPL
+  (`mtplx chat` with no prompt, `mtplx start cli`) still applied only the
+  profile defaults; it now runs the serve environment before the model loads.
+- **The in-process generators use the family's verifier.** `mtplx run` and
+  the terminal chat hardcoded the legacy capture-commit verifier over the
+  batched verifier the Flash-Next contract selects; a two-turn terminal
+  session on Flash-Next degenerated into repetition and a later run ended
+  in a Metal GPU address fault. The resolved strategy and core now reach
+  generation, as they always did in serve.
+- **The terminal chat keeps reasoning in its own channel.** It stored
+  `thought</think>answer` as the assistant's content, so Qwen 3.8's
+  template nested that after an empty thinking block and the next turn's
+  history was malformed. Reasoning and content are stored separately.
+- **`--expect-python` validates the final answer.** It compiled the
+  reasoning and the Markdown fence as Python and failed a valid program;
+  it now splits off the reasoning with the model's codec, unwraps one
+  enclosing fence, and still rejects malformed or missing programs.
 - **The app's Hermes profile `.env` keeps a configured reasoning effort on
   its own line.** With Performance › Reasoning effort set, the app wrote
   `TERMINAL_CWD="…"HERMES_MTPLX_REASONING_EFFORT="xhigh"` as one statement;
@@ -97,12 +108,25 @@ app and CLI fixes. Cross-hardware speed measurements remain separate.
   MTPLX wrote it into `~/.hermes/profiles/mtplx/config.yaml` on every
   launch, overriding a Docker sandbox the user had configured; the merge
   keeps what the user set.
+- **A root Hermes sandbox choice reaches the MTPLX profile.** Hermes
+  profiles do not inherit `~/.hermes/config.yaml`, so a profile with no
+  `terminal.backend` of its own now receives the root `terminal` section;
+  an explicit backend in the profile always wins and nothing else from the
+  root config is copied. Both the app and `mtplx` write it, idempotently.
 - **The setup wizard measures free space on the model store's volume
   (#466).** With `~/.mtplx/models` on an external drive (a symlink or
   `MTPLX_MODEL_DIR`) it read the home volume and refused every catalog
   model as "insufficient space". The download step and Forge share the fix.
 - **A foreign-looking occupant of the daemon port is re-probed for five
   seconds before the app moves ports (#409).**
+- **Installation survives a failing native-wheel selector.** When the
+  optional step that picks the native sparse-prefill wheel fails, the app
+  installs the bundled pure wheel and records that choice instead of
+  stopping; installation health and the wheel fingerprint checks are
+  unchanged.
+- **`build_and_run.sh --no-launch` no longer terminates a running app.**
+  It refuses to overwrite the exact running bundle and leaves every other
+  MTPLX instance alone; the launch path is unchanged.
 - **SSD prefix restore reads only the needed prefix and slices the committed
   MTP history to it (PR #444 by @softpudding).** Fixed verifier capacity is
   renewed for adaptive depths and copy windows; shared verifier programs are
@@ -122,10 +146,21 @@ app and CLI fixes. Cross-hardware speed measurements remain separate.
   Stall watchdog in the app (#448)**, 0 disables; the Flash-Next
   sparse-prefill loops tick the owner heartbeat so a long page-in is not
   mistaken for a stall.
-- **The MTP on/off law in the trace economics** for any depth policy: MTP
-  pays when acceptance per drafted token exceeds (cycle cost in AR steps − 1)
-  ÷ drafts per cycle; `mtplx trace` reports `cycle_cost_ar_steps`,
-  `drafts_per_cycle`, `acceptance_margin` and `mtp_pays`.
+- **An MTP on/off verdict in the trace economics** for any depth policy:
+  `mtp_pays` compares the tokens a run delivered per second with the
+  matched AR rate the caller supplies, and `break_even_acceptance` is the
+  acceptance at which the run would only have matched AR, under its
+  observed cycle cost, non-draft output and depth mix. Proposal cycles are
+  counted from the first draft position, not from verifier calls; `mtplx
+  trace` reports `proposal_cycles`, `cycle_cost_ar_steps`,
+  `drafts_per_cycle`, `acceptance_margin`, `break_even_basis` and `mtp_pays`.
+- **Opt-in interleaved n-gram rows (#449, David Tai's layout).**
+  `python -m mtplx.ngram_row_layout <table> --out <cache>` writes a derived
+  cache with one 100-byte record per row, checked bit-for-bit, and
+  `MTPLX_NGRAM_ROW_FILE` serves from it. Off by default; no speed claim
+  until the cold-row measurement exists. `docs/diagnostics/ngram-row-cache.md`.
+- **`scripts/run_harness_check.py`** runs an agent CLI with the real exit
+  code recorded and a timeout counted as a failure.
 - **Traces inspectable across harnesses**: exact Pi joins, retained tool
   results, prefix diagnostics kept with their request, verifier route costs,
   new tool content distinguished from reduced prefix reuse.
