@@ -17523,6 +17523,23 @@ def _prefill_admission_refusal(
     )
 
 
+def _vision_bank_session_id(bank: Any, prompt_ids: list[int], splice: Any) -> str | None:
+    """Recover anonymous lineage from a pixel-keyed snapshot, never raw KV.
+
+    Vision deliberately has no raw-token session frontier. Its bank entry
+    still owns a session id; reusing that id keeps consecutive image turns
+    in one cache budget instead of creating a protected terminal per turn.
+    Require an exact prefix containing pixels, not a shared text preamble.
+    """
+    from mtplx.vision.splice import vision_bank_key_ids
+
+    keys = vision_bank_key_ids(prompt_ids, splice)
+    entry = bank.longest_prefix(keys) if keys is not None else None
+    if entry is None or tuple(prompt_ids[:len(entry.token_ids)]) == entry.token_ids:
+        return None
+    return entry.session_id
+
+
 def _prefill_admission_shed_enabled() -> bool:
     return os.environ.get(
         "MTPLX_PREFILL_ADMISSION_SHED", "1"
@@ -17579,6 +17596,7 @@ def _prefill_admission_shed(
     prompt_ids: list[int],
     session_bank: Any | None,
     session_id: str | None,
+    vision_splice: Any | None = None,
 ) -> dict[str, Any] | None:
     """Release idle memory BEFORE a tight cache-miss prefill (#415).
 
@@ -17607,6 +17625,18 @@ def _prefill_admission_shed(
         prompt_tokens = len(prompt_ids)
         if prompt_tokens < _prefill_admission_min_miss_tokens():
             return None
+        if vision_splice is not None:
+            # Admission must ask the same content-keyed question as restore.
+            # Raw image pads only match the text before the first image;
+            # that false miss can evict the very snapshot we need and refuse
+            # a warm request. Surrogates never reach the model input.
+            from mtplx.vision.splice import vision_bank_key_ids
+
+            keyed_ids = vision_bank_key_ids(prompt_ids, vision_splice)
+            if keyed_ids is None:
+                session_bank = None
+            else:
+                prompt_ids = keyed_ids
         caps = getattr(state, "metal_memory_caps", None)
         limit = 0
         if isinstance(caps, dict):
@@ -17680,7 +17710,7 @@ def _prefill_admission_shed(
         # cleared its snapshots as "superseded", and every client retry
         # was then a 211,807-token cold miss that could never be admitted
         # until a server restart (#447).
-        if _prefill_admission_live_prefix_enabled():
+        if vision_splice is None and _prefill_admission_live_prefix_enabled():
             sessions = getattr(state, "sessions", None)
             live_tokens = 0
             if sessions is not None:
@@ -24120,6 +24150,7 @@ def _run_generation(
                 prompt_ids=prompt_ids,
                 session_bank=session_bank,
                 session_id=session_id,
+                vision_splice=vision_splice,
             )
             if admission_shed is not None and request_observability is not None:
                 request_observability["prefill_admission_shed"] = admission_shed
@@ -30760,6 +30791,15 @@ def create_app(state: ServerState) -> FastAPI:
                     prompt_ids=prompt_ids,
                     diagnostic_out=resolved_session_diagnostic,
                 )
+            if vision_cache_keying and session_source in {
+                "new", "longest_prefix", "pending_postcommit_near_prefix", "common_prefix_reuse"
+            }:
+                bank_session_id = _vision_bank_session_id(
+                    state.sessions.bank, prompt_ids, vision_splice
+                )
+                if bank_session_id:
+                    session_id, session_source = bank_session_id, "vision_bank_prefix"
+                    resolved_session_diagnostic.clear()
             session = state.sessions.get_or_create(session_id)
             session.last_cache_miss_reason = cache_miss_reason
             session.last_restore_mode = session_restore_mode
@@ -33969,10 +34009,14 @@ def create_app(state: ServerState) -> FastAPI:
                                         if assistant_tool_calls
                                         else "postcommit_prompt_prefix"
                                     )
-                                    if read_only_force_answer_contract_active:
+                                    if read_only_force_answer_contract_active or vision_splice is not None:
                                         prompt_prefix_commit_info = {
                                             "committed": False,
-                                            "reason": "transient_generation_contract",
+                                            "reason": (
+                                                "vision_session_frontier_skip"
+                                                if vision_splice is not None
+                                                else "transient_generation_contract"
+                                            ),
                                             "prefix_len": int(
                                                 getattr(session, "prefix_len", 0) or 0
                                             ),

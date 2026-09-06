@@ -122,6 +122,59 @@ def _shed(state, prompt_ids, bank, session_id):
     )
 
 
+def _vision_prompt(digest=123):
+    prompt = [1] * 53_000 + [99] * 300 + [2] * 10_000
+    splice = SimpleNamespace(
+        image_pad_token_id=99, image_digests=[digest], pad_counts=[300]
+    )
+    return prompt, splice
+
+
+def test_warm_vision_admission_does_not_evict_its_keyed_snapshot(monkeypatch):
+    from mtplx.vision.splice import vision_bank_key_ids
+
+    prompt, splice = _vision_prompt()
+    entry = _Entry(vision_bank_key_ids(prompt, splice), "images", 3 * GIB)
+    bank = _Bank([entry])
+    _pin_live_stats(monkeypatch, active=93 * GIB, cache=2 * GIB)
+    assert srv._prefill_admission_shed(
+        _state(), prompt_ids=prompt + [3] * 100,
+        session_bank=bank, session_id="images", vision_splice=splice,
+    ) is None
+    assert bank.entries == [entry]
+    assert bank.shrink_calls == []
+
+
+def test_changed_pixels_cannot_borrow_raw_live_frontier_for_admission(monkeypatch):
+    from mtplx.vision.splice import vision_bank_key_ids
+
+    prompt, old_splice = _vision_prompt()
+    _, new_splice = _vision_prompt(456)
+    bank = _Bank([_Entry(vision_bank_key_ids(prompt, old_splice), "old", 3 * GIB)])
+    state = _state_with_live(prompt)
+    _pin_live_stats(monkeypatch, active=93 * GIB, cache=2 * GIB)
+    receipt = srv._prefill_admission_shed(
+        state, prompt_ids=prompt, session_bank=bank,
+        session_id="new", vision_splice=new_splice,
+    )
+    assert receipt is not None
+    assert receipt["reusable_prefix_tokens"] <= 53_000
+    assert receipt["miss_tokens"] >= 10_300
+    assert receipt["reusable_prefix_mode"] != "live_session"
+
+
+def test_vision_lineage_comes_from_matching_pixels_not_shared_text():
+    from mtplx.vision.splice import vision_bank_key_ids
+
+    prompt, splice = _vision_prompt()
+    bank = _Bank([_Entry(vision_bank_key_ids(prompt, splice), "images", 3 * GIB)])
+    assert srv._vision_bank_session_id(bank, prompt + [3], splice) == "images"
+    _, changed = _vision_prompt(456)
+    assert srv._vision_bank_session_id(bank, prompt, changed) is None
+    bank.entries.append(_Entry(prompt[:53_000], "shared-text", GIB))
+    assert srv._vision_bank_session_id(bank, prompt, changed) is None
+
+
 class TestInertWhenHealthy:
     def test_healthy_memory_is_a_no_op_without_probing(self, monkeypatch):
         _pin_live_stats(monkeypatch, active=60 * GIB, cache=2 * GIB)

@@ -11472,10 +11472,18 @@ def test_chat_stream_tool_call_preamble_is_stored_for_postcommit(monkeypatch):
         }
 
 
-def test_chat_stream_hermes_suppresses_tool_call_preamble(monkeypatch):
+@pytest.mark.parametrize("with_vision", [False, True])
+def test_chat_stream_hermes_suppresses_tool_call_preamble(monkeypatch, with_vision):
     state = _fake_streaming_session_state()
     state.args.stream_interval = 1
     state.args.enable_thinking = False
+    if with_vision:
+        state._vision_spec_cache = SimpleNamespace()
+        splice = SimpleNamespace(
+            image_pad_token_id=999999, image_digests=[123], pad_counts=[1], total_rows=1,
+        )
+        monkeypatch.setattr(openai, "_vision_extract_and_flatten", lambda messages: (messages, [object()]))
+        monkeypatch.setattr(openai, "_materialize_vision_splice", lambda state, images, ids: (ids + [999999], splice))
     commits = []
     def capture_final(*_args, **kwargs):
         commits.append(kwargs)
@@ -11522,6 +11530,10 @@ def test_chat_stream_hermes_suppresses_tool_call_preamble(monkeypatch):
     for commit in commits:
         assert commit["assistant_content"] == ""
         assert commit["strip_tool_call_preamble_text"] is True
+    if with_vision:
+        # Even the unsafe/idle-postcommit arm must not publish raw image
+        # placeholders as a session frontier that different pixels can adopt.
+        assert state.sessions.peek("hermes-preamble").committed_token_ids == ()
 
 
 def test_chat_stream_hermes_defers_content_until_native_tool_extraction(monkeypatch):
