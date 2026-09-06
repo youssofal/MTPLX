@@ -114,6 +114,11 @@ from mtplx.gemma4_pair import (
     is_gemma4_pair_repo_id,
     resolve_gemma4_pair_paths,
 )
+from mtplx.memory_governor import (
+    MemorySafePoint,
+    RuntimeMemoryGovernor,
+    sample_process_memory,
+)
 from mtplx.model_scheduler import ModelWorkScheduler
 from mtplx.server.hyper import HYPER_ADMISSION_CAP, HyperAdmissionGate
 from mtplx.reasoning_effort import (
@@ -3457,9 +3462,10 @@ class ServerState:
                 f"({self.gpu_keepalive.get('reason', 'unknown')})"
             )
         self.session_bank_cold_tier = _session_bank_cold_tier_from_args(args)
+        self.model_weights_bytes = _plan_weights_bytes
         self.sessions = EngineSessionManager(
             cold_tier=self.session_bank_cold_tier,
-            model_weights_bytes=_plan_weights_bytes,
+            model_weights_bytes=self.model_weights_bytes,
             memory_plan=self.memory_plan,
         )
         # Keep the SSD cold-tier encode (full-KV byte conversion; post-#169
@@ -3486,6 +3492,7 @@ class ServerState:
                 _bank.cold_enqueue_dispatch = lambda job: (
                     _scheduler.submit_idle_postcommit(job, batch_key="ssd.cold_enqueue")
                 )
+        self.memory_governor = _create_memory_governor(_bank)
         # Foreground-yield wiring (2026-08-07): the cold tier's encode runs
         # on the model-owner thread and its writer thread moves GBs through
         # unified memory — both must stand down while a request is queued or
@@ -17970,6 +17977,121 @@ def _allocator_pressure_level(state: "ServerState") -> tuple[int, float]:
     if fraction >= 0.97:
         return 2, fraction
     return 1, fraction
+def _memory_governor_enabled() -> bool:
+    return os.environ.get("MTPLX_MEMORY_GOVERNOR", "").strip().lower() in {
+        "1",
+        "on",
+        "true",
+        "yes",
+    }
+
+
+def _create_memory_governor(bank: Any) -> RuntimeMemoryGovernor | None:
+    if not _memory_governor_enabled() or bank is None:
+        return None
+    try:
+        return RuntimeMemoryGovernor(
+            initial_bank_max_bytes=int(bank.max_bytes),
+            initial_per_session_max_bytes=int(bank.per_session_max_bytes),
+        )
+    except Exception as exc:
+        LOGGER.warning("runtime memory governor disabled: %s", exc)
+        return None
+
+
+def _memory_governor_safe_point(
+    state: Any,
+    *,
+    model_lock_held: bool = False,
+) -> MemorySafePoint:
+    foreground = 0
+    try:
+        foreground = int(state.foreground_count())
+    except Exception:
+        pass
+
+    scheduler_pending = False
+    postcommit_active = False
+    try:
+        scheduler = getattr(state, "model_scheduler", None)
+        stats = scheduler.stats() if scheduler is not None else {}
+        pending = sum(
+            int(stats.get(key, 0) or 0)
+            for key in (
+                "foreground_pending",
+                "idle_pending",
+                "persistence_pending",
+            )
+        )
+        active_kind = stats.get("active_kind")
+        scheduler_pending = pending > 0 or active_kind is not None
+        postcommit_active = bool(
+            active_kind in {"idle", "idle_postcommit", "persistence"}
+            or int(stats.get("idle_pending", 0) or 0) > 0
+            or int(stats.get("persistence_pending", 0) or 0) > 0
+        )
+    except Exception:
+        scheduler_pending = True
+
+    lock_active = False
+    if not model_lock_held:
+        try:
+            lock_active = bool(state.lock.locked())
+        except Exception:
+            lock_active = True
+    return MemorySafePoint(
+        foreground_active=foreground,
+        scheduler_pending_or_active=scheduler_pending,
+        session_restore_active=lock_active,
+        session_commit_active=postcommit_active,
+        mtp_transaction_active=lock_active,
+        postcommit_active=postcommit_active,
+    )
+
+
+def _memory_governor_tick(state: Any) -> dict[str, Any] | None:
+    governor = getattr(state, "memory_governor", None)
+    bank = getattr(getattr(state, "sessions", None), "bank", None)
+    if governor is None or bank is None:
+        return None
+
+    sample = sample_process_memory(
+        session_bank_bytes=int(getattr(bank, "total_nbytes", 0) or 0),
+        model_bytes=getattr(state, "model_weights_bytes", None),
+        safe_point=MemorySafePoint(mtp_transaction_active=True),
+        total_bytes=(_machine_info().get("unified_memory_bytes") or None),
+    )
+    model_lock = getattr(state, "lock", None)
+    acquired = False
+    if model_lock is not None:
+        try:
+            acquired = bool(model_lock.acquire(blocking=False))
+        except Exception:
+            acquired = False
+
+    try:
+        safe_point = (
+            _memory_governor_safe_point(state, model_lock_held=True)
+            if acquired
+            else MemorySafePoint(mtp_transaction_active=True)
+        )
+        sample = replace(sample, safe_point=safe_point)
+        decision = governor.observe(sample)
+        receipt = governor.apply(decision, bank=bank)
+        if receipt.applied and receipt.evicted_entries > 0:
+            try:
+                import mlx.core as _mx
+
+                _mx.clear_cache()
+            except Exception:
+                pass
+        return {
+            "decision": decision.to_dict(),
+            "apply": receipt.to_dict(),
+        }
+    finally:
+        if acquired:
+            model_lock.release()
 
 
 def _engine_busy_signal(state: "ServerState") -> bool:
@@ -18168,6 +18290,8 @@ async def _memory_pressure_loop(
 
     guard = _MemoryPressureGuard()
     abort_streak = 0
+    guard_enabled = _memory_pressure_guard_enabled()
+    governor_enabled = _memory_governor_enabled()
     while True:
         try:
             level = await asyncio.to_thread(_memory_pressure_level)
@@ -18235,8 +18359,13 @@ async def _memory_pressure_loop(
                             )
                 except Exception:
                     pass
+            if governor_enabled:
+                try:
+                    await asyncio.to_thread(_memory_governor_tick, state)
+                except Exception as exc:
+                    LOGGER.warning("runtime memory governor tick: %s", exc)
             busy = False
-            if 2 <= level < 4:
+            if guard_enabled and 2 <= level < 4:
                 busy = await asyncio.to_thread(_engine_busy_signal, state)
             # The guard's own busy is deliberately not computed at CRITICAL
             # (CRITICAL trims never defer); the abort tracker needs it there.
@@ -18249,7 +18378,7 @@ async def _memory_pressure_loop(
                 state, level, critical_busy, abort_streak
             )
             deferred_s = guard.deferred_for_s(time.monotonic())
-            if guard.decide(level, time.monotonic(), busy):
+            if guard_enabled and guard.decide(level, time.monotonic(), busy):
                 bank = getattr(getattr(state, "sessions", None), "bank", None)
                 evicted = 0
                 if bank is not None:
@@ -28652,7 +28781,7 @@ def create_app(state: ServerState) -> FastAPI:
             getattr(state.args, "enable_thermal_poll", False)
         ):
             bg_tasks.append(asyncio.create_task(_thermal_poll_loop(state)))
-        if _memory_pressure_guard_enabled():
+        if _memory_pressure_guard_enabled() or _memory_governor_enabled():
             bg_tasks.append(asyncio.create_task(_memory_pressure_loop(state)))
         if (
             _idle_pump_enabled()

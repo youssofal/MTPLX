@@ -1,0 +1,61 @@
+{
+  "benchmark": "sessionbank_memory_governor_no_model",
+  "command": "python3 scripts/bench_memory_governor.py --observe-iterations 200000 --apply-iterations 50000 --batches 40 --output docs/benchmarks/sessionbank-memory-governor-no-model-20260826.json",
+  "configuration": {
+    "apply_iterations": 50000,
+    "batches": 40,
+    "observe_iterations": 200000
+  },
+  "correctness": {
+    "blocked_apply_receipts": 0,
+    "blocked_rebalance_calls": 0,
+    "safe_apply_receipts": 50000,
+    "safe_rebalance_calls": 50000
+  },
+  "host": {
+    "machine": "arm64",
+    "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "python": "3.14.7"
+  },
+  "inputs_sha256": {
+    "mtplx/memory_governor.py": "ffd1a64765e021a00175a3b5e26b0333eee80a438c93aceb7ad0c81d3e563f54",
+    "scripts/bench_memory_governor.py": "74345371ef1b34a203105626ff1360db582157e628f75c8c2aff422059dda70c"
+  },
+  "measurements": [
+    {
+      "batches": 40,
+      "mean_ns_per_operation": 1594.4477000000002,
+      "name": "observe_synthetic_pressure",
+      "operations": 200000,
+      "operations_per_second": 627176.4197721882,
+      "p50_ns_per_operation": 1585.6416,
+      "p95_ns_per_operation": 1678.9,
+      "p99_ns_per_operation": 1764.3416,
+      "total_seconds": 0.31888954
+    },
+    {
+      "batches": 40,
+      "mean_ns_per_operation": 1032.0492,
+      "name": "apply_safe_budget",
+      "operations": 50000,
+      "operations_per_second": 968946.0541222258,
+      "p50_ns_per_operation": 1020.3664,
+      "p95_ns_per_operation": 1169.1672,
+      "p99_ns_per_operation": 1183.8664,
+      "total_seconds": 0.05160246
+    },
+    {
+      "batches": 40,
+      "mean_ns_per_operation": 650.84922,
+      "name": "reject_unsafe_budget",
+      "operations": 50000,
+      "operations_per_second": 1536454.1729035182,
+      "p50_ns_per_operation": 641.8,
+      "p95_ns_per_operation": 728.8328,
+      "p99_ns_per_operation": 754.5336,
+      "total_seconds": 0.032542461
+    }
+  ],
+  "schema_version": 1,
+  "scope": "Synthetic controller overhead only. No model, MLX runtime, or live memory-pressure event is used."
+}
