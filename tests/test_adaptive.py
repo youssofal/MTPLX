@@ -19,6 +19,27 @@ def test_expected_value_uses_measured_shape_cost_in_both_directions():
         assert decision["continue"] is should_continue
 
 
+def test_expected_value_rechecks_deeper_cost_after_expensive_initial_samples():
+    policy = ExpectedValueDepthPolicy(max_depth=3, accepts_verify_cost=True,
+                                      confidence_weight=0)
+    depths = []
+    # Allow the 0.12 EWMA to replace the four deliberately costly samples
+    # through repeated probes; the regression never makes another D3 probe.
+    for cycle in range(1024):
+        decision = policy.should_continue_after_draft(
+            drafted_depth=2, max_depth=3, draft_metrics={})
+        depth = 3 if decision["continue"] else 2
+        depths.append(depth)
+        policy.observe(
+            attempted_depth=depth, accepted_depths=1,
+            verify_time_s=(0.070 if cycle < 4 else 0.025) if depth == 3 else 0.045,
+            draft_time_s=0.012 if depth == 3 else 0.008,
+        )
+    assert depths[32] == 3
+    assert depths[64] == 2
+    assert depths[-128:].count(3) >= 120
+
+
 def test_expected_value_does_not_count_untested_positions_as_observed():
     policy = ExpectedValueDepthPolicy(max_depth=3)
     policy.observe(attempted_depth=3, accepted_depths=0)

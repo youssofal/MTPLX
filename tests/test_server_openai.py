@@ -1396,6 +1396,18 @@ def test_metrics_envelope_excludes_ssd_restore_from_decode_timing():
     assert envelope["display_decode_tok_s"] == 12.8
 
 
+def test_decode_timing_preserves_native_prompt_setup_accounting():
+    rate, seconds = openai._decode_timing({
+        "generated_tokens": 5252,
+        "elapsed_s": 140.07,
+        "prompt_eval_time_s": 13.35,
+        "prompt_state_total_time_s": 24.44,
+        "decode_elapsed_s": 115.63,
+    })
+    assert seconds == pytest.approx(115.63)
+    assert rate == pytest.approx(5252 / 115.63)
+
+
 def test_ar_batch_keeps_tool_history_turns_in_fair_lane():
     assert (
         openai._ar_batch_history_bypass_reason(

@@ -166,8 +166,16 @@ class ExpectedValueDepthPolicy:
         # Revisit the base occasionally so a context/route change cannot leave
         # the comparison pinned to its initial cost. Same bounded probe cadence
         # as the existing policy, with no new shapes outside the D2/D3 pair.
-        if measured and self.exploration_interval > 0 and self._cycles_observed % self.exploration_interval == 0:
-            return {"continue": False, "action": "stop", "reason": "remeasure_base_cost"}
+        if (
+            measured
+            and self.exploration_interval > 0
+            and self._cycles_observed % (2 * self.exploration_interval) == 0
+        ):
+            # Alternate base/deeper probes. Replacing every deeper probe with
+            # a base probe would lock us at D2 after an expensive first trace.
+            decision = {"continue": False, "action": "stop", "reason": "remeasure_base_cost"}
+            self._last_continue_decision = decision
+            return decision
 
         exploration_reason = self._exploration_reason(next_depth)
         if exploration_reason is not None:

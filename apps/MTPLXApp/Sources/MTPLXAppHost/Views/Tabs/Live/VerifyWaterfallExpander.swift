@@ -20,7 +20,7 @@ struct VerifyWaterfallExpander: View {
     static let liftStaggerIndex: Int = 7
 
     var body: some View {
-        let latest = backend.observedCompletionCount > 0 ? backend.latest : nil
+        let latest = backend.hasObservedCurrentRunMetrics ? backend.latest : nil
         let isRunning = backend.daemonState.kind == .running
         let liftAnimation: Animation? = themeStore.reduceMotionPreference
             ? nil

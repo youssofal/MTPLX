@@ -25218,6 +25218,12 @@ def _run_startup_warmup(state: ServerState) -> dict[str, Any]:
 
 def _decode_timing(stats: dict[str, Any]) -> tuple[float, float]:
     generated_tokens = int(stats.get("generated_tokens") or 0)
+    # Native generators already separate restore, prompt-state construction
+    # and verifier setup. Recomputing from prefill compute alone charged that
+    # setup to decode a second time (11 s in the Hermes incident replay).
+    measured_decode_s = stats.get("decode_elapsed_s")
+    if measured_decode_s is not None and float(measured_decode_s) > 0.0:
+        return generated_tokens / float(measured_decode_s), float(measured_decode_s)
     elapsed_s = float(stats.get("elapsed_s") or 0.0)
     if "prompt_eval_time_s" in stats:
         prompt_eval_time_s = float(stats.get("prompt_eval_time_s") or 0.0)

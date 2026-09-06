@@ -10005,6 +10005,10 @@ def generate_mtpk(
                 "committed_tokens": len(tokens),
             }
         _policy_draft_before, _policy_verify_before = draft_time, verify_time
+        _policy_traces_before = (
+            compiled_verify_bank.stats["traces"]
+            if compiled_verify_bank is not None else 0
+        )
         repetition_result = _trim_repeated_suffix(tokens, repetition_config)
         if repetition_result is not None:
             events.append(
@@ -12558,7 +12562,13 @@ def generate_mtpk(
         if adaptive_policy is not None:
             _policy_now = time.perf_counter()
             _policy_kwargs: dict[str, float] = {}
-            if getattr(adaptive_policy, "accepts_verify_cost", False):
+            if (
+                getattr(adaptive_policy, "accepts_verify_cost", False)
+                and compiled_verify_bank is not None
+                and compiled_verify_bank.stats["traces"] == _policy_traces_before
+            ):
+                # Compilation is paid once per shape; it remains in wall time
+                # but must not masquerade as the recurring cost of this depth.
                 _policy_kwargs.update(
                     verify_time_s=verify_time - _policy_verify_before,
                     draft_time_s=draft_time - _policy_draft_before,
@@ -13406,7 +13416,6 @@ def generate_mtpk(
                     - float(prompt_state.cache_restore_time_s or 0.0),
                 )
                 + float(pre_first_token_setup_s)
-                + float(prompt_prefix_bank_commit.get("elapsed_s") or 0.0)
             ),
         ),
         accepted_drafts=accepted,
