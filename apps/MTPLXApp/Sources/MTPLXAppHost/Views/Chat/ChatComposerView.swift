@@ -38,6 +38,9 @@ struct ChatComposerView: View {
             if !viewModel.pendingAttachments.isEmpty {
                 attachmentStrip
             }
+            if !commandSuggestions.isEmpty {
+                commandPalette
+            }
             HStack(alignment: .bottom, spacing: 12) {
                 ComposerInputTextView(
                     text: $text,
@@ -153,6 +156,43 @@ struct ChatComposerView: View {
         .buttonStyle(.plain)
         .help(tr("Attach a file (PDF, docx, md, txt)"))
         .accessibilityLabel(tr("Attach file"))
+    }
+
+    private var commandSuggestions: [ChatSlashCommandDefinition] {
+        ChatSlashCommands.suggestions(for: text)
+    }
+
+    private var commandPalette: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(commandSuggestions.prefix(6)) { command in
+                Button {
+                    text = command.commandText + " "
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: command.icon)
+                            .frame(width: 16)
+                        Text(command.commandText)
+                            .fontWeight(.semibold)
+                        Text(command.detail)
+                            .foregroundStyle(Brand.typeTertiary)
+                            .lineLimit(1)
+                        Spacer()
+                    }
+                    .font(.system(size: 11, design: .rounded))
+                    .foregroundStyle(Brand.typeSecondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(5)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Brand.bgOuter)
+                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Brand.separator, lineWidth: 0.5))
+        )
     }
 
     private var webSearchToggle: some View {

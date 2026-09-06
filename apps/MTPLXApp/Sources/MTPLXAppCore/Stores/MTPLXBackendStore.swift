@@ -235,6 +235,23 @@ public final class MTPLXBackendStore: ObservableObject {
     @Published public private(set) var prefillHistory: PrefillHistoryPayload? = nil
     /// `/v1/models` list, populated lazily for the About sheet.
     @Published public private(set) var models: ModelsResponse? = nil
+    @Published public private(set) var agentModels: AgentModelsPayload?
+    @Published public private(set) var agentProfiles: AgentProfilesPayload?
+    @Published public private(set) var workspaces: [AgentWorkspace] = []
+    @Published public private(set) var agentRuns: [AgentRun] = []
+    @Published public private(set) var activeRun: AgentRun?
+    @Published public private(set) var activeRunEvents: [AgentRunEvent] = []
+    @Published public private(set) var delegations: [AgentDelegation] = []
+    @Published public private(set) var pendingApprovals: [AgentApproval] = []
+    @Published public private(set) var graphDefinitions: [AgentGraphDefinition] = []
+    @Published public private(set) var graphRuns: [AgentGraphRun] = []
+    @Published public private(set) var activeGraphRun: AgentGraphRun?
+    @Published public private(set) var activeGraphRunEvents: [AgentRunEvent] = []
+    @Published public private(set) var activeGraphRunApprovals: [AgentApproval] = []
+    @Published public private(set) var workspaceError: String?
+    @Published public var activeWorkspaceID: String?
+    @Published public var activeRunID: String?
+    @Published public var activeGraphRunID: String?
     /// Number of completed user requests we've actually observed since
     /// the current daemon started — via `.completed` SSE frames, or via
     /// a finished request's receipt arriving on the snapshot poller
@@ -1811,6 +1828,17 @@ public final class MTPLXBackendStore: ObservableObject {
         memoryPlan = nil
         memoryGuardRecentShed = false
         models = nil
+        agentModels = nil
+        workspaces = []
+        pendingApprovals = []
+        graphDefinitions = []
+        graphRuns = []
+        activeGraphRun = nil
+        activeGraphRunEvents = []
+        activeGraphRunApprovals = []
+        workspaceError = nil
+        activeWorkspaceID = nil
+        activeGraphRunID = nil
         observedCompletionCount = 0
         observedUserMetricEventCount = 0
         snapshotCompletionFingerprint = nil
@@ -1845,6 +1873,7 @@ public final class MTPLXBackendStore: ObservableObject {
             let refreshedLogs = await supervisor.logs.snapshot()
             guard isCurrent?() ?? true else { return }
             logs = refreshedLogs
+            await refreshAgentState()
         } catch is DecodingError {
             // The daemon answered; only the app-side schema mapping failed.
             // Never treat a decode bug as a dead daemon (2026-07-06 reap).
@@ -1857,6 +1886,407 @@ public final class MTPLXBackendStore: ObservableObject {
                 )
             }
             throw error
+        }
+    }
+
+    public func refreshAgentState() async {
+        do {
+            agentModels = try await apiClient.agentModels()
+            agentProfiles = try? await apiClient.agentProfiles()
+            let workspacePayload = try await apiClient.workspaces()
+            workspaces = workspacePayload.workspaces
+            if let activeWorkspaceID,
+               !workspaces.contains(where: { $0.id == activeWorkspaceID }) {
+                self.activeWorkspaceID = nil
+            }
+            if let activeWorkspaceID {
+                let runPayload = try await apiClient.runs(workspaceID: activeWorkspaceID)
+                agentRuns = runPayload.runs
+                let selectedRun = agentRuns.first(where: { $0.id == activeRunID })
+                    ?? agentRuns.first
+                activeRun = selectedRun
+                activeRunID = selectedRun?.id
+                if let selectedRun {
+                    activeRunEvents = try await apiClient.runEvents(runID: selectedRun.id).events
+                    delegations = (try? await apiClient.delegations(
+                        workspaceID: activeWorkspaceID,
+                        parentRunID: selectedRun.id
+                    ).delegations) ?? []
+                } else {
+                    activeRunEvents = []
+                    delegations = []
+                }
+                pendingApprovals = try await apiClient.approvals(workspaceID: activeWorkspaceID).approvals
+                await refreshGraphState(workspaceID: activeWorkspaceID)
+            } else {
+                agentRuns = []
+                activeRun = nil
+                activeRunEvents = []
+                delegations = []
+                pendingApprovals = []
+                graphDefinitions = []
+                graphRuns = []
+                activeGraphRun = nil
+                activeGraphRunID = nil
+                activeGraphRunEvents = []
+                activeGraphRunApprovals = []
+            }
+            workspaceError = nil
+        } catch {
+            workspaceError = error.localizedDescription
+        }
+    }
+
+    @discardableResult
+    public func createWorkspace(
+        name: String,
+        rootPath: String,
+        instructions: String = ""
+    ) async throws -> AgentWorkspace {
+        let workspace = try await apiClient.createWorkspace(
+            name: name,
+            rootPath: rootPath,
+            model: agentModels?.models.first?.id ?? health?.model ?? configuration.model,
+            instructions: instructions
+        )
+        workspaces = [workspace] + workspaces.filter { $0.id != workspace.id }
+        activeWorkspaceID = workspace.id
+        agentRuns = []
+        activeRun = nil
+        activeRunID = nil
+        activeRunEvents = []
+        delegations = []
+        pendingApprovals = []
+        graphDefinitions = []
+        graphRuns = []
+        activeGraphRun = nil
+        activeGraphRunID = nil
+        activeGraphRunEvents = []
+        activeGraphRunApprovals = []
+        return workspace
+    }
+
+    public func selectWorkspace(_ workspaceID: String?) async {
+        activeWorkspaceID = workspaceID
+        activeRunID = nil
+        guard let workspaceID else {
+            agentRuns = []
+            activeRun = nil
+            activeRunEvents = []
+            delegations = []
+            pendingApprovals = []
+            graphDefinitions = []
+            graphRuns = []
+            activeGraphRun = nil
+            activeGraphRunID = nil
+            activeGraphRunEvents = []
+            activeGraphRunApprovals = []
+            return
+        }
+        if let payload = try? await apiClient.runs(workspaceID: workspaceID) {
+            agentRuns = payload.runs
+            activeRun = agentRuns.first
+            activeRunID = activeRun?.id
+            if let activeRun {
+                activeRunEvents = (try? await apiClient.runEvents(runID: activeRun.id).events) ?? []
+                delegations = (try? await apiClient.delegations(
+                    workspaceID: workspaceID,
+                    parentRunID: activeRun.id
+                ).delegations) ?? []
+            } else {
+                activeRunEvents = []
+                delegations = []
+            }
+        } else {
+            agentRuns = []
+            activeRun = nil
+            activeRunEvents = []
+            delegations = []
+        }
+        pendingApprovals = (try? await apiClient.approvals(workspaceID: workspaceID))?.approvals ?? []
+        await refreshGraphState(workspaceID: workspaceID)
+    }
+
+    public func selectRun(_ runID: String?) async {
+        activeRunID = runID
+        guard let runID else {
+            activeRun = nil
+            activeRunEvents = []
+            return
+        }
+        do {
+            activeRun = try await apiClient.run(runID: runID)
+            activeRunEvents = try await apiClient.runEvents(runID: runID).events
+            if let workspaceID = activeWorkspaceID {
+                delegations = (try? await apiClient.delegations(
+                    workspaceID: workspaceID,
+                    parentRunID: runID
+                ).delegations) ?? []
+            }
+        } catch {
+            workspaceError = error.localizedDescription
+        }
+    }
+
+    public func refreshRun(_ runID: String? = nil) async {
+        await selectRun(runID ?? activeRunID)
+    }
+
+    public func refreshGraphState(workspaceID: String? = nil) async {
+        guard let workspaceID = workspaceID ?? activeWorkspaceID else {
+            graphDefinitions = []
+            graphRuns = []
+            activeGraphRun = nil
+            activeGraphRunID = nil
+            activeGraphRunEvents = []
+            activeGraphRunApprovals = []
+            return
+        }
+        do {
+            async let definitions = apiClient.graphs(workspaceID: workspaceID)
+            async let runs = apiClient.graphRuns(workspaceID: workspaceID)
+            let definitionPayload = try await definitions
+            let runPayload = try await runs
+            guard activeWorkspaceID == workspaceID else { return }
+            graphDefinitions = definitionPayload.graphs
+            graphRuns = runPayload.runs
+            let selected = graphRuns.first(where: { $0.id == activeGraphRunID })
+                ?? graphRuns.first
+            activeGraphRun = selected
+            activeGraphRunID = selected?.id
+            if let selected {
+                async let events = apiClient.graphRunEvents(runID: selected.id)
+                async let approvals = apiClient.graphRunApprovals(runID: selected.id)
+                let eventPayload = try await events
+                let approvalPayload = try await approvals
+                guard activeWorkspaceID == workspaceID,
+                      activeGraphRunID == selected.id else { return }
+                activeGraphRunEvents = eventPayload.events
+                activeGraphRunApprovals = approvalPayload.approvals.filter {
+                    $0.status == "pending"
+                }
+            } else {
+                activeGraphRunEvents = []
+                activeGraphRunApprovals = []
+            }
+            if let approvals = try? await apiClient.approvals(workspaceID: workspaceID),
+               activeWorkspaceID == workspaceID {
+                pendingApprovals = approvals.approvals.filter { $0.status == "pending" }
+            }
+        } catch {
+            guard activeWorkspaceID == workspaceID else { return }
+            graphDefinitions = []
+            graphRuns = []
+            activeGraphRun = nil
+            activeGraphRunID = nil
+            activeGraphRunEvents = []
+            activeGraphRunApprovals = []
+            workspaceError = error.localizedDescription
+        }
+    }
+
+    public func selectGraphRun(_ runID: String?) async {
+        activeGraphRunID = runID
+        guard let runID else {
+            activeGraphRun = nil
+            activeGraphRunEvents = []
+            activeGraphRunApprovals = []
+            return
+        }
+        do {
+            async let run = apiClient.graphRun(runID: runID)
+            async let events = apiClient.graphRunEvents(runID: runID)
+            async let approvals = apiClient.graphRunApprovals(runID: runID)
+            let selected = try await run
+            let eventPayload = try await events
+            let approvalPayload = try await approvals
+            guard activeGraphRunID == runID,
+                  activeWorkspaceID == selected.workspaceID else { return }
+            activeGraphRun = selected
+            activeGraphRunEvents = eventPayload.events
+            activeGraphRunApprovals = approvalPayload.approvals.filter {
+                $0.status == "pending"
+            }
+        } catch {
+            workspaceError = error.localizedDescription
+        }
+    }
+
+    public func startGraphRun(
+        _ graph: AgentGraphDefinition,
+        inputs: DynamicObject = DynamicObject()
+    ) async {
+        do {
+            let run = try await apiClient.startGraphRun(
+                graphID: graph.id,
+                revision: graph.revision,
+                inputs: inputs
+            )
+            await applyGraphRun(run)
+        } catch {
+            workspaceError = error.localizedDescription
+        }
+    }
+
+    public func pauseGraphRun(_ run: AgentGraphRun) async {
+        do {
+            await applyGraphRun(try await apiClient.pauseGraphRun(runID: run.id))
+        } catch {
+            workspaceError = error.localizedDescription
+        }
+    }
+
+    public func resumeGraphRun(_ run: AgentGraphRun) async {
+        do {
+            await applyGraphRun(try await apiClient.resumeGraphRun(runID: run.id))
+        } catch {
+            workspaceError = error.localizedDescription
+        }
+    }
+
+    public func cancelGraphRun(_ run: AgentGraphRun) async {
+        do {
+            await applyGraphRun(try await apiClient.cancelGraphRun(runID: run.id))
+        } catch {
+            workspaceError = error.localizedDescription
+        }
+    }
+
+    public func retryGraphRun(
+        _ run: AgentGraphRun,
+        allowSideEffectRetry: Bool = false,
+        forceNewSideEffect: Bool = false
+    ) async {
+        do {
+            let updated = try await apiClient.retryGraphRun(
+                runID: run.id,
+                nodeID: run.currentNodeID,
+                allowSideEffectRetry: allowSideEffectRetry,
+                forceNewSideEffect: forceNewSideEffect
+            )
+            await applyGraphRun(updated)
+        } catch {
+            workspaceError = error.localizedDescription
+        }
+    }
+
+    private func applyGraphRun(_ run: AgentGraphRun) async {
+        activeGraphRun = run
+        activeGraphRunID = run.id
+        if let index = graphRuns.firstIndex(where: { $0.id == run.id }) {
+            graphRuns[index] = run
+        } else {
+            graphRuns.insert(run, at: 0)
+        }
+        activeGraphRunEvents = (try? await apiClient.graphRunEvents(runID: run.id).events) ?? []
+        activeGraphRunApprovals = (try? await apiClient.graphRunApprovals(
+            runID: run.id
+        ).approvals.filter { $0.status == "pending" }) ?? []
+        pendingApprovals = (try? await apiClient.approvals(
+            workspaceID: run.workspaceID
+        ).approvals.filter { $0.status == "pending" }) ?? pendingApprovals
+        workspaceError = nil
+    }
+
+    public func refreshDelegations() async {
+        guard let workspaceID = activeWorkspaceID else {
+            delegations = []
+            return
+        }
+        delegations = (try? await apiClient.delegations(
+            workspaceID: workspaceID,
+            parentRunID: activeRunID
+        ).delegations) ?? []
+    }
+
+    public func retryDelegation(_ delegation: AgentDelegation) async {
+        do {
+            _ = try await apiClient.retryDelegation(delegationID: delegation.id)
+            await refreshDelegations()
+        } catch {
+            workspaceError = error.localizedDescription
+        }
+    }
+
+    public func cancelDelegation(_ delegation: AgentDelegation) async {
+        do {
+            _ = try await apiClient.cancelDelegation(delegationID: delegation.id)
+            await refreshDelegations()
+        } catch {
+            workspaceError = error.localizedDescription
+        }
+    }
+
+    public func requestToolApproval(
+        workspaceID: String,
+        runID: String?,
+        tool: String,
+        action: String,
+        description: String,
+        target: String?,
+        risk: String
+    ) async -> Bool {
+        do {
+            let created = try await apiClient.createApproval(
+                workspaceID: workspaceID,
+                runID: runID,
+                tool: tool,
+                action: action,
+                description: description,
+                target: target,
+                risk: risk
+            )
+            return await awaitToolApproval(created)
+        } catch is CancellationError {
+            return false
+        } catch {
+            workspaceError = error.localizedDescription
+        }
+        return false
+    }
+
+    public func awaitToolApproval(_ approval: AgentApproval) async -> Bool {
+        pendingApprovals = [approval] + pendingApprovals.filter { $0.id != approval.id }
+        do {
+            while !Task.isCancelled {
+                try await Task.sleep(for: .milliseconds(250))
+                let payload = try await apiClient.approvals(
+                    workspaceID: approval.workspaceID,
+                    runID: approval.runID,
+                    status: nil
+                )
+                pendingApprovals = payload.approvals.filter { $0.status == "pending" }
+                if let resolved = payload.approvals.first(where: { $0.id == approval.id }) {
+                    return resolved.status == "approved"
+                }
+            }
+        } catch is CancellationError {
+            return false
+        } catch {
+            workspaceError = error.localizedDescription
+        }
+        return false
+    }
+
+    public func resolveApproval(_ approval: AgentApproval, decision: String) async {
+        do {
+            if let runID = approval.runID,
+               graphRuns.contains(where: { $0.id == runID }) {
+                _ = try await apiClient.resolveGraphApproval(
+                    runID: runID,
+                    approvalID: approval.id,
+                    decision: decision
+                )
+                await refreshGraphState(workspaceID: approval.workspaceID)
+            } else {
+                _ = try await apiClient.resolveApproval(
+                    approvalID: approval.id,
+                    decision: decision
+                )
+            }
+            pendingApprovals = (try? await apiClient.approvals(workspaceID: approval.workspaceID))?.approvals ?? []
+        } catch {
+            workspaceError = error.localizedDescription
         }
     }
 

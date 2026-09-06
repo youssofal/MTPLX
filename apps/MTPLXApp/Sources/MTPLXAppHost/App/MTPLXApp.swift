@@ -135,6 +135,42 @@ struct MTPLXApp: App {
                     reason: "MTPLX lost contact with the model server. Start it again."
                 )
             },
+            memoryContextProvider: { [backend] query in
+                guard backend.daemonState.kind == .running else { return nil }
+                guard let context = try? await backend.apiClient.memoryContext(
+                    query: query,
+                    agentID: "mtplx-app"
+                ) else {
+                    return nil
+                }
+                guard !context.hits.isEmpty else { return nil }
+                return context.context
+            },
+            workspaceRootProvider: { [backend] workspaceID in
+                guard let workspaceID else { return nil }
+                return backend.workspaces.first { $0.id == workspaceID }?.rootPath
+            },
+            workspacePolicyProvider: { [backend] workspaceID in
+                guard let workspaceID else { return [:] }
+                return backend.workspaces.first { $0.id == workspaceID }?.toolPolicy ?? [:]
+            },
+            workspaceProvider: { [backend] in
+                backend.workspaces
+            },
+            agentAPIProvider: { [backend] in
+                backend.apiClient
+            },
+            workspaceRunSelectionProvider: { [backend] runID in
+                backend.activeRunID = runID
+                Task { await backend.refreshRun(runID) }
+            },
+            workspaceSelectionProvider: { [backend] workspaceID in
+                backend.activeWorkspaceID = workspaceID
+                Task { await backend.selectWorkspace(workspaceID) }
+            },
+            toolApprovalProvider: { [backend] approval in
+                await backend.awaitToolApproval(approval)
+            },
             onLiveTurnActivityChanged: { [backend] streaming in
                 backend.setChatTurnStreaming(streaming)
             }

@@ -65,6 +65,7 @@ final class ChatTurnStream {
 
     // Request plumbing.
     var requestId: String?
+    var agentRunID: String?
     var task: Task<Void, Never>?
 
     // Per-round accumulation for the tool loop.

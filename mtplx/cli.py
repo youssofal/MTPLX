@@ -101,6 +101,9 @@ PUBLIC_COMMANDS = (
     ("forge", "Forge, verify, brand, discover, and publish MTP models"),
     ("hardware", "Inspect Apple Silicon / MLX acceleration eligibility"),
     ("models", "List models in the local MTPLX cache"),
+    ("memory", "Manage portable agent memory and dreaming"),
+    ("agent", "Control local workspaces, durable runs, and delegated agents"),
+    ("graph", "Create and run durable agent Graphs with bounded Loop nodes"),
 )
 
 ADVANCED_COMMANDS = {
@@ -939,6 +942,18 @@ def cmd_hardware_public(args: argparse.Namespace) -> int:
     for warning in payload.get("warnings") or []:
         print(f"warning: {warning}")
     return 0
+
+
+def cmd_memory_public(args: argparse.Namespace) -> int:
+    from .memory_cli import cmd_memory_public as handler
+
+    return handler(args)
+
+
+def cmd_agent_public(args: argparse.Namespace) -> int:
+    from .agent_cli import cmd_agent as handler
+
+    return handler(args)
 
 
 def cmd_chat_public(args: argparse.Namespace) -> int:
@@ -2208,6 +2223,11 @@ def build_parser() -> argparse.ArgumentParser:
     advanced_p = sub.add_parser("advanced", help=argparse.SUPPRESS)
     advanced_p.set_defaults(func=lambda _args: print(_format_advanced_help()) or 0)
 
+    from .agent_cli import add_agent_parser, add_graph_parser
+
+    add_agent_parser(sub)
+    add_graph_parser(sub)
+
     hardware_p = sub.add_parser("hardware", help="Inspect local Apple Silicon hardware")
     hardware_p.add_argument(
         "--json", action="store_true", help="Emit machine-readable JSON"
@@ -2220,6 +2240,114 @@ def build_parser() -> argparse.ArgumentParser:
     )
     hardware_inspect_p.add_argument("--json", action="store_true")
     hardware_inspect_p.set_defaults(func=cmd_hardware_public)
+
+    memory_p = sub.add_parser(
+        "memory",
+        help="Manage portable agent memory and dreaming",
+        description=(
+            "Read and update human-readable agent memory, capture session "
+            "transcripts, and run an out-of-band dreaming pass."
+        ),
+    )
+    memory_p.add_argument("--dir", dest="memory_dir", help="Memory root directory")
+    memory_sub = memory_p.add_subparsers(dest="memory_action", required=True)
+
+    memory_init_p = memory_sub.add_parser("init", help="Create the memory directory layout")
+    memory_init_p.add_argument("--dir", dest="memory_dir", default=argparse.SUPPRESS)
+    memory_init_p.add_argument("--json", action="store_true")
+    memory_init_p.set_defaults(func=cmd_memory_public)
+
+    memory_status_p = memory_sub.add_parser("status", help="Show memory store status")
+    memory_status_p.add_argument("--dir", dest="memory_dir", default=argparse.SUPPRESS)
+    memory_status_p.set_defaults(func=cmd_memory_public)
+
+    memory_list_p = memory_sub.add_parser("list", help="List memory documents")
+    memory_list_p.add_argument("--dir", dest="memory_dir", default=argparse.SUPPRESS)
+    memory_list_p.add_argument("--scope", choices=["all", "shared", "working", "transcripts", "dreaming"], default="all")
+    memory_list_p.add_argument("--limit", type=int, default=100)
+    memory_list_p.add_argument("--json", action="store_true")
+    memory_list_p.set_defaults(func=cmd_memory_public)
+
+    memory_read_p = memory_sub.add_parser("read", help="Read one memory document")
+    memory_read_p.add_argument("path")
+    memory_read_p.add_argument("--dir", dest="memory_dir", default=argparse.SUPPRESS)
+    memory_read_p.add_argument("--metadata-only", action="store_true")
+    memory_read_p.add_argument("--json", action="store_true")
+    memory_read_p.set_defaults(func=cmd_memory_public)
+
+    memory_search_p = memory_sub.add_parser("search", help="Progressively search memory")
+    memory_search_p.add_argument("query")
+    memory_search_p.add_argument("--dir", dest="memory_dir", default=argparse.SUPPRESS)
+    memory_search_p.add_argument("--scope", choices=["all", "shared", "working", "transcripts", "dreaming"], default="all")
+    memory_search_p.add_argument("--limit", type=int, default=20)
+    memory_search_p.add_argument("--json", action="store_true")
+    memory_search_p.set_defaults(func=cmd_memory_public)
+
+    memory_context_p = memory_sub.add_parser(
+        "context",
+        help="Build a bounded reference context pack from memory",
+    )
+    memory_context_p.add_argument("query")
+    memory_context_p.add_argument("--dir", dest="memory_dir", default=argparse.SUPPRESS)
+    memory_context_p.add_argument(
+        "--scope",
+        choices=["all", "shared", "working", "transcripts", "dreaming"],
+        default="all",
+    )
+    memory_context_p.add_argument("--limit", type=int, default=8)
+    memory_context_p.add_argument("--max-chars", type=int, default=12000)
+    memory_context_p.set_defaults(func=cmd_memory_public)
+
+    memory_history_p = memory_sub.add_parser("history", help="Inspect document versions")
+    memory_history_p.add_argument("path")
+    memory_history_p.add_argument("--dir", dest="memory_dir", default=argparse.SUPPRESS)
+    memory_history_p.add_argument("--json", action="store_true")
+    memory_history_p.set_defaults(func=cmd_memory_public)
+
+    for action, help_text in (("write", "Write a memory document"), ("append", "Append to a memory document")):
+        memory_write_p = memory_sub.add_parser(action, help=help_text)
+        memory_write_p.add_argument("path")
+        memory_write_p.add_argument("--dir", dest="memory_dir", default=argparse.SUPPRESS)
+        memory_write_p.add_argument("--content")
+        memory_write_p.add_argument("--file")
+        memory_write_p.add_argument("--expected-sha256")
+        memory_write_p.add_argument("--author", default="local")
+        memory_write_p.add_argument("--agent-id")
+        memory_write_p.add_argument("--session-id")
+        memory_write_p.add_argument("--json", action="store_true")
+        memory_write_p.set_defaults(func=cmd_memory_public)
+
+    memory_restore_p = memory_sub.add_parser("restore", help="Restore a prior document version")
+    memory_restore_p.add_argument("path")
+    memory_restore_p.add_argument("version", type=int)
+    memory_restore_p.add_argument("--dir", dest="memory_dir", default=argparse.SUPPRESS)
+    memory_restore_p.add_argument("--expected-sha256")
+    memory_restore_p.add_argument("--author", default="local")
+    memory_restore_p.add_argument("--agent-id")
+    memory_restore_p.add_argument("--session-id")
+    memory_restore_p.add_argument("--json", action="store_true")
+    memory_restore_p.set_defaults(func=cmd_memory_public)
+
+    memory_transcript_p = memory_sub.add_parser("transcript", help="Record a session transcript turn")
+    memory_transcript_p.add_argument("session_id")
+    memory_transcript_p.add_argument("--messages", required=True, help="JSON array of role/content messages")
+    memory_transcript_p.add_argument("--dir", dest="memory_dir", default=argparse.SUPPRESS)
+    memory_transcript_p.add_argument("--agent-id")
+    memory_transcript_p.add_argument("--request-id")
+    memory_transcript_p.add_argument("--model")
+    memory_transcript_p.add_argument("--json", action="store_true")
+    memory_transcript_p.set_defaults(func=cmd_memory_public)
+
+    memory_dream_p = memory_sub.add_parser("dream", help="Run an out-of-band memory curation pass")
+    memory_dream_p.add_argument("--dir", dest="memory_dir", default=argparse.SUPPRESS)
+    memory_dream_p.add_argument("--max-transcripts", type=int, default=100)
+    memory_dream_p.add_argument("--apply", action="store_true", help="Apply reviewed proposals immediately")
+    memory_dream_p.set_defaults(func=cmd_memory_public)
+
+    memory_apply_p = memory_sub.add_parser("apply", help="Apply a completed dreaming run")
+    memory_apply_p.add_argument("run_id")
+    memory_apply_p.add_argument("--dir", dest="memory_dir", default=argparse.SUPPRESS)
+    memory_apply_p.set_defaults(func=cmd_memory_public)
 
     start_flow_p = sub.add_parser(
         "start",

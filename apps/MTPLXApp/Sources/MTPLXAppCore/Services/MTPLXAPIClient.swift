@@ -160,6 +160,445 @@ public struct MTPLXAPIClient: Sendable {
         try await get("/v1/mtplx/app/capabilities")
     }
 
+    public func agentModels() async throws -> AgentModelsPayload {
+        try await get("/v1/mtplx/agent/models")
+    }
+
+    public func agentProfiles() async throws -> AgentProfilesPayload {
+        try await get("/v1/mtplx/agent/profiles")
+    }
+
+    public func memoryContext(
+        query: String,
+        scope: String = "all",
+        agentID: String? = nil,
+        sessionID: String? = nil,
+        limit: Int = 8,
+        maxChars: Int = 12000
+    ) async throws -> MemoryContextPayload {
+        var items = [
+            URLQueryItem(name: "query", value: query),
+            URLQueryItem(name: "scope", value: scope),
+            URLQueryItem(name: "limit", value: String(limit)),
+            URLQueryItem(name: "max_chars", value: String(maxChars)),
+        ]
+        if let agentID {
+            items.append(URLQueryItem(name: "agent_id", value: agentID))
+        }
+        if let sessionID {
+            items.append(URLQueryItem(name: "session_id", value: sessionID))
+        }
+        return try await get("/v1/mtplx/memory/context", queryItems: items)
+    }
+
+    public func workspaces(limit: Int = 100) async throws -> AgentWorkspacesPayload {
+        try await get(
+            "/v1/mtplx/workspaces",
+            queryItems: [URLQueryItem(name: "limit", value: String(limit))]
+        )
+    }
+
+    public func createWorkspace(
+        name: String,
+        rootPath: String,
+        workspaceID: String? = nil,
+        agentProfile: String = "mtplx-agent",
+        model: String? = nil,
+        instructions: String = "",
+        toolPolicy: [String: String] = [:]
+    ) async throws -> AgentWorkspace {
+        try await post(
+            "/v1/mtplx/workspaces",
+            body: AgentWorkspaceCreateRequest(
+                name: name,
+                rootPath: rootPath,
+                workspaceID: workspaceID,
+                agentProfile: agentProfile,
+                model: model,
+                instructions: instructions,
+                toolPolicy: toolPolicy
+            )
+        )
+    }
+
+    public func runs(workspaceID: String, limit: Int = 100) async throws -> AgentRunsPayload {
+        try await get(
+            "/v1/mtplx/workspaces/\(workspaceID.urlPathComponentEscaped)/runs",
+            queryItems: [URLQueryItem(name: "limit", value: String(limit))]
+        )
+    }
+
+    public func run(runID: String) async throws -> AgentRun {
+        try await get("/v1/mtplx/runs/\(runID.urlPathComponentEscaped)")
+    }
+
+    @discardableResult
+    public func resumeRun(runID: String) async throws -> AgentRun {
+        try await post(
+            "/v1/mtplx/runs/\(runID.urlPathComponentEscaped)/resume",
+            body: EmptyBody()
+        )
+    }
+
+    public func runEvents(
+        runID: String,
+        limit: Int = 500,
+        after: Int = 0
+    ) async throws -> AgentRunEventsPayload {
+        try await get(
+            "/v1/mtplx/runs/\(runID.urlPathComponentEscaped)/events",
+            queryItems: [
+                URLQueryItem(name: "limit", value: String(limit)),
+                URLQueryItem(name: "after", value: String(after))
+            ]
+        )
+    }
+
+    public func graphs(
+        workspaceID: String? = nil,
+        limit: Int = 100
+    ) async throws -> AgentGraphsPayload {
+        var query = [URLQueryItem(name: "limit", value: String(limit))]
+        if let workspaceID {
+            query.append(URLQueryItem(name: "workspace_id", value: workspaceID))
+        }
+        return try await get("/v1/mtplx/graphs", queryItems: query)
+    }
+
+    public func graphRuns(
+        workspaceID: String? = nil,
+        graphID: String? = nil,
+        limit: Int = 100
+    ) async throws -> AgentGraphRunsPayload {
+        var query = [URLQueryItem(name: "limit", value: String(limit))]
+        if let workspaceID {
+            query.append(URLQueryItem(name: "workspace_id", value: workspaceID))
+        }
+        if let graphID {
+            query.append(URLQueryItem(name: "graph_id", value: graphID))
+        }
+        return try await get("/v1/mtplx/graph-runs", queryItems: query)
+    }
+
+    public func graphRun(runID: String) async throws -> AgentGraphRun {
+        try await get("/v1/mtplx/graph-runs/\(runID.urlPathComponentEscaped)")
+    }
+
+    @discardableResult
+    public func startGraphRun(
+        graphID: String,
+        revision: Int? = nil,
+        inputs: DynamicObject = DynamicObject(),
+        model: String? = nil,
+        runtimeProfile: String = "auto",
+        runID: String? = nil
+    ) async throws -> AgentGraphRun {
+        try await post(
+            "/v1/mtplx/graph-runs",
+            body: AgentGraphRunRequest(
+                graphID: graphID,
+                revision: revision,
+                inputs: inputs,
+                model: model,
+                runtimeProfile: runtimeProfile,
+                runID: runID
+            )
+        )
+    }
+
+    @discardableResult
+    public func pauseGraphRun(runID: String) async throws -> AgentGraphRun {
+        try await post(
+            "/v1/mtplx/graph-runs/\(runID.urlPathComponentEscaped)/pause",
+            body: EmptyBody()
+        )
+    }
+
+    @discardableResult
+    public func resumeGraphRun(runID: String) async throws -> AgentGraphRun {
+        try await post(
+            "/v1/mtplx/graph-runs/\(runID.urlPathComponentEscaped)/resume",
+            body: EmptyBody()
+        )
+    }
+
+    @discardableResult
+    public func cancelGraphRun(runID: String) async throws -> AgentGraphRun {
+        try await post(
+            "/v1/mtplx/graph-runs/\(runID.urlPathComponentEscaped)/cancel",
+            body: EmptyBody()
+        )
+    }
+
+    @discardableResult
+    public func retryGraphRun(
+        runID: String,
+        nodeID: String? = nil,
+        allowSideEffectRetry: Bool = false,
+        forceNewSideEffect: Bool = false
+    ) async throws -> AgentGraphRun {
+        try await post(
+            "/v1/mtplx/graph-runs/\(runID.urlPathComponentEscaped)/retry",
+            body: AgentGraphRetryRequest(
+                nodeID: nodeID,
+                allowSideEffectRetry: allowSideEffectRetry,
+                forceNewSideEffect: forceNewSideEffect
+            )
+        )
+    }
+
+    public func graphRunEvents(
+        runID: String,
+        limit: Int = 500,
+        after: Int = 0
+    ) async throws -> AgentRunEventsPayload {
+        try await get(
+            "/v1/mtplx/graph-runs/\(runID.urlPathComponentEscaped)/events",
+            queryItems: [
+                URLQueryItem(name: "limit", value: String(limit)),
+                URLQueryItem(name: "after", value: String(after))
+            ]
+        )
+    }
+
+    public func graphRunApprovals(
+        runID: String,
+        status: String? = "pending",
+        limit: Int = 100
+    ) async throws -> AgentGraphApprovalsPayload {
+        var query = [URLQueryItem(name: "limit", value: String(limit))]
+        if let status {
+            query.append(URLQueryItem(name: "status", value: status))
+        }
+        return try await get(
+            "/v1/mtplx/graph-runs/\(runID.urlPathComponentEscaped)/approvals",
+            queryItems: query
+        )
+    }
+
+    public func resolveGraphApproval(
+        runID: String,
+        approvalID: String,
+        decision: String,
+        reason: String? = nil,
+        resolvedBy: String = "desktop"
+    ) async throws -> AgentGraphApprovalResponse {
+        try await post(
+            "/v1/mtplx/graph-runs/\(runID.urlPathComponentEscaped)/approve",
+            body: AgentGraphApprovalRequest(
+                approvalID: approvalID,
+                decision: decision,
+                resolvedBy: resolvedBy,
+                reason: reason
+            )
+        )
+    }
+
+    public func delegations(
+        workspaceID: String,
+        parentRunID: String? = nil,
+        limit: Int = 100
+    ) async throws -> AgentDelegationsPayload {
+        var query = [URLQueryItem(name: "limit", value: String(limit))]
+        if let parentRunID {
+            query.append(URLQueryItem(name: "parent_run_id", value: parentRunID))
+        }
+        return try await get(
+            "/v1/mtplx/workspaces/\(workspaceID.urlPathComponentEscaped)/delegations",
+            queryItems: query
+        )
+    }
+
+    public func delegateAgent(
+        workspaceID: String,
+        role: String = "reviewer",
+        prompt: String = "",
+        parentRunID: String? = nil,
+        model: String? = nil,
+        budget: Int? = nil,
+        contextWindow: Int? = nil,
+        sourceDelegationID: String? = nil
+    ) async throws -> AgentDelegation {
+        try await post(
+            "/v1/mtplx/workspaces/\(workspaceID.urlPathComponentEscaped)/delegations",
+            body: AgentDelegationRequest(
+                role: role,
+                prompt: prompt,
+                parentRunID: parentRunID,
+                model: model,
+                budget: budget,
+                contextWindow: contextWindow,
+                sourceDelegationID: sourceDelegationID
+            )
+        )
+    }
+
+    public func delegation(delegationID: String) async throws -> AgentDelegation {
+        try await get("/v1/mtplx/delegations/\(delegationID.urlPathComponentEscaped)")
+    }
+
+    public func cancelDelegation(delegationID: String) async throws -> AgentDelegation {
+        try await post(
+            "/v1/mtplx/delegations/\(delegationID.urlPathComponentEscaped)/cancel",
+            body: EmptyBody()
+        )
+    }
+
+    public func retryDelegation(delegationID: String) async throws -> AgentDelegation {
+        try await post(
+            "/v1/mtplx/delegations/\(delegationID.urlPathComponentEscaped)/retry",
+            body: EmptyBody()
+        )
+    }
+
+    public func delegationWorktree(delegationID: String) async throws -> DynamicObject {
+        try await get(
+            "/v1/mtplx/delegations/\(delegationID.urlPathComponentEscaped)/worktree"
+        )
+    }
+
+    public func executeWorkspaceTool(
+        workspaceID: String,
+        name: String,
+        runID: String? = nil,
+        arguments: DynamicObject = DynamicObject(),
+        approvalID: String? = nil,
+        executorID: String = "desktop",
+        idempotencyKey: String? = nil
+    ) async throws -> AgentWorkspaceToolResponse {
+        try await post(
+            "/v1/mtplx/workspaces/\(workspaceID.urlPathComponentEscaped)/tools/\(name.urlPathComponentEscaped)",
+            body: AgentWorkspaceToolRequest(
+                runID: runID,
+                arguments: arguments,
+                approvalID: approvalID,
+                executorID: executorID,
+                idempotencyKey: idempotencyKey
+            )
+        )
+    }
+
+    public func authorizeExternalAction(
+        workspaceID: String,
+        tool: String,
+        runID: String? = nil,
+        arguments: DynamicObject,
+        approvalID: String? = nil,
+        executorID: String = "desktop"
+    ) async throws -> AgentWorkspaceToolResponse {
+        try await post(
+            "/v1/mtplx/workspaces/\(workspaceID.urlPathComponentEscaped)/external-actions/authorize",
+            body: AgentExternalActionRequest(
+                runID: runID,
+                tool: tool,
+                arguments: arguments,
+                approvalID: approvalID,
+                executorID: executorID
+            )
+        )
+    }
+
+    public func createRun(
+        workspaceID: String,
+        sessionID: String? = nil,
+        title: String = "Agent run",
+        model: String? = nil,
+        runID: String? = nil
+    ) async throws -> AgentRun {
+        try await post(
+            "/v1/mtplx/workspaces/\(workspaceID.urlPathComponentEscaped)/runs",
+            body: AgentWorkspaceRunRequest(
+                sessionID: sessionID,
+                title: title,
+                model: model,
+                runID: runID
+            )
+        )
+    }
+
+    public func appendRunEvent(
+        runID: String,
+        kind: String,
+        payload: DynamicObject = DynamicObject()
+    ) async throws -> AgentRunEvent {
+        try await post(
+            "/v1/mtplx/runs/\(runID.urlPathComponentEscaped)/events",
+            body: AgentEventRequest(kind: kind, payload: payload)
+        )
+    }
+
+    public func updateRun(
+        runID: String,
+        title: String? = nil,
+        status: String? = nil,
+        error: String? = nil
+    ) async throws -> AgentRun {
+        try await patch(
+            "/v1/mtplx/runs/\(runID.urlPathComponentEscaped)",
+            body: AgentRunUpdateRequest(title: title, status: status, error: error)
+        )
+    }
+
+    public func approvals(
+        workspaceID: String,
+        runID: String? = nil,
+        status: String? = "pending",
+        limit: Int = 100
+    ) async throws -> AgentApprovalsPayload {
+        var items = [URLQueryItem(name: "limit", value: String(limit))]
+        if let runID {
+            items.append(URLQueryItem(name: "run_id", value: runID))
+        }
+        if let status {
+            items.append(URLQueryItem(name: "status", value: status))
+        }
+        return try await get(
+            "/v1/mtplx/workspaces/\(workspaceID.urlPathComponentEscaped)/approvals",
+            queryItems: items
+        )
+    }
+
+    public func createApproval(
+        workspaceID: String,
+        runID: String? = nil,
+        tool: String,
+        action: String,
+        description: String,
+        target: String? = nil,
+        risk: String = "medium",
+        arguments: DynamicObject = DynamicObject()
+    ) async throws -> AgentApproval {
+        try await post(
+            "/v1/mtplx/workspaces/\(workspaceID.urlPathComponentEscaped)/approvals",
+            body: AgentApprovalRequest(
+                runID: runID,
+                tool: tool,
+                action: action,
+                description: description,
+                target: target,
+                risk: risk,
+                arguments: arguments,
+                expiresInSeconds: 600
+            )
+        )
+    }
+
+    public func resolveApproval(
+        approvalID: String,
+        decision: String,
+        reason: String? = nil,
+        resolvedBy: String = "user"
+    ) async throws -> AgentApproval {
+        try await post(
+            "/v1/mtplx/approvals/\(approvalID.urlPathComponentEscaped)",
+            body: AgentApprovalDecisionRequest(
+                decision: decision,
+                resolvedBy: resolvedBy,
+                reason: reason
+            )
+        )
+    }
+
     public func snapshot() async throws -> DashboardSnapshot {
         try await get("/v1/mtplx/snapshot")
     }
@@ -383,9 +822,35 @@ public struct MTPLXAPIClient: Sendable {
         return try await send(request)
     }
 
+    private func get<T: Decodable>(
+        _ path: String,
+        queryItems: [URLQueryItem]
+    ) async throws -> T {
+        var components = URLComponents(
+            url: makeURL(path),
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = queryItems
+        var request = URLRequest(url: components.url!)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        applyAuth(to: &request)
+        return try await send(request)
+    }
+
     private func post<T: Decodable, Body: Encodable>(_ path: String, body: Body) async throws -> T {
         var request = URLRequest(url: makeURL(path))
         request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try encoder.encode(body)
+        applyAuth(to: &request)
+        return try await send(request)
+    }
+
+    private func patch<T: Decodable, Body: Encodable>(_ path: String, body: Body) async throws -> T {
+        var request = URLRequest(url: makeURL(path))
+        request.httpMethod = "PATCH"
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try encoder.encode(body)

@@ -58,6 +58,7 @@ public enum JSONValue: Codable, Equatable, Sendable {
     public var boolValue: Bool? {
         if case .bool(let value) = self { value } else { nil }
     }
+
 }
 
 public struct DynamicObject: Codable, Equatable, Sendable {

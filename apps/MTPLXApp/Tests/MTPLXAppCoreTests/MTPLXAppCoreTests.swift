@@ -3,6 +3,7 @@ import Darwin
 import AppKit
 import CoreGraphics
 import CoreText
+import SwiftData
 @testable import MTPLXAppCore
 
 private actor FanFallbackProbe {
@@ -8569,6 +8570,181 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(viewModel.visibleMessages.last?.role, .assistant)
         XCTAssertEqual(viewModel.visibleMessages.last?.visibleContent, "partial answer\nline two")
         XCTAssertEqual(viewModel.visibleMessages.last?.finishReason, "cancelled")
+        XCTAssertNotNil(viewModel.current?.sessionIDOverride)
+    }
+
+    @MainActor
+    func testCompactCommandPersistsFreshDaemonSessionWithoutDeletingTranscript() throws {
+        let container = try ChatStore.makeInMemoryContainer()
+        let context = container.mainContext
+        let conversation = ChatConversation(title: "Compact me")
+        let message = ChatMessage(
+            role: .user,
+            visibleContent: "keep this full transcript",
+            conversation: conversation
+        )
+        context.insert(conversation)
+        context.insert(message)
+        try context.save()
+        let chatClient = MTPLXChatClient(
+            apiClient: MTPLXAPIClient(baseURL: URL(string: "http://127.0.0.1:9")!)
+        )
+        let viewModel = ChatViewModel(
+            container: container,
+            chatClientProvider: { chatClient },
+            modelName: { "mtplx-test-model" }
+        )
+
+        XCTAssertNil(viewModel.current?.sessionIDOverride)
+        viewModel.send("/compact")
+
+        let replacement = try XCTUnwrap(viewModel.current?.sessionIDOverride)
+        XCTAssertNotEqual(replacement, conversation.id)
+        XCTAssertEqual(viewModel.visibleMessages.map(\.visibleContent), ["keep this full transcript"])
+        XCTAssertTrue(viewModel.commandOutput?.contains("fresh MTPLX session") == true)
+
+        viewModel.send("/compact")
+        let secondReplacement = try XCTUnwrap(viewModel.current?.sessionIDOverride)
+        XCTAssertNotEqual(secondReplacement, replacement)
+        XCTAssertEqual(viewModel.visibleMessages.map(\.visibleContent), ["keep this full transcript"])
+
+        let reloaded = ChatViewModel(
+            container: container,
+            chatClientProvider: { chatClient },
+            modelName: { "mtplx-test-model" }
+        )
+        XCTAssertEqual(reloaded.current?.sessionIDOverride, secondReplacement)
+        XCTAssertEqual(reloaded.visibleMessages.map(\.visibleContent), ["keep this full transcript"])
+    }
+
+    @MainActor
+    func testRetryCommandRequiresARecordedFailedRequest() throws {
+        let container = try ChatStore.makeInMemoryContainer()
+        let context = container.mainContext
+        let conversation = ChatConversation(title: "No failed request")
+        let message = ChatMessage(
+            role: .user,
+            visibleContent: "do not resend this message",
+            conversation: conversation
+        )
+        context.insert(conversation)
+        context.insert(message)
+        try context.save()
+        let chatClient = MTPLXChatClient(
+            apiClient: MTPLXAPIClient(baseURL: URL(string: "http://127.0.0.1:9")!)
+        )
+        let viewModel = ChatViewModel(
+            container: container,
+            chatClientProvider: { chatClient },
+            modelName: { "mtplx-test-model" }
+        )
+
+        viewModel.send("/retry")
+
+        XCTAssertFalse(viewModel.isStreaming)
+        XCTAssertEqual(
+            viewModel.commandOutput,
+            "There is no failed model request to retry."
+        )
+        XCTAssertEqual(
+            viewModel.visibleMessages.map(\.visibleContent),
+            ["do not resend this message"]
+        )
+    }
+
+    @MainActor
+    func testFeedbackCommandPersistsLocalConversationNote() throws {
+        let container = try ChatStore.makeInMemoryContainer()
+        let chatClient = MTPLXChatClient(
+            apiClient: MTPLXAPIClient(baseURL: URL(string: "http://127.0.0.1:9")!)
+        )
+        let viewModel = ChatViewModel(
+            container: container,
+            chatClientProvider: { chatClient },
+            modelName: { "mtplx-test-model" }
+        )
+
+        viewModel.send("/feedback Keep the approval timeline visible")
+
+        XCTAssertEqual(
+            viewModel.current?.feedbackNotes,
+            "Keep the approval timeline visible"
+        )
+        XCTAssertEqual(
+            viewModel.commandOutput,
+            "Feedback saved locally with this chat."
+        )
+
+        let reloaded = ChatViewModel(
+            container: container,
+            chatClientProvider: { chatClient },
+            modelName: { "mtplx-test-model" }
+        )
+        XCTAssertEqual(
+            reloaded.current?.feedbackNotes,
+            "Keep the approval timeline visible"
+        )
+    }
+
+    @MainActor
+    func testGoalModePersistsAndClearsConversationGoal() throws {
+        let container = try ChatStore.makeInMemoryContainer()
+        let chatClient = MTPLXChatClient(
+            apiClient: MTPLXAPIClient(baseURL: URL(string: "http://127.0.0.1:9")!)
+        )
+        let viewModel = ChatViewModel(
+            container: container,
+            chatClientProvider: { chatClient },
+            modelName: { "mtplx-test-model" }
+        )
+        _ = viewModel.createNewConversation()
+
+        viewModel.setGoal("Ship the native coding-agent workflow")
+        XCTAssertEqual(
+            viewModel.current?.goalText,
+            "Ship the native coding-agent workflow"
+        )
+
+        viewModel.send("/status")
+        XCTAssertTrue(
+            viewModel.commandOutput?.contains(
+                "Goal: Ship the native coding-agent workflow"
+            ) == true
+        )
+
+        let reloaded = ChatViewModel(
+            container: container,
+            chatClientProvider: { chatClient },
+            modelName: { "mtplx-test-model" }
+        )
+        XCTAssertEqual(
+            reloaded.current?.goalText,
+            "Ship the native coding-agent workflow"
+        )
+
+        reloaded.setGoal("   ")
+        XCTAssertNil(reloaded.current?.goalText)
+    }
+
+    func testAgentConversationSchemaCarriesLegacyMigrationDefaults() throws {
+        let schema = Schema([
+            ChatConversation.self,
+            ChatMessage.self,
+            ChatAttachment.self,
+            ToolTraceRecord.self,
+        ])
+        let conversation = try XCTUnwrap(
+            schema.entitiesByName["ChatConversation"]
+        )
+        let planMode = try XCTUnwrap(
+            conversation.attributesByName["planModeEnabled"]
+        )
+        let reasoning = try XCTUnwrap(
+            conversation.attributesByName["reasoningEffortRaw"]
+        )
+
+        XCTAssertEqual(planMode.defaultValue as? Bool, false)
+        XCTAssertEqual(reasoning.defaultValue as? String, "auto")
     }
 
     func testChatStoreSupportsExplicitQAStorePathOverride() throws {
