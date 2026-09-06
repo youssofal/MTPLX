@@ -1714,6 +1714,25 @@ def test_serve_no_auth_parses_and_forwards(monkeypatch, tmp_path, capsys):
     assert "--no-auth" in payload["server_command"]
 
 
+def test_serve_stream_stall_deadline_parses_and_forwards(monkeypatch, tmp_path, capsys):
+    """`mtplx serve --stream-stall-deadline-s 0` is what the 2.11.2 notes
+    promise (#448) and what the app passes for its Stall watchdog setting.
+    The flag existed only on the server module's parser, so the app's daemon
+    launch died with an argparse error whenever the setting left its default
+    (found by the 2011019 app QA, 2026-09-06)."""
+    monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
+    model_dir = tmp_path / "example-model"
+    model_dir.mkdir()
+    payload = _serve_dry_run_payload_for_model(
+        monkeypatch, capsys, model_dir, extra_args=("--stream-stall-deadline-s", "0")
+    )
+    assert "--stream-stall-deadline-s 0 " in payload["server_command"] + " "
+    payload = _serve_dry_run_payload_for_model(
+        monkeypatch, capsys, model_dir, extra_args=("--stream-stall-deadline-s", "45.5")
+    )
+    assert "--stream-stall-deadline-s 45.5" in payload["server_command"]
+
+
 def test_serve_no_auth_still_requires_key_off_localhost(monkeypatch, tmp_path):
     """--no-auth is a localhost convenience only: a non-localhost bind without
     a key still refuses, exactly as the #235 close promised."""

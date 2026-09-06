@@ -9665,6 +9665,13 @@ def cmd_serve_public(args: Any) -> int:
     context_window = getattr(args, "context_window", None)
     if context_window is not None:
         cmd.extend(["--context-window", str(context_window)])
+    stream_stall_deadline_s = getattr(args, "stream_stall_deadline_s", None)
+    if stream_stall_deadline_s is not None:
+        # Issue #448: the app's Stall watchdog setting rides this flag; the
+        # module owns the value, the wrapper only has to know the flag.
+        cmd.extend(
+            ["--stream-stall-deadline-s", format(float(stream_stall_deadline_s), "g")]
+        )
     if bool(getattr(args, "allow_swap", False)):
         cmd.append("--allow-swap")
     mtp_adapter = getattr(args, "mtp_adapter", None)

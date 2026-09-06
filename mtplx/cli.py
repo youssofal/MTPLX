@@ -3606,6 +3606,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override context window. Default reads the model/tokenizer config.",
     )
     serve_p.add_argument(
+        "--stream-stall-deadline-s",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "Fail a stream whose model owner makes no progress for this many "
+            "seconds; 0 turns the watchdog off. Default: "
+            "$MTPLX_STREAM_STALL_DEADLINE_S or 300 (issue #448). The app "
+            "passes its Stall watchdog setting through this flag."
+        ),
+    )
+    serve_p.add_argument(
         "--allow-swap",
         action="store_true",
         help=(
