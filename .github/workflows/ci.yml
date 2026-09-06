@@ -18,5 +18,5 @@ jobs:
           python-version: "3.11"
       - run: python -m pip install -U pip
       - run: python -m pip install -e ".[dev,server]"
-      - run: python -m pytest tests/test_no_mlx_imports.py tests/test_public_cli.py tests/test_runtime_kpis.py tests/test_server_openai.py tests/test_openai_bridge.py tests/test_thermal.py tests/test_cache_state.py
+      - run: python -m pytest tests/test_no_mlx_imports.py tests/test_public_cli.py tests/test_runtime_kpis.py tests/test_server_openai.py tests/test_openai_bridge.py tests/test_thermal.py tests/test_cache_state.py tests/test_replay_orchestrator.py
       - run: python -m compileall -q mtplx tests
