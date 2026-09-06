@@ -32,6 +32,7 @@ from typing import Any, Callable
 
 from mtplx.artifacts import inspect_model
 from mtplx.benchmarks.validators.basic import (
+    ValidationResult,
     summarize_benchmark_quality,
     validate_balanced_delimiters,
     validate_no_degenerate_loop,
@@ -10476,12 +10477,33 @@ def _generate_one_shot_public(
         if max_session is not None:
             max_session.stop()
             thermal = max_session.thermal
+    validation_text = out.text
+    if args.expect_python:
+        from mtplx.reasoning_codecs import split_reasoning_text
+
+        # Validate the delivered program, not the model's thought channel.
+        # Only unwrap a complete outer fence; malformed or multiple blocks
+        # must still fail the normal Python validator.
+        codec = reasoning_policy_for_model(model_ref=runtime_model, inspection=inspection)
+        validation_text = split_reasoning_text(
+            out.text, parser=codec.parser, thinking_enabled=reasoning_mode != "off"
+        ).content.strip()
+        fenced = re.fullmatch(
+            r"```(?:python|py)?[ \t]*\r?\n(.*?)\r?\n```",
+            validation_text, flags=re.DOTALL | re.IGNORECASE,
+        )
+        if fenced:
+            validation_text = fenced.group(1)
     validations = [
         validate_no_degenerate_loop(out.text),
-        validate_balanced_delimiters(out.text),
+        validate_balanced_delimiters(validation_text),
     ]
     if args.expect_python:
-        validations.append(validate_python_syntax(out.text))
+        validations.append(
+            validate_python_syntax(validation_text)
+            if validation_text.strip()
+            else ValidationResult("python_syntax", False, "No Python answer after reasoning")
+        )
     payload = {
         "text": out.text,
         "model": _compact_model_summary(inspection),

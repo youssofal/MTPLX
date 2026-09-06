@@ -9,6 +9,8 @@ All notable user-facing changes to MTPLX. The format is based on
 - Complete interactive CLI family setup, matching one-shot and server paths.
 - Keep terminal-chat reasoning in its own history field so follow-ups do not
   receive duplicate thinking delimiters.
+- Validate the final Python answer in the CLI, accepting a complete code fence
+  and keeping reasoning out of the syntax check.
 - Inherit root Hermes terminal settings when a profile has no explicit backend.
 - Recover from optional native-wheel selector failure using the bundled pure wheel.
 - Correct proposal-cycle accounting and distinguish measured MTP throughput from

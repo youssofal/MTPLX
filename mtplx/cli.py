@@ -2558,7 +2558,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show the MTPLX stats footer",
     )
     ask_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
-    ask_p.add_argument("--expect-python", action="store_true")
+    ask_p.add_argument(
+        "--expect-python", action="store_true",
+        help="Validate the final answer as Python, allowing one enclosing code fence",
+    )
     _add_fan_mode_args(
         ask_p,
         max_help="Compatibility alias for --fan-mode max for this run",
@@ -3429,7 +3432,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_reasoning_effort_arg(run_p)
     run_p.add_argument("--quiet", action="store_true", help="Hide the stats footer")
     run_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
-    run_p.add_argument("--expect-python", action="store_true")
+    run_p.add_argument(
+        "--expect-python", action="store_true",
+        help="Validate the final answer as Python, allowing one enclosing code fence",
+    )
     _add_fan_mode_args(
         run_p,
         max_help="Compatibility alias for --fan-mode max for this run",
@@ -3467,7 +3473,10 @@ def build_parser() -> argparse.ArgumentParser:
     chat_p.add_argument(
         "--json", action="store_true", help="Emit machine-readable JSON"
     )
-    chat_p.add_argument("--expect-python", action="store_true")
+    chat_p.add_argument(
+        "--expect-python", action="store_true",
+        help="Validate the final answer as Python, allowing one enclosing code fence",
+    )
     _add_fan_mode_args(
         chat_p,
         max_help="Compatibility alias for --fan-mode max for this run",

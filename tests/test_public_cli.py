@@ -931,6 +931,38 @@ def _stub_one_shot_generation(monkeypatch) -> dict[str, object]:
     return seen
 
 
+@pytest.mark.parametrize(
+    "text,passed",
+    [
+        ("def f():\n    return 6\nassert f() == 6", True),
+        ("I don't need extra imports. </think>\n```python\ndef f():\n    return 6\nassert f() == 6\n```", True),
+        ("<think>Plan first.</think>\n```py\nassert 2 + 4 == 6\n```", True),
+        ("```\nassert True\n```", True),
+        ("Thoughts.</think>\n```python\ndef broken(:\n    pass\n```", False),
+        ("```python\nassert True", False),
+        ("```python\nassert True\n```\n```python\nassert False\n```", False),
+        ("<think>No final answer.</think>", False),
+    ],
+)
+def test_one_shot_expect_python_validates_the_final_program(monkeypatch, text, passed):
+    _stub_one_shot_generation(monkeypatch)
+    generate = sys.modules["mtplx.generation"].generate_mtpk
+
+    def response(*args, **kwargs):
+        result = generate(*args, **kwargs)
+        result.text = text
+        return result
+
+    monkeypatch.setattr(sys.modules["mtplx.generation"], "generate_mtpk", response)
+    _stub_effort_codec(monkeypatch)
+    code, payload, validations = public._generate_one_shot_public(
+        _one_shot_args(prompt="Write Python", expect_python=True), command="run"
+    )
+    assert (code == 0) is passed
+    assert payload["text"] == text  # Preserve the actual output in the receipt.
+    assert next(row for row in validations if row.name == "python_syntax").passed is passed
+
+
 @pytest.mark.parametrize("command", ["run", "ask", "chat"])
 def test_one_shot_takes_its_prompt_from_a_pipe(monkeypatch, command):
     """`echo "..." | mtplx run` used to die with "requires a prompt"."""
