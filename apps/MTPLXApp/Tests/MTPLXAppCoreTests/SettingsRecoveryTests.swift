@@ -139,6 +139,20 @@ final class SettingsRecoveryTests: XCTestCase {
         XCTAssertEqual(result.degradedFields.map(\.path).sorted(), ["custom_models", "embedding_models"])
     }
 
+    func testRemovedCustomModelStaysRemovedAfterSaveAndLoad() throws {
+        let store = makeStore()
+        var configuration = MTPLXAppConfiguration()
+        configuration.rememberCustomModel(repoID: "Foo/Bar")
+        configuration.rememberCustomModel(repoID: "Foo/Baz")
+        let removedID = try XCTUnwrap(configuration.customModels.first?.id)
+
+        XCTAssertTrue(configuration.removeCustomModel(id: removedID))
+        try store.save(configuration)
+
+        let loaded = try store.load()
+        XCTAssertEqual(loaded.customModels.map(\.hfModelID), ["Foo/Baz"])
+    }
+
     // MARK: - Unreadable file
 
     func testNonJSONFileIsKeptBesideItselfWithDatedSuffixAndNoticeSet() throws {

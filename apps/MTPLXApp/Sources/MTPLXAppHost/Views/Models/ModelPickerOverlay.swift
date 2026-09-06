@@ -58,6 +58,7 @@ struct ModelPickerOverlay: View, Equatable {
     @State private var rowsVisibleCount: Int = 0
     @State private var applyingModelID: String? = nil
     @State private var errorMessage: String? = nil
+    @State private var pendingRemoveID: String?
     @State private var addRowExpanded: Bool = false
     @State private var customRepoInput: String = ""
     /// The input the visible verdict (probe or error) was produced for.
@@ -120,6 +121,23 @@ struct ModelPickerOverlay: View, Equatable {
             // updates; the store throttles to one network check per 6 h.
             guard presented else { return }
             await backend.refreshModelUpdates()
+        }
+        .confirmationDialog(
+            tr("Remove this model from MTPLX?"),
+            isPresented: removePresented,
+            titleVisibility: .visible
+        ) {
+            Button(tr("Remove from picker"), role: .destructive) {
+                if let id = pendingRemoveID {
+                    removeFromPicker(id: id)
+                }
+                pendingRemoveID = nil
+            }
+            Button(tr("Cancel"), role: .cancel) {
+                pendingRemoveID = nil
+            }
+        } message: {
+            Text(tr("This unregisters the model from the picker only — the files on disk stay intact. Delete the folder from Finder if you want to free the space."))
         }
     }
 
@@ -315,7 +333,9 @@ struct ModelPickerOverlay: View, Equatable {
             disabled: applyingModelID != nil || checkingCustomRepo || isTransitioning,
             visible: visible,
             motionEnabled: motionEnabled,
-            action: { select(row) }
+            action: { select(row) },
+            canRemoveFromPicker: row.canRemoveFromPicker,
+            removeAction: { pendingRemoveID = row.id }
         )
     }
 
@@ -562,6 +582,19 @@ struct ModelPickerOverlay: View, Equatable {
         }
     }
 
+    private var removePresented: Binding<Bool> {
+        Binding(
+            get: { pendingRemoveID != nil },
+            set: { if !$0 { pendingRemoveID = nil } }
+        )
+    }
+
+    private func removeFromPicker(id: String) {
+        var next = backend.configuration
+        guard next.removeCustomModel(id: id) else { return }
+        try? backend.saveSettings(next)
+    }
+
     private func checkAndAddCustomModel() {
         guard !checkingCustomRepo, applyingModelID == nil, !isTransitioning else { return }
         // A path is checked on disk; anything else is a Hugging Face id.
@@ -803,7 +836,11 @@ struct ModelPickerOverlay: View, Equatable {
                     hardware: hardware
                 )
                 .map { option in
-                    ModelPickerPreparedOption(option: option, currentModel: currentModel)
+                    ModelPickerPreparedOption(
+                        option: option,
+                        currentModel: currentModel,
+                        customModels: customModels
+                    )
                 }
             }.value
 
@@ -846,7 +883,7 @@ private struct ModelPickerCatalogSignature: Equatable, Sendable {
     let hardware: DetectedHardware?
 }
 
-private struct ModelPickerPreparedOption: Equatable, Identifiable, Sendable {
+struct ModelPickerPreparedOption: Equatable, Identifiable, Sendable {
     let option: MTPLXModelOption
     let id: String
     let displayName: String
@@ -854,9 +891,17 @@ private struct ModelPickerPreparedOption: Equatable, Identifiable, Sendable {
     let isInstalled: Bool
     let selected: Bool
     let resolvedReference: String
+    let canRemoveFromPicker: Bool
 
-    init(option: MTPLXModelOption, currentModel: String) {
+    init(option: MTPLXModelOption, currentModel: String, customModels: [MTPLXModelOption]) {
         let installedLocalPath = option.installedLocalPath
+        let selected = Self.matches(
+            option: option,
+            model: currentModel,
+            resolvedReference: installedLocalPath ?? option.hfModelID
+        )
+        let isOfficial = MTPLXModelOption.officialCatalog.contains { $0.id == option.id }
+        let isPersistedCustom = !isOfficial && customModels.contains { $0.id == option.id }
 
         self.option = option
         self.id = option.id
@@ -864,11 +909,8 @@ private struct ModelPickerPreparedOption: Equatable, Identifiable, Sendable {
         self.detail = option.detail
         self.isInstalled = installedLocalPath != nil
         self.resolvedReference = installedLocalPath ?? option.hfModelID
-        self.selected = Self.matches(
-            option: option,
-            model: currentModel,
-            resolvedReference: installedLocalPath ?? option.hfModelID
-        )
+        self.selected = selected
+        self.canRemoveFromPicker = isPersistedCustom && installedLocalPath == nil && !selected
     }
 
     func matches(_ model: String) -> Bool {
@@ -930,6 +972,8 @@ private struct ModelRowView: View {
     let visible: Bool
     let motionEnabled: Bool
     let action: () -> Void
+    let canRemoveFromPicker: Bool
+    let removeAction: () -> Void
 
     @State private var hovering = false
 
@@ -973,6 +1017,11 @@ private struct ModelRowView: View {
             }
         }
         .buttonStyle(.plain)
+        .contextMenu {
+            if canRemoveFromPicker {
+                Button(tr("Remove from picker"), role: .destructive, action: removeAction)
+            }
+        }
         .disabled(disabled)
         .opacity(visible ? 1 : 0)
         .offset(y: visible ? 0 : 8)

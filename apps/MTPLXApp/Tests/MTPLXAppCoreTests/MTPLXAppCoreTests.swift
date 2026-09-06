@@ -4322,6 +4322,51 @@ final class MTPLXAppCoreTests: XCTestCase {
         )
     }
 
+    func testRemoveCustomModelByIDPreservesUnrelatedModelsAndOfficialCatalog() throws {
+        var config = MTPLXAppConfiguration()
+        config.rememberCustomModel(repoID: "Foo/Bar")
+        config.rememberCustomModel(repoID: "Foo/Baz")
+        let officialIDs = Set(MTPLXModelOption.officialCatalog.map(\.id))
+        let removedID = try XCTUnwrap(config.customModels.first?.id)
+
+        XCTAssertTrue(config.removeCustomModel(id: removedID))
+        XCTAssertFalse(config.customModels.contains { $0.id == removedID })
+        XCTAssertEqual(config.customModels.map(\.hfModelID), ["Foo/Baz"])
+        XCTAssertEqual(Set(MTPLXModelOption.officialCatalog.map(\.id)), officialIDs)
+        XCTAssertFalse(config.removeCustomModel(id: "missing-model"))
+    }
+
+    func testRemovingCustomModelDoesNotDeleteItsLocalFiles() throws {
+        let directory = temporaryDirectory().appendingPathComponent("custom-model", isDirectory: true)
+        let file = directory.appendingPathComponent("weights.bin")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data([1, 2, 3]).write(to: file)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        var config = MTPLXAppConfiguration()
+        config.rememberForgedModel(brandedName: "Custom", localPath: directory.path)
+        let modelID = try XCTUnwrap(config.customModels.first?.id)
+
+        XCTAssertTrue(config.removeCustomModel(id: modelID))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+    }
+
+    func testRemovingCurrentCustomRegistrationPreservesCurrentModelSynthesis() throws {
+        var config = MTPLXAppConfiguration()
+        config.rememberCustomModel(repoID: "Foo/Current")
+        config.model = "Foo/Current"
+        let modelID = try XCTUnwrap(config.customModels.first?.id)
+
+        XCTAssertTrue(config.removeCustomModel(id: modelID))
+        let catalog = MTPLXModelOption.pickerCatalog(
+            customModels: config.customModels,
+            currentModel: config.model
+        )
+
+        XCTAssertTrue(catalog.contains { $0.matches(config.model) })
+    }
+
     func testCommandBuilderEmitsBatchingRuntimeSettings() throws {
         let fake = try makeExecutable(named: "mtplx")
         let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
