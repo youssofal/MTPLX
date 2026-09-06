@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-06",
+  "client": "codex-cli 0.144.1",
+  "platform": "Linux x86_64, GitHub-hosted Ubuntu runner",
+  "workflow_run": "https://github.com/PhilipJohnBasile/MTPLX/actions/runs/34064490796",
+  "workflow_commit": "09909e992990256abbbdf6f36b0f26a8393cba92",
+  "scope": "CLI first-request construction against a loopback capture endpoint only. No account, real model, or MTPLX inference was used.",
+  "setup": "Fresh temporary CODEX_HOME for each case, custom Responses provider, requires_openai_auth=false, model=mtplx-test. The endpoint deliberately returned HTTP 400 after recording tool types; the CLI's nonzero request exit is expected.",
+  "cases": [
+    {
+      "name": "default",
+      "flags": [],
+      "feature_list_exit": 0,
+      "image_generation_enabled": true,
+      "apps_enabled": true,
+      "tool_types": ["function", "namespace", "web_search"],
+      "tool_count": 10,
+      "request_bytes": 46736
+    },
+    {
+      "name": "web_disabled",
+      "flags": ["-c", "web_search=\"disabled\""],
+      "feature_list_exit": 0,
+      "image_generation_enabled": true,
+      "apps_enabled": true,
+      "tool_types": ["function", "namespace"],
+      "tool_count": 9,
+      "request_bytes": 46711
+    },
+    {
+      "name": "hosted_disabled",
+      "flags": ["-c", "web_search=\"disabled\"", "--disable", "image_generation"],
+      "feature_list_exit": 0,
+      "image_generation_enabled": false,
+      "apps_enabled": true,
+      "tool_types": ["function", "namespace"],
+      "tool_count": 9,
+      "request_bytes": 46726
+    },
+    {
+      "name": "local_minimal",
+      "flags": ["-c", "web_search=\"disabled\"", "--disable", "image_generation", "--disable", "apps"],
+      "feature_list_exit": 0,
+      "image_generation_enabled": false,
+      "apps_enabled": false,
+      "tool_types": ["function", "namespace"],
+      "tool_count": 9,
+      "request_bytes": 46716
+    }
+  ],
+  "limitations": [
+    "The custom-provider capture did not advertise image_generation even when the feature was enabled. This does not contradict another model/account configuration advertising it.",
+    "A fresh home has no installed connectors, so this does not measure schema reduction for an account with apps installed.",
+    "No desktop app-server, extension, alternate client version, generated answer, tool execution, or inference throughput was validated."
+  ]
+}
