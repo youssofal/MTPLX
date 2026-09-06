@@ -515,6 +515,26 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         onboardingCompletedAt != nil && languagePromptCompletedAt == nil
     }
 
+    /// Records the app-owned embedded Hermes session to offer on the next
+    /// overlay visit. This deliberately leaves the generic daemon launch
+    /// target alone: embedded Hermes is not a `mtplx start hermes` handoff.
+    public mutating func rememberEmbeddedHermesSession(_ reference: HermesSessionReference) {
+        lastHermesProfile = reference.profileName
+        lastHermesSessionID = reference.sessionID
+        lastHermesSessionTitle = reference.title
+    }
+
+    /// Persists profile-only navigation independently from the generic launch
+    /// target. A session belongs to its profile, so crossing that boundary
+    /// must discard the old resume identity while reselecting the same profile
+    /// keeps its remembered session intact.
+    public mutating func rememberHermesProfileSelection(_ profileName: String) {
+        guard lastHermesProfile != profileName else { return }
+        lastHermesProfile = profileName
+        lastHermesSessionID = nil
+        lastHermesSessionTitle = nil
+    }
+
     /// Fresh installs must be portable. Installed local copies are discovered
     /// by the model catalog; the default configuration should never point at
     /// a developer machine path.

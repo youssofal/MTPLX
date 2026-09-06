@@ -2013,7 +2013,6 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertTrue(command.arguments.containsInOrder(["--app-launch-id", "hermes-launch"]))
         XCTAssertEqual(command.environment["MTPLX_CLIENT"], "hermes")
         XCTAssertEqual(command.environment["MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE"], "async_per_head")
-        XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_MAX_ENTRIES"], "32")
     }
 
     func testCommandBuilderHermesHonorsExplicitSchedulingPreset() throws {
@@ -3126,6 +3125,7 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(environment["OPENAI_API_KEY"], PiIntegration.localAPIKey)
         XCTAssertEqual(environment["HERMES_MODEL"], "mtplx-qwen36-27b-optimized-speed")
         XCTAssertEqual(environment["HERMES_INFERENCE_MODEL"], "mtplx-qwen36-27b-optimized-speed")
+        XCTAssertEqual(environment["HERMES_TUI_PROVIDER"], "custom")
         XCTAssertEqual(environment["HERMES_INFERENCE_PROVIDER"], "custom")
         XCTAssertEqual(environment["HERMES_YOLO_MODE"], "1")
         XCTAssertEqual(environment["HERMES_MTPLX_TOOLSETS"], "terminal,file,web,browser,messaging")
@@ -3206,6 +3206,7 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertTrue(configText.contains("tool_use_enforcement: auto"))
         XCTAssertTrue(configText.contains("cwd: '\(workspace.path)'"))
         XCTAssertTrue(configText.contains("show_reasoning: true"))
+        XCTAssertTrue(envText.contains("HERMES_TUI_PROVIDER=custom"))
         XCTAssertTrue(envText.contains("HERMES_INFERENCE_PROVIDER=custom"))
         XCTAssertTrue(envText.contains("HERMES_MTPLX_REASONING=\"auto\""))
         XCTAssertTrue(envText.contains("HERMES_MTPLX_SHOW_REASONING=1"))
@@ -3236,6 +3237,52 @@ final class MTPLXAppCoreTests: XCTestCase {
         )
         XCTAssertTrue(channelDirectoryText.contains("launch-room"))
         XCTAssertEqual(integration.discoverProfiles().map(\.name), ["default", "mtplx", "research"])
+    }
+
+    // The Hermes CLI writes `base_url: ''` for provider profiles without a
+    // custom endpoint (for example openai-codex). The routing parser used to
+    // reject the quoted empty scalar and mark the whole profile unavailable,
+    // which disabled it in the profile picker and hid its sessions.
+    func testRoutingStateToleratesExplicitlyEmptyBaseURL() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let hermesHome = root.appendingPathComponent("hermes", isDirectory: true)
+        let profileURL = hermesHome
+            .appendingPathComponent("profiles", isDirectory: true)
+            .appendingPathComponent("bernd", isDirectory: true)
+        try FileManager.default.createDirectory(at: profileURL, withIntermediateDirectories: true)
+        try """
+        model:
+          provider: openai-codex
+          default: gpt-5.6-sol
+          base_url: ''
+        """.write(to: profileURL.appendingPathComponent("config.yaml"), atomically: true, encoding: .utf8)
+
+        let integration = HermesIntegration(
+            hermesHome: hermesHome,
+            environment: [
+                "HOME": root.path,
+                "PATH": "/usr/bin:/bin",
+            ],
+            terminalCommandURL: root.appendingPathComponent(".mtplx").appendingPathComponent("open-hermes.command")
+        )
+        let profile = HermesProfile(name: "bernd", path: profileURL.path, isDefault: false)
+        let state = integration.routingState(
+            for: profile,
+            configuration: MTPLXAppConfiguration(
+                model: "/models/Qwen3.6-27B-MTPLX-Optimized-Speed",
+                host: "127.0.0.1",
+                port: 8123,
+                apiKey: "",
+                hermesWorkspacePath: root.path
+            )
+        )
+        guard case .external = state else {
+            XCTFail("expected .external for explicitly empty base_url, got \(state)")
+            return
+        }
     }
 
     // Issue #131: the app regenerated the Hermes profile config from its
@@ -3415,17 +3462,25 @@ final class MTPLXAppCoreTests: XCTestCase {
     }
 
     func testHermesInstallStatusChecksGatewayOutsideProfileHome() async throws {
+        let root = temporaryDirectory()
+        let project = root.appendingPathComponent("hermes-project", isDirectory: true)
+        try writeAuthenticatedHermesGatewayProject(at: project)
         let fakeHermes = try makeExecutable(
             named: "hermes",
             body: """
             #!/bin/sh
             if [ "$1" = "--version" ]; then
               echo "Hermes Agent v0.5.0"
+              echo "Install directory: \(project.path)"
               exit 0
             fi
             if [ "$1" = "chat" ] && [ "$2" = "--help" ]; then
               echo "--query"
               echo "--source"
+              exit 0
+            fi
+            if [ "$1" = "serve" ] && [ "$2" = "--help" ]; then
+              echo "--isolated --host --port --ssh-owner-nonce"
               exit 0
             fi
             if [ "$1" = "gateway" ] && [ "$2" = "status" ]; then
@@ -3440,7 +3495,6 @@ final class MTPLXAppCoreTests: XCTestCase {
             echo ok
             """
         )
-        let root = temporaryDirectory()
         let integration = HermesIntegration(
             hermesHome: root.appendingPathComponent(".hermes", isDirectory: true),
             environment: [
@@ -3455,6 +3509,190 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(status.kind, .ready)
         XCTAssertEqual(status.gatewayHealth, .healthy)
         XCTAssertEqual(status.gatewaySummary, "Gateway service loaded; PID 42")
+    }
+
+    func testHermesInstallStatusRejectsOlderCLIOnlyInstall() async throws {
+        let root = temporaryDirectory()
+        let fakeHermes = try makeExecutable(
+            named: "hermes",
+            body: """
+            #!/bin/sh
+            if [ "$1" = "--version" ]; then
+              echo "Hermes Agent v0.5.0"
+              echo "Install directory: \(root.path)"
+              exit 0
+            fi
+            if [ "$1" = "chat" ] && [ "$2" = "--help" ]; then
+              echo "--query --source"
+              exit 0
+            fi
+            if [ "$1" = "serve" ] && [ "$2" = "--help" ]; then
+              echo "--host --port"
+              exit 0
+            fi
+            if [ "$1" = "gateway" ] && [ "$2" = "status" ]; then
+              echo "Gateway service is loaded"
+              exit 0
+            fi
+            exit 0
+            """
+        )
+        let integration = HermesIntegration(
+            hermesHome: root.appendingPathComponent(".hermes", isDirectory: true),
+            executablePath: fakeHermes.path,
+            environment: ["HOME": root.path, "PATH": "/usr/bin:/bin"]
+        )
+
+        let status = await integration.installStatus()
+
+        XCTAssertEqual(status.kind, .incompatible)
+        XCTAssertTrue(status.detail.contains("isolated loopback sidecars"), status.detail)
+    }
+
+    func testHermesInstallStatusRejectsServeWithoutGatewayWebSocketSurface() async throws {
+        let root = temporaryDirectory()
+        let fakeHermes = try makeExecutable(
+            named: "hermes",
+            body: """
+            #!/bin/sh
+            if [ "$1" = "--version" ]; then
+              echo "Hermes Agent v0.6.0"
+              echo "Project: \(root.path)"
+              exit 0
+            fi
+            if [ "$2" = "--help" ]; then
+              if [ "$1" = "chat" ]; then echo "--query --source"; fi
+              if [ "$1" = "serve" ]; then echo "--isolated --host --port --ssh-owner-nonce"; fi
+              exit 0
+            fi
+            exit 0
+            """
+        )
+        let integration = HermesIntegration(
+            hermesHome: root.appendingPathComponent(".hermes", isDirectory: true),
+            executablePath: fakeHermes.path,
+            environment: ["HOME": root.path, "PATH": "/usr/bin:/bin"]
+        )
+
+        let status = await integration.installStatus()
+
+        XCTAssertEqual(status.kind, .incompatible)
+        XCTAssertTrue(status.detail.contains("/api/ws gateway"), status.detail)
+    }
+
+    func testHermesInstallStatusRejectsUnauthenticatedGatewayWebSocketRouteDespiteAuthenticatedDecoy() async throws {
+        let root = temporaryDirectory()
+        let project = root.appendingPathComponent("unauthenticated-project", isDirectory: true)
+        let transportSource = project.appendingPathComponent("tui_gateway/ws.py")
+        let serverSource = project.appendingPathComponent("hermes_cli/web_server.py")
+        try FileManager.default.createDirectory(
+            at: transportSource.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: serverSource.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try "async def handle_ws(ws): pass\n".write(to: transportSource, atomically: true, encoding: .utf8)
+        try """
+        import hmac
+        import os
+        import secrets
+
+        def _resolve_session_token():
+            return os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or secrets.token_urlsafe(32)
+
+        _SESSION_TOKEN = _resolve_session_token()
+
+        def _ws_auth_reason(ws):
+            token = ws.query_params.get("token", "")
+            if not token:
+                return "no_credential", "none"
+            if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
+                return None, "token"
+            return "token_mismatch", "token"
+
+        def _ws_auth_ok(ws):
+            return _ws_auth_reason(ws)[0] is None
+
+        @app.websocket("/api/ws")
+        async def gateway_ws(ws):
+            await handle_ws(ws)
+
+        @app.websocket("/api/secure-decoy")
+        async def secure_decoy_ws(ws):
+            if not _ws_auth_ok(ws):
+                await ws.close(code=4401)
+                return
+            await handle_ws(ws)
+        """.write(to: serverSource, atomically: true, encoding: .utf8)
+        let fakeHermes = try makeExecutable(
+            named: "hermes",
+            body: """
+            #!/bin/sh
+            if [ "$1" = "--version" ]; then printf 'Hermes Agent v0.6.0\\nProject: %s\\n' '\(project.path)'; exit 0; fi
+            if [ "$1" = "chat" ]; then echo "--query --source"; exit 0; fi
+            if [ "$1" = "serve" ]; then echo "--isolated --host --port --ssh-owner-nonce"; exit 0; fi
+            exit 0
+            """
+        )
+        let integration = HermesIntegration(
+            hermesHome: root.appendingPathComponent(".hermes", isDirectory: true),
+            executablePath: fakeHermes.path,
+            environment: ["HOME": root.path, "PATH": "/usr/bin:/bin"]
+        )
+
+        let status = await integration.installStatus()
+
+        XCTAssertEqual(status.kind, .incompatible)
+        XCTAssertTrue(status.detail.contains("authenticated /api/ws gateway"), status.detail)
+    }
+
+    func testHermesInstallStatusRejectsGatewayGuardWithoutSessionTokenValidation() async throws {
+        let root = temporaryDirectory()
+        let project = root.appendingPathComponent("fake-auth-project", isDirectory: true)
+        let transportSource = project.appendingPathComponent("tui_gateway/ws.py")
+        let serverSource = project.appendingPathComponent("hermes_cli/web_server.py")
+        try FileManager.default.createDirectory(
+            at: transportSource.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: serverSource.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try "async def handle_ws(ws): pass\n".write(to: transportSource, atomically: true, encoding: .utf8)
+        try """
+        def _ws_auth_ok(ws):
+            return True
+
+        @app.websocket("/api/ws")
+        async def gateway_ws(ws):
+            if not _ws_auth_ok(ws):
+                await ws.close(code=4401)
+                return
+            await handle_ws(ws)
+        """.write(to: serverSource, atomically: true, encoding: .utf8)
+        let fakeHermes = try makeExecutable(
+            named: "hermes",
+            body: """
+            #!/bin/sh
+            if [ "$1" = "--version" ]; then printf 'Hermes Agent v0.6.0\\nProject: %s\\n' '\(project.path)'; exit 0; fi
+            if [ "$1" = "chat" ]; then echo "--query --source"; exit 0; fi
+            if [ "$1" = "serve" ]; then echo "--isolated --host --port --ssh-owner-nonce"; exit 0; fi
+            exit 0
+            """
+        )
+        let integration = HermesIntegration(
+            hermesHome: root.appendingPathComponent(".hermes", isDirectory: true),
+            executablePath: fakeHermes.path,
+            environment: ["HOME": root.path, "PATH": "/usr/bin:/bin"]
+        )
+
+        let status = await integration.installStatus()
+
+        XCTAssertEqual(status.kind, .incompatible)
+        XCTAssertTrue(status.detail.contains("authenticated /api/ws gateway"), status.detail)
     }
 
     func testHermesGatewayStatusClassifiesStaleLaunchAgent() throws {
@@ -4688,6 +4926,48 @@ final class MTPLXAppCoreTests: XCTestCase {
         )
 
         XCTAssertEqual(backend.settingsURL, expected)
+    }
+
+    func testRememberingEmbeddedHermesSessionPreservesExistingLaunchTarget() {
+        var configuration = MTPLXAppConfiguration(
+            lastLaunchTarget: LaunchTarget.openCode.rawValue,
+            lastHermesProfile: "old-profile",
+            lastHermesSessionID: "old-session",
+            lastHermesSessionTitle: "Old agent"
+        )
+
+        configuration.rememberEmbeddedHermesSession(
+            HermesSessionReference(
+                profileName: "bernd",
+                sessionID: "session-123",
+                title: "Fix the app"
+            )
+        )
+
+        XCTAssertEqual(configuration.lastLaunchTarget, LaunchTarget.openCode.rawValue)
+        XCTAssertEqual(configuration.lastHermesProfile, "bernd")
+        XCTAssertEqual(configuration.lastHermesSessionID, "session-123")
+        XCTAssertEqual(configuration.lastHermesSessionTitle, "Fix the app")
+    }
+
+    func testRememberingHermesProfileSelectionClearsOnlyCrossProfileSessionState() {
+        var configuration = MTPLXAppConfiguration(
+            lastLaunchTarget: LaunchTarget.openCode.rawValue,
+            lastHermesProfile: "bernd",
+            lastHermesSessionID: "session-123",
+            lastHermesSessionTitle: "Fix the app"
+        )
+
+        configuration.rememberHermesProfileSelection("bernd")
+        XCTAssertEqual(configuration.lastHermesSessionID, "session-123")
+        XCTAssertEqual(configuration.lastHermesSessionTitle, "Fix the app")
+
+        configuration.rememberHermesProfileSelection("researcher")
+
+        XCTAssertEqual(configuration.lastLaunchTarget, LaunchTarget.openCode.rawValue)
+        XCTAssertEqual(configuration.lastHermesProfile, "researcher")
+        XCTAssertNil(configuration.lastHermesSessionID)
+        XCTAssertNil(configuration.lastHermesSessionTitle)
     }
 
     func testAppConfigurationPersistsHermesResumeState() throws {
@@ -11195,6 +11475,55 @@ final class MTPLXAppCoreTests: XCTestCase {
         }
 
         XCTAssertEqual(failure, "cached model is incomplete: tokenizer.json")
+    }
+
+    private func writeAuthenticatedHermesGatewayProject(at project: URL) throws {
+        let transportSource = project.appendingPathComponent("tui_gateway/ws.py")
+        let serverSource = project.appendingPathComponent("hermes_cli/web_server.py")
+        try FileManager.default.createDirectory(
+            at: transportSource.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: serverSource.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try "async def handle_ws(ws): pass\n".write(
+            to: transportSource,
+            atomically: true,
+            encoding: .utf8
+        )
+        try """
+        import hmac
+        import os
+        import secrets
+
+        def _resolve_session_token():
+            return os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or secrets.token_urlsafe(32)
+
+        _SESSION_TOKEN = _resolve_session_token()
+
+        def _ws_auth_reason(ws):
+            token = ws.query_params.get("token", "")
+            if not token:
+                return "no_credential", "none"
+            if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
+                return None, "token"
+            return "token_mismatch", "token"
+
+        def _ws_auth_ok(ws):
+            return _ws_auth_reason(ws)[0] is None
+
+        @app.websocket("/api/ws")
+        async def gateway_ws(ws):
+            if not _ws_auth_ok(ws):
+                await ws.close(code=4401)
+                return
+            await handle_ws(
+                ws,
+                auth_identity=getattr(ws, "_hermes_auth_identity", None),
+            )
+        """.write(to: serverSource, atomically: true, encoding: .utf8)
     }
 
     private func makeExecutable(
