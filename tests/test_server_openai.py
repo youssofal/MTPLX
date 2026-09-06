@@ -5080,6 +5080,56 @@ def test_non_mtp_cancellation_keeps_request_thread_mlx_cleanup(monkeypatch):
     assert "mlx_finalize_scope" not in state.last_metrics[-1]
 
 
+def test_dflash2_server_generation_disables_session_bank_export(monkeypatch):
+    state = _fake_streaming_session_state()
+    state.runtime.backend_id = "dflash2"
+    state.args.backend_id = "dflash2"
+    state.draft_sampler = None
+    state.requests_completed = 0
+    captured: dict[str, object] = {}
+
+    def fake_generate_mtpk(*_args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            tokens=[ord("O")],
+            text="O",
+            stats=SimpleNamespace(
+                to_dict=lambda: {
+                    "prompt_eval_time_s": 0.0,
+                    "generated_tokens": 1,
+                    "elapsed_s": 0.1,
+                    "tok_s": 10.0,
+                }
+            ),
+            final_state=None,
+        )
+
+    monkeypatch.setattr(openai, "generate_mtpk", fake_generate_mtpk)
+
+    openai._run_generation(
+        state,
+        [1, 2, 3],
+        max_tokens=1,
+        temperature=None,
+        top_p=None,
+        top_k=None,
+        seed=None,
+        generation_mode="mtp",
+        depth=5,
+        session_id="passive-session-id",
+        session_bank=state.sessions.bank,
+        session_template_hash=state.template_hash,
+        session_draft_head_identity=state.draft_head_identity,
+        session_policy_fingerprint="policy",
+        commit_final_state_to_bank=True,
+        commit_prompt_prefix_to_bank=True,
+    )
+
+    assert captured["session_bank"] is None
+    assert captured["capture_final_state"] is False
+    assert captured["commit_prompt_state_to_bank"] is False
+
+
 def test_tool_requests_enable_prompt_prefix_bank_commit(monkeypatch):
     state = _fake_streaming_session_state()
     state.draft_sampler = None

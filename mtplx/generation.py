@@ -6622,6 +6622,27 @@ def generate_ar(
     abort_check: Callable[[], bool] | None = None,
 ) -> GenerationOutput:
     reject_non_k1_a3b_whole_moe_request(rt, entrypoint="generate_ar")
+    if getattr(rt, "backend_id", None) == "dflash2":
+        from .backends.dflash2 import generate_dflash2_ar
+
+        return generate_dflash2_ar(
+            rt,
+            prompt_ids,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            seed=seed,
+            stop_token_ids=stop_token_ids,
+            token_callback=token_callback,
+            abort_check=abort_check,
+            constraint=constraint,
+            session_bank=session_bank,
+            session_id=session_id,
+            session_template_hash=session_template_hash,
+            session_draft_head_identity=session_draft_head_identity,
+            session_policy_fingerprint=session_policy_fingerprint,
+            capture_final_state=capture_final_state,
+            session_restore_mode=session_restore_mode,
+        )
     if getattr(rt, "backend_id", None) == "gemma4_assistant":
         if constraint is not None:
             raise ValueError(
@@ -8019,6 +8040,29 @@ def generate_mtpk(
     target cache snapshot and re-forwards only the committed prefix. This keeps
     the hybrid GDN/attention cache contract exact while we measure depth.
     """
+    if getattr(rt, "backend_id", None) == "dflash2":
+        from .backends.dflash2 import generate_dflash2
+
+        return generate_dflash2(
+            rt,
+            prompt_ids,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            seed=seed,
+            stop_token_ids=stop_token_ids,
+            token_callback=token_callback,
+            abort_check=abort_check,
+            constraint=constraint,
+            session_bank=session_bank,
+            session_id=session_id,
+            session_template_hash=session_template_hash,
+            session_draft_head_identity=session_draft_head_identity,
+            session_policy_fingerprint=session_policy_fingerprint,
+            capture_final_state=capture_final_state,
+            session_restore_mode=session_restore_mode,
+            commit_prompt_state_to_bank=commit_prompt_state_to_bank,
+            speculative_depth=speculative_depth,
+        )
     # FR-Spec legacy lane (2026-08-25): when the pruned draft head is swapped
     # in globally (MTPLX_FRSPEC_LEGACY), sampled draft ids are LOCAL rows of
     # the shortlist. They are remapped to full-vocab ids at the single draft

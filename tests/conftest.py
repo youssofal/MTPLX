@@ -47,6 +47,22 @@ def _hermetic_mtplx_state(monkeypatch, tmp_path_factory):
     # Tests that exercise the config writer set their own path; everyone
     # else writes into this scratch file.
     monkeypatch.setenv("MTPLX_OPENCODE_CONFIG", str(isolated / "opencode.json"))
+    # Same story for the user config: it resolves to ~/.mtplx/config.toml unless
+    # MTPLX_CONFIG points elsewhere, so whatever default model the developer last
+    # served silently changed tests that assert the built-in default. Observed
+    # 2026-09-06: two `test_public_cli.py` legacy-path tests failed on a machine
+    # whose config.toml named a Flash-Next pack, and passed under an empty HOME.
+    monkeypatch.setenv("MTPLX_CONFIG", str(isolated / "config.toml"))
+    # A CLI dispatch mutates the process environment: `apply_profile_env` writes a
+    # whole profile into os.environ (that is how the daemon child inherits it) and
+    # the one-shot paths never restore what it returned. `monkeypatch` only undoes
+    # what a test set through it, so the snapshot has to cover raw writes too —
+    # otherwise every later test in the session inherits knobs such as
+    # MTPLX_SKIP_VERIFY_SNAPSHOT and MTPLX_LAZY_TARGET_DISTRIBUTIONS.
+    saved_environment = os.environ.copy()
+    yield
+    os.environ.clear()
+    os.environ.update(saved_environment)
 
 
 @pytest.fixture

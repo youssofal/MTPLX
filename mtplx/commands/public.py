@@ -38,6 +38,12 @@ from mtplx.benchmarks.validators.basic import (
     validate_python_syntax,
 )
 from mtplx.constants import DEFAULT_RUNTIME_MODEL_DIR
+from mtplx.dflash2_bundle import (
+    DFLASH2_BACKEND as DFLASH2_BACKEND_ID,
+    DFLASH2_DEFAULT_SAMPLER as DFLASH2_SAMPLER_DEFAULTS,
+    DFLASH2_MANIFEST as DFLASH2_BUNDLE_MANIFEST,
+    resolve_dflash2_bundle_paths,
+)
 from mtplx.default_models import (
     OPTIMIZED_QUALITY_DESCRIPTION,
     DefaultModelUnavailable,
@@ -151,6 +157,90 @@ from mtplx.runtime_options import (
     paged_kv_quantization_env,
     resolve_api_key,
 )
+
+
+def _launcher_python() -> str:
+    """Return the configured Homebrew/runtime venv interpreter, if any."""
+    raw = str(os.environ.get("MTPLX_BREW_VENV") or "").strip()
+    if not raw:
+        return sys.executable
+    path = Path(raw).expanduser()
+    candidate = path / "bin" / "python" if path.is_dir() else path
+    return str(candidate) if candidate.exists() else sys.executable
+
+
+def _dflash2_descriptor() -> Any | None:
+    """Load the optional DFlash2 descriptor without making native MTP import it."""
+    for module_name in ("mtplx.backends.descriptors", "mtplx.backends.dflash2"):
+        try:
+            module = importlib.import_module(module_name)
+            descriptor = getattr(module, "DFLASH2_DESCRIPTOR", None)
+        except (ImportError, AttributeError):
+            continue
+        if descriptor is not None and getattr(descriptor, "backend_id", None) == DFLASH2_BACKEND_ID:
+            return descriptor
+    return None
+
+
+def _prepare_dflash2_args(args: Any) -> dict[str, Any] | None:
+    """Select DFlash2 or route an explicit AR request to its target model."""
+    requested = str(getattr(args, "backend_id", "") or "").strip().lower()
+    if requested in {"llama.cpp", "llama_cpp", "llamacpp"}:
+        raise ValueError("llama.cpp is not a supported MTPLX backend")
+    model_ref = str(getattr(args, "model", "") or "")
+    manifest_exists = bool(model_ref) and (
+        Path(model_ref).expanduser() / DFLASH2_BUNDLE_MANIFEST
+    ).is_file()
+    bundle = (
+        resolve_dflash2_bundle_paths(model_ref)
+        if requested == DFLASH2_BACKEND_ID or manifest_exists
+        else None
+    )
+    if (requested == DFLASH2_BACKEND_ID or manifest_exists) and bundle is None:
+        message = (
+            "--backend-id dflash2 requires a valid DFlash2 bundle"
+            if requested == DFLASH2_BACKEND_ID
+            else "invalid DFlash2 bundle; refusing native-MTP fallback"
+        )
+        raise ValueError(message)
+    if bundle is None:
+        return None
+    if requested and requested != DFLASH2_BACKEND_ID:
+        raise ValueError(f"DFlash2 bundle requires backend_id={DFLASH2_BACKEND_ID}")
+    args.dflash2_bundle = bundle
+    args.dflash2_target_model = bundle.get("target_model")
+    args.dflash2_draft_model = bundle.get("draft_model")
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    target_only = (
+        bool(getattr(args, "no_mtp", False))
+        or getattr(args, "load_mtp", True) is False
+        or str(getattr(args, "generation_mode", "mtp") or "mtp").lower() == "ar"
+    )
+    if target_only:
+        args.model = str(bundle["target_model"])
+        args.backend_id = "qwen3_next"
+        args.no_mtp = True
+        args.load_mtp = False
+        args.generation_mode = "ar"
+        return None
+    args.backend_id = DFLASH2_BACKEND_ID
+    injected = set(getattr(args, "_injected_default_flags", set()) or set())
+    for attr, value, flag in (
+        ("temperature", DFLASH2_SAMPLER_DEFAULTS["temperature"], "temperature"),
+        ("top_p", DFLASH2_SAMPLER_DEFAULTS["top_p"], "top-p"),
+        ("top_k", DFLASH2_SAMPLER_DEFAULTS["top_k"], "top-k"),
+    ):
+        if flag not in cli_flags and getattr(args, attr, None) in (None, 0.6, 0.95, 20):
+            setattr(args, attr, value)
+            injected.add(flag)
+    depth_explicit = "depth" in cli_flags or "draft-block-size" in cli_flags
+    if not depth_explicit:
+        args.depth = 5
+        args.draft_block_size = 5
+    elif "draft-block-size" not in cli_flags and getattr(args, "depth", None) is not None:
+        args.draft_block_size = int(args.depth)
+    args._injected_default_flags = injected
+    return bundle
 
 
 DEFAULT_CHAMPION = DEFAULT_MODEL_ID
@@ -688,6 +778,15 @@ def _looks_like_gemma4_model_ref(value: Any) -> bool:
 
 
 def _public_depth_ceiling(args: Any) -> int:
+    requested = str(getattr(args, "backend_id", "") or "").strip().lower()
+    model_ref = str(getattr(args, "model", "") or "")
+    manifest_exists = bool(model_ref) and (
+        Path(model_ref).expanduser() / DFLASH2_BUNDLE_MANIFEST
+    ).is_file()
+    if requested == DFLASH2_BACKEND_ID or manifest_exists:
+        descriptor = _dflash2_descriptor()
+        if descriptor is not None:
+            return int(descriptor.draft_semantics.maximum)
     refs = (getattr(args, "model", None), getattr(args, "model_id", None))
     if any(_looks_like_gemma4_model_ref(ref) for ref in refs):
         return MAX_GEMMA4_SPECULATIVE_DEPTH
@@ -1355,6 +1454,7 @@ def _gemma4_pair_draft_block_size(inspection: dict[str, Any]) -> int:
 
 
 def _apply_backend_serve_defaults(args: Any, inspection: dict[str, Any]) -> None:
+    dflash2_bundle = _prepare_dflash2_args(args)
     descriptor = descriptor_from_inspection(inspection)
     cli_flags = getattr(args, "_cli_flags", set()) or set()
     if _inspection_backend_id(inspection) == "qwen4_exp":
@@ -1553,6 +1653,29 @@ def _apply_backend_serve_defaults(args: Any, inspection: dict[str, Any]) -> None
         ):
             args.adaptive_policy = "none"
 
+    if dflash2_bundle is not None or getattr(args, "backend_id", None) == DFLASH2_BACKEND_ID:
+        cli_flags = getattr(args, "_cli_flags", set()) or set()
+        injected = set(getattr(args, "_injected_default_flags", set()) or set())
+        if "temperature" not in cli_flags:
+            args.temperature = DFLASH2_SAMPLER_DEFAULTS["temperature"]
+            injected.add("temperature")
+        if "top-p" not in cli_flags and "default-top-p" not in cli_flags:
+            args.top_p = DFLASH2_SAMPLER_DEFAULTS["top_p"]
+            injected.add("top-p")
+        if "top-k" not in cli_flags:
+            args.top_k = DFLASH2_SAMPLER_DEFAULTS["top_k"]
+            injected.add("top-k")
+        if "draft-temperature" not in cli_flags:
+            args.draft_temperature = DFLASH2_SAMPLER_DEFAULTS["temperature"]
+            injected.add("draft-temperature")
+        if "draft-top-p" not in cli_flags:
+            args.draft_top_p = DFLASH2_SAMPLER_DEFAULTS["top_p"]
+            injected.add("draft-top-p")
+        if "draft-top-k" not in cli_flags:
+            args.draft_top_k = DFLASH2_SAMPLER_DEFAULTS["top_k"]
+            injected.add("draft-top-k")
+        args._injected_default_flags = injected
+        return
     if not _inspection_is_gemma4_assistant(inspection):
         return
     sampler = _gemma4_pair_sampler(inspection)
@@ -8969,7 +9092,9 @@ def _serve_dry_run_payload(
         "chat_url": _chat_url(host, port),
         "fan_mode": str(getattr(args, "fan_mode", "default") or "default"),
         "generation_mode": str(generation_mode),
+        "backend_id": str(getattr(args, "backend_id", "") or "") or None,
         "depth": int(getattr(args, "depth", 3)),
+        "draft_block_size": getattr(args, "draft_block_size", None),
         "argv": argv,
         "server_command": shlex.join(argv),
         "env": _serve_dry_run_env_delta(env),
@@ -9522,6 +9647,16 @@ def cmd_serve_public(args: Any) -> int:
                 json_output=bool(getattr(args, "json", False)),
             )
             return 1
+    try:
+        dflash2_bundle = _prepare_dflash2_args(args)
+    except ValueError as exc:
+        _print_serve_start_line(f"error: {exc}")
+        return 2
+    if (
+        getattr(args, "dflash2_bundle", None) is not None
+        and str(getattr(args, "model", "")) != str(runtime_model)
+    ):
+        runtime_model = str(args.model)
     inspection, gate_exit = _model_gate(
         runtime_model,
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
@@ -9549,6 +9684,7 @@ def cmd_serve_public(args: Any) -> int:
     _apply_backend_serve_defaults(args, inspection)
     _apply_qwen36_35b_optimized_speed_defaults(args, model_id)
     backend_descriptor = descriptor_from_inspection(inspection)
+    backend_id = DFLASH2_BACKEND_ID if dflash2_bundle is not None else backend_descriptor.backend_id
     draft_lm_head = _model_draft_lm_head_spec(inspection, profile) or {
         "bits": 4,
         "group_size": 64,
@@ -9561,7 +9697,7 @@ def cmd_serve_public(args: Any) -> int:
     if not quiet_json:
         _print_serve_handoff(args, runtime_model, profile.name)
     cmd = [
-        sys.executable,
+        _launcher_python(),
         # -P (safe path, 3.11+): -m alone puts the CWD on sys.path, so
         # serving from any directory containing an mtplx/ package silently
         # swapped the daemon's runtime to that directory's code — measured
@@ -9574,7 +9710,7 @@ def cmd_serve_public(args: Any) -> int:
         "--model",
         runtime_model,
         "--backend-id",
-        backend_descriptor.backend_id,
+        backend_id,
         "--host",
         args.host,
         "--port",
@@ -9804,6 +9940,17 @@ def cmd_serve_public(args: Any) -> int:
         cmd.extend(["--launch-opencode", "--server-console"])
     if bool(getattr(args, "quickstart_swival", False)):
         cmd.append("--server-console")
+    if dflash2_bundle is not None:
+        cmd.extend(
+            [
+                "--dflash2-bundle",
+                str(dflash2_bundle.get("bundle_root") or args.model),
+                "--dflash2-draft-model",
+                str(dflash2_bundle.get("draft_model") or ""),
+                "--draft-block-size",
+                str(getattr(args, "draft_block_size", 5)),
+            ]
+        )
     if bool(getattr(args, "quickstart_hermes", False)):
         cmd.extend(["--launch-hermes", "--server-console"])
         hermes_launch_command = str(
@@ -10240,6 +10387,10 @@ def _generate_one_shot_public(
         prompt = _piped_prompt_text()
     if not prompt:
         raise SystemExit(f"mtplx {command} requires a prompt")
+    try:
+        _prepare_dflash2_args(args)
+    except ValueError as exc:
+        return 2, {"error": str(exc), "backend_id": DFLASH2_BACKEND_ID}, []
     depth_error = _validate_public_depth(args, printer=lambda _line: None)
     if depth_error is not None:
         depth_ceiling = _public_depth_ceiling(args)
@@ -12820,6 +12971,11 @@ def _quickstart_apply_local_model_defaults(
     model_path = Path(str(model)).expanduser()
     if not model_path.exists():
         return None
+    try:
+        _prepare_dflash2_args(args)
+    except ValueError as exc:
+        _quickstart_line(f"error: {exc}")
+        return {"compatibility": {"can_run": False, "message": str(exc)}}
     inspection, gate_exit = _model_gate(
         str(model_path),
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
@@ -12869,6 +13025,9 @@ def _with_server_policy_args(target: Any, source: Any) -> Any:
     # raw sampler VALUES (a config temperature equal to the 0.6 parser
     # default is indistinguishable from unset without the parsed file).
     setattr(target, "mtplx_config", getattr(source, "mtplx_config", None))
+    for attr in ("backend_id", "dflash2_bundle", "dflash2_target_model", "dflash2_draft_model"):
+        if hasattr(source, attr):
+            setattr(target, attr, getattr(source, attr))
     _with_batching_args(target, source)
     for attr, default in (
         # Retrieval models: quickstart builds its serve namespace field by
@@ -14127,6 +14286,12 @@ def cmd_quickstart_public(args: Any) -> int:
             "action": _start_command_name(args),
             "target": target,
             "model": model,
+            "backend_id": str(
+                getattr(args, "backend_id", "")
+                or _inspection_backend_id(dry_run_inspection or {})
+                or ""
+            )
+            or None,
             "cache_dir": cache_dir,
             # Display the profile the launch will actually resolve (per-model
             # turbo rewrite included) — the raw parser default here made the
