@@ -1560,3 +1560,5 @@
 "Your edits are kept while you use other tabs. Save them to apply, or revert to the saved values." = "يتم الاحتفاظ بتعديلاتك أثناء استخدامك لعلامات التبويب الأخرى. احفظها لتطبيقها، أو تراجع إلى القيم المحفوظة.";
 "Stall watchdog" = "مراقب التوقف";
 "Seconds a response may wait on a model that is making no progress before it is cancelled. 0 turns the watchdog off; long prompts and deep reasoning keep reporting progress and are never cut short by this." = "عدد الثواني التي قد تنتظرها الاستجابة نموذجًا لا يحرز تقدمًا قبل إلغائها. القيمة 0 تعطّل المراقب؛ المطالبات الطويلة والتفكير العميق يواصلان الإبلاغ عن التقدم ولا يُقطعان بسبب هذا أبدًا.";
+"Adaptive depth" = "عمق تكيّفي";
+"Stops a draft early when the next token is unlikely to be accepted. Off drafts to the full depth every cycle." = "يوقف المسودة مبكرًا عندما يكون قبول الرمز التالي غير مرجح. عند الإيقاف تُكتب المسودة بالعمق الكامل في كل دورة.";

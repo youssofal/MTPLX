@@ -332,6 +332,12 @@ public struct MutableSettings: Codable, Equatable, Sendable {
     public var reasoning: String?
     public var reasoningEffort: String?
     public var prefillChunkTokens: Int?
+    /// `none` or a policy name (`expected_value`). Live-mutable like
+    /// `depth`; the daemon builds its depth policy per request.
+    public var adaptivePolicy: String?
+    /// False for a family that owns its own draft policy; the app hides
+    /// the Adaptive depth toggle then.
+    public var adaptiveDepthSupported: Bool?
 
     public init(
         generationMode: String? = nil,
@@ -357,7 +363,9 @@ public struct MutableSettings: Codable, Equatable, Sendable {
         reasoningParser: String? = nil,
         reasoning: String? = nil,
         reasoningEffort: String? = nil,
-        prefillChunkTokens: Int? = nil
+        prefillChunkTokens: Int? = nil,
+        adaptivePolicy: String? = nil,
+        adaptiveDepthSupported: Bool? = nil
     ) {
         self.generationMode = generationMode
         self.depth = depth
@@ -383,6 +391,8 @@ public struct MutableSettings: Codable, Equatable, Sendable {
         self.reasoning = reasoning
         self.reasoningEffort = reasoningEffort
         self.prefillChunkTokens = prefillChunkTokens
+        self.adaptivePolicy = adaptivePolicy
+        self.adaptiveDepthSupported = adaptiveDepthSupported
     }
 
     enum CodingKeys: String, CodingKey {
@@ -410,6 +420,8 @@ public struct MutableSettings: Codable, Equatable, Sendable {
         case reasoning
         case reasoningEffort = "reasoning_effort"
         case prefillChunkTokens = "prefill_chunk_tokens"
+        case adaptivePolicy = "adaptive_policy"
+        case adaptiveDepthSupported = "adaptive_depth_supported"
     }
 }
 

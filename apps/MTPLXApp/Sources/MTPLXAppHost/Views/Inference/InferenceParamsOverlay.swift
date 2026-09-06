@@ -119,6 +119,7 @@ struct InferenceParamsOverlay: View, Equatable {
     @State private var topK: Int = 20
     @State private var presencePenalty: Double = 0
     @State private var depth: Int = 3
+    @State private var adaptiveDepth: Bool = true
 
     // Reasoning draft — live-mutable. "auto" lets the daemon decide per
     // turn, "on" always reasons, "off" suppresses reasoning entirely.
@@ -894,7 +895,52 @@ struct InferenceParamsOverlay: View, Equatable {
                     .foregroundStyle(Brand.warning)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if adaptiveDepthSupported {
+                adaptiveDepthRow
+            }
         }
+    }
+
+    /// Hidden for a family that owns its own draft policy (the daemon
+    /// says so); before the daemon answers, the depth-style control is
+    /// the tell.
+    private var adaptiveDepthSupported: Bool {
+        compatibleSettings?.adaptiveDepthSupported ?? (draftControl?.requestField == "depth")
+    }
+
+    /// Sits under the depth slider because it qualifies that slider: on,
+    /// the engine may stop a draft short of the chosen depth when the next
+    /// token is unlikely to be accepted; off, every cycle drafts to the
+    /// full depth. Live like depth itself, persisted so a relaunch boots
+    /// the daemon with the same policy.
+    @ViewBuilder
+    private var adaptiveDepthRow: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(tr("Adaptive depth"))
+                    .font(.system(size: 12))
+                    .foregroundStyle(Brand.typeBody)
+                Text(tr("Stops a draft early when the next token is unlikely to be accepted. Off drafts to the full depth every cycle."))
+                    .font(.caption2)
+                    .foregroundStyle(Brand.typeTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 12)
+            Toggle("", isOn: Binding(
+                get: { adaptiveDepth },
+                set: { isOn in
+                    guard isOn != adaptiveDepth else { return }
+                    Haptics.tick(.levelChange)
+                    adaptiveDepth = isOn
+                    commitAdaptiveDepth()
+                }
+            ))
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .controlHoverLift(motionEnabled: motionEnabled)
+            .disabled(!draftControlSupported || depth <= 0)
+        }
+        .padding(.top, 6)
     }
 
     @ViewBuilder
@@ -1249,6 +1295,18 @@ struct InferenceParamsOverlay: View, Equatable {
         }
     }
 
+    /// Adaptive depth is live (the daemon builds its depth policy per
+    /// request) and persisted, so the next launch passes the same policy.
+    private func commitAdaptiveDepth() {
+        var config = backend.configuration
+        config.adaptiveDepth = adaptiveDepth
+        try? backend.saveSettings(config)
+        let live = currentLiveSettingsDraft()
+        Task {
+            try? await backend.updateLiveSettings(live)
+        }
+    }
+
     private func commitReasoning() {
         let draft = currentLiveSettingsDraft()
         Task {
@@ -1297,6 +1355,16 @@ struct InferenceParamsOverlay: View, Equatable {
             }
         } else {
             draft.depth = min(depthMax, max(depthMin, depth))
+        }
+        if adaptiveDepthSupported {
+            // Turning it on restores the engine default unless the daemon
+            // already runs another named policy (a CLI-launched daemon).
+            let current = compatibleSettings?.adaptivePolicy ?? "expected_value"
+            draft.adaptivePolicy = adaptiveDepth
+                ? (current == "none" ? "expected_value" : current)
+                : "none"
+        } else {
+            draft.adaptivePolicy = nil
         }
         if reasoningSupported {
             draft.reasoning = reasoningMode
@@ -1399,6 +1467,8 @@ struct InferenceParamsOverlay: View, Equatable {
         } else {
             depth = min(depthMax, max(draftLabelBase, settings?.depth ?? liveDepth ?? tunedDraftValue ?? depthDefault))
         }
+        adaptiveDepth = (settings?.adaptivePolicy).map { $0 != "none" }
+            ?? snapshot.configuration.adaptiveDepth
         reasoningMode = normalizedReasoningMode(
             settings?.reasoning
                 ?? compatibleConfigurationReasoning

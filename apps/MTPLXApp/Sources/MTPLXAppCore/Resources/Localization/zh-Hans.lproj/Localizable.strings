@@ -1560,3 +1560,5 @@
 "Your edits are kept while you use other tabs. Save them to apply, or revert to the saved values." = "你切换到其他标签页时，编辑内容会保留。保存以应用更改，或还原为已保存的值。";
 "Stall watchdog" = "停滞看门狗";
 "Seconds a response may wait on a model that is making no progress before it is cancelled. 0 turns the watchdog off; long prompts and deep reasoning keep reporting progress and are never cut short by this." = "响应在等待无进展的模型多少秒后被取消。0 表示关闭看门狗；长提示和深度推理会持续报告进展，绝不会因此被中断。";
+"Adaptive depth" = "自适应深度";
+"Stops a draft early when the next token is unlikely to be accepted. Off drafts to the full depth every cycle." = "当下一个 token 不太可能被接受时提前停止草稿。关闭后每个周期都草拟到完整深度。";

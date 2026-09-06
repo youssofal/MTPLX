@@ -1629,6 +1629,35 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertFalse(configuration.pinFansAtMaxOnStart)
     }
 
+    func testAppConfigurationAdaptiveDepthDefaultsOnAndRoundTrips() throws {
+        XCTAssertTrue(MTPLXAppConfiguration().adaptiveDepth)
+        let legacy = try JSONDecoder().decode(MTPLXAppConfiguration.self, from: Data("{}".utf8))
+        XCTAssertTrue(legacy.adaptiveDepth)
+        var configuration = MTPLXAppConfiguration()
+        configuration.adaptiveDepth = false
+        let decoded = try JSONDecoder().decode(
+            MTPLXAppConfiguration.self, from: JSONEncoder().encode(configuration))
+        XCTAssertFalse(decoded.adaptiveDepth)
+    }
+
+    func testCommandBuilderPassesExplicitNoneWhenAdaptiveDepthIsOff() throws {
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: [
+            "PATH": fake.deletingLastPathComponent().path,
+            "MTPLX_APP_TEST_PHYSICAL_MEMORY_BYTES": "137438953472",
+        ])
+        var configuration = MTPLXAppConfiguration(
+            executablePath: fake.path, model: "/models/qwen", profile: "sustained")
+        configuration.adaptiveDepth = false
+        let command = try builder.buildServeCommand(
+            configuration: configuration, target: .hermes, launchID: "hermes-launch")
+        // The engine injects expected_value for every family that supports
+        // the policy, so off must be an explicit flag.
+        XCTAssertTrue(command.arguments.containsInOrder(["--adaptive-policy", "none"]))
+        XCTAssertFalse(command.arguments.contains("--adaptive-min-depth"))
+        XCTAssertFalse(command.arguments.contains("--adaptive-ev-base-depth"))
+    }
+
     func testAppConfigurationMigratesLegacyPinnedFansToMax() throws {
         let configuration = try JSONDecoder().decode(
             MTPLXAppConfiguration.self,

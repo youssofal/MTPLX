@@ -1677,6 +1677,7 @@ class MTPLXSettingsUpdate(BaseModel):
     draft_temperature: float | None = None
     draft_top_p: float | None = None
     draft_top_k: int | None = None
+    adaptive_policy: str | None = None
 
 
 class FanModeRequest(BaseModel):
@@ -16200,6 +16201,7 @@ DASHBOARD_MUTABLE_SETTINGS_KEYS: tuple[str, ...] = (
     "draft_temperature",
     "draft_top_p",
     "draft_top_k",
+    "adaptive_policy",
 )
 DASHBOARD_READ_ONLY_SETTINGS_KEYS: tuple[str, ...] = (
     # Every informational key the settings GET echoes must be listed here so
@@ -16234,6 +16236,7 @@ DASHBOARD_READ_ONLY_SETTINGS_KEYS: tuple[str, ...] = (
     "tool_contract_policy_version",
     "tool_prompt_mode",
     "tune_policy",
+    "adaptive_depth_supported",
 )
 DASHBOARD_RESTART_REQUIRED_KEYS: tuple[str, ...] = (
     "profile",
@@ -16696,6 +16699,13 @@ def _coerce_setting(name: str, value: Any) -> Any:
         if name == "draft_top_k" and coerced < 0:
             raise ValueError("draft_top_k must be non-negative")
         return coerced
+    if name == "adaptive_policy":
+        text = str(value).strip().lower()
+        if text not in {"none", "streak", "expected_value", "cost"}:
+            raise ValueError(
+                "adaptive_policy must be one of none, streak, expected_value, cost"
+            )
+        return text
     if name == "generation_mode":
         text = str(value).strip().lower()
         if text not in {"mtp", "ar"}:
@@ -16819,6 +16829,18 @@ def _mtplx_apply_settings_payload(
                             "for the loaded model"
                         ),
                     )
+            if (
+                key == "adaptive_policy"
+                and value != "none"
+                and not backend.supports("native_adaptive_depth_policy")
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"{backend.backend_id} owns its draft policy; "
+                        "adaptive_policy must be 'none' for the loaded model"
+                    ),
+                )
             if (
                 key == "generation_mode"
                 and value == "mtp"
@@ -17023,6 +17045,12 @@ def _mtplx_current_settings(state: "ServerState") -> dict[str, Any]:
         "generation_mode": str(getattr(args, "generation_mode", "mtp") or "mtp"),
         "depth": int(getattr(args, "depth", 3) or 3),
         "depth_max": int(backend.draft_semantics.maximum),
+        # Live-mutable like depth: the daemon builds its depth policy per
+        # request from state.args, so the app's Adaptive depth toggle needs
+        # no restart. A family that owns its own draft policy reports
+        # unsupported and the toggle stays hidden.
+        "adaptive_policy": str(getattr(args, "adaptive_policy", "none") or "none"),
+        "adaptive_depth_supported": bool(backend.supports("native_adaptive_depth_policy")),
         "draft_control": backend.draft_semantics.to_dict(),
         "backend_id": backend.backend_id,
         "architecture_id": backend.architecture_id,

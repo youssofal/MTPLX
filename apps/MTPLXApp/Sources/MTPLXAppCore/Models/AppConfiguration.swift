@@ -211,6 +211,13 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
     /// the daemon as `--stream-stall-deadline-s`, because a LaunchServices
     /// app never sees a shell `export`.
     public var streamStallDeadlineSeconds: Double
+    /// Settings › Draft depth › Adaptive depth. On (the default) lets the
+    /// engine stop a draft early when the next token is unlikely to be
+    /// accepted; off drafts to the slider's depth every cycle. Applied
+    /// live through `/v1/mtplx/settings` and passed at launch as an
+    /// explicit `--adaptive-policy none`, because the engine injects
+    /// `expected_value` for every family that supports the policy.
+    public var adaptiveDepth: Bool
     public var ramSessionCachePolicy: String
     public var ramSessionBlockPrefixRestore: Bool
     public var ramSessionCacheMaxEntries: Int
@@ -371,6 +378,7 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         retrievalMaxResident: Int = 2,
         retrievalIdleTimeout: Double = 0,
         streamStallDeadlineSeconds: Double = MTPLXAppConfiguration.defaultStreamStallDeadlineSeconds,
+        adaptiveDepth: Bool = true,
         ramSessionCachePolicy: String = "target-default",
         ramSessionBlockPrefixRestore: Bool = true,
         ramSessionCacheMaxEntries: Int = 8,
@@ -443,6 +451,7 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         self.retrievalMaxResident = retrievalMaxResident
         self.retrievalIdleTimeout = retrievalIdleTimeout
         self.streamStallDeadlineSeconds = max(0, streamStallDeadlineSeconds)
+        self.adaptiveDepth = adaptiveDepth
         self.ramSessionCachePolicy = ramSessionCachePolicy
         self.ramSessionBlockPrefixRestore = ramSessionBlockPrefixRestore
         self.ramSessionCacheMaxEntries = ramSessionCacheMaxEntries
@@ -664,6 +673,7 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         case retrievalMaxResident = "retrieval_max_resident"
         case retrievalIdleTimeout = "retrieval_idle_timeout"
         case streamStallDeadlineSeconds = "stream_stall_deadline_s"
+        case adaptiveDepth = "adaptive_depth"
         case ramSessionCachePolicy = "ram_session_cache_policy"
         case ramSessionBlockPrefixRestore = "ram_session_block_prefix_restore"
         case ramSessionCacheMaxEntries = "ram_session_cache_max_entries"
@@ -761,6 +771,7 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         streamStallDeadlineSeconds = max(
             0, field(Double.self, .streamStallDeadlineSeconds) ?? defaults.streamStallDeadlineSeconds
         )
+        adaptiveDepth = field(Bool.self, .adaptiveDepth) ?? defaults.adaptiveDepth
         ramSessionCachePolicy = field(String.self, .ramSessionCachePolicy) ?? defaults.ramSessionCachePolicy
         ramSessionBlockPrefixRestore = field(Bool.self, .ramSessionBlockPrefixRestore) ?? defaults.ramSessionBlockPrefixRestore
         ramSessionCacheMaxEntries = field(Int.self, .ramSessionCacheMaxEntries) ?? defaults.ramSessionCacheMaxEntries

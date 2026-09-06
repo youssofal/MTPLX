@@ -1038,3 +1038,22 @@ def test_rolling_metrics_per_session_map_is_lru_bounded():
     # Most-recent sessions survive; the oldest were evicted.
     assert "session-199" in per_session
     assert "session-0" not in per_session
+
+
+def test_settings_post_toggles_adaptive_depth_policy_live():
+    state = _fake_state()
+    client = TestClient(create_app(state))
+    supported = client.get("/v1/mtplx/settings").json()["adaptive_depth_supported"]
+    off = client.post("/v1/mtplx/settings", json={"adaptive_policy": "none"})
+    assert off.status_code == 200
+    assert off.json()["adaptive_policy"] == "none"
+    assert state.args.adaptive_policy == "none"
+    on = client.post("/v1/mtplx/settings", json={"adaptive_policy": "expected_value"})
+    if supported:
+        assert on.status_code == 200
+        assert state.args.adaptive_policy == "expected_value"
+        assert on.json()["adaptive_policy"] == "expected_value"
+    else:
+        assert on.status_code == 400
+        assert state.args.adaptive_policy == "none"
+    assert client.post("/v1/mtplx/settings", json={"adaptive_policy": "always"}).status_code == 400

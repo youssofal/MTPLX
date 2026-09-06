@@ -381,6 +381,11 @@ public struct MTPLXCommandBuilder: Sendable {
         if let reasoningEffort = resolved.reasoningEffort {
             arguments.append(contentsOf: ["--reasoning-effort", reasoningEffort])
         }
+        if !configuration.adaptiveDepth {
+            // The engine injects expected_value for every family that
+            // supports the policy, so "off" has to be said explicitly.
+            arguments.append(contentsOf: ["--adaptive-policy", "none"])
+        }
         if let adaptivePolicy = resolved.adaptivePolicy, adaptivePolicy != "none" {
             arguments.append(contentsOf: ["--adaptive-policy", adaptivePolicy])
             if let adaptiveMinDepth = resolved.adaptiveMinDepth {
@@ -983,7 +988,7 @@ struct ResolvedDaemonArgs {
             : preset.draftTopK
         toolPromptMode = preset.toolPromptMode
         chatTemplateProfile = preset.chatTemplateProfile
-        adaptivePolicy = preset.adaptivePolicy
+        adaptivePolicy = configuration.adaptiveDepth ? preset.adaptivePolicy : "none"
         adaptiveMinDepth = preset.adaptiveMinDepth
         adaptiveEVBaseDepth = preset.adaptiveEVBaseDepth
         adaptiveEVWarmupFullDepthCycles = preset.adaptiveEVWarmupFullDepthCycles
