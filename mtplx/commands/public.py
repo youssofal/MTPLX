@@ -10466,8 +10466,8 @@ def _generate_one_shot_public(
                     mtp_hidden_variant="post_norm",
                     mtp_cache_policy="persistent",
                     mtp_history_policy="committed",
-                    verify_strategy="capture_commit",
-                    verify_core="linear-gdn-from-conv-tape",
+                    verify_strategy=getattr(args, "verify_strategy", None) or "capture_commit",
+                    verify_core=getattr(args, "verify_core", None) or "linear-gdn-from-conv-tape",
                 )
         finally:
             if smart_fans is not None and smart_request_id is not None:
@@ -11372,8 +11372,8 @@ def _quickstart_generate(
                 mtp_hidden_variant="post_norm",
                 mtp_cache_policy="persistent",
                 mtp_history_policy="committed",
-                verify_strategy="capture_commit",
-                verify_core="linear-gdn-from-conv-tape",
+                verify_strategy=getattr(args, "verify_strategy", None) or "capture_commit",
+                verify_core=getattr(args, "verify_core", None) or "linear-gdn-from-conv-tape",
                 token_callback=record_tokens,
             )
     finally:

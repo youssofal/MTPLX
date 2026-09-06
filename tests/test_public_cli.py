@@ -2096,6 +2096,7 @@ def test_depth_sweep_native60_keeps_model_runtime_env_overrides(monkeypatch):
 
 def test_one_shot_max_uses_verified_max_session(monkeypatch):
     calls: list[str] = []
+    monkeypatch.setattr(os, "environ", dict(os.environ))
 
     class FakeMaxSession:
         def __init__(self, **_kwargs):
@@ -2116,21 +2117,31 @@ def test_one_shot_max_uses_verified_max_session(monkeypatch):
     fake_schema.PromptCase = lambda **kw: SimpleNamespace(**kw)
     fake_schema.encode_prompt_case = lambda *a, **kw: [1, 2, 3]
     fake_generation = ModuleType("mtplx.generation")
-    fake_generation.generate_mtpk = lambda *a, **kw: SimpleNamespace(
-        text="ok",
-        tokens=[1],
-        stats=SimpleNamespace(
-            generated_tokens=1, tok_s=1.0, verify_time_s=0.0, verify_calls=0
-        ),
-    )
+
+    def generate(*_a, **kwargs):
+        assert kwargs["verify_strategy"] == "batched"
+        assert kwargs["verify_core"] == "stock"
+        return SimpleNamespace(
+            text="ok", tokens=[1],
+            stats=SimpleNamespace(
+                generated_tokens=1, tok_s=1.0, verify_time_s=0.0, verify_calls=0
+            ),
+        )
+
+    fake_generation.generate_mtpk = generate
     fake_generation.generate_ar = fake_generation.generate_mtpk
     fake_sampling = ModuleType("mtplx.sampling")
     fake_sampling.SamplerConfig = lambda **kw: SimpleNamespace(**kw)
+    fake_server = ModuleType("mtplx.server.openai")
+    fake_server.load_runtime_contract = lambda *_a: (None, None)
+    fake_server._server_runtime_env_overrides = lambda _args, overrides: overrides
+    fake_server.apply_memory_caps_preflight = lambda **_kw: {}
 
     monkeypatch.setitem(sys.modules, "mtplx.runtime", fake_runtime)
     monkeypatch.setitem(sys.modules, "mtplx.benchmarks.schema", fake_schema)
     monkeypatch.setitem(sys.modules, "mtplx.generation", fake_generation)
     monkeypatch.setitem(sys.modules, "mtplx.sampling", fake_sampling)
+    monkeypatch.setitem(sys.modules, "mtplx.server.openai", fake_server)
     monkeypatch.setattr("mtplx.thermal.MaxSession", FakeMaxSession)
     monkeypatch.setattr(
         public,
@@ -2160,6 +2171,8 @@ def test_one_shot_max_uses_verified_max_session(monkeypatch):
         depth=3,
         seed=0,
         expect_python=False,
+        verify_strategy="batched",
+        verify_core="stock",
     )
 
     code, payload, _validations = public._generate_one_shot_public(args, command="run")
@@ -3008,8 +3021,9 @@ def test_quickstart_incremental_decoder_streams_word_boundaries():
     assert decoder.finish() == "world"
 
 
+@pytest.mark.parametrize("verify_strategy", [None, "batched"])
 def test_quickstart_generation_default_uses_remaining_model_context(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, verify_strategy
 ):
     captured: dict[str, int] = {}
 
@@ -3024,6 +3038,7 @@ def test_quickstart_generation_default_uses_remaining_model_context(
 
     def fake_generate_mtpk(*_args, **kwargs):
         captured["max_tokens"] = kwargs["max_tokens"]
+        captured["verify_strategy"] = kwargs["verify_strategy"]
         return SimpleNamespace(
             text="ok",
             stats=SimpleNamespace(
@@ -3064,6 +3079,7 @@ def test_quickstart_generation_default_uses_remaining_model_context(
             top_k=20,
             depth=3,
             seed=0,
+            verify_strategy=verify_strategy,
         ),
         prompt="hello",
         history=[],
@@ -3071,6 +3087,7 @@ def test_quickstart_generation_default_uses_remaining_model_context(
     )
 
     assert captured["max_tokens"] == 88
+    assert captured["verify_strategy"] == (verify_strategy or "capture_commit")
     assert captured["enable_thinking"] is True
     assert payload["stats"]["max_tokens"] == 88
     assert payload["stats"]["remaining_context_tokens"] == 88
