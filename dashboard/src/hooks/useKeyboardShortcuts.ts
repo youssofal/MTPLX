@@ -9,6 +9,7 @@ const TAB_ORDER: TabId[] = [
   "memory",
   "thermal",
   "requests",
+  "native",
   "settings",
 ];
 
