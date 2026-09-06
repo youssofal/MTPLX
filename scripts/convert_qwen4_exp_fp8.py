@@ -163,11 +163,15 @@ class SourceReader:
         if dtype == "F8_E4M3":
             w = mx.array(fp8_e4m3_lut()[np.ascontiguousarray(arr)])
             scale_name = name.replace(".weight", ".weight_scale_inv")
+            if scale_name not in self.weight_map and ".ngram_embedding.shard_" in name:
+                scale_name = name.split(".ngram_embedding.shard_", 1)[0] + ".ngram_embedding.weight_scale"
             s_arr, s_dtype = self.raw(scale_name)
             scale = mx.array(np.ascontiguousarray(s_arr))
             if s_dtype in ("BF16", "F16"):
                 scale = scale.view(mx.bfloat16 if s_dtype == "BF16" else mx.float16)
             scale = scale.astype(mx.float32)
+            if tuple(scale.shape) == (1,):
+                return (w * scale).astype(mx.bfloat16)
             R, C = w.shape
             br, bc = scale.shape
             scale = mx.repeat(mx.repeat(scale, 128, axis=0)[:R], 128, axis=1)[:, :C]
@@ -438,6 +442,9 @@ def main():
             if (i + 1) % 16 == 0:
                 print(f"[ngram] {i + 1}/{len(shard_names)}", flush=True)
         ng.close()
+        global_scale_name = ple_prefix + ".ple_embedding.ngram_embedding.weight_scale"
+        if global_scale_name in reader.weight_map:
+            accounted[global_scale_name] = "ngram-scale"
 
     # ---- 2. numbered experts -> stacked switch_mlp (trunk + mtp) ------------
     expert_re = re.compile(r"^(.*)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
