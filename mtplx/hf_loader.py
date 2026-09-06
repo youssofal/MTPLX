@@ -1121,6 +1121,144 @@ def _download_repo_file(
     )
 
 
+def _resolve_download_backend(requested: str) -> tuple[str, str | None]:
+    backend = requested.strip().lower()
+    if backend not in {"auto", "python", "aria2"}:
+        raise ValueError(
+            "download backend must be one of: auto, python, aria2"
+        )
+    aria2c = shutil.which("aria2c")
+    if backend == "python":
+        return "python", None
+    if aria2c:
+        return "aria2", aria2c
+    if backend == "aria2":
+        raise RuntimeError(
+            "aria2 download backend requested, but aria2c is not installed. "
+            "Install it with `brew install aria2` or use --download-backend python."
+        )
+    return "python", None
+
+
+def _download_repo_files_with_aria2(
+    repo_files: list[RepoFile],
+    *,
+    executable: str,
+    repo_id: str,
+    revision: str | None,
+    destination: Path,
+    hf_hub_url: Callable[..., str],
+    build_hf_headers: Callable[..., dict[str, str]],
+    token: str | bool | None,
+    callback: DownloadProgressCallback | None,
+    total_bytes: int | None,
+    started_at: float,
+    progress_interval_s: float,
+    last_emit_at: float,
+    last_emit_size: int,
+) -> tuple[float, int]:
+    from mtplx.aria2_downloader import Aria2Download, run_aria2_downloads
+
+    headers = tuple(
+        f"{name}: {value}" for name, value in build_hf_headers(token=token).items()
+    )
+    downloads: list[Aria2Download] = []
+    settled_bytes = 0
+    for repo_file in repo_files:
+        target = _safe_destination_for_repo_file(destination, repo_file)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        expected_size = repo_file.size_bytes
+        if expected_size is not None and target.exists() and target.stat().st_size == expected_size:
+            settled_bytes += expected_size
+            continue
+        if expected_size is None and target.exists() and target.stat().st_size > 0:
+            settled_bytes += target.stat().st_size
+            continue
+
+        partial = target.with_name(target.name + ".incomplete")
+        if target.exists():
+            target.unlink()
+        if (
+            expected_size is not None
+            and partial.exists()
+            and partial.stat().st_size > expected_size
+        ):
+            partial.unlink()
+        downloads.append(
+            Aria2Download(
+                url=hf_hub_url(
+                    repo_id=repo_id,
+                    filename=repo_file.path,
+                    revision=revision,
+                ),
+                output=partial,
+                headers=headers,
+                expected_size=expected_size,
+                sha256=repo_file.sha256,
+                display_name=repo_file.path,
+            )
+        )
+
+    def report(completed: int, rate_bps: float, file_path: str | None) -> None:
+        nonlocal last_emit_at, last_emit_size
+        now = time.monotonic()
+        current_size = settled_bytes + completed
+        interval = max(0.001, now - last_emit_at)
+        reported_size = min(current_size, total_bytes) if total_bytes else current_size
+        _emit_download_progress(
+            callback,
+            {
+                "event": "progress",
+                "repo_id": repo_id,
+                "path": str(destination),
+                "file": file_path,
+                "size_bytes": reported_size,
+                "total_bytes": total_bytes,
+                "delta_bytes": current_size - last_emit_size,
+                "rate_bps": max(0.0, rate_bps),
+                "elapsed_s": now - started_at,
+                "interval_s": interval,
+                "stalled_s": 0,
+                "message": "Downloading model files with aria2c",
+            },
+        )
+        last_emit_at = now
+        last_emit_size = current_size
+
+    run_aria2_downloads(
+        downloads,
+        executable=executable,
+        progress_callback=report if callback is not None else None,
+        progress_interval_s=progress_interval_s,
+    )
+    for download in downloads:
+        partial = download.output
+        if not partial.is_file():
+            raise RuntimeError(
+                f"aria2c did not produce a completed file for {download.display_name}"
+            )
+        if (
+            download.expected_size is not None
+            and partial.stat().st_size != download.expected_size
+        ):
+            raise RuntimeError(
+                f"incomplete download for {download.display_name}: expected "
+                f"{download.expected_size} bytes, got {partial.stat().st_size}"
+            )
+        target = partial.with_name(partial.name.removesuffix(".incomplete"))
+        partial.replace(target)
+    return _emit_current_download_size(
+        callback,
+        repo_id=repo_id,
+        destination=destination,
+        total_bytes=total_bytes,
+        started_at=started_at,
+        last_emit_at=last_emit_at,
+        last_emit_size=last_emit_size,
+        measure=lambda: manifest_bytes_on_disk(destination, repo_files),
+    )
+
+
 def _download_snapshot_with_structured_progress(
     *,
     repo_id: str,
@@ -1128,6 +1266,8 @@ def _download_snapshot_with_structured_progress(
     destination: Path,
     progress_callback: DownloadProgressCallback | None,
     progress_interval_s: float,
+    download_backend: str = "python",
+    aria2c_path: str | None = None,
 ) -> tuple[Path, int | None]:
     HfApi, hf_hub_url, get_session, build_hf_headers, hf_raise_for_status = _hub_runtime()
     try:
@@ -1173,6 +1313,30 @@ def _download_snapshot_with_structured_progress(
     started_at = time.monotonic()
     last_emit_at = started_at
     last_emit_size = measure()
+    if download_backend == "aria2":
+        if not aria2c_path:
+            raise RuntimeError("aria2 download backend has no aria2c executable")
+        try:
+            _download_repo_files_with_aria2(
+                repo_files,
+                executable=aria2c_path,
+                repo_id=repo_id,
+                revision=revision,
+                destination=destination,
+                hf_hub_url=hf_hub_url,
+                build_hf_headers=build_hf_headers,
+                token=token,
+                callback=progress_callback,
+                total_bytes=total_bytes,
+                started_at=started_at,
+                progress_interval_s=max(0.1, progress_interval_s),
+                last_emit_at=last_emit_at,
+                last_emit_size=last_emit_size,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise RuntimeError(_classify_pull_error(exc, repo_id)) from exc
+        return destination, total_bytes
+
     for repo_file in repo_files:
         try:
             last_emit_at, last_emit_size = _download_repo_file(
@@ -1295,6 +1459,7 @@ def pull_model(
     progress_interval_s: float = 10.0,
     force_sync: bool = False,
     destination: Path | None = None,
+    download_backend: str = "python",
 ) -> dict[str, Any]:
     repo_id = repo_id_from_model_ref(model_ref)
     if repo_id is None:
@@ -1381,6 +1546,7 @@ def pull_model(
         )
     else:
         reused_existing = False
+        selected_backend, aria2c_path = _resolve_download_backend(download_backend)
         # Pin the whole download to one resolved commit so every file comes
         # from the same snapshot even if the repo is pushed to mid-download.
         _resolve_remote_snapshot()
@@ -1442,13 +1608,15 @@ def pull_model(
             else contextlib.nullcontext()
         )
         with progress_suppression:
-            if progress_callback is not None:
+            if progress_callback is not None or selected_backend == "aria2":
                 resolved, total_bytes_from_download = _download_snapshot_with_structured_progress(
                     repo_id=repo_id,
                     revision=download_revision,
                     destination=destination,
                     progress_callback=progress_callback,
                     progress_interval_s=progress_interval_s,
+                    download_backend=selected_backend,
+                    aria2c_path=aria2c_path,
                 )
                 if total_bytes_from_download:
                     total_bytes = total_bytes_from_download
