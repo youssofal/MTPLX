@@ -120,3 +120,42 @@ def test_interactive_cli_applies_family_contract_before_loading(tmp_path, monkey
         public._quickstart_run_terminal_chat_body(
             SimpleNamespace(profile="turbo", load_mtp=True, generation_mode="mtp",
                             verify_strategy="batched"), runtime_model=model, inspection={})
+
+
+@pytest.mark.parametrize("raw", ["Check the types.</think>\n\nanswer", "<think>Check the types.</think>\n\nanswer"])
+def test_terminal_followup_stores_reasoning_in_its_own_channel(monkeypatch, raw):
+    """The actual REPL must not feed generated thinking back as answer text."""
+    import sys
+    from types import ModuleType, SimpleNamespace
+    from mtplx.commands import public
+
+    runtime = ModuleType("mtplx.runtime")
+    runtime.load = lambda *_a, **_kw: SimpleNamespace(tokenizer=object())
+    server = ModuleType("mtplx.server.openai")
+    server.apply_memory_caps_preflight = lambda **_kw: None
+    monkeypatch.setitem(sys.modules, "mtplx.runtime", runtime)
+    monkeypatch.setitem(sys.modules, "mtplx.server.openai", server)
+    monkeypatch.setattr(public, "apply_profile_env", lambda *_a, **_kw: None)
+    monkeypatch.setattr(public, "_in_process_runtime_env_overrides", lambda *_a, **_kw: {})
+    monkeypatch.setattr(public, "_model_draft_lm_head_spec", lambda *_a: None)
+    monkeypatch.setattr(public, "_model_draft_sampler_spec", lambda *_a: None)
+    monkeypatch.setattr(public, "_enable_chat_line_editing", lambda: None)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    prompts = iter(["first", "follow-up", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda *_a: next(prompts))
+    histories = []
+
+    def generate(**kwargs):
+        histories.append([dict(m) for m in kwargs["history"]])
+        return {"text": raw, "streamed": True, "validations": [], "stats": {}}
+
+    monkeypatch.setattr(public, "_quickstart_generate", generate)
+    args = SimpleNamespace(profile="stable", load_mtp=False, reasoning="on", show_stats=False)
+    assert public._quickstart_run_terminal_chat_body(
+        args, runtime_model="Qwen3.8-Flash-Next-MTPLX-Optimized-Speed", inspection={}
+    ) == 0
+    assert histories == [[], [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "answer", "reasoning_content": "Check the types."},
+    ]]

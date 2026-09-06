@@ -7,6 +7,8 @@ All notable user-facing changes to MTPLX. The format is based on
 ## [2.11.2] - 2026-09-05
 
 - Complete interactive CLI family setup, matching one-shot and server paths.
+- Keep terminal-chat reasoning in its own history field so follow-ups do not
+  receive duplicate thinking delimiters.
 - Inherit root Hermes terminal settings when a profile has no explicit backend.
 - Recover from optional native-wheel selector failure using the bundled pure wheel.
 - Correct proposal-cycle accounting and distinguish measured MTP throughput from

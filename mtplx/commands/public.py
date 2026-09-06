@@ -13633,6 +13633,9 @@ def _quickstart_run_terminal_chat_body(
         args, _public_model_id_for_args(args, str(runtime_model))
     )
     profile = get_profile(_resolved_default_profile_name(args))
+    reasoning_codec = reasoning_policy_for_model(
+        model_ref=runtime_model, inspection=inspection
+    )
     generation_mode = _generation_mode_from_args(args)
     apply_profile_env(
         profile.name,
@@ -13782,8 +13785,22 @@ def _quickstart_run_terminal_chat_body(
             _quickstart_line()
             _print_stats_line(_quickstart_stats_line(payload))
         if record_history:
+            from mtplx.reasoning_codecs import split_reasoning_text
+
+            # Generation starts inside the template's thinking block. Store
+            # its two channels separately, as the server does: feeding raw
+            # `thought</think>answer` back as content nests it after an empty
+            # thinking block in Qwen 3.8 and corrupts the next turn's history.
+            parts = split_reasoning_text(
+                text,
+                parser=reasoning_codec.parser,
+                thinking_enabled=_reasoning_mode(args) != "off",
+            )
+            assistant = {"role": "assistant", "content": parts.content}
+            if parts.reasoning:
+                assistant["reasoning_content"] = parts.reasoning
             history.append({"role": "user", "content": prompt})
-            history.append({"role": "assistant", "content": text})
+            history.append(assistant)
         failures = [row for row in payload["validations"] if not row.get("passed")]
         if failures and quality_gate:
             _quickstart_line(
