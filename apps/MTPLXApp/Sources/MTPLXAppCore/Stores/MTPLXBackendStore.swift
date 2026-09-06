@@ -119,6 +119,23 @@ public enum BenchmarkDaemonReadinessError: Error, Equatable, LocalizedError {
     }
 }
 
+public enum CachedModelRemovalError: Error, Equatable, LocalizedError {
+    case selectedModel
+    case transferInProgress
+    case outsideManagedCache
+
+    public var errorDescription: String? {
+        switch self {
+        case .selectedModel:
+            return "Switch to another model before removing this download."
+        case .transferInProgress:
+            return "Wait for the current model download or update to finish."
+        case .outsideManagedCache:
+            return "This model is outside the MTPLX download cache and was left untouched."
+        }
+    }
+}
+
 public struct ClientHandoffNotice: Equatable, Sendable {
     public let target: LaunchTarget
     public let status: String
@@ -504,6 +521,46 @@ public final class MTPLXBackendStore: ObservableObject {
         seedLiveSettingsFromConfiguration(next)
         supervisor.setAutomaticRestartEnabled(next.automaticDaemonRestart)
         try settingsStore.save(next)
+    }
+
+    /// Return a removable CLI reference only for app-managed cache entries.
+    /// User-selected folders and Forge output outside the cache are never
+    /// exposed through the destructive model-picker action.
+    public func cachedModelReference(forInstalledPath path: String) -> String? {
+        modelDownloader.cachedModelReference(forInstalledPath: path)
+    }
+
+    public func removeCachedModel(
+        repoID: String,
+        installedPath: String
+    ) async throws -> CachedModelRemovalResult {
+        guard let cachedReference = cachedModelReference(forInstalledPath: installedPath),
+              cachedReference.caseInsensitiveCompare(repoID) == .orderedSame
+        else {
+            throw CachedModelRemovalError.outsideManagedCache
+        }
+        guard !isModelDownloading, modelPackUpdatingRepoID == nil else {
+            throw CachedModelRemovalError.transferInProgress
+        }
+
+        let expandedSelected = (configuration.model as NSString).expandingTildeInPath
+        let expandedInstalled = (installedPath as NSString).expandingTildeInPath
+        let selectedOption = downloadableModelOption(for: repoID)
+        guard expandedSelected != expandedInstalled,
+              configuration.model.caseInsensitiveCompare(repoID) != .orderedSame,
+              selectedOption?.matches(configuration.model) != true
+        else {
+            throw CachedModelRemovalError.selectedModel
+        }
+
+        let result = try await modelDownloader.removeCachedModel(repo: repoID)
+        modelUpdates.removeAll {
+            $0.repoID.caseInsensitiveCompare(repoID) == .orderedSame
+        }
+        if modelPackUpdateNeedsRestart?.repoID.caseInsensitiveCompare(repoID) == .orderedSame {
+            modelPackUpdateNeedsRestart = nil
+        }
+        return result
     }
 
     /// Commit a Performance mode pick straight to settings.json.

@@ -37,6 +37,20 @@ public enum DownloadEvent: Sendable {
     case cancelled
 }
 
+public struct CachedModelRemovalResult: Codable, Equatable, Sendable {
+    public let repoID: String
+    public let path: String
+    public let removed: Bool
+    public let sizeBytesRemoved: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case repoID = "repo_id"
+        case path
+        case removed
+        case sizeBytesRemoved = "size_bytes_removed"
+    }
+}
+
 // MARK: - ModelDownloader
 //
 // Shells out to `mtplx pull <repo> --progress-json` and consumes the
@@ -427,6 +441,23 @@ public struct ModelDownloader: Sendable {
         return root.appendingPathComponent(safeName, isDirectory: true)
     }
 
+    /// Return the CLI model reference for a direct child of the configured
+    /// MTPLX cache. Paths outside that cache are user-managed local models
+    /// and must never receive the app's destructive removal affordance.
+    public func cachedModelReference(forInstalledPath path: String) -> String? {
+        let root = (modelCacheRoot ?? Self.defaultCacheRoot(env: processEnvironment))
+            .standardizedFileURL
+        let candidate = URL(fileURLWithPath: path).standardizedFileURL
+        guard candidate.deletingLastPathComponent().path == root.path else { return nil }
+        let safeName = candidate.lastPathComponent
+        guard !safeName.isEmpty, !safeName.hasPrefix(".") else { return nil }
+        if let attributes = try? FileManager.default.attributesOfItem(atPath: candidate.path),
+           attributes[.type] as? FileAttributeType == .typeSymbolicLink {
+            return nil
+        }
+        return safeName.replacingOccurrences(of: "--", with: "/")
+    }
+
     public static func defaultCacheRoot(env: [String: String]) -> URL {
         if let override = env["MTPLX_MODEL_DIR"], !override.isEmpty {
             return URL(fileURLWithPath: (override as NSString).expandingTildeInPath)
@@ -514,6 +545,74 @@ public struct ModelDownloader: Sendable {
             )
         }
         return try JSONDecoder().decode(ModelUpdateCheckPayload.self, from: stdout).models
+    }
+
+    static func removalArguments(repo: String, cacheRoot: URL?) -> [String] {
+        var arguments = ["remove", repo, "--missing-ok", "--json"]
+        if let cacheRoot {
+            arguments += ["--cache-dir", cacheRoot.path]
+        }
+        return arguments
+    }
+
+    /// Delete one direct child of the MTPLX model cache through the public
+    /// CLI contract. The caller owns confirmation and selected-model guards.
+    public func removeCachedModel(
+        repo: String,
+        timeoutSeconds: TimeInterval = 120
+    ) async throws -> CachedModelRemovalResult {
+        let executable = try resolveMtplxExecutable { _ in }
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = Self.removalArguments(repo: repo, cacheRoot: modelCacheRoot)
+        var env = processEnvironment
+        env["PATH"] = MTPLXCommandBuilder.expandedPATH(environment: processEnvironment)
+        process.environment = MTPLXCommandBuilder.pythonBytecodeSafeEnvironment(
+            environment: env
+        )
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+        try process.run()
+        let watchdog = Task.detached(priority: .utility) {
+            try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
+            if process.isRunning {
+                process.terminate()
+            }
+        }
+        defer { watchdog.cancel() }
+        let stdout = await Task.detached(priority: .utility) { () -> Data in
+            let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            return data
+        }.value
+        guard process.terminationStatus == 0 else {
+            let stderr = errPipe.fileHandleForReading.readDataToEndOfFile()
+            let tail = String(decoding: stderr.suffix(1024), as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            throw NSError(
+                domain: "ModelDownloader",
+                code: Int(process.terminationStatus),
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        tail.isEmpty
+                            ? "model removal exited \(process.terminationStatus)"
+                            : tail
+                ]
+            )
+        }
+        do {
+            return try JSONDecoder().decode(CachedModelRemovalResult.self, from: stdout)
+        } catch {
+            throw NSError(
+                domain: "ModelDownloader",
+                code: 2,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "MTPLX returned an invalid model-removal response"
+                ]
+            )
+        }
     }
 
     private func resolveMtplxExecutable(

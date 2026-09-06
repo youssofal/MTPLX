@@ -974,6 +974,34 @@ def test_remove_cli_refuses_traversal_even_with_yes(tmp_path: Path, capsys):
     assert (model / "weights.bin").read_bytes() == b"1234"
 
 
+def test_remove_cached_model_unlinks_symlink_without_deleting_target(tmp_path: Path):
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "weights.safetensors").write_bytes(b"weights")
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    link = cache / "mtplx--example"
+    link.symlink_to(external, target_is_directory=True)
+
+    removed = remove_cached_model("mtplx/example", cache_dir=cache)
+
+    assert removed["removed"] is True
+    assert removed["size_bytes_removed"] == 0
+    assert not link.exists()
+    assert not link.is_symlink()
+    assert (external / "weights.safetensors").read_bytes() == b"weights"
+
+
+def test_remove_cached_model_refuses_non_directory_cache_entry(tmp_path: Path):
+    entry = tmp_path / "mtplx--example"
+    entry.write_text("not a model directory", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not a directory"):
+        remove_cached_model("mtplx/example", cache_dir=tmp_path)
+
+    assert entry.read_text(encoding="utf-8") == "not a model directory"
+
+
 def test_hf_cache_report_is_no_network(tmp_path: Path, monkeypatch):
     monkeypatch.delenv("HF_TOKEN", raising=False)
     monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)

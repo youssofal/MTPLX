@@ -67,6 +67,8 @@ struct ModelPickerOverlay: View, Equatable {
     @State private var verdictInput: String = ""
     @State private var customProbe: OtherModelProbe? = nil
     @State private var checkingCustomRepo: Bool = false
+    @State private var removalCandidate: ModelRemovalCandidate?
+    @State private var removingModelID: String?
     @State private var preparedRows: [ModelPickerPreparedOption] = []
     @State private var preparedRowsSignature: ModelPickerCatalogSignature?
     @State private var prepareRowsTask: Task<Void, Never>?
@@ -120,6 +122,16 @@ struct ModelPickerOverlay: View, Equatable {
             // updates; the store throttles to one network check per 6 h.
             guard presented else { return }
             await backend.refreshModelUpdates()
+        }
+        .alert(item: $removalCandidate) { candidate in
+            Alert(
+                title: Text("Remove \(candidate.displayName)?"),
+                message: Text(removalConfirmationMessage(candidate)),
+                primaryButton: .destructive(Text("Remove")) {
+                    removeCachedModel(candidate)
+                },
+                secondaryButton: .cancel()
+            )
         }
     }
 
@@ -305,18 +317,72 @@ struct ModelPickerOverlay: View, Equatable {
 
     @ViewBuilder
     private func modelRow(_ row: ModelPickerPreparedOption, visible: Bool) -> some View {
+        let removalReference = row.installedPath.flatMap {
+            backend.cachedModelReference(forInstalledPath: $0)
+        }
         ModelRowView(
             displayName: row.displayName,
             detail: row.detail,
             isInstalled: row.isInstalled,
             selected: row.selected,
             applying: applyingModelID == row.id,
+            removing: removingModelID == row.id,
             restartRequired: restartRequired,
-            disabled: applyingModelID != nil || checkingCustomRepo || isTransitioning,
+            disabled: applyingModelID != nil
+                || removingModelID != nil
+                || checkingCustomRepo
+                || isTransitioning,
             visible: visible,
             motionEnabled: motionEnabled,
-            action: { select(row) }
+            action: { select(row) },
+            removalAction: (!row.selected && removalReference != nil) ? {
+                guard let installedPath = row.installedPath,
+                      let removalReference
+                else { return }
+                removalCandidate = ModelRemovalCandidate(
+                    modelID: row.id,
+                    repoID: removalReference,
+                    displayName: row.displayName,
+                    installedPath: installedPath,
+                    approximateSizeBytes: row.option.sizeBytes
+                )
+            } : nil
         )
+    }
+
+    private func removalConfirmationMessage(_ candidate: ModelRemovalCandidate) -> String {
+        var lines = ["Deletes the downloaded files at \(candidate.installedPath)."]
+        if candidate.approximateSizeBytes > 0 {
+            let formatter = ByteCountFormatter()
+            formatter.countStyle = .file
+            let size = formatter.string(fromByteCount: candidate.approximateSizeBytes)
+            lines.append("This should free about \(size).")
+        }
+        lines.append("This cannot be undone.")
+        return lines.joined(separator: "\n\n")
+    }
+
+    private func removeCachedModel(_ candidate: ModelRemovalCandidate) {
+        guard removingModelID == nil, applyingModelID == nil, !isTransitioning else { return }
+        removingModelID = candidate.modelID
+        errorMessage = nil
+        Task {
+            do {
+                _ = try await backend.removeCachedModel(
+                    repoID: candidate.repoID,
+                    installedPath: candidate.installedPath
+                )
+                await MainActor.run {
+                    removingModelID = nil
+                    preparePickerRows()
+                }
+            } catch {
+                await MainActor.run {
+                    removingModelID = nil
+                    errorMessage = error.localizedDescription
+                }
+            }
+        }
     }
 
     @ViewBuilder
@@ -854,6 +920,7 @@ private struct ModelPickerPreparedOption: Equatable, Identifiable, Sendable {
     let isInstalled: Bool
     let selected: Bool
     let resolvedReference: String
+    let installedPath: String?
 
     init(option: MTPLXModelOption, currentModel: String) {
         let installedLocalPath = option.installedLocalPath
@@ -863,6 +930,7 @@ private struct ModelPickerPreparedOption: Equatable, Identifiable, Sendable {
         self.displayName = option.displayName
         self.detail = option.detail
         self.isInstalled = installedLocalPath != nil
+        self.installedPath = installedLocalPath
         self.resolvedReference = installedLocalPath ?? option.hfModelID
         self.selected = Self.matches(
             option: option,
@@ -903,6 +971,16 @@ private struct ModelPickerPreparedOption: Equatable, Identifiable, Sendable {
     }
 }
 
+private struct ModelRemovalCandidate: Identifiable {
+    let modelID: String
+    let repoID: String
+    let displayName: String
+    let installedPath: String
+    let approximateSizeBytes: Int64
+
+    var id: String { modelID }
+}
+
 // MARK: - ModelRowView
 //
 // One row in the model picker. Owns its own hover state so the picker
@@ -925,54 +1003,81 @@ private struct ModelRowView: View {
     let isInstalled: Bool
     let selected: Bool
     let applying: Bool
+    let removing: Bool
     let restartRequired: Bool
     let disabled: Bool
     let visible: Bool
     let motionEnabled: Bool
     let action: () -> Void
+    let removalAction: (() -> Void)?
 
     @State private var hovering = false
 
     var body: some View {
-        Button(action: action) {
-            HStack(alignment: .center, spacing: 12) {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(alignment: .firstTextBaseline, spacing: 9) {
-                        Text(displayName)
-                            .font(.system(size: 13, weight: .semibold, design: .rounded))
-                            .foregroundStyle(selected ? Brand.typeHi : Brand.typeBody)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                        statusBadge
+        HStack(alignment: .center, spacing: 8) {
+            Button(action: action) {
+                HStack(alignment: .center, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(alignment: .firstTextBaseline, spacing: 9) {
+                            Text(displayName)
+                                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                                .foregroundStyle(selected ? Brand.typeHi : Brand.typeBody)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                            statusBadge
+                        }
+                        Text(detail)
+                            .font(.caption2)
+                            .foregroundStyle(Brand.typeTertiary)
+                            .lineLimit(2)
                     }
-                    Text(detail)
-                        .font(.caption2)
-                        .foregroundStyle(Brand.typeTertiary)
-                        .lineLimit(2)
+                    Spacer(minLength: 10)
+                    if removalAction == nil {
+                        trailingIcon
+                    }
                 }
-                Spacer(minLength: 10)
-                trailingIcon
+                .contentShape(Rectangle())
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 11)
-            .contentShape(Rectangle())
-            // Two flat full-width fills stacked: hover sits on top of
-            // the selection tint so a hovered selected row reads as
-            // selected + lifted. No `RoundedRectangle` here — the
-            // popover's `.clipShape` rounds these stripes at the top
-            // and bottom of the list automatically.
-            .background {
-                ZStack {
-                    if selected {
-                        Brand.accentChrome.opacity(0.10)
+            .buttonStyle(.plain)
+            if let removalAction {
+                Button(action: removalAction) {
+                    Group {
+                        if applying || removing {
+                            ProgressView()
+                                .controlSize(.small)
+                                .scaleEffect(0.76)
+                        } else {
+                            Image(systemName: "trash")
+                                .font(.system(size: 12, weight: .semibold))
+                                .symbolRenderingMode(.monochrome)
+                        }
                     }
-                    if hovering {
-                        Brand.wash.opacity(0.05)
-                    }
+                    .foregroundStyle(Brand.danger)
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Remove downloaded files")
+                .accessibilityLabel("Remove \(displayName) download")
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
+        .contentShape(Rectangle())
+        // Two flat full-width fills stacked: hover sits on top of
+        // the selection tint so a hovered selected row reads as
+        // selected + lifted. No rounded inner card is introduced.
+        .background {
+            ZStack {
+                if selected {
+                    Brand.accentChrome.opacity(0.10)
+                }
+                if hovering {
+                    Brand.wash.opacity(0.05)
                 }
             }
         }
-        .buttonStyle(.plain)
         .disabled(disabled)
         .opacity(visible ? 1 : 0)
         .offset(y: visible ? 0 : 8)

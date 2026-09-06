@@ -121,6 +121,7 @@ mtplx serve --port 8000    # API server only
 mtplx stop                 # stop the running server cleanly
 mtplx pull <hf-repo>       # download a model safely
 mtplx models               # what is cached, sizes, validation
+mtplx remove <hf-repo>     # delete one cached model and its downloaded files
 mtplx inspect <model>      # compatibility report before anything runs
 mtplx tune --retune        # measure AR vs D1/D2/D3 on your Mac
 mtplx forge --help         # build, verify, and publish MTP models (probe/build/publish/verify subcommands)

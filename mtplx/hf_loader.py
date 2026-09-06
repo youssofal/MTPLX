@@ -1555,9 +1555,12 @@ def resolve_cached_model_target(
     """
 
     repo_id = repo_id_from_model_ref(model_ref) or model_ref.replace("--", "/")
-    root = model_cache_dir(cache_dir).resolve()
-    path = cached_model_path(repo_id, cache_dir=cache_dir).resolve()
-    if path.parent != root or path.name in {"", ".", ".."}:
+    root = model_cache_dir(cache_dir).expanduser().resolve()
+    path = cached_model_path(repo_id, cache_dir=root)
+    # Validate the lexical direct child without resolving the final path:
+    # resolving it would follow a cached-model symlink into user-managed
+    # storage, and removal must unlink that symlink rather than its target.
+    if path.parent.resolve() != root or path.name in {"", ".", ".."}:
         raise ValueError(
             f"refusing to remove {path}: model ref {model_ref!r} does not name "
             f"a model directory inside {root}"
@@ -1567,10 +1570,17 @@ def resolve_cached_model_target(
 
 def remove_cached_model(model_ref: str, *, cache_dir: str | Path | None = None) -> dict[str, Any]:
     repo_id, path = resolve_cached_model_target(model_ref, cache_dir=cache_dir)
-    existed = path.exists()
-    size = directory_size_bytes(path) if existed else 0
+    existed = path.exists() or path.is_symlink()
+    # Unlinking a cache symlink does not free its target's bytes, so do not
+    # report the external directory size as reclaimed storage.
+    size = directory_size_bytes(path) if existed and not path.is_symlink() else 0
     if existed:
-        shutil.rmtree(path)
+        if path.is_symlink():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path)
+        else:
+            raise ValueError(f"cached model entry is not a directory: {path}")
     return {
         "repo_id": repo_id,
         "path": str(path),
