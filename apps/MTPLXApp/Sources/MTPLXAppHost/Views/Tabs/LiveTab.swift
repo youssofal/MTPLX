@@ -144,7 +144,12 @@ struct LiveTab: View {
         case .running: break
         }
 
-        if let prefill = currentPrefill(), prefill.isActive {
+        if let prefill = currentPrefill(), prefill.isActive,
+           HeroPrefillGate.showsPrefill(
+               prefill: prefill,
+               promptTokens: currentPrefillRequest?.promptTokens,
+               sessionPrefixLen: currentPrefillSessionPrefixLen
+           ) {
             return .prefill(
                 progress: prefill.progress,
                 // Sanity-filter the rate so the gauge never shows
@@ -176,6 +181,20 @@ struct LiveTab: View {
             || backend.inFlight.contains { $0.hasDecodeProgress }
         let decode = hasRealDecode ? (backend.headlineDecode.value ?? 0) : 0
         return .tps(decode: decode, max: 100)
+    }
+
+    /// The in-flight request that owns the active prefill, for the gate's
+    /// prompt size and session identity.
+    private var currentPrefillRequest: InFlightRequest? {
+        backend.inFlight.first(where: { $0.prefillState?.isActive == true }) ?? backend.inFlight.first
+    }
+
+    /// What the resolved session already holds, so a tool turn's
+    /// `started` frame (fired before the restore runs) is not read as a
+    /// full re-prefill.
+    private var currentPrefillSessionPrefixLen: Int? {
+        guard let sessionId = currentPrefillRequest?.sessionId else { return nil }
+        return backend.sessions?.sessions.first(where: { $0.sessionId == sessionId })?.prefixLen
     }
 
     private func loadingPhase() -> LoadingPhase {

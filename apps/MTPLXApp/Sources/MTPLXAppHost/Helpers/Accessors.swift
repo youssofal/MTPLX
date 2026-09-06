@@ -306,6 +306,12 @@ extension PrefillState {
 
     var isActive: Bool { phase == "started" || phase == "chunk" }
 
+    /// Uncached prompt work this prefill has to do: the server's figure,
+    /// or total minus cached for a frame that omits it.
+    var newWorkTokens: Int {
+        newPrefillTokens ?? max(0, tokensTotal - (cachedTokens ?? 0))
+    }
+
     private func longContextAdjustedETA(
         elapsed: Double,
         done: Int,
@@ -417,5 +423,42 @@ extension DaemonState {
         case .crashed(let status?): tr("exit %@", String(status))
         default: nil
         }
+    }
+}
+
+// MARK: - Hero gauge prefill gate
+
+/// Decides when the hero gauge morphs to its prefill face.
+///
+/// Every prefill fires a `started` frame before the restore has run, so that
+/// frame reports the whole prompt as new work, and an agent's tool turns then
+/// re-prefill a few hundred cached-suffix tokens in well under a second. The
+/// dial used to morph prefill ↔ decode for each of them, faster than its
+/// 0.55 s morph could settle, and nothing on it could be read (Hermes tool
+/// loops, 2026-09-06). The gate keeps the decode face, which holds the last
+/// decode reading exactly as it does between requests, unless the prefill is
+/// expected to do at least `minimumNewTokens` of work: the frame's own
+/// new-token count once a chunk or the completion has reported it, and before
+/// that the prompt minus the resolved session's known prefix. A cold prompt, a
+/// file read or an edited history still shows as prefill from its first frame.
+/// No timer, no hold: a morph either happens at once or not at all.
+enum HeroPrefillGate {
+    /// About a second of prompt processing on an M5 Max, a few seconds on an
+    /// M1; short enough that a real prompt never hides, long enough that a
+    /// tool-result suffix never flickers.
+    static let minimumNewTokens = 1024
+
+    static func newWorkTokens(prefill: PrefillState, promptTokens: Int?, sessionPrefixLen: Int?) -> Int {
+        if prefill.phase != "started" { return prefill.newWorkTokens }
+        if let promptTokens, let sessionPrefixLen, sessionPrefixLen <= promptTokens {
+            return promptTokens - sessionPrefixLen
+        }
+        return prefill.newWorkTokens
+    }
+
+    static func showsPrefill(prefill: PrefillState, promptTokens: Int?, sessionPrefixLen: Int?) -> Bool {
+        prefill.isActive
+            && newWorkTokens(prefill: prefill, promptTokens: promptTokens, sessionPrefixLen: sessionPrefixLen)
+                >= minimumNewTokens
     }
 }

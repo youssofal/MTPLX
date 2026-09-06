@@ -27,4 +27,25 @@ final class PrefillDisplayTests: XCTestCase {
         XCTAssertEqual(summary.peakTokS, 2048)
         XCTAssertEqual(Format.tps(summary.averageTokS), "1536")
     }
+
+    func testHeroGaugeKeepsDecodeFaceForShortSuffixPrefills() throws {
+        // A Hermes tool turn: the started frame claims the whole prompt before
+        // the restore runs; the session's known prefix says 625 tokens are new.
+        let started = PrefillState(phase: "started", tokensDone: 0, tokensTotal: 15953,
+            cachedTokens: 0, newPrefillTokens: 15953)
+        XCTAssertFalse(HeroPrefillGate.showsPrefill(prefill: started, promptTokens: 15953, sessionPrefixLen: 15328))
+        // The same frame for a cold prompt, or for an 8,715-token file read, morphs at once.
+        XCTAssertTrue(HeroPrefillGate.showsPrefill(prefill: started, promptTokens: 15953, sessionPrefixLen: nil))
+        XCTAssertTrue(HeroPrefillGate.showsPrefill(prefill: started, promptTokens: 24752, sessionPrefixLen: 16037))
+        // An edited history shorter than the session's prefix is unknown work: shown.
+        XCTAssertTrue(HeroPrefillGate.showsPrefill(prefill: started, promptTokens: 9000, sessionPrefixLen: 15328))
+        // Once a chunk or the completion reports the real split, the frame decides.
+        var chunk = PrefillState(phase: "chunk", tokensDone: 35857, tokensTotal: 35857,
+            cachedTokens: 35600, newPrefillTokens: 257)
+        XCTAssertFalse(HeroPrefillGate.showsPrefill(prefill: chunk, promptTokens: 35857, sessionPrefixLen: nil))
+        chunk.newPrefillTokens = nil
+        XCTAssertEqual(HeroPrefillGate.newWorkTokens(prefill: chunk, promptTokens: nil, sessionPrefixLen: nil), 257)
+        chunk.phase = "completed"
+        XCTAssertFalse(HeroPrefillGate.showsPrefill(prefill: chunk, promptTokens: 35857, sessionPrefixLen: nil))
+    }
 }
