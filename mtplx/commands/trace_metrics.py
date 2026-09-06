@@ -16,23 +16,14 @@ def _number(value: Any) -> float | None:
 
 
 def mtp_economics(receipt: dict, ar_tok_s: float | None = None) -> dict:
-    """Compare actual delivered tokens / full decode time with a matched AR run.
+    """Compare delivered throughput with a supplied, matched AR measurement.
 
-    Acceptance here is UNCONDITIONAL: accepted draft tokens over all proposed
-    draft tokens. Conditional per-position acceptance (p1, p1*p2, ...) is a
-    different quantity and must not be confused with it.
-
-    The on/off law. Let r be the cost of one MTP cycle in AR-step units
-    (cycle wall / AR step wall) and D the drafts proposed per cycle; a cycle
-    delivers 1 + D*q tokens at acceptance q, so MTP pays exactly when
-
-        q > (r - 1) / D            (break-even acceptance)
-
-    r comes from this receipt's measured cycle (decode_elapsed_s /
-    verify_calls) against the matched AR rate the caller supplies; D is the
-    receipt's mean drafts per cycle, so the law holds for fixed and adaptive
-    depth alike. Nothing here estimates an AR baseline: without ar_tok_s the
-    speedup and the threshold stay None.
+    A proposal cycle is counted by the first draft position, not verifier
+    forwards (which also include copy/bonus work). With G delivered tokens,
+    A accepted drafts, P proposals and full decode time T, the observed
+    speedup is G / (T * ar_tok_s). The conditional threshold is
+    (T * ar_tok_s - (G - A)) / P: hold full cost, non-draft output and the
+    depth mix fixed. It does not predict how cost changes with acceptance.
     """
     tokens = _number(receipt.get("completion_tokens"))
     elapsed = _number(receipt.get("decode_elapsed_s"))
@@ -44,13 +35,15 @@ def mtp_economics(receipt: dict, ar_tok_s: float | None = None) -> dict:
     verify = _number(receipt.get("verify_time_s"))
     draft = _number(receipt.get("draft_time_s"))
     acceptance = accepted / proposed if proposed else None
-    drafts_per_cycle = proposed / rounds if proposed and rounds else None
+    cycles = _number(drafted[0]) if drafted else None
+    non_draft = tokens - accepted if tokens is not None else None
+    drafts_per_cycle = proposed / cycles if proposed and cycles else None
     result: dict[str, Any] = {
         "acceptance_definition": "accepted draft tokens / all proposed draft tokens",
         "acceptance": acceptance,
         "drafts_per_cycle": drafts_per_cycle,
         "fixed_depth": bool(
-            rounds and drafted and all(float(n) == rounds for n in drafted)
+            cycles and drafted and all(float(n) == cycles for n in drafted)
         ),
         "tokens_per_verify": tokens / rounds if tokens and rounds else None,
         "decode_ms_per_token": 1000 * elapsed / tokens if elapsed and tokens else None,
@@ -60,11 +53,21 @@ def mtp_economics(receipt: dict, ar_tok_s: float | None = None) -> dict:
         "draft_ms_per_round": (
             1000 * draft / rounds if draft is not None and rounds else None
         ),
-        "cycle_ms": 1000 * elapsed / rounds if elapsed and rounds else None,
+        "proposal_cycles": cycles,
+        "tokens_per_cycle": tokens / cycles if tokens and cycles else None,
+        "non_draft_tokens_per_cycle": (
+            non_draft / cycles if non_draft is not None and non_draft >= 0 and cycles else None
+        ),
+        "cycle_ms": 1000 * elapsed / cycles if elapsed and cycles else None,
         "ar_tok_s": ar_tok_s,
         "cycle_cost_ar_steps": None,
         "speedup_vs_ar": None,
         "break_even_acceptance": None,
+        "break_even_basis": None,
+        "break_even_assumption": (
+            "Holds full cost, non-draft output and the proposal depth mix constant; "
+            "an estimate, not a measurement at lower acceptance."
+        ),
         "acceptance_margin": None,
         "mtp_pays": None,
         "status": "matched_ar_measurement_required",
@@ -77,22 +80,21 @@ def mtp_economics(receipt: dict, ar_tok_s: float | None = None) -> dict:
     if ar and tokens and elapsed:
         result["speedup_vs_ar"] = (tokens / elapsed) / ar
         result["status"] = "measured_comparison_requires_matched_workload"
-        if rounds:
-            result["cycle_cost_ar_steps"] = elapsed / rounds * ar
-        if (
-            drafts_per_cycle
-            and rounds
-            and not receipt.get("context_copy_accepted_tokens")
-        ):
-            # Do not clamp: >1 means even perfect acceptance cannot amortize
-            # this observed cycle cost; <0 means the cycle is already cheaper
-            # than an AR step. A copy route delivers tokens outside the draft
-            # ledger, so its receipt has no single acceptance threshold.
-            break_even = (elapsed / rounds * ar - 1) / drafts_per_cycle
+        if cycles:
+            result["cycle_cost_ar_steps"] = elapsed / cycles * ar
+            result["mtp_pays"] = bool(result["speedup_vs_ar"] > 1)
+        if proposed and non_draft is not None and non_draft >= 0 and accepted <= proposed:
+            # Keep >1 and <0 values meaningful; never mistake the number of
+            # extra verifier calls for extra primary output tokens.
+            break_even = (elapsed * ar - non_draft) / proposed
             result["break_even_acceptance"] = break_even
-            if acceptance is not None:
-                result["acceptance_margin"] = acceptance - break_even
-                result["mtp_pays"] = bool(acceptance > break_even)
+            depth_basis = "fixed_depth" if result["fixed_depth"] else "observed_depth_mix"
+            result["break_even_basis"] = depth_basis + (
+                "_with_observed_copy_mix"
+                if receipt.get("context_copy_rounds") or receipt.get("context_copy_accepted_tokens")
+                else "_with_observed_non_draft_output"
+            )
+            result["acceptance_margin"] = acceptance - break_even
     return result
 
 

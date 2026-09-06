@@ -838,9 +838,13 @@ public struct HermesIntegration: Sendable {
         // not own (memory/providers/delegation/…), so the template is merged
         // over the existing file instead: app-owned keys are rewritten, all
         // other content is preserved byte-for-byte.
-        let existingConfigText = try? String(contentsOf: configURL, encoding: .utf8)
+        let rootConfigURL = hermesHome.appendingPathComponent("config.yaml")
+        let existingConfigText = FileManager.default.fileExists(atPath: configURL.path)
+            ? try String(contentsOf: configURL, encoding: .utf8) : nil
+        let rootConfigText = FileManager.default.fileExists(atPath: rootConfigURL.path)
+            ? try String(contentsOf: rootConfigURL, encoding: .utf8) : nil
         let configText = Self.mergedConfigYAML(
-            existing: existingConfigText,
+            existing: Self.inheritTerminalConfig(existing: existingConfigText, root: rootConfigText),
             template: Self.configYAML(
                 modelID: modelID,
                 baseURL: baseURL,
@@ -1546,6 +1550,26 @@ public struct HermesIntegration: Sendable {
     /// The child-key scan assumes the template's own two-space indentation,
     /// which is what the app has always written; user files started from our
     /// template keep that shape.
+    /// Inherit the root execution policy only when the profile has no backend.
+    /// Provider credentials and other root sections stay outside this profile.
+    static func inheritTerminalConfig(existing: String?, root: String?) -> String? {
+        guard let root else { return existing }
+        if let terminal = parseTopLevelBlocks(existing ?? "").blocks.first(where: { $0.keyName == "terminal" }),
+           directChildBlocks(of: terminal).contains(where: { $0.key == "backend" }) {
+            return existing
+        }
+        guard let terminal = parseTopLevelBlocks(root).blocks.first(where: { $0.keyName == "terminal" }) else {
+            return existing
+        }
+        let body = Array(terminal.lines.dropFirst())
+        let indent = body.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+            .map { $0.prefix(while: { $0 == " " }).count }.min() ?? 0
+        let normalized = body.map { $0.isEmpty ? "" : "  " + $0.dropFirst(indent) }
+        let seed = ([terminal.lines[0]] + normalized).joined(separator: "\n") + "\n"
+        guard let existing, !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return seed }
+        return mergedConfigYAML(existing: seed, template: existing)
+    }
+
     static func mergedConfigYAML(existing: String?, template: String) -> String {
         guard
             let existing,

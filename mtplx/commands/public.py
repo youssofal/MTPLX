@@ -10229,10 +10229,10 @@ def _piped_prompt_text() -> str:
         return ""
 
 
-def _one_shot_runtime_env_overrides(
+def _in_process_runtime_env_overrides(
     args: Any, runtime_model: str, *, generation_mode: str
 ) -> dict[str, str]:
-    """The serve runtime contract for an in-process one-shot run (#463).
+    """The shared serve contract for all in-process CLI entrypoints (#463).
 
     ``mtplx run`` and ``chat`` load the runtime in-process and applied only
     the profile defaults, so Flash-Next never received the family lanes serve
@@ -10328,7 +10328,7 @@ def _generate_one_shot_public(
     # profile defaults.
     apply_profile_env(
         profile.name,
-        runtime_env_overrides=_one_shot_runtime_env_overrides(
+        runtime_env_overrides=_in_process_runtime_env_overrides(
             args, runtime_model, generation_mode=generation_mode
         ),
     )
@@ -11847,6 +11847,28 @@ def _hermes_merged_config_yaml(existing: str | None, template: str) -> str:
     return "\n".join(out) + "\n"
 
 
+def _hermes_inherit_terminal(existing: str | None, root: str | None) -> str | None:
+    """Seed only execution settings; an explicit profile backend wins (#460)."""
+    if not root:
+        return existing
+    _, profile_blocks, _ = _hermes_parse_top_level_blocks(existing or "")
+    for block in profile_blocks:
+        if block["key"] == "terminal" and any(
+            key == "backend" for key, _ in _hermes_direct_child_blocks(block)
+        ):
+            return existing
+    _, root_blocks, _ = _hermes_parse_top_level_blocks(root)
+    terminal = next((b for b in root_blocks if b["key"] == "terminal"), None)
+    if terminal is None:
+        return existing
+    # Root config need not use the generated profile's two-space indentation.
+    import textwrap
+
+    body = textwrap.indent(textwrap.dedent("\n".join(terminal["lines"][1:])), "  ")
+    seed = terminal["lines"][0] + "\n" + body + "\n"
+    return _hermes_merged_config_yaml(seed, existing) if existing and existing.strip() else seed
+
+
 def _write_if_changed(path: Path, text: str, *, mode: int = 0o600) -> bool:
     existing = None
     if path.exists():
@@ -11891,12 +11913,10 @@ def _sync_hermes_profile(
     config_path = profile_dir / "config.yaml"
     env_path = profile_dir / ".env"
     profile_dir.mkdir(parents=True, exist_ok=True)
-    existing_config: str | None = None
-    if config_path.exists():
-        try:
-            existing_config = config_path.read_text(encoding="utf-8")
-        except OSError:
-            existing_config = None
+    existing_config = config_path.read_text(encoding="utf-8") if config_path.exists() else None
+    root_path = _hermes_home() / "config.yaml"
+    root_config = root_path.read_text(encoding="utf-8") if root_path.exists() else None
+    existing_config = _hermes_inherit_terminal(existing_config, root_config)
     config_changed = _write_if_changed(
         config_path,
         _hermes_merged_config_yaml(
@@ -13613,8 +13633,13 @@ def _quickstart_run_terminal_chat_body(
         args, _public_model_id_for_args(args, str(runtime_model))
     )
     profile = get_profile(_resolved_default_profile_name(args))
-    apply_profile_env(profile.name)
     generation_mode = _generation_mode_from_args(args)
+    apply_profile_env(
+        profile.name,
+        runtime_env_overrides=_in_process_runtime_env_overrides(
+            args, runtime_model, generation_mode=generation_mode
+        ),
+    )
     draft_lm_head = (
         _model_draft_lm_head_spec(inspection, profile)
         if getattr(args, "load_mtp", True) is not False

@@ -10328,6 +10328,35 @@ final class MTPLXAppCoreTests: XCTestCase {
         )
     }
 
+    func testNativeSelectorFailureUsesThePureWheelAndItsExactFingerprint() throws {
+        for script in ["exit 1", "printf '/missing/selected.whl\\n'"] {
+            let fixture = try makeRuntimeFixture(wheelContents: "pure-wheel")
+            let nativeDir = fixture.home.appendingPathComponent("Native")
+            try FileManager.default.createDirectory(at: nativeDir, withIntermediateDirectories: true)
+            let native = nativeDir.appendingPathComponent("mtplx-1.0.0-cp314-cp314-macosx_15_0_arm64.whl")
+            try Data("native-wheel".utf8).write(to: native)
+            let python = fixture.runtimeDir.appendingPathComponent("bin/python")
+            try Data("#!/bin/sh\n\(script)\n".utf8).write(to: python)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: python.path)
+            let bootstrapper = MTPLXRuntimeBootstrapper(environment: fixture.environment)
+            XCTAssertEqual(try bootstrapper.selectedBundledRuntimeWheel(
+                fallback: fixture.wheel, python: python
+            ), fixture.wheel)
+            MTPLXRuntimeBootstrapper.recordWheelFingerprint(for: native, runtimeDir: fixture.runtimeDir)
+            XCTAssertFalse(bootstrapper.installedRuntimeMatchesBundledWheel(
+                installedExecutable: fixture.managedExecutable
+            ))
+            MTPLXRuntimeBootstrapper.recordWheelFingerprint(for: fixture.wheel, runtimeDir: fixture.runtimeDir)
+            XCTAssertTrue(bootstrapper.installedRuntimeMatchesBundledWheel(
+                installedExecutable: fixture.managedExecutable
+            ))
+            try Data("rebuilt-pure-wheel".utf8).write(to: fixture.wheel)
+            XCTAssertFalse(bootstrapper.installedRuntimeMatchesBundledWheel(
+                installedExecutable: fixture.managedExecutable
+            ), "A selector error must not bypass the fallback wheel fingerprint")
+        }
+    }
+
     func testShimSymlinkToManagedVenvIsTreatedAsManaged() throws {
         let fixture = try makeRuntimeFixture(wheelContents: "wheel-A")
         let shimDir = fixture.home

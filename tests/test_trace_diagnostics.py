@@ -24,10 +24,10 @@ def test_economics_distinguishes_aggregate_acceptance_from_conditional_probabili
     assert result["mtp_pays"] is True
     assert mtp_economics(receipt)["speedup_vs_ar"] is None
     assert mtp_economics(receipt)["break_even_acceptance"] is None
-    # A copy route delivers tokens outside the draft ledger: no threshold.
-    assert mtp_economics({**receipt, "context_copy_accepted_tokens": 12}, 50)["break_even_acceptance"] is None
-    # Adaptive depth: the law uses the mean drafts per cycle (2.0 here), so
-    # break-even = (2 - 1) / 2 = 0.5 and 50 % acceptance is exactly the line.
+    # Copy output is accounted for by observed non-draft output.
+    assert mtp_economics({**receipt, "context_copy_accepted_tokens": 12}, 50)["break_even_acceptance"] == pytest.approx(1 / 3)
+    # Adaptive depth holds the observed mix and non-draft output constant;
+    # its threshold is conditional, while the throughput comparison is observed.
     adaptive = mtp_economics({**receipt, "drafted_by_depth": [100, 80, 20]}, 50)
     assert adaptive["fixed_depth"] is False
     assert adaptive["drafts_per_cycle"] == 2
@@ -37,7 +37,7 @@ def test_economics_distinguishes_aggregate_acceptance_from_conditional_probabili
     # Real receipts carry a few more verify calls than drafted rows (terminal
     # and bonus boundaries); the threshold must not vanish for them.
     real = mtp_economics({**receipt, "verify_calls": 103}, 50)
-    assert real["fixed_depth"] is False
+    assert real["fixed_depth"] is True
     assert real["break_even_acceptance"] is not None
     # A cycle costlier than perfect acceptance can amortize: threshold > 1.
     slow = mtp_economics({**receipt, "decode_elapsed_s": 9.0}, 50)
@@ -109,3 +109,25 @@ def test_new_tool_content_and_unknown_reasoning_are_not_false_regressions():
     assert _detect_pathologies(turns) == []
     turns[1]["receipt"]["cached_tokens"] = 1024
     assert any("REDUCED PREFIX REUSE" in flag for flag in _detect_pathologies(turns))
+
+
+def test_economics_counts_real_proposals_and_never_contradicts_throughput():
+    receipt = {"completion_tokens": 2400, "decode_elapsed_s": 44.598313789931126,
+               "verify_calls": 807, "drafted_by_depth": [801, 801, 801],
+               "accepted_by_depth": [654, 526, 409],
+               "context_copy_rounds": 6, "context_copy_accepted_tokens": 4}
+    result = mtp_economics(receipt, 33.81733719505653)
+    assert result["proposal_cycles"] == 801
+    assert result["fixed_depth"] is True
+    assert result["cycle_ms"] == pytest.approx(55.67829436945209)
+    assert result["break_even_acceptance"] == pytest.approx(
+        (44.598313789931126 * 33.81733719505653 - 811) / 2403)
+    assert result["break_even_basis"] == "fixed_depth_with_observed_copy_mix"
+    assert result["speedup_vs_ar"] == pytest.approx(1.591304881230316)
+    assert result["mtp_pays"] is True
+    extra = mtp_economics({"completion_tokens": 150, "decode_elapsed_s": 3.5,
+                          "verify_calls": 200, "drafted_by_depth": [100],
+                          "accepted_by_depth": [50]}, 50)
+    assert extra["speedup_vs_ar"] < 1
+    assert extra["mtp_pays"] is False
+    assert extra["break_even_acceptance"] == .75

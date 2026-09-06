@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import OSLog
 
 public enum MTPLXRuntimeBootstrapperError: Error, LocalizedError, Sendable {
     case homebrewNotFound
@@ -31,6 +32,7 @@ public enum MTPLXRuntimeBootstrapperError: Error, LocalizedError, Sendable {
 
 public struct MTPLXRuntimeBootstrapper: Sendable {
     public static let formula = "youssofal/mtplx/mtplx"
+    private static let logger = Logger(subsystem: "com.mtplx.app", category: "RuntimeBootstrapper")
 
     public init(environment: [String: String] = ProcessInfo.processInfo.environment) {
         self.environment = environment
@@ -452,30 +454,48 @@ public struct MTPLXRuntimeBootstrapper: Sendable {
     }
 
     func selectedBundledRuntimeWheel(fallback: URL, python: URL) throws -> URL {
+        var isDirectory: ObjCBool = false
+        guard fallback.pathExtension == "whl",
+              FileManager.default.fileExists(atPath: fallback.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue else {
+            throw MTPLXRuntimeBootstrapperError.runtimeStillMissing(
+                output: "Bundled fallback runtime wheel was not found: \(fallback.path)"
+            )
+        }
         let resources = fallback.deletingLastPathComponent()
         let native = resources.appendingPathComponent("Native", isDirectory: true)
         guard FileManager.default.fileExists(atPath: native.path) else { return fallback }
-        let contents = try FileManager.default.contentsOfDirectory(
-            at: native, includingPropertiesForKeys: nil
-        )
-        guard contents.contains(where: { $0.pathExtension == "whl" }) else {
+        do {
+            let contents = try FileManager.default.contentsOfDirectory(
+                at: native, includingPropertiesForKeys: nil
+            )
+            guard contents.contains(where: { $0.pathExtension == "whl" }) else {
+                return fallback
+            }
+            // Run against the actual venv, so pip's tags cover its Python ABI,
+            // CPU and macOS version. Unsupported cells retain the pure wheel.
+            let output = try run(
+                executable: python,
+                arguments: ["-I", "-B", resources.appendingPathComponent("select_runtime_wheel.py").path,
+                            fallback.path, native.path],
+                displayCommand: "Selecting compatible bundled MTPLX runtime"
+            )
+            let selected = URL(fileURLWithPath: output.trimmingCharacters(in: .whitespacesAndNewlines))
+            guard selected.pathExtension == "whl",
+                  FileManager.default.fileExists(atPath: selected.path, isDirectory: &isDirectory),
+                  !isDirectory.boolValue else {
+                throw MTPLXRuntimeBootstrapperError.runtimeStillMissing(
+                    output: "Compatible bundled runtime was not found: \(output)"
+                )
+            }
+            return selected
+        } catch {
+            // Native selection is optional. Keep the known bundled runtime
+            // usable while recording the failure; installation/import errors
+            // still propagate, and fingerprinting uses this exact fallback.
+            Self.logger.error("Native wheel selection failed; using bundled pure wheel: \(error.localizedDescription, privacy: .public)")
             return fallback
         }
-        // Run against the actual venv, so pip's tags cover its Python ABI,
-        // CPU and macOS version. Unsupported cells retain the pure wheel.
-        let output = try run(
-            executable: python,
-            arguments: ["-I", "-B", resources.appendingPathComponent("select_runtime_wheel.py").path,
-                        fallback.path, native.path],
-            displayCommand: "Selecting compatible bundled MTPLX runtime"
-        )
-        let selected = URL(fileURLWithPath: output.trimmingCharacters(in: .whitespacesAndNewlines))
-        guard FileManager.default.fileExists(atPath: selected.path) else {
-            throw MTPLXRuntimeBootstrapperError.runtimeStillMissing(
-                output: "Compatible bundled runtime was not found: \(output)"
-            )
-        }
-        return selected
     }
 
     private func installBundledRuntime(wheel fallback: URL, rebuildFromScratch: Bool = false) throws -> URL {

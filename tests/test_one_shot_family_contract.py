@@ -54,7 +54,7 @@ def test_one_shot_run_resolves_the_serve_contract_for_flash_next(tmp_path, monke
         SimpleNamespace(runtime_env_overrides=pack), None))
 
     args = SimpleNamespace(verify_strategy="batched")
-    resolved = public._one_shot_runtime_env_overrides(args, model, generation_mode="mtp")
+    resolved = public._in_process_runtime_env_overrides(args, model, generation_mode="mtp")
 
     expected = openai._server_runtime_env_overrides(
         SimpleNamespace(model=model, generation_mode="mtp", verify_strategy="batched"), pack)
@@ -74,7 +74,7 @@ def test_one_shot_run_keeps_a_dense_pack_on_its_profile(tmp_path, monkeypatch):
     model = _write(tmp_path, {"model_type": "qwen3_5", "text_config": {"model_type": "qwen3_5_text"}})
     monkeypatch.setattr(openai, "load_runtime_contract", lambda _: (None, None))
 
-    resolved = public._one_shot_runtime_env_overrides(
+    resolved = public._in_process_runtime_env_overrides(
         SimpleNamespace(verify_strategy="capture_commit"), model, generation_mode="mtp")
 
     assert "MTPLX_FAMILY_CAPTURE_COMMIT" not in resolved
@@ -86,6 +86,36 @@ def test_missing_contract_is_not_an_error(tmp_path, monkeypatch):
     from mtplx.server import openai
 
     monkeypatch.setattr(openai, "load_runtime_contract", lambda _: (None, "no contract"))
-    resolved = public._one_shot_runtime_env_overrides(
+    resolved = public._in_process_runtime_env_overrides(
         SimpleNamespace(), str(tmp_path), generation_mode="ar")
     assert isinstance(resolved, dict)
+
+
+def test_interactive_cli_applies_family_contract_before_loading(tmp_path, monkeypatch):
+    from mtplx.commands import public
+    from mtplx.server import openai
+    from mtplx import runtime
+
+    for key in list(os.environ):
+        if key.startswith("MTPLX_"):
+            monkeypatch.delenv(key)
+    model = _write(tmp_path, FLASH_NEXT)
+    monkeypatch.setattr(openai, "load_runtime_contract", lambda _: (None, None))
+    monkeypatch.setattr(openai, "apply_memory_caps_preflight", lambda **_: None)
+    monkeypatch.setattr(public, "_apply_model_default_profile", lambda *_: None)
+    monkeypatch.setattr(public, "_model_draft_lm_head_spec", lambda *_: None)
+    monkeypatch.setattr(public, "_model_draft_sampler_spec", lambda *_: None)
+
+    class ReachedLoad(Exception):
+        pass
+
+    def load(*args, **kwargs):
+        assert os.environ["MTPLX_FAMILY_CAPTURE_COMMIT"] == "1"
+        assert os.environ["MTPLX_SKIP_VERIFY_SNAPSHOT"] == "0"
+        raise ReachedLoad
+
+    monkeypatch.setattr(runtime, "load", load)
+    with pytest.raises(ReachedLoad):
+        public._quickstart_run_terminal_chat_body(
+            SimpleNamespace(profile="turbo", load_mtp=True, generation_mode="mtp",
+                            verify_strategy="batched"), runtime_model=model, inspection={})

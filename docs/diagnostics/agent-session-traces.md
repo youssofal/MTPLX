@@ -78,3 +78,11 @@ Supply a normal chat-completion request JSON with the actual coding task and nat
 For a candidate replay, `--seed-map seeds.json` accepts the baseline's resolved seeds keyed by run label, for example `{"r1-d0": 123, "r1-d3": 456}`. Exact request captures record the resolved seed in `outcome.resolved_seed`. Preserve the request hash and every sampler setting alongside the seeds. Matching seeds reduce one source of variation; different speculative routes can still consume randomness differently.
 
 A repetition-guard stop can arrive with client `finish_reason: "stop"`. The probe retains that sample but exits unsuccessfully and excludes its throughput from MTP economics. A guard pass is not a code-quality pass: run the produced code, its assertions and the actual client follow-up before accepting a performance result.
+
+Proposal cycles come from the first `drafted_by_depth` counter. Verifier forwards
+also include copy and bonus work and are not a cycle count. `mtp_pays` compares
+actual delivered throughput with the supplied matched AR measurement. The
+acceptance threshold uses `(decode_time * AR_TPS - non_draft_output) / proposals`;
+it holds the observed full cost, non-draft output and depth mix constant. Copy
+and adaptive runs remain usable, but this is a conditional estimate, not a
+measurement of performance at another acceptance rate.

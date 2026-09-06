@@ -9264,3 +9264,36 @@ def test_bench_run_dry_run_resolves_the_suite_inside_the_package(monkeypatch, ca
     assert suite_path.is_absolute()
     assert suite_path.is_file()
     assert suite_path.name == "flappy.jsonl"
+
+
+@pytest.mark.parametrize("existing_backend", [None, "local", "ssh"])
+@pytest.mark.parametrize("root_indent", [2, 4])
+def test_hermes_sync_inherits_root_terminal_only_without_a_profile_choice(
+    monkeypatch, tmp_path, existing_backend, root_indent
+):
+    import yaml
+
+    root = tmp_path / ".hermes"
+    root.mkdir()
+    terminal = "terminal:\n" + "\n".join(" " * root_indent + s for s in (
+        "backend: docker", "docker_image: example/coding:test",
+        "docker_volumes: ['/data:/data:ro']")) + "\n"
+    (root / "config.yaml").write_text(terminal + "providers:\n  private: untouched\n")
+    monkeypatch.setattr(public, "_hermes_home", lambda: root)
+    profile = root / "profiles" / "mtplx" / "config.yaml"
+    if existing_backend:
+        profile.parent.mkdir(parents=True)
+        profile.write_text(f"terminal:\n  backend: {existing_backend}\n  ssh_host: chosen-host\n")
+    args = dict(model_id="test-model", base_url="http://127.0.0.1:8123/v1",
+                api_key="test-key", workspace_path=str(tmp_path / "workspace"))
+    public._sync_hermes_profile(**args)
+    config = yaml.safe_load(profile.read_text())
+    assert config["terminal"]["backend"] == (existing_backend or "docker")
+    assert "providers" not in config
+    if existing_backend:
+        assert "docker_image" not in config["terminal"]
+        assert config["terminal"]["ssh_host"] == "chosen-host"
+    else:
+        assert config["terminal"]["docker_image"] == "example/coding:test"
+        assert config["terminal"]["docker_volumes"] == ["/data:/data:ro"]
+    assert public._sync_hermes_profile(**args)["did_change"] is False
