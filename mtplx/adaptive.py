@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -91,6 +91,9 @@ class ExpectedValueDepthPolicy:
     exploration_interval: int = 32
 
     wants_draft_metrics: bool = True
+    # Enabled by generation only for a shape-specialized verifier. A shorter
+    # eager window can cost MORE than its compiled D3 counterpart.
+    accepts_verify_cost: bool = False
 
     def __post_init__(self) -> None:
         if self.max_depth < 1:
@@ -121,6 +124,10 @@ class ExpectedValueDepthPolicy:
         self._last_continue_decision: dict[str, int | float | bool | str] | None = None
         self._cycles_observed = 0
         self._attempt_counts = [0 for _ in range(self.max_depth)]
+        self._tested_counts = [0 for _ in range(self.max_depth)]
+        self._verify_costs: dict[int, float] = {}
+        self._draft_costs: dict[int, float] = {}
+        self._cost_counts: dict[int, int] = {}
 
     def should_continue_after_draft(
         self,
@@ -153,6 +160,15 @@ class ExpectedValueDepthPolicy:
             self._last_continue_decision = decision
             return decision
 
+        measured = self.accepts_verify_cost and all(
+            self._cost_counts.get(d, 0) >= 4 for d in (drafted_depth, next_depth)
+        )
+        # Revisit the base occasionally so a context/route change cannot leave
+        # the comparison pinned to its initial cost. Same bounded probe cadence
+        # as the existing policy, with no new shapes outside the D2/D3 pair.
+        if measured and self.exploration_interval > 0 and self._cycles_observed % self.exploration_interval == 0:
+            return {"continue": False, "action": "stop", "reason": "remeasure_base_cost"}
+
         exploration_reason = self._exploration_reason(next_depth)
         if exploration_reason is not None:
             decision = {
@@ -178,9 +194,19 @@ class ExpectedValueDepthPolicy:
             0.999,
         )
         extra_cost_s = self.draft_cost_s + self.extra_verify_cost_s
+        baseline_tok_s = self.baseline_tok_s
+        if measured:
+            base_cost = self._draft_costs[drafted_depth] + self._verify_costs[drafted_depth]
+            next_cost = self._draft_costs[next_depth] + self._verify_costs[next_depth]
+            extra_cost_s = next_cost - base_cost
+            expected_base_tokens, prefix = 1.0, 1.0
+            for probability in self._accept_ewma[:drafted_depth]:
+                prefix *= probability
+                expected_base_tokens += prefix
+            baseline_tok_s = expected_base_tokens / base_cost
         required_extra_accept = max(
-            self.min_extra_accept_probability,
-            extra_cost_s * self.baseline_tok_s * (1.0 + self.safety_margin),
+            0.0 if measured else self.min_extra_accept_probability,
+            extra_cost_s * baseline_tok_s * (1.0 + self.safety_margin),
         )
         should_continue = expected_extra_accept >= required_extra_accept
         decision = {
@@ -195,16 +221,27 @@ class ExpectedValueDepthPolicy:
             "expected_extra_accept": float(expected_extra_accept),
             "required_extra_accept": float(required_extra_accept),
             "extra_cost_s": float(extra_cost_s),
-            "baseline_tok_s": float(self.baseline_tok_s),
+            "baseline_tok_s": float(baseline_tok_s),
+            "cost_source": "observed_draft_and_verify" if measured else "configured_prior",
         }
         self._last_continue_decision = decision
         return decision
 
-    def observe(self, *, attempted_depth: int, accepted_depths: int) -> dict[str, int | float | bool | str | list[float] | dict | None]:
+    def observe(self, *, attempted_depth: int, accepted_depths: int,
+                verify_time_s: float | None = None, draft_time_s: float | None = None) -> dict:
         """Update EWMAs from one cycle outcome and return a loggable decision."""
         attempted_depth = max(1, min(int(attempted_depth), self.max_depth))
         accepted_depths = max(0, min(int(accepted_depths), attempted_depth))
         self._cycles_observed += 1
+        if (
+            self.accepts_verify_cost and verify_time_s is not None and draft_time_s is not None
+            and all(math.isfinite(t) and t >= 0 for t in (verify_time_s, draft_time_s))
+            and verify_time_s > 0
+        ):
+            self._cost_counts[attempted_depth] = self._cost_counts.get(attempted_depth, 0) + 1
+            for costs, value in ((self._verify_costs, verify_time_s), (self._draft_costs, draft_time_s)):
+                previous = costs.get(attempted_depth, value)
+                costs[attempted_depth] = previous + self.ewma_alpha * (value - previous)
         for index in range(attempted_depth):
             self._attempt_counts[index] += 1
             # These estimates are multiplied in should_continue_after_draft,
@@ -213,6 +250,7 @@ class ExpectedValueDepthPolicy:
             # them rejected would count that earlier failure repeatedly.
             if index > accepted_depths:
                 continue
+            self._tested_counts[index] += 1
             accepted = 1.0 if accepted_depths > index else 0.0
             self._accept_ewma[index] = (
                 (1.0 - self.ewma_alpha) * self._accept_ewma[index]
@@ -229,6 +267,7 @@ class ExpectedValueDepthPolicy:
             "last_continue_decision": self._last_continue_decision,
             "cycles_observed": self._cycles_observed,
             "attempt_counts": list(self._attempt_counts),
+            "tested_counts": list(self._tested_counts),
         }
 
     def _exploration_reason(self, next_depth: int) -> str | None:

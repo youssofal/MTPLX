@@ -248,6 +248,19 @@ def _match_receipt(message: dict, receipts: list[dict], used: set[int]) -> dict 
     """Best receipt for an assistant message: exact session ids narrow the pool,
     then nearest logged_at_s to the message completion, with a token cross-foot
     tiebreak (completion_tokens ~ output+reasoning) for historical fuzzy joins."""
+    if message.get("_client") == "hermes":
+        counts = message.get("_hermes_api_counts")
+        if not counts:
+            return None
+        completed = message["time"]["completed"] / 1000
+        created = message["time"].get("created", message["time"]["completed"]) / 1000
+        matches = [(i, r) for i, r in enumerate(receipts) if i not in used
+                   and [r.get("prompt_tokens"), r.get("completion_tokens")] == list(counts)
+                   and created - 1 <= float(r.get("logged_at_s") or 0) <= completed + 3]
+        if len(matches) != 1:
+            return None
+        used.add(matches[0][0])
+        return matches[0][1]
     parent_entry = message.get("_parent_entry_id")
     if parent_entry:
         exact = [(i, r) for i, r in enumerate(receipts) if i not in used
@@ -321,7 +334,8 @@ def _join_session(
                 "turn": turn_no,
                 "message": message,
                 "receipt": receipt,
-                "join": ("exact Pi parent entry" if receipt and message.get("_parent_entry_id")
+                "join": ("Hermes input/output tokens and completion clock" if receipt and message.get("_client") == "hermes"
+                         else "exact Pi parent entry" if receipt and message.get("_parent_entry_id")
                          and receipt.get("request_client_entry_id") == message["_parent_entry_id"]
                          and sum(r.get("request_client_entry_id") == message["_parent_entry_id"] for r in pool) == 1
                          else "exact client turn; request by time/tokens" if receipt and receipt.get("request_client_turn_id")
@@ -336,6 +350,19 @@ def _join_session(
 
 
 def _load_joined(args: argparse.Namespace, receipts: list[dict], flight: list[dict]):
+    hermes_db = getattr(args, "hermes_db", None)
+    if hermes_db:
+        from .trace_clients import load_hermes_session
+
+        log = getattr(args, "hermes_log", None)
+        session, messages = load_hermes_session(Path(hermes_db).expanduser(), args.session,
+                                              Path(log).expanduser() if log else None)
+        if messages:
+            start = min(m["time"]["created"] for m in messages) / 1000 - 3
+            end = max(m["time"]["completed"] for m in messages) / 1000 + 90
+            receipts = [r for r in receipts if start <= float(r.get("logged_at_s") or 0) <= end]
+        return None, _join_session(None, session["id"], receipts, flight,
+                                   session=session, messages=messages)
     pi_path = getattr(args, "pi_session", None)
     if pi_path:
         from .trace_clients import load_pi_session
@@ -547,7 +574,7 @@ def _turn_row(turn: dict) -> dict:
         "cache_source": receipt.get("cache_source"),
         "cache_miss_reason": receipt.get("cache_miss_reason"),
         "completion_tokens": receipt.get("completion_tokens"),
-        "client_reasoning_tokens": None if message.get("_client") == "pi" else tokens["reasoning"],
+        "client_reasoning_tokens": None if message.get("_client") in {"pi", "hermes"} else tokens["reasoning"],
         "client_output_tokens": tokens["output"],
         "client_cache_read": tokens["cache_read"],
         "decode_tok_s": receipt.get("decode_tok_s"),

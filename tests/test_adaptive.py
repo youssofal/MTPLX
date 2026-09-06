@@ -4,6 +4,28 @@ from mtplx.adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
 from mtplx.benchmarks.runners import mtp_adaptive
 
 
+def test_expected_value_uses_measured_shape_cost_in_both_directions():
+    for d3_verify, should_continue in [(0.025, True), (0.070, False)]:
+        policy = ExpectedValueDepthPolicy(max_depth=3, accepts_verify_cost=True,
+                                          warmup_full_depth_cycles=0, exploration_interval=0,
+                                          confidence_weight=0)
+        for _ in range(8):
+            policy.observe(attempted_depth=2, accepted_depths=1,
+                           verify_time_s=0.045, draft_time_s=0.008)
+            policy.observe(attempted_depth=3, accepted_depths=1,
+                           verify_time_s=d3_verify, draft_time_s=0.012)
+        decision = policy.should_continue_after_draft(drafted_depth=2, max_depth=3, draft_metrics={})
+        assert decision["cost_source"] == "observed_draft_and_verify"
+        assert decision["continue"] is should_continue
+
+
+def test_expected_value_does_not_count_untested_positions_as_observed():
+    policy = ExpectedValueDepthPolicy(max_depth=3)
+    policy.observe(attempted_depth=3, accepted_depths=0)
+    assert policy._attempt_counts == [1, 1, 1]
+    assert policy._tested_counts == [1, 0, 0]
+
+
 def test_expected_value_does_not_charge_early_rejection_again_at_later_positions():
     policy = ExpectedValueDepthPolicy(
         max_depth=3, accept_priors=(1.0, 1.0, 1.0), ewma_alpha=0.5,

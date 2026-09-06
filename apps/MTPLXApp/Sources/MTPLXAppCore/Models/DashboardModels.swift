@@ -650,6 +650,19 @@ public struct MetricsLatest: Codable, Equatable, Sendable {
 
     public var decodeTokS: Double? { values["decode_tok_s"]?.doubleValue }
     public var prefillTokS: Double? { values["prefill_tok_s"]?.doubleValue }
+    /// Aggregate work / aggregate compute time. Averaging per-request rates
+    /// gives a 50-token tool result the same weight as a 30K cold prompt.
+    public static func aggregatePrefillRate(_ rows: [MetricsLatest]) -> Double? {
+        var tokens = 0.0, seconds = 0.0
+        for row in rows {
+            guard let count = row.values["new_prefill_tokens"]?.doubleValue,
+                  let rate = row.values["prefill_compute_tok_s"]?.doubleValue ?? row.prefillTokS,
+                  count > 0, count.isFinite, rate > 0, rate.isFinite else { continue }
+            tokens += count
+            seconds += count / rate
+        }
+        return seconds > 0 ? tokens / seconds : nil
+    }
     public var ttftS: Double? { values["ttft_s"]?.doubleValue }
     public var sessionId: String? { values["session_id"]?.stringValue }
     public var cacheSource: String? { values["cache_source"]?.stringValue }

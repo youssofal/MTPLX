@@ -11657,6 +11657,7 @@ def _hermes_config_yaml(
     api_key: str,
     workspace_path: str,
     reasoning_effort: str | None = None,
+    vision: bool = False,
 ) -> str:
     # SYNC PAIR: HermesIntegration.configYAML — both writers must emit the
     # same template shape or the shared merge sweeps each other's lines.
@@ -11678,6 +11679,8 @@ def _hermes_config_yaml(
         f"  base_url: {_hermes_yaml_quote(base_url)}\n"
         f"  api_key: {_hermes_yaml_quote(api_key)}\n"
         "  api_mode: chat_completions\n"
+        f"  supports_vision: {str(vision).lower()}\n"
+        "  reasoning_echo: true\n"
         "  default_headers:\n"
         "    x-mtplx-client: hermes\n"
         "toolsets:\n"
@@ -11869,16 +11872,20 @@ def _hermes_merged_config_yaml(existing: str | None, template: str) -> str:
     return "\n".join(out) + "\n"
 
 
+def _hermes_profile_declares_backend(existing: str | None) -> bool:
+    """True when the profile config sets ``terminal.backend`` itself."""
+    _, profile_blocks, _ = _hermes_parse_top_level_blocks(existing or "")
+    return any(
+        block["key"] == "terminal"
+        and any(key == "backend" for key, _ in _hermes_direct_child_blocks(block))
+        for block in profile_blocks
+    )
+
+
 def _hermes_inherit_terminal(existing: str | None, root: str | None) -> str | None:
     """Seed only execution settings; an explicit profile backend wins (#460)."""
-    if not root:
+    if not root or _hermes_profile_declares_backend(existing):
         return existing
-    _, profile_blocks, _ = _hermes_parse_top_level_blocks(existing or "")
-    for block in profile_blocks:
-        if block["key"] == "terminal" and any(
-            key == "backend" for key, _ in _hermes_direct_child_blocks(block)
-        ):
-            return existing
     _, root_blocks, _ = _hermes_parse_top_level_blocks(root)
     terminal = next((b for b in root_blocks if b["key"] == "terminal"), None)
     if terminal is None:
@@ -11930,15 +11937,22 @@ def _sync_hermes_profile(
     api_key: str,
     workspace_path: str,
     reasoning_effort: str | None = None,
+    vision: bool = False,
 ) -> dict[str, Any]:
     profile_dir = _hermes_profile_dir()
     config_path = profile_dir / "config.yaml"
     env_path = profile_dir / ".env"
     profile_dir.mkdir(parents=True, exist_ok=True)
     existing_config = config_path.read_text(encoding="utf-8") if config_path.exists() else None
-    root_path = _hermes_home() / "config.yaml"
-    root_config = root_path.read_text(encoding="utf-8") if root_path.exists() else None
-    existing_config = _hermes_inherit_terminal(existing_config, root_config)
+    if not _hermes_profile_declares_backend(existing_config):
+        # The root config is read only when a terminal policy has to be
+        # inherited (#460): a profile with its own backend never depends on
+        # it, so an unreadable root cannot fail that profile's launch. When
+        # inheritance is needed, an unreadable root is a loud error rather
+        # than a silently dropped sandbox choice.
+        root_path = _hermes_home() / "config.yaml"
+        root_config = root_path.read_text(encoding="utf-8") if root_path.exists() else None
+        existing_config = _hermes_inherit_terminal(existing_config, root_config)
     config_changed = _write_if_changed(
         config_path,
         _hermes_merged_config_yaml(
@@ -11949,6 +11963,7 @@ def _sync_hermes_profile(
                 api_key=api_key,
                 workspace_path=workspace_path,
                 reasoning_effort=reasoning_effort,
+                vision=vision,
             ),
         ),
     )
@@ -12686,6 +12701,7 @@ def _quickstart_hermes_payload(
             api_key=api_key,
             workspace_path=workspace_path,
             reasoning_effort=_hermes_client_reasoning_effort(args),
+            vision=_model_vision_enabled(str(getattr(args, "model", ""))),
         )
     return payload
 

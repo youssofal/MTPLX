@@ -1946,6 +1946,11 @@ class _DecodeTrace:
                             ),
                             "verify_calls": totals.get("verify_calls"),
                             "verify_time_s": totals.get("verify_time_s"),
+                            "verify_forward_time_s": totals.get("verify_forward_time_s"),
+                            "verify_logits_eval_time_s": totals.get("verify_logits_eval_time_s"),
+                            "verify_hidden_eval_time_s": totals.get("verify_hidden_eval_time_s"),
+                            "verify_target_distribution_time_s": totals.get("verify_target_distribution_time_s"),
+                            "verify_eval_unattributed_time_s": totals.get("verify_eval_unattributed_time_s"),
                             "draft_time_s": totals.get("draft_time_s"),
                             "accept_time_s": totals.get("accept_time_s"),
                             "commit_time_s": totals.get("commit_time_s"),
@@ -9848,6 +9853,11 @@ def generate_mtpk(
     # (first observe gets the span since loop entry, later ones the span
     # since the previous observe) — real cycle cost, not inter-request gaps.
     _policy_cycle_started = time.perf_counter()
+    if isinstance(adaptive_policy, ExpectedValueDepthPolicy):
+        adaptive_policy.accepts_verify_cost = bool(
+            qwen4_fixed_m4_compiled_verify
+            and os.environ.get("MTPLX_ADAPTIVE_VERIFY_COST_FEEDBACK", "1") != "0"
+        )
     # Long-context fence for the trio defaults (#313/#315c1/#318): decided
     # once per request from the prompt length, stamped through to graphbank
     # for the paged-offsets read. Receipts in _trio_max_context's docstring.
@@ -9994,6 +10004,7 @@ def generate_mtpk(
                 "verify_calls": int(verify_calls),
                 "committed_tokens": len(tokens),
             }
+        _policy_draft_before, _policy_verify_before = draft_time, verify_time
         repetition_result = _trim_repeated_suffix(tokens, repetition_config)
         if repetition_result is not None:
             events.append(
@@ -12547,6 +12558,11 @@ def generate_mtpk(
         if adaptive_policy is not None:
             _policy_now = time.perf_counter()
             _policy_kwargs: dict[str, float] = {}
+            if getattr(adaptive_policy, "accepts_verify_cost", False):
+                _policy_kwargs.update(
+                    verify_time_s=verify_time - _policy_verify_before,
+                    draft_time_s=draft_time - _policy_draft_before,
+                )
             if getattr(adaptive_policy, "accepts_cycle_ms", False):
                 _policy_kwargs["cycle_ms"] = (
                     _policy_now - _policy_cycle_started

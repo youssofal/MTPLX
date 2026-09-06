@@ -838,20 +838,30 @@ public struct HermesIntegration: Sendable {
         // not own (memory/providers/delegation/…), so the template is merged
         // over the existing file instead: app-owned keys are rewritten, all
         // other content is preserved byte-for-byte.
-        let rootConfigURL = hermesHome.appendingPathComponent("config.yaml")
         let existingConfigText = FileManager.default.fileExists(atPath: configURL.path)
             ? try String(contentsOf: configURL, encoding: .utf8) : nil
-        let rootConfigText = FileManager.default.fileExists(atPath: rootConfigURL.path)
-            ? try String(contentsOf: rootConfigURL, encoding: .utf8) : nil
+        var seededConfigText = existingConfigText
+        if !Self.profileDeclaresTerminalBackend(existingConfigText) {
+            // The root config is read only when a terminal policy has to be
+            // inherited (#460): a profile with its own backend never depends
+            // on it, so an unreadable root cannot fail that profile's launch.
+            // When inheritance is needed, an unreadable root is a thrown
+            // error rather than a silently dropped sandbox choice.
+            let rootConfigURL = hermesHome.appendingPathComponent("config.yaml")
+            let rootConfigText = FileManager.default.fileExists(atPath: rootConfigURL.path)
+                ? try String(contentsOf: rootConfigURL, encoding: .utf8) : nil
+            seededConfigText = Self.inheritTerminalConfig(existing: existingConfigText, root: rootConfigText)
+        }
         let configText = Self.mergedConfigYAML(
-            existing: Self.inheritTerminalConfig(existing: existingConfigText, root: rootConfigText),
+            existing: seededConfigText,
             template: Self.configYAML(
                 modelID: modelID,
                 baseURL: baseURL,
                 apiKey: apiKey,
                 workspacePath: workspacePath,
                 showReasoning: reasoning != "off",
-                reasoningEffort: reasoningEffort
+                reasoningEffort: reasoningEffort,
+                vision: Self.supportsVision(model: configuration.model)
             )
         )
         let envText = Self.dotenv(
@@ -1455,13 +1465,29 @@ public struct HermesIntegration: Sendable {
         return candidate
     }
 
+    /// Match the engine's vision-spec probe: metadata and actual tower weights,
+    /// never a model-name guess. The picker resolves downloaded aliases first.
+    static func supportsVision(model: String) -> Bool {
+        let path = MTPLXModelOption.option(matching: model)?.installedLocalPath ?? model
+        let directory = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath)
+        func object(_ name: String) -> [String: Any]? {
+            guard let data = try? Data(contentsOf: directory.appendingPathComponent(name)) else { return nil }
+            return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        }
+        guard object("config.json")?["vision_config"] is [String: Any],
+              let weights = object("model.safetensors.index.json")?["weight_map"] as? [String: String]
+        else { return false }
+        return weights.keys.contains { $0.hasPrefix("vision_tower.") || $0.hasPrefix("model.visual.") }
+    }
+
     private static func configYAML(
         modelID: String,
         baseURL: String,
         apiKey: String,
         workspacePath: String,
         showReasoning: Bool,
-        reasoningEffort: String?
+        reasoningEffort: String?,
+        vision: Bool
     ) -> String {
         // SYNC PAIR: public.py _hermes_config_yaml — both writers must emit
         // the same template shape or the shared merge sweeps each other's
@@ -1483,6 +1509,8 @@ public struct HermesIntegration: Sendable {
           base_url: \(yamlQuote(baseURL))
           api_key: \(yamlQuote(apiKey))
           api_mode: chat_completions
+          supports_vision: \(vision ? "true" : "false")
+          reasoning_echo: true
           default_headers:
             x-mtplx-client: hermes
         toolsets:
@@ -1552,12 +1580,15 @@ public struct HermesIntegration: Sendable {
     /// template keep that shape.
     /// Inherit the root execution policy only when the profile has no backend.
     /// Provider credentials and other root sections stay outside this profile.
+    /// True when the profile config sets `terminal.backend` itself.
+    static func profileDeclaresTerminalBackend(_ existing: String?) -> Bool {
+        guard let terminal = parseTopLevelBlocks(existing ?? "").blocks
+            .first(where: { $0.keyName == "terminal" }) else { return false }
+        return directChildBlocks(of: terminal).contains(where: { $0.key == "backend" })
+    }
+
     static func inheritTerminalConfig(existing: String?, root: String?) -> String? {
-        guard let root else { return existing }
-        if let terminal = parseTopLevelBlocks(existing ?? "").blocks.first(where: { $0.keyName == "terminal" }),
-           directChildBlocks(of: terminal).contains(where: { $0.key == "backend" }) {
-            return existing
-        }
+        guard let root, !profileDeclaresTerminalBackend(existing) else { return existing }
         guard let terminal = parseTopLevelBlocks(root).blocks.first(where: { $0.keyName == "terminal" }) else {
             return existing
         }

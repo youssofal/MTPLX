@@ -16095,6 +16095,12 @@ def _dashboard_publish_progress(
             return None
 
         enriched = dict(payload)
+        # The decoder already publishes these counters at ~1 Hz. Progress
+        # used to omit them, clearing the app's waterfall on every new turn.
+        # Reuse the same request-scoped host snapshot; never evaluate the GPU.
+        recorder = getattr(state, "flight", None)
+        if recorder is not None:
+            enriched.update(recorder.live_depth_snapshot(request_id))
         enriched["dashboard_progress_published"] = True
         registry_started_s = time.perf_counter()
         dashboard.in_flight.update_progress(request_id, enriched)
@@ -24015,7 +24021,10 @@ def _run_generation(
         and requested_depth > 0
     ):
         effective_depth = max(1, min(int(resolved_mtp_depth), int(requested_depth)))
-    started = time.perf_counter()
+    # Include admission and pending-history waits in user-facing TTFT/wall
+    # time. Decode still starts at the first produced token; throughput is
+    # unaffected. Previously a 39s postcommit wait vanished from the receipt.
+    started = float((request_observability or {}).get("request_received_monotonic_s") or time.perf_counter())
     token_times: list[float] = []
     lock_wait_time_s = 0.0
 
@@ -30027,6 +30036,11 @@ def create_app(state: ServerState) -> FastAPI:
                     "created": now,
                     "owned_by": "mtplx",
                     "capability": "chat",
+                    "supports_vision": _server_vision_spec(state) is not None,
+                    "modalities": {
+                        "input": ["text", "image"] if _server_vision_spec(state) is not None else ["text"],
+                        "output": ["text"],
+                    },
                     "context_length": state.context_window,
                     "max_context_length": state.context_window,
                     "max_model_len": state.context_window,
@@ -30176,6 +30190,7 @@ def create_app(state: ServerState) -> FastAPI:
     async def chat_completions(
         raw_request: Request, request: ChatCompletionRequest
     ) -> Any:
+        request_received_monotonic_s = time.perf_counter()
         if not request.messages:
             raise HTTPException(status_code=400, detail="messages must not be empty")
         if bool(request.logprobs) or int(request.top_logprobs or 0) > 0:
@@ -30615,6 +30630,7 @@ def create_app(state: ServerState) -> FastAPI:
             request_generation_mode=request_generation_mode,
             request_depth=request_depth,
         )
+        request_observability["request_received_monotonic_s"] = request_received_monotonic_s
         if constraint_spec is not None:
             request_observability["constrained_decoding"] = constraint_spec.source_type
         if vision_splice is not None:

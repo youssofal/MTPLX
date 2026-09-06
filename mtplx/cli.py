@@ -3087,6 +3087,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--request-log", help="explicit request JSONL, including its rotation files")
         p.add_argument("--flight-log", help="explicit flight JSONL, including its rotation files")
         p.add_argument("--pi-session", help="Pi session JSONL instead of the OpenCode database")
+        p.add_argument("--hermes-db", help="Hermes state.db instead of the OpenCode database")
+        p.add_argument("--hermes-log", help="Hermes agent.log for API tokens and completion times")
         p.add_argument("--ar-tok-s", type=float, help="measured AR decode TPS for the same hardware, model and workload; never a default estimate")
 
     trace_sessions_p = trace_sub.add_parser(

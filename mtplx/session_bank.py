@@ -2593,6 +2593,19 @@ class SessionBank:
             and entry.hidden_variant == container.hidden_variant
         ]
         for entry in victims:
+            if container.has_recurrent:
+                # Token containment alone is not state coverage. A recurrent
+                # container with only a 2K checkpoint cannot replace an exact
+                # 16K entry; doing so turned Hermes' next tool turn into a
+                # 31K re-prefill. Keep the smaller entry unless every restore
+                # point it supplies is present in the container as well.
+                points = [entry.prefix_len, *(int(r[0]) for r in entry.gdn_boundaries)]
+                if entry.gdn_boundary_loader is not None or any(
+                    (boundary := container.recurrent_boundary_at_or_below(point)) is None
+                    or int(boundary[0]) != point
+                    for point in points
+                ):
+                    continue
             self._evict_entry(entry, reason="superseded_by_longer_prefix")
         self._enforce_session_entry_retention(
             container.session_id, protected_tokens=tokens

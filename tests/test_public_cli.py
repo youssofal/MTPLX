@@ -9346,3 +9346,30 @@ def test_hermes_sync_inherits_root_terminal_only_without_a_profile_choice(
         assert config["terminal"]["docker_image"] == "example/coding:test"
         assert config["terminal"]["docker_volumes"] == ["/data:/data:ro"]
     assert public._sync_hermes_profile(**args)["did_change"] is False
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads through mode 000")
+def test_hermes_sync_reads_root_config_only_when_inheriting(monkeypatch, tmp_path):
+    root = tmp_path / ".hermes"
+    root.mkdir()
+    root_config = root / "config.yaml"
+    root_config.write_text("terminal:\n  backend: docker\n")
+    root_config.chmod(0)
+    monkeypatch.setattr(public, "_hermes_home", lambda: root)
+    profile = root / "profiles" / "mtplx" / "config.yaml"
+    profile.parent.mkdir(parents=True)
+    profile.write_text("terminal:\n  backend: ssh\n  ssh_host: chosen-host\n")
+    args = dict(model_id="test-model", base_url="http://127.0.0.1:8123/v1",
+                api_key="test-key", workspace_path=str(tmp_path / "workspace"))
+    try:
+        # An explicit profile backend never depends on the root config, so an
+        # unreadable root must not fail this profile's sync.
+        public._sync_hermes_profile(**args)
+        assert "  backend: ssh\n" in profile.read_text()
+        # Without a backend the root has to be read; unreadable is a loud
+        # error, not a silently dropped sandbox choice.
+        profile.write_text("terminal:\n  cwd: /workspace\n")
+        with pytest.raises(PermissionError):
+            public._sync_hermes_profile(**args)
+    finally:
+        root_config.chmod(0o600)

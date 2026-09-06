@@ -69,11 +69,11 @@ def _bank(**kwargs) -> SessionBank:
     return SessionBank(**defaults)
 
 
-def _put(bank: SessionBank, *, boundaries, base: int = BASE_BYTES, tokens=(1, 2, 3)):
+def _put(bank: SessionBank, *, boundaries, base: int = BASE_BYTES, tokens=(1, 2, 3), cache=None):
     return bank.put(
         runtime=RUNTIME,
         token_ids=list(tokens),
-        cache=[],
+        cache=[] if cache is None else cache,
         logits=None,
         hidden=_bytes(base),
         session_id="s1",
@@ -278,20 +278,32 @@ def test_a_boundary_carrying_container_supersedes_its_prefixes(monkeypatch):
     monkeypatch.setenv(SESSION_BANK_SHED_BOUNDARIES_ENV, "1")
     bank = _bank(per_session_max_bytes=BUDGET, max_bytes=100_000)
 
-    short = _put(bank, boundaries=FOUR, tokens=(1, 2, 3))
+    short = _put(bank, boundaries=FOUR, tokens=tuple(range(4_000)))
     assert short is not None
     assert [record[0] for record in short.gdn_boundaries] == [3_000, 4_000]
 
     # The generation-final commit passes NO boundaries, exactly as the receipt
     # shows; put inherits them from the longest banked prefix.
-    longer = _put(bank, boundaries=[], tokens=(1, 2, 3, 4, 5))
+    longer = _put(bank, boundaries=[], tokens=tuple(range(5_000)))
     assert longer is not None
     assert [record[0] for record in longer.gdn_boundaries] == [3_000, 4_000]
 
     # The container dominates, so the shorter donor is superseded away and the
     # single surviving entry still answers the boundary probe.
-    assert set(bank._entries) == {(1, 2, 3, 4, 5)}
+    assert set(bank._entries) == {tuple(range(5_000))}
     assert longer.recurrent_boundary_at_or_below(3_500)[0] == 3_000
+
+
+def test_longer_recurrent_entry_does_not_erase_uncovered_exact_prefix(monkeypatch):
+    monkeypatch.setenv(SESSION_BANK_SHED_BOUNDARIES_ENV, "1")
+    bank = _bank(per_session_max_bytes=10_000)
+    recurrent = [SimpleNamespace(state=None, meta_state=None, is_trimmable=lambda: False)]
+    short = _put(bank, boundaries=[_boundary(2_048)], tokens=range(15_688), cache=recurrent)
+    longer = _put(bank, boundaries=[_boundary(2_048), _boundary(30_720)], tokens=range(32_870), cache=recurrent)
+    assert short is not None and longer is not None
+    next_prompt = [*range(15_702), -1]
+    assert bank.longest_prefix(next_prompt) is short
+    assert longer.recurrent_boundary_at_or_below(15_702)[0] == 2_048
 
 
 def test_to_dict_publishes_the_engagement_receipt(monkeypatch):

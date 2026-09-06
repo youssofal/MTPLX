@@ -391,15 +391,15 @@ struct TileRow: View {
     // Replaces the old "Depth" tile, which only echoed the depth the
     // user already set in Settings. Prefill throughput is the metric
     // the user actually cares about here: how fast the model ingests
-    // the prompt. The headline is the mean prefill rate across recent
+    // the prompt. The headline is work / compute time across recent
     // completed requests; the caption shows the peak so a single fast
     // cache-warm read doesn't read as the steady rate.
 
     private func avgPrefillValue(snapshot: DashboardSnapshot?, latest: MetricsLatest?) -> String {
-        let samples = prefillSamples(snapshot: snapshot, latest: latest)
-        guard !samples.isEmpty else { return "—" }
-        let avg = samples.reduce(0, +) / Double(samples.count)
-        return Format.tps(avg)
+        let rows = snapshot?.recent ?? []
+        guard let rate = MetricsLatest.aggregatePrefillRate(rows.isEmpty ? [latest].compactMap { $0 } : rows)
+        else { return "—" }
+        return Format.tps(rate)
     }
 
     private func avgPrefillCaption(snapshot: DashboardSnapshot?, latest: MetricsLatest?) -> String? {
