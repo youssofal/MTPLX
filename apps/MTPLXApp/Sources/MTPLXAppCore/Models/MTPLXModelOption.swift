@@ -2,6 +2,23 @@ import Foundation
 import os
 
 public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
+    /// Match the engine's vision-spec probe: metadata and actual tower weights,
+    /// never a model-name guess. The picker resolves downloaded aliases first.
+    static func supportsVision(model: String) -> Bool {
+        let explicitPath = NSString(string: model).expandingTildeInPath
+        let path = FileManager.default.fileExists(atPath: explicitPath)
+            ? explicitPath : (MTPLXModelOption.option(matching: model)?.installedLocalPath ?? model)
+        let directory = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath)
+        func object(_ name: String) -> [String: Any]? {
+            guard let data = try? Data(contentsOf: directory.appendingPathComponent(name)) else { return nil }
+            return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        }
+        guard object("config.json")?["vision_config"] is [String: Any],
+              let weights = object("model.safetensors.index.json")?["weight_map"] as? [String: String]
+        else { return false }
+        return weights.keys.contains { $0.hasPrefix("vision_tower.") || $0.hasPrefix("model.visual.") }
+    }
+
     public var id: String
     public var displayName: String
     public var shortName: String

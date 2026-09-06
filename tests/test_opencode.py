@@ -68,6 +68,15 @@ def test_build_opencode_config_keeps_sampler_policy_server_side():
     assert "maxTokens" not in json.dumps(payload)
 
 
+def test_opencode_writer_upgrades_text_only_model_registration(tmp_path):
+    path = tmp_path / "opencode.json"
+    kwargs = dict(base_url="http://127.0.0.1:8000/v1", model_id="vision-model", path=path)
+    write_opencode_config(**kwargs)
+    assert json.loads(path.read_text())["provider"]["mtplx"]["models"]["vision-model"]["modalities"]["input"] == ["text"]
+    write_opencode_config(**kwargs, vision=True)
+    assert json.loads(path.read_text())["provider"]["mtplx"]["models"]["vision-model"]["modalities"]["input"] == ["text", "image"]
+
+
 def test_build_opencode_config_carries_family_effort_dial():
     payload = build_opencode_provider_config(
         base_url="http://127.0.0.1:18083/v1",

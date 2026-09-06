@@ -304,6 +304,7 @@ public struct PiIntegration: Sendable {
                     baseURL: baseURL,
                     apiKey: apiKey,
                     contextWindow: contextWindow,
+                    vision: MTPLXModelOption.supportsVision(model: configuration.model),
                     reasoningEnabled: OpenCodeIntegration.reasoningEnabled(forModelID: modelID)
                 )
             )
@@ -518,9 +519,11 @@ public struct PiIntegration: Sendable {
                 $0.objectValue?["id"]?.stringValue == freshID
             }) {
                 let existingEntry = resultModels[index].objectValue ?? [:]
-                resultModels[index] = .object(
-                    fillMissingDeep(existing: existingEntry, defaults: freshObject)
-                )
+                var entry = fillMissingDeep(existing: existingEntry, defaults: freshObject)
+                if freshObject["input"]?.arrayValue?.contains(.string("image")) == true {
+                    entry["input"] = freshObject["input"]
+                }
+                resultModels[index] = .object(entry)
             } else {
                 resultModels.append(freshModel)
             }
@@ -534,6 +537,7 @@ public struct PiIntegration: Sendable {
         baseURL: String,
         apiKey: String,
         contextWindow: Int,
+        vision: Bool,
         reasoningEnabled: Bool
     ) -> [String: JSONValue] {
         // Mirrors the CLI provider block (mtplx/pi.py build_pi_provider_config):
@@ -569,7 +573,7 @@ public struct PiIntegration: Sendable {
                         "minimal": .null,
                         "xhigh": .string("xhigh"),
                     ]),
-                    "input": .array([.string("text")]),
+                    "input": .array(vision ? [.string("text"), .string("image")] : [.string("text")]),
                     "contextWindow": .number(Double(contextWindow)),
                     // Pi silently substitutes a 16,384 output ceiling for
                     // models whose metadata omits maxTokens. Advertise the

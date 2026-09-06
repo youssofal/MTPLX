@@ -186,6 +186,7 @@ public struct OpenCodeIntegration: Sendable {
                 baseURL: baseURL,
                 apiKey: configuration.apiKey,
                 contextLimit: contextLimit,
+                vision: MTPLXModelOption.supportsVision(model: configuration.model),
                 reasoningEffort: Self.resolvedReasoningEffort(
                     forModelID: modelID,
                     configuredEffort: configuration.reasoningEffort
@@ -900,6 +901,7 @@ public struct OpenCodeIntegration: Sendable {
         baseURL: String,
         apiKey: String?,
         contextLimit: Int,
+        vision: Bool,
         reasoningEffort: String?
     ) -> [String: JSONValue] {
         var options: [String: JSONValue] = [
@@ -934,7 +936,7 @@ public struct OpenCodeIntegration: Sendable {
                 "output": .number(Double(contextLimit)),
             ]),
             "modalities": .object([
-                "input": .array([.string("text")]),
+                "input": .array(vision ? [.string("text"), .string("image")] : [.string("text")]),
                 "output": .array([.string("text")]),
             ]),
         ]

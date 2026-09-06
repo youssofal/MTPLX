@@ -12463,6 +12463,7 @@ def _quickstart_opencode_payload(
         top_k=int(getattr(args, "top_k", 20)),
         reasoning_effort=reasoning_effort,
         reasoning_effort_levels=reasoning_effort_levels,
+        vision=_model_vision_enabled(str(getattr(args, "model", ""))),
     )
     payload = {
         "integration": "opencode",
@@ -12540,6 +12541,7 @@ def _quickstart_opencode_payload(
                 top_k=int(getattr(args, "top_k", 20)),
                 reasoning_effort=reasoning_effort,
                 reasoning_effort_levels=reasoning_effort_levels,
+                vision=_model_vision_enabled(str(getattr(args, "model", ""))),
             )
         except (InvalidConfigFile, OSError) as exc:
             raise SystemExit(_client_config_refusal("OpenCode", exc)) from exc
@@ -14748,6 +14750,7 @@ def cmd_integrate_public(args: Any) -> int:
                     else "mtplx-local"
                 ),
                 enable_thinking=reasoning_policy.supported,
+                vision=_model_vision_enabled(str(getattr(args, "model", "") or model_id)),
                 reasoning_effort=reasoning_policy.default_effort,
                 reasoning_effort_levels=(
                     tuple(reasoning_policy.effort_levels)
@@ -14774,6 +14777,7 @@ def cmd_integrate_public(args: Any) -> int:
                 model_name=f"MTPLX {model_id}",
                 api_key=getattr(args, "api_key", None),
                 enable_thinking=reasoning_policy.supported,
+                vision=_model_vision_enabled(str(getattr(args, "model", "") or model_id)),
                 reasoning_effort=reasoning_policy.default_effort,
                 reasoning_effort_levels=(
                     tuple(reasoning_policy.effort_levels)

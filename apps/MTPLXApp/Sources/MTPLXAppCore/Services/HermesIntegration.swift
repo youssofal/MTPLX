@@ -861,7 +861,7 @@ public struct HermesIntegration: Sendable {
                 workspacePath: workspacePath,
                 showReasoning: reasoning != "off",
                 reasoningEffort: reasoningEffort,
-                vision: Self.supportsVision(model: configuration.model)
+                vision: MTPLXModelOption.supportsVision(model: configuration.model)
             )
         )
         let envText = Self.dotenv(
@@ -1463,21 +1463,6 @@ public struct HermesIntegration: Sendable {
             index += 1
         }
         return candidate
-    }
-
-    /// Match the engine's vision-spec probe: metadata and actual tower weights,
-    /// never a model-name guess. The picker resolves downloaded aliases first.
-    static func supportsVision(model: String) -> Bool {
-        let path = MTPLXModelOption.option(matching: model)?.installedLocalPath ?? model
-        let directory = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath)
-        func object(_ name: String) -> [String: Any]? {
-            guard let data = try? Data(contentsOf: directory.appendingPathComponent(name)) else { return nil }
-            return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        }
-        guard object("config.json")?["vision_config"] is [String: Any],
-              let weights = object("model.safetensors.index.json")?["weight_map"] as? [String: String]
-        else { return false }
-        return weights.keys.contains { $0.hasPrefix("vision_tower.") || $0.hasPrefix("model.visual.") }
     }
 
     private static func configYAML(
