@@ -229,20 +229,29 @@ kill_tree() {
   /bin/kill "$pid" >/dev/null 2>&1 || true
 }
 
-while read -r pid; do
-  [[ -n "$pid" ]] || continue
-  kill_tree "$pid"
-done < <(app_pids)
-while read -r pid; do
-  [[ -n "$pid" ]] || continue
-  kill_tree "$pid"
-done < <(misdirected_app_pids)
-for _ in {1..50}; do
-  if [[ -z "$(app_pids)" && -z "$(misdirected_app_pids)" ]]; then
-    break
+# Packaging must not interrupt an app the user is currently using. Refuse
+# to overwrite the exact running target; a separate bundle can be built safely.
+if [[ "$NO_LAUNCH" == "1" ]]; then
+  if [[ -n "$(app_pids)" ]]; then
+    echo "error: target bundle is running; set MTPLX_APP_BUNDLE_DIR to a separate output path" >&2
+    exit 1
   fi
-  sleep 0.1
-done
+else
+  while read -r pid; do
+    [[ -n "$pid" ]] || continue
+    kill_tree "$pid"
+  done < <(app_pids)
+  while read -r pid; do
+    [[ -n "$pid" ]] || continue
+    kill_tree "$pid"
+  done < <(misdirected_app_pids)
+  for _ in {1..50}; do
+    if [[ -z "$(app_pids)" && -z "$(misdirected_app_pids)" ]]; then
+      break
+    fi
+    sleep 0.1
+  done
+fi
 
 swift build -c "$BUILD_CONFIG" --product "$APP_NAME"
 
