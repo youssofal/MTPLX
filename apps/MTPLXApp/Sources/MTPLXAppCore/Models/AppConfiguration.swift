@@ -556,6 +556,13 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         customModels.append(option)
     }
 
+    @discardableResult
+    public mutating func removeCustomModel(id: String) -> Bool {
+        let originalCount = customModels.count
+        customModels.removeAll { $0.id == id }
+        return customModels.count != originalCount
+    }
+
     /// Persist a locally-forged model into the picker. Called by the
     /// Forge wizard's Registered stage when the build completes;
     /// dedup is by id (same branded name re-forged) AND by local
