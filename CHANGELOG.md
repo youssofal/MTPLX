@@ -19,9 +19,9 @@ and app and CLI repairs.
   image-aware M-RoPE positions on the indexer's queries and pooled
   block-start keys. The engine follows it, checked against an independent
   position oracle. A 54k image conversation went from about 19 tok/s and a
-  128 GiB allocator peak to a 92 GiB peak with turns completing at 43k–74k.
+  128 GiB allocator peak to a 92 GiB peak with turns completing at 43k-74k.
   Dense-path vision cache entries are not reused. Image-bearing turns still
-  decode on the eager verifier (33–50 tok/s here versus 54–61 text-only);
+  decode on the eager verifier (33-50 tok/s here versus 54-61 text-only);
   `MTPLX_QWEN4_VISION_QSA=0` is a diagnostic rollback.
 - **Hermes, OpenCode and Pi advertise image input from the pack's metadata.**
   All three registered the model as text-only, so Hermes routed screenshots
@@ -56,8 +56,8 @@ and app and CLI repairs.
   cost per depth** when the compiled fixed-M4 verifier is engaged, instead of
   assuming a shorter eager draft is cheaper than compiled depth 3; it leaves
   one-time compilation out of the estimate and re-probes both depths. The
-  rehearsal's 15k coding turn went from about 11 % to 90–96 % of cycles on
-  the compiled route and from 41–47 to 56–59 tok/s (machine in use, not a
+  rehearsal's 15k coding turn went from about 11 % to 90-96 % of cycles on
+  the compiled route and from 41-47 to 56-59 tok/s (machine in use, not a
   quiet A/B). `MTPLX_ADAPTIVE_VERIFY_COST_FEEDBACK=0` restores the prior.
 - **The prefill gauge and the Avg Prefill card measure the same chunk work.**
   The card averaged completed-request rates (a cached follow-up counted like
@@ -79,10 +79,10 @@ and app and CLI repairs.
   daemon-supervisor tests overwrote the saved model and onboarding choices
   through the real settings file; synthetic Python requests entered the real
   request log and flight recorder.
-- **27B on M1–M4: the flash-decoding verify route is gated by hardware
+- **27B on M1-M4: the flash-decoding verify route is gated by hardware
   (#459, #464, #467, #461).** 2.11 turned the route on in turbo without
   a GPU-family gate. It engages once the KV buffer reaches 8,192 tokens and
-  uses the M5 GPU's tensor units; on M1–M4 GPUs it returned wrong attention
+  uses the M5 GPU's tensor units; on M1-M4 GPUs it returned wrong attention
   (unrelated reasoning, imaginary tasks, mixed languages, no tool calls) and
   on macOS 15 the kernel failed to build (`MetalPerformancePrimitives.h`
   not found). The route now runs only on an M5-class GPU on macOS 26.2 or
@@ -90,7 +90,7 @@ and app and CLI repairs.
   validated at startup. `/health degradation.nax` carries `available`, the
   `gpu_family_or_os` bail counts and, new, `flash_dispatch_counters` for an
   engaged route. Rehearsed on an M5 Max with the reporters' 14k and 32k
-  diff-summary prompts: the forced M1–M4 path and the native route both
+  diff-summary prompts: the forced M1-M4 path and the native route both
   answer correctly; the route counts 66 dispatches with no bails. Item 3
   of #455 (incoherent output with MTP on, through Pi on an M3 Ultra)
   matches the route's engagement point and is not yet confirmed from that
@@ -101,7 +101,7 @@ and app and CLI repairs.
   said `committed`, so the bank refused the longest entry with
   `policy_mismatch` and Hermes or Pi re-prefilled the whole prompt on every
   top-level turn (14.5k tokens, about two minutes on an M1 Max). One policy
-  per runtime is now derived in one place. The 90–116 s first turn after
+  per runtime is now derived in one place. The 90-116 s first turn after
   idle in #455 runs the same configuration on an M3 Ultra: the same
   mechanism on paper, unconfirmed from that machine.
 - **The pre-prefill memory guard refuses a prompt that still projects over
