@@ -436,6 +436,50 @@ def test_mtp_batch_explicit_ar_stays_on_serial_ar(monkeypatch):
     assert generated == {"route": "ar"}
 
 
+@pytest.mark.parametrize(
+    ("scheduler_mode", "generation_mode"),
+    [("mtp_batch", "mtp"), ("ar_batch", "ar")],
+)
+def test_semantic_anchor_edges_bypass_batch_prefill(
+    monkeypatch, scheduler_mode, generation_mode
+):
+    state = (
+        _mtp_batch_dispatch_state()
+        if scheduler_mode == "mtp_batch"
+        else _fake_state()
+    )
+    state.args.scheduler_mode = scheduler_mode
+    state.mtp_batch_service = SimpleNamespace(
+        submit=lambda _job: pytest.fail("semantic anchors must not use MTP batching")
+    )
+    state.ar_batch_service = SimpleNamespace(
+        submit=lambda _job: pytest.fail("semantic anchors must not use AR batching")
+    )
+    captured = {}
+
+    def run_serial(_state, _prompt_ids, **kwargs):
+        captured.update(kwargs)
+        return {"route": "serial"}
+
+    monkeypatch.setattr(openai, "_run_generation", run_serial)
+
+    generated = openai._run_generation_dispatched(
+        state,
+        [1, 2, 3],
+        batch_key="test.semantic_anchor_batch_bypass",
+        generation_mode=generation_mode,
+        request_observability={"semantic_anchor_edges": [2]},
+    )
+
+    assert generated == {"route": "serial"}
+    assert captured["request_observability"]["scheduler_lane"] == (
+        "solo_semantic_anchors"
+    )
+    assert captured["request_observability"]["ar_batch_bypass_reason"] == (
+        "semantic_anchors_require_serial_prefill"
+    )
+
+
 def test_mtp_batch_rejects_constraint_graph_without_solo_fallback(monkeypatch):
     state = _mtp_batch_dispatch_state()
     state.mtp_batch_service = SimpleNamespace(
@@ -13590,6 +13634,9 @@ def _make_route_restore(captured: dict):
 
     def _fake_restore(rt, prompt_ids, *, mtp_history_policy, **_kwargs):
         captured["restore_policy"] = mtp_history_policy
+        captured["mandatory_prefix_edges"] = _kwargs.get(
+            "mandatory_prefix_edges"
+        )
         if _mtp_history_uses_committed_cache(mtp_history_policy):
             # The real committed-history prefill builds an MTP history cache;
             # on an AR runtime that call is exactly what raised in production.
@@ -13637,10 +13684,12 @@ def test_ar_postcommit_snapshot_routes_through_ar_path(monkeypatch):
         assistant_content="hello",
         thinking_enabled=False,
         policy_fingerprint="pf",
+        mandatory_prefix_edges=(2, 3),
     )
 
     # Routed through the AR path (never the MTP-only committed branch).
     assert captured["restore_policy"] == "cycle"
+    assert captured["mandatory_prefix_edges"] == (2, 3)
     assert result["stored"] is True
     # The banked entry's policy metadata matches what the next AR turn looks up.
     assert state.sessions.bank.puts

@@ -1,0 +1,259 @@
+{
+  "schema_version": 1,
+  "complete": true,
+  "pairs": [
+    {
+      "workload": "short",
+      "repetition": 1,
+      "output_parity": true
+    },
+    {
+      "workload": "short",
+      "repetition": 2,
+      "output_parity": true
+    },
+    {
+      "workload": "short",
+      "repetition": 3,
+      "output_parity": true
+    },
+    {
+      "workload": "long",
+      "repetition": 1,
+      "output_parity": false
+    },
+    {
+      "workload": "long",
+      "repetition": 2,
+      "output_parity": false
+    },
+    {
+      "workload": "long",
+      "repetition": 3,
+      "output_parity": false
+    }
+  ],
+  "output_parity_gate": false,
+  "any_incremental_cached_tokens": false,
+  "acceptance": "failed",
+  "timing_note": "ON minus OFF; positive means ON was slower. Failed-parity timings are diagnostic, not eligible speed claims.",
+  "host_limit": "AC power and no competing model process observed before/after each arm; no continuous system-wide GPU trace.",
+  "within_arm_output_stability": {
+    "short": {
+      "off": {
+        "repetitions": 3,
+        "unique_outputs_per_turn": [
+          1,
+          1,
+          1,
+          1,
+          1
+        ]
+      },
+      "on": {
+        "repetitions": 3,
+        "unique_outputs_per_turn": [
+          1,
+          1,
+          1,
+          1,
+          1
+        ]
+      }
+    },
+    "long": {
+      "off": {
+        "repetitions": 3,
+        "unique_outputs_per_turn": [
+          1,
+          1,
+          1,
+          1,
+          1
+        ]
+      },
+      "on": {
+        "repetitions": 3,
+        "unique_outputs_per_turn": [
+          1,
+          1,
+          1,
+          1,
+          1
+        ]
+      }
+    }
+  },
+  "turn_summaries": [
+    {
+      "workload": "short",
+      "turn": 0,
+      "label": "cold tool call",
+      "repetitions": 3,
+      "parity_passes": 3,
+      "cached_tokens_deltas": [
+        0,
+        0,
+        0
+      ],
+      "off_ttft_generated_median_s": 6.122617875000287,
+      "on_ttft_generated_median_s": 6.2108222500010015,
+      "paired_ttft_delta_median_s": 0.12102075099937792,
+      "paired_ttft_delta_min_s": 0.06754300000102376,
+      "paired_ttft_delta_max_s": 0.44763229099953605
+    },
+    {
+      "workload": "short",
+      "turn": 1,
+      "label": "tool result",
+      "repetitions": 3,
+      "parity_passes": 3,
+      "cached_tokens_deltas": [
+        0,
+        0,
+        0
+      ],
+      "off_ttft_generated_median_s": 0.5781908749995637,
+      "on_ttft_generated_median_s": 0.7417105419999643,
+      "paired_ttft_delta_median_s": 0.1470747500006837,
+      "paired_ttft_delta_min_s": 0.14696695899965562,
+      "paired_ttft_delta_max_s": 0.1657536250004341
+    },
+    {
+      "workload": "short",
+      "turn": 2,
+      "label": "plain append",
+      "repetitions": 3,
+      "parity_passes": 3,
+      "cached_tokens_deltas": [
+        0,
+        0,
+        0
+      ],
+      "off_ttft_generated_median_s": 0.612796958999752,
+      "on_ttft_generated_median_s": 0.7801992079994307,
+      "paired_ttft_delta_median_s": 0.1545991659986612,
+      "paired_ttft_delta_min_s": 0.14718774999892048,
+      "paired_ttft_delta_max_s": 0.1701950830010901
+    },
+    {
+      "workload": "short",
+      "turn": 3,
+      "label": "repeated tool call",
+      "repetitions": 3,
+      "parity_passes": 3,
+      "cached_tokens_deltas": [
+        0,
+        0,
+        0
+      ],
+      "off_ttft_generated_median_s": 1.7124029589995189,
+      "on_ttft_generated_median_s": 1.8673579999995127,
+      "paired_ttft_delta_median_s": 0.15798733299925516,
+      "paired_ttft_delta_min_s": 0.15449033299955772,
+      "paired_ttft_delta_max_s": 0.16432762399927014
+    },
+    {
+      "workload": "short",
+      "turn": 4,
+      "label": "repeated tool result",
+      "repetitions": 3,
+      "parity_passes": 3,
+      "cached_tokens_deltas": [
+        0,
+        0,
+        0
+      ],
+      "off_ttft_generated_median_s": 0.7076711249992513,
+      "on_ttft_generated_median_s": 0.8873327080000308,
+      "paired_ttft_delta_median_s": 0.17409104099988326,
+      "paired_ttft_delta_min_s": 0.16750549899916223,
+      "paired_ttft_delta_max_s": 0.19235891700191132
+    },
+    {
+      "workload": "long",
+      "turn": 0,
+      "label": "cold tool call",
+      "repetitions": 3,
+      "parity_passes": 3,
+      "cached_tokens_deltas": [
+        0,
+        0,
+        0
+      ],
+      "off_ttft_generated_median_s": 260.22338770900024,
+      "on_ttft_generated_median_s": 249.26736504199653,
+      "paired_ttft_delta_median_s": -0.9884694169995782,
+      "paired_ttft_delta_min_s": -34.244204000002355,
+      "paired_ttft_delta_max_s": 33.56897733200094
+    },
+    {
+      "workload": "long",
+      "turn": 1,
+      "label": "tool result",
+      "repetitions": 3,
+      "parity_passes": 3,
+      "cached_tokens_deltas": [
+        0,
+        0,
+        0
+      ],
+      "off_ttft_generated_median_s": 11.03609483299988,
+      "on_ttft_generated_median_s": 10.408787958000175,
+      "paired_ttft_delta_median_s": -0.6273068749997037,
+      "paired_ttft_delta_min_s": -0.6740208749979502,
+      "paired_ttft_delta_max_s": -0.35182341700237885
+    },
+    {
+      "workload": "long",
+      "turn": 2,
+      "label": "plain append",
+      "repetitions": 3,
+      "parity_passes": 0,
+      "cached_tokens_deltas": [
+        0,
+        0,
+        0
+      ],
+      "off_ttft_generated_median_s": 1.30877799999962,
+      "on_ttft_generated_median_s": 1.6825121250003576,
+      "paired_ttft_delta_median_s": 0.37324625000019296,
+      "paired_ttft_delta_min_s": 0.3717293340014294,
+      "paired_ttft_delta_max_s": 0.4136846669989609
+    },
+    {
+      "workload": "long",
+      "turn": 3,
+      "label": "repeated tool call",
+      "repetitions": 3,
+      "parity_passes": 3,
+      "cached_tokens_deltas": [
+        0,
+        0,
+        0
+      ],
+      "off_ttft_generated_median_s": 2.9743564580021484,
+      "on_ttft_generated_median_s": 3.377279250002175,
+      "paired_ttft_delta_median_s": 0.4029227920000267,
+      "paired_ttft_delta_min_s": 0.39000804199895356,
+      "paired_ttft_delta_max_s": 0.43013895900003263
+    },
+    {
+      "workload": "long",
+      "turn": 4,
+      "label": "repeated tool result",
+      "repetitions": 3,
+      "parity_passes": 3,
+      "cached_tokens_deltas": [
+        0,
+        0,
+        0
+      ],
+      "off_ttft_generated_median_s": 1.6527434159997938,
+      "on_ttft_generated_median_s": 2.2649254579991975,
+      "paired_ttft_delta_median_s": 0.5952633330007302,
+      "paired_ttft_delta_min_s": 0.5901298749995476,
+      "paired_ttft_delta_max_s": 0.6337396260005335
+    }
+  ]
+}

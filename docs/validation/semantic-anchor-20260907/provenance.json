@@ -1,0 +1,94 @@
+{
+  "server_commit": "dfe28bf94fb62d35ba305d3b764c044c880f0905",
+  "model": "<MODEL_DIR>",
+  "repo_id": "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed",
+  "revision": "766cec2bb474544381139cc036ae1c2267759b33",
+  "files": {
+    ".gitattributes": {
+      "size": 1570,
+      "sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930"
+    },
+    "README.md": {
+      "size": 3611,
+      "sha256": "73b3bde4bcf074f6d30df82807a96411ec9732a6cb6750c0e048b919eeed0e70"
+    },
+    "chat_template.jinja": {
+      "size": 8952,
+      "sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+    },
+    "config.json": {
+      "size": 23985,
+      "sha256": "913b57d11eb131d9e1bb7316ea8729b6bcd110b59f8a08840a83ba2e524f370d"
+    },
+    "generation_config.json": {
+      "size": 202,
+      "sha256": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e"
+    },
+    "model-00001-of-00004.safetensors": {
+      "size": 5355017068,
+      "sha256": "aed435f4011667af7772fee7ccec90c86f5a6c85649ef74fe6e397a7504b4578"
+    },
+    "model-00002-of-00004.safetensors": {
+      "size": 5326635766,
+      "sha256": "3f1960306e36255b7f0c7e80c742f03d96131561b766b1f6af9ca138ff77f939"
+    },
+    "model-00003-of-00004.safetensors": {
+      "size": 5362328225,
+      "sha256": "6525c0edae616c0f62b69fc190268c69bdf7a18b0b2ad3de007f3e4464387471"
+    },
+    "model-00004-of-00004.safetensors": {
+      "size": 3478828572,
+      "sha256": "cef192620e5ecb23eaac19d2c041edc44d9cbb9fb10265bf1213b649c3eae0d9"
+    },
+    "model-vision.safetensors": {
+      "size": 921497225,
+      "sha256": "964bef26c740bdb6fe464b4c7c48840d4c952ea597c181c41cb131c65ea3c5d5"
+    },
+    "model.safetensors.index.json": {
+      "size": 206923,
+      "sha256": "aec76dd8123c07e947f22a0e391bc278c05989094d398a64d759b76a93e3754e"
+    },
+    "mtp.safetensors": {
+      "size": 238934249,
+      "sha256": "c58feddc584f37971c72af1f0da95e0099478487009936b3c26ddd88844fab10"
+    },
+    "mtplx_runtime.json": {
+      "size": 6566,
+      "sha256": "1019a8e17f9d527360b3f6916c7c8412c3602444f282be4e81a4adea9e7bebf6"
+    },
+    "preprocessor_config.json": {
+      "size": 390,
+      "sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+    },
+    "processor_config.json": {
+      "size": 367,
+      "sha256": "dcc7ce0121d6d1c514804e68e5673e04c239ad2547339ea6330289d272a748f8"
+    },
+    "tokenizer.json": {
+      "size": 19989325,
+      "sha256": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523"
+    },
+    "tokenizer_config.json": {
+      "size": 1161,
+      "sha256": "95c557768e6b88a7128befc7bfd3c7de50e5d51af9b8b33a9f4dee0e04f99679"
+    },
+    "video_preprocessor_config.json": {
+      "size": 385,
+      "sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+    }
+  },
+  "versions": {
+    "mlx": "0.32.2",
+    "mlx-lm": "0.31.3",
+    "transformers": "5.8.0",
+    "tokenizers": "0.22.2"
+  },
+  "hardware": "Apple M5 Max\n137438953472\n27.0\n26A5425a",
+  "host": {
+    "utc": "2026-09-07T03:37:50Z",
+    "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=23658595)\t80%; charging; 1:06 remaining present: true",
+    "foreign_model_processes": [],
+    "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+  },
+  "source_harness_sha256": "d93ee5deb50de957b67cbfdb285fc29088b0df26d9392f1ab0d900df895e8df2"
+}

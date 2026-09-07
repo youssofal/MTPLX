@@ -292,6 +292,64 @@ def test_thinning_retains_tail_adjacent_stable_edge():
     )
 
 
+def test_128k_pretool_anchor_survives_capture_grid_thinning():
+    prompt_body_tokens = 126_687
+    pretool_edge = 126_683
+    spans = _prefill_spans_with_tail_grid(
+        prompt_body_tokens,
+        tail_interval=512,
+        mandatory_edges=(pretool_edge,),
+        chunk_size=8192,
+    )
+    records = []
+    for _start, end in spans:
+        records.append((end, object(), None))
+        if len(records) > 8:
+            records = _thin_gdn_boundary_records(records, 8)
+
+    assert pretool_edge in {record[0] for record in records}
+    assert prompt_body_tokens in {record[0] for record in records}
+
+
+def test_oversized_live_frontier_retains_pretool_boundary_for_restore():
+    pretool_edge = 126_683
+    stored_tokens = [*range(pretool_edge), *range(200_000, 200_032)]
+    followup_tokens = [*range(pretool_edge), *range(300_000, 301_043)]
+    boundary_state = CacheSnapshot(states=(), meta_states=())
+    boundary_hidden = object()
+    recurrent_cache = SimpleNamespace(is_trimmable=lambda: False)
+    runtime = SimpleNamespace(model_path=Path("models/example"), mtp_enabled=True)
+    bank = SessionBank(max_entries=4, max_bytes=4096, per_session_max_bytes=64)
+
+    entry = bank.put(
+        runtime=runtime,
+        token_ids=stored_tokens,
+        cache=[recurrent_cache],
+        logits=None,
+        hidden=None,
+        keep_live_ref=True,
+        session_id="tool-turn",
+        nbytes_override=1024,
+        gdn_boundaries=[(pretool_edge, boundary_state, boundary_hidden)],
+    )
+
+    assert entry is not None and entry.live_ref_only
+    assert [record[0] for record in entry.gdn_boundaries] == [pretool_edge]
+    candidates = bank.near_prefix_candidates(followup_tokens)
+    assert candidates == [(entry, pretool_edge)]
+    restored = bank.restore_entry_prefix_cache(
+        runtime,
+        entry,
+        pretool_edge,
+        mode="reference",
+    )
+    assert restored is not None
+    _cache, _mtp_cache, mode, restore_point, hidden = restored
+    assert mode == "reference_lease"
+    assert restore_point == pretool_edge
+    assert hidden is boundary_hidden
+
+
 class _NearPrefixProbe(Exception):
     """Raised by the recorder to stop restore_or_prefill before any real work."""
 

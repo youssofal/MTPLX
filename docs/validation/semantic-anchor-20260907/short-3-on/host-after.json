@@ -1,0 +1,6 @@
+{
+  "utc": "2026-09-07T07:10:06Z",
+  "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=23658595)\t80%; AC attached; not charging present: true",
+  "foreign_model_processes": [],
+  "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+}

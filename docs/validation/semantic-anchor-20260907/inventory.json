@@ -1,0 +1,831 @@
+{
+  "source_commit": "dfe28bf94fb62d35ba305d3b764c044c880f0905",
+  "files": [
+    {
+      "path": "summary.json",
+      "sha256": "9235c816781fdc264ef15bbd17ee32af95473ef507a86b5cb32454631775aebd",
+      "size": 6601,
+      "original_sha256": "9235c816781fdc264ef15bbd17ee32af95473ef507a86b5cb32454631775aebd",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "per-turn.csv",
+      "sha256": "545ce98e0f89e5e14b59afc6f5c37a95da06e1fabb6205c12bd088511be1815e",
+      "size": 11494,
+      "original_sha256": "c99267cc9c2091f504fea00ca18bb12800155a34bfd620b7b15a2fabcc4cb1fa",
+      "transformation": "local path substitution only; CRLF-to-LF normalization"
+    },
+    {
+      "path": "provenance.json",
+      "sha256": "0e04f4f9b675e7f51af870aa414ae3d87fe0cce7bf4a1c9ad805d90991349548",
+      "size": 3475,
+      "original_sha256": "88118199ec15fecb51f7d60ac40e3e946893371502c83da2f5ac306849fab48d",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-transcript.json.gz",
+      "sha256": "1243b9499081ee0ada72f16cb680cafd12a2afaaf31c7e4c198c47835af19eb0",
+      "size": 2192,
+      "original_sha256": "a16939637a7364891c60f9ca3aeebce8c89865b8831e041e342869e1e544da31",
+      "transformation": "gzip; decompressed bytes exactly match the frozen transcript"
+    },
+    {
+      "path": "capture-short-responses.json",
+      "sha256": "3b29794f3559060f7128b44c5efb97548c80bee9eb433fc38b19d84a130e301c",
+      "size": 87010,
+      "original_sha256": "3b29794f3559060f7128b44c5efb97548c80bee9eb433fc38b19d84a130e301c",
+      "transformation": "none"
+    },
+    {
+      "path": "long-transcript.json.gz",
+      "sha256": "3295bf6916abdc210d3e2bb1af14ef49c8d259f5c8084dad54386afbd3c2cfe7",
+      "size": 105287,
+      "original_sha256": "43843538b84eb0b641036bf8353a5920e564233d914815e66fb1058a5a260eb0",
+      "transformation": "gzip; decompressed bytes exactly match the frozen transcript"
+    },
+    {
+      "path": "capture-long-responses.json",
+      "sha256": "7f11abcbfafe66c8c471ba73e1202ab2465c5bafd23d98930dc6c513925feaba",
+      "size": 87142,
+      "original_sha256": "7f11abcbfafe66c8c471ba73e1202ab2465c5bafd23d98930dc6c513925feaba",
+      "transformation": "none"
+    },
+    {
+      "path": "short-1-off/replay.json",
+      "sha256": "8c3c7a720ad4a2f304bf0a3f47a69eb6843f813c3e3e736e30f443de3f5c5e39",
+      "size": 5038,
+      "original_sha256": "a4de8f92147b24afc0355ab9144907299bed8995c8c95fabaf20715a6eac723a",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-1-off/manifest.json",
+      "sha256": "e5cc71b3d75e48c2cdf28293d6e126ec3571855b090cbf6cd23fbc6cf2a8c5e0",
+      "size": 1943,
+      "original_sha256": "b2f71120a3ae6b544260b1236a81b1ebef9e533667e49343f46b116335bac9e3",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-1-off/launch.json",
+      "sha256": "17ef85aaefa3fc5fa5bacd887d9fbad030ad94cef91b0682a35d27082db1b1a2",
+      "size": 1811,
+      "original_sha256": "e2184eafcab7839e1f68858365845151a414c27179428b296bf5668e291aa0e8",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-1-off/health.json",
+      "sha256": "78dee3526a28fd4ccda04e9cd66dd5291dfcf9cd0bac502a42466e144740cbb5",
+      "size": 36993,
+      "original_sha256": "d25e84e013b45ee3a3d81abc932bfda93deb63e866e60665520f0085d4366711",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-1-off/health-after.json",
+      "sha256": "927afa5e11e9fa97d0b3a9cc6d0581b40574278a3b8ad8ca44a80dbdbf0a37d8",
+      "size": 43952,
+      "original_sha256": "b029518c05fa514367e8a571bf2b66af9381cbf253e4e552f4d804b6de0719c8",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-1-off/host-after.json",
+      "sha256": "1360480e3fed88dfad306c42dace551f72ac9e3afc7327d4891ceffab4ff36b1",
+      "size": 355,
+      "original_sha256": "1360480e3fed88dfad306c42dace551f72ac9e3afc7327d4891ceffab4ff36b1",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-1-off/restore-commit.jsonl",
+      "sha256": "01880b58b7d5856531bfdc6b06103f77a1693d1626c6f4aa008f05f87c2fcbc7",
+      "size": 6540,
+      "original_sha256": "c10ce6a0a23dc341c56f8a745f28e9dbc7c72643deeb7a5779939bdca4125442",
+      "transformation": "five measured requests only; selected cache/timing/anchor fields; warmup and unrelated telemetry omitted"
+    },
+    {
+      "path": "short-1-off/generation-events.jsonl",
+      "sha256": "8faee20c331c4387edfad1ef3c33d4b42cd7b96bf758c7105838c12271225309",
+      "size": 1725,
+      "original_sha256": "d3d91f48a6d35cf77e29173bd1df1cf715e2351bf85a6bcd5b1b3837e3293726",
+      "transformation": "generation events only; text previews are from the frozen public synthetic fixture"
+    },
+    {
+      "path": "short-1-on/replay.json",
+      "sha256": "7a3c4042ef920ee5f8df3be6608a2a3b3dfe75672a047ca1c680d4b78814da43",
+      "size": 5037,
+      "original_sha256": "898c26827fec03200170d87fd4456dd9860f76d4c7376b5b592800064eeb7768",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-1-on/manifest.json",
+      "sha256": "3c020aaeff5a623edad8aa3531f46f8d5871b59a69503f1e8b856d24cb275087",
+      "size": 1942,
+      "original_sha256": "1d07baa8e33406931386a163bd79d6603f146826c6db5052a9ff24f2297e6bb2",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-1-on/launch.json",
+      "sha256": "ac90eb38fc4d85cb73f216ea722a4091f0ef03246d4fa7a2787e7b275f65ffa2",
+      "size": 1809,
+      "original_sha256": "6995e147d7ab956477ea09185c81d9043b70d807bcffd1fbe49b12b4ccb22b96",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-1-on/health.json",
+      "sha256": "cbf9117e3eac8887e63134315855bce1805a37b8b8a08eb96fa180480120e6ba",
+      "size": 37003,
+      "original_sha256": "cdb63fefb387d71f3f53c416767d33e0ff2bf8522dc3f2d760fd874fc29bbe6a",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-1-on/health-after.json",
+      "sha256": "91d1e499dd6abfc1ef3e6cbb29c82f29de53ab52d358674adede49debe37036b",
+      "size": 44019,
+      "original_sha256": "efaf4075199be7fe950c61c616c8a147ed08de24904f9d7ef58839153351b482",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-1-on/host-after.json",
+      "sha256": "2a4ef75ee38968b21668bfdbd69854548055ec110423b97d263655cc73dd5b42",
+      "size": 355,
+      "original_sha256": "2a4ef75ee38968b21668bfdbd69854548055ec110423b97d263655cc73dd5b42",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-1-on/restore-commit.jsonl",
+      "sha256": "3ff2672e9099eeb5b6f1d1ada49ef7ad26cd523af4a856c9f750cf827c4254a7",
+      "size": 8250,
+      "original_sha256": "b02747c4d85c293fd0b594e7ff33b38f1d7c0c6ec9e6ae8650f77dcb12bc52bf",
+      "transformation": "five measured requests only; selected cache/timing/anchor fields; warmup and unrelated telemetry omitted"
+    },
+    {
+      "path": "short-1-on/generation-events.jsonl",
+      "sha256": "901e8f37e92e494138b3dc5f9ace67310aab8fe81d9a847493e0d94ef267ce2a",
+      "size": 1724,
+      "original_sha256": "d9736a16d69e5b2420ddfbf7ad17c56c17ff9cb3ba3e2b0af862b5d4b99f67c0",
+      "transformation": "generation events only; text previews are from the frozen public synthetic fixture"
+    },
+    {
+      "path": "short-2-off/replay.json",
+      "sha256": "45b57904ee4398bd2550e8b30c09567778d87a3914738b4c665ec243a6a2fb36",
+      "size": 5037,
+      "original_sha256": "162a3197f39fdd1e44ec4fe4f2445d6a7e121891c334f0153ce744cc89fcfd68",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-2-off/manifest.json",
+      "sha256": "e5cc71b3d75e48c2cdf28293d6e126ec3571855b090cbf6cd23fbc6cf2a8c5e0",
+      "size": 1943,
+      "original_sha256": "b2f71120a3ae6b544260b1236a81b1ebef9e533667e49343f46b116335bac9e3",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-2-off/launch.json",
+      "sha256": "c5dc064efe6c7c4f17d1c1af2de1c4e73485ce960e23057ee276efdb24267ade",
+      "size": 1812,
+      "original_sha256": "3ec6d1226e93638cf0aa9f8647ce89880fb97fb4fc6b1da442472cbdad0d44a4",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-2-off/health.json",
+      "sha256": "e9b4c9df2117bb4b85b419dba9515062949188f352055dbd54f6d35c97c6a6c3",
+      "size": 37014,
+      "original_sha256": "9cc4d67a45f9694ab8d5c31be007ea2fd9e5c89d77adb3ea72d1c655882f799d",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-2-off/health-after.json",
+      "sha256": "37c3aabd4d6009d70a71919cc7119029b17b50c80cd8173b5a7731007fbb6528",
+      "size": 43966,
+      "original_sha256": "644362b6a0439e2b7dcc942f03940d9636f1f2797dbdadd0dfc2d6ea2183a1ab",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-2-off/host-after.json",
+      "sha256": "7011a64d12d719d0c6635e5e381246b5a2547775c95aa6a35f27dec140837b9d",
+      "size": 356,
+      "original_sha256": "7011a64d12d719d0c6635e5e381246b5a2547775c95aa6a35f27dec140837b9d",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-2-off/restore-commit.jsonl",
+      "sha256": "7ab817b334f7701dd88f7c7ba75153f89b964515d2f86975070a9b39575376ae",
+      "size": 6546,
+      "original_sha256": "06800ec0a7a023651232bc45de39374e243c9793c1c20a4cfb6468b933a7e5f7",
+      "transformation": "five measured requests only; selected cache/timing/anchor fields; warmup and unrelated telemetry omitted"
+    },
+    {
+      "path": "short-2-off/generation-events.jsonl",
+      "sha256": "52aeacb49a283571ae0832f9cbffbe755720d3a06ff448ac9cd78e97d6b3140d",
+      "size": 1724,
+      "original_sha256": "b4f249c66a1266d23a52aac8fd383744b0047924a6ff2dba48c11ef0e0c4572d",
+      "transformation": "generation events only; text previews are from the frozen public synthetic fixture"
+    },
+    {
+      "path": "short-2-on/replay.json",
+      "sha256": "84f0f640e362559d4d6ef8a79625ea5c05e278f1c00d923e1b7416198ef18a54",
+      "size": 5035,
+      "original_sha256": "981f973bce5aa3428bc83807e31ecf5cb1cd82fc6d574337cf638eab3be2ade7",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-2-on/manifest.json",
+      "sha256": "3c020aaeff5a623edad8aa3531f46f8d5871b59a69503f1e8b856d24cb275087",
+      "size": 1942,
+      "original_sha256": "1d07baa8e33406931386a163bd79d6603f146826c6db5052a9ff24f2297e6bb2",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-2-on/launch.json",
+      "sha256": "7b880864636ea791e8d9ac7ce08b3b8b190de500b35cd8760c576a8054f0d41a",
+      "size": 1810,
+      "original_sha256": "6c2a1f853718a3f0526f9ae2f683b97a026d5ebd59275f5e7163806602e53872",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-2-on/health.json",
+      "sha256": "cd215bc1a5d0ec022ba0b513f2ca9273d86ff61725a6c682330e856c6412be60",
+      "size": 37007,
+      "original_sha256": "55e4ce34097877cedd621ba1485433f1cb4bd46b399e4a9a1df4034b6826daca",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-2-on/health-after.json",
+      "sha256": "0a0954b8c1d429f96a11946b9da68748a375a95a473d42dfdd51a06bdacfbd2d",
+      "size": 44017,
+      "original_sha256": "2dc55df9bf331f944b9ccee21d35354e51d5c785f9a8e952630d7cd30a35f7d2",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-2-on/host-after.json",
+      "sha256": "4acf179df88c3a219176fd9632a804f846c410d21235580c1db56a1af9fc3eb0",
+      "size": 356,
+      "original_sha256": "4acf179df88c3a219176fd9632a804f846c410d21235580c1db56a1af9fc3eb0",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-2-on/restore-commit.jsonl",
+      "sha256": "5951e69d132189296cdcc6e689e37394674aaf11be9069ff2bf56a09fb659a5c",
+      "size": 8256,
+      "original_sha256": "521b5b7632aa12ce58698d3c377d638935cb48f52f1a4c88a00936426ec35e9c",
+      "transformation": "five measured requests only; selected cache/timing/anchor fields; warmup and unrelated telemetry omitted"
+    },
+    {
+      "path": "short-2-on/generation-events.jsonl",
+      "sha256": "627efb3c177d8ea6601d843915146ea7e3b43c96e2550cfeac5fc3adee5ea7a2",
+      "size": 1724,
+      "original_sha256": "ae98d5ded39cf3f95b3246428ca190254fc1c8f95b6bdb0ea76f151a0aba6aa0",
+      "transformation": "generation events only; text previews are from the frozen public synthetic fixture"
+    },
+    {
+      "path": "short-3-off/replay.json",
+      "sha256": "ced39bb14c1dfcb33726901a4f14cfde18a8c3523a59cb71a75da63befe7e90d",
+      "size": 5033,
+      "original_sha256": "e277ae93398a145dd9c913444c8516a3a28f8b2076266572f67623a60862f57e",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-3-off/manifest.json",
+      "sha256": "e5cc71b3d75e48c2cdf28293d6e126ec3571855b090cbf6cd23fbc6cf2a8c5e0",
+      "size": 1943,
+      "original_sha256": "b2f71120a3ae6b544260b1236a81b1ebef9e533667e49343f46b116335bac9e3",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-3-off/launch.json",
+      "sha256": "614bc8a9c1077e8326a7c658d27f4133efe845bcdc253e616b48c8e40206fbc0",
+      "size": 1812,
+      "original_sha256": "0b7e624e4276e992fa878aa920f021b3843eb01d3cc67924a4874a123bb72c1b",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-3-off/health.json",
+      "sha256": "d4ec70d4a129dcb9cd8b05063aef3bda0b5fac11b517fded95e23057511df8ef",
+      "size": 37010,
+      "original_sha256": "238f2e6733054f8ef0691a2fcac6524b5d493c990202a9126e77298cbbd615a4",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-3-off/health-after.json",
+      "sha256": "c53cc6cdb19709148bd969028b072d41373d93808f5971f3c228805f90576034",
+      "size": 43974,
+      "original_sha256": "143e188d6d39b5cdcca08eb9e25162b287f425cb04554c53ae129c694a488fbb",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-3-off/host-after.json",
+      "sha256": "faa7664de9221570baba85cfd4daa71ba549136281d9830ee58b585678169378",
+      "size": 356,
+      "original_sha256": "faa7664de9221570baba85cfd4daa71ba549136281d9830ee58b585678169378",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-3-off/restore-commit.jsonl",
+      "sha256": "92e34790304087db8d7a503dbf172432b99f67d8fde44f34d27d8196c1703f8c",
+      "size": 6541,
+      "original_sha256": "74944429c1ccdc46bb00a13cc1c3000035110471a0bede61a0203c14271d22b3",
+      "transformation": "five measured requests only; selected cache/timing/anchor fields; warmup and unrelated telemetry omitted"
+    },
+    {
+      "path": "short-3-off/generation-events.jsonl",
+      "sha256": "dbbdbf9145154a36f100d72aa2edc990eeb25b0147f21b259eafa72baf175083",
+      "size": 1724,
+      "original_sha256": "8340cec043aa403048f1b611e7b13842de9fdf6962b245a3b497df8fe1ff53e4",
+      "transformation": "generation events only; text previews are from the frozen public synthetic fixture"
+    },
+    {
+      "path": "short-3-on/replay.json",
+      "sha256": "9c7e499664c00619b175ee9106fb8258e8cf6401e2325072951ccc713b1d8881",
+      "size": 5039,
+      "original_sha256": "f485fb36a6cfc3531c7bd7aa5ddf5ee159afa682b55d9d38c8b4c24121f7d970",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-3-on/manifest.json",
+      "sha256": "3c020aaeff5a623edad8aa3531f46f8d5871b59a69503f1e8b856d24cb275087",
+      "size": 1942,
+      "original_sha256": "1d07baa8e33406931386a163bd79d6603f146826c6db5052a9ff24f2297e6bb2",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-3-on/launch.json",
+      "sha256": "7bfdf01290776da4a9717ba0d9e84f9afef0db611a398c46a8f7a7da8c6a6882",
+      "size": 1810,
+      "original_sha256": "2db608a33a9df77c27f9584bf9b7adfbb52932adca2d26f99cbba6314640058d",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-3-on/health.json",
+      "sha256": "4ac8f0cfdd5090896bb8cb69a00f523372da81c9b26f28cc57c1cac263771b6e",
+      "size": 37002,
+      "original_sha256": "515cbe6983547ecdd53a86ab73c81822dfdca4915f73bbb558ff037392a14a91",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-3-on/health-after.json",
+      "sha256": "f2a5bddb88334fd0d6605d74ba3b7c3cd682374f855c971b685d1556707ae175",
+      "size": 44019,
+      "original_sha256": "7611d16e4c29172fcccfe22a9819841170c4b8ffcc829a312c67126484fd4f62",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-3-on/host-after.json",
+      "sha256": "9b86a64d46aafb1205a4c159e7284b52b9a141292d7e0cb3578b13dbfcd4284c",
+      "size": 356,
+      "original_sha256": "9b86a64d46aafb1205a4c159e7284b52b9a141292d7e0cb3578b13dbfcd4284c",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "short-3-on/restore-commit.jsonl",
+      "sha256": "6ecf3263dbc4d5a25a39b6951120304de3d4ec6ce2db7b7ca0ca931e4996c036",
+      "size": 8254,
+      "original_sha256": "62949b5349c89acda8e044b388328cbd02536d389068d433d65a369790ab929d",
+      "transformation": "five measured requests only; selected cache/timing/anchor fields; warmup and unrelated telemetry omitted"
+    },
+    {
+      "path": "short-3-on/generation-events.jsonl",
+      "sha256": "4c9b9284cf21e69c053347ff1d3d1f4a26f3f33d28cf111a1ef849bbd43f5599",
+      "size": 1726,
+      "original_sha256": "9f0eb2b9c12525701b8d030da020321de7e050e388eca9c902edcc77e9dd2702",
+      "transformation": "generation events only; text previews are from the frozen public synthetic fixture"
+    },
+    {
+      "path": "long-1-off/replay.json",
+      "sha256": "359c39832b2567e4c875a494a5f4b3ac4b2770513cd9e0038725aae383ae5a60",
+      "size": 5051,
+      "original_sha256": "b3054c2892f2508177ed57df3492dd4bc185d2bb6147a1580151bcf92ced1093",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-1-off/manifest.json",
+      "sha256": "e5cc71b3d75e48c2cdf28293d6e126ec3571855b090cbf6cd23fbc6cf2a8c5e0",
+      "size": 1943,
+      "original_sha256": "b2f71120a3ae6b544260b1236a81b1ebef9e533667e49343f46b116335bac9e3",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-1-off/launch.json",
+      "sha256": "5f440abd21d2f02f780d4c6b1ebce7c9fec4088149e2893088b608ec6ea9eaeb",
+      "size": 1809,
+      "original_sha256": "6b93113e900345bf09d28614e646f2e3e286875e475abe42f1e23aa7a13017be",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-1-off/health.json",
+      "sha256": "ebed253e0331f497208108cd374ac3600167815b41502f9250b1f85c54e997ce",
+      "size": 37000,
+      "original_sha256": "638001d114c21b7fcb97cfce345f84a930c6d0ddc9afd52be4870f549f814cc5",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-1-off/health-after.json",
+      "sha256": "3fa6a94749b496fcaeffe6687627ac09baa818b3c23236fe0fd0235bceb1c2e9",
+      "size": 43770,
+      "original_sha256": "367fa8278fb4d665aa265f2a64fc57ecc450d584ddd1c134893023d6c6a796e6",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-1-off/host-after.json",
+      "sha256": "a7ce7080004f51c668f2fe697e60caaed10af9ca1ccb641842588f069efb71a4",
+      "size": 355,
+      "original_sha256": "a7ce7080004f51c668f2fe697e60caaed10af9ca1ccb641842588f069efb71a4",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-1-off/restore-commit.jsonl",
+      "sha256": "11ef8cf7d2eff79a7146ac9110978bc21bb4aeae84df041b23687368b567caab",
+      "size": 7035,
+      "original_sha256": "028958e177f8f970839387a315e6fe09c1c77b25e83fff2421cc05b935f79d5c",
+      "transformation": "five measured requests only; selected cache/timing/anchor fields; warmup and unrelated telemetry omitted"
+    },
+    {
+      "path": "long-1-off/generation-events.jsonl",
+      "sha256": "5a351498b4d642dcf1e9b20d5ffc518101ae86cfc2a623f54e9a457ea0e9fbcb",
+      "size": 1735,
+      "original_sha256": "02fc0ef01233dc8c9a88d7a5e904b75451a3efdf242f3f020c354a9a70d76d9f",
+      "transformation": "generation events only; text previews are from the frozen public synthetic fixture"
+    },
+    {
+      "path": "long-1-on/replay.json",
+      "sha256": "f6cde569777e526e6f788e73452a73592286724c7ccb5ed7bcef6046cd06a0ab",
+      "size": 5050,
+      "original_sha256": "c2a81ca000a8d5caa47d0670820ae2d4165321b1f62f0cb0588ba4a647c268f0",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-1-on/manifest.json",
+      "sha256": "3c020aaeff5a623edad8aa3531f46f8d5871b59a69503f1e8b856d24cb275087",
+      "size": 1942,
+      "original_sha256": "1d07baa8e33406931386a163bd79d6603f146826c6db5052a9ff24f2297e6bb2",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-1-on/launch.json",
+      "sha256": "fe87c6e424eaadcb7cf2152d4bf38f366c709253ef9f8a465a41741fe5e73adb",
+      "size": 1807,
+      "original_sha256": "2a9e0a8c69a4298c2d3b9e43bfa609b7dba7f01b5ca148726ac7f14d75390a68",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-1-on/health.json",
+      "sha256": "523ec06e4f16636d85dd08b8872d572c15131234fd9e83c68a4a1d553a18d7ce",
+      "size": 37005,
+      "original_sha256": "c86fe10907c2a63f53e81eb956323c0239f05798f7dbf25b7a62e7a1fecc6e2e",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-1-on/health-after.json",
+      "sha256": "6f95bd9479de40af03b1ccbd7999b24dbfe805fff71dff4ac3606d3c2b5567dc",
+      "size": 43683,
+      "original_sha256": "6bb68fa17955979f24e4b3b304c307444602695a63d299bd3c7c1614832b800f",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-1-on/host-after.json",
+      "sha256": "7ad44c164c685f9c93e23a4cc8d1caf551c64ffef05e96b99932725b04c07309",
+      "size": 355,
+      "original_sha256": "7ad44c164c685f9c93e23a4cc8d1caf551c64ffef05e96b99932725b04c07309",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-1-on/restore-commit.jsonl",
+      "sha256": "8a728baccd3e139075250b8c40476d9808cd8f483f076888be102a012cd52af7",
+      "size": 8769,
+      "original_sha256": "904d0cf5836023542d6577a4329d171e77f256fb086ef3692b553aae7423fb3d",
+      "transformation": "five measured requests only; selected cache/timing/anchor fields; warmup and unrelated telemetry omitted"
+    },
+    {
+      "path": "long-1-on/generation-events.jsonl",
+      "sha256": "034e12187bd5f1f580e7da7b1ecae2a2a4a3b68356f499c0dfc9d6aac26bbb04",
+      "size": 1728,
+      "original_sha256": "c5de3e1cbb213a74faec7c3623366e4ce7f2f77a554104782c607c9e8b09325b",
+      "transformation": "generation events only; text previews are from the frozen public synthetic fixture"
+    },
+    {
+      "path": "long-2-off/replay.json",
+      "sha256": "6d2339400ad1db9ca4cfea8fc644341c2d9c83cc6e463652f128e9c8da13cdf3",
+      "size": 5056,
+      "original_sha256": "cceffaf693223eb24dbcee363e81f64d2866f99d615ca28cc277195039acdf9e",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-2-off/manifest.json",
+      "sha256": "e5cc71b3d75e48c2cdf28293d6e126ec3571855b090cbf6cd23fbc6cf2a8c5e0",
+      "size": 1943,
+      "original_sha256": "b2f71120a3ae6b544260b1236a81b1ebef9e533667e49343f46b116335bac9e3",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-2-off/launch.json",
+      "sha256": "3268e2938a450ed0ac86f94bc0e492b9cd9e5110d6cffb0319828f63e1fc073d",
+      "size": 1810,
+      "original_sha256": "26b4b04cd31a38661c7b9e173578f284de9a946d9da1f616edecbae82bb6645f",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-2-off/health.json",
+      "sha256": "e2e1be9722e004e7e01af3945cba054cfbae1c3f4ca80984be262e29a764feab",
+      "size": 37001,
+      "original_sha256": "5202bfb4fe70e681b630b75a9ba71e0ce6ca5473cbead2ad7ce3d1f11c491f3f",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-2-off/health-after.json",
+      "sha256": "8612aff32b538e24b5848d0e369a8ee6643c6cb0260d498c499862de19026da3",
+      "size": 43757,
+      "original_sha256": "15b4efea9b31bf12cb420e03f0a827ea78418b30107b939116eaf1f4a5e4103d",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-2-off/host-after.json",
+      "sha256": "c279cd7720e72bf87f2399f281b7d689309a83527a816ae80eaf0ef0c87aef2c",
+      "size": 356,
+      "original_sha256": "c279cd7720e72bf87f2399f281b7d689309a83527a816ae80eaf0ef0c87aef2c",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-2-off/restore-commit.jsonl",
+      "sha256": "c68c91d27c03f00a55b8b560962cf71a5fae88188a8f6bdea2f2f8c707bffdfb",
+      "size": 7039,
+      "original_sha256": "ab7a368b21c27f703eb761081cc02e6f5a70cf916ccb6c2ecf1515bb007f2290",
+      "transformation": "five measured requests only; selected cache/timing/anchor fields; warmup and unrelated telemetry omitted"
+    },
+    {
+      "path": "long-2-off/generation-events.jsonl",
+      "sha256": "9abb03e6b096b36616b57f22b267ea63c1ff1c526843771f0b0051730158df72",
+      "size": 1737,
+      "original_sha256": "d7eed3ddd0c526b13ab49bb12869aea8abb3d1e910da3b2188f299eb89d40405",
+      "transformation": "generation events only; text previews are from the frozen public synthetic fixture"
+    },
+    {
+      "path": "long-2-on/replay.json",
+      "sha256": "f17f1a4a47f3b014c3396a31efbc38a223f99412c84763442b19097fc2599634",
+      "size": 5053,
+      "original_sha256": "81d4e959a9795964007dc3586c28328e065b591aba0833db7aff22eac694cff4",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-2-on/manifest.json",
+      "sha256": "3c020aaeff5a623edad8aa3531f46f8d5871b59a69503f1e8b856d24cb275087",
+      "size": 1942,
+      "original_sha256": "1d07baa8e33406931386a163bd79d6603f146826c6db5052a9ff24f2297e6bb2",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-2-on/launch.json",
+      "sha256": "8d216a257fdc3a848f7bd5123a056f3037edddac4517d28ce1b4fa2c6f717f27",
+      "size": 1808,
+      "original_sha256": "78b55fc452b2c5fb394dab21cd1b942cb125623925f239058959a9adf71ec67c",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-2-on/health.json",
+      "sha256": "c1d5bce0cfd129d4a8f87ea58d6618f6ffd349f5b52906ae2a2f701244f1ebf1",
+      "size": 37003,
+      "original_sha256": "8331b67726af78cd10621ad6f09b97692c41e0857e5db99ef55d78ac08271aa6",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-2-on/health-after.json",
+      "sha256": "b3c97b54f4340341a09d1ecc18100d0c7b1c82afcb41136ae2f15a89c89ce949",
+      "size": 43683,
+      "original_sha256": "651fd02841f2af171f3935021280e74f6659853656e35c5bce5a4993395dee4d",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-2-on/host-after.json",
+      "sha256": "6ce0dd932f25d85a3522ebc018a5ae5328de657ba073eb8b4f72da69180e72b8",
+      "size": 356,
+      "original_sha256": "6ce0dd932f25d85a3522ebc018a5ae5328de657ba073eb8b4f72da69180e72b8",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-2-on/restore-commit.jsonl",
+      "sha256": "d5ad6bbcd72c5c94d419db2f936efc8edf01a7a82d7a2ab66fc2ff6963be118b",
+      "size": 8769,
+      "original_sha256": "290d9520e5e5c8122851e521f1e21df50c81881e1184ce6127b8190d809062be",
+      "transformation": "five measured requests only; selected cache/timing/anchor fields; warmup and unrelated telemetry omitted"
+    },
+    {
+      "path": "long-2-on/generation-events.jsonl",
+      "sha256": "8c720ac2e39118ef27af96fbd016c86038a37c2dd4f0c92daa17d2ffb4b34d77",
+      "size": 1729,
+      "original_sha256": "48dba4e9b77340a32393d7c6d40b80829a8ff87ef2faf23efc49da9f4c95a8ea",
+      "transformation": "generation events only; text previews are from the frozen public synthetic fixture"
+    },
+    {
+      "path": "long-3-off/replay.json",
+      "sha256": "17e87b7c267f2dee33ce6a75acc5074bd9c9dcc53c24fc3803e620610755e3d3",
+      "size": 5050,
+      "original_sha256": "1b83d86a739a63878766df4717c2911ec3571975a43711e8641aab2a412cf7ed",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-3-off/manifest.json",
+      "sha256": "e5cc71b3d75e48c2cdf28293d6e126ec3571855b090cbf6cd23fbc6cf2a8c5e0",
+      "size": 1943,
+      "original_sha256": "b2f71120a3ae6b544260b1236a81b1ebef9e533667e49343f46b116335bac9e3",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-3-off/launch.json",
+      "sha256": "b4dff2ff1389747a6f8bd01ad983edfabd5f6a8bc3802e6725462789ec3f42e6",
+      "size": 1810,
+      "original_sha256": "a104199d7f33e83e80da3c676e637e3a6bdd2b3fde91fc717a1de1cadf707099",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-3-off/health.json",
+      "sha256": "431215af8bf46c14bb80c958dd4c4b8b685c982e1f233b486c16b4f4c29e613b",
+      "size": 37005,
+      "original_sha256": "3da274db37c068b40d3a4ccb520e4608fe675104459607f8bbbd8cd81c4df6a5",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-3-off/health-after.json",
+      "sha256": "322efdb8173c7dd9ac46cad08fc637d34a305f2395d22a95193db20127a4e052",
+      "size": 43761,
+      "original_sha256": "971f240f850d06acb5efc9b4f28337a3d4ff43ea6e0bf55a894a635010518689",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-3-off/host-after.json",
+      "sha256": "edbb91bc4b25d115e776850abe1b1f2f9b51a8d6edf19d574befe6d9fcd7dffb",
+      "size": 356,
+      "original_sha256": "edbb91bc4b25d115e776850abe1b1f2f9b51a8d6edf19d574befe6d9fcd7dffb",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-3-off/restore-commit.jsonl",
+      "sha256": "1065c4ca5db398973fbf94ab782508dd5cb66fd34f588208462efae765a474e9",
+      "size": 7044,
+      "original_sha256": "35584d950f339e62c21bdaebdf7c26721776f430b08113bdd1882a6156033f4b",
+      "transformation": "five measured requests only; selected cache/timing/anchor fields; warmup and unrelated telemetry omitted"
+    },
+    {
+      "path": "long-3-off/generation-events.jsonl",
+      "sha256": "3df022182714ab976fe563858f869bfa84cbb45a7222276006fe4a4b9e959b84",
+      "size": 1737,
+      "original_sha256": "a6d3a1fab8d7689fcf246ee66ec930fc92c89556f6f461bae072152b981d3514",
+      "transformation": "generation events only; text previews are from the frozen public synthetic fixture"
+    },
+    {
+      "path": "long-3-on/replay.json",
+      "sha256": "2bc816ab86dd999f6762513166c8f623d5b67200ec7af154c1be5e2f032a84c8",
+      "size": 5053,
+      "original_sha256": "dc2d2f777acd675fbe8c68ee5eca599de6b7f946b3f8f86349e28b4be3673c1b",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-3-on/manifest.json",
+      "sha256": "3c020aaeff5a623edad8aa3531f46f8d5871b59a69503f1e8b856d24cb275087",
+      "size": 1942,
+      "original_sha256": "1d07baa8e33406931386a163bd79d6603f146826c6db5052a9ff24f2297e6bb2",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-3-on/launch.json",
+      "sha256": "00fcec1e07e48631a18977f07e49d0f647b2b49dab4153aa62878017b7cd33f3",
+      "size": 1808,
+      "original_sha256": "b205fa4629964b63c9cf2e7310727a767a4ad6b94ebbde15c197bffcadfae016",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-3-on/health.json",
+      "sha256": "286a4ba48182e5abab55ade4eaf53b82e762b975354d4119e59eff620478c93d",
+      "size": 36998,
+      "original_sha256": "08df22162821fffac3affcfeac931cd51976eaa317740e0db15b76ca1b2b0a9d",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-3-on/health-after.json",
+      "sha256": "561cf4477d0bacc38de618e634069cdbdeb89ad230331df306fc6069e91c3641",
+      "size": 43683,
+      "original_sha256": "f3ca4b1b07e824c55c0d0d7969e3002c3f26449e5b4ce6784e03d140f0c7859a",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-3-on/host-after.json",
+      "sha256": "e91fbc072c6394d3aaf2f2dbb121429d3f9b02797080569cd7baa2beb544d5cf",
+      "size": 356,
+      "original_sha256": "e91fbc072c6394d3aaf2f2dbb121429d3f9b02797080569cd7baa2beb544d5cf",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "long-3-on/restore-commit.jsonl",
+      "sha256": "4378fca4217bf81b904c7b9b9908ca3cbc8c77483c3f56291ad94d0e85bd5139",
+      "size": 8775,
+      "original_sha256": "522816371e4adac0bbc91b39bfb44dbc054845d81c6235c5e5a88c39f66d4564",
+      "transformation": "five measured requests only; selected cache/timing/anchor fields; warmup and unrelated telemetry omitted"
+    },
+    {
+      "path": "long-3-on/generation-events.jsonl",
+      "sha256": "c3eb4d8ec7e943cf3cba498faad9e0e7d02312c4328e05cb4a12839895cefa4e",
+      "size": 1728,
+      "original_sha256": "1912f7b1803f3275f04aa7074eac39563345656b54aea8e7446b5a131c1dfe1b",
+      "transformation": "generation events only; text previews are from the frozen public synthetic fixture"
+    },
+    {
+      "path": "excluded/long-2-on/replay.json",
+      "sha256": "19448ed64e7afbefe40f0c9b61fb559559a0e8d7eaec6c5753c705712fb4be2b",
+      "size": 5050,
+      "original_sha256": "f0354c67bd64a3e3d2832aaff712b84948117461fa6b9b00752a3cee877db5ed",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "excluded/long-2-on/manifest.json",
+      "sha256": "3c020aaeff5a623edad8aa3531f46f8d5871b59a69503f1e8b856d24cb275087",
+      "size": 1942,
+      "original_sha256": "1d07baa8e33406931386a163bd79d6603f146826c6db5052a9ff24f2297e6bb2",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "excluded/long-2-on/launch.json",
+      "sha256": "559502623220ce94c8e863ad3f17fa783bac691a9803e9fe9892f72deab41a8d",
+      "size": 1807,
+      "original_sha256": "c491ed90d794406f38e2096d141deb2b875660e100dc406ca16ea9f31bc0c75b",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "excluded/long-2-on/health.json",
+      "sha256": "3fd028377f62d63ada25df421bd0763f3ced7fe32d600236acdceaf16f63bd68",
+      "size": 36998,
+      "original_sha256": "aa554632eea2f31b8b29c99c01fd7d5a2e751e1b223cdbb0b01e42641c3ff834",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "excluded/long-2-on/health-after.json",
+      "sha256": "52d0f32a7aac0f869345847cff3cbabcbf16c7655e48dedcf5eaae30ed683edb",
+      "size": 43685,
+      "original_sha256": "3e0fa18bb276d9d65493fe662d71cbad1a325e2fdf77c69cc9578c712f2f8f71",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "excluded/long-2-on/host-after.json",
+      "sha256": "5bf74b5665ec961b84653bf132d72030ee0622b0fe8e7b778589da849b204901",
+      "size": 486,
+      "original_sha256": "5bf74b5665ec961b84653bf132d72030ee0622b0fe8e7b778589da849b204901",
+      "transformation": "local path substitution only"
+    },
+    {
+      "path": "excluded/long-2-on/restore-commit.jsonl",
+      "sha256": "9398e8e44ee109f565082b14b2f50d8721ac9d7a3effe9f020c406d2a2a31255",
+      "size": 8773,
+      "original_sha256": "ad2b9e0d39cd0019e8742de088ca39a9e56f76c10ae147b2913d3e7462e91ab3",
+      "transformation": "five measured requests only; selected cache/timing/anchor fields; warmup and unrelated telemetry omitted"
+    },
+    {
+      "path": "excluded/long-2-on/generation-events.jsonl",
+      "sha256": "3c59aaa3e79dfed8a108896c6c71d1aa0161238e775e313cae0ca2a22541d420",
+      "size": 1730,
+      "original_sha256": "4643991047a63f2eb515375c26db109e0ac80d76ad5abe564191e8e541f4bfd8",
+      "transformation": "generation events only; text previews are from the frozen public synthetic fixture"
+    },
+    {
+      "path": "excluded/long-2-on/EXCLUDED.json",
+      "sha256": "013bbf8fcb173c12a100a75ec8e0ef6cb8c726f06ba6bade4b3daa71e3b4ead4",
+      "size": 333,
+      "original_sha256": null,
+      "transformation": "none"
+    },
+    {
+      "path": "short-pair-1.json",
+      "sha256": "e27d72ca13f83e8893a43a4c5770d764df04e0881dc7868359a4281457d2f2c3",
+      "size": 1817,
+      "original_sha256": "e27d72ca13f83e8893a43a4c5770d764df04e0881dc7868359a4281457d2f2c3",
+      "transformation": "none"
+    },
+    {
+      "path": "short-pair-2.json",
+      "sha256": "75e2dcdf0fa2d91e0adb1bc8ac66e7b4686716649430f207ae92b5700d2aed8b",
+      "size": 1814,
+      "original_sha256": "75e2dcdf0fa2d91e0adb1bc8ac66e7b4686716649430f207ae92b5700d2aed8b",
+      "transformation": "none"
+    },
+    {
+      "path": "short-pair-3.json",
+      "sha256": "595c8b7f1524073d8358f80969c126162b08b6ed3e84adfe3b33b8bee71f6995",
+      "size": 1815,
+      "original_sha256": "595c8b7f1524073d8358f80969c126162b08b6ed3e84adfe3b33b8bee71f6995",
+      "transformation": "none"
+    },
+    {
+      "path": "long-pair-1.json",
+      "sha256": "4ad410b62c9c513f9ee83405664beb026a045469b3f1c4d2cc110252eaedba7b",
+      "size": 1830,
+      "original_sha256": "4ad410b62c9c513f9ee83405664beb026a045469b3f1c4d2cc110252eaedba7b",
+      "transformation": "none"
+    },
+    {
+      "path": "long-pair-2.json",
+      "sha256": "c8276dc95128e2fed5eeb9500163c6416349bc03eb5c3485230de5a70a1282dd",
+      "size": 1832,
+      "original_sha256": "c8276dc95128e2fed5eeb9500163c6416349bc03eb5c3485230de5a70a1282dd",
+      "transformation": "none"
+    },
+    {
+      "path": "long-pair-3.json",
+      "sha256": "562440a104e6b8b94114fe08a17106d9ef856e9f450ab99c8d18fbfb680a3938",
+      "size": 1829,
+      "original_sha256": "562440a104e6b8b94114fe08a17106d9ef856e9f450ab99c8d18fbfb680a3938",
+      "transformation": "none"
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "reason": "A second MLX campaign controller appeared after arm launch. The host isolation guard rejected this arm.",
+  "timing_claim_eligible": false,
+  "completed_pair": false,
+  "additional_observation": "The same plain-append output hash divergence recurred, but this excluded arm is not counted as an isolated repetition."
+}

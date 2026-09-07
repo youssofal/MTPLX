@@ -1,0 +1,1445 @@
+{
+  "ok": true,
+  "model": "qwen38-27b-semantic-anchor-validation",
+  "model_path": "<MODEL_DIR>",
+  "vision": {
+    "enabled": true,
+    "formats": [
+      "png",
+      "jpeg",
+      "webp"
+    ]
+  },
+  "generation_mode": "ar",
+  "default_generation_mode": "ar",
+  "runtime_mode": "turbo AR",
+  "parent_runtime_released_for_aime": false,
+  "fan_mode": "default",
+  "fan_boost_active": false,
+  "smart_fan_active_count": 0,
+  "smart_fan_last_transition_at": null,
+  "smart_fan_last_error": null,
+  "smart_fan_target_verified": false,
+  "smart_fan_actual_ramp_verified": false,
+  "smart_fan_ramp_latency_s": null,
+  "smart_fan_actual_ramp_latency_s": null,
+  "startup": {
+    "launch_id": null,
+    "pid": 89062,
+    "app_parent_pid": null,
+    "started_at": 1788764980.067432,
+    "model_id": "qwen38-27b-semantic-anchor-validation",
+    "api_key_required": false,
+    "api_key_source": "disabled_by_no_auth_flag",
+    "paged_kv_quantization": "off",
+    "backend": {
+      "backend_id": "qwen3_next",
+      "architecture_id": "qwen3-next-mtp",
+      "model_family": "qwen",
+      "display_name": "Qwen native MTP",
+      "artifact_layout": "single_mlx_folder_native_mtp",
+      "runtime_capabilities": [
+        "target_logits",
+        "native_draft_head",
+        "exact_speculative_sampling",
+        "sessionbank_committed_mtp_history",
+        "native_adaptive_depth_policy",
+        "async_session_postcommit"
+      ],
+      "sampler_defaults": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20
+      },
+      "reasoning_codec": {
+        "supported": true,
+        "parser": "qwen3",
+        "display_name": "Qwen think tags",
+        "modes": [
+          "auto",
+          "on",
+          "off"
+        ],
+        "default_mode": "auto",
+        "default": "auto",
+        "history_policy": "preserve_when_enabled",
+        "effort_levels": [
+          "xhigh",
+          "medium",
+          "low"
+        ],
+        "default_effort": "medium"
+      },
+      "draft_semantics": {
+        "supported": true,
+        "request_field": "depth",
+        "display_label": "Draft depth",
+        "default": 3,
+        "minimum": 1,
+        "maximum": 3,
+        "unit": "depth",
+        "value_labels": [
+          "D1",
+          "D2",
+          "D3"
+        ]
+      },
+      "uses_external_assistant": false,
+      "uses_draft_lm_head": true,
+      "hidden_variant": "post_norm",
+      "mtp_history_policy": "committed",
+      "target_distribution_modes": [
+        "backend_default"
+      ],
+      "default_target_distribution_mode": "backend_default",
+      "target_distribution_policy": {
+        "modes": [
+          "backend_default"
+        ],
+        "default_mode": "backend_default",
+        "default_window_size": null,
+        "exact": true,
+        "mode_metadata": [],
+        "status": "backend_default",
+        "telemetry_fields": [],
+        "notes": []
+      },
+      "tune_policy": {
+        "supported": true,
+        "supported_families": [
+          "qwen3_5",
+          "qwen3_6",
+          "qwen3_8",
+          "gemma4"
+        ],
+        "control_field": "depth",
+        "candidates": [
+          "AR",
+          "D1",
+          "D2",
+          "D3"
+        ],
+        "unsupported_reason": null
+      },
+      "kv_quant_policy": {
+        "supported": true,
+        "modes": [
+          "off",
+          "q8",
+          "q4"
+        ],
+        "restart_required": true,
+        "proof_level": "unit_and_runtime_cache_validated",
+        "disabled_reason": null
+      },
+      "context_window_policy": {
+        "supported": true,
+        "minimum": 4096,
+        "maximum": 262144,
+        "default": 262144,
+        "step": 1024,
+        "source": "qwen3_next_config",
+        "unit": "tokens"
+      },
+      "default_max_response_tokens": null,
+      "default_tool_prompt_mode": "hybrid",
+      "required_tool_prompt_mode": null,
+      "required_chat_template_profile": null,
+      "allows_chat_template_path": true,
+      "validation_status": "qa_verified",
+      "app_ui_policy": "descriptor_owned",
+      "status": "qa_verified",
+      "profile_policy": "profile-owned",
+      "notes": []
+    },
+    "model_controls": {
+      "schema_version": 1,
+      "model_ref": "<MODEL_DIR>",
+      "model_family": "qwen3_8",
+      "backend_id": "qwen3_next",
+      "architecture_id": "qwen3-next-mtp",
+      "support_level": "qa_verified",
+      "display_name": "Qwen native MTP",
+      "draft_control": {
+        "supported": true,
+        "request_field": "depth",
+        "display_label": "Draft depth",
+        "default": 3,
+        "minimum": 1,
+        "maximum": 3,
+        "unit": "depth",
+        "value_labels": [
+          "D1",
+          "D2",
+          "D3"
+        ]
+      },
+      "sampling": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "family_default_reason": "Qwen3.8 official thinking sampler"
+      },
+      "reasoning": {
+        "supported": true,
+        "parser": "qwen3",
+        "display_name": "Qwen think tags",
+        "modes": [
+          "auto",
+          "on",
+          "off"
+        ],
+        "default_mode": "auto",
+        "default": "auto",
+        "history_policy": "preserve_when_enabled",
+        "effort_levels": [
+          "xhigh",
+          "medium",
+          "low"
+        ],
+        "default_effort": "medium"
+      },
+      "tune": {
+        "supported": true,
+        "supported_families": [
+          "qwen3_5",
+          "qwen3_6",
+          "qwen3_8",
+          "gemma4"
+        ],
+        "control_field": "depth",
+        "candidates": [
+          "AR",
+          "D1",
+          "D2",
+          "D3"
+        ],
+        "unsupported_reason": null
+      },
+      "kv_quant": {
+        "supported": true,
+        "modes": [
+          "off",
+          "q8",
+          "q4"
+        ],
+        "restart_required": true,
+        "proof_level": "unit_and_runtime_cache_validated",
+        "disabled_reason": null
+      },
+      "context_window": {
+        "supported": true,
+        "minimum": 4096,
+        "maximum": 262144,
+        "default": 262144,
+        "step": 1024,
+        "source": "runtime",
+        "unit": "tokens"
+      }
+    },
+    "warmup": {
+      "enabled": true,
+      "ran": true,
+      "tokens": 32,
+      "elapsed_s": 6.692568541000583,
+      "error": null,
+      "completion_tokens": 32,
+      "tok_s": 25.138827367245362,
+      "extended": {
+        "ran": true,
+        "prefill_tokens": 2560,
+        "tok_s": 27.1886548540181,
+        "gqa_packed_pipelines": true,
+        "elapsed_s": 4.305
+      }
+    },
+    "tool_prompt_mode": "native",
+    "tool_contract_active": false,
+    "tool_contract_policy_version": "native_template_tools:agent_tail:v7",
+    "chat_template_profile": "tokenizer",
+    "chat_template_source": "tokenizer",
+    "chat_template_path": null,
+    "chat_template_hash": "c3cf9e34abf4f9e3"
+  },
+  "thermal": {
+    "max_requested": false,
+    "max_verified": false,
+    "actual_ramp_verified": false,
+    "smart": {
+      "active": false,
+      "active_count": 0,
+      "active_requests": [],
+      "commanded_max": false,
+      "target_verified": false,
+      "actual_ramp_verified": false,
+      "ramp_latency_s": null,
+      "actual_ramp_latency_s": null,
+      "ramp_attempts": 0,
+      "last_transition_at": null,
+      "last_error": null,
+      "last_result": null,
+      "restore_verified": true,
+      "restore_failures": 0,
+      "stale_leases_reconciled": 0,
+      "soak_release_temp_c": 75.0,
+      "soak_hold_cap_s": 180.0,
+      "soak_holding": false,
+      "soak_holds": 0,
+      "soak_last_temp_c": null,
+      "soak_last_sensor": null,
+      "soak_release_reason": null
+    },
+    "fan_summary": null,
+    "verified_at": null,
+    "verified": null
+  },
+  "available_generation_modes": [
+    "mtp",
+    "ar"
+  ],
+  "load_mtp": false,
+  "mtp_enabled": false,
+  "depth": 3,
+  "profile": {
+    "name": "turbo",
+    "runtime_profile": "native_mtp_turbo",
+    "summary": "Sustained Mode plus verify-specialized quantized-matmul kernels (MTPLX_NAX_VERIFY) and the compiled verify step for 4-bit models (MTPLX_COMPILED_VERIFY, context-routed). Fastest decode profile.",
+    "env": {
+      "MTPLX_BATCH_TARGET_ARRAYS": "0",
+      "MTPLX_CLEAR_CACHE_EVERY": "auto",
+      "MTPLX_CLEAR_CACHE_EVERY_CONTEXT_THRESHOLD": "16384",
+      "MTPLX_CLEAR_CACHE_EVERY_LONG_CONTEXT": "1024",
+      "MTPLX_COMPILED_VERIFY": "1",
+      "MTPLX_COMPILED_VERIFY_MAX_CONTEXT": "32768",
+      "MTPLX_DEFER_VERIFY_HIDDEN_EVAL": "1",
+      "MTPLX_DROP_EVENTS": "1",
+      "MTPLX_DYNAMIC_PAGED_KV": "1",
+      "MTPLX_GQA_PACKED_SDPA": "1",
+      "MTPLX_GQA_PACKED_SDPA_THRESHOLD": "8192",
+      "MTPLX_LAZY_MTP_HISTORY_APPEND": "1",
+      "MTPLX_LAZY_TARGET_DISTRIBUTIONS": "1",
+      "MTPLX_LAZY_VERIFY_LOGITS": "1",
+      "MTPLX_LONG_CONTEXT_MTP_DEPTH": "3",
+      "MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY": "off",
+      "MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD": "98304",
+      "MTPLX_MTP_HISTORY_LAST_WINDOW": "8192",
+      "MTPLX_MTP_HISTORY_LAST_WINDOW_THRESHOLD": "16384",
+      "MTPLX_MTP_HISTORY_POLICY": "committed",
+      "MTPLX_NAX_FLASH_ROUTE": "1",
+      "MTPLX_NAX_M4_IMPL": "vk_k",
+      "MTPLX_NAX_VERIFY": "1",
+      "MTPLX_PREFILL_CHUNK_CACHE_CLEANUP": "1",
+      "MTPLX_PREFILL_CHUNK_CACHE_CLEANUP_EVERY": "auto",
+      "MTPLX_PREFILL_CHUNK_SIZE": "auto",
+      "MTPLX_PREFILL_CHUNK_SIZE_DENSE": "2048",
+      "MTPLX_PREFILL_CHUNK_SIZE_REPAGE": "2048",
+      "MTPLX_PREFILL_EXTERNAL_EMIT_LOGITS": "0",
+      "MTPLX_PREFILL_OMLX_EXTERNAL": "1",
+      "MTPLX_SKIP_VERIFY_SNAPSHOT": "1",
+      "MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT": "auto",
+      "MTPLX_SUSTAINED_PREFILL": "1",
+      "MTPLX_SUSTAINED_PREFILL_LAYOUT": "auto",
+      "MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS": "0",
+      "MTPLX_VERIFY_HIDDEN_MODE": "logits_first_committed_slice",
+      "MTPLX_VLLM_METAL_PAGED_ATTN": "1",
+      "MTPLX_VLLM_METAL_PAGED_ATTN_IMPL": "mlx_vector_paged",
+      "MTPLX_VLLM_METAL_PAGED_BLOCK_SIZE": "16",
+      "MTPLX_VLLM_METAL_PAGED_PARTITIONED_ATTN": "1",
+      "MTPLX_VLLM_METAL_PAGED_PARTITION_SIZE": "512",
+      "MTPLX_VLLM_METAL_PAGED_PARTITION_THRESHOLD": "2048",
+      "MTPLX_VLLM_METAL_PAGED_TURBOQUANT": "0",
+      "MTPLX_WARMUP_LADDER": "512,2560"
+    },
+    "sampler": {
+      "temperature": 0.0,
+      "top_p": 0.95,
+      "top_k": 20
+    },
+    "model_id": "qwen38-27b-semantic-anchor-validation",
+    "benchmark_ids": [],
+    "caveats": [
+      "Speculative-verify matmuls use the MTPLX verify_kernels family. 4-bit (vk_k): argmax- and sampler-distribution-validated, not bit-exact vs stock. 8-bit (vk q8): ULP-exact vs stock.",
+      "Prefill and non-speculative decode remain bit-identical to stock.",
+      "4-bit and 8-bit affine models; 6-bit models silently run the stock path.",
+      "Compiled verify engages on 4-bit and 8-bit affine trunks at contexts <= 32768 (parity2-validated on both; fence raised from 12288 in 2.7.0); other quantizations/contexts run the eager verify path unchanged.",
+      "Measured 2026-07-02/03 on M5 Max chat lane (app-launch flags, thinking on): 27B Optimized-Speed 44.7 -> 58-60 tok/s (vk_k within ~2% of the retired dflash-port kernel both directions); 27B Optimized-Quality 31-36 -> 43-44 tok/s (+22-40%, q8 verify 61-64 ms/call vs stock 81-93).",
+      "Runs on stock PyPI MLX; the MTPLX verify kernels are shipped in-package Metal kernels, not an MLX fork or patched qmm build."
+    ],
+    "draft_lm_head": {
+      "bits": 4,
+      "group_size": 64,
+      "mode": "affine"
+    },
+    "draft_sampler": null,
+    "qa_only": false,
+    "fan_control_allowed": false,
+    "clock_anchor_allowed": false,
+    "product_claim_eligible": false,
+    "profile_default_model_id": "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed",
+    "profile_default_sampler": {
+      "temperature": 0.6,
+      "top_p": 0.95,
+      "top_k": 20
+    }
+  },
+  "adaptive": {
+    "policy": "none"
+  },
+  "proposal_cache": {
+    "online_correction_cache": false,
+    "online_correction_cache_min_depth": 1,
+    "online_correction_cache_key": "local_prefix",
+    "prompt_correction_cache": false,
+    "prompt_correction_cache_min_depth": 2
+  },
+  "online_hidden": {
+    "alpha": 0.0,
+    "decay": 0.8,
+    "warmup": 1,
+    "max_feed_depth": null,
+    "key": "global"
+  },
+  "verify_core": "linear-gdn-from-conv-tape",
+  "verify_strategy": "capture_commit",
+  "reasoning": "auto",
+  "enable_thinking": true,
+  "preserve_thinking": "on",
+  "preserve_thinking_effective": true,
+  "reasoning_history_mode": "preserve",
+  "strip_assistant_reasoning_history": false,
+  "context_window": 131072,
+  "max_response_tokens": null,
+  "api_key_required": false,
+  "api_key_source": "disabled_by_no_auth_flag",
+  "paged_kv_quantization": "off",
+  "paged_kv_quantization_detail": {
+    "mode": "off"
+  },
+  "kernel_selfcheck": {
+    "ran": true,
+    "elapsed_ms": 16.887333000340732,
+    "dtype": "bfloat16",
+    "bits": 4,
+    "fused_add_rmsnorm": "skipped",
+    "fused_gdn_norm_gate": "skipped",
+    "gdn_postconv_headquarter": "skipped",
+    "gdn_postconv_inline_g": "skipped",
+    "gqa_packed_sdpa": "ok",
+    "lm_head_topk": "skipped",
+    "nax_flash_dsplit_sdpa": "ok",
+    "nax_flash_sdpa": "ok",
+    "nax_tile_sdpa": "skipped",
+    "qmm_m16_nax": "ok",
+    "qmm_m4": "ok",
+    "qmm_m4_wide": "skipped",
+    "qmm_m6": "ok",
+    "qmm_m6_wide": "skipped",
+    "qmm_m8_ksplit": "skipped",
+    "qwen_combine_tail_m1_m2": "skipped",
+    "qwen_row_owned_router": "skipped"
+  },
+  "rate_limit_per_minute": 0,
+  "stream_interval": 1,
+  "warmup": {
+    "enabled": true,
+    "ran": true,
+    "tokens": 32,
+    "elapsed_s": 6.692568541000583,
+    "error": null,
+    "completion_tokens": 32,
+    "tok_s": 25.138827367245362,
+    "extended": {
+      "ran": true,
+      "prefill_tokens": 2560,
+      "tok_s": 27.1886548540181,
+      "gqa_packed_pipelines": true,
+      "elapsed_s": 4.305
+    }
+  },
+  "foreground_active": 0,
+  "dashboard_active_requests": 0,
+  "active_requests": 0,
+  "scheduler": {
+    "config": {
+      "mode": "serial",
+      "preset": "latency",
+      "max_active_requests": 1,
+      "decode_batch_max": 1,
+      "batch_wait_ms": 0.0,
+      "prefill_chunk_tokens": 1024,
+      "experimental_mtp_cohorts": false
+    },
+    "mode": "serial",
+    "preset": "latency",
+    "scheduler_policy": "solo_mtp_oracle",
+    "active_lane": "serial_ar",
+    "active_requests": 0,
+    "mtp_available": false,
+    "mtp_disabled_reason": "generation_mode_ar",
+    "mtp_batch_numerics": null,
+    "mtp_batch_route_id": null,
+    "mtp_batch_config_fingerprint": null,
+    "mtp_batch_construction_receipt": {},
+    "mtp_batch_installed_widths": [],
+    "mtp_batch_width_routes": {},
+    "path": "path_a",
+    "ar_batch_unavailable_reason": null,
+    "path_a": {
+      "solo_mtp_protected": true,
+      "concurrent_strategy": "cooperative_ar_batch",
+      "batched_mtp_required_for_v1": false
+    },
+    "path_b": {
+      "experimental_mtp_cohorts": false,
+      "default_enabled": false
+    },
+    "telemetry": {
+      "idle_keepalive": {
+        "armed": true,
+        "attentive": true,
+        "interval_s": 1.0,
+        "attentive_s": 600.0,
+        "attentive_remaining_s": 599.9926012079977,
+        "beats": 2,
+        "errors": 0,
+        "last_error": null,
+        "last_beat_age_s": 12.173817124999914,
+        "last_beat_duration_s": 0.0006181250009831274,
+        "warm": true
+      },
+      "foreground_pending": 0,
+      "idle_pending": 1,
+      "persistence_pending": 1,
+      "persistence_coalesced": 4,
+      "persistence_pump_budget": 0,
+      "persistence_pumped": 0,
+      "active_kind": null,
+      "active_sequence": null,
+      "active_batch_key": null,
+      "active_run_s": null,
+      "active_queue_wait_s": null,
+      "started": 19,
+      "completed": 19,
+      "cancelled_before_start": 0,
+      "request_cancelled": 0,
+      "completed_by_kind": {
+        "foreground": 15,
+        "idle_postcommit": 4
+      },
+      "started_by_batch_key": {
+        "startup.load": 1,
+        "startup.chat_template_profile": 1,
+        "startup.template_hash": 1,
+        "startup.warmup": 1,
+        "startup.warmup_extended": 1,
+        "chat.stream": 5,
+        "postcommit.stream.final": 5,
+        "postcommit": 4
+      },
+      "batch_histogram": {
+        "1": 15
+      },
+      "queue_wait_s": {
+        "count": 19,
+        "latest": 7.95800042396877e-06,
+        "min": 7.4169984145555645e-06,
+        "max": 0.30503145799957565,
+        "mean": 0.06417864021022979,
+        "p50": 4.441599958227016e-05,
+        "p95": 0.30502939609887103
+      },
+      "run_duration_s": {
+        "count": 19,
+        "latest": 0.00479145899953437,
+        "min": 2.7833999411086552e-05,
+        "max": 6.08389116699982,
+        "mean": 0.8129004233687738,
+        "p50": 0.13441475000036007,
+        "p95": 3.5731714423001844
+      },
+      "cancellation_latency_s": {
+        "count": 0,
+        "latest": null,
+        "min": null,
+        "max": null,
+        "mean": null,
+        "p50": null,
+        "p95": null
+      },
+      "owner_thread_id": 6148829184,
+      "shutdown": false
+    },
+    "ar_batch": {
+      "pending": 0,
+      "active": 0,
+      "pump_scheduled": false,
+      "last_batch_size": 0,
+      "last_error": null
+    },
+    "mtp_batch": {},
+    "hyper": {}
+  },
+  "session_bank": {
+    "max_entries": 24,
+    "max_bytes": 34359738368,
+    "effective_max_bytes": 34359738368,
+    "dynamic_ceiling_bytes": null,
+    "dynamic_ceiling_errors": 0,
+    "protect_newest_extending": false,
+    "protected_rejections": 0,
+    "shed_gdn_boundaries_to_fit": false,
+    "boundary_shed_puts": 0,
+    "boundary_shed_records": 0,
+    "per_session_max_bytes": 25769803776,
+    "idle_ttl_s": 3600.0,
+    "entries": 3,
+    "total_nbytes": 4058168320,
+    "last_miss_reason": null,
+    "last_restore_source": "ram",
+    "last_ssd_restore_s": 0.0,
+    "last_prefix_diagnostic": {
+      "prompt_len": 4281,
+      "session_id": "semantic-anchor-controlled-short",
+      "stored_prefix_len": 4125,
+      "common_prefix_tokens": 4125,
+      "nearest_boundary_tokens": 4125,
+      "new_prefill_tokens": 156,
+      "miss_reason": null,
+      "restore_kind": "exact_prefix"
+    },
+    "active_pin_ttl_s": 600.0,
+    "active_sessions": [
+      "semantic-anchor-controlled-short"
+    ],
+    "recent_evictions": [
+      {
+        "reason": "session_entry_retention",
+        "session_id": "semantic-anchor-controlled-short",
+        "prefix_len": 4097,
+        "token_hash": "678668bc9d826f954d17e34fc35529b4318263f57a56e2cd7671e00f0400bd23",
+        "nbytes": 1500550144,
+        "last_access_s": 1788764996.7671602,
+        "session_active": true
+      },
+      {
+        "reason": "session_entry_retention",
+        "session_id": "semantic-anchor-controlled-short",
+        "prefix_len": 4164,
+        "token_hash": "f69e26c0a91426532af711c8be86a5822b5e8df1f72747a5bec49b084d6c0649",
+        "nbytes": 1350996992,
+        "last_access_s": 1788764998.697502,
+        "session_active": true
+      }
+    ],
+    "cold_tier": {
+      "format_version": 3,
+      "mode": "on",
+      "dir": "<CAMPAIGN_DIR>/short-3-on/ssd-cache",
+      "max_bytes": 21474836480,
+      "min_prefix_tokens": 512,
+      "block_size": 256,
+      "writes_enqueued": 0,
+      "writes_completed": 0,
+      "write_failures": 0,
+      "write_only_skips": 0,
+      "skipped_too_short": 0,
+      "skipped_queue_full": 0,
+      "skipped_size_cap": 0,
+      "skipped_serialize_error": 0,
+      "deduped_blob_hits": 0,
+      "entries_evicted": 0,
+      "restore_hits": 0,
+      "restore_misses": 11,
+      "restore_failures": 0,
+      "corrupt_entries": 0,
+      "orphan_cleanup_runs": 0,
+      "orphan_cleanup_files_deleted": 0,
+      "orphan_cleanup_dirs_deleted": 0,
+      "orphan_cleanup_disk_bytes_deleted": 0,
+      "orphan_cleanup_last_s": 0.0,
+      "last_write_s": null,
+      "last_restore_s": null,
+      "last_miss_reason": "ssd_prefix_miss",
+      "last_archive_path": null,
+      "encode_yields_foreground": 0,
+      "writer_foreground_pauses": 0,
+      "writer_foreground_pause_s": 0.0,
+      "writer_pause_expired_busy": 0,
+      "enabled": true,
+      "restorable": true,
+      "writer_queue_depth": 0,
+      "writer_backlog_bytes": 0,
+      "writer_backlog_budget_bytes": 4294967296,
+      "written_bytes_last_hour": 0,
+      "write_budget_per_hour_bytes": 68719476736,
+      "manifest_path": "<CAMPAIGN_DIR>/short-3-on/ssd-cache/manifest.sqlite",
+      "entries": 0,
+      "logical_bytes": 0,
+      "bytes": 0,
+      "physical_bytes": 0,
+      "live_physical_bytes": 0,
+      "deduped_bytes": 0,
+      "dedupe_ratio": 0.0,
+      "managed_file_bytes": 20480,
+      "managed_disk_bytes": 20480,
+      "database_file_bytes": 20480,
+      "database_disk_bytes": 20480,
+      "managed_file_count": 1,
+      "managed_dir_count": 2,
+      "disk_usage_scan_s": 0.00044024999988323543,
+      "disk_usage_last_scan_s": 1788764989.959497,
+      "disk_usage_scan_pending": false,
+      "disk_usage_stale": false,
+      "manifest_physical_bytes_at_scan": 0,
+      "disk_usage_generation": 0,
+      "untracked_file_bytes": 0,
+      "untracked_disk_bytes": 0,
+      "orphan_cleanup_running": false
+    },
+    "prefixes": [
+      {
+        "session_id": "semantic-anchor-controlled-short",
+        "prefix_len": 4125,
+        "token_hash": "715a3c4bdb2679be4a45002ee92eeb171cb48cedd2dd30b5aa830943f3b50468",
+        "model_path": "<MODEL_DIR>",
+        "mtp_enabled": false,
+        "hidden_variant": "post_norm",
+        "template_hash": "c3cf9e34abf4f9e3",
+        "mtp_history_policy": "cycle",
+        "draft_head_identity": null,
+        "policy_fingerprint": "template=c3cf9e34abf4f9e3;thinking=0;strip_reasoning=0;openai_bridge=omlx_style:preserve_history:parse_at_completion:tool_digest:v4;tool_prompt_mode=native;tool_contract=native_template_tools:agent_tail:v7;no_tools_contract=0;simple_chat_contract=0;opencode_prompt_contract=none;generation_mode=ar;depth=0;hidden_variant=post_norm;mtp_history_policy=cycle;draft_head=None;adaptive={\"policy\":\"none\"};proposal_cache={\"online_correction_cache\":false,\"online_correction_cache_key\":\"local_prefix\",\"online_correction_cache_min_depth\":1,\"prompt_correction_cache\":false,\"prompt_correction_cache_min_depth\":2};online_hidden={\"alpha\":0.0,\"decay\":0.8,\"key\":\"global\",\"max_feed_depth\":null,\"warmup\":1}",
+        "hits": 5,
+        "nbytes": 1348441088,
+        "created_at_s": 1788764996.7680159,
+        "last_access_s": 1788765000.858494,
+        "has_live_ref": true,
+        "has_mtp_history_live_ref": false,
+        "live_ref_only": false,
+        "snapshot_epoch": 4125,
+        "mtp_snapshot_epoch": null,
+        "lazy_kv": true,
+        "has_recurrent": true,
+        "gdn_boundaries": [
+          2048,
+          2816,
+          3328,
+          3584,
+          3840,
+          4090
+        ]
+      },
+      {
+        "session_id": "semantic-anchor-controlled-short",
+        "prefix_len": 4199,
+        "token_hash": "38804dab4fae6e6095c124765b82215cedfd5018936a98ca264b2b6ce74017ab",
+        "model_path": "<MODEL_DIR>",
+        "mtp_enabled": false,
+        "hidden_variant": "post_norm",
+        "template_hash": "c3cf9e34abf4f9e3",
+        "mtp_history_policy": "cycle",
+        "draft_head_identity": null,
+        "policy_fingerprint": "template=c3cf9e34abf4f9e3;thinking=0;strip_reasoning=0;openai_bridge=omlx_style:preserve_history:parse_at_completion:tool_digest:v4;tool_prompt_mode=native;tool_contract=native_template_tools:agent_tail:v7;no_tools_contract=0;simple_chat_contract=0;opencode_prompt_contract=none;generation_mode=ar;depth=0;hidden_variant=post_norm;mtp_history_policy=cycle;draft_head=None;adaptive={\"policy\":\"none\"};proposal_cache={\"online_correction_cache\":false,\"online_correction_cache_key\":\"local_prefix\",\"online_correction_cache_min_depth\":1,\"prompt_correction_cache\":false,\"prompt_correction_cache_min_depth\":2};online_hidden={\"alpha\":0.0,\"decay\":0.8,\"key\":\"global\",\"max_feed_depth\":null,\"warmup\":1}",
+        "hits": 1,
+        "nbytes": 1353290752,
+        "created_at_s": 1788764998.8227232,
+        "last_access_s": 1788765000.560014,
+        "has_live_ref": true,
+        "has_mtp_history_live_ref": false,
+        "live_ref_only": false,
+        "snapshot_epoch": 4199,
+        "mtp_snapshot_epoch": null,
+        "lazy_kv": true,
+        "has_recurrent": true,
+        "gdn_boundaries": [
+          2048,
+          2816,
+          3328,
+          3584,
+          3840,
+          4090
+        ]
+      },
+      {
+        "session_id": "semantic-anchor-controlled-short",
+        "prefix_len": 4247,
+        "token_hash": "47619d6e256c7bd60f802238dc6626d59d0306ed743bafc28a5f815cb058c630",
+        "model_path": "<MODEL_DIR>",
+        "mtp_enabled": false,
+        "hidden_variant": "post_norm",
+        "template_hash": "c3cf9e34abf4f9e3",
+        "mtp_history_policy": "cycle",
+        "draft_head_identity": null,
+        "policy_fingerprint": "template=c3cf9e34abf4f9e3;thinking=0;strip_reasoning=0;openai_bridge=omlx_style:preserve_history:parse_at_completion:tool_digest:v4;tool_prompt_mode=native;tool_contract=native_template_tools:agent_tail:v7;no_tools_contract=0;simple_chat_contract=0;opencode_prompt_contract=none;generation_mode=ar;depth=0;hidden_variant=post_norm;mtp_history_policy=cycle;draft_head=None;adaptive={\"policy\":\"none\"};proposal_cache={\"online_correction_cache\":false,\"online_correction_cache_key\":\"local_prefix\",\"online_correction_cache_min_depth\":1,\"prompt_correction_cache\":false,\"prompt_correction_cache_min_depth\":2};online_hidden={\"alpha\":0.0,\"decay\":0.8,\"key\":\"global\",\"max_feed_depth\":null,\"warmup\":1}",
+        "hits": 0,
+        "nbytes": 1356436480,
+        "created_at_s": 1788765000.6876621,
+        "last_access_s": 1788765000.6876621,
+        "has_live_ref": true,
+        "has_mtp_history_live_ref": false,
+        "live_ref_only": false,
+        "snapshot_epoch": 4247,
+        "mtp_snapshot_epoch": null,
+        "lazy_kv": true,
+        "has_recurrent": true,
+        "gdn_boundaries": [
+          2048,
+          2816,
+          3328,
+          3584,
+          3840,
+          4090
+        ]
+      }
+    ],
+    "eviction_log": [
+      {
+        "reason": "session_entry_retention",
+        "session_id": "semantic-anchor-controlled-short",
+        "prefix_len": 4097,
+        "token_hash": "678668bc9d826f954d17e34fc35529b4318263f57a56e2cd7671e00f0400bd23",
+        "nbytes": 1500550144,
+        "last_access_s": 1788764996.7671602,
+        "session_active": true
+      },
+      {
+        "reason": "session_entry_retention",
+        "session_id": "semantic-anchor-controlled-short",
+        "prefix_len": 4164,
+        "token_hash": "f69e26c0a91426532af711c8be86a5822b5e8df1f72747a5bec49b084d6c0649",
+        "nbytes": 1350996992,
+        "last_access_s": 1788764998.697502,
+        "session_active": true
+      }
+    ]
+  },
+  "ssd_session_cache": {
+    "format_version": 3,
+    "mode": "on",
+    "dir": "<CAMPAIGN_DIR>/short-3-on/ssd-cache",
+    "max_bytes": 21474836480,
+    "min_prefix_tokens": 512,
+    "block_size": 256,
+    "writes_enqueued": 0,
+    "writes_completed": 0,
+    "write_failures": 0,
+    "write_only_skips": 0,
+    "skipped_too_short": 0,
+    "skipped_queue_full": 0,
+    "skipped_size_cap": 0,
+    "skipped_serialize_error": 0,
+    "deduped_blob_hits": 0,
+    "entries_evicted": 0,
+    "restore_hits": 0,
+    "restore_misses": 11,
+    "restore_failures": 0,
+    "corrupt_entries": 0,
+    "orphan_cleanup_runs": 0,
+    "orphan_cleanup_files_deleted": 0,
+    "orphan_cleanup_dirs_deleted": 0,
+    "orphan_cleanup_disk_bytes_deleted": 0,
+    "orphan_cleanup_last_s": 0.0,
+    "last_write_s": null,
+    "last_restore_s": null,
+    "last_miss_reason": "ssd_prefix_miss",
+    "last_archive_path": null,
+    "encode_yields_foreground": 0,
+    "writer_foreground_pauses": 0,
+    "writer_foreground_pause_s": 0.0,
+    "writer_pause_expired_busy": 0,
+    "enabled": true,
+    "restorable": true,
+    "writer_queue_depth": 0,
+    "writer_backlog_bytes": 0,
+    "writer_backlog_budget_bytes": 4294967296,
+    "written_bytes_last_hour": 0,
+    "write_budget_per_hour_bytes": 68719476736,
+    "manifest_path": "<CAMPAIGN_DIR>/short-3-on/ssd-cache/manifest.sqlite",
+    "entries": 0,
+    "logical_bytes": 0,
+    "bytes": 0,
+    "physical_bytes": 0,
+    "live_physical_bytes": 0,
+    "deduped_bytes": 0,
+    "dedupe_ratio": 0.0,
+    "managed_file_bytes": 20480,
+    "managed_disk_bytes": 20480,
+    "database_file_bytes": 20480,
+    "database_disk_bytes": 20480,
+    "managed_file_count": 1,
+    "managed_dir_count": 2,
+    "disk_usage_scan_s": 0.00044024999988323543,
+    "disk_usage_last_scan_s": 1788764989.959497,
+    "disk_usage_scan_pending": false,
+    "disk_usage_stale": false,
+    "manifest_physical_bytes_at_scan": 0,
+    "disk_usage_generation": 0,
+    "untracked_file_bytes": 0,
+    "untracked_disk_bytes": 0,
+    "orphan_cleanup_running": false
+  },
+  "last_request_started_at": 1788765000.85692,
+  "requests_completed": 5,
+  "requests_cancelled": 0,
+  "last_request_at": 1788765001.4114711,
+  "idle_seconds": 0.01302790641784668,
+  "gpu_keepalive": {
+    "enabled": true,
+    "interval_s": 1.0,
+    "attentive_s": 600.0,
+    "wired_limit_bytes": 82463372083,
+    "armed": true,
+    "attentive": true,
+    "attentive_remaining_s": 599.9921224169975,
+    "beats": 2,
+    "errors": 0,
+    "last_error": null,
+    "last_beat_age_s": 12.17429591600012,
+    "last_beat_duration_s": 0.0006181250009831274,
+    "warm": true
+  },
+  "reasoning_parser": "qwen3",
+  "load_time_s": 2.4129615830006514,
+  "draft_lm_head": {
+    "installed": false,
+    "reason": "mtp_disabled"
+  },
+  "draft_sampler": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0
+  },
+  "draft_head_identity": null,
+  "tokenizer_template_hash": "c3cf9e34abf4f9e3",
+  "fast_path_env": {
+    "MTPLX_LAZY_VERIFY_LOGITS": {
+      "expected": "1",
+      "observed": "1",
+      "ok": true
+    },
+    "MTPLX_BATCH_TARGET_ARRAYS": {
+      "expected": "0",
+      "observed": "0",
+      "ok": true
+    },
+    "MTPLX_LAZY_TARGET_DISTRIBUTIONS": {
+      "expected": "1",
+      "observed": "1",
+      "ok": true
+    },
+    "MTPLX_LAZY_MTP_HISTORY_APPEND": {
+      "expected": "1",
+      "observed": "1",
+      "ok": true
+    },
+    "MTPLX_DROP_EVENTS": {
+      "expected": "1",
+      "observed": "1",
+      "ok": true
+    },
+    "MTPLX_SKIP_VERIFY_SNAPSHOT": {
+      "expected": "1",
+      "observed": "1",
+      "ok": true
+    }
+  },
+  "qwen4_install_reports": {},
+  "profile_env": {
+    "MTPLX_BATCH_TARGET_ARRAYS": {
+      "expected": "0",
+      "observed": "0",
+      "override_allowed": true,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_CLEAR_CACHE_EVERY": {
+      "expected": "auto",
+      "observed": "auto",
+      "override_allowed": true,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_CLEAR_CACHE_EVERY_CONTEXT_THRESHOLD": {
+      "expected": "16384",
+      "observed": "16384",
+      "override_allowed": true,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_CLEAR_CACHE_EVERY_LONG_CONTEXT": {
+      "expected": "1024",
+      "observed": "1024",
+      "override_allowed": true,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_COMPILED_VERIFY": {
+      "expected": "1",
+      "observed": "1",
+      "override_allowed": true,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_COMPILED_VERIFY_MAX_CONTEXT": {
+      "expected": "32768",
+      "observed": "32768",
+      "override_allowed": true,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_DEFER_VERIFY_HIDDEN_EVAL": {
+      "expected": "1",
+      "observed": "1",
+      "override_allowed": false,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_DROP_EVENTS": {
+      "expected": "1",
+      "observed": "1",
+      "override_allowed": true,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_DYNAMIC_PAGED_KV": {
+      "expected": "1",
+      "observed": "1",
+      "override_allowed": false,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_GQA_PACKED_SDPA": {
+      "expected": "1",
+      "observed": "1",
+      "override_allowed": true,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_GQA_PACKED_SDPA_THRESHOLD": {
+      "expected": "8192",
+      "observed": "8192",
+      "override_allowed": true,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_LAZY_MTP_HISTORY_APPEND": {
+      "expected": "1",
+      "observed": "1",
+      "override_allowed": false,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_LAZY_TARGET_DISTRIBUTIONS": {
+      "expected": "1",
+      "observed": "1",
+      "override_allowed": true,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_LAZY_VERIFY_LOGITS": {
+      "expected": "1",
+      "observed": "1",
+      "override_allowed": false,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_LONG_CONTEXT_MTP_DEPTH": {
+      "expected": "3",
+      "observed": "3",
+      "override_allowed": true,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY": {
+      "expected": "off",
+      "observed": "off",
+      "override_allowed": true,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD": {
+      "expected": "98304",
+      "observed": "98304",
+      "override_allowed": true,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_MTP_HISTORY_LAST_WINDOW": {
+      "expected": "8192",
+      "observed": "8192",
+      "override_allowed": true,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_MTP_HISTORY_LAST_WINDOW_THRESHOLD": {
+      "expected": "16384",
+      "observed": "16384",
+      "override_allowed": true,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_MTP_HISTORY_POLICY": {
+      "expected": "committed",
+      "observed": "committed",
+      "override_allowed": true,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_NAX_FLASH_ROUTE": {
+      "expected": "1",
+      "observed": "1",
+      "override_allowed": true,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_NAX_M4_IMPL": {
+      "expected": "vk_k",
+      "observed": "vk_k",
+      "override_allowed": false,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_NAX_VERIFY": {
+      "expected": "1",
+      "observed": "1",
+      "override_allowed": false,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_PREFILL_CHUNK_CACHE_CLEANUP": {
+      "expected": "1",
+      "observed": "1",
+      "override_allowed": false,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_PREFILL_CHUNK_CACHE_CLEANUP_EVERY": {
+      "expected": "auto",
+      "observed": "auto",
+      "override_allowed": false,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_PREFILL_CHUNK_SIZE": {
+      "expected": "auto",
+      "observed": "auto",
+      "override_allowed": true,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_PREFILL_CHUNK_SIZE_DENSE": {
+      "expected": "2048",
+      "observed": "2048",
+      "override_allowed": true,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_PREFILL_CHUNK_SIZE_REPAGE": {
+      "expected": "2048",
+      "observed": "2048",
+      "override_allowed": true,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_PREFILL_EXTERNAL_EMIT_LOGITS": {
+      "expected": "0",
+      "observed": "0",
+      "override_allowed": false,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_PREFILL_OMLX_EXTERNAL": {
+      "expected": "1",
+      "observed": "1",
+      "override_allowed": false,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_SKIP_VERIFY_SNAPSHOT": {
+      "expected": "1",
+      "observed": "1",
+      "override_allowed": true,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT": {
+      "expected": "auto",
+      "observed": "auto",
+      "override_allowed": true,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_SUSTAINED_PREFILL": {
+      "expected": "1",
+      "observed": "1",
+      "override_allowed": false,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_SUSTAINED_PREFILL_LAYOUT": {
+      "expected": "auto",
+      "observed": "auto",
+      "override_allowed": true,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_TARGET_EMIT_FULL_PREFILL_LOGITS": {
+      "expected": "0",
+      "observed": "0",
+      "override_allowed": false,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_VERIFY_HIDDEN_MODE": {
+      "expected": "logits_first_committed_slice",
+      "observed": "logits_first_committed_slice",
+      "override_allowed": false,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_VLLM_METAL_PAGED_ATTN": {
+      "expected": "1",
+      "observed": "1",
+      "override_allowed": false,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_VLLM_METAL_PAGED_ATTN_IMPL": {
+      "expected": "mlx_vector_paged",
+      "observed": "mlx_vector_paged",
+      "override_allowed": false,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_VLLM_METAL_PAGED_BLOCK_SIZE": {
+      "expected": "16",
+      "observed": "16",
+      "override_allowed": false,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_VLLM_METAL_PAGED_PARTITIONED_ATTN": {
+      "expected": "1",
+      "observed": "1",
+      "override_allowed": false,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_VLLM_METAL_PAGED_PARTITION_SIZE": {
+      "expected": "512",
+      "observed": "512",
+      "override_allowed": false,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_VLLM_METAL_PAGED_PARTITION_THRESHOLD": {
+      "expected": "2048",
+      "observed": "2048",
+      "override_allowed": false,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_VLLM_METAL_PAGED_TURBOQUANT": {
+      "expected": "0",
+      "observed": "0",
+      "override_allowed": true,
+      "overridden": false,
+      "ok": true
+    },
+    "MTPLX_WARMUP_LADDER": {
+      "expected": "512,2560",
+      "observed": "512,2560",
+      "override_allowed": true,
+      "overridden": false,
+      "ok": true
+    }
+  },
+  "diagnostic_env_ablation": false,
+  "mtp_history_materialize_every": null,
+  "clear_cache_every": "auto",
+  "trunk_cache_materialize_every": null,
+  "state_rebase_every": null,
+  "state_root_eval": null,
+  "state_root_eval_include_mtp": null,
+  "state_root_eval_include_live": null,
+  "target_layer_eval_every": null,
+  "target_layer_eval_schedule": null,
+  "target_layer_eval_context_threshold": null,
+  "target_layer_eval_max_q": null,
+  "defer_verify_hidden_eval": "1",
+  "late_depth_switch_after_tokens": null,
+  "late_depth_before": null,
+  "late_depth_after": null,
+  "long_context_mtp_depth_policy": "off",
+  "long_context_mtp_depth_threshold": "98304",
+  "long_context_mtp_depth": "3",
+  "opencode_short_context_depth_policy": {
+    "active": false,
+    "reason": "disabled_depth_preservation",
+    "default_depth": 3
+  },
+  "opencode_short_context_depth2_tokens": null,
+  "mtp_position_mode": null,
+  "mtp_position_cap": null,
+  "mtp_position_period": null,
+  "mtp_position_base": null,
+  "split_verify_eval": null,
+  "split_full_attn": null,
+  "split_full_attn_chunk_size": null,
+  "split_full_attn_threshold": null,
+  "sdpa_2pass": null,
+  "sdpa_2pass_threshold": null,
+  "sdpa_2pass_max_q": null,
+  "blockwise_attn": null,
+  "blockwise_attn_threshold": null,
+  "dirty_detach_components": null,
+  "dirty_detach_mode": null,
+  "dirty_detach_gdn_every": null,
+  "dirty_detach_conv_every": null,
+  "dirty_detach_attn_every": null,
+  "capture_commit_detach_components": null,
+  "capture_commit_detach_mode": null,
+  "capture_commit_detach_gdn_every": null,
+  "capture_commit_detach_conv_every": null,
+  "owned_recurrent_state": null,
+  "owned_recurrent_state_mode": null,
+  "owned_attn_kv": null,
+  "owned_attn_kv_mode": null,
+  "owned_attn_kv_step": null,
+  "owned_attn_kv_block_size": null,
+  "vllm_metal_paged_attn": "1",
+  "vllm_metal_paged_block_size": "16",
+  "vllm_metal_paged_num_blocks": null,
+  "vllm_metal_paged_sliding_window": null,
+  "vllm_metal_paged_partitioned_attn": "1",
+  "vllm_metal_paged_partition_threshold": "2048",
+  "vllm_metal_paged_partition_size": "512",
+  "vllm_metal_paged_mtp_attn": null,
+  "vllm_metal_paged_mtp_block_size": null,
+  "vllm_metal_paged_mtp_num_blocks": null,
+  "vllm_metal_paged_turboquant": "0",
+  "vllm_metal_paged_turboquant_k_quant": null,
+  "vllm_metal_paged_turboquant_v_quant": null,
+  "vllm_metal_paged_kv_quant": "off",
+  "native_mlp_rowwise": null,
+  "native_mlp_min_m": null,
+  "native_mlp_max_m": null,
+  "native_mlp_context_threshold": null,
+  "mlp_call_variant": null,
+  "mlp_variant_stats": {
+    "enabled": false,
+    "variant": "stock",
+    "variant_calls": 0,
+    "native_calls": 0,
+    "fallback_calls": 0,
+    "min_m": 2,
+    "max_m": 6,
+    "context_threshold": 0,
+    "current_context_tokens": -1
+  },
+  "native_gdn_tail": null,
+  "native_gdn_tail_simdgroups": null,
+  "live_output_detach": null,
+  "live_output_detach_mode": null,
+  "aime_process_isolation": null,
+  "degradation": {
+    "compiled_verify": {
+      "mode": "on",
+      "permanent_eager": false,
+      "reason": "unknown",
+      "flip_count": 0,
+      "transient_exception_count": 0
+    },
+    "profile_env_overridden": [],
+    "nax": {
+      "env_enabled": true,
+      "available": true,
+      "counters": {},
+      "bail_counters": {
+        "gqa_packed_bail_counts": {},
+        "gqa_packed_route_bail_counts": {
+          "capacity_below_threshold": 32
+        },
+        "nax_flash_bail_counts": {},
+        "nax_flash_dsplit_bail_counts": {},
+        "nax_tile_bail_counts": {}
+      },
+      "flash_dispatch_counters": {
+        "nax_flash_dispatch_counts": {
+          "dispatched": 1
+        },
+        "nax_flash_dsplit_dispatch_counts": {
+          "dispatched": 1
+        }
+      }
+    }
+  },
+  "metal_memory_caps": {
+    "applied": true,
+    "total_ram_bytes": 137438953472,
+    "total_ram_source": "sysctl_hw_memsize",
+    "memory_limit_api": "mx.set_memory_limit",
+    "memory_limit_bytes": 103079215104,
+    "memory_limit_source": "default",
+    "wired_limit_api": "mx.set_wired_limit",
+    "wired_limit_bytes": 82463372083
+  },
+  "memory_plan": {
+    "available": true,
+    "unavailable_reason": null,
+    "total_ram_bytes": 137438953472,
+    "memory_budget_bytes": null,
+    "usable_bytes": 103079215104,
+    "model_weights_bytes": 20683241105,
+    "ngram_table_streamed_bytes": 0,
+    "kv_bytes_per_token": 65536,
+    "kv_quantization": "off",
+    "kv_bytes_per_token_effective": 65536,
+    "aux_bytes_per_token": 0,
+    "prefill_transient_bytes_per_token": 0,
+    "model_fits": true,
+    "context_window_fit": 262144,
+    "context_window_resolved": 131072,
+    "context_machine_bound": false,
+    "context_overcommitted": false,
+    "kv_reserve_tokens": 131072,
+    "kv_reserve_bytes": 8589934592,
+    "bank_idle_max_bytes": 51539607552,
+    "bank_steady_bytes": 51539607552,
+    "runtime_transients_bytes": 3221225472,
+    "headroom_bytes": 19045206383,
+    "notes": []
+  },
+  "mlx_cache_limit": {
+    "requested": null,
+    "configured": true,
+    "source": "ram_tier_default",
+    "limit_bytes": 8589934592,
+    "previous_limit_bytes": 130567005798
+  },
+  "mlx_runtime": {
+    "ok": true,
+    "path": "/Users/pjb/git/MTPLX/.venv/lib/python3.13/site-packages/mlx/core.cpython-313-darwin.so",
+    "version": "0.32.2",
+    "stock_pypi_layout": true
+  },
+  "ngram_prewarm": {
+    "enabled": false,
+    "mode": null,
+    "order": null,
+    "table_bytes": null,
+    "budget_bytes": null,
+    "warmed_bytes": 0,
+    "seconds": 0.0,
+    "gib_per_s": null,
+    "free_bytes": null,
+    "reserved_bytes": null,
+    "margin_bytes": null,
+    "source": "env",
+    "skipped_reason": "no_model_loaded"
+  },
+  "chip": "Apple M5 Max",
+  "machine_model": "Mac17,6",
+  "unified_memory_bytes": 137438953472
+}

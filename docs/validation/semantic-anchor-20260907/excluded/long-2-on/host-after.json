@@ -1,0 +1,12 @@
+{
+  "utc": "2026-09-07T04:40:00Z",
+  "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=23658595)\t80%; AC attached; not charging present: true",
+  "foreign_model_processes": [
+    {
+      "pid": 21503,
+      "rss_kib": 36992,
+      "executable": "/Users/pjb/git/mlx-m5-workbench/.venv/bin/python"
+    }
+  ],
+  "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+}
