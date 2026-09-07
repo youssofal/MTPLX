@@ -270,8 +270,11 @@ def _effort_state(levels, default):
         (("xhigh", "medium", "low"), "medium", "low", "low"),
         (("xhigh", "medium", "low"), "medium", "medium", "medium"),
         (("xhigh", "medium", "low"), "medium", "xhigh", "xhigh"),
+        (("xhigh", "medium", "low"), "medium", "max", "xhigh"),
         # Family with a real "high" tier: the literal tier wins.
         (("low", "medium", "high"), "medium", "high", "high"),
+        # DeepSeek V4's native top tier remains literal and family-scoped.
+        (("low", "high", "max"), None, "max", "max"),
         # Nothing above the request -> nearest declared below.
         (("low", "medium", "high"), "medium", "xhigh", "high"),
         (("low", "medium"), "low", "high", "medium"),

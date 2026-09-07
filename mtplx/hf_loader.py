@@ -23,8 +23,15 @@ from mtplx.models.laguna_config import (
     LAGUNA_S_2_1_REVISION,
     laguna_s_2_1_artifact_integrity_errors,
 )
-
-
+from mtplx.models.deepseek_v4_target_only_config import (
+    DEEPSEEK_V4_TARGET_ONLY_REPO_BYTES,
+    DEEPSEEK_V4_TARGET_ONLY_REPO_ID,
+    DEEPSEEK_V4_TARGET_ONLY_REQUIRED_FILES,
+    DEEPSEEK_V4_TARGET_ONLY_REVISION,
+    DEEPSEEK_V4_TARGET_ONLY_SHARD_SHA256,
+    DEEPSEEK_V4_TARGET_ONLY_SIDECAR_SHA256,
+    deepseek_v4_target_only_artifact_integrity_errors,
+)
 DEFAULT_MODEL_CACHE = Path("~/.mtplx/models").expanduser()
 DownloadProgressCallback = Callable[[dict[str, Any]], None]
 REQUIRED_MTPLX_MODEL_FILES = (
@@ -60,6 +67,13 @@ def _effective_model_revision(repo_id: str, revision: str | None) -> str | None:
                 f"{LAGUNA_S_2_1_REVISION}"
             )
         return LAGUNA_S_2_1_REVISION
+    if repo_id.casefold() == DEEPSEEK_V4_TARGET_ONLY_REPO_ID.casefold():
+        if revision is not None and revision != DEEPSEEK_V4_TARGET_ONLY_REVISION:
+            raise ValueError(
+                "DeepSeek V4 target-only support is pinned to revision "
+                f"{DEEPSEEK_V4_TARGET_ONLY_REVISION}"
+            )
+        return DEEPSEEK_V4_TARGET_ONLY_REVISION
     return revision
 
 
@@ -76,6 +90,12 @@ def read_source_marker(path: Path) -> dict[str, Any] | None:
     except (OSError, UnicodeError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
+def _pinned_source_identity(repo_id: str) -> tuple[str, str] | None:
+    if repo_id.casefold() == LAGUNA_S_2_1_REPO_ID.casefold():
+        return LAGUNA_S_2_1_REPO_ID, LAGUNA_S_2_1_REVISION
+    if repo_id.casefold() == DEEPSEEK_V4_TARGET_ONLY_REPO_ID.casefold():
+        return DEEPSEEK_V4_TARGET_ONLY_REPO_ID, DEEPSEEK_V4_TARGET_ONLY_REVISION
+    return None
 
 
 def _source_marker_matches(
@@ -84,14 +104,20 @@ def _source_marker_matches(
     repo_id: str,
     revision: str | None,
 ) -> bool:
-    if repo_id.casefold() != LAGUNA_S_2_1_REPO_ID.casefold():
+    pinned = _pinned_source_identity(repo_id)
+    if pinned is None:
         return True
     payload = read_source_marker(destination)
     if payload is None:
         return False
-    # Subset compare: 2.9.0 markers carry provenance fields (resolved_sha,
-    # pulled_at, files) on top of the original two-key pin payload.
-    return payload.get("repo_id") == repo_id and payload.get("revision") == revision
+    # Preserve current-main provenance fields while enforcing the
+    # canonical identity of pinned model artifacts.
+    canonical_repo_id, canonical_revision = pinned
+    return (
+        payload.get("repo_id") == canonical_repo_id
+        and payload.get("revision") == canonical_revision
+        and revision == canonical_revision
+    )
 
 
 def _write_source_marker(
@@ -102,6 +128,9 @@ def _write_source_marker(
     resolved_sha: str | None = None,
     files: dict[str, dict[str, Any]] | None = None,
 ) -> None:
+    pinned = _pinned_source_identity(repo_id)
+    if pinned is not None:
+        repo_id, revision = pinned
     payload: dict[str, Any] = {"repo_id": repo_id, "revision": revision}
     if resolved_sha:
         payload["resolved_sha"] = resolved_sha
@@ -182,19 +211,68 @@ def _validate_pinned_laguna_files(destination: Path, repo_id: str) -> None:
         )
 
 
-def _pull_validation(path: Path, repo_id: str) -> dict[str, Any]:
+def _validate_pinned_deepseek_v4_files(destination: Path, repo_id: str) -> None:
+    if repo_id.casefold() != DEEPSEEK_V4_TARGET_ONLY_REPO_ID.casefold():
+        return
+    missing_or_wrong = deepseek_v4_target_only_artifact_integrity_errors(destination)
+    if missing_or_wrong:
+        raise RuntimeError(
+            "pinned DeepSeek V4 target-only snapshot is incomplete or differs "
+            f"from revision {DEEPSEEK_V4_TARGET_ONLY_REVISION}: "
+            + ", ".join(sorted(missing_or_wrong))
+        )
+
+
+def _validate_pinned_model_files(destination: Path, repo_id: str) -> None:
+    _validate_pinned_laguna_files(destination, repo_id)
+    _validate_pinned_deepseek_v4_files(destination, repo_id)
+
+
+def _pinned_artifact_integrity_errors(
+    destination: Path, repo_id: str
+) -> tuple[str, ...]:
+    """Name same-size files which must be atomically re-fetched by a pull."""
+
+    if repo_id.casefold() == LAGUNA_S_2_1_REPO_ID.casefold():
+        return laguna_s_2_1_artifact_integrity_errors(destination)
+    if repo_id.casefold() == DEEPSEEK_V4_TARGET_ONLY_REPO_ID.casefold():
+        return deepseek_v4_target_only_artifact_integrity_errors(destination)
+    return ()
+
+
+def _pinned_file_sha256(repo_id: str, path: str) -> str | None:
+    if repo_id.casefold() == DEEPSEEK_V4_TARGET_ONLY_REPO_ID.casefold():
+        return (
+            DEEPSEEK_V4_TARGET_ONLY_SHARD_SHA256.get(path)
+            or DEEPSEEK_V4_TARGET_ONLY_SIDECAR_SHA256.get(path)
+        )
+    return None
+
+
+def _pull_validation(
+    path: Path, repo_id: str, *, pinned_integrity_checked: bool = False
+) -> dict[str, Any]:
     validation = validate_mtplx_model_files(path)
-    if repo_id.casefold() != LAGUNA_S_2_1_REPO_ID.casefold():
+    if repo_id.casefold() == LAGUNA_S_2_1_REPO_ID.casefold():
+        required_files = LAGUNA_S_2_1_REQUIRED_FILES
+    elif repo_id.casefold() == DEEPSEEK_V4_TARGET_ONLY_REPO_ID.casefold():
+        required_files = DEEPSEEK_V4_TARGET_ONLY_REQUIRED_FILES
+    else:
         return validation
-    _validate_pinned_laguna_files(path, repo_id)
+    if not pinned_integrity_checked:
+        _validate_pinned_model_files(path, repo_id)
     return {
         **validation,
         "ok": True,
         "missing_files": [],
         "contract_error": None,
-        "required_files": sorted(LAGUNA_S_2_1_REQUIRED_FILES),
+        "required_files": sorted(required_files),
         "mtp_supported": False,
-        "runtime_compatibility": "native-ar-only",
+        "runtime_compatibility": (
+            "external-mem-preflight-required"
+            if repo_id.casefold() == DEEPSEEK_V4_TARGET_ONLY_REPO_ID.casefold()
+            else "native-ar-only"
+        ),
     }
 
 
@@ -546,7 +624,12 @@ def _repo_requires_qwen_mtplx_payload(repo_id: str) -> bool:
     return lower.startswith("youssofal/qwen3.") and "mtplx" in lower
 
 
-def _cached_model_ready_for_repo(path: Path, repo_id: str) -> bool:
+def _cached_model_ready_for_repo(
+    path: Path,
+    repo_id: str,
+    *,
+    pinned_integrity_errors: tuple[str, ...] | None = None,
+) -> bool:
     if not cached_model_is_complete(path):
         return False
     if repo_id.casefold() == LAGUNA_S_2_1_REPO_ID.casefold():
@@ -556,9 +639,26 @@ def _cached_model_ready_for_repo(path: Path, repo_id: str) -> bool:
             revision=LAGUNA_S_2_1_REVISION,
         ):
             return False
-        try:
-            _validate_pinned_laguna_files(path, repo_id)
-        except RuntimeError:
+        errors = (
+            laguna_s_2_1_artifact_integrity_errors(path)
+            if pinned_integrity_errors is None
+            else pinned_integrity_errors
+        )
+        if errors:
+            return False
+    if repo_id.casefold() == DEEPSEEK_V4_TARGET_ONLY_REPO_ID.casefold():
+        if not _source_marker_matches(
+            path,
+            repo_id=repo_id,
+            revision=DEEPSEEK_V4_TARGET_ONLY_REVISION,
+        ):
+            return False
+        errors = (
+            deepseek_v4_target_only_artifact_integrity_errors(path)
+            if pinned_integrity_errors is None
+            else pinned_integrity_errors
+        )
+        if errors:
             return False
     if _repo_requires_qwen_mtplx_payload(repo_id):
         return bool(validate_mtplx_model_files(path).get("ok"))
@@ -996,6 +1096,29 @@ def _iter_response_bytes(response: Any) -> Iterator[bytes]:
     raise RuntimeError("Hugging Face response does not support byte streaming")
 
 
+def _verify_downloaded_file(
+    path: Path,
+    *,
+    repo_file: RepoFile,
+    expected_sha256: str | None,
+) -> None:
+    if repo_file.size_bytes is not None and path.stat().st_size != repo_file.size_bytes:
+        raise RuntimeError(
+            f"incomplete download for {repo_file.path}: "
+            f"expected {repo_file.size_bytes} bytes, got {path.stat().st_size}"
+        )
+    if expected_sha256 is None:
+        return
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(DOWNLOAD_CHUNK_SIZE), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != expected_sha256:
+        raise RuntimeError(
+            f"downloaded file failed pinned SHA-256 verification: {repo_file.path}"
+        )
+
+
 def _download_repo_file(
     repo_file: RepoFile,
     *,
@@ -1012,6 +1135,8 @@ def _download_repo_file(
     progress_interval_s: float,
     last_emit_at: float,
     last_emit_size: int,
+    force: bool = False,
+    expected_sha256: str | None = None,
     measure: Callable[[], int] | None = None,
     token: str | bool | None = None,
 ) -> tuple[float, int]:
@@ -1020,18 +1145,20 @@ def _download_repo_file(
     target = _safe_destination_for_repo_file(destination, repo_file)
     target.parent.mkdir(parents=True, exist_ok=True)
     expected_size = repo_file.size_bytes
-    if expected_size is not None and target.exists() and target.stat().st_size == expected_size:
+    if not force and expected_size is not None and target.exists() and target.stat().st_size == expected_size:
         return last_emit_at, last_emit_size
-    if expected_size is None and target.exists() and target.stat().st_size > 0:
+    if not force and expected_size is None and target.exists() and target.stat().st_size > 0:
         return last_emit_at, last_emit_size
 
     partial = target.with_name(target.name + ".incomplete")
-    if target.exists():
-        # A size-mismatched final file is a stale version of a file that
-        # changed upstream (e.g. a repaired index gaining vision entries),
-        # not an interrupted download. Resuming from it would append the
-        # remote tail onto old content and corrupt the file, so discard it.
-        # Only a leftover *.incomplete partial may be range-resumed.
+    if force:
+        # Retain a known-bad target until the replacement is complete
+        # and hashed; a failed repair must not discard the only local copy.
+        if partial.exists():
+            partial.unlink()
+    elif target.exists():
+        # A size-mismatched final file is stale, not an interrupted
+        # partial. Do not append a remote tail to old final content.
         target.unlink()
     existing = partial.stat().st_size if partial.exists() else 0
     if expected_size is not None and existing > expected_size:
@@ -1053,6 +1180,9 @@ def _download_repo_file(
                 f"corrupt download for {repo_file.path}: the bytes on disk do not "
                 "match the file on Hugging Face. The partial was discarded; run the pull again."
             )
+        _verify_downloaded_file(
+            landed, repo_file=repo_file, expected_sha256=expected_sha256
+        )
         landed.replace(target)
 
     headers = build_hf_headers(token=token)
@@ -1128,6 +1258,7 @@ def _download_snapshot_with_structured_progress(
     destination: Path,
     progress_callback: DownloadProgressCallback | None,
     progress_interval_s: float,
+    force_paths: frozenset[str] = frozenset(),
 ) -> tuple[Path, int | None]:
     HfApi, hf_hub_url, get_session, build_hf_headers, hf_raise_for_status = _hub_runtime()
     try:
@@ -1191,6 +1322,12 @@ def _download_snapshot_with_structured_progress(
                 progress_interval_s=max(0.1, progress_interval_s),
                 last_emit_at=last_emit_at,
                 last_emit_size=last_emit_size,
+                force=repo_file.path in force_paths,
+                expected_sha256=(
+                    _pinned_file_sha256(repo_id, repo_file.path)
+                    if repo_file.path in force_paths
+                    else None
+                ),
                 measure=measure,
             )
         except Exception as exc:
@@ -1240,6 +1377,14 @@ def list_cached_models(*, cache_dir: str | Path | None = None) -> list[CachedMod
         if not child.is_dir() or child.name.startswith("."):
             continue
         repo_id = child.name.replace("--", "/")
+        try:
+            validation = _pull_validation(child, repo_id)
+        except RuntimeError as exc:
+            validation = {
+                **validate_mtplx_model_files(child),
+                "ok": False,
+                "contract_error": str(exc),
+            }
         rows.append(
             CachedModel(
                 repo_id=repo_id,
@@ -1247,7 +1392,7 @@ def list_cached_models(*, cache_dir: str | Path | None = None) -> list[CachedMod
                 size_bytes=directory_size_bytes(child),
                 has_runtime_contract=(child / "mtplx_runtime.json").exists(),
                 has_config=(child / "config.json").exists(),
-                validation=validate_mtplx_model_files(child),
+                validation=validation,
             )
         )
     return rows
@@ -1331,10 +1476,29 @@ def pull_model(
             return remote_sha is None or remote_sha == local_sha
         return _local_matches_remote_index(destination, repo_id, revision)
 
+    pinned_integrity_errors = (
+        _pinned_artifact_integrity_errors(destination, repo_id)
+        if destination.is_dir() and _pinned_source_identity(repo_id) is not None
+        else None
+    )
+    repair_paths = (
+        frozenset(
+            error.partition(":")[0]
+            for error in pinned_integrity_errors
+            if error.partition(":")[0]
+        )
+        if pinned_integrity_errors
+        else frozenset()
+    )
+    pinned_integrity_checked = pinned_integrity_errors is not None
     if (
         not force_sync
         and destination.exists()
-        and _cached_model_ready_for_repo(destination, repo_id)
+        and _cached_model_ready_for_repo(
+            destination,
+            repo_id,
+            pinned_integrity_errors=pinned_integrity_errors,
+        )
         and _source_marker_matches(
             destination,
             repo_id=repo_id,
@@ -1349,7 +1513,7 @@ def pull_model(
         # then lost the marker cleanup; the marker means nothing now.
         (resolved / TRANSFER_MARKER_FILE).unlink(missing_ok=True)
         validation = validate_mtplx_model_files(resolved)
-        _validate_pinned_laguna_files(resolved, repo_id)
+        _validate_pinned_model_files(resolved, repo_id)
         if repo_id.lower().startswith("youssofal/qwen3.6-27b-mtplx") and not validation["ok"]:
             raise RuntimeError(
                 "cached MTPLX model is incomplete: "
@@ -1397,6 +1561,8 @@ def pull_model(
         resumed_existing = destination.exists() and started_size > 0
         if repo_id.casefold() == LAGUNA_S_2_1_REPO_ID.casefold():
             total_bytes: int | None = LAGUNA_S_2_1_REPO_BYTES
+        elif repo_id.casefold() == DEEPSEEK_V4_TARGET_ONLY_REPO_ID.casefold():
+            total_bytes = DEEPSEEK_V4_TARGET_ONLY_REPO_BYTES
         elif remote_files:
             total_bytes = (
                 sum(
@@ -1442,13 +1608,17 @@ def pull_model(
             else contextlib.nullcontext()
         )
         with progress_suppression:
-            if progress_callback is not None:
+            # A generic Hub snapshot treats a same-size local file as reusable.
+            # For a pinned identity known to be corrupt, force the streaming
+            # path so every bad target is hash-verified then atomically replaced.
+            if progress_callback is not None or repair_paths:
                 resolved, total_bytes_from_download = _download_snapshot_with_structured_progress(
                     repo_id=repo_id,
                     revision=download_revision,
                     destination=destination,
                     progress_callback=progress_callback,
                     progress_interval_s=progress_interval_s,
+                    force_paths=repair_paths,
                 )
                 if total_bytes_from_download:
                     total_bytes = total_bytes_from_download
@@ -1490,10 +1660,9 @@ def pull_model(
                 "downloaded MTPLX model is incomplete: "
                 + ", ".join(validation["missing_files"] or [str(validation.get("contract_error"))])
             )
-        _validate_pinned_laguna_files(resolved, repo_id)
-        # Provenance marker on every pull (2.9.0): records the exact commit
-        # and per-file blob map this cache was synced to, so update checks
-        # can compare revisions instead of guessing from the weight index.
+        _validate_pinned_model_files(resolved, repo_id)
+        # Preserve current-main provenance for every successful pull;
+        # _write_source_marker canonicalizes pinned identities first.
         _write_source_marker(
             resolved,
             repo_id=repo_id,
@@ -1537,7 +1706,11 @@ def pull_model(
         "stale_files": stale_files,
         "has_runtime_contract": (resolved / "mtplx_runtime.json").exists(),
         "has_config": (resolved / "config.json").exists(),
-        "validation": _pull_validation(resolved, repo_id),
+        "validation": _pull_validation(
+            resolved,
+            repo_id,
+            pinned_integrity_checked=pinned_integrity_checked,
+        ),
     }
 
 

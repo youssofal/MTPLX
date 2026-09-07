@@ -1562,3 +1562,9 @@
 "Seconds a response may wait on a model that is making no progress before it is cancelled. 0 turns the watchdog off; long prompts and deep reasoning keep reporting progress and are never cut short by this." = "Segundos que una respuesta puede esperar a un modelo sin progreso antes de cancelarse. 0 desactiva el vigilante; los prompts largos y el razonamiento profundo siguen registrando progreso y nunca se cortan por esto.";
 "Adaptive depth" = "Profundidad adaptativa";
 "Stops a draft early when the next token is unlikely to be accepted. Off drafts to the full depth every cycle." = "Detiene un borrador antes cuando es poco probable que se acepte el siguiente token. Desactivado: cada ciclo redacta hasta la profundidad completa.";
+
+/* External mlx-serve route. */
+"Running and ready. External backend live stats are unavailable." = "En ejecución y listo. Las estadísticas en directo del backend externo no están disponibles.";
+"MTPLX's benchmark, metrics, and live-control endpoints are unavailable for the external mlx-serve route." = "Los puntos de acceso de MTPLX para pruebas de rendimiento, métricas y control en directo no están disponibles en la ruta externa de mlx-serve.";
+"an external mlx-serve server" = "un servidor externo de mlx-serve";
+"Experimental target-only route. Requires mlx-serve and a 128 GB Apple Silicon Mac; no MTP or DSpark." = "Ruta experimental solo para el modelo objetivo. Requiere mlx-serve y un Mac con Apple Silicon de 128 GB; sin MTP ni DSpark.";

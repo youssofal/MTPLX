@@ -1562,3 +1562,9 @@
 "Seconds a response may wait on a model that is making no progress before it is cancelled. 0 turns the watchdog off; long prompts and deep reasoning keep reporting progress and are never cut short by this." = "進捗のないモデルを応答が待てる秒数。超えるとキャンセルされます。0 で監視をオフにします。長いプロンプトや深い推論は進捗を報告し続けるため、これで中断されることはありません。";
 "Adaptive depth" = "適応的な深さ";
 "Stops a draft early when the next token is unlikely to be accepted. Off drafts to the full depth every cycle." = "次のトークンが採用されにくいときはドラフトを早めに打ち切ります。オフにすると毎サイクル最大の深さまでドラフトします。";
+
+/* External mlx-serve route. */
+"Running and ready. External backend live stats are unavailable." = "実行中で準備完了です。外部バックエンドのライブ統計は利用できません。";
+"MTPLX's benchmark, metrics, and live-control endpoints are unavailable for the external mlx-serve route." = "外部 mlx-serve 経路では、MTPLX のベンチマーク、メトリクス、ライブ制御のエンドポイントは利用できません。";
+"an external mlx-serve server" = "外部 mlx-serve サーバー";
+"Experimental target-only route. Requires mlx-serve and a 128 GB Apple Silicon Mac; no MTP or DSpark." = "ターゲットモデルのみを使用する実験的な経路です。mlx-serve と 128 GB の Apple Silicon Mac が必要です。MTP と DSpark は使用しません。";

@@ -13,6 +13,7 @@ from mtplx.profiles import DEFAULT_PROFILE_NAME, PROFILE_CHOICES, resolve_profil
 RUNTIME_CONTRACT_FILE = "mtplx_runtime.json"
 SUPPORTED_ARCH_IDS = {
     "laguna-s-2.1-ar",
+    "deepseek-v4-mlxserve-ar",
     "deepseek-v4",
     "qwen4-next",
     "qwen3-next-mtp",
@@ -136,6 +137,23 @@ ARCHITECTURE_CATALOG: dict[str, ArchitectureSupport] = {
             "Target-only AR runtime for the exact mlx-community Laguna-S-2.1-oQ4e "
             "checkpoint; the artifact has no native MTP head and must be loaded "
             "with mtp=False."
+        ),
+    ),
+    "deepseek-v4-mlxserve-ar": ArchitectureSupport(
+        arch_id="deepseek-v4-mlxserve-ar",
+        display_name="DeepSeek V4 Flash 0731 target-only (external mlx-serve)",
+        family="deepseek",
+        backend="deepseek_v4_mlxserve_ar",
+        support_level="external-runtime-experimental",
+        runtime_compatibility="external-mem-preflight-required",
+        can_run_verified=True,
+        aliases=(),
+        config_markers=(),
+        family_gate="exact-pinned-target-only-artifact",
+        notes=(
+            "Only the exact pinned 44-shard target-only artifact is admitted. "
+            "MTPLX delegates execution to an independently installed mlx-serve binary; "
+            "this is neither MTP nor DSpark support."
         ),
     ),
     "lfm2-moe-ar": ArchitectureSupport(
@@ -1397,6 +1415,33 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
     contract_path = getattr(inspection, "runtime_contract_path", None)
     if not contract_path:
         contract_path = str(_contract_path(model_dir)) if _contract_path(model_dir).exists() else None
+    if (
+        not has_mtp
+        and bool(getattr(inspection, "deepseek_v4_target_only_match", False))
+        and bool(
+            getattr(inspection, "deepseek_v4_target_only_artifacts_complete", False)
+        )
+    ):
+        support = ARCHITECTURE_CATALOG["deepseek-v4-mlxserve-ar"]
+        return CompatibilityVerdict(
+            tier=TIER_AR_ONLY,
+            arch_id=support.arch_id,
+            supported=True,
+            recognized=True,
+            can_run=True,
+            exit_code=EXIT_VERIFIED,
+            message=(
+                "Exact DeepSeek V4 Flash 0731 target-only artifact admitted for "
+                "the external mlx-serve AR route. It has no MTP or DSpark weights."
+            ),
+            recommended_backend=support.backend,
+            recommended_profile=DEFAULT_PROFILE_NAME,
+            mtp_supported="no",
+            runtime_compatibility=support.runtime_compatibility,
+            support_level=support.support_level,
+            support_notes=support.notes,
+        )
+
     # One question decides runnability throughout this function: can this
     # build construct the trunk from code it ships. MTP, contracts, and
     # verification tiers are labels and speed levers on top of that answer,

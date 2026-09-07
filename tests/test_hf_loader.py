@@ -1336,3 +1336,43 @@ def test_pull_model_rejects_a_landed_file_whose_sha256_differs(tmp_path: Path, m
 
     assert not (cached / _SHARD).exists()
     assert not (cached / f"{_SHARD}.incomplete").exists()
+
+
+@pytest.mark.parametrize('bad_digest', ['hub', 'pinned', None])
+def test_forced_repair_requires_both_hub_and_pinned_hashes_before_replacement(
+    tmp_path: Path, monkeypatch, bad_digest: str | None
+):
+    from mtplx.hf_loader import _download_repo_file
+
+    monkeypatch.setattr('mtplx.hf_loader.hf_token_for_download', lambda: False)
+    original = b'old-weights!'
+    replacement = b'new-weights!'
+    target = tmp_path / _SHARD
+    target.write_bytes(original)
+    correct = hashlib.sha256(replacement).hexdigest()
+    repo_file = RepoFile(
+        path=_SHARD,
+        size_bytes=len(replacement),
+        sha256='0' * 64 if bad_digest == 'hub' else correct,
+    )
+    session = _FakeHubSession({_SHARD: replacement})
+
+    def repair():
+        return _download_repo_file(
+            repo_file,
+            repo_id='mtplx/example', revision=None, destination=tmp_path,
+            session=session, hf_hub_url=lambda **kwargs: 'fake://' + kwargs['filename'],
+            build_hf_headers=lambda **_kwargs: {}, hf_raise_for_status=lambda r: r.raise_for_status(),
+            callback=None, total_bytes=len(replacement), started_at=time.monotonic(),
+            progress_interval_s=0, last_emit_at=0, last_emit_size=0,
+            force=True, expected_sha256='0' * 64 if bad_digest == 'pinned' else correct,
+        )
+
+    if bad_digest:
+        with pytest.raises(RuntimeError, match='corrupt download|pinned SHA-256'):
+            repair()
+        assert target.read_bytes() == original
+    else:
+        repair()
+        assert target.read_bytes() == replacement
+        assert not target.with_name(target.name + '.incomplete').exists()

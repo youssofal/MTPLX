@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import XCTest
 @testable import MTPLXAppCore
@@ -595,5 +596,154 @@ final class HuggingFaceProbeForgeTests: XCTestCase {
         let probe = HuggingFaceProbe(endpoint: "https://hf-mirror.example/", runner: fake.runner())
         let result = await probe.probe(repo: "mirror-org/some-model")
         XCTAssertEqual(result.verdict, .noMTP)
+    }
+
+    func testProbeExplainsThePinnedDeepSeekExternalRoute() async {
+        let fake = FakeRunner()
+        let repo = "philipjohnbasile/DeepSeek-V4-Flash-0731-MLX-M5Max-TargetOnly"
+        let revision = "ac33e4f3ca3546e6cec104558d42161e15814e33"
+        let configData = try! JSONSerialization.data(withJSONObject: Self.externalTargetOnlyConfigFixture())
+        let configBody = String(decoding: configData, as: UTF8.self)
+        let configHash = SHA256.hash(data: configData)
+            .map({ String(format: "%02x", $0) })
+            .joined()
+        fake.install(
+            url: "https://huggingface.co/\(repo)/resolve/\(revision)/config.json",
+            body: configBody
+        )
+        let names = (0...42).map { "model-layer-\($0).safetensors" }
+            + ["model-top.safetensors", "config.json", "generation_config.json", "model.safetensors.index.json", "tokenizer.json", "tokenizer_config.json"]
+        let tree = names.map { ["path": $0] }
+        let treeData = try! JSONSerialization.data(withJSONObject: tree)
+        fake.install(
+            url: "https://huggingface.co/api/models/\(repo)/tree/\(revision)",
+            body: String(decoding: treeData, as: UTF8.self)
+        )
+        let probe = HuggingFaceProbe(
+            runner: fake.runner(),
+            externalAROnlyConfigSHA256: configHash
+        )
+
+        let result = await probe.probe(
+            repo: "https://huggingface.co/philipjohnbasile/DeepSeek-V4-Flash-0731-MLX-M5Max-TargetOnly/tree/main"
+        )
+
+        XCTAssertEqual(result.verdict, .noMTP)
+        XCTAssertEqual(
+            result.hfRepo,
+            "philipjohnbasile/DeepSeek-V4-Flash-0731-MLX-M5Max-TargetOnly"
+        )
+        XCTAssertTrue(result.message.contains("mlx-serve"))
+        XCTAssertTrue(result.message.contains("128 GB"))
+        XCTAssertTrue(result.message.contains("DSpark"))
+        XCTAssertEqual(result.diagnostic, "external_target_only_verified")
+    }
+
+    func testPinnedDeepSeekExternalRouteRejectsRemoteConfigAndClosedShardShapeDrift() async {
+        let repo = "philipjohnbasile/DeepSeek-V4-Flash-0731-MLX-M5Max-TargetOnly"
+        let revision = "ac33e4f3ca3546e6cec104558d42161e15814e33"
+        let config = Self.externalTargetOnlyConfigFixture()
+        let configData = try! JSONSerialization.data(withJSONObject: config)
+        let configBody = String(decoding: configData, as: UTF8.self)
+        let configHash = SHA256.hash(data: configData)
+            .map({ String(format: "%02x", $0) })
+            .joined()
+        let required = (0...42).map { "model-layer-\($0).safetensors" }
+            + ["model-top.safetensors", "config.json", "generation_config.json", "model.safetensors.index.json", "tokenizer.json", "tokenizer_config.json"]
+
+        func makeProbe(configBody: String, names: [String], expectedHash: String) -> HuggingFaceProbe {
+            let fake = FakeRunner()
+            fake.install(
+                url: "https://huggingface.co/\(repo)/resolve/\(revision)/config.json",
+                body: configBody
+            )
+            let treeData = try! JSONSerialization.data(withJSONObject: names.map { ["path": $0] })
+            fake.install(
+                url: "https://huggingface.co/api/models/\(repo)/tree/\(revision)",
+                body: String(decoding: treeData, as: UTF8.self)
+            )
+            return HuggingFaceProbe(
+                runner: fake.runner(),
+                externalAROnlyConfigSHA256: expectedHash
+            )
+        }
+
+        let wrongConfig = await makeProbe(
+            configBody: configBody.replacingOccurrences(of: "\"dspark_block_size\":0", with: "\"dspark_block_size\":1"),
+            names: required,
+            expectedHash: configHash
+        ).probe(repo: repo)
+        XCTAssertEqual(wrongConfig.verdict, .probeFailed)
+        XCTAssertEqual(wrongConfig.diagnostic, "pinned_config_mismatch")
+
+        let missing = await makeProbe(
+            configBody: configBody,
+            names: required.filter { $0 != "model-layer-42.safetensors" },
+            expectedHash: configHash
+        ).probe(repo: repo)
+        XCTAssertEqual(missing.verdict, .probeFailed)
+        XCTAssertEqual(missing.diagnostic, "closed_44_shard_shape_mismatch")
+
+        let extra = await makeProbe(
+            configBody: configBody,
+            names: required + ["model-layer-43.safetensors"],
+            expectedHash: configHash
+        ).probe(repo: repo)
+        XCTAssertEqual(extra.verdict, .probeFailed)
+        XCTAssertEqual(extra.diagnostic, "closed_44_shard_shape_mismatch")
+    }
+
+    func testPinnedDeepSeekExternalRouteDoesNotTrustASpoofedOwner() async {
+        let fake = FakeRunner()
+        let spoofedRepo = "someone-else/DeepSeek-V4-Flash-0731-MLX-M5Max-TargetOnly"
+        let configData = try! JSONSerialization.data(withJSONObject: Self.externalTargetOnlyConfigFixture())
+        fake.install(
+            url: "https://huggingface.co/\(spoofedRepo)/resolve/main/config.json",
+            body: String(decoding: configData, as: UTF8.self)
+        )
+
+        let result = await HuggingFaceProbe(runner: fake.runner()).probe(repo: spoofedRepo)
+
+        XCTAssertEqual(result.verdict, .noMTP)
+        XCTAssertNotEqual(result.diagnostic, "external_target_only_verified")
+        XCTAssertFalse(MTPLXModelOption.isCanonicalExternalAROnlyRepoID(spoofedRepo))
+        XCTAssertFalse(
+            MTPLXModelOption.customHuggingFaceModel(repoID: spoofedRepo)?.arOnly ?? true
+        )
+    }
+
+    private static func externalTargetOnlyConfigFixture() -> [String: Any] {
+        var quantization: [String: Any] = [
+            "bits": 8,
+            "group_size": 64,
+            "mode": "affine",
+            "embed": ["bits": 8, "group_size": 64, "mode": "affine"],
+            "head": ["bits": 8, "group_size": 64, "mode": "affine"],
+        ]
+        for layer in 0..<43 {
+            let recipe: ([Int], Int) = layer < 39 ? ([2, 3, 2], 128) : ([4, 4, 4], 64)
+            for (projection, bits) in zip(["w1", "w2", "w3"], recipe.0) {
+                quantization["layers.\(layer).ffn.experts.\(projection)"] = [
+                    "bits": bits,
+                    "group_size": recipe.1,
+                    "mode": "affine",
+                ]
+            }
+        }
+        return [
+            "architectures": ["DeepseekV4ForCausalLM"],
+            "model_type": "deepseek_v4",
+            "num_hidden_layers": 43,
+            "hidden_size": 4096,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 1,
+            "head_dim": 512,
+            "vocab_size": 129_280,
+            "num_nextn_predict_layers": 0,
+            "dspark_block_size": 0,
+            "num_experts_per_tok": 6,
+            "n_routed_experts": 256,
+            "quantization": quantization,
+        ]
     }
 }

@@ -19,6 +19,17 @@ template. Other Laguna variants — including the earlier uniform-4bit build —
 remain blocked until they have their own construction-time validation and
 runtime evidence.
 
+The external AR route is reserved for
+`philipjohnbasile/DeepSeek-V4-Flash-0731-MLX-M5Max-TargetOnly` at immutable
+revision `ac33e4f3ca3546e6cec104558d42161e15814e33`. Admission requires its
+DeepSeek V4 target-only configuration, all 44 exact weight shards, required
+sidecars, and the closed safetensors index; cached content is hash-checked and
+a same-size corrupt file is repaired through an atomic re-download. MTPLX then
+executes the separately installed `mlx-serve` binary. The required zero
+`num_nextn_predict_layers` / zero `dspark_block_size` contract means an MTP or
+DSpark artifact is not silently routed here. The external runtime's memory
+preflight remains enabled. Its streaming and throughput are unapproved.
+
 ## Embedded MTP heads and third-party loaders (#306)
 
 An MTPLX-branded pack stores its MTP head as a standalone `mtp.safetensors`

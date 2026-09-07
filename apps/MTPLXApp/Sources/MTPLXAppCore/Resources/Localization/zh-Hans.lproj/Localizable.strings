@@ -1562,3 +1562,9 @@
 "Seconds a response may wait on a model that is making no progress before it is cancelled. 0 turns the watchdog off; long prompts and deep reasoning keep reporting progress and are never cut short by this." = "响应在等待无进展的模型多少秒后被取消。0 表示关闭看门狗；长提示和深度推理会持续报告进展，绝不会因此被中断。";
 "Adaptive depth" = "自适应深度";
 "Stops a draft early when the next token is unlikely to be accepted. Off drafts to the full depth every cycle." = "当下一个 token 不太可能被接受时提前停止草稿。关闭后每个周期都草拟到完整深度。";
+
+/* External mlx-serve route. */
+"Running and ready. External backend live stats are unavailable." = "正在运行且已就绪。外部后端的实时统计信息不可用。";
+"MTPLX's benchmark, metrics, and live-control endpoints are unavailable for the external mlx-serve route." = "外部 mlx-serve 路径不支持 MTPLX 的基准测试、指标和实时控制端点。";
+"an external mlx-serve server" = "外部 mlx-serve 服务器";
+"Experimental target-only route. Requires mlx-serve and a 128 GB Apple Silicon Mac; no MTP or DSpark." = "仅使用目标模型的实验性路径。需要 mlx-serve 和配备 128 GB 内存的 Apple Silicon Mac；不使用 MTP 或 DSpark。";
