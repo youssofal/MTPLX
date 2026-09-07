@@ -38,6 +38,32 @@ public final class ChatConversation {
     /// for a research thread and off for everyday chat without paging
     /// through Settings.
     public var webSearchEnabled: Bool
+    /// Optional local workspace selected for this conversation. The daemon
+    /// stays the model authority; this id binds the chat to the user's
+    /// project, run history, and approval policy.
+    public var workspaceID: String?
+    /// Model override for this conversation. Nil means use the loaded MTPLX
+    /// runtime reported by the backend.
+    public var modelOverride: String?
+    /// Agent mode controls are conversation-scoped so a planning thread can
+    /// coexist with ordinary chat without changing global runtime settings.
+    // These defaults live on the stored properties, not only on init.
+    // SwiftData needs schema defaults to backfill conversations created by
+    // older MTPLX releases during lightweight migration.
+    public var planModeEnabled: Bool = false
+    public var reasoningEffortRaw: String = "auto"
+    public var goalText: String?
+    /// User feedback kept with this conversation. Feedback stays local until
+    /// the user explicitly exports or shares the chat.
+    public var feedbackNotes: String?
+    /// Most recent durable agent run for this conversation. Keeping the id
+    /// here lets /resume rehydrate the run timeline after app or daemon
+    /// restarts without relying on in-memory view state.
+    public var activeRunID: String?
+    /// Optional persisted daemon session replacement. Cancelling or manually
+    /// compacting a conversation rotates the session so a later app restart
+    /// cannot accidentally reuse stale server-side prefix state.
+    public var sessionIDOverride: UUID?
 
     @Relationship(deleteRule: .cascade, inverse: \ChatMessage.conversation)
     public var messages: [ChatMessage]
@@ -48,6 +74,14 @@ public final class ChatConversation {
         createdAt: Date = Date(),
         updatedAt: Date? = nil,
         webSearchEnabled: Bool = false,
+        workspaceID: String? = nil,
+        modelOverride: String? = nil,
+        planModeEnabled: Bool = false,
+        reasoningEffortRaw: String = "auto",
+        goalText: String? = nil,
+        feedbackNotes: String? = nil,
+        activeRunID: String? = nil,
+        sessionIDOverride: UUID? = nil,
         messages: [ChatMessage] = []
     ) {
         self.id = id
@@ -55,6 +89,14 @@ public final class ChatConversation {
         self.createdAt = createdAt
         self.updatedAt = updatedAt ?? createdAt
         self.webSearchEnabled = webSearchEnabled
+        self.workspaceID = workspaceID
+        self.modelOverride = modelOverride
+        self.planModeEnabled = planModeEnabled
+        self.reasoningEffortRaw = reasoningEffortRaw
+        self.goalText = goalText
+        self.feedbackNotes = feedbackNotes
+        self.activeRunID = activeRunID
+        self.sessionIDOverride = sessionIDOverride
         self.messages = messages
     }
 }
@@ -260,7 +302,9 @@ public enum ToolTraceStatus: String, Codable, Sendable, CaseIterable {
 // user's store open.
 
 public enum ChatSchemaV1: VersionedSchema {
-    public static let versionIdentifier = Schema.Version(1, 0, 0)
+    // Older supported SDKs do not mark Schema.Version Sendable. Construct
+    // the immutable value per access instead of sharing non-Sendable storage.
+    public static var versionIdentifier: Schema.Version { Schema.Version(1, 0, 0) }
 
     public static var models: [any PersistentModel.Type] {
         [

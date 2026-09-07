@@ -37,6 +37,8 @@ extension EnvironmentValues {
 struct ChatView: View {
     @EnvironmentObject private var chatViewModel: ChatViewModel
     @EnvironmentObject private var router: AppRouter
+    @EnvironmentObject private var backend: MTPLXBackendStore
+    @State private var workspacePanelPresented = false
 
     let daemonState: DaemonState
     let startupPhase: DaemonStartupPhase
@@ -53,8 +55,21 @@ struct ChatView: View {
             VStack(spacing: 0) {
                 ChatHeaderView(
                     viewModel: chatViewModel,
-                    sidebarCollapsed: $router.chatSidebarCollapsed
+                    sidebarCollapsed: $router.chatSidebarCollapsed,
+                    workspacePanelPresented: $workspacePanelPresented
                 )
+                if let commandOutput = chatViewModel.commandOutput {
+                    ChatCommandOutputView(
+                        text: commandOutput,
+                        onDismiss: chatViewModel.dismissCommandOutput
+                    )
+                }
+                if !backend.pendingApprovals.isEmpty {
+                    ChatApprovalBanner(
+                        count: backend.pendingApprovals.count,
+                        onReview: { workspacePanelPresented = true }
+                    )
+                }
                 ChatConversationView(
                     viewModel: chatViewModel,
                     daemonState: daemonState,
@@ -75,6 +90,11 @@ struct ChatView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Brand.bgOuter)
+            if workspacePanelPresented {
+                AgentWorkspacePanel()
+                    .frame(width: 280)
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .environment(\.mtplxPerformanceLock, performanceLock)
@@ -92,12 +112,82 @@ struct ChatView: View {
             if chatViewModel.current == nil {
                 _ = chatViewModel.createNewConversation()
             }
+            syncWorkspaceSelection()
+        }
+        .task {
+            await backend.refreshAgentState()
+        }
+        .onChange(of: chatViewModel.current?.id) { _, _ in
+            syncWorkspaceSelection()
         }
         .onChange(of: performanceLock, initial: true) { _, locked in
             // Mirror for render leaves that can't take the flag as a
             // parameter (theme closures, NSView viewports).
             ChatRenderPreferences.plainTextOnly = locked
         }
+    }
+
+    private func syncWorkspaceSelection() {
+        let workspaceID = chatViewModel.current?.workspaceID
+        backend.activeWorkspaceID = workspaceID
+        Task { await backend.selectWorkspace(workspaceID) }
+    }
+}
+
+private struct ChatApprovalBanner: View {
+    let count: Int
+    let onReview: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "checkmark.shield")
+                .foregroundStyle(Brand.warning)
+            Text(count == 1 ? "Agent action needs approval" : "\(count) agent actions need approval")
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .foregroundStyle(Brand.typeSecondary)
+            Spacer()
+            Button("Review", action: onReview)
+                .buttonStyle(.borderedProminent)
+                .tint(Brand.warning)
+                .controlSize(.small)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(
+            Brand.bgInner
+                .overlay(Rectangle().fill(Brand.warning.opacity(0.35)).frame(height: 0.5), alignment: .bottom)
+        )
+    }
+}
+
+private struct ChatCommandOutputView: View {
+    let text: String
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "terminal")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Brand.accentChrome)
+            Text(text)
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundStyle(Brand.typeSecondary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button(action: onDismiss) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(Brand.typeTertiary)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss command output")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(
+            Brand.bgInner
+                .overlay(Rectangle().fill(Brand.separator).frame(height: 0.5), alignment: .bottom)
+        )
     }
 }
 

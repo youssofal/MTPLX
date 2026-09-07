@@ -231,9 +231,7 @@ def test_usable_override_takes_the_configured_metal_limit() -> None:
 def test_budget_beats_the_real_machines_metal_limit() -> None:
     # Simulating a 48G seat on a 128G box: the caps were configured for
     # the real machine (96G); the budgeted formula (36G) must win.
-    plan = _plan(
-        128, memory_budget_bytes=RAM[48], usable_bytes_override=96 * GIB
-    )
+    plan = _plan(128, memory_budget_bytes=RAM[48], usable_bytes_override=96 * GIB)
     assert plan.usable_bytes == 36 * GIB
 
 
@@ -317,28 +315,22 @@ def test_transient_reserve_tracks_the_observed_spike() -> None:
     )
 
     # Below the static floor: the floor wins (idle process, tiny spike).
-    assert (
-        transient_reserve_bytes(84 * GIB, 83 * GIB) == RUNTIME_TRANSIENTS_BYTES
-    )
+    assert transient_reserve_bytes(84 * GIB, 83 * GIB) == RUNTIME_TRANSIENTS_BYTES
     # The measured 2026-08-29 shape: 95.2G peak over 82.8G active = 12.4G —
     # the reserve must carry the real spike, not the 3 GiB guess.
     spike = transient_reserve_bytes(int(95.2 * GIB), int(82.8 * GIB))
     assert spike == int(95.2 * GIB) - int(82.8 * GIB)
     # One pathological turn cannot starve the bank forever: capped.
-    assert (
-        transient_reserve_bytes(120 * GIB, 80 * GIB)
-        == TRANSIENT_RESERVE_CAP_BYTES
-    )
+    assert transient_reserve_bytes(120 * GIB, 80 * GIB) == TRANSIENT_RESERVE_CAP_BYTES
     # Tight-play models (Flash-Next: 77G weights on a 96G limit leaves
     # ~18G): the reserve never takes more than half the post-weights play,
     # so a deep turn's lifetime spike cannot permanently eat the bank.
-    assert transient_reserve_bytes(
-        96 * GIB, 80 * GIB, play_bytes=18 * GIB
-    ) == 9 * GIB
+    assert transient_reserve_bytes(96 * GIB, 80 * GIB, play_bytes=18 * GIB) == 9 * GIB
     # The play cap never pushes the reserve below the static floor.
-    assert transient_reserve_bytes(
-        96 * GIB, 80 * GIB, play_bytes=4 * GIB
-    ) == RUNTIME_TRANSIENTS_BYTES
+    assert (
+        transient_reserve_bytes(96 * GIB, 80 * GIB, play_bytes=4 * GIB)
+        == RUNTIME_TRANSIENTS_BYTES
+    )
 
 
 def test_dynamic_ceiling_observed_reserve_shrinks_the_bank_first() -> None:
@@ -367,8 +359,9 @@ def test_unavailable_reasons_are_explicit() -> None:
         == "total_ram_unknown"
     )
     assert (
-        plan_memory(total_ram_bytes=RAM[48], model_weights_bytes=None)
-        .unavailable_reason
+        plan_memory(
+            total_ram_bytes=RAM[48], model_weights_bytes=None
+        ).unavailable_reason
         == "model_weights_unknown"
     )
 
@@ -388,5 +381,19 @@ def test_describe_plan_names_the_machine_bound() -> None:
 
 
 def test_detect_total_ram_reports_this_machine() -> None:
-    detected = detect_total_ram_bytes()
-    assert detected is not None and detected > 8 * GIB
+    import os
+    import subprocess
+    import sys
+
+    # A hosted Apple Silicon runner can legitimately have 7 GiB. Verify
+    # the detected bytes against the OS, not the developer machine's size.
+    if sys.platform == "darwin":
+        expected = int(
+            subprocess.check_output(
+                ["/usr/sbin/sysctl", "-n", "hw.memsize"], text=True, timeout=5
+            ).strip()
+        )
+    else:
+        expected = int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_PHYS_PAGES"))
+    assert expected > 0
+    assert detect_total_ram_bytes() == expected

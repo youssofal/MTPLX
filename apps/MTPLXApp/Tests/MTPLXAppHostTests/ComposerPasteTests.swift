@@ -48,6 +48,7 @@ final class ComposerPasteTests: XCTestCase {
         return (host, textView)
     }
 
+    @MainActor
     private static func firstComposerTextView(in view: NSView) -> ComposerNSTextView? {
         if let textView = view as? ComposerNSTextView { return textView }
         for child in view.subviews {

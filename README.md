@@ -52,6 +52,129 @@ The dashboard shows what your model is doing while it does it: live tokens per s
 
 Chat is native, streams with thinking cards, takes file attachments, and can search the web. One click launches OpenCode, Pi, Hermes, Open WebUI, or anything else that speaks the OpenAI or Anthropic API against your local server. There is also a built-in AIME benchmark runner with fully disclosed, coaching-free prompts, so you can score a model yourself instead of trusting a chart.
 
+The native chat also has a small command layer for the high-value desktop controls. Type `/` in the composer to see autocomplete, or use `/help` for the full list:
+
+```text
+/help                 show native chat commands
+/new                 start a conversation
+/clear               remove messages from this conversation
+/model [name|clear]  inspect or override the loaded MTPLX model
+/plan [on|off]       toggle planning mode
+/reasoning [level]   set auto, low, medium, or high effort
+/goal [text|clear]   set the current task goal
+/memory [query]      retrieve bounded local memory context
+/workspace [id]      show or select the active project
+/files [path]        list files inside the workspace
+/diff [scope]        show unstaged, staged, or both Git diffs
+/test [command]      run detected or explicit tests after approval
+/run <command>       run a workspace command after approval
+/resume [run-id]     reload and resume a durable run
+/fork                branch this conversation into a new chat
+/stop                stop the model or active agent run
+/retry [agent-id]    retry a failed request or delegated agent
+/review [prompt]     delegate a read-only reviewer in a worktree
+/skills [query]      list local reusable workflows
+/mcp                 inspect tools enabled for this chat
+/status              show model, workspace, and mode state
+/usage               show the latest request metrics
+/side                start a side conversation
+/compact             rebuild bounded context around the chat
+/feedback <text>     save local feedback with this chat
+```
+
+For coding and agent work, select a local project from the workspace button in the chat header. The workspace binds the conversation to a persistent project root, model/runtime metadata, durable run events, and an explicit approval queue. MTPLX remains the model provider and runtime source of truth. Read and search are available by policy, while writes, terminal actions, and browser actions default to approval-required state.
+
+The workspace state is exposed for clients that want the same desktop experience:
+
+```text
+GET  /v1/mtplx/agent/models
+GET  /v1/mtplx/agent/profiles
+GET  /v1/mtplx/workspaces
+POST /v1/mtplx/workspaces/{workspace_id}/runs
+POST /v1/mtplx/runs/{run_id}/resume
+GET  /v1/mtplx/runs/{run_id}/events
+GET  /v1/mtplx/workspaces/{workspace_id}/approvals
+POST /v1/mtplx/approvals/{approval_id}
+GET  /v1/mtplx/workspaces/{workspace_id}/skills
+POST /v1/mtplx/workspaces/{workspace_id}/delegations
+GET  /v1/mtplx/delegations/{delegation_id}/worktree
+POST /v1/mtplx/delegations/{delegation_id}/retry
+```
+
+The same control plane is available from the CLI:
+
+```bash
+mtplx agent profiles
+mtplx agent workspace-add MTPLX /path/to/repository
+mtplx agent run-list <workspace-id>
+mtplx agent events <run-id>
+mtplx agent review <workspace-id> --prompt "Review the current diff"
+mtplx agent worktree <delegation-id>
+```
+
+Delegated agents use the Planner, Implementer, Reviewer, Tester, Research,
+Memory Curator, and User Profile roles. Each delegation gets a durable child
+run and an isolated Git worktree. MTPLX records the prompt, model, role,
+events, skill hashes, worktree base commit, review evidence, and terminal
+status. Worktree checks are evidence-only. MTPLX does not merge a delegated
+worktree implicitly.
+
+Delegated agents recover as `paused` after a daemon restart. Retry requeues the
+child run, preserving its event history and isolated worktree. Each delegation
+also persists its role permissions and bounded output-token budget.
+
+### Durable Graphs
+
+Graphs is the durable workflow engine for repeatable local agent work. A definition can combine input, output, model, tool, conditional, human approval, and memory nodes in a validated sequential DAG. General cycles are rejected. Loop is the only iteration mechanism, has an explicit bound, and checkpoints after every iteration.
+
+Graphs is separate from `mtplx/graphbank.py`; the two have independent schemas, storage, and execution paths. MTPLX remains the source of truth for model selection, loading, inference, runtime profiles, and telemetry. Graphs calls the existing MTPLX runtime instead of loading or owning a second model.
+
+Definitions are stored as immutable, content-hashed revisions, and every Graph run pins one revision. A Graph run persists node state and durable events, supports pause, resume, cancel, exact one-use approvals, and explicit failed-node retry, and preserves completed nodes across restart recovery. Side-effecting tool calls use stable idempotency keys, so recovery can replay a recorded result without silently repeating the action.
+
+The HTTP lifecycle is available under the MTPLX server:
+
+```text
+POST  /v1/mtplx/graphs/validate
+GET   /v1/mtplx/graphs
+POST  /v1/mtplx/graphs
+GET   /v1/mtplx/graphs/{graph_id}
+PATCH /v1/mtplx/graphs/{graph_id}
+GET   /v1/mtplx/graphs/{graph_id}/revisions
+GET   /v1/mtplx/graphs/{graph_id}/revisions/{revision}
+GET   /v1/mtplx/graph-runs
+POST  /v1/mtplx/graph-runs
+GET   /v1/mtplx/graph-runs/{run_id}
+POST  /v1/mtplx/graph-runs/{run_id}/pause
+POST  /v1/mtplx/graph-runs/{run_id}/resume
+POST  /v1/mtplx/graph-runs/{run_id}/cancel
+POST  /v1/mtplx/graph-runs/{run_id}/retry
+POST  /v1/mtplx/graph-runs/{run_id}/approve
+GET   /v1/mtplx/graph-runs/{run_id}/events
+GET   /v1/mtplx/graph-runs/{run_id}/logs
+GET   /v1/mtplx/graph-runs/{run_id}/approvals
+```
+
+The CLI exposes the same lifecycle:
+
+```bash
+mtplx graph list
+mtplx graph validate definition.json
+mtplx graph create definition.json
+mtplx graph update <graph-id> definition.json
+mtplx graph show <graph-id>
+mtplx graph revisions <graph-id>
+mtplx graph run <graph-id> --inputs '{}'
+mtplx graph status <run-id>
+mtplx graph pause <run-id>
+mtplx graph resume <run-id>
+mtplx graph cancel <run-id>
+mtplx graph retry <run-id> --node-id <node-id>
+mtplx graph approve <run-id> <approval-id>
+mtplx graph logs <run-id>
+```
+
+The native desktop Graphs inspector is read-only for definitions and Graph run control. It shows the pinned revision, runtime profile, model, status, node checkpoints, Loop progress, errors, and durable event history. Pending exact approvals continue through the shared workspace approval queue.
+
 ## Auto-tune
 
 The right draft depth depends on your specific Mac: chip, memory bandwidth, thermals. During onboarding (and any time after), MTPLX runs the real model on your machine at each depth, with fans pinned for clean timing, and keeps autoregressive decoding as the baseline. If an MTP depth beats it, that depth is saved. If nothing beats the baseline, nothing is saved and the app says so. From the terminal it is one command:
@@ -109,6 +232,28 @@ Both flags repeat, so several models can be served at once and picked per reques
 These models do not go through the MTP path, and that is deliberate: multi-token prediction makes *next-token* decoding cheaper, which means nothing for a model that returns a vector instead of a token stream. Configure them in the app under Settings → Retrieval endpoints, or persist them in `~/.mtplx/config.toml` as `embedding_models` and `reranker_models`. With nothing configured the endpoints answer 404 and chat behaves exactly as before. One safety gate: checkpoints that bundle their own Python inference code (the jina embedding/reranker MLX releases do) are refused with a 403 until you opt in with `--retrieval-trust-remote-code` (or `retrieval_trust_remote_code = true` in the config file) — a model download never gains code execution just by being pointed at.
 
 Sampler controls cover `temperature`, `top_p`, `top_k`, and the OpenAI penalty pair `presence_penalty` / `frequency_penalty` — per request, as server defaults (`--default-presence-penalty` / `--default-frequency-penalty` on `start`/`serve`/`quickstart`), or live via `mtplx settings set` and the app's Presence Penalty dial. Penalties default to 0, which is an exact no-op that preserves MTP exactness. Qwen's guidance: leave them at 0 for coding and agent work; ~0.5–1.5 presence penalty helps creative writing or when a model loops on itself.
+### Agent memory and dreaming
+
+MTPLX also provides a portable semantic memory store for agents. Memory is ordinary Markdown with JSON frontmatter, so it stays inspectable and moves with the project. Reads can list or search the store before loading full documents. Writes use atomic replacement, author and session metadata, content SHA-256 preconditions, version history, and an audit log.
+
+The store has four scopes:
+
+- `shared/` for team knowledge. Agents can read it but cannot write it through the scoped API.
+- `working/<agent-id>/` for agent-owned notes.
+- `transcripts/` for session input.
+- `dreaming/` for reviewable batch reports and proposals.
+
+```bash
+mtplx memory init
+mtplx memory write shared/deploy.md --content "Deploy via make ship."
+mtplx memory search deploy
+mtplx memory transcript session-1 --agent-id agent-a \
+  --messages '[{"role":"user","content":"Remember: deploy with make ship."}]'
+mtplx memory dream
+mtplx memory apply <dream-run-id>
+```
+
+The server exposes the same store at `/v1/mtplx/memory`. Set `MTPLX_MEMORY_DIR` to choose the root directory. Use `X-MTPLX-Agent-Id` and `X-MTPLX-Session-Id` for scoped API access. Set `MTPLX_MEMORY_CAPTURE=1` to record the latest chat turn into the transcript store, or call the transcript endpoint directly. Set `MTPLX_DREAM_INTERVAL_MINUTES` to schedule periodic dreaming. `POST /v1/mtplx/memory/dream` runs a single-worker, out-of-band curation pass that verifies hashes, organizes transcript input, and proposes only explicitly marked durable facts. Applying a run is an explicit operation and fails if the source snapshot changed.
 
 Concurrent scheduler modes, ownership guarantees, and backend-specific
 implementations are documented in [Concurrency modes](docs/concurrency.md).
@@ -128,6 +273,8 @@ mtplx bench aime --quick   # run the AIME benchmark from the terminal
 mtplx doctor               # install and integration health
 mtplx max --install        # fan control (one sudo prompt, crash-safe)
 mtplx settings get/set     # read or change live server settings
+mtplx memory --help        # inspect, search, update, and dream over agent memory
+mtplx graph --help         # create, inspect, run, recover, and control durable Graphs
 ```
 
 Every command takes `--help`, and most inspection/diagnostic commands take `--json`. The CLI works without MLX installed for everything that does not need a model, so `doctor` and `inspect` run on any machine.
@@ -163,7 +310,7 @@ before admitting it. The checkpoint has no native MTP head, so an MTP launch is
 rejected before weights load instead of falling back during execution. The
 weights occupy 59.72 GiB, a 64.13 GB snapshot on disk. The launch preflight
 requires about 85 GiB of unified memory (weights, runtime headroom, and a
-16 GiB system reserve) — in practice a 96 GB Mac; 128 GB is
+16 GiB system reserve), in practice a 96 GB Mac; 128 GB is
 comfortable. MTPLX defaults Laguna to a 32,768-token context
 and response cap, and checks larger explicit server contexts against the active
 Metal memory cap.

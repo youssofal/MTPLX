@@ -81,8 +81,44 @@ public struct MTPLXChatToolFactory: Sendable {
     /// OpenAI-shape tool definitions the chat client puts on the wire.
     /// Returns typed `ChatRequestTool` values so the viewmodel can drop
     /// them straight into `ChatRequest.tools`.
-    public func toolDefinitions() -> [ChatRequestTool] {
-        [webSearchToolDefinition(), fetchURLToolDefinition()]
+    public func toolDefinitions(
+        webSearchEnabled: Bool = true,
+        workspaceRoot: String? = nil
+    ) -> [ChatRequestTool] {
+        var definitions: [ChatRequestTool] = []
+        if webSearchEnabled {
+            definitions += [webSearchToolDefinition(), fetchURLToolDefinition()]
+        }
+        if workspaceRoot != nil {
+            definitions += MTPLXWorkspaceToolService().toolDefinitions()
+        }
+        return definitions
+    }
+
+    public func requiresApproval(for name: String) -> Bool {
+        requiresApproval(for: name, policy: [:])
+    }
+
+    public func requiresApproval(for name: String, policy: [String: String]) -> Bool {
+        guard let key = Self.workspacePolicyKey(for: name) else { return false }
+        return policy[key]?.lowercased() != "allow"
+    }
+
+    public static func workspacePolicyKey(for name: String) -> String? {
+        switch name {
+        case "list_files", "read_file", "inspect_repo", "git_status", "git_diff":
+            return "read"
+        case "search_files":
+            return "search"
+        case "write_file", "apply_patch":
+            return "write"
+        case "run_tests", "run_command":
+            return "terminal"
+        case "web_search", "fetch_url":
+            return "browser"
+        default:
+            return nil
+        }
     }
 
     /// Wakes the per-turn state machine — call once at the start of

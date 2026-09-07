@@ -68,6 +68,7 @@ struct WordmarkView: View {
 // cached so we don't re-scan every paint; once located, subsequent
 // calls return the same NSImage instance.
 
+@MainActor
 private let cachedWordmarkImage: NSImage? = {
     let resourceName = "Wordmark"
     let resourceExt  = "png"
@@ -121,16 +122,19 @@ private let cachedWordmarkImage: NSImage? = {
 }()
 
 /// The cream-look raster, derived once from the shipped PNG.
+@MainActor
 private let cachedWordmarkInkImage: NSImage? = {
     guard let source = cachedWordmarkImage else { return nil }
     return WordmarkInk.derive(from: source)
 }()
 
+@MainActor
 func wordmarkNSImage() -> NSImage? { cachedWordmarkImage }
 
 /// The wordmark raster for a color scheme: the shipped chrome PNG on
 /// jet, the gunmetal derivation on cream (falling back to the shipped
 /// PNG if the derivation is unavailable).
+@MainActor
 func wordmarkNSImage(for scheme: ColorScheme) -> NSImage? {
     scheme == .light ? (cachedWordmarkInkImage ?? cachedWordmarkImage) : cachedWordmarkImage
 }

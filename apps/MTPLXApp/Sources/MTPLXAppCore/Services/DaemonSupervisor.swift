@@ -146,8 +146,8 @@ public final class DaemonSupervisor: @unchecked Sendable {
     private let logStore: BoundedLogStore
     private let restartPolicy: DaemonRestartPolicy
     private let restartSleeper: @Sendable (TimeInterval) async -> Void
-    private let initialHealthProbe: @Sendable (URL, String?) async -> HealthPayload?
-    private let healthWaitProbe: @Sendable (URL, String?) async -> HealthPayload?
+    private let initialHealthProbe: (@Sendable (URL, String?) async -> HealthPayload?)?
+    private let healthWaitProbe: (@Sendable (URL, String?) async -> HealthPayload?)?
     private let beforeProcessReservation: @Sendable () async -> Void
     private let beforeProcessRun: @Sendable () async -> Void
     private let beforePostRunLivenessCheck: @Sendable () async -> Void
@@ -191,12 +191,8 @@ public final class DaemonSupervisor: @unchecked Sendable {
             guard delay > 0 else { return }
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
         },
-        initialHealthProbe: @escaping @Sendable (URL, String?) async -> HealthPayload? = { baseURL, apiKey in
-            try? await MTPLXAPIClient(baseURL: baseURL, apiKey: apiKey).health()
-        },
-        healthWaitProbe: @escaping @Sendable (URL, String?) async -> HealthPayload? = { baseURL, apiKey in
-            try? await MTPLXAPIClient(baseURL: baseURL, apiKey: apiKey).health()
-        },
+        initialHealthProbe: (@Sendable (URL, String?) async -> HealthPayload?)? = nil,
+        healthWaitProbe: (@Sendable (URL, String?) async -> HealthPayload?)? = nil,
         // Test seam immediately before the atomic lifecycle reservation.
         beforeProcessReservation: @escaping @Sendable () async -> Void = {},
         // Test seam for the narrow period after ownership is published but
@@ -229,6 +225,23 @@ public final class DaemonSupervisor: @unchecked Sendable {
         self.beforeStopProcessFamilyResolution = beforeStopProcessFamilyResolution
         self.beforeStopProcessFamilySignal = beforeStopProcessFamilySignal
         self.beforeTerminationHandling = beforeTerminationHandling
+    }
+
+    // Keep the default health requests as direct async calls. Injected probes
+    // are reserved for tests, avoiding a default async closure reabstraction
+    // around the large optional health payload on older Swift toolchains.
+    private func probeInitialHealth(baseURL: URL, apiKey: String?) async -> HealthPayload? {
+        if let initialHealthProbe {
+            return await initialHealthProbe(baseURL, apiKey)
+        }
+        return try? await MTPLXAPIClient(baseURL: baseURL, apiKey: apiKey).health()
+    }
+
+    private func probeWaitingHealth(baseURL: URL, apiKey: String?) async -> HealthPayload? {
+        if let healthWaitProbe {
+            return await healthWaitProbe(baseURL, apiKey)
+        }
+        return try? await MTPLXAPIClient(baseURL: baseURL, apiKey: apiKey).health()
     }
 
     public var logs: BoundedLogStore {
@@ -386,7 +399,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
         notifyStatusObserver()
         onPhase?(.launching)
 
-        let existingHealth = probeHealth ? await initialHealthProbe(healthBaseURL, apiKey) : nil
+        let existingHealth = probeHealth ? await probeInitialHealth(baseURL: healthBaseURL, apiKey: apiKey) : nil
         if Task.isCancelled, automaticAttempt != nil {
             await stopCancelledAutomaticLaunchIfCurrent(
                 generation: launchGeneration,
@@ -1002,7 +1015,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
         let adoptionGeneration = adoption.generation
         let adoptionLifecycleEpoch = adoption.lifecycleEpoch
         notifyStatusObserver()
-        guard let existing = await initialHealthProbe(healthBaseURL, apiKey), existing.ok else {
+        guard let existing = await probeInitialHealth(baseURL: healthBaseURL, apiKey: apiKey), existing.ok else {
             abortUnstartedLaunch(
                 generation: adoptionGeneration,
                 lifecycleEpoch: adoptionLifecycleEpoch
@@ -1485,7 +1498,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
                     : "daemon exited before /health became ready: \(tail)"
                 throw DaemonSupervisorError.launchFailed(detail)
             }
-            if let health = await healthWaitProbe(baseURL, apiKey), health.ok {
+            if let health = await probeWaitingHealth(baseURL: baseURL, apiKey: apiKey), health.ok {
                 try Task.checkCancellation()
                 if let expectedLaunchID {
                     guard health.startup?.launchId == expectedLaunchID else {

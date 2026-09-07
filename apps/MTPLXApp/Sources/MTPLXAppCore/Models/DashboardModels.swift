@@ -680,9 +680,9 @@ public struct MetricsLatest: Codable, Equatable, Sendable {
     public var ssdSuffixTokens: Int? { values["ssd_suffix_tokens"]?.intValue }
     public var requestCacheVerdict: RequestCacheVerdict {
         switch values["session_cache_hit"]?.boolValue {
-        case true: return .hit
-        case false: return .miss
-        case nil: return .unknown
+        case .some(true): return .hit
+        case .some(false): return .miss
+        case .none: return .unknown
         }
     }
 

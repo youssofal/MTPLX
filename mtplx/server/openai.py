@@ -32,6 +32,7 @@ import socket
 import subprocess
 import struct
 import sys
+import tempfile
 import time
 import urllib.parse
 import uuid
@@ -1689,6 +1690,232 @@ class FanModeRequest(BaseModel):
     mode: str = Field(..., pattern="^(default|smart|max|auto)$")
     require_actual_ramp: bool = False
     timeout_s: float | None = Field(default=None, ge=0.0, le=120.0)
+
+
+class MemoryWriteRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    content: str
+    expected_sha256: str | None = None
+    author: str | None = None
+    session_id: str | None = None
+    agent_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemoryTranscriptRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    session_id: str
+    messages: list[dict[str, Any]] = Field(default_factory=list)
+    agent_id: str | None = None
+    request_id: str | None = None
+    model: str | None = None
+
+
+class MemoryDreamRequest(BaseModel):
+    max_transcripts: int = Field(default=100, ge=1, le=5000)
+
+
+class MemoryRestoreRequest(BaseModel):
+    version: int = Field(..., ge=1)
+    expected_sha256: str | None = None
+    author: str | None = None
+    session_id: str | None = None
+    agent_id: str | None = None
+
+
+class WorkspaceCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    name: str
+    root_path: str
+    workspace_id: str | None = None
+    agent_profile: str = "mtplx-agent"
+    model: str | None = None
+    instructions: str = ""
+    tool_policy: dict[str, str] = Field(default_factory=dict)
+
+
+class WorkspaceUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    name: str | None = None
+    root_path: str | None = None
+    agent_profile: str | None = None
+    model: str | None = None
+    instructions: str | None = None
+    tool_policy: dict[str, str] | None = None
+
+
+class WorkspaceRunRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    session_id: str | None = None
+    title: str = "Agent run"
+    model: str | None = None
+    run_id: str | None = None
+    status: str | None = None
+    error: str | None = None
+
+
+class WorkspaceRunUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    title: str | None = None
+    status: str | None = None
+    error: str | None = None
+
+
+class WorkspaceEventRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    kind: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkspaceApprovalRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    run_id: str | None = None
+    tool: str
+    action: str
+    description: str = ""
+    target: str | None = None
+    risk: str = "medium"
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    expires_in_seconds: int = Field(default=600, ge=30, le=86400)
+
+
+class WorkspaceApprovalDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    decision: str
+    resolved_by: str = "user"
+    reason: str | None = None
+
+
+class WorkspaceToolRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str | None = None
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    approval_id: str | None = None
+    executor_id: str = "api"
+    idempotency_key: str | None = Field(default=None, max_length=300)
+
+
+class WorkspaceExternalActionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str | None = None
+    tool: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    approval_id: str | None = None
+    executor_id: str = "desktop"
+
+
+class AgentDelegationRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    role: str = "reviewer"
+    prompt: str = ""
+    parent_run_id: str | None = None
+    model: str | None = None
+    budget: int | None = Field(default=None, ge=256, le=16384)
+    context_window: int | None = Field(default=None, ge=1024, le=1048576)
+    source_delegation_id: str | None = None
+    start: bool = True
+
+
+class AgentDelegationCancelRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    reason: str | None = None
+
+
+class AgentIntegrationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reviewer_delegation_id: str
+    approval_id: str | None = None
+    executor_id: str = "api"
+
+
+class AgentProfileCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    name: str
+    description: str = ""
+    permissions: list[str] = Field(default_factory=lambda: ["read", "search"])
+    instructions: str = ""
+    token_budget: int = Field(default=2400, ge=256, le=16384)
+    context_window: int = Field(default=65536, ge=1024, le=1048576)
+    model: str | None = None
+
+
+class AgentProfileUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = None
+    description: str | None = None
+    permissions: list[str] | None = None
+    instructions: str | None = None
+    token_budget: int | None = Field(default=None, ge=256, le=16384)
+    context_window: int | None = Field(default=None, ge=1024, le=1048576)
+    model: str | None = None
+
+
+class GraphDefinitionRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    schema_version: int = 1
+    id: str | None = None
+    project_id: str | None = None
+    workspace_id: str
+    name: str
+    description: str = ""
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    outputs: dict[str, Any] = Field(default_factory=dict)
+    nodes: list[dict[str, Any]] = Field(default_factory=list)
+    edges: list[dict[str, Any]] = Field(default_factory=list)
+    limits: dict[str, Any] = Field(default_factory=dict)
+    policies: dict[str, str] = Field(default_factory=dict)
+    runtime_requirements: dict[str, Any] = Field(default_factory=dict)
+    retry: dict[str, Any] = Field(default_factory=dict)
+    timeout_seconds: int = Field(default=3600, ge=1, le=604800)
+    approval_requirements: dict[str, Any] = Field(default_factory=dict)
+
+
+class GraphRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    graph_id: str
+    revision: int | None = Field(default=None, ge=1)
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    model: str | None = None
+    runtime_profile: str = "auto"
+    run_id: str | None = None
+    start: bool = True
+
+
+class GraphRetryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: str | None = None
+    allow_side_effect_retry: bool = False
+    force_new_side_effect: bool = False
+
+
+class GraphApprovalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    approval_id: str
+    decision: str
+    resolved_by: str = "user"
+    reason: str | None = None
+    resume: bool = True
 
 
 class CompletionRequest(BaseModel):
@@ -3529,6 +3756,13 @@ class ServerState:
         # warmup so the optional warmup metrics can flow through the same
         # surface as user requests.
         self.dashboard = DashboardState()
+        from mtplx.dreaming import DreamingService
+        from mtplx.memory import MemoryStore
+        from mtplx.agent_workspace import WorkspaceStore
+
+        self.memory_store = MemoryStore.from_env()
+        self.dreaming_service = DreamingService(self.memory_store)
+        self.workspace_store = WorkspaceStore.from_env()
         self.ar_batch_service = _BatchedARGenerationService(self)
         self.ar_batch_unavailable_reason: str | None = None
         if scheduler_config.mode in {
@@ -14314,7 +14548,6 @@ def _postcommit_next_turn_prefix_ids(
         )
 
     normalized: list[dict[str, Any]] = []
-    last_history_role: str | None = None
     for message in history_messages:
         item = _message_to_template_dict(
             message,
@@ -14329,7 +14562,6 @@ def _postcommit_next_turn_prefix_ids(
         )
         if item is not None:
             normalized.append(item)
-            last_history_role = str(item.get("role") or "")
     item = _message_to_template_dict(
         sentinel_message,
         strip_assistant_reasoning_history=strip_assistant_reasoning_history,
@@ -16322,6 +16554,41 @@ def _mtplx_app_capabilities() -> dict[str, Any]:
         "cancel": "/v1/mtplx/cancel/{request_id}",
         "dashboard": "/dashboard/",
         "app_capabilities": "/v1/mtplx/app/capabilities",
+        "memory": "/v1/mtplx/memory",
+        "memory_document": "/v1/mtplx/memory/{memory_path}",
+        "memory_history": "/v1/mtplx/memory/history/{memory_path}",
+        "memory_restore": "/v1/mtplx/memory/history/{memory_path}/restore",
+        "memory_transcript": "/v1/mtplx/memory/transcripts",
+        "memory_dream": "/v1/mtplx/memory/dream",
+        "memory_context": "/v1/mtplx/memory/context",
+        "workspaces": "/v1/mtplx/workspaces",
+        "workspace": "/v1/mtplx/workspaces/{workspace_id}",
+        "workspace_runs": "/v1/mtplx/workspaces/{workspace_id}/runs",
+        "run": "/v1/mtplx/runs/{run_id}",
+        "run_events": "/v1/mtplx/runs/{run_id}/events",
+        "approvals": "/v1/mtplx/workspaces/{workspace_id}/approvals",
+        "approval": "/v1/mtplx/approvals/{approval_id}",
+        "agent_models": "/v1/mtplx/agent/models",
+        "agent_profiles": "/v1/mtplx/agent/profiles",
+        "agent_tools": "/v1/mtplx/agent/tools",
+        "workspace_tool_preview": "/v1/mtplx/workspaces/{workspace_id}/tools/{tool_name}/preview",
+        "workspace_tool_execute": "/v1/mtplx/workspaces/{workspace_id}/tools/{tool_name}",
+        "external_action_authorize": "/v1/mtplx/workspaces/{workspace_id}/external-actions/authorize",
+        "delegations": "/v1/mtplx/workspaces/{workspace_id}/delegations",
+        "delegation": "/v1/mtplx/delegations/{delegation_id}",
+        "delegation_worktree": "/v1/mtplx/delegations/{delegation_id}/worktree",
+        "delegation_retry": "/v1/mtplx/delegations/{delegation_id}/retry",
+        "delegation_integration": "/v1/mtplx/delegations/{delegation_id}/integration",
+        "delegation_integrate": "/v1/mtplx/delegations/{delegation_id}/integrate",
+        "workspace_skills": "/v1/mtplx/workspaces/{workspace_id}/skills",
+        "graphs": "/v1/mtplx/graphs",
+        "graph": "/v1/mtplx/graphs/{graph_id}",
+        "graph_revisions": "/v1/mtplx/graphs/{graph_id}/revisions",
+        "graph_validate": "/v1/mtplx/graphs/validate",
+        "graph_runs": "/v1/mtplx/graph-runs",
+        "graph_run": "/v1/mtplx/graph-runs/{run_id}",
+        "graph_run_events": "/v1/mtplx/graph-runs/{run_id}/events",
+        "graph_run_approvals": "/v1/mtplx/graph-runs/{run_id}/approvals",
     }
     return {
         "ok": True,
@@ -16366,6 +16633,28 @@ def _mtplx_app_capabilities() -> dict[str, Any]:
             "parse_tools_at_completion": True,
             "early_tool_cancel_default": False,
             "hidden_generation_repair_default": False,
+            "semantic_memory": True,
+            "memory_versioning": True,
+            "memory_scoped_permissions": True,
+            "memory_dreaming": True,
+            "memory_context": True,
+            "agent_workspaces": True,
+            "durable_run_events": True,
+            "tool_approval_state": True,
+            "policy_bound_tool_execution": True,
+            "one_time_exact_approvals": True,
+            "network_policy": True,
+            "external_action_authorization": True,
+            "agent_profiles": True,
+            "agent_delegation": True,
+            "isolated_agent_worktrees": True,
+            "guarded_agent_integration": True,
+            "graphs": True,
+            "graph_schema_v1": True,
+            "graph_loop_nodes": True,
+            "durable_graph_execution": True,
+            "graph_restart_recovery": True,
+            "local_model_registry": True,
         },
         "openai_bridge": {
             "mode": "omlx_style",
@@ -16398,6 +16687,35 @@ def _json_env(name: str) -> dict[str, Any] | None:
     except Exception:
         return None
     return value if isinstance(value, dict) else None
+
+
+def _memory_capture_enabled() -> bool:
+    return os.environ.get("MTPLX_MEMORY_CAPTURE", "off").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _memory_dream_interval_s() -> float | None:
+    raw = os.environ.get("MTPLX_DREAM_INTERVAL_MINUTES", "").strip()
+    if not raw:
+        return None
+    try:
+        minutes = float(raw)
+    except ValueError:
+        return None
+    return minutes * 60.0 if minutes > 0 else None
+
+
+async def _memory_dream_loop(service: Any, interval_s: float) -> None:
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            service.start()
+        except Exception as exc:
+            LOGGER.warning("scheduled semantic memory dreaming failed: %s", exc)
 
 
 def _int_env(name: str) -> int | None:
@@ -28639,6 +28957,189 @@ def _as_text_list(value: Any, *, field: str) -> list[str]:
 
 
 def create_app(state: ServerState) -> FastAPI:
+    from mtplx.agent_workspace import (
+        WorkspaceConflictError,
+        WorkspaceNotFoundError,
+        WorkspaceStore,
+        WorkspaceStoreError,
+    )
+    from mtplx.agent_orchestrator import AgentDelegationError, AgentOrchestrator
+    from mtplx.graph_executor import GraphExecutionError, GraphExecutor
+    from mtplx.graphs import (
+        GraphError,
+        GraphStore,
+        GraphValidationError,
+        validate_graph_payload,
+    )
+    from mtplx.workspace_tools import WorkspaceToolService, first_party_tool_definitions
+    from mtplx.skills import SkillStore
+    from mtplx.dreaming import DreamingService
+    from mtplx.memory import (
+        MemoryConflictError,
+        MemoryNotFoundError,
+        MemoryPermissionError,
+        MemoryPrincipal,
+        MemoryStore,
+        MemoryStoreError,
+    )
+
+    memory_store = getattr(state, "memory_store", None)
+    workspace_store = getattr(state, "workspace_store", None)
+    agent_state_root = getattr(state, "agent_state_root", None)
+    if (
+        agent_state_root is None
+        and memory_store is None
+        and workspace_store is None
+        and not isinstance(state, ServerState)
+    ):
+        temporary_state = tempfile.TemporaryDirectory(prefix="mtplx-agent-state-")
+        state._agent_state_temporary_directory = temporary_state
+        agent_state_root = temporary_state.name
+        state.agent_state_root = agent_state_root
+    if memory_store is None:
+        memory_store = (
+            MemoryStore(Path(agent_state_root) / "memory")
+            if agent_state_root is not None
+            else MemoryStore.from_env()
+        )
+    dreaming_service = getattr(state, "dreaming_service", None)
+    if dreaming_service is None:
+        dreaming_service = DreamingService(memory_store)
+        state.dreaming_service = dreaming_service
+    state.memory_store = memory_store
+    if workspace_store is None:
+        configured_workspace_root = os.environ.get("MTPLX_WORKSPACE_DIR")
+        workspace_store = WorkspaceStore(
+            configured_workspace_root
+            or (
+                Path(agent_state_root) / "workspaces"
+                if agent_state_root is not None
+                else memory_store.root.parent / "workspaces"
+            )
+        )
+    state.workspace_store = workspace_store
+    # A daemon restart must not leave the desktop showing a false live run.
+    # Runs can be explicitly resumed later through the durable API.
+    workspace_store.recover_incomplete_runs()
+    workspace_tool_service = getattr(state, "workspace_tool_service", None)
+    if workspace_tool_service is None:
+        workspace_tool_service = WorkspaceToolService(workspace_store)
+        state.workspace_tool_service = workspace_tool_service
+    graph_store = getattr(state, "graph_store", None)
+    if graph_store is None:
+        graph_store = GraphStore(workspace_store)
+        state.graph_store = graph_store
+
+    def graph_resource_snapshot() -> dict[str, Any]:
+        dashboard = getattr(state, "dashboard", None)
+        thermal = getattr(dashboard, "last_thermal", None) if dashboard is not None else None
+        thermal_data = dict(thermal) if isinstance(thermal, Mapping) else {}
+        backend = _backend_descriptor(state)
+        runtime = getattr(state, "runtime", None)
+        active_profile = getattr(state, "profile", None)
+        return {
+            **_mlx_allocator_public_stats(),
+            "provider": "mtplx",
+            "runtime_loaded": runtime is not None,
+            "loaded_model": str(getattr(state, "model_id", "") or ""),
+            "backend_id": str(getattr(backend, "backend_id", "") or ""),
+            "runtime_capabilities": list(
+                getattr(backend, "runtime_capabilities", ()) or ()
+            ),
+            "memory_pressure_level": int(
+                getattr(dashboard, "last_memory_pressure_level", 0) or 0
+            )
+            if dashboard is not None
+            else 0,
+            "thermal_throttled": bool(
+                thermal_data.get("throttled")
+                or thermal_data.get("thermal_throttled")
+                or thermal_data.get("pressure") == "critical"
+            ),
+            "context_window": int(getattr(state, "context_window", 0) or 0),
+            "runtime_profile": str(
+                getattr(active_profile, "name", None)
+                or getattr(getattr(state, "args", None), "profile", None)
+                or "auto"
+            ),
+            "runtime_execution_profile": str(
+                getattr(active_profile, "runtime_profile", None) or ""
+            ),
+        }
+
+    graph_executor = getattr(state, "graph_executor", None)
+    if graph_executor is None:
+        graph_executor = GraphExecutor(
+            graph_store,
+            workspace_tool_service,
+            memory_store,
+            resource_snapshot=graph_resource_snapshot,
+            base_url=(
+                os.environ.get("MTPLX_BASE_URL")
+                or f"http://127.0.0.1:{int(getattr(getattr(state, 'args', None), 'port', 8000) or 8000)}"
+            ),
+            api_key=getattr(getattr(state, "args", None), "api_key", None),
+        )
+        state.graph_executor = graph_executor
+    agent_orchestrator = getattr(state, "agent_orchestrator", None)
+    if agent_orchestrator is None:
+        agent_orchestrator = AgentOrchestrator(workspace_store, state)
+        state.agent_orchestrator = agent_orchestrator
+
+    def memory_principal(
+        request: Request,
+        *,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+    ) -> MemoryPrincipal:
+        return MemoryPrincipal(
+            agent_id=(request.headers.get("x-mtplx-agent-id") or agent_id or request.query_params.get("agent_id")),
+            session_id=(request.headers.get("x-mtplx-session-id") or session_id or request.query_params.get("session_id")),
+        )
+
+    def memory_http_error(exc: Exception) -> HTTPException:
+        if isinstance(exc, MemoryNotFoundError):
+            return HTTPException(status_code=404, detail=str(exc))
+        if isinstance(exc, MemoryPermissionError):
+            return HTTPException(status_code=403, detail=str(exc))
+        if isinstance(exc, MemoryConflictError):
+            return HTTPException(
+                status_code=409,
+                detail={
+                    "message": str(exc),
+                    "path": exc.path,
+                    "expected_sha256": exc.expected,
+                    "actual_sha256": exc.actual,
+                },
+            )
+        if isinstance(exc, MemoryStoreError):
+            return HTTPException(status_code=400, detail=str(exc))
+        return HTTPException(status_code=500, detail=f"memory operation failed: {exc}")
+
+    def workspace_http_error(exc: Exception) -> HTTPException:
+        if isinstance(exc, WorkspaceNotFoundError):
+            return HTTPException(status_code=404, detail=str(exc))
+        if isinstance(exc, WorkspaceConflictError):
+            return HTTPException(status_code=409, detail=str(exc))
+        if isinstance(exc, WorkspaceStoreError):
+            return HTTPException(status_code=400, detail=str(exc))
+        return HTTPException(status_code=500, detail=f"workspace operation failed: {exc}")
+
+    def graph_http_error(exc: Exception) -> HTTPException:
+        if isinstance(exc, GraphValidationError):
+            return HTTPException(
+                status_code=422,
+                detail={"message": str(exc), "issues": list(exc.issues)},
+            )
+        if isinstance(exc, WorkspaceConflictError):
+            return HTTPException(status_code=409, detail=str(exc))
+        if isinstance(exc, GraphExecutionError):
+            return HTTPException(status_code=409, detail=str(exc))
+        if isinstance(exc, GraphError):
+            status_code = 404 if "not found" in str(exc).lower() else 400
+            return HTTPException(status_code=status_code, detail=str(exc))
+        return workspace_http_error(exc)
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         # Bind the running asyncio loop to the dashboard bus so generation
@@ -28665,6 +29166,11 @@ def create_app(state: ServerState) -> FastAPI:
         retrieval = getattr(state, "retrieval", None)
         if retrieval is not None and retrieval.idle_timeout_s > 0:
             bg_tasks.append(asyncio.create_task(_retrieval_idle_loop(state)))
+        dream_interval_s = _memory_dream_interval_s()
+        if dream_interval_s is not None:
+            bg_tasks.append(
+                asyncio.create_task(_memory_dream_loop(dreaming_service, dream_interval_s))
+            )
         try:
             yield
         finally:
@@ -28703,6 +29209,17 @@ def create_app(state: ServerState) -> FastAPI:
                     postcommit_executor.shutdown(wait=False, cancel_futures=True)
                 if generation_executor is not None:
                     generation_executor.shutdown(wait=False, cancel_futures=True)
+            active_dreaming_service = getattr(state, "dreaming_service", None)
+            if active_dreaming_service is not None and hasattr(
+                active_dreaming_service, "close"
+            ):
+                active_dreaming_service.close()
+            active_agent_orchestrator = getattr(state, "agent_orchestrator", None)
+            if active_agent_orchestrator is not None:
+                active_agent_orchestrator.close()
+            active_graph_executor = getattr(state, "graph_executor", None)
+            if active_graph_executor is not None:
+                active_graph_executor.close()
 
     app = FastAPI(title="MTPLX OpenAI-compatible server", lifespan=lifespan)
     app.state.mtplx = state
@@ -28931,6 +29448,21 @@ def create_app(state: ServerState) -> FastAPI:
                 "actual_ramp_latency_s"
             ),
             "startup": _startup_health_payload(state),
+            "semantic_memory": {
+                "enabled": True,
+                "root": str(memory_store.root),
+                "capture": _memory_capture_enabled(),
+                "dream_interval_minutes": (
+                    _memory_dream_interval_s() / 60.0
+                    if _memory_dream_interval_s() is not None
+                    else None
+                ),
+            },
+            "agent_workspace": {
+                "enabled": True,
+                **workspace_store.status(),
+                "delegations": len(agent_orchestrator.list(limit=1000)),
+            },
             "thermal": _thermal_health_payload(
                 fan_mode=fan_mode,
                 smart_status=smart_status,
@@ -29239,6 +29771,885 @@ def create_app(state: ServerState) -> FastAPI:
     @app.get("/v1/mtplx/app/capabilities")
     def mtplx_app_capabilities() -> dict[str, Any]:
         return _mtplx_app_capabilities()
+
+    @app.get("/v1/mtplx/memory")
+    def list_mtplx_memory(
+        request: Request,
+        query: str = "",
+        scope: str = "all",
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        principal = memory_principal(
+            request,
+            agent_id=agent_id,
+            session_id=session_id,
+        )
+        try:
+            if query.strip():
+                results = [
+                    hit.to_dict()
+                    for hit in memory_store.search(
+                        query,
+                        scope=scope,
+                        principal=principal,
+                        limit=limit,
+                    )
+                ]
+                return {"query": query, "scope": scope, "results": results}
+            documents = memory_store.list_documents(
+                scope=scope,
+                principal=principal,
+                limit=limit,
+            )
+            return {
+                "scope": scope,
+                "documents": [doc.to_dict(include_content=False) for doc in documents],
+            }
+        except Exception as exc:
+            raise memory_http_error(exc) from exc
+
+    @app.get("/v1/mtplx/memory/context")
+    def build_mtplx_memory_context(
+        request: Request,
+        query: str,
+        scope: str = "all",
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        limit: int = 8,
+        max_chars: int = 12000,
+    ) -> dict[str, Any]:
+        principal = memory_principal(
+            request,
+            agent_id=agent_id,
+            session_id=session_id,
+        )
+        try:
+            return memory_store.build_context(
+                query,
+                scope=scope,
+                principal=principal,
+                limit=limit,
+                max_chars=max_chars,
+            ).to_dict()
+        except Exception as exc:
+            raise memory_http_error(exc) from exc
+
+    @app.put("/v1/mtplx/memory/{memory_path:path}")
+    def write_mtplx_memory(
+        memory_path: str,
+        request: Request,
+        payload: MemoryWriteRequest,
+    ) -> dict[str, Any]:
+        principal = memory_principal(
+            request,
+            agent_id=payload.agent_id,
+            session_id=payload.session_id,
+        )
+        try:
+            document = memory_store.write(
+                memory_path,
+                payload.content,
+                expected_sha256=payload.expected_sha256,
+                author=payload.author or principal.agent_id or "agent",
+                session_id=payload.session_id,
+                agent_id=principal.agent_id,
+                metadata=payload.metadata,
+                principal=principal,
+            )
+            return document.to_dict()
+        except Exception as exc:
+            raise memory_http_error(exc) from exc
+
+    @app.post("/v1/mtplx/memory/append")
+    def append_mtplx_memory(
+        request: Request,
+        payload: MemoryWriteRequest,
+        path: str,
+    ) -> dict[str, Any]:
+        principal = memory_principal(
+            request,
+            agent_id=payload.agent_id,
+            session_id=payload.session_id,
+        )
+        try:
+            document = memory_store.append(
+                path,
+                payload.content,
+                expected_sha256=payload.expected_sha256,
+                author=payload.author or principal.agent_id or "agent",
+                session_id=payload.session_id,
+                agent_id=principal.agent_id,
+                metadata=payload.metadata,
+                principal=principal,
+            )
+            return document.to_dict()
+        except Exception as exc:
+            raise memory_http_error(exc) from exc
+
+    @app.post("/v1/mtplx/memory/transcripts")
+    def record_mtplx_transcript(
+        request: Request,
+        payload: MemoryTranscriptRequest,
+    ) -> dict[str, Any]:
+        principal = memory_principal(
+            request,
+            agent_id=payload.agent_id,
+            session_id=payload.session_id,
+        )
+        try:
+            document = memory_store.record_transcript(
+                payload.session_id,
+                payload.messages,
+                agent_id=principal.agent_id,
+                request_id=payload.request_id,
+                model=payload.model,
+                principal=principal,
+            )
+            return document.to_dict(include_content=False)
+        except Exception as exc:
+            raise memory_http_error(exc) from exc
+
+    @app.post("/v1/mtplx/memory/dream")
+    def start_mtplx_dreaming(payload: MemoryDreamRequest) -> dict[str, Any]:
+        return dreaming_service.start(max_transcripts=payload.max_transcripts)
+
+    @app.get("/v1/mtplx/memory/dream/{run_id}")
+    def get_mtplx_dreaming(run_id: str) -> dict[str, Any]:
+        result = dreaming_service.get(run_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail=f"dreaming run not found: {run_id}")
+        return result
+
+    @app.post("/v1/mtplx/memory/dream/{run_id}/apply")
+    def apply_mtplx_dreaming(run_id: str) -> dict[str, Any]:
+        try:
+            return dreaming_service.apply(run_id)
+        except Exception as exc:
+            raise memory_http_error(exc) from exc
+
+    @app.get("/v1/mtplx/memory/history/{memory_path:path}")
+    def history_mtplx_memory(memory_path: str, request: Request) -> dict[str, Any]:
+        try:
+            return memory_store.history(
+                memory_path,
+                principal=memory_principal(request),
+            )
+        except Exception as exc:
+            raise memory_http_error(exc) from exc
+
+    @app.post("/v1/mtplx/memory/history/{memory_path:path}/restore")
+    def restore_mtplx_memory(
+        memory_path: str,
+        request: Request,
+        payload: MemoryRestoreRequest,
+    ) -> dict[str, Any]:
+        principal = memory_principal(
+            request,
+            agent_id=payload.agent_id,
+            session_id=payload.session_id,
+        )
+        try:
+            document = memory_store.restore(
+                memory_path,
+                payload.version,
+                expected_sha256=payload.expected_sha256,
+                author=payload.author or principal.agent_id or "agent",
+                session_id=payload.session_id,
+                agent_id=principal.agent_id,
+                principal=principal,
+            )
+            return document.to_dict()
+        except Exception as exc:
+            raise memory_http_error(exc) from exc
+
+    @app.get("/v1/mtplx/memory/{memory_path:path}")
+    def read_mtplx_memory(memory_path: str, request: Request) -> dict[str, Any]:
+        try:
+            document = memory_store.read(
+                memory_path,
+                principal=memory_principal(request),
+            )
+            return document.to_dict()
+        except Exception as exc:
+            raise memory_http_error(exc) from exc
+
+    @app.get("/v1/mtplx/agent/models")
+    def list_mtplx_agent_models() -> dict[str, Any]:
+        runtime = getattr(state, "runtime", None)
+        model_path = str(
+            getattr(runtime, "model_path", None)
+            or getattr(state.args, "model", None)
+            or state.model_id
+        )
+        backend = _backend_descriptor(state)
+        return {
+            "provider": {
+                "id": "mtplx",
+                "name": "MTPLX local runtime",
+                "kind": "local",
+                "source_of_truth": "loaded daemon runtime",
+            },
+            "models": [
+                {
+                    "id": state.model_id,
+                    "path": model_path,
+                    "backend": getattr(backend, "backend_id", None),
+                    "display_name": getattr(backend, "display_name", None),
+                    "context_window": getattr(state, "context_window", None),
+                    "reasoning": bool(_reasoning_parser_for_state(state) != "none"),
+                    "vision": _server_vision_spec(state) is not None,
+                    "loaded": runtime is not None,
+                }
+            ],
+        }
+
+    @app.post("/v1/mtplx/graphs/validate")
+    def validate_mtplx_graph(payload: GraphDefinitionRequest) -> dict[str, Any]:
+        try:
+            value = payload.model_dump(exclude_none=True)
+            value["project_id"] = value.get("project_id") or value["workspace_id"]
+            graph = validate_graph_payload(value)
+            return {"valid": True, "graph": graph.to_dict()}
+        except Exception as exc:
+            raise graph_http_error(exc) from exc
+
+    @app.get("/v1/mtplx/graphs")
+    def list_mtplx_graphs(
+        workspace_id: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        try:
+            if workspace_id:
+                workspace_store.get_workspace(workspace_id)
+            return {
+                "graphs": [
+                    item.to_dict()
+                    for item in graph_store.list(
+                        workspace_id=workspace_id,
+                        limit=limit,
+                    )
+                ]
+            }
+        except Exception as exc:
+            raise graph_http_error(exc) from exc
+
+    @app.post("/v1/mtplx/graphs")
+    def create_mtplx_graph(payload: GraphDefinitionRequest) -> dict[str, Any]:
+        try:
+            value = payload.model_dump(exclude_none=True)
+            value["project_id"] = value.get("project_id") or value["workspace_id"]
+            return graph_store.create(value).to_dict()
+        except Exception as exc:
+            raise graph_http_error(exc) from exc
+
+    @app.get("/v1/mtplx/graphs/{graph_id}")
+    def get_mtplx_graph(graph_id: str, revision: int | None = None) -> dict[str, Any]:
+        try:
+            return graph_store.get(graph_id, revision=revision).to_dict()
+        except Exception as exc:
+            raise graph_http_error(exc) from exc
+
+    @app.patch("/v1/mtplx/graphs/{graph_id}")
+    def update_mtplx_graph(
+        graph_id: str,
+        payload: dict[str, Any] = Body(...),
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        try:
+            return graph_store.update(
+                graph_id,
+                payload,
+                expected_revision=expected_revision,
+            ).to_dict()
+        except Exception as exc:
+            raise graph_http_error(exc) from exc
+
+    @app.get("/v1/mtplx/graphs/{graph_id}/revisions")
+    def list_mtplx_graph_revisions(graph_id: str, limit: int = 100) -> dict[str, Any]:
+        try:
+            return {
+                "graph_id": graph_id,
+                "revisions": [
+                    item.to_dict()
+                    for item in graph_store.list_revisions(graph_id, limit=limit)
+                ],
+            }
+        except Exception as exc:
+            raise graph_http_error(exc) from exc
+
+    @app.get("/v1/mtplx/graphs/{graph_id}/revisions/{revision}")
+    def get_mtplx_graph_revision(graph_id: str, revision: int) -> dict[str, Any]:
+        try:
+            return graph_store.get(graph_id, revision=revision).to_dict()
+        except Exception as exc:
+            raise graph_http_error(exc) from exc
+
+    @app.get("/v1/mtplx/graph-runs")
+    def list_mtplx_graph_runs(
+        graph_id: str | None = None,
+        workspace_id: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        try:
+            return {
+                "runs": [
+                    item.to_dict()
+                    for item in graph_store.list_runs(
+                        graph_id=graph_id,
+                        workspace_id=workspace_id,
+                        limit=limit,
+                    )
+                ]
+            }
+        except Exception as exc:
+            raise graph_http_error(exc) from exc
+
+    @app.post("/v1/mtplx/graph-runs")
+    def create_mtplx_graph_run(payload: GraphRunRequest) -> dict[str, Any]:
+        try:
+            return graph_executor.start(
+                payload.graph_id,
+                revision=payload.revision,
+                inputs=payload.inputs,
+                model=payload.model,
+                runtime_profile=payload.runtime_profile,
+                run_id=payload.run_id,
+                start=payload.start,
+            ).to_dict()
+        except Exception as exc:
+            raise graph_http_error(exc) from exc
+
+    @app.get("/v1/mtplx/graph-runs/{run_id}")
+    def get_mtplx_graph_run(run_id: str) -> dict[str, Any]:
+        try:
+            return graph_store.get_run(run_id).to_dict()
+        except Exception as exc:
+            raise graph_http_error(exc) from exc
+
+    @app.post("/v1/mtplx/graph-runs/{run_id}/pause")
+    def pause_mtplx_graph_run(run_id: str) -> dict[str, Any]:
+        try:
+            return graph_executor.pause(run_id).to_dict()
+        except Exception as exc:
+            raise graph_http_error(exc) from exc
+
+    @app.post("/v1/mtplx/graph-runs/{run_id}/resume")
+    def resume_mtplx_graph_run(run_id: str) -> dict[str, Any]:
+        try:
+            return graph_executor.resume(run_id).to_dict()
+        except Exception as exc:
+            raise graph_http_error(exc) from exc
+
+    @app.post("/v1/mtplx/graph-runs/{run_id}/cancel")
+    def cancel_mtplx_graph_run(run_id: str) -> dict[str, Any]:
+        try:
+            return graph_executor.cancel(run_id).to_dict()
+        except Exception as exc:
+            raise graph_http_error(exc) from exc
+
+    @app.post("/v1/mtplx/graph-runs/{run_id}/retry")
+    def retry_mtplx_graph_run(
+        run_id: str,
+        payload: GraphRetryRequest,
+    ) -> dict[str, Any]:
+        try:
+            return graph_executor.retry_failed_node(
+                run_id,
+                payload.node_id,
+                allow_side_effect_retry=payload.allow_side_effect_retry,
+                force_new_side_effect=payload.force_new_side_effect,
+            ).to_dict()
+        except Exception as exc:
+            raise graph_http_error(exc) from exc
+
+    @app.post("/v1/mtplx/graph-runs/{run_id}/approve")
+    def approve_mtplx_graph_run(
+        run_id: str,
+        payload: GraphApprovalRequest,
+    ) -> dict[str, Any]:
+        try:
+            run = graph_executor.approve(
+                run_id,
+                payload.approval_id,
+                payload.decision,
+                resolved_by=payload.resolved_by,
+                reason=payload.reason,
+                resume=payload.resume,
+            )
+            return {
+                "run": run.to_dict(),
+                "approval": workspace_store.get_approval(payload.approval_id).to_dict(),
+            }
+        except Exception as exc:
+            raise graph_http_error(exc) from exc
+
+    @app.get("/v1/mtplx/graph-runs/{run_id}/events")
+    @app.get("/v1/mtplx/graph-runs/{run_id}/logs")
+    def list_mtplx_graph_run_events(
+        run_id: str,
+        limit: int = 500,
+        after: int = 0,
+    ) -> dict[str, Any]:
+        try:
+            graph_store.get_run(run_id)
+            return {
+                "run_id": run_id,
+                "events": [
+                    item.to_dict()
+                    for item in workspace_store.list_events(
+                        run_id,
+                        limit=limit,
+                        after=after,
+                    )
+                ],
+            }
+        except Exception as exc:
+            raise graph_http_error(exc) from exc
+
+    @app.get("/v1/mtplx/graph-runs/{run_id}/approvals")
+    def list_mtplx_graph_run_approvals(
+        run_id: str,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        try:
+            run = graph_store.get_run(run_id)
+            return {
+                "run_id": run_id,
+                "approvals": [
+                    item.to_dict()
+                    for item in workspace_store.list_approvals(
+                        workspace_id=run.workspace_id,
+                        run_id=run.id,
+                        status=status,
+                        limit=limit,
+                    )
+                ],
+            }
+        except Exception as exc:
+            raise graph_http_error(exc) from exc
+
+    @app.get("/v1/mtplx/workspaces")
+    def list_mtplx_workspaces(limit: int = 100) -> dict[str, Any]:
+        try:
+            return {
+                "workspaces": [
+                    item.to_dict() for item in workspace_store.list_workspaces(limit=limit)
+                ],
+                "status": workspace_store.status(),
+            }
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
+
+    @app.post("/v1/mtplx/workspaces")
+    def create_mtplx_workspace(payload: WorkspaceCreateRequest) -> dict[str, Any]:
+        try:
+            workspace = workspace_store.create_workspace(
+                payload.name,
+                payload.root_path,
+                workspace_id=payload.workspace_id,
+                agent_profile=payload.agent_profile,
+                model=payload.model or state.model_id,
+                instructions=payload.instructions,
+                tool_policy=payload.tool_policy,
+            )
+            return workspace.to_dict()
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
+
+    @app.get("/v1/mtplx/workspaces/{workspace_id}")
+    def get_mtplx_workspace(workspace_id: str) -> dict[str, Any]:
+        try:
+            return workspace_store.get_workspace(workspace_id).to_dict()
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
+
+    @app.patch("/v1/mtplx/workspaces/{workspace_id}")
+    def update_mtplx_workspace(
+        workspace_id: str,
+        payload: WorkspaceUpdateRequest,
+    ) -> dict[str, Any]:
+        try:
+            changes = payload.model_dump(exclude_none=True)
+            return workspace_store.update_workspace(workspace_id, **changes).to_dict()
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
+
+    @app.get("/v1/mtplx/workspaces/{workspace_id}/runs")
+    def list_mtplx_workspace_runs(workspace_id: str, limit: int = 100) -> dict[str, Any]:
+        try:
+            workspace_store.get_workspace(workspace_id)
+            return {
+                "workspace_id": workspace_id,
+                "runs": [
+                    item.to_dict()
+                    for item in workspace_store.list_runs(workspace_id, limit=limit)
+                ],
+            }
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
+
+    @app.post("/v1/mtplx/workspaces/{workspace_id}/runs")
+    def create_mtplx_workspace_run(
+        workspace_id: str,
+        payload: WorkspaceRunRequest,
+    ) -> dict[str, Any]:
+        try:
+            run = workspace_store.create_run(
+                workspace_id,
+                session_id=payload.session_id,
+                title=payload.title,
+                model=payload.model or state.model_id,
+                run_id=payload.run_id,
+            )
+            return run.to_dict()
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
+
+    @app.get("/v1/mtplx/runs/{run_id}")
+    def get_mtplx_run(run_id: str) -> dict[str, Any]:
+        try:
+            return workspace_store.get_run(run_id).to_dict()
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
+
+    @app.patch("/v1/mtplx/runs/{run_id}")
+    def update_mtplx_run(
+        run_id: str,
+        payload: WorkspaceRunUpdateRequest,
+    ) -> dict[str, Any]:
+        try:
+            updates = payload.model_dump(exclude_none=True)
+            return workspace_store.update_run(
+                run_id,
+                title=updates.get("title"),
+                status=updates.get("status"),
+                error=updates.get("error"),
+            ).to_dict()
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
+
+    @app.post("/v1/mtplx/runs/{run_id}/resume")
+    def resume_mtplx_run(run_id: str) -> dict[str, Any]:
+        try:
+            return workspace_store.resume_run(run_id).to_dict()
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
+
+    @app.get("/v1/mtplx/runs/{run_id}/events")
+    def list_mtplx_run_events(
+        run_id: str,
+        limit: int = 500,
+        after: int = 0,
+    ) -> dict[str, Any]:
+        try:
+            return {
+                "run_id": run_id,
+                "events": [
+                    item.to_dict()
+                    for item in workspace_store.list_events(run_id, limit=limit, after=after)
+                ],
+            }
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
+
+    @app.post("/v1/mtplx/runs/{run_id}/events")
+    def append_mtplx_run_event(
+        run_id: str,
+        payload: WorkspaceEventRequest,
+    ) -> dict[str, Any]:
+        try:
+            return workspace_store.append_event(run_id, payload.kind, payload.payload).to_dict()
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
+
+    @app.get("/v1/mtplx/workspaces/{workspace_id}/approvals")
+    def list_mtplx_approvals(
+        workspace_id: str,
+        run_id: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        try:
+            workspace_store.get_workspace(workspace_id)
+            return {
+                "workspace_id": workspace_id,
+                "approvals": [
+                    item.to_dict()
+                    for item in workspace_store.list_approvals(
+                        workspace_id=workspace_id,
+                        run_id=run_id,
+                        status=status,
+                        limit=limit,
+                    )
+                ],
+            }
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
+
+    @app.post("/v1/mtplx/workspaces/{workspace_id}/approvals")
+    def create_mtplx_approval(
+        workspace_id: str,
+        payload: WorkspaceApprovalRequest,
+    ) -> dict[str, Any]:
+        try:
+            return workspace_store.create_approval(
+                workspace_id,
+                run_id=payload.run_id,
+                tool=payload.tool,
+                action=payload.action,
+                description=payload.description,
+                target=payload.target,
+                risk=payload.risk,
+                arguments=payload.arguments,
+                expires_in_seconds=payload.expires_in_seconds,
+            ).to_dict()
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
+
+    @app.post("/v1/mtplx/approvals/{approval_id}")
+    def resolve_mtplx_approval(
+        approval_id: str,
+        payload: WorkspaceApprovalDecisionRequest,
+    ) -> dict[str, Any]:
+        try:
+            return workspace_store.resolve_approval(
+                approval_id,
+                payload.decision,
+                resolved_by=payload.resolved_by,
+                reason=payload.reason,
+            ).to_dict()
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
+
+    @app.get("/v1/mtplx/agent/profiles")
+    def list_mtplx_agent_profiles() -> dict[str, Any]:
+        return {
+            "profiles": agent_orchestrator.profiles(),
+            "delegation_statuses": [
+                "queued",
+                "running",
+                "waiting_approval",
+                "paused",
+                "completed",
+                "failed",
+                "cancelled",
+            ],
+        }
+
+    @app.post("/v1/mtplx/agent/profiles")
+    def create_mtplx_agent_profile(payload: AgentProfileCreateRequest) -> dict[str, Any]:
+        try:
+            return agent_orchestrator.profile_store.create(
+                payload.id,
+                name=payload.name,
+                description=payload.description,
+                permissions=payload.permissions,
+                instructions=payload.instructions,
+                token_budget=payload.token_budget,
+                context_window=payload.context_window,
+                model=payload.model,
+            ).to_dict()
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
+
+    @app.patch("/v1/mtplx/agent/profiles/{profile_id}")
+    def update_mtplx_agent_profile(
+        profile_id: str,
+        payload: AgentProfileUpdateRequest,
+    ) -> dict[str, Any]:
+        try:
+            return agent_orchestrator.profile_store.update(
+                profile_id,
+                **payload.model_dump(exclude_none=True),
+            ).to_dict()
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
+
+    @app.get("/v1/mtplx/agent/tools")
+    def list_mtplx_agent_tools() -> dict[str, Any]:
+        definitions = first_party_tool_definitions()
+        return {
+            "tools": definitions,
+            "names": [item["function"]["name"] for item in definitions],
+            "execution_boundary": "workspace policy plus exact one-time approval",
+        }
+
+    @app.post("/v1/mtplx/workspaces/{workspace_id}/tools/{tool_name}/preview")
+    def preview_mtplx_workspace_tool(
+        workspace_id: str,
+        tool_name: str,
+        payload: WorkspaceToolRequest,
+    ) -> dict[str, Any]:
+        try:
+            return workspace_tool_service.preview(
+                workspace_id,
+                tool_name,
+                payload.arguments,
+                run_id=payload.run_id,
+            ).to_dict()
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
+
+    @app.post("/v1/mtplx/workspaces/{workspace_id}/tools/{tool_name}")
+    def execute_mtplx_workspace_tool(
+        workspace_id: str,
+        tool_name: str,
+        payload: WorkspaceToolRequest,
+    ) -> dict[str, Any]:
+        try:
+            return workspace_tool_service.execute(
+                workspace_id,
+                tool_name,
+                payload.arguments,
+                run_id=payload.run_id,
+                approval_id=payload.approval_id,
+                executor_id=payload.executor_id,
+                idempotency_key=payload.idempotency_key,
+            )
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
+
+    @app.post("/v1/mtplx/workspaces/{workspace_id}/external-actions/authorize")
+    def authorize_mtplx_external_action(
+        workspace_id: str,
+        payload: WorkspaceExternalActionRequest,
+    ) -> dict[str, Any]:
+        try:
+            return workspace_tool_service.authorize_external_action(
+                workspace_id,
+                payload.tool,
+                payload.arguments,
+                run_id=payload.run_id,
+                approval_id=payload.approval_id,
+                executor_id=payload.executor_id,
+            )
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
+
+    @app.get("/v1/mtplx/workspaces/{workspace_id}/skills")
+    def list_mtplx_workspace_skills(
+        workspace_id: str,
+        include_instructions: bool = False,
+    ) -> dict[str, Any]:
+        try:
+            workspace = workspace_store.get_workspace(workspace_id)
+            skills = SkillStore([workspace.root_path]).discover()
+            return {
+                "workspace_id": workspace_id,
+                "skills": [
+                    skill.to_dict(include_instructions=include_instructions)
+                    for skill in skills
+                ],
+            }
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
+
+    @app.get("/v1/mtplx/workspaces/{workspace_id}/delegations")
+    def list_mtplx_delegations(
+        workspace_id: str,
+        parent_run_id: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        try:
+            workspace_store.get_workspace(workspace_id)
+            return {
+                "workspace_id": workspace_id,
+                "delegations": [
+                    item.to_dict()
+                    for item in agent_orchestrator.list(
+                        workspace_id=workspace_id,
+                        parent_run_id=parent_run_id,
+                        limit=limit,
+                    )
+                ],
+            }
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
+
+    @app.post("/v1/mtplx/workspaces/{workspace_id}/delegations")
+    def create_mtplx_delegation(
+        workspace_id: str,
+        payload: AgentDelegationRequest,
+    ) -> dict[str, Any]:
+        try:
+            return agent_orchestrator.delegate(
+                workspace_id,
+                role=payload.role,
+                prompt=payload.prompt,
+                parent_run_id=payload.parent_run_id,
+                model=payload.model,
+                budget=payload.budget,
+                context_window=payload.context_window,
+                source_delegation_id=payload.source_delegation_id,
+                start=payload.start,
+            ).to_dict()
+        except Exception as exc:
+            if isinstance(exc, AgentDelegationError):
+                raise workspace_http_error(exc) from exc
+            raise workspace_http_error(exc) from exc
+
+    @app.get("/v1/mtplx/delegations/{delegation_id}")
+    def get_mtplx_delegation(delegation_id: str) -> dict[str, Any]:
+        try:
+            return agent_orchestrator.get(delegation_id).to_dict()
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
+
+    @app.post("/v1/mtplx/delegations/{delegation_id}/cancel")
+    def cancel_mtplx_delegation(
+        delegation_id: str,
+        payload: AgentDelegationCancelRequest | None = None,
+    ) -> dict[str, Any]:
+        try:
+            delegation = agent_orchestrator.cancel(delegation_id)
+            return delegation.to_dict()
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
+
+    @app.post("/v1/mtplx/delegations/{delegation_id}/retry")
+    def retry_mtplx_delegation(delegation_id: str) -> dict[str, Any]:
+        try:
+            return agent_orchestrator.retry(delegation_id).to_dict()
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
+
+    @app.get("/v1/mtplx/delegations/{delegation_id}/worktree")
+    def check_mtplx_delegation_worktree(delegation_id: str) -> dict[str, Any]:
+        try:
+            return agent_orchestrator.worktree_check(delegation_id)
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
+
+    @app.get("/v1/mtplx/delegations/{delegation_id}/integration")
+    def check_mtplx_delegation_integration(
+        delegation_id: str,
+        reviewer_delegation_id: str,
+    ) -> dict[str, Any]:
+        try:
+            return agent_orchestrator.integration_check(
+                delegation_id,
+                reviewer_delegation_id=reviewer_delegation_id,
+            )
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
+
+    @app.post("/v1/mtplx/delegations/{delegation_id}/integrate")
+    def integrate_mtplx_delegation(
+        delegation_id: str,
+        payload: AgentIntegrationRequest,
+    ) -> dict[str, Any]:
+        try:
+            return agent_orchestrator.integrate(
+                delegation_id,
+                reviewer_delegation_id=payload.reviewer_delegation_id,
+                approval_id=payload.approval_id,
+                executor_id=payload.executor_id,
+            )
+        except Exception as exc:
+            raise workspace_http_error(exc) from exc
 
     @app.post("/v1/mtplx/thermal/fan_mode")
     @app.post("/mtplx/thermal/fan_mode")
@@ -31002,6 +32413,35 @@ def create_app(state: ServerState) -> FastAPI:
                 if key in request_observability:
                     stats.setdefault(key, request_observability[key])
             return generated
+
+        def capture_memory_turn(assistant_content: str) -> None:
+            if not _memory_capture_enabled():
+                return
+            latest = request.messages[-1]
+            input_message: dict[str, Any] = {
+                "role": latest.role,
+                "content": latest.content,
+            }
+            if latest.tool_calls:
+                input_message["tool_calls"] = latest.tool_calls
+            capture_session_id = session_id or response_id
+            capture_agent_id = (
+                headers.get("x-mtplx-agent-id")
+                or metadata.get("agent_id")
+                or request.user
+                or "mtplx-agent"
+            )
+            try:
+                memory_store.record_transcript(
+                    capture_session_id,
+                    [input_message, {"role": "assistant", "content": assistant_content}],
+                    agent_id=str(capture_agent_id),
+                    request_id=response_id,
+                    model=model,
+                    principal=MemoryPrincipal(is_admin=True),
+                )
+            except Exception as exc:
+                LOGGER.warning("semantic memory capture failed: %s", exc)
 
         def _nonstream_on_tokens(new_tokens: list[int]) -> None:
             nonlocal nonstream_completion_tokens
@@ -34476,6 +35916,7 @@ def create_app(state: ServerState) -> FastAPI:
                 _merge_final_bridge_stats_into_latest_metrics(
                     state, {"finish_reason": finish_reason}
                 )
+                capture_memory_turn(streamed_history_content())
                 done = {
                     "id": response_id,
                     "object": "chat.completion.chunk",
@@ -34818,7 +36259,10 @@ def create_app(state: ServerState) -> FastAPI:
                 generated,
                 assistant_content=display_text,
             )
-            _merge_final_bridge_stats_into_latest_metrics(state, generated["stats"])
+            capture_memory_turn(display_text)
+            _merge_final_bridge_stats_into_latest_metrics(
+                state, generated["stats"]
+            )
             message = {"role": "assistant", "content": display_text}
             if reasoning_text:
                 message["reasoning_content"] = reasoning_text

@@ -18,6 +18,7 @@ final class AssistantBubbleFailureLabelTests: XCTestCase {
         super.tearDown()
     }
 
+    @MainActor
     func testErrorFinishWithPersistedMessageReadsAsFailedWithTheServerMessage() {
         let statsJSON = ChatTurnFailure.statsJSON(
             stats: nil,
@@ -31,6 +32,7 @@ final class AssistantBubbleFailureLabelTests: XCTestCase {
         )
     }
 
+    @MainActor
     func testFailedLabelIsLocalisedAroundTheVerbatimServerMessage() {
         L10n.activate(.german)
         let title = AssistantBubbleView.interruptedReplyTitle(
@@ -39,6 +41,7 @@ final class AssistantBubbleFailureLabelTests: XCTestCase {
         XCTAssertEqual(title, "Fehlgeschlagen: context window exceeded")
     }
 
+    @MainActor
     func testCancelledAndLegacyErrorTurnsKeepInterruptedReply() {
         // A user stop never carries a failure, whatever the blob holds.
         let blob = ChatTurnFailure.statsJSON(stats: nil, failure: ChatTurnFailure(errorMessage: "x"))
@@ -50,6 +53,7 @@ final class AssistantBubbleFailureLabelTests: XCTestCase {
         XCTAssertEqual(AssistantBubbleView.interruptedReplyTitle(failure: nil), "Interrupted reply")
     }
 
+    @MainActor
     func testStreamLostTurnsReadAsInterruptedAndCompletionsDoNot() {
         // A reply the daemon never finished (bytes stopped without a
         // terminal chunk) is an interrupted reply, without a server message.

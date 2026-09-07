@@ -615,6 +615,15 @@ final class DaemonSupervisorTests: XCTestCase {
             processID: Int(pi.processIdentifier),
             cancellationMarkerURL: handoffDirectory.appendingPathComponent("cancelled")
         )
+        // The system Python launcher may still be replacing itself when
+        // Process.run returns. Wait for the owned fixture's environment,
+        // while retaining the exact-token and lookalike rejection checks.
+        let handoffDeadline = Date().addingTimeInterval(3)
+        while pi.isRunning,
+              !MTPLXTerminalHandoffLease.process(pid: pi.processIdentifier, hasExactHandoffID: handoffID),
+              Date() < handoffDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
         XCTAssertTrue(MTPLXTerminalHandoffLease.process(
             pid: pi.processIdentifier,
             hasExactHandoffID: handoffID

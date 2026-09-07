@@ -358,9 +358,9 @@ public final class OnboardingOrchestrator: ObservableObject {
                 extraEnvironment: extraEnvironment
             ) {
                 if Task.isCancelled { break }
-                await MainActor.run {
-                    self?.handleDownloadEvent(event)
-                }
+                // Hop directly to the owning actor. Do not capture the
+                // task's weak reference inside another actor-isolated closure.
+                await self?.handleDownloadEvent(event)
             }
         }
     }

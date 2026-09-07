@@ -172,6 +172,8 @@ public struct ChatRequest: Encodable, Sendable {
     public var enableThinking: Bool?
     public var generationMode: String?
     public var depth: Int?
+    public var reasoningEffort: String?
+    public var metadata: [String: String]?
 
     public init(
         model: String? = nil,
@@ -186,7 +188,9 @@ public struct ChatRequest: Encodable, Sendable {
         toolChoice: String? = nil,
         enableThinking: Bool? = nil,
         generationMode: String? = nil,
-        depth: Int? = nil
+        depth: Int? = nil,
+        reasoningEffort: String? = nil,
+        metadata: [String: String]? = nil
     ) {
         self.model = model
         self.messages = messages
@@ -201,6 +205,8 @@ public struct ChatRequest: Encodable, Sendable {
         self.enableThinking = enableThinking
         self.generationMode = generationMode
         self.depth = depth
+        self.reasoningEffort = reasoningEffort
+        self.metadata = metadata
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -215,6 +221,8 @@ public struct ChatRequest: Encodable, Sendable {
         case enableThinking = "enable_thinking"
         case generationMode = "generation_mode"
         case depth
+        case reasoningEffort = "reasoning_effort"
+        case metadata
     }
 }
 

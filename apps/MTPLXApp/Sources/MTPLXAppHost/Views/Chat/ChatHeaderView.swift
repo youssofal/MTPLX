@@ -13,6 +13,7 @@ import MTPLXAppCore
 struct ChatHeaderView: View {
     @ObservedObject var viewModel: ChatViewModel
     @Binding var sidebarCollapsed: Bool
+    @Binding var workspacePanelPresented: Bool
 
     /// Latched display state for the TPS chip. The daemon emits
     /// progress events several times per second; binding the chip
@@ -46,6 +47,20 @@ struct ChatHeaderView: View {
                 .truncationMode(.tail)
 
             Spacer()
+
+            Button {
+                withAnimation(.smooth(duration: 0.2)) {
+                    workspacePanelPresented.toggle()
+                }
+            } label: {
+                Image(systemName: workspacePanelPresented ? "sidebar.right" : "folder")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(workspacePanelPresented ? Brand.accentChrome : Brand.typeSecondary)
+                    .frame(width: 24, height: 24)
+            }
+            .buttonStyle(.plain)
+            .help("Workspace and agent controls")
+            .accessibilityLabel("Workspace and agent controls")
 
             tpsChip
         }
