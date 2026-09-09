@@ -308,11 +308,13 @@ def _env_falsey(name: str) -> bool:
     }
 
 
-# MTPLX_QWEN4_DRAFT_K20_PRESCATTER -- read ONCE at import (in
-# ``mtplx.qwen4_draft_k20_prescatter``), default OFF.  When off this constant
-# is False, no plan is claimed, `_draft_k20_prescatter_plan` stays None, and
-# the one draft-read site below is behind `is not None`, so the retained stock
-# lane runs the code it ran before this module existed.
+# MTPLX_QWEN4_DRAFT_K20_PRESCATTER -- read AT USE via
+# ``_qwen4_draft_k20_prescatter_enabled()`` (see mtplx.qwen4_draft_k20_prescatter),
+# default OFF, NOT frozen at import. The server's fixed-M4 auto-arm stamps this
+# key AFTER this module is imported, so a module-level constant read here froze
+# the default and the served lane never engaged (arming audit 2026-09-07). When
+# off the claim below (behind `is not None`) is never built, so the retained
+# stock lane runs the code it ran before this module existed.
 #
 # When on (and the request is eligible -- the claim RAISES rather than falling
 # back) each draft step builds its K20 support from the FR-Spec head's 65,536
@@ -320,21 +322,19 @@ def _env_falsey(name: str) -> bool:
 # 65,536-lane `argpartition` and `logsumexp` instead of 248,320-lane ones, and
 # the same `(ids, probs)` support because the ranked id table is strictly
 # ascending.  See that module's docstring for the exactness argument.
-_QWEN4_DRAFT_K20_PRESCATTER = _qwen4_draft_k20_prescatter_enabled()
-
-# MTPLX_QWEN4_BLOCK_VERIFY -- read ONCE at import (in
-# ``mtplx.qwen4_block_verify``), default OFF.  When off this constant is False,
-# no verifier is built, and the stock accept loop evaluates exactly the
-# expressions it evaluated before -- same acceptance probability, same
-# residual, same uniforms, same order.  When on, the loop runs block
-# verification (Sun et al. 2024, arXiv:2403.10444) instead of the per-token
-# Leviathan-Chen law: it clips the RUNNING reach product at 1 rather than
-# clipping each factor, water-fills the resulting budget across the depth d+1
-# draft support, and corrects from the SCALED residual (c*p - q)+.  Both laws
-# are exact samplers of the same target distribution; BV accepts deeper more
-# often (+1.85% tokens/window measured offline on 381 real windows) and draws
-# exactly the same number of uniforms.  See ``mtplx/qwen4_block_verify.py``.
-_QWEN4_BLOCK_VERIFY = _qwen4_block_verify_enabled()
+#
+# MTPLX_QWEN4_BLOCK_VERIFY -- likewise read AT USE via
+# ``_qwen4_block_verify_enabled()`` (see mtplx.qwen4_block_verify), default OFF,
+# NOT frozen at import (same served-arming reason). The env is frozen once
+# serving starts, so the accept loop reads the same value at every step. When
+# on, the loop runs block verification (Sun et al. 2024, arXiv:2403.10444)
+# instead of the per-token Leviathan-Chen law: it clips the RUNNING reach
+# product at 1 rather than clipping each factor, water-fills the resulting
+# budget across the depth d+1 draft support, and corrects from the SCALED
+# residual (c*p - q)+.  Both laws are exact samplers of the same target
+# distribution; BV accepts deeper more often (+1.85% tokens/window measured
+# offline on 381 real windows) and draws exactly the same number of uniforms.
+# See ``mtplx/qwen4_block_verify.py``.
 
 def _family_capture_commit_enabled() -> bool:
     """qwen4_exp layer-owned capture-commit (``MTPLX_FAMILY_CAPTURE_COMMIT``).
@@ -9953,7 +9953,7 @@ def generate_mtpk(
     # both are passed as absent.
     _draft_k20_prescatter_plan = None
     _draft_k20_prescatter_receipt: dict[str, object] = {"installed": False}
-    if _QWEN4_DRAFT_K20_PRESCATTER:
+    if _qwen4_draft_k20_prescatter_enabled():
         _draft_k20_prescatter_plan = _qwen4_draft_k20_prescatter_claim(
             rt,
             greedy_chain_enabled=_greedy_chain_eligible,
@@ -12194,7 +12194,7 @@ def generate_mtpk(
         _host_accept_drafts = draft_tokens
         _bv = None
         if (
-            _QWEN4_BLOCK_VERIFY
+            _qwen4_block_verify_enabled()
             and _host_accept_drafts
             and sampler.temperature > 0
             and target_prefix_tokens is None

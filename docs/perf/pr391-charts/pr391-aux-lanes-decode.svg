@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="780" height="460" viewBox="0 0 780 460" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<rect x="0" y="0" width="780" height="460" fill="#ffffff"/>
+<text x="390.0" y="24" text-anchor="middle" font-size="16" font-weight="600" fill="#111827">Qwen3.8 Flash-Next stacked lanes: decode tok/s per window (16,384 / 1,024, ABBA retest)</text>
+<line x1="70" y1="380.0" x2="720" y2="380.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="62" y="384.0" text-anchor="end" font-size="11" fill="#6b7280">74</text>
+<line x1="70" y1="324.0" x2="720" y2="324.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="62" y="328.0" text-anchor="end" font-size="11" fill="#6b7280">76</text>
+<line x1="70" y1="268.0" x2="720" y2="268.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="62" y="272.0" text-anchor="end" font-size="11" fill="#6b7280">78</text>
+<line x1="70" y1="212.0" x2="720" y2="212.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="62" y="216.0" text-anchor="end" font-size="11" fill="#6b7280">80</text>
+<line x1="70" y1="156.0" x2="720" y2="156.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="62" y="160.0" text-anchor="end" font-size="11" fill="#6b7280">82</text>
+<line x1="70" y1="100.0" x2="720" y2="100.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="62" y="104.0" text-anchor="end" font-size="11" fill="#6b7280">84</text>
+<line x1="70" y1="44.0" x2="720" y2="44.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="62" y="48.0" text-anchor="end" font-size="11" fill="#6b7280">86</text>
+<line x1="70" y1="44" x2="70" y2="380" stroke="#9ca3af" stroke-width="1"/>
+<line x1="70" y1="380" x2="720" y2="380" stroke="#9ca3af" stroke-width="1"/>
+<text x="18" y="212" text-anchor="middle" font-size="12" fill="#374151" transform="rotate(-90 18 212)">decode tok/s</text>
+<rect x="70.0" y="44" width="108.3" height="336" fill="#f3f4f6"/>
+<rect x="178.3" y="44" width="108.3" height="336" fill="#eff6ff"/>
+<rect x="286.7" y="44" width="108.3" height="336" fill="#ecfdf5"/>
+<rect x="395.0" y="44" width="108.3" height="336" fill="#ecfdf5"/>
+<rect x="503.3" y="44" width="108.3" height="336" fill="#eff6ff"/>
+<rect x="611.7" y="44" width="108.3" height="336" fill="#f3f4f6"/>
+<text x="124.2" y="398" text-anchor="middle" font-size="11" fill="#374151">control</text>
+<text x="124.2" y="412" text-anchor="middle" font-size="11" fill="#374151">c1</text>
+<text x="232.5" y="398" text-anchor="middle" font-size="11" fill="#374151">cached</text>
+<text x="232.5" y="412" text-anchor="middle" font-size="11" fill="#374151">a1</text>
+<text x="340.8" y="398" text-anchor="middle" font-size="11" fill="#374151">pooled</text>
+<text x="340.8" y="412" text-anchor="middle" font-size="11" fill="#374151">b1</text>
+<text x="449.2" y="398" text-anchor="middle" font-size="11" fill="#374151">pooled</text>
+<text x="449.2" y="412" text-anchor="middle" font-size="11" fill="#374151">b2</text>
+<text x="557.5" y="398" text-anchor="middle" font-size="11" fill="#374151">cached</text>
+<text x="557.5" y="412" text-anchor="middle" font-size="11" fill="#374151">a2</text>
+<text x="665.8" y="398" text-anchor="middle" font-size="11" fill="#374151">control</text>
+<text x="665.8" y="412" text-anchor="middle" font-size="11" fill="#374151">c2</text>
+<polyline points="124.2,202.0 232.5,148.7 340.8,174.9 449.2,147.3 557.5,132.9 665.8,164.7" fill="none" stroke="#2563eb" stroke-width="2"/>
+<circle cx="124.2" cy="202.0" r="3.2" fill="#2563eb"/>
+<circle cx="232.5" cy="148.7" r="3.2" fill="#2563eb"/>
+<circle cx="340.8" cy="174.9" r="3.2" fill="#2563eb"/>
+<circle cx="449.2" cy="147.3" r="3.2" fill="#2563eb"/>
+<circle cx="557.5" cy="132.9" r="3.2" fill="#2563eb"/>
+<circle cx="665.8" cy="164.7" r="3.2" fill="#2563eb"/>
+<polyline points="124.2,328.2 232.5,283.7 340.8,304.9 449.2,275.8 557.5,279.9 665.8,296.8" fill="none" stroke="#d97706" stroke-width="2"/>
+<circle cx="124.2" cy="328.2" r="3.2" fill="#d97706"/>
+<circle cx="232.5" cy="283.7" r="3.2" fill="#d97706"/>
+<circle cx="340.8" cy="304.9" r="3.2" fill="#d97706"/>
+<circle cx="449.2" cy="275.8" r="3.2" fill="#d97706"/>
+<circle cx="557.5" cy="279.9" r="3.2" fill="#d97706"/>
+<circle cx="665.8" cy="296.8" r="3.2" fill="#d97706"/>
+<polyline points="124.2,134.8 232.5,93.9 340.8,102.2 449.2,84.1 557.5,81.0 665.8,101.3" fill="none" stroke="#059669" stroke-width="2"/>
+<circle cx="124.2" cy="134.8" r="3.2" fill="#059669"/>
+<circle cx="232.5" cy="93.9" r="3.2" fill="#059669"/>
+<circle cx="340.8" cy="102.2" r="3.2" fill="#059669"/>
+<circle cx="449.2" cy="84.1" r="3.2" fill="#059669"/>
+<circle cx="557.5" cy="81.0" r="3.2" fill="#059669"/>
+<circle cx="665.8" cy="101.3" r="3.2" fill="#059669"/>
+<line x1="82" y1="52" x2="104" y2="52" stroke="#2563eb" stroke-width="2"/>
+<circle cx="93" cy="52" r="3.2" fill="#2563eb"/>
+<text x="112" y="56" font-size="11" fill="#374151">seed 20260829</text>
+<line x1="82" y1="70" x2="104" y2="70" stroke="#d97706" stroke-width="2"/>
+<circle cx="93" cy="70" r="3.2" fill="#d97706"/>
+<text x="112" y="74" font-size="11" fill="#374151">seed 20260830</text>
+<line x1="82" y1="88" x2="104" y2="88" stroke="#059669" stroke-width="2"/>
+<circle cx="93" cy="88" r="3.2" fill="#059669"/>
+<text x="112" y="92" font-size="11" fill="#374151">seed 20260831</text>
+<text x="70" y="450" font-size="10.5" fill="#6b7280">Run order c1, a1, b1, b2, a2, c2. Column tint marks the arm: grey control, blue cached PLE (a), green pooled rowsel (b). Each cached and pooled window is above both control windows at every seed.</text>
+</svg>

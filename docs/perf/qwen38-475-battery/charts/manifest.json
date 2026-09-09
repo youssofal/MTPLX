@@ -1,0 +1,142 @@
+[
+  {
+    "alt": "Prefill tok/s by context size, one line per engine",
+    "bytes": 80203,
+    "caption": "_Prefill tok/s by context size, per engine. Seeds behind each point: 1K-8K n=3; 16K n=9; 32K-128K n=3; band = min-max across those seeds. Every engine was sent the same request per cell -- identical request body on all 18 shared cells (request_body_sha256, every field but model)._",
+    "engines": [
+      "arm-A-release",
+      "arm-C-aux475",
+      "arm-D-t478-020",
+      "arm-E-t478-009"
+    ],
+    "file": "prefill_tok_s.svg",
+    "key": "prefill_tok_s",
+    "label": "Prefill tok/s"
+  },
+  {
+    "alt": "Decode tok/s by context size, one line per engine",
+    "bytes": 79610,
+    "caption": "_Decode tok/s by context size, per engine. Seeds behind each point: 1K-8K n=3; 16K n=9; 32K-128K n=3; band = min-max across those seeds. Every engine was sent the same request per cell -- identical request body on all 18 shared cells (request_body_sha256, every field but model)._",
+    "engines": [
+      "arm-A-release",
+      "arm-C-aux475",
+      "arm-D-t478-020",
+      "arm-E-t478-009"
+    ],
+    "file": "decode_tok_s.svg",
+    "key": "decode_tok_s",
+    "label": "Decode tok/s"
+  },
+  {
+    "alt": "TTFT s by context size, one line per engine",
+    "bytes": 85353,
+    "caption": "_TTFT s by context size, per engine. Seeds behind each point: 1K-8K n=3; 16K n=9; 32K-128K n=3; band = min-max across those seeds. Every engine was sent the same request per cell -- identical request body on all 18 shared cells (request_body_sha256, every field but model)._",
+    "engines": [
+      "arm-A-release",
+      "arm-C-aux475",
+      "arm-D-t478-020",
+      "arm-E-t478-009"
+    ],
+    "file": "ttft_s.svg",
+    "key": "ttft_s",
+    "label": "TTFT s"
+  },
+  {
+    "alt": "Peak mem GB by context size, one line per engine",
+    "bytes": 80770,
+    "caption": "_Peak mem GB by context size, per engine. Seeds behind each point: 1K-8K n=3; 16K n=9; 32K-128K n=3; band = min-max across those seeds. Every engine was sent the same request per cell -- identical request body on all 18 shared cells (request_body_sha256, every field but model)._",
+    "engines": [
+      "arm-A-release",
+      "arm-C-aux475",
+      "arm-D-t478-020",
+      "arm-E-t478-009"
+    ],
+    "file": "peak_memory_gb.svg",
+    "key": "peak_memory_gb",
+    "label": "Peak mem GB"
+  },
+  {
+    "alt": "Peak footprint GB by context size, one line per engine",
+    "bytes": 84725,
+    "caption": "_Peak footprint GB by context size, per engine. Seeds behind each point: 1K-8K n=3; 16K n=9; 32K-128K n=3; band = min-max across those seeds. Every engine was sent the same request per cell -- identical request body on all 18 shared cells (request_body_sha256, every field but model)._",
+    "engines": [
+      "arm-A-release",
+      "arm-C-aux475",
+      "arm-D-t478-020",
+      "arm-E-t478-009"
+    ],
+    "file": "peak_footprint_gb.svg",
+    "key": "peak_footprint_gb",
+    "label": "Peak footprint GB"
+  },
+  {
+    "alt": "Wall s by context size, one line per engine",
+    "bytes": 79027,
+    "caption": "_Wall s by context size, per engine. Seeds behind each point: 1K-8K n=3; 16K n=9; 32K-128K n=3; band = min-max across those seeds. Every engine was sent the same request per cell -- identical request body on all 18 shared cells (request_body_sha256, every field but model)._",
+    "engines": [
+      "arm-A-release",
+      "arm-C-aux475",
+      "arm-D-t478-020",
+      "arm-E-t478-009"
+    ],
+    "file": "wall_s.svg",
+    "key": "wall_s",
+    "label": "Wall s"
+  },
+  {
+    "alt": "Gen tokens by context size, one line per engine",
+    "bytes": 81536,
+    "caption": "_Gen tokens by context size, per engine. Seeds behind each point: 1K-8K n=3; 16K n=9; 32K-128K n=3; band = min-max across those seeds. Every engine was sent the same request per cell -- identical request body on all 18 shared cells (request_body_sha256, every field but model)._",
+    "engines": [
+      "arm-A-release",
+      "arm-C-aux475",
+      "arm-D-t478-020",
+      "arm-E-t478-009"
+    ],
+    "file": "completion_tokens.svg",
+    "key": "completion_tokens",
+    "label": "Gen tokens"
+  },
+  {
+    "alt": "Prefill s (server) by context size, one line per engine",
+    "bytes": 86898,
+    "caption": "_Prefill s (server) by context size, per engine. Seeds behind each point: 1K-8K n=3; 16K n=9; 32K-128K n=3; band = min-max across those seeds. Every engine was sent the same request per cell -- identical request body on all 18 shared cells (request_body_sha256, every field but model)._",
+    "engines": [
+      "arm-A-release",
+      "arm-C-aux475",
+      "arm-D-t478-020",
+      "arm-E-t478-009"
+    ],
+    "file": "prefill_time_s.svg",
+    "key": "prefill_time_s",
+    "label": "Prefill s (server)"
+  },
+  {
+    "alt": "PR #391 battery summary: decode, prefill, TTFT and peak memory by context size, one line per engine",
+    "bytes": 160282,
+    "caption": "_Decode, prefill, TTFT (log scale) and peak memory in one grid, same series and colours as the per-metric charts. Seeds behind each point: 1K-8K n=3; 16K n=9; 32K-128K n=3. Every engine was sent the same request per cell -- identical request body on all 18 shared cells (request_body_sha256, every field but model)._",
+    "engines": [
+      "arm-A-release",
+      "arm-C-aux475",
+      "arm-D-t478-020",
+      "arm-E-t478-009"
+    ],
+    "file": "summary.svg",
+    "key": "summary",
+    "label": "Summary"
+  },
+  {
+    "alt": "Decode tok/s for the twelve interleaved 16K windows in run order, fastest seed as the point with a min-max band, one colour per arm",
+    "bytes": 88511,
+    "caption": "_The twelve interleaved 16K windows (A C D E x three rounds) in run order. Each point is the window's fastest seed; the band is min-max over its three seeds. The dashed line is each arm's fastest window. A drift (first vs last) = +0.17 tok/s (+0.24%)._",
+    "engines": [
+      "arm-A-release",
+      "arm-C-aux475",
+      "arm-D-t478-020",
+      "arm-E-t478-009"
+    ],
+    "file": "decode_16k_windows.svg",
+    "key": "decode_16k_windows",
+    "label": "16K ABAB decode by window"
+  }
+]
