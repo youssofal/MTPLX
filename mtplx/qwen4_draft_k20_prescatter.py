@@ -196,14 +196,25 @@ def _env_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-#: Read exactly once, at import.
-_ENABLED = _env_truthy(_ENV_VAR)
+#: ``None`` = resolve from the environment on each read; a test may force a
+#: bool via :func:`_configure_for_test`. Read at USE, never at import: the
+#: server's fixed-M4 auto-arm stamps MTPLX_QWEN4_DRAFT_K20_PRESCATTER into the
+#: environment AFTER this module is imported (via mtplx.server.openai's
+#: generation import), so an import-time read froze the default (off) and the
+#: served lane never engaged -- the arming audit, 2026-09-07. The env is frozen
+#: once serving starts, so a per-call read returns the same value every time.
+_ENABLED = None
 
 
 def is_enabled() -> bool:
-    """True when ``MTPLX_QWEN4_DRAFT_K20_PRESCATTER`` was set at import."""
+    """True when ``MTPLX_QWEN4_DRAFT_K20_PRESCATTER`` is set for this process.
 
-    return _ENABLED
+    Read at use, not frozen at import (a test may force :data:`_ENABLED`).
+    """
+
+    if _ENABLED is not None:
+        return bool(_ENABLED)
+    return _env_truthy(_ENV_VAR)
 
 
 def _configure_for_test(enabled: bool) -> None:
@@ -211,6 +222,45 @@ def _configure_for_test(enabled: bool) -> None:
 
     global _ENABLED
     _ENABLED = bool(enabled)
+
+
+#: First-use engagement latch + the last install receipt, surfaced at /health
+#: so the battery can gate on the install verdict instead of the env. The
+#: receipt (``{installed, rows, ...}``) is per-request in generation.py; this
+#: latches the last one a claim installed. Read-only reporting.
+_ENGAGED = [False]
+_LAST_RECEIPT: dict[str, object] = {}
+
+
+def _note_engaged(receipt: dict[str, object] | None = None) -> None:
+    """Latch first-use for /health (called by ``claim_draft_route`` on install)."""
+
+    _ENGAGED[0] = True
+    if receipt:
+        _LAST_RECEIPT.clear()
+        _LAST_RECEIPT.update(receipt)
+
+
+def engagement_report() -> dict:
+    """Install/first-use verdict for ``/health qwen4_install_reports.draft_k20_prescatter``.
+
+    ``armed`` is read at use (reflects the served auto-arm stamp, gate-able
+    without a request); ``engaged`` latches True the first time a claim installs
+    the pre-scatter route, and the last install receipt rides along.
+    """
+
+    return {
+        "armed": is_enabled(),
+        "engaged": bool(_ENGAGED[0]),
+        "receipt": dict(_LAST_RECEIPT),
+    }
+
+
+def reset_engagement_for_test() -> None:
+    """Clear the first-use latch and receipt (tests only)."""
+
+    _ENGAGED[0] = False
+    _LAST_RECEIPT.clear()
 
 
 class DraftK20PrescatterIneligible(RuntimeError):
@@ -405,7 +455,7 @@ def claim_draft_route(
     if not _ENABLED:
         return None
     try:
-        return _claim_draft_route(
+        plan = _claim_draft_route(
             rt,
             draft_sampler=draft_sampler,
             draft_core=draft_core,
@@ -435,6 +485,12 @@ def claim_draft_route(
             receipt.clear()
             receipt.update(stamped)
         return None
+    if plan is not None:
+        try:
+            _note_engaged(plan.to_dict())
+        except Exception:
+            _note_engaged()
+    return plan
 
 
 def _claim_draft_route(

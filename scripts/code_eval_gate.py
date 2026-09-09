@@ -49,6 +49,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from mtplx.benchmarks.code_eval import (  # noqa: E402
     CodeTask,
     TaskResult,
+    extract_code,
     load_tasks,
     pass_at_k,
     run_candidate,
@@ -183,6 +184,12 @@ def build_payload(
         # Distinct seed per sample, or n>1 just draws the same completion n
         # times at a nonzero temperature and pass@k is a lie.
         payload["seed"] = int(args.seed) + sample
+    # Optional server-extension passthrough (default empty == byte-identical to
+    # the classic payload). Used to carry e.g. enable_thinking:false or top_k
+    # for engines that read them off the request body. Applied last so it is
+    # explicit in the recorded request args.
+    for key, value in (args.extra_body or {}).items():
+        payload[key] = value
     return payload
 
 
@@ -419,6 +426,7 @@ def _request_args(args: argparse.Namespace) -> dict[str, Any]:
         "top_p": args.top_p,
         "max_tokens": args.max_tokens,
         "seed": args.seed,
+        "extra_body": dict(getattr(args, "extra_body", {}) or {}),
     }
 
 
@@ -557,6 +565,11 @@ def run(args: argparse.Namespace) -> int:
             if args.progress:
                 _print_progress("score", done, len(units), results[index])
 
+    if getattr(args, "save_completions", None):
+        _write_completions_sidecar(
+            Path(args.save_completions), units, generations, args.suite
+        )
+
     report = build_report(
         args=args,
         tasks=tasks,
@@ -598,6 +611,44 @@ def run(args: argparse.Namespace) -> int:
             )
             return 1
     return 0
+
+
+def _write_completions_sidecar(
+    path: Path,
+    units: Sequence[tuple[CodeTask, int]],
+    generations: Sequence[dict[str, Any]],
+    suite: str,
+) -> None:
+    """Persist one JSON-Lines record per (task_id, sample).
+
+    Each record carries the raw model ``completion`` and the ``solution`` that
+    the gate actually executed (``extract_code`` applied identically to the
+    scoring path), so a later extended-test rescore (HumanEval+) can run offline
+    on the exact same completions without re-hitting the model. Writing this file
+    does not change the report or any pass rate.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as handle:
+        for (task, sample), gen in zip(units, generations):
+            gen = gen or {}
+            completion = gen.get("completion") or ""
+            try:
+                solution = extract_code(completion, suite=suite)
+            except Exception:  # noqa: BLE001 - a bad completion is still a record
+                solution = ""
+            handle.write(
+                json.dumps(
+                    {
+                        "task_id": task.task_id,
+                        "sample": int(sample),
+                        "completion": completion,
+                        "solution": solution,
+                        "finish_reason": gen.get("finish_reason"),
+                        "error": gen.get("error"),
+                    }
+                )
+                + "\n"
+            )
 
 
 def _resolve_output_path(args: argparse.Namespace) -> Path | None:
@@ -662,6 +713,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="0.0 by default so two arms are comparable. Raise it for pass@k.",
     )
     parser.add_argument("--top-p", type=float)
+    parser.add_argument(
+        "--extra-body",
+        action="append",
+        default=[],
+        metavar="KEY=JSONVALUE",
+        help="Extra request-body field(s) to send, repeatable. VALUE is parsed "
+        "as JSON (falls back to a string). E.g. --extra-body enable_thinking=false "
+        "--extra-body top_k=20. Default empty == unchanged payload.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--n",
@@ -679,6 +739,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--output-json", help="Write the full report here.")
     parser.add_argument("--output-dir", help="Write the report into this directory.")
+    parser.add_argument(
+        "--save-completions",
+        help=(
+            "Also write a completions sidecar (JSON Lines) here: one object per "
+            "(task_id, sample) with the raw completion and the extracted solution. "
+            "This is what lets a later HumanEval+ / extended-test rescore run "
+            "offline (CPU only) on the SAME completions. Omit == unchanged "
+            "behaviour; the report JSON is byte-for-byte identical either way."
+        ),
+    )
     parser.add_argument(
         "--min-pass-rate",
         type=float,
@@ -699,6 +769,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--n > 1 with --temperature 0 draws the same completion n times; "
             "pass@k would be meaningless. Raise --temperature."
         )
+    # Parse repeated --extra-body KEY=JSONVALUE into a dict (JSON value, string
+    # fallback). Empty list -> {} -> payload unchanged.
+    extra_body: dict[str, Any] = {}
+    for item in args.extra_body or []:
+        if "=" not in item:
+            parser.error(f"--extra-body entry is not KEY=VALUE: {item!r}")
+        key, _, raw = item.partition("=")
+        try:
+            extra_body[key] = json.loads(raw)
+        except json.JSONDecodeError:
+            extra_body[key] = raw
+    args.extra_body = extra_body
     return run(args)
 
 

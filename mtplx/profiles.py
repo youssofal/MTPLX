@@ -428,8 +428,24 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         "MTPLX_QWEN4_VERIFY_GLUE",
         "MTPLX_QWEN4_VERIFY_GLUE_ITEMS",
         "MTPLX_QWEN4_PLE_FIRST_GATHER_EARLY",
+        # PR #475 aux lanes: the server auto-arms these for a served fixed-M4
+        # pack, so they pass through normalize_runtime_env_overrides and must
+        # be accepted here or the boot-time validator raises on the server's
+        # own overrides before a weight is read.
+        "MTPLX_QWEN4_PLE_CACHED_AUX",
+        "MTPLX_QSA_POOLED_ROWSEL",
         "MTPLX_SESSION_BANK_SHED_BOUNDARIES",
         "MTPLX_SESSION_BANK_PROTECTED_TERMINAL",
+        # PR #391 remainder ports (davidtai), stamped by the Flash-Next lane
+        # defaults on the fixed-M4 geometry; registered so operator A/B
+        # launches and pack contracts pass the boot-time runtime-env
+        # validator. All rounding-class, quality-gated.
+        "MTPLX_QWEN4_HC_M4",
+        "MTPLX_QWEN4_PREFILL_MASK_FUSE",
+        "MTPLX_QSA_PREFILL_QUERY_TILE",
+        "MTPLX_QSA_SPARSE_DECODE",
+        "MTPLX_QSA_SPARSE_DECODE_TILE",
+        "MTPLX_QSA_SPARSE_DECODE_SPLITS",
         "MTPLX_NGRAM_PREWARM_ORDER",
         "MTPLX_STRICT_CLAIMS",
         "MTPLX_QWEN4_COMPILED_MTP_PREPARE",

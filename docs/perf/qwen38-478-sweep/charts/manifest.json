@@ -1,0 +1,83 @@
+[
+  {
+    "alt": "Pass rate against completion tokens in log-spaced bins, one line per typical threshold plus the release arm, with a task-count table under the axis and a cap-hit column",
+    "bytes": 117628,
+    "caption": "_Pass rate against how long the completion ran, per typical threshold. Every bin is joined and the y-range comes from the data, so no point falls off the axis and breaks a line. Series carry a small constant downward offset so lines that share a value can be told apart; the offset never changes the values or the counts. Cap hits are off the axis, with their counts in the right-hand column. Scored from the re-scored HumanEval rows._",
+    "engines": [
+      "sweep off",
+      "sweep delta0.09",
+      "sweep delta0.2",
+      "sweep delta0.4",
+      "arm-A-release"
+    ],
+    "file": "acc_vs_length.svg",
+    "key": "acc_vs_length",
+    "label": "HumanEval pass rate by completion length"
+  },
+  {
+    "alt": "Pass rate against completion tokens in log-spaced bins for the typical-off arm, task-count table under the axis and a cap-hit count column at the right",
+    "bytes": 91833,
+    "caption": "_MBPP pass rate against how long the completion ran. Only the typical-off arm was run: the sweep was cut after it, so this figure carries one series. Cap hits are off the axis with their counts in the right-hand column._",
+    "engines": [
+      "sweep off"
+    ],
+    "file": "acc_vs_length_mbpp.svg",
+    "key": "acc_vs_length_mbpp",
+    "label": "MBPP pass rate by completion length"
+  },
+  {
+    "alt": "Grouped bars of the percentage of tasks passed against per-request decode speed in fixed linear tok/s bins, one bar per typical threshold plus the release arm, each labelled with its percentage",
+    "bytes": 156748,
+    "caption": "_Percentage of tasks passed against per-request decode speed, in fixed linear bins, as grouped bars: several thresholds share the same rate, which lines draw on top of each other. Each bar is labelled with its percentage above the bar; the task count per bin is in the table under the axis. The eval ran 4 concurrent requests, so this speed is relative to that concurrency, not the single-stream 16K figure. Cap hits are excluded from the bins, with their counts in the right-hand column. Scored from the re-scored HumanEval rows._",
+    "engines": [
+      "sweep off",
+      "sweep delta0.09",
+      "sweep delta0.2",
+      "sweep delta0.4",
+      "arm-A-release"
+    ],
+    "file": "acc_vs_speed.svg",
+    "key": "acc_vs_speed",
+    "label": "HumanEval tasks passed by per-request decode speed"
+  },
+  {
+    "alt": "Bars of the percentage of MBPP tasks passed against per-request decode speed in fixed linear tok/s bins, typical-off arm only, each labelled with its percentage",
+    "bytes": 129390,
+    "caption": "_MBPP percentage of tasks passed against per-request decode speed, in fixed linear bins. Only the typical-off arm was run. The eval ran 4 concurrent requests, so this speed is relative to that concurrency. Cap hits are excluded from the bins, with their counts in the right-hand column._",
+    "engines": [
+      "sweep off"
+    ],
+    "file": "acc_vs_speed_mbpp.svg",
+    "key": "acc_vs_speed_mbpp",
+    "label": "MBPP tasks passed by per-request decode speed"
+  },
+  {
+    "alt": "Decode tok/s for the twelve interleaved 16K windows in run order plus the typical sweep's own windows past a separator, fastest seed as the point with a min-max band, one colour per arm or threshold",
+    "bytes": 126328,
+    "caption": "_The twelve interleaved 16K windows (A C D E x three rounds) in run order, then the typical sweep's own windows past the dotted separator. Each point is the window's fastest seed; the band is min-max over its three seeds. The dashed line is each arm's fastest window. A drift (first vs last) = +0.17 tok/s (+0.24%)._",
+    "engines": [
+      "arm-A-release",
+      "arm-C-aux475",
+      "arm-D-t478-020",
+      "arm-E-t478-009"
+    ],
+    "file": "decode_16k_windows.svg",
+    "key": "decode_16k_windows",
+    "label": "16K ABAB decode by window"
+  },
+  {
+    "alt": "Decode tok/s against HumanEval pass@1, one labelled point per typical threshold plus the release arm, filled marker strict and hollow marker completed-task pass@1, horizontal band the pooled min-max decode",
+    "bytes": 94388,
+    "caption": "_Decode rate against task quality, one point per operating point. The filled marker is strict pass@1, the hollow marker the completed-task value at the same decode rate; the horizontal band is the pooled min-max over that point's windows, with n in the label. Quality is one seed at the cell's own sampler._",
+    "engines": [
+      "arm-A-release",
+      "sweep-perf-off",
+      "sweep-perf-delta0.09",
+      "sweep-perf-delta0.2",
+      "sweep-perf-delta0.4"
+    ],
+    "file": "tok_s_vs_passk.svg",
+    "key": "tok_s_vs_passk",
+    "label": "decode tok/s against HumanEval pass@1"
+  }
+]
