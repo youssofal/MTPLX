@@ -8,6 +8,7 @@ CRITICAL; `shrink_to_bytes` is the bank-side primitive.
 from __future__ import annotations
 
 import asyncio
+from threading import Lock
 from types import SimpleNamespace
 
 import mtplx.server.openai as srv
@@ -30,8 +31,14 @@ class FakeBank:
 
 def make_state(bank):
     return SimpleNamespace(
+        lock=Lock(),
+        foreground_count=lambda: 0,
+        model_scheduler=SimpleNamespace(run_idle_maintenance=lambda fn: (fn(), True)[1]),
         sessions=SimpleNamespace(bank=bank),
-        dashboard=SimpleNamespace(last_memory_pressure_level=0),
+        dashboard=SimpleNamespace(
+            last_memory_pressure_level=0,
+            in_flight=SimpleNamespace(count=lambda: 0, session_ids=lambda: []),
+        ),
     )
 
 
@@ -143,12 +150,8 @@ class FakeDynamicBank(FakeBank):
 
 
 def test_dynamic_ceiling_enforced_every_tick_even_at_level_normal(monkeypatch):
-    # A long-context prefill grows KV for minutes with no put() running;
-    # the loop must walk the bank down to the ceiling without waiting for
-    # a macOS pressure edge — but with the active session protected: the
-    # ceiling reads the working set instantaneously, and a prefill spike
-    # must never evict the live session's own prefix chain (93k receipt
-    # 2026-08-28: bank walked to 0 mid-request, 54-57 s TTFTs after).
+    # At a safe point, enforce the existing ceiling without waiting for a
+    # macOS pressure edge. Recently active chains retain their protection.
     bank = FakeDynamicBank(total=8 << 30, max_bytes=8 << 30, ceiling=2 << 30)
     state = make_state(bank)
     run_one_tick(state, level=1, monkeypatch=monkeypatch)
@@ -158,17 +161,14 @@ def test_dynamic_ceiling_enforced_every_tick_even_at_level_normal(monkeypatch):
     assert events and events[-1]["action"] == "dynamic_ceiling"
 
 
-def test_dynamic_ceiling_tick_restamps_in_flight_sessions(monkeypatch):
-    # The activity pin is otherwise touched only at restore/put, so a turn
-    # longer than its 600 s TTL would lose protect_active mid-generation
-    # (xhigh turns measured 618-624 s on 2026-08-28). Each tick re-stamps
-    # the live requests' sessions before enforcing the ceiling.
+def test_dynamic_ceiling_tick_restamps_sessions_inside_safe_point(monkeypatch):
+    # No bank mutation, including activity-pin writes, precedes the gate.
     bank = FakeDynamicBank(total=8 << 30, max_bytes=8 << 30, ceiling=2 << 30)
     bank.touched = []
     bank.touch_sessions = lambda ids: bank.touched.extend(ids)
     state = make_state(bank)
     state.dashboard.in_flight = SimpleNamespace(
-        session_ids=lambda: ["ses_live"]
+        count=lambda: 0, session_ids=lambda: ["ses_live"]
     )
     run_one_tick(state, level=1, monkeypatch=monkeypatch)
     assert bank.touched == ["ses_live"]

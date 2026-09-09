@@ -18140,6 +18140,93 @@ async def _retrieval_idle_loop(
             LOGGER.warning("retrieval idle watcher: %s", exc)
 
 
+def _apply_dynamic_bank_ceiling_at_safe_point(state: "ServerState") -> None:
+    """Apply the memory plan's ceiling only between model transactions.
+
+    No second budget policy: effective_max_bytes() still owns the ceiling,
+    including the plan's working-set reserve and operator caps. Sample it
+    outside the model lock, then try that lock and the scheduler idle gate
+    without waiting. The model lock excludes restore/commit/MTP transactions;
+    the scheduler gate also excludes postcommit, persistence and keepalive.
+
+    Unlike the emergency pressure/admission paths, this routine trim may
+    defer through a long prefill. It never clears the allocator cache or
+    changes configured bank/per-session budgets. Inspired by the safe-point
+    proposal in #357 (Philip John Basile).
+    """
+    bank = getattr(getattr(state, "sessions", None), "bank", None)
+    if bank is None or not getattr(bank, "dynamic_ceiling_fn", None):
+        return
+
+    def deferred(reason: str) -> None:
+        _record_guard_event(
+            state, {"action": "dynamic_ceiling_deferred", "reason": reason}
+        )
+
+    try:
+        ceiling = int(bank.effective_max_bytes())
+        if int(bank.total_nbytes) <= ceiling + 256 * 1024**2:
+            return
+    except Exception:
+        deferred("ceiling_sample_failed")
+        return
+
+    model_lock = getattr(state, "lock", None)
+    if model_lock is None:
+        deferred("model_lock_unavailable")
+        return
+    if not model_lock.acquire(blocking=False):
+        deferred("model_lock_busy")
+        return
+    try:
+        scheduler = getattr(state, "model_scheduler", None)
+        run_idle = getattr(scheduler, "run_idle_maintenance", None)
+        if not callable(run_idle):
+            deferred("scheduler_gate_unavailable")
+            return
+
+        def apply() -> None:
+            # Unknown activity is not idle. Recheck after both gates so a
+            # foreground arriving between sampling and acquisition wins.
+            try:
+                foreground = int(state.foreground_count())
+                in_flight = state.dashboard.in_flight
+                requests = int(in_flight.count())
+                session_ids = in_flight.session_ids()
+            except Exception:
+                deferred("activity_probe_failed")
+                return
+            if foreground != 0 or requests != 0:
+                deferred("foreground_busy")
+                return
+            if bank is not getattr(getattr(state, "sessions", None), "bank", None):
+                deferred("bank_changed")
+                return
+            touch = getattr(bank, "touch_sessions", None)
+            if callable(touch):
+                touch(session_ids)
+            evicted = bank.shrink_to_bytes(
+                ceiling, reason="dynamic_ceiling", protect_active=True
+            )
+            if evicted:
+                _record_guard_event(
+                    state,
+                    {
+                        "action": "dynamic_ceiling",
+                        "ceiling_bytes": ceiling,
+                        "bank_entries_evicted": int(evicted),
+                        "bank_bytes_after": int(bank.total_nbytes),
+                    },
+                )
+
+        if not run_idle(apply):
+            deferred("scheduler_busy")
+    except Exception:
+        deferred("safe_point_apply_failed")
+    finally:
+        model_lock.release()
+
+
 async def _memory_pressure_loop(
     state: "ServerState", *, interval_s: float = 10.0
 ) -> None:
@@ -18190,51 +18277,10 @@ async def _memory_pressure_loop(
             state.dashboard.last_memory_pressure_level = level
             state.dashboard.last_memory_pressure_source = level_source
             state.dashboard.last_allocator_fraction = float(allocator_fraction)
-            # Dynamic bank ceiling (memory plan): during a long-context
-            # prefill no put() runs for minutes while KV grows, so the
-            # put-time budget check alone reacts too late. Enforce here
-            # every tick. Deliberately NO mx.clear_cache() while busy —
-            # freed bank buffers return to the allocator pool and get
-            # reused by the growing KV, which is exactly the point.
-            bank = getattr(getattr(state, "sessions", None), "bank", None)
-            if bank is not None and getattr(bank, "dynamic_ceiling_fn", None):
-                try:
-                    # Re-stamp the activity pin for live requests first: the
-                    # pin is otherwise touched only at restore/put, so one
-                    # turn longer than its 600 s TTL would lose
-                    # protect_active mid-generation.
-                    in_flight = getattr(
-                        getattr(state, "dashboard", None), "in_flight", None
-                    )
-                    touch = getattr(bank, "touch_sessions", None)
-                    if in_flight is not None and callable(touch):
-                        touch(in_flight.session_ids())
-                    ceiling = int(bank.effective_max_bytes())
-                    if int(bank.total_nbytes) > ceiling + 256 * 1024**2:
-                        # protect_active: the ceiling reads the working set
-                        # instantaneously, so a deep prefill's transient
-                        # spike must squeeze idle sessions' cache, never the
-                        # in-flight session's own prefix chain (93k receipt
-                        # 2026-08-28: bank walked to 0 mid-request, 54-57 s
-                        # TTFTs after). Real macOS/allocator pressure below
-                        # keeps take-anything semantics.
-                        dyn_evicted = bank.shrink_to_bytes(
-                            ceiling,
-                            reason="dynamic_ceiling",
-                            protect_active=True,
-                        )
-                        if dyn_evicted:
-                            _record_guard_event(
-                                state,
-                                {
-                                    "action": "dynamic_ceiling",
-                                    "ceiling_bytes": ceiling,
-                                    "bank_entries_evicted": int(dyn_evicted),
-                                    "bank_bytes_after": int(bank.total_nbytes),
-                                },
-                            )
-                except Exception:
-                    pass
+            # Routine plan enforcement waits for a proven safe point. The
+            # admission/507 path and emergency pressure shedding below stay
+            # active during long foreground turns; they are not idle work.
+            _apply_dynamic_bank_ceiling_at_safe_point(state)
             busy = False
             if 2 <= level < 4:
                 busy = await asyncio.to_thread(_engine_busy_signal, state)

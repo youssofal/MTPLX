@@ -18,6 +18,8 @@ and a drifted constant should fail loudly, not fuzzily.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from mtplx.memory_plan import (
@@ -389,4 +391,8 @@ def test_describe_plan_names_the_machine_bound() -> None:
 
 def test_detect_total_ram_reports_this_machine() -> None:
     detected = detect_total_ram_bytes()
-    assert detected is not None and detected > 8 * GIB
+    # Hosted macOS runners expose 7 GiB. Compare with the OS total instead
+    # of assuming a minimum machine size unrelated to the probe contract.
+    expected = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    assert detected is not None and detected > 0
+    assert detected == expected

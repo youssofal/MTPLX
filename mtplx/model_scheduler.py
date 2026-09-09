@@ -202,6 +202,9 @@ class ModelWorkScheduler:
         self._shutdown = False
         self._park_on_exit = False
         self._active_kind: str | None = None
+        # Covers the dequeue-to-start gap as well as keepalive work, neither
+        # of which is represented by _active_kind throughout its lifetime.
+        self._owner_work_claimed = False
         self._owner_thread_id: int | None = None
         self._started = 0
         self._completed = 0
@@ -284,7 +287,35 @@ class ModelWorkScheduler:
                 or bool(self._idle)
                 or bool(self._persistence)
                 or self._active_kind is not None
+                or self._owner_work_claimed
             )
+
+    def run_idle_maintenance(self, fn: Callable[[], Any]) -> bool:
+        """Try a short maintenance callback while all owner work is excluded.
+
+        The caller must first acquire the model lock without blocking and
+        recheck request activity inside ``fn``. This gate closes the race
+        between an idle snapshot and a newly admitted postcommit, restore,
+        persistence or keepalive item. It never waits for scheduler work.
+        The callback runs on the caller's thread; it must not execute model
+        work or wait for a scheduler future.
+        """
+        if not self._condition.acquire(blocking=False):
+            return False
+        try:
+            if (
+                self._shutdown
+                or self._owner_work_claimed
+                or self._foreground
+                or self._idle
+                or self._persistence
+                or self._active_kind is not None
+            ):
+                return False
+            fn()
+            return True
+        finally:
+            self._condition.release()
 
     # MARK: idle keepalive
 
@@ -648,11 +679,18 @@ class ModelWorkScheduler:
             if item is None:
                 return
             if item is _KEEPALIVE:
-                self._run_keepalive()
+                try:
+                    self._run_keepalive()
+                finally:
+                    with self._condition:
+                        self._owner_work_claimed = False
+                        self._condition.notify_all()
                 continue
             if not item.future.set_running_or_notify_cancel():
                 with self._condition:
                     self._cancelled_before_start += 1
+                    self._owner_work_claimed = False
+                    self._condition.notify_all()
                 # Same lifetime contract as the completed path below: the
                 # loop is about to park in _take_next, so the canceled
                 # item must not survive in this frame.
@@ -709,6 +747,7 @@ class ModelWorkScheduler:
                         # before the tail postcommit arrives.
                         self._last_quiet_anchor_s = time.monotonic()
                     self._active_kind = None
+                    self._owner_work_claimed = False
                     self._active_sequence = None
                     self._active_batch_key = None
                     self._active_started_at_s = None
@@ -731,11 +770,13 @@ class ModelWorkScheduler:
                 ):
                     return None
                 if self._foreground:
+                    self._owner_work_claimed = True
                     return self._foreground.popleft()
                 now = time.monotonic()
                 wait_until: float | None = None
                 if self._idle:
                     if self._idle[0].earliest_start_s - now <= 0:
+                        self._owner_work_claimed = True
                         return self._idle.popleft()
                     wait_until = self._idle[0].earliest_start_s
                 if self._persistence and (
@@ -767,6 +808,7 @@ class ModelWorkScheduler:
                             # Pump-bridged pop: consume one armed slot.
                             self._persistence_pump_budget -= 1
                             self._persistence_pumped += 1
+                        self._owner_work_claimed = True
                         return self._persistence.popleft()
                     if wait_until is None:
                         wait_until = ready_at
@@ -777,6 +819,7 @@ class ModelWorkScheduler:
                 keepalive_at = self._keepalive_due_locked(now)
                 if keepalive_at is not None:
                     if now >= keepalive_at:
+                        self._owner_work_claimed = True
                         return _KEEPALIVE
                     wait_until = (
                         keepalive_at if wait_until is None else min(wait_until, keepalive_at)

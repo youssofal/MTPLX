@@ -228,7 +228,41 @@ def test_release_mlx_thread_state_swallows_missing_and_raising(monkeypatch):
 # --- idle keepalive (GPU residency) -----------------------------------------
 
 
-def test_idle_keepalive_beats_on_owner_thread_only_while_attentive():
+class _KeepaliveClock:
+    """Advance scheduler time without imposing sub-second host deadlines."""
+
+    def __init__(self, monkeypatch):
+        from mtplx import model_scheduler
+
+        self.now = 100.0
+        # Replace only this module's clock, not time used by Condition waits.
+        monkeypatch.setattr(
+            model_scheduler, "time", SimpleNamespace(monotonic=lambda: self.now)
+        )
+
+    def settle(self, scheduler):
+        with scheduler._condition:
+            assert scheduler._condition.wait_for(
+                lambda: not scheduler._owner_work_claimed, timeout=5
+            )
+
+    def advance(self, scheduler, seconds, *, beats=None, errors=None):
+        with scheduler._condition:
+            self.now += seconds
+            scheduler._condition.notify_all()
+            if beats is not None or errors is not None:
+                assert scheduler._condition.wait_for(
+                    lambda: (
+                        (beats is None or scheduler._keepalive_beats >= beats)
+                        and (errors is None or scheduler._keepalive_errors >= errors)
+                        and not scheduler._owner_work_claimed
+                    ),
+                    timeout=5,
+                )
+
+
+def test_idle_keepalive_beats_on_owner_thread_only_while_attentive(monkeypatch):
+    clock = _KeepaliveClock(monkeypatch)
     scheduler = ModelWorkScheduler(name="test-model-scheduler", idle_grace_s=0.01)
     beat_threads: list[int] = []
     try:
@@ -237,82 +271,87 @@ def test_idle_keepalive_beats_on_owner_thread_only_while_attentive():
             interval_s=0.05,
             attentive_s=0.4,
         )
-        # Arming starts the attentive window: beats begin without any request.
-        time.sleep(0.3)
+        # Arming starts the window; each completed beat gets a fresh interval.
+        for count in range(1, 4):
+            clock.advance(scheduler, 0.06, beats=count)
         state = scheduler.keepalive_state()
         assert state["armed"] and state["attentive"]
-        assert state["beats"] >= 3, state
+        assert state["beats"] == 3, state
         assert set(beat_threads) == {scheduler.owner_thread_id}
-        # The window expires: the owner thread parks and beats stop.
-        time.sleep(0.4)
-        settled = scheduler.keepalive_state()["beats"]
+        clock.advance(scheduler, 0.5)
         assert not scheduler.keepalive_state()["attentive"]
-        time.sleep(0.2)
-        assert scheduler.keepalive_state()["beats"] == settled
+        clock.advance(scheduler, 0.2)
+        assert scheduler.keepalive_state()["beats"] == 3
         # A foreground completion re-opens the window and beats resume.
-        scheduler.submit_foreground(lambda: None).result(timeout=2)
-        time.sleep(0.25)
-        assert scheduler.keepalive_state()["beats"] > settled
+        scheduler.submit_foreground(lambda: None).result(timeout=5)
+        clock.settle(scheduler)
+        clock.advance(scheduler, 0.06, beats=4)
         assert scheduler.keepalive_state()["attentive"]
     finally:
         scheduler.shutdown(wait=True, cancel_futures=True)
 
 
-def test_idle_keepalive_never_runs_while_work_is_queued_and_yields_to_foreground():
+def test_idle_keepalive_never_runs_while_work_is_queued_and_yields_to_foreground(monkeypatch):
+    clock = _KeepaliveClock(monkeypatch)
     scheduler = ModelWorkScheduler(name="test-model-scheduler", idle_grace_s=0.01)
     events: list[str] = []
-    release = Event()
+    release, started = Event(), Event()
 
     def long_foreground() -> None:
         events.append("fg-start")
-        assert release.wait(timeout=2)
+        started.set()
+        assert release.wait(timeout=5)
         events.append("fg-end")
 
     try:
         scheduler.arm_idle_keepalive(
-            lambda: events.append("beat"), interval_s=0.02, attentive_s=10.0
+            lambda: events.append("beat"), interval_s=0.05, attentive_s=10.0
         )
         future = scheduler.submit_foreground(long_foreground)
-        time.sleep(0.15)  # several intervals pass while the item runs
-        assert "fg-start" in events
-        # No beat interleaves with a running item (single owner thread).
-        assert events.count("beat") <= events.index("fg-start")
+        assert started.wait(timeout=5)
+        clock.advance(scheduler, 0.15)
+        assert events == ["fg-start"]
         release.set()
-        future.result(timeout=2)
-        time.sleep(0.1)
-        assert events.index("fg-end") < len(events) - 1, "beats resume after the item"
-        # Everything the keepalive did happened strictly between items.
-        assert events[events.index("fg-start") + 1] == "fg-end"
+        future.result(timeout=5)
+        clock.settle(scheduler)
+        clock.advance(scheduler, 0.06, beats=1)
+        assert events == ["fg-start", "fg-end", "beat"]
     finally:
+        release.set()
         scheduler.shutdown(wait=True, cancel_futures=True)
 
 
-def test_idle_keepalive_disarms_after_repeated_failures_and_reports_them():
+def test_idle_keepalive_disarms_after_repeated_failures_and_reports_them(monkeypatch):
+    clock = _KeepaliveClock(monkeypatch)
     scheduler = ModelWorkScheduler(name="test-model-scheduler", idle_grace_s=0.01)
 
     def boom() -> None:
         raise RuntimeError("no metal device")
 
     try:
-        scheduler.arm_idle_keepalive(boom, interval_s=0.02, attentive_s=10.0)
-        time.sleep(0.3)
+        scheduler.arm_idle_keepalive(boom, interval_s=0.05, attentive_s=10.0)
+        for count in range(1, 4):
+            clock.advance(scheduler, 0.06, errors=count)
         state = scheduler.keepalive_state()
         assert state["errors"] == 3
         assert state["armed"] is False
         assert "no metal device" in (state["last_error"] or "")
-        # The owner thread is still healthy for real work.
-        assert scheduler.submit_foreground(lambda: 7).result(timeout=2) == 7
+        assert scheduler.submit_foreground(lambda: 7).result(timeout=5) == 7
     finally:
         scheduler.shutdown(wait=True, cancel_futures=True)
 
 
-def test_idle_keepalive_warm_flag_tracks_recent_owner_activity():
+def test_idle_keepalive_warm_flag_tracks_recent_owner_activity(monkeypatch):
+    clock = _KeepaliveClock(monkeypatch)
     scheduler = ModelWorkScheduler(name="test-model-scheduler", idle_grace_s=0.01)
     try:
-        assert scheduler.keepalive_state()["warm"] is False  # not armed
+        assert scheduler.keepalive_state()["warm"] is False
         scheduler.arm_idle_keepalive(lambda: None, interval_s=0.05, attentive_s=10.0)
-        time.sleep(0.2)
+        clock.advance(scheduler, 0.06, beats=1)
         assert scheduler.keepalive_state()["warm"] is True
+        # Once attention expires, no beat refreshes the residency signal.
+        clock.advance(scheduler, 11.0)
+        assert scheduler.keepalive_state()["warm"] is False
         scheduler.disarm_idle_keepalive()
         assert scheduler.keepalive_state()["armed"] is False
         assert "idle_keepalive" in scheduler.stats()
