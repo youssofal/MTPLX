@@ -62,3 +62,15 @@ export function relativeTime(timestampS: number | null | undefined): string {
   if (diff < 86400) return `${Math.round(diff / 3600)}h ago`;
   return `${Math.round(diff / 86400)}d ago`;
 }
+
+// `_metrics_envelope` emits `accepted_by_depth` and `drafted_by_depth` but not
+// the flat `accepted_drafts` / `drafted_tokens` totals, so the surfaces that
+// show a total derive it from the per-depth arrays. A total emitted by the
+// envelope still wins, so this keeps working if the server starts sending one.
+export function depthTotal(
+  emitted: number | null | undefined,
+  byDepth: number[] | null | undefined,
+): number {
+  if (emitted !== null && emitted !== undefined) return emitted;
+  return (byDepth ?? []).reduce((sum, n) => sum + n, 0);
+}

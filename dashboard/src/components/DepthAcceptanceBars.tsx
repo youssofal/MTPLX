@@ -10,13 +10,16 @@ import {
 } from "recharts";
 import { Card } from "./Card";
 import { useDashboardStore } from "../state/store";
-import { fmtNumber } from "../lib/utils";
+import { depthTotal, fmtNumber } from "../lib/utils";
 
 export function DepthAcceptanceBars() {
   const latest = useDashboardStore((s) => s.latest);
   const accepted = latest?.accepted_by_depth ?? [];
   const drafted = latest?.drafted_by_depth ?? [];
   const meanProb = latest?.mean_accept_probability_by_depth ?? [];
+
+  const acceptedTotal = depthTotal(latest?.accepted_drafts, accepted);
+  const draftedTotal = depthTotal(latest?.drafted_tokens, drafted);
 
   const maxLen = Math.max(accepted.length, drafted.length, meanProb.length);
   const rows = Array.from({ length: maxLen }, (_, i) => {
@@ -36,7 +39,7 @@ export function DepthAcceptanceBars() {
       title="Per-depth acceptance"
       subtitle={
         rows.length > 0
-          ? `${fmtNumber(latest?.verify_calls)} verify calls · ${fmtNumber(latest?.accepted_drafts)} accepted of ${fmtNumber(latest?.drafted_tokens)} drafted`
+          ? `${fmtNumber(latest?.verify_calls)} verify calls · ${fmtNumber(acceptedTotal)} accepted of ${fmtNumber(draftedTotal)} drafted`
           : "no completed generation yet"
       }
     >
