@@ -101,7 +101,7 @@ def test_m4_stage3_installer_keeps_both_down_projections_stock() -> None:
     from mtplx import qwen4_m4_stage3
 
     forward_source = inspect.getsource(qwen4_m4_stage3._m4_forward)
-    install_source = inspect.getsource(qwen4_m4_stage3.install_qwen4_m4_stage3)
+    install_source = inspect.getsource(qwen4_m4_stage3._install_qwen4_m4_stage3_impl)
     assert "routed.down_proj(" in forward_source
     assert "shared.down_proj(" in forward_source
     assert "bind()" in install_source
@@ -340,7 +340,7 @@ def test_m4_residual_route_uses_paired_gu_producer_without_hot_fallback() -> Non
     assert "try:" not in forward_source
     assert "except" not in forward_source
 
-    install_source = inspect.getsource(qwen4_m4_stage3.install_qwen4_m4_stage3)
+    install_source = inspect.getsource(qwen4_m4_stage3._install_qwen4_m4_stage3_impl)
     plan_source = inspect.getsource(qwen4_m4_stage3._build_install_plans)
     mutation_source = inspect.getsource(qwen4_m4_stage3._install_validated_plans)
     assert "_validate_residual_tail_contract" in plan_source

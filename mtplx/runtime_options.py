@@ -58,7 +58,14 @@ def env_bool(
 #: with it on the rewritten sites are value-identical by construction (see
 #: tests/test_qwen4_opdiet.py, which proves each rewrite against its original
 #: on random inputs).
-_QWEN4_OPDIET = env_bool("MTPLX_QWEN4_OPDIET", default=False)
+#: ``None`` = resolve from the environment on each read; a test may force a
+#: bool. Read at USE, not frozen at import: the server's fixed-M4 auto-arm
+#: stamps MTPLX_QWEN4_OPDIET into the environment AFTER this module is imported
+#: (via the generation import), so an import-time read froze the default and
+#: the served compiled verifier ran without the op diet (arming audit
+#: 2026-09-07). The env is frozen once serving starts, so two traces of the
+#: same graph still read the same value.
+_QWEN4_OPDIET = None
 
 #: The independently selectable rewrites behind the master switch.
 #:
@@ -105,25 +112,74 @@ def parse_opdiet_items(
     return frozenset(tokens)
 
 
-_QWEN4_OPDIET_SELECTED = parse_opdiet_items(
-    os.environ.get("MTPLX_QWEN4_OPDIET_ITEMS")
-)
+#: ``None`` = resolve from the environment on each read; a test may force a
+#: frozenset. Read at use, not frozen at import (same server-arming reason).
+_QWEN4_OPDIET_SELECTED = None
+
+#: First-use latch: the op-diet items actually applied at a gated site in the
+#: compiled fixed-M4 verify graph. The graph has no other per-window observable,
+#: so /health surfaces this so the battery can confirm which rewrites ran
+#: instead of trusting the env. Read-only reporting.
+_QWEN4_OPDIET_APPLIED: set[str] = set()
 
 
 def qwen4_opdiet_enabled(item: str | None = None) -> bool:
     """True when the op diet is armed, and this item is selected.
 
     ``item=None`` answers only the master switch. Every gated call site names
-    its item so ``MTPLX_QWEN4_OPDIET_ITEMS`` can isolate one rewrite.
+    its item so ``MTPLX_QWEN4_OPDIET_ITEMS`` can isolate one rewrite. Read at
+    use, not frozen at import; a test may set :data:`_QWEN4_OPDIET` /
+    :data:`_QWEN4_OPDIET_SELECTED` to force the answer.
     """
 
-    if not _QWEN4_OPDIET:
+    master = (
+        _QWEN4_OPDIET
+        if _QWEN4_OPDIET is not None
+        else env_bool("MTPLX_QWEN4_OPDIET", default=False)
+    )
+    if not master:
         return False
     if item is None:
         return True
     if item not in QWEN4_OPDIET_ITEMS:
         raise ValueError(f"unknown op-diet item {item!r}")
-    return item in _QWEN4_OPDIET_SELECTED
+    selected = (
+        _QWEN4_OPDIET_SELECTED
+        if _QWEN4_OPDIET_SELECTED is not None
+        else parse_opdiet_items(os.environ.get("MTPLX_QWEN4_OPDIET_ITEMS"))
+    )
+    applied = item in selected
+    if applied:
+        _QWEN4_OPDIET_APPLIED.add(item)
+    return applied
+
+
+def qwen4_opdiet_report() -> dict:
+    """Install/first-use verdict for ``/health qwen4_install_reports.opdiet``.
+
+    ``armed`` is read at use (reflects the served auto-arm stamp, gate-able
+    without a request); ``items`` is the configured selection; ``applied`` is
+    the first-use latch of items that actually ran at a gated site.
+    """
+
+    if not qwen4_opdiet_enabled():
+        return {"armed": False, "items": [], "applied": sorted(_QWEN4_OPDIET_APPLIED)}
+    selected = (
+        _QWEN4_OPDIET_SELECTED
+        if _QWEN4_OPDIET_SELECTED is not None
+        else parse_opdiet_items(os.environ.get("MTPLX_QWEN4_OPDIET_ITEMS"))
+    )
+    return {
+        "armed": True,
+        "items": sorted(selected),
+        "applied": sorted(_QWEN4_OPDIET_APPLIED),
+    }
+
+
+def reset_qwen4_opdiet_applied_for_test() -> None:
+    """Clear the applied-items latch (tests only)."""
+
+    _QWEN4_OPDIET_APPLIED.clear()
 
 
 #: W70 -- fused glue inside the compiled fixed-M4 verify body.
@@ -156,7 +212,13 @@ def qwen4_opdiet_enabled(item: str | None = None) -> bool:
 #: ``kernels/qwen4_m4_hyper_read`` already measured at 13.2 tok/s against 67.8.
 QWEN4_VERIFY_GLUE_ITEMS = ("qsa_rope", "qsa_rope_idx")
 
-_QWEN4_VERIFY_GLUE = env_bool("MTPLX_QWEN4_VERIFY_GLUE", default=False)
+#: ``None`` = resolve from the environment on each read; a test may force a
+#: bool (directly or via :func:`reset_qwen4_verify_glue_cache`). Read at USE,
+#: not frozen at import: the server's fixed-M4 auto-arm stamps
+#: MTPLX_QWEN4_VERIFY_GLUE into the environment AFTER this module is imported,
+#: so an import-time read froze the default and the served verify body ran
+#: without the fused glue (arming audit 2026-09-07).
+_QWEN4_VERIFY_GLUE = None
 
 
 def parse_verify_glue_items(
@@ -188,29 +250,46 @@ def parse_verify_glue_items(
     return frozenset(tokens)
 
 
-_QWEN4_VERIFY_GLUE_SELECTED = parse_verify_glue_items(
-    os.environ.get("MTPLX_QWEN4_VERIFY_GLUE_ITEMS")
-)
+#: ``None`` = resolve from the environment on each read; a test may force a
+#: frozenset. Read at use, not frozen at import (same server-arming reason).
+_QWEN4_VERIFY_GLUE_SELECTED = None
 
 
 def qwen4_verify_glue_enabled(item: str | None = None) -> bool:
-    """True when the verify-glue flag is armed, and this item is selected."""
+    """True when the verify-glue flag is armed, and this item is selected.
 
-    if not _QWEN4_VERIFY_GLUE:
+    Read at use, not frozen at import; a test may set :data:`_QWEN4_VERIFY_GLUE`
+    / :data:`_QWEN4_VERIFY_GLUE_SELECTED` (directly or via
+    :func:`reset_qwen4_verify_glue_cache`) to force the answer.
+    """
+
+    master = (
+        _QWEN4_VERIFY_GLUE
+        if _QWEN4_VERIFY_GLUE is not None
+        else env_bool("MTPLX_QWEN4_VERIFY_GLUE", default=False)
+    )
+    if not master:
         return False
     if item is None:
         return True
     if item not in QWEN4_VERIFY_GLUE_ITEMS:
         raise ValueError(f"unknown verify-glue item {item!r}")
-    return item in _QWEN4_VERIFY_GLUE_SELECTED
+    selected = (
+        _QWEN4_VERIFY_GLUE_SELECTED
+        if _QWEN4_VERIFY_GLUE_SELECTED is not None
+        else parse_verify_glue_items(
+            os.environ.get("MTPLX_QWEN4_VERIFY_GLUE_ITEMS")
+        )
+    )
+    return item in selected
 
 
 def reset_qwen4_verify_glue_cache(env: Mapping[str, str] | None = None) -> None:
-    """Re-read the verify-glue gates from the environment.  Tests only.
+    """Force the verify-glue gates from a given environment.  Tests only.
 
-    The hot path reads these once at import on purpose; this exists so a test
-    can arm one item without a subprocess, and it is never called by the
-    runtime.
+    The runtime reads these at use and never calls this; it exists so a test
+    can arm one item without a subprocess by FORCING the module globals (which
+    then win over the environment until reset again).
     """
 
     global _QWEN4_VERIFY_GLUE, _QWEN4_VERIFY_GLUE_SELECTED
@@ -220,6 +299,213 @@ def reset_qwen4_verify_glue_cache(env: Mapping[str, str] | None = None) -> None:
     )
     _QWEN4_VERIFY_GLUE_SELECTED = parse_verify_glue_items(
         source.get("MTPLX_QWEN4_VERIFY_GLUE_ITEMS")
+    )
+
+
+#: Verify-width fused hyper-connection read (mtplx/kernels/qwen4_m4_hyper_read).
+#:
+#: Read at USE, never frozen at import. ``MTPLX_QWEN4_HC_M4`` is the key; the
+#: old ``MTPLX_FABLE_HC_M4`` name is honoured as an alias only when the new key
+#: is unset (the new key wins for any non-empty value, including ``0`` for the
+#: per-key opt-out). The kernel RAISES on a family-contract miss rather than
+#: falling back, so an armed-but-inert lane is unreachable.
+#:
+#: ``None`` = resolve from the environment on each read; a test may force a
+#: bool. This must NOT freeze at import: the server's fixed-M4 auto-arm stamps
+#: ``MTPLX_QWEN4_HC_M4`` into the environment AFTER this module is imported, so
+#: an import-time read froze the default (False) and the served lane never
+#: armed -- the second arming failure the battery caught 2026-09-07 (the first
+#: was the sibling QSA sparse-decode reader). The install check runs after the
+#: overrides are applied, so reading the environment there sees the stamp.
+_QWEN4_HC_M4 = None
+
+
+def _resolve_qwen4_hc_m4() -> bool:
+    raw = os.environ.get("MTPLX_QWEN4_HC_M4")
+    if raw is None or not str(raw).strip():
+        return env_bool("MTPLX_FABLE_HC_M4", default=False)
+    return env_bool("MTPLX_QWEN4_HC_M4", default=False)
+
+
+def qwen4_hc_m4_enabled() -> bool:
+    """True when the HC_M4 flag is armed for this process.
+
+    Armed by ``MTPLX_QWEN4_HC_M4`` (or the old ``MTPLX_FABLE_HC_M4`` alias).
+    Read at use, not frozen at import; a test may set :data:`_QWEN4_HC_M4` to
+    a bool to force the answer.
+    """
+
+    if _QWEN4_HC_M4 is not None:
+        return bool(_QWEN4_HC_M4)
+    return _resolve_qwen4_hc_m4()
+
+
+
+#: Split-K (KV-split) native sparse-GQA attention for the DECODE geometries
+#: (native_extensions/qsa_sparse_gqa, mtplx/kernels/qsa_sparse_decode.py).
+#:
+#: ``MTPLX_QSA_SPARSE_DECODE`` serves the M=4 fixed verify, all 12 QSA
+#: layers, once per verify cycle.  This is where the bytes are: the shipped
+#: lane materialises a [1, 2, 4, 2052, 256] gathered K/V pair per layer
+#: (16.8 MB written, then re-read by the score and P@V GEMMs), plus MLX's own
+#: 8.4 MB contiguous copy of the transposed key view.  The kernel reads the
+#: cache rows once and never writes them.
+#:
+#: Off by default.  It RAISES on a contract failure rather than silently
+#: reverting -- a silently inert flag is how MTPLX_FUSED_HC_V3 came to be
+#: armed-but-dead at M=4.  The one thing that does NOT raise is a PARITY
+#: failure at install: this kernel is rounding-class, so a parity miss is a
+#: numerical verdict, and the lane disables itself for the process and
+#: reports the measured deltas.
+def _resolve_qsa_sparse_decode() -> bool:
+    # New key wins for any non-empty value (including "0" for the per-key
+    # opt-out); the old MTPLX_FABLE_QSA_SPARSE_DECODE name is honoured as an
+    # alias only when the new key is unset.
+    raw = os.environ.get("MTPLX_QSA_SPARSE_DECODE")
+    if raw is None or not str(raw).strip():
+        return env_bool("MTPLX_FABLE_QSA_SPARSE_DECODE", default=False)
+    return env_bool("MTPLX_QSA_SPARSE_DECODE", default=False)
+
+
+#: ``None`` = resolve from the environment on every read; a test may force a
+#: bool (the fixtures set this directly to arm/disarm the lane).
+#:
+#: The flag is read at USE, never frozen at import. The server's fixed-M4
+#: auto-arm stamps ``MTPLX_QSA_SPARSE_DECODE`` into the environment AFTER this
+#: module is imported (``openai.py:_server_runtime_env_overrides``, gated on
+#: the built native extension). An import-time read (or a first-use read that
+#: happened to fire before the stamp) froze the default (False) before the
+#: stamp landed, so the served lane never engaged even with the extension
+#: built -- the bug the battery caught 2026-09-07. Reading the environment on
+#: each call means the graphbank cache install (after the overrides are
+#: applied) always sees the resolved value; the read is a dict lookup and the
+#: env is frozen once serving starts.
+_QSA_SPARSE_DECODE = None
+
+
+def qsa_sparse_decode_enabled() -> bool:
+    """True when the QSA split-K decode flag is armed for this process.
+
+    Armed by ``MTPLX_QSA_SPARSE_DECODE`` (or the old
+    ``MTPLX_FABLE_QSA_SPARSE_DECODE`` alias). Read at use, not frozen at
+    import -- see the note on :data:`_QSA_SPARSE_DECODE`. A test may set that
+    global to a bool to force the answer.
+    """
+
+    if _QSA_SPARSE_DECODE is not None:
+        return bool(_QSA_SPARSE_DECODE)
+    return _resolve_qsa_sparse_decode()
+
+
+def _parse_sparse_decode_tile(raw: str | None) -> tuple[int, int]:
+    """``"BK:DC"`` -> the compiled tile pair; unset means the default."""
+
+    if raw is None or not str(raw).strip():
+        return (128, 32)
+    token = str(raw).strip()
+    parts = token.split(":")
+    if len(parts) != 2:
+        raise ValueError(
+            f"MTPLX_QSA_SPARSE_DECODE_TILE={raw!r} must be 'BK:DC'"
+        )
+    try:
+        tile = (int(parts[0]), int(parts[1]))
+    except ValueError as exc:
+        raise ValueError(
+            f"MTPLX_QSA_SPARSE_DECODE_TILE={raw!r} must be 'BK:DC'"
+        ) from exc
+    if tile not in QSA_SPARSE_DECODE_TILES:
+        accepted = ", ".join(f"{a}:{b}" for a, b in QSA_SPARSE_DECODE_TILES)
+        raise ValueError(
+            f"MTPLX_QSA_SPARSE_DECODE_TILE={raw!r} is not instantiated; "
+            f"expected one of: {accepted}"
+        )
+    return tile
+
+
+#: The (BK, DC) pairs the metallib instantiates.  Anything else raises rather
+#: than falling back, so a typo in a sweep cannot quietly measure the default.
+QSA_SPARSE_DECODE_TILES = ((128, 32), (256, 32), (64, 64), (128, 64))
+QSA_SPARSE_DECODE_MAX_SPLITS = 64
+
+#: ``None`` = resolve from the environment on each read; a test may force a
+#: (key_tile, dim_tile) tuple. Read at use, not frozen at import (same
+#: server-arming ordering as the master flag above).
+_QSA_SPARSE_DECODE_TILE = None
+
+
+#: MEASURED default (2026-09-02, guarded micro, M=4, 16K, 12 layers).  The
+#: kernel is occupancy-bound, and at the shipped tile (BK=128) there are 17
+#: BK-tiles over the 2,051 selected keys, so 17 is the smallest split target
+#: that reaches one tile per threadgroup -- a 4 x 2 x 17 = 136-threadgroup
+#: grid on a 40-core M5 Max.  Everything below it leaves cores idle:
+#:
+#:     splits   n_splits   threadgroups   ms/layer   x baseline
+#:          4          4             32      0.325         0.70
+#:          8          6             48      0.210         1.08
+#:         16          9             72      0.149         1.52
+#:         17         17            136      0.094-0.099   2.3-2.4
+#:
+#: Larger values clamp to the same 17 at BK=128, so 17 is also the point past
+#: which the knob stops doing anything -- which is why the first sweep's s17
+#: and s32 rows are the SAME configuration measured twice, and their 5.3%
+#: spread is the bench's noise floor rather than a result.
+#:
+#: The previous default of 8 was a placeholder, and it measured 2.2x slower.
+QSA_SPARSE_DECODE_DEFAULT_SPLITS = 17
+
+
+def _parse_sparse_decode_splits(raw: str | None) -> int:
+    """``MTPLX_QSA_SPARSE_DECODE_SPLITS`` -- the KV-split target."""
+
+    if raw is None or not str(raw).strip():
+        return QSA_SPARSE_DECODE_DEFAULT_SPLITS
+    try:
+        value = int(str(raw).strip())
+    except ValueError as exc:
+        raise ValueError(
+            f"MTPLX_QSA_SPARSE_DECODE_SPLITS={raw!r} must be an integer"
+        ) from exc
+    if not 1 <= value <= QSA_SPARSE_DECODE_MAX_SPLITS:
+        raise ValueError(
+            f"MTPLX_QSA_SPARSE_DECODE_SPLITS={raw!r} must be in "
+            f"[1, {QSA_SPARSE_DECODE_MAX_SPLITS}]"
+        )
+    return value
+
+
+#: ``None`` = resolve from the environment on each read; a test may force an
+#: int. Read at use, not frozen at import.
+_QSA_SPARSE_DECODE_SPLITS = None
+
+
+def qsa_sparse_decode_tile() -> tuple[int, int]:
+    """The armed ``(key_tile, dimension_tile)`` for the decode kernel.
+
+    Read at use, not frozen at import; a test may set
+    :data:`_QSA_SPARSE_DECODE_TILE` to force the answer.
+    """
+
+    if _QSA_SPARSE_DECODE_TILE is not None:
+        return _QSA_SPARSE_DECODE_TILE
+    return _parse_sparse_decode_tile(
+        os.environ.get("MTPLX_QSA_SPARSE_DECODE_TILE")
+        or os.environ.get("MTPLX_FABLE_QSA_SPARSE_DECODE_TILE")
+    )
+
+
+def qsa_sparse_decode_splits() -> int:
+    """The armed KV-split target for the decode kernel.
+
+    Read at use, not frozen at import; a test may set
+    :data:`_QSA_SPARSE_DECODE_SPLITS` to force the answer.
+    """
+
+    if _QSA_SPARSE_DECODE_SPLITS is not None:
+        return _QSA_SPARSE_DECODE_SPLITS
+    return _parse_sparse_decode_splits(
+        os.environ.get("MTPLX_QSA_SPARSE_DECODE_SPLITS")
+        or os.environ.get("MTPLX_FABLE_QSA_SPARSE_DECODE_SPLITS")
     )
 
 

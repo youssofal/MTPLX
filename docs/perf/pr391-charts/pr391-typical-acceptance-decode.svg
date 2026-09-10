@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="780" height="460" viewBox="0 0 780 460" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<rect x="0" y="0" width="780" height="460" fill="#ffffff"/>
+<text x="390" y="24" text-anchor="middle" font-size="16" font-weight="600" fill="#111827">Qwen3.8 Flash-Next typical acceptance: decode tok/s by threshold (16,384 / 1,024, 3-seed mean)</text>
+<line x1="70" y1="380" x2="720" y2="380" stroke="#9ca3af" stroke-width="1"/>
+<line x1="70" y1="323.33" x2="720" y2="323.33" stroke="#e5e7eb" stroke-width="1"/>
+<text x="62" y="327.33" text-anchor="end" font-size="11" fill="#6b7280">20</text>
+<line x1="70" y1="266.67" x2="720" y2="266.67" stroke="#e5e7eb" stroke-width="1"/>
+<text x="62" y="270.67" text-anchor="end" font-size="11" fill="#6b7280">40</text>
+<line x1="70" y1="210" x2="720" y2="210" stroke="#e5e7eb" stroke-width="1"/>
+<text x="62" y="214" text-anchor="end" font-size="11" fill="#6b7280">60</text>
+<line x1="70" y1="153.33" x2="720" y2="153.33" stroke="#e5e7eb" stroke-width="1"/>
+<text x="62" y="157.33" text-anchor="end" font-size="11" fill="#6b7280">80</text>
+<line x1="70" y1="96.67" x2="720" y2="96.67" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="6 4"/>
+<text x="724" y="100.67" text-anchor="start" font-size="11" fill="#b45309">100 tok/s target</text>
+<line x1="70" y1="40" x2="720" y2="40" stroke="#e5e7eb" stroke-width="1"/>
+<text x="62" y="44" text-anchor="end" font-size="11" fill="#6b7280">120</text>
+<text x="62" y="384" text-anchor="end" font-size="11" fill="#6b7280">0</text>
+<line x1="70" y1="40" x2="70" y2="380" stroke="#9ca3af" stroke-width="1"/>
+<text x="18" y="210" text-anchor="middle" font-size="12" fill="#374151" transform="rotate(-90 18 210)">decode tok/s</text>
+<rect x="118.33" y="148.32" width="120" height="231.68" fill="#9ca3af"/>
+<text x="178.33" y="140" text-anchor="middle" font-size="14" font-weight="600" fill="#111827">81.78</text>
+<rect x="335" y="74.14" width="120" height="305.86" fill="#059669"/>
+<text x="395" y="66" text-anchor="middle" font-size="14" font-weight="600" fill="#111827">107.95</text>
+<text x="395" y="52" text-anchor="middle" font-size="11" fill="#059669">+32.0%</text>
+<rect x="551.67" y="102.36" width="120" height="277.64" fill="#2563eb"/>
+<text x="611.67" y="94" text-anchor="middle" font-size="14" font-weight="600" fill="#111827">97.99</text>
+<text x="611.67" y="80" text-anchor="middle" font-size="11" fill="#2563eb">+19.8%</text>
+<text x="178.33" y="398" text-anchor="middle" font-size="12" fill="#374151">typical off</text>
+<text x="178.33" y="414" text-anchor="middle" font-size="11" fill="#6b7280">threshold 0</text>
+<text x="178.33" y="429" text-anchor="middle" font-size="11" fill="#6b7280">2.54 tok/cycle</text>
+<text x="395" y="398" text-anchor="middle" font-size="12" fill="#374151">typical, threshold 0.09</text>
+<text x="395" y="414" text-anchor="middle" font-size="11" fill="#6b7280">3.73 tok/cycle</text>
+<text x="395" y="429" text-anchor="middle" font-size="11" fill="#6b7280">accept 0.86</text>
+<text x="611.67" y="398" text-anchor="middle" font-size="12" fill="#374151">typical, threshold 0.20</text>
+<text x="611.67" y="414" text-anchor="middle" font-size="11" fill="#6b7280">3.31 tok/cycle</text>
+<text x="611.67" y="429" text-anchor="middle" font-size="11" fill="#6b7280">accept 0.80</text>
+<text x="70" y="452" font-size="10.5" fill="#6b7280">Higher threshold = stricter (fewer typical positions). Both typical arms hold HumanEval-sampling within +/-1 task of typical off (153/164); greedy and MBPP byte-identical. NOT distribution-exact.</text>
+</svg>

@@ -79,12 +79,17 @@ def _kernel_primitives(*outputs: mx.array) -> list[str]:
 # --------------------------------------------------------------------------
 
 
-def test_opdiet_defaults_off_and_is_read_once_at_import(monkeypatch):
+def test_opdiet_defaults_off_and_is_read_at_use(monkeypatch):
+    # Read at USE, not frozen at import: the served fixed-M4 auto-arm stamps
+    # MTPLX_QWEN4_OPDIET AFTER this module is imported, so a frozen import-time
+    # read left the compiled verifier without the op diet (arming audit). The
+    # env is frozen once serving starts, so two traces of one graph still agree.
+    monkeypatch.setattr(runtime_options, "_QWEN4_OPDIET", None)
+    monkeypatch.setattr(runtime_options, "_QWEN4_OPDIET_SELECTED", None)
+    monkeypatch.delenv("MTPLX_QWEN4_OPDIET", raising=False)
     assert runtime_options.qwen4_opdiet_enabled() is False
-    # A late env change must NOT flip the hot path: the value was frozen at
-    # import so two traces of one graph can never disagree.
     monkeypatch.setenv("MTPLX_QWEN4_OPDIET", "1")
-    assert runtime_options.qwen4_opdiet_enabled() is False
+    assert runtime_options.qwen4_opdiet_enabled() is True
 
 
 def test_every_gated_module_reads_the_same_flag():

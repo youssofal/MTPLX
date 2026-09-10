@@ -1021,6 +1021,98 @@ def load(
             qwen4_verify_report = install_qwen4_fixed_verify_route(runtime)
             runtime.qwen4_fixed_verify_report = qwen4_verify_report
             logger.info("[qwen4-fixed-M4-verify] %s", qwen4_verify_report)
+            # ---- stacked auxiliary lane: cached async PLE (PR #475) ---------
+            # Wraps the fixed-M4 compiled-verify aux builder installed just
+            # above so the auxiliary PLE plane is produced outside the compiled
+            # verifier via mx.async_eval. Exact by construction (the stock
+            # owner-side row cache is preserved). Needs the native
+            # ple_cpu_rows extension; declines with a printed reason and serves
+            # stock when it is not built. Any other failure (a contract miss)
+            # escapes and fails the load, keeping the exactness contract
+            # unhealthy-on-failure.
+            from .qwen4_aux_lanes import (
+                ple_cached_aux_enabled,
+                qsa_pooled_rowsel_enabled,
+            )
+
+            if ple_cached_aux_enabled():
+                from .native import (
+                    load_ple_cpu_rows_extension,
+                    ple_cpu_rows_unavailable_reason,
+                )
+
+                decline = ple_cpu_rows_unavailable_reason()
+                if decline is not None:
+                    ple_cached_aux_report = {
+                        "lane": "ple_cached_aux",
+                        "status": "declined",
+                        "reason": decline,
+                    }
+                else:
+                    from .ple_cached_aux import (
+                        PENDING_LIMIT,
+                        install_fixed_m4_cached_aux_builder,
+                    )
+
+                    native_module = load_ple_cpu_rows_extension()
+                    installation = install_fixed_m4_cached_aux_builder(
+                        runtime, native_module=native_module
+                    )
+                    runtime._ple_cached_aux_installation = installation
+                    ple_cached_aux_report = {
+                        "lane": "ple_cached_aux",
+                        "status": "installed",
+                        "variant": "async_aux",
+                        "pending_limit": PENDING_LIMIT,
+                        "native_ext": getattr(native_module, "__file__", None),
+                    }
+                runtime.ple_cached_aux_report = ple_cached_aux_report
+                logger.info("[qwen4-ple-cached-aux] %s", ple_cached_aux_report)
+                # A stderr install line (print, not logger.info, which the serve
+                # log drops at the default level) so a benchmark window can tell
+                # an engaged lane from a decline-to-stock, matching the
+                # qsa_sparse_decode convention.
+                if ple_cached_aux_report["status"] == "declined":
+                    print(
+                        "[mtplx] ple_cached_aux declined to stock: "
+                        f"{ple_cached_aux_report['reason']}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[mtplx] ple_cached_aux armed: "
+                        f"{ple_cached_aux_report['variant']} "
+                        f"pending_limit={ple_cached_aux_report['pending_limit']} "
+                        f"native_ext={ple_cached_aux_report['native_ext']}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            # ---- stacked auxiliary lane: fixed-M4 pooled-key rowsel ---------
+            # Rebinds the twelve QSA indexers' pooled-key preparation to the
+            # construction-bound rowsel method, sharing one inv_freq object.
+            # Exact by construction; contract failures escape (unhealthy).
+            if qsa_pooled_rowsel_enabled():
+                from .qsa_pooled_rowsel import install_fixed_m4_pool
+
+                pool_report = install_fixed_m4_pool(runtime)
+                qsa_pooled_rowsel_report = {
+                    "lane": "qsa_pooled_rowsel",
+                    "status": "installed",
+                    **pool_report,
+                }
+                runtime.qsa_pooled_rowsel_report = qsa_pooled_rowsel_report
+                logger.info(
+                    "[qwen4-qsa-pooled-rowsel] %s", qsa_pooled_rowsel_report
+                )
+                print(
+                    "[mtplx] qsa_pooled_rowsel armed: "
+                    f"bank_mode={pool_report['bank_mode']} "
+                    f"indexers={pool_report['kernel_binding_count']} "
+                    f"shared_inv_freq_objects={pool_report['shared_inv_freq_object_count']}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         from .qwen4_m4_stage3 import (
             install_qwen4_m4_stage3,
             qwen4_m4_stage3_flags,
@@ -1040,6 +1132,17 @@ def load(
                 routed_glu_enabled=routed_glu_enabled,
             )
             logger.info("[qwen4-M4-stage3] %s", qwen4_m4_stage3_report)
+        # MTPLX_QWEN4_HC_M4's PACK contract, checked here because the weights
+        # exist by now. Everything it validates is process-invariant, so a
+        # miss is a deployment error: it must stop the server coming up with a
+        # precise reason rather than turn the first request that reaches verify
+        # width into an HTTP 500. No-op (armed=False) when the flag is off.
+        from .models.qwen4_exp import install_hc_m4_pack_validation
+
+        hc_m4_report = install_hc_m4_pack_validation(runtime.model)
+        runtime.qwen4_hc_m4_report = hc_m4_report
+        if hc_m4_report.get("armed"):
+            logger.info("[qwen4-hc-m4] %s", hc_m4_report)
     if whole_moe_plan is not None:
         if compiled_target_factory is None:
             from .a3b_whole_moe import A3BWholeMoeConfigError

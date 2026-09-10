@@ -19,6 +19,9 @@ import mlx.core as mx
 
 from .attention_context import attention_phase
 from .gdn_capture import resolve_gdn_capture_backend
+# Module-level so a test (and the twin-construction guard) can see one name;
+# read at each call so the process-frozen flag is honoured and monkeypatchable.
+from .runtime_options import qsa_sparse_decode_enabled
 
 
 def _prepare_fixed_m4_materialized(
@@ -626,6 +629,7 @@ class TensorOffsetQSACache:
         rows_gather_enabled: bool = False,
         rows_gather_min_context: int = 0,
         fused_rows_gather_kv_m4: bool = False,
+        qsa_sparse_decode: bool = False,
     ) -> None:
         self.kv = kv
         self.raw_keys = raw_keys
@@ -637,6 +641,62 @@ class TensorOffsetQSACache:
         self.rows_gather_enabled = bool(rows_gather_enabled)
         self.rows_gather_min_context = max(0, int(rows_gather_min_context))
         self.fused_rows_gather_kv_m4 = bool(fused_rows_gather_kv_m4)
+        # MTPLX_QSA_SPARSE_DECODE: the native split-K sparse-GQA attention
+        # lane. Validated ONCE, here, at cache install: this is model-build
+        # time and outside any mx.compile trace, which is what lets the
+        # install run a real parity probe. The indexer reads the row count
+        # below and never re-derives the decision, so one trace of the verify
+        # graph cannot disagree with the next about which attention it holds.
+        #
+        # The gate is asymmetric on purpose. install() RAISES when the
+        # contract cannot be met (an armed flag that cannot apply is a
+        # configuration error, including a missing native extension) and
+        # DISABLES when the numerical probe fails (this kernel is
+        # rounding-class; a parity miss is a measurement, and turning a
+        # measurement into an outage helps nobody). The server auto-arm only
+        # STAMPS the default when the extension is built, so a wheel without
+        # it serves the stock decode path; an explicit operator export of
+        # MTPLX_QSA_SPARSE_DECODE=1 still reaches this fail-closed install.
+        self.qsa_sparse_decode = bool(qsa_sparse_decode)
+        self.qsa_sparse_decode_rows = 0
+        # An armed flag that reaches a cache constructed WITHOUT it is the
+        # armed-but-inert failure mode, and it is silent: the cache carries
+        # qsa_sparse_decode_rows = 0 and every routing decision declines.
+        # Every construction site that can be reached with the flag armed
+        # passes it through (from_qsa_cache reads the frozen flag), so a site
+        # that forgot is a bug in THIS file and dies here.
+        if qsa_sparse_decode_enabled() and not self.qsa_sparse_decode:
+            raise RuntimeError(
+                "MTPLX_QSA_SPARSE_DECODE is armed but this QSA cache was "
+                "constructed without the lane; the construction site did not "
+                "pass qsa_sparse_decode through, so the kernel would be inert "
+                "on this cache"
+            )
+        if self.qsa_sparse_decode:
+            from .kernels import qsa_sparse_decode as _qsa_sparse
+
+            if not _qsa_sparse.install(
+                self.kv.keys,
+                self.kv.values,
+                compress_ratio=self.ratio,
+                verify=True,
+            ):
+                # install() recorded the measured deltas before returning
+                # False; this turns them into a build failure instead of a
+                # silent revert to the stock chain: an armed arm that runs the
+                # stock chain is worse than an outage because it looks like a
+                # result.
+                raise RuntimeError(
+                    "MTPLX_QSA_SPARSE_DECODE is armed but the split-K lane "
+                    "declined to install: "
+                    + (
+                        _qsa_sparse.disabled_reason()
+                        or "the lane returned no verdict"
+                    )
+                    + " -- read the deltas off the [mtplx] qsa_sparse_decode "
+                    "stderr line, then unarm the flag deliberately"
+                )
+            self.qsa_sparse_decode_rows = _qsa_sparse.VERIFY_ROWS
 
     @staticmethod
     def _fixed_bank(value: mx.array, capacity: int, axis: int) -> mx.array:
@@ -684,6 +744,10 @@ class TensorOffsetQSACache:
         rows_gather_enabled = _qsa_gather_enabled()
         rows_gather_min_context = _qsa_gather_min_context()
         rows_gather = rows_gather_enabled and offset >= rows_gather_min_context
+        # MTPLX_QSA_SPARSE_DECODE: read the process-frozen flag here so the
+        # cache validates the native split-K lane once, at install; the
+        # indexer never re-derives it. Passed to __init__ below.
+        qsa_sparse_decode = qsa_sparse_decode_enabled()
         rows_gather_kv_m4 = entry.rows_gather_kv_m4
         fused_rows_gather_kv_m4 = _env_enabled("MTPLX_QSA_M4_FUSED_KV_GATHER")
         if fused_rows_gather_kv_m4:
@@ -725,6 +789,7 @@ class TensorOffsetQSACache:
             rows_gather_enabled=rows_gather_enabled,
             rows_gather_min_context=rows_gather_min_context,
             fused_rows_gather_kv_m4=fused_rows_gather_kv_m4,
+            qsa_sparse_decode=qsa_sparse_decode,
         )
 
     @property
@@ -3173,6 +3238,9 @@ class CompiledVerifyBank:
                     rows_gather_enabled=entry.rows_gather_enabled,
                     rows_gather_min_context=entry.rows_gather_min_context,
                     fused_rows_gather_kv_m4=entry.fused_rows_gather_kv_m4,
+                    # A twin that dropped this would silently revert to the
+                    # stock QSA chain -- the armed-but-inert failure mode.
+                    qsa_sparse_decode=entry.qsa_sparse_decode,
                 )
             elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
                 if isinstance(entry, TensorOffsetKVCache):
@@ -3331,6 +3399,16 @@ class CompiledVerifyBank:
                         entry.cache[slot] = state_in[pos + slot]
                 pos += n_leaves
             # (2) The existing runtime forward, on shadow containers only.
+            #
+            # Sample the sparse-decode lane's route counters ACROSS the
+            # forward. The routing decision is host-side and happens in THIS
+            # python body, so a trace that ends with neither a route hit nor a
+            # short-context decline is an armed flag that is not in the graph
+            # -- and the graph is what the next few hundred cycles replay.
+            # Raising here costs one trace; the alternative was a whole window.
+            from .kernels import qsa_sparse_decode as _qsa_sparse_lane
+
+            sparse_route_before = _qsa_sparse_lane.route_snapshot()
             with attention_phase("decode_verify"):
                 result = live._runtime_forward(
                     input_ids,
@@ -3339,6 +3417,13 @@ class CompiledVerifyBank:
                     hidden_variant=hidden_variant,
                     compiled_aux=compiled_aux,
                 )
+            # Trace-time engagement check on the graph this body just built,
+            # fatal because the graph is what the next few hundred cycles
+            # replay: an armed sparse-decode flag that never routed is an inert
+            # arm. A no-op when the lane is unarmed (route_snapshot stays 0).
+            _qsa_sparse_lane.assert_traced(
+                length, before=sparse_route_before, where="compiled verify"
+            )
             logits, hidden, captures = result
             # (3) Read every leaf back out and return it explicitly.
             captures_flat: list[Any] = []
@@ -3711,6 +3796,9 @@ class CompiledVerifyBank:
                     rows_gather_enabled=entry.rows_gather_enabled,
                     rows_gather_min_context=entry.rows_gather_min_context,
                     fused_rows_gather_kv_m4=entry.fused_rows_gather_kv_m4,
+                    # A twin that dropped this would silently revert to the
+                    # stock QSA chain -- the armed-but-inert failure mode.
+                    qsa_sparse_decode=entry.qsa_sparse_decode,
                 )
             elif kind == VERIFY_SPEC_KIND_FULL_ATTN:
                 if isinstance(entry, TensorOffsetKVCache):

@@ -1013,10 +1013,14 @@ def test_claim_declines_without_top_k(armed):
 # ---------------------------------------------------------------------------
 
 
-def test_gate_is_off_by_default_in_generation():
+def test_gate_is_off_by_default_in_generation(monkeypatch):
     from mtplx import generation
+    from mtplx import qwen4_draft_k20_prescatter as prescatter
 
-    assert generation._QWEN4_DRAFT_K20_PRESCATTER is False
+    # Read at USE (not frozen at import): unforced global + unset env => off.
+    monkeypatch.setattr(prescatter, "_ENABLED", None)
+    monkeypatch.delenv("MTPLX_QWEN4_DRAFT_K20_PRESCATTER", raising=False)
+    assert generation._qwen4_draft_k20_prescatter_enabled() is False
     assert "draft_k20_prescatter" in generation.GenerationStats.__dataclass_fields__
 
 

@@ -22,10 +22,15 @@ THREADS = 64
 OUTPUTS_PER_SIMD = 4
 OUTPUTS_PER_THREADGROUP = 8
 
-_KERNEL: Any | None = None
+#: One compiled kernel per affine group size (32 for Optimized-Speed, 64 for
+#: Bare-Speed). GROUP_SIZE is the only constexpr that changes: the 4-bit
+#: packing is group-size-independent (WEIGHT_BYTES_PER_ROW = HIDDEN / 2) and
+#: every scale/bias stride derives from GROUP_SIZE.
+_KERNEL: dict[int, Any] = {}
 
 
-_HEADER = f"""
+def _header(group_size: int = 32) -> str:
+    return f"""
     #include <metal_simdgroup>
     #include <metal_stdlib>
     using namespace metal;
@@ -35,7 +40,7 @@ _HEADER = f"""
     constant constexpr uint HIDDEN = {HIDDEN};
     constant constexpr uint INTERMEDIATE = {INTERMEDIATE};
     constant constexpr uint FUSED_OUTPUTS = 2 * INTERMEDIATE;
-    constant constexpr uint GROUP_SIZE = 32;
+    constant constexpr uint GROUP_SIZE = {group_size};
     constant constexpr uint VALUES_PER_THREAD = 16;
     constant constexpr uint BLOCK_SIZE = VALUES_PER_THREAD * 32;
     constant constexpr uint OUTPUTS_PER_SIMD = 4;
@@ -166,10 +171,10 @@ _SOURCE = """
 """
 
 
-def source() -> str:
-    """Return the exact paired q4 QMV and BF16 GLU source."""
+def source(group_size: int = 32) -> str:
+    """Return the exact paired q4 QMV and BF16 GLU source for a group size."""
 
-    return _HEADER + _SOURCE
+    return _header(group_size) + _SOURCE
 
 
 def launch_geometry() -> tuple[tuple[int, int, int], tuple[int, int, int]]:
@@ -181,13 +186,18 @@ def launch_geometry() -> tuple[tuple[int, int, int], tuple[int, int, int]]:
     )
 
 
-def bind() -> Callable[..., mx.array]:
-    """Bind the construction-validated paired routed-GU producer."""
+def bind(group_size: int = 32) -> Callable[..., mx.array]:
+    """Bind the construction-validated paired routed-GU producer.
 
-    global _KERNEL
-    if _KERNEL is None:
-        _KERNEL = mx.fast.metal_kernel(
-            name="mtplx_qwen4_m4_paired_routed_glu",
+    ``group_size`` selects the affine group the pack quantized the routed
+    experts to (32 for Optimized-Speed, 64 for Bare-Speed); one kernel is
+    compiled and cached per group size.
+    """
+
+    kernel = _KERNEL.get(group_size)
+    if kernel is None:
+        kernel = mx.fast.metal_kernel(
+            name=f"mtplx_qwen4_m4_paired_routed_glu_gs{group_size}",
             input_names=[
                 "value",
                 "weights",
@@ -196,11 +206,11 @@ def bind() -> Callable[..., mx.array]:
                 "expert_ids",
             ],
             output_names=["routed_h"],
-            header=_HEADER,
+            header=_header(group_size),
             source=_SOURCE,
             ensure_row_contiguous=True,
         )
-    kernel = _KERNEL
+        _KERNEL[group_size] = kernel
     grid, threadgroup = launch_geometry()
 
     def routed_glu(value, weights, scales, biases, expert_ids):

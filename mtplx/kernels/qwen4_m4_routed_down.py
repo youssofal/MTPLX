@@ -14,12 +14,17 @@ HIDDEN = 2560
 THREADS = 64
 OUTPUTS_PER_THREADGROUP = 8
 
-_ROUTED_KERNEL: Any | None = None
+#: One routed-reduce kernel per affine group size (32 Optimized-Speed, 64
+#: Bare-Speed); GROUP_SIZE is the only constexpr that changes. The shared-add
+#: tail kernels below operate on already-computed activations and carry no
+#: group size, so they are compiled once.
+_ROUTED_KERNEL: dict[int, Any] = {}
 _TAIL_KERNEL: Any | None = None
 _RESIDUAL_TAIL_KERNEL: Any | None = None
 
 
-_HEADER = f"""
+def _header(group_size: int = 32) -> str:
+    return f"""
     #include <metal_simdgroup>
     #include <metal_stdlib>
     using namespace metal;
@@ -28,7 +33,7 @@ _HEADER = f"""
     constant constexpr uint TOP_K = {TOP_K};
     constant constexpr uint K = {K};
     constant constexpr uint HIDDEN = {HIDDEN};
-    constant constexpr uint GROUP_SIZE = 32;
+    constant constexpr uint GROUP_SIZE = {group_size};
     constant constexpr uint VALUES_PER_THREAD = 8;
     constant constexpr uint BLOCK_SIZE = VALUES_PER_THREAD * 32;
     constant constexpr uint OUTPUTS_PER_SIMD = 4;
@@ -259,10 +264,10 @@ _RESIDUAL_TAIL_SOURCE = f"""
 """
 
 
-def source() -> str:
+def source(group_size: int = 32) -> str:
     """Return the exact fixed-shape q4 QMV plus routed-reduction source."""
 
-    return _HEADER + _ROUTED_SOURCE
+    return _header(group_size) + _ROUTED_SOURCE
 
 
 def tail_source() -> str:
@@ -284,13 +289,13 @@ def launch_geometry() -> tuple[tuple[int, int, int], tuple[int, int, int]]:
     )
 
 
-def bind() -> Callable[..., mx.array]:
-    """Bind the routed-only reduction and separate shared-add tail."""
+def _routed_reduce_kernel(group_size: int) -> Any:
+    """Compile-and-cache the routed-down reduce kernel for a group size."""
 
-    global _ROUTED_KERNEL, _TAIL_KERNEL
-    if _ROUTED_KERNEL is None:
-        _ROUTED_KERNEL = mx.fast.metal_kernel(
-            name="mtplx_qwen4_m4_routed_down_reduce",
+    kernel = _ROUTED_KERNEL.get(group_size)
+    if kernel is None:
+        kernel = mx.fast.metal_kernel(
+            name=f"mtplx_qwen4_m4_routed_down_reduce_gs{group_size}",
             input_names=[
                 "routed_h",
                 "weights",
@@ -300,10 +305,23 @@ def bind() -> Callable[..., mx.array]:
                 "route_scores",
             ],
             output_names=["routed_down"],
-            header=_HEADER,
+            header=_header(group_size),
             source=_ROUTED_SOURCE,
             ensure_row_contiguous=True,
         )
+        _ROUTED_KERNEL[group_size] = kernel
+    return kernel
+
+
+def bind(group_size: int = 32) -> Callable[..., mx.array]:
+    """Bind the routed-only reduction and separate shared-add tail.
+
+    ``group_size`` selects the affine group the pack quantized the routed
+    down projection to (32 Optimized-Speed, 64 Bare-Speed).
+    """
+
+    global _TAIL_KERNEL
+    routed_kernel = _routed_reduce_kernel(group_size)
     if _TAIL_KERNEL is None:
         _TAIL_KERNEL = mx.fast.metal_kernel(
             name="mtplx_qwen4_m4_routed_shared_tail",
@@ -316,7 +334,6 @@ def bind() -> Callable[..., mx.array]:
             source=_TAIL_SOURCE,
             ensure_row_contiguous=True,
         )
-    routed_kernel = _ROUTED_KERNEL
     tail_kernel = _TAIL_KERNEL
     grid, threadgroup = launch_geometry()
 
@@ -356,26 +373,15 @@ def bind() -> Callable[..., mx.array]:
     return routed_down_reduce
 
 
-def bind_residual_tail() -> Callable[..., mx.array]:
-    """Bind routed reduction plus the combined shared and residual tail."""
+def bind_residual_tail(group_size: int = 32) -> Callable[..., mx.array]:
+    """Bind routed reduction plus the combined shared and residual tail.
 
-    global _ROUTED_KERNEL, _RESIDUAL_TAIL_KERNEL
-    if _ROUTED_KERNEL is None:
-        _ROUTED_KERNEL = mx.fast.metal_kernel(
-            name="mtplx_qwen4_m4_routed_down_reduce",
-            input_names=[
-                "routed_h",
-                "weights",
-                "scales",
-                "biases",
-                "expert_ids",
-                "route_scores",
-            ],
-            output_names=["routed_down"],
-            header=_HEADER,
-            source=_ROUTED_SOURCE,
-            ensure_row_contiguous=True,
-        )
+    ``group_size`` selects the routed down projection's affine group (32
+    Optimized-Speed, 64 Bare-Speed).
+    """
+
+    global _RESIDUAL_TAIL_KERNEL
+    routed_kernel = _routed_reduce_kernel(group_size)
     if _RESIDUAL_TAIL_KERNEL is None:
         _RESIDUAL_TAIL_KERNEL = mx.fast.metal_kernel(
             name="mtplx_qwen4_m4_routed_shared_residual_tail",
@@ -390,7 +396,6 @@ def bind_residual_tail() -> Callable[..., mx.array]:
             source=_RESIDUAL_TAIL_SOURCE,
             ensure_row_contiguous=True,
         )
-    routed_kernel = _ROUTED_KERNEL
     residual_tail_kernel = _RESIDUAL_TAIL_KERNEL
     grid, threadgroup = launch_geometry()
 

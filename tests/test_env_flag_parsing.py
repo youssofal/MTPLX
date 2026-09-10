@@ -412,37 +412,40 @@ def test_flash_next_speed_lane_is_default_on_and_pack_gated(
     assert overrides["MTPLX_NGRAM_PREWARM"] == "auto"
     assert normalize_runtime_env_overrides(overrides) == overrides
 
-    # Bare-Speed shape (lm_head Q4/g64 over a flat Q4/g64 MoE): the two
-    # load-time gates that would refuse the pack stay off, the rest stays on.
+    # Bare-Speed shape (lm_head Q4/g64 over a flat Q4/g64 MoE): FR-Spec and the
+    # M=4 stage-3 optimization now arm here too -- the pruning and the combine
+    # read the modules' own bits/group_size. Only the Q8-shared-gate route head
+    # stays off (deferred; Bare runs the stock routing head).
     bare = _flash_next_fixed_m4_config()
     bare["quantization"] = _flash_next_quantization(lm_head_bits=4, stage3=False)
     write(bare)
     overrides = _server_runtime_env_overrides(args, {})
     assert overrides["MTPLX_QWEN4_FIXED_M4_VERIFY"] == "1"
     assert overrides["MTPLX_QSA_M4_FUSED_KV_GATHER"] == "1"
-    assert "MTPLX_QWEN4_M4_STAGE3" not in overrides
-    assert "MTPLX_FRSPEC_DRAFT" not in overrides
-    assert "MTPLX_FRSPEC_VOCAB" not in overrides
-    # No stage 3: none of its children; no FR-Spec head: no pre-scatter read.
-    # The glue rides the fixed-M4 verifier, which this shape still runs.
+    assert overrides["MTPLX_QWEN4_M4_STAGE3"] == "1"
+    assert overrides["MTPLX_FRSPEC_DRAFT"] == "1"
+    assert overrides["MTPLX_FRSPEC_VOCAB"] == "builtin:qwen38-code-64k"
+    assert overrides["MTPLX_QWEN4_DRAFT_K20_PRESCATTER"] == "1"
+    # Stage 3's routed children arm with it; the Q8-only route head does not.
     for key in (
         "MTPLX_QWEN4_M4_ROUTED_DOWN_REDUCE",
         "MTPLX_QWEN4_M4_ROUTED_DOWN_RESIDUAL_TAIL",
         "MTPLX_QWEN4_M4_ROUTED_GLU",
-        "MTPLX_QWEN4_ROUTE_KERNEL",
-        "MTPLX_QWEN4_DRAFT_K20_PRESCATTER",
     ):
-        assert key not in overrides, key
+        assert overrides.get(key) == "1", key
+    assert "MTPLX_QWEN4_ROUTE_KERNEL" not in overrides
     assert overrides["MTPLX_QWEN4_VERIFY_GLUE"] == "1"
     assert overrides["MTPLX_QWEN4_BLOCK_VERIFY"] == "1"
-    # A pack with no per-module entries resolves every module to the
-    # pack-wide values, which can never satisfy the stage-3 contract.
+    assert normalize_runtime_env_overrides(overrides) == overrides
+    # A pack with no per-module entries resolves every module to the pack-wide
+    # values: the Q4/g64 lm_head is still FR-Spec-capable, but the pack-wide
+    # Q4 router can never satisfy the stage-3 contract (router must be Q8/g64).
     flat = _flash_next_fixed_m4_config()
     flat["quantization"] = {"bits": 4, "group_size": 64, "mode": "affine"}
     write(flat)
     overrides = _server_runtime_env_overrides(args, {})
     assert "MTPLX_QWEN4_M4_STAGE3" not in overrides
-    assert "MTPLX_FRSPEC_DRAFT" not in overrides
+    assert overrides["MTPLX_FRSPEC_DRAFT"] == "1"
     write(optimized)
 
     # An explicit =0 export wins for every lane key and drops its companions.

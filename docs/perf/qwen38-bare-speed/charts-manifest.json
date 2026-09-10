@@ -1,0 +1,58 @@
+{
+  "generated_by": "battery475/scripts/render_bare_16k.py + render_bare_ladder.py + render_comparison.py",
+  "generator": "server_cell_charts (min-max variance bands, fastest-of-seeds)",
+  "parent": "perf/qwen38-bare-speed-main @ 548e568c (docs commit adds these)",
+  "charts": [
+    {
+      "file": "bare_16k_bars.svg",
+      "bytes": 49794,
+      "sha256": "0c50060b4159b9e595ba7b43337c9ac3bbf9e90854919777ebef2781f2a9441a"
+    },
+    {
+      "file": "bare_decode_16k_windows.svg",
+      "bytes": 67200,
+      "sha256": "4d0d562bd00644932f392d231b83ee7a984de186dd068097d8a3cf3483c535be"
+    },
+    {
+      "file": "decode_tok_s.svg",
+      "bytes": 89634,
+      "sha256": "01c6d8b060f3499ccd4947c279441ce425af91cee4f7df9a007aee64eada7fb4"
+    },
+    {
+      "file": "peak_memory_gb.svg",
+      "bytes": 88678,
+      "sha256": "c29048ac89cccccd0629b14140356f273dd71bf70b30a2ec7f6abaf9a8864c6b"
+    },
+    {
+      "file": "prefill_tok_s.svg",
+      "bytes": 88073,
+      "sha256": "0344f33821fc7c6e6fcfab6870ef451d15ea53ba9753874c1729ee76df45fc46"
+    },
+    {
+      "file": "summary.svg",
+      "bytes": 175277,
+      "sha256": "d6e1dc8223945ee02b7ecb2b28401d3809864b981647c8bb66a431d77466c9af"
+    },
+    {
+      "file": "ttft_s.svg",
+      "bytes": 94575,
+      "sha256": "8cd8448266ff5a04bd08656f58fc2752591eff2cd4a73f709a22cad9bbb309a3"
+    },
+    {
+      "file": "bare_vs_475_478_16k.svg",
+      "label": "Bare-Speed against #475 and #478 at 16K",
+      "alt": "Grouped bars of decode tok/s at 16,384 tokens, the Optimized-Speed pack beside the Bare-Speed pack, one colour family each",
+      "caption": "_Decode tok/s at 16,384 tokens. The two colour families are the two model packs: blues are Optimized-Speed (release 2.11.2 acceptance mode off 71.97, #475 (base) acceptance mode off 82.84, #478 typical 0.2 99.16) and the warm bars are Bare-Speed (release acceptance mode off 67.80, #475 (base) acceptance mode off 78.39, #478 on Bare-Speed typical 0.2 84.70, this PR acceptance mode off 79.84, this PR typical 0.2 89.25, cascade OPT alpha 0.5 121.48, cascade TokenV3 alpha 0.95 103.98). Every #478 and #488 comparison bar is at typical 0.2, the comparison threshold used across this set of pull requests; the typical-0.09 figures stay in the four-arm A/B/C/D tables. Bar height is the fastest seed and the whisker is the min-max band. HumanEval strict pass@1 is annotated on the two arms measured on this pack, both with acceptance mode off._",
+      "bytes": 205443,
+      "sha256": "099da674846b4beb8d7f31b45a2b10c2919d016bad33b11f97c392687c5b1d40"
+    },
+    {
+      "file": "bare_vs_475_478_ladder.svg",
+      "label": "Bare-Speed against #475 and #478 by context",
+      "alt": "Decode tok/s against context size from 1,024 to 261,120 tokens for #475 and #478 on both packs and this pull request on Bare-Speed",
+      "caption": "_Decode tok/s against context size for #475 (base) and #478 on the Optimized-Speed pack (acceptance mode off and typical 0.2), #475 (base) and #478 on the Bare-Speed pack (acceptance mode off and typical 0.2), and this pull request on Bare-Speed at typical acceptance 0.2. Every #478 and #488 line is at typical 0.2, the comparison threshold used across this set of pull requests. Each point is the fastest seed and the band is the min-max range. At 261,120 the three Bare-Speed arms carry a point and the two Optimized-Speed arms do not: they exceed the memory knob on the #475 base without #482._",
+      "bytes": 171105,
+      "sha256": "984160b41043f8f6a28d1c33ced32473f39bbbbdb58a8178e7db6339521a0d32"
+    }
+  ]
+}

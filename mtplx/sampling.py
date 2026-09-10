@@ -288,6 +288,66 @@ def residual_distribution(target_p: Distribution, draft_q: Distribution) -> Dist
     return residual / total
 
 
+def distribution_entropy(distribution: Distribution) -> float:
+    """Shannon entropy (nats) of ``distribution`` over its positive support.
+
+    For a top-p / top-k truncated, renormalized target row -- exactly what
+    ``distribution_from_logits`` and ``BatchedSparseDistributions.to_distribution``
+    produce -- this is the entropy of the *truncated support*, which is the
+    quantity Medusa-2 typical acceptance sizes its per-position threshold from
+    (Cai et al. 2024, arXiv:2401.10774, Eq. "typical acceptance"). A one-hot /
+    empty row has entropy 0.
+    """
+    if isinstance(distribution, SparseDistribution):
+        probs = np.asarray(distribution.probs, dtype=np.float64)
+    else:
+        probs = np.asarray(distribution, dtype=np.float64)
+    probs = probs[np.isfinite(probs) & (probs > 0.0)]
+    if probs.size == 0:
+        return 0.0
+    probs = probs / probs.sum()
+    return float(-np.sum(probs * np.log(probs)))
+
+
+def typical_acceptance_threshold(entropy_value: float, eps: float, delta: float) -> float:
+    """Medusa-2 typical-acceptance floor ``min(eps, delta * exp(-H))``.
+
+    ``eps`` is the hard probability floor; ``delta * exp(-H)`` is the
+    entropy-scaled floor that drops as the target row gets more uncertain (a
+    token needs less mass to be "typical" when the target itself is unsure).
+    A draft token is accepted when its target probability exceeds this value.
+    """
+    return float(min(float(eps), float(delta) * float(np.exp(-float(entropy_value)))))
+
+
+def typical_accept_decision(
+    target_p: Distribution,
+    token_id: int,
+    *,
+    eps: float,
+    delta: float,
+    entropy_value: float | None = None,
+) -> tuple[bool, float, float]:
+    """Medusa-2 typical acceptance for one position.
+
+    Returns ``(accepted, threshold, entropy)``. The token is accepted iff the
+    target assigns it more mass than the entropy-scaled floor:
+
+        p_target(token) > min(eps, delta * exp(-H(target_p)))
+
+    The decision is DETERMINISTIC -- it consumes no uniform, unlike the exact
+    Leviathan-Chen ``min(1, p/q)`` coin. This is *not* a distribution-exact
+    sampler: the caller resamples the first non-typical position from
+    ``target_p`` itself (not the residual ``(p-q)+``), and the emitted stream is
+    gated on task quality, not on matching the target law. Pass ``entropy_value``
+    to reuse a precomputed entropy for the row.
+    """
+    entropy = distribution_entropy(target_p) if entropy_value is None else float(entropy_value)
+    threshold = typical_acceptance_threshold(entropy, eps, delta)
+    p = _probability(target_p, int(token_id))
+    return (p > threshold, threshold, entropy)
+
+
 def sample_from_distribution(probs: Distribution, rng: np.random.Generator | None = None) -> int:
     rng = rng or np.random.default_rng()
     if isinstance(probs, SparseDistribution):

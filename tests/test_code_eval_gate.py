@@ -61,6 +61,9 @@ def _args(**overrides) -> argparse.Namespace:
         "top_p": None,
         "max_tokens": 512,
         "seed": 42,
+        # build_payload reads args.extra_body (the --extra-body passthrough); the
+        # real parser always sets it, so the minimal namespace must too.
+        "extra_body": {},
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -545,3 +548,61 @@ def test_sampling_n_at_temperature_zero_is_rejected(tmp_path) -> None:
         gate.main(
             _cli(dataset, tmp_path / "r.json", "--allow-code-execution", "--n", "3")
         )
+
+
+# --------------------------------------------------------------------------
+# --save-completions sidecar (enables the offline HumanEval+ rescore)
+# --------------------------------------------------------------------------
+
+
+def test_save_completions_sidecar_persists_task_id_and_solution(tmp_path, monkeypatch) -> None:
+    dataset = _humaneval_dataset(tmp_path)
+    output = tmp_path / "report.json"
+    sidecar = tmp_path / "samples.jsonl"
+
+    monkeypatch.setattr(gate, "_post_json", lambda *a, **k: _chat_response(_GOOD))
+    monkeypatch.setattr(gate.time, "sleep", lambda _s: None)
+
+    code = gate.main(
+        _cli(dataset, output, "--allow-code-execution", "--save-completions", str(sidecar))
+    )
+    assert code == 0
+    assert sidecar.exists()
+    rows = [json.loads(line) for line in sidecar.read_text().splitlines() if line.strip()]
+    assert len(rows) == 3
+    assert {r["task_id"] for r in rows} == {"HumanEval/0", "HumanEval/1", "HumanEval/2"}
+    for r in rows:
+        assert r["completion"] == _GOOD          # the raw model text is preserved
+        assert "return a + b" in r["solution"]   # and the extracted, runnable code
+        assert r["sample"] == 0
+
+
+def test_save_completions_is_opt_in_and_leaves_the_report_unchanged(tmp_path, monkeypatch) -> None:
+    dataset = _humaneval_dataset(tmp_path)
+    monkeypatch.setattr(gate, "_post_json", lambda *a, **k: _chat_response(_GOOD))
+    monkeypatch.setattr(gate.time, "sleep", lambda _s: None)
+
+    out_plain = tmp_path / "plain.json"
+    assert gate.main(_cli(dataset, out_plain, "--allow-code-execution")) == 0
+    # No --save-completions -> no sidecar is written.
+    assert not (tmp_path / "samples.jsonl").exists()
+
+    out_side = tmp_path / "withside.json"
+    sidecar = tmp_path / "samples.jsonl"
+    assert gate.main(
+        _cli(dataset, out_side, "--allow-code-execution", "--save-completions", str(sidecar))
+    ) == 0
+    assert sidecar.exists()
+
+    a = json.loads(out_plain.read_text())
+    b = json.loads(out_side.read_text())
+    # The report is identical run-for-run once wall-clock fields are dropped:
+    # the sidecar is a side output, not a change to the scored report.
+    for rep in (a, b):
+        rep["provenance"].pop("timestamp_utc", None)
+        rep["provenance"].pop("wall_s", None)
+        for row in rep["rows"]:
+            row.pop("seconds", None)
+            row.pop("request_seconds", None)
+    assert a["summary"] == b["summary"]
+    assert a["rows"] == b["rows"]

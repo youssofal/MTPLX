@@ -83,9 +83,38 @@ def test_frspec_install_binds_full_shape_head_once(monkeypatch, tmp_path) -> Non
     assert bool(mx.all(reduced[..., [0, 2, 3, 4, 5, 7]] < -1e20).item())
 
 
-def test_frspec_rejects_non_q8_native_head(monkeypatch, tmp_path) -> None:
+def test_frspec_accepts_q4_g64_native_head(monkeypatch, tmp_path) -> None:
+    # Bare-Speed ships an affine Q4/g64 native MTP head. The pruning carries
+    # the head's own bits/group_size, so it installs exactly like the Q8/g64
+    # Optimized-Speed head.
     linear = nn.Linear(64, 8, bias=False)
+    linear.weight = mx.arange(8 * 64, dtype=mx.float32).reshape(8, 64) / 100
     native = nn.QuantizedLinear.from_linear(linear, group_size=64, bits=4)
+    mx.eval(native.parameters())
+    vocab = tmp_path / "draft-vocab.json"
+    vocab.write_text(json.dumps({"ids": [1, 6]}))
+    monkeypatch.setenv("MTPLX_FRSPEC_VOCAB", str(vocab))
+    monkeypatch.delenv("MTPLX_FRSPEC_N", raising=False)
+    monkeypatch.delenv("MTPLX_FRSPEC_LEGACY", raising=False)
+
+    report = install_frspec_draft_head(
+        SimpleNamespace(_mtplx_native_mtp_draft_head=lambda: native)
+    )
+
+    assert report["installed"] is True
+    assert report["bits"] == 4
+    assert report["group_size"] == 64
+    assert report["mode"] == "affine"
+    assert report["source"] == "native_mtp_head"
+    assert report["n"] == 2
+    assert report["vocab_rows"] == 8
+
+
+def test_frspec_rejects_wrong_group_size_native_head(monkeypatch, tmp_path) -> None:
+    # Only affine g64 (Q8 or Q4) is prunable; a g32 head is still refused so a
+    # mismatched pack fails the model LOAD rather than serving a mispruned head.
+    linear = nn.Linear(64, 8, bias=False)
+    native = nn.QuantizedLinear.from_linear(linear, group_size=32, bits=4)
     vocab = tmp_path / "draft-vocab.json"
     vocab.write_text(json.dumps({"ids": [1, 6]}))
     monkeypatch.setenv("MTPLX_FRSPEC_VOCAB", str(vocab))
@@ -98,7 +127,7 @@ def test_frspec_rejects_non_q8_native_head(monkeypatch, tmp_path) -> None:
         "installed": False,
         "reason": "native_head_contract",
         "bits": 4,
-        "group_size": 64,
+        "group_size": 32,
         "mode": "affine",
     }
 

@@ -310,7 +310,7 @@ def test_routed_residual_binding_uses_exactly_two_dispatches(monkeypatch) -> Non
 
         return run
 
-    monkeypatch.setattr(kernel_module, "_ROUTED_KERNEL", None)
+    monkeypatch.setattr(kernel_module, "_ROUTED_KERNEL", {})
     monkeypatch.setattr(kernel_module, "_RESIDUAL_TAIL_KERNEL", None, raising=False)
     monkeypatch.setattr(kernel_module.mx.fast, "metal_kernel", fake_metal_kernel)
     combined = kernel_module.bind_residual_tail()

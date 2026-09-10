@@ -100,9 +100,11 @@ from .sampling import (
     SamplerConfig,
     SparseDistribution,
     acceptance_probability as compute_acceptance_probability,
+    distribution_entropy,
     distribution_from_logits as dense_distribution_from_logits,
     residual_distribution,
     sample_from_distribution,
+    typical_accept_decision,
 )
 from .session_bank import _boundary_true_restore_enabled
 from .runtime_options import (
@@ -308,11 +310,13 @@ def _env_falsey(name: str) -> bool:
     }
 
 
-# MTPLX_QWEN4_DRAFT_K20_PRESCATTER -- read ONCE at import (in
-# ``mtplx.qwen4_draft_k20_prescatter``), default OFF.  When off this constant
-# is False, no plan is claimed, `_draft_k20_prescatter_plan` stays None, and
-# the one draft-read site below is behind `is not None`, so the retained stock
-# lane runs the code it ran before this module existed.
+# MTPLX_QWEN4_DRAFT_K20_PRESCATTER -- read AT USE via
+# ``_qwen4_draft_k20_prescatter_enabled()`` (see mtplx.qwen4_draft_k20_prescatter),
+# default OFF, NOT frozen at import. The server's fixed-M4 auto-arm stamps this
+# key AFTER this module is imported, so a module-level constant read here froze
+# the default and the served lane never engaged (arming audit 2026-09-07). When
+# off the claim below (behind `is not None`) is never built, so the retained
+# stock lane runs the code it ran before this module existed.
 #
 # When on (and the request is eligible -- the claim RAISES rather than falling
 # back) each draft step builds its K20 support from the FR-Spec head's 65,536
@@ -320,21 +324,19 @@ def _env_falsey(name: str) -> bool:
 # 65,536-lane `argpartition` and `logsumexp` instead of 248,320-lane ones, and
 # the same `(ids, probs)` support because the ranked id table is strictly
 # ascending.  See that module's docstring for the exactness argument.
-_QWEN4_DRAFT_K20_PRESCATTER = _qwen4_draft_k20_prescatter_enabled()
-
-# MTPLX_QWEN4_BLOCK_VERIFY -- read ONCE at import (in
-# ``mtplx.qwen4_block_verify``), default OFF.  When off this constant is False,
-# no verifier is built, and the stock accept loop evaluates exactly the
-# expressions it evaluated before -- same acceptance probability, same
-# residual, same uniforms, same order.  When on, the loop runs block
-# verification (Sun et al. 2024, arXiv:2403.10444) instead of the per-token
-# Leviathan-Chen law: it clips the RUNNING reach product at 1 rather than
-# clipping each factor, water-fills the resulting budget across the depth d+1
-# draft support, and corrects from the SCALED residual (c*p - q)+.  Both laws
-# are exact samplers of the same target distribution; BV accepts deeper more
-# often (+1.85% tokens/window measured offline on 381 real windows) and draws
-# exactly the same number of uniforms.  See ``mtplx/qwen4_block_verify.py``.
-_QWEN4_BLOCK_VERIFY = _qwen4_block_verify_enabled()
+#
+# MTPLX_QWEN4_BLOCK_VERIFY -- likewise read AT USE via
+# ``_qwen4_block_verify_enabled()`` (see mtplx.qwen4_block_verify), default OFF,
+# NOT frozen at import (same served-arming reason). The env is frozen once
+# serving starts, so the accept loop reads the same value at every step. When
+# on, the loop runs block verification (Sun et al. 2024, arXiv:2403.10444)
+# instead of the per-token Leviathan-Chen law: it clips the RUNNING reach
+# product at 1 rather than clipping each factor, water-fills the resulting
+# budget across the depth d+1 draft support, and corrects from the SCALED
+# residual (c*p - q)+.  Both laws are exact samplers of the same target
+# distribution; BV accepts deeper more often (+1.85% tokens/window measured
+# offline on 381 real windows) and draws exactly the same number of uniforms.
+# See ``mtplx/qwen4_block_verify.py``.
 
 def _family_capture_commit_enabled() -> bool:
     """qwen4_exp layer-owned capture-commit (``MTPLX_FAMILY_CAPTURE_COMMIT``).
@@ -606,6 +608,77 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, str(default)))
     except (TypeError, ValueError):
         return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return float(default)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _typical_accept_threshold() -> float:
+    """MTPLX_FABLE_TYPICAL_THRESHOLD (default 0.0 = lane OFF).
+
+    The single operator knob (server flag ``--typical-threshold``). It maps to
+    DELTA, the coefficient in the typical-acceptance floor
+
+        min(eps, delta * exp(-H(p_t)))
+
+    over the target row's entropy H. Higher = stricter: the entropy-scaled floor
+    rises, fewer draft positions clear it, fewer draft tokens are accepted, and
+    the arm sits closer to the exact rule. The endpoints of the dial:
+
+    - unset / 0  -> lane OFF: the accept loop runs the exact, distribution-exact
+      speculative-sampling law (Leviathan-Chen ``min(1, p/q)`` coin + residual
+      correction) byte-for-byte.
+    - very large -> the floor exceeds every target-row mass at every position,
+      so every position is "non-typical" and is resampled from the target row
+      p_t itself; each cycle then commits exactly one exact token (the exact
+      rule's one-token-per-cycle worst case, reached deterministically).
+    """
+    return _env_float("MTPLX_FABLE_TYPICAL_THRESHOLD", 0.0)
+
+
+def _typical_accept_enabled() -> bool:
+    """The typical-acceptance lane is ON iff the threshold knob is > 0.
+
+    NEVER on by default: MTPLX_FABLE_TYPICAL_THRESHOLD is 0.0 unless an operator
+    sets it. At threshold 0 the exact law runs unchanged. The call site gates
+    this further to temperature > 0: at temperature <= 0 the primary is the
+    argmax and greedy acceptance already coincides with the typical rule, so the
+    lane is a deliberate no-op there.
+
+    When on (Cai et al. 2024, arXiv:2401.10774, Section 2.3.1 "Typical
+    Acceptance"; the typicality criterion is adapted from Hewitt et al. 2022,
+    "Truncation Sampling as Language Model Desmoothing"): a draft token is
+    accepted when it is "typical" under the target row,
+
+        p_target(x_t) > min(eps, delta * exp(-H(p_t))),
+
+    the accepted prefix is the longest run of typical positions, the first
+    non-typical position is resampled from the target row p_t itself (NOT the
+    residual), and the all-accept bonus stays a plain sample from p. This is
+    NOT distribution-exact; it is gated on task quality.
+    """
+    return _typical_accept_threshold() > 0.0
+
+
+def _typical_accept_eps() -> float:
+    """MTPLX_FABLE_TYPICAL_EPS (default 1.0): an ADVANCED hard-probability cap.
+
+    The floor is ``min(eps, delta*exp(-H))`` where delta is the operator
+    threshold. With the default eps=1.0 the cap never binds for any delta <= 1
+    (``delta*exp(-H) <= delta <= 1 == eps``), so eps is inert and the effective
+    floor is ``delta*exp(-H)`` -- the operating point the perf/quality battery
+    measured. Lower eps only to impose a hard ceiling on the floor independent
+    of the row's entropy; most operators never touch it. (A test pins that the
+    delta=0.09 numerics are identical under the old eps=0.3 and this eps=1.0.)
+    """
+    return _env_float("MTPLX_FABLE_TYPICAL_EPS", 1.0)
 
 
 def _generation_rate_fields(
@@ -2676,6 +2749,18 @@ class GenerationStats:
     drafted_by_depth: list[int] = field(default_factory=list)
     accept_probability_sum_by_depth: list[float] = field(default_factory=list)
     mean_accept_probability_by_depth: list[float | None] = field(default_factory=list)
+    # Medusa-2 typical acceptance (MTPLX_FABLE_TYPICAL_THRESHOLD > 0). All
+    # zero/false on the exact-rule path. typical_positions is every draft
+    # position the typical rule decided this request; typical_accepted /
+    # typical_resamples split it; typical_mean_entropy is the mean target-row
+    # entropy (nats). typical_accept_delta carries the operator threshold.
+    typical_accept_enabled: bool = False
+    typical_accept_eps: float = 0.0
+    typical_accept_delta: float = 0.0
+    typical_positions: int = 0
+    typical_accepted: int = 0
+    typical_resamples: int = 0
+    typical_mean_entropy: float = 0.0
     # Which commit path produced the stop token when finish_reason == "stop"
     # (#414 telemetry): accepted_draft | residual_correction | bonus |
     # primary | context_copy | repetition_stop | grammar_terminal | unknown.
@@ -8691,6 +8776,19 @@ def generate_mtpk(
     # vLLM-exact). Counts are rebuilt from `tokens` at each sample point — simple
     # and drift-proof; an incremental counter is a documented perf follow-up.
     _penalties_active = bool(sampler.presence_penalty) or bool(sampler.frequency_penalty)
+    # Medusa-2 typical acceptance. OFF by default: the operator knob is
+    # MTPLX_FABLE_TYPICAL_THRESHOLD (server flag --typical-threshold), which maps
+    # to delta and enables the lane only when > 0. Engages only under
+    # temperature > 0: at temperature <= 0 the primary is the argmax and greedy
+    # acceptance already coincides with the typical rule (argmax is always
+    # typical), so nothing changes there. When active it replaces the exact
+    # min(1, p/q) coin + residual correction with the deterministic typicality
+    # threshold and a target-row resample (NOT distribution-exact); see
+    # _typical_accept_threshold for the dial and _typical_accept_eps for the cap.
+    _typical_threshold = _typical_accept_threshold()
+    _typical_active = _typical_threshold > 0.0 and sampler.temperature > 0
+    _typical_eps = _typical_accept_eps()
+    _typical_delta = _typical_threshold
     # Loop Guard: loop-armed DRY-style steering (see mtplx/loop_guard.py).
     # Disarmed = zero distribution impact (identity transform, fast paths kept).
     # Armed = target distributions get sparse anti-cycle penalties per position;
@@ -8732,6 +8830,13 @@ def generate_mtpk(
     append_event = events.append if record_events else (lambda _event: None)
     accepted = rejected = drafted = 0
     bonus_tokens = correction_tokens = verify_calls = 0
+    # Typical-acceptance per-request counters (only move when _typical_active).
+    # typical_positions counts every draft position the typical rule decided;
+    # typical_accepted / typical_resamples split that into accepts and the
+    # first-non-typical resample from the target row; typical_entropy_sum feeds
+    # the mean target-row entropy on the verdict line.
+    typical_positions = typical_accepted = typical_resamples = 0
+    typical_entropy_sum = 0.0
     stop_origin: str | None = None
     accepted_by_depth = [0 for _ in range(speculative_depth)]
     drafted_by_depth = [0 for _ in range(speculative_depth)]
@@ -9953,7 +10058,7 @@ def generate_mtpk(
     # both are passed as absent.
     _draft_k20_prescatter_plan = None
     _draft_k20_prescatter_receipt: dict[str, object] = {"installed": False}
-    if _QWEN4_DRAFT_K20_PRESCATTER:
+    if _qwen4_draft_k20_prescatter_enabled():
         _draft_k20_prescatter_plan = _qwen4_draft_k20_prescatter_claim(
             rt,
             greedy_chain_enabled=_greedy_chain_eligible,
@@ -12194,7 +12299,7 @@ def generate_mtpk(
         _host_accept_drafts = draft_tokens
         _bv = None
         if (
-            _QWEN4_BLOCK_VERIFY
+            _qwen4_block_verify_enabled()
             and _host_accept_drafts
             and sampler.temperature > 0
             and target_prefix_tokens is None
@@ -12286,6 +12391,35 @@ def generate_mtpk(
                 accepted_now = int(draft_token) == target_token
                 accept_prob = 1.0 if accepted_now else 0.0
                 correction = target_token
+            elif _typical_active and target_distribution_batch is not None:
+                # Typical acceptance, batched-target rows. Deterministic: no
+                # coin. The target row is the truncated (top-p/top-k) support
+                # already materialised for the exact rule; entropy is a cheap
+                # reduction over it. A non-typical position resamples from the
+                # target row itself (one rng.choice), never the residual.
+                draft_q = draft_probs[depth_index]
+                if draft_q is None:
+                    raise RuntimeError("non-greedy MTP requires draft distributions")
+                target_p_for_cache = target_distribution_batch.to_distribution(
+                    depth_index
+                )
+                accepted_now, _typ_thr, _typ_H = typical_accept_decision(
+                    target_p_for_cache,
+                    draft_token,
+                    eps=_typical_eps,
+                    delta=_typical_delta,
+                )
+                accept_prob = 1.0 if accepted_now else 0.0
+                typical_positions += 1
+                typical_entropy_sum += _typ_H
+                if accepted_now:
+                    correction = draft_token
+                    typical_accepted += 1
+                else:
+                    correction = int(
+                        sample_from_distribution(target_p_for_cache, rng)
+                    )
+                    typical_resamples += 1
             elif target_distribution_batch is not None:
                 draft_q = draft_probs[depth_index]
                 if draft_q is None:
@@ -12362,27 +12496,49 @@ def generate_mtpk(
                 draft_q = draft_probs[depth_index]
                 if draft_q is None:
                     raise RuntimeError("non-greedy MTP requires draft distributions")
-                accept_prob = compute_acceptance_probability(
-                    target_p, draft_q, draft_token
-                )
-                if _bv is not None:
-                    # Block verification: see the batched branch above. `_bv`
-                    # is only ever built when every target row was already
-                    # materialised, so it is None on the lazy path that just
-                    # built `target_p` here.
-                    accept_prob = _bv.accept_probability[depth_index]
-                accepted_now = float(rng.random()) <= accept_prob
                 target_p_for_cache = target_p
-                if accepted_now:
-                    correction = draft_token
-                elif _bv is not None:
-                    correction = sample_from_distribution(
-                        _bv.scaled_residual(depth_index), rng
+                if _typical_active:
+                    # Typical acceptance, lazy/per-row target. Same law as the
+                    # batched branch: deterministic typicality threshold, no
+                    # coin, a non-typical position resamples from target_p.
+                    accepted_now, _typ_thr, _typ_H = typical_accept_decision(
+                        target_p,
+                        draft_token,
+                        eps=_typical_eps,
+                        delta=_typical_delta,
                     )
+                    accept_prob = 1.0 if accepted_now else 0.0
+                    typical_positions += 1
+                    typical_entropy_sum += _typ_H
+                    if accepted_now:
+                        correction = draft_token
+                        typical_accepted += 1
+                    else:
+                        correction = int(
+                            sample_from_distribution(target_p, rng)
+                        )
+                        typical_resamples += 1
                 else:
-                    correction = sample_from_distribution(
-                        residual_distribution(target_p, draft_q), rng
+                    accept_prob = compute_acceptance_probability(
+                        target_p, draft_q, draft_token
                     )
+                    if _bv is not None:
+                        # Block verification: see the batched branch above. `_bv`
+                        # is only ever built when every target row was already
+                        # materialised, so it is None on the lazy path that just
+                        # built `target_p` here.
+                        accept_prob = _bv.accept_probability[depth_index]
+                    accepted_now = float(rng.random()) <= accept_prob
+                    if accepted_now:
+                        correction = draft_token
+                    elif _bv is not None:
+                        correction = sample_from_distribution(
+                            _bv.scaled_residual(depth_index), rng
+                        )
+                    else:
+                        correction = sample_from_distribution(
+                            residual_distribution(target_p, draft_q), rng
+                        )
                 if not accepted_now and _env_truthy("MTPLX_DELTA_TELEMETRY"):
                     # Tree Stage-0 pricing (2026-08-25): would a sibling branch
                     # have caught this rejection? Record the rank of the
@@ -13564,6 +13720,17 @@ def generate_mtpk(
             accept_probability_sum_by_depth,
             drafted_by_depth,
         ),
+        typical_accept_enabled=bool(_typical_active),
+        typical_accept_eps=float(_typical_eps) if _typical_active else 0.0,
+        typical_accept_delta=float(_typical_delta) if _typical_active else 0.0,
+        typical_positions=int(typical_positions),
+        typical_accepted=int(typical_accepted),
+        typical_resamples=int(typical_resamples),
+        typical_mean_entropy=(
+            float(typical_entropy_sum / typical_positions)
+            if typical_positions
+            else 0.0
+        ),
         bonus_tokens=bonus_tokens,
         correction_tokens=correction_tokens,
         verify_calls=verify_calls,
@@ -13665,6 +13832,23 @@ def generate_mtpk(
         events=events,
     )
     _attach_runtime_diagnostics(stats, rt, counter_start)
+    if _typical_active:
+        _typ_denom = typical_accepted + typical_resamples
+        _typ_rate = (typical_accepted / _typ_denom) if _typ_denom else 0.0
+        _typ_cycles = max(1, verify_calls)
+        print(
+            "[typical-accept] NOT distribution-exact; "
+            f"threshold={_typical_threshold:.4g} "
+            f"eps={_typical_eps:.4g} delta={_typical_delta:.4g} "
+            f"positions={typical_positions} accepted={typical_accepted} "
+            f"resamples={typical_resamples} accept_rate={_typ_rate:.4f} "
+            f"mean_entropy={stats.typical_mean_entropy:.4f} "
+            f"tokens_per_cycle={len(tokens) / _typ_cycles:.3f} "
+            f"accepted_by_depth={accepted_by_depth} "
+            f"generated={len(tokens)} verify_calls={verify_calls}",
+            file=sys.stderr,
+            flush=True,
+        )
     return GenerationOutput(
         tokens=tokens,
         text=_decode(rt.tokenizer, _strip_terminal_stop(tokens, stop_token_ids)),

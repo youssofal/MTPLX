@@ -184,8 +184,13 @@ def install_frspec_draft_head(text: Any) -> dict[str, Any]:
     bits = int(head.bits)
     group_size = int(head.group_size)
     mode = str(head.mode)
+    # The row-pruned head carries the source head's own bits/group_size/mode
+    # (the nn.QuantizedLinear built below), so any affine g64 head prunes
+    # exactly -- Q8/g64 (Optimized-Speed) and Q4/g64 (Bare-Speed) both install.
+    # Reject every other native-head layout so the model LOAD fails loudly
+    # rather than serving a mispruned head.
     if source == "native_mtp_head" and (
-        bits != 8 or group_size != 64 or mode != "affine"
+        bits not in (4, 8) or group_size != 64 or mode != "affine"
     ):
         return {
             "installed": False,
