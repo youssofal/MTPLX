@@ -287,14 +287,19 @@ def _accept_loop_source(source: str) -> str:
     return source[start:end]
 
 
-def test_the_gate_is_read_once_at_import_and_only_in_one_place():
+def test_the_gate_is_read_at_use_and_only_in_one_place():
     source = _generation_source()
-    assert "_QWEN4_BLOCK_VERIFY = _qwen4_block_verify_enabled()" in source
-    # generation.py never reads the variable itself.
+    # generation.py consults the reader at USE, not a module constant frozen
+    # at import: the served fixed-M4 auto-arm stamps the key after import, so a
+    # frozen constant would leave the lane off as launched (arming audit).
+    assert "_qwen4_block_verify_enabled()" in source
+    assert "_QWEN4_BLOCK_VERIFY = " not in source
+    # generation.py never reads the env var itself.
     assert 'os.environ.get("MTPLX_QWEN4_BLOCK_VERIFY"' not in source
     assert '_env_truthy("MTPLX_QWEN4_BLOCK_VERIFY")' not in source
     module = (REPO_ROOT / "mtplx" / "qwen4_block_verify.py").read_text()
     assert module.count('_ENV_VAR = "MTPLX_QWEN4_BLOCK_VERIFY"') == 1
+    # the env is read in exactly one place (is_enabled), at use.
     assert module.count("_env_truthy(_ENV_VAR)") == 1
     assert "os.environ" not in inspect.getsource(bv_mod.BlockVerifier)
     assert "os.environ" not in inspect.getsource(bv_mod.build_verifier)
@@ -317,9 +322,21 @@ def test_the_shipped_law_survives_verbatim_in_the_accept_loop():
     assert "residual_distribution(\n" in loop
     assert "else target_distribution_batch.to_distribution(depth_index)," in loop
     # The accept coin is still drawn once per depth and compared with `<=`,
-    # so arming block verification cannot shift the PCG64 stream.
-    assert loop.count("accepted_now = float(rng.random()) <= accept_prob") == 2
-    assert loop.count("rng.random()") == 2
+    # so arming block verification cannot shift the PCG64 stream. The exact law
+    # appears in six places now: the two shipped exact branches (batched +
+    # lazy), the two speculative-cascade OPT DEFER paths (batched + lazy), and
+    # the two token-specific cascade DEFER paths (batched + lazy, rule
+    # tokenv1/2/3), all of which reuse the identical coin verbatim. Every cascade
+    # path is gated behind `_cascade_active` (MTPLX_FABLE_CASCADE_THRESHOLD, off
+    # by default and mutually exclusive with block verification's own lane), and
+    # the OPT vs token-specific paths are mutually exclusive per request via
+    # `_cascade_rule`, so exactly one coin fires per depth and the
+    # block-verification RNG guarantee is unchanged.
+    assert loop.count("accepted_now = float(rng.random()) <= accept_prob") == 6
+    # Same six coin sites (the token-specific defer paths reuse the identical
+    # `float(rng.random()) <= accept_prob` draw); no other `rng.random()` call
+    # appears in the accept loop, so the per-depth draw count is unchanged.
+    assert loop.count("rng.random()") == 6
 
 
 def test_every_block_verification_read_is_guarded():
@@ -356,9 +373,9 @@ def test_the_verifier_is_built_once_before_the_loop_and_is_gated():
     )
     assert built < loop
     assert body.count("_qwen4_build_block_verifier(") == 1
-    gate = body.rindex("_QWEN4_BLOCK_VERIFY", 0, built)
-    # The construction sits under the module-level gate, and under the
-    # preconditions that make a block law meaningful at all.
+    gate = body.rindex("_qwen4_block_verify_enabled()", 0, built)
+    # The construction sits under the at-use gate, and under the preconditions
+    # that make a block law meaningful at all.
     guard = body[gate:built]
     assert "sampler.temperature > 0" in guard
     assert "target_prefix_tokens is None" in guard

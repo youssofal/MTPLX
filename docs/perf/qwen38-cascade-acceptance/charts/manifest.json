@@ -1,0 +1,65 @@
+[
+  {
+    "alt": "Decode tok/s by cascade alpha, fastest of three with a min-max band, and two reference lines for cascade off (#475 base) and typical acceptance at 0.2",
+    "bytes": 95540,
+    "caption": "_Decode by alpha for BOTH cascade rules: OPT (Equation 10) and TokenV3 (Equation 15), each fastest of three seeds with a min-max band. Reference lines are cascade off / #475 base (82.80) and typical acceptance at 0.2 (99.16) from the pooled 16K windows in #478. The two rules' alphas are different quantities and are NOT comparable at equal alpha; compare at equal decode speed._",
+    "file": "cascade_decode_vs_alpha.svg",
+    "key": "cascade_decode_vs_alpha",
+    "label": "cascade decode by alpha",
+    "sha256": "2ac1a4d3ffb281a0d218f67b09e4c2af50a85023707844ae259555f2ba6a79c7"
+  },
+  {
+    "alt": "Cascade kept-draft rate by alpha for the OPT and TokenV3 rules",
+    "bytes": 84026,
+    "caption": "_Cascade kept-draft rate, Definitions (c), by alpha for BOTH rules, OPT (Equation 10) and TokenV3 (Equation 15), from each run's `[cascade-accept]` verdict line rather than the receipts. Equal alphas are NOT comparable across the two rules._",
+    "file": "cascade_kept_draft_vs_alpha.svg",
+    "key": "cascade_kept_draft_vs_alpha",
+    "label": "cascade kept-draft rate by alpha",
+    "sha256": "cf90fc510da90ab94cceb5a4e511fc18601dd8ce4af047680903e606463ffa89"
+  },
+  {
+    "alt": "Tokens per verify cycle by alpha for the OPT and TokenV3 rules",
+    "bytes": 74232,
+    "caption": "_Tokens per verify cycle by alpha for BOTH rules, OPT (Equation 10) and TokenV3 (Equation 15), from each run's `[cascade-accept]` verdict line rather than the receipts. Equal alphas are NOT comparable across the two rules._",
+    "file": "cascade_tokens_per_cycle_vs_alpha.svg",
+    "key": "cascade_tokens_per_cycle_vs_alpha",
+    "label": "tokens per verify cycle by alpha",
+    "sha256": "9a36a010ec9ee5d7bf86c3efb5ff15fceb157658bb38bd7f3ea2ff8655ecb2fe"
+  },
+  {
+    "alt": "Decode tok/s by context size for cascade off (#475 base), cascade OPT alphas 0.0-2.0 and TokenV3 alpha 0.95",
+    "bytes": 90125,
+    "caption": "_Decode tok/s by context size, one line per arm: cascade off (#475 base), the OPT rule at alpha 0.0/0.25/0.5/0.75/1.0/2.0, and the TokenV3 rule at alpha 0.95. Each point is the fastest seed with a min-max band; the 16,384 rung is merged in from the 16K sweeps, the OPT arms from battery475/g and the TokenV3 arm from battery475/t; 261,120 is absent because every arm exceeds the memory knob on the #475 base without #482._",
+    "file": "cascade_decode_by_context.svg",
+    "key": "cascade_decode_by_context",
+    "label": "cascade decode by context",
+    "sha256": "345985e2361ead5d9f0d1edc1f307bd57c31eaaad2f8642bc04fe0c6a5ba14cf"
+  },
+  {
+    "alt": "Grouped bars of decode tok/s at 16,384 tokens for release 2.11.2, #475, #478 and four #485 cascade operating points, each annotated with its HumanEval strict pass@1",
+    "bytes": 157421,
+    "caption": "_Decode tok/s at 16,384 tokens on the Optimized-Speed pack: release 2.11.2 with acceptance mode off (71.97), #475 (base) with acceptance mode off (82.84), #478 at typical acceptance 0.2 (99.16), and #485 at the OPT rule (Equation 10) alpha 0.25 (104.78) and the TokenV3 rule (Equation 15) alpha 0.75 (95.30) and 0.95 (107.10). Bar height is the fastest seed, the whisker is the min-max band, and the figure above each whisker is HumanEval strict pass@1 for the same arm. Alpha is NOT comparable between the two rules; compare at equal decode speed._",
+    "file": "cascade_vs_475_478_16k.svg",
+    "key": "cascade_vs_475_478_16k",
+    "label": "cascade against #475 and #478 at 16K",
+    "sha256": "cfbbae204ddbb54a16bcbc690f543fa644a177e5091725e3cdda9215f8ef88e9"
+  },
+  {
+    "alt": "Decode tok/s against context size from 1,024 to 131,072 tokens for #475 (base) cascade off, #478 typical 0.2, #485 OPT alpha 0.25 and #485 TokenV3 alpha 0.95",
+    "bytes": 143817,
+    "caption": "_Decode tok/s against context size on the Optimized-Speed pack for #475 (base) with cascade off, #478 at typical acceptance 0.2, #485 at the OPT rule alpha 0.25 and #485 at the TokenV3 rule alpha 0.95. Each point is the fastest seed and the band is the min-max range. No arm has a 261,120 point: on the #475 base without #482 every arm on this pack exceeds the memory knob._",
+    "file": "cascade_vs_475_478_ladder.svg",
+    "key": "cascade_vs_475_478_ladder",
+    "label": "cascade against #475 and #478 by context",
+    "sha256": "c4747722fe0d98c71038b21cd52b7a20ca8ce2f7dfb8bc60087e3bcb56acecb4"
+  },
+  {
+    "alt": "HumanEval strict and completed-task pass@1 as grouped bars per operating point: cascade off, #478 typical 0.2, OPT alpha 0.0 to 0.75, TokenV3 alpha 0.75 and 0.95",
+    "bytes": 132371,
+    "caption": "_HumanEval pass@1 per cascade operating point, one seed at the cell's sampler, re-scored offline, with #478 typical 0.2 beside cascade off as the second reference: strict (truncated tasks count as failures) and completed-task (truncated tasks excluded). The OPT rule (Equation 10) loses accuracy at every alpha; the TokenV3 rule (Equation 15) holds the cascade-off level at 0.75 and 0.95. OPT alpha 1.0 did not finish 164 tasks in 3 h and has no bar. Equal alphas are NOT comparable across the two rules._",
+    "file": "cascade_humaneval_by_alpha.svg",
+    "key": "cascade_humaneval_by_alpha",
+    "label": "HumanEval by cascade operating point",
+    "sha256": "7008eed4da1c881dee646ee9563264eca8708e8950ed0d3594e5caadb5721bc8"
+  }
+]

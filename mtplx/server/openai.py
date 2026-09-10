@@ -925,8 +925,27 @@ def _server_runtime_env_overrides(
                 "MTPLX_QWEN4_BLOCK_VERIFY",
                 "MTPLX_QWEN4_PLE_PREFILL_LOOKAHEAD",
                 "MTPLX_QWEN4_PLE_FIRST_GATHER_EARLY",
+                # PR #475 (davidtai), measured at the 16,384/1,024 cell on the
+                # same fixed-M4 geometry: the cached async PLE auxiliary plane
+                # (native CPU-stream rows, produced outside the compiled
+                # verifier via mx.async_eval; declines to stock and prints a
+                # reason when the native extension is not built) and the
+                # construction-bound fixed-M4 pooled-key rowsel install. Both
+                # exact by construction (byte-identical output).
+                "MTPLX_QWEN4_PLE_CACHED_AUX",
+                "MTPLX_QSA_POOLED_ROWSEL",
                 "MTPLX_SESSION_BANK_SHED_BOUNDARIES",
                 "MTPLX_SESSION_BANK_PROTECTED_TERMINAL",
+                # PR #391 remainder ports (davidtai), same fixed-M4 geometry.
+                # Decode: the verify-width fused hyper-connection read
+                # (mtplx/kernels/qwen4_m4_hyper_read; rounding-class, RAISES on
+                # a family-contract miss rather than falling back).
+                "MTPLX_QWEN4_HC_M4",
+                # Prefill: the causal-mask fuse routes the dense QSA prefill
+                # chunk through MLX's fused SDPA (rounding-class, exact visible
+                # set; per-shape-class capability cache, so a verify step MLX
+                # refuses never disarms a wide chunk).
+                "MTPLX_QWEN4_PREFILL_MASK_FUSE",
             ]
             if _qwen4_port_opt_in(
                 overrides, "MTPLX_FUSED_GATE_UP"
@@ -934,6 +953,15 @@ def _server_runtime_env_overrides(
                 # The tail also requires the fused gate+up owners, so the
                 # MTPLX_FUSED_GATE_UP kill switch drops it with them.
                 lane_defaults.append("MTPLX_QWEN4_M4_STAGE3")
+            # PR #475 aux lanes: mirror an operator's old MTPLX_FABLE_* export
+            # onto the primary MTPLX_QWEN4_*/MTPLX_QSA_* key when the primary is
+            # unset, so the alias arms or kills the lane before the default
+            # stamp. setdefault below then leaves the mirrored value in place.
+            for _primary, _alias in _QWEN4_AUX_LANE_ALIASES.items():
+                if os.environ.get(_primary) is None:
+                    _alias_val = os.environ.get(_alias)
+                    if _alias_val is not None and _alias_val.strip():
+                        overrides[_primary] = _alias_val
             for key in lane_defaults:
                 if os.environ.get(key) is None:
                     overrides.setdefault(key, "1")
@@ -942,6 +970,44 @@ def _server_runtime_env_overrides(
             # leaves them inert.
             if os.environ.get("MTPLX_NGRAM_PREWARM") is None:
                 overrides.setdefault("MTPLX_NGRAM_PREWARM", "auto")
+            # PR #391 remainder port (davidtai): the QSA prefill query tile.
+            # Caps the dense QSA attention peak to 2,048 rows so a wider
+            # prefill chunk keeps the 8x2,048 attention peak AND cost. Inert
+            # at the production 2,048 chunk width (tile >= chunk == no-op), so
+            # it only bites a 4,096-row chunk experiment; an explicit export
+            # (including 0 for whole-chunk) wins via the pop loop below.
+            if os.environ.get("MTPLX_QSA_PREFILL_QUERY_TILE") is None:
+                overrides.setdefault("MTPLX_QSA_PREFILL_QUERY_TILE", "2048")
+            # PR #391 remainder port (davidtai): the native split-K QSA decode
+            # lane. Default ON for the fixed-M4 pack, but ONLY when the native
+            # mtplx_native_qsa extension is built -- a wheel without it declines
+            # to stock and serves the shipped QSA decode path, so a release
+            # without the Apple-Silicon native wheel still boots. An explicit
+            # operator export of MTPLX_QSA_SPARSE_DECODE=1 bypasses this check
+            # and reaches the fail-closed install (armed + unbuilt -> RAISE),
+            # which is the measured-arm contract. Its measured companions (the
+            # 128:32 tile and 17 KV-splits) are the runtime_options defaults,
+            # so they need no stamp; an explicit export of either still wins.
+            if os.environ.get("MTPLX_QSA_SPARSE_DECODE") is None:
+                try:
+                    from mtplx.native import native_qsa_available
+
+                    _qsa_decode_ext_ok = bool(native_qsa_available())
+                except Exception:
+                    _qsa_decode_ext_ok = False
+                if _qsa_decode_ext_ok:
+                    overrides.setdefault("MTPLX_QSA_SPARSE_DECODE", "1")
+                else:
+                    print(
+                        "[mtplx] MTPLX_QSA_SPARSE_DECODE declined to stock: the "
+                        "native mtplx_native_qsa split-K extension is not built "
+                        "in this environment; serving the stock QSA decode "
+                        "path. Build native_extensions/qsa_sparse_gqa to arm "
+                        "the lane, or export MTPLX_QSA_SPARSE_DECODE=1 to "
+                        "require it (armed + unbuilt fails closed at load).",
+                        file=sys.stderr,
+                        flush=True,
+                    )
             # The stage-3 child routes are consumed at model load and raise
             # unless stage 3 itself resolves on, so they are derived from the
             # resolved parent, never stamped alone: the routed-down reduction,
@@ -1095,16 +1161,38 @@ _QWEN4_PORT_KEYS = (
     "MTPLX_QWEN4_VERIFY_GLUE_ITEMS",
     "MTPLX_QWEN4_PLE_PREFILL_LOOKAHEAD",
     "MTPLX_QWEN4_PLE_FIRST_GATHER_EARLY",
+    # PR #475 aux lanes (davidtai): the cached async PLE auxiliary and the
+    # fixed-M4 pooled-key rowsel install. Both exact by construction; each is
+    # its own kill switch through the pop loop below.
+    "MTPLX_QWEN4_PLE_CACHED_AUX",
+    "MTPLX_QSA_POOLED_ROWSEL",
     "MTPLX_SESSION_BANK_SHED_BOUNDARIES",
     "MTPLX_SESSION_BANK_PROTECTED_TERMINAL",
+    # PR #391 remainder ports (davidtai): each is its own kill switch through
+    # the pop loop below.
+    "MTPLX_QWEN4_HC_M4",
+    "MTPLX_QWEN4_PREFILL_MASK_FUSE",
+    "MTPLX_QSA_SPARSE_DECODE",
     "MTPLX_NGRAM_PREWARM",
 )
+# PR #475's aux lanes were spelled MTPLX_FABLE_* under PR #391. Upstream has no
+# full_stack_env, so the primary keys are the MTPLX_QWEN4_*/MTPLX_QSA_* names
+# above; the old names are honoured as aliases when the primary is unset.
+_QWEN4_AUX_LANE_ALIASES = {
+    "MTPLX_QWEN4_PLE_CACHED_AUX": "MTPLX_FABLE_PLE_CACHED_AUX",
+    "MTPLX_QSA_POOLED_ROWSEL": "MTPLX_FABLE_QSA_POOLED_ROWSEL",
+}
 # Every key the fixed-M4 lane defaults may stamp; an explicit operator
 # export (any non-empty value) always beats a stamped value for these.
 _QWEN4_LANE_KEYS = _QWEN4_PORT_KEYS + (
     "MTPLX_FRSPEC_DRAFT",
     "MTPLX_FRSPEC_VOCAB",
     "MTPLX_QSA_GATHER_MAX_ROWS",
+    # PR #391 remainder ports (davidtai): the QSA prefill query-tile value and
+    # the split-K decode lane's tile/splits companions.
+    "MTPLX_QSA_PREFILL_QUERY_TILE",
+    "MTPLX_QSA_SPARSE_DECODE_TILE",
+    "MTPLX_QSA_SPARSE_DECODE_SPLITS",
 )
 
 
@@ -16407,6 +16495,66 @@ def _int_env(name: str) -> int | None:
         return None
 
 
+def _cascade_acceptance_health_payload() -> dict[str, Any]:
+    """Resolved speculative-cascade acceptance lane state, for ``/health``.
+
+    A SECOND lossy verify rule beside typical acceptance (Narasimhan et al.
+    2024, arXiv:2405.19261, "Faster Cascades via Speculative Decoding", Eq.
+    (10)). OFF unless the operator sets MTPLX_FABLE_CASCADE_THRESHOLD (server
+    flag ``--cascade-threshold``); unset leaves the exact speculative law
+    unchanged. When on it is NOT distribution-exact: it accepts the draft token
+    whenever ``max_v q(v) >= max_v p(v) - alpha*D_TV(p,q)`` and otherwise defers
+    to the exact ``min(1, p/q)`` coin + residual. Mutually exclusive with the
+    typical lane (both set is a fail-loud misconfiguration). See
+    docs/perf/qwen38-cascade-acceptance.md.
+    """
+    raw = os.environ.get("MTPLX_FABLE_CASCADE_THRESHOLD")
+    enabled = raw is not None and str(raw).strip() != ""
+    alpha: float | None = None
+    if enabled:
+        try:
+            alpha = float(raw)
+        except ValueError:
+            alpha = None
+            enabled = False
+    typical_on = False
+    tv = os.environ.get("MTPLX_FABLE_TYPICAL_THRESHOLD")
+    try:
+        typical_on = tv is not None and float(tv) > 0.0
+    except ValueError:
+        typical_on = False
+    rule_raw = os.environ.get("MTPLX_FABLE_CASCADE_RULE")
+    rule_name = str(rule_raw).strip().lower() if rule_raw not in (None, "") else "tokenv3"
+    rule_text = {
+        "opt": "defer iff max_q < max_p - alpha*D_TV(p,q); else accept draft (Eq. 10)",
+        "tokenv1": "defer token v iff q(v) < max_p - alpha; else accept (Eq. 13)",
+        "tokenv2": "defer token v iff p(v) < max_p - alpha; else accept (Eq. 14)",
+        "tokenv3": "defer token v iff p(v) < max_p*(1-alpha); else accept (Eq. 15)",
+    }.get(rule_name, rule_name)
+    return {
+        "enabled": enabled,
+        "alpha": alpha,
+        "threshold": alpha,
+        "rule_name": rule_name,
+        "rule": rule_text,
+        "divergence": "D_TV(p,q) = sum_v max(0, p(v)-q(v)) over scored top-k",
+        "rates": {
+            "defer_rate": "cascade_deferred / cascade_positions -- the paper's deferral rate r (fraction of cascade-decided positions the rule deferred to the target); per-request value in VerifyStats.cascade_defer_rate and the [cascade-accept] verdict line",
+            "accept_rate": "cascade_accepted / cascade_positions -- kept-draft rate over cascade-decided positions (no-defer accepts + coin-accepted deferred tokens); NOT the deferral rate",
+            "resample_rate": "cascade_resamples / cascade_positions -- deferred tokens that lost the exact coin; accept_rate + resample_rate == 1 over cascade-decided positions",
+        },
+        "distribution_exact": not enabled,
+        "mutually_exclusive_with_typical": True,
+        "conflict": bool(enabled and typical_on),
+        "citation": "arXiv:2405.19261 Eq. (10)",
+        "note": (
+            "OFF unless --cascade-threshold (MTPLX_FABLE_CASCADE_THRESHOLD) is "
+            "set; when on it is NOT distribution-exact and engages only at "
+            "temperature > 0; mutually exclusive with --typical-threshold"
+        ),
+    }
+
+
 def _startup_health_payload(state: "ServerState") -> dict[str, Any]:
     chat_template_report = getattr(state, "chat_template_report", {}) or {}
     tool_prompt_mode = _tool_prompt_mode_from_args(state.args)
@@ -18625,9 +18773,64 @@ def _qwen4_install_reports(state: Any) -> dict[str, Any]:
     stage3 = getattr(runtime, "qwen4_m4_stage3_report", None)
     if isinstance(stage3, dict):
         out["m4_stage3"] = stage3
+    hc_m4 = getattr(runtime, "qwen4_hc_m4_report", None)
+    if isinstance(hc_m4, dict):
+        out["hc_m4"] = hc_m4
+    try:
+        from mtplx.runtime_options import qsa_sparse_decode_enabled
+
+        if qsa_sparse_decode_enabled():
+            from mtplx.kernels import qsa_sparse_decode as _qsd
+
+            out["qsa_sparse_decode"] = _qsd.receipt()
+    except Exception:
+        pass
     glue = getattr(runtime, "_mtplx_qwen4_verify_glue", None)
     if isinstance(glue, dict):
         out["verify_glue"] = glue
+    # PR #391 remainder / arming audit: three decode-verify lanes with no
+    # per-window observable. Read-only {armed (read at use, gate-able without a
+    # request) + first-use engaged/applied latch}, so the battery gates on the
+    # install verdict instead of trusting the env. Present only when ARMED, so an
+    # unarmed lane stays absent (== off) like the others; the engaged/applied
+    # latch rides inside the armed report.
+    try:
+        from mtplx import qwen4_draft_k20_prescatter as _k20
+
+        report = _k20.engagement_report()
+        if report.get("armed"):
+            out["draft_k20_prescatter"] = report
+    except Exception:
+        pass
+    try:
+        from mtplx import qwen4_block_verify as _bv
+
+        report = _bv.engagement_report()
+        if report.get("armed"):
+            out["block_verify"] = report
+    except Exception:
+        pass
+    try:
+        from mtplx.runtime_options import qwen4_opdiet_report
+
+        report = qwen4_opdiet_report()
+        if report.get("armed"):
+            out["opdiet"] = report
+    except Exception:
+        pass
+    # PR #475 aux lanes: their own per-window observable. Read-only
+    # {armed (read at use) + the load-time install report on the runtime}, so a
+    # served window can tell an engaged lane from a decline-to-stock. Present
+    # only when ARMED, like the lanes above.
+    try:
+        from mtplx import qwen4_aux_lanes as _aux
+
+        for _lane in ("ple_cached_aux", "qsa_pooled_rowsel"):
+            entry = _aux.health_report(_lane, runtime)
+            if entry is not None:
+                out[_lane] = entry
+    except Exception:
+        pass
     try:
         model = getattr(runtime, "model", None)
         text = getattr(model, "language_model", model)
@@ -28931,6 +29134,7 @@ def create_app(state: ServerState) -> FastAPI:
                 "actual_ramp_latency_s"
             ),
             "startup": _startup_health_payload(state),
+            "cascade_acceptance": _cascade_acceptance_health_payload(),
             "thermal": _thermal_health_payload(
                 fan_mode=fan_mode,
                 smart_status=smart_status,
@@ -36177,6 +36381,43 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Load and inject the native MTP sidecar. Disable only for stock AR diagnostics.",
     )
     parser.add_argument(
+        "--cascade-threshold",
+        type=float,
+        default=None,
+        metavar="ALPHA",
+        help=(
+            "Enable speculative-cascade acceptance (arXiv:2405.19261 Eq. (10)) "
+            "at this deferral cost alpha: accept the draft token when "
+            "max_q >= max_p - alpha*D_TV(p,q), else defer to the exact "
+            "min(1,p/q) coin + residual. Unset = OFF = exact speculative "
+            "sampling (the default); any set value (including 0) turns it on. "
+            "Higher alpha widens the accept band (fewer defers). NOT "
+            "distribution-exact; engages only at temperature > 0. Mutually "
+            "exclusive with --typical-threshold (setting both is an error). "
+            "Environment: MTPLX_FABLE_CASCADE_THRESHOLD, which this flag "
+            "overrides. See docs/perf/qwen38-cascade-acceptance.md."
+        ),
+    )
+    parser.add_argument(
+        "--cascade-rule",
+        choices=("opt", "tokenv1", "tokenv2", "tokenv3"),
+        # default=None (sentinel) so an unset flag does not override a
+        # shell-set MTPLX_FABLE_CASCADE_RULE; the effective default resolves in
+        # generation._cascade_accept_rule() (tokenv3).
+        default=None,
+        help=(
+            "Which speculative-cascade deferral rule --cascade-threshold "
+            "applies (arXiv:2405.19261 v2). tokenv3 (default) = the "
+            "token-specific multiplicative rule (Eq. 15, Sec. 4.4), the only "
+            "rule with exact-level accuracy; opt = the position-level peak "
+            "rule (Eq. 10); tokenv1/tokenv2 = the additive token-specific "
+            "rules (Eq. 13/14). The token-specific rules judge the drafted "
+            "token and defer to the exact coin with target pi_Token (Eq. 11). "
+            "Ignored unless --cascade-threshold is set. Environment: "
+            "MTPLX_FABLE_CASCADE_RULE, which this flag overrides."
+        ),
+    )
+    parser.add_argument(
         "--ngram-prewarm",
         metavar="auto|all|off|GiB",
         # Not a boolean, and default=None rather than "auto": the flag has an
@@ -36710,6 +36951,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "off" if args.strip_assistant_reasoning_history else args.preserve_thinking
     )
     args.strip_assistant_reasoning_history = not _preserve_thinking_effective(args)
+    if getattr(args, "cascade_threshold", None) is not None:
+        # Same flag-beats-env contract; generation.py reads the env per request.
+        # Unlike the typical delta, any set value (including 0) turns the lane
+        # on, so only pass --cascade-threshold to enable it.
+        os.environ["MTPLX_FABLE_CASCADE_THRESHOLD"] = str(float(args.cascade_threshold))
+    if getattr(args, "cascade_rule", None) is not None:
+        # Flag beats env; generation.py resolves the rule per request. Only the
+        # deferral rule -- inert unless --cascade-threshold turns the lane on.
+        os.environ["MTPLX_FABLE_CASCADE_RULE"] = str(args.cascade_rule)
+    # Fail loud on the mutually exclusive lossy verify rules, whether they were
+    # set by flag (stamped just above) or already present in the environment.
+    _typ_env = os.environ.get("MTPLX_FABLE_TYPICAL_THRESHOLD")
+    _cas_env = os.environ.get("MTPLX_FABLE_CASCADE_THRESHOLD")
+    _typ_on = False
+    try:
+        _typ_on = _typ_env is not None and float(_typ_env) > 0.0
+    except ValueError:
+        _typ_on = False
+    _cas_on = _cas_env is not None and str(_cas_env).strip() != ""
+    if _typ_on and _cas_on:
+        raise SystemExit(
+            "error: --typical-threshold and --cascade-threshold are mutually "
+            "exclusive lossy verify rules; set at most one "
+            f"(typical={_typ_env!r}, cascade={_cas_env!r})."
+        )
     return args
 
 

@@ -288,6 +288,183 @@ def residual_distribution(target_p: Distribution, draft_q: Distribution) -> Dist
     return residual / total
 
 
+def _peak_probability(distribution: Distribution) -> float:
+    """The largest single-token mass in ``distribution`` (``max_v P(v)``)."""
+    if isinstance(distribution, SparseDistribution):
+        probs = np.asarray(distribution.probs, dtype=np.float64)
+    else:
+        probs = np.asarray(distribution, dtype=np.float64)
+    probs = probs[np.isfinite(probs)]
+    if probs.size == 0:
+        return 0.0
+    return float(probs.max())
+
+
+def total_variation(target_p: Distribution, draft_q: Distribution) -> float:
+    """``D_TV(p, q) = sum_v max(0, p(v) - q(v))`` over the scored top-k support.
+
+    This is the total-variation divergence in the one-sided form the cascade
+    paper writes it (Narasimhan et al. 2024, arXiv:2405.19261, Eq. (8)); it is
+    the same unnormalized mass ``residual_distribution`` renormalizes. Taken
+    over the UNION of the two supports (the truncated target row and the draft
+    head's sparse rows), so tokens the draft scores but the target truncated
+    away, and vice versa, both count. Bounded in [0, 1].
+    """
+    if isinstance(target_p, SparseDistribution) or isinstance(draft_q, SparseDistribution):
+        if isinstance(target_p, SparseDistribution) and isinstance(draft_q, SparseDistribution):
+            token_ids = np.union1d(target_p.token_ids, draft_q.token_ids)
+            tv = 0.0
+            for token in token_ids:
+                diff = target_p.probability(int(token)) - draft_q.probability(int(token))
+                if diff > 0:
+                    tv += diff
+            return float(tv)
+        dense_target = _as_dense(target_p)
+        dense_draft = _as_dense(draft_q)
+    else:
+        dense_target = np.asarray(target_p, dtype=np.float64)
+        dense_draft = np.asarray(draft_q, dtype=np.float64)
+    diff = dense_target - dense_draft
+    return float(np.sum(diff[np.isfinite(diff) & (diff > 0.0)]))
+
+
+def cascade_defer_decision(
+    target_p: Distribution,
+    draft_q: Distribution,
+    *,
+    alpha: float,
+    tv_value: float | None = None,
+) -> tuple[bool, float]:
+    """Speculative-cascade plug-in deferral rule.
+
+    Narasimhan, Jitkrittum, Rawat, Kim, Gupta, Menon, Kumar, "Faster Cascades
+    via Speculative Decoding", arXiv:2405.19261 v2 (2024), Eq. (10) (the
+    plug-in approximation to the optimal deferral rule of Eq. (8)):
+
+        r_OPT(x_<t) = 1  <=>  max_v q(v) < max_v p(v) - alpha * D_TV(p, q)
+
+    ``r = 1`` DEFERS to the large (target) model; ``r = 0`` accepts the small
+    (draft) model's token. Returns ``(defer, tv)``.
+
+    The draft is 'good enough' (do NOT defer) when its peak confidence
+    ``max_v q(v)`` is within ``alpha * D_TV(p, q)`` of the target's peak
+    ``max_v p(v)``. Not deferring means the effective speculative-cascade target
+    is ``pi = q`` (Sec. 4.1), so Algorithm 4's speculative-execution accept
+    probability ``min(1, pi(x)/q(x)) = 1`` and the draft token is accepted with
+    no coin. Deferring sets ``pi = p``, which is exactly the lossless
+    speculative-decoding law: accept with ``min(1, p(x)/q(x))`` and, on
+    rejection, resample the residual ``norm(max(0, p - q))``.
+
+    ``alpha`` (the operator knob) is the Eq. (8) deferral cost. Higher ``alpha``
+    lowers the RHS, so the accept band widens and FEWER positions defer (faster,
+    lossier); ``alpha = 0`` defers whenever the target is strictly more
+    confident than the draft. The decision is DETERMINISTIC (consumes no
+    uniform) -- the coin only appears on the deferred exact path.
+    """
+    tv = total_variation(target_p, draft_q) if tv_value is None else float(tv_value)
+    peak_p = _peak_probability(target_p)
+    peak_q = _peak_probability(draft_q)
+    defer = peak_q < (peak_p - float(alpha) * tv)
+    return (defer, tv)
+
+
+def cascade_token_deferral(
+    target_p: Distribution,
+    draft_q: Distribution,
+    token_id: int,
+    *,
+    alpha: float,
+    rule: str,
+) -> bool:
+    """Token-specific speculative-cascade deferral r(x_<t, v) for ONE token v.
+
+    Narasimhan, Jitkrittum, Rawat, Kim, Gupta, Menon, Kumar, "Faster Cascades
+    via Speculative Decoding", arXiv:2405.19261 v2 (2024), Sec. 4.4. The OPT
+    rule (Eq. 10) compares only the peaks ``max_v q(v)`` vs ``max_v p(v)``, so a
+    drafted token ``x_t ~ q`` that does not maximise ``q`` can be accepted
+    "because q happens to be more peaked than p" even when the token is poor
+    (Sec. 4.4). The token-specific rules judge the specific candidate ``v``:
+
+        r_TokenV1(x_<t, v) = 1  <=>  q(v) < max_v' p(v') - alpha        (Eq. 13)
+        r_TokenV3(x_<t, v) = 1  <=>  p(v) < max_v' p(v') * (1 - alpha)  (Eq. 15)
+
+    ``r = 1`` DEFERS (``v`` judged poor); ``r = 0`` ACCEPTS ``v`` (it is in
+    ``Top_alpha``). Higher ``alpha`` grows ``Top_alpha`` and defers fewer
+    tokens. (Eq. 14 / TokenV2 -- ``p(v) < max p - alpha`` -- is available via
+    ``rule="tokenv2"`` for completeness.)
+    """
+    max_p = _peak_probability(target_p)
+    a = float(alpha)
+    if rule == "tokenv3":
+        return _probability(target_p, token_id) < max_p * (1.0 - a)
+    if rule == "tokenv1":
+        return _probability(draft_q, token_id) < max_p - a
+    if rule == "tokenv2":
+        return _probability(target_p, token_id) < max_p - a
+    raise ValueError(f"unknown token-specific cascade rule: {rule!r}")
+
+
+def cascade_token_target_distribution(
+    target_p: Distribution,
+    draft_q: Distribution,
+    *,
+    alpha: float,
+    rule: str,
+) -> Distribution:
+    """``pi_Token`` (Eq. 11) for the token-specific rule ``r_TokenV{1,2,3}``.
+
+    arXiv:2405.19261 v2, Eq. (11) and Appendix D (Algorithm 6, TokenSpecCascade):
+
+        pi_Token(v) = q(v) * (1 - r(x_<t, v)) + p(v) * eta,
+        eta = sum_{v'} r(x_<t, v') * q(v')
+
+    For V3 this is the intuitive form (Sec. 4.4):
+
+        pi_TokenV3(v) = q(v) * 1[v in Top_alpha] + p(v) * sum_{v' not in Top_alpha} q(v'),
+        Top_alpha = { v : p(v) >= max_v' p(v') * (1 - alpha) }.
+
+    The ``p(v)*eta`` term is present for EVERY ``v``: an accepted token
+    ``v in Top_alpha`` has ``pi(v) = q(v) + p(v)*eta >= q(v)``, so the generic
+    speculative coin (Algorithm 4) accepts it with probability 1; a deferred
+    token has ``pi(v) = p(v)*eta``. ``sum_v pi(v) = 1`` by construction. The
+    deferred exact coin/residual then runs with this ``pi`` as the target,
+    exactly the shipped ``min(1, pi/q)`` accept + ``norm(max(0, pi - q))``
+    residual (Algorithm 6 = GenSpecSample(q, p, pi_Token)).
+    """
+    max_p = _peak_probability(target_p)
+    a = float(alpha)
+    sparse = isinstance(target_p, SparseDistribution) or isinstance(draft_q, SparseDistribution)
+    if sparse and isinstance(target_p, SparseDistribution) and isinstance(draft_q, SparseDistribution):
+        token_ids = np.union1d(target_p.token_ids, draft_q.token_ids).astype(np.int64)
+        p = np.array([target_p.probability(int(t)) for t in token_ids], dtype=np.float64)
+        q = np.array([draft_q.probability(int(t)) for t in token_ids], dtype=np.float64)
+        vocab = _vocab_size(target_p)
+    else:
+        p = _as_dense(target_p)
+        q = _as_dense(draft_q)
+        token_ids = np.arange(p.shape[0], dtype=np.int64)
+        vocab = int(p.shape[0])
+    if rule == "tokenv3":
+        defer = p < max_p * (1.0 - a)
+    elif rule == "tokenv1":
+        defer = q < max_p - a
+    elif rule == "tokenv2":
+        defer = p < max_p - a
+    else:
+        raise ValueError(f"unknown token-specific cascade rule: {rule!r}")
+    eta = float(q[defer].sum())
+    # pi(v) = q(v)*(1 - r(v)) + p(v)*eta  for every v.
+    pi = np.where(defer, 0.0, q) + p * eta
+    pi = np.where(np.isfinite(pi) & (pi > 0), pi, 0.0)
+    total = pi.sum()
+    if not np.isfinite(total) or total <= 0:
+        return target_p  # degenerate; keep the coin well-defined
+    pi = pi / total
+    if sparse:
+        keep = pi > 0
+        return SparseDistribution(token_ids[keep], pi[keep], vocab)
+    return pi
+
 def sample_from_distribution(probs: Distribution, rng: np.random.Generator | None = None) -> int:
     rng = rng or np.random.default_rng()
     if isinstance(probs, SparseDistribution):
