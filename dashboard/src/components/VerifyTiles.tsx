@@ -1,10 +1,10 @@
 import { BigNumber, Card } from "./Card";
-import { fmtNumber, fmtTokS } from "../lib/utils";
+import { depthTotal, fmtNumber, fmtTokS } from "../lib/utils";
 import { useDashboardStore } from "../state/store";
 
 export function VerifyRatioTile() {
   const latest = useDashboardStore((s) => s.latest);
-  const drafted = latest?.drafted_tokens ?? 0;
+  const drafted = depthTotal(latest?.drafted_tokens, latest?.drafted_by_depth);
   const verifies = latest?.verify_calls ?? 0;
   const ratio = verifies > 0 ? drafted / verifies : null;
   return (
