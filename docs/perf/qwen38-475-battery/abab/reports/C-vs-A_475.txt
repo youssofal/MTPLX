@@ -1,0 +1,74 @@
+# ABAB paired-delta report
+arms present: ['A', 'C', 'D', 'E']
+
+## Arm 'A' — decode tok/s per window (on generated tokens)
+engine: 2.11.2 | mlx 0.32.2 | git 21be78b3f518 | profile turbo
+seed        | r1 decode (gen)   | r2 decode (gen)   | r3 decode (gen)   | mean   | spread(min-max)
+20260829  | 71.282 (1024) | 71.667 (1024) | 71.488 (1024) | 71.479 | 71.282-71.667
+20260830  | 70.978 ( 689) | 71.972 ( 689) | 71.387 ( 689) | 71.446 | 70.978-71.972
+20260831  | 71.664 ( 879) | 71.943 ( 879) | 71.838 ( 879) | 71.815 | 71.664-71.943
+
+per-window mean decode (across seeds):
+  round 1: mean 71.308 tok/s (n=3)
+  round 2: mean 71.860 tok/s (n=3)
+  round 3: mean 71.571 tok/s (n=3)
+  ALL windows: mean 71.580 tok/s, sd 0.310, n=9
+
+## Arm 'C' — decode tok/s per window (on generated tokens)
+engine: 2.11.2 | mlx 0.32.2 | git 27d5ff6b02d6 | profile turbo
+seed        | r1 decode (gen)   | r2 decode (gen)   | r3 decode (gen)   | mean   | spread(min-max)
+20260829  | 82.683 (1024) | 82.844 (1024) | 82.716 (1024) | 82.747 | 82.683-82.844
+20260830  | 72.441 ( 566) | 72.639 ( 566) | 72.023 ( 566) | 72.368 | 72.023-72.639
+20260831  | 75.693 (1024) | 75.859 (1024) | 75.250 (1024) | 75.601 | 75.250-75.859
+
+per-window mean decode (across seeds):
+  round 1: mean 76.939 tok/s (n=3)
+  round 2: mean 77.114 tok/s (n=3)
+  round 3: mean 76.663 tok/s (n=3)
+  ALL windows: mean 76.905 tok/s, sd 4.342, n=9
+
+## Drift bracket ('A'): first window (r1) vs last window (r3)
+  seed 20260829: 71.282 -> 71.488  (drift +0.205 tok/s, +0.29%)
+  seed 20260830: 70.978 -> 71.387  (drift +0.409 tok/s, +0.58%)
+  seed 20260831: 71.664 -> 71.838  (drift +0.174 tok/s, +0.24%)
+  mean drift first->last: +0.263 tok/s
+
+## Paired deltas: candidate 'C' minus control 'A'
+control rounds [1, 2, 3] | candidate rounds [1, 2, 3] | paired rounds [1, 2, 3]
+
+round seed        ctrl decode (gen)   cand decode (gen)   delta      delta%   flags
+  r1 20260829   71.282 (1024)     82.683 (1024)     +11.400   +15.99%   ok
+  r1 20260830   70.978 ( 689)     72.441 ( 566)     +1.463   +2.06%   ok
+  r1 20260831   71.664 ( 879)     75.693 (1024)     +4.029   +5.62%   STOP-ASYMMETRY(ctrl=879,cand=1024)
+  r2 20260829   71.667 (1024)     82.844 (1024)     +11.177   +15.60%   ok
+  r2 20260830   71.972 ( 689)     72.639 ( 566)     +0.667   +0.93%   ok
+  r2 20260831   71.943 ( 879)     75.859 (1024)     +3.916   +5.44%   STOP-ASYMMETRY(ctrl=879,cand=1024)
+  r3 20260829   71.488 (1024)     82.716 (1024)     +11.228   +15.71%   ok
+  r3 20260830   71.387 ( 689)     72.023 ( 566)     +0.636   +0.89%   ok
+  r3 20260831   71.838 ( 879)     75.250 (1024)     +3.412   +4.75%   STOP-ASYMMETRY(ctrl=879,cand=1024)
+
+paired cells: 9
+mean delta:   +5.325 tok/s (+7.44%)
+sd / se:      4.636 / 1.545 tok/s
+95% CI (t,df=8): [+1.762, +8.889] tok/s
+verdict:      candidate FASTER (CI excludes 0)
+
+## Per-cell digests (prompt_sha256 head / text_sha256 head)
+  A r1 seed 20260829: prompt 2a91c296733b text ee9993ec5b08 (gen 1024, finish length)
+  A r1 seed 20260830: prompt 309c685184ab text eec89cc6af7d (gen 689, finish stop)
+  A r1 seed 20260831: prompt b64d4fa9f95e text 1ac58119b2df (gen 879, finish stop)
+  A r2 seed 20260829: prompt 2a91c296733b text ee9993ec5b08 (gen 1024, finish length)
+  A r2 seed 20260830: prompt 309c685184ab text eec89cc6af7d (gen 689, finish stop)
+  A r2 seed 20260831: prompt b64d4fa9f95e text 1ac58119b2df (gen 879, finish stop)
+  A r3 seed 20260829: prompt 2a91c296733b text ee9993ec5b08 (gen 1024, finish length)
+  A r3 seed 20260830: prompt 309c685184ab text eec89cc6af7d (gen 689, finish stop)
+  A r3 seed 20260831: prompt b64d4fa9f95e text 1ac58119b2df (gen 879, finish stop)
+  C r1 seed 20260829: prompt 2a91c296733b text e3b0c44298fc (gen 1024, finish length)
+  C r1 seed 20260830: prompt 309c685184ab text 577264fea2d7 (gen 566, finish stop)
+  C r1 seed 20260831: prompt b64d4fa9f95e text e3b0c44298fc (gen 1024, finish length)
+  C r2 seed 20260829: prompt 2a91c296733b text e3b0c44298fc (gen 1024, finish length)
+  C r2 seed 20260830: prompt 309c685184ab text 577264fea2d7 (gen 566, finish stop)
+  C r2 seed 20260831: prompt b64d4fa9f95e text e3b0c44298fc (gen 1024, finish length)
+  C r3 seed 20260829: prompt 2a91c296733b text e3b0c44298fc (gen 1024, finish length)
+  C r3 seed 20260830: prompt 309c685184ab text 577264fea2d7 (gen 566, finish stop)
+  C r3 seed 20260831: prompt b64d4fa9f95e text e3b0c44298fc (gen 1024, finish length)

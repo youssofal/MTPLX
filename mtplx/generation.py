@@ -308,11 +308,13 @@ def _env_falsey(name: str) -> bool:
     }
 
 
-# MTPLX_QWEN4_DRAFT_K20_PRESCATTER -- read ONCE at import (in
-# ``mtplx.qwen4_draft_k20_prescatter``), default OFF.  When off this constant
-# is False, no plan is claimed, `_draft_k20_prescatter_plan` stays None, and
-# the one draft-read site below is behind `is not None`, so the retained stock
-# lane runs the code it ran before this module existed.
+# MTPLX_QWEN4_DRAFT_K20_PRESCATTER -- read AT USE via
+# ``_qwen4_draft_k20_prescatter_enabled()`` (see mtplx.qwen4_draft_k20_prescatter),
+# default OFF, NOT frozen at import. The server's fixed-M4 auto-arm stamps this
+# key AFTER this module is imported, so a module-level constant read here froze
+# the default and the served lane never engaged (arming audit 2026-09-07). When
+# off the claim below (behind `is not None`) is never built, so the retained
+# stock lane runs the code it ran before this module existed.
 #
 # When on (and the request is eligible -- the claim RAISES rather than falling
 # back) each draft step builds its K20 support from the FR-Spec head's 65,536
@@ -320,21 +322,19 @@ def _env_falsey(name: str) -> bool:
 # 65,536-lane `argpartition` and `logsumexp` instead of 248,320-lane ones, and
 # the same `(ids, probs)` support because the ranked id table is strictly
 # ascending.  See that module's docstring for the exactness argument.
-_QWEN4_DRAFT_K20_PRESCATTER = _qwen4_draft_k20_prescatter_enabled()
-
-# MTPLX_QWEN4_BLOCK_VERIFY -- read ONCE at import (in
-# ``mtplx.qwen4_block_verify``), default OFF.  When off this constant is False,
-# no verifier is built, and the stock accept loop evaluates exactly the
-# expressions it evaluated before -- same acceptance probability, same
-# residual, same uniforms, same order.  When on, the loop runs block
-# verification (Sun et al. 2024, arXiv:2403.10444) instead of the per-token
-# Leviathan-Chen law: it clips the RUNNING reach product at 1 rather than
-# clipping each factor, water-fills the resulting budget across the depth d+1
-# draft support, and corrects from the SCALED residual (c*p - q)+.  Both laws
-# are exact samplers of the same target distribution; BV accepts deeper more
-# often (+1.85% tokens/window measured offline on 381 real windows) and draws
-# exactly the same number of uniforms.  See ``mtplx/qwen4_block_verify.py``.
-_QWEN4_BLOCK_VERIFY = _qwen4_block_verify_enabled()
+#
+# MTPLX_QWEN4_BLOCK_VERIFY -- likewise read AT USE via
+# ``_qwen4_block_verify_enabled()`` (see mtplx.qwen4_block_verify), default OFF,
+# NOT frozen at import (same served-arming reason). The env is frozen once
+# serving starts, so the accept loop reads the same value at every step. When
+# on, the loop runs block verification (Sun et al. 2024, arXiv:2403.10444)
+# instead of the per-token Leviathan-Chen law: it clips the RUNNING reach
+# product at 1 rather than clipping each factor, water-fills the resulting
+# budget across the depth d+1 draft support, and corrects from the SCALED
+# residual (c*p - q)+.  Both laws are exact samplers of the same target
+# distribution; BV accepts deeper more often (+1.85% tokens/window measured
+# offline on 381 real windows) and draws exactly the same number of uniforms.
+# See ``mtplx/qwen4_block_verify.py``.
 
 def _family_capture_commit_enabled() -> bool:
     """qwen4_exp layer-owned capture-commit (``MTPLX_FAMILY_CAPTURE_COMMIT``).
@@ -2493,6 +2493,8 @@ class GenerationStats:
     runtime_mtp_enabled: bool = False
     draft_head_installed: bool | None = None
     ar_return_hidden: bool = False
+    ar_pipeline_active: bool = False
+    ar_pipeline_variant: str = ""
     forward_ar_hidden_calls: int = 0
     forward_ar_plain_calls: int = 0
     mtp_forward_calls: int = 0
@@ -5210,39 +5212,6 @@ def _sample_from_logits(
     return sample_from_distribution(probs, rng), probs
 
 
-def _mx_lazy_sample(row: mx.array, config: SamplerConfig, key: mx.array) -> mx.array:
-    """Device-side shaped sampling (temp -> top-k -> top-p -> categorical)
-    returning a LAZY scalar token array — the pipelined-AR lane's sampler.
-
-    Shaping is distribution-identical to the CPU sampler; the randomness
-    stream is mx.random keyed from the request seed instead of the numpy
-    generator, so runs stay deterministic per seed but the streams differ.
-    Callers gate on temperature > 0 and 1 < top_k < vocab.
-
-    The top-k selection runs on the model dtype (half the bytes over the
-    248k vocab); only the k survivors are cast to fp32 for temperature,
-    top-p and the draw — bf16 argpartition ranks by value exactly.
-    """
-    k = int(config.top_k or 0)
-    top_idx = mx.argpartition(-row, kth=k - 1)[:k]
-    logits = mx.take(row, top_idx).astype(mx.float32) * (
-        1.0 / max(float(config.temperature), 1e-6)
-    )
-    top_vals = logits
-    top_p = float(config.top_p or 1.0)
-    if 0.0 < top_p < 1.0:
-        order = mx.argsort(-top_vals)
-        sv = mx.take(top_vals, order)
-        sp = mx.softmax(sv)
-        # nucleus keep-rule incl. the first probability that crosses top_p
-        keep_n = mx.maximum(mx.sum((mx.cumsum(sp) - sp) < top_p), 1)
-        sv = mx.where(mx.arange(k) < keep_n, sv, mx.array(float("-inf")))
-        local = mx.random.categorical(sv[None], key=key)[0]
-        return mx.take(top_idx, mx.take(order, local))
-    local = mx.random.categorical(top_vals[None], key=key)[0]
-    return mx.take(top_idx, local)
-
-
 def _greedy_draft_token_and_top_values(
     logits: mx.array,
     *,
@@ -6855,21 +6824,25 @@ def generate_ar(
     ) or bool(os.environ.get("MTPLX_EVAL_AUDIT"))
 
     # ---- Pipelined AR lane (MTPLX_AR_PIPELINE) ---------------------------
-    # Software pipeline over the decode stream: sampling runs INSIDE the lazy
-    # graph (_mx_lazy_sample), so step k+1's graph is built on step k's
-    # still-lazy sampled token while the GPU executes step k. A token's KV is
-    # only ever written by the forward that consumes it, and only committed
-    # tokens are consumed — the cache never runs ahead of the committed
-    # sequence, so there is no rollback machinery. Guards observe at commit
+    # Software pipeline over the decode stream. Step k+1's graph is built on a
+    # native mutable token leaf while the GPU executes step k. The original
+    # CPU sampler then materializes step k with the request's NumPy RNG, fills
+    # that leaf, and submits its already-built consumer. This preserves the
+    # classic sampler arithmetic and random stream exactly while overlapping
+    # graph construction. A token's KV is written only by the forward that
+    # consumes it, so the cache never needs rollback. Guards observe at commit
     # (lag <= 1 step); when one arms, the lane drains into the classic loop
     # with its exact entry invariant (logits row + cache both at the last
-    # committed token). Engages only on models that publish
-    # set_ar_pipeline_mode (qwen4_exp: staging off + in-graph mmap gathers).
+    # committed token).
     _lane_committed = 0
     _lane_finished = False
     _lane_cache_has_final = False
     _lane_final_row: mx.array | None = None
     _lane_mode_off = None
+    _lane_flush_ple = None
+    _lane_discard_ple = None
+    _lane_make_token = None
+    _lane_variant = ""
     if (
         _env_truthy("MTPLX_AR_PIPELINE")
         and constraint is None
@@ -6882,10 +6855,24 @@ def generate_ar(
         _set_lane_mode = getattr(rt.model, "set_ar_pipeline_mode", None)
         if callable(_set_lane_mode) and _set_lane_mode(True):
             _lane_mode_off = _set_lane_mode
+            _lane_flush_ple = getattr(rt.model, "flush_ar_pipeline_ple", None)
+            _lane_discard_ple = getattr(rt.model, "discard_ar_pipeline_ple", None)
+            _lane_make_token = getattr(rt.model, "make_ar_pipeline_token", None)
+            if (
+                not callable(_lane_flush_ple)
+                or not callable(_lane_discard_ple)
+                or not callable(_lane_make_token)
+            ):
+                _set_lane_mode(False)
+                raise RuntimeError(
+                    "pipelined AR model must provide token and PLE flush/discard hooks"
+                )
+            _lane_variant = str(
+                getattr(rt.model, "_ar_pipeline_variant", "unknown")
+            )
     if _lane_mode_off is not None:
         try:
             events.append({"ar_pipeline": True})
-            _lane_key = mx.random.key(int(seed) & 0x7FFFFFFF)
             token, _ = _sample_from_logits(logits[0], sampler, rng)
             tokens.append(token)
             emit_token(token)
@@ -6895,27 +6882,28 @@ def generate_ar(
                 _lane_finished = True
             else:
 
-                def _lane_step(tok_lazy: mx.array) -> tuple[mx.array, mx.array]:
-                    nonlocal _lane_key
-                    _lane_key, sub = mx.random.split(_lane_key)
+                def _lane_forward(token_array: mx.array) -> mx.array:
                     with attention_phase("ar_decode"):
-                        out = rt.forward_ar(tok_lazy.reshape(1, 1), cache=cache)
-                    row = out[:, -1, :]
-                    nxt = _mx_lazy_sample(row[0], sampler, sub)
-                    return row, nxt
+                        out = rt.forward_ar(token_array.reshape(1, 1), cache=cache)
+                    return out[:, -1, :]
 
                 started = time.perf_counter()
-                row_lazy, tok_lazy = _lane_step(mx.array([token]))
-                mx.async_eval(tok_lazy)
+                row_current = _lane_forward(mx.array([token]))
                 target_forward_graph_time += time.perf_counter() - started
+                _lane_flush_ple()
+                mx.async_eval(row_current)
                 while True:
                     built = time.perf_counter()
-                    row_next, tok_next = _lane_step(tok_lazy)
-                    mx.async_eval(tok_next)
+                    token_handle = _lane_make_token()
+                    token_leaf = token_handle.array()
+                    row_next = _lane_forward(token_leaf)
                     build_elapsed = time.perf_counter() - built
                     target_forward_graph_time += build_elapsed
                     waited = time.perf_counter()
-                    v = int(tok_lazy.item())
+                    v, _ = _sample_from_logits(row_current[0], sampler, rng)
+                    token_handle.fill(v)
+                    _lane_flush_ple()
+                    mx.async_eval(row_next)
                     wait_elapsed = time.perf_counter() - waited
                     target_eval_time += wait_elapsed
                     target_decode_time += build_elapsed + wait_elapsed
@@ -6981,7 +6969,7 @@ def generate_ar(
                         _eval(row_next)
                         logits = row_next
                         break
-                    row_lazy, tok_lazy = row_next, tok_next
+                    row_current = row_next
             if _env_truthy("MTPLX_AR_PIPELINE_DEBUG") and _lane_committed > 1:
                 n = max(_lane_committed - 1, 1)
                 print(
@@ -6990,6 +6978,9 @@ def generate_ar(
                     f"per-step={target_decode_time / n * 1e3:.2f}ms",
                     flush=True,
                 )
+        except BaseException:
+            _lane_discard_ple()
+            raise
         finally:
             _lane_mode_off(False)
 
@@ -7198,6 +7189,8 @@ def generate_ar(
             )
         ),
         target_forward_time_s=prompt_eval_time + target_decode_time,
+        ar_pipeline_active=_lane_mode_off is not None,
+        ar_pipeline_variant=_lane_variant,
         prompt_eval_time_s=prompt_eval_time,
         prompt_tps=(
             prompt_state.suffix_tokens / prompt_eval_time
@@ -9953,7 +9946,7 @@ def generate_mtpk(
     # both are passed as absent.
     _draft_k20_prescatter_plan = None
     _draft_k20_prescatter_receipt: dict[str, object] = {"installed": False}
-    if _QWEN4_DRAFT_K20_PRESCATTER:
+    if _qwen4_draft_k20_prescatter_enabled():
         _draft_k20_prescatter_plan = _qwen4_draft_k20_prescatter_claim(
             rt,
             greedy_chain_enabled=_greedy_chain_eligible,
@@ -12194,7 +12187,7 @@ def generate_mtpk(
         _host_accept_drafts = draft_tokens
         _bv = None
         if (
-            _QWEN4_BLOCK_VERIFY
+            _qwen4_block_verify_enabled()
             and _host_accept_drafts
             and sampler.temperature > 0
             and target_prefix_tokens is None

@@ -1,0 +1,6 @@
+include CMakeLists.txt
+include *.cpp
+include *.h
+include pyproject.toml
+include setup.py
+recursive-include mtplx_native_ple_cpu_rows *.py

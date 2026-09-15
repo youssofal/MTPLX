@@ -61,7 +61,15 @@ from mlx_lm.models.qwen3_next import (
 )
 
 from mtplx.attention_context import current_attention_phase
-from mtplx.runtime_options import qwen4_opdiet_enabled, qwen4_verify_glue_enabled
+from mtplx.runtime_options import (
+    qsa_sparse_decode_enabled,
+    qwen4_hc_m4_enabled,
+    qwen4_opdiet_enabled,
+    qwen4_verify_glue_enabled,
+)
+# Verify-width shared between the model and the split-K decode lane so a
+# selection width and the kernel's own contract cannot drift apart.
+from mtplx.kernels.qsa_sparse_decode import VERIFY_ROWS as _SPARSE_VERIFY_ROWS
 
 
 @dataclass
@@ -861,6 +869,111 @@ class GatedResidual(nn.Module):
         self.input_mix_weight_up = nn.Linear(args.hc_lowrank, hc_hidden, bias=False)
         if use_combine:
             self.block_inject_weight = nn.Linear(hc_hidden, self.hc_count, bias=False)
+        # Construction-time half of the MTPLX_QWEN4_HC_M4 eligibility check:
+        # the config-level geometry the kernel hardcodes is knowable now, so a
+        # mis-armed flag fails at model build rather than mid-forward. The
+        # weight-level half (dtype, quantization, shapes) needs loaded weights
+        # and runs on the first verify-width read.
+        if qwen4_hc_m4_enabled() and (
+            self.hc_count != 4 or self.hidden_size != 2560
+        ):
+            raise RuntimeError(
+                "MTPLX_QWEN4_HC_M4 is armed but this GatedResidual is not the "
+                f"Flash-Next family shape: hc_count={self.hc_count} (want 4), "
+                f"hidden_size={self.hidden_size} (want 2560). Unset the flag "
+                "for this model; the kernel has no other geometry."
+            )
+
+    def validate_hc_m4_pack(self, label: str = "GatedResidual") -> None:
+        """The PACK half of the MTPLX_QWEN4_HC_M4 contract, at install time.
+
+        Everything here is a property of the loaded weights, so it is the same
+        answer for every request this process will ever serve.  Checking it
+        when the weights land (``install_hc_m4_pack_validation``, called from
+        the runtime's qwen4 install section) means a mis-armed flag stops the
+        server coming up with a precise reason, instead of turning the first
+        request that reaches verify width into an HTTP 500.
+
+        Not checked here: the weight/activation dtype agreement, which needs
+        an activation -- ``_hc_m4_applies`` still checks it, and it is likewise
+        process-invariant, so it cannot single out one request either.
+        """
+
+        from mtplx.kernels import qwen4_m4_hyper_read as hcm4
+
+        down = self.input_mix_weight_down
+        up = self.input_mix_weight_up
+        for name, proj in (
+            ("input_mix_weight_down", down),
+            ("input_mix_weight_up", up),
+        ):
+            if hasattr(proj, "scales"):
+                raise RuntimeError(
+                    f"MTPLX_QWEN4_HC_M4: {label}.{name} is quantized; the "
+                    "kernel reads unquantized bf16 mix weights. Unset the "
+                    "flag for this pack."
+                )
+        wi = self.block_inject_weight.weight if "block_inject_weight" in self else None
+        try:
+            hcm4.check_weight_shapes(
+                self.hc_norm.weight, down.weight, up.weight, wi
+            )
+        except ValueError as exc:
+            raise RuntimeError(f"MTPLX_QWEN4_HC_M4: {label}: {exc}") from exc
+
+    def _hc_m4_applies(self, hyper_input: mx.array) -> bool:
+        """Verify-width fused read gate (MTPLX_QWEN4_HC_M4).
+
+        Rows 2..8 only -- rows == 1 keeps whatever the draft path already
+        uses (v3, or the eager chain).  The row count is the one REQUEST-shaped
+        term here and it routes (returns False) rather than raising; every
+        other term is a property of the pack, re-checked here but already
+        settled at install by :meth:`validate_hc_m4_pack`.
+        """
+
+        if not qwen4_hc_m4_enabled():
+            return False
+        from mtplx.kernels import qwen4_m4_hyper_read as hcm4
+
+        rows = 1
+        for s in hyper_input.shape[:-1]:
+            rows *= s
+        if rows < hcm4.MIN_ROWS or rows > hcm4.MAX_ROWS:
+            return False
+        down = self.input_mix_weight_down
+        up = self.input_mix_weight_up
+        for name, proj in (("input_mix_weight_down", down), ("input_mix_weight_up", up)):
+            if hasattr(proj, "scales"):
+                raise RuntimeError(
+                    f"MTPLX_QWEN4_HC_M4: {name} is quantized; the kernel reads "
+                    "unquantized bf16 mix weights. Unset the flag for this pack."
+                )
+        wi = self.block_inject_weight.weight if "block_inject_weight" in self else None
+        # Raises with the offending shape/dtype named. Takes the unreshaped
+        # hyper state so validation adds no node to the traced graph.
+        hcm4.check_shapes(
+            hyper_input, self.hc_norm.weight, down.weight, up.weight, wi
+        )
+        return True
+
+    def _hc_m4_read(self, hyper_input: mx.array):
+        from mtplx.kernels.qwen4_m4_hyper_read import fused_hc_read_m4
+
+        combine = "block_inject_weight" in self
+        x2 = hyper_input.reshape(-1, self.hc_count * self.hidden_size)
+        mixed, inject = fused_hc_read_m4(
+            x2,
+            self.hc_norm.weight,
+            self.input_mix_weight_down.weight,
+            self.input_mix_weight_up.weight,
+            self.block_inject_weight.weight if combine else None,
+            eps=float(self.hc_norm.eps),
+        )
+        mixed = mixed.reshape(*hyper_input.shape[:-1], self.hidden_size)
+        if not combine:
+            return mixed
+        inject = inject.reshape(*hyper_input.shape[:-1], self.hc_count)
+        return mixed, hyper_input, inject
 
     def _fused_read_applies(self, hyper_input: mx.array) -> bool:
         # The fused kernel hardcodes the family geometry and reads bf16
@@ -910,6 +1023,12 @@ class GatedResidual(nn.Module):
         return True
 
     def __call__(self, hyper_input: mx.array):
+        # Verify-width (2..8 rows) fused read first: it is the only one of the
+        # three fused paths laid out as a multi-threadgroup GEMV, and it is
+        # gated to widths the others handle badly (the (1024, S, 1) v1 kernel
+        # re-reads every weight once per row and runs 4 threadgroups at S=4).
+        if self._hc_m4_applies(hyper_input):
+            return self._hc_m4_read(hyper_input)
         if self._v3_read_applies(hyper_input):
             from mtplx.kernels.hyper_connection_v3 import fused_hyper_read_v3
 
@@ -950,18 +1069,72 @@ class GatedResidual(nn.Module):
 
 
 
-def _named_gated_residuals(owner: Any):
-    """``(attribute name, module)`` for every GatedResidual ``owner`` holds."""
+def install_hc_m4_pack_validation(model: Any) -> dict[str, Any]:
+    """Validate every ``GatedResidual`` against the MTPLX_QWEN4_HC_M4 contract.
 
-    for name in dir(owner):
-        if name.startswith("__"):
-            continue
-        try:
-            value = getattr(owner, name)
-        except Exception:  # pragma: no cover - defensive: properties may raise
-            continue
-        if isinstance(value, GatedResidual):
-            yield name, value
+    Called from the runtime's qwen4 install section once the weights are
+    loaded.  A no-op (``{"armed": False}``) when the flag is off, so an
+    unarmed process pays one attribute read.
+
+    This is the INSTALL-time half of the flag's contract.  Every property it
+    checks -- quantized mix weights, weight shapes -- belongs to the pack, so
+    a failure means the flag was armed for a model the kernel cannot read.
+    That is a deployment error and it should stop the server, not fail
+    whichever request first reaches verify width.
+
+    Discovery goes through :func:`_named_gated_residuals`, which walks the
+    model the way MLX itself does.  The first cut of this function walked
+    ``dir(layer)`` instead and found NOTHING on the real pack -- an
+    ``nn.Module``'s children live in its dict and are served by
+    ``__getattr__``, so ``dir()`` does not list them -- which turned an armed
+    flag into a dead server (2026-09-02, both the HumanEval screen and the
+    ABBA lane).  Never enumerate an MLX module with ``dir()``.
+    """
+
+    if not qwen4_hc_m4_enabled():
+        return {"armed": False, "validated": 0}
+
+    validated = 0
+    for path, module in _named_gated_residuals(model):
+        module.validate_hc_m4_pack(path)
+        validated += 1
+    if not validated:
+        raise RuntimeError(
+            "MTPLX_QWEN4_HC_M4 is armed but no GatedResidual hyper-connection "
+            "module was found anywhere in "
+            f"{type(model).__name__}.named_modules(); the flag cannot do "
+            "anything here. Unset it for this model."
+        )
+    return {"armed": True, "validated": validated}
+
+
+def _named_gated_residuals(model: Any):
+    """``(dotted path, module)`` for every GatedResidual in ``model``.
+
+    ``nn.Module.named_modules`` is the model's OWN traversal -- the one that
+    finds its parameters -- so it reaches children held directly
+    (``model.hyper_connection_mixer``), inside lists (``model.layers[i]
+    .attn_hyper_connection``) and behind a published sub-tree
+    (``language_model.mtp.hyper_connection_mixer``) alike.  If the forward can
+    reach a module, this finds it.
+
+    Sorted by path so the failure message names layers in a stable order
+    rather than MLX's dict order.
+    """
+
+    named = getattr(model, "named_modules", None)
+    if named is None:  # pragma: no cover - every qwen4 model is an nn.Module
+        raise RuntimeError(
+            "MTPLX_QWEN4_HC_M4 pack validation needs an mlx.nn.Module; got "
+            f"{type(model).__name__}"
+        )
+    found = [
+        (path, module)
+        for path, module in named()
+        if isinstance(module, GatedResidual)
+    ]
+    found.sort(key=lambda item: item[0])
+    return found
 
 
 class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
@@ -1747,6 +1920,412 @@ def _qsa_prefill_gather_tile_rows() -> int:
         return 64
 
 
+def _prefill_mask_fuse_enabled() -> bool:
+    """MTPLX_QWEN4_PREFILL_MASK_FUSE: ask MLX for the fused masked SDPA.
+
+    (Old name ``MTPLX_FABLE_PREFILL_MASK_FUSE`` still works as an alias.)
+
+
+    At ``head_dim`` 256 MLX's own heuristic
+    (``ScaledDotProductAttention::use_fallback``) refuses the fused steel
+    attention kernel and takes the unfused route: QK^T into a materialized
+    ``[H, S, T]`` bf16 tensor, ``mx.where`` against the bool mask, softmax,
+    then P@V.  The census confirms it -- ``steel_attention`` appears **zero**
+    times in 2.1 M dispatches, while ``g2_Selectbfloat16`` runs at grids
+    ``2048 x T`` for every QSA layer of every chunk (337 ms of pure mask
+    apply at 687 GB/s, on a 1.61 GB transient at the last chunk).
+
+    There is nothing to fuse by hand: the unfused route is MLX's C++
+    fallback lambda, and swapping the bool mask for an additive one only
+    turns the ``where`` into an ``add`` over the same bytes.  What MLX 0.32
+    added instead is ``force_fused=True``, whose own docs say it "would
+    result in slower kernel getting used but can reduce memory
+    consumption" -- and the shipped metallib does carry
+    ``steel_attention_bfloat16_bq32_bk16_bd256_wm4_wn1_maskbool_``.  So the
+    exact-visible-set fused kernel exists at this geometry; only the
+    heuristic declines it.
+
+    Two arms ride this one flag, both fused, chosen by what the indexer
+    returned:
+
+    * **causal** -- no selection came back, so every key a row can see IS
+      visible.  Nothing is built: the string ``"causal"`` goes to MLX, whose
+      lower-right alignment matches this lane's ``[1, 1, S, T]`` mask exactly
+      when ``T == pos_start + S`` (see ``_prefill_causal_mask_is_exact``).
+      This is the regime below the indexer's own budget --
+      ``T <= (block_topk + 1) * ratio - 1``, i.e. 2,051 tokens on the
+      production pack -- plus vision requests, where QSA is bypassed.  With
+      the retained 4,096-token prefill width it therefore fires for NO chunk
+      of a 16K or 32K prompt; the win at those cells is entirely the bool
+      arm below.
+    * **bool** -- a real top-k selection, which no string can express; the
+      array is handed to the fused kernel untouched.
+
+    Off by default: it trades a materialized score tensor (and its mask
+    apply and softmax passes) for a flash kernel at a head dimension MLX
+    considers unfavourable.  It is also NOT bit-identical -- online softmax
+    reassociates the same visible set -- so it is a quality-gated arm.
+
+    Counters (``MTPLX_QSA_PREFILL_DEBUG=1``): ``mask_causal_eligible`` (the
+    lane saw an exactly-causal visible set, flag-independent),
+    ``mask_fuse_causal``, ``mask_fuse_bool``, ``mask_fuse_unavailable``
+    (one per SHAPE CLASS this MLX has no fused kernel for -- see
+    :data:`_PREFILL_MASK_FUSE_UNAVAILABLE`; it is NOT a process-wide
+    disarm), and ``mask_fuse_dense_causal`` / ``mask_fuse_dense_bool``
+    (calls sent to the dense route because their own class was refused,
+    while every other class stays fused).  A serving process runs without
+    that debug flag, so the first class MLX fuses also prints one
+    ``engaged:`` line -- the absence of a refusal is not a receipt.
+    """
+
+    # Read at USE, never frozen at import: the server's fixed-M4 auto-arm
+    # stamps this key into the environment after the module is imported, so an
+    # import-time freeze would miss the stamp (the arming-ordering class the
+    # battery caught). The read is one dict lookup, and it is only reached on
+    # the prefill path. The renamed key wins when set to any non-empty value
+    # (including "0" for the per-key opt-out); the old
+    # MTPLX_FABLE_PREFILL_MASK_FUSE name is honoured as an alias only when the
+    # new key is unset.
+    raw = os.environ.get("MTPLX_QWEN4_PREFILL_MASK_FUSE")
+    if raw is None or not str(raw).strip():
+        raw = os.environ.get("MTPLX_FABLE_PREFILL_MASK_FUSE")
+    raw = (raw or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+#: MLX's only string mask mode.  ``mx.fast.scaled_dot_product_attention``
+#: documents the alignment in MLX 0.32.2 itself (``mlx/core/fast.pyi``):
+#: *"The ``causal`` mask uses lower-right alignment where the last query
+#: aligns with the last key."*  That is exactly the offset case this lane
+#: needs -- chunk k carries ``pos_start`` keys of prior context and ``S``
+#: queries, so its last query IS its last key -- which is why a chunked
+#: prefill can pass the string instead of a ``[1, 1, S, T]`` tensor.
+_CAUSAL_MASK = "causal"
+
+
+def _prefill_causal_mask_is_exact(
+    *, pos_start: int, rows: int, total_keys: int
+) -> bool:
+    """Is the dense mask this lane would build exactly MLX's ``"causal"``?
+
+    The lane builds ``tpos[None, :] <= qpos[:, None]`` over
+    ``qpos = pos_start + arange(S)`` and ``tpos = arange(T)``: query row
+    ``i`` sees keys ``0 .. pos_start + i``.  MLX's lower-right ``"causal"``
+    gives row ``i`` keys ``0 .. T - S + i``.  The two agree for every row
+    iff ``T == pos_start + S`` -- i.e. iff the KV the cache just handed back
+    ends at this chunk's last query.
+
+    That is the normal case (``T`` comes straight out of
+    ``cache.kv.update_and_fetch``), but a cache that returned padded or
+    capacity-shaped keys would break it, and there the dense mask -- which
+    masks the pad columns off -- is the correct one.  Checked, never assumed.
+    """
+
+    return int(rows) > 0 and int(total_keys) == int(pos_start) + int(rows)
+
+
+#: Fused-SDPA capability, keyed by SHAPE CLASS -- never by mask kind alone.
+#:
+#: MLX admits the fused route through two different kernels with two
+#: different rule sets, and it picks between them on the QUERY LENGTH
+#: (``ScaledDotProductAttention::use_fallback``,
+#: ``mlx/backend/metal/scaled_dot_product_attention.cpp``; the installed
+#: 0.32.2 dylib carries exactly these refusal reasons as strings, with the
+#: head-dim sets below):
+#:
+#: * the **full** kernel (``steel_attention``) takes the long query --
+#:   ``query_sequence_length > 8`` -- with a head dim in
+#:   ``{64, 72, 80, 96, 128, 192, 256}`` shared by q and v and, when the
+#:   mask is the causal string, ``q_len <= k_len``;
+#: * the **vector** kernel (``sdpa_vector``) takes the short query --
+#:   ``q_len <= 8`` -- with a head dim in ``{64, 96, 128, 192, 256}``,
+#:   ``q_len <= k_len``, AND ``q_len * gqa_factor <= 32``.
+#:
+#: (The ``> 8`` split is read off MLX's own source; what this key relies on
+#: is only that SOME such split exists, which the served refusal proves --
+#: MLX answered a 5-row query with the VECTOR kernel's reason at a head dim
+#: the full kernel accepts.  ``q_len`` is therefore kept exact below, so the
+#: constant itself is never baked in.)
+#:
+#: This model is 24 q heads over 2 kv heads (GQA 12) at ``head_dim`` 256,
+#: which leaves a DEAD BAND at ``q_len`` 3..8: too long for the vector
+#: kernel (``3 * 12 = 36 > 32``), too short for the full one.  A 4,096-row
+#: prefill chunk is far above the band and IS fused; an MTP verify step (4
+#: rows, 5 with the extra) sits inside it and is not.  Keying availability
+#: by mask kind alone therefore let the FIRST verify step of the process
+#: disarm the flag for every prefill chunk after it -- which is exactly
+#: what the served process did (warmup ladder: verify before any wide
+#: chunk) while the benchmark driver, whose first call IS a wide chunk,
+#: kept the win.  So the capability is keyed by the geometry MLX's own
+#: rules read, and a negative learned at one class says nothing about any
+#: other.
+_PREFILL_MASK_FUSE_UNAVAILABLE: Dict[tuple, bool] = {}
+
+#: Cap on the class table.  Distinct classes are structurally few (mask
+#: kind x chunk width), but a build with no fused kernel at all would learn
+#: one negative per distinct prefill width forever; evicting the oldest
+#: costs one more host-side refusal, never a wrong answer.
+_MASK_FUSE_CLASS_CACHE_MAX = 1024
+
+#: stderr is a shared log, and a build that refuses everything would
+#: otherwise print one line per prefill width for the life of the process.
+_MASK_FUSE_REFUSAL_PRINT_LIMIT = 8
+_MASK_FUSE_REFUSALS_PRINTED = [0]
+
+#: One positive receipt per process, printed by the first class that MLX
+#: actually fuses.  ABSENCE of a refusal line is not evidence of engagement:
+#: the served process printed two refusals (the 4- and 5-row verify steps)
+#: and nothing at all for its chunks, which is exactly the log a process
+#: with the flag unset writes.  A serving process has no
+#: ``MTPLX_QSA_PREFILL_DEBUG`` receipt to fall back on, so it needs this.
+_MASK_FUSE_ENGAGED = [False]
+
+
+def _prefill_mask_fuse_kind(mask) -> str:
+    """``"causal"`` for the string mode, ``"bool"`` for a real selection."""
+
+    return "causal" if isinstance(mask, str) else "bool"
+
+
+def _prefill_mask_fuse_class(kind: str, q, k, v) -> tuple:
+    """The geometry MLX's fused-SDPA admission rules actually read.
+
+    Everything in the tuple appears in one of MLX's own refusal reasons:
+    the query and value head dims, the query length (which selects the
+    kernel and, in the vector kernel, is multiplied by the GQA factor
+    against its 32 cap), the GQA factor, and whether the query is no longer
+    than the key sequence.  ``dtype`` rides along because the fused kernels
+    are per-dtype specialisations.  Two calls with the same class get the
+    same answer from MLX by construction -- which is what makes caching one
+    call's refusal safe for the others in it, and only for those.
+    """
+
+    kv_heads = max(int(k.shape[1]), 1)
+    q_len = int(q.shape[2])
+    return (
+        kind,
+        int(q.shape[-1]),
+        int(v.shape[-1]),
+        str(q.dtype).rsplit(".", 1)[-1],
+        q_len,
+        int(q.shape[1]) // kv_heads,
+        q_len <= int(k.shape[2]),
+    )
+
+
+def _prefill_mask_fuse_class_text(cls: tuple) -> str:
+    """The class as a log line reads it."""
+
+    kind, q_head_dim, v_head_dim, dtype, q_len, gqa, q_fits = cls
+    head_dim = (
+        f"head_dim {q_head_dim}"
+        if q_head_dim == v_head_dim
+        else f"head_dim {q_head_dim} (value {v_head_dim})"
+    )
+    return (
+        f"{kind}-mask q_len {q_len} x GQA {gqa} at {head_dim} {dtype}"
+        + ("" if q_fits else ", query longer than the key sequence")
+    )
+
+
+def _prefill_mask_fuse_announce(cls: tuple) -> None:
+    """Say ONCE, on the first fused call, which shape class engaged."""
+
+    _MASK_FUSE_ENGAGED[0] = True
+    import sys as _sys
+
+    print(
+        "[mtplx] MTPLX_QWEN4_PREFILL_MASK_FUSE engaged: fused SDPA for "
+        f"shape class [{_prefill_mask_fuse_class_text(cls)}]; every other "
+        "shape class is asked on its first call and reported here only if "
+        "it is refused",
+        file=_sys.stderr,
+        flush=True,
+    )
+
+
+def _prefill_mask_fuse_refuse(cls: tuple, exc: BaseException) -> None:
+    """Route ONE shape class to the dense path for the rest of the process.
+
+    Loud, because an armed flag that silently measured the control under a
+    candidate label is the failure this receipt exists to prevent -- but
+    scoped, because the class that refused is usually not the class the
+    lane is armed for.
+    """
+
+    if len(_PREFILL_MASK_FUSE_UNAVAILABLE) >= _MASK_FUSE_CLASS_CACHE_MAX:
+        _PREFILL_MASK_FUSE_UNAVAILABLE.pop(
+            next(iter(_PREFILL_MASK_FUSE_UNAVAILABLE)), None
+        )
+    _PREFILL_MASK_FUSE_UNAVAILABLE[cls] = True
+    _qsa_prefill_count("mask_fuse_unavailable")
+    if _MASK_FUSE_REFUSALS_PRINTED[0] >= _MASK_FUSE_REFUSAL_PRINT_LIMIT:
+        return
+    _MASK_FUSE_REFUSALS_PRINTED[0] += 1
+    import sys as _sys
+
+    tail = (
+        "; further shape-class refusals are counted but not printed"
+        if _MASK_FUSE_REFUSALS_PRINTED[0] == _MASK_FUSE_REFUSAL_PRINT_LIMIT
+        else ""
+    )
+    print(
+        "[mtplx] MTPLX_QWEN4_PREFILL_MASK_FUSE armed but this MLX has no "
+        "fused SDPA for shape class "
+        f"[{_prefill_mask_fuse_class_text(cls)}]; falling back to the "
+        "dense/unfused route for THAT shape class only -- per-class, NOT "
+        "process-wide: every other shape class (a wide prefill chunk "
+        f"included) is still asked and still fused{tail}: {exc}",
+        file=_sys.stderr,
+        flush=True,
+    )
+
+
+def _prefill_mask_fuse_sdpa(q, k, v, *, scale, mask):
+    """Masked SDPA, fused when armed and available, else stock.
+
+    Two arms behind one door:
+
+    * ``mask is _CAUSAL_MASK`` -- the visible set is exactly causal (proved
+      host-side by :func:`_prefill_causal_mask_is_exact`), so no tensor is
+      built at all and MLX generates the mask inside the kernel.
+    * ``mask`` is a bool array -- the real QSA block selection, which no
+      string can express; the fused kernel reads it directly
+      (``steel_attention_..._maskbool_``).
+
+    **Exactness.**  Neither arm is bit-identical to the unfused route, and
+    both are the same rounding class.  The dense path materialises bf16
+    ``QK^T``, applies the mask with ``mx.where``, runs a precise two-pass
+    softmax and contracts ``P@V`` in bf16; the fused kernel streams tiles
+    through an fp32 online softmax and accumulates in fp32.  What is
+    identical is the VISIBLE SET -- causal-string and dense-causal mask
+    admit the same keys per row by construction, and the bool arm passes the
+    selection through untouched -- so this is reassociation of the same sum,
+    not an approximation, and it is gated by the agreement screen rather
+    than by a bit-parity assert.
+    """
+
+    kind = _prefill_mask_fuse_kind(mask)
+    if (
+        mask is not None
+        # Prefill only. At S == 1 MLX already fuses (head_dim 256 IS in the
+        # sdpa_VECTOR supported set); the fallback this flag exists to
+        # replace is the S > 1 one.
+        and int(q.shape[2]) > 1
+        and _prefill_mask_fuse_enabled()
+    ):
+        # The capability question is asked AT THE CALL, with the call's own
+        # operands -- there is no synthetic stand-in that can be wrong about
+        # the geometry, because it IS the geometry.  ``force_fused=True`` is
+        # resolved while the op is BUILT (no encoder is opened, nothing is
+        # evaluated), so a class MLX refuses costs one host-side raise, once,
+        # and never a dispatch.  The answer is then bound to that shape class
+        # alone: the hot lane never retries a class it has been refused, and
+        # a refusal at one class never touches another.
+        cls = _prefill_mask_fuse_class(kind, q, k, v)
+        if not _PREFILL_MASK_FUSE_UNAVAILABLE.get(cls, False):
+            try:
+                out = mx.fast.scaled_dot_product_attention(
+                    q, k, v, scale=scale, mask=mask, force_fused=True
+                )
+            except Exception as exc:  # no fused kernel for THIS shape class
+                _prefill_mask_fuse_refuse(cls, exc)
+            else:
+                if not _MASK_FUSE_ENGAGED[0]:
+                    _prefill_mask_fuse_announce(cls)
+                _qsa_prefill_count(
+                    "mask_fuse_causal" if kind == "causal" else "mask_fuse_bool"
+                )
+                return out
+        # Armed, and this call still went dense: its own shape class has no
+        # fused kernel in this MLX.  Counted per call so a receipt can tell
+        # "the flag never fired" from "the flag fired for the chunks and not
+        # for the 4-row verify steps".
+        _qsa_prefill_count(
+            "mask_fuse_dense_causal" if kind == "causal" else "mask_fuse_dense_bool"
+        )
+    return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+
+
+def _prefill_qsa_query_tile_rows() -> int:
+    """MTPLX_QSA_PREFILL_QUERY_TILE: rows per attention query tile.
+
+    (Old name ``MTPLX_FABLE_PREFILL_QSA_QUERY_TILE`` still works as an alias.)
+
+    The middle path for a wide prefill chunk.  The 36 GDN layers, the MoE
+    grouped GEMM and every projection want a WIDE chunk (better grouped-GEMM
+    tile occupancy, fewer per-chunk syncs); the 12 dense QSA layers want a
+    NARROW one (their score tensor is ``[H, rows, T]`` and their work term
+    ``rows x T`` grows with the chunk).  Splitting only the attention into
+    query tiles gives both: tile A never reads tile B's keys, so a 4,096-row
+    chunk tiled at 2,048 has exactly the peak AND exactly the
+    ``sum(rows x context)`` of an 8 x 2,048 cut, while everything outside
+    attention still sees 4,096 rows.
+
+    0 (default) = whole chunk, i.e. today's behaviour.
+    """
+
+    from mtplx.qwen4_prefill_chunk import resolve_query_tile_rows
+
+    return resolve_query_tile_rows()
+
+
+def _qsa_dense_attention(q, k, v, *, mask, scale):
+    """Dense masked SDPA, optionally split into query tiles.
+
+    Unarmed (the default) this is one ``_prefill_mask_fuse_sdpa`` call --
+    byte-identical to the code it replaced when the mask-fuse flag is also
+    off.
+
+    Armed, it cuts the chunk's query rows into tiles and truncates each
+    tile's keys to that tile's last visible position.  Rows are independent
+    under attention, and the keys dropped were exactly the ones the mask
+    already set to ``finfo.min`` (whose ``exp`` is a hard zero), so the
+    visible set per row is unchanged.  Reduction order is not: shorter
+    softmax rows and a shorter P@V contraction, the same class of difference
+    as the portable gather tier.
+
+    ``mask`` may also be :data:`_CAUSAL_MASK`, the string mode.  Tiling
+    composes with it without any slicing: ``query_tile_spans`` sets a tile's
+    key bound to ``context_before + row_end``, so the tile's own last query
+    is again its last key and MLX's lower-right ``"causal"`` describes the
+    sub-problem exactly.  The string is therefore passed through unchanged
+    while the K/V slices narrow, which is the whole point -- there is no
+    ``[1, 1, S, T]`` tensor to slice in the first place.
+    """
+
+    S = int(q.shape[2])
+    tile = _prefill_qsa_query_tile_rows() if S > 1 else 0
+    total_keys = int(k.shape[2])
+    causal_string = isinstance(mask, str)
+    if (
+        tile <= 0
+        or tile >= S
+        or mask is None
+        or total_keys < S
+        or (not causal_string and int(mask.shape[-1]) != total_keys)
+    ):
+        return _prefill_mask_fuse_sdpa(q, k, v, scale=scale, mask=mask)
+
+    from mtplx.qwen4_prefill_chunk import query_tile_spans
+
+    spans = query_tile_spans(S, context_before=total_keys - S, tile=tile)
+    if not spans:
+        return _prefill_mask_fuse_sdpa(q, k, v, scale=scale, mask=mask)
+    _qsa_prefill_count("query_tile")
+    parts = [
+        _prefill_mask_fuse_sdpa(
+            q[:, :, r0:r1],
+            k[:, :, :keys],
+            v[:, :, :keys],
+            scale=scale,
+            mask=mask if causal_string else mask[..., r0:r1, :keys],
+        )
+        for r0, r1, keys in spans
+    ]
+    return mx.concatenate(parts, axis=2)
+
+
 def _fused_hc_enabled() -> bool:
     raw = (os.environ.get("MTPLX_FUSED_HC") or "0").strip().lower()
     return raw in {"1", "true", "yes", "on"}
@@ -2419,6 +2998,15 @@ class QSAIndexer(nn.Module):
                 :, nb_total - k_eff :
             ]
 
+        # This selector is what a fixed-capacity verify forward reaches on
+        # the fixed-M4 stack; asking the sparse lane the wrong width here
+        # would make it unreachable (armed flag, installed cache, kernel
+        # never runs). Routing, never failure at the request shape.
+        if self._sparse_decode_route(
+            cache, rows=S, k_eff=k_eff, site="select_eager_verify"
+        ):
+            return ("sparse_blocks", top_idx)
+
         if S > 1 and not fixed_capacity and _qsa_large_prefill_enabled(S, total):
             # Preserve the eager score/top-k expression as an independently
             # selectable oracle while handing attention the compact block set.
@@ -2670,6 +3258,114 @@ class QSAIndexer(nn.Module):
             mx.concatenate([chunk[leaf] for chunk in chunks], axis=0)
             for leaf in range(len(chunks[0]))
         )
+
+    def _sparse_decode_route(
+        self,
+        cache: QSACache,
+        *,
+        rows: int,
+        k_eff: int,
+        site: str,
+    ) -> bool:
+        """True when the native split-K sparse-GQA kernel serves this call.
+
+        Host-only, and read from state the CACHE validated once at install
+        (graphbank ran the contract check and the numerical parity probe
+        there, at model build, outside any mx.compile trace).  The indexer
+        never re-derives the decision, so two traces of the same verify graph
+        cannot disagree about which attention they contain.
+
+        TWO KINDS OF "NO", AND THE 2026-09-02 WINDOW IS WHY THEY ARE SPLIT.
+
+        That window armed MTPLX_QSA_SPARSE_DECODE at 16 K and measured
+        the control on both seeds.  The cause was one silent narrowing: the
+        only call site that could reach the verify width asked this predicate
+        for a width the flag did not arm, so it read a zero row count,
+        returned False, and fell through to the rows-gather lane.  Nothing
+        said so.  So:
+
+        * ROUTING (returns False): the flag is off for this width, or the
+          selection is a width it does not arm -- a 16 K prefill row count is
+          not a 4-row verify.  A growable cache is routing too, and IS
+          recorded in the lane's ``route_declines``: the lane installs on the
+          fixed-capacity compiled-verify cache, so an armed run that only ever
+          saw growable caches has a readable cause in its receipt rather than
+          a silent zero.
+        * FAILURE (raises): the flag is armed, this IS the width it arms, and
+          the cache is the one it installs on -- but the geometry or the
+          budget does not match.  An armed flag that reverts here would make
+          the arm measure the stock chain again.
+
+        ``site`` names the call site in the receipt.
+        """
+
+        # The unarmed path is ONE cached-bool test: this predicate runs once
+        # per QSA layer per forward, and a decode cycle that pays for a flag
+        # nobody armed is a cost with no lever.
+        if not qsa_sparse_decode_enabled():
+            return False
+        if int(rows) != int(_SPARSE_VERIFY_ROWS):
+            return False
+
+        from mtplx.kernels import qsa_sparse_decode as _qsa_sparse
+
+        if not bool(getattr(cache, "fixed_capacity", False)):
+            # The lane's install probe needs the materialized fixed bank, so a
+            # growable cache never carried it.  Construction owns this gate:
+            # TensorOffsetQSACache.__init__ raises when the flag is armed and
+            # the cache was built without the lane.
+            _qsa_sparse.note_route_decline(f"{site}: growable cache")
+            return False
+        attribute = "qsa_sparse_decode_rows"
+        wired = int(getattr(cache, attribute, 0))
+        lane = "MTPLX_QSA_SPARSE_DECODE"
+        if wired <= 0:
+            raise RuntimeError(
+                f"{lane} is armed and this is its {int(rows)}-row width, but "
+                f"the fixed QSA cache carries {attribute}={wired}: it was "
+                "built without the lane, or the install probe disabled it"
+            )
+        if int(rows) != wired:
+            raise RuntimeError(
+                f"{lane} bound {wired} rows but this selection is "
+                f"{int(rows)}; the cache and the module disagree about the "
+                "width the kernel serves"
+            )
+        if int(self.ratio) != 4 or int(self.block_topk) != 512:
+            raise RuntimeError(
+                f"{lane} is wired for the ratio-4 top-512 QSA geometry the "
+                f"metallib is instantiated for; got ratio={int(self.ratio)}, "
+                f"block_topk={int(self.block_topk)}"
+            )
+        # REQUEST SHAPE -- routing, never failure, and this is the LAST point
+        # at which the stock chain is still reachable: once the selection
+        # returns ("sparse_blocks", top_idx) the rows-gather token list was
+        # never built and attention has nothing to fall back to.
+        #
+        # ``total_tokens`` is read from the K/V BACKING, because that is what
+        # the attention call site passes: ``update_and_fetch`` returns the
+        # whole fixed bank, so its ``T`` is the capacity, not the logical
+        # context. A 1,024-token prompt in a 2,048-token bank has a FULL
+        # 512-block budget (k_eff == 512) and a context that has not crossed
+        # the kernel's dense/sparse boundary -- two different questions, and
+        # asking only the budget one took the 1 K served cell down on
+        # 2026-09-02 with an HTTP 500 from inside the kernel wrapper.
+        backing = getattr(cache.kv, "keys", None)
+        total_tokens = 0 if backing is None else int(backing.shape[2])
+        decline = _qsa_sparse.context_decline(
+            total_tokens=total_tokens,
+            rows=int(rows),
+            k_eff=int(k_eff),
+            capacity=total_tokens,
+        )
+        if decline is not None:
+            # Counted, never printed: once per QSA layer per request.
+            _qsa_sparse.note_request_decline(
+                site, decline, total_tokens=total_tokens, blocks=int(k_eff)
+            )
+            return False
+        _qsa_sparse.note_route_hit(site)
+        return True
 
     def _verify_glue_rope_idx(self) -> bool:
         """True when ``MTPLX_QWEN4_VERIFY_GLUE``'s ``qsa_rope_idx`` serves.
@@ -3459,6 +4155,14 @@ def _qsa_blocks_to_dense_mask(
     return ((token_selected | tail) & causal)[None, None]
 
 
+def _sparse_route_snapshot():
+    """``qsa_sparse_decode.route_snapshot()``, imported only when armed."""
+
+    from mtplx.kernels import qsa_sparse_decode as _qsa_sparse
+
+    return _qsa_sparse.route_snapshot()
+
+
 class Attention(nn.Module):
     """Gated GQA (qwen3_5 style: double-width q_proj, sigmoid output gate,
     per-head q/k RMSNorm, partial rotary) masked by the QSA indexer."""
@@ -3503,6 +4207,64 @@ class Attention(nn.Module):
             else None
         )
 
+    def _sparse_decode_required(self, cache: QSACache, rows: int) -> bool:
+        """True when the armed split-K lane MUST have served this selection.
+
+        Narrow on purpose, and every narrowing is a place the lane genuinely
+        cannot be: no indexer at all (a dense layer), a growable cache (the
+        lane installs on the fixed-capacity compiled-verify cache, and
+        construction owns that gate), or a width this process did not arm.
+        Everything else is the contract, and failing it is fatal -- see the
+        call site in ``__call__``.
+        """
+
+        if self.indexer is None:
+            return False
+        rows = int(rows)
+        if rows != _SPARSE_VERIFY_ROWS:
+            return False
+        if not qsa_sparse_decode_enabled():
+            return False
+        return bool(getattr(cache, "fixed_capacity", False))
+
+    def _require_sparse_decode_lane(self, sel_mask, *, rows: int, before) -> None:
+        """The armed lane is IN this graph, or this forward legitimately isn't.
+
+        The trace-time proof.  Every ``sel_mask`` branch below is a
+        DIFFERENT attention, and the 2026-09-02 window took one of them
+        (rows-gather) for 394 cycles with the flag armed and nothing saying
+        so.  The selection is decided in this Python body, which under
+        ``mx.compile`` runs at TRACE time, so this raises while the graph is
+        being built rather than after a window.
+
+        TWO ways to pass.  The selection is ``sparse_blocks``; or the indexer
+        declined for this request's own SHAPE -- context length, row count,
+        block budget -- where the kernel has no analogue and the stock chain
+        is the correct lane (see ``qsa_sparse_decode.context_decline``).  A
+        servable forward that got any other lane still raises -- that is the
+        armed-but-inert failure this guard exists for.
+        """
+
+        if isinstance(sel_mask, tuple) and sel_mask and sel_mask[0] == "sparse_blocks":
+            return
+        from mtplx.kernels import qsa_sparse_decode as _qsa_sparse
+
+        now = _qsa_sparse.route_snapshot()
+        if now["request_declines"] > int(before["request_declines"]):
+            return
+        lane = "MTPLX_QSA_SPARSE_DECODE"
+        took = (
+            sel_mask[0]
+            if isinstance(sel_mask, tuple) and sel_mask
+            else ("dense_mask" if sel_mask is not None else "no_selection")
+        )
+        raise RuntimeError(
+            f"{lane} is armed and this is its {int(rows)}-row width on a "
+            "fixed QSA cache whose shape the lane can serve, but the indexer "
+            f"handed attention the {took!r} lane: the split-K kernel is not "
+            "in this graph and the arm would replay the stock chain"
+        )
+
     def _verify_glue_rope(self, rows: int) -> bool:
         """True when ``MTPLX_QWEN4_VERIFY_GLUE``'s ``qsa_rope`` serves this call.
 
@@ -3524,6 +4286,13 @@ class Attention(nn.Module):
         B, S, _ = x.shape
         pos_start = cache.offset
         vrope = vision_rope_state()
+        # The armed split-K lane's per-layer proof, sampled BEFORE the
+        # indexer runs (the routing decision is taken inside it). A forward
+        # proves engagement two ways: it routed to the kernel, or it
+        # declined for its own request SHAPE, where the stock chain is
+        # correct (see _require_sparse_decode_lane).
+        sparse_required = self._sparse_decode_required(cache, S)
+        sparse_before = _sparse_route_snapshot() if sparse_required else None
 
         fused = getattr(self, "qkv_fused", None)
         if fused is not None:
@@ -3622,6 +4391,11 @@ class Attention(nn.Module):
             # Diagnostic rollback only. The reference model applies QSA to
             # images too; dropping selection changed its attention function.
             sel_mask = None
+
+        if vrope is None and sparse_required:
+            self._require_sparse_decode_lane(
+                sel_mask, rows=int(S), before=sparse_before
+            )
 
         if isinstance(sel_mask, tuple) and sel_mask and sel_mask[0] == "flash":
             # Block-sparse flash attention over the indexer's exact visible
@@ -3759,6 +4533,34 @@ class Attention(nn.Module):
                 compress_ratio=self.indexer.ratio,
             )
 
+        if isinstance(sel_mask, tuple) and sel_mask and sel_mask[0] == "sparse_blocks":
+            # MTPLX_QSA_SPARSE_DECODE: split-K direct-index
+            # sparse GQA over exactly the visible set the rows-gather lane
+            # attends, reading the cache BACKING in place.  No gathered K/V
+            # tensor is written, no transposed copy is made for the score
+            # operand, and no score tensor is materialized -- which is the
+            # whole point: the shipped lane's ~70 MB per layer is bytes, not
+            # bandwidth (see mtplx/kernels/qsa_sparse_decode.py).
+            #
+            # ROUNDING CLASS, not exact: fp32 online softmax in exp2, fp32
+            # probabilities into an fp32 P@V, Steel-MMA reassociation, and a
+            # split-K rescale.  Adopted on greedy-token agreement plus a full
+            # HumanEval run, exactly like MTPLX_QWEN4_HC_M4.
+            from mtplx.kernels import qsa_sparse_decode as _qsa_sparse
+
+            _, sparse_top_idx = sel_mask
+            out = _qsa_sparse.attention(
+                q,
+                cache.kv.keys,
+                cache.kv.values,
+                sparse_top_idx,
+                query_offset=pos_start,
+                total_tokens=T,
+                scale=self.scale,
+            )
+            out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
+            return self.o_proj(out * mx.sigmoid(gate))
+
         if isinstance(sel_mask, tuple) and sel_mask and sel_mask[0] == "gather_rows":
             # Rows-gather lane (S>1): each verify/pipeline row reads only
             # its own selected blocks + tail instead of the full context
@@ -3789,15 +4591,27 @@ class Attention(nn.Module):
         elif sel_mask is not None:
             mask = sel_mask
         elif S > 1:
-            qpos = pos_start + mx.arange(S, dtype=mx.int32)
-            tpos = mx.arange(T, dtype=mx.int32)
-            mask = (tpos[None, :] <= qpos[:, None])[None, None]
+            # No selection came back, so every visible key is visible: either
+            # the chunk's whole history fits the indexer budget
+            # (``last_nb <= block_topk``, i.e. ``T <= (block_topk + 1) * ratio
+            # - 1`` = 2,051 tokens on the production pack, where top-512 of
+            # <= 512 candidate blocks IS all of them), or the request is a
+            # vision one where QSA is bypassed outright.  In both cases the
+            # mask below is EXACTLY causal -- so when the flag is armed, hand
+            # MLX the string and never build the tensor.
+            _qsa_prefill_count("mask_causal_eligible")
+            if _prefill_mask_fuse_enabled() and _prefill_causal_mask_is_exact(
+                pos_start=pos_start, rows=S, total_keys=T
+            ):
+                mask = _CAUSAL_MASK
+            else:
+                qpos = pos_start + mx.arange(S, dtype=mx.int32)
+                tpos = mx.arange(T, dtype=mx.int32)
+                mask = (tpos[None, :] <= qpos[:, None])[None, None]
         else:
             mask = None
 
-        out = mx.fast.scaled_dot_product_attention(
-            q, k, v, scale=self.scale, mask=mask
-        )
+        out = _qsa_dense_attention(q, k, v, mask=mask, scale=self.scale)
         out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
         return self.o_proj(out * mx.sigmoid(gate))
 
@@ -4731,6 +5545,9 @@ class NGramEmbedding(nn.Module):
                     :, -self.context_len :
                 ]
             return compiled
+        streamed_ar = getattr(self, "_streamed_ar_active", None)
+        if streamed_ar is not None:
+            return streamed_ar.build(input_ids, cache, state_idx)
         staged = getattr(self, "_staged", None)
         if staged is not None:
             self._staged = None
@@ -5743,28 +6560,93 @@ class Model(nn.Module):
             )
 
     def set_ar_pipeline_mode(self, enabled: bool) -> bool:
-        """Flip the family into (or out of) the pipelined-AR decode contract:
-        n-gram staging off + in-graph mmap-lazy gathers, so a forward built
-        on LAZY token ids records no host sync. Returns False when the lazy
-        table binding is unavailable (lane must not engage)."""
-        ready = True
+        """Flip the family into the installed pipelined-AR decode route.
+
+        A resident table keeps the original in-graph lazy gather.  A streamed
+        table uses a deferred packed-row leaf installed by ``ple_cached_aux``.
+        Route selection is completed before any layer state is changed.
+        """
+        routes = []
+        token_factory = None
         for layer in self.layers:
             if "ple" not in layer:
                 continue
             emb = layer.ple.ple_embedding
             table = emb.ngram_embedding
-            if enabled and getattr(table, "_lazy_parts", None) is None:
-                ready = False
-                continue
-            emb._stage_disabled = bool(enabled)
-            table.prefer_lazy = bool(enabled)
-        if ready:
-            model = self.language_model.model
-            if not getattr(model, "_gdn_compile_explicit_off", False):
-                model._gdn_compiled_lane = bool(enabled)
+            if enabled:
+                streamed = getattr(emb, "_streamed_ar_ple", None)
+                candidate_factory = getattr(streamed, "make_token", None)
+                if not callable(candidate_factory):
+                    return False
+                if token_factory is None:
+                    token_factory = candidate_factory
+                if getattr(table, "_lazy_parts", None) is not None:
+                    routes.append((emb, table, "resident", None))
+                    continue
+                routes.append((emb, table, "streamed", streamed))
             else:
-                model._gdn_compiled_lane = False
-        return ready
+                routes.append(
+                    (
+                        emb,
+                        table,
+                        getattr(emb, "_ar_pipeline_route", None),
+                        getattr(emb, "_streamed_ar_active", None),
+                    )
+                )
+
+        if enabled and (not routes or token_factory is None):
+            return False
+
+        # Validate every phase transition before publishing any route fields.
+        for _emb, _table, route, streamed in routes:
+            if route == "streamed" and streamed is not None:
+                streamed.set_active(bool(enabled))
+
+        flushers = []
+        discarders = []
+        for emb, table, route, streamed in routes:
+            if route == "streamed" and streamed is not None:
+                if enabled:
+                    flushers.append(streamed.flush)
+                    discarders.append(streamed.discard)
+            emb._streamed_ar_active = (
+                streamed if enabled and route == "streamed" else None
+            )
+            emb._ar_pipeline_route = route if enabled else None
+            emb._stage_disabled = bool(enabled)
+            table.prefer_lazy = bool(enabled and route == "resident")
+
+        variants = {route for _emb, _table, route, _streamed in routes}
+        self._ar_pipeline_variant = (
+            next(iter(variants)) if enabled and len(variants) == 1 else ""
+        )
+        self._ar_pipeline_token_factory = token_factory if enabled else None
+        self._ar_pipeline_ple_flushers = tuple(flushers)
+        self._ar_pipeline_ple_discarders = tuple(discarders)
+
+        model = self.language_model.model
+        if not getattr(model, "_gdn_compile_explicit_off", False):
+            model._gdn_compiled_lane = bool(enabled)
+        else:
+            model._gdn_compiled_lane = False
+        return True
+
+    def make_ar_pipeline_token(self):
+        """Return a fresh token leaf from the installed pipeline contract."""
+
+        return self._ar_pipeline_token_factory()
+
+    def flush_ar_pipeline_ple(self) -> None:
+        """Fill the streamed PLE leaf before its consumer is submitted."""
+
+        for flush in self._ar_pipeline_ple_flushers:
+            flush()
+
+    def discard_ar_pipeline_ple(self) -> None:
+        """Discard an unsubmitted streamed leaf after a failed graph build."""
+
+        for discard in self._ar_pipeline_ple_discarders:
+            discard()
 
     # -- family capture-commit (repair-free verify rollback) ----------------
 
