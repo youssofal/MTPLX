@@ -110,11 +110,49 @@ def recipe_params(recipe: dict[str, Any]) -> dict[str, int]:
     ngram_group = int(ngram.get("group_size") or NGRAM_PRODUCTION_LAYOUT[1])
     mtp_bits = recipe.get("qwen4_mtp_bits")
     mtp_bits = body_bits if mtp_bits is None else int(mtp_bits)
+    keep = load_expert_keep(recipe)
     return {
+        "expert_keep": keep,
         "body_bits": body_bits, "body_group": body_group,
         "ngram_bits": ngram_bits, "ngram_group": ngram_group,
         "mtp_bits": mtp_bits, "mtp_group": body_group,
     }
+
+
+def load_expert_keep(recipe: dict[str, Any]) -> dict[str, Any] | None:
+    """``qwen4_expert_keep``: path to a JSON {"k": K, "keep": [[ids] per MoE layer],
+    "layers": [layer indices], "mtp_keep": [ids]} produced from routing statistics.
+    Experts outside the keep set are dropped from the pack (uniform K per layer,
+    since the runtime config carries one ``num_experts``)."""
+    raw = recipe.get("qwen4_expert_keep")
+    if not raw:
+        return None
+    keep = json.loads(Path(str(raw)).expanduser().read_text(encoding="utf-8"))
+    k = int(keep["k"])
+    if any(len(ids) != k for ids in keep["keep"]) or len(keep.get("mtp_keep") or []) != k:
+        raise Qwen4ForgeError("qwen4_expert_keep: every layer and mtp_keep must list exactly k experts")
+    return keep
+
+
+def prune_expert_tensors(weights: dict[str, Any], keep: dict[str, Any], *, prefix: str) -> int:
+    """Slice ``<prefix>layers.N.mlp.{switch_mlp.*,gate}`` (sanitized layout) to the
+    kept experts, in place. Returns the number of layers pruned."""
+    import mlx.core as mx
+
+    by_layer = {int(layer): ids for layer, ids in zip(keep["layers"], keep["keep"])}
+    pruned = 0
+    for layer, ids in by_layer.items():
+        idx = mx.array(ids, dtype=mx.int32)
+        base = f"{prefix}layers.{layer}.mlp."
+        touched = False
+        for name in ("switch_mlp.gate_proj.weight", "switch_mlp.up_proj.weight",
+                     "switch_mlp.down_proj.weight", "gate.weight"):
+            key = base + name
+            if key in weights:
+                weights[key] = mx.take(weights[key], idx, axis=0)
+                touched = True
+        pruned += int(touched)
+    return pruned
 
 
 # --------------------------------------------------------------------------- n-gram sidecar
@@ -259,6 +297,10 @@ def convert_body(
     config = _load_json(source / "config.json")
     config.setdefault("text_config", {})["ngram_sidecar"] = True
     config.pop("model_file", None)
+    keep = load_expert_keep(recipe)
+    if keep is not None:
+        _text_config(config)["num_experts"] = int(keep["k"])
+        _log(f"expert pruning: keeping {keep['k']} of {keep.get('experts', '?')} experts per MoE layer")
     model = Model(ModelArgs.from_dict(config))
 
     weight_map = _load_json(source / "model.safetensors.index.json")["weight_map"]
@@ -266,6 +308,9 @@ def convert_body(
     for filename in sorted(set(weight_map.values())):
         weights.update(mx.load(str(source / filename)))
     weights = model.sanitize(weights)
+    if keep is not None:
+        n = prune_expert_tensors(weights, keep, prefix="language_model.model.")
+        _log(f"expert pruning: sliced {n} MoE layers")
     dtype_name = config.get("torch_dtype") or _text_config(config).get("dtype")
     if dtype_name in ("float16", "bfloat16", "float32"):
         dtype = getattr(mx, dtype_name)
@@ -384,6 +429,7 @@ def write_mtp_sidecar(
     mtp_bits: int,
     mtp_group: int,
     qsa_8bit: bool = False,
+    expert_keep: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     import mlx.core as mx
 
@@ -422,6 +468,10 @@ def write_mtp_sidecar(
         if value.ndim == 1 and any(key.endswith(s) for s in MTP_NORM_SHIFT_SUFFIXES):
             value = (value.astype(mx.float32) + 1.0).astype(value.dtype)
         tensors[key] = value
+    if expert_keep is not None:
+        head_keep = {"layers": [0], "keep": [expert_keep["mtp_keep"]]}
+        prune_expert_tensors(tensors, head_keep, prefix="")
+        _log(f"expert pruning: MTP head sliced to {len(expert_keep['mtp_keep'])} experts")
     packed: dict[str, Any] = {}
     modules: dict[str, str] = {}
     for key, value in tensors.items():
@@ -473,7 +523,8 @@ def run_lane(
     )
     progress("convert", 0.97, "extract_mtp", False)
     report["mtp"] = write_mtp_sidecar(
-        source, destination, mtp_bits=params["mtp_bits"], mtp_group=params["mtp_group"], qsa_8bit=qsa_8bit
+        source, destination, mtp_bits=params["mtp_bits"], mtp_group=params["mtp_group"], qsa_8bit=qsa_8bit,
+        expert_keep=params["expert_keep"],
     )
     config_path = destination / "config.json"
     config = _load_json(config_path)
@@ -488,6 +539,7 @@ def run_lane(
         "ngram": {"bits": params["ngram_bits"], "group_size": params["ngram_group"]},
         "mtp": {"bits": params["mtp_bits"], "group_size": params["mtp_group"]},
         "qsa_8bit": qsa_8bit,
+        "expert_keep": (params["expert_keep"] or {}).get("k"),
         "lane": "qwen4_exp",
     }
     config_path.write_text(json.dumps(dict(sorted(config.items())), indent=4), encoding="utf-8")
