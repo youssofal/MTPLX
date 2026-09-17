@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "measured_at_utc": "2026-08-26T04:49:08Z",
+  "base_sha": "e07224aa1b51f50dbb65161f7013ca784dd7e758",
+  "command": "python3 scripts/bench_expert_locality.py --iterations 50000 --repeats 7 --sample-every 16",
+  "environment": {
+    "hardware": "Apple M5 Max, 18 CPU cores",
+    "memory_bytes": 137438953472,
+    "macos": "27.0 (26A5416b)",
+    "architecture": "arm64",
+    "python": "3.14.7"
+  },
+  "workload": {
+    "iterations_per_repeat": 50000,
+    "repeats": 7,
+    "route_pattern": "rotating_8_experts_top_2_period_63",
+    "input": "Python lists through the same installed switch wrapper used at runtime"
+  },
+  "baseline": {
+    "median_us_per_call": 0.06824084,
+    "min_us_per_call": 0.06683,
+    "max_us_per_call": 0.094165
+  },
+  "sample_every_16": {
+    "median_us_per_call": 1.1987125,
+    "min_us_per_call": 1.18680918,
+    "max_us_per_call": 1.21676,
+    "overhead_us_per_call": 1.13047166,
+    "accepted_calls": 21875,
+    "working_set_90": 8,
+    "lru_16_hit_rate": 0.9998171428571428
+  },
+  "sample_every_1": {
+    "median_us_per_call": 3.4736025,
+    "min_us_per_call": 3.43360918,
+    "max_us_per_call": 3.49104668,
+    "overhead_us_per_call": 3.40536166,
+    "accepted_calls": 350000,
+    "working_set_90": 8,
+    "lru_16_hit_rate": 0.9999885714285714
+  },
+  "output_parity": true,
+  "scope": "CPU-only no-model measurement of router tap overhead. It does not measure model throughput or MLX array materialization."
+}
