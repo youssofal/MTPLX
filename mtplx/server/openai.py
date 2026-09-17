@@ -120,6 +120,7 @@ from mtplx.gemma4_pair import (
     resolve_gemma4_pair_paths,
 )
 from mtplx.model_scheduler import ModelWorkScheduler
+from mtplx.os_memory import phys_footprint_bytes
 from mtplx.server.hyper import HYPER_ADMISSION_CAP, HyperAdmissionGate
 from mtplx.reasoning_effort import (
     REASONING_EFFORT_CHOICES,
@@ -18243,6 +18244,16 @@ def _prefill_admission_shed(
         cache = int(stats.get("cache_memory_bytes") or 0)
         if active <= 0:
             return None
+        # #456 / two independently reported kernel panics: active+cache is
+        # MLX's own account of what it allocated through Metal, and it can
+        # drift below what the kernel actually holds resident for this
+        # process. live_bytes floors every projection below at the real
+        # phys_footprint when that reads higher, so a request already
+        # dangerous in reality is never judged safe by allocator bookkeeping
+        # alone. A missing/failed probe (non-Darwin, no libproc) leaves
+        # live_bytes identical to active+cache — byte-identical to before.
+        footprint = phys_footprint_bytes()
+        live_bytes = max(active + cache, int(footprint or 0))
         plan = getattr(state, "memory_plan", None)
         per_token = 0
         transients = 0
@@ -18262,7 +18273,7 @@ def _prefill_admission_shed(
         # Cheap worst-case gate first (miss == full prompt): skip the bank
         # probe entirely when even a fully cold prefill projects under the
         # line — the common, memory-healthy case.
-        if active + cache + prompt_tokens * per_token + transients <= threshold:
+        if live_bytes + prompt_tokens * per_token + transients <= threshold:
             return None
         reused_tokens = 0
         reused_mode = "none"
@@ -18347,7 +18358,7 @@ def _prefill_admission_shed(
         miss_tokens = max(0, prompt_tokens - reused_tokens)
         if miss_tokens < _prefill_admission_min_miss_tokens():
             return None
-        projected = active + cache + miss_tokens * per_token + transients
+        projected = live_bytes + miss_tokens * per_token + transients
         if projected <= threshold:
             return None
         receipt: dict[str, Any] = {
@@ -18358,6 +18369,7 @@ def _prefill_admission_shed(
             "miss_tokens": int(miss_tokens),
             "active_bytes": int(active),
             "cache_bytes": int(cache),
+            "phys_footprint_bytes": footprint,
             "projected_bytes": int(projected),
             "threshold_bytes": int(threshold),
             "limit_bytes": int(limit),
@@ -18375,12 +18387,14 @@ def _prefill_admission_shed(
             receipt["cache_cleared"] = False
             receipt["cache_clear_error"] = repr(exc)
         after_cache = _mlx_memory_stats_live()
+        footprint_after_cache = phys_footprint_bytes()
         if int(after_cache.get("active_memory_bytes") or 0) > 0:
-            projected = (
+            live_after_cache = max(
                 int(after_cache["active_memory_bytes"])
-                + int(after_cache.get("cache_memory_bytes") or 0)
-                + miss_tokens * per_token + transients
+                + int(after_cache.get("cache_memory_bytes") or 0),
+                int(footprint_after_cache or 0),
             )
+            projected = live_after_cache + miss_tokens * per_token + transients
         receipt["projected_bytes_after_cache_clear"] = int(projected)
         deficit = max(0, projected - threshold)
         if session_bank is not None and deficit > 0:
@@ -18468,12 +18482,21 @@ def _prefill_admission_shed(
         # mark the receipt refused; the caller answers with the structured
         # 507 before prefill. --allow-swap (#427) keeps the operator's
         # explicit past-the-fit choice.
-        projected_after = (
+        #
+        # This final check is the one #450 added and the one that still
+        # missed both later kernel panics: active+cache after reclamation
+        # read under the limit while the OS-reported footprint did not.
+        # Float the same phys_footprint floor in here too, or the refusal
+        # this comment describes never actually fires for that failure
+        # shape.
+        footprint_after = phys_footprint_bytes()
+        live_after = max(
             int(after.get("active_memory_bytes") or 0)
-            + int(after.get("cache_memory_bytes") or 0)
-            + miss_tokens * per_token
-            + transients
+            + int(after.get("cache_memory_bytes") or 0),
+            int(footprint_after or 0),
         )
+        projected_after = live_after + miss_tokens * per_token + transients
+        receipt["phys_footprint_bytes_after"] = footprint_after
         receipt["projected_bytes_after"] = int(projected_after)
         if projected_after > limit and not bool(getattr(state, "allow_swap", False)):
             receipt["refused"] = True
@@ -18498,14 +18521,27 @@ def _prefill_admission_shed(
 
 
 def _allocator_pressure_level(state: "ServerState") -> tuple[int, float]:
-    """Engine-relative pressure: allocator footprint vs the Metal limit.
+    """Engine-relative pressure: real footprint vs the Metal limit.
 
     macOS's kern.memorystatus level fires only once the system is already
     compressing/swapping — on a 48 GB Mac that is minutes into the death
     spiral (#305: 61.8/48.0 GB before the first signal). The allocator
     knows its allocation envelope earlier: active+cache at >=97% of the
     configured Metal memory limit is treated as WARNING (2);
-    past the limit is CRITICAL-equivalent (4). Returns (level, fraction).
+    past the limit is CRITICAL-equivalent (4).
+
+    active+cache is MLX's own account of what it allocated through Metal,
+    and it can drift below what the kernel actually holds resident for this
+    process — touched-then-kept weight pages, non-Metal Python/NumPy heap,
+    thread stacks, the session bank's host-side buffers. Two independently
+    reported machines grew past this gate's limit while it still read
+    sub-WARNING, and both ended in a kernel panic (watchdog timeout, near-
+    zero free pages) rather than the sustained-pressure abort this loop is
+    meant to arm. ``phys_footprint_bytes()`` reads the same counter macOS's
+    own jetsam subsystem uses for this exact decision; taking the max with
+    the allocator's own number can only raise the reading, never lower it
+    below what the allocator already measured, so a healthy engine sees no
+    change. Returns (level, fraction).
     """
     caps = getattr(state, "metal_memory_caps", None)
     limit = 0
@@ -18520,7 +18556,9 @@ def _allocator_pressure_level(state: "ServerState") -> tuple[int, float]:
     cache = stats.get("cache_memory_bytes") or 0
     if not active:
         return 1, 0.0
-    fraction = float(int(active) + int(cache)) / float(limit)
+    footprint = phys_footprint_bytes()
+    live_bytes = max(int(active) + int(cache), int(footprint or 0))
+    fraction = float(live_bytes) / float(limit)
     if fraction >= 1.02:
         return 4, fraction
     if fraction >= 0.97:
