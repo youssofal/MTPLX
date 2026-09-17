@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from mtplx.dflash2_bundle import DFLASH2_ARCH_ID, DFLASH2_BACKEND
 from mtplx.profiles import DEFAULT_PROFILE_NAME, PROFILE_CHOICES, resolve_profile_name
 
 
@@ -16,6 +17,7 @@ SUPPORTED_ARCH_IDS = {
     "deepseek-v4",
     "qwen4-next",
     "qwen3-next-mtp",
+    DFLASH2_ARCH_ID,
     "deepseek-v3-mtp",
     "glm-moe-dsa-mtp",
     "glm4-moe-mtp",
@@ -202,6 +204,20 @@ ARCHITECTURE_CATALOG: dict[str, ArchitectureSupport] = {
             "loads through the bundled mlx-lm llama module and serves "
             "target-only AR."
         ),
+    ),
+    DFLASH2_ARCH_ID: ArchitectureSupport(
+        arch_id=DFLASH2_ARCH_ID,
+        display_name="Qwen3.8 DFlash2 bundle",
+        family="qwen",
+        backend=DFLASH2_BACKEND,
+        support_level="verified-bundle-contract",
+        runtime_compatibility="dflash2-bundle-native",
+        can_run_verified=True,
+        aliases=("dflash2", "qwen3.8-dflash2"),
+        config_markers=("mtplx_dflash2.json",),
+        family_gate="dflash2-qwen38-bundle-contract",
+        references=("https://github.com/z-lab/dflash",),
+        notes="DFlash2 is a separate five-layer drafter under dflash2/; it must never be interpreted as native mtp.* tensors.",
     ),
     "qwen3-next-mtp": ArchitectureSupport(
         arch_id="qwen3-next-mtp",
@@ -822,6 +838,8 @@ def _detect_arch_id(inspection: Any) -> str | None:
     combined = f"{architecture} {model_type}"
     has_config_mtp = int(getattr(inspection, "mtp_num_hidden_layers", 0) or 0) > 0
     has_explicit_mtp = has_config_mtp or "mtp" in combined or "nextn" in combined
+    if getattr(inspection, "dflash2_bundle", None) is not None or DFLASH2_BACKEND in combined:
+        return DFLASH2_ARCH_ID
 
     qwen_support = ARCHITECTURE_CATALOG["qwen3-next-mtp"]
     if _support_alias_matches(qwen_support, combined):
@@ -1397,6 +1415,28 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
     contract_path = getattr(inspection, "runtime_contract_path", None)
     if not contract_path:
         contract_path = str(_contract_path(model_dir)) if _contract_path(model_dir).exists() else None
+    if detected_arch_id == DFLASH2_ARCH_ID or getattr(inspection, "dflash2_bundle", None) is not None:
+        support = architecture_support_for(DFLASH2_ARCH_ID)
+        payload = getattr(inspection, "compatibility", None)
+        payload = payload if isinstance(payload, dict) else {}
+        can_run = bool(payload.get("can_run"))
+        return CompatibilityVerdict(
+            tier=str(payload.get("tier") or (TIER_VERIFIED if can_run else TIER_INCOMPATIBLE_ARCHITECTURE)),
+            arch_id=DFLASH2_ARCH_ID,
+            supported=can_run,
+            recognized=True,
+            can_run=can_run,
+            exit_code=int(payload.get("exit_code", EXIT_VERIFIED if can_run else EXIT_INCOMPATIBLE_ARCHITECTURE)),
+            message=str(payload.get("message") or "DFlash2 bundle failed its artifact contract."),
+            recommended_backend=DFLASH2_BACKEND,
+            recommended_profile=DEFAULT_PROFILE_NAME,
+            unsafe_force_required=False,
+            unverified_model=not can_run,
+            mtp_supported="yes" if can_run else "no",
+            runtime_compatibility=str(payload.get("runtime_compatibility") or "invalid-dflash2-bundle"),
+            support_level=str(payload.get("support_level") or (support.support_level if support else "dflash2-bundle-invalid")),
+            support_notes=(support.notes if support else None),
+        )
     # One question decides runnability throughout this function: can this
     # build construct the trunk from code it ships. MTP, contracts, and
     # verification tiers are labels and speed levers on top of that answer,
