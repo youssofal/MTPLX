@@ -45,7 +45,7 @@ dependencies = [
   # Floor 5.10.0: GHSA path traversal in save_pretrained through chat
   # template names (Dependabot alert 24, 2026-09-06); the shipped venvs run
   # 5.14.1, so the floor changes nothing installed and closes the alert.
-  "transformers>=5.10.0,!=5.13.0,<5.15; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "transformers>=5.10.0,!=5.13.0,<5.18; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "nanobind>=2; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "numpy>=2",
   "pydantic>=2",
