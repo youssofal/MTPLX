@@ -464,7 +464,7 @@ struct SettingsTab: View {
 
     private var launchTargetDefaultMaxActiveRequests: Int {
         switch draftLaunchTarget {
-        case .chat, .pi:
+        case .chat, .pi, .omp:
             return 2
         case .other:
             return 4
@@ -479,7 +479,7 @@ struct SettingsTab: View {
 
     private var launchTargetDefaultDecodeBatchMax: Int {
         switch draftLaunchTarget {
-        case .chat, .pi:
+        case .chat, .pi, .omp:
             return 2
         case .other:
             return 4
@@ -492,7 +492,7 @@ struct SettingsTab: View {
 
     private var launchTargetDefaultBatchWaitMs: Double {
         switch draftLaunchTarget {
-        case .chat, .pi, .other:
+        case .chat, .pi, .omp, .other:
             return 50
         case .openCode, .hermes:
             return 0
@@ -1375,7 +1375,7 @@ struct SettingsTab: View {
 
                 FormRow(
                     label: tr("Agent workspace"),
-                    caption: tr("Pi and Hermes terminal tools start in this folder.")
+                    caption: tr("Pi, OMP, and Hermes terminal tools start in this folder.")
                 ) {
                     HStack(spacing: 8) {
                         TextField(

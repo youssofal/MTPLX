@@ -288,7 +288,7 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
     /// yesterday's client surface.
     public var lastLaunchTarget: String
     /// Project root handed to terminal coding agents launched by MTPLX.
-    /// Pi uses this as its shell cwd; Hermes uses it for both terminal
+    /// Pi and OMP use this as their shell cwd; Hermes uses it for both terminal
     /// commands and file tools, so relative paths stay anchored to the
     /// same workspace.
     public var hermesWorkspacePath: String

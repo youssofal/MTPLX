@@ -52,6 +52,9 @@ struct ActivityTab: View {
                         if shouldShowPiHandoff {
                             piHandoffCard()
                         }
+                        if shouldShowOMPHandoff {
+                            ompHandoffCard()
+                        }
                         recentRequestsCard(recent: recent)
                         speedTruthCard(latest: backend.latest)
                         cacheSummaryCard(sessions: sessions, sessionBank: sessionBank)
@@ -165,6 +168,62 @@ struct ActivityTab: View {
             )
         }
         return parts.isEmpty ? tr("No Pi handoff yet.") : parts.joined(separator: " · ")
+    }
+
+    private var shouldShowOMPHandoff: Bool {
+        backend.ompTerminalAgentRunning
+            || backend.ompTerminalLaunchDetail?.isEmpty == false
+            || backend.ompTerminalLaunchCommand?.isEmpty == false
+    }
+
+    @ViewBuilder
+    private func ompHandoffCard() -> some View {
+        Card("Agent Handoff", subtitle: "External terminal client launched by MTPLX.") {
+            PillBadge(
+                text: backend.ompTerminalAgentRunning ? "OMP running" : "OMP not detected",
+                systemImage: "option",
+                tint: backend.ompTerminalAgentRunning ? .mtplxSuccess : .mtplxWarning,
+                emphasized: backend.ompTerminalAgentRunning
+            )
+        } content: {
+            VStack(alignment: .leading, spacing: 8) {
+                truthRow(
+                    "OMP Terminal",
+                    ompHandoffStatusText(),
+                    systemImage: "terminal",
+                    tint: backend.ompTerminalAgentRunning ? .mtplxSuccess : .mtplxWarning
+                )
+                truthRow(
+                    "Workspace",
+                    OMPIntegration.resolvedWorkspacePath(configuration: backend.configuration),
+                    systemImage: "folder",
+                    tint: Brand.accentChrome
+                )
+                if let command = backend.ompTerminalLaunchCommand, !command.isEmpty {
+                    truthRow(
+                        "Command",
+                        command,
+                        systemImage: "chevron.left.forwardslash.chevron.right",
+                        tint: .secondary
+                    )
+                }
+            }
+        }
+    }
+
+    private func ompHandoffStatusText() -> String {
+        var parts: [String] = []
+        if let detail = backend.ompTerminalLaunchDetail, !detail.isEmpty {
+            parts.append(detail)
+        }
+        if !backend.ompTerminalAgentProcessIDs.isEmpty {
+            parts.append(
+                "pid " + backend.ompTerminalAgentProcessIDs
+                    .map(String.init)
+                    .joined(separator: ", ")
+            )
+        }
+        return parts.isEmpty ? "No OMP handoff yet." : parts.joined(separator: " · ")
     }
 
     // MARK: Requests half
