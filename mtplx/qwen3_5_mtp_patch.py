@@ -147,6 +147,8 @@ def _candidate_weight_files(model_path: Path, config: dict[str, Any]) -> list[Pa
 def _load_mtp_weights(paths: list[Path]) -> dict[str, Any]:
     import mlx.core as mx
 
+    from .compressed_tensors import shift_delta_mtp_norms
+
     mapped: dict[str, Any] = {}
     for path in paths:
         if path.suffix != ".safetensors":
@@ -155,7 +157,17 @@ def _load_mtp_weights(paths: list[Path]) -> dict[str, Any]:
             local = _strip_mtp_prefix(key)
             if local is not None:
                 mapped[local] = value
-    return mapped
+    # A head taken straight from a raw HF checkpoint carries delta-encoded
+    # RMSNorm gains. mlx-lm's qwen3_5 sanitize applies the +1.0 absolute
+    # convention to trunk norms, but it drops ``mtp.*`` before that loop, so
+    # the head never receives the shift. Forge shifts at build time (#301);
+    # a sidecar that did not come through forge reaches this loader still
+    # delta-encoded, and binds with no error: injection reports success,
+    # validation passes, and decode runs at ~0% acceptance -- slower than
+    # plain AR. Shift here as well. The helper is detector-gated, so an
+    # absolute-convention sidecar passes through byte-identical and nothing
+    # is ever double-shifted.
+    return shift_delta_mtp_norms(mapped)
 
 
 def _full_attention_layer_idx(args: Any) -> int:
