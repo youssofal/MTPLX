@@ -98,7 +98,6 @@ from .qsa_mtp_precompute import (
 )
 from .runtime import MTPLXRuntime
 from .sampling import (
-    NonFiniteLogitsError,
     non_finite_logits_error,
     SamplerConfig,
     SparseDistribution,
@@ -5297,17 +5296,19 @@ def _mx_lazy_shape(
 
 
 def _mx_lazy_sample(row: mx.array, config: SamplerConfig, key: mx.array) -> mx.array:
-    """Device-side shaped sampling returning a LAZY scalar token array — the
-    pipelined-AR lane's sampler (shaping: :func:`_mx_lazy_shape`).
+    """Device-side shaped sampling returning a LAZY scalar token array
+    (shaping: :func:`_mx_lazy_shape`); a device-sampler primitive, no longer
+    on the decode path (see the MTPLX_AR_PIPELINE note in :func:`generate_ar`).
 
-    The randomness stream is mx.random keyed from the request seed instead
-    of the numpy generator, so runs stay deterministic per seed but the
-    streams differ. Callers gate on temperature > 0 and 1 < top_k < vocab.
+    The randomness stream is mx.random keyed from the caller-supplied key
+    instead of the numpy generator, so runs stay deterministic per key but the
+    stream differs from :func:`_sample_from_logits` — which is exactly why it
+    is off the decode path. Callers gate on temperature > 0 and 1 < top_k < vocab.
 
-    A row with NaN or +inf (or all -inf) returns -1 instead of a token so the
-    lane raises NonFiniteLogitsError when it reads the value, rather than
-    emitting token 0 (``!``); the check rides the same lazy graph, so the
-    pipeline keeps its one sync per token.
+    A row with NaN or +inf (or all -inf) returns -1 instead of a token so a
+    caller can raise NonFiniteLogitsError when it reads the value, rather than
+    emitting token 0 (``!``); the check rides the same lazy graph, so a reader
+    keeps its one sync per token.
     """
     ids, log_weights, bad = _mx_lazy_shape(row, config)
     local = mx.random.categorical(log_weights[None], key=key)[0]
@@ -6927,22 +6928,29 @@ def generate_ar(
         in ("1", "true", "yes", "on")
     ) or bool(os.environ.get("MTPLX_EVAL_AUDIT"))
 
-    # ---- Pipelined AR lane (MTPLX_AR_PIPELINE) ---------------------------
-    # Software pipeline over the decode stream: sampling runs INSIDE the lazy
-    # graph (_mx_lazy_sample), so step k+1's graph is built on step k's
-    # still-lazy sampled token while the GPU executes step k. A token's KV is
-    # only ever written by the forward that consumes it, and only committed
-    # tokens are consumed — the cache never runs ahead of the committed
-    # sequence, so there is no rollback machinery. Guards observe at commit
-    # (lag <= 1 step); when one arms, the lane drains into the classic loop
-    # with its exact entry invariant (logits row + cache both at the last
-    # committed token). Engages only on models that publish
-    # set_ar_pipeline_mode (qwen4_exp: staging off + in-graph mmap gathers).
+    # ---- MTPLX_AR_PIPELINE: shares the classic sampling path --------------
+    # This flag used to run a software-pipelined decode lane that drew output
+    # token 0 with the request's numpy rng (_sample_from_logits) but every
+    # later token from a device-side mx.random stream (_mx_lazy_sample). The
+    # two streams differ, so MTPLX_AR_PIPELINE=1 produced a DIFFERENT
+    # continuation than the classic AR loop for the same request and seed —
+    # the serial-decoding divergence seen when comparing against mlx-serve.
+    #
+    # Byte-identity with classic requires the numpy draw for EVERY token, and
+    # that draw needs the materialized logits row, which forecloses the lane's
+    # build-ahead overlap — no overlap is left to keep. So the flag now falls
+    # through to the classic loop below and shares its per-token
+    # _sample_from_logits(row, sampler, rng) draw (identical tokens by
+    # construction). The model's pipeline forward-mode is still OFFERED via
+    # set_ar_pipeline_mode, so the flag's gating stays observable and
+    # independent of MTPLX_ASYNC_AR, but it is RELEASED before decode: its only
+    # benefit is eliding host sync on LAZY-token forwards, which the classic
+    # loop (materialized tokens) never issues, and running decode under it is
+    # not validated bit-exact with the classic forward this lane must match.
     _lane_committed = 0
     _lane_finished = False
     _lane_cache_has_final = False
     _lane_final_row: mx.array | None = None
-    _lane_mode_off = None
     if (
         _env_truthy("MTPLX_AR_PIPELINE")
         and constraint is None
@@ -6954,124 +6962,8 @@ def generate_ar(
     ):
         _set_lane_mode = getattr(rt.model, "set_ar_pipeline_mode", None)
         if callable(_set_lane_mode) and _set_lane_mode(True):
-            _lane_mode_off = _set_lane_mode
-    if _lane_mode_off is not None:
-        try:
-            events.append({"ar_pipeline": True})
-            _lane_key = mx.random.key(int(seed) & 0x7FFFFFFF)
-            token, _ = _sample_from_logits(logits[0], sampler, rng)
-            tokens.append(token)
-            emit_token(token)
-            events.append({"step": 0, "token": token})
-            _lane_committed = 1
-            if _is_stop(token, stop_token_ids) or max_tokens <= 1:
-                _lane_finished = True
-            else:
-
-                def _lane_step(tok_lazy: mx.array) -> tuple[mx.array, mx.array]:
-                    nonlocal _lane_key
-                    _lane_key, sub = mx.random.split(_lane_key)
-                    with attention_phase("ar_decode"):
-                        out = rt.forward_ar(tok_lazy.reshape(1, 1), cache=cache)
-                    row = out[:, -1, :]
-                    nxt = _mx_lazy_sample(row[0], sampler, sub)
-                    return row, nxt
-
-                started = time.perf_counter()
-                row_lazy, tok_lazy = _lane_step(mx.array([token]))
-                mx.async_eval(tok_lazy)
-                target_forward_graph_time += time.perf_counter() - started
-                while True:
-                    built = time.perf_counter()
-                    row_next, tok_next = _lane_step(tok_lazy)
-                    mx.async_eval(tok_next)
-                    build_elapsed = time.perf_counter() - built
-                    target_forward_graph_time += build_elapsed
-                    waited = time.perf_counter()
-                    v = int(tok_lazy.item())
-                    wait_elapsed = time.perf_counter() - waited
-                    target_eval_time += wait_elapsed
-                    target_decode_time += build_elapsed + wait_elapsed
-                    verify_calls += 1
-                    if v < 0:
-                        # _mx_lazy_sample's non-finite sentinel: the row that
-                        # produced this token carried NaN/inf.
-                        raise NonFiniteLogitsError(
-                            "non-finite logits in the pipelined AR lane at "
-                            f"output token {_lane_committed}"
-                        )
-                    step = _lane_committed
-                    tokens.append(v)
-                    emit_token(v)
-                    events.append({"step": step, "token": v})
-                    _lane_committed += 1
-                    armed = False
-                    if _loop_guard is not None:
-                        _lg = _loop_guard.observe(tokens)
-                        if _lg is not None:
-                            events.append(
-                                {
-                                    "step": step,
-                                    "loop_guard": {
-                                        "transition": _lg,
-                                        "completion_tokens": len(tokens),
-                                        **_loop_guard.summary(),
-                                    },
-                                }
-                            )
-                        armed = armed or _loop_guard.armed
-                    if _thinking_guard is not None:
-                        _tg = _thinking_guard.observe(tokens)
-                        if _tg is not None:
-                            events.append(
-                                {
-                                    "step": step,
-                                    "thinking_guard": {
-                                        "transition": _tg,
-                                        "completion_tokens": len(tokens),
-                                        **_thinking_guard.summary(),
-                                    },
-                                }
-                            )
-                        armed = armed or _thinking_guard.steering_active
-                    repetition_result = _trim_repeated_suffix(tokens, repetition_config)
-                    if repetition_result is not None:
-                        events.append(
-                            {
-                                "step": step,
-                                "repetition_stop": {
-                                    "reason": "exact_repeated_token_suffix",
-                                    "block_tokens": repetition_result.block_tokens,
-                                    "repeats": repetition_result.repeats,
-                                    "trimmed_tokens": repetition_result.repeated_tokens,
-                                },
-                            }
-                        )
-                        _lane_finished = True
-                        break
-                    if _is_stop(v, stop_token_ids) or len(tokens) >= max_tokens:
-                        _lane_finished = True
-                        _lane_cache_has_final = True
-                        _lane_final_row = row_next
-                        break
-                    if armed:
-                        # Steering must shape the NEXT sample: hand the
-                        # classic loop its invariant (this row's graph also
-                        # committed v's cache entries).
-                        _eval(row_next)
-                        logits = row_next
-                        break
-                    row_lazy, tok_lazy = row_next, tok_next
-            if _env_truthy("MTPLX_AR_PIPELINE_DEBUG") and _lane_committed > 1:
-                n = max(_lane_committed - 1, 1)
-                print(
-                    f"[ar-lane] steps={n} build={target_forward_graph_time / n * 1e3:.2f}ms "
-                    f"wait={target_eval_time / n * 1e3:.2f}ms "
-                    f"per-step={target_decode_time / n * 1e3:.2f}ms",
-                    flush=True,
-                )
-        finally:
-            _lane_mode_off(False)
+            _set_lane_mode(False)
+            events.append({"ar_pipeline": "classic_fallthrough"})
 
     _classic_start = max_tokens if _lane_finished else _lane_committed
     for step in range(_classic_start, max_tokens):

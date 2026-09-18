@@ -138,3 +138,95 @@ def test_pipeline_lane_gating_independent_of_async_flag(monkeypatch):
     assert len(out.tokens) == 4
     # The lane was OFFERED engagement (gate independent of MTPLX_ASYNC_AR).
     assert model.pipeline_mode_calls[:1] == [True]
+
+
+class _SpreadModel(TinyModel):
+    """Deterministic but high-entropy logits that shift with the last token,
+    so a divergent RNG stream picks a different continuation.
+
+    ``set_ar_pipeline_mode`` returns True, so the (now removed) device-sampled
+    pipeline lane would engage on this stub — the regression is that
+    MTPLX_AR_PIPELINE must still emit the classic loop's tokens, not an
+    mx.random continuation.
+    """
+
+    VOCAB = 64
+
+    def __init__(self):
+        super().__init__()
+        self.pipeline_mode_calls: list[bool] = []
+
+    def set_ar_pipeline_mode(self, enabled):
+        self.pipeline_mode_calls.append(bool(enabled))
+        return True
+
+    def __call__(
+        self,
+        input_ids,
+        *,
+        cache=None,
+        return_hidden: bool = False,
+        hidden_variant: str | None = None,
+        emit_logits: bool = True,
+        logits_keep: int | None = None,
+    ):
+        length = int(input_ids.shape[1])
+        hidden = mx.zeros((1, length, 2), dtype=mx.float32)
+        if not emit_logits:
+            return (None, hidden) if return_hidden else None
+        keep = length if logits_keep is None else min(length, max(1, int(logits_keep)))
+        j = mx.arange(self.VOCAB, dtype=mx.float32)[None, :]
+        last = input_ids[:, -1:].astype(mx.float32)  # (1, 1): drives per-step shift
+        row = 0.9 * mx.cos(0.4 * j + 0.7 * last) + 0.6 * mx.sin(0.2 * j - 0.5 * last)
+        logits = mx.broadcast_to(row[:, None, :], (1, keep, self.VOCAB))
+        if return_hidden:
+            return logits, hidden
+        return logits
+
+
+def _spread_tokens(
+    monkeypatch, *, pipeline: bool, seed: int, max_tokens: int, prompt
+) -> list[int]:
+    for key in ("MTPLX_ASYNC_AR", "MTPLX_EVAL_AUDIT", "MTPLX_AR_PIPELINE"):
+        monkeypatch.delenv(key, raising=False)
+    if pipeline:
+        monkeypatch.setenv("MTPLX_AR_PIPELINE", "1")
+    rt = _make_runtime(_SpreadModel())
+    # CPU only: this box gates every Metal exec behind the GPU flock, and the
+    # comparison is device-agnostic (same device on both runs).
+    with mx.stream(mx.cpu):
+        out = generate_ar(
+            rt,
+            prompt,
+            max_tokens=max_tokens,
+            sampler=SamplerConfig(temperature=1.0, top_p=0.95, top_k=20),
+            stop_token_ids=set(),
+            seed=seed,
+        )
+    return out.tokens
+
+
+def test_ar_pipeline_matches_classic_token_for_token(monkeypatch):
+    """MTPLX_AR_PIPELINE=1 emits the SAME tokens as the classic AR loop for one
+    request and seed.
+
+    The old lane drew output token 0 with the request's numpy rng but every
+    later token from an mx.random stream keyed off the seed; the streams
+    differ, so the flag diverged from classic AR (PR #501's own test asserted
+    divergence by token 3). The fix routes the flag through the classic
+    per-token ``_sample_from_logits(row, sampler, rng)`` draw, so the two token
+    sequences are byte-identical."""
+    seed = 20250917
+    prompt = [5]
+    max_tokens = 12
+    classic = _spread_tokens(
+        monkeypatch, pipeline=False, seed=seed, max_tokens=max_tokens, prompt=prompt
+    )
+    pipelined = _spread_tokens(
+        monkeypatch, pipeline=True, seed=seed, max_tokens=max_tokens, prompt=prompt
+    )
+    assert len(classic) == max_tokens
+    # A degenerate (near one-hot) distribution would let the streams agree by
+    # luck and rob the test of its teeth; require real sampling variety.
+    assert len(set(classic)) > 1
+    assert pipelined == classic
