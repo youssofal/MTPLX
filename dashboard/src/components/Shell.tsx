@@ -7,6 +7,7 @@ import {
   Layers,
   Settings,
   Sliders,
+  Terminal,
   Thermometer,
 } from "lucide-react";
 import { cn } from "../lib/utils";
@@ -24,6 +25,7 @@ export type TabId =
   | "memory"
   | "thermal"
   | "requests"
+  | "native"
   | "settings";
 
 const TABS: { id: TabId; label: string; icon: typeof Activity }[] = [
@@ -33,6 +35,7 @@ const TABS: { id: TabId; label: string; icon: typeof Activity }[] = [
   { id: "memory", label: "Memory", icon: HardDrive },
   { id: "thermal", label: "Thermal", icon: Thermometer },
   { id: "requests", label: "Requests", icon: Sliders },
+  { id: "native", label: "Native", icon: Terminal },
   { id: "settings", label: "Settings", icon: Settings },
 ];
 

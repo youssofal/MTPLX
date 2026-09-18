@@ -5,6 +5,7 @@ import { CacheTab } from "./components/CacheTab";
 import { ControlsSidebar } from "./components/ControlsSidebar";
 import { KeyboardShortcutsOverlay } from "./components/KeyboardShortcutsOverlay";
 import { MemoryTab } from "./components/MemoryTab";
+import { NativeTab } from "./components/NativeTab";
 import { NewMaxTPSToast } from "./components/NewMaxTPSToast";
 import { OverviewTab } from "./components/OverviewTab";
 import { RequestsTab } from "./components/RequestsTab";
@@ -67,6 +68,8 @@ function DashboardRoot() {
         <ThermalTab />
       ) : active === "requests" ? (
         <RequestsTab />
+      ) : active === "native" ? (
+        <NativeTab />
       ) : active === "settings" ? (
         <ControlsSidebar />
       ) : null}
