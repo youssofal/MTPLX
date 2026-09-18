@@ -120,6 +120,10 @@ from mtplx.gemma4_pair import (
     resolve_gemma4_pair_paths,
 )
 from mtplx.model_scheduler import ModelWorkScheduler
+from mtplx.runtime_systems import (
+    RuntimeSystemsRegistry,
+    install_runtime_systems_endpoint,
+)
 from mtplx.server.hyper import HYPER_ADMISSION_CAP, HyperAdmissionGate
 from mtplx.reasoning_effort import (
     REASONING_EFFORT_CHOICES,
@@ -2904,6 +2908,7 @@ class ServerState:
         _validate_mtp_batch_settings(args)
         _validate_hyper_settings(args)
         self.args = args
+        self.runtime_systems = RuntimeSystemsRegistry()
         try:
             args.paged_kv_quantization = normalize_paged_kv_quantization(
                 getattr(args, "paged_kv_quantization", "off")
@@ -29508,6 +29513,12 @@ def create_app(state: ServerState) -> FastAPI:
 
     app = FastAPI(title="MTPLX OpenAI-compatible server", lifespan=lifespan)
     app.state.mtplx = state
+    from mtplx.server.runtime_status import ServingStatusProvider
+
+    if getattr(state, "runtime_systems", None) is None:
+        state.runtime_systems = RuntimeSystemsRegistry()
+    serving_status = ServingStatusProvider(state)
+    install_runtime_systems_endpoint(app, state, refresh=serving_status.publish)
     # Registered before the auth middleware below so auth stays outermost
     # (the most recently added Starlette middleware runs first): fans only
     # ramp for requests that passed the API-key and rate-limit gates.
