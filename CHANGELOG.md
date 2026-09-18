@@ -4,6 +4,30 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`forge build` converts Qwen3.8-Flash-Next (`qwen4_exp`) sources.** The
+  flat lane handed every Flash-Next fine-tune to the pinned mlx-lm, which has
+  no `qwen4_exp` and died with `Model type qwen4_exp not supported` (#390);
+  the official packs were converted out of band and `forge verify --stamp`ed.
+  A BF16 source whose probe recommends the `qwen4_exp` backend now takes an
+  in-tree lane: the 51B n-gram table is quantized shard by shard straight
+  into the `ngram-table.safetensors` SSD sidecar (never materialized, ~2 min),
+  the trunk is converted with MTPLX's own backend under the model's
+  Optimized Speed recipe (`module_overrides` still layer on top), and the
+  draft head is written in the layout `attach_mtp` loads. The body is
+  evaluated one tensor at a time: mlx-lm's whole-shard save trips the Metal
+  GPU watchdog on this graph. Recipe keys `ngram.bits`/`ngram.group_size`
+  (default 4/32, the runtime's production layout), `qwen4_mtp_bits`
+  (default: follow the body) and `qwen4_qsa_8bit` (QSA q/k/v/o at 8-bit,
+  +0.25 GiB). Verified on an M5 Max 128 GB: `orcarouter/Qwen3.8-Flash-Next-
+  Uncensored` forges in ~8 min to a 112 GiB pack that serves 47 tok/s AR and
+  86 tok/s at depth 3 through the family-serve verify rows. A build verified
+  through that lane no longer fails on "required depths: D1, D2": the lane
+  measures AR plus the family's speculative default, not the tune sweep.
+
 ## [2.11.3] - 2026-09-17
 
 ### Added
