@@ -43,7 +43,7 @@ import os
 import re
 import struct
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -5786,7 +5786,6 @@ class Model(nn.Module):
             return False
         raw = mx.load(str(path))
         args = self.language_model.args
-        mtp = Qwen4ExpMTP(args)
 
         flat = dict(raw)
         stripped = {}
@@ -5794,6 +5793,13 @@ class Model(nn.Module):
             if not name.startswith("mtp."):
                 continue
             stripped[name[len("mtp."):]] = v
+        # The head carries its own expert bank: an expert-pruned pack may keep
+        # the head at full width (or prune it differently), so its width comes
+        # from the sidecar, not the trunk config.
+        head_experts = mtp_head_num_experts(stripped, default=int(args.num_experts))
+        if head_experts != int(args.num_experts):
+            args = replace(args, num_experts=head_experts)
+        mtp = Qwen4ExpMTP(args)
         # The converter's +1 norm shift covers the trunk-suffix norms only;
         # the head's pre_fc norms ship raw zero-centered ((1+w) convention).
         for n in ("pre_fc_norm_embedding.weight", "pre_fc_norm_hidden.weight"):
@@ -6099,6 +6105,16 @@ def _tree_get(module: nn.Module, dotted: str):
         if k == dotted:
             return v
     raise KeyError(dotted)
+
+
+def mtp_head_num_experts(tensors: dict, *, default: int) -> int:
+    """Expert count of an ``mtp.safetensors`` head from its own router rows
+    (``layers.0.mlp.gate.weight`` is [E, ...] whether bf16 or packed u32).
+    Falls back to ``default`` for a head that ships no router."""
+    router = tensors.get("layers.0.mlp.gate.weight")
+    if router is None or getattr(router, "ndim", 0) < 2:
+        return int(default)
+    return int(router.shape[0])
 
 
 def is_qwen4_exp_mtp_config(config: dict) -> bool:

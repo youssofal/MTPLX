@@ -129,8 +129,16 @@ def load_expert_keep(recipe: dict[str, Any]) -> dict[str, Any] | None:
         return None
     keep = json.loads(Path(str(raw)).expanduser().read_text(encoding="utf-8"))
     k = int(keep["k"])
-    if any(len(ids) != k for ids in keep["keep"]) or len(keep.get("mtp_keep") or []) != k:
-        raise Qwen4ForgeError("qwen4_expert_keep: every layer and mtp_keep must list exactly k experts")
+    if any(len(ids) != k for ids in keep["keep"]):
+        raise Qwen4ForgeError("qwen4_expert_keep: every layer must list exactly k experts")
+    # The MTP head is left at full width unless ``qwen4_prune_mtp_head`` opts in:
+    # its experts are picked by proxy from trunk routing, and pruning them
+    # measurably costs draft acceptance (1.72x -> 1.48x at K=256) while the
+    # full head is only ~0.7 GiB larger. The runtime reads the head's own
+    # expert count off the sidecar, so trunk and head may differ.
+    keep["prune_mtp_head"] = bool(recipe.get("qwen4_prune_mtp_head", False))
+    if keep["prune_mtp_head"] and len(keep.get("mtp_keep") or []) != k:
+        raise Qwen4ForgeError("qwen4_prune_mtp_head: mtp_keep must list exactly k experts")
     return keep
 
 
@@ -468,10 +476,12 @@ def write_mtp_sidecar(
         if value.ndim == 1 and any(key.endswith(s) for s in MTP_NORM_SHIFT_SUFFIXES):
             value = (value.astype(mx.float32) + 1.0).astype(value.dtype)
         tensors[key] = value
-    if expert_keep is not None:
+    if expert_keep is not None and expert_keep.get("prune_mtp_head"):
         head_keep = {"layers": [0], "keep": [expert_keep["mtp_keep"]]}
         prune_expert_tensors(tensors, head_keep, prefix="")
         _log(f"expert pruning: MTP head sliced to {len(expert_keep['mtp_keep'])} experts")
+    elif expert_keep is not None:
+        _log("expert pruning: MTP head kept at full width (qwen4_prune_mtp_head not set)")
     packed: dict[str, Any] = {}
     modules: dict[str, str] = {}
     for key, value in tensors.items():
@@ -540,6 +550,8 @@ def run_lane(
         "mtp": {"bits": params["mtp_bits"], "group_size": params["mtp_group"]},
         "qsa_8bit": qsa_8bit,
         "expert_keep": (params["expert_keep"] or {}).get("k"),
+        "mtp_expert_keep": (params["expert_keep"] or {}).get("k")
+        if (params["expert_keep"] or {}).get("prune_mtp_head") else None,
         "lane": "qwen4_exp",
     }
     config_path.write_text(json.dumps(dict(sorted(config.items())), indent=4), encoding="utf-8")

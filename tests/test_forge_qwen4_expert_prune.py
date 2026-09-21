@@ -31,8 +31,23 @@ def test_recipe_without_keep_is_unpruned() -> None:
 def test_keep_file_loads_and_validates(tmp_path: Path) -> None:
     keep = load_expert_keep({"qwen4_expert_keep": str(_keep_file(tmp_path, 4))})
     assert keep["k"] == 4 and keep["keep"] == [[0, 1, 2, 3], [0, 1, 2, 3]]
+    # default: the MTP head is not pruned, so a short/missing mtp_keep is fine
+    assert keep["prune_mtp_head"] is False
+    assert load_expert_keep({"qwen4_expert_keep": str(_keep_file(tmp_path, 4, bad=True))})["k"] == 4
     with pytest.raises(Qwen4ForgeError, match="exactly k"):
-        load_expert_keep({"qwen4_expert_keep": str(_keep_file(tmp_path, 4, bad=True))})
+        load_expert_keep({"qwen4_expert_keep": str(_keep_file(tmp_path, 4, bad=True)),
+                          "qwen4_prune_mtp_head": True})
+    keep = load_expert_keep({"qwen4_expert_keep": str(_keep_file(tmp_path, 4)), "qwen4_prune_mtp_head": True})
+    assert keep["prune_mtp_head"] is True and keep["mtp_keep"] == [0, 1, 2, 3]
+
+
+def test_mtp_head_width_comes_from_its_router_rows() -> None:
+    mx = pytest.importorskip("mlx.core")
+    from mtplx.models.qwen4_exp import mtp_head_num_experts
+
+    assert mtp_head_num_experts({"layers.0.mlp.gate.weight": mx.zeros((512, 640))}, default=256) == 512
+    assert mtp_head_num_experts({"layers.0.mlp.gate.weight": mx.zeros((256, 160), dtype=mx.uint32)}, default=512) == 256
+    assert mtp_head_num_experts({}, default=512) == 512
 
 
 def test_prune_slices_experts_and_router_rows() -> None:
