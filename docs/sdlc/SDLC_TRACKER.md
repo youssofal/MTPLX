@@ -7,6 +7,6 @@
 | 1.5 Decomposition | DONE | docs/features/model-supervisor/COMPONENT_DAG.md |
 | 2 Design | DONE | docs/features/model-supervisor/DESIGN.md |
 | 3 Implementation | DONE (waves 1-2, 91 tests) | mtplx/supervisor/** |
-| 4 Review + security | IN PROGRESS | docs/reviews/ |
-| 5 Verify + docs | PENDING | docs/server.md section |
-| 6 PR | PENDING | upstream draft PR |
+| 4 Review + security | DONE (2 CRIT, 5 HIGH, 6 MED fixed; full suite green) | docs/reviews/ |
+| 5 Verify + docs | DONE | docs/server.md section |
+| 6 PR | IN PROGRESS | upstream draft PR |
