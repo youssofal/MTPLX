@@ -9,4 +9,4 @@
 | 3 Implementation | DONE (waves 1-2, 91 tests) | mtplx/supervisor/** |
 | 4 Review + security | DONE (2 CRIT, 5 HIGH, 6 MED fixed; full suite green) | docs/reviews/ |
 | 5 Verify + docs | DONE | docs/server.md section |
-| 6 PR | IN PROGRESS | upstream draft PR |
+| 6 PR | DONE (draft upstream #520) | upstream draft PR |
