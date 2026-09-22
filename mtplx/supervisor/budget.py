@@ -82,10 +82,12 @@ def estimate_resident_bytes(path: Path) -> int:
     D5: use the catalog's measured ``peak_memory_gib`` when the pack
     matches a known official model (by directory name, or by the model id
     recorded in its ``mtplx_runtime.json``). Otherwise sum the on-disk size
-    of every ``*.safetensors`` file under the pack, excluding
-    ``ngram-table.safetensors`` (that sidecar streams from SSD rather than
-    residing in RAM; see docs/server.md), and scale by 1.15 to account for
-    allocator overhead beyond the raw weight bytes.
+    of every ``*.safetensors`` file under the pack -- recursively, since a
+    sharded pack can nest weights under a subdirectory (M3) -- excluding
+    any file named ``ngram-table.safetensors`` at any depth (that sidecar
+    streams from SSD rather than residing in RAM; see docs/server.md), and
+    scale by 1.15 to account for allocator overhead beyond the raw weight
+    bytes.
     """
     path = Path(path)
     model = catalog_model_matching(path.name)
@@ -97,7 +99,7 @@ def estimate_resident_bytes(path: Path) -> int:
         return int(model.peak_memory_gib * GIB)
 
     total = 0
-    for file in path.glob("*.safetensors"):
+    for file in path.rglob("*.safetensors"):
         if file.name == _NGRAM_SIDECAR_NAME:
             continue
         try:

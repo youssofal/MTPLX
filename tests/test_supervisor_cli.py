@@ -1,4 +1,4 @@
-"""Tests for `mtplx supervise` — CLI parsing, model resolution and the
+"""Tests for `mtplx supervise`: CLI parsing, model resolution and the
 SupervisorConfig handed to `mtplx.supervisor.service.run_supervisor`.
 
 `mtplx/supervisor/service.py` may not exist yet (wave 2 sibling task), so

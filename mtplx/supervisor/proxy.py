@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import secrets
+import threading
+import time
 import urllib.parse
 from typing import TYPE_CHECKING, Any
 
@@ -44,6 +47,35 @@ _REQUEST_HOP_BY_HOP = {
 _RESPONSE_HOP_BY_HOP = _REQUEST_HOP_BY_HOP
 
 _LOCALHOST_BINDS = {"", "127.0.0.1", "::1", "localhost"}
+
+# Front-door and admin paths, lowercased. Matched against a normalized path
+# (see ``normalize_path``) so a differently-cased or slash-doubled spelling
+# still lands on the admin app instead of being forwarded to an engine as a
+# literal path (SECURITY_REVIEW L1).
+_FRONT_DOOR_EXACT_PATHS = ("/health", "/v1/models")
+_ADMIN_PREFIX = "/mtplx/admin"
+
+_MULTI_SLASH_RE = re.compile(r"/{2,}")
+
+# Body size cap enforced before buffering (H1): a request larger than this
+# gets a 413, never fully read into memory. Not currently CLI-configurable;
+# raise this constant if a legitimate payload (e.g. large image/audio input)
+# needs more room.
+_MAX_BODY_BYTES = 32 * 1024 * 1024  # 32 MiB
+
+
+def normalize_path(path: str) -> str:
+    """Lowercase and collapse duplicate slashes, so ``/HEALTH`` and
+    ``//v1//models`` match the same routes as ``/health`` and
+    ``/v1/models``."""
+    collapsed = _MULTI_SLASH_RE.sub("/", path or "/")
+    return collapsed.lower()
+
+
+def is_front_door_or_admin_path(path: str) -> bool:
+    """True when a normalized path names ``/health``, ``/v1/models``, or
+    anything under ``/mtplx/admin``."""
+    return path in _FRONT_DOOR_EXACT_PATHS or path.startswith(_ADMIN_PREFIX)
 
 
 def is_localhost_bind(host: str | None) -> bool:
@@ -87,6 +119,86 @@ def is_authorized(request: Request, configured_api_key: str | None) -> bool:
     return bool(candidate and secrets.compare_digest(candidate, configured_api_key))
 
 
+class RateLimiter:
+    """In-process sliding-window limiter, keyed per caller (client host).
+
+    Not shared across processes or restarts; good enough to blunt a local
+    abuser hammering the admin API or brute-forcing the key (M1). Mirrors
+    the algorithm of ``mtplx/server/openai.py``'s ``_RateLimiter`` without
+    importing that module, which would pull in the model runtime.
+    """
+
+    def __init__(self, limit_per_minute: int) -> None:
+        self.limit_per_minute = limit_per_minute
+        self._lock = threading.Lock()
+        self._events: dict[str, list[float]] = {}
+
+    def _trim(self, key: str, now: float) -> list[float]:
+        window_start = now - 60.0
+        events = [item for item in self._events.get(key, []) if item > window_start]
+        self._events[key] = events
+        return events
+
+    def allow(self, key: str, *, now: float | None = None) -> tuple[bool, int]:
+        """Record one hit against ``key``; returns ``(allowed, retry_after_s)``."""
+        timestamp = time.monotonic() if now is None else float(now)
+        with self._lock:
+            events = self._trim(key, timestamp)
+            if len(events) >= self.limit_per_minute:
+                retry_after = max(1, int(60.0 - (timestamp - events[0])))
+                return False, retry_after
+            events.append(timestamp)
+            return True, 0
+
+    def is_over(self, key: str, *, now: float | None = None) -> tuple[bool, int]:
+        """Read-only: is ``key`` already over budget, without recording a hit."""
+        timestamp = time.monotonic() if now is None else float(now)
+        with self._lock:
+            events = self._trim(key, timestamp)
+            if len(events) >= self.limit_per_minute:
+                retry_after = max(1, int(60.0 - (timestamp - events[0])))
+                return True, retry_after
+            return False, 0
+
+
+def client_host(request: Request) -> str:
+    return request.client.host if request.client is not None else "unknown"
+
+
+# Shared across ProxyApp and AdminApp so a host that racks up failed-auth
+# attempts on one gets throttled on the other too (M1: "10/minute then 429
+# on any route for that host"). Lives here, not in admin.py, so proxy.py
+# never needs to import admin.py (admin.py already imports this module).
+auth_fail_limiter = RateLimiter(10)
+
+
+class _BodyTooLarge(Exception):
+    """Raised by ``_read_body_capped`` when the body exceeds the cap."""
+
+
+async def _read_body_capped(request: Request, limit: int) -> bytes:
+    """Read the request body up to ``limit`` bytes, never buffering more.
+
+    Checks ``Content-Length`` first as a cheap early-out, then still caps
+    the actual read in case the header is absent, wrong, or chunked (H1).
+    """
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > limit:
+                raise _BodyTooLarge()
+        except ValueError:
+            pass
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit:
+            raise _BodyTooLarge()
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _json_error(status: int, code: str, message: str | None = None, **extra: Any) -> dict:
     error: dict[str, Any] = {"code": code}
     if message:
@@ -95,7 +207,9 @@ def _json_error(status: int, code: str, message: str | None = None, **extra: Any
     return {"error": error}
 
 
-async def _send_json(scope, receive, send, status: int, payload: dict, headers: dict | None = None) -> None:
+async def _send_json(
+    scope, receive, send, status: int, payload: dict, headers: dict | None = None
+) -> None:
     from starlette.responses import JSONResponse
 
     response = JSONResponse(payload, status_code=status, headers=headers or {})
@@ -136,11 +250,45 @@ class ProxyApp:
             return
         request = Request(scope, receive=receive)
         method = str(scope.get("method") or "GET").upper()
-        path = str(scope.get("path") or "/")
+        path = normalize_path(str(scope.get("path") or "/"))
         query_string = scope.get("query_string") or b""
-        body = await request.body()
+
+        if is_front_door_or_admin_path(path):
+            # The outer Supervisor dispatch only recognizes the exact/prefix
+            # spelling of these paths; a case- or slash-varied spelling
+            # (``/HEALTH``, ``//v1//models``) still names a front-door or
+            # admin route, not a literal path to forward to an engine
+            # (SECURITY_REVIEW L1).
+            from .admin import AdminApp
+
+            await AdminApp(self.supervisor)(scope, receive, send)
+            return
+
+        host_key = client_host(request)
+        blocked, retry_after = auth_fail_limiter.is_over(host_key)
+        if blocked:
+            await _send_json(
+                scope,
+                receive,
+                send,
+                429,
+                _json_error(429, "rate_limited", "too many failed auth attempts"),
+                headers={"Retry-After": str(retry_after)},
+            )
+            return
 
         if not self._is_authorized(request):
+            allowed, fail_retry_after = auth_fail_limiter.allow(host_key)
+            if not allowed:
+                await _send_json(
+                    scope,
+                    receive,
+                    send,
+                    429,
+                    _json_error(429, "rate_limited", "too many failed auth attempts"),
+                    headers={"Retry-After": str(fail_retry_after)},
+                )
+                return
             await _send_json(
                 scope,
                 receive,
@@ -148,6 +296,22 @@ class ProxyApp:
                 401,
                 _json_error(401, "unauthorized", "missing or invalid API key"),
                 headers={"WWW-Authenticate": "Bearer"},
+            )
+            return
+
+        try:
+            body = await _read_body_capped(request, _MAX_BODY_BYTES)
+        except _BodyTooLarge:
+            await _send_json(
+                scope,
+                receive,
+                send,
+                413,
+                _json_error(
+                    413,
+                    "request_too_large",
+                    f"request body exceeds {_MAX_BODY_BYTES} bytes",
+                ),
             )
             return
 
@@ -161,6 +325,17 @@ class ProxyApp:
         else:
             requested = None
             record, kind = registry.resolve(None, default_id, False)
+
+        if kind == "draining":
+            await _send_json(
+                scope,
+                receive,
+                send,
+                503,
+                _json_error(503, "engine_draining"),
+                headers={"Retry-After": "2"},
+            )
+            return
 
         if kind == "unknown" or record is None:
             await _send_json(scope, receive, send, 404, _json_error(404, "model_not_found"))
@@ -241,6 +416,7 @@ class ProxyApp:
             for name, value in request.headers.items()
             if name.lower() not in _REQUEST_HOP_BY_HOP
         ]
+        started = False
         try:
             async with client.stream(method, url, headers=headers, content=body) as response:
                 out_headers = [
@@ -256,9 +432,22 @@ class ProxyApp:
                         "headers": [(k.encode("latin-1"), v.encode("latin-1")) for k, v in out_headers],
                     }
                 )
+                started = True
                 async for chunk in response.aiter_raw():
                     await send({"type": "http.response.body", "body": chunk, "more_body": True})
                 await send({"type": "http.response.body", "body": b"", "more_body": False})
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.ReadError) as exc:
+        except httpx.HTTPError as exc:
+            if started:
+                # ``http.response.start`` already went out: a second one
+                # would break the ASGI connection (C2). Close the body
+                # cleanly instead and let the client see a short read.
+                logger.warning(
+                    "engine connection dropped mid-stream for %s: %s", record.spec.model_id, exc
+                )
+                try:
+                    await send({"type": "http.response.body", "body": b"", "more_body": False})
+                except Exception:
+                    pass
+                return
             logger.warning("engine connection error for %s: %s", record.spec.model_id, exc)
             await _send_json(scope, receive, send, 503, _json_error(503, "engine_unavailable", str(exc)))

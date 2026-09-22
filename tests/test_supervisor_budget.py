@@ -70,6 +70,18 @@ def test_estimate_resident_bytes_sums_safetensors_excluding_ngram_table(monkeypa
     assert result == int(3000 * 1.15)
 
 
+def test_estimate_resident_bytes_recurses_shards(monkeypatch, tmp_path):
+    """M3: a pack that shards its weights under a subdirectory must still
+    be counted -- estimate_resident_bytes uses rglob, not glob."""
+    pack = tmp_path / "sharded-pack"
+    monkeypatch.setattr(budget_mod, "catalog_model_matching", lambda ref: None)
+    _write_safetensors(pack, "weights-00001.safetensors", 1000)
+    _write_safetensors(pack / "shard-00002", "weights-00002.safetensors", 2000)
+    _write_safetensors(pack / "shard-00002" / "nested", "ngram-table.safetensors", 500_000)
+    result = estimate_resident_bytes(pack)
+    assert result == int(3000 * 1.15)
+
+
 def test_estimate_resident_bytes_ignores_unreadable_runtime_json(monkeypatch, tmp_path):
     pack = tmp_path / "bad-json"
     pack.mkdir()

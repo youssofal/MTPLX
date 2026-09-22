@@ -16222,7 +16222,7 @@ def cmd_debug_public(args: Any) -> int:
 
 
 # ---------------------------------------------------------------------------
-# `mtplx supervise` — multi-model JIT-loading front door.
+# `mtplx supervise`: multi-model JIT-loading front door.
 #
 # The supervisor package (`mtplx/supervisor/`) is written by a sibling task
 # and imported lazily below so this module keeps importing even before that
@@ -16305,7 +16305,7 @@ def _supervise_resolve_models(
 # None/empty), "flag" (append flag alone when truthy), or "append" (append
 # flag+str(item) for every item in the list attribute). Every flag here is a
 # `mtplx serve` spelling, because engine children are launched with the
-# public `serve` argv (DESIGN.md key behavior 7) — never the lower-level
+# public `serve` argv (DESIGN.md key behavior 7), never the lower-level
 # `mtplx.server.openai` spellings `cmd_serve_public` builds for that child.
 _SUPERVISE_ENGINE_FLAG_TABLE: tuple[tuple[str, str, str], ...] = (
     ("profile", "--profile", "value"),

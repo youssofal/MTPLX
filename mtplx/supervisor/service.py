@@ -9,7 +9,9 @@ serving other requests never stalls on a subprocess call.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import logging
+import os
 import socket
 import time
 from dataclasses import dataclass, field
@@ -28,6 +30,12 @@ logger = logging.getLogger("mtplx.supervisor")
 
 _HEALTH_SWEEP_INTERVAL_S = 2.0
 _IDLE_SWEEP_INTERVAL_S = 30.0
+
+# M4: _free_port()'s bind-then-close probe has a TOCTOU window -- two
+# concurrent JIT loads can be handed the same "free" port before either
+# child binds it. Retry the spawn on a fresh port a bounded number of times
+# rather than surfacing an opaque load_timeout/GONE to the caller.
+_MAX_PORT_COLLISION_RETRIES = 3
 
 __all__ = ["SupervisorConfig", "Supervisor", "run_supervisor"]
 
@@ -117,6 +125,17 @@ class Supervisor:
         self._proxy_app = ProxyApp(self)
         self.app = self
 
+        # H3: orphan protection for the unclean-shutdown path (SIGKILL/OOM
+        # bypasses lifespan shutdown entirely, so stop() never runs). Each
+        # EngineProcess is also spawned with MTPLX_APP_PARENT_PID set to our
+        # own pid (see process.py's module docstring), which gives a second,
+        # independent line of defense: the engine's own `mtplx serve`
+        # watchdog tears itself down if this process disappears. This hook
+        # is belt-and-suspenders and is idempotent (guarded by
+        # ``_atexit_done``; ``EngineProcess.terminate`` is idempotent too).
+        self._atexit_done = False
+        atexit.register(self._atexit_cleanup)
+
     def _resolve_default_id(self) -> str | None:
         if self.config.default_model_id:
             return self.config.default_model_id
@@ -199,6 +218,22 @@ class Supervisor:
         if self.http_client is not None:
             await self.http_client.aclose()
             self.http_client = None
+        self._atexit_done = True
+
+    def _atexit_cleanup(self) -> None:
+        """Synchronous, idempotent last resort: terminate every spawned
+        engine's process group. Runs on normal interpreter exit (including
+        an uncaught exception), not on SIGKILL -- see the class docstring
+        note above and process.py's MTPLX_APP_PARENT_PID mechanism for the
+        SIGKILL case."""
+        if self._atexit_done:
+            return
+        self._atexit_done = True
+        for model_id, proc in list(self._processes.items()):
+            try:
+                proc.terminate(grace_s=5.0)
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                logger.exception("atexit cleanup failed to terminate engine %s", model_id)
 
     def track_background(self, task: asyncio.Task) -> None:
         """Keep a strong reference to a fire-and-forget task and log if it fails."""
@@ -244,26 +279,38 @@ class Supervisor:
 
             port = _free_port()
             self.registry.set_state(model_id, EngineState.LOADING, port=port)
-
-            if self.config.engine_argv_override:
-                argv = _substitute_argv(self.config.engine_argv_override, port, spec.path)
-                proc = EngineProcess(spec.path, port, self.config.engine_extra_args, argv_override=argv)
-            else:
-                proc = EngineProcess(spec.path, port, self.config.engine_extra_args)
-            self._processes[model_id] = proc
+            proc = self._spawn_engine(model_id, spec, port)
             self._trackers.setdefault(model_id, RestartTracker(RestartPolicy()))
-
             await asyncio.to_thread(proc.spawn)
 
             deadline = time.monotonic() + self.config.load_timeout_s
+            port_collision_attempts = 0
             while True:
                 liveness = await asyncio.to_thread(proc.probe, 2.0)
                 if liveness == Liveness.READY:
                     self.registry.set_state(model_id, EngineState.READY, pid=proc.pid)
                     self.registry.touch(model_id)
+                    await self._register_engine_alias(model_id)
                     return self.registry.get(model_id)
                 if liveness == Liveness.GONE:
                     reason = proc.death_reason()
+                    if (
+                        reason == "port_in_use"
+                        and port_collision_attempts < _MAX_PORT_COLLISION_RETRIES
+                    ):
+                        port_collision_attempts += 1
+                        logger.warning(
+                            "port collision loading %s (attempt %d/%d); retrying on a fresh port",
+                            model_id,
+                            port_collision_attempts,
+                            _MAX_PORT_COLLISION_RETRIES,
+                        )
+                        port = _free_port()
+                        self.registry.set_state(model_id, EngineState.LOADING, port=port)
+                        proc = self._spawn_engine(model_id, spec, port)
+                        await asyncio.to_thread(proc.spawn)
+                        deadline = time.monotonic() + self.config.load_timeout_s
+                        continue
                     self.registry.set_state(model_id, EngineState.FAILED, failure_reason=reason)
                     raise EngineUnavailable(reason)
                 if time.monotonic() >= deadline:
@@ -271,37 +318,108 @@ class Supervisor:
                     raise EngineUnavailable("load_timeout")
                 await asyncio.sleep(0.2)
 
+    def _spawn_engine(self, model_id: str, spec: EngineSpec, port: int) -> EngineProcess:
+        """Build (but do not yet spawn) the EngineProcess for `model_id` on
+        `port`, wiring in the H3 parent-pid env so the child can self-clean
+        if this supervisor disappears (see process.py's module docstring)."""
+        env_overrides = {
+            "MTPLX_APP_PARENT_PID": str(os.getpid()),
+            "MTPLX_SUPERVISOR_PID": str(os.getpid()),
+        }
+        if self.config.engine_argv_override:
+            argv = _substitute_argv(self.config.engine_argv_override, port, spec.path)
+            proc = EngineProcess(
+                spec.path,
+                port,
+                self.config.engine_extra_args,
+                env=env_overrides,
+                argv_override=argv,
+            )
+        else:
+            proc = EngineProcess(
+                spec.path, port, self.config.engine_extra_args, env=env_overrides
+            )
+        self._processes[model_id] = proc
+        return proc
+
+    async def _register_engine_alias(self, model_id: str) -> None:
+        """R1: an engine answers with its own served model id (first entry
+        of its own `/v1/models`), which can differ from the pack directory
+        name the supervisor routes by. Register that id as an alias so
+        clients can send either. Best-effort: any failure just means no
+        alias, never a failed load."""
+        proc = self._processes.get(model_id)
+        record = self.registry.get(model_id)
+        if proc is None or record is None or self.http_client is None:
+            return
+        try:
+            response = await self.http_client.get(
+                f"http://127.0.0.1:{proc.port}/v1/models", timeout=5.0
+            )
+            response.raise_for_status()
+            data = response.json().get("data") or []
+            if data and isinstance(data[0], dict):
+                served_id = data[0].get("id")
+                if isinstance(served_id, str) and served_id.strip():
+                    self.registry.add_alias(model_id, served_id.strip())
+        except (httpx.HTTPError, ValueError, KeyError, IndexError) as exc:
+            logger.warning("could not register alias for %s: %s", model_id, exc)
+
     async def unload(self, model_id: str) -> None:
         await self._unload(model_id)
 
     async def _unload(self, model_id: str, *, drain_s: float | None = None) -> None:
-        record = self.registry.get(model_id)
-        if record is None:
-            return
-        self.registry.set_state(model_id, EngineState.DRAINING)
-        wait_s = self.config.drain_s if drain_s is None else drain_s
-        deadline = time.monotonic() + wait_s
-        while time.monotonic() < deadline:
-            current = self.registry.get(model_id)
-            if current is None or current.pins == 0:
-                break
-            await asyncio.sleep(0.05)
-        proc = self._processes.get(model_id)
-        if proc is not None:
-            await asyncio.to_thread(proc.terminate, 10.0)
-        self.registry.set_state(model_id, EngineState.STOPPED)
+        """C1: shares the per-model load lock with ensure_loaded/restart so
+        a JIT load for the same model id can never interleave with a drain
+        in progress -- it blocks until the drain finishes, then loads a
+        fresh engine against the now-STOPPED record. `proc` is captured
+        before the drain wait (not after), so termination always targets
+        the engine this call actually meant to drain."""
+        lock = self._load_locks.setdefault(model_id, asyncio.Lock())
+        async with lock:
+            record = self.registry.get(model_id)
+            if record is None or record.state not in (EngineState.READY, EngineState.LOADING):
+                return
+            proc = self._processes.get(model_id)
+            self.registry.set_state(model_id, EngineState.DRAINING)
+            wait_s = self.config.drain_s if drain_s is None else drain_s
+            deadline = time.monotonic() + wait_s
+            while time.monotonic() < deadline:
+                current = self.registry.get(model_id)
+                if current is None or current.pins == 0:
+                    break
+                await asyncio.sleep(0.05)
+            if proc is not None:
+                await asyncio.to_thread(proc.terminate, 10.0)
+                if self._processes.get(model_id) is proc:
+                    del self._processes[model_id]
+            self.registry.set_state(model_id, EngineState.STOPPED)
 
     async def restart(self, model_id: str) -> EngineRecord:
+        """H3/H4: the terminate-and-reset critical section runs under the
+        same per-model load lock as ensure_loaded/_unload, so a client
+        request racing an admin restart can never observe READY, get
+        pinned, and then have its engine pulled out from under it. The lock
+        is released before calling ensure_loaded (an asyncio.Lock is not
+        reentrant); ensure_loaded's own locking still makes the reload
+        itself concurrency-safe against any other caller."""
         record = self.registry.get(model_id)
         if record is None:
             raise ModelNotFound(model_id)
-        proc = self._processes.get(model_id)
-        if proc is not None and proc.is_alive():
-            await asyncio.to_thread(proc.terminate, 10.0)
-        tracker = self._trackers.get(model_id)
-        if tracker is not None:
-            tracker.reset()
-        self.registry.set_state(model_id, EngineState.INSTALLED)
+        lock = self._load_locks.setdefault(model_id, asyncio.Lock())
+        async with lock:
+            record = self.registry.get(model_id)
+            if record is None:
+                raise ModelNotFound(model_id)
+            proc = self._processes.get(model_id)
+            if proc is not None and proc.is_alive():
+                await asyncio.to_thread(proc.terminate, 10.0)
+            if self._processes.get(model_id) is proc:
+                self._processes.pop(model_id, None)
+            tracker = self._trackers.get(model_id)
+            if tracker is not None:
+                tracker.reset()
+            self.registry.set_state(model_id, EngineState.INSTALLED)
         return await self.ensure_loaded(model_id)
 
     # -- background sweeps --------------------------------------------------
@@ -315,6 +433,11 @@ class Supervisor:
             return
 
     async def _health_sweep_once(self) -> None:
+        """L2: probes run concurrently (asyncio.gather over to_thread), so
+        detection latency for a wedged/dead engine no longer grows linearly
+        with the number of supervised engines. Reaping stays sequential
+        (cheap, and each reap takes its own per-model lock)."""
+        targets: list[tuple[str, EngineProcess]] = []
         for record in self.registry.records():
             if record.state not in (EngineState.READY, EngineState.LOADING):
                 continue
@@ -326,29 +449,51 @@ class Supervisor:
             proc = self._processes.get(model_id)
             if proc is None:
                 continue
+            targets.append((model_id, proc))
+        if not targets:
+            return
+
+        async def _probe(model_id: str, proc: EngineProcess) -> tuple[str, EngineProcess, Liveness]:
             liveness = await asyncio.to_thread(proc.probe, 1.5)
-            now = time.monotonic()
+            return model_id, proc, liveness
+
+        results = await asyncio.gather(*(_probe(m, p) for m, p in targets), return_exceptions=True)
+        now = time.monotonic()
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.exception("health probe failed", exc_info=result)
+                continue
+            model_id, proc, liveness = result
             if liveness in (Liveness.GONE, Liveness.PORT_CLOSED):
                 await self._reap(model_id, proc)
             elif liveness == Liveness.BUSY and proc.unresponsive_for_s(now) >= self.config.unresponsive_grace_s:
                 await self._reap(model_id, proc)
 
     async def _reap(self, model_id: str, proc: EngineProcess) -> None:
-        record = self.registry.get(model_id)
-        if record is None or record.state not in (EngineState.READY, EngineState.LOADING):
-            return
-        reason = proc.death_reason()
-        if reason == "out_of_memory":
-            self.registry.set_state(model_id, EngineState.FAILED, failure_reason="out_of_memory")
-            return
-        tracker = self._trackers.setdefault(model_id, RestartTracker(RestartPolicy()))
-        now = time.monotonic()
-        delay = tracker.record_crash(now)
-        if delay is None:
-            self.registry.set_state(model_id, EngineState.FAILED, failure_reason="crash_loop")
-            return
-        self.registry.set_state(model_id, EngineState.INSTALLED, failure_reason="crash: restart scheduled")
-        generation = tracker.generation
+        """C1: takes the same per-model load lock as ensure_loaded/_unload/
+        restart, and re-checks that `proc` is still the tracked process for
+        this model id once the lock is held -- a concurrent load or restart
+        may have already superseded it, in which case this reap is stale
+        and does nothing."""
+        lock = self._load_locks.setdefault(model_id, asyncio.Lock())
+        async with lock:
+            record = self.registry.get(model_id)
+            if record is None or record.state not in (EngineState.READY, EngineState.LOADING):
+                return
+            if self._processes.get(model_id) is not proc:
+                return
+            reason = proc.death_reason()
+            if reason == "out_of_memory":
+                self.registry.set_state(model_id, EngineState.FAILED, failure_reason="out_of_memory")
+                return
+            tracker = self._trackers.setdefault(model_id, RestartTracker(RestartPolicy()))
+            now = time.monotonic()
+            delay = tracker.record_crash(now)
+            if delay is None:
+                self.registry.set_state(model_id, EngineState.FAILED, failure_reason="crash_loop")
+                return
+            self.registry.set_state(model_id, EngineState.INSTALLED, failure_reason="crash: restart scheduled")
+            generation = tracker.generation
         task = asyncio.ensure_future(self._restart_after_delay(model_id, delay, generation, tracker))
         self.track_background(task)
 

@@ -8,7 +8,9 @@ No real model is ever loaded.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import logging
 import socket
 import sys
 import threading
@@ -329,3 +331,237 @@ def test_pin_unpin_around_forward_no_leak(tmp_path, two_packs, monkeypatch):
         for _ in range(3):
             httpx.post(base_url + "/v1/chat/completions", json={"model": "pack-a"}, timeout=5.0)
         assert supervisor.registry.get("pack-a").pins == 0
+
+
+@contextlib.contextmanager
+def _dying_stream_engine():
+    """A raw asyncio TCP server standing in for an engine that dies mid-SSE:
+    sends valid HTTP headers plus one complete chunk, then closes the
+    connection without the terminating chunk. Runs on its own thread/loop so
+    it can sit alongside the supervisor's own uvicorn thread."""
+
+    port_holder: list[int] = []
+    ready = threading.Event()
+    stop_loop: asyncio.AbstractEventLoop | None = None
+
+    async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(reader.read(65536), timeout=2.0)
+        frame = b'data: {"frame": 0}\n\n'
+        chunk = f"{len(frame):x}\r\n".encode() + frame + b"\r\n"
+        writer.write(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/event-stream\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"\r\n" + chunk
+        )
+        with contextlib.suppress(Exception):
+            await writer.drain()
+        # No terminating "0\r\n\r\n" chunk: the client is left mid-stream.
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+
+    async def _serve() -> None:
+        nonlocal stop_loop
+        stop_loop = asyncio.get_running_loop()
+        server = await asyncio.start_server(_handle, "127.0.0.1", 0)
+        port_holder.append(server.sockets[0].getsockname()[1])
+        ready.set()
+        async with server:
+            await server.serve_forever()
+
+    def _run() -> None:
+        with contextlib.suppress(Exception):
+            asyncio.run(_serve())
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    assert ready.wait(timeout=5.0), "dying-stream engine did not start"
+    try:
+        yield port_holder[0]
+    finally:
+        if stop_loop is not None:
+            with contextlib.suppress(Exception):
+                stop_loop.call_soon_threadsafe(stop_loop.stop)
+        thread.join(timeout=5.0)
+
+
+def test_engine_dies_mid_stream_after_headers_sent(tmp_path, two_packs, monkeypatch, caplog):
+    a, b = two_packs
+    _patch_sizes(monkeypatch, {"pack-a": 1024, "pack-b": 1024})
+    config = SupervisorConfig(
+        host="127.0.0.1",
+        port=_free_port(),
+        model_paths=[a, b],
+        preload=["pack-a"],
+        default_model_id="pack-a",
+        load_timeout_s=10.0,
+        engine_argv_override=_fake_argv(),
+    )
+    with running_supervisor(config) as (supervisor, base_url):
+        assert _wait_until(
+            lambda: supervisor.registry.get("pack-a").state == EngineState.READY, timeout_s=10.0
+        )
+        with _dying_stream_engine() as dying_port:
+            record = supervisor.registry.get("pack-a")
+            record.port = dying_port  # redirect this model's routing at a dead-mid-stream server
+            with caplog.at_level(logging.WARNING, logger="mtplx.supervisor"):
+                # The stream dies after http.response.start has already gone
+                # out: uvicorn manages its own framing to the client, so the
+                # client sees a clean (short) response, not a hung
+                # connection and not a second ASGI response.start (C2). The
+                # only trace of the mid-stream death is the supervisor's own
+                # warning log and the truncated body (no [DONE] frame).
+                resp = httpx.post(
+                    base_url + "/v1/chat/completions",
+                    json={"model": "pack-a", "stream": True},
+                    timeout=5.0,
+                )
+            assert resp.status_code == 200
+            assert b"frame" in resp.content
+            assert b"[DONE]" not in resp.content
+            assert any("mid-stream" in rec.message for rec in caplog.records)
+
+        # The supervisor's ASGI loop is still healthy (no unhandled
+        # exception took the server down) and the next request against the
+        # now-dead port gets a clean 503, not a hang or crash.
+        resp = httpx.post(
+            base_url + "/v1/chat/completions", json={"model": "pack-a"}, timeout=5.0
+        )
+        assert resp.status_code == 503
+        assert resp.json()["error"]["code"] == "engine_unavailable"
+
+
+def test_request_body_size_limit_rejected(tmp_path, two_packs, monkeypatch):
+    a, b = two_packs
+    _patch_sizes(monkeypatch, {"pack-a": 1024, "pack-b": 1024})
+    monkeypatch.setattr("mtplx.supervisor.proxy._MAX_BODY_BYTES", 1024)
+    config = SupervisorConfig(
+        host="127.0.0.1",
+        port=_free_port(),
+        model_paths=[a, b],
+        preload=["pack-a"],
+        default_model_id="pack-a",
+        load_timeout_s=10.0,
+        engine_argv_override=_fake_argv(),
+    )
+    with running_supervisor(config) as (supervisor, base_url):
+        assert _wait_until(
+            lambda: supervisor.registry.get("pack-a").state == EngineState.READY, timeout_s=10.0
+        )
+        oversized = {"model": "pack-a", "padding": "x" * 4096}
+        resp = httpx.post(base_url + "/v1/chat/completions", json=oversized, timeout=5.0)
+        assert resp.status_code == 413
+        assert resp.json()["error"]["code"] == "request_too_large"
+
+
+def test_body_cap_checked_after_auth_not_before(tmp_path, two_packs, monkeypatch):
+    """H1: auth runs before the body is ever read. An unauthenticated
+    request with an oversized body gets 401 (auth rejected it before the
+    body cap even ran), not 413."""
+    a, b = two_packs
+    _patch_sizes(monkeypatch, {"pack-a": 1024, "pack-b": 1024})
+    monkeypatch.setattr("mtplx.supervisor.proxy._MAX_BODY_BYTES", 1024)
+    config = SupervisorConfig(
+        host="0.0.0.0",
+        port=_free_port(),
+        model_paths=[a, b],
+        preload=["pack-a"],
+        default_model_id="pack-a",
+        api_key="secret",
+        load_timeout_s=10.0,
+        engine_argv_override=_fake_argv(),
+    )
+    with running_supervisor(config) as (supervisor, base_url):
+        assert _wait_until(
+            lambda: supervisor.registry.get("pack-a").state == EngineState.READY, timeout_s=10.0
+        )
+        oversized = {"model": "pack-a", "padding": "x" * 4096}
+        resp = httpx.post(base_url + "/v1/chat/completions", json=oversized, timeout=5.0)
+        assert resp.status_code == 401
+
+
+def test_draining_engine_returns_503_with_retry_after(tmp_path, two_packs, monkeypatch):
+    a, b = two_packs
+    _patch_sizes(monkeypatch, {"pack-a": 1024, "pack-b": 1024})
+    config = SupervisorConfig(
+        host="127.0.0.1",
+        port=_free_port(),
+        model_paths=[a, b],
+        preload=["pack-a"],
+        default_model_id="pack-a",
+        load_timeout_s=10.0,
+        engine_argv_override=_fake_argv(),
+    )
+    with running_supervisor(config) as (supervisor, base_url):
+        assert _wait_until(
+            lambda: supervisor.registry.get("pack-a").state == EngineState.READY, timeout_s=10.0
+        )
+        record = supervisor.registry.get("pack-a")
+        original_resolve = supervisor.registry.resolve
+        monkeypatch.setattr(
+            supervisor.registry, "resolve", lambda *a, **k: (record, "draining")
+        )
+        try:
+            resp = httpx.post(
+                base_url + "/v1/chat/completions", json={"model": "pack-a"}, timeout=5.0
+            )
+        finally:
+            monkeypatch.setattr(supervisor.registry, "resolve", original_resolve)
+        assert resp.status_code == 503
+        assert resp.json()["error"]["code"] == "engine_draining"
+        assert resp.headers.get("retry-after") == "2"
+
+
+def test_path_normalization_uppercase_and_double_slash(tmp_path, two_packs, monkeypatch):
+    a, b = two_packs
+    _patch_sizes(monkeypatch, {"pack-a": 1024, "pack-b": 1024})
+    config = SupervisorConfig(
+        host="127.0.0.1",
+        port=_free_port(),
+        model_paths=[a, b],
+        preload=["pack-a"],
+        default_model_id="pack-a",
+        load_timeout_s=10.0,
+        engine_argv_override=_fake_argv(),
+    )
+    with running_supervisor(config) as (supervisor, base_url):
+        assert _wait_until(
+            lambda: supervisor.registry.get("pack-a").state == EngineState.READY, timeout_s=10.0
+        )
+        resp = httpx.get(base_url + "/HEALTH", timeout=5.0)
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+
+        resp = httpx.get(base_url + "//v1//models", timeout=5.0)
+        assert resp.status_code == 200
+        assert resp.json()["object"] == "list"
+
+
+def test_alias_routes_to_the_same_engine(tmp_path, two_packs, monkeypatch):
+    a, b = two_packs
+    _patch_sizes(monkeypatch, {"pack-a": 1024, "pack-b": 1024})
+    config = SupervisorConfig(
+        host="127.0.0.1",
+        port=_free_port(),
+        model_paths=[a, b],
+        preload=["pack-a"],
+        default_model_id="pack-a",
+        load_timeout_s=10.0,
+        engine_argv_override=_fake_argv(),
+    )
+    with running_supervisor(config) as (supervisor, base_url):
+        if not hasattr(supervisor.registry, "add_alias"):
+            pytest.xfail("waits for registry aliases")
+        assert _wait_until(
+            lambda: supervisor.registry.get("pack-a").state == EngineState.READY, timeout_s=10.0
+        )
+        supervisor.registry.add_alias("pack-a", "pack-a-alias")
+        resp = httpx.post(
+            base_url + "/v1/chat/completions", json={"model": "pack-a-alias"}, timeout=5.0
+        )
+        assert resp.status_code == 200
+        assert resp.json()["model"] == "fake"
+        # Routed to the loaded engine directly, not the "fallback" default path.
+        assert "x-mtplx-routed-model" not in resp.headers

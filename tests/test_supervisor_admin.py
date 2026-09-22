@@ -381,3 +381,149 @@ def test_pins_block_idle_unload(tmp_path, two_packs, monkeypatch):
             assert supervisor.registry.get("pack-b").state == EngineState.READY
         finally:
             supervisor.registry.unpin("pack-b")
+
+
+def _fresh_limiter_state(monkeypatch, limiter, *, limit_per_minute: int) -> None:
+    """Isolate a shared module-level RateLimiter for one test: lower its
+    budget and wipe accumulated events from other tests sharing the same
+    "127.0.0.1" key, restoring both afterward via monkeypatch."""
+    monkeypatch.setattr(limiter, "limit_per_minute", limit_per_minute)
+    monkeypatch.setattr(limiter, "_events", {})
+
+
+def test_admin_rate_limit_429(tmp_path, two_packs, monkeypatch):
+    import mtplx.supervisor.admin as admin_mod
+
+    _fresh_limiter_state(monkeypatch, admin_mod.admin_rate_limiter, limit_per_minute=3)
+    _fresh_limiter_state(monkeypatch, admin_mod.auth_fail_limiter, limit_per_minute=100)
+
+    a, b = two_packs
+    _patch_sizes(monkeypatch, {"pack-a": 1024, "pack-b": 1024})
+    config = SupervisorConfig(
+        host="127.0.0.1",
+        port=_free_port(),
+        model_paths=[a, b],
+        preload=["pack-a"],
+        default_model_id="pack-a",
+        api_key="secret",
+        engine_argv_override=_fake_argv(),
+    )
+    headers = {"x-api-key": "secret"}
+    with running_supervisor(config) as (supervisor, base_url):
+        assert _wait_until(
+            lambda: supervisor.registry.get("pack-a").state == EngineState.READY, timeout_s=10.0
+        )
+        statuses = [
+            httpx.get(base_url + "/mtplx/admin/models", headers=headers, timeout=5.0).status_code
+            for _ in range(4)
+        ]
+        assert statuses[:3] == [200, 200, 200]
+        assert statuses[3] == 429
+        resp = httpx.get(base_url + "/mtplx/admin/models", headers=headers, timeout=5.0)
+        assert resp.status_code == 429
+        assert resp.json()["error"]["code"] == "rate_limited"
+        assert "retry-after" in resp.headers
+
+
+def test_failed_auth_throttled_then_429_on_any_route(tmp_path, two_packs, monkeypatch):
+    import mtplx.supervisor.admin as admin_mod
+
+    _fresh_limiter_state(monkeypatch, admin_mod.auth_fail_limiter, limit_per_minute=3)
+    _fresh_limiter_state(monkeypatch, admin_mod.admin_rate_limiter, limit_per_minute=100)
+
+    a, b = two_packs
+    _patch_sizes(monkeypatch, {"pack-a": 1024, "pack-b": 1024})
+    config = SupervisorConfig(
+        host="127.0.0.1",
+        port=_free_port(),
+        model_paths=[a, b],
+        preload=["pack-a"],
+        default_model_id="pack-a",
+        api_key="secret",
+        engine_argv_override=_fake_argv(),
+    )
+    bad_headers = {"x-api-key": "wrong"}
+    with running_supervisor(config) as (supervisor, base_url):
+        assert _wait_until(
+            lambda: supervisor.registry.get("pack-a").state == EngineState.READY, timeout_s=10.0
+        )
+        statuses = [
+            httpx.get(
+                base_url + "/mtplx/admin/models", headers=bad_headers, timeout=5.0
+            ).status_code
+            for _ in range(3)
+        ]
+        assert statuses == [401, 401, 401]
+        # The budget is now exhausted: the next failed-auth attempt gets
+        # 429, not 401, and so does a *different*, unrelated route (proving
+        # the throttle applies host-wide, not per-route).
+        resp = httpx.get(base_url + "/mtplx/admin/models", headers=bad_headers, timeout=5.0)
+        assert resp.status_code == 429
+        resp = httpx.get(base_url + "/health", timeout=5.0)
+        assert resp.status_code == 429
+
+
+def test_health_redacted_without_key_full_with_key(tmp_path, two_packs, monkeypatch):
+    a, b = two_packs
+    _patch_sizes(monkeypatch, {"pack-a": 1024, "pack-b": 1024})
+    config = SupervisorConfig(
+        host="127.0.0.1",
+        port=_free_port(),
+        model_paths=[a, b],
+        preload=["pack-a"],
+        default_model_id="pack-a",
+        api_key="secret",
+        engine_argv_override=_fake_argv(),
+    )
+    with running_supervisor(config) as (supervisor, base_url):
+        assert _wait_until(
+            lambda: supervisor.registry.get("pack-a").state == EngineState.READY, timeout_s=10.0
+        )
+
+        redacted = httpx.get(base_url + "/health", timeout=5.0)
+        assert redacted.status_code == 200
+        body = redacted.json()
+        assert body["ok"] is True
+        assert body["model"] == "pack-a"
+        assert "pid" in body["startup"]
+        engines = body["supervisor"]["engines"]
+        assert engines and set(engines[0]) == {"model", "state"}
+        assert "budget" not in body["supervisor"]
+
+        full = httpx.get(
+            base_url + "/health", headers={"Authorization": "Bearer secret"}, timeout=5.0
+        )
+        assert full.status_code == 200
+        full_body = full.json()
+        full_engines = full_body["supervisor"]["engines"]
+        assert full_engines and "port" in full_engines[0] and "pid" in full_engines[0]
+        assert "budget" in full_body["supervisor"]
+
+
+def test_v1_models_lists_aliases(tmp_path, two_packs, monkeypatch):
+    a, b = two_packs
+    _patch_sizes(monkeypatch, {"pack-a": 1024, "pack-b": 1024})
+    config = SupervisorConfig(
+        host="127.0.0.1",
+        port=_free_port(),
+        model_paths=[a, b],
+        preload=["pack-a"],
+        default_model_id="pack-a",
+        engine_argv_override=_fake_argv(),
+    )
+    with running_supervisor(config) as (supervisor, base_url):
+        if not hasattr(supervisor.registry, "add_alias"):
+            pytest.xfail("waits for registry aliases")
+        assert _wait_until(
+            lambda: supervisor.registry.get("pack-a").state == EngineState.READY, timeout_s=10.0
+        )
+        supervisor.registry.add_alias("pack-a", "pack-a-alias")
+        resp = httpx.get(base_url + "/v1/models", timeout=5.0)
+        assert resp.status_code == 200
+        by_id = {row["id"]: row for row in resp.json()["data"]}
+        # The service also auto-registers the engine's own self-reported id
+        # (here "fake", from the fixture) as an alias once READY; assert on
+        # membership, not exact equality, so that registration doesn't make
+        # this test brittle.
+        assert "pack-a-alias" in by_id["pack-a"]["aliases"]
+        assert by_id["pack-b"]["aliases"] == []

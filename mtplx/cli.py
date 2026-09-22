@@ -3918,7 +3918,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="127.0.0.1",
         help=(
             "Bind address. Default 127.0.0.1 is this Mac only; 0.0.0.0 shares "
-            "the API with other devices and VM guests (requires an API key — "
+            "the API with other devices and VM guests (requires an API key. "
             "add --api-key-file ~/.mtplx/api-key to generate one)"
         ),
     )

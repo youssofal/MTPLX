@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import socket
 import sys
 import time
@@ -179,6 +181,122 @@ def test_terminate_escalates_to_sigkill_for_stubborn_child(tmp_path):
         assert not proc.is_alive()
         assert code is not None
         assert elapsed < 5.0
+    finally:
+        if proc.is_alive():
+            proc.terminate(grace_s=0.1)
+
+
+def test_ready_after_delay_shows_not_ready_then_ready_via_warmup(spawned):
+    """R3: `/health` answers 200 ok=true immediately but with
+    warmup.ready=false; probe() must report BUSY, not READY, until the
+    fake engine's warmup elapses -- proving the gate reads the warmup
+    signal, not just `ok`."""
+    port = _free_port()
+    proc = spawned(port, _fake_argv(port, "--warmup-s", "0.6"))
+    results: list[Liveness] = []
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        verdict = proc.probe(timeout_s=0.2)
+        results.append(verdict)
+        if verdict == Liveness.READY:
+            break
+        time.sleep(0.05)
+    assert results[-1] == Liveness.READY
+    assert any(v == Liveness.BUSY for v in results[:-1])
+
+
+def test_probe_ready_immediately_when_warmup_not_signaled(spawned):
+    """A payload with no warmup field (the pre-R3 shape) is never gated;
+    plain `ok: true` is still READY right away."""
+    port = _free_port()
+    proc = spawned(port, _fake_argv(port))
+    ready = _wait_until(lambda: proc.probe(timeout_s=0.3) == Liveness.READY, timeout_s=5.0)
+    assert ready
+
+
+def test_spawn_scrubs_secret_shaped_env_vars(tmp_path, monkeypatch):
+    """H2: a child must never see MTPLX_API_KEY (or anything else
+    API_KEY/TOKEN/SECRET-shaped) via its inherited environment."""
+    monkeypatch.setenv("MTPLX_API_KEY", "super-secret-value")
+    monkeypatch.setenv("SOME_TOKEN", "also-secret")
+    monkeypatch.setenv("PLAIN_VAR", "keep-me")
+    dump_path = tmp_path / "env_dump.json"
+    script = tmp_path / "dump_env.py"
+    script.write_text(
+        "import json, os, sys\n"
+        f"json.dump(dict(os.environ), open({str(dump_path)!r}, 'w'))\n",
+        encoding="utf-8",
+    )
+    proc = EngineProcess(
+        "unused.gguf", _free_port(), [], argv_override=[sys.executable, str(script)]
+    )
+    proc.spawn()
+    try:
+        _wait_until(lambda: dump_path.exists(), timeout_s=5.0)
+        _wait_until(lambda: not proc.is_alive(), timeout_s=5.0)
+        seen = json.loads(dump_path.read_text())
+        assert "MTPLX_API_KEY" not in seen
+        assert "SOME_TOKEN" not in seen
+        assert seen.get("PLAIN_VAR") == "keep-me"
+    finally:
+        if proc.is_alive():
+            proc.terminate(grace_s=0.1)
+
+
+def test_spawn_env_overrides_win_over_scrub():
+    """Explicit `env=` overrides (e.g. MTPLX_APP_PARENT_PID) always survive
+    the scrub, even though the parent's own env may set the same name."""
+    port = _free_port()
+    proc = EngineProcess(
+        "unused.gguf",
+        port,
+        [],
+        env={"MTPLX_APP_PARENT_PID": "4242", "MTPLX_SUPERVISOR_PID": "4242"},
+        argv_override=[sys.executable, "-c", "pass"],
+    )
+    proc.spawn()
+    try:
+        _wait_until(lambda: not proc.is_alive(), timeout_s=5.0)
+    finally:
+        if proc.is_alive():
+            proc.terminate(grace_s=0.1)
+    assert proc.env == {"MTPLX_APP_PARENT_PID": "4242", "MTPLX_SUPERVISOR_PID": "4242"}
+
+
+def test_terminate_kills_the_whole_process_group(tmp_path):
+    """H3: engines are spawned with start_new_session=True and terminate()
+    kills the whole group, so a grandchild the engine itself spawned is
+    cleaned up too, not just the direct child (supervisor-exit orphan
+    protection)."""
+    child_pid_file = tmp_path / "child.pid"
+    script = tmp_path / "parent_with_child.py"
+    script.write_text(
+        "import subprocess, sys, time\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        f"open({str(child_pid_file)!r}, 'w').write(str(p.pid))\n"
+        "while True:\n"
+        "    time.sleep(0.05)\n",
+        encoding="utf-8",
+    )
+    proc = EngineProcess(
+        "unused.gguf", _free_port(), [], argv_override=[sys.executable, str(script)]
+    )
+    proc.spawn()
+    try:
+        _wait_until(lambda: child_pid_file.exists(), timeout_s=5.0)
+        grandchild_pid = int(child_pid_file.read_text().strip())
+
+        def grandchild_alive() -> bool:
+            try:
+                os.kill(grandchild_pid, 0)
+                return True
+            except OSError:
+                return False
+
+        assert _wait_until(grandchild_alive, timeout_s=3.0)
+        proc.terminate(grace_s=2.0)
+        assert not proc.is_alive()
+        assert _wait_until(lambda: not grandchild_alive(), timeout_s=3.0)
     finally:
         if proc.is_alive():
             proc.terminate(grace_s=0.1)

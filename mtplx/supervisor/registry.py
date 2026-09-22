@@ -11,11 +11,14 @@ backends under a cap" to "engine processes under supervision".
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+
+logger = logging.getLogger("mtplx.supervisor")
 
 
 class EngineState(str, Enum):
@@ -49,6 +52,7 @@ class EngineRecord:
     pins: int = 0
     last_used: float = field(default_factory=time.time)
     failure_reason: str | None = None
+    aliases: list[str] = field(default_factory=list)
 
 
 class EngineRegistry:
@@ -87,22 +91,32 @@ class EngineRegistry:
     def resolve(
         self, requested: str | None, default_id: str, strict: bool
     ) -> tuple[EngineRecord | None, str]:
-        """Resolve a requested model id to a record, per DESIGN.md behavior 1.
+        """Resolve a requested model id (or alias) to a record, per
+        DESIGN.md behavior 1.
 
         Returns ``(record, "loaded")`` when ``requested`` names a record
-        that is READY or LOADING; ``(record, "installed")`` when it names a
-        record in any other known state (INSTALLED, STOPPED, FAILED,
-        DRAINING); and, when ``requested`` is ``None`` or names nothing
-        registered, falls back to ``default_id`` as ``(record, "fallback")``
-        unless ``strict`` is set, in which case that case is
-        ``(None, "unknown")``.
+        (by model id or by a registered alias) that is READY or LOADING;
+        ``(record, "draining")`` when it names a record currently DRAINING
+        (a caller should treat this as unavailable, not loadable -- see
+        C1); ``(record, "installed")`` when it names a record in any other
+        known state (INSTALLED, STOPPED, FAILED); and, when ``requested``
+        is ``None`` or names nothing registered, falls back to
+        ``default_id`` as ``(record, "fallback")`` unless ``strict`` is
+        set, in which case that case is ``(None, "unknown")``.
         """
         with self._lock:
             if requested:
                 record = self._records.get(requested)
+                if record is None:
+                    for candidate in self._records.values():
+                        if requested in candidate.aliases:
+                            record = candidate
+                            break
                 if record is not None:
                     if record.state in (EngineState.READY, EngineState.LOADING):
                         return record, "loaded"
+                    if record.state == EngineState.DRAINING:
+                        return record, "draining"
                     return record, "installed"
             if strict:
                 return None, "unknown"
@@ -110,6 +124,40 @@ class EngineRegistry:
             if default is not None:
                 return default, "fallback"
             return None, "unknown"
+
+    def add_alias(self, model_id: str, alias: str) -> None:
+        """Register ``alias`` as another accepted name for ``model_id`` (R1:
+        engines often answer with their own served model id, which differs
+        from the pack directory name the supervisor routes by).
+
+        Idempotent: re-adding the same alias to the same model is a no-op.
+        An alias equal to an existing model id, or already registered as
+        another record's alias, is ignored with a warning log rather than
+        silently reassigning routing.
+        """
+        with self._lock:
+            record = self._records.get(model_id)
+            if record is None:
+                raise KeyError(model_id)
+            if alias == model_id or alias in record.aliases:
+                return
+            if alias in self._records:
+                logger.warning(
+                    "alias %r for model %r collides with an existing model id; ignored",
+                    alias,
+                    model_id,
+                )
+                return
+            for other_id, other in self._records.items():
+                if other_id != model_id and alias in other.aliases:
+                    logger.warning(
+                        "alias %r for model %r is already registered to %r; ignored",
+                        alias,
+                        model_id,
+                        other_id,
+                    )
+                    return
+            record.aliases.append(alias)
 
     # -- pins ---------------------------------------------------------------
 

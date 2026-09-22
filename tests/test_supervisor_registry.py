@@ -104,6 +104,69 @@ def test_resolve_missing_default_is_unknown():
     assert record is None
 
 
+def test_resolve_draining_engine_returns_draining_not_installed():
+    """C1: a DRAINING record must not be treated as loadable/installed --
+    resolve() reports it as its own "draining" verdict so a caller (F2's
+    proxy) can 503 it instead of JIT-reloading underneath the drain."""
+    registry = EngineRegistry()
+    registry.add(_spec("a"))
+    registry.set_state("a", EngineState.READY)
+    registry.set_state("a", EngineState.DRAINING)
+    record, verdict = registry.resolve("a", default_id="a", strict=False)
+    assert verdict == "draining"
+    assert record.state == EngineState.DRAINING
+
+
+def test_add_alias_resolves_to_canonical_record():
+    registry = EngineRegistry()
+    registry.add(_spec("pack-dir-name"))
+    registry.set_state("pack-dir-name", EngineState.READY)
+    registry.add_alias("pack-dir-name", "engine-served-id")
+    record, verdict = registry.resolve("engine-served-id", default_id="pack-dir-name", strict=False)
+    assert verdict == "loaded"
+    assert record.spec.model_id == "pack-dir-name"
+    assert "engine-served-id" in registry.get("pack-dir-name").aliases
+
+
+def test_add_alias_is_idempotent():
+    registry = EngineRegistry()
+    registry.add(_spec("a"))
+    registry.add_alias("a", "alias-1")
+    registry.add_alias("a", "alias-1")
+    assert registry.get("a").aliases == ["alias-1"]
+
+
+def test_add_alias_unknown_model_raises():
+    registry = EngineRegistry()
+    with pytest.raises(KeyError):
+        registry.add_alias("missing", "alias-1")
+
+
+def test_add_alias_colliding_with_existing_model_id_is_ignored():
+    registry = EngineRegistry()
+    registry.add(_spec("a"))
+    registry.add(_spec("b"))
+    registry.add_alias("a", "b")
+    assert registry.get("a").aliases == []
+
+
+def test_add_alias_colliding_with_another_records_alias_is_ignored():
+    registry = EngineRegistry()
+    registry.add(_spec("a"))
+    registry.add(_spec("b"))
+    registry.add_alias("a", "shared-alias")
+    registry.add_alias("b", "shared-alias")
+    assert registry.get("a").aliases == ["shared-alias"]
+    assert registry.get("b").aliases == []
+
+
+def test_add_alias_equal_to_own_model_id_is_a_no_op():
+    registry = EngineRegistry()
+    registry.add(_spec("a"))
+    registry.add_alias("a", "a")
+    assert registry.get("a").aliases == []
+
+
 def test_pin_increments_and_unknown_id_raises():
     registry = EngineRegistry()
     registry.add(_spec("a"))

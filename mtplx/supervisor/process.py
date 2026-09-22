@@ -8,12 +8,39 @@ engine children, and replicates the macOS app's busy-vs-dead liveness split
 dead) and restart backoff (`DaemonSupervisor.swift`'s `DaemonRestartPolicy`)
 in Python. Health is fetched the same way `daemon_client.fetch_daemon_health`
 does: stdlib HTTP, no new dependency.
+
+Orphan protection: every child is spawned in its own process group
+(``start_new_session=True``), so ``terminate()`` can ``os.killpg`` the whole
+group (the engine and anything it may have spawned) rather than just the one
+pid. The child also inherits ``MTPLX_APP_PARENT_PID`` (and, informationally,
+``MTPLX_SUPERVISOR_PID``) set to the supervisor's own pid. `mtplx serve`
+already understands ``MTPLX_APP_PARENT_PID`` on its own: `cmd_serve_public`
+in `mtplx/commands/public.py` (`_app_parent_pid_from_env`,
+`_run_server_child_with_app_parent_watchdog`) watches that pid and tears
+down the real server child itself if it vanishes. Setting it to the
+supervisor's pid means an engine self-terminates if the supervisor is
+SIGKILLed or OOM-killed, without the supervisor having to do anything.
+
+Warmup gating: `probe()` treats a `READY` verdict as gated on any warmup
+signal the payload carries. The real engine's `/health` (see
+`mtplx/server/openai.py`'s `_startup_health_payload`, ~line 16925, and the
+`/health` route at ~line 29674) nests `startup.warmup` = `{"enabled",
+"ran", "tokens", "elapsed_s", "error"}`. In practice that blocking startup
+warmup (`_run_startup_warmup`) runs during `ServerState.__init__`, before
+uvicorn ever starts serving, so `ran` is already True the first time a
+probe can succeed at all -- gating on it does not change observed JIT-load
+latency against today's real engine. The gate is implemented anyway,
+generically, against both that nested shape and a simpler top-level
+`{"warmup": {"ready": bool}}` shape (used by the test fixture and left
+available for a future engine build that reports async warmup progress),
+so a not-yet-ready engine is reported BUSY rather than READY.
 """
 
 from __future__ import annotations
 
 import http.client
 import json
+import os
 import re
 import signal
 import socket
@@ -41,6 +68,49 @@ _OOM_PATTERNS = tuple(
         r"MemoryError",
     )
 )
+
+# Case-insensitive: matched against the joined stderr tail in death_reason(),
+# ahead of the OOM patterns. Lets a bind-collision (see budget/service
+# M4 -- two concurrent JIT loads picking the same free port) be retried on a
+# fresh port instead of being reported as a generic "exit" failure.
+_PORT_IN_USE_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"address already in use",
+        r"errno 48",
+        r"errno 98",
+    )
+)
+
+# H2 (security review): any env var whose name contains one of these,
+# case-insensitive, is stripped before an engine child is spawned so a
+# `--no-auth` engine never inherits the supervisor's own credential (e.g.
+# MTPLX_API_KEY) via os.environ / /proc/<pid>/environ.
+_SECRET_ENV_NAME_RE = re.compile(r"(API_KEY|TOKEN|SECRET)", re.IGNORECASE)
+
+
+def _scrubbed_env(overrides: dict[str, str] | None) -> dict[str, str]:
+    """Parent environment minus anything secret-shaped, with `overrides`
+    applied last so they always win (used for MTPLX_APP_PARENT_PID etc,
+    none of which match the secret pattern anyway)."""
+    env = {key: value for key, value in os.environ.items() if not _SECRET_ENV_NAME_RE.search(key)}
+    if overrides:
+        env.update(overrides)
+    return env
+
+
+def _warmup_ready(payload: dict) -> bool:
+    """True unless `payload` carries an explicit not-yet-ready warmup
+    signal. See the module docstring for the two shapes recognized."""
+    warmup = payload.get("warmup")
+    if isinstance(warmup, dict) and "ready" in warmup:
+        return bool(warmup["ready"])
+    startup = payload.get("startup")
+    if isinstance(startup, dict):
+        nested = startup.get("warmup")
+        if isinstance(nested, dict) and nested.get("enabled") and "ran" in nested:
+            return bool(nested["ran"])
+    return True
 
 
 class Liveness(str, Enum):
@@ -94,7 +164,13 @@ class RestartTracker:
         return min(self.policy.max_delay_s, delay)
 
     def reset(self) -> None:
+        """Clear crash history and bump `generation` (H4), so any
+        already-scheduled `_restart_after_delay` from a crash that predates
+        this reset is provably stale by the generation counter itself,
+        rather than by an incidental registry-state check at the call
+        site."""
         self._crash_times.clear()
+        self.generation += 1
 
 
 class EngineProcess:
@@ -150,13 +226,20 @@ class EngineProcess:
 
     def spawn(self) -> None:
         """Start the child. Stdout is discarded; stderr is drained on a
-        background thread into a bounded tail so the pipe never fills."""
+        background thread into a bounded tail so the pipe never fills.
+
+        Spawned with ``start_new_session=True`` so the child (and anything
+        it spawns) lands in its own process group, letting ``terminate()``
+        kill the whole group by pgid instead of just this one pid. The env
+        is always scrubbed of secret-shaped names (H2); ``self.env`` (if
+        given) is applied on top as explicit overrides."""
         self._proc = subprocess.Popen(
             self.argv,
-            env=self.env,
+            env=_scrubbed_env(self.env),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
+            start_new_session=True,
         )
         self._reader_thread = threading.Thread(target=self._drain_stderr, daemon=True)
         self._reader_thread.start()
@@ -205,6 +288,10 @@ class EngineProcess:
         return Liveness.BUSY
 
     def _health_ok(self, timeout_s: float) -> bool:
+        """`ok: true` alone is not enough: a payload carrying an explicit
+        not-yet-ready warmup signal (`_warmup_ready`, see module docstring)
+        keeps this False -- and the caller's probe() reports BUSY, not
+        READY -- until the engine reports warmup complete."""
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout_s)
         try:
             conn.request("GET", "/health")
@@ -213,7 +300,9 @@ class EngineProcess:
             if response.status != 200:
                 return False
             payload = json.loads(body.decode("utf-8"))
-            return isinstance(payload, dict) and payload.get("ok") is True
+            if not isinstance(payload, dict) or payload.get("ok") is not True:
+                return False
+            return _warmup_ready(payload)
         except (OSError, ValueError):
             return False
         finally:
@@ -227,15 +316,34 @@ class EngineProcess:
             return 0.0
         return max(0.0, now - self.unresponsive_since)
 
+    def _signal_group(self, sig: int) -> None:
+        """Signal the whole process group (H3: the child was spawned with
+        start_new_session=True, so its pgid equals its own pid, and this
+        also reaches anything the engine itself spawned). Falls back to
+        signaling just the one pid if the group is already gone or
+        killpg is unavailable (non-POSIX)."""
+        proc = self._proc
+        if proc is None:
+            return
+        killpg = getattr(os, "killpg", None)
+        if killpg is not None:
+            try:
+                killpg(proc.pid, sig)
+                return
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        proc.send_signal(sig)
+
     def terminate(self, grace_s: float = 10.0) -> int | None:
         """SIGTERM, wait grace_s; SIGINT, wait grace_s/2; SIGKILL, wait
-        grace_s/2. Idempotent. Returns the exit code (None if never spawned)."""
+        grace_s/2. Signals the whole process group each step. Idempotent.
+        Returns the exit code (None if never spawned)."""
         proc = self._proc
         if proc is None:
             return None
         if proc.poll() is not None:
             return proc.returncode
-        proc.terminate()
+        self._signal_group(signal.SIGTERM)
         try:
             proc.wait(timeout=max(0.1, grace_s))
             return proc.returncode
@@ -244,7 +352,7 @@ class EngineProcess:
         if proc.poll() is not None:
             return proc.returncode
         try:
-            proc.send_signal(signal.SIGINT)
+            self._signal_group(signal.SIGINT)
             proc.wait(timeout=max(0.1, grace_s / 2))
             return proc.returncode
         except (subprocess.TimeoutExpired, ProcessLookupError):
@@ -252,7 +360,7 @@ class EngineProcess:
         if proc.poll() is not None:
             return proc.returncode
         try:
-            proc.kill()
+            self._signal_group(signal.SIGKILL)
         except ProcessLookupError:
             return proc.poll()
         try:
@@ -262,9 +370,14 @@ class EngineProcess:
         return proc.poll()
 
     def death_reason(self) -> str:
-        """"out_of_memory" if the captured stderr tail matches a known OOM
-        pattern; else "signal" for a negative return code; else "exit"."""
+        """"port_in_use" if the stderr tail matches a bind-collision message
+        (M4: the caller can retry on a fresh port); else "out_of_memory" if
+        it matches a known OOM pattern; else "signal" for a negative return
+        code; else "exit"."""
         tail = "\n".join(self._stderr_tail)
+        for pattern in _PORT_IN_USE_PATTERNS:
+            if pattern.search(tail):
+                return "port_in_use"
         for pattern in _OOM_PATTERNS:
             if pattern.search(tail):
                 return "out_of_memory"

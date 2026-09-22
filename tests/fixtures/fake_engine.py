@@ -12,11 +12,21 @@ Flags:
   --hang-health           /health never responds (simulates a wedged engine)
   --exit-after-s FLOAT    process exits cleanly this many seconds after start
   --oom                   print a Metal OOM line to stderr and exit(1)
+  --warmup-s FLOAT        /health answers 200 "ok" but with
+                          `"warmup": {"ready": false}` until this many
+                          seconds after start (default 0: ready immediately;
+                          see process.py R3 -- gates the supervisor's READY
+                          verdict on a warmup signal when one is present)
+  --alias-id ID           `/v1/models` reports this as its served id
+                          (default "fake"); used to exercise R1 alias
+                          registration
 
 Also answers ``POST /v1/chat/completions`` for supervisor proxy tests: with
 ``"stream": true`` it emits a 3-frame SSE response (each frame echoes the
 request body's ``model`` field), otherwise it echoes the parsed request
 body back as JSON under ``{"echo": <body>, "model": "fake"}``.
+
+Also answers ``GET /v1/models`` with ``{"data": [{"id": <alias-id>}]}``.
 """
 
 from __future__ import annotations
@@ -38,6 +48,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--hang-health", action="store_true")
     parser.add_argument("--exit-after-s", type=float, default=None)
     parser.add_argument("--oom", action="store_true")
+    parser.add_argument("--warmup-s", type=float, default=0.0)
+    parser.add_argument("--alias-id", type=str, default="fake")
     return parser.parse_args(argv)
 
 
@@ -47,6 +59,14 @@ def _make_handler(args: argparse.Namespace) -> type[BaseHTTPRequestHandler]:
             pass
 
         def do_GET(self) -> None:  # noqa: N802 - stdlib method name
+            if self.path == "/v1/models":
+                payload = json.dumps({"data": [{"id": args.alias_id}]}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
             if self.path != "/health":
                 self.send_response(404)
                 self.end_headers()
@@ -62,7 +82,10 @@ def _make_handler(args: argparse.Namespace) -> type[BaseHTTPRequestHandler]:
                 self.end_headers()
                 self.wfile.write(json.dumps({"ok": False}).encode("utf-8"))
                 return
-            payload = json.dumps({"ok": True, "model": "fake"}).encode("utf-8")
+            warmup_ready = elapsed >= args.warmup_s
+            payload = json.dumps(
+                {"ok": True, "model": "fake", "warmup": {"ready": warmup_ready}}
+            ).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
