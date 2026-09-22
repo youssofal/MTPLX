@@ -272,3 +272,58 @@ and OpenCode never receive it, so no flag is needed for them.
 `--no-stats-footer` still turns it off everywhere, and
 `MTPLX_STATS_FOOTER_SCOPE=all` restores the pre-2.5.3 behavior. Metrics
 remain available at `/metrics`.
+
+## Serving several models: `mtplx supervise`
+
+`mtplx serve` loads exactly one model for the life of the process. `mtplx
+supervise` puts one front door in front of several models instead, loading
+and unloading engine child processes on demand. `mtplx serve` itself is
+unchanged — supervise is a separate command, not a flag on serve.
+
+```bash
+mtplx supervise --models 9b,27b --preload 9b --default 9b \
+  --host 0.0.0.0 --port 8000 --api-key-file ~/.mtplx/api-key
+```
+
+Each `--models` entry resolves the same way `serve --model` does: a local
+path, a `~/.mtplx/models/<Org>--<Name>` directory, or an installed catalog
+id. `--models all` picks up every installed pack. A name that isn't
+installed is a fatal error that lists what is.
+
+A request's `model` field routes it: a match on a loaded or installed model
+routes there (loading it just-in-time if it isn't running yet, holding the
+request until it's ready or `--load-timeout-s` runs out). An unmatched or
+missing `model` falls back to `--default` and adds the response header
+`x-mtplx-routed-model: <default>` — pass `--strict-model` to return a 404
+`model_not_found` error there instead.
+
+`--memory-budget <GiB>` caps how much engine memory the supervisor will
+admit at once; the default is this machine's usable budget. Without
+`--evict-to-fit`, a model that would exceed the budget is refused with a 507
+carrying `{"error": {"code": "insufficient_memory", "needed_bytes",
+"available_bytes", "would_free": [...]}}`. With `--evict-to-fit`, the
+supervisor unloads idle models in least-recently-used order (never one with
+an in-flight request) until the new one fits.
+
+A model with no in-flight requests for `--idle-ttl-s` (default 1800, `0`
+disables) is drained and unloaded; `--default` is exempt unless you also
+pass `--unload-default`.
+
+If an engine child crashes, the supervisor restarts it with backoff, up to 3
+crashes in 120 seconds, after which it stays `failed` until an admin
+restart. A crash classified as out-of-memory never auto-restarts — retrying
+into the same OOM only spins.
+
+Admin routes always require the API key; inference routes follow the same
+rule `serve` uses — no key on a localhost bind, a key required otherwise
+(`--insecure-lan --yes` lifts that for inference only, and prints a warning
+at start).
+
+| Route | Method | Auth |
+| --- | --- | --- |
+| `/mtplx/admin/models` | GET | key always |
+| `/mtplx/admin/load` | POST | key always |
+| `/mtplx/admin/unload` | POST | key always |
+| `/mtplx/admin/restart` | POST | key always |
+| `/mtplx/admin/health` | GET | key always |
+| `/v1/*` (chat, embeddings, ...) | as usual | localhost free, else key (or `--insecure-lan`) |

@@ -12,6 +12,11 @@ Flags:
   --hang-health           /health never responds (simulates a wedged engine)
   --exit-after-s FLOAT    process exits cleanly this many seconds after start
   --oom                   print a Metal OOM line to stderr and exit(1)
+
+Also answers ``POST /v1/chat/completions`` for supervisor proxy tests: with
+``"stream": true`` it emits a 3-frame SSE response (each frame echoes the
+request body's ``model`` field), otherwise it echoes the parsed request
+body back as JSON under ``{"echo": <body>, "model": "fake"}``.
 """
 
 from __future__ import annotations
@@ -58,6 +63,37 @@ def _make_handler(args: argparse.Namespace) -> type[BaseHTTPRequestHandler]:
                 self.wfile.write(json.dumps({"ok": False}).encode("utf-8"))
                 return
             payload = json.dumps({"ok": True, "model": "fake"}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_POST(self) -> None:  # noqa: N802 - stdlib method name
+            if self.path != "/v1/chat/completions":
+                self.send_response(404)
+                self.end_headers()
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            try:
+                body = json.loads(raw.decode("utf-8")) if raw else {}
+            except ValueError:
+                body = {}
+            if not isinstance(body, dict):
+                body = {}
+            if body.get("stream"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                for i in range(3):
+                    frame = json.dumps({"frame": i, "model": "fake"}).encode("utf-8")
+                    self.wfile.write(b"data: " + frame + b"\n\n")
+                    self.wfile.flush()
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                return
+            payload = json.dumps({"echo": body, "model": "fake"}).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))

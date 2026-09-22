@@ -727,6 +727,7 @@ version = "2.11.3"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "mlx", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
     { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
@@ -762,6 +763,7 @@ requires-dist = [
     { name = "dflash-mlx", marker = "extra == 'competitors'", specifier = "==0.1.0" },
     { name = "fastapi", specifier = ">=0.136" },
     { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.136" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "huggingface-hub", specifier = ">=0.36" },
     { name = "llguidance", marker = "extra == 'server'", specifier = ">=1.7" },
     { name = "mlx", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.32.2,<0.33" },

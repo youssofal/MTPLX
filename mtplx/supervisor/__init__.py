@@ -7,13 +7,16 @@ re-exports the public names from the pieces implemented so far.
 
 from __future__ import annotations
 
+from .admin import AdminApp
 from .budget import Admission, admit, estimate_resident_bytes, total_ram_bytes
+from .proxy import EngineUnavailable, InsufficientMemory, ModelNotFound, ProxyApp
 from .registry import (
     EngineRecord,
     EngineRegistry,
     EngineSpec,
     EngineState,
 )
+from .service import Supervisor, SupervisorConfig, run_supervisor
 
 __all__ = [
     "EngineState",
@@ -24,4 +27,12 @@ __all__ = [
     "admit",
     "estimate_resident_bytes",
     "total_ram_bytes",
+    "AdminApp",
+    "ProxyApp",
+    "InsufficientMemory",
+    "EngineUnavailable",
+    "ModelNotFound",
+    "Supervisor",
+    "SupervisorConfig",
+    "run_supervisor",
 ]

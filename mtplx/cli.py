@@ -1030,6 +1030,12 @@ def cmd_thermal_public(args: argparse.Namespace) -> int:
     return handler(args)
 
 
+def cmd_supervise_public(args: argparse.Namespace) -> int:
+    from .commands.public import cmd_supervise_public as handler
+
+    return handler(args)
+
+
 def cmd_max_public(args: argparse.Namespace) -> int:
     from .commands.public import cmd_max_public as handler
 
@@ -3881,6 +3887,158 @@ def build_parser() -> argparse.ArgumentParser:
         help="Deprecated, no effect: MTPLX runs on stock PyPI MLX; no fork is required.",
     )
     serve_p.set_defaults(func=cmd_serve_public)
+
+    supervise_p = sub.add_parser(
+        "supervise",
+        help="Serve several models behind one port, loading/unloading engines on demand",
+    )
+    supervise_p.add_argument(
+        "--models",
+        required=True,
+        help=(
+            "Comma-separated model ids/paths to make available, or 'all' for "
+            "every installed pack. Each entry resolves like `serve --model`: "
+            "a local path, a ~/.mtplx/models/<Org>--<Name> dir, or an "
+            "installed catalog id."
+        ),
+    )
+    supervise_p.add_argument("--cache-dir")
+    _add_model_search_dir_args(supervise_p)
+    supervise_p.add_argument(
+        "--preload",
+        help="Comma-separated subset of --models to load at startup (default: the first model)",
+    )
+    supervise_p.add_argument(
+        "--default",
+        dest="default",
+        help="Model id routed to when a request's model is missing or unknown (default: the first --models entry)",
+    )
+    supervise_p.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help=(
+            "Bind address. Default 127.0.0.1 is this Mac only; 0.0.0.0 shares "
+            "the API with other devices and VM guests (requires an API key — "
+            "add --api-key-file ~/.mtplx/api-key to generate one)"
+        ),
+    )
+    supervise_p.add_argument("--port", type=int, default=8000)
+    supervise_p.add_argument(
+        "--api-key",
+        default=None,
+        help="Require Bearer or X-API-Key auth. Required for non-localhost binds.",
+    )
+    supervise_p.add_argument(
+        "--api-key-file",
+        help=(
+            "Read the API key from a local file instead of argv/env. "
+            "A missing file is created with a fresh key (printed once)."
+        ),
+    )
+    supervise_p.add_argument(
+        "--yes", action="store_true", help="Confirm unsafe non-interactive actions"
+    )
+    supervise_p.add_argument(
+        "--memory-budget",
+        type=float,
+        default=None,
+        metavar="GIB",
+        help="Engine memory budget in GiB. Default: this machine's usable budget.",
+    )
+    supervise_p.add_argument("--idle-ttl-s", type=float, default=1800.0)
+    supervise_p.add_argument("--load-timeout-s", type=float, default=600.0)
+    supervise_p.add_argument("--unresponsive-grace-s", type=float, default=90.0)
+    supervise_p.add_argument("--drain-s", type=float, default=15.0)
+    supervise_p.add_argument("--evict-to-fit", action="store_true")
+    supervise_p.add_argument("--strict-model", action="store_true")
+    supervise_p.add_argument(
+        "--insecure-lan",
+        action="store_true",
+        help="Lift the API-key requirement for inference routes on a non-localhost bind. Requires --yes.",
+    )
+    supervise_p.add_argument("--unload-default", action="store_true")
+    supervise_p.add_argument(
+        "--app-launch-id",
+        help="Opaque native-app launch id echoed by /health for daemon ownership checks.",
+    )
+    supervise_p.add_argument(
+        "--profile",
+        type=_profile_arg,
+        metavar=_PROFILE_METAVAR,
+        default=DEFAULT_PROFILE_NAME,
+        help="Runtime profile forwarded to every engine child.",
+    )
+    supervise_p.add_argument(
+        "--generation-mode",
+        choices=["mtp", "ar", "auto"],
+        default=None,
+        help="Daemon decode mode forwarded to every engine child.",
+    )
+    supervise_p.add_argument(
+        "--no-mtp",
+        action="store_true",
+        dest="no_mtp",
+        default=False,
+        help="Use target-only AR generation on every engine child.",
+    )
+    supervise_p.add_argument("--depth", type=int, default=3)
+    supervise_p.add_argument(
+        "--context-window",
+        type=_positive_int,
+        help="Override context window. Default reads the model/tokenizer config.",
+    )
+    supervise_p.add_argument(
+        "--batching-preset",
+        choices=BATCHING_PRESET_CHOICES,
+        default="latency",
+        help="Concurrent batching preset forwarded to every engine child.",
+    )
+    supervise_p.add_argument("--max-active-requests", type=_positive_int)
+    supervise_p.add_argument(
+        "--paged-kv-quantization",
+        "--paged-kv-quant",
+        "--kv-quant",
+        dest="paged_kv_quantization",
+        metavar="{off,q8,q4}",
+        type=_kv_quant_arg,
+        default=None,
+    )
+    supervise_p.add_argument(
+        "--ssd-session-cache",
+        choices=["off", "on", "write-only"],
+        default="on",
+    )
+    supervise_p.add_argument(
+        "--ssd-session-cache-dir",
+        help="Directory for persistent SessionBank snapshots.",
+    )
+    supervise_p.add_argument("--prefill-chunk-tokens", type=_positive_int)
+    supervise_p.add_argument(
+        "--embedding-model",
+        action="append",
+        default=[],
+        metavar="REF[=SERVED_ID]",
+        help="Serve REF on /v1/embeddings (repeatable). Forwarded to every engine child.",
+    )
+    supervise_p.add_argument(
+        "--reranker-model",
+        action="append",
+        default=[],
+        metavar="REF[=SERVED_ID]",
+        help="Serve REF on /v1/rerank (repeatable). Forwarded to every engine child.",
+    )
+    supervise_p.add_argument(
+        "--fan-mode",
+        choices=FAN_MODE_CHOICES,
+        default="default",
+        help="Fan policy forwarded to every engine child.",
+    )
+    supervise_p.add_argument(
+        "--enable-thermal-poll",
+        action="store_true",
+        help="Enable live fan telemetry polling. Off by default.",
+    )
+    supervise_p.set_defaults(func=cmd_supervise_public)
 
     preflight_p = sub.add_parser(
         "bench-preflight", help="Check benchmark contamination before speed runs"
