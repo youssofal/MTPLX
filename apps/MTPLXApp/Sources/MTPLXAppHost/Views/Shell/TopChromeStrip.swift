@@ -49,11 +49,27 @@ struct TopChromeStrip: View {
                         .font(.system(size: 11, weight: .regular, design: .monospaced))
                         .foregroundStyle(Brand.typeTertiary)
                         .accessibilityHidden(true)
+
+                    // Engine first, model second: the engine decides which
+                    // models are even loadable, so reading left to right the
+                    // second control is always scoped by the first.
+                    engineMenu
+
+                    Text("\u{00B7}")
+                        .font(.system(size: 11, weight: .regular, design: .monospaced))
+                        .foregroundStyle(Brand.typeTertiary)
+                        .accessibilityHidden(true)
+
+                    // One model control for both engines: it opens the same
+                    // picker, which lists whatever the selected engine can load.
                     Button {
                         router.modelPickerPresented.toggle()
                     } label: {
                         HStack(spacing: 5) {
-                            Text(modelShort(activeModelLabel))
+                            Text(isSplashEngine
+                                 ? (SplashPackageOption.option(for: configuration.splashModel)?.displayName
+                                    ?? MTPLXAppConfiguration.splashPackageLabel(configuration.splashModel))
+                                 : modelShort(activeModelLabel))
                                 .font(.system(size: 11, weight: .medium, design: .monospaced))
                                 .tracking(1)
                                 .lineLimit(1)
@@ -117,6 +133,67 @@ struct TopChromeStrip: View {
 
     /// Show catalog-backed names where possible so the top strip stays
     /// readable even when the backend reports a full path or HF id.
+    private var isSplashEngine: Bool {
+        MTPLXAppConfiguration.normalizedEngine(configuration.engine) == "splash"
+    }
+
+    /// MLX or Splash, in the same monospaced idiom as the model control.
+    @ViewBuilder
+    private var engineMenu: some View {
+        Menu {
+            ForEach(MTPLXAppConfiguration.engineChoices, id: \.self) { choice in
+                Button {
+                    apply { $0.engine = choice }
+                } label: {
+                    if choice == MTPLXAppConfiguration.normalizedEngine(configuration.engine) {
+                        Label(Self.engineLabel(choice), systemImage: "checkmark")
+                    } else {
+                        Text(Self.engineLabel(choice))
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Text(Self.engineLabel(configuration.engine).uppercased())
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .tracking(1)
+                    .lineLimit(1)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .bold))
+            }
+            .foregroundStyle(Brand.typeSecondary)
+            .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help(tr("Change engine"))
+    }
+
+    static func engineLabel(_ raw: String) -> String {
+        MTPLXAppConfiguration.normalizedEngine(raw) == "splash" ? "Splash" : "MLX"
+    }
+
+    /// Persist a chrome-level change, restarting the daemon if one is up —
+    /// the same contract the model picker uses, so a switch from here and a
+    /// switch from Settings behave identically.
+    private func apply(_ mutate: @escaping (inout MTPLXAppConfiguration) -> Void) {
+        var next = backend.configuration
+        mutate(&next)
+        if MTPLXAppConfiguration.normalizedEngine(next.engine) == "splash" {
+            // Splash's KV width is fixed in its kernels; keep the stored
+            // config from claiming a width the engine will ignore.
+            next.pagedKVQuantization = "q8"
+        }
+        Task {
+            do {
+                try await backend.applyConfiguration(next, restartIfRunning: true)
+            } catch {
+                print("MTPLX: engine switch failed: \(error)")
+            }
+        }
+    }
+
     private func modelShort(_ raw: String) -> String {
         let stripped = MTPLXModelOption.displayName(
             for: raw,

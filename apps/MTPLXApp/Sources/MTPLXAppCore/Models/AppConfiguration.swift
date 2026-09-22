@@ -184,6 +184,70 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
     public var profile: String
     public var host: String
     public var port: Int
+    /// The default engine: MTPLX's own MLX runtime.
+    public static let defaultEngine = "mlx"
+
+    /// Every engine the daemon accepts for `--engine`.
+    public static let engineChoices = ["mlx", "splash"]
+
+    /// Splash's flagship package; the engine accepts only its own packages.
+    public static let defaultSplashModel = "incoai/Qwen3.8-27B-Splash"
+
+    /// The Splash packages the UI offers, newest flagship first.
+    /// Splash's KV width is compiled into its Metal kernels, not configurable.
+    ///
+    /// Every KV control in the app reads a `KVQuantPolicy`, so publishing one
+    /// here locks all of them from a single place — including the panels that
+    /// never see a daemon response.
+    public static let splashKVQuantPolicy = KVQuantPolicy(
+        supported: false,
+        modes: ["q8"],
+        restartRequired: false,
+        proofLevel: "engine-fixed",
+        disabledReason:
+            "Splash only supports q8. Its Metal kernels read 8-bit KV directly, so the width is fixed in the engine. Switch the engine to MLX for 4-bit or unquantized KV."
+    )
+
+    public static var splashPackageChoices: [String] {
+        SplashPackageOption.catalog.map(\.id)
+    }
+
+    /// "Qwen3.8-27B" from "incoai/Qwen3.8-27B-Splash", for a compact control.
+    public static func splashPackageLabel(_ identifier: String) -> String {
+        identifier
+            .split(separator: "/").last
+            .map { $0.replacingOccurrences(of: "-Splash", with: "") }
+            ?? identifier
+    }
+
+    /// The model this configuration will actually serve, whichever engine.
+    public var activeModelReference: String {
+        normalizedEngine(engine) == "splash" ? splashModel : model
+    }
+
+    private func normalizedEngine(_ raw: String) -> String {
+        MTPLXAppConfiguration.normalizedEngine(raw)
+    }
+
+    /// An unknown persisted value must never reach argparse as `--engine`.
+    public static func normalizedEngine(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return engineChoices.contains(trimmed) ? trimmed : defaultEngine
+    }
+
+    /// Which inference engine the daemon runs.
+    ///
+    /// `"mlx"` is MTPLX's own runtime: many architectures, native MTP, and
+    /// 4-bit / 8-bit / unquantized paged KV. `"splash"` serves the same API
+    /// over Inco's Splash engine, which is specialized per model and whose KV
+    /// cache is fixed at 8-bit. Changing it restarts the daemon.
+    public var engine: String
+    /// The Splash package served when `engine` is `"splash"`.
+    ///
+    /// Splash loads only its own packages, so this is deliberately separate
+    /// from `model`: switching engines must not overwrite the MLX checkpoint
+    /// the user chose, or vice versa.
+    public var splashModel: String
     public var generationMode: String
     public var loadMTP: Bool
     public var schedulerMode: String
@@ -372,6 +436,8 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         profile: String = "auto",
         host: String = "127.0.0.1",
         port: Int = 8000,
+        engine: String = MTPLXAppConfiguration.defaultEngine,
+        splashModel: String = MTPLXAppConfiguration.defaultSplashModel,
         generationMode: String = "mtp",
         loadMTP: Bool = true,
         schedulerMode: String = "serial",
@@ -443,6 +509,8 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         self.profile = profile
         self.host = host
         self.port = port
+        self.engine = engine
+        self.splashModel = splashModel
         self.generationMode = generationMode
         self.loadMTP = loadMTP
         self.schedulerMode = schedulerMode
@@ -715,6 +783,8 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         case profile
         case host
         case port
+        case engine
+        case splashModel = "splash_model"
         case generationMode = "generation_mode"
         case loadMTP = "load_mtp"
         case schedulerMode = "scheduler_mode"
@@ -805,6 +875,10 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         profile = field(String.self, .profile) ?? defaults.profile
         host = field(String.self, .host) ?? defaults.host
         port = field(Int.self, .port) ?? defaults.port
+        engine = MTPLXAppConfiguration.normalizedEngine(
+            field(String.self, .engine) ?? defaults.engine
+        )
+        splashModel = field(String.self, .splashModel) ?? defaults.splashModel
         generationMode = field(String.self, .generationMode) ?? defaults.generationMode
         loadMTP = field(Bool.self, .loadMTP) ?? defaults.loadMTP
         schedulerMode = field(String.self, .schedulerMode) ?? defaults.schedulerMode

@@ -36,7 +36,11 @@ let package = Package(
         .testTarget(
             name: "MTPLXAppCoreTests",
             dependencies: ["MTPLXAppCore"],
-            path: "Tests/MTPLXAppCoreTests"
+            path: "Tests/MTPLXAppCoreTests",
+            // Real /health, /snapshot and /settings responses captured from a
+            // live `mtplx serve --engine splash`, so the decoding tests run
+            // against what the daemon actually sends rather than a guess.
+            resources: [.process("Fixtures")]
         ),
         .testTarget(
             name: "MTPLXAppHostTests",

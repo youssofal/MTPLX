@@ -1544,7 +1544,8 @@ public final class ChatViewModel: ObservableObject {
             draftedByDepth: stats?.draftedByDepth,
             verifyCalls: stats?.verifyCalls,
             verifyTimeS: stats?.verifyTimeS,
-            thinkingTimeMs: thinkingTimeMs
+            thinkingTimeMs: thinkingTimeMs,
+            cachedTokens: usage?.cachedTokens
         )
         let statsJSON: String? = {
             guard let data = try? JSONEncoder().encode(chatStats),

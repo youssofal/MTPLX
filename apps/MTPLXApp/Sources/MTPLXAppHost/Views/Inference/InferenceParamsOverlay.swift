@@ -506,8 +506,18 @@ struct InferenceParamsOverlay: View, Equatable {
     private var reasoningPolicy: ReasoningPolicy? {
         modelControls?.reasoning ?? compatibleSettings?.reasoningPolicy ?? fallbackReasoningPolicy
     }
+    /// True as soon as the engine is Splash, before any daemon reports in.
+    ///
+    /// This panel is reachable from the top bar and has its own KV picker, so
+    /// locking only the Settings card left a second, live control that could
+    /// still promise a width Splash cannot honor.
+    private var splashEngineSelected: Bool {
+        MTPLXAppConfiguration.normalizedEngine(snapshot.configuration.engine) == "splash"
+    }
+
     private var kvQuantPolicy: KVQuantPolicy? {
-        modelControls?.kvQuant ?? compatibleSettings?.kvQuantPolicy ?? fallbackKVQuantPolicy
+        if splashEngineSelected { return MTPLXAppConfiguration.splashKVQuantPolicy }
+        return modelControls?.kvQuant ?? compatibleSettings?.kvQuantPolicy ?? fallbackKVQuantPolicy
     }
     private var contextWindowPolicy: ContextWindowPolicy? {
         modelControls?.contextWindow
@@ -1529,6 +1539,7 @@ struct InferenceParamsOverlay: View, Equatable {
     }
 
     private var currentKVQuantization: String {
+        if splashEngineSelected { return "q8" }
         guard kvQuantSupported else { return "off" }
         switch snapshot.configuration.pagedKVQuantization {
         case "q8", "q4":

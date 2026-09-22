@@ -1018,6 +1018,12 @@ def cmd_qa_public(args: argparse.Namespace) -> int:
     return handler(args)
 
 
+def cmd_splash(args: argparse.Namespace) -> int:
+    from .commands.splash import cmd_splash as handler
+
+    return handler(args)
+
+
 def cmd_serve_public(args: argparse.Namespace) -> int:
     from .commands.public import cmd_serve_public as handler
 
@@ -2232,6 +2238,40 @@ def build_parser() -> argparse.ArgumentParser:
 
     advanced_p = sub.add_parser("advanced", help=argparse.SUPPRESS)
     advanced_p.set_defaults(func=lambda _args: print(_format_advanced_help()) or 0)
+
+    splash_p = sub.add_parser(
+        "splash", help="Manage the Splash engine's model packages"
+    )
+    splash_p.add_argument("--json", action="store_true", help="Machine-readable output")
+    splash_p.add_argument(
+        "--splash-prefix", default=None, help="Path to a non-Homebrew Splash install"
+    )
+    splash_p.set_defaults(func=cmd_splash, splash_action="list")
+    splash_sub = splash_p.add_subparsers(dest="splash_action")
+
+    splash_list_p = splash_sub.add_parser("list", help="Show packages and install state")
+    splash_list_p.add_argument("--json", action="store_true")
+    splash_list_p.add_argument("--splash-prefix", default=None)
+    splash_list_p.set_defaults(func=cmd_splash)
+
+    splash_install_p = splash_sub.add_parser(
+        "install", help="Download and verify a package"
+    )
+    splash_install_p.add_argument("--model", required=True, metavar="OWNER/REPO")
+    splash_install_p.add_argument("--json", action="store_true")
+    splash_install_p.add_argument("--splash-prefix", default=None)
+    splash_install_p.add_argument(
+        "--force", action="store_true", help="Re-run even if already verified"
+    )
+    splash_install_p.set_defaults(func=cmd_splash)
+
+    splash_verify_p = splash_sub.add_parser(
+        "verify", help="Re-verify a package, repairing or updating it in place"
+    )
+    splash_verify_p.add_argument("--model", required=True, metavar="OWNER/REPO")
+    splash_verify_p.add_argument("--json", action="store_true")
+    splash_verify_p.add_argument("--splash-prefix", default=None)
+    splash_verify_p.set_defaults(func=cmd_splash)
 
     hardware_p = sub.add_parser("hardware", help="Inspect local Apple Silicon hardware")
     hardware_p.add_argument(
@@ -3567,6 +3607,33 @@ def build_parser() -> argparse.ArgumentParser:
 
     serve_p = sub.add_parser(
         "serve", help="Choose model/mode, then start the OpenAI-compatible MTPLX server"
+    )
+    serve_p.add_argument(
+        "--engine",
+        choices=["mlx", "splash"],
+        default="mlx",
+        help=(
+            "Inference engine. 'mlx' is MTPLX's own runtime: many "
+            "architectures, native MTP, and 4-bit/8-bit/unquantized paged KV. "
+            "'splash' serves the same API over Inco's Splash engine, which is "
+            "specialized per model with precompiled Metal kernels and a "
+            "trained DFlash 2 draft, and whose KV cache is fixed at 8-bit. "
+            "Splash accepts only its own packages; see --model."
+        ),
+    )
+    serve_p.add_argument(
+        "--splash-port",
+        type=int,
+        default=None,
+        help=(
+            "Loopback port for the supervised Splash engine with "
+            "--engine splash (default: an unused port). MTPLX keeps --port."
+        ),
+    )
+    serve_p.add_argument(
+        "--splash-prefix",
+        default=None,
+        help="Path to a Splash install, when it is not the Homebrew one",
     )
     serve_p.add_argument("--model", default=default_model)
     serve_p.add_argument("--cache-dir")

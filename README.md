@@ -231,6 +231,30 @@ Every command takes `--help`, and most inspection/diagnostic commands take `--js
 
 Fan-backed modes restore your fans to automatic if MTPLX dies for any reason, including `kill -9` and closing the terminal. A detached watchdog handles it; this is verified on hardware, not assumed.
 
+## The Splash engine
+
+MTPLX can also serve its API over [Inco's Splash](https://inco.ai/blog/splash/),
+an Apple-silicon engine that rebuilds itself around each model it supports —
+Metal kernels compiled for that model's exact shapes and a DFlash 2 draft
+trained for it:
+
+```bash
+brew install incoai/tap/splash
+mtplx serve --engine splash --model incoai/Qwen3.8-27B-Splash
+```
+
+Same endpoints, same dashboard, same app: only the kernels change. Splash is
+faster on the two packages it supports, and narrower everywhere else — it
+loads only its own packages, and its KV cache is **fixed at 8-bit** because its
+kernels read 8-bit KV directly. For 4-bit or unquantized KV, stay on the MLX
+engine and use `--kv-quant`. `--engine splash` imports no MLX at all.
+
+The dashboard works unchanged — live decode gauge, per-request prefill and
+decode speeds, min/max/p95 — with every finished request's numbers taken from
+Splash's own counters. What Splash cannot do is reported rather than faked:
+MTP depth reads absent, and the app disables the KV control with the reason
+attached. See [docs/splash-engine.md](docs/splash-engine.md).
+
 ## Compatibility, honestly
 
 `mtplx inspect` classifies models before anything runs: verified, family-compatible but unverified, architecture-compatible but unverified, AR-only, incompatible architecture, or no MTP heads at all. Unverified models load with an explicit unverified label. There are no silent fallbacks: if MTPLX cannot run a model correctly, it tells you instead of running it badly.

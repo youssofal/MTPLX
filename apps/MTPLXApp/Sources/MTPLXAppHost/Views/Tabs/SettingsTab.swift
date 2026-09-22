@@ -47,6 +47,7 @@ struct SettingsTab: View {
                 }
                 appearanceCard
                 languageCard
+                engineCard
                 performanceCard
                 ramCacheCard
                 kvQuantCard
@@ -68,6 +69,10 @@ struct SettingsTab: View {
                 }
             }
             .padding(20)
+            .task(id: draftConfig.engine) {
+                // Only pay for the subprocess when the Splash card is showing.
+                if splashEngineSelected { await splashPackages.refresh() }
+            }
         }
         .onAppear {
             // Pending edits survive a tab switch; only an unedited draft
@@ -226,7 +231,43 @@ struct SettingsTab: View {
     // same Save+Restart button is used. Prefill chunk size lives under Live
     // Settings because the daemon can apply it to the next request.
 
+    @StateObject private var splashPackages = SplashPackageStore()
     @State private var performanceAdvancedExpanded = false
+    /// Shown when a KV mode is picked that the selected engine cannot honor.
+    @State private var kvQuantLockNotice: String? = nil
+
+    /// True as soon as the Engine picker says Splash, before any daemon runs.
+    ///
+    /// The daemon reports its own `kv_quant_policy`, but that only arrives
+    /// once a Splash daemon is up. Reading the draft here means the KV control
+    /// locks the moment the engine is chosen, instead of staying live and
+    /// promising a width the next launch would silently ignore.
+    private var splashEngineSelected: Bool {
+        MTPLXAppConfiguration.normalizedEngine(draftConfig.engine) == "splash"
+    }
+
+    /// Splash's KV width is compiled into its Metal kernels, not configurable.
+    private static let splashKVQuantMode = "q8"
+    /// Shared with the inference-params panel so the two cannot disagree.
+    private static var splashKVQuantReason: String {
+        MTPLXAppConfiguration.splashKVQuantPolicy.disabledReason ?? ""
+    }
+
+    private var engineSelectionBinding: Binding<String> {
+        Binding(
+            get: { MTPLXAppConfiguration.normalizedEngine(draftConfig.engine) },
+            set: { value in
+                let normalized = MTPLXAppConfiguration.normalizedEngine(value)
+                draftConfig.engine = normalized
+                kvQuantLockNotice = nil
+                if normalized == "splash" {
+                    // Persist what will actually run, so the saved config and
+                    // the engine never disagree about KV width.
+                    draftConfig.pagedKVQuantization = Self.splashKVQuantMode
+                }
+            }
+        )
+    }
 
     @ViewBuilder
     private var performanceCard: some View {
@@ -676,6 +717,174 @@ struct SettingsTab: View {
         }
     }
 
+    // MARK: - Engine (MLX runtime vs Splash)
+    //
+    // The engine is above every other performance control here: pick Splash
+    // and the MTP, scheduler and KV cards below stop applying, because that
+    // engine has none of those knobs. The daemon reports what it can actually
+    // do (see `kv_quant_policy`), so those cards grey themselves out with a
+    // reason rather than offering settings the engine will ignore.
+    @ViewBuilder
+    private var engineCard: some View {
+        let running = backend.daemonState.kind == .running || backend.daemonState.kind == .warming
+        let engineDirty = draftConfig.engine != backend.configuration.engine
+            || draftConfig.splashModel != backend.configuration.splashModel
+        let isSplash = draftConfig.engine == "splash"
+        Card(tr("Engine"),
+             subtitle: tr("Which engine runs behind the API. Needs a restart to apply.")) {
+            if engineDirty && running {
+                PillBadge(text: tr("restart to apply"), systemImage: "arrow.clockwise.circle.fill", tint: .mtplxWarning, emphasized: true)
+            }
+        } content: {
+            VStack(alignment: .leading, spacing: 6) {
+                FormRow(
+                    label: tr("Engine"),
+                    caption: isSplash
+                        ? tr("Splash is specialized per model: Metal kernels compiled for its exact shapes and a trained DFlash 2 draft. Faster on the two packages it supports, and its KV cache is fixed at 8-bit.")
+                        : tr("MTPLX's own runtime: many architectures, native MTP speculative decoding, and 4-bit / 8-bit / unquantized KV cache.")
+                ) {
+                    Picker(tr("Engine"), selection: engineSelectionBinding) {
+                        Text(tr("MLX")).tag("mlx")
+                        Text(tr("Splash")).tag("splash")
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(maxWidth: 220, alignment: .leading)
+                }
+
+                if isSplash {
+                    Divider().overlay(Brand.separator)
+
+                    Text(tr("Splash package"))
+                        .font(.callout.weight(.medium))
+                    Text(tr("Splash loads only its own packages, kept separate from the MLX model so switching engines never overwrites either choice. Picking one downloads and verifies it here, rather than at first launch."))
+                        .font(.caption)
+                        .foregroundStyle(Brand.typeSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if !splashPackages.splashAvailable {
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(Color.mtplxWarning)
+                            Text(splashPackages.errorMessage
+                                 ?? tr("Splash is not installed. Run: brew install incoai/tap/splash"))
+                                .font(.caption)
+                                .foregroundStyle(Color.mtplxWarning)
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Spacer(minLength: 0)
+                        }
+                    } else {
+                        ForEach(splashPackages.packages) { package in
+                            splashPackageRow(package)
+                        }
+                        if splashPackages.packages.isEmpty {
+                            Text(splashPackages.refreshing
+                                 ? tr("Checking packages…")
+                                 : tr("No Splash packages found."))
+                                .font(.caption)
+                                .foregroundStyle(Brand.typeSecondary)
+                        }
+                    }
+                }
+
+                // What the picker promises vs what the daemon in front of you
+                // actually launched with — the same distinction the scheduling
+                // card draws, and the reason #398 was unreadable without it.
+                if running {
+                    Text(tr("Running now: %@.", backend.configuration.engine == "splash"
+                        ? tr("Splash") : tr("MLX")))
+                        .font(.caption)
+                        .foregroundStyle(Brand.typeSecondary)
+                }
+            }
+        }
+    }
+
+    /// One Splash package: select it, see whether it is on disk, fetch it.
+    @ViewBuilder
+    private func splashPackageRow(_ package: SplashPackageStore.Package) -> some View {
+        let selected = draftConfig.splashModel == package.id
+        let busy = splashPackages.installing == package.id
+        HStack(spacing: 10) {
+            Button {
+                draftConfig.splashModel = package.id
+            } label: {
+                Image(systemName: selected ? "largecircle.fill.circle" : "circle")
+                    .foregroundStyle(selected ? Color.mtplxAccent : Brand.typeSecondary)
+            }
+            .buttonStyle(.plain)
+            .disabled(busy)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(SplashPackageOption.option(for: package.id)?.displayName
+                     ?? Self.splashPackageLabel(package.id))
+                    .font(.callout)
+                if let detail = SplashPackageOption.option(for: package.id)?.detail, !busy {
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(Brand.typeSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if busy {
+                    // The installer's own line: Hugging Face's transfer bar
+                    // while bytes move, then verification.
+                    Text(splashPackages.progressLine.isEmpty
+                         ? tr("Starting…") : splashPackages.progressLine)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(Brand.typeSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                } else if package.installed {
+                    Text(tr("Installed and verified"))
+                        .font(.caption)
+                        .foregroundStyle(Color.mtplxSuccess)
+                } else {
+                    Text(package.downloadSizeLabel.map { tr("Not downloaded · %@", $0) }
+                         ?? tr("Not downloaded"))
+                        .font(.caption)
+                        .foregroundStyle(Brand.typeSecondary)
+                }
+            }
+
+            Spacer(minLength: 0)
+
+            if busy {
+                ProgressView().controlSize(.small)
+                Button(tr("Cancel")) { splashPackages.cancelInstall() }
+                    .buttonStyle(.plain)
+                    .font(.caption)
+                    .foregroundStyle(Color.mtplxDanger)
+            } else if package.installed {
+                // Re-running the installer re-checks every artifact against
+                // the manifest and refetches what no longer matches, so this
+                // is both "repair" and "update".
+                Button(tr("Update")) { splashPackages.install(package.id, force: true) }
+                    .buttonStyle(.plain)
+                    .font(.caption)
+                    .foregroundStyle(Color.mtplxAccent)
+                    .disabled(splashPackages.installing != nil)
+            } else {
+                Button(package.downloadSizeLabel.map { tr("Download %@", $0) }
+                       ?? tr("Download")) {
+                    splashPackages.install(package.id)
+                }
+                .buttonStyle(.plain)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(Color.mtplxAccent)
+                .disabled(splashPackages.installing != nil)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    static func splashPackageLabel(_ identifier: String) -> String {
+        identifier
+            .split(separator: "/").last
+            .map { $0.replacingOccurrences(of: "-Splash", with: "") }
+            ?? identifier
+    }
+
     // MARK: - KV Quantization
 
     @ViewBuilder
@@ -694,9 +903,11 @@ struct SettingsTab: View {
             VStack(alignment: .leading, spacing: 6) {
                 FormRow(
                     label: tr("Quantization"),
-                    caption: supported
-                        ? "Off is the speed path. q8 saves memory when the selected model supports it; q4 is experimental."
-                        : policy.disabledReason ?? tr("KV quantization is not supported for this model.")
+                    caption: splashEngineSelected
+                        ? tr(Self.splashKVQuantReason)
+                        : (supported
+                            ? "Off is the speed path. q8 saves memory when the selected model supports it; q4 is experimental."
+                            : policy.disabledReason ?? tr("KV quantization is not supported for this model."))
                 ) {
                     Picker(tr("Quantization"), selection: kvQuantSelectionBinding(policy)) {
                         ForEach(modes, id: \.self) { mode in
@@ -705,8 +916,21 @@ struct SettingsTab: View {
                     }
                     .pickerStyle(.segmented)
                     .labelsHidden()
-                    .disabled(!supported)
+                    .disabled(!supported && !splashEngineSelected)
                     .frame(maxWidth: 220, alignment: .leading)
+                }
+
+                if let notice = kvQuantLockNotice {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Image(systemName: "lock.fill")
+                            .foregroundStyle(Color.mtplxWarning)
+                        Text(notice)
+                            .font(.caption)
+                            .foregroundStyle(Color.mtplxWarning)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 0)
+                    }
+                    .transition(.opacity)
                 }
 
                 Divider().overlay(Brand.separator)
@@ -815,6 +1039,7 @@ struct SettingsTab: View {
     }
 
     private var kvQuantCaption: String {
+        if splashEngineSelected { return tr(Self.splashKVQuantReason) }
         let policy = settingsKVQuantPolicy
         guard settingsKVQuantSupported(policy) else {
             return policy.disabledReason ?? tr("KV quantization is not supported for this model.")
@@ -1750,6 +1975,9 @@ struct SettingsTab: View {
     }
 
     private func settingsKVQuantModes(_ policy: KVQuantPolicy) -> [String] {
+        // The other widths stay visible so the control still reads as a
+        // choice that has been made, rather than a control that vanished.
+        if splashEngineSelected { return ["off", Self.splashKVQuantMode, "q4"] }
         let normalized = policy.modes
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
             .filter { !$0.isEmpty }
@@ -1762,6 +1990,7 @@ struct SettingsTab: View {
         let supported = settingsKVQuantSupported(policy)
         return Binding(
             get: {
+                if splashEngineSelected { return Self.splashKVQuantMode }
                 let value = draftConfig.pagedKVQuantization
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                     .lowercased()
@@ -1769,6 +1998,15 @@ struct SettingsTab: View {
             },
             set: { value in
                 let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if splashEngineSelected {
+                    // Frozen: accept the tap, keep q8, and say why.
+                    draftConfig.pagedKVQuantization = Self.splashKVQuantMode
+                    kvQuantLockNotice = normalized == Self.splashKVQuantMode
+                        ? nil
+                        : Self.splashKVQuantReason
+                    return
+                }
+                kvQuantLockNotice = nil
                 draftConfig.pagedKVQuantization = supported && modes.contains(normalized)
                     ? normalized
                     : "off"

@@ -177,6 +177,9 @@ struct ModelPickerOverlay: View, Equatable {
         let rows = preparedRows
         VStack(alignment: .leading, spacing: 0) {
             header
+            if isSplashEngine {
+                splashRows
+            } else {
             if modelPackUpdateNeedsRestart != nil || !availablePackUpdates.isEmpty {
                 modelUpdatesBanner
             }
@@ -195,6 +198,7 @@ struct ModelPickerOverlay: View, Equatable {
             .frame(height: modelListHeight(for: rows.count))
             sectionDivider(precedesRow: rows.count + 1)
             addModelRow(visible: rowsVisibleCount > rows.count)
+            }
             if let errorMessage {
                 errorBar(errorMessage)
             }
@@ -220,7 +224,7 @@ struct ModelPickerOverlay: View, Equatable {
     @ViewBuilder
     private var header: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(tr("Model"))
+            Text(isSplashEngine ? tr("Splash model") : tr("Model"))
                 .font(.system(.callout, design: .rounded).weight(.semibold))
                 .foregroundStyle(Brand.typeBody)
             Text(restartHint)
@@ -758,6 +762,89 @@ struct ModelPickerOverlay: View, Equatable {
             config.generationMode = "mtp"
             config.loadMTP = true
             config.liveSettingsModelFamily = nil
+        }
+    }
+
+    // MARK: - Splash engine
+    //
+    // Same popover, same row, same choreography: only the catalog differs.
+    // Splash loads its own packages rather than MLX checkpoints, so when it is
+    // the selected engine this list replaces the scanned MLX one instead of
+    // living in a second, differently-styled picker.
+
+    private var isSplashEngine: Bool {
+        MTPLXAppConfiguration.normalizedEngine(configuration.engine) == "splash"
+    }
+
+    @ViewBuilder
+    private var splashRows: some View {
+        let options = SplashPackageOption.catalog
+        sectionDivider(precedesRow: 1)
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(options.enumerated()), id: \.element.id) { index, option in
+                ModelRowView(
+                    displayName: option.displayName,
+                    detail: option.detail,
+                    isInstalled: option.isInstalled,
+                    selected: configuration.splashModel == option.id,
+                    applying: applyingModelID == option.id,
+                    restartRequired: restartRequired,
+                    disabled: applyingModelID != nil || isTransitioning,
+                    visible: rowsVisibleCount > index,
+                    motionEnabled: motionEnabled,
+                    action: { selectSplash(option) },
+                    canRemoveFromPicker: false,
+                    removeAction: {}
+                )
+                if index < options.count - 1 {
+                    sectionDivider(precedesRow: index + 2)
+                }
+            }
+        }
+        .frame(width: popoverWidth, alignment: .leading)
+        sectionDivider(precedesRow: options.count + 1)
+        splashFootnote(visible: rowsVisibleCount > options.count)
+    }
+
+    /// Where the numbers come from, and that a missing package downloads.
+    @ViewBuilder
+    private func splashFootnote(visible: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(tr("A package that is not downloaded yet is fetched and verified on first start, or from Settings."))
+            Text(tr("Speeds are Inco's published figures on a 48 GB M5 Pro; KV cache is fixed at 8-bit."))
+        }
+        .font(.caption2)
+        .foregroundStyle(Brand.typeTertiary)
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(width: popoverWidth, alignment: .leading)
+        .opacity(visible ? 1 : 0)
+    }
+
+    private func selectSplash(_ option: SplashPackageOption) {
+        guard applyingModelID == nil, !isTransitioning else { return }
+        errorMessage = nil
+        applyingModelID = option.id
+        var next = backend.configuration
+        next.splashModel = option.id
+        // Splash's KV width is fixed in its kernels; keep the saved config
+        // from claiming a width the engine will ignore.
+        next.pagedKVQuantization = "q8"
+        Task {
+            do {
+                try await backend.applyConfiguration(next, restartIfRunning: true)
+                await MainActor.run {
+                    applyingModelID = nil
+                    presented = false
+                }
+            } catch {
+                print("MTPLX: Splash package switch failed: \(error)")
+                await MainActor.run {
+                    applyingModelID = nil
+                    errorMessage = tr("Couldn't switch models. Try again.")
+                }
+            }
         }
     }
 

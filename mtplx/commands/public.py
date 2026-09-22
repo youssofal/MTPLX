@@ -9414,7 +9414,54 @@ def _resolve_runtime_options_on_args(
     return None
 
 
+def _serve_splash(args: Any) -> int:
+    """`mtplx serve --engine splash`: the MTPLX contract over Splash.
+
+    Nothing below this point touches MLX. The bridge supervises a Splash
+    process and translates its telemetry, so the model resolution, profile
+    tuning and MTP machinery the MLX path runs first are all skipped.
+    """
+    from mtplx.server.splash_bridge import DEFAULT_MODEL, serve as splash_serve
+
+    model = getattr(args, "model", None)
+    # The MLX default model is meaningless to Splash, which only loads its own
+    # packages; fall back to the Splash default unless the user named one.
+    if not model or "Splash" not in model:
+        cli_flags = getattr(args, "_cli_flags", set()) or set()
+        if "model" not in cli_flags:
+            model = DEFAULT_MODEL
+
+    if bool(getattr(args, "dry_run", False)):
+        plan = {
+            "engine": "splash",
+            "model": model,
+            "host": getattr(args, "host", "127.0.0.1"),
+            "port": int(getattr(args, "port", 8000)),
+            "splash_port": getattr(args, "splash_port", None),
+        }
+        if getattr(args, "json", False):
+            _print(plan)
+        else:
+            for key, value in plan.items():
+                print(f"{key}: {value}")
+        return 0
+
+    return splash_serve(
+        model=model,
+        host=str(getattr(args, "host", "127.0.0.1")),
+        port=int(getattr(args, "port", 8000)),
+        max_memory=getattr(args, "max_memory", None),
+        max_context=getattr(args, "context_window", None),
+        api_key=getattr(args, "api_key", None),
+        splash_port=getattr(args, "splash_port", None),
+        splash_prefix=getattr(args, "splash_prefix", None),
+        download=bool(getattr(args, "download", True)),
+    )
+
+
 def cmd_serve_public(args: Any) -> int:
+    if getattr(args, "engine", "mlx") == "splash":
+        return _serve_splash(args)
     dry_run = bool(getattr(args, "dry_run", False))
     quiet_json = dry_run and bool(getattr(args, "json", False))
     agent_rewrites = getattr(args, "agent_rewrites", None)

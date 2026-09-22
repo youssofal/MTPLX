@@ -431,11 +431,47 @@ public struct MTPLXCommandBuilder: Sendable {
                 allowSwap: configuration.allowSwap
             )
         ) { _, new in new }
+        // A non-MLX engine runs behind the same API, but every runtime flag
+        // built above describes the MLX runtime and means nothing to it — and
+        // its model is one of the engine's own packages, not an MLX
+        // checkpoint. Reduce argv to what the bridge actually reads, so the
+        // launch record reports what took effect rather than what was
+        // intended (the same honesty rule as `flagValue` below).
+        let engine = MTPLXAppConfiguration.normalizedEngine(configuration.engine)
+        if engine != MTPLXAppConfiguration.defaultEngine {
+            arguments = Self.engineServeArguments(
+                arguments,
+                engine: engine,
+                model: configuration.splashModel
+            )
+        }
         return DaemonCommand(
             executableURL: executableURL,
             arguments: arguments,
             environment: environment
         )
+    }
+
+    /// argv for an engine that is not the MLX runtime: the transport flags
+    /// the bridge honors, plus `--engine` and that engine's own model.
+    static func engineServeArguments(
+        _ arguments: [String],
+        engine: String,
+        model: String
+    ) -> [String] {
+        let passthrough: Set<String> = ["--host", "--port", "--api-key", "--context-window"]
+        var result = ["serve", "--engine", engine, "--model", model]
+        var index = 0
+        while index < arguments.count {
+            let token = arguments[index]
+            if passthrough.contains(token), arguments.indices.contains(index + 1) {
+                result.append(contentsOf: [token, arguments[index + 1]])
+                index += 2
+                continue
+            }
+            index += 1
+        }
+        return result
     }
 
     /// Value that follows `flag` in a built argv, or nil when the flag was

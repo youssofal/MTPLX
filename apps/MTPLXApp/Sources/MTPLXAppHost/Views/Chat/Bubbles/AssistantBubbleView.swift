@@ -349,6 +349,9 @@ struct AssistantBubbleView: View {
         if let prompt = stats.promptTokens, prompt > 0 {
             items.append(MetricItem(label: tr("in"), value: Self.formatCount(prompt)))
         }
+        if let cached = stats.cachedTokens, cached > 0 {
+            items.append(MetricItem(label: tr("cached"), value: Self.formatCount(cached)))
+        }
         if let ttft = stats.ttftS, ttft > 0 {
             items.append(MetricItem(label: tr("TTFT"), value: Self.formatSeconds(ttft)))
         }

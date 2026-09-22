@@ -318,6 +318,9 @@ public struct ChatTurnStats: Codable, Hashable, Sendable {
     /// Drives the collapsed "Thought · 12.4s" chip. Optional so stats
     /// persisted before this field decode unchanged.
     public var thinkingTimeMs: Int?
+    /// Prompt tokens the engine reused from its prefix cache rather than
+    /// prefilling. Optional so stats persisted before it decode unchanged.
+    public var cachedTokens: Int?
 
     public init(
         rawDecodeTokS: Double? = nil,
@@ -329,7 +332,8 @@ public struct ChatTurnStats: Codable, Hashable, Sendable {
         draftedByDepth: [Int]? = nil,
         verifyCalls: Int? = nil,
         verifyTimeS: Double? = nil,
-        thinkingTimeMs: Int? = nil
+        thinkingTimeMs: Int? = nil,
+        cachedTokens: Int? = nil
     ) {
         self.rawDecodeTokS = rawDecodeTokS
         self.displayDecodeTokS = displayDecodeTokS
@@ -341,6 +345,7 @@ public struct ChatTurnStats: Codable, Hashable, Sendable {
         self.verifyCalls = verifyCalls
         self.verifyTimeS = verifyTimeS
         self.thinkingTimeMs = thinkingTimeMs
+        self.cachedTokens = cachedTokens
     }
 }
 

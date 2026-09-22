@@ -272,6 +272,9 @@ public struct ChatUsage: Sendable {
     public var promptTokens: Int?
     public var completionTokens: Int?
     public var totalTokens: Int?
+    /// Prompt tokens served from the engine's prefix cache
+    /// (`usage.prompt_tokens_details.cached_tokens`, sent by both engines).
+    public var cachedTokens: Int? = nil
 }
 
 public struct ChatStreamStats: Sendable {
@@ -633,7 +636,8 @@ public struct MTPLXChatClient: Sendable {
         return ChatUsage(
             promptTokens: raw.promptTokens,
             completionTokens: raw.completionTokens,
-            totalTokens: raw.totalTokens
+            totalTokens: raw.totalTokens,
+            cachedTokens: raw.promptTokensDetails?.cachedTokens
         )
     }
 
@@ -720,11 +724,21 @@ private struct ChatCompletionUsage: Decodable {
     var promptTokens: Int?
     var completionTokens: Int?
     var totalTokens: Int?
+    var promptTokensDetails: PromptTokensDetails?
+
+    struct PromptTokensDetails: Decodable {
+        var cachedTokens: Int?
+
+        private enum CodingKeys: String, CodingKey {
+            case cachedTokens = "cached_tokens"
+        }
+    }
 
     private enum CodingKeys: String, CodingKey {
         case promptTokens = "prompt_tokens"
         case completionTokens = "completion_tokens"
         case totalTokens = "total_tokens"
+        case promptTokensDetails = "prompt_tokens_details"
     }
 }
 
