@@ -31,3 +31,17 @@ Findings to fold into the fix backlog:
 3. The restart came back `ready` at 6 s while the weights were still loading (engine
    `/health` reports ok before warmup completes). Routing during warmup works but is slow;
    consider gating READY on the engine health's warmup field if one exists.
+
+## Second pass after the review fixes (65e74d1)
+
+| Check | Result |
+|---|---|
+| `/health` without key | redacted to model + state per engine; `fetch_daemon_health` fields intact |
+| 27B JIT load | 200; `/v1/models` shows both packs `ready` with the engine-reported ids as `aliases` |
+| Route by alias `mtplx-qwen38-27b-optimized-speed` | 200 |
+| 34 MB body | 413 `request_too_large` |
+| `kill -9` the 27B engine | `loading` at 3 s, `ready` at 9 s |
+| SIGTERM | engines and listener gone, exit 143 (uvicorn's signal exit; documented) |
+| Full test suite in the worktree | green, about 7090 tests, after installing the `server` extra (`llguidance`) that one pre-existing JSON-schema test needs |
+
+Findings 1 and 3 from the first pass are fixed; finding 2 is documented rather than changed.
