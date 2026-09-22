@@ -2912,6 +2912,54 @@ def test_anthropic_tool_result_image_stays_an_image_on_the_tool_message():
     assert flattened[1].content == "What does it show?"
 
 
+def test_vision_extract_strips_stale_placeholder_from_string_content():
+    """A resent transcript can carry a prior turn's flattened placeholder as
+    plain text alongside a fresh image part; the stale literal must be removed
+    so the placeholder count matches the image count (the "more image
+    placeholders than images" failure)."""
+    from mtplx.server.openai import (
+        ChatMessage,
+        _vision_extract_and_flatten,
+        _VISION_PLACEHOLDER,
+    )
+
+    message = ChatMessage(
+        role="tool",
+        tool_call_id="toolu_1",
+        content=[
+            {"type": "text", "text": "file contents: " + _VISION_PLACEHOLDER},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_TINY_PNG_B64}"}},
+        ],
+    )
+
+    flattened, images = _vision_extract_and_flatten([message])
+
+    assert len(images) == 1
+    assert flattened[0].content == "file contents: " + _VISION_PLACEHOLDER
+    assert flattened[0].content.count(_VISION_PLACEHOLDER) == 1
+
+
+def test_vision_extract_strips_stale_placeholder_from_plain_string_content():
+    """A plain-string message that already carries the placeholder literal (a
+    prior turn's flattened result persisted as text) must not leave stray
+    image_pad tokens in the prompt when no image part accompanies them."""
+    from mtplx.server.openai import (
+        ChatMessage,
+        _vision_extract_and_flatten,
+        _VISION_PLACEHOLDER,
+    )
+
+    message = ChatMessage(
+        role="user",
+        content="prefix " + _VISION_PLACEHOLDER + " suffix",
+    )
+
+    flattened, images = _vision_extract_and_flatten([message])
+
+    assert len(images) == 0
+    assert flattened[0].content == "prefix  suffix"
+
+
 def test_anthropic_request_with_image_round_trips_to_chat_request():
     from mtplx.server.openai import (
         AnthropicMessage,

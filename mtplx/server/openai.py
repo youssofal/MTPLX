@@ -5027,6 +5027,12 @@ def _vision_extract_and_flatten(
     Returns the flattened messages plus the raw image payloads in prompt
     order. Messages without image parts pass through untouched so the
     text-only path stays byte-identical.
+
+    Stale placeholder literals already present in string content (a prior
+    turn's flattened result re-sent as plain text) are stripped so that only
+    the image_url parts actually present in THIS request become placeholders;
+    otherwise `_expand_image_pads` counts more pads than images and rejects
+    the prompt.
     """
 
     images: list[bytes] = []
@@ -5037,15 +5043,25 @@ def _vision_extract_and_flatten(
             message.get("content") if is_mapping else getattr(message, "content", None)
         )
         if not isinstance(content, list):
+            if isinstance(content, str):
+                stripped = content.replace(_VISION_PLACEHOLDER, "")
+                if stripped != content:
+                    if is_mapping:
+                        updated = dict(message)
+                        updated["content"] = stripped
+                    else:
+                        updated = message.model_copy(update={"content": stripped})
+                    flattened.append(updated)
+                    continue
             flattened.append(message)
             continue
         parts: list[str] = []
         for item in content:
             if isinstance(item, str):
-                parts.append(item)
+                parts.append(item.replace(_VISION_PLACEHOLDER, ""))
                 continue
             if not isinstance(item, dict):
-                parts.append(str(item))
+                parts.append(str(item).replace(_VISION_PLACEHOLDER, ""))
                 continue
             item_type = str(item.get("type") or "")
             if item_type == "image_url" or "image_url" in item:
@@ -5054,7 +5070,7 @@ def _vision_extract_and_flatten(
                 images.append(_image_bytes_from_url(str(url or "")))
                 parts.append(_VISION_PLACEHOLDER)
             elif item_type == "text" or "text" in item:
-                parts.append(str(item.get("text", "")))
+                parts.append(str(item.get("text", "")).replace(_VISION_PLACEHOLDER, ""))
         text = "".join(parts)
         if is_mapping:
             updated = dict(message)
