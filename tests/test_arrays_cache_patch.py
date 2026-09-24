@@ -318,12 +318,18 @@ def test_per_field_fold_on_read():
     assert cache.left_padding.tolist() == [0]
     assert cache._lp_advance == 0
 
-    # make_mask folds only the field the mask consumes (lp wins when armed).
+    # make_mask folds only the fields the mask consumes: both when both are
+    # armed (the mask is their AND since the #420 batched-lane fix), else one.
     cache2 = _armed_cache(cache_module.ArraysCache, [2], [6])
     cache2.advance(2)
     mask = cache2.make_mask(4)
-    assert cache2._lp_advance == 0 and cache2._len_advance == 2
-    assert mask.tolist() == [[True, True, True, True]]  # pos >= (2 - 2)
+    assert cache2._lp_advance == 0 and cache2._len_advance == 0
+    assert mask.tolist() == [[True, True, True, True]]  # pos >= (2 - 2) and pos < (6 - 2)
+    cache3 = cache_module.ArraysCache(1)
+    cache3[0] = mx.zeros((1, 4))
+    cache3.left_padding = mx.array([2])  # lengths stay unarmed
+    cache3.advance(1)
+    assert cache3.make_mask(3).tolist() == [[False, True, True]] and cache3._lp_advance == 0
 
 
 # --------------------------------------------------------------------------
@@ -458,6 +464,17 @@ def test_advance_offset_validation():
 # --------------------------------------------------------------------------
 
 
+def _mask(cache, n, eager):
+    """The mask under test. For the STOCK reference (``eager``) apply the #420 rule the fixed
+    class implements: when left_padding and lengths are both armed the mask is their AND
+    (stock returned the left-padding mask alone, which let right-padded rows' pad tokens
+    reach the recurrent update). Everything else stays stock."""
+    mask = cache.make_mask(n)
+    if eager and mask is not None and cache.left_padding is not None and cache.lengths is not None:
+        mask = mask & (mx.arange(n) < cache.lengths[:, None])
+    return mask
+
+
 def _drive(cls, eager):
     """Run one synthetic cache lifecycle and return a plain-python trace.
 
@@ -481,7 +498,7 @@ def _drive(cls, eager):
 
     cache.advance(1)
     settle()
-    out.append(("mask_lp", cache.make_mask(4).tolist()))
+    out.append(("mask_lp", _mask(cache, 4, eager).tolist()))
     cache.advance(1)
     settle()
     out.append(("lp", cache.left_padding.tolist()))
@@ -503,7 +520,7 @@ def _drive(cls, eager):
     out.append(("batch_size", cache.batch_size))
     cache.advance(1)
     settle()
-    out.append(("mask_extended", cache.make_mask(5).tolist()))
+    out.append(("mask_extended", _mask(cache, 5, eager).tolist()))
     out.append(("lp_extended", cache.left_padding.tolist()))
     out.append(("len_extended", cache.lengths.tolist()))
     out.append(("slot1_extended", cache[1].tolist()))
@@ -514,7 +531,7 @@ def _drive(cls, eager):
     cache.finalize()
     out.append(("final_lp", cache.left_padding))
     out.append(("final_len", cache.lengths))
-    out.append(("final_mask", cache.make_mask(3)))
+    out.append(("final_mask", _mask(cache, 3, eager)))
 
     # lengths-only mask branch
     lengths_only = cls(1)

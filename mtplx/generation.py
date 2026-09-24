@@ -3689,6 +3689,42 @@ class PostcommitAbort(RuntimeError):
     """Raised when best-effort postcommit prefill yields to foreground work."""
 
 
+class PrefillHandover(RuntimeError):
+    """Raised between prefill chunks when the solo lane hands the request over
+    to the batched lane mid-prefill: ``cache`` holds the first ``prefix_len``
+    prompt tokens, the lane prefills the rest interleaved with its rows."""
+
+    def __init__(self, cache: Any, prefix_len: int) -> None:
+        super().__init__(f"prefill handover at {int(prefix_len)} tokens")
+        self.cache = cache
+        self.prefix_len = int(prefix_len)
+
+
+def _maybe_prefill_handover(
+    check: Callable[[int, int], bool] | None,
+    cache: Any,
+    prefix_len: int,
+    total: int,
+    rt: Any = None,
+) -> None:
+    """Poll the prefill-phase handover check at a chunk boundary (the cache
+    covers exactly prompt[:prefix_len]); raise PrefillHandover when it wants it.
+    The cache leaves in the same paged layout a finished prefill hands to
+    decode (the batched lane has only ever inserted that layout)."""
+    if check is None or int(prefix_len) <= 0 or int(prefix_len) >= int(total):
+        return
+    try:
+        wanted = bool(check(int(prefix_len), int(total)))
+    except Exception:  # noqa: BLE001 - a broken check never stops prefill
+        return
+    if not wanted:
+        return
+    if rt is not None:
+        _maybe_repage_target_prefill_cache(rt, cache)
+    _eval_cache_roots(cache)
+    raise PrefillHandover(cache, int(prefix_len))
+
+
 def _check_postcommit_abort(abort_check: Callable[[], bool] | None) -> None:
     if abort_check is not None and bool(abort_check()):
         raise PostcommitAbort("foreground_preempted_postcommit")
@@ -3963,6 +3999,7 @@ def _prefill_restored_prompt_suffix(
     chunk_callback: Callable[[dict[str, Any]], None] | None = None,
     tokens_total: int | None = None,
     cached_tokens: int = 0,
+    handover_check: Callable[[int, int], bool] | None = None,
     chunk_started_s: float | None = None,
     gdn_boundary_sink: list[tuple[int, Any, Any]] | None = None,
     vision_splice: Any | None = None,
@@ -4353,6 +4390,13 @@ def _prefill_restored_prompt_suffix(
             del logits_chunk
             target_forward_time += _prefill_chunk_cache_cleanup(rt)
             _check_postcommit_abort(abort_check)
+            _maybe_prefill_handover(
+                handover_check,
+                restored.cache,
+                cached_tokens + end,
+                int(tokens_total) if tokens_total else cached_tokens + len(suffix),
+                rt=rt,
+            )
 
     started = time.perf_counter()
     _check_postcommit_abort(abort_check)
@@ -4548,6 +4592,7 @@ def _restore_near_prefix_prompt_state(
     chunk_started_s: float | None = None,
     cache_factory: Callable[[], Any] | None = None,
     stable_prefix_len: int | None = None,
+    prefill_handover_check: Callable[[int, int], bool] | None = None,
     matched_ceiling: int | None = None,
     vision_splice: Any | None = None,
 ) -> PromptState | None:
@@ -4923,6 +4968,7 @@ def _restore_near_prefix_prompt_state(
                 tokens_total=len(prompt_ids),
                 cached_tokens=restore_point,
                 chunk_started_s=chunk_started_s,
+                handover_check=prefill_handover_check,
                 gdn_boundary_sink=suffix_boundary_sink,
                 stable_prefix_len=stable_prefix_len,
                 vision_splice=vision_splice,
@@ -5899,6 +5945,7 @@ def restore_or_prefill_prompt_state(
     store_prefix_snapshot: bool | None = None,
     stable_prefix_len: int | None = None,
     capture_hidden: bool | None = None,
+    prefill_handover_check: Callable[[int, int], bool] | None = None,
 ) -> PromptState:
     """Build the initial prompt state used by MTP-k decode.
 
@@ -6201,6 +6248,7 @@ def restore_or_prefill_prompt_state(
                 abort_check=abort_check,
                 chunk_callback=prefill_callback,
                 chunk_started_s=prefill_started_s,
+                prefill_handover_check=prefill_handover_check,
                 matched_ceiling=(
                     vision_restore_spans[0][0]
                     if vision_restore_spans
@@ -6337,6 +6385,7 @@ def restore_or_prefill_prompt_state(
                     mtp_history_policy=mtp_history_policy,
                     abort_check=abort_check,
                     chunk_callback=prefill_callback,
+                    handover_check=prefill_handover_check,
                     tokens_total=len(prompt_ids),
                     cached_tokens=restored.entry.prefix_len,
                     chunk_started_s=prefill_started_s,
@@ -6390,6 +6439,7 @@ def restore_or_prefill_prompt_state(
             chunk_started_s=prefill_started_s,
             cache_factory=restore_cache_factory,
             stable_prefix_len=stable_prefix_len,
+            prefill_handover_check=prefill_handover_check,
             matched_ceiling=(
                 vision_restore_spans[0][0] if vision_restore_spans else None
             ),
@@ -6439,6 +6489,7 @@ def restore_or_prefill_prompt_state(
                 vision_splice=vision_splice,
                 stable_prefix_len=stable_prefix_len,
                 gdn_boundary_sink=gdn_boundary_sink,
+                handover_check=prefill_handover_check,
             )
             prompt_eval_time = target_time + prompt_history_time
         else:
@@ -6520,6 +6571,7 @@ def restore_or_prefill_prompt_state(
             vision_splice=vision_splice,
             gdn_boundary_sink=gdn_boundary_sink,
             stable_prefix_len=stable_prefix_len,
+            handover_check=prefill_handover_check,
         )
         prompt_eval_time = target_time
     return _emit_prefill_complete(PromptState(
@@ -7500,6 +7552,7 @@ def _prefill(
     vision_splice: Any | None = None,
     gdn_boundary_sink: list[tuple[int, Any]] | None = None,
     stable_prefix_len: int | None = None,
+    handover_check: Callable[[int, int], bool] | None = None,
 ):
     _reject_unwired_ple_lookahead("_prefill")
     if not prompt_ids:
@@ -7576,6 +7629,7 @@ def _prefill(
             if capture_boundaries:
                 _capture_gdn_boundary(gdn_boundary_sink, end, cache)
             _check_postcommit_abort(abort_check)
+            _maybe_prefill_handover(handover_check, cache, end, len(prompt_ids), rt=rt)
         if vision_splice is not None and vision_splice.remaining() > 0:
             raise ValueError(
                 "vision splice overflow: request supplied more vision rows "
@@ -7623,6 +7677,7 @@ def _prefill_committed_mtp_history_streaming(
     gdn_boundary_sink: list[tuple[int, Any]] | None = None,
     stable_prefix_len: int | None = None,
     prefill_chunk_size: int | None = None,
+    handover_check: Callable[[int, int], bool] | None = None,
 ):
     if not prompt_ids:
         raise ValueError("prompt_ids must not be empty")
@@ -7859,6 +7914,7 @@ def _prefill_committed_mtp_history_streaming(
             _boundary_s = time.perf_counter() - _boundary_started + _inforward_s
             del boundary_hidden
             _check_postcommit_abort(abort_check)
+            _maybe_prefill_handover(handover_check, cache, cursor, len(prompt_ids), rt=rt)
             if _chunk_trace:
                 _annotate_prefill_chunk(
                     mtp_history_s=prompt_history_time - _history_before,
@@ -9426,11 +9482,46 @@ def generate_mtp1(
 
 
 @_with_dense_mrope_request
+def _prefill_handover_output(
+    rt: MTPLXRuntime,
+    exc: PrefillHandover,
+    *,
+    started_s: float,
+    mtp_history_policy: str = "cycle",
+) -> "GenerationOutput":
+    """The solo run's output when its prefill handed over: no tokens, the
+    partial trunk cache and its prefix length for the continuation job."""
+    elapsed = max(0.0, time.perf_counter() - started_s)
+    stats = GenerationStats(
+        mode="mtpk",
+        generated_tokens=0,
+        elapsed_s=elapsed,
+        tok_s=0.0,
+        runtime_mtp_enabled=bool(getattr(rt, "mtp_enabled", False)),
+    )
+    final_state = GenerationFinalState(
+        final_trunk_cache=exc.cache,
+        final_logits=None,
+        final_hidden=None,
+        final_committed_mtp_cache=None,
+        generated_token_ids=(),
+        safe_to_commit=False,
+        finish_reason="handover",
+        mtp_history_policy=mtp_history_policy,
+        extra_state={"prefill_handover_prefix_len": int(exc.prefix_len)},
+    )
+    return GenerationOutput(
+        tokens=[], text="", stats=stats, final_state=final_state, finish_reason="handover"
+    )
+
+
 def generate_mtpk(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
     *,
     abort_check: Callable[[], bool] | None = None,
+    handover_check: Callable[[], bool] | None = None,
+    prefill_handover_check: Callable[[int, int], bool] | None = None,
     max_tokens: int,
     sampler: SamplerConfig,
     speculative_depth: int,
@@ -9967,7 +10058,8 @@ def generate_mtpk(
     except (TypeError, ValueError):
         _stable_prefix_len = None
     _prompt_state_started = time.perf_counter()
-    prompt_state = restore_or_prefill_prompt_state(
+    try:
+      prompt_state = restore_or_prefill_prompt_state(
         rt,
         prompt_ids,
         vision_splice=vision_splice,
@@ -9988,7 +10080,17 @@ def generate_mtpk(
         # 10+ minutes, 2026-07-03).
         abort_check=abort_check,
         stable_prefix_len=_stable_prefix_len,
-    )
+        prefill_handover_check=prefill_handover_check,
+      )
+    except PrefillHandover as _prefill_handover:
+        # Mid-prefill lane handover: the batched lane inserts the partial
+        # cache and prefills the remaining prompt interleaved with its rows.
+        return _prefill_handover_output(
+            rt,
+            _prefill_handover,
+            started_s=_prompt_state_started,
+            mtp_history_policy=mtp_history_policy,
+        )
     prompt_state_total_time_s = time.perf_counter() - _prompt_state_started
     pre_first_token_setup_started = time.perf_counter()
     pre_first_token_setup_s = 0.0
@@ -11634,6 +11736,20 @@ def generate_mtpk(
             _sampled_chain_status = (
                 "installed" if _sampled_chain_plan is not None else f"declined:{_sc_reason}"
             )
+    # Lane handover (solo MTP -> batched AR when another request arrives): polled
+    # only at the point where the trunk cache holds prompt + tokens[:-1] and the
+    # last token is sampled but not forwarded, which is exactly the shape the
+    # batch generator inserts. The caller decides what "another request" means.
+    handover_requested = False
+
+    def _handover_now() -> bool:
+        if handover_check is None or constraint is not None or a3b_rebase_state is not None:
+            return False
+        try:
+            return bool(handover_check())
+        except Exception:  # noqa: BLE001 - a broken check never stops decode
+            return False
+
     while len(tokens) < max_tokens:
         if first_round_snapshot is None and step >= 1:
             # Top of iteration 2: the cumulative timers now hold exactly
@@ -11745,7 +11861,14 @@ def generate_mtpk(
                 # FOLLOW the primary, so consume it now.
                 constraint.advance_many(tokens[constraint_synced_tokens:])
                 constraint_synced_tokens = len(tokens)
+            if _handover_now():
+                pending_primary = primary  # sampled, emitted, not forwarded
+                handover_requested = True
+                break
         else:
+            if _handover_now():
+                handover_requested = True  # pending_primary stays set, same shape
+                break
             primary = pending_primary
             pending_primary = None
         planned_depth = (
@@ -15157,6 +15280,7 @@ def generate_mtpk(
         and pending_primary is not None
         and tokens
         and repetition_result is None
+        and not handover_requested  # the continuation lane forwards the pending token
     ):
         try:
             pending_token = int(pending_primary)
@@ -15264,7 +15388,10 @@ def generate_mtpk(
             )
             else "unknown"
         )
-    if capture_final_state:
+    if handover_requested:
+        finish_reason = "handover"
+        stop_origin = None
+    if capture_final_state or handover_requested:
         final_state = GenerationFinalState(
             final_trunk_cache=cache,
             final_logits=logits,

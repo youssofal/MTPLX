@@ -807,16 +807,21 @@ class FixedArraysCache(_StockArraysCache):
         if self._left_padding is None and self._lengths is None:
             return None
         pos = mx.arange(N)
-        if self._left_padding is not None:
-            # Fold (and schedule) only the field the mask uses; the other
-            # field's counter is untouched. Scheduling matters even here:
-            # a caller that discards the mask would otherwise leave the
-            # fold unevaluated, one node per call.
-            with self._fold_lock:
+        # Both fields can be live at once: ``merge`` of fresh caches sets
+        # left_padding to zeros and a ragged prefill then sets lengths. The
+        # stock rule returned the left-padding mask alone in that case, so the
+        # right-padded rows' pad tokens reached the recurrent update and
+        # drifted the shorter rows' state (#420 follow-up, batched Flash-Next).
+        # AND the two; fold (and schedule) only the fields the mask uses.
+        mask = None
+        with self._fold_lock:
+            if self._left_padding is not None:
                 with self._lp_state.array_lock:
                     self._fold_lp()
-                    return pos >= self._left_padding[:, None]
-        with self._fold_lock:
-            with self._len_state.array_lock:
-                self._fold_len()
-                return pos < self._lengths[:, None]
+                    mask = pos >= self._left_padding[:, None]
+            if self._lengths is not None:
+                with self._len_state.array_lock:
+                    self._fold_len()
+                    len_mask = pos < self._lengths[:, None]
+                    mask = len_mask if mask is None else (mask & len_mask)
+        return mask

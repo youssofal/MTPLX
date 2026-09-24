@@ -689,6 +689,43 @@ All notable user-facing changes to MTPLX. The format is based on
   is served with vision.
 - **`/health` no longer swallows a cancellation or an interrupt** while it
   reads its optional counters.
+## [Unreleased]
+
+### Added
+
+- **Batched AR lane for the Flash-Next (QSA) cache family** (issue #420).
+  `QSACache.merge` now exists: it returns a `BatchQSACache` that keeps one
+  single-sequence cache per row and implements the batch-generator entry
+  contract (merge / extend / filter / extract / prepare / finalize / state /
+  nbytes) as row-list operations, so `--scheduler-mode ar_batch` no longer
+  refuses Qwen3.8-Flash-Next at startup. The QSA layer runs its unchanged
+  single-row path once per row (every selection kernel, the indexer's host
+  offsets and the dense-attention shortcut stay single-sequence by design);
+  a ragged prefill right-pads the shorter prompts and `finalize` trims the
+  pad rows off each row's KV and indexer streams. The PLE n-gram history and
+  the short-conv window now end at each row's real length during a ragged
+  prefill, the same rule the GDN conv state already used. The compiled GDN
+  decode runs stay on the single-row path; a batched decode step takes the
+  eager layers unless `MTPLX_GDN_COMPILED_BATCH=1` opts the batched decode
+  into the compiled GDN runs (verified batch-safe on a tiny model; measured
+  on the real one before the default flips). `tests/test_qsa_cache_batching.py`
+  pins the contract and a tiny random layer's solo-vs-batched parity
+  (bit-identical outputs, caches and decode step through a ragged prefill);
+  `tests/test_flash_next_batched_lane_parity.py` runs a tiny hybrid model
+  through the lane's exact sequence, eager and compiled.
+
+### Fixed
+
+- **Ragged-prefill mask precedence in the vendored `ArraysCache`** (found
+  by the batched-lane parity test). `merge` of fresh caches arms
+  `left_padding` with zeros and a ragged prefill then arms `lengths`; the
+  stock `make_mask` rule returned the left-padding mask alone whenever it
+  was armed, so the right-padded rows' pad tokens reached the gated-delta
+  update and drifted the shorter rows' recurrent state (about 3e-3 on a
+  tiny model, growing with every pad token). `FixedArraysCache.make_mask`
+  now ANDs the two masks. Stock mlx-lm 0.31.3 has the same precedence
+  (`ArraysCache.make_mask`), so any hybrid model batched through its
+  `BatchGenerator` with ragged prompts is affected there too.
 
 ## [2.11.3] - 2026-09-17
 
