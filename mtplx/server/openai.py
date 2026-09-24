@@ -4124,6 +4124,59 @@ class _BatchedARJob:
         self.token_times.append(time.perf_counter())
 
 
+def _log_json_event(event: str, **fields: Any) -> None:
+    try:
+        print(json.dumps({"event": event, **fields}, default=str), flush=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# Batched lane: bank the stable prefix (prompt minus the transient trailing hint) per turn.
+_STABLE_PREFIX_BANK_MIN_TOKENS = int(os.environ.get("MTPLX_AR_BATCH_STABLE_PREFIX_MIN_TOKENS", "512"))
+_STABLE_PREFIX_PREFILL_CHUNK = int(os.environ.get("MTPLX_AR_BATCH_STABLE_PREFIX_CHUNK", "2048"))
+
+
+def _ar_batch_decode_steps_per_chunk() -> int:
+    """Decode steps the batched lane takes per prefill chunk of an incoming request.
+    mlx-lm's BatchGenerator alternates ONE decode step with ONE prefill chunk, so
+    while a 100k prompt prefills the active streams get a token every ~3.5 s
+    (2026-09-24 receipt: a 145k-token session stalled 110 s behind a 47k
+    session's prefill). N > 1 trades prefill time (~N x 30 ms per chunk) for
+    decode continuity. Default 1 = stock behaviour."""
+    try:
+        return max(1, int(os.environ.get("MTPLX_AR_BATCH_DECODE_STEPS_PER_CHUNK", "1")))
+    except ValueError:
+        return 1
+
+
+def _interleaved_batch_generator_class(base: type) -> type:
+    """Subclass mlx-lm's BatchGenerator (passed in: this module must not import
+    mlx at import time) so each step takes extra decode steps for the active
+    rows before a prefill chunk (see _ar_batch_decode_steps_per_chunk)."""
+
+    class _InterleavedBatchGenerator(base):
+        def _next(self):
+            extra = _ar_batch_decode_steps_per_chunk() - 1
+            gen_batch = getattr(self, "_generation_batch", None)
+            prefilling = bool(getattr(self, "_currently_processing", None)) or bool(
+                getattr(self, "_unprocessed_sequences", None)
+            )
+            extra_responses = []
+            if extra > 0 and prefilling and gen_batch is not None and len(gen_batch) > 0:
+                for _ in range(extra):
+                    if len(gen_batch) == 0:
+                        break
+                    extra_responses.extend(gen_batch.next())
+                    self._gen_tokens_counter += 1
+                    self._steps_counter += 1
+            prompt_responses, generation_responses = super()._next()
+            if extra_responses:
+                generation_responses = [*extra_responses, *generation_responses]
+            return prompt_responses, generation_responses
+
+    return _InterleavedBatchGenerator
+
+
 class _BatchedARGenerationService:
     """Live AR continuous-batching pump owned by ``ModelWorkScheduler``.
 
@@ -4291,24 +4344,208 @@ class _BatchedARGenerationService:
         max_prefix = min(max(0, len(job.prompt_ids) - 1) for job in jobs)
         return min(len(prefix), max_prefix)
 
+    def _wait_pending_postcommit(self, job: _BatchedARJob) -> None:
+        """Mirror the solo lane: a same-session follow-up turn arriving while the
+        previous turn's postcommit is still pending waits for it (bounded,
+        MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S / 8 s) instead of falling through to
+        an SSD miss and a full re-prefill. Live 2026-09-24 receipt on the
+        batched lane: every opencode follow-up turn resolved to
+        pending_postcommit_near_prefix_match and re-prefilled 15-17k tokens."""
+        sessions = getattr(self.state, "sessions", None)
+        peek = getattr(sessions, "peek", None)
+        if not job.session_id or not callable(peek):
+            return
+        try:
+            session = peek(job.session_id)
+        except Exception:  # noqa: BLE001
+            return
+        wait = getattr(session, "wait_for_pending_postcommit", None)
+        if not callable(wait):
+            return
+        try:
+            outcome = wait()
+        except Exception as exc:  # noqa: BLE001
+            job.request_observability["ar_batch_postcommit_wait_error"] = repr(exc)
+            return
+        if isinstance(outcome, dict) and outcome.get("waited"):
+            job.request_observability["ar_batch_postcommit_wait"] = outcome
+            _log_json_event("ar_batch_postcommit_wait", request_id=job.request_id, session_id=job.session_id, **{k: v for k, v in outcome.items() if isinstance(v, (str, int, float, bool))})
+
+    def _prepare_near_prefix_restore(self, job: _BatchedARJob) -> bool:
+        """Exact-prefix entries are superseded by the finished entry (prompt +
+        generation), so a same-session follow-up turn is served by a near-prefix
+        BOUNDARY restore. This restores the bank entry up to the boundary and hands
+        the remaining tokens to the batch generator, which prefills them in chunks
+        interleaved with the other rows' decode steps. It must NOT prefill the
+        suffix here: this runs in the pump's admission step, and a 88k-token suffix
+        prefilled inline blocked every other stream for 190 s (2026-09-24 live).
+        Lookup on the prompt minus its last token so at least one token is left
+        to insert."""
+        bank = getattr(job, "session_bank", None)
+        if bank is None or len(job.prompt_ids) < 2 or job.cancel_requested():
+            return False
+        if any(int(token) >= (1 << 40) for token in job.prompt_ids):
+            return False
+        candidates_fn = getattr(bank, "near_prefix_candidates", None)
+        restore_fn = getattr(bank, "restore_entry_prefix_cache", None)
+        if not callable(candidates_fn) or not callable(restore_fn):
+            return False
+        head = [int(token) for token in job.prompt_ids[:-1]]
+        started = time.perf_counter()
+        try:
+            from mtplx.generation import (
+                _entry_matches_restore_lookup,
+                _mtp_history_uses_committed_cache,
+                _resolve_mtp_history_policy,
+                _resolve_runtime_base_hidden_variant,
+            )
+
+            rt = self.state.runtime
+            try:
+                requested_policy = _bank_history_policy(self.state)
+            except Exception:  # noqa: BLE001
+                requested_policy = "committed"
+            history_policy = _resolve_mtp_history_policy(requested_policy, len(head))
+            base_variant = _resolve_runtime_base_hidden_variant(rt, None)
+            draft_head = getattr(self.state, "draft_head_identity", None)
+            candidates = candidates_fn(
+                head,
+                model_path=str(rt.model_path),
+                mtp_enabled=bool(getattr(rt, "mtp_enabled", False)),
+                hidden_variant=base_variant,
+                template_hash=job.session_template_hash,
+                mtp_history_policy=history_policy,
+                draft_head_identity=draft_head,
+                policy_fingerprint=job.session_policy_fingerprint,
+            )
+            chosen = None
+            for entry, matched in candidates:
+                matched = int(matched)
+                if matched < 2 or matched >= int(getattr(entry, "prefix_len", 0) or 0):
+                    continue
+                if not _entry_matches_restore_lookup(
+                    entry, rt, hidden_variant=base_variant, template_hash=job.session_template_hash,
+                    mtp_history_policy=history_policy, draft_head_identity=draft_head,
+                    policy_fingerprint=job.session_policy_fingerprint,
+                ):
+                    continue
+                if _mtp_history_uses_committed_cache(history_policy) and not (
+                    entry.mtp_history_snapshot is not None or getattr(entry, "mtp_history_cache_ref", None) is not None
+                ):
+                    continue
+                modes = (["reference"] if getattr(entry, "live_ref_only", False)
+                         else ["reference", "clone"] if getattr(entry, "cache_ref", None) is not None else ["clone"])
+                for mode in modes:
+                    restored = restore_fn(rt, entry, matched, mode=mode)
+                    if restored is not None:
+                        chosen = (entry, matched, restored)
+                        break
+                if chosen is not None:
+                    break
+        except Exception as exc:  # noqa: BLE001
+            job.request_observability["ar_batch_near_prefix_error"] = f"{type(exc).__name__}: {exc}"
+            _log_json_event("ar_batch_near_prefix_error", request_id=job.request_id, error=f"{type(exc).__name__}: {exc}")
+            return False
+        if chosen is None:
+            return False
+        entry, matched, restored = chosen
+        cache = restored[0]
+        restore_point = int(restored[3]) if len(restored) >= 4 else int(matched)
+        mode = str(restored[2]) if len(restored) >= 3 else "clone"
+        if not cache or restore_point < 1 or restore_point >= len(job.prompt_ids):
+            return False
+        if not self._cache_supports_batch_history_merge(cache):
+            return False
+        job.insert_cache = cache
+        job.insert_all_tokens = [int(token) for token in job.prompt_ids[:restore_point]]
+        job.insert_prompt_ids = [int(token) for token in job.prompt_ids[restore_point:]]
+        job.cached_tokens = restore_point
+        job.session_cache_hit = True
+        job.cache_miss_reason = None
+        job.effective_restore_mode = f"ar_batch_near_prefix:{mode}"
+        job.cache_source = str(getattr(entry, "cache_source", "ram") or "ram")
+        job.ssd_cache_hit = job.cache_source == "ssd"
+        job.ssd_cached_tokens = restore_point if job.ssd_cache_hit else 0
+        job.ssd_suffix_tokens = len(job.insert_prompt_ids)
+        job.prompt_prepare_s += time.perf_counter() - started
+        job.request_observability["ar_batch_near_prefix_restore"] = {
+            "cached_tokens": restore_point,
+            "suffix_to_generator": len(job.insert_prompt_ids),
+            "restore_mode": job.effective_restore_mode,
+            "prepare_s": round(time.perf_counter() - started, 3),
+        }
+        _log_json_event(
+            "ar_batch_near_prefix_restore",
+            request_id=job.request_id,
+            session_id=job.session_id,
+            prompt_len=len(job.prompt_ids),
+            cached_tokens=restore_point,
+            suffix_to_generator=len(job.insert_prompt_ids),
+            restore_mode=job.effective_restore_mode,
+            prepare_s=round(time.perf_counter() - started, 3),
+        )
+        return True
+
     def _prepare_session_bank_restore(self, job: _BatchedARJob) -> bool:
         if job.session_bank is None or len(job.prompt_ids) < 2:
             return False
+        self._wait_pending_postcommit(job)
         started = time.perf_counter()
         try:
+            restore_mode = _session_bank_restore_mode(job.session_restore_mode)
             restored = job.session_bank.restore(
                 self.state.runtime,
                 job.prompt_ids,
-                mode=_session_bank_restore_mode(job.session_restore_mode),
+                mode=restore_mode,
                 session_id=job.session_id,
                 template_hash=job.session_template_hash,
                 policy_fingerprint=job.session_policy_fingerprint,
             )
+            ram_miss = getattr(job.session_bank, "last_ram_miss_reason", None)
+            if restored is not None and int(restored.entry.prefix_len) >= len(job.prompt_ids):
+                # The exact entry is LONGER than the prompt (previous turn's prompt +
+                # generation): nothing is left to insert, and the recurrent state
+                # cannot be trimmed back. The solo lane serves this through the
+                # boundary restore; do the same instead of refusing (2026-09-24
+                # quiet-box 20k receipt: ar_batch_full_prefix_not_insertable, 35 s
+                # cold prefill while the solo lane restored all 19.5k tokens).
+                restored = None
+                if self._prepare_near_prefix_restore(job):
+                    return True
+                job.cache_miss_reason = "ar_batch_full_prefix_not_insertable"
+                return False
+            if restored is None and restore_mode == "clone" and ram_miss == "no_snapshot_coverage":
+                peek = getattr(job.session_bank, "longest_prefix", None)
+                entry = peek(job.prompt_ids) if callable(peek) else None
+                if entry is not None and int(getattr(entry, "prefix_len", 0)) >= len(job.prompt_ids):
+                    # A lease would consume the live reference for nothing: the
+                    # entry is not insertable either. Boundary restore instead.
+                    if self._prepare_near_prefix_restore(job):
+                        return True
+                    job.cache_miss_reason = "ar_batch_full_prefix_not_insertable"
+                    return False
+                # The entry is a live reference (the solo lane leases the live
+                # cache for coding-agent tool sessions instead of snapshotting
+                # it), so a clone has nothing to copy. Take the lease the same
+                # way the solo lane does; the row's state is banked again when
+                # the batched row finishes. 2026-09-24 opencode receipt: every
+                # same-session follow-up turn on the lane missed this way.
+                restored = job.session_bank.restore(
+                    self.state.runtime,
+                    job.prompt_ids,
+                    mode="reference",
+                    session_id=job.session_id,
+                    template_hash=job.session_template_hash,
+                    policy_fingerprint=job.session_policy_fingerprint,
+                )
+                job.request_observability["ar_batch_restore_retried_as_reference"] = restored is not None
         except Exception as exc:
             job.cache_miss_reason = f"ar_batch_restore_error:{type(exc).__name__}"
             return False
         finally:
             job.prompt_prepare_s += time.perf_counter() - started
+        if restored is None and self._prepare_near_prefix_restore(job):
+            return True
         if restored is None:
             job.cache_miss_reason = getattr(
                 job.session_bank,
@@ -4321,6 +4558,7 @@ class _BatchedARGenerationService:
                     json.dumps(
                         {
                             "event": "ar_batch_restore_miss_debug",
+                            "ram_miss_reason": getattr(job.session_bank, "last_ram_miss_reason", None),
                             "prompt_len": len(job.prompt_ids),
                             "bank_entries": len(job.session_bank),
                             "miss_reason": job.cache_miss_reason,
@@ -4491,6 +4729,105 @@ class _BatchedARGenerationService:
         for job in jobs:
             self._prepare_session_bank_restore(job)
         self._prepare_shared_prefix(jobs)
+        for job in jobs:
+            self._prepare_stable_prefix(job)
+
+    @staticmethod
+    def _stable_prefix_len(job: _BatchedARJob) -> int | None:
+        raw = job.request_observability.get("stable_prefix_len")
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            return None
+        if raw < _STABLE_PREFIX_BANK_MIN_TOKENS or raw >= len(job.prompt_ids):
+            return None
+        return int(raw)
+
+    def _prepare_stable_prefix(self, job: _BatchedARJob) -> None:
+        """Bank this turn's STABLE prefix (the prompt without MTPLX's transient
+        trailing hint) as an exact-prefix entry before the batch generator sees
+        the request. The lane used to bank only the full prompt (hint included)
+        at the prompt boundary, so the next same-session turn, whose prompt
+        never contains the previous hint, diverged ~200 tokens before the
+        entry's end and needed a recurrent boundary the lane never captured:
+        full re-prefill every turn (2026-09-24 opencode receipt). The solo lane
+        freezes its committed frontier at stable_prefix_len; this is the batched
+        equivalent: advance the (restored or fresh) cache to the stable edge with
+        the runtime's own forward, snapshot it into the bank, then let the batch
+        generator prefill only the hint. Never fatal; a failure leaves the job
+        exactly as it was."""
+        stable = self._stable_prefix_len(job)
+        bank = getattr(job, "session_bank", None)
+        if stable is None or bank is None or job.cancel_requested():
+            _log_json_event(
+                "ar_batch_stable_prefix_skipped",
+                request_id=job.request_id,
+                session_id=job.session_id,
+                reason=("no_stable_prefix_len" if stable is None else "no_bank" if bank is None else "cancelled"),
+                stable_prefix_len_raw=job.request_observability.get("stable_prefix_len"),
+                prompt_len=len(job.prompt_ids),
+            )
+            return
+        if any(int(token) >= (1 << 40) for token in job.prompt_ids[:stable]):
+            return  # vision surrogate ids never enter the batched bank path
+        start = len(job.insert_all_tokens) if job.insert_cache is not None else 0
+        if start > stable:
+            return  # the restore already covers the stable edge (plus some hint tokens)
+        if job.insert_cache is not None and job.insert_all_tokens != list(job.prompt_ids[:start]):
+            return  # not a prefix restore we can extend
+        prepare_started = time.perf_counter()
+        try:
+            import mlx.core as mx
+
+            cache = job.insert_cache if job.insert_cache is not None else self.state.runtime.make_cache()
+            if not self._cache_supports_batch_history_merge(cache):
+                return
+            chunk = max(1, int(_STABLE_PREFIX_PREFILL_CHUNK))
+            with attention_phase("prefill"):
+                for lo in range(start, stable, chunk):
+                    hi = min(stable, lo + chunk)
+                    logits = self.state.runtime.forward_ar(
+                        mx.array([list(job.prompt_ids[lo:hi])]),
+                        cache=cache,
+                        return_hidden=False,
+                    )
+                    mx.eval(logits, [entry.state for entry in cache])
+            snapshot = snapshot_cache(cache)
+            mx.eval(snapshot.states, snapshot.meta_states)
+            put_snapshot = getattr(bank, "put_snapshot", None)
+            stored = False
+            if callable(put_snapshot):
+                entry = put_snapshot(
+                    runtime=self.state.runtime,
+                    token_ids=list(job.prompt_ids[:stable]),
+                    cache_snapshot=snapshot,
+                    logits=None,
+                    hidden=None,
+                    session_id=job.session_id,
+                    template_hash=job.session_template_hash,
+                    policy_fingerprint=job.session_policy_fingerprint,
+                    snapshot_epoch=stable,
+                )
+                stored = entry is not None
+        except Exception as exc:  # noqa: BLE001
+            job.request_observability["ar_batch_stable_prefix_error"] = f"{type(exc).__name__}: {exc}"
+            _log_json_event("ar_batch_stable_prefix_error", request_id=job.request_id, error=f"{type(exc).__name__}: {exc}")
+            return
+        job.insert_cache = cache
+        job.insert_all_tokens = list(job.prompt_ids[:stable])
+        job.insert_prompt_ids = list(job.prompt_ids[stable:])
+        job.prompt_prepare_s += time.perf_counter() - prepare_started
+        job.request_observability["ar_batch_stable_prefix_tokens"] = stable
+        job.request_observability["ar_batch_stable_prefix_prefilled"] = stable - start
+        job.request_observability["ar_batch_stable_prefix_bank_stored"] = stored
+        _log_json_event(
+            "ar_batch_stable_prefix",
+            request_id=job.request_id,
+            session_id=job.session_id,
+            stable_prefix_len=stable,
+            restored_prefix=start,
+            prefilled=stable - start,
+            bank_stored=stored,
+            prepare_s=round(time.perf_counter() - prepare_started, 3),
+        )
 
     @staticmethod
     def _cache_supports_batch_history_merge(cache: list[Any] | None) -> bool:
@@ -4836,7 +5173,7 @@ class _BatchedARGenerationService:
             or getattr(self.state, "context_window", 0)
             or 1
         )
-        generator = BatchGenerator(
+        generator = _interleaved_batch_generator_class(BatchGenerator)(
             self.state.runtime.model,
             max_tokens=max(1, generator_max_tokens),
             stop_tokens=self._stop_sequences(),

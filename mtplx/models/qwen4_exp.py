@@ -2748,6 +2748,11 @@ def _qsa_rows_gather_kv_route(cache: Any, rows: int) -> Any:
     return _qsa_stock_rows_gather_kv
 
 
+# Batched AR lane (#420): the compiled GDN decode runs are shape-generic, but B > 1 through them is
+# opt-in until measured on the real model. MTPLX_GDN_COMPILED_BATCH=1 enables it.
+_GDN_COMPILED_BATCH = os.environ.get("MTPLX_GDN_COMPILED_BATCH", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
 class QSACache:
     """Cache for one QSA layer: the attention KV plus the indexer's raw key
     stream and the incrementally maintained pooled (mean->norm->rope) block
@@ -2977,6 +2982,104 @@ class QSACache:
         self.pooled_f32_t = None
         self._reserved_raw_capacity = 0 if raw is None else int(raw.shape[1])
         self._reserved_pooled_capacity = 0 if pooled is None else int(pooled.shape[1])
+
+
+
+    # ---- batched AR lane support (#420) ------------------------------------
+    @classmethod
+    def merge(cls, caches):
+        """Build the batch-lane cache for B single-sequence QSA caches.
+
+        mlx-lm's ``BatchGenerator`` merges every batched prompt's caches and
+        needs ``merge()`` on each entry; QSA never had one, so ``ar_batch``
+        refused this family at startup (#420). The batched cache keeps one
+        ``QSACache`` PER ROW instead of one padded buffer: the indexer streams
+        are positional per sequence, the selection kernels are single-row,
+        and RoPE / the causal mask / the dense-shortcut threshold all key off
+        each row's own offset, so a shared left-padded buffer would need a
+        second copy of every kernel. ``QSAAttention`` loops the rows.
+        Rows may already hold history (session-bank restores)."""
+        rows = []
+        for c in caches:
+            if isinstance(c, BatchQSACache):
+                rows.extend(c.rows)
+            elif c is None:
+                rows.append(cls())
+            else:
+                rows.append(c)
+        return BatchQSACache(rows)
+
+
+class BatchQSACache:
+    """Batch-lane container: one ``QSACache`` per row (see ``QSACache.merge``).
+
+    Implements the entry contract mlx-lm's batch generator uses (``merge`` /
+    ``extend`` / ``filter`` / ``extract`` / ``prepare`` / ``finalize`` /
+    ``state`` / ``nbytes``) as list operations over the rows. Ragged prefill
+    right-pads the shorter prompts; each row simply forwards the pad tokens
+    and ``finalize`` trims them off that row (``QSACache.trim`` already keeps
+    the pooled stream in step), so nothing padded ever survives into decode
+    or into a session-bank snapshot (``extract`` hands the row back as is)."""
+
+    def __init__(self, rows):
+        self.rows = list(rows)
+        self._right_padding = None
+
+    @classmethod
+    def merge(cls, caches):
+        return QSACache.merge(caches)
+
+    def __len__(self):
+        return len(self.rows)
+
+    def extend(self, other):
+        self.rows.extend(other.rows if isinstance(other, BatchQSACache) else [other])
+
+    def filter(self, keep):
+        idx = keep.tolist() if hasattr(keep, "tolist") else list(keep)
+        self.rows = [self.rows[int(i)] for i in idx]
+
+    def extract(self, idx):
+        return self.rows[int(idx)]
+
+    def prepare(self, lengths=None, right_padding=None):
+        self._right_padding = None if right_padding is None else [int(p) for p in right_padding]
+
+    def finalize(self):
+        if self._right_padding is not None:
+            for row, pad in zip(self.rows, self._right_padding):
+                if pad > 0:
+                    row.trim(pad)
+        self._right_padding = None
+
+    def is_trimmable(self) -> bool:
+        return all(r.is_trimmable() for r in self.rows)
+
+    def trim(self, n: int) -> int:
+        return min([r.trim(n) for r in self.rows], default=0)
+
+    @property
+    def offset(self) -> int:
+        # Rows are only equal-length outside a ragged prefill; callers on the
+        # batch lane read per-row offsets through ``rows``.
+        return max((r.offset for r in self.rows), default=0)
+
+    @property
+    def nbytes(self) -> int:
+        return sum(r.nbytes for r in self.rows)
+
+    @property
+    def state(self):
+        leaves = []
+        for r in self.rows:
+            if r.kv.keys is None:  # a row that has not been forwarded yet (stock KVCache.state would raise)
+                continue
+            leaves.extend(x for x in r.state if x is not None)
+        return leaves
+
+    @state.setter
+    def state(self, v):
+        raise ValueError("BatchQSACache state is per row; snapshot rows via extract()")
 
 
 class QSAIndexer(nn.Module):
@@ -4181,6 +4284,42 @@ class QSAIndexer(nn.Module):
         return self._call_prefill(hidden, pos_start, cache, qk_rows)
 
 
+def _tail_by_lengths(seq: mx.array, n_keep: int, cache, S: int) -> mx.array:
+    """Last ``n_keep`` entries of ``seq`` [B, prev+S, ...] per row, ending at
+    each row's real length during a right-padded ragged prefill
+    (``cache.lengths``, set by ``prepare``); the plain tail otherwise. Same
+    rule the GDN conv state uses, so pad tokens never enter the PLE n-gram
+    history or the short-conv window of a shorter row (batched lane, #420)."""
+    lengths = getattr(cache, "lengths", None)
+    if lengths is None:
+        return seq[:, -n_keep:]
+    prev = seq.shape[1] - S
+    ends = prev + mx.clip(lengths, 0, S)
+    positions = ends[:, None] + mx.arange(n_keep) - n_keep
+    if seq.ndim == 3:
+        positions = positions[..., None]
+    return mx.take_along_axis(seq, positions, axis=1)
+
+
+def _qsa_batched_forward(attn, x: mx.array, cache: "BatchQSACache") -> mx.array:
+    """Batch-lane QSA forward: run the single-row layer once per row.
+
+    Every QSA kernel, the indexer's host-int offsets and the dense-attention
+    shortcut are single-sequence by design (``QSAIndexer`` raises on B != 1),
+    so the batched lane feeds each row its own cache and slice. Rows are
+    padded to a common S during a ragged prefill; the pad tokens are
+    forwarded like real ones and trimmed by ``BatchQSACache.finalize``."""
+    B = x.shape[0]
+    if B != len(cache.rows):
+        raise ValueError(
+            f"BatchQSACache has {len(cache.rows)} rows for a batch of {B}"
+        )
+    if B == 1:
+        return attn(x, cache.rows[0])
+    outs = [attn(x[i : i + 1], cache.rows[i]) for i in range(B)]
+    return mx.concatenate(outs, axis=0)
+
+
 def _qsa_rows_gather_attention(
     q: mx.array,
     k: mx.array,
@@ -4414,6 +4553,8 @@ class Attention(nn.Module):
         return _glue.qsa_rope_installed()
 
     def __call__(self, x: mx.array, cache: QSACache) -> mx.array:
+        if isinstance(cache, BatchQSACache):
+            return _qsa_batched_forward(self, x, cache)
         B, S, _ = x.shape
         pos_start = cache.offset
         # A fixed-capacity bank (the compiled verify lane) owns its rotary
@@ -5705,7 +5846,7 @@ class NGramEmbedding(nn.Module):
                 prev = mx.full((B, self.context_len), self.eos_id, dtype=mx.int64)
         history = mx.concatenate([prev, ids], axis=1)
         if cache is not None:
-            cache[state_idx] = history[:, -self.context_len :]
+            cache[state_idx] = _tail_by_lengths(history, self.context_len, cache, S)
 
         shifted = [self._shift_ignore_eos(history, s) for s in range(self.ngram_size)]
         blocks = []
@@ -5770,7 +5911,7 @@ class PLELayer(nn.Module):
                     ),
                 )
         if cache is not None:
-            cache[self.CONV_IDX] = window[:, -self.conv_state_len :, :]
+            cache[self.CONV_IDX] = _tail_by_lengths(window, self.conv_state_len, cache, S)
         out = mx.conv1d(
             window,
             self.conv_weight,
@@ -6040,6 +6181,7 @@ class Qwen4ExpTextModel(nn.Module):
             # GDN states are S-invariant so the same run fns serve all
             # widths. Prefill and masked/padded forwards stay eager.
             1 <= h.shape[1] <= 4
+            and (h.shape[0] == 1 or _GDN_COMPILED_BATCH)  # batched AR lane (#420): eager unless opted in
             and ssm_mask is None
             and not self._gdn_compile_explicit_off
             and self._gdn_compiled_env

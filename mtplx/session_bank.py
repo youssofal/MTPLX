@@ -669,6 +669,7 @@ class SessionBank:
         self.last_miss_reason: str | None = None
         self.last_put_nbytes: int = 0
         self.last_put_skipped_oversized_snapshot: bool = False
+        self.last_ram_miss_reason: str | None = None
         # Sessions whose latest generation-final snapshot was refused for size
         # (issue #499, 2026-09-16 repro): the next restore of that conversation
         # names the refusal as the miss instead of the cold tier's prefix miss,
@@ -1746,6 +1747,10 @@ class SessionBank:
         self._touch_session(session_id)
 
         def cold_fallback() -> SessionBankRestore | None:
+            # The RAM path's reason is what operators need when an exact-prefix
+            # entry exists and the restore still misses; the cold tier's own
+            # miss overwrites last_miss_reason, so keep it separately.
+            self.last_ram_miss_reason = self.last_miss_reason
             return self._restore_cold(
                 runtime,
                 token_ids,
