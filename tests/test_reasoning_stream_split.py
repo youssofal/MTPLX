@@ -8,7 +8,11 @@ everywhere, including CI on non-Apple platforms.
 
 from __future__ import annotations
 
+import pytest
+
 from mtplx.reasoning_codecs import (
+    GEMMA4_THINK_CLOSE,
+    GEMMA4_THINK_OPEN,
     QwenThinkingContentStreamSplitter,
     split_reasoning_text,
     stream_splitter_for_parser,
@@ -127,3 +131,52 @@ def test_lfm2_normalize_keeps_plain_history_as_content() -> None:
     )
     assert "Ship it." in with_think
     assert with_think.index("weigh options") < with_think.index("Ship it.")
+
+
+# The model separates the close tag from its answer with "\n\n". Non-stream
+# responses strip it; streamed content must concatenate to the same text
+# whether the separator arrives with the close tag or in a later chunk.
+_ANSWER_SEPARATOR_CASES = (
+    ("qwen3", True, "plan</think>\n\nThe answer is 4."),
+    ("qwen3", True, "plan</think>\n \t\nThe answer is 4."),
+    ("qwen3", False, "\n\nThe answer is 4."),
+    ("lfm2", True, "<think>plan</think>\n\nThe answer is 4."),
+    (
+        "gemma4",
+        True,
+        f"{GEMMA4_THINK_OPEN}plan{GEMMA4_THINK_CLOSE}\n\nThe answer is 4.",
+    ),
+    ("gemma4", False, "\n\nThe answer is 4."),
+)
+
+
+def _stream_content(parser: str, thinking_enabled: bool, chunks: list[str]) -> str:
+    sp = stream_splitter_for_parser(parser, thinking_enabled=thinking_enabled)
+    out = list(sp.start())
+    for c in chunks:
+        out += sp.feed(c)
+    out += sp.finish()
+    return "".join(t for f, t in out if f == "content")
+
+
+@pytest.mark.parametrize(
+    ("parser", "thinking_enabled", "text"), _ANSWER_SEPARATOR_CASES
+)
+def test_answer_separator_never_streams_as_content(
+    parser, thinking_enabled, text
+) -> None:
+    expected = split_reasoning_text(
+        text, parser=parser, thinking_enabled=thinking_enabled
+    ).content
+    assert expected == "The answer is 4."
+    splits = [[text], list(text)]
+    splits += [[text[:i], text[i:]] for i in range(1, len(text))]
+    for chunks in splits:
+        assert _stream_content(parser, thinking_enabled, chunks) == expected, chunks
+
+
+def test_answer_whitespace_after_the_first_visible_character_is_kept() -> None:
+    content = _stream_content(
+        "qwen3", True, ["plan</think>", "\n\n", "Line one.", "\n\n", "Line two."]
+    )
+    assert content == "Line one.\n\nLine two."
