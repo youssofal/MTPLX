@@ -8112,6 +8112,69 @@ def _append_mtp_history(
     return time.perf_counter() - started
 
 
+# Block width of the top-K prefilter. 248,320 (the Qwen3.6 vocabulary) is
+# 3,880 blocks of 64, so the real vocabulary needs no tail.
+_TOP_K_PREFILTER_BLOCK = 64
+
+
+def _row_logsumexp_f32(logits: mx.array) -> mx.array:
+    """Per-row float32 logsumexp, shape ``[rows, 1]``."""
+
+    return mx.logsumexp(logits.astype(mx.float32), axis=-1, keepdims=True)
+
+
+def _logprobs_at(logits: mx.array, row_lse: mx.array, ids: mx.array) -> mx.array:
+    """float32 logprobs of ``ids`` per row: the same ``float32(logit) - lse``
+    a full log-softmax would hold at those ids, without building it."""
+
+    return mx.take_along_axis(logits, ids, axis=-1).astype(mx.float32) - row_lse
+
+
+def _exact_top_k_ids(logits: mx.array, k: int) -> mx.array:
+    """Ids of the ``k`` largest logits per row, without a full-vocab sort.
+
+    The vocabulary is cut into blocks of ``_TOP_K_PREFILTER_BLOCK``; only the
+    ``k`` blocks with the highest maxima can hold the top ``k`` (any other
+    block's elements are beaten by ``k`` block maxima), so the final
+    selection runs over ``k`` blocks plus the ragged tail of the vocabulary.
+    Raw logits convert to float32 exactly, so ranking them is ranking the
+    logprobs. Which of several exactly tied values fills the last slot is
+    unspecified, as it was with a full-vocab ``argpartition``.
+    """
+
+    rows, vocab = logits.shape
+    block = _TOP_K_PREFILTER_BLOCK
+    full_blocks = vocab // block
+    if k >= full_blocks:
+        return _argpartition_top_k(logits, k)
+    blocked = logits[:, : full_blocks * block].reshape(rows, full_blocks, block)
+    block_ids = _argpartition_top_k(blocked.max(axis=-1), k)
+    candidate_ids = (block_ids[..., None] * block + mx.arange(block)).reshape(
+        rows, k * block
+    )
+    tail_ids = mx.broadcast_to(
+        mx.arange(full_blocks * block, vocab), (rows, vocab - full_blocks * block)
+    )
+    candidate_ids = mx.concatenate([candidate_ids, tail_ids], axis=-1)
+    candidates = mx.take_along_axis(logits, candidate_ids, axis=-1)
+    chosen = _argpartition_top_k(candidates, k)
+    return mx.take_along_axis(candidate_ids, chosen, axis=-1)
+
+
+def _argpartition_top_k(values: mx.array, k: int) -> mx.array:
+    return mx.argpartition(-values, kth=k - 1, axis=-1)[..., :k]
+
+
+def _sorted_top_k(ids: np.ndarray, logprobs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Each row by descending logprob; equal logprobs by ascending token id."""
+
+    order = np.lexsort((ids, -logprobs), axis=-1)
+    return (
+        np.take_along_axis(ids, order, axis=-1),
+        np.take_along_axis(logprobs, order, axis=-1),
+    )
+
+
 def score_prompt_logprobs(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
@@ -8153,11 +8216,11 @@ def score_prompt_logprobs(
                 hidden_variant=None,
                 emit_logits=True,
             )
-        logprobs = logits[0].astype(mx.float32)
-        logprobs = logprobs - mx.logsumexp(logprobs, axis=-1, keepdims=True)
-        k = min(top_k, int(logprobs.shape[-1]))
-        top_idx = mx.argpartition(-logprobs, kth=k - 1, axis=-1)[..., :k]
-        top_vals = mx.take_along_axis(logprobs, top_idx, axis=-1)
+        rows_logits = logits[0]
+        row_lse = _row_logsumexp_f32(rows_logits)
+        k = min(top_k, int(rows_logits.shape[-1]))
+        top_idx = _exact_top_k_ids(rows_logits, k)
+        top_vals = _logprobs_at(rows_logits, row_lse, top_idx)
         # Positions start..end-1 predict prompt tokens start+1..end; the
         # final prompt position has no target inside the prompt.
         target_rows = min(end, n - 1) - start
@@ -8165,8 +8228,8 @@ def score_prompt_logprobs(
             targets = mx.array(
                 [prompt_ids[start + 1 : start + 1 + target_rows]]
             )[0][:, None]
-            target_lp = mx.take_along_axis(
-                logprobs[:target_rows], targets, axis=-1
+            target_lp = _logprobs_at(
+                rows_logits[:target_rows], row_lse[:target_rows], targets
             )[:, 0]
         else:
             target_lp = None
@@ -8174,12 +8237,7 @@ def score_prompt_logprobs(
             mx.eval(top_idx, top_vals, target_lp)
         else:
             mx.eval(top_idx, top_vals)
-        idx_np = np.array(top_idx)
-        vals_np = np.array(top_vals)
-        # Sort each row descending by logprob.
-        order = np.argsort(-vals_np, axis=-1)
-        idx_np = np.take_along_axis(idx_np, order, axis=-1)
-        vals_np = np.take_along_axis(vals_np, order, axis=-1)
+        idx_np, vals_np = _sorted_top_k(np.array(top_idx), np.array(top_vals))
         rows = end - start
         for row in range(rows):
             # The last prompt position's distribution predicts a token
@@ -8194,7 +8252,7 @@ def score_prompt_logprobs(
             )
         if target_lp is not None:
             token_logprobs.extend(float(v) for v in np.array(target_lp))
-        del logits, logprobs, top_idx, top_vals
+        del logits, rows_logits, row_lse, top_idx, top_vals
     return {
         "positions": top_entries,
         "token_logprobs": token_logprobs,

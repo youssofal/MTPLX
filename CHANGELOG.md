@@ -4,6 +4,29 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **Prompt scoring picks its top-K without a full-vocabulary log-softmax.**
+  `/v1/completions` with `echo`, `logprobs` and `max_tokens: 0` used to
+  build a float32 log-softmax over all 248,320 logits of every row and
+  partition all of it. It now takes one float32 logsumexp per row, finds
+  the top-K ids by the largest value per 64-logit block (only the K best
+  blocks can hold the top K), and subtracts the logsumexp only at those ids
+  and at the scored token. The logprobs are bitwise the same values; the
+  ids are the same except where the K-th value is an exact tie, and exact
+  ties now list by ascending token id instead of an unspecified order.
+  Measured on synthetic tensors only (256 x 248,320 random bf16 logits, one
+  scoring chunk, M5 Pro): 47 ms -> 3.4 to 5.2 ms per chunk on the GPU for
+  K 1 to 128, and 420 ms -> 150 to 170 ms on the CPU. On the real model
+  (M5 Pro 64 GB, Qwen3.6-35B-A3B MTPLX Optimized-Balance, profile turbo,
+  depth 2, fan mode default, logprobs 20, fresh server per run, 2026-09-26)
+  against 2.12.0 over 240 prompts of 250-840 tokens plus ~2k, ~4k and ~8k
+  token prompts: every scored position bitwise equal (121,263 of 121,263,
+  largest logprob difference 0), p50 432 ms vs 536 ms below 512 tokens,
+  521 ms vs 630 ms at 512-1,023 tokens, 7.55 s vs 8.84 s at ~8k tokens.
+
 ## [2.12.0] - 2026-09-23
 
 ### Added
