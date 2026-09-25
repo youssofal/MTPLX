@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **The session bank names why RAM could not serve a shared prompt start.** When the near/block-prefix lane passed over every stored entry, the request fell through to the SSD lookup and `/health` only showed its `ssd_prefix_miss`, which hid the RAM-lane cause. The prefix diagnostic now carries `ram_miss_reason` (also shown as `session_bank.last_ram_miss_reason`): `below_block_min_match:<N>` with the minimum that actually applied, `no_gdn_boundaries` for a hybrid entry stored without boundary records, `block_prefix_disabled`, or the near-prefix lane's own refusal of the best candidate (`boundary_not_better:<N>`, `identity_mismatch`, `missing_committed_mtp_history`, ...). `last_miss_reason` keeps its meaning; restore behavior is unchanged. Host unit tests only (`tests/test_ram_miss_reason.py`), no model run.
+
 ## [2.12.0] - 2026-09-23
 
 ### Added

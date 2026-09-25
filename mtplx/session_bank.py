@@ -326,6 +326,30 @@ def block_aligned_prefix_len(matched_tokens: int, *, block_size: int) -> int:
     return (matched // block) * block
 
 
+def block_prefix_skip_reason(
+    *,
+    matched_tokens: int,
+    block_prefix_allowed: bool,
+    exact_capable: bool,
+    block_min_matched_tokens: int,
+) -> str:
+    """Why the block-prefix lane passed over an entry.
+
+    Recorded as ``ram_miss_reason`` in the prefix diagnostic. Without it a
+    RAM-lane refusal only surfaced as the cold tier's ``ssd_prefix_miss``
+    (the SSD lookup that runs afterwards), which hid the actual cause.
+    """
+    if matched_tokens <= 0:
+        return CacheMissReason.PREFIX_DIVERGENCE_AT_TOKEN.value
+    if not block_prefix_allowed:
+        return "block_prefix_disabled"
+    if not exact_capable and matched_tokens >= block_min_matched_tokens:
+        # Hybrid entry without stored GDN boundaries: the restore point
+        # rounds down to a block edge that falls below the minimum.
+        return "no_gdn_boundaries"
+    return f"below_block_min_match:{int(block_min_matched_tokens)}"
+
+
 # Policies that share the committed-mtp-cache representation. An entry stored
 # under any of these policies can be safely reused for a lookup that requests
 # any other policy in this set, because the cache snapshot shape is identical
@@ -1398,6 +1422,12 @@ class SessionBank:
                 continue
 
             if not allow_block_prefix:
+                diag["ram_miss_reason"] = block_prefix_skip_reason(
+                    matched_tokens=matched,
+                    block_prefix_allowed=False,
+                    exact_capable=False,
+                    block_min_matched_tokens=block_min_match,
+                )
                 continue
             # kvcache-v2 token-granularity: entries that can restore exactly at
             # any offset (pure-attention models) or that carry interior
@@ -1411,6 +1441,12 @@ class SessionBank:
             )
             candidate_len = matched if exact_capable else safe_block
             if candidate_len < block_min_match:
+                diag["ram_miss_reason"] = block_prefix_skip_reason(
+                    matched_tokens=matched,
+                    block_prefix_allowed=True,
+                    exact_capable=exact_capable,
+                    block_min_matched_tokens=block_min_match,
+                )
                 continue
             if candidate_len < 2:
                 continue
@@ -1562,6 +1598,7 @@ class SessionBank:
                 if self._entries
                 else CacheMissReason.NEW_SESSION.value
             )
+            best.setdefault("ram_miss_reason", best["miss_reason"])
             self.last_prefix_diagnostic = best
         return matches
 
@@ -2172,6 +2209,11 @@ class SessionBank:
             "lease_entries": self.lease_entries,
             "lease_nbytes": self.lease_nbytes,
             "last_miss_reason": self.last_miss_reason,
+            # Why the RAM lane could not serve the last lookup; last_miss_reason
+            # may name the cold tier's miss that ran afterwards instead.
+            "last_ram_miss_reason": (self.last_prefix_diagnostic or {}).get(
+                "ram_miss_reason"
+            ),
             "last_oversized_skip": self.last_oversized_skip,
             "last_restore_source": self.last_restore_source,
             "last_ssd_restore_s": self.last_ssd_restore_s,

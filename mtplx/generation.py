@@ -4530,6 +4530,21 @@ def _opencode_compact_tool_history_policy(policy_fingerprint: str | None) -> boo
     )
 
 
+def _note_near_prefix_miss(session_bank: Any, reason: str | None) -> None:
+    """Keep the RAM-lane refusal next to the bank's prefix diagnostic.
+
+    The SSD lookup that runs after a refused candidate reports its own
+    ``ssd_prefix_miss``; without this note the RAM reason (for example
+    ``boundary_not_better``) was only visible under
+    MTPLX_DEBUG_PREFIX_DIVERGENCE.
+    """
+    if reason is None:
+        return
+    diagnostic = getattr(session_bank, "last_prefix_diagnostic", None)
+    if isinstance(diagnostic, dict):
+        diagnostic["ram_miss_reason"] = reason
+
+
 def _restore_near_prefix_prompt_state(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
@@ -4582,6 +4597,7 @@ def _restore_near_prefix_prompt_state(
         _env_int("MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS", 512),
     )
     candidates_seen = 0
+    first_reject: str | None = None
     _prefix_restore_fn = getattr(session_bank, "restore_entry_prefix_cache", None)
     _prefix_restore_supports_served = callable(
         _prefix_restore_fn
@@ -4625,11 +4641,18 @@ def _restore_near_prefix_prompt_state(
                     flush=True,
                 )
 
+        def _near_reject(reason: str) -> None:
+            # Candidates arrive best-first: the first refusal explains the miss.
+            nonlocal first_reject
+            if first_reject is None:
+                first_reject = reason
+            _near_debug(reason)
+
         if matched <= int(min_restore_tokens):
-            _near_debug("matched_below_min_restore")
+            _near_reject("matched_below_min_restore")
             continue
         if matched < 2 or matched >= int(getattr(entry, "prefix_len", 0) or 0):
-            _near_debug("matched_out_of_range")
+            _near_reject("matched_out_of_range")
             continue
         if not _entry_matches_restore_lookup(
             entry,
@@ -4640,7 +4663,7 @@ def _restore_near_prefix_prompt_state(
             draft_head_identity=draft_head_identity,
             policy_fingerprint=policy_fingerprint,
         ):
-            _near_debug("identity_mismatch")
+            _near_reject("identity_mismatch")
             continue
         committed_history_required = _mtp_history_uses_committed_cache(
             mtp_history_policy
@@ -4650,7 +4673,7 @@ def _restore_near_prefix_prompt_state(
             or getattr(entry, "mtp_history_cache_ref", None) is not None
         )
         if committed_history_required and not has_committed_history:
-            _near_debug("missing_committed_mtp_history")
+            _near_reject("missing_committed_mtp_history")
             continue
         if getattr(entry, "has_recurrent", False):
             # Every partial restore of a recurrent entry lands at the newest
@@ -4668,7 +4691,7 @@ def _restore_near_prefix_prompt_state(
                 if boundary_probe is not None:
                     achievable = int(boundary_probe[0])
             if achievable <= int(min_restore_tokens):
-                _near_debug(f"boundary_not_better:{achievable}")
+                _near_reject(f"boundary_not_better:{achievable}")
                 continue
 
         prefix_restore = None
@@ -4730,7 +4753,7 @@ def _restore_near_prefix_prompt_state(
                     prefix_restore = (cache, mtp_history_cache, "clone")
             cache_restore_time_s = time.perf_counter() - restore_started
         if prefix_restore is None:
-            _near_debug(
+            _near_reject(
                 "restore_failed:"
                 + str(getattr(session_bank, "last_miss_reason", None))
             )
@@ -4959,6 +4982,7 @@ def _restore_near_prefix_prompt_state(
             ),
             restore_served=served_truth,
         )
+    _note_near_prefix_miss(session_bank, first_reject)
     return None
 
 
