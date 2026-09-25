@@ -106,7 +106,12 @@ from mtplx.backends.descriptors import (
 )
 from mtplx.backends.registry import load_runtime_contract
 from mtplx.batching import BatchSchedulerConfig, SchedulerMode, SchedulerPreset
-from mtplx.chat_encode_cache import GLOBAL_CHAT_ENCODE_CACHE, ChatEncodeCache
+from mtplx.chat_encode_cache import (
+    GLOBAL_CHAT_ENCODE_CACHE,
+    GLOBAL_CHAT_SEGMENT_MEMO,
+    ChatEncodeCache,
+    ChatSegmentEncodeMemo,
+)
 from mtplx.chat_encoding import encode_chat_messages, is_gemma4_tokenizer
 from mtplx.constrained import (
     ResponseFormatError,
@@ -14557,25 +14562,80 @@ def _encode_rendered_chat_text_segmented(
     boundaries: list[int],
     *,
     token_counts_at: dict[int, int] | None = None,
+    template_observability: dict[str, Any] | None = None,
 ) -> list[int]:
     if not boundaries:
         return _encode_rendered_chat_text(tokenizer, rendered)
+    encode_segment = _chat_segment_encoder(tokenizer, template_observability)
     token_ids: list[int] = []
     start = 0
     for boundary in sorted(set(int(boundary) for boundary in boundaries)):
         if boundary <= start or boundary >= len(rendered):
             continue
-        token_ids.extend(
-            _encode_rendered_chat_text(tokenizer, rendered[start:boundary])
-        )
+        token_ids.extend(encode_segment(rendered[start:boundary]))
         start = boundary
         if token_counts_at is not None and boundary in token_counts_at:
             # Cumulative token count at this char boundary — token-exact
             # because the segment split IS the encode split.
             token_counts_at[boundary] = len(token_ids)
     if start < len(rendered):
-        token_ids.extend(_encode_rendered_chat_text(tokenizer, rendered[start:]))
+        token_ids.extend(encode_segment(rendered[start:]))
     return token_ids
+
+
+def _chat_segment_encoder(
+    tokenizer: Any,
+    template_observability: dict[str, Any] | None,
+) -> Callable[[str], list[int]]:
+    """Encoder for one segment of a segmented chat encode.
+
+    The segmented encode is by definition the concatenation of independent
+    per-segment encodes, so a segment's ids depend only on the tokenizer and
+    the segment's exact text: memoizing them is exact by construction. Agent
+    transcripts resend every earlier segment each turn, so only the new ones
+    are tokenized. Counts land in template_observability["chat_segment_memo"].
+    """
+    tokenizer_key = (
+        _chat_encode_tokenizer_key(tokenizer)
+        if GLOBAL_CHAT_SEGMENT_MEMO.enabled()
+        else None
+    )
+    if tokenizer_key is None:
+        return lambda text: _encode_rendered_chat_text(tokenizer, text)
+    tokenizer_key = f"{tokenizer_key}:{_chat_segment_vocab_size(tokenizer)}"
+    counts = {"hits": 0, "misses": 0, "reused_tokens": 0}
+    if template_observability is not None:
+        template_observability["chat_segment_memo"] = counts
+
+    def encode_segment(text: str) -> list[int]:
+        key = ChatSegmentEncodeMemo.make_key(tokenizer_key=tokenizer_key, text=text)
+        ids = GLOBAL_CHAT_SEGMENT_MEMO.get(key)
+        if ids is not None:
+            counts["hits"] += 1
+            counts["reused_tokens"] += len(ids)
+            return ids
+        counts["misses"] += 1
+        ids = _encode_rendered_chat_text(tokenizer, text)
+        GLOBAL_CHAT_SEGMENT_MEMO.put(key, ids)
+        return ids
+
+    return encode_segment
+
+
+def _chat_segment_vocab_size(tokenizer: Any) -> str | None:
+    """Vocabulary component of the segment-memo key.
+
+    The tokenizer identity key survives tokens added to a live tokenizer
+    (``add_tokens``), and a new token can change how a remembered segment
+    splits. The base vocab size plus the added-token count changes with it.
+    ``len(tokenizer)`` would too, but on a fast tokenizer with a ~250K vocab
+    it costs ~11 ms per call; these two attributes cost microseconds.
+    mlx-lm's TokenizerWrapper forwards both to the HF tokenizer.
+    """
+    try:
+        return f"{int(tokenizer.vocab_size)}+{len(tokenizer.added_tokens_decoder)}"
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 def _encode_generation_compatible_tool_history(
@@ -14616,7 +14676,12 @@ def _encode_generation_compatible_tool_history(
     # the tool-continuation nudge (audit F11 #5).
     hint_boundary = _trailing_tool_hint_char_boundary(rendered)
     if hint_boundary is None:
-        return _encode_rendered_chat_text_segmented(tokenizer, rendered, boundaries)
+        return _encode_rendered_chat_text_segmented(
+            tokenizer,
+            rendered,
+            boundaries,
+            template_observability=template_observability,
+        )
     # Report where the transient trailing tool-continuation hint's user turn
     # begins, in TOKENS. Splitting the segmented encode at the turn's
     # <|im_start|> (a special token, so the split is merge-safe like every
@@ -14631,6 +14696,7 @@ def _encode_generation_compatible_tool_history(
         rendered,
         [*boundaries, hint_boundary],
         token_counts_at=token_counts,
+        template_observability=template_observability,
     )
     stable_prefix_len = int(token_counts.get(hint_boundary, -1))
     if template_observability is not None and 0 < stable_prefix_len < len(token_ids):
@@ -14676,6 +14742,7 @@ def _encode_with_stable_hint_boundary(
         rendered,
         [boundary],
         token_counts_at=token_counts,
+        template_observability=template_observability,
     )
     stable_prefix_len = int(token_counts.get(boundary, -1))
     if 0 < stable_prefix_len < len(token_ids):
@@ -15044,7 +15111,10 @@ def _encode_messages_uncached(
                 hint_boundary = _trailing_tool_hint_char_boundary(seam_rendered)
                 if hint_boundary is None:
                     return _encode_rendered_chat_text_segmented(
-                        tokenizer, seam_rendered, canon_boundaries
+                        tokenizer,
+                        seam_rendered,
+                        canon_boundaries,
+                        template_observability=template_observability,
                     )
                 token_counts: dict[int, int] = {hint_boundary: -1}
                 token_ids = _encode_rendered_chat_text_segmented(
@@ -15052,6 +15122,7 @@ def _encode_messages_uncached(
                     seam_rendered,
                     [*canon_boundaries, hint_boundary],
                     token_counts_at=token_counts,
+                    template_observability=template_observability,
                 )
                 stable_prefix_len = int(token_counts.get(hint_boundary, -1))
                 if (

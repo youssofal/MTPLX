@@ -4,6 +4,46 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **Agent turns tokenize only the part of the transcript that is new.** The
+  whole-request encode cache misses on every new agent turn because the
+  transcript grew, so each tool-call turn re-tokenized the entire
+  conversation on the CPU ahead of prefill. Transcripts with tool-call
+  history (and, with reasoning history preserved, any transcript with
+  assistant history) are already encoded segment by segment at the
+  assistant generation seams; the token ids of each segment are now
+  memoized by tokenizer identity, vocabulary size and a SHA-256 of the exact
+  segment text. Because the segmented encode is by definition the
+  concatenation of independent per-segment encodes, a memoized segment is
+  token-identical to a fresh one; parity tests cover growing tool-call
+  transcripts with thinking, unicode, repeated and very long segments, edits
+  in earlier history, separate tokenizers and tokens added to a live
+  tokenizer, in hybrid and compact tool mode with thinking on and off.
+  Transcripts that are not segmented (plain chat under scoped reasoning
+  history, thinking off) are encoded exactly as before. The memo is bounded
+  to 1,048,576 stored tokens (int32, about 4 MB) and 4,096 entries, least
+  recently used first. Measured on an Apple M5 Pro (64 GB) with
+  Qwen3.6-35B-A3B MTPLX-Optimized-Balance, profile turbo, fan mode default,
+  production server flags (scoped reasoning history, hybrid tool mode),
+  2026-09-26, this change on main 1de2b1c0, a fresh server per run, three
+  runs per variant: a neutral tool-call agent transcript over
+  `/v1/chat/completions` growing from 10K to 82K tokens, alternating long
+  (~8K-token) and short tool results. Server-side `_encode_messages` per
+  request went from 67 to 53 ms at 27K tokens, 83 to 62 ms at 42K, 90 to 56
+  ms at 58K and 107 to 57 ms at 82K (medians); TTFT minus
+  `prompt_eval_time_s` dropped by 19 to 56 ms (median 42) from 42K tokens up,
+  and TTFT of the short turns went from 288 to 237 ms at 58K and 414 to 367
+  ms at 74K. Generated text, `completion_tokens`, `prompt_tokens` and
+  `cached_tokens` were identical to main on every request of every run
+  (greedy, 48 tokens; 20 chat and 10 `/v1/messages` tool-call requests, plus
+  30 plain-chat requests). `template_observability.chat_segment_memo`
+  reports hits, misses and reused tokens per request;
+  `MTPLX_CHAT_SEGMENT_MEMO=off` turns the memo off and
+  `MTPLX_CHAT_SEGMENT_MEMO_TOKENS` sets the token budget.
+
 ## [2.12.0] - 2026-09-23
 
 ### Added

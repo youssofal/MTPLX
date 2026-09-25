@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import threading
+from array import array
 from collections import OrderedDict
 from typing import Any
 
@@ -94,3 +95,102 @@ class ChatEncodeCache:
 
 
 GLOBAL_CHAT_ENCODE_CACHE = ChatEncodeCache()
+
+
+class ChatSegmentEncodeMemo:
+    """Token ids per segment of a segmented chat encode.
+
+    The whole-payload cache above misses on every new agent turn, because
+    the transcript grew. The segmented encoder
+    (``_encode_rendered_chat_text_segmented``) already tokenizes each
+    segment on its own and concatenates the results, so a segment's ids
+    depend only on the tokenizer and the segment's exact text. Memoizing
+    them lets a new turn tokenize only the segments it has not seen yet.
+
+    Keys are the tokenizer identity plus a SHA-256 of the segment text, so
+    the text itself is not retained. Ids are stored as int32 arrays (4 bytes
+    per token). The memo is bounded by total stored tokens and by entry
+    count; least recently used entries go first.
+
+    Env: MTPLX_CHAT_SEGMENT_MEMO=off disables; MTPLX_CHAT_SEGMENT_MEMO_TOKENS
+    overrides the token budget (default 1,048,576, about 4 MB of ids).
+    """
+
+    DEFAULT_MAX_TOKENS = 1 << 20
+    MAX_ENTRIES = 4096
+
+    def __init__(self, max_tokens: int | None = None) -> None:
+        if max_tokens is None:
+            max_tokens = _env_int(
+                "MTPLX_CHAT_SEGMENT_MEMO_TOKENS", self.DEFAULT_MAX_TOKENS
+            )
+        self.max_tokens = max(1, max_tokens)
+        self._lock = threading.Lock()
+        self._entries: OrderedDict[str, array] = OrderedDict()
+        self._stored_tokens = 0
+        self.hits = 0
+        self.misses = 0
+
+    @staticmethod
+    def enabled() -> bool:
+        return _env_flag_on("MTPLX_CHAT_SEGMENT_MEMO")
+
+    @staticmethod
+    def make_key(*, tokenizer_key: str, text: str) -> str:
+        digest = hashlib.sha256(text.encode("utf-8", errors="surrogatepass"))
+        return tokenizer_key + ":" + digest.hexdigest()
+
+    def get(self, key: str) -> list[int] | None:
+        with self._lock:
+            ids = self._entries.get(key)
+            if ids is None:
+                self.misses += 1
+                return None
+            self._entries.move_to_end(key)
+            self.hits += 1
+        return ids.tolist()
+
+    def put(self, key: str, ids: list[int]) -> None:
+        if len(ids) > self.max_tokens:
+            return
+        try:
+            stored = array("i", ids)
+        except OverflowError:
+            return
+        with self._lock:
+            self._forget(key)
+            self._entries[key] = stored
+            self._stored_tokens += len(stored)
+            self._evict_to_bounds()
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "entries": len(self._entries),
+                "tokens": self._stored_tokens,
+                "hits": self.hits,
+                "misses": self.misses,
+            }
+
+    def _forget(self, key: str) -> None:
+        previous = self._entries.pop(key, None)
+        if previous is not None:
+            self._stored_tokens -= len(previous)
+
+    def _evict_to_bounds(self) -> None:
+        while (
+            self._stored_tokens > self.max_tokens
+            or len(self._entries) > self.MAX_ENTRIES
+        ):
+            _, evicted = self._entries.popitem(last=False)
+            self._stored_tokens -= len(evicted)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+GLOBAL_CHAT_SEGMENT_MEMO = ChatSegmentEncodeMemo()
