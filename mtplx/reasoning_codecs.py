@@ -337,6 +337,10 @@ class ReasoningContentStreamSplitter:
       no tools. A codec that never withholds markup reports 0.
     * ``tool_preamble_recovered_content``: pre-tool-call text ``finish`` hands
       back for the content channel, or ``None``.
+    * Streamed content concatenates to the same leading edge as the
+      non-stream split, which strips it: whitespace before the first visible
+      character (the model's "\n\n" after the close tag) is dropped, even
+      when it arrives in a later chunk than the tag.
 
     A codec implements ``_feed`` and ``_finish``; the public methods own the
     bookkeeping, so a new codec cannot satisfy half of the contract.
@@ -384,12 +388,18 @@ class ReasoningContentStreamSplitter:
         raise NotImplementedError
 
     def _observe(self, chunks: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        observed: list[tuple[str, str]] = []
         for field, text in chunks:
             if field == "reasoning_content":
                 self._streamed_reasoning.append(text)
-            elif field == "content" and text:
+            elif field == "content":
+                if not self._streamed_content:
+                    text = text.lstrip()
+                if not text:
+                    continue
                 self._streamed_content = True
-        return chunks
+            observed.append((field, text))
+        return observed
 
 
 class QwenThinkingContentStreamSplitter(ReasoningContentStreamSplitter):
