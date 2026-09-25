@@ -573,6 +573,139 @@ def test_score_prompt_logprobs_alignment_and_normalization():
         )
 
 
+def _tiny_raw_logprobs():
+    """Log-softmax of TinyModel's fixed row [0, 1, 0, 0]."""
+    import math
+
+    log_total = math.log(math.e + 3.0)
+    return {0: -log_total, 1: 1.0 - log_total, 2: -log_total, 3: -log_total}
+
+
+def test_first_token_logprobs_matches_reference_log_softmax():
+    from mtplx.generation import first_token_logprobs
+
+    row = mx.array([[2.0, -1.0, 0.5, 3.0]], dtype=mx.bfloat16)
+    reference = row.astype(mx.float32)[0]
+    reference = reference - mx.logsumexp(reference)
+
+    result = first_token_logprobs(row, token_id=2, top_k=3)
+
+    assert result.token_id == 2
+    assert result.logprob == pytest.approx(reference[2].item(), abs=1e-5)
+    assert [token for token, _value in result.top] == [3, 0, 2]
+    for token, value in result.top:
+        assert value == pytest.approx(reference[token].item(), abs=1e-5)
+
+
+def test_first_token_logprobs_top_k_zero_reports_sampled_token_only():
+    from mtplx.generation import first_token_logprobs
+
+    result = first_token_logprobs(
+        mx.array([0.0, 1.0, 0.0, 0.0]), token_id=1, top_k=0
+    )
+
+    assert result.top == ()
+    assert result.logprob == pytest.approx(_tiny_raw_logprobs()[1], abs=1e-6)
+
+
+@pytest.mark.parametrize("lane", ["ar", "mtpk"])
+@pytest.mark.parametrize("temperature", [0.0, 0.6])
+def test_generation_reports_raw_first_token_logprobs(lane, temperature):
+    """The reported distribution is the raw target log-softmax of the row
+    that produced token 0: sampler temperature must not reshape it."""
+
+    rt = _runtime(TinyModel(), mtp_enabled=True)
+    generate = generate_ar if lane == "ar" else generate_mtpk
+    extra = {} if lane == "ar" else {"speculative_depth": 1}
+
+    out = generate(
+        rt,
+        [0],
+        max_tokens=1,
+        sampler=SamplerConfig(temperature=temperature, top_p=1.0, top_k=1),
+        stop_token_ids=set(),
+        first_token_logprobs_top_k=2,
+        **extra,
+    )
+
+    expected = _tiny_raw_logprobs()
+    first = out.first_token_logprobs
+    assert out.tokens == [1]
+    assert first is not None
+    assert first.token_id == 1
+    assert first.logprob == pytest.approx(expected[1], abs=1e-5)
+    assert len(first.top) == 2
+    assert first.top[0] == (1, pytest.approx(expected[1], abs=1e-5))
+    assert first.top[1][1] == pytest.approx(expected[0], abs=1e-5)
+
+
+class _MaskTokenOneConstraint:
+    """Grammar stand-in that forbids token 1 (TinyModel's argmax)."""
+
+    stopped = False
+    completed = False
+    mask_time_s = 0.0
+    masked_steps = 0
+
+    def validate_prefix(self, tokens):
+        return len(tokens)
+
+    def mask_logits_row(self, row):
+        return row + mx.array([0.0, float("-inf"), 0.0, 0.0], dtype=row.dtype)
+
+    def advance(self, _token):
+        return None
+
+    def advance_many(self, _tokens):
+        return None
+
+
+@pytest.mark.parametrize("lane", ["ar", "mtpk"])
+def test_first_token_logprobs_ignore_grammar_mask(lane):
+    """The sampled token obeys the mask; the reported distribution does not:
+    it is the model's, so the masked-out argmax still leads top_logprobs."""
+
+    rt = _runtime(TinyModel(), mtp_enabled=True)
+    generate = generate_ar if lane == "ar" else generate_mtpk
+    extra = {} if lane == "ar" else {"speculative_depth": 1}
+
+    out = generate(
+        rt,
+        [0],
+        max_tokens=1,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        stop_token_ids=set(),
+        constraint=_MaskTokenOneConstraint(),
+        first_token_logprobs_top_k=1,
+        **extra,
+    )
+
+    expected = _tiny_raw_logprobs()
+    first = out.first_token_logprobs
+    assert out.tokens == [0]
+    assert first.token_id == 0
+    assert first.logprob == pytest.approx(expected[0], abs=1e-5)
+    assert first.top == ((1, pytest.approx(expected[1], abs=1e-5)),)
+
+
+@pytest.mark.parametrize("lane", ["ar", "mtpk"])
+def test_generation_without_logprobs_request_reports_none(lane):
+    rt = _runtime(AcceptingTinyMTPModel(), mtp_enabled=True)
+    generate = generate_ar if lane == "ar" else generate_mtpk
+    extra = {} if lane == "ar" else {"speculative_depth": 1}
+
+    out = generate(
+        rt,
+        [0],
+        max_tokens=2,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        stop_token_ids=set(),
+        **extra,
+    )
+
+    assert out.first_token_logprobs is None
+
+
 def test_generate_ar_restores_warm_prefix_from_session_bank():
     """#246: the AR lane used to full-prefill unconditionally and hardcode
     cached_tokens 0 / cache_hit false. With a bank hit it must restore the
@@ -613,6 +746,56 @@ def test_generate_ar_restores_warm_prefix_from_session_bank():
     assert out.stats.cached_tokens > 0
     assert out.stats.new_prefill_tokens < 5
     assert len(out.tokens) == 2
+
+
+@pytest.mark.parametrize("lane", ["ar", "mtpk"])
+def test_first_token_logprobs_on_full_prompt_bank_hit_use_restored_logits(lane):
+    """A full-prompt hit prefills nothing: token 0 comes from the bank's
+    stored logits row, and the logprobs must describe that same row."""
+
+    rt = _runtime(TinyModel(), mtp_enabled=True)
+    prompt = [0, 1, 2]
+    restored_row = mx.array([[3.0, 0.0, 0.0, 1.0]], dtype=mx.float32)
+
+    class FullHitBank:
+        last_miss_reason = None
+
+        def longest_prefix(self, _prompt_ids):
+            return SimpleNamespace(prefix_len=len(prompt))
+
+        def restore(self, _rt, _prompt_ids, **kwargs):
+            cache_factory = kwargs.get("cache_factory")
+            cache = cache_factory() if callable(cache_factory) else _rt.make_cache()
+            return SimpleNamespace(
+                entry=SimpleNamespace(prefix_len=len(prompt)),
+                cache=cache,
+                logits=restored_row,
+                hidden=mx.zeros((1, 1, 2), dtype=mx.float32),
+                mtp_history_cache=None,
+                restore_mode="clone",
+            )
+
+    generate = generate_ar if lane == "ar" else generate_mtpk
+    extra = {} if lane == "ar" else {"speculative_depth": 1}
+    out = generate(
+        rt,
+        prompt,
+        max_tokens=1,
+        sampler=SamplerConfig(temperature=0.0, top_p=1.0, top_k=4),
+        stop_token_ids=set(),
+        session_bank=FullHitBank(),
+        session_id="full-hit",
+        first_token_logprobs_top_k=2,
+        **extra,
+    )
+
+    reference = restored_row[0] - mx.logsumexp(restored_row[0])
+    first = out.first_token_logprobs
+    assert out.stats.session_cache_hit is True
+    assert out.tokens == [0]
+    assert first.logprob == pytest.approx(reference[0].item(), abs=1e-5)
+    assert [token for token, _value in first.top] == [0, 3]
+    assert first.top[1][1] == pytest.approx(reference[3].item(), abs=1e-5)
 
 
 def test_generate_ar_cold_output_identical_with_and_without_bank():

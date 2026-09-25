@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Logprobs for the first generated token.** `/v1/completions` accepts `logprobs: K` with `max_tokens: 1` (and `echo` off) and returns OpenAI-shaped `choices[0].logprobs` (`tokens`, `token_logprobs`, `top_logprobs`, `text_offset`, plus `token_ids`); `/v1/chat/completions` accepts `logprobs: true` with `top_logprobs: K` and returns `choices[0].logprobs.content`. Values are the raw model distribution of the row that produced the token, before temperature, penalties, grammar masks and steering, and a full-prompt SessionBank hit uses the restored logits. Scope is deliberately the first token only: `max_tokens` other than 1, `stream`, a non-empty `stop`, `K` above `MTPLX_PROMPT_LOGPROBS_MAX` (default 128) and backends that cannot serve it return 400, and the MTP batch lane refuses these requests while the live AR batch lane routes them solo. Blank retries are skipped for logprobs requests, since the distribution is the answer. This lets a classifier read the next-token distribution through the normal generation path instead of cold prompt scoring. Measured on an M5 Pro (64 GB), Qwen3.6-35B-A3B MTPLX Optimized-Balance, profile turbo, depth 2, fan mode default, temperature 0, 240 prompts of 250-840 tokens (median 475), 2026-09-26: same top label as echo prompt scoring on 228/240 prompts, p50 486 ms against 562 ms, p90 590 ms against 667 ms. The Anthropic `/v1/messages` route does not expose logprobs.
+
 ## [2.12.0] - 2026-09-23
 
 ### Added

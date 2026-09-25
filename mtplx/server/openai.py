@@ -1631,9 +1631,9 @@ class ChatCompletionRequest(BaseModel):
     response_format: Any = None
     metadata: dict[str, Any] | None = None
     user: str | None = None
-    # Declared so a logprobs request fails loudly (400) instead of being
-    # silently swallowed by extra="allow" — clients were reading absent
-    # logprobs as "model returned none" rather than "server ignored me".
+    # Declared so logprobs are never silently swallowed by extra="allow".
+    # Served for the first generated token only (max_tokens 1, non-stream);
+    # every other shape is a loud 400.
     logprobs: Any = None
     top_logprobs: int | None = None
     # Internal adapter control: Responses clients must never receive the
@@ -1902,7 +1902,8 @@ class CompletionRequest(BaseModel):
     stream: bool = False
     # Prompt scoring (echo + logprobs + max_tokens 0): one teacher-forced
     # pass returning per-position top-K logprobs — the lane KL-divergence
-    # harnesses consume. Decode-time logprobs remain unsupported.
+    # harnesses consume. Without echo, logprobs covers the first generated
+    # token only and requires max_tokens 1.
     echo: bool = False
     logprobs: int | None = None
 
@@ -24539,9 +24540,12 @@ def _validate_mtp_batch_request_contract(
     background_request: bool,
     depth: int | None,
     resolved_mtp_depth: int | None,
+    first_token_logprobs_top_k: int | None = None,
 ) -> None:
     if constraint_spec is not None:
         raise MTPBatchRequestError("mtp_batch does not support response_format")
+    if first_token_logprobs_top_k is not None:
+        raise MTPBatchRequestError("mtp_batch does not support logprobs")
     if vision_splice is not None:
         raise MTPBatchRequestError("mtp_batch does not support vision_splice")
     if background_request:
@@ -24812,6 +24816,7 @@ def _run_mtp_batch_generation_dispatched(
         prompt_ids,
         response_max=response_max,
         constraint_spec=kwargs.get("constraint_spec"),
+        first_token_logprobs_top_k=kwargs.get("first_token_logprobs_top_k"),
         vision_splice=kwargs.get("vision_splice"),
         background_request=bool(kwargs.get("background_request")),
         depth=kwargs.get("depth"),
@@ -25190,6 +25195,136 @@ class _OriginPolicyMiddleware:
         await self.app(scope, receive, send_with_cors_headers)
 
 
+def _logprobs_top_k_limit() -> int:
+    """Shared top-K cap for prompt scoring and first-token logprobs."""
+    return _env_int("MTPLX_PROMPT_LOGPROBS_MAX", 128) or 128
+
+
+def _reject_unservable_first_token_logprobs(
+    state: ServerState,
+    *,
+    top_k: int,
+    max_tokens: int | None,
+    stream: bool,
+    stop_sequences: Sequence[str],
+    top_k_field: str,
+) -> None:
+    """400 for every first-token logprobs request the engine cannot answer.
+
+    Decode-time logprobs cover the FIRST generated token only. Requiring
+    max_tokens=1 keeps the response honest: every returned token carries
+    its logprob, so no client mistakes a partial array for a full one.
+    """
+
+    if top_k < 0:
+        raise HTTPException(
+            status_code=400, detail=f"{top_k_field} must be >= 0, got {top_k}"
+        )
+    limit = _logprobs_top_k_limit()
+    if top_k > limit:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{top_k_field}={top_k} exceeds the logprobs limit of {limit} "
+                "(MTPLX_PROMPT_LOGPROBS_MAX)"
+            ),
+        )
+    if max_tokens is None or int(max_tokens) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "logprobs for generated tokens cover the first token only: "
+                "set max_tokens to 1 (on /v1/completions, echo=true with "
+                "max_tokens=0 scores the prompt instead)"
+            ),
+        )
+    if stream:
+        raise HTTPException(
+            status_code=400,
+            detail="logprobs are not supported with stream=true; omit stream",
+        )
+    if stop_sequences:
+        raise HTTPException(
+            status_code=400,
+            detail="logprobs cannot be combined with stop sequences; omit stop",
+        )
+    if _bank_backend_id(state) == GEMMA4_BACKEND:
+        raise HTTPException(
+            status_code=400,
+            detail="logprobs are not supported on the gemma4_assistant backend",
+        )
+
+
+def _require_first_token_logprobs(generated: Mapping[str, Any]) -> Any:
+    first = generated.get("first_token_logprobs")
+    if first is None:
+        raise HTTPException(
+            status_code=500,
+            detail="generation produced no first-token logprobs for this request",
+        )
+    return first
+
+
+def _chat_first_token_logprobs_top_k(request: Any) -> int | None:
+    """``top_logprobs`` K for a chat request that asked for logprobs, else None.
+
+    OpenAI chat semantics: ``logprobs=true`` turns logprobs on and
+    ``top_logprobs`` (default 0) sizes the alternatives list; ``top_logprobs``
+    without ``logprobs=true`` is a client error, not a silent no-op.
+    """
+
+    top_logprobs = request.top_logprobs
+    if not bool(request.logprobs):
+        if top_logprobs is not None and int(top_logprobs) > 0:
+            raise HTTPException(
+                status_code=400,
+                detail="top_logprobs requires logprobs=true",
+            )
+        return None
+    return int(top_logprobs or 0)
+
+
+def _completion_first_token_logprobs(tokenizer: Any, first: Any) -> dict[str, Any]:
+    """OpenAI /v1/completions ``choices[0].logprobs`` for one generated token.
+
+    ``top_logprobs[0]`` is string-keyed and always contains the sampled
+    token with its true value (OpenAI: "up to logprobs+1 entries");
+    ``token_ids`` rides along like on the prompt-scoring lane.
+    """
+
+    token_text = tokenizer.decode([int(first.token_id)])
+    top: dict[str, float] = {}
+    for token_id, logprob in first.top:
+        # Entries arrive sorted descending; keep the best of colliding keys.
+        top.setdefault(tokenizer.decode([int(token_id)]), float(logprob))
+    top[token_text] = float(first.logprob)
+    return {
+        "tokens": [token_text],
+        "token_logprobs": [float(first.logprob)],
+        "top_logprobs": [top],
+        "text_offset": [0],
+        "token_ids": [int(first.token_id)],
+    }
+
+
+def _chat_first_token_logprobs(tokenizer: Any, first: Any) -> dict[str, Any]:
+    """OpenAI /v1/chat/completions ``choices[0].logprobs`` for one token."""
+
+    def entry(token_id: int, logprob: float) -> dict[str, Any]:
+        text = tokenizer.decode([int(token_id)])
+        return {
+            "token": text,
+            "logprob": float(logprob),
+            "bytes": list(text.encode("utf-8")),
+        }
+
+    sampled = entry(first.token_id, first.logprob)
+    sampled["top_logprobs"] = [
+        entry(token_id, logprob) for token_id, logprob in first.top
+    ]
+    return {"content": [sampled], "refusal": None}
+
+
 async def _prompt_scoring_response(
     state: "ServerState",
     *,
@@ -25215,7 +25350,7 @@ async def _prompt_scoring_response(
     zero decode-hot-path involvement.
     """
 
-    max_top_k = _env_int("MTPLX_PROMPT_LOGPROBS_MAX", 128) or 128
+    max_top_k = _logprobs_top_k_limit()
     if top_k > max_top_k:
         raise HTTPException(
             status_code=400,
@@ -25423,6 +25558,15 @@ def _run_generation_dispatched(
         request_observability_for_lane["scheduler_lane"] = "solo_constrained"
         request_observability_for_lane["ar_batch_bypass_reason"] = (
             "constrained_decoding"
+        )
+    elif kwargs.get("first_token_logprobs_top_k") is not None:
+        # The batched AR pump's per-job samplers do not report the raw
+        # distribution; logprobs requests ride the serial lanes.
+        use_ar_batch = False
+        mtp_disabled_reason = None
+        request_observability_for_lane["scheduler_lane"] = "solo_logprobs"
+        request_observability_for_lane["ar_batch_bypass_reason"] = (
+            "first_token_logprobs"
         )
     elif history_bypass_reason is not None:
         use_ar_batch = False
@@ -25790,6 +25934,7 @@ def _run_generation(
     vision_splice: Any | None = None,
     constraint_spec: Any | None = None,
     prefill_chunk_tokens: int | None = None,
+    first_token_logprobs_top_k: int | None = None,
 ) -> dict[str, Any]:
     response_max, sampler, generation_limits = _generation_params(
         state,
@@ -25872,7 +26017,10 @@ def _run_generation(
         if streaming_response is None
         else bool(streaming_response)
     )
-    max_attempts = 1 if response_is_streaming else 1 + blank_retry_budget
+    # A logprobs request asks for the distribution, not for visible text: a
+    # whitespace or stop first token is a valid answer, never a blank to retry.
+    retries_allowed = not response_is_streaming and first_token_logprobs_top_k is None
+    max_attempts = 1 + blank_retry_budget if retries_allowed else 1
     last: dict[str, Any] | None = None
     trace_preview = (
         str((request_observability or {}).get("request_last_user_preview") or "")
@@ -26026,6 +26174,7 @@ def _run_generation(
                         max_tokens=response_max,
                         sampler=sampler,
                         seed=generation_seed,
+                        first_token_logprobs_top_k=first_token_logprobs_top_k,
                         token_callback=record_tokens,
                         trace_label=trace_label,
                         trace_metadata=trace_metadata,
@@ -26077,6 +26226,7 @@ def _run_generation(
                         prompt_ids,
                         constraint=constraint,
                         vision_splice=vision_splice,
+                        first_token_logprobs_top_k=first_token_logprobs_top_k,
                         abort_check=(
                             (
                                 lambda: bool(
@@ -26481,6 +26631,7 @@ def _run_generation(
             "end_to_end_tok_s": server_tok_s,
             "_final_state": final_state,
             "finish_reason": stats["finish_reason"],
+            "first_token_logprobs": getattr(out, "first_token_logprobs", None),
         }
         if seed_is_explicit or out.text.strip():
             break
@@ -32258,13 +32409,15 @@ def create_app(state: ServerState) -> FastAPI:
         request_received_monotonic_s = time.perf_counter()
         if not request.messages:
             raise HTTPException(status_code=400, detail="messages must not be empty")
-        if bool(request.logprobs) or int(request.top_logprobs or 0) > 0:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "logprobs/top_logprobs are not supported on "
-                    "/v1/chat/completions; omit them (support is planned)"
-                ),
+        first_token_logprobs_top_k = _chat_first_token_logprobs_top_k(request)
+        if first_token_logprobs_top_k is not None:
+            _reject_unservable_first_token_logprobs(
+                state,
+                top_k=first_token_logprobs_top_k,
+                max_tokens=_request_max_tokens(request),
+                stream=bool(request.stream),
+                stop_sequences=_normalize_stop_sequences(request.stop),
+                top_k_field="top_logprobs",
             )
         headers = dict(raw_request.headers)
         metadata = _request_metadata(request)
@@ -33140,6 +33293,7 @@ def create_app(state: ServerState) -> FastAPI:
                         cancel_event=nonstream_cancel_event,
                         mtp_batch_finalize_ownership=mtp_batch_finalize_ownership,
                         streaming_response=False,
+                        first_token_logprobs_top_k=first_token_logprobs_top_k,
                     )
                 )
             with state.sessions.generation_slot(
@@ -33182,6 +33336,7 @@ def create_app(state: ServerState) -> FastAPI:
                     cancel_event=nonstream_cancel_event,
                     mtp_batch_finalize_ownership=mtp_batch_finalize_ownership,
                     streaming_response=False,
+                    first_token_logprobs_top_k=first_token_logprobs_top_k,
                 )
                 generated_result = attach_response_observability(generated_result)
                 if vision_splice is None:
@@ -36953,19 +37108,23 @@ def create_app(state: ServerState) -> FastAPI:
             if reasoning_text:
                 message["reasoning_content"] = reasoning_text
             finish_reason = generated.get("finish_reason", "stop")
+        chat_choice: dict[str, Any] = {
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason,
+        }
+        if first_token_logprobs_top_k is not None:
+            chat_choice["logprobs"] = _chat_first_token_logprobs(
+                state.runtime.tokenizer,
+                _require_first_token_logprobs(generated),
+            )
         return JSONResponse(
             {
                 "id": response_id,
                 "object": "chat.completion",
                 "created": created,
                 "model": model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": message,
-                        "finish_reason": finish_reason,
-                    }
-                ],
+                "choices": [chat_choice],
                 "usage": _usage_payload(generated),
                 "mtplx_stats": _public_mtplx_stats(generated),
                 "timings": _build_timings(generated),
@@ -37196,14 +37355,13 @@ def create_app(state: ServerState) -> FastAPI:
                 request_observability=request_observability,
             )
         if requested_logprobs is not None:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "logprobs on /v1/completions (including logprobs=0) "
-                    "requires echo=true with max_tokens=0 (prompt scoring); "
-                    "decode-time logprobs for generated tokens are not "
-                    "supported yet — omit logprobs to generate"
-                ),
+            _reject_unservable_first_token_logprobs(
+                state,
+                top_k=requested_logprobs,
+                max_tokens=request.max_tokens,
+                stream=bool(request.stream),
+                stop_sequences=stop_sequences,
+                top_k_field="logprobs",
             )
 
         if request.stream:
@@ -37595,6 +37753,7 @@ def create_app(state: ServerState) -> FastAPI:
                         if nonstream_stop_monitor is not None
                         else None
                     ),
+                    first_token_logprobs_top_k=requested_logprobs,
                 )
             )
         except _StopSequenceHit:
@@ -37634,15 +37793,23 @@ def create_app(state: ServerState) -> FastAPI:
             generated,
             footer_allowed=_stats_footer_allowed(state, headers, metadata),
         )
+        choice: dict[str, Any] = {
+            "index": 0,
+            "text": display_text,
+            "finish_reason": finish_reason,
+        }
+        if requested_logprobs is not None:
+            choice["logprobs"] = _completion_first_token_logprobs(
+                state.runtime.tokenizer,
+                _require_first_token_logprobs(generated),
+            )
         return JSONResponse(
             {
                 "id": response_id,
                 "object": "text_completion",
                 "created": created,
                 "model": model,
-                "choices": [
-                    {"index": 0, "text": display_text, "finish_reason": finish_reason}
-                ],
+                "choices": [choice],
                 "usage": _usage_payload(generated),
                 "mtplx_stats": _public_mtplx_stats(generated),
                 "timings": _build_timings(generated),

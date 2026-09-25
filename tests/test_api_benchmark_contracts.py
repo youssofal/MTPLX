@@ -649,9 +649,9 @@ def test_stream_partial_stop_prefix_tail_is_still_released(monkeypatch):
 
 def test_logprobs_zero_is_a_real_request_not_absent(monkeypatch):
     """OpenAI semantics: logprobs=0 means 'sampled token logprob only'.
-    Without echo we cannot serve it (decode-time logprobs are not wired), so
-    it must be the loud 400 — never a silent fall-through into generation
-    that returns no logprobs at all."""
+    Without echo it is served for max_tokens=1 only, so max_tokens=8 must be
+    the loud 400 — never a silent fall-through into generation that returns
+    no logprobs at all."""
 
     def _explode(*_args, **_kwargs):
         raise AssertionError("logprobs=0 must never reach generation silently")

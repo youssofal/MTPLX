@@ -3117,8 +3117,8 @@ def test_completions_prompt_scoring_top_k_capped(monkeypatch):
 )
 def test_chat_completions_rejects_logprobs_with_clear_400(body_extra):
     """logprobs used to be swallowed by extra="allow" and silently ignored;
-    clients read the missing data as model behavior. Interim contract: a
-    clean 400 until logprob support ships."""
+    clients read the missing data as model behavior. Logprobs are served for
+    max_tokens=1 only, so these shapes stay a clean 400."""
 
     client = TestClient(create_app(_fake_state()))
 

@@ -24,10 +24,30 @@ When tools are active, Qwen XML tool calls are translated into OpenAI
 `delta.tool_calls` chunks as the function name and arguments stream. Unknown or
 malformed tool-shaped output falls back to assistant content rather than hanging
 or returning a server 500.
+`logprobs: true` with `top_logprobs: K` returns `choices[0].logprobs.content` for
+the first generated token only; it requires `max_tokens: 1` and no streaming
+(see First-token logprobs below).
 
 ## `POST /v1/completions`
 
 Legacy OpenAI completions.
+Two logprobs modes:
+
+- Prompt scoring: `echo: true`, `max_tokens: 0`, `logprobs: K` returns the top-K
+  distribution for every prompt position.
+- First-token logprobs: `max_tokens: 1`, `logprobs: K` (echo off) returns the
+  top-K distribution of the first generated token.
+
+### First-token logprobs
+
+Both completion routes can return the next-token distribution after the prompt
+through the normal generation path. The values are the raw model
+log-probabilities of the row that produced the token, before temperature,
+penalties, grammar masks and steering. The top-K list always contains the sampled
+token with its true value. Limits: `max_tokens` must be 1, `stream` and a
+non-empty `stop` are refused, and `K` is capped by `MTPLX_PROMPT_LOGPROBS_MAX`
+(default 128). Requests the MTP batch lane cannot serve are refused with 400
+rather than answered without logprobs.
 
 ## `POST /v1/responses`
 

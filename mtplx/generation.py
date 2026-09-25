@@ -3414,6 +3414,22 @@ class GenerationStats:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class FirstTokenLogprobs:
+    """Raw next-token distribution behind the first generated token.
+
+    ``logprob`` is the sampled token's log-probability and ``top`` the K most
+    likely ``(token_id, logprob)`` pairs, sorted descending. Both come from a
+    plain log-softmax of the target logits row that produced the token:
+    before temperature, top-k/top-p, penalties, steering overlays or grammar
+    masks, so they describe the model, not the sampler.
+    """
+
+    token_id: int
+    logprob: float
+    top: tuple[tuple[int, float], ...]
+
+
 @dataclass
 class GenerationOutput:
     tokens: list[int]
@@ -3421,6 +3437,7 @@ class GenerationOutput:
     stats: GenerationStats
     final_state: GenerationFinalState | None = None
     finish_reason: str | None = None
+    first_token_logprobs: FirstTokenLogprobs | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -8112,6 +8129,54 @@ def _append_mtp_history(
     return time.perf_counter() - started
 
 
+def _log_softmax_f32(logits: mx.array) -> mx.array:
+    """Lazy float32 log-softmax over the last (vocabulary) axis."""
+    logits = logits.astype(mx.float32)
+    return logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+
+
+def _top_k_logprobs(logprobs: mx.array, top_k: int) -> tuple[mx.array, mx.array]:
+    """Lazy ``(ids, values)`` of the ``top_k`` largest entries per row.
+
+    Unordered (argpartition); callers sort the k survivors on the host.
+    """
+    k = min(int(top_k), int(logprobs.shape[-1]))
+    top_idx = mx.argpartition(-logprobs, kth=k - 1, axis=-1)[..., :k]
+    return top_idx, mx.take_along_axis(logprobs, top_idx, axis=-1)
+
+
+def first_token_logprobs(
+    logits_row: mx.array,
+    *,
+    token_id: int,
+    top_k: int,
+) -> FirstTokenLogprobs:
+    """Evaluate the raw distribution of one logits row for ``token_id``.
+
+    ``logits_row`` must be the UNMASKED target row the token was sampled
+    from. Everything is evaluated and copied to the host here, so later cache
+    updates cannot alter the result. ``top_k`` 0 returns the sampled token's
+    logprob with an empty ``top``.
+    """
+    logprobs = _log_softmax_f32(logits_row.reshape(-1))
+    chosen = logprobs[int(token_id)]
+    if int(top_k) <= 0:
+        mx.eval(chosen)
+        return FirstTokenLogprobs(int(token_id), float(chosen.item()), ())
+    top_idx, top_vals = _top_k_logprobs(logprobs, top_k)
+    mx.eval(chosen, top_idx, top_vals)
+    pairs = sorted(
+        zip(np.array(top_idx).tolist(), np.array(top_vals).tolist()),
+        key=lambda pair: pair[1],
+        reverse=True,
+    )
+    return FirstTokenLogprobs(
+        token_id=int(token_id),
+        logprob=float(chosen.item()),
+        top=tuple((int(token), float(value)) for token, value in pairs),
+    )
+
+
 def score_prompt_logprobs(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
@@ -8153,11 +8218,8 @@ def score_prompt_logprobs(
                 hidden_variant=None,
                 emit_logits=True,
             )
-        logprobs = logits[0].astype(mx.float32)
-        logprobs = logprobs - mx.logsumexp(logprobs, axis=-1, keepdims=True)
-        k = min(top_k, int(logprobs.shape[-1]))
-        top_idx = mx.argpartition(-logprobs, kth=k - 1, axis=-1)[..., :k]
-        top_vals = mx.take_along_axis(logprobs, top_idx, axis=-1)
+        logprobs = _log_softmax_f32(logits[0])
+        top_idx, top_vals = _top_k_logprobs(logprobs, top_k)
         # Positions start..end-1 predict prompt tokens start+1..end; the
         # final prompt position has no target inside the prompt.
         target_rows = min(end, n - 1) - start
@@ -8227,6 +8289,7 @@ def generate_ar(
     session_policy_fingerprint: str | None = None,
     capture_final_state: bool = False,
     abort_check: Callable[[], bool] | None = None,
+    first_token_logprobs_top_k: int | None = None,
 ) -> GenerationOutput:
     reject_non_k1_a3b_whole_moe_request(rt, entrypoint="generate_ar")
     if getattr(rt, "backend_id", None) == "gemma4_assistant":
@@ -8250,6 +8313,7 @@ def generate_ar(
             repetition_stop=repetition_stop,
         )
     counter_start = _runtime_counter_snapshot(rt)
+    first_logprobs: FirstTokenLogprobs | None = None
     rng = np.random.default_rng(seed)
     stop_token_ids = (
         _default_stop_tokens(rt.tokenizer) if stop_token_ids is None else stop_token_ids
@@ -8509,6 +8573,10 @@ def generate_ar(
             else None,
             penalty_overlay=(_ar_steer_overlay(tokens) if _steer_active else None),
         )
+        if first_token_logprobs_top_k is not None and not tokens:
+            first_logprobs = first_token_logprobs(
+                logits[0], token_id=token, top_k=first_token_logprobs_top_k
+            )
         tokens.append(token)
         emit_token(token)
         events.append({"step": step, "token": token})
@@ -8741,6 +8809,7 @@ def generate_ar(
         stats=stats,
         final_state=final_state,
         finish_reason=finish_reason,
+        first_token_logprobs=first_logprobs,
     )
 
 
@@ -9481,6 +9550,7 @@ def generate_mtpk(
     vision_splice: Any | None = None,
     constraint: Any | None = None,
     adaptive_width_policy: Any | None = None,
+    first_token_logprobs_top_k: int | None = None,
 ) -> GenerationOutput:
     """Generate with a fixed native-MTP depth.
 
@@ -9762,6 +9832,7 @@ def generate_mtpk(
         else:
             _validate_target_prefix_sampler_request(sampler)
     counter_start = _runtime_counter_snapshot(rt)
+    first_logprobs: FirstTokenLogprobs | None = None
     verify_core_backend = resolve_gdn_capture_backend(verify_core)
     online_hidden_enabled = online_hidden_corrector_alpha > 0.0
     online_hidden_max_feed_depth = (
@@ -11736,6 +11807,12 @@ def generate_mtpk(
                 # touching the seed logits has just been paid. Passive read.
                 first_primary_sample_time_s = (
                     time.perf_counter() - decode_loop_entered_s
+                )
+            if first_token_logprobs_top_k is not None and not tokens:
+                # logits[0], not primary_row: the raw target distribution,
+                # before the grammar mask and sampler shaping.
+                first_logprobs = first_token_logprobs(
+                    logits[0], token_id=primary, top_k=first_token_logprobs_top_k
                 )
             tokens.append(primary)
             emit_new_tokens()
@@ -15582,6 +15659,7 @@ def generate_mtpk(
         stats=stats,
         final_state=final_state,
         finish_reason=finish_reason,
+        first_token_logprobs=first_logprobs,
     )
 
 
