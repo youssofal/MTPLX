@@ -34,7 +34,7 @@ from mtplx.graphbank import (
     promote_kv_cache_offsets,
 )
 
-from test_graphbank_compiled_verify import ToyHybridRuntime, _prefill
+from test_graphbank_compiled_verify import PRE_M5_BIT_PARITY, ToyHybridRuntime, _prefill
 
 
 def _window(start: int, length: int) -> list[int]:
@@ -93,6 +93,7 @@ def test_extended_window_ceiling_env(monkeypatch):
     assert bank.stats["fallback_reasons"]["length_outside_bank"] == 2
 
 
+@PRE_M5_BIT_PARITY
 def test_extended_block_bit_equal_vs_eager_reference():
     """Interleaved MTP + block windows: compiled session == eager session.
 
