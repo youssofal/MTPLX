@@ -16413,3 +16413,265 @@ def cmd_debug_public(args: Any) -> int:
     }
     _print(payload)
     return 0
+
+
+# ---------------------------------------------------------------------------
+# `mtplx supervise`: multi-model JIT-loading front door.
+#
+# The supervisor package (`mtplx/supervisor/`) is written by a sibling task
+# and imported lazily below so this module keeps importing even before that
+# package exists. Model resolution mirrors `serve --model` (a local path, a
+# `~/.mtplx/models/<Org>--<Name>` dir, or an installed catalog id) via
+# `mtplx.model_catalog.scan_installed_models`; the resolved model id is the
+# pack directory name, which is what `--preload`/`--default` name and what
+# `engine_extra_args` never needs to know about.
+# ---------------------------------------------------------------------------
+
+
+class _SuperviseModelError(Exception):
+    """A `--models`/`--preload`/`--default` entry could not be resolved."""
+
+
+def _supervise_installed_models(args: Any) -> list[Any]:
+    from mtplx import model_catalog
+
+    return model_catalog.scan_installed_models(
+        getattr(args, "cache_dir", None),
+        search_dirs=getattr(args, "model_search_dirs", None),
+    )
+
+
+def _supervise_match_installed(ref: str, installed: list[Any]) -> Any | None:
+    lowered = ref.strip().lower()
+    for model in installed:
+        if model.name.lower() == lowered:
+            return model
+    for model in installed:
+        if model.catalog is not None and model.catalog.id.lower() == lowered:
+            return model
+    for model in installed:
+        if model.display_name.lower() == lowered:
+            return model
+    return None
+
+
+def _supervise_resolve_one(ref: str, installed: list[Any]) -> tuple[str, Path]:
+    stripped = ref.strip()
+    candidate = Path(stripped).expanduser()
+    if candidate.is_dir():
+        resolved = candidate.resolve()
+        return resolved.name, resolved
+    match = _supervise_match_installed(stripped, installed)
+    if match is not None:
+        return match.name, match.path
+    names = ", ".join(model.name for model in installed) or "(none installed)"
+    raise _SuperviseModelError(
+        f"model not found: {stripped!r}. installed models: {names}"
+    )
+
+
+def _supervise_resolve_models(
+    models_arg: str, args: Any
+) -> list[tuple[str, Path]]:
+    installed = _supervise_installed_models(args)
+    raw = str(models_arg).strip()
+    if raw.lower() == "all":
+        if not installed:
+            raise _SuperviseModelError("--models all: no installed models found")
+        return [(model.name, model.path) for model in installed]
+    resolved: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        model_id, path = _supervise_resolve_one(entry, installed)
+        if model_id in seen:
+            continue
+        seen.add(model_id)
+        resolved.append((model_id, path))
+    if not resolved:
+        raise _SuperviseModelError("--models must name at least one model")
+    return resolved
+
+
+# (attr, flag, kind): kind is "value" (append flag+str(value) when not
+# None/empty), "flag" (append flag alone when truthy), or "append" (append
+# flag+str(item) for every item in the list attribute). Every flag here is a
+# `mtplx serve` spelling, because engine children are launched with the
+# public `serve` argv (DESIGN.md key behavior 7), never the lower-level
+# `mtplx.server.openai` spellings `cmd_serve_public` builds for that child.
+_SUPERVISE_ENGINE_FLAG_TABLE: tuple[tuple[str, str, str], ...] = (
+    ("profile", "--profile", "value"),
+    ("generation_mode", "--generation-mode", "value"),
+    ("no_mtp", "--no-mtp", "flag"),
+    ("depth", "--depth", "value"),
+    ("context_window", "--context-window", "value"),
+    ("batching_preset", "--batching-preset", "value"),
+    ("max_active_requests", "--max-active-requests", "value"),
+    ("paged_kv_quantization", "--paged-kv-quantization", "value"),
+    ("ssd_session_cache", "--ssd-session-cache", "value"),
+    ("ssd_session_cache_dir", "--ssd-session-cache-dir", "value"),
+    ("prefill_chunk_tokens", "--prefill-chunk-tokens", "value"),
+    ("embedding_model", "--embedding-model", "append"),
+    ("reranker_model", "--reranker-model", "append"),
+    ("fan_mode", "--fan-mode", "value"),
+    ("enable_thermal_poll", "--enable-thermal-poll", "flag"),
+)
+# Flag values that equal the parser default carry no information for the
+# engine child (which has the identical default), so they are left out.
+_SUPERVISE_ENGINE_FLAG_DEFAULTS: dict[str, Any] = {
+    "batching_preset": "latency",
+    "ssd_session_cache": "on",
+    "fan_mode": "default",
+    "paged_kv_quantization": None,
+}
+
+
+def _engine_flag_pairs(args: Any) -> list[str]:
+    """Build `engine_extra_args` for `SupervisorConfig` from supervise args.
+
+    Standalone by design: this never touches `cmd_serve_public`'s own argv
+    tables (public.py:9856-9990), which build a different child's argv
+    (`mtplx.server.openai`, not `mtplx serve`).
+    """
+
+    extra: list[str] = []
+    for attr, flag, kind in _SUPERVISE_ENGINE_FLAG_TABLE:
+        if kind == "append":
+            for item in getattr(args, attr, None) or []:
+                if str(item).strip():
+                    extra.extend([flag, str(item)])
+            continue
+        if kind == "flag":
+            if bool(getattr(args, attr, False)):
+                extra.append(flag)
+            continue
+        value = getattr(args, attr, None)
+        default = _SUPERVISE_ENGINE_FLAG_DEFAULTS.get(attr, None)
+        if value is None or value == default:
+            continue
+        extra.extend([flag, str(value)])
+    return extra
+
+
+def _supervise_print_start_banner(
+    config: Any, model_ids: list[str], *, host: str, port: int
+) -> None:
+    _print_serve_start_line(f"Supervising models: {', '.join(model_ids)}")
+    _print_serve_start_line(f"Default model: {config.default_model_id}")
+    _print_serve_start_line(f"Preload: {', '.join(config.preload) or '(none)'}")
+    if config.budget_bytes is not None:
+        gib = config.budget_bytes / (1024**3)
+        _print_serve_start_line(f"Memory budget: {gib:.2f} GiB")
+    else:
+        _print_serve_start_line("Memory budget: unset (uses this machine's usable budget)")
+    _print_serve_start_line(f"Listening on {host}:{port}")
+    if config.insecure_lan:
+        _print_serve_start_line(
+            "warning: --insecure-lan is set; inference routes on this bind "
+            "require no API key"
+        )
+
+
+def cmd_supervise_public(args: Any) -> int:
+    models_arg = getattr(args, "models", None)
+    if not models_arg or not str(models_arg).strip():
+        raise SystemExit("error: --models is required")
+    try:
+        resolved = _supervise_resolve_models(str(models_arg), args)
+    except _SuperviseModelError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+
+    model_ids = [model_id for model_id, _ in resolved]
+    model_paths = [path for _, path in resolved]
+
+    preload_arg = getattr(args, "preload", None)
+    if preload_arg and str(preload_arg).strip():
+        preload_ids = [
+            entry.strip() for entry in str(preload_arg).split(",") if entry.strip()
+        ]
+        unknown = [entry for entry in preload_ids if entry not in model_ids]
+        if unknown:
+            raise SystemExit(
+                "error: --preload names model(s) not in --models: "
+                f"{', '.join(unknown)}. --models: {', '.join(model_ids)}"
+            )
+    else:
+        preload_ids = [model_ids[0]]
+
+    default_id = getattr(args, "default", None) or model_ids[0]
+    if default_id not in model_ids:
+        raise SystemExit(
+            f"error: --default {default_id!r} is not one of --models: "
+            f"{', '.join(model_ids)}"
+        )
+
+    host = str(getattr(args, "host", None) or "127.0.0.1")
+    port = int(getattr(args, "port", 8000) or 8000)
+
+    runtime_options_error = _resolve_runtime_options_on_args(
+        args, printer=_print_serve_start_line
+    )
+    if runtime_options_error is not None:
+        return runtime_options_error
+
+    api_key = getattr(args, "api_key", None)
+    if getattr(args, "api_key_source", None) == "flag":
+        _print_serve_start_line(
+            "warning: --api-key on the command line is visible to `ps`; "
+            "prefer --api-key-file"
+        )
+
+    insecure_lan = bool(getattr(args, "insecure_lan", False))
+    if insecure_lan and not bool(getattr(args, "yes", False)):
+        _print_serve_start_line(
+            "error: --insecure-lan requires --yes to confirm you accept "
+            "unauthenticated inference on this network"
+        )
+        return 2
+
+    if not _is_localhost_bind(host) and not api_key and not insecure_lan:
+        _print_serve_start_line(
+            "error: --api-key or --api-key-file is required when --host is "
+            "not localhost"
+        )
+        _print_serve_start_line(f"host: {host}")
+        _print_serve_start_line("try: mtplx supervise --host 127.0.0.1 --models ...")
+        _print_serve_start_line(
+            "try: mtplx supervise --host 0.0.0.0 --api-key-file "
+            "~/.mtplx/api-key --models ..."
+        )
+        return 2
+
+    memory_budget_gib = getattr(args, "memory_budget", None)
+    budget_bytes = (
+        int(float(memory_budget_gib) * (1024**3))
+        if memory_budget_gib is not None
+        else None
+    )
+
+    from mtplx.supervisor.service import SupervisorConfig, run_supervisor
+
+    config = SupervisorConfig(
+        host=host,
+        port=port,
+        model_paths=model_paths,
+        preload=preload_ids,
+        default_model_id=default_id,
+        api_key=api_key,
+        budget_bytes=budget_bytes,
+        idle_ttl_s=float(getattr(args, "idle_ttl_s", 1800.0)),
+        load_timeout_s=float(getattr(args, "load_timeout_s", 600.0)),
+        unresponsive_grace_s=float(getattr(args, "unresponsive_grace_s", 90.0)),
+        drain_s=float(getattr(args, "drain_s", 15.0)),
+        evict_to_fit=bool(getattr(args, "evict_to_fit", False)),
+        strict_model=bool(getattr(args, "strict_model", False)),
+        insecure_lan=insecure_lan,
+        unload_default=bool(getattr(args, "unload_default", False)),
+        engine_extra_args=_engine_flag_pairs(args),
+        launch_id=getattr(args, "app_launch_id", None),
+    )
+
+    _supervise_print_start_banner(config, model_ids, host=host, port=port)
+    return int(run_supervisor(config))

@@ -397,6 +397,13 @@ def test_laguna_s_2_1_ar_route_skips_qwen_performance_hooks(
 
     model = FakeModel()
     tokenizer = object()
+    # This test is about routing, not the memory floor: pin a Mac large
+    # enough for Laguna so the preflight passes on any host.
+    monkeypatch.setattr(
+        runtime,
+        "_detect_total_system_memory_bytes",
+        lambda: 128 * 1024**3,
+    )
     monkeypatch.setattr(
         runtime,
         "_load_base_model",

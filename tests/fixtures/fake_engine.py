@@ -1,0 +1,154 @@
+"""A tiny stdlib HTTP server standing in for a real `mtplx serve` engine.
+
+Used only by ``tests/test_supervisor_process.py`` to exercise
+``mtplx.supervisor.process.EngineProcess`` against a real subprocess without
+loading an actual model. Speaks just enough of the daemon's `/health`
+contract (``{"ok": true, ...}``) for the supervisor's liveness probe.
+
+Flags:
+  --port PORT            required, TCP port to bind
+  --ready-after-s FLOAT   /health answers 503 "not ready" until this many
+                          seconds after start (default 0: ready immediately)
+  --hang-health           /health never responds (simulates a wedged engine)
+  --exit-after-s FLOAT    process exits cleanly this many seconds after start
+  --oom                   print a Metal OOM line to stderr and exit(1)
+  --warmup-s FLOAT        /health answers 200 "ok" but with
+                          `"warmup": {"ready": false}` until this many
+                          seconds after start (default 0: ready immediately;
+                          see process.py R3 -- gates the supervisor's READY
+                          verdict on a warmup signal when one is present)
+  --alias-id ID           `/v1/models` reports this as its served id
+                          (default "fake"); used to exercise R1 alias
+                          registration
+
+Also answers ``POST /v1/chat/completions`` for supervisor proxy tests: with
+``"stream": true`` it emits a 3-frame SSE response (each frame echoes the
+request body's ``model`` field), otherwise it echoes the parsed request
+body back as JSON under ``{"echo": <body>, "model": "fake"}``.
+
+Also answers ``GET /v1/models`` with ``{"data": [{"id": <alias-id>}]}``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+START_TIME = time.monotonic()
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--ready-after-s", type=float, default=0.0)
+    parser.add_argument("--hang-health", action="store_true")
+    parser.add_argument("--exit-after-s", type=float, default=None)
+    parser.add_argument("--oom", action="store_true")
+    parser.add_argument("--warmup-s", type=float, default=0.0)
+    parser.add_argument("--alias-id", type=str, default="fake")
+    return parser.parse_args(argv)
+
+
+def _make_handler(args: argparse.Namespace) -> type[BaseHTTPRequestHandler]:
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_a: object) -> None:  # quiet
+            pass
+
+        def do_GET(self) -> None:  # noqa: N802 - stdlib method name
+            if self.path == "/v1/models":
+                payload = json.dumps({"data": [{"id": args.alias_id}]}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            if self.path != "/health":
+                self.send_response(404)
+                self.end_headers()
+                return
+            if args.hang_health:
+                # Never respond; the client's timeout is what ends this.
+                while True:
+                    time.sleep(1.0)
+            elapsed = time.monotonic() - START_TIME
+            if elapsed < args.ready_after_s:
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": False}).encode("utf-8"))
+                return
+            warmup_ready = elapsed >= args.warmup_s
+            payload = json.dumps(
+                {"ok": True, "model": "fake", "warmup": {"ready": warmup_ready}}
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_POST(self) -> None:  # noqa: N802 - stdlib method name
+            if self.path != "/v1/chat/completions":
+                self.send_response(404)
+                self.end_headers()
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            try:
+                body = json.loads(raw.decode("utf-8")) if raw else {}
+            except ValueError:
+                body = {}
+            if not isinstance(body, dict):
+                body = {}
+            if body.get("stream"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                for i in range(3):
+                    frame = json.dumps({"frame": i, "model": "fake"}).encode("utf-8")
+                    self.wfile.write(b"data: " + frame + b"\n\n")
+                    self.wfile.flush()
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                return
+            payload = json.dumps({"echo": body, "model": "fake"}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    return Handler
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(sys.argv[1:] if argv is None else argv)
+
+    if args.oom:
+        print(
+            "RuntimeError: cannot load inside the available Metal memory budget",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 1
+
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), _make_handler(args))
+
+    if args.exit_after_s is not None:
+        def _stop_after() -> None:
+            time.sleep(args.exit_after_s)
+            server.shutdown()
+
+        threading.Thread(target=_stop_after, daemon=True).start()
+
+    server.serve_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
