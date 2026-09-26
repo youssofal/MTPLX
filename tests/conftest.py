@@ -38,6 +38,11 @@ def _hermetic_mtplx_state(monkeypatch, tmp_path_factory):
         "MTPLX_APP_SETTINGS_PATH", str(isolated / "app-settings.json")
     )
     monkeypatch.setenv("MTPLX_MODEL_DIR", str(isolated / "models"))
+    # A real ~/.mtplx/config.toml outranks MTPLX_MODEL_DIR: its `model` changed
+    # the default-model and bench dry runs, and its `model_dir` sent forge
+    # builds into the user's real model cache. Tests that exercise the config
+    # set their own MTPLX_CONFIG.
+    monkeypatch.setenv("MTPLX_CONFIG", str(isolated / "config.toml"))
     # Synthetic server requests must not enter a live user's trace history.
     monkeypatch.setenv("MTPLX_REQUEST_LOG_JSONL", str(isolated / "requests.jsonl"))
     monkeypatch.setenv("MTPLX_FLIGHT_RECORDER", str(isolated / "flight.jsonl"))

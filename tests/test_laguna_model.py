@@ -397,6 +397,11 @@ def test_laguna_s_2_1_ar_route_skips_qwen_performance_hooks(
 
     model = FakeModel()
     tokenizer = object()
+    # The memory preflight has its own test above; without this stub the
+    # route test fails on any Mac with less memory than Laguna needs.
+    monkeypatch.setattr(
+        runtime, "_preflight_laguna_system_memory", lambda config: None
+    )
     monkeypatch.setattr(
         runtime,
         "_load_base_model",
