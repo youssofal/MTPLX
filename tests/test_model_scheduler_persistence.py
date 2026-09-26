@@ -478,6 +478,7 @@ def test_bank_cold_jobs_carry_session_coalesce_key():
     )
     assert len(dispatched) == 1
     assert getattr(dispatched[0], "coalesce_key", None) == "ssd_cold:session-42"
+    assert getattr(dispatched[0], "pinned_bytes", None) == 64
 
 
 def test_capability_marker_and_legacy_fallback_shape():
@@ -580,3 +581,110 @@ def test_cancelled_persistence_closure_released_while_worker_parks_idle():
     finally:
         release.set()
         scheduler.shutdown(wait=True, cancel_futures=True)
+
+
+def _hold_owner(scheduler: ModelWorkScheduler):
+    started = Event()
+    release = Event()
+
+    def blocker() -> None:
+        started.set()
+        assert release.wait(timeout=2)
+
+    future = scheduler.submit_foreground(blocker)
+    assert started.wait(timeout=2)
+    return future, release
+
+
+def test_persistence_budget_drops_oldest_pinned_and_keeps_newest():
+    scheduler = _scheduler(persistence_max_pending_bytes=100)
+    ran: list[str] = []
+    held, release = _hold_owner(scheduler)
+    try:
+        futures = [
+            scheduler.submit_idle_persistence(
+                lambda name=name: ran.append(name),
+                coalesce_key=f"ssd_cold:{name}",
+                pinned_bytes=40,
+            )
+            for name in ("a", "b", "c")
+        ]
+        stats = scheduler.stats()
+        assert futures[0].cancelled()
+        assert stats["persistence_pending"] == 2
+        assert stats["persistence_pending_bytes"] == 80
+        assert stats["persistence_budget_dropped"] == 1
+        release.set()
+        held.result(timeout=2)
+        futures[1].result(timeout=2)
+        futures[2].result(timeout=2)
+        assert ran == ["b", "c"]
+        assert scheduler.stats()["persistence_pending_bytes"] == 0
+    finally:
+        release.set()
+        scheduler.shutdown(wait=True, cancel_futures=True)
+
+
+def test_persistence_budget_never_drops_newest_or_unpinned_items():
+    scheduler = _scheduler(persistence_max_pending_bytes=10)
+    _held, release = _hold_owner(scheduler)
+    try:
+        unpinned = scheduler.submit_idle_persistence(lambda: None)
+        pinned = scheduler.submit_idle_persistence(lambda: None, pinned_bytes=50)
+        stats = scheduler.stats()
+        assert not unpinned.cancelled()
+        assert not pinned.cancelled()
+        assert stats["persistence_pending_bytes"] == 50
+        assert stats["persistence_budget_dropped"] == 0
+    finally:
+        release.set()
+        scheduler.shutdown(wait=True, cancel_futures=True)
+
+
+def test_zero_persistence_budget_disables_the_cap():
+    scheduler = _scheduler(persistence_max_pending_bytes=0)
+    _held, release = _hold_owner(scheduler)
+    try:
+        futures = [
+            scheduler.submit_idle_persistence(lambda: None, pinned_bytes=10**12)
+            for _ in range(3)
+        ]
+        assert not any(future.cancelled() for future in futures)
+        assert scheduler.stats()["persistence_budget_dropped"] == 0
+    finally:
+        release.set()
+        scheduler.shutdown(wait=True, cancel_futures=True)
+
+
+def test_coalescing_releases_pinned_bytes():
+    scheduler = _scheduler(persistence_max_pending_bytes=100)
+    _held, release = _hold_owner(scheduler)
+    try:
+        scheduler.submit_idle_persistence(
+            lambda: None, coalesce_key="ssd_cold:s", pinned_bytes=60
+        )
+        scheduler.submit_idle_persistence(
+            lambda: None, coalesce_key="ssd_cold:s", pinned_bytes=70
+        )
+        stats = scheduler.stats()
+        assert stats["persistence_pending_bytes"] == 70
+        assert stats["persistence_budget_dropped"] == 0
+    finally:
+        release.set()
+        scheduler.shutdown(wait=True, cancel_futures=True)
+
+
+def test_persistence_budget_reads_env(monkeypatch):
+    def budget() -> int:
+        scheduler = _scheduler()
+        try:
+            return scheduler.persistence_max_pending_bytes
+        finally:
+            scheduler.shutdown(wait=True)
+
+    monkeypatch.setenv("MTPLX_PERSISTENCE_MAX_PENDING_BYTES", "2G")
+    assert budget() == 2 * 1024**3
+    monkeypatch.setenv("MTPLX_PERSISTENCE_MAX_PENDING_BYTES", "off")
+    assert budget() == 0
+    monkeypatch.delenv("MTPLX_PERSISTENCE_MAX_PENDING_BYTES")
+    assert budget() == 4 * 1024**3
