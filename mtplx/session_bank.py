@@ -2295,6 +2295,7 @@ class SessionBank:
                 )
 
         job = _settle_job
+        job.pinned_bytes = int(entry.nbytes)
         # Newest-wins per session: settling a superseded entry's snapshot
         # is pure waste, and the key namespace is disjoint from the SSD
         # encode's so a settle never coalesces away a persist (or vice
@@ -2360,6 +2361,7 @@ class SessionBank:
             dispatch_started = time.perf_counter()
             try:
                 job = lambda: self._cold_enqueue_job(entry, put_entry)  # noqa: E731
+                job.pinned_bytes = int(entry.nbytes)
                 # Stable logical key for newest-wins coalescing of PENDING
                 # persistence work: each queued job pins its entry's
                 # GB-scale snapshot until it runs, and under continuous
@@ -2478,6 +2480,7 @@ class SessionBank:
             dispatch = self.cold_enqueue_dispatch
             if dispatch is not None:
                 job = lambda: self._cold_enqueue_job(entry, put_entry)  # noqa: E731
+                job.pinned_bytes = int(entry.nbytes)
                 # Same key expression as the original dispatch site so the
                 # retry coalesces with (and is superseded by) newer commits.
                 job.coalesce_key = (
