@@ -849,15 +849,18 @@ def inject_mtp_support(
                 if logits_keep is not None:
                     keep = max(1, int(logits_keep))
                     logits_source = logits_source[:, -keep:, :]
-                logits = (
-                    inner.embed_tokens.as_linear(logits_source)
-                    if self.args.tie_word_embeddings
-                    else self.lm_head(logits_source)
-                )
+                logits = self.logits_from_post_norm(logits_source)
             if not return_hidden:
                 return logits
             hidden = pre_norm if variant == "pre_norm" else post_norm
             return logits, hidden
+
+        def logits_from_post_norm(self, post_norm):
+            """The target lm_head, exactly as ``__call__`` applies it."""
+
+            if self.args.tie_word_embeddings:
+                return self.model.embed_tokens.as_linear(post_norm)
+            return self.lm_head(post_norm)
 
         def _mixed_hidden(self, variant: str, *, previous, fc_hidden, pre_norm, post_norm, input_embeds):
             aliases = {
