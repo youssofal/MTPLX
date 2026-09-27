@@ -4358,7 +4358,7 @@ def _prefill_restored_prompt_suffix(
     _check_postcommit_abort(abort_check)
     final_array = mx.array([[suffix[-1]]])
     final_embeddings = _suffix_chunk_embeddings(final_array)
-    with attention_phase("prefill"):
+    with _final_token_prefill_phase():
         suffix_logits, suffix_hidden = _forward_ar_optional_hidden(
             rt,
             final_array,
@@ -4802,7 +4802,7 @@ def _restore_near_prefix_prompt_state(
             repair_time = 0.0
         else:
             started = time.perf_counter()
-            with attention_phase("prefill"):
+            with _final_token_prefill_phase():
                 logits, hidden = _forward_ar_optional_hidden(
                     rt,
                     mx.array([[int(prompt_ids[restore_point - 1])]]),
@@ -4998,6 +4998,44 @@ def _gdn_boundary_tail_interval() -> int:
         return max(0, int(raw))
     except (TypeError, ValueError):
         return 256
+
+
+@contextmanager
+def _final_token_prefill_phase():
+    """Prefill phase for the forward of the lone final prompt token.
+
+    With the batch-invariant prefill lane this one row runs on the stock
+    kernels: padded to the lane's minimums (66 rows, 128 expert tokens) it
+    cost ~70 ms of TTFT on A3B, and no caller compares it with a wider
+    forward. Without the lane this is plain ``attention_phase("prefill")``.
+    """
+
+    from .batch_invariant_prefill import stock_prefill_kernels
+
+    with attention_phase("prefill"), stock_prefill_kernels():
+        yield
+
+
+def _cold_prefill_tail_interval(prompt_tokens: int) -> int:
+    """Tail boundary grid for a cold prefill of ``prompt_tokens``.
+
+    With the batch-invariant prefill lane, a prompt below the block-restore
+    floor (512 by default, also the SSD cache minimum) gets no tail grid: the
+    forward the grid cuts off costs ~0.1-0.15 s on A3B (all experts read
+    again) and only serves a near-prefix restore of a short prompt. Without
+    the lane the cut is kept, because removing it changes the chunk layout
+    and so the MoE routing and the scores.
+    """
+
+    from .batch_invariant_prefill import batch_invariant_prefill_installed
+
+    if (
+        batch_invariant_prefill_installed()
+        and int(prompt_tokens)
+        < max(1, _env_int("MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS", 512))
+    ):
+        return 0
+    return _gdn_boundary_tail_interval()
 
 
 def _cache_has_recurrent_entries(cache: list[Any] | None) -> bool:
@@ -7532,7 +7570,7 @@ def _prefill(
             len(body),
             capture_boundaries=capture_boundaries,
             inforward=_inforward_hooks is not None,
-            tail_interval=_gdn_boundary_tail_interval(),
+            tail_interval=_cold_prefill_tail_interval(len(prompt_ids)),
             mandatory_edges=_cold_edges,
         )
         for start, end in spans:
@@ -7584,7 +7622,7 @@ def _prefill(
 
     started = time.perf_counter()
     _check_postcommit_abort(abort_check)
-    with attention_phase("prefill"):
+    with _final_token_prefill_phase():
         result = rt.forward_ar(
             mx.array([[prompt_ids[-1]]]),
             cache=cache,
@@ -7678,7 +7716,7 @@ def _prefill_committed_mtp_history_streaming(
         len(body),
         capture_boundaries=capture_boundaries,
         inforward=_inforward_hooks is not None,
-        tail_interval=_gdn_boundary_tail_interval(),
+        tail_interval=_cold_prefill_tail_interval(len(prompt_ids)),
         mandatory_edges=_cold_edges,
         chunk_size=prefill_chunk_size,
     )
@@ -7871,7 +7909,7 @@ def _prefill_committed_mtp_history_streaming(
 
     started = time.perf_counter()
     _check_postcommit_abort(abort_check)
-    with attention_phase("prefill"):
+    with _final_token_prefill_phase():
         logits, hidden = rt.forward_ar(
             mx.array([[prompt_ids[-1]]]),
             cache=cache,
@@ -7967,7 +8005,7 @@ def _prefill_with_hidden_sequence(
             "prompt body"
         )
     started = time.perf_counter()
-    with attention_phase("prefill"):
+    with _final_token_prefill_phase():
         logits, final_hidden = rt.forward_ar(
             mx.array([[prompt_ids[-1]]]),
             cache=cache,
@@ -8112,22 +8150,104 @@ def _append_mtp_history(
     return time.perf_counter() - started
 
 
+_PROMPT_SCORE_LEGACY_TRUNK_ROWS = 256
+
+
+def _prompt_score_trunk_chunk_size() -> int:
+    """Rows per trunk forward when scoring a prompt.
+
+    ``MTPLX_PROMPT_SCORE_TRUNK_CHUNK`` names a width. Otherwise the normal
+    prefill chunk (live setting, else profile) when the batch-invariant
+    prefill lane is installed, because only then is the result independent
+    of the width; else 256, the layout through 2.12.0: on MoE models such as
+    Qwen3.6-35B-A3B another width changes the routing and the scores."""
+
+    from .batch_invariant_prefill import batch_invariant_prefill_installed
+
+    override = _env_int("MTPLX_PROMPT_SCORE_TRUNK_CHUNK", 0)
+    if override > 0:
+        return override
+    if batch_invariant_prefill_installed():
+        return _prefill_chunk_size()
+    return _PROMPT_SCORE_LEGACY_TRUNK_ROWS
+
+
+def _post_norm_logits_head(rt: MTPLXRuntime) -> Callable[[Any], Any] | None:
+    """The target lm_head over post-norm hidden rows, or None when this
+    runtime cannot run its trunk without logits (logits then come from the
+    forward itself)."""
+
+    if not rt.mtp_enabled:
+        return None
+    text_model = getattr(rt.model, "language_model", rt.model)
+    return getattr(text_model, "logits_from_post_norm", None)
+
+
+def _prompt_logit_slices(
+    rt: MTPLXRuntime,
+    prompt_array: mx.array,
+    cache: Any,
+    *,
+    logits_rows: int,
+    trunk_rows: int,
+):
+    """Yield ``(start, logits[rows, vocab])`` over the prompt, never more
+    than ``logits_rows`` rows of logits at a time.
+
+    With a separate lm_head the trunk runs ``trunk_rows`` rows per forward
+    (the prefill shape) and the head runs per ``logits_rows`` slice of its
+    hidden rows; without one each forward is one ``logits_rows`` slice.
+    """
+
+    logits_head = _post_norm_logits_head(rt)
+    if logits_head is None:
+        trunk_rows = logits_rows
+    for trunk_start in range(0, int(prompt_array.shape[1]), trunk_rows):
+        trunk = prompt_array[:, trunk_start : trunk_start + trunk_rows]
+        if logits_head is None:
+            with attention_phase("prefill"):
+                logits, _hidden = _forward_ar_optional_hidden(
+                    rt, trunk, cache=cache, hidden_variant=None, emit_logits=True
+                )
+            yield trunk_start, logits[0]
+            continue
+        with attention_phase("prefill"):
+            _logits, hidden = rt.forward_ar(
+                trunk,
+                cache=cache,
+                return_hidden=True,
+                hidden_variant="post_norm",
+                emit_logits=False,
+            )
+        for offset in range(0, int(trunk.shape[1]), logits_rows):
+            rows = hidden[:, offset : offset + logits_rows, :]
+            # In the prefill phase, like the forward's own head, so the
+            # batch-invariant lane also covers a slice of a few rows.
+            with attention_phase("prefill"):
+                logits = logits_head(rows)
+            yield trunk_start + offset, logits[0]
+
+
 def score_prompt_logprobs(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
     *,
     top_k: int,
     chunk_size: int = 256,
+    trunk_chunk_size: int | None = None,
 ) -> dict[str, Any]:
     """Teacher-forced prompt scoring: per-position next-token top-K logprobs.
 
     One prefill-shaped pass over the prompt, chunked so at most
     ``chunk_size x vocab`` logits are resident at once — the full-prompt
     logits tensor was the 32k memory-balloon root cause and must never come
-    back. Position ``i`` of the result describes the model's distribution
-    AFTER prefix ``prompt_ids[:i+1]`` (i.e. it predicts token ``i+1``): the
-    alignment Ivan's kl_capture consumes and llama.cpp's echo+logprobs
-    emits. Zero decode-hot-path cost: nothing here touches generation.
+    back. The trunk runs in forwards of ``trunk_chunk_size`` rows (default:
+    ``_prompt_score_trunk_chunk_size``) where the runtime can apply its
+    lm_head separately; otherwise in forwards of ``chunk_size``. Position
+    ``i`` of the result describes the model's distribution AFTER prefix
+    ``prompt_ids[:i+1]`` (i.e. it predicts token ``i+1``): the alignment
+    Ivan's kl_capture consumes and llama.cpp's echo+logprobs emits. Zero
+    decode-hot-path cost: nothing here touches generation.
     """
 
     import numpy as np
@@ -8141,19 +8261,18 @@ def score_prompt_logprobs(
     prompt_array = mx.array([prompt_ids])
     token_logprobs: list[float | None] = []
     top_entries: list[list[tuple[int, float]]] = []
+    if trunk_chunk_size is None:
+        trunk_chunk_size = _prompt_score_trunk_chunk_size()
     started = time.perf_counter()
-    for start in range(0, n, chunk_size):
-        end = min(n, start + chunk_size)
-        chunk = prompt_array[:, start:end]
-        with attention_phase("prefill"):
-            logits, _hidden = _forward_ar_optional_hidden(
-                rt,
-                chunk,
-                cache=cache,
-                hidden_variant=None,
-                emit_logits=True,
-            )
-        logprobs = logits[0].astype(mx.float32)
+    for start, rows_logits in _prompt_logit_slices(
+        rt,
+        prompt_array,
+        cache,
+        logits_rows=chunk_size,
+        trunk_rows=max(1, int(trunk_chunk_size)),
+    ):
+        end = start + int(rows_logits.shape[0])
+        logprobs = rows_logits.astype(mx.float32)
         logprobs = logprobs - mx.logsumexp(logprobs, axis=-1, keepdims=True)
         k = min(top_k, int(logprobs.shape[-1]))
         top_idx = mx.argpartition(-logprobs, kth=k - 1, axis=-1)[..., :k]
@@ -8194,7 +8313,7 @@ def score_prompt_logprobs(
             )
         if target_lp is not None:
             token_logprobs.extend(float(v) for v in np.array(target_lp))
-        del logits, logprobs, top_idx, top_vals
+        del rows_logits, logprobs, top_idx, top_vals
     return {
         "positions": top_entries,
         "token_logprobs": token_logprobs,
