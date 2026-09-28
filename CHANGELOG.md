@@ -4,6 +4,14 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Scoped reasoning history keeps the in-round postcommit.** Under `--preserve-thinking auto` (scoped) the postcommit predicted the next prompt with the turn it just generated appended without its think interior, while the next request (the client echoing its reasoning) renders it inside the active round. Every in-round generation-final commit was refused with `reasoning_history_scoping_mismatch` and the next turn re-prefilled from the last block boundary, on `/v1/messages` and `/v1/chat/completions` alike. The prediction now carries this turn's own interior from the committed stream; the chat template still decides whether it stays (in-round) or goes (after the next user query).
+- **Client bookkeeping after tool results no longer closes the agent round.** Claude Code appends a text block such as `<total_tokens>…</total_tokens>` or `<system-reminder>…</system-reminder>` after the `tool_result` blocks of a turn. The Anthropic bridge turned it into a separate user message, which the Qwen rolling checkpoint counts as a new user query, so under scoped reasoning history every tool step dropped the reasoning of the whole round from the prompt. A trailing text block that is exactly one tag is now folded into the preceding tool response; any other text still becomes a user message.
+- The pending-postcommit branch of the session prefix diagnostic reports `pending_postcommit_tokens` and `committed_lag_tokens`. `best_prefix_len` there is the last finished commit, which stays put for as long as an agent chain keeps the postcommit pending; the new fields tell that commit lag apart from a stale bank.
+
 ## [2.12.0] - 2026-09-23
 
 ### Added

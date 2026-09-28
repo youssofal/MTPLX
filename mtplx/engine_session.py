@@ -1068,6 +1068,12 @@ class EngineSession:
         with self._postcommit_lock:
             return self._pending_postcommit is not None
 
+    def pending_postcommit_token_count(self) -> int:
+        """Token count of the in-flight postcommit, 0 when none or unknown."""
+        with self._postcommit_lock:
+            record = self._pending_postcommit
+            return 0 if record is None else int(record.token_count or 0)
+
     def pending_postcommit_admin(self) -> dict[str, Any] | None:
         with self._postcommit_lock:
             record = self._pending_postcommit
@@ -1985,6 +1991,17 @@ class EngineSessionManager:
                         - int(matched),
                     }
                 )
+                # best_prefix_len is the last *finished* commit; under a fast
+                # agent chain the postcommit stays pending turn after turn and
+                # that length freezes while restores are served from the newer
+                # pending snapshot. Report the pending job's own size and the
+                # lag so the frozen value reads as commit lag, not a stale bank.
+                pending_tokens = pending.pending_postcommit_token_count()
+                if pending_tokens:
+                    diagnostic["pending_postcommit_tokens"] = int(pending_tokens)
+                    diagnostic["committed_lag_tokens"] = max(
+                        0, int(pending_tokens) - len(pending.committed_token_ids)
+                    )
                 record(diagnostic)
                 return pending.session_id, "pending_postcommit_near_prefix"
             best, matched = self.best_common_prefix_session(prompt_ids)

@@ -5947,6 +5947,30 @@ def _anthropic_tool_result_id(block: dict[str, Any]) -> str:
     return str(block.get("tool_use_id") or block.get("id") or "").strip()
 
 
+_ANTHROPIC_CLIENT_METADATA_RE = re.compile(r"^\s*<([A-Za-z][\w.-]*)>[\s\S]*</\1>\s*$")
+
+
+def _is_anthropic_client_metadata_block(block: Any) -> bool:
+    """A text block that is one client-emitted tag and nothing else, such as
+    ``<total_tokens>…</total_tokens>`` or ``<system-reminder>…</system-reminder>``."""
+    if not isinstance(block, dict) or str(block.get("type") or "") != "text":
+        return False
+    return bool(_ANTHROPIC_CLIENT_METADATA_RE.match(str(block.get("text") or "")))
+
+
+def _fold_metadata_into_tool_message(
+    tool_message: ChatMessage, blocks: list[Any]
+) -> ChatMessage:
+    extra = "\n\n".join(str(block.get("text") or "").strip() for block in blocks)
+    content = tool_message.content
+    if isinstance(content, list):
+        folded: Any = [*content, {"type": "text", "text": "\n\n" + extra}]
+    else:
+        base = _content_to_text(content)
+        folded = f"{base}\n\n{extra}" if base else extra
+    return tool_message.model_copy(update={"content": folded})
+
+
 def _anthropic_message_to_chat_messages(
     message: AnthropicMessage,
 ) -> list[ChatMessage]:
@@ -6014,6 +6038,21 @@ def _anthropic_message_to_chat_messages(
                 )
             else:
                 pending_blocks.append(block)
+        if (
+            pending_blocks
+            and messages
+            and messages[-1].role == "tool"
+            and all(_is_anthropic_client_metadata_block(b) for b in pending_blocks)
+        ):
+            # Agent clients append their own bookkeeping after the tool
+            # results of a turn (Claude Code: a `<total_tokens>` budget, a
+            # `<system-reminder>`). As a separate user message it counts as a
+            # real user query for the Qwen rolling checkpoint, so every tool
+            # step closed the round and the prompt dropped the reasoning of
+            # the whole active round. Folded into the tool response it stays
+            # visible to the model and the round stays open.
+            messages[-1] = _fold_metadata_into_tool_message(messages[-1], pending_blocks)
+            pending_blocks = []
         if pending_blocks or not messages:
             messages.append(
                 ChatMessage(
@@ -22678,6 +22717,49 @@ def _history_ids_for_postcommit(
                     )
                     history_messages[-1:] = current
                 substitution_walked = True
+    if (
+        not substitution_walked
+        and committed_stream_ids
+        and thinking_enabled
+        and _committed_reasoning_canonicalization_enabled()
+        and _reasoning_history_scoped_active(state)
+        and history_messages
+        and history_messages[-1].role == "assistant"
+    ):
+        # Scoped mode skips the walk above, but the turn generated THIS
+        # request is appended without reasoning_content, while the next
+        # request carries it back (the client echo) and the rolling
+        # checkpoint keeps it in-round. The predicted prefix then renders an
+        # empty think scaffold where the next prompt has the interior, so
+        # every in-round generation-final commit was refused with
+        # reasoning_history_scoping_mismatch. Carry this turn's own interior
+        # from the committed stream; the template keeps or drops it exactly
+        # as it will for the next prompt, and earlier turns keep their echo.
+        try:
+            committed_text = state.runtime.tokenizer.decode(
+                [int(token) for token in committed_stream_ids]
+            )
+        except Exception:
+            committed_text = ""
+        committed_turns = (
+            _committed_assistant_turns(
+                committed_text,
+                gemma4=_reasoning_parser_for_state(state) == "gemma4",
+            )
+            if committed_text
+            else []
+        )
+        if committed_turns and committed_turns[-1][0]:
+            current, _ = _substitute_committed_reasoning_messages(
+                history_messages[-1:],
+                committed_turns[-1:],
+                strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+            )
+            history_messages = [
+                _scrub_inbound_committed_reasoning(message)
+                for message in history_messages[:-1]
+            ] + current
+            substitution_walked = True
     if not substitution_walked:
         history_messages = [
             _scrub_inbound_committed_reasoning(message) for message in history_messages
