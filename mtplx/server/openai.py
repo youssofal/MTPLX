@@ -17727,11 +17727,16 @@ def _health_degradation_payload(state: Any) -> dict[str, Any]:
     except Exception:
         demotions = "unknown"
 
+    # The invariant prefill lane: its install report, or why it stays off
+    # (e.g. a quantized projection class the lane cannot cover).
+    from mtplx.batch_invariant_prefill import batch_invariant_prefill_status
+
     return {
         "compiled_verify": compiled_verify,
         "profile_env_overridden": profile_env_overridden,
         "nax": nax,
         "demotions": demotions,
+        "batch_invariant_prefill": batch_invariant_prefill_status(),
     }
 
 
@@ -25240,11 +25245,15 @@ async def _prompt_scoring_response(
         state.begin_foreground()
         state.lock.acquire()
         try:
-            return score_prompt_logprobs(
-                state.runtime,
-                list(prompt_ids),
-                top_k=int(top_k),
-            )
+            # The trunk runs at the prefill chunk a generation would use.
+            with prefill_chunk_size_override(
+                getattr(state.args, "prefill_chunk_tokens", None)
+            ):
+                return score_prompt_logprobs(
+                    state.runtime,
+                    list(prompt_ids),
+                    top_k=int(top_k),
+                )
         finally:
             state.lock.release()
             state.end_foreground()

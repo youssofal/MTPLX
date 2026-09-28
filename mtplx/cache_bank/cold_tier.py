@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from mtplx.cache_state import CacheSnapshot
+from mtplx.runtime_options import session_head_anchor_enabled
 
 from .codec import (
     ColdEncodeInterrupted,
@@ -298,6 +299,19 @@ def block_aligned_prefix_len(matched_tokens: int, *, block_size: int) -> int:
     block = max(1, int(block_size))
     matched = max(0, int(matched_tokens))
     return (matched // block) * block
+
+
+def _block_restore_match(matched: int, safe_block: int) -> int:
+    """How far a block-prefix candidate may restore.
+
+    The block-aligned match, or with ``MTPLX_SESSION_HEAD_ANCHOR`` on the
+    exact match, as in RAM: the session-head anchor (the end of the prompt
+    head) is rarely block aligned, so an aligned match would stop just short
+    of it. The prefix decode takes any length; a boundary restore picks the
+    newest persisted boundary at or below the match.
+    """
+
+    return int(matched) if session_head_anchor_enabled() else int(safe_block)
 
 
 def _payload_boundary_at_or_below(
@@ -1124,7 +1138,7 @@ class SessionBankColdTier:
                     candidate_matched = int(matched)
                     restore_kind = "near_prefix"
                 elif block_match:
-                    candidate_matched = int(safe_block)
+                    candidate_matched = _block_restore_match(matched, safe_block)
                     restore_kind = "block_prefix"
                 else:
                     continue

@@ -359,6 +359,21 @@ def block_prefix_restore_enabled() -> bool:
     return env_bool("MTPLX_SESSION_BLOCK_PREFIX_RESTORE", default=True)
 
 
+SESSION_HEAD_ANCHOR_ENV = "MTPLX_SESSION_HEAD_ANCHOR"
+
+
+def session_head_anchor_enabled() -> bool:
+    """``MTPLX_SESSION_HEAD_ANCHOR``, default OFF.
+
+    When on, a prefill records recurrent state exactly where the prompt's
+    fixed head (tools and system turn) ends, and boundary thinning never
+    drops that record, so a new session with the same head restores all of
+    it (see ``mtplx.session_head_anchor``).
+    """
+
+    return env_bool(SESSION_HEAD_ANCHOR_ENV, default=False)
+
+
 def normalize_paged_kv_quantization(value: object | None, *, allow_none: bool = False) -> str | None:
     if value is None:
         if allow_none:

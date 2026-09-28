@@ -116,6 +116,7 @@ from .runtime_options import (
     block_prefix_restore_enabled,
     env_bool,
     qwen4_opdiet_enabled,
+    session_head_anchor_enabled,
 )
 from .route_tape import RouteTape, counter_deltas
 
@@ -1476,9 +1477,11 @@ def _predicted_first_prefill_span(
         # Boundaries recorded inside the forwards: the loop runs the plain
         # grid whatever the tail looks like.
         return plain[0]
-    cold_edges: tuple[int, ...] = ()
-    if stable_prefix_len is not None and 0 < int(stable_prefix_len) < body_len:
-        cold_edges = (int(stable_prefix_len),)
+    cold_edges = _mandatory_prefill_edges(
+        stable_prefix_len,
+        _session_head_anchors(rt, prompt_ids, vision_splice=vision_splice),
+        limit=body_len,
+    )
     grid = _prefill_spans_with_tail_grid(
         body_len,
         tail_interval=_gdn_boundary_tail_interval(),
@@ -4168,15 +4171,18 @@ def _prefill_restored_prompt_suffix(
     # the fused single-forward cannot capture interior boundaries, so it
     # defers to the chunked path in that case (same tokens, one extra
     # launch; no re-evaluation).
-    _stable_edge_rel: int | None = None
-    if (
-        stable_prefix_len is not None
-        and gdn_boundary_sink is not None
-        and 0 < int(stable_prefix_len) - int(cached_tokens) < max(0, len(suffix) - 1)
-    ):
-        _stable_edge_rel = int(stable_prefix_len) - int(cached_tokens)
+    _stable_edges_rel = (
+        _mandatory_prefill_edges(
+            stable_prefix_len,
+            _sink_anchors(gdn_boundary_sink),
+            limit=len(suffix) - 1,
+            offset=int(cached_tokens),
+        )
+        if gdn_boundary_sink is not None
+        else ()
+    )
     fused_max = _small_suffix_fused_max()
-    if 0 < len(suffix) <= fused_max and _stable_edge_rel is None:
+    if 0 < len(suffix) <= fused_max and not _stable_edges_rel:
         fused_array = mx.array([suffix])
         fused_embeddings = _suffix_chunk_embeddings(fused_array)
         started = time.perf_counter()
@@ -4246,9 +4252,7 @@ def _prefill_restored_prompt_suffix(
             capture_boundaries=capture_boundaries,
             inforward=_inforward_hooks is not None,
             tail_interval=_gdn_boundary_tail_interval(),
-            mandatory_edges=(
-                (_stable_edge_rel,) if _stable_edge_rel is not None else ()
-            ),
+            mandatory_edges=_stable_edges_rel,
         )
     # PLE n-gram prefill lookahead (MTPLX_QWEN4_PLE_PREFILL_LOOKAHEAD, off by
     # default), wired to the warm loop exactly as to the cold one: chunk k+1's
@@ -4358,7 +4362,7 @@ def _prefill_restored_prompt_suffix(
     _check_postcommit_abort(abort_check)
     final_array = mx.array([[suffix[-1]]])
     final_embeddings = _suffix_chunk_embeddings(final_array)
-    with attention_phase("prefill"):
+    with _final_token_prefill_phase():
         suffix_logits, suffix_hidden = _forward_ar_optional_hidden(
             rt,
             final_array,
@@ -4571,6 +4575,7 @@ def _restore_near_prefix_prompt_state(
         return None
     max_gap = max(0, _env_int("MTPLX_SESSION_NEAR_PREFIX_MAX_TOKEN_GAP", 8))
     min_match = max(1, _env_int("MTPLX_SESSION_NEAR_PREFIX_MIN_MATCH_TOKENS", 64))
+    head_anchors = _session_head_anchors(rt, prompt_ids, vision_splice=vision_splice)
     block_prefix_enabled = (
         block_prefix_restore_enabled()
         if allow_block_prefix is None
@@ -4802,7 +4807,7 @@ def _restore_near_prefix_prompt_state(
             repair_time = 0.0
         else:
             started = time.perf_counter()
-            with attention_phase("prefill"):
+            with _final_token_prefill_phase():
                 logits, hidden = _forward_ar_optional_hidden(
                     rt,
                     mx.array([[int(prompt_ids[restore_point - 1])]]),
@@ -4846,7 +4851,9 @@ def _restore_near_prefix_prompt_state(
             # an empty suffix. (Only reachable when a boundary coincides with
             # a fully-contained prompt — fall through to other candidates.)
             continue
-        inherited_boundaries = _inherited_gdn_boundaries(entry, restore_point)
+        inherited_boundaries = _inherited_gdn_boundaries(
+            entry, restore_point, head_anchors
+        )
         restored = SimpleNamespace(
             entry=SimpleNamespace(prefix_len=restore_point),
             cache=cache,
@@ -4892,7 +4899,7 @@ def _restore_near_prefix_prompt_state(
                 restore_served=served_truth,
             )
         suffix_boundary_sink: list[tuple[int, Any, Any]] | None = (
-            list(inherited_boundaries)
+            GdnBoundarySink(inherited_boundaries, anchors=head_anchors)
             if _gdn_boundary_capture_enabled()
             else None
         )
@@ -5000,6 +5007,44 @@ def _gdn_boundary_tail_interval() -> int:
         return 256
 
 
+@contextmanager
+def _final_token_prefill_phase():
+    """Prefill phase for the forward of the lone final prompt token.
+
+    With the batch-invariant prefill lane this one row runs on the stock
+    kernels: padded to the lane's minimums (66 rows, 128 expert tokens) it
+    cost ~70 ms of TTFT on A3B, and no caller compares it with a wider
+    forward. Without the lane this is plain ``attention_phase("prefill")``.
+    """
+
+    from .batch_invariant_prefill import stock_prefill_kernels
+
+    with attention_phase("prefill"), stock_prefill_kernels():
+        yield
+
+
+def _cold_prefill_tail_interval(prompt_tokens: int) -> int:
+    """Tail boundary grid for a cold prefill of ``prompt_tokens``.
+
+    With the batch-invariant prefill lane, a prompt below the block-restore
+    floor (512 by default, also the SSD cache minimum) gets no tail grid: the
+    forward the grid cuts off costs ~0.1-0.15 s on A3B (all experts read
+    again) and only serves a near-prefix restore of a short prompt. Without
+    the lane the cut is kept, because removing it changes the chunk layout
+    and so the MoE routing and the scores.
+    """
+
+    from .batch_invariant_prefill import batch_invariant_prefill_installed
+
+    if (
+        batch_invariant_prefill_installed()
+        and int(prompt_tokens)
+        < max(1, _env_int("MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS", 512))
+    ):
+        return 0
+    return _gdn_boundary_tail_interval()
+
+
 def _cache_has_recurrent_entries(cache: list[Any] | None) -> bool:
     from .cache_state import _is_trimmable
 
@@ -5007,7 +5052,7 @@ def _cache_has_recurrent_entries(cache: list[Any] | None) -> bool:
 
 
 def _thin_gdn_boundary_records(
-    records: list[tuple[int, Any, Any]], cap: int
+    records: list[tuple[int, Any, Any]], cap: int, keep: Sequence[int] = ()
 ) -> list[tuple[int, Any, Any]]:
     """Thin boundary records to `cap` with geometric distance-from-tail coverage.
 
@@ -5025,7 +5070,10 @@ def _thin_gdn_boundary_records(
       - one record per power-of-two bucket of distance-from-newest
         (256..512, 512..1024, ... tokens), preferring the record CLOSEST to
         the newest inside each bucket,
-      - the oldest record (deep-divergence anchor).
+      - the oldest record (deep-divergence anchor),
+      - every record at a ``keep`` position (the session-head anchor: a new
+        session with the same head restores there, however far from the
+        tail it lies).
     Coverage invariant (unit-tested): for any matched position covered by the
     original records, restoring at the nearest kept boundary at or below it
     re-prefills at most ~3x the true divergence distance from the tail (plus
@@ -5039,6 +5087,10 @@ def _thin_gdn_boundary_records(
     oldest = ordered[0]
     newest_pos = int(newest[0])
     kept: dict[int, tuple[int, Any, Any]] = {int(newest[0]): newest, int(oldest[0]): oldest}
+    protected = {int(position) for position in keep}
+    kept.update(
+        (int(record[0]), record) for record in ordered if int(record[0]) in protected
+    )
     # Walk from the tail toward the head (distance from newest increasing).
     # Keep the first record past each doubling floor — one keeper per
     # distance scale, geometric spacing by construction regardless of how
@@ -5065,6 +5117,77 @@ def _thin_gdn_boundary_records(
             next_floor *= 2
         idx -= 1
     return sorted(kept.values(), key=lambda record: int(record[0]))
+
+
+class GdnBoundarySink(list):
+    """The boundary records a prefill appends to, plus its anchors.
+
+    Anchors are prompt positions the prefill must end a span at (so a record
+    lands exactly there) and that retention never thins away. A plain list
+    is a sink without anchors.
+    """
+
+    def __init__(self, records: Sequence[Any] = (), *, anchors: Sequence[int] = ()):
+        super().__init__(records)
+        self.anchors = tuple(int(position) for position in anchors)
+
+
+def _sink_anchors(sink: Any) -> tuple[int, ...]:
+    return tuple(getattr(sink, "anchors", ()))
+
+
+def _thin_boundary_sink(sink: list[tuple[int, Any, Any]]) -> None:
+    """Keep the sink within the boundary cap, never dropping an anchor."""
+
+    cap = _gdn_boundary_max_count()
+    if len(sink) > cap:
+        sink[:] = _thin_gdn_boundary_records(sink, cap, keep=_sink_anchors(sink))
+
+
+def _mandatory_prefill_edges(
+    stable_prefix_len: int | None,
+    anchors: Sequence[int],
+    *,
+    limit: int,
+    offset: int = 0,
+) -> tuple[int, ...]:
+    """Span ends a capturing prefill must hit, relative to ``offset``.
+
+    The caller's stable prompt prefix and the session-head anchors, each kept
+    only strictly inside ``(0, limit)`` of the span being planned.
+    """
+
+    positions = [int(position) for position in anchors]
+    if stable_prefix_len is not None:
+        positions.append(int(stable_prefix_len))
+    return tuple(
+        sorted({p - offset for p in positions if 0 < p - offset < int(limit)})
+    )
+
+
+def _session_head_anchors(
+    rt: Any, prompt_ids: Sequence[int], *, vision_splice: Any = None
+) -> tuple[int, ...]:
+    """Where the prompt's fixed head ends, as boundary anchors (switch on).
+
+    Empty when ``MTPLX_SESSION_HEAD_ANCHOR`` is off, for image prompts, for a
+    tokenizer without ChatML turns, and when the head is shorter than the
+    block-restore minimum (no restore could use it).
+    """
+
+    if vision_splice is not None or not session_head_anchor_enabled():
+        return ()
+    from .session_head_anchor import session_head_length, turn_markers
+
+    markers = turn_markers(getattr(rt, "tokenizer", None))
+    if markers is None:
+        return ()
+    head = session_head_length(prompt_ids, markers)
+    if head is None or head < max(
+        1, _env_int("MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS", 512)
+    ):
+        return ()
+    return (head,)
 
 
 def _capture_gdn_boundary(
@@ -5096,9 +5219,7 @@ def _capture_gdn_boundary(
         sink.append(
             (int(tokens_done), snapshot_untrimmable_cache(cache), hidden_leaf)
         )
-        cap = _gdn_boundary_max_count()
-        if len(sink) > cap:
-            sink[:] = _thin_gdn_boundary_records(sink, cap)
+        _thin_boundary_sink(sink)
     except Exception:
         # Boundary capture is an accelerator for future restores; never let it
         # break the cold prefill that is running right now.
@@ -5383,9 +5504,7 @@ def _append_gdn_boundary_record(
     """Append one boundary record and keep the geometric retention."""
 
     sink.append((int(tokens_done), snapshot, hidden_leaf))
-    cap = _gdn_boundary_max_count()
-    if len(sink) > cap:
-        sink[:] = _thin_gdn_boundary_records(sink, cap)
+    _thin_boundary_sink(sink)
 
 
 def _record_inforward_gdn_boundary(
@@ -5511,7 +5630,9 @@ def _bank_inforward_boundaries(
     return banked
 
 
-def _inherited_gdn_boundaries(entry: Any, restore_point: int) -> list:
+def _inherited_gdn_boundaries(
+    entry: Any, restore_point: int, anchors: Sequence[int] = ()
+) -> list:
     """Boundaries carried over from a restored SessionBank entry.
 
     A boundary record (position, recurrent snapshot[, hidden]) describes the
@@ -5524,6 +5645,9 @@ def _inherited_gdn_boundaries(entry: Any, restore_point: int) -> list:
     last completed postcommit (measured 2026-07-04: rounds pinned at a stale
     6.5k prefix while prompts grew to 12.5k, and the follow-up turn went
     fully cold with `no_snapshot_coverage`).
+
+    ``anchors`` are the new request's session-head anchors: a record there
+    survives the thinning.
     """
     records = list(getattr(entry, "gdn_boundaries", None) or [])
     kept = [record for record in records if int(record[0]) <= int(restore_point)]
@@ -5532,7 +5656,7 @@ def _inherited_gdn_boundaries(entry: Any, restore_point: int) -> list:
         # Geometric retention, mirroring _capture_gdn_boundary — the old
         # oldest+dense-tail pop(1) here was the second churn site that
         # hollowed out mid-prefix coverage on clone/lease chains.
-        kept = _thin_gdn_boundary_records(kept, cap)
+        kept = _thin_gdn_boundary_records(kept, cap, keep=anchors)
     return kept
 
 
@@ -6136,6 +6260,9 @@ def restore_or_prefill_prompt_state(
         # The bank only ever sees the content-keyed view of a vision prompt;
         # for text prompts the two views are the same list.
         bank_match_ids = bank_key_ids if bank_key_ids is not None else prompt_ids
+        head_anchors = _session_head_anchors(
+            rt, prompt_ids, vision_splice=vision_splice
+        )
         exact_prefix_len = 0
         try:
             longest_prefix = getattr(session_bank, "longest_prefix", None)
@@ -6241,7 +6368,7 @@ def restore_or_prefill_prompt_state(
             _check_postcommit_abort(abort_check)
             suffix = list(prompt_ids[restored.entry.prefix_len :])
             inherited_boundaries = _inherited_gdn_boundaries(
-                restored.entry, restored.entry.prefix_len
+                restored.entry, restored.entry.prefix_len, head_anchors
             )
             exact_served: dict[str, Any] = {
                 "entry_prefix_len": int(restored.entry.prefix_len),
@@ -6311,7 +6438,7 @@ def restore_or_prefill_prompt_state(
                 ssd_suffix_tokens=len(suffix),
             )
             suffix_boundary_sink: list[tuple[int, Any, Any]] | None = (
-                list(inherited_boundaries)
+                GdnBoundarySink(inherited_boundaries, anchors=head_anchors)
                 if session_bank is not None
                 and vision_splice is None
                 and _gdn_boundary_capture_enabled()
@@ -6405,7 +6532,9 @@ def restore_or_prefill_prompt_state(
     # whenever the result will be banked — they are what make sub-prefix
     # restores on hybrid models exact instead of approximate.
     gdn_boundary_sink: list[tuple[int, Any]] | None = (
-        []
+        GdnBoundarySink(
+            anchors=_session_head_anchors(rt, prompt_ids, vision_splice=vision_splice)
+        )
         if session_bank is not None
         and vision_splice is None
         and _gdn_boundary_capture_enabled()
@@ -7516,13 +7645,13 @@ def _prefill(
     if len(prompt_ids) > 1:
         body = prompt_ids[:-1]
         body_array = mx.array([body])
-        _cold_edges: tuple[int, ...] = ()
-        if (
-            stable_prefix_len is not None
-            and capture_boundaries
-            and 0 < int(stable_prefix_len) < len(body)
-        ):
-            _cold_edges = (int(stable_prefix_len),)
+        _cold_edges = (
+            _mandatory_prefill_edges(
+                stable_prefix_len, _sink_anchors(gdn_boundary_sink), limit=len(body)
+            )
+            if capture_boundaries
+            else ()
+        )
         _inforward_hooks = (
             _resolve_inforward_boundary_hooks(rt, vision_splice=vision_splice)
             if capture_boundaries
@@ -7532,7 +7661,7 @@ def _prefill(
             len(body),
             capture_boundaries=capture_boundaries,
             inforward=_inforward_hooks is not None,
-            tail_interval=_gdn_boundary_tail_interval(),
+            tail_interval=_cold_prefill_tail_interval(len(prompt_ids)),
             mandatory_edges=_cold_edges,
         )
         for start, end in spans:
@@ -7584,7 +7713,7 @@ def _prefill(
 
     started = time.perf_counter()
     _check_postcommit_abort(abort_check)
-    with attention_phase("prefill"):
+    with _final_token_prefill_phase():
         result = rt.forward_ar(
             mx.array([[prompt_ids[-1]]]),
             cache=cache,
@@ -7662,13 +7791,13 @@ def _prefill_committed_mtp_history_streaming(
             pad_prefix_counts.append(
                 pad_prefix_counts[-1] + (1 if token == pad_id else 0)
             )
-    _cold_edges: tuple[int, ...] = ()
-    if (
-        stable_prefix_len is not None
-        and capture_boundaries
-        and 0 < int(stable_prefix_len) < len(body)
-    ):
-        _cold_edges = (int(stable_prefix_len),)
+    _cold_edges = (
+        _mandatory_prefill_edges(
+            stable_prefix_len, _sink_anchors(gdn_boundary_sink), limit=len(body)
+        )
+        if capture_boundaries
+        else ()
+    )
     _inforward_hooks = (
         _resolve_inforward_boundary_hooks(rt, vision_splice=vision_splice)
         if capture_boundaries
@@ -7678,7 +7807,7 @@ def _prefill_committed_mtp_history_streaming(
         len(body),
         capture_boundaries=capture_boundaries,
         inforward=_inforward_hooks is not None,
-        tail_interval=_gdn_boundary_tail_interval(),
+        tail_interval=_cold_prefill_tail_interval(len(prompt_ids)),
         mandatory_edges=_cold_edges,
         chunk_size=prefill_chunk_size,
     )
@@ -7871,7 +8000,7 @@ def _prefill_committed_mtp_history_streaming(
 
     started = time.perf_counter()
     _check_postcommit_abort(abort_check)
-    with attention_phase("prefill"):
+    with _final_token_prefill_phase():
         logits, hidden = rt.forward_ar(
             mx.array([[prompt_ids[-1]]]),
             cache=cache,
@@ -7967,7 +8096,7 @@ def _prefill_with_hidden_sequence(
             "prompt body"
         )
     started = time.perf_counter()
-    with attention_phase("prefill"):
+    with _final_token_prefill_phase():
         logits, final_hidden = rt.forward_ar(
             mx.array([[prompt_ids[-1]]]),
             cache=cache,
@@ -8112,22 +8241,104 @@ def _append_mtp_history(
     return time.perf_counter() - started
 
 
+_PROMPT_SCORE_LEGACY_TRUNK_ROWS = 256
+
+
+def _prompt_score_trunk_chunk_size() -> int:
+    """Rows per trunk forward when scoring a prompt.
+
+    ``MTPLX_PROMPT_SCORE_TRUNK_CHUNK`` names a width. Otherwise the normal
+    prefill chunk (live setting, else profile) when the batch-invariant
+    prefill lane is installed, because only then is the result independent
+    of the width; else 256, the layout through 2.12.0: on MoE models such as
+    Qwen3.6-35B-A3B another width changes the routing and the scores."""
+
+    from .batch_invariant_prefill import batch_invariant_prefill_installed
+
+    override = _env_int("MTPLX_PROMPT_SCORE_TRUNK_CHUNK", 0)
+    if override > 0:
+        return override
+    if batch_invariant_prefill_installed():
+        return _prefill_chunk_size()
+    return _PROMPT_SCORE_LEGACY_TRUNK_ROWS
+
+
+def _post_norm_logits_head(rt: MTPLXRuntime) -> Callable[[Any], Any] | None:
+    """The target lm_head over post-norm hidden rows, or None when this
+    runtime cannot run its trunk without logits (logits then come from the
+    forward itself)."""
+
+    if not rt.mtp_enabled:
+        return None
+    text_model = getattr(rt.model, "language_model", rt.model)
+    return getattr(text_model, "logits_from_post_norm", None)
+
+
+def _prompt_logit_slices(
+    rt: MTPLXRuntime,
+    prompt_array: mx.array,
+    cache: Any,
+    *,
+    logits_rows: int,
+    trunk_rows: int,
+):
+    """Yield ``(start, logits[rows, vocab])`` over the prompt, never more
+    than ``logits_rows`` rows of logits at a time.
+
+    With a separate lm_head the trunk runs ``trunk_rows`` rows per forward
+    (the prefill shape) and the head runs per ``logits_rows`` slice of its
+    hidden rows; without one each forward is one ``logits_rows`` slice.
+    """
+
+    logits_head = _post_norm_logits_head(rt)
+    if logits_head is None:
+        trunk_rows = logits_rows
+    for trunk_start in range(0, int(prompt_array.shape[1]), trunk_rows):
+        trunk = prompt_array[:, trunk_start : trunk_start + trunk_rows]
+        if logits_head is None:
+            with attention_phase("prefill"):
+                logits, _hidden = _forward_ar_optional_hidden(
+                    rt, trunk, cache=cache, hidden_variant=None, emit_logits=True
+                )
+            yield trunk_start, logits[0]
+            continue
+        with attention_phase("prefill"):
+            _logits, hidden = rt.forward_ar(
+                trunk,
+                cache=cache,
+                return_hidden=True,
+                hidden_variant="post_norm",
+                emit_logits=False,
+            )
+        for offset in range(0, int(trunk.shape[1]), logits_rows):
+            rows = hidden[:, offset : offset + logits_rows, :]
+            # In the prefill phase, like the forward's own head, so the
+            # batch-invariant lane also covers a slice of a few rows.
+            with attention_phase("prefill"):
+                logits = logits_head(rows)
+            yield trunk_start + offset, logits[0]
+
+
 def score_prompt_logprobs(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
     *,
     top_k: int,
     chunk_size: int = 256,
+    trunk_chunk_size: int | None = None,
 ) -> dict[str, Any]:
     """Teacher-forced prompt scoring: per-position next-token top-K logprobs.
 
     One prefill-shaped pass over the prompt, chunked so at most
     ``chunk_size x vocab`` logits are resident at once — the full-prompt
     logits tensor was the 32k memory-balloon root cause and must never come
-    back. Position ``i`` of the result describes the model's distribution
-    AFTER prefix ``prompt_ids[:i+1]`` (i.e. it predicts token ``i+1``): the
-    alignment Ivan's kl_capture consumes and llama.cpp's echo+logprobs
-    emits. Zero decode-hot-path cost: nothing here touches generation.
+    back. The trunk runs in forwards of ``trunk_chunk_size`` rows (default:
+    ``_prompt_score_trunk_chunk_size``) where the runtime can apply its
+    lm_head separately; otherwise in forwards of ``chunk_size``. Position
+    ``i`` of the result describes the model's distribution AFTER prefix
+    ``prompt_ids[:i+1]`` (i.e. it predicts token ``i+1``): the alignment
+    Ivan's kl_capture consumes and llama.cpp's echo+logprobs emits. Zero
+    decode-hot-path cost: nothing here touches generation.
     """
 
     import numpy as np
@@ -8141,19 +8352,18 @@ def score_prompt_logprobs(
     prompt_array = mx.array([prompt_ids])
     token_logprobs: list[float | None] = []
     top_entries: list[list[tuple[int, float]]] = []
+    if trunk_chunk_size is None:
+        trunk_chunk_size = _prompt_score_trunk_chunk_size()
     started = time.perf_counter()
-    for start in range(0, n, chunk_size):
-        end = min(n, start + chunk_size)
-        chunk = prompt_array[:, start:end]
-        with attention_phase("prefill"):
-            logits, _hidden = _forward_ar_optional_hidden(
-                rt,
-                chunk,
-                cache=cache,
-                hidden_variant=None,
-                emit_logits=True,
-            )
-        logprobs = logits[0].astype(mx.float32)
+    for start, rows_logits in _prompt_logit_slices(
+        rt,
+        prompt_array,
+        cache,
+        logits_rows=chunk_size,
+        trunk_rows=max(1, int(trunk_chunk_size)),
+    ):
+        end = start + int(rows_logits.shape[0])
+        logprobs = rows_logits.astype(mx.float32)
         logprobs = logprobs - mx.logsumexp(logprobs, axis=-1, keepdims=True)
         k = min(top_k, int(logprobs.shape[-1]))
         top_idx = mx.argpartition(-logprobs, kth=k - 1, axis=-1)[..., :k]
@@ -8194,7 +8404,7 @@ def score_prompt_logprobs(
             )
         if target_lp is not None:
             token_logprobs.extend(float(v) for v in np.array(target_lp))
-        del logits, logprobs, top_idx, top_vals
+        del rows_logits, logprobs, top_idx, top_vals
     return {
         "positions": top_entries,
         "token_logprobs": token_logprobs,
