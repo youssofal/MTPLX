@@ -3064,6 +3064,40 @@ def test_completions_prompt_scoring_contract(monkeypatch):
     assert body["mtplx_stats"]["scored_positions"] == 3
 
 
+def test_completions_prompt_scoring_trunk_uses_the_live_prefill_chunk(monkeypatch):
+    """With the batch-invariant prefill lane, scoring runs its trunk at the
+    chunk a generation would prefill with."""
+
+    from mtplx import batch_invariant_prefill, generation
+
+    monkeypatch.delenv("MTPLX_PROMPT_SCORE_TRUNK_CHUNK", raising=False)
+    monkeypatch.setitem(batch_invariant_prefill._STATE, "installed", True)
+    state = _prompt_scoring_state()
+    state.args.prefill_chunk_tokens = 1536
+    seen: list[int] = []
+
+    def fake_score(runtime, prompt_ids, *, top_k):
+        seen.append(generation._prompt_score_trunk_chunk_size())
+        n = len(prompt_ids)
+        return {
+            "positions": [[(prompt_ids[i + 1], -0.1)] for i in range(n - 1)],
+            "token_logprobs": [-0.1] * (n - 1),
+            "prompt_tokens": n,
+            "elapsed_s": 0.01,
+        }
+
+    monkeypatch.setattr(openai, "score_prompt_logprobs", fake_score)
+    client = TestClient(create_app(state))
+
+    response = client.post(
+        "/v1/completions",
+        json={"prompt": "abcd", "echo": True, "logprobs": 1, "max_tokens": 0},
+    )
+
+    assert response.status_code == 200
+    assert seen == [1536]
+
+
 def _prompt_scoring_state():
     state = _fake_state()
     state.runtime.tokenizer = CaptureTokenizer()

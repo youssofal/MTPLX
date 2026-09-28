@@ -76,6 +76,12 @@ _FLASH_NEXT_ROWS = 32
 _FLASH_NEXT_TOP_K = 10
 _FLASH_NEXT_HIDDEN = 2560
 
+# A3B (Qwen3.6-35B-A3B) prefill combine probe: the invariant lane's narrowest
+# sorted forward at the family's geometry (top-8 experts of hidden 2048).
+_A3B_ROWS = 128
+_A3B_TOP_K = 8
+_A3B_HIDDEN = 2048
+
 _K = 1024  # satisfies every lane's K divisibility contract (%256 for m16)
 _N = 1024  # satisfies N%32 (m16/msg) and N%4 (ksplit)
 
@@ -109,6 +115,7 @@ def selfcheck_enabled(*, prism_ternary: bool = False, flash_next: bool = False) 
         or _env_on("MTPLX_QWEN_COMBINE_TAIL")
         or _env_on("MTPLX_FUSE_GDN_POST_CONV")
         or _env_on("MTPLX_A3B_WHOLE_MOE_FUSION")
+        or _env_on("MTPLX_A3B_MOE_PREFILL_COMBINE")
     )
 
 
@@ -697,6 +704,31 @@ def _check_qwen4_moe_prefill_combine(mx) -> float:
     )
 
 
+def _check_a3b_moe_prefill_combine(mx) -> float:
+    """Bitwise: the MoE combine at the A3B geometry (top-8 of hidden 2,048).
+
+    The lane's narrowest sorted forward (128 rows), expert outputs in a
+    shuffled order as the sorted gather leaves them, scores as the block's
+    normalized softmax, against the stock unsort, weight, sum, + shared tail.
+    """
+    from .kernels import qwen4_moe_prefill_combine as mc
+
+    mx.random.seed(43)
+    rows, top_k, hidden = _A3B_ROWS, _A3B_TOP_K, _A3B_HIDDEN
+    y_sorted = mx.random.normal((rows * top_k, hidden)).astype(mx.bfloat16)
+    inv_order = mx.argsort(mx.random.uniform(shape=(rows * top_k,))).astype(mx.uint32)
+    gates = mx.softmax(
+        (mx.random.normal((rows, top_k)) * 3.0).astype(mx.bfloat16), axis=-1, precise=True
+    )
+    scores = gates / gates.sum(axis=-1, keepdims=True)
+    shared = mx.random.normal((rows, hidden)).astype(mx.bfloat16)
+    return _bitwise_worst(
+        mx,
+        mc._launch(y_sorted, inv_order, scores, shared),
+        mc.moe_prefill_combine_reference(y_sorted, inv_order, scores, shared),
+    )
+
+
 def run_kernel_selfcheck(
     dtype,
     bits: int,
@@ -1040,6 +1072,18 @@ def run_kernel_selfcheck(
             _record(lane, 0.0, probe)
         else:
             lanes[lane] = _STATUS_SKIPPED
+
+    # A3B prefill combine (opt-in, on the invariant lane): bitwise as well.
+    from . import a3b_moe_prefill_combine
+
+    if a3b_moe_prefill_combine.switched_on():
+        _record(
+            a3b_moe_prefill_combine.LANE,
+            0.0,
+            lambda: _check_a3b_moe_prefill_combine(mx),
+        )
+    else:
+        lanes[a3b_moe_prefill_combine.LANE] = _STATUS_SKIPPED
 
     elapsed_ms = (time.perf_counter() - started) * 1000.0
 
