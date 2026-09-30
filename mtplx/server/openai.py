@@ -6158,6 +6158,10 @@ def _anthropic_to_chat_request(
     requested_effort = getattr(request, "reasoning_effort", None)
     if isinstance(requested_effort, str) and requested_effort.strip():
         extra_fields["reasoning_effort"] = requested_effort.strip()
+    # Carried so the chat path can refuse it instead of dropping it here.
+    repetition_penalty = getattr(request, "repetition_penalty", None)
+    if repetition_penalty is not None:
+        extra_fields["repetition_penalty"] = repetition_penalty
     disable_parallel = _anthropic_disable_parallel_tool_use(request.tool_choice)
     chat_request = ChatCompletionRequest(
         model=request.model,
@@ -16053,6 +16057,33 @@ def _reject_non_finite_sampler_controls(request: BaseModel) -> None:
             raise HTTPException(
                 status_code=400, detail=f"{name} must be a finite number"
             )
+
+
+def _reject_unapplied_repetition_penalty(request: BaseModel) -> None:
+    """400 on a ``repetition_penalty`` the sampler would silently drop.
+
+    The request models are ``extra="allow"``, so the vLLM/HF-style field
+    parsed, was listed under ``request_extra_keys`` and never reached the
+    sampler: greedy output with 1.3 was byte-identical to output without it,
+    while the client believed a penalty applied. 1.0 is the documented no-op
+    and stays accepted. Only called when client sampler controls are
+    applied; server-owned requests report it as an ignored field instead.
+    """
+    value = _request_extra(request, "repetition_penalty")
+    if value is None:
+        return
+    try:
+        is_noop = not isinstance(value, bool) and float(value) == 1.0
+    except (TypeError, ValueError):
+        is_noop = False
+    if not is_noop:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "repetition_penalty is not supported; omit it or send 1.0 "
+                "(presence_penalty and frequency_penalty are supported)"
+            ),
+        )
 
 
 def _managed_client_controls(state: Any = None) -> str:

@@ -220,6 +220,7 @@ def _resolve_sampler(
     observability["managed_client_controls"] = srv._managed_client_controls(state)
     if client_controls_allowed:
         srv._reject_non_finite_sampler_controls(request)
+        srv._reject_unapplied_repetition_penalty(request)
     sampler_temperature = request.temperature if client_controls_allowed else None
     sampler_top_p = request.top_p if client_controls_allowed else None
     sampler_top_k = request.top_k if client_controls_allowed else None
@@ -247,6 +248,7 @@ def _resolve_sampler(
             ("top_k", request.top_k),
             ("presence_penalty", request.presence_penalty),
             ("frequency_penalty", request.frequency_penalty),
+            ("repetition_penalty", srv._request_extra(request, "repetition_penalty")),
         )
         if value is not None and not client_controls_allowed
     ]

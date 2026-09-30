@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`repetition_penalty` is refused instead of silently ignored.** The request models accept extra fields, so the vLLM/HF-style `repetition_penalty` parsed on `/v1/chat/completions`, `/v1/completions` and `/v1/messages`, was listed under `request_extra_keys` and never reached the sampler: greedy output with `repetition_penalty: 1.3` was byte-identical to output without it. When client sampler controls apply, a value other than the no-op 1.0 now returns HTTP 400 that names `presence_penalty` and `frequency_penalty` as the supported alternatives, the same way `logprobs` is refused on chat; 1.0 is still accepted. With server-owned controls the field joins `client_sampler_fields_ignored`. The Anthropic bridge now carries the field over instead of dropping it. Measured on an M5 Pro (64 GB) with Qwen3.5-9B-MTPLX-Optimized-Speed, default profile, 2026-09-30, `origin/main` 1de2b1c0 against this change: on main, 3 of 3 repetition-prone greedy prompts (359 to 400 tokens) returned identical text with `repetition_penalty: 1.3` and 1.05 was accepted on `/v1/messages` and `/v1/completions`; with the change all of those return 400, while 1.0 returns 200 with text identical to a request without the field.
+
 ## [2.12.0] - 2026-09-23
 
 ### Added
