@@ -20,6 +20,13 @@ Env contract (all default-off):
 - ``MTPLX_FRSPEC_N`` optional cap for external ranked files. The built-in 64K
   artifact is row-sorted for efficient gathering and therefore only accepts
   its full size.
+
+Binding: Qwen4's native MTP route takes the full-vocabulary wrapper through
+its bind hook; the generic ``mtp_patch`` route (dense Qwen3.5 / Qwen3.8)
+takes it in ``_mtplx_draft_lm_head`` (``_bind_full_head``). The server turns
+the builtin table on by default for Flash-Next packs with a Q8/g64 lm_head
+and for dense Qwen3.8 packs with a configured affine draft head; an explicit
+``MTPLX_FRSPEC_DRAFT=0`` export turns it off.
 """
 
 from __future__ import annotations
@@ -180,6 +187,10 @@ def install_frspec_draft_head(text: Any) -> dict[str, Any]:
         return {"installed": False, "reason": "no_draft_lm_head"}
     if not isinstance(head, nn.QuantizedLinear):
         return {"installed": False, "reason": f"head_type_{type(head).__name__}"}
+    if _is_rotated_head(head):
+        # Gathering rows of a rotated packed head (Bonsai) drops its
+        # activation transform: the pruned copy would draft from garbage.
+        return {"installed": False, "reason": "rotated_packed_head"}
 
     bits = int(head.bits)
     group_size = int(head.group_size)
@@ -228,23 +239,11 @@ def install_frspec_draft_head(text: Any) -> dict[str, Any]:
     full_head = _full_vocab_head(pruned, ids_arr, vocab_rows)
     mx.eval(full_head.parameters())
 
-    # Keep the configured draft head unchanged for legacy consumers. Qwen4's
-    # native MTP route binds the full-domain wrapper once below and calls it
-    # directly without a per-token eligibility branch.
     text._mtplx_frspec_draft_head = full_head
     text._mtplx_frspec_full_vocab = vocab_rows
     text._mtplx_frspec_ids = ids_arr
     legacy = frspec_legacy_enabled()
-    bind_draft_head = getattr(text, "_mtplx_bind_draft_lm_head", None)
-    if bind_draft_head is not None:
-        bind_draft_head(full_head)
-    if legacy:
-        # Legacy per-step lane (2026-08-25): the mtp forward projects through
-        # _mtplx_draft_lm_head directly, so the swap is global here and
-        # generate_mtpk remaps sampled local ids -> full ids at its single
-        # draft convergence point (width-guarded).
-        text._mtplx_frspec_saved_head = head
-        text._mtplx_draft_lm_head = full_head
+    binding = _bind_full_head(text, head, full_head, legacy=legacy)
     report = {
         "installed": True,
         "n": n,
@@ -256,6 +255,7 @@ def install_frspec_draft_head(text: Any) -> dict[str, Any]:
         "source": source,
         "output_mode": "full",
         "legacy_swap": bool(legacy),
+        "binding": binding,
         "elapsed_s": round(time.perf_counter() - started, 3),
     }
     logger.info("[frspec] pruned draft lm_head installed: %s", report)
@@ -265,3 +265,35 @@ def install_frspec_draft_head(text: Any) -> dict[str, Any]:
 def frspec_legacy_enabled() -> bool:
     return (os.environ.get("MTPLX_FRSPEC_LEGACY", "").strip().lower()
             in {"1", "true", "yes", "on"})
+
+
+def _is_rotated_head(head: Any) -> bool:
+    from .draft_lm_head import _is_rotated_packed_head
+
+    return _is_rotated_packed_head(head)
+
+
+def _bind_full_head(text: Any, head: Any, full_head: Any, *, legacy: bool) -> str:
+    """Make the full-domain wrapper the head every draft step projects through.
+
+    Two draft forwards exist. Qwen4's native MTP route exposes a bind hook
+    (``_mtplx_bind_draft_lm_head``) and keeps ``_mtplx_draft_lm_head`` holding
+    the unpruned configured head. The generic ``mtp_patch`` forward (dense
+    Qwen3.5 / Qwen3.8) projects through ``_mtplx_draft_lm_head`` itself, so
+    the wrapper takes that slot; the configured head is kept at
+    ``_mtplx_frspec_saved_head``. The wrapper returns full-vocabulary logits
+    (pruned rows at -1e30), so every draft reader, the dense ``draft_q`` and
+    the acceptance test see real token ids and stay exact.
+    ``MTPLX_FRSPEC_LEGACY=1`` keeps its old meaning (the same slot swap, plus
+    its width-guarded id remap in ``generate_mtpk``, which a full-width row
+    never triggers).
+    """
+
+    bind_draft_head = getattr(text, "_mtplx_bind_draft_lm_head", None)
+    if bind_draft_head is not None:
+        bind_draft_head(full_head)
+        if not legacy:
+            return "native_mtp_hook"
+    text._mtplx_frspec_saved_head = head
+    text._mtplx_draft_lm_head = full_head
+    return "configured_draft_head"
