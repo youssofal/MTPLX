@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Forge stamps the verified depth and a served id.** `mtplx forge build` and `mtplx forge verify --stamp` now write the depth that won verification as `mtp_depth_default` (marked `mtp_depth_default_status: forge_verified`), so `serve` launches the pack at that depth instead of the `mtp_depth_max` ceiling. A depth the source declares is kept; one an earlier Forge verify stamped is replaced, or dropped when AR wins. A pack whose name is not first-party and that has no id claim gets `public_model_id` set to its sanitized branded name, so its served id no longer changes with the directory name. Seen on a Forge build of Apodex-1.1-mini Balance (6-bit g64 body, BF16 MTP head; M5 Pro 64 GB, turbo, 30 September 2026): verify picked D2 (1.72x AR), but the stamped runtime json left the launch depth at the D3 ceiling and needed a hand edit. Unit tests only; no change to the generation path.
+
 ## [2.12.0] - 2026-09-23
 
 ### Added

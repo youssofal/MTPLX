@@ -813,6 +813,29 @@ def public_model_id_for_ref(
     return _sanitize_public_model_id(basename)
 
 
+def forge_local_public_model_id(branded_name: str, model_path: str | Path) -> str | None:
+    """Served id Forge stamps on a pack it built, or None to leave it unset.
+
+    First-party names already resolve to their canonical id by name at serve
+    time, so they get no stamp. Any other pack gets the sanitized branded
+    name: the id ``public_model_id_for_ref`` would infer from a directory of
+    that name, but pinned in ``mtplx_runtime.json`` so it survives a rename,
+    a ``-1`` suffix from ``_unique_model_dir`` or a copy of the pack.
+    """
+
+    if not re.search(r"[A-Za-z0-9]", str(branded_name or "")):
+        return None
+    path = Path(model_path)
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    for name in (str(branded_name), str(path), str(resolved)):
+        if _public_model_id_from_name(name):
+            return None
+    return _sanitize_public_model_id(branded_name)
+
+
 def _normalize_variant(value: str | None) -> tuple[str, str | None]:
     raw = str(value or "").strip().lower()
     if raw in {"", "auto"}:

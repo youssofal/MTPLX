@@ -3829,6 +3829,7 @@ def _stamp_runtime_metadata(
         "recommended_profile",
         _recommended_profile_stamp(model_path, best_depth=best_depth),
     )
+    _stamp_verified_depth_default(metadata, best_depth=best_depth)
     # Stamp the FAMILY's sampler law, not a fixed 0.6 — the Qwen3.8/Qwen4
     # families serve at temperature 1.0, and a contract advertising 0.6
     # would mis-sample every client that honors it (the 27B misattribution
@@ -3855,6 +3856,7 @@ def _stamp_runtime_metadata(
         metadata["quality_pack"] = config["mtplx_quality"]
         metadata["min_engine_version"] = config["mtplx_quality"]["min_engine_version"]
         metadata["served_model_id"] = config["mtplx_quality"]["served_id"]
+    _stamp_forge_local_public_model_id(metadata, model_path=model_path, branded_name=branded_name)
     metadata.setdefault("exactness_baseline", {})
     speed_evidence = _speed_evidence(rows)
     artifact_fingerprint = _verification_artifact_fingerprint(model_path)
@@ -3886,6 +3888,47 @@ def _stamp_runtime_metadata(
     if isinstance(calibration, dict):
         metadata["forge_provenance"]["mtp_contract_calibration"] = dict(calibration)
     return metadata
+
+
+_FORGE_VERIFIED_DEPTH_STATUS = "forge_verified"
+_ID_CLAIM_KEYS = ("public_model_id", "served_model_id", "model_id")
+
+
+def _stamp_verified_depth_default(metadata: dict[str, Any], *, best_depth: int) -> None:
+    """Record verify's fastest depth as ``mtp_depth_default``.
+
+    Serve reads ``mtp_depth_default`` (or its historical spelling
+    ``recommended_mtp_depth``) as the launch depth and otherwise runs at the
+    ``mtp_depth_max`` ceiling, which is slower whenever acceptance decays
+    with depth. A value declared by the source is kept; a value an earlier
+    Forge verify stamped is replaced by the new measurement, or dropped when
+    no MTP depth won this time.
+    """
+
+    declared = any(metadata.get(key) is not None for key in ("mtp_depth_default", "recommended_mtp_depth"))
+    stamped_by_forge = metadata.get("mtp_depth_default_status") == _FORGE_VERIFIED_DEPTH_STATUS
+    if declared and not stamped_by_forge:
+        return
+    if best_depth > 0:
+        metadata["mtp_depth_default"] = int(best_depth)
+        metadata["mtp_depth_default_status"] = _FORGE_VERIFIED_DEPTH_STATUS
+    elif stamped_by_forge:
+        metadata.pop("mtp_depth_default", None)
+        metadata.pop("mtp_depth_default_status", None)
+
+
+def _stamp_forge_local_public_model_id(
+    metadata: dict[str, Any], *, model_path: Path, branded_name: str
+) -> None:
+    """Pin a served id on a non-first-party pack that has no id claim."""
+
+    if any(isinstance(metadata.get(key), str) and metadata[key].strip() for key in _ID_CLAIM_KEYS):
+        return
+    from mtplx.default_models import forge_local_public_model_id
+
+    public_id = forge_local_public_model_id(branded_name, model_path)
+    if public_id:
+        metadata["public_model_id"] = public_id
 
 
 def _vision_metadata_stamp(model_path: Path) -> dict[str, Any] | None:
