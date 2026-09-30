@@ -5535,6 +5535,58 @@ def test_run_generation_uses_effective_depth_but_preserves_requested_depth(monke
     assert generated["stats"]["requested_speculative_depth"] == 3
 
 
+def _run_generation_with_queue_wait(monkeypatch, **extra):
+    state = _fake_streaming_session_state()
+    state.draft_sampler = None
+    state.requests_completed = 0
+
+    def fake_generate_mtpk(*_args, **_kwargs):
+        return SimpleNamespace(
+            tokens=[ord("O")],
+            text="O",
+            stats=SimpleNamespace(
+                to_dict=lambda: {
+                    "prompt_eval_time_s": 0.0,
+                    "generated_tokens": 1,
+                    "elapsed_s": 0.1,
+                    "tok_s": 10.0,
+                }
+            ),
+            final_state=None,
+        )
+
+    monkeypatch.setattr(openai, "generate_mtpk", fake_generate_mtpk)
+    return openai._run_generation(
+        state,
+        [1, 2, 3],
+        max_tokens=1,
+        temperature=None,
+        top_p=None,
+        top_k=None,
+        seed=None,
+        generation_mode="mtp",
+        depth=3,
+        **extra,
+    )
+
+
+def test_run_generation_reports_scheduler_queue_wait(monkeypatch):
+    generated = _run_generation_with_queue_wait(monkeypatch, queue_wait_s=2.5)
+
+    stats = generated["stats"]
+    assert stats["queue_wait_s"] == 2.5
+    # The uncontended generation lock adds ~0 on top of the queue wait.
+    assert 2.5 <= stats["lock_wait_time_s"] < 3.0
+
+
+def test_run_generation_without_queue_wait_keeps_row_shape(monkeypatch):
+    generated = _run_generation_with_queue_wait(monkeypatch)
+
+    stats = generated["stats"]
+    assert "queue_wait_s" not in stats
+    assert stats["lock_wait_time_s"] < 0.5
+
+
 def test_run_generation_can_store_final_state_without_live_cache_ref(monkeypatch):
     state = _fake_streaming_session_state()
     state.draft_sampler = None

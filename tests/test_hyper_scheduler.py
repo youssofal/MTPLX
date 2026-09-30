@@ -323,6 +323,62 @@ def test_serial_dispatch_has_no_hyper_gate_and_still_serves(monkeypatch):
     assert generated["lane"] is None
 
 
+def test_serial_dispatch_passes_scheduler_queue_wait(monkeypatch):
+    args = parse_args(["--warmup-tokens", "0"])
+    state = SimpleNamespace(
+        args=args,
+        model_scheduler=ModelWorkScheduler(name="test-serial-queue"),
+        runtime=SimpleNamespace(mtp_enabled=True),
+    )
+    first_running = Event()
+    release_first = Event()
+    queue_waits: dict[str, float | None] = {}
+
+    def fake_generation(_state, _prompt_ids, **kwargs):
+        request_id = (kwargs.get("request_observability") or {}).get("request_id")
+        queue_waits[request_id] = kwargs.get("queue_wait_s")
+        if request_id == "req-first":
+            first_running.set()
+            assert release_first.wait(timeout=10.0)
+        return {"text": "ok"}
+
+    monkeypatch.setattr(openai, "_run_generation", fake_generation)
+
+    def dispatch(request_id: str) -> None:
+        openai._run_generation_dispatched(
+            state,
+            [1, 2],
+            batch_key=f"test.serial.{request_id}",
+            response_id=request_id,
+            generation_mode="mtp",
+            request_observability={},
+        )
+
+    first = Thread(target=dispatch, args=("req-first",), daemon=True)
+    second = Thread(target=dispatch, args=("req-second",), daemon=True)
+    try:
+        first.start()
+        assert first_running.wait(timeout=5.0)
+        second.start()
+        assert _wait_until(
+            lambda: state.model_scheduler.stats()["foreground_pending"] == 1
+        )
+        time.sleep(0.3)
+        release_first.set()
+        first.join(timeout=10.0)
+        second.join(timeout=10.0)
+        assert not first.is_alive() and not second.is_alive()
+    finally:
+        release_first.set()
+        state.model_scheduler.shutdown(wait=False, cancel_futures=True)
+
+    # The first request found the owner idle; the second queued behind it.
+    assert queue_waits["req-first"] is not None
+    assert queue_waits["req-first"] < 0.25
+    assert queue_waits["req-second"] is not None
+    assert queue_waits["req-second"] >= 0.3
+
+
 # ---------------------------------------------------------------------------
 # Admission gate unit semantics
 # ---------------------------------------------------------------------------

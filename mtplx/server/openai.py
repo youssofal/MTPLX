@@ -25528,11 +25528,15 @@ def _run_generation_dispatched(
             request_observability=request_observability,
         )
 
+    submitted_at_s = time.perf_counter()
+
     def run() -> dict[str, Any]:
         # Routing-only token: consumed by the mtp_batch branch (which receives
         # the whole kwargs dict). The solo/_run_generation path must not see it
         # — chat completions on non-mtp_batch schedulers crash otherwise.
         kwargs.pop("mtp_batch_finalize_ownership", None)
+        # Time spent in the scheduler FIFO behind other requests.
+        kwargs["queue_wait_s"] = max(0.0, time.perf_counter() - submitted_at_s)
         return _run_generation(state, prompt_ids, **kwargs)
 
     # scheduler_mode=hyper (H0 singleton chassis): the SAME `run` closure and
@@ -25790,6 +25794,7 @@ def _run_generation(
     vision_splice: Any | None = None,
     constraint_spec: Any | None = None,
     prefill_chunk_tokens: int | None = None,
+    queue_wait_s: float | None = None,
 ) -> dict[str, Any]:
     response_max, sampler, generation_limits = _generation_params(
         state,
@@ -25858,7 +25863,10 @@ def _run_generation(
     # unaffected. Previously a 39s postcommit wait vanished from the receipt.
     started = float((request_observability or {}).get("request_received_monotonic_s") or time.perf_counter())
     token_times: list[float] = []
-    lock_wait_time_s = 0.0
+    # Serial dispatch waits in the model scheduler's FIFO before this
+    # function runs; the generation lock below is then uncontended. Count
+    # that queue time as lock wait, as the batched lanes already do.
+    lock_wait_time_s = float(queue_wait_s or 0.0)
 
     def record_tokens(new_tokens: list[int]) -> None:
         now = time.perf_counter()
@@ -26334,6 +26342,8 @@ def _run_generation(
         ):
             if key in stats:
                 envelope[key] = stats[key]
+        if queue_wait_s is not None:
+            envelope["queue_wait_s"] = float(queue_wait_s)
         envelope["generation_mode"] = effective_mode
         envelope["requested_mtp_depth"] = (
             requested_mtp_depth if effective_mode == "mtp" else 0

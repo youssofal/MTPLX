@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Request logs show how long a serial request queued.** With the serial scheduler a request waits in the model scheduler's FIFO before `_run_generation` runs, and the generation lock inside is then uncontended, so `lock_wait_time_s` read 0 even for requests that waited seconds. The serial and hyper dispatch now pass the FIFO wait into `_run_generation`, which reports it as `queue_wait_s` (the key the batched lanes already use) and counts it in `lock_wait_time_s`, as the batched lanes already do. Both show up in the request log, `mtplx_stats` and `/v1/mtplx/snapshot` `latest`. Requests that never pass the scheduler (warmup) keep their row shape. Measured on an M5 Pro (64 GB), Qwen3.5-9B MTPLX-Optimized-Speed, default profile and fan mode, 30 Sep 2026, streamed chat with a shared 7.8K-token prefix and 300 new tokens, 1, 2 and 4 parallel requests twice each: queued requests now report 2.6 to 9.4 s (previously 0), and client TTFT minus `queue_wait_s` stays at 0.2 to 0.5 s for every request, the same as an unqueued request.
+
 ## [2.12.0] - 2026-09-23
 
 ### Added
