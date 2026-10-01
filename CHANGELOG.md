@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Eager verify can overlap graph building with GPU work** (`MTPLX_VERIFY_ASYNC_CHUNK_LAYERS=N`, off by default). When the verify runs eager (for example on 6-bit packs, where the compiled verify is gated off, or above the compiled-verify context limit), the host rebuilds the whole layer graph every round while the GPU waits. With the switch set, `forward_with_gdn_capture` submits the residual stream with `mx.async_eval` every N layers for decode-sized windows, so the GPU starts on the first layers while the host builds the rest. Same kernels and inputs, so the output is bit-identical (identical tokens in every measured run). M5 Pro 64 GB, Qwen3.6-35B-A3B Balance (6-bit), profile turbo, depth 2, temperature 0.6, 2026-09-30, commit 5fbdfe94: round 25.7 -> 23.5 ms, decode 92.5 -> 100.6 tok/s (+8.8%) on a fresh server over 11 streamed requests (code, English and Dutch, with and without reasoning); in-process 93.0 -> 102.0 tok/s over 4,096 tokens. The gain shrinks when macOS reports heavy thermal pressure (the GPU then clocks down and the round lands near the baseline), because the GPU no longer idles between rounds. N between 4 and 10 performs the same on this model; 8 is a good default.
+
 ## [2.12.0] - 2026-09-23
 
 ### Added

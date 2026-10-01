@@ -452,6 +452,54 @@ def _target_layer_eval_every(context_len: int) -> int:
     return int(os.environ.get("MTPLX_TARGET_LAYER_EVAL_EVERY", "0") or "0")
 
 
+def _verify_async_chunk_layers() -> int:
+    """Layers per non-blocking submit inside a decode verify (0 = off).
+
+    ``MTPLX_VERIFY_ASYNC_CHUNK_LAYERS=N`` makes the eager verify forward call
+    ``mx.async_eval`` on the residual stream every N layers, so the GPU starts
+    on layers 0..N-1 while the host is still building the graph for the rest.
+    Same kernels, same inputs, only the submit points move: the output is
+    bit-identical. Inside a graph transformation (the compiled verify trace)
+    nothing is submitted, so the compiled path is unchanged. Measured on
+    Qwen3.6-35B-A3B (6-bit, eager verify) at depth 2: the host spends ~2 ms
+    per round building the verify graph with the GPU idle; N=8 cut the round
+    from ~26 to ~23.7 ms (M5 Pro, 2026-09-30).
+    Default off.
+    """
+
+    raw = os.environ.get("MTPLX_VERIFY_ASYNC_CHUNK_LAYERS", "").strip().lower()
+    if raw in {"", "0", "off", "false", "no", "none"}:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def _try_async_submit(array: mx.array) -> bool:
+    """``mx.async_eval(array)`` unless a graph transformation is tracing.
+
+    The chunked submit only belongs on the eager verify path. Inside an
+    ``mx.compile`` trace (the compiled verify bank, a compiled forward) an
+    ``async_eval`` raises, and the bank would count that as a trace failure
+    and demote the whole verify to eager. Returns False when tracing, so the
+    caller stops submitting for the rest of the forward and the traced graph
+    is exactly the one built with the switch off.
+    """
+
+    from .compile_state import compile_trace_active
+
+    if compile_trace_active():
+        return False
+    try:
+        mx.async_eval(array)
+    except ValueError as exc:
+        if "graph transformation" not in str(exc):
+            raise
+        return False
+    return True
+
+
 def _make_linear_conv1d_kernel():
     if not mx.metal.is_available():
         return None
@@ -3027,6 +3075,10 @@ def forward_with_gdn_capture(
         and int(inputs.shape[1]) <= max(1, layer_eval_max_q)
         and context_len >= max(0, layer_eval_threshold)
     )
+    async_chunk = _verify_async_chunk_layers()
+    if async_chunk and int(inputs.shape[1]) > max(1, layer_eval_max_q):
+        async_chunk = 0
+    last_layer_idx = len(inner.layers) - 1
 
     for layer_idx, (layer, layer_cache) in enumerate(zip(inner.layers, cache)):
         mask = ssm_mask if layer.is_linear else fa_mask
@@ -3090,6 +3142,14 @@ def forward_with_gdn_capture(
         hidden_states = h + layer.mlp(mlp_input)
         if layer_eval_enabled and (layer_idx + 1) % layer_eval_every == 0:
             mx.eval(hidden_states)
+        elif (
+            async_chunk
+            and (layer_idx + 1) % async_chunk == 0
+            and layer_idx != last_layer_idx
+            and not _try_async_submit(hidden_states)
+        ):
+            # Tracing (compiled verify): submit nothing for the rest.
+            async_chunk = 0
 
     pre_norm = hidden_states
     post_norm = inner.norm(hidden_states)
