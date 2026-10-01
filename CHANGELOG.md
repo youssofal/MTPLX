@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`mtplx frspec build` ranks an FR-Spec draft vocabulary on your own text.** The built-in `qwen38-code-64k` table is ranked on code, and a token outside the table can never be drafted, so other languages lose acceptance where it misses their tokens. The command reads text, Markdown, code, JSON and chat/session JSONL (assistant messages by default) with only the model's `tokenizer.json`, always keeps the added and byte tokens, fills the remaining rows from the built-in table for that tokenizer, and writes an `int32` table in the built-in's ascending layout (or `--order ranked` for `MTPLX_FRSPEC_N`) plus a `.meta.json` sidecar with the tokenizer fingerprint. `--holdout` reports coverage on files kept out of the ranking, against the built-in; `--list-models` groups local packs by tokenizer, since one table serves every pack that shares it (the Qwen3.5, 3.6 and 3.8 packs all do). With a sidecar present, FR-Spec installation refuses a model whose tokenizer maps ids to other tokens (`tokenizer_mismatch`), and `MTPLX_FRSPEC_N` refuses to cut a row-sorted table; tables without a sidecar and the built-in behave as before. Measured on an M5 Pro 64 GB, CPU only (no model load, so no profile or fan mode), 2026-09-30, on 1de2b1c0 plus this change, Qwen3.8-27B tokenizer: this repository's `docs/` and `mtplx/` (390 files, 1.8M tokens) build in 1.5 s, held-out coverage 99.93% for the new table and 99.89% for the built-in; on a set of Dutch Markdown notes (64 files, 76K tokens, 9 files with 14.6K tokens held out) the new table covers 98.23% of the held-out tokens and the built-in 82.67%. Host tests in `tests/test_frspec_build.py`.
+
 ## [2.12.0] - 2026-09-23
 
 ### Added

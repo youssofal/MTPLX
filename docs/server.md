@@ -149,6 +149,53 @@ unaffected. A periodic re-warm, or growing that LRU to cover the hot set the
 hotness file already identifies, is the follow-up - deliberately not part of
 this change.
 
+## FR-Spec draft vocabulary (`MTPLX_FRSPEC_*`)
+
+FR-Spec drafts from a pruned draft head: only the rows listed in a vocabulary
+table (65,536 of 248,320 on the Qwen family) are projected, while the target
+still verifies over the full vocabulary, so output stays exact. A token outside
+the table can never be drafted, so that position is always rejected.
+
+```bash
+MTPLX_FRSPEC_DRAFT=1 MTPLX_FRSPEC_VOCAB=builtin:qwen38-code-64k mtplx serve ...
+```
+
+The built-in `qwen38-code-64k` table is ranked on code. Code and English
+prose are well covered; other languages lose tokens the table misses, and
+drafting in those languages can accept less than without FR-Spec. To rank a
+table on your own text instead:
+
+```bash
+mtplx frspec build --list-models          # local packs, grouped by tokenizer
+mtplx frspec build --model Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed \
+  --input ~/notes --input ~/sessions --holdout 0.1 --out ~/frspec/mine-64k.npy
+MTPLX_FRSPEC_DRAFT=1 MTPLX_FRSPEC_VOCAB=~/frspec/mine-64k.npy mtplx serve ...
+```
+
+- `--model` takes a name from `mtplx models`, a local pack directory, or a cached
+  Hugging Face repo; only its `tokenizer.json` is read. One table serves every
+  pack that shares the tokenizer vocabulary (`--list-models` shows the groups).
+- `--input` (repeatable) reads plain text, Markdown, code, JSON and JSONL. For
+  chat and session files (OpenAI messages, Claude Code sessions) only the
+  message text of `--roles` (default `assistant`) is used, since the draft
+  proposes model output. Each file is read up to `--max-file-bytes`.
+- The table always holds the tokenizer's added tokens and its 256 byte tokens.
+  The remaining rows go to the most frequent ids in the input, then
+  `--fill-from` (default: the built-in table for this tokenizer, else
+  tokenizer id order; `none` leaves the table short).
+- `--holdout 0.1` keeps a tenth of the files out of the ranking and prints the
+  coverage of the new table and of the built-in on them.
+- `--order ascending` (default) matches the built-in layout. `--order ranked`
+  keeps frequency order, so `MTPLX_FRSPEC_N` can cut the table to its top N.
+- A `<name>.meta.json` sidecar records the tokenizer fingerprint and row
+  order. With it, loading refuses a model whose tokenizer maps ids to other
+  tokens (install reason `tokenizer_mismatch`), and `MTPLX_FRSPEC_N` refuses to
+  cut a row-sorted table.
+
+The table holds token ids only, but their selection reveals which tokens are
+frequent in the input. Treat it as derived from that input; `--exclude-tokens
+<file>` (one string per line) keeps specific single-token strings out.
+
 ## Warm session cache (RAM bank) limits
 
 Every conversation's KV state is kept warm in RAM after a turn so the next

@@ -121,6 +121,7 @@ ADVANCED_COMMANDS = {
     "Models": (
         ("pull", "Download a model into the cache"),
         ("forge *", "Forge and publish MTPLX-branded MTP artifacts"),
+        ("frspec build", "Build an FR-Spec draft vocabulary from your own text"),
         ("models", "List local cached models"),
         ("model architectures", "Architecture support matrix"),
         ("model publish-check", "HF staging readiness"),
@@ -1090,6 +1091,12 @@ def cmd_forge_public(args: argparse.Namespace) -> int:
     from .commands.forge import cmd_forge_public as handler
 
     return handler(args, model_root=getattr(args, "model_root", None))
+
+
+def cmd_frspec_public(args: argparse.Namespace) -> int:
+    from .commands.frspec import cmd_frspec as handler
+
+    return handler(args)
 
 
 def cmd_trace_public(args: argparse.Namespace) -> int:
@@ -3419,6 +3426,62 @@ def build_parser() -> argparse.ArgumentParser:
     )
     forge_cancel_p.add_argument("run_id")
     forge_cancel_p.set_defaults(func=cmd_forge_public)
+
+    frspec_p = sub.add_parser(
+        "frspec",
+        help="Build FR-Spec draft vocabulary tables from your own text",
+    )
+    frspec_sub = frspec_p.add_subparsers(dest="frspec_action", required=True)
+    frspec_build_p = frspec_sub.add_parser(
+        "build",
+        help="Rank token ids by frequency in local text and write an MTPLX_FRSPEC_VOCAB table",
+    )
+    frspec_build_p.add_argument(
+        "--model",
+        help=(
+            "Model name from `mtplx models`, a local pack directory, or a Hugging Face "
+            "repo; only its tokenizer.json is read. See --list-models"
+        ),
+    )
+    frspec_build_p.add_argument("--cache-dir")
+    _add_model_search_dir_args(frspec_build_p)
+    frspec_build_p.add_argument(
+        "--list-models",
+        action="store_true",
+        help="List local packs grouped by tokenizer (one table serves a whole group) and exit",
+    )
+    frspec_build_p.add_argument(
+        "--input",
+        action="append",
+        help="Text, Markdown, code, JSON or chat/session JSONL file or directory (repeatable)",
+    )
+    frspec_build_p.add_argument("--out", help="Output table (.npy); a .meta.json sidecar is written next to it")
+    frspec_build_p.add_argument("--rows", type=int, default=65_536, help="Table size (default 65536)")
+    frspec_build_p.add_argument(
+        "--fill-from",
+        help="Rows after the input's own ids: builtin:<name>, ids (tokenizer order) or none; "
+        "default: the built-in table for this tokenizer, else ids",
+    )
+    frspec_build_p.add_argument(
+        "--order",
+        choices=("ascending", "ranked"),
+        default="ascending",
+        help="ascending matches the built-in table; ranked allows MTPLX_FRSPEC_N truncation",
+    )
+    frspec_build_p.add_argument(
+        "--holdout", type=float, default=0.0, help="Fraction of input files kept out of the ranking to report coverage on"
+    )
+    frspec_build_p.add_argument(
+        "--exclude-tokens", help="File with one string per line whose single-token ids stay out of the table"
+    )
+    frspec_build_p.add_argument(
+        "--roles", help="Chat roles read from JSON/JSONL conversations, comma separated (default: assistant)"
+    )
+    frspec_build_p.add_argument(
+        "--max-file-bytes", type=int, default=8 * 1024 * 1024, help="Bytes read per file (default 8 MiB)"
+    )
+    frspec_build_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    frspec_build_p.set_defaults(func=cmd_frspec_public)
 
     init_p = sub.add_parser(
         "init", help="Initialize MTPLX user config without importing MLX"

@@ -524,7 +524,9 @@ def _install_draft_lm_head(rt: Any, *, bits: int, group_size: int, mode: str) ->
 
     if frspec_enabled():
         report = dict(report)
-        report["frspec"] = install_frspec_draft_head(text)
+        report["frspec"] = install_frspec_draft_head(
+            text, model_path=getattr(rt, "model_path", None)
+        )
         if not report["frspec"].get("installed"):
             raise RuntimeError(
                 "FR-Spec draft head installation failed: "

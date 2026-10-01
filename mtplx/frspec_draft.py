@@ -24,6 +24,7 @@ Env contract (all default-off):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -119,6 +120,77 @@ def _vocab_path() -> Path | None:
     return path if path.exists() else None
 
 
+def vocab_sidecar_path(vocab_path: Path) -> Path:
+    """Metadata next to a table built by ``mtplx frspec build``: ``mine.npy`` -> ``mine.meta.json``.
+
+    It records the fingerprint of the tokenizer the table was ranked with and
+    its row order. When present, installation refuses a model whose tokenizer
+    maps ids to other tokens, and ``MTPLX_FRSPEC_N`` refuses to cut a
+    row-sorted table.
+    """
+
+    return vocab_path.with_name(vocab_path.stem + ".meta.json")
+
+
+def tokenizer_vocab_fingerprint(tokenizer_json: Path) -> str:
+    """sha256 over the id -> token mapping of a Hugging Face ``tokenizer.json``.
+
+    Only the mapping counts: packs of one family that differ in formatting,
+    pre-tokenizer or decoder settings share a fingerprint, while a tokenizer
+    whose ids mean other tokens does not.
+    """
+
+    payload = json.loads(Path(tokenizer_json).read_text(encoding="utf-8"))
+    vocab = (payload.get("model") or {}).get("vocab") or {}
+    if isinstance(vocab, dict):
+        tokens = {int(token_id): str(token) for token, token_id in vocab.items()}
+    else:  # Unigram: a list of [token, score] pairs in id order
+        tokens = {
+            index: str(entry[0] if isinstance(entry, list) else entry)
+            for index, entry in enumerate(vocab)
+        }
+    for added in payload.get("added_tokens") or []:
+        tokens[int(added["id"])] = str(added["content"])
+    canonical = json.dumps(sorted(tokens.items()), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _read_sidecar(vocab_path: Path) -> dict[str, Any]:
+    sidecar = vocab_sidecar_path(vocab_path)
+    if not sidecar.is_file():
+        return {}
+    try:
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.warning("[frspec] ignoring unreadable %s: %s", sidecar, exc)
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def frspec_tokenizer_mismatch(model_path: str | Path | None) -> dict[str, Any] | None:
+    """Compare the configured table's recorded tokenizer with the model's.
+
+    Returns None when they match or when either side carries no fingerprint
+    (built-in tables, tables without a sidecar, packs without tokenizer.json).
+    """
+
+    vocab_path = _vocab_path()
+    if vocab_path is None or model_path is None:
+        return None
+    expected = _read_sidecar(vocab_path).get("tokenizer_vocab_sha256")
+    tokenizer_json = Path(model_path) / "tokenizer.json"
+    if not expected or not tokenizer_json.is_file():
+        return None
+    actual = tokenizer_vocab_fingerprint(tokenizer_json)
+    if actual == expected:
+        return None
+    return {
+        "reason": "tokenizer_mismatch",
+        "table_tokenizer": str(expected)[:12],
+        "model_tokenizer": actual[:12],
+    }
+
+
 def load_frspec_ids() -> list[int] | None:
     path = _vocab_path()
     if path is None:
@@ -152,6 +224,12 @@ def load_frspec_ids() -> list[int] | None:
         if raw_vocab.startswith("builtin:") and n != len(ids):
             logger.warning("[frspec] built-in vocabularies do not support truncation")
             return None
+        if n != len(ids) and _read_sidecar(path).get("order") == "ascending":
+            logger.warning(
+                "[frspec] %s is row-sorted; MTPLX_FRSPEC_N needs a table built with --order ranked",
+                path,
+            )
+            return None
         ids = ids[:n]
     resolved = [int(i) for i in ids]
     if len(set(resolved)) != len(resolved):
@@ -160,7 +238,9 @@ def load_frspec_ids() -> list[int] | None:
     return resolved
 
 
-def install_frspec_draft_head(text: Any) -> dict[str, Any]:
+def install_frspec_draft_head(
+    text: Any, *, model_path: str | Path | None = None
+) -> dict[str, Any]:
     """Install a row-pruned proposal head at the model construction boundary.
 
     Call after the normal draft-head install. A contract miss returns an
@@ -198,6 +278,9 @@ def install_frspec_draft_head(text: Any) -> dict[str, Any]:
     ids = load_frspec_ids()
     if not ids:
         return {"installed": False, "reason": "no_ids"}
+    mismatch = frspec_tokenizer_mismatch(model_path)
+    if mismatch is not None:
+        return {"installed": False, **mismatch}
 
     vocab_rows = int(head.weight.shape[0])
     if max(ids) >= vocab_rows or min(ids) < 0:
