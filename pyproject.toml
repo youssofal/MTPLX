@@ -53,7 +53,7 @@ dependencies = [
   # ids identical to 5.14.1 on the Qwen 3.8 27B, Flash-Next, Qwen 3.6 A3B,
   # Qwen 3.5 9B and LFM2.5 pack tokenizers; 5.16.1 brings tokenizers 0.23.2
   # with the same ids. 5.17 is not verified, so the ceiling stays below it.
-  "transformers>=5.10.0,!=5.13.0,<5.17; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "transformers>=5.10.0,!=5.13.0,<5.18; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "nanobind>=2; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "numpy>=2",
   "pydantic>=2",
