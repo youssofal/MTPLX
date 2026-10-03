@@ -33846,6 +33846,28 @@ def _generated_text_attempts_tool_call(
     )
 
 
+def _unclosed_reasoning_recovery_allowed(
+    *, finish_reason: str, tools_active: bool, generated_text: str
+) -> bool:
+    """Gate for surfacing an unclosed reasoning block as visible content.
+
+    Needs a natural stop (a ``length`` cut is not an answer). With tools
+    declared, every agent turn qualifies, so the turn must also hold no tool
+    markup: a call that opened inside the reasoning belongs to the tool
+    parser, not to the recovered text. A turn whose tool call parsed never
+    reaches the recovery, because the tool-call branch comes first.
+    """
+    if finish_reason != "stop":
+        return False
+    if not tools_active:
+        return True
+    lowered = generated_text.lower()
+    return not any(
+        marker in lowered
+        for marker in _ThinkingContentStreamSplitter._TOOL_CONTROL_MARKERS
+    )
+
+
 def _finish_stream_splitter(
     splitter: Any, *, recover_unclosed_reasoning: bool
 ) -> list[tuple[str, str]]:
@@ -41266,8 +41288,15 @@ def create_app(state: ServerState) -> FastAPI:
                                             ):
                                                 yield mark_sse_sent(chunk)
                                 recover_unclosed_reasoning = (
-                                    str(generated.get("finish_reason") or "") == "stop"
-                                    and not tools_active
+                                    _unclosed_reasoning_recovery_allowed(
+                                        finish_reason=str(
+                                            generated.get("finish_reason") or ""
+                                        ),
+                                        tools_active=tools_active,
+                                        generated_text=str(
+                                            generated.get("text") or ""
+                                        ),
+                                    )
                                 )
                                 for field, text in _finish_stream_splitter(
                                     splitter,
@@ -42371,11 +42400,15 @@ def create_app(state: ServerState) -> FastAPI:
                     suppress_visible_reasoning=suppress_visible_reasoning,
                     footer_allowed=_stats_footer_allowed(state, headers, metadata),
                     # Same gate as the streaming twin (#F3): recover only on a
-                    # natural stop with no tools declared. /v1/messages
-                    # inherits through chat_completions.
+                    # natural stop; with tools declared also only when the
+                    # turn holds no tool markup. /v1/messages inherits
+                    # through chat_completions.
                     recover_unclosed_reasoning=(
-                        str(generated.get("finish_reason") or "") == "stop"
-                        and not tools_active
+                        _unclosed_reasoning_recovery_allowed(
+                            finish_reason=str(generated.get("finish_reason") or ""),
+                            tools_active=tools_active,
+                            generated_text=str(generated.get("text") or ""),
+                        )
                     ),
                     suppress_stats_footer=request.suppress_stats_footer,
                 )
