@@ -2,6 +2,7 @@ import {
   Bar,
   BarChart,
   CartesianGrid,
+  Cell,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -70,6 +71,7 @@ export function VerifyWaterfall() {
                 dataKey="label"
                 stroke="rgba(200,210,220,0.7)"
                 width={100}
+                interval={0}
               />
               <Tooltip
                 contentStyle={{
@@ -90,7 +92,7 @@ export function VerifyWaterfall() {
               />
               <Bar dataKey="seconds" radius={[0, 6, 6, 0]}>
                 {rows.map((entry) => (
-                  <Bar key={entry.key} dataKey="seconds" fill={entry.color} />
+                  <Cell key={entry.key} fill={entry.color} />
                 ))}
               </Bar>
             </BarChart>
