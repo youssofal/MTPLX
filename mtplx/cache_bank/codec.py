@@ -103,6 +103,15 @@ INCREMENTAL_WHOLE_TENSOR_MIN_BYTES = 1024 * 1024
 _UINT_VIEW_BY_ITEMSIZE: dict[int, Any] = {1: mx.uint8, 2: mx.uint16, 4: mx.uint32}
 
 
+def _mix32(bits: Any) -> Any:
+    """Per-element uint32 mixer (lowbias32 variant; uint32 ops wrap in MLX)."""
+    h = bits ^ (bits >> mx.array(16, dtype=mx.uint32))
+    h = h * mx.array(0x7FEB352D, dtype=mx.uint32)
+    h = h ^ (h >> mx.array(15, dtype=mx.uint32))
+    h = h * mx.array(0x846CA68B, dtype=mx.uint32)
+    return h ^ (h >> mx.array(16, dtype=mx.uint32))
+
+
 def content_fingerprints(value: Any, *, rows: int | None = None) -> list[int] | None:
     """64-bit content fingerprints of a tensor, computed on the GPU.
 
@@ -111,9 +120,11 @@ def content_fingerprints(value: Any, *, rows: int | None = None) -> list[int] | 
     without it, one fingerprint for the whole tensor. The fingerprint reads
     the raw bits (an unsigned view, so -0.0/+0.0 and NaN payloads differ)
     and folds them into two position-weighted sums modulo 2**32: one linear,
-    one over the squared bits. Integer arithmetic makes it exact and
-    order-independent; a single changed element always changes the linear
-    sum (odd weights). Returns None for dtypes without a same-size unsigned
+    one over the bits after a non-linear 32-bit mixer. Integer arithmetic
+    makes it exact and order-independent; a single changed element always
+    changes the linear sum (odd weights). The mixer replaces an earlier
+    squared-bits term that was blind to sign flips (b*b == (-b)*(-b) for the
+    top bit), so an even number of float32 sign flips collided. Returns None for dtypes without a same-size unsigned
     view (e.g. 8-byte types), which then take the normal copy path.
     """
     view_dtype = _UINT_VIEW_BY_ITEMSIZE.get(int(value.dtype.size))
@@ -142,7 +153,7 @@ def content_fingerprints(value: Any, *, rows: int | None = None) -> list[int] | 
     weight_b = (index * mx.array(0x85EBCA6B, dtype=mx.uint32)
                 + mx.array(0xC2B2AE35, dtype=mx.uint32)) | mx.array(1, dtype=mx.uint32)
     sum_a = mx.sum(bits * weight_a, axis=1)
-    sum_b = mx.sum((bits * bits) * weight_b, axis=1)
+    sum_b = mx.sum(_mix32(bits) * weight_b, axis=1)
     mx.eval(sum_a, sum_b)
     return [
         ((int(a) & 0xFFFFFFFF) << 32) | (int(b) & 0xFFFFFFFF)

@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **The incremental SSD encode no longer misses blocks that differ by an even number of float32 sign flips.** The content fingerprint's second sum used `bits * bits`, which is blind to a flip of bit 31; each element now goes through a uint32 mixer first. Fingerprints only live in memory, so no format change. `MTPLX_SSD_INCREMENTAL_ENCODE` stays opt-in.
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed

@@ -157,14 +157,14 @@ def _two_signs_flipped(turn):
     return gdn, flipped
 
 
-def test_default_store_restores_a_state_whose_fingerprint_collides(tmp_path, monkeypatch):
-    """The reason the switch is off: turn 2's recurrent state differs from
-    turn 1's in two signs and shares its fingerprint. The default (full)
-    encode still stores and restores turn 2's own bytes."""
+def test_default_store_restores_a_state_with_two_flipped_signs(tmp_path, monkeypatch):
+    """Turn 2's recurrent state differs from turn 1's in two signs. The
+    fingerprint tells them apart, and the default (full) encode stores and
+    restores turn 2's own bytes either way."""
     turn1, turn2 = _turns()
     gdn, flipped = _two_signs_flipped(turn2)
     assert not _bits_equal(gdn, flipped)
-    assert content_fingerprints(gdn) == content_fingerprints(flipped)
+    assert content_fingerprints(gdn) != content_fingerprints(flipped)
 
     monkeypatch.delenv("MTPLX_SSD_INCREMENTAL_ENCODE", raising=False)
     tier = _tier(tmp_path / "store")
@@ -182,12 +182,6 @@ def test_default_store_restores_a_state_whose_fingerprint_collides(tmp_path, mon
         tier.close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the incremental content key is not collision-proof: two float32 "
-    "sign flips borrow the predecessor's blob; keep the switch opt-in until "
-    "this passes",
-)
 def test_incremental_store_is_full_encode_when_the_fingerprint_collides(
     tmp_path, monkeypatch
 ):
@@ -205,6 +199,91 @@ def test_incremental_store_is_full_encode_when_the_fingerprint_collides(
     finally:
         full.close()
         incremental.close()
+
+
+def _flip_signs(array, positions):
+    """Copy of ``array`` with the sign bit flipped at flat ``positions``."""
+    view = {2: mx.uint16, 4: mx.uint32}[array.dtype.size]
+    top = 1 << (8 * array.dtype.size - 1)
+    mask = np.zeros(array.size, dtype=np.uint32)
+    mask[list(positions)] = top
+    bits = array.reshape(-1).view(view) ^ mx.array(mask.astype(np.dtype(f"u{array.dtype.size}")))
+    return bits.view(array.dtype).reshape(array.shape)
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+@pytest.mark.parametrize("flips", [1, 2, 4])
+def test_sign_flips_change_the_fingerprint(dtype, flips):
+    base = _rand((1, 2, 256, 64), dtype, 21)
+    rng = np.random.default_rng(flips)
+    for _ in range(25):
+        positions = rng.choice(base.size, flips, replace=False)
+        flipped = _flip_signs(base, positions)
+        assert not _bits_equal(base, flipped)
+        assert content_fingerprints(base) != content_fingerprints(flipped)
+        assert content_fingerprints(base, rows=256) != content_fingerprints(
+            flipped, rows=256
+        )
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_swapped_values_change_the_fingerprint(dtype):
+    base = _rand((1, 2, 256, 64), dtype, 22)
+    flat = np.array(base.astype(mx.float32).reshape(-1))
+    rng = np.random.default_rng(3)
+    for _ in range(25):
+        i, j = rng.choice(flat.size, 2, replace=False)
+        if flat[i] == flat[j]:
+            continue
+        swapped = flat.copy()
+        swapped[[i, j]] = swapped[[j, i]]
+        other = mx.array(swapped).astype(dtype).reshape(base.shape)
+        assert content_fingerprints(base) != content_fingerprints(other)
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_small_perturbations_change_the_fingerprint(dtype):
+    base = _rand((1, 2, 256, 64), dtype, 23)
+    view = {2: mx.uint16, 4: mx.uint32}[dtype.size]
+    bits = np.array(base.reshape(-1).view(view))
+    rng = np.random.default_rng(4)
+    seen = {tuple(content_fingerprints(base))}
+    for _ in range(100):
+        changed = bits.copy()
+        for pos in rng.choice(bits.size, int(rng.integers(1, 4)), replace=False):
+            changed[pos] ^= bits.dtype.type(1 << int(rng.integers(0, 8 * dtype.size)))
+        other = mx.array(changed).view(dtype).reshape(base.shape)
+        fp = tuple(content_fingerprints(other))
+        assert fp not in seen
+        seen.add(fp)
+
+
+def test_identical_content_has_identical_fingerprints():
+    for dtype, shape in ((mx.bfloat16, (1, 2, 512, 64)), (mx.float32, (1, 8, 128, 256))):
+        a = _rand(shape, dtype, 24)
+        b = mx.array(np.array(a.astype(mx.float32))).astype(dtype)
+        assert content_fingerprints(a) == content_fingerprints(b)
+        assert content_fingerprints(a, rows=256 if shape[2] % 256 == 0 else 128) == (
+            content_fingerprints(b, rows=256 if shape[2] % 256 == 0 else 128)
+        )
+
+
+def test_fingerprint_has_two_32_bit_halves_and_one_per_block():
+    kv = _rand((1, 2, 768, 64), mx.bfloat16, 25)
+    fps = content_fingerprints(kv, rows=256)
+    assert len(fps) == 3
+    assert all(0 <= fp < 1 << 64 for fp in fps)
+    assert len(set(fps)) == 3
+    gdn = _rand((1, 8, 128, 256), mx.float32, 26)
+    (whole,) = content_fingerprints(gdn)
+    assert 0 <= whole < 1 << 64
+
+
+def test_uint32_multiply_wraps_modulo_2_32():
+    a = mx.array([0xFFFFFFFF, 0x80000000], dtype=mx.uint32)
+    product = a * mx.array(0x846CA68B, dtype=mx.uint32)
+    expected = (np.array([0xFFFFFFFF, 0x80000000], dtype=np.uint64) * 0x846CA68B) & 0xFFFFFFFF
+    assert product.tolist() == expected.tolist()
 
 
 def _session_turns(dtype, seed):
