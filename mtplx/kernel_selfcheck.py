@@ -780,6 +780,24 @@ def run_kernel_selfcheck(
         )
         lanes["qmm_m4_wide"] = _STATUS_SKIPPED  # single m4 impl covers all N at 4-bit
         lanes["qmm_m6_wide"] = _STATUS_SKIPPED
+        if nax_verify.m5_rows_lane_enabled():
+            # Opt-in exact 5-row lane (MTPLX_M5_ROWS_LANE=1); only probed, and
+            # only reported, when the switch is on. A mismatch routes M=5 back
+            # to stock. The pipelined m16 tile (MTPLX_NAX_M16_PIPELINED=1) is
+            # covered by the qmm_m16_nax probe below, which runs whichever
+            # kernel the switch selects.
+            _record(
+                "qmm_m5",
+                _QMM_TOLERANCE,
+                lambda: _check_qmm_lane(
+                    mx,
+                    lambda x, w, s, b: nax_verify.nax_qmm_m5(x, w, s, b, group_size=group_size),
+                    5,
+                    4,
+                    group_size,
+                    dtype,
+                ),
+            )
         if nax_verify.nax_available():
             _record(
                 "qmm_m16_nax",
@@ -793,6 +811,19 @@ def run_kernel_selfcheck(
                     dtype,
                 ),
             )
+            if nax_verify.m32_tile_enabled():
+                _record(
+                    "qmm_m32_nax",
+                    _QMM_TOLERANCE,
+                    lambda: _check_qmm_lane(
+                        mx,
+                        lambda x, w, s, b: nax_verify.nax_qmm_m32(x, w, s, b, group_size=group_size),
+                        24,
+                        4,
+                        group_size,
+                        dtype,
+                    ),
+                )
         else:
             lanes["qmm_m16_nax"] = _STATUS_SKIPPED
     elif nax_on and bits == 8:

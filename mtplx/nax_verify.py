@@ -9,7 +9,11 @@ based on DFlash (arXiv:2602.06036). Two kernels are kept:
 - m4 K-split: plain SIMD kernel for exact M=4 rows, 4-bit affine weights,
   K % 32 == 0, N % 4 == 0.
 
-MTPLX additions: M-padding dispatch (verify rows 2..16 pad to the 16-row NAX
+MTPLX additions: multi-row lanes that read each weight tile once for 5 to 32
+verify rows (an exact 5-row split-K lane, a pipelined m16 tile and a two-tile
+32-row variant; default-off switches, ``MTPLX_MULTIROW_QMM=1`` turns all three
+on, see ``m5_rows_lane_enabled``, ``m16_pipelined_enabled`` and
+``m32_tile_enabled``), M-padding dispatch (verify rows 2..16 pad to the 16-row NAX
 tile; weight streaming dominates so padded rows are nearly free), env gating,
 and availability probes. Exactness vs stock mx.quantized_matmul is enforced by
 the capture-commit/R1b gates before any product use.
@@ -154,6 +158,237 @@ def _build_kernel_m16_nax_ktmpl(k_val: int, group_size: int, dtype: mx.Dtype):
     dtype_tag = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
     kernel = mx.fast.metal_kernel(
         name=f"mtplx_verify_m16_nax_k{int(k_val)}_gs{group_size}_{dtype_tag}",
+        input_names=["x", "w_q", "scales", "biases", "N_size"],
+        output_names=["y"],
+        header="""
+            #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+        """,
+        source=source,
+    )
+    _VERIFY_KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+def _build_kernel_m16_nax_pipelined(
+    k_val: int, group_size: int, dtype: mx.Dtype, row_tiles: int = 1
+):
+    """m16 NAX tile with a register prefetch and ping-pong B tiles.
+
+    Same arithmetic and summation order as ``_build_kernel_m16_nax_ktmpl`` (the
+    output is bit-identical), different schedule. Per simdgroup the K chunk is
+    walked in two-step units of 32 K: the weights and scales of the next unit
+    are loaded into registers while the current unit runs, and the dequantized
+    B tile of step i+1 is written into the second tile right after the matmul
+    of step i is issued, so the tile writes no longer wait for the matmul.
+    Receipts (2026-10-04, M5 Pro, dependent chain, weights cycled through
+    1.5 GB, M=16): gate/up 5120x17408 0.292 -> 0.237 ms, down 17408x5120
+    0.321 -> 0.255 ms, 5120x6144 0.115 -> 0.095, 6144x5120 0.114 -> 0.093,
+    5120x10240 0.178 -> 0.146, 5120x12288 0.213 -> 0.175 (-17 to -21%). A
+    prefetch of one unit (0.265) or four units (0.280, register pressure) is
+    slower than two, and NSG=4 or 16 loses to NSG=8. Needs K % 512 == 0 (the
+    K chunk of one simdgroup is a whole number of two-step units).
+
+    ``row_tiles=2`` stacks two 16-row tiles (32 rows): the B tile is dequantized
+    once and feeds both matmuls, so a 17 to 32 row verify still reads each
+    weight once. Stock qmm needs 0.42 ms (gate/up) and 0.98 ms (down) for the
+    same rows; the 32-row tile 0.30 and 0.34 ms.
+    """
+    key = ("m16_nax_pipelined", int(k_val), group_size, dtype, int(row_tiles))
+    if key in _VERIFY_KERNEL_CACHE:
+        return _VERIFY_KERNEL_CACHE[key]
+
+    source = f"""
+        using namespace metal;
+        using namespace mpp::tensor_ops;
+
+        constexpr int NR = {int(row_tiles)};
+        constexpr int BM = 16 * NR;
+        constexpr int BN = 32;
+        constexpr int BK = 32;
+        constexpr int NSG = 8;
+        constexpr int NU = 2;
+        constexpr int LU = NU * BK;
+        constexpr int GS = {group_size};
+        constexpr int K = KCONST;
+        constexpr int K_by_8 = K / 8;
+        constexpr int K_by_gs = K / GS;
+        constexpr int K_chunk = K / NSG;
+        constexpr int NG = (LU / GS) > 0 ? (LU / GS) : 1;
+
+        uint tid = thread_position_in_threadgroup.x;
+        uint sg_id = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint tg_n = threadgroup_position_in_grid.y;
+        int N = int(N_size);
+        int n0 = int(tg_n) * BN;
+        int k_begin = int(sg_id) * K_chunk;
+        int k_end = k_begin + K_chunk;
+
+        // Two B tiles per simdgroup; after the loop the same memory holds the
+        // eight fp32 partial tiles (16 KB, or all 32 KB at two row tiles).
+        threadgroup T B_tile[NSG][2][BK * BN];
+        threadgroup float* partial_base = (threadgroup float*)B_tile;
+
+        constexpr auto desc = matmul2d_descriptor(
+            16,
+            BN,
+            BK,
+            false,
+            false,
+            false,
+            matmul2d_descriptor::mode::multiply_accumulate);
+        matmul2d<desc, metal::execution_simdgroup> op;
+
+        tensor<device T, dextents<int, 2>, tensor_inline> A(
+            (device T*)x,
+            dextents<int, 2>{{K, BM}},
+            array<int, 2>{{1, K}});
+        tensor<threadgroup T, dextents<int, 2>, tensor_inline> B0(
+            B_tile[sg_id][0],
+            dextents<int, 2>{{BN, BK}},
+            array<int, 2>{{1, BN}});
+        tensor<threadgroup T, dextents<int, 2>, tensor_inline> B1(
+            B_tile[sg_id][1],
+            dextents<int, 2>{{BN, BK}},
+            array<int, 2>{{1, BN}});
+
+        auto ct_c = op.template get_destination_cooperative_tensor<
+            tensor<device T, extents<int, BK, 16>, tensor_inline>,
+            tensor<threadgroup T, extents<int, BN, BK>, tensor_inline>,
+            float>();
+        auto ct_c1 = op.template get_destination_cooperative_tensor<
+            tensor<device T, extents<int, BK, 16>, tensor_inline>,
+            tensor<threadgroup T, extents<int, BN, BK>, tensor_inline>,
+            float>();
+        _Pragma("unroll")
+        for (uint16_t i = 0; i < ct_c.get_capacity(); ++i) {{
+            ct_c[i] = 0.0f;
+            if constexpr (NR > 1) {{
+                ct_c1[i] = 0.0f;
+            }}
+        }}
+
+        int n_global = n0 + int(lane);
+        const device uint4* wr = (const device uint4*)(w_q + (long)n_global * K_by_8);
+        const device T* srow = scales + (long)n_global * K_by_gs;
+        const device T* brow = biases + (long)n_global * K_by_gs;
+
+        uint4 cur[NU];
+        uint4 nxt[NU];
+        float scur[NG];
+        float bcur[NG];
+        float snxt[NG];
+        float bnxt[NG];
+        _Pragma("unroll")
+        for (int u = 0; u < NU; ++u) {{
+            cur[u] = wr[k_begin / 32 + u];
+        }}
+        _Pragma("unroll")
+        for (int g = 0; g < NG; ++g) {{
+            scur[g] = float(srow[k_begin / GS + g]);
+            bcur[g] = float(brow[k_begin / GS + g]);
+        }}
+
+        auto dequant = [&](threadgroup T* dst, uint4 q, float ss, float bb) {{
+            uint32_t p[4] = {{q.x, q.y, q.z, q.w}};
+            _Pragma("unroll")
+            for (int j = 0; j < 4; ++j) {{
+                _Pragma("unroll")
+                for (int ki = 0; ki < 8; ++ki) {{
+                    uint32_t nib = (p[j] >> (ki * 4)) & 0xFu;
+                    dst[(j * 8 + ki) * BN + int(lane)] = T(float(nib) * ss + bb);
+                }}
+            }}
+        }};
+
+        dequant(B_tile[sg_id][0], cur[0], scur[0], bcur[0]);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int k1 = k_begin; k1 < k_end; k1 += LU) {{
+            bool more = (k1 + LU) < k_end;
+            if (more) {{
+                _Pragma("unroll")
+                for (int u = 0; u < NU; ++u) {{
+                    nxt[u] = wr[(k1 + LU) / 32 + u];
+                }}
+                _Pragma("unroll")
+                for (int g = 0; g < NG; ++g) {{
+                    snxt[g] = float(srow[(k1 + LU) / GS + g]);
+                    bnxt[g] = float(brow[(k1 + LU) / GS + g]);
+                }}
+            }}
+            _Pragma("unroll")
+            for (int u = 0; u < NU; ++u) {{
+                int k0 = k1 + u * BK;
+                auto tA = A.template slice<BK, 16>(k0, 0);
+                if ((u & 1) == 0) {{
+                    auto tB = B0.template slice<BN, BK>(0, 0);
+                    op.run(tA, tB, ct_c);
+                    if constexpr (NR > 1) {{
+                        auto tA1 = A.template slice<BK, 16>(k0, 16);
+                        op.run(tA1, tB, ct_c1);
+                    }}
+                }} else {{
+                    auto tB = B1.template slice<BN, BK>(0, 0);
+                    op.run(tA, tB, ct_c);
+                    if constexpr (NR > 1) {{
+                        auto tA1 = A.template slice<BK, 16>(k0, 16);
+                        op.run(tA1, tB, ct_c1);
+                    }}
+                }}
+                if (u + 1 < NU) {{
+                    dequant(
+                        B_tile[sg_id][(u + 1) & 1],
+                        cur[u + 1],
+                        scur[((u + 1) * 32) / GS],
+                        bcur[((u + 1) * 32) / GS]);
+                }} else if (more) {{
+                    dequant(B_tile[sg_id][(u + 1) & 1], nxt[0], snxt[0], bnxt[0]);
+                }}
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }}
+            if (more) {{
+                _Pragma("unroll")
+                for (int u = 0; u < NU; ++u) {{
+                    cur[u] = nxt[u];
+                }}
+                _Pragma("unroll")
+                for (int g = 0; g < NG; ++g) {{
+                    scur[g] = snxt[g];
+                    bcur[g] = bnxt[g];
+                }}
+            }}
+        }}
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* part = partial_base + sg_id * (BM * BN);
+        tensor<threadgroup float, dextents<int, 2>, tensor_inline> C(
+            part,
+            dextents<int, 2>{{BN, BM}},
+            array<int, 2>{{1, BN}});
+        auto tC = C.template slice<BN, 16>(0, 0);
+        ct_c.store(tC);
+        if constexpr (NR > 1) {{
+            auto tC1 = C.template slice<BN, 16>(0, 16);
+            ct_c1.store(tC1);
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int off = int(tid); off < BM * BN; off += NSG * 32) {{
+            float acc01 = partial_base[0 * BM * BN + off] + partial_base[1 * BM * BN + off];
+            float acc23 = partial_base[2 * BM * BN + off] + partial_base[3 * BM * BN + off];
+            float acc45 = partial_base[4 * BM * BN + off] + partial_base[5 * BM * BN + off];
+            float acc67 = partial_base[6 * BM * BN + off] + partial_base[7 * BM * BN + off];
+            float acc = (acc01 + acc23) + (acc45 + acc67);
+            int row = off / BN;
+            int col = off - row * BN;
+            y[row * N + n0 + col] = T(acc);
+        }}
+    """
+
+    dtype_tag = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
+    kernel = mx.fast.metal_kernel(
+        name=f"mtplx_verify_m16_nax_pp_k{int(k_val)}_gs{group_size}_r{int(row_tiles)}_{dtype_tag}",
         input_names=["x", "w_q", "scales", "biases", "N_size"],
         output_names=["y"],
         header="""
@@ -687,6 +922,32 @@ def m4_ksplit_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype
     )
 
 
+def m16_pipelined_eligible(
+    M: int, K: int, N: int, bits: int, group_size: int, dtype
+) -> bool:
+    """The pipelined m16 tile walks two-step units of 32 K per simdgroup."""
+    return m16_nax_eligible(M, K, N, bits, group_size, dtype) and int(K) % 512 == 0
+
+
+def m32_nax_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> bool:
+    """17 to 32 rows on the two-row-tile pipelined kernel (NAX hardware, K % 512)."""
+    return (
+        17 <= int(M) <= 32
+        and m16_pipelined_eligible(16, K, N, bits, group_size, dtype)
+    )
+
+
+def m5_rows_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> bool:
+    return (
+        int(bits) == 4
+        and int(group_size) in (32, 64, 128)
+        and dtype in (mx.bfloat16, mx.float16)
+        and int(M) == 5
+        and int(K) % 64 == 0
+        and int(N) % 4 == 0
+    )
+
+
 def nax_qmm_m16(
     x2: mx.array,
     w_q: mx.array,
@@ -704,7 +965,12 @@ def nax_qmm_m16(
         x16 = mx.contiguous(mx.concatenate([x2, pad], axis=0))
     else:
         x16 = mx.contiguous(x2)
-    kernel = _build_kernel_m16_nax_ktmpl(K, group_size, x2.dtype)
+    if m16_pipelined_enabled() and m16_pipelined_eligible(
+        16, K, N, 4, group_size, x2.dtype
+    ):
+        kernel = _build_kernel_m16_nax_pipelined(K, group_size, x2.dtype)
+    else:
+        kernel = _build_kernel_m16_nax_ktmpl(K, group_size, x2.dtype)
     (y,) = kernel(
         inputs=[x16, w_q, scales, biases, N],
         template=[("T", x2.dtype), ("KCONST", K)],
@@ -716,6 +982,66 @@ def nax_qmm_m16(
     if M < 16:
         return y[:M, :]
     return y
+
+
+def nax_qmm_m32(
+    x2: mx.array,
+    w_q: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    *,
+    group_size: int = 64,
+) -> mx.array:
+    """Run the 32-row (two 16-row tiles) pipelined NAX matmul. x2 is (17..32, K); pads to 32."""
+    M = int(x2.shape[0])
+    K = int(x2.shape[1])
+    N = int(w_q.shape[0])
+    if M < 32:
+        pad = mx.zeros((32 - M, K), dtype=x2.dtype)
+        x32 = mx.contiguous(mx.concatenate([x2, pad], axis=0))
+    else:
+        x32 = mx.contiguous(x2)
+    kernel = _build_kernel_m16_nax_pipelined(K, group_size, x2.dtype, row_tiles=2)
+    (y,) = kernel(
+        inputs=[x32, w_q, scales, biases, N],
+        template=[("T", x2.dtype), ("KCONST", K)],
+        grid=(256, N // 32, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(32, N)],
+        output_dtypes=[x2.dtype],
+    )
+    if M < 32:
+        return y[:M, :]
+    return y
+
+
+def nax_qmm_m5(
+    x2: mx.array,
+    w_q: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    *,
+    group_size: int = 64,
+) -> mx.array:
+    """Run the exact 5-row split-K verify matmul. x2 must be (5, K).
+
+    The MTPLX verify_kernels split-K kernel at M=5 (20 accumulators per thread,
+    K as a compile-time constant), without padding to 6 rows. Each weight tile
+    is read once and serves all five rows.
+    """
+    from .verify_kernels import _run_ksplit
+
+    return _run_ksplit(
+        5,
+        x2,
+        w_q,
+        scales,
+        biases,
+        bits=4,
+        group_size=group_size,
+        dual=False,
+        kconst=True,
+    )
 
 
 _QLINEAR_PATCH: dict[str, object] = {"installed": False, "original": None}
@@ -883,18 +1209,42 @@ def install_nax_qlinear_patch() -> dict[str, object]:
             m = 1
             for d in x.shape[:-1]:
                 m *= int(d)
-            if 4 <= m <= 16:
+            if 4 <= m <= (32 if m32_tile_enabled() else 16):
                 w_q = self["weight"]
                 k = int(x.shape[-1])
                 n = int(w_q.shape[0])
                 y = None
                 if (
+                    m > 16
+                    and not lane_disabled("qmm_m32_nax")
+                    and m32_nax_eligible(m, k, n, bits, group_size, x.dtype)
+                ):
+                    # 17 to 32 rows (context-copy blocks): two 16-row tiles on
+                    # one dequantized B tile, opt-in (MTPLX_NAX_M32_TILE=1).
+                    y = nax_qmm_m32(
+                        x.reshape(m, k), w_q, self["scales"], self["biases"],
+                        group_size=group_size,
+                    )
+                elif (
                     m == 4
                     and not lane_disabled("qmm_m4")
                     and m4_ksplit_eligible(m, k, n, bits, group_size, x.dtype)
                 ):
                     # Plain SIMD K-split kernel: no NAX hardware requirement.
                     y = nax_qmm_m4(
+                        x.reshape(m, k), w_q, self["scales"], self["biases"],
+                        group_size=group_size,
+                    )
+                elif (
+                    m == 5
+                    and m5_rows_lane_enabled()
+                    and not lane_disabled("qmm_m5")
+                    and m5_rows_eligible(m, k, n, bits, group_size, x.dtype)
+                ):
+                    # Exact 5-row split-K lane, opt-in (MTPLX_M5_ROWS_LANE=1):
+                    # reaches M=4 speed where stock qmv_wide and the padded
+                    # lanes lose 10 to 15%.
+                    y = nax_qmm_m5(
                         x.reshape(m, k), w_q, self["scales"], self["biases"],
                         group_size=group_size,
                     )
@@ -972,6 +1322,34 @@ def _m5_padded_lane() -> bool:
         "on",
         "yes",
     }
+
+
+def _env_flag(name: str) -> bool:
+    return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _multirow_umbrella() -> bool:
+    """MTPLX_MULTIROW_QMM=1 turns on all three multi-row lanes at once."""
+    return _env_flag("MTPLX_MULTIROW_QMM")
+
+
+def m16_pipelined_enabled() -> bool:
+    """Opt in to the pipelined m16 tile (default off, read per call).
+
+    Bit-identical to the default m16 kernel, 17 to 21% faster per matmul on the
+    Qwen3.8-27B shapes (see ``_build_kernel_m16_nax_pipelined``).
+    """
+    return _env_flag("MTPLX_NAX_M16_PIPELINED") or _multirow_umbrella()
+
+
+def m32_tile_enabled() -> bool:
+    """Opt in to the 32-row tile for 17 to 32 verify rows (default off, read per call)."""
+    return _env_flag("MTPLX_NAX_M32_TILE") or _multirow_umbrella()
+
+
+def m5_rows_lane_enabled() -> bool:
+    """Opt in to the exact 5-row split-K lane for M=5 (default off, read per call)."""
+    return _env_flag("MTPLX_M5_ROWS_LANE") or _multirow_umbrella()
 
 
 def nax_qmm_m4(

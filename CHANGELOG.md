@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Multi-row 4-bit verify matmuls for 5 to 32 rows, behind `MTPLX_MULTIROW_QMM=1` (off by default).** Stock MLX routes 2 to 12 rows through `qmv_wide`, which re-reads the weights once per five-row tile, and 13 or more rows through a tiled matmul that runs at 57 to 130 GB/s on the Qwen3.8-27B shapes, so a verify block of 5 or more rows loses most of the bandwidth that 4 rows still reach. Three lanes read each weight tile once and serve all rows (also switchable one by one: `MTPLX_M5_ROWS_LANE`, `MTPLX_NAX_M16_PIPELINED`, `MTPLX_NAX_M32_TILE`): an exact 5-row split-K lane, a pipelined version of the 16-row NAX tile (register prefetch of the next two K steps and ping-pong B tiles, bit-identical output to the current tile) for 7 to 16 rows, and a two-tile 32-row variant for 17 to 32 rows. Measured on an M5 Pro with the stock MLX 0.32.2 wheel and Qwen3.8-27B 4-bit g32: per matmul 11 to 20% faster at 5 and 7 to 16 rows and 18 to 68% at 17 to 32 rows (4-bit g32, seven shapes); whole verify forward at 2K context 87.8 to 82.0 ms (5 rows), 111.5 to 98.4 ms (8), 127.8 to 114.4 ms (13), 188.9 to 125.9 ms (17) and 194.8 to 129.2 ms (24), argmax equal on every row. Rows 1 to 4 and 6 are untouched. Needs K divisible by 512 for the NAX lanes (every Qwen3.8 projection qualifies).
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed
