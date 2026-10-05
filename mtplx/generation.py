@@ -2402,6 +2402,43 @@ def _split_spans_at(
     return out
 
 
+def _prefill_min_chunk_rows() -> int:
+    """``MTPLX_PREFILL_MIN_CHUNK_ROWS``: a final chunk narrower than this is
+    merged into the one before it (0 = off, the default).
+
+    MLX runs causal SDPA fused only for 1,024 or more query rows; below that
+    it takes an unfused route about 1.9x slower per row at an 80K prefix, so
+    a 4,096 + 839 plan pays 3.35 s for the 839 rows instead of ~2.6 s.
+    1024 is the value that matches the kernel's threshold.
+    """
+
+    raw = os.environ.get("MTPLX_PREFILL_MIN_CHUNK_ROWS", "0")
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _merge_small_remainder(
+    spans: list[tuple[int, int]], min_rows: int
+) -> list[tuple[int, int]]:
+    """Fold a final chunk narrower than ``min_rows`` into its predecessor.
+
+    The merged chunk is at most ``chunk_size + min_rows - 1`` rows.  Where the
+    tail ladder cuts the last chunk (families without in-forward boundary
+    capture) no forward gets wider than before: the ladder re-cuts it into
+    wide rungs plus the 64-row tail.  A single chunk, or a remainder already
+    ``min_rows`` wide, is left as it is.
+    """
+
+    if min_rows <= 0 or len(spans) < 2:
+        return spans
+    (start, _mid), (last_start, end) = spans[-2], spans[-1]
+    if end - last_start >= min_rows:
+        return spans
+    return [*spans[:-2], (start, end)]
+
+
 def _iter_prefill_chunk_spans(
     token_count: int,
     *,
@@ -2416,10 +2453,13 @@ def _iter_prefill_chunk_spans(
         _prefill_chunk_size() if chunk_size is None else max(1, int(chunk_size))
     )
     return _split_spans_at(
-        [
-            (start, min(token_count, start + resolved_chunk_size))
-            for start in range(0, token_count, resolved_chunk_size)
-        ],
+        _merge_small_remainder(
+            [
+                (start, min(token_count, start + resolved_chunk_size))
+                for start in range(0, token_count, resolved_chunk_size)
+            ],
+            _prefill_min_chunk_rows(),
+        ),
         mandatory_edges,
     )
 

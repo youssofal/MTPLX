@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`MTPLX_PREFILL_MIN_CHUNK_ROWS` (opt-in): merge a final prefill chunk below MLX's fused-SDPA threshold into the chunk before it.** MLX runs causal SDPA at head_dim 256 fused only from 1,024 query rows; a 4,096 + 839 plan paid the unfused route for the 839 rows. With `1024`, a 5,000-token append at an 80K prefix on Qwen3.8-27B (M5 Pro) took 19.25 s instead of 20.69 s, 9,000 tokens 34.60 s instead of 35.45 s. Appends whose last chunk is already 1,024 rows or wider are unchanged.
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed
