@@ -25,6 +25,7 @@ mock.module("react", () => ({
 mock.module("../src/components/Card", () => ({ Card: () => null }));
 mock.module("../src/state/store", () => ({
   useFilteredHistory: () => [],
+  useFilteredLiveHistory: () => [],
   useDashboardStore: (select: (state: object) => unknown) =>
     select({ rolling: null, sessionFilter: null }),
 }));
