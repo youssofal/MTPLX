@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Context-copy drafting for runtimes without an MTP head, opt-in.** `MTPLX_CONTEXT_COPY_AR=1` lets `generate_ar` copy a block from the prompt when the stream matches a prompt n-gram, and verify it in one forward pass (default off; same n-gram index, block ladder and probation/suspend policy as the MTP lanes). Measured by @jvmenen on an M5 Pro 64 GB (automatic power mode, thermal pressure 0), Llama 3.1 8B Instruct 4-bit, in process, median of 5 runs, October 4, commit f1d7d1e1: decode tok/s 55.3 to 289.3 (5.2x) returning an edited 2,458-token Python file, 52.4 to 69.2 (1.3x) quoting from a 4,075-token report, 59.5 to 59.3 on free prose (no matches, no copy rounds); greedy streams identical to the one-token loop in 20 of 20 runs; peak memory unchanged.
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed

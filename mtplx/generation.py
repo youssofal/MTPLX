@@ -47,6 +47,7 @@ from .deepseek_v4_adaptive_width import (
 )
 from .errors import is_allocation_failure
 from .progress_heartbeat import tick as _owner_progress_tick
+from .context_copy_ar import ArContextCopy, copy_ar_eligible, verify_copy_block
 from .cache_state import (
     CacheSnapshot,
     detach_array_leaf,
@@ -9415,6 +9416,24 @@ def generate_ar(
         in ("1", "true", "yes", "on")
     ) or bool(os.environ.get("MTPLX_EVAL_AUDIT"))
 
+    _cc_ar = (
+        ArContextCopy(prompt_ids)
+        if copy_ar_eligible(
+            mtp_enabled=bool(getattr(rt, "mtp_enabled", False)),
+            penalized=bool(sampler.presence_penalty or sampler.frequency_penalty),
+            guarded=(
+                constraint is not None
+                or _loop_guard is not None
+                or _thinking_guard is not None
+                or ar_return_hidden
+            ),
+            sync_eval=_ar_sync_eval,
+            cache=cache,
+        )
+        else None
+    )
+    _cc_forced: int | None = None  # residual correction awaiting its emit
+
     for step in range(max_tokens):
         if _loop_guard is not None:
             _guard_transition = _loop_guard.observe(tokens)
@@ -9458,15 +9477,18 @@ def generate_ar(
             sync_elapsed = time.perf_counter() - sync_started
             target_eval_time += sync_elapsed
             target_decode_time += sync_elapsed
-        token, _ = _sample_from_logits(
-            logits_row,
-            sampler,
-            rng,
-            token_counts=Counter(tokens)
-            if (sampler.presence_penalty or sampler.frequency_penalty)
-            else None,
-            penalty_overlay=(_ar_steer_overlay(tokens) if _steer_active else None),
-        )
+        if _cc_forced is not None:
+            token, _cc_forced = _cc_forced, None
+        else:
+            token, _ = _sample_from_logits(
+                logits_row,
+                sampler,
+                rng,
+                token_counts=Counter(tokens)
+                if (sampler.presence_penalty or sampler.frequency_penalty)
+                else None,
+                penalty_overlay=(_ar_steer_overlay(tokens) if _steer_active else None),
+            )
         if first_token_logprobs_top_k is not None and not tokens:
             first_logprobs = first_token_logprobs(
                 logits[0], token_id=token, top_k=first_token_logprobs_top_k
@@ -9497,8 +9519,58 @@ def generate_ar(
                 }
             )
             break
-        if step + 1 >= max_tokens or _is_stop(token, stop_token_ids):
+        if len(tokens) >= max_tokens or _is_stop(token, stop_token_ids):
             break
+
+        if _cc_ar is not None:
+            _cc_block = _cc_ar.propose(tokens, max_tokens - len(tokens) - 1)
+            if _cc_block:
+                _cc_started = time.perf_counter()
+                _cc_round = verify_copy_block(
+                    lambda ids: rt.forward_ar(ids, cache=cache, return_hidden=False),
+                    lambda keep: _trim_cache_to_offset(cache, keep),
+                    int(cache[0].offset),
+                    token,
+                    _cc_block,
+                    stop_token_ids,
+                    greedy=sampler.temperature <= 0,
+                    accept=lambda rows, block: _point_mass_block_accept(
+                        rows, block, sampler, rng
+                    ),
+                )
+                _cc_elapsed = time.perf_counter() - _cc_started
+                target_decode_time += _cc_elapsed
+                target_eval_time += _cc_elapsed
+                verify_calls += 1
+                _cc_ar.record(
+                    _cc_round.block_len,
+                    len(_cc_round.tokens),
+                    len(tokens) + len(_cc_round.tokens),
+                )
+                for _cc_token in _cc_round.tokens:
+                    tokens.append(_cc_token)
+                    emit_token(_cc_token)
+                    events.append({"step": step, "token": _cc_token})
+                    repetition_result = _trim_repeated_suffix(
+                        tokens, repetition_config, repetition_long_cycle
+                    )
+                    if repetition_result is not None:
+                        events.append(
+                            {
+                                "step": step,
+                                "repetition_stop": {
+                                    "reason": repetition_result.reason,
+                                    "block_tokens": repetition_result.block_tokens,
+                                    "repeats": repetition_result.repeats,
+                                    "trimmed_tokens": repetition_result.repeated_tokens,
+                                },
+                            }
+                        )
+                        break
+                if repetition_result is not None or _cc_round.stopped:
+                    break
+                logits, _cc_forced = _cc_round.logits, _cc_round.correction
+                continue
 
         started = time.perf_counter()
         profiler = _ar_forward_profiler(step)
@@ -9538,6 +9610,8 @@ def generate_ar(
         verify_calls += 1
         logits = logits_next[:, -1, :]
 
+    if _cc_ar is not None:
+        events.append({"context_copy_ar": _cc_ar.summary()})
     if token_callback is not None and _stream_gate.window > 0:
         # Armed-stream reconcile (F35): the trim decision is known here —
         # flush the held tail in full (no trim) or the post-trim remainder.

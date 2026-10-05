@@ -18,6 +18,10 @@ file re-emission, RAG) most of the output already exists in the prompt, where a 
 block can commit far more per verify call (see the benchmarks in the pull request).
 The two mechanisms compose: copy when a prompt match exists, MTP otherwise.
 
+AR-only runtimes (no MTP head) can opt in to the same lane in generate_ar with
+MTPLX_CONTEXT_COPY_AR=1 (see context_copy_ar.py); it reuses NgramIndex,
+block_for_ext and CopyGovernor from here.
+
 RAMP (adapting community PR #375 by @johninthewinter): an opt-in fixed/long
 block-length policy plus a mismatch-tolerant fuzzy re-anchor fallback for when
 the exact n-gram key misses. OFF BY DEFAULT (MTPLX_RAMP_ENABLED unset or
@@ -38,6 +42,20 @@ import os
 def context_copy_enabled() -> bool:
     """Enabled by default. MTPLX_CONTEXT_COPY set to 0, false, or off disables it."""
     return (os.environ.get("MTPLX_CONTEXT_COPY") or "").strip() not in {"0", "false", "off"}
+
+
+def context_copy_ar_enabled() -> bool:
+    """Context-copy for AR-only runtimes (no MTP head), in ``generate_ar``.
+
+    Opt-in: MTPLX_CONTEXT_COPY_AR=1 (also true/on/yes), and only while the
+    global MTPLX_CONTEXT_COPY switch is not off. Default off: plain AR decoding
+    stays byte-identical to before. The copy block is verified with one
+    multi-row forward, whose batched numerics can differ from row-by-row
+    decoding in the last bits, so a greedy stream is not guaranteed
+    bit-identical to the one-token loop.
+    """
+    value = (os.environ.get("MTPLX_CONTEXT_COPY_AR") or "").strip().lower()
+    return context_copy_enabled() and value in {"1", "true", "on", "yes"}
 
 
 def context_copy_batched_enabled() -> bool:
@@ -300,6 +318,43 @@ def block_for_ext(ext: int, k_cap: int) -> int:
             return fixed
     idx = max(0, min(int(ext), len(_BLOCK_LADDER) - 1))
     return min(_BLOCK_LADDER[idx], max(4, k_cap))
+
+
+class CopyGovernor:
+    """Acceptance EMA, probation and suspend/backoff of a copy lane.
+
+    The same policy the MTP decode loops keep inline: blocks stay at the
+    probation size until two sampled rounds hold the 0.5 starting EMA, an EMA
+    below 0.35 after three rounds suspends copying for ``backoff`` tokens, and
+    the backoff doubles on each suspension (reset to 64 once a round accepts at
+    least half its block).
+    """
+
+    def __init__(self) -> None:
+        self.ema = 0.5
+        self.seen = 0
+        self.suspend_until = 0
+        self.backoff = 64
+        self.suspensions = 0
+
+    def suspended(self, n_tokens: int) -> bool:
+        return n_tokens < self.suspend_until
+
+    def block_cap(self, k: int, probation_k: int) -> int:
+        """Full block cap once proven, the probation cap before that."""
+        return k if (self.seen >= 2 and self.ema >= 0.5) else probation_k
+
+    def record(self, accepted: int, block_len: int, n_tokens: int) -> None:
+        """Fold in one verified block; ``n_tokens`` counts the stream after it."""
+        self.ema = 0.7 * self.ema + 0.3 * (accepted / block_len)
+        self.seen += 1
+        if accepted / block_len >= 0.5:
+            self.backoff = 64
+        if self.seen >= 3 and self.ema < 0.35:
+            self.suspend_until = n_tokens + self.backoff
+            self.backoff = min(self.backoff * 2, 4096)
+            self.ema, self.seen = 0.5, 0
+            self.suspensions += 1
 
 
 def ladder_widths(k_caps) -> frozenset[int]:
