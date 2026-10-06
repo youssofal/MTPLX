@@ -62,6 +62,13 @@ export type MetricsLatest = {
   cache_miss_reason?: string | null;
   session_restore_mode?: string | null;
   session_id?: string | null;
+  // ---- refusal / error (a request the server turned away or failed) ----
+  error_kind?: string | null;
+  error_status?: number | null;
+  error_detail?: string | null;
+  refusal_reason?: string | null;
+  retry_when?: string | null;
+  retry_can_succeed?: boolean | null;
   context_len?: number | null;
   lock_wait_time_s?: number | null;
   // ---- memory ----

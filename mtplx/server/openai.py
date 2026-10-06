@@ -26063,6 +26063,18 @@ def _record_stream_error_metric(
         "session_cache_hit": False,
         "cache_miss_reason": None,
     }
+    # The refusal's own verdict (why, and what would let a retry succeed)
+    # rides the receipt so the dashboard can say more than "507".
+    refusal = (
+        _http_exception_detail_payload(error)
+        if isinstance(error, HTTPException)
+        else None
+    )
+    memory = refusal.get("memory") if isinstance(refusal, dict) else None
+    if isinstance(memory, dict):
+        for key in ("refusal_reason", "retry_when", "retry_can_succeed"):
+            if memory.get(key) is not None:
+                envelope[key] = memory[key]
     if token_times:
         envelope.update(_producer_gap_census(token_times))
     # Allocator truth at failure time — for memory refusals this is the

@@ -1,9 +1,10 @@
-import { useMemo, useState } from "react";
+import { Fragment, useMemo, useState } from "react";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { Card } from "./Card";
 import { useRecentRequests } from "../hooks/usePolling";
 import { fmtNumber, fmtSeconds, fmtTokS, relativeTime, truncateMiddle } from "../lib/utils";
 import { useDashboardStore, useFilteredRecent } from "../state/store";
+import { refusalOf } from "../lib/requestRefusal";
 import type { MetricsLatest } from "../lib/types";
 
 export function RequestLogTable() {
@@ -122,7 +123,7 @@ function Td({
   );
 }
 
-function Row({
+export function Row({
   row,
   isOpen,
   onToggle,
@@ -132,7 +133,13 @@ function Row({
   onToggle: () => void;
 }) {
   const sessionId = row.session_id ?? "—";
-  const cacheBadge = row.session_cache_hit
+  const refusal = refusalOf(row);
+  const cacheBadge = refusal
+    ? {
+        label: refusal.label,
+        color: "text-[var(--accent-hot)] bg-[var(--accent-hot)]/10",
+      }
+    : row.session_cache_hit
     ? { label: "HIT", color: "text-[var(--accent)] bg-[var(--accent)]/10" }
     : {
         label: (row.cache_miss_reason ?? "MISS").toUpperCase(),
@@ -156,12 +163,12 @@ function Row({
         </Td>
         <Td align="right">{fmtNumber(row.prompt_tokens)}</Td>
         <Td align="right">{fmtNumber(row.cached_tokens)}</Td>
-        <Td align="right">{fmtNumber(row.completion_tokens)}</Td>
+        <Td align="right">{refusal ? "—" : fmtNumber(row.completion_tokens)}</Td>
         <Td align="right" highlight>
-          {fmtTokS(row.decode_tok_s)}
+          {refusal ? "—" : fmtTokS(row.decode_tok_s)}
         </Td>
-        <Td align="right">{fmtSeconds(row.ttft_s)}</Td>
-        <Td align="right">{fmtNumber(row.verify_calls)}</Td>
+        <Td align="right">{refusal ? "—" : fmtSeconds(row.ttft_s)}</Td>
+        <Td align="right">{refusal ? "—" : fmtNumber(row.verify_calls)}</Td>
         <Td>
           <span
             className={`px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wider ${cacheBadge.color}`}
@@ -178,6 +185,16 @@ function Row({
       {isOpen ? (
         <tr className="bg-[var(--bg-elevated)]/40">
           <td colSpan={10} className="px-3 py-3">
+            {refusal && refusal.details.length > 0 ? (
+              <dl className="mb-2 text-xs grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1">
+                {refusal.details.map(([name, value]) => (
+                  <Fragment key={name}>
+                    <dt className="text-[var(--text-muted)]">{name}</dt>
+                    <dd className="text-[var(--text-primary)]">{value}</dd>
+                  </Fragment>
+                ))}
+              </dl>
+            ) : null}
             <pre className="text-[11px] leading-relaxed text-[var(--text-muted)] overflow-x-auto max-h-[260px]">
               {JSON.stringify(row, null, 2)}
             </pre>

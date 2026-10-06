@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **The dashboard's request log shows a refused request as a refusal.** A request the server refuses before prefill (a 507 memory refusal, a 503, a 429) used to render as an ordinary row with a "MISS" cache badge and zeros for tokens and speed. It now carries a "507 memory" badge, dashes for the generation columns, and the refusal reason and when a retry can succeed in its details. The request log row gained `refusal_reason`, `retry_when` and `retry_can_succeed` for memory refusals.
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed
