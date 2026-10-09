@@ -6813,6 +6813,38 @@ def restore_or_prefill_prompt_state(
                     )
         except Exception:
             exact_prefix_len = 0
+        # With no exact prefix in RAM, an SSD entry that is a whole prefix of
+        # the prompt (a session the bank spilled) is the exact lane's to
+        # serve: session_bank.restore() reads it back (ssd_clone). The near
+        # lane cannot serve it (it needs matched < prefix_len), so it is the
+        # floor that lane must beat. Without it the near lane hydrated the
+        # spilled entry, refused it, and served a RAM neighbour that shares
+        # only the system prompt: 2026-10-09, a 58,529-token turn restored
+        # 4,019 tokens and re-read the rest (143 s) while its own 57,989
+        # tokens sat on disk, and held the hydrated copy (5.4 GB) through
+        # that prefill.
+        near_restore_floor = exact_prefix_len
+        if exact_prefix_len == 0:
+            try:
+                cold_exact_prefix_len = getattr(
+                    session_bank, "cold_exact_prefix_len", None
+                )
+                if callable(cold_exact_prefix_len):
+                    near_restore_floor = int(
+                        cold_exact_prefix_len(
+                            bank_match_ids,
+                            model_path=str(rt.model_path),
+                            mtp_enabled=bool(rt.mtp_enabled),
+                            hidden_variant=base_hidden_variant,
+                            template_hash=template_hash,
+                            mtp_history_policy=mtp_history_policy,
+                            draft_head_identity=draft_head_identity,
+                            policy_fingerprint=policy_fingerprint,
+                        )
+                        or 0
+                    )
+            except Exception:
+                near_restore_floor = 0
 
         tried_larger_near_prefix = False
         # Image prompts take the near/block-prefix lanes in their content-keyed
@@ -6862,7 +6894,7 @@ def restore_or_prefill_prompt_state(
                 template_hash=template_hash,
                 draft_head_identity=draft_head_identity,
                 policy_fingerprint=policy_fingerprint,
-                min_restore_tokens=exact_prefix_len,
+                min_restore_tokens=near_restore_floor,
                 allow_block_prefix=allow_block_prefix,
                 abort_check=abort_check,
                 chunk_callback=prefill_callback,
