@@ -203,6 +203,10 @@ public enum CacheExplanation {
             return tr("No saved state for this conversation in memory or on the SSD")
         case "ssd_prefix_not_better_than_ram", "ssd_prefix_shadowed_by_resident_duplicate":
             return tr("The copy in memory was as good as the one on the SSD")
+        case "ssd_prefix_boundary_below_floor":
+            // A conversation on the SSD shares the start, but its checkpoint
+            // lies before the point the saved state already reaches.
+            return tr("The copy in memory was as good as the one on the SSD")
         case "ssd_prefix_no_recurrent_boundary":
             // An older conversation on the SSD shares the start, but has no
             // saved checkpoint inside the shared part to resume from.

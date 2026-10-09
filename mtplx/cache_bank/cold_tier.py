@@ -374,6 +374,7 @@ class SessionBankColdTier:
     # the pre-shadow call shape.
     SUPPORTS_RESIDENT_DUPLICATE_SHADOW = True
     SUPPORTS_MIN_USEFUL_MATCHED_TOKENS = True
+    SUPPORTS_MIN_RESTORE_POINT = True
 
     def __init__(
         self,
@@ -1190,7 +1191,14 @@ class SessionBankColdTier:
         allow_block_prefix: bool = True,
         resident_duplicates: dict[str, dict[str, Any]] | None = None,
         min_useful_matched_tokens: int = 0,
+        min_restore_point: int = 0,
     ) -> ColdPrefixRestoreRecord | None:
+        # min_restore_point: the lowest point the caller can restore at. A
+        # hybrid row restores at its newest recurrent boundary at or below
+        # the match, which the row's payload.json gives before any tensor is
+        # read; a row whose boundary lies below this point is refused
+        # undecoded and the next one is tried (see _restore_row).
+        #
         # resident_duplicates: token_hash -> {prefix_len, has_mtp_history}
         # for RAM entries the caller has ALREADY proven identity-compatible
         # with this request, snapshot-capable (never live-ref-only), and
@@ -1316,6 +1324,7 @@ class SessionBankColdTier:
                     require_exact_prefix=False,
                     include_gdn_boundaries=True,
                     prefix_restore_tokens=int(candidate_matched),
+                    min_restore_point=int(min_restore_point),
                 )
                 if record is not None:
                     return ColdPrefixRestoreRecord(
@@ -2716,6 +2725,7 @@ class SessionBankColdTier:
         require_exact_prefix: bool = True,
         include_gdn_boundaries: bool = False,
         prefix_restore_tokens: int | None = None,
+        min_restore_point: int = 0,
     ) -> ColdRestoreRecord | None:
         metadata = dict(row)
         token_ids = tuple(int(token) for token in json.loads(str(metadata["token_ids_json"])))
@@ -2777,6 +2787,18 @@ class SessionBankColdTier:
                     self._inc("prefix_restores_without_boundary")
                     self._set_last_miss("ssd_prefix_no_recurrent_boundary")
                     return None
+            if (
+                has_recurrent
+                and boundary_prefix is not None
+                and boundary_prefix < int(min_restore_point)
+            ):
+                # The restore would land below the lowest point the caller
+                # can use (the near lane's floor: its exact prefix in RAM or
+                # on SSD). The lane refused such a candidate only after this
+                # decode, as boundary_not_better.
+                self._inc("prefix_restores_below_caller_floor")
+                self._set_last_miss("ssd_prefix_boundary_below_floor")
+                return None
             # Cache types whose metadata couples rolling state to their
             # tensors must use the exact decoder plus trim; so does a hybrid
             # entry without a boundary when boundary-true restores are off.

@@ -2136,6 +2136,11 @@ class SessionBank:
             allow_block_prefix=allow_block_prefix,
             resident_duplicates=resident_duplicates,
             min_useful_matched_tokens=ram_best_matched,
+            # A hybrid row's restore lands at its recurrent boundary, below
+            # the match, and no caller uses one below its floor. A boundary
+            # at the floor itself still decodes: the batched lane serves it,
+            # the serial near lane refuses it.
+            min_restore_point=floor,
             model_path=model_path,
             mtp_enabled=mtp_enabled,
             hidden_variant=hidden_variant,
@@ -2200,6 +2205,7 @@ class SessionBank:
         policy_fingerprint: str | None,
         resident_duplicates: dict[str, dict[str, Any]] | None = None,
         min_useful_matched_tokens: int = 0,
+        min_restore_point: int = 0,
     ) -> tuple[SessionBankEntry, int] | None:
         if self.cold_tier is None:
             return None
@@ -2225,6 +2231,10 @@ class SessionBank:
             lookup_kwargs["min_useful_matched_tokens"] = int(
                 min_useful_matched_tokens
             )
+        if min_restore_point > 0 and getattr(
+            self.cold_tier, "SUPPORTS_MIN_RESTORE_POINT", False
+        ):
+            lookup_kwargs["min_restore_point"] = int(min_restore_point)
         result = lookup(
             tokens,
             model_path=model_path,
