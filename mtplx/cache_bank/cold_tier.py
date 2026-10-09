@@ -374,6 +374,7 @@ class SessionBankColdTier:
     # the pre-shadow call shape.
     SUPPORTS_RESIDENT_DUPLICATE_SHADOW = True
     SUPPORTS_MIN_USEFUL_MATCHED_TOKENS = True
+    SUPPORTS_MIN_RESTORE_POINT = True
 
     def __init__(
         self,
@@ -1118,6 +1119,60 @@ class SessionBankColdTier:
         self._set_last_miss("ssd_prefix_miss")
         return None
 
+    def exact_prefix_len(
+        self,
+        token_ids: list[int] | tuple[int, ...],
+        *,
+        model_path: str,
+        mtp_enabled: bool,
+        hidden_variant: str | None = None,
+        template_hash: str | None = None,
+        mtp_history_policy: str | None = None,
+        draft_head_identity: str | None = None,
+        policy_fingerprint: str | None = None,
+    ) -> int:
+        """Length of the longest stored entry that is a whole prefix of
+        ``token_ids``, read from the manifest alone (no tensor is read).
+
+        The rows are the ones ``lookup`` would try, under the row gates
+        ``_restore_row`` applies before it reads a tensor. A probe, not a
+        lookup: no counter and no miss reason change.
+        """
+        if self.mode in {"off", "write-only"}:
+            return 0
+        tokens = tuple(int(token) for token in token_ids)
+        if not tokens:
+            return 0
+        try:
+            rows = self._candidate_rows(
+                tokens,
+                model_path=model_path,
+                mtp_enabled=mtp_enabled,
+                hidden_variant=hidden_variant,
+                template_hash=template_hash,
+                mtp_history_policy=mtp_history_policy,
+                draft_head_identity=draft_head_identity,
+                policy_fingerprint=policy_fingerprint,
+            )
+            for row in rows:
+                if int(row["format_version"]) != COLD_TIER_FORMAT_VERSION:
+                    continue
+                epoch = row["mtp_snapshot_epoch"]
+                if epoch is not None and int(epoch) != int(row["snapshot_epoch"]):
+                    continue
+                prefix = tuple(
+                    int(token) for token in json.loads(str(row["token_ids_json"]))
+                )
+                if prefix and tokens[: len(prefix)] == prefix:
+                    return len(prefix)
+        except Exception as exc:
+            logger.warning(
+                "SessionBank SSD exact-prefix probe failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+        return 0
+
     def lookup_prefix_boundary(
         self,
         token_ids: list[int] | tuple[int, ...],
@@ -1136,7 +1191,14 @@ class SessionBankColdTier:
         allow_block_prefix: bool = True,
         resident_duplicates: dict[str, dict[str, Any]] | None = None,
         min_useful_matched_tokens: int = 0,
+        min_restore_point: int = 0,
     ) -> ColdPrefixRestoreRecord | None:
+        # min_restore_point: the lowest point the caller can restore at. A
+        # hybrid row restores at its newest recurrent boundary at or below
+        # the match, which the row's payload.json gives before any tensor is
+        # read; a row whose boundary lies below this point is refused
+        # undecoded and the next one is tried (see _restore_row).
+        #
         # resident_duplicates: token_hash -> {prefix_len, has_mtp_history}
         # for RAM entries the caller has ALREADY proven identity-compatible
         # with this request, snapshot-capable (never live-ref-only), and
@@ -1262,6 +1324,7 @@ class SessionBankColdTier:
                     require_exact_prefix=False,
                     include_gdn_boundaries=True,
                     prefix_restore_tokens=int(candidate_matched),
+                    min_restore_point=int(min_restore_point),
                 )
                 if record is not None:
                     return ColdPrefixRestoreRecord(
@@ -2662,6 +2725,7 @@ class SessionBankColdTier:
         require_exact_prefix: bool = True,
         include_gdn_boundaries: bool = False,
         prefix_restore_tokens: int | None = None,
+        min_restore_point: int = 0,
     ) -> ColdRestoreRecord | None:
         metadata = dict(row)
         token_ids = tuple(int(token) for token in json.loads(str(metadata["token_ids_json"])))
@@ -2723,6 +2787,18 @@ class SessionBankColdTier:
                     self._inc("prefix_restores_without_boundary")
                     self._set_last_miss("ssd_prefix_no_recurrent_boundary")
                     return None
+            if (
+                has_recurrent
+                and boundary_prefix is not None
+                and boundary_prefix < int(min_restore_point)
+            ):
+                # The restore would land below the lowest point the caller
+                # can use (the near lane's floor: its exact prefix in RAM or
+                # on SSD). The lane refused such a candidate only after this
+                # decode, as boundary_not_better.
+                self._inc("prefix_restores_below_caller_floor")
+                self._set_last_miss("ssd_prefix_boundary_below_floor")
+                return None
             # Cache types whose metadata couples rolling state to their
             # tensors must use the exact decoder plus trim; so does a hybrid
             # entry without a boundary when boundary-true restores are off.

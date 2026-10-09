@@ -5106,22 +5106,32 @@ def _restore_near_prefix_prompt_state(
     _candidates_kwargs: dict[str, Any] = {}
     if getattr(session_bank, "SUPPORTS_NEAR_PREFIX_MIN_RESTORE", False):
         _candidates_kwargs["min_restore_tokens"] = int(min_restore_tokens)
-    for entry, matched in candidates(
-        match_ids if image_keyed else prompt_ids,
-        max_token_gap=max_gap,
-        min_matched_tokens=min_match,
-        **_candidates_kwargs,
-        block_size=block_size,
-        block_min_matched_tokens=block_min_match,
-        allow_block_prefix=block_prefix_enabled,
-        model_path=str(rt.model_path),
-        mtp_enabled=bool(rt.mtp_enabled),
-        hidden_variant=base_hidden_variant,
-        template_hash=template_hash,
-        mtp_history_policy=mtp_history_policy,
-        draft_head_identity=draft_head_identity,
-        policy_fingerprint=policy_fingerprint,
-    ):
+    # Taken off the list as each one is tried, so a refused candidate is not
+    # held while a later one's suffix prefill runs: the cold tier decodes its
+    # best row into a candidate before this lane can refuse it (5.4 GB on
+    # 2026-10-09, refused as a whole prefix, held through a 54K-token prefill
+    # that the memory guard then stopped). The untried rest go before that
+    # prefill too.
+    pending = list(
+        candidates(
+            match_ids if image_keyed else prompt_ids,
+            max_token_gap=max_gap,
+            min_matched_tokens=min_match,
+            **_candidates_kwargs,
+            block_size=block_size,
+            block_min_matched_tokens=block_min_match,
+            allow_block_prefix=block_prefix_enabled,
+            model_path=str(rt.model_path),
+            mtp_enabled=bool(rt.mtp_enabled),
+            hidden_variant=base_hidden_variant,
+            template_hash=template_hash,
+            mtp_history_policy=mtp_history_policy,
+            draft_head_identity=draft_head_identity,
+            policy_fingerprint=policy_fingerprint,
+        )
+    )
+    while pending:
+        entry, matched = pending.pop(0)
         _check_postcommit_abort(abort_check)
         candidates_seen += 1
         matched = int(matched)
@@ -5485,6 +5495,15 @@ def _restore_near_prefix_prompt_state(
                 vision_splice.cursor = sum(
                     1 for token in prompt_ids[:restore_point] if token == pad_id
                 )
+            # This candidate is served: no later one will be tried.
+            pending.clear()
+            # A candidate the SSD tier decoded is this request's own copy, and
+            # its state now sits in ``cache`` (the restore cloned it up to the
+            # restore point): let it go so the suffix prefill does not run next
+            # to a second copy. A RAM entry stays with the bank, which keeps
+            # its hits.
+            banked = None if ssd_cache_hit else entry
+            entry = None
             suffix_logits, suffix_hidden, suffix_time, mtp_history_time = (
                 _prefill_restored_prompt_suffix(
                     rt,
@@ -5507,8 +5526,9 @@ def _restore_near_prefix_prompt_state(
                     plan_ids=prompt_ids,
                 )
             )
-            entry.hits += 1
-            entry.last_access_s = time.time()
+            if banked is not None:
+                banked.hits += 1
+                banked.last_access_s = time.time()
             served = True
             return PromptState(
                 trunk_cache=cache,
@@ -6813,6 +6833,38 @@ def restore_or_prefill_prompt_state(
                     )
         except Exception:
             exact_prefix_len = 0
+        # With no exact prefix in RAM, an SSD entry that is a whole prefix of
+        # the prompt (a session the bank spilled) is the exact lane's to
+        # serve: session_bank.restore() reads it back (ssd_clone). The near
+        # lane cannot serve it (it needs matched < prefix_len), so it is the
+        # floor that lane must beat. Without it the near lane hydrated the
+        # spilled entry, refused it, and served a RAM neighbour that shares
+        # only the system prompt: 2026-10-09, a 58,529-token turn restored
+        # 4,019 tokens and re-read the rest (143 s) while its own 57,989
+        # tokens sat on disk, and held the hydrated copy (5.4 GB) through
+        # that prefill.
+        near_restore_floor = exact_prefix_len
+        if exact_prefix_len == 0:
+            try:
+                cold_exact_prefix_len = getattr(
+                    session_bank, "cold_exact_prefix_len", None
+                )
+                if callable(cold_exact_prefix_len):
+                    near_restore_floor = int(
+                        cold_exact_prefix_len(
+                            bank_match_ids,
+                            model_path=str(rt.model_path),
+                            mtp_enabled=bool(rt.mtp_enabled),
+                            hidden_variant=base_hidden_variant,
+                            template_hash=template_hash,
+                            mtp_history_policy=mtp_history_policy,
+                            draft_head_identity=draft_head_identity,
+                            policy_fingerprint=policy_fingerprint,
+                        )
+                        or 0
+                    )
+            except Exception:
+                near_restore_floor = 0
 
         tried_larger_near_prefix = False
         # Image prompts take the near/block-prefix lanes in their content-keyed
@@ -6862,7 +6914,7 @@ def restore_or_prefill_prompt_state(
                 template_hash=template_hash,
                 draft_head_identity=draft_head_identity,
                 policy_fingerprint=policy_fingerprint,
-                min_restore_tokens=exact_prefix_len,
+                min_restore_tokens=near_restore_floor,
                 allow_block_prefix=allow_block_prefix,
                 abort_check=abort_check,
                 chunk_callback=prefill_callback,

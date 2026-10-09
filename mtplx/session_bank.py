@@ -1913,6 +1913,37 @@ class SessionBank:
                 best = entry
         return best
 
+    def cold_exact_prefix_len(
+        self,
+        token_ids: list[int] | tuple[int, ...],
+        *,
+        model_path: str,
+        mtp_enabled: bool,
+        hidden_variant: str | None = None,
+        template_hash: str | None = None,
+        mtp_history_policy: str | None = None,
+        draft_head_identity: str | None = None,
+        policy_fingerprint: str | None = None,
+    ) -> int:
+        """Longest SSD entry that is a whole prefix of ``token_ids`` (0 when
+        none, or without a cold tier). Manifest only: nothing is hydrated."""
+        probe = getattr(self.cold_tier, "exact_prefix_len", None)
+        if not callable(probe):
+            return 0
+        return int(
+            probe(
+                token_ids,
+                model_path=model_path,
+                mtp_enabled=mtp_enabled,
+                hidden_variant=hidden_variant,
+                template_hash=template_hash,
+                mtp_history_policy=mtp_history_policy,
+                draft_head_identity=draft_head_identity,
+                policy_fingerprint=policy_fingerprint,
+            )
+            or 0
+        )
+
     def near_prefix_candidates(
         self,
         token_ids: list[int] | tuple[int, ...],
@@ -2105,6 +2136,11 @@ class SessionBank:
             allow_block_prefix=allow_block_prefix,
             resident_duplicates=resident_duplicates,
             min_useful_matched_tokens=ram_best_matched,
+            # A hybrid row's restore lands at its recurrent boundary, below
+            # the match, and no caller uses one below its floor. A boundary
+            # at the floor itself still decodes: the batched lane serves it,
+            # the serial near lane refuses it.
+            min_restore_point=floor,
             model_path=model_path,
             mtp_enabled=mtp_enabled,
             hidden_variant=hidden_variant,
@@ -2169,6 +2205,7 @@ class SessionBank:
         policy_fingerprint: str | None,
         resident_duplicates: dict[str, dict[str, Any]] | None = None,
         min_useful_matched_tokens: int = 0,
+        min_restore_point: int = 0,
     ) -> tuple[SessionBankEntry, int] | None:
         if self.cold_tier is None:
             return None
@@ -2194,6 +2231,10 @@ class SessionBank:
             lookup_kwargs["min_useful_matched_tokens"] = int(
                 min_useful_matched_tokens
             )
+        if min_restore_point > 0 and getattr(
+            self.cold_tier, "SUPPORTS_MIN_RESTORE_POINT", False
+        ):
+            lookup_kwargs["min_restore_point"] = int(min_restore_point)
         result = lookup(
             tokens,
             model_path=model_path,
