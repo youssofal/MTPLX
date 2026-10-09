@@ -2361,6 +2361,8 @@ class SessionBank:
                 draft_head_identity=draft_head_identity,
                 policy_fingerprint=policy_fingerprint,
                 ram_refusal=ram_refusal,
+                cache_factory=cache_factory,
+                mtp_cache_factory=mtp_cache_factory,
             )
 
         entry = self.longest_prefix(token_ids)
@@ -3419,7 +3421,12 @@ class SessionBank:
         draft_head_identity: str | None,
         policy_fingerprint: str | None,
         ram_refusal: dict[str, Any] | None = None,
+        cache_factory: Callable[[], list[Any]] | None = None,
+        mtp_cache_factory: Callable[[], list[Any]] | None = None,
     ) -> SessionBankRestore | None:
+        # cache_factory / mtp_cache_factory: the request's cache layout, the same
+        # factories restore() hands to its RAM restore.
+        #
         # ram_refusal: restore() refused this lookup's longest RAM prefix
         # (ram_miss_reason, ram_refused_prefix_len, ram_refused_session_id).
         # It stays in the diagnostic whatever this lookup finds.
@@ -3519,14 +3526,28 @@ class SessionBank:
         ):
             self.last_miss_reason = CacheMissReason.SNAPSHOT_DESYNC.value
             return None
-        cache = runtime.make_cache()
-        restore_cache(cache, entry.cache_snapshot)
+        # The request's cache layout, exactly as a RAM restore builds it (restore() above).
+        # runtime.make_cache() is the default layout, which for a long context is the paged
+        # KV cache: about 5x slower prefill and slower decode than the dense cache the request
+        # asked for (Qwen3.8 27B, 2026-10-08: first token after an SSD restore at 50K and 80K
+        # 16 to 48 s with the default layout, 5 to 8 s with the request's). As in the RAM
+        # restore, the stored meta state is not imposed on the request's cache.
+        cache = cache_factory() if cache_factory is not None else runtime.make_cache()
+        restore_cache(
+            cache,
+            entry.cache_snapshot,
+            restore_meta_state=cache_factory is None,
+        )
         # Read back from disk, the entry's floor is its restored caches'.
         entry.restore_floor_tokens = _cache_restore_floor(cache)
         entry.window_nbytes = _cache_window_nbytes(cache)
         mtp_history_cache = None
         if entry.mtp_history_snapshot is not None:
-            mtp_history_cache = runtime.make_mtp_cache()
+            mtp_history_cache = (
+                mtp_cache_factory()
+                if mtp_cache_factory is not None
+                else runtime.make_mtp_cache()
+            )
             restore_cache(mtp_history_cache, entry.mtp_history_snapshot)
         entry.hits += 1
         entry.last_access_s = time.time()
