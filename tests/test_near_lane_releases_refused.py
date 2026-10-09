@@ -151,6 +151,55 @@ def test_a_refused_ssd_candidate_is_released_before_the_served_prefill(
         cold.close()
 
 
+def test_a_served_ssd_candidate_is_released_before_its_suffix_prefill(
+    tmp_path, monkeypatch
+):
+    """A's spilled entry is served at the point A's next turn leaves it. The
+    restore copied its state into the new cache, so the decoded candidate
+    must not be held next to that copy while the suffix is read."""
+    monkeypatch.setenv("MTPLX_SESSION_PREFIX_BLOCK_SIZE", "8")
+    monkeypatch.setenv("MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS", "8")
+    monkeypatch.setenv("MTPLX_SESSION_NEAR_PREFIX_MIN_MATCH_TOKENS", "4")
+    model = _WatchingModel()
+    rt = _runtime(model)
+    cold = SessionBankColdTier(
+        base_dir=tmp_path / "session-bank", mode="on", min_prefix_tokens=2
+    )
+    try:
+        bank = SessionBank(
+            max_entries=8, max_bytes=4096, per_session_max_bytes=4096, cold_tier=cold
+        )
+        assert _put(bank, rt, SPILLED, "a") is not None
+        assert cold.flush(timeout_s=5.0) is True
+        bank.clear()
+
+        decoded: list[weakref.ref] = []
+        original = bank._cold_near_prefix_candidate
+
+        def watch(*args, **kwargs):
+            found = original(*args, **kwargs)
+            if found is not None:
+                decoded.append(weakref.ref(found[0]))
+                model.watched.append(decoded[-1])
+            return found
+
+        monkeypatch.setattr(bank, "_cold_near_prefix_candidate", watch)
+        prompt = SPILLED[:32] + [80 + i for i in range(12)]
+        state = _near(rt, prompt, bank, session_id="a")
+
+        assert len(decoded) == 1, "the cold tier decoded A's entry"
+        assert state is not None and state.ssd_cache_hit
+        assert state.cached_tokens == 32
+        assert state.suffix_tokens == len(prompt) - 32
+        # The seed forward runs on the restored cache; the suffix forwards
+        # after it run without the decoded candidate.
+        assert len(model.alive_per_forward) >= 2
+        assert model.alive_per_forward[0] == [True]
+        assert all(alive == [False] for alive in model.alive_per_forward[1:])
+    finally:
+        cold.close()
+
+
 class _Candidate:
     """A bank entry as far as the lane's gates read it."""
 
@@ -218,6 +267,8 @@ def test_refused_and_untried_candidates_go_before_the_served_prefill():
     assert model.alive_per_forward
     assert model.alive_per_forward[-1] == [False, False, False]
     assert served_ref() is not None
+    # A RAM entry stays with the bank, which counts the hit.
+    assert served_ref().hits == 1
 
 
 def test_with_no_candidate_served_the_lane_still_reports_the_first_refusal():

@@ -5497,6 +5497,13 @@ def _restore_near_prefix_prompt_state(
                 )
             # This candidate is served: no later one will be tried.
             pending.clear()
+            # A candidate the SSD tier decoded is this request's own copy, and
+            # its state now sits in ``cache`` (the restore cloned it up to the
+            # restore point): let it go so the suffix prefill does not run next
+            # to a second copy. A RAM entry stays with the bank, which keeps
+            # its hits.
+            banked = None if ssd_cache_hit else entry
+            entry = None
             suffix_logits, suffix_hidden, suffix_time, mtp_history_time = (
                 _prefill_restored_prompt_suffix(
                     rt,
@@ -5519,8 +5526,9 @@ def _restore_near_prefix_prompt_state(
                     plan_ids=prompt_ids,
                 )
             )
-            entry.hits += 1
-            entry.last_access_s = time.time()
+            if banked is not None:
+                banked.hits += 1
+                banked.last_access_s = time.time()
             served = True
             return PromptState(
                 trunk_cache=cache,
