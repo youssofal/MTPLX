@@ -106,6 +106,7 @@ from .graphbank import (
     stamp_rope_delta,
 )
 from .native_mlp import set_native_mlp_context
+from .prefill_rungs import draft_history_scope
 from .one_copy import (
     hand_back_on_raise,
     held_qsa_rows,
@@ -8896,7 +8897,7 @@ def _append_mtp_history(
             mtp_cache if mtp_cache is not None else (),
             window_tokens=len(token_ids),
         )
-    with attention_phase(phase):
+    with attention_phase(phase), draft_history_scope():
         hidden = rt.update_mtp_cache(
             hidden_states,
             mx.array([token_ids]),
