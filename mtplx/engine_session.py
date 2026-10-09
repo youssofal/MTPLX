@@ -2062,6 +2062,11 @@ class EngineSessionManager:
             # on-wire prompt shrank at r4/r8/r9 and prefix identity churned).
             "x-session-affinity",
             "x-session-id",
+            # Claude Code (CLI and Agent SDK) stamps every /v1/messages
+            # request with its session id; without it a Claude Code agent is
+            # found by prompt inference only, which loses the session when
+            # the agent compacts its history.
+            "x-claude-code-session-id",
             "x-openwebui-chat-id",
             "x-openwebui-user-id",
         ):
