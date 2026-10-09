@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **A conversation restored from the SSD tier gets the cache layout the request asked for**, the same one a restore from memory gets. The SSD restore built the runtime's default layout, which for a long context is the paged KV cache (`VllmMetalPagedKVCache`) instead of the dense cache: about 5x slower prefill and slower decode after every restore from disk. Measured on Qwen3.8 27B (with the segmented KV cache of a later change, which had the same omission), the first token after a restore from SSD at 50K and 80K came after 5 to 8 s instead of 16 to 48 s and decode went from 14 to 18 to 25 to 30 tok/s; a run without segments showed the same 14 to 17 tok/s after its SSD restore.
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed
