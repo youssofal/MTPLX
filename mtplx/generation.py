@@ -5106,22 +5106,32 @@ def _restore_near_prefix_prompt_state(
     _candidates_kwargs: dict[str, Any] = {}
     if getattr(session_bank, "SUPPORTS_NEAR_PREFIX_MIN_RESTORE", False):
         _candidates_kwargs["min_restore_tokens"] = int(min_restore_tokens)
-    for entry, matched in candidates(
-        match_ids if image_keyed else prompt_ids,
-        max_token_gap=max_gap,
-        min_matched_tokens=min_match,
-        **_candidates_kwargs,
-        block_size=block_size,
-        block_min_matched_tokens=block_min_match,
-        allow_block_prefix=block_prefix_enabled,
-        model_path=str(rt.model_path),
-        mtp_enabled=bool(rt.mtp_enabled),
-        hidden_variant=base_hidden_variant,
-        template_hash=template_hash,
-        mtp_history_policy=mtp_history_policy,
-        draft_head_identity=draft_head_identity,
-        policy_fingerprint=policy_fingerprint,
-    ):
+    # Taken off the list as each one is tried, so a refused candidate is not
+    # held while a later one's suffix prefill runs: the cold tier decodes its
+    # best row into a candidate before this lane can refuse it (5.4 GB on
+    # 2026-10-09, refused as a whole prefix, held through a 54K-token prefill
+    # that the memory guard then stopped). The untried rest go before that
+    # prefill too.
+    pending = list(
+        candidates(
+            match_ids if image_keyed else prompt_ids,
+            max_token_gap=max_gap,
+            min_matched_tokens=min_match,
+            **_candidates_kwargs,
+            block_size=block_size,
+            block_min_matched_tokens=block_min_match,
+            allow_block_prefix=block_prefix_enabled,
+            model_path=str(rt.model_path),
+            mtp_enabled=bool(rt.mtp_enabled),
+            hidden_variant=base_hidden_variant,
+            template_hash=template_hash,
+            mtp_history_policy=mtp_history_policy,
+            draft_head_identity=draft_head_identity,
+            policy_fingerprint=policy_fingerprint,
+        )
+    )
+    while pending:
+        entry, matched = pending.pop(0)
         _check_postcommit_abort(abort_check)
         candidates_seen += 1
         matched = int(matched)
@@ -5485,6 +5495,8 @@ def _restore_near_prefix_prompt_state(
                 vision_splice.cursor = sum(
                     1 for token in prompt_ids[:restore_point] if token == pad_id
                 )
+            # This candidate is served: no later one will be tried.
+            pending.clear()
             suffix_logits, suffix_hidden, suffix_time, mtp_history_time = (
                 _prefill_restored_prompt_suffix(
                     rt,
