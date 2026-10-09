@@ -153,6 +153,19 @@ class RequestClock:
                 self._marks.pop("discarded_attempt", None)
                 self._marks["discarded_attempt"] = stamp
 
+    def scheduler_queue_wait_s(self) -> float | None:
+        """Time this attempt waited between dispatch and the owner thread
+        taking it (the ``scheduler_queue`` span), or None before that mark."""
+
+        with self._lock:
+            end = self._marks.get("scheduler_queue")
+            start = self._attempt_anchor_s
+            if start is None:
+                start = self._marks.get("dispatch")
+        if end is None or start is None:
+            return None
+        return max(0.0, end - start)
+
     @property
     def attempts(self) -> int:
         with self._lock:

@@ -31083,6 +31083,10 @@ def _run_generation(
     ttft_clock = request_spans.clock_from_observability(request_observability)
     if ttft_clock is not None:
         ttft_clock.mark("scheduler_queue")
+        # The serial scheduler queues a request before this function runs, so
+        # the generation lock below is uncontended. Report that queue time as
+        # lock wait, as the batched lanes already do with queue_wait_s.
+        lock_wait_time_s = ttft_clock.scheduler_queue_wait_s() or 0.0
         _owner = getattr(state, "model_scheduler", None)
         _receipt = (
             _owner.active_item_receipt()

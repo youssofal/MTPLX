@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`lock_wait_time_s` reports the serial scheduler's queue wait.** A request that queued behind another generation read 0 here, because the generation lock it takes afterwards is uncontended. It now carries the `scheduler_queue` span of the request's TTFT breakdown, as the batched lanes already report their queue wait.
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed
