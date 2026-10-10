@@ -45,7 +45,7 @@ jobs:
       - run: python -m build
       - run: python -m twine check dist/*
       - run: scripts/fresh_venv_smoke.sh
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: dist
           path: dist/*
