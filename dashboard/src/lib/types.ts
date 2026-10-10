@@ -15,6 +15,10 @@ export type MetricsLatest = {
   prompt_eval_time_s?: number | null;
   decode_elapsed_s?: number | null;
   ttft_s?: number | null;
+  // Where the time to first token went, span by span (request_spans.py).
+  ttft_spans?: {
+    exclusive_s?: Record<string, number | null> | null;
+  } | null;
   // ---- rates ----
   tok_s?: number | null;
   decode_tok_s?: number | null;
