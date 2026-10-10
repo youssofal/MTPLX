@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **The waits before a request's own work are visible in the flight log and on the dashboard.** The flight `end` event carries `response_tail_wait_s`, `postcommit_wait_s`, `scheduler_queue_s` and `lock_wait_s` from the TTFT breakdown; `begin` is written after the first two, so a request that waited minutes for the session's previous turn to commit looked like a request that started late. The dashboard's request log adds a wait column with their sum, split per wait on hover.
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed

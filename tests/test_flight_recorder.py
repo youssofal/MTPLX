@@ -106,6 +106,49 @@ def test_normal_end_keeps_text_off_disk_in_abnormal_mode(tmp_path):
     assert events[-1]["reason"] == "stop" and events[-1]["cancelled"] is False
 
 
+def test_end_carries_the_waits_before_the_request_ran(tmp_path):
+    """begin is written after the wait for the previous turn's commit, so the
+    end event carries every wait span of the TTFT breakdown."""
+    path = str(tmp_path / "flight-9994.jsonl")
+    recorder = FlightRecorder(path, text_mode="off")
+    recorder.begin("w", session_id="ses_w", model=None, prompt_tokens=9, stream=True)
+    recorder.end(
+        "w",
+        {
+            "request_id": "w",
+            "ttft_s": 140.2,
+            "ttft_spans": {
+                "exclusive_s": {
+                    "encode_s": 0.01,
+                    "response_tail_wait_s": 135.0004,
+                    "postcommit_wait_s": 0.002,
+                    "scheduler_queue_s": 4.5,
+                    "lock_wait_s": 0.1,
+                    "engine_first_token_s": 0.6,
+                }
+            },
+        },
+    )
+    end = _wait_for_writer(path, ["begin", "end"])[-1]
+    assert end["response_tail_wait_s"] == 135.0
+    assert end["postcommit_wait_s"] == 0.002
+    assert end["scheduler_queue_s"] == 4.5
+    assert end["lock_wait_s"] == 0.1
+    assert "encode_s" not in end and "engine_first_token_s" not in end
+
+
+def test_end_without_spans_adds_no_wait_fields(tmp_path):
+    path = str(tmp_path / "flight-9993.jsonl")
+    recorder = FlightRecorder(path, text_mode="off")
+    recorder.begin("n", session_id=None, model=None, prompt_tokens=1, stream=False)
+    recorder.end(
+        "n",
+        {"request_id": "n", "ttft_spans": {"exclusive_s": {"scheduler_queue_s": None}}},
+    )
+    end = _wait_for_writer(path, ["begin", "end"])[-1]
+    assert not any(key.endswith("_wait_s") or key == "scheduler_queue_s" for key in end)
+
+
 def test_sweep_writes_orphan_end_once(tmp_path):
     path = str(tmp_path / "flight-9997.jsonl")
     recorder = FlightRecorder(path, text_mode="off")
@@ -198,10 +241,12 @@ def test_receipt_sink_emits_flight_end(tmp_path):
             "completion_tokens": 3,
             "cached_tokens": 5,
             "finish_reason": "stop",
+            "ttft_spans": {"exclusive_s": {"response_tail_wait_s": 12.5}},
         },
     )
     events = _wait_for_writer(path, ["begin", "end"])
     assert events[-1]["completion_tokens"] == 3 and events[-1]["cached_tokens"] == 5
+    assert events[-1]["response_tail_wait_s"] == 12.5
     assert state.flight.snapshot()["active"] == []
 
 

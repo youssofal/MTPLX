@@ -3,6 +3,7 @@ import { ChevronDown, ChevronRight } from "lucide-react";
 import { Card } from "./Card";
 import { useRecentRequests } from "../hooks/usePolling";
 import { fmtNumber, fmtSeconds, fmtTokS, relativeTime, truncateMiddle } from "../lib/utils";
+import { requestWait } from "../lib/requestWait";
 import { useDashboardStore, useFilteredRecent } from "../state/store";
 import type { MetricsLatest } from "../lib/types";
 
@@ -49,6 +50,7 @@ export function RequestLogTable() {
                 <Th align="right">gen</Th>
                 <Th align="right">tok/s</Th>
                 <Th align="right">ttft</Th>
+                <Th align="right">wait</Th>
                 <Th align="right">verify</Th>
                 <Th>cache</Th>
                 <Th align="right">when</Th>
@@ -138,6 +140,12 @@ function Row({
         label: (row.cache_miss_reason ?? "MISS").toUpperCase(),
         color: "text-[var(--accent-warm)] bg-[var(--accent-warm)]/10",
       };
+  const wait = requestWait(row);
+  const waitTitle = wait
+    ? wait.parts.length > 0
+      ? wait.parts.map((part) => `${part.label}: ${fmtSeconds(part.seconds)}`).join("\n")
+      : "no wait before the work started"
+    : undefined;
   return (
     <>
       <tr className="border-t border-[var(--border-soft)] hover:bg-[var(--bg-elevated)]/60">
@@ -161,6 +169,9 @@ function Row({
           {fmtTokS(row.decode_tok_s)}
         </Td>
         <Td align="right">{fmtSeconds(row.ttft_s)}</Td>
+        <Td align="right">
+          <span title={waitTitle}>{fmtSeconds(wait?.total_s)}</span>
+        </Td>
         <Td align="right">{fmtNumber(row.verify_calls)}</Td>
         <Td>
           <span
@@ -177,7 +188,7 @@ function Row({
       </tr>
       {isOpen ? (
         <tr className="bg-[var(--bg-elevated)]/40">
-          <td colSpan={10} className="px-3 py-3">
+          <td colSpan={11} className="px-3 py-3">
             <pre className="text-[11px] leading-relaxed text-[var(--text-muted)] overflow-x-auto max-h-[260px]">
               {JSON.stringify(row, null, 2)}
             </pre>
