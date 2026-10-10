@@ -479,6 +479,8 @@ class _Bank:
         protect_keys=None,
         protect_session_ids=None,
         cancel_queued_persistence=True,
+        protect_unwritten=False,
+        receipt_out=None,
     ):
         self.shrink_calls.append((int(target_bytes), reason, protect_active))
         evicted = 1 if self.nbytes > int(target_bytes) else 0
@@ -690,7 +692,14 @@ class _LoopBank:
         self.calls = []
 
     def shrink_to_bytes(
-        self, target, *, reason, protect_active=False, protect_session_ids=None
+        self,
+        target,
+        *,
+        reason,
+        protect_active=False,
+        protect_session_ids=None,
+        protect_unwritten=False,
+        receipt_out=None,
     ):
         # The real bank's keywords: the trim names the sessions generating.
         self.calls.append((target, reason))

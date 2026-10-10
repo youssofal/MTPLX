@@ -2461,6 +2461,7 @@ class EngineSessionManager:
         protect_tokens: list[int] | tuple[int, ...] | None = None,
         restore_identity: dict[str, Any] | None = None,
         reason: str = "idle_session_release",
+        write_out_before_release: bool = False,
     ) -> dict[str, Any]:
         """Give back the memory of conversations that are not generating.
 
@@ -2484,6 +2485,9 @@ class EngineSessionManager:
         the committed tokens serve canonicalization, token-splice recovery
         and turn boundaries when the conversation comes back, and the
         admission estimate reads the bank's coverage, not the record.
+        ``write_out_before_release`` writes a released conversation's newest
+        state to the SSD cache first when its own write is still queued
+        (``SessionBank.release_sessions``).
         """
 
         kept = {str(session_id) for session_id in (keep_session_ids or ()) if session_id}
@@ -2516,6 +2520,7 @@ class EngineSessionManager:
                 restore_identity=restore_identity,
                 hold_session=hold,
                 reason=reason,
+                write_out_before_release=write_out_before_release,
             )
         except QueuedPersistenceCancelError as exc:
             # The release happened; a queued job it could not cancel still
