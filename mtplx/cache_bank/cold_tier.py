@@ -1297,7 +1297,7 @@ class SessionBankColdTier:
         row_has_mtp = "mtp_full" in row_caps or row["mtp_snapshot_epoch"] is not None
         return (not row_has_mtp) or bool(dup.get("has_mtp_history"))
 
-    def _manifest_stats_row(self) -> tuple[int, int, int, int, int]:
+    def _manifest_stats_row(self) -> tuple[Any, ...]:
         """The stats() aggregate, opening the manifest only when it changed.
 
         Before 2.8.2 every stats() call — i.e. every /health and dashboard
@@ -1327,7 +1327,11 @@ class SessionBankColdTier:
                 "COALESCE(SUM(CASE WHEN physical_nbytes > 0 "
                 "THEN physical_nbytes ELSE nbytes END), 0), "
                 "COALESCE(SUM(deduped_nbytes), 0), "
-                "COALESCE(MAX(max(nbytes, logical_nbytes)), 0) FROM entries"
+                "COALESCE(MAX(max(nbytes, logical_nbytes)), 0), "
+                "COUNT(DISTINCT session_id), "
+                "COALESCE(SUM(CASE WHEN session_id IS NULL THEN 1 ELSE 0 END), 0), "
+                "MIN(created_at_s), MAX(created_at_s), "
+                "COALESCE(SUM(CASE WHEN hits = 0 THEN 1 ELSE 0 END), 0) FROM entries"
             ).fetchone()
         row = (
             int(fetched[0]),
@@ -1335,6 +1339,11 @@ class SessionBankColdTier:
             int(fetched[2]),
             int(fetched[3]),
             int(fetched[4]),
+            int(fetched[5]),
+            int(fetched[6]),
+            None if fetched[7] is None else float(fetched[7]),
+            None if fetched[8] is None else float(fetched[8]),
+            int(fetched[9]),
         )
         with self._manifest_stats_lock:
             self._manifest_stats_cache = {
@@ -1373,6 +1382,15 @@ class SessionBankColdTier:
             stats["deduped_bytes"] = int(row[3])
             logical = max(1, int(row[1]))
             stats["dedupe_ratio"] = max(0.0, float(row[3]) / float(logical))
+            # What the store holds, for the dashboard's cache overview: how
+            # many conversations the snapshots belong to (rows written
+            # without a session id are counted apart), how old the oldest
+            # and newest snapshot are, and how many were never restored.
+            stats["sessions"] = int(row[5])
+            stats["entries_without_session"] = int(row[6])
+            stats["oldest_created_at_s"] = row[7]
+            stats["newest_created_at_s"] = row[8]
+            stats["never_restored_entries"] = int(row[9])
             usage = self._managed_disk_usage()
             managed_file_bytes = int(usage.get("managed_file_bytes", 0))
             managed_disk_bytes = int(usage.get("managed_disk_bytes", 0))

@@ -156,12 +156,41 @@ export type EvictionEntry = {
   when_s: number;
 };
 
+// `SessionBankColdTier.stats()`, nested in the bank as `cold_tier` (and served
+// alone at /admin/cache/ssd). Only the fields the dashboard reads.
+export type ColdTierStats = {
+  enabled: boolean;
+  max_bytes?: number;
+  effective_max_bytes?: number;
+  entries?: number;
+  bytes?: number;
+  physical_bytes?: number;
+  logical_bytes?: number;
+  dedupe_ratio?: number;
+  sessions?: number;
+  entries_without_session?: number;
+  oldest_created_at_s?: number | null;
+  newest_created_at_s?: number | null;
+  never_restored_entries?: number;
+  writer_queue_depth?: number;
+  writer_backlog_bytes?: number;
+  restore_hits?: number;
+  restore_misses?: number;
+  restore_failures?: number;
+  entries_evicted?: number;
+};
+
 export type SessionBank = {
   max_entries: number;
+  max_bytes?: number | null;
+  effective_max_bytes?: number | null;
+  idle_ttl_s?: number | null;
+  entries?: number;
   total_nbytes: number;
   last_miss_reason: string | null;
   prefixes: SessionBankPrefix[];
   eviction_log: EvictionEntry[];
+  cold_tier?: ColdTierStats;
 };
 
 export type SessionRow = {
