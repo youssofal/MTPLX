@@ -10373,7 +10373,7 @@ def cmd_serve_public(args: Any) -> int:
             try:
                 return _run_server_child_with_app_parent_watchdog(
                     cmd,
-                    env=child_env,
+                    env=_with_serve_launch_handoff(child_env),
                     cwd=repo_root(),
                     app_parent_pid=app_parent_pid,
                 )
@@ -10384,12 +10384,36 @@ def cmd_serve_public(args: Any) -> int:
     if app_parent_pid is not None:
         return _run_server_child_with_app_parent_watchdog(
             cmd,
-            env=child_env_base,
+            env=_with_serve_launch_handoff(child_env_base),
             cwd=repo_root(),
             app_parent_pid=app_parent_pid,
         )
-    os.execvpe(sys.executable, cmd, child_env_base)
+    os.execvpe(sys.executable, cmd, _with_serve_launch_handoff(child_env_base))
     return 0
+
+
+def _with_serve_launch_handoff(child_env: dict[str, str]) -> dict[str, str]:
+    """Tell the server child how the operator started ``mtplx serve``.
+
+    The child runs ``python -m mtplx.server.openai`` with an expanded argument
+    list, so on its own it cannot show the command the operator typed, nor
+    tell the operator's env from the variables this wrapper derives from its
+    flags. The dashboard's Settings tab needs both for its restart command.
+    """
+
+    from mtplx.server.launch_info import (
+        SERVE_LAUNCH_ENV,
+        serve_invocation_argv,
+        serve_launch_handoff,
+    )
+
+    env = dict(child_env)
+    env[SERVE_LAUNCH_ENV] = serve_launch_handoff(
+        argv=serve_invocation_argv(sys.argv, executable=sys.executable),
+        parent_env=os.environ,
+        child_env=child_env,
+    )
+    return env
 
 
 def _app_parent_pid_from_env(env: dict[str, str]) -> int | None:

@@ -1,6 +1,7 @@
 import type {
   DashboardSnapshot,
   HealthPayload,
+  LaunchInfo,
   MutableSettings,
   PrefillHistoryPayload,
   SessionsPayload,
@@ -87,6 +88,7 @@ export const api = {
   getSessions: () => getJson<SessionsPayload>("/admin/sessions"),
   getPrefillHistory: () => getJson<PrefillHistoryPayload>("/v1/mtplx/prefill_history"),
   getSnapshot: () => getJson<DashboardSnapshot>("/v1/mtplx/snapshot"),
+  getLaunch: () => getJson<LaunchInfo>("/v1/mtplx/launch"),
   // The response is the server's settings payload after the write: the
   // mutable keys at the top level (already clamped/normalised), plus
   // `applied` listing what this write changed.

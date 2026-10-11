@@ -112,6 +112,7 @@ wheel via `[tool.setuptools.package-data]` so `pip install mtplx` is enough.
 | `/v1/mtplx/prefill_history`           | GET    | Bounded ring (cap 100) of recent prefill rows.                                          |
 | `/v1/mtplx/flight`                    | GET    | Live flight-recorder snapshot: in-flight phase/TPS/acceptance, stall age, text tail.    |
 | `/v1/mtplx/settings`                  | POST   | Mutate the small whitelisted surface of `state.args`; rejects restart-required keys.    |
+| `/v1/mtplx/launch`                    | GET    | How the process was started, captured once: argv, MTPLX_/MLX_/PYTHONPATH env + source.  |
 | `/v1/mtplx/cancel/{request_id}`       | POST   | Sets the in-flight handle's `cancel_event` (best-effort, one-token-batch worst case).   |
 
 `/health` gains three fields: `chip` (`sysctl machdep.cpu.brand_string`),
@@ -122,9 +123,16 @@ wheel via `[tool.setuptools.package-data]` so `pip install mtplx` is enough.
 
 `profile`, `model`, `host`, `port`, `load_mtp`, `verify_core`,
 `verify_strategy`, `context_window`, `api_key`.
-These require a model/runtime reload. The Settings tab shows a
-"restart required" card with the exact CLI command and a copy button
-instead of pretending to hot-swap.
+These require a model/runtime reload. The Settings tab shows them under
+"Fixed until restart", read from `/v1/mtplx/launch`: the startup choices
+and flags, a searchable table of every `MTPLX_*`, `MLX_*` and `PYTHONPATH`
+variable with its source (`launch`, `profile`, `both`, or `flag` when MTPLX
+set it from a command-line flag), and a restart command rebuilt from the
+launch environment and the command the server was started with, with a copy
+button. Values of variables and flags whose name holds the word KEY, TOKEN,
+SECRET or PASSWORD are shown as `•••`. `mtplx serve` hands its own command
+line to the server child in `MTPLX_SERVE_LAUNCH`, so the restart command is
+the `mtplx serve` invocation rather than the expanded server command.
 
 ## Security notes
 

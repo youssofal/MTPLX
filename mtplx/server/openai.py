@@ -223,6 +223,12 @@ from mtplx.server.flight_recorder import FlightRecorder, resolve_flight_recorder
 from mtplx.server.stream_rate import PhaseRateMeter, decode_phase_for_fields
 from mtplx import thermal_pressure as _thermal_pressure
 from mtplx.server.served_window import served_execution_window
+from mtplx.server.launch_info import (
+    SERVE_LAUNCH_ENV,
+    LaunchCapture,
+    build_launch_info,
+    capture_launch,
+)
 from mtplx.prefill_plan import publishable_reread
 
 # Inert fallback so stubbed states (tests) hit no-op recorder methods instead
@@ -3472,6 +3478,9 @@ class ServerState:
         _startup_line(f"[4/6] Preparing {runtime_label} runtime")
         if args.generation_mode == "mtp" and not args.load_mtp:
             raise ValueError("--generation-mode mtp requires --load-mtp")
+        # How the operator started the process, before the profile writes
+        # os.environ; main() captures it even earlier, before parse_args.
+        args._launch_capture = _launch_capture(args)
         if args.diagnostic_env_ablation:
             self.profile_env_status = profile_env_status(self.profile.name)
             self.fast_path_env_status = _fast_path_env_status()
@@ -3532,6 +3541,21 @@ class ServerState:
         # BEFORE the load below, which is what performs the read.
         self.ngram_prewarm_source = _apply_ngram_prewarm_choice(args)
         self.ngram_prewarm_reservation = _publish_ngram_prewarm_reservation(args)
+        # Captured once, after every env write of startup (profile, flags):
+        # the dashboard's Settings tab reads it from /v1/mtplx/launch.
+        self.launch_info = build_launch_info(
+            args._launch_capture,
+            environ=os.environ,
+            profile_env={
+                **(
+                    {}
+                    if args.diagnostic_env_ablation
+                    else self.profile.env_dict()
+                ),
+                **getattr(self, "runtime_env_overrides", {}),
+            },
+            fixed=_launch_fixed_settings(args),
+        )
         _startup_line("[4/6] Runtime checks complete")
         started = time.perf_counter()
         _startup_line(f"[5/6] Loading model weights: {args.model}")
@@ -18661,6 +18685,7 @@ def _mtplx_app_capabilities() -> dict[str, Any]:
         "prefill_history": "/v1/mtplx/prefill_history",
         "flight": "/v1/mtplx/flight",
         "settings": "/v1/mtplx/settings",
+        "launch": "/v1/mtplx/launch",
         "cancel": "/v1/mtplx/cancel/{request_id}",
         "dashboard": "/dashboard/",
         "app_capabilities": "/v1/mtplx/app/capabilities",
@@ -35852,6 +35877,33 @@ def _set_server_reasoning_mode(state: ServerState, mode: str) -> None:
     state.args.enable_thinking = False if normalized == "off" else True
 
 
+def _launch_capture(args: argparse.Namespace) -> LaunchCapture:
+    capture = getattr(args, "_launch_capture", None)
+    if capture is None:
+        capture = capture_launch(
+            os.environ,
+            getattr(args, "_raw_args", sys.argv[1:]),
+            executable=sys.executable,
+        )
+    return capture
+
+
+def _launch_fixed_settings(args: argparse.Namespace) -> dict[str, Any]:
+    """The startup choices the Settings tab shows as fixed until restart."""
+
+    return {
+        "profile": getattr(args, "profile", None),
+        "model": getattr(args, "model", None),
+        "model_id": getattr(args, "model_id", None),
+        "host": getattr(args, "host", None),
+        "port": getattr(args, "port", None),
+        "generation_mode": getattr(args, "generation_mode", None),
+        "load_mtp": bool(getattr(args, "load_mtp", False)),
+        "api_key_required": bool(getattr(args, "api_key", None)),
+        "context_window": getattr(args, "context_window", None),
+    }
+
+
 def _server_settings_payload(state: ServerState) -> dict[str, Any]:
     reasoning = getattr(state.args, "reasoning", None)
     if reasoning not in {"auto", "on", "off"}:
@@ -36591,6 +36643,16 @@ def create_app(state: ServerState) -> FastAPI:
         if applied:
             result["applied"] = applied
         return result
+
+    @app.get("/v1/mtplx/launch")
+    def mtplx_launch() -> dict[str, Any]:
+        # Read-only and captured once at startup: the command line, the
+        # MTPLX_/MLX_/PYTHONPATH environment with each variable's source,
+        # and the settings that only change with a restart.
+        launch_info = getattr(state, "launch_info", None)
+        if launch_info is None:
+            return {"ok": False, "reason": "launch_info_unavailable"}
+        return launch_info
 
     @app.get("/v1/mtplx/snapshot")
     def mtplx_snapshot() -> dict[str, Any]:
@@ -44536,7 +44598,16 @@ def _refuse_unresolvable_retrieval_models(registry: Any) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
+    launch_capture = capture_launch(
+        os.environ,
+        list(sys.argv[1:] if argv is None else argv),
+        executable=sys.executable,
+    )
+    # The handoff from `mtplx serve` describes this process only; a worker
+    # this server spawns must not inherit it.
+    os.environ.pop(SERVE_LAUNCH_ENV, None)
     args = parse_args(argv)
+    args._launch_capture = launch_capture
     validate_server_security_args(args)
     set_stream_stall_deadline_s(getattr(args, "stream_stall_deadline_s", None))
     try:

@@ -36,3 +36,13 @@ export function useHealth() {
     refetchOnWindowFocus: false,
   });
 }
+
+// Captured once at server startup; the slow refetch only notices a restart.
+export function useLaunchInfo() {
+  return useQuery({
+    queryKey: ["launch"],
+    queryFn: api.getLaunch,
+    refetchInterval: 30000,
+    refetchOnWindowFocus: false,
+  });
+}

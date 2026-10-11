@@ -362,3 +362,44 @@ export type PrefillHistoryPayload = {
   capacity: number;
   history: PrefillRow[];
 };
+
+// GET /v1/mtplx/launch: how the server process was started, captured once
+// at startup. Secret values arrive as "•••".
+export type LaunchEnvSource = "launch" | "profile" | "both" | "flag";
+
+export type LaunchEnvRow = {
+  name: string;
+  value: string;
+  source: LaunchEnvSource;
+  // Only for source "both": what was passed at launch and what the profile
+  // asked for; `value` is whichever won.
+  launch_value?: string;
+  profile_value?: string;
+};
+
+export type LaunchFixedSettings = {
+  profile: string | null;
+  model: string | null;
+  model_id: string | null;
+  host: string | null;
+  port: number | null;
+  generation_mode: string | null;
+  load_mtp: boolean;
+  api_key_required: boolean;
+  context_window: number | null;
+};
+
+export type LaunchRestart = {
+  env: { name: string; value: string }[];
+  argv: string[];
+};
+
+export type LaunchInfo = {
+  ok: boolean;
+  reason?: string;
+  launcher?: string;
+  fixed?: LaunchFixedSettings;
+  argv?: string[];
+  env?: LaunchEnvRow[];
+  restart?: LaunchRestart;
+};
