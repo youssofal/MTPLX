@@ -1466,16 +1466,26 @@ def _served_model_lm_head_is_q8_g64(args: argparse.Namespace) -> bool:
 
 # Per-module quantization the M=4 stage-3 combine tail pins for every MoE
 # layer (qwen4_m4_stage3 contracts: router and shared expert Q8/g64, routed
-# experts Q4/g32); the installer raises on any other geometry at model load.
+# experts Q4/g32 or Q2/g64); the installer raises on any other geometry at
+# model load.
 _QWEN4_STAGE3_MODULE_CONTRACT = (
     ("mlp.gate", (8, 64, "affine")),
     ("mlp.shared_expert_gate", (8, 64, "affine")),
     ("mlp.shared_expert.gate_proj", (8, 64, "affine")),
     ("mlp.shared_expert.up_proj", (8, 64, "affine")),
     ("mlp.shared_expert.down_proj", (8, 64, "affine")),
-    ("mlp.switch_mlp.gate_proj", (4, 32, "affine")),
-    ("mlp.switch_mlp.up_proj", (4, 32, "affine")),
-    ("mlp.switch_mlp.down_proj", (4, 32, "affine")),
+)
+_QWEN4_STAGE3_ROUTED_MODULES = (
+    "mlp.switch_mlp.gate_proj",
+    "mlp.switch_mlp.up_proj",
+    "mlp.switch_mlp.down_proj",
+)
+# Routed-expert geometries with stage-3 kernels: the forge recipe's Q4/g32,
+# and Q2/g64 (MLX affine 2-bit, e.g. a ggml Q2_0 expert pack repacked without
+# loss). All three routed projections of every layer share one of them.
+_QWEN4_STAGE3_ROUTED_GEOMETRIES = (
+    (4, 32, "affine"),
+    (2, 64, "affine"),
 )
 
 
@@ -1488,13 +1498,25 @@ def _served_model_pack_is_stage3_geometry(args: argparse.Namespace) -> bool:
     layers = text.get("num_hidden_layers") if isinstance(text, Mapping) else None
     if not isinstance(layers, int) or layers <= 0:
         return False
-    return all(
-        _served_module_quantization(
+
+    def quantization(index: int, module: str):
+        return _served_module_quantization(
             config, f"language_model.model.layers.{index}.{module}"
         )
-        == expected
+
+    routed = {
+        quantization(index, module)
         for index in range(layers)
-        for module, expected in _QWEN4_STAGE3_MODULE_CONTRACT
+        for module in _QWEN4_STAGE3_ROUTED_MODULES
+    }
+    return (
+        len(routed) == 1
+        and routed <= set(_QWEN4_STAGE3_ROUTED_GEOMETRIES)
+        and all(
+            quantization(index, module) == expected
+            for index in range(layers)
+            for module, expected in _QWEN4_STAGE3_MODULE_CONTRACT
+        )
     )
 
 

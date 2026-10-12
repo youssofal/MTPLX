@@ -14,6 +14,11 @@ from .kernels.qwen4_m4_routed_down import (
     bind_residual_tail,
 )
 from .kernels.qwen4_m4_routed_glu import bind as bind_routed_glu
+from .kernels.qwen4_m4_routed_down_q2 import (
+    bind as bind_routed_down_reduce_q2g64,
+    bind_residual_tail as bind_residual_tail_q2g64,
+)
+from .kernels.qwen4_m4_routed_glu_q2 import bind as bind_routed_glu_q2g64
 from .kernels import qwen4_m4_route as _route_kernel
 from .models.qwen4_exp import (
     DecoderLayer,
@@ -614,6 +619,67 @@ _SHARED_DOWN_CONTRACT = (
     (2560, 10),
     (2560, 10),
 )
+#: Routed experts in MLX affine 2-bit, group 64: the layout of a ggml Q2_0
+#: expert pack repacked without loss (scale = d, bias = -d, codes reused).
+#: Served by the q2/g64 twins of the routed GLU and routed-down kernels.
+_ROUTED_GU_CONTRACT_Q2G64 = (
+    2,
+    64,
+    "affine",
+    mx.uint32,
+    mx.bfloat16,
+    mx.bfloat16,
+    (512, 1280, 160),
+    (512, 1280, 40),
+    (512, 1280, 40),
+)
+_ROUTED_DOWN_CONTRACT_Q2G64 = (
+    2,
+    64,
+    "affine",
+    mx.uint32,
+    mx.bfloat16,
+    mx.bfloat16,
+    (512, 2560, 40),
+    (512, 2560, 10),
+    (512, 2560, 10),
+)
+
+ROUTED_Q4G32 = (4, 32)
+ROUTED_Q2G64 = (2, 64)
+#: Routed-expert geometry -> (fused gate/up contract, down contract).
+_ROUTED_CONTRACTS = {
+    ROUTED_Q4G32: (_ROUTED_GU_CONTRACT, _ROUTED_DOWN_CONTRACT),
+    ROUTED_Q2G64: (_ROUTED_GU_CONTRACT_Q2G64, _ROUTED_DOWN_CONTRACT_Q2G64),
+}
+
+
+def _block_routed_geometry(block: Any) -> tuple[int, int]:
+    """(bits, group_size) of a block's routed fused gate/up owner.
+
+    An owner that passed ``_validate_block_contract`` carries both; anything
+    else keeps the q4/g32 geometry the lane shipped with."""
+
+    routed = getattr(block, "switch_mlp", None)
+    return (
+        int(getattr(routed, "bits", ROUTED_Q4G32[0])),
+        int(getattr(routed, "group_size", ROUTED_Q4G32[1])),
+    )
+
+
+def _routed_binders(geometry: tuple[int, int]):
+    """(routed GLU, routed-down reduce, routed-down residual tail) binders.
+
+    Resolved through the module globals at call time, so a test that
+    monkeypatches one binder sees it used."""
+
+    if geometry == ROUTED_Q2G64:
+        return (
+            bind_routed_glu_q2g64,
+            bind_routed_down_reduce_q2g64,
+            bind_residual_tail_q2g64,
+        )
+    return bind_routed_glu, bind_routed_down_reduce, bind_residual_tail
 
 
 def _validate_layer_owner(layer: Any, *, index: int) -> None:
@@ -641,11 +707,15 @@ def _validate_block_contract(block: Any, *, index: int) -> None:
         raise ValueError(f"{label} router mismatch")
     if _projection_contract(block.shared_expert_gate) != _SHARED_GATE_CONTRACT:
         raise ValueError(f"{label} shared gate mismatch")
-    if _fused_gu_contract(block.switch_mlp) != _ROUTED_GU_CONTRACT:
+    routed_contracts = _ROUTED_CONTRACTS.get(_block_routed_geometry(block))
+    if (
+        routed_contracts is None
+        or _fused_gu_contract(block.switch_mlp) != routed_contracts[0]
+    ):
         raise ValueError(f"{label} routed fused GU mismatch")
     if _fused_gu_contract(block.shared_expert) != _SHARED_GU_CONTRACT:
         raise ValueError(f"{label} shared fused GU mismatch")
-    if _projection_contract(block.switch_mlp.down_proj) != _ROUTED_DOWN_CONTRACT:
+    if _projection_contract(block.switch_mlp.down_proj) != routed_contracts[1]:
         raise ValueError(f"{label} routed down mismatch")
     if _projection_contract(block.shared_expert.down_proj) != _SHARED_DOWN_CONTRACT:
         raise ValueError(f"{label} shared down mismatch")
@@ -691,7 +761,8 @@ def bind_qwen4_m4_residual_tail(layer: Any, *, index: int):
     _validate_input_contract(layer, index=index)
     _validate_residual_tail_contract(layer, index=index)
     _validate_block_contract(layer.mlp, index=index)
-    return bind_residual_tail()
+    _, _, bind_tail = _routed_binders(_block_routed_geometry(layer.mlp))
+    return bind_tail()
 
 
 def _build_install_plans(
@@ -723,16 +794,19 @@ def _installation_report(
     routed_glu_enabled: bool = False,
     route_kernel_enabled: bool = False,
     route_kernel_vec_lanes: int | None = None,
+    routed_geometry: tuple[int, int] = ROUTED_Q4G32,
 ) -> dict[str, Any]:
+    bits, group_size = routed_geometry
+    routed_tag = f"q{bits}g{group_size}"
     return {
         "installed": True,
         "layers": layer_count,
         "rows": 4,
         "max_abs_diff": max_delta,
         "boundary": (
-            "paired_routed_q4g32_glu_reduce_shared_add_mlp_residual"
+            f"paired_routed_{routed_tag}_glu_reduce_shared_add_mlp_residual"
             if routed_glu_enabled
-            else "routed_q4g32_reduce_shared_add_mlp_residual"
+            else f"routed_{routed_tag}_reduce_shared_add_mlp_residual"
             if routed_down_residual_tail_enabled
             else "stock_qmm_combine_tail"
         ),
@@ -741,7 +815,7 @@ def _installation_report(
             if routed_down_residual_tail_enabled
             else "stock_sparse_moe_block"
         ),
-        "routed": "stock_q4/g32",
+        "routed": f"stock_q{bits}/g{group_size}",
         "shared": "stock_q8/g64",
         "routed_down_reduce": routed_down_reduce_enabled,
         "routed_down_residual_tail": routed_down_residual_tail_enabled,
@@ -843,15 +917,27 @@ def install_qwen4_m4_stage3(
         # _build_install_plans so an owner-type problem reports as one.
         for index, (_, block, _, _) in enumerate(validated_plans):
             _route_kernel.check_contract(block, index=index)
+    # Every layer passed a supported routed contract; the kernels are bound
+    # once for the whole stack, so the stack must share one geometry.
+    geometries = {
+        _block_routed_geometry(block) for _, block, _, _ in validated_plans
+    }
+    if len(geometries) != 1:
+        raise ValueError(
+            "qwen4 M4 stage3 requires one routed expert geometry across layers, "
+            f"got {sorted(geometries)}"
+        )
+    (geometry,) = geometries
+    bind_glu, bind_reduce, bind_tail = _routed_binders(geometry)
     stage3 = bind()
     routed_down_reduce = (
-        bind_residual_tail()
+        bind_tail()
         if routed_down_residual_tail_enabled
-        else bind_routed_down_reduce()
+        else bind_reduce()
         if routed_down_reduce_enabled
         else None
     )
-    routed_glu = bind_routed_glu() if routed_glu_enabled else None
+    routed_glu = bind_glu() if routed_glu_enabled else None
     route = (
         _route_kernel.bind(vec_lanes=route_kernel_vec_lanes)
         if route_kernel_enabled
@@ -967,6 +1053,7 @@ def install_qwen4_m4_stage3(
         routed_glu_enabled=routed_glu_enabled,
         route_kernel_enabled=route_kernel_enabled,
         route_kernel_vec_lanes=route_kernel_vec_lanes,
+        routed_geometry=geometry,
     )
     runtime.qwen4_m4_stage3_report = report
     return report

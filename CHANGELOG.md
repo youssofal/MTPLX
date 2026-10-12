@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Flash-Next packs with 2-bit routed experts run the stage-3 verify lane.** The lane covers the fused routing head, the paired routed GLU and the one-dispatch routed-down reduce with residual tail, and until now ran only for packs with q4/g32 routed experts. A pack whose routed experts are MLX affine 2-bit with 64-weight groups now runs it too, through q2/g64 twins of the two routed-expert kernels that are bit-exact with MLX's stock 2-bit arithmetic. Such packs include IST Austria's GSQ-RCO `Q2_0` experts, which repack from GGUF without loss. On an M5 Max with 128 GB, `trustos/Qwen3.8-Flash-Next-GSQ-RCO-Q2-MTPLX` decodes at 105.0 to 107.3 tok/s with the lane against 94.6 to 98.1 without (code prompt, 512 tokens, turbo, seed 1, three rounds each), with identical output, at a 45 GiB peak.
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed
