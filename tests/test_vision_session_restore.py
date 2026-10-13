@@ -683,7 +683,7 @@ def test_kill_switch_restores_the_old_image_turn(harness, monkeypatch):
     # as two), so nothing past that point can be restored: the whole text
     # history is prefilled again.
     prompt_ids = call["prompt_ids"]
-    parted_at = openai._common_prefix_len(prompt_ids, committed)
+    parted_at = openai.common_prefix_len(prompt_ids, committed)
     assert parted_at < 64
     assert call["cached_tokens"] <= parted_at
     assert call["logits"] == _cold_logits(prompt_ids, [IMAGE_A])

@@ -142,7 +142,7 @@ def test_raw_encode_matches_canonical_encode_identity(tok):
         canon = _encode(tok, history, allow=True, tool_prompt_mode=mode)
         assert raw == canon, (
             f"raw/canonical encode diverged under {mode}: first mismatch at "
-            f"{oa._common_prefix_len(raw, canon)} of {len(raw)}/{len(canon)}"
+            f"{oa.common_prefix_len(raw, canon)} of {len(raw)}/{len(canon)}"
         )
 
 
@@ -198,7 +198,7 @@ def test_postcommit_byte_extension_compact_lane(tok, monkeypatch):
     )
     assert result is not None, "canonicalization must apply on the compact lane"
     _canon_messages, canon2_ids = result
-    cp_canon = oa._common_prefix_len(canon2_ids, committed_now)
+    cp_canon = oa.common_prefix_len(canon2_ids, committed_now)
     assert cp_canon == len(committed_now), (
         f"turn-2 canonical prompt must contain the committed stream fully: "
         f"cp_canon={cp_canon} committed={len(committed_now)}"
@@ -277,7 +277,7 @@ def test_raw_encode_carries_preserve_echo_and_matches_canonical(tok):
     canon = _encode(tok, history, allow=True, preserve=True)
     assert raw == canon, (
         f"raw/canonical diverged with echo present: first mismatch at "
-        f"{oa._common_prefix_len(raw, canon)} of {len(raw)}/{len(canon)}"
+        f"{oa.common_prefix_len(raw, canon)} of {len(raw)}/{len(canon)}"
     )
 
 

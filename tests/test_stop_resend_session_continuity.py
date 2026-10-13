@@ -411,7 +411,7 @@ def test_a_renamed_session_is_the_silent_exit_of_the_receipt(monkeypatch):
     assert THINK1 not in _text(turn3)
     # That prompt leaves the committed stream where turn 1's reasoning began
     # (the receipt's cp_raw: 90 of 49,968); all the rest is a prefill.
-    assert openai._common_prefix_len(turn3, committed) == len(engine.prompts[0])
+    assert openai.common_prefix_len(turn3, committed) == len(engine.prompts[0])
 
 
 def test_the_follow_up_waits_for_the_stopped_generation_to_let_go(monkeypatch):
@@ -732,5 +732,5 @@ def test_real_template_follow_up_extends_the_committed_stream_and_the_stopped_pr
     # Under a renamed session the gate is silent and the prompt is the raw one.
     _raw, renamed, renamed_record = canonicalize(TURN3_MESSAGES, ROTATED)
     assert renamed is None and renamed_record is None
-    assert openai._common_prefix_len(raw3, committed) == record3["cp_raw"]
+    assert openai.common_prefix_len(raw3, committed) == record3["cp_raw"]
     assert record3["cp_raw"] < len(committed)

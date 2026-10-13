@@ -144,9 +144,14 @@ from .sampling import (
 )
 from .session_bank import _boundary_true_restore_enabled
 from .runtime_options import (
+    block_prefix_min_match_tokens,
     block_prefix_restore_enabled,
     env_bool,
+    near_prefix_max_token_gap,
+    near_prefix_min_match_tokens,
+    prefix_block_size,
     qwen4_opdiet_enabled,
+    store_on_prefill_min_suffix,
 )
 from .route_tape import RouteTape, counter_deltas
 
@@ -1840,9 +1845,7 @@ def _bank_may_preempt_first_span(session_bank, prompt_ids, span) -> bool:
     probe = getattr(session_bank, "shares_ram_prefix", None)
     if not callable(probe):
         return False
-    block_min_match = max(
-        1, _env_int("MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS", 512)
-    )
+    block_min_match = block_prefix_min_match_tokens()
     span_end = int(span[1]) if span is not None else block_min_match
     try:
         return bool(
@@ -5079,18 +5082,15 @@ def _restore_near_prefix_prompt_state(
     candidates = getattr(session_bank, "near_prefix_candidates", None)
     if not callable(candidates):
         return None
-    max_gap = max(0, _env_int("MTPLX_SESSION_NEAR_PREFIX_MAX_TOKEN_GAP", 8))
-    min_match = max(1, _env_int("MTPLX_SESSION_NEAR_PREFIX_MIN_MATCH_TOKENS", 64))
+    max_gap = near_prefix_max_token_gap()
+    min_match = near_prefix_min_match_tokens()
     block_prefix_enabled = (
         block_prefix_restore_enabled()
         if allow_block_prefix is None
         else bool(allow_block_prefix)
     )
-    block_size = max(1, _env_int("MTPLX_SESSION_PREFIX_BLOCK_SIZE", 256))
-    block_min_match = max(
-        block_size,
-        _env_int("MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS", 512),
-    )
+    block_size = prefix_block_size()
+    block_min_match = max(block_size, block_prefix_min_match_tokens())
     candidates_seen = 0
     first_reject: str | None = None
     _prefix_restore_fn = getattr(session_bank, "restore_entry_prefix_cache", None)
@@ -6183,16 +6183,7 @@ def _store_on_prefill_env_enabled() -> bool:
     """Default ON (2026-07-02 A/B: agent turn-2 TTFT 40s -> 1.3s, e2e 1.7 ->
     33.6 tok/s at 25k ctx; cost is one bank snapshot copy on large cold
     prefills). MTPLX_SESSION_STORE_ON_PREFILL=0 is the kill switch."""
-    raw = str(os.environ.get("MTPLX_SESSION_STORE_ON_PREFILL", "1")).strip().lower()
-    return raw not in {"0", "false", "off", "no"}
-
-
-def _store_on_prefill_min_suffix() -> int:
-    raw = os.environ.get("MTPLX_SESSION_STORE_ON_PREFILL_MIN_SUFFIX", "1024")
-    try:
-        return max(1, int(raw))
-    except (TypeError, ValueError):
-        return 1024
+    return not _env_falsey("MTPLX_SESSION_STORE_ON_PREFILL")
 
 
 def _debug_prefix_divergence(rt: MTPLXRuntime, prompt_ids: list[int], session_bank: Any) -> None:
@@ -6658,7 +6649,7 @@ def restore_or_prefill_prompt_state(
                 "skip_reason": "vision_no_bank_key",
             }
             return
-        if int(state.suffix_tokens or 0) < _store_on_prefill_min_suffix():
+        if int(state.suffix_tokens or 0) < store_on_prefill_min_suffix():
             # Warm restore or trivial extension: the existing postcommit
             # machinery owns those; storing again would just churn the bank.
             state.prefill_store_snapshot = {

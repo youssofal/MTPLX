@@ -28,6 +28,7 @@ from mtplx.backends.family_settings import (
     family_settings,
     resolved_value,
 )
+from mtplx.runtime_options import DEFAULT_COLD_TIER_MIN_PREFIX_TOKENS
 
 GIB = 1024**3
 
@@ -62,7 +63,7 @@ PI_BATCHING_PRESET = "latency"
 # (cold_tier.default_cold_tier_max_bytes). Literal sizes are gone from every
 # table; a user's explicit size still wins.
 SSD_SESSION_CACHE_MAX_SIZE = "auto"
-SSD_SESSION_CACHE_MIN_PREFIX_TOKENS = 512
+SSD_SESSION_CACHE_MIN_PREFIX_TOKENS = DEFAULT_COLD_TIER_MIN_PREFIX_TOKENS
 
 # Session-bank entries for coding agents: 32 from 96 GiB of RAM, else 6.
 AGENT_HIGH_MEMORY_THRESHOLD_BYTES = 96 * GIB

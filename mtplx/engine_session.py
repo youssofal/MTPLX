@@ -23,17 +23,22 @@ from typing import Any, Iterator, Mapping
 
 from .session_bank import (
     CacheMissReason,
-    DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS,
     DEFAULT_IDLE_TTL_S,
     DEFAULT_MAX_ENTRIES,
     DEFAULT_MAX_BYTES,
     DEFAULT_PER_SESSION_MAX_BYTES,
-    DEFAULT_PREFIX_BLOCK_SIZE,
     QueuedPersistenceCancelError,
     SessionBank,
     block_aligned_prefix_len,
 )
-from .runtime_options import block_prefix_restore_enabled
+from .runtime_options import (
+    block_prefix_min_match_tokens,
+    block_prefix_restore_enabled,
+    near_prefix_max_token_gap,
+    near_prefix_min_match_tokens,
+    prefix_block_size,
+)
+from .token_prefix import common_prefix_len
 
 
 logger = logging.getLogger(__name__)
@@ -512,14 +517,6 @@ def _new_anon_session_id() -> str:
     return f"anon-{secrets.token_hex(8)}"
 
 
-def common_prefix_len(left: list[int] | tuple[int, ...], right: list[int] | tuple[int, ...]) -> int:
-    limit = min(len(left), len(right))
-    for index in range(limit):
-        if int(left[index]) != int(right[index]):
-            return index
-    return limit
-
-
 def _message_role(message: Any) -> str:
     if isinstance(message, Mapping):
         return str(message.get("role", ""))
@@ -594,10 +591,6 @@ def is_background_request(
 
 
 _DEFAULT_POSTCOMMIT_WAIT_TIMEOUT_S = 8.0
-_DEFAULT_NEAR_PREFIX_MAX_TOKEN_GAP = 8
-_DEFAULT_NEAR_PREFIX_MIN_MATCH_TOKENS = 64
-_DEFAULT_PREFIX_BLOCK_SIZE = DEFAULT_PREFIX_BLOCK_SIZE
-_DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS = DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS
 
 
 _DEFAULT_POSTCOMMIT_ARRIVAL_WAIT_S = 0.6
@@ -821,33 +814,6 @@ def _postcommit_wait_timeout_s() -> float:
     return value
 
 
-def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        value = int(str(raw).strip())
-    except (TypeError, ValueError):
-        return default
-    return max(int(minimum), value)
-
-
-def _near_prefix_max_token_gap() -> int:
-    return _env_int(
-        "MTPLX_SESSION_NEAR_PREFIX_MAX_TOKEN_GAP",
-        _DEFAULT_NEAR_PREFIX_MAX_TOKEN_GAP,
-        minimum=0,
-    )
-
-
-def _near_prefix_min_match_tokens() -> int:
-    return _env_int(
-        "MTPLX_SESSION_NEAR_PREFIX_MIN_MATCH_TOKENS",
-        _DEFAULT_NEAR_PREFIX_MIN_MATCH_TOKENS,
-        minimum=1,
-    )
-
-
 def _block_prefix_restore_enabled() -> bool:
     """The single parse of ``MTPLX_SESSION_BLOCK_PREFIX_RESTORE`` (default ON).
 
@@ -857,22 +823,6 @@ def _block_prefix_restore_enabled() -> bool:
     """
 
     return block_prefix_restore_enabled()
-
-
-def _prefix_block_size() -> int:
-    return _env_int(
-        "MTPLX_SESSION_PREFIX_BLOCK_SIZE",
-        _DEFAULT_PREFIX_BLOCK_SIZE,
-        minimum=1,
-    )
-
-
-def _block_prefix_min_match_tokens() -> int:
-    return _env_int(
-        "MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS",
-        _DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS,
-        minimum=1,
-    )
 
 
 @dataclass
@@ -1769,12 +1719,12 @@ class EngineSession:
             matched = common_prefix_len(current, tokens)
             block_boundary = block_aligned_prefix_len(
                 matched,
-                block_size=_prefix_block_size(),
+                block_size=prefix_block_size(),
             )
-            block_min_match = max(_prefix_block_size(), _block_prefix_min_match_tokens())
+            block_min_match = max(prefix_block_size(), block_prefix_min_match_tokens())
             if (
                 matched < len(current)
-                and (len(current) - matched) > _near_prefix_max_token_gap()
+                and (len(current) - matched) > near_prefix_max_token_gap()
                 and (
                     not _block_prefix_restore_enabled()
                     or block_boundary < block_min_match
@@ -1787,7 +1737,7 @@ class EngineSession:
                 )
             if (
                 matched < len(current)
-                and (len(current) - matched) > _near_prefix_max_token_gap()
+                and (len(current) - matched) > near_prefix_max_token_gap()
             ):
                 commit_reason = "committed_retokenized_prefix_after_block_overlap"
             if len(tokens) == len(current) and matched == len(current):
@@ -2341,19 +2291,19 @@ class EngineSessionManager:
         """Return a pending-postcommit session with a near-exact prompt prefix."""
         tokens = tuple(int(token) for token in token_ids)
         gap_limit = (
-            _near_prefix_max_token_gap()
+            near_prefix_max_token_gap()
             if max_token_gap is None
             else max(0, int(max_token_gap))
         )
         min_match = (
-            _near_prefix_min_match_tokens()
+            near_prefix_min_match_tokens()
             if min_matched_tokens is None
             else max(1, int(min_matched_tokens))
         )
         best: EngineSession | None = None
         best_matched = 0
-        block_size = _prefix_block_size()
-        block_min_match = max(block_size, _block_prefix_min_match_tokens())
+        block_size = prefix_block_size()
+        block_min_match = max(block_size, block_prefix_min_match_tokens())
         for session in self._sessions_snapshot():
             if not session.has_pending_postcommit():
                 continue
@@ -2423,7 +2373,7 @@ class EngineSessionManager:
         divergence_at = None if exact else matched
         boundary = block_aligned_prefix_len(
             matched,
-            block_size=_prefix_block_size(),
+            block_size=prefix_block_size(),
         )
         return {
             "prompt_len": len(tokens),

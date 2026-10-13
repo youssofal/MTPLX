@@ -339,6 +339,85 @@ def canonicalize_flag_tokens(
     return resolved
 
 
+#: Session-prefix reuse defaults. Each number has one home, here; the
+#: readers below and the modules that need the bare default import them.
+DEFAULT_NEAR_PREFIX_MAX_TOKEN_GAP = 8
+DEFAULT_NEAR_PREFIX_MIN_MATCH_TOKENS = 64
+DEFAULT_PREFIX_BLOCK_SIZE = 256
+DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS = 512
+DEFAULT_STORE_ON_PREFILL_MIN_SUFFIX = 1024
+#: Shortest committed prefix the SSD session cache writes (and the shortest
+#: prompt the batched lane looks up there).
+DEFAULT_COLD_TIER_MIN_PREFIX_TOKENS = 512
+
+
+def env_int_at_least(name: str, default: int, *, minimum: int = 0) -> int:
+    """Parse an integer ``MTPLX_*`` env var, clamped to ``minimum``.
+
+    Unset, blank or unparsable yields ``default`` (which is not clamped).
+    """
+
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return max(int(minimum), value)
+
+
+def near_prefix_max_token_gap() -> int:
+    return env_int_at_least(
+        "MTPLX_SESSION_NEAR_PREFIX_MAX_TOKEN_GAP",
+        DEFAULT_NEAR_PREFIX_MAX_TOKEN_GAP,
+        minimum=0,
+    )
+
+
+def near_prefix_min_match_tokens() -> int:
+    return env_int_at_least(
+        "MTPLX_SESSION_NEAR_PREFIX_MIN_MATCH_TOKENS",
+        DEFAULT_NEAR_PREFIX_MIN_MATCH_TOKENS,
+        minimum=1,
+    )
+
+
+def prefix_block_size() -> int:
+    return env_int_at_least(
+        "MTPLX_SESSION_PREFIX_BLOCK_SIZE",
+        DEFAULT_PREFIX_BLOCK_SIZE,
+        minimum=1,
+    )
+
+
+def block_prefix_min_match_tokens() -> int:
+    """Shortest shared prefix a block-prefix restore may serve.
+
+    Every caller (generation, engine_session, session_bank, cold_tier) uses
+    ``max(prefix_block_size(), block_prefix_min_match_tokens())``, so the
+    effective floor never drops below one block even when this env is set
+    lower. That is deliberate and the same on every lane: the restore
+    rewinds to a block edge, and the lanes that restore at any token (entries
+    without recurrent state) would otherwise serve a match shorter than the
+    block that the block lane itself refuses.
+    """
+
+    return env_int_at_least(
+        "MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS",
+        DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS,
+        minimum=1,
+    )
+
+
+def store_on_prefill_min_suffix() -> int:
+    return env_int_at_least(
+        "MTPLX_SESSION_STORE_ON_PREFILL_MIN_SUFFIX",
+        DEFAULT_STORE_ON_PREFILL_MIN_SUFFIX,
+        minimum=1,
+    )
+
+
 def block_prefix_restore_enabled() -> bool:
     """The single parse of ``MTPLX_SESSION_BLOCK_PREFIX_RESTORE``.
 

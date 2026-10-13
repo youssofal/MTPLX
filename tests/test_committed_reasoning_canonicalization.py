@@ -308,7 +308,7 @@ def test_canonicalized_encode_extends_committed_stream_real_template():
 
     history = [system, u1, {"role": "assistant", "content": answer}, u2]
     raw_ids = encode(history)
-    cp_raw = oa._common_prefix_len(raw_ids, committed)
+    cp_raw = oa.common_prefix_len(raw_ids, committed)
 
     canon_history = [
         system,
@@ -321,7 +321,7 @@ def test_canonicalized_encode_extends_committed_stream_real_template():
         u2,
     ]
     canon_ids = encode(canon_history, allow=True)
-    cp_canon = oa._common_prefix_len(canon_ids, committed)
+    cp_canon = oa.common_prefix_len(canon_ids, committed)
 
     assert cp_raw < len(committed) - len(generated) + 8, (
         f"raw encode unexpectedly matched deep into the committed stream "
@@ -507,8 +507,8 @@ def test_substituted_write_turn_re_encodes_to_the_generated_bytes_real_template(
     canon, substituted = oa._substitute_committed_reasoning_messages(history, turns)
     assert substituted == 1
     canon_ids = encode(canon, allow=True)
-    cp_raw = oa._common_prefix_len(raw_ids, committed)
-    cp_canon = oa._common_prefix_len(canon_ids, committed)
+    cp_raw = oa.common_prefix_len(raw_ids, committed)
+    cp_canon = oa.common_prefix_len(canon_ids, committed)
     assert cp_raw < len(committed), "raw re-render is expected to lose the trailing newline"
     assert cp_canon >= len(committed) - 1, (cp_canon, len(committed))
 

@@ -18,6 +18,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 from mtplx.cache_state import CacheSnapshot
+from mtplx.runtime_options import (
+    DEFAULT_COLD_TIER_MIN_PREFIX_TOKENS,
+    DEFAULT_PREFIX_BLOCK_SIZE,
+)
+from mtplx.token_prefix import common_prefix_len
 
 from .codec import (
     ColdEncodeInterrupted,
@@ -85,8 +90,7 @@ COLD_TIER_FORMAT_VERSION = 3
 # DEFAULT_COLD_TIER_DIR is defined once, in .reconcile (MLX-free), and
 # re-exported here for the server and the package namespace.
 DEFAULT_COLD_TIER_MAX_BYTES = 100 * 1024**3
-DEFAULT_COLD_TIER_MIN_PREFIX_TOKENS = 512
-DEFAULT_BLOCK_SIZE = 256
+DEFAULT_BLOCK_SIZE = DEFAULT_PREFIX_BLOCK_SIZE
 DISK_USAGE_CACHE_TTL_S = 30.0
 # stats() manifest-aggregate snapshot TTL. /health and the dashboard poll
 # stats() continuously; the aggregate is exact while _store_generation is
@@ -297,14 +301,6 @@ def token_hash(token_ids: tuple[int, ...]) -> str:
     for token in token_ids:
         h.update(int(token).to_bytes(8, byteorder="little", signed=True))
     return h.hexdigest()
-
-
-def common_prefix_len(left: tuple[int, ...], right: tuple[int, ...]) -> int:
-    limit = min(len(left), len(right))
-    for index in range(limit):
-        if int(left[index]) != int(right[index]):
-            return index
-    return limit
 
 
 def block_aligned_prefix_len(matched_tokens: int, *, block_size: int) -> int:
