@@ -8,8 +8,10 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import { useState } from "react";
 import { Card } from "./Card";
-import { fmtSeconds } from "../lib/utils";
+import { cn, fmtNumber, fmtSeconds } from "../lib/utils";
+import { waterfallScale, type WaterfallMode } from "../lib/verifyRounds";
 import { useDashboardStore } from "../state/store";
 
 type Slice = { key: string; label: string; color: string; description: string };
@@ -27,12 +29,51 @@ const SLICES: Slice[] = [
   { key: "rollback_time_s", label: "rollback", color: "rgba(240,88,106,0.55)", description: "State rollback after reject" },
 ];
 
+const MODES: { value: WaterfallMode; label: string }[] = [
+  { value: "request", label: "per request" },
+  { value: "round", label: "per round (avg)" },
+];
+
+function ModeToggle({
+  value,
+  onChange,
+}: {
+  value: WaterfallMode;
+  onChange: (next: WaterfallMode) => void;
+}) {
+  return (
+    <div className="inline-flex rounded-md border border-[var(--border-soft)] p-0.5 text-[11px]">
+      {MODES.map((mode) => (
+        <button
+          key={mode.value}
+          type="button"
+          onClick={() => onChange(mode.value)}
+          aria-pressed={value === mode.value}
+          className={cn(
+            "px-2 py-0.5 rounded transition-colors",
+            value === mode.value
+              ? "bg-[var(--bg-elevated)] text-[var(--text-primary)]"
+              : "text-[var(--text-muted)] hover:text-[var(--text-primary)]",
+          )}
+        >
+          {mode.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 export function VerifyWaterfall() {
   const latest = useDashboardStore((s) => s.latest);
+  const [requested, setRequested] = useState<WaterfallMode>("round");
+  const scale = waterfallScale(requested, latest?.verify_calls);
+  const perRound = scale.mode === "round";
 
-  const total = Number(latest?.verify_time_s ?? 0);
+  const requestTotal = Number(latest?.verify_time_s ?? 0);
+  const total = requestTotal / scale.divisor;
   const rows = SLICES.map((slice) => {
-    const seconds = Number((latest as Record<string, unknown> | null)?.[slice.key] ?? 0) || 0;
+    const seconds =
+      (Number((latest as Record<string, unknown> | null)?.[slice.key] ?? 0) || 0) / scale.divisor;
     return {
       ...slice,
       seconds,
@@ -46,11 +87,20 @@ export function VerifyWaterfall() {
       title="Verify-cycle waterfall"
       subtitle={
         latest
-          ? `verify total ${fmtSeconds(total)} · target forward ${fmtSeconds(
-              latest?.target_forward_time_s,
-            )} · draft ${fmtSeconds(latest?.draft_time_s)}`
+          ? [
+              "last request",
+              scale.rounds > 0
+                ? `${fmtNumber(scale.rounds)} verify rounds`
+                : "verify round count unknown, showing totals",
+              perRound
+                ? `verify ${fmtSeconds(requestTotal)} (${fmtSeconds(total)}/round)`
+                : `verify total ${fmtSeconds(requestTotal)}`,
+              `target forward ${fmtSeconds(latest?.target_forward_time_s)}`,
+              `draft ${fmtSeconds(latest?.draft_time_s)}`,
+            ].join(" · ")
           : "no completed verify cycle"
       }
+      action={<ModeToggle value={requested} onChange={setRequested} />}
     >
       <div className="h-[280px]">
         {hasData ? (
@@ -85,7 +135,7 @@ export function VerifyWaterfall() {
                   const slice = SLICES.find((s) => s.label === item?.payload?.label);
                   if (typeof value !== "number") return [value, slice?.label ?? "—"];
                   return [
-                    `${fmtSeconds(value)} · ${item?.payload?.pct?.toFixed(1) ?? "—"}%`,
+                    `${fmtSeconds(value)}${perRound ? "/round" : ""} · ${item?.payload?.pct?.toFixed(1) ?? "—"}%`,
                     slice?.description ?? slice?.label ?? "—",
                   ];
                 }}
