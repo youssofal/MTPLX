@@ -348,7 +348,11 @@ def _install_split_attention_hook(attn: Any) -> bool:
         x: mx.array,
         mask: mx.array | None = None,
         cache: Any | None = None,
+        **kwargs,
     ) -> mx.array:
+        # Position-aware attention owns its rotary contract.
+        if kwargs:
+            return original_call(self, x, mask=mask, cache=cache, **kwargs)
         route_off = not getattr(self, "_mtplx_split_full_attention_enabled", False)
         if route_off and not cache_owns_rotary_origin(cache):
             # No MTPLX attention route asked for, and the cache has no rotary

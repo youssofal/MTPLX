@@ -1175,6 +1175,14 @@ def _qwen4_exp_model_classes() -> tuple[type, type]:
     return Model, ModelArgs
 
 
+def _minicpmv4_7_model_classes() -> tuple[type, type]:
+    try:
+        from .models.minicpmv4_7 import Model, ModelConfig
+    except ImportError as exc:
+        raise ImportError("MiniCPM-V 4.7 requires mlx-vlm with minicpmv4_7 support") from exc
+    return Model, ModelConfig
+
+
 def _prism_hadamard_qwen35_model_classes() -> tuple[type, type]:
     from .models.prism_hadamard_qwen35 import Model, ModelArgs
 
@@ -1189,6 +1197,7 @@ def _prism_hadamard_qwen35_model_classes() -> tuple[type, type]:
 # geometry-gated special case below because its match is not model_type-keyed.
 _INTREE_MODEL_CLASS_LOADERS: dict[str, Callable[[], tuple[type, type]]] = {
     "deepseek_v4": _deepseek_v4_model_classes,
+    "minicpmv4_7": _minicpmv4_7_model_classes,
     "qwen4_exp": _qwen4_exp_model_classes,
     # Text-config spelling of the same family: inspection prefers the nested
     # text_config.model_type for multimodal checkpoints, and text-only
