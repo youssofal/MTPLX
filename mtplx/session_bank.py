@@ -2293,6 +2293,61 @@ class SessionBank:
             return None
         return record
 
+    def _explain_cold_miss(
+        self,
+        cold_miss: str,
+        *,
+        ram_reason: str | None,
+        session_id: str | None,
+        token_ids: list[int] | tuple[int, ...],
+    ) -> str:
+        """Say what a plain SSD miss meant, instead of naming the last tier.
+
+        The cold tier reports ``ssd_prefix_miss`` whenever it holds nothing
+        reusable, which is the normal answer for a new conversation or for a
+        prompt that shares less than the reuse minimum with what is stored. The
+        reason this lookup reports is, in order: ``evicted`` when this
+        conversation's own earlier turn left RAM and is not on the SSD,
+        ``new_session`` when the bank held nothing, and
+        ``prefix_divergence_at_token`` when it held other conversations but no
+        shared prefix long enough to reuse. A real SSD failure
+        (``ssd_restore_error:*`` and the like) is passed through unchanged, and
+        so is ``ssd_prefix_miss`` when the RAM lane refused a prefix for some
+        other reason (that refusal is in ``last_ram_miss_reason``).
+        """
+        if cold_miss != "ssd_prefix_miss":
+            return cold_miss
+        if self._own_turn_evicted(session_id, token_ids):
+            return CacheMissReason.EVICTED.value
+        if ram_reason == CacheMissReason.NEW_SESSION.value:
+            return ram_reason
+        if ram_reason == CacheMissReason.PREFIX_DIVERGENCE_AT_TOKEN.value or str(
+            ram_reason or ""
+        ).startswith("below_block_min_match"):
+            return CacheMissReason.PREFIX_DIVERGENCE_AT_TOKEN.value
+        return cold_miss
+
+    def _own_turn_evicted(
+        self, session_id: str | None, token_ids: list[int] | tuple[int, ...]
+    ) -> bool:
+        """True when the eviction log holds this conversation's earlier turn
+        (a prefix of the prompt) as evicted from RAM."""
+        if not session_id:
+            return False
+        tokens = tuple(int(token) for token in token_ids)
+        for record in reversed(self.eviction_log):
+            if (
+                record.get("reason") != CacheMissReason.EVICTED.value
+                or record.get("session_id") != session_id
+            ):
+                continue
+            n = int(record.get("prefix_len") or 0)
+            if 0 < n <= len(tokens) and token_prefix_hash(tokens[:n]) == record.get(
+                "token_hash"
+            ):
+                return True
+        return False
+
     def _note_oversized_miss(
         self, session_id: str | None, token_ids: list[int] | tuple[int, ...]
     ) -> bool:
@@ -3462,7 +3517,16 @@ class SessionBank:
             else:
                 cold_miss = None
             if cold_miss:
-                self.last_miss_reason = str(cold_miss)
+                self.last_miss_reason = self._explain_cold_miss(
+                    str(cold_miss),
+                    ram_reason=(
+                        (ram_refusal or {}).get("ram_miss_reason")
+                        if ram_refusal is not None
+                        else self.last_miss_reason
+                    ),
+                    session_id=session_id,
+                    token_ids=token_ids,
+                )
                 if self.last_prefix_diagnostic is not None:
                     self.last_prefix_diagnostic["miss_reason"] = self.last_miss_reason
             self._note_oversized_miss(session_id, token_ids)

@@ -31,14 +31,20 @@ def _bank(**kwargs) -> SessionBank:
     return SessionBank(**defaults)
 
 
-def _put(bank: SessionBank, tokens: list[int], *, recurrent: bool = False):
+def _put(
+    bank: SessionBank,
+    tokens: list[int],
+    *,
+    recurrent: bool = False,
+    session_id: str = "s1",
+):
     entry = bank.put(
         runtime=RUNTIME,
         token_ids=tokens,
         cache=[],
         logits=None,
         hidden=None,
-        session_id="s1",
+        session_id=session_id,
         nbytes_override=16,
     )
     assert entry is not None
@@ -153,7 +159,7 @@ class _MissingColdTier:
         return {"enabled": True, "last_miss_reason": self.last_miss_reason}
 
 
-def test_ssd_prefix_miss_stays_the_cold_reason_and_the_ram_reason_survives():
+def test_a_shared_prefix_below_the_minimum_reads_as_no_shared_prefix_and_the_ram_reason_survives():
     bank = _bank(cold_tier=_MissingColdTier())
     _put(bank, SHARED + list(range(80)))
     prompt = SHARED + [7] * 100
@@ -162,7 +168,7 @@ def test_ssd_prefix_miss_stays_the_cold_reason_and_the_ram_reason_survives():
     assert bank.restore(RUNTIME, prompt, session_id="s1") is None
 
     health = bank.to_dict()
-    assert health["last_miss_reason"] == "ssd_prefix_miss"
+    assert health["last_miss_reason"] == "prefix_divergence_at_token"
     assert health["last_ram_miss_reason"] == "below_block_min_match:512"
 
 
@@ -248,3 +254,44 @@ def test_duck_typed_bank_without_diagnostic_is_tolerated():
     del bank.last_prefix_diagnostic
 
     assert _near_lane(bank) is None
+
+
+# --- a plain SSD miss is reported as what it meant --------------------------
+
+
+class _FailingColdTier(_MissingColdTier):
+    last_miss_reason = "ssd_restore_error:OSError"
+
+
+def _restore(bank, prompt, session_id="s1"):
+    return bank.restore(RUNTIME, prompt, session_id=session_id)
+
+
+def test_a_new_conversation_on_an_empty_bank_is_new_session():
+    bank = _bank(cold_tier=_MissingColdTier())
+    assert _restore(bank, SHARED) is None
+    assert bank.last_miss_reason == "new_session"
+
+
+def test_stored_conversations_without_a_shared_prefix_read_as_prefix_divergence():
+    bank = _bank(cold_tier=_MissingColdTier())
+    _put(bank, SHARED)
+    assert _restore(bank, [1, 2, 3], session_id="other") is None
+    assert bank.last_miss_reason == "prefix_divergence_at_token"
+
+
+def test_the_conversations_own_evicted_turn_reads_as_evicted():
+    bank = _bank(cold_tier=_MissingColdTier())
+    entry = _put(bank, SHARED + [5, 6], session_id="s1")
+    bank._evict_entry(entry, reason="evicted")
+    assert _restore(bank, SHARED + [5, 6, 7, 8], session_id="s1") is None
+    assert bank.last_miss_reason == "evicted"
+    # Another conversation with the same text is not the owner of that turn.
+    assert _restore(bank, SHARED + [5, 6, 7, 8], session_id="s2") is None
+    assert bank.last_miss_reason == "new_session"
+
+
+def test_a_real_ssd_failure_is_passed_through():
+    bank = _bank(cold_tier=_FailingColdTier())
+    assert _restore(bank, SHARED) is None
+    assert bank.last_miss_reason == "ssd_restore_error:OSError"

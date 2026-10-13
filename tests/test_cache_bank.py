@@ -457,7 +457,7 @@ def test_session_bank_ssd_different_session_different_prompt_misses(tmp_path):
         )
 
         assert restored is None
-        assert bank.last_miss_reason == "ssd_prefix_miss"
+        assert bank.last_miss_reason == "new_session"
     finally:
         cold.close()
 
@@ -950,7 +950,7 @@ def test_session_bank_cold_tier_rejects_identity_mismatch(tmp_path):
         )
 
         assert restored is None
-        assert bank.last_miss_reason == "ssd_prefix_miss"
+        assert bank.last_miss_reason == "new_session"
     finally:
         cold.close()
 

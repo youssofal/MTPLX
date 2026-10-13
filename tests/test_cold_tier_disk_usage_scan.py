@@ -213,7 +213,7 @@ def test_lookup_miss_reads_last_miss_reason_without_stats(tmp_path, monkeypatch)
             policy_fingerprint="policy-a",
         )
         assert restored is None
-        assert bank.last_miss_reason == "ssd_prefix_miss"
+        assert bank.last_miss_reason == "new_session"
         assert cold.last_miss_reason == "ssd_prefix_miss"
         assert stats_calls[0] == 0
     finally:

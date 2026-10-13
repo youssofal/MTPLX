@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **A request that found nothing to reuse says why, and the dashboard stops labelling normal misses as an SSD fault.** The request log's `cache_miss_reason` used to read `ssd_prefix_miss` for almost every miss, because the SSD is the last place searched, and the dashboard showed it in orange. It now reports `new_session` (a new conversation), `prefix_divergence_at_token` (other conversations are stored but share less than the reuse minimum with this prompt) or `evicted` (the conversation's own earlier turn left memory and is not on the SSD). `ssd_prefix_miss` is still reported when the memory lane refused a prefix for another reason (see `last_ram_miss_reason`), and a failed SSD lookup or restore keeps its `ssd_restore_error:*` and `ssd_missing_*` reasons. The dashboard shows NEW CHAT and NO SHARED PREFIX in grey, EVICTED in yellow and SSD ERROR in orange, with the precise reason in the tooltip.
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed

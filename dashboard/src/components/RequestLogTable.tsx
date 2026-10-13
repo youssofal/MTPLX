@@ -4,6 +4,7 @@ import { Card } from "./Card";
 import { useRecentRequests } from "../hooks/usePolling";
 import { fmtNumber, fmtSeconds, fmtTokS, relativeTime, truncateMiddle } from "../lib/utils";
 import { useDashboardStore, useFilteredRecent } from "../state/store";
+import { cacheMissBadge } from "../lib/cacheMiss";
 import type { MetricsLatest } from "../lib/types";
 
 export function RequestLogTable() {
@@ -122,7 +123,7 @@ function Td({
   );
 }
 
-function Row({
+export function Row({
   row,
   isOpen,
   onToggle,
@@ -133,11 +134,12 @@ function Row({
 }) {
   const sessionId = row.session_id ?? "—";
   const cacheBadge = row.session_cache_hit
-    ? { label: "HIT", color: "text-[var(--accent)] bg-[var(--accent)]/10" }
-    : {
-        label: (row.cache_miss_reason ?? "MISS").toUpperCase(),
-        color: "text-[var(--accent-warm)] bg-[var(--accent-warm)]/10",
-      };
+    ? {
+        label: "HIT",
+        color: "text-[var(--accent)] bg-[var(--accent)]/10",
+        tooltip: "Served from the session cache.",
+      }
+    : cacheMissBadge(row.cache_miss_reason);
   return (
     <>
       <tr className="border-t border-[var(--border-soft)] hover:bg-[var(--bg-elevated)]/60">
@@ -164,6 +166,7 @@ function Row({
         <Td align="right">{fmtNumber(row.verify_calls)}</Td>
         <Td>
           <span
+            title={cacheBadge.tooltip}
             className={`px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wider ${cacheBadge.color}`}
           >
             {cacheBadge.label}
