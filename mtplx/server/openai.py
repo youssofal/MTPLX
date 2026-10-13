@@ -2137,6 +2137,7 @@ class AnthropicMessagesRequest(BaseModel):
     tool_choice: Any = None
     thinking: Any | None = None
     chat_template_kwargs: dict[str, Any] | None = None
+    output_config: Any | None = None
     depth: int | None = None
     draft_block_size: int | None = None
     gemma_draft_block_size: int | None = None
@@ -6595,6 +6596,27 @@ def _anthropic_disable_parallel_tool_use(tool_choice: Any) -> bool | None:
     return bool(raw)
 
 
+# Claude Code sends output_config.effort in Anthropic's vocabulary, which has
+# "max" and "none"; the chat-template vocabulary has neither.
+_ANTHROPIC_EFFORT_TO_REASONING_EFFORT = {
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "xhigh",
+    "none": "low",
+}
+
+
+def _anthropic_output_config_effort(output_config: Any) -> str | None:
+    if not isinstance(output_config, dict):
+        return None
+    effort = output_config.get("effort")
+    if not isinstance(effort, str):
+        return None
+    return _ANTHROPIC_EFFORT_TO_REASONING_EFFORT.get(effort.strip().lower())
+
+
 def _anthropic_to_chat_request(
     request: AnthropicMessagesRequest,
 ) -> ChatCompletionRequest:
@@ -6617,6 +6639,10 @@ def _anthropic_to_chat_request(
     requested_effort = getattr(request, "reasoning_effort", None)
     if isinstance(requested_effort, str) and requested_effort.strip():
         extra_fields["reasoning_effort"] = requested_effort.strip()
+    else:
+        output_config_effort = _anthropic_output_config_effort(request.output_config)
+        if output_config_effort:
+            extra_fields["reasoning_effort"] = output_config_effort
     disable_parallel = _anthropic_disable_parallel_tool_use(request.tool_choice)
     chat_request = ChatCompletionRequest(
         model=request.model,
