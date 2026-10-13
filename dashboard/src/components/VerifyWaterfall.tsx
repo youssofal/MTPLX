@@ -29,9 +29,17 @@ const SLICES: Slice[] = [
   { key: "rollback_time_s", label: "rollback", color: "rgba(240,88,106,0.55)", description: "State rollback after reject" },
 ];
 
-const MODES: { value: WaterfallMode; label: string }[] = [
-  { value: "request", label: "per request" },
-  { value: "round", label: "per round (avg)" },
+const MODES: { value: WaterfallMode; label: string; hint: string }[] = [
+  {
+    value: "request",
+    label: "per request",
+    hint: "Summed over every verify round of the last request (one answer). Grows with the answer's length.",
+  },
+  {
+    value: "round",
+    label: "per round (avg)",
+    hint: "One verify round: the draft proposes tokens and the target model checks them in one forward. Request totals divided by its rounds; comparable across requests.",
+  },
 ];
 
 function ModeToggle({
@@ -49,6 +57,7 @@ function ModeToggle({
           type="button"
           onClick={() => onChange(mode.value)}
           aria-pressed={value === mode.value}
+          title={mode.hint}
           className={cn(
             "px-2 py-0.5 rounded transition-colors",
             value === mode.value
