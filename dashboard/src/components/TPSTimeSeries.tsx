@@ -5,6 +5,7 @@ import { Card } from "./Card";
 import { useDashboardStore, useFilteredHistory } from "../state/store";
 import { fmtTokS } from "../lib/utils";
 import { autoAxisSize } from "../lib/uplotAxis";
+import { cursorValueTooltip } from "../lib/uplotTooltip";
 
 export function TPSTimeSeries() {
   const history = useFilteredHistory();
@@ -61,6 +62,7 @@ export function TPSTimeSeries() {
         },
       ],
       legend: { show: false },
+      plugins: [cursorValueTooltip((value) => `${fmtTokS(value)} tok/s`)],
       series: [
         {},
         {
