@@ -4676,6 +4676,12 @@ def configure_tail_owned_attention_kv_cache(cache: list[Any]) -> dict[str, int |
             turboquant_config=turboquant_config,
             kv_quant_config=kv_quant_config_from_env(),
         )
+    from .segmented_kv import install_segmented_attention_kv_cache, segmented_kv_enabled
+
+    if segmented_kv_enabled():
+        # MTPLX_SEGMENTED_KV=1: sealed segments plus a growing tail per full-attention
+        # layer (mtplx/segmented_kv.py). Paged/quantized KV (above) keeps its own layout.
+        return install_segmented_attention_kv_cache(cache)
     raw = os.environ.get("MTPLX_OWNED_ATTN_KV") or ""
     normalized = raw.strip().lower().replace("-", "_")
     if normalized not in {
@@ -5015,7 +5021,14 @@ def restore_cache(
     restore_meta_state: bool = True,
     clone_states: bool = True,
 ) -> None:
+    from .segmented_kv import adapt_layer_for_restore, segmented_kv_enabled
+
+    segmented = segmented_kv_enabled()
     for entry, state, meta_state in zip(cache, snapshot.states, snapshot.meta_states):
+        if segmented and state is not None:
+            # MTPLX_SEGMENTED_KV: a segment cache takes either snapshot kind; a stock
+            # layer (MTP, recurrent) gets a segmented snapshot as contiguous rows.
+            state = adapt_layer_for_restore(entry, state)
         if state is not None:
             install_view = not clone_states and _is_trimmable(entry)
             _restore_state_preserving_container(entry, state, clone=not install_view)

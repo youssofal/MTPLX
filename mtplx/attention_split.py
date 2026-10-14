@@ -19,6 +19,16 @@ from .rope_origin import (
     note_unowned_rotary_origin,
     rope_offset_of,
 )
+from .segmented_kv import (
+    VERIFY_WINDOW_MAX,
+    SegmentedKVCache,
+    attend_segments_lse,
+    decode_segments_attention,
+    gathered_view,
+    segmented_kv_requested,
+)
+from .segmented_kv import count_route as segmented_count
+from .segmented_kv import prefill_route as segmented_prefill_route
 
 
 def _env_enabled(name: str, *, default: bool = False) -> bool:
@@ -336,6 +346,39 @@ def _attention_has_gated_q_proj(attn: Any) -> bool:
     return int(weight.shape[0]) == expected
 
 
+def _attention_has_plain_q_proj(attn: Any) -> bool:
+    """Plain q/k-norm attention (Qwen3): q_proj has one output per head dimension, no gate."""
+    q_proj = getattr(attn, "q_proj", None)
+    q_norm = getattr(attn, "q_norm", None)
+    weight = getattr(q_proj, "weight", None)
+    norm_weight = getattr(q_norm, "weight", None)
+    if weight is None or norm_weight is None:
+        return False
+    num_heads = int(getattr(attn, "num_attention_heads", getattr(attn, "n_heads", 0)))
+    return int(weight.shape[0]) == num_heads * int(norm_weight.shape[0])
+
+
+def _attention_has_unnormed_q_proj(attn: Any) -> bool:
+    """Llama-style attention (Llama, Mistral): q/k/v projections and rope, no q/k norm, no gate."""
+    if getattr(attn, "q_norm", None) is not None or getattr(attn, "k_norm", None) is not None:
+        return False
+    if any(getattr(attn, name, None) is None for name in ("k_proj", "v_proj", "o_proj", "rope")):
+        return False
+    weight = getattr(getattr(attn, "q_proj", None), "weight", None)
+    head_dim = getattr(attn, "head_dim", None)
+    if not head_dim and getattr(attn, "scale", None):
+        head_dim = round(float(attn.scale) ** -2)
+    num_heads = int(getattr(attn, "num_attention_heads", getattr(attn, "n_heads", 0)))
+    if weight is None or not head_dim or not num_heads:
+        return False
+    return int(weight.shape[0]) == num_heads * int(head_dim)
+
+
+def _attention_has_ungated_q_proj(attn: Any) -> bool:
+    """Ungated attention the hook body serves on a segmented cache (Qwen3, Llama, Mistral)."""
+    return _attention_has_plain_q_proj(attn) or _attention_has_unnormed_q_proj(attn)
+
+
 def _install_split_attention_hook(attn: Any) -> bool:
     cls = type(attn)
     if getattr(cls, "_mtplx_split_full_attention_installed", False):
@@ -350,7 +393,11 @@ def _install_split_attention_hook(attn: Any) -> bool:
         cache: Any | None = None,
     ) -> mx.array:
         route_off = not getattr(self, "_mtplx_split_full_attention_enabled", False)
-        if route_off and not cache_owns_rotary_origin(cache):
+        if (
+            route_off
+            and not cache_owns_rotary_origin(cache)
+            and not isinstance(cache, SegmentedKVCache)
+        ):
             # No MTPLX attention route asked for, and the cache has no rotary
             # origin of its own: the stock forward, untouched. A cache that
             # owns one (an image request on a compiled route) rotates at it
@@ -371,27 +418,44 @@ def _install_split_attention_hook(attn: Any) -> bool:
             # standalone sigmoid eagerly and a fused one inside the compiled
             # verifier's trace, which differ in the last bit of some bfloat16
             # and float32 values (mtplx/attention_math.py).
-        if not _attention_has_gated_q_proj(self):
+            # A segmented cache always takes the body (the segment route
+            # below), under any profile: the stock forward would gather the
+            # history on every call.
+        gated_q_proj = _attention_has_gated_q_proj(self)
+        if not gated_q_proj and not (
+            isinstance(cache, SegmentedKVCache) and _attention_has_ungated_q_proj(self)
+        ):
+            # Only the gated (Qwen3-Next style) attention goes through this body, and, for
+            # MTPLX_SEGMENTED_KV, an ungated attention (Qwen3 with q/k norm, Llama and
+            # Mistral without) on a segmented cache: the stock forward would gather the
+            # history on every call.
             return original_call(self, x, mask=mask, cache=cache)
 
         from mlx_lm.models.base import scaled_dot_product_attention
 
+        n_heads = getattr(self, "num_attention_heads", None) or self.n_heads
+        n_kv_heads = getattr(self, "num_key_value_heads", None) or self.n_kv_heads
         B, L, _ = x.shape
         q_proj_output = self.q_proj(x)
-        queries, gate = mx.split(
-            q_proj_output.reshape(B, L, self.num_attention_heads, -1),
-            2,
-            axis=-1,
-        )
-        gate = gate.reshape(B, L, -1)
+        if gated_q_proj:
+            queries, gate = mx.split(
+                q_proj_output.reshape(B, L, n_heads, -1),
+                2,
+                axis=-1,
+            )
+            gate = gate.reshape(B, L, -1)
+        else:
+            queries, gate = q_proj_output.reshape(B, L, n_heads, -1), None
 
         keys = self.k_proj(x)
         values = self.v_proj(x)
-        queries = self.q_norm(queries).transpose(0, 2, 1, 3)
-        keys = self.k_norm(
-            keys.reshape(B, L, self.num_key_value_heads, -1)
-        ).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
+        keys = keys.reshape(B, L, n_kv_heads, -1)
+        if getattr(self, "q_norm", None) is not None:
+            queries = self.q_norm(queries)
+            keys = self.k_norm(keys)
+        queries = queries.transpose(0, 2, 1, 3)
+        keys = keys.transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, n_kv_heads, -1).transpose(
             0,
             2,
             1,
@@ -425,11 +489,51 @@ def _install_split_attention_hook(attn: Any) -> bool:
             and int(B) == 1
             and can_slice_mask
         )
+        segmented_output = None
+        segmented_route = ""
         if cache is not None:
             rope_offset = _cache_rope_offset(cache)
             queries = self.rope(queries, offset=rope_offset)
             keys = self.rope(keys, offset=rope_offset)
-            if blockwise_enabled or vllm_metal_paged_enabled:
+            if isinstance(cache, SegmentedKVCache):
+                # Sealed segments plus a tail (MTPLX_SEGMENTED_KV): the new rows go to
+                # the tail. A prefill chunk over several segments takes the logsumexp
+                # route and a verify window attends straight over the segments; any
+                # other call runs the ladder below on one view of the rows (zero-copy
+                # for a single segment, gathered otherwise).
+                cache.append_rows(keys, values)
+                if (
+                    int(queries.shape[2]) > VERIFY_WINDOW_MAX
+                    and cache.segment_count > 1
+                    and segmented_prefill_route() == "lse"
+                    and (mask is None or (isinstance(mask, str) and mask == "causal"))
+                ):
+                    segmented_output = attend_segments_lse(
+                        queries, cache, scale=self.scale
+                    )
+                    segmented_route = "segments_lse"
+                    segmented_count("prefill_lse")
+                else:
+                    segmented_output = decode_segments_attention(
+                        queries,
+                        cache,
+                        scale=self.scale,
+                        mask=mask,
+                        packed_threshold=int(
+                            getattr(self, "_mtplx_gqa_packed_sdpa_threshold", 8192)
+                        ),
+                    )
+                    segmented_route = "nax_flash_segments"
+                if segmented_output is None:
+                    q_rows = int(queries.shape[2])
+                    segmented_count(
+                        f"{'single' if cache.segment_count == 1 else 'gather'}_q"
+                        f"{q_rows if q_rows <= VERIFY_WINDOW_MAX else 'prefill'}"
+                    )
+                    view = gathered_view(cache)
+                    keys, values = view.keys, view.values
+                    cache = view
+            elif blockwise_enabled or vllm_metal_paged_enabled:
                 cache.update_without_fetch(keys, values)
             else:
                 keys, values = cache.update_and_fetch(keys, values)
@@ -559,7 +663,10 @@ def _install_split_attention_hook(attn: Any) -> bool:
         )
         route = "sdpa"
         fallback = ""
-        if should_use_vllm_metal_paged:
+        if segmented_output is not None:
+            output = segmented_output
+            route = segmented_route
+        elif should_use_vllm_metal_paged:
             impl_override = (
                 "fast_sdpa_gather"
                 if getattr(self, "_mtplx_vllm_metal_exact_gather_layer", False)
@@ -799,6 +906,8 @@ def _install_split_attention_hook(attn: Any) -> bool:
             )
         _note_kv_attention(self, cache, queries, output, mask, route, fallback)
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        if gate is None:
+            return self.o_proj(output)
         return self.o_proj(attention_gate(output, gate))
 
     cls.__call__ = split_call
@@ -883,6 +992,7 @@ def configure_split_full_attention(
     }
     full_layers = list(_full_attention_layers(model))
     full_layer_count = len(full_layers)
+    hooked_layers: list[bool] = []
     for full_idx, attn in enumerate(full_layers):
         exact_gather_layer = bool(
             vllm_metal_paged
@@ -894,7 +1004,13 @@ def configure_split_full_attention(
                 )
             )
         )
-        stats["installed"] += int(_install_split_attention_hook(attn))
+        newly_hooked = bool(_install_split_attention_hook(attn))
+        # The hook is installed once per attention class: later instances report False.
+        hooked_layers.append(
+            (newly_hooked or bool(getattr(type(attn), "_mtplx_split_full_attention_installed", False)))
+            and (_attention_has_gated_q_proj(attn) or _attention_has_ungated_q_proj(attn))
+        )
+        stats["installed"] += int(newly_hooked)
         attn._mtplx_split_full_attention_enabled = bool(
             active or sdpa_2pass or vllm_metal_paged or gqa_packed
         )
@@ -916,4 +1032,11 @@ def configure_split_full_attention(
         attn._mtplx_split_full_attention_calls = 0
         stats["layers"] += 1
         stats["exact_gather_layers"] += int(exact_gather_layer)
+    if segmented_kv_requested():
+        # MTPLX_SEGMENTED_KV: decide once, from the hooked layers, whether this model can use
+        # segments without ever falling back to a gather (mtplx/segmented_kv.py).
+        from .segmented_kv import evaluate_model_support
+
+        verdict = evaluate_model_support(full_layers, hooked=hooked_layers)
+        stats["segmented_kv_supported"] = bool(verdict["supported"])
     return stats

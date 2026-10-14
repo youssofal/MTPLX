@@ -35,6 +35,15 @@ from .cache_bank.codec import ColdEncodeInterrupted
 from .checkpoint_anchors import AnchorPlan, default_tail_backoff, retain_checkpoints
 from .runtime import MTPLXRuntime
 from .runtime_options import block_prefix_restore_enabled
+from .segmented_kv import (
+    SegmentedKVCache,
+    SegmentedKVState,
+    segmented_kv_enabled,
+    segmented_kv_health,
+    segmented_ssd_enabled,
+    unique_state_bytes,
+    walk_segmented_states,
+)
 
 
 def _policy_uses_committed_history(policy: str | None) -> bool:
@@ -390,11 +399,38 @@ def _tree_nbytes(value: Any) -> int:
         return _tree_nbytes(value.states) + _tree_nbytes(value.meta_states)
     if isinstance(value, mx.array):
         return int(value.nbytes)
+    if isinstance(value, SegmentedKVState):
+        # The segments it references, counted as if it were alone; segments that several
+        # entries share are taken out once in ``SessionBank.total_nbytes``.
+        return int(value.nbytes)
     if isinstance(value, (list, tuple)):
         return sum(_tree_nbytes(item) for item in value)
     if isinstance(value, dict):
         return sum(_tree_nbytes(item) for item in value.values())
     return 0
+
+
+def _entry_segmented_states(entry: Any) -> list[SegmentedKVState]:
+    """The segmented KV states a bank entry's cache snapshot holds (empty for a stock snapshot)."""
+    snapshot = getattr(entry, "cache_snapshot", None)
+    if snapshot is None:
+        return []
+    return list(walk_segmented_states(snapshot.states))
+
+
+def entry_has_segmented_kv(entry: Any) -> bool:
+    return bool(_entry_segmented_states(entry))
+
+
+def _cache_has_segmented_kv(cache: list[Any] | None) -> bool:
+    return any(isinstance(layer, SegmentedKVCache) for layer in cache or ())
+
+
+def _shared_segment_overcount(entries: list[Any]) -> int:
+    """Bytes counted more than once because several snapshots reference the same segment."""
+    states = [state for entry in entries for state in _entry_segmented_states(entry)]
+    naive = sum(int(state.nbytes) for state in states)
+    return max(0, naive - unique_state_bytes(states))
 
 
 def _snapshot_nbytes(snapshot: CacheSnapshot) -> int:
@@ -1266,7 +1302,12 @@ class SessionBank:
         # "nothing sheddable", shrink_to_bytes never entered its loop, and the
         # dynamic ceiling (working set = active - weights - this total) took
         # the lease for working set and evicted the durable snapshots instead.
-        return sum(entry.held_nbytes for entry in list(self._entries.values()))
+        entries = list(self._entries.values())
+        total = sum(entry.held_nbytes for entry in entries)
+        if segmented_kv_enabled():
+            # A segment that several entries reference is held once (mtplx/segmented_kv.py).
+            total -= _shared_segment_overcount(entries)
+        return total
 
     @property
     def lease_entries(self) -> int:
@@ -2361,6 +2402,8 @@ class SessionBank:
                 draft_head_identity=draft_head_identity,
                 policy_fingerprint=policy_fingerprint,
                 ram_refusal=ram_refusal,
+                cache_factory=cache_factory,
+                mtp_cache_factory=mtp_cache_factory,
             )
 
         entry = self.longest_prefix(token_ids)
@@ -2911,6 +2954,13 @@ class SessionBank:
         return bool(flush(timeout_s=timeout_s))
 
     def to_dict(self) -> dict[str, Any]:
+        payload = self._to_dict()
+        segmented = segmented_kv_health(list(self._entries.values()))
+        if segmented is not None:
+            payload["segmented_kv"] = segmented  # MTPLX_SEGMENTED_KV only; absent otherwise
+        return payload
+
+    def _to_dict(self) -> dict[str, Any]:
         return {
             "max_entries": self.max_entries,
             "max_bytes": self.max_bytes,
@@ -3113,6 +3163,14 @@ class SessionBank:
                 cold["enabled"] = False
                 cold["skip_reason"] = "no_cold_tier"
             return
+        if entry_has_segmented_kv(entry) and not segmented_ssd_enabled():
+            # MTPLX_SEGMENTED_KV_SSD=0: a segmented snapshot is a list of references and is not
+            # persisted. By default the codec encodes it as the stock tensors of the same rows
+            # (mtplx/cache_bank/codec.py, mtplx/segmented_kv.py:SegmentedRows).
+            if cold is not None:
+                cold["enabled"] = False
+                cold["skip_reason"] = "segmented_kv"
+            return
         put_entry = getattr(self.cold_tier, "put_entry", None)
         if not callable(put_entry):
             if cold is not None:
@@ -3278,6 +3336,8 @@ class SessionBank:
         cold = self.cold_tier
         if cold is None or not callable(getattr(cold, "spill_entry", None)):
             return
+        if _cache_has_segmented_kv(entry.cache_ref) and not segmented_ssd_enabled():
+            return
         if self.cold_enqueue_dispatch is None:
             self.eviction_log.append(
                 {
@@ -3339,6 +3399,8 @@ class SessionBank:
         cold = self.cold_tier
         spill = getattr(cold, "spill_entry", None) if cold is not None else None
         if not callable(spill):
+            return False
+        if _cache_has_segmented_kv(entry.cache_ref) and not segmented_ssd_enabled():
             return False
         try:
             snapshot = snapshot_cache_lazy_hybrid(entry.cache_ref)
@@ -3419,7 +3481,12 @@ class SessionBank:
         draft_head_identity: str | None,
         policy_fingerprint: str | None,
         ram_refusal: dict[str, Any] | None = None,
+        cache_factory: Callable[[], list[Any]] | None = None,
+        mtp_cache_factory: Callable[[], list[Any]] | None = None,
     ) -> SessionBankRestore | None:
+        # cache_factory / mtp_cache_factory: the request's cache layout, the same
+        # factories restore() hands to its RAM restore.
+        #
         # ram_refusal: restore() refused this lookup's longest RAM prefix
         # (ram_miss_reason, ram_refused_prefix_len, ram_refused_session_id).
         # It stays in the diagnostic whatever this lookup finds.
@@ -3519,14 +3586,28 @@ class SessionBank:
         ):
             self.last_miss_reason = CacheMissReason.SNAPSHOT_DESYNC.value
             return None
-        cache = runtime.make_cache()
-        restore_cache(cache, entry.cache_snapshot)
+        # The request's cache layout, exactly as a RAM restore builds it (restore() above).
+        # runtime.make_cache() is the default layout, which for a long context is the paged
+        # KV cache: about 5x slower prefill and slower decode than the dense cache the request
+        # asked for (Qwen3.8 27B, 2026-10-08: first token after an SSD restore at 50K and 80K
+        # 16 to 48 s with the default layout, 5 to 8 s with the request's). As in the RAM
+        # restore, the stored meta state is not imposed on the request's cache.
+        cache = cache_factory() if cache_factory is not None else runtime.make_cache()
+        restore_cache(
+            cache,
+            entry.cache_snapshot,
+            restore_meta_state=cache_factory is None,
+        )
         # Read back from disk, the entry's floor is its restored caches'.
         entry.restore_floor_tokens = _cache_restore_floor(cache)
         entry.window_nbytes = _cache_window_nbytes(cache)
         mtp_history_cache = None
         if entry.mtp_history_snapshot is not None:
-            mtp_history_cache = runtime.make_mtp_cache()
+            mtp_history_cache = (
+                mtp_cache_factory()
+                if mtp_cache_factory is not None
+                else runtime.make_mtp_cache()
+            )
             restore_cache(mtp_history_cache, entry.mtp_history_snapshot)
         entry.hits += 1
         entry.last_access_s = time.time()

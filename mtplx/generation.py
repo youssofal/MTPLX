@@ -2447,6 +2447,18 @@ def _sustained_prefill_layout(context_tokens: int | None = None) -> str:
 
     if paged_kv_quant_mode_from_env() != "off":
         return "contiguous_then_repage"
+    from .segmented_kv import segmented_kv_enabled
+
+    if segmented_kv_enabled():
+        # Segments are the long-context layout, so there is no dense-decode
+        # ceiling: past it the repage would gather every segment into a paged
+        # copy of the history (VllmMetalPagedKVCache.from_cache reads
+        # ``keys``), the copy segments exist to avoid. 2026-10-10,
+        # Qwen3.8-27B on a 64 GB Mac (ceiling 157,286 tokens): a follow-up
+        # turn of 161,835 tokens, 84 of them new, was priced 11.6 GiB for
+        # that repage and refused with 10.1 GiB free, after the turn before
+        # it had decoded to 161,751 tokens on segments.
+        return "contiguous_dense_decode"
     if context_tokens is None:
         context_tokens = _env_int("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", 0)
     dense_max = _dense_decode_max_context()

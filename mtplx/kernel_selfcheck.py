@@ -95,6 +95,8 @@ def selfcheck_enabled(*, prism_ternary: bool = False, flash_next: bool = False) 
     ``flash_next``: the model is a Flash-Next (qwen4_exp) load, likewise for
     its four prefill kernels.
     """
+    from .segmented_kv import segmented_kv_requested
+
     raw = str(os.environ.get("MTPLX_KERNEL_SELFCHECK", "")).strip().lower()
     if raw in {"0", "false", "off", "no"}:
         return False
@@ -102,6 +104,7 @@ def selfcheck_enabled(*, prism_ternary: bool = False, flash_next: bool = False) 
         return True
     return (
         prism_ternary
+        or segmented_kv_requested()
         or flash_next
         or _env_on("MTPLX_NAX_VERIFY")
         or _env_on("MTPLX_GQA_PACKED_SDPA")
@@ -274,6 +277,38 @@ def _check_gqa_packed(mx, dtype, kernel=None, *, d=128, q_len=4) -> float:
         scale=scale,
         mask=mask,
     )
+    return _max_abs_diff(mx, out, ref)
+
+
+def _check_segments(mx, dtype, *, d: int, gqa: int) -> float:
+    """The segment kernel over two segments against stock SDPA on the concatenated rows."""
+    from .kernels.sdpa_segmented import (
+        MAX_M_ROWS,
+        MAX_Q_LEN,
+        sdpa_nax_flash_dsplit_segments,
+    )
+
+    hk = 2
+    hq = hk * gqa
+    q_len = max(1, min(4, MAX_Q_LEN, MAX_M_ROWS // gqa))
+    rows, capacity = (192, 136), 256
+    scale = d**-0.5
+    mx.random.seed(13)
+
+    def buffer():
+        return (mx.random.normal((1, hk, capacity, d), dtype=mx.float32) * 0.5).astype(dtype)
+
+    queries = (mx.random.normal((1, hq, q_len, d), dtype=mx.float32) * 0.5).astype(dtype)
+    segments = [(buffer(), buffer(), n) for n in rows]
+    out = sdpa_nax_flash_dsplit_segments(queries=queries, segments=segments, scale=scale)
+    if out is None:
+        return float("inf")
+    keys = mx.concatenate([k[:, :, :n, :] for k, _, n in segments], axis=2)
+    values = mx.concatenate([v[:, :, :n, :] for _, v, n in segments], axis=2)
+    total = sum(rows)
+    # Tail-causal: query row j attends to rows n <= total - q_len + j.
+    mask = mx.arange(total).reshape(1, total) <= (total - q_len + mx.arange(q_len).reshape(q_len, 1))
+    ref = mx.fast.scaled_dot_product_attention(queries, keys, values, scale=scale, mask=mask)
     return _max_abs_diff(mx, out, ref)
 
 
@@ -934,6 +969,21 @@ def run_kernel_selfcheck(
         else:
             lanes[lane] = _STATUS_SKIPPED
 
+    # MTPLX_SEGMENTED_KV: the segment kernel at the loaded model's head_dim and GQA factor
+    # (any profile). A failure turns segments off for this load (stock caches), since a
+    # segmented cache without its kernel would gather the history on every call.
+    from .segmented_kv import kernel_probe_shapes
+
+    segment_shapes = kernel_probe_shapes()
+    if segment_shapes:
+        _record(
+            "segmented_kv_sdpa",
+            _SDPA_TOLERANCE,
+            lambda: max(_check_segments(mx, dtype, d=d, gqa=g) for d, g in segment_shapes),
+        )
+    else:
+        lanes["segmented_kv_sdpa"] = _STATUS_SKIPPED
+
     if _env_on("MTPLX_FUSE_POST_NORM_RESIDUAL"):
         # Bitwise gate: this lane's contract is exact identity with the
         # unfused reference (#319). _NORM_TOLERANCE stays loose only for
@@ -1049,6 +1099,10 @@ def run_kernel_selfcheck(
     _DISABLED_LANES.update(
         lane for lane, status in lanes.items() if status == _STATUS_FALLBACK
     )
+    if lanes.get("segmented_kv_sdpa") == _STATUS_FALLBACK:
+        from .segmented_kv import note_kernel_selfcheck_failed
+
+        note_kernel_selfcheck_failed()
     dtype_tag = {mx.bfloat16: "bfloat16", mx.float16: "float16"}.get(dtype, str(dtype))
     report = {
         "lanes": dict(lanes),
@@ -1161,4 +1215,9 @@ def maybe_run_model_selfcheck(model: Any) -> dict[str, Any] | None:
         return report
     except Exception as exc:  # noqa: BLE001 - probe must never block serving
         logger.warning("[mtplx] kernel selfcheck failed to run: %s", exc)
+        from .segmented_kv import kernel_probe_shapes, note_kernel_selfcheck_failed
+
+        if kernel_probe_shapes():
+            # The segment kernel went unchecked: stock caches, never an unprobed kernel.
+            note_kernel_selfcheck_failed()
         return None

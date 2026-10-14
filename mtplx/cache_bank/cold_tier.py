@@ -984,6 +984,25 @@ class SessionBankColdTier:
             on_unit=self._observe_encode_unit,
         )
         codec.tensors = _WriteThroughTensors()
+
+        def _known_blob(blob: dict[str, Any]) -> dict[str, Any] | None:
+            # MTPLX_SEGMENTED_KV: a block of an immutable segment hashed by an earlier spill.
+            # Claim first (so the orphan cleanup keeps it), then require it on disk.
+            digest = str(blob["sha256"])
+            if digest not in claimed_digests:
+                claimed_digests.add(digest)
+                tier._claim_inflight(digests={digest})
+            if not tier._blob_path(digest).exists():
+                return None
+            written_state["logical"] += int(blob["nbytes"])
+            written_state["deduped_hits"] += 1
+            return blob
+
+        def _on_block(rows: Any, start: int, end: int, name: str) -> None:
+            rows.remember_digest(start, end, tensor_blobs[name])
+
+        codec.known_blob = _known_blob
+        codec.on_block = _on_block
         boundaries = tuple(
             (int(r[0]), r[1], r[2] if len(r) > 2 else None)
             for r in (getattr(entry, "gdn_boundaries", None) or [])
@@ -1015,6 +1034,8 @@ class SessionBankColdTier:
                 "SessionBank SSD spill skipped: %s: %s", type(exc).__name__, exc
             )
             return False
+        for name, blob in codec.reused.items():
+            tensor_blobs[name] = dict(blob)
         if should_abort is not None:
             # Same fencing rationale as put_entry: the per-tensor evals
             # above schedule GPU work whose command buffers must drain in

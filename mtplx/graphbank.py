@@ -1510,6 +1510,13 @@ def promote_kv_cache_offsets(
                 cache[idx] = TensorOffsetVllmMetalPagedKVCache.from_paged_cache(entry)
                 promoted += 1
                 continue
+        from .segmented_kv import SegmentedKVCache
+
+        if isinstance(entry, SegmentedKVCache):
+            # A segmented KV cache (MTPLX_SEGMENTED_KV) has no single buffer for the
+            # tensor-offset adapter to adopt; the verify runs eager on it.
+            failures["segmented_kv_cache"] = failures.get("segmented_kv_cache", 0) + 1
+            continue
         offset = getattr(entry, "offset", None)
         if not isinstance(offset, int):
             continue
