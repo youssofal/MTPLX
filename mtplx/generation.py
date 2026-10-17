@@ -4177,6 +4177,11 @@ class GenerationFinalState:
     prompt_boundary_logits: Any | None = None
     prompt_boundary_hidden: Any | None = None
     prompt_boundary_extra_state: dict[str, Any] | None = None
+    # The prompt's recurrent checkpoints (``PromptState.gdn_boundaries``):
+    # records at positions inside the prompt describe a prefix of the final
+    # history too, so the generation-final commit can bank them. When the
+    # admission skips the prompt-prefix commit, no other entry carries them.
+    prompt_gdn_boundaries: tuple = ()
 
 
 def _finish_reason_from_tokens(
@@ -9584,6 +9589,7 @@ def generate_ar(
                 safe_to_commit=True,
                 finish_reason=finish_reason,
                 mtp_history_policy=prompt_state.mtp_history_policy,
+                prompt_gdn_boundaries=tuple(prompt_state.gdn_boundaries or ()),
             )
         except Exception as exc:  # capture only — never lose a finished response
             final_state = None
@@ -16509,6 +16515,7 @@ def generate_mtpk(
             # and the bank must hand the next turn a base that matches the
             # committed cache it stores.
             mtp_history_position_base=int(mtp_history_position_base),
+            prompt_gdn_boundaries=tuple(prompt_state.gdn_boundaries or ()),
         )
     reject_path_counts, repair_time_by_reject_depth = _reject_repair_breakdown(events)
     _forkev_snapshot: dict[str, object] = {}

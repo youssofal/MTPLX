@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **A cold prompt keeps its recurrent checkpoints when the memory admission skips the prompt-prefix commit.** On hybrid models the generation-final commit was then the turn's only bank entry, and it carried none of the prefill's checkpoints, so a later restore below the previous prompt's end (a new agent session with the same tools and system text, or a compacted history) fell back to an older entry or went cold. The generation-final commit now banks the prompt's checkpoints that the final history shares. Seen on Qwen 3.8 27B Optimized Speed with Claude Code agents (October 17): a shared 11,843-token head restored 1,024 tokens, and a new session restored none.
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed

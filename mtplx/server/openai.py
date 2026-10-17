@@ -27861,13 +27861,47 @@ def _generation_final_bank_values(
                 None,
             ),
         }
-    return {
+    values = {
         "token_ids": [int(token) for token in final_token_ids],
         "cache": final_state.final_trunk_cache,
         "logits": final_state.final_logits,
         "hidden": final_state.final_hidden,
         "extra_state": getattr(final_state, "extra_state", None),
     }
+    boundaries = _generation_final_prompt_boundaries(
+        final_state, prompt_ids=prompt_ids, final_token_ids=values["token_ids"]
+    )
+    if boundaries:
+        values["gdn_boundaries"] = boundaries
+    return values
+
+
+def _generation_final_prompt_boundaries(
+    final_state: Any,
+    *,
+    prompt_ids: Sequence[int],
+    final_token_ids: Sequence[int],
+) -> list[Any]:
+    """The prompt's recurrent checkpoints that the final history shares.
+
+    A checkpoint at position p is the recurrent state after the first p
+    tokens, so it stays valid for any history that starts with those tokens.
+    The prompt-prefix commit used to be the only entry that carried the
+    prefill's checkpoints; when the admission skips it (a cold prefill near
+    the memory line), the generation-final entry had none, put() found no
+    donor, and the checkpoints were lost: every later restore below the
+    previous prompt's end fell back to whatever older entry still had one.
+    """
+
+    records = list(getattr(final_state, "prompt_gdn_boundaries", None) or ())
+    if not records:
+        return []
+    shared = 0
+    for prompt_token, final_token in zip(prompt_ids, final_token_ids):
+        if int(prompt_token) != int(final_token):
+            break
+        shared += 1
+    return [record for record in records if 0 < int(record[0]) <= shared]
 
 
 def _store_generation_final_history_snapshot(
