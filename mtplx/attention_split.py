@@ -470,6 +470,9 @@ def _install_split_attention_hook(attn: Any) -> bool:
         # to the query-group kernel instead of the second-bank path the QL
         # sweep measured as the depth cliff. Off = shipping behavior.
         gqa_packed_wide = _env_enabled("MTPLX_GQA_PACKED_WIDE")
+        nax_flash_wide = _env_enabled("MTPLX_NAX_FLASH_WIDE") and _env_enabled(
+            "MTPLX_NAX_FLASH_ROUTE"
+        )
         should_use_gqa_packed = (
             gqa_packed_enabled
             and cache is not None
@@ -477,7 +480,13 @@ def _install_split_attention_hook(attn: Any) -> bool:
             and not vllm_metal_paged_enabled
             # 8 rows since 2026-07-21 (second float4 bank): depth 4's
             # verify window is q_len 5; QL <= 4 compiles identically.
-            and 2 <= int(queries.shape[2]) <= (16 if gqa_packed_wide else 8)
+            and 2 <= int(queries.shape[2]) <= max(
+                16 if gqa_packed_wide else 8,
+                # MTPLX_NAX_FLASH_WIDE: the flash-decoding kernel also takes the
+                # 9..32-row verify windows (context-copy blocks); the scalar
+                # packed kernels still stop at their own limits and bail.
+                32 if nax_flash_wide else 0,
+            )
             and can_slice_mask
             and getattr(cache, "keys", None) is not None
             and getattr(cache, "values", None) is not None
@@ -610,7 +619,10 @@ def _install_split_attention_hook(attn: Any) -> bool:
             # fall through to the scalar routes unchanged.
             if _env_enabled("MTPLX_NAX_FLASH_ROUTE") and int(queries.shape[2]) >= 2:
                 from .kernels.sdpa_nax_flash import sdpa_nax_flash
-                from .kernels.sdpa_nax_flash_dsplit import sdpa_nax_flash_dsplit
+                from .kernels.sdpa_nax_flash_dsplit import (
+                    sdpa_nax_flash_dsplit,
+                    sdpa_nax_flash_dsplit_wide,
+                )
 
                 # Variant B (head-dim split, 64 accumulators/thread, no spills) owns the
                 # M<=32 windows (QL<=5 at GQA 6): 0.917 vs 1.015 ms/layer at 72.7k, 0.257 vs
@@ -618,6 +630,22 @@ def _install_split_attention_hook(attn: Any) -> bool:
                 # the scalar routes on any contract miss.
                 if not lane_disabled("nax_flash_dsplit_sdpa"):
                     output = sdpa_nax_flash_dsplit(
+                        queries=queries,
+                        keys=cache.keys,
+                        values=cache.values,
+                        offset=cache.offset,
+                        scale=self.scale,
+                    )
+                # MTPLX_NAX_FLASH_WIDE: q_len 9..32 (54..192 rows per KV head) in one
+                # KV pass, the query rows tiled in groups inside the dsplit kernel.
+                # q_len 6..8 stay on variant A, which is as fast there.
+                if (
+                    output is None
+                    and nax_flash_wide
+                    and int(queries.shape[2]) >= 9
+                    and not lane_disabled("nax_flash_dsplit_wide_sdpa")
+                ):
+                    output = sdpa_nax_flash_dsplit_wide(
                         queries=queries,
                         keys=cache.keys,
                         values=cache.values,

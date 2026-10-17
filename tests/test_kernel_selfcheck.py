@@ -63,6 +63,29 @@ def test_nax_attention_selfcheck_failure_is_local_to_its_lane(monkeypatch) -> No
     assert report["lanes"]["gqa_packed_sdpa"] == "ok"
 
 
+def test_nax_dsplit4_selfcheck_failure_falls_back_to_two_way(monkeypatch) -> None:
+    if not nax_verify.nax_available():
+        pytest.skip("NAX hardware/OS unavailable")
+    from mtplx.kernels import sdpa_nax_flash_dsplit as module
+
+    monkeypatch.setenv("MTPLX_NAX_VERIFY", "0")
+    monkeypatch.setenv("MTPLX_GQA_PACKED_SDPA", "1")
+    monkeypatch.setenv("MTPLX_NAX_FLASH_ROUTE", "1")
+    monkeypatch.setenv("MTPLX_NAX_FLASH_DSPLIT4", "1")
+    real = module.sdpa_nax_flash_dsplit
+
+    def wrong_quarter(**kwargs):
+        if kwargs.get("ndh") == 4:
+            return None
+        return real(**kwargs)
+
+    monkeypatch.setattr(module, "sdpa_nax_flash_dsplit", wrong_quarter)
+    report = run_kernel_selfcheck(mx.bfloat16, 4, 64)
+    assert report["lanes"]["nax_flash_dsplit4_sdpa"] == "fallback"
+    assert lane_disabled("nax_flash_dsplit4_sdpa")
+    assert report["lanes"]["nax_flash_dsplit_sdpa"] == "ok"
+
+
 def test_selfcheck_mismatch_disables_lane_and_surfaces_in_health(monkeypatch) -> None:
     monkeypatch.setenv("MTPLX_NAX_VERIFY", "1")
     monkeypatch.setenv("MTPLX_GQA_PACKED_SDPA", "1")
