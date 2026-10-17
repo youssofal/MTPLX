@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Wide verify attention, behind `MTPLX_NAX_FLASH_WIDE=1` (off by default).** MLX's attention falls back to its unfused path for more than 8 query rows at head dimension 256, so a context-copy verify block of 9 to 32 rows read the dense KV cache several times: 112 ms at 16 rows and 131 ms at 24 rows per verify at an 80K prefix on Qwen3.8-27B. The head-dim-split TensorOps flash kernel now takes the 6 x q_len query rows of a KV head in groups of 32 inside one launch. On an M5 Pro 64 GB with the stock MLX 0.32.2 wheel the attention op at 80K takes 2.70, 3.69, 5.67 and 6.63 ms per layer at 9, 16, 24 and 32 rows (stock 9.83, 6.80, 7.88, 8.45), and a whole verify forward drops from 286 to 164 ms at 9 rows, 241 to 190 ms at 16 rows and 336 to 294 ms at 24 rows at 80K. End to end on context-copy edits at 81K tokens (depth 3, 3 repetitions) decode is 5 to 13% faster at 24 rows or fewer per verify; combined with `MTPLX_MULTIROW_QMM=1` it is 13 to 26% at temperature 0. Rows up to 8 are unchanged and bit-identical. (branch `perf/wide-verify-attention`, 2026-10-04)
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed

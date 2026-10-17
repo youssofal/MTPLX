@@ -34,12 +34,15 @@ nax_flash_dsplit_bail_counts: dict[str, int] = {}
 # its bails) — the one-line receipt the #459 reports needed.
 nax_flash_dsplit_dispatch_counts: dict[str, int] = {}
 
-# Template params: InT, PartT, D, QL, GQA_F.
+WIDE_MAX_Q = 32
+WIDE_MAX_ROWS = 192
+
+# Template params: InT, PartT, D, QL, GQA_F, TG_M (16-row blocks per threadgroup).
 _SOURCE = r"""
     constexpr int TK = 32;
     constexpr int MROWS = 16;
     constexpr int LIVE = GQA_F * QL;
-    constexpr int NSGM = (LIVE + MROWS - 1) / MROWS;
+    constexpr int NSGM = TG_M;                   // 16-row blocks per threadgroup
     constexpr int NDH = 2;                       // head-dim halves
     constexpr int DH = D / NDH;                  // dims per simdgroup
     constexpr int NSGS = NSGM * NDH;
@@ -63,7 +66,9 @@ _SOURCE = r"""
     const int kv_end = metal::min(kv_start + chunk, n_kv);
 
     const short2 sc = nax_get_coord(lane);
-    const int m_base = mg * MROWS;
+    // Query-row tiling (wide verify): grid.y walks row groups of NSGM * 16 rows, so one
+    // KV pass per group; groups of the same KV chunk are adjacent in dispatch order.
+    const int m_base = int(threadgroup_position_in_grid.y) * (NSGM * MROWS) + mg * MROWS;
     const int db = dh * DH;
 
     threadgroup float tg_s[2 * NSGS * SBUF];
@@ -296,15 +301,32 @@ def _default_dsplit_blocks(capacity: int) -> int:
     return 64
 
 
-def sdpa_nax_flash_dsplit(
+def _wide_rows_per_tg() -> int:
+    """16-row blocks per threadgroup for the wide route (MTPLX_NAX_FLASH_WIDE_TGM, default 2)."""
+    raw = (os.environ.get("MTPLX_NAX_FLASH_WIDE_TGM") or "").strip()
+    try:
+        return min(4, max(1, int(raw))) if raw else 2
+    except ValueError:
+        return 2
+
+
+def _default_wide_blocks(capacity: int, rows: int) -> int:
+    # Wide windows write rows x blocks x D partials; with many rows fewer, longer chunks
+    # keep that traffic small (see the wide-route sweep in the PR text).
+    base = _default_dsplit_blocks(capacity)
+    return max(32, base // 2) if rows > 64 else base
+
+
+def _dsplit_dispatch(
     *,
     queries: mx.array,
     keys: mx.array,
     values: mx.array,
     offset: int | mx.array,
     scale: float,
+    wide: bool,
 ) -> mx.array | None:
-    """Head-dim-split TensorOps flash SDPA. Same contract as the packed kernel."""
+    """Shared gate + dispatch. ``wide=False`` is the shipping M<=32 contract."""
     if os.environ.get("MTPLX_NAX_FLASH_DSPLIT", "1") == "0":
         return _bail("env_disabled")
     if not mx.metal.is_available():
@@ -321,10 +343,17 @@ def sdpa_nax_flash_dsplit(
     if hk <= 0 or hq % hk:
         return _bail("gqa_heads")
     gqa_factor = hq // hk
-    if gqa_factor * q_len > 32:
-        return _bail("m_rows_gt_32")
-    if q_len < 1 or q_len > 10:
-        return _bail("q_len")
+    live = gqa_factor * q_len
+    if wide:
+        if live > WIDE_MAX_ROWS:
+            return _bail("m_rows_gt_wide_max")
+        if q_len < 1 or q_len > WIDE_MAX_Q:
+            return _bail("q_len")
+    else:
+        if live > 32:
+            return _bail("m_rows_gt_32")
+        if q_len < 1 or q_len > 10:
+            return _bail("q_len")
     if queries.dtype not in (mx.bfloat16, mx.float16):
         return _bail("query_dtype")
     if keys.dtype != queries.dtype or values.dtype != queries.dtype:
@@ -343,7 +372,8 @@ def sdpa_nax_flash_dsplit(
             return _bail("offset_range")
         offset_arr = mx.array([offset_int], dtype=mx.int32)
 
-    blocks = int(os.environ.get("MTPLX_NAX_FLASH_DSPLIT_BLOCKS", "0") or 0) or _default_dsplit_blocks(capacity)
+    default_blocks = _default_wide_blocks(capacity, live) if wide else _default_dsplit_blocks(capacity)
+    blocks = int(os.environ.get("MTPLX_NAX_FLASH_DSPLIT_BLOCKS", "0") or 0) or default_blocks
     blocks = max(32, (blocks // 32) * 32)
     blocks_arr = mx.array([blocks], dtype=mx.int32)
 
@@ -352,8 +382,11 @@ def sdpa_nax_flash_dsplit(
     if kernel is None or reduce_kernel is None:
         return _bail("kernel_unavailable")
 
-    nsgm = (gqa_factor * q_len + 15) // 16
-    nthreads = 32 * nsgm * 2
+    # 16-row blocks per threadgroup and number of row groups (grid.y). The shipping
+    # contract (live <= 32) is one group covering every row, as before.
+    tg_m = min(_wide_rows_per_tg(), (live + 15) // 16) if wide else (live + 15) // 16
+    row_groups = (live + 16 * tg_m - 1) // (16 * tg_m)
+    nthreads = 32 * tg_m * 2
     partial_shape = (bsz, hq, q_len, blocks, d)
     stats_shape = (bsz, hq, q_len, blocks)
     try:
@@ -366,8 +399,9 @@ def sdpa_nax_flash_dsplit(
                 ("D", d),
                 ("QL", q_len),
                 ("GQA_F", gqa_factor),
+                ("TG_M", tg_m),
             ],
-            grid=(hk * nthreads, 1, blocks),
+            grid=(hk * nthreads, row_groups, blocks),
             threadgroup=(nthreads, 1, 1),
             output_shapes=[partial_shape, stats_shape, stats_shape],
             output_dtypes=[unnormalized_partials_dtype(queries.dtype), mx.float32, mx.float32],
@@ -386,5 +420,35 @@ def sdpa_nax_flash_dsplit(
         output_shapes=[(bsz, hq, q_len, d)],
         output_dtypes=[queries.dtype],
     )
-    nax_flash_dsplit_dispatch_counts["dispatched"] = nax_flash_dsplit_dispatch_counts.get("dispatched", 0) + 1
+    key = "dispatched_wide" if wide else "dispatched"
+    nax_flash_dsplit_dispatch_counts[key] = nax_flash_dsplit_dispatch_counts.get(key, 0) + 1
     return out
+
+
+def sdpa_nax_flash_dsplit(
+    *,
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    offset: int | mx.array,
+    scale: float,
+) -> mx.array | None:
+    """Head-dim-split TensorOps flash SDPA. Same contract as the packed kernel."""
+    return _dsplit_dispatch(
+        queries=queries, keys=keys, values=values, offset=offset, scale=scale, wide=False,
+    )
+
+
+def sdpa_nax_flash_dsplit_wide(
+    *,
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    offset: int | mx.array,
+    scale: float,
+) -> mx.array | None:
+    """Wide verify windows (6 x q_len up to 192 rows): the dsplit kernel with the query rows
+    tiled in groups inside one launch (grid.y), same tail-causal semantics."""
+    return _dsplit_dispatch(
+        queries=queries, keys=keys, values=values, offset=offset, scale=scale, wide=True,
+    )
