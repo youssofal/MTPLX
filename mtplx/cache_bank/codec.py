@@ -886,21 +886,81 @@ def _decode_tree_prefix(
     return decode_tree(spec, read_tensor)
 
 
+def _array_from_buffer(raw: Any, dtype: str) -> Any:
+    """One host copy of ``raw`` (bytes or a byte buffer) into a flat array."""
+    if dtype == "bfloat16":
+        return mx.array(np.frombuffer(raw, dtype=np.uint16)).view(mx.bfloat16)
+    np_dtype = _MLX_TO_NUMPY_DTYPE.get(dtype)
+    mlx_dtype = _NUMPY_TO_MLX_DTYPE.get(dtype)
+    if np_dtype is None or mlx_dtype is None:
+        raise ValueError(f"unsupported persisted tensor dtype: {dtype!r}")
+    return mx.array(np.frombuffer(raw, dtype=np_dtype), dtype=mlx_dtype)
+
+
+def _read_into_buffer(
+    read_tensor: Callable[[str], bytes], parts: list[dict[str, Any]]
+) -> Any | None:
+    """Read the blobs named by ``parts`` back to back into one host buffer.
+
+    Only when ``read_tensor`` carries a ``read_into`` hook (the cold tier's
+    parallel reader) and every part records its ``nbytes``; otherwise None,
+    and the caller reads blob by blob as before.
+    """
+    read_into = getattr(read_tensor, "read_into", None)
+    if read_into is None:
+        return None
+    try:
+        sizes = [int(part["nbytes"]) for part in parts]
+    except (KeyError, TypeError, ValueError):
+        return None
+    allocate = getattr(read_tensor, "allocate", None)
+    total = sum(sizes)
+    buffer = allocate(total) if allocate is not None else memoryview(bytearray(total))
+    items = []
+    offset = 0
+    for part, size in zip(parts, sizes):
+        items.append((str(part["name"]), buffer[offset : offset + size]))
+        offset += size
+    read_into(items)
+    return buffer
+
+
 def _decode_tensor(spec: dict[str, Any], read_tensor: Callable[[str], bytes]) -> Any:
     dtype = str(spec["dtype"])
     shape = tuple(int(dim) for dim in spec.get("shape") or [])
-    raw = read_tensor(str(spec["name"]))
-    if dtype == "bfloat16":
-        arr = mx.array(np.frombuffer(raw, dtype=np.uint16)).view(mx.bfloat16)
-    else:
-        np_dtype = _MLX_TO_NUMPY_DTYPE.get(dtype)
-        mlx_dtype = _NUMPY_TO_MLX_DTYPE.get(dtype)
-        if np_dtype is None or mlx_dtype is None:
-            raise ValueError(f"unsupported persisted tensor dtype: {dtype!r}")
-        arr = mx.array(np.frombuffer(raw, dtype=np_dtype), dtype=mlx_dtype)
+    raw = _read_into_buffer(read_tensor, [spec])
+    if raw is None:
+        raw = read_tensor(str(spec["name"]))
+    arr = _array_from_buffer(raw, dtype)
     if shape:
         arr = arr.reshape(shape)
     return arr
+
+
+def _decode_blocks_from_buffer(
+    blocks: list[dict[str, Any]], dtype: str, read_tensor: Callable[[str], bytes]
+) -> list[Any] | None:
+    """Every block of one tensor in one parallel read and one host copy.
+
+    The chunks are views of a single flat array; the concatenate that
+    follows is the only other copy, and it runs on the GPU.
+    """
+    raw = _read_into_buffer(read_tensor, blocks)
+    if raw is None:
+        return None
+    flat = _array_from_buffer(raw, dtype)
+    itemsize = int(flat.dtype.size)
+    chunks = []
+    offset = 0
+    for block in blocks:
+        count = int(block["nbytes"]) // itemsize
+        chunk = flat[offset : offset + count]
+        shape = block.get("shape")
+        if shape:
+            chunk = chunk.reshape(tuple(int(dim) for dim in shape))
+        chunks.append(chunk)
+        offset += count
+    return chunks
 
 
 def _decode_tensor_blocks(
@@ -914,10 +974,16 @@ def _decode_tensor_blocks(
     blocks = list(spec.get("blocks", []))
     if limit is not None:
         blocks = [block for block in blocks if int(block.get("start", 0)) < limit]
-    chunks = [
-        _decode_tensor({**block, "dtype": spec["dtype"]}, read_tensor)
-        for block in blocks
-    ]
+    chunks = (
+        _decode_blocks_from_buffer(blocks, str(spec["dtype"]), read_tensor)
+        if blocks
+        else None
+    )
+    if chunks is None:
+        chunks = [
+            _decode_tensor({**block, "dtype": spec["dtype"]}, read_tensor)
+            for block in blocks
+        ]
     if not chunks:
         shape = tuple(int(dim) for dim in spec.get("shape") or [])
         if limit is not None and axis < len(shape):

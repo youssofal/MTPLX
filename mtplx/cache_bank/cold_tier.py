@@ -19,6 +19,7 @@ from typing import Any, Callable
 
 from mtplx.cache_state import CacheSnapshot
 
+from .blob_io import StagingBuffer, read_into_many, write_file
 from .codec import (
     ColdEncodeInterrupted,
     TreeCodec,
@@ -1977,13 +1978,13 @@ class SessionBankColdTier:
         temp_path = path.with_name(f".{path.name}.tmp-{time.time_ns()}")
         try:
             try:
-                temp_path.write_bytes(raw)
+                write_file(temp_path, raw)
             except FileNotFoundError:
                 # An orphan cleanup pruned the now-empty prefix directory
                 # between the mkdir above and this write; the directory is
                 # ours to remake.
                 path.parent.mkdir(parents=True, exist_ok=True)
-                temp_path.write_bytes(raw)
+                write_file(temp_path, raw)
             try:
                 temp_path.rename(path)
             except FileExistsError:
@@ -2683,18 +2684,51 @@ class SessionBankColdTier:
         payload = json.loads(payload_path.read_text(encoding="utf-8"))
         tensor_blobs = dict(payload.get("tensor_blobs") or {})
 
-        def read_tensor(name: str) -> bytes:
+        def tensor_path(name: str) -> Path:
             blob = tensor_blobs.get(name)
             if blob:
-                path = self._blob_path(str(blob["sha256"]))
-                if not path.exists():
-                    raise FileNotFoundError(str(path))
-                return path.read_bytes()
-            path = entry_dir / "tensors" / f"{name}.bin"
+                return self._blob_path(str(blob["sha256"]))
+            return entry_dir / "tensors" / f"{name}.bin"
+
+        def read_tensor(name: str) -> bytes:
+            path = tensor_path(name)
             if not path.exists():
                 raise FileNotFoundError(str(path))
             return path.read_bytes()
 
+        # The codec reads through these when present: a tensor's blobs land
+        # in one buffer from parallel reads instead of one read_bytes each.
+        read_tensor.read_into = lambda items: read_into_many(  # type: ignore[attr-defined]
+            (tensor_path(name), view) for name, view in items
+        )
+        staging = StagingBuffer()
+        read_tensor.allocate = staging.allocate  # type: ignore[attr-defined]
+        try:
+            return self._decode_restore_row(
+                metadata,
+                token_ids,
+                payload,
+                read_tensor,
+                started_s=started_s,
+                require_exact_prefix=require_exact_prefix,
+                include_gdn_boundaries=include_gdn_boundaries,
+                prefix_restore_tokens=prefix_restore_tokens,
+            )
+        finally:
+            staging.release()
+
+    def _decode_restore_row(
+        self,
+        metadata: dict[str, Any],
+        token_ids: tuple[int, ...],
+        payload: dict[str, Any],
+        read_tensor: Callable[[str], bytes],
+        *,
+        started_s: float,
+        require_exact_prefix: bool,
+        include_gdn_boundaries: bool,
+        prefix_restore_tokens: int | None,
+    ) -> ColdRestoreRecord | None:
         payload_spec = payload["payload_spec"]
         partial_restore = (
             prefix_restore_tokens is not None
