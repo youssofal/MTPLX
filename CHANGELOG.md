@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **The SSD session cache drops entries this server can never use first** (by @jvmenen). Entries written by another model, another draft head, or under server-wide settings that have since changed (the server-level parts of the session fingerprint) could not be restored, yet eviction was plain least-recently-used, so they could fill the cap while every restore missed. They are now evicted before the server's own entries, and removed when the cache opens (and every six hours after writes) once unused for `MTPLX_SSD_FOREIGN_MAX_AGE_DAYS` days (default 7, `0` turns it off). Request-level choices such as thinking or the reasoning-history mode never make an entry foreign; shared blobs stay while another entry references them. `/health` and `/admin/cache/ssd` report `foreign_entries`, `foreign_bytes` and what was evicted or removed.
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed

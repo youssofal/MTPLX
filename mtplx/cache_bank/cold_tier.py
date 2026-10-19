@@ -106,6 +106,87 @@ DISK_USAGE_SCAN_YIELD_EVERY_FILES = 4096
 # this long is reported: it is the bound on how long a request waits.
 ENCODE_SLOW_UNIT_S = 1.0
 _COMMITTED_CACHE_POLICIES = frozenset({"committed", "last_window"})
+# Foreign entries (see ServerIdentity) not used for this many days are
+# removed when the store opens and by a periodic pass after writes.
+# MTPLX_SSD_FOREIGN_MAX_AGE_DAYS overrides it; 0 turns the removal off.
+DEFAULT_FOREIGN_MAX_AGE_DAYS = 7.0
+# A long-running server repeats the foreign-entry removal at most this often,
+# after a completed write; the pass at open covers restarts.
+FOREIGN_EXPIRY_INTERVAL_S = 6 * 3600.0
+
+
+def parse_policy_fingerprint(fingerprint: str | None) -> dict[str, str]:
+    """Split a session policy fingerprint (``key=value;key=value``) into parts.
+
+    A part without ``=`` carries no key and is skipped. The server derives
+    its own components with this same function, so a value that happens to
+    contain ``;`` splits identically on both sides of a comparison.
+    """
+
+    parts: dict[str, str] = {}
+    for part in str(fingerprint or "").split(";"):
+        key, sep, value = part.partition("=")
+        if sep and key:
+            parts[key] = value
+    return parts
+
+
+@dataclass(frozen=True)
+class ServerIdentity:
+    """What a stored entry must match for this server to ever restore it.
+
+    Only facts fixed for the life of the serving process belong here: the
+    loaded model, its draft head, and the policy fingerprint components that
+    every request of this process carries with the same value
+    (``fingerprint_components``; a ``None`` value means this server never
+    emits that component). Components a request chooses (thinking, depth,
+    generation mode, tool contracts, reasoning-history mode, cache scope)
+    are deliberately absent: a later request may choose them again, so an
+    entry that differs only there is not foreign.
+    """
+
+    model_path: str
+    draft_head_identity: str | None = None
+    fingerprint_components: dict[str, str | None] = field(default_factory=dict)
+
+    def is_foreign(
+        self,
+        *,
+        model_path: str | None,
+        draft_head_identity: str | None,
+        policy_fingerprint: str | None,
+        parsed: dict[str, str] | None = None,
+    ) -> bool:
+        """True when no request this server can serve would restore the entry.
+
+        Lookups match ``model_path`` and ``policy_fingerprint`` exactly, so
+        a different model, or a server-level component that differs (or is
+        present on one side only), can never match. An entry whose
+        fingerprint carries none of the server-level components (empty, or a
+        format this server does not know) is judged on model and draft head
+        alone: without evidence it is kept on the ordinary LRU footing.
+        """
+
+        if str(model_path or "") != str(self.model_path):
+            return True
+        if (
+            draft_head_identity is not None
+            and self.draft_head_identity is not None
+            and str(draft_head_identity) != str(self.draft_head_identity)
+        ):
+            return True
+        if not policy_fingerprint or not self.fingerprint_components:
+            return False
+        if parsed is None:
+            parsed = parse_policy_fingerprint(policy_fingerprint)
+        emitted = [
+            key for key, value in self.fingerprint_components.items() if value is not None
+        ]
+        if not any(key in parsed for key in emitted):
+            return False
+        return any(
+            parsed.get(key) != value for key, value in self.fingerprint_components.items()
+        )
 
 
 def _deferred_encode_enabled() -> bool:
@@ -385,8 +466,22 @@ class SessionBankColdTier:
         writer_queue_depth: int = 32,
         block_size: int = DEFAULT_BLOCK_SIZE,
         reconcile_listener: Callable[[dict[str, Any]], None] | None = None,
+        server_identity: Callable[[], ServerIdentity | None] | None = None,
     ) -> None:
         self.base_dir = Path(base_dir).expanduser()
+        # Returns what this server can restore (ServerIdentity), read live so
+        # a released or reloaded runtime is seen; None (standalone tools,
+        # tests, a runtime not loaded) classifies nothing as foreign and
+        # keeps plain LRU eviction. A constructor argument for the same
+        # reason as reconcile_listener: the pass at open uses it.
+        self.server_identity = server_identity
+        self._foreign_max_age_s = (
+            _env_float("MTPLX_SSD_FOREIGN_MAX_AGE_DAYS", DEFAULT_FOREIGN_MAX_AGE_DAYS)
+            * 86400.0
+        )
+        self._last_foreign_expiry_monotonic: float | None = None
+        self._foreign_census_lock = threading.Lock()
+        self._foreign_census_cache: dict[str, Any] | None = None
         # Called once with the summary of the reconciliation pass that runs
         # when the store opens (#493). The server wires its structured
         # stdout event here; it is a constructor argument because the pass
@@ -514,6 +609,16 @@ class SessionBankColdTier:
             "skipped_serialize_error": 0,
             "deduped_blob_hits": 0,
             "entries_evicted": 0,
+            # Entries this server can never restore (ServerIdentity): taken
+            # first when room is needed, and removed once unused for
+            # foreign_max_age_days. Bytes are the physical bytes their rows
+            # booked; a blob another entry still references stays.
+            "foreign_entries_evicted": 0,
+            "foreign_bytes_evicted": 0,
+            "foreign_entries_expired": 0,
+            "foreign_bytes_expired": 0,
+            "foreign_max_age_days": round(self._foreign_max_age_s / 86400.0, 3),
+            "last_foreign_expiry": None,
             "restore_hits": 0,
             "restore_misses": 0,
             "restore_failures": 0,
@@ -1373,6 +1478,11 @@ class SessionBankColdTier:
             stats["deduped_bytes"] = int(row[3])
             logical = max(1, int(row[1]))
             stats["dedupe_ratio"] = max(0.0, float(row[3]) / float(logical))
+            # Entries this server can never restore; null when the server
+            # identity is not known (standalone use), not zero.
+            census = self._foreign_census()
+            stats["foreign_entries"] = None if census is None else census["foreign_entries"]
+            stats["foreign_bytes"] = None if census is None else census["foreign_bytes"]
             usage = self._managed_disk_usage()
             managed_file_bytes = int(usage.get("managed_file_bytes", 0))
             managed_disk_bytes = int(usage.get("managed_disk_bytes", 0))
@@ -1682,6 +1792,10 @@ class SessionBankColdTier:
                         int(pending.metadata["prefix_len"]),
                         int(pending.metadata["nbytes"]),
                     )
+                    # A long-running server sees foreign entries age past
+                    # the limit without a restart; writes are what fill the
+                    # store, so the periodic pass rides on them.
+                    self._maybe_expire_foreign_entries()
             except Exception as exc:
                 self._inc("write_failures")
                 logger.warning(
@@ -2009,8 +2123,10 @@ class SessionBankColdTier:
         on_yield: Callable[[], None] | None = None,
         protect: frozenset[str] = frozenset(),
     ) -> bool:
-        """Retire LRU entries, then reclaim their blobs in one paced pass.
+        """Retire entries, then reclaim their blobs in one paced pass.
 
+        Entries this server can never restore (see ServerIdentity) go
+        first, then its own; each group in least-recently-used order.
         Called WITHOUT _base_lock. The writer can wait out a foreground
         turn; owner-thread spills instead raise ColdEncodeInterrupted.
         Re-reading every surviving payload for every victim made a 66-entry
@@ -2028,10 +2144,15 @@ class SessionBankColdTier:
         with self._connect() as conn:
             rows = list(
                 conn.execute(
-                    "SELECT entry_id, entry_dir, physical_nbytes, nbytes, last_access_s "
+                    "SELECT entry_id, entry_dir, physical_nbytes, nbytes, last_access_s, "
+                    "model_path, draft_head_identity, policy_fingerprint "
                     "FROM entries ORDER BY last_access_s ASC"
                 ).fetchall()
             )
+        foreign_ids = self._foreign_entry_ids(rows)
+        if foreign_ids:
+            # Stable sort: last_access_s order holds within each group.
+            rows.sort(key=lambda row: 0 if str(row["entry_id"]) in foreign_ids else 1)
         garbage: set[str] = set()
         try:
             for row in rows:
@@ -2048,8 +2169,12 @@ class SessionBankColdTier:
                     if not self._entry_in_manifest(str(row["entry_id"])):
                         continue
                     garbage.update(self._retire_entry_row(row))
-                    current -= int(row["physical_nbytes"] or row["nbytes"] or 0)
+                    row_bytes = int(row["physical_nbytes"] or row["nbytes"] or 0)
+                    current -= row_bytes
                     self._inc("entries_evicted")
+                    if str(row["entry_id"]) in foreign_ids:
+                        self._inc("foreign_entries_evicted")
+                        self._inc("foreign_bytes_evicted", row_bytes)
                 if current + required <= cap:
                     break
             self._delete_unreferenced_blobs(garbage, on_yield=yield_work)
@@ -2279,6 +2404,202 @@ class SessionBankColdTier:
                 type(exc).__name__,
                 exc,
             )
+
+    def _current_server_identity(self) -> ServerIdentity | None:
+        provider = self.server_identity
+        if provider is None:
+            return None
+        try:
+            identity = provider()
+        except Exception as exc:  # noqa: BLE001 - any failure means "unknown"
+            # No identity means nothing is foreign: the safe direction.
+            logger.debug(
+                "SessionBank SSD server identity unavailable: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return None
+        return identity if isinstance(identity, ServerIdentity) else None
+
+    def _foreign_entry_ids(
+        self,
+        rows: list[sqlite3.Row],
+        identity: ServerIdentity | None = None,
+    ) -> set[str]:
+        """Ids of the rows this server can never restore (empty without an identity)."""
+        if identity is None:
+            identity = self._current_server_identity()
+        if identity is None:
+            return set()
+        verdicts: dict[tuple[Any, Any, Any], bool] = {}
+        foreign: set[str] = set()
+        for row in rows:
+            # A store holds few distinct identities; parse each one once.
+            key = (row["model_path"], row["draft_head_identity"], row["policy_fingerprint"])
+            verdict = verdicts.get(key)
+            if verdict is None:
+                verdict = identity.is_foreign(
+                    model_path=key[0],
+                    draft_head_identity=key[1],
+                    policy_fingerprint=key[2],
+                )
+                verdicts[key] = verdict
+            if verdict:
+                foreign.add(str(row["entry_id"]))
+        return foreign
+
+    def _expire_foreign_entries(
+        self,
+        *,
+        on_yield: Callable[[], None] | None = None,
+    ) -> dict[str, Any] | None:
+        """Remove foreign entries unused for the configured age; None if off.
+
+        Goes through the eviction path (row retired under _base_lock, then
+        a blob is deleted only when no manifest row or write in flight still
+        names it), so a blob a foreign entry shares with a live one stays.
+        Recency is re-read under the lock: a server sharing this directory
+        that still uses an entry keeps it.
+        """
+        if not self.enabled or self._foreign_max_age_s <= 0:
+            return None
+        identity = self._current_server_identity()
+        if identity is None:
+            return None
+        self._last_foreign_expiry_monotonic = time.monotonic()
+        yield_work = on_yield or self._pause_for_foreground
+        started = time.monotonic()
+        cutoff = time.time() - self._foreign_max_age_s
+        with self._connect() as conn:
+            rows = list(
+                conn.execute(
+                    "SELECT entry_id, entry_dir, physical_nbytes, nbytes, last_access_s, "
+                    "model_path, draft_head_identity, policy_fingerprint "
+                    "FROM entries WHERE last_access_s < ? ORDER BY last_access_s ASC",
+                    (cutoff,),
+                ).fetchall()
+            )
+        foreign_ids = self._foreign_entry_ids(rows, identity)
+        removed = 0
+        removed_bytes = 0
+        garbage: set[str] = set()
+        try:
+            for row in rows:
+                entry_id = str(row["entry_id"])
+                if entry_id not in foreign_ids:
+                    continue
+                yield_work()
+                if self._stop.is_set():
+                    break
+                with self._base_lock:
+                    if str(row["entry_dir"]) in self._inflight_entry_dirs:
+                        continue
+                    with self._connect() as conn:
+                        current = conn.execute(
+                            "SELECT last_access_s FROM entries WHERE entry_id = ?",
+                            (entry_id,),
+                        ).fetchone()
+                    if current is None or float(current[0]) >= cutoff:
+                        continue
+                    garbage.update(self._retire_entry_row(row))
+                row_bytes = int(row["physical_nbytes"] or row["nbytes"] or 0)
+                removed += 1
+                removed_bytes += row_bytes
+            self._delete_unreferenced_blobs(garbage, on_yield=yield_work)
+            garbage.clear()
+        finally:
+            if garbage:
+                # Stopped mid-pass: the reconcile reclaims what is left.
+                self._start_orphan_cleanup()
+        result = {
+            "at_s": time.time(),
+            "entries": removed,
+            "bytes": removed_bytes,
+            "max_age_days": round(self._foreign_max_age_s / 86400.0, 3),
+            "elapsed_s": round(time.monotonic() - started, 3),
+        }
+        with self._stats_lock:
+            self._stats["foreign_entries_expired"] = (
+                int(self._stats.get("foreign_entries_expired", 0) or 0) + removed
+            )
+            self._stats["foreign_bytes_expired"] = (
+                int(self._stats.get("foreign_bytes_expired", 0) or 0) + removed_bytes
+            )
+            self._stats["last_foreign_expiry"] = dict(result)
+        if removed:
+            logger.info(
+                "SessionBank SSD removed %d entries this server cannot restore, "
+                "unused for over %g days (%.2f GB booked) in %.1f s",
+                removed,
+                self._foreign_max_age_s / 86400.0,
+                removed_bytes / 1e9,
+                float(result["elapsed_s"]),
+            )
+        return result
+
+    def _maybe_expire_foreign_entries(self) -> None:
+        """The periodic pass: on the writer thread, at most once per interval."""
+        last = self._last_foreign_expiry_monotonic
+        if last is not None and time.monotonic() - last < FOREIGN_EXPIRY_INTERVAL_S:
+            return
+        try:
+            self._expire_foreign_entries()
+        except (OSError, sqlite3.Error) as exc:
+            logger.warning(
+                "SessionBank SSD foreign-entry removal failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+
+    def _foreign_census(self) -> dict[str, int] | None:
+        """Foreign entries and their booked bytes now; None without an identity.
+
+        Exact while the store generation and the identity are unchanged, so
+        /health polls reuse it; MANIFEST_STATS_TTL_S bounds staleness
+        against other processes sharing the directory.
+        """
+        identity = self._current_server_identity()
+        if identity is None:
+            return None
+        now = time.monotonic()
+        generation = self._generation_now()
+        with self._foreign_census_lock:
+            cached = self._foreign_census_cache
+            if (
+                cached is not None
+                and cached["generation"] == generation
+                and cached["identity"] == identity
+                and now - float(cached["at"]) < MANIFEST_STATS_TTL_S
+            ):
+                return dict(cached["census"])
+        with self._connect() as conn:
+            groups = list(
+                conn.execute(
+                    "SELECT model_path, draft_head_identity, policy_fingerprint, "
+                    "COUNT(*) AS entries, "
+                    "COALESCE(SUM(CASE WHEN physical_nbytes > 0 "
+                    "THEN physical_nbytes ELSE nbytes END), 0) AS bytes "
+                    "FROM entries GROUP BY model_path, draft_head_identity, "
+                    "policy_fingerprint"
+                ).fetchall()
+            )
+        census = {"foreign_entries": 0, "foreign_bytes": 0}
+        for group in groups:
+            if identity.is_foreign(
+                model_path=group["model_path"],
+                draft_head_identity=group["draft_head_identity"],
+                policy_fingerprint=group["policy_fingerprint"],
+            ):
+                census["foreign_entries"] += int(group["entries"])
+                census["foreign_bytes"] += int(group["bytes"])
+        with self._foreign_census_lock:
+            self._foreign_census_cache = {
+                "generation": generation,
+                "identity": identity,
+                "at": now,
+                "census": dict(census),
+            }
+        return census
 
     def _record_write_skip(self, reason: str, message: str, prefix_len: int) -> None:
         with self._stats_lock:
@@ -2530,10 +2851,22 @@ class SessionBankColdTier:
 
     def _orphan_cleanup_worker(self, *, at_start: bool = False) -> None:
         try:
+            expiry: dict[str, Any] | None = None
+            if at_start:
+                # Before the walk: the blobs of removed entries are then
+                # reclaimed here, and the walk no longer visits them.
+                try:
+                    expiry = self._expire_foreign_entries()
+                except (OSError, sqlite3.Error) as exc:
+                    logger.warning(
+                        "SessionBank SSD foreign-entry removal at start failed: %s: %s",
+                        type(exc).__name__,
+                        exc,
+                    )
             result = self._cleanup_untracked_cache_once()
             self._record_orphan_cleanup_result(result)
             if at_start:
-                self._log_startup_reconcile(result)
+                self._log_startup_reconcile(result, foreign_expiry=expiry)
         except Exception as exc:  # pragma: no cover - defensive background task
             logger.warning(
                 "SessionBank SSD orphan cleanup failed: %s: %s",
@@ -2543,7 +2876,12 @@ class SessionBankColdTier:
         finally:
             self._release_orphan_cleanup()
 
-    def _log_startup_reconcile(self, result: dict[str, int | float]) -> None:
+    def _log_startup_reconcile(
+        self,
+        result: dict[str, int | float],
+        *,
+        foreign_expiry: dict[str, Any] | None = None,
+    ) -> None:
         with self._disk_usage_lock:
             cached = dict(self._disk_usage_cache or {})
         summary: dict[str, Any] = {
@@ -2556,6 +2894,11 @@ class SessionBankColdTier:
             "disk_bytes": int(cached.get("managed_disk_bytes", 0) or 0),
             "max_bytes": int(self.max_bytes),
             "interrupted": bool(cached.get("disk_usage_stale", False)) and self._stop.is_set(),
+            # Foreign entries removed before the walk (0 when the removal is
+            # off or the server identity is not known).
+            "foreign_entries_expired": int((foreign_expiry or {}).get("entries", 0)),
+            "foreign_bytes_expired": int((foreign_expiry or {}).get("bytes", 0)),
+            "foreign_max_age_days": round(self._foreign_max_age_s / 86400.0, 3),
         }
         if summary["files_deleted"] or summary["dirs_deleted"]:
             logger.info(

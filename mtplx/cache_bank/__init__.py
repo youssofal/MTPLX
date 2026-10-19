@@ -23,6 +23,7 @@ _COLD_TIER_EXPORTS = frozenset(
         "COLD_TIER_FORMAT_VERSION",
         "DEFAULT_COLD_TIER_MAX_BYTES",
         "DEFAULT_COLD_TIER_MIN_PREFIX_TOKENS",
+        "ServerIdentity",
         "SessionBankColdTier",
         "parse_size_bytes",
     }
@@ -33,6 +34,7 @@ __all__ = [
     "DEFAULT_COLD_TIER_DIR",
     "DEFAULT_COLD_TIER_MAX_BYTES",
     "DEFAULT_COLD_TIER_MIN_PREFIX_TOKENS",
+    "ServerIdentity",
     "SessionBankColdTier",
     "parse_size_bytes",
 ]

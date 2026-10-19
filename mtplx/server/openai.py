@@ -3961,7 +3961,10 @@ class ServerState:
                 "for; the rest can be paged out while idle. To wire it all: "
                 f"sudo sysctl iogpu.wired_limit_mb={math.ceil(requested_wired / 1024**2)}"
             )
-        self.session_bank_cold_tier = _session_bank_cold_tier_from_args(args)
+        self.session_bank_cold_tier = _session_bank_cold_tier_from_args(
+            args,
+            server_identity=lambda: _session_bank_server_identity(self),
+        )
         self.sessions = EngineSessionManager(
             cold_tier=self.session_bank_cold_tier,
             model_weights_bytes=_plan_weights_bytes,
@@ -4194,7 +4197,11 @@ def _with_kv_attention_scope(fn: Callable[..., Any]) -> Callable[..., Any]:
     return run
 
 
-def _session_bank_cold_tier_from_args(args: argparse.Namespace) -> Any | None:
+def _session_bank_cold_tier_from_args(
+    args: argparse.Namespace,
+    *,
+    server_identity: Callable[[], Any] | None = None,
+) -> Any | None:
     mode = str(getattr(args, "ssd_session_cache", "off") or "off").strip().lower()
     if mode == "off":
         return None
@@ -4241,6 +4248,7 @@ def _session_bank_cold_tier_from_args(args: argparse.Namespace) -> Any | None:
         max_bytes=max_bytes,
         min_prefix_tokens=min_prefix_tokens,
         reconcile_listener=_reconcile_event,
+        server_identity=server_identity,
     )
 
 
@@ -26414,6 +26422,57 @@ def _policy_fingerprint(
     if normalized_cache_scope and normalized_cache_scope != "stable":
         parts.append(f"cache_scope={normalized_cache_scope}")
     return ";".join(parts)
+
+
+# Session policy fingerprint components that every request this process
+# serves carries with the same value: the template, the bridge policy
+# version, the hidden variant, the MTP history policy, the draft head, the
+# proposal-cache and online-hidden settings, and the model-specific
+# attention and batch-lane components. An SSD entry that differs in one of
+# them can never be restored by this server (the lookup matches the whole
+# fingerprint). Components a request can choose stay out on purpose:
+# thinking, the reasoning-history mode (a server setting the app can change
+# at runtime), tool prompt mode and contracts, generation mode, depth,
+# ``adaptive`` (it depends on the request's depth) and cache scope. A
+# component added to _policy_fingerprint is request-level until it is
+# listed here, so a new one can only make the classification more careful.
+_SERVER_LEVEL_POLICY_COMPONENTS: tuple[str, ...] = (
+    "template",
+    "openai_bridge",
+    "hidden_variant",
+    "mtp_history_policy",
+    "draft_head",
+    "proposal_cache",
+    "online_hidden",
+    "vision_attention",
+    "mtp_batch_numerics",
+    "mtp_batch_route",
+    "mtp_batch_config",
+)
+
+
+def _session_bank_server_identity(state: ServerState) -> Any | None:
+    """What an SSD session entry must match for this server to restore it.
+
+    Derived from a fingerprint built the same way requests build theirs, so
+    the server-level values are byte-identical to what entries store. None
+    while no runtime is loaded: then nothing is classified as foreign.
+    """
+
+    runtime = getattr(state, "runtime", None)
+    if runtime is None or getattr(runtime, "model_path", None) is None:
+        return None
+    from mtplx.cache_bank.cold_tier import ServerIdentity, parse_policy_fingerprint
+
+    parsed = parse_policy_fingerprint(_policy_fingerprint(state, thinking_enabled=False))
+    draft_head = getattr(state, "draft_head_identity", None)
+    return ServerIdentity(
+        model_path=str(runtime.model_path),
+        draft_head_identity=None if draft_head is None else str(draft_head),
+        fingerprint_components={
+            key: parsed.get(key) for key in _SERVER_LEVEL_POLICY_COMPONENTS
+        },
+    )
 
 
 def _session_cache_scope_for_request(

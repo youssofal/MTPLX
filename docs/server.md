@@ -221,6 +221,7 @@ stored once.
 | `--ssd-session-cache-max-size` | `100GB` (`32GB` on 64 GB Macs unless the disk has 150 GiB free, `24GB` on 32 GB, `16GB` on 16 GB) | Cap on the **whole** store directory as it sits on disk, orphaned files included. The effective cap is `min(this, free_disk / 4)`, and writes stop below 10 GiB free. When a write would take the store over the cap, garbage is reclaimed first and only then are the least recently used entries evicted. |
 | `MTPLX_SSD_WRITE_BUDGET_PER_HOUR` | `128G` | Rolling one-hour byte budget for SSD writes (SSD wear); writes beyond it are skipped for the hour. |
 | `MTPLX_SSD_WRITER_BACKLOG_BYTES` | `4G` | Bytes of encoded snapshots the writer may hold in RAM while waiting to write; larger single entries stream to disk instead. |
+| `MTPLX_SSD_FOREIGN_MAX_AGE_DAYS` | `7` | Entries this server can never restore (see below) that nobody used for this many days are removed when the cache opens and every few hours after writes. `0` turns the removal off. |
 
 **Orphaned files.** A crash between a blob write and its manifest row, an
 interrupted write, or a blob whose last entry was evicted while a sibling
@@ -232,6 +233,23 @@ what it reclaimed and what the store holds. The same pass runs whenever a
 write finds the store over its cap. `/health` reports the store under
 `ssd_session_cache` (`entries`, `managed_disk_bytes`, `orphan_disk_bytes`,
 `orphan_cleanup_runs`, `startup_reconcile`).
+
+**Entries this server cannot use.** An entry is restored only by a server
+with the same model, the same draft head and the same server-wide settings
+that the entry's session fingerprint records (for example the chat template
+or the MTP history policy). Entries written by another model, or before such
+a setting changed, stay on disk but can never be restored by this server.
+When the store needs room, those entries are evicted before the server's own,
+each group oldest first, and the ones unused for
+`MTPLX_SSD_FOREIGN_MAX_AGE_DAYS` are removed. Settings a request can pick
+(thinking on or off, the reasoning-history mode, depth, tool contracts) never
+make an entry foreign. Several servers can share one directory: each treats
+the others' entries as foreign, so the age limit leaves entries another
+server used recently alone, but under space pressure a server evicts the
+others' entries before its own. `/health` and `/admin/cache/ssd` report
+`foreign_entries`, `foreign_bytes`, `foreign_entries_evicted` and
+`foreign_entries_expired`; the reconcile line carries
+`foreign_entries_expired`.
 
 To inspect or clean a store by hand, with or without a daemon running:
 
