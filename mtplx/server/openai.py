@@ -18064,19 +18064,23 @@ def _restore_telemetry_fields(stats: Mapping[str, Any]) -> dict[str, Any]:
         fields = _ssd_restore_split_fields(
             served.get("ssd_restore") if stats.get("ssd_cache_hit") else None
         )
-    landing = served.get("landing") or {}
-    fields.update(
-        {
-            "prefix_restore_matched_tokens": int(landing.get("matched_tokens") or 0),
-            "prefix_restore_point_tokens": int(landing.get("restore_point_tokens") or 0),
-            "prefix_restore_checkpoint_gap_tokens": int(
-                landing.get("checkpoint_gap_tokens") or 0
-            ),
-            "prefix_restore_partial": bool(landing.get("partial", False)),
-            "prefix_restore_origin": landing.get("origin"),
-        }
-    )
+    fields.update(_restore_landing_fields(served.get("landing")))
     return fields
+
+
+def _restore_landing_fields(landing: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The flat ``prefix_restore_*`` request fields of one restore landing
+    (generation._record_restore_landing); zeros and None without one."""
+    landing = landing or {}
+    return {
+        "prefix_restore_matched_tokens": int(landing.get("matched_tokens") or 0),
+        "prefix_restore_point_tokens": int(landing.get("restore_point_tokens") or 0),
+        "prefix_restore_checkpoint_gap_tokens": int(
+            landing.get("checkpoint_gap_tokens") or 0
+        ),
+        "prefix_restore_partial": bool(landing.get("partial", False)),
+        "prefix_restore_origin": landing.get("origin"),
+    }
 
 
 def _metrics_envelope(
@@ -30078,6 +30082,60 @@ def _validate_mtp_batch_request_contract(
         )
 
 
+def _mtp_batch_restore_telemetry(
+    session_bank: Any,
+    entry: Any,
+    *,
+    matched: int,
+    restore_point: int,
+    storage_mode: str,
+    session_id: str | None,
+    prompt_tokens: int,
+) -> dict[str, Any]:
+    """Request fields for a batched row's restore: where it came from, the
+    SSD split when the entry was read from disk, and where it landed (also
+    counted in the bank's restore_landings). The row's envelope takes them
+    from request_observability."""
+    from types import SimpleNamespace
+
+    from mtplx.generation import _record_restore_landing, served_restore_record
+
+    cache_source = str(getattr(entry, "cache_source", "ram") or "ram")
+    ssd_hit = cache_source == "ssd"
+    split = getattr(entry, "ssd_restore_split", None) if ssd_hit else None
+    served = served_restore_record(
+        entry,
+        matched=matched,
+        restore_point=restore_point,
+        storage_restore_mode=storage_mode,
+        session_id=session_id,
+        ssd_cache_hit=ssd_hit,
+        ssd_restore_split=split,
+    )
+    suffix_tokens = max(0, int(prompt_tokens) - int(restore_point))
+    landing = _record_restore_landing(
+        session_bank,
+        SimpleNamespace(
+            restore_served=served,
+            ssd_cache_hit=ssd_hit,
+            cache_source=cache_source,
+            suffix_tokens=suffix_tokens,
+        ),
+    )
+    return {
+        "cache_source": cache_source,
+        "ssd_cache_hit": ssd_hit,
+        "ssd_cached_tokens": int(restore_point) if ssd_hit else 0,
+        "ssd_restore_s": (
+            float(getattr(entry, "ssd_restore_s", 0.0) or 0.0) if ssd_hit else 0.0
+        ),
+        "ssd_suffix_tokens": suffix_tokens if ssd_hit else 0,
+        **_ssd_restore_split_fields(split),
+        **_restore_landing_fields(landing),
+        "session_restore_served": served,
+    }
+
+
 def _build_mtp_batch_session_hooks(
     state: ServerState,
     *,
@@ -30182,6 +30240,20 @@ def _build_mtp_batch_session_hooks(
                         "restore_s": round(time.perf_counter() - started, 6),
                     }
                 )
+                try:
+                    request_observability.update(
+                        _mtp_batch_restore_telemetry(
+                            session_bank,
+                            entry,
+                            matched=int(matched),
+                            restore_point=restore_point,
+                            storage_mode=str(storage_mode),
+                            session_id=session_id,
+                            prompt_tokens=len(tokens),
+                        )
+                    )
+                except Exception:
+                    pass  # telemetry never turns a restore into a miss
                 return _NS(
                     cache=cache,
                     mtp_cache=history,

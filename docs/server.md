@@ -256,7 +256,8 @@ writes in flight; `--force` overrides that when you know the daemon is idle.
 read. The request log carries the same split as `ssd_restore_read_s`,
 `ssd_restore_copy_s`, `ssd_restore_eval_s`, `ssd_restore_other_s` (manifest
 query, payload file, rows refused before reading) and `ssd_restore_bytes`.
-For every restore from RAM or SSD it also records where the restore landed:
+For every restore from RAM or SSD (the serial lanes, the batched MTP lane and
+the Gemma 4 pair) it also records where the restore landed:
 `prefix_restore_matched_tokens` (how much of the prompt the entry matched),
 `prefix_restore_point_tokens` (where the state resumed: on a hybrid model the
 newest recurrent checkpoint at or below the match),
@@ -264,7 +265,8 @@ newest recurrent checkpoint at or below the match),
 no checkpoint sat closer), `prefix_restore_partial` and
 `prefix_restore_origin` (`same_session`, or `other_session` when another
 conversation's entry served a shared prompt head); the suffix prefilled after
-the restore point is `new_prefill_tokens`. `/health` sums these per source
+the restore point is `new_prefill_tokens`. A model without recurrent layers,
+such as Gemma 4, resumes at the matched length itself: its gap is 0. `/health` sums these per source
 under `session_bank.restore_landings`. `/health` (`ssd_session_cache`) and
 `/admin/cache/ssd` report the restore split totals (`restore_read_s_total`
 and so on, `last_restore_split`) and `write_volume`: the bytes written to

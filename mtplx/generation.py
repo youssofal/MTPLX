@@ -6188,12 +6188,41 @@ def _accepts_keyword(fn: Any, name: str) -> bool:
         return False
 
 
-def _record_restore_landing(session_bank: Any, state: PromptState) -> None:
+def served_restore_record(
+    entry: Any,
+    *,
+    matched: int,
+    restore_point: int,
+    storage_restore_mode: str,
+    session_id: str | None,
+    ssd_cache_hit: bool,
+    ssd_restore_split: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The served-entry record for restore lanes outside this module (the
+    Gemma 4 pair, the batched MTP lane), in the shape the near and exact
+    lanes build inline, so ``_record_restore_landing`` reads them alike."""
+    served: dict[str, Any] = {
+        "entry_prefix_len": int(getattr(entry, "prefix_len", 0) or 0),
+        "requested_matched": int(matched),
+        "actual_restore_point": int(restore_point),
+        "boundary_restore": int(restore_point) < int(matched),
+        "storage_restore_mode": str(storage_restore_mode),
+        "has_recurrent": bool(getattr(entry, "has_recurrent", False)),
+        "entry_origin": entry_origin(getattr(entry, "session_id", None), session_id),
+    }
+    if ssd_cache_hit:
+        served["ssd_restore"] = dict(ssd_restore_split or {})
+    return served
+
+
+def _record_restore_landing(session_bank: Any, state: Any) -> dict[str, Any] | None:
     """Telemetry: where a served restore landed, into the request's served
-    record (``landing``) and the bank's counters. Never fails a request."""
+    record (``landing``) and the bank's counters. ``state`` is any prompt
+    state with ``restore_served``, ``ssd_cache_hit``, ``cache_source`` and
+    ``suffix_tokens``. Never fails a request."""
     served = getattr(state, "restore_served", None)
     if not served:
-        return
+        return None
     try:
         matched = int(served.get("requested_matched") or 0)
         point = int(served.get("actual_restore_point") or 0)
@@ -6211,8 +6240,9 @@ def _record_restore_landing(session_bank: Any, state: PromptState) -> None:
         record = getattr(session_bank, "record_restore_landing", None)
         if callable(record):
             record(landing)
+        return landing
     except Exception:
-        pass
+        return None
 
 
 def _accepts_served_out(fn: Any) -> bool:
@@ -10779,6 +10809,7 @@ def generate_mtpk(
             stop_token_ids=stop_token_ids,
             token_callback=token_callback,
             session_bank=session_bank,
+            session_id=session_id,
             session_restore_mode=session_restore_mode,
             session_template_hash=session_template_hash,
             session_draft_head_identity=session_draft_head_identity,
