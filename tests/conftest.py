@@ -28,6 +28,52 @@ def pytest_configure(config):
             "comparison. Unset it, or acknowledge regeneration explicitly "
             "with MTPLX_UPDATE_GOLDENS_ACK=yes."
         )
+    _drop_operator_switches()
+
+
+# Variables that steer the suite itself (opt-in QA arms, artifacts to check,
+# local model paths, golden regeneration) rather than MTPLX. Everything else
+# under MTPLX_ is a runtime switch and is dropped before collection.
+_SUITE_VARIABLES = frozenset(
+    {
+        "MTPLX_UPDATE_GOLDENS",
+        "MTPLX_UPDATE_GOLDENS_ACK",
+        "MTPLX_TEST_BASELINE",
+        "MTPLX_TEST_TOKENIZER_DIR",
+        "MTPLX_RUN_LONG_CONTEXT_QA",
+        "MTPLX_LONG_CONTEXT_QA_ARTIFACT",
+        "MTPLX_QA_BURST_BASELINE",
+        "MTPLX_RUN_32K_MEMORY_QA",
+        "MTPLX_32K_QA_MODEL",
+        "MTPLX_DSV4_MTP_MODEL",
+        "MTPLX_PREFILL_TPS_ARTIFACT",
+        "MTPLX_PREFILL_TPS_REQUIRE_FULL",
+        "MTPLX_SSE_DUMP",
+    }
+)
+
+_dropped_switches: list[str] = []
+
+
+def _drop_operator_switches():
+    # An operator who runs the suite from the shell they serve from carries
+    # their lane switches into it (MTPLX_SEGMENTED_KV=1, MTPLX_NAX_VERIFY=1,
+    # chunk sizes, ...). Tests pin the defaults, and code that reads a switch
+    # at import or caches it would keep the operator's value even under a
+    # per-test monkeypatch, so the switches leave the process before any
+    # test module is imported. Tests that exercise a switch set it themselves.
+    for name in sorted(os.environ):
+        if name.startswith("MTPLX_") and name not in _SUITE_VARIABLES:
+            _dropped_switches.append(name)
+            del os.environ[name]
+
+
+def pytest_report_header(config):
+    if _dropped_switches:
+        return "ignored MTPLX switches from the environment: " + ", ".join(
+            _dropped_switches
+        )
+    return None
 
 
 @pytest.fixture(autouse=True)
