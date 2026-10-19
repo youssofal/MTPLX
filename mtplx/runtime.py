@@ -900,6 +900,24 @@ def load(
                     "MTPLX_GDN_BLOCKED_PREFILL is on but the patch did not "
                     f"install: {gdn_prefill_report.get('error') or 'unknown error'}",
                 )
+        from .kernels.gdn_fast_prefill import (
+            fast_prefill_env_enabled,
+            install_gdn_fast_prefill_patch,
+        )
+
+        # After the blocked patch: the fast route wraps it, so the calls it
+        # declines keep the blocked kernel when that is on.
+        if fast_prefill_env_enabled():
+            gdn_fast_report = install_gdn_fast_prefill_patch()
+            logger.info("[gdn-fast-prefill] %s", gdn_fast_report)
+            if not gdn_fast_report.get("installed"):
+                from .demotions import note as _note_demotion
+
+                _note_demotion(
+                    "gdn_fast_prefill_not_engaged",
+                    "MTPLX_GDN_FAST_PREFILL is on but the patch did not "
+                    f"install: {gdn_fast_report.get('error') or 'unknown error'}",
+                )
         from .qwen_row_owned_router import (
             install_qwen_row_owned_routers,
             prepare_qwen_row_owned_routers,

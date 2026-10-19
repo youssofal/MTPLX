@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Opt-in GDN prefill on MLX's chunked kernel (`MTPLX_GDN_FAST_PREFILL=1`, off by default).** With MLX 0.32.4 or later, prefill-sized Gated DeltaNet calls of Qwen 3.5, 3.6 and 3.8 (64 tokens or more, scalar gating, no mask) run through `mx.fast.gated_delta_update`, which processes 16 tokens at a time on the M5's tensor units. The op rounds the decay and beta to the input type; in bf16 the decay, which sits close to 1, loses most of its precision (4% output and 6 to 9% state error on real Qwen 3.8 activations), so the route passes float32 inputs and casts the output back; on an MLX build that keeps `g` and `beta` in float32 (probed once at install) only those two go in as float32 and the bf16 activations go in as they are. Measured on an M5 Pro with Qwen 3.8 27B (one process per variant, A B B A A B, median of 3): cold prefill 18.54 to 17.94 s at 8,192 tokens (-3.2%) and 74.98 to 73.69 s at 30,720 tokens (-1.7%); last-row logits within 0.14 of the stock route with the same argmax and top 5, and greedy output identical until the first token where the stock route's top two logits are one bf16 step apart. The state then lands about 1e-3 from a float64 reference, inside bf16 rounding but not bit-equal to the stock per-token kernel, so the route adds its name to the session policy fingerprint: a banked or SSD state from one route is not continued by the other. With the switch off nothing changes, fingerprints included. Without the op (MLX 0.32.2, the pinned version) the switch installs nothing and says so in the demotion ledger.
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed

@@ -26411,6 +26411,14 @@ def _policy_fingerprint(
                 f"{getattr(mtp_batch_lane, 'config_fingerprint', 'unknown')}",
             )
         )
+    from mtplx.kernels.gdn_fast_prefill import gdn_prefill_numerics_identity
+
+    # GDN states from the MLX fast prefill route are not bit-equal to the
+    # stock recurrence; entries banked under one route must not be continued
+    # by the other. Absent while the route is off, so stock fingerprints stay.
+    gdn_prefill = gdn_prefill_numerics_identity()
+    if gdn_prefill is not None:
+        parts.append(f"gdn_prefill={gdn_prefill}")
     if normalized_cache_scope and normalized_cache_scope != "stable":
         parts.append(f"cache_scope={normalized_cache_scope}")
     return ";".join(parts)

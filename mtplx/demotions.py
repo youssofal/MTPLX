@@ -87,6 +87,10 @@ KINDS: dict[str, str] = {
         "The blocked GDN prefill kernel was requested but a prefill-sized call "
         "ran the stock path."
     ),
+    "gdn_fast_prefill_not_engaged": (
+        "The MLX fast GDN prefill route was requested but did not install "
+        "(MLX before 0.32.4) or a prefill-sized call took the previous path."
+    ),
     "vision_request_eager_verify": (
         "An image request ran on the eager verifier. Image requests take the "
         "compiled verifier on Flash-Next and on the dense Qwen3.5 / Qwen3.8 "
