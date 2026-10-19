@@ -200,7 +200,7 @@ def _batch_hooks(bank, *, session_id="b1"):
         backend_descriptor=None,
     )
     lane = SimpleNamespace(
-        prefill_request=SimpleNamespace(keywords={"target_cache_factory": lambda: []})
+        prefill_request=SimpleNamespace(keywords={"target_cache_factory": list})
     )
     observability: dict = {}
     restore, _commit = openai._build_mtp_batch_session_hooks(
