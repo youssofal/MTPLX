@@ -12,6 +12,8 @@ import numpy as np
 
 from mtplx.cache_state import CacheSnapshot
 
+from .telemetry import active_restore_timings
+
 
 _MLX_TO_NUMPY_DTYPE: dict[str, Any] = {
     "bool": np.bool_,
@@ -695,7 +697,18 @@ def _eval_decoded_arrays(decoded: DecodedPayload) -> None:
     ):
         _collect_arrays(part, arrays)
     if arrays:
-        mx.eval(*arrays)
+        _timed_eval(arrays)
+
+
+def _timed_eval(arrays: list[Any]) -> None:
+    """``mx.eval``, counted as restore eval time while a restore is timed:
+    the GPU side of the decode, the concatenate of each tensor's blocks
+    included."""
+    timings = active_restore_timings()
+    started = time.perf_counter() if timings is not None else 0.0
+    mx.eval(*arrays)
+    if timings is not None:
+        timings.eval_s += time.perf_counter() - started
 
 
 def decode_gdn_boundaries(
@@ -742,7 +755,7 @@ def decode_gdn_boundaries(
         arrays: list[Any] = []
         _collect_arrays(decoded, arrays)
         if arrays:
-            mx.eval(*arrays)
+            _timed_eval(arrays)
         boundaries.append(decoded)
     return tuple(boundaries)
 
@@ -902,10 +915,11 @@ def _decode_tree_prefix(
     return decode_tree(spec, read_tensor)
 
 
-def _decode_tensor(spec: dict[str, Any], read_tensor: Callable[[str], bytes]) -> Any:
-    dtype = str(spec["dtype"])
-    shape = tuple(int(dim) for dim in spec.get("shape") or [])
-    raw = read_tensor(str(spec["name"]))
+def _array_from_buffer(raw: Any, dtype: str) -> Any:
+    """One host copy of ``raw`` (bytes or a byte buffer) into a flat array,
+    counted as restore copy time while a restore is timed."""
+    timings = active_restore_timings()
+    started = time.perf_counter() if timings is not None else 0.0
     if dtype == "bfloat16":
         arr = mx.array(np.frombuffer(raw, dtype=np.uint16)).view(mx.bfloat16)
     else:
@@ -914,6 +928,29 @@ def _decode_tensor(spec: dict[str, Any], read_tensor: Callable[[str], bytes]) ->
         if np_dtype is None or mlx_dtype is None:
             raise ValueError(f"unsupported persisted tensor dtype: {dtype!r}")
         arr = mx.array(np.frombuffer(raw, dtype=np_dtype), dtype=mlx_dtype)
+    if timings is not None:
+        timings.copy_s += time.perf_counter() - started
+    return arr
+
+
+def _read_blob(read_tensor: Callable[[str], bytes], name: str) -> bytes:
+    """``read_tensor(name)``, counted as restore read time and bytes while a
+    restore is timed."""
+    timings = active_restore_timings()
+    if timings is None:
+        return read_tensor(name)
+    started = time.perf_counter()
+    raw = read_tensor(name)
+    timings.read_s += time.perf_counter() - started
+    timings.bytes_read += len(raw)
+    return raw
+
+
+def _decode_tensor(spec: dict[str, Any], read_tensor: Callable[[str], bytes]) -> Any:
+    dtype = str(spec["dtype"])
+    shape = tuple(int(dim) for dim in spec.get("shape") or [])
+    raw = _read_blob(read_tensor, str(spec["name"]))
+    arr = _array_from_buffer(raw, dtype)
     if shape:
         arr = arr.reshape(shape)
     return arr

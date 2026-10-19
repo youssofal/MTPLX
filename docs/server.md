@@ -249,6 +249,31 @@ writes in flight; `--force` overrides that when you know the daemon is idle.
 `--dir` defaults to the `ssd_session_cache_dir` in your saved config, then
 `~/.mtplx/session-bank`.
 
+**Where restores and writes go.** Every SSD restore logs one
+`SessionBank SSD restored` line with its `restore_s` split into `read_s`
+(reading blobs from disk), `copy_s` (copying the bytes into MLX arrays),
+`eval_s` (the GPU evaluation, which joins each tensor's blocks) and the bytes
+read. The request log carries the same split as `ssd_restore_read_s`,
+`ssd_restore_copy_s`, `ssd_restore_eval_s`, `ssd_restore_other_s` (manifest
+query, payload file, rows refused before reading) and `ssd_restore_bytes`.
+For every restore from RAM or SSD it also records where the restore landed:
+`prefix_restore_matched_tokens` (how much of the prompt the entry matched),
+`prefix_restore_point_tokens` (where the state resumed: on a hybrid model the
+newest recurrent checkpoint at or below the match),
+`prefix_restore_checkpoint_gap_tokens` (matched tokens computed again because
+no checkpoint sat closer), `prefix_restore_partial` and
+`prefix_restore_origin` (`same_session`, or `other_session` when another
+conversation's entry served a shared prompt head); the suffix prefilled after
+the restore point is `new_prefill_tokens`. `/health` sums these per source
+under `session_bank.restore_landings`. `/health` (`ssd_session_cache`) and
+`/admin/cache/ssd` report the restore split totals (`restore_read_s_total`
+and so on, `last_restore_split`) and `write_volume`: the bytes written to
+disk over the last hour, the bytes not written because the blob was already
+on disk, each split into recurrent-checkpoint (`gdn_boundary_*`) and other
+(`kv_*`: attention KV plus the final state, logits and hidden) bytes, and the
+share of `MTPLX_SSD_WRITE_BUDGET_PER_HOUR` written. `written_bytes_last_hour`
+next to it stays what the budget booked, an estimate for queued writes.
+
 ## Sharing on your network (other devices, Parallels/VM guests)
 
 The default bind is `127.0.0.1`: only this Mac can connect. To reach MTPLX

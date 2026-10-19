@@ -142,6 +142,7 @@ from .sampling import (
     residual_distribution,
     sample_from_distribution,
 )
+from .cache_bank.telemetry import entry_origin
 from .session_bank import _boundary_true_restore_enabled
 from .runtime_options import (
     block_prefix_restore_enabled,
@@ -5320,6 +5321,8 @@ def _restore_near_prefix_prompt_state(
             "lazy_kv": bool(getattr(entry, "lazy_kv", False)),
             "candidate_index": int(candidates_seen),
             "bank": bank_served,
+            "has_recurrent": bool(getattr(entry, "has_recurrent", False)),
+            "entry_origin": entry_origin(getattr(entry, "session_id", None), session_id),
         }
         _done_at = getattr(entry, "cold_encode_completed_at", None)
         served_truth["encode_completed"] = _done_at is not None
@@ -5371,6 +5374,10 @@ def _restore_near_prefix_prompt_state(
             ssd_cache_hit = bool(getattr(entry, "ssd_cache_hit", False)) or cache_source == "ssd"
             ssd_restore_s = float(getattr(entry, "ssd_restore_s", 0.0) or 0.0)
             ssd_cached_tokens = restore_point if ssd_cache_hit else 0
+            if ssd_cache_hit:
+                served_truth["ssd_restore"] = dict(
+                    getattr(entry, "ssd_restore_split", None) or {}
+                )
             total_cache_restore_time_s = (
                 cache_restore_time_s + ssd_restore_s if ssd_cache_hit else cache_restore_time_s
             )
@@ -6181,6 +6188,33 @@ def _accepts_keyword(fn: Any, name: str) -> bool:
         return False
 
 
+def _record_restore_landing(session_bank: Any, state: PromptState) -> None:
+    """Telemetry: where a served restore landed, into the request's served
+    record (``landing``) and the bank's counters. Never fails a request."""
+    served = getattr(state, "restore_served", None)
+    if not served:
+        return
+    try:
+        matched = int(served.get("requested_matched") or 0)
+        point = int(served.get("actual_restore_point") or 0)
+        landing = {
+            "source": "ssd" if state.ssd_cache_hit else str(state.cache_source or "ram"),
+            "partial": point < int(served.get("entry_prefix_len") or 0),
+            "hybrid": bool(served.get("has_recurrent", False)),
+            "matched_tokens": matched,
+            "restore_point_tokens": point,
+            "checkpoint_gap_tokens": max(0, matched - point),
+            "suffix_tokens": int(state.suffix_tokens),
+            "origin": served.get("entry_origin"),
+        }
+        served["landing"] = landing
+        record = getattr(session_bank, "record_restore_landing", None)
+        if callable(record):
+            record(landing)
+    except Exception:
+        pass
+
+
 def _accepts_served_out(fn: Any) -> bool:
     """Feature-detect the passive-probe ``served_out`` kwarg.
 
@@ -6791,6 +6825,7 @@ def restore_or_prefill_prompt_state(
                 budget_bytes=getattr(session_bank, "checkpoint_budget_bytes", None),
                 first_image_start=first_image_start,
             )
+            _record_restore_landing(session_bank, state)
         _maybe_store_prefix_snapshot(state)
         if prefill_callback is None:
             return state
@@ -7042,7 +7077,15 @@ def restore_or_prefill_prompt_state(
                 "storage_restore_mode": str(restored.restore_mode),
                 "lazy_kv": bool(getattr(restored.entry, "lazy_kv", False)),
                 "candidate_index": 0,
+                "has_recurrent": bool(getattr(restored.entry, "has_recurrent", False)),
+                "entry_origin": entry_origin(
+                    getattr(restored.entry, "session_id", None), session_id
+                ),
             }
+            if getattr(restored, "ssd_cache_hit", False):
+                exact_served["ssd_restore"] = dict(
+                    getattr(restored, "ssd_restore_split", None) or {}
+                )
             _done_at = getattr(restored.entry, "cold_encode_completed_at", None)
             exact_served["encode_completed"] = _done_at is not None
             if _done_at is not None:
