@@ -4645,6 +4645,13 @@ class _BatchedARGenerationService:
         job.request_observability["ssd_cache_hit"] = job.ssd_cache_hit
         job.request_observability["ssd_cached_tokens"] = job.ssd_cached_tokens
         job.request_observability["ssd_restore_s"] = job.ssd_restore_s
+        job.request_observability.update(
+            _ssd_restore_split_fields(
+                getattr(restored, "ssd_restore_split", None)
+                if job.ssd_cache_hit
+                else None
+            )
+        )
         job.request_observability["ssd_suffix_tokens"] = job.ssd_suffix_tokens
         return True
 
@@ -4753,6 +4760,7 @@ class _BatchedARGenerationService:
             job.request_observability["ssd_cache_hit"] = False
             job.request_observability["ssd_cached_tokens"] = 0
             job.request_observability["ssd_restore_s"] = 0.0
+            job.request_observability.update(_ssd_restore_split_fields(None))
             job.request_observability["ssd_suffix_tokens"] = 0
             if bank_error is not None:
                 job.request_observability["ar_batch_shared_prefix_bank_error"] = (
@@ -4790,6 +4798,7 @@ class _BatchedARGenerationService:
                 job.ssd_suffix_tokens = 0
                 job.effective_restore_mode = "cold"
                 job.cache_miss_reason = "ar_batch_nonmergeable_history_cache"
+                job.request_observability.update(_ssd_restore_split_fields(None))
                 job.request_observability["ar_batch_cache_restore_skipped"] = (
                     "nonmergeable_history_cache"
                 )
@@ -17746,6 +17755,61 @@ def _round_timing_series(stats: dict[str, Any]) -> list[dict[str, float]]:
     return series
 
 
+_SSD_RESTORE_SPLIT_FIELDS = (
+    ("ssd_restore_read_s", "read_s"),
+    ("ssd_restore_copy_s", "copy_s"),
+    ("ssd_restore_eval_s", "eval_s"),
+    ("ssd_restore_other_s", "other_s"),
+)
+
+
+def _ssd_restore_split_fields(split: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Where an SSD restore's ``ssd_restore_s`` went: reading blobs, copying
+    them into arrays, the GPU eval, and the rest (manifest, payload file);
+    zeros without an SSD restore."""
+    split = split or {}
+    fields: dict[str, Any] = {
+        key: float(split.get(part) or 0.0) for key, part in _SSD_RESTORE_SPLIT_FIELDS
+    }
+    fields["ssd_restore_bytes"] = int(split.get("bytes") or 0)
+    return fields
+
+
+def _restore_telemetry_fields(stats: Mapping[str, Any]) -> dict[str, Any]:
+    """Request-log fields for the restore split and where the restore landed
+    (generation._record_restore_landing). The suffix prefilled after the
+    restore point is ``new_prefill_tokens``."""
+    served = stats.get("session_restore_served") or {}
+    if "ssd_restore_read_s" in stats:
+        # The AR batch lane fills the flat fields itself.
+        fields = {
+            key: stats[key]
+            for key, _part in (*_SSD_RESTORE_SPLIT_FIELDS, ("ssd_restore_bytes", ""))
+            if key in stats
+        }
+    else:
+        fields = _ssd_restore_split_fields(
+            served.get("ssd_restore") if stats.get("ssd_cache_hit") else None
+        )
+    fields.update(_restore_landing_fields(served.get("landing")))
+    return fields
+
+
+def _restore_landing_fields(landing: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The flat ``prefix_restore_*`` request fields of one restore landing
+    (generation._record_restore_landing); zeros and None without one."""
+    landing = landing or {}
+    return {
+        "prefix_restore_matched_tokens": int(landing.get("matched_tokens") or 0),
+        "prefix_restore_point_tokens": int(landing.get("restore_point_tokens") or 0),
+        "prefix_restore_checkpoint_gap_tokens": int(
+            landing.get("checkpoint_gap_tokens") or 0
+        ),
+        "prefix_restore_partial": bool(landing.get("partial", False)),
+        "prefix_restore_origin": landing.get("origin"),
+    }
+
+
 def _metrics_envelope(
     *,
     stats: dict[str, Any],
@@ -17800,6 +17864,7 @@ def _metrics_envelope(
         "ssd_cache_hit": bool(stats.get("ssd_cache_hit") or False),
         "ssd_cached_tokens": int(stats.get("ssd_cached_tokens") or 0),
         "ssd_restore_s": float(stats.get("ssd_restore_s") or 0.0),
+        **_restore_telemetry_fields(stats),
         "ssd_suffix_tokens": int(stats.get("ssd_suffix_tokens") or 0),
         "completion_tokens": int(completion_tokens),
         "prompt_eval_time_s": prompt_eval_time_s,
@@ -29501,6 +29566,60 @@ def _validate_mtp_batch_request_contract(
         )
 
 
+def _mtp_batch_restore_telemetry(
+    session_bank: Any,
+    entry: Any,
+    *,
+    matched: int,
+    restore_point: int,
+    storage_mode: str,
+    session_id: str | None,
+    prompt_tokens: int,
+) -> dict[str, Any]:
+    """Request fields for a batched row's restore: where it came from, the
+    SSD split when the entry was read from disk, and where it landed (also
+    counted in the bank's restore_landings). The row's envelope takes them
+    from request_observability."""
+    from types import SimpleNamespace
+
+    from mtplx.generation import _record_restore_landing, served_restore_record
+
+    cache_source = str(getattr(entry, "cache_source", "ram") or "ram")
+    ssd_hit = cache_source == "ssd"
+    split = getattr(entry, "ssd_restore_split", None) if ssd_hit else None
+    served = served_restore_record(
+        entry,
+        matched=matched,
+        restore_point=restore_point,
+        storage_restore_mode=storage_mode,
+        session_id=session_id,
+        ssd_cache_hit=ssd_hit,
+        ssd_restore_split=split,
+    )
+    suffix_tokens = max(0, int(prompt_tokens) - int(restore_point))
+    landing = _record_restore_landing(
+        session_bank,
+        SimpleNamespace(
+            restore_served=served,
+            ssd_cache_hit=ssd_hit,
+            cache_source=cache_source,
+            suffix_tokens=suffix_tokens,
+        ),
+    )
+    return {
+        "cache_source": cache_source,
+        "ssd_cache_hit": ssd_hit,
+        "ssd_cached_tokens": int(restore_point) if ssd_hit else 0,
+        "ssd_restore_s": (
+            float(getattr(entry, "ssd_restore_s", 0.0) or 0.0) if ssd_hit else 0.0
+        ),
+        "ssd_suffix_tokens": suffix_tokens if ssd_hit else 0,
+        **_ssd_restore_split_fields(split),
+        **_restore_landing_fields(landing),
+        "session_restore_served": served,
+    }
+
+
 def _build_mtp_batch_session_hooks(
     state: ServerState,
     *,
@@ -29605,6 +29724,20 @@ def _build_mtp_batch_session_hooks(
                         "restore_s": round(time.perf_counter() - started, 6),
                     }
                 )
+                try:
+                    request_observability.update(
+                        _mtp_batch_restore_telemetry(
+                            session_bank,
+                            entry,
+                            matched=int(matched),
+                            restore_point=restore_point,
+                            storage_mode=str(storage_mode),
+                            session_id=session_id,
+                            prompt_tokens=len(tokens),
+                        )
+                    )
+                except Exception:
+                    pass  # telemetry never turns a restore into a miss
                 return _NS(
                     cache=cache,
                     mtp_cache=history,

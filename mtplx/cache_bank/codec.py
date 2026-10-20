@@ -12,6 +12,8 @@ import numpy as np
 
 from mtplx.cache_state import CacheSnapshot
 
+from .telemetry import active_restore_timings
+
 
 _MLX_TO_NUMPY_DTYPE: dict[str, Any] = {
     "bool": np.bool_,
@@ -56,6 +58,8 @@ class EncodedPayload:
     reused: dict[str, dict[str, Any]] = field(default_factory=dict)
     reused_nbytes: int = 0
     fingerprints: dict[str, tuple] = field(default_factory=dict)
+    # Seconds of eval and host copy per captured name (telemetry.WriteSplit).
+    capture_s: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -171,6 +175,11 @@ class TreeCodec:
         self.reuse = reuse
         self.reused: dict[str, dict[str, Any]] = {}
         self.fingerprints: dict[str, tuple] = {}
+        # Seconds of eval and host copy behind each captured name, set just
+        # before the name's bytes land in ``tensors``, so a streaming sink can
+        # read its own blob's cost there.
+        self.capture_s: dict[str, float] = {}
+        self._unit_s = 0.0
         self.tensors: dict[str, bytes] = {}
         self.block_size = max(1, int(block_size))
         self.should_abort = should_abort
@@ -194,14 +203,22 @@ class TreeCodec:
         started = time.perf_counter()
         mx.eval(array)
         raw = bytes(memoryview(array))
+        elapsed = time.perf_counter() - started
+        self._unit_s += elapsed
         observer = self.on_unit
         if observer is not None:
             try:
-                observer(kind, time.perf_counter() - started, len(raw))
+                observer(kind, elapsed, len(raw))
             except Exception:
                 pass
         self._check_abort()
         return raw
+
+    def _store(self, name: str, raw: bytes) -> None:
+        """Hand a captured blob to ``tensors`` with the units it took."""
+        self.capture_s[name] = self._unit_s
+        self._unit_s = 0.0
+        self.tensors[name] = raw
 
     def _fingerprints(self, value: Any, *, rows: int | None) -> list[int] | None:
         """One bounded unit like _materialize: a single GPU reduction over
@@ -294,7 +311,7 @@ class TreeCodec:
                         "nbytes": int(hit["nbytes"]),
                     }
         raw = self._tensor_bytes(value, shape)
-        self.tensors[name] = raw
+        self._store(name, raw)
         return {
             "kind": "tensor",
             "name": name,
@@ -375,7 +392,7 @@ class TreeCodec:
                     )
                     continue
             raw = self._materialize("block", chunk)
-            self.tensors[name] = raw
+            self._store(name, raw)
             total += len(raw)
             blocks.append(
                 {
@@ -511,6 +528,7 @@ def encode_payload(
         reused=dict(codec.reused),
         reused_nbytes=sum(int(blob["nbytes"]) for blob in codec.reused.values()),
         fingerprints=dict(codec.fingerprints),
+        capture_s=dict(codec.capture_s),
     )
 
 
@@ -684,7 +702,18 @@ def _eval_decoded_arrays(decoded: DecodedPayload) -> None:
     ):
         _collect_arrays(part, arrays)
     if arrays:
-        mx.eval(*arrays)
+        _timed_eval(arrays)
+
+
+def _timed_eval(arrays: list[Any]) -> None:
+    """``mx.eval``, counted as restore eval time while a restore is timed:
+    the GPU side of the decode, the concatenate of each tensor's blocks
+    included."""
+    timings = active_restore_timings()
+    started = time.perf_counter() if timings is not None else 0.0
+    mx.eval(*arrays)
+    if timings is not None:
+        timings.eval_s += time.perf_counter() - started
 
 
 def decode_gdn_boundaries(
@@ -731,7 +760,7 @@ def decode_gdn_boundaries(
         arrays: list[Any] = []
         _collect_arrays(decoded, arrays)
         if arrays:
-            mx.eval(*arrays)
+            _timed_eval(arrays)
         boundaries.append(decoded)
     return tuple(boundaries)
 
@@ -886,10 +915,11 @@ def _decode_tree_prefix(
     return decode_tree(spec, read_tensor)
 
 
-def _decode_tensor(spec: dict[str, Any], read_tensor: Callable[[str], bytes]) -> Any:
-    dtype = str(spec["dtype"])
-    shape = tuple(int(dim) for dim in spec.get("shape") or [])
-    raw = read_tensor(str(spec["name"]))
+def _array_from_buffer(raw: Any, dtype: str) -> Any:
+    """One host copy of ``raw`` (bytes or a byte buffer) into a flat array,
+    counted as restore copy time while a restore is timed."""
+    timings = active_restore_timings()
+    started = time.perf_counter() if timings is not None else 0.0
     if dtype == "bfloat16":
         arr = mx.array(np.frombuffer(raw, dtype=np.uint16)).view(mx.bfloat16)
     else:
@@ -898,6 +928,29 @@ def _decode_tensor(spec: dict[str, Any], read_tensor: Callable[[str], bytes]) ->
         if np_dtype is None or mlx_dtype is None:
             raise ValueError(f"unsupported persisted tensor dtype: {dtype!r}")
         arr = mx.array(np.frombuffer(raw, dtype=np_dtype), dtype=mlx_dtype)
+    if timings is not None:
+        timings.copy_s += time.perf_counter() - started
+    return arr
+
+
+def _read_blob(read_tensor: Callable[[str], bytes], name: str) -> bytes:
+    """``read_tensor(name)``, counted as restore read time and bytes while a
+    restore is timed."""
+    timings = active_restore_timings()
+    if timings is None:
+        return read_tensor(name)
+    started = time.perf_counter()
+    raw = read_tensor(name)
+    timings.read_s += time.perf_counter() - started
+    timings.bytes_read += len(raw)
+    return raw
+
+
+def _decode_tensor(spec: dict[str, Any], read_tensor: Callable[[str], bytes]) -> Any:
+    dtype = str(spec["dtype"])
+    shape = tuple(int(dim) for dim in spec.get("shape") or [])
+    raw = _read_blob(read_tensor, str(spec["name"]))
+    arr = _array_from_buffer(raw, dtype)
     if shape:
         arr = arr.reshape(shape)
     return arr

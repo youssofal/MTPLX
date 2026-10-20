@@ -477,6 +477,29 @@ class Gemma4PromptState:
     cache_hit: bool = False
     cache_miss_reason: str | None = None
     restore_mode: str = "cold"
+    # Where a session-bank restore came from and what it served, in the
+    # shape of the Qwen lanes (generation.PromptState): the request log's
+    # ssd_* and prefix_restore_* fields read these.
+    cache_source: str = "none"
+    ssd_cache_hit: bool = False
+    ssd_restore_s: float = 0.0
+    restore_served: dict[str, Any] = field(default_factory=dict)
+
+
+def _gemma4_restore_stats(prompt_state: Any) -> dict[str, Any]:
+    """GenerationStats fields for the prompt state's restore (read with
+    defaults: callers may hand in a prompt state without these fields)."""
+    ssd_hit = bool(getattr(prompt_state, "ssd_cache_hit", False))
+    return {
+        "cache_source": str(getattr(prompt_state, "cache_source", "none") or "none"),
+        "ssd_cache_hit": ssd_hit,
+        "ssd_cached_tokens": int(prompt_state.cached_tokens) if ssd_hit else 0,
+        "ssd_restore_s": (
+            float(getattr(prompt_state, "ssd_restore_s", 0.0) or 0.0) if ssd_hit else 0.0
+        ),
+        "ssd_suffix_tokens": int(prompt_state.suffix_tokens) if ssd_hit else 0,
+        "session_restore_served": dict(getattr(prompt_state, "restore_served", None) or {}),
+    }
 
 
 @dataclass(frozen=True)
@@ -3102,6 +3125,7 @@ def _restore_or_prefill_gemma4_prompt(
     prompt_ids: list[int],
     *,
     session_bank: Any | None = None,
+    session_id: str | None = None,
     session_restore_mode: str = "clone",
     session_template_hash: str | None = None,
     session_draft_head_identity: str | None = None,
@@ -3109,9 +3133,18 @@ def _restore_or_prefill_gemma4_prompt(
     require_shared_kv: bool,
     abort_check: Any | None = None,
 ) -> Gemma4PromptState:
+    """Restore the longest banked prefix, or prefill cold.
+
+    ``session_id`` is used for telemetry only (whether a restored entry came
+    from the same conversation); the restore itself does not depend on it.
+    """
     if not prompt_ids:
         raise ValueError("prompt_ids must not be empty for Gemma 4 generation")
-    from mtplx.generation import _check_postcommit_abort
+    from mtplx.generation import (
+        _check_postcommit_abort,
+        _record_restore_landing,
+        served_restore_record,
+    )
 
     def forward(tokens: list[int], cache: Any) -> tuple[Gemma4TargetOutput, float]:
         # The request's abort site (the per-chunk memory check, the
@@ -3230,7 +3263,11 @@ def _restore_or_prefill_gemma4_prompt(
                 output, _suffix_elapsed = forward(list(prompt_ids[seed:]), cache)
                 entry.hits += 1
                 entry.last_access_s = time.time()
-                return Gemma4PromptState(
+                # Gemma 4 has no recurrent layers: the restore lands on the
+                # matched length itself, so the checkpoint gap is 0.
+                cache_source = str(getattr(entry, "cache_source", "ram") or "ram")
+                ssd_hit = cache_source == "ssd"
+                near_state = Gemma4PromptState(
                     cache=cache,
                     logits=output.logits[:, -1, :],
                     hidden=output.hidden[:, -1:, :],
@@ -3242,13 +3279,43 @@ def _restore_or_prefill_gemma4_prompt(
                     cache_hit=True,
                     cache_miss_reason=None,
                     restore_mode=f"block_prefix_{storage_mode}",
+                    cache_source=cache_source,
+                    ssd_cache_hit=ssd_hit,
+                    ssd_restore_s=float(getattr(entry, "ssd_restore_s", 0.0) or 0.0),
+                    restore_served=served_restore_record(
+                        entry,
+                        matched=matched,
+                        restore_point=restore_point,
+                        storage_restore_mode=str(storage_mode),
+                        session_id=session_id,
+                        ssd_cache_hit=ssd_hit,
+                        ssd_restore_split=getattr(entry, "ssd_restore_split", None),
+                    ),
                 )
+                _record_restore_landing(session_bank, near_state)
+                return near_state
         return cold_prefill(getattr(session_bank, "last_miss_reason", None))
 
+    cache_source = str(getattr(restored, "cache_source", "ram") or "ram")
+    ssd_hit = bool(getattr(restored, "ssd_cache_hit", False))
+    restore_fields = {
+        "cache_source": cache_source,
+        "ssd_cache_hit": ssd_hit,
+        "ssd_restore_s": float(getattr(restored, "ssd_restore_s", 0.0) or 0.0),
+        "restore_served": served_restore_record(
+            restored.entry,
+            matched=int(restored.entry.prefix_len),
+            restore_point=int(restored.entry.prefix_len),
+            storage_restore_mode=str(restored.restore_mode or session_restore_mode),
+            session_id=session_id,
+            ssd_cache_hit=ssd_hit,
+            ssd_restore_split=getattr(restored, "ssd_restore_split", None),
+        ),
+    }
     suffix = list(prompt_ids[restored.entry.prefix_len :])
     if suffix:
         output, suffix_elapsed = forward(suffix, restored.cache)
-        return Gemma4PromptState(
+        exact_state = Gemma4PromptState(
             cache=restored.cache,
             logits=output.logits[:, -1, :],
             hidden=output.hidden[:, -1:, :],
@@ -3260,7 +3327,10 @@ def _restore_or_prefill_gemma4_prompt(
             cache_hit=True,
             cache_miss_reason=None,
             restore_mode=str(restored.restore_mode or session_restore_mode),
+            **restore_fields,
         )
+        _record_restore_landing(session_bank, exact_state)
+        return exact_state
 
     extra_state = restored.extra_state if isinstance(restored.extra_state, dict) else {}
     shared_kv_states = extra_state.get("gemma4_shared_kv_states")
@@ -3271,7 +3341,7 @@ def _restore_or_prefill_gemma4_prompt(
     kv_offset = extra_state.get("gemma4_kv_offset")
     if kv_offset is None:
         kv_offset = runtime.target.cache_offset(restored.cache)
-    return Gemma4PromptState(
+    exact_state = Gemma4PromptState(
         cache=restored.cache,
         logits=restored.logits,
         hidden=restored.hidden,
@@ -3283,7 +3353,10 @@ def _restore_or_prefill_gemma4_prompt(
         cache_hit=True,
         cache_miss_reason=None,
         restore_mode=str(restored.restore_mode or session_restore_mode),
+        **restore_fields,
     )
+    _record_restore_landing(session_bank, exact_state)
+    return exact_state
 
 
 def generate_gemma4_ar(
@@ -3300,6 +3373,7 @@ def generate_gemma4_ar(
     prefill_callback: Any | None = None,
     repetition_stop: bool = False,
     session_bank: Any | None = None,
+    session_id: str | None = None,
     session_restore_mode: str = "clone",
     session_template_hash: str | None = None,
     session_draft_head_identity: str | None = None,
@@ -3358,6 +3432,7 @@ def generate_gemma4_ar(
         session_policy_fingerprint=session_policy_fingerprint,
         require_shared_kv=False,
         abort_check=abort_check,
+        session_id=session_id,
     )
     if prefill_callback is not None:
         try:
@@ -3510,6 +3585,7 @@ def generate_gemma4_ar(
         session_cache_hit=bool(prompt_state.cache_hit),
         cache_miss_reason=prompt_state.cache_miss_reason,
         session_restore_mode=prompt_state.restore_mode,
+        **_gemma4_restore_stats(prompt_state),
         target_forward_time_s=prompt_state.prompt_eval_time_s + target_decode_time,
         verify_time_s=target_decode_time,
         verify_forward_time_s=target_decode_time,
@@ -3558,6 +3634,7 @@ def generate_gemma4_assistant(
     stop_token_ids: set[int] | None = None,
     token_callback: Any | None = None,
     session_bank: Any | None = None,
+    session_id: str | None = None,
     session_restore_mode: str = "clone",
     session_template_hash: str | None = None,
     session_draft_head_identity: str | None = None,
@@ -3627,6 +3704,7 @@ def generate_gemma4_assistant(
         session_policy_fingerprint=session_policy_fingerprint,
         require_shared_kv=True,
         abort_check=abort_check,
+        session_id=session_id,
     )
     if prefill_callback is not None:
         try:
@@ -3945,6 +4023,7 @@ def generate_gemma4_assistant(
         session_cache_hit=bool(prompt_state.cache_hit),
         cache_miss_reason=prompt_state.cache_miss_reason,
         session_restore_mode=prompt_state.restore_mode,
+        **_gemma4_restore_stats(prompt_state),
         target_forward_time_s=prompt_state.prompt_eval_time_s + float(timing_totals["verify"]),
         verify_time_s=float(timing_totals["verify"]),
         verify_forward_time_s=float(timing_totals["verify"]),

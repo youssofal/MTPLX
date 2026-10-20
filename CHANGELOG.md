@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **SSD session cache telemetry** (by @jvmenen). Every SSD restore reports where its time went: reading blobs, copying them into arrays and the GPU evaluation, plus the bytes read, in its log line and in the request log (`ssd_restore_read_s`, `ssd_restore_copy_s`, `ssd_restore_eval_s`, `ssd_restore_other_s`, `ssd_restore_bytes`). Every RAM and SSD restore records where it landed: the tokens matched, the recurrent checkpoint it resumed at, the tokens lost between the two, and whether the entry came from the same conversation or another one sharing the prompt head (`prefix_restore_*` in the request log, counters per source under `session_bank.restore_landings` in `/health`). `/health` and `/admin/cache/ssd` show the bytes the writer put on disk over the last hour, the bytes it did not write because the blob was already there, both split into checkpoint and KV bytes, against `MTPLX_SSD_WRITE_BUDGET_PER_HOUR` (`write_volume`). The timing costs about 0.2 µs per tensor read.
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed
