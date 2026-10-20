@@ -82,6 +82,7 @@ from mtplx.a3b_mtp_batch import (
 from mtplx.adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
 from mtplx.attention_context import attention_phase
 from mtplx.cache_state import snapshot_cache
+from mtplx.segmented_kv import segmented_kv_enabled
 from mtplx.one_copy import (
     anchor_nbytes as one_copy_anchor_nbytes,
     one_copy_runtime,
@@ -21777,6 +21778,14 @@ def _admission_restore_copies_prefix(
 
     if entry is None:
         return True
+    from mtplx.session_bank import entry_has_segmented_kv
+
+    if segmented_kv_enabled() and entry_has_segmented_kv(entry):
+        # A segmented snapshot is a list of references to sealed segments: the restored
+        # cache writes its turn into a new tail, so the history is never copied
+        # (mtplx/segmented_kv.py; +4.95 GiB at 80K with a stock snapshot, +0.125 GiB with
+        # segments, phase 1 measurement).
+        return False
     if str(restore_mode or "clone") != "reference":
         return True
     if getattr(entry, "cache_ref", None) is None:
@@ -22094,6 +22103,7 @@ def _admission_growth(
     restore_fixed_bytes: int | None = None,
     publish_bytes: int | None = None,
     slack_rows: int = 0,
+    segmented_kv: bool = False,
 ) -> dict[str, Any]:
     """New memory one request needs at its peak, on top of what is measured.
 
@@ -22282,6 +22292,10 @@ def _admission_growth(
         publish_copy = 0
     elif publish_bytes is not None:
         publish_copy = max(0, int(publish_bytes))
+    elif segmented_kv and not paged_live:
+        # Segmented KV: the snapshot is a list of references and seals the tail, a copy of
+        # the rows this request writes (one layer at a time), never of the history.
+        publish_copy = (M + max(0, int(output_tokens))) * live_w
     else:
         publish_copy = live_total
     decode_start = live_decode + publish_copy
@@ -23071,6 +23085,7 @@ def _run_prefill_admission(
             ),
             publish_bytes=anchor_bytes,
             slack_rows=slack_rows,
+            segmented_kv=segmented_kv_enabled(),
         )
         model["scratch_source"] = scratch_source
         calibration = getattr(runtime, "prefill_scratch_calibration", None)

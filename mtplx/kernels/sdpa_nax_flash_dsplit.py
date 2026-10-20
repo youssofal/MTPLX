@@ -15,6 +15,28 @@ and each simdgroup owns HALF of the head dimension for one 16-row M block:
 Bytes read from DRAM are unchanged; the kernel just splits them across twice the
 simdgroups with half the live state each. Gated like the sibling kernel; env kill-switch
 MTPLX_NAX_FLASH_DSPLIT=0; block count MTPLX_NAX_FLASH_DSPLIT_BLOCKS.
+
+Quarter split (attn4, 2026-10-04, ``MTPLX_NAX_FLASH_DSPLIT4=1``, off by default). The
+halves kernel is limited by live state, not by what it reads: with the MMA removed the
+same loads run at 248 GB/s, with it at 180 to 190 GB/s, and any extra live register in
+a row-ordered-load variant made it 30 to 50% slower. Splitting the head dimension in
+quarters (``NSGM x 4`` simdgroups, 32 accumulators per thread, 256 threads for 24 rows)
+raises occupancy and hides the MMA behind other simdgroups' loads: M=4 at 80k goes
+from 1.73-1.76 to 1.31 ms per layer (186 to 250 GB/s of a 288 GB/s read roof), 50k
+1.11 to 0.86, 20k 0.48 to 0.37. The four partial scores are summed through the same
+double-buffered threadgroup buffer (32 KB, the device limit), still one barrier per tile.
+Accumulation order differs from the halves kernel (four partial sums), so results agree
+within fp32 rounding but are not bit-identical to the 2-way route; the 2-way route itself
+is bit-identical to before when the switch is off.
+
+NDH and TG_M are independent template parameters, so the two compose
+(``NSGM = TG_M`` row blocks, each split ``NDH`` ways). The wide route (q_len 9..32, row
+groups tiled over TG_M) takes the quarter split with the same switch (``wide_shape``):
+wide windows are not limited by what they read but by the work per 16-row block (every
+block walks every key; one group of 32 or 64 rows per threadgroup instead of 32 rows in
+two groups is not faster, and neither is reusing each K/V fragment for two blocks), and
+quarters take 11 to 19% less time per window (9 to 25 rows at 100K). Row groups are 32 rows when the window's
+16-row blocks pair up, otherwise 16 rows, so no group carries an empty block.
 """
 
 from __future__ import annotations
@@ -34,13 +56,17 @@ nax_flash_dsplit_bail_counts: dict[str, int] = {}
 # its bails) — the one-line receipt the #459 reports needed.
 nax_flash_dsplit_dispatch_counts: dict[str, int] = {}
 
-# Template params: InT, PartT, D, QL, GQA_F.
+WIDE_MAX_Q = 32
+WIDE_MAX_ROWS = 192
+
+# Template params: InT, PartT, D, QL, GQA_F, TG_M (16-row blocks per threadgroup), NDH
+# (head-dim parts per 16-row block: 2 shipping, 4 opt-in).
 _SOURCE = r"""
     constexpr int TK = 32;
     constexpr int MROWS = 16;
     constexpr int LIVE = GQA_F * QL;
-    constexpr int NSGM = (LIVE + MROWS - 1) / MROWS;
-    constexpr int NDH = 2;                       // head-dim halves
+    constexpr int NSGM = TG_M;                   // 16-row blocks per threadgroup
+    // NDH head-dim parts (2: halves, shipping; 4: quarters, MTPLX_NAX_FLASH_DSPLIT4=1).
     constexpr int DH = D / NDH;                  // dims per simdgroup
     constexpr int NSGS = NSGM * NDH;
     constexpr int DFRAGS = DH / 16;
@@ -63,7 +89,9 @@ _SOURCE = r"""
     const int kv_end = metal::min(kv_start + chunk, n_kv);
 
     const short2 sc = nax_get_coord(lane);
-    const int m_base = mg * MROWS;
+    // Query-row tiling (wide verify): grid.y walks row groups of NSGM * 16 rows, so one
+    // KV pass per group; groups of the same KV chunk are adjacent in dispatch order.
+    const int m_base = int(threadgroup_position_in_grid.y) * (NSGM * MROWS) + mg * MROWS;
     const int db = dh * DH;
 
     threadgroup float tg_s[2 * NSGS * SBUF];
@@ -96,7 +124,6 @@ _SOURCE = r"""
         for (int i = 0; i < kElemsPerFrag; i++) o_frag[g][h][i] = 0.0f;
 
     const int my_slot = mg * NDH + dh;
-    const int other_slot = mg * NDH + (1 - dh);
     int tile_par = 0;
 
     for (int t0 = kv_start; t0 < kv_end; t0 += TK) {
@@ -145,16 +172,19 @@ _SOURCE = r"""
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
       float s_raw[2][kElemsPerFrag];
-      {
-        const threadgroup float* other = tg_s + (size_t)(tile_par * NSGS + other_slot) * SBUF;
+      for (short hh = 0; hh < 2; hh++)
+        for (short e = 0; e < kElemsPerFrag; e++) s_raw[hh][e] = ct_s[hh * kElemsPerFrag + e];
+      for (int od = 0; od < NDH; od++) {
+        if (od == dh) continue;
+        const threadgroup float* other = tg_s + (size_t)(tile_par * NSGS + mg * NDH + od) * SBUF;
         for (short hh = 0; hh < 2; hh++)
           for (short i = 0; i < 2; i++) {
             const int idx = (sc.y + i * kElemRowsJump) * TK + hh * 16 + sc.x;
             const float4 v4 = reinterpret_cast<const threadgroup float4*>(other + idx)[0];
-            s_raw[hh][i * kElemCols + 0] = ct_s[hh * kElemsPerFrag + i * kElemCols + 0] + v4.x;
-            s_raw[hh][i * kElemCols + 1] = ct_s[hh * kElemsPerFrag + i * kElemCols + 1] + v4.y;
-            s_raw[hh][i * kElemCols + 2] = ct_s[hh * kElemsPerFrag + i * kElemCols + 2] + v4.z;
-            s_raw[hh][i * kElemCols + 3] = ct_s[hh * kElemsPerFrag + i * kElemCols + 3] + v4.w;
+            s_raw[hh][i * kElemCols + 0] += v4.x;
+            s_raw[hh][i * kElemCols + 1] += v4.y;
+            s_raw[hh][i * kElemCols + 2] += v4.z;
+            s_raw[hh][i * kElemCols + 3] += v4.w;
           }
       }
       tile_par ^= 1;
@@ -296,15 +326,65 @@ def _default_dsplit_blocks(capacity: int) -> int:
     return 64
 
 
-def sdpa_nax_flash_dsplit(
+def _default_dsplit4_blocks(capacity: int) -> int:
+    # 2026-10-04 attn4 sweep, M=4, ms per layer (full op incl. reduce), NDH=4:
+    # 20k b64 0.368 / b128 0.382 / b256 0.430 / b512 0.524;
+    # 50k b64 0.851 / b128 0.857 / b256 0.909; 80k b64 1.333 / b96 1.323 / b128 1.313 / b256 1.355.
+    # Fewer, longer blocks than the NDH=2 table: the kernel is no longer
+    # occupancy-bound, so fewer partials and a cheaper reduce win.
+    return 128 if capacity >= 65536 else 64
+
+
+def wide_shape(live: int, *, quarters: bool = True) -> tuple[int, int]:
+    """(NDH, TG_M) of the wide route for ``live`` query rows per KV head.
+
+    Quarters with ``MTPLX_NAX_FLASH_DSPLIT4=1`` (unless its self-check lane failed), halves
+    otherwise or with ``quarters=False``. TG_M: ``MTPLX_NAX_FLASH_WIDE_TGM`` when set (1 to 4, at most 2 with quarters:
+    the score exchange holds 2 x 2 KB per simdgroup in 32 KB); else 2 with halves, as before,
+    and with quarters 2 when the 16-row blocks pair up, 1 otherwise (an odd block count in
+    groups of two leaves the last group one empty block, which costs as much as a full one).
+    """
+    ndh = 2
+    if quarters and os.environ.get("MTPLX_NAX_FLASH_DSPLIT4", "0") == "1":
+        from ..kernel_selfcheck import lane_disabled
+
+        if not lane_disabled("nax_flash_dsplit4_sdpa"):
+            ndh = 4
+    m_blocks = (live + 15) // 16
+    raw = (os.environ.get("MTPLX_NAX_FLASH_WIDE_TGM") or "").strip()
+    try:
+        tg_m = min(4, max(1, int(raw))) if raw else None
+    except ValueError:
+        tg_m = None
+    if tg_m is None:
+        tg_m = 2 if ndh == 2 or m_blocks % 2 == 0 else 1
+    tg_m = min(tg_m, 8 // ndh)
+    return ndh, min(tg_m, m_blocks)
+
+
+def _default_wide_blocks(capacity: int, rows: int) -> int:
+    # Wide windows write rows x blocks x D partials; with many rows fewer, longer chunks
+    # keep that traffic small (see the wide-route sweep in the PR text).
+    base = _default_dsplit_blocks(capacity)
+    return max(32, base // 2) if rows > 64 else base
+
+
+def _dsplit_dispatch(
     *,
     queries: mx.array,
     keys: mx.array,
     values: mx.array,
     offset: int | mx.array,
     scale: float,
+    wide: bool,
+    ndh: int | None = None,
 ) -> mx.array | None:
-    """Head-dim-split TensorOps flash SDPA. Same contract as the packed kernel."""
+    """Shared gate + dispatch. ``wide=False`` is the shipping M<=32 contract.
+
+    ``ndh`` (head-dim parts per M block, shipping contract only): None reads the switch
+    (``MTPLX_NAX_FLASH_DSPLIT4=1`` selects 4, otherwise 2); the kernel self-check passes 4
+    explicitly. The wide route ignores it and takes ``wide_shape``.
+    """
     if os.environ.get("MTPLX_NAX_FLASH_DSPLIT", "1") == "0":
         return _bail("env_disabled")
     if not mx.metal.is_available():
@@ -321,10 +401,17 @@ def sdpa_nax_flash_dsplit(
     if hk <= 0 or hq % hk:
         return _bail("gqa_heads")
     gqa_factor = hq // hk
-    if gqa_factor * q_len > 32:
-        return _bail("m_rows_gt_32")
-    if q_len < 1 or q_len > 10:
-        return _bail("q_len")
+    live = gqa_factor * q_len
+    if wide:
+        if live > WIDE_MAX_ROWS:
+            return _bail("m_rows_gt_wide_max")
+        if q_len < 1 or q_len > WIDE_MAX_Q:
+            return _bail("q_len")
+    else:
+        if live > 32:
+            return _bail("m_rows_gt_32")
+        if q_len < 1 or q_len > 10:
+            return _bail("q_len")
     if queries.dtype not in (mx.bfloat16, mx.float16):
         return _bail("query_dtype")
     if keys.dtype != queries.dtype or values.dtype != queries.dtype:
@@ -343,7 +430,24 @@ def sdpa_nax_flash_dsplit(
             return _bail("offset_range")
         offset_arr = mx.array([offset_int], dtype=mx.int32)
 
-    blocks = int(os.environ.get("MTPLX_NAX_FLASH_DSPLIT_BLOCKS", "0") or 0) or _default_dsplit_blocks(capacity)
+    if wide:
+        ndh, wide_tg_m = wide_shape(live)
+    elif ndh is None:
+        ndh = 4 if os.environ.get("MTPLX_NAX_FLASH_DSPLIT4", "0") == "1" else 2
+        if ndh == 4:
+            from ..kernel_selfcheck import lane_disabled
+
+            if lane_disabled("nax_flash_dsplit4_sdpa"):
+                ndh = 2  # the quarter-split probe failed on this machine: keep the shipping split
+    if ndh not in (2, 4):
+        return _bail("ndh")
+    if wide:
+        default_blocks = _default_wide_blocks(capacity, live)
+    elif ndh == 4:
+        default_blocks = _default_dsplit4_blocks(capacity)
+    else:
+        default_blocks = _default_dsplit_blocks(capacity)
+    blocks = int(os.environ.get("MTPLX_NAX_FLASH_DSPLIT_BLOCKS", "0") or 0) or default_blocks
     blocks = max(32, (blocks // 32) * 32)
     blocks_arr = mx.array([blocks], dtype=mx.int32)
 
@@ -352,8 +456,11 @@ def sdpa_nax_flash_dsplit(
     if kernel is None or reduce_kernel is None:
         return _bail("kernel_unavailable")
 
-    nsgm = (gqa_factor * q_len + 15) // 16
-    nthreads = 32 * nsgm * 2
+    # 16-row blocks per threadgroup and number of row groups (grid.y). The shipping
+    # contract (live <= 32) is one group covering every row, as before.
+    tg_m = wide_tg_m if wide else (live + 15) // 16
+    row_groups = (live + 16 * tg_m - 1) // (16 * tg_m)
+    nthreads = 32 * tg_m * ndh
     partial_shape = (bsz, hq, q_len, blocks, d)
     stats_shape = (bsz, hq, q_len, blocks)
     try:
@@ -366,8 +473,10 @@ def sdpa_nax_flash_dsplit(
                 ("D", d),
                 ("QL", q_len),
                 ("GQA_F", gqa_factor),
+                ("TG_M", tg_m),
+                ("NDH", ndh),
             ],
-            grid=(hk * nthreads, 1, blocks),
+            grid=(hk * nthreads, row_groups, blocks),
             threadgroup=(nthreads, 1, 1),
             output_shapes=[partial_shape, stats_shape, stats_shape],
             output_dtypes=[unnormalized_partials_dtype(queries.dtype), mx.float32, mx.float32],
@@ -386,5 +495,42 @@ def sdpa_nax_flash_dsplit(
         output_shapes=[(bsz, hq, q_len, d)],
         output_dtypes=[queries.dtype],
     )
-    nax_flash_dsplit_dispatch_counts["dispatched"] = nax_flash_dsplit_dispatch_counts.get("dispatched", 0) + 1
+    key = "dispatched_wide" if wide else "dispatched"
+    nax_flash_dsplit_dispatch_counts[key] = nax_flash_dsplit_dispatch_counts.get(key, 0) + 1
     return out
+
+
+def sdpa_nax_flash_dsplit(
+    *,
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    offset: int | mx.array,
+    scale: float,
+    ndh: int | None = None,
+) -> mx.array | None:
+    """Head-dim-split TensorOps flash SDPA. Same contract as the packed kernel.
+
+    ``ndh`` is the number of head-dim parts per M block: None reads the switch
+    (``MTPLX_NAX_FLASH_DSPLIT4=1`` selects 4, otherwise the shipping 2); the kernel
+    self-check passes 4 explicitly.
+    """
+    return _dsplit_dispatch(
+        queries=queries, keys=keys, values=values, offset=offset, scale=scale, wide=False,
+        ndh=ndh,
+    )
+
+
+def sdpa_nax_flash_dsplit_wide(
+    *,
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    offset: int | mx.array,
+    scale: float,
+) -> mx.array | None:
+    """Wide verify windows (6 x q_len up to 192 rows): the dsplit kernel with the query rows
+    tiled in groups inside one launch (grid.y), same tail-causal semantics."""
+    return _dsplit_dispatch(
+        queries=queries, keys=keys, values=values, offset=offset, scale=scale, wide=True,
+    )

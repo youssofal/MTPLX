@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -150,6 +151,22 @@ def content_fingerprints(value: Any, *, rows: int | None = None) -> list[int] | 
     ]
 
 
+# Segmented KV (MTPLX_SEGMENTED_KV): at most this many blocks per fingerprint unit (16 x 256 rows).
+_SEGMENTED_FINGERPRINT_BLOCKS = 16
+
+
+def _count_ssd(route: str) -> None:
+    from mtplx.segmented_kv import count_route
+
+    count_route(route)
+
+
+def _is_segmented_state(value: Any) -> bool:
+    """True for a SegmentedKVState; never imports the segmented module when it is not loaded."""
+    module = sys.modules.get("mtplx.segmented_kv")
+    return module is not None and isinstance(value, module.SegmentedKVState)
+
+
 class TreeCodec:
     """Flatten JSON-safe trees plus MLX arrays into raw tensor blobs."""
 
@@ -171,6 +188,14 @@ class TreeCodec:
         self.reuse = reuse
         self.reused: dict[str, dict[str, Any]] = {}
         self.fingerprints: dict[str, tuple] = {}
+        # Streaming writer hooks for segmented rows (MTPLX_SEGMENTED_KV, spill_entry): a block
+        # inside one sealed segment that an earlier spill already hashed is referenced
+        # (known_blob confirms the blob is still on disk) instead of read back and hashed again;
+        # on_block records the digest of every block that was hashed.
+        self.known_blob: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None
+        self.on_block: Callable[[Any, int, int, str], None] | None = None
+        # Names of ``reused`` that a segment named (not the incremental memo).
+        self.segment_reused: set[str] = set()
         self.tensors: dict[str, bytes] = {}
         self.block_size = max(1, int(block_size))
         self.should_abort = should_abort
@@ -232,6 +257,37 @@ class TreeCodec:
         if interrupted:
             raise ColdEncodeInterrupted()
 
+    def _block_fingerprint(
+        self,
+        value: Any,
+        block_index: int,
+        *,
+        full: int,
+        block_fps: dict[int, int | None],
+        skip: Callable[[int], bool] | None,
+    ) -> int | None:
+        """The content fingerprint of one full block, or None (no memo key).
+
+        For segmented rows the first block that needs one is fingerprinted with the blocks
+        after it, at most _SEGMENTED_FINGERPRINT_BLOCKS in one unit; the run stops before a
+        block that needs none (``skip``)."""
+        if (block_index + 1) * self.block_size > full:
+            return None
+        if block_index not in block_fps and hasattr(value, "rows_slice"):
+            stop = block_index + 1
+            limit = min(full // self.block_size, block_index + _SEGMENTED_FINGERPRINT_BLOCKS)
+            while stop < limit and (skip is None or not skip(stop)):
+                stop += 1
+            part = self._fingerprints(
+                value.rows_slice(block_index * self.block_size, stop * self.block_size),
+                rows=self.block_size,
+            )
+            for offset in range(stop - block_index):
+                block_fps[block_index + offset] = (
+                    part[offset] if part is not None and offset < len(part) else None
+                )
+        return block_fps.get(block_index)
+
     def encode(self, value: Any) -> Any:
         if value is None:
             return {"kind": "none"}
@@ -249,6 +305,23 @@ class TreeCodec:
             return {"kind": "str", "value": str(value)}
         if isinstance(value, mx.array):
             return self._encode_tensor(value)
+        if _is_segmented_state(value):
+            # MTPLX_SEGMENTED_KV: the same spec and blobs as the stock (keys, values) tuple of
+            # the same rows; the history is sliced block by block, never gathered. Below the
+            # block threshold of _encode_tensor (2 blocks of rows) a tensor is stored as one
+            # blob, which the codec reads as one mx.array: those few rows are concatenated.
+            from mtplx.segmented_kv import segmented_state_tensors
+
+            _count_ssd("ssd_layer_states_encoded")
+            return {
+                "kind": "tuple",
+                "items": [
+                    self._encode_tensor(
+                        t if t.shape[2] >= self.block_size * 2 else t.rows_slice(0, t.shape[2])
+                    )
+                    for t in segmented_state_tensors(value)
+                ],
+            }
         if isinstance(value, tuple):
             return {"kind": "tuple", "items": [self.encode(item) for item in value]}
         if isinstance(value, list):
@@ -336,15 +409,31 @@ class TreeCodec:
         axis = 2
         blocks: list[dict[str, Any]] = []
         total = 0
-        block_fps: list[int] | None = None
-        if self.reuse is not None:
-            full = (shape[axis] // self.block_size) * self.block_size
-            if full:
+        full = (shape[axis] // self.block_size) * self.block_size
+        # block index -> content fingerprint. Segmented rows are fingerprinted per run of at
+        # most _SEGMENTED_FINGERPRINT_BLOCKS blocks, the first time a block of the run needs
+        # one, so the pass never builds the whole history and skips blocks a segment names.
+        block_fps: dict[int, int | None] | None = None
+        if self.reuse is not None and full:
+            if hasattr(value, "rows_slice"):
+                block_fps = {}
+            else:
                 slices = [slice(None)] * len(shape)
                 slices[axis] = slice(0, full)
-                block_fps = self._fingerprints(
-                    value[tuple(slices)], rows=self.block_size
-                )
+                fps = self._fingerprints(value[tuple(slices)], rows=self.block_size)
+                block_fps = dict(enumerate(fps)) if fps is not None else None
+        seg_rows = value if hasattr(value, "known_digest") and self.known_blob is not None else None
+
+        def needs_no_fingerprint(index: int) -> bool:
+            lo, hi = index * self.block_size, (index + 1) * self.block_size
+            if seg_rows.known_digest(lo, hi) is not None:
+                return True
+            # With an empty memo nothing can hit, and a block inside one sealed segment is named
+            # by its segment once captured: its fingerprint would only cost (a session's first
+            # spill would read the whole history for it).
+            return not self.reuse and seg_rows.in_one_sealed_segment(lo, hi)
+
+        skip = needs_no_fingerprint if seg_rows is not None else None
         for start in range(0, shape[axis], self.block_size):
             # No check here: _encode_tensor checked before the first block and
             # _materialize checks after every block.
@@ -355,27 +444,50 @@ class TreeCodec:
             name = f"tensor_{self._next_tensor_id:08d}"
             self._next_tensor_id += 1
             block_index = start // self.block_size
-            if block_fps is not None and block_index < len(block_fps):
-                chunk_shape = [int(dim) for dim in chunk.shape]
-                key = (dtype, tuple(chunk_shape), int(start), block_fps[block_index])
-                self.fingerprints[name] = key
-                hit = self.reuse.get(key) if self.reuse is not None else None
+            hit = None
+            if seg_rows is not None:
+                # MTPLX_SEGMENTED_KV spill: a block of a sealed segment that an earlier spill
+                # already wrote is referenced like a reuse hit (known_blob confirms the blob),
+                # before any fingerprint is taken for it.
+                known = seg_rows.known_digest(start, end)
+                hit = self.known_blob(known) if known is not None else None
                 if hit is not None:
-                    nbytes = int(hit["nbytes"])
-                    self.reused[name] = dict(hit)
-                    total += nbytes
-                    blocks.append(
-                        {
-                            "name": name,
-                            "start": int(start),
-                            "end": int(end),
-                            "shape": chunk_shape,
-                            "nbytes": nbytes,
-                        }
-                    )
-                    continue
+                    _count_ssd("ssd_blocks_reused")
+                    self.segment_reused.add(name)
+            if hit is None and block_fps is not None and (skip is None or not skip(block_index)):
+                fingerprint = self._block_fingerprint(
+                    value, block_index, full=full, block_fps=block_fps, skip=skip
+                )
+                if fingerprint is not None:
+                    chunk_shape = [int(dim) for dim in chunk.shape]
+                    key = (dtype, tuple(chunk_shape), int(start), fingerprint)
+                    self.fingerprints[name] = key
+                    hit = self.reuse.get(key) if self.reuse is not None else None
+                    if hit is not None and self.known_blob is not None:
+                        hit = self.known_blob(hit)
+                    if hit is not None and seg_rows is not None:
+                        # The segment names the block from now on (a block across two
+                        # segments has no segment to name it and keeps its memo key).
+                        seg_rows.remember_digest(start, end, hit)
+            if hit is not None:
+                nbytes = int(hit["nbytes"])
+                self.reused[name] = dict(hit)
+                total += nbytes
+                blocks.append(
+                    {
+                        "name": name,
+                        "start": int(start),
+                        "end": int(end),
+                        "shape": [int(dim) for dim in chunk.shape],
+                        "nbytes": nbytes,
+                    }
+                )
+                continue
             raw = self._materialize("block", chunk)
             self.tensors[name] = raw
+            if seg_rows is not None and self.on_block is not None:
+                _count_ssd("ssd_blocks_hashed")
+                self.on_block(seg_rows, int(start), int(end), name)
             total += len(raw)
             blocks.append(
                 {

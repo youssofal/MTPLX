@@ -172,3 +172,57 @@ def test_nax_flash_dsplit_matches_reference(ctx, q_len, blocks):
         perr = mx.abs(packed.astype(mx.float32) - ref).max().item()
         assert err <= max(2.5 * perr, 0.02), (err, perr)
     assert err < 0.05, err
+
+
+@pytest.mark.parametrize("ctx,q_len", [
+    (512, 2), (2048, 3), (2048, 4), (4096, 4), (1023, 4), (1000, 5), (3000, 2),
+])
+@pytest.mark.parametrize("blocks", [32, 64, 128])
+def test_nax_flash_dsplit_quarter_split_matches_reference(ctx, q_len, blocks):
+    """attn4: NDH=4 (MTPLX_NAX_FLASH_DSPLIT4) stays inside the shipping envelope for q_len 2..5."""
+    mx.random.seed(11)
+    cap = ctx + 192
+    q = (mx.random.normal((1, HQ, q_len, D)) * 0.5).astype(mx.bfloat16)
+    k = (mx.random.normal((1, HKV, cap, D)) * 0.5).astype(mx.bfloat16)
+    v = (mx.random.normal((1, HKV, cap, D)) * 0.5).astype(mx.bfloat16)
+    mx.eval(q, k, v)
+    scale = 1.0 / math.sqrt(D)
+    os.environ["MTPLX_NAX_FLASH_DSPLIT_BLOCKS"] = str(blocks)
+    try:
+        out4 = sdpa_nax_flash_dsplit(queries=q, keys=k, values=v, offset=ctx, scale=scale, ndh=4)
+        out2 = sdpa_nax_flash_dsplit(queries=q, keys=k, values=v, offset=ctx, scale=scale, ndh=2)
+    finally:
+        os.environ.pop("MTPLX_NAX_FLASH_DSPLIT_BLOCKS", None)
+    assert out4 is not None and out2 is not None
+    mx.eval(out4, out2)
+    ref = _ref_tail_causal(q, k, v, ctx, scale, q_len)
+    e4 = mx.abs(out4.astype(mx.float32) - ref).max().item()
+    e2 = mx.abs(out2.astype(mx.float32) - ref).max().item()
+    assert e4 <= max(2.5 * e2, 0.02), (e4, e2)
+    assert e4 < 0.05, e4
+
+
+def test_nax_flash_dsplit_quarter_split_switch():
+    """Switch off (default) is the 2-way kernel bit for bit; switch on is the 4-way kernel."""
+    mx.random.seed(21)
+    ctx, q_len = 3000, 4
+    cap = ctx + 192
+    q = (mx.random.normal((1, HQ, q_len, D)) * 0.5).astype(mx.bfloat16)
+    k = (mx.random.normal((1, HKV, cap, D)) * 0.5).astype(mx.bfloat16)
+    v = (mx.random.normal((1, HKV, cap, D)) * 0.5).astype(mx.bfloat16)
+    mx.eval(q, k, v)
+    kw = {"queries": q, "keys": k, "values": v, "offset": ctx, "scale": 1.0 / math.sqrt(D)}
+    os.environ.pop("MTPLX_NAX_FLASH_DSPLIT4", None)
+    try:
+        off = sdpa_nax_flash_dsplit(**kw)
+        two = sdpa_nax_flash_dsplit(**kw, ndh=2)
+        os.environ["MTPLX_NAX_FLASH_DSPLIT4"] = "1"
+        on = sdpa_nax_flash_dsplit(**kw)
+        four = sdpa_nax_flash_dsplit(**kw, ndh=4)
+    finally:
+        os.environ.pop("MTPLX_NAX_FLASH_DSPLIT4", None)
+    assert all(x is not None for x in (off, two, on, four))
+    mx.eval(off, two, on, four)
+    assert mx.array_equal(off, two).item()
+    assert mx.array_equal(on, four).item()
+    assert sdpa_nax_flash_dsplit(**kw, ndh=3) is None
