@@ -617,6 +617,46 @@ def test_a_reply_that_changed_after_the_screenshot_resumes_at_the_change(vision_
     assert explanation["recompute_tokens"] == len(second) - seam
 
 
+@pytest.mark.parametrize("source", ["ram", "ssd"])
+def test_the_completed_prefill_reports_the_cache_outcome_the_stats_will(source):
+    model = _TinyModel()
+    events, record = _recorder(model)
+    prompt_state = restore_or_prefill_prompt_state(
+        _tiny_runtime(model),
+        IDS[:5],
+        session_bank=_ExactRestoreBank(3, source=source),
+        session_id="s",
+        prefill_callback=record,
+    )
+    ((completed, _),) = [(p, c) for p, c in events if p.get("phase") == "completed"]
+    assert completed["cache_hit"] is prompt_state.cache_hit is True
+    assert completed["cached_tokens"] == prompt_state.cached_tokens == 3
+    assert completed["new_prefill_tokens"] == prompt_state.suffix_tokens == 2
+    assert completed["cache_source"] == prompt_state.cache_source == source
+    assert completed["cache_miss_reason"] is None
+    assert completed["ssd_cache_hit"] is (source == "ssd")
+    assert completed["ssd_cached_tokens"] == (3 if source == "ssd" else 0)
+    assert completed["ssd_suffix_tokens"] == (2 if source == "ssd" else 0)
+    assert completed["session_restore_served"] == prompt_state.restore_served
+
+
+def test_the_completed_prefill_of_a_cold_read_reports_the_miss_reason():
+    model = _TinyModel()
+    events, record = _recorder(model)
+    prompt_state = restore_or_prefill_prompt_state(
+        _tiny_runtime(model),
+        IDS[:6],
+        session_bank=_bank(),
+        session_id="new-session",
+        prefill_callback=record,
+    )
+    ((completed, _),) = [(p, c) for p, c in events if p.get("phase") == "completed"]
+    assert completed["cache_hit"] is False
+    assert completed["cache_source"] == "none"
+    assert completed["cache_miss_reason"] == prompt_state.cache_miss_reason
+    assert completed["cache_miss_reason"]
+
+
 # ---- The server: classify, estimate, carry forward, receipt -------------
 
 

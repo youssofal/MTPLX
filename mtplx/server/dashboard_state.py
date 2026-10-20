@@ -671,6 +671,9 @@ class DashboardState:
     lifetime: LifetimeCounters = field(default_factory=LifetimeCounters)
     prefill_history: PrefillHistory = field(default_factory=PrefillHistory)
     rereads: RereadLedger = field(default_factory=RereadLedger)
+    # The cache outcome of each recent completed prefill, for the receipt of
+    # a request cancelled before its stats exist. Same bounded ledger.
+    prefill_outcomes: RereadLedger = field(default_factory=RereadLedger)
     progress_events: ProgressEventGate = field(default_factory=ProgressEventGate)
     last_thermal: dict[str, Any] | None = None
     last_thermal_when_s: float = 0.0
