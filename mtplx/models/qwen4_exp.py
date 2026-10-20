@@ -3268,7 +3268,16 @@ class QSACache:
         self.kv.state = (keys, values)
         self.raw_keys = raw
         self.pooled = pooled
-        self.pooled_len = 0 if pooled is None else pooled.shape[1]
+        # The valid pooled blocks are those the restored KV covers. A snapshot
+        # decoded for a sub-prefix restore (cold tier, ``decode_payload_prefix``)
+        # cuts keys and values to the restore point but hands over the donor's
+        # whole pooled table: trusting its length made the indexer skip the
+        # blocks of every later token and score against the donor's keys.
+        self.pooled_len = (
+            0
+            if pooled is None
+            else min(pooled.shape[1], self.kv.offset // self.ratio)
+        )
         # Derived mirror: rebuilt lazily on the first pooled_f32_view read.
         # Restored snapshots stay 4-leaf — the state contract is unchanged.
         self.pooled_f32_t = None

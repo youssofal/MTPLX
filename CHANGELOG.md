@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **A conversation restored from the SSD tier below its end no longer attends through another conversation's block keys.** On the Flash-Next pair, a sub-prefix restore decoded the keys and values up to the restore point but kept the donor's whole pooled indexer table, and the cache took its count of valid pooled blocks from that table's length. The indexer then found every block of the new tokens already pooled, computed none, and scored attention against the donor's keys, so the answer lost the request and cited facts that are not in the prompt (#635). The count now follows the restored keys, as it already did after a RAM restore and trim.
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed
