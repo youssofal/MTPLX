@@ -830,6 +830,12 @@ def load(
     whole_moe_plan = None
     selfcheck_report = None
     router_report: dict[str, Any] = {}
+    # MTPLX_SEGMENTED_KV: the verdict on the model belongs to this load. A route that
+    # skips configure_split_full_attention (Laguna below) leaves none, and without a
+    # verdict the segmented cache stays off (mtplx/segmented_kv.py).
+    from .segmented_kv import reset_model_support
+
+    reset_model_support()
     # Laguna skips the qwen3-next kernel stack entirely; its own env-gated
     # fused lanes install right before runtime construction below.
     if not _is_laguna_s_2_1_mlx_4bit_config(config):
