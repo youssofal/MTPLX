@@ -4,6 +4,7 @@ import { Card } from "./Card";
 import { useRecentRequests } from "../hooks/usePolling";
 import { fmtNumber, fmtSeconds, fmtTokS, relativeTime, truncateMiddle } from "../lib/utils";
 import { useDashboardStore, useFilteredRecent } from "../state/store";
+import { cancellationOf } from "../lib/requestCancel";
 import type { MetricsLatest } from "../lib/types";
 
 export function RequestLogTable() {
@@ -122,7 +123,7 @@ function Td({
   );
 }
 
-function Row({
+export function Row({
   row,
   isOpen,
   onToggle,
@@ -132,11 +133,23 @@ function Row({
   onToggle: () => void;
 }) {
   const sessionId = row.session_id ?? "—";
-  const cacheBadge = row.session_cache_hit
-    ? { label: "HIT", color: "text-[var(--accent)] bg-[var(--accent)]/10" }
+  const cancellation = cancellationOf(row);
+  const cacheBadge = cancellation
+    ? {
+        label: cancellation.label,
+        color: "text-[var(--text-muted)] bg-[var(--text-muted)]/10",
+        tooltip: cancellation.tooltip as string | undefined,
+      }
+    : row.session_cache_hit
+    ? {
+        label: "HIT",
+        color: "text-[var(--accent)] bg-[var(--accent)]/10",
+        tooltip: undefined,
+      }
     : {
         label: (row.cache_miss_reason ?? "MISS").toUpperCase(),
         color: "text-[var(--accent-warm)] bg-[var(--accent-warm)]/10",
+        tooltip: undefined,
       };
   return (
     <>
@@ -164,10 +177,16 @@ function Row({
         <Td align="right">{fmtNumber(row.verify_calls)}</Td>
         <Td>
           <span
+            title={cacheBadge.tooltip}
             className={`px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wider ${cacheBadge.color}`}
           >
             {cacheBadge.label}
           </span>
+          {cancellation?.cacheHint ? (
+            <span className="ml-2 text-[10px] text-[var(--text-muted)]">
+              {cancellation.cacheHint}
+            </span>
+          ) : null}
         </Td>
         <Td align="right" highlight={false}>
           <span className="text-[var(--text-muted)] text-xs">

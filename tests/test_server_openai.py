@@ -5383,6 +5383,152 @@ def test_stream_cancellation_metric_keeps_partial_throughput():
     assert latest["partial_request_tok_s"] == latest["request_tok_s"]
 
 
+def _publish_completed_prefill(state, request_id, **fields):
+    openai._dashboard_publish_prefill(
+        state,
+        request_id=request_id,
+        session_id="ses_cancel",
+        payload={"phase": "completed", "tokens_total": 92819, **fields},
+    )
+
+
+def test_stream_cancellation_metric_carries_the_known_cache_outcome(monkeypatch):
+    """A turn cancelled during decode after a RAM restore read MISS in the
+    request log: the receipt hard-coded session_cache_hit False."""
+
+    state = _fake_streaming_session_state()
+    published = []
+    monkeypatch.setattr(state.dashboard.bus, "publish", published.append)
+    _publish_completed_prefill(
+        state,
+        "chatcmpl_cancel_hit",
+        cached_tokens=92636,
+        new_prefill_tokens=183,
+        cache_hit=True,
+        cache_source="ram",
+        cache_miss_reason=None,
+        ssd_cache_hit=False,
+        ssd_cached_tokens=0,
+        ssd_restore_s=0.0,
+        ssd_suffix_tokens=0,
+        prompt_eval_time_s=0.8,
+        session_restore_served={"actual_restore_point": 92636},
+    )
+    received_s = time.perf_counter() - 180.0
+    openai._record_stream_cancellation_metric(
+        state,
+        response_id="chatcmpl_cancel_hit",
+        session_id="ses_cancel",
+        prompt_tokens=92819,
+        streamed_completion_tokens=3,
+        stream_started_s=received_s + 0.5,
+        reason="client_disconnected",
+        request_observability={"request_received_monotonic_s": received_s},
+        client_disconnected=True,
+        token_times=[received_s + 2.0, received_s + 2.1, received_s + 2.2],
+    )
+
+    latest = state.last_metrics[-1]
+    assert latest["request_cancelled"] is True
+    assert latest["session_cache_hit"] is True
+    assert latest["cached_tokens"] == 92636
+    assert latest["new_prefill_tokens"] == 183
+    assert latest["cache_source"] == "ram"
+    assert latest["cache_miss_reason"] is None
+    assert latest["ssd_cache_hit"] is False
+    assert latest["prompt_eval_time_s"] == 0.8
+    assert latest["session_restore_served"] == {"actual_restore_point": 92636}
+    assert latest["ttft_s"] == pytest.approx(2.0)
+    assert state.dashboard.prefill_outcomes.get("chatcmpl_cancel_hit") is None
+    # The live prefill event does not carry the served record.
+    (prefill_event,) = [e for e in published if e["kind"] == "prefill"]
+    assert "session_restore_served" not in prefill_event
+    assert prefill_event["cache_source"] == "ram"
+
+
+def test_stream_cancellation_metric_carries_a_miss_and_its_reason():
+    state = _fake_streaming_session_state()
+    _publish_completed_prefill(
+        state,
+        "chatcmpl_cancel_miss",
+        cached_tokens=0,
+        new_prefill_tokens=92819,
+        cache_hit=False,
+        cache_source="none",
+        cache_miss_reason="evicted",
+    )
+    openai._record_stream_cancellation_metric(
+        state,
+        response_id="chatcmpl_cancel_miss",
+        session_id="ses_cancel",
+        prompt_tokens=92819,
+        streamed_completion_tokens=0,
+        stream_started_s=time.perf_counter() - 30.0,
+        reason="client_disconnected",
+        request_observability={},
+        client_disconnected=True,
+    )
+
+    latest = state.last_metrics[-1]
+    assert latest["session_cache_hit"] is False
+    assert latest["cache_miss_reason"] == "evicted"
+    assert latest["cache_source"] == "none"
+    assert latest["new_prefill_tokens"] == 92819
+    # No token reached the client: there is no first-token time.
+    assert latest["ttft_s"] is None
+
+
+def test_stream_cancellation_before_the_prefill_completed_leaves_the_outcome_unknown():
+    state = _fake_streaming_session_state()
+    openai._record_stream_cancellation_metric(
+        state,
+        response_id="chatcmpl_cancel_early",
+        session_id="ses_cancel",
+        prompt_tokens=92819,
+        streamed_completion_tokens=0,
+        stream_started_s=time.perf_counter() - 5.0,
+        reason="client_disconnected",
+        request_observability={},
+        client_disconnected=True,
+    )
+
+    latest = state.last_metrics[-1]
+    for key in (
+        "session_cache_hit",
+        "cached_tokens",
+        "new_prefill_tokens",
+        "cache_source",
+        "cache_miss_reason",
+        "ttft_s",
+    ):
+        assert key in latest
+        assert latest[key] is None, key
+
+
+def test_a_completed_request_releases_its_prefill_outcome():
+    state = _fake_streaming_session_state()
+    _publish_completed_prefill(state, "chatcmpl_done", cached_tokens=10, cache_hit=True)
+    assert state.dashboard.prefill_outcomes.get("chatcmpl_done") is not None
+    openai._record_request_metrics(state, {"request_id": "chatcmpl_done"})
+    assert state.dashboard.prefill_outcomes.get("chatcmpl_done") is None
+
+
+def test_prefill_cache_outcome_applies_the_envelope_defaults():
+    outcome = openai._prefill_cache_outcome(
+        {"tokens_total": 100, "cached_tokens": 60, "cache_hit": True}
+    )
+    assert outcome is not None
+    assert outcome["session_cache_hit"] is True
+    assert outcome["cache_source"] == "ram"
+    assert outcome["new_prefill_tokens"] == 40
+    assert outcome["cache_miss_reason"] is None
+    # An event that says nothing about the cache gives no outcome.
+    assert openai._prefill_cache_outcome({"tokens_total": 100}) is None
+    # A hit never keeps a miss reason.
+    hit = openai._prefill_cache_outcome({"cache_hit": True, "cache_miss_reason": "evicted"})
+    assert hit["cache_miss_reason"] is None
+
+
 @pytest.mark.parametrize(
     ("owner_admitted", "expected_calls", "expected_scope"),
     [

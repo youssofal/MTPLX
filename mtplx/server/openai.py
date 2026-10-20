@@ -5174,6 +5174,12 @@ class _BatchedARGenerationService:
                                 "prefill_compute_tok_s": prefill_tok_s,
                                 "prefill_wall_tok_s": prefill_tok_s,
                                 "cache_hit": bool(job.session_cache_hit),
+                                "cache_source": job.cache_source,
+                                "cache_miss_reason": job.cache_miss_reason,
+                                "ssd_cache_hit": bool(job.ssd_cache_hit),
+                                "ssd_cached_tokens": int(job.ssd_cached_tokens),
+                                "ssd_restore_s": float(job.ssd_restore_s),
+                                "ssd_suffix_tokens": int(job.ssd_suffix_tokens),
                                 "scheduler_lane": "ar_batch",
                                 "request_id": job.request_id,
                             }
@@ -16764,6 +16770,10 @@ def _record_request_metrics(state: "ServerState", record: dict[str, Any]) -> Non
         reread = rereads.pop(str(record["request_id"]))
         if reread is not None:
             record.setdefault("reread", reread)
+        # Only a cancellation reads its prefill outcome; let it go here.
+        outcomes = getattr(state.dashboard, "prefill_outcomes", None)
+        if outcomes is not None:
+            outcomes.pop(str(record["request_id"]))
     safe = _json_safe(record)
     # Warmup generations (startup pass and the idle background ladder) are
     # not user requests: keep them out of the RAM ring that feeds the
@@ -18305,6 +18315,43 @@ def _dashboard_record_completion(
         _safe_stdout_print(f"[dashboard] record_completion suppressed error: {exc!r}")
 
 
+def _prefill_cache_outcome(payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The cache outcome a completed prefill reports, in the request-log
+    field names and with the defaults ``_metrics_envelope`` applies, or None
+    when the event says nothing about the cache.
+
+    A request cancelled during decode never reaches its stats; its receipt
+    takes these fields instead.
+    """
+
+    hit = payload.get("session_cache_hit", payload.get("cache_hit"))
+    if hit is None:
+        return None
+    hit = bool(hit)
+    prompt_tokens = int(payload.get("tokens_total") or 0)
+    cached_tokens = int(payload.get("cached_tokens") or 0)
+    new_prefill_tokens = payload.get("new_prefill_tokens")
+    if new_prefill_tokens is None:
+        new_prefill_tokens = prompt_tokens - cached_tokens
+    outcome: dict[str, Any] = {
+        "session_cache_hit": hit,
+        "cached_tokens": cached_tokens,
+        "new_prefill_tokens": max(0, int(new_prefill_tokens)),
+        "cache_source": str(payload.get("cache_source") or ("ram" if hit else "none")),
+        "cache_miss_reason": None if hit else payload.get("cache_miss_reason"),
+        "ssd_cache_hit": bool(payload.get("ssd_cache_hit") or False),
+        "ssd_cached_tokens": int(payload.get("ssd_cached_tokens") or 0),
+        "ssd_restore_s": float(payload.get("ssd_restore_s") or 0.0),
+        "ssd_suffix_tokens": int(payload.get("ssd_suffix_tokens") or 0),
+    }
+    if isinstance(payload.get("prompt_eval_time_s"), (int, float)):
+        outcome["prompt_eval_time_s"] = float(payload["prompt_eval_time_s"])
+    served = payload.get("session_restore_served")
+    if isinstance(served, Mapping) and served:
+        outcome["session_restore_served"] = dict(served)
+    return outcome
+
+
 def _dashboard_publish_prefill(
     state: "ServerState",
     *,
@@ -18384,6 +18431,11 @@ def _dashboard_publish_prefill(
         # for the SSE stream.
         if enriched.get("phase") == "completed":
             dashboard.in_flight.update_prefill(request_id, None)
+            outcome = _prefill_cache_outcome(enriched)
+            if outcome is not None:
+                dashboard.prefill_outcomes.put(request_id, outcome)
+            # Kept for the receipt only; the live view has no use for it.
+            enriched.pop("session_restore_served", None)
         else:
             dashboard.in_flight.update_prefill(request_id, enriched)
         dashboard.bus.publish({"kind": "prefill", "when_s": time.time(), **enriched})
@@ -25935,10 +25987,25 @@ def _record_stream_cancellation_metric(
         "server_tok_s": partial_tok_s,
         "partial_decode_tok_s": partial_tok_s,
         "partial_request_tok_s": partial_tok_s,
-        "session_cache_hit": False,
+        # Unknown until the prefill completes: None, not a miss.
+        "session_cache_hit": None,
+        "cached_tokens": None,
+        "new_prefill_tokens": None,
+        "cache_source": None,
         "cache_miss_reason": None,
+        "ttft_s": None,
     }
+    outcomes = getattr(getattr(state, "dashboard", None), "prefill_outcomes", None)
+    outcome = outcomes.pop(response_id) if outcomes is not None else None
+    if outcome is not None:
+        envelope.update(outcome)
     if token_times:
+        # As in _metrics_envelope: from the request's arrival to its first token.
+        received_s = request_observability.get("request_received_monotonic_s")
+        first_token_origin_s = (
+            float(received_s) if isinstance(received_s, (int, float)) else stream_started_s
+        )
+        envelope["ttft_s"] = max(0.0, token_times[0] - first_token_origin_s)
         envelope.update(_producer_gap_census(token_times))
         envelope["sliding_decode_tok_s_first_32"] = _token_window_rate_first(
             token_times, 32

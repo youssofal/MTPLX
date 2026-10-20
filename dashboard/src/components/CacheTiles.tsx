@@ -1,6 +1,7 @@
 import { BigNumber, Card } from "./Card";
 import { fmtNumber } from "../lib/utils";
 import { useDashboardStore } from "../state/store";
+import { countsTowardHitRate } from "../lib/requestCancel";
 
 export function CumulativeCachedTokensTile() {
   const lifetime = useDashboardStore((s) => s.lifetime);
@@ -21,7 +22,8 @@ export function CumulativeCachedTokensTile() {
 
 export function HitRateGauge() {
   const recent = useDashboardStore((s) => s.recent);
-  const window = recent.slice(-32);
+  // A cancelled request says nothing about the cache's hit rate.
+  const window = recent.filter(countsTowardHitRate).slice(-32);
   const hits = window.filter((r) => r.session_cache_hit).length;
   const ratio = window.length > 0 ? (hits / window.length) * 100 : 0;
   const tone = ratio >= 70 ? "accent" : ratio >= 40 ? "warm" : "hot";

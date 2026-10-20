@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **A cancelled request keeps its cache outcome in the request log.** A streamed turn the client closed during decode was written with `session_cache_hit: false` and no `cached_tokens`, `cache_source` or `ttft_s`, so the dashboard showed it as a "MISS" and counted it against the hit rate, even when its prompt had been restored from the cache. The receipt now carries the cache outcome of the completed prefill (`session_cache_hit`, `cached_tokens`, `new_prefill_tokens`, `cache_source`, `cache_miss_reason`, the SSD fields) and `ttft_s`; when the request was cancelled before its prefill finished, these are `null` (unknown). The dashboard gives a cancelled row its own badge, such as "cancelled · client · 3m 0s", with the cache outcome beside it, and leaves cancelled requests out of the hit rate.
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed

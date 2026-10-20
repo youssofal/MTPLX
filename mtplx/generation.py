@@ -6776,6 +6776,18 @@ def restore_or_prefill_prompt_state(
                     "prefill_compute_tok_s": compute_tok_s,
                     "prefill_wall_tok_s": wall_tok_s,
                     "cache_hit": bool(state.cache_hit),
+                    # The cache outcome as the request's stats will report
+                    # it, so a request cancelled during decode can still say
+                    # where its prompt came from.
+                    "cache_source": state.cache_source,
+                    "cache_miss_reason": state.cache_miss_reason,
+                    "ssd_cache_hit": bool(state.ssd_cache_hit),
+                    "ssd_cached_tokens": int(state.ssd_cached_tokens),
+                    "ssd_restore_s": float(state.ssd_restore_s),
+                    "ssd_suffix_tokens": new_tokens if state.ssd_cache_hit else 0,
+                    "session_restore_served": dict(
+                        getattr(state, "restore_served", None) or {}
+                    ),
                 }
             )
         except Exception:

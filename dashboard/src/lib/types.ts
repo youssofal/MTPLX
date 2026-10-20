@@ -57,9 +57,16 @@ export type MetricsLatest = {
   repair_time_by_reject_depth_s?: Record<string, number> | null;
   // ---- when the request finished (wall clock, seconds) ----
   completed_at_s?: number | null;
+  // ---- cancellation (a request that did not run to the end) ----
+  request_cancelled?: boolean | null;
+  cancellation_reason?: string | null;
+  cancellation_elapsed_s?: number | null;
+  stream_cancelled_by_client?: boolean | null;
   // ---- cache ----
+  // null on a cancelled request whose prefill had not finished: unknown.
   session_cache_hit?: boolean | null;
   cache_miss_reason?: string | null;
+  cache_source?: string | null;
   session_restore_mode?: string | null;
   session_id?: string | null;
   context_len?: number | null;
