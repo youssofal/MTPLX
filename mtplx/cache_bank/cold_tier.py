@@ -31,6 +31,7 @@ from .codec import (
     snapshot_supports_prefix_decode,
 )
 from .telemetry import (
+    WriteSplit,
     WriteVolume,
     active_restore_timings,
     gdn_boundary_tensor_names,
@@ -155,6 +156,8 @@ class PendingWrite:
     reused_blobs: dict[str, dict[str, Any]] = field(default_factory=dict)
     fingerprints: dict[str, tuple] = field(default_factory=dict)
     memo_key: str | None = None
+    # Seconds of eval and host copy per captured name (telemetry.WriteSplit).
+    capture_s: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -559,6 +562,12 @@ class SessionBankColdTier:
             "incremental_reused_blobs": 0,
             "incremental_reused_bytes": 0,
             "incremental_missing_blobs": 0,
+            # Write split (telemetry.WriteSplit), summed over every write:
+            # deduplicated blobs a memo referenced without capture or hash,
+            # blobs captured and hashed only to be found on disk (and the
+            # seconds that cost), and the new blobs; the newest write's own.
+            **WriteSplit().counters(),
+            "last_write_split": None,
             # Restore split (telemetry.RestoreTimings), summed over every
             # SSD restore, and the newest restore's own split.
             "restore_read_s_total": 0.0,
@@ -712,6 +721,7 @@ class SessionBankColdTier:
             reused_blobs=encoded.reused,
             fingerprints=encoded.fingerprints,
             memo_key=memo_key,
+            capture_s=encoded.capture_s,
         )
         try:
             self._queue.put_nowait(pending)
@@ -956,6 +966,7 @@ class SessionBankColdTier:
         tensor_blobs: dict[str, dict[str, Any]] = {}
         written_state = {"logical": 0, "physical": 0, "deduped_hits": 0}
         deduped_names: set[str] = set()
+        split = WriteSplit()
         tier = self
 
         class _WriteThroughTensors(dict):
@@ -987,7 +998,9 @@ class SessionBankColdTier:
                         raise ColdEncodeInterrupted()
                 if tier._stop.is_set():
                     raise ColdEncodeInterrupted()
+                started = time.perf_counter()
                 digest = hashlib.sha256(raw).hexdigest()
+                hash_s = time.perf_counter() - started
                 tensor_blobs[name] = {"sha256": digest, "nbytes": len(raw)}
                 written_state["logical"] += len(raw)
                 # Claim the digest before the blob exists on disk so the
@@ -995,11 +1008,19 @@ class SessionBankColdTier:
                 if digest not in claimed_digests:
                     claimed_digests.add(digest)
                     tier._claim_inflight(digests={digest})
-                if tier._write_blob(digest, raw):
+                wrote = tier._write_blob(digest, raw)
+                split.hashed(
+                    len(raw),
+                    capture_s=codec.capture_s.pop(name, 0.0),
+                    hash_s=hash_s,
+                    on_disk=not wrote,
+                )
+                if wrote:
                     written_state["physical"] += len(raw)
                 else:
                     written_state["deduped_hits"] += 1
                     deduped_names.add(name)
+                    tier._inc("deduped_blob_hits")
 
         codec = TreeCodec(
             block_size=self.block_size,
@@ -1045,9 +1066,15 @@ class SessionBankColdTier:
             # (checkpoints are encoded last and rarely reached then). Reused
             # blobs were on disk already.
             reused = {name: dict(blob) for name, blob in codec.reused.items()}
+            for blob in reused.values():
+                split.referenced(int(blob["nbytes"]))
             self._note_write_volume(
-                payload_spec, {**tensor_blobs, **reused}, deduped_names | set(reused)
+                payload_spec,
+                {**tensor_blobs, **reused},
+                deduped_names | set(reused),
+                referenced=set(reused),
             )
+            self._note_write_split(split, path="spill")
         if should_abort is not None:
             # Same fencing rationale as put_entry: the per-tensor evals
             # above schedule GPU work whose command buffers must drain in
@@ -1912,7 +1939,7 @@ class SessionBankColdTier:
                     self._touch_entry(pending.entry_id)
                     return True
                 self._archive_orphan_entry_dir(final_dir, pending.entry_id)
-        tensor_blobs, missing_blob_bytes = self._plan_tensor_blobs(
+        tensor_blobs, missing_blob_bytes, hash_s = self._plan_tensor_blobs(
             pending.tensors, pause_for_foreground=True
         )
         # Incremental encode: referenced blobs carry their digest already.
@@ -1955,6 +1982,7 @@ class SessionBankColdTier:
             wrote = self._write_pending_admitted(
                 pending,
                 tensor_blobs=tensor_blobs,
+                hash_s=hash_s,
                 payload_text=payload_text,
                 pending_bytes=pending_bytes,
                 final_dir=final_dir,
@@ -1971,6 +1999,7 @@ class SessionBankColdTier:
         pending: PendingWrite,
         *,
         tensor_blobs: dict[str, dict[str, Any]],
+        hash_s: dict[str, float],
         payload_text: str,
         pending_bytes: int,
         final_dir: Path,
@@ -2000,6 +2029,7 @@ class SessionBankColdTier:
             # straddling the arrival).
             processed: dict[str, dict[str, Any]] = {}
             deduped: set[str] = set()
+            split = WriteSplit()
             try:
                 for name, raw in pending.tensors.items():
                     self._pause_for_foreground()
@@ -2012,6 +2042,12 @@ class SessionBankColdTier:
                         self._record_write_failure(pending.entry_id, prefix_len, exc)
                         return False
                     processed[name] = blob
+                    split.hashed(
+                        len(raw),
+                        capture_s=pending.capture_s.get(name, 0.0),
+                        hash_s=hash_s.get(name, 0.0),
+                        on_disk=not wrote,
+                    )
                     if not wrote:
                         deduped.add(name)
                         self._inc("deduped_blob_hits")
@@ -2019,8 +2055,15 @@ class SessionBankColdTier:
                 for name in pending.reused_blobs:
                     processed[name] = tensor_blobs[name]
                     deduped.add(name)
+                    split.referenced(int(tensor_blobs[name]["nbytes"]))
             finally:
-                self._note_write_volume(pending.payload_spec, processed, deduped)
+                self._note_write_volume(
+                    pending.payload_spec,
+                    processed,
+                    deduped,
+                    referenced=set(pending.reused_blobs),
+                )
+                self._note_write_split(split, path="queued")
             metadata = dict(pending.metadata)
             metadata["logical_nbytes"] = int(logical_bytes)
             metadata["physical_nbytes"] = int(pending_bytes)
@@ -2049,16 +2092,31 @@ class SessionBankColdTier:
         payload_spec: dict[str, Any] | None,
         tensor_blobs: dict[str, dict[str, Any]],
         deduped: set[str],
+        *,
+        referenced: set[str] | frozenset[str] = frozenset(),
     ) -> None:
         """Telemetry only: never fails a write."""
         if not tensor_blobs:
             return
         try:
             self._write_volume.record(
-                tensor_blobs, deduped, gdn_boundary_tensor_names(payload_spec)
+                tensor_blobs,
+                deduped,
+                gdn_boundary_tensor_names(payload_spec),
+                referenced,
             )
         except Exception:
             pass
+
+    def _note_write_split(self, split: WriteSplit, *, path: str) -> None:
+        """Adds one write's split to the totals and keeps it as the newest.
+        ``path`` is ``queued`` (put_entry) or ``spill`` (spill_entry)."""
+        if not (split.referenced_blobs or split.duplicate_blobs or split.new_blobs):
+            return
+        with self._stats_lock:
+            for key, value in split.counters().items():
+                self._stats[key] = self._stats.get(key, 0) + value
+            self._stats["last_write_split"] = {"path": path, **split.as_dict()}
 
     def _block_memo(self, memo_key: str | None) -> dict[tuple, dict[str, Any]]:
         if memo_key is None:
@@ -2104,21 +2162,25 @@ class SessionBankColdTier:
         tensors: dict[str, bytes],
         *,
         pause_for_foreground: bool = False,
-    ) -> tuple[dict[str, dict[str, Any]], int]:
+    ) -> tuple[dict[str, dict[str, Any]], int, dict[str, float]]:
+        """Digests, the bytes not on disk yet, and each name's hash seconds."""
         blobs: dict[str, dict[str, Any]] = {}
+        hash_s: dict[str, float] = {}
         missing_bytes = 0
         planned_missing: set[str] = set()
         for name, raw in tensors.items():
             if pause_for_foreground:
                 self._pause_for_foreground()
+            started = time.perf_counter()
             digest = hashlib.sha256(raw).hexdigest()
+            hash_s[name] = time.perf_counter() - started
             blobs[name] = {"sha256": digest, "nbytes": len(raw)}
             if digest in planned_missing:
                 continue
             if not self._blob_path(digest).exists():
                 planned_missing.add(digest)
                 missing_bytes += len(raw)
-        return blobs, missing_bytes
+        return blobs, missing_bytes, hash_s
 
     def _blob_path(self, digest: str) -> Path:
         return self.base_dir / "blobs" / digest[:2] / f"{digest}.bin"

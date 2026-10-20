@@ -16,6 +16,13 @@ and the bytes it did not write because the blob was already there, split
 into recurrent-checkpoint (GDN boundary) blobs and the rest (attention KV
 plus the final recurrent state, logits and hidden), in one-minute buckets
 over a rolling hour. One lock and a few additions per entry written.
+
+Write split. A deduplicated blob was found one of two ways: referenced, when
+a memo already named its digest and its bytes were never evaluated, copied
+or hashed; or hashed, when its bytes were captured and hashed and only then
+found on disk. :class:`WriteSplit` counts both per write, with the capture
+and hash seconds the hashed duplicates cost, next to the blobs that were new.
+Two ``perf_counter`` calls per captured blob.
 """
 
 from __future__ import annotations
@@ -93,6 +100,91 @@ def gdn_boundary_tensor_names(payload_spec: dict[str, Any] | None) -> set[str]:
     return names
 
 
+class WriteSplit:
+    """One write's blobs by how they reached the payload: ``referenced``
+    (a memo hit, never captured or hashed), ``hashed_duplicate`` (captured
+    and hashed, then found on disk) and ``hashed_new`` (captured, hashed and
+    written)."""
+
+    __slots__ = (
+        "duplicate_blobs",
+        "duplicate_bytes",
+        "duplicate_capture_s",
+        "duplicate_hash_s",
+        "new_blobs",
+        "new_bytes",
+        "new_capture_s",
+        "new_hash_s",
+        "referenced_blobs",
+        "referenced_bytes",
+    )
+
+    def __init__(self) -> None:
+        self.referenced_blobs = 0
+        self.referenced_bytes = 0
+        self.duplicate_blobs = 0
+        self.duplicate_bytes = 0
+        self.duplicate_capture_s = 0.0
+        self.duplicate_hash_s = 0.0
+        self.new_blobs = 0
+        self.new_bytes = 0
+        self.new_capture_s = 0.0
+        self.new_hash_s = 0.0
+
+    def referenced(self, nbytes: int) -> None:
+        self.referenced_blobs += 1
+        self.referenced_bytes += int(nbytes)
+
+    def hashed(
+        self, nbytes: int, *, capture_s: float, hash_s: float, on_disk: bool
+    ) -> None:
+        if on_disk:
+            self.duplicate_blobs += 1
+            self.duplicate_bytes += int(nbytes)
+            self.duplicate_capture_s += float(capture_s)
+            self.duplicate_hash_s += float(hash_s)
+        else:
+            self.new_blobs += 1
+            self.new_bytes += int(nbytes)
+            self.new_capture_s += float(capture_s)
+            self.new_hash_s += float(hash_s)
+
+    def counters(self) -> dict[str, int | float]:
+        """The tier's cumulative counter names and this write's values."""
+        return {
+            "write_referenced_blobs": self.referenced_blobs,
+            "write_referenced_bytes": self.referenced_bytes,
+            "write_hashed_duplicate_blobs": self.duplicate_blobs,
+            "write_hashed_duplicate_bytes": self.duplicate_bytes,
+            "write_hashed_duplicate_capture_s": self.duplicate_capture_s,
+            "write_hashed_duplicate_hash_s": self.duplicate_hash_s,
+            "write_hashed_new_blobs": self.new_blobs,
+            "write_hashed_new_bytes": self.new_bytes,
+            "write_hashed_new_capture_s": self.new_capture_s,
+            "write_hashed_new_hash_s": self.new_hash_s,
+        }
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "referenced": {
+                "blobs": self.referenced_blobs,
+                "bytes": self.referenced_bytes,
+            },
+            "hashed_duplicate": {
+                "blobs": self.duplicate_blobs,
+                "bytes": self.duplicate_bytes,
+                "capture_s": round(self.duplicate_capture_s, 6),
+                "hash_s": round(self.duplicate_hash_s, 6),
+            },
+            "hashed_new": {
+                "blobs": self.new_blobs,
+                "bytes": self.new_bytes,
+                "capture_s": round(self.new_capture_s, 6),
+                "hash_s": round(self.new_hash_s, 6),
+            },
+        }
+
+
 WINDOW_S = 3600
 BUCKET_S = 60
 
@@ -103,26 +195,31 @@ class WriteVolume:
     def __init__(self, *, clock: Any = time.time) -> None:
         self._clock = clock
         self._lock = threading.Lock()
-        # minute index -> [written, deduped] per kind, flattened
+        # minute index -> [written, deduped] per kind, flattened, then the
+        # deduped bytes again by how they were found: [referenced, hashed]
         self._buckets: dict[int, list[int]] = {}
-        self._totals = [0, 0, 0, 0]
+        self._totals = [0, 0, 0, 0, 0, 0]
 
     def record(
         self,
         tensor_blobs: dict[str, dict[str, Any]],
         deduped_names: set[str],
         gdn_names: set[str],
+        referenced_names: set[str] | frozenset[str] = frozenset(),
     ) -> None:
-        """One entry's blobs: ``deduped_names`` were already on disk."""
-        add = [0, 0, 0, 0]
+        """One entry's blobs: ``deduped_names`` were already on disk, and of
+        those ``referenced_names`` were never captured or hashed."""
+        add = [0, 0, 0, 0, 0, 0]
         for name, blob in tensor_blobs.items():
+            nbytes = int(blob.get("nbytes") or 0)
             slot = 0 if name in gdn_names else 2
             if name in deduped_names:
                 slot += 1
-            add[slot] += int(blob.get("nbytes") or 0)
+                add[4 if name in referenced_names else 5] += nbytes
+            add[slot] += nbytes
         minute = int(self._clock() // BUCKET_S)
         with self._lock:
-            bucket = self._buckets.setdefault(minute, [0, 0, 0, 0])
+            bucket = self._buckets.setdefault(minute, [0, 0, 0, 0, 0, 0])
             for index, value in enumerate(add):
                 bucket[index] += value
                 self._totals[index] += value
@@ -132,7 +229,7 @@ class WriteVolume:
 
     def snapshot(self, *, budget_per_hour_bytes: int) -> dict[str, Any]:
         oldest = int(self._clock() // BUCKET_S) - WINDOW_S // BUCKET_S
-        hour = [0, 0, 0, 0]
+        hour = [0, 0, 0, 0, 0, 0]
         with self._lock:
             for minute, bucket in self._buckets.items():
                 if minute > oldest:
@@ -148,12 +245,16 @@ class WriteVolume:
             "gdn_boundary_deduped_bytes_last_hour": hour[1],
             "kv_written_bytes_last_hour": hour[2],
             "kv_deduped_bytes_last_hour": hour[3],
+            "deduped_referenced_bytes_last_hour": hour[4],
+            "deduped_hashed_bytes_last_hour": hour[5],
             "write_budget_per_hour_bytes": int(budget_per_hour_bytes),
             "budget_used_fraction": round(written / budget, 4),
             "written_bytes_total": totals[0] + totals[2],
             "deduped_bytes_total": totals[1] + totals[3],
             "gdn_boundary_written_bytes_total": totals[0],
             "kv_written_bytes_total": totals[2],
+            "deduped_referenced_bytes_total": totals[4],
+            "deduped_hashed_bytes_total": totals[5],
         }
 
 

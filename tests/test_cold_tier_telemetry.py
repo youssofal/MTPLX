@@ -249,6 +249,103 @@ class TestWriteVolume:
         assert gdn_boundary_tensor_names(None) == set()
 
 
+def _blob_count(tier):
+    return sum(1 for _ in (tier.base_dir / "blobs").rglob("*.bin"))
+
+
+class TestWriteSplit:
+    """Deduplicated blobs by how they were found: referenced by a memo (no
+    capture, no hash) or captured and hashed before the disk said so."""
+
+    def _spill(self, tier, entry):
+        assert tier.spill_entry(entry, capabilities=["ar_insert"]) is True
+
+    def _queued(self, tier, entry):
+        assert tier.put_entry(entry, capabilities=["ar_insert"]) is True
+        # flush, not _store: the writer updates the memo after the write.
+        assert tier.flush(timeout_s=10.0) is True
+
+    def _check_write_twice(self, tier, write):
+        tokens = list(range(TOKENS))
+        write(tier, _entry(tokens, boundaries=[_boundary(64)]))
+        first = tier.stats()
+        blobs, nbytes = _blob_count(tier), _blob_bytes(tier)
+        assert first["write_hashed_new_blobs"] == blobs
+        assert first["write_hashed_new_bytes"] == nbytes
+        assert first["write_hashed_duplicate_blobs"] == 0
+        assert first["write_referenced_blobs"] == 0
+        assert first["write_hashed_new_hash_s"] > 0.0
+        assert first["write_hashed_new_capture_s"] > 0.0
+        # The same tensors under another session (no memo applies): every
+        # blob is captured and hashed, then found on disk.
+        write(tier, _entry(tokens, session_id="s2", boundaries=[_boundary(64)]))
+        second = tier.stats()
+        last = second["last_write_split"]
+        assert last["hashed_duplicate"]["blobs"] == blobs
+        assert last["hashed_duplicate"]["bytes"] == nbytes
+        assert last["hashed_duplicate"]["hash_s"] > 0.0
+        assert last["hashed_duplicate"]["capture_s"] > 0.0
+        assert last["hashed_new"]["blobs"] == 0
+        assert last["referenced"] == {"blobs": 0, "bytes": 0}
+        assert second["write_hashed_duplicate_bytes"] == nbytes
+        assert second["deduped_blob_hits"] == blobs
+        volume = second["write_volume"]
+        assert volume["deduped_hashed_bytes_total"] == nbytes
+        assert volume["deduped_referenced_bytes_total"] == 0
+        assert volume["deduped_bytes_total"] == nbytes
+        return last
+
+    def test_queued_write(self, tmp_path):
+        tier = _tier(tmp_path)
+        try:
+            assert self._check_write_twice(tier, self._queued)
+            assert tier.stats()["last_write_split"]["path"] == "queued"
+        finally:
+            tier.close()
+
+    def test_spill_write(self, tmp_path):
+        tier = _tier(tmp_path)
+        try:
+            assert self._check_write_twice(tier, self._spill)
+            assert tier.stats()["last_write_split"]["path"] == "spill"
+        finally:
+            tier.close()
+
+    def test_memo_hits_are_referenced(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MTPLX_SSD_INCREMENTAL_ENCODE", "1")
+        tier = _tier(tmp_path)
+        try:
+            tokens = list(range(TOKENS))
+            self._queued(tier, _entry(tokens))
+            # Other tokens, the same tensors: a new entry of the same session.
+            self._queued(tier, _entry(tokens[:-1] + [7777]))
+            stats = tier.stats()
+            last = stats["last_write_split"]
+            # Every full KV block was referenced; the small tensors below the
+            # whole-tensor fingerprint floor were captured and deduplicated.
+            assert last["referenced"]["blobs"] == TOKENS // BLOCK
+            assert last["referenced"]["blobs"] == stats["incremental_reused_blobs"]
+            assert last["referenced"]["bytes"] == stats["incremental_reused_bytes"]
+            assert last["hashed_duplicate"]["blobs"] == 3
+            assert last["hashed_new"]["blobs"] == 0
+            volume = stats["write_volume"]
+            assert volume["deduped_referenced_bytes_total"] == last["referenced"]["bytes"]
+            assert volume["deduped_hashed_bytes_total"] == last["hashed_duplicate"]["bytes"]
+        finally:
+            tier.close()
+
+    def test_write_volume_splits_referenced_from_hashed(self):
+        volume = WriteVolume(clock=lambda: 10_000.0)
+        blobs = {"a": {"nbytes": 100}, "b": {"nbytes": 50}, "c": {"nbytes": 25}}
+        volume.record(blobs, {"b", "c"}, {"c"}, {"b"})
+        snap = volume.snapshot(budget_per_hour_bytes=1000)
+        assert snap["deduped_bytes_last_hour"] == 75
+        assert snap["deduped_referenced_bytes_last_hour"] == 50
+        assert snap["deduped_hashed_bytes_last_hour"] == 25
+        assert snap["deduped_referenced_bytes_total"] == 50
+        assert snap["deduped_hashed_bytes_total"] == 25
+
+
 class TestRestoreLandings:
     def test_origin(self):
         assert entry_origin("a", "a") == ORIGIN_SAME
