@@ -18677,6 +18677,9 @@ def _prefill_cache_outcome(payload: Mapping[str, Any]) -> dict[str, Any] | None:
     served = payload.get("session_restore_served")
     if isinstance(served, Mapping) and served:
         outcome["session_restore_served"] = dict(served)
+        # The restore split and where the restore landed, as the normal
+        # receipt flattens them.
+        outcome.update(_restore_telemetry_fields(payload))
     return outcome
 
 
