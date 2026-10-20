@@ -6,6 +6,7 @@ import { fmtNumber, fmtSeconds, fmtTokS, relativeTime, truncateMiddle } from "..
 import { requestWait } from "../lib/requestWait";
 import { useDashboardStore, useFilteredRecent } from "../state/store";
 import { refusalOf } from "../lib/requestRefusal";
+import { cancellationOf } from "../lib/requestCancel";
 import type { MetricsLatest } from "../lib/types";
 
 export function RequestLogTable() {
@@ -136,16 +137,29 @@ export function Row({
 }) {
   const sessionId = row.session_id ?? "—";
   const refusal = refusalOf(row);
+  const cancellation = refusal ? null : cancellationOf(row);
   const cacheBadge = refusal
     ? {
         label: refusal.label,
         color: "text-[var(--accent-hot)] bg-[var(--accent-hot)]/10",
+        tooltip: undefined as string | undefined,
+      }
+    : cancellation
+    ? {
+        label: cancellation.label,
+        color: "text-[var(--text-muted)] bg-[var(--text-muted)]/10",
+        tooltip: cancellation.tooltip as string | undefined,
       }
     : row.session_cache_hit
-    ? { label: "HIT", color: "text-[var(--accent)] bg-[var(--accent)]/10" }
+    ? {
+        label: "HIT",
+        color: "text-[var(--accent)] bg-[var(--accent)]/10",
+        tooltip: undefined,
+      }
     : {
         label: (row.cache_miss_reason ?? "MISS").toUpperCase(),
         color: "text-[var(--accent-warm)] bg-[var(--accent-warm)]/10",
+        tooltip: undefined,
       };
   const wait = requestWait(row);
   const waitTitle = wait
@@ -182,10 +196,16 @@ export function Row({
         <Td align="right">{refusal ? "—" : fmtNumber(row.verify_calls)}</Td>
         <Td>
           <span
+            title={cacheBadge.tooltip}
             className={`px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wider ${cacheBadge.color}`}
           >
             {cacheBadge.label}
           </span>
+          {cancellation?.cacheHint ? (
+            <span className="ml-2 text-[10px] text-[var(--text-muted)]">
+              {cancellation.cacheHint}
+            </span>
+          ) : null}
         </Td>
         <Td align="right" highlight={false}>
           <span className="text-[var(--text-muted)] text-xs">
