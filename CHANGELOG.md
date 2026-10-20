@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **`MTPLX_SSD_INCREMENTAL_ENCODE` also reaches the streaming SSD write** (by @jvmenen). Large sessions, live-reference sessions and the write before an idle release go through `spill_entry`, which ignored the switch: every block, recurrent state and checkpoint was read back and hashed on every write, and `incremental_reused_blobs` stayed 0. The spill now uses the same per-session memo as the queued write, references a block only when its blob is still on disk (otherwise it writes it again), and keeps the store byte-identical to a full encode. The fingerprint pass runs in chunks of one encode unit (32 MiB) instead of one pass per tensor. The switch stays off by default.
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed

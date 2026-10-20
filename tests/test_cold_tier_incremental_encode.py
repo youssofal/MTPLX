@@ -449,3 +449,224 @@ def test_encode_payload_without_reuse_is_unchanged():
     assert legacy.tensors == empty_memo.tensors
     assert legacy.reused == {} and legacy.fingerprints == {}
     assert empty_memo.reused == {} and empty_memo.fingerprints
+
+
+# ---- spill_entry (the streaming writer) ----------------------------------------
+
+
+def _spill(tier: SessionBankColdTier, entry) -> str:
+    assert tier.spill_entry(entry) is True
+    return tier._metadata_for_entry(entry, capabilities=(), payload_nbytes=0)["entry_id"]
+
+
+def _with_boundaries(entry, records):
+    entry.gdn_boundaries = tuple(records)
+    return entry
+
+
+def _boundary(tokens, salt):
+    """A recurrent checkpoint as the bank keeps one: a 1 MiB float32 state
+    (a whole-tensor fingerprint) and a bfloat16 convolution state long
+    enough on axis 2 to be stored in blocks."""
+    return (
+        int(tokens),
+        CacheSnapshot(
+            states=(None, (_rand((1, 8, 128, 256), mx.float32, salt),
+                           _rand((1, 3, 1024), mx.bfloat16, salt + 1))),
+            meta_states=(None, {"kind": "gdn"}),
+        ),
+        _rand((1, 1, 8), mx.bfloat16, salt + 2),
+    )
+
+
+def _spill_turns():
+    """Two turns of one session as the spill path sees them: turn 2 extends
+    turn 1's KV and keeps its first recurrent checkpoint, adding one."""
+    turn1, turn2 = _turns()
+    first = _boundary(512, 40)
+    _with_boundaries(turn1, [first])
+    _with_boundaries(turn2, [first, _boundary(1024, 50)])
+    return turn1, turn2
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("seed", [1, 2])
+def test_spill_every_turn_shape_stores_what_the_full_encode_stores(
+    tmp_path, monkeypatch, dtype, seed
+):
+    monkeypatch.setenv("MTPLX_SSD_INCREMENTAL_ENCODE", "0")
+    full = _tier(tmp_path / "full")
+    monkeypatch.setenv("MTPLX_SSD_INCREMENTAL_ENCODE", "1")
+    incremental = _tier(tmp_path / "incremental")
+    try:
+        for turn in _session_turns(dtype, seed):
+            entry_id = _spill(full, turn)
+            assert _spill(incremental, turn) == entry_id
+            assert _payload(incremental, entry_id) == _payload(full, entry_id)
+        assert _blobs(incremental) == _blobs(full)
+        stats = incremental.stats()
+        assert stats["incremental_reused_blobs"] > 0
+        assert stats["incremental_missing_blobs"] == 0
+        assert full.stats()["incremental_reused_blobs"] == 0
+    finally:
+        full.close()
+        incremental.close()
+
+
+def test_spill_references_kv_and_an_unchanged_checkpoint(tmp_path, monkeypatch):
+    monkeypatch.setenv("MTPLX_SSD_INCREMENTAL_ENCODE", "0")
+    full = _tier(tmp_path / "full")
+    monkeypatch.setenv("MTPLX_SSD_INCREMENTAL_ENCODE", "1")
+    incremental = _tier(tmp_path / "incremental")
+    try:
+        for turn in _spill_turns():
+            entry_id = _spill(full, turn)
+            assert _spill(incremental, turn) == entry_id
+            assert _payload(incremental, entry_id) == _payload(full, entry_id)
+        assert _blobs(incremental) == _blobs(full)
+        stats = incremental.stats()
+        # Turn 2: 4 full blocks each of K, V and the MTP history, the 1 MiB
+        # final recurrent state, and the kept checkpoint's 1 MiB state plus
+        # the 4 blocks of its convolution state.
+        assert stats["incremental_encodes"] == 1
+        assert stats["incremental_reused_blobs"] == 4 * 3 + 1 + 1 + 4
+        # A full encode of turn 2 captures each of those again.
+        assert full.stats()["incremental_reused_blobs"] == 0
+    finally:
+        full.close()
+        incremental.close()
+
+
+def test_spill_restore_after_restart_is_bit_identical(tmp_path, monkeypatch):
+    monkeypatch.setenv("MTPLX_SSD_INCREMENTAL_ENCODE", "1")
+    base = tmp_path / "store"
+    tier = _tier(base)
+    turn1, turn2 = _spill_turns()
+    try:
+        _spill(tier, turn1)
+        _spill(tier, turn2)
+        assert tier.stats()["incremental_reused_blobs"] > 0
+    finally:
+        tier.close()
+    monkeypatch.setenv("MTPLX_SSD_INCREMENTAL_ENCODE", "0")
+    reopened = _tier(base)
+    try:
+        record = reopened.lookup(
+            list(turn2.token_ids) + [7, 7], model_path=MODEL, mtp_enabled=True
+        )
+        assert record is not None
+        assert record.token_ids == turn2.token_ids
+        (k, v), (gdn,) = record.cache_snapshot.states
+        (k2, v2), (gdn2,) = turn2.cache_snapshot.states
+        assert _bits_equal(k, k2)
+        assert _bits_equal(v, v2)
+        assert _bits_equal(gdn, gdn2)
+        assert _bits_equal(
+            record.mtp_history_snapshot.states[0][0],
+            turn2.mtp_history_snapshot.states[0][0],
+        )
+        boundaries = record.gdn_boundary_loader()
+        assert len(boundaries) == 2
+        for restored, source in zip(boundaries, turn2.gdn_boundaries):
+            assert restored[0] == source[0]
+            for a, b in zip(restored[1].states[1], source[1].states[1]):
+                assert _bits_equal(a, b)
+            assert _bits_equal(restored[2], source[2])
+    finally:
+        reopened.close()
+
+
+def test_spill_captures_a_memo_blob_that_left_the_disk(tmp_path, monkeypatch):
+    """A blob the memo names but the disk lost (its entries were evicted)
+    is captured and written again in the same spill; the write lands."""
+    monkeypatch.setenv("MTPLX_SSD_INCREMENTAL_ENCODE", "0")
+    full = _tier(tmp_path / "full")
+    monkeypatch.setenv("MTPLX_SSD_INCREMENTAL_ENCODE", "1")
+    tier = _tier(tmp_path / "store")
+    try:
+        turn1, turn2 = _spill_turns()
+        _spill(full, turn1)
+        _spill(tier, turn1)
+        memo = tier._block_memo(SESSION)
+        victim = next(iter(memo.values()))["sha256"]
+        tier._blob_path(victim).unlink()
+
+        entry_id = _spill(tier, turn2)
+        stats = tier.stats()
+        assert stats["incremental_missing_blobs"] == 1
+        assert stats["incremental_reused_blobs"] > 0
+        assert tier._blob_path(victim).exists()
+        _spill(full, turn2)
+        # The same entry; only the bytes written differ (the victim twice).
+        stored, reference = _payload(tier, entry_id), _payload(full, entry_id)
+        assert stored["payload_spec"] == reference["payload_spec"]
+        assert stored["tensor_blobs"] == reference["tensor_blobs"]
+        record = tier.lookup(list(turn2.token_ids), model_path=MODEL, mtp_enabled=True)
+        assert record is not None
+        assert _bits_equal(
+            record.cache_snapshot.states[0][0], turn2.cache_snapshot.states[0][0]
+        )
+    finally:
+        full.close()
+        tier.close()
+
+
+def test_spill_other_session_does_not_borrow(tmp_path, monkeypatch):
+    monkeypatch.setenv("MTPLX_SSD_INCREMENTAL_ENCODE", "1")
+    tier = _tier(tmp_path / "store")
+    try:
+        turn1, turn2 = _spill_turns()
+        _spill(tier, turn1)
+        turn2.session_id = "another-session"
+        _spill(tier, turn2)
+        stats = tier.stats()
+        assert stats["incremental_reused_blobs"] == 0
+    finally:
+        tier.close()
+
+
+def test_spill_and_queued_writes_share_the_session_memo(tmp_path, monkeypatch):
+    """A queued write's memo serves the next spill of the session, and the
+    other way round."""
+    monkeypatch.setenv("MTPLX_SSD_INCREMENTAL_ENCODE", "1")
+    tier = _tier(tmp_path / "store")
+    try:
+        turns = _session_turns(mx.bfloat16, 4)
+        _write(tier, turns[0])
+        _spill(tier, turns[1])
+        after_spill = tier.stats()["incremental_reused_blobs"]
+        assert after_spill > 0
+        _write(tier, turns[2])
+        assert tier.stats()["incremental_reused_blobs"] > after_spill
+    finally:
+        tier.close()
+
+
+def test_fingerprints_run_in_bounded_chunks_with_the_same_keys():
+    """Block fingerprints are taken per chunk of at most one unit, with the same
+    content keys as one pass over the whole tensor."""
+    turn1, _ = _turns()
+    kwargs = {
+        "cache_snapshot": turn1.cache_snapshot,
+        "logits": turn1.logits,
+        "hidden": turn1.hidden,
+        "mtp_history_snapshot": turn1.mtp_history_snapshot,
+        "has_recurrent": True,
+        "block_size": 256,
+        "reuse": {},
+    }
+    units = []
+    whole = encode_payload(**kwargs)
+    small = encode_payload(
+        **kwargs,
+        unit_bytes=2 * 2 * 256 * 64 * 2,  # two K blocks
+        on_unit=lambda kind, seconds, nbytes: units.append((kind, nbytes)),
+    )
+    assert small.fingerprints == whole.fingerprints
+    assert small.spec == whole.spec and small.tensors == whole.tensors
+    block_fingerprints = [n for kind, n in units if kind == "fingerprint"]
+    # K and V: 4 full blocks in 2 chunks each; the MTP history (2 KiB a block
+    # row of 32 dims) fits in one chunk; the 1 MiB recurrent state is whole.
+    assert sorted(block_fingerprints) == sorted(
+        [2 * 2 * 256 * 64 * 2] * 4 + [4 * 256 * 32 * 2] + [1024 * 1024]
+    )

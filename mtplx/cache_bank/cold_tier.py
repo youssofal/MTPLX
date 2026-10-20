@@ -449,9 +449,10 @@ class SessionBankColdTier:
         # agent turn re-encodes the whole session on the model-owner thread
         # (eval + host copy of every KV block) and the writer re-hashes every
         # blob, although only the new tail is new on disk. With this on,
-        # put_entry fingerprints every KV block on the GPU (one reduction per
-        # tensor) and references a block whose content key matches the
-        # session's last completed write instead of capturing it. Off by
+        # put_entry and spill_entry fingerprint every KV block on the GPU (one
+        # reduction per tensor) and reference a block whose content key
+        # matches the session's last completed write instead of capturing it.
+        # Off by
         # default: the fingerprint is not a content identity. Flipping the
         # signs of any two float32 elements leaves both of its sums unchanged,
         # so a changed tensor can borrow its predecessor's blob and restore
@@ -978,12 +979,39 @@ class SessionBankColdTier:
                 else:
                     written_state["deduped_hits"] += 1
 
+        # Incremental encode: the same per-session memo as put_entry. A hit
+        # is referenced only when _known_blob finds the blob on disk; the
+        # memo is replaced by this write's keys once its row is installed.
+        memo_key: str | None = None
+        reuse: dict[tuple, dict[str, Any]] | None = None
+        if self._incremental_encode:
+            session_id = getattr(entry, "session_id", None)
+            memo_key = str(session_id) if session_id else None
+            reuse = dict(self._block_memo(memo_key))
         codec = TreeCodec(
             block_size=self.block_size,
             should_abort=should_abort,
             on_unit=self._observe_encode_unit,
+            reuse=reuse,
         )
         codec.tensors = _WriteThroughTensors()
+
+        def _known_blob(blob: dict[str, Any]) -> dict[str, Any] | None:
+            # Claim first (so the orphan cleanup and eviction keep it), then
+            # require it on disk; a blob gone since the memo was taken is
+            # captured and written again.
+            digest = str(blob["sha256"])
+            if digest not in claimed_digests:
+                claimed_digests.add(digest)
+                tier._claim_inflight(digests={digest})
+            if not tier._blob_path(digest).exists():
+                tier._inc("incremental_missing_blobs")
+                return None
+            written_state["logical"] += int(blob["nbytes"])
+            written_state["deduped_hits"] += 1
+            return blob
+
+        codec.known_blob = _known_blob
         boundaries = tuple(
             (int(r[0]), r[1], r[2] if len(r) > 2 else None)
             for r in (getattr(entry, "gdn_boundaries", None) or [])
@@ -1015,6 +1043,15 @@ class SessionBankColdTier:
                 "SessionBank SSD spill skipped: %s: %s", type(exc).__name__, exc
             )
             return False
+        for name, blob in codec.reused.items():
+            tensor_blobs[name] = dict(blob)
+        if codec.reused:
+            self._inc("incremental_encodes")
+            self._inc("incremental_reused_blobs", len(codec.reused))
+            self._inc(
+                "incremental_reused_bytes",
+                sum(int(blob["nbytes"]) for blob in codec.reused.values()),
+            )
         if should_abort is not None:
             # Same fencing rationale as put_entry: the per-tensor evals
             # above schedule GPU work whose command buffers must drain in
@@ -1052,6 +1089,8 @@ class SessionBankColdTier:
             return False
         if outcome == _INSTALL_PRESENT:
             return True
+        if codec.fingerprints:
+            self._store_block_memo(memo_key, codec.fingerprints, tensor_blobs)
         self._inc("writes_completed")
         self._inc("spill_writes_completed")
         with self._stats_lock:
@@ -1834,7 +1873,9 @@ class SessionBankColdTier:
                 entry_hash_prefix=entry_hash_prefix,
             )
             if wrote and pending.fingerprints:
-                self._store_block_memo(pending, tensor_blobs)
+                self._store_block_memo(
+                    pending.memo_key, pending.fingerprints, tensor_blobs
+                )
             return wrote
         finally:
             self._release_inflight(entry_dirs=(entry_dir_rel,), digests=digests)
@@ -1924,24 +1965,25 @@ class SessionBankColdTier:
 
     def _store_block_memo(
         self,
-        pending: PendingWrite,
+        memo_key: str | None,
+        fingerprints: dict[str, tuple],
         tensor_blobs: dict[str, dict[str, Any]],
     ) -> None:
         """Newest completed write per session becomes the reuse source: its
         content keys map to the digests the manifest row now references."""
-        if pending.memo_key is None:
+        if memo_key is None:
             return
         memo = {
             key: {
                 "sha256": str(tensor_blobs[name]["sha256"]),
                 "nbytes": int(tensor_blobs[name]["nbytes"]),
             }
-            for name, key in pending.fingerprints.items()
+            for name, key in fingerprints.items()
             if name in tensor_blobs
         }
         with self._block_memos_lock:
-            self._block_memos[pending.memo_key] = memo
-            self._block_memos.move_to_end(pending.memo_key)
+            self._block_memos[memo_key] = memo
+            self._block_memos.move_to_end(memo_key)
             while len(self._block_memos) > self._block_memos_max:
                 self._block_memos.popitem(last=False)
 

@@ -171,6 +171,12 @@ class TreeCodec:
         self.reuse = reuse
         self.reused: dict[str, dict[str, Any]] = {}
         self.fingerprints: dict[str, tuple] = {}
+        # Streaming writer hook (cold_tier.spill_entry): a memo hit is
+        # referenced only once known_blob confirms the blob (it claims the
+        # digest and requires it on disk, returning the blob, or None to
+        # capture the bytes after all). The staged writer checks its
+        # referenced blobs itself and leaves this unset.
+        self.known_blob: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None
         self.tensors: dict[str, bytes] = {}
         self.block_size = max(1, int(block_size))
         self.should_abort = should_abort
@@ -220,6 +226,42 @@ class TreeCodec:
                 pass
         self._check_abort()
         return fps
+
+    def _fingerprint_chunk_blocks(self, value: Any, shape: list[int]) -> int:
+        """Blocks per fingerprint chunk: as many as fit in one unit."""
+        rows = max(1, int(shape[2]))
+        block_bytes = max(1, int(getattr(value, "nbytes", 0) or 0) // rows) * self.block_size
+        return max(1, self.unit_bytes // block_bytes)
+
+    def _block_fingerprint(
+        self,
+        value: Any,
+        shape: list[int],
+        block_index: int,
+        *,
+        full: int,
+        chunk_blocks: int,
+        chunk_fps: dict[int, list[int] | None] | None,
+    ) -> int | None:
+        """The content fingerprint of one full block, or None (no memo key)."""
+        if chunk_fps is None or (block_index + 1) * self.block_size > full:
+            return None
+        chunk = block_index // chunk_blocks
+        if chunk not in chunk_fps:
+            lo = chunk * chunk_blocks * self.block_size
+            slices = [slice(None)] * len(shape)
+            slices[2] = slice(lo, min(full, lo + chunk_blocks * self.block_size))
+            chunk_fps[chunk] = self._fingerprints(
+                value[tuple(slices)], rows=self.block_size
+            )
+        part = chunk_fps[chunk]
+        offset = block_index - chunk * chunk_blocks
+        return part[offset] if part is not None and offset < len(part) else None
+
+    def _confirmed(self, hit: dict[str, Any] | None) -> dict[str, Any] | None:
+        if hit is None or self.known_blob is None:
+            return hit
+        return self.known_blob(hit)
 
     def _check_abort(self) -> None:
         check = self.should_abort
@@ -283,7 +325,7 @@ class TreeCodec:
             if fps:
                 key = (dtype, tuple(shape), -1, fps[0])
                 self.fingerprints[name] = key
-                hit = self.reuse.get(key)
+                hit = self._confirmed(self.reuse.get(key))
                 if hit is not None:
                     self.reused[name] = dict(hit)
                     return {
@@ -336,15 +378,15 @@ class TreeCodec:
         axis = 2
         blocks: list[dict[str, Any]] = []
         total = 0
-        block_fps: list[int] | None = None
-        if self.reuse is not None:
-            full = (shape[axis] // self.block_size) * self.block_size
-            if full:
-                slices = [slice(None)] * len(shape)
-                slices[axis] = slice(0, full)
-                block_fps = self._fingerprints(
-                    value[tuple(slices)], rows=self.block_size
-                )
+        full = (shape[axis] // self.block_size) * self.block_size
+        # Fingerprints per chunk of whole blocks of at most unit_bytes, taken the
+        # first time a block of the chunk needs one: a bounded unit like every
+        # capture, and the reduction's temporaries stay a chunk's size on the
+        # streaming writer, which also runs when memory is short.
+        chunk_fps: dict[int, list[int] | None] | None = (
+            {} if self.reuse is not None and full else None
+        )
+        chunk_blocks = self._fingerprint_chunk_blocks(value, shape)
         for start in range(0, shape[axis], self.block_size):
             # No check here: _encode_tensor checked before the first block and
             # _materialize checks after every block.
@@ -355,11 +397,17 @@ class TreeCodec:
             name = f"tensor_{self._next_tensor_id:08d}"
             self._next_tensor_id += 1
             block_index = start // self.block_size
-            if block_fps is not None and block_index < len(block_fps):
+            fingerprint = self._block_fingerprint(
+                value, shape, block_index, full=full, chunk_blocks=chunk_blocks,
+                chunk_fps=chunk_fps,
+            )
+            if fingerprint is not None:
                 chunk_shape = [int(dim) for dim in chunk.shape]
-                key = (dtype, tuple(chunk_shape), int(start), block_fps[block_index])
+                key = (dtype, tuple(chunk_shape), int(start), fingerprint)
                 self.fingerprints[name] = key
-                hit = self.reuse.get(key) if self.reuse is not None else None
+                hit = self._confirmed(
+                    self.reuse.get(key) if self.reuse is not None else None
+                )
                 if hit is not None:
                     nbytes = int(hit["nbytes"])
                     self.reused[name] = dict(hit)
