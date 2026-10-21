@@ -82,6 +82,7 @@ from mtplx.a3b_mtp_batch import (
 from mtplx.adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
 from mtplx.attention_context import attention_phase
 from mtplx.cache_state import snapshot_cache
+from mtplx.token_ids import as_token_tuple
 from mtplx.one_copy import (
     anchor_nbytes as one_copy_anchor_nbytes,
     one_copy_runtime,
@@ -22888,7 +22889,7 @@ def _run_prefill_admission(
     prompt_tokens = len(prompt_ids)
     if prompt_tokens <= 0:
         return None
-    probe_ids = list(prompt_ids)
+    probe_ids = as_token_tuple(prompt_ids)
     if vision_splice is not None:
         # Admission must ask the same content-keyed question as restore.
         # Raw image pads only match the text before the first image; that
@@ -22900,7 +22901,7 @@ def _run_prefill_admission(
         if keyed_ids is None:
             session_bank = None
         else:
-            probe_ids = list(keyed_ids)
+            probe_ids = as_token_tuple(keyed_ids)
     caps = getattr(state, "metal_memory_caps", None)
     limit = 0
     if isinstance(caps, dict):

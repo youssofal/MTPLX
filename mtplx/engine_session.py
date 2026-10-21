@@ -34,6 +34,7 @@ from .session_bank import (
     block_aligned_prefix_len,
 )
 from .runtime_options import block_prefix_restore_enabled
+from .token_ids import as_token_tuple
 
 
 logger = logging.getLogger(__name__)
@@ -1681,7 +1682,7 @@ class EngineSession:
         if finish_reason not in {"stop", "length", "tool_calls"}:
             return EngineSessionCommit(False, f"unsafe_finish:{finish_reason}", self.prefix_len)
         self.note_turn_prompt_len(len(prompt_ids))
-        tokens = tuple(int(token) for token in prompt_ids) + tuple(int(token) for token in generated_ids)
+        tokens = as_token_tuple(prompt_ids) + tuple(int(token) for token in generated_ids)
         self.committed_token_ids = tokens
         self.last_commit_s = time.time()
         self.last_finish_reason = finish_reason
@@ -1708,7 +1709,7 @@ class EngineSession:
         prefix gives the resolver a stable session anchor without claiming the
         assistant/tool history has landed yet.
         """
-        tokens = tuple(int(token) for token in prompt_ids)
+        tokens = as_token_tuple(prompt_ids)
         if not tokens:
             return EngineSessionCommit(False, "empty_prompt_prefix", self.prefix_len)
         current = self.committed_token_ids
@@ -1752,7 +1753,7 @@ class EngineSession:
         prevents the next OpenCode turn from resolving by a stale prompt
         boundary that can differ by one chat-template token.
         """
-        tokens = tuple(int(token) for token in token_ids)
+        tokens = as_token_tuple(token_ids)
         if not tokens:
             return EngineSessionCommit(False, "empty_retokenized_prefix", self.prefix_len)
         if expected_revision is not None and self.revision != int(expected_revision):
@@ -2270,7 +2271,7 @@ class EngineSessionManager:
             acquired.end_generation()
 
     def longest_prefix_session(self, token_ids: list[int] | tuple[int, ...]) -> EngineSession | None:
-        tokens = tuple(int(token) for token in token_ids)
+        tokens = as_token_tuple(token_ids)
         best: EngineSession | None = None
         for session in self._sessions_snapshot():
             prefix = session.committed_token_ids
@@ -2297,7 +2298,7 @@ class EngineSessionManager:
         is strictly better than forking. A 64-token probe rejects unrelated
         sessions before the O(prefix) compare.
         """
-        tokens = tuple(int(token) for token in token_ids)
+        tokens = as_token_tuple(token_ids)
         if not tokens:
             return None, 0
         probe = tokens[:_COMMON_PREFIX_PROBE_TOKENS]
@@ -2339,7 +2340,7 @@ class EngineSessionManager:
         min_matched_tokens: int | None = None,
     ) -> tuple[EngineSession | None, int]:
         """Return a pending-postcommit session with a near-exact prompt prefix."""
-        tokens = tuple(int(token) for token in token_ids)
+        tokens = as_token_tuple(token_ids)
         gap_limit = (
             _near_prefix_max_token_gap()
             if max_token_gap is None
@@ -2388,7 +2389,7 @@ class EngineSessionManager:
         self,
         token_ids: list[int] | tuple[int, ...],
     ) -> tuple[EngineSession | None, int]:
-        tokens = tuple(int(token) for token in token_ids)
+        tokens = as_token_tuple(token_ids)
         best: EngineSession | None = None
         best_len = 0
         for session in self._sessions_snapshot():
@@ -2408,7 +2409,7 @@ class EngineSessionManager:
         selected: EngineSession | None = None,
         exact: bool = False,
     ) -> dict[str, Any]:
-        tokens = tuple(int(token) for token in token_ids)
+        tokens = as_token_tuple(token_ids)
         session, matched = (selected, len(selected.committed_token_ids)) if selected is not None else self.nearest_prefix_session(tokens)
         if session is None:
             return {

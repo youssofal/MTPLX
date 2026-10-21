@@ -34,6 +34,7 @@ from .cache_state import (
 from .cache_bank.codec import ColdEncodeInterrupted
 from .checkpoint_anchors import AnchorPlan, default_tail_backoff, retain_checkpoints
 from .runtime import MTPLXRuntime
+from .token_ids import TokenTuple, as_token_tuple
 from .runtime_options import block_prefix_restore_enabled
 
 
@@ -324,6 +325,37 @@ def common_prefix_len(left: list[int] | tuple[int, ...], right: list[int] | tupl
     return limit
 
 
+_SHARED_LEN_MEMO_MAX = 128
+_shared_len_memo: dict[tuple[int, int], tuple[Any, Any, int]] = {}
+_shared_len_memo_lock = threading.Lock()
+
+
+def shared_prefix_len(tokens: Any, prefix: Any) -> int:
+    """``common_prefix_len`` that remembers its answer per (prompt, entry).
+
+    One request asks the same question of every RAM entry several times (the
+    dominant-prefix estimate, the exact lookup, the near-prefix lane, its
+    diagnostics, the reread receipt); at 80K tokens each pass costs ~0.45 ms
+    per entry. Both inputs are immutable ``TokenTuple`` objects, so the answer
+    is keyed on their identity; the memo holds both objects, which keeps the
+    identities from being reused while an answer is stored. Anything else
+    takes the plain compare.
+    """
+    if type(tokens) is not TokenTuple or type(prefix) is not TokenTuple:
+        return common_prefix_len(tokens, prefix)
+    key = (id(tokens), id(prefix))
+    with _shared_len_memo_lock:
+        hit = _shared_len_memo.get(key)
+    if hit is not None and hit[0] is tokens and hit[1] is prefix:
+        return hit[2]
+    matched = common_prefix_len(tokens, prefix)
+    with _shared_len_memo_lock:
+        if len(_shared_len_memo) >= _SHARED_LEN_MEMO_MAX:
+            _shared_len_memo.pop(next(iter(_shared_len_memo)), None)
+        _shared_len_memo[key] = (tokens, prefix, matched)
+    return matched
+
+
 def block_aligned_prefix_len(matched_tokens: int, *, block_size: int) -> int:
     block = max(1, int(block_size))
     matched = max(0, int(matched_tokens))
@@ -484,7 +516,7 @@ def _near_prefix_candidate_len(
     prefix = entry.token_ids
     if not prefix:
         return None
-    matched = common_prefix_len(tokens, prefix)
+    matched = shared_prefix_len(tokens, prefix)
     # An image prompt is matched in its content-keyed view: the match is
     # content-true, but a restore never cuts an image (image_safe_restore_len).
     # A cut back to an image's start is no tiny gap; the block rules judge it.
@@ -1417,7 +1449,7 @@ class SessionBank:
         # synchronous_serialize_elapsed_s}. Early returns leave later keys
         # absent. Deferred cold-tier serialization is never charged here —
         # only the dispatch span is; the job itself runs on the idle lane.
-        tokens = tuple(int(token) for token in token_ids)
+        tokens = as_token_tuple(token_ids)
         if not tokens:
             raise ValueError("cannot store an empty prefix")
         if mtp_snapshot_epoch is not None and int(mtp_snapshot_epoch) != int(snapshot_epoch):
@@ -1789,7 +1821,7 @@ class SessionBank:
         mtp_snapshot_epoch: int | None = None,
         nbytes_override: int | None = None,
     ) -> SessionBankEntry | None:
-        tokens = tuple(int(token) for token in token_ids)
+        tokens = as_token_tuple(token_ids)
         if not tokens:
             raise ValueError("cannot store an empty prefix")
         if mtp_snapshot_epoch is not None and int(mtp_snapshot_epoch) != int(snapshot_epoch):
@@ -1891,18 +1923,18 @@ class SessionBank:
         and calls the session compacted. One compare per entry, no cold-tier
         scan, no lookup side effects.
         """
-        tokens = tuple(int(token) for token in token_ids)
+        tokens = as_token_tuple(token_ids)
         best = 0
         for prefix, entry in self._entries.items():
             if session_id is not None and entry.session_id != session_id:
                 continue
-            matched = common_prefix_len(tokens, prefix)
+            matched = shared_prefix_len(tokens, prefix)
             if matched > best:
                 best = matched
         return best
 
     def longest_prefix(self, token_ids: list[int] | tuple[int, ...]) -> SessionBankEntry | None:
-        tokens = tuple(int(token) for token in token_ids)
+        tokens = as_token_tuple(token_ids)
         best: SessionBankEntry | None = None
         for prefix, entry in self._entries.items():
             if len(prefix) > len(tokens):
@@ -1938,7 +1970,7 @@ class SessionBank:
         if a new prompt shares a large stable token prefix, restore to the last
         full block and prefill only the changed suffix.
         """
-        tokens = tuple(int(token) for token in token_ids)
+        tokens = as_token_tuple(token_ids)
         gap_limit = max(0, int(max_token_gap))
         min_match = max(1, int(min_matched_tokens))
         block = max(1, int(block_size))
@@ -1950,7 +1982,7 @@ class SessionBank:
             prefix = entry.token_ids
             if not prefix:
                 continue
-            matched = common_prefix_len(tokens, prefix)
+            matched = shared_prefix_len(tokens, prefix)
             gap = len(prefix) - matched
             safe_block = min(
                 block_aligned_prefix_len(matched, block_size=block),
@@ -2123,7 +2155,7 @@ class SessionBank:
                 "prompt_len": len(tokens),
                 "session_id": entry.session_id,
                 "stored_prefix_len": entry.prefix_len,
-                "common_prefix_tokens": int(common_prefix_len(tokens, entry.token_ids)),
+                "common_prefix_tokens": int(shared_prefix_len(tokens, entry.token_ids)),
                 "nearest_boundary_tokens": int(matched),
                 "new_prefill_tokens": max(0, len(tokens) - int(matched)),
                 "miss_reason": None,
@@ -2218,7 +2250,7 @@ class SessionBank:
             return None
         metadata = dict(getattr(record, "metadata", {}) or {})
         entry = SessionBankEntry(
-            token_ids=tuple(int(token) for token in record.token_ids),
+            token_ids=as_token_tuple(record.token_ids),
             token_hash=metadata.get("token_hash") or token_prefix_hash(record.token_ids),
             has_recurrent=bool(
                 getattr(record, "has_recurrent", False)
@@ -2288,7 +2320,7 @@ class SessionBank:
         if record is None:
             return None
         n = int(record["prefix_len"])
-        tokens = tuple(int(token) for token in token_ids)
+        tokens = as_token_tuple(token_ids)
         if len(tokens) < n or token_prefix_hash(tokens[:n]) != record["token_hash"]:
             return None
         return record
@@ -2524,7 +2556,7 @@ class SessionBank:
             entry.last_access_s = time.time()
         self.last_restore_source = "ram"
         self.last_ssd_restore_s = 0.0
-        lookup_len = len(tuple(int(token) for token in token_ids))
+        lookup_len = len(as_token_tuple(token_ids))
         self.last_prefix_diagnostic = {
             "prompt_len": lookup_len,
             "session_id": entry.session_id,
@@ -3316,7 +3348,7 @@ class SessionBank:
         views: later cache writes cannot mutate what gets encoded — the
         lazy-snapshot COW pin covers this), and streams to disk.
         """
-        entry = self._entries.get(tuple(int(token) for token in token_ids))
+        entry = self._entries.get(as_token_tuple(token_ids))
         if entry is None or not entry.live_ref_only or entry.cache_ref is None:
             return False
         if int(entry.snapshot_epoch) != int(snapshot_epoch):
@@ -3481,7 +3513,7 @@ class SessionBank:
             return None
         metadata = dict(getattr(record, "metadata", {}) or {})
         entry = SessionBankEntry(
-            token_ids=tuple(int(token) for token in record.token_ids),
+            token_ids=as_token_tuple(record.token_ids),
             token_hash=metadata.get("token_hash") or token_prefix_hash(record.token_ids),
             has_recurrent=bool(
                 getattr(record, "has_recurrent", False)
@@ -3538,7 +3570,7 @@ class SessionBank:
         self.last_restore_source = "ssd"
         self.last_ssd_restore_s = float(getattr(record, "restore_s", 0.0) or 0.0)
         self.last_miss_reason = None
-        lookup_len = len(tuple(int(token) for token in token_ids))
+        lookup_len = len(as_token_tuple(token_ids))
         self.last_prefix_diagnostic = {
             "prompt_len": lookup_len,
             "session_id": entry.session_id,
@@ -4091,7 +4123,7 @@ class SessionBank:
         }
         if not prompt_tokens:
             return plan
-        tokens = tuple(int(token) for token in prompt_tokens)
+        tokens = as_token_tuple(prompt_tokens)
         identity = {
             "model_path": model_path,
             "mtp_enabled": mtp_enabled,
@@ -4220,7 +4252,7 @@ class SessionBank:
 
         if not session_id or not prompt_tokens:
             return 0
-        tokens = tuple(int(token) for token in prompt_tokens)
+        tokens = as_token_tuple(prompt_tokens)
         knobs = _near_prefix_knobs()
         best = 0
         for key, entry in list(self._entries.items()):
@@ -4265,7 +4297,7 @@ class SessionBank:
 
         if not session_id or not prompt_tokens:
             return []
-        tokens = tuple(int(token) for token in prompt_tokens)
+        tokens = as_token_tuple(prompt_tokens)
         candidates: list[tuple[SessionBankEntry, bool]] = [
             (entry, True)
             for entry in list(self._entries.values())
@@ -4283,7 +4315,7 @@ class SessionBank:
                 continue
             seen.add(id(entry))
             length = len(entry.token_ids)
-            shared = common_prefix_len(tokens, entry.token_ids)
+            shared = shared_prefix_len(tokens, entry.token_ids)
             if length <= 0 or shared <= 0 or 2 * shared < length:
                 continue
             rows.append(

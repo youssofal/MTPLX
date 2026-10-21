@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from array import array
 import hashlib
 from collections import Counter, OrderedDict, deque
 import json
@@ -307,11 +308,36 @@ def common_prefix_len(left: tuple[int, ...], right: tuple[int, ...]) -> int:
     return limit
 
 
+def _token_array(token_ids: list[int]) -> array | tuple[int, ...]:
+    """Token ids as a compact ``array('I')``; a tuple if an id does not fit."""
+    try:
+        return array("I", token_ids)
+    except (OverflowError, TypeError):
+        return tuple(int(token) for token in token_ids)
+
+
+def _starts_with(tokens: tuple[int, ...], prefix: array | tuple[int, ...]) -> bool:
+    if len(tokens) < len(prefix):
+        return False
+    head = tokens[: len(prefix)]
+    if isinstance(prefix, array):
+        try:
+            return array(prefix.typecode, head) == prefix
+        except (OverflowError, TypeError):
+            return False
+    return tuple(head) == tuple(prefix)
+
+
 def block_aligned_prefix_len(matched_tokens: int, *, block_size: int) -> int:
     block = max(1, int(block_size))
     matched = max(0, int(matched_tokens))
     return (matched // block) * block
 
+
+# Upper bound on token ids held by the parsed-row memo. Rows are held as
+# 4-byte arrays, so the cap is about 128 MB; a full 100 GB store of long agent
+# conversations stays below it (5.7M tokens in 79 rows measured).
+_ROW_TOKENS_MEMO_MAX_TOKENS = 32_000_000
 
 # Ranked SSD rows a prefix lookup opens before it gives up: each refusal
 # costs only its payload.json read.
@@ -464,6 +490,12 @@ class SessionBankColdTier:
         self._block_memos: OrderedDict[str, dict[tuple, dict[str, Any]]] = OrderedDict()
         self._block_memos_lock = threading.Lock()
         self._block_memos_max = 16
+        # entry_id -> (token_hash, parsed token ids) for manifest rows. A row's
+        # token list is immutable, so a prefix lookup parses each one once
+        # instead of on every request; bounded by total cached tokens.
+        self._row_tokens_memo: dict[str, tuple[str, array | tuple[int, ...]]] = {}
+        self._row_tokens_memo_tokens = 0
+        self._row_tokens_memo_lock = threading.Lock()
         self._stop = threading.Event()
         self._base_lock = threading.RLock()
         self._disk_usage_lock = threading.Lock()
@@ -1169,6 +1201,7 @@ class SessionBankColdTier:
         block_min_match = max(block, int(block_min_matched_tokens))
         started = time.perf_counter()
         try:
+            floor = max(0, int(min_useful_matched_tokens))
             rows = self._candidate_rows_for_prefix_boundary(
                 model_path=model_path,
                 mtp_enabled=mtp_enabled,
@@ -1177,12 +1210,15 @@ class SessionBankColdTier:
                 mtp_history_policy=mtp_history_policy,
                 draft_head_identity=draft_head_identity,
                 policy_fingerprint=policy_fingerprint,
+                min_prefix_len=floor,
             )
-            ranked: list[tuple[tuple[int, int, int], sqlite3.Row, int, str, int]] = []
-            for row in rows:
-                prefix = tuple(int(token) for token in json.loads(str(row["token_ids_json"])))
+
+            def rank_row(
+                row: sqlite3.Row,
+            ) -> tuple[tuple[int, int, int], sqlite3.Row, int, str, int] | None:
+                prefix = self._row_token_ids(row)
                 if not prefix:
-                    continue
+                    return None
                 matched = common_prefix_len(tokens, prefix)
                 gap = len(prefix) - matched
                 safe_block = min(
@@ -1205,16 +1241,40 @@ class SessionBankColdTier:
                     candidate_matched = int(safe_block)
                     restore_kind = "block_prefix"
                 else:
-                    continue
-                ranked.append(
-                    (
-                        (candidate_matched, int(matched), len(prefix)),
-                        row,
-                        candidate_matched,
-                        restore_kind,
-                        len(prefix),
-                    )
+                    return None
+                return (
+                    (candidate_matched, int(matched), len(prefix)),
+                    row,
+                    candidate_matched,
+                    restore_kind,
+                    len(prefix),
                 )
+
+            ranked: list[tuple[tuple[int, int, int], sqlite3.Row, int, str, int]] = []
+            for row in rows:
+                item = rank_row(row)
+                if item is not None:
+                    ranked.append(item)
+            if not ranked and floor > 0:
+                # Rows shorter than the caller's RAM match cannot beat it
+                # (candidate_matched <= prefix_len) and were left out of the
+                # query. Whether one of them would have matched still
+                # decides the miss reason, so look at them only on this
+                # path; their token lists come from the memo.
+                for row in self._candidate_rows_for_prefix_boundary(
+                    model_path=model_path,
+                    mtp_enabled=mtp_enabled,
+                    hidden_variant=hidden_variant,
+                    template_hash=template_hash,
+                    mtp_history_policy=mtp_history_policy,
+                    draft_head_identity=draft_head_identity,
+                    policy_fingerprint=policy_fingerprint,
+                    max_prefix_len=floor - 1,
+                ):
+                    if rank_row(row) is not None:
+                        self._inc("prefix_lookups_not_better_than_ram")
+                        self._set_last_miss("ssd_prefix_not_better_than_ram")
+                        return None
             if not ranked:
                 self._inc("restore_misses")
                 self._set_last_miss("ssd_prefix_miss")
@@ -2395,6 +2455,7 @@ class SessionBankColdTier:
         blob_hashes = self._entry_blob_hashes(entry_dir)
         with self._connect() as conn:
             conn.execute("DELETE FROM entries WHERE entry_id = ?", (entry_id,))
+        self._forget_row_tokens(entry_id)
         try:
             if entry_dir.exists():
                 shutil.rmtree(entry_dir)
@@ -2409,6 +2470,7 @@ class SessionBankColdTier:
             self._archive_orphan_entry_dir(entry_dir, entry_id)
         with self._connect() as conn:
             conn.execute("DELETE FROM entries WHERE entry_id = ?", (entry_id,))
+        self._forget_row_tokens(entry_id)
         self._invalidate_disk_usage_cache()
 
     def _entry_in_manifest(self, entry_id: str) -> bool:
@@ -2664,8 +2726,8 @@ class SessionBankColdTier:
         prefix_restore_tokens: int | None = None,
     ) -> ColdRestoreRecord | None:
         metadata = dict(row)
-        token_ids = tuple(int(token) for token in json.loads(str(metadata["token_ids_json"])))
-        if require_exact_prefix and lookup_tokens[: len(token_ids)] != token_ids:
+        token_ids = self._row_token_ids(row)
+        if require_exact_prefix and not _starts_with(lookup_tokens, token_ids):
             return None
         if int(metadata["format_version"]) != COLD_TIER_FORMAT_VERSION:
             self._set_last_miss("ssd_format_mismatch")
@@ -2803,7 +2865,9 @@ class SessionBankColdTier:
         )
         return ColdRestoreRecord(
             entry_id=str(metadata["entry_id"]),
-            token_ids=token_ids,
+            # The memo holds a compact array; a restored record carries the
+            # tuple its callers have always received.
+            token_ids=tuple(token_ids),
             cache_snapshot=decoded.cache_snapshot,
             logits=decoded.logits,
             hidden=decoded.hidden,
@@ -2861,6 +2925,37 @@ class SessionBankColdTier:
                 compatible.append(row)
         return compatible
 
+    def _row_token_ids(self, row: sqlite3.Row) -> array | tuple[int, ...]:
+        """Token ids of a manifest row, parsed once per (entry_id, token_hash).
+
+        Held as an ``array('I')`` (4 bytes per id; a tuple of ints costs about
+        40). A full memo keeps its residents and hands a newcomer back
+        unmemoized: prefix lookups walk the rows in the same order every
+        time, so evicting the oldest row would drop each row just before its
+        next use and the memo would never hit.
+        """
+        entry_id = str(row["entry_id"])
+        token_hash = str(row["token_hash"])
+        with self._row_tokens_memo_lock:
+            hit = self._row_tokens_memo.get(entry_id)
+            if hit is not None and hit[0] == token_hash:
+                return hit[1]
+        tokens = _token_array(json.loads(str(row["token_ids_json"])))
+        with self._row_tokens_memo_lock:
+            old = self._row_tokens_memo.pop(entry_id, None)
+            if old is not None:
+                self._row_tokens_memo_tokens -= len(old[1])
+            if self._row_tokens_memo_tokens + len(tokens) <= _ROW_TOKENS_MEMO_MAX_TOKENS:
+                self._row_tokens_memo[entry_id] = (token_hash, tokens)
+                self._row_tokens_memo_tokens += len(tokens)
+        return tokens
+
+    def _forget_row_tokens(self, entry_id: str) -> None:
+        with self._row_tokens_memo_lock:
+            old = self._row_tokens_memo.pop(str(entry_id), None)
+            if old is not None:
+                self._row_tokens_memo_tokens -= len(old[1])
+
     def _candidate_rows_for_prefix_boundary(
         self,
         *,
@@ -2871,12 +2966,20 @@ class SessionBankColdTier:
         mtp_history_policy: str | None,
         draft_head_identity: str | None,
         policy_fingerprint: str | None,
+        min_prefix_len: int = 0,
+        max_prefix_len: int | None = None,
     ) -> list[sqlite3.Row]:
         query = [
             "SELECT * FROM entries WHERE model_path = ?",
             "AND mtp_enabled = ?",
         ]
         params: list[Any] = [str(model_path), 1 if mtp_enabled else 0]
+        if min_prefix_len > 0:
+            query.append("AND prefix_len >= ?")
+            params.append(int(min_prefix_len))
+        if max_prefix_len is not None:
+            query.append("AND prefix_len <= ?")
+            params.append(int(max_prefix_len))
         if hidden_variant is not None:
             query.append("AND hidden_variant = ?")
             params.append(str(hidden_variant))
@@ -3221,6 +3324,7 @@ class SessionBankColdTier:
                 self._disk_usage_cache["disk_usage_stale"] = True
 
     def _insert_manifest(self, metadata: dict[str, Any]) -> None:
+        self._forget_row_tokens(str(metadata["entry_id"]))
         with self._connect() as conn:
             conn.execute(
                 """
