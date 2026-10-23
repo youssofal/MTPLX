@@ -34,6 +34,10 @@ from typing import Any
 _DISABLE_VALUES = {"0", "false", "no", "off"}
 
 
+class QSAResizeWouldCut(ValueError):
+    """The requested capacity would truncate a cache's live logical rows."""
+
+
 def one_copy_enabled() -> bool:
     """The one-copy conversation store (MTPLX_ONE_COPY, on unless set off)."""
 
@@ -162,8 +166,9 @@ def resize_bill(cache: Any, rows: int) -> int | None:
     buffers written beside its old ones. On the 2026-10-01 turn (12 layers
     of 147,456 rows, a 148,480-row bank) that is 0.38 GB, where the padded
     copy of the same bank was priced at 4.22 GB. None when a QSA layer of
-    ``cache`` cannot be resized (a promoted bank, a missing buffer): the
-    promotion then copies, as it always did.
+    ``cache`` cannot be resized (a promoted bank, a missing buffer, or a
+    target below the live frontier): the promotion then copies, as it
+    always did.
     """
 
     entries = _resizable(cache)
@@ -171,7 +176,13 @@ def resize_bill(cache: Any, rows: int) -> int | None:
         return None
     gained = peak = 0
     for entry in entries:
-        new, old = _layer_bytes(entry, rows)
+        try:
+            new, old = _layer_bytes(entry, rows)
+        except QSAResizeWouldCut:
+            # Capacity planning may decline an in-place resize. Let the
+            # caller price its copy/eager path; an actual resize must still
+            # reject cutting live rows.
+            return None
         peak = max(peak, gained + new)
         gained += new - old
     return peak
@@ -204,18 +215,26 @@ def _resized_buffers(entry: Any, rows: int) -> list[tuple[str, Any, int, int]]:
 
     rows = int(rows)
     offset = int(entry.kv.offset)
+    ratio = max(1, int(entry.ratio))
+    # A rewound lease can retain its previous pooled count. Blocks beyond
+    # the KV frontier are invalid, just as in QSACache.trim/state and
+    # TensorOffsetQSACache.demote (#592).
+    valid_pooled = min(int(entry.pooled_len), offset // ratio)
+    entry.pooled_len = valid_pooled
     wanted = (
         ("keys", entry.kv.keys, 2, rows, offset),
         ("values", entry.kv.values, 2, rows, offset),
         ("raw_keys", entry.raw_keys, 1, rows, offset),
-        ("pooled", entry.pooled, 1, rows // max(1, int(entry.ratio)), int(entry.pooled_len)),
+        ("pooled", entry.pooled, 1, rows // ratio, valid_pooled),
     )
     resized = []
     for name, buffer, axis, target, held in wanted:
         if int(buffer.shape[axis]) == target:
             continue
         if target < held:
-            raise ValueError(f"QSA {name} hold {held} rows; resizing to {target} would cut them")
+            raise QSAResizeWouldCut(
+                f"QSA {name} hold {held} rows; resizing to {target} would cut them"
+            )
         resized.append((name, buffer, axis, target))
     return resized
 

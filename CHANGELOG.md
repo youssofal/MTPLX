@@ -4,6 +4,12 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- Flash-Next cache rewinds no longer retain pooled-block counts beyond the KV frontier. Capacity planning can decline an unsafe in-place resize, and a resize rejected during verification falls back to eager verification while preserving live rows (#592, #605).
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed

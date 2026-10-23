@@ -3380,7 +3380,11 @@ class QSAIndexer(nn.Module):
         if getattr(cache, "fixed_capacity", False):
             return self._extend_pooled_fixed(cache, total)
         nb_total = total // self.ratio
-        nb_old = min(cache.pooled_len, nb_total)
+        # After a KV rewind, recompute newly completed blocks instead of
+        # selecting stale pooled keys.
+        # The indexer runs before KV advances through this forward's rows.
+        nb_old = min(cache.pooled_len, cache.kv.offset // self.ratio, nb_total)
+        cache.pooled_len = nb_old
         if nb_total > nb_old:
             fresh = cache.raw_keys[:, nb_old * self.ratio : nb_total * self.ratio, :]
             if self._prepare_kernel_supported(

@@ -107,6 +107,7 @@ from .graphbank import (
 )
 from .native_mlp import set_native_mlp_context
 from .one_copy import (
+    QSAResizeWouldCut,
     hand_back_on_raise,
     held_qsa_rows,
     layers_to_resize,
@@ -936,6 +937,18 @@ def _qwen4_fixed_m4_resize_held(
         # leaves that layer as it was: the request answers on the eager
         # verifier, as a refused layer does. Anything else is not the
         # resize's to absorb.
+        if isinstance(exc, QSAResizeWouldCut):
+            # If the live frontier changed after the estimate, keep its
+            # buffers intact and use eager verification.
+            receipt.update(
+                engaged=False, reason="cache_resize_guard",
+                resize_error=f"{type(exc).__name__}: {exc}",
+            )
+            _announce_qwen4_fixed_m4_skip(
+                f"QSA resize to {rows} rows would cut live cache; "
+                "keeping eager verification"
+            )
+            return False
         if not is_allocation_failure(exc):
             raise
         failure = f"{type(exc).__name__}: {exc}"
