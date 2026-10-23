@@ -43,6 +43,68 @@ Endpoints:
 - `GET /admin/sessions`
 - `POST /admin/cache/clear`
 
+## Loading models on demand (`--jit`)
+
+One MTPLX server process holds one model, so an agent that wants to switch
+models used to need a restart with new flags. `--jit` puts a small router on
+the public port instead. It reads the `model` field of each request, starts
+an ordinary `mtplx serve` for that model, and replaces it when a request names
+another one:
+
+```bash
+mtplx pull Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed
+mtplx pull Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Balance
+mtplx serve --jit --port 8000
+```
+
+Nothing loads at startup. The first request for a model loads it, and a
+request for a different model waits for the requests in flight, stops the
+loaded model, loads the new one and then runs. Only one model is resident at a
+time, so a request for a model that needs more memory than the Mac has is
+refused with a 503 before the loaded model is stopped.
+
+- `GET /v1/models` lists every installed model, with `loaded: true` on the
+  one in memory. Models that are not on disk are not listed and are not
+  downloaded by a request; run `mtplx pull` first.
+- `model` accepts the Hugging Face id, the catalog id, an alias, the id the
+  plain server reports (`mtplx-qwen38-27b-optimized-speed`), or the folder
+  name. An id that matches no installed model gets a 404 listing what is
+  installed, instead of the plain server's answer from whatever is loaded.
+  A request with no `model` uses the loaded model, or is a 400 if none is.
+- Streaming requests get `: loading model` comments every 5 seconds while a
+  load runs, so client timeouts do not fire. A load that fails mid-stream
+  ends the stream with an error event.
+- `--jit-models A,B` limits the switchable models to that list.
+- Every other `mtplx serve` flag (`--depth`, `--profile`, `--cache-dir`,
+  `--model-search-dir`, ...) is passed to each model's server. `--model`,
+  if given, is only the model that model-less requests load.
+- `--api-key` and `--api-key-file` are checked by the router. The model
+  servers behind it listen on 127.0.0.1 on a random port.
+- `/health` reports the loaded server's fields with a `jit` block;
+  `/metrics` and `/admin/*` go to the loaded model and return 503 until
+  one is loaded.
+
+A swap takes as long as loading the model (tens of seconds for a 20 GB pack),
+and alternating models on every request reloads each time, so switch between
+sessions rather than between turns.
+
+### Hermes
+
+Point Hermes at the router and change `model.default` in
+`~/.hermes/config.yaml` to switch:
+
+```yaml
+model:
+  default: "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed"
+  # or: "Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Balance"
+  provider: custom
+  base_url: "http://127.0.0.1:8000/v1"
+  api_key: "mtplx-local"
+  api_mode: chat_completions
+  default_headers:
+    x-mtplx-client: hermes
+```
+
 ## n-gram table pre-read (`--ngram-prewarm`, on by default)
 
 Models with a streamed n-gram sidecar (the Qwen 3.8 Flash-Next family) keep a
