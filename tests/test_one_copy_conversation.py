@@ -368,6 +368,26 @@ def test_a_boundary_restore_rewinds_an_advanced_lease(monkeypatch):
     assert mtp_cache[0].offset == 39 - (40 - 24)
 
 
+def test_the_answer_lease_keeps_the_prompt_logits_for_an_identical_retry(monkeypatch):
+    monkeypatch.delenv("MTPLX_ONE_COPY", raising=False)
+    bank = SessionBank(max_bytes=1 << 30, per_session_max_bytes=1 << 30)
+    trunk, mtp = _conversation(40, 64)
+    prompt = list(range(40))
+    prompt_entry = _prompt_lease(bank, trunk, mtp, prompt)
+    _advance(trunk, mtp, 6)
+    answer = bank.put(
+        runtime=RUNTIME, token_ids=prompt + list(range(100, 106)), cache=trunk,
+        logits=mx.zeros((1, 16)), hidden=mx.ones((1, 1, 8)), keep_live_ref=True,
+        session_id="s", mtp_history_cache_ref=mtp, snapshot_epoch=46, mtp_snapshot_epoch=46,
+    )
+    assert len(bank) == 1
+    position, logits = answer.boundary_logits
+    assert position == 40 and logits is prompt_entry.logits
+    served = bank.restore_entry_prefix_cache(RUNTIME, answer, 40, mode="reference")
+    _cache, _mtp, _mode, restore_point, _hidden = served
+    assert restore_point == 40 and trunk[1].offset == 40
+
+
 def test_the_spill_skips_a_lease_the_answer_ran_past(monkeypatch):
     monkeypatch.delenv("MTPLX_ONE_COPY", raising=False)
     bank = SessionBank(max_bytes=1 << 30, per_session_max_bytes=1 << 30)

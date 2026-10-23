@@ -5397,10 +5397,13 @@ def _restore_near_prefix_prompt_state(
                 pass
             suffix = list(prompt_ids[restore_point:])
             if boundary_restore and not suffix:
-                # A boundary restore has no seed logits; decode cannot start from
-                # an empty suffix. (Only reachable when a boundary coincides with
-                # a fully-contained prompt — fall through to other candidates.)
-                continue
+                boundary_logits = getattr(entry, "boundary_logits", None)
+                if boundary_logits is None or int(boundary_logits[0]) != restore_point:
+                    # A boundary restore has no seed logits; decode cannot start from
+                    # an empty suffix. (Only reachable when a boundary coincides with
+                    # a fully-contained prompt — fall through to other candidates.)
+                    continue
+                logits = boundary_logits[1][:, None]
             inherited_boundaries = _inherited_gdn_boundaries(
                 entry,
                 restore_point,
@@ -10998,7 +11001,7 @@ def generate_mtpk(
             # cancelled answer leaves the conversation where it was.
             or (
                 one_copy_runtime(rt)
-                and str(prompt_state.restore_mode) == "reference_lease"
+                and str(prompt_state.restore_mode).endswith("reference_lease")
             )
         )
     ):

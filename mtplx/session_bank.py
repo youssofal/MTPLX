@@ -853,6 +853,7 @@ class SessionBankEntry:
     # A lease a stopped prefill gave back (return_lease): it has no logits for
     # its last position, so it serves only prompts that extend it.
     extension_only: bool = False
+    boundary_logits: tuple[int, Any] | None = None
     # Passive probe: monotonic time this ENTRY OBJECT's cold-tier encode
     # completed (the encode evals the entry's lazy roots in place), or None.
     # Kept on the exact object — Site A and Site B can create distinct
@@ -3701,6 +3702,15 @@ class SessionBank:
             and entry.session_id == session_id
         ]
         for entry in stale:
+            if (
+                newest.live_ref_only
+                and entry.cache_ref is newest.cache_ref
+                and entry.logits is not None
+                and newest.token_ids[: entry.prefix_len] == entry.token_ids
+                and any(int(r[0]) == entry.prefix_len for r in newest.gdn_boundaries)
+            ):
+                newest.boundary_logits = (entry.prefix_len, entry.logits)
+                newest.lease_aux_nbytes += _tree_nbytes(entry.logits)
             self._evict_entry(entry, reason="superseded_session_lease")
 
     def _supersede_contained_prefixes(self, tokens: tuple[int, ...]) -> None:

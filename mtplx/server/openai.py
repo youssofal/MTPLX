@@ -27977,7 +27977,7 @@ def _store_generation_final_history_snapshot(
         put_kwargs: dict[str, Any] = dict(
             runtime=state.runtime,
             token_ids=token_ids,
-            keep_live_ref=bool(keep_live_ref),
+            keep_live_ref=bool(keep_live_ref) or one_copy_runtime(state.runtime),
             session_id=session_id,
             template_hash=state.template_hash,
             draft_head_identity=state.draft_head_identity,
