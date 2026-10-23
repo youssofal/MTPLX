@@ -9623,6 +9623,20 @@ def cmd_serve_public(args: Any) -> int:
                 f"try: mtplx {server_command} --host 0.0.0.0 --api-key-file ~/.mtplx/api-key"
             )
         return 2
+    if getattr(args, "jit", False):
+        if dry_run:
+            _print_serve_start_line("error: --jit cannot be combined with --dry-run")
+            return 2
+        if _port_is_busy(
+            str(getattr(args, "host", "127.0.0.1")), int(getattr(args, "port", 8000))
+        ):
+            _print_serve_start_line(
+                f"error: port {getattr(args, 'port', 8000)} is already in use"
+            )
+            return 2
+        from mtplx.server.jit_router import run_jit_router
+
+        return run_jit_router(args, list(getattr(args, "_raw_argv", None) or []))
     cli_flags = getattr(args, "_cli_flags", set()) or set()
     _apply_model_id_as_model_default(
         args,

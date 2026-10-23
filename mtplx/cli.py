@@ -3935,6 +3935,31 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Deprecated, no effect: MTPLX runs on stock PyPI MLX; no fork is required.",
     )
+    serve_p.add_argument(
+        "--jit",
+        action="store_true",
+        help=(
+            "Load models on demand: serve the installed models and start the "
+            "one a request names in its 'model' field, replacing the one "
+            "that was loaded. See docs/server.md."
+        ),
+    )
+    serve_p.add_argument(
+        "--jit-models",
+        metavar="MODEL[,MODEL...]",
+        help="With --jit, limit the switchable models to this list.",
+    )
+    serve_p.add_argument(
+        "--jit-idle-unload",
+        type=float,
+        default=0,
+        metavar="SECONDS",
+        help=(
+            "With --jit, stop the loaded model after this many idle seconds "
+            "to free its memory; the next request reloads it. Default 0 keeps "
+            "it loaded."
+        ),
+    )
     serve_p.set_defaults(func=cmd_serve_public)
 
     preflight_p = sub.add_parser(
@@ -5345,6 +5370,7 @@ def main(argv: list[str] | None = None) -> int:
     args._cli_flags = canonicalize_flag_tokens(
         _explicit_cli_flags(raw_args), parser, args
     )
+    args._raw_argv = raw_args
     from .config import apply_user_config
 
     try:
