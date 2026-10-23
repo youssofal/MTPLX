@@ -75,6 +75,9 @@ refused with a 503 before the loaded model is stopped.
   load runs, so client timeouts do not fire. A load that fails mid-stream
   ends the stream with an error event.
 - `--jit-models A,B` limits the switchable models to that list.
+- A loaded model stays loaded until another model is requested or the router
+  stops. `--jit-idle-unload SECONDS` also stops it after that long with no
+  request in flight, which frees its memory; the next request reloads it.
 - Every other `mtplx serve` flag (`--depth`, `--profile`, `--cache-dir`,
   `--model-search-dir`, ...) is passed to each model's server. `--model`,
   if given, is only the model that model-less requests load.

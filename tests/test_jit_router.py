@@ -233,6 +233,43 @@ def test_model_less_request_uses_loaded_model_else_asks(router, supervisor):
     assert status == 200 and body["served_by"] == "/m/beta"
 
 
+def test_idle_model_is_unloaded_and_reloaded_on_demand(fake_script, supervisor):
+    sup = ModelSupervisor(
+        raw_argv=["serve", "--jit"],
+        discover=_models,
+        spawn=supervisor._spawn,
+        ready_timeout_s=30.0,
+        stop_grace_s=5.0,
+        ram_gib=128.0,
+        idle_unload_s=0.6,
+    )
+    try:
+        model = sup.resolve("Org/Alpha")
+        sup.acquire(model)
+        first = supervisor.spawned[-1]
+        time.sleep(1.2)
+        assert sup.current == model, "a request in flight keeps the model loaded"
+        sup.release()
+        deadline = time.monotonic() + 10
+        while sup.current is not None and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert sup.current is None and first.poll() is not None
+        sup.acquire(model)
+        assert sup.current == model and supervisor.spawned[-1] is not first
+        sup.release()
+    finally:
+        sup.shutdown()
+
+
+def test_idle_flag_is_not_forwarded_to_children():
+    argv = child_serve_argv(
+        ["serve", "--jit", "--jit-idle-unload", "300", "--depth", "3"],
+        model_ref="/m/a",
+        port=1,
+    )
+    assert "--jit-idle-unload" not in argv and "300" not in argv
+
+
 def test_streaming_request_gets_events_and_a_keepalive_while_loading(
     router, supervisor, monkeypatch
 ):

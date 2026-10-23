@@ -4206,6 +4206,17 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="MODEL[,MODEL...]",
         help="With --jit, limit the switchable models to this list.",
     )
+    serve_p.add_argument(
+        "--jit-idle-unload",
+        type=float,
+        default=0,
+        metavar="SECONDS",
+        help=(
+            "With --jit, stop the loaded model after this many idle seconds "
+            "to free its memory; the next request reloads it. Default 0 keeps "
+            "it loaded."
+        ),
+    )
     serve_p.set_defaults(func=cmd_serve_public)
 
     preflight_p = sub.add_parser(

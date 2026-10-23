@@ -8,7 +8,7 @@ All notable user-facing changes to MTPLX. The format is based on
 
 ### Added
 
-- **`mtplx serve --jit` loads models on demand.** A request's `model` field now picks which installed model serves it: the router starts that model's `mtplx serve`, waits for requests in flight and replaces the one that was loaded, so agents such as Hermes can switch between `Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed` and `Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Balance` by changing one config line. `/v1/models` lists the installed models and marks the loaded one. See [Server](docs/server.md#loading-models-on-demand---jit).
+- **`mtplx serve --jit` loads models on demand.** A request's `model` field now picks which installed model serves it: the router starts that model's `mtplx serve`, waits for requests in flight and replaces the one that was loaded, so agents such as Hermes can switch between `Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed` and `Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Balance` by changing one config line. `/v1/models` lists the installed models and marks the loaded one. `--jit-idle-unload SECONDS` stops an idle model to free its memory. See [Server](docs/server.md#loading-models-on-demand---jit).
 
 ## [2.13.3] - 2026-11-24
 

@@ -70,6 +70,7 @@ _JIT_STRIPPED_VALUE_FLAGS = frozenset(
         "--host",
         "--port",
         "--jit-models",
+        "--jit-idle-unload",
         "--api-key",
         "--api-key-file",
     }
@@ -217,6 +218,7 @@ class ModelSupervisor:
         ready_timeout_s: float = CHILD_READY_TIMEOUT_S,
         stop_grace_s: float = CHILD_STOP_GRACE_S,
         ram_gib: float | None = None,
+        idle_unload_s: float = 0.0,
     ) -> None:
         self._raw_argv = raw_argv
         self._discover = discover
@@ -235,6 +237,13 @@ class ModelSupervisor:
         # A swap in progress blocks new leases on the old model too, so a
         # steady stream of requests for it cannot starve the swap.
         self._swapping_to: str | None = None
+        self._idle_unload_s = max(0.0, float(idle_unload_s))
+        self._last_active = time.monotonic()
+        self._reaper_stop = threading.Event()
+        if self._idle_unload_s > 0:
+            threading.Thread(
+                target=self._reap_idle, name="mtplx-jit-reaper", daemon=True
+            ).start()
 
     # -- model resolution -------------------------------------------------
 
@@ -334,6 +343,7 @@ class ModelSupervisor:
     def release(self) -> None:
         with self._cond:
             self._leases = max(0, self._leases - 1)
+            self._last_active = time.monotonic()
             self._cond.notify_all()
 
     # -- swap -------------------------------------------------------------
@@ -352,6 +362,7 @@ class ModelSupervisor:
             raise
         with self._cond:
             self._proc, self._port, self._current = proc, port, model
+            self._last_active = time.monotonic()
         print(f"[mtplx-jit] {model.model_id} ready", file=sys.stderr, flush=True)
 
     def _check_fits(self, model: JitModel) -> None:
@@ -406,6 +417,33 @@ class ModelSupervisor:
                 next_tick = time.monotonic() + KEEPALIVE_INTERVAL_S
             time.sleep(0.5)
 
+    def _reap_idle(self) -> None:
+        interval = min(5.0, max(0.05, self._idle_unload_s / 4))
+        while not self._reaper_stop.wait(interval):
+            with self._cond:
+                if (
+                    not self._alive()
+                    or self._leases
+                    or self._swapping_to is not None
+                    or time.monotonic() - self._last_active < self._idle_unload_s
+                ):
+                    continue
+                # Claim the swap slot so a request arriving mid-stop waits
+                # for the unload, then loads the model afresh.
+                self._swapping_to = "<idle-unload>"
+                name = self._current.model_id if self._current else "model"
+            print(
+                f"[mtplx-jit] unloading {name} after {self._idle_unload_s:.0f}s idle",
+                file=sys.stderr,
+                flush=True,
+            )
+            try:
+                self._stop_child()
+            finally:
+                with self._cond:
+                    self._swapping_to = None
+                    self._cond.notify_all()
+
     def _stop_child(self) -> None:
         with self._cond:
             proc, self._proc, self._port, self._current = self._proc, None, None, None
@@ -435,6 +473,7 @@ class ModelSupervisor:
                 pass
 
     def shutdown(self) -> None:
+        self._reaper_stop.set()
         self._stop_child()
 
 
@@ -732,6 +771,7 @@ def run_jit_router(args: Any, raw_argv: list[str]) -> int:
             cache_dir=cache_dir, search_dirs=search_dirs, allow=allow or None
         ),
         default_ref=default_ref,
+        idle_unload_s=float(getattr(args, "jit_idle_unload", 0) or 0),
     )
     server = ThreadingHTTPServer((host, port), make_handler(supervisor, api_key=api_key))
     server.daemon_threads = True
