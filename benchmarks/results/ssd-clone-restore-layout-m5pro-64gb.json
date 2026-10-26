@@ -1,0 +1,552 @@
+{
+  "environment": {
+    "date": "2026-10-24T09:16:53-07:00 to 2026-10-24T09:35:46-07:00",
+    "hardware": {
+      "model": "Mac17,8",
+      "chip": "Apple M5 Pro",
+      "memory_bytes": 68719476736
+    },
+    "os": "macOS 26.4.1",
+    "model": {
+      "path_name": "Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed",
+      "repo_id": "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed",
+      "revision": "1d5087d2062c02b279180a53e4016cf9cd7a3d7e",
+      "quantization": {
+        "bits": 4,
+        "group_size": 32,
+        "note": "dynamic: embeddings, lm_head, GDN out_proj and last 8 MLP blocks at 8-bit"
+      }
+    },
+    "sampler": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 20,
+      "thinking": "off"
+    },
+    "profile": {
+      "installed": "turbo",
+      "checkout": "turbo"
+    },
+    "fan_mode": "smart",
+    "fan_mode_note": "Smart fans boost only while a request generates. Thermal pressure stayed nominal for every turn.",
+    "reasoning_effort": "medium",
+    "user_turn_tokens": [
+      56012,
+      6034,
+      6035,
+      6034,
+      6035
+    ],
+    "arms": {
+      "installed": {
+        "session_bank": "<MTPLX app runtime>/site-packages/mtplx/session_bank.py",
+        "version": "2.12.2"
+      },
+      "checkout": {
+        "session_bank": "<checkout>/mtplx/session_bank.py",
+        "version": "2.12.2",
+        "note": "v2.12.2 plus this PR's mtplx/session_bank.py change"
+      }
+    },
+    "checkout_commit": "9882703f (v2.12.2) with this PR's session_bank.py change applied, uncommitted at run time",
+    "harness": "an earlier revision of benchmarks/repro_ssd_clone_restore_layout.py with identical serve flags, prompts and turn plan",
+    "serve_flags": [
+      "--host",
+      "127.0.0.1",
+      "--model",
+      "Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed",
+      "--scheduler-mode",
+      "ar_batch",
+      "--batching-preset",
+      "agent",
+      "--max-active-requests",
+      "4",
+      "--decode-batch-max",
+      "4",
+      "--batch-wait-ms",
+      "50.0",
+      "--depth",
+      "3",
+      "--ssd-session-cache",
+      "on",
+      "--ssd-session-cache-max-size",
+      "auto",
+      "--ssd-session-cache-min-prefix-tokens",
+      "512",
+      "--context-window",
+      "131072",
+      "--enable-thermal-poll",
+      "--fan-mode",
+      "smart",
+      "--unsafe-force-unverified",
+      "--yes",
+      "--reasoning",
+      "auto",
+      "--temperature",
+      "1.0",
+      "--top-p",
+      "0.95",
+      "--top-k",
+      "20",
+      "--reasoning-effort",
+      "medium",
+      "--adaptive-policy",
+      "expected_value",
+      "--no-stats-footer"
+    ]
+  },
+  "turns": [
+    {
+      "arm": "installed",
+      "turn": "A1",
+      "expect": "cold",
+      "wall_s": 157.5,
+      "receipt": {
+        "request_id": "chatcmpl-7c6ddf32b72b4e9aa9f5de3c14fcee6b",
+        "prompt_tokens": 56044,
+        "cached_tokens": 0,
+        "new_prefill_tokens": 56044,
+        "completion_tokens": 256,
+        "cache_source": "none",
+        "session_restore_mode": "cold",
+        "cache_miss_reason": "ssd_prefix_miss",
+        "ssd_restore_s": 0.0,
+        "cache_restore_time_s": 0.0,
+        "prompt_eval_time_s": 144.53888683900004,
+        "prefill_compute_tok_s": 387.74340404618357,
+        "ttft_s": 145.37018841600366,
+        "decode_tok_s": 21.707673418685822,
+        "decode_elapsed_s": 11.793064832992968,
+        "paged_kv_num_blocks": 0,
+        "paged_kv_capacity_tokens": 0,
+        "thermal_pressure_max": "nominal",
+        "active_memory_bytes": 29847397466,
+        "accepted_by_depth": [
+          70,
+          48,
+          37
+        ],
+        "drafted_by_depth": [
+          98,
+          98,
+          97
+        ],
+        "context_copy_accepted_tokens": 0,
+        "effective_temperature": 1.0,
+        "effective_top_p": 0.95,
+        "effective_top_k": 20,
+        "compiled_verify_calls": 98,
+        "compiled_verify_compiled": 98,
+        "compiled_verify_fallback_reasons": {}
+      }
+    },
+    {
+      "arm": "installed",
+      "turn": "A2",
+      "expect": "ssd_clone",
+      "wall_s": 176.1,
+      "receipt": {
+        "request_id": "chatcmpl-607c1343b1c94658a4f741ef92a93e9b",
+        "prompt_tokens": 62347,
+        "cached_tokens": 56300,
+        "new_prefill_tokens": 6047,
+        "completion_tokens": 768,
+        "cache_source": "ssd",
+        "session_restore_mode": "ssd_clone",
+        "cache_miss_reason": null,
+        "ssd_restore_s": 1.255633166001644,
+        "cache_restore_time_s": 1.4098523749999003,
+        "prompt_eval_time_s": 120.61278041699552,
+        "prefill_compute_tok_s": 50.13564880184056,
+        "ttft_s": 124.68861054200534,
+        "decode_tok_s": 15.006005736443095,
+        "decode_elapsed_s": 51.17950862399448,
+        "paged_kv_num_blocks": 3953,
+        "paged_kv_capacity_tokens": 63248,
+        "thermal_pressure_max": "nominal",
+        "active_memory_bytes": 30213478118,
+        "accepted_by_depth": [
+          218,
+          155,
+          111
+        ],
+        "drafted_by_depth": [
+          276,
+          276,
+          267
+        ],
+        "context_copy_accepted_tokens": 3,
+        "effective_temperature": 1.0,
+        "effective_top_p": 0.95,
+        "effective_top_k": 20,
+        "compiled_verify_calls": 276,
+        "compiled_verify_compiled": 0,
+        "compiled_verify_fallback_reasons": {
+          "context_above_threshold": 276
+        }
+      }
+    },
+    {
+      "arm": "installed",
+      "turn": "A3",
+      "expect": "RAM control",
+      "wall_s": 54.8,
+      "receipt": {
+        "request_id": "chatcmpl-c8ec825f5fa640e3ac0aa576a281ef0a",
+        "prompt_tokens": 69163,
+        "cached_tokens": 63115,
+        "new_prefill_tokens": 6048,
+        "completion_tokens": 768,
+        "cache_source": "ram",
+        "session_restore_mode": "clone",
+        "cache_miss_reason": null,
+        "ssd_restore_s": 0.0,
+        "cache_restore_time_s": 0.003915374996722676,
+        "prompt_eval_time_s": 21.396399581994046,
+        "prefill_compute_tok_s": 282.6643789682093,
+        "ttft_s": 21.532173250001506,
+        "decode_tok_s": 23.190372550755384,
+        "decode_elapsed_s": 33.11719112399442,
+        "paged_kv_num_blocks": 0,
+        "paged_kv_capacity_tokens": 0,
+        "thermal_pressure_max": "nominal",
+        "active_memory_bytes": 31728116696,
+        "accepted_by_depth": [
+          208,
+          158,
+          118
+        ],
+        "drafted_by_depth": [
+          250,
+          250,
+          250
+        ],
+        "context_copy_accepted_tokens": 22,
+        "effective_temperature": 1.0,
+        "effective_top_p": 0.95,
+        "effective_top_k": 20,
+        "compiled_verify_calls": 250,
+        "compiled_verify_compiled": 241,
+        "compiled_verify_fallback_reasons": {
+          "growth_budget_exhausted": 1
+        }
+      }
+    },
+    {
+      "arm": "installed",
+      "turn": "A4",
+      "expect": "ssd_clone",
+      "wall_s": 186.2,
+      "receipt": {
+        "request_id": "chatcmpl-0b9af9b9ae964c17b0902ac5d7ef1953",
+        "prompt_tokens": 75978,
+        "cached_tokens": 69931,
+        "new_prefill_tokens": 6047,
+        "completion_tokens": 506,
+        "cache_source": "ssd",
+        "session_restore_mode": "ssd_clone",
+        "cache_miss_reason": null,
+        "ssd_restore_s": 1.6522461249987828,
+        "cache_restore_time_s": 1.8246932500042021,
+        "prompt_eval_time_s": 145.419318459004,
+        "prefill_compute_tok_s": 41.583195851002046,
+        "ttft_s": 150.30134779200307,
+        "decode_tok_s": 14.3157547370533,
+        "decode_elapsed_s": 35.34567400001106,
+        "paged_kv_num_blocks": 4805,
+        "paged_kv_capacity_tokens": 76880,
+        "thermal_pressure_max": "nominal",
+        "active_memory_bytes": 32107414022,
+        "accepted_by_depth": [
+          138,
+          107,
+          73
+        ],
+        "drafted_by_depth": [
+          164,
+          164,
+          160
+        ],
+        "context_copy_accepted_tokens": 17,
+        "effective_temperature": 1.0,
+        "effective_top_p": 0.95,
+        "effective_top_k": 20,
+        "compiled_verify_calls": 164,
+        "compiled_verify_compiled": 0,
+        "compiled_verify_fallback_reasons": {
+          "context_above_threshold": 164
+        }
+      }
+    },
+    {
+      "arm": "installed",
+      "turn": "A5",
+      "expect": "RAM control",
+      "wall_s": 29.6,
+      "receipt": {
+        "request_id": "chatcmpl-95c48d91ea274dfeb3c41b27ffb5ffc2",
+        "prompt_tokens": 82531,
+        "cached_tokens": 76484,
+        "new_prefill_tokens": 6047,
+        "completion_tokens": 137,
+        "cache_source": "ram",
+        "session_restore_mode": "clone",
+        "cache_miss_reason": null,
+        "ssd_restore_s": 0.0,
+        "cache_restore_time_s": 0.0043727919983211905,
+        "prompt_eval_time_s": 22.70634733400948,
+        "prefill_compute_tok_s": 266.31319917064894,
+        "ttft_s": 22.891106625000248,
+        "decode_tok_s": 21.15238026241913,
+        "decode_elapsed_s": 6.476812458000495,
+        "paged_kv_num_blocks": 0,
+        "paged_kv_capacity_tokens": 0,
+        "thermal_pressure_max": "nominal",
+        "active_memory_bytes": 27658649122,
+        "accepted_by_depth": [
+          41,
+          27,
+          17
+        ],
+        "drafted_by_depth": [
+          47,
+          47,
+          46
+        ],
+        "context_copy_accepted_tokens": 2,
+        "effective_temperature": 1.0,
+        "effective_top_p": 0.95,
+        "effective_top_k": 20,
+        "compiled_verify_calls": 47,
+        "compiled_verify_compiled": 47,
+        "compiled_verify_fallback_reasons": {}
+      }
+    },
+    {
+      "arm": "checkout",
+      "turn": "A1",
+      "expect": "cold",
+      "wall_s": 154.2,
+      "receipt": {
+        "request_id": "chatcmpl-d6a8b884404648b8a097292802ef83e4",
+        "prompt_tokens": 56044,
+        "cached_tokens": 0,
+        "new_prefill_tokens": 56044,
+        "completion_tokens": 256,
+        "cache_source": "none",
+        "session_restore_mode": "cold",
+        "cache_miss_reason": "ssd_prefix_miss",
+        "ssd_restore_s": 0.0,
+        "cache_restore_time_s": 0.0,
+        "prompt_eval_time_s": 142.5062773780155,
+        "prefill_compute_tok_s": 393.2739036564429,
+        "ttft_s": 142.81818075000047,
+        "decode_tok_s": 22.89985799498048,
+        "decode_elapsed_s": 11.179108623997308,
+        "paged_kv_num_blocks": 0,
+        "paged_kv_capacity_tokens": 0,
+        "thermal_pressure_max": "nominal",
+        "active_memory_bytes": 29847714824,
+        "accepted_by_depth": [
+          71,
+          51,
+          38
+        ],
+        "drafted_by_depth": [
+          92,
+          92,
+          92
+        ],
+        "context_copy_accepted_tokens": 1,
+        "effective_temperature": 1.0,
+        "effective_top_p": 0.95,
+        "effective_top_k": 20,
+        "compiled_verify_calls": 92,
+        "compiled_verify_compiled": 92,
+        "compiled_verify_fallback_reasons": {}
+      }
+    },
+    {
+      "arm": "checkout",
+      "turn": "A2",
+      "expect": "ssd_clone",
+      "wall_s": 56.2,
+      "receipt": {
+        "request_id": "chatcmpl-4bd17128d587453ba1a762536b0d7ddb",
+        "prompt_tokens": 62347,
+        "cached_tokens": 56300,
+        "new_prefill_tokens": 6047,
+        "completion_tokens": 768,
+        "cache_source": "ssd",
+        "session_restore_mode": "ssd_clone",
+        "cache_miss_reason": null,
+        "ssd_restore_s": 0.9887645830021938,
+        "cache_restore_time_s": 0.9966276250052033,
+        "prompt_eval_time_s": 19.945170667997445,
+        "prefill_compute_tok_s": 303.18116102674276,
+        "ttft_s": 23.442938791005872,
+        "decode_tok_s": 23.72090700525223,
+        "decode_elapsed_s": 32.37650229099381,
+        "paged_kv_num_blocks": 0,
+        "paged_kv_capacity_tokens": 0,
+        "thermal_pressure_max": "nominal",
+        "active_memory_bytes": 30158280794,
+        "accepted_by_depth": [
+          223,
+          167,
+          99
+        ],
+        "drafted_by_depth": [
+          278,
+          277,
+          244
+        ],
+        "context_copy_accepted_tokens": 0,
+        "effective_temperature": 1.0,
+        "effective_top_p": 0.95,
+        "effective_top_k": 20,
+        "compiled_verify_calls": 278,
+        "compiled_verify_compiled": 231,
+        "compiled_verify_fallback_reasons": {
+          "growth_budget_exhausted": 1
+        }
+      }
+    },
+    {
+      "arm": "checkout",
+      "turn": "A3",
+      "expect": "RAM control",
+      "wall_s": 53.5,
+      "receipt": {
+        "request_id": "chatcmpl-bb9cec1f64f34ddc84c305f15b916ad2",
+        "prompt_tokens": 69163,
+        "cached_tokens": 63115,
+        "new_prefill_tokens": 6048,
+        "completion_tokens": 768,
+        "cache_source": "ram",
+        "session_restore_mode": "clone",
+        "cache_miss_reason": null,
+        "ssd_restore_s": 0.0,
+        "cache_restore_time_s": 0.004984291997971013,
+        "prompt_eval_time_s": 21.018159750012273,
+        "prefill_compute_tok_s": 287.7511671780146,
+        "ttft_s": 21.1826134169969,
+        "decode_tok_s": 23.847711278377588,
+        "decode_elapsed_s": 32.20434829300939,
+        "paged_kv_num_blocks": 0,
+        "paged_kv_capacity_tokens": 0,
+        "thermal_pressure_max": "nominal",
+        "active_memory_bytes": 31730318750,
+        "accepted_by_depth": [
+          211,
+          159,
+          122
+        ],
+        "drafted_by_depth": [
+          257,
+          256,
+          243
+        ],
+        "context_copy_accepted_tokens": 12,
+        "effective_temperature": 1.0,
+        "effective_top_p": 0.95,
+        "effective_top_k": 20,
+        "compiled_verify_calls": 257,
+        "compiled_verify_compiled": 242,
+        "compiled_verify_fallback_reasons": {
+          "growth_budget_exhausted": 1
+        }
+      }
+    },
+    {
+      "arm": "checkout",
+      "turn": "A4",
+      "expect": "ssd_clone",
+      "wall_s": 59.7,
+      "receipt": {
+        "request_id": "chatcmpl-65eb8c810a4a491788b2d82d03d4aa65",
+        "prompt_tokens": 75978,
+        "cached_tokens": 69931,
+        "new_prefill_tokens": 6047,
+        "completion_tokens": 768,
+        "cache_source": "ssd",
+        "session_restore_mode": "ssd_clone",
+        "cache_miss_reason": null,
+        "ssd_restore_s": 0.8390643749953597,
+        "cache_restore_time_s": 0.8486974589977763,
+        "prompt_eval_time_s": 21.784833876008634,
+        "prefill_compute_tok_s": 277.57843068335194,
+        "ttft_s": 24.771484750002855,
+        "decode_tok_s": 22.25796121871393,
+        "decode_elapsed_s": 34.50450795800134,
+        "paged_kv_num_blocks": 0,
+        "paged_kv_capacity_tokens": 0,
+        "thermal_pressure_max": "nominal",
+        "active_memory_bytes": 32054337966,
+        "accepted_by_depth": [
+          212,
+          159,
+          114
+        ],
+        "drafted_by_depth": [
+          271,
+          271,
+          267
+        ],
+        "context_copy_accepted_tokens": 6,
+        "effective_temperature": 1.0,
+        "effective_top_p": 0.95,
+        "effective_top_k": 20,
+        "compiled_verify_calls": 271,
+        "compiled_verify_compiled": 203,
+        "compiled_verify_fallback_reasons": {
+          "growth_budget_exhausted": 1
+        }
+      }
+    },
+    {
+      "arm": "checkout",
+      "turn": "A5",
+      "expect": "RAM control",
+      "wall_s": 39.6,
+      "receipt": {
+        "request_id": "chatcmpl-eeb2dfd851d14b0484ae7ca833113c46",
+        "prompt_tokens": 82794,
+        "cached_tokens": 76746,
+        "new_prefill_tokens": 6048,
+        "completion_tokens": 378,
+        "cache_source": "ram",
+        "session_restore_mode": "clone",
+        "cache_miss_reason": null,
+        "ssd_restore_s": 0.0,
+        "cache_restore_time_s": 0.004692499998782296,
+        "prompt_eval_time_s": 22.754981333004253,
+        "prefill_compute_tok_s": 265.78795699682104,
+        "ttft_s": 22.938273333995312,
+        "decode_tok_s": 23.02255992164279,
+        "decode_elapsed_s": 16.418678082998667,
+        "paged_kv_num_blocks": 0,
+        "paged_kv_capacity_tokens": 0,
+        "thermal_pressure_max": "nominal",
+        "active_memory_bytes": 27677394296,
+        "accepted_by_depth": [
+          100,
+          84,
+          60
+        ],
+        "drafted_by_depth": [
+          119,
+          119,
+          119
+        ],
+        "context_copy_accepted_tokens": 8,
+        "effective_temperature": 1.0,
+        "effective_top_p": 0.95,
+        "effective_top_k": 20,
+        "compiled_verify_calls": 119,
+        "compiled_verify_compiled": 119,
+        "compiled_verify_fallback_reasons": {}
+      }
+    }
+  ]
+}

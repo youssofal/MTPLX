@@ -2361,6 +2361,8 @@ class SessionBank:
                 draft_head_identity=draft_head_identity,
                 policy_fingerprint=policy_fingerprint,
                 ram_refusal=ram_refusal,
+                cache_factory=cache_factory,
+                mtp_cache_factory=mtp_cache_factory,
             )
 
         entry = self.longest_prefix(token_ids)
@@ -3419,6 +3421,8 @@ class SessionBank:
         draft_head_identity: str | None,
         policy_fingerprint: str | None,
         ram_refusal: dict[str, Any] | None = None,
+        cache_factory: Callable[[], list[Any]] | None = None,
+        mtp_cache_factory: Callable[[], list[Any]] | None = None,
     ) -> SessionBankRestore | None:
         # ram_refusal: restore() refused this lookup's longest RAM prefix
         # (ram_miss_reason, ram_refused_prefix_len, ram_refused_session_id).
@@ -3519,14 +3523,31 @@ class SessionBank:
         ):
             self.last_miss_reason = CacheMissReason.SNAPSHOT_DESYNC.value
             return None
-        cache = runtime.make_cache()
-        restore_cache(cache, entry.cache_snapshot)
+        # Build the restored caches the way the RAM clone lane does: through
+        # the caller's factory when it passes one. generation passes the
+        # contiguous target-prefill layout here and repages after the suffix
+        # prefill. runtime.make_cache() installs the tail-owned decode layout
+        # (vLLM-Metal paged attention under turbo), so an exact-prefix SSD
+        # restore that ignored the factory ran its suffix prefill and the
+        # whole decode on the paged layout, with compiled verify falling back
+        # on every call: 27-46 tok/s prefill and about half-speed decode
+        # against 210-270 tok/s on the other restore lanes.
+        cache = cache_factory() if cache_factory is not None else runtime.make_cache()
+        restore_cache(
+            cache,
+            entry.cache_snapshot,
+            restore_meta_state=cache_factory is None,
+        )
         # Read back from disk, the entry's floor is its restored caches'.
         entry.restore_floor_tokens = _cache_restore_floor(cache)
         entry.window_nbytes = _cache_window_nbytes(cache)
         mtp_history_cache = None
         if entry.mtp_history_snapshot is not None:
-            mtp_history_cache = runtime.make_mtp_cache()
+            mtp_history_cache = (
+                mtp_cache_factory()
+                if mtp_cache_factory is not None
+                else runtime.make_mtp_cache()
+            )
             restore_cache(mtp_history_cache, entry.mtp_history_snapshot)
         entry.hits += 1
         entry.last_access_s = time.time()
