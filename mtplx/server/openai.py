@@ -69,7 +69,7 @@ from fastapi.responses import (
     Response,
     StreamingResponse,
 )
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, PrivateAttr
 
 from mtplx import progress_heartbeat
 from mtplx.a3b_mtp_batch import (
@@ -1780,6 +1780,14 @@ class ChatMessage(BaseModel):
 
 class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
+
+    # Set by the Anthropic conversion only. Pydantic does not read a private
+    # attribute from client JSON, so a body field of the same name is ignored.
+    _auto_mode_classifier: bool = PrivateAttr(default=False)
+
+    @property
+    def auto_mode_classifier(self) -> bool:
+        return self._auto_mode_classifier
 
     model: str | None = None
     messages: list[ChatMessage] = Field(default_factory=list)
@@ -6645,6 +6653,15 @@ def _anthropic_to_chat_request(
         # own bridges but record the defaulting for observability instead of
         # rejecting (a 400 here would break those bridges).
         chat_request.anthropic_max_tokens_defaulted = True
+    # Claude Code's auto-mode safety classifier: a tool-free, non-streaming
+    # request whose system prompt names the monitor role. The policy turns
+    # thinking off for it, because it needs only a verdict.
+    chat_request._auto_mode_classifier = (
+        not request.tools
+        and not request.stream
+        and "you are a security monitor for autonomous ai coding agents"
+        in system_text.lower()
+    )
     return chat_request
 
 

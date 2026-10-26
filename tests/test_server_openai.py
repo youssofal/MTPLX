@@ -11741,6 +11741,96 @@ def test_anthropic_messages_returns_tool_use_nonstream(monkeypatch):
     assert "<tool_call" not in response.text
 
 
+def test_anthropic_auto_mode_classifier_request_runs_with_thinking_off(monkeypatch):
+    # Issue #1: Claude Code's safety classifier only needs a verdict, so its
+    # request runs with thinking off. A normal turn keeps the default.
+    state = _fake_state()
+    state.runtime.tokenizer = CaptureTokenizer()
+    state.args.stats_footer = False
+    state.args.reasoning_parser = "qwen3"
+    client = TestClient(create_app(state))
+    seen: list[dict[str, object]] = []
+
+    def fake_run_generation(*_args, **kwargs):
+        seen.append(dict(kwargs["request_observability"]))
+        return _fake_generation("ok")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+    user = [{"role": "user", "content": "Is `rm -rf build` safe?"}]
+
+    # A short max_tokens with a foreign system prompt reads as a background
+    # title job, which is a different path. Keep both requests above it.
+    classifier = client.post(
+        "/v1/messages",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "model": "mtplx-test-model",
+            "max_tokens": 256,
+            "system": (
+                "You are a security monitor for autonomous AI coding agents."
+            ),
+            "messages": user,
+        },
+    )
+    normal = client.post(
+        "/v1/messages",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "model": "mtplx-test-model",
+            "max_tokens": 256,
+            "system": "You are a helpful coding assistant.",
+            "messages": user,
+        },
+    )
+
+    assert classifier.status_code == 200
+    assert normal.status_code == 200
+    classifier_stats, normal_stats = seen
+    assert classifier_stats["request_enable_thinking"] is False
+    assert normal_stats["request_enable_thinking"] is True
+
+
+@pytest.mark.parametrize("body_key", ["auto_mode_classifier", "_auto_mode_classifier"])
+def test_client_cannot_set_auto_mode_classifier_flag_on_chat_completions(
+    monkeypatch, body_key
+):
+    # The flag comes from the Anthropic conversion only. A chat body field of
+    # either name must leave thinking on, whatever its value.
+    state = _fake_state()
+    state.runtime.tokenizer = CaptureTokenizer()
+    state.args.stats_footer = False
+    state.args.reasoning_parser = "qwen3"
+    client = TestClient(create_app(state))
+    seen: dict[str, object] = {}
+
+    def fake_run_generation(*_args, **kwargs):
+        seen["request_observability"] = dict(kwargs["request_observability"])
+        return _fake_generation("ok")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "model": "mtplx-test-model",
+            "max_tokens": 256,
+            body_key: True,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a security monitor for autonomous AI coding agents.",
+                },
+                {"role": "user", "content": "Is `rm -rf build` safe?"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    stats = seen["request_observability"]
+    assert stats["request_enable_thinking"] is True
+
+
 def test_anthropic_messages_streams_tool_use_without_text_leak(monkeypatch):
     client = TestClient(create_app(_fake_state()))
     monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])

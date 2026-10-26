@@ -681,6 +681,9 @@ def resolve_request_policy(
         request_effort=request.reasoning_effort,
         allow_client_controls=thinking_controls_allowed,
     )
+    # A classifier request needs only a verdict, so it runs with thinking off.
+    if chat and request.auto_mode_classifier:
+        thinking_enabled, reasoning_effort = False, None
     if (
         read_only_force_answer_contract_active
         and srv._reasoning_parser_for_state(state) == "gemma4"
