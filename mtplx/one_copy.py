@@ -34,6 +34,16 @@ from typing import Any
 _DISABLE_VALUES = {"0", "false", "no", "off"}
 
 
+class QSACutError(ValueError):
+    """Resizing a QSA layer to ``rows`` would cut rows it holds.
+
+    The layer's buffers hold more tokens than ``rows`` (a cache left by an
+    earlier, longer conversation): taking ``rows`` in place would discard
+    rows the layer holds. The resize refuses rather than cut them, and the
+    caller treats the cache as unusable for the request sizing to ``rows``.
+    """
+
+
 def one_copy_enabled() -> bool:
     """The one-copy conversation store (MTPLX_ONE_COPY, on unless set off)."""
 
@@ -149,6 +159,13 @@ def layers_to_resize(cache: Any, rows: int) -> int:
 
 
 def _pending_layers(cache: Any, rows: int) -> list[Any]:
+    """The QSA layers ``resize_qsa_buffers(cache, rows)`` would resize now.
+
+    A cut into rows a layer holds raises ``QSACutError`` (never silently
+    skipped): ``resize_qsa_buffers`` and ``layers_to_resize`` can therefore
+    never report "all resized" while any layer sits at the wrong rows.
+    """
+
     entries = _resizable(cache)
     if entries is None:
         raise ValueError("this cache has a QSA layer that cannot be resized in place")
@@ -163,7 +180,9 @@ def resize_bill(cache: Any, rows: int) -> int | None:
     of 147,456 rows, a 148,480-row bank) that is 0.38 GB, where the padded
     copy of the same bank was priced at 4.22 GB. None when a QSA layer of
     ``cache`` cannot be resized (a promoted bank, a missing buffer): the
-    promotion then copies, as it always did.
+    promotion then copies, as it always did. Raises ``QSACutError`` when the
+    resize would cut rows a layer holds — the cache is foreign to ``rows``
+    and must not be priced as a copy of it (see ``resize_cut_rows``).
     """
 
     entries = _resizable(cache)
@@ -215,9 +234,30 @@ def _resized_buffers(entry: Any, rows: int) -> list[tuple[str, Any, int, int]]:
         if int(buffer.shape[axis]) == target:
             continue
         if target < held:
-            raise ValueError(f"QSA {name} hold {held} rows; resizing to {target} would cut them")
+            raise QSACutError(f"QSA {name} hold {held} rows; resizing to {target} would cut them")
         resized.append((name, buffer, axis, target))
     return resized
+
+
+def resize_cut_rows(cache: Any, rows: int) -> bool:
+    """Whether resizing ``cache`` to ``rows`` rows would cut rows a layer holds.
+
+    The cut means a layer's buffers hold more tokens than ``rows``: the cache
+    belongs to an earlier, longer conversation, so it is foreign to a request
+    sizing its bank to ``rows`` and must not be attended or copied. The
+    admission prices this before any resize, and refuses the lane instead of
+    adopting, resizing, or copying a stale conversation.
+    """
+
+    entries = _resizable(cache)
+    if entries is None:
+        return False
+    for entry in entries:
+        try:
+            _resized_buffers(entry, rows)
+        except QSACutError:
+            return True
+    return False
 
 
 def _layer_bytes(entry: Any, rows: int) -> tuple[int, int]:

@@ -107,6 +107,7 @@ from .graphbank import (
 )
 from .native_mlp import set_native_mlp_context
 from .one_copy import (
+    QSACutError,
     hand_back_on_raise,
     held_qsa_rows,
     layers_to_resize,
@@ -117,6 +118,7 @@ from .one_copy import (
     prompt_lease_fields,
     qsa_buffers_short,
     resize_bill,
+    resize_cut_rows,
     resize_qsa_buffers,
 )
 from .mtp_history_cache_only import (
@@ -827,9 +829,20 @@ def _qwen4_fixed_m4_promotion_bill(
       bank, so every short turn would resize, and its banks are small.
     - ("copied", the whole padded bank, bank_rows): every other case, as
       before.
+    - ("refused", 0, 0): ``held_cache`` holds more tokens than ``bank_rows``
+      (an earlier, longer conversation still leased in the bank). Adopting,
+      resizing, or copying it would attend over the wrong conversation, so
+      the admission refuses the lane and the request verifies eagerly.
     """
 
     if held_cache is not None:
+        # A held cache whose rows exceed this prompt's bank is foreign: it
+        # belongs to an earlier, longer conversation. Never adopt, resize, or
+        # copy it into the bank — answering from it serves the wrong turn's
+        # state. The resize's cut predicate (one_copy.resize_cut_rows) is the
+        # exact signal: rows a layer holds it cannot shrink below.
+        if resize_cut_rows(held_cache, bank_rows):
+            return "refused", 0, 0
         rows = (
             _qwen4_fixed_m4_adoption_rows(rt, prompt_tokens, plan, bank_rows, held_rows)
             if held_rows is not None else None
@@ -922,6 +935,7 @@ def _qwen4_fixed_m4_resize_held(
     if rows <= 0:
         return True
     failure = None
+    cut = False
     try:
         left = resize_qsa_buffers(
             cache,
@@ -930,6 +944,12 @@ def _qwen4_fixed_m4_resize_held(
                 rt, need, session_bank=session_bank, protect_ids=protect_ids,
             ),
         )
+    except QSACutError as exc:
+        # The held cache turned out to hold a longer, foreign conversation
+        # than the admission priced (an admission/execution race): it is
+        # unusable for this request, and the layers' row counts are moot.
+        cut = True
+        failure = f"{type(exc).__name__}: {exc}"
     except Exception as exc:
         # The memory refusing a layer's new buffers while they are written
         # (an admission reads live bytes; it cannot promise the allocation)
@@ -945,6 +965,14 @@ def _qwen4_fixed_m4_resize_held(
         # back to the system.
         mx.synchronize()
         _mlx_release_allocator_cache()
+        if cut:
+            receipt.update(engaged=False, reason="held_cache_foreign", resize_error=failure)
+            _announce_qwen4_fixed_m4_skip(
+                f"the held cache holds a longer, foreign conversation than the "
+                f"{rows}-row bank it was priced for ({failure}): the request "
+                f"verifies eagerly"
+            )
+            return False
         left = layers_to_resize(cache, rows)
         receipt.update(
             engaged=False, reason="memory_gate", resize_layers_left=int(left),
@@ -1409,6 +1437,23 @@ def _qwen4_fixed_m4_lane_fits(
         promotion, need, resize_rows = _qwen4_fixed_m4_promotion_bill(
             rt, prompt_tokens, plan, bank_rows, held_cache, held_rows, per_token
         )
+    if promotion == "refused":
+        # The held cache belongs to an earlier, longer conversation than this
+        # prompt sizes for. Adopting, resizing, or copying it would attend
+        # over (and answer from) the wrong conversation: refuse the lane and
+        # let the request verify eagerly, which recomputes the right state.
+        if receipt is not None:
+            receipt.update(
+                promotion="refused",
+                held_rows=int(held_rows) if held_rows is not None else 0,
+                promotion_rows=int(bank_rows),
+            )
+        _announce_qwen4_fixed_m4_skip(
+            f"held cache holds {held_rows} rows, longer than this prompt's "
+            f"{bank_rows}-row bank: refusing the fixed-M4 lane rather than "
+            f"attending over a foreign conversation"
+        )
+        return False
     if promotion == "adopted":
         if receipt is not None:
             receipt.update(

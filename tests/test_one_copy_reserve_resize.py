@@ -553,11 +553,43 @@ def test_the_resize_allocates_its_bill_and_no_more():
 
 
 def test_a_resize_never_cuts_the_rows_a_layer_holds():
+    """A resize that would cut rows a layer holds refuses loudly and leaves
+    every buffer untouched — never a silent skip, never a copied stale cache."""
+
     entry = _layer(300, 512, seed=10)
     buffers = _buffers(entry)
-    with pytest.raises(ValueError, match="would cut them"):
+    # The resize refuses with the structured cut error (a ValueError, so the
+    # request can retry or fall back) and never cuts the held rows.
+    with pytest.raises(one_copy.QSACutError, match="would cut them"):
         resize_qsa_buffers([entry], 256)
+    # The bill is priced on the same refusal: it never reports None, which
+    # the admission used to read as "copy the stale cache".
+    with pytest.raises(one_copy.QSACutError, match="would cut them"):
+        resize_bill([entry], 256)
+    # The pending-layer count can never report "all resized" over a cut.
+    with pytest.raises(one_copy.QSACutError, match="would cut them"):
+        one_copy.layers_to_resize([entry], 256)
+    # The admission's own predicate sees the cut.
+    assert one_copy.resize_cut_rows([entry], 256) is True
+    assert one_copy.resize_cut_rows([entry], 512) is False
+    # Every buffer is untouched: no layer was cut, copied, or swapped.
     assert all(a is b for a, b in zip(_buffers(entry), buffers))
+
+
+def test_a_foreign_held_cache_refuses_the_lane_instead_of_copying(gather):
+    """A held cache longer than the prompt's bank is foreign: the admission
+    refuses the fixed-M4 lane rather than adopting, resizing, or copying it
+    (which would attend over, and answer from, the wrong conversation)."""
+
+    foreign = _flash_next_cache([_flash_next_layer(200_000, 200_000) for _ in range(12)])
+    assert held_qsa_rows(foreign) == 200_000
+    fits, receipt, plan, bank = _gate(gather, held_cache=foreign)
+    assert fits is False
+    assert receipt["promotion"] == "refused"
+    assert receipt["held_rows"] == 200_000
+    assert plan.resize_rows == 0  # nothing scheduled to resize
+    assert bank.reclaims == 0  # no idle session evicted for it
+    assert demotions.snapshot()["counts"]["fixed_m4_lane_skipped"] == 1
 
 
 # -- through generate_mtpk on the tiny Flash-Next pack ------------------------------
