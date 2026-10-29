@@ -20754,7 +20754,9 @@ class _PrefillSystemGuard:
         that are not generating (the admission's last step,
         ``EngineSessionManager.release_idle_sessions``: sessions already on
         SSD first, then the rest least recently used first; never a session
-        in flight, this request's included). Never raises."""
+        in flight, this request's included), then this request's own
+        entries it does not restore from. An entry whose SSD write is still
+        queued is written out first, as in the admission. Never raises."""
 
         receipt: dict[str, Any] = {
             "action": "prefill_shed_before_abort",
@@ -20801,6 +20803,12 @@ class _PrefillSystemGuard:
                     target,
                     keep_session_ids=_in_flight_session_ids(self.state),
                     reason="prefill_shed_before_abort",
+                    # As in the admission: a conversation whose newest state
+                    # is not on SSD yet is written there before it goes. The
+                    # prefill waits between chunks, so the engine allocates
+                    # nothing meanwhile, and the write streams one tensor at
+                    # a time.
+                    write_out_before_release=True,
                 )
             except Exception as exc:  # noqa: BLE001
                 released = getattr(exc, "receipt", None)
@@ -20815,6 +20823,10 @@ class _PrefillSystemGuard:
                     for row in released.get("sessions") or []
                     if isinstance(row, dict)
                 ]
+                receipt["written_out_entries"] = int(
+                    released.get("written_out_entries") or 0
+                )
+                receipt["write_out_s"] = float(released.get("write_out_s") or 0.0)
             try:
                 import mlx.core as _mx
 
@@ -20826,6 +20838,12 @@ class _PrefillSystemGuard:
         # from goes too (the admission's last steps before a refusal): a Pi
         # compaction's summary prompt shares 41 tokens with the turn after
         # it, and its 2.79 GB lease sat in RAM while that turn was refused.
+        # It is written to SSD first, like an idle conversation: the request
+        # may be a side call of the conversation (a client's title or
+        # summary request under the same session id), and the conversation's
+        # next turn restores from that state (2026-10-29: an 8K side request
+        # released its 23K conversation, whose write the turns 3 s apart had
+        # kept queued; the next turn re-read it all, 69 s to its first token).
         own = self.own_session_shed
         short = target is None or int(receipt["released_bytes"]) < int(target)
         if own is not None and short:
@@ -20837,6 +20855,9 @@ class _PrefillSystemGuard:
             own_bytes = int(own_receipt.get("held_bytes") or 0)
             receipt["own_session_released_bytes"] = own_bytes
             receipt["own_session_released_entries"] = int(own_receipt.get("entries") or 0)
+            receipt["own_session_written_out_entries"] = int(
+                own_receipt.get("written_out_entries") or 0
+            )
             receipt["released_bytes"] = int(receipt["released_bytes"]) + own_bytes
             if own_bytes > 0:
                 try:
@@ -22405,6 +22426,8 @@ def _merge_release_receipts(rounds: list[dict[str, Any]]) -> dict[str, Any]:
         "entries": 0,
         "held_bytes": 0,
         "dropped_entries": 0,
+        "written_out_entries": 0,
+        "write_out_s": 0.0,
         "persistence_cancelled": 0,
         "queued_persistence_entries": 0,
         "queued_persistence_bytes": 0,
@@ -22421,8 +22444,12 @@ def _merge_release_receipts(rounds: list[dict[str, Any]]) -> dict[str, Any]:
             "queued_persistence_entries",
             "queued_persistence_bytes",
             "postcommits_aborted",
+            "written_out_entries",
         ):
             merged[key] += int(receipt.get(key) or 0)
+        merged["write_out_s"] = round(
+            float(merged["write_out_s"]) + float(receipt.get("write_out_s") or 0.0), 3
+        )
         merged["session_records_dropped"].extend(
             receipt.get("session_records_dropped") or ()
         )
@@ -22612,7 +22639,8 @@ def _release_own_unusable_entries(
     """The admission's step 7 for a request already past it: this request's
     own conversation's RAM entries that it does not restore from, other than
     its same-conversation entry. Called from the request's own thread, which
-    holds the session's slot (no ownership hold)."""
+    holds the session's slot (no ownership hold), so an entry whose SSD write
+    is still queued is written out before it goes."""
 
     release = getattr(session_bank, "release_sessions", None)
     if session_bank is None or not session_id or not callable(release):
@@ -22630,6 +22658,7 @@ def _release_own_unusable_entries(
         "protect_tokens": probe_ids,
         "restore_identity": dict(restore_identity or {}),
         "reason": reason,
+        "write_out_before_release": True,
     }
     same_conversation_fn = getattr(session_bank, "same_conversation_entries", None)
     if callable(same_conversation_fn):
@@ -23680,6 +23709,12 @@ def _run_prefill_admission(
                         protect_tokens=probe_ids,
                         restore_identity=identity,
                         reason="prefill_admission_idle_release",
+                        # A conversation whose newest state is not on SSD
+                        # yet is written there before it goes: its queued
+                        # write waits for a quiet window that two clients
+                        # taking turns never leave, and without it the
+                        # conversation's next turn re-reads everything.
+                        write_out_before_release=True,
                     )
                 )
                 clear_pool()
@@ -23715,12 +23750,16 @@ def _run_prefill_admission(
         and refusal_deficit(now, current) > 0
     ):
         try:
-            # No ownership hold: this request holds the session's slot.
+            # No ownership hold: this request holds the session's slot. A
+            # sibling not on SSD yet is written there first: under one
+            # session id the request may be a side call (a title, a summary)
+            # and the sibling the conversation's next turn restores from.
             own_release_kwargs: dict[str, Any] = {
                 "only_session_ids": {str(session_id)},
                 "protect_tokens": probe_ids,
                 "restore_identity": identity,
                 "reason": "prefill_admission_own_session",
+                "write_out_before_release": True,
             }
             if kept_keys:
                 # The same-conversation entries and their SSD writes stay.

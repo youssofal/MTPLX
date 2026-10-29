@@ -253,6 +253,12 @@ DEFAULT_PREFIX_BLOCK_SIZE = 256
 DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS = 512
 DEFAULT_ACTIVE_SESSION_PIN_TTL_S = 600.0
 DEFAULT_PER_SESSION_MAX_ENTRIES = 3
+# The memory guard's release writes an idle session's unwritten entry to the
+# SSD cache before letting it go (release_sessions, write_out_before_release):
+# the request being admitted waits for that write. A first write of a 100K
+# conversation (about 8 GB) streams in a few seconds on an internal SSD; a
+# slower disk gives up here and the entry is dropped as before.
+RELEASE_WRITE_OUT_MAX_S = 30.0
 
 
 def _per_session_max_entries() -> int:
@@ -420,6 +426,17 @@ def _live_cache_nbytes(cache: list[Any] | None) -> int:
         except NotImplementedError:
             continue
     return total
+
+
+def _persistence_capabilities(entry: Any) -> list[str]:
+    """What an entry's SSD copy can serve: an insert always, the MTP draft
+    state when the entry carries its logits and hidden state."""
+
+    capabilities = ["ar_insert"]
+    logits = getattr(entry, "logits", None)
+    if logits is not None and getattr(entry, "hidden", None) is not None:
+        capabilities.append("mtp_full")
+    return capabilities
 
 
 def cold_persistence_key(entry: Any) -> str:
@@ -3202,9 +3219,7 @@ class SessionBank:
         # silently downgrade its whole lineage on the next restart — so
         # hydrate first. Runs on the postcommit/idle lane; the loader fails
         # closed on a corrupt payload.
-        capabilities = ["ar_insert"]
-        if entry.logits is not None and entry.hidden is not None:
-            capabilities.append("mtp_full")
+        capabilities = _persistence_capabilities(entry)
         # Entries at/above the tier's staged-queue backlog budget could
         # never persist through put_entry (the fully encoded payload would
         # not fit the queue) — stream them instead. Same on-disk format.
@@ -3374,10 +3389,9 @@ class SessionBank:
                 cache_ref=None,
                 mtp_history_cache_ref=None,
             )
-            capabilities = ["ar_insert"]
-            if view.logits is not None and view.hidden is not None:
-                capabilities.append("mtp_full")
-            stored = spill(view, capabilities=capabilities, raise_on_yield=True)
+            stored = spill(
+                view, capabilities=_persistence_capabilities(view), raise_on_yield=True
+            )
         except ColdEncodeInterrupted:
             # A foreground request arrived mid-encode. Re-dispatch for the
             # next quiet window; the coalesce key keeps at most one pending
@@ -4308,6 +4322,85 @@ class SessionBank:
             entry_ref = self._persistence_pending.get(key)
         return entry_ref is not None and entry_ref() is entry
 
+    def _awaits_queued_write(self, entry: SessionBankEntry) -> bool:
+        """Whether RAM holds the only copy of ``entry`` while its own SSD
+        write waits in the idle lane: not published, a snapshot (a lease's
+        spill re-derives one from the live cache), and the newest queued
+        write under its key is its own."""
+
+        return (
+            not entry.live_ref_only
+            and self._persistence_pending_for(entry)
+            and not self.entry_is_durable(entry)
+        )
+
+    def _write_out_before_release(
+        self, entry: SessionBankEntry, *, give_up_at_s: float, reason: str
+    ) -> bool:
+        """Write ``entry`` to the SSD cache now, on the caller's (model-owner)
+        thread, before a release lets it go. Returns whether it is published.
+
+        The release would otherwise cancel the entry's queued write and lose
+        the conversation: the idle lane runs that write only in a quiet
+        window, and two clients taking turns on one server leave none, so
+        the next turn re-reads the whole conversation (2026-10-10: seven
+        idle sessions of 7.5 to 9.9 GB dropped this way, each followed by a
+        re-read of 80K to 103K tokens). The write streams through
+        ``spill_entry`` whatever the entry's size: one tensor's bytes at a
+        time, never the payload staged in RAM, so it adds little to the
+        memory the release is about to give back. It stops at
+        ``give_up_at_s``; a tier that refuses the write (hourly budget, disk
+        room) or stops leaves the entry to be dropped as before."""
+
+        tier = self.cold_tier
+        spill = getattr(tier, "spill_entry", None) if tier is not None else None
+        if not callable(spill) or not getattr(tier, "SUPPORTS_SPILL_DEADLINE", False):
+            return False
+        deadline = float(give_up_at_s)
+
+        def should_abort() -> bool:
+            return time.monotonic() >= deadline
+
+        started = time.perf_counter()
+        outcome = "written"
+        error: str | None = None
+        try:
+            # The boundary records are part of the copy (_cold_enqueue_job).
+            entry._ensure_boundaries_loaded(should_abort=should_abort)
+            stored = bool(
+                spill(
+                    entry,
+                    capabilities=_persistence_capabilities(entry),
+                    raise_on_yield=True,
+                    give_up_at_s=deadline,
+                )
+            )
+        except ColdEncodeInterrupted:
+            stored, outcome = False, "deadline"
+        except Exception as exc:  # noqa: BLE001
+            # Any failure leaves the release as it was: the entry is dropped.
+            stored, outcome = False, "error"
+            error = f"{type(exc).__name__}: {exc}"
+        if stored:
+            entry.cold_encode_completed_at = time.monotonic()
+            stored = self.entry_is_durable(entry)
+        if not stored and outcome == "written":
+            outcome = "refused"
+        record = {
+            "reason": "release_write_out",
+            "release_reason": reason,
+            "session_id": entry.session_id,
+            "prefix_len": entry.prefix_len,
+            "token_hash": entry.token_hash,
+            "nbytes": int(entry.nbytes),
+            "outcome": outcome,
+            "elapsed_s": round(time.perf_counter() - started, 3),
+        }
+        if error is not None:
+            record["error"] = error
+        self.eviction_log.append(record)
+        return stored
+
     def move_durable_entries_to_ssd(
         self, keys: Any, *, reason: str = "moved_to_ssd"
     ) -> dict[str, Any]:
@@ -4635,6 +4728,7 @@ class SessionBank:
         hold_session: Callable[[str], Callable[[], None] | None] | None = None,
         reason: str = "idle_session_release",
         protect_keys: Any = (),
+        write_out_before_release: bool = False,
     ) -> dict[str, Any]:
         """Release whole sessions' RAM state until ``target_bytes`` is freed.
 
@@ -4650,10 +4744,16 @@ class SessionBank:
         conversation restores from disk when it comes back; then the rest,
         least recently used first, their entries dropped. An entry not
         published yet loses its queued SSD encode when that job is its own
-        (``_cancel_queued_persistence``); writing it out here instead would
-        stage its bytes through the page cache and hash them on the request
-        path, exactly while the Mac is short of memory. When a kept entry of
-        the same session had its job coalesced away, it is filed again.
+        (``_cancel_queued_persistence``). With ``write_out_before_release``
+        (the memory guard's releases on the model-owner thread: the
+        admission's and the prefill shed's, of idle conversations and of the
+        request's own siblings) that entry is first
+        written to the SSD cache on this thread, streamed one tensor at a
+        time and bounded by ``RELEASE_WRITE_OUT_MAX_S``, so the conversation
+        restores from disk when it comes back instead of being re-read
+        (``_write_out_before_release``); a write that fails or runs out of
+        time leaves the drop as it was. When a kept entry of the same
+        session had its job coalesced away, it is filed again.
 
         ``hold_session(session_id)`` makes the eviction atomic with request
         ownership: it returns a releaser once the caller holds that session
@@ -4726,6 +4826,8 @@ class SessionBank:
 
         released_bytes = 0
         rows: list[dict[str, Any]] = []
+        write_out_deadline: float | None = None
+        write_out_s = 0.0
         skipped_busy: list[str] = []
         released_ids: set[int] = set()
         released_groups: dict[str, list[SessionBankEntry]] = {}
@@ -4749,6 +4851,25 @@ class SessionBank:
                     skipped_busy.append(str(session_id))
                     continue
             try:
+                written_out = 0
+                if write_out_before_release:
+                    # While this release holds the session: no request of it
+                    # can start and extend the entry being written.
+                    unwritten = [
+                        entry
+                        for entry in list(members) + held_by_queue
+                        if self._awaits_queued_write(entry)
+                    ]
+                    if unwritten and write_out_deadline is None:
+                        write_out_deadline = time.monotonic() + RELEASE_WRITE_OUT_MAX_S
+                    for entry in unwritten:
+                        started = time.perf_counter()
+                        if self._write_out_before_release(
+                            entry, give_up_at_s=float(write_out_deadline), reason=reason
+                        ):
+                            durable[id(entry)] = True
+                            written_out += 1
+                        write_out_s += time.perf_counter() - started
                 row = {
                     "session_id": session_id,
                     "entries": 0,
@@ -4763,6 +4884,7 @@ class SessionBank:
                     ),
                     "queued_persistence_entries": len(held_by_queue),
                     "queued_persistence_bytes": 0,
+                    "written_out_entries": written_out,
                 }
                 for entry in held_by_queue:
                     # Out of RAM already; cancelling its queued jobs (below,
@@ -4863,6 +4985,8 @@ class SessionBank:
             "held_bytes": int(max(0, released_bytes - still_held_bytes)),
             "queued_persistence_still_held_bytes": still_held_bytes,
             "dropped_entries": int(sum(row["dropped_entries"] for row in rows)),
+            "written_out_entries": int(sum(row["written_out_entries"] for row in rows)),
+            "write_out_s": round(write_out_s, 3),
             "persistence_cancelled": int(persistence_cancelled),
             "persistence_redispatched": int(redispatched),
             "protected_restore_source_tokens": (

@@ -374,6 +374,9 @@ class SessionBankColdTier:
     # the pre-shadow call shape.
     SUPPORTS_RESIDENT_DUPLICATE_SHADOW = True
     SUPPORTS_MIN_USEFUL_MATCHED_TOKENS = True
+    # spill_entry takes give_up_at_s: the memory guard writes an entry out
+    # before it lets it go, as foreground work with a deadline.
+    SUPPORTS_SPILL_DEADLINE = True
 
     def __init__(
         self,
@@ -778,6 +781,7 @@ class SessionBankColdTier:
         *,
         capabilities: list[str] | tuple[str, ...] | None = None,
         raise_on_yield: bool = False,
+        give_up_at_s: float | None = None,
     ) -> bool:
         """Stream one entry to disk tensor-by-tensor, no RAM staging.
 
@@ -804,6 +808,13 @@ class SessionBankColdTier:
         failed or interrupted write, a full disk or a killed process leaves
         one restorable copy (2026-09-29: evicting first left none between
         20:55 and 20:56, and a 138K request had nothing to restore).
+
+        ``give_up_at_s`` is a ``time.monotonic()`` deadline for a caller that
+        runs the spill as foreground work itself: the memory guard, writing
+        an entry out before it lets it go. The foreground signal is not
+        polled then (that caller is the work it reports); the spill stops at
+        the deadline instead, the same way it yields: nothing restorable is
+        left behind.
         """
         if self.mode == "off":
             return False
@@ -811,6 +822,14 @@ class SessionBankColdTier:
         if len(token_ids) < self.min_prefix_tokens:
             self._inc("skipped_too_short")
             return False
+        if give_up_at_s is None:
+            should_abort = self.encode_should_abort()
+        else:
+            deadline = float(give_up_at_s)
+
+            def should_abort() -> bool:
+                return time.monotonic() >= deadline
+
         estimated = int(getattr(entry, "nbytes", 0) or 0)
         if estimated <= 0:
             estimated = int(getattr(entry, "oversized_nbytes", 0) or 0)
@@ -833,11 +852,7 @@ class SessionBankColdTier:
         # behind foreground work. In particular, never pause with _base_lock
         # held: a foreground restore may need that same lock.
         def yield_to_foreground() -> None:
-            if self._stop.is_set() or (
-                self._encode_yield_enabled
-                and self.foreground_busy is not None
-                and self.foreground_busy()
-            ):
+            if self._stop.is_set() or (should_abort is not None and should_abort()):
                 raise ColdEncodeInterrupted()
 
         try:
@@ -882,6 +897,7 @@ class SessionBankColdTier:
                 token_ids=token_ids,
                 raise_on_yield=raise_on_yield,
                 claimed_digests=claimed_digests,
+                should_abort=should_abort,
             )
         finally:
             self._release_inflight(entry_dirs=(entry_dir_rel,), digests=claimed_digests)
@@ -930,8 +946,8 @@ class SessionBankColdTier:
         token_ids: tuple[int, ...],
         raise_on_yield: bool,
         claimed_digests: set[str],
+        should_abort: Callable[[], bool] | None,
     ) -> bool:
-        should_abort = self.encode_should_abort()
         tensor_blobs: dict[str, dict[str, Any]] = {}
         written_state = {"logical": 0, "physical": 0, "deduped_hits": 0}
         tier = self
