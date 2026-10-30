@@ -2094,6 +2094,13 @@ class EngineSessionManager:
                 session_id = str(value).strip()
                 if key == "x-claude-code-session-id":
                     session_id = _claude_code_session_id(session_id, lowered_headers)
+                    if self._claude_code_side_request(session_id, prompt_ids):
+                        if diagnostic_out is not None:
+                            diagnostic_out["claude_code_side_request"] = {
+                                "named_session_id": session_id,
+                                "reason": "prompt_does_not_share_the_conversation_prefix",
+                            }
+                        continue
                 return session_id, f"header.{key}"
         for key in ("session_id", "mtplx_session_id", "chat_id", "conversation_id"):
             value = metadata.get(key)
@@ -2246,6 +2253,36 @@ class EngineSessionManager:
             result["marathon_protected"] = protected[:8]
             result["marathon_protected_count"] = len(protected)
         return result
+
+    def _claude_code_side_request(
+        self,
+        session_id: str,
+        prompt_ids: list[int] | tuple[int, ...] | None,
+    ) -> bool:
+        """Whether a request named into a Claude Code conversation is not that conversation.
+
+        Claude Code stamps its session id on its side requests too (the
+        session title, the auto-mode safety classifier, the Bash command
+        prefix check). Their prompts share nothing with the conversation's.
+        Taking the conversation's session would replace its committed stream,
+        which the next turn's reasoning re-insertion and token splice read,
+        and abort its pending commit. A request that does not share the
+        conversation's first _COMMON_PREFIX_REUSE_MIN_TOKENS tokens (its
+        system prompt and tool contract) is resolved by its own prompt, as it
+        was before the header was read. A compacted or rewound conversation
+        keeps those tokens, so it keeps its session; a session shorter than
+        that has nothing to protect and is taken as before.
+        """
+        if not prompt_ids:
+            return False
+        session = self.peek(session_id)
+        if session is None:
+            return False
+        committed = session.committed_token_ids
+        span = _COMMON_PREFIX_REUSE_MIN_TOKENS
+        if len(committed) < span:
+            return False
+        return tuple(int(token) for token in prompt_ids[:span]) != committed[:span]
 
     def _begin_on_fresh_anon_session(self, cancel_event: Any | None) -> EngineSession:
         while True:
