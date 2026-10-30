@@ -49,6 +49,11 @@ _SUITE_VARIABLES = frozenset(
         "MTPLX_PREFILL_TPS_ARTIFACT",
         "MTPLX_PREFILL_TPS_REQUIRE_FULL",
         "MTPLX_SSE_DUMP",
+        # The M1-M4 rehearsal runs the suite on the fallback routes on
+        # purpose: MLX_METAL_GPU_ARCH=applegpu_g16s plus this switch is the
+        # release gate's rehearsal subset, which dropping it would turn into
+        # a second run of the M5 routes.
+        "MTPLX_FORCE_GPU_FAMILY_FALLBACK",
     }
 )
 
@@ -93,6 +98,13 @@ def _hermetic_mtplx_state(monkeypatch, tmp_path_factory):
     # builds into the user's real model cache. Tests that exercise the config
     # set their own MTPLX_CONFIG.
     monkeypatch.setenv("MTPLX_CONFIG", str(isolated / "config.toml"))
+    # A server the suite builds with default arguments opens the SSD session
+    # bank at MTPLX_SSD_SESSION_CACHE_DIR, ~/.mtplx/session-bank by default:
+    # the developer's real bank, which a running daemon may be writing and
+    # which the cold tier reconciles when it opens. pytest_configure drops an
+    # operator's MTPLX_SSD_SESSION_CACHE=off with the other switches, so the
+    # directory itself is scratch.
+    monkeypatch.setenv("MTPLX_SSD_SESSION_CACHE_DIR", str(isolated / "session-bank"))
     # Synthetic server requests must not enter a live user's trace history.
     monkeypatch.setenv("MTPLX_REQUEST_LOG_JSONL", str(isolated / "requests.jsonl"))
     monkeypatch.setenv("MTPLX_FLIGHT_RECORDER", str(isolated / "flight.jsonl"))
