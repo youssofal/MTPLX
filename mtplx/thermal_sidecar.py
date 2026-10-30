@@ -185,6 +185,13 @@ def _clear_marker(marker_path: str | None) -> None:
         pass
 
 
+def _lease_current(marker_path: str | None, owner_token: str | None) -> bool:
+    """Whether the Max lease this sidecar guards still owns the fans."""
+
+    with _max_marker_lock(marker_path):
+        return _max_marker_owned_by(marker_path, owner_token)
+
+
 def _restore_owned_fans(
     binary: str,
     marker_path: str | None,
@@ -240,6 +247,17 @@ def main(argv: list[str] | None = None) -> int:
                 args.marker,
                 args.owner_token,
             )
+        if (
+            args.owner_token
+            and args.marker
+            and not _lease_current(args.marker, args.owner_token)
+        ):
+            # The parent runs on, but this lease is over: its cleanup restored
+            # the fans and cleared the marker, or a newer lease owns them with
+            # a sidecar of its own. Smart fan mode takes a lease for every busy
+            # stretch, so waiting for the parent kept one sidecar per ramp alive
+            # until the server exited (#602).
+            return 0
         if (time.time() - started_at) > args.max_lifetime_seconds:
             return 0
         try:

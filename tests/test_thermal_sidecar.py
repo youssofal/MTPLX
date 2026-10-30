@@ -436,3 +436,79 @@ def test_spawn_sidecar_passes_owner_token(monkeypatch, tmp_path):
     assert thermal._spawn_thermal_sidecar("lease-123") is not None
     assert captured
     assert captured[0][-2:] == ["--owner-token", "lease-123"]
+
+
+def _poll_with_parent_alive(monkeypatch, marker, *, lifetime_s: float) -> tuple[int, float, list]:
+    captured: list[list[str]] = []
+    monkeypatch.setattr(thermal_sidecar, "_detach_from_terminal", lambda: None)
+    monkeypatch.setattr(thermal_sidecar, "_parent_alive", lambda pid: True)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda cmd, *args, **kwargs: captured.append(list(cmd)),
+    )
+    started = time.time()
+    rc = thermal_sidecar.main(
+        [
+            "--parent-pid",
+            str(os.getpid()),
+            "--binary",
+            "/path/to/thermalforge",
+            "--marker",
+            str(marker),
+            "--owner-token",
+            "ramp-1",
+            "--poll-seconds",
+            "0.05",
+            "--max-lifetime-seconds",
+            str(lifetime_s),
+        ]
+    )
+    return rc, time.time() - started, captured
+
+
+def test_sidecar_exits_once_a_newer_lease_owns_the_fans(monkeypatch, tmp_path):
+    """#602: Smart fan mode takes a new lease, with its own sidecar, for every
+    busy stretch. The old sidecar's lease is over while the server lives on,
+    so it exits instead of waiting for the server, and leaves the new lease
+    alone."""
+
+    marker = tmp_path / "active.json"
+    marker.write_text(json.dumps({"pid": os.getpid(), "owner_token": "ramp-2"}))
+
+    rc, elapsed, captured = _poll_with_parent_alive(monkeypatch, marker, lifetime_s=30.0)
+
+    assert rc == 0
+    assert elapsed < 5.0, f"sidecar outlived its lease by {elapsed:.1f}s"
+    assert captured == []
+    assert json.loads(marker.read_text())["owner_token"] == "ramp-2"
+
+
+def test_sidecar_exits_once_its_lease_was_restored_and_cleared(monkeypatch, tmp_path):
+    """The parent's own cleanup restored the fans and cleared the marker:
+    nothing is left to guard."""
+
+    marker = tmp_path / "active.json"
+
+    rc, elapsed, captured = _poll_with_parent_alive(monkeypatch, marker, lifetime_s=30.0)
+
+    assert rc == 0
+    assert elapsed < 5.0
+    assert captured == []
+    assert not marker.exists()
+
+
+def test_sidecar_keeps_watching_while_its_lease_is_current(monkeypatch, tmp_path):
+    """Control: while the marker still carries this sidecar's lease it keeps
+    polling (here until its lifetime ceiling), so a SIGKILL of the parent is
+    still covered."""
+
+    marker = tmp_path / "active.json"
+    marker.write_text(json.dumps({"pid": os.getpid(), "owner_token": "ramp-1"}))
+
+    rc, elapsed, captured = _poll_with_parent_alive(monkeypatch, marker, lifetime_s=0.4)
+
+    assert rc == 0
+    assert elapsed >= 0.4
+    assert captured == []
+    assert json.loads(marker.read_text())["owner_token"] == "ramp-1"
