@@ -6899,6 +6899,19 @@ def restore_or_prefill_prompt_state(
             cache_factory=restore_cache_factory,
         )
         restore_elapsed_s = time.perf_counter() - restore_started
+        if (
+            restored is not None
+            and restored.mtp_history_cache is None
+            and _mtp_history_uses_committed_cache(mtp_history_policy)
+        ):
+            # The entry matched but holds no draft history to resume from, so
+            # this turn prefills cold: report that, not the server's default
+            # new_session (2.12.2 hid #591 behind that label).
+            session_bank.last_miss_reason = "no_snapshot_coverage"
+            if isinstance(getattr(session_bank, "last_prefix_diagnostic", None), dict):
+                session_bank.last_prefix_diagnostic["miss_reason"] = (
+                    "missing_committed_mtp_history"
+                )
         if restored is not None and (
             not _mtp_history_uses_committed_cache(mtp_history_policy)
             or restored.mtp_history_cache is not None

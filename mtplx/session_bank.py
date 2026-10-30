@@ -1658,6 +1658,18 @@ class SessionBank:
                 }
             )
             return None
+        if (
+            not keep_live_ref
+            and mtp_history_snapshot is None
+            and mtp_history_cache_ref is not None
+        ):
+            # A snapshot entry keeps no live reference, so it owns its draft
+            # history too. One-copy callers hand the history by reference for
+            # the lease; when this put keeps none (OpenCode's snapshot-only
+            # policy, an anonymous API session, a postcommit without a lease)
+            # dropping the reference left an entry the committed policy can
+            # never resume, and every turn prefilled cold (#591, #616, #649).
+            mtp_history_snapshot = snapshot_cache(mtp_history_cache_ref)
         trunk_snapshot_done = time.perf_counter()
         if timing_out is not None:
             timing_out["trunk_snapshot_s"] = trunk_snapshot_done - trunk_snapshot_started

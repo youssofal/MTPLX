@@ -27793,7 +27793,8 @@ def _generation_final_bank_metadata(
     if committed_mtp_cache is not None and one_copy_runtime(state.runtime):
         # One-copy store: the draft head's history rides the lease by
         # reference, like the trunk; a snapshot here would be copied into the
-        # entry (session_bank live_ref_entry).
+        # entry (session_bank live_ref_entry). A put that keeps no live
+        # reference snapshots it there instead (SessionBank.put).
         return {
             "hidden_variant": (
                 "gemma4_pre_norm" if backend_id == GEMMA4_BACKEND else "post_norm"
