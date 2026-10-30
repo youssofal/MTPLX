@@ -1483,14 +1483,26 @@ class SessionBank:
             # checkpoints (#637), while the prompt-end anchor lives on the
             # prompt's lease (prompt_lease_fields), and a retry resumes from
             # that anchor with the logits kept beside it (#661). Records
-            # describe token prefixes, so the donor's stay valid; supplied
-            # ones win a shared position. A loader-backed donor is left
-            # alone: its records are not in memory to merge.
+            # describe token prefixes, so the donor's stay valid when it was
+            # written under this entry's identity (a record's hidden state
+            # follows the hidden variant); supplied ones win a shared
+            # position. A loader-backed donor is left alone: its records are
+            # not in memory to merge.
             prefix_donor = self.longest_prefix(tokens)
             if (
                 prefix_donor is not None
                 and prefix_donor.gdn_boundaries
                 and getattr(prefix_donor, "gdn_boundary_loader", None) is None
+                and _restore_identity_compatible(
+                    prefix_donor,
+                    model_path=str(runtime.model_path),
+                    mtp_enabled=bool(runtime.mtp_enabled),
+                    hidden_variant=hidden_variant,
+                    template_hash=template_hash,
+                    mtp_history_policy=mtp_history_policy,
+                    draft_head_identity=draft_head_identity,
+                    policy_fingerprint=policy_fingerprint,
+                )
             ):
                 supplied = {position for position, _state, _hidden in normalized_boundaries}
                 normalized_boundaries = sorted(

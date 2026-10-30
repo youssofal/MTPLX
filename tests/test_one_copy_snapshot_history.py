@@ -312,3 +312,43 @@ def test_the_final_commit_keeps_the_prompt_end_anchor_a_retry_resumes_from(monke
     assert entry.boundary_logits is not None
     assert entry.boundary_logits[0] == 40
     assert bool(mx.array_equal(entry.boundary_logits[1], prompt_logits))
+
+
+def test_a_put_takes_no_records_from_a_prefix_written_under_another_identity(monkeypatch):
+    """The stored prefix's records are merged only when that entry was written
+    under the new entry's identity: a record carries the hidden state of its
+    variant, so a pre-norm record under a post-norm entry would restore the
+    wrong hidden state."""
+
+    monkeypatch.delenv("MTPLX_ONE_COPY", raising=False)
+    from mtplx.cache_state import snapshot_untrimmable_cache
+
+    bank = _bank()
+    trunk, _mtp = _conversation(40, 64)
+    prompt = list(range(1, 41))
+
+    def record(position: int):
+        return (position, snapshot_untrimmable_cache(trunk), mx.ones((1, 1, 8)))
+
+    bank.put(
+        runtime=RUNTIME, token_ids=prompt, cache=trunk, logits=mx.zeros((1, 16)),
+        hidden=mx.ones((1, 1, 8)), session_id="a", snapshot_epoch=40,
+        hidden_variant="pre_norm", gdn_boundaries=[record(30)],
+    )
+    entry = bank.put(
+        runtime=RUNTIME, token_ids=prompt + [101, 102, 103, 104, 105, 106],
+        cache=trunk, logits=mx.zeros((1, 16)), hidden=mx.ones((1, 1, 8)),
+        session_id="b", snapshot_epoch=46, hidden_variant="post_norm",
+        gdn_boundaries=[record(20)],
+    )
+    assert entry is not None
+    assert [int(r[0]) for r in entry.gdn_boundaries] == [20]
+
+    same = bank.put(
+        runtime=RUNTIME, token_ids=prompt + [201, 202, 203, 204, 205, 206],
+        cache=trunk, logits=mx.zeros((1, 16)), hidden=mx.ones((1, 1, 8)),
+        session_id="c", snapshot_epoch=46, hidden_variant="pre_norm",
+        gdn_boundaries=[record(20)],
+    )
+    assert same is not None
+    assert [int(r[0]) for r in same.gdn_boundaries] == [20, 30]
