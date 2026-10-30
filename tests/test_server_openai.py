@@ -11840,8 +11840,9 @@ def test_anthropic_messages_returns_tool_use_nonstream(monkeypatch):
 
 
 def test_anthropic_auto_mode_classifier_request_runs_with_thinking_off(monkeypatch):
-    # Issue #1: Claude Code's safety classifier only needs a verdict, so its
-    # request runs with thinking off. A normal turn keeps the default.
+    # Issue #669: Claude Code's safety classifier only needs a verdict, so its
+    # request runs with thinking off. The same request from a client that is
+    # not Claude Code (no billing block) keeps the default.
     state = _fake_state()
     state.runtime.tokenizer = CaptureTokenizer()
     state.args.stats_footer = False
@@ -11855,6 +11856,11 @@ def test_anthropic_auto_mode_classifier_request_runs_with_thinking_off(monkeypat
 
     monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
     user = [{"role": "user", "content": "Is `rm -rf build` safe?"}]
+    monitor = "You are a security monitor for autonomous AI coding agents."
+    billing = {
+        "type": "text",
+        "text": "x-anthropic-billing-header: cc_version=2.1.201.af3; cc_entrypoint=sdk-cli;",
+    }
 
     # A short max_tokens with a foreign system prompt reads as a background
     # title job, which is a different path. Keep both requests above it.
@@ -11863,20 +11869,19 @@ def test_anthropic_auto_mode_classifier_request_runs_with_thinking_off(monkeypat
         headers={"x-mtplx-cache-mode": "bypass"},
         json={
             "model": "mtplx-test-model",
-            "max_tokens": 256,
-            "system": (
-                "You are a security monitor for autonomous AI coding agents."
-            ),
+            "max_tokens": 2112,
+            "system": [billing, {"type": "text", "text": monitor}],
             "messages": user,
         },
     )
+    classifier_renders = list(state.runtime.tokenizer.calls)
     normal = client.post(
         "/v1/messages",
         headers={"x-mtplx-cache-mode": "bypass"},
         json={
             "model": "mtplx-test-model",
-            "max_tokens": 256,
-            "system": "You are a helpful coding assistant.",
+            "max_tokens": 2112,
+            "system": monitor,
             "messages": user,
         },
     )
@@ -11886,6 +11891,10 @@ def test_anthropic_auto_mode_classifier_request_runs_with_thinking_off(monkeypat
     classifier_stats, normal_stats = seen
     assert classifier_stats["request_enable_thinking"] is False
     assert normal_stats["request_enable_thinking"] is True
+    normal_renders = state.runtime.tokenizer.calls[len(classifier_renders) :]
+    assert classifier_renders and normal_renders
+    assert all(kwargs.get("enable_thinking") is False for _m, kwargs in classifier_renders)
+    assert all(kwargs.get("enable_thinking") is not False for _m, kwargs in normal_renders)
 
 
 @pytest.mark.parametrize("body_key", ["auto_mode_classifier", "_auto_mode_classifier"])

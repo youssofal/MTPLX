@@ -6679,16 +6679,52 @@ def _anthropic_to_chat_request(
         # own bridges but record the defaulting for observability instead of
         # rejecting (a 400 here would break those bridges).
         chat_request.anthropic_max_tokens_defaulted = True
-    # Claude Code's auto-mode safety classifier: a tool-free, non-streaming
-    # request whose system prompt names the monitor role. The policy turns
-    # thinking off for it, because it needs only a verdict.
-    chat_request._auto_mode_classifier = (
-        not request.tools
-        and not request.stream
-        and "you are a security monitor for autonomous ai coding agents"
-        in system_text.lower()
+    # Claude Code's auto-mode safety classifier. The policy turns thinking
+    # off for it, because it needs only a verdict.
+    chat_request._auto_mode_classifier = _claude_code_auto_mode_classifier(
+        request, system_text
     )
     return chat_request
+
+
+# The first sentence of the system prompt of Claude Code's auto-mode safety
+# classifier, in both of its stages (claude-cli 2.1.201).
+_CLAUDE_CODE_CLASSIFIER_SYSTEM_START = (
+    "You are a security monitor for autonomous AI coding agents."
+)
+
+
+def _anthropic_system_has_billing_block(system: Any) -> bool:
+    """Whether the system carries Claude Code's x-anthropic-billing-header line."""
+    blocks = system if isinstance(system, list) else [system]
+    for block in blocks:
+        if any(
+            line.strip().lower().startswith("x-anthropic-billing-header:")
+            for line in _anthropic_content_to_text([block]).splitlines()
+        ):
+            return True
+    return False
+
+
+def _claude_code_auto_mode_classifier(
+    request: AnthropicMessagesRequest, system_text: str
+) -> bool:
+    """Whether a /v1/messages request is Claude Code's auto-mode safety classifier.
+
+    The classifier wants a verdict and is written for a model without extended
+    thinking: it sends no ``thinking`` field, which on the Anthropic API means
+    thinking off, while this server thinks by default. Thinking first pushed
+    the verdict past Claude Code's classifier deadline (#669). Turning thinking
+    off changes generation, so only the classifier's exact shape matches:
+    Claude Code's billing block, a system prompt that begins with the
+    classifier's first sentence, no tools, no stream, and no thinking choice of
+    the client's own.
+    """
+    if request.tools or request.stream or request.thinking is not None:
+        return False
+    if not system_text.startswith(_CLAUDE_CODE_CLASSIFIER_SYSTEM_START):
+        return False
+    return _anthropic_system_has_billing_block(request.system)
 
 
 def _anthropic_tool_input_from_arguments(arguments: Any) -> dict[str, Any]:
