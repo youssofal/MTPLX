@@ -169,7 +169,10 @@ def _load_json(path: Path) -> dict[str, Any]:
 def _run_dir(out: str | Path, run_id: str) -> Path:
     if not str(run_id).strip():
         raise ForgeError("--run-id is required", code=2)
-    root = Path(out).expanduser()
+    # Absolute, because the steps hand paths inside the run to subprocesses
+    # that run with cwd=run: a relative --out made the contract probe write
+    # its result under run/run/ and calibration report agreement 0.0 (#627).
+    root = Path(out).expanduser().resolve()
     run = root / str(run_id)
     run.mkdir(parents=True, exist_ok=True)
     return run

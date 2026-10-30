@@ -3234,3 +3234,17 @@ def test_unique_model_dir_explains_unavailable_model_root(tmp_path):
 
     assert str(root) in str(excinfo.value)
     assert excinfo.value.code == 2
+
+
+def test_run_dir_is_absolute_for_a_relative_out(tmp_path, monkeypatch):
+    """#627: the calibrate step runs its contract probe with cwd=run and hands
+    it a path inside run. With a relative --out that path was relative too, so
+    the probe wrote under run/run/ and calibration reported agreement 0.0."""
+
+    monkeypatch.chdir(tmp_path)
+
+    run = forge._run_dir("forge-out", "q8")
+
+    assert run.is_absolute()
+    assert run == (tmp_path / "forge-out" / "q8").resolve()
+    assert run.is_dir()
