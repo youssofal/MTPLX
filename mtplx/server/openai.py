@@ -26400,6 +26400,12 @@ def _policy_fingerprint(
         # Old vision entries used dense attention, including their text
         # prefixes. They must not seed the corrected sparse model path.
         parts.append(f"vision_attention=mrope_qsa_v1:{int(vision_qsa_enabled())}")
+        # Entries stored before 2.12.3 may hold another conversation's pooled
+        # index keys: a restore from the SSD tier below an entry's end kept
+        # that entry's block count, and the next commit stored its blocks
+        # (#635). Such entries must not seed this build; the cold tier's LRU
+        # eviction reclaims them.
+        parts.append("qsa_pooled_index=v2")
     mtp_batch_lane = getattr(state, "mtp_batch_lane", None)
     if mtp_batch_lane is not None:
         parts.extend(

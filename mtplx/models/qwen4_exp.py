@@ -3268,7 +3268,16 @@ class QSACache:
         self.kv.state = (keys, values)
         self.raw_keys = raw
         self.pooled = pooled
-        self.pooled_len = 0 if pooled is None else pooled.shape[1]
+        # The valid pooled blocks are those the restored KV covers. A snapshot
+        # decoded for a sub-prefix restore (cold tier, ``decode_payload_prefix``)
+        # cuts keys and values to the restore point but hands over the donor's
+        # whole pooled table: trusting its length made the indexer skip the
+        # blocks of every later token and score against the donor's keys.
+        self.pooled_len = (
+            0
+            if pooled is None
+            else min(pooled.shape[1], self.kv.offset // self.ratio)
+        )
         # Derived mirror: rebuilt lazily on the first pooled_f32_view read.
         # Restored snapshots stay 4-leaf — the state contract is unchanged.
         self.pooled_f32_t = None
@@ -4421,6 +4430,11 @@ class QSAIndexer(nn.Module):
         # cannot run; the stock eager arithmetic is what the trace records.
         fixed_capacity = bool(getattr(cache, "fixed_capacity", False))
         if not fixed_capacity:
+            # The cache's own pooled blocks end where its keys do. A forward
+            # that raised after pooling its blocks, before attention wrote its
+            # keys, left the count past them; this forward writes those rows
+            # again and pools their blocks again, on every route.
+            cache.pooled_len = min(cache.pooled_len, cache.kv.offset // self.ratio)
             compiled_mode = self._compiled_mode(
                 decode=decode,
                 rows=S,
