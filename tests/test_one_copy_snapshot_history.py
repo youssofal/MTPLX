@@ -206,3 +206,54 @@ def test_a_restore_without_history_reports_why_it_went_cold(pack, lane):
     )
     assert second.stats.cached_tokens == 0
     assert second.stats.cache_miss_reason == "no_snapshot_coverage"
+
+
+def test_an_identical_retry_resumes_from_the_answer_lease_and_decodes_the_same(pack, lane):
+    """A regenerate sends the same prompt again; the answer's lease still holds
+    the prompt-end state and its logits, so the retry restores instead of
+    re-reading the prompt, and with the same seed it decodes the same tokens."""
+
+    smoke, model = pack
+    lane.setenv("MTPLX_ONE_COPY", "1")
+    lane.setenv("MTPLX_COMPILED_VERIFY", "1")
+    lane.setenv("MTPLX_QSA_GATHER", "1")
+    lane.setenv("MTPLX_QSA_GATHER_MIN_CONTEXT", "16")
+    lane.setenv("MTPLX_QWEN4_FIXED_M4_CAPACITY_BUCKET", "512")
+    # The prompt is banked as a lease with its prompt-end anchor, as a real
+    # prompt of 1,024 tokens or more is.
+    lane.setenv("MTPLX_SESSION_STORE_ON_PREFILL_MIN_SUFFIX", "16")
+    rt = smoke._tiny_runtime(model)
+    install_qwen4_fixed_verify_route(rt)
+    hidden_variant = generation._resolve_runtime_base_hidden_variant(rt, None)
+    state = SimpleNamespace(
+        runtime=rt, backend_descriptor=SimpleNamespace(backend_id="native_mtp")
+    )
+    bank = SessionBank(max_bytes=1 << 32, per_session_max_bytes=1 << 32)
+    # Long enough for the near-prefix lookup's block floor and minimum match.
+    prompt = [(11 * i + 2) % 128 for i in range(600)]
+    runs = []
+    for _attempt in range(2):
+        result = generation.generate_mtpk(
+            rt, list(prompt), max_tokens=16, sampler=NATIVE, draft_sampler=NATIVE,
+            speculative_depth=3, seed=SEED, mtp_cache_policy="persistent",
+            mtp_history_policy="committed", verify_strategy="batched",
+            stop_token_ids=set(), capture_final_state=True, session_bank=bank,
+            session_id="chat", session_restore_mode="reference",
+            commit_prompt_state_to_bank=True,
+        )
+        final = result.final_state
+        tokens = list(prompt) + list(result.tokens)
+        metadata = server._generation_final_bank_metadata(
+            state, final, token_count=len(tokens)
+        )
+        metadata["mtp_history_policy"] = final.mtp_history_policy
+        metadata["hidden_variant"] = hidden_variant
+        bank.put(
+            runtime=rt, token_ids=tokens, cache=final.final_trunk_cache,
+            logits=final.final_logits, hidden=final.final_hidden, keep_live_ref=True,
+            session_id="chat", snapshot_epoch=len(tokens), **metadata,
+        )
+        runs.append(result)
+    assert runs[0].stats.cached_tokens == 0
+    assert runs[1].stats.cached_tokens == len(prompt)
+    assert list(runs[1].tokens) == list(runs[0].tokens)
