@@ -117,3 +117,67 @@ def test_requests_near_the_classifier_shape_keep_thinking(near_miss):
 
 def test_no_system_is_not_a_classifier_request():
     assert _is_classifier(_classifier(system=None)) is False
+
+
+MAIN_SYSTEM = [
+    {**BILLING, "text": "x-anthropic-billing-header: cc_version=2.1.201.8ca; cc_entrypoint=sdk-cli;"},
+    {"type": "text", "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK."},
+    {"type": "text", "text": "You are an interactive agent that helps users with software engineering tasks."},
+]
+BASH_TOOL = {"name": "Bash", "description": "Run a shell command.", "input_schema": {"type": "object"}}
+
+
+def test_the_compaction_summary_request_keeps_thinking():
+    # The summarization request repeats the system, tools and history and
+    # appends the summary instruction.
+    compaction = openai.AnthropicMessagesRequest(
+        model="mtplx-capture-model",
+        max_tokens=32000,
+        stream=True,
+        system=MAIN_SYSTEM,
+        tools=[BASH_TOOL],
+        messages=[
+            {"role": "user", "content": "Fix the failing test."},
+            {"role": "assistant", "content": "Done: the test passes."},
+            {
+                "role": "user",
+                "content": "Your task is to create a detailed summary of the conversation so far.",
+            },
+        ],
+    )
+    assert _is_classifier(compaction) is False
+
+
+def test_a_subagent_request_keeps_thinking():
+    subagent = openai.AnthropicMessagesRequest(
+        model="mtplx-capture-model",
+        max_tokens=32000,
+        stream=True,
+        system=[
+            MAIN_SYSTEM[0],
+            {"type": "text", "text": "You are an agent for Claude Code. Search the codebase and report."},
+        ],
+        tools=[BASH_TOOL],
+        messages=[{"role": "user", "content": "Find where the session id is resolved."}],
+        thinking={"type": "adaptive", "display": "omitted"},
+    )
+    assert _is_classifier(subagent) is False
+
+
+@pytest.mark.parametrize("system", [None, "You are a helpful assistant.", "Answer yes or no."])
+def test_a_plain_api_request_with_a_short_max_tokens_keeps_thinking(system):
+    payload = {
+        "model": "any",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "Is this command safe: git push --force?"}],
+    }
+    if system is not None:
+        payload["system"] = system
+    assert _is_classifier(openai.AnthropicMessagesRequest(**payload)) is False
+
+
+def test_the_classifier_shape_is_matched_whatever_its_token_limit():
+    # The two captured stages ask for 2,112 and 10,240 tokens, and other
+    # Claude Code versions may ask for other limits; the match never keys on
+    # the limit.
+    assert _is_classifier(_classifier(max_tokens=64)) is True
