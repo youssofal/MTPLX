@@ -26227,6 +26227,7 @@ def _request_observability(
             "x-mtplx-session-id",
             "x-claude-code-session-id",
             "x-claude-code-agent-id",
+            "x-claude-code-request-class",
             "x-openwebui-chat-id",
             "x-openwebui-user-id",
             "x-openwebui-task",

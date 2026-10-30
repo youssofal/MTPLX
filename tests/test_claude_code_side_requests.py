@@ -11,6 +11,8 @@ re-insertion and token splice read. Header values are the ones claude-cli
 
 from __future__ import annotations
 
+import pytest
+
 from mtplx.engine_session import _COMMON_PREFIX_REUSE_MIN_TOKENS, EngineSessionManager
 
 CLAUDE_CODE_SESSION = "e2617d79-cf1b-42df-b4fe-b8fa4d9d6168"
@@ -89,3 +91,62 @@ def test_a_request_without_prompt_ids_keeps_the_header():
     manager = EngineSessionManager()
     _turn(manager, HEADERS, CONVERSATION, [7])
     assert manager.resolve_session_id(headers=HEADERS) == (CLAUDE_CODE_SESSION, SOURCE)
+
+
+# Claude Code 2.1.273 and later name the request class when the user sets
+# CLAUDE_CODE_GATEWAY_HINT_HEADERS=1 (documented gateway hint header). When it
+# is there it decides; the prefix check is the fallback for when it is not. A
+# side request either way is resolved as it was before the session header was
+# read: by its own prompt.
+
+
+def test_an_auxiliary_request_class_never_takes_the_named_session():
+    manager = EngineSessionManager()
+    # A short named session: without the header the prefix check would hand
+    # it to any request.
+    _turn(manager, HEADERS, SIDE_REQUEST, [1])
+    diagnostic: dict = {}
+    session_id, source = manager.resolve_session_id(
+        headers={**HEADERS, "X-Claude-Code-Request-Class": "auxiliary"},
+        prompt_ids=list(range(80_000, 80_200)),
+        diagnostic_out=diagnostic,
+    )
+    assert session_id != CLAUDE_CODE_SESSION
+    assert source == "new"
+    assert diagnostic["claude_code_side_request"]["reason"] == "request_class_auxiliary"
+
+
+@pytest.mark.parametrize("request_class", ["main", "compaction", "workflow", "subagent"])
+def test_a_conversation_request_class_keeps_the_session_without_the_prefix(request_class):
+    manager = EngineSessionManager()
+    _turn(manager, HEADERS, CONVERSATION, [7])
+    assert manager.resolve_session_id(
+        headers={**HEADERS, "x-claude-code-request-class": request_class},
+        prompt_ids=SIDE_REQUEST,
+    ) == (CLAUDE_CODE_SESSION, SOURCE)
+
+
+def test_an_unknown_request_class_falls_back_to_the_prefix_check():
+    manager = EngineSessionManager()
+    _turn(manager, HEADERS, CONVERSATION, [7])
+    side, _ = manager.resolve_session_id(
+        headers={**HEADERS, "x-claude-code-request-class": "something-new"},
+        prompt_ids=SIDE_REQUEST,
+    )
+    assert side != CLAUDE_CODE_SESSION
+    assert manager.resolve_session_id(
+        headers={**HEADERS, "x-claude-code-request-class": "something-new"},
+        prompt_ids=[*CONVERSATION, 7, 8],
+    ) == (CLAUDE_CODE_SESSION, SOURCE)
+
+
+def test_the_compaction_summary_request_keeps_the_session_without_the_header():
+    # The summarization request repeats the system, tools and history and
+    # appends the summary instruction, so it shares the conversation prefix.
+    manager = EngineSessionManager()
+    _turn(manager, HEADERS, CONVERSATION, [7, 8])
+    summary_request = [*CONVERSATION, 7, 8, *range(70_000, 70_040)]
+    assert manager.resolve_session_id(headers=HEADERS, prompt_ids=summary_request) == (
+        CLAUDE_CODE_SESSION,
+        SOURCE,
+    )

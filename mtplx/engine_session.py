@@ -485,6 +485,13 @@ IMPLICIT_SESSION_SOURCES = frozenset(
 FORK_WHEN_BUSY_SESSION_SOURCES = frozenset({"header.x-claude-code-session-id"})
 
 
+# x-claude-code-request-class values that are the conversation itself (see
+# EngineSessionManager._claude_code_side_request).
+_CLAUDE_CODE_CONVERSATION_REQUEST_CLASSES = frozenset(
+    {"main", "subagent", "workflow", "compaction"}
+)
+
+
 def _claude_code_session_id(session_id: str, lowered_headers: Mapping[str, Any]) -> str:
     """Give each Claude Code subagent its own session.
 
@@ -2094,11 +2101,14 @@ class EngineSessionManager:
                 session_id = str(value).strip()
                 if key == "x-claude-code-session-id":
                     session_id = _claude_code_session_id(session_id, lowered_headers)
-                    if self._claude_code_side_request(session_id, prompt_ids):
+                    side_reason = self._claude_code_side_request(
+                        session_id, prompt_ids, lowered_headers
+                    )
+                    if side_reason is not None:
                         if diagnostic_out is not None:
                             diagnostic_out["claude_code_side_request"] = {
                                 "named_session_id": session_id,
-                                "reason": "prompt_does_not_share_the_conversation_prefix",
+                                "reason": side_reason,
                             }
                         continue
                 return session_id, f"header.{key}"
@@ -2258,31 +2268,51 @@ class EngineSessionManager:
         self,
         session_id: str,
         prompt_ids: list[int] | tuple[int, ...] | None,
-    ) -> bool:
-        """Whether a request named into a Claude Code conversation is not that conversation.
+        lowered_headers: Mapping[str, Any],
+    ) -> str | None:
+        """Why a request named into a Claude Code conversation is not that
+        conversation, or None when it is.
 
         Claude Code stamps its session id on its side requests too (the
         session title, the auto-mode safety classifier, the Bash command
         prefix check). Their prompts share nothing with the conversation's.
         Taking the conversation's session would replace its committed stream,
         which the next turn's reasoning re-insertion and token splice read,
-        and abort its pending commit. A request that does not share the
-        conversation's first _COMMON_PREFIX_REUSE_MIN_TOKENS tokens (its
-        system prompt and tool contract) is resolved by its own prompt, as it
-        was before the header was read. A compacted or rewound conversation
-        keeps those tokens, so it keeps its session; a session shorter than
-        that has nothing to protect and is taken as before.
+        and abort its pending commit.
+
+        Claude Code names the request class itself in
+        x-claude-code-request-class when CLAUDE_CODE_GATEWAY_HINT_HEADERS=1
+        (2.1.273 on; off by default for a custom endpoint): ``auxiliary`` is
+        a side request, ``main``, ``subagent``, ``workflow`` and
+        ``compaction`` belong to the conversation. Without the header, a
+        request that does not share the conversation's first
+        _COMMON_PREFIX_REUSE_MIN_TOKENS tokens (its system prompt and tool
+        contract) is resolved by its own prompt, as it was before the header
+        was read. A compacted or rewound conversation keeps those tokens, so
+        it keeps its session; a session shorter than that has nothing to
+        protect and is taken as before.
         """
+        request_class = (
+            str(lowered_headers.get("x-claude-code-request-class") or "")
+            .strip()
+            .lower()
+        )
+        if request_class == "auxiliary":
+            return "request_class_auxiliary"
+        if request_class in _CLAUDE_CODE_CONVERSATION_REQUEST_CLASSES:
+            return None
         if not prompt_ids:
-            return False
+            return None
         session = self.peek(session_id)
         if session is None:
-            return False
+            return None
         committed = session.committed_token_ids
         span = _COMMON_PREFIX_REUSE_MIN_TOKENS
         if len(committed) < span:
-            return False
-        return tuple(int(token) for token in prompt_ids[:span]) != committed[:span]
+            return None
+        if tuple(int(token) for token in prompt_ids[:span]) == committed[:span]:
+            return None
+        return "prompt_does_not_share_the_conversation_prefix"
 
     def _begin_on_fresh_anon_session(self, cancel_event: Any | None) -> EngineSession:
         while True:
