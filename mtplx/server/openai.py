@@ -28205,11 +28205,16 @@ def _store_generation_final_history_snapshot(
         # was refused every time.
         _flight(state).pc(session_id, {"action": "generation_final", **outcome})
         return outcome
+    bank_token_ids = compatibility.get("token_ids") or prompt_ids
     bank_values = _generation_final_bank_values(
         state,
         final_state,
-        prompt_ids=prompt_ids,
-        final_token_ids=compatibility.get("token_ids") or prompt_ids,
+        # Both sides in the bank's view. For an image prompt the compatibility
+        # check returns content-keyed ids for prompt plus answer, the same
+        # length as the raw ids; compared with the raw prompt they parted at
+        # the first image pad and every checkpoint after it was dropped.
+        prompt_ids=bank_token_ids[: len(prompt_ids)],
+        final_token_ids=bank_token_ids,
     )
     token_ids = bank_values.pop("token_ids")
     lock_started = time.perf_counter()

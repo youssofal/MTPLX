@@ -97,3 +97,49 @@ def test_a_final_state_without_the_field_gives_no_checkpoints():
     )
 
     assert kept == []
+
+
+def test_an_image_turn_keeps_its_checkpoints_after_the_image(monkeypatch):
+    """A streamed image turn: the compatibility check returns content-keyed
+    ids (a surrogate at each image pad) while the prompt arrives raw. Compared
+    as they were, the two parted at the first pad and every checkpoint after
+    the image was dropped, so a later turn that changed text after a
+    screenshot read everything after the image again."""
+
+    import mlx.core as mx
+
+    from mtplx.server import openai
+    from mtplx.vision.splice import VisionSplice, vision_bank_key_ids
+
+    state = _postcommit_state()
+    prompt_ids = [1, 2, 99, 99, 5, 6]
+    tokens = [7, 8]
+    splice = VisionSplice(
+        image_pad_token_id=99,
+        embeddings=mx.zeros((2, 4)),
+        image_digests=(0xC0FFEE,),
+        pad_counts=(2,),
+    )
+    monkeypatch.setattr(
+        openai,
+        "_history_ids_for_postcommit",
+        lambda *args, **kwargs: (prompt_ids + tokens, splice),
+    )
+    final_state = _final_state(tokens)
+    final_state.prompt_gdn_boundaries = (_record(2), _record(4), _record(5))
+
+    result = _store_generation_final_history_snapshot(
+        state,
+        session_id="session-1",
+        prompt_ids=list(prompt_ids),
+        generated={"tokens": tokens, "_final_state": final_state},
+        messages=[ChatMessage(role="user", content="look")],
+        assistant_content="ok",
+        thinking_enabled=False,
+        policy_fingerprint="policy",
+    )
+
+    assert result["stored"] is True
+    put = state.sessions.bank.puts[-1]
+    assert put["token_ids"] == vision_bank_key_ids(prompt_ids + tokens, splice)
+    assert [record[0] for record in put["gdn_boundaries"]] == [2, 4, 5]
