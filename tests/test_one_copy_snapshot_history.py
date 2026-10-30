@@ -257,3 +257,58 @@ def test_an_identical_retry_resumes_from_the_answer_lease_and_decodes_the_same(p
     assert runs[0].stats.cached_tokens == 0
     assert runs[1].stats.cached_tokens == len(prompt)
     assert list(runs[1].tokens) == list(runs[0].tokens)
+
+
+def test_the_final_commit_keeps_the_prompt_end_anchor_a_retry_resumes_from(monkeypatch):
+    """The answer's commit hands over the prefill's checkpoints (#637), which
+    never include the prompt-end anchor: the prompt's lease adds that one. A
+    put with supplied checkpoints used to skip the lease's records, so the
+    answer's entry lost the anchor and the prompt's logits, and a retry of the
+    same prompt (#661) resumed at the last interior checkpoint and read the
+    rest again. Through the server's final-values helper, as the server calls
+    it."""
+
+    monkeypatch.delenv("MTPLX_ONE_COPY", raising=False)
+    from mtplx.cache_state import snapshot_untrimmable_cache
+    from mtplx.one_copy import prompt_lease_fields
+
+    bank = _bank()
+    trunk, mtp = _conversation(40, 64)
+    prompt = list(range(1, 41))
+    interior = [
+        (position, snapshot_untrimmable_cache(trunk), mx.ones((1, 1, 8)))
+        for position in (20, 30)
+    ]
+    prompt_logits = mx.arange(16, dtype=mx.float32).reshape(1, 16)
+    fields = prompt_lease_fields(
+        trunk, committed_mtp_cache=mtp, hidden=mx.ones((1, 1, 8)),
+        prompt_len=len(prompt), boundaries=interior,
+    )
+    bank.put(
+        runtime=RUNTIME, token_ids=prompt, cache=trunk, logits=prompt_logits,
+        hidden=mx.ones((1, 1, 8)), session_id="chat", snapshot_epoch=40,
+        mtp_snapshot_epoch=40, mtp_history_policy="committed", **fields,
+    )
+    _advance(trunk, mtp, 6)
+    answer = [101, 102, 103, 104, 105, 106]
+    final_state = SimpleNamespace(
+        final_trunk_cache=trunk, final_logits=mx.zeros((1, 16)),
+        final_hidden=mx.ones((1, 1, 8)), extra_state=None,
+        prompt_gdn_boundaries=tuple(interior),
+    )
+    state = SimpleNamespace(backend_descriptor=SimpleNamespace(backend_id="native_mtp"))
+    values = server._generation_final_bank_values(
+        state, final_state, prompt_ids=prompt, final_token_ids=prompt + answer
+    )
+    assert [record[0] for record in values["gdn_boundaries"]] == [20, 30]
+    token_ids = values.pop("token_ids")
+    entry = bank.put(
+        runtime=RUNTIME, token_ids=token_ids, keep_live_ref=True, session_id="chat",
+        snapshot_epoch=len(token_ids), mtp_snapshot_epoch=len(token_ids),
+        mtp_history_policy="committed", mtp_history_cache_ref=mtp, **values,
+    )
+    assert entry is not None
+    assert [int(record[0]) for record in entry.gdn_boundaries] == [20, 30, 40]
+    assert entry.boundary_logits is not None
+    assert entry.boundary_logits[0] == 40
+    assert bool(mx.array_equal(entry.boundary_logits[1], prompt_logits))

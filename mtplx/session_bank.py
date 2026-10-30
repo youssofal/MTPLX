@@ -1477,6 +1477,31 @@ class SessionBank:
                     inherited_loader = getattr(
                         prefix_donor, "gdn_boundary_loader", None
                     )
+        else:
+            # Supplied records can lack ones only the stored prefix holds:
+            # the generation-final commit hands over the prefill's
+            # checkpoints (#637), while the prompt-end anchor lives on the
+            # prompt's lease (prompt_lease_fields), and a retry resumes from
+            # that anchor with the logits kept beside it (#661). Records
+            # describe token prefixes, so the donor's stay valid; supplied
+            # ones win a shared position. A loader-backed donor is left
+            # alone: its records are not in memory to merge.
+            prefix_donor = self.longest_prefix(tokens)
+            if (
+                prefix_donor is not None
+                and prefix_donor.gdn_boundaries
+                and getattr(prefix_donor, "gdn_boundary_loader", None) is None
+            ):
+                supplied = {position for position, _state, _hidden in normalized_boundaries}
+                normalized_boundaries = sorted(
+                    normalized_boundaries
+                    + [
+                        (int(r[0]), r[1], r[2] if len(r) > 2 else None)
+                        for r in prefix_donor.gdn_boundaries
+                        if 0 < int(r[0]) <= len(tokens) and int(r[0]) not in supplied
+                    ],
+                    key=lambda item: item[0],
+                )
         if normalized_boundaries:
             # Every stored set keeps its anchors within the checkpoint budget,
             # whatever produced it (a prefill, an inheriting commit, a set
