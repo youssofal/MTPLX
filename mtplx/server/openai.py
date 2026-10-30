@@ -5314,13 +5314,27 @@ def _is_localhost_bind(host: str | None) -> bool:
     return str(host or "").strip().lower().strip("[]") in LOCALHOST_BINDS
 
 
+# What a keyless non-localhost bind is refused with, and how to opt out (#491).
+NETWORK_KEY_REQUIRED_MESSAGE = (
+    "--api-key or --api-key-file is required when --host is not localhost; "
+    "on a network you trust, --no-auth --trust-network serves without a key"
+)
+
+
+def keyless_network_bind_allowed(args: Any) -> bool:
+    """A non-localhost bind may serve without a key only on both opt-ins."""
+    return bool(getattr(args, "no_auth", False)) and bool(
+        getattr(args, "trust_network", False)
+    )
+
+
 def validate_server_security_args(args: argparse.Namespace) -> None:
-    if not _is_localhost_bind(getattr(args, "host", None)) and not getattr(
-        args, "api_key", None
+    if (
+        not _is_localhost_bind(getattr(args, "host", None))
+        and not getattr(args, "api_key", None)
+        and not keyless_network_bind_allowed(args)
     ):
-        raise SystemExit(
-            "--api-key or --api-key-file is required when --host is not localhost"
-        )
+        raise SystemExit(NETWORK_KEY_REQUIRED_MESSAGE)
     if int(getattr(args, "stream_interval", 1)) < 1:
         raise SystemExit("--stream-interval must be >= 1")
     if int(getattr(args, "rate_limit", 0)) < 0:
@@ -43917,8 +43931,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help=(
             "Serve without API-key auth even when MTPLX_API_KEY or a config "
-            "key is set. Localhost binds only — non-localhost still requires "
-            "a key (#235)."
+            "key is set (#235). A non-localhost bind also needs "
+            "--trust-network."
+        ),
+    )
+    parser.add_argument(
+        "--trust-network",
+        action="store_true",
+        help=(
+            "With --no-auth, serve without an API key on a non-localhost "
+            "bind. Anyone who can reach the port can use the model, so use "
+            "it only on a network you trust (#491)."
         ),
     )
     parser.add_argument(
@@ -44574,8 +44597,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args.api_key_source = resolved_key.source
     if getattr(args, "no_auth", False):
         # #235: an explicit off-switch beats patching site-packages. The
-        # non-localhost guard downstream still refuses keyless remote binds,
-        # so this can only widen access on loopback.
+        # non-localhost guard downstream still refuses keyless remote binds
+        # unless --trust-network is given as well (#491).
         args.api_key = None
         args.api_key_source = "disabled_by_no_auth_flag"
     try:
@@ -44663,6 +44686,19 @@ def _refuse_unresolvable_retrieval_models(registry: Any) -> None:
     raise RetrievalError("\n".join(lines))
 
 
+def _startup_api_key_line(args: Any) -> str:
+    if getattr(args, "api_key", None):
+        return "API key: required"
+    if not _is_localhost_bind(getattr(args, "host", None)):
+        # Only reachable through --no-auth --trust-network (#491): say so
+        # where the operator reads the bind, not only in the help text.
+        return (
+            "API key: off (--no-auth --trust-network): anyone who can reach "
+            f"port {int(args.port)} can use the model"
+        )
+    return "API key: leave blank for localhost"
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     validate_server_security_args(args)
@@ -44695,7 +44731,11 @@ def main(argv: list[str] | None = None) -> None:
             _startup_line(
                 "Network OpenAI API Base URL: "
                 + network_url
-                + " (use from other devices and VM guests, with your API key)"
+                + (
+                    " (use from other devices and VM guests, with your API key)"
+                    if getattr(args, "api_key", None)
+                    else " (use from other devices and VM guests, no API key)"
+                )
             )
     else:
         _startup_line("Chat UI: " + chat_url)
@@ -44710,10 +44750,7 @@ def main(argv: list[str] | None = None) -> None:
         }[_reasoning_history_mode(state)]
         + f" (policy {getattr(args, 'preserve_thinking', 'auto')})"
     )
-    if getattr(args, "api_key", None):
-        _startup_line("API key: required")
-    else:
-        _startup_line("API key: leave blank for localhost")
+    _startup_line(_startup_api_key_line(args))
     _startup_line("Health check: " + _startup_server_url(args) + "/health")
     _startup_line("Keep this terminal open. Press Ctrl-C to stop MTPLX.")
     if args.server_console:

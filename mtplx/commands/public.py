@@ -9623,10 +9623,18 @@ def cmd_serve_public(args: Any) -> int:
         _print_serve_start_line(f"error: {exc}")
         return 2
     api_key = getattr(args, "api_key", None)
-    if not _is_localhost_bind(getattr(args, "host", None)) and not api_key:
+    keyless_network = bool(getattr(args, "no_auth", False)) and bool(
+        getattr(args, "trust_network", False)
+    )
+    if (
+        not _is_localhost_bind(getattr(args, "host", None))
+        and not api_key
+        and not keyless_network
+    ):
         payload = {
             "error": "--api-key or --api-key-file is required when --host is not localhost",
             "host": getattr(args, "host", None),
+            "trusted_network_opt_out": "mtplx serve --no-auth --trust-network",
         }
         if getattr(args, "json", False):
             _print(payload)
@@ -9639,6 +9647,10 @@ def cmd_serve_public(args: Any) -> int:
             print(f"try: mtplx {server_command} --host 127.0.0.1")
             print(
                 f"try: mtplx {server_command} --host 0.0.0.0 --api-key-file ~/.mtplx/api-key"
+            )
+            print(
+                "on a network you trust: mtplx serve --host 0.0.0.0 --no-auth "
+                "--trust-network (anyone who can reach the port can use the model)"
             )
         return 2
     cli_flags = getattr(args, "_cli_flags", set()) or set()
@@ -10082,6 +10094,8 @@ def cmd_serve_public(args: Any) -> int:
     # spelling died at this parser with an argparse error.
     if bool(getattr(args, "no_auth", False)):
         cmd.append("--no-auth")
+    if bool(getattr(args, "trust_network", False)):
+        cmd.append("--trust-network")
     # The chat model is already an absolute path by this point, but retrieval
     # references are resolved inside the server, which has no cache directory
     # of its own — so a model pulled into a custom --cache-dir would not be

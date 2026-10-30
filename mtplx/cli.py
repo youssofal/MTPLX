@@ -3660,7 +3660,19 @@ def build_parser() -> argparse.ArgumentParser:
     serve_p.add_argument(
         "--no-auth",
         action="store_true",
-        help="Disable API-key auth for localhost binds (non-localhost still requires a key)",
+        help=(
+            "Disable API-key auth. A non-localhost bind also needs "
+            "--trust-network"
+        ),
+    )
+    serve_p.add_argument(
+        "--trust-network",
+        action="store_true",
+        help=(
+            "With --no-auth, serve without an API key on a non-localhost bind "
+            "(--host 0.0.0.0). Anyone who can reach the port can use the "
+            "model: only on a network you trust"
+        ),
     )
     serve_p.add_argument("--depth", type=int, default=3)
     _add_mtp_toggle_args(serve_p)

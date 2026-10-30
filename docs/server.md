@@ -272,6 +272,19 @@ click Allow. To pass the key inline instead of a file:
 mtplx serve --host 0.0.0.0 --port 8000 --api-key "$MTPLX_API_KEY"
 ```
 
+On a network you trust, you can serve without a key. It takes two flags, so
+it never happens by accident: `--no-auth` switches the key off and
+`--trust-network` confirms that a non-localhost bind may run without one.
+Anyone who can reach the port can then use the model, and the startup banner
+says so.
+
+```bash
+mtplx serve --host 0.0.0.0 --port 8000 --no-auth --trust-network
+```
+
+An SSH tunnel (`ssh -N -L 8000:localhost:8000 you@your-mac`) keeps the
+server on localhost and needs no key either.
+
 For Open WebUI, set the OpenAI-compatible base URL to:
 
 ```text

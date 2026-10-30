@@ -132,7 +132,9 @@ instead of pretending to hot-swap.
   that bind.
 - If you pass `--host 0.0.0.0`, MTPLX requires `--api-key` for chat
   completions; the dashboard control endpoints (`/v1/mtplx/settings`,
-  `/v1/mtplx/cancel/{id}`) inherit that same middleware.
+  `/v1/mtplx/cancel/{id}`) inherit that same middleware. With
+  `--no-auth --trust-network` there is no key, so anyone who can reach the
+  port can chat, change these settings and cancel requests.
 - CORS is wide-open (`allow_origins=["*"]`) for browser-driven
   third-party tooling. Treat this as the same trust boundary as
   `/v1/chat/completions`.

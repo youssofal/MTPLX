@@ -152,7 +152,9 @@ mtplx serve --reasoning-parser qwen3
 mtplx serve --no-mtp
 ```
 
-Non-localhost binds require `--api-key`. Requests may authenticate with either:
+Non-localhost binds require `--api-key`, unless you pass both `--no-auth`
+and `--trust-network` to serve keyless on a network you trust (anyone who can
+reach the port can then use the model). Requests may authenticate with either:
 
 ```text
 Authorization: Bearer <key>
