@@ -211,3 +211,76 @@ def test_stream_with_tools_length_stays_empty(monkeypatch):
     response = _post(TestClient(create_app(_state())), stream=True)
 
     assert _stream_content(response) == ""
+
+
+# --- replies that were already right stay as they were ----------------------
+
+
+def test_nonstream_with_tools_closed_think_answer_is_unchanged(monkeypatch):
+    _patch_nonstream(monkeypatch, "<think>The tool said 7505.</think>\n\nPORT=7505", "stop")
+    response = _post(TestClient(create_app(_state())))
+
+    message = response.json()["choices"][0]["message"]
+    assert message["content"] == "PORT=7505"
+    assert message.get("reasoning_content") == "The tool said 7505."
+
+
+def test_stream_with_tools_closed_think_answer_is_unchanged(monkeypatch):
+    monkeypatch.setattr(
+        openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3]
+    )
+    monkeypatch.setattr(
+        openai,
+        "_run_generation",
+        _fake_streaming_generation(
+            "The tool said 7505.</think>\n\nPORT=7505", finish_reason="stop"
+        ),
+    )
+    response = _post(TestClient(create_app(_state())), stream=True)
+
+    assert _stream_content(response) == "PORT=7505"
+
+
+def test_anthropic_messages_with_tools_recovers_unclosed_answer(monkeypatch):
+    # #583 counted empty turns on /v1/messages too; it inherits the
+    # non-stream path.
+    _patch_nonstream(monkeypatch, "<think>PORT=7505", "stop")
+    response = TestClient(create_app(_state())).post(
+        "/v1/messages",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "model": "mtplx-test-model",
+            "max_tokens": 128,
+            "tools": [
+                {
+                    "name": "lookup_service",
+                    "description": "Look up a service port.",
+                    "input_schema": TOOLS[0]["function"]["parameters"],
+                }
+            ],
+            "messages": [
+                {"role": "user", "content": "Which port? Answer only with PORT=<n>."},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "lookup_service",
+                            "input": {"name": "billing"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_1", "content": '{"port": 7505}'}
+                    ],
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    texts = [block["text"] for block in response.json()["content"] if block["type"] == "text"]
+    assert texts == ["PORT=7505"]
