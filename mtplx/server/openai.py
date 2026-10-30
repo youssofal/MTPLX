@@ -69,7 +69,7 @@ from fastapi.responses import (
     Response,
     StreamingResponse,
 )
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, PrivateAttr
 
 from mtplx import progress_heartbeat
 from mtplx.a3b_mtp_batch import (
@@ -1782,6 +1782,14 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
+    # Set by the Anthropic conversion only. Pydantic does not read a private
+    # attribute from client JSON, so a body field of the same name is ignored.
+    _auto_mode_classifier: bool = PrivateAttr(default=False)
+
+    @property
+    def auto_mode_classifier(self) -> bool:
+        return self._auto_mode_classifier
+
     model: str | None = None
     messages: list[ChatMessage] = Field(default_factory=list)
     max_tokens: int | None = None
@@ -2138,6 +2146,7 @@ class AnthropicMessagesRequest(BaseModel):
     tool_choice: Any = None
     thinking: Any | None = None
     chat_template_kwargs: dict[str, Any] | None = None
+    output_config: Any | None = None
     depth: int | None = None
     draft_block_size: int | None = None
     gemma_draft_block_size: int | None = None
@@ -5306,13 +5315,27 @@ def _is_localhost_bind(host: str | None) -> bool:
     return str(host or "").strip().lower().strip("[]") in LOCALHOST_BINDS
 
 
+# What a keyless non-localhost bind is refused with, and how to opt out (#491).
+NETWORK_KEY_REQUIRED_MESSAGE = (
+    "--api-key or --api-key-file is required when --host is not localhost; "
+    "on a network you trust, --no-auth --trust-network serves without a key"
+)
+
+
+def keyless_network_bind_allowed(args: Any) -> bool:
+    """A non-localhost bind may serve without a key only on both opt-ins."""
+    return bool(getattr(args, "no_auth", False)) and bool(
+        getattr(args, "trust_network", False)
+    )
+
+
 def validate_server_security_args(args: argparse.Namespace) -> None:
-    if not _is_localhost_bind(getattr(args, "host", None)) and not getattr(
-        args, "api_key", None
+    if (
+        not _is_localhost_bind(getattr(args, "host", None))
+        and not getattr(args, "api_key", None)
+        and not keyless_network_bind_allowed(args)
     ):
-        raise SystemExit(
-            "--api-key or --api-key-file is required when --host is not localhost"
-        )
+        raise SystemExit(NETWORK_KEY_REQUIRED_MESSAGE)
     if int(getattr(args, "stream_interval", 1)) < 1:
         raise SystemExit("--stream-interval must be >= 1")
     if int(getattr(args, "rate_limit", 0)) < 0:
@@ -6596,6 +6619,31 @@ def _anthropic_disable_parallel_tool_use(tool_choice: Any) -> bool | None:
     return bool(raw)
 
 
+# Claude Code sends output_config.effort in Anthropic's vocabulary, which has
+# "max" and "none"; the chat-template vocabulary has neither. "high" is left
+# out on purpose: it is what Claude Code sends when the user never picked a
+# level, so it keeps the server's default instead of standing for a choice.
+# Qwen 3.8 has no "high" and maps it up to xhigh, which on the dense models
+# would replace their measured medium default (51.5 s against 314.9 s for the
+# same coding task, descriptors.py) on every default Claude Code turn.
+_ANTHROPIC_EFFORT_TO_REASONING_EFFORT = {
+    "low": "low",
+    "medium": "medium",
+    "xhigh": "xhigh",
+    "max": "xhigh",
+    "none": "low",
+}
+
+
+def _anthropic_output_config_effort(output_config: Any) -> str | None:
+    if not isinstance(output_config, dict):
+        return None
+    effort = output_config.get("effort")
+    if not isinstance(effort, str):
+        return None
+    return _ANTHROPIC_EFFORT_TO_REASONING_EFFORT.get(effort.strip().lower())
+
+
 def _anthropic_to_chat_request(
     request: AnthropicMessagesRequest,
 ) -> ChatCompletionRequest:
@@ -6618,6 +6666,10 @@ def _anthropic_to_chat_request(
     requested_effort = getattr(request, "reasoning_effort", None)
     if isinstance(requested_effort, str) and requested_effort.strip():
         extra_fields["reasoning_effort"] = requested_effort.strip()
+    else:
+        output_config_effort = _anthropic_output_config_effort(request.output_config)
+        if output_config_effort:
+            extra_fields["reasoning_effort"] = output_config_effort
     disable_parallel = _anthropic_disable_parallel_tool_use(request.tool_choice)
     chat_request = ChatCompletionRequest(
         model=request.model,
@@ -6646,7 +6698,52 @@ def _anthropic_to_chat_request(
         # own bridges but record the defaulting for observability instead of
         # rejecting (a 400 here would break those bridges).
         chat_request.anthropic_max_tokens_defaulted = True
+    # Claude Code's auto-mode safety classifier. The policy turns thinking
+    # off for it, because it needs only a verdict.
+    chat_request._auto_mode_classifier = _claude_code_auto_mode_classifier(
+        request, system_text
+    )
     return chat_request
+
+
+# The first sentence of the system prompt of Claude Code's auto-mode safety
+# classifier, in both of its stages (claude-cli 2.1.201).
+_CLAUDE_CODE_CLASSIFIER_SYSTEM_START = (
+    "You are a security monitor for autonomous AI coding agents."
+)
+
+
+def _anthropic_system_has_billing_block(system: Any) -> bool:
+    """Whether the system carries Claude Code's x-anthropic-billing-header line."""
+    blocks = system if isinstance(system, list) else [system]
+    for block in blocks:
+        if any(
+            line.strip().lower().startswith("x-anthropic-billing-header:")
+            for line in _anthropic_content_to_text([block]).splitlines()
+        ):
+            return True
+    return False
+
+
+def _claude_code_auto_mode_classifier(
+    request: AnthropicMessagesRequest, system_text: str
+) -> bool:
+    """Whether a /v1/messages request is Claude Code's auto-mode safety classifier.
+
+    The classifier wants a verdict and is written for a model without extended
+    thinking: it sends no ``thinking`` field, which on the Anthropic API means
+    thinking off, while this server thinks by default. Thinking first pushed
+    the verdict past Claude Code's classifier deadline (#669). Turning thinking
+    off changes generation, so only the classifier's exact shape matches:
+    Claude Code's billing block, a system prompt that begins with the
+    classifier's first sentence, no tools, no stream, and no thinking choice of
+    the client's own.
+    """
+    if request.tools or request.stream or request.thinking is not None:
+        return False
+    if not system_text.startswith(_CLAUDE_CODE_CLASSIFIER_SYSTEM_START):
+        return False
+    return _anthropic_system_has_billing_block(request.system)
 
 
 def _anthropic_tool_input_from_arguments(arguments: Any) -> dict[str, Any]:
@@ -8328,7 +8425,21 @@ def _tool_example_value(schema: Any) -> str:
 def _tool_call_example(tools: list[dict[str, Any]]) -> str:
     if not tools:
         return "<tool_call>\n<function=tool_name>\n</function>\n</tool_call>"
-    tool = tools[0]
+    # Models copy this example (#170, the <string> wrappers). In compact mode
+    # (OpenCode's) the chat template is given no tools, so it is also the only
+    # place the prompt shows how a parameter is written. Built from a first
+    # tool that takes no parameters, it showed none, and after a screenshot
+    # the model wrote values as "<parameter=290>" (#584). Use the first tool
+    # that has parameters; the example is unchanged whenever the first does.
+    tool = next(
+        (
+            candidate
+            for candidate in tools
+            if isinstance(_tool_json_schema(candidate).get("properties"), dict)
+            and _tool_json_schema(candidate)["properties"]
+        ),
+        tools[0],
+    )
     name = _tool_spec_name(tool) or "tool_name"
     schema = _tool_json_schema(tool)
     properties = schema.get("properties")
@@ -26221,6 +26332,9 @@ def _request_observability(
         if key.lower()
         in {
             "x-mtplx-session-id",
+            "x-claude-code-session-id",
+            "x-claude-code-agent-id",
+            "x-claude-code-request-class",
             "x-openwebui-chat-id",
             "x-openwebui-user-id",
             "x-openwebui-task",
@@ -31227,6 +31341,10 @@ def _run_generation(
     ttft_clock = request_spans.clock_from_observability(request_observability)
     if ttft_clock is not None:
         ttft_clock.mark("scheduler_queue")
+        # The serial scheduler queues a request before this function runs, so
+        # the generation lock below is uncontended. Report that queue time as
+        # lock wait, as the batched lanes already do with queue_wait_s.
+        lock_wait_time_s = ttft_clock.scheduler_queue_wait_s() or 0.0
         _owner = getattr(state, "model_scheduler", None)
         _receipt = (
             _owner.active_item_receipt()
@@ -33986,6 +34104,28 @@ def _generated_text_attempts_tool_call(
     content = "".join(part for field, part in chunks if field == "content").lower()
     return any(
         marker in content
+        for marker in _ThinkingContentStreamSplitter._TOOL_CONTROL_MARKERS
+    )
+
+
+def _unclosed_reasoning_recovery_allowed(
+    *, finish_reason: str, tools_active: bool, generated_text: str
+) -> bool:
+    """Gate for surfacing an unclosed reasoning block as visible content.
+
+    Needs a natural stop (a ``length`` cut is not an answer). With tools
+    declared, every agent turn qualifies, so the turn must also hold no tool
+    markup: a call that opened inside the reasoning belongs to the tool
+    parser, not to the recovered text. A turn whose tool call parsed never
+    reaches the recovery, because the tool-call branch comes first.
+    """
+    if finish_reason != "stop":
+        return False
+    if not tools_active:
+        return True
+    lowered = generated_text.lower()
+    return not any(
+        marker in lowered
         for marker in _ThinkingContentStreamSplitter._TOOL_CONTROL_MARKERS
     )
 
@@ -41410,8 +41550,15 @@ def create_app(state: ServerState) -> FastAPI:
                                             ):
                                                 yield mark_sse_sent(chunk)
                                 recover_unclosed_reasoning = (
-                                    str(generated.get("finish_reason") or "") == "stop"
-                                    and not tools_active
+                                    _unclosed_reasoning_recovery_allowed(
+                                        finish_reason=str(
+                                            generated.get("finish_reason") or ""
+                                        ),
+                                        tools_active=tools_active,
+                                        generated_text=str(
+                                            generated.get("text") or ""
+                                        ),
+                                    )
                                 )
                                 for field, text in _finish_stream_splitter(
                                     splitter,
@@ -42515,11 +42662,15 @@ def create_app(state: ServerState) -> FastAPI:
                     suppress_visible_reasoning=suppress_visible_reasoning,
                     footer_allowed=_stats_footer_allowed(state, headers, metadata),
                     # Same gate as the streaming twin (#F3): recover only on a
-                    # natural stop with no tools declared. /v1/messages
-                    # inherits through chat_completions.
+                    # natural stop; with tools declared also only when the
+                    # turn holds no tool markup. /v1/messages inherits
+                    # through chat_completions.
                     recover_unclosed_reasoning=(
-                        str(generated.get("finish_reason") or "") == "stop"
-                        and not tools_active
+                        _unclosed_reasoning_recovery_allowed(
+                            finish_reason=str(generated.get("finish_reason") or ""),
+                            tools_active=tools_active,
+                            generated_text=str(generated.get("text") or ""),
+                        )
                     ),
                     suppress_stats_footer=request.suppress_stats_footer,
                 )
@@ -43933,8 +44084,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help=(
             "Serve without API-key auth even when MTPLX_API_KEY or a config "
-            "key is set. Localhost binds only — non-localhost still requires "
-            "a key (#235)."
+            "key is set (#235). A non-localhost bind also needs "
+            "--trust-network."
+        ),
+    )
+    parser.add_argument(
+        "--trust-network",
+        action="store_true",
+        help=(
+            "With --no-auth, serve without an API key on a non-localhost "
+            "bind. Anyone who can reach the port can use the model, so use "
+            "it only on a network you trust (#491)."
         ),
     )
     parser.add_argument(
@@ -44590,8 +44750,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args.api_key_source = resolved_key.source
     if getattr(args, "no_auth", False):
         # #235: an explicit off-switch beats patching site-packages. The
-        # non-localhost guard downstream still refuses keyless remote binds,
-        # so this can only widen access on loopback.
+        # non-localhost guard downstream still refuses keyless remote binds
+        # unless --trust-network is given as well (#491).
         args.api_key = None
         args.api_key_source = "disabled_by_no_auth_flag"
     try:
@@ -44679,6 +44839,19 @@ def _refuse_unresolvable_retrieval_models(registry: Any) -> None:
     raise RetrievalError("\n".join(lines))
 
 
+def _startup_api_key_line(args: Any) -> str:
+    if getattr(args, "api_key", None):
+        return "API key: required"
+    if not _is_localhost_bind(getattr(args, "host", None)):
+        # Only reachable through --no-auth --trust-network (#491): say so
+        # where the operator reads the bind, not only in the help text.
+        return (
+            "API key: off (--no-auth --trust-network): anyone who can reach "
+            f"port {int(args.port)} can use the model"
+        )
+    return "API key: leave blank for localhost"
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     validate_server_security_args(args)
@@ -44711,7 +44884,11 @@ def main(argv: list[str] | None = None) -> None:
             _startup_line(
                 "Network OpenAI API Base URL: "
                 + network_url
-                + " (use from other devices and VM guests, with your API key)"
+                + (
+                    " (use from other devices and VM guests, with your API key)"
+                    if getattr(args, "api_key", None)
+                    else " (use from other devices and VM guests, no API key)"
+                )
             )
     else:
         _startup_line("Chat UI: " + chat_url)
@@ -44726,10 +44903,7 @@ def main(argv: list[str] | None = None) -> None:
         }[_reasoning_history_mode(state)]
         + f" (policy {getattr(args, 'preserve_thinking', 'auto')})"
     )
-    if getattr(args, "api_key", None):
-        _startup_line("API key: required")
-    else:
-        _startup_line("API key: leave blank for localhost")
+    _startup_line(_startup_api_key_line(args))
     _startup_line("Health check: " + _startup_server_url(args) + "/health")
     _startup_line("Keep this terminal open. Press Ctrl-C to stop MTPLX.")
     if args.server_console:

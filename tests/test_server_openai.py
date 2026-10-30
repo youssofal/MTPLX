@@ -10464,6 +10464,106 @@ def test_anthropic_bridge_forwards_reasoning_effort():
     assert openai._anthropic_to_chat_request(without).reasoning_effort is None
 
 
+def _anthropic_effort_request(**fields):
+    return openai.AnthropicMessagesRequest(
+        model="m",
+        max_tokens=16,
+        messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        **fields,
+    )
+
+
+@pytest.mark.parametrize(
+    ("sent", "expected"),
+    [
+        ("low", "low"),
+        ("medium", "medium"),
+        ("high", None),
+        ("xhigh", "xhigh"),
+        ("max", "xhigh"),
+        ("none", "low"),
+    ],
+)
+def test_anthropic_bridge_maps_output_config_effort(sent, expected):
+    # Claude Code sends output_config.effort, never the flat field. "high" is
+    # what it sends when the user picked no level, so it keeps the server's
+    # default.
+    request = _anthropic_effort_request(output_config={"effort": sent})
+    chat = openai._anthropic_to_chat_request(request)
+    assert chat.reasoning_effort == expected
+
+
+def test_anthropic_bridge_flat_reasoning_effort_beats_output_config():
+    request = _anthropic_effort_request(
+        reasoning_effort="low", output_config={"effort": "max"}
+    )
+    assert openai._anthropic_to_chat_request(request).reasoning_effort == "low"
+
+
+@pytest.mark.parametrize(
+    "output_config",
+    [None, {}, {"effort": "ultra"}, {"effort": 3}, {"effort": None}, "high", ["high"]],
+)
+def test_anthropic_bridge_ignores_absent_or_unknown_output_config(output_config):
+    fields = {} if output_config is None else {"output_config": output_config}
+    chat = openai._anthropic_to_chat_request(_anthropic_effort_request(**fields))
+    assert chat.reasoning_effort is None
+
+
+def test_anthropic_effort_vocabulary_is_accepted_by_the_server():
+    # Whatever the bridge emits must survive the server's own normaliser. An
+    # unmapped "max" would be a 400 on every Claude Code `--effort max` request.
+    from mtplx.reasoning_effort import normalize_reasoning_effort
+
+    for emitted in openai._ANTHROPIC_EFFORT_TO_REASONING_EFFORT.values():
+        assert normalize_reasoning_effort(emitted) == emitted
+
+
+@pytest.mark.parametrize(
+    ("sent", "expected"),
+    [
+        ("low", "low"),
+        ("medium", "medium"),
+        ("high", "medium"),
+        ("xhigh", "xhigh"),
+        ("max", "xhigh"),
+        ("none", "low"),
+    ],
+)
+def test_anthropic_messages_route_applies_output_config_effort(monkeypatch, sent, expected):
+    from mtplx.backends.descriptors import QWEN3_8_REASONING_CODEC
+
+    state = _fake_state()
+    state.runtime.tokenizer = StreamingTokenizer()
+    state.args.reasoning = "on"
+    state.args.enable_thinking = True
+    state.args.reasoning_effort = "medium"  # the server default the request must override
+    state.args.stats_footer = False
+    captured = {}
+    monkeypatch.setattr(openai, "_reasoning_codec_for_state", lambda _state: QWEN3_8_REASONING_CODEC)
+
+    def generate(_state, _prompt_ids, **kwargs):
+        captured.update(kwargs)
+        return _fake_generation("ok")
+
+    monkeypatch.setattr(openai, "_run_generation", generate)
+    client = TestClient(create_app(state))
+
+    response = client.post(
+        "/v1/messages",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "model": "mtplx-test-model",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"effort": sent},
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert captured["request_observability"]["request_reasoning_effort"] == expected
+
+
 def test_cancel_attribution_first_origin_wins_and_labels():
     # #381: one shared cancel event, many setters — the terminal frame
     # blamed every non-disconnect trip on POST /v1/mtplx/cancel. The first
@@ -11739,6 +11839,105 @@ def test_anthropic_messages_returns_tool_use_nonstream(monkeypatch):
     assert payload["content"][0]["name"] == "Bash"
     assert payload["content"][0]["input"] == {"command": "./test.sh"}
     assert "<tool_call" not in response.text
+
+
+def test_anthropic_auto_mode_classifier_request_runs_with_thinking_off(monkeypatch):
+    # Issue #669: Claude Code's safety classifier only needs a verdict, so its
+    # request runs with thinking off. The same request from a client that is
+    # not Claude Code (no billing block) keeps the default.
+    state = _fake_state()
+    state.runtime.tokenizer = CaptureTokenizer()
+    state.args.stats_footer = False
+    state.args.reasoning_parser = "qwen3"
+    client = TestClient(create_app(state))
+    seen: list[dict[str, object]] = []
+
+    def fake_run_generation(*_args, **kwargs):
+        seen.append(dict(kwargs["request_observability"]))
+        return _fake_generation("ok")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+    user = [{"role": "user", "content": "Is `rm -rf build` safe?"}]
+    monitor = "You are a security monitor for autonomous AI coding agents."
+    billing = {
+        "type": "text",
+        "text": "x-anthropic-billing-header: cc_version=2.1.201.af3; cc_entrypoint=sdk-cli;",
+    }
+
+    # A short max_tokens with a foreign system prompt reads as a background
+    # title job, which is a different path. Keep both requests above it.
+    classifier = client.post(
+        "/v1/messages",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "model": "mtplx-test-model",
+            "max_tokens": 2112,
+            "system": [billing, {"type": "text", "text": monitor}],
+            "messages": user,
+        },
+    )
+    classifier_renders = list(state.runtime.tokenizer.calls)
+    normal = client.post(
+        "/v1/messages",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "model": "mtplx-test-model",
+            "max_tokens": 2112,
+            "system": monitor,
+            "messages": user,
+        },
+    )
+
+    assert classifier.status_code == 200
+    assert normal.status_code == 200
+    classifier_stats, normal_stats = seen
+    assert classifier_stats["request_enable_thinking"] is False
+    assert normal_stats["request_enable_thinking"] is True
+    normal_renders = state.runtime.tokenizer.calls[len(classifier_renders) :]
+    assert classifier_renders and normal_renders
+    assert all(kwargs.get("enable_thinking") is False for _m, kwargs in classifier_renders)
+    assert all(kwargs.get("enable_thinking") is not False for _m, kwargs in normal_renders)
+
+
+@pytest.mark.parametrize("body_key", ["auto_mode_classifier", "_auto_mode_classifier"])
+def test_client_cannot_set_auto_mode_classifier_flag_on_chat_completions(
+    monkeypatch, body_key
+):
+    # The flag comes from the Anthropic conversion only. A chat body field of
+    # either name must leave thinking on, whatever its value.
+    state = _fake_state()
+    state.runtime.tokenizer = CaptureTokenizer()
+    state.args.stats_footer = False
+    state.args.reasoning_parser = "qwen3"
+    client = TestClient(create_app(state))
+    seen: dict[str, object] = {}
+
+    def fake_run_generation(*_args, **kwargs):
+        seen["request_observability"] = dict(kwargs["request_observability"])
+        return _fake_generation("ok")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "model": "mtplx-test-model",
+            "max_tokens": 256,
+            body_key: True,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a security monitor for autonomous AI coding agents.",
+                },
+                {"role": "user", "content": "Is `rm -rf build` safe?"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    stats = seen["request_observability"]
+    assert stats["request_enable_thinking"] is True
 
 
 def test_anthropic_messages_streams_tool_use_without_text_leak(monkeypatch):

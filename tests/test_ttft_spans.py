@@ -612,3 +612,33 @@ def test_a_response_from_a_lane_that_does_not_publish_still_carries_spans(
         assert spans["origin"] == "http_arrival"
         for name in ("encode", "policy", "prologue", "dispatch"):
             assert f"{name}_s" in spans["exclusive_s"], (name, spans)
+
+
+def test_scheduler_queue_wait_is_the_scheduler_queue_span():
+    clock = request_spans.RequestClock(100.0)
+    clock.mark("dispatch", 100.700)
+    assert clock.scheduler_queue_wait_s() is None
+    clock.mark("scheduler_queue", 101.900)
+    clock.mark("engine_first_token", 102.500)
+
+    assert clock.scheduler_queue_wait_s() == pytest.approx(1.2)
+    assert clock.scheduler_queue_wait_s() == pytest.approx(
+        clock.summary()["exclusive_s"]["scheduler_queue_s"]
+    )
+
+
+def test_scheduler_queue_wait_counts_only_the_attempt_that_runs():
+    clock = request_spans.RequestClock(0.0)
+    clock.mark("dispatch", 0.2)
+    clock.mark("scheduler_queue", 3.0)
+    clock.discard_attempt("retry", now=5.0)
+    clock.mark("scheduler_queue", 5.4)
+
+    assert clock.scheduler_queue_wait_s() == pytest.approx(0.4)
+
+
+def test_scheduler_queue_wait_is_none_without_a_dispatch():
+    clock = request_spans.RequestClock(0.0)
+    clock.mark("scheduler_queue", 1.0)
+
+    assert clock.scheduler_queue_wait_s() is None

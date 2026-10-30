@@ -112,7 +112,7 @@ reasoning configuration.
 
 Thinking depth is a request-level setting with a server-level default.
 
-- Per request: `reasoning_effort` in the chat completions body (`"reasoning_effort": "high"`), or `reasoning.effort` on the Responses API. Accepted values are `low`, `medium`, `high` and `xhigh`. OpenAI's `minimal` and `none` (and `off`, `disable`, `disabled`) are accepted and map to `low`; they do not switch thinking off.
+- Per request: `reasoning_effort` in the chat completions body (`"reasoning_effort": "high"`), `reasoning.effort` on the Responses API, or `output_config.effort` on `/v1/messages` (which Claude Code sends on every request). Accepted values are `low`, `medium`, `high` and `xhigh`. OpenAI's `minimal` and `none` (and `off`, `disable`, `disabled`) are accepted and map to `low`; they do not switch thinking off. On `/v1/messages`, Anthropic's `high`, which Claude Code sends unless you pick another level with `/effort`, keeps the server default (medium on the Qwen 3.8 dense models, xhigh on Flash-Next); `max` maps to `xhigh`, `none` maps to `low`, a value MTPLX does not recognise is ignored so the server default applies, and an explicit `reasoning_effort` field in the same request wins.
 - Server default: `mtplx start --reasoning-effort high` (or `mtplx serve`) applies to every request that carries no value. `auto` (the default) uses the loaded model family's own default.
 - App: the effort picker in the chat settings lists the levels the loaded model supports.
 
@@ -127,7 +127,7 @@ Supported now:
 - `system` as text or text content blocks
 - `messages[].content` as text or text/tool-result content blocks
 - `max_tokens`, `temperature`, `top_p`, and `top_k`
-- `tools`, `tool_choice`, `stop_sequences`, and `thinking`
+- `tools`, `tool_choice`, `stop_sequences`, `thinking`, and `output_config.effort`
 - `stream=false`
 - `stream=true` server-sent events with `message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, and `message_stop`
 
@@ -152,7 +152,9 @@ mtplx serve --reasoning-parser qwen3
 mtplx serve --no-mtp
 ```
 
-Non-localhost binds require `--api-key`. Requests may authenticate with either:
+Non-localhost binds require `--api-key`, unless you pass both `--no-auth`
+and `--trust-network` to serve keyless on a network you trust (anyone who can
+reach the port can then use the model). Requests may authenticate with either:
 
 ```text
 Authorization: Bearer <key>

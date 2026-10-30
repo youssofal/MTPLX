@@ -28,6 +28,57 @@ def pytest_configure(config):
             "comparison. Unset it, or acknowledge regeneration explicitly "
             "with MTPLX_UPDATE_GOLDENS_ACK=yes."
         )
+    _drop_operator_switches()
+
+
+# Variables that steer the suite itself (opt-in QA arms, artifacts to check,
+# local model paths, golden regeneration) rather than MTPLX. Everything else
+# under MTPLX_ is a runtime switch and is dropped before collection.
+_SUITE_VARIABLES = frozenset(
+    {
+        "MTPLX_UPDATE_GOLDENS",
+        "MTPLX_UPDATE_GOLDENS_ACK",
+        "MTPLX_TEST_BASELINE",
+        "MTPLX_TEST_TOKENIZER_DIR",
+        "MTPLX_RUN_LONG_CONTEXT_QA",
+        "MTPLX_LONG_CONTEXT_QA_ARTIFACT",
+        "MTPLX_QA_BURST_BASELINE",
+        "MTPLX_RUN_32K_MEMORY_QA",
+        "MTPLX_32K_QA_MODEL",
+        "MTPLX_DSV4_MTP_MODEL",
+        "MTPLX_PREFILL_TPS_ARTIFACT",
+        "MTPLX_PREFILL_TPS_REQUIRE_FULL",
+        "MTPLX_SSE_DUMP",
+        # The M1-M4 rehearsal runs the suite on the fallback routes on
+        # purpose: MLX_METAL_GPU_ARCH=applegpu_g16s plus this switch is the
+        # release gate's rehearsal subset, which dropping it would turn into
+        # a second run of the M5 routes.
+        "MTPLX_FORCE_GPU_FAMILY_FALLBACK",
+    }
+)
+
+_dropped_switches: list[str] = []
+
+
+def _drop_operator_switches():
+    # An operator who runs the suite from the shell they serve from carries
+    # their lane switches into it (MTPLX_SEGMENTED_KV=1, MTPLX_NAX_VERIFY=1,
+    # chunk sizes, ...). Tests pin the defaults, and code that reads a switch
+    # at import or caches it would keep the operator's value even under a
+    # per-test monkeypatch, so the switches leave the process before any
+    # test module is imported. Tests that exercise a switch set it themselves.
+    for name in sorted(os.environ):
+        if name.startswith("MTPLX_") and name not in _SUITE_VARIABLES:
+            _dropped_switches.append(name)
+            del os.environ[name]
+
+
+def pytest_report_header(config):
+    if _dropped_switches:
+        return "ignored MTPLX switches from the environment: " + ", ".join(
+            _dropped_switches
+        )
+    return None
 
 
 @pytest.fixture(autouse=True)
@@ -47,6 +98,13 @@ def _hermetic_mtplx_state(monkeypatch, tmp_path_factory):
     # builds into the user's real model cache. Tests that exercise the config
     # set their own MTPLX_CONFIG.
     monkeypatch.setenv("MTPLX_CONFIG", str(isolated / "config.toml"))
+    # A server the suite builds with default arguments opens the SSD session
+    # bank at MTPLX_SSD_SESSION_CACHE_DIR, ~/.mtplx/session-bank by default:
+    # the developer's real bank, which a running daemon may be writing and
+    # which the cold tier reconciles when it opens. pytest_configure drops an
+    # operator's MTPLX_SSD_SESSION_CACHE=off with the other switches, so the
+    # directory itself is scratch.
+    monkeypatch.setenv("MTPLX_SSD_SESSION_CACHE_DIR", str(isolated / "session-bank"))
     # Synthetic server requests must not enter a live user's trace history.
     monkeypatch.setenv("MTPLX_REQUEST_LOG_JSONL", str(isolated / "requests.jsonl"))
     monkeypatch.setenv("MTPLX_FLIGHT_RECORDER", str(isolated / "flight.jsonl"))

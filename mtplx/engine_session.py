@@ -478,6 +478,32 @@ IMPLICIT_SESSION_SOURCES = frozenset(
     {"longest_prefix", "pending_postcommit_near_prefix", "common_prefix_reuse"}
 )
 
+# Claude Code stamps its parent session id on every request, including the
+# side requests it runs next to the main turn. A busy session named this way
+# forks like an inferred one instead of answering 409, unless its holder was
+# cancelled (then it is the same conversation coming back, and it waits).
+FORK_WHEN_BUSY_SESSION_SOURCES = frozenset({"header.x-claude-code-session-id"})
+
+
+# x-claude-code-request-class values that are the conversation itself (see
+# EngineSessionManager._claude_code_side_request).
+_CLAUDE_CODE_CONVERSATION_REQUEST_CLASSES = frozenset(
+    {"main", "subagent", "workflow", "compaction"}
+)
+
+
+def _claude_code_session_id(session_id: str, lowered_headers: Mapping[str, Any]) -> str:
+    """Give each Claude Code subagent its own session.
+
+    Subagent requests carry the parent's x-claude-code-session-id plus their
+    own x-claude-code-agent-id (claude-cli 2.1.287); the parent's requests
+    carry no agent id. A subagent is a separate conversation, so sharing the
+    parent's session would answer 409 to parallel subagents and move the
+    parent's cached frontier to the subagent's history.
+    """
+    agent_id = str(lowered_headers.get("x-claude-code-agent-id") or "").strip()
+    return f"{session_id}:agent:{agent_id}" if agent_id else session_id
+
 # common_prefix_reuse thresholds: adopt an existing session's identity when
 # no exact prefix matches but a session shares at least this much committed
 # prefix with the incoming prompt. Two unrelated conversations essentially
@@ -2071,12 +2097,30 @@ class EngineSessionManager:
             # on-wire prompt shrank at r4/r8/r9 and prefix identity churned).
             "x-session-affinity",
             "x-session-id",
+            # Claude Code (CLI and Agent SDK) stamps every /v1/messages
+            # request with its session id; without it a Claude Code agent is
+            # found by prompt inference only, which loses the session when
+            # the agent compacts its history.
+            "x-claude-code-session-id",
             "x-openwebui-chat-id",
             "x-openwebui-user-id",
         ):
             value = lowered_headers.get(key)
             if str(value or "").strip():
-                return str(value).strip(), f"header.{key}"
+                session_id = str(value).strip()
+                if key == "x-claude-code-session-id":
+                    session_id = _claude_code_session_id(session_id, lowered_headers)
+                    side_reason = self._claude_code_side_request(
+                        session_id, prompt_ids, lowered_headers
+                    )
+                    if side_reason is not None:
+                        if diagnostic_out is not None:
+                            diagnostic_out["claude_code_side_request"] = {
+                                "named_session_id": session_id,
+                                "reason": side_reason,
+                            }
+                        continue
+                return session_id, f"header.{key}"
         for key in ("session_id", "mtplx_session_id", "chat_id", "conversation_id"):
             value = metadata.get(key)
             if value:
@@ -2229,6 +2273,62 @@ class EngineSessionManager:
             result["marathon_protected_count"] = len(protected)
         return result
 
+    def _claude_code_side_request(
+        self,
+        session_id: str,
+        prompt_ids: list[int] | tuple[int, ...] | None,
+        lowered_headers: Mapping[str, Any],
+    ) -> str | None:
+        """Why a request named into a Claude Code conversation is not that
+        conversation, or None when it is.
+
+        Claude Code stamps its session id on its side requests too (the
+        session title, the auto-mode safety classifier, the Bash command
+        prefix check). Their prompts share nothing with the conversation's.
+        Taking the conversation's session would replace its committed stream,
+        which the next turn's reasoning re-insertion and token splice read,
+        and abort its pending commit.
+
+        Claude Code names the request class itself in
+        x-claude-code-request-class when CLAUDE_CODE_GATEWAY_HINT_HEADERS=1
+        (2.1.273 on; off by default for a custom endpoint): ``auxiliary`` is
+        a side request, ``main``, ``subagent``, ``workflow`` and
+        ``compaction`` belong to the conversation. Without the header, a
+        request that does not share the conversation's first
+        _COMMON_PREFIX_REUSE_MIN_TOKENS tokens (its system prompt and tool
+        contract) is resolved by its own prompt, as it was before the header
+        was read. A compacted or rewound conversation keeps those tokens, so
+        it keeps its session; a session shorter than that has nothing to
+        protect and is taken as before.
+        """
+        request_class = (
+            str(lowered_headers.get("x-claude-code-request-class") or "")
+            .strip()
+            .lower()
+        )
+        if request_class == "auxiliary":
+            return "request_class_auxiliary"
+        if request_class in _CLAUDE_CODE_CONVERSATION_REQUEST_CLASSES:
+            return None
+        if not prompt_ids:
+            return None
+        session = self.peek(session_id)
+        if session is None:
+            return None
+        committed = session.committed_token_ids
+        span = _COMMON_PREFIX_REUSE_MIN_TOKENS
+        if len(committed) < span:
+            return None
+        if tuple(int(token) for token in prompt_ids[:span]) == committed[:span]:
+            return None
+        return "prompt_does_not_share_the_conversation_prefix"
+
+    def _begin_on_fresh_anon_session(self, cancel_event: Any | None) -> EngineSession:
+        while True:
+            fresh = self.get_or_create(_new_anon_session_id())
+            if fresh.try_begin_generation(cancel_event=cancel_event):
+                return fresh
+
     @contextmanager
     def generation_slot(
         self,
@@ -2260,7 +2360,14 @@ class EngineSessionManager:
                     "disabled",
                 }:
                     handoff_out.update(handoff)
-                if not handoff.get("acquired"):
+                if handoff.get("acquired"):
+                    pass
+                elif (
+                    str(source or "") in FORK_WHEN_BUSY_SESSION_SOURCES
+                    and handoff.get("outcome") == "holder_not_cancelled"
+                ):
+                    acquired = self._begin_on_fresh_anon_session(cancel_event)
+                else:
                     detail = f"session {session.session_id} is already in flight"
                     if handoff.get("outcome") == "timeout":
                         detail += (
@@ -2269,10 +2376,7 @@ class EngineSessionManager:
                         )
                     raise EngineSessionBusy(detail)
             else:
-                while True:
-                    acquired = self.get_or_create(_new_anon_session_id())
-                    if acquired.try_begin_generation(cancel_event=cancel_event):
-                        break
+                acquired = self._begin_on_fresh_anon_session(cancel_event)
         try:
             yield acquired
         finally:
