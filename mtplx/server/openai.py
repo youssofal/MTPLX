@@ -8406,7 +8406,21 @@ def _tool_example_value(schema: Any) -> str:
 def _tool_call_example(tools: list[dict[str, Any]]) -> str:
     if not tools:
         return "<tool_call>\n<function=tool_name>\n</function>\n</tool_call>"
-    tool = tools[0]
+    # Models copy this example (#170, the <string> wrappers). In compact mode
+    # (OpenCode's) the chat template is given no tools, so it is also the only
+    # place the prompt shows how a parameter is written. Built from a first
+    # tool that takes no parameters, it showed none, and after a screenshot
+    # the model wrote values as "<parameter=290>" (#584). Use the first tool
+    # that has parameters; the example is unchanged whenever the first does.
+    tool = next(
+        (
+            candidate
+            for candidate in tools
+            if isinstance(_tool_json_schema(candidate).get("properties"), dict)
+            and _tool_json_schema(candidate)["properties"]
+        ),
+        tools[0],
+    )
     name = _tool_spec_name(tool) or "tool_name"
     schema = _tool_json_schema(tool)
     properties = schema.get("properties")
