@@ -6619,11 +6619,15 @@ def _anthropic_disable_parallel_tool_use(tool_choice: Any) -> bool | None:
 
 
 # Claude Code sends output_config.effort in Anthropic's vocabulary, which has
-# "max" and "none"; the chat-template vocabulary has neither.
+# "max" and "none"; the chat-template vocabulary has neither. "high" is left
+# out on purpose: it is what Claude Code sends when the user never picked a
+# level, so it keeps the server's default instead of standing for a choice.
+# Qwen 3.8 has no "high" and maps it up to xhigh, which on the dense models
+# would replace their measured medium default (51.5 s against 314.9 s for the
+# same coding task, descriptors.py) on every default Claude Code turn.
 _ANTHROPIC_EFFORT_TO_REASONING_EFFORT = {
     "low": "low",
     "medium": "medium",
-    "high": "high",
     "xhigh": "xhigh",
     "max": "xhigh",
     "none": "low",

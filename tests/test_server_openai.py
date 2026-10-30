@@ -10478,14 +10478,16 @@ def _anthropic_effort_request(**fields):
     [
         ("low", "low"),
         ("medium", "medium"),
-        ("high", "high"),
+        ("high", None),
         ("xhigh", "xhigh"),
         ("max", "xhigh"),
         ("none", "low"),
     ],
 )
 def test_anthropic_bridge_maps_output_config_effort(sent, expected):
-    # Claude Code sends output_config.effort, never the flat field.
+    # Claude Code sends output_config.effort, never the flat field. "high" is
+    # what it sends when the user picked no level, so it keeps the server's
+    # default.
     request = _anthropic_effort_request(output_config={"effort": sent})
     chat = openai._anthropic_to_chat_request(request)
     assert chat.reasoning_effort == expected
@@ -10522,7 +10524,7 @@ def test_anthropic_effort_vocabulary_is_accepted_by_the_server():
     [
         ("low", "low"),
         ("medium", "medium"),
-        ("high", "xhigh"),
+        ("high", "medium"),
         ("xhigh", "xhigh"),
         ("max", "xhigh"),
         ("none", "low"),
