@@ -258,3 +258,55 @@ def test_a_ram_exact_prefix_keeps_its_own_floor_and_skips_the_probe():
     )
     assert bank.probes == 0
     assert bank.near_floors == [30]
+
+
+def test_the_probe_skips_a_row_the_exact_lane_refuses_for_its_missing_logits(tmp_path):
+    """An MTP request names a hidden variant, and the exact lane refuses an
+    SSD record without the entry's final logits and hidden
+    (ssd_missing_mtp_generation_state): a lease returned at a boundary is
+    written that way. Counted as the floor, such a row made the near lane
+    stand aside for a restore that decoded the whole row and refused it."""
+    variant = "post_norm"
+    cold = _tier(tmp_path)
+    try:
+        bank = _bank(cold)
+        bank.put_snapshot(
+            runtime=_runtime(),
+            token_ids=SPILLED,
+            cache_snapshot=CacheSnapshot(states=(), meta_states=()),
+            logits=None,
+            hidden=None,
+            hidden_variant=variant,
+            session_id="a",
+            snapshot_epoch=len(SPILLED),
+            nbytes_override=128,
+        )
+        assert cold.flush(timeout_s=5.0) is True
+        bank.clear()
+        # The exact lane refuses this record for this request ...
+        assert bank.restore(_runtime(), PROMPT, hidden_variant=variant) is None
+        assert bank.last_miss_reason == "ssd_missing_mtp_generation_state"
+        # ... so it is no floor the near lane must beat.
+        probe = {"model_path": MODEL, "mtp_enabled": True}
+        assert bank.cold_exact_prefix_len(PROMPT, hidden_variant=variant, **probe) == 0
+        # A request that names no hidden variant can be served from it.
+        assert bank.cold_exact_prefix_len(PROMPT, **probe) == len(SPILLED)
+
+        # The same conversation written with its final logits and hidden is
+        # the floor again.
+        bank.put_snapshot(
+            runtime=_runtime(),
+            token_ids=SPILLED + [70],
+            cache_snapshot=CacheSnapshot(states=(), meta_states=()),
+            logits=mx.zeros((1, 8)),
+            hidden=mx.zeros((1, 1, 4)),
+            hidden_variant=variant,
+            session_id="a",
+            snapshot_epoch=len(SPILLED) + 1,
+            nbytes_override=128,
+        )
+        assert cold.flush(timeout_s=5.0) is True
+        bank.clear()
+        assert bank.cold_exact_prefix_len(PROMPT, hidden_variant=variant, **probe) == len(SPILLED) + 1
+    finally:
+        cold.close()

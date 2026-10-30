@@ -1135,8 +1135,12 @@ class SessionBankColdTier:
         ``token_ids``, read from the manifest alone (no tensor is read).
 
         The rows are the ones ``lookup`` would try, under the row gates
-        ``_restore_row`` applies before it reads a tensor. A probe, not a
-        lookup: no counter and no miss reason change.
+        ``_restore_row`` applies before it reads a tensor, and without the
+        rows ``SessionBank._restore_cold`` refuses once read: a request that
+        names a hidden variant needs the entry's final logits and hidden
+        (``ssd_missing_mtp_generation_state``), which a row carries exactly
+        when the bank stamped ``mtp_full`` on it. A probe, not a lookup: no
+        counter and no miss reason change.
         """
         if self.mode in {"off", "write-only"}:
             return 0
@@ -1159,6 +1163,8 @@ class SessionBankColdTier:
                     continue
                 epoch = row["mtp_snapshot_epoch"]
                 if epoch is not None and int(epoch) != int(row["snapshot_epoch"]):
+                    continue
+                if hidden_variant is not None and not _row_carries_generation_state(row):
                     continue
                 prefix = tuple(
                     int(token) for token in json.loads(str(row["token_ids_json"]))
@@ -3414,3 +3420,20 @@ def _policy_compatible(entry_policy: str | None, lookup_policy: str | None) -> b
     if entry_policy is None or lookup_policy is None:
         return False
     return entry_policy in _COMMITTED_CACHE_POLICIES and lookup_policy in _COMMITTED_CACHE_POLICIES
+
+
+def _row_carries_generation_state(row: sqlite3.Row) -> bool:
+    """Whether a manifest row holds its entry's final logits and hidden.
+
+    The bank stamps ``mtp_full`` on a row exactly when the entry it writes
+    has both (``SessionBank._cold_enqueue_job``, ``run_live_ref_spill``); a
+    lease returned at a boundary has no logits for its last position and is
+    written without it. Unreadable capabilities count as carrying them, as
+    ``_shadowed_by_resident_duplicate`` assumes a maximal row.
+    """
+
+    try:
+        capabilities = {str(item) for item in json.loads(str(row["capabilities_json"] or "[]"))}
+    except Exception:
+        return True
+    return "mtp_full" in capabilities
