@@ -3171,16 +3171,24 @@ def _restore_or_prefill_gemma4_prompt(
         if callable(candidates) and callable(restore_prefix):
             from mtplx.session_bank import _restore_identity_compatible
 
-            for entry, matched in candidates(
-                prompt_ids,
-                model_path=str(runtime.model_path),
-                mtp_enabled=bool(runtime.mtp_enabled),
-                hidden_variant="gemma4_pre_norm",
-                template_hash=session_template_hash,
-                mtp_history_policy=GEMMA4_SESSION_STATE_POLICY,
-                draft_head_identity=session_draft_head_identity,
-                policy_fingerprint=session_policy_fingerprint,
-            ):
+            # Taken off the list as each one is tried, so a refused candidate
+            # (the SSD tier decodes its row before this lane sees it) is not
+            # held through a later candidate's tail forward or the cold
+            # prefill below; the untried rest go before that forward too.
+            pending = list(
+                candidates(
+                    prompt_ids,
+                    model_path=str(runtime.model_path),
+                    mtp_enabled=bool(runtime.mtp_enabled),
+                    hidden_variant="gemma4_pre_norm",
+                    template_hash=session_template_hash,
+                    mtp_history_policy=GEMMA4_SESSION_STATE_POLICY,
+                    draft_head_identity=session_draft_head_identity,
+                    policy_fingerprint=session_policy_fingerprint,
+                )
+            )
+            while pending:
+                entry, matched = pending.pop(0)
                 matched = int(matched)
                 if (
                     matched < 2
@@ -3227,9 +3235,20 @@ def _restore_or_prefill_gemma4_prompt(
                     prefix_restore = cache = _history = boundary_hidden = None
                     continue
                 seed = restore_point - 1
+                pending.clear()
+                # A candidate the SSD tier decoded is this request's own copy,
+                # already cloned into ``cache``; a RAM entry stays with the
+                # bank, which keeps its hits.
+                banked = (
+                    None
+                    if getattr(entry, "cache_source", "ram") == "ssd"
+                    else entry
+                )
+                entry = None
                 output, _suffix_elapsed = forward(list(prompt_ids[seed:]), cache)
-                entry.hits += 1
-                entry.last_access_s = time.time()
+                if banked is not None:
+                    banked.hits += 1
+                    banked.last_access_s = time.time()
                 return Gemma4PromptState(
                     cache=cache,
                     logits=output.logits[:, -1, :],
@@ -3243,6 +3262,7 @@ def _restore_or_prefill_gemma4_prompt(
                     cache_miss_reason=None,
                     restore_mode=f"block_prefix_{storage_mode}",
                 )
+            entry = None
         return cold_prefill(getattr(session_bank, "last_miss_reason", None))
 
     suffix = list(prompt_ids[restored.entry.prefix_len :])

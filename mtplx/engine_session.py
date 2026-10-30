@@ -1164,6 +1164,15 @@ class EngineSession:
         if record is None:
             return {"aborted": False, "reason": "no_pending"}
         cancelled = record.abort(reason)
+        if cancelled:
+            # Cancelled before it started: the scheduler skips the job, so it
+            # never finishes its own record. Left here, the record read as
+            # pending for the session's life and every later admission
+            # aborted it again (#640: "count": 262 such records per request).
+            self.finish_pending_postcommit(
+                record,
+                {"stored": False, "mode": "cancelled_before_start", "reason": str(reason)},
+            )
         return {
             "aborted": True,
             "reason": str(reason),

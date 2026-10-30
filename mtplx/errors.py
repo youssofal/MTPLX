@@ -117,3 +117,20 @@ def is_allocation_failure(exc: BaseException) -> bool:
         return False
     text = str(exc).lower()
     return any(marker in text for marker in _ALLOCATION_FAILURE_MARKERS)
+
+
+def is_resource_count_failure(exc: BaseException) -> bool:
+    """Whether ``exc`` is Metal's limit on live buffer objects, not memory.
+
+    MLX's allocator refuses a new buffer once 499,000 of them are alive
+    (``[metal::malloc] Resource limit (499000) exceeded.``), whatever memory
+    is free, and it has already released its cache of free buffers before
+    it raises. Halving a byte budget or clearing that cache cannot answer it;
+    only letting go of arrays can (#640: 1,124 identical failures over a
+    7.1 GB bank under its byte budget, until a restart).
+    """
+
+    if not is_allocation_failure(exc):
+        return False
+    text = str(exc).lower()
+    return "resource limit" in text and "exceeded" in text

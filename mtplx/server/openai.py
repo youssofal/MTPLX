@@ -140,6 +140,7 @@ from mtplx.constrained import (
 # Allocation failures the daemon survives as per-request memory errors
 # (mtplx.errors, shared with the generation's optional allocations).
 from mtplx.errors import is_allocation_failure as _is_allocation_failure
+from mtplx.errors import is_resource_count_failure as _is_resource_count_failure
 from mtplx.gemma4_pair import (
     GEMMA4_BACKEND,
     gemma4_pair_sampler_defaults,
@@ -20033,10 +20034,112 @@ def _shed_after_allocation_failure(state: "ServerState") -> dict[str, Any]:
     return receipt
 
 
+def _shed_after_resource_count_failure(state: ServerState) -> dict[str, Any]:
+    """Let go of arrays after Metal's live-buffer limit refused one; never raises.
+
+    The count is of buffer objects, not bytes: halving the bank's byte budget
+    took nothing from a bank under that half, and MLX empties its own cache
+    of free buffers before it raises (#640). So every conversation that is
+    not generating gives up its saved state (``release_idle_sessions``: the
+    ones the SSD already holds first; they restore from there). A session in
+    flight, the failing request's included, keeps everything.
+    """
+
+    receipt: dict[str, Any] = {
+        "action": "resource_count_shed",
+        "released_sessions": [],
+        "released_entries": 0,
+        "released_bytes": 0,
+    }
+    sessions = getattr(state, "sessions", None)
+    bank = getattr(sessions, "bank", None)
+    try:
+        keep = _in_flight_session_ids(state)
+        release = getattr(sessions, "release_idle_sessions", None)
+        if callable(release):
+            try:
+                released = release(None, keep_session_ids=keep, reason="resource_count_failure")
+            except Exception as exc:
+                # The release ran; a queued job it could not cancel still
+                # holds its entry. Report what left, then the failure.
+                released = getattr(exc, "receipt", None)
+                if not isinstance(released, dict):
+                    raise
+                receipt["release_error"] = repr(exc)
+                _note_guard_health(state, where="resource_count_shed", error=exc)
+            receipt["released_sessions"] = sorted(
+                str(row.get("session_id"))
+                for row in released.get("sessions") or []
+                if isinstance(row, dict)
+            )
+            receipt["released_entries"] = int(released.get("entries") or 0)
+            receipt["released_bytes"] = int(released.get("held_bytes") or 0)
+        elif bank is not None:
+            receipt["released_entries"] = bank.shrink_to_bytes(
+                0, reason="resource_count_failure", protect_session_ids=keep
+            )
+        if bank is not None:
+            receipt["bank_entries_after"] = len(bank)
+            receipt["bank_bytes_after"] = int(bank.total_nbytes)
+        if "release_error" not in receipt:
+            _note_guard_health(state, where="resource_count_shed", error=None)
+    except Exception as exc:
+        receipt["release_error"] = repr(exc)
+        receipt["guard_degraded"] = True
+        _note_guard_health(state, where="resource_count_shed", error=exc)
+    try:
+        import mlx.core as _mx
+
+        _mx.clear_cache()
+        receipt["cache_cleared"] = True
+    except Exception:
+        receipt["cache_cleared"] = False
+    _record_guard_event(state, receipt)
+    try:
+        print("[mtplx] memory guard " + json.dumps(receipt), flush=True)
+    except Exception:
+        pass
+    return receipt
+
+
+def _resource_count_failure_http_exception(
+    state: ServerState, exc: BaseException
+) -> HTTPException:
+    """The 507 for Metal's live-buffer limit, after the count shed."""
+
+    receipt = _shed_after_resource_count_failure(state)
+    released = int(receipt.get("released_entries") or 0)
+    conversations = len(receipt.get("released_sessions") or ()) or released
+    if released > 0:
+        outcome = (
+            f"The engine released the saved state of {conversations} idle "
+            f"{'conversation' if conversations == 1 else 'conversations'} "
+            "(those on the SSD cache restore from it) and stays up; this "
+            "request failed and a retry can succeed."
+        )
+    else:
+        outcome = (
+            "No idle conversation held saved state to release, so the engine "
+            "itself holds the buffers; this request failed. Restart the "
+            "engine to recover (in the app, Stop and Start; on the command "
+            "line, restart mtplx serve)."
+        )
+    return HTTPException(
+        status_code=507,
+        detail=(
+            "the request reached the GPU's limit on live buffers "
+            f"({exc}). This limit counts buffer objects, and it is not a "
+            f"shortage of memory. {outcome}"
+        ),
+    )
+
+
 def _allocation_failure_http_exception(
     state: "ServerState", exc: BaseException
 ) -> HTTPException:
     """Shed caches, then turn the raw allocator error into an honest 507."""
+    if _is_resource_count_failure(exc):
+        return _resource_count_failure_http_exception(state, exc)
     _shed_after_allocation_failure(state)
     plan = getattr(state, "memory_plan", None)
     advice = "Reduce --context-window, close other apps, or try q8 KV quantization."

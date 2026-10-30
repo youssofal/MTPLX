@@ -360,3 +360,39 @@ def test_same_session_marathon_path_is_unchanged(
     assert outcome is None
     assert not own_record.abort_event.is_set()
     assert own_session.has_pending_postcommit()
+
+
+def test_a_commit_cancelled_before_it_ran_stops_reading_as_pending() -> None:
+    """#640: the scheduler skips a job cancelled before it started, so the job
+    never finished its own record. The record read as pending for the
+    session's life, and every later admission aborted it again: the report's
+    ``"count": 262`` on every request was such records, not live commits."""
+    manager = _manager()
+    session, record = _pending(manager, "sess-a")
+    manager.get_or_create("sess-b")
+
+    first = manager.abort_cross_session_postcommits(except_session_id="sess-b")
+
+    assert first is not None and first["count"] == 1
+    assert record.future.cancelled()
+    assert not session.has_pending_postcommit()
+    assert session.last_postcommit_outcome["mode"] == "cancelled_before_start"
+    # The next admission finds nothing left to abort.
+    assert manager.abort_cross_session_postcommits(except_session_id="sess-b") is None
+
+
+def test_a_running_commit_keeps_its_record_until_it_finishes() -> None:
+    """A job already running is not cancelled: it sees its abort event at the
+    next chunk boundary and finishes its own record, as before."""
+    manager = _manager()
+    session, record = _pending(manager, "sess-a")
+    assert record.future.set_running_or_notify_cancel()
+    manager.get_or_create("sess-b")
+
+    outcome = manager.abort_cross_session_postcommits(except_session_id="sess-b")
+
+    assert outcome is not None and outcome["count"] == 1
+    assert record.abort_event.is_set()
+    assert session.has_pending_postcommit()
+    session.finish_pending_postcommit(record, {"stored": False, "mode": "aborted"})
+    assert not session.has_pending_postcommit()
