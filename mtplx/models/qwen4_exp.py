@@ -4430,6 +4430,11 @@ class QSAIndexer(nn.Module):
         # cannot run; the stock eager arithmetic is what the trace records.
         fixed_capacity = bool(getattr(cache, "fixed_capacity", False))
         if not fixed_capacity:
+            # The cache's own pooled blocks end where its keys do. A forward
+            # that raised after pooling its blocks, before attention wrote its
+            # keys, left the count past them; this forward writes those rows
+            # again and pools their blocks again, on every route.
+            cache.pooled_len = min(cache.pooled_len, cache.kv.offset // self.ratio)
             compiled_mode = self._compiled_mode(
                 decode=decode,
                 rows=S,

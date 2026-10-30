@@ -199,16 +199,19 @@ def _resized_buffers(entry: Any, rows: int) -> list[tuple[str, Any, int, int]]:
 
     Keys, values and raw index keys take ``rows`` rows and the pooled index
     keys one block per ``ratio`` of them, as in the bank. A resize never cuts
-    into the rows a layer holds.
+    into the rows a layer holds. Its pooled blocks are the ones its keys
+    cover: a count past them (#592: a restore below a longer entry's end
+    handed over that entry's count) names no rows of this conversation.
     """
 
     rows = int(rows)
     offset = int(entry.kv.offset)
+    ratio = max(1, int(entry.ratio))
     wanted = (
         ("keys", entry.kv.keys, 2, rows, offset),
         ("values", entry.kv.values, 2, rows, offset),
         ("raw_keys", entry.raw_keys, 1, rows, offset),
-        ("pooled", entry.pooled, 1, rows // max(1, int(entry.ratio)), int(entry.pooled_len)),
+        ("pooled", entry.pooled, 1, rows // ratio, min(int(entry.pooled_len), offset // ratio)),
     )
     resized = []
     for name, buffer, axis, target, held in wanted:
@@ -264,6 +267,10 @@ def _resize_layer(entry: Any, rows: int) -> None:
         entry.pooled = resized["pooled"]
         # Derived from ``pooled``; rebuilt on the next stock read.
         entry.pooled_f32_t = None
+        # The new buffer holds the blocks the keys cover, and the count says so.
+        entry.pooled_len = min(
+            int(entry.pooled_len), int(entry.kv.offset) // max(1, int(entry.ratio)),
+        )
     # The old buffers are let go when the command buffer that read them
     # completes, which ``eval`` does not wait for: without this the next
     # layer is admitted and allocated beside them (two layers at once).
