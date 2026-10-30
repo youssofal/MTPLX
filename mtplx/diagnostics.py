@@ -386,6 +386,43 @@ def _port_open(host: str, port: int) -> bool:
         return False
 
 
+def structured_output_check() -> DiagnosticCheck:
+    """Whether response_format json_schema/json_object and strict tool calls can run.
+
+    The server refuses those requests when llguidance cannot load; this check
+    reports the same reason, so an install that has llguidance but cannot load
+    it (#643: 1.3.0 predates the API MTPLX calls) is not taken for one that
+    lacks it.
+    """
+    from mtplx.constrained import llguidance_status
+
+    status = llguidance_status()
+    ready = bool(status["available"]) and bool(status["meets_requirement"])
+    if ready:
+        fix = None
+    elif status["available"]:
+        fix = (
+            f"llguidance {status['installed_version'] or status['version']} is older than "
+            f"{status['required']}: structured output works, but JSON is "
+            "written in a compact layout without newlines. Upgrade for the "
+            "layout every other install uses."
+        )
+    else:
+        fix = (
+            "Requests with response_format json_schema or json_object are "
+            f"refused until this is fixed: {status['reason']}."
+        )
+    return DiagnosticCheck(
+        "python.dep.llguidance",
+        "pass" if ready else "warn",
+        "warning",
+        status,
+        f"{status['required']} loads, for response_format json_schema and json_object",
+        fix,
+        command=None if ready else status["install_command"],
+    )
+
+
 def build_diagnostic_checks(
     *,
     model_cache: str | Path | None = None,
@@ -719,6 +756,7 @@ def build_diagnostic_checks(
                     command="python3 -m pip install --force-reinstall mtplx",
                 )
             )
+    checks.append(structured_output_check())
     thermal = thermal_control or {}
     checks.append(
         DiagnosticCheck(

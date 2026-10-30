@@ -21,28 +21,116 @@ tokens are set to -inf, which survives every downstream shaping step.
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import os
 import re
+import shlex
+import sys
 import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
+# The floor the [server] extra declares in pyproject.toml (raised for #547).
+LLGUIDANCE_REQUIREMENT = "llguidance>=1.8"
+_LLGUIDANCE_MIN_RELEASE = (1, 8)
+
+
+def _installed_llguidance_version() -> str | None:
+    """The installed llguidance distribution's version, read without importing it."""
+    try:
+        return importlib.metadata.version("llguidance")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _below_llguidance_floor(version: str | None) -> bool:
+    match = re.match(r"(\d+)\.(\d+)", version or "")
+    if match is None:
+        return False
+    return (int(match.group(1)), int(match.group(2))) < _LLGUIDANCE_MIN_RELEASE
+
+
+def _llguidance_unavailable_reason(exc: BaseException, installed: str | None) -> str:
+    """Why llguidance cannot be used, in words that point at the fix.
+
+    "Not installed" is only true when the package itself is missing. An
+    installed llguidance can still fail to load: 1.3.0 has no get_version()
+    (#643), and a submodule can fail on its own imports. Saying "not installed"
+    then sends the user to a pip install that reports it is already satisfied.
+    """
+    if isinstance(exc, ModuleNotFoundError) and exc.name == "llguidance":
+        return "llguidance is not installed"
+    version = f" {installed}" if installed else ""
+    reason = (
+        f"llguidance{version} is installed but failed to load "
+        f"({type(exc).__name__}: {exc})"
+    )
+    if _below_llguidance_floor(installed):
+        reason += "; MTPLX needs llguidance 1.8 or later"
+    return reason
+
+
+def llguidance_install_command() -> str:
+    """The pip command that gives the Python running MTPLX a usable llguidance.
+
+    It names this interpreter because a bare ``pip`` often belongs to another
+    Python (Homebrew installs MTPLX into its own environment).
+    """
+    return f"{shlex.quote(sys.executable)} -m pip install -U '{LLGUIDANCE_REQUIREMENT}'"
+
+
 try:  # pragma: no cover - exercised via LLGUIDANCE_AVAILABLE branches
     import llguidance as _llg
     import llguidance.hf as _llg_hf
     import llguidance.mlx as _llg_mlx
 
-    LLGUIDANCE_AVAILABLE = True
     LLGUIDANCE_VERSION = str(_llg.get_version())
-except Exception:  # pragma: no cover
+    LLGUIDANCE_AVAILABLE = True
+    LLGUIDANCE_UNAVAILABLE_REASON: str | None = None
+except Exception as _llg_import_error:  # pragma: no cover
+    # llguidance is optional: no failure to load it may stop the server from
+    # starting. Every failure is kept as the reason the refusals and
+    # `mtplx doctor` report.
     _llg = None
     _llg_hf = None
     _llg_mlx = None
     LLGUIDANCE_AVAILABLE = False
     LLGUIDANCE_VERSION = None
+    LLGUIDANCE_UNAVAILABLE_REASON = _llguidance_unavailable_reason(
+        _llg_import_error, _installed_llguidance_version()
+    )
+
+
+def llguidance_unavailable_message(feature: str) -> str:
+    """The refusal text for a feature that needs llguidance when it cannot load."""
+    return (
+        f"{feature} cannot be enforced without the optional llguidance "
+        f"dependency ({LLGUIDANCE_REQUIREMENT}): {LLGUIDANCE_UNAVAILABLE_REASON}. "
+        f"Install it with: {llguidance_install_command()}"
+    )
+
+
+def llguidance_status() -> dict[str, Any]:
+    """Structured-output readiness for `mtplx doctor`."""
+    installed = _installed_llguidance_version()
+    if LLGUIDANCE_AVAILABLE:
+        # The loaded library's own version is the truth when it loaded.
+        release = _llguidance_release()
+        meets_requirement = release is not None and release[:2] >= _LLGUIDANCE_MIN_RELEASE
+    else:
+        meets_requirement = installed is not None and not _below_llguidance_floor(installed)
+    return {
+        "available": LLGUIDANCE_AVAILABLE,
+        "version": LLGUIDANCE_VERSION,
+        "installed_version": installed,
+        "required": LLGUIDANCE_REQUIREMENT,
+        "meets_requirement": meets_requirement,
+        "reason": LLGUIDANCE_UNAVAILABLE_REASON,
+        "install_command": llguidance_install_command(),
+    }
 
 SUPPORTED_RESPONSE_FORMAT_TYPES = ("text", "json_object", "json_schema")
 
@@ -226,9 +314,8 @@ def constraint_spec_from_response_format(
         return None
     if not LLGUIDANCE_AVAILABLE:
         raise ResponseFormatError(
-            f"response_format type {format_type!r} requires the optional "
-            "llguidance dependency (pip install llguidance); refusing to "
-            "silently return unconstrained output"
+            llguidance_unavailable_message(f"response_format type {format_type!r}")
+            + "; refusing to silently return unconstrained output"
         )
     if format_type == "json_object":
         schema = _JSON_OBJECT_SCHEMA
@@ -293,10 +380,7 @@ def tool_call_constraint_spec(
             f"got {tool_choice!r}"
         )
     if not LLGUIDANCE_AVAILABLE:
-        raise ResponseFormatError(
-            "strict tool calls require the optional llguidance dependency "
-            "(pip install llguidance)"
-        )
+        raise ResponseFormatError(llguidance_unavailable_message("strict tool calls"))
     if (
         _single_token_id(tokenizer, TOOL_CALL_START) is None
         or _single_token_id(tokenizer, TOOL_CALL_END) is None

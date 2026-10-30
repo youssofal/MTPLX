@@ -2760,6 +2760,24 @@ def _render_doctor_report(args: Any, report: dict[str, Any]) -> int:
             f"{'available' if thermal.get('available') else 'not configured'}"
             f" ({selected.get('kind') or 'none'})"
         )
+        structured = next(
+            (
+                check
+                for check in (report.get("diagnostics") or {}).get("checks") or ()
+                if check.get("id") == "python.dep.llguidance"
+            ),
+            None,
+        )
+        if structured is not None:
+            if structured.get("status") == "pass":
+                observed = structured.get("observed") or {}
+                print(
+                    "structured output: ready "
+                    f"(llguidance {observed.get('installed_version')})"
+                )
+            else:
+                print(f"structured output: {structured.get('fix')}")
+                print(f"  fix: {structured.get('command')}")
         fence = report.get("compiled_verify") or {}
         if fence:
             print(
