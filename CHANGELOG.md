@@ -4,6 +4,34 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [2.12.3] - 2026-10-30
+
+### Fixed
+
+- **Flash-Next follow-up turns reuse the conversation again** (#591, #616, #649). 2.12.2 saved a Flash-Next conversation without the draft head's history whenever it kept no live copy of it (OpenCode's tool turns, API clients that name no session, a turn saved after it ended), so the next turn matched the saved conversation, could not resume from it, and read the whole prompt again, reported as `new_session`. Saved conversations keep that history again; the live conversation is still not copied. With OpenCode 1.19.5 on Flash-Next Bare Speed (M5 Max, October 30), 2.12.2 served 0 of 19 follow-up requests from the cache, with the first token in 3.0 to 9.9 s; 2.12.3 served 30 of 30 and 98.4% of all prompt tokens, with a median first token of 0.18 s. Pi 1.4.0 was not affected (97.8% and 96.7%). A restore that finds an entry without the history now reports `no_snapshot_coverage`.
+- **A new conversation about the same document resumes inside the earlier prompt** (#649, #637 by @jvmenen): the final save of a turn whose prompt was not saved on its own keeps the restore points recorded while reading it.
+- **A retry or regenerate resumes from the saved prompt** (#661 by @a3rosol). The saved answer keeps the prompt's last logits (about 1 MB); a retry of a 16,000-token prompt read it again in 23.5 s on an M1 Ultra in the report.
+- **Flash-Next no longer fails with an HTTP 500 after a compaction** (#592, #605): `QSA pooled hold N rows; resizing to M would cut them`, on turns that resumed from the start of a longer saved conversation, and on their instant retries. The attention index's block count is taken from the restored conversation (#650 by @goodbadwolf) and a resize keeps only the blocks the conversation covers (adapted from #657 by @transcendence-x). A replay of #605 through the shipped restore now resizes 122,880 bytes and runs on the compiled verifier.
+- **A Flash-Next turn restored from the SSD cache no longer selects attention blocks from another conversation** (#635). In a replay, 25 of 64 new tokens got a different attention output on 2.12.2; a restored turn now decodes the same tokens and final logits as a cold start. Flash-Next conversations saved to the SSD cache by 2.11.2 to 2.12.2 are no longer used, because they may hold another conversation's blocks: each reads its prompt once after updating, and the cache's normal eviction reclaims the old entries.
+- **SSD restores run on the request's own cache layout** (#608 by @jvmenen, #668 by @CocoaBeans). On an M5 Pro with 64 GB and Qwen 3.8 27B Optimized Speed, a 62,000-token exact restore went from 50.1 to 303.2 tok/s prompt, 15.0 to 23.7 tok/s decode and 124.7 to 23.4 s to the first token (@CocoaBeans's measurement).
+- **A conversation moved to the SSD cache restores its own state** (#609 by @jvmenen) instead of only a system prompt it shares with a conversation still in memory (143 to 146 s at 50,000 tokens in the report, or a 507), and candidates it does not use are released before its prompt is read.
+- **Partial SSD restores work on paged and tail-owned caches** (#655, fixed in #656 by @Phydra11); they failed with `TypeError: int() ... NoneType`.
+- **A server at Metal's 499,000-buffer limit keeps serving** (#640): the guard releases idle conversations' saved state, and the 507 says the limit is a buffer count and when a restart is needed.
+- **Claude Code**: sessions follow Claude Code's session header and each subagent gets its own session (#606 by @jvmenen); side requests no longer replace the conversation's cached turn, and `X-Claude-Code-Request-Class` is read when sent; `/effort low`, `medium` and `max` apply, while the default `high` keeps the server's default (#634 by @goodbadwolf); the auto-mode safety classifier runs without thinking (#670 by @phaedrus1992, for #669).
+- **Codex**: `reasoning_summary_delivery` is accepted (#658), and a preamble with its tool call is one assistant turn (#603).
+- **OpenCode**: the tool-call example shows parameter syntax when any tool has parameters (#584).
+- **An answer that ends inside an unclosed reasoning block is returned when tools are declared** (#583, #588 by @jvmenen).
+- **Structured output names why llguidance cannot load**, in the refusal and in `mtplx doctor` (#643).
+- **Smart fan mode no longer leaves a watchdog process per ramp** (#602).
+- **`mtplx forge build` works with a relative `--out`** (#627, diagnosed by @Starefossen).
+- **Gemma 4 loaded without its draft model runs** (#632 by @jvmenen).
+- **`lock_wait_time_s` includes the serial queue wait** (#576 by @jvmenen).
+- **Tests ignore the shell's `MTPLX_` settings and never open the real session cache** (#644 by @jvmenen).
+
+### Added
+
+- **`--trust-network`**: with `--no-auth`, serves without an API key on a non-localhost bind (#491). Either flag alone keeps the old behaviour.
+
 ## [2.12.2] - 2026-10-03
 
 ### Fixed
