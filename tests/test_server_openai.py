@@ -1617,6 +1617,47 @@ def test_long_prompt_commits_prompt_prefix_when_ssd_cache_is_enabled():
     )
 
 
+def test_one_copy_plain_chat_commits_its_prompt_without_the_ssd_cache(monkeypatch):
+    """#291 with --ssd-session-cache off: a client that sends the answer back
+    without its reasoning diverges where the assistant turn starts, so the
+    next turn resumes from the prompt's end anchor. The one-copy store banks
+    the prompt as a lease plus that anchor and copies nothing, so the commit
+    no longer waits for the SSD tier; a copying store still skips it."""
+
+    monkeypatch.delenv("MTPLX_ONE_COPY", raising=False)
+    one_copy = SimpleNamespace(qwen4_fixed_m4_compiled_verify=True)
+    copying = SimpleNamespace(qwen4_fixed_m4_compiled_verify=False)
+
+    assert openai._commit_prompt_prefix_for_request(
+        SimpleNamespace(session_bank_cold_tier=None, runtime=one_copy),
+        prompt_ids=list(range(512)),
+        tools_active=False,
+    )
+    assert openai._commit_prompt_prefix_for_request(
+        SimpleNamespace(
+            session_bank_cold_tier=SimpleNamespace(enabled=False), runtime=one_copy
+        ),
+        prompt_ids=list(range(4000)),
+        tools_active=False,
+    )
+    assert not openai._commit_prompt_prefix_for_request(
+        SimpleNamespace(session_bank_cold_tier=None, runtime=one_copy),
+        prompt_ids=list(range(511)),
+        tools_active=False,
+    )
+    assert not openai._commit_prompt_prefix_for_request(
+        SimpleNamespace(session_bank_cold_tier=None, runtime=copying),
+        prompt_ids=list(range(4000)),
+        tools_active=False,
+    )
+    monkeypatch.setenv("MTPLX_ONE_COPY", "0")
+    assert not openai._commit_prompt_prefix_for_request(
+        SimpleNamespace(session_bank_cold_tier=None, runtime=one_copy),
+        prompt_ids=list(range(4000)),
+        tools_active=False,
+    )
+
+
 def test_implicit_anonymous_sessions_do_not_keep_live_refs(monkeypatch):
     monkeypatch.delenv(
         "MTPLX_SESSIONBANK_LIVE_REFS_FOR_IMPLICIT_SESSIONS",

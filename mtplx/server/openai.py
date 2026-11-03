@@ -25162,10 +25162,18 @@ def _commit_prompt_prefix_for_request(
     if not prompt_ids:
         return False
     tier = getattr(state, "session_bank_cold_tier", None)
-    if tier is None or not bool(getattr(tier, "enabled", False)):
-        return False
-    min_prefix_tokens = int(getattr(tier, "min_prefix_tokens", 512) or 512)
-    return len(prompt_ids) >= max(512, min_prefix_tokens)
+    if tier is not None and bool(getattr(tier, "enabled", False)):
+        min_prefix_tokens = int(getattr(tier, "min_prefix_tokens", 512) or 512)
+        return len(prompt_ids) >= max(512, min_prefix_tokens)
+    # Without the SSD tier a copying store skips this commit for plain chat:
+    # it would snapshot views the answer's first decode write then copies.
+    # The one-copy store banks the prompt as a lease plus one recurrent anchor
+    # and copies nothing, and that anchor is where the next turn resumes when
+    # the client sends the answer back without its reasoning (the history
+    # diverges where the assistant turn starts). Skipping it left every
+    # follow-up at the first turn's prompt, re-reading one more answer each
+    # turn (#291, with --ssd-session-cache off).
+    return one_copy_runtime(getattr(state, "runtime", None)) and len(prompt_ids) >= 512
 
 
 def _anonymous_coding_agent_tool_request(
