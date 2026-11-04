@@ -142,11 +142,15 @@ def test_the_boundary_window_is_the_probe_width() -> None:
     assert diagnostic["reuse_rule"] == "turn_boundary"
     assert diagnostic["matched_prefix_len"] == 6_000 + inside
 
+    # Past the probe window but still inside the tokens the turn generated:
+    # the client's rendering of that turn differs deep inside it (#624).
     past = _COMMON_PREFIX_PROBE_TOKENS + 1
     resent = prompt + generated[:past] + [_differing(generated[past])] + tail
-    resolved, source, _ = _resolve(manager, resent)
-    assert resolved != session_id
-    assert source == "new"
+    resolved, source, diagnostic = _resolve(manager, resent)
+    assert resolved == session_id
+    assert source == "common_prefix_reuse"
+    assert diagnostic["reuse_rule"] == "turn_boundary"
+    assert diagnostic["turn_boundary"] == 6_000
 
 
 def test_turn_prompt_lens_come_from_both_commit_paths_and_stay_bounded() -> None:

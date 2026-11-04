@@ -1011,6 +1011,10 @@ class EngineSession:
         # Prompt lengths of the turns this session generated from; the
         # resolver's turn-boundary reuse (#446) reads them.
         self.turn_prompt_lens: list[int] = []
+        # Where each of those turns' generated tokens ended (prompt length ->
+        # committed length): a client's rendering of a turn can diverge from
+        # what this session generated anywhere inside it (#624).
+        self.turn_generated_ends: dict[int, int] = {}
         self.in_flight = False
         self.in_flight_started_s: float | None = None
         self.last_commit_s: float | None = None
@@ -1730,8 +1734,8 @@ class EngineSession:
         # assistant turn. Aborted/cancelled/error finishes stay refused.
         if finish_reason not in {"stop", "length", "tool_calls"}:
             return EngineSessionCommit(False, f"unsafe_finish:{finish_reason}", self.prefix_len)
-        self.note_turn_prompt_len(len(prompt_ids))
         tokens = tuple(int(token) for token in prompt_ids) + tuple(int(token) for token in generated_ids)
+        self.note_turn_prompt_len(len(prompt_ids), generated_end=len(tokens))
         self.committed_token_ids = tokens
         self.last_commit_s = time.time()
         self.last_finish_reason = finish_reason
@@ -1877,14 +1881,23 @@ class EngineSession:
         self.touch()
         return boundary
 
-    def note_turn_prompt_len(self, prompt_len: int) -> None:
-        """Record the prompt length a turn generated from (#446 identity)."""
+    def note_turn_prompt_len(self, prompt_len: int, generated_end: int | None = None) -> None:
+        """Record the prompt length a turn generated from (#446 identity), and
+        where its generated tokens ended when the turn committed them (#624)."""
         prompt_len = int(prompt_len)
-        if prompt_len <= 0 or prompt_len in self.turn_prompt_lens:
+        if prompt_len <= 0:
+            return
+        if generated_end is not None and int(generated_end) > prompt_len:
+            self.turn_generated_ends[prompt_len] = max(
+                int(generated_end), self.turn_generated_ends.get(prompt_len, 0)
+            )
+        if prompt_len in self.turn_prompt_lens:
             return
         self.turn_prompt_lens.append(prompt_len)
         overflow = len(self.turn_prompt_lens) - _TURN_PROMPT_LENS_MAX
         if overflow > 0:
+            for dropped in self.turn_prompt_lens[:overflow]:
+                self.turn_generated_ends.pop(dropped, None)
             del self.turn_prompt_lens[:overflow]
 
     def turn_boundary_at(self, common_prefix: int) -> int | None:
@@ -1892,11 +1905,19 @@ class EngineSession:
 
         The match may run up to the probe window past the boundary: a chat
         template can repeat the generation prompt's tail (``<think>``) in the
-        rendered history before the streamed reasoning diverges from it.
+        rendered history before the streamed reasoning diverges from it. It
+        may also end anywhere inside the tokens the turn generated: the
+        client resends that turn as text and the template's rendering of it
+        can differ from the generated stream deep inside (96 tokens in, at a
+        tool-call block, in #624). A match that ends past the generated
+        tokens, inside a message the client wrote, is not this rule's.
         """
         common_prefix = int(common_prefix)
         for prompt_len in reversed(self.turn_prompt_lens):
             if prompt_len <= common_prefix <= prompt_len + _COMMON_PREFIX_PROBE_TOKENS:
+                return prompt_len
+            generated_end = self.turn_generated_ends.get(prompt_len, 0)
+            if prompt_len <= common_prefix < generated_end:
                 return prompt_len
         return None
 
