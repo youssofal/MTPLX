@@ -5506,6 +5506,58 @@ def test_opencode_injected_output_cap_is_stripped_server_side(
     )
 
 
+_TEXT_PROTOCOL_CALL = (
+    'Running it now.\n<tool_call>\n{"name": "run", "arguments": {"cmd": "echo hi"}}\n</tool_call>'
+)
+
+
+@pytest.mark.parametrize(
+    ("headers", "extra_body", "kept"),
+    [
+        ({}, {}, False),
+        ({"x-mtplx-keep-tool-markup": "on"}, {}, True),
+        ({}, {"keep_orphan_tool_markup": True}, True),
+        ({}, {"metadata": {"keep_orphan_tool_markup": "true"}}, True),
+    ],
+)
+def test_a_text_protocol_client_can_keep_tool_markup_per_request(
+    monkeypatch, headers, extra_body, kept
+):
+    """#674: a client that parses the reply itself declares no tools; the
+    strip ate the command it was waiting for. The default (strip and notice,
+    for the app chat) stays; the client can opt its own requests out."""
+    monkeypatch.delenv("MTPLX_KEEP_ORPHAN_TOOL_MARKUP", raising=False)
+    state = _fake_state()
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(
+        openai, "_encode_rendered_chat_text", lambda *_args, **_kwargs: [1, 2, 3]
+    )
+    monkeypatch.setattr(
+        openai,
+        "_run_generation",
+        lambda *_args, **_kwargs: _fake_generation(_TEXT_PROTOCOL_CALL),
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass", **headers},
+        json={
+            "messages": [{"role": "user", "content": "RUN: echo hi"}],
+            "max_tokens": 64,
+            **extra_body,
+        },
+    )
+    assert response.status_code == 200
+    content = response.json()["choices"][0]["message"]["content"]
+    if kept:
+        assert '<tool_call>\n{"name": "run"' in content
+        assert "no tools are active" not in content
+    else:
+        assert "<tool_call>" not in content
+        assert "no tools are active" in content
+
+
 def test_stream_cancellation_metric_records_prompt_and_policy_context():
     state = _fake_streaming_session_state()
     state.requests_cancelled = 0

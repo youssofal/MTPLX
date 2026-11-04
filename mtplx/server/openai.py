@@ -7274,14 +7274,35 @@ _CODE_FENCE_SPAN_RE = re.compile(r"```.*?(?:```|\Z)", re.DOTALL)
 
 
 # ---- opt-out for the no-tools markup strip -------------------------------
-# MTPLX_KEEP_ORPHAN_TOOL_MARKUP=on: leave tool-call markup in the reply even
-# when the request declares no tools, and skip the "no tools are active"
-# notice. Default off (strip + notice), unchanged.
-def _keep_orphan_tool_markup() -> bool:
-    return (
-        os.environ.get("MTPLX_KEEP_ORPHAN_TOOL_MARKUP", "").strip().lower()
-        in {"1", "true", "yes", "on"}
-    )
+# Leave tool-call markup in the reply even when the request declares no
+# tools, and skip the "no tools are active" notice. For a client that parses
+# the reply as its own text protocol (#674), where the markup is the command,
+# not dead syntax. Default off (strip + notice, for the app chat: #160, #349).
+# The operator sets MTPLX_KEEP_ORPHAN_TOOL_MARKUP=on for every request; a
+# client sets it for its own requests with the x-mtplx-keep-tool-markup header
+# or a "keep_orphan_tool_markup": true body or metadata field, so it needs no
+# access to the server's environment.
+_KEEP_TOOL_MARKUP_HEADER = "x-mtplx-keep-tool-markup"
+_KEEP_TOOL_MARKUP_FIELD = "keep_orphan_tool_markup"
+_KEEP_TOOL_MARKUP_ON = {"1", "true", "yes", "on"}
+
+
+def _keep_orphan_tool_markup(
+    request: Any = None,
+    headers: Mapping[str, str] | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> bool:
+    def on(value: Any) -> bool:
+        return value is True or str(value or "").strip().lower() in _KEEP_TOOL_MARKUP_ON
+
+    if on(os.environ.get("MTPLX_KEEP_ORPHAN_TOOL_MARKUP")):
+        return True
+    if headers is not None and on(headers.get(_KEEP_TOOL_MARKUP_HEADER)):
+        return True
+    extra = getattr(request, "model_extra", None) or {}
+    if on(extra.get(_KEEP_TOOL_MARKUP_FIELD)):
+        return True
+    return bool(metadata) and on(metadata.get(_KEEP_TOOL_MARKUP_FIELD))
 # ---- end opt-out --------------------------------------------------------
 
 
@@ -39422,7 +39443,8 @@ def create_app(state: ServerState) -> FastAPI:
                         # No declared tools: raw tool-call XML must not stream
                         # to the user as visible content (#160).
                         suppress_orphan_tool_markup=(
-                            not tools_active and not _keep_orphan_tool_markup()
+                            not tools_active
+                            and not _keep_orphan_tool_markup(request, headers, metadata)
                         ),
                         # Declared names let the splitter tell a real call
                         # from tool markup the model is only quoting in its
@@ -42788,7 +42810,7 @@ def create_app(state: ServerState) -> FastAPI:
                     # answer "look it up" prompts with raw
                     # <tool_call><function=web_search> XML in the app chat).
                     pre_strip_text = display_text
-                    if _keep_orphan_tool_markup():
+                    if _keep_orphan_tool_markup(request, headers, metadata):
                         # The client asked to keep raw protocol markup: it
                         # parses the text itself, so nothing is dead syntax.
                         display_text, orphan_blocks = display_text, 0
