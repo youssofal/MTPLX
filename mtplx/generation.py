@@ -9254,6 +9254,109 @@ def score_prompt_logprobs(
     }
 
 
+def _commit_ar_prompt_state(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    prompt_state: PromptState,
+    *,
+    session_bank: Any,
+    session_id: str,
+    template_hash: str | None,
+    draft_head_identity: str | None,
+    policy_fingerprint: str | None,
+) -> dict[str, object]:
+    """Bank a plain-decoding prompt before its answer decodes, as generate_mtpk does.
+
+    The next turn of a conversation shares this prompt and then differs where
+    the answer starts (the client sends it back without its reasoning, or
+    renders a tool call its own way). On a hybrid model it can only resume at
+    a recurrent checkpoint, and the plain-decoding lane left none at the
+    prompt's end: its prefill store skips suffixes under the store-on-prefill
+    floor (1,024 tokens), so every follow-up resumed at the last turn that
+    reached it and read up to that much again. The one-copy store banks a
+    lease on the live cache plus a recurrent anchor at the prompt's end, so
+    the answer decoding into the same buffers is never restored under this
+    prefix; a copying store banks a snapshot, never a live reference to a
+    cache the decode is about to change. Identity is what the lane's own
+    lookup asks for: the trunk-only history and the contract's hidden variant.
+    """
+
+    started = time.perf_counter()
+    snapshot_done = started
+    try:
+        boundaries = list(getattr(prompt_state, "gdn_boundaries", None) or [])
+        committed_mtp_cache = prompt_state.committed_mtp_cache
+        if one_copy_runtime(rt):
+            bank_fields = prompt_lease_fields(
+                prompt_state.trunk_cache,
+                committed_mtp_cache=committed_mtp_cache,
+                hidden=prompt_state.hidden,
+                prompt_len=len(prompt_ids),
+                boundaries=boundaries,
+                runtime=rt,
+            )
+        else:
+            bank_fields = {
+                "keep_live_ref": False,
+                "mtp_history_snapshot": (
+                    snapshot_cache(committed_mtp_cache)
+                    if committed_mtp_cache is not None
+                    else None
+                ),
+                "mtp_history_cache_ref": None,
+                "gdn_boundaries": boundaries,
+            }
+        snapshot_done = time.perf_counter()
+        put_timing: dict[str, object] = {}
+        entry = session_bank.put(
+            runtime=rt,
+            token_ids=list(prompt_ids),
+            cache=prompt_state.trunk_cache,
+            logits=prompt_state.logits,
+            hidden=prompt_state.hidden,
+            hidden_variant=_resolve_runtime_base_hidden_variant(rt, None),
+            session_id=session_id,
+            template_hash=template_hash,
+            mtp_history_policy=prompt_state.mtp_history_policy,
+            draft_head_identity=draft_head_identity,
+            policy_fingerprint=policy_fingerprint,
+            snapshot_epoch=len(prompt_ids),
+            mtp_snapshot_epoch=(
+                len(prompt_ids) if committed_mtp_cache is not None else None
+            ),
+            timing_out=put_timing,
+            **bank_fields,
+        )
+        put_done = time.perf_counter()
+        return {
+            "stored": entry is not None,
+            "mode": "prompt_prefix",
+            "reason": (
+                "committed_prompt_prefix"
+                if entry is not None
+                else "sessionbank_snapshot_skipped"
+            ),
+            "prefix_len": int(entry.prefix_len if entry is not None else len(prompt_ids)),
+            "nbytes": int(entry.nbytes if entry is not None else 0),
+            "elapsed_s": put_done - started,
+            "mtp_snapshot_elapsed_s": snapshot_done - started,
+            "put_elapsed_s": put_done - snapshot_done,
+            "put_timing": put_timing,
+            "cached_tokens": int(prompt_state.cached_tokens),
+            "suffix_tokens": int(prompt_state.suffix_tokens),
+        }
+    except Exception as exc:
+        # Like the prefill store beside it: a failed commit costs the next
+        # turn its resume point, never this answer. The request log says why.
+        return {
+            "stored": False,
+            "mode": "prompt_prefix",
+            "reason": f"prompt_prefix_commit_error:{type(exc).__name__}",
+            "elapsed_s": time.perf_counter() - started,
+            "mtp_snapshot_elapsed_s": max(0.0, snapshot_done - started),
+        }
+
+
 def generate_ar(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
@@ -9280,6 +9383,7 @@ def generate_ar(
     abort_check: Callable[[], bool] | None = None,
     first_token_logprobs_top_k: int | None = None,
     store_prefix_snapshot: bool | None = None,
+    commit_prompt_state_to_bank: bool = False,
 ) -> GenerationOutput:
     reject_non_k1_a3b_whole_moe_request(rt, entrypoint="generate_ar")
     if getattr(rt, "backend_id", None) == "gemma4_assistant":
@@ -9345,6 +9449,36 @@ def generate_ar(
         store_prefix_snapshot=store_prefix_snapshot,
     )
     prompt_state_total_time_s = time.perf_counter() - _prompt_state_started
+    # The prompt-prefix commit generate_mtpk makes, under the same conditions:
+    # without it a follow-up whose history differs where this answer starts
+    # resumes at an older checkpoint (_commit_ar_prompt_state).
+    prompt_prefix_bank_commit: dict[str, object] = {}
+    if (
+        commit_prompt_state_to_bank
+        and session_bank is not None
+        and session_id is not None
+        and prompt_ids
+        and (
+            int(prompt_state.suffix_tokens) > 0
+            # An identical prompt took its conversation's only copy as a
+            # lease: banked again before the answer decodes into it, so a
+            # cancelled answer leaves the conversation where it was.
+            or (
+                one_copy_runtime(rt)
+                and str(prompt_state.restore_mode).endswith("reference_lease")
+            )
+        )
+    ):
+        prompt_prefix_bank_commit = _commit_ar_prompt_state(
+            rt,
+            prompt_ids,
+            prompt_state,
+            session_bank=session_bank,
+            session_id=session_id,
+            template_hash=session_template_hash,
+            draft_head_identity=session_draft_head_identity,
+            policy_fingerprint=session_policy_fingerprint,
+        )
     cache = prompt_state.trunk_cache
     logits = prompt_state.logits
     prompt_eval_time = prompt_state.prompt_eval_time_s
@@ -9748,6 +9882,7 @@ def generate_ar(
         session_prefill_store=dict(
             getattr(prompt_state, "prefill_store_snapshot", None) or {}
         ),
+        session_prompt_prefix_bank_commit=prompt_prefix_bank_commit,
         session_restore_served=dict(
             getattr(prompt_state, "restore_served", None) or {}
         ),

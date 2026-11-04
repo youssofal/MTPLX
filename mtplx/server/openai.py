@@ -31755,9 +31755,9 @@ def _run_generation(
                 mtp_depth=effective_depth,
                 prefill_chunk_tokens=prefill_chunk_tokens,
                 restore_mode=_session_bank_restore_mode(session_restore_mode),
-                commit_prompt_prefix=bool(
-                    commit_prompt_prefix_to_bank and effective_mode != "ar"
-                ),
+                # Both lanes commit the prompt before decoding into it, so the
+                # admission prices the commit for both.
+                commit_prompt_prefix=bool(commit_prompt_prefix_to_bank),
                 restore_identity=admission_restore_identity,
                 pricing=admission_pricing,
                 wide_prefill_rungs=wide_prefill_rungs,
@@ -31935,6 +31935,15 @@ def _run_generation(
                         capture_final_state=session_bank is not None,
                         abort_check=_prefill_abort_check,
                         store_prefix_snapshot=store_prefix_snapshot,
+                        # The same prompt-prefix commit the MTP branch makes:
+                        # without it a follow-up that differs where the answer
+                        # starts resumed at the last 1,024-token prefill.
+                        commit_prompt_state_to_bank=(
+                            commit_prompt_prefix_to_bank
+                            and session_bank is not None
+                            and session_id is not None
+                            and not prompt_publish_skipped
+                        ),
                     )
                 else:
                     adaptive_policy = _make_adaptive_policy(
