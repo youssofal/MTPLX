@@ -1140,8 +1140,15 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
     }
 
     public func compatibleContextWindowOverride() -> Int? {
+        compatibleContextWindowOverride(modelFamily: MTPLXModelOption.modelFamily(for: model))
+    }
+
+    /// `compatibleContextWindowOverride()` for a caller that already holds
+    /// `MTPLXModelOption.modelFamily(for: model)`. Resolving the family can
+    /// read the model's metadata files from disk, and the Settings popover
+    /// asks on every render and slider step.
+    public func compatibleContextWindowOverride(modelFamily family: String) -> Int? {
         guard let raw = contextWindow, raw > 0 else { return nil }
-        let family = MTPLXModelOption.modelFamily(for: model)
         if let storedFamily = contextWindowModelFamily {
             guard MTPLXModelOption.settingsFamiliesCompatible(
                 stored: storedFamily,
@@ -1156,16 +1163,30 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
     }
 
     public func compatibleTunedDepth() -> Int? {
-        guard MTPLXModelOption.supportsTune(family: MTPLXModelOption.modelFamily(for: model)) else {
+        compatibleTunedDepth(modelFamily: MTPLXModelOption.modelFamily(for: model))
+    }
+
+    /// `compatibleTunedDepth()` for a caller that already holds
+    /// `MTPLXModelOption.modelFamily(for: model)` (no metadata read).
+    public func compatibleTunedDepth(modelFamily family: String) -> Int? {
+        guard MTPLXModelOption.supportsTune(family: family) else {
             return nil
         }
-        return compatibleTunedControlValue(controlField: "depth")
+        return compatibleTunedControlValue(controlField: "depth", modelFamily: family)
     }
 
     public func compatibleTunedControlValue(controlField: String) -> Int? {
+        compatibleTunedControlValue(
+            controlField: controlField,
+            modelFamily: MTPLXModelOption.modelFamily(for: model)
+        )
+    }
+
+    /// `compatibleTunedControlValue(controlField:)` for a caller that
+    /// already holds `MTPLXModelOption.modelFamily(for: model)`.
+    public func compatibleTunedControlValue(controlField: String, modelFamily family: String) -> Int? {
         let requestedField = controlField.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !requestedField.isEmpty else { return nil }
-        let family = MTPLXModelOption.modelFamily(for: model)
         if let record = tunedControlRecordForCurrentModel(),
            record.schemaVersion == 1,
            record.controlField == requestedField,

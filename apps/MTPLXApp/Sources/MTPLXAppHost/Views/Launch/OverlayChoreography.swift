@@ -10,9 +10,11 @@ import SwiftUI
 // look and feel identical. All timings come from `Motion`.
 
 enum OverlayChoreography {
-    /// Reset all three state values to zero, then animate the border,
-    /// header, and rows in with the standard stagger. Pass the bindings
-    /// to the three overlay @State fields.
+    /// Reset all three state values to zero, then reveal the border,
+    /// header and rows in one transaction (`Motion.overlayEnter`). One
+    /// state change means the popover's body runs once for the reveal
+    /// instead of once per staggered beat. Pass the bindings to the three
+    /// overlay @State fields.
     static func runEnter(
         motionEnabled: Bool,
         rowCount: Int,
@@ -24,35 +26,10 @@ enum OverlayChoreography {
         headerVisible.wrappedValue = false
         rowsVisibleCount.wrappedValue = 0
 
-        guard motionEnabled else {
+        withAnimation(motionEnabled ? Motion.overlayEnter : nil) {
             borderProgress.wrappedValue = 1
             headerVisible.wrappedValue = true
             rowsVisibleCount.wrappedValue = rowCount
-            return
-        }
-
-        withAnimation(Motion.overlayBorder) {
-            borderProgress.wrappedValue = 1
-        }
-
-        // Header + per-row staggered reveals via modern Swift Concurrency
-        // (was DispatchQueue.main.asyncAfter chains per swiftui-pro
-        // swift.md "Never use Grand Central Dispatch").
-        Task { @MainActor in
-            try? await Task.sleep(for: .seconds(Motion.overlayHeaderDelay))
-            withAnimation(Motion.overlayHeaderSpring) {
-                headerVisible.wrappedValue = true
-            }
-        }
-
-        for idx in 0..<rowCount {
-            let delay = Motion.overlayRowBaseDelay + Double(idx) * Motion.overlayRowStaggerStep
-            Task { @MainActor in
-                try? await Task.sleep(for: .seconds(delay))
-                withAnimation(Motion.overlayRowSpring) {
-                    rowsVisibleCount.wrappedValue = idx + 1
-                }
-            }
         }
     }
 
