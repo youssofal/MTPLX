@@ -335,6 +335,18 @@ export function useFilteredHistory(): RollingTPSPoint[] {
   );
 }
 
+export function useFilteredLiveHistory(): RollingTPSPoint[] {
+  return useDashboardStore(
+    useShallow((s) => {
+      if (!s.rolling) return [];
+      const live = s.rolling.live_history ?? [];
+      const filter = s.sessionFilter;
+      if (!filter) return live;
+      return live.filter((p) => p.session_id === filter);
+    }),
+  );
+}
+
 export function useFilteredRecent(): MetricsLatest[] {
   return useDashboardStore(
     useShallow((s) => {
