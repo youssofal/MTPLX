@@ -7,6 +7,7 @@ import { requestWait } from "../lib/requestWait";
 import { useDashboardStore, useFilteredRecent } from "../state/store";
 import { refusalOf } from "../lib/requestRefusal";
 import { cancellationOf } from "../lib/requestCancel";
+import { cacheMissBadge } from "../lib/cacheMiss";
 import type { MetricsLatest } from "../lib/types";
 
 export function RequestLogTable() {
@@ -154,13 +155,9 @@ export function Row({
     ? {
         label: "HIT",
         color: "text-[var(--accent)] bg-[var(--accent)]/10",
-        tooltip: undefined,
+        tooltip: "Served from the session cache.",
       }
-    : {
-        label: (row.cache_miss_reason ?? "MISS").toUpperCase(),
-        color: "text-[var(--accent-warm)] bg-[var(--accent-warm)]/10",
-        tooltip: undefined,
-      };
+    : cacheMissBadge(row.cache_miss_reason);
   const wait = requestWait(row);
   const waitTitle = wait
     ? wait.parts.length > 0
