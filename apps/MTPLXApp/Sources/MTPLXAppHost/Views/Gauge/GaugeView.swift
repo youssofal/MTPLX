@@ -387,7 +387,23 @@ struct GaugeView: View {
             } animation: { _ in
                 motionEnabled ? .spring(response: 0.28, dampingFraction: 0.72) : nil
             }
+            // Draw the number, its halo and its pulse on the GPU as one
+            // layer. Left to itself the halo's blur was redrawn on the CPU
+            // (CoreGraphics, then vImage fanned out over worker threads) on
+            // every frame of every digit roll and pulse, which is every
+            // 0.5 s while the engine decodes: about one core of app CPU for
+            // the whole decode. The inset keeps the halo, the 6% pulse and
+            // the rolling digits inside the layer; the negative inset leaves
+            // layout unchanged.
+            .padding(Self.heroLayerInset)
+            .drawingGroup()
+            .padding(Self.heroLayerOutset)
     }
+
+    /// Room around the hero number for its 8 pt halo, its 1.06 pulse and
+    /// digits rolling in and out vertically.
+    private static let heroLayerInset = EdgeInsets(top: 40, leading: 20, bottom: 40, trailing: 20)
+    private static let heroLayerOutset = EdgeInsets(top: -40, leading: -20, bottom: -40, trailing: -20)
 
     /// Whether the hero TPS should carry the polished-steel ambient
     /// halo. Off in degraded / dim states so the semantic foreground
