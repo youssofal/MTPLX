@@ -3248,6 +3248,22 @@ def _validate_mtp_batch_settings(args: argparse.Namespace) -> None:
                 "requires scheduler_mode=mtp_batch"
             )
         return
+    # The family first: mtp_batch is the Qwen 3.6 35B-A3B service, and on a
+    # Flash-Next pack the flag list below asked for target_prefix, which the
+    # family coerces back to batched, so the refusal repeated whatever the
+    # user set. An unreadable folder keeps the checks below; the load
+    # validates the architecture exactly (a3b_mtp_batch._validate_config).
+    config = _served_model_config(args)
+    model_type = (
+        str(config.get("model_type") or "").strip().lower() if config is not None else ""
+    )
+    if model_type and model_type != "qwen3_5_moe":
+        raise A3BMTPBatchInstallError(
+            "--scheduler-mode mtp_batch serves the Qwen 3.6 35B-A3B packs only, and "
+            f"this model is {model_type}. Remove --scheduler-mode mtp_batch and its "
+            "settings (--mtp-batch-numerics, --verify-strategy target_prefix); the "
+            "default scheduler serves one request at a time and queues the rest."
+        )
     required = (
         (str(getattr(args, "generation_mode", "")) == "mtp", "generation_mode=mtp"),
         (bool(getattr(args, "load_mtp", False)), "load_mtp=true"),
