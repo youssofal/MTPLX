@@ -5364,6 +5364,148 @@ def test_opencode_title_request_fast_path_does_not_enter_model(monkeypatch):
     assert state.last_metrics[-1]["request_max_tokens"] == 32000
 
 
+# OpenCode 2.x (2.2.3 to 2.2.5) rewrote its title agent's prompt and sends it
+# beside the first turn and again during the conversation, under the
+# conversation's own session id. The 1.x fast path no longer matched it, so
+# the title ran on the model and took the conversation's session (3 Nov).
+_OPENCODE_2_TITLE_SYSTEM = (
+    "You name conversations so the user can find them later in a list of past "
+    "sessions.\n\nYou will receive the first message of a conversation, or for an "
+    "ongoing conversation its original request and recent messages."
+)
+
+
+@pytest.mark.parametrize(
+    ("user_content", "expected"),
+    [
+        (
+            "Here is the first message of the conversation:\n\n<message>\n"
+            "make me a flappy bird game in one html file\n</message>\n\n"
+            "Reply with only the title.",
+            "make me a flappy bird game in one",
+        ),
+        (
+            "Here is the conversation so far:\n\n<conversation>\nOriginal request:\n"
+            "fix the snake speed bug in game.js\n\nRecent conversation:\nUser: "
+            "now make it prettier\n\nAssistant: Done.\n</conversation>\n\n"
+            "Reply with only the title.",
+            "fix the snake speed bug in game.js",
+        ),
+        (
+            "Here is the first message of the conversation:\n\n<message>\nhey\n"
+            "</message>\n\nReply with only the title.",
+            "Greeting",
+        ),
+    ],
+)
+def test_opencode_2_title_request_fast_path_does_not_enter_model(
+    monkeypatch, user_content, expected
+):
+    state = _fake_state()
+    client = TestClient(create_app(state))
+
+    def fail_generation(*_args, **_kwargs):
+        raise AssertionError("OpenCode title request should not enter generation")
+
+    monkeypatch.setattr(openai, "_run_generation", fail_generation)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={
+            "x-session-affinity": "ses_title_case",
+            "x-opencode-client": "desktop",
+            "User-Agent": "opencode/2.2.5",
+        },
+        json={
+            "model": "mtplx-test-model",
+            "stream": False,
+            "max_tokens": 32000,
+            "messages": [
+                {"role": "system", "content": _OPENCODE_2_TITLE_SYSTEM},
+                {"role": "user", "content": user_content},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == expected
+    assert state.last_metrics[-1]["opencode_title_fast_path"] is True
+
+
+def test_opencode_title_kind_header_takes_the_fast_path(monkeypatch):
+    state = _fake_state()
+    client = TestClient(create_app(state))
+
+    def fail_generation(*_args, **_kwargs):
+        raise AssertionError("a request the plugin marks as a title must not reach the model")
+
+    monkeypatch.setattr(openai, "_run_generation", fail_generation)
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-client": "opencode", "x-mtplx-request-kind": "title"},
+        json={
+            "model": "mtplx-test-model",
+            "messages": [
+                {"role": "system", "content": "Name this conversation in a few words."},
+                {"role": "user", "content": "debug 500 errors in production"},
+            ],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "debug 500 errors in production"
+
+
+def test_a_coding_turn_with_the_title_phrase_in_chat_is_not_a_title():
+    request = openai.ChatCompletionRequest(
+        model="m",
+        messages=[
+            {"role": "system", "content": "You are opencode, an interactive CLI agent."},
+            {"role": "user", "content": "You name conversations so the user can find them later"},
+        ],
+    )
+    assert not openai._is_opencode_title_request(request, {"x-mtplx-client": "opencode"})
+    with_tools = openai.ChatCompletionRequest(
+        model="m",
+        messages=[
+            {"role": "system", "content": _OPENCODE_2_TITLE_SYSTEM},
+            {"role": "user", "content": "hi"},
+        ],
+        tools=[_write_tool_schema()],
+    )
+    assert not openai._is_opencode_title_request(
+        with_tools, {"x-mtplx-request-kind": "title"}
+    )
+
+
+_OPENCODE_2_HEADERS = {"x-opencode-client": "desktop", "user-agent": "opencode/2.2.5"}
+
+
+@pytest.mark.parametrize(
+    ("max_tokens", "headers", "window", "expected"),
+    [
+        # OpenCode 2.x sends min(limit.output, 32,000); MTPLX wrote that reserve.
+        (32_000, _OPENCODE_2_HEADERS, 262_144, (None, True)),
+        (16_384, _OPENCODE_2_HEADERS, 32_768, (None, True)),
+        # The user's --max-response-tokens rides on the model's own header.
+        (32_000, {**_OPENCODE_2_HEADERS, "x-mtplx-max-response-tokens": "48000"}, 262_144, (48_000, True)),
+        # A cap set in OpenCode itself passes through untouched.
+        (8_000, _OPENCODE_2_HEADERS, 262_144, (8_000, False)),
+        # Another client's 32,000 is that client's choice.
+        (32_000, {"user-agent": "curl/8.7"}, 262_144, (32_000, False)),
+        (None, _OPENCODE_2_HEADERS, 262_144, (None, False)),
+    ],
+)
+def test_opencode_injected_output_cap_is_stripped_server_side(
+    max_tokens, headers, window, expected
+):
+    assert (
+        openai._strip_client_injected_output_cap(
+            max_tokens, headers=headers, metadata={}, context_window=window
+        )
+        == expected
+    )
+
+
 def test_stream_cancellation_metric_records_prompt_and_policy_context():
     state = _fake_streaming_session_state()
     state.requests_cancelled = 0

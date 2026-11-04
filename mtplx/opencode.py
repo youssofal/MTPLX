@@ -195,6 +195,7 @@ export default {
     await ctx.session.hook("model.request", (event) => {
       event.headers["x-mtplx-client"] = "opencode";
       event.headers["x-mtplx-session-id"] = String(event.sessionID);
+      if (event.kind) event.headers["x-mtplx-request-kind"] = String(event.kind);
     }, { providerID: "mtplx" });
   }
 };

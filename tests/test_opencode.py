@@ -450,9 +450,11 @@ console.log(JSON.stringify({{id: plugin.id, name, filter, count: registrations.l
     assert data["count"] == 1
     assert data["name"] == "model.request"
     assert data["filter"] == {"providerID": "mtplx"}
+    # OpenCode 2.x's own request kind (primary, title, compaction) reaches
+    # the server, which keeps a title off the conversation's session.
     assert data["event"]["headers"] == {
         "existing": "kept", "x-mtplx-client": "opencode",
-        "x-mtplx-session-id": "ses_v2",
+        "x-mtplx-session-id": "ses_v2", "x-mtplx-request-kind": "primary",
     }
     assert data["output"]["headers"]["x-mtplx-session-id"] == "ses_v1"
     assert data["output"]["headers"]["x-mtplx-client-turn-id"] == "msg_user"

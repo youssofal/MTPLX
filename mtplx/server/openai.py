@@ -16979,19 +16979,47 @@ def _strip_client_injected_output_cap(
     *,
     headers: Mapping[str, str],
     metadata: Mapping[str, Any],
+    context_window: int | None = None,
 ) -> tuple[int | None, bool]:
-    """Strip exactly hermes's injected default cap for hermes-hinted requests.
+    """Strip exactly a client's injected default cap for that client's requests.
 
-    Same contract as the OpenCode plugin's 32,000 strip and Pi's
-    request-policy extension: MTPLX owns the uncapped generation contract for
-    the known client-injected value, while any other value is a deliberate
-    client choice and passes through untouched.
+    hermes-agent sends 65,536 when its user set no cap. OpenCode sends
+    ``min(limit.output, 32,000)`` with every request, and MTPLX writes
+    ``limit.output`` as its reply reserve (``opencode_output_limit``: half
+    the window, at most 32,000). OpenCode 1.x let the session-headers
+    plugin strip that value in ``chat.params``; OpenCode 2.x no longer calls
+    that hook, so without this rule every 2.x answer stopped at 32,000
+    tokens (an xhigh answer runs past that). An answer cap the user asked
+    MTPLX for (--max-response-tokens) rides along as the model's
+    x-mtplx-max-response-tokens header and replaces the stripped value, as
+    the plugin did. Same contract as Pi's request-policy extension: MTPLX
+    owns the uncapped generation contract for the known client-injected
+    value, while any other value is a deliberate client choice and passes
+    through untouched.
     """
 
     if request_max_tokens == _HERMES_INJECTED_DEFAULT_MAX_TOKENS and _is_hermes_client(
         headers=headers, metadata=metadata
     ):
         return None, True
+    if request_max_tokens is not None and _is_opencode_client(
+        headers=headers, metadata=metadata
+    ):
+        from mtplx.opencode import (
+            OPENCODE_INJECTED_OUTPUT_CAP,
+            OPENCODE_REQUESTED_OUTPUT_HEADER,
+            opencode_output_limit,
+        )
+
+        injected = {OPENCODE_INJECTED_OUTPUT_CAP}
+        if context_window and int(context_window) > 0:
+            injected.add(opencode_output_limit(int(context_window)))
+        if int(request_max_tokens) in injected:
+            try:
+                requested = int(str(headers.get(OPENCODE_REQUESTED_OUTPUT_HEADER) or "").strip())
+            except ValueError:
+                requested = 0
+            return (requested if requested > 0 else None), True
     return request_max_tokens, False
 
 
@@ -17003,34 +17031,79 @@ def _request_max_tokens(request: BaseModel) -> int | None:
     return None if alias is None else int(alias)
 
 
-def _is_opencode_title_request(request: ChatCompletionRequest) -> bool:
+# The system message of OpenCode's title agent: each tuple is one release
+# line's prompt, matched when all of its phrases appear. 1.x: "You are a
+# title generator ...". 2.x (2.2.3 to 2.2.5 checked): "You name
+# conversations so the user can find them later in a list of past
+# sessions", sent beside the first turn and again during the conversation.
+_OPENCODE_TITLE_SYSTEM_MARKERS = (
+    ("You are a title generator", "Generate a brief title", "Never use tools"),
+    ("You name conversations so the user can find them later",),
+)
+# MTPLX's OpenCode plugin passes OpenCode 2.x's own request kind.
+_OPENCODE_REQUEST_KIND_HEADER = "x-mtplx-request-kind"
+
+
+def _is_opencode_title_request(
+    request: ChatCompletionRequest,
+    headers: Mapping[str, str] | None = None,
+) -> bool:
     """Detect OpenCode's auxiliary thread-title call.
 
-    OpenCode sends this beside the real coding request. Letting the 27B model
+    OpenCode sends this beside the real coding request. Letting the model
     spend seconds on a cosmetic title blocks the single model-owner lane and
     makes users stare at "Thinking..." before their actual request starts.
-    This fast path only handles the exact title-generator prompt shape and
-    never touches normal user chat/tool requests.
+    Under OpenCode 2.x it also arrived under the conversation's own session
+    id, so it took the conversation's session: the user's turn got HTTP 409
+    and the title replaced the conversation's live cache (3 Nov: a 7 s
+    re-read of 9,465 tokens). This fast path only handles the title agent's
+    prompt shape, or a request MTPLX's plugin marks as OpenCode's title
+    kind, and never touches normal user chat or tool requests.
     """
     if request.tools or len(request.messages) < 2:
         return False
+    if headers is not None:
+        kind = str(headers.get(_OPENCODE_REQUEST_KIND_HEADER) or "").strip().lower()
+        if kind == "title":
+            return True
     first = request.messages[0]
     if str(first.role).lower() != "system":
         return False
     system_text = _content_to_text(first.content)
-    return (
-        "You are a title generator" in system_text
-        and "Generate a brief title" in system_text
-        and "Never use tools" in system_text
+    return any(
+        all(phrase in system_text for phrase in phrases)
+        for phrases in _OPENCODE_TITLE_SYSTEM_MARKERS
     )
+
+
+def _opencode_title_subject(text: str) -> str:
+    """The conversation's original request inside an OpenCode title prompt.
+
+    OpenCode 2.x wraps it: "Here is the first message of the conversation:
+    <message>...</message>", or for an ongoing conversation "<conversation>
+    Original request: ... Recent conversation: User: ... </conversation>".
+    Titling from the original request keeps the title stable across the
+    conversation instead of following its latest message.
+    """
+    match = re.search(r"<message>\s*(.*?)\s*</message>", text, re.S)
+    if match:
+        return match.group(1)
+    match = re.search(
+        r"Original request:\s*(.*?)\s*(?:\n\s*\nRecent conversation:|</conversation>|\Z)",
+        text,
+        re.S,
+    )
+    if match:
+        return match.group(1)
+    return text
 
 
 def _opencode_fast_title(request: ChatCompletionRequest) -> str:
     user_text = ""
-    for message in reversed(request.messages):
+    for message in request.messages:
         if str(message.role).lower() != "user":
             continue
-        text = _content_to_text(message.content).strip()
+        text = _opencode_title_subject(_content_to_text(message.content)).strip()
         if not text or text.lower().startswith("generate a title"):
             continue
         user_text = text
@@ -37999,7 +38072,10 @@ def create_app(state: ServerState) -> FastAPI:
         metadata = _request_metadata(request)
         request_max_tokens, hermes_default_cap_stripped = (
             _strip_client_injected_output_cap(
-                _request_max_tokens(request), headers=headers, metadata=metadata
+                _request_max_tokens(request),
+                headers=headers,
+                metadata=metadata,
+                context_window=int(getattr(state.args, "context_window", 0) or 0),
             )
         )
         requested_model = request.model
@@ -38036,7 +38112,7 @@ def create_app(state: ServerState) -> FastAPI:
             response_id, arrival=_arrival_s, handler_start=_handler_start_s
         )
         created = int(time.time())
-        if _is_opencode_title_request(request):
+        if _is_opencode_title_request(request, headers):
             return _opencode_title_response(
                 state,
                 request,
@@ -38589,7 +38665,11 @@ def create_app(state: ServerState) -> FastAPI:
         if reasoning_effort is not None:
             request_observability["resolved_reasoning_effort"] = reasoning_effort
         if hermes_default_cap_stripped:
-            request_observability["hermes_default_cap_stripped"] = True
+            # The client's own default cap was dropped (hermes 65,536,
+            # OpenCode's 32,000 reserve); the server's limits apply.
+            request_observability["client_default_cap_stripped"] = True
+            if _is_hermes_client(headers=headers, metadata=metadata):
+                request_observability["hermes_default_cap_stripped"] = True
         if transient_suffix_contract_active:
             if read_only_force_answer_contract_active:
                 _restore_policy_label = "stable_without_transient_force_answer"

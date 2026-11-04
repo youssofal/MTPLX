@@ -492,6 +492,22 @@ _CLAUDE_CODE_CONVERSATION_REQUEST_CLASSES = frozenset(
 )
 
 
+# OpenCode 2.x request kinds, passed by MTPLX's plugin as
+# x-mtplx-request-kind (see EngineSessionManager._opencode_side_request).
+# Any other kind, compaction included, goes to the prefix check.
+_OPENCODE_SIDE_REQUEST_KINDS = frozenset({"title"})
+_OPENCODE_CONVERSATION_REQUEST_KINDS = frozenset({"primary"})
+
+
+def _is_opencode_request(lowered_headers: Mapping[str, Any]) -> bool:
+    """Per-request evidence that OpenCode sent this request."""
+    if str(lowered_headers.get("x-mtplx-client") or "").strip().lower() == "opencode":
+        return True
+    if any(str(key).startswith("x-opencode-") for key in lowered_headers):
+        return True
+    return "opencode" in str(lowered_headers.get("user-agent") or "").lower()
+
+
 def _claude_code_session_id(session_id: str, lowered_headers: Mapping[str, Any]) -> str:
     """Give each Claude Code subagent its own session.
 
@@ -2120,6 +2136,22 @@ class EngineSessionManager:
                                 "reason": side_reason,
                             }
                         continue
+                elif _is_opencode_request(lowered_headers):
+                    side_reason = self._opencode_side_request(
+                        session_id, prompt_ids, lowered_headers
+                    )
+                    if side_reason is not None:
+                        if diagnostic_out is not None:
+                            diagnostic_out["opencode_side_request"] = {
+                                "named_session_id": session_id,
+                                "header": key,
+                                "reason": side_reason,
+                            }
+                        # OpenCode stamps the same id under several of these
+                        # headers (x-session-affinity, X-Session-Id and the
+                        # plugin's x-mtplx-session-id): a side request leaves
+                        # the header lookup instead of falling to an alias.
+                        break
                 return session_id, f"header.{key}"
         for key in ("session_id", "mtplx_session_id", "chat_id", "conversation_id"):
             value = metadata.get(key)
@@ -2315,6 +2347,17 @@ class EngineSessionManager:
         session = self.peek(session_id)
         if session is None:
             return None
+        return self._outside_conversation_prefix(session, prompt_ids)
+
+    @staticmethod
+    def _outside_conversation_prefix(
+        session: "EngineSession",
+        prompt_ids: list[int] | tuple[int, ...],
+    ) -> str | None:
+        """The side-request reason when ``prompt_ids`` does not open with the
+        first _COMMON_PREFIX_REUSE_MIN_TOKENS tokens ``session`` committed
+        (its system prompt and tool contract), else None. A session shorter
+        than that has nothing to protect."""
         committed = session.committed_token_ids
         span = _COMMON_PREFIX_REUSE_MIN_TOKENS
         if len(committed) < span:
@@ -2322,6 +2365,42 @@ class EngineSessionManager:
         if tuple(int(token) for token in prompt_ids[:span]) == committed[:span]:
             return None
         return "prompt_does_not_share_the_conversation_prefix"
+
+    def _opencode_side_request(
+        self,
+        session_id: str,
+        prompt_ids: list[int] | tuple[int, ...] | None,
+        lowered_headers: Mapping[str, Any],
+    ) -> str | None:
+        """Why an OpenCode request named into a conversation is not that
+        conversation, or None when it is.
+
+        OpenCode 2.x stamps the conversation's id (x-session-affinity,
+        X-Session-Id, x-opencode-session) on every request of a session,
+        including the title request it sends beside each turn. On 3 Nov the
+        title won the race to the named session: the user's 18,348-token
+        turn got HTTP 409 and the title replaced the conversation's live
+        cache, so the retry re-read 9,465 tokens (7 s to first token). The
+        server answers recognised title prompts without the model before
+        this point; this is the rule for the rest. MTPLX's plugin passes
+        OpenCode's own request kind: ``title`` is a side request, ``primary``
+        is the conversation. Otherwise, as for Claude Code, a request that
+        does not open with the conversation's system prompt and tools is
+        resolved by its own prompt. OpenCode's system prompt and tools run
+        past that span on every agent, so a compacted conversation keeps its
+        session.
+        """
+        kind = str(lowered_headers.get("x-mtplx-request-kind") or "").strip().lower()
+        if kind in _OPENCODE_SIDE_REQUEST_KINDS:
+            return f"request_kind_{kind}"
+        if kind in _OPENCODE_CONVERSATION_REQUEST_KINDS:
+            return None
+        if not prompt_ids:
+            return None
+        session = self.peek(session_id)
+        if session is None:
+            return None
+        return self._outside_conversation_prefix(session, prompt_ids)
 
     def _begin_on_fresh_anon_session(self, cancel_event: Any | None) -> EngineSession:
         while True:
