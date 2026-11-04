@@ -2851,21 +2851,26 @@ public final class MTPLXBackendStore: ObservableObject {
     private(set) var dashboardVisible = true
 
     var metricsSnapshotIntervalMs: Int {
-        if configuration.performanceLock || !dashboardVisible {
+        if configuration.performanceLock {
             return Self.quietMetricsIntervalMs
         }
-        return max(configuration.streamSnapshotIntervalMs, Self.dashboardSnapshotFloorMs)
+        let chosen = max(configuration.streamSnapshotIntervalMs, Self.dashboardSnapshotFloorMs)
+        // Hidden slows the stream down, never up: a user who chose 2 s or
+        // 5 s keeps it while nobody can see the window.
+        return dashboardVisible ? chosen : max(chosen, Self.quietMetricsIntervalMs)
     }
 
     /// Window visibility hook (the host reports AppKit's occlusion state).
-    /// Reopens an open metrics stream at the new cadence; it keeps `.open`
+    /// Reopens the metrics stream at the new cadence, also while it is still
+    /// connecting or reconnecting: the client reuses the interval it was
+    /// started with for every reconnect, so a change made then would
+    /// otherwise last until the next restart. An open stream keeps `.open`
     /// throughout so the status dot never blinks for it.
     public func setDashboardVisible(_ visible: Bool) {
         guard dashboardVisible != visible else { return }
         let previousInterval = metricsSnapshotIntervalMs
         dashboardVisible = visible
         guard streamTask != nil,
-              connectionState == .open,
               metricsSnapshotIntervalMs != previousInterval
         else { return }
         startMetricsStream(retainingOpenState: true)
@@ -2877,10 +2882,19 @@ public final class MTPLXBackendStore: ObservableObject {
         let transportGeneration = daemonTransportGeneration
         let client = MetricsStreamClient(apiClient: apiClient)
         let interval = metricsSnapshotIntervalMs
-        // A cadence-only reopen of a healthy stream must not report
-        // `.connecting`: the chrome would flip to "Connecting" and pulse
-        // for a reconnect the user never saw fail.
-        let keepOpen = retainingOpenState && connectionState == .open
+        // A cadence-only reopen must not move the chrome backwards. A
+        // healthy stream keeps `.open`: the chrome would otherwise flip to
+        // "Connecting" and pulse for a reconnect the user never saw fail. A
+        // reconnecting one keeps `.reconnecting`, so its return to `.open`
+        // still runs the held-daemon check (#528); a window coming back
+        // after sleep is both a reconnect and a visibility change.
+        let keepOpen: Bool
+        switch connectionState {
+        case .open, .reconnecting:
+            keepOpen = retainingOpenState
+        default:
+            keepOpen = false
+        }
         streamTask = Task { [weak self] in
             await client.connect(
                 snapshotIntervalMs: interval,
@@ -5213,9 +5227,11 @@ public final class MTPLXBackendStore: ObservableObject {
     /// gauge and decode headline): the configured cadence, 100 ms by
     /// default, independent of the slower snapshot cadence.
     var progressFrameIntervalMs: Int {
-        configuration.performanceLock || !dashboardVisible
-            ? Self.quietMetricsIntervalMs
-            : max(100, configuration.streamSnapshotIntervalMs)
+        if configuration.performanceLock {
+            return Self.quietMetricsIntervalMs
+        }
+        let chosen = max(100, configuration.streamSnapshotIntervalMs)
+        return dashboardVisible ? chosen : max(chosen, Self.quietMetricsIntervalMs)
     }
 
     private func shouldPublishProgressFrame() -> Bool {

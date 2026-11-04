@@ -18,7 +18,7 @@ struct DaemonStatePill: View {
                 .font(.system(size: 10, weight: .heavy, design: .monospaced))
                 .tracking(1.5)
             if let detail {
-                Text("·")
+                Text(verbatim: "·")
                     .foregroundStyle(Brand.textHighlight.opacity(0.4))
                 Text(detail)
                     .font(.caption2)
@@ -172,7 +172,7 @@ struct ProfilePill: View {
             Text(name.capitalized)
                 .font(.caption.weight(.medium))
             if let family, family != name {
-                Text("·")
+                Text(verbatim: "·")
                     .foregroundStyle(.tertiary)
                 Text(family)
                     .font(.caption2)

@@ -779,7 +779,7 @@ struct ModelDownloadSheet: View {
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(Brand.typeSecondary)
             } else {
-                Text("—")
+                Text(verbatim: "—")
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(Brand.typeTertiary)
             }

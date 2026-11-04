@@ -45,7 +45,7 @@ struct TopChromeStrip: View {
                         daemonState: daemonState,
                         connectionState: connectionState
                     )
-                    Text("\u{00B7}")
+                    Text(verbatim: "\u{00B7}")
                         .font(.system(size: 11, weight: .regular, design: .monospaced))
                         .foregroundStyle(Brand.typeTertiary)
                         .accessibilityHidden(true)

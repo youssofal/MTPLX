@@ -115,7 +115,7 @@ struct AcceptanceSection: View {
                     .font(.system(size: 12, weight: .heavy, design: .rounded))
                     .foregroundStyle(Brand.textHighlight)
                 Spacer()
-                Text("\(Format.percent(rate)) (\(accepted)/\(drafted))")
+                Text(verbatim: "\(Format.percent(rate)) (\(accepted)/\(drafted))")
                     .font(.system(size: 11, weight: .medium, design: .monospaced))
                     .monospacedDigit()
                     .foregroundStyle(Brand.textHighlight.opacity(0.85))
