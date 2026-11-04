@@ -5558,6 +5558,163 @@ def test_a_text_protocol_client_can_keep_tool_markup_per_request(
         assert "no tools are active" in content
 
 
+def test_another_clients_title_prompt_with_the_2x_phrase_reaches_the_model(monkeypatch):
+    """The 2.x phrase alone is not OpenCode: a custom title prompt of another
+    client that shares it (here asking for JSON) is generated as usual."""
+    state = _fake_state()
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    calls = []
+
+    def generation(*_args, **_kwargs):
+        calls.append(1)
+        return _fake_generation('{"title": "UTF-8 CSV importer failure"}')
+
+    monkeypatch.setattr(openai, "_run_generation", generation)
+    for headers in ({"x-mtplx-client": "openwebui"}, {"x-mtplx-request-kind": "title"}):
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"x-mtplx-cache-mode": "bypass", **headers},
+            json={
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You name conversations so the user can find them later. "
+                        "Return a JSON object with the key title.",
+                    },
+                    {"role": "user", "content": "why does the new importer fail on UTF-8 CSV files"},
+                ],
+                "max_tokens": 64,
+            },
+        )
+        assert response.status_code == 200
+        assert "UTF-8 CSV importer failure" in response.json()["choices"][0]["message"]["content"]
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(("served", "wire_cap"), [(32_768, 16_384), (262_144, 32_000)])
+def test_opencode_reserve_is_stripped_for_the_window_it_was_configured_from(
+    monkeypatch, served, wire_cap
+):
+    """OpenCode is configured from the served window, which the server may
+    size itself (--context-window 0) or fit to the Mac; its reserve for that
+    window is OpenCode's default, not a cap."""
+    state = _fake_state()
+    state.args.stats_footer = False
+    state.args.context_window = 0
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(openai, "served_execution_window", lambda _state: {"tokens": served})
+    seen = {}
+
+    def generation(_state, _prompt_ids, **kwargs):
+        seen["max_tokens"] = kwargs.get("max_tokens")
+        return _fake_generation("ok")
+
+    monkeypatch.setattr(openai, "_run_generation", generation)
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass", "user-agent": "opencode/latest/2.2.5/desktop"},
+        json={"messages": [{"role": "user", "content": "hi"}], "max_tokens": wire_cap},
+    )
+    assert response.status_code == 200
+    assert seen["max_tokens"] != wire_cap
+
+
+_KEEP = {"x-mtplx-cache-mode": "bypass", "x-mtplx-keep-tool-markup": "on"}
+
+
+def _stream_text(client, headers, body):
+    response = client.post(
+        "/v1/chat/completions", headers=headers, json={**body, "stream": True}
+    )
+    assert response.status_code == 200
+    payloads = _stream_payloads(response.text)
+    content = "".join(
+        choice.get("delta", {}).get("content") or ""
+        for payload in payloads
+        for choice in payload.get("choices", [])
+    )
+    reasoning = "".join(
+        choice.get("delta", {}).get("reasoning_content") or ""
+        for payload in payloads
+        for choice in payload.get("choices", [])
+    )
+    return content, reasoning
+
+
+def test_kept_markup_quoted_in_closed_thinking_stays_reasoning_when_streamed(monkeypatch):
+    """With no tools declared nothing ends thinking, even when the client
+    keeps tool markup: a call the model only considers stays reasoning."""
+    text = (
+        "<think>I should consider this:\n<tool_call>\n"
+        '{"name": "run", "arguments": {"cmd": "echo hi"}}\n</tool_call>\n'
+        "This is still my reasoning.</think>\nFinal answer."
+    )
+    state = _fake_state()
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(openai, "_run_generation", _fake_streaming_generation(text))
+    content, reasoning = _stream_text(
+        client,
+        _KEEP,
+        {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 256,
+         "enable_thinking": True},
+    )
+    assert content.strip() == "Final answer."
+    assert "This is still my reasoning." in reasoning
+
+
+def test_kept_markup_streams_with_its_line_breaks(monkeypatch):
+    text = "RUN: echo hi\n<tool_call>\nWRITE: result.txt\nhello\n</tool_call>"
+    state = _fake_state()
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(
+        openai, "_encode_rendered_chat_text", lambda *_args, **_kwargs: [1, 2, 3]
+    )
+    body = {"messages": [{"role": "user", "content": "go"}], "max_tokens": 256,
+            "enable_thinking": False}
+    monkeypatch.setattr(openai, "_run_generation", _fake_streaming_generation(text))
+    content, _ = _stream_text(client, _KEEP, body)
+    assert content == text
+    monkeypatch.setattr(openai, "_run_generation", lambda *_a, **_k: _fake_generation(text))
+    response = client.post("/v1/chat/completions", headers=_KEEP, json=body)
+    assert response.json()["choices"][0]["message"]["content"] == content
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_the_operator_switch_keeps_markup_and_drops_the_notice(monkeypatch, stream):
+    monkeypatch.setenv("MTPLX_KEEP_ORPHAN_TOOL_MARKUP", "on")
+    state = _fake_state()
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(
+        openai, "_encode_rendered_chat_text", lambda *_args, **_kwargs: [1, 2, 3]
+    )
+    body = {"messages": [{"role": "user", "content": "RUN: echo hi"}], "max_tokens": 128,
+            "enable_thinking": False}
+    headers = {"x-mtplx-cache-mode": "bypass"}
+    if stream:
+        monkeypatch.setattr(
+            openai, "_run_generation", _fake_streaming_generation(_TEXT_PROTOCOL_CALL)
+        )
+        content, _ = _stream_text(client, headers, body)
+    else:
+        monkeypatch.setattr(
+            openai, "_run_generation", lambda *_a, **_k: _fake_generation(_TEXT_PROTOCOL_CALL)
+        )
+        content = client.post("/v1/chat/completions", headers=headers, json=body).json()[
+            "choices"
+        ][0]["message"]["content"]
+    assert '<tool_call>\n{"name": "run"' in content
+    assert "no tools are active" not in content
+
+
 def test_stream_cancellation_metric_records_prompt_and_policy_context():
     state = _fake_streaming_session_state()
     state.requests_cancelled = 0

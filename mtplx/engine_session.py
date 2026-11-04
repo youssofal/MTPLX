@@ -494,9 +494,8 @@ _CLAUDE_CODE_CONVERSATION_REQUEST_CLASSES = frozenset(
 
 # OpenCode 2.x request kinds, passed by MTPLX's plugin as
 # x-mtplx-request-kind (see EngineSessionManager._opencode_side_request).
-# Any other kind, compaction included, goes to the prefix check.
+# Every other kind (primary, compaction) is the conversation.
 _OPENCODE_SIDE_REQUEST_KINDS = frozenset({"title"})
-_OPENCODE_CONVERSATION_REQUEST_KINDS = frozenset({"primary"})
 
 
 def _is_opencode_request(lowered_headers: Mapping[str, Any]) -> bool:
@@ -2382,25 +2381,19 @@ class EngineSessionManager:
         turn got HTTP 409 and the title replaced the conversation's live
         cache, so the retry re-read 9,465 tokens (7 s to first token). The
         server answers recognised title prompts without the model before
-        this point; this is the rule for the rest. MTPLX's plugin passes
-        OpenCode's own request kind: ``title`` is a side request, ``primary``
-        is the conversation. Otherwise, as for Claude Code, a request that
-        does not open with the conversation's system prompt and tools is
-        resolved by its own prompt. OpenCode's system prompt and tools run
-        past that span on every agent, so a compacted conversation keeps its
-        session.
+        this point. Here only OpenCode's own word counts: MTPLX's plugin
+        passes the request kind, and ``title`` is a side request. A prompt
+        comparison is not used for OpenCode: an agent with a short system
+        prompt has generated reasoning inside the conversation's first
+        4,096 committed tokens, which the client's resent history does not
+        carry until the session's canonicalization restores it, so the
+        comparison would move a real follow-up off its own session.
         """
+        del session_id, prompt_ids
         kind = str(lowered_headers.get("x-mtplx-request-kind") or "").strip().lower()
         if kind in _OPENCODE_SIDE_REQUEST_KINDS:
             return f"request_kind_{kind}"
-        if kind in _OPENCODE_CONVERSATION_REQUEST_KINDS:
-            return None
-        if not prompt_ids:
-            return None
-        session = self.peek(session_id)
-        if session is None:
-            return None
-        return self._outside_conversation_prefix(session, prompt_ids)
+        return None
 
     def _begin_on_fresh_anon_session(self, cancel_event: Any | None) -> EngineSession:
         while True:

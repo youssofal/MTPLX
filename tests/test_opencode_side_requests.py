@@ -52,30 +52,30 @@ def _turn(manager, headers, prompt, generated, diagnostic=None):
     return session_id, source
 
 
-@pytest.mark.parametrize(
-    ("headers", "named_source"),
-    [
-        (BARE_HEADERS, "header.x-session-affinity"),
-        (PLUGIN_HEADERS, "header.x-mtplx-session-id"),
-    ],
-)
-def test_a_title_request_does_not_take_an_established_conversation(headers, named_source):
+TITLE_HEADERS = {**PLUGIN_HEADERS, "x-mtplx-request-kind": "title"}
+
+
+def test_a_title_request_does_not_take_an_established_conversation():
     manager = EngineSessionManager()
-    assert _turn(manager, headers, CONVERSATION, [7, 8, 9]) == (OPENCODE_SESSION, named_source)
+    assert _turn(manager, PLUGIN_HEADERS, CONVERSATION, [7, 8, 9]) == (
+        OPENCODE_SESSION,
+        "header.x-mtplx-session-id",
+    )
     conversation_stream = manager.peek(OPENCODE_SESSION).committed_token_ids
 
     diagnostic: dict = {}
-    side, side_source = _turn(manager, headers, TITLE_REQUEST, [1, 2], diagnostic)
+    side, side_source = _turn(manager, TITLE_HEADERS, TITLE_REQUEST, [1, 2], diagnostic)
     # Not the conversation, and not an alias header carrying the same id.
     assert side != OPENCODE_SESSION
     assert side_source == "new"
     assert diagnostic["opencode_side_request"]["named_session_id"] == OPENCODE_SESSION
+    assert diagnostic["opencode_side_request"]["reason"] == "request_kind_title"
     assert manager.peek(OPENCODE_SESSION).committed_token_ids == conversation_stream
 
     follow_up = [*CONVERSATION, 7, 8, 9, 4242, 4243]
-    assert manager.resolve_session_id(headers=headers, prompt_ids=follow_up) == (
+    assert manager.resolve_session_id(headers=PLUGIN_HEADERS, prompt_ids=follow_up) == (
         OPENCODE_SESSION,
-        named_source,
+        "header.x-mtplx-session-id",
     )
 
 
@@ -84,18 +84,47 @@ def test_the_3_nov_race_serves_the_turn_without_a_409():
     arrives while the title is still running: both run, each on its own
     session, and the turn finds the conversation it left."""
     manager = EngineSessionManager()
-    _turn(manager, BARE_HEADERS, CONVERSATION, [7, 8, 9])
+    _turn(manager, PLUGIN_HEADERS, CONVERSATION, [7, 8, 9])
 
-    title_id, _ = manager.resolve_session_id(headers=BARE_HEADERS, prompt_ids=TITLE_REQUEST)
+    title_id, _ = manager.resolve_session_id(headers=TITLE_HEADERS, prompt_ids=TITLE_REQUEST)
     title_session = manager.get_or_create(title_id)
     turn = [*CONVERSATION, 7, 8, 9, 4242]
     with manager.generation_slot(title_session, source="new"):
-        turn_id, turn_source = manager.resolve_session_id(headers=BARE_HEADERS, prompt_ids=turn)
-        assert (turn_id, turn_source) == (OPENCODE_SESSION, "header.x-session-affinity")
+        turn_id, turn_source = manager.resolve_session_id(headers=PLUGIN_HEADERS, prompt_ids=turn)
+        assert (turn_id, turn_source) == (OPENCODE_SESSION, "header.x-mtplx-session-id")
         with manager.generation_slot(
             manager.get_or_create(turn_id), source=turn_source
         ) as held:
             assert held.session_id == OPENCODE_SESSION
+
+
+@pytest.mark.parametrize("headers", [BARE_HEADERS, PLUGIN_HEADERS])
+def test_an_untagged_opencode_request_keeps_the_named_session(headers):
+    """Without OpenCode's own word the header decides, as before: the server
+    answers recognised title prompts before this point, and a prompt
+    comparison would misjudge agents with short system prompts."""
+    manager = EngineSessionManager()
+    _turn(manager, headers, CONVERSATION, [7, 8, 9])
+    session_id, source = manager.resolve_session_id(headers=headers, prompt_ids=TITLE_REQUEST)
+    assert session_id == OPENCODE_SESSION
+    assert source.startswith("header.")
+
+
+def test_a_short_prompt_agent_keeps_its_session_when_reasoning_is_stripped():
+    """A custom OpenCode agent with a short system prompt: the first answer's
+    reasoning sits inside the first 4,096 committed tokens, and the next
+    request resends the history without it. It is the same conversation and
+    must keep its session so its committed reasoning can be restored."""
+    manager = EngineSessionManager()
+    system_and_question = list(range(1000, 1067))
+    reasoning = list(range(20_000, 25_000))
+    answer = list(range(30_000, 30_118))
+    _turn(manager, BARE_HEADERS, system_and_question, [*reasoning, *answer])
+    follow_up = [*system_and_question, *answer, *range(40_000, 40_034)]
+    assert manager.resolve_session_id(headers=BARE_HEADERS, prompt_ids=follow_up) == (
+        OPENCODE_SESSION,
+        "header.x-session-affinity",
+    )
 
 
 def test_a_named_session_still_refuses_a_second_copy_of_the_conversation():
@@ -129,7 +158,7 @@ def test_the_plugins_title_kind_is_a_side_request_on_a_new_session():
     assert diagnostic["opencode_side_request"]["reason"] == "request_kind_title"
 
 
-def test_the_primary_kind_keeps_the_conversation_without_the_prefix():
+def test_the_primary_kind_keeps_the_conversation():
     manager = EngineSessionManager()
     _turn(manager, PLUGIN_HEADERS, CONVERSATION, [7])
     assert manager.resolve_session_id(

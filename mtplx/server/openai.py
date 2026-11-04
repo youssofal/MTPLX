@@ -17075,6 +17075,11 @@ _OPENCODE_TITLE_SYSTEM_MARKERS = (
 )
 # MTPLX's OpenCode plugin passes OpenCode 2.x's own request kind.
 _OPENCODE_REQUEST_KIND_HEADER = "x-mtplx-request-kind"
+# The 1.x prompt is matched on its own, as before 2.12.3. The 2.x phrase is
+# short enough for another client's custom title prompt to share it (an Open
+# WebUI title prompt asking for JSON, for example), so it and the kind header
+# count only on a request that carries per-request OpenCode evidence.
+_OPENCODE_TITLE_SYSTEM_MARKERS_ANY_CLIENT = _OPENCODE_TITLE_SYSTEM_MARKERS[:1]
 
 
 def _is_opencode_title_request(
@@ -17095,7 +17100,10 @@ def _is_opencode_title_request(
     """
     if request.tools or len(request.messages) < 2:
         return False
-    if headers is not None:
+    opencode = headers is not None and _is_opencode_client(
+        headers=headers, metadata=_request_metadata(request)
+    )
+    if opencode:
         kind = str(headers.get(_OPENCODE_REQUEST_KIND_HEADER) or "").strip().lower()
         if kind == "title":
             return True
@@ -17103,10 +17111,10 @@ def _is_opencode_title_request(
     if str(first.role).lower() != "system":
         return False
     system_text = _content_to_text(first.content)
-    return any(
-        all(phrase in system_text for phrase in phrases)
-        for phrases in _OPENCODE_TITLE_SYSTEM_MARKERS
+    markers = (
+        _OPENCODE_TITLE_SYSTEM_MARKERS if opencode else _OPENCODE_TITLE_SYSTEM_MARKERS_ANY_CLIENT
     )
+    return any(all(phrase in system_text for phrase in phrases) for phrases in markers)
 
 
 def _opencode_title_subject(text: str) -> str:
@@ -33300,6 +33308,8 @@ class _ThinkingContentStreamSplitter:
         suppress_orphan_tool_markup: bool = False,
         trim_visible_content_edges: bool = False,
         tool_names: Iterable[str] | None = None,
+        no_tools_declared: bool = False,
+        tool_markup_is_content: bool = False,
     ) -> None:
         # Live-SSE lanes only (stream/non-stream text parity): the
         # non-stream cleaner ends with a global strip(), so streamed
@@ -33318,6 +33328,11 @@ class _ThinkingContentStreamSplitter:
         # dead syntax the client cannot execute — suppress instead of
         # streaming raw XML to the user (#160).
         self._suppress_orphan_tool_markup = bool(suppress_orphan_tool_markup)
+        # No tools declared: nothing the model writes can be a call, whether
+        # its markup is stripped or kept as the client's text (#674).
+        self._no_tools_declared = bool(no_tools_declared) or self._suppress_orphan_tool_markup
+        # Kept markup is ordinary content: it gets no tool-marker trimming.
+        self._tool_markup_is_content = bool(tool_markup_is_content)
         self.suppressed_tool_markup_chars = 0
         self._orphan_in_span = False
         self._orphan_hold = ""
@@ -33420,7 +33435,9 @@ class _ThinkingContentStreamSplitter:
             if channel != "content" or not text:
                 out.append((channel, text))
                 continue
-            if text.lstrip().startswith(self._TOOL_CONTROL_MARKERS):
+            if not self._tool_markup_is_content and text.lstrip().startswith(
+                self._TOOL_CONTROL_MARKERS
+            ):
                 # The pre-tool separator ("...\n\n<tool_call>") rides at the
                 # head of the markup chunk; non-stream strips it, so drop it
                 # here too along with any held run. The markup itself passes
@@ -33720,7 +33737,7 @@ class _ThinkingContentStreamSplitter:
         be followed by a JSON object or a "<function=" element; a bare
         "<function=NAME>" must name a declared tool when the names are known.
         """
-        if self._suppress_orphan_tool_markup:
+        if self._no_tools_declared:
             # No tools declared: nothing the model writes can be a call.
             return "text"
         if self._think_line_has_text or self._think_fence_open:
@@ -34180,6 +34197,8 @@ def _stream_splitter_for_state(
     recover_unclosed_reasoning_as_content: bool = True,
     start_inside_thinking: bool = True,
     suppress_orphan_tool_markup: bool = False,
+    no_tools_declared: bool = False,
+    tool_markup_is_content: bool = False,
     tool_names: Iterable[str] | None = None,
 ) -> Any:
     parser = _reasoning_parser_for_state(state)
@@ -34190,6 +34209,8 @@ def _stream_splitter_for_state(
         recover_unclosed_reasoning_as_content=recover_unclosed_reasoning_as_content,
         start_inside_thinking=start_inside_thinking,
         suppress_orphan_tool_markup=suppress_orphan_tool_markup,
+        no_tools_declared=no_tools_declared,
+        tool_markup_is_content=tool_markup_is_content,
         trim_visible_content_edges=True,
         tool_names=tool_names,
     )
@@ -38108,7 +38129,9 @@ def create_app(state: ServerState) -> FastAPI:
                 _request_max_tokens(request),
                 headers=headers,
                 metadata=metadata,
-                context_window=int(getattr(state.args, "context_window", 0) or 0),
+                # The window OpenCode was configured from: the served one,
+                # not --context-window (0 when the server sizes it itself).
+                context_window=int(served_execution_window(state).get("tokens") or 0),
             )
         )
         requested_model = request.model
@@ -39434,6 +39457,10 @@ def create_app(state: ServerState) -> FastAPI:
                 )
                 decoder = _IncrementalTokenDecoder(state.runtime.tokenizer)
 
+                keep_tool_markup = not tools_active and _keep_orphan_tool_markup(
+                    request, headers, metadata
+                )
+
                 def new_stream_splitter() -> Any:
                     return _stream_splitter_for_state(
                         state,
@@ -39443,9 +39470,13 @@ def create_app(state: ServerState) -> FastAPI:
                         # No declared tools: raw tool-call XML must not stream
                         # to the user as visible content (#160).
                         suppress_orphan_tool_markup=(
-                            not tools_active
-                            and not _keep_orphan_tool_markup(request, headers, metadata)
+                            not tools_active and not keep_tool_markup
                         ),
+                        # Kept markup is still not a call: with no tools
+                        # declared nothing ends thinking, and the markup is
+                        # the client's own text, whitespace included (#674).
+                        no_tools_declared=not tools_active,
+                        tool_markup_is_content=keep_tool_markup,
                         # Declared names let the splitter tell a real call
                         # from tool markup the model is only quoting in its
                         # thinking.
