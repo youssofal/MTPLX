@@ -7273,6 +7273,18 @@ _ORPHAN_TOOL_MARKUP_RE = re.compile(
 _CODE_FENCE_SPAN_RE = re.compile(r"```.*?(?:```|\Z)", re.DOTALL)
 
 
+# ---- opt-out for the no-tools markup strip -------------------------------
+# MTPLX_KEEP_ORPHAN_TOOL_MARKUP=on: leave tool-call markup in the reply even
+# when the request declares no tools, and skip the "no tools are active"
+# notice. Default off (strip + notice), unchanged.
+def _keep_orphan_tool_markup() -> bool:
+    return (
+        os.environ.get("MTPLX_KEEP_ORPHAN_TOOL_MARKUP", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+# ---- end opt-out --------------------------------------------------------
+
+
 def _strip_orphan_tool_markup(text: str) -> tuple[str, int]:
     """Remove dead tool-call protocol markup from no-tools responses (#160).
 
@@ -39409,7 +39421,9 @@ def create_app(state: ServerState) -> FastAPI:
                         start_inside_thinking=not aime_visible_working,
                         # No declared tools: raw tool-call XML must not stream
                         # to the user as visible content (#160).
-                        suppress_orphan_tool_markup=not tools_active,
+                        suppress_orphan_tool_markup=(
+                            not tools_active and not _keep_orphan_tool_markup()
+                        ),
                         # Declared names let the splitter tell a real call
                         # from tool markup the model is only quoting in its
                         # thinking.
@@ -42774,9 +42788,15 @@ def create_app(state: ServerState) -> FastAPI:
                     # answer "look it up" prompts with raw
                     # <tool_call><function=web_search> XML in the app chat).
                     pre_strip_text = display_text
-                    display_text, orphan_blocks = _strip_orphan_tool_markup(
-                        display_text
-                    )
+                    if _keep_orphan_tool_markup():
+                        # The client asked to keep raw protocol markup: it
+                        # parses the text itself, so nothing is dead syntax.
+                        display_text, orphan_blocks = display_text, 0
+                        generated["stats"]["raw_tool_markup_kept"] = True
+                    else:
+                        display_text, orphan_blocks = _strip_orphan_tool_markup(
+                            display_text
+                        )
                     if orphan_blocks:
                         generated["stats"]["raw_tool_markup_suppressed"] = True
                         generated["stats"]["orphan_tool_markup_blocks"] = int(
