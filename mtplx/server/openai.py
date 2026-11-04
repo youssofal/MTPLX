@@ -1101,6 +1101,16 @@ def _server_runtime_env_overrides(
                 # The tail also requires the fused gate+up owners, so the
                 # MTPLX_FUSED_GATE_UP kill switch drops it with them.
                 lane_defaults.append("MTPLX_QWEN4_M4_STAGE3")
+            # --no-load-mtp and --stock-ar load no MTP head, and the loader
+            # refuses a draft-head gate without one ("relaxed Qwen4 draft
+            # ties require native MTP"): plain decoding of the pack, the
+            # fallback on GPUs where speculative rounds lose (#400), could
+            # not boot.
+            mtp_head_loads = bool(getattr(args, "load_mtp", True))
+            if not mtp_head_loads:
+                lane_defaults = [
+                    key for key in lane_defaults if key not in _QWEN4_MTP_HEAD_LANE_KEYS
+                ]
             for key in lane_defaults:
                 if os.environ.get(key) is None:
                     overrides.setdefault(key, "1")
@@ -1153,7 +1163,7 @@ def _server_runtime_env_overrides(
             # rows-gather engage floor and under MTPLX_QSA_GATHER=0.
             if os.environ.get("MTPLX_QSA_GATHER_MAX_ROWS") is None:
                 overrides.setdefault("MTPLX_QSA_GATHER_MAX_ROWS", "32")
-            if _served_model_lm_head_is_q8_g64(args):
+            if mtp_head_loads and _served_model_lm_head_is_q8_g64(args):
                 if os.environ.get("MTPLX_FRSPEC_DRAFT") is None:
                     overrides.setdefault("MTPLX_FRSPEC_DRAFT", "1")
                 if (
@@ -1365,6 +1375,17 @@ _QWEN4_LANE_KEYS = _QWEN4_PORT_KEYS + (
     "MTPLX_FRSPEC_DRAFT",
     "MTPLX_FRSPEC_VOCAB",
     "MTPLX_QSA_GATHER_MAX_ROWS",
+)
+# Lane defaults the model loader consumes only together with the native MTP
+# head (runtime.load: the relaxed draft-tie reader and the compiled draft-head
+# preparation), so they are stamped only when the head loads. The FR-Spec draft
+# head and the two draft readers that follow it are gated the same way where
+# they are stamped.
+_QWEN4_MTP_HEAD_LANE_KEYS = frozenset(
+    {
+        "MTPLX_QWEN4_COMPILED_MTP_PREPARE",
+        "MTPLX_QWEN4_RELAXED_DRAFT_TIES",
+    }
 )
 
 
