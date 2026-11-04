@@ -1679,3 +1679,4 @@
 "Free disk space is below the floor the SSD cache always leaves free, so it has stopped saving conversations. Free up disk space to turn it back on." = "디스크 여유 공간이 SSD 캐시가 항상 비워 두는 하한보다 적어 대화 저장을 중단했습니다. 다시 켜려면 디스크 공간을 확보하십시오.";
 "Free disk space is %@. The SSD cache needs room for two copies of your largest conversation (%@) while it saves a new one, so it may skip saving new progress. Copies it already saved are kept." = "디스크 여유 공간이 %@입니다. SSD 캐시는 새 사본을 저장하는 동안 가장 큰 대화(%@)의 사본 두 개를 둘 공간이 필요하므로 새 진행 상황 저장을 건너뛸 수 있습니다. 이미 저장된 사본은 유지됩니다.";
 "Free disk space is low. The SSD cache may skip saving new progress. Copies it already saved are kept." = "디스크 여유 공간이 부족합니다. SSD 캐시가 새 진행 상황 저장을 건너뛸 수 있습니다. 이미 저장된 사본은 유지됩니다.";
+"macOS is slowing the GPU because the Mac is hot. Speed returns as it cools." = "Mac이 뜨거워 macOS가 GPU 속도를 낮추고 있습니다. 식으면 속도가 돌아옵니다.";

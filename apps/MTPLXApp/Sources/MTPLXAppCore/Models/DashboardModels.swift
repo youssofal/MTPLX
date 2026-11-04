@@ -1206,6 +1206,9 @@ public struct HealthPayload: Codable, Equatable, Sendable {
     public var ssdSessionCache: SSDSessionCacheHealth?
     public var startup: Startup?
     public var thermal: Thermal?
+    /// macOS thermal pressure as the engine samples it, read leniently (the
+    /// Live tab's heat notice reads it).
+    public var thermalPressure: ThermalPressureHealth?
     public var vision: VisionCapability?
 
     public struct VisionCapability: Codable, Equatable, Sendable {
@@ -1240,6 +1243,7 @@ public struct HealthPayload: Codable, Equatable, Sendable {
         case ssdSessionCache = "ssd_session_cache"
         case startup
         case thermal
+        case thermalPressure = "thermal_pressure"
         case vision
     }
 }
