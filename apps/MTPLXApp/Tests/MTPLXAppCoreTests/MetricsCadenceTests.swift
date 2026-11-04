@@ -44,6 +44,29 @@ final class MetricsCadenceTests: XCTestCase {
         XCTAssertEqual(backend.progressFrameIntervalMs, 1000)
     }
 
+    func testAHiddenWindowKeepsASlowerChosenCadence() {
+        for chosen in [2000, 5000] {
+            var configuration = MTPLXAppConfiguration()
+            configuration.streamSnapshotIntervalMs = chosen
+            let backend = store(configuration)
+            backend.setDashboardVisible(false)
+            XCTAssertEqual(backend.metricsSnapshotIntervalMs, chosen)
+            XCTAssertEqual(backend.progressFrameIntervalMs, chosen)
+            backend.setDashboardVisible(true)
+            XCTAssertEqual(backend.metricsSnapshotIntervalMs, chosen)
+            XCTAssertEqual(backend.progressFrameIntervalMs, chosen)
+        }
+    }
+
+    func testPerformanceModeStaysAtOneSecondWhileHidden() {
+        var configuration = MTPLXAppConfiguration()
+        configuration.performanceLock = true
+        let backend = store(configuration)
+        backend.setDashboardVisible(false)
+        XCTAssertEqual(backend.metricsSnapshotIntervalMs, 1000)
+        XCTAssertEqual(backend.progressFrameIntervalMs, 1000)
+    }
+
     func testAHiddenWindowDropsSnapshotsAndProgressToOneSecondUntilItShowsAgain() {
         let backend = store()
         backend.setDashboardVisible(false)
