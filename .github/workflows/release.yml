@@ -38,7 +38,7 @@ jobs:
               exit 1
               ;;
           esac
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/setup-python@v7.1.0
         with:
           python-version: "3.11"
       - run: python -m pip install -U pip build twine
