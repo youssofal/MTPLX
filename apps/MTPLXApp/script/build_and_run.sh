@@ -290,6 +290,8 @@ fi
 if ! /usr/bin/otool -l "$BUNDLE_DIR/Contents/MacOS/$APP_NAME" | /usr/bin/grep -q '@executable_path/../Frameworks'; then
   /usr/bin/install_name_tool -add_rpath '@executable_path/../Frameworks' "$BUNDLE_DIR/Contents/MacOS/$APP_NAME"
 fi
+# No rpath into this Mac's toolchains ships (Xcode 27 adds two).
+"$ROOT/script/strip_build_rpaths.sh" "$BUNDLE_DIR/Contents/MacOS/$APP_NAME"
 
 # Gate: macOS picks the controls' style (Liquid Glass or the old look) from
 # the SDK stamped in the main binary, so read the stamp back off the bundle.
