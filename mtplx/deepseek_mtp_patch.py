@@ -368,12 +368,19 @@ def inject_deepseek_mtp_support(
             return_hidden: bool = False,
             input_embeddings=None,
             hidden_variant: str | None = None,
+            emit_logits: bool = True,
+            logits_keep: int | None = None,
             **kwargs,
         ):
             if input_embeddings is not None:
                 raise ValueError("DeepSeek MTP backend does not support input_embeddings")
             hidden = self.model(inputs, cache)
-            logits = self.lm_head(hidden)
+            logits = None
+            if emit_logits:
+                logits_source = hidden
+                if logits_keep is not None:
+                    logits_source = logits_source[:, -max(1, int(logits_keep)):, :]
+                logits = self.lm_head(logits_source)
             if not return_hidden:
                 return logits
             return logits, hidden

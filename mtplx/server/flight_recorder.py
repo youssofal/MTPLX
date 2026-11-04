@@ -5,8 +5,12 @@ answer "what was the TPS curve of that 45-minute think?", "is the engine hung
 or deriving right now?", or "what did the cancelled turn actually generate?".
 The recorder writes a compact JSONL event stream per serve port:
 
-    begin    request accepted (identity, prompt size)
-    prefill  decode started (cached/new split, prefill timing)
+    begin    request accepted (identity, prompt size). Written after the
+             request prologue, so after the waits for the session's
+             previous turn (its commit and its postcommit); the end event
+             carries those waits
+    prefill  decode started, i.e. the first token (cached/new split,
+             prefill timing)
     s        ~1 Hz while decoding: tokens, instantaneous+cumulative TPS,
              reasoning/content chars, live MTP accepted/drafted-by-depth
     end      ALWAYS written — completion, cancel, disconnect, and orphaned
@@ -57,6 +61,15 @@ _LIVE_FIELDS = (
     ("cache_memory_bytes", "mem_cache"), ("peak_memory_bytes", "mem_peak"),
     ("verify_route", "route"), ("compiled_verify_calls", "cv"),
     ("eager_verify_calls", "evc"),
+)
+# Spans of the TTFT breakdown (request_spans) in which the request waited for
+# other work instead of doing its own: the previous turn's commit, its
+# postcommit, the owner-thread queue and the generation lock.
+_WAIT_SPANS = (
+    "response_tail_wait_s",
+    "postcommit_wait_s",
+    "scheduler_queue_s",
+    "lock_wait_s",
 )
 
 
@@ -474,6 +487,13 @@ class FlightRecorder:
         ):
             if receipt.get(key) is not None:
                 event[key] = receipt[key]
+        # The first two waits happen before begin, so begin-to-prefill alone
+        # cannot tell a slow request from one that waited.
+        spans = (receipt.get("ttft_spans") or {}).get("exclusive_s") or {}
+        for key in _WAIT_SPANS:
+            value = spans.get(key)
+            if isinstance(value, (int, float)):
+                event[key] = round(float(value), 3)
         text = "".join(record.text_parts) if record.text_parts else ""
         if text and (self.text_mode == "always" or (self.text_mode == "abnormal" and cancelled)):
             dest = os.path.join(

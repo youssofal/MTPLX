@@ -128,3 +128,41 @@ class TestWiring:
         lead = src[cut - 2500 : cut]
         assert "except HTTPException as exc:" in lead
         assert "== 507" in lead
+
+
+class TestRefusalFieldsOnRow:
+    def test_structured_507_carries_reason_and_retry_when(self, monkeypatch):
+        rows: list[dict] = []
+        monkeypatch.setattr(
+            srv, "_record_request_metrics", lambda _state, row: rows.append(row)
+        )
+        state = SimpleNamespace(
+            dashboard=SimpleNamespace(bus=SimpleNamespace(publish=lambda _e: None)),
+        )
+        error = HTTPException(
+            status_code=507,
+            detail={
+                "message": "insufficient memory: ...",
+                "code": "insufficient_memory",
+                "memory": {
+                    "refusal_reason": "system_memory_short_after_reclamation",
+                    "retry_when": "after_other_apps_free_memory",
+                    "retry_can_succeed": True,
+                },
+            },
+        )
+        srv._record_stream_error_metric(
+            state,
+            response_id="chatcmpl-test-reason",
+            session_id=None,
+            prompt_tokens=90005,
+            streamed_completion_tokens=0,
+            stream_started_s=time.perf_counter(),
+            error=error,
+            request_observability={},
+            mode="nonstream",
+        )
+        row = rows[0]
+        assert row["refusal_reason"] == "system_memory_short_after_reclamation"
+        assert row["retry_when"] == "after_other_apps_free_memory"
+        assert row["retry_can_succeed"] is True

@@ -266,7 +266,8 @@ class RollingMetrics:
 
     WINDOW_S = 300.0  # 5 minutes
     LIVE_SAMPLE_MIN_INTERVAL_S = 0.75
-    LIVE_HISTORY_MAX_POINTS = 240
+    # The whole window at the sampling rate (400); 240 covered only 3 of the 5 minutes.
+    LIVE_HISTORY_MAX_POINTS = int(WINDOW_S / LIVE_SAMPLE_MIN_INTERVAL_S)
 
     MAX_PER_SESSION_ENTRIES = 64
 
@@ -671,6 +672,9 @@ class DashboardState:
     lifetime: LifetimeCounters = field(default_factory=LifetimeCounters)
     prefill_history: PrefillHistory = field(default_factory=PrefillHistory)
     rereads: RereadLedger = field(default_factory=RereadLedger)
+    # The cache outcome of each recent completed prefill, for the receipt of
+    # a request cancelled before its stats exist. Same bounded ledger.
+    prefill_outcomes: RereadLedger = field(default_factory=RereadLedger)
     progress_events: ProgressEventGate = field(default_factory=ProgressEventGate)
     last_thermal: dict[str, Any] | None = None
     last_thermal_when_s: float = 0.0

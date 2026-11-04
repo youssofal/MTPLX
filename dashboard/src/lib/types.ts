@@ -15,6 +15,10 @@ export type MetricsLatest = {
   prompt_eval_time_s?: number | null;
   decode_elapsed_s?: number | null;
   ttft_s?: number | null;
+  // Where the time to first token went, span by span (request_spans.py).
+  ttft_spans?: {
+    exclusive_s?: Record<string, number | null> | null;
+  } | null;
   // ---- rates ----
   tok_s?: number | null;
   decode_tok_s?: number | null;
@@ -57,11 +61,25 @@ export type MetricsLatest = {
   repair_time_by_reject_depth_s?: Record<string, number> | null;
   // ---- when the request finished (wall clock, seconds) ----
   completed_at_s?: number | null;
+  // ---- cancellation (a request that did not run to the end) ----
+  request_cancelled?: boolean | null;
+  cancellation_reason?: string | null;
+  cancellation_elapsed_s?: number | null;
+  stream_cancelled_by_client?: boolean | null;
   // ---- cache ----
+  // null on a cancelled request whose prefill had not finished: unknown.
   session_cache_hit?: boolean | null;
   cache_miss_reason?: string | null;
+  cache_source?: string | null;
   session_restore_mode?: string | null;
   session_id?: string | null;
+  // ---- refusal / error (a request the server turned away or failed) ----
+  error_kind?: string | null;
+  error_status?: number | null;
+  error_detail?: string | null;
+  refusal_reason?: string | null;
+  retry_when?: string | null;
+  retry_can_succeed?: boolean | null;
   context_len?: number | null;
   lock_wait_time_s?: number | null;
   // ---- memory ----
@@ -156,12 +174,41 @@ export type EvictionEntry = {
   when_s: number;
 };
 
+// `SessionBankColdTier.stats()`, nested in the bank as `cold_tier` (and served
+// alone at /admin/cache/ssd). Only the fields the dashboard reads.
+export type ColdTierStats = {
+  enabled: boolean;
+  max_bytes?: number;
+  effective_max_bytes?: number;
+  entries?: number;
+  bytes?: number;
+  physical_bytes?: number;
+  logical_bytes?: number;
+  dedupe_ratio?: number;
+  sessions?: number;
+  entries_without_session?: number;
+  oldest_created_at_s?: number | null;
+  newest_created_at_s?: number | null;
+  never_restored_entries?: number;
+  writer_queue_depth?: number;
+  writer_backlog_bytes?: number;
+  restore_hits?: number;
+  restore_misses?: number;
+  restore_failures?: number;
+  entries_evicted?: number;
+};
+
 export type SessionBank = {
   max_entries: number;
+  max_bytes?: number | null;
+  effective_max_bytes?: number | null;
+  idle_ttl_s?: number | null;
+  entries?: number;
   total_nbytes: number;
   last_miss_reason: string | null;
   prefixes: SessionBankPrefix[];
   eviction_log: EvictionEntry[];
+  cold_tier?: ColdTierStats;
 };
 
 export type SessionRow = {

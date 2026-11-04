@@ -1,9 +1,13 @@
-import { useMemo, useState } from "react";
+import { Fragment, useMemo, useState } from "react";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { Card } from "./Card";
 import { useRecentRequests } from "../hooks/usePolling";
 import { fmtNumber, fmtSeconds, fmtTokS, relativeTime, truncateMiddle } from "../lib/utils";
+import { requestWait } from "../lib/requestWait";
 import { useDashboardStore, useFilteredRecent } from "../state/store";
+import { refusalOf } from "../lib/requestRefusal";
+import { cancellationOf } from "../lib/requestCancel";
+import { cacheMissBadge } from "../lib/cacheMiss";
 import type { MetricsLatest } from "../lib/types";
 
 export function RequestLogTable() {
@@ -49,6 +53,7 @@ export function RequestLogTable() {
                 <Th align="right">gen</Th>
                 <Th align="right">tok/s</Th>
                 <Th align="right">ttft</Th>
+                <Th align="right">wait</Th>
                 <Th align="right">verify</Th>
                 <Th>cache</Th>
                 <Th align="right">when</Th>
@@ -122,7 +127,7 @@ function Td({
   );
 }
 
-function Row({
+export function Row({
   row,
   isOpen,
   onToggle,
@@ -132,12 +137,33 @@ function Row({
   onToggle: () => void;
 }) {
   const sessionId = row.session_id ?? "—";
-  const cacheBadge = row.session_cache_hit
-    ? { label: "HIT", color: "text-[var(--accent)] bg-[var(--accent)]/10" }
-    : {
-        label: (row.cache_miss_reason ?? "MISS").toUpperCase(),
-        color: "text-[var(--accent-warm)] bg-[var(--accent-warm)]/10",
-      };
+  const refusal = refusalOf(row);
+  const cancellation = refusal ? null : cancellationOf(row);
+  const cacheBadge = refusal
+    ? {
+        label: refusal.label,
+        color: "text-[var(--accent-hot)] bg-[var(--accent-hot)]/10",
+        tooltip: undefined as string | undefined,
+      }
+    : cancellation
+    ? {
+        label: cancellation.label,
+        color: "text-[var(--text-muted)] bg-[var(--text-muted)]/10",
+        tooltip: cancellation.tooltip as string | undefined,
+      }
+    : row.session_cache_hit
+    ? {
+        label: "HIT",
+        color: "text-[var(--accent)] bg-[var(--accent)]/10",
+        tooltip: "Served from the session cache.",
+      }
+    : cacheMissBadge(row.cache_miss_reason);
+  const wait = requestWait(row);
+  const waitTitle = wait
+    ? wait.parts.length > 0
+      ? wait.parts.map((part) => `${part.label}: ${fmtSeconds(part.seconds)}`).join("\n")
+      : "no wait before the work started"
+    : undefined;
   return (
     <>
       <tr className="border-t border-[var(--border-soft)] hover:bg-[var(--bg-elevated)]/60">
@@ -156,18 +182,27 @@ function Row({
         </Td>
         <Td align="right">{fmtNumber(row.prompt_tokens)}</Td>
         <Td align="right">{fmtNumber(row.cached_tokens)}</Td>
-        <Td align="right">{fmtNumber(row.completion_tokens)}</Td>
+        <Td align="right">{refusal ? "—" : fmtNumber(row.completion_tokens)}</Td>
         <Td align="right" highlight>
-          {fmtTokS(row.decode_tok_s)}
+          {refusal ? "—" : fmtTokS(row.decode_tok_s)}
         </Td>
-        <Td align="right">{fmtSeconds(row.ttft_s)}</Td>
-        <Td align="right">{fmtNumber(row.verify_calls)}</Td>
+        <Td align="right">{refusal ? "—" : fmtSeconds(row.ttft_s)}</Td>
+        <Td align="right">
+          <span title={waitTitle}>{fmtSeconds(wait?.total_s)}</span>
+        </Td>
+        <Td align="right">{refusal ? "—" : fmtNumber(row.verify_calls)}</Td>
         <Td>
           <span
+            title={cacheBadge.tooltip}
             className={`px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wider ${cacheBadge.color}`}
           >
             {cacheBadge.label}
           </span>
+          {cancellation?.cacheHint ? (
+            <span className="ml-2 text-[10px] text-[var(--text-muted)]">
+              {cancellation.cacheHint}
+            </span>
+          ) : null}
         </Td>
         <Td align="right" highlight={false}>
           <span className="text-[var(--text-muted)] text-xs">
@@ -177,7 +212,17 @@ function Row({
       </tr>
       {isOpen ? (
         <tr className="bg-[var(--bg-elevated)]/40">
-          <td colSpan={10} className="px-3 py-3">
+          <td colSpan={11} className="px-3 py-3">
+            {refusal && refusal.details.length > 0 ? (
+              <dl className="mb-2 text-xs grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1">
+                {refusal.details.map(([name, value]) => (
+                  <Fragment key={name}>
+                    <dt className="text-[var(--text-muted)]">{name}</dt>
+                    <dd className="text-[var(--text-primary)]">{value}</dd>
+                  </Fragment>
+                ))}
+              </dl>
+            ) : null}
             <pre className="text-[11px] leading-relaxed text-[var(--text-muted)] overflow-x-auto max-h-[260px]">
               {JSON.stringify(row, null, 2)}
             </pre>
