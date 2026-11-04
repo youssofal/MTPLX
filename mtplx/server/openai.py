@@ -34547,6 +34547,7 @@ def _chat_ui_html(
     server_url: str,
     api_key_required: bool,
     default_settings: dict[str, Any],
+    vision_input: bool = False,
 ) -> str:
     api_note = "API key required" if api_key_required else "local · no API key"
     depth_max = max(1, int(default_settings.get("depth_max", 3) or 3))
@@ -34951,6 +34952,25 @@ def _chat_ui_html(
     }
     #status-row.ready { color: var(--muted); }
     #status-row.streaming { color: var(--accent-strong); }
+    #status-row.error { color: var(--error); }
+    /* Images pasted or dropped into the composer, before they are sent */
+    #attachments { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 4px 8px; }
+    #attachments[hidden] { display: none; }
+    .attachment { position: relative; }
+    .attachment img {
+      display: block; height: 64px; max-width: 160px; object-fit: cover;
+      border: 1px solid var(--line); border-radius: 8px;
+    }
+    .attachment-remove {
+      position: absolute; top: -6px; right: -6px;
+      width: 20px; height: 20px; border-radius: 50%;
+      border: 1px solid var(--line); background: var(--surface); color: var(--text);
+      font-size: 13px; line-height: 1; cursor: pointer; padding: 0;
+    }
+    .turn-user .turn-image {
+      display: block; max-width: 100%; max-height: 320px;
+      margin-top: 8px; border-radius: 8px;
+    }
     #status-row .dot {
       width: 6px; height: 6px;
       border-radius: 50%;
@@ -35103,6 +35123,7 @@ def _chat_ui_html(
           <span id="live-stats"></span>
         </div>
         <form id="chat-form" autocomplete="off">
+          <div id="attachments" hidden></div>
           <div class="composer-box">
             <textarea id="prompt" placeholder="Message MTPLX (Enter to send · Shift+Enter for newline)" rows="1" autofocus></textarea>
             <button id="send" class="send-btn" type="submit" aria-label="Send">
@@ -35117,6 +35138,9 @@ def _chat_ui_html(
   <script>
     "use strict";
     const MODEL_ID = __MODEL_JSON__;
+    // Whether the served model has a vision tower (the /v1/models
+    // supports_vision answer); a text-only model gets no image parts.
+    const VISION_INPUT = __VISION_INPUT_JSON__;
     const messagesEl = document.getElementById("messages");
     const messagesInner = messagesEl.querySelector(".messages-inner");
     const messagesBottom = document.getElementById("messages-bottom");
@@ -35585,12 +35609,19 @@ def _chat_ui_html(
       statusText.textContent = text;
       statusRow.className = kind || "";
     }
-    function appendUser(text) {
+    function appendUser(text, images) {
       const node = document.createElement("div");
       node.className = "turn turn-user";
       const body = document.createElement("div");
       body.className = "turn-body";
       body.textContent = text;
+      for (const url of images || []) {
+        const img = document.createElement("img");
+        img.className = "turn-image";
+        img.alt = "attached image";
+        img.src = url;
+        body.appendChild(img);
+      }
       node.appendChild(body);
       messagesInner.appendChild(node);
       scheduleScrollToBottom();
@@ -35728,15 +35759,26 @@ def _chat_ui_html(
         sendBtn.setAttribute("aria-label", "Send");
       }
     }
-    async function sendMessage(text) {
+    // A user turn with images is sent as text and image_url parts, the shape
+    // agent clients use for screenshots; a text-only turn stays a string.
+    function userContent(text, images) {
+      if (!images.length) return text;
+      const parts = [];
+      if (text) parts.push({type: "text", text: text});
+      for (const url of images) parts.push({type: "image_url", image_url: {url: url}});
+      return parts;
+    }
+
+    async function sendMessage(text, images) {
+      const attached = Array.isArray(images) ? images : [];
       // Remove the greeting bubble on first send.
       const greeting = messagesInner.querySelector(".turn-greeting");
       if (greeting) greeting.remove();
 
       pinnedToBottom = true;
       forceAutoScroll = true;
-      appendUser(text);
-      history.push({role: "user", content: text});
+      appendUser(text, attached);
+      history.push({role: "user", content: userContent(text, attached)});
       const turn = appendAssistantTurn();
       scheduleScrollToBottom({force: true});
       setSendButton("stop");
@@ -35933,17 +35975,102 @@ def _chat_ui_html(
     }
     promptEl.addEventListener("input", autoResizePrompt);
 
+    // ---------- images: paste or drop into the composer --------------------
+    const attachmentsEl = document.getElementById("attachments");
+    const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+    const pendingImages = [];
+    let pendingReads = 0;
+    function renderAttachments() {
+      attachmentsEl.textContent = "";
+      attachmentsEl.hidden = pendingImages.length === 0;
+      pendingImages.forEach((image, index) => {
+        const chip = document.createElement("div");
+        chip.className = "attachment";
+        const img = document.createElement("img");
+        img.src = image.url;
+        img.alt = image.name;
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "attachment-remove";
+        remove.setAttribute("aria-label", "Remove image");
+        remove.textContent = "\u00d7";
+        remove.addEventListener("click", () => {
+          pendingImages.splice(index, 1);
+          renderAttachments();
+          promptEl.focus();
+        });
+        chip.appendChild(img);
+        chip.appendChild(remove);
+        attachmentsEl.appendChild(chip);
+      });
+    }
+    function addImageFiles(files) {
+      const images = files.filter((file) => file && String(file.type || "").startsWith("image/"));
+      if (!images.length) return 0;
+      if (!VISION_INPUT) {
+        setStatus("This model reads text only, so images are not sent", "error");
+        return images.length;
+      }
+      for (const file of images) {
+        if (file.size > MAX_IMAGE_BYTES) {
+          setStatus("That image is " + Math.round(file.size / 1048576) + " MB; the limit is 20 MB", "error");
+          continue;
+        }
+        pendingReads += 1;
+        const reader = new FileReader();
+        reader.onload = () => {
+          pendingImages.push({url: String(reader.result), name: file.name || "pasted image"});
+          renderAttachments();
+        };
+        reader.onerror = () => setStatus("Could not read that image", "error");
+        reader.onloadend = () => { pendingReads -= 1; };
+        reader.readAsDataURL(file);
+      }
+      return images.length;
+    }
+    promptEl.addEventListener("paste", (event) => {
+      const data = event.clipboardData;
+      if (!data) return;
+      const files = [];
+      for (const item of Array.from(data.items || [])) {
+        if (item.kind === "file") {
+          const file = item.getAsFile();
+          if (file) files.push(file);
+        }
+      }
+      // A screenshot carries no text: keep the image and paste nothing.
+      if (addImageFiles(files) > 0 && !data.getData("text/plain")) event.preventDefault();
+    });
+    form.addEventListener("dragover", (event) => {
+      if (event.dataTransfer && Array.from(event.dataTransfer.types || []).includes("Files")) {
+        event.preventDefault();
+      }
+    });
+    form.addEventListener("drop", (event) => {
+      const files = event.dataTransfer ? Array.from(event.dataTransfer.files || []) : [];
+      if (files.length) {
+        event.preventDefault();
+        addImageFiles(files);
+      }
+    });
+
     form.addEventListener("submit", (event) => {
       event.preventDefault();
       if (sendBtn.dataset.action === "stop") {
         if (activeAbort) activeAbort.abort();
         return;
       }
+      if (pendingReads > 0) {
+        setStatus("Still reading the image", "streaming");
+        return;
+      }
       const text = promptEl.value.trim();
-      if (!text) return;
+      if (!text && !pendingImages.length) return;
+      const images = pendingImages.splice(0).map((image) => image.url);
+      renderAttachments();
       promptEl.value = "";
       autoResizePrompt();
-      sendMessage(text);
+      sendMessage(text, images);
     });
     promptEl.addEventListener("keydown", (event) => {
       if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
@@ -35955,6 +36082,8 @@ def _chat_ui_html(
     newChatBtn.addEventListener("click", () => {
       if (activeAbort) activeAbort.abort();
       history.length = 0;
+      pendingImages.length = 0;
+      renderAttachments();
       messagesInner.innerHTML = '<div class="turn turn-assistant turn-greeting"><div class="avatar">M</div><div class="turn-body"><div class="answer"><p>New conversation. Settings on the left are unchanged.</p></div></div></div>';
       pinnedToBottom = true;
       forceAutoScroll = false;
@@ -35975,6 +36104,7 @@ def _chat_ui_html(
         .replace("__API_NOTE__", html.escape(api_note))
         .replace("__SERVER_URL__", html.escape(server_url))
         .replace("__MODEL_JSON__", json.dumps(model_id))
+        .replace("__VISION_INPUT_JSON__", json.dumps(bool(vision_input)))
         .replace(
             "__DEFAULT_SETTINGS_JSON__", json.dumps(default_settings, sort_keys=True)
         )
@@ -36670,6 +36800,7 @@ def create_app(state: ServerState) -> FastAPI:
                     "reasoning": str(getattr(state.args, "reasoning", None) or "auto"),
                     "system": "",
                 },
+                vision_input=_server_vision_spec(state) is not None,
             )
         )
 
