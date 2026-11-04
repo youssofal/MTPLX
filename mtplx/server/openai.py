@@ -26643,6 +26643,12 @@ def _bank_history_policy(state: "ServerState") -> str:
     ``extra_state``; there is no committed MTP-history cache). Until PR #283
     every server put site banked Gemma 4 under the Qwen strings while the
     backend restored under its own, so no Gemma 4 turn ever restored warm.
+
+    An MTP runtime whose operator set ``MTPLX_MTP_HISTORY_POLICY`` to
+    ``cycle`` banks under ``cycle``: generation applies that override to the
+    policy it is handed (``generation.bank_history_policy_family``), and the
+    rest of the committed family (``last_window``, ``auto``) keeps
+    ``committed``, so nothing changes for anyone who did not ask for cycle.
     """
     declared = str(
         getattr(getattr(state, "backend_descriptor", None), "mtp_history_policy", "")
@@ -26651,7 +26657,16 @@ def _bank_history_policy(state: "ServerState") -> str:
     if declared and declared != "committed":
         return declared
     runtime = getattr(state, "runtime", None)
-    return "committed" if bool(getattr(runtime, "mtp_enabled", True)) else "cycle"
+    if not bool(getattr(runtime, "mtp_enabled", True)):
+        return "cycle"
+    # An MTP runtime under the operator's MTPLX_MTP_HISTORY_POLICY=cycle (the
+    # #400 workaround on M1 and M2): generation runs, looks up and stores its
+    # prompt under cycle, so the server's own stores and lookups must too.
+    # Labelled committed, the generation-final save was refused by the next
+    # turn's lookup and every turn read its whole prompt again (#422, M2 Ultra).
+    from mtplx.generation import bank_history_policy_family
+
+    return bank_history_policy_family()
 
 
 def _policy_fingerprint(

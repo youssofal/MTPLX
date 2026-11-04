@@ -1611,6 +1611,20 @@ def _resolve_mtp_history_policy(requested_policy: str, prompt_tokens: int) -> st
     return "last_window" if int(prompt_tokens) >= threshold else "committed"
 
 
+def bank_history_policy_family() -> str:
+    """``cycle`` or ``committed``: the history family an MTP runtime banks under.
+
+    ``restore_or_prefill_prompt_state`` resolves the operator's
+    ``MTPLX_MTP_HISTORY_POLICY`` over the requested ``committed`` and runs its
+    own bank lookups and prompt store under that answer, so every other store,
+    lookup and fingerprint of the runtime has to name the same family, or the
+    conversation saved at the end of a turn is never found by the next one.
+    ``last_window`` and ``auto`` keep the committed history cache, and the bank
+    treats them as ``committed``.
+    """
+    return "cycle" if _resolve_mtp_history_policy("committed", 0) == "cycle" else "committed"
+
+
 #: Per-chunk prefill timings for the most recent chunked prompt prefill.
 #: Written on BOTH A/B arms (the scope below is entered unconditionally) and
 #: read by the PR #391 harness abba_driver.py.  Bounded and replaced wholesale at
