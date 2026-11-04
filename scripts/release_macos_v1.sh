@@ -5,12 +5,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP_ROOT="$ROOT/apps/MTPLXApp"
 BUILD_SCRIPT="$APP_ROOT/script/build_and_run.sh"
 VERSION="${MTPLX_RELEASE_VERSION:-$(/usr/bin/awk -F'"' '/^version = / { print $2; exit }' "$ROOT/pyproject.toml")}"
-# Sparkle ranks releases by CFBundleVersion alone. QA bundles take the numbers
-# after the one build_and_run.sh derives from VERSION (2.12.0's ran 2012001 to
-# 2012005), so the release names its own build: raise this with the version.
-# The appcast reads the number back off the built bundle, so the feed cannot
-# rank a release differently from the app it ships.
-APP_BUILD="${MTPLX_RELEASE_BUILD:-2012006}"
+BUILD_NUMBER_TOOL="$APP_ROOT/script/app_build_number.sh"
 RELEASE_TAG="${MTPLX_RELEASE_TAG:-v$VERSION}"
 GITHUB_REPO="${MTPLX_GITHUB_REPO:-youssofal/mtplx}"
 GITHUB_ASSET_BASE="${MTPLX_GITHUB_ASSET_BASE:-https://github.com/$GITHUB_REPO/releases/download/$RELEASE_TAG}"
@@ -32,13 +27,15 @@ if [[ ! "$VERSION" =~ ^[1-9][0-9]*\.[0-9]+\.[0-9]+$ ]]; then
   exit 1
 fi
 
-# Sparkle ranks releases purely by CFBundleVersion, and the semantic
-# derivation in build_and_run.sh (major*1000000 + minor*1000 + patch) has
-# drifted below shipped reality: 2.9.1 shipped as 2009009 and 2.9.2 as
-# 2009010, so a derived 2.9.3 (2009003) would rank BELOW the shipped 2.9.2
-# and never be offered to updaters — while 2.9.2 could be offered "back" to
-# 2.9.3 users. Refuse, before any expensive gate runs, any build number
-# that does not strictly advance the local shipping record.
+# Sparkle ranks releases by CFBundleVersion alone. Local and QA builds of
+# VERSION carry its base number (apps/MTPLXApp/script/app_build_number.sh);
+# the release ships the first revision above that base and above every
+# number this Mac has staged before (a staged release may already be on a
+# tester's Mac), so neither a QA build nor an earlier release build of the
+# same version can outrank it, and nobody types the number. Refuse, before
+# any expensive gate runs, a number that does not strictly advance that
+# record. The appcast reads the number back off the built bundle, so the
+# feed cannot rank a release differently from the app it ships.
 LAST_SHIPPED_BUILD=0
 for _bn_manifest in "$HOME"/.mtplx/releases/*/site/releases/latest.json; do
   [[ -f "$_bn_manifest" ]] || continue
@@ -46,12 +43,28 @@ for _bn_manifest in "$HOME"/.mtplx/releases/*/site/releases/latest.json; do
   [[ "$_bn_val" =~ ^[0-9]+$ ]] || continue
   if (( _bn_val > LAST_SHIPPED_BUILD )); then LAST_SHIPPED_BUILD="$_bn_val"; fi
 done
-if (( LAST_SHIPPED_BUILD > 0 && APP_BUILD <= LAST_SHIPPED_BUILD )); then
-  echo "error: build number $APP_BUILD does not advance the last shipped CFBundleVersion $LAST_SHIPPED_BUILD" >&2
-  echo "       Sparkle ranks by CFBundleVersion alone, so this release would never reach existing users." >&2
-  echo "       Export MTPLX_RELEASE_BUILD=$((LAST_SHIPPED_BUILD + 1)) and rerun." >&2
+BASE_BUILD="$("$BUILD_NUMBER_TOOL" "$VERSION")"
+if [[ -n "${MTPLX_RELEASE_BUILD:-}" ]]; then
+  APP_BUILD="$MTPLX_RELEASE_BUILD"
+else
+  APP_BUILD=$((BASE_BUILD + 1))
+  while (( APP_BUILD <= LAST_SHIPPED_BUILD && APP_BUILD < BASE_BUILD + 9 )); do
+    APP_BUILD=$((APP_BUILD + 1))
+  done
+fi
+if [[ ! "$APP_BUILD" =~ ^[0-9]+$ ]] \
+  || (( APP_BUILD <= BASE_BUILD || APP_BUILD > BASE_BUILD + 9 )); then
+  echo "error: build number $APP_BUILD is not a release revision of $VERSION ($((BASE_BUILD + 1)) to $((BASE_BUILD + 9)))" >&2
+  echo "       unset MTPLX_RELEASE_BUILD to derive it, or bump the patch version after nine release builds" >&2
   exit 1
 fi
+if (( APP_BUILD <= LAST_SHIPPED_BUILD )); then
+  echo "error: build number $APP_BUILD does not advance the last staged CFBundleVersion $LAST_SHIPPED_BUILD" >&2
+  echo "       Sparkle ranks by CFBundleVersion alone, so this release would never reach existing users." >&2
+  echo "       Unset MTPLX_RELEASE_BUILD to take the next free revision; if all nine revisions of $VERSION are staged, release a newer version." >&2
+  exit 1
+fi
+echo "Release build number: $APP_BUILD ($VERSION, last staged $LAST_SHIPPED_BUILD)"
 
 RELEASE_NOTES_MD="$ROOT/docs/releases/v$VERSION.md"
 if [[ ! -f "$RELEASE_NOTES_MD" ]]; then
