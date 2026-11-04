@@ -2832,30 +2832,38 @@ public final class MTPLXBackendStore: ObservableObject {
         self.sessions = try await apiClient.sessions()
     }
 
-    /// Snapshot cadence floor while a chat turn streams. Every snapshot
-    /// is built inside the serving process and fanned out to each
-    /// dashboard observer on the main actor, while the chat surface reads
-    /// its own progress frames; the README's native 500 ms is plenty
-    /// under a live turn.
-    private static let chatStreamingSnapshotIntervalMs = 500
-    private var chatTurnStreaming = false
+    /// Dashboard snapshot cadence floor. Every snapshot is built and
+    /// JSON-encoded inside the serving process while it decodes (sessions,
+    /// bank, the last request rows, memory, scheduler) and fanned out to
+    /// every dashboard observer on the main actor. The engine builds them at
+    /// the requested cadence only while a request runs (it floors idle
+    /// streams at 1 s), so this is the cadence during every request, from
+    /// Pi, OpenCode or the app's own chat. The live gauge does not wait on
+    /// snapshots: it reads progress frames, which keep the configured
+    /// cadence (`shouldPublishProgressFrame`). The README's native cadence.
+    static let dashboardSnapshotFloorMs = 500
+    /// Performance mode's cadence, also used while the window cannot be seen.
+    static let quietMetricsIntervalMs = 1000
 
-    private var metricsSnapshotIntervalMs: Int {
-        if configuration.performanceLock { return 1000 }
-        let configured = configuration.streamSnapshotIntervalMs
-        return chatTurnStreaming
-            ? max(configured, Self.chatStreamingSnapshotIntervalMs)
-            : configured
+    /// Whether the app's window can be seen (AppKit's occlusion state: not
+    /// minimized, hidden or fully covered). Nobody sees a snapshot or a
+    /// progress frame otherwise, so both drop to the quiet cadence.
+    private(set) var dashboardVisible = true
+
+    var metricsSnapshotIntervalMs: Int {
+        if configuration.performanceLock || !dashboardVisible {
+            return Self.quietMetricsIntervalMs
+        }
+        return max(configuration.streamSnapshotIntervalMs, Self.dashboardSnapshotFloorMs)
     }
 
-    /// Chat turn lifecycle hook. Reopens the metrics stream at the
-    /// slower cadence while a turn streams and at the configured cadence
-    /// once it settles; only an open stream is reopened, and it keeps
-    /// `.open` throughout so the status dot never blinks for it.
-    public func setChatTurnStreaming(_ streaming: Bool) {
-        guard chatTurnStreaming != streaming else { return }
+    /// Window visibility hook (the host reports AppKit's occlusion state).
+    /// Reopens an open metrics stream at the new cadence; it keeps `.open`
+    /// throughout so the status dot never blinks for it.
+    public func setDashboardVisible(_ visible: Bool) {
+        guard dashboardVisible != visible else { return }
         let previousInterval = metricsSnapshotIntervalMs
-        chatTurnStreaming = streaming
+        dashboardVisible = visible
         guard streamTask != nil,
               connectionState == .open,
               metricsSnapshotIntervalMs != previousInterval
@@ -5201,12 +5209,18 @@ public final class MTPLXBackendStore: ObservableObject {
         return try JSONDecoder().decode(T.self, from: data)
     }
 
+    /// How often a progress frame reaches the store's observers (the live
+    /// gauge and decode headline): the configured cadence, 100 ms by
+    /// default, independent of the slower snapshot cadence.
+    var progressFrameIntervalMs: Int {
+        configuration.performanceLock || !dashboardVisible
+            ? Self.quietMetricsIntervalMs
+            : max(100, configuration.streamSnapshotIntervalMs)
+    }
+
     private func shouldPublishProgressFrame() -> Bool {
         let now = Date().timeIntervalSince1970
-        let intervalMs = configuration.performanceLock
-            ? 1000
-            : max(100, configuration.streamSnapshotIntervalMs)
-        let intervalS = Double(intervalMs) / 1000.0
+        let intervalS = Double(progressFrameIntervalMs) / 1000.0
         guard now - lastProgressPublishS >= intervalS else { return false }
         lastProgressPublishS = now
         return true
