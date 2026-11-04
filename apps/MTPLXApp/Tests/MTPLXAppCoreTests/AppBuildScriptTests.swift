@@ -124,4 +124,68 @@ final class AppBuildScriptTests: XCTestCase {
         let manifest = try String(contentsOf: Self.packageRoot.appendingPathComponent("Package.swift"), encoding: .utf8)
         XCTAssertTrue(manifest.contains(".macOS(.v14)"))
     }
+
+    // MARK: Build-machine rpaths
+
+    /// Xcode 27's build adds a back-deploy rpath into every toolchain,
+    /// including the Metal toolchain's /var/run cryptex mount. The script
+    /// drops them and refuses any other absolute path left in the binary.
+    func testToolchainRpathsAreStrippedAndAnyOtherAbsoluteRpathFailsTheBuild() throws {
+        let build = try String(
+            contentsOf: Self.packageRoot.appendingPathComponent("script/build_and_run.sh"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(build.contains(#""$ROOT/script/strip_build_rpaths.sh" "$BUNDLE_DIR/Contents/MacOS/$APP_NAME""#))
+
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mtplx-rpaths-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+
+        let xcodeRpath = "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-6.2/macosx"
+        let metalRpath = "/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v27.1.266.1.TEST01/Metal.xctoolchain/usr/lib/swift-6.2/macosx"
+        let kept = ["/usr/lib/swift", "@loader_path", "@executable_path/../Frameworks"]
+
+        let clean = try linkBinary(in: scratch, named: "clean", rpaths: ["/usr/lib/swift", "@loader_path", metalRpath, xcodeRpath, "@executable_path/../Frameworks"])
+        XCTAssertEqual(try run("/bin/bash", [Self.packageRoot.appendingPathComponent("script/strip_build_rpaths.sh").path, clean.path]).status, 0)
+        XCTAssertEqual(try rpaths(of: clean), kept)
+
+        let stray = try linkBinary(in: scratch, named: "stray", rpaths: kept + ["/opt/local/lib"])
+        let refused = try run("/bin/bash", [Self.packageRoot.appendingPathComponent("script/strip_build_rpaths.sh").path, stray.path])
+        XCTAssertNotEqual(refused.status, 0, "an absolute rpath outside the toolchains must fail the build")
+    }
+
+    private func linkBinary(in directory: URL, named name: String, rpaths: [String]) throws -> URL {
+        let source = directory.appendingPathComponent("\(name).c")
+        try "int main(void) { return 0; }\n".write(to: source, atomically: true, encoding: .utf8)
+        let output = directory.appendingPathComponent(name)
+        let linked = try run("/usr/bin/xcrun", ["clang", source.path, "-o", output.path] + rpaths.flatMap { ["-Wl,-rpath,\($0)"] })
+        guard linked.status == 0 else { throw XCTSkip("clang is not available to link a test binary") }
+        return output
+    }
+
+    private func rpaths(of binary: URL) throws -> [String] {
+        let loadCommands = try run("/usr/bin/otool", ["-l", binary.path]).stdout.components(separatedBy: "\n")
+        var found: [String] = []
+        for (index, line) in loadCommands.enumerated() where line.trimmingCharacters(in: .whitespaces) == "cmd LC_RPATH" {
+            guard let pathLine = loadCommands.dropFirst(index + 1).first(where: { $0.contains(" path ") }) else { continue }
+            let path = pathLine.trimmingCharacters(in: .whitespaces).dropFirst("path ".count)
+            found.append(String(path.components(separatedBy: " (offset").first ?? ""))
+        }
+        return found
+    }
+
+    private func run(_ executable: String, _ arguments: [String]) throws -> Run {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        let stdout = Pipe()
+        process.standardOutput = stdout
+        process.standardError = FileHandle.nullDevice
+        process.standardInput = FileHandle.nullDevice
+        try process.run()
+        let data = stdout.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return Run(status: process.terminationStatus, stdout: String(decoding: data, as: UTF8.self))
+    }
 }
