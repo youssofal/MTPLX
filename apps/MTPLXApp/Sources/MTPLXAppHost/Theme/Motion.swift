@@ -13,23 +13,23 @@ import SwiftUI
 enum Motion {
     // MARK: - Overlay choreography (LaunchOverlay, InferenceParamsOverlay, ModelPickerOverlay)
 
-    /// Border-stroke draw-in. Trims the rounded-rect outline from 0 to 1.
+    /// The toolbar popovers' reveal: border draw-in, header and every row in
+    /// one transaction, complete 0.2 s after the click. The old reveal
+    /// staggered ten beats over about a second (header at 0.22 s, the last
+    /// row at 0.72 s plus its spring), and each beat re-ran the popover's
+    /// body; on the Settings popover that read as slow and mushy.
+    static let overlayEnter: Animation = .smooth(duration: 0.20)
+
+    /// Border-stroke draw-in for the benchmark overlay. Trims the
+    /// rounded-rect outline from 0 to 1.
     static let overlayBorder: Animation = .smooth(duration: 0.40)
 
-    /// Header pop. Drives the title fade + 6pt downward slide.
+    /// Benchmark overlay header pop. Drives the title fade + 6pt slide.
     static let overlayHeaderSpring: Animation = .spring(response: 0.32, dampingFraction: 0.85)
 
-    /// Per-row reveal. Drives opacity + 8pt drop on each row.
-    static let overlayRowSpring: Animation = .spring(response: 0.28, dampingFraction: 0.85)
-
-    /// Delay after entry begins before the header animates in.
+    /// Delay after the benchmark overlay's entry begins before its header
+    /// animates in.
     static let overlayHeaderDelay: TimeInterval = 0.22
-
-    /// Delay after entry begins before the first row animates in.
-    static let overlayRowBaseDelay: TimeInterval = 0.30
-
-    /// Per-row stagger added on top of `overlayRowBaseDelay`.
-    static let overlayRowStaggerStep: TimeInterval = 0.06
 
     /// Exit animation for every overlay state reset.
     static let overlayExit: Animation = .easeIn(duration: 0.18)

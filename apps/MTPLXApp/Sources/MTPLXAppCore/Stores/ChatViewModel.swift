@@ -189,9 +189,6 @@ public final class ChatViewModel: ObservableObject {
     private let modelName: () -> String?
     private let reasoningEnabledProvider: @MainActor () -> Bool?
     private let onDaemonUnreachable: @MainActor () -> Void
-    /// Fires with `true` when the first turn goes live and `false` when
-    /// the last one settles, whichever conversation owns it.
-    private let onLiveTurnActivityChanged: @MainActor (Bool) -> Void
     private let maxToolRounds: Int
     /// Turns a dropped file into attachment data, off the main actor.
     /// Injectable so tests can pin where it runs and how the card
@@ -245,7 +242,6 @@ public final class ChatViewModel: ObservableObject {
         modelName: @escaping () -> String? = { nil },
         reasoningEnabledProvider: @escaping @MainActor () -> Bool? = { nil },
         onDaemonUnreachable: @escaping @MainActor () -> Void = {},
-        onLiveTurnActivityChanged: @escaping @MainActor (Bool) -> Void = { _ in },
         maxToolRounds: Int = 1,
         attachmentExtractor: @escaping AttachmentExtractor = ChatViewModel.extractAttachment
     ) {
@@ -255,7 +251,6 @@ public final class ChatViewModel: ObservableObject {
         self.modelName = modelName
         self.reasoningEnabledProvider = reasoningEnabledProvider
         self.onDaemonUnreachable = onDaemonUnreachable
-        self.onLiveTurnActivityChanged = onLiveTurnActivityChanged
         self.maxToolRounds = maxToolRounds
         self.attachmentExtractor = attachmentExtractor
         refreshConversations()
@@ -1315,7 +1310,6 @@ public final class ChatViewModel: ObservableObject {
     /// turn, stopped when the last one settles.
     private func ensureStreamFlushLoop() {
         guard streamDisplayLink == nil, streamFlushTask == nil else { return }
-        onLiveTurnActivityChanged(true)
         // Reveal on the DISPLAY clock, not a dispatch timer. The 32 ms
         // Task.sleep loop this replaces was measured slipping 4-9 frame
         // multiples under decode load (flush-gap p95 140 ms / max 315 ms
@@ -1358,13 +1352,11 @@ public final class ChatViewModel: ObservableObject {
     }
 
     private func stopStreamFlushLoop() {
-        let wasLive = streamDisplayLink != nil || streamFlushTask != nil
         streamDisplayLink?.invalidate()
         streamDisplayLink = nil
         streamDisplayLinkTarget.onTick = {}
         streamFlushTask?.cancel()
         streamFlushTask = nil
-        if wasLive { onLiveTurnActivityChanged(false) }
     }
 
     private func stopStreamFlushLoopIfIdle() {

@@ -26,9 +26,11 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP_ROOT="$ROOT/apps/MTPLXApp"
 BUILD_SCRIPT="$APP_ROOT/script/build_and_run.sh"
 BASE_VERSION="1.0.0"
-BASE_BUILD="10000"
 TEST_VERSION="1.0.1"
-TEST_BUILD="10001"
+# First release revision of each version, from the same derivation the real
+# release uses (build_and_run.sh refuses any other number for a public build).
+BASE_BUILD="$("$APP_ROOT/script/app_build_number.sh" "$BASE_VERSION" 1)"
+TEST_BUILD="$("$APP_ROOT/script/app_build_number.sh" "$TEST_VERSION" 1)"
 OUT_ROOT="${MTPLX_REHEARSAL_OUT:-$HOME/.mtplx/releases/sparkle-rehearsal-$(/bin/date -u +%Y%m%dT%H%M%SZ)}"
 ASSET_BASE="${MTPLX_REHEARSAL_ASSET_BASE:-https://mtplx.com/releases/test}"
 SITE_OUT="$OUT_ROOT/site"

@@ -150,6 +150,9 @@ struct ContentView: View {
         // as the fallback when the tuner is disabled.
         .frame(minWidth: 420, minHeight: 540)
         .background(WindowSizingTuner())
+        .background(WindowVisibilityReporter { [backend] visible in
+            backend.setDashboardVisible(visible)
+        })
         .sheet(isPresented: $router.logsSheetPresented) {
             LogsSheet()
                 .environmentObject(backend)

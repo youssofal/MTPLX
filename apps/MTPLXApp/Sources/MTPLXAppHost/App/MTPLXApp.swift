@@ -144,9 +144,6 @@ struct MTPLXApp: App {
                 backend.markDaemonUnreachable(
                     reason: "MTPLX lost contact with the model server. Start it again."
                 )
-            },
-            onLiveTurnActivityChanged: { [backend] streaming in
-                backend.setChatTurnStreaming(streaming)
             }
         )
         _backend = State(initialValue: backend)

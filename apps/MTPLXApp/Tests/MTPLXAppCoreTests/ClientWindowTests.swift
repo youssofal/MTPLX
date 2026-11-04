@@ -216,7 +216,8 @@ final class ClientWindowTests: XCTestCase {
             aboveCeiling["limit"] = ["context": context, "output": 50_000]
             aboveCeiling["headers"] = ["x-mtplx-max-response-tokens": "50000"]
             let results = try chatParamsAfterHook(
-                plugin: URL(fileURLWithPath: result.sessionHeadersPluginPath),
+                plugin: URL(fileURLWithPath: result.sessionHeadersPluginPath)
+                    .appendingPathComponent("index.js"),
                 cases: [
                     "injected": (["model": model], ["maxOutputTokens": min(output, 32_000)]),
                     "userCap": (["model": model], ["maxOutputTokens": 9_000]),

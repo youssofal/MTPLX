@@ -31,29 +31,25 @@ BUNDLED_PYTHON_DIR="${MTPLX_BUNDLED_PYTHON_DIR:-}"
 REQUIRE_BUNDLED_PYTHON_RESOURCE="${MTPLX_REQUIRE_BUNDLED_PYTHON_RESOURCE:-0}"
 APP_VERSION="${MTPLX_APP_VERSION:-$(/usr/bin/awk -F'"' '/^version = / { print $2; exit }' "$REPO_ROOT/pyproject.toml" 2>/dev/null || true)}"
 APP_VERSION="${APP_VERSION:-1.0.0}"
-# Sparkle ranks updates by CFBundleVersion alone, so this must rise with every
-# release. Widths give minor/patch 999 each so a bump can never carry into the
-# field above it; the floor keeps derived numbers above the hand-typed builds
-# shipped before this was derived (2.7.0 went out as 27000).
-semantic_build_number() {
-  local version="$1"
-  local major=0
-  local minor=0
-  local patch=0
-  IFS='.' read -r major minor patch _ <<< "$version"
-  major="${major:-0}"
-  minor="${minor:-0}"
-  patch="${patch:-0}"
-  if [[ ! "$major" =~ ^[0-9]+$ || ! "$minor" =~ ^[0-9]+$ || ! "$patch" =~ ^[0-9]+$ ]]; then
-    return 1
-  fi
-  if (( minor > 999 || patch > 999 )); then
-    return 1
-  fi
-  printf '%d' "$((major * 1000000 + minor * 1000 + patch))"
-}
-APP_BUILD="${MTPLX_APP_BUILD:-$(semantic_build_number "$APP_VERSION" 2>/dev/null || true)}"
+# Sparkle ranks updates by CFBundleVersion alone. script/app_build_number.sh
+# is the one place the number is derived (see its header): a build of this
+# version carries its base number unless the caller names a release revision
+# through MTPLX_APP_BUILD (scripts/release_macos_v1.sh does).
+BASE_APP_BUILD="$("$ROOT/script/app_build_number.sh" "$APP_VERSION" 2>/dev/null || true)"
+APP_BUILD="${MTPLX_APP_BUILD:-$BASE_APP_BUILD}"
 APP_BUILD="${APP_BUILD:-$(/bin/date +%Y%m%d%H%M)}"
+# The deployment target: Package.swift's `.macOS(.v14)`, the Info.plist's
+# LSMinimumSystemVersion and the linker's platform_version all carry it.
+MACOS_DEPLOYMENT_TARGET="14.0"
+# The SDK the app compiles against. Xcode 27's `swift build` stamps the
+# binary's LC_BUILD_VERSION sdk with the deployment target (sdk 14.0) although
+# it compiles against MacOSX27.0.sdk, and macOS draws a binary that claims an
+# SDK older than 26 in the pre-Liquid Glass style. The linker gets the real
+# SDK below, and the gate after linking refuses a binary stamped below 26.
+MACOS_SDK_VERSION="$(/usr/bin/xcrun --show-sdk-version)"
+# Contributors whose newest SDK is older than 26 (Xcode 16 on macOS 14) can
+# still build a local app with this set; a public release never can.
+ALLOW_PRE_GLASS_SDK="${MTPLX_APP_ALLOW_PRE_GLASS_SDK:-0}"
 EMBED_LOCAL_RUNTIME_WRAPPER="${MTPLX_APP_EMBED_LOCAL_RUNTIME_WRAPPER:-0}"
 PUBLIC_RELEASE="${MTPLX_APP_PUBLIC_RELEASE:-0}"
 SPARKLE_FEED_URL="${MTPLX_APPCAST_URL:-https://mtplx.com/releases/appcast.xml}"
@@ -253,7 +249,28 @@ else
   done
 fi
 
-swift build -c "$BUILD_CONFIG" --product "$APP_NAME"
+if [[ "$PUBLIC_RELEASE" == "1" ]]; then
+  # A public release is a release revision of its version's base number:
+  # above every QA build of that version, below the next version's.
+  if [[ -z "$BASE_APP_BUILD" ]]; then
+    echo "error: public release version '$APP_VERSION' has no derivable build number" >&2
+    exit 1
+  fi
+  if [[ ! "$APP_BUILD" =~ ^[0-9]+$ ]] \
+    || (( APP_BUILD <= BASE_APP_BUILD || APP_BUILD > BASE_APP_BUILD + 9 )); then
+    echo "error: public release CFBundleVersion '$APP_BUILD' is not a release revision of $APP_VERSION ($((BASE_APP_BUILD + 1)) to $((BASE_APP_BUILD + 9)))" >&2
+    echo "       derive it with script/app_build_number.sh $APP_VERSION <1-9>" >&2
+    exit 1
+  fi
+  if [[ "$ALLOW_PRE_GLASS_SDK" == "1" ]]; then
+    echo "error: MTPLX_APP_ALLOW_PRE_GLASS_SDK is for local builds; a public release must be stamped with SDK 26 or later" >&2
+    exit 1
+  fi
+fi
+
+swift build -c "$BUILD_CONFIG" --product "$APP_NAME" \
+  -Xlinker -platform_version -Xlinker macos \
+  -Xlinker "$MACOS_DEPLOYMENT_TARGET" -Xlinker "$MACOS_SDK_VERSION"
 
 /bin/rm -rf "$BUNDLE_DIR"
 mkdir -p "$BUNDLE_DIR/Contents/MacOS" "$BUNDLE_DIR/Contents/Resources" "$BUNDLE_DIR/Contents/Frameworks"
@@ -273,6 +290,32 @@ fi
 if ! /usr/bin/otool -l "$BUNDLE_DIR/Contents/MacOS/$APP_NAME" | /usr/bin/grep -q '@executable_path/../Frameworks'; then
   /usr/bin/install_name_tool -add_rpath '@executable_path/../Frameworks' "$BUNDLE_DIR/Contents/MacOS/$APP_NAME"
 fi
+
+# Gate: macOS picks the controls' style (Liquid Glass or the old look) from
+# the SDK stamped in the main binary, so read the stamp back off the bundle.
+BUILD_STAMP="$(/usr/bin/vtool -show-build "$BUNDLE_DIR/Contents/MacOS/$APP_NAME")"
+STAMPED_MINOS="$(printf '%s\n' "$BUILD_STAMP" | /usr/bin/awk '$1 == "minos" { print $2; exit }')"
+STAMPED_SDK="$(printf '%s\n' "$BUILD_STAMP" | /usr/bin/awk '$1 == "sdk" { print $2; exit }')"
+STAMPED_SDK_MAJOR="${STAMPED_SDK%%.*}"
+if [[ ! "$STAMPED_SDK_MAJOR" =~ ^[0-9]+$ ]]; then
+  echo "error: no SDK stamp in $BUNDLE_DIR/Contents/MacOS/$APP_NAME:" >&2
+  printf '%s\n' "$BUILD_STAMP" >&2
+  exit 1
+fi
+if (( STAMPED_SDK_MAJOR < 26 )); then
+  if [[ "$ALLOW_PRE_GLASS_SDK" == "1" ]]; then
+    echo "warning: $APP_NAME is stamped sdk $STAMPED_SDK (built with SDK $MACOS_SDK_VERSION); macOS draws it without Liquid Glass" >&2
+  else
+    echo "error: $APP_NAME is stamped sdk $STAMPED_SDK (built with SDK $MACOS_SDK_VERSION); macOS would draw it without Liquid Glass" >&2
+    if (( ${MACOS_SDK_VERSION%%.*} >= 26 )); then
+      echo "       the linker ignored -platform_version macos $MACOS_DEPLOYMENT_TARGET $MACOS_SDK_VERSION; check the toolchain's swift build" >&2
+    else
+      echo "       build with Xcode 26 or later, or set MTPLX_APP_ALLOW_PRE_GLASS_SDK=1 for a local build on an older SDK" >&2
+    fi
+    exit 1
+  fi
+fi
+echo "$APP_NAME stamped minos $STAMPED_MINOS sdk $STAMPED_SDK, build $APP_BUILD"
 
 # App-owned resources are copied flat into `Contents/Resources` and resolved
 # through `Bundle.main`. Do not copy SwiftPM-generated resource bundles here:
@@ -412,7 +455,7 @@ $(for code in "${LOCALIZATION_CODES[@]}"; do printf '    <string>%s</string>\n' 
   <key>LSApplicationCategoryType</key>
   <string>public.app-category.developer-tools</string>
   <key>LSMinimumSystemVersion</key>
-  <string>14.0</string>
+  <string>$MACOS_DEPLOYMENT_TARGET</string>
   <key>MTPLXAllowLocalRuntimeWrapper</key>
   <$([[ "$EMBED_LOCAL_RUNTIME_WRAPPER" == "1" ]] && printf true || printf false)/>
 $LOCAL_RUNTIME_WRAPPER_PLIST

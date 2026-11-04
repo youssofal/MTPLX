@@ -1679,3 +1679,4 @@
 "Free disk space is below the floor the SSD cache always leaves free, so it has stopped saving conversations. Free up disk space to turn it back on." = "ディスクの空き容量がSSDキャッシュが常に空けておく下限を下回っているため、会話の保存を停止しました。再開するにはディスク容量を空けてください。";
 "Free disk space is %@. The SSD cache needs room for two copies of your largest conversation (%@) while it saves a new one, so it may skip saving new progress. Copies it already saved are kept." = "ディスクの空き容量は%@です。SSDキャッシュは新しいコピーを保存する間、最大の会話（%@）のコピー2つ分の容量を必要とするため、新しい進行状況の保存をスキップする場合があります。保存済みのコピーは保持されます。";
 "Free disk space is low. The SSD cache may skip saving new progress. Copies it already saved are kept." = "ディスクの空き容量が少なくなっています。SSDキャッシュは新しい進行状況の保存をスキップする場合があります。保存済みのコピーは保持されます。";
+"macOS is slowing the GPU because the Mac is hot. Speed returns as it cools." = "Mac が高温のため、macOS が GPU の速度を下げています。冷えると速度は戻ります。";

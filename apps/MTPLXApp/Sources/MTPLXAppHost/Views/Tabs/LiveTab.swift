@@ -38,6 +38,11 @@ struct LiveTab: View {
                         SSDLowDiskBanner(notice: notice)
                     }
 
+                    if backend.daemonState.kind == .running,
+                       let notice = ThermalPressureNotice.from(backend.health?.thermalPressure) {
+                        ThermalPressureBanner(notice: notice)
+                    }
+
                     heroSection(availableWidth: contentWidth)
                     TileRow(availableWidth: contentWidth)
                     AcceptanceSection()

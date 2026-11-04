@@ -1679,3 +1679,4 @@
 "Free disk space is below the floor the SSD cache always leaves free, so it has stopped saving conversations. Free up disk space to turn it back on." = "可用磁盘空间低于 SSD 缓存始终保留的下限，因此它已停止保存对话。请释放磁盘空间以重新启用。";
 "Free disk space is %@. The SSD cache needs room for two copies of your largest conversation (%@) while it saves a new one, so it may skip saving new progress. Copies it already saved are kept." = "可用磁盘空间为 %@。SSD 缓存在保存新副本时需要容纳您最大对话（%@）的两份副本，因此可能会跳过保存新进度。已保存的副本会保留。";
 "Free disk space is low. The SSD cache may skip saving new progress. Copies it already saved are kept." = "可用磁盘空间不足。SSD 缓存可能会跳过保存新进度。已保存的副本会保留。";
+"macOS is slowing the GPU because the Mac is hot. Speed returns as it cools." = "Mac 温度过高，macOS 正在降低 GPU 速度。冷却后速度会恢复。";

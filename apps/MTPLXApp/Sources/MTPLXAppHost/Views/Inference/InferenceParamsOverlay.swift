@@ -4,9 +4,10 @@ import MTPLXAppCore
 
 // MARK: - InferenceParamsOverlay
 //
-// Sibling to `LaunchOverlay` — same draw-in border + staggered row
-// reveal, same outside-tap dismiss. Lets the user tune the inference
-// knobs they care about most without leaving the dashboard:
+// Sibling to `LaunchOverlay` — same one-step reveal (border, header and
+// rows together, `Motion.overlayEnter`), same outside-tap dismiss. Lets
+// the user tune the inference knobs they care about most without leaving
+// the dashboard:
 //
 //   - Performance Mode             (re-opens SSE stream, no restart)
 //   - Temperature                  (live mutable, no restart)
@@ -20,7 +21,10 @@ import MTPLXAppCore
 //
 // Sampling/depth/reasoning/prefill sliders commit on release: live
 // settings update for the current daemon, plus a single persisted
-// settings write so the value sticks across relaunches. The
+// settings write so the value sticks across relaunches. While a slider is
+// dragged its row (`DraftSlider`) holds the value itself, so a step
+// redraws that row only, and neither the engine nor a settings refresh
+// can move the thumb under the cursor. The
 // context-window slider and KV quantization picker commit through the
 // Apply bar because they need a daemon restart, so the user can stage
 // both at once before paying the warm-up cost. Performance Mode toggles
@@ -158,6 +162,7 @@ struct InferenceParamsOverlay: View, Equatable {
         let topK: Int
         let presencePenalty: Double
         let depth: Int
+        let adaptiveDepth: Bool
         let reasoningMode: String
         let reasoningEffort: String
         let controlClientSettings: Bool
@@ -228,6 +233,7 @@ struct InferenceParamsOverlay: View, Equatable {
             topK: topK,
             presencePenalty: presencePenalty,
             depth: depth,
+            adaptiveDepth: adaptiveDepth,
             reasoningMode: reasoningMode,
             reasoningEffort: reasoningEffort,
             controlClientSettings: controlClientSettings,
@@ -405,24 +411,26 @@ struct InferenceParamsOverlay: View, Equatable {
             sectionHeader(tr("SAMPLING"))
             paramSlider(
                 title: tr("Temperature"),
-                value: Binding(get: { temperature }, set: { temperature = $0 }),
+                value: temperature,
                 range: 0...Self.temperatureMax,
                 step: 0.05,
                 valueText: { v in
                     Text(v, format: .number.precision(.fractionLength(2)))
                 },
                 hapticPattern: .alignment,
+                onChange: { temperature = $0 },
                 onCommit: { commitLiveSettings() }
             )
             paramSlider(
                 title: tr("Top P"),
-                value: Binding(get: { topP }, set: { topP = $0 }),
+                value: topP,
                 range: Self.topPMin...Self.topPMax,
                 step: 0.05,
                 valueText: { v in
                     Text(v, format: .number.precision(.fractionLength(2)))
                 },
                 hapticPattern: .alignment,
+                onChange: { topP = $0 },
                 onCommit: { commitLiveSettings() }
             )
             // Top K uses 0…200 step 5 so the tick density on the
@@ -433,27 +441,26 @@ struct InferenceParamsOverlay: View, Equatable {
             // Values above 200 are rare and clamped on slider entry.
             paramSlider(
                 title: tr("Top K"),
-                value: Binding(
-                    get: { Double(topK) },
-                    set: { topK = Int($0.rounded()) }
-                ),
+                value: Double(topK),
                 range: 0...Double(Self.topKMax),
                 step: 5,
                 valueText: { v in
                     Text(Int(v.rounded()), format: .number)
                 },
                 hapticPattern: .alignment,
+                onChange: { topK = Int($0.rounded()) },
                 onCommit: { commitLiveSettings() }
             )
             paramSlider(
                 title: tr("Presence Penalty"),
-                value: Binding(get: { presencePenalty }, set: { presencePenalty = $0 }),
+                value: presencePenalty,
                 range: 0...Self.presencePenaltyMax,
                 step: 0.05,
                 valueText: { v in
                     Text(v, format: .number.precision(.fractionLength(2)))
                 },
                 hapticPattern: .alignment,
+                onChange: { presencePenalty = $0 },
                 onCommit: { commitLiveSettings() }
             )
             Text(tr("Discourages reusing tokens the reply already contains. 0 is exact and best for coding; try 0.5–1.5 for creative or repetitive output."))
@@ -599,12 +606,18 @@ struct InferenceParamsOverlay: View, Equatable {
         // depth controls to open on D1.
         return MTPLXModelOption.supportsTune(family: family) && mode == "ar" ? mode : nil
     }
+    // The configured model's family comes from the shell projection, which
+    // resolves it once per model; asking the configuration to resolve it
+    // again would read the model's metadata from disk on every render.
     private var compatibleConfigurationTunedDraftValue: Int? {
         guard let field = draftControl?.requestField else { return nil }
         if field == "depth" {
-            return snapshot.configuration.compatibleTunedDepth()
+            return snapshot.configuration.compatibleTunedDepth(modelFamily: configuredModelFamily)
         }
-        return snapshot.configuration.compatibleTunedControlValue(controlField: field)
+        return snapshot.configuration.compatibleTunedControlValue(
+            controlField: field,
+            modelFamily: configuredModelFamily
+        )
     }
     private var defaultGenerationModeForSelectedControl: String {
         depthControlSupportsMtpOff ? "ar" : "mtp"
@@ -916,19 +929,17 @@ struct InferenceParamsOverlay: View, Equatable {
             if let sliderRange = depthSliderRange {
                 paramSlider(
                     title: draftControl?.displayLabel ?? tr("Depth"),
-                    value: Binding(
-                        get: { Double(depth) },
-                        set: {
-                            guard draftControlSupported else { return }
-                            depth = Int($0.rounded())
-                        }
-                    ),
+                    value: Double(depth),
                     range: Double(sliderRange.lowerBound)...Double(sliderRange.upperBound),
                     step: 1,
                     valueText: { v in
                         Text(draftValueLabel(for: Int(v.rounded())))
                     },
                     hapticPattern: .levelChange,
+                    onChange: {
+                        guard draftControlSupported else { return }
+                        depth = Int($0.rounded())
+                    },
                     onCommit: { if draftControlSupported { commitLiveSettings() } }
                 )
             } else if draftControlSupported {
@@ -1004,10 +1015,7 @@ struct InferenceParamsOverlay: View, Equatable {
             sectionHeader(tr("PREFILL"), hint: tr("next request"))
             paramSlider(
                 title: tr("Batch step size"),
-                value: Binding(
-                    get: { Double(prefillChunk) },
-                    set: { prefillChunk = Int($0.rounded()) }
-                ),
+                value: Double(prefillChunk),
                 range: 256...32768,
                 step: 256,
                 valueText: { v in
@@ -1015,6 +1023,7 @@ struct InferenceParamsOverlay: View, Equatable {
                         + Text(Int(v.rounded()), format: .number) + Text(tr(" tok"))
                 },
                 hapticPattern: .alignment,
+                onChange: { prefillChunk = Int($0.rounded()) },
                 onCommit: { commitPrefill() }
             )
             prefillPresetChips
@@ -1025,7 +1034,34 @@ struct InferenceParamsOverlay: View, Equatable {
     private var contextWindowSection: some View {
         InferenceSection(visible: rowsVisibleCount > 6) {
             sectionHeader(tr("CONTEXT WINDOW"), hint: "restart")
-            VStack(alignment: .leading, spacing: 6) {
+            if let sliderRange = contextWindowSliderRange {
+                // Restart-required: the drag stages the window for the
+                // Apply bar instead of committing it. The bar's dirty flag
+                // follows the thumb (written only when it flips), so the
+                // bar appears as soon as the value leaves the running one.
+                let running = currentContextWindow
+                DraftSlider(
+                    title: tr("Window"),
+                    value: Double(contextWindow),
+                    range: Double(sliderRange.lowerBound)...Double(sliderRange.upperBound),
+                    step: 1024,
+                    valueText: { v in
+                        Text(Self.formatTokensVerbose(clampContextWindow(Int(v.rounded()))))
+                    },
+                    hapticPattern: .alignment,
+                    motionEnabled: motionEnabled,
+                    onDragStep: { v in
+                        let dirty = clampContextWindow(Int(v.rounded())) != running
+                        if dirty != contextWindowDirty { contextWindowDirty = dirty }
+                    },
+                    onChange: { v in
+                        let clamped = clampContextWindow(Int(v.rounded()))
+                        contextWindow = clamped
+                        contextWindowDirty = clamped != running
+                    },
+                    onCommit: nil
+                )
+            } else {
                 HStack {
                     Text(tr("Window"))
                         .font(.system(size: 12))
@@ -1035,25 +1071,6 @@ struct InferenceParamsOverlay: View, Equatable {
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(Brand.typeSecondary)
                         .monospacedDigit()
-                }
-                if let sliderRange = contextWindowSliderRange {
-                    Slider(
-                        value: Binding(
-                            get: { Double(contextWindow) },
-                            set: { newValue in
-                                let clamped = clampContextWindow(Int(newValue.rounded()))
-                                if clamped != contextWindow {
-                                    Haptics.tick(.alignment)
-                                }
-                                contextWindow = clamped
-                                contextWindowDirty = clamped != currentContextWindow
-                            }
-                        ),
-                        in: Double(sliderRange.lowerBound)...Double(sliderRange.upperBound),
-                        step: 1024
-                    )
-                    .tint(Brand.typeBody)
-                    .controlHoverLift(motionEnabled: motionEnabled)
                 }
             }
             contextPresetChips
@@ -1265,64 +1282,41 @@ struct InferenceParamsOverlay: View, Equatable {
         .padding(.bottom, 2)
     }
 
-    /// Build a labelled slider. The label + value text are static; the
-    /// `controlHoverLift` modifier is applied *only* to the Slider
-    /// itself so the dial floats up on hover and the surrounding text
-    /// stays put. If `hapticPattern` is supplied, every step crossing
-    /// during a drag fires that haptic on the trackpad — `.alignment`
-    /// for micro tuning (temperature, top K, prefill), `.levelChange`
-    /// for big detents (depth, KV quantization).
+    /// Build a labelled live slider. `value` is the popover's draft;
+    /// `onChange` writes a new one into it and `onCommit` pushes the
+    /// drafts to the engine. While the user drags, the row keeps the value
+    /// itself (`DraftSlider`): a step redraws the row, and the popover
+    /// takes the value once, on release, then commits it. If
+    /// `hapticPattern` is supplied, every step crossing fires that haptic
+    /// on the trackpad — `.alignment` for micro tuning (temperature, top
+    /// K, prefill), `.levelChange` for big detents (depth).
     ///
     /// The caller supplies the value formatter as a `(Double) -> Text`
     /// closure so each slider can route through swiftui-pro
     /// `Text(value, format: .number.precision(.fractionLength(N)))`
     /// instead of the C-style `String(format: "%.2f", value)` the V0
     /// helper used (per swiftui-pro swift.md).
-    @ViewBuilder
     private func paramSlider(
         title: String,
-        value: Binding<Double>,
+        value: Double,
         range: ClosedRange<Double>,
         step: Double,
         valueText: @escaping (Double) -> Text,
         hapticPattern: NSHapticFeedbackManager.FeedbackPattern? = nil,
+        onChange: @escaping (Double) -> Void,
         onCommit: (() -> Void)?
     ) -> some View {
-        // Wrap the source binding so the setter fires a haptic
-        // whenever the step-snapped value actually changes. The Slider
-        // already snaps to the step grid, so a `!=` check after the
-        // snap is exactly one tick per step crossing.
-        let hapticValue = Binding<Double>(
-            get: { value.wrappedValue },
-            set: { newValue in
-                if let pattern = hapticPattern, newValue != value.wrappedValue {
-                    Haptics.tick(pattern)
-                }
-                value.wrappedValue = newValue
-            }
+        DraftSlider(
+            title: title,
+            value: value,
+            range: range,
+            step: step,
+            valueText: valueText,
+            hapticPattern: hapticPattern,
+            motionEnabled: motionEnabled,
+            onChange: onChange,
+            onCommit: onCommit
         )
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text(title)
-                    .font(.system(size: 12))
-                    .foregroundStyle(Brand.typeBody)
-                Spacer()
-                valueText(value.wrappedValue)
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(Brand.typeSecondary)
-                    .monospacedDigit()
-            }
-            Slider(
-                value: hapticValue,
-                in: range,
-                step: step,
-                onEditingChanged: { editing in
-                    if !editing { onCommit?() }
-                }
-            )
-            .tint(Brand.typeBody)
-            .controlHoverLift(motionEnabled: motionEnabled)
-        }
     }
 
     @ViewBuilder
@@ -1383,19 +1377,15 @@ struct InferenceParamsOverlay: View, Equatable {
     }
 
     /// Prefill is live-mutable: the daemon picks up the new chunk size
-    /// on the next request without a restart. We persist the same
-    /// value into `configuration` so the change sticks across
-    /// relaunches — one disk write per drag (on slider release), not
-    /// per step. Failure to persist or push live silently no-ops; the
-    /// next slider release retries.
+    /// on the next request without a restart. The live update persists
+    /// the pinned chunk into `configuration` with the other live settings
+    /// (`prefillChunkTokens` rides the draft), so the change sticks across
+    /// relaunches with one disk write per drag (on slider release), not
+    /// per step; a separate save here used to make it two. Failure to
+    /// push live silently no-ops; the next slider release retries.
     private func commitPrefill() {
         prefillChunkPinned = true
         let live = currentLiveSettingsDraft()
-
-        var config = backend.configuration
-        config.prefillChunkTokens = prefillChunk
-
-        try? backend.saveSettings(config)
         Task {
             try? await backend.updateLiveSettings(live)
         }
@@ -1498,9 +1488,12 @@ struct InferenceParamsOverlay: View, Equatable {
     private func runEnterChoreography() {
         seedDraftsFromCurrentState()
 
+        // Nine: the sections' eight reveal steps (0 to 7) plus the divider
+        // above KV QUANTIZATION (`sectionDivider(precedesRow: 8)` shows only
+        // past eight), which a count of eight left out on every open.
         OverlayChoreography.runEnter(
             motionEnabled: motionEnabled,
-            rowCount: 8,
+            rowCount: 9,
             borderProgress: $borderProgress,
             headerVisible: $headerVisible,
             rowsVisibleCount: $rowsVisibleCount
@@ -1603,18 +1596,14 @@ struct InferenceParamsOverlay: View, Equatable {
             ?? 2048
     }
 
-    /// Hand the chunk back to the engine: forget the saved value and push 0,
-    /// which a running daemon reads as "use your own choice".
+    /// Hand the chunk back to the engine: push 0, which a running daemon
+    /// reads as "use your own choice" and the live update persists as no
+    /// saved chunk (one settings write).
     private func resetPrefillToAuto() {
         prefillChunkPinned = false
         prefillChunk = compatibleSettings?.prefillChunkTokensDefault ?? 2048
         var live = currentLiveSettingsDraft()
         live.prefillChunkTokens = 0
-
-        var config = backend.configuration
-        config.prefillChunkTokens = nil
-
-        try? backend.saveSettings(config)
         Task {
             try? await backend.updateLiveSettings(live)
         }
@@ -1661,7 +1650,7 @@ struct InferenceParamsOverlay: View, Equatable {
     }
 
     private var compatibleConfigurationContextWindow: Int? {
-        snapshot.configuration.compatibleContextWindowOverride()
+        snapshot.configuration.compatibleContextWindowOverride(modelFamily: configuredModelFamily)
     }
 
     private var compatibleHealthContextWindow: Int? {
@@ -1778,15 +1767,106 @@ struct InferenceParamsOverlay: View, Equatable {
     }
 }
 
+// MARK: - DraftSlider
+//
+// One labelled slider row that owns its value while it is dragged. The
+// popover's drafts feed every control, so writing a draft on each step
+// re-ran the whole popover body and re-applied every hosted AppKit control
+// twenty times across a Temperature drag. Here a step writes only the
+// row's `dragValue`: the row redraws its label and slider, and the popover
+// gets the value once, when the drag ends, followed by its commit (one
+// engine request, one settings write). The row ignores the popover's value
+// while dragging, so a settings refresh from the engine cannot move the
+// thumb under the cursor; between drags it follows the popover again.
+//
+// A change that arrives outside a drag (keyboard, VoiceOver) is written
+// through to the popover at once, as before, without a commit.
+
+private struct DraftSlider: View {
+    let title: String
+    /// The popover's draft for this control.
+    let value: Double
+    let range: ClosedRange<Double>
+    let step: Double
+    let valueText: (Double) -> Text
+    let hapticPattern: NSHapticFeedbackManager.FeedbackPattern?
+    let motionEnabled: Bool
+    /// Runs on each step of a drag with the row's value. Write popover
+    /// state from here only when it actually changes (the context window's
+    /// dirty flag), or the drag redraws the whole popover again.
+    var onDragStep: ((Double) -> Void)? = nil
+    /// Writes a value into the popover's draft.
+    let onChange: (Double) -> Void
+    /// Runs once after a drag ends and its value is written.
+    let onCommit: (() -> Void)?
+
+    @State private var dragValue: Double?
+    @State private var dragging = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(title)
+                    .font(.system(size: 12))
+                    .foregroundStyle(Brand.typeBody)
+                Spacer()
+                valueText(dragValue ?? value)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(Brand.typeSecondary)
+                    .monospacedDigit()
+            }
+            Slider(
+                value: Binding(
+                    get: { dragValue ?? value },
+                    set: { newValue in
+                        // The Slider snaps to its step grid, so a change
+                        // after the snap is exactly one step crossing.
+                        if let hapticPattern, newValue != (dragValue ?? value) {
+                            Haptics.tick(hapticPattern)
+                        }
+                        dragValue = newValue
+                        if dragging {
+                            onDragStep?(newValue)
+                        } else {
+                            onChange(newValue)
+                        }
+                    }
+                ),
+                in: range,
+                step: step,
+                onEditingChanged: { editing in
+                    if editing {
+                        dragging = true
+                        if dragValue == nil { dragValue = value }
+                    } else {
+                        dragging = false
+                        let final = dragValue ?? value
+                        dragValue = nil
+                        onChange(final)
+                        onCommit?()
+                    }
+                }
+            )
+            .tint(Brand.typeBody)
+            .controlHoverLift(motionEnabled: motionEnabled)
+        }
+        .onChange(of: value) { _, _ in
+            // The popover's draft moved (a write-through, a preset chip, a
+            // re-seed): between drags the row shows it again.
+            if !dragging { dragValue = nil }
+        }
+    }
+}
+
 // MARK: - InferenceSection
 //
 // Pure layout container for a single section in the inference popover.
 // Holds the section header + the section's body. *Never* lifts and
 // *never* paints a background highlight on hover — the section is
 // structural, not interactive. Hover lift belongs to the widget the
-// cursor is over (see `controlHoverLift`). The choreographed entrance
-// (opacity + 8pt drop) rides at the section level because each section
-// is one beat in the staggered reveal.
+// cursor is over (see `controlHoverLift`). The entrance (opacity + 8pt
+// drop) rides at the section level; every section reveals in the same
+// transaction (`OverlayChoreography.runEnter`).
 
 private struct InferenceSection<Content: View>: View {
     let visible: Bool

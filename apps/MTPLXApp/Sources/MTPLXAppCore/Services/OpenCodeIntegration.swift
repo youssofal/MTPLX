@@ -76,21 +76,34 @@ private struct OpenCodeReasoningVisibilityResult: Equatable, Sendable {
 
 public struct OpenCodeIntegration: Sendable {
     private static let desktopGlobalStoreName = "opencode.global.dat"
-    private static let sessionHeadersPluginName = "mtplx-session-headers.js"
+    /// The managed plugin is the package the CLI installs
+    /// (`mtplx.opencode.write_opencode_session_headers_plugin`), byte for
+    /// byte, at the same place: `plugins/mtplx-session-headers/` beside
+    /// opencode.json, with `package.json`, the V1 entrypoint `index.js` and
+    /// the V2 entrypoint `server.js`. OpenCode 1.x imports the package main
+    /// and calls its `chat.headers`/`chat.params` hooks; OpenCode 2.x
+    /// resolves `./server` and calls only `model.request`, so a single-file
+    /// V1 plugin did nothing there. Both writers compare content before
+    /// rewriting, so the app and the CLI never fight over the files.
+    /// `OpenCodePluginParityTests` reads the CLI's sources at test time and
+    /// fails when the two drift.
+    static let sessionHeadersPackageName = "mtplx-session-headers"
+    /// The single-file plugin earlier app versions wrote next to
+    /// opencode.json. Its registration is replaced by the package so the
+    /// V1 hooks never run twice; the file itself is inert once unregistered.
+    static let legacySessionHeadersPluginName = "mtplx-session-headers.js"
 
-    /// The managed OpenCode plugin the app installs, with the same
-    /// `chat.params` rules as the CLI's package plugin
-    /// (`mtplx.opencode.OPENCODE_SESSION_HEADERS_PLUGIN_SOURCE`); both writers
-    /// compare content before rewriting, so the lanes never fight. It carries
-    /// the session headers and strips exactly the values OpenCode injects:
-    /// its output ceiling (provider/transform.ts maxOutputTokens,
-    /// min(limit.output, 32,000) on every request, which on a small window is
-    /// the reply reserve `outputLimit(forContextWindow:)` writes) and the
-    /// qwen-keyed sampler OpenCode <= 1.18.20 sends. MTPLX then owns the
-    /// uncapped generation contract while every explicit client choice
-    /// passes through untouched, and an answer cap the user gave the CLI
-    /// (the model's `x-mtplx-max-response-tokens` header) is sent whole.
-    private static let sessionHeadersPluginSource = """
+    /// `index.js` (`mtplx.opencode.OPENCODE_SESSION_HEADERS_PLUGIN_SOURCE`).
+    /// It carries the session headers and strips exactly the values
+    /// OpenCode 1.x injects: its output ceiling (provider/transform.ts
+    /// maxOutputTokens, min(limit.output, 32,000) on every request, which on
+    /// a small window is the reply reserve `outputLimit(forContextWindow:)`
+    /// writes) and the qwen-keyed sampler OpenCode <= 1.18.20 sends. MTPLX
+    /// then owns the uncapped generation contract while every explicit
+    /// client choice passes through untouched, and an answer cap the user
+    /// gave the CLI (the model's `x-mtplx-max-response-tokens` header) is
+    /// sent whole.
+    static let sessionHeadersPluginSource = """
     const mtplxProviderID = (input) =>
       input?.model?.providerID || input?.provider?.id;
 
@@ -107,6 +120,9 @@ public struct OpenCodeIntegration: Sendable {
         output.headers["x-mtplx-client"] = "opencode";
         if (input?.sessionID) {
           output.headers["x-mtplx-session-id"] = String(input.sessionID);
+        }
+        if (input?.message?.id) {
+          output.headers["x-mtplx-client-turn-id"] = String(input.message.id);
         }
       },
       "chat.params": async (input, output) => {
@@ -159,6 +175,43 @@ public struct OpenCodeIntegration: Sendable {
 
     """
 
+    /// `server.js` (`mtplx.opencode.OPENCODE_SESSION_HEADERS_V2_SOURCE`): the
+    /// OpenCode 2.x entrypoint. Its `model.request` hook sends the session
+    /// headers and OpenCode's request kind (`x-mtplx-request-kind`), which
+    /// lets the server tell a title request from the conversation it names.
+    static let sessionHeadersServerSource = """
+    // Older V1 imports index.js; modern V1 and V2 resolve this entrypoint.
+    // No prompt, tool-schema or generation-option rewriting belongs here.
+    import { MTPLXSessionHeaders } from "./index.js";
+    export default {
+      id: "mtplx.session-headers",
+      server: MTPLXSessionHeaders,
+      async setup(ctx) {
+        await ctx.session.hook("model.request", (event) => {
+          event.headers["x-mtplx-client"] = "opencode";
+          event.headers["x-mtplx-session-id"] = String(event.sessionID);
+          if (event.kind) event.headers["x-mtplx-request-kind"] = String(event.kind);
+        }, { providerID: "mtplx" });
+      }
+    };
+
+    """
+
+    /// `package.json`, as the CLI's `json.dumps(..., indent=2)` writes it.
+    static let sessionHeadersPackageJSON = """
+    {
+      "name": "mtplx-session-headers",
+      "private": true,
+      "type": "module",
+      "main": "./index.js",
+      "exports": {
+        ".": "./index.js",
+        "./server": "./server.js"
+      }
+    }
+
+    """
+
     public let configURL: URL
     public let desktopSettingsStoreURL: URL
     public let desktopBundleIdentifier: String
@@ -204,8 +257,7 @@ public struct OpenCodeIntegration: Sendable {
         let modelID = Self.modelID(for: configuration.model)
         let modelReference = "mtplx/\(modelID)"
         let baseURL = Self.baseURLString(host: configuration.host, port: configuration.port)
-        let sessionHeadersPluginURL = configURL.deletingLastPathComponent()
-            .appendingPathComponent(Self.sessionHeadersPluginName)
+        let sessionHeadersPluginURL = Self.sessionHeadersPluginURL(configURL: configURL)
         var backupURL: URL?
 
         // A file OpenCode accepts (comments, trailing commas) is merged; one
@@ -251,7 +303,7 @@ public struct OpenCodeIntegration: Sendable {
             at: configURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        let pluginFileDidChange = try Self.installSessionHeadersPluginFile(
+        let pluginFileDidChange = try Self.installSessionHeadersPlugin(
             at: sessionHeadersPluginURL
         )
 
@@ -672,9 +724,18 @@ public struct OpenCodeIntegration: Sendable {
         try ClientConfigFile.readObject(at: configURL)
     }
 
+    /// The managed plugin package: `plugins/mtplx-session-headers` beside
+    /// opencode.json (`mtplx.opencode.opencode_session_headers_plugin_path`).
+    static func sessionHeadersPluginURL(configURL: URL) -> URL {
+        configURL.deletingLastPathComponent()
+            .appendingPathComponent("plugins", isDirectory: true)
+            .appendingPathComponent(sessionHeadersPackageName, isDirectory: true)
+    }
+
     /// Register the managed plugin in the config's `plugin` list, replacing
-    /// any stale registration of the same basename under another path (a
-    /// duplicate would double-fire the hooks).
+    /// any stale registration of it under another path (the CLI's merge
+    /// rule): the package or the single file earlier versions installed,
+    /// since a second copy would run the V1 hooks twice.
     private static func ensureManagedSessionHeadersPlugin(
         in root: inout [String: JSONValue],
         path: String
@@ -692,7 +753,8 @@ public struct OpenCodeIntegration: Sendable {
         var next = existing.filter { plugin in
             guard let pluginPath = plugin.stringValue else { return true }
             if pluginPath == path { return true }
-            return URL(fileURLWithPath: pluginPath).lastPathComponent != sessionHeadersPluginName
+            let name = URL(fileURLWithPath: pluginPath).lastPathComponent
+            return name != sessionHeadersPackageName && name != legacySessionHeadersPluginName
         }
         if !next.contains(where: { $0.stringValue == path }) {
             next.append(.string(path))
@@ -702,18 +764,28 @@ public struct OpenCodeIntegration: Sendable {
         return didChange
     }
 
-    /// Write the managed plugin next to opencode.json. Content-compared
-    /// before writing so repeat launches (and the Python `mtplx start
+    /// Write the managed plugin package. Each file is content-compared
+    /// before writing, so repeat launches (and the Python `mtplx start
     /// opencode` writer, which installs the identical bytes) never churn
-    /// the file.
-    private static func installSessionHeadersPluginFile(at url: URL) throws -> Bool {
-        let data = Data(sessionHeadersPluginSource.utf8)
-        if let existing = try? Data(contentsOf: url), existing == data {
-            return false
+    /// it, and is private to the user like the CLI's copy.
+    private static func installSessionHeadersPlugin(at directory: URL) throws -> Bool {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var changed = false
+        for (name, source) in [
+            ("package.json", sessionHeadersPackageJSON),
+            ("index.js", sessionHeadersPluginSource),
+            ("server.js", sessionHeadersServerSource),
+        ] {
+            let url = directory.appendingPathComponent(name)
+            let data = Data(source.utf8)
+            if let existing = try? Data(contentsOf: url), existing == data {
+                continue
+            }
+            try data.write(to: url, options: [.atomic])
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            changed = true
         }
-        try data.write(to: url, options: [.atomic])
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
-        return true
+        return changed
     }
 
     public static func repairDeadWorkspaceState(
