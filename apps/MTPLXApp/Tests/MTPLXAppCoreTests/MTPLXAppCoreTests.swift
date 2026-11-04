@@ -5427,7 +5427,13 @@ final class MTPLXAppCoreTests: XCTestCase {
 
     func testOpenCodeIntegrationWritesCurrentPortProviderHeadersAndNoHiddenCaps() throws {
         let url = temporaryDirectory().appendingPathComponent("opencode.json")
+        // The CLI's package layout: plugins/mtplx-session-headers beside
+        // opencode.json. Earlier app versions wrote a single file next to
+        // opencode.json and registered that instead.
         let managedPluginURL = url.deletingLastPathComponent()
+            .appendingPathComponent("plugins")
+            .appendingPathComponent("mtplx-session-headers")
+        let legacyPluginURL = url.deletingLastPathComponent()
             .appendingPathComponent("mtplx-session-headers.js")
         let existing = """
         {
@@ -5436,16 +5442,17 @@ final class MTPLXAppCoreTests: XCTestCase {
             "lmstudio": {"name": "keep me"},
             "mtplx": {"options": {"baseURL": "http://127.0.0.1:18119/v1"}}
           },
-          "plugin": ["/tmp/keep-plugin.js", "/tmp/mtplx-session-headers.js"],
+          "plugin": ["/tmp/keep-plugin.js", "/tmp/mtplx-session-headers.js", "\(legacyPluginURL.path)"],
           "model": "mtplx/stale"
         }
         """
         try FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(),
+            at: managedPluginURL,
             withIntermediateDirectories: true
         )
         try Data(existing.utf8).write(to: url)
-        try Data("stale plugin body".utf8).write(to: managedPluginURL)
+        try Data("stale plugin body".utf8).write(to: legacyPluginURL)
+        try Data("stale plugin body".utf8).write(to: managedPluginURL.appendingPathComponent("index.js"))
 
         let desktopSettingsURL = temporaryDirectory().appendingPathComponent("default.dat")
         let integration = OpenCodeIntegration(
@@ -5470,8 +5477,10 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertTrue(result.reasoningVisibilityDidChange)
 
         let root = try JSONDecoder().decode([String: JSONValue].self, from: Data(contentsOf: url))
-        // The managed plugin is installed (a stale registration under a
-        // foreign path is replaced, so the hooks never double-fire).
+        // The managed package is installed and registered once: a stale
+        // registration under a foreign path and the single file earlier
+        // versions registered are both replaced, so the V1 hooks never
+        // double-fire, and the unrelated plugin is kept.
         XCTAssertEqual(
             root["plugin"]?.arrayValue,
             [.string("/tmp/keep-plugin.js"), .string(managedPluginURL.path)]
@@ -5516,13 +5525,24 @@ final class MTPLXAppCoreTests: XCTestCase {
                 atPath: url.deletingLastPathComponent().appendingPathComponent("package.json").path
             )
         )
-        // The plugin file is managed in place: stale content is replaced
-        // with the template that replaces exactly OpenCode's own output
+        // The package is managed in place: stale content is replaced with
+        // the V1 template that replaces exactly OpenCode's own output
         // default, min(limit.output, 32,000), and strips the <=1.18.20 qwen
-        // sampler pair.
+        // sampler pair; the V2 entrypoint and package.json sit beside it.
         let pluginSource = try XCTUnwrap(
-            String(data: Data(contentsOf: managedPluginURL), encoding: .utf8)
+            String(data: Data(contentsOf: managedPluginURL.appendingPathComponent("index.js")), encoding: .utf8)
         )
+        XCTAssertEqual(pluginSource, OpenCodeIntegration.sessionHeadersPluginSource)
+        XCTAssertEqual(
+            try String(contentsOf: managedPluginURL.appendingPathComponent("server.js"), encoding: .utf8),
+            OpenCodeIntegration.sessionHeadersServerSource
+        )
+        XCTAssertEqual(
+            try String(contentsOf: managedPluginURL.appendingPathComponent("package.json"), encoding: .utf8),
+            OpenCodeIntegration.sessionHeadersPackageJSON
+        )
+        // The legacy file is left as it was, and inert: nothing registers it.
+        XCTAssertEqual(try Data(contentsOf: legacyPluginURL), Data("stale plugin body".utf8))
         XCTAssertTrue(pluginSource.contains("const mtplxInjectedOutputCap = 32000;"))
         XCTAssertTrue(pluginSource.contains("const mtplxInjectedQwenTemperature = 0.55;"))
         XCTAssertTrue(pluginSource.contains("if (output.maxOutputTokens === opencodeDefault)"))
