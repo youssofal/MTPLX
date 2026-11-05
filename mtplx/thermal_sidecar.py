@@ -6,7 +6,10 @@ the fans. The sidecar:
   1. Detaches itself from the parent's controlling terminal via ``setsid``
      so closing the terminal window or sending SIGHUP to the process
      group does NOT kill it too.
-  2. Polls the parent PID every ``poll_seconds``.
+  2. Polls the parent PID every ``poll_seconds``, and exits quietly once
+     its Max lease is released: cleared by a verified restore, or replaced
+     by a newer lease. Smart fan mode takes a lease per ramp, so a sidecar
+     that outlived its lease would linger until the server exited (#602).
   3. The moment the parent is gone (any cause: clean exit, SIGINT,
      SIGTERM, SIGHUP, SIGKILL, OOM, terminal closed, kernel panic
      followed by reboot — well, except that last one), it restores Auto
@@ -215,6 +218,17 @@ def _restore_owned_fans(
         return 1
 
 
+def _lease_released(marker_path: str | None, owner_token: str) -> bool:
+    """True once the Max lease this sidecar guards is gone.
+
+    Writers rewrite the marker in place under the marker lock, so it is read
+    under the lock too: a half-written marker must not read as a lost lease.
+    """
+
+    with _max_marker_lock(marker_path):
+        return not _max_marker_owned_by(marker_path, owner_token)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--parent-pid", type=int, required=True)
@@ -240,6 +254,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.marker,
                 args.owner_token,
             )
+        if args.owner_token and _lease_released(args.marker, args.owner_token):
+            return 0
         if (time.time() - started_at) > args.max_lifetime_seconds:
             return 0
         try:

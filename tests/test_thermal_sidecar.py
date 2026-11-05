@@ -436,3 +436,119 @@ def test_spawn_sidecar_passes_owner_token(monkeypatch, tmp_path):
     assert thermal._spawn_thermal_sidecar("lease-123") is not None
     assert captured
     assert captured[0][-2:] == ["--owner-token", "lease-123"]
+
+
+# -- #602: a sidecar exits once its lease is released --------------------------
+
+
+def _main_args(marker, owner_token: str) -> list[str]:
+    return [
+        "--parent-pid",
+        "1",
+        "--binary",
+        "/path/to/thermalforge",
+        "--marker",
+        str(marker),
+        "--owner-token",
+        owner_token,
+        "--poll-seconds",
+        "0.1",
+    ]
+
+
+def _record_fan_commands(monkeypatch) -> list[list[str]]:
+    commands: list[list[str]] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        commands.append(list(cmd))
+        return _FakeProc(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return commands
+
+
+def test_main_exits_without_restoring_once_its_lease_is_cleared(monkeypatch, tmp_path):
+    """Smart fan mode takes a lease per ramp, and a verified restore clears the
+    marker. The lease's sidecar used to keep polling the live server until it
+    exited, one leftover process per ramp (#602). It now exits on the next poll
+    and leaves the fans alone."""
+    marker = tmp_path / "active.json"
+    marker.write_text(json.dumps({"pid": 1, "owner_token": "lease-a"}))
+    fan_commands = _record_fan_commands(monkeypatch)
+    sleeps: list[float] = []
+
+    def fake_sleep(seconds):
+        if sleeps:
+            raise AssertionError("sidecar kept polling after its lease was cleared")
+        sleeps.append(seconds)
+        marker.unlink()  # the in-process restore cleared the lease
+
+    monkeypatch.setattr(thermal_sidecar, "_detach_from_terminal", lambda: None)
+    monkeypatch.setattr(thermal_sidecar, "_parent_alive", lambda pid: True)
+    monkeypatch.setattr(time, "sleep", fake_sleep)
+
+    assert thermal_sidecar.main(_main_args(marker, "lease-a")) == 0
+    assert len(sleeps) == 1  # held the lease on the first poll, saw it gone on the second
+    assert fan_commands == []
+
+
+def test_main_exits_without_restoring_when_a_newer_lease_replaces_it(monkeypatch, tmp_path):
+    marker = tmp_path / "active.json"
+    marker.write_text(json.dumps({"pid": 1, "owner_token": "lease-a"}))
+    newer = json.dumps({"pid": 1, "owner_token": "lease-b"})
+    fan_commands = _record_fan_commands(monkeypatch)
+
+    monkeypatch.setattr(thermal_sidecar, "_detach_from_terminal", lambda: None)
+    monkeypatch.setattr(thermal_sidecar, "_parent_alive", lambda pid: True)
+    replaced: list[bool] = []
+
+    def fake_sleep(seconds):
+        if replaced:
+            raise AssertionError("sidecar kept polling after a newer lease replaced it")
+        replaced.append(True)
+        marker.write_text(newer)
+
+    monkeypatch.setattr(time, "sleep", fake_sleep)
+
+    assert thermal_sidecar.main(_main_args(marker, "lease-a")) == 0
+    assert fan_commands == []
+    assert marker.read_text() == newer  # the newer lease is untouched
+
+
+def test_main_keeps_guarding_a_held_lease_until_the_parent_dies(monkeypatch, tmp_path):
+    """The lease check must not cost crash safety: while the sidecar still holds
+    the lease it keeps polling, and restores the fans when the parent dies."""
+    marker = tmp_path / "active.json"
+    marker.write_text(json.dumps({"pid": 1, "owner_token": "lease-a"}))
+    fan_commands = _record_fan_commands(monkeypatch)
+    sleeps: list[float] = []
+
+    monkeypatch.setattr(thermal_sidecar, "_detach_from_terminal", lambda: None)
+    monkeypatch.setattr(thermal_sidecar, "_parent_alive", lambda pid: len(sleeps) < 3)
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+
+    assert thermal_sidecar.main(_main_args(marker, "lease-a")) == 0
+    assert len(sleeps) == 3
+    assert fan_commands == [["sudo", "-n", "/path/to/thermalforge", "auto"]]
+    assert not marker.exists()  # verified restore cleared it
+
+
+def test_lease_check_reads_the_marker_under_the_lock(monkeypatch, tmp_path):
+    """Writers rewrite the marker in place under the marker lock; reading it
+    outside the lock could see a half-written file and exit early."""
+    import contextlib
+
+    marker = tmp_path / "active.json"
+    marker.write_text(json.dumps({"pid": 1, "owner_token": "lease-a"}))
+    locked: list[str] = []
+
+    @contextlib.contextmanager
+    def fake_lock(marker_path=None):
+        locked.append(marker_path)
+        yield
+
+    monkeypatch.setattr(thermal_sidecar, "_max_marker_lock", fake_lock)
+
+    assert thermal_sidecar._lease_released(str(marker), "lease-a") is False
+    assert thermal_sidecar._lease_released(str(marker), "lease-b") is True
+    assert locked == [str(marker), str(marker)]
