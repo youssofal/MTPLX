@@ -19,7 +19,7 @@ All notable user-facing changes to MTPLX. The format is based on
 - **Partial SSD restores work on paged and tail-owned caches** (#655, fixed in #656 by @Phydra11); they failed with `TypeError: int() ... NoneType`.
 - **A server at Metal's 499,000-buffer limit keeps serving** (#640): the guard releases idle conversations' saved state, and the 507 says the limit is a buffer count and when a restart is needed.
 - **Claude Code**: sessions follow Claude Code's session header and each subagent gets its own session (#606 by @jvmenen); side requests no longer replace the conversation's cached turn, and `X-Claude-Code-Request-Class` is read when sent; `/effort low`, `medium` and `max` apply, while the default `high` keeps the server's default (#634 by @goodbadwolf); the auto-mode safety classifier runs without thinking (#670 by @phaedrus1992, for #669).
-- **Codex**: `reasoning_summary_delivery` is accepted (#658), and a preamble with its tool call is one assistant turn (#603).
+- **Codex**: `reasoning_summary_delivery` is accepted (#658), a preamble with its tool call is one assistant turn (#603), and the Responses stream sends a status event every 5 seconds while a long prompt is read, so Codex's idle timer no longer ends the turn before the first token (#680 by @SuperMarioYL).
 - **OpenCode**: the tool-call example shows parameter syntax when any tool has parameters (#584).
 - **An answer that ends inside an unclosed reasoning block is returned when tools are declared** (#583, #588 by @jvmenen).
 - **Structured output names why llguidance cannot load**, in the refusal and in `mtplx doctor` (#643).
