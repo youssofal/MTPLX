@@ -939,12 +939,26 @@ async def _iter_sse_data(body_iterator: Any) -> AsyncIterator[str]:
             ]
             if data_lines:
                 yield "\n".join(data_lines)
+            elif frame.startswith(":"):
+                # SSE comment-only frame — the pre-first-token keep-alive
+                # from the chat lane (#358). Without this branch a long prefill
+                # puts zero bytes on the wire between response.in_progress and
+                # the first token, so strict client and proxy read-timeouts kill
+                # the connection while the engine is still computing. Forward it
+                # verbatim so stream_from_chat_sse restates it; the leading ":"
+                # is unambiguous because data payloads here are JSON or
+                # "[DONE]".
+                yield frame
     if pending.strip():
         data_lines = [
             line[6:] for line in pending.splitlines() if line.startswith("data: ")
         ]
         if data_lines:
             yield "\n".join(data_lines)
+        elif pending.startswith(":"):
+            # The body can end inside a frame; a trailing comment is still
+            # liveness, so apply the same rule instead of dropping it.
+            yield pending
 
 
 async def stream_from_chat_sse(
@@ -997,6 +1011,22 @@ async def stream_from_chat_sse(
         async for data in _iter_sse_data(body_iterator):
             if data == "[DONE]":
                 break
+            if data.startswith(":"):
+                # Keep-alive comment from the chat lane (#358), emitted only
+                # while a long prefill has produced no token yet. Forwarding
+                # the comment alone would not be enough: it resets
+                # read-timeouts but produces no event, and clients that arm
+                # a watchdog over the parsed event stream (codex-rs:
+                # timeout(idle_timeout, stream.next()) in
+                # codex-api/src/sse/responses.rs) never see a comment disarm
+                # it. Restating it as a real response.in_progress does; base()
+                # already reports that status, and event_payload keeps
+                # sequence_number monotonic.
+                yield _sse(
+                    "response.in_progress",
+                    event_payload("response.in_progress", response=base("in_progress")),
+                )
+                continue
             try:
                 chat_chunk = json.loads(data)
             except json.JSONDecodeError as exc:

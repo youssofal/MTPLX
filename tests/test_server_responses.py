@@ -622,6 +622,41 @@ def test_stream_final_usage_preserves_bounded_reasoning_tokens():
     }
 
 
+def test_stream_emits_keepalive_event_while_prefill_runs():
+    async def chat_sse():
+        yield ": keep-alive\n\n"
+        yield ": keep-alive\n\n"
+        yield (
+            'data: {"choices":[{"index":0,"delta":{"content":"Hi"},'
+            '"finish_reason":null}]}\n\n'
+        )
+        yield ('data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n')
+        yield "data: [DONE]\n\n"
+
+    async def collect() -> list[str]:
+        return [
+            frame
+            async for frame in responses_api.stream_from_chat_sse(
+                chat_sse(),
+                response_id="resp_keepalive",
+                model="mtplx",
+                response_fields={},
+                custom_tool_names=set(),
+                namespace_functions={},
+            )
+        ]
+
+    events = _responses_events("".join(asyncio.run(collect())))
+    names = [name for name, _payload in events]
+    first_in_progress = names.index("response.in_progress")
+    output_item_added = names.index("response.output_item.added")
+    keepalives = names[first_in_progress + 1 : output_item_added]
+
+    assert keepalives.count("response.in_progress") >= 1
+    assert events[-1][0] == "response.completed"
+    assert events[-1][1]["response"]["output"][0]["content"][0]["text"] == "Hi"
+
+
 def test_stream_reuses_one_created_at_for_response_lifecycle():
     async def chat_sse():
         yield (
