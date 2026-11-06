@@ -267,18 +267,21 @@ def test_the_predecessor_restores_while_its_replacement_is_written(
 
 
 def _fail_blob_write(monkeypatch) -> None:
-    original = Path.write_bytes
+    # Blobs are written through blob_io.write_file (F_NOCACHE on macOS), not
+    # Path.write_bytes, so the fault goes where cold_tier calls it.
+    original = cold_tier.write_file
     fired = []
 
-    def write_bytes(self, data):
-        if ".bin.tmp-" in self.name and not fired:
-            fired.append(self)
-            with open(self, "wb") as handle:  # a partial write, then the disk is full
+    def write_file(path, data, *args, **kwargs):
+        path = Path(path)
+        if ".bin.tmp-" in path.name and not fired:
+            fired.append(path)
+            with open(path, "wb") as handle:  # a partial write, then the disk is full
                 handle.write(bytes(data)[: len(data) // 2])
-            raise OSError(errno.ENOSPC, "No space left on device", str(self))
-        return original(self, data)
+            raise OSError(errno.ENOSPC, "No space left on device", str(path))
+        return original(path, data, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "write_bytes", write_bytes)
+    monkeypatch.setattr(cold_tier, "write_file", write_file)
 
 
 def _fail_payload_write(monkeypatch) -> None:
