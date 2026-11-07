@@ -43813,13 +43813,32 @@ def create_app(state: ServerState) -> FastAPI:
         nonstream_stop_monitor: _StopSequenceStreamMonitor | None = None
         nonstream_stop_decoder: _IncrementalTokenDecoder | None = None
         nonstream_completion_tokens = 0
+        nonstream_client_disconnected = False
         if stop_sequences:
             nonstream_stop_monitor = _StopSequenceStreamMonitor(stop_sequences)
             nonstream_stop_decoder = _IncrementalTokenDecoder(state.runtime.tokenizer)
 
-        def nonstream_stop_on_tokens(new_tokens: list[int]) -> None:
+        def mark_nonstream_client_disconnected() -> None:
+            nonlocal nonstream_client_disconnected
+            nonstream_client_disconnected = True
+
+        def nonstream_on_tokens(new_tokens: list[int]) -> None:
+            # The serial lane's only in-decode cancellation point is this
+            # per-batch callback: raise before the next batch is produced,
+            # exactly as the chat non-stream lane does. Without it a cancel
+            # trip left the decoder running to max_tokens while the route
+            # already answered cancelled: true.
             nonlocal nonstream_completion_tokens
             nonstream_completion_tokens += len(new_tokens)
+            _flight(state).on_tokens(response_id, len(new_tokens), time.perf_counter())
+            _raise_if_stream_cancelled(
+                cancel_event,
+                (
+                    "client disconnected"
+                    if nonstream_client_disconnected
+                    else "request cancelled"
+                ),
+            )
             if nonstream_stop_monitor is None or nonstream_stop_decoder is None:
                 return
             delta = nonstream_stop_decoder.feed([int(token) for token in new_tokens])
@@ -43834,7 +43853,7 @@ def create_app(state: ServerState) -> FastAPI:
         # the worker checks, and watch the transport so a legacy client that
         # gives up at its own timeout does not hold the model lock to
         # max_tokens. Deregistered in the `finally`.
-        cancel_event = Event()
+        cancel_event = _AttributedCancelEvent()
         state.dashboard.in_flight.register(
             InFlightHandle(
                 request_id=response_id,
@@ -43856,8 +43875,13 @@ def create_app(state: ServerState) -> FastAPI:
             stream=False,
         )
         disconnect_monitor_task = asyncio.create_task(
-            _monitor_request_disconnect(raw_request, cancel_event)
+            _monitor_request_disconnect(
+                raw_request,
+                cancel_event,
+                on_disconnect=mark_nonstream_client_disconnected,
+            )
         )
+        nonstream_started_s = time.perf_counter()
         try:
             generated = await asyncio.to_thread(
                 lambda: _run_generation_dispatched(
@@ -43877,13 +43901,10 @@ def create_app(state: ServerState) -> FastAPI:
                     depth=request_depth,
                     resolved_mtp_depth=effective_request_depth,
                     request_observability=request_observability,
-                    token_callback=(
-                        nonstream_stop_on_tokens
-                        if nonstream_stop_monitor is not None
-                        else None
-                    ),
+                    token_callback=nonstream_on_tokens,
                     first_token_logprobs_top_k=requested_logprobs,
                     cancel_event=cancel_event,
+                    streaming_response=False,
                 )
             )
         except _StopSequenceHit:
@@ -43908,6 +43929,25 @@ def create_app(state: ServerState) -> FastAPI:
             # Cancelled via POST /v1/mtplx/cancel or a client disconnect:
             # answer like the chat non-stream lane instead of a 500. (A stop
             # hit is a subclass and is handled above as a normal completion.)
+            # The cancel receipt is what the dashboard's cancelled count and
+            # the request log read, so the completions lane records it too.
+            cancel_reason = (
+                "client_disconnected"
+                if nonstream_client_disconnected
+                else (getattr(cancel_event, "origin", None) or "request_cancelled")
+            )
+            state.dashboard.lifetime.record_cancellation()
+            _record_stream_cancellation_metric(
+                state,
+                response_id=response_id,
+                session_id=None,
+                prompt_tokens=len(prompt_ids),
+                streamed_completion_tokens=nonstream_completion_tokens,
+                stream_started_s=nonstream_started_s,
+                reason=cancel_reason,
+                request_observability=request_observability,
+                client_disconnected=nonstream_client_disconnected,
+            )
             return JSONResponse(
                 status_code=499,
                 content=_openai_error_content(

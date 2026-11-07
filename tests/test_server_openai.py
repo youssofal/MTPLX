@@ -15767,15 +15767,25 @@ def test_completions_lane_registers_in_flight_and_cancels(monkeypatch, tmp_path)
     started = Event()
     release = Event()
 
-    def blocked_generation(_state, prompt_ids, **kwargs):
-        cancel_event = kwargs.get("cancel_event")
-        assert cancel_event is not None
+    def callback_driven_generation(_state, prompt_ids, **kwargs):
+        # The real serial lane never polls cancel_event during decode: its only
+        # in-decode cancellation point is the per-batch token callback, which
+        # raises _StreamCancelled once the cancel lands. Respond through that
+        # callback only, so a fake that stops itself cannot green the test.
+        assert kwargs.get("cancel_event") is not None
+        token_callback = kwargs.get("token_callback")
+        assert token_callback is not None, "decode path has no cancellation callback"
+        if "streaming_response" in kwargs:
+            # A non-streaming response must say so, or the engine takes the
+            # streaming path and disables blank retry.
+            assert kwargs["streaming_response"] is False
         started.set()
-        # Hold the "model lock" until the cancel lands, like a real decode.
-        while not cancel_event.is_set() and not release.wait(0.01):
-            pass
-        if cancel_event.is_set():
-            raise openai._StreamCancelled("request cancelled")
+        # Bounded so a lane that never observes the cancel finishes like a
+        # real max_tokens stop instead of hanging the test.
+        for _ in range(250):
+            token_callback([ord("x")])
+            if release.wait(0.01):
+                break
         return _fake_generation("bye")
 
     def wait_for_in_flight(seconds: float = 5.0) -> dict | None:
@@ -15787,7 +15797,7 @@ def test_completions_lane_registers_in_flight_and_cancels(monkeypatch, tmp_path)
             time.sleep(0.005)
         return None
 
-    monkeypatch.setattr(openai, "_run_generation", blocked_generation)
+    monkeypatch.setattr(openai, "_run_generation", callback_driven_generation)
 
     with TestClient(create_app(state)) as client:
         threads: list[Thread] = []
@@ -15814,32 +15824,52 @@ def test_completions_lane_registers_in_flight_and_cancels(monkeypatch, tmp_path)
             assert state.dashboard.in_flight.count() == 0
             assert streamed["response"].status_code == 200
 
-            started.clear()
-            completed: dict = {}
+            # Both non-streaming shapes: no stop (the callback used to be
+            # absent entirely) and a configured stop monitor.
+            for body in (
+                {"prompt": "hi", "max_tokens": 8},
+                {"prompt": "hi", "max_tokens": 8, "stop": ["STOP"]},
+            ):
+                started.clear()
+                completed: dict = {}
 
-            def post_nonstream() -> None:
-                completed["response"] = client.post(
-                    "/v1/completions",
-                    json={"prompt": "hi", "max_tokens": 8},
+                def post_nonstream() -> None:
+                    completed["response"] = client.post("/v1/completions", json=body)
+
+                thread = Thread(target=post_nonstream, daemon=True)
+                threads.append(thread)
+                thread.start()
+                assert started.wait(5), (
+                    f"non-streaming completion never started: {body}"
                 )
+                handle = wait_for_in_flight()
+                assert handle is not None, (
+                    f"non-streaming completion never registered in flight: {body}"
+                )
+                request_id = handle["request_id"]
+                assert request_id.startswith("cmpl-")
+                flight = client.get("/v1/mtplx/flight").json()
+                assert [item["rid"] for item in flight["active"]] == [request_id]
+                cancelled = client.post(f"/v1/mtplx/cancel/{request_id}")
+                assert cancelled.json()["cancelled"] is True
+                thread.join(10)
+                assert not thread.is_alive()
+                assert completed["response"].status_code == 499, body
+                assert state.dashboard.in_flight.count() == 0
 
-            threads.append(Thread(target=post_nonstream, daemon=True))
-            threads[-1].start()
-            assert started.wait(5), "non-streaming completion never started"
-            handle = wait_for_in_flight()
-            assert handle is not None, (
-                "non-streaming completion never registered in flight"
-            )
-            request_id = handle["request_id"]
-            assert request_id.startswith("cmpl-")
-            flight = client.get("/v1/mtplx/flight").json()
-            assert [item["rid"] for item in flight["active"]] == [request_id]
-            cancelled = client.post(f"/v1/mtplx/cancel/{request_id}")
-            assert cancelled.json()["cancelled"] is True
-            threads[-1].join(10)
-            assert not threads[-1].is_alive()
-            assert completed["response"].status_code == 499
-            assert state.dashboard.in_flight.count() == 0
+            # Chat records the same cancellation receipt; a completions cancel
+            # must not vanish from the dashboard and request log.
+            assert state.dashboard.lifetime.cancelled_total == 2
+            receipts = [
+                row
+                for row in state.last_metrics
+                if row.get("cancellation_reason") is not None
+            ]
+            assert [row["cancellation_reason"] for row in receipts] == [
+                "post_endpoint",
+                "post_endpoint",
+            ]
+            assert all(row["request_cancelled"] is True for row in receipts)
         finally:
             release.set()
             for thread in threads:
