@@ -249,7 +249,7 @@ def _served_here() -> bool:
 
 needs_the_read = pytest.mark.skipif(
     not _served_here(),
-    reason="this GPU's route keeps the stock chain (M1, M2, an Ultra): nothing to engage",
+    reason="this GPU's route keeps the stock chain (M1, M2, an M3 Ultra): nothing to engage",
 )
 
 
@@ -561,7 +561,8 @@ def test_quantized_mixers_keep_the_stock_chain():
         ("applegpu_g16s", True),  # M4 Max, and the M1-M4 rehearsal string
         ("applegpu_g17s", True),  # M5 Max
         ("applegpu_g17g", True),  # M5, M5 Pro
-        ("applegpu_g17d", False),  # Ultra: not measured
+        ("applegpu_g17d", True),  # M5 Ultra: measured
+        ("applegpu_g15d", False),  # M3 Ultra: not measured
         ("applegpu_g18p", False),  # phone class
         (None, False),
         ("mystery", False),
@@ -569,6 +570,13 @@ def test_quantized_mixers_keep_the_stock_chain():
 )
 def test_the_device_route_follows_the_library_wide_gemv(architecture, served):
     assert hc_verify_read.device_route(architecture)[0] is served
+
+
+@pytest.mark.parametrize("architecture", ["applegpu_g15d", "applegpu_g18p", "applegpu_g14s", "mystery", None])
+def test_a_refused_route_leaves_the_suffix_to_install(architecture):
+    # install() prints every reason with "; the stock chain serves" appended.
+    ok, why = hc_verify_read.device_route(architecture)
+    assert not ok and why and "stock chain serves" not in why
 
 
 @pytest.mark.parametrize(

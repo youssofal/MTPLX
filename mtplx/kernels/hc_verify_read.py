@@ -45,9 +45,9 @@ kernel repeats MLX 0.32.2's own arithmetic in the same order:
 The read therefore engages only where that is its parent: inside a compiled
 step body (the fused elementwise lowering), at 2 to 8 rows, in bfloat16 or
 float16, with unquantized mixers, on a single-die GPU of generation 15 or
-newer (where MLX serves these projections with its wide gemv; M1 and M2 run a
-tiled GEMM and keep the stock chain). An Ultra keeps the stock chain until it
-is measured. ``install`` proves every width it enables on this GPU against the
+newer or an M5 Ultra (where MLX serves these projections with its wide gemv;
+M1 and M2 run a tiled GEMM and keep the stock chain). An M3 Ultra keeps the
+stock chain until it is measured. ``install`` proves every width it enables on this GPU against the
 compiled stock chain with the model's own weights before the first verify
 trace; a difference, a build failure or a refused thread count turns the read
 off for the process with a printed reason, and the stock chain serves.
@@ -543,7 +543,9 @@ def device_route(architecture: Optional[str]) -> tuple[bool, str]:
     MLX reads the generation from the last three characters of its
     architecture string (``MLX_METAL_GPU_ARCH`` overrides it, which is what
     the M1-M4 rehearsal switch uses), and takes the wide gemv from generation
-    15. Ultra-class GPUs (``d``) are left on the stock chain until measured.
+    15. Of the Ultra-class GPUs (``d``), generation 17 (the M5 Ultra) has
+    measured this read; an earlier Ultra keeps the stock chain until it is
+    measured.
     """
 
     if not isinstance(architecture, str):
@@ -557,11 +559,13 @@ def device_route(architecture: Optional[str]) -> tuple[bool, str]:
             f"{architecture}: MLX serves 2-15 row projections with a tiled "
             "GEMM before GPU generation 15, so the stock chain is the parent"
         )
-    if klass not in {"g", "s"}:
+    if klass == "d" and generation < 17:
         return False, (
-            f"{architecture}: only single-die GPUs have measured this read; "
-            "the stock chain serves"
+            f"{architecture}: of the Ultra-class GPUs only generation 17 "
+            "(the M5 Ultra) has measured this read"
         )
+    if klass not in {"g", "s", "d"}:
+        return False, f"{architecture}: no GPU of this class has measured this read"
     return True, ""
 
 
