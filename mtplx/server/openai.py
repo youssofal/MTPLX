@@ -43429,6 +43429,32 @@ def create_app(state: ServerState) -> FastAPI:
                 top_k_field="logprobs",
             )
 
+        def register_completions_flight(
+            cancel_event: _AttributedCancelEvent, *, stream: bool
+        ) -> None:
+            # Both lanes publish the request where the cancel route and the
+            # dashboard read it; each lane deregisters and sweeps in teardown.
+            state.dashboard.in_flight.register(
+                InFlightHandle(
+                    request_id=response_id,
+                    cancel_event=cancel_event,
+                    started_s=time.time(),
+                    session_id=None,
+                    model=model,
+                    prompt_preview=_dashboard_prompt_preview(
+                        request, state.runtime.tokenizer
+                    ),
+                    prompt_tokens=len(prompt_ids),
+                )
+            )
+            _flight(state).begin(
+                response_id,
+                session_id=None,
+                model=model,
+                prompt_tokens=len(prompt_ids),
+                stream=stream,
+            )
+
         ttft_clock.mark("prologue")
         if request.stream:
             # Real incremental streaming: tokens flow through a queue from the
@@ -43439,33 +43465,12 @@ def create_app(state: ServerState) -> FastAPI:
             async def event_stream():
                 queue = _LoopFedStreamQueue(asyncio.get_running_loop())
                 cancel_event = _AttributedCancelEvent()
-                # Register this request in the dashboard's in-flight registry
-                # so external cancel (`POST /v1/mtplx/cancel/{id}`) can flip
-                # the same per-request cancel_event the worker already checks.
-                # Deregistered in the stream's `finally`.
-                state.dashboard.in_flight.register(
-                    InFlightHandle(
-                        request_id=response_id,
-                        cancel_event=cancel_event,
-                        started_s=time.time(),
-                        session_id=None,
-                        model=model,
-                        prompt_preview=_dashboard_prompt_preview(
-                            request, state.runtime.tokenizer
-                        ),
-                        prompt_tokens=len(prompt_ids),
-                    )
-                )
-                _flight(state).begin(
-                    response_id,
-                    session_id=None,
-                    model=model,
-                    prompt_tokens=len(prompt_ids),
-                    stream=True,
-                )
+                register_completions_flight(cancel_event, stream=True)
                 decoder = _IncrementalTokenDecoder(state.runtime.tokenizer)
                 stop_monitor = _StopSequenceStreamMonitor(stop_sequences)
                 streamed_completion_tokens = 0
+                stream_started_s = time.perf_counter()
+                completion_client_disconnected = False
                 generated: dict[str, Any] | None = None
                 stop_hit = False
                 owner_stall_probe = _OwnerStallProbe(deadline_s=STREAM_STALL_DEADLINE_S)
@@ -43750,6 +43755,7 @@ def create_app(state: ServerState) -> FastAPI:
                             yield "data: [DONE]\n\n"
                             return
                 except asyncio.CancelledError:
+                    completion_client_disconnected = True
                     _cancel_stream_generation(
                         cancel_event, generation_future, origin="client_disconnect"
                     )
@@ -43758,15 +43764,41 @@ def create_app(state: ServerState) -> FastAPI:
                     # Client disconnect closes the async generator; yielding
                     # from the catch-all below would raise "async generator
                     # ignored GeneratorExit". Re-raise untouched (#F36).
+                    completion_client_disconnected = True
                     raise
                 except BaseException as exc:
                     yield error_chunk(exc)
                     yield "data: [DONE]\n\n"
                     return
                 finally:
+                    # Snapshot before teardown trips the event on every exit,
+                    # and record before deregistering: the dashboard, request
+                    # log and bus event are what prove the Stop reached us.
+                    cancelled = cancel_event.is_set() and generated is None
+                    cancel_reason = (
+                        "client_disconnected"
+                        if completion_client_disconnected
+                        else (
+                            getattr(cancel_event, "origin", None)
+                            or "stream_cancelled"
+                        )
+                    )
                     _cancel_stream_generation(
                         cancel_event, generation_future, origin="stream_teardown"
                     )
+                    if cancelled:
+                        state.dashboard.lifetime.record_cancellation()
+                        _record_stream_cancellation_metric(
+                            state,
+                            response_id=response_id,
+                            session_id=None,
+                            prompt_tokens=len(prompt_ids),
+                            streamed_completion_tokens=streamed_completion_tokens,
+                            stream_started_s=stream_started_s,
+                            reason=cancel_reason,
+                            request_observability=request_observability,
+                            client_disconnected=completion_client_disconnected,
+                        )
                     state.dashboard.in_flight.deregister(response_id)
                     _flight(state).sweep(response_id)
 
@@ -43848,32 +43880,9 @@ def create_app(state: ServerState) -> FastAPI:
             if nonstream_stop_monitor.stopped:
                 raise _StopSequenceHit(nonstream_stop_monitor.matched_stop or "")
 
-        # Mirror the chat non-stream lane: register this request so external
-        # cancel (`POST /v1/mtplx/cancel/{id}`) can trip the same cancel_event
-        # the worker checks, and watch the transport so a legacy client that
-        # gives up at its own timeout does not hold the model lock to
-        # max_tokens. Deregistered in the `finally`.
+        # Also watch the transport, so a client that gives up releases the lock.
         cancel_event = _AttributedCancelEvent()
-        state.dashboard.in_flight.register(
-            InFlightHandle(
-                request_id=response_id,
-                cancel_event=cancel_event,
-                started_s=time.time(),
-                session_id=None,
-                model=model,
-                prompt_preview=_dashboard_prompt_preview(
-                    request, state.runtime.tokenizer
-                ),
-                prompt_tokens=len(prompt_ids),
-            )
-        )
-        _flight(state).begin(
-            response_id,
-            session_id=None,
-            model=model,
-            prompt_tokens=len(prompt_ids),
-            stream=False,
-        )
+        register_completions_flight(cancel_event, stream=False)
         disconnect_monitor_task = asyncio.create_task(
             _monitor_request_disconnect(
                 raw_request,
@@ -43904,7 +43913,9 @@ def create_app(state: ServerState) -> FastAPI:
                     token_callback=nonstream_on_tokens,
                     first_token_logprobs_top_k=requested_logprobs,
                     cancel_event=cancel_event,
-                    streaming_response=False,
+                    # Pre-change equivalence: the callback (and so the
+                    # engine's response_is_streaming) existed only with stop.
+                    streaming_response=nonstream_stop_monitor is not None,
                 )
             )
         except _StopSequenceHit:

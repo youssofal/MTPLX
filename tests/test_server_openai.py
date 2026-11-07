@@ -15766,6 +15766,8 @@ def test_completions_lane_registers_in_flight_and_cancels(monkeypatch, tmp_path)
     state.flight = openai.FlightRecorder(str(tmp_path / "flight.jsonl"))
     started = Event()
     release = Event()
+    # What the handler tells the engine about this response's shape, in order.
+    engine_streaming_flags: list[object] = []
 
     def callback_driven_generation(_state, prompt_ids, **kwargs):
         # The real serial lane never polls cancel_event during decode: its only
@@ -15775,10 +15777,7 @@ def test_completions_lane_registers_in_flight_and_cancels(monkeypatch, tmp_path)
         assert kwargs.get("cancel_event") is not None
         token_callback = kwargs.get("token_callback")
         assert token_callback is not None, "decode path has no cancellation callback"
-        if "streaming_response" in kwargs:
-            # A non-streaming response must say so, or the engine takes the
-            # streaming path and disables blank retry.
-            assert kwargs["streaming_response"] is False
+        engine_streaming_flags.append(kwargs.get("streaming_response", "absent"))
         started.set()
         # Bounded so a lane that never observes the cancel finishes like a
         # real max_tokens stop instead of hanging the test.
@@ -15857,9 +15856,17 @@ def test_completions_lane_registers_in_flight_and_cancels(monkeypatch, tmp_path)
                 assert completed["response"].status_code == 499, body
                 assert state.dashboard.in_flight.count() == 0
 
-            # Chat records the same cancellation receipt; a completions cancel
-            # must not vanish from the dashboard and request log.
-            assert state.dashboard.lifetime.cancelled_total == 2
+            # Hard by shape: the stream lane passes no flag (its token callback
+            # already derives response_is_streaming=True), and each
+            # non-streaming shape keeps its pre-change answer — False without a
+            # stop monitor (no callback used to exist), True with one (which
+            # used to pass nonstream_stop_on_tokens).
+            assert engine_streaming_flags == ["absent", False, True]
+
+            # The streaming cancel recorded its receipt too: every cancelled
+            # completion, streamed or not, must reach cancelled_total and the
+            # request log instead of only stopping the model.
+            assert state.dashboard.lifetime.cancelled_total == 3
             receipts = [
                 row
                 for row in state.last_metrics
@@ -15868,9 +15875,59 @@ def test_completions_lane_registers_in_flight_and_cancels(monkeypatch, tmp_path)
             assert [row["cancellation_reason"] for row in receipts] == [
                 "post_endpoint",
                 "post_endpoint",
+                "post_endpoint",
             ]
             assert all(row["request_cancelled"] is True for row in receipts)
         finally:
             release.set()
             for thread in threads:
                 thread.join(10)
+
+
+def test_completions_nonstream_keeps_its_blank_retry_answer_per_shape(monkeypatch):
+    """A non-streaming completion's 200 body reports the blank-retry answer the
+    engine derived before this lane gained a cancel-aware token callback.
+
+    The engine treats a set token_callback as "this is a stream", which
+    suppresses blank retries. The lane now always passes a callback, so the
+    handler must state the shape explicitly: True with a stop monitor (the only
+    shape that used to pass a callback), False without one. Otherwise `stop`
+    requests silently regain up to --blank-retry-attempts replays and the
+    public server_blank_retry_suppressed stat flips.
+    """
+
+    state = _fake_streaming_session_state()
+    state.draft_sampler = None
+    state.requests_completed = 0
+
+    def fake_generate_mtpk(_runtime, prompt_ids, **kwargs):
+        tokens = [ord(char) for char in "OK"]
+        callback = kwargs.get("token_callback")
+        if callback is not None:
+            callback(tokens)
+        return SimpleNamespace(
+            tokens=tokens,
+            text="OK",
+            stats=SimpleNamespace(
+                to_dict=lambda: {
+                    "prompt_eval_time_s": 0.001,
+                    "generated_tokens": len(tokens),
+                    "elapsed_s": 0.01,
+                    "tok_s": 100.0,
+                }
+            ),
+            final_state=None,
+        )
+
+    monkeypatch.setattr(openai, "generate_mtpk", fake_generate_mtpk)
+
+    with TestClient(create_app(state)) as client:
+        for body, expected_suppressed in (
+            ({"prompt": "hi", "max_tokens": 2}, False),
+            ({"prompt": "hi", "max_tokens": 2, "stop": ["STOP"]}, True),
+        ):
+            response = client.post("/v1/completions", json=body)
+            assert response.status_code == 200, body
+            stats = response.json()["mtplx_stats"]
+            assert stats["server_blank_retry_suppressed"] is expected_suppressed, body
+            assert stats["server_blank_retries"] == 0, body
