@@ -1263,7 +1263,7 @@ _DECLARED_MODULES_LOWERED = {
 # deliberately absent: its runnability is decided by the pinned-artifact
 # geometry/sidecar gate on its catalog row (supply-chain fence), never by
 # model_type alone.
-_INTREE_MODEL_TYPES = {"deepseek_v4", "qwen4_exp", "qwen4_exp_text"}
+_INTREE_MODEL_TYPES = {"deepseek_v4", "qwen4_exp", "qwen4_exp_text", "minicpmv4_7"}
 
 # Families whose catalog family_gate is an artifact-integrity fence (pinned
 # geometry + pinned sidecars). A gate failure here refuses outright and is

@@ -59,3 +59,40 @@ def test_explicit_split_full_attention_chunk_one_gets_safe_default(monkeypatch):
     assert stats["split_full_attn_chunk_size_defaulted"] is True
     assert attn._mtplx_split_full_attention_explicit_enabled is True
     assert attn._mtplx_split_full_attention_chunk_size == 2048
+
+
+def test_position_kwargs_delegate_to_original_attention():
+    from mtplx.attention_split import _install_split_attention_hook
+
+    class PositionAttention:
+        def __call__(
+            self, x, mask=None, cache=None, position_ids=None, position_embeddings=None
+        ):
+            assert mask == "mask" and cache == "cache"
+            assert position_ids == "canvas" and position_embeddings == "rotary"
+            return x + 1
+
+    attention = PositionAttention()
+    assert _install_split_attention_hook(attention)
+    assert (
+        attention(
+            2,
+            mask="mask",
+            cache="cache",
+            position_ids="canvas",
+            position_embeddings="rotary",
+        )
+        == 3
+    )
+
+
+def test_no_position_kwargs_preserve_original_attention():
+    from mtplx.attention_split import _install_split_attention_hook
+
+    class PlainAttention:
+        def __call__(self, x, mask=None, cache=None):
+            return x
+
+    attention = PlainAttention()
+    assert _install_split_attention_hook(attention)
+    assert attention(7) == 7
