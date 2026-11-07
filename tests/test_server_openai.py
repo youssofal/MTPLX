@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import re
 import time
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -15752,3 +15752,95 @@ def test_live_app_ownership_applies_to_actual_request_policy(monkeypatch, hint):
 
     assert client.post("/v1/mtplx/settings", json={"managed_client_controls": "typo"}).status_code == 400
     assert state.args.managed_client_controls == "app"
+
+
+def test_completions_lane_registers_in_flight_and_cancels(monkeypatch, tmp_path):
+    """The /v1/completions lane is visible to the in-flight registry.
+
+    Both branches must register the request (like the chat lane does) so
+    POST /v1/mtplx/cancel/{id} can flip the worker's cancel_event and the
+    dashboard can show the request; without that a completion runs to
+    max_tokens and the cancel route always answers cancelled: false.
+    """
+    state = _fake_streaming_session_state()
+    state.flight = openai.FlightRecorder(str(tmp_path / "flight.jsonl"))
+    started = Event()
+    release = Event()
+
+    def blocked_generation(_state, prompt_ids, **kwargs):
+        cancel_event = kwargs.get("cancel_event")
+        assert cancel_event is not None
+        started.set()
+        # Hold the "model lock" until the cancel lands, like a real decode.
+        while not cancel_event.is_set() and not release.wait(0.01):
+            pass
+        if cancel_event.is_set():
+            raise openai._StreamCancelled("request cancelled")
+        return _fake_generation("bye")
+
+    def wait_for_in_flight(seconds: float = 5.0) -> dict | None:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            handles = state.dashboard.in_flight.snapshot()
+            if handles:
+                return handles[0]
+            time.sleep(0.005)
+        return None
+
+    monkeypatch.setattr(openai, "_run_generation", blocked_generation)
+
+    with TestClient(create_app(state)) as client:
+        threads: list[Thread] = []
+        try:
+            streamed: dict = {}
+
+            def post_stream() -> None:
+                streamed["response"] = client.post(
+                    "/v1/completions",
+                    json={"prompt": "hi", "max_tokens": 8, "stream": True},
+                )
+
+            threads.append(Thread(target=post_stream, daemon=True))
+            threads[-1].start()
+            assert started.wait(5), "streaming completion never started"
+            handle = wait_for_in_flight()
+            assert handle is not None, "streaming completion never registered in flight"
+            request_id = handle["request_id"]
+            assert request_id.startswith("cmpl-")
+            cancelled = client.post(f"/v1/mtplx/cancel/{request_id}")
+            assert cancelled.json()["cancelled"] is True
+            threads[-1].join(10)
+            assert not threads[-1].is_alive()
+            assert state.dashboard.in_flight.count() == 0
+            assert streamed["response"].status_code == 200
+
+            started.clear()
+            completed: dict = {}
+
+            def post_nonstream() -> None:
+                completed["response"] = client.post(
+                    "/v1/completions",
+                    json={"prompt": "hi", "max_tokens": 8},
+                )
+
+            threads.append(Thread(target=post_nonstream, daemon=True))
+            threads[-1].start()
+            assert started.wait(5), "non-streaming completion never started"
+            handle = wait_for_in_flight()
+            assert handle is not None, (
+                "non-streaming completion never registered in flight"
+            )
+            request_id = handle["request_id"]
+            assert request_id.startswith("cmpl-")
+            flight = client.get("/v1/mtplx/flight").json()
+            assert [item["rid"] for item in flight["active"]] == [request_id]
+            cancelled = client.post(f"/v1/mtplx/cancel/{request_id}")
+            assert cancelled.json()["cancelled"] is True
+            threads[-1].join(10)
+            assert not threads[-1].is_alive()
+            assert completed["response"].status_code == 499
+            assert state.dashboard.in_flight.count() == 0
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(10)

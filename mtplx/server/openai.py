@@ -43439,6 +43439,30 @@ def create_app(state: ServerState) -> FastAPI:
             async def event_stream():
                 queue = _LoopFedStreamQueue(asyncio.get_running_loop())
                 cancel_event = _AttributedCancelEvent()
+                # Register this request in the dashboard's in-flight registry
+                # so external cancel (`POST /v1/mtplx/cancel/{id}`) can flip
+                # the same per-request cancel_event the worker already checks.
+                # Deregistered in the stream's `finally`.
+                state.dashboard.in_flight.register(
+                    InFlightHandle(
+                        request_id=response_id,
+                        cancel_event=cancel_event,
+                        started_s=time.time(),
+                        session_id=None,
+                        model=model,
+                        prompt_preview=_dashboard_prompt_preview(
+                            request, state.runtime.tokenizer
+                        ),
+                        prompt_tokens=len(prompt_ids),
+                    )
+                )
+                _flight(state).begin(
+                    response_id,
+                    session_id=None,
+                    model=model,
+                    prompt_tokens=len(prompt_ids),
+                    stream=True,
+                )
                 decoder = _IncrementalTokenDecoder(state.runtime.tokenizer)
                 stop_monitor = _StopSequenceStreamMonitor(stop_sequences)
                 streamed_completion_tokens = 0
@@ -43743,6 +43767,8 @@ def create_app(state: ServerState) -> FastAPI:
                     _cancel_stream_generation(
                         cancel_event, generation_future, origin="stream_teardown"
                     )
+                    state.dashboard.in_flight.deregister(response_id)
+                    _flight(state).sweep(response_id)
 
                 if generated is None:
                     yield error_chunk(RuntimeError("generation ended without a result"))
@@ -43803,6 +43829,35 @@ def create_app(state: ServerState) -> FastAPI:
             if nonstream_stop_monitor.stopped:
                 raise _StopSequenceHit(nonstream_stop_monitor.matched_stop or "")
 
+        # Mirror the chat non-stream lane: register this request so external
+        # cancel (`POST /v1/mtplx/cancel/{id}`) can trip the same cancel_event
+        # the worker checks, and watch the transport so a legacy client that
+        # gives up at its own timeout does not hold the model lock to
+        # max_tokens. Deregistered in the `finally`.
+        cancel_event = Event()
+        state.dashboard.in_flight.register(
+            InFlightHandle(
+                request_id=response_id,
+                cancel_event=cancel_event,
+                started_s=time.time(),
+                session_id=None,
+                model=model,
+                prompt_preview=_dashboard_prompt_preview(
+                    request, state.runtime.tokenizer
+                ),
+                prompt_tokens=len(prompt_ids),
+            )
+        )
+        _flight(state).begin(
+            response_id,
+            session_id=None,
+            model=model,
+            prompt_tokens=len(prompt_ids),
+            stream=False,
+        )
+        disconnect_monitor_task = asyncio.create_task(
+            _monitor_request_disconnect(raw_request, cancel_event)
+        )
         try:
             generated = await asyncio.to_thread(
                 lambda: _run_generation_dispatched(
@@ -43828,6 +43883,7 @@ def create_app(state: ServerState) -> FastAPI:
                         else None
                     ),
                     first_token_logprobs_top_k=requested_logprobs,
+                    cancel_event=cancel_event,
                 )
             )
         except _StopSequenceHit:
@@ -43848,6 +43904,25 @@ def create_app(state: ServerState) -> FastAPI:
                     "stop_sequence_matched": (nonstream_stop_monitor.matched_stop),
                 },
             )
+        except _StreamCancelled as exc:
+            # Cancelled via POST /v1/mtplx/cancel or a client disconnect:
+            # answer like the chat non-stream lane instead of a 500. (A stop
+            # hit is a subclass and is handled above as a normal completion.)
+            return JSONResponse(
+                status_code=499,
+                content=_openai_error_content(
+                    str(exc),
+                    status_code=499,
+                    code="request_cancelled",
+                    error_type="request_cancelled",
+                ),
+            )
+        finally:
+            disconnect_monitor_task.cancel()
+            with suppress(asyncio.CancelledError, TimeoutError):
+                await asyncio.wait_for(disconnect_monitor_task, timeout=0.25)
+            state.dashboard.in_flight.deregister(response_id)
+            _flight(state).sweep(response_id)
         finish_reason = str(generated.get("finish_reason") or "stop")
         if stop_sequences and not generated.get("stats", {}).get("stop_sequence_hit"):
             # Post-trim safety net for matches the incremental monitor cannot
