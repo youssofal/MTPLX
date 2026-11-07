@@ -1429,16 +1429,29 @@ class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
         Routing and experts are the parent's own ops, in its order.
         """
 
-        gates = mx.softmax(self.gate(x), axis=-1, precise=True)
-        k = self.top_k
-        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
-        scores = mx.take_along_axis(gates, inds, axis=-1)
-        if self.norm_topk_prob:
-            scores = scores / scores.sum(axis=-1, keepdims=True)
+        inds, scores = self._verify_route(x, getattr(self, "_mtplx_route_tail", None))
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
         shared_y = attention_gate(self.shared_expert(x), self.shared_expert_gate(x))
         return y + shared_y
+
+    def _verify_route(self, x: mx.array, tail=None) -> tuple[mx.array, mx.array]:
+        logits = self.gate(x)
+        k = self.top_k
+        if (
+            tail is not None
+            and logits.dtype == mx.float16
+            and x.size == 4 * x.shape[-1]
+            and in_compiled_step_body()
+        ):
+            inds, scores = tail(logits.reshape(4, -1))
+            return inds.reshape(*x.shape[:-1], k), scores.reshape(*x.shape[:-1], k)
+        gates = mx.softmax(logits, axis=-1, precise=True)
+        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        scores = mx.take_along_axis(gates, inds, axis=-1)
+        if self.norm_topk_prob:
+            scores = scores / scores.sum(axis=-1, keepdims=True)
+        return inds, scores
 
     def _prefill_call(self, x: mx.array) -> mx.array:
         """The parent's forward with the combine tail as one kernel.

@@ -16,6 +16,7 @@ from .models.qwen4_exp import (
     verify_capture_scope,
 )
 
+_ROUTE_KERNEL_FP16_ENV = "MTPLX_QWEN4_ROUTE_KERNEL_FP16"
 _GDN_ROW_NAMES = ("qkv", "q", "k", "v", "a", "b")
 _PLE_ROW_NAMES = ("ple_hidden", "ple_ids")
 
@@ -410,6 +411,12 @@ def install_qwen4_fixed_verify_route(runtime: Any) -> dict[str, Any]:
     from mtplx.kernels import qsa_pooled_row
 
     runtime._mtplx_qsa_pooled_row = qsa_pooled_row.install(inner)
+
+    from mtplx.kernels import qwen4_m4_route
+    from mtplx.runtime_options import env_bool
+
+    if env_bool(_ROUTE_KERNEL_FP16_ENV, default=False):
+        qwen4_m4_route.install_tail_fp16(inner)
 
     return {"installed": True, "linear_layers": len(linear), "rows": 4}
 
