@@ -12,6 +12,8 @@ tool search) are rejected because MTPLX cannot execute them.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import re
@@ -20,6 +22,7 @@ import uuid
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Mapping
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict
 
@@ -118,6 +121,75 @@ def _text(value: Any, *, field_name: str) -> str:
             raise unsupported(f"{field_name}[{index}].text must be a string")
         chunks.append(text)
     return "".join(chunks)
+
+
+def _content_to_chat(value: Any, *, field_name: str) -> str | list[dict[str, Any]]:
+    """Preserve text-only bytes; translate structured images for the vision path.
+
+    Fetching/decoding remains in the existing chat runtime, with its existing
+    limits and policy. File IDs cannot be resolved by this stateless bridge.
+    """
+    if not isinstance(value, list):
+        return _text(value, field_name=field_name)
+    parts: list[dict[str, Any]] = []
+    text_run: list[str] = []
+    saw_image = False
+
+    def flush_text() -> None:
+        if text_run:
+            parts.append({"type": "text", "text": "".join(text_run)})
+            text_run.clear()
+
+    for index, part in enumerate(value):
+        name = f"{field_name}[{index}]"
+        if not isinstance(part, Mapping):
+            raise unsupported(f"{name} must be a text or input_image part")
+        part_type = str(part.get("type") or "").strip().lower()
+        if part_type != "input_image":
+            # Use the original strict text parser, including its errors.
+            text_run.append(_text([part], field_name=name))
+            continue
+        unknown = set(part) - {"type", "image_url", "detail", "file_id"}
+        if unknown:
+            raise unsupported(f"{name} input_image has unsupported key(s): "
+                              + ", ".join(sorted(unknown)))
+        if part.get("file_id") is not None:
+            raise unsupported(f"{name}.file_id is not supported; use image_url")
+        url = part.get("image_url")
+        if not isinstance(url, str) or not url or any(c.isspace() for c in url):
+            raise unsupported(f"{name}.image_url must be a non-empty URL string without whitespace")
+        if url.startswith("data:"):
+            header, separator, payload = url.partition(",")
+            if (not separator or not re.fullmatch(r"data:image/[A-Za-z0-9.+-]+;base64", header)
+                    or not payload):
+                raise unsupported(f"{name}.image_url must be a base64 image data URL")
+            try:
+                base64.b64decode(payload, validate=True)
+            except (ValueError, binascii.Error):
+                raise unsupported(f"{name}.image_url has invalid base64 image data") from None
+        else:
+            try:
+                parsed = urlsplit(url)
+                valid = url.startswith(("http://", "https://")) and bool(parsed.hostname)
+                _ = parsed.port  # Validate numeric port/range even when unused.
+                valid = valid and parsed.username is None and parsed.password is None
+            except ValueError:
+                valid = False
+            if not valid:
+                raise unsupported(f"{name}.image_url must be an http(s) URL or base64 image data URL")
+        detail = part.get("detail")
+        if detail is not None and (not isinstance(detail, str) or detail not in {"auto", "low", "high"}):
+            raise unsupported(f"{name}.detail must be auto, low, or high")
+        image_url: dict[str, Any] = {"url": url}
+        if detail is not None:
+            image_url["detail"] = detail
+        flush_text()
+        parts.append({"type": "image_url", "image_url": image_url})
+        saw_image = True
+    if not saw_image:
+        return "".join(text_run)
+    flush_text()
+    return parts
 
 
 def _arguments(value: Any, *, field_name: str) -> str:
@@ -413,7 +485,7 @@ def _input_to_chat_messages(
                 {
                     "role": "tool",
                     "tool_call_id": call_id,
-                    "content": _text(
+                    "content": _content_to_chat(
                         item.get("output"), field_name=f"input[{index}].output"
                     ),
                 }
@@ -429,7 +501,7 @@ def _input_to_chat_messages(
         messages.append(
             {
                 "role": role,
-                "content": _text(
+                "content": (_content_to_chat if role == "user" else _text)(
                     item.get("content"), field_name=f"input[{index}].content"
                 ),
             }
