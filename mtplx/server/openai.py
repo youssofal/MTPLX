@@ -18726,15 +18726,21 @@ def _dashboard_publish_progress(
     state: "ServerState",
     *,
     request_id: str,
-    payload: dict[str, Any],
+    payload: dict[str, Any] | Callable[[], dict[str, Any]],
+    completion_tokens: int | None = None,
 ) -> dict[str, Any] | None:
-    """Forward a streaming progress chunk into the dashboard bus + registry."""
+    """Forward a decode progress frame into the dashboard bus + registry.
+
+    ``payload`` may be a callable that builds the frame; it then runs only
+    when the gate lets the frame through, and ``completion_tokens`` feeds the
+    gate. Non-streaming requests publish from the model thread this way."""
 
     dashboard = getattr(state, "dashboard", None)
     if dashboard is None:
         return None
     decision_started_s = time.perf_counter()
-    completion_tokens = int(payload.get("completion_tokens") or 0)
+    if completion_tokens is None:
+        completion_tokens = int(payload.get("completion_tokens") or 0)
     try:
         should_publish = dashboard.progress_events.should_publish(
             request_id,
@@ -18750,6 +18756,8 @@ def _dashboard_publish_progress(
             )
             return None
 
+        if callable(payload):
+            payload = payload()
         enriched = dict(payload)
         # The decoder already publishes these counters at ~1 Hz. Progress
         # used to omit them, clearing the app's waterfall on every new turn.
@@ -25065,6 +25073,86 @@ def _stream_progress_payload(
     if phase_meter is not None:
         payload.update(phase_meter.snapshot(now_s))
     return payload
+
+
+class _DashboardDecodeProgress:
+    """Live decode progress of one request, for the flight recorder and the
+    dashboard.
+
+    Streaming and non-streaming requests run the same generation; only the
+    HTTP layer differs. Progress used to be published from the SSE drain
+    loop only, so a non-streaming request reached the dashboard when it
+    completed: during a 25 s non-streaming decode the metrics stream carried
+    122 snapshots, 8 prefill events and 0 progress events, and the live
+    gauge stayed on the previous request. Both variants now feed each token
+    batch through ``on_tokens``.
+
+    For a non-streaming request ``on_tokens`` runs on the model thread, once
+    per decode step. The progress gate decides first and the frame is built
+    only when it is due (every 0.2 s plus a few token milestones), so a
+    throttled step costs a few counter updates and two short locks.
+    """
+
+    def __init__(self, state: Any, request_id: str) -> None:
+        self._state = state
+        self._request_id = request_id
+        self.completion_tokens = 0
+        self.decode_started_s: float | None = None
+        # Rate of the phase the answer is in (reasoning, answer, tool call),
+        # for the live gauge; receipts keep the cumulative rate. Only the
+        # streaming path tells the meter the phase, from the text it drains.
+        self.phase_meter = PhaseRateMeter()
+        self._frame_s = 0.0
+        self._frame_session_id: str | None = None
+
+    def on_tokens(
+        self,
+        count: int,
+        timestamp_s: float,
+        *,
+        session_id: str | None,
+    ) -> dict[str, Any] | None:
+        """Record a token batch produced at ``timestamp_s`` (perf_counter).
+
+        Returns the published progress frame, or None when the gate held it
+        back; the streaming path forwards the frame to its client."""
+
+        if count <= 0:
+            return None
+        recorder = _flight(self._state)
+        if self.decode_started_s is None:
+            self.decode_started_s = timestamp_s
+            dashboard = getattr(self._state, "dashboard", None)
+            handle = (
+                dashboard.in_flight.get(self._request_id)
+                if dashboard is not None
+                else None
+            )
+            recorder.note_decode_started(
+                self._request_id, getattr(handle, "prefill_state", None)
+            )
+        self.completion_tokens += count
+        recorder.on_tokens(self._request_id, count, timestamp_s)
+        self.phase_meter.observe(count, timestamp_s)
+        self._frame_s = timestamp_s
+        self._frame_session_id = session_id
+        return _dashboard_publish_progress(
+            self._state,
+            request_id=self._request_id,
+            payload=self._frame,
+            completion_tokens=self.completion_tokens,
+        )
+
+    def _frame(self) -> dict[str, Any]:
+        payload = _stream_progress_payload(
+            completion_tokens=self.completion_tokens,
+            decode_started_s=self.decode_started_s,
+            now_s=self._frame_s,
+            phase_meter=self.phase_meter,
+        )
+        payload["request_id"] = self._request_id
+        payload["session_id"] = self._frame_session_id
+        return payload
 
 
 class _OwnerStallProbe:
@@ -39257,14 +39345,19 @@ def create_app(state: ServerState) -> FastAPI:
                     stats.setdefault(key, request_observability[key])
             return generated
 
+        nonstream_progress = _DashboardDecodeProgress(state, response_id)
+
         def _nonstream_on_tokens(new_tokens: list[int]) -> None:
             nonlocal nonstream_completion_tokens
             nonstream_completion_tokens += len(new_tokens)
             # The flight recorder learned about tokens only from the SSE
             # drain loop, so a non-streaming request decoding 24,000 tokens
             # showed as "prefill, 0 tokens, 0 tok/s" on /v1/mtplx/flight and
-            # the dashboard for its whole life. Same hook, same clock.
-            _flight(state).on_tokens(response_id, len(new_tokens), time.perf_counter())
+            # the dashboard for its whole life. Same hook, same clock, and
+            # the same live progress frames a stream publishes.
+            nonstream_progress.on_tokens(
+                len(new_tokens), time.perf_counter(), session_id=session_id
+            )
             cancel_message = (
                 "client disconnected"
                 if nonstream_client_disconnected
@@ -41128,9 +41221,7 @@ def create_app(state: ServerState) -> FastAPI:
                 streamed_token_times: list[float] = []
                 streamed_progress_tokens = 0
                 streamed_decode_started_s: float | None = None
-                # Rate of the phase the answer is in (reasoning, answer, tool
-                # call), for the live gauge; receipts keep the cumulative rate.
-                stream_phase_meter = PhaseRateMeter()
+                stream_progress = _DashboardDecodeProgress(state, response_id)
                 streamed_assistant_tool_calls: list[dict[str, Any]] | None = None
                 streamed_tool_deltas_emitted = False
                 early_tool_cancel_used = False
@@ -41697,33 +41788,11 @@ def create_app(state: ServerState) -> FastAPI:
                                 )
                                 if streamed_decode_started_s is None:
                                     streamed_decode_started_s = token_timestamp_s
-                                    _flight(state).note_decode_started(
-                                        response_id,
-                                        getattr(
-                                            in_flight_handle, "prefill_state", None
-                                        ),
-                                    )
                                 streamed_progress_tokens += len(stream_tokens)
-                                _flight(state).on_tokens(
-                                    response_id,
+                                published_progress = stream_progress.on_tokens(
                                     len(stream_tokens),
                                     token_timestamp_s,
-                                )
-                                stream_phase_meter.observe(
-                                    len(stream_tokens), token_timestamp_s
-                                )
-                                progress_payload = _stream_progress_payload(
-                                    completion_tokens=streamed_progress_tokens,
-                                    decode_started_s=streamed_decode_started_s,
-                                    now_s=token_timestamp_s,
-                                    phase_meter=stream_phase_meter,
-                                )
-                                progress_payload["request_id"] = response_id
-                                progress_payload["session_id"] = session_id
-                                published_progress = _dashboard_publish_progress(
-                                    state,
-                                    request_id=response_id,
-                                    payload=progress_payload,
+                                    session_id=session_id,
                                 )
                                 if (
                                     published_progress is not None
@@ -41777,7 +41846,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     ):
                                         yield mark_sse_sent(chunk)
                             if stream_tokens:
-                                stream_phase_meter.note_phase(
+                                stream_progress.phase_meter.note_phase(
                                     decode_phase_for_fields(
                                         (field for field, _text in pieces),
                                         tool_call_open=bool(
