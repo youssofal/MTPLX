@@ -34,7 +34,7 @@ dependencies = [
   # but its output is not bit-identical to 0.32.2 on Flash-Next, and the app
   # bundles 0.32.2, so pip and Homebrew now install what the app runs.
   "mlx==0.32.2; sys_platform == 'darwin' and platform_machine == 'arm64'",
-  "mlx-lm>=0.31,<0.32; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "mlx-lm>=0.31,<0.33; sys_platform == 'darwin' and platform_machine == 'arm64'",
   # transformers 5.13.0 changed AutoTokenizer.register to require a config
   # class as the key; mlx-lm 0.31.x still registers by name
   # ("NewlineTokenizer") and crashes at import, killing every fresh install
