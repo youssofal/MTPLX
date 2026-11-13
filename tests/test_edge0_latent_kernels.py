@@ -59,33 +59,42 @@ def test_swiglu_is_bit_identical(dtype, lead):
     assert mx.array_equal(latent_swiglu(split, ids, scalars, I, dtype), want).item()
 
 
-def _q4(n, k, seed):
+def _q4(n, k, seed, bits=4):
+    """A random affine ``bits``-bit ``[n, k]`` matrix (group 32), ggml-style float16 scales and ``-2**(bits-1)`` biases."""
     rng = np.random.default_rng(seed)
-    w = mx.array(rng.integers(0, 2**32, (n, k // 8), dtype=np.uint64).astype(np.uint32))
+    w = mx.array(rng.integers(0, 2**32, (n, k * bits // 32), dtype=np.uint64).astype(np.uint32))
     s = mx.array(rng.uniform(0.002, 0.02, (n, k // 32)).astype(np.float16).astype(np.float32))
-    return w, s, -8 * s
+    return w, s, -(2 ** (bits - 1)) * s
 
 
+# (G, L, H, groups used): 120B-like and 145B-like latent widths (a K block straddles two groups at 4 bits),
+# and L below the K block, so one block spans four groups, only an inner one of them used (block 1: groups 4..7)
+_GEOMS = [(4, 256, 512, (0, 2)), (2, 1280, 512, (1,)), (2, 1792, 512, (0,)), (8, 128, 512, (0, 5))]
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("geom", _GEOMS)
 @pytest.mark.parametrize("xdt", [mx.float32, mx.bfloat16])
 @pytest.mark.parametrize("sdt", [mx.float32, mx.float16])
-def test_masked_qmv_matches_quantized_matmul(xdt, sdt):
-    G, L, H = 4, 256, 512
-    groups = mx.array([[2, 2, 0, 2, 0, 2, 2, 0, 0, 2]], dtype=mx.int32)
-    used = {0, 2}
-    w, s, b = _q4(G * L, H, 1)
+def test_masked_qmv_matches_quantized_matmul(xdt, sdt, geom, bits):
+    G, L, H, used = geom
+    groups = mx.array([[used[j % len(used)] for j in range(10)]], dtype=mx.int32)
+    used = set(used)
+    w, s, b = _q4(G * L, H, 1, bits)
     x = mx.random.normal((1, H)).astype(xdt)
-    assert masked_qmv_eligible(x, w, s, 4, 32, L, "rows")
-    want = mx.quantized_matmul(x.astype(mx.float32), w, s, b, transpose=True, group_size=32, bits=4).reshape(G, L)
+    assert masked_qmv_eligible(x, w, s, bits, 32, L, "rows")
+    want = mx.quantized_matmul(x.astype(mx.float32), w, s, b, transpose=True, group_size=32, bits=bits).reshape(G, L)
     got = masked_qmv(x, w, s.astype(sdt), b.astype(sdt), groups, by="rows", latent=L, group_size=32, out_dtype=mx.float32).reshape(G, L)
     for g in range(G):
         if g in used:
             assert mx.array_equal(got[g], want[g]).item()
         else:
             assert (got[g] == 0).all().item()
-    w, s, b = _q4(H, G * L, 2)
+    w, s, b = _q4(H, G * L, 2, bits)
     mask = mx.array([1.0 if g in used else 0.0 for g in range(G)])[:, None]
     z = (mx.random.normal((G, L)) * mask).reshape(1, G * L)
-    want = mx.quantized_matmul(z, w, s, b, transpose=True, group_size=32, bits=4)
+    assert masked_qmv_eligible(z, w, s, bits, 32, L, "cols")
+    want = mx.quantized_matmul(z, w, s, b, transpose=True, group_size=32, bits=bits)
     got = masked_qmv(z, w, s.astype(sdt), b.astype(sdt), groups, by="cols", latent=L, group_size=32, out_dtype=mx.float32)
     assert mx.array_equal(got, want).item()
 
@@ -93,7 +102,10 @@ def test_masked_qmv_matches_quantized_matmul(xdt, sdt):
 def test_masked_qmv_eligibility():
     w, s, _ = _q4(1024, 512, 3)
     assert not masked_qmv_eligible(mx.zeros((2, 512)), w, s, 4, 32, 256, "rows")  # two rows
-    assert not masked_qmv_eligible(mx.zeros((1, 512)), w, s, 8, 32, 256, "rows")  # 8-bit
+    assert not masked_qmv_eligible(mx.zeros((1, 512)), w, s, 8, 32, 256, "rows")  # 4-bit words named 8-bit
+    w8, s8, _ = _q4(1024, 512, 3, bits=8)
+    assert masked_qmv_eligible(mx.zeros((1, 512)), w8, s8, 8, 32, 256, "rows")
+    assert not masked_qmv_eligible(mx.zeros((1, 512)), w8, s8, 6, 32, 256, "rows")  # other widths: MLX's path
     assert not masked_qmv_eligible(mx.zeros((1, 512)), w, s, 4, 32, 100, "rows")  # rows not group-aligned
     assert not masked_qmv_eligible(mx.zeros((1, 512)), w, s.astype(mx.bfloat16), 4, 32, 256, "rows")
 
@@ -101,10 +113,10 @@ def test_masked_qmv_eligibility():
 # --------------------------------------------------------------------------- the block on kernel-eligible shapes
 
 
-@pytest.fixture(scope="module")
-def wide():
-    # H and G*L multiples of 512: the one-token D/U kernels engage
-    return Synth(seed=5, H=512, L=128, F=64, G=4, E=32, K=6, IS=64, labels=np.arange(32, dtype=np.int32) % 4)
+@pytest.fixture(scope="module", params=["q4", "q8"])
+def wide(request):
+    # H and G*L multiples of 512: the one-token D/U kernels engage; D/U 4-bit (120B) or 8-bit (145B)
+    return Synth(seed=5, H=512, L=128, F=64, G=4, E=32, K=6, IS=64, labels=np.arange(32, dtype=np.int32) % 4, dense=request.param)
 
 
 @pytest.mark.parametrize("seed", [1, 2, 3])
@@ -141,26 +153,27 @@ def test_layout_changes_keep_the_bits(wide, dtype, S, monkeypatch):
         assert _rel(np.array(got.astype(mx.float32)), np.array(want.astype(mx.float32), np.float64)) < tol
 
 
+@pytest.mark.parametrize("bits", [4, 8])
 @pytest.mark.parametrize("by", ["rows", "cols"])
 @pytest.mark.parametrize("xdt", [mx.float32, mx.bfloat16])
 @pytest.mark.parametrize("M", [1, 2, 3, 4, 8])
-def test_masked_qmv_rows_is_one_row_per_row(by, xdt, M):
+def test_masked_qmv_rows_is_one_row_per_row(by, xdt, M, bits):
     """Each row of the few-rows kernel is bit-identical to the one-row kernel on that row."""
     G, L, H = 4, 256, 512
     rng = np.random.default_rng(100 + M)
     groups = mx.array(rng.integers(0, G, (M, 10)).astype(np.int32))
     groups = mx.concatenate([groups[:, :1] * 0 + 1, groups[:, 1:] % 2 * 3], axis=1) if M == 3 else groups  # rows using few groups
     if by == "rows":
-        w, s, b = _q4(G * L, H, 4)
+        w, s, b = _q4(G * L, H, 4, bits)
         x = mx.array(rng.standard_normal((M, H)).astype(np.float32)).astype(xdt)
     else:
-        w, s, b = _q4(H, G * L, 5)
+        w, s, b = _q4(H, G * L, 5, bits)
         used = np.zeros((M, G, 1), np.float32)
         for m, row in enumerate(np.array(groups)):
             used[m, sorted(set(row.tolist()))] = 1.0
         x = (mx.array(rng.standard_normal((M, G, L)).astype(np.float32)) * mx.array(used)).reshape(M, G * L).astype(xdt)
     for sdt in (mx.float32, mx.float16):
-        assert masked_qmv_eligible(x, w, s.astype(sdt), 4, 32, L, by, max_rows=FEW_ROWS_MAX)
+        assert masked_qmv_eligible(x, w, s.astype(sdt), bits, 32, L, by, max_rows=FEW_ROWS_MAX)
         got = masked_qmv_rows(x, w, s.astype(sdt), b.astype(sdt), groups, by=by, latent=L, group_size=32, out_dtype=xdt)
         assert got.shape == (M, w.shape[0]) and got.dtype == xdt
         for m in range(M):

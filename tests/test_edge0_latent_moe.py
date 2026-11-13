@@ -24,7 +24,7 @@ import pytest
 
 from mtplx.edge0 import latent_convert as lc
 from mtplx.edge0 import reference as ref
-from mtplx.edge0.ggml_quants import KVALUES_FP4, decode_q4_0, ue4m3_to_float
+from mtplx.edge0.ggml_quants import KVALUES_FP4, decode_q4_0, decode_q8_0, ue4m3_to_float
 from mtplx.models.edge0_latent_moe import LatentGeometry, LatentMoeBlock, float32_logits, top_k_lowest_id
 from tests import edge0_synth as syn
 
@@ -46,7 +46,7 @@ def _rel(got, want) -> float:
 class Synth:
     """Small layer: ggml-coded weights, converted for the block and decoded for the reference."""
 
-    def __init__(self, seed=0, *, H=128, L=128, F=64, G=3, E=24, K=4, IS=64, labels=None, router=None):
+    def __init__(self, seed=0, *, H=128, L=128, F=64, G=3, E=24, K=4, IS=64, labels=None, router=None, dense="q4"):
         rng = np.random.default_rng(seed)
         self.H, self.L, self.F, self.G, self.E, self.K = H, L, F, G, E, K
         arrays, floats = {}, {}
@@ -60,14 +60,17 @@ class Synth:
         scal = np.stack([rng.uniform(0.02, 0.05, E), rng.uniform(0.02, 0.05, E), rng.uniform(5e-5, 3e-4, E)], 1).astype(np.float32)
         arrays["experts.scalars"] = scal
 
-        def q4(r, c):
-            raw = syn.pack_q4_0(rng.integers(0, 16, r * c, dtype=np.uint8), rng.uniform(0.002, 0.02, r * c // 32).astype(np.float16))
-            return raw, decode_q4_0(raw)
+        def qd(r, c):  # ggml Q4_0 (Edge0-120B's D/U) or Q8_0 (Edge0-145B's)
+            if dense == "q4":
+                raw = syn.pack_q4_0(rng.integers(0, 16, r * c, dtype=np.uint8), rng.uniform(0.002, 0.02, r * c // 32).astype(np.float16))
+                return raw, decode_q4_0(raw)
+            raw = syn.pack_q8_0(rng.integers(-128, 128, r * c), rng.uniform(0.0002, 0.002, r * c // 32).astype(np.float16))
+            return raw, decode_q8_0(raw)
 
-        d_raw, d = q4(G * L, H)
-        u_raw, u = q4(G * H, L)
-        arrays.update({f"dense_d.{k}": v for k, v in lc.dense_to_affine(d_raw, "q4", G * L, H).items()})
-        arrays.update({f"dense_u.{k}": v for k, v in lc.regroup_u(lc.dense_to_affine(u_raw, "q4", G * H, L), G).items()})
+        d_raw, d = qd(G * L, H)
+        u_raw, u = qd(G * H, L)
+        arrays.update({f"dense_d.{k}": v for k, v in lc.dense_to_affine(d_raw, dense, G * L, H).items()})
+        arrays.update({f"dense_u.{k}": v for k, v in lc.regroup_u(lc.dense_to_affine(u_raw, dense, G * H, L), G).items()})
         if labels is None:  # unbalanced: one expert in group 0, three in group 2, the rest in group 1
             labels = np.ones(E, np.int32)
             labels[rng.permutation(E)[:4]] = [0, 2, 2, 2]

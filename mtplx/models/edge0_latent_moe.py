@@ -41,7 +41,10 @@ Decode speed (2026-11-13; the 120B at T=1, 48 layers, M5 Max, bf16: 17.4 ->
   ``s_down`` scalars) are one Metal dispatch each instead of ~40 small ops;
 - for one token, ``D`` computes only the rows of the groups its routes use and
   ``U`` skips the 512-column blocks that are all unused groups (exact zeros);
-  on the 120B a token's 10 routes touch 4.3 of 8 groups on average;
+  on the 120B a token's 10 routes touch 4.3 of 8 groups on average. The
+  kernels take 4- and 8-bit D/U: Edge0-145B ships them as Q8_0 (8-bit), and
+  before the kernels handled 8 bits its D and U ran the full MLX matmul over
+  all 8 groups (12.1 -> 4.3 ms per token over 48 layers, step 33.4 -> 27.5 ms);
 - after loading, ``gate_proj``/``up_proj`` are stacked into one
   ``gate_up_proj`` (one routed matmul instead of two) and the D/U scales and
   biases are held in float16 where every value round-trips (fewer bytes).

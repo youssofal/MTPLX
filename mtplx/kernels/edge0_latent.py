@@ -171,29 +171,33 @@ __all__ = ["latent_combine", "latent_combine_reference", "latent_swiglu", "laten
 
 # -- D and U on the groups a token routes to ---------------------------------------
 #
-# Single-row affine 4-bit GEMVs that skip the work of groups no route of the
-# token selected. The dot product is MLX's ``qmv_fast_impl`` (quantized.h,
+# Single-row affine 4- or 8-bit GEMVs that skip the work of groups no route of
+# the token selected. The dot product is MLX's ``qmv_fast_impl`` (quantized.h,
 # MLX 0.32.2) line for line with float accumulation: 2 simdgroups x 4 rows
-# per threadgroup, 16 values per lane, K blocks of 512, x pre-divided by
-# 16/256/4096 so nibble products need no shifts, one ``simd_sum`` per row. So a
-# row it computes is bit-identical to ``mx.quantized_matmul`` on float32
-# inputs (x of another dtype is converted exactly on load; scales/biases may
-# be float16 when that is lossless, which changes no value).
+# per threadgroup, two 32-bit packs per lane (16 values at 4 bits, 8 at 8
+# bits), K blocks of 32 lanes' worth (512 / 256 values), and at 4 bits x
+# pre-divided by 16/256/4096 so nibble products need no shifts; one
+# ``simd_sum`` per row. So a row it computes is bit-identical to
+# ``mx.quantized_matmul`` on float32 inputs (x of another dtype is converted
+# exactly on load; scales/biases may be float16 when that is lossless, which
+# changes no value). Edge0-120B's D/U are 4-bit (ggml Q4_0), Edge0-145B's
+# 8-bit (Q8_0).
 #
 # D (rows): output rows of group g are computed only if g is used; the rest
-# are written as zeros (nothing reads them). U (columns): a 512-wide K block
-# whose columns all fall in unused groups is skipped; those inputs are exact
-# zeros (the combine writes 0.0 there), so skipping them leaves every sum
-# unchanged (up to the sign of an exactly-zero sum).
+# are written as zeros (nothing reads them). U (columns): a K block is skipped
+# when every group its columns fall in is unused (a block may span any number
+# of groups); those inputs are exact zeros (the combine writes 0.0 there), so
+# skipping them leaves every sum unchanged (up to the sign of an exactly-zero
+# sum).
 
 _QMV_HEADER = """
 using namespace metal;
 constant constexpr int SIMD = 32;
-constant constexpr int PACK_FACTOR = 8;
+constant constexpr int PACK_FACTOR = 32 / BITS;                // values per 32-bit pack
 constant constexpr int PACKS_PER_THREAD = 2;
 constant constexpr int BYTES_PER_PACK = 4;
-constant constexpr int VPT = PACK_FACTOR * PACKS_PER_THREAD;   // 16 values per lane
-constant constexpr int BLOCK = VPT * SIMD;                     // 512
+constant constexpr int VPT = PACK_FACTOR * PACKS_PER_THREAD;   // values per lane: 16 (4-bit), 8 (8-bit)
+constant constexpr int BLOCK = VPT * SIMD;                     // 512 (4-bit), 256 (8-bit)
 constant constexpr int RPS = 4;                                // rows per simdgroup
 constant constexpr int NSG = 2;
 constant constexpr int SCALE_STEP = GS / VPT;
@@ -201,26 +205,40 @@ constant constexpr int SCALE_STEP = GS / VPT;
 template <typename XT>
 inline float load_x(const device XT* x, thread float* xt) {
   float sum = 0;
-  for (int i = 0; i < VPT; i += 4) {
-    const float a = float(x[i]), b = float(x[i + 1]), c = float(x[i + 2]), d = float(x[i + 3]);
-    sum += a + b + c + d;
-    xt[i] = a;
-    xt[i + 1] = b / 16.0f;
-    xt[i + 2] = c / 256.0f;
-    xt[i + 3] = d / 4096.0f;
+  if (BITS == 4) {
+    for (int i = 0; i < VPT; i += 4) {
+      const float a = float(x[i]), b = float(x[i + 1]), c = float(x[i + 2]), d = float(x[i + 3]);
+      sum += a + b + c + d;
+      xt[i] = a;
+      xt[i + 1] = b / 16.0f;
+      xt[i + 2] = c / 256.0f;
+      xt[i + 3] = d / 4096.0f;
+    }
+  } else {  // 8 bits
+    for (int i = 0; i < VPT; i++) {
+      const float a = float(x[i]);
+      sum += a;
+      xt[i] = a;
+    }
   }
   return sum;
 }
 
-inline float qdot4(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
-  const device uint16_t* ws = (const device uint16_t*)w;
+inline float qdot(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
   float accum = 0;
-  for (int i = 0; i < (VPT / 4); i++) {
-    accum +=
-        (xt[4 * i] * (ws[i] & 0x000f) +
-         xt[4 * i + 1] * (ws[i] & 0x00f0) +
-         xt[4 * i + 2] * (ws[i] & 0x0f00) +
-         xt[4 * i + 3] * (ws[i] & 0xf000));
+  if (BITS == 4) {
+    const device uint16_t* ws = (const device uint16_t*)w;
+    for (int i = 0; i < (VPT / 4); i++) {
+      accum +=
+          (xt[4 * i] * (ws[i] & 0x000f) +
+           xt[4 * i + 1] * (ws[i] & 0x00f0) +
+           xt[4 * i + 2] * (ws[i] & 0x0f00) +
+           xt[4 * i + 3] * (ws[i] & 0xf000));
+    }
+  } else {  // 8 bits
+    for (int i = 0; i < VPT; i++) {
+      accum += xt[i] * w[i];
+    }
   }
   return scale * accum + sum * bias;
 }
@@ -229,6 +247,14 @@ template <typename P>
 inline bool group_used(P groups, uint m, int g) {  // groups may sit in device or constant memory
   for (int j = 0; j < TOP_K; ++j) {
     if (groups[m * TOP_K + j] == g) return true;
+  }
+  return false;
+}
+
+template <typename P>
+inline bool block_used(P groups, uint m, int k) {  // any group the K block [k, k + BLOCK) touches
+  for (int g = k / LAT; g <= (k + BLOCK - 1) / LAT; ++g) {
+    if (group_used(groups, m, g)) return true;
   }
   return false;
 }
@@ -256,7 +282,7 @@ COL_SKIP
       const device uint8_t* wl = ws + row * in_w;
       const float s = float(sc[row * in_g]);
       const float b = float(bs[row * in_g]);
-      result[row] += qdot4(wl, xt, s, b, sum);
+      result[row] += qdot(wl, xt, s, b, sum);
     }
     ws += BLOCK * BYTES_PER_PACK / PACK_FACTOR;
     sc += BLOCK / GS;
@@ -281,7 +307,7 @@ _ROW_SKIP = """
 """
 
 _COL_SKIP = """
-    if (!group_used(groups, m, k / LAT) && !group_used(groups, m, (k + BLOCK - 1) / LAT)) {
+    if (!block_used(groups, m, k)) {
       ws += BLOCK * BYTES_PER_PACK / PACK_FACTOR;
       sc += BLOCK / GS;
       bs += BLOCK / GS;
@@ -292,17 +318,17 @@ _COL_SKIP = """
 
 
 @lru_cache(maxsize=None)
-def _masked_qmv_kernel(kind: str, k_in: int, n_out: int, latent: int, top_k: int, group_size: int):
+def _masked_qmv_kernel(kind: str, k_in: int, n_out: int, latent: int, top_k: int, group_size: int, bits: int = 4):
     header = (
         f"constant constexpr int K = {k_in};\nconstant constexpr int N = {n_out};\n"
         f"constant constexpr int LAT = {latent};\nconstant constexpr int TOP_K = {top_k};\n"
-        f"constant constexpr int GS = {group_size};\n" + _QMV_HEADER
+        f"constant constexpr int GS = {group_size};\nconstant constexpr int BITS = {bits};\n" + _QMV_HEADER
     )
     body = _QMV_BODY.replace("ROW_SKIP", _ROW_SKIP if kind == "rows" else "").replace(
         "COL_SKIP", _COL_SKIP if kind == "cols" else ""
     )
     return mx.fast.metal_kernel(
-        name=f"mtplx_edge0_latent_qmv_{kind}_k{k_in}_n{n_out}_l{latent}_t{top_k}_g{group_size}",
+        name=f"mtplx_edge0_latent_qmv_{kind}_k{k_in}_n{n_out}_l{latent}_t{top_k}_g{group_size}_b{bits}",
         input_names=["x", "w", "scales", "biases", "groups"],
         output_names=["y"],
         header=header,
@@ -311,9 +337,9 @@ def _masked_qmv_kernel(kind: str, k_in: int, n_out: int, latent: int, top_k: int
 
 
 def masked_qmv_eligible(x: mx.array, w: mx.array, scales: mx.array, bits: int, group_size: int, latent: int, by: str, *, max_rows: int = 1) -> bool:
-    """Shapes the masked GEMVs serve: up to ``max_rows`` rows (one for :func:`masked_qmv`), 4-bit,
-    K a multiple of 512, groups aligned to the 8-row tiles."""
-    if bits != 4 or group_size not in (32, 64, 128) or x.dtype not in (mx.float32, mx.bfloat16, mx.float16):
+    """Shapes the masked GEMVs serve: up to ``max_rows`` rows (one for :func:`masked_qmv`), 4- or 8-bit,
+    K a multiple of 512 (MLX's fast GEMV, which the kernels reproduce), groups aligned to the 8-row tiles."""
+    if bits not in (4, 8) or group_size not in (32, 64, 128) or x.dtype not in (mx.float32, mx.bfloat16, mx.float16):
         return False
     if scales.dtype not in (mx.float32, mx.float16):
         return False
@@ -322,11 +348,15 @@ def masked_qmv_eligible(x: mx.array, w: mx.array, scales: mx.array, bits: int, g
         rows *= int(d)
     k_in = int(x.shape[-1])
     n_out = int(w.shape[0])
-    if not 1 <= rows <= max_rows or k_in % 512 or n_out % 8 or int(w.shape[1]) * 8 != k_in:
+    if not 1 <= rows <= max_rows or k_in % 512 or n_out % 8 or int(w.shape[1]) * (32 // bits) != k_in:
         return False
     if max_rows > 1 and (n_out if by == "rows" else k_in) > 32 * latent:  # masked_qmv_rows keeps a 32-bit group mask
         return False
     return (n_out % latent == 0 and latent % 8 == 0) if by == "rows" else k_in % latent == 0
+
+
+def _bits_of(w: mx.array, k_in: int) -> int:
+    return 32 * int(w.shape[1]) // k_in
 
 
 def masked_qmv(x, w, scales, biases, groups, *, by: str, latent: int, group_size: int, out_dtype: mx.Dtype) -> mx.array:
@@ -340,7 +370,7 @@ def masked_qmv(x, w, scales, biases, groups, *, by: str, latent: int, group_size
     k_in = int(x.shape[-1])
     n_out = int(w.shape[0])
     top_k = int(groups.shape[-1])
-    kernel = _masked_qmv_kernel(by, k_in, n_out, int(latent), top_k, int(group_size))
+    kernel = _masked_qmv_kernel(by, k_in, n_out, int(latent), top_k, int(group_size), _bits_of(w, k_in))
     (y,) = kernel(
         inputs=[x.reshape(1, k_in), w, scales, biases, groups.reshape(1, top_k).astype(mx.int32)],
         template=[("XT", x.dtype), ("ST", scales.dtype), ("OutT", out_dtype)],
@@ -404,7 +434,7 @@ _QMV_ROWS_BODY = """
       for (int row = 0; row < RPS; row++) {
         const float s = float(sc[row * in_g]);
         const float b = float(bs[row * in_g]);
-        result[m][row] += qdot4(ws + row * in_w, xt, s, b, sum);
+        result[m][row] += qdot(ws + row * in_w, xt, s, b, sum);
       }
     }
     ws += BLOCK * BYTES_PER_PACK / PACK_FACTOR;
@@ -421,25 +451,28 @@ _QMV_ROWS_BODY = """
   }
 """
 
-_ROWS_COL_NEEDED = "((((gmask[m] >> uint(k / LAT)) | (gmask[m] >> uint((k + BLOCK - 1) / LAT))) & 1u) != 0u)"
+# the bits of groups k / LAT .. (k + BLOCK - 1) / LAT (at most 32 groups, see masked_qmv_eligible)
+_ROWS_COL_NEEDED = (
+    "((gmask[m] & ((0xFFFFFFFFu >> uint(31 - (k + BLOCK - 1) / LAT)) & (0xFFFFFFFFu << uint(k / LAT)))) != 0u)"
+)
 
 #: Row counts the few-rows kernels are built for (a verify forward is 2..depth+1 rows).
 FEW_ROWS_MAX = 8
 
 
 @lru_cache(maxsize=None)
-def _masked_qmv_rows_kernel(kind: str, rows: int, k_in: int, n_out: int, latent: int, top_k: int, group_size: int):
+def _masked_qmv_rows_kernel(kind: str, rows: int, k_in: int, n_out: int, latent: int, top_k: int, group_size: int, bits: int = 4):
     header = (
         f"constant constexpr int K = {k_in};\nconstant constexpr int N = {n_out};\n"
         f"constant constexpr int LAT = {latent};\nconstant constexpr int TOP_K = {top_k};\n"
         f"constant constexpr int GS = {group_size};\nconstant constexpr int M = {rows};\n"
-        + _QMV_HEADER
+        f"constant constexpr int BITS = {bits};\n" + _QMV_HEADER
     )
     row_used = "(((gmask[m] >> uint(out_row / LAT)) & 1u) != 0u)" if kind == "rows" else "true"
     col_needed = _ROWS_COL_NEEDED if kind == "cols" else "true"
     body = _QMV_ROWS_BODY.replace("ROW_USED", row_used).replace("COL_NEEDED", col_needed)
     return mx.fast.metal_kernel(
-        name=f"mtplx_edge0_latent_qmv_{kind}_m{rows}_k{k_in}_n{n_out}_l{latent}_t{top_k}_g{group_size}",
+        name=f"mtplx_edge0_latent_qmv_{kind}_m{rows}_k{k_in}_n{n_out}_l{latent}_t{top_k}_g{group_size}_b{bits}",
         input_names=["x", "w", "scales", "biases", "groups"],
         output_names=["y"],
         header=header,
@@ -454,7 +487,7 @@ def masked_qmv_rows(x, w, scales, biases, groups, *, by: str, latent: int, group
     rows = int(x.size // k_in)
     n_out = int(w.shape[0])
     top_k = int(groups.shape[-1])
-    kernel = _masked_qmv_rows_kernel(by, rows, k_in, n_out, int(latent), top_k, int(group_size))
+    kernel = _masked_qmv_rows_kernel(by, rows, k_in, n_out, int(latent), top_k, int(group_size), _bits_of(w, k_in))
     (y,) = kernel(
         inputs=[x.reshape(rows, k_in), w, scales, biases, groups.reshape(rows, top_k).astype(mx.int32)],
         template=[("XT", x.dtype), ("ST", scales.dtype), ("OutT", out_dtype)],

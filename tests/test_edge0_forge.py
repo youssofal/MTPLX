@@ -164,8 +164,20 @@ def test_real_pack_accounts_exactly():
     acc = forge.account(out, cfg)
     state = json.loads((out / forge.STATE_NAME).read_text())
     assert state["complete"] and acc["parameters"] == state["accounting"]["parameters"]
-    assert cfg["edge0_latent"]["latent_dim"] == 1280 and cfg["text_config"]["num_hidden_layers"] == 48
-    assert len(list(out.glob("model-latent-*.safetensors"))) == 48
+    e0 = cfg["edge0_latent"]
+    known_latent = {"edge0-120b-fp4": 1280, "edge0-145b-fp4": 1792}
+    if e0.get("model_name") in known_latent:
+        assert e0["latent_dim"] == known_latent[e0["model_name"]]
+    assert e0["dense_bits"] == {"q4": 4, "q8": 8}[e0["dense_format"]]
+    layers = cfg["text_config"]["num_hidden_layers"]
+    assert layers == 48 and len(list(out.glob("model-latent-*.safetensors"))) == layers
+    # every layer's D is [n_groups * latent_dim, hidden * dense_bits / 32] (uint32 words), read from the headers
+    from safetensors import safe_open
+
+    with safe_open(str(out / "model-latent-000.safetensors"), framework="numpy") as f:
+        name = next(k for k in f.keys() if k.endswith("dense_d.weight"))
+        rows, words = f.get_slice(name).get_shape()
+    assert rows == e0["n_groups"] * e0["latent_dim"] and words * 32 // e0["dense_bits"] == cfg["text_config"]["hidden_size"]
 
 
 # --------------------------------------------------------------------------- the MTP draft head

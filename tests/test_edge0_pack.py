@@ -187,61 +187,109 @@ def test_inconsistent_hidden_size(synth, tmp_path):
         Edge0Pack(dst)
 
 
-# -- real 120B folder ----------------------------------------------------------------
+# -- real Edge0 folder (120B or 145B) ---------------------------------------------------
+#
+# Geometry comes from the folder's own files; the known values are keyed by
+# model. Each was computed from the raw bytes by a decoder that shares no code
+# with mtplx.edge0 (the scratch oracle that test_real_blob_and_dense_match_scratch_oracle
+# below re-implements), not read back from Edge0Pack.
+
+KNOWN = {
+    "edge0-120b-fp4": {
+        "latent_dim": 1280,
+        "dense": "q4",
+        "expert0": {"s_gate": 0.0030459, "s_up": 0.0030459, "s_down": 8.2107e-5, "rms": (0.1117, 0.0918, 0.0314)},
+        "dense0_rms": (0.00855, 0.00997),
+    },
+    "edge0-145b-fp4": {
+        "latent_dim": 1792,
+        "dense": "q8",
+        "expert0": {"s_gate": 0.0030459, "s_up": 0.0030459, "s_down": 7.8837e-5, "rms": (0.09484, 0.07814, 0.02840)},
+        "dense0_rms": (0.01060, 0.00989),
+    },
+}
 
 
 def _rms(a):
     return float(np.sqrt((a.astype(np.float64) ** 2).mean()))
 
 
+def _meta() -> dict:
+    return json.loads((Path(REAL) / "model.json").read_text())
+
+
 @real_only
 def test_real_pack_geometry_and_known_values():
     p = Edge0Pack(Path(REAL))
-    assert (p.n_layers, p.n_experts, p.hidden, p.expert_ff, p.latent_dim, p.n_groups) == (48, 512, 2560, 640, 1280, 8)
-    assert p.expert_format == "NVFP4" and p.default_dense_format == "q4" and p.model_name == "edge0-120b-fp4"
+    meta = _meta()
+    assert (p.n_layers, p.n_experts, p.latent_dim) == (meta["layers"], meta["experts"], meta["latent_dim"])
+    assert (p.n_layers, p.n_experts, p.hidden, p.expert_ff, p.n_groups) == (48, 512, 2560, 640, 8)  # the Flash Next shell
+    assert p.expert_format == "NVFP4" and p.model_name == meta["model_name"]
+    assert p.default_dense_format == "q" + meta["env"]["STRATA_LATENT_DENSE_FMT"]
     assert p.labels.shape == (48, 512) and p.labels.min() == 0 and p.labels.max() == 7
     assert np.bincount(p.labels[0], minlength=8).tolist() != [64] * 8  # groups are not balanced
-    ex = p.expert(0, 0)
-    assert ex.s_gate == pytest.approx(0.0030459, rel=1e-3) and ex.s_up == pytest.approx(0.0030459, rel=1e-3)
-    assert ex.s_down == pytest.approx(8.2107e-5, rel=1e-3)
-    g, u, d = ex.scaled()
-    assert _rms(g) == pytest.approx(0.1117, rel=2e-3)
-    assert _rms(u) == pytest.approx(0.0918, rel=2e-3)
-    assert _rms(d) == pytest.approx(0.0314, rel=2e-3)
     assert p.skeleton.metadata["general.architecture"] == "qwen4exp" and len(p.skeleton.tensors) == 1079
+    known = KNOWN.get(p.model_name)
+    if known is None:
+        pytest.skip(f"no known values recorded for {p.model_name}")
+    assert p.latent_dim == known["latent_dim"] and p.default_dense_format == known["dense"]
+    k = known["expert0"]
+    ex = p.expert(0, 0)
+    assert ex.s_gate == pytest.approx(k["s_gate"], rel=1e-3) and ex.s_up == pytest.approx(k["s_up"], rel=1e-3)
+    assert ex.s_down == pytest.approx(k["s_down"], rel=1e-3)
+    assert [_rms(a) for a in ex.scaled()] == pytest.approx(list(k["rms"]), rel=2e-3)
 
 
 @real_only
 def test_real_dense_layer0_known_rms_and_q4_q8_agree():
     p = Edge0Pack(Path(REAL))
+    G, L, H = p.n_groups, p.latent_dim, p.hidden
     d, u = p.dense_d(0), p.dense_u(0)
-    assert d.shape == (8, 1280, 2560) and u.shape == (8, 2560, 1280)
-    assert _rms(d) == pytest.approx(0.00855, rel=5e-3) and _rms(u) == pytest.approx(0.00997, rel=5e-3)
+    assert d.shape == (G, L, H) and u.shape == (G, H, L)
+    known = KNOWN.get(p.model_name)
+    if known is not None:
+        assert [_rms(d), _rms(u)] == pytest.approx(list(known["dense0_rms"]), rel=5e-3)
+    other = "q8" if p.default_dense_format == "q4" else "q4"
+    if not (Path(REAL) / f"latent_dense_{other}.bin").exists():
+        pytest.skip(f"no latent_dense_{other}.bin to compare against")
     d8 = p.dense_d(0, "q8")[:1, :64]
-    assert np.linalg.norm(d[:1, :64] - d8) / np.linalg.norm(d8) < 0.2
+    d4 = p.dense_d(0, "q4")[:1, :64]
+    assert np.linalg.norm(d4 - d8) / np.linalg.norm(d8) < 0.2
+
+
+def _oracle_dense(path: Path, fmt: str, layer: int, G: int, L: int, H: int) -> np.ndarray:
+    """D of ``layer`` from latent_dense_{fmt}.bin: ggml Q4_0 (18-byte blocks) or Q8_0 (34-byte blocks) of 32 values."""
+    nb = 18 if fmt == "q4" else 34
+    d_bytes = G * L * (H // 32) * nb  # U has as many bytes (H x L per group)
+    raw = np.memmap(path / f"latent_dense_{fmt}.bin", dtype=np.uint8, mode="r", offset=layer * 2 * d_bytes, shape=(d_bytes,))
+    blocks = np.asarray(raw).reshape(-1, nb)
+    dd = blocks[:, :2].copy().view("<f2").astype(np.float32)
+    q = blocks[:, 2:]
+    if fmt == "q4":
+        vals = (np.concatenate([q & 15, q >> 4], 1).astype(np.float32) - 8) * dd
+    else:
+        vals = q.view(np.int8).astype(np.float32) * dd
+    return vals.reshape(G, L, H)
 
 
 @real_only
-def test_real_blob_and_dense_match_scratch_oracle():
+@pytest.mark.parametrize("fmt", ["q4", "q8"])
+def test_real_blob_and_dense_match_scratch_oracle(fmt):
     # independent decoders in the style of the phase0 scratch scripts (row/block reshape, no shared code)
     p = Edge0Pack(Path(REAL))
+    G, L, H, ff = p.n_groups, p.latent_dim, p.hidden, p.expert_ff
     blob = np.asarray(p.expert_blob(47, 511))
     kv = np.array(syn.KV, np.float32) * 0.5
-    a = blob[:460800].reshape(640, 20, 36)
+    a = blob[: ff * (L // 64) * 36].reshape(ff, L // 64, 36)
     sc = a[:, :, :4].astype(np.int32)
     e, m = sc >> 3, sc & 7
     d_ = np.where(e == 0, m * 2.0**-9, (1 + m / 8.0) * 2.0 ** (e - 7)).astype(np.float32)
     d_[(sc == 0) | (sc == 0x7F)] = 0
-    qs = a[:, :, 4:].reshape(640, 20, 4, 8)
-    want = (np.concatenate([kv[qs & 15], kv[qs >> 4]], -1) * d_[..., None]).reshape(640, 1280)
+    qs = a[:, :, 4:].reshape(ff, L // 64, 4, 8)
+    want = (np.concatenate([kv[qs & 15], kv[qs >> 4]], -1) * d_[..., None]).reshape(ff, L)
     np.testing.assert_array_equal(p.expert(47, 511).gate, want)
 
+    if not (Path(REAL) / f"latent_dense_{fmt}.bin").exists():
+        pytest.skip(f"no latent_dense_{fmt}.bin")
     layer = 5
-    d_bytes = 8 * 1280 * 80 * 18
-    off = layer * 2 * d_bytes
-    raw = np.memmap(Path(REAL) / "latent_dense_q4.bin", dtype=np.uint8, mode="r", offset=off, shape=(d_bytes,))
-    blocks = np.asarray(raw).reshape(-1, 18)
-    dd = blocks[:, :2].copy().view("<f2").astype(np.float32)
-    q = blocks[:, 2:]
-    ref = ((np.concatenate([q & 15, q >> 4], 1).astype(np.float32) - 8) * dd).reshape(8, 1280, 2560)
-    np.testing.assert_array_equal(p.dense_d(layer), ref)
+    np.testing.assert_array_equal(p.dense_d(layer, fmt), _oracle_dense(Path(REAL), fmt, layer, G, L, H))
