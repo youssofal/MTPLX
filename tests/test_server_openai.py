@@ -5897,6 +5897,43 @@ def test_stream_cancellation_before_the_prefill_completed_leaves_the_outcome_unk
         assert latest[key] is None, key
 
 
+def test_stream_cancellation_metric_carries_the_restore_landing():
+    state = _fake_streaming_session_state()
+    _publish_completed_prefill(
+        state,
+        "chatcmpl_cancel_landing",
+        cached_tokens=92636,
+        cache_hit=True,
+        cache_source="ram",
+        session_restore_served={
+            "landing": {
+                "matched_tokens": 92636,
+                "restore_point_tokens": 92636,
+                "checkpoint_gap_tokens": 0,
+                "partial": False,
+                "origin": "own",
+            }
+        },
+    )
+    openai._record_stream_cancellation_metric(
+        state,
+        response_id="chatcmpl_cancel_landing",
+        session_id="ses_cancel",
+        prompt_tokens=92819,
+        streamed_completion_tokens=0,
+        stream_started_s=time.perf_counter() - 10.0,
+        reason="client_disconnected",
+        request_observability={},
+        client_disconnected=True,
+    )
+
+    latest = state.last_metrics[-1]
+    assert latest["prefix_restore_matched_tokens"] == 92636
+    assert latest["prefix_restore_point_tokens"] == 92636
+    assert latest["prefix_restore_origin"] == "own"
+    assert latest["ssd_restore_bytes"] == 0
+
+
 def test_a_completed_request_releases_its_prefill_outcome():
     state = _fake_streaming_session_state()
     _publish_completed_prefill(state, "chatcmpl_done", cached_tokens=10, cache_hit=True)
