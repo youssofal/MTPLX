@@ -780,6 +780,10 @@ def load(
             is_qwen4_exp_mtp_config,
         )
         from .qwen3_5_mtp_patch import inject_qwen3_5_mtp_support
+        from .edge0.mtp import (
+            inject_edge0_latent_mtp_support,
+            is_edge0_latent_mtp_config,
+        )
 
         if is_deepseek_v4_mtp_config(config):
             # Native draft head: the block binds through the ordinary load path
@@ -799,6 +803,12 @@ def load(
             mtp_enabled = inject_step3p5_mtp_support(model, path, config, contract)
         elif is_hy_v3_mtp_config(config):
             mtp_enabled = inject_hy_v3_mtp_support(model, path, config, contract)
+        elif is_edge0_latent_mtp_config(config):
+            # Edge0-120B: the Flash-Next shell with latent experts. The base
+            # family's draft head fits it unchanged (attach_mtp is inherited
+            # from the qwen4_exp Model); its own predicate keeps every
+            # qwen4_exp-keyed lane off. No mtp.safetensors -> False (AR).
+            mtp_enabled = inject_edge0_latent_mtp_support(model, path, config, contract)
         elif is_qwen4_exp_mtp_config(config):
             # Flash-Next native draft head: attach_mtp builds it from the
             # pack's self-describing mtp.safetensors sidecar and publishes

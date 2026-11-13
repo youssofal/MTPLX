@@ -441,6 +441,12 @@ def _runtime_env_with_model_contract_overrides(
             SimpleNamespace(model=model, generation_mode="mtp", verify_strategy="batched"),
             contract.runtime_env_overrides if contract is not None else {},
         ))
+    elif model is not None and _model_config_is_flash_next_shell(model):
+        # Edge0-120B: these bench/tune runs verify 'batched' on the Flash-Next
+        # shell (_depth_sweep_native60), whose rejection rollback needs the
+        # recurrent-state snapshot that performance-cold/turbo skip. Only that
+        # correctness key, none of the base family's speed lanes.
+        resolved["MTPLX_SKIP_VERIFY_SNAPSHOT"] = "0"
     return resolved
 
 
@@ -1376,7 +1382,10 @@ def _gemma4_pair_draft_block_size(inspection: dict[str, Any]) -> int:
 def _apply_backend_serve_defaults(args: Any, inspection: dict[str, Any]) -> None:
     descriptor = descriptor_from_inspection(inspection)
     cli_flags = getattr(args, "_cli_flags", set()) or set()
-    if _inspection_backend_id(inspection) == "qwen4_exp":
+    if _inspection_backend_id(inspection) in {"qwen4_exp", "edge0_latent"}:
+        # Edge0-120B (edge0_latent) runs the Flash-Next shell layers, so the
+        # same verify default holds for it; its own sampler and depth ceiling
+        # come from the edge0_latent descriptor below.
         # Flash-Next verify defaults: the capture-commit verifier walks the
         # qwen3-next GDN internals, which this family's own GDN classes do
         # not expose — batched verify snapshots/restores the recurrent caches
@@ -2370,6 +2379,23 @@ def _model_config_is_qwen4_exp(model: str) -> bool:
     tmt = str((cfg.get("text_config") or {}).get("model_type") or "").lower()
     return "qwen4_exp" in (mt, tmt) or "qwen4_exp_text" in (mt, tmt)
 
+
+def _model_config_is_flash_next_shell(model: str) -> bool:
+    """qwen4_exp or Edge0-120B (edge0_latent): MTP verify must run 'batched'
+    on these layers. A correctness gate only; base-only lanes key on
+    _model_config_is_qwen4_exp."""
+    if _model_config_is_qwen4_exp(model):
+        return True
+    try:
+        with open(Path(str(model)) / "config.json", "rb") as fh:
+            cfg = json.load(fh)
+    except Exception:
+        return False
+    mt = str(cfg.get("model_type") or "").lower()
+    tmt = str((cfg.get("text_config") or {}).get("model_type") or "").lower()
+    return bool({"edge0_latent", "edge0_latent_text"} & {mt, tmt})
+
+
 def _depth_sweep_native60(
     *,
     model: str,
@@ -2396,7 +2422,7 @@ def _depth_sweep_native60(
 ) -> dict[str, Any]:
     from mtplx.benchmarks.runners.mtp_depth_sweep import run_mtp_depth_sweep
 
-    _family_batched = _model_config_is_qwen4_exp(model)
+    _family_batched = _model_config_is_flash_next_shell(model)
     previous = apply_profile_env("performance-cold")
     if runtime_env:
         for key in runtime_env:

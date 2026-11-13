@@ -132,8 +132,11 @@ def test_bfloat16_policy_keeps_the_latent_scales(model):
     model.set_activation_dtype("bfloat16")
     params = dict(nn.utils.tree_flatten(model.parameters()))
     mlp = "language_model.model.layers.0.mlp."
-    for k in ("dense_d.scales", "dense_d.biases", "dense_u.scales", "dense_u.biases", "experts.scalars", "gate.weight"):
+    for k in ("experts.scalars", "gate.weight"):
         assert params[mlp + k].dtype == mx.float32, k
+    # D/U scales stay exact: float32, or float16 when every value round-trips (compact_scales)
+    for k in ("dense_d.scales", "dense_d.biases", "dense_u.scales", "dense_u.biases"):
+        assert params[mlp + k].dtype in (mx.float32, mx.float16), k
     assert params["language_model.model.layers.0.attn_hyper_connection.hc_norm.weight"].dtype == mx.bfloat16
     assert params["language_model.model.embed_tokens.scales"].dtype == mx.bfloat16
     assert model.layers[0].mlp.latent_dtype == mx.bfloat16
@@ -170,6 +173,35 @@ def test_runtime_and_registry_know_the_model_type():
 
     cfg = {"model_type": "edge0_latent", "text_config": {"model_type": "edge0_latent_text"}}
     assert not is_qwen4_exp_mtp_config(cfg)  # no qwen4_exp lane keys on this config
+
+
+_SHELL_LANES = ("MTPLX_COMPILED_GDN", "MTPLX_QWEN4EXP_COMPILE", "MTPLX_FUSED_GDN_STEP", "MTPLX_FUSED_GDN_CONVNORM")
+
+
+def test_server_stamps_the_shell_lanes(forged, monkeypatch):
+    """The Flash-Next shell's decode lanes are stamped for Edge0; no routed-expert or lossy lane is."""
+    import argparse
+
+    from mtplx.server.openai import _server_runtime_env_overrides
+
+    for key in (*_SHELL_LANES, "MTPLX_FUSED_HC_V3", "MTPLX_FUSED_GATE_UP"):
+        monkeypatch.delenv(key, raising=False)
+    args = argparse.Namespace(model=str(forged / "out"), generation_mode="ar", verify_strategy=None)
+    got = _server_runtime_env_overrides(args, {})
+    assert all(got.get(key) == "1" for key in _SHELL_LANES), got
+    assert "MTPLX_FUSED_HC_V3" not in got and "MTPLX_FUSED_GATE_UP" not in got
+    # an explicit operator kill switch wins, on either compile alias
+    monkeypatch.setenv("MTPLX_COMPILED_GDN", "0")
+    got = _server_runtime_env_overrides(args, {})
+    assert "MTPLX_COMPILED_GDN" not in got and "MTPLX_QWEN4EXP_COMPILE" not in got
+    assert got.get("MTPLX_FUSED_GDN_STEP") == "1"
+
+
+def test_load_merges_gate_up_and_compacts_exact_scales(model):
+    mlp = model.layers[0].mlp
+    assert mlp.experts.merged and "gate_proj" not in mlp.experts
+    # the forged D/U scales are float16 values (ggml Q4_0), so compaction is exact
+    assert mlp.dense_d.scales.dtype == mx.float16 and mlp.dense_u.biases.dtype == mx.float16
 
 
 def test_runtime_load_autoregressive(forged):

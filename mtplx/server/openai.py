@@ -969,15 +969,83 @@ def _server_runtime_env_overrides(
         and verify_strategy not in VERIFY_SNAPSHOT_OPTIONAL_STRATEGIES
     ):
         overrides["MTPLX_SKIP_VERIFY_SNAPSHOT"] = "0"
-    if generation_mode == "mtp" and _served_model_type_is_qwen4_exp(args):
+    if generation_mode == "mtp" and _served_model_is_flash_next_shell(args):
         # Flash-Next rejection rollback REQUIRES the recurrent-state
         # snapshot: it is both the safety fallback and the pre-state source
         # the family capture-commit replays from. (With the capture lane
         # active the snapshot is the zero-copy lazy variant, so this is no
         # longer a per-round clone.) Keyed on the served config's
         # model_type: the family rides the generic native_mtp descriptor, so
-        # args.backend_id cannot identify it.
+        # args.backend_id cannot identify it. Edge0-120B verifies 'batched'
+        # on the same shell and needs the snapshot the same way: under
+        # turbo's MTPLX_SKIP_VERIFY_SNAPSHOT=1 the first rejected draft
+        # raised "capture commit failed".
         overrides["MTPLX_SKIP_VERIFY_SNAPSHOT"] = "0"
+    if (
+        generation_mode == "mtp"
+        and _served_model_type_is_edge0_latent(args)
+        and os.environ.get("MTPLX_NAX_VERIFY") is None
+    ):
+        # The base family holds turbo's 27B NAX verify patch off (below);
+        # Edge0's speculative lane, which has no family block, does the
+        # same: unmeasured on this model, and its exactness gates ride the
+        # capture-commit lanes Edge0 does not run. An operator export wins.
+        overrides["MTPLX_NAX_VERIFY"] = "0"
+    if _served_model_type_is_edge0_latent(args):
+        # Edge0-120B runs the Flash-Next shell unchanged, so the shell's own
+        # decode lanes apply; each is geometry-checked where it engages (the
+        # GatedDeltaNet gates, the GDN-run compile) and none touches the
+        # routed experts, which this model replaces. Off for it until
+        # 2026-11-13 only because the family block above keys on qwen4_exp.
+        # AR receipts on the 120B pack (M5 Max, bf16, 300 tokens):
+        # compiled GDN runs 29.95 -> 27.59 ms/token, the one-dispatch GDN
+        # step + conv/norm a further -1.0 ms. Both reorder bf16 rounding
+        # (tolerance class, as on the base family): logits move by up to
+        # one bf16 ulp, greedy text can differ at near-ties. The 8-bit
+        # hyper-read v3 is NOT stamped: it requantizes the hyper weights.
+        explicit_off = any(
+            (os.environ.get(key) or "").strip().lower() not in ("", "1", "true", "yes", "on")
+            for key in ("MTPLX_COMPILED_GDN", "MTPLX_QWEN4EXP_COMPILE")
+        )
+        keys = ["MTPLX_FUSED_GDN_CONVNORM", "MTPLX_FUSED_GDN_STEP"]
+        if not explicit_off:
+            keys += ["MTPLX_COMPILED_GDN", "MTPLX_QWEN4EXP_COMPILE"]
+        for key in keys:
+            if os.environ.get(key) is None:
+                overrides.setdefault(key, "1")
+        if generation_mode == "mtp" and bool(getattr(args, "load_mtp", True)):
+            # Speculative lanes measured on the 120B pack (2026-11-13, M5 Max,
+            # bf16, greedy depth 3, medians of 3; code prompt 49.5 -> 74.8
+            # tok/s, 20k-token context 24.9 -> 47.2):
+            # - Layer-owned capture-commit: a rejected draft replays the GDN
+            #   recurrences from captured rows instead of rolling back and
+            #   re-forwarding the trunk (17-26 ms per round -> ~0.5 ms). It
+            #   is GatedDeltaNet state only, so it does not depend on the
+            #   routed experts; the verify strategy stays 'batched' and the
+            #   snapshot above stays the fallback.
+            # - QSA rows-gather: self-fenced to a KV cache of 16k+ tokens
+            #   (one A/B at 20k: 43.7 -> 46.4); tolerance class, as on the
+            #   base family.
+            # - Row-pruned draft head over the release's own draft vocabulary
+            #   (draft_vocab.npy, written by the forge from
+            #   mtp/draft_vocab.bin): 7.7 -> 5.4 ms of draft per round. Only
+            #   when the pack carries the list; drafts are proposals, every
+            #   emitted token still comes from the full verify logits.
+            # The base family's other speculative lanes stay off: the M4
+            # stage-3 tail and gate+up fusion target switch_mlp experts,
+            # hyper-read v3 requantizes, and the rest measured no gain here.
+            for key in ("MTPLX_FAMILY_CAPTURE_COMMIT", "MTPLX_QSA_GATHER"):
+                if os.environ.get(key) is None:
+                    overrides.setdefault(key, "1")
+            draft_vocab = Path(str(args.model)) / "draft_vocab.npy"
+            if draft_vocab.is_file():
+                if os.environ.get("MTPLX_FRSPEC_DRAFT") is None:
+                    overrides.setdefault("MTPLX_FRSPEC_DRAFT", "1")
+                if (
+                    _qwen4_port_opt_in(overrides, "MTPLX_FRSPEC_DRAFT")
+                    and os.environ.get("MTPLX_FRSPEC_VOCAB") is None
+                ):
+                    overrides.setdefault("MTPLX_FRSPEC_VOCAB", str(draft_vocab))
     if _served_model_type_is_qwen4_exp(args):
         # Family speed lanes, defaulted only when the launcher environment
         # left them unset (an explicit operator export wins):
@@ -1330,6 +1398,26 @@ def _served_family_env_stamp(args: argparse.Namespace) -> dict[str, str]:
         )
     except Exception:
         return {}
+
+
+def _served_model_type_is_edge0_latent(args: argparse.Namespace) -> bool:
+    try:
+        with open(Path(str(args.model)) / "config.json", "rb") as fh:
+            cfg = json.load(fh)
+    except Exception:
+        return False
+    mt = str(cfg.get("model_type") or "").lower()
+    tmt = str((cfg.get("text_config") or {}).get("model_type") or "").lower()
+    return bool({"edge0_latent", "edge0_latent_text"} & {mt, tmt})
+
+
+def _served_model_is_flash_next_shell(args: argparse.Namespace) -> bool:
+    """qwen4_exp (Flash-Next) or edge0_latent (Edge0-120B, the Flash-Next shell
+    with latent experts): the models whose MTP verify must run 'batched' with
+    the recurrent-state snapshot kept, and whose resident floor counts the
+    mtp.safetensors sidecar. Correctness gates only — the base family's speed
+    lanes stay keyed on _served_model_type_is_qwen4_exp."""
+    return _served_model_type_is_qwen4_exp(args) or _served_model_type_is_edge0_latent(args)
 
 
 def _served_model_type_is_qwen4_exp(args: argparse.Namespace) -> bool:
@@ -3354,7 +3442,7 @@ _QWEN3NEXT_STRUCTURE_VERIFY_STRATEGIES = frozenset(
 
 
 def _coerce_family_verify_strategy(args: argparse.Namespace) -> None:
-    """qwen4_exp packs cannot run the qwen3-next structure verify strategies.
+    """Flash-Next shell packs cannot run the qwen3-next structure verify strategies.
 
     The server default (--verify-strategy capture_commit) is the 27B fast
     path; its capture stack introspects the qwen3-next DecoderLayer layout
@@ -3363,17 +3451,21 @@ def _coerce_family_verify_strategy(args: argparse.Namespace) -> None:
     2026-08-27, raw-module boot). The family's repair-free lane is
     MTPLX_FAMILY_CAPTURE_COMMIT, which wraps the batched verify instead of
     replacing it, so 'batched' is the only correct base strategy here.
+    Edge0-120B (edge0_latent) runs the same shell layers, so the same holds.
     """
-    if not _served_model_type_is_qwen4_exp(args):
+    if not _served_model_is_flash_next_shell(args):
         return
+    if _served_model_type_is_qwen4_exp(args):
+        family, rollback = "qwen4_exp", "repair-free rollback rides the MTPLX_FAMILY_CAPTURE_COMMIT env lane"
+    else:
+        family, rollback = "edge0_latent", "rejections roll back from the recurrent-state snapshot"
     strategy = (
         str(getattr(args, "verify_strategy", "") or "").strip().lower().replace("-", "_")
     )
     if strategy in _QWEN3NEXT_STRUCTURE_VERIFY_STRATEGIES:
         print(
             f"[serve] verify-strategy {strategy!r} is a qwen3-next structure "
-            "lane; qwen4_exp verifies 'batched' (repair-free rollback rides "
-            "the MTPLX_FAMILY_CAPTURE_COMMIT env lane). Coercing.",
+            f"lane; {family} verifies 'batched' ({rollback}). Coercing.",
             flush=True,
         )
         args.verify_strategy = "batched"
@@ -3460,7 +3552,7 @@ class ServerState:
 
             minimum_resident_bytes = LAGUNA_S_2_1_MIN_RESIDENT_BYTES
             resident_floor_label = "Laguna-S-2.1"
-        elif _served_model_type_is_qwen4_exp(args):
+        elif _served_model_is_flash_next_shell(args):
             # The default wired cap (60% of RAM) sits BELOW this family's
             # working set: on a 128G M5 Max the cap landed at ~82G against a
             # ~99G resident set (the n-gram table was then resident) and
@@ -3480,7 +3572,11 @@ class ServerState:
                     minimum_resident_bytes = floor + _resident_floor_margin_bytes(
                         ram_bytes
                     )
-                    resident_floor_label = "Qwen3.8-Flash-Next"
+                    resident_floor_label = (
+                        "Qwen3.8-Flash-Next"
+                        if _served_model_type_is_qwen4_exp(args)
+                        else "Edge0-120B"
+                    )
             except OSError:
                 minimum_resident_bytes = None
         self.metal_memory_caps = _apply_metal_memory_caps(

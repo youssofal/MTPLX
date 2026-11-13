@@ -142,7 +142,15 @@ class Model(_q.Model):
             super().post_weight_load(model_path)
         for layer in self.layers:
             layer.mlp.cast_router_float32()
-        name = activation_dtype or os.environ.get(DTYPE_ENV) or self.args.edge0_activation_dtype
+            # One routed gate+up matmul instead of two (lossless row stack,
+            # bit-identical outputs); one layer at a time bounds the transient.
+            layer.mlp.experts.merge_gate_up()
+            # float16 D/U scales and biases where exact (ggml Q4_0 scales are
+            # float16): fewer bytes per token, the same values.
+            layer.mlp.dense_d.compact_scales()
+            layer.mlp.dense_u.compact_scales()
+            mx.clear_cache()
+        name =activation_dtype or os.environ.get(DTYPE_ENV) or self.args.edge0_activation_dtype
         self.set_activation_dtype(name)
 
     def _attach_edge0_ngram(self, model_path: Path, spec: dict) -> None:

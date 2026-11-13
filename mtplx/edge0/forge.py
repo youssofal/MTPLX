@@ -9,6 +9,7 @@
     config.json                     model_type edge0_latent (mtplx.models.edge0_latent)
     tokenizer files                 copied from a Flash Next tokenizer folder after checking
                                     that its vocabulary, merges and special tokens are Edge0's
+    mtp.safetensors                 the Flash Next MTP draft head (optional, see below)
     chat_template.jinja, generation_config.json
     edge0-forge.json                provenance: source revision and file hashes, settings, accounting
 
@@ -16,6 +17,20 @@ The n-gram table is not copied: ``config.json`` points at the folder's
 ``ple-fp8.gguf`` (``mtplx_ngram_source``), which the model reads in place.
 Shard names match mlx-lm's ``model*.safetensors`` glob, so the stock loader
 reads them.
+
+MTP draft head (``mtp_head``, ``--mtp-head``). ``"auto"`` (default) copies the
+base Flash Next pack's ``mtp.safetensors`` when the base folder (``mtp_from``,
+else the tokenizer source) has one, and builds without a head otherwise;
+``"base"`` requires it; ``"none"`` builds without (and removes a head an
+earlier run added). The file is accepted only when
+:func:`mtplx.edge0.mtp.check_head` finds exactly the head the loader builds
+for this config; its sha256 and source path go into ``edge0-forge.json`` and
+the config gains ``text_config.mtp_num_hidden_layers = 1``,
+``text_config.mtp_use_dedicated_embeddings = false`` and
+``mlx_lm_extra_tensors.mtp_file``. The head choice is part of the recorded
+settings but never invalidates the converted shards: rerunning on a finished
+pack with another ``--mtp-head`` only adds or removes the head and rewrites
+the config.
 
 Resumable: the shell is written as a unit (temporary directory, then
 renamed), latent layers one file at a time (temporary name, then renamed), and
@@ -26,7 +41,7 @@ config's quantization the way ``mlx_lm.utils.load_model`` does, and checks
 that the shard headers hold exactly its parameters with the right shapes (and,
 for the latent arrays, dtypes); every file's size must match its header.
 
-``python -m mtplx.edge0.forge SRC OUT [--tokenizer-from DIR]``.
+``python -m mtplx.edge0.forge SRC OUT [--tokenizer-from DIR] [--mtp-head auto|base|none] [--mtp-from DIR]``.
 """
 
 from __future__ import annotations
@@ -42,6 +57,7 @@ import time
 from pathlib import Path
 
 from . import latent_convert, shell
+from . import mtp as edge0_mtp
 from .pack import Edge0Pack
 
 FORGE_VERSION = 1
@@ -68,6 +84,9 @@ SOURCE_FILES = (
     "tokenizer/token_type.json",
 )
 _SMALL_HASH_BYTES = 64 * 2**20
+MTP_HEAD_CHOICES = ("auto", "base", "none")
+#: Settings that change what the forge adds next to the converted shards, never the shards themselves.
+_ADDON_SETTINGS = ("mtp_head",)
 
 
 class ForgeError(RuntimeError):
@@ -142,6 +161,18 @@ def _write_json_atomic(path: Path, obj) -> None:
     tmp = path.with_name(f".{path.name}.partial")
     tmp.write_text(json.dumps(obj, indent=1, sort_keys=True) + "\n")
     os.replace(tmp, path)
+
+
+def _copy_atomic(src: Path, dst: Path) -> None:
+    """Copy to a temporary name, then rename: never writes through a symlink at ``dst``."""
+    tmp = dst.with_name(f".{dst.name}.partial")
+    shutil.copyfile(src, tmp)
+    os.replace(tmp, dst)
+
+
+def _conversion_settings(settings: dict | None) -> dict:
+    """The settings that decide the converted shards (the head choice does not)."""
+    return {k: v for k, v in (settings or {}).items() if k not in _ADDON_SETTINGS}
 
 
 # --------------------------------------------------------------------------- config and tokenizer
@@ -275,9 +306,11 @@ def _write_tokenizer(pack: Edge0Pack, base: Path, out: Path) -> dict:
     tok = pack.path / "tokenizer"
     report = check_tokenizer(tok, base)
     for name in TOKENIZER_FILES:
-        shutil.copyfile(base / name, out / name)
+        _copy_atomic(base / name, out / name)
     template = (tok / "chat_template.jinja").read_text()
-    (out / "chat_template.jinja").write_text(template)
+    tmp = out / ".chat_template.jinja.partial"
+    tmp.write_text(template)
+    os.replace(tmp, out / "chat_template.jinja")
     tc = json.loads((out / "tokenizer_config.json").read_text())
     report["inline_template_was_identical"] = tc.get("chat_template") == template
     tc["chat_template"] = template
@@ -289,6 +322,125 @@ def _write_tokenizer(pack: Edge0Pack, base: Path, out: Path) -> dict:
         gen.update({k: bg[k] for k in ("do_sample", "temperature", "top_k", "top_p") if k in bg})
     _write_json_atomic(out / "generation_config.json", gen)
     return report
+
+
+# --------------------------------------------------------------------------- the MTP draft head
+
+
+def _resolve_mtp_head(mtp_head: str, mtp_from, tokenizer_base: Path | None) -> Path | None:
+    """The head file to copy, or None for a pack without one (``auto`` with no base head found)."""
+    if mtp_head not in MTP_HEAD_CHOICES:
+        raise ValueError(f"mtp_head must be one of {MTP_HEAD_CHOICES}, got {mtp_head!r}")
+    if mtp_head == "none":
+        return None
+    where = Path(mtp_from).expanduser() if mtp_from else tokenizer_base
+    cand = None
+    if where is not None:
+        cand = where if where.is_file() else where / edge0_mtp.HEAD_FILE
+    if cand is not None and cand.is_file():
+        return cand
+    if mtp_head == "base" or mtp_from:
+        raise ForgeError(
+            f"no {edge0_mtp.HEAD_FILE} at {cand or 'any known Flash Next folder'}; pass mtp_from (--mtp-from) "
+            "pointing at the base Flash Next pack, or mtp_head='none' (--mtp-head none)"
+        )
+    return None
+
+
+def _set_head_config(cfg: dict, present: bool) -> None:
+    tc = cfg["text_config"]
+    for key in edge0_mtp.CONFIG_TEXT_KEYS:
+        tc.pop(key, None)
+    cfg.pop("mlx_lm_extra_tensors", None)
+    if present:
+        tc.update(edge0_mtp.CONFIG_TEXT_KEYS)
+        cfg["mlx_lm_extra_tensors"] = {"mtp_file": edge0_mtp.HEAD_FILE}
+
+
+def _write_mtp_head(out: Path, src: Path | None, cfg: dict, previous: dict | None, *, explicit_none: bool) -> dict:
+    """Copy (or keep, or remove) ``mtp.safetensors``; returns the ``mtp_head`` provenance record."""
+    dst = out / edge0_mtp.HEAD_FILE
+    previous = previous or {}
+    forge_wrote_it = previous.get("choice") == "base" and previous.get("sha256")
+    if src is None:
+        if dst.exists() or dst.is_symlink():
+            if not forge_wrote_it:
+                raise ForgeError(
+                    f"{dst} exists but this forge did not write it; remove it, or pass mtp_head='base' "
+                    "(--mtp-head base) to replace it with a checked copy"
+                )
+            if not explicit_none:
+                # auto found no base head this run: keep the one an earlier run checked and copied
+                _log(f"mtp head: no base {edge0_mtp.HEAD_FILE} found; keeping the head copied earlier")
+                _set_head_config(cfg, True)
+                return dict(previous)
+            dst.unlink()
+            _log(f"mtp head: removed {dst.name} (--mtp-head none)")
+        else:
+            _log("mtp head: none (pack serves autoregressive; add one with --mtp-head base --mtp-from <Flash Next pack>)")
+        _set_head_config(cfg, False)
+        return {"choice": "none"}
+    try:
+        report = edge0_mtp.check_head(src, cfg)
+    except edge0_mtp.HeadError as exc:
+        raise ForgeError(f"refusing {src} as the MTP head: {exc}") from exc
+    src_sha = _sha256(src)
+    if dst.is_file() and not dst.is_symlink() and previous.get("sha256") == src_sha and os.stat(dst).st_size == report["bytes"]:
+        _log(f"mtp head: {dst.name} already holds {src} (sha256 {src_sha[:12]}), kept")
+    else:
+        t = time.perf_counter()
+        tmp = out / f".{edge0_mtp.HEAD_FILE}.partial"
+        shutil.copyfile(src, tmp)
+        got = _sha256(tmp)
+        if got != src_sha:
+            tmp.unlink()
+            raise ForgeError(f"copying {src} produced sha256 {got}, source has {src_sha}")
+        os.replace(tmp, dst)
+        _log(
+            f"mtp head: copied {src} ({report['bytes'] / 2**30:.2f} GiB, {report['tensors']} tensors, "
+            f"sha256 {src_sha[:12]}) in {time.perf_counter() - t:.1f} s"
+        )
+    _set_head_config(cfg, True)
+    return {"choice": "base", "source": str(src), "sha256": src_sha, "bytes": report["bytes"], "check": report}
+
+
+DRAFT_VOCAB_NAME = "draft_vocab.npy"
+
+
+def _write_draft_vocab(pack: Edge0Pack, out: Path, cfg: dict, *, head_present: bool) -> dict | None:
+    """Write Edge0's draft vocabulary (``mtp/draft_vocab.bin``) as ``draft_vocab.npy`` next to the head.
+
+    The release drafts over a subset of the output rows (int32 token ids); the
+    runtime's row-pruned draft head (``mtplx.frspec_draft``) reads the same list
+    as a ``.npy``, sorted here so the pruned rows keep the table's order. Only a
+    pack with a head carries it. Returns the provenance record, or None.
+    """
+    import numpy as np
+
+    dst = out / DRAFT_VOCAB_NAME
+    src = pack.path / "mtp" / "draft_vocab.bin"
+    if not head_present or not src.is_file():
+        if dst.exists() or dst.is_symlink():
+            dst.unlink()
+        if head_present:
+            _log(f"draft vocabulary: {src} not found; drafts read the full output table")
+        return None
+    raw = src.read_bytes()
+    if not raw or len(raw) % 4:
+        raise ForgeError(f"{src}: {len(raw)} bytes is not a list of int32 token ids")
+    ids = np.frombuffer(raw, dtype="<i4")
+    vocab = int((cfg.get("text_config") or {}).get("vocab_size") or 0)
+    if ids.min() < 0 or (vocab and ids.max() >= vocab):
+        raise ForgeError(f"{src}: token ids span [{ids.min()}, {ids.max()}], outside the vocabulary of {vocab}")
+    ordered = np.unique(ids).astype(np.int32)
+    if ordered.size != ids.size:
+        raise ForgeError(f"{src}: {ids.size - ordered.size} duplicate token ids")
+    tmp = out / f".{DRAFT_VOCAB_NAME}.partial"
+    with open(tmp, "wb") as fh:
+        np.save(fh, ordered, allow_pickle=False)
+    os.replace(tmp, dst)
+    _log(f"draft vocabulary: {ordered.size} of {vocab} token ids -> {dst.name}")
+    return {"file": DRAFT_VOCAB_NAME, "source": str(src), "ids": int(ordered.size), "sha256": hashlib.sha256(raw).hexdigest()}
 
 
 # --------------------------------------------------------------------------- shell and latent shards
@@ -417,11 +569,15 @@ def build_pack(
     shard_bytes: int = SHELL_SHARD_BYTES,
     force: bool = False,
     layers=None,
+    mtp_head: str = "auto",
+    mtp_from=None,
 ) -> dict:
     """Build (or finish) the pack; returns the provenance record also written to ``edge0-forge.json``.
 
     ``layers`` limits the latent layers written (tests, partial builds); the
-    final accounting runs only when every layer is present.
+    final accounting runs only when every layer is present. ``mtp_head`` /
+    ``mtp_from`` choose the draft head (module docstring); changing them on a
+    finished pack touches only ``mtp.safetensors`` and the config.
     """
     t0 = time.perf_counter()
     src = Path(edge0_dir)
@@ -438,17 +594,25 @@ def build_pack(
         "latent_format_version": latent_convert.FORMAT_VERSION,
         "shell_shard_bytes": int(shard_bytes),
     }
+    base = Path(tokenizer_from) if tokenizer_from else find_tokenizer_source()
+    if base is None:
+        raise ForgeError("no Flash Next tokenizer folder found; pass tokenizer_from (--tokenizer-from)")
+    head_src = _resolve_mtp_head(mtp_head, mtp_from, base)
+    settings["mtp_head"] = "base" if head_src is not None else "none"
     fingerprint = _source_fingerprint(src)
     out.mkdir(parents=True, exist_ok=True)
     state_path = out / STATE_NAME
     state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    # The head choice is recorded with the settings but never invalidates the converted shards.
+    same_conversion = _conversion_settings(state.get("settings")) == _conversion_settings(settings)
     if state and not force:
-        if state.get("settings") != settings or state.get("source", {}).get("files") != fingerprint["files"]:
+        if not same_conversion or state.get("source", {}).get("files") != fingerprint["files"]:
             raise ForgeError(
                 f"{out} holds a pack built from another source or with other settings; pass force=True "
                 "(--force) to rebuild it"
             )
-    if force or state.get("settings") != settings:
+    previous_head = state.get("mtp_head")  # provenance of an mtp.safetensors already in OUT
+    if force or not same_conversion:
         state = {}
     state.update({"settings": settings, "source": fingerprint, "mtplx_commit": _mtplx_commit()})
     state.setdefault("steps", {})
@@ -458,9 +622,6 @@ def build_pack(
     cfg = pack_config(pack, q8=q8, dense_format=dense_format, ngram_file=str(gguf))
     state["ngram"] = {"file": str(gguf), "tables": _check_ngram(pack, cfg, gguf)}
 
-    base = Path(tokenizer_from) if tokenizer_from else find_tokenizer_source()
-    if base is None:
-        raise ForgeError("no Flash Next tokenizer folder found; pass tokenizer_from (--tokenizer-from)")
     state["tokenizer"] = _write_tokenizer(pack, base, out)
 
     shell_step = state["steps"].get("shell")
@@ -494,6 +655,9 @@ def build_pack(
     done = [i for i in range(pack.n_layers) if (out / LATENT_PATTERN.format(layer=i)).exists()]
     state["steps"]["latent"] = {"layers_written_this_run": todo, "layers_present": len(done)}
 
+    state["mtp_head"] = _write_mtp_head(out, head_src, cfg, previous_head, explicit_none=(mtp_head == "none"))
+    state["settings"]["mtp_head"] = state["mtp_head"]["choice"]
+    state["draft_vocab"] = _write_draft_vocab(pack, out, cfg, head_present=state["mtp_head"]["choice"] == "base")
     _write_json_atomic(out / "config.json", cfg)
     complete = len(done) == pack.n_layers
     if complete:
@@ -520,14 +684,25 @@ def main(argv=None) -> int:
     ap.add_argument("--q8", choices=shell.Q8_MODES, default="affine8")
     ap.add_argument("--dense-format", choices=sorted(latent_convert.DENSE_BITS))
     ap.add_argument("--force", action="store_true", help="rebuild even if OUT holds a different build")
+    ap.add_argument(
+        "--mtp-head", choices=MTP_HEAD_CHOICES, default="auto",
+        help="MTP draft head: auto (default) copies the base Flash Next pack's mtp.safetensors when found, "
+             "base requires it, none builds without (and removes one an earlier run added). On a finished pack "
+             "only the head and config.json change.",
+    )
+    ap.add_argument("--mtp-from", help="base Flash Next pack folder (or file) holding mtp.safetensors; "
+                                       "default: the tokenizer source")
     args = ap.parse_args(argv)
     try:
         state = build_pack(args.src, args.out, tokenizer_from=args.tokenizer_from, q8=args.q8,
-                           dense_format=args.dense_format, force=args.force)
+                           dense_format=args.dense_format, force=args.force, mtp_head=args.mtp_head,
+                           mtp_from=args.mtp_from)
     except ForgeError as exc:
         print(f"edge0-forge: {exc}", file=sys.stderr)
         return 1
-    _log(f"done in {state['seconds_this_run']} s, complete={state['complete']}")
+    head = state.get("mtp_head") or {}
+    _log(f"done in {state['seconds_this_run']} s, complete={state['complete']}, mtp head: "
+         + (f"yes ({head.get('source')})" if head.get("choice") == "base" else "none (autoregressive only)"))
     return 0 if state["complete"] else 2
 
 

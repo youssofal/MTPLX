@@ -30,8 +30,32 @@ The class deliberately does not derive from mlx-lm's or MTPLX's MoE blocks
 and shapes of ``Qwen3NextSparseMoeBlock``'s, so shell weights load into either.
 
 Everything in ``__call__`` is traceable by ``mx.compile``: no host reads, and
-the only Python branch is on the static row count (gather order for large
-batches, as in mlx-lm's ``SwitchGLU``).
+the only Python branches are on the static row count (gather order for large
+batches, as in mlx-lm's ``SwitchGLU``; the one-token D/U kernels).
+
+Decode speed (2026-11-13; the 120B at T=1, 48 layers, M5 Max, bf16: 17.4 ->
+7.9 ms eager). Each change reproduces the op chain it replaced bit for bit
+(:mod:`mtplx.kernels.edge0_latent`):
+
+- the per-group combine and the SwiGLU epilogue (with the ``s_gate``/``s_up``/
+  ``s_down`` scalars) are one Metal dispatch each instead of ~40 small ops;
+- for one token, ``D`` computes only the rows of the groups its routes use and
+  ``U`` skips the 512-column blocks that are all unused groups (exact zeros);
+  on the 120B a token's 10 routes touch 4.3 of 8 groups on average;
+- after loading, ``gate_proj``/``up_proj`` are stacked into one
+  ``gate_up_proj`` (one routed matmul instead of two) and the D/U scales and
+  biases are held in float16 where every value round-trips (fewer bytes).
+
+Verify widths (2..``FEW_ROWS_MAX`` tokens, an MTP verify forward; 120B, 4
+tokens: 17.3 -> 13.1 ms over 48 layers). ``D`` and ``U`` run the one-token
+masked GEMVs for all rows in one dispatch, each weight tile read once, and each
+row bit-identical to the one-token kernel on that row
+(:func:`mtplx.kernels.edge0_latent.masked_qmv_rows`); the router logits come
+from a float32 GEMV kernel that reads the weight once (float32-accurate like
+the one-token GEMV, not bit-identical to it). The routed experts stay on
+``gather_qmm``: neighbouring tokens share ~40% of their experts, but the
+concurrent gathers already hit the same weights in cache (a kernel that gave
+each distinct expert one threadgroup measured slower).
 """
 
 from __future__ import annotations
@@ -45,6 +69,18 @@ from mlx.utils import tree_flatten, tree_unflatten
 from mlx_lm.models.qwen3_next import Qwen3NextMLP
 
 from mtplx.attention_math import attention_gate
+from mtplx.kernels.edge0_latent import (
+    FEW_ROWS_MAX,
+    latent_combine,
+    latent_combine_reference,
+    latent_swiglu,
+    latent_swiglu_reference,
+    masked_qmv,
+    masked_qmv_eligible,
+    masked_qmv_rows,
+    router_logits_rows,
+    router_rows_eligible,
+)
 
 ROUTER_WEIGHT_FLOOR = 6.103515625e-05  # 2**-14, mtplx.edge0.reference.ROUTER_WEIGHT_FLOOR
 DEFAULT_TOP_K = 10
@@ -115,9 +151,38 @@ class LatentExperts(nn.Module):
         self.down_proj = PackedExpertProjection(n_experts, latent_dim, expert_ff)
         self.scalars = mx.ones((n_experts, 3), dtype=mx.float32)
 
+    @property
+    def merged(self) -> bool:
+        return "gate_up_proj" in self
+
+    def merge_gate_up(self) -> None:
+        """Stack ``gate_proj`` and ``up_proj`` row-wise into one ``gate_up_proj [E, 2I, L/8]``.
+
+        Lossless (the ``nvfp4`` blocks are copied, each output row keeps its
+        own weights and scales) and bit-identical in output: a row of
+        ``gather_qmm`` depends only on that row. One expert matmul per route
+        instead of two. Call after the weights are loaded; it evaluates the
+        stack and drops the two originals.
+        """
+        if self.merged:
+            return
+        e, ff, words = (int(d) for d in self.gate_proj.weight.shape)
+        fused = PackedExpertProjection(e, 2 * ff, words * 8)
+        fused.weight = mx.concatenate([self.gate_proj.weight, self.up_proj.weight], axis=1)
+        fused.scales = mx.concatenate([self.gate_proj.scales, self.up_proj.scales], axis=1)
+        mx.eval(fused.weight, fused.scales)
+        self.gate_up_proj = fused
+        del self["gate_proj"]
+        del self["up_proj"]
+
 
 class PackedDense(nn.Module):
-    """An affine-quantized ``[out, in]`` matrix with float32 scales and biases (group 32)."""
+    """An affine-quantized ``[out, in]`` matrix with float32 scales and biases (group 32).
+
+    :meth:`compact_scales` may hold the scales and biases in float16 when
+    every value round-trips exactly (the ggml blocks they copy store float16
+    scales); the matmul then reads them back as the same float32 values.
+    """
 
     def __init__(self, out_dims: int, in_dims: int, bits: int):
         super().__init__()
@@ -126,8 +191,26 @@ class PackedDense(nn.Module):
         self.biases = mx.zeros((out_dims, in_dims // DENSE_GROUP), dtype=mx.float32)
         self._bits = bits
 
+    @property
+    def bits(self) -> int:
+        return self._bits
+
+    def compact_scales(self) -> bool:
+        """Store scales and biases as float16 if that is exact for every value; returns whether it did."""
+        if self.scales.dtype != mx.float32:
+            return self.scales.dtype == mx.float16
+        half = [a.astype(mx.float16) for a in (self.scales, self.biases)]
+        exact = all(mx.array_equal(h.astype(mx.float32), a).item() for h, a in zip(half, (self.scales, self.biases)))
+        if exact:
+            mx.eval(half)
+            self.scales, self.biases = half
+        return exact
+
     def __call__(self, x: mx.array) -> mx.array:
-        return mx.quantized_matmul(x, self.weight, self.scales, self.biases, transpose=True, group_size=DENSE_GROUP, bits=self._bits)
+        scales, biases = self.scales, self.biases
+        if scales.dtype != x.dtype:  # compacted float16: the same values in float32
+            scales, biases = scales.astype(x.dtype), biases.astype(x.dtype)
+        return mx.quantized_matmul(x, self.weight, scales, biases, transpose=True, group_size=DENSE_GROUP, bits=self._bits)
 
 
 def _split_tf32(a: mx.array) -> tuple[mx.array, mx.array]:
@@ -174,6 +257,28 @@ def top_k_lowest_id(p: mx.array, k: int) -> tuple[mx.array, mx.array]:
     """
     idx = mx.argsort(-p, axis=-1)[..., :k].astype(mx.int32)
     return idx, mx.take_along_axis(p, idx, axis=-1)
+
+
+def _use_kernels() -> bool:
+    return mx.default_device() == mx.gpu and mx.metal.is_available()
+
+
+def _combine(down: mx.array, ids: mx.array, scalars: mx.array, w: mx.array, groups: mx.array, n_groups: int) -> mx.array:
+    """``z [T, G, L]`` float32: per group, the left fold over the routes of ``(float(down) * s_down) * w``.
+
+    One Metal dispatch where available, bit-identical to the ``mx.where`` loop
+    it replaced (:func:`mtplx.kernels.edge0_latent.latent_combine_reference`).
+    """
+    if _use_kernels():
+        return latent_combine(down, ids, scalars, w, groups, n_groups)
+    return latent_combine_reference(down, ids, scalars, w, groups, n_groups)
+
+
+def _swiglu(gate_up, ids: mx.array, scalars: mx.array, expert_ff: int, dtype: mx.Dtype) -> mx.array:
+    """``(silu(s_gate * gate) * (s_up * up)).astype(dtype)``, one dispatch where available (bit-identical)."""
+    if _use_kernels():
+        return latent_swiglu(gate_up, ids, scalars, expert_ff, dtype)
+    return latent_swiglu_reference(gate_up, ids, scalars, expert_ff, dtype)
 
 
 class LatentMoeBlock(nn.Module):
@@ -268,9 +373,19 @@ class LatentMoeBlock(nn.Module):
     # -- forward --------------------------------------------------------------------
 
     def route(self, x2: mx.array) -> tuple[mx.array, mx.array]:
-        """``x2 [T, H]`` -> ``(ids int32 [T, K], weights float32 [T, K])``."""
+        """``x2 [T, H]`` -> ``(ids int32 [T, K], weights float32 [T, K])``.
+
+        A few rows (speculative verify) take a float32 GEMV kernel that reads
+        the router weight once for all rows (:func:`router_logits_rows`):
+        float32-accurate like the one-row call, ~5x cheaper than the split
+        GEMM :func:`float32_logits` runs at more than one row.
+        """
         if isinstance(self.gate, nn.Linear) and "bias" not in self.gate:
-            logits = float32_logits(x2, self.gate.weight, weight_tf32_exact=self._router_tf32_exact or None)
+            weight = self.gate.weight
+            if x2.shape[0] > 1 and _use_kernels() and router_rows_eligible(x2, weight):
+                logits = router_logits_rows(x2, weight)
+            else:
+                logits = float32_logits(x2, weight, weight_tf32_exact=self._router_tf32_exact or None)
         else:  # a quantized router: its own kernel, read in float32
             logits = self.gate(x2.astype(mx.float32)).astype(mx.float32)
         p = mx.softmax(logits, axis=-1, precise=True)
@@ -280,9 +395,19 @@ class LatentMoeBlock(nn.Module):
 
     def _experts(self, xl: mx.array, ids: mx.array, groups: mx.array) -> mx.array:
         """Group latents ``xl [T, G, L]`` -> each route's scaled expert output ``h [T, K, L]`` (float32)."""
+        down = self._experts_raw(xl, ids, groups)
+        return down.astype(mx.float32) * self.experts.scalars[ids][..., 2:3]
+
+    def _experts_raw(self, xl: mx.array, ids: mx.array, groups: mx.array) -> mx.array:
+        """Group latents ``xl [T, G, L]`` -> ``down [T, K, L]`` in ``latent_dtype``.
+
+        ``down`` is the down projection before its ``s_down`` scalar, which the
+        combine applies (:func:`_combine`).
+        """
         t, n_groups, lat = xl.shape
         k = ids.shape[-1]
         ex = self.experts
+        ff = self.geometry.expert_ff
         xl3 = xl.reshape(t * n_groups, 1, lat).astype(self.latent_dtype)
         lhs = (mx.arange(t, dtype=mx.int32)[:, None] * n_groups + groups).astype(mx.uint32)
         do_sort = t * k >= self.sort_threshold
@@ -292,21 +417,16 @@ class LatentMoeBlock(nn.Module):
             inv = mx.argsort(order)
             rid = flat[order]
             xs = xl3[lhs.reshape(-1)[order]]  # [R, 1, L]
-            gate = ex.gate_proj(xs, rid, sorted_indices=True)
-            up = ex.up_proj(xs, rid, sorted_indices=True)
-            sc = ex.scalars[rid][:, None, :]  # [R, 1, 3]
+            proj = lambda m: m(xs, rid, sorted_indices=True)  # noqa: E731  [R, 1, I or 2I]
         else:
             rid = ids
-            gate = ex.gate_proj(xl3, ids, lhs_indices=lhs)  # [T, K, 1, I]
-            up = ex.up_proj(xl3, ids, lhs_indices=lhs)
-            sc = ex.scalars[ids][..., None, :]  # [T, K, 1, 3]
-        g = gate.astype(mx.float32) * sc[..., 0:1]
-        u = up.astype(mx.float32) * sc[..., 1:2]
-        a = (nn.silu(g) * u).astype(self.latent_dtype)
-        h = ex.down_proj(a, rid, sorted_indices=do_sort).astype(mx.float32) * sc[..., 2:3]
+            proj = lambda m: m(xl3, ids, lhs_indices=lhs)  # noqa: E731  [T, K, 1, I or 2I]
+        gate_up = proj(ex.gate_up_proj) if ex.merged else (proj(ex.gate_proj), proj(ex.up_proj))
+        a = _swiglu(gate_up, rid, ex.scalars, ff, self.latent_dtype)
+        down = ex.down_proj(a, rid, sorted_indices=do_sort)
         if do_sort:
-            h = h[inv]
-        return h.reshape(t, k, lat)
+            down = down[inv]
+        return down.reshape(t, k, lat)
 
     def __call__(self, x: mx.array, *, return_routing: bool = False):
         shape = x.shape
@@ -316,19 +436,28 @@ class LatentMoeBlock(nn.Module):
 
         ids, w = self.route(x2)
         groups = self.labels[ids]  # [T, K]
-        xl = self.dense_d(x2.astype(mx.float32)).astype(mx.float32).reshape(t, geo.n_groups, geo.latent_dim)
-        h = self._experts(xl, ids, groups)  # [T, K, L] float32
+        # One token: D and U only on the groups its routes use (bit-identical rows, see
+        # mtplx.kernels.edge0_latent.masked_qmv); the D rows come out in latent_dtype directly.
+        # A few tokens (verify): the same per row, each weight tile read once for all rows.
+        kernels = t <= FEW_ROWS_MAX and _use_kernels()
+        single = kernels and t == 1
+        qmv = masked_qmv if single else masked_qmv_rows
+        d, u = self.dense_d, self.dense_u
+        if kernels and masked_qmv_eligible(x2, d.weight, d.scales, d.bits, DENSE_GROUP, geo.latent_dim, "rows", max_rows=FEW_ROWS_MAX):
+            xl = qmv(x2, d.weight, d.scales, d.biases, groups, by="rows", latent=geo.latent_dim, group_size=DENSE_GROUP, out_dtype=self.latent_dtype)
+        else:
+            xl = d(x2.astype(mx.float32)).astype(mx.float32)
+        xl = xl.reshape(t, geo.n_groups, geo.latent_dim)
+        down = self._experts_raw(xl, ids, groups)  # [T, K, L] latent dtype
 
-        # per-group combine: z[g] = sum over routes in group g of w * h, then one U matmul
-        # (elementwise over the K routes, not a matmul: float32 GEMMs may run as TF32)
-        gid = mx.arange(geo.n_groups, dtype=mx.int32)[:, None]  # [G, 1]
-        hw = h * w[..., None]  # [T, K, L]
-        zero = mx.array(0.0, dtype=mx.float32)
-        z = None
-        for j in range(self.top_k):
-            term = mx.where((groups[:, j, None, None] == gid), hw[:, j, None, :], zero)  # [T, G, L]
-            z = term if z is None else z + term
-        routed = self.dense_u(z.reshape(t, geo.n_groups * geo.latent_dim)).astype(mx.float32)
+        # per-group combine: z[g] = sum over routes in group g of w * s_down * down, then one
+        # U matmul (elementwise over the K routes, not a matmul: float32 GEMMs may run as TF32)
+        z = _combine(down, ids, self.experts.scalars, w, groups, geo.n_groups)  # [T, G, L] float32
+        z = z.reshape(t, geo.n_groups * geo.latent_dim)
+        if kernels and masked_qmv_eligible(z, u.weight, u.scales, u.bits, DENSE_GROUP, geo.latent_dim, "cols", max_rows=FEW_ROWS_MAX):
+            routed = qmv(z, u.weight, u.scales, u.biases, groups, by="cols", latent=geo.latent_dim, group_size=DENSE_GROUP, out_dtype=mx.float32)
+        else:
+            routed = u(z).astype(mx.float32)
 
         shared = attention_gate(self.shared_expert(x2), self.shared_expert_gate(x2))
         y = (routed + shared.astype(mx.float32)).astype(x.dtype).reshape(shape)

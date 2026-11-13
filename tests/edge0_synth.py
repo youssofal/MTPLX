@@ -310,3 +310,50 @@ def make_folder(root: Path, base_tok: Path, *, seed: int = 0) -> SynthPack:
     )
     write_tokenizers(root, base_tok, g["V"])
     return pack
+
+
+# -- a tiny Flash Next MTP draft head for the forged synthetic pack ---------------
+
+
+def write_mtp_head(path: Path, config: dict, *, seed: int = 0, quantize: bool = True, dtype: str = "bfloat16") -> Path:
+    """A ``mtp.safetensors`` shaped like the base Flash Next head for ``config`` (a forged pack's config.json).
+
+    Built from :class:`mtplx.models.qwen4_exp.Qwen4ExpMTP` with seeded random weights, stored the way the
+    base packs ship it: every key under ``mtp.``, the two ``pre_fc`` norms zero-centred (the loader adds
+    +1), floating tensors in ``dtype``, and (``quantize``) the attention and MoE projections 4-bit g32 as in
+    the base recipe while the fc and hyper-connection weights stay unquantized. ``path`` is a folder (the
+    file is ``mtp.safetensors`` in it) or a file path.
+    """
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+
+    from mtplx.models.qwen4_exp import Qwen4ExpMTP, TextArgs
+
+    path = Path(path)
+    if path.suffix != ".safetensors":
+        path = path / "mtp.safetensors"
+    mx.random.seed(seed)
+    head = Qwen4ExpMTP(TextArgs.from_dict(dict(config["text_config"])))
+    if quantize:
+        def predicate(p, m):
+            if not (hasattr(m, "to_quantized") and (".self_attn." in f".{p}." or ".mlp." in f".{p}.")):
+                return False
+            if p.endswith(("mlp.gate", "shared_expert_gate")) and m.weight.shape[-1] % 64 == 0:
+                return {"group_size": 64, "bits": 8}  # the base recipe keeps the routers 8-bit
+            return m.weight.shape[-1] % 32 == 0
+
+        nn.quantize(head, group_size=32, bits=4, class_predicate=predicate)
+    target = getattr(mx, dtype)
+    out = {}
+    rng = np.random.default_rng(seed + 7)
+    for name, arr in tree_flatten(head.parameters()):
+        if name in ("pre_fc_norm_embedding.weight", "pre_fc_norm_hidden.weight"):
+            arr = mx.array(rng.normal(0.0, 0.05, arr.shape).astype(np.float32))  # zero-centred: (1 + w)
+        if arr.dtype in (mx.float32, mx.float16, mx.bfloat16):
+            arr = arr.astype(target)
+        out[f"mtp.{name}"] = arr
+    mx.eval(out)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mx.save_safetensors(str(path), out, metadata={"format": "mlx"})
+    return path

@@ -20,6 +20,7 @@ SUPPORTED_ARCH_IDS = {
     "laguna-s-2.1-ar",
     "deepseek-v4",
     "qwen4-next",
+    "edge0-latent",
     "qwen3-next-mtp",
     "deepseek-v3-mtp",
     "glm-moe-dsa-mtp",
@@ -264,6 +265,31 @@ ARCHITECTURE_CATALOG: dict[str, ArchitectureSupport] = {
             "prefetch) and the native MTP draft head attached from the "
             "pack's self-describing mtp.safetensors, driven through the "
             "standard speculative lane."
+        ),
+    ),
+    "edge0-latent": ArchitectureSupport(
+        arch_id="edge0-latent",
+        display_name="Edge0-120B (latent MoE on the Flash Next shell)",
+        family="edge0",
+        # Its own backend id, not qwen4_exp: the family settings, descriptors
+        # and server lanes keyed on qwen4_exp assume the base experts.
+        backend="edge0_latent",
+        support_level="experimental-native-family-gated",
+        runtime_compatibility="native",
+        can_run_verified=True,
+        # mtplx.edge0.forge packs: model_type edge0_latent / edge0_latent_text,
+        # Edge0LatentForCausalLM. The strings cannot mean another family, so
+        # recognition does not hinge on MTP markers (as for qwen4-next).
+        aliases=("edge0_latent", "edge0_latent_text", "Edge0LatentForCausalLM"),
+        config_markers=(),
+        family_gate="edge0-latent-mtp-sidecar",
+        references=("https://huggingface.co/Edge0/Edge0-120B-NVFP4",),
+        notes=(
+            "Edge0-120B: the Qwen3.8-Flash-Next shell with latent MoE blocks "
+            "(mtplx.models.edge0_latent, packs from mtplx.edge0.forge). The "
+            "base Flash Next MTP head attaches unchanged from the pack's "
+            "mtp.safetensors (forge --mtp-head base) and verifies 'batched'; "
+            "a pack without it serves autoregressive."
         ),
     ),
     "deepseek-v3-mtp": ArchitectureSupport(
@@ -872,10 +898,15 @@ def _detect_arch_id(inspection: Any) -> str | None:
     if _support_alias_matches(qwen4_support, combined):
         return "qwen4-next"
 
+    # Same reasoning for Edge0's own model_type strings: a pack without its
+    # draft head is still an Edge0 pack (AR-only, with the reason).
+    if _support_alias_matches(ARCHITECTURE_CATALOG["edge0-latent"], combined):
+        return "edge0-latent"
+
     supports = [
         support
         for support in ARCHITECTURE_CATALOG.values()
-        if support.arch_id not in {"qwen3-next-mtp", "qwen4-next", "generic-mtp"}
+        if support.arch_id not in {"qwen3-next-mtp", "qwen4-next", "edge0-latent", "generic-mtp"}
     ]
     supports.sort(
         key=lambda row: max(
@@ -1410,6 +1441,93 @@ def _requires_remote_code(model_dir: Any) -> bool:
     return False
 
 
+def _edge0_head_status(inspection: Any) -> tuple[bool, str]:
+    """(head usable, reason) for an Edge0 pack: header-only, see mtplx.edge0.mtp.head_status."""
+    model_dir = getattr(inspection, "model_dir", None)
+    if model_dir and (Path(str(model_dir)) / "config.json").exists():
+        from mtplx.edge0.mtp import head_status
+
+        return head_status(Path(str(model_dir)))
+    # A remote listing: presence is all a header-less check can say.
+    if _file_present(inspection, "mtp.safetensors"):
+        return True, ""
+    return False, "mtp.safetensors is missing"
+
+
+def _edge0_latent_verdict(
+    inspection: Any, *, has_mtp: bool, native_path: str | None, constructable: bool
+) -> "CompatibilityVerdict | None":
+    """The verdict for an Edge0 pack without a runtime contract, or None to fall through.
+
+    With a usable head: MTP-capable (family-gated, unverified until a
+    baseline is recorded). Without one, or with a head that does not fit:
+    autoregressive, and the message says why and how to add the head.
+    """
+    support = ARCHITECTURE_CATALOG["edge0-latent"]
+    if not constructable:
+        return None
+    head_ok, reason = _edge0_head_status(inspection)
+    hint = (
+        "Add the Flash Next draft head with `python -m mtplx.edge0.forge SRC OUT "
+        "--mtp-head base --mtp-from <Qwen3.8-Flash-Next pack>` (on a finished pack "
+        "this only copies mtp.safetensors and rewrites config.json)."
+    )
+    common = dict(
+        arch_id=support.arch_id,
+        recognized=True,
+        can_run=True,
+        recommended_backend=support.backend,
+        recommended_profile=DEFAULT_PROFILE_NAME,
+        unsafe_force_required=False,
+        unverified_model=True,
+        support_level=support.support_level,
+        support_notes=support.notes,
+    )
+    if head_ok:
+        return CompatibilityVerdict(
+            tier=TIER_FAMILY_COMPATIBLE_UNVERIFIED,
+            supported=True,
+            exit_code=EXIT_VERIFIED,
+            message=(
+                f"{support.display_name}: the Flash Next MTP head in mtp.safetensors "
+                "matches this pack. No mtplx_runtime.json exactness baseline is "
+                "present, so runs are marked unverified."
+            ),
+            mtp_supported="yes",
+            runtime_compatibility="native-family-gated",
+            **common,
+        )
+    head_file_present = _file_present(inspection, "mtp.safetensors")
+    if head_file_present:
+        return CompatibilityVerdict(
+            tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,
+            supported=False,
+            exit_code=EXIT_UNVERIFIED,
+            message=(
+                f"{support.display_name}: mtp.safetensors is not a Flash Next draft "
+                f"head for this pack ({reason}). MTP unavailable -> mtp_off: serving "
+                f"autoregressive via {native_path}. {hint}"
+            ),
+            mtp_supported="no",
+            runtime_compatibility="native-ar-only-mtp-unsupported",
+            **common,
+        )
+    declared = " although config.json declares one" if has_mtp else ""
+    return CompatibilityVerdict(
+        tier=TIER_AR_ONLY,
+        supported=False,
+        exit_code=EXIT_VERIFIED,
+        message=(
+            f"{support.display_name}: this pack has no MTP draft head "
+            f"(mtp.safetensors){declared}. MTP unavailable -> mtp_off: serving "
+            f"autoregressive via {native_path}. {hint}"
+        ),
+        mtp_supported="no",
+        runtime_compatibility="native-ar-only-missing-mtp",
+        **common,
+    )
+
+
 def _passes_family_runtime_gate(arch_id: str, inspection: Any, tensor_gate: bool) -> bool:
     if arch_id == "qwen4-next":
         # Preview family: serve AR only when this build actually ships an
@@ -1418,6 +1536,14 @@ def _passes_family_runtime_gate(arch_id: str, inspection: Any, tensor_gate: bool
         return (
             _passes_mlx_lm_ar_gate(inspection)
             and _native_construction_path(inspection) is not None
+        )
+    if arch_id == "edge0-latent":
+        # Trunk constructable (in-tree edge0_latent classes) AND a head file
+        # that is structurally the Flash Next draft head for this config.
+        return (
+            _passes_mlx_lm_ar_gate(inspection)
+            and _native_construction_path(inspection) is not None
+            and _edge0_head_status(inspection)[0]
         )
     if arch_id in {"lfm2-moe-ar", "iquestcoder-ar", "llama-ar"}:
         return _passes_mlx_lm_ar_gate(inspection)
@@ -1858,6 +1984,16 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
             support_level=(support.support_level if support else "unsupported"),
             support_notes=(support.notes if support else None),
         )
+
+    if detected_arch_id == "edge0-latent":
+        edge0_verdict = _edge0_latent_verdict(
+            inspection,
+            has_mtp=has_mtp,
+            native_path=native_path,
+            constructable=constructable,
+        )
+        if edge0_verdict is not None:
+            return edge0_verdict
 
     if detected_arch_id == "qwen3-next-mtp":
         support = architecture_support_for(detected_arch_id)

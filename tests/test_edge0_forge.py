@@ -166,3 +166,138 @@ def test_real_pack_accounts_exactly():
     assert state["complete"] and acc["parameters"] == state["accounting"]["parameters"]
     assert cfg["edge0_latent"]["latent_dim"] == 1280 and cfg["text_config"]["num_hidden_layers"] == 48
     assert len(list(out.glob("model-latent-*.safetensors"))) == 48
+
+
+# --------------------------------------------------------------------------- the MTP draft head
+
+
+@pytest.fixture(scope="module")
+def head_base(built, tmp_path_factory):
+    """A Flash Next base folder with a synthetic mtp.safetensors for the built pack's config."""
+    root, _ = built
+    base = tmp_path_factory.mktemp("edge0-forge-base")
+    for p in (root / "base").iterdir():
+        shutil.copyfile(p, base / p.name)
+    cfg = json.loads((root / "out" / "config.json").read_text())
+    syn.write_mtp_head(base, cfg)
+    return base
+
+
+def _mtimes(out: Path) -> dict:
+    return {p.name: p.stat().st_mtime_ns for p in out.glob("model-*.safetensors")}
+
+
+def test_built_without_a_head_by_default_when_none_is_found(built):
+    root, state = built
+    cfg = json.loads((root / "out" / "config.json").read_text())
+    assert state["mtp_head"] == {"choice": "none"} and state["settings"]["mtp_head"] == "none"
+    assert not (root / "out" / "mtp.safetensors").exists()
+    assert "mlx_lm_extra_tensors" not in cfg and "mtp_num_hidden_layers" not in cfg["text_config"]
+
+
+def test_head_is_copied_checked_and_recorded(built, head_base, tmp_path):
+    import hashlib
+
+    root, _ = built
+    state = forge.build_pack(root / "src", tmp_path / "out", tokenizer_from=head_base)  # auto finds it
+    out = tmp_path / "out"
+    src = head_base / "mtp.safetensors"
+    assert (out / "mtp.safetensors").read_bytes() == src.read_bytes()
+    sha = hashlib.sha256(src.read_bytes()).hexdigest()
+    rec = state["mtp_head"]
+    assert rec["choice"] == "base" and rec["source"] == str(src) and rec["sha256"] == sha
+    assert rec["check"]["tensors"] == 58 and rec["check"]["bits"] == [4, 8]
+    assert state["settings"]["mtp_head"] == "base"
+    prov = json.loads((out / forge.STATE_NAME).read_text())
+    assert prov["mtp_head"]["sha256"] == sha
+    cfg = json.loads((out / "config.json").read_text())
+    assert cfg["mlx_lm_extra_tensors"] == {"mtp_file": "mtp.safetensors"}
+    assert cfg["text_config"]["mtp_num_hidden_layers"] == 1
+    assert cfg["text_config"]["mtp_use_dedicated_embeddings"] is False
+    assert not (out / "mtplx_runtime.json").exists()
+    # the head is not a pack shard: accounting and the index ignore it
+    index = json.loads((out / "model.safetensors.index.json").read_text())
+    assert not any(k.startswith("mtp.") for k in index["weight_map"])
+
+
+def test_adding_the_head_to_a_finished_pack_touches_only_the_head(built, head_base, tmp_path):
+    root, _ = built
+    out = _copy(built, tmp_path)
+    before = _mtimes(out)
+    shell_before = json.loads((out / forge.STATE_NAME).read_text())["steps"]["shell"]
+    state = forge.build_pack(root / "src", out, tokenizer_from=root / "base", mtp_head="base", mtp_from=head_base)
+    assert state["complete"] and state["steps"]["latent"]["layers_written_this_run"] == []
+    assert state["steps"]["shell"] == shell_before and _mtimes(out) == before
+    assert (out / "mtp.safetensors").exists() and state["mtp_head"]["choice"] == "base"
+    # an auto rerun that cannot find a base head keeps the one already checked in
+    state = forge.build_pack(root / "src", out, tokenizer_from=root / "base")
+    assert state["mtp_head"]["choice"] == "base" and (out / "mtp.safetensors").exists()
+    assert json.loads((out / "config.json").read_text())["text_config"]["mtp_num_hidden_layers"] == 1
+    # rerun with the same head: kept, not copied again
+    mtime = (out / "mtp.safetensors").stat().st_mtime_ns
+    forge.build_pack(root / "src", out, tokenizer_from=root / "base", mtp_head="base", mtp_from=head_base)
+    assert (out / "mtp.safetensors").stat().st_mtime_ns == mtime
+    # and --mtp-head none takes it out again, still without touching the shards
+    state = forge.build_pack(root / "src", out, tokenizer_from=root / "base", mtp_head="none")
+    cfg = json.loads((out / "config.json").read_text())
+    assert not (out / "mtp.safetensors").exists() and state["mtp_head"] == {"choice": "none"}
+    assert "mlx_lm_extra_tensors" not in cfg and "mtp_num_hidden_layers" not in cfg["text_config"]
+    assert _mtimes(out) == before and state["steps"]["latent"]["layers_written_this_run"] == []
+
+
+def test_a_wrong_head_is_refused(built, head_base, tmp_path):
+    root, _ = built
+    cfg = json.loads((root / "out" / "config.json").read_text())
+    other = json.loads(json.dumps(cfg))
+    other["text_config"]["moe_intermediate_size"] = int(other["text_config"]["moe_intermediate_size"]) * 2
+    wrong = syn.write_mtp_head(tmp_path / "wrong" / "mtp.safetensors", other)
+    out = _copy(built, tmp_path)
+    with pytest.raises(forge.ForgeError, match="refusing .*switch_mlp"):
+        forge.build_pack(root / "src", out, tokenizer_from=root / "base", mtp_head="base", mtp_from=wrong)
+    trunk = tmp_path / "trunk" / "mtp.safetensors"
+    trunk.parent.mkdir()
+    shutil.copyfile(out / "model-latent-000.safetensors", trunk)
+    with pytest.raises(forge.ForgeError, match="not under mtp"):
+        forge.build_pack(root / "src", out, tokenizer_from=root / "base", mtp_from=trunk)
+    assert not (out / "mtp.safetensors").exists()
+    truncated = tmp_path / "trunc" / "mtp.safetensors"
+    truncated.parent.mkdir()
+    truncated.write_bytes((head_base / "mtp.safetensors").read_bytes()[:-8])
+    with pytest.raises(forge.ForgeError, match="bytes on disk"):
+        forge.build_pack(root / "src", out, tokenizer_from=root / "base", mtp_from=truncated)
+
+
+def test_head_required_but_absent_and_foreign_head_file(built, tmp_path):
+    root, _ = built
+    out = _copy(built, tmp_path)
+    with pytest.raises(forge.ForgeError, match="no mtp.safetensors"):
+        forge.build_pack(root / "src", out, tokenizer_from=root / "base", mtp_head="base")
+    (out / "mtp.safetensors").write_bytes(b"not ours")
+    with pytest.raises(forge.ForgeError, match="did not write it"):
+        forge.build_pack(root / "src", out, tokenizer_from=root / "base", mtp_head="none")
+
+
+def test_cli_flags(built, head_base, tmp_path, capsys):
+    root, _ = built
+    out = _copy(built, tmp_path)
+    rc = forge.main([str(root / "src"), str(out), "--tokenizer-from", str(root / "base"),
+                     "--mtp-head", "base", "--mtp-from", str(head_base)])
+    assert rc == 0 and (out / "mtp.safetensors").exists()
+    assert "mtp head: yes" in capsys.readouterr().out
+
+
+def test_symlinked_pack_is_not_written_through(built, head_base, tmp_path):
+    """A copy made of symlinks (the safe way to add a head next to a pack in use) leaves the original intact."""
+    root, _ = built
+    orig = _copy(built, tmp_path)
+    link = tmp_path / "link"
+    link.mkdir()
+    for p in orig.iterdir():
+        if p.name in ("config.json", forge.STATE_NAME):
+            shutil.copyfile(p, link / p.name)
+        else:
+            (link / p.name).symlink_to(p)
+    snapshot = {p.name: p.read_bytes() for p in orig.iterdir() if p.is_file()}
+    forge.build_pack(root / "src", link, tokenizer_from=root / "base", mtp_head="base", mtp_from=head_base)
+    assert {p.name: p.read_bytes() for p in orig.iterdir() if p.is_file()} == snapshot
+    assert not (orig / "mtp.safetensors").exists() and (link / "mtp.safetensors").is_file()

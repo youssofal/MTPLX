@@ -160,6 +160,13 @@ def load_frspec_ids() -> list[int] | None:
     return resolved
 
 
+def _is_edge0_text(text: Any) -> bool:
+    """Whether ``text`` is an Edge0-120B text model (``edge0_latent_text``)."""
+
+    model_type = str(getattr(getattr(text, "args", None), "model_type", "") or "").lower()
+    return model_type in {"edge0_latent", "edge0_latent_text"}
+
+
 def install_frspec_draft_head(text: Any) -> dict[str, Any]:
     """Install a row-pruned proposal head at the model construction boundary.
 
@@ -184,8 +191,12 @@ def install_frspec_draft_head(text: Any) -> dict[str, Any]:
     bits = int(head.bits)
     group_size = int(head.group_size)
     mode = str(head.mode)
+    # The native contract is the Flash-Next head (8-bit, group 64). Edge0-120B
+    # shares that head's shape but ships it as Q8_0 (8-bit, group 32); a row
+    # gather is layout-agnostic, so that one model type also accepts group 32.
+    native_groups = (64, 32) if _is_edge0_text(text) else (64,)
     if source == "native_mtp_head" and (
-        bits != 8 or group_size != 64 or mode != "affine"
+        bits != 8 or group_size not in native_groups or mode != "affine"
     ):
         return {
             "installed": False,

@@ -571,6 +571,8 @@ def sampler_defaults_for_model(
         return QWEN3_8_SAMPLER_DEFAULTS
     if family == "qwen4_exp":
         return QWEN4_EXP_SAMPLER_DEFAULTS
+    if family == "edge0_latent":
+        return EDGE0_LATENT_DESCRIPTOR.sampler_defaults
     return resolved.sampler_defaults
 
 
@@ -615,6 +617,8 @@ def draft_semantics_for_model(
         return QWEN3_8_DRAFT_SEMANTICS
     if family == "qwen4_exp":
         return QWEN4_EXP_DRAFT_SEMANTICS
+    if family == "edge0_latent":
+        return EDGE0_LATENT_DESCRIPTOR.draft_semantics
     return resolved.draft_semantics
 
 
@@ -805,6 +809,44 @@ NATIVE_CONTRACT_SINGLE_STEP_DESCRIPTOR = replace(
         maximum=1,
         unit="depth",
     ),
+)
+
+
+# Edge0-120B (mtplx.models.edge0_latent): the Flash-Next shell with latent
+# MoE blocks, drafting with the base Flash-Next MTP head. Its own backend id
+# and family ("edge0_latent") so nothing keyed on qwen4_exp (family settings
+# block, server speed lanes, reasoning-history and sampler-owner sets) is
+# inherited by name; the policies that are model facts are mapped here
+# explicitly:
+# - sampler: the pack's generation_config.json (forge copies the Flash-Next
+#   values: temperature 1.0, top_p 0.95, top_k 20) = QWEN4_EXP_SAMPLER_DEFAULTS;
+# - reasoning: the pack's chat_template.jinja is byte-identical to the base
+#   pack's (diff 2026-11-13), so the Flash-Next think-tag codec and its
+#   xhigh/medium/low effort triple apply;
+# - draft depth: default 3, ceiling 3 (the base family allows 5; Edge0's
+#   acceptance at depth 4-5 is unmeasured);
+# - KV quant: the same 12 QSA layers, so the base family's "unsupported".
+EDGE0_LATENT_DESCRIPTOR = replace(
+    NATIVE_CONTRACT_DESCRIPTOR,
+    backend_id="edge0_latent",
+    architecture_id="edge0-latent",
+    model_family="edge0_latent",
+    display_name="Edge0 latent MoE native MTP",
+    sampler_defaults=QWEN4_EXP_SAMPLER_DEFAULTS,
+    reasoning_codec=QWEN4_EXP_REASONING_CODEC,
+    draft_semantics=DraftSemantics(
+        request_field="depth",
+        display_label="Draft depth",
+        default=3,
+        minimum=1,
+        maximum=3,
+        unit="depth",
+    ),
+    tune_policy=TunePolicy(
+        supported=False,
+        unsupported_reason="Tune has no calibrated depth set for Edge0-120B yet.",
+    ),
+    kv_quant_policy=QWEN4_EXP_KV_QUANT_POLICY,
 )
 
 
@@ -1080,6 +1122,7 @@ DESCRIPTORS_BY_BACKEND_ID: dict[str, BackendDescriptor] = {
     ),
     "mimo_mtp": NATIVE_CONTRACT_SINGLE_STEP_DESCRIPTOR,
     "nemotron_h_mtp": NATIVE_CONTRACT_SINGLE_STEP_DESCRIPTOR,
+    EDGE0_LATENT_DESCRIPTOR.backend_id: EDGE0_LATENT_DESCRIPTOR,
 }
 
 
@@ -1242,6 +1285,17 @@ def model_family_from_inspection(
     descriptor: BackendDescriptor | None = None,
 ) -> str:
     text = _text_markers(model_ref, inspection)
+    # Edge0 first: its folder names and provenance may carry Flash-Next or
+    # Qwen 3.8 markers (the shell is Flash-Next), but its policy is its own.
+    if (
+        getattr(descriptor, "backend_id", None) == EDGE0_LATENT_DESCRIPTOR.backend_id
+        or (
+            descriptor is None
+            and backend_id_from_inspection(inspection) == EDGE0_LATENT_DESCRIPTOR.backend_id
+        )
+        or "edge0_latent" in _architecture_markers(inspection)
+    ):
+        return "edge0_latent"
     if model_ref:
         # The artifact outranks its folder name: forge provenance first,
         # then the symlink-resolved location, then the ref as spelled.
@@ -1362,7 +1416,7 @@ def kv_quant_policy_for_model(
         return GLM_MTP_DESCRIPTOR.kv_quant_policy
     if family == "deepseek":
         return DEEPSEEK_MTP_DESCRIPTOR.kv_quant_policy
-    if family == "qwen4_exp":
+    if family in {"qwen4_exp", "edge0_latent"}:
         return QWEN4_EXP_KV_QUANT_POLICY
     return KVQuantPolicy(supported=False)
 
@@ -1433,6 +1487,8 @@ def reasoning_policy_for_model(
         return QWEN3_8_REASONING_CODEC
     if family == "qwen4_exp":
         return QWEN4_EXP_REASONING_CODEC
+    if family == "edge0_latent":
+        return EDGE0_LATENT_DESCRIPTOR.reasoning_codec
     if family in {"qwen3_5", "qwen3_6"}:
         return QWEN3_NEXT_DESCRIPTOR.reasoning_codec
     if family == "gemma4":
