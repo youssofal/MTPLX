@@ -22,7 +22,8 @@ stream, the KV cache and every activation are float32 (``"float32"``). The
 ``"bfloat16"`` policy casts the shell's floating parameters to bfloat16 after
 loading (as the stock Flash Next packs hold them), which makes the stream
 bfloat16; it never touches the D/U scales and biases, ``experts.scalars`` or
-the router (held in float32, ``LatentMoeBlock.cast_router_float32``). Pick the
+the router (held in float32, ``LatentMoeBlock.cast_router_float32``, which also
+keeps the loaded bfloat16 router for the fused router GEMV). Pick the
 policy with ``edge0_activation_dtype`` in ``config.json`` or the
 ``MTPLX_EDGE0_DTYPE`` environment variable (which wins).
 """

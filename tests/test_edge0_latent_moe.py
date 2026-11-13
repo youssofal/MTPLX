@@ -384,3 +384,33 @@ def test_real_layer_against_reference(real_pack, layer):
     err = _rel(y, want)
     print(f"layer {layer} bf16 compiled S=128: out rel {err:.2e}")
     assert err < BF16
+
+
+@real_only
+@pytest.mark.parametrize("layer", [0, 47])
+def test_real_layer_fused_kernels(real_pack, layer, monkeypatch):
+    """The fused routing and routed-expert kernels on a real layer (merged gate_up, compacted D/U scales, the
+    router read through its kept bfloat16 copy when exact): bit-identical to the op chain at one row and at
+    verify widths (routes, routing weights and outputs)."""
+    from mtplx.models import edge0_latent_moe as moe
+
+    blk, lw, _ = _real_block(real_pack, layer)
+    blk.experts.merge_gate_up()
+    blk.dense_d.compact_scales()
+    blk.dense_u.compact_scales()
+    w16 = mx.array(lw.router).astype(mx.bfloat16)
+    if mx.array_equal(w16.astype(mx.float32), blk.gate.weight).item():
+        blk.gate.weight = w16
+        blk.cast_router_float32()
+        assert blk._router_kernel_weight().dtype == mx.bfloat16
+    X = mx.array(_plausible_inputs(lw, 8, np.random.default_rng(100 + layer)))
+    for dtype in (mx.float32, mx.bfloat16):
+        blk.latent_dtype = dtype
+        xs = X.astype(dtype)[None]
+        calls = [xs[:, t : t + 1] for t in range(xs.shape[1])] + [xs[:, :2], xs[:, :4], xs, mx.concatenate([xs[:, :3], xs[:, :1]], axis=1)]
+        for xc in calls:
+            monkeypatch.setattr(moe, "_FUSED_DEFAULT", True)
+            got = blk(xc, return_routing=True)
+            monkeypatch.setattr(moe, "_FUSED_DEFAULT", False)
+            want = blk(xc, return_routing=True)
+            assert all(mx.array_equal(a, b).item() for a, b in zip(got, want)), (dtype, xc.shape)

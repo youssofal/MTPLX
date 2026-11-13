@@ -15,11 +15,18 @@ from mtplx.kernels.edge0_latent import (
     FEW_ROWS_MAX,
     latent_combine,
     latent_combine_reference,
+    latent_down_combine,
+    latent_experts_eligible,
+    latent_gate_up_swiglu,
     latent_swiglu,
     latent_swiglu_reference,
     masked_qmv,
     masked_qmv_eligible,
     masked_qmv_rows,
+    route_topk,
+    route_topk_eligible,
+    router_logits,
+    router_logits_eligible,
     router_logits_rows,
     router_rows_eligible,
 )
@@ -223,3 +230,176 @@ def test_verify_rows_match_decode_rows(wide, dtype, S):
         assert _rel(np.array(y[0, t].astype(mx.float32)), np.array(y1[0, 0].astype(mx.float32), np.float64)) < tol
     res = wide.reference(np.array(X.astype(mx.float32))[0])
     np.testing.assert_array_equal(np.array(ids)[0], np.stack([r.ids for r in res]))
+
+
+# --------------------------------------------------------------------------- fused routing and routed experts
+
+
+@pytest.mark.parametrize("wdt", [mx.float32, mx.bfloat16])
+@pytest.mark.parametrize("xdt", [mx.float32, mx.bfloat16])
+@pytest.mark.parametrize("M", [1, 2, 4, 8])
+def test_router_logits_are_the_one_row_gemv(wdt, xdt, M):
+    """Every row is MLX's one-row float32 GEMV of that row, bit for bit (a bfloat16 weight is read as its float32 values)."""
+    rng = np.random.default_rng(300 + M)
+    E, H = 128, 1024  # H < 16 E: the GEMV layout the kernel reproduces
+    W = mx.array((rng.standard_normal((E, H)) * 0.05).astype(np.float32)).astype(wdt)
+    X = mx.array((rng.standard_normal((M, H)) * 3).astype(np.float32)).astype(xdt)
+    assert router_logits_eligible(X, W)
+    got = router_logits(X, W)
+    assert got.dtype == mx.float32 and got.shape == (M, E)
+    for m in range(M):
+        assert mx.array_equal(got[m : m + 1], moe.float32_logits(X[m : m + 1], W.astype(mx.float32))).item(), m
+
+
+def test_router_logits_eligibility():
+    assert router_logits_eligible(mx.zeros((1, 512)), mx.zeros((64, 512)))
+    assert router_logits_eligible(mx.zeros((FEW_ROWS_MAX, 512)), mx.zeros((64, 512), dtype=mx.bfloat16))
+    assert not router_logits_eligible(mx.zeros((1, 512)), mx.zeros((32, 512)))  # H >= 16 E: MLX splits H, another order
+    assert not router_logits_eligible(mx.zeros((FEW_ROWS_MAX + 1, 512)), mx.zeros((64, 512)))  # prefill: MLX's GEMM
+    assert not router_logits_eligible(mx.zeros((1, 448)), mx.zeros((64, 448)))  # H not a multiple of 128
+    assert not router_logits_eligible(mx.zeros((1, 512)), mx.zeros((60, 512)))  # E not a multiple of 8
+
+
+def _route_chain(logits, labels, k):
+    p = mx.softmax(logits, axis=-1, precise=True)
+    ids, p_sel = moe.top_k_lowest_id(p, k)
+    return ids, p_sel / mx.maximum(p_sel.sum(axis=-1, keepdims=True), moe.ROUTER_WEIGHT_FLOOR), labels[ids]
+
+
+@pytest.mark.parametrize("E", [64, 512])
+@pytest.mark.parametrize("M", [1, 3, 8])
+def test_route_topk_matches_the_op_chain(E, M):
+    """softmax + top-k (ties to the lower id) + renormalisation + labels, row by row as the one-row chain."""
+    rng = np.random.default_rng(400 + E + M)
+    K = 10
+    labels = mx.array(rng.integers(0, 8, E).astype(np.int32))
+    assert route_topk_eligible((M, E), labels, K)
+    cases = [rng.standard_normal((M, E)) * s for s in (0.3, 3.0, 30.0)]
+    cases.append(np.round(rng.standard_normal((M, E)) * 2) / 2)  # many exact ties
+    cases.append(np.zeros((M, E)))  # every probability equal
+    cases.append(np.repeat(rng.standard_normal((1, E)) * 4, M, axis=0))  # identical rows
+    for lg in cases:
+        lg = mx.array(lg.astype(np.float32))
+        ids, w, g = route_topk(lg, labels, K)
+        for m in range(M):
+            ri, rw, rg = _route_chain(lg[m : m + 1], labels, K)
+            assert mx.array_equal(ids[m : m + 1], ri).item() and mx.array_equal(w[m : m + 1], rw).item()
+            assert mx.array_equal(g[m : m + 1], rg).item()
+    lg = np.full((1, E), -5.0, np.float32)
+    lg[0, [40, 7, 33, 2]] = 3.0
+    ids, _, _ = route_topk(mx.array(lg), labels, K)
+    assert np.array(ids)[0, :4].tolist() == [2, 7, 33, 40]  # equal logits: lowest id first
+    assert not route_topk_eligible((FEW_ROWS_MAX + 1, E), labels, K)
+    assert not route_topk_eligible((1, E), labels.astype(mx.uint32), K)
+
+
+def _nvfp4(rng, n_exp, rows, cols):
+    w = mx.array(rng.integers(0, 2**32, (n_exp, rows, cols // 8), dtype=np.uint64).astype(np.uint32))
+    s = mx.array(rng.integers(0x28, 0x48, (n_exp, rows, cols // 16), dtype=np.uint8))
+    return w, s
+
+
+# (L, I): a full last K block, a half-lane tail (L % 256 == 128) with an I tail, MLX's fp_qmv_fast (L % 512 == 0)
+_EXPERT_GEOMS = [(256, 64), (384, 80), (512, 48)]
+
+
+@pytest.mark.parametrize("geom", _EXPERT_GEOMS)
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32, mx.float16])
+@pytest.mark.parametrize("T", [1, 2, 4, 8])
+def test_fused_experts_match_gather_qmm(geom, dtype, T):
+    """gate_up + SwiGLU and down + combine against gather_qmm + latent_swiglu / latent_combine, bit for bit;
+    with several rows the rows share experts (each distinct expert's weights stream once)."""
+    L, F = geom
+    rng = np.random.default_rng(500 + L + T)
+    E, G, K = 40, 4, 6
+    gu_w, gu_s = _nvfp4(rng, E, 2 * F, L)
+    dn_w, dn_s = _nvfp4(rng, E, L, F)
+    scal = mx.array(np.stack([rng.uniform(0.02, 0.05, E), rng.uniform(0.02, 0.05, E), rng.uniform(5e-5, 3e-4, E)], 1).astype(np.float32))
+    lab = mx.array(rng.integers(0, G, E).astype(np.int32))
+    ids = mx.array(np.stack([rng.choice(9 if t % 2 else E, K, replace=False) for t in range(T)]).astype(np.int32))
+    groups = lab[ids]
+    w = mx.array(rng.uniform(0.01, 0.3, (T, K)).astype(np.float32))
+    xl = mx.array((rng.standard_normal((T, G, L)) * 2).astype(np.float32)).astype(dtype)
+    assert latent_experts_eligible(xl, gu_w, gu_s, dn_w, dn_s, K)
+    lhs = (mx.arange(T, dtype=mx.int32)[:, None] * G + groups).astype(mx.uint32)
+    gu = mx.gather_qmm(xl.reshape(T * G, 1, L), gu_w, gu_s, lhs_indices=lhs, rhs_indices=ids, transpose=True, group_size=16, bits=4, mode="nvfp4")
+    a_ref = latent_swiglu(gu, ids, scal, F, dtype)
+    a, info = latent_gate_up_swiglu(xl, gu_w, gu_s, ids, groups, scal)
+    assert (info is None) == (T == 1)
+    assert a.dtype == dtype and mx.array_equal(a.reshape(a_ref.shape), a_ref).item()
+    dn = mx.gather_qmm(a_ref, dn_w, dn_s, rhs_indices=ids, transpose=True, group_size=16, bits=4, mode="nvfp4")
+    z_ref = latent_combine(dn.reshape(T, K, L), ids, scal, w, groups, G)
+    z = latent_down_combine(a, dn_w, dn_s, ids, groups, scal, w, info, G)
+    assert z.dtype == mx.float32 and mx.array_equal(z, z_ref).item()
+
+
+def test_fused_experts_eligibility():
+    rng = np.random.default_rng(7)
+    gu_w, gu_s = _nvfp4(rng, 8, 128, 256)
+    dn_w, dn_s = _nvfp4(rng, 8, 256, 64)
+    xl = mx.zeros((1, 4, 256), dtype=mx.bfloat16)
+    assert latent_experts_eligible(xl, gu_w, gu_s, dn_w, dn_s, 6)
+    assert not latent_experts_eligible(mx.zeros((FEW_ROWS_MAX + 1, 4, 256)), gu_w, gu_s, dn_w, dn_s, 6)  # prefill
+    assert not latent_experts_eligible(xl.astype(mx.int32), gu_w, gu_s, dn_w, dn_s, 6)
+    assert not latent_experts_eligible(xl, gu_w, gu_s.astype(mx.uint32), dn_w, dn_s, 6)
+    assert not latent_experts_eligible(mx.zeros((1, 4, 128)), gu_w, gu_s, dn_w, dn_s, 6)  # L disagrees with the weights
+
+
+@pytest.fixture(scope="module", params=["q4", "q8"])
+def fusable(request):
+    # H < 16 E (the fused router GEMV), H and G*L multiples of 512 (the masked D/U kernels)
+    return Synth(seed=9, H=512, L=256, F=64, G=4, E=64, K=6, IS=64, labels=np.arange(64, dtype=np.int32) % 4, dense=request.param)
+
+
+def _packed(synth, dtype, bf16_router=False):
+    blk = synth.block(latent_dtype=dtype)
+    blk.experts.merge_gate_up()
+    blk.dense_d.compact_scales()
+    blk.dense_u.compact_scales()
+    if bf16_router:  # as a loaded pack: a bfloat16 router, held in float32 with the 16-bit copy kept
+        blk.gate.weight = blk.gate.weight.astype(mx.bfloat16)
+        blk.cast_router_float32()
+    return blk
+
+
+@pytest.mark.parametrize("bf16_router", [False, True])
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+@pytest.mark.parametrize("S", [1, 2, 3, 4, 8, 9])
+def test_fused_block_is_the_op_chain(fusable, dtype, S, bf16_router, monkeypatch):
+    """Decode (one row), verify widths (2..8 rows, rows sharing experts) and prefill widths (which fall back):
+    the fused kernels give the op chain's bits, routes and routing weights included."""
+    blk = _packed(fusable, dtype, bf16_router)
+    X = mx.array(np.random.default_rng(60 + S).standard_normal((1, S, fusable.H)).astype(np.float32)).astype(dtype)
+    if S > 2:
+        X = mx.concatenate([X[:, : S - 1], X[:, :1]], axis=1)  # the last row repeats the first: all its experts are shared
+    monkeypatch.setattr(moe, "_FUSED_DEFAULT", True)
+    got = blk(X, return_routing=True)
+    monkeypatch.setattr(moe, "_FUSED_DEFAULT", False)
+    want = blk(X, return_routing=True)
+    assert all(mx.array_equal(a, b).item() for a, b in zip(got, want))
+    if not bf16_router:  # (the reference holds the unrounded router)
+        res = fusable.reference(np.array(X.astype(mx.float32))[0])
+        np.testing.assert_array_equal(np.array(got[1])[0], np.stack([r.ids for r in res]))
+
+
+def test_fused_block_paths_and_router_shadow(fusable, monkeypatch):
+    """Unmerged experts take the op chain; a bfloat16 router kept by cast_router_float32 gives the float32 bits;
+    replacing gate.weight drops the stale copy."""
+    monkeypatch.setattr(moe, "_FUSED_DEFAULT", True)
+    X = mx.array(np.random.default_rng(80).standard_normal((1, 1, fusable.H)).astype(np.float32)).astype(mx.bfloat16)
+    plain = fusable.block(latent_dtype=mx.bfloat16)  # not merged: the op-chain experts
+    packed = _packed(fusable, mx.bfloat16)
+    assert mx.array_equal(plain(X), packed(X)).item()
+    blk = _packed(fusable, mx.bfloat16)
+    want = blk(X)
+    blk.gate.weight = blk.gate.weight.astype(mx.bfloat16)
+    blk.cast_router_float32()
+    assert blk.gate.weight.dtype == mx.float32 and blk._router_kernel_weight().dtype == mx.bfloat16
+    assert "_router_lowp" not in dict(__import__("mlx.utils", fromlist=["tree_flatten"]).tree_flatten(blk.parameters()))
+    bf_exact = blk(X)
+    blk.gate.weight = blk.gate.weight * 1.0  # a new array: the 16-bit copy no longer shadows it
+    assert blk._router_kernel_weight() is blk.gate.weight
+    assert mx.array_equal(blk(X), bf_exact).item()
+    monkeypatch.setattr(moe, "_FUSED_DEFAULT", False)
+    assert mx.array_equal(blk(X), bf_exact).item()
+    del want

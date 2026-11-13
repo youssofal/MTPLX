@@ -31,7 +31,8 @@ and shapes of ``Qwen3NextSparseMoeBlock``'s, so shell weights load into either.
 
 Everything in ``__call__`` is traceable by ``mx.compile``: no host reads, and
 the only Python branches are on the static row count (gather order for large
-batches, as in mlx-lm's ``SwitchGLU``; the one-token D/U kernels).
+batches, as in mlx-lm's ``SwitchGLU``; the one-token D/U kernels; the fused
+kernels' eligibility).
 
 Decode speed (2026-11-13; the 120B at T=1, 48 layers, M5 Max, bf16: 17.4 ->
 7.9 ms eager). Each change reproduces the op chain it replaced bit for bit
@@ -53,16 +54,24 @@ Verify widths (2..``FEW_ROWS_MAX`` tokens, an MTP verify forward; 120B, 4
 tokens: 17.3 -> 13.1 ms over 48 layers). ``D`` and ``U`` run the one-token
 masked GEMVs for all rows in one dispatch, each weight tile read once, and each
 row bit-identical to the one-token kernel on that row
-(:func:`mtplx.kernels.edge0_latent.masked_qmv_rows`); the router logits come
-from a float32 GEMV kernel that reads the weight once (float32-accurate like
-the one-token GEMV, not bit-identical to it). The routed experts stay on
-``gather_qmm``: neighbouring tokens share ~40% of their experts, but the
-concurrent gathers already hit the same weights in cache (a kernel that gave
-each distinct expert one threadgroup measured slower).
+(:func:`mtplx.kernels.edge0_latent.masked_qmv_rows`).
+
+Fused routing and routed experts (2026-11-13; 145B, 48 layers, compiled block:
+10.4 -> 8.9 ms at one token, 18.4 -> 15.7 ms at four; dispatching graph nodes
+per layer 34 -> 16). Up to ``FEW_ROWS_MAX`` tokens, routing is two kernels
+(the float32 router GEMV reading the kept bfloat16 router weight, then
+softmax/top-k/renormalisation/labels) and the routed experts two more
+(gate_up + SwiGLU, down + per-group combine), each reproducing the op chain it
+replaces bit for bit, at one token and at verify widths alike. With several
+tokens, each distinct expert's weights stream once for all the routes that use
+it (the first route of an expert computes them all; that layout, with the
+weight decode shared across routes, is what makes it beat the concurrent
+gathers). ``MTPLX_EDGE0_FUSED_ROUTED=0`` runs the op chains instead.
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -76,11 +85,18 @@ from mtplx.kernels.edge0_latent import (
     FEW_ROWS_MAX,
     latent_combine,
     latent_combine_reference,
+    latent_down_combine,
+    latent_experts_eligible,
+    latent_gate_up_swiglu,
     latent_swiglu,
     latent_swiglu_reference,
     masked_qmv,
     masked_qmv_eligible,
     masked_qmv_rows,
+    route_topk,
+    route_topk_eligible,
+    router_logits,
+    router_logits_eligible,
     router_logits_rows,
     router_rows_eligible,
 )
@@ -90,6 +106,9 @@ DEFAULT_TOP_K = 10
 NVFP4_GROUP = 16
 DENSE_GROUP = 32
 SORT_THRESHOLD = 64  # routes per call from which the expert matmuls run in expert order
+#: ``0`` turns the fused routing and routed-expert kernels off (the op chains they replace run instead).
+FUSED_ENV = "MTPLX_EDGE0_FUSED_ROUTED"
+_FUSED_DEFAULT = os.environ.get(FUSED_ENV, "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 @dataclass(frozen=True)
@@ -266,6 +285,11 @@ def _use_kernels() -> bool:
     return mx.default_device() == mx.gpu and mx.metal.is_available()
 
 
+def _fused_routed() -> bool:
+    """Whether the fused routing / routed-expert kernels may run (``MTPLX_EDGE0_FUSED_ROUTED``, read at import)."""
+    return _FUSED_DEFAULT
+
+
 def _combine(down: mx.array, ids: mx.array, scalars: mx.array, w: mx.array, groups: mx.array, n_groups: int) -> mx.array:
     """``z [T, G, L]`` float32: per group, the left fold over the routes of ``(float(down) * s_down) * w``.
 
@@ -331,13 +355,19 @@ class LatentMoeBlock(nn.Module):
         self.experts = LatentExperts(g.n_experts, g.latent_dim, g.expert_ff)
         self.labels = mx.zeros((g.n_experts,), dtype=mx.int32)
         self._router_tf32_exact = False
+        # the loaded 16-bit router weight, kept beside the float32 one for the fused router GEMV (half the
+        # bytes, the same float32 values); paired with the identity of the float32 array it shadows
+        self._router_lowp = None
+        self._router_lowp_of = None
 
     def cast_router_float32(self) -> None:
         """Hold the router weight in float32 (saves a cast per call; ~5 MB per layer for the 120B).
 
         Call after the weights are loaded. Records whether the values are
         TF32-exact (they are when they came from bfloat16 or float16), which lets
-        multi-row calls skip splitting the weight.
+        multi-row calls skip splitting the weight. A bfloat16 or float16 original
+        is kept for :func:`mtplx.kernels.edge0_latent.router_logits`, which reads
+        it as the same float32 values.
         """
         w = self.gate.weight
         if not isinstance(self.gate, nn.Linear) or w.dtype == mx.float32:
@@ -346,6 +376,15 @@ class LatentMoeBlock(nn.Module):
         self.gate.weight = w.astype(mx.float32)
         mx.eval(self.gate.weight)
         self._router_tf32_exact = exact
+        if exact:
+            self._router_lowp, self._router_lowp_of = w, id(self.gate.weight)
+
+    def _router_kernel_weight(self) -> mx.array:
+        """The router weight for the fused GEMV: the exact 16-bit copy if it still matches ``gate.weight``."""
+        weight = self.gate.weight
+        if self._router_lowp is not None and self._router_lowp_of == id(weight):
+            return self._router_lowp
+        return weight
 
     @classmethod
     def from_model_args(cls, args: Any, geometry: LatentGeometry, **kwargs) -> LatentMoeBlock:
@@ -376,16 +415,38 @@ class LatentMoeBlock(nn.Module):
     # -- forward --------------------------------------------------------------------
 
     def route(self, x2: mx.array) -> tuple[mx.array, mx.array]:
-        """``x2 [T, H]`` -> ``(ids int32 [T, K], weights float32 [T, K])``.
+        """``x2 [T, H]`` -> ``(ids int32 [T, K], weights float32 [T, K])``."""
+        ids, w, _ = self._route(x2)
+        return ids, w
 
-        A few rows (speculative verify) take a float32 GEMV kernel that reads
-        the router weight once for all rows (:func:`router_logits_rows`):
-        float32-accurate like the one-row call, ~5x cheaper than the split
-        GEMM :func:`float32_logits` runs at more than one row.
+    def _route(self, x2: mx.array) -> tuple[mx.array, mx.array, mx.array]:
+        """``x2 [T, H]`` -> ``(ids int32 [T, K], weights float32 [T, K], groups int32 [T, K])``.
+
+        Up to ``FEW_ROWS_MAX`` rows (decode, speculative verify) take two
+        kernels, each reading the kept bfloat16 router weight where there is
+        one: the router GEMV (:func:`router_logits`, MLX's one-row float32
+        GEMV, at one row; :func:`router_logits_rows` at verify widths) and
+        softmax/top-k/renormalisation/labels (:func:`route_topk`). Both give
+        the op chain below its bits, at every row count. A few rows otherwise
+        take :func:`router_logits_rows` on the float32 weight: one read of the
+        weight for all rows, float32-accurate like the one-row call (not
+        bit-identical to it), ~5x cheaper than the split GEMM
+        :func:`float32_logits` runs at more than one row.
         """
-        if isinstance(self.gate, nn.Linear) and "bias" not in self.gate:
+        t = x2.shape[0]
+        plain = isinstance(self.gate, nn.Linear) and "bias" not in self.gate
+        if plain and _use_kernels() and _fused_routed() and route_topk_eligible((t, self.num_experts), self.labels, self.top_k):
+            weight = self._router_kernel_weight()
+            logits = None
+            if t == 1 and router_logits_eligible(x2, weight):
+                logits = router_logits(x2, weight)
+            elif t > 1 and router_rows_eligible(x2, weight):
+                logits = router_logits_rows(x2, weight)  # a 16-bit weight reads as the same float32 values
+            if logits is not None:
+                return route_topk(logits, self.labels, self.top_k)
+        if plain:
             weight = self.gate.weight
-            if x2.shape[0] > 1 and _use_kernels() and router_rows_eligible(x2, weight):
+            if t > 1 and _use_kernels() and router_rows_eligible(x2, weight):
                 logits = router_logits_rows(x2, weight)
             else:
                 logits = float32_logits(x2, weight, weight_tf32_exact=self._router_tf32_exact or None)
@@ -394,7 +455,7 @@ class LatentMoeBlock(nn.Module):
         p = mx.softmax(logits, axis=-1, precise=True)
         ids, p_sel = top_k_lowest_id(p, self.top_k)
         denom = mx.maximum(p_sel.sum(axis=-1, keepdims=True), ROUTER_WEIGHT_FLOOR)
-        return ids, p_sel / denom
+        return ids, p_sel / denom, self.labels[ids]
 
     def _experts(self, xl: mx.array, ids: mx.array, groups: mx.array) -> mx.array:
         """Group latents ``xl [T, G, L]`` -> each route's scaled expert output ``h [T, K, L]`` (float32)."""
@@ -437,8 +498,7 @@ class LatentMoeBlock(nn.Module):
         x2 = x.reshape(-1, shape[-1])
         t = x2.shape[0]
 
-        ids, w = self.route(x2)
-        groups = self.labels[ids]  # [T, K]
+        ids, w, groups = self._route(x2)  # [T, K] each
         # One token: D and U only on the groups its routes use (bit-identical rows, see
         # mtplx.kernels.edge0_latent.masked_qmv); the D rows come out in latent_dtype directly.
         # A few tokens (verify): the same per row, each weight tile read once for all rows.
@@ -451,11 +511,23 @@ class LatentMoeBlock(nn.Module):
         else:
             xl = d(x2.astype(mx.float32)).astype(mx.float32)
         xl = xl.reshape(t, geo.n_groups, geo.latent_dim)
-        down = self._experts_raw(xl, ids, groups)  # [T, K, L] latent dtype
 
-        # per-group combine: z[g] = sum over routes in group g of w * s_down * down, then one
-        # U matmul (elementwise over the K routes, not a matmul: float32 GEMMs may run as TF32)
-        z = _combine(down, ids, self.experts.scalars, w, groups, geo.n_groups)  # [T, G, L] float32
+        # Routed experts and the per-group combine z[g] = sum over routes in group g of
+        # w * s_down * down (elementwise over the K routes, not a matmul: float32 GEMMs may run
+        # as TF32), then one U matmul. Up to FEW_ROWS_MAX tokens: two kernels, gate_up+SwiGLU and
+        # down+combine, bit-identical to the op chain (mtplx.kernels.edge0_latent).
+        ex = self.experts
+        fused = kernels and ex.merged and _fused_routed()
+        if fused:
+            xl_lp = xl.astype(self.latent_dtype)
+            gu, dn = ex.gate_up_proj, ex.down_proj
+            fused = latent_experts_eligible(xl_lp, gu.weight, gu.scales, dn.weight, dn.scales, self.top_k)
+        if fused:
+            a, info = latent_gate_up_swiglu(xl_lp, gu.weight, gu.scales, ids, groups, ex.scalars)
+            z = latent_down_combine(a, dn.weight, dn.scales, ids, groups, ex.scalars, w, info, geo.n_groups)
+        else:
+            down = self._experts_raw(xl, ids, groups)  # [T, K, L] latent dtype
+            z = _combine(down, ids, ex.scalars, w, groups, geo.n_groups)  # [T, G, L] float32
         z = z.reshape(t, geo.n_groups * geo.latent_dim)
         if kernels and masked_qmv_eligible(z, u.weight, u.scales, u.bits, DENSE_GROUP, geo.latent_dim, "cols", max_rows=FEW_ROWS_MAX):
             routed = qmv(z, u.weight, u.scales, u.biases, groups, by="cols", latent=geo.latent_dim, group_size=DENSE_GROUP, out_dtype=mx.float32)
