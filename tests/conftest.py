@@ -36,6 +36,8 @@ def pytest_configure(config):
 # under MTPLX_ is a runtime switch and is dropped before collection.
 _SUITE_VARIABLES = frozenset(
     {
+        "MTPLX_EDGE0_MODEL",
+        "MTPLX_EDGE0_PACK",
         "MTPLX_UPDATE_GOLDENS",
         "MTPLX_UPDATE_GOLDENS_ACK",
         "MTPLX_TEST_BASELINE",

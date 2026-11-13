@@ -5226,6 +5226,17 @@ class NGramTable(nn.Module):
         self.pop("weight", None)
         header, data_start = _read_safetensors_header(path)
         meta = header.get("__metadata__", {})
+        if "ngram.weight" not in header:
+            # Edge0 FP8 backend (mtplx.edge0.ngram): rows read in place from
+            # ple-fp8.gguf; the stock 4-bit path below is untouched.
+            from mtplx.edge0 import ngram as edge0_ngram
+
+            gguf = edge0_ngram.resolve_source(path, meta)
+            if gguf is not None:
+                entries, scale = edge0_ngram.open_table(gguf, self.rows, self.dim)
+                self._sidecar = _SidecarGather(gguf, entries, bits=0, group_size=0)
+                self._sidecar.fp8_scale = scale
+                return
         entries = {}
         names = ("weight",) if int(meta.get("ngram_bits", 4)) == 0 else ("weight", "scales", "biases")
         for name in names:
@@ -5283,7 +5294,7 @@ class _SidecarGather:
         self.madvise_applied, _advice_value = madvise_choice()
         self._fd = os.open(str(path), os.O_RDONLY)
         for name, (info, data_start) in entries.items():
-            dtype = {"U32": np.uint32, "BF16": np.uint16, "F16": np.uint16}[info["dtype"]]
+            dtype = {"U32": np.uint32, "BF16": np.uint16, "F16": np.uint16, "F8_E4M3": np.uint8}[info["dtype"]]
             shape = tuple(info["shape"])
             offset = data_start + info["data_offsets"][0]
             mm = np.memmap(path, mode="r", dtype=dtype, offset=offset, shape=shape)
@@ -5300,7 +5311,7 @@ class _SidecarGather:
             except (AttributeError, OSError, ValueError):
                 self.madvise_applied = "unavailable"
             self._maps[name] = (mm, info["dtype"])
-            itemsize = 4 if info["dtype"] == "U32" else 2
+            itemsize = {"U32": 4, "F8_E4M3": 1}.get(info["dtype"], 2)
             self._row_meta.append((offset, int(shape[1]) * itemsize))
         self.row_layout = "planar"
         row_file = os.environ.get("MTPLX_NGRAM_ROW_FILE")
@@ -5659,6 +5670,10 @@ class _SidecarGather:
             )
             dt = self._maps["weight"][1]
             rows = mx.array(mats["weight"])
+            if dt == "F8_E4M3":
+                from mtplx.edge0.ngram import decode_rows
+
+                return decode_rows(rows, self.fp8_scale)
             return rows.view(mx.bfloat16 if dt == "BF16" else mx.float16)
         names = ("weight", "scales", "biases")
         mats = (
