@@ -118,10 +118,11 @@ def test_real_nvfp4_blob_matches_phase0_decoder():
     pack = Edge0Pack(Path(REAL))
     blob = np.asarray(pack.expert_blob(0, 0))
     p = pack._proj_bytes
-    got = gq.decode_nvfp4(blob[:p]).reshape(640, 1280)
+    ff, lat = pack.expert_ff, pack.latent_dim  # 640 x 1280 on the 120B, 640 x 1792 on the 145B
+    got = gq.decode_nvfp4(blob[:p]).reshape(ff, lat)
     kv = np.array(syn.KV, np.float32) * 0.5
-    a = blob[:p].reshape(640, 1280 // 64, 36)
+    a = blob[:p].reshape(ff, lat // 64, 36)
     d = gq.ue4m3_to_float(a[:, :, :4])
-    qs = a[:, :, 4:].reshape(640, 20, 4, 8)
-    want = (np.concatenate([kv[qs & 15], kv[qs >> 4]], -1) * d[..., None]).reshape(640, 1280)
+    qs = a[:, :, 4:].reshape(ff, lat // 64, 4, 8)
+    want = (np.concatenate([kv[qs & 15], kv[qs >> 4]], -1) * d[..., None]).reshape(ff, lat)
     np.testing.assert_array_equal(got, want)
