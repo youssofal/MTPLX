@@ -1,0 +1,34 @@
+id = "tool-calendar"
+kind = "tool"
+prompt = '''
+Put a 45 minute meeting called "Design review" on my calendar for 3 December 2026 at 2:30 in the afternoon, and invite ana@example.com and li@example.com.
+'''
+tools_json = '''
+[
+  {"type": "function", "function": {
+    "name": "create_event",
+    "description": "Create a calendar event.",
+    "parameters": {"type": "object", "properties": {
+      "title": {"type": "string"},
+      "date": {"type": "string", "description": "YYYY-MM-DD"},
+      "start_time": {"type": "string", "description": "24-hour HH:MM"},
+      "duration_minutes": {"type": "integer"},
+      "attendees": {"type": "array", "items": {"type": "string"}, "description": "Email addresses"}},
+      "required": ["title", "date", "start_time", "duration_minutes"]}}},
+  {"type": "function", "function": {
+    "name": "list_events",
+    "description": "List the events on a date.",
+    "parameters": {"type": "object", "properties": {
+      "date": {"type": "string", "description": "YYYY-MM-DD"}}, "required": ["date"]}}}
+]
+'''
+
+[[expect_calls]]
+name = "create_event"
+
+[expect_calls.args]
+title = { equals = "design review" }
+date = { equals = "2026-12-03" }
+start_time = { equals = "14:30" }
+duration_minutes = { equals = 45 }
+attendees = { set_equals = ["ana@example.com", "li@example.com"] }

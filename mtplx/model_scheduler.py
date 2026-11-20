@@ -456,6 +456,35 @@ class ModelWorkScheduler:
             self._keepalive_fn = None
             self._condition.notify_all()
 
+    def beat_within_item(self) -> bool:
+        """The keepalive beat from inside a long owner-thread item.
+
+        The loop beats between items and counts any item as GPU activity,
+        but an SSD spill or restore is one item of seconds of CPU work with
+        no command buffer: it reads a lease's KV as views and copies them
+        with the CPU (12 Nov, M5 Max, a 1.5 GiB wired set: after 4 s of that
+        work the next full read took 24.7 ms, as after 4 s idle, against
+        4.8 ms with one beat a second), so the working set lost its
+        residency about 2.5 s into a long conversation's spill (11 s at
+        131K) and the next request paid to bring it back. Such an item calls this between its
+        units: one beat per interval while the engine is attentive, on the
+        owner thread only, nothing otherwise. Returns whether it beat.
+        """
+        if self._keepalive_fn is None or not self.is_owner_thread():
+            return False
+        now = time.monotonic()
+        # Called once per unit (tens of thousands per spill): the common
+        # not-yet-due case reads two floats and takes no lock; the locked
+        # check below decides.
+        if now < self._last_owner_activity_s + self._keepalive_interval_s:
+            return False
+        with self._condition:
+            due = self._keepalive_due_locked(now)
+            if due is None or now < due:
+                return False
+        self._run_keepalive()
+        return True
+
     def keepalive_state(self) -> dict[str, Any]:
         """Telemetry envelope for /health and the request record."""
         with self._condition:

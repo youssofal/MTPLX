@@ -6,8 +6,9 @@ import MTPLXAppCore
 // Browser for every model the user has forged locally (or that
 // AppConfiguration.customModels registered via rememberForgedModel).
 // Two-column layout in the same dashboard rhythm as Cache + Sessions:
-// list of cards on the left, detail panel on the right surfacing the
-// full mtplx_runtime.json via RuntimeMetadataTable.
+// list of cards on the left, detail panel on the right: a summary of
+// the model, then the full mtplx_runtime.json (RuntimeMetadataTable)
+// behind a disclosure.
 //
 // Per-entry actions: Use, Open in Finder, Publish to HF, Remove.
 
@@ -19,6 +20,7 @@ struct ForgeMineView: View {
     @State private var entries: [ForgeLocalEntry] = []
     @State private var selectedID: String?
     @State private var pendingRemoveID: String?
+    @State private var showsRuntimeFile = false
 
     var body: some View {
         Group {
@@ -135,7 +137,7 @@ struct ForgeMineView: View {
                     detailHeader(entry: entry)
                     actionRow(entry: entry)
                     if let metadata = entry.metadata {
-                        metadataCard(metadata: metadata)
+                        metadataCard(entry: entry, metadata: metadata)
                     } else {
                         Text(tr("mtplx_runtime.json missing or unreadable."))
                             .font(.caption)
@@ -186,23 +188,142 @@ struct ForgeMineView: View {
         }
     }
 
-    private func metadataCard(metadata: MTPLXRuntimeMetadata) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("MTPLX_RUNTIME.JSON")
-                .font(.system(size: 10, weight: .heavy, design: .monospaced))
-                .tracking(1.5)
-                .foregroundStyle(Brand.typeTertiary)
-            RuntimeMetadataTable(json: metadata.rawJSON)
-                .padding(12)
-                .background(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(Brand.bgInner.opacity(0.6))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .stroke(Brand.separator, lineWidth: 0.5)
-                        )
-                )
+    /// What a person asks of a model first (what it is built from, how
+    /// fast it measured, how big it is, how it samples), then the whole
+    /// runtime file one click away. The file used to fill the panel.
+    private func metadataCard(entry: ForgeLocalEntry, metadata: MTPLXRuntimeMetadata) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            let facts = summaryFacts(entry: entry, metadata: metadata)
+            if !facts.isEmpty {
+                Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 18, verticalSpacing: 11) {
+                    ForEach(facts) { fact in
+                        GridRow {
+                            Text(fact.label)
+                                .textCase(.uppercase)
+                                .font(.system(size: 10, weight: .heavy, design: .monospaced))
+                                .tracking(1.5)
+                                .foregroundStyle(Brand.typeTertiary)
+                                .gridColumnAlignment(.leading)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(fact.value)
+                                    .font(.system(size: 12.5, weight: .medium))
+                                    .foregroundStyle(Brand.typeHi)
+                                    .textSelection(.enabled)
+                                if let detail = fact.detail {
+                                    Text(detail)
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(Brand.typeTertiary)
+                                }
+                            }
+                        }
+                    }
+                }
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(panelBackground)
+            }
+            runtimeFileToggle
+            if showsRuntimeFile {
+                RuntimeMetadataTable(json: metadata.rawJSON)
+                    .padding(12)
+                    .background(panelBackground)
+            }
         }
+    }
+
+    private var runtimeFileToggle: some View {
+        Button {
+            showsRuntimeFile.toggle()
+        } label: {
+            HStack(spacing: 7) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .bold))
+                    .rotationEffect(.degrees(showsRuntimeFile ? 90 : 0))
+                Text(tr("Runtime file"))
+                    .textCase(.uppercase)
+                    .font(.system(size: 10, weight: .heavy, design: .monospaced))
+                    .tracking(1.5)
+                Text(verbatim: "mtplx_runtime.json")
+                    .font(.system(size: 10.5, design: .monospaced))
+                    .foregroundStyle(Brand.typeTertiary)
+            }
+            .foregroundStyle(Brand.typeSecondary)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(showsRuntimeFile ? [.isSelected] : [])
+    }
+
+    private var panelBackground: some View {
+        RoundedRectangle(cornerRadius: 10, style: .continuous)
+            .fill(Brand.bgInner.opacity(0.6))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(Brand.separator, lineWidth: 0.5)
+            )
+    }
+
+    private struct Fact: Identifiable {
+        let label: String
+        let value: String
+        var detail: String?
+        var id: String { label }
+    }
+
+    /// Only what the model's own files say; a row with nothing behind it
+    /// is left out rather than guessed.
+    private func summaryFacts(entry: ForgeLocalEntry, metadata: MTPLXRuntimeMetadata) -> [Fact] {
+        var facts: [Fact] = []
+        if let base = entry.sourceRepo ?? metadata.baseTrunk, !base.isEmpty {
+            facts.append(Fact(label: tr("Base model"), value: base))
+        }
+        if let verification = entry.verification, verification.bestDepth > 0, verification.multiplierVsAr > 1 {
+            // The stamped "hardware" is a platform string
+            // ("macOS-26.3.1-arm64-..."), not a Mac a person would name,
+            // so the rate is labelled by when it was measured instead.
+            let tokS = verification.tokSByDepth[verification.bestDepth]
+            facts.append(Fact(
+                label: tr("Speed"),
+                value: tr("%.2f× baseline at depth %lld", verification.multiplierVsAr, verification.bestDepth),
+                detail: tokS.map { tr("%.1f tok/s at build time", $0) }
+            ))
+        }
+        if let recipe = metadata.forgeProvenance?.forgeRecipe {
+            facts.append(Fact(
+                label: tr("Weights"),
+                value: tr("%lld-bit, group size %lld", recipe.bodyBits, recipe.bodyGroupSize)
+            ))
+        }
+        if entry.sizeOnDisk > 0 {
+            facts.append(Fact(label: tr("Size on disk"), value: formatGiB(entry.sizeOnDisk)))
+        }
+        if let sampler = metadata.rawJSON["sampler"] as? [String: Any],
+           let temperature = (sampler["temperature"] as? NSNumber)?.doubleValue,
+           let topP = (sampler["top_p"] as? NSNumber)?.doubleValue,
+           let topK = (sampler["top_k"] as? NSNumber)?.intValue {
+            facts.append(Fact(
+                label: tr("Sampler"),
+                value: tr(
+                    "temperature %@ · top-p %@ · top-k %lld",
+                    Self.samplerNumber(temperature), Self.samplerNumber(topP), topK
+                )
+            ))
+        }
+        if let profile = metadata.recommendedProfile, !profile.isEmpty {
+            facts.append(Fact(label: tr("Profile"), value: profile))
+        }
+        if let version = metadata.mtplxVersion, !version.isEmpty {
+            facts.append(Fact(label: tr("Built with"), value: tr("MTPLX %@", version)))
+        }
+        facts.append(Fact(label: tr("Hugging Face"), value: entry.publishedRepo ?? tr("Not published")))
+        return facts
+    }
+
+    /// "1.0", "0.6", "0.95": at least one decimal so a temperature of
+    /// 1.0 never reads as an integer setting; separators follow the app
+    /// language, as `tr` does.
+    private static func samplerNumber(_ value: Double) -> String {
+        value.formatted(.number.precision(.fractionLength(1...2)).locale(L10n.language.locale))
     }
 
     @ViewBuilder

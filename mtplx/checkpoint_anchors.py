@@ -20,8 +20,14 @@ frontier advances, in this order:
   reply after it is re-rendered);
 * for an image prompt, the pre-image anchor: the newest checkpoint at or
   before its first image, where a turn that changes that image resumes;
+* the turn-start anchor: the newest checkpoint at or before the first token
+  of the answer to the last real user message (``user_turn_start``), where
+  the next user turn's history changes when the chat template drops this
+  turn's thinking (Qwen 3.5 and 3.6), kept through the turn's whole tool loop;
 * the restore point this prefill resumed from (the previous prompt's end);
 * the stable prompt-prefix edge (the turn the tool-continuation hint rides);
+* the end of the prompt's system segment (``system_segment_end``), where a
+  new session of the same client resumes;
 * the newest checkpoint;
 * a fixed absolute grid: the first checkpoint in every ``grid_tokens`` cell,
   thinned by halving its resolution when the budget cannot hold every cell
@@ -53,10 +59,12 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 #: Cell width of the absolute grid, in tokens.
 GRID_TOKENS = 8192
+#: A system segment shorter than this gets no checkpoint of its own.
+SYSTEM_SEGMENT_MIN_TOKENS = 2048
 #: Checkpoints kept when the caller gives no byte budget (the count the
 #: prefill memory plan has always priced: eight boundary snapshots).
 DEFAULT_CHECKPOINT_COUNT = 8
@@ -89,6 +97,112 @@ def default_tail_backoff() -> int:
         return DEFAULT_TAIL_BACKOFF
 
 
+def system_prompt_checkpoint_enabled() -> bool:
+    """``MTPLX_SYSTEM_PROMPT_CHECKPOINT=0`` turns off the checkpoint at the
+    end of a system prompt and the SSD lane's exact point that serves it."""
+
+    raw = str(os.environ.get("MTPLX_SYSTEM_PROMPT_CHECKPOINT", "1")).strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def system_segment_end(tokens: Sequence[int]) -> int | None:
+    """Where a chat prompt's first turn ends, in tokens: the next occurrence
+    of the token the prompt opens with (ChatML's ``<|im_start|>``), when that
+    turn is at least ``SYSTEM_SEGMENT_MIN_TOKENS`` long.
+
+    For an agent client the first turn is its system prompt and tools, which
+    every new session of the client in the same project, a subagent and a
+    compacted conversation send again token for token before a different
+    first message (the founder's bank, 12 Nov: a Pi pair and an OpenCode pair
+    matched exactly to this point plus the next turn's 3-token header; a Pi
+    pair from two project folders differed 373 tokens before it, at a path).
+    Prefill records a checkpoint here for such prompts and every retention
+    keeps it. It is read from the tokens alone, so the session bank needs no
+    tokenizer; a template that opens with a BOS token has none.
+    ``MTPLX_SYSTEM_PROMPT_CHECKPOINT=0`` turns the checkpoint off.
+    """
+
+    if not system_prompt_checkpoint_enabled() or len(tokens) < 2:
+        return None
+    if not hasattr(tokens, "index"):
+        tokens = tuple(tokens)
+    try:
+        # A C-level scan that stops at the segment's end, a few thousand
+        # tokens in for an agent prompt.
+        end = int(tokens.index(tokens[0], 1))
+    except ValueError:
+        return None
+    return end if end >= SYSTEM_SEGMENT_MIN_TOKENS else None
+
+
+#: ``(<|im_start|> id, ids of "user\n", ids of "assistant\n", <tool_response> id)``
+#: of the served model's chat template, registered once by the runtime that
+#: owns the tokenizer (``configure_turn_markers``); None leaves the turn-start
+#: anchor off (the session bank itself has no tokenizer).
+_TURN_MARKERS: tuple[int, tuple[int, ...], tuple[int, ...], int] | None = None
+
+
+def configure_turn_markers(
+    markers: tuple[int, tuple[int, ...], tuple[int, ...], int] | None,
+) -> None:
+    global _TURN_MARKERS
+    _TURN_MARKERS = markers
+
+
+def turn_markers() -> tuple[int, tuple[int, ...], tuple[int, ...], int] | None:
+    return _TURN_MARKERS
+
+
+def user_turn_start(tokens: Sequence[int] | None, *, limit: int | None = None) -> int | None:
+    """The position of the first token of the answer to the last real user
+    message in ``tokens[:limit]`` (a ChatML user turn that is not a tool
+    result), or None.
+
+    With thinking on, the Qwen 3.5 and 3.6 templates drop the thinking of
+    every assistant message before the last user message, so when the next
+    user message arrives the history changes right here: everything the turn
+    wrote after it (its tool calls, the tool results, its answer) is read
+    again. A checkpoint at or before this position is what that read resumes
+    from (17 Nov 2026, founder's Pi task on the 35B: the turn's checkpoint at
+    22,164 was evicted by tool-result checkpoints and the next turn resumed at
+    18,176, 4,051 tokens earlier).
+    """
+
+    markers = _TURN_MARKERS
+    if markers is None or not tokens:
+        return None
+    start_id, user_ids, assistant_ids, tool_id = markers
+    import numpy as np
+
+    end = len(tokens) if limit is None else max(0, min(len(tokens), int(limit)))
+    if end <= 0:
+        return None
+    try:
+        ids = np.asarray(tokens[:end], dtype=np.int64)
+    except (TypeError, ValueError):
+        ids = np.fromiter((int(token) for token in tokens[:end]), dtype=np.int64, count=end)
+    if ids.ndim != 1:
+        return None
+    starts = np.flatnonzero(ids == start_id)
+    user = np.asarray(user_ids, dtype=np.int64)
+    assistant = np.asarray(assistant_ids, dtype=np.int64)
+    for index in range(len(starts) - 1, -1, -1):
+        start = int(starts[index])
+        role_end = start + 1 + len(user)
+        if role_end >= end or not np.array_equal(ids[start + 1 : role_end], user):
+            continue
+        if int(ids[role_end]) == tool_id:
+            continue
+        if index + 1 >= len(starts):
+            return None
+        answer = int(starts[index + 1])
+        answer_end = answer + 1 + len(assistant)
+        if answer_end > end or not np.array_equal(ids[answer + 1 : answer_end], assistant):
+            return None
+        return answer_end
+    return None
+
+
 @dataclass(frozen=True)
 class AnchorPlan:
     """What one prefill knows about its checkpoints before capturing any.
@@ -104,6 +218,12 @@ class AnchorPlan:
     content-keyed near-prefix lane, 2026-09-30); a checkpoint between or
     after images is a state a cold prefill of the same keyed prefix reaches
     exactly.
+    ``system_end``: the end of the prompt's system segment
+    (``system_segment_end``), protected: the checkpoint there shares the
+    grid's first cell with the chunk-grid checkpoint below it, which the
+    grid keeps first, so it was the first one dropped.
+    ``turn_start``: ``user_turn_start`` of the prompt, protected: the newest
+    checkpoint at or before it is where the next user turn resumes.
     """
 
     budget_bytes: int | None = None
@@ -115,6 +235,8 @@ class AnchorPlan:
     ceiling: int | None = None
     image_spans: tuple[tuple[int, int], ...] = ()
     grid_tokens: int = GRID_TOKENS
+    system_end: int | None = None
+    turn_start: int | None = None
 
     def admits(self, position: int) -> bool:
         position = int(position)
@@ -210,12 +332,19 @@ def retain_checkpoints(records: Iterable[Any], plan: AnchorPlan) -> list:
         if first_image is not None
         else []
     )
+    turn = (
+        [position for position in positions if position <= int(plan.turn_start)]
+        if plan.turn_start is not None
+        else []
+    )
     protected: list[int] = []
     for position in (
         below_limit[-1] if below_limit else None,
         pre_image[-1] if pre_image else None,
+        turn[-1] if turn else None,
         plan.restore_point,
         plan.stable_prefix,
+        plan.system_end,
         newest,
     ):
         if position is None:

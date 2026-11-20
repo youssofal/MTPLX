@@ -17,6 +17,11 @@ extension MetricsLatest {
 
     // --- timing ---
     var elapsedS: Double? { doubleValue("elapsed_s") }
+    /// Request arrival to the last reasoning delta a streamed turn sent.
+    var reasoningS: Double? { doubleValue("reasoning_s") }
+    /// Request arrival to the first answer text or tool call a streamed turn
+    /// sent; nil when it sent none.
+    var firstVisibleS: Double? { doubleValue("first_visible_s") }
     var requestElapsedS: Double? { doubleValue("request_elapsed_s") }
     var promptEvalTimeS: Double? { doubleValue("prompt_eval_time_s") }
     var decodeElapsedS: Double? { doubleValue("decode_elapsed_s") }

@@ -1,0 +1,757 @@
+{
+ "codex_desktop_bundle_id": "com.openai.codex",
+ "codex_desktop_min_version": [
+  26,
+  1106
+ ],
+ "codex_desktop_rows": [
+  {
+   "inputs": {
+    "api_key": null,
+    "base_url": "http://127.0.0.1:8000",
+    "context_window": 262144,
+    "existing_config": null,
+    "model_id": "mtplx-qwen38-flash-next-optimized-speed"
+   },
+   "plan": {
+    "argv": [
+     "/usr/bin/open",
+     "-n",
+     "--env",
+     "CODEX_HOME=<home>",
+     "--env",
+     "CODEX_ELECTRON_USER_DATA_PATH=<user-data>",
+     "/Applications/ChatGPT.app",
+     "--args",
+     "--user-data-dir=<user-data>"
+    ],
+    "client": "codex",
+    "env": {},
+    "files": {
+     "<home>/config.toml": "# MTPLX sets model, model_provider, web_search, model_context_window and [model_providers.mtplx] on each launch; everything else here is kept.\nmodel = \"mtplx-qwen38-flash-next-optimized-speed\"\nmodel_provider = \"mtplx\"\nweb_search = \"disabled\"\nmodel_context_window = 262144\nmodel_reasoning_effort = \"medium\"\n\n[model_providers.mtplx]\nname = \"MTPLX\"\nbase_url = \"http://127.0.0.1:8000/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nhttp_headers = { \"x-mtplx-client\" = \"codex\" }\n"
+    },
+    "folders": [
+     "<home>",
+     "<user-data>"
+    ],
+    "surface": "desktop",
+    "unset_env": []
+   }
+  },
+  {
+   "inputs": {
+    "api_key": "sk-local-test",
+    "base_url": "http://127.0.0.1:8123",
+    "context_window": 65536,
+    "existing_config": null,
+    "model_id": "mtplx-qwen38-27b-optimized-speed"
+   },
+   "plan": {
+    "argv": [
+     "/usr/bin/open",
+     "-n",
+     "--env",
+     "CODEX_HOME=<home>",
+     "--env",
+     "CODEX_ELECTRON_USER_DATA_PATH=<user-data>",
+     "/Applications/ChatGPT.app",
+     "--args",
+     "--user-data-dir=<user-data>"
+    ],
+    "client": "codex",
+    "env": {},
+    "files": {
+     "<home>/config.toml": "# MTPLX sets model, model_provider, web_search, model_context_window and [model_providers.mtplx] on each launch; everything else here is kept.\nmodel = \"mtplx-qwen38-27b-optimized-speed\"\nmodel_provider = \"mtplx\"\nweb_search = \"disabled\"\nmodel_context_window = 65536\nmodel_reasoning_effort = \"medium\"\n\n[model_providers.mtplx]\nname = \"MTPLX\"\nbase_url = \"http://127.0.0.1:8123/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nhttp_headers = { \"x-mtplx-client\" = \"codex\" }\nexperimental_bearer_token = \"sk-local-test\"\n"
+    },
+    "folders": [
+     "<home>",
+     "<user-data>"
+    ],
+    "surface": "desktop",
+    "unset_env": []
+   }
+  },
+  {
+   "inputs": {
+    "api_key": null,
+    "base_url": "http://127.0.0.1:8000",
+    "context_window": null,
+    "existing_config": null,
+    "model_id": "mtplx-qwen35-4b-speed"
+   },
+   "plan": {
+    "argv": [
+     "/usr/bin/open",
+     "-n",
+     "--env",
+     "CODEX_HOME=<home>",
+     "--env",
+     "CODEX_ELECTRON_USER_DATA_PATH=<user-data>",
+     "/Applications/ChatGPT.app",
+     "--args",
+     "--user-data-dir=<user-data>"
+    ],
+    "client": "codex",
+    "env": {},
+    "files": {
+     "<home>/config.toml": "# MTPLX sets model, model_provider, web_search, model_context_window and [model_providers.mtplx] on each launch; everything else here is kept.\nmodel = \"mtplx-qwen35-4b-speed\"\nmodel_provider = \"mtplx\"\nweb_search = \"disabled\"\nmodel_reasoning_effort = \"medium\"\n\n[model_providers.mtplx]\nname = \"MTPLX\"\nbase_url = \"http://127.0.0.1:8000/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nhttp_headers = { \"x-mtplx-client\" = \"codex\" }\n"
+    },
+    "folders": [
+     "<home>",
+     "<user-data>"
+    ],
+    "surface": "desktop",
+    "unset_env": []
+   }
+  },
+  {
+   "inputs": {
+    "api_key": null,
+    "base_url": "http://127.0.0.1:8000",
+    "context_window": 262144,
+    "existing_config": "model = \"mtplx-mock-model\"\nmodel_provider = \"mtplx\"\nweb_search = \"disabled\"\nmodel_context_window = 65536\n\nnotify = [\"/x/SkyComputerUseClient\", \"turn-ended\"]\n\n[model_providers.mtplx]\nname = \"MTPLX\"\nbase_url = \"http://127.0.0.1:51738/v1\"\nwire_api = \"responses\"\nenv_key = \"MTPLX_API_KEY\"\nrequires_openai_auth = false\nhttp_headers = { \"x-mtplx-client\" = \"codex\" }\n\n[plugins.\"browser@openai-bundled\"]\nenabled = true\n\n[mcp_servers.node_repl]\nargs = []\ncommand = \"/Applications/ChatGPT.app/node_repl\"\n\n[mcp_servers.node_repl.env]\nCODEX_HOME = \"/x/home\"\n",
+    "model_id": "mtplx-qwen38-flash-next-optimized-speed"
+   },
+   "plan": {
+    "argv": [
+     "/usr/bin/open",
+     "-n",
+     "--env",
+     "CODEX_HOME=<home>",
+     "--env",
+     "CODEX_ELECTRON_USER_DATA_PATH=<user-data>",
+     "/Applications/ChatGPT.app",
+     "--args",
+     "--user-data-dir=<user-data>"
+    ],
+    "client": "codex",
+    "env": {},
+    "files": {
+     "<home>/config.toml": "# MTPLX sets model, model_provider, web_search, model_context_window and [model_providers.mtplx] on each launch; everything else here is kept.\nmodel = \"mtplx-qwen38-flash-next-optimized-speed\"\nmodel_provider = \"mtplx\"\nweb_search = \"disabled\"\nmodel_context_window = 262144\nmodel_reasoning_effort = \"medium\"\nnotify = [\"/x/SkyComputerUseClient\", \"turn-ended\"]\n\n[plugins.\"browser@openai-bundled\"]\nenabled = true\n\n[mcp_servers.node_repl]\nargs = []\ncommand = \"/Applications/ChatGPT.app/node_repl\"\n\n[mcp_servers.node_repl.env]\nCODEX_HOME = \"/x/home\"\n\n[model_providers.mtplx]\nname = \"MTPLX\"\nbase_url = \"http://127.0.0.1:8000/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nhttp_headers = { \"x-mtplx-client\" = \"codex\" }\n"
+    },
+    "folders": [
+     "<home>",
+     "<user-data>"
+    ],
+    "surface": "desktop",
+    "unset_env": []
+   }
+  },
+  {
+   "inputs": {
+    "api_key": "sk-local-test",
+    "base_url": "http://127.0.0.1:8123",
+    "context_window": 65536,
+    "existing_config": "model = \"mtplx-mock-model\"\nmodel_provider = \"mtplx\"\nweb_search = \"disabled\"\nmodel_context_window = 65536\n\nnotify = [\"/x/SkyComputerUseClient\", \"turn-ended\"]\n\n[model_providers.mtplx]\nname = \"MTPLX\"\nbase_url = \"http://127.0.0.1:51738/v1\"\nwire_api = \"responses\"\nenv_key = \"MTPLX_API_KEY\"\nrequires_openai_auth = false\nhttp_headers = { \"x-mtplx-client\" = \"codex\" }\n\n[plugins.\"browser@openai-bundled\"]\nenabled = true\n\n[mcp_servers.node_repl]\nargs = []\ncommand = \"/Applications/ChatGPT.app/node_repl\"\n\n[mcp_servers.node_repl.env]\nCODEX_HOME = \"/x/home\"\n",
+    "model_id": "mtplx-qwen38-27b-optimized-speed"
+   },
+   "plan": {
+    "argv": [
+     "/usr/bin/open",
+     "-n",
+     "--env",
+     "CODEX_HOME=<home>",
+     "--env",
+     "CODEX_ELECTRON_USER_DATA_PATH=<user-data>",
+     "/Applications/ChatGPT.app",
+     "--args",
+     "--user-data-dir=<user-data>"
+    ],
+    "client": "codex",
+    "env": {},
+    "files": {
+     "<home>/config.toml": "# MTPLX sets model, model_provider, web_search, model_context_window and [model_providers.mtplx] on each launch; everything else here is kept.\nmodel = \"mtplx-qwen38-27b-optimized-speed\"\nmodel_provider = \"mtplx\"\nweb_search = \"disabled\"\nmodel_context_window = 65536\nmodel_reasoning_effort = \"medium\"\nnotify = [\"/x/SkyComputerUseClient\", \"turn-ended\"]\n\n[plugins.\"browser@openai-bundled\"]\nenabled = true\n\n[mcp_servers.node_repl]\nargs = []\ncommand = \"/Applications/ChatGPT.app/node_repl\"\n\n[mcp_servers.node_repl.env]\nCODEX_HOME = \"/x/home\"\n\n[model_providers.mtplx]\nname = \"MTPLX\"\nbase_url = \"http://127.0.0.1:8123/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nhttp_headers = { \"x-mtplx-client\" = \"codex\" }\nexperimental_bearer_token = \"sk-local-test\"\n"
+    },
+    "folders": [
+     "<home>",
+     "<user-data>"
+    ],
+    "surface": "desktop",
+    "unset_env": []
+   }
+  },
+  {
+   "inputs": {
+    "api_key": null,
+    "base_url": "http://127.0.0.1:8000",
+    "context_window": null,
+    "existing_config": "model = \"mtplx-mock-model\"\nmodel_provider = \"mtplx\"\nweb_search = \"disabled\"\nmodel_context_window = 65536\n\nnotify = [\"/x/SkyComputerUseClient\", \"turn-ended\"]\n\n[model_providers.mtplx]\nname = \"MTPLX\"\nbase_url = \"http://127.0.0.1:51738/v1\"\nwire_api = \"responses\"\nenv_key = \"MTPLX_API_KEY\"\nrequires_openai_auth = false\nhttp_headers = { \"x-mtplx-client\" = \"codex\" }\n\n[plugins.\"browser@openai-bundled\"]\nenabled = true\n\n[mcp_servers.node_repl]\nargs = []\ncommand = \"/Applications/ChatGPT.app/node_repl\"\n\n[mcp_servers.node_repl.env]\nCODEX_HOME = \"/x/home\"\n",
+    "model_id": "mtplx-qwen35-4b-speed"
+   },
+   "plan": {
+    "argv": [
+     "/usr/bin/open",
+     "-n",
+     "--env",
+     "CODEX_HOME=<home>",
+     "--env",
+     "CODEX_ELECTRON_USER_DATA_PATH=<user-data>",
+     "/Applications/ChatGPT.app",
+     "--args",
+     "--user-data-dir=<user-data>"
+    ],
+    "client": "codex",
+    "env": {},
+    "files": {
+     "<home>/config.toml": "# MTPLX sets model, model_provider, web_search, model_context_window and [model_providers.mtplx] on each launch; everything else here is kept.\nmodel = \"mtplx-qwen35-4b-speed\"\nmodel_provider = \"mtplx\"\nweb_search = \"disabled\"\nmodel_reasoning_effort = \"medium\"\nnotify = [\"/x/SkyComputerUseClient\", \"turn-ended\"]\n\n[plugins.\"browser@openai-bundled\"]\nenabled = true\n\n[mcp_servers.node_repl]\nargs = []\ncommand = \"/Applications/ChatGPT.app/node_repl\"\n\n[mcp_servers.node_repl.env]\nCODEX_HOME = \"/x/home\"\n\n[model_providers.mtplx]\nname = \"MTPLX\"\nbase_url = \"http://127.0.0.1:8000/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nhttp_headers = { \"x-mtplx-client\" = \"codex\" }\n"
+    },
+    "folders": [
+     "<home>",
+     "<user-data>"
+    ],
+    "surface": "desktop",
+    "unset_env": []
+   }
+  },
+  {
+   "inputs": {
+    "api_key": null,
+    "base_url": "http://127.0.0.1:8000",
+    "context_window": 262144,
+    "existing_config": "# my settings\nmodel_reasoning_effort = \"high\"\nmodel = \"gpt-old\"\n\n[model_providers.other]\nname = \"Other\"\nbase_url = \"https://example.invalid/v1\"\n",
+    "model_id": "mtplx-qwen38-flash-next-optimized-speed"
+   },
+   "plan": {
+    "argv": [
+     "/usr/bin/open",
+     "-n",
+     "--env",
+     "CODEX_HOME=<home>",
+     "--env",
+     "CODEX_ELECTRON_USER_DATA_PATH=<user-data>",
+     "/Applications/ChatGPT.app",
+     "--args",
+     "--user-data-dir=<user-data>"
+    ],
+    "client": "codex",
+    "env": {},
+    "files": {
+     "<home>/config.toml": "# MTPLX sets model, model_provider, web_search, model_context_window and [model_providers.mtplx] on each launch; everything else here is kept.\nmodel = \"mtplx-qwen38-flash-next-optimized-speed\"\nmodel_provider = \"mtplx\"\nweb_search = \"disabled\"\nmodel_context_window = 262144\n# my settings\nmodel_reasoning_effort = \"high\"\n\n[model_providers.other]\nname = \"Other\"\nbase_url = \"https://example.invalid/v1\"\n\n[model_providers.mtplx]\nname = \"MTPLX\"\nbase_url = \"http://127.0.0.1:8000/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nhttp_headers = { \"x-mtplx-client\" = \"codex\" }\n"
+    },
+    "folders": [
+     "<home>",
+     "<user-data>"
+    ],
+    "surface": "desktop",
+    "unset_env": []
+   }
+  },
+  {
+   "inputs": {
+    "api_key": "sk-local-test",
+    "base_url": "http://127.0.0.1:8123",
+    "context_window": 65536,
+    "existing_config": "# my settings\nmodel_reasoning_effort = \"high\"\nmodel = \"gpt-old\"\n\n[model_providers.other]\nname = \"Other\"\nbase_url = \"https://example.invalid/v1\"\n",
+    "model_id": "mtplx-qwen38-27b-optimized-speed"
+   },
+   "plan": {
+    "argv": [
+     "/usr/bin/open",
+     "-n",
+     "--env",
+     "CODEX_HOME=<home>",
+     "--env",
+     "CODEX_ELECTRON_USER_DATA_PATH=<user-data>",
+     "/Applications/ChatGPT.app",
+     "--args",
+     "--user-data-dir=<user-data>"
+    ],
+    "client": "codex",
+    "env": {},
+    "files": {
+     "<home>/config.toml": "# MTPLX sets model, model_provider, web_search, model_context_window and [model_providers.mtplx] on each launch; everything else here is kept.\nmodel = \"mtplx-qwen38-27b-optimized-speed\"\nmodel_provider = \"mtplx\"\nweb_search = \"disabled\"\nmodel_context_window = 65536\n# my settings\nmodel_reasoning_effort = \"high\"\n\n[model_providers.other]\nname = \"Other\"\nbase_url = \"https://example.invalid/v1\"\n\n[model_providers.mtplx]\nname = \"MTPLX\"\nbase_url = \"http://127.0.0.1:8123/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nhttp_headers = { \"x-mtplx-client\" = \"codex\" }\nexperimental_bearer_token = \"sk-local-test\"\n"
+    },
+    "folders": [
+     "<home>",
+     "<user-data>"
+    ],
+    "surface": "desktop",
+    "unset_env": []
+   }
+  },
+  {
+   "inputs": {
+    "api_key": null,
+    "base_url": "http://127.0.0.1:8000",
+    "context_window": null,
+    "existing_config": "# my settings\nmodel_reasoning_effort = \"high\"\nmodel = \"gpt-old\"\n\n[model_providers.other]\nname = \"Other\"\nbase_url = \"https://example.invalid/v1\"\n",
+    "model_id": "mtplx-qwen35-4b-speed"
+   },
+   "plan": {
+    "argv": [
+     "/usr/bin/open",
+     "-n",
+     "--env",
+     "CODEX_HOME=<home>",
+     "--env",
+     "CODEX_ELECTRON_USER_DATA_PATH=<user-data>",
+     "/Applications/ChatGPT.app",
+     "--args",
+     "--user-data-dir=<user-data>"
+    ],
+    "client": "codex",
+    "env": {},
+    "files": {
+     "<home>/config.toml": "# MTPLX sets model, model_provider, web_search, model_context_window and [model_providers.mtplx] on each launch; everything else here is kept.\nmodel = \"mtplx-qwen35-4b-speed\"\nmodel_provider = \"mtplx\"\nweb_search = \"disabled\"\n# my settings\nmodel_reasoning_effort = \"high\"\n\n[model_providers.other]\nname = \"Other\"\nbase_url = \"https://example.invalid/v1\"\n\n[model_providers.mtplx]\nname = \"MTPLX\"\nbase_url = \"http://127.0.0.1:8000/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nhttp_headers = { \"x-mtplx-client\" = \"codex\" }\n"
+    },
+    "folders": [
+     "<home>",
+     "<user-data>"
+    ],
+    "surface": "desktop",
+    "unset_env": []
+   }
+  },
+  {
+   "inputs": {
+    "api_key": null,
+    "base_url": "http://127.0.0.1:8000",
+    "context_window": 262144,
+    "existing_config": "approval_policy = \"never\"\nnotify = [\n  \"a[1]\",\n  [\"nested\", \"]\"],\n  \"\"\"x\n[not.a.table]\n\"\"\"\n]\n[tui]\nnotifications = true\n",
+    "model_id": "mtplx-qwen38-flash-next-optimized-speed"
+   },
+   "plan": {
+    "argv": [
+     "/usr/bin/open",
+     "-n",
+     "--env",
+     "CODEX_HOME=<home>",
+     "--env",
+     "CODEX_ELECTRON_USER_DATA_PATH=<user-data>",
+     "/Applications/ChatGPT.app",
+     "--args",
+     "--user-data-dir=<user-data>"
+    ],
+    "client": "codex",
+    "env": {},
+    "files": {
+     "<home>/config.toml": "# MTPLX sets model, model_provider, web_search, model_context_window and [model_providers.mtplx] on each launch; everything else here is kept.\nmodel = \"mtplx-qwen38-flash-next-optimized-speed\"\nmodel_provider = \"mtplx\"\nweb_search = \"disabled\"\nmodel_context_window = 262144\nmodel_reasoning_effort = \"medium\"\napproval_policy = \"never\"\nnotify = [\n  \"a[1]\",\n  [\"nested\", \"]\"],\n  \"\"\"x\n[not.a.table]\n\"\"\"\n]\n\n[tui]\nnotifications = true\n\n[model_providers.mtplx]\nname = \"MTPLX\"\nbase_url = \"http://127.0.0.1:8000/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nhttp_headers = { \"x-mtplx-client\" = \"codex\" }\n"
+    },
+    "folders": [
+     "<home>",
+     "<user-data>"
+    ],
+    "surface": "desktop",
+    "unset_env": []
+   }
+  },
+  {
+   "inputs": {
+    "api_key": "sk-local-test",
+    "base_url": "http://127.0.0.1:8123",
+    "context_window": 65536,
+    "existing_config": "approval_policy = \"never\"\nnotify = [\n  \"a[1]\",\n  [\"nested\", \"]\"],\n  \"\"\"x\n[not.a.table]\n\"\"\"\n]\n[tui]\nnotifications = true\n",
+    "model_id": "mtplx-qwen38-27b-optimized-speed"
+   },
+   "plan": {
+    "argv": [
+     "/usr/bin/open",
+     "-n",
+     "--env",
+     "CODEX_HOME=<home>",
+     "--env",
+     "CODEX_ELECTRON_USER_DATA_PATH=<user-data>",
+     "/Applications/ChatGPT.app",
+     "--args",
+     "--user-data-dir=<user-data>"
+    ],
+    "client": "codex",
+    "env": {},
+    "files": {
+     "<home>/config.toml": "# MTPLX sets model, model_provider, web_search, model_context_window and [model_providers.mtplx] on each launch; everything else here is kept.\nmodel = \"mtplx-qwen38-27b-optimized-speed\"\nmodel_provider = \"mtplx\"\nweb_search = \"disabled\"\nmodel_context_window = 65536\nmodel_reasoning_effort = \"medium\"\napproval_policy = \"never\"\nnotify = [\n  \"a[1]\",\n  [\"nested\", \"]\"],\n  \"\"\"x\n[not.a.table]\n\"\"\"\n]\n\n[tui]\nnotifications = true\n\n[model_providers.mtplx]\nname = \"MTPLX\"\nbase_url = \"http://127.0.0.1:8123/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nhttp_headers = { \"x-mtplx-client\" = \"codex\" }\nexperimental_bearer_token = \"sk-local-test\"\n"
+    },
+    "folders": [
+     "<home>",
+     "<user-data>"
+    ],
+    "surface": "desktop",
+    "unset_env": []
+   }
+  },
+  {
+   "inputs": {
+    "api_key": null,
+    "base_url": "http://127.0.0.1:8000",
+    "context_window": null,
+    "existing_config": "approval_policy = \"never\"\nnotify = [\n  \"a[1]\",\n  [\"nested\", \"]\"],\n  \"\"\"x\n[not.a.table]\n\"\"\"\n]\n[tui]\nnotifications = true\n",
+    "model_id": "mtplx-qwen35-4b-speed"
+   },
+   "plan": {
+    "argv": [
+     "/usr/bin/open",
+     "-n",
+     "--env",
+     "CODEX_HOME=<home>",
+     "--env",
+     "CODEX_ELECTRON_USER_DATA_PATH=<user-data>",
+     "/Applications/ChatGPT.app",
+     "--args",
+     "--user-data-dir=<user-data>"
+    ],
+    "client": "codex",
+    "env": {},
+    "files": {
+     "<home>/config.toml": "# MTPLX sets model, model_provider, web_search, model_context_window and [model_providers.mtplx] on each launch; everything else here is kept.\nmodel = \"mtplx-qwen35-4b-speed\"\nmodel_provider = \"mtplx\"\nweb_search = \"disabled\"\nmodel_reasoning_effort = \"medium\"\napproval_policy = \"never\"\nnotify = [\n  \"a[1]\",\n  [\"nested\", \"]\"],\n  \"\"\"x\n[not.a.table]\n\"\"\"\n]\n\n[tui]\nnotifications = true\n\n[model_providers.mtplx]\nname = \"MTPLX\"\nbase_url = \"http://127.0.0.1:8000/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nhttp_headers = { \"x-mtplx-client\" = \"codex\" }\n"
+    },
+    "folders": [
+     "<home>",
+     "<user-data>"
+    ],
+    "surface": "desktop",
+    "unset_env": []
+   }
+  },
+  {
+   "inputs": {
+    "api_key": null,
+    "base_url": "http://127.0.0.1:8000",
+    "context_window": 262144,
+    "existing_config": "model_provider = \"mtplx\"\n[model_providers.mtplx]\nname = \"Old\"\n\n[model_providers.mtplx.http_headers]\nX-Old = \"1\"\n\n[history]\npersistence = \"none\"\n",
+    "model_id": "mtplx-qwen38-flash-next-optimized-speed"
+   },
+   "plan": {
+    "argv": [
+     "/usr/bin/open",
+     "-n",
+     "--env",
+     "CODEX_HOME=<home>",
+     "--env",
+     "CODEX_ELECTRON_USER_DATA_PATH=<user-data>",
+     "/Applications/ChatGPT.app",
+     "--args",
+     "--user-data-dir=<user-data>"
+    ],
+    "client": "codex",
+    "env": {},
+    "files": {
+     "<home>/config.toml": "# MTPLX sets model, model_provider, web_search, model_context_window and [model_providers.mtplx] on each launch; everything else here is kept.\nmodel = \"mtplx-qwen38-flash-next-optimized-speed\"\nmodel_provider = \"mtplx\"\nweb_search = \"disabled\"\nmodel_context_window = 262144\nmodel_reasoning_effort = \"medium\"\n\n[history]\npersistence = \"none\"\n\n[model_providers.mtplx]\nname = \"MTPLX\"\nbase_url = \"http://127.0.0.1:8000/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nhttp_headers = { \"x-mtplx-client\" = \"codex\" }\n"
+    },
+    "folders": [
+     "<home>",
+     "<user-data>"
+    ],
+    "surface": "desktop",
+    "unset_env": []
+   }
+  },
+  {
+   "inputs": {
+    "api_key": "sk-local-test",
+    "base_url": "http://127.0.0.1:8123",
+    "context_window": 65536,
+    "existing_config": "model_provider = \"mtplx\"\n[model_providers.mtplx]\nname = \"Old\"\n\n[model_providers.mtplx.http_headers]\nX-Old = \"1\"\n\n[history]\npersistence = \"none\"\n",
+    "model_id": "mtplx-qwen38-27b-optimized-speed"
+   },
+   "plan": {
+    "argv": [
+     "/usr/bin/open",
+     "-n",
+     "--env",
+     "CODEX_HOME=<home>",
+     "--env",
+     "CODEX_ELECTRON_USER_DATA_PATH=<user-data>",
+     "/Applications/ChatGPT.app",
+     "--args",
+     "--user-data-dir=<user-data>"
+    ],
+    "client": "codex",
+    "env": {},
+    "files": {
+     "<home>/config.toml": "# MTPLX sets model, model_provider, web_search, model_context_window and [model_providers.mtplx] on each launch; everything else here is kept.\nmodel = \"mtplx-qwen38-27b-optimized-speed\"\nmodel_provider = \"mtplx\"\nweb_search = \"disabled\"\nmodel_context_window = 65536\nmodel_reasoning_effort = \"medium\"\n\n[history]\npersistence = \"none\"\n\n[model_providers.mtplx]\nname = \"MTPLX\"\nbase_url = \"http://127.0.0.1:8123/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nhttp_headers = { \"x-mtplx-client\" = \"codex\" }\nexperimental_bearer_token = \"sk-local-test\"\n"
+    },
+    "folders": [
+     "<home>",
+     "<user-data>"
+    ],
+    "surface": "desktop",
+    "unset_env": []
+   }
+  },
+  {
+   "inputs": {
+    "api_key": null,
+    "base_url": "http://127.0.0.1:8000",
+    "context_window": null,
+    "existing_config": "model_provider = \"mtplx\"\n[model_providers.mtplx]\nname = \"Old\"\n\n[model_providers.mtplx.http_headers]\nX-Old = \"1\"\n\n[history]\npersistence = \"none\"\n",
+    "model_id": "mtplx-qwen35-4b-speed"
+   },
+   "plan": {
+    "argv": [
+     "/usr/bin/open",
+     "-n",
+     "--env",
+     "CODEX_HOME=<home>",
+     "--env",
+     "CODEX_ELECTRON_USER_DATA_PATH=<user-data>",
+     "/Applications/ChatGPT.app",
+     "--args",
+     "--user-data-dir=<user-data>"
+    ],
+    "client": "codex",
+    "env": {},
+    "files": {
+     "<home>/config.toml": "# MTPLX sets model, model_provider, web_search, model_context_window and [model_providers.mtplx] on each launch; everything else here is kept.\nmodel = \"mtplx-qwen35-4b-speed\"\nmodel_provider = \"mtplx\"\nweb_search = \"disabled\"\nmodel_reasoning_effort = \"medium\"\n\n[history]\npersistence = \"none\"\n\n[model_providers.mtplx]\nname = \"MTPLX\"\nbase_url = \"http://127.0.0.1:8000/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nhttp_headers = { \"x-mtplx-client\" = \"codex\" }\n"
+    },
+    "folders": [
+     "<home>",
+     "<user-data>"
+    ],
+    "surface": "desktop",
+    "unset_env": []
+   }
+  }
+ ],
+ "generated_by": "scripts/write_agent_client_plans.py",
+ "local_api_key": "mtplx-local",
+ "rows": [
+  {
+   "inputs": {
+    "api_key": null,
+    "base_url": "http://127.0.0.1:8000",
+    "client": "claude-code",
+    "context_window": 262144,
+    "model_id": "mtplx-qwen38-flash-next-optimized-speed"
+   },
+   "plan": {
+    "argv": [
+     "claude",
+     "--settings",
+     "<settings>",
+     "--append-system-prompt",
+     "Your replies are shown in a terminal that draws Markdown but not LaTeX: write math as plain text with Unicode symbols (x\u00b2, \u221a2, \u2211, \u2264, \u2192, \u2202f/\u2202x), never with $...$, \\(...\\) or other LaTeX commands. When the user asks you not to search or not to use a tool, keep to that for the rest of the topic unless they say otherwise."
+    ],
+    "client": "claude-code",
+    "env": {
+     "ANTHROPIC_AUTH_TOKEN": "mtplx-local",
+     "ANTHROPIC_BASE_URL": "http://127.0.0.1:8000",
+     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "mtplx-qwen38-flash-next-optimized-speed",
+     "ANTHROPIC_DEFAULT_OPUS_MODEL": "mtplx-qwen38-flash-next-optimized-speed",
+     "ANTHROPIC_DEFAULT_SONNET_MODEL": "mtplx-qwen38-flash-next-optimized-speed",
+     "ANTHROPIC_MODEL": "mtplx-qwen38-flash-next-optimized-speed",
+     "API_TIMEOUT_MS": "3000000",
+     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+     "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "262144",
+     "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "65536",
+     "CLAUDE_CODE_SUBAGENT_MODEL": "mtplx-qwen38-flash-next-optimized-speed",
+     "ENABLE_TOOL_SEARCH": "true"
+    },
+    "files": {
+     "<settings>": "{\n  \"env\": {\n    \"ANTHROPIC_AUTH_TOKEN\": \"mtplx-local\",\n    \"ANTHROPIC_BASE_URL\": \"http://127.0.0.1:8000\",\n    \"ANTHROPIC_DEFAULT_HAIKU_MODEL\": \"mtplx-qwen38-flash-next-optimized-speed\",\n    \"ANTHROPIC_DEFAULT_OPUS_MODEL\": \"mtplx-qwen38-flash-next-optimized-speed\",\n    \"ANTHROPIC_DEFAULT_SONNET_MODEL\": \"mtplx-qwen38-flash-next-optimized-speed\",\n    \"ANTHROPIC_MODEL\": \"mtplx-qwen38-flash-next-optimized-speed\",\n    \"API_TIMEOUT_MS\": \"3000000\",\n    \"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\": \"1\",\n    \"CLAUDE_CODE_MAX_CONTEXT_TOKENS\": \"262144\",\n    \"CLAUDE_CODE_MAX_OUTPUT_TOKENS\": \"65536\",\n    \"CLAUDE_CODE_SUBAGENT_MODEL\": \"mtplx-qwen38-flash-next-optimized-speed\",\n    \"ENABLE_TOOL_SEARCH\": \"true\"\n  }\n}\n"
+    },
+    "unset_env": [
+     "ANTHROPIC_API_KEY",
+     "CLAUDE_CODE_OAUTH_TOKEN",
+     "CLAUDE_CODE_USE_BEDROCK",
+     "CLAUDE_CODE_USE_VERTEX",
+     "CLAUDE_CODE_USE_FOUNDRY",
+     "CLAUDE_CODE_USE_ANTHROPIC_AWS"
+    ]
+   }
+  },
+  {
+   "inputs": {
+    "api_key": null,
+    "base_url": "http://127.0.0.1:8000",
+    "client": "codex",
+    "context_window": 262144,
+    "model_id": "mtplx-qwen38-flash-next-optimized-speed"
+   },
+   "plan": {
+    "argv": [
+     "codex",
+     "-c",
+     "model_provider=\"mtplx\"",
+     "-c",
+     "model_providers.mtplx.name=\"MTPLX\"",
+     "-c",
+     "model_providers.mtplx.base_url=\"http://127.0.0.1:8000/v1\"",
+     "-c",
+     "model_providers.mtplx.wire_api=\"responses\"",
+     "-c",
+     "model_providers.mtplx.env_key=\"MTPLX_API_KEY\"",
+     "-c",
+     "model_providers.mtplx.requires_openai_auth=false",
+     "-c",
+     "model_providers.mtplx.http_headers={ \"x-mtplx-client\" = \"codex\" }",
+     "-c",
+     "web_search=\"disabled\"",
+     "-c",
+     "model_context_window=262144",
+     "-m",
+     "mtplx-qwen38-flash-next-optimized-speed"
+    ],
+    "client": "codex",
+    "env": {
+     "MTPLX_API_KEY": "mtplx-local"
+    },
+    "files": {},
+    "unset_env": []
+   }
+  },
+  {
+   "inputs": {
+    "api_key": "sk-local-test",
+    "base_url": "http://127.0.0.1:8123",
+    "client": "claude-code",
+    "context_window": 65536,
+    "model_id": "mtplx-qwen38-27b-optimized-speed"
+   },
+   "plan": {
+    "argv": [
+     "claude",
+     "--settings",
+     "<settings>",
+     "--append-system-prompt",
+     "Your replies are shown in a terminal that draws Markdown but not LaTeX: write math as plain text with Unicode symbols (x\u00b2, \u221a2, \u2211, \u2264, \u2192, \u2202f/\u2202x), never with $...$, \\(...\\) or other LaTeX commands. When the user asks you not to search or not to use a tool, keep to that for the rest of the topic unless they say otherwise."
+    ],
+    "client": "claude-code",
+    "env": {
+     "ANTHROPIC_AUTH_TOKEN": "sk-local-test",
+     "ANTHROPIC_BASE_URL": "http://127.0.0.1:8123",
+     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "mtplx-qwen38-27b-optimized-speed",
+     "ANTHROPIC_DEFAULT_OPUS_MODEL": "mtplx-qwen38-27b-optimized-speed",
+     "ANTHROPIC_DEFAULT_SONNET_MODEL": "mtplx-qwen38-27b-optimized-speed",
+     "ANTHROPIC_MODEL": "mtplx-qwen38-27b-optimized-speed",
+     "API_TIMEOUT_MS": "3000000",
+     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+     "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "65536",
+     "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "32000",
+     "CLAUDE_CODE_SUBAGENT_MODEL": "mtplx-qwen38-27b-optimized-speed",
+     "ENABLE_TOOL_SEARCH": "true"
+    },
+    "files": {
+     "<settings>": "{\n  \"env\": {\n    \"ANTHROPIC_AUTH_TOKEN\": \"sk-local-test\",\n    \"ANTHROPIC_BASE_URL\": \"http://127.0.0.1:8123\",\n    \"ANTHROPIC_DEFAULT_HAIKU_MODEL\": \"mtplx-qwen38-27b-optimized-speed\",\n    \"ANTHROPIC_DEFAULT_OPUS_MODEL\": \"mtplx-qwen38-27b-optimized-speed\",\n    \"ANTHROPIC_DEFAULT_SONNET_MODEL\": \"mtplx-qwen38-27b-optimized-speed\",\n    \"ANTHROPIC_MODEL\": \"mtplx-qwen38-27b-optimized-speed\",\n    \"API_TIMEOUT_MS\": \"3000000\",\n    \"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\": \"1\",\n    \"CLAUDE_CODE_MAX_CONTEXT_TOKENS\": \"65536\",\n    \"CLAUDE_CODE_MAX_OUTPUT_TOKENS\": \"32000\",\n    \"CLAUDE_CODE_SUBAGENT_MODEL\": \"mtplx-qwen38-27b-optimized-speed\",\n    \"ENABLE_TOOL_SEARCH\": \"true\"\n  }\n}\n"
+    },
+    "unset_env": [
+     "ANTHROPIC_API_KEY",
+     "CLAUDE_CODE_OAUTH_TOKEN",
+     "CLAUDE_CODE_USE_BEDROCK",
+     "CLAUDE_CODE_USE_VERTEX",
+     "CLAUDE_CODE_USE_FOUNDRY",
+     "CLAUDE_CODE_USE_ANTHROPIC_AWS"
+    ]
+   }
+  },
+  {
+   "inputs": {
+    "api_key": "sk-local-test",
+    "base_url": "http://127.0.0.1:8123",
+    "client": "codex",
+    "context_window": 65536,
+    "model_id": "mtplx-qwen38-27b-optimized-speed"
+   },
+   "plan": {
+    "argv": [
+     "codex",
+     "-c",
+     "model_provider=\"mtplx\"",
+     "-c",
+     "model_providers.mtplx.name=\"MTPLX\"",
+     "-c",
+     "model_providers.mtplx.base_url=\"http://127.0.0.1:8123/v1\"",
+     "-c",
+     "model_providers.mtplx.wire_api=\"responses\"",
+     "-c",
+     "model_providers.mtplx.env_key=\"MTPLX_API_KEY\"",
+     "-c",
+     "model_providers.mtplx.requires_openai_auth=false",
+     "-c",
+     "model_providers.mtplx.http_headers={ \"x-mtplx-client\" = \"codex\" }",
+     "-c",
+     "web_search=\"disabled\"",
+     "-c",
+     "model_context_window=65536",
+     "-m",
+     "mtplx-qwen38-27b-optimized-speed"
+    ],
+    "client": "codex",
+    "env": {
+     "MTPLX_API_KEY": "sk-local-test"
+    },
+    "files": {},
+    "unset_env": []
+   }
+  },
+  {
+   "inputs": {
+    "api_key": null,
+    "base_url": "http://127.0.0.1:8000",
+    "client": "claude-code",
+    "context_window": null,
+    "model_id": "mtplx-qwen35-4b-speed"
+   },
+   "plan": {
+    "argv": [
+     "claude",
+     "--settings",
+     "<settings>",
+     "--append-system-prompt",
+     "Your replies are shown in a terminal that draws Markdown but not LaTeX: write math as plain text with Unicode symbols (x\u00b2, \u221a2, \u2211, \u2264, \u2192, \u2202f/\u2202x), never with $...$, \\(...\\) or other LaTeX commands. When the user asks you not to search or not to use a tool, keep to that for the rest of the topic unless they say otherwise."
+    ],
+    "client": "claude-code",
+    "env": {
+     "ANTHROPIC_AUTH_TOKEN": "mtplx-local",
+     "ANTHROPIC_BASE_URL": "http://127.0.0.1:8000",
+     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "mtplx-qwen35-4b-speed",
+     "ANTHROPIC_DEFAULT_OPUS_MODEL": "mtplx-qwen35-4b-speed",
+     "ANTHROPIC_DEFAULT_SONNET_MODEL": "mtplx-qwen35-4b-speed",
+     "ANTHROPIC_MODEL": "mtplx-qwen35-4b-speed",
+     "API_TIMEOUT_MS": "3000000",
+     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+     "CLAUDE_CODE_SUBAGENT_MODEL": "mtplx-qwen35-4b-speed",
+     "ENABLE_TOOL_SEARCH": "true"
+    },
+    "files": {
+     "<settings>": "{\n  \"env\": {\n    \"ANTHROPIC_AUTH_TOKEN\": \"mtplx-local\",\n    \"ANTHROPIC_BASE_URL\": \"http://127.0.0.1:8000\",\n    \"ANTHROPIC_DEFAULT_HAIKU_MODEL\": \"mtplx-qwen35-4b-speed\",\n    \"ANTHROPIC_DEFAULT_OPUS_MODEL\": \"mtplx-qwen35-4b-speed\",\n    \"ANTHROPIC_DEFAULT_SONNET_MODEL\": \"mtplx-qwen35-4b-speed\",\n    \"ANTHROPIC_MODEL\": \"mtplx-qwen35-4b-speed\",\n    \"API_TIMEOUT_MS\": \"3000000\",\n    \"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\": \"1\",\n    \"CLAUDE_CODE_SUBAGENT_MODEL\": \"mtplx-qwen35-4b-speed\",\n    \"ENABLE_TOOL_SEARCH\": \"true\"\n  }\n}\n"
+    },
+    "unset_env": [
+     "ANTHROPIC_API_KEY",
+     "CLAUDE_CODE_OAUTH_TOKEN",
+     "CLAUDE_CODE_USE_BEDROCK",
+     "CLAUDE_CODE_USE_VERTEX",
+     "CLAUDE_CODE_USE_FOUNDRY",
+     "CLAUDE_CODE_USE_ANTHROPIC_AWS"
+    ]
+   }
+  },
+  {
+   "inputs": {
+    "api_key": null,
+    "base_url": "http://127.0.0.1:8000",
+    "client": "codex",
+    "context_window": null,
+    "model_id": "mtplx-qwen35-4b-speed"
+   },
+   "plan": {
+    "argv": [
+     "codex",
+     "-c",
+     "model_provider=\"mtplx\"",
+     "-c",
+     "model_providers.mtplx.name=\"MTPLX\"",
+     "-c",
+     "model_providers.mtplx.base_url=\"http://127.0.0.1:8000/v1\"",
+     "-c",
+     "model_providers.mtplx.wire_api=\"responses\"",
+     "-c",
+     "model_providers.mtplx.env_key=\"MTPLX_API_KEY\"",
+     "-c",
+     "model_providers.mtplx.requires_openai_auth=false",
+     "-c",
+     "model_providers.mtplx.http_headers={ \"x-mtplx-client\" = \"codex\" }",
+     "-c",
+     "web_search=\"disabled\"",
+     "-m",
+     "mtplx-qwen35-4b-speed"
+    ],
+    "client": "codex",
+    "env": {
+     "MTPLX_API_KEY": "mtplx-local"
+    },
+    "files": {},
+    "unset_env": []
+   }
+  }
+ ],
+ "version": 2
+}

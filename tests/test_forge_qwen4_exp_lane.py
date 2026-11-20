@@ -9,6 +9,7 @@ import struct
 from mtplx.commands.forge_qwen4_exp import (
     NGRAM_PRODUCTION_LAYOUT,
     Qwen4ForgeError,
+    head_overrides,
     is_qwen4_exp_source,
     mtp_layout_keys,
     mtp_module_rule,
@@ -95,6 +96,31 @@ def test_mtp_rules_mirror_trunk_recipe() -> None:
     assert rule("layers.0.attn_hyper_connection.input_mix_weight_down.weight") is None
     assert rule("fc_hidden.weight") is None
     assert mtp_module_rule("layers.0.mlp.switch_mlp.up_proj.weight", mtp_bits=0, mtp_group=32) is None
+
+
+def test_the_head_mirrors_a_recipes_overrides_except_those_that_name_trunk_layers() -> None:
+    recipe = {
+        "module_overrides": [
+            {"suffix": "shared_expert.up_proj", "bits": 4, "group_size": 64},
+            {"suffix": "self_attn.o_proj", "quantize": False},
+            {"suffix": "mlp.gate", "bits": 4, "group_size": 32, "layers": [46, 47]},
+        ]
+    }
+    overrides = head_overrides(recipe)
+
+    def rule(key):
+        return mtp_module_rule(key, mtp_bits=4, mtp_group=32, overrides=overrides)
+
+    assert rule("layers.0.mlp.shared_expert.up_proj.weight") == (4, 64)
+    assert rule("layers.0.self_attn.o_proj.weight") is None
+    assert rule("layers.0.mlp.gate.weight") == (8, 64)  # the trunk's layers 46 and 47 are not the head's layer 0
+    assert rule("layers.0.mlp.shared_expert.down_proj.weight") == (8, 64)
+    assert head_overrides({}) == ()
+
+
+def test_the_head_follows_the_trunks_group_unless_pinned() -> None:
+    assert recipe_params({"body_bits": 4, "body_group_size": 64})["mtp_group"] == 64
+    assert recipe_params({"body_bits": 4, "body_group_size": 64, "qwen4_mtp_group_size": 32})["mtp_group"] == 32
 
 
 def test_named_quality_is_the_decided_recipe_and_is_not_mutable_global_state():

@@ -143,6 +143,83 @@ def test_the_receipt_carries_the_thermal_state(process_sampler):
     assert receipt["thermal_pressure_max"] == "heavy"
 
 
+def test_the_receipt_says_whether_the_prompt_was_read_on_a_throttled_chip(process_sampler):
+    from test_server_openai import _fake_state
+    from mtplx.server import openai
+
+    # Nominal while the prompt is read (102 to 104), heavy from 105 on: the
+    # read was cool even though the request ended hot.
+    clock = _Clock(100.0)
+    sampler = process_sampler(ThermalPressureSampler(_Reader([0, 2]), clock=clock))
+    for when in (100.0, 105.0):
+        clock.t = when
+        sampler.sample_once()
+    state = _fake_state()
+    openai._record_request_metrics(
+        state,
+        {"request_id": "chatcmpl-a", "request_received_monotonic_s": 102.0, "ttft_s": 2.0},
+    )
+    openai._record_request_metrics(
+        state,
+        {"request_id": "chatcmpl-b", "request_received_monotonic_s": 103.0, "ttft_s": 4.0},
+    )
+    cool, hot = state.last_metrics[-2:]
+    assert cool["thermal_pressure_max"] == "heavy"
+    assert cool["thermal_pressure_prefill_max"] == "nominal"
+    assert hot["thermal_pressure_prefill_max"] == "heavy"
+    # A request that never reached a first token has no read to judge.
+    openai._record_request_metrics(
+        state, {"request_id": "chatcmpl-c", "request_received_monotonic_s": 103.0}
+    )
+    assert "thermal_pressure_prefill_max" not in state.last_metrics[-1]
+
+
+def test_heavy_and_worse_are_throttling():
+    assert [thermal_pressure.is_throttling(level) for level in thermal_pressure.THERMAL_PRESSURE_LEVELS] == [
+        False, False, True, True, True,
+    ]
+    assert not thermal_pressure.is_throttling(UNAVAILABLE)
+    assert not thermal_pressure.is_throttling(None)
+
+
+def test_the_session_prefill_speed_is_weighted_by_tokens_and_counts_throttled_reads(
+    process_sampler,
+):
+    from test_server_openai import _fake_state
+    from mtplx.server import openai
+    from mtplx.server.dashboard_state import DashboardState
+
+    clock = _Clock(100.0)
+    sampler = process_sampler(ThermalPressureSampler(_Reader([0, 2]), clock=clock))
+    for when in (100.0, 200.0):
+        clock.t = when
+        sampler.sample_once()
+    state = _fake_state()
+    state.dashboard = DashboardState()
+    # His 12 November shape: a cold 50K read on a cool chip, then a warm
+    # 6,843-token read at 868 tok/s under heavy pressure, and a cached turn
+    # whose 19 new tokens are no speed at all.
+    reads = [
+        {"new_prefill_tokens": 50_000, "prefill_tok_s": 2_200.0, "request_received_monotonic_s": 110.0, "ttft_s": 23.0},
+        {"new_prefill_tokens": 6_843, "prefill_tok_s": 868.0, "request_received_monotonic_s": 210.0, "ttft_s": 8.0},
+        {"new_prefill_tokens": 19, "prefill_tok_s": 153.0, "request_received_monotonic_s": 220.0, "ttft_s": 0.3},
+    ]
+    for index, read in enumerate(reads):
+        openai._dashboard_record_completion(
+            state, envelope={"request_id": f"r{index}", **read}, stats={}
+        )
+    lifetime = state.dashboard.lifetime.snapshot()
+    assert lifetime["prefill_reads_total"] == 2
+    assert lifetime["prefill_throttled_reads_total"] == 1
+    assert lifetime["prefill_read_tokens_total"] == 56_843
+    assert lifetime["prefill_read_peak_tok_s"] == 2_200.0
+    weighted = 56_843 / lifetime["prefill_read_seconds_total"]
+    assert weighted == pytest.approx(56_843 / (50_000 / 2_200 + 6_843 / 868))
+    # Weighted by tokens, the session reads at about 1,860 tok/s: neither the
+    # throttled turn's 868 nor a plain mean of the two turns.
+    assert 1_800 < weighted < 1_900
+
+
 def test_the_flight_end_event_keeps_the_receipt_thermal_state(tmp_path):
     from mtplx.server.flight_recorder import FlightRecorder
 

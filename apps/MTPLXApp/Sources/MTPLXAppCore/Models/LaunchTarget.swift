@@ -17,6 +17,13 @@ public enum LaunchTarget: String, Codable, CaseIterable, Identifiable, Sendable 
     case pi          // Pi terminal
     case openCode    // OpenCode Desktop D3 MTP; reasoning follows MTPLXApp
     case hermes      // Hermes Agent launched in Terminal against MTPLX
+    case claudeCode  // Claude Code CLI in Terminal; MTPLX-owned --settings
+                     // file and per-launch env, the user's setup untouched
+    case codex       // Codex app as MTPLX's own instance when installed,
+                     // else the Codex CLI in Terminal (-c overrides)
+    case deepseekHarness // DeepSeek Harness: its browser app by default, or
+                     // its terminal app; MTPLX's own harness home with its
+                     // telemetry off (mtplx connect deepseek-harness)
     case benchmark   // AIME 2026 native benchmark overlay. The overlay
                      // starts a benchmark-tuned daemon if none is
                      // reachable, then runs against that daemon.
@@ -31,6 +38,9 @@ public enum LaunchTarget: String, Codable, CaseIterable, Identifiable, Sendable 
         case .pi: return tr("Pi")
         case .openCode: return tr("OpenCode")
         case .hermes: return tr("Hermes")
+        case .claudeCode: return tr("Claude Code")
+        case .codex: return tr("Codex")
+        case .deepseekHarness: return tr("DeepSeek Harness")
         case .benchmark: return tr("Benchmark")
         case .other: return tr("Other")
         }
@@ -46,18 +56,44 @@ public enum LaunchTarget: String, Codable, CaseIterable, Identifiable, Sendable 
         case .pi:
             return tr("Use Pi in the terminal.")
         case .openCode:
-            return tr("Use OpenCode Desktop, powered by MTPLX.")
+            return ClientOpenings.currentSurface(.openCode) == ClientOpenings.terminalChoice
+                ? tr("Use OpenCode in the terminal, powered by MTPLX.")
+                : tr("Use OpenCode Desktop, powered by MTPLX.")
         case .hermes:
-            return tr("Use Hermes Desktop, powered by MTPLX — terminal, file, web, browser, and messaging tools.")
+            return ClientOpenings.currentSurface(.hermes) == ClientOpenings.terminalChoice
+                ? tr("Use Hermes in the terminal, powered by MTPLX, with file, web, browser and messaging tools.")
+                : tr("Use Hermes Desktop, powered by MTPLX — terminal, file, web, browser, and messaging tools.")
+        case .claudeCode:
+            return tr("Use Claude Code in the terminal, powered by MTPLX.")
+        case .codex:
+            // The Codex app as MTPLX's own instance when installed and not
+            // set to a terminal, else the Codex CLI in the picked terminal
+            // (CodexDesktopIntegration, ClientOpenings). The copy is a second
+            // app in the Dock with its own history: say so up front.
+            return ClientOpenings.currentSurface(.codex) == ClientOpenings.mtplxApp
+                && CodexDesktopIntegration.findApp()?.supported == true
+                ? tr("Opens a separate copy of the Codex app with its own history, powered by MTPLX.")
+                : tr("Use Codex in the terminal, powered by MTPLX.")
+        case .deepseekHarness:
+            // Its browser app by default (`dsh web`, which MTPLX starts and
+            // stops). With a terminal picked, the same browser app is started
+            // from that terminal so its log shows there: 0.1.2 has no
+            // terminal interface of its own.
+            return ClientOpenings.currentSurface(.deepseekHarness) == ClientOpenings.terminalChoice
+                ? tr("Starts DeepSeek Harness from the terminal and opens it in your browser, powered by MTPLX, telemetry off.")
+                : tr("Use DeepSeek Harness in your browser, powered by MTPLX, telemetry off.")
         case .benchmark:
             return tr("Run AIME 2026.")
         case .other:
-            return tr("Connect Cursor, Codex, Claude Code, or any compatible app.")
+            return tr("Connect Cursor, Cline, or any compatible app.")
         }
     }
 
-    /// SF Symbol identifier. Picked so every glyph reads at the same
-    /// visual weight as a single-stroke monochrome shape:
+    /// SF Symbol identifier, shown where the target has no drawn mark (the
+    /// app draws Claude Code, Codex, OpenCode and Hermes as one-colour
+    /// monochrome artwork, `ClientMark`). Picked so every
+    /// glyph reads at the same visual weight as a single-stroke
+    /// monochrome shape:
     ///   - chat → single message bubble (`text.bubble`) — the dual
     ///     bubbles SF Symbol was visually heavier than its siblings.
     ///   - openCode → `square` is an outlined frame (the SF Symbol
@@ -68,13 +104,17 @@ public enum LaunchTarget: String, Codable, CaseIterable, Identifiable, Sendable 
     ///     mathematical reasoning"; the bullseye / target glyphs
     ///     visually clashed with the other launch icons.
     ///   - other → curly-braces ellipsis to suggest "custom client".
+    ///   - claudeCode → asterisk; codex → terminal prompt.
     public var systemImage: String {
         switch self {
         case .chat: return "text.bubble"
         case .openWebUI: return "globe"
         case .pi: return "pi"
         case .openCode: return "square"
-        case .hermes: return "sparkles"  // fallback only; launch picker renders the real Hermes logo
+        case .hermes: return "sparkles"
+        case .claudeCode: return "asterisk"
+        case .codex: return "terminal"
+        case .deepseekHarness: return "fish"
         case .benchmark: return "function"
         case .other: return "ellipsis.curlybraces"
         }

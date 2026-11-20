@@ -1267,6 +1267,56 @@ public struct OpenCodeIntegration: Sendable {
             }
         }
     }
+
+    /// OpenCode's terminal UI on the MTPLX model, in the terminal picked for
+    /// OpenCode (Settings, or `opencode_opens_in`), as `mtplx start opencode`
+    /// opens it. It reads the config `sync` wrote, like the Desktop app.
+    /// The window is the user's: Stop does not close it.
+    @MainActor
+    public func launchInTerminal(
+        configuration: MTPLXAppConfiguration,
+        handoffDirectory: URL = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent(".mtplx/handoffs", isDirectory: true)
+    ) async -> OpenCodeDesktopResult {
+        let opening = ClientOpenings.currentTerminal(.openCode)
+        func result(_ action: OpenCodeDesktopAction, _ detail: String) -> OpenCodeDesktopResult {
+            OpenCodeDesktopResult(
+                action: action, wasRunning: false, didTerminateExistingInstance: false,
+                didOpen: action == .opened, detail: detail
+            )
+        }
+        let quote = AgentCLIIntegration.shellQuote
+        // The provider `sync` writes (`providers["mtplx"]`).
+        let reference = "mtplx/\(Self.modelID(for: configuration.model))"
+        let script = [
+            "#!/bin/zsh",
+            "cd \(quote(PiIntegration.resolvedWorkspacePath(configuration: configuration))) || exit 1",
+            "command -v opencode >/dev/null 2>&1 || { print -r -- "
+                + quote("OpenCode for the terminal is not installed: npm install -g opencode-ai")
+                + "; exit 127; }",
+            "exec opencode --model \(quote(reference))",
+        ].joined(separator: "\n") + "\n"
+        let scriptURL = handoffDirectory
+            .appendingPathComponent("open-opencode-\(UUID().uuidString.lowercased()).command")
+        do {
+            try MTPLXTerminalHandoffLease.writeSecureCommandScript(script, to: scriptURL)
+        } catch {
+            return result(.unavailable, tr("could not open OpenCode automatically: %@", String(describing: error)))
+        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = ["-a", opening.openApplication, scriptURL.path]
+        let watchdog = SubprocessWatchdog(process)
+        do {
+            try process.run()
+        } catch {
+            return result(.unavailable, tr("could not open OpenCode automatically: %@", String(describing: error)))
+        }
+        guard watchdog.wait(for: process, timeout: 30), process.terminationStatus == 0 else {
+            return result(.unavailable, tr("could not open OpenCode automatically: %@", "open exited \(process.terminationStatus)"))
+        }
+        return result(.opened, tr("opened OpenCode in %@", opening.terminalName))
+    }
     #endif
 }
 

@@ -221,3 +221,120 @@ def test_clear_cache_stays_off_below_threshold(monkeypatch):
         MTPLX_CONTEXT_COPY_BATCHED="0",
     )
     assert out.stats.clear_cache_events == 0
+
+
+def test_a_long_prefill_is_cleared_out_of_the_cache_at_the_first_round(monkeypatch):
+    """A long prefill's freed buffers are not the answer's sizes: the first
+    round after it clears MLX's cache, though the answer never reaches the
+    cadence's first clear (window n4a4, 12 Nov: 97.7 GB held for the first
+    120 tokens of a 131K answer against 92.1 GB of live arrays)."""
+
+    calls: list[str] = []
+    monkeypatch.setattr("mtplx.generation.mx.clear_cache", lambda: calls.append("clear"))
+    out = _run(
+        monkeypatch,
+        max_tokens=64,
+        MTPLX_CLEAR_CACHE_EVERY="auto",
+        MTPLX_CLEAR_CACHE_EVERY_CONTEXT_THRESHOLD="8",  # the 16-token prompt is "long"
+        MTPLX_CLEAR_CACHE_EVERY_LONG_CONTEXT="100000",  # the cadence alone never fires
+        MTPLX_SUSTAINED_PREFILL_LAYOUT="contiguous_dense_decode",
+        MTPLX_CONTEXT_COPY_BATCHED="0",
+    )
+    assert out.stats.clear_cache_events == 1
+    assert calls.count("clear") >= 1
+    assert list(out.tokens) == _expected_cycle(_FULL_CYCLE_PROMPT[-1], len(out.tokens))
+
+
+def test_a_short_prefill_keeps_the_cache_for_the_answer(monkeypatch):
+    out = _run(
+        monkeypatch,
+        max_tokens=64,
+        MTPLX_CLEAR_CACHE_EVERY="auto",
+        MTPLX_CLEAR_CACHE_EVERY_CONTEXT_THRESHOLD="1000",
+        MTPLX_CLEAR_CACHE_EVERY_LONG_CONTEXT="100000",
+        MTPLX_SUSTAINED_PREFILL_LAYOUT="contiguous_dense_decode",
+        MTPLX_CONTEXT_COPY_BATCHED="0",
+    )
+    assert out.stats.clear_cache_events == 0
+
+
+def test_an_operator_who_turned_the_clears_off_gets_none(monkeypatch):
+    out = _run(
+        monkeypatch,
+        max_tokens=64,
+        MTPLX_CLEAR_CACHE_EVERY="0",
+        MTPLX_CLEAR_CACHE_EVERY_CONTEXT_THRESHOLD="8",
+        MTPLX_SUSTAINED_PREFILL_LAYOUT="contiguous_dense_decode",
+        MTPLX_CONTEXT_COPY_BATCHED="0",
+    )
+    assert out.stats.clear_cache_events == 0
+
+
+
+def _restored(monkeypatch, *, source: str) -> None:
+    """The prompt comes back from ``source`` with one new token, as a
+    follow-up's does: the real prefill runs, and its state then reads as a
+    restore of all but the last token."""
+
+    import dataclasses
+
+    from mtplx import generation
+
+    real = generation.restore_or_prefill_prompt_state
+
+    def restored(*args, **kwargs):
+        state = real(*args, **kwargs)
+        cached = len(state.token_prefix) - 1
+        return dataclasses.replace(
+            state,
+            cached_tokens=cached,
+            suffix_tokens=1,
+            cache_hit=True,
+            cache_source=source,
+            ssd_cache_hit=source == "ssd",
+            ssd_cached_tokens=cached if source == "ssd" else 0,
+        )
+
+    monkeypatch.setattr(generation, "restore_or_prefill_prompt_state", restored)
+
+
+def test_a_long_conversation_restored_from_ssd_is_cleared_out_of_the_cache_at_the_first_round(
+    monkeypatch,
+):
+    """An SSD restore frees buffers behind a short suffix (the decode's read
+    buffers, each layer's buffers from before it grew): in window n4k1 (12
+    Nov, the built candidate) a 118,096-token restore left 6.25 to 6.73 GB in
+    MLX's cache for the answer's first 1,041 tokens against 88.38 GB of live
+    arrays. The first round clears them, as after a long prefill."""
+
+    _restored(monkeypatch, source="ssd")
+    calls: list[str] = []
+    monkeypatch.setattr("mtplx.generation.mx.clear_cache", lambda: calls.append("clear"))
+    out = _run(
+        monkeypatch,
+        max_tokens=64,
+        MTPLX_CLEAR_CACHE_EVERY="auto",
+        MTPLX_CLEAR_CACHE_EVERY_CONTEXT_THRESHOLD="8",  # the 15 restored tokens are "long"
+        MTPLX_CLEAR_CACHE_EVERY_LONG_CONTEXT="100000",  # the cadence alone never fires
+        MTPLX_SUSTAINED_PREFILL_LAYOUT="contiguous_dense_decode",
+        MTPLX_CONTEXT_COPY_BATCHED="0",
+    )
+    assert out.stats.clear_cache_events == 1
+    assert calls.count("clear") >= 1
+    assert list(out.tokens) == _expected_cycle(_FULL_CYCLE_PROMPT[-1], len(out.tokens))
+
+
+def test_a_conversation_served_from_ram_keeps_the_cache_for_the_answer(monkeypatch):
+    """A lease or RAM restore allocated nothing to free: no clear at its first round."""
+
+    _restored(monkeypatch, source="ram")
+    out = _run(
+        monkeypatch,
+        max_tokens=64,
+        MTPLX_CLEAR_CACHE_EVERY="auto",
+        MTPLX_CLEAR_CACHE_EVERY_CONTEXT_THRESHOLD="8",
+        MTPLX_CLEAR_CACHE_EVERY_LONG_CONTEXT="100000",
+        MTPLX_SUSTAINED_PREFILL_LAYOUT="contiguous_dense_decode",
+        MTPLX_CONTEXT_COPY_BATCHED="0",
+    )
+    assert out.stats.clear_cache_events == 0

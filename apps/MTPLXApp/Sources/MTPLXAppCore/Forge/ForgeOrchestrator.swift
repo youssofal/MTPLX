@@ -201,7 +201,7 @@ public final class ForgeOrchestrator: ObservableObject {
 
     public func freeDiskGiB(modelLibrary: ModelLibrary? = nil) -> Double {
         let library = modelLibrary ?? self.modelLibrary
-        return ModelStoreVolume.freeGiB(at: ModelStoreVolume.measurementURL(for: library.primaryDirectory))
+        return ModelStoreVolume.freeGiB(forStore: library.primaryDirectory)
     }
 
     // MARK: - Plan step

@@ -504,6 +504,20 @@ public struct ModelDownloader: Sendable {
         if let override = env["MTPLX_MODEL_DIR"], !override.isEmpty {
             return URL(fileURLWithPath: (override as NSString).expandingTildeInPath)
         }
+        // The download folder the app and `mtplx folders downloads` share
+        // (`model_dir` in ~/.mtplx/config.toml). Without it, a wizard that
+        // measured free space here read the home volume while downloads went
+        // to an external drive (#466, through the shared setting). Read only
+        // from the environment the caller passes, so a test's scratch HOME
+        // never reaches the real file.
+        if env["HOME"] != nil || env["MTPLX_CONFIG"] != nil,
+           let shared = try? SharedModelFolders.read(
+               from: SharedModelFolders.configURL(environment: env)
+           ),
+           let modelDir = shared.modelDir,
+           !modelDir.isEmpty {
+            return URL(fileURLWithPath: (modelDir as NSString).expandingTildeInPath)
+        }
         let home = env["HOME"] ?? NSHomeDirectory()
         return URL(fileURLWithPath: home)
             .appendingPathComponent(".mtplx", isDirectory: true)

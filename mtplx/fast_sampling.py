@@ -861,12 +861,19 @@ def batched_sparse_distributions_from_mlx_logits(
 def sample_token_ids_from_mlx_logits(
     logits: mx.array,
     config: SamplerConfig,
+    *,
+    key: mx.array | None = None,
 ) -> mx.array | None:
     """Sample token ids on-device with the same top-k/top-p semantics.
 
     This is for exact target-prefix verification paths that need sampled target
     ids, not p/q residual distributions. It keeps the small-support sampling on
     MLX and returns one token id per input row.
+
+    ``key`` is the draw's MLX random key. A decode loop passes one made from
+    its request's seeded generator (``device_sample_key``): without it the
+    draw comes from MLX's process-wide generator, which MLX seeds from the
+    clock, so two processes never draw the same tokens for the same seed.
     """
 
     if config.temperature <= 0:
@@ -877,7 +884,7 @@ def sample_token_ids_from_mlx_logits(
     if config.top_k <= 0:
         if 0 < config.top_p < 1.0:
             return None
-        return mx.random.categorical(rows)
+        return mx.random.categorical(rows, key=key)
 
     k = min(int(config.top_k), vocab_size)
     if k <= 0:
@@ -903,5 +910,15 @@ def sample_token_ids_from_mlx_logits(
         top_idx = mx.take_along_axis(top_idx, vocab_order, axis=-1)
         top_vals = mx.take_along_axis(top_vals, vocab_order, axis=-1)
 
-    sampled_offsets = mx.random.categorical(top_vals)
+    sampled_offsets = mx.random.categorical(top_vals, key=key)
     return mx.take_along_axis(top_idx, sampled_offsets[..., None], axis=-1)[..., 0]
+
+
+def device_sample_key(rng: np.random.Generator, config: SamplerConfig) -> mx.array | None:
+    """The MLX key for one on-device draw, taken from a request's seeded host
+    generator, so a request's seed fixes its device-sampled tokens in any
+    process; None for a greedy sampler, which draws nothing."""
+
+    if config.temperature <= 0:
+        return None
+    return mx.random.key(int(rng.integers(0, 2**31 - 1)))

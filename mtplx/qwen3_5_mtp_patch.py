@@ -285,6 +285,9 @@ def inject_qwen3_5_mtp_support(
     text_model.mtp = mtp
     text_model._mtplx_hidden_variant = "pre_norm"
     text_model._mtplx_concat_order = "embedding_hidden"
+    from .compressed_tensors import LAST_MTP_NORM_REPAIRS
+
+    text_model._mtplx_draft_head_norm_repairs = [dict(r) for r in LAST_MTP_NORM_REPAIRS]
 
     original_text_class = text_model.__class__
 

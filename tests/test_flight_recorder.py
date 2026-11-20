@@ -394,7 +394,8 @@ def test_non_streaming_requests_get_sink_driven_samples(tmp_path):
 def test_non_stream_token_callback_feeds_the_flight_recorder():
     """A non-streaming chat request must drive the recorder's token hook the
     way the SSE drain loop does, or /v1/mtplx/flight reports it as a
-    never-ending prefill."""
+    never-ending prefill. Both feed the same per-request progress helper,
+    whose recorder calls tests/test_nonstream_dashboard_progress.py pins."""
     import inspect
     import re
 
@@ -403,4 +404,6 @@ def test_non_stream_token_callback_feeds_the_flight_recorder():
     source = inspect.getsource(server)
     start = source.index("def _nonstream_on_tokens(")
     body = source[start : source.index("def adopt_forked_session(", start)]
-    assert re.search(r"_flight\(state\)\.on_tokens\(\s*response_id,", body)
+    assert re.search(r"nonstream_progress\.on_tokens\(\s*len\(new_tokens\),", body)
+    helper = inspect.getsource(server._DashboardDecodeProgress.on_tokens)
+    assert re.search(r"recorder\.on_tokens\(self\._request_id,", helper)

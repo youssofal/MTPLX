@@ -82,6 +82,7 @@ from mtplx.a3b_mtp_batch import (
 from mtplx.adaptive import AdaptiveDepthPolicy, ExpectedValueDepthPolicy
 from mtplx.attention_context import attention_phase
 from mtplx.cache_state import snapshot_cache
+from mtplx.token_ids import as_token_tuple
 from mtplx.one_copy import (
     anchor_nbytes as one_copy_anchor_nbytes,
     one_copy_runtime,
@@ -119,9 +120,12 @@ from mtplx.chat_encode_cache import (
     ChatSegmentEncodeMemo,
 )
 from mtplx.chat_encoding import encode_chat_messages, is_gemma4_tokenizer
+from mtplx.token_prefix import common_prefix_len
 from mtplx.server.stream_recovery import (
     _ATTEMPT_PROMPT_IDS_KEY,
+    _append_metrics_row,
     _metric_for_request,
+    _note_metrics_rows_changed,
     _run_stream_recovery_chain,
     _update_recovery_metrics,
 )
@@ -250,6 +254,9 @@ from mtplx.server.omlx_bridge import (
 from mtplx.server.omlx_bridge.tool_calling import (
     PYTHONIC_TOOL_CALL_END,
     PYTHONIC_TOOL_CALL_START,
+    decode_escaped_tool_text as _decode_escaped_tool_text,
+    order_tool_arguments_for_client_display as _order_tool_arguments_for_client_display,
+    tool_arguments_exact as _tool_arguments_exact,
 )
 from mtplx.server_urls import (
     bind_label,
@@ -322,7 +329,7 @@ try:
         system_prompt_hash,
     )
     from mtplx.runtime import load
-    from mtplx.session_bank import CacheMissReason, common_prefix_len
+    from mtplx.session_bank import CacheMissReason
     from mtplx.cache_state import restore_cache, snapshot_cache
 
     _RUNTIME_IMPORT_ERROR: Exception | None = None
@@ -344,7 +351,6 @@ except Exception as exc:
     _default_stop_tokens = _missing_runtime
     _sample_from_logits = _missing_runtime
     _strip_terminal_stop = _missing_runtime
-    common_prefix_len = _missing_runtime
     restore_cache = _missing_runtime
     snapshot_cache = _missing_runtime
     load = _missing_runtime
@@ -1806,10 +1812,30 @@ class ChatCompletionRequest(BaseModel):
     # Set by the Anthropic conversion only. Pydantic does not read a private
     # attribute from client JSON, so a body field of the same name is ignored.
     _auto_mode_classifier: bool = PrivateAttr(default=False)
+    # Tools the client loads on demand (Anthropic tool search): declared, so
+    # the parser knows them, but kept out of the prompt's tool section. The
+    # conversation carries a loaded tool's definition where it was loaded.
+    _deferred_tool_names: frozenset[str] = PrivateAttr(default=frozenset())
+    _loaded_tool_names: tuple[str, ...] = PrivateAttr(default=())
+    # Tools that asked to be loaded on demand but are declared up front: the
+    # served template does not list tools the way a loaded one is written.
+    _defer_loading_declined_names: frozenset[str] = PrivateAttr(default=frozenset())
 
     @property
     def auto_mode_classifier(self) -> bool:
         return self._auto_mode_classifier
+
+    @property
+    def defer_loading_declined_names(self) -> frozenset[str]:
+        return self._defer_loading_declined_names
+
+    @property
+    def deferred_tool_names(self) -> frozenset[str]:
+        return self._deferred_tool_names
+
+    @property
+    def loaded_tool_names(self) -> tuple[str, ...]:
+        return self._loaded_tool_names
 
     model: str | None = None
     messages: list[ChatMessage] = Field(default_factory=list)
@@ -1831,6 +1857,13 @@ class ChatCompletionRequest(BaseModel):
     seed: int | None = None
     enable_thinking: bool | None = None
     reasoning_effort: str | None = None
+    # The client's own cap on reasoning tokens, under the names clients send
+    # it by (_client_thinking_budget). Declared so that none of them is
+    # silently swallowed by extra="allow"; typed loosely so that a value this
+    # server does not read as a cap is ignored, not refused.
+    thinking_budget: Any = None
+    thinking_token_budget: Any = None
+    reasoning: Any = None
     stream: bool = False
     tools: list[dict[str, Any]] | None = None
     tool_choice: Any = None
@@ -2579,6 +2612,27 @@ def _sync_launched_client_window(state: Any) -> None:
         _startup_line(f"warning: could not set the client window: {exc}")
 
 
+def _client_opens_in(client: str, *, terminal: bool = False) -> str:
+    """Where a client opens, for startup lines: "Ghostty", "the OpenCode
+    app". ``terminal``: the terminal its command runs in."""
+
+    from mtplx import client_opening
+
+    choice = client_opening.saved_choice(client)
+    opening = (
+        client_opening.terminal_for(client, choice)
+        if terminal
+        else client_opening.resolve(client, choice)
+    )
+    return client_opening.describe(opening)
+
+
+def _opened_line(name: str, result: dict[str, Any]) -> None:
+    _startup_line(f"{name} opened in {result.get('terminal') or 'Terminal'}.")
+    if result.get("note"):
+        _startup_line(f"  ({result['note']})")
+
+
 def _open_pi_later(command: str, *, model_id: str, delay_s: float = 1.0) -> None:
     def open_pi() -> None:
         try:
@@ -2586,7 +2640,7 @@ def _open_pi_later(command: str, *, model_id: str, delay_s: float = 1.0) -> None
 
             result = launch_pi_in_terminal(command, model_ref=pi_model_ref(model_id))
             if result.get("ok"):
-                _startup_line("Pi opened in Terminal.")
+                _opened_line("Pi", result)
             else:
                 _startup_line(
                     f"warning: could not open Pi automatically: {result.get('error')}"
@@ -2601,14 +2655,18 @@ def _open_pi_later(command: str, *, model_id: str, delay_s: float = 1.0) -> None
     timer.start()
 
 
-def _open_opencode_later(*, delay_s: float = 1.0) -> None:
+def _open_opencode_later(
+    *, model_id: str, surface: str | None = None, delay_s: float = 1.0
+) -> None:
     def open_opencode() -> None:
         try:
-            from mtplx.opencode import launch_opencode_app
+            from mtplx.opencode import open_opencode
 
-            result = launch_opencode_app()
+            result = open_opencode(model_id, surface=surface)
             if result.get("ok"):
-                _startup_line("OpenCode Desktop opened.")
+                _startup_line(f"Opened {result.get('opened')}.")
+                if result.get("note"):
+                    _startup_line(f"  ({result['note']})")
             else:
                 _startup_line(
                     f"warning: could not open OpenCode automatically: {result.get('error')}"
@@ -2628,9 +2686,9 @@ def _open_hermes_later(command: str, *, delay_s: float = 1.0) -> None:
         try:
             from mtplx.pi import launch_pi_in_terminal
 
-            result = launch_pi_in_terminal(command)
+            result = launch_pi_in_terminal(command, client="hermes")
             if result.get("ok"):
-                _startup_line("Hermes Agent opened in Terminal.")
+                _opened_line("Hermes Agent", result)
             else:
                 _startup_line(
                     f"warning: could not open Hermes automatically: {result.get('error')}"
@@ -2641,6 +2699,161 @@ def _open_hermes_later(command: str, *, delay_s: float = 1.0) -> None:
             _startup_line(f"run manually: {command}")
 
     timer = Timer(delay_s, open_hermes)
+    timer.daemon = True
+    timer.start()
+
+
+def _agent_client_desktop_app(args: Any) -> dict[str, Any] | None:
+    """The app ``mtplx start codex|claude-code|deepseek-harness`` opens
+    (Codex: MTPLX's own copy of its app, by default; DeepSeek Harness: its
+    browser app, by default; Claude Code: MTPLX's own copy of the Claude app
+    when ``claude_code_opens_in`` picks it), or None for the client's CLI in
+    a terminal (``--cli``, a terminal chosen in the client's setting, no app
+    MTPLX can open). ``--app`` asks for the app whatever the setting says."""
+
+    from mtplx import agent_clients, client_opening
+
+    client = str(getattr(args, "launch_agent_client", "") or "")
+    if client not in agent_clients.AGENT_CLIENTS:
+        return None
+    return agent_clients.desktop_app_for(
+        client,
+        cli=bool(getattr(args, "agent_client_cli", False)),
+        app=bool(getattr(args, "agent_client_app", False)),
+        choice=client_opening.saved_choice(client),
+    )
+
+
+def _agent_client_app_phrase(client: str) -> str:
+    """How a startup line names the app a client opens as."""
+
+    if client == "deepseek-harness":
+        return "its browser app"
+    app_name = "Claude" if client == "claude-code" else "Codex"
+    return f"MTPLX's own copy of the {app_name} app"
+
+
+def _open_agent_client_later(state: Any, *, delay_s: float = 1.0) -> None:
+    """Open Claude Code, Codex or DeepSeek Harness on this server (mtplx start).
+
+    The plan comes from mtplx.agent_clients, the one the app's Start menu
+    mirrors, built here because only the running server knows the window it
+    serves (and whether it reads images). Nothing in the user's own client
+    configuration is edited. Codex opens as MTPLX's own copy of the Codex app
+    when a supported one is installed, DeepSeek Harness as its browser app
+    (the CLI with ``--cli`` or a terminal chosen in the client's setting), and
+    that app is closed when this server exits, as the app's Stop does. The
+    CLI opens in the terminal chosen for the client, Terminal by default.
+    """
+
+    args = state.args
+    client = str(getattr(args, "launch_agent_client", "") or "").strip()
+    if not client:
+        return
+    desktop_app = _agent_client_desktop_app(args)
+    app_phrase = _agent_client_app_phrase(client)
+    app_name = "DeepSeek Harness browser" if client == "deepseek-harness" else (
+        "Claude" if client == "claude-code" else "Codex"
+    )
+    workspace = str(getattr(args, "agent_client_workspace", "") or "") or os.getcwd()
+    vision = _server_vision_spec(state) is not None
+
+    def open_desktop(app: dict[str, Any]) -> bool:
+        import atexit
+
+        from mtplx import agent_clients
+
+        name = agent_clients.DISPLAY_NAMES[client]
+        result = agent_clients.open_desktop_copy(
+            client,
+            app,
+            base_url=_startup_server_url(args),
+            model_id=str(args.model_id),
+            context_window=int(served_execution_window(state).get("tokens") or 0) or None,
+            api_key=getattr(args, "api_key", None),
+            vision=vision,
+            workspace=workspace,
+        )
+        if not result.get("ok"):
+            _startup_line(
+                f"warning: could not open the {app_name} app: {result.get('error')}; "
+                f"opening the {name} CLI in {_client_opens_in(client, terminal=True)} instead."
+            )
+            return False
+        pid = result.get("pid")
+        if pid and client == "deepseek-harness":
+            atexit.register(agent_clients.end_desktop_copy, client, int(pid), app)
+            _startup_line(
+                f"{name} opened as {app_phrase} at {result.get('url')} (pid {pid}); "
+                "it closes when this server stops. Its telemetry, its vendor session "
+                "log and feedback uploads are off."
+            )
+            return True
+        if pid:
+            atexit.register(agent_clients.end_desktop_copy, client, int(pid), app)
+            _startup_line(
+                f"{name} opened as {app_phrase} (pid {pid}); "
+                "it closes when this server stops."
+            )
+        elif client == "codex":
+            _startup_line(
+                "Codex opened as MTPLX's own copy of the Codex app; its process did "
+                "not appear in time, so quit it yourself when you stop this server."
+            )
+        else:
+            _startup_line(
+                "Claude Code opened as MTPLX's own copy of the Claude app (experimental); "
+                "quit it yourself when you stop this server."
+            )
+        _startup_line(
+            f"  Its own history and settings live in {agent_clients.desktop_copy_root(client)} "
+            "(`mtplx clients` shows its size and how to remove it)."
+        )
+        return True
+
+    def open_client() -> None:
+        from mtplx import agent_clients
+
+        if desktop_app is not None:
+            try:
+                if open_desktop(desktop_app):
+                    return
+            except Exception as exc:  # the server keeps serving; fall back
+                _startup_line(f"warning: could not open the {app_name} app: {exc}")
+        plan = agent_clients.build_plan(
+            client,
+            base_url=_startup_server_url(args),
+            model_id=str(args.model_id),
+            context_window=int(served_execution_window(state).get("tokens") or 0) or None,
+            api_key=getattr(args, "api_key", None),
+            tool_search=_served_template_lists_tools_as_json_lines(state),
+            vision=vision,
+        )
+        name = agent_clients.DISPLAY_NAMES[plan["client"]]
+        if client == "deepseek-harness":
+            from mtplx import deepseek_harness
+
+            # Nothing that reports to the vendor may be on in the tree the
+            # installed harness composes with MTPLX's profile: fail closed.
+            checked = deepseek_harness.check_composition(
+                plan, profile=deepseek_harness.TERMINAL_PROFILE
+            )
+            if not checked.get("ok"):
+                _startup_line(f"warning: MTPLX did not open {name}: {checked.get('error')}")
+                return
+        try:
+            result = agent_clients.open_in_terminal(plan, workspace=workspace)
+        except Exception as exc:  # the server keeps serving; say what to run
+            result = {"ok": False, "error": str(exc)}
+        if result.get("ok"):
+            _opened_line(name, result)
+        else:
+            _startup_line(
+                f"warning: could not open {name} automatically: {result.get('error')}"
+            )
+            _startup_line(f"run it yourself: {agent_clients.display_command(plan)}")
+
+    timer = Timer(delay_s, open_client)
     timer.daemon = True
     timer.start()
 
@@ -3083,6 +3296,33 @@ def _arm_gpu_keepalive(state: "ServerState") -> dict[str, Any]:
     receipt["enabled"] = True
     receipt["wired_limit_bytes"] = int(wired)
     return receipt
+
+
+def _wire_cold_tier_to_scheduler(cold_tier: Any, scheduler: Any) -> None:
+    """Connect the SSD cold tier to the model-owner scheduler.
+
+    Foreground yield (2026-08-07): the tier's encode runs on the owner
+    thread and its writer thread moves GBs through unified memory; both
+    stand down while a request is queued or running (the encode aborts
+    between tensor evals and re-dispatches, the writer pauses between entry
+    writes). Without it the SSD write of each fresh postcommit entry
+    overlapped the next turn: -30% decode and 0.66-0.75 s of unattributed
+    prompt-state wall (gate254-c4s).
+
+    Residency (12 Nov): the spill and the restore run on the owner thread
+    for seconds with no command buffer of their own, and the keepalive
+    beats only between items, so between their units they beat it
+    (``ModelWorkScheduler.beat_within_item``); otherwise the process lost
+    its Metal residency in the middle of a long answer's spill, at Stop's
+    flush too, and the next request paid to bring the weights back.
+    """
+
+    if cold_tier is None:
+        return
+    if hasattr(scheduler, "foreground_busy"):
+        cold_tier.foreground_busy = scheduler.foreground_busy
+    if hasattr(scheduler, "beat_within_item"):
+        cold_tier.owner_beat = scheduler.beat_within_item
 
 
 def _gpu_keepalive_health(state: "ServerState") -> dict[str, Any]:
@@ -3669,6 +3909,19 @@ class ServerState:
             )
         else:
             self.draft_head_identity = None
+        # Draft-head gains the load restored (compressed_tensors.unshifted_mtp_norms):
+        # in /health and in every request's log row, never silent.
+        _model_for_repairs = getattr(self.runtime, "model", None)
+        _text_for_repairs = getattr(_model_for_repairs, "language_model", _model_for_repairs)
+        self.draft_head_norm_repairs = [
+            dict(r) for r in (getattr(_text_for_repairs, "_mtplx_draft_head_norm_repairs", None) or [])
+        ]
+        for _repair in self.draft_head_norm_repairs:
+            _startup_line(
+                f"[mtp norms] draft head gain restored: {_repair.get('tensor')} mean "
+                f"{_repair.get('mean_before')} -> {_repair.get('mean_after')} "
+                "(MTPLX_DRAFT_HEAD_NORM_REPAIR=0 loads it as stored)"
+            )
         scheduler_config = _scheduler_config_from_args(args)
         self.mtp_batch_lane = None
         self.mtp_batch_lanes: dict[int, Any] = {}
@@ -4046,20 +4299,14 @@ class ServerState:
                 _bank.cold_enqueue_dispatch = lambda job: (
                     _scheduler.submit_idle_postcommit(job, batch_key="ssd.cold_enqueue")
                 )
-        # Foreground-yield wiring (2026-08-07): the cold tier's encode runs
-        # on the model-owner thread and its writer thread moves GBs through
-        # unified memory — both must stand down while a request is queued or
-        # running (encode aborts between tensor evals and re-dispatches;
-        # writer pauses between entry writes). Without this the SSD write of
-        # each fresh postcommit entry overlapped the next turn: -30% decode
-        # + 0.66-0.75 s unattributed prompt-state wall (gate254-c4s).
-        if self.session_bank_cold_tier is not None and hasattr(
-            self.model_scheduler, "foreground_busy"
-        ):
-            self.session_bank_cold_tier.foreground_busy = (
-                self.model_scheduler.foreground_busy
-            )
+        _wire_cold_tier_to_scheduler(
+            self.session_bank_cold_tier, self.model_scheduler
+        )
         self.last_metrics: list[dict[str, Any]] = []
+        # Bumped whenever a row of last_metrics is added or updated in place
+        # (_note_metrics_rows_changed): a metrics stream opened with
+        # rows=changed sends the rows only when they changed.
+        self.metrics_revision = 0
         # Per-request flight recorder (second-by-second telemetry + live
         # in-flight endpoint). Inert when resolved off; hot paths only touch
         # plain counters and a queue.
@@ -5917,7 +6164,7 @@ def _image_prompt_view(splice: Any) -> Callable[[Sequence[int]], list[int] | Non
     def keyed(text_ids: Sequence[int]) -> list[int] | None:
         try:
             expanded = _expand_image_pads(
-                [int(token) for token in text_ids],
+                list(map(int, text_ids)),
                 image_pad_id=pad_id,
                 pad_counts=pad_counts,
             )
@@ -5969,7 +6216,7 @@ def _session_frontier_ids(token_ids: Sequence[int], splice: Any) -> list[int] | 
     session switch is off.
     """
 
-    ids = [int(token) for token in token_ids]
+    ids = list(map(int, token_ids))
     if splice is None:
         return ids
     if not _vision_session_frontier_enabled():
@@ -6016,9 +6263,9 @@ def _vision_canonicalization_refusal(
             break
         shared += 1
     limit = raw_runs[shared][0] if shared < len(raw_runs) else len(raw_keyed)
-    tail = [int(token) for token in raw_keyed[limit:]]
+    tail = list(map(int, raw_keyed[limit:]))
     head_len = len(canonical_keyed) - len(tail)
-    if head_len < 0 or [int(t) for t in canonical_keyed[head_len:]] != tail:
+    if head_len < 0 or list(map(int, canonical_keyed[head_len:])) != tail:
         return "canonicalization_crossed_an_image_not_in_the_session"
     head = canonical_keyed[:head_len]
     if [tuple(head[start:end]) for start, end in image_key_runs(head)] != [
@@ -6072,7 +6319,7 @@ def _vision_gate_canonicalization(
             served_splice = _vision_splice_for_ids(state, splice, served_ids)
             # The ids the model reads, keyed with their own positions, must be
             # exactly the view the repair was judged in.
-            if vision_bank_key_ids(served_ids, served_splice) != [int(t) for t in keyed]:
+            if vision_bank_key_ids(served_ids, served_splice) != list(map(int, keyed)):
                 refusal = "image_positions_changed"
             else:
                 served = (messages, served_ids, served_splice)
@@ -6090,7 +6337,7 @@ def _vision_gate_canonicalization(
     receipt["canonicalized"] = served is not None
     served_keyed = canonicalized[1] if served is not None else raw_keyed
     receipt["session_committed_tokens"] = len(committed)
-    receipt["committed_prefix_tokens"] = int(_common_prefix_len(served_keyed, committed))
+    receipt["committed_prefix_tokens"] = int(common_prefix_len(served_keyed, committed))
     if not committed and receipt.get("refused") is None:
         receipt["refused"] = "no_committed_stream"
     return served
@@ -6158,6 +6405,32 @@ def _vision_rows_for_image(
                 (pinned or frozenset()) | frozenset({cache_key})
             )
     return rows, pad_count, grid
+
+
+async def _materialize_vision_splice_observed(
+    state: Any,
+    images: list[bytes],
+    prompt_ids: list[int],
+    observability: dict[str, Any],
+) -> tuple[list[int], Any]:
+    """``_materialize_vision_splice`` off the event loop (#487), with what this
+    request's images cost in its row: ``vision_cache_hits`` (images whose
+    embedding was cached: a screenshot already seen), ``vision_tower_misses``
+    and ``vision_tower_s`` (images the image model ran on, and its time), and
+    ``vision_materialize_s`` (all of it, wall time). An image already seen
+    should cost a hit and no tower time; the row now says whether it did."""
+
+    timing: dict[str, Any] = {}
+    started = time.perf_counter()
+    try:
+        return await asyncio.to_thread(
+            _materialize_vision_splice, state, images, prompt_ids, timing=timing
+        )
+    finally:
+        observability["vision_materialize_s"] = round(time.perf_counter() - started, 4)
+        observability["vision_cache_hits"] = int(timing.get("vision_cache_hits", 0))
+        observability["vision_tower_misses"] = int(timing.get("vision_tower_misses", 0))
+        observability["vision_tower_s"] = round(float(timing.get("vision_tower_s", 0.0)), 4)
 
 
 def _materialize_vision_splice(
@@ -6407,12 +6680,18 @@ def _anthropic_content_to_chat_content(content: Any) -> Any:
     return parts
 
 
+# Anthropic's own search tools (tool_search_tool_regex_*, _bm25_*) run on the
+# API's servers. This server cannot run them, so they are dropped like the
+# other server-side tools, and a request that declares one keeps every tool in
+# the tool section: nothing is deferred that the model could not reach.
+_ANTHROPIC_TOOL_SEARCH_SERVER_TYPE_PREFIX = "tool_search_tool_"
 _ANTHROPIC_SERVER_SIDE_TOOL_TYPE_PREFIXES = (
     "web_search_",
     "code_execution_",
     "bash_",
     "text_editor_",
     "computer_",
+    _ANTHROPIC_TOOL_SEARCH_SERVER_TYPE_PREFIX,
 )
 
 
@@ -6473,9 +6752,40 @@ def _anthropic_tool_result_id(block: dict[str, Any]) -> str:
     return str(block.get("tool_use_id") or block.get("id") or "").strip()
 
 
+_ANTHROPIC_CLIENT_METADATA_RE = re.compile(r"^\s*<([A-Za-z][\w.-]*)>[\s\S]*</\1>\s*$")
+
+
+def _is_anthropic_client_metadata_block(block: Any) -> bool:
+    """A text block that is one client-emitted tag and nothing else, such as
+    ``<total_tokens>…</total_tokens>`` or ``<system-reminder>…</system-reminder>``."""
+    if not isinstance(block, dict) or str(block.get("type") or "") != "text":
+        return False
+    return bool(_ANTHROPIC_CLIENT_METADATA_RE.match(str(block.get("text") or "")))
+
+
+def _fold_metadata_into_tool_message(
+    tool_message: ChatMessage, blocks: list[Any]
+) -> ChatMessage:
+    extra = "\n\n".join(str(block.get("text") or "").strip() for block in blocks)
+    content = tool_message.content
+    if isinstance(content, list):
+        folded: Any = [*content, {"type": "text", "text": "\n\n" + extra}]
+    else:
+        base = _content_to_text(content)
+        folded = f"{base}\n\n{extra}" if base else extra
+    return tool_message.model_copy(update={"content": folded})
+
+
 def _anthropic_message_to_chat_messages(
     message: AnthropicMessage,
+    *,
+    fold_client_metadata: bool = False,
 ) -> list[ChatMessage]:
+    """``fold_client_metadata``: fold a client's one-tag bookkeeping blocks
+    after tool results into the tool response. The server sets it only when
+    it resolves scoped reasoning history (_reasoning_history_scoped_active),
+    the one mode where a trailing user message changes what the template
+    renders; every other family's prompt stays as it was."""
     role = str(message.role or "").strip().lower()
     if role == "assistant":
         text_parts: list[str] = []
@@ -6540,6 +6850,22 @@ def _anthropic_message_to_chat_messages(
                 )
             else:
                 pending_blocks.append(block)
+        if (
+            fold_client_metadata
+            and pending_blocks
+            and messages
+            and messages[-1].role == "tool"
+            and all(_is_anthropic_client_metadata_block(b) for b in pending_blocks)
+        ):
+            # Agent clients append their own bookkeeping after the tool
+            # results of a turn (Claude Code: a `<total_tokens>` budget, a
+            # `<system-reminder>`). As a separate user message it counts as a
+            # real user query for the Qwen rolling checkpoint, so every tool
+            # step closed the round and the prompt dropped the reasoning of
+            # the whole active round. Folded into the tool response it stays
+            # visible to the model and the round stays open.
+            messages[-1] = _fold_metadata_into_tool_message(messages[-1], pending_blocks)
+            pending_blocks = []
         if pending_blocks or not messages:
             messages.append(
                 ChatMessage(
@@ -6562,6 +6888,148 @@ def _anthropic_is_server_side_tool(tool: dict[str, Any]) -> bool:
         tool_type.startswith(prefix)
         for prefix in _ANTHROPIC_SERVER_SIDE_TOOL_TYPE_PREFIXES
     )
+
+
+def _anthropic_is_tool_search_server_tool(tool: Any) -> bool:
+    return isinstance(tool, dict) and str(tool.get("type") or "").strip().startswith(
+        _ANTHROPIC_TOOL_SEARCH_SERVER_TYPE_PREFIX
+    )
+
+
+@dataclass(frozen=True)
+class _AnthropicTools:
+    """A request's client tools as the chat path takes them.
+
+    ``specs`` holds every client tool, OpenAI-shaped, so the parser knows every
+    name the model may call. ``deferred`` names the tools declared with
+    ``defer_loading: true`` (Claude Code's tool search): they stay out of the
+    prompt's tool section, and a ``tool_reference`` block writes a tool's
+    definition (``definitions``) where the client loaded it. The tool section
+    is the same before and after a load, so the cached prefix survives it.
+    ``declined`` names the tools that asked for ``defer_loading`` but stay in
+    the tool section: the served template does not list tools in the
+    encoding a loaded definition is written in.
+    """
+
+    specs: list[dict[str, Any]] | None
+    deferred: frozenset[str]
+    definitions: Mapping[str, dict[str, Any]]
+    declined: frozenset[str] = frozenset()
+
+
+def _anthropic_tools(
+    tools: list[dict[str, Any]] | None, *, defer: bool = True
+) -> _AnthropicTools:
+    specs = _anthropic_tools_to_openai(tools)
+    definitions = {spec["function"]["name"]: spec for spec in specs or ()}
+    deferred: frozenset[str] = frozenset()
+    if not any(_anthropic_is_tool_search_server_tool(tool) for tool in tools or ()):
+        deferred = frozenset(
+            name
+            for tool in tools or ()
+            if isinstance(tool, dict)
+            and tool.get("defer_loading") is True
+            and (name := str(tool.get("name") or "").strip()) in definitions
+        )
+    if not defer:
+        return _AnthropicTools(
+            specs=specs, deferred=frozenset(), definitions=definitions, declined=deferred
+        )
+    if deferred and deferred.issuperset(definitions):
+        # The Anthropic API refuses this too: no tool would be left to load
+        # the others with.
+        raise HTTPException(
+            status_code=400,
+            detail="every tool has defer_loading set; at least one must be loaded up front",
+        )
+    return _AnthropicTools(specs=specs, deferred=deferred, definitions=definitions)
+
+
+def _anthropic_tool_reference_name(block: Any) -> str | None:
+    if not isinstance(block, dict) or block.get("type") != "tool_reference":
+        return None
+    name = str(block.get("tool_name") or "").strip()
+    return name or None
+
+
+def _anthropic_loaded_tools_block(
+    names: Sequence[str],
+    definitions: Mapping[str, dict[str, Any]],
+    *,
+    inline: bool = True,
+) -> dict[str, Any]:
+    """One text block for a run of ``tool_reference`` blocks.
+
+    ``inline``: the definitions are written in the encoding of the prompt's
+    own tool section (one JSON function per line inside ``<tools>``, keys
+    sorted as the template receives them), so the model reads a tool it
+    loaded exactly as it reads one declared up front. Only for a served
+    template that lists tools that way (`_served_template_lists_tools_as_json_lines`);
+    any other template already declares every tool up front, so a load only
+    names the tools.
+    """
+
+    known_names = [name for name in names if name in definitions]
+    known = [
+        json.dumps(definitions[name], sort_keys=True, ensure_ascii=False)
+        for name in known_names
+    ]
+    missing = [name for name in names if name not in definitions]
+    parts: list[str] = []
+    if known and not inline:
+        parts.append("Loaded: " + ", ".join(known_names))
+    elif known:
+        parts.append(
+            "You now have access to the following functions:\n\n<tools>\n"
+            + "\n".join(known)
+            + "\n</tools>"
+        )
+    if missing:
+        parts.append("These tools are not available: " + ", ".join(missing))
+    return {"type": "text", "text": "\n\n".join(parts)}
+
+
+def _anthropic_expand_tool_references(
+    blocks: Any,
+    definitions: Mapping[str, dict[str, Any]],
+    loaded: list[str],
+    *,
+    inline: bool = True,
+) -> Any:
+    """``blocks`` with every run of ``tool_reference`` blocks, here or inside a
+    tool result, replaced by one text block carrying the loaded definitions.
+    The referenced names are appended to ``loaded``. Content without a
+    reference is returned as the same object, so its bytes cannot change."""
+
+    if not isinstance(blocks, list):
+        return blocks
+    expanded: list[Any] = []
+    run: list[str] = []
+    changed = False
+
+    def flush_run() -> None:
+        if run:
+            expanded.append(_anthropic_loaded_tools_block(run, definitions, inline=inline))
+            loaded.extend(run)
+            run.clear()
+
+    for block in blocks:
+        if (name := _anthropic_tool_reference_name(block)) is not None:
+            run.append(name)
+            changed = True
+            continue
+        flush_run()
+        if isinstance(block, dict) and block.get("type") == "tool_result":
+            content = block.get("content")
+            content_expanded = _anthropic_expand_tool_references(
+                content, definitions, loaded, inline=inline
+            )
+            if content_expanded is not content:
+                block = {**block, "content": content_expanded}
+                changed = True
+        expanded.append(block)
+    flush_run()
+    return expanded if changed else blocks
 
 
 def _anthropic_tools_to_openai(
@@ -6648,6 +7116,13 @@ def _anthropic_thinking_to_enable_thinking(thinking: Any) -> bool | None:
     return None
 
 
+def _anthropic_thinking_budget(thinking: Any) -> Any:
+    """``thinking.budget_tokens``: the request's own cap on reasoning tokens,
+    passed on as the chat request's ``thinking_budget``."""
+
+    return thinking.get("budget_tokens") if isinstance(thinking, dict) else None
+
+
 def _anthropic_disable_parallel_tool_use(tool_choice: Any) -> bool | None:
     """Anthropic's parallel-tools preference rides as a sibling key on
     tool_choice (``{"type": "auto", "disable_parallel_tool_use": true}``).
@@ -6689,13 +7164,30 @@ def _anthropic_output_config_effort(output_config: Any) -> str | None:
 
 def _anthropic_to_chat_request(
     request: AnthropicMessagesRequest,
+    *,
+    fold_client_metadata: bool = False,
+    defer_tools: bool = True,
 ) -> ChatCompletionRequest:
+    """``defer_tools``: whether tools with ``defer_loading`` may stay out of
+    the prompt (`_served_template_lists_tools_as_json_lines`); when not, every
+    tool is declared up front and the request log counts the declined ones."""
     messages: list[ChatMessage] = []
     system_text = _anthropic_system_to_text(request.system)
     if system_text:
         messages.append(ChatMessage(role="system", content=system_text))
+    tools = _anthropic_tools(request.tools, defer=defer_tools)
+    loaded: list[str] = []
     for message in request.messages:
-        messages.extend(_anthropic_message_to_chat_messages(message))
+        content = _anthropic_expand_tool_references(
+            message.content, tools.definitions, loaded, inline=defer_tools
+        )
+        if content is not message.content:
+            message = message.model_copy(update={"content": content})
+        messages.extend(
+            _anthropic_message_to_chat_messages(
+                message, fold_client_metadata=fold_client_metadata
+            )
+        )
     enable_thinking = _anthropic_thinking_to_enable_thinking(request.thinking)
     extra_fields: dict[str, Any] = {}
     if isinstance(request.chat_template_kwargs, dict):
@@ -6721,7 +7213,7 @@ def _anthropic_to_chat_request(
         temperature=request.temperature,
         top_p=request.top_p,
         top_k=request.top_k,
-        tools=_anthropic_tools_to_openai(request.tools),
+        tools=tools.specs,
         tool_choice=_anthropic_tool_choice_to_openai(request.tool_choice),
         parallel_tool_calls=(
             None if disable_parallel is None else not disable_parallel
@@ -6729,6 +7221,7 @@ def _anthropic_to_chat_request(
         stop=request.stop_sequences,
         metadata=request.metadata,
         enable_thinking=enable_thinking,
+        thinking_budget=_anthropic_thinking_budget(request.thinking),
         depth=request.depth,
         draft_block_size=request.draft_block_size,
         gemma_draft_block_size=request.gemma_draft_block_size,
@@ -6746,7 +7239,86 @@ def _anthropic_to_chat_request(
     chat_request._auto_mode_classifier = _claude_code_auto_mode_classifier(
         request, system_text
     )
+    chat_request._deferred_tool_names = tools.deferred
+    chat_request._loaded_tool_names = tuple(
+        dict.fromkeys(name for name in loaded if name in tools.deferred)
+    )
+    chat_request._defer_loading_declined_names = tools.declined
     return chat_request
+
+
+# A one-tool render of the served chat template tells whether it lists tools
+# as one JSON object per line inside <tools>, the encoding a loaded tool's
+# definition is written in (`_anthropic_loaded_tools_block`). The Qwen
+# templates do; Gemma 4's and others do not, and a definition written that way
+# would reach their model in a format it was never trained on.
+_TOOL_ENCODING_PROBE_NAME = "mtplx_tool_encoding_probe"
+_TOOL_ENCODING_PROBE = {
+    "type": "function",
+    "function": {
+        "name": _TOOL_ENCODING_PROBE_NAME,
+        "description": "Probe.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
+
+
+def _template_lists_tools_as_json_lines(rendered: str) -> bool:
+    """Whether ``rendered`` (a prompt rendered with the probe tool) carries
+    the probe as one JSON line inside ``<tools>`` ... ``</tools>``."""
+
+    start = rendered.find("<tools>")
+    end = rendered.find("</tools>", start + 1) if start >= 0 else -1
+    if start < 0 or end < 0:
+        return False
+    for line in rendered[start + len("<tools>"):end].splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except ValueError:
+            return False
+        function = item.get("function") if isinstance(item, dict) else None
+        if isinstance(function, dict) and function.get("name") == _TOOL_ENCODING_PROBE_NAME:
+            return True
+    return False
+
+
+def _served_template_lists_tools_as_json_lines(state: "ServerState") -> bool:
+    """Whether a tool Claude Code loads through its tool search can be written
+    inline for the served model (rendered once per tokenizer). False keeps
+    every tool up front: no deferral on a template this cannot read, and a
+    template that fails to render is treated the same way (logged once)."""
+
+    tokenizer = getattr(getattr(state, "runtime", None), "tokenizer", None)
+    if tokenizer is None:
+        return False
+    # Kept with the tokenizer it was rendered with, so a reloaded model is
+    # probed again.
+    cached = getattr(state, "_tool_json_lines_probe", None)
+    if isinstance(cached, tuple) and cached[0] is tokenizer:
+        return bool(cached[1])
+    try:
+        rendered = _render_messages_with_chat_template(
+            tokenizer,
+            [{"role": "user", "content": "Hi."}],
+            add_generation_prompt=True,
+            enable_thinking=False,
+            reasoning_effort=None,
+            preserve_thinking=False,
+            tools=[_TOOL_ENCODING_PROBE],
+        )
+        result = _template_lists_tools_as_json_lines(rendered or "")
+    except Exception as exc:
+        LOGGER.warning(
+            "tool search: the served chat template did not render a probe tool (%s); "
+            "every tool stays up front",
+            exc,
+        )
+        result = False
+    state._tool_json_lines_probe = (tokenizer, result)
+    return result
 
 
 # The first sentence of the system prompt of Claude Code's auto-mode safety
@@ -7560,8 +8132,11 @@ _TOOL_FUNCTION_START_RE = re.compile(
     r"^\s*<function=([^>\s]+)>\s*(.*?)\s*$",
     re.IGNORECASE | re.DOTALL,
 )
+# The template writes a parameter as "<parameter=k>\n{value}\n</parameter>":
+# capture between exactly those two formatting newlines, so a value's own
+# leading or trailing whitespace stays part of it (#691).
 _TOOL_PARAMETER_BLOCK_RE = re.compile(
-    r"<parameter=([^>\s]+)>\s*(.*?)\s*</parameter>",
+    r"<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>",
     re.IGNORECASE | re.DOTALL,
 )
 _TOOL_PARAMETER_TYPE_WRAPPER_RE = re.compile(
@@ -9943,39 +10518,6 @@ def _json_object_string(value: Any, *, context: str) -> str:
     return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
 
 
-_TOOL_ARGUMENT_PRIMARY_ORDER: dict[str, tuple[str, ...]] = {
-    "read": ("filePath", "path", "offset", "limit"),
-    "grep": ("pattern", "path", "include", "limit"),
-    "glob": ("pattern", "path"),
-    "bash": ("command", "description", "timeout"),
-    "write": ("filePath", "path", "content"),
-    "edit": ("filePath", "path", "oldString", "newString", "replaceAll"),
-    "webfetch": ("url", "format", "timeout"),
-    "skill": ("name",),
-    "question": ("questions",),
-}
-
-
-def _order_tool_arguments_for_client_display(
-    *,
-    tool_name: str,
-    arguments: dict[str, Any],
-) -> dict[str, Any]:
-    if not arguments:
-        return arguments
-    order = _TOOL_ARGUMENT_PRIMARY_ORDER.get(str(tool_name or "").strip().lower())
-    if not order:
-        return arguments
-    ordered: dict[str, Any] = {}
-    for key in order:
-        if key in arguments:
-            ordered[key] = arguments[key]
-    for key, value in arguments.items():
-        if key not in ordered:
-            ordered[key] = value
-    return ordered
-
-
 def _schema_type_names(schema: Any) -> set[str]:
     if not isinstance(schema, dict):
         return set()
@@ -10012,51 +10554,92 @@ def _tool_parameter_schema(
     return None
 
 
+def _tool_parameter_placeholder_text(text: str, schema_types: set[str]) -> str | None:
+    """The inner text of a placeholder type wrapper (``<string>x</string>``)."""
+    wrapper = _TOOL_PARAMETER_TYPE_WRAPPER_RE.match(text)
+    if wrapper is None:
+        return None
+    tag = wrapper.group(1).strip().casefold()
+    expected = {item.casefold() for item in schema_types if item != "null"}
+    placeholder_tags = {
+        "array",
+        "bool",
+        "boolean",
+        "float",
+        "int",
+        "integer",
+        "json",
+        "number",
+        "object",
+        "str",
+        "string",
+        "text",
+        "value",
+    }
+    aliases = {
+        "bool": "boolean",
+        "float": "number",
+        "int": "integer",
+        "json": "object",
+        "str": "string",
+        "text": "string",
+        "value": "string",
+    }
+    normalized_tag = aliases.get(tag, tag)
+    if tag in placeholder_tags and (
+        not expected or normalized_tag in expected or tag == "value"
+    ):
+        return wrapper.group(2).strip()
+    return None
+
+
 def _decode_tool_parameter_value(value: str, schema: Any | None = None) -> Any:
+    """A tool parameter's text as the client's argument value.
+
+    ``value`` is the text between ``<parameter=k>`` and ``</parameter>`` with
+    the template's one formatting newline on each side already removed by the
+    parser. A string comes back exactly as the model wrote it: a file keeps
+    its last newline and its indentation, an entity in an HTML page stays an
+    entity (the template writes values raw, so the model does too) (#691).
+    Only a value written wholly XML-escaped is decoded
+    (_decode_escaped_tool_text). A value the schema types as something else
+    (a number, a boolean, an array) is trimmed and read as JSON; with no
+    schema, text that parses as JSON is read as JSON and anything else stays
+    as written. A placeholder type wrapper is still unwrapped. Decoding a
+    decoded string again with the same schema changes nothing (the stream
+    parser decodes once and the schema normalization runs over the result).
+    ``MTPLX_TOOL_ARGUMENTS_EXACT=0`` brings back the earlier handling: every
+    value trimmed and entity-decoded.
+    """
+    exact = _tool_arguments_exact()
+    schema_types = _schema_type_names(schema)
+    string_only = bool(schema_types) and schema_types <= {"string", "null"}
     text = value.strip()
     if not text:
-        return ""
-    schema_types = _schema_type_names(schema)
-    wrapper = _TOOL_PARAMETER_TYPE_WRAPPER_RE.match(text)
-    if wrapper is not None:
-        tag = wrapper.group(1).strip().casefold()
-        expected = {item.casefold() for item in schema_types if item != "null"}
-        placeholder_tags = {
-            "array",
-            "bool",
-            "boolean",
-            "float",
-            "int",
-            "integer",
-            "json",
-            "number",
-            "object",
-            "str",
-            "string",
-            "text",
-            "value",
-        }
-        aliases = {
-            "bool": "boolean",
-            "float": "number",
-            "int": "integer",
-            "json": "object",
-            "str": "string",
-            "text": "string",
-            "value": "string",
-        }
-        normalized_tag = aliases.get(tag, tag)
-        if tag in placeholder_tags and (
-            not expected or normalized_tag in expected or tag == "value"
-        ):
-            text = wrapper.group(2).strip()
-    text = html.unescape(text)
-    if schema_types and schema_types <= {"string", "null"}:
-        return text
+        return value if exact and (string_only or not schema_types) else ""
+    inner = _tool_parameter_placeholder_text(text, schema_types)
+    if inner is not None:
+        inner = html.unescape(inner)
+        if string_only:
+            return inner
+        try:
+            return json.loads(inner)
+        except json.JSONDecodeError:
+            return inner
+    if not exact:
+        text = html.unescape(text)
+        if string_only:
+            return text
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return text
+    if string_only:
+        return _decode_escaped_tool_text(value)
     try:
-        return json.loads(text)
+        return json.loads(_decode_escaped_tool_text(text))
     except json.JSONDecodeError:
-        return text
+        return _decode_escaped_tool_text(value)
 
 
 def _repair_tool_argument_keys_for_schema(
@@ -10143,6 +10726,10 @@ def _normalize_tool_arguments_for_schema(
         tools=tools,
     )
     normalized: dict[str, Any] = {}
+    # The model's own argument order is kept: the client sends the call back
+    # in the next request and the template renders it in that order, so a
+    # reordered call no longer matched the tokens the model generated and the
+    # end-of-answer save was refused (#691: "read" with limit before path).
     for key, value in arguments.items():
         if isinstance(value, str):
             normalized[key] = _decode_tool_parameter_value(
@@ -10155,10 +10742,9 @@ def _normalize_tool_arguments_for_schema(
             )
         else:
             normalized[key] = value
-    return _order_tool_arguments_for_client_display(
-        tool_name=tool_name,
-        arguments=normalized,
-    )
+    if not _tool_arguments_exact():
+        return _order_tool_arguments_for_client_display(tool_name, normalized)
+    return normalized
 
 
 def _parse_json_tool_call(block: str) -> tuple[str, Any] | None:
@@ -10224,7 +10810,16 @@ def _parse_xml_tool_call(
             raise _tool_protocol_error(
                 f"tool '{name}' contains an empty parameter name"
             )
-        arguments[param_name] = _decode_tool_parameter_value(param_match.group(2))
+        # The text as written: the value's type comes from the tool schema in
+        # _normalize_tool_arguments_for_schema, after the tool name and keys
+        # are resolved. Reading it as JSON here, with no schema, turned a
+        # written JSON file or a file holding only "42" into an object or a
+        # number that the string schema then refused (#691).
+        arguments[param_name] = (
+            param_match.group(2)
+            if _tool_arguments_exact()
+            else _decode_tool_parameter_value(param_match.group(2))
+        )
         consumed.append(param_match.span())
     if consumed:
         residue_parts: list[str] = []
@@ -10278,7 +10873,12 @@ def _parse_invoke_tool_call(block: str) -> tuple[str, Any] | None:
             raise _tool_protocol_error(
                 f"tool '{name}' contains an empty parameter name"
             )
-        arguments[param_name] = _decode_tool_parameter_value(param_match.group(2))
+        # Typed against the schema later, as in _parse_xml_tool_call.
+        arguments[param_name] = (
+            param_match.group(2)
+            if _tool_arguments_exact()
+            else _decode_tool_parameter_value(param_match.group(2))
+        )
         consumed.append(param_match.span())
     if consumed:
         residue_parts: list[str] = []
@@ -10313,7 +10913,12 @@ def _parse_poolside_tool_call(block: str) -> tuple[str, Any] | None:
             raise _tool_protocol_error(
                 f"tool '{name}' contains duplicate arg_key '{key}'"
             )
-        arguments[key] = _decode_tool_parameter_value(pair.group(2))
+        # Typed against the schema later, as in _parse_xml_tool_call.
+        arguments[key] = (
+            pair.group(2)
+            if _tool_arguments_exact()
+            else _decode_tool_parameter_value(pair.group(2))
+        )
         consumed.append(pair.span())
     residue_parts: list[str] = []
     cursor = 0
@@ -11042,6 +11647,7 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
         self._name: str | None = None
         self._current_key: str | None = None
         self._current_value_parts: list[str] = []
+        self._value_lead_newline_pending = False
         self._params: dict[str, Any] = {}
         self._done = False
         self._tool_calls: list[dict[str, Any]] | None = None
@@ -11255,32 +11861,41 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
                     return deltas
                 self._current_key = key
                 self._current_value_parts = []
+                self._value_lead_newline_pending = True
                 self._buf = self._buf[param_end + 1 :]
                 self._stage = "in_parameter"
                 continue
 
             if self._stage == "in_parameter":
+                # The template writes "<parameter=k>\n{value}\n</parameter>":
+                # exactly one formatting newline comes off each side and every
+                # other character is the value (#691: a written file keeps its
+                # last newline). The value is cut off in pieces as it streams.
                 close_start = _find_casefold(self._buf, self._PARAM_CLOSE)
                 if close_start < 0:
-                    hold = len(self._PARAM_CLOSE) - 1
+                    # Hold a whole closing tag's length: a partial
+                    # "</parameter" plus the formatting newline before it.
+                    # Holding one less let that newline into the value when a
+                    # chunk ended inside the closing tag.
+                    hold = len(self._PARAM_CLOSE)
                     if len(self._buf) <= hold:
                         return deltas
                     value_piece = self._buf[:-hold]
                     self._buf = self._buf[-hold:]
-                    if not self._current_value_parts and value_piece.startswith("\n"):
-                        value_piece = value_piece[1:]
+                    if self._value_lead_newline_pending:
+                        self._value_lead_newline_pending = False
+                        if value_piece.startswith("\n"):
+                            value_piece = value_piece[1:]
                     if value_piece:
                         self._current_value_parts.append(value_piece)
                     return deltas
                 value_piece = self._buf[:close_start]
-                # Qwen usually formats XML parameters as newline-delimited
-                # blocks. Preserve user payload text, but drop the formatting
-                # newline immediately before the closing tag to match the
-                # existing final parser's stripped value semantics.
                 if value_piece.endswith("\n"):
                     value_piece = value_piece[:-1]
-                if not self._current_value_parts and value_piece.startswith("\n"):
-                    value_piece = value_piece[1:]
+                if self._value_lead_newline_pending:
+                    self._value_lead_newline_pending = False
+                    if value_piece.startswith("\n"):
+                        value_piece = value_piece[1:]
                 if value_piece:
                     self._current_value_parts.append(value_piece)
                 key = str(self._current_key or "")
@@ -14515,14 +15130,6 @@ def _committed_reasoning_canonicalization_enabled() -> bool:
     return str(raw).strip().lower() not in {"off", "0", "false", "no"}
 
 
-def _common_prefix_len(a: Sequence[int], b: Sequence[int]) -> int:
-    n = min(len(a), len(b))
-    for i in range(n):
-        if a[i] != b[i]:
-            return i
-    return n
-
-
 _COMMITTED_SPLICE_WINDOW = 8
 _COMMITTED_SPLICE_MAX_SPANS = 256
 
@@ -14574,14 +15181,15 @@ def _splice_committed_token_ids(
     never matched. Returns the ids and a receipt.
     """
 
+    from mtplx.token_prefix import common_run_len
     from mtplx.vision.splice import is_image_key
 
-    prompt = [int(token) for token in prompt_ids]
-    stream = [int(token) for token in committed]
+    prompt = list(map(int, prompt_ids))
+    stream = list(map(int, committed))
     receipt: dict[str, Any] = {"spans": 0, "tokens_in": 0, "tokens_out": 0}
     if not prompt or not stream:
         return prompt, receipt
-    common = _common_prefix_len(prompt, stream)
+    common = common_prefix_len(prompt, stream)
     if common >= len(prompt) or common >= len(stream):
         return prompt, receipt
 
@@ -14604,9 +15212,13 @@ def _splice_committed_token_ids(
     spans = 0
     while p < len(prompt) and c < len(stream):
         if prompt[p] == stream[c]:
-            out.append(prompt[p])
-            p += 1
-            c += 1
+            # The whole equal run at once (C-speed slices): a token at a time
+            # this walk cost 10 ms on a 150K-token prompt, and a request runs
+            # it more than once.
+            run = common_run_len(prompt, p, stream, c)
+            out += prompt[p : p + run]
+            p += run
+            c += run
             continue
         if spans >= max_spans:
             break
@@ -14662,7 +15274,7 @@ def _splice_committed_token_ids(
     receipt["spans"] = spans
     if spans:
         receipt["first_divergence"] = int(common)
-        receipt["cp_after"] = int(_common_prefix_len(out, stream))
+        receipt["cp_after"] = int(common_prefix_len(out, stream))
     return out, receipt
 
 
@@ -15139,7 +15751,7 @@ def _maybe_canonicalize_committed_reasoning(
     if compare_ids is None:
         _declined("image_keying_failed", session_id=session_id)
         return None
-    cp_raw = _common_prefix_len(compare_ids, committed)
+    cp_raw = common_prefix_len(compare_ids, committed)
     if cp_raw >= min(len(committed), len(compare_ids)):
         # already extends (or is contained in) the committed stream: the
         # healthy no-op, silent by contract (byte-identical resend test)
@@ -15238,7 +15850,7 @@ def _maybe_canonicalize_committed_reasoning(
             _record(template_observability)
             _record(request_observability)
             return spliced
-    cp_canon = _common_prefix_len(canon_ids, committed)
+    cp_canon = common_prefix_len(canon_ids, committed)
     outcome["cp_canon"] = int(cp_canon)
     if cp_canon <= cp_raw:
         # A tie here is not yet "the canonical encode is no better". When the
@@ -16940,10 +17552,11 @@ def _record_request_metrics(state: "ServerState", record: dict[str, Any]) -> Non
     # that already knows a more precise instant keeps it.
     record.setdefault("completed_at_s", time.time())
     # Thermal pressure (the kernel's throttle verdict, not the fan state):
-    # the level at completion and the worst level in effect since the request
-    # arrived, from the background sampler's cache. No OS call here.
+    # the level at completion, the worst level in effect since the request
+    # arrived, and the worst while its prompt was read, from the background
+    # sampler's cache. No OS call here.
     for key, value in _thermal_pressure.receipt_fields(
-        record.get("request_received_monotonic_s")
+        record.get("request_received_monotonic_s"), record.get("ttft_s")
     ).items():
         record.setdefault(key, value)
     # Why this request re-read part of its prompt, as its prefill events said.
@@ -16967,8 +17580,7 @@ def _record_request_metrics(state: "ServerState", record: dict[str, Any]) -> Non
     # counters. Flight end + the durable JSONL below still record warmup
     # rows so forensics keeps the full trail.
     if not bool(safe.get("warmup")):
-        state.last_metrics.append(safe)
-        state.last_metrics = state.last_metrics[-100:]
+        _append_metrics_row(state, safe)
     # Flight recorder terminal event: every completion path (normal, cancel,
     # disconnect) funnels through this sink, so the flight "end" is written
     # even for requests whose client-side accounting is lost (turn-13 class).
@@ -16977,11 +17589,22 @@ def _record_request_metrics(state: "ServerState", record: dict[str, Any]) -> Non
     except Exception:
         pass
     path = _request_log_path(state)
+    # A chat stream still sending writes its row itself (_StreamRows).
+    held, superseded = _STREAM_ROWS.hold(safe, path)
+    if superseded is not None:
+        _append_request_log_line(*superseded)
+    if not held:
+        _append_request_log_line(safe, path)
+
+
+def _append_request_log_line(record: dict[str, Any], path: str | None) -> None:
+    """One durable request-log line (best-effort, like every telemetry write)."""
+
     if not path:
         return
     try:
         line = json.dumps(
-            {"logged_at_s": time.time(), **_redact_request_log_record(safe)},
+            {"logged_at_s": time.time(), **_redact_request_log_record(record)},
             ensure_ascii=False,
             default=str,
         )
@@ -17052,6 +17675,11 @@ def _response_id_from_client_hint(
 # hermes-agent's custom provider serializes this floor on every request when
 # the user has not set model.max_tokens — the client cannot express "no cap".
 _HERMES_INJECTED_DEFAULT_MAX_TOKENS = 65_536
+# DeepSeek Harness (through the pi-ai library) writes its model's output size
+# into every request: 32,768 when the model entry names none, and the served
+# window in the profile MTPLX writes (mtplx/deepseek_harness.py). Neither is
+# the user's choice.
+_DEEPSEEK_HARNESS_INJECTED_DEFAULT_MAX_TOKENS = 32_768
 
 
 def _strip_client_injected_output_cap(
@@ -17080,6 +17708,16 @@ def _strip_client_injected_output_cap(
 
     if request_max_tokens == _HERMES_INJECTED_DEFAULT_MAX_TOKENS and _is_hermes_client(
         headers=headers, metadata=metadata
+    ):
+        return None, True
+    if (
+        request_max_tokens is not None
+        and _request_client_hint_from_request(headers, metadata) == "deepseek_harness"
+        and int(request_max_tokens)
+        in {
+            _DEEPSEEK_HARNESS_INJECTED_DEFAULT_MAX_TOKENS,
+            int(context_window or 0),
+        }
     ):
         return None, True
     if request_max_tokens is not None and _is_opencode_client(
@@ -18573,6 +19211,19 @@ def _dashboard_record_completion(
                     "raw_decode_tok_s": raw_decode_tok_s,
                 }
             )
+        # Last, so nothing in it can cost the gauges above their reading: the
+        # session's prompt-read speed weighted by tokens, and whether each
+        # read ran on a throttled chip (the app's Avg Prefill tile).
+        dashboard.lifetime.record_prefill_read(
+            tokens=int(envelope.get("new_prefill_tokens") or 0),
+            tok_s=envelope.get("prefill_tok_s"),
+            throttled=_thermal_pressure.is_throttling(
+                _thermal_pressure.prefill_level(
+                    envelope.get("request_received_monotonic_s"),
+                    envelope.get("ttft_s"),
+                )
+            ),
+        )
     except Exception as exc:
         # Never let a metrics bug break a user response.
         _safe_stdout_print(f"[dashboard] record_completion suppressed error: {exc!r}")
@@ -18726,15 +19377,21 @@ def _dashboard_publish_progress(
     state: "ServerState",
     *,
     request_id: str,
-    payload: dict[str, Any],
+    payload: dict[str, Any] | Callable[[], dict[str, Any]],
+    completion_tokens: int | None = None,
 ) -> dict[str, Any] | None:
-    """Forward a streaming progress chunk into the dashboard bus + registry."""
+    """Forward a decode progress frame into the dashboard bus + registry.
+
+    ``payload`` may be a callable that builds the frame; it then runs only
+    when the gate lets the frame through, and ``completion_tokens`` feeds the
+    gate. Non-streaming requests publish from the model thread this way."""
 
     dashboard = getattr(state, "dashboard", None)
     if dashboard is None:
         return None
     decision_started_s = time.perf_counter()
-    completion_tokens = int(payload.get("completion_tokens") or 0)
+    if completion_tokens is None:
+        completion_tokens = int(payload.get("completion_tokens") or 0)
     try:
         should_publish = dashboard.progress_events.should_publish(
             request_id,
@@ -18750,6 +19407,8 @@ def _dashboard_publish_progress(
             )
             return None
 
+        if callable(payload):
+            payload = payload()
         enriched = dict(payload)
         # The decoder already publishes these counters at ~1 Hz. Progress
         # used to omit them, clearing the app's waterfall on every new turn.
@@ -18927,6 +19586,10 @@ DASHBOARD_SNAPSHOT_INTERVAL_DEFAULT_MS = 200
 DASHBOARD_SNAPSHOT_INTERVAL_MIN_MS = 100
 DASHBOARD_SNAPSHOT_INTERVAL_MAX_MS = 5000
 DASHBOARD_SNAPSHOT_INTERVAL_IDLE_MIN_MS = 1000
+# A stream opened with rows=changed still sends the request rows this often
+# when no change was noted, so a row updated by a path that does not note it
+# is shown late, never wrong for long.
+DASHBOARD_ROWS_REFRESH_S = 5.0
 
 
 def _dashboard_snapshot_interval_s(snapshot_interval_ms: int | None) -> float:
@@ -18941,6 +19604,31 @@ def _dashboard_snapshot_interval_s(snapshot_interval_ms: int | None) -> float:
         min(DASHBOARD_SNAPSHOT_INTERVAL_MAX_MS, value),
     )
     return value / 1000.0
+
+
+class _DashboardRowsGate:
+    """One metrics stream's choice of whether its next snapshot carries the
+    request rows: always for a stream that did not ask for rows=changed;
+    otherwise when the rows changed (state.metrics_revision) since this
+    stream last sent them, and at least every DASHBOARD_ROWS_REFRESH_S."""
+
+    def __init__(self, only_when_changed: bool) -> None:
+        self.only_when_changed = only_when_changed
+        self._sent_revision: int | None = None
+        self._sent_at_s = 0.0
+
+    def rows_due(self, revision: Any, now_s: float) -> bool:
+        known = revision if isinstance(revision, int) else None
+        if (
+            self.only_when_changed
+            and known is not None
+            and known == self._sent_revision
+            and now_s - self._sent_at_s < DASHBOARD_ROWS_REFRESH_S
+        ):
+            return False
+        self._sent_revision = known
+        self._sent_at_s = now_s
+        return True
 
 
 def _dashboard_snapshot_interval_for_activity_s(
@@ -20063,8 +20751,17 @@ def _mtplx_scheduler_state(state: "ServerState") -> dict[str, Any]:
     }
 
 
-def _mtplx_dashboard_snapshot(state: "ServerState") -> dict[str, Any]:
-    """Aggregate the dashboard snapshot served by SSE + the polling endpoint."""
+def _mtplx_dashboard_snapshot(
+    state: "ServerState", *, rows: bool = True
+) -> dict[str, Any]:
+    """Aggregate the dashboard snapshot served by SSE + the polling endpoint.
+
+    rows=False leaves out the request rows (`latest` null, `recent` empty)
+    and says so with `rows_unchanged`: a stream that already sent them sends
+    them again only when they change. They are most of a snapshot's bytes
+    (about 640 of 800 KB with 32 rows), built and encoded in the serving
+    process and decoded by the app, twice a second while a model decodes.
+    """
 
     dashboard = state.dashboard
     bank_dict: dict[str, Any]
@@ -20081,7 +20778,7 @@ def _mtplx_dashboard_snapshot(state: "ServerState") -> dict[str, Any]:
         }
         bank_dict = {}
     retrieval = getattr(state, "retrieval", None)
-    return {
+    snapshot = {
         "ts": time.time(),
         "model_id": state.model_id,
         # Always present, so a client can tell "no retrieval configured" apart
@@ -20093,8 +20790,8 @@ def _mtplx_dashboard_snapshot(state: "ServerState") -> dict[str, Any]:
         "context_window": state.context_window,
         "active_requests": state.dashboard.in_flight.count(),
         "in_flight": dashboard.in_flight.snapshot(),
-        "latest": state.last_metrics[-1] if state.last_metrics else None,
-        "recent": state.last_metrics[-32:],
+        "latest": state.last_metrics[-1] if rows and state.last_metrics else None,
+        "recent": state.last_metrics[-32:] if rows else [],
         "prefill_rates": dashboard.prefill_history.rates(),
         "rolling": dashboard.rolling.snapshot(),
         "lifetime": dashboard.lifetime.snapshot(),
@@ -20133,6 +20830,9 @@ def _mtplx_dashboard_snapshot(state: "ServerState") -> dict[str, Any]:
         "machine": _machine_info(),
         "uptime_s": dashboard.lifetime.snapshot()["uptime_s"],
     }
+    if not rows:
+        snapshot["rows_unchanged"] = True
+    return snapshot
 
 
 def _memory_pressure_level() -> int:
@@ -20745,6 +21445,13 @@ def _http_exception_detail_payload(exc: HTTPException) -> dict[str, Any] | None:
 # Seconds between two per-chunk reads of the Mac's memory during a prefill.
 _PREFILL_SYSTEM_CHECK_INTERVAL_S = 0.2
 
+# How far a prefill may grow past its admission's price before the guard
+# says so (``prefill_grew_past_price``). The bill leaves out a little on
+# purpose or by measurement (Flash-Next's eight restore anchors, 0.93 GB;
+# MLX's transients, 0.65 GB at 194K in n4l1); a second copy of a long
+# conversation is several GB (6.5 GB at 194K, 4.67 GB at 131K).
+_PREFILL_GROWTH_OVER_PRICE_BYTES = 2 * 1024**3
+
 
 def _generation_call_site(max_depth: int = 12) -> str | None:
     """``function:line`` of the generation frame that asked the per-chunk
@@ -20850,9 +21557,18 @@ class _PrefillSystemGuard:
         forward_rows_bytes: int | None = None,
         restore_bytes: int = 0,
         own_session_shed: Callable[[str], Mapping[str, Any] | None] | None = None,
+        priced_growth_bytes: int | None = None,
     ) -> None:
         self.state = state
         self.chunk_reserve_bytes = max(0, int(chunk_reserve_bytes))
+        # The admission's price for this request (its growth), and the most
+        # the request has grown past what it held when the check was made.
+        self.priced_growth_bytes = (
+            None if priced_growth_bytes is None else max(0, int(priced_growth_bytes))
+        )
+        self.grew_max: dict[str, Any] | None = None
+        self._grew_now: int | None = None
+        self.grew_past_price: dict[str, Any] | None = None
         self.tokens_done: int | None = None
         # The closest the engine came to its line (scalars only).
         self.engine_margin_min: dict[str, Any] | None = None
@@ -20890,21 +21606,36 @@ class _PrefillSystemGuard:
         limit = caps.get("memory_limit_bytes") if isinstance(caps, dict) else None
         self.limit = int(limit) if isinstance(limit, int) and limit > 0 else 0
         self.allow_swap = bool(getattr(state, "allow_swap", False))
+        # What the request holds before its restore and prefill: the base of
+        # the one-forward witness below and of the growth against the price.
         self.base_held: int | None = None
-        if self.forward_rows_bytes and not self.allow_swap:
+        if not self.allow_swap:
             stats = _mlx_memory_stats_live()
             if _allocator_reading_failure(stats) is None:
                 self.base_held = self._request_held(stats)
 
     def _request_held(self, stats: Mapping[str, Any]) -> int:
-        """MLX's active memory less what the bank and its queued jobs hold:
-        a bank trim during the forward must not read as the forward undone."""
+        """MLX's active memory less what the bank's durable entries and its
+        queued jobs hold: a bank trim during the forward must not read as the
+        forward undone.
+
+        A lease's bytes stay in: they are the live cache it pins, and the
+        request that takes the lease holds the same buffers, so taking it is
+        no growth (n4l2, 2026-11-12, Bare Speed follow-up at 247,590 tokens:
+        the lease moved 8.41 GB from the bank's account to the request's
+        while MLX's active memory grew 0.11 GB, and the growth receipt read
+        8.52 GB against a 1.30 GB price). Another conversation's lease let go
+        during the prefill lowers this figure: the one-forward witness below
+        then fires later, never earlier, and the growth receipt can under-say
+        by that lease, never over-say."""
 
         bank = getattr(getattr(self.state, "sessions", None), "bank", None)
         held = 0
         if bank is not None:
-            held = int(getattr(bank, "total_nbytes", 0) or 0) + int(
-                getattr(bank, "queued_persistence_bytes", 0) or 0
+            held = (
+                int(getattr(bank, "total_nbytes", 0) or 0)
+                - int(getattr(bank, "lease_nbytes", 0) or 0)
+                + int(getattr(bank, "queued_persistence_bytes", 0) or 0)
             )
         return int(stats.get("active_memory_bytes") or 0) - held
 
@@ -20987,6 +21718,10 @@ class _PrefillSystemGuard:
             ),
             "checks": int(self.checks),
             "shed_before_abort": dict(self.shed) if self.shed is not None else None,
+            # What this request grew by since the check was made, against its
+            # price: a copy the admission did not expect reads as the gap.
+            "request_grew_bytes": self._grew_now,
+            "priced_growth_bytes": self.priced_growth_bytes,
         }
         return True
 
@@ -21006,13 +21741,11 @@ class _PrefillSystemGuard:
         )
         active = 0 if failure is not None else int(stats.get("active_memory_bytes") or 0)
         pool = 0 if failure is not None else int(stats.get("cache_memory_bytes") or 0)
-        if (
-            self.prefill_done_by is None
-            and self.forward_rows_bytes
-            and self.base_held is not None
-            and failure is None
-        ):
+        grown = None
+        if failure is None and self.base_held is not None:
             grown = self._request_held(stats) - self.base_held
+            self._note_growth(grown)
+        if self.prefill_done_by is None and self.forward_rows_bytes and grown is not None:
             if grown >= self.restore_bytes + self.forward_rows_bytes // 2:
                 self.prefill_done_by = "forward_rows_resident"
         if self.prefill_done_by is not None:
@@ -21061,6 +21794,40 @@ class _PrefillSystemGuard:
         }
         self._note_engine_margin(verdict)
         return verdict
+
+    def _note_growth(self, grown: int) -> None:
+        """How much this request has grown past what it held when the check
+        was made (MLX's active memory less the bank's), against its price.
+
+        A restore that copies what the admission priced as free shows here,
+        once per request, while it still fits: n4l1 (2026-11-12) restored a
+        194K follow-up by clone on a lease's price, grew 6.5 GB and was refused
+        at the engine's line; at 131K the same copy fit, unseen (+4.67 GB)."""
+
+        self._grew_now = int(grown)
+        if self.grew_max is None or int(grown) > int(self.grew_max["grew_bytes"]):
+            self.grew_max = {
+                "grew_bytes": int(grown),
+                "tokens_done": self.tokens_done,
+                "check": int(self.checks),
+            }
+        priced = self.priced_growth_bytes
+        if (
+            self.grew_past_price is not None
+            or priced is None
+            or int(grown) - int(priced) <= _PREFILL_GROWTH_OVER_PRICE_BYTES
+        ):
+            return
+        self.grew_past_price = {
+            "action": "prefill_grew_past_price",
+            "grew_bytes": int(grown),
+            "priced_growth_bytes": int(priced),
+            "over_bytes": int(grown) - int(priced),
+            "tokens_done": self.tokens_done,
+            "check": int(self.checks),
+        }
+        _record_guard_event(self.state, dict(self.grew_past_price))
+        _safe_stdout_print("[mtplx] memory guard " + json.dumps(self.grew_past_price))
 
     def _note_engine_margin(self, verdict: Mapping[str, Any]) -> None:
         """Keep the reading closest to the engine's line, with where the
@@ -21163,6 +21930,11 @@ class _PrefillSystemGuard:
             "swap_growth_bytes": delta("swap_used_bytes"),
             "engine_margin_min": (
                 dict(self.engine_margin_min) if self.engine_margin_min else None
+            ),
+            "request_grew_max": dict(self.grew_max) if self.grew_max else None,
+            "priced_growth_bytes": self.priced_growth_bytes,
+            "grew_past_price": (
+                dict(self.grew_past_price) if self.grew_past_price else None
             ),
         }
 
@@ -23305,7 +24077,7 @@ def _run_prefill_admission(
     prompt_tokens = len(prompt_ids)
     if prompt_tokens <= 0:
         return None
-    probe_ids = list(prompt_ids)
+    probe_ids = as_token_tuple(prompt_ids)
     if vision_splice is not None:
         # Admission must ask the same content-keyed question as restore.
         # Raw image pads only match the text before the first image; that
@@ -23317,7 +24089,7 @@ def _run_prefill_admission(
         if keyed_ids is None:
             session_bank = None
         else:
-            probe_ids = list(keyed_ids)
+            probe_ids = as_token_tuple(keyed_ids)
     caps = getattr(state, "metal_memory_caps", None)
     limit = 0
     if isinstance(caps, dict):
@@ -25067,6 +25839,86 @@ def _stream_progress_payload(
     return payload
 
 
+class _DashboardDecodeProgress:
+    """Live decode progress of one request, for the flight recorder and the
+    dashboard.
+
+    Streaming and non-streaming requests run the same generation; only the
+    HTTP layer differs. Progress used to be published from the SSE drain
+    loop only, so a non-streaming request reached the dashboard when it
+    completed: during a 25 s non-streaming decode the metrics stream carried
+    122 snapshots, 8 prefill events and 0 progress events, and the live
+    gauge stayed on the previous request. Both variants now feed each token
+    batch through ``on_tokens``.
+
+    For a non-streaming request ``on_tokens`` runs on the model thread, once
+    per decode step. The progress gate decides first and the frame is built
+    only when it is due (every 0.2 s plus a few token milestones), so a
+    throttled step costs a few counter updates and two short locks.
+    """
+
+    def __init__(self, state: Any, request_id: str) -> None:
+        self._state = state
+        self._request_id = request_id
+        self.completion_tokens = 0
+        self.decode_started_s: float | None = None
+        # Rate of the phase the answer is in (reasoning, answer, tool call),
+        # for the live gauge; receipts keep the cumulative rate. Only the
+        # streaming path tells the meter the phase, from the text it drains.
+        self.phase_meter = PhaseRateMeter()
+        self._frame_s = 0.0
+        self._frame_session_id: str | None = None
+
+    def on_tokens(
+        self,
+        count: int,
+        timestamp_s: float,
+        *,
+        session_id: str | None,
+    ) -> dict[str, Any] | None:
+        """Record a token batch produced at ``timestamp_s`` (perf_counter).
+
+        Returns the published progress frame, or None when the gate held it
+        back; the streaming path forwards the frame to its client."""
+
+        if count <= 0:
+            return None
+        recorder = _flight(self._state)
+        if self.decode_started_s is None:
+            self.decode_started_s = timestamp_s
+            dashboard = getattr(self._state, "dashboard", None)
+            handle = (
+                dashboard.in_flight.get(self._request_id)
+                if dashboard is not None
+                else None
+            )
+            recorder.note_decode_started(
+                self._request_id, getattr(handle, "prefill_state", None)
+            )
+        self.completion_tokens += count
+        recorder.on_tokens(self._request_id, count, timestamp_s)
+        self.phase_meter.observe(count, timestamp_s)
+        self._frame_s = timestamp_s
+        self._frame_session_id = session_id
+        return _dashboard_publish_progress(
+            self._state,
+            request_id=self._request_id,
+            payload=self._frame,
+            completion_tokens=self.completion_tokens,
+        )
+
+    def _frame(self) -> dict[str, Any]:
+        payload = _stream_progress_payload(
+            completion_tokens=self.completion_tokens,
+            decode_started_s=self.decode_started_s,
+            now_s=self._frame_s,
+            phase_meter=self.phase_meter,
+        )
+        payload["request_id"] = self._request_id
+        payload["session_id"] = self._frame_session_id
+        return payload
+
+
 class _OwnerStallProbe:
     """Detects a genuinely parked model owner behind a silent stream (#86).
 
@@ -25333,6 +26185,7 @@ def _session_keep_live_refs_for_request(
     session_source: str | None,
     session_id: str | None,
     tool_names: list[str] | tuple[str, ...] | None = None,
+    one_copy: bool = False,
 ) -> bool:
     if os.environ.get(
         "MTPLX_SESSIONBANK_LIVE_REFS_FOR_IMPLICIT_SESSIONS", ""
@@ -25344,6 +26197,20 @@ def _session_keep_live_refs_for_request(
     if source in {"user", "chat_id", "conversation_id"}:
         return True
     if _anonymous_coding_agent_tool_request(tool_names):
+        return True
+    if one_copy and session_id:
+        # A one-copy runtime keeps the conversation in buffers sized to the
+        # conversation, so its live cache IS the snapshot a copying store
+        # would take: a lease holds no byte the snapshot would not, and the
+        # follow-up adopts it instead of copying it back. The snapshot cost
+        # a client that names no session a second copy of its state at every
+        # follow-up (4.24 GB restored by copy at 131K tokens, window n4a1),
+        # and above the per-session budget nothing at all: the answer's state
+        # was dropped and the whole 194K conversation re-read in the
+        # background for 136 s, after which the follow-up was refused for
+        # memory (window n4a2, 12 Nov). The prompt of the same request was
+        # already banked as a lease (prompt_lease_fields); the answer now is
+        # too. Leases count against the bank's byte budget like snapshots.
         return True
     # Anonymous auto sessions are useful as cloneable prefix snapshots, but
     # retaining their live paged-KV containers preserves the full request
@@ -27402,6 +28269,18 @@ def _store_retokenized_history_snapshot(
             pending_record.update_token_count(history_tokens)
         except BaseException:
             pass
+    if pending_record is not None and hasattr(pending_record, "note_target"):
+        # What this job builds, so a same-session request whose prompt starts
+        # with it waits for the job instead of redoing its work
+        # (EngineSession.resolve_pending_postcommit_for_request).
+        pending_record.note_target(
+            history_ids,
+            image_pad_token_id=(
+                None
+                if history_vision_splice is None
+                else getattr(history_vision_splice, "image_pad_token_id", None)
+            ),
+        )
     best_prefix_len = 0
     best_prefix_nbytes = 0
     try:
@@ -27747,6 +28626,11 @@ def _store_retokenized_history_snapshot(
     return outcome
 
 
+# A caller that does not say which vision splice its prompt was served with
+# (None for a text prompt) keeps the prediction-only contract below.
+_PROMPT_SPLICE_UNKNOWN: Any = object()
+
+
 def _history_ids_for_postcommit(
     state: ServerState,
     *,
@@ -27920,6 +28804,49 @@ def _history_ids_for_postcommit(
                     )
                     history_messages[-1:] = current
                 substitution_walked = True
+    if (
+        not substitution_walked
+        and committed_stream_ids
+        and thinking_enabled
+        and _committed_reasoning_canonicalization_enabled()
+        and _reasoning_history_scoped_active(state)
+        and history_messages
+        and history_messages[-1].role == "assistant"
+    ):
+        # Scoped mode skips the walk above, but the turn generated THIS
+        # request is appended without reasoning_content, while the next
+        # request carries it back (the client echo) and the rolling
+        # checkpoint keeps it in-round. The predicted prefix then renders an
+        # empty think scaffold where the next prompt has the interior, so
+        # every in-round generation-final commit was refused with
+        # reasoning_history_scoping_mismatch. Carry this turn's own interior
+        # from the committed stream; the template keeps or drops it exactly
+        # as it will for the next prompt, and earlier turns keep their echo.
+        try:
+            committed_text = state.runtime.tokenizer.decode(
+                [int(token) for token in committed_stream_ids]
+            )
+        except Exception:
+            committed_text = ""
+        committed_turns = (
+            _committed_assistant_turns(
+                committed_text,
+                gemma4=_reasoning_parser_for_state(state) == "gemma4",
+            )
+            if committed_text
+            else []
+        )
+        if committed_turns and committed_turns[-1][0]:
+            current, _ = _substitute_committed_reasoning_messages(
+                history_messages[-1:],
+                committed_turns[-1:],
+                strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+            )
+            history_messages = [
+                _scrub_inbound_committed_reasoning(message)
+                for message in history_messages[:-1]
+            ] + current
+            substitution_walked = True
     if not substitution_walked:
         history_messages = [
             _scrub_inbound_committed_reasoning(message) for message in history_messages
@@ -28006,6 +28933,7 @@ def _generation_final_postcommit_compatibility(
     strip_tool_call_preamble_text: bool = False,
     session: Any | None = None,
     timing: dict[str, Any] | None = None,
+    prompt_vision_splice: Any = _PROMPT_SPLICE_UNKNOWN,
 ) -> dict[str, Any]:
     # Tool-call turns are no longer refused a priori (the retired
     # "tool_call_history_rewrite" gate): the byte-compare below is the real
@@ -28054,6 +28982,14 @@ def _generation_final_postcommit_compatibility(
     final_token_ids = [int(token) for token in prompt_ids] + final_generated_tokens
     if not final_token_ids:
         return {"safe": False, "mode": "unsafe", "reason": "empty_generation_boundary"}
+    unguessed = _live_state_without_guess(
+        state,
+        prompt_ids=prompt_ids,
+        written=final_generated_tokens,
+        prompt_vision_splice=prompt_vision_splice,
+    )
+    if unguessed is not None:
+        return unguessed
     history_started = time.perf_counter()
     history_ids, history_vision_splice = _history_ids_for_postcommit(
         state,
@@ -28381,6 +29317,141 @@ def _generation_final_prompt_boundaries(
     return [record for record in records if 0 < int(record[0]) <= shared]
 
 
+# The server's guess of how the client will render the turn it just answered
+# disagreed with what the model wrote. Not in this set: the two reshapes the
+# server applies itself (reasoning stripped or scoped out of the next prompt),
+# where the server renders that prompt and knows the reasoning will not be in
+# it, and every refusal about the engine's own state.
+_PREDICTION_MISMATCH_REASONS = frozenset(
+    {"retokenized_history_mismatch", "stop_token_boundary_mismatch"}
+)
+
+
+def _keep_live_state_over_prediction_enabled() -> bool:
+    """MTPLX_POSTCOMMIT_KEEP_LIVE_STATE=0 restores the prediction-only refusal."""
+
+    raw = os.environ.get("MTPLX_POSTCOMMIT_KEEP_LIVE_STATE", "1")
+    return str(raw).strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _live_state_over_prediction(
+    compatibility: Mapping[str, Any],
+    *,
+    prompt_ids: Sequence[int],
+    generated: Mapping[str, Any],
+    prompt_vision_splice: Any,
+) -> dict[str, Any] | None:
+    """Keep the state that wrote the answer when only the guess disagrees.
+
+    At the end of a turn the engine holds the state of exactly the prompt it
+    was served plus the tokens it wrote. The compatibility check compares those
+    tokens with the server's own prediction of how the client will send the
+    turn back, and a disagreement used to refuse the live state, re-read the
+    turn in the background and let the next request wait 0.6 s, cancel that
+    re-read and do it again itself: 31,920 tokens and 32.9 s to first text on
+    2.12.3, 19,422 and 10.0 s on the candidate (rows h2h3a-1110-1454 and
+    n3f4-1111-2223). Both times the next prompt was the written tokens plus the
+    new ones and the prediction was the wrong side (it left 3,397 tokens of
+    reasoning out that Pi sent back). The state is the truth of what was
+    written: it is banked under those tokens, and the next request decides by
+    its real prompt, restoring all of it when it matches and resuming at the
+    last recurrent checkpoint before the first differing token when it does
+    not (the prompt's checkpoints ride the entry, as on every commit). Banked
+    tokens are the prompt in the bank's view (images keyed by their content,
+    as the session commit keys them) followed by the generated ids.
+
+    None (the old refusal stands) for any other refusal, when the caller did
+    not say how its prompt's images were spliced, when the images cannot be
+    keyed, or when the switch is off.
+    """
+
+    if not _keep_live_state_over_prediction_enabled():
+        return None
+    if str(compatibility.get("reason") or "") not in _PREDICTION_MISMATCH_REASONS:
+        return None
+    if prompt_vision_splice is _PROMPT_SPLICE_UNKNOWN:
+        return None
+    final_state = generated.get("_final_state")
+    if final_state is None or not bool(getattr(final_state, "safe_to_commit", False)):
+        return None
+    generated_tokens = [int(token) for token in generated.get("tokens") or []]
+    written = [
+        int(token)
+        for token in getattr(final_state, "generated_token_ids", tuple(generated_tokens))
+    ]
+    if written != generated_tokens:
+        return None
+    frontier = _session_frontier_ids(prompt_ids, prompt_vision_splice)
+    if frontier is None or len(frontier) != len(prompt_ids):
+        return None
+    prediction = {
+        key: compatibility[key]
+        for key in (
+            "reason",
+            "history_tokens",
+            "generation_boundary_tokens",
+            "divergence_token",
+            "divergence_offset_in_turn",
+        )
+        if key in compatibility
+    }
+    return {
+        "safe": True,
+        "mode": "generation_final_live",
+        "reason": "live_state_kept_over_prediction",
+        "token_ids": frontier + written,
+        "history_suffix_tokens": 0,
+        "prediction": prediction,
+    }
+
+
+def _live_state_without_guess(
+    state: Any,
+    *,
+    prompt_ids: Sequence[int],
+    written: Sequence[int],
+    prompt_vision_splice: Any,
+) -> dict[str, Any] | None:
+    """Bank a one-copy runtime's answer as written, without first guessing
+    how the client will send it back.
+
+    Every stored commit of a turn is banked under the prompt (keyed for its
+    images) plus the tokens the model wrote, whatever the guess said: an
+    exact or prefix guess stores exactly those ids, and since 12 Nov a wrong
+    guess keeps them too (``_live_state_over_prediction``). The guess was
+    then only deciding a label, at the price of re-rendering, re-encoding and
+    re-decoding the whole conversation at the end of every answer: 0.12 to
+    0.29 s of the response tail at 101K to 157K tokens in the founder's Pi
+    session (flight recorder of 12 Nov, ``compat_s``), which the next agent
+    request waits for or runs beside. The next request still decides by its
+    real prompt. The guess still runs where the server reshapes the next
+    prompt itself (reasoning stripped or scoped out of history: a mismatch
+    there is expected and refused), and on copying runtimes, which this
+    change leaves as they were.
+    """
+
+    if prompt_vision_splice is _PROMPT_SPLICE_UNKNOWN:
+        return None
+    if not _keep_live_state_over_prediction_enabled():
+        return None
+    if not one_copy_runtime(getattr(state, "runtime", None)):
+        return None
+    if getattr(getattr(state, "args", None), "strip_assistant_reasoning_history", False):
+        return None
+    if _reasoning_history_scoped_active(state):
+        return None
+    frontier = _session_frontier_ids(prompt_ids, prompt_vision_splice)
+    if frontier is None or len(frontier) != len(prompt_ids):
+        return None
+    return {
+        "safe": True,
+        "mode": "generation_final_live",
+        "reason": "live_state_without_guess",
+        "token_ids": frontier + [int(token) for token in written],
+        "history_suffix_tokens": 0,
+    }
+
+
 def _store_generation_final_history_snapshot(
     state: ServerState,
     *,
@@ -28398,6 +29469,7 @@ def _store_generation_final_history_snapshot(
     tool_prompt_mode: str | None = None,
     strip_tool_call_preamble_text: bool = False,
     session: Any | None = None,
+    prompt_vision_splice: Any = _PROMPT_SPLICE_UNKNOWN,
 ) -> dict[str, Any]:
     if session_id is None:
         return {"stored": False, "mode": "unsafe", "reason": "no_session_id"}
@@ -28431,6 +29503,7 @@ def _store_generation_final_history_snapshot(
         strip_tool_call_preamble_text=strip_tool_call_preamble_text,
         session=session,
         timing=timing,
+        prompt_vision_splice=prompt_vision_splice,
     )
     _record_phase(timing, "compat_s", started)
     final_state = generated.get("_final_state")
@@ -28438,6 +29511,15 @@ def _store_generation_final_history_snapshot(
         final_state is not None
         and _generation_final_prompt_boundary_available(state, final_state)
     )
+    if not bool(compatibility.get("safe")) and not prompt_boundary_safe:
+        kept = _live_state_over_prediction(
+            compatibility,
+            prompt_ids=prompt_ids,
+            generated=generated,
+            prompt_vision_splice=prompt_vision_splice,
+        )
+        if kept is not None:
+            compatibility = kept
     if not bool(compatibility.get("safe")) and not prompt_boundary_safe:
         outcome = {
             "stored": False,
@@ -28553,6 +29635,10 @@ def _store_generation_final_history_snapshot(
     }
     if "token_splice" in compatibility:
         outcome["token_splice"] = compatibility["token_splice"]
+    if "prediction" in compatibility:
+        # What the refused guess would have been: kept per turn so a client
+        # whose next prompt really does differ shows up in the flight log.
+        outcome["prediction"] = compatibility["prediction"]
     _flight(state).pc(session_id, {"action": "generation_final", **outcome})
     return outcome
 
@@ -28598,14 +29684,28 @@ def _stream_terminal_frame_before_commit_enabled() -> bool:
     return str(raw).strip().lower() not in {"0", "false", "off", "no"}
 
 
-# The delta keys a client counts as its first token (the chat stream writes
-# each delta as json.dumps of a one-key dict after this prefix).
-_SSE_VISIBLE_DELTA_PREFIXES = (
-    '"delta": {"content": "',
-    '"delta": {"reasoning_content": "',
-    '"delta": {"reasoning": "',
-    '"delta": {"tool_calls": [',
+# The delta keys a client counts as its first token, and what its reader
+# sees of each (the chat stream writes each delta as json.dumps of a one-key
+# dict after this prefix).
+_SSE_DELTA_CHANNELS = (
+    ('"delta": {"content": "', "answer"),
+    ('"delta": {"reasoning_content": "', "reasoning"),
+    ('"delta": {"reasoning": "', "reasoning"),
+    ('"delta": {"tool_calls": [', "tool_call"),
 )
+
+
+def _sse_delta_channel(chunk: str) -> str | None:
+    """``"answer"``, ``"reasoning"`` or ``"tool_call"`` for an SSE chunk that
+    carries a non-empty delta of that kind; None for the role chunk, a
+    progress or heartbeat chunk and the terminal frame."""
+
+    for prefix, channel in _SSE_DELTA_CHANNELS:
+        at = chunk.find(prefix)
+        if at >= 0:
+            empty = chunk[at + len(prefix) : at + len(prefix) + 1] in {'"', "]"}
+            return None if empty else channel
+    return None
 
 
 def _sse_chunk_carries_visible_delta(chunk: str) -> bool:
@@ -28613,11 +29713,110 @@ def _sse_chunk_carries_visible_delta(chunk: str) -> bool:
     tool-call delta (not the role chunk, a progress or heartbeat chunk, or
     the terminal frame)."""
 
-    for prefix in _SSE_VISIBLE_DELTA_PREFIXES:
-        at = chunk.find(prefix)
-        if at >= 0:
-            return chunk[at + len(prefix) : at + len(prefix) + 1] not in {'"', "]"}
-    return False
+    return _sse_delta_channel(chunk) is not None
+
+
+class _StreamVisibility:
+    """When a chat stream's reader saw the model think and answer.
+
+    Fed every chunk the stream sends. ``reasoning_s``: from the request's
+    arrival to its last reasoning delta; ``first_visible_s``: to its first
+    answer text or tool call, the end of the wait a user watches the model
+    think through (12 Nov: Pi at xhigh had its first token at a median 0.74 s
+    and its first answer or tool call at a median 5.5 s, 34.6 s at 88K; the
+    request log said only the first). None when the stream sent none.
+    """
+
+    __slots__ = ("origin_s", "last_reasoning_s", "first_visible_s")
+
+    def __init__(self, origin_s: float) -> None:
+        self.origin_s = float(origin_s)
+        self.last_reasoning_s: float | None = None
+        self.first_visible_s: float | None = None
+
+    def saw(self, channel: str | None, sent_s: float) -> None:
+        if channel == "reasoning":
+            self.last_reasoning_s = sent_s
+        elif channel is not None and self.first_visible_s is None:
+            self.first_visible_s = sent_s
+
+    def fields(self, reasoning_tokens: Any) -> dict[str, Any]:
+        def since_arrival(sent_s: float | None) -> float | None:
+            return None if sent_s is None else round(max(0.0, sent_s - self.origin_s), 4)
+
+        return {
+            "reasoning_tokens": (
+                int(reasoning_tokens) if isinstance(reasoning_tokens, int) else None
+            ),
+            "reasoning_s": since_arrival(self.last_reasoning_s),
+            "first_visible_s": since_arrival(self.first_visible_s),
+        }
+
+
+class _StreamRows:
+    """Request-log rows of chat streams that are still sending.
+
+    The generation records a stream's row when the engine's last token is
+    out, before the stream has sent its last deltas: a tool call held until
+    its markup is whole goes out after that, and the stream counts the
+    reasoning tokens then. A registered stream's row is held instead of
+    written until the stream releases it with what it saw, just before its
+    terminal frame (so a client that reads the log after ``[DONE]`` finds
+    the row) or on any other exit. Still one row per attempt; the RAM ring
+    holds the same dict, so the app's record gets the fields too.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._rows: dict[str, tuple[dict[str, Any], str | None] | None] = {}
+
+    def open(self, request_id: str) -> None:
+        with self._lock:
+            self._rows[str(request_id)] = None
+
+    def hold(
+        self, row: dict[str, Any], path: str | None
+    ) -> tuple[bool, tuple[dict[str, Any], str | None] | None]:
+        """``(held, superseded)``: whether ``row`` waits for its stream, and
+        an earlier attempt's held row for the caller to write now."""
+
+        request_id = row.get("request_id")
+        if request_id is None:
+            return False, None
+        with self._lock:
+            key = str(request_id)
+            if key not in self._rows:
+                return False, None
+            superseded = self._rows[key]
+            self._rows[key] = (row, path)
+        return True, superseded
+
+    def release(self, request_id: str) -> tuple[dict[str, Any], str | None] | None:
+        with self._lock:
+            return self._rows.pop(str(request_id), None)
+
+
+_STREAM_ROWS = _StreamRows()
+
+
+def _release_stream_row(
+    state: "ServerState", request_id: str, fields: dict[str, Any]
+) -> None:
+    """Write a chat stream's held row with the stream's own fields. A row
+    written already (the generation ended after the stream did) or not yet
+    recorded gets them in the RAM ring only."""
+
+    held = _STREAM_ROWS.release(request_id)
+    fields = _json_safe(fields)
+    if held is None:
+        row = _metric_for_request(state, request_id)
+        if row is not None:
+            row.update(fields)
+        return
+    row, path = held
+    row.update(fields)
+    _note_metrics_rows_changed(state)
+    _append_request_log_line(row, path)
 
 
 def _session_named_by_client(session_source: str | None) -> bool:
@@ -28647,6 +29846,19 @@ _RESPONSE_TAIL_SNAPSHOT_MARKER: dict[str, Any] = {
     "mode": "after_response",
     "reason": "terminal_frame_before_commit",
 }
+
+
+def _failed_commit_snapshot(exc: BaseException) -> dict[str, Any]:
+    """What a streamed turn records when its commit raised. The session bank
+    is a cache: failing to fill it costs the next turn a re-read and never
+    the answer the client already holds."""
+
+    return {
+        "stored": False,
+        "mode": "failed",
+        "reason": "commit_error",
+        "error": f"{type(exc).__name__}: {exc}",
+    }
 
 
 async def _await_session_response_tail(session: Any) -> dict[str, Any] | None:
@@ -28728,7 +29940,24 @@ def _merge_response_tail_into_metrics(
         if isinstance(row, dict) and row.get("request_id") == response_id:
             for key, value in fields.items():
                 row[key] = _json_safe(value)
+            _note_metrics_rows_changed(state)
             return
+
+
+def _resolve_pending_postcommit(session: Any, prompt_ids: Sequence[int] | None) -> Any:
+    """The session's policy for the previous turn's running end-of-turn job,
+    given this request's prompt where the session takes it: a job building
+    that prompt's own prefix is waited for instead of aborted
+    (``EngineSession.resolve_pending_postcommit_for_request``)."""
+
+    resolve = session.resolve_pending_postcommit_for_request
+    try:
+        takes_prompt = "prompt_ids" in inspect.signature(resolve).parameters
+    except (TypeError, ValueError):
+        takes_prompt = False
+    if takes_prompt:
+        return resolve(prompt_ids=prompt_ids)
+    return resolve()
 
 
 def _idle_postcommit_foreground_grace_s() -> float:
@@ -28879,6 +30108,11 @@ def _schedule_idle_postcommit_snapshot(
 
     def _foreground_pressure_past_grace() -> bool:
         if not _foreground_model_work_pending(state):
+            return False
+        record = pending_record_holder.get("record")
+        if record is not None and getattr(record, "adopted", False):
+            # The request waiting for this job is the foreground pressure,
+            # and the job's remaining work is that request's own prefix.
             return False
         started_at = job_started_holder.get("t")
         if started_at is None:
@@ -29115,6 +30349,21 @@ def _skipped_idle_postcommit_snapshot(
             "stored": False,
             "mode": "skipped",
             "reason": "gemma4_retokenized_postcommit_unsupported",
+            "unsafe_reason": unsafe_reason,
+            "assistant_tool_calls": len(assistant_tool_calls or []),
+            "prompt_prefix_len": int(prompt_prefix_len or 0),
+        }
+    if unsafe_reason == "sessionbank_snapshot_skipped":
+        # The bank refused to keep a snapshot of this conversation (over the
+        # per-session budget with no live reference to lease instead). A
+        # background re-read builds the same state at the same size and is
+        # refused the same way: on window n4a2 (12 Nov) it re-read all
+        # 194,044 tokens for 136 s, kept nothing, and the memory it churned
+        # left the follow-up turn refused. The prompt stays banked.
+        return {
+            "stored": False,
+            "mode": "skipped",
+            "reason": "bank_refused_this_size",
             "unsafe_reason": unsafe_reason,
             "assistant_tool_calls": len(assistant_tool_calls or []),
             "prompt_prefix_len": int(prompt_prefix_len or 0),
@@ -29689,8 +30938,7 @@ def _finalize_batched_ar_generation(
     # Warmup rows stay out of the dashboard ring (see
     # _record_request_metrics); real-request bookkeeping below still runs.
     if not bool(envelope.get("warmup")):
-        state.last_metrics.append(dict(envelope))
-        state.last_metrics = state.last_metrics[-100:]
+        _append_metrics_row(state, dict(envelope))
         # Warming generations are not user requests (adapting community PR
         # #300 by @Blakeolson21): stamping the traffic clock from a warm rung
         # made the ladder defer against its own output and made /health
@@ -29893,8 +31141,7 @@ def _finalize_mtp_batch_generation(
     # Warmup rows stay out of the dashboard ring (see
     # _record_request_metrics); real-request bookkeeping below still runs.
     if not bool(envelope.get("warmup")):
-        state.last_metrics.append(dict(envelope))
-        state.last_metrics = state.last_metrics[-100:]
+        _append_metrics_row(state, dict(envelope))
         # Warming generations are not user requests (adapting community PR
         # #300 by @Blakeolson21): stamping the traffic clock from a warm rung
         # made the ladder defer against its own output and made /health
@@ -31488,6 +32735,9 @@ def _resolve_draft_sampler_for_request(
             if effective is not None
             else None
         )
+        request_observability["draft_head_norm_repairs"] = [
+            str(r.get("tensor")) for r in (getattr(state, "draft_head_norm_repairs", None) or [])
+        ]
     return effective
 
 
@@ -32140,7 +33390,7 @@ def _run_generation(
                 final_state,
                 token_count=len(bank_token_ids),
             )
-            session_bank.put(
+            final_entry = session_bank.put(
                 runtime=state.runtime,
                 token_ids=bank_token_ids,
                 keep_live_ref=bool(session_keep_live_ref),
@@ -32151,6 +33401,11 @@ def _run_generation(
                 snapshot_epoch=len(bank_token_ids),
                 **bank_values,
                 **bank_metadata,
+            )
+            # The state that wrote the answer, banked under what it wrote: the
+            # postcommit reads this to know the next turn needs no re-read.
+            stats["session_final_state_banked_tokens"] = (
+                int(final_entry.prefix_len) if final_entry is not None else 0
             )
             stats["sessionbank_snapshot_bytes"] = int(
                 getattr(session_bank, "last_put_nbytes", 0) or 0
@@ -33460,6 +34715,14 @@ class _ThinkingContentStreamSplitter:
         self._trim_visible_content_edges = bool(trim_visible_content_edges)
         self._stream_lead_ws_pending = True
         self._stream_trailing_ws_hold = ""
+        # Whether the content stream is between a "<tool_call" and its
+        # "</tool_call>", where the edge trim stands down, and the unmatched
+        # tail of the last chunk, so a marker split across chunks is still
+        # found (see _trim_visible_edges). Not followed with
+        # MTPLX_TOOL_ARGUMENTS_EXACT=0 (the earlier trim inside calls).
+        self._follow_tool_calls = _tool_arguments_exact()
+        self._trim_inside_tool_call = False
+        self._tool_scan_tail = ""
         self._thinking_enabled = thinking_enabled
         self._recover_unclosed_reasoning_as_content = (
             recover_unclosed_reasoning_as_content
@@ -33557,6 +34820,47 @@ class _ThinkingContentStreamSplitter:
         self._pending += text
         return self._trim_visible_edges(self._drain(final=False))
 
+    # A call opens at "<tool_call" and closes at "</tool_call" (whatever
+    # follows the name: ">", "s>", ":name>").
+    _TOOL_SCAN_CLOSE_PREFIX = "</tool_call"
+
+    def _advance_tool_call_scan(self, text: str) -> int:
+        """Follow tool calls through one content chunk.
+
+        Sets whether the stream is inside a call after ``text`` and returns
+        the offset in ``text`` just past the closing marker of the call that
+        was open when ``text`` began, or -1. Markers match without regard to
+        case, as the tool translator matches them; one split across two
+        chunks is found through the tail of the previous chunk that could
+        still begin one.
+        """
+        tail = self._tool_scan_tail
+        scan = tail + text.lower()
+        started_inside = self._trim_inside_tool_call
+        inside = started_inside
+        close_end = -1
+        cursor = 0
+        while True:
+            marker = (
+                self._TOOL_SCAN_CLOSE_PREFIX if inside else self._TOOL_CALL_MARKER
+            )
+            found = scan.find(marker, cursor)
+            if found < 0:
+                break
+            cursor = found + len(marker)
+            if inside:
+                # The closing tag runs to its ">" when that is in this chunk.
+                gt = scan.find(">", cursor, cursor + 64)
+                if gt >= 0 and scan.find("<", cursor, gt) < 0:
+                    cursor = gt + 1
+                if started_inside and close_end < 0:
+                    close_end = cursor - len(tail)
+            inside = not inside
+        self._trim_inside_tool_call = inside
+        marker = self._TOOL_SCAN_CLOSE_PREFIX if inside else self._TOOL_CALL_MARKER
+        self._tool_scan_tail = scan[max(cursor, len(scan) - len(marker) + 1) :]
+        return close_end
+
     def _trim_visible_edges(
         self, chunks: list[tuple[str, str]], *, final: bool = False
     ) -> list[tuple[str, str]]:
@@ -33567,6 +34871,10 @@ class _ThinkingContentStreamSplitter:
         ahead of tool-call markup (interior whitespace passes untouched, so
         markdown structure is preserved). Tool-protocol markup chunks are
         never padded or trimmed — the tool translator consumes them verbatim.
+        Inside a tool call nothing is trimmed at all: every character there is
+        argument data, and a run of newlines before "</parameter>" is the end
+        of a file the model is writing (#691: holding it at a chunk edge and
+        dropping it ahead of the closing tag cut the file's last newline).
         """
         if not self._trim_visible_content_edges:
             return chunks
@@ -33575,16 +34883,33 @@ class _ThinkingContentStreamSplitter:
             if channel != "content" or not text:
                 out.append((channel, text))
                 continue
-            if not self._tool_markup_is_content and text.lstrip().startswith(
-                self._TOOL_CONTROL_MARKERS
-            ):
-                # The pre-tool separator ("...\n\n<tool_call>") rides at the
-                # head of the markup chunk; non-stream strips it, so drop it
-                # here too along with any held run. The markup itself passes
-                # verbatim for the tool translator.
-                self._stream_trailing_ws_hold = ""
-                out.append((channel, text.lstrip()))
-                continue
+            hold_trailing = True
+            if not self._tool_markup_is_content:
+                started_inside = self._trim_inside_tool_call
+                close_end = (
+                    self._advance_tool_call_scan(text)
+                    if self._follow_tool_calls
+                    else -1
+                )
+                if started_inside:
+                    if close_end < 0:
+                        out.append((channel, text))
+                        continue
+                    out.append((channel, text[:close_end]))
+                    text = text[close_end:]
+                    if not text:
+                        continue
+                if text.lstrip().startswith(self._TOOL_CONTROL_MARKERS):
+                    # The pre-tool separator ("...\n\n<tool_call>") rides at
+                    # the head of the markup chunk; non-stream strips it, so
+                    # drop it here too along with any held run. The markup
+                    # itself passes verbatim for the tool translator.
+                    self._stream_trailing_ws_hold = ""
+                    out.append((channel, text.lstrip()))
+                    continue
+                # A chunk that opens a call and ends inside it keeps its
+                # trailing whitespace: that is argument data too.
+                hold_trailing = not self._trim_inside_tool_call
             if self._stream_lead_ws_pending:
                 text = text.lstrip()
                 if not text:
@@ -33593,7 +34918,7 @@ class _ThinkingContentStreamSplitter:
             if self._stream_trailing_ws_hold:
                 text = self._stream_trailing_ws_hold + text
                 self._stream_trailing_ws_hold = ""
-            body = text.rstrip()
+            body = text.rstrip() if hold_trailing else text
             if len(body) != len(text):
                 self._stream_trailing_ws_hold = text[len(body):]
             if body:
@@ -36235,6 +37560,40 @@ def _request_chat_template_kwargs(request: Any) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
+def _client_thinking_budget(request: Any) -> dict[str, Any]:
+    """The cap on reasoning tokens a client sent with its request, as request
+    log fields; empty when it sent none.
+
+    Clients spell it ``thinking_budget`` (Qwen's own API, and what the
+    ``thinking.budget_tokens`` of a /v1/messages request arrives as),
+    ``thinking_token_budget``, ``reasoning.max_tokens``, or ``thinking_budget``
+    among the chat template's kwargs. The first of these that holds a positive
+    whole number is the cap. Anything else is no cap: whether the model thinks
+    at all is ``enable_thinking``'s to say, not a budget of zero's.
+    """
+
+    reasoning = getattr(request, "reasoning", None)
+    spellings = (
+        ("thinking_budget", getattr(request, "thinking_budget", None)),
+        ("thinking_token_budget", getattr(request, "thinking_token_budget", None)),
+        (
+            "reasoning.max_tokens",
+            reasoning.get("max_tokens") if isinstance(reasoning, dict) else None,
+        ),
+        (
+            "chat_template_kwargs.thinking_budget",
+            _request_chat_template_kwargs(request).get("thinking_budget"),
+        ),
+    )
+    for field_name, value in spellings:
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return {
+                "request_thinking_budget": value,
+                "request_thinking_budget_field": field_name,
+            }
+    return {}
+
+
 def _thinking_enabled_for_request(
     state: ServerState,
     request: ChatCompletionRequest,
@@ -36326,13 +37685,11 @@ def _thinking_guard_covers_chat() -> bool:
     return os.environ.get("MTPLX_THINKING_GUARD_SCOPE", "agent").strip().lower() == "all"
 
 
-def _thinking_guard_config_for_request(
-    state: ServerState,
-    *,
-    prompt_ids: list[int],
-    request_observability: Mapping[str, Any] | None,
-) -> Any | None:
-    """Resolve the agent-lane reasoning budget for this request, or None.
+def _agent_thinking_budget(
+    state: ServerState, observability: Mapping[str, Any]
+) -> tuple[bool, int] | None:
+    """The operator's reasoning budget for an agent-lane request, as
+    ``(switched on at launch, tokens)``; None outside its scope.
 
     DISABLED BY DEFAULT (project policy, 2026-07-20: no generation-policy
     intervention ships on). Opt-in surfaces: --agent-thinking-budget
@@ -36340,21 +37697,14 @@ def _thinking_guard_config_for_request(
     the env is consulted even when the CLI arg is off, so an operator can
     enable the guard on a stock launch.
 
-    Scope when enabled: requests that declare tools AND have thinking
-    enabled (the OpenCode/agent tool loop) — plain chat and no-think
-    requests never get a guard. ``MTPLX_THINKING_GUARD_SCOPE=all`` widens
-    the opt-in to plain chat with thinking enabled (xhigh chat marathons
-    and single-token collapses inside ``<think>`` have the same shape as
-    the agent-lane ones); no-think requests still never get a guard. The
-    guard is a surfaced budget (telemetry key thinking_guard); below the
-    budget decode is bit-exact. Mechanism and the 2026-07-20 chess-marathon
-    forensics: mtplx/thinking_guard.py.
+    Scope when enabled: requests that declare tools (the OpenCode/agent tool
+    loop) — plain chat never gets this budget.
+    ``MTPLX_THINKING_GUARD_SCOPE=all`` widens the opt-in to plain chat with
+    thinking enabled (xhigh chat marathons and single-token collapses inside
+    ``<think>`` have the same shape as the agent-lane ones).
     """
-    obs = request_observability or {}
-    if not bool(obs.get("request_enable_thinking")):
-        return None
     try:
-        tool_count = int(obs.get("request_tool_count") or 0)
+        tool_count = int(observability.get("request_tool_count") or 0)
     except (TypeError, ValueError):
         tool_count = 0
     if tool_count <= 0 and not _thinking_guard_covers_chat():
@@ -36364,32 +37714,66 @@ def _thinking_guard_config_for_request(
         .strip()
         .lower()
     )
-    arg_enabled = True
-    budget = 3072
     if raw in {"off", "0", "false", "no", "none"}:
-        arg_enabled = False
-    elif raw == "auto":
-        effort = str(obs.get("request_reasoning_effort") or "").strip().lower()
-        budget = _AGENT_THINKING_BUDGET_BY_EFFORT.get(effort, 3072)
+        return False, 3072
+    if raw == "auto":
+        effort = str(observability.get("request_reasoning_effort") or "").strip().lower()
+        return True, _AGENT_THINKING_BUDGET_BY_EFFORT.get(effort, 3072)
+    try:
+        budget = int(raw)
+    except ValueError:
+        return False, 3072
+    return budget > 0, budget
+
+
+def _thinking_guard_config_for_request(
+    state: ServerState,
+    *,
+    prompt_ids: list[int],
+    request_observability: Mapping[str, Any] | None,
+) -> Any | None:
+    """Resolve the reasoning budget for this request, or None.
+
+    A cap the client sent with its request (``request_thinking_budget``, see
+    ``_client_thinking_budget``) is the client's own instruction: it is
+    honoured on every thinking request, with or without tools. Without one
+    the operator's agent-lane budget applies (``_agent_thinking_budget``),
+    which is off unless asked for. An operator's MTPLX_THINKING_BUDGET can
+    lower a client's cap or, set to off, switch every budget off; it never
+    raises what the client asked for.
+
+    No-think requests never get a guard. The guard is a surfaced budget
+    (telemetry key thinking_guard); below the budget decode is bit-exact.
+    Mechanism and the 2026-07-20 chess-marathon forensics:
+    mtplx/thinking_guard.py.
+    """
+    obs = request_observability or {}
+    if not bool(obs.get("request_enable_thinking")):
+        return None
+    client_budget = int(obs.get("request_thinking_budget") or 0)
+    if client_budget > 0:
+        enabled, budget = True, client_budget
     else:
-        try:
-            budget = int(raw)
-        except ValueError:
-            arg_enabled = False
-        if budget <= 0:
-            arg_enabled = False
+        operator = _agent_thinking_budget(state, obs)
+        if operator is None:
+            return None
+        enabled, budget = operator
     tokenizer = getattr(state.runtime, "tokenizer", None)
     markers = think_marker_ids(tokenizer)
     if markers is None:
         return None
     starts_in_think = int(markers[0]) in {int(t) for t in prompt_ids[-8:]}
     config = thinking_guard_config_from_env(
-        arg_enabled,
+        enabled,
         budget_tokens=budget,
         tokenizer=tokenizer,
         starts_in_think=starts_in_think,
     )
-    return config if getattr(config, "enabled", False) else None
+    if not getattr(config, "enabled", False):
+        return None
+    if 0 < client_budget < config.budget_tokens:
+        config = replace(config, budget_tokens=client_budget)
+    return config
 
 
 def _aime_visible_working_for_request(metadata: Mapping[str, Any]) -> bool:
@@ -37044,6 +38428,10 @@ def create_app(state: ServerState) -> FastAPI:
             # What clients should configure: the window this server executes,
             # which is also their answer ceiling (mtplx/server/served_window.py).
             "execution_window": served_execution_window(state),
+            # Whether Claude Code's tool search can run here: a tool it loads
+            # is written in the served template's own tool encoding. False
+            # keeps every tool up front, and launchers leave tool search off.
+            "anthropic_tool_search": _served_template_lists_tools_as_json_lines(state),
             "max_response_tokens": state.args.max_response_tokens,
             "api_key_required": bool(state.args.api_key),
             "api_key_source": str(
@@ -37093,6 +38481,7 @@ def create_app(state: ServerState) -> FastAPI:
                 else None
             ),
             "draft_head_identity": state.draft_head_identity,
+            "draft_head_norm_repairs": getattr(state, "draft_head_norm_repairs", []),
             "tokenizer_template_hash": state.template_hash,
             "fast_path_env": state.fast_path_env_status,
             "qwen4_install_reports": _qwen4_install_reports(state),
@@ -38066,15 +39455,23 @@ def create_app(state: ServerState) -> FastAPI:
     @app.get("/v1/mtplx/metrics/stream")
     async def mtplx_metrics_stream(
         snapshot_interval_ms: int | None = None,
+        rows: str | None = None,
     ) -> StreamingResponse:
         bus = state.dashboard.bus
         queue = bus.subscribe()
         snapshot_interval_s = _dashboard_snapshot_interval_s(snapshot_interval_ms)
+        rows_gate = _DashboardRowsGate(str(rows or "").strip().lower() == "changed")
+
+        def snapshot_frame() -> str:
+            include_rows = rows_gate.rows_due(
+                getattr(state, "metrics_revision", None), time.perf_counter()
+            )
+            snapshot = _mtplx_dashboard_snapshot(state, rows=include_rows)
+            return f"event: snapshot\ndata: {json.dumps(_json_safe(snapshot))}\n\n"
 
         async def event_stream():
             try:
-                snapshot = _mtplx_dashboard_snapshot(state)
-                yield (f"event: snapshot\ndata: {json.dumps(_json_safe(snapshot))}\n\n")
+                yield snapshot_frame()
                 last_snapshot_s = time.perf_counter()
                 while True:
                     effective_interval_s = _dashboard_snapshot_interval_for_activity_s(
@@ -38098,11 +39495,7 @@ def create_app(state: ServerState) -> FastAPI:
                         active_requests=_dashboard_in_flight_count(state),
                     )
                     if (time.perf_counter() - last_snapshot_s) >= effective_interval_s:
-                        snapshot = _mtplx_dashboard_snapshot(state)
-                        yield (
-                            "event: snapshot\n"
-                            f"data: {json.dumps(_json_safe(snapshot))}\n\n"
-                        )
+                        yield snapshot_frame()
                         last_snapshot_s = time.perf_counter()
             except asyncio.CancelledError:
                 raise
@@ -38589,6 +39982,10 @@ def create_app(state: ServerState) -> FastAPI:
                     detail="image content requires MTP generation mode",
                 )
         template_observability: dict[str, Any] = {}
+        # What this request's images cost, kept apart until the images are
+        # settled below: serving a repaired encode replaces
+        # template_observability's contents with a copy taken earlier.
+        vision_cost: dict[str, Any] = {}
         prompt_ids = _encode_messages(
             state.runtime.tokenizer,
             messages_for_generation,
@@ -38716,7 +40113,7 @@ def create_app(state: ServerState) -> FastAPI:
                     )
                     ttft_clock.mark("response_tail_wait")
                     early_postcommit_wait = await asyncio.to_thread(
-                        _pending_session.resolve_pending_postcommit_for_request
+                        _resolve_pending_postcommit, _pending_session, prompt_ids
                     )
                 ttft_clock.mark("postcommit_wait")
             # Defect B (2.8 headline): if this conversation's session holds a
@@ -38747,8 +40144,10 @@ def create_app(state: ServerState) -> FastAPI:
                 # and position scheme. The same work, earlier, and off the
                 # event loop as below (#487).
                 try:
-                    raw_expanded_ids, vision_splice = await asyncio.to_thread(
-                        _materialize_vision_splice, state, vision_images, prompt_ids
+                    raw_expanded_ids, vision_splice = (
+                        await _materialize_vision_splice_observed(
+                            state, vision_images, prompt_ids, vision_cost
+                        )
                     )
                 except ValueError as vision_error:
                     raise HTTPException(status_code=400, detail=str(vision_error))
@@ -38759,7 +40158,7 @@ def create_app(state: ServerState) -> FastAPI:
                 raw_keyed = prompt_view(prompt_ids) if prompt_view is not None else None
                 if raw_keyed is None or unkeyed_ids(
                     raw_keyed, int(vision_splice.image_pad_token_id)
-                ) != [int(token) for token in raw_expanded_ids]:
+                ) != list(map(int, raw_expanded_ids)):
                     prompt_view = None
             _canonicalized = None
             if vision_session_restore is None or prompt_view is not None:
@@ -38817,12 +40216,13 @@ def create_app(state: ServerState) -> FastAPI:
             # as before; only the thread doing the work changes (the same
             # to_thread pattern the non-stream generation path uses).
             try:
-                prompt_ids, vision_splice = await asyncio.to_thread(
-                    _materialize_vision_splice, state, vision_images, prompt_ids
+                prompt_ids, vision_splice = await _materialize_vision_splice_observed(
+                    state, vision_images, prompt_ids, vision_cost
                 )
             except ValueError as vision_error:
                 raise HTTPException(status_code=400, detail=str(vision_error))
         if vision_images:
+            template_observability.update(vision_cost)
             # Alias-boundary receipt for QA gates: positions before the first
             # image pad carry no pixel influence (causal attention), so this
             # is the exact bar a restore must stay under for a different
@@ -38830,10 +40230,11 @@ def create_app(state: ServerState) -> FastAPI:
             # span bookkeeping — a gate comparing restores against this value
             # must not be self-certified by the code path it is auditing.
             _pad_id = int(vision_splice.image_pad_token_id)
-            _first_pad = next(
-                (pos for pos, tok in enumerate(prompt_ids) if tok == _pad_id),
-                None,
-            )
+            try:
+                # A C-level scan (the generator walked 84K ids in his session).
+                _first_pad = prompt_ids.index(_pad_id)
+            except ValueError:
+                _first_pad = None
             if _first_pad is not None:
                 template_observability["first_image_pad_position"] = int(_first_pad)
             # The encoder counted the stable prefix (the tokens before a
@@ -39142,6 +40543,7 @@ def create_app(state: ServerState) -> FastAPI:
             session_source=session_source,
             session_id=session_id,
             tool_names=_tool_names(tool_specs) if tools_active else None,
+            one_copy=one_copy_runtime(getattr(state, "runtime", None)),
         )
         live_frontier_policy = "none"
         if agent_transcript_tools_active:
@@ -39257,14 +40659,19 @@ def create_app(state: ServerState) -> FastAPI:
                     stats.setdefault(key, request_observability[key])
             return generated
 
+        nonstream_progress = _DashboardDecodeProgress(state, response_id)
+
         def _nonstream_on_tokens(new_tokens: list[int]) -> None:
             nonlocal nonstream_completion_tokens
             nonstream_completion_tokens += len(new_tokens)
             # The flight recorder learned about tokens only from the SSE
             # drain loop, so a non-streaming request decoding 24,000 tokens
             # showed as "prefill, 0 tokens, 0 tok/s" on /v1/mtplx/flight and
-            # the dashboard for its whole life. Same hook, same clock.
-            _flight(state).on_tokens(response_id, len(new_tokens), time.perf_counter())
+            # the dashboard for its whole life. Same hook, same clock, and
+            # the same live progress frames a stream publishes.
+            nonstream_progress.on_tokens(
+                len(new_tokens), time.perf_counter(), session_id=session_id
+            )
             cancel_message = (
                 "client disconnected"
                 if nonstream_client_disconnected
@@ -39438,6 +40845,7 @@ def create_app(state: ServerState) -> FastAPI:
                 tool_prompt_mode=postcommit_tool_prompt_mode,
                 strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                 session=session,
+                prompt_vision_splice=vision_splice,
             )
             final_state = generated.get("_final_state")
             if final_state is not None and _generation_final_prompt_boundary_available(
@@ -39473,6 +40881,34 @@ def create_app(state: ServerState) -> FastAPI:
             generated_mode = str(
                 generated.get("stats", {}).get("generation_mode") or ""
             )
+            banked_tokens = int(
+                generated.get("stats", {}).get("session_final_state_banked_tokens") or 0
+            )
+            kept = (
+                _live_state_over_prediction(
+                    compatibility,
+                    prompt_ids=prompt_ids,
+                    generated=generated,
+                    prompt_vision_splice=vision_splice,
+                )
+                if banked_tokens
+                else None
+            )
+            if kept is not None and banked_tokens == len(kept["token_ids"]):
+                # The generation already banked the state that wrote this
+                # answer under what it wrote (and the session committed it):
+                # a background re-read of the guessed history would be a
+                # second pass the next request then waits for and cancels.
+                generated["stats"]["session_postcommit_snapshot"] = {
+                    "stored": True,
+                    "mode": kept["mode"],
+                    "reason": kept["reason"],
+                    "prefix_len": banked_tokens,
+                    "elapsed_s": time.perf_counter() - started,
+                    "history_suffix_tokens": 0,
+                    "prediction": kept["prediction"],
+                }
+                return
             skipped = _skipped_idle_postcommit_snapshot(
                 state=state,
                 unsafe_reason=unsafe_reason,
@@ -39621,7 +41057,7 @@ def create_app(state: ServerState) -> FastAPI:
                 if response_tail_wait is not None:
                     request_observability["response_tail_wait"] = response_tail_wait
             postcommit_wait_outcome = await asyncio.to_thread(
-                session.resolve_pending_postcommit_for_request
+                _resolve_pending_postcommit, session, prompt_ids
             )
             ttft_clock.mark("postcommit_wait")
             request_observability["postcommit_wait"] = postcommit_wait_outcome
@@ -39652,6 +41088,16 @@ def create_app(state: ServerState) -> FastAPI:
                 stream_started_s = time.perf_counter()
                 last_sse_sent_s = stream_started_s
                 first_delta_marked = False
+                # When this stream's reader saw the model think and answer;
+                # its request-log row carries them (_StreamRows).
+                visibility_origin_s = request_observability.get(
+                    "request_received_monotonic_s"
+                )
+                visibility = _StreamVisibility(
+                    visibility_origin_s
+                    if isinstance(visibility_origin_s, (int, float))
+                    else stream_started_s
+                )
                 last_token_s: float | None = None
                 # Enqueue stamp of the token item currently being drained
                 # (generation-thread perf_counter). The census subtracts it
@@ -39664,9 +41110,10 @@ def create_app(state: ServerState) -> FastAPI:
                 def mark_sse_sent(chunk: str) -> str:
                     nonlocal last_sse_sent_s, first_delta_marked
                     last_sse_sent_s = time.perf_counter()
-                    if not first_delta_marked and _sse_chunk_carries_visible_delta(
-                        chunk
-                    ):
+                    channel = _sse_delta_channel(chunk)
+                    if channel is not None:
+                        visibility.saw(channel, last_sse_sent_s)
+                    if not first_delta_marked and channel is not None:
                         # The client's TTFT ends at its first non-empty
                         # content, reasoning or tool-call delta, whichever
                         # path writes it (a tool call held until its markup
@@ -40651,14 +42098,39 @@ def create_app(state: ServerState) -> FastAPI:
                             ),
                         )
                     tail_stats = generated.get("stats") or {}
-                    outcome = {
-                        key: tail_stats[key]
-                        for key in (
-                            "session_postcommit_snapshot",
-                            "session_prompt_prefix_commit",
-                        )
-                        if key in tail_stats
-                    }
+                    land_tail_outcome(
+                        {
+                            key: tail_stats[key]
+                            for key in (
+                                "session_postcommit_snapshot",
+                                "session_prompt_prefix_commit",
+                            )
+                            if key in tail_stats
+                        }
+                    )
+
+                def hand_off_failed_commit(exc: BaseException) -> None:
+                    """The answer is complete and the stream has all of it:
+                    only its commit failed (#696). The stream still ends as
+                    a finished answer, the session stays at its last good
+                    commit, so the next turn reads this one again, and the
+                    request's row says why."""
+
+                    failure = _failed_commit_snapshot(exc)
+                    _safe_stdout_print(
+                        "[mtplx] session commit failed after a finished "
+                        f"answer; the next turn re-reads it: {exc!r}"
+                    )
+                    if commit_state.get("early"):
+                        land_tail_outcome({"session_postcommit_snapshot": failure})
+                    else:
+                        queue.put(("commit_failed", failure))
+
+                def land_tail_outcome(outcome: dict[str, Any]) -> None:
+                    """Record what the commit did after the terminal frame:
+                    on the session, for the request that waits for this
+                    tail, and in this request's own metrics row."""
+
                     commit_state["tail_outcome"] = outcome
                     try:
                         # Queued before the tail ends, so a request that
@@ -40875,6 +42347,7 @@ def create_app(state: ServerState) -> FastAPI:
                                                     keep_live_ref=session_keep_live_ref,
                                                     tool_prompt_mode=postcommit_tool_prompt_mode,
                                                     strip_tool_call_preamble_text=strip_tool_call_preamble_text,
+                                                    prompt_vision_splice=vision_splice,
                                                 )
                                             ),
                                             batch_key=(
@@ -40918,19 +42391,13 @@ def create_app(state: ServerState) -> FastAPI:
                             ("error", HTTPException(status_code=409, detail=str(exc)))
                         )
                     except BaseException as exc:
-                        if (
-                            session is not None
-                            and commit_event.is_set()
-                            and state.args.session_postcommit_mode == "async"
-                        ):
-                            _safe_stdout_print(
-                                f"[mtplx] async session postcommit failed: {exc!r}"
-                            )
-                        if commit_state.get("early"):
-                            commit_state["tail_outcome"] = {
-                                "error": f"{type(exc).__name__}: {exc}"
-                            }
-                        queue.put(_stream_error_queue_item(exc))
+                        # The stream asks for the commit only once it holds
+                        # the finished answer, so from then on a failure is
+                        # the commit's and never the answer's.
+                        if commit_state.get("commit"):
+                            hand_off_failed_commit(exc)
+                        else:
+                            queue.put(_stream_error_queue_item(exc))
                     else:
                         queue.put(("done", generated))
                     finally:
@@ -40956,6 +42423,9 @@ def create_app(state: ServerState) -> FastAPI:
                         if not generation_future.done():
                             generation_future.set_result(None)
 
+                # The worker's row waits for this stream (released in the
+                # drain's finally, before the terminal frame).
+                _STREAM_ROWS.open(response_id)
                 Thread(
                     target=run_worker_thread,
                     name=f"mtplx-stream-worker-{response_id[-8:]}",
@@ -41128,9 +42598,7 @@ def create_app(state: ServerState) -> FastAPI:
                 streamed_token_times: list[float] = []
                 streamed_progress_tokens = 0
                 streamed_decode_started_s: float | None = None
-                # Rate of the phase the answer is in (reasoning, answer, tool
-                # call), for the live gauge; receipts keep the cumulative rate.
-                stream_phase_meter = PhaseRateMeter()
+                stream_progress = _DashboardDecodeProgress(state, response_id)
                 streamed_assistant_tool_calls: list[dict[str, Any]] | None = None
                 streamed_tool_deltas_emitted = False
                 early_tool_cancel_used = False
@@ -41509,10 +42977,16 @@ def create_app(state: ServerState) -> FastAPI:
                 stream_cancelled_by_client = False
                 cancelled_metric_recorded = False
                 stream_error_item: BaseException | None = None
-                for field, text in splitter.start():
-                    if text:
-                        for chunk in stream_content_delta_chunks(field, text):
-                            yield mark_sse_sent(chunk)
+                try:
+                    for field, text in splitter.start():
+                        if text:
+                            for chunk in stream_content_delta_chunks(field, text):
+                                yield mark_sse_sent(chunk)
+                except BaseException:
+                    # Gone before the drain, whose finally would have
+                    # released the row: release it here.
+                    _release_stream_row(state, response_id, visibility.fields(None))
+                    raise
 
                 try:
                     while True:
@@ -41697,33 +43171,11 @@ def create_app(state: ServerState) -> FastAPI:
                                 )
                                 if streamed_decode_started_s is None:
                                     streamed_decode_started_s = token_timestamp_s
-                                    _flight(state).note_decode_started(
-                                        response_id,
-                                        getattr(
-                                            in_flight_handle, "prefill_state", None
-                                        ),
-                                    )
                                 streamed_progress_tokens += len(stream_tokens)
-                                _flight(state).on_tokens(
-                                    response_id,
+                                published_progress = stream_progress.on_tokens(
                                     len(stream_tokens),
                                     token_timestamp_s,
-                                )
-                                stream_phase_meter.observe(
-                                    len(stream_tokens), token_timestamp_s
-                                )
-                                progress_payload = _stream_progress_payload(
-                                    completion_tokens=streamed_progress_tokens,
-                                    decode_started_s=streamed_decode_started_s,
-                                    now_s=token_timestamp_s,
-                                    phase_meter=stream_phase_meter,
-                                )
-                                progress_payload["request_id"] = response_id
-                                progress_payload["session_id"] = session_id
-                                published_progress = _dashboard_publish_progress(
-                                    state,
-                                    request_id=response_id,
-                                    payload=progress_payload,
+                                    session_id=session_id,
                                 )
                                 if (
                                     published_progress is not None
@@ -41777,7 +43229,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     ):
                                         yield mark_sse_sent(chunk)
                             if stream_tokens:
-                                stream_phase_meter.note_phase(
+                                stream_progress.phase_meter.note_phase(
                                     decode_phase_for_fields(
                                         (field for field, _text in pieces),
                                         tool_call_open=bool(
@@ -42451,6 +43903,10 @@ def create_app(state: ServerState) -> FastAPI:
                                     # lands the outcome in this request's
                                     # metrics row.
                                     pass
+                                elif commit_kind == "commit_failed":
+                                    generated["stats"][
+                                        "session_postcommit_snapshot"
+                                    ] = commit_item
                                 elif commit_kind == "error":
                                     yield mark_sse_sent(error_chunk(commit_item))
                                     yield mark_sse_sent("data: [DONE]\n\n")
@@ -42787,6 +44243,17 @@ def create_app(state: ServerState) -> FastAPI:
                     state.dashboard.in_flight.deregister(response_id)
                     _flight(state).sweep(response_id)
                     state.dashboard.progress_events.forget(response_id)
+                    # Every delta but the terminal frame is out: the row
+                    # gets when the reader saw the model think and answer.
+                    _release_stream_row(
+                        state,
+                        response_id,
+                        visibility.fields(
+                            (generated.get("stats") or {}).get("reasoning_tokens")
+                            if generated is not None
+                            else None
+                        ),
+                    )
 
                 if generated is None:
                     yield mark_sse_sent(
@@ -43255,7 +44722,11 @@ def create_app(state: ServerState) -> FastAPI:
     ) -> Any:
         if not request.messages:
             raise HTTPException(status_code=400, detail="messages must not be empty")
-        chat_request = _anthropic_to_chat_request(request)
+        chat_request = _anthropic_to_chat_request(
+            request,
+            fold_client_metadata=_reasoning_history_scoped_active(state),
+            defer_tools=_served_template_lists_tools_as_json_lines(state),
+        )
         chat_request.stream = bool(request.stream)
         response = await chat_completions(raw_request, chat_request)
         if request.stream:
@@ -43287,7 +44758,11 @@ def create_app(state: ServerState) -> FastAPI:
     ) -> Any:
         if not request.messages:
             raise HTTPException(status_code=400, detail="messages must not be empty")
-        chat_request = _anthropic_to_chat_request(request)
+        chat_request = _anthropic_to_chat_request(
+            request,
+            fold_client_metadata=_reasoning_history_scoped_active(state),
+            defer_tools=_served_template_lists_tools_as_json_lines(state),
+        )
         headers = dict(raw_request.headers)
         metadata = _request_metadata(chat_request)
         policy = resolve_request_policy(
@@ -43429,6 +44904,32 @@ def create_app(state: ServerState) -> FastAPI:
                 top_k_field="logprobs",
             )
 
+        def register_completions_flight(
+            cancel_event: _AttributedCancelEvent, *, stream: bool
+        ) -> None:
+            # Both lanes publish the request where the cancel route and the
+            # dashboard read it; each lane deregisters and sweeps in teardown.
+            state.dashboard.in_flight.register(
+                InFlightHandle(
+                    request_id=response_id,
+                    cancel_event=cancel_event,
+                    started_s=time.time(),
+                    session_id=None,
+                    model=model,
+                    prompt_preview=_dashboard_prompt_preview(
+                        request, state.runtime.tokenizer
+                    ),
+                    prompt_tokens=len(prompt_ids),
+                )
+            )
+            _flight(state).begin(
+                response_id,
+                session_id=None,
+                model=model,
+                prompt_tokens=len(prompt_ids),
+                stream=stream,
+            )
+
         ttft_clock.mark("prologue")
         if request.stream:
             # Real incremental streaming: tokens flow through a queue from the
@@ -43439,9 +44940,12 @@ def create_app(state: ServerState) -> FastAPI:
             async def event_stream():
                 queue = _LoopFedStreamQueue(asyncio.get_running_loop())
                 cancel_event = _AttributedCancelEvent()
+                register_completions_flight(cancel_event, stream=True)
                 decoder = _IncrementalTokenDecoder(state.runtime.tokenizer)
                 stop_monitor = _StopSequenceStreamMonitor(stop_sequences)
                 streamed_completion_tokens = 0
+                stream_started_s = time.perf_counter()
+                completion_client_disconnected = False
                 generated: dict[str, Any] | None = None
                 stop_hit = False
                 owner_stall_probe = _OwnerStallProbe(deadline_s=STREAM_STALL_DEADLINE_S)
@@ -43451,9 +44955,18 @@ def create_app(state: ServerState) -> FastAPI:
                 # only the keep-alive comments below can advance it in the
                 # pre-first-token window (#358).
                 last_sse_sent_s = time.perf_counter()
+                # This lane told neither the flight recorder nor the dashboard
+                # about its tokens: a streamed completion showed 0 tokens and
+                # no live speed until it ended. The model thread publishes the
+                # same frames a non-streaming request does; the client's bytes
+                # are unchanged.
+                stream_progress = _DashboardDecodeProgress(state, response_id)
 
                 def on_tokens(new_tokens: list[int]) -> None:
                     _raise_if_stream_cancelled(cancel_event)
+                    stream_progress.on_tokens(
+                        len(new_tokens), time.perf_counter(), session_id=None
+                    )
                     queue.put(("tokens", [int(token) for token in new_tokens]))
                     _raise_if_stream_cancelled(cancel_event)
 
@@ -43726,6 +45239,7 @@ def create_app(state: ServerState) -> FastAPI:
                             yield "data: [DONE]\n\n"
                             return
                 except asyncio.CancelledError:
+                    completion_client_disconnected = True
                     _cancel_stream_generation(
                         cancel_event, generation_future, origin="client_disconnect"
                     )
@@ -43734,15 +45248,44 @@ def create_app(state: ServerState) -> FastAPI:
                     # Client disconnect closes the async generator; yielding
                     # from the catch-all below would raise "async generator
                     # ignored GeneratorExit". Re-raise untouched (#F36).
+                    completion_client_disconnected = True
                     raise
                 except BaseException as exc:
                     yield error_chunk(exc)
                     yield "data: [DONE]\n\n"
                     return
                 finally:
+                    # Snapshot before teardown trips the event on every exit,
+                    # and record before deregistering: the dashboard, request
+                    # log and bus event are what prove the Stop reached us.
+                    cancelled = cancel_event.is_set() and generated is None
+                    cancel_reason = (
+                        "client_disconnected"
+                        if completion_client_disconnected
+                        else (
+                            getattr(cancel_event, "origin", None)
+                            or "stream_cancelled"
+                        )
+                    )
                     _cancel_stream_generation(
                         cancel_event, generation_future, origin="stream_teardown"
                     )
+                    if cancelled:
+                        state.dashboard.lifetime.record_cancellation()
+                        _record_stream_cancellation_metric(
+                            state,
+                            response_id=response_id,
+                            session_id=None,
+                            prompt_tokens=len(prompt_ids),
+                            streamed_completion_tokens=streamed_completion_tokens,
+                            stream_started_s=stream_started_s,
+                            reason=cancel_reason,
+                            request_observability=request_observability,
+                            client_disconnected=completion_client_disconnected,
+                        )
+                    state.dashboard.in_flight.deregister(response_id)
+                    state.dashboard.progress_events.forget(response_id)
+                    _flight(state).sweep(response_id)
 
                 if generated is None:
                     yield error_chunk(RuntimeError("generation ended without a result"))
@@ -43787,13 +45330,38 @@ def create_app(state: ServerState) -> FastAPI:
         nonstream_stop_monitor: _StopSequenceStreamMonitor | None = None
         nonstream_stop_decoder: _IncrementalTokenDecoder | None = None
         nonstream_completion_tokens = 0
+        nonstream_client_disconnected = False
         if stop_sequences:
             nonstream_stop_monitor = _StopSequenceStreamMonitor(stop_sequences)
             nonstream_stop_decoder = _IncrementalTokenDecoder(state.runtime.tokenizer)
 
-        def nonstream_stop_on_tokens(new_tokens: list[int]) -> None:
+        def mark_nonstream_client_disconnected() -> None:
+            nonlocal nonstream_client_disconnected
+            nonstream_client_disconnected = True
+
+        nonstream_progress = _DashboardDecodeProgress(state, response_id)
+
+        def nonstream_on_tokens(new_tokens: list[int]) -> None:
+            # The serial lane's only in-decode cancellation point is this
+            # per-batch callback: raise before the next batch is produced,
+            # exactly as the chat non-stream lane does. Without it a cancel
+            # trip left the decoder running to max_tokens while the route
+            # already answered cancelled: true.
             nonlocal nonstream_completion_tokens
             nonstream_completion_tokens += len(new_tokens)
+            # The flight recorder's tokens and the dashboard's live frames,
+            # as the chat lanes publish them.
+            nonstream_progress.on_tokens(
+                len(new_tokens), time.perf_counter(), session_id=None
+            )
+            _raise_if_stream_cancelled(
+                cancel_event,
+                (
+                    "client disconnected"
+                    if nonstream_client_disconnected
+                    else "request cancelled"
+                ),
+            )
             if nonstream_stop_monitor is None or nonstream_stop_decoder is None:
                 return
             delta = nonstream_stop_decoder.feed([int(token) for token in new_tokens])
@@ -43803,6 +45371,17 @@ def create_app(state: ServerState) -> FastAPI:
             if nonstream_stop_monitor.stopped:
                 raise _StopSequenceHit(nonstream_stop_monitor.matched_stop or "")
 
+        # Also watch the transport, so a client that gives up releases the lock.
+        cancel_event = _AttributedCancelEvent()
+        register_completions_flight(cancel_event, stream=False)
+        disconnect_monitor_task = asyncio.create_task(
+            _monitor_request_disconnect(
+                raw_request,
+                cancel_event,
+                on_disconnect=mark_nonstream_client_disconnected,
+            )
+        )
+        nonstream_started_s = time.perf_counter()
         try:
             generated = await asyncio.to_thread(
                 lambda: _run_generation_dispatched(
@@ -43822,12 +45401,12 @@ def create_app(state: ServerState) -> FastAPI:
                     depth=request_depth,
                     resolved_mtp_depth=effective_request_depth,
                     request_observability=request_observability,
-                    token_callback=(
-                        nonstream_stop_on_tokens
-                        if nonstream_stop_monitor is not None
-                        else None
-                    ),
+                    token_callback=nonstream_on_tokens,
                     first_token_logprobs_top_k=requested_logprobs,
+                    cancel_event=cancel_event,
+                    # Pre-change equivalence: the callback (and so the
+                    # engine's response_is_streaming) existed only with stop.
+                    streaming_response=nonstream_stop_monitor is not None,
                 )
             )
         except _StopSequenceHit:
@@ -43848,6 +45427,45 @@ def create_app(state: ServerState) -> FastAPI:
                     "stop_sequence_matched": (nonstream_stop_monitor.matched_stop),
                 },
             )
+        except _StreamCancelled as exc:
+            # Cancelled via POST /v1/mtplx/cancel or a client disconnect:
+            # answer like the chat non-stream lane instead of a 500. (A stop
+            # hit is a subclass and is handled above as a normal completion.)
+            # The cancel receipt is what the dashboard's cancelled count and
+            # the request log read, so the completions lane records it too.
+            cancel_reason = (
+                "client_disconnected"
+                if nonstream_client_disconnected
+                else (getattr(cancel_event, "origin", None) or "request_cancelled")
+            )
+            state.dashboard.lifetime.record_cancellation()
+            _record_stream_cancellation_metric(
+                state,
+                response_id=response_id,
+                session_id=None,
+                prompt_tokens=len(prompt_ids),
+                streamed_completion_tokens=nonstream_completion_tokens,
+                stream_started_s=nonstream_started_s,
+                reason=cancel_reason,
+                request_observability=request_observability,
+                client_disconnected=nonstream_client_disconnected,
+            )
+            return JSONResponse(
+                status_code=499,
+                content=_openai_error_content(
+                    str(exc),
+                    status_code=499,
+                    code="request_cancelled",
+                    error_type="request_cancelled",
+                ),
+            )
+        finally:
+            disconnect_monitor_task.cancel()
+            with suppress(asyncio.CancelledError, TimeoutError):
+                await asyncio.wait_for(disconnect_monitor_task, timeout=0.25)
+            state.dashboard.in_flight.deregister(response_id)
+            state.dashboard.progress_events.forget(response_id)
+            _flight(state).sweep(response_id)
         finish_reason = str(generated.get("finish_reason") or "stop")
         if stop_sequences and not generated.get("stats", {}).get("stop_sequence_hit"):
             # Post-trim safety net for matches the incremental monitor cannot
@@ -45171,6 +46789,34 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="",
         help="Hermes command to open when --launch-hermes is set.",
     )
+    parser.add_argument(
+        "--launch-agent-client",
+        choices=["claude-code", "codex", "deepseek-harness"],
+        default=None,
+        help=(
+            "Open Claude Code (Terminal), Codex (the Codex app as MTPLX's own copy, "
+            "else Terminal) or DeepSeek Harness (its browser app, else Terminal) on "
+            "this server once it is ready."
+        ),
+    )
+    parser.add_argument(
+        "--agent-client-workspace",
+        default="",
+        help="Folder the client opens in (default: the server's working folder).",
+    )
+    parser.add_argument(
+        "--agent-client-cli",
+        action="store_true",
+        help=(
+            "Open the client's CLI in its terminal even when its app is the "
+            "saved choice (Codex opens MTPLX's own copy of its app by default)."
+        ),
+    )
+    parser.add_argument(
+        "--agent-client-app",
+        action="store_true",
+        help="Open the client's app even when a terminal is the saved choice.",
+    )
     args = parser.parse_args(raw_args)
     args._raw_args = list(raw_args)
     args._cli_flags = canonicalize_flag_tokens(
@@ -45360,24 +47006,56 @@ def main(argv: list[str] | None = None) -> None:
     if args.launch_pi:
         command = str(args.pi_launch_command or "").strip()
         if command:
-            _startup_line("Opening Pi in Terminal...")
+            _startup_line(f"Opening Pi in {_client_opens_in('pi', terminal=True)}...")
             _open_pi_later(command, model_id=str(args.model_id))
         else:
             _startup_line(
                 "warning: --launch-pi was set but no Pi command was provided."
             )
     if args.launch_opencode:
-        _startup_line("Opening OpenCode Desktop...")
-        _open_opencode_later()
+        from mtplx import client_opening
+
+        # `mtplx start opencode --cli|--app` decides for this launch only.
+        surface = (
+            client_opening.TERMINAL
+            if getattr(args, "agent_client_cli", False)
+            else client_opening.OWN_APP
+            if getattr(args, "agent_client_app", False)
+            else None
+        )
+        saved = client_opening.saved_choice("opencode")
+        opening = (
+            client_opening.terminal_for("opencode", saved)
+            if surface == client_opening.TERMINAL
+            else client_opening.resolve("opencode", surface or saved)
+        )
+        _startup_line(
+            "Opening OpenCode Desktop..."
+            if opening.surface == client_opening.OWN_APP
+            else f"Opening OpenCode in {opening.terminal_name}..."
+        )
+        _open_opencode_later(model_id=str(args.model_id), surface=surface)
     if args.launch_hermes:
         command = str(args.hermes_launch_command or "").strip()
         if command:
-            _startup_line("Opening Hermes Agent in Terminal...")
+            _startup_line(
+                f"Opening Hermes Agent in {_client_opens_in('hermes', terminal=True)}..."
+            )
             _open_hermes_later(command)
         else:
             _startup_line(
                 "warning: --launch-hermes was set but no Hermes command was provided."
             )
+    if getattr(args, "launch_agent_client", None):
+        from mtplx import agent_clients
+
+        client = str(args.launch_agent_client)
+        name = agent_clients.DISPLAY_NAMES[client]
+        if _agent_client_desktop_app(args) is not None:
+            _startup_line(f"Opening {name} as {_agent_client_app_phrase(client)}...")
+        else:
+            _startup_line(f"Opening {name} in {_client_opens_in(client, terminal=True)}...")
+        _open_agent_client_later(state)
     # Main-thread insurance for the mlx 0.32.1 TLS-destructor teardown
     # crash (#303): the owner thread parks (model_scheduler), and the main
     # thread clears its own mlx streams before Py_Finalize.

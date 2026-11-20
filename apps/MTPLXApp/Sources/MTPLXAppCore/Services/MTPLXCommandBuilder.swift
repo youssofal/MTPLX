@@ -1103,7 +1103,7 @@ struct ResolvedDaemonArgs {
         switch target {
         case nil, .chat, .benchmark, .openWebUI:
             return true
-        case .pi, .openCode, .hermes, .other:
+        case .pi, .openCode, .hermes, .claudeCode, .codex, .deepseekHarness, .other:
             return false
         }
     }
@@ -1916,11 +1916,29 @@ private struct TargetPreset {
                 reasoning: "auto",
                 environment: env
             )
+        case .claudeCode, .codex, .deepseekHarness:
+            // Single-stream coding agents with long tool histories: the
+            // serial lane the OpenCode preset measured faster than the agent
+            // batch lane (51.4 against 36.8 decode tok/s at 8K), SSD session
+            // cache on like OpenCode and Hermes. Sampler, depth and reasoning
+            // effort stay with the model family and the client's request.
+            // Owner: mtplx/launch_lane.py _CLIENT_LANES["claude-code"/"codex"/
+            // "deepseek-harness"]; LaunchLaneParityTests fails if this preset
+            // parts from it.
+            return TargetPreset(
+                schedulerMode: "serial",
+                batchingPreset: "latency",
+                ssdSessionCache: "on",
+                reasoning: "auto",
+                environment: codingAgentRuntimeEnvironment(
+                    processEnvironment: processEnvironment
+                )
+            )
         case .other:
             // Custom OpenAI/Anthropic-compatible client. The user picks
             // their own port + API key in the LaunchOverlay inline
             // form; pick a balanced preset that works for both single
-            // and 2-3 client agents (Cursor, Codex CLI, Claude Code).
+            // and 2-3 client agents (Cursor, Cline, several at once).
             return TargetPreset(
                 schedulerMode: "ar_batch",
                 batchingPreset: "agent",

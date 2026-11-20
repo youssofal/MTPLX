@@ -4,6 +4,8 @@ tool-only responses (the original v0.2.0 fix) and mixed text+tool responses
 
 import json
 
+import pytest
+
 from mtplx.server.openai import _ToolAwareContentStreamTranslator, _tool_call_example
 
 
@@ -198,7 +200,18 @@ def test_pure_tool_call_response_streamed_in_pieces():
     assert any("tool_calls" in d for d in deltas)
 
 
-def test_opencode_read_tool_call_stream_orders_target_before_limit():
+@pytest.mark.parametrize(
+    "exact, prefix",
+    [
+        # #691: the model's own order, so the call the client sends back
+        # renders as the tokens the model generated.
+        ("1", '{"limit":100,"filePath":"src/game/Game.ts"'),
+        # MTPLX_TOOL_ARGUMENTS_EXACT=0: the earlier path-first order.
+        ("0", '{"filePath":"src/game/Game.ts","limit":100'),
+    ],
+)
+def test_opencode_read_tool_call_stream_argument_order(monkeypatch, exact, prefix):
+    monkeypatch.setenv("MTPLX_TOOL_ARGUMENTS_EXACT", exact)
     t = _make(tools=OPENCODE_READ_LIMIT_TOOL_SPECS)
     out = t.feed(
         "content",
@@ -212,7 +225,7 @@ def test_opencode_read_tool_call_stream_orders_target_before_limit():
     out.extend(t.finish())
 
     arguments = _argument_text(out)
-    assert arguments.startswith('{"filePath":"src/game/Game.ts","limit":100')
+    assert arguments.startswith(prefix)
     assert json.loads(arguments) == {"filePath": "src/game/Game.ts", "limit": 100}
     assert _content_text(out) == ""
 

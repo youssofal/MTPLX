@@ -880,11 +880,29 @@ def _one_shot_args(**overrides):
     return SimpleNamespace(**args)
 
 
+def _import_one_shot_lazy_modules() -> None:
+    """Import, for real, the modules the one-shot path imports lazily.
+
+    The one-shot tests replace mtplx.runtime, mtplx.sampling or
+    mtplx.generation in sys.modules so no model loads. A module that the
+    one-shot path imports for the first time while such a stub is installed
+    binds the stub and the import fails: since #463 the path resolves the
+    serve runtime contract (mtplx.server.openai, which imports
+    mtplx.session_bank and so mtplx.runtime.MTPLXRuntime), and the profile
+    refresh imports mtplx.qwen4_block_verify (mtplx.sampling's
+    SparseDistribution). Run alone, this file failed fifteen of these tests;
+    after any file that had imported the server they passed.
+    """
+    import mtplx.qwen4_block_verify  # noqa: F401
+    import mtplx.server.openai  # noqa: F401
+
+
 def _stub_one_shot_generation(monkeypatch) -> dict[str, object]:
     """Stub everything past the prompt so no model loads and no tokens generate.
 
     Returns a dict capturing what actually reached the generation entry.
     """
+    _import_one_shot_lazy_modules()
     # The one-shot path applies a profile, which writes MTPLX_* keys into the
     # process env for the rest of the CLI lifetime. Without this copy they leak
     # into every later in-process test.
@@ -2132,6 +2150,7 @@ def test_terminal_quickstart_max_uses_verified_max_session(monkeypatch):
             self.thermal["restore"] = {"ok": True}
             return {"ok": True}
 
+    _import_one_shot_lazy_modules()
     fake_runtime = ModuleType("mtplx.runtime")
     fake_runtime.load = lambda *a, **kw: SimpleNamespace(tokenizer=object())
     fake_draft = ModuleType("mtplx.draft_lm_head")
@@ -2217,6 +2236,7 @@ def test_depth_sweep_native60_keeps_model_runtime_env_overrides(monkeypatch):
 
 
 def test_one_shot_max_uses_verified_max_session(monkeypatch):
+    _import_one_shot_lazy_modules()
     calls: list[str] = []
     monkeypatch.setattr(os, "environ", dict(os.environ))
 
@@ -2312,6 +2332,7 @@ def test_laguna_one_shot_uses_target_generation_defaults(monkeypatch, command):
     monkeypatch.setattr(os, "environ", os.environ.copy())
     observed: dict[str, object] = {}
 
+    _import_one_shot_lazy_modules()
     fake_runtime = ModuleType("mtplx.runtime")
 
     def fake_load(*_args, **kwargs):
@@ -6404,7 +6425,8 @@ def test_integrate_openwebui_json(capsys):
     assert "--no-stats-footer" in payload["server_command"]
 
 
-def test_integrate_claude_code_json_uses_anthropic_root_and_auth_token(capsys):
+def test_integrate_claude_code_json_uses_anthropic_root_and_auth_token(capsys, monkeypatch):
+    monkeypatch.delenv("MTPLX_API_KEY", raising=False)
     code = main(["integrate", "claude-code", "--port", "18012", "--json"])
 
     payload = json.loads(capsys.readouterr().out)
@@ -6413,8 +6435,11 @@ def test_integrate_claude_code_json_uses_anthropic_root_and_auth_token(capsys):
     assert payload["integration"] == "claude-code"
     assert payload["base_url"] == "http://127.0.0.1:18012"
     assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:18012"
-    assert env["ANTHROPIC_AUTH_TOKEN"] == "$MTPLX_API_KEY"
-    assert env["ANTHROPIC_API_KEY"] == ""
+    # Never empty: with only a base URL, Claude Code keeps the claude.ai login
+    # and sends it to this server. Unset MTPLX_API_KEY means the local key.
+    assert env["ANTHROPIC_AUTH_TOKEN"] == "mtplx-local"
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "ANTHROPIC_API_KEY" in payload["unset_environment"]
     assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == payload["model_id"]
     assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == payload["model_id"]
     assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == payload["model_id"]
@@ -8072,33 +8097,33 @@ def test_quickstart_pi_passes_launch_command_to_server(monkeypatch):
     assert command == "pi --model mtplx/example"
 
 
-def test_launch_pi_in_terminal_does_not_false_positive_on_server_command(monkeypatch):
-    from mtplx import pi
+def test_launch_pi_in_terminal_does_not_false_positive_on_server_command(
+    monkeypatch, tmp_path
+):
+    from mtplx import client_opening, pi
 
     calls = {}
-    monkeypatch.setattr(pi.sys, "platform", "darwin")
+    monkeypatch.setattr(client_opening.sys, "platform", "darwin")
+    monkeypatch.setattr(client_opening, "installed_terminals", lambda search_dirs=None: [])
 
-    def fake_popen(cmd, stdout=None, stderr=None):
+    def fake_run(cmd, **_kwargs):
         calls["cmd"] = cmd
-        calls["stdout"] = stdout
-        calls["stderr"] = stderr
+        return subprocess.CompletedProcess(cmd, 0, "", "")
 
-        class Proc:
-            pass
-
-        return Proc()
-
-    monkeypatch.setattr(pi.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(client_opening.subprocess, "run", fake_run)
 
     result = pi.launch_pi_in_terminal(
         "pi --model mtplx/mtplx-qwen36-27b-optimized-speed",
         model_ref="mtplx/mtplx-qwen36-27b-optimized-speed",
+        workspace=str(tmp_path),
     )
 
     assert result["status"] == "launched"
-    assert calls["cmd"][0] == "osascript"
-    script = calls["cmd"][2]
-    assert "do script" in script
+    assert result["terminal"] == "Terminal"
+    assert calls["cmd"][:3] == ["/usr/bin/open", "-a", "Terminal"]
+    script = Path(calls["cmd"][3]).read_text()
+    assert script.startswith("#!/bin/zsh\n")
+    assert f"cd {tmp_path} || exit 1" in script
     assert "pi --model mtplx/mtplx-qwen36-27b-optimized-speed" in script
 
 
@@ -9840,7 +9865,7 @@ def test_already_running_server_window_reaches_pi_and_opencode(
         public, "_quickstart_launch_pi_now", lambda **_kwargs: launched.append("pi")
     )
     monkeypatch.setattr(
-        public, "_quickstart_launch_opencode_now", lambda: launched.append("opencode")
+        public, "_quickstart_launch_opencode_now", lambda **_kwargs: launched.append("opencode")
     )
 
     def start(client):
@@ -9952,7 +9977,7 @@ def test_attach_to_a_server_running_another_model_sets_the_client_up_for_it(
         lambda **kwargs: launched.append(("pi", kwargs["model_id"])),
     )
     monkeypatch.setattr(
-        public, "_quickstart_launch_opencode_now", lambda: launched.append(("opencode",))
+        public, "_quickstart_launch_opencode_now", lambda **_kwargs: launched.append(("opencode",))
     )
 
     def start(client, **flags):

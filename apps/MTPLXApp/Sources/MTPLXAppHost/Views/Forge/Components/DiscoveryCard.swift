@@ -115,7 +115,28 @@ struct DiscoveryCard: View {
         }
     }
 
+    @ViewBuilder
     private var installButton: some View {
+        if isInstalled {
+            // A state, not a control: drawn as a disabled pill it read
+            // as a button that did not work.
+            HStack(spacing: 5) {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Brand.success)
+                Text(tr("Installed"))
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundStyle(Brand.typeSecondary)
+            }
+            .padding(.vertical, 6)
+            .padding(.trailing, 4)
+            .accessibilityElement(children: .combine)
+        } else {
+            installControl
+        }
+    }
+
+    private var installControl: some View {
         let (title, icon) = installButtonLabel
         return Button(action: onInstall) {
             HStack(spacing: 5) {
@@ -130,27 +151,20 @@ struct DiscoveryCard: View {
                 Text(title)
                     .font(.system(size: 11.5, weight: .semibold))
             }
-            .foregroundStyle(isInstalled ? Brand.typeSecondary : Brand.bgOuter)
+            .foregroundStyle(Brand.bgOuter)
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
-            .background(
-                Capsule(style: .continuous)
-                    .fill(isInstalled ? AnyShapeStyle(Color.clear) : AnyShapeStyle(Brand.typeBody))
-                    .overlay(
-                        Capsule(style: .continuous)
-                            .stroke(isInstalled ? Brand.separator : Color.clear, lineWidth: 0.5)
-                    )
-            )
+            .background(Capsule(style: .continuous).fill(Brand.typeBody))
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
-        .disabled(isInstalling || isInstalled)
+        .disabled(isInstalling)
     }
 
+    /// Localized: these three labels used to reach every language in English.
     private var installButtonLabel: (String, String) {
-        if isInstalled { return ("Installed", "checkmark.circle.fill") }
-        if isInstalling { return ("Installing…", "arrow.down.circle") }
-        return ("Install", "arrow.down.circle.fill")
+        if isInstalling { return (tr("Installing…"), "arrow.down.circle") }
+        return (tr("Install"), "arrow.down.circle.fill")
     }
 
     private var openOnHFButton: some View {

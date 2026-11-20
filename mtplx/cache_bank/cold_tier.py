@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from array import array
 import hashlib
 from collections import Counter, OrderedDict, deque
 import json
@@ -18,7 +19,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 from mtplx.cache_state import CacheSnapshot
+from mtplx.checkpoint_anchors import system_prompt_checkpoint_enabled
+from mtplx.token_ids import token_id_bytes
+from mtplx.token_prefix import common_prefix_len
 
+from .blob_io import StagingBuffer, read_into_many, write_file
 from .codec import (
     ColdEncodeInterrupted,
     TreeCodec,
@@ -171,6 +176,10 @@ class ColdRestoreRecord:
     # decoded KV only covers the boundary it will actually serve.
     cache_snapshot_prefix_len: int | None = None
     mtp_history_snapshot_prefix_len: int | None = None
+    # The match point a sub-prefix restore was decoded for, when the
+    # lookup's token-exact point replaced its block edge (see
+    # lookup_prefix_boundary); None otherwise.
+    prefix_restore_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -293,18 +302,27 @@ def parse_size_bytes(value: str | int | None, default: int) -> int:
 
 
 def token_hash(token_ids: tuple[int, ...]) -> str:
-    h = hashlib.sha256()
-    for token in token_ids:
-        h.update(int(token).to_bytes(8, byteorder="little", signed=True))
-    return h.hexdigest()
+    return hashlib.sha256(token_id_bytes(token_ids)).hexdigest()
 
 
-def common_prefix_len(left: tuple[int, ...], right: tuple[int, ...]) -> int:
-    limit = min(len(left), len(right))
-    for index in range(limit):
-        if int(left[index]) != int(right[index]):
-            return index
-    return limit
+def _token_array(token_ids: list[int]) -> array | tuple[int, ...]:
+    """Token ids as a compact ``array('I')``; a tuple if an id does not fit."""
+    try:
+        return array("I", token_ids)
+    except (OverflowError, TypeError):
+        return tuple(int(token) for token in token_ids)
+
+
+def _starts_with(tokens: tuple[int, ...], prefix: array | tuple[int, ...]) -> bool:
+    if len(tokens) < len(prefix):
+        return False
+    head = tokens[: len(prefix)]
+    if isinstance(prefix, array):
+        try:
+            return array(prefix.typecode, head) == prefix
+        except (OverflowError, TypeError):
+            return False
+    return tuple(head) == tuple(prefix)
 
 
 def block_aligned_prefix_len(matched_tokens: int, *, block_size: int) -> int:
@@ -312,6 +330,11 @@ def block_aligned_prefix_len(matched_tokens: int, *, block_size: int) -> int:
     matched = max(0, int(matched_tokens))
     return (matched // block) * block
 
+
+# Upper bound on token ids held by the parsed-row memo. Rows are held as
+# 4-byte arrays, so the cap is about 128 MB; a full 100 GB store of long agent
+# conversations stays below it (5.7M tokens in 79 rows measured).
+_ROW_TOKENS_MEMO_MAX_TOKENS = 32_000_000
 
 # Ranked SSD rows a prefix lookup opens before it gives up: each refusal
 # costs only its payload.json read.
@@ -346,15 +369,17 @@ def chain_block_hashes(
     identity: dict[str, Any] | None = None,
 ) -> list[str]:
     parent = ""
-    identity = identity or {}
+    identity_bytes = json.dumps(
+        identity or {}, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    data = memoryview(token_id_bytes(token_ids))
     hashes: list[str] = []
     for start in range(0, len(token_ids), block_size):
-        block = token_ids[start : start + block_size]
+        end = min(len(token_ids), start + block_size)
         h = hashlib.sha256()
-        h.update(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        h.update(identity_bytes)
         h.update(parent.encode("utf-8"))
-        for token in block:
-            h.update(int(token).to_bytes(8, byteorder="little", signed=True))
+        h.update(data[start * 8 : end * 8])
         parent = h.hexdigest()
         hashes.append(parent)
     return hashes
@@ -429,6 +454,12 @@ class SessionBankColdTier:
         # prompt-state wall, gate254-c4s receipts 2026-08-07). None (e.g.
         # standalone/test construction) keeps legacy behavior.
         self.foreground_busy: Callable[[], bool] | None = None
+        # The server wires this to ModelWorkScheduler.beat_within_item: an
+        # encode or a restore on the model-owner thread is seconds of CPU
+        # work with no command buffer, so it beats between its units to keep
+        # the model's GPU working set resident (the beat is a no-op off the
+        # owner thread and between beats).
+        self.owner_beat: Callable[[], Any] | None = None
         self._writer_pause_enabled = _env_flag(
             "MTPLX_SSD_WRITER_FOREGROUND_PAUSE", default=True
         )
@@ -465,6 +496,12 @@ class SessionBankColdTier:
         self._block_memos: OrderedDict[str, dict[tuple, dict[str, Any]]] = OrderedDict()
         self._block_memos_lock = threading.Lock()
         self._block_memos_max = 16
+        # entry_id -> (token_hash, parsed token ids) for manifest rows. A row's
+        # token list is immutable, so a prefix lookup parses each one once
+        # instead of on every request; bounded by total cached tokens.
+        self._row_tokens_memo: dict[str, tuple[str, array | tuple[int, ...]]] = {}
+        self._row_tokens_memo_tokens = 0
+        self._row_tokens_memo_lock = threading.Lock()
         self._stop = threading.Event()
         self._base_lock = threading.RLock()
         self._disk_usage_lock = threading.Lock()
@@ -1237,6 +1274,7 @@ class SessionBankColdTier:
         block_min_match = max(block, int(block_min_matched_tokens))
         started = time.perf_counter()
         try:
+            floor = max(0, int(min_useful_matched_tokens))
             rows = self._candidate_rows_for_prefix_boundary(
                 model_path=model_path,
                 mtp_enabled=mtp_enabled,
@@ -1245,12 +1283,20 @@ class SessionBankColdTier:
                 mtp_history_policy=mtp_history_policy,
                 draft_head_identity=draft_head_identity,
                 policy_fingerprint=policy_fingerprint,
+                min_prefix_len=floor,
             )
-            ranked: list[tuple[tuple[int, int, int], sqlite3.Row, int, str, int]] = []
-            for row in rows:
-                prefix = tuple(int(token) for token in json.loads(str(row["token_ids_json"])))
+
+            from mtplx.vision.splice import is_image_key
+
+            def rank_row(
+                row: sqlite3.Row,
+            ) -> (
+                tuple[tuple[int, int, int], sqlite3.Row, int, str, int, int | None]
+                | None
+            ):
+                prefix = self._row_token_ids(row)
                 if not prefix:
-                    continue
+                    return None
                 matched = common_prefix_len(tokens, prefix)
                 gap = len(prefix) - matched
                 safe_block = min(
@@ -1266,23 +1312,76 @@ class SessionBankColdTier:
                     and safe_block >= 2
                     and safe_block <= matched
                 )
+                exact_point: int | None = None
                 if near_match:
                     candidate_matched = int(matched)
                     restore_kind = "near_prefix"
                 elif block_match:
                     candidate_matched = int(safe_block)
                     restore_kind = "block_prefix"
+                    # The token-exact match, as an addition to the block edge
+                    # (which still ranks the row and decides eligibility):
+                    # _decode_restore_row takes it only when a hybrid row
+                    # holds a newer recurrent checkpoint at or below it than
+                    # at or below the edge. The edge hid the checkpoint at
+                    # the end of a system prompt from a new session (12 Nov
+                    # bank: a Pi and an OpenCode pair matched 8,277 and 8,749
+                    # tokens, block 8,192 and 8,704, system prompts ending at
+                    # 8,274 and 8,746). One token short of the prompt's end:
+                    # a hybrid restore resumes AT its checkpoint, and a
+                    # checkpoint at the prompt's last token (an identical
+                    # first turn's prompt-end anchor) leaves no token to read.
+                    # Nor past an image row: a checkpoint inside an image
+                    # would be cut back to the image's start, where this row
+                    # holds no state (the edge's restore stands instead).
+                    exact = min(int(matched), len(tokens) - 1)
+                    if (
+                        exact > candidate_matched
+                        and system_prompt_checkpoint_enabled()
+                        and not any(
+                            is_image_key(token)
+                            for token in tokens[candidate_matched:exact]
+                        )
+                    ):
+                        exact_point = exact
                 else:
-                    continue
-                ranked.append(
-                    (
-                        (candidate_matched, int(matched), len(prefix)),
-                        row,
-                        candidate_matched,
-                        restore_kind,
-                        len(prefix),
-                    )
+                    return None
+                return (
+                    (candidate_matched, int(matched), len(prefix)),
+                    row,
+                    candidate_matched,
+                    restore_kind,
+                    len(prefix),
+                    exact_point,
                 )
+
+            ranked: list[
+                tuple[tuple[int, int, int], sqlite3.Row, int, str, int, int | None]
+            ] = []
+            for row in rows:
+                item = rank_row(row)
+                if item is not None:
+                    ranked.append(item)
+            if not ranked and floor > 0:
+                # Rows shorter than the caller's RAM match cannot beat it
+                # (candidate_matched <= prefix_len) and were left out of the
+                # query. Whether one of them would have matched still
+                # decides the miss reason, so look at them only on this
+                # path; their token lists come from the memo.
+                for row in self._candidate_rows_for_prefix_boundary(
+                    model_path=model_path,
+                    mtp_enabled=mtp_enabled,
+                    hidden_variant=hidden_variant,
+                    template_hash=template_hash,
+                    mtp_history_policy=mtp_history_policy,
+                    draft_head_identity=draft_head_identity,
+                    policy_fingerprint=policy_fingerprint,
+                    max_prefix_len=floor - 1,
+                ):
+                    if rank_row(row) is not None:
+                        self._inc("prefix_lookups_not_better_than_ram")
+                        self._set_last_miss("ssd_prefix_not_better_than_ram")
+                        return None
             if not ranked:
                 self._inc("restore_misses")
                 self._set_last_miss("ssd_prefix_miss")
@@ -1308,7 +1407,7 @@ class SessionBankColdTier:
             # and the next one is tried: a new conversation shares its system
             # prompt with every older one, and the longest of them is often a
             # conversation without a boundary there.
-            for _key, row, candidate_matched, restore_kind, prefix_len in ranked[
+            for _key, row, candidate_matched, restore_kind, prefix_len, exact_point in ranked[
                 :_PREFIX_BOUNDARY_ROWS_TRIED
             ]:
                 if candidate_matched < int(min_useful_matched_tokens):
@@ -1330,12 +1429,16 @@ class SessionBankColdTier:
                     require_exact_prefix=False,
                     include_gdn_boundaries=True,
                     prefix_restore_tokens=int(candidate_matched),
+                    exact_restore_tokens=exact_point,
                     min_restore_point=int(min_restore_point),
                 )
                 if record is not None:
                     return ColdPrefixRestoreRecord(
                         record=record,
-                        matched_tokens=int(candidate_matched),
+                        matched_tokens=int(
+                            getattr(record, "prefix_restore_tokens", None)
+                            or candidate_matched
+                        ),
                         restore_kind=str(restore_kind),
                     )
             return None
@@ -2064,13 +2167,13 @@ class SessionBankColdTier:
         temp_path = path.with_name(f".{path.name}.tmp-{time.time_ns()}")
         try:
             try:
-                temp_path.write_bytes(raw)
+                write_file(temp_path, raw)
             except FileNotFoundError:
                 # An orphan cleanup pruned the now-empty prefix directory
                 # between the mkdir above and this write; the directory is
                 # ours to remake.
                 path.parent.mkdir(parents=True, exist_ok=True)
-                temp_path.write_bytes(raw)
+                write_file(temp_path, raw)
             try:
                 temp_path.rename(path)
             except FileExistsError:
@@ -2482,6 +2585,7 @@ class SessionBankColdTier:
         blob_hashes = self._entry_blob_hashes(entry_dir)
         with self._connect() as conn:
             conn.execute("DELETE FROM entries WHERE entry_id = ?", (entry_id,))
+        self._forget_row_tokens(entry_id)
         try:
             if entry_dir.exists():
                 shutil.rmtree(entry_dir)
@@ -2496,6 +2600,7 @@ class SessionBankColdTier:
             self._archive_orphan_entry_dir(entry_dir, entry_id)
         with self._connect() as conn:
             conn.execute("DELETE FROM entries WHERE entry_id = ?", (entry_id,))
+        self._forget_row_tokens(entry_id)
         self._invalidate_disk_usage_cache()
 
     def _entry_in_manifest(self, entry_id: str) -> bool:
@@ -2749,11 +2854,12 @@ class SessionBankColdTier:
         require_exact_prefix: bool = True,
         include_gdn_boundaries: bool = False,
         prefix_restore_tokens: int | None = None,
+        exact_restore_tokens: int | None = None,
         min_restore_point: int = 0,
     ) -> ColdRestoreRecord | None:
         metadata = dict(row)
-        token_ids = tuple(int(token) for token in json.loads(str(metadata["token_ids_json"])))
-        if require_exact_prefix and lookup_tokens[: len(token_ids)] != token_ids:
+        token_ids = self._row_token_ids(row)
+        if require_exact_prefix and not _starts_with(lookup_tokens, token_ids):
             return None
         if int(metadata["format_version"]) != COLD_TIER_FORMAT_VERSION:
             self._set_last_miss("ssd_format_mismatch")
@@ -2771,30 +2877,95 @@ class SessionBankColdTier:
         payload = json.loads(payload_path.read_text(encoding="utf-8"))
         tensor_blobs = dict(payload.get("tensor_blobs") or {})
 
-        def read_tensor(name: str) -> bytes:
+        def tensor_path(name: str) -> Path:
             blob = tensor_blobs.get(name)
             if blob:
-                path = self._blob_path(str(blob["sha256"]))
-                if not path.exists():
-                    raise FileNotFoundError(str(path))
-                return path.read_bytes()
-            path = entry_dir / "tensors" / f"{name}.bin"
+                return self._blob_path(str(blob["sha256"]))
+            return entry_dir / "tensors" / f"{name}.bin"
+
+        def read_tensor(name: str) -> bytes:
+            self._beat_owner()
+            path = tensor_path(name)
             if not path.exists():
                 raise FileNotFoundError(str(path))
             return path.read_bytes()
 
+        def read_into(items: Any) -> None:
+            # One tensor's blobs per call: the owner thread waits on the read
+            # pool here, so it beats first, as the serial read does per blob,
+            # and again while the pool reads.
+            self._beat_owner()
+            read_into_many(
+                ((tensor_path(name), view) for name, view in items),
+                waiting=self._beat_owner,
+            )
+
+        # The codec reads through these when present: a tensor's blobs land
+        # in one buffer from parallel reads instead of one read_bytes each.
+        read_tensor.read_into = read_into  # type: ignore[attr-defined]
+        staging = StagingBuffer()
+        read_tensor.allocate = staging.allocate  # type: ignore[attr-defined]
+        try:
+            return self._decode_restore_row(
+                metadata,
+                token_ids,
+                payload,
+                read_tensor,
+                started_s=started_s,
+                require_exact_prefix=require_exact_prefix,
+                include_gdn_boundaries=include_gdn_boundaries,
+                prefix_restore_tokens=prefix_restore_tokens,
+                exact_restore_tokens=exact_restore_tokens,
+                min_restore_point=min_restore_point,
+            )
+        finally:
+            staging.release()
+
+    def _decode_restore_row(
+        self,
+        metadata: dict[str, Any],
+        token_ids: tuple[int, ...],
+        payload: dict[str, Any],
+        read_tensor: Callable[[str], bytes],
+        *,
+        started_s: float,
+        require_exact_prefix: bool,
+        include_gdn_boundaries: bool,
+        prefix_restore_tokens: int | None,
+        exact_restore_tokens: int | None = None,
+        min_restore_point: int,
+    ) -> ColdRestoreRecord | None:
         payload_spec = payload["payload_spec"]
         partial_restore = (
             prefix_restore_tokens is not None
             and not require_exact_prefix
             and int(prefix_restore_tokens) > 0
         )
+        exact_point_taken: int | None = None
         if partial_restore:
             requested_prefix = int(prefix_restore_tokens)
             has_recurrent = bool(payload_spec.get("has_recurrent", False))
             boundary_prefix = _payload_boundary_at_or_below(
                 payload_spec, requested_prefix
             )
+            if (
+                has_recurrent
+                and exact_restore_tokens is not None
+                and int(exact_restore_tokens) > requested_prefix
+            ):
+                # The lookup's token-exact point, taken only when this row
+                # holds a newer recurrent checkpoint at or below it than at
+                # or below the block edge; otherwise the edge stands and the
+                # restore is the one it always was.
+                exact_boundary = _payload_boundary_at_or_below(
+                    payload_spec, int(exact_restore_tokens)
+                )
+                if exact_boundary is not None and (
+                    boundary_prefix is None or exact_boundary > boundary_prefix
+                ):
+                    requested_prefix = int(exact_restore_tokens)
+                    boundary_prefix = exact_boundary
+                    exact_point_taken = requested_prefix
             if has_recurrent and boundary_prefix is None:
                 from mtplx.session_bank import _boundary_true_restore_enabled
 
@@ -2880,6 +3051,8 @@ class SessionBankColdTier:
             )
         restore_s = time.perf_counter() - started_s
         self._inc("restore_hits")
+        if exact_point_taken is not None:
+            self._inc("prefix_restores_at_exact_point")
         with self._stats_lock:
             self._stats["last_restore_s"] = time.time()
             self._stats["last_miss_reason"] = None
@@ -2903,7 +3076,9 @@ class SessionBankColdTier:
         )
         return ColdRestoreRecord(
             entry_id=str(metadata["entry_id"]),
-            token_ids=token_ids,
+            # The memo holds a compact array; a restored record carries the
+            # tuple its callers have always received.
+            token_ids=tuple(token_ids),
             cache_snapshot=decoded.cache_snapshot,
             logits=decoded.logits,
             hidden=decoded.hidden,
@@ -2918,6 +3093,7 @@ class SessionBankColdTier:
             mtp_history_snapshot_prefix_len=(
                 decoded.mtp_history_snapshot_prefix_len
             ),
+            prefix_restore_tokens=exact_point_taken,
         )
 
     def _candidate_rows(
@@ -2961,6 +3137,37 @@ class SessionBankColdTier:
                 compatible.append(row)
         return compatible
 
+    def _row_token_ids(self, row: sqlite3.Row) -> array | tuple[int, ...]:
+        """Token ids of a manifest row, parsed once per (entry_id, token_hash).
+
+        Held as an ``array('I')`` (4 bytes per id; a tuple of ints costs about
+        40). A full memo keeps its residents and hands a newcomer back
+        unmemoized: prefix lookups walk the rows in the same order every
+        time, so evicting the oldest row would drop each row just before its
+        next use and the memo would never hit.
+        """
+        entry_id = str(row["entry_id"])
+        token_hash = str(row["token_hash"])
+        with self._row_tokens_memo_lock:
+            hit = self._row_tokens_memo.get(entry_id)
+            if hit is not None and hit[0] == token_hash:
+                return hit[1]
+        tokens = _token_array(json.loads(str(row["token_ids_json"])))
+        with self._row_tokens_memo_lock:
+            old = self._row_tokens_memo.pop(entry_id, None)
+            if old is not None:
+                self._row_tokens_memo_tokens -= len(old[1])
+            if self._row_tokens_memo_tokens + len(tokens) <= _ROW_TOKENS_MEMO_MAX_TOKENS:
+                self._row_tokens_memo[entry_id] = (token_hash, tokens)
+                self._row_tokens_memo_tokens += len(tokens)
+        return tokens
+
+    def _forget_row_tokens(self, entry_id: str) -> None:
+        with self._row_tokens_memo_lock:
+            old = self._row_tokens_memo.pop(str(entry_id), None)
+            if old is not None:
+                self._row_tokens_memo_tokens -= len(old[1])
+
     def _candidate_rows_for_prefix_boundary(
         self,
         *,
@@ -2971,12 +3178,20 @@ class SessionBankColdTier:
         mtp_history_policy: str | None,
         draft_head_identity: str | None,
         policy_fingerprint: str | None,
+        min_prefix_len: int = 0,
+        max_prefix_len: int | None = None,
     ) -> list[sqlite3.Row]:
         query = [
             "SELECT * FROM entries WHERE model_path = ?",
             "AND mtp_enabled = ?",
         ]
         params: list[Any] = [str(model_path), 1 if mtp_enabled else 0]
+        if min_prefix_len > 0:
+            query.append("AND prefix_len >= ?")
+            params.append(int(min_prefix_len))
+        if max_prefix_len is not None:
+            query.append("AND prefix_len <= ?")
+            params.append(int(max_prefix_len))
         if hidden_variant is not None:
             query.append("AND hidden_variant = ?")
             params.append(str(hidden_variant))
@@ -3321,6 +3536,7 @@ class SessionBankColdTier:
                 self._disk_usage_cache["disk_usage_stale"] = True
 
     def _insert_manifest(self, metadata: dict[str, Any]) -> None:
+        self._forget_row_tokens(str(metadata["entry_id"]))
         with self._connect() as conn:
             conn.execute(
                 """
@@ -3411,6 +3627,14 @@ class SessionBankColdTier:
                 kind,
                 int(nbytes),
             )
+        self._beat_owner()
+
+    def _beat_owner(self) -> None:
+        """Keep the model's GPU working set resident between units of SSD
+        work on the owner thread (``owner_beat``; a no-op when unwired)."""
+        beat = self.owner_beat
+        if beat is not None:
+            beat()
 
     def _set_last_miss(self, reason: str) -> None:
         with self._stats_lock:

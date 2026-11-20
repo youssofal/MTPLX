@@ -111,6 +111,13 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         detailLocalizationKey = localizedDetailKey
     }
 
+    /// A row whose pack is on a drive that is not plugged in says so in its
+    /// detail line (already localized) instead of its catalog text.
+    mutating func markNotConnected(_ text: String) {
+        detail = text
+        detailLocalizationKey = nil
+    }
+
     /// Resolves only app-authored catalog text. Arbitrary details supplied by
     /// clients remain literal instead of accidentally becoming table keys.
     public var localizedDetail: String {
@@ -1065,7 +1072,11 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
             }
         }
         var discoveredRows: [String: Int] = [:]
-        for local in modelLibrary.discoverCompleteModels() {
+        let discovered = modelLibrary.discoverCompleteModels()
+        // Remember what each readable folder holds, so its packs stay listed
+        // (as not connected) while its drive is unplugged.
+        ModelFolderIndex.record(library: modelLibrary, discovered: discovered)
+        for local in discovered {
             if let index = listedInstalls[local.path] ?? rows.indices.first(where: {
                 !rows[$0].id.hasPrefix("local:") && rows[$0].matches(local.reference)
             }) {
@@ -1105,6 +1116,31 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 localCandidates: [local.path],
                 aliases: [local.reference, local.path]
             ))
+        }
+        // Packs last seen on a drive that is unplugged: listed and marked, so
+        // they neither vanish nor look like something to download again.
+        for remembered in ModelFolderIndex.rememberedPacks(library: modelLibrary) {
+            let text = ModelFolderIndex.notConnectedDetail(driveName: remembered.driveName)
+            if let index = rows.indices.first(where: {
+                rows[$0].localCandidates.contains(remembered.model.path)
+                    || rows[$0].matches(remembered.model.reference)
+            }) {
+                if rows[index].installedLocalPath(in: modelLibrary) == nil {
+                    rows[index].markNotConnected(text)
+                }
+                continue
+            }
+            var row = MTPLXModelOption(
+                id: "local:\(remembered.model.path)",
+                displayName: remembered.model.displayName,
+                shortName: remembered.model.displayName,
+                detail: text,
+                hfModelID: remembered.model.reference,
+                localCandidates: [remembered.model.path],
+                aliases: [remembered.model.reference, remembered.model.path]
+            )
+            row.markNotConnected(text)
+            rows.append(row)
         }
         return rows
     }

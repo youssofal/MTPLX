@@ -773,13 +773,30 @@ def test_every_residual_write_site_goes_through_the_shared_helper():
         assert "inject[..., :, None]" not in source
 
 
-def test_text_trunk_opens_a_rope_scope_only_when_armed():
-    import inspect
+def test_text_trunk_opens_a_rope_scope_only_when_armed(monkeypatch):
+    import contextlib
 
-    source = inspect.getsource(qwen4_exp.Qwen4ExpTextModel.__call__)
-    assert 'qwen4_opdiet_enabled("rope")' in source
-    assert "_rope_table_scope()" in source
-    assert "return self._forward(inputs, cache, input_embeddings)" in source
+    events = []
+
+    @contextlib.contextmanager
+    def rope_scope():
+        events.append("open")
+        yield
+        events.append("close")
+
+    class Trunk:
+        def _forward(self, *args):
+            events.append(("forward", args))
+            return "hidden"
+
+    monkeypatch.setattr(qwen4_exp, "_rope_table_scope", rope_scope)
+    monkeypatch.setattr(runtime_options, "_QWEN4_OPDIET_SELECTED", frozenset({"rope"}))
+    forward = ("forward", ("ids", "cache", None, None))
+    for armed, expected in ((False, [forward]), (True, ["open", forward, "close"])):
+        monkeypatch.setattr(runtime_options, "_QWEN4_OPDIET", armed)
+        events.clear()
+        assert qwen4_exp.Qwen4ExpTextModel.__call__(Trunk(), "ids", "cache") == "hidden"
+        assert events == expected  # the forward runs inside the scope only when the diet is armed
 
 
 def test_extend_pooled_fixed_keeps_the_bank_dtype_when_the_norm_widens(

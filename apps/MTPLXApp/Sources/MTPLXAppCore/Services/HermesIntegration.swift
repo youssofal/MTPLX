@@ -1131,9 +1131,10 @@ public struct HermesIntegration: Sendable {
     }
 
     /// Desktop-first launch: the built Desktop app when present (same flow
-    /// as the OpenCode card), the Terminal handoff otherwise. A present-but-
-    /// broken Desktop bundle falls back to Terminal rather than stranding
-    /// the user, carrying both details.
+    /// as the OpenCode card), the Terminal handoff otherwise or when a
+    /// terminal is picked for Hermes. A present-but-broken Desktop bundle
+    /// falls back to the terminal rather than stranding the user, carrying
+    /// both details.
     @MainActor
     public func launch(
         configuration: MTPLXAppConfiguration,
@@ -1141,6 +1142,11 @@ public struct HermesIntegration: Sendable {
     ) async -> HermesLaunchResult {
         guard isCurrent?() ?? true else {
             return staleHandoffResult(command: Self.launchCommand(for: configuration.model))
+        }
+        // A terminal picked for Hermes (Settings, or `hermes_opens_in`) skips
+        // the Desktop app.
+        if ClientOpenings.currentSurface(.hermes) == ClientOpenings.terminalChoice {
+            return await launchInTerminal(configuration: configuration, isCurrent: isCurrent)
         }
         guard let desktop = await launchDesktopApplication(
             configuration: configuration,
@@ -1219,9 +1225,11 @@ public struct HermesIntegration: Sendable {
             )
         }
 
+        // The terminal the user picked for Hermes (Settings, or `hermes_opens_in`).
+        let opening = ClientOpenings.currentTerminal(.hermes)
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        process.arguments = ["-a", "Terminal", handoff.commandURL.path]
+        process.arguments = ["-a", opening.openApplication, handoff.commandURL.path]
         let stderr = Pipe()
         process.standardError = stderr
         // The backend store calls this from the main actor, so a wedged
@@ -1300,7 +1308,7 @@ public struct HermesIntegration: Sendable {
             return HermesLaunchResult(
                 action: .launched,
                 command: command,
-                detail: tr("opened Hermes in Terminal"),
+                detail: tr("opened Hermes in %@", opening.terminalName),
                 launchedProcessIDs: [lease.processID],
                 terminalHandoffLease: lease
             )

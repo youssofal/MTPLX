@@ -132,7 +132,9 @@ def test_rows_gather_result_does_not_depend_on_the_capacity(attn, rows_gather_la
         TensorOffsetQSACache,
         "_bank_capacity",
         staticmethod(
-            lambda needed, ratio, kv_step, *, rows_gather, bucket=0: _old_capacity(needed, ratio)
+            lambda needed, ratio, kv_step, *, rows_gather, bucket=0, dense_bucket=0: _old_capacity(
+                needed, ratio
+            )
         ),
     )
     old = TensorOffsetQSACache.from_qsa_cache(_prefilled(attn), reserve_tokens=RESERVE)

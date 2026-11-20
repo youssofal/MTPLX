@@ -1,0 +1,68 @@
+id = "agent-slugify"
+kind = "agent"
+prompt = '''
+`slugify` in `text_utils.py` does not do what its docstring says, and the tests fail. Fix it and make the tests pass.
+'''
+hidden_tests = '''
+from text_utils import slugify
+
+assert slugify("Hello World") == "hello-world"
+assert slugify("  Hello, World!  ") == "hello-world"
+assert slugify("Crème brûlée") == "creme-brulee"
+assert slugify("Ça va? Très bien!!") == "ca-va-tres-bien"
+assert slugify("already-a-slug") == "already-a-slug"
+assert slugify("Python 3.14 release") == "python-3-14-release"
+assert slugify("Ünïcödé") == "unicode"
+assert slugify("---") == ""
+assert slugify("") == ""
+assert slugify("a  --  b") == "a-b"
+'''
+
+[files]
+"text_utils.py" = '''
+import re
+
+
+def slugify(title):
+    """Turn a title into a URL slug.
+
+    The slug holds lowercase ASCII letters and digits, with words separated
+    by single hyphens and no hyphen at either end. Accented letters lose
+    their accents ("é" becomes "e"); every other character separates words.
+    """
+    slug = title.lower()
+    slug = re.sub(r"[^a-z0-9]", "-", slug)
+    return slug
+'''
+"test_text_utils.py" = '''
+import unittest
+
+from text_utils import slugify
+
+
+class SlugifyTests(unittest.TestCase):
+    def test_spaces(self):
+        self.assertEqual(slugify("Hello World"), "hello-world")
+
+    def test_punctuation_and_ends(self):
+        self.assertEqual(slugify("  Hello, World!  "), "hello-world")
+
+    def test_accents(self):
+        self.assertEqual(slugify("Crème brûlée"), "creme-brulee")
+
+
+if __name__ == "__main__":
+    unittest.main()
+'''
+
+[reference_files]
+"text_utils.py" = '''
+import re
+import unicodedata
+
+
+def slugify(title):
+    """Turn a title into a URL slug."""
+    plain = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]+", "-", plain.lower()).strip("-")
+'''

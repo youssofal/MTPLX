@@ -367,6 +367,9 @@ def _restore_delta_encoded_mtp_norms(
     weights: dict[str, Any],
     config: dict[str, Any],
 ) -> dict[str, Any]:
+    from .compressed_tensors import LAST_MTP_NORM_REPAIRS
+
+    LAST_MTP_NORM_REPAIRS.clear()
     if not _mtp_norms_are_delta_encoded(config):
         return _heal_raw_delta_mtp_norms(weights)
     restored = dict(weights)
@@ -820,6 +823,11 @@ def inject_mtp_support(
     text_model._mtplx_hidden_variant = contract.hidden_variant
     text_model._mtplx_concat_order = contract.concat_order
     text_model._mtplx_mtp_quant_policy = contract.mtp_quant_policy
+    # Which draft-head gains the load restored (compressed_tensors.
+    # unshifted_mtp_norms): reported in /health and every request's log row.
+    from .compressed_tensors import LAST_MTP_NORM_REPAIRS
+
+    text_model._mtplx_draft_head_norm_repairs = [dict(r) for r in LAST_MTP_NORM_REPAIRS]
 
     original_text_class = text_model.__class__
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from mtplx.models import qwen4_exp
 from mtplx.server.openai import _qwen4_install_reports
 
 
@@ -35,7 +36,11 @@ def test_reports_are_collected_from_the_runtime() -> None:
     assert reports["ngram_prewarm"]["mode"] == "auto"
 
 
-def test_absent_lanes_read_as_absent_and_never_raise() -> None:
+def test_absent_lanes_read_as_absent_and_never_raise(monkeypatch) -> None:
+    # The verify head-chunk receipt is process-wide (a server process serves
+    # one model). A Flash-Next test that ran earlier on this worker leaves it
+    # set, so this read starts from a process where the lane never fired.
+    monkeypatch.setattr(qwen4_exp, "_VERIFY_SDPA_HEAD_CHUNK_ENGAGED", None)
     assert _qwen4_install_reports(SimpleNamespace()) == {}
     runtime = SimpleNamespace(model=object())
     assert _qwen4_install_reports(SimpleNamespace(runtime=runtime)) == {}

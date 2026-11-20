@@ -790,6 +790,15 @@ public struct LifetimeSnapshot: Codable, Equatable, Sendable {
     public var tokensTotal: Int
     public var requestsTotal: Int
     public var cancelledTotal: Int
+    /// Prompt reads of 2,048 or more new tokens since the server started,
+    /// their tokens and their seconds (the token-weighted read speed), the
+    /// fastest one, and how many ran on a throttled chip. Nil from older
+    /// servers.
+    public var prefillReadsTotal: Int?
+    public var prefillReadTokensTotal: Int?
+    public var prefillReadSecondsTotal: Double?
+    public var prefillReadPeakTokS: Double?
+    public var prefillThrottledReadsTotal: Int?
 
     enum CodingKeys: String, CodingKey {
         case startedAtS = "started_at_s"
@@ -800,6 +809,11 @@ public struct LifetimeSnapshot: Codable, Equatable, Sendable {
         case tokensTotal = "tokens_total"
         case requestsTotal = "requests_total"
         case cancelledTotal = "cancelled_total"
+        case prefillReadsTotal = "prefill_reads_total"
+        case prefillReadTokensTotal = "prefill_read_tokens_total"
+        case prefillReadSecondsTotal = "prefill_read_seconds_total"
+        case prefillReadPeakTokS = "prefill_read_peak_tok_s"
+        case prefillThrottledReadsTotal = "prefill_throttled_reads_total"
     }
 }
 
@@ -1040,6 +1054,10 @@ public struct MemSnapshot: Codable, Equatable, Sendable {
     public var modelWeightsBytes: Int?
     public var sessionBankBytes: Int?
     public var generationWorkingBytes: Int?
+    /// What macOS counts for the daemon process (the counter jetsam reads),
+    /// and the part of it MLX's own account (active + pool) does not explain.
+    public var physFootprintBytes: Int?
+    public var hostOverhangBytes: Int?
     public var error: String?
 
     enum CodingKeys: String, CodingKey {
@@ -1050,6 +1068,8 @@ public struct MemSnapshot: Codable, Equatable, Sendable {
         case modelWeightsBytes = "model_weights_bytes"
         case sessionBankBytes = "session_bank_bytes"
         case generationWorkingBytes = "generation_working_bytes"
+        case physFootprintBytes = "phys_footprint_bytes"
+        case hostOverhangBytes = "host_overhang_bytes"
         case error
     }
 }
@@ -1210,10 +1230,23 @@ public struct HealthPayload: Codable, Equatable, Sendable {
     /// Live tab's heat notice reads it).
     public var thermalPressure: ThermalPressureHealth?
     public var vision: VisionCapability?
+    /// The Metal memory limit the engine configured: the line its memory
+    /// guard measures against (`/health` `metal_memory_caps`).
+    public var metalMemoryCaps: MetalMemoryCaps?
 
     public struct VisionCapability: Codable, Equatable, Sendable {
         public var enabled: Bool
         public var formats: [String]?
+    }
+
+    public struct MetalMemoryCaps: Codable, Equatable, Sendable {
+        public var applied: Bool?
+        public var memoryLimitBytes: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case applied
+            case memoryLimitBytes = "memory_limit_bytes"
+        }
     }
 
     enum CodingKeys: String, CodingKey {
@@ -1245,6 +1278,7 @@ public struct HealthPayload: Codable, Equatable, Sendable {
         case thermal
         case thermalPressure = "thermal_pressure"
         case vision
+        case metalMemoryCaps = "metal_memory_caps"
     }
 }
 
@@ -1462,6 +1496,10 @@ public struct DashboardSnapshot: Codable, Equatable, Sendable {
     /// during multi-session prefill showed the shedding banner while the
     /// ring was empty).
     public var memoryGuardEvents: [MemoryGuardEvent]?
+    /// True on a stream snapshot that left out the request rows because they
+    /// did not change since the stream last sent them (`latest` is null and
+    /// `recent` empty then): the rows already held still stand.
+    public var rowsUnchanged: Bool?
 
     enum CodingKeys: String, CodingKey {
         case ts
@@ -1490,6 +1528,17 @@ public struct DashboardSnapshot: Codable, Equatable, Sendable {
         case allocatorFraction = "allocator_fraction"
         case memoryPlan = "memory_plan"
         case memoryGuardEvents = "memory_guard_events"
+        case rowsUnchanged = "rows_unchanged"
+    }
+
+    /// This snapshot with the request rows of `held` when the stream left
+    /// them out as unchanged; otherwise this snapshot as it came.
+    public func keepingRows(of held: DashboardSnapshot?) -> DashboardSnapshot {
+        guard rowsUnchanged == true, let held else { return self }
+        var merged = self
+        merged.latest = held.latest
+        merged.recent = held.recent
+        return merged
     }
 }
 

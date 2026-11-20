@@ -255,7 +255,7 @@ public final class OnboardingOrchestrator: ObservableObject {
     }
 
     public func freeDiskGiB() -> Double {
-        ModelStoreVolume.freeGiB(at: ModelStoreVolume.measurementURL(for: modelLibrary.primaryDirectory))
+        ModelStoreVolume.freeGiB(forStore: modelLibrary.primaryDirectory)
     }
 
     /// Bytes an interrupted pull already left in `repo`'s model folder.

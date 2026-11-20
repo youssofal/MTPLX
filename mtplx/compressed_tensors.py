@@ -6,6 +6,7 @@ import contextlib
 import json
 import logging
 import math
+import os
 import shutil
 import struct
 from collections import Counter
@@ -66,6 +67,37 @@ MTP_RMSNORM_QK_SUFFIXES = (
 MTP_RMSNORM_FINAL_NORM_KEYS = ("norm.weight", "mtp.norm.weight")
 MTP_RMSNORM_QK_DELTA_MEAN_MAX = 1.25
 MTP_RMSNORM_LOW_DELTA_MEAN_MAX = 0.5
+# One gain can miss the shift the rest of its sidecar got, so after the
+# set-level verdict each norm of an absolute sidecar is checked on its own.
+# The shipped Qwen3.6-35B-A3B Speed and Balance sidecars carry the head's
+# post_attention_layernorm as upstream stores it, zero-centred (mean 0.8686,
+# one channel at -0.14), beside six norms that carry the +1: the set-level
+# verdict reads that sidecar absolute and shifts nothing, so every draft step
+# ran the head's MoE MLP on its input scaled by w where it was trained on
+# 1 + w (the same head forged from its source
+# holds 1.8685, every channel positive). Over every MTP head installed on the
+# measuring Mac (30 heads: Qwen 3.5, 3.6, 3.8, MiMo, Bonsai, Flash-Next, R1,
+# Q8, a third-party 35B sidecar) an absolute decoder-layer gain
+# (input_layernorm, post_attention_layernorm) has mean 0.905 or more and no
+# negative channel, and only those two 35B tensors fall below a mean of 1.0
+# with a negative channel: the repair asks for both signals. The q/k, pre-fc
+# and final gains keep the set-level verdict alone (q/k alone low is an
+# unusual model, not a missed shift: test_single_signal_low_norms_are_not_
+# healed; the final norm overlaps across conventions; Flash-Next's own model
+# reads its pre-fc gains centred). (The "0.87+" of the fleet note above was
+# the unshifted 35B tensor.)
+MTP_LAYER_NORM_REPAIR_SUFFIXES = (
+    "input_layernorm.weight",
+    "post_attention_layernorm.weight",
+)
+MTP_LAYER_NORM_ABSOLUTE_MEAN_MIN = 1.0
+#: The repair's switch (on by default): MTPLX_DRAFT_HEAD_NORM_REPAIR=0 loads
+#: every gain as stored, to compare.
+MTP_NORM_REPAIR_ENV = "MTPLX_DRAFT_HEAD_NORM_REPAIR"
+#: What the last sidecar load repaired: [{"tensor", "mean_before",
+#: "mean_after", "min_before"}]; the runtime stamps it on the model and the
+#: server reports it in /health and in every request's log row.
+LAST_MTP_NORM_REPAIRS: list[dict[str, Any]] = []
 
 
 def convert_compressed_tensors_awq_to_mlx(
@@ -823,15 +855,65 @@ def mtp_sidecar_norms_are_delta(weights: dict[str, Any]) -> bool:
     )
 
 
+def draft_head_norm_repair_enabled() -> bool:
+    return os.environ.get(MTP_NORM_REPAIR_ENV, "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def unshifted_mtp_norms(weights: dict[str, Any]) -> list[str]:
+    """Per tensor, the decoder-layer gains of an absolute sidecar that missed
+    their +1 (see MTP_LAYER_NORM_REPAIR_SUFFIXES): mean below
+    MTP_LAYER_NORM_ABSOLUTE_MEAN_MIN and a negative channel, both at once."""
+
+    keys: list[str] = []
+    for key, value in weights.items():
+        if getattr(value, "ndim", None) != 1:
+            continue
+        if any(key.endswith(suffix) for suffix in MTP_LAYER_NORM_REPAIR_SUFFIXES):
+            if (
+                float(value.mean().item()) < MTP_LAYER_NORM_ABSOLUTE_MEAN_MIN
+                and float(value.min().item()) < 0.0
+            ):
+                keys.append(key)
+    return sorted(keys)
+
+
+def _repair_unshifted_mtp_norms(weights: dict[str, Any]) -> dict[str, Any]:
+    """An absolute sidecar with each gain that missed its +1 given it, recorded
+    in LAST_MTP_NORM_REPAIRS and logged. Off under MTPLX_DRAFT_HEAD_NORM_REPAIR=0."""
+
+    keys = unshifted_mtp_norms(weights) if draft_head_norm_repair_enabled() else []
+    if not keys:
+        return weights
+    repaired = dict(weights)
+    for key in keys:
+        value = weights[key]
+        repaired[key] = value + 1.0
+        record = {
+            "tensor": key,
+            "mean_before": round(float(value.mean().item()), 4),
+            "mean_after": round(float(repaired[key].mean().item()), 4),
+            "min_before": round(float(value.min().item()), 4),
+        }
+        LAST_MTP_NORM_REPAIRS.append(record)
+        logging.getLogger(__name__).warning(
+            "[mtp norms] %s missed its +1 in an absolute sidecar (mean %.4f, min %.4f): restored to mean %.4f "
+            "(%s=0 to load it as stored)",
+            key, record["mean_before"], record["min_before"], record["mean_after"], MTP_NORM_REPAIR_ENV,
+        )
+    return repaired
+
+
 def shift_delta_mtp_norms(weights: dict[str, Any]) -> dict[str, Any]:
     """Restore the +1.0 absolute convention on a delta-encoded MTP sidecar.
 
-    Absolute-convention sidecars pass through byte-identical (#301). Keys may
-    be namespaced ("mtp.layers.0...") or stripped ("layers.0..."); both spell
-    the final norm as one of MTP_RMSNORM_FINAL_NORM_KEYS.
+    Absolute-convention sidecars pass through byte-identical (#301), except a
+    gain that alone missed its +1 (``unshifted_mtp_norms``), which gets it.
+    Keys may be namespaced ("mtp.layers.0...") or stripped ("layers.0...");
+    both spell the final norm as one of MTP_RMSNORM_FINAL_NORM_KEYS.
     """
+    LAST_MTP_NORM_REPAIRS.clear()
     if not mtp_sidecar_norms_are_delta(weights):
-        return weights
+        return _repair_unshifted_mtp_norms(weights)
     logging.getLogger(__name__).warning(
         "[mtp norms] sidecar gains are delta-encoded; restoring the +1.0 convention"
     )

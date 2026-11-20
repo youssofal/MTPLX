@@ -1,0 +1,63 @@
+id = "code-lru-cache"
+kind = "code"
+prompt = '''
+Implement a Python class `LRUCache` with `__init__(self, capacity)`, `get(self, key)` and `put(self, key, value)`.
+
+`get` returns the value stored for `key` and marks the key as most recently used, or returns `-1` if the key is absent. `put` inserts or updates the value and marks the key as most recently used; when inserting a new key would make the cache hold more than `capacity` keys, it first evicts the least recently used key. A capacity of 0 stores nothing. Both operations must take O(1) time on average.
+
+Reply with the complete class in one fenced Python code block.
+'''
+tests = '''
+c = LRUCache(2)
+c.put(1, 1)
+c.put(2, 2)
+assert c.get(1) == 1
+c.put(3, 3)
+assert c.get(2) == -1
+c.put(4, 4)
+assert c.get(1) == -1
+assert c.get(3) == 3
+assert c.get(4) == 4
+c = LRUCache(2)
+c.put(1, 1)
+c.put(2, 2)
+c.put(1, 10)
+c.put(3, 3)
+assert c.get(2) == -1
+assert c.get(1) == 10
+assert c.get(3) == 3
+z = LRUCache(0)
+z.put(1, 1)
+assert z.get(1) == -1
+o = LRUCache(1)
+o.put("a", 1)
+o.put("b", 2)
+assert o.get("a") == -1
+assert o.get("b") == 2
+o.put("b", 3)
+assert o.get("b") == 3
+'''
+reference = '''
+from collections import OrderedDict
+
+
+class LRUCache:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self._data = OrderedDict()
+
+    def get(self, key):
+        if key not in self._data:
+            return -1
+        self._data.move_to_end(key)
+        return self._data[key]
+
+    def put(self, key, value):
+        if self.capacity <= 0:
+            return
+        if key in self._data:
+            self._data.move_to_end(key)
+        elif len(self._data) >= self.capacity:
+            self._data.popitem(last=False)
+        self._data[key] = value
+'''

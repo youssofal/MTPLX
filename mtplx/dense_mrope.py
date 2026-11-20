@@ -101,9 +101,12 @@ SCHEME = "dense_mrope_v1"
 
 # Families whose full-attention layers are mlx-lm Qwen3NextAttention with a
 # plain nn.RoPE and whose every route is covered by the map above. The MoE
-# sibling (qwen3_5_moe) has its own compiled target-prefix routes and is not
-# covered here.
-DENSE_MODEL_TYPES = frozenset({"qwen3_5", "prism_hadamard_qwen35"})
+# sibling (qwen3_5_moe, the 35B-A3B) is the same model with routed experts:
+# its attention, its draft head and its serial routes are the dense model's.
+# Its own A3B target-prefix route carries no rotary delta, so an image
+# request roped here never takes it (generation.generate_mtpk), and its
+# batch scheduler takes no image request at all.
+DENSE_MODEL_TYPES = frozenset({"qwen3_5", "qwen3_5_moe", "prism_hadamard_qwen35"})
 
 INSTALL_ATTR = "_mtplx_dense_mrope"
 

@@ -38,6 +38,9 @@ CLIENTS: tuple[str, ...] = (
     "opencode",
     "pi",
     "hermes",
+    "claude-code",
+    "codex",
+    "deepseek-harness",
     "other",
     "benchmark",
 )
@@ -89,7 +92,9 @@ DECLARED_ENTRY_POINT_DIFFERENCES: dict[tuple[str, str], str] = {
     ("pi", "ssd_session_cache"): "app Pi ships it off, `mtplx start pi` on: unmeasured, cell P5.0",
 }
 
-_AGENT_CLIENTS = frozenset({"opencode", "pi", "hermes"})
+_AGENT_CLIENTS = frozenset(
+    {"opencode", "pi", "hermes", "claude-code", "codex", "deepseek-harness"}
+)
 
 # Per-client base lane. Sampler values apply only to families that do not
 # own their sampler; None means "the family or the pack decides".
@@ -134,6 +139,29 @@ _CLIENT_LANES: dict[str, dict[str, Any]] = {
         "chat_template_profile": "local_qwen36",
         "adaptive_policy": "expected_value",
         "preserve_thinking": "auto",
+    },
+    # Claude Code and Codex are single-stream coding agents with long tool
+    # histories, the shape the serial lane was measured on (51.4 against 36.8
+    # decode tok/s for the agent batch lane at 8K). Before they had their own
+    # Start entries they arrived through "other", the batch lane. Sampler,
+    # depth and reasoning effort stay with the model family.
+    "claude-code": {
+        "scheduler_mode": "serial",
+        "batching_preset": "latency",
+        "ssd_session_cache": "on",
+    },
+    "codex": {
+        "scheduler_mode": "serial",
+        "batching_preset": "latency",
+        "ssd_session_cache": "on",
+    },
+    # DeepSeek Harness: the same single-stream coding-agent shape (its title
+    # side request is switched off in MTPLX's profile, so nothing shares the
+    # lane with the turn).
+    "deepseek-harness": {
+        "scheduler_mode": "serial",
+        "batching_preset": "latency",
+        "ssd_session_cache": "on",
     },
     "other": {
         "scheduler_mode": "ar_batch",

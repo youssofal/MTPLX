@@ -18,14 +18,22 @@ import MTPLXAppCore
 //
 // Backward compatibility: the old `.cache` and `.requests` raw values
 // can still appear in a returning user's UserDefaults
-// ("mtplx.app.selectedTab"); the init at line 122 below decodes
-// unknown values back to `.live`, so removing the cases is safe.
+// ("mtplx.app.selectedTab"); the router's init decodes unknown values
+// back to `.live`, so removing the cases is safe.
+//
+// Settings is a destination, not a dashboard: it opens from the gear in
+// the top bar (and Cmd-,), so the bottom bar shows `barTabs` only. The
+// case stays in `allCases` so a saved "settings" selection still
+// restores and Cmd-5 keeps opening it.
 enum AppTab: String, Hashable, CaseIterable, Identifiable, Sendable {
     case live
     case activity
     case system
     case forge
     case settings
+
+    /// The dashboards the bottom tab bar shows.
+    static let barTabs: [AppTab] = [.live, .activity, .system, .forge]
 
     var id: String { rawValue }
 
@@ -46,7 +54,7 @@ enum AppTab: String, Hashable, CaseIterable, Identifiable, Sendable {
         case .activity: return "waveform.path.ecg"
         case .system: return "cpu"
         case .forge: return "hammer.fill"
-        case .settings: return "slider.horizontal.3"
+        case .settings: return "gearshape"
         }
     }
 }
@@ -109,10 +117,23 @@ enum OnboardingPhase: String, Hashable, Sendable {
 @MainActor
 final class AppRouter: ObservableObject {
     private static let defaultsKey = "mtplx.app.selectedTab"
+    private static let settingsSectionKey = "mtplx.app.settingsSection"
 
     @Published var selection: AppTab {
         didSet {
             UserDefaults.standard.set(selection.rawValue, forKey: Self.defaultsKey)
+            if selection != .settings {
+                lastDashboardTab = selection
+            }
+        }
+    }
+    /// The dashboard to return to when the Settings gear is pressed again.
+    private(set) var lastDashboardTab: AppTab = .live
+    /// The Settings page's open section. Lives here, like `selection`,
+    /// because the dashboard rebuilds the Settings view on every visit.
+    @Published var settingsSection: SettingsSection {
+        didSet {
+            UserDefaults.standard.set(settingsSection.rawValue, forKey: Self.settingsSectionKey)
         }
     }
     /// Which top-level surface the window shows. Session-local — NOT
@@ -165,7 +186,28 @@ final class AppRouter: ObservableObject {
 
     init() {
         let raw = UserDefaults.standard.string(forKey: Self.defaultsKey) ?? AppTab.live.rawValue
-        self.selection = AppTab(rawValue: raw) ?? .live
+        let restored = AppTab(rawValue: raw) ?? .live
+        self.selection = restored
+        if restored != .settings { lastDashboardTab = restored }
+        let section = UserDefaults.standard.string(forKey: Self.settingsSectionKey) ?? ""
+        self.settingsSection = SettingsSection(rawValue: section) ?? .general
+    }
+
+    /// Open Settings on the dashboard surface, at `section` when given.
+    func openSettings(section: SettingsSection? = nil) {
+        if let section { settingsSection = section }
+        selection = .settings
+        primaryMode = .dashboard
+    }
+
+    /// The gear in the top bar: opens Settings, or, when Settings is
+    /// already showing, goes back to the dashboard the user came from.
+    func toggleSettings() {
+        if selection == .settings, primaryMode == .dashboard {
+            selection = lastDashboardTab
+        } else {
+            openSettings()
+        }
     }
 
     /// Flip into chat mode (called after `.chat` daemon reaches running,
@@ -196,16 +238,17 @@ final class AppRouter: ObservableObject {
         selection = tab
     }
 
-    func nextTab() {
-        let all = AppTab.allCases
-        guard let idx = all.firstIndex(of: selection) else { return }
-        selection = all[(idx + 1) % all.count]
-    }
+    func nextTab() { stepTab(by: 1) }
 
-    func previousTab() {
-        let all = AppTab.allCases
-        guard let idx = all.firstIndex(of: selection) else { return }
-        selection = all[(idx - 1 + all.count) % all.count]
+    func previousTab() { stepTab(by: -1) }
+
+    /// Cycles the bottom bar's dashboards. Settings is not one of them: from
+    /// Settings the step starts at the dashboard it was opened from.
+    private func stepTab(by offset: Int) {
+        let tabs = AppTab.barTabs
+        let current = tabs.contains(selection) ? selection : lastDashboardTab
+        guard let idx = tabs.firstIndex(of: current) else { return }
+        selection = tabs[(idx + offset + tabs.count) % tabs.count]
     }
 
     func presentLogs() {

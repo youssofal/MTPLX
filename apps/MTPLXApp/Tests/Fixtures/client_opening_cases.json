@@ -1,0 +1,1541 @@
+{
+ "clients": [
+  {
+   "app_name": null,
+   "app_surfaces": [],
+   "config_key": "pi_opens_in",
+   "default": "terminal",
+   "id": "pi",
+   "name": "Pi"
+  },
+  {
+   "app_name": "OpenCode",
+   "app_surfaces": [
+    "app"
+   ],
+   "config_key": "opencode_opens_in",
+   "default": "app",
+   "id": "opencode",
+   "name": "OpenCode"
+  },
+  {
+   "app_name": "Hermes",
+   "app_surfaces": [
+    "app"
+   ],
+   "config_key": "hermes_opens_in",
+   "default": "app",
+   "id": "hermes",
+   "name": "Hermes"
+  },
+  {
+   "app_name": null,
+   "app_surfaces": [],
+   "config_key": "claude_code_opens_in",
+   "default": "terminal",
+   "id": "claude-code",
+   "name": "Claude Code"
+  },
+  {
+   "app_name": "Codex",
+   "app_surfaces": [
+    "mtplx-app"
+   ],
+   "config_key": "codex_opens_in",
+   "default": "mtplx-app",
+   "id": "codex",
+   "name": "Codex"
+  },
+  {
+   "app_name": "DeepSeek Harness web",
+   "app_surfaces": [
+    "app"
+   ],
+   "config_key": "deepseek_harness_opens_in",
+   "default": "app",
+   "id": "deepseek-harness",
+   "name": "DeepSeek Harness"
+  }
+ ],
+ "generated_by": "scripts/write_client_opening_cases.py",
+ "infos": [
+  {
+   "info": {
+    "CFBundleDocumentTypes": [
+     {
+      "CFBundleTypeRole": "Shell",
+      "LSItemContentTypes": [
+       "com.apple.terminal.shell-script"
+      ]
+     }
+    ],
+    "CFBundleIdentifier": "com.apple.Terminal",
+    "CFBundleName": "Terminal"
+   },
+   "terminal": {
+    "bundle_id": "com.apple.Terminal",
+    "name": "Terminal",
+    "path": "/Applications/X.app"
+   }
+  },
+  {
+   "info": {
+    "CFBundleDisplayName": "Warp",
+    "CFBundleDocumentTypes": [
+     {
+      "CFBundleTypeRole": "Viewer",
+      "LSItemContentTypes": [
+       "public.folder"
+      ]
+     },
+     {
+      "CFBundleTypeRole": "Shell",
+      "LSItemContentTypes": [
+       "com.apple.terminal.shell-script"
+      ]
+     }
+    ],
+    "CFBundleIdentifier": "dev.warp.Warp-Stable",
+    "CFBundleName": "Warp-Stable"
+   },
+   "terminal": {
+    "bundle_id": "dev.warp.Warp-Stable",
+    "name": "Warp",
+    "path": "/Applications/X.app"
+   }
+  },
+  {
+   "info": {
+    "CFBundleDocumentTypes": [
+     {
+      "CFBundleTypeRole": "Editor",
+      "LSItemContentTypes": [
+       "com.apple.terminal.shell-script"
+      ]
+     }
+    ],
+    "CFBundleIdentifier": "com.example.editor",
+    "CFBundleName": "Editor"
+   },
+   "terminal": null
+  },
+  {
+   "info": {
+    "CFBundleName": "No Id"
+   },
+   "terminal": null
+  }
+ ],
+ "resolve": [
+  {
+   "choice": null,
+   "client": "pi",
+   "opening": {
+    "client": "pi",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   },
+   "terminal_for": {
+    "client": "pi",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "",
+   "client": "pi",
+   "opening": {
+    "client": "pi",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   },
+   "terminal_for": {
+    "client": "pi",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "terminal",
+   "client": "pi",
+   "opening": {
+    "client": "pi",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   },
+   "terminal_for": {
+    "client": "pi",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "app",
+   "client": "pi",
+   "opening": {
+    "client": "pi",
+    "note": "Pi has no app to open; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   },
+   "terminal_for": {
+    "client": "pi",
+    "note": "Pi has no app to open; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "mtplx-app",
+   "client": "pi",
+   "opening": {
+    "client": "pi",
+    "note": "Pi has no app to open; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   },
+   "terminal_for": {
+    "client": "pi",
+    "note": "Pi has no app to open; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "Ghostty",
+   "client": "pi",
+   "opening": {
+    "client": "pi",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   },
+   "terminal_for": {
+    "client": "pi",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   }
+  },
+  {
+   "choice": " ghostty ",
+   "client": "pi",
+   "opening": {
+    "client": "pi",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   },
+   "terminal_for": {
+    "client": "pi",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   }
+  },
+  {
+   "choice": "com.mitchellh.ghostty",
+   "client": "pi",
+   "opening": {
+    "client": "pi",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   },
+   "terminal_for": {
+    "client": "pi",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   }
+  },
+  {
+   "choice": "iTerm",
+   "client": "pi",
+   "opening": {
+    "client": "pi",
+    "note": "iTerm is not installed; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   },
+   "terminal_for": {
+    "client": "pi",
+    "note": "iTerm is not installed; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "Warp",
+   "client": "pi",
+   "opening": {
+    "client": "pi",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "dev.warp.Warp-Stable",
+     "name": "Warp",
+     "path": "/Applications/Warp.app"
+    }
+   },
+   "terminal_for": {
+    "client": "pi",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "dev.warp.Warp-Stable",
+     "name": "Warp",
+     "path": "/Applications/Warp.app"
+    }
+   }
+  },
+  {
+   "choice": null,
+   "client": "opencode",
+   "opening": {
+    "client": "opencode",
+    "note": null,
+    "surface": "app",
+    "terminal": null
+   },
+   "terminal_for": {
+    "client": "opencode",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "",
+   "client": "opencode",
+   "opening": {
+    "client": "opencode",
+    "note": null,
+    "surface": "app",
+    "terminal": null
+   },
+   "terminal_for": {
+    "client": "opencode",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "terminal",
+   "client": "opencode",
+   "opening": {
+    "client": "opencode",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   },
+   "terminal_for": {
+    "client": "opencode",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "app",
+   "client": "opencode",
+   "opening": {
+    "client": "opencode",
+    "note": null,
+    "surface": "app",
+    "terminal": null
+   },
+   "terminal_for": {
+    "client": "opencode",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "mtplx-app",
+   "client": "opencode",
+   "opening": {
+    "client": "opencode",
+    "note": "OpenCode has no app to open; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   },
+   "terminal_for": {
+    "client": "opencode",
+    "note": "OpenCode has no app to open; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "Ghostty",
+   "client": "opencode",
+   "opening": {
+    "client": "opencode",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   },
+   "terminal_for": {
+    "client": "opencode",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   }
+  },
+  {
+   "choice": " ghostty ",
+   "client": "opencode",
+   "opening": {
+    "client": "opencode",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   },
+   "terminal_for": {
+    "client": "opencode",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   }
+  },
+  {
+   "choice": "com.mitchellh.ghostty",
+   "client": "opencode",
+   "opening": {
+    "client": "opencode",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   },
+   "terminal_for": {
+    "client": "opencode",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   }
+  },
+  {
+   "choice": "iTerm",
+   "client": "opencode",
+   "opening": {
+    "client": "opencode",
+    "note": "iTerm is not installed; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   },
+   "terminal_for": {
+    "client": "opencode",
+    "note": "iTerm is not installed; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "Warp",
+   "client": "opencode",
+   "opening": {
+    "client": "opencode",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "dev.warp.Warp-Stable",
+     "name": "Warp",
+     "path": "/Applications/Warp.app"
+    }
+   },
+   "terminal_for": {
+    "client": "opencode",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "dev.warp.Warp-Stable",
+     "name": "Warp",
+     "path": "/Applications/Warp.app"
+    }
+   }
+  },
+  {
+   "choice": null,
+   "client": "hermes",
+   "opening": {
+    "client": "hermes",
+    "note": null,
+    "surface": "app",
+    "terminal": null
+   },
+   "terminal_for": {
+    "client": "hermes",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "",
+   "client": "hermes",
+   "opening": {
+    "client": "hermes",
+    "note": null,
+    "surface": "app",
+    "terminal": null
+   },
+   "terminal_for": {
+    "client": "hermes",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "terminal",
+   "client": "hermes",
+   "opening": {
+    "client": "hermes",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   },
+   "terminal_for": {
+    "client": "hermes",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "app",
+   "client": "hermes",
+   "opening": {
+    "client": "hermes",
+    "note": null,
+    "surface": "app",
+    "terminal": null
+   },
+   "terminal_for": {
+    "client": "hermes",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "mtplx-app",
+   "client": "hermes",
+   "opening": {
+    "client": "hermes",
+    "note": "Hermes has no app to open; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   },
+   "terminal_for": {
+    "client": "hermes",
+    "note": "Hermes has no app to open; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "Ghostty",
+   "client": "hermes",
+   "opening": {
+    "client": "hermes",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   },
+   "terminal_for": {
+    "client": "hermes",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   }
+  },
+  {
+   "choice": " ghostty ",
+   "client": "hermes",
+   "opening": {
+    "client": "hermes",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   },
+   "terminal_for": {
+    "client": "hermes",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   }
+  },
+  {
+   "choice": "com.mitchellh.ghostty",
+   "client": "hermes",
+   "opening": {
+    "client": "hermes",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   },
+   "terminal_for": {
+    "client": "hermes",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   }
+  },
+  {
+   "choice": "iTerm",
+   "client": "hermes",
+   "opening": {
+    "client": "hermes",
+    "note": "iTerm is not installed; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   },
+   "terminal_for": {
+    "client": "hermes",
+    "note": "iTerm is not installed; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "Warp",
+   "client": "hermes",
+   "opening": {
+    "client": "hermes",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "dev.warp.Warp-Stable",
+     "name": "Warp",
+     "path": "/Applications/Warp.app"
+    }
+   },
+   "terminal_for": {
+    "client": "hermes",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "dev.warp.Warp-Stable",
+     "name": "Warp",
+     "path": "/Applications/Warp.app"
+    }
+   }
+  },
+  {
+   "choice": null,
+   "client": "claude-code",
+   "opening": {
+    "client": "claude-code",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   },
+   "terminal_for": {
+    "client": "claude-code",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "",
+   "client": "claude-code",
+   "opening": {
+    "client": "claude-code",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   },
+   "terminal_for": {
+    "client": "claude-code",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "terminal",
+   "client": "claude-code",
+   "opening": {
+    "client": "claude-code",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   },
+   "terminal_for": {
+    "client": "claude-code",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "app",
+   "client": "claude-code",
+   "opening": {
+    "client": "claude-code",
+    "note": "Claude Code has no app to open; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   },
+   "terminal_for": {
+    "client": "claude-code",
+    "note": "Claude Code has no app to open; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "mtplx-app",
+   "client": "claude-code",
+   "opening": {
+    "client": "claude-code",
+    "note": "Claude Code has no app to open; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   },
+   "terminal_for": {
+    "client": "claude-code",
+    "note": "Claude Code has no app to open; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "Ghostty",
+   "client": "claude-code",
+   "opening": {
+    "client": "claude-code",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   },
+   "terminal_for": {
+    "client": "claude-code",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   }
+  },
+  {
+   "choice": " ghostty ",
+   "client": "claude-code",
+   "opening": {
+    "client": "claude-code",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   },
+   "terminal_for": {
+    "client": "claude-code",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   }
+  },
+  {
+   "choice": "com.mitchellh.ghostty",
+   "client": "claude-code",
+   "opening": {
+    "client": "claude-code",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   },
+   "terminal_for": {
+    "client": "claude-code",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   }
+  },
+  {
+   "choice": "iTerm",
+   "client": "claude-code",
+   "opening": {
+    "client": "claude-code",
+    "note": "iTerm is not installed; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   },
+   "terminal_for": {
+    "client": "claude-code",
+    "note": "iTerm is not installed; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "Warp",
+   "client": "claude-code",
+   "opening": {
+    "client": "claude-code",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "dev.warp.Warp-Stable",
+     "name": "Warp",
+     "path": "/Applications/Warp.app"
+    }
+   },
+   "terminal_for": {
+    "client": "claude-code",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "dev.warp.Warp-Stable",
+     "name": "Warp",
+     "path": "/Applications/Warp.app"
+    }
+   }
+  },
+  {
+   "choice": null,
+   "client": "codex",
+   "opening": {
+    "client": "codex",
+    "note": null,
+    "surface": "mtplx-app",
+    "terminal": null
+   },
+   "terminal_for": {
+    "client": "codex",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "",
+   "client": "codex",
+   "opening": {
+    "client": "codex",
+    "note": null,
+    "surface": "mtplx-app",
+    "terminal": null
+   },
+   "terminal_for": {
+    "client": "codex",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "terminal",
+   "client": "codex",
+   "opening": {
+    "client": "codex",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   },
+   "terminal_for": {
+    "client": "codex",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "app",
+   "client": "codex",
+   "opening": {
+    "client": "codex",
+    "note": "Codex has no app to open; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   },
+   "terminal_for": {
+    "client": "codex",
+    "note": "Codex has no app to open; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "mtplx-app",
+   "client": "codex",
+   "opening": {
+    "client": "codex",
+    "note": null,
+    "surface": "mtplx-app",
+    "terminal": null
+   },
+   "terminal_for": {
+    "client": "codex",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "Ghostty",
+   "client": "codex",
+   "opening": {
+    "client": "codex",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   },
+   "terminal_for": {
+    "client": "codex",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   }
+  },
+  {
+   "choice": " ghostty ",
+   "client": "codex",
+   "opening": {
+    "client": "codex",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   },
+   "terminal_for": {
+    "client": "codex",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   }
+  },
+  {
+   "choice": "com.mitchellh.ghostty",
+   "client": "codex",
+   "opening": {
+    "client": "codex",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   },
+   "terminal_for": {
+    "client": "codex",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   }
+  },
+  {
+   "choice": "iTerm",
+   "client": "codex",
+   "opening": {
+    "client": "codex",
+    "note": "iTerm is not installed; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   },
+   "terminal_for": {
+    "client": "codex",
+    "note": "iTerm is not installed; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "Warp",
+   "client": "codex",
+   "opening": {
+    "client": "codex",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "dev.warp.Warp-Stable",
+     "name": "Warp",
+     "path": "/Applications/Warp.app"
+    }
+   },
+   "terminal_for": {
+    "client": "codex",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "dev.warp.Warp-Stable",
+     "name": "Warp",
+     "path": "/Applications/Warp.app"
+    }
+   }
+  },
+  {
+   "choice": null,
+   "client": "deepseek-harness",
+   "opening": {
+    "client": "deepseek-harness",
+    "note": null,
+    "surface": "app",
+    "terminal": null
+   },
+   "terminal_for": {
+    "client": "deepseek-harness",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "",
+   "client": "deepseek-harness",
+   "opening": {
+    "client": "deepseek-harness",
+    "note": null,
+    "surface": "app",
+    "terminal": null
+   },
+   "terminal_for": {
+    "client": "deepseek-harness",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "terminal",
+   "client": "deepseek-harness",
+   "opening": {
+    "client": "deepseek-harness",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   },
+   "terminal_for": {
+    "client": "deepseek-harness",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "app",
+   "client": "deepseek-harness",
+   "opening": {
+    "client": "deepseek-harness",
+    "note": null,
+    "surface": "app",
+    "terminal": null
+   },
+   "terminal_for": {
+    "client": "deepseek-harness",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "mtplx-app",
+   "client": "deepseek-harness",
+   "opening": {
+    "client": "deepseek-harness",
+    "note": "DeepSeek Harness has no app to open; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   },
+   "terminal_for": {
+    "client": "deepseek-harness",
+    "note": "DeepSeek Harness has no app to open; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "Ghostty",
+   "client": "deepseek-harness",
+   "opening": {
+    "client": "deepseek-harness",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   },
+   "terminal_for": {
+    "client": "deepseek-harness",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   }
+  },
+  {
+   "choice": " ghostty ",
+   "client": "deepseek-harness",
+   "opening": {
+    "client": "deepseek-harness",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   },
+   "terminal_for": {
+    "client": "deepseek-harness",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   }
+  },
+  {
+   "choice": "com.mitchellh.ghostty",
+   "client": "deepseek-harness",
+   "opening": {
+    "client": "deepseek-harness",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   },
+   "terminal_for": {
+    "client": "deepseek-harness",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.mitchellh.ghostty",
+     "name": "Ghostty",
+     "path": "/Applications/Ghostty.app"
+    }
+   }
+  },
+  {
+   "choice": "iTerm",
+   "client": "deepseek-harness",
+   "opening": {
+    "client": "deepseek-harness",
+    "note": "iTerm is not installed; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   },
+   "terminal_for": {
+    "client": "deepseek-harness",
+    "note": "iTerm is not installed; opening Terminal",
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "com.apple.Terminal",
+     "name": "Terminal",
+     "path": "/System/Applications/Utilities/Terminal.app"
+    }
+   }
+  },
+  {
+   "choice": "Warp",
+   "client": "deepseek-harness",
+   "opening": {
+    "client": "deepseek-harness",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "dev.warp.Warp-Stable",
+     "name": "Warp",
+     "path": "/Applications/Warp.app"
+    }
+   },
+   "terminal_for": {
+    "client": "deepseek-harness",
+    "note": null,
+    "surface": "terminal",
+    "terminal": {
+     "bundle_id": "dev.warp.Warp-Stable",
+     "name": "Warp",
+     "path": "/Applications/Warp.app"
+    }
+   }
+  }
+ ],
+ "terminals": [
+  {
+   "bundle_id": "com.apple.Terminal",
+   "name": "Terminal",
+   "path": "/System/Applications/Utilities/Terminal.app"
+  },
+  {
+   "bundle_id": "com.mitchellh.ghostty",
+   "name": "Ghostty",
+   "path": "/Applications/Ghostty.app"
+  },
+  {
+   "bundle_id": "dev.warp.Warp-Stable",
+   "name": "Warp",
+   "path": "/Applications/Warp.app"
+  }
+ ],
+ "version": 1
+}

@@ -12,6 +12,7 @@ import datetime
 import base64
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -22,6 +23,7 @@ from typing import Any
 from mtplx.jsonc import load_config_file
 
 OPENCODE_PROVIDER_ID = "mtplx"
+OPENCODE_CLI_INSTALL_HINT = "npm install -g opencode-ai"
 OPENCODE_NPM_PACKAGE = "@ai-sdk/openai-compatible"
 OPENCODE_DEFAULT_CONTEXT_WINDOW = 262_144
 OPENCODE_DEFAULT_CHUNK_TIMEOUT_MS = 900_000
@@ -318,6 +320,39 @@ def launch_opencode_app() -> dict[str, Any]:
         "error": last_error,
         "desktop_state_repair": state_repair,
     }
+
+
+def open_opencode(
+    model_id: str, *, workspace: str | None = None, surface: str | None = None
+) -> dict[str, Any]:
+    """Open OpenCode where the user chose (``opencode_opens_in``): the
+    OpenCode app by default, or OpenCode's terminal UI on the MTPLX model in
+    the terminal they picked. Both read the config MTPLX wrote. ``surface``
+    ("app" or "terminal", from ``mtplx start opencode --app|--cli``) decides
+    for this launch only. ``opened`` in the result names what opened, for the
+    caller's line ("OpenCode Desktop", "OpenCode in Ghostty")."""
+
+    from mtplx import client_opening
+
+    saved = client_opening.saved_choice("opencode")
+    if surface == client_opening.OWN_APP:
+        opening = client_opening.resolve("opencode", client_opening.OWN_APP, [])
+    elif surface == client_opening.TERMINAL:
+        opening = client_opening.terminal_for("opencode", saved)
+    else:
+        opening = client_opening.resolve("opencode", saved)
+    if opening.surface == client_opening.OWN_APP:
+        return {**launch_opencode_app(), "opened": "OpenCode Desktop"}
+    command = (
+        "command -v opencode >/dev/null 2>&1 || { print -r -- "
+        + shlex.quote(f"OpenCode for the terminal is not installed: {OPENCODE_CLI_INSTALL_HINT}")
+        + "; exit 127; }\nexec opencode --model "
+        + shlex.quote(opencode_model_ref(model_id))
+    )
+    result = client_opening.open_command(
+        command, client="opencode", workspace=workspace, opening=opening
+    )
+    return {**result, "opened": f"OpenCode in {result.get('terminal') or 'Terminal'}"}
 
 
 def _opencode_effort_variants(

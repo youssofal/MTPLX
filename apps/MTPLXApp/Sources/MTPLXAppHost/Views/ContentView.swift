@@ -352,7 +352,13 @@ struct ContentView: View {
             InferenceParamsOverlay(
                 backend: backend,
                 snapshot: snapshot.inferenceParams,
-                presented: $router.inferenceParamsPresented
+                presented: $router.inferenceParamsPresented,
+                openAllSettings: { [router] in
+                    // Reachable from the benchmark header too; closing the
+                    // overlay does not cancel a run.
+                    if router.benchmarkOverlayPresented { router.closeBenchmark() }
+                    router.openSettings()
+                }
             )
                 .equatable()
                 .zIndex(20)

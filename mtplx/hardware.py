@@ -89,7 +89,17 @@ def _first_item(payload: dict[str, Any], key: str) -> dict[str, Any]:
     return {}
 
 
-_APPLE_SILICON_GENERATION_RE = re.compile(r"\bM([1-5])\b", re.IGNORECASE)
+#: The newest M-series generation this build's packs and kernels were measured on.
+NEWEST_KNOWN_GENERATION = 5
+
+_APPLE_SILICON_CHIP_RE = re.compile(r"\bM(\d+)\b", re.IGNORECASE)
+
+
+def chip_generation_number(chip: str | None) -> int | None:
+    """The M-series number in a chip's name ("Apple M6 Max" is 6), or None."""
+
+    match = _APPLE_SILICON_CHIP_RE.search(str(chip or ""))
+    return int(match.group(1)) if match else None
 
 
 def classify_apple_silicon_generation(
@@ -98,7 +108,14 @@ def classify_apple_silicon_generation(
     system: str | None = None,
     machine: str | None = None,
 ) -> str:
-    """Normalize local Mac hardware into the generation used by model policy."""
+    """Normalize local Mac hardware into the generation used by model policy.
+
+    A chip newer than this build knows is classified as the newest one it
+    does know.  Everything chosen by generation (the default pack, the
+    tensor-unit report) then takes the newest path, which is the best guess
+    for a newer Mac; before, such a chip was "unknown" and took the oldest.
+    ``newer_chip_note`` is the sentence that says so.
+    """
 
     system_value = system or platform.system()
     machine_value = machine or platform.machine()
@@ -108,10 +125,22 @@ def classify_apple_silicon_generation(
         return "intel"
     if "intel" in lowered:
         return "intel"
-    match = _APPLE_SILICON_GENERATION_RE.search(chip_value)
-    if match:
-        return f"m{match.group(1)}".lower()
+    number = chip_generation_number(chip_value)
+    if number is not None and number >= 1:
+        return f"m{min(number, NEWEST_KNOWN_GENERATION)}"
     return "unknown"
+
+
+def newer_chip_note(chip: str | None) -> str | None:
+    """What to tell the owner of a chip newer than this build knows; None for any other."""
+
+    number = chip_generation_number(chip)
+    if number is None or number <= NEWEST_KNOWN_GENERATION:
+        return None
+    return (
+        f"{str(chip).strip()} is newer than this MTPLX build knows. It runs the paths "
+        f"measured on the M{NEWEST_KNOWN_GENERATION} until a build measured on it ships."
+    )
 
 
 def total_memory_gib() -> float:
@@ -148,8 +177,9 @@ def detect_apple_silicon() -> dict[str, Any]:
         "machine": machine,
         "chip": chip,
         "apple_silicon_generation": generation,
-        "is_apple_silicon": generation in {"m1", "m2", "m3", "m4", "m5"},
+        "is_apple_silicon": generation not in {"intel", "unknown"},
         "memory_gib": total_memory_gib(),
+        "newer_chip_note": newer_chip_note(chip),
     }
 
 
@@ -182,7 +212,10 @@ def inspect_hardware() -> dict[str, Any]:
         gpu_cores = None
     mlx_version = _dist_version("mlx")
     mlx_lm_version = _dist_version("mlx-lm")
-    is_m5 = "m5" in chip.lower()
+    # By generation, so a chip newer than this build knows reports as the
+    # newest class it does know (the GPU's own tensor-unit check is
+    # mtplx.nax_detect, which reads the Metal architecture, never the name).
+    is_m5 = generation == "m5"
     is_m3_ultra = "m3 ultra" in chip.lower()
     macos_eligible = _version_tuple(macos_version) >= (26, 2)
     mlx_eligible = _version_tuple(mlx_version or "") >= (0, 31)
@@ -194,6 +227,9 @@ def inspect_hardware() -> dict[str, Any]:
         and mlx_eligible
     )
     warnings: list[str] = []
+    newer = newer_chip_note(chip)
+    if newer:
+        warnings.append(newer)
     if is_m5 and not macos_eligible:
         warnings.append("M5 TensorOps eligibility requires macOS 26.2 or newer.")
     if is_m5 and not mlx_eligible:

@@ -67,6 +67,10 @@ public final class SettingsDecodeIssues: @unchecked Sendable {
         lock.withLock { issues.append(issue) }
     }
 
+    public func record(_ issue: SettingsDecodeIssue) {
+        lock.withLock { issues.append(issue) }
+    }
+
     public var all: [SettingsDecodeIssue] {
         lock.withLock { issues }
     }

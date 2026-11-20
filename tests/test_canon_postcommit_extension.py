@@ -134,7 +134,7 @@ def test_postcommit_byte_extension_two_turn_e2e(tok, monkeypatch):
     committed_now = tuple(session.committed_token_ids)
     history2 = [SYSTEM, U1, {"role": "assistant", "content": ANSWER}, U2]
     raw2_ids = _encode(tok, history2)
-    cp_raw = oa._common_prefix_len(raw2_ids, committed_now)
+    cp_raw = oa.common_prefix_len(raw2_ids, committed_now)
     assert cp_raw < len(committed_now), (
         "precondition lost: the raw echo should diverge inside the think"
     )
@@ -166,7 +166,7 @@ def test_postcommit_byte_extension_two_turn_e2e(tok, monkeypatch):
     )
     assert result is not None
     _canon_messages, canon2_ids = result
-    cp_canon = oa._common_prefix_len(canon2_ids, committed_now)
+    cp_canon = oa.common_prefix_len(canon2_ids, committed_now)
     assert cp_canon == len(committed_now), (
         f"turn-2 canonical prompt must contain the committed stream fully: "
         f"cp_canon={cp_canon} committed={len(committed_now)}"

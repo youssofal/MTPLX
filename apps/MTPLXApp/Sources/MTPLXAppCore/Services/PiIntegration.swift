@@ -129,9 +129,11 @@ public struct PiIntegration: Sendable {
             return staleHandoffResult(command: command)
         }
 
+        // The terminal the user picked for Pi (Settings, or `pi_opens_in`).
+        let opening = ClientOpenings.currentTerminal(.pi)
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        process.arguments = ["-a", "Terminal", handoff.commandURL.path]
+        process.arguments = ["-a", opening.openApplication, handoff.commandURL.path]
         let stderr = Pipe()
         process.standardError = stderr
         // The backend store calls this from the main actor, so a wedged
@@ -210,7 +212,7 @@ public struct PiIntegration: Sendable {
             return PiLaunchResult(
                 action: .launched,
                 command: command,
-                detail: tr("opened Pi in Terminal"),
+                detail: tr("opened Pi in %@", opening.terminalName),
                 launchedProcessIDs: [lease.processID],
                 terminalHandoffLease: lease
             )

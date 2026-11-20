@@ -240,7 +240,7 @@ def test_gemma4_two_turn_memory_rewrite_restores_common_prefix_with_cold_parity(
         enable_thinking=True,
         add_generation_prompt=True,
     )
-    common = openai._common_prefix_len(committed_ids, second_prompt)
+    common = openai.common_prefix_len(committed_ids, second_prompt)
     assert common > 512
     assert common < len(first_prompt)
 

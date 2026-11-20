@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mtplx"
-version = "2.12.3"
+version = "2.13.0"
 description = "Native MTP speculative decoding for Qwen3-Next on Apple Silicon."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -52,8 +52,16 @@ dependencies = [
   # the tool chat template (thinking on and off) and plain encodes give token
   # ids identical to 5.14.1 on the Qwen 3.8 27B, Flash-Next, Qwen 3.6 A3B,
   # Qwen 3.5 9B and LFM2.5 pack tokenizers; 5.16.1 brings tokenizers 0.23.2
-  # with the same ids. 5.17 is not verified, so the ceiling stays below it.
-  "transformers>=5.10.0,!=5.13.0,<5.17; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  # with the same ids. 5.22.2 verified 2026-11-12 (PR #684): mlx-lm 0.31.3
+  # imports; a 40-message agent transcript (tool calls, reasoning, image
+  # placeholders) through both server encode paths, at every reasoning
+  # effort with thinking and preserve_thinking on and off, gives token ids
+  # identical to 5.16.1 on 19 catalog pack tokenizers (every Flash-Next,
+  # Qwen 3.8 27B, Bonsai 2, Qwen 3.6, Qwen 3.5, MiMo and Gemma 4 pack on the
+  # test Mac: 380 of 380 cases), with the same tokenizer type for
+  # llguidance (tokenizers 0.23.3 both sides). 5.23 is not verified, so the
+  # ceiling stays below it.
+  "transformers>=5.10.0,!=5.13.0,<5.23; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "nanobind>=2; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "numpy>=2",
   "pydantic>=2",
@@ -107,8 +115,8 @@ mtplx-tune = "mtplx.cli:main_tune"
 include = ["mtplx*", "vllm_metal*"]
 
 [tool.setuptools.package-data]
-mtplx = ["templates/**/*.jinja", "data/*.npy"]
-"mtplx.benchmarks" = ["prompts/*.jsonl"]
+mtplx = ["templates/**/*.jinja", "data/*.npy", "data/deepseek-harness-lock.json"]
+"mtplx.benchmarks" = ["prompts/*.jsonl", "prompts/quality/*.toml"]
 "mtplx.dashboard" = ["_static/**/*"]
 "vllm_metal.metal" = [
   "README.md",

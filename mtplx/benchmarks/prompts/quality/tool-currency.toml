@@ -1,0 +1,25 @@
+id = "tool-currency"
+kind = "tool"
+prompt = '''
+How much is 250 US dollars in euros, and how much in Japanese yen? Look up both conversions at once.
+'''
+tools_json = '''
+[
+  {"type": "function", "function": {
+    "name": "convert_currency",
+    "description": "Convert an amount from one currency to another at today's rate.",
+    "parameters": {"type": "object", "properties": {
+      "amount": {"type": "number"},
+      "from_currency": {"type": "string", "description": "ISO 4217 code, for example USD"},
+      "to_currency": {"type": "string", "description": "ISO 4217 code"}},
+      "required": ["amount", "from_currency", "to_currency"]}}}
+]
+'''
+
+[[expect_calls]]
+name = "convert_currency"
+args = { amount = { equals = 250 }, from_currency = { equals = "usd" }, to_currency = { equals = "eur" } }
+
+[[expect_calls]]
+name = "convert_currency"
+args = { amount = { equals = 250 }, from_currency = { equals = "usd" }, to_currency = { equals = "jpy" } }

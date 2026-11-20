@@ -6774,6 +6774,8 @@ final class MTPLXAppCoreTests: XCTestCase {
                 await probe.restore()
             }
         )
+        // This copy's own server ran (the store launches or adopts one).
+        await MainActor.run { backend.ownServerRanSinceFanRestore = true }
 
         await backend.stopDaemon()
         // Fan restore + process reap now run in a detached teardown task so
@@ -6802,6 +6804,7 @@ final class MTPLXAppCoreTests: XCTestCase {
                 await probe.restore()
             }
         )
+        await MainActor.run { backend.ownServerRanSinceFanRestore = true }
 
         await backend.stopDaemon()
         await backend.awaitDaemonTeardown()
@@ -6812,7 +6815,7 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(currentFanMode, "default")
     }
 
-    func testStopDaemonRestoresFansEvenWhenStateLooksDefault() async throws {
+    func testStopDaemonRestoresFansEvenWhenStateLooksDefaultOnceItsOwnServerRan() async throws {
         let root = temporaryDirectory()
         let probe = FanFallbackProbe()
         let backend = await MTPLXBackendStore(
@@ -6825,6 +6828,7 @@ final class MTPLXAppCoreTests: XCTestCase {
                 await probe.restore()
             }
         )
+        await MainActor.run { backend.ownServerRanSinceFanRestore = true }
 
         await backend.stopDaemon()
         await backend.awaitDaemonTeardown()
@@ -6833,6 +6837,132 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(fallbackCalls, 1)
         let currentFanMode = await backend.currentFanMode
         XCTAssertEqual(currentFanMode, "default")
+    }
+
+    /// 17 Nov: a QA copy of the app that never started a server reset the
+    /// Mac's fans to auto when it quit (Quit runs Stop), during another
+    /// tool's run that had pinned them at max. A copy that ran no server
+    /// set nothing, so it leaves the fans alone, whatever its saved Smart or
+    /// Max preference says.
+    func testStopAndQuitLeaveTheFansAloneWhenThisCopyRanNoServer() async throws {
+        for fanMode in [MTPLXFanMode.smart, .max, .default] {
+            let root = temporaryDirectory()
+            let probe = FanFallbackProbe()
+            let backend = await MTPLXBackendStore(
+                configuration: MTPLXAppConfiguration(
+                    port: try freeTCPPort(),
+                    fanMode: fanMode.rawValue,
+                    pinFansAtMaxOnStart: fanMode == .max
+                ),
+                settingsStore: MTPLXSettingsStore(settingsURL: root.appendingPathComponent("settings.json")),
+                localFanRestorer: {
+                    await probe.restore()
+                }
+            )
+
+            await backend.stopDaemon()
+            await backend.awaitDaemonTeardown()
+
+            let calls = await probe.count()
+            XCTAssertEqual(calls, 0, "a copy that ran no server touched the fans (preference \(fanMode))")
+        }
+    }
+
+    /// A server of this copy's own started with fan mode Default leaves the
+    /// fans to macOS, and so does Stop (and Quit, which runs Stop): resetting
+    /// them would override whatever holds them (17 Nov: a run's keeper held
+    /// them at max while the final block's QA copy quit). Smart and Max set
+    /// the fans, so Stop still puts them back after those.
+    @MainActor
+    func testStopLeavesTheFansAloneAfterThisCopysServerRanWithDefaultFans() async throws {
+        for (fanMode, restores) in [(MTPLXFanMode.default, false), (.smart, true), (.max, true)] {
+            let root = temporaryDirectory()
+            let modelDir = root.appendingPathComponent("complete-model", isDirectory: true)
+            try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)
+            for file in ["config.json", "tokenizer.json", "mtplx_runtime.json"] {
+                try "{}".data(using: .utf8)!.write(to: modelDir.appendingPathComponent(file))
+            }
+            try Data().write(to: modelDir.appendingPathComponent("mtp.safetensors"))
+            try Data().write(to: modelDir.appendingPathComponent("model.safetensors"))
+            let fake = try makeExecutable(
+                named: "mtplx-slow-start-\(fanMode.rawValue)",
+                body: """
+                #!/bin/sh
+                echo "This is the long step; MTPLX is mapping the model into MLX."
+                while true; do sleep 1; done
+                """
+            )
+            let probe = FanFallbackProbe()
+            let backend = MTPLXBackendStore(
+                configuration: MTPLXAppConfiguration(
+                    executablePath: fake.path,
+                    model: modelDir.path,
+                    port: try freeTCPPort(),
+                    fanMode: fanMode.rawValue,
+                    pinFansAtMaxOnStart: fanMode == .max,
+                    customModels: [
+                        MTPLXModelOption(
+                            id: "complete-model",
+                            displayName: "Complete Model",
+                            shortName: "Complete",
+                            detail: "Fixture model",
+                            hfModelID: "Example/CompleteModel",
+                            localCandidates: [modelDir.path]
+                        )
+                    ]
+                ),
+                settingsStore: MTPLXSettingsStore(settingsURL: root.appendingPathComponent("settings.json")),
+                localFanRestorer: {
+                    await probe.restore()
+                }
+            )
+
+            let startTask = Task { @MainActor in
+                await backend.startDaemon(target: .chat)
+            }
+            let deadline = Date().addingTimeInterval(3)
+            while Date() < deadline, backend.daemonState != .starting {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            XCTAssertEqual(backend.daemonState, .starting, "fan mode \(fanMode)")
+
+            await backend.stopDaemon()
+            await startTask.value
+            await backend.awaitDaemonTeardown()
+
+            let calls = await probe.count()
+            if restores {
+                XCTAssertGreaterThanOrEqual(calls, 1, "fan mode \(fanMode): Stop must put the fans back")
+            } else {
+                XCTAssertEqual(calls, 0, "fan mode \(fanMode): Stop touched fans this copy never set")
+            }
+        }
+    }
+
+    /// After its own server's fans are restored, a later Stop (or the Quit
+    /// after a Stop) does not reset them again: by then another copy or
+    /// tool may have set them.
+    func testAFanRestoreIsNotRepeatedByALaterStop() async throws {
+        let root = temporaryDirectory()
+        let probe = FanFallbackProbe()
+        let backend = await MTPLXBackendStore(
+            configuration: MTPLXAppConfiguration(port: try freeTCPPort()),
+            settingsStore: MTPLXSettingsStore(settingsURL: root.appendingPathComponent("settings.json")),
+            localFanRestorer: {
+                await probe.restore()
+            }
+        )
+        await MainActor.run { backend.ownServerRanSinceFanRestore = true }
+
+        await backend.stopDaemon()
+        await backend.awaitDaemonTeardown()
+        let afterFirstStop = await probe.count()
+        XCTAssertGreaterThanOrEqual(afterFirstStop, 1)
+
+        await backend.stopDaemon()
+        await backend.awaitDaemonTeardown()
+        let afterSecondStop = await probe.count()
+        XCTAssertEqual(afterSecondStop, afterFirstStop)
     }
 
     @MainActor
@@ -7145,6 +7275,33 @@ final class MTPLXAppCoreTests: XCTestCase {
         }
     }
 
+    /// A stream snapshot that leaves the request rows out as unchanged keeps
+    /// the rows the app holds; a full one replaces them.
+    func testSnapshotWithUnchangedRowsKeepsTheRowsHeld() throws {
+        let decoder = JSONDecoder()
+        let full = try decoder.decode(DashboardSnapshot.self, from: Data(Self.snapshotJSON.utf8))
+        XCTAssertNil(full.rowsUnchanged)
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(Self.snapshotJSON.utf8)) as? [String: Any]
+        )
+        object["latest"] = NSNull()
+        object["recent"] = [Any]()
+        object["rows_unchanged"] = true
+        let lean = try decoder.decode(
+            DashboardSnapshot.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+        XCTAssertEqual(lean.rowsUnchanged, true)
+        XCTAssertNil(lean.latest)
+
+        let kept = lean.keepingRows(of: full)
+        XCTAssertEqual(kept.latest, full.latest)
+        XCTAssertEqual(kept.recent, full.recent)
+        XCTAssertEqual(kept.ts, lean.ts)
+        XCTAssertEqual(full.keepingRows(of: lean), full)
+        XCTAssertEqual(lean.keepingRows(of: nil), lean)
+    }
+
     func testSSEDecoderHandlesFlatPrefillEvents() throws {
         let client = MetricsStreamClient(
             apiClient: MTPLXAPIClient(baseURL: URL(string: "http://127.0.0.1:8000")!)
@@ -7179,7 +7336,7 @@ final class MTPLXAppCoreTests: XCTestCase {
         let client = MTPLXAPIClient(baseURL: URL(string: "http://127.0.0.1:8000")!)
         XCTAssertEqual(
             client.metricsStreamURL(snapshotIntervalMs: 500).absoluteString,
-            "http://127.0.0.1:8000/v1/mtplx/metrics/stream?snapshot_interval_ms=500"
+            "http://127.0.0.1:8000/v1/mtplx/metrics/stream?snapshot_interval_ms=500&rows=changed"
         )
     }
 
@@ -7196,7 +7353,7 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(request.httpMethod, "GET")
         XCTAssertEqual(
             request.url?.absoluteString,
-            "http://127.0.0.1:8000/v1/mtplx/metrics/stream?snapshot_interval_ms=500"
+            "http://127.0.0.1:8000/v1/mtplx/metrics/stream?snapshot_interval_ms=500&rows=changed"
         )
         XCTAssertEqual(request.value(forHTTPHeaderField: "Accept"), "text/event-stream")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Cache-Control"), "no-cache")

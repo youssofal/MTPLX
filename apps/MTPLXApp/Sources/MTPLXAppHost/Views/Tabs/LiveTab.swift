@@ -27,6 +27,17 @@ struct LiveTab: View {
                         PortFallbackBanner(message: portNotice)
                     }
 
+                    if let outsideNotice = backend.outsideServerNotice {
+                        PortFallbackBanner(
+                            title: backend.attachedToOutsideServer
+                                ? tr("Using the MTPLX server already running")
+                                : tr("MTPLX is still running"),
+                            message: outsideNotice,
+                            symbol: "link",
+                            tint: Color.mtplxSuccess
+                        )
+                    }
+
                     MemoryGuardBanner(
                         pressureLevel: backend.memoryPressureLevel,
                         recentShed: backend.memoryGuardRecentShed,
@@ -349,17 +360,23 @@ struct LiveTab: View {
     }
 }
 
+/// Where the engine the Live tab shows listens, when that is not simply the
+/// configured port: a port fallback, or an MTPLX server started outside the
+/// app that the app uses instead of loading the model again.
 private struct PortFallbackBanner: View {
+    var title: String = tr("Port changed")
     let message: String
+    var symbol: String = "rectangle.connected.to.line.below"
+    var tint: Color = Color.mtplxWarning
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            Image(systemName: "rectangle.connected.to.line.below")
+            Image(systemName: symbol)
                 .font(.title3.weight(.semibold))
-                .foregroundStyle(Color.mtplxWarning)
+                .foregroundStyle(tint)
                 .frame(width: 24)
             VStack(alignment: .leading, spacing: 4) {
-                Text(tr("Port changed"))
+                Text(title)
                     .font(.callout.weight(.semibold))
                     .foregroundStyle(Brand.typeHi)
                 Text(message)
@@ -372,10 +389,10 @@ private struct PortFallbackBanner: View {
         .padding(14)
         .background {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color.mtplxWarning.opacity(0.10))
+                .fill(tint.opacity(0.10))
                 .overlay {
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .strokeBorder(Color.mtplxWarning.opacity(0.28), lineWidth: Brand.hairline)
+                        .strokeBorder(tint.opacity(0.28), lineWidth: Brand.hairline)
                 }
         }
     }

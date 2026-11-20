@@ -2,6 +2,45 @@
  "adaptive_no_effect_reason": "adaptive depth has no effect on this model yet",
  "agent_env_by_seat_gib": {
   "128": {
+   "claude-code": {
+    "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
+    "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "4096",
+    "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER": "1",
+    "MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S": "30.0",
+    "MTPLX_SESSION_BANK_MAX_BYTES": "auto",
+    "MTPLX_SESSION_BANK_MAX_ENTRIES": "32",
+    "MTPLX_SESSION_BANK_PER_SESSION_BYTES": "auto",
+    "MTPLX_SESSION_BLOCK_PREFIX_RESTORE": "1",
+    "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE": "1",
+    "MTPLX_TOOL_PROMPT_MODE": "hybrid",
+    "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "async_per_head"
+   },
+   "codex": {
+    "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
+    "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "4096",
+    "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER": "1",
+    "MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S": "30.0",
+    "MTPLX_SESSION_BANK_MAX_BYTES": "auto",
+    "MTPLX_SESSION_BANK_MAX_ENTRIES": "32",
+    "MTPLX_SESSION_BANK_PER_SESSION_BYTES": "auto",
+    "MTPLX_SESSION_BLOCK_PREFIX_RESTORE": "1",
+    "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE": "1",
+    "MTPLX_TOOL_PROMPT_MODE": "hybrid",
+    "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "async_per_head"
+   },
+   "deepseek-harness": {
+    "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
+    "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "4096",
+    "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER": "1",
+    "MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S": "30.0",
+    "MTPLX_SESSION_BANK_MAX_BYTES": "auto",
+    "MTPLX_SESSION_BANK_MAX_ENTRIES": "32",
+    "MTPLX_SESSION_BANK_PER_SESSION_BYTES": "auto",
+    "MTPLX_SESSION_BLOCK_PREFIX_RESTORE": "1",
+    "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE": "1",
+    "MTPLX_TOOL_PROMPT_MODE": "hybrid",
+    "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "async_per_head"
+   },
    "hermes": {
     "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
     "MTPLX_CLIENT": "hermes",
@@ -44,6 +83,45 @@
    }
   },
   "16": {
+   "claude-code": {
+    "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
+    "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "4096",
+    "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER": "1",
+    "MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S": "30.0",
+    "MTPLX_SESSION_BANK_MAX_BYTES": "auto",
+    "MTPLX_SESSION_BANK_MAX_ENTRIES": "6",
+    "MTPLX_SESSION_BANK_PER_SESSION_BYTES": "auto",
+    "MTPLX_SESSION_BLOCK_PREFIX_RESTORE": "1",
+    "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE": "1",
+    "MTPLX_TOOL_PROMPT_MODE": "hybrid",
+    "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "async_per_head"
+   },
+   "codex": {
+    "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
+    "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "4096",
+    "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER": "1",
+    "MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S": "30.0",
+    "MTPLX_SESSION_BANK_MAX_BYTES": "auto",
+    "MTPLX_SESSION_BANK_MAX_ENTRIES": "6",
+    "MTPLX_SESSION_BANK_PER_SESSION_BYTES": "auto",
+    "MTPLX_SESSION_BLOCK_PREFIX_RESTORE": "1",
+    "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE": "1",
+    "MTPLX_TOOL_PROMPT_MODE": "hybrid",
+    "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "async_per_head"
+   },
+   "deepseek-harness": {
+    "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
+    "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "4096",
+    "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER": "1",
+    "MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S": "30.0",
+    "MTPLX_SESSION_BANK_MAX_BYTES": "auto",
+    "MTPLX_SESSION_BANK_MAX_ENTRIES": "6",
+    "MTPLX_SESSION_BANK_PER_SESSION_BYTES": "auto",
+    "MTPLX_SESSION_BLOCK_PREFIX_RESTORE": "1",
+    "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE": "1",
+    "MTPLX_TOOL_PROMPT_MODE": "hybrid",
+    "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "async_per_head"
+   },
    "hermes": {
     "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
     "MTPLX_CLIENT": "hermes",
@@ -86,6 +164,45 @@
    }
   },
   "24": {
+   "claude-code": {
+    "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
+    "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "4096",
+    "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER": "1",
+    "MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S": "30.0",
+    "MTPLX_SESSION_BANK_MAX_BYTES": "auto",
+    "MTPLX_SESSION_BANK_MAX_ENTRIES": "6",
+    "MTPLX_SESSION_BANK_PER_SESSION_BYTES": "auto",
+    "MTPLX_SESSION_BLOCK_PREFIX_RESTORE": "1",
+    "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE": "1",
+    "MTPLX_TOOL_PROMPT_MODE": "hybrid",
+    "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "async_per_head"
+   },
+   "codex": {
+    "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
+    "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "4096",
+    "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER": "1",
+    "MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S": "30.0",
+    "MTPLX_SESSION_BANK_MAX_BYTES": "auto",
+    "MTPLX_SESSION_BANK_MAX_ENTRIES": "6",
+    "MTPLX_SESSION_BANK_PER_SESSION_BYTES": "auto",
+    "MTPLX_SESSION_BLOCK_PREFIX_RESTORE": "1",
+    "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE": "1",
+    "MTPLX_TOOL_PROMPT_MODE": "hybrid",
+    "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "async_per_head"
+   },
+   "deepseek-harness": {
+    "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
+    "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "4096",
+    "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER": "1",
+    "MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S": "30.0",
+    "MTPLX_SESSION_BANK_MAX_BYTES": "auto",
+    "MTPLX_SESSION_BANK_MAX_ENTRIES": "6",
+    "MTPLX_SESSION_BANK_PER_SESSION_BYTES": "auto",
+    "MTPLX_SESSION_BLOCK_PREFIX_RESTORE": "1",
+    "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE": "1",
+    "MTPLX_TOOL_PROMPT_MODE": "hybrid",
+    "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "async_per_head"
+   },
    "hermes": {
     "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
     "MTPLX_CLIENT": "hermes",
@@ -128,6 +245,45 @@
    }
   },
   "36": {
+   "claude-code": {
+    "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
+    "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "4096",
+    "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER": "1",
+    "MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S": "30.0",
+    "MTPLX_SESSION_BANK_MAX_BYTES": "auto",
+    "MTPLX_SESSION_BANK_MAX_ENTRIES": "6",
+    "MTPLX_SESSION_BANK_PER_SESSION_BYTES": "auto",
+    "MTPLX_SESSION_BLOCK_PREFIX_RESTORE": "1",
+    "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE": "1",
+    "MTPLX_TOOL_PROMPT_MODE": "hybrid",
+    "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "async_per_head"
+   },
+   "codex": {
+    "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
+    "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "4096",
+    "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER": "1",
+    "MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S": "30.0",
+    "MTPLX_SESSION_BANK_MAX_BYTES": "auto",
+    "MTPLX_SESSION_BANK_MAX_ENTRIES": "6",
+    "MTPLX_SESSION_BANK_PER_SESSION_BYTES": "auto",
+    "MTPLX_SESSION_BLOCK_PREFIX_RESTORE": "1",
+    "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE": "1",
+    "MTPLX_TOOL_PROMPT_MODE": "hybrid",
+    "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "async_per_head"
+   },
+   "deepseek-harness": {
+    "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
+    "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "4096",
+    "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER": "1",
+    "MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S": "30.0",
+    "MTPLX_SESSION_BANK_MAX_BYTES": "auto",
+    "MTPLX_SESSION_BANK_MAX_ENTRIES": "6",
+    "MTPLX_SESSION_BANK_PER_SESSION_BYTES": "auto",
+    "MTPLX_SESSION_BLOCK_PREFIX_RESTORE": "1",
+    "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE": "1",
+    "MTPLX_TOOL_PROMPT_MODE": "hybrid",
+    "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "async_per_head"
+   },
    "hermes": {
     "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
     "MTPLX_CLIENT": "hermes",
@@ -170,6 +326,45 @@
    }
   },
   "48": {
+   "claude-code": {
+    "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
+    "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "4096",
+    "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER": "1",
+    "MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S": "30.0",
+    "MTPLX_SESSION_BANK_MAX_BYTES": "auto",
+    "MTPLX_SESSION_BANK_MAX_ENTRIES": "6",
+    "MTPLX_SESSION_BANK_PER_SESSION_BYTES": "auto",
+    "MTPLX_SESSION_BLOCK_PREFIX_RESTORE": "1",
+    "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE": "1",
+    "MTPLX_TOOL_PROMPT_MODE": "hybrid",
+    "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "async_per_head"
+   },
+   "codex": {
+    "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
+    "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "4096",
+    "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER": "1",
+    "MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S": "30.0",
+    "MTPLX_SESSION_BANK_MAX_BYTES": "auto",
+    "MTPLX_SESSION_BANK_MAX_ENTRIES": "6",
+    "MTPLX_SESSION_BANK_PER_SESSION_BYTES": "auto",
+    "MTPLX_SESSION_BLOCK_PREFIX_RESTORE": "1",
+    "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE": "1",
+    "MTPLX_TOOL_PROMPT_MODE": "hybrid",
+    "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "async_per_head"
+   },
+   "deepseek-harness": {
+    "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
+    "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "4096",
+    "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER": "1",
+    "MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S": "30.0",
+    "MTPLX_SESSION_BANK_MAX_BYTES": "auto",
+    "MTPLX_SESSION_BANK_MAX_ENTRIES": "6",
+    "MTPLX_SESSION_BANK_PER_SESSION_BYTES": "auto",
+    "MTPLX_SESSION_BLOCK_PREFIX_RESTORE": "1",
+    "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE": "1",
+    "MTPLX_TOOL_PROMPT_MODE": "hybrid",
+    "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "async_per_head"
+   },
    "hermes": {
     "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
     "MTPLX_CLIENT": "hermes",
@@ -212,6 +407,45 @@
    }
   },
   "64": {
+   "claude-code": {
+    "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
+    "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "4096",
+    "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER": "1",
+    "MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S": "30.0",
+    "MTPLX_SESSION_BANK_MAX_BYTES": "auto",
+    "MTPLX_SESSION_BANK_MAX_ENTRIES": "6",
+    "MTPLX_SESSION_BANK_PER_SESSION_BYTES": "auto",
+    "MTPLX_SESSION_BLOCK_PREFIX_RESTORE": "1",
+    "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE": "1",
+    "MTPLX_TOOL_PROMPT_MODE": "hybrid",
+    "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "async_per_head"
+   },
+   "codex": {
+    "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
+    "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "4096",
+    "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER": "1",
+    "MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S": "30.0",
+    "MTPLX_SESSION_BANK_MAX_BYTES": "auto",
+    "MTPLX_SESSION_BANK_MAX_ENTRIES": "6",
+    "MTPLX_SESSION_BANK_PER_SESSION_BYTES": "auto",
+    "MTPLX_SESSION_BLOCK_PREFIX_RESTORE": "1",
+    "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE": "1",
+    "MTPLX_TOOL_PROMPT_MODE": "hybrid",
+    "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "async_per_head"
+   },
+   "deepseek-harness": {
+    "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
+    "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "4096",
+    "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER": "1",
+    "MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S": "30.0",
+    "MTPLX_SESSION_BANK_MAX_BYTES": "auto",
+    "MTPLX_SESSION_BANK_MAX_ENTRIES": "6",
+    "MTPLX_SESSION_BANK_PER_SESSION_BYTES": "auto",
+    "MTPLX_SESSION_BLOCK_PREFIX_RESTORE": "1",
+    "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE": "1",
+    "MTPLX_TOOL_PROMPT_MODE": "hybrid",
+    "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "async_per_head"
+   },
    "hermes": {
     "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
     "MTPLX_CLIENT": "hermes",
@@ -254,6 +488,45 @@
    }
   },
   "96": {
+   "claude-code": {
+    "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
+    "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "4096",
+    "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER": "1",
+    "MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S": "30.0",
+    "MTPLX_SESSION_BANK_MAX_BYTES": "auto",
+    "MTPLX_SESSION_BANK_MAX_ENTRIES": "32",
+    "MTPLX_SESSION_BANK_PER_SESSION_BYTES": "auto",
+    "MTPLX_SESSION_BLOCK_PREFIX_RESTORE": "1",
+    "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE": "1",
+    "MTPLX_TOOL_PROMPT_MODE": "hybrid",
+    "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "async_per_head"
+   },
+   "codex": {
+    "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
+    "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "4096",
+    "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER": "1",
+    "MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S": "30.0",
+    "MTPLX_SESSION_BANK_MAX_BYTES": "auto",
+    "MTPLX_SESSION_BANK_MAX_ENTRIES": "32",
+    "MTPLX_SESSION_BANK_PER_SESSION_BYTES": "auto",
+    "MTPLX_SESSION_BLOCK_PREFIX_RESTORE": "1",
+    "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE": "1",
+    "MTPLX_TOOL_PROMPT_MODE": "hybrid",
+    "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "async_per_head"
+   },
+   "deepseek-harness": {
+    "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
+    "MTPLX_DYNAMIC_PAGED_KV_MAX_INITIAL_NEW_TOKENS": "4096",
+    "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER": "1",
+    "MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S": "30.0",
+    "MTPLX_SESSION_BANK_MAX_BYTES": "auto",
+    "MTPLX_SESSION_BANK_MAX_ENTRIES": "32",
+    "MTPLX_SESSION_BANK_PER_SESSION_BYTES": "auto",
+    "MTPLX_SESSION_BLOCK_PREFIX_RESTORE": "1",
+    "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE": "1",
+    "MTPLX_TOOL_PROMPT_MODE": "hybrid",
+    "MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE": "async_per_head"
+   },
    "hermes": {
     "MTPLX_CHAT_TEMPLATE_PROFILE": "local_qwen36",
     "MTPLX_CLIENT": "hermes",
@@ -606,6 +879,177 @@
   },
   {
    "adaptive_depth_switch": null,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "claude-code",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "qwen4_exp",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": true,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "claude-code",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "qwen4_exp",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": false,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "claude-code",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "qwen4_exp",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": null,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "codex",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "qwen4_exp",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": true,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "codex",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "qwen4_exp",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": false,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "codex",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "qwen4_exp",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": null,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "deepseek-harness",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "qwen4_exp",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": true,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "deepseek-harness",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "qwen4_exp",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": false,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "deepseek-harness",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "qwen4_exp",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": null,
    "agent_env": false,
    "argv": {
     "batch_wait_ms": 50,
@@ -998,6 +1442,177 @@
     "ssd_session_cache_min_prefix_tokens": 512
    },
    "client": "hermes",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "qwen3_8",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": null,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "claude-code",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "qwen3_8",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": true,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "claude-code",
+   "effective_adaptive_policy": "expected_value",
+   "effective_depth": 3,
+   "family": "qwen3_8",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": false,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "claude-code",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "qwen3_8",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": null,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "codex",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "qwen3_8",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": true,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "codex",
+   "effective_adaptive_policy": "expected_value",
+   "effective_depth": 3,
+   "family": "qwen3_8",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": false,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "codex",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "qwen3_8",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": null,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "deepseek-harness",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "qwen3_8",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": true,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "deepseek-harness",
+   "effective_adaptive_policy": "expected_value",
+   "effective_depth": 3,
+   "family": "qwen3_8",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": false,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "deepseek-harness",
    "effective_adaptive_policy": "none",
    "effective_depth": 3,
    "family": "qwen3_8",

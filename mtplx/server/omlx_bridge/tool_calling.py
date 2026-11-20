@@ -10,11 +10,91 @@ and valid tool calls are parsed at completion.
 from __future__ import annotations
 
 import ast
+import html
 import json
+import os
 import re
 import uuid
 from dataclasses import dataclass
 from typing import Any
+
+
+def tool_arguments_exact() -> bool:
+    """Tool-call arguments reach the client as the model wrote them (#691).
+
+    On by default. ``MTPLX_TOOL_ARGUMENTS_EXACT=0`` restores the earlier
+    handling as a whole: every value trimmed and entity-decoded, and the
+    arguments of the common coding tools reordered with the path first.
+    """
+    raw = str(os.environ.get("MTPLX_TOOL_ARGUMENTS_EXACT", "1")).strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+_XML_ENTITY_RE = re.compile(r"&(?:amp|lt|gt|quot|apos|#[0-9]+|#[xX][0-9a-fA-F]+);")
+
+
+def decode_escaped_tool_text(text: str) -> str:
+    """Decode a value the model wrote XML-escaped, and nothing else.
+
+    The chat template writes argument values raw, but MTPLX's own notices in
+    tool results escape the commands and paths they quote, and a model can
+    copy that into its next call ("pwd &amp;&amp; ls"), which a shell would
+    run literally. A value counts as escaped only when it has no raw "<" or
+    ">" and every "&" in it begins an entity. A file that also holds raw
+    markup or a bare "&" (an HTML page with "&lt;" in its text) keeps its
+    entities exactly as written.
+    """
+    if "&" not in text or "<" in text or ">" in text:
+        return text
+    position = text.find("&")
+    while position >= 0:
+        if _XML_ENTITY_RE.match(text, position) is None:
+            return text
+        position = text.find("&", position + 1)
+    return html.unescape(text)
+
+
+_TOOL_ARGUMENT_PRIMARY_ORDER: dict[str, tuple[str, ...]] = {
+    "read": ("filePath", "path", "offset", "limit"),
+    "grep": ("pattern", "path", "include", "limit"),
+    "glob": ("pattern", "path"),
+    "bash": ("command", "description", "timeout"),
+    "write": ("filePath", "path", "content"),
+    "edit": ("filePath", "path", "oldString", "newString", "replaceAll"),
+    "webfetch": ("url", "format", "timeout"),
+    "skill": ("name",),
+    "question": ("questions",),
+}
+
+
+def order_tool_arguments_for_client_display(
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """The arguments with the user-facing identifiers first.
+
+    Only with ``MTPLX_TOOL_ARGUMENTS_EXACT=0``. OpenCode renders tool argument
+    values in JSON insertion order, and Qwen can emit an optional knob such
+    as ``limit`` before the target path, so its transcript row then starts
+    with a bare ``100``. The reorder fixed that row, but the client sends the
+    call back in that order, the template renders it so, and the render no
+    longer matched the tokens the model generated (#691), so by default the
+    model's order is kept.
+    """
+
+    if not arguments:
+        return arguments
+    order = _TOOL_ARGUMENT_PRIMARY_ORDER.get(str(tool_name or "").strip().lower())
+    if not order:
+        return arguments
+    ordered: dict[str, Any] = {}
+    for key in order:
+        if key in arguments:
+            ordered[key] = arguments[key]
+    for key, value in arguments.items():
+        if key not in ordered:
+            ordered[key] = value
+    return ordered
 
 
 # LFM-family (lfm2/lfm2_moe/lfm2.5) tool envelope: special tokens survive the
@@ -43,11 +123,7 @@ class ToolCallExtraction:
 
 def _serialize_tool_call_arguments(arguments: Any) -> str:
     if isinstance(arguments, dict):
-        return json.dumps(
-            _order_tool_arguments_for_client_display("", arguments),
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
+        return json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
     if isinstance(arguments, str):
         try:
             parsed = json.loads(arguments)
@@ -58,49 +134,11 @@ def _serialize_tool_call_arguments(arguments: Any) -> str:
     return "{}"
 
 
-_TOOL_ARGUMENT_PRIMARY_ORDER: dict[str, tuple[str, ...]] = {
-    "read": ("filePath", "path", "offset", "limit"),
-    "grep": ("pattern", "path", "include", "limit"),
-    "glob": ("pattern", "path"),
-    "bash": ("command", "description", "timeout"),
-    "write": ("filePath", "path", "content"),
-    "edit": ("filePath", "path", "oldString", "newString", "replaceAll"),
-    "webfetch": ("url", "format", "timeout"),
-    "skill": ("name",),
-    "question": ("questions",),
-}
-
-
-def _order_tool_arguments_for_client_display(
-    tool_name: str,
-    arguments: dict[str, Any],
-) -> dict[str, Any]:
-    """Return stable argument order so clients do not lead with display noise.
-
-    OpenCode renders tool argument values in JSON insertion order. Qwen can emit
-    optional knobs such as ``limit`` before the useful target path, producing
-    transcript rows that start with a bare ``100``. This preserves every
-    argument and only moves the user-facing identifiers first.
-    """
-
-    if not arguments:
-        return arguments
-    order = _TOOL_ARGUMENT_PRIMARY_ORDER.get(str(tool_name or "").strip().lower())
-    if not order:
-        return arguments
-    ordered: dict[str, Any] = {}
-    for key in order:
-        if key in arguments:
-            ordered[key] = arguments[key]
-    for key, value in arguments.items():
-        if key not in ordered:
-            ordered[key] = value
-    return ordered
-
-
 def _tool_call(name: str, arguments: Any) -> dict[str, Any]:
-    if isinstance(arguments, dict):
-        arguments = _order_tool_arguments_for_client_display(str(name), arguments)
+    # Arguments keep the model's own order (see
+    # order_tool_arguments_for_client_display).
+    if isinstance(arguments, dict) and not tool_arguments_exact():
+        arguments = order_tool_arguments_for_client_display(str(name), arguments)
     return {
         "id": f"call_{uuid.uuid4().hex[:8]}",
         "type": "function",
@@ -168,7 +206,46 @@ def _parse_bare_tool_payload(content: str) -> dict[str, Any] | None:
     return _tool_call(name, arguments)
 
 
-def _parse_xml_tool_calls(text: str) -> tuple[str, list[dict[str, Any]] | None, str | None]:
+def _decode_xml_parameter_value(value: str, schema: dict[str, Any] | None) -> Any:
+    """A ``<parameter=k>`` value as the model wrote it (#691).
+
+    ``value`` lies between the template's one formatting newline after the
+    opening tag and the one before the closing tag. A string keeps every
+    other character (a written file keeps its last newline, code keeps its
+    indentation); a value the schema types as something else is trimmed and
+    read as JSON; with no schema, text that parses as JSON is read as JSON
+    and anything else stays exactly as written. A wholly XML-escaped value
+    is decoded (decode_escaped_tool_text).
+    """
+    if not tool_arguments_exact():
+        text = value.strip()
+        try:
+            return json.loads(text)
+        except (TypeError, ValueError):
+            return text
+    schema_type = schema.get("type") if isinstance(schema, dict) else None
+    schema_types = (
+        {schema_type}
+        if isinstance(schema_type, str)
+        else {str(item) for item in schema_type}
+        if isinstance(schema_type, list)
+        else set()
+    )
+    if schema_types and schema_types <= {"string", "null"}:
+        return decode_escaped_tool_text(value)
+    text = value.strip()
+    if not text:
+        return "" if schema_types else value
+    try:
+        return json.loads(decode_escaped_tool_text(text))
+    except (TypeError, ValueError):
+        return decode_escaped_tool_text(value)
+
+
+def _parse_xml_tool_calls(
+    text: str,
+    tools: list[dict[str, Any]] | None = None,
+) -> tuple[str, list[dict[str, Any]] | None, str | None]:
     calls: list[dict[str, Any]] = []
     malformed_reason: str | None = None
     for match in re.findall(r"<tool_call>\s*(.*?)\s*</tool_call>", text, re.DOTALL):
@@ -193,18 +270,21 @@ def _parse_xml_tool_calls(text: str) -> tuple[str, list[dict[str, Any]] | None, 
         if func_match:
             name = func_match.group(1)
             params = {}
+            # The template writes "<parameter=k>\n{value}\n</parameter>":
+            # capture between exactly those two newlines (#691).
             param_patterns = (
-                r"<parameter=([^>\s]+)>\s*(.*?)\s*</parameter>",
-                r'<parameter\s+name="([^"]+)">\s*(.*?)\s*</parameter>',
+                r"<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>",
+                r'<parameter\s+name="([^"]+)">\n?(.*?)\n?</parameter>',
             )
             for pattern in param_patterns:
                 for param in re.finditer(pattern, func_match.group(2), re.DOTALL):
                     key = param.group(1)
-                    value = param.group(2).strip()
-                    try:
-                        params[key] = json.loads(value)
-                    except (TypeError, ValueError):
-                        params[key] = value
+                    params[key] = _decode_xml_parameter_value(
+                        param.group(2),
+                        _tool_parameter_schema(
+                            tools, tool_name=name, parameter_name=key
+                        ),
+                    )
             if not params:
                 body = func_match.group(2).strip()
                 if body:
@@ -778,7 +858,7 @@ def parse_tool_calls(
                         # give our own envelope parser a second opinion and
                         # adopt its arguments, or skip the item entirely.
                         _cleaned, recovered, _reason = _parse_xml_tool_calls(
-                            "<tool_call>" + match.strip() + "</tool_call>"
+                            "<tool_call>" + match.strip() + "</tool_call>", tools
                         )
                         recovered_args = None
                         for candidate in recovered or []:
@@ -844,7 +924,7 @@ def parse_tool_calls(
         )
 
     if "<tool_call" in cleaned_text:
-        cleaned, calls, malformed = _parse_xml_tool_calls(cleaned_text)
+        cleaned, calls, malformed = _parse_xml_tool_calls(cleaned_text, tools)
         filtered_calls = _filter_known_tools(calls, tools)
         if calls and not filtered_calls and tools:
             # OpenAI passes unknown-named calls through; the client owns the

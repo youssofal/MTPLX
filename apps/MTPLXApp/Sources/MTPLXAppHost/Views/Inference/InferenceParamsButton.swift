@@ -26,7 +26,14 @@ struct InferenceParamsButton: View {
                 .foregroundStyle(Brand.typeHi)
         }
         .buttonStyle(PremiumPuckStyle())
-        .help(performanceLock ? tr("Settings · Performance mode on") : tr("Settings"))
-        .accessibilityLabel(tr("Settings"))
+        // Named for what it holds: the gear beside it opens Settings,
+        // and two controls both called "Settings" sent people to the
+        // wrong one.
+        .help(
+            (performanceLock ? tr("Model controls · Performance mode on") : tr("Model controls"))
+                + "\n" + tr("Sampling, reasoning, speed and context for the loaded model.")
+        )
+        .accessibilityLabel(tr("Model controls"))
+        .accessibilityHint(tr("Sampling, reasoning, speed and context for the loaded model."))
     }
 }

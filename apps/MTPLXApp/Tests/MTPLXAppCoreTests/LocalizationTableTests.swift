@@ -223,7 +223,7 @@ final class LocalizationTableTests: XCTestCase {
         "Checking MTPLX runtime", "Checking fan control", "Checking for an existing mtplx command",
         "Installing MTPLX runtime", "Installing fan control", "Repairing MTPLX runtime",
         "Add a model", "Choose a model folder", "Use Folder", "Local model folder on this Mac.",
-        "The fastest way to run local AI.", "Speed and batching. Needs a restart to apply.",
+        "The fastest way to run local AI.", "How MTPLX handles several requests at once. Changes apply after a restart.",
         "The language MTPLX uses across the app. Changes apply immediately.",
         "MTPLX speaks %lld languages. Your pick applies right away, and you can change it anytime in Settings.",
     ]

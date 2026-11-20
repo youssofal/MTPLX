@@ -42,13 +42,16 @@ public struct ThermalPressureNotice: Equatable, Sendable {
 
     /// nil below heavy pressure, or when the engine reports no level.
     public static func from(_ health: ThermalPressureHealth?) -> ThermalPressureNotice? {
-        guard let raw = health?.level else { return nil }
-        let level = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        switch level {
-        case "heavy", "trapping", "sleeping":
-            return ThermalPressureNotice(level: level)
-        default:
-            return nil
+        guard let raw = health?.level, isThrottling(raw) else { return nil }
+        return ThermalPressureNotice(level: raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }
+
+    /// Heavy pressure and worse, where macOS slows the GPU. The engine names
+    /// the same levels (`THROTTLING_LEVELS` in `mtplx/thermal_pressure.py`).
+    public static func isThrottling(_ level: String?) -> Bool {
+        switch level?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "heavy", "trapping", "sleeping": return true
+        default: return false
         }
     }
 

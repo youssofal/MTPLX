@@ -146,6 +146,10 @@ def gather(monkeypatch):
         "MTPLX_ONE_COPY",
     ):
         monkeypatch.delenv(name, raising=False)
+    # The dense lane's bank (under 16K) is the exact one unless a test asks
+    # for the rounding: unset, it follows whether the native executor's module
+    # loads in this interpreter, and these figures must not.
+    monkeypatch.setenv("MTPLX_QWEN4_FIXED_M4_DENSE_BUCKET", "0")
     demotions.reset()
     yield monkeypatch
     demotions.reset()
@@ -261,6 +265,19 @@ def test_the_dense_lane_and_unresizable_caches_keep_the_copy(gather):
     fits, receipt, _plan, _bank = _gate(gather, held_cache=small, live=10 * GB, prompt=8_000)
     assert fits is True and receipt["promotion"] == "copied"
     assert receipt["promotion_bytes"] == 9_024 * FN_ROW
+
+    # With the native executor the same bank is rounded up inside its
+    # attention class (1,024 rows, graphbank._dense_lane_rows) so one recorded
+    # program serves every request in the bucket. The copy still stays, and
+    # the gate bills the rows the bank will really have: 192 more here, never
+    # more than 1,020 (27.6 MiB at this geometry).
+    gather.setenv("MTPLX_QWEN4_FIXED_M4_DENSE_BUCKET", "1024")
+    fits, receipt, plan, _bank = _gate(gather, held_cache=small, live=10 * GB, prompt=8_000)
+    assert fits is True and receipt["promotion"] == "copied"
+    assert plan.dense_bucket == 1024
+    assert receipt["promotion_bytes"] == 9_216 * FN_ROW
+    assert receipt["promotion_bytes"] - 9_024 * FN_ROW <= 1_020 * FN_ROW
+    gather.setenv("MTPLX_QWEN4_FIXED_M4_DENSE_BUCKET", "0")
 
     # A layer already promoted to a bank cannot be resized here.
     promoted = _flash_next_cache([_flash_next_layer(HELD, PROMPT) for _ in range(12)])

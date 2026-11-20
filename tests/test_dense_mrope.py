@@ -171,8 +171,17 @@ def test_positions_past_the_prompt_are_index_plus_delta():
     np.testing.assert_array_equal(np.asarray(axes[1]), state.table[1, 2:7])
 
 
-def test_text_request_is_bit_identical_after_install():
-    model = _text_model()
+# The MoE sibling (the 35B-A3B): the same model with routed and shared experts
+# in every layer. Its attention, and so the adapter, is the dense model's.
+FAMILIES = [
+    pytest.param({}, "qwen3_5", id="dense"),
+    pytest.param(synth.MOE_FIELDS, "qwen3_5_moe", id="moe"),
+]
+
+
+@pytest.mark.parametrize("fields, model_type", FAMILIES)
+def test_text_request_is_bit_identical_after_install(fields, model_type):
+    model = _text_model(**fields)
     ids = mx.array([[(3 * i + 1) % 97 for i in range(24)]])
 
     def run():
@@ -186,7 +195,7 @@ def test_text_request_is_bit_identical_after_install():
         return outs
 
     before = run()
-    install = configure_dense_mrope(model, _pack_config())
+    install = configure_dense_mrope(model, _pack_config(model_type=model_type))
     assert install is not None and install.installed
     assert install.trunk_layers == 2 and install.mtp_layers == 0
     assert all(isinstance(a.rope, DenseMRopeAdapter) for a in _full_attention(model))
@@ -206,9 +215,10 @@ def test_text_request_is_bit_identical_after_install():
     assert dense_mrope_state() is None
 
 
-def test_image_request_changes_only_rows_from_the_first_image_on():
-    model = _text_model()
-    assert configure_dense_mrope(model, _pack_config()).installed
+@pytest.mark.parametrize("fields, model_type", FAMILIES)
+def test_image_request_changes_only_rows_from_the_first_image_on(fields, model_type):
+    model = _text_model(**fields)
+    assert configure_dense_mrope(model, _pack_config(model_type=model_type)).installed
     ids = mx.array([PROMPT])
 
     def chunked_prefill():
@@ -229,6 +239,12 @@ def test_image_request_changes_only_rows_from_the_first_image_on():
     # same there too. Every later row moved, by far more than float noise.
     moved = np.abs(np.asarray(grid - sequential))[0, first_image + 1 :].max(axis=-1)
     assert moved.min() > 1e-2
+    if fields:
+        # On random weights the MoE's router turns the chunked forward's
+        # float noise into other experts, row by row, so the comparison below
+        # measures routing, not positions; the positions are the adapter's,
+        # which the dense model pins.
+        return
 
     # Chunked prefill agrees with the single forward as closely as it does on
     # a text request (the GatedDeltaNet layers of this random model differ by
@@ -337,7 +353,6 @@ def test_kill_switch_leaves_the_model_and_the_request_alone(monkeypatch):
 
 def test_other_families_and_text_only_packs_get_no_adapter():
     for config in (
-        _pack_config(model_type="qwen3_5_moe"),
         _pack_config(model_type="qwen4_exp"),
         {k: v for k, v in _pack_config().items() if k != "vision_config"},
     ):

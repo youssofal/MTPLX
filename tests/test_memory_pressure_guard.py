@@ -321,6 +321,17 @@ def test_allocation_failure_becomes_shed_plus_507():
     assert events and events[-1]["action"] == "allocation_failure_shed"
 
 
+# A fabricated entry's first token, one per name. It was ``hash(name) % 1000``:
+# a string's hash is salted per process, so about once in 330 runs two of a
+# test's three names drew the same number, the bank's table (keyed by token
+# ids) held two entries where the test counted three, and the gate of 16
+# November read 400 bytes for a live session of 800.
+_FIRST_TOKEN = {
+    name: number
+    for number, name in enumerate(("old", "mid", "new", "live-a", "live-b", "idle-a"), start=1)
+}
+
+
 def test_bank_shrink_to_bytes_evicts_lru_first():
     from mtplx.session_bank import SessionBank
 
@@ -331,7 +342,7 @@ def test_bank_shrink_to_bytes_evicts_lru_first():
 
     def entry(name, last_access, nbytes):
         return SessionBankEntry(
-            token_ids=(hash(name) % 1000, 2, 3),
+            token_ids=(_FIRST_TOKEN[name], 2, 3),
             token_hash=name,
             model_path="/m",
             mtp_enabled=False,
@@ -373,7 +384,7 @@ def test_bank_shrink_protect_active_never_evicts_the_live_session():
 
     def entry(name, session, last_access, nbytes):
         return SessionBankEntry(
-            token_ids=(hash(name) % 1000, 2, 3),
+            token_ids=(_FIRST_TOKEN[name], 2, 3),
             token_hash=name,
             model_path="/m",
             mtp_enabled=False,

@@ -1,0 +1,20 @@
+id = "image-stripes"
+kind = "image"
+prompt = '''
+This picture shows three vertical stripes. Name their colours from left to right, on the last line, separated by commas.
+'''
+
+[expect]
+type = "sequence"
+words = ["red", "green", "blue", "yellow", "black", "white"]
+value = ["green", "blue", "red"]
+
+[image]
+width = 300
+height = 120
+background = "white"
+rects = [
+  { x = 0, y = 0, w = 100, h = 120, color = "green" },
+  { x = 100, y = 0, w = 100, h = 120, color = "blue" },
+  { x = 200, y = 0, w = 100, h = 120, color = "red" },
+]

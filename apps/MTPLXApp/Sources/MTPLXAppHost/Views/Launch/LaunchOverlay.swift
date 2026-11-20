@@ -466,88 +466,13 @@ private struct DownNotch: Shape {
 
 // MARK: - TargetIcon
 //
-// Renders the launch-target icon. Every target uses its SF Symbol
-// except `.openCode` — that one renders the actual OpenCode app mark
-// (a thick rounded-rect "square donut" with a hole) via the custom
-// `SquareDonut` shape filled with even-odd rule. SF Symbols don't
-// ship a true square-donut variant; `square` is too thin, `app.fill`
-// is too solid.
+// ClientMark supplies the monochrome artwork shared with the Settings rows.
 
 private struct TargetIcon: View {
     let target: LaunchTarget
     let isLast: Bool
 
     var body: some View {
-        if target == .openCode {
-            OpenCodeMark(
-                frameColor: isLast ? Brand.accent : Brand.typeSecondary,
-                detailColor: (isLast ? Brand.accent : Brand.typeSecondary).opacity(0.45)
-            )
-            .frame(width: 12, height: 15)
-        } else if target == .hermes {
-            // Real Hermes Agent (Nous Research) brand mark instead of a
-            // generic glyph. Tinted to match the other launch-row icons —
-            // neutral gray at rest, accent when it's the last-used target —
-            // so it doesn't read as a too-bright white blob in the list.
-            HermesMark(size: 16, tint: isLast ? Brand.accent : Brand.typeSecondary)
-        } else {
-            Image(systemName: target.systemImage)
-                .font(.system(size: 13, weight: .regular))
-                .symbolRenderingMode(.monochrome)
-                .foregroundStyle(isLast ? Brand.accent : Brand.typeSecondary)
-        }
-    }
-}
-
-// MARK: - OpenCodeMark
-//
-// 1:1 SwiftUI reconstruction of the official OpenCode mark from
-// dashboardicons.com/icons/opencode (verified against opencode.ai/brand).
-//
-// SVG viewBox = 240 × 300 (W:H = 4:5). Geometry:
-//   - Outer canvas      : 240 × 300, sharp corners
-//   - Inner cutout      : 120 × 180 centred at (60,60) → (180,240)
-//                         — uniform 60pt border (25% of width / 20% of
-//                         height)
-//   - Detail fill       : 120 × 120 in the bottom 2/3 of the cutout,
-//                         (60,120) → (180,240), contrast color
-//
-// The mark is sharp-cornered; the rounded look in some renders is the
-// macOS icon wrapper, not the mark.
-//
-// Rendered with `Canvas` so the frame uses even-odd fill (canvas
-// minus inner) in `frameColor`, and the detail rect uses
-// `detailColor` painted underneath.
-
-private struct OpenCodeMark: View {
-    let frameColor: Color
-    let detailColor: Color
-
-    var body: some View {
-        Canvas { context, size in
-            let sx = size.width / 240
-            let sy = size.height / 300
-
-            // Detail fill — bottom 2/3 of the inner cutout.
-            let detail = CGRect(
-                x: 60 * sx,
-                y: 120 * sy,
-                width: 120 * sx,
-                height: 120 * sy
-            )
-            context.fill(Path(detail), with: .color(detailColor))
-
-            // Frame — full canvas minus the 120×180 inner cutout,
-            // even-odd filled so the cutout punches through.
-            var framePath = Path()
-            framePath.addRect(CGRect(origin: .zero, size: size))
-            framePath.addRect(CGRect(
-                x: 60 * sx,
-                y: 60 * sy,
-                width: 120 * sx,
-                height: 180 * sy
-            ))
-            context.fill(framePath, with: .color(frameColor), style: FillStyle(eoFill: true))
-        }
+        ClientMark(target: target, size: 18, tint: isLast ? Brand.typeHi : Brand.typeBody)
     }
 }

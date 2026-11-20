@@ -11,6 +11,7 @@ override these variables with their own fixtures.
 from __future__ import annotations
 
 import os
+import sys
 
 import pytest
 
@@ -121,6 +122,9 @@ def _hermetic_mtplx_state(monkeypatch, tmp_path_factory):
     # same treatment: ~/.pi/agent is never written by the suite. So do the
     # OpenCode Desktop stores the OpenCode writer and launcher edit on macOS.
     monkeypatch.setenv("MTPLX_PI_MODELS_JSON", str(isolated / "pi" / "models.json"))
+    # Claude Code's MTPLX settings file and the Terminal scripts that open
+    # Claude Code and Codex: never ~/.mtplx/clients or ~/.mtplx/handoffs.
+    monkeypatch.setenv("MTPLX_AGENT_CLIENTS_DIR", str(isolated / "agent-clients"))
     monkeypatch.setenv(
         "MTPLX_OPENCODE_DESKTOP_SETTINGS_STORE", str(isolated / "opencode-desktop.dat")
     )
@@ -154,6 +158,14 @@ def _hermetic_mtplx_state(monkeypatch, tmp_path_factory):
     monkeypatch.setenv(
         "MTPLX_START_FAILURE_REPORT", str(isolated / "last-failed-start.log")
     )
+    # /health reports a one-shot receipt of the first verify attention that
+    # split its query heads, kept in the module for the life of the process.
+    # A test that reads the receipts of an empty server must not see the one
+    # an earlier test's forward left behind (the engine and prefill tests run
+    # such forwards before the health tests in a full run).
+    qwen4_exp = sys.modules.get("mtplx.models.qwen4_exp")
+    if qwen4_exp is not None:
+        qwen4_exp.reset_verify_sdpa_head_chunk_engagement()
 
 
 @pytest.fixture

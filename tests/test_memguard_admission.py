@@ -1168,6 +1168,154 @@ class TestPerChunkSupplyCheck:
         assert closest["margin_bytes"] == self._LIMIT - 92_000_000_000 - self._CHUNK
         assert closest["check"] == 2
 
+    # Window n4l1 (2026-11-12), in its own numbers: a 194K follow-up whose
+    # restore copied the conversation (the bank kept its 7.12 GB entry) on
+    # the admission's price for a lease, a 44-token forward and the closing
+    # anchor. MLX held 90.91 GB before the turn and 97.42 GB at the abort.
+    _BANK = 7_119_505_552
+    _BEFORE = 90_907_266_229
+    _AT_ABORT = 97_416_433_015
+    _LEASE_PRICE = 400_000_000
+
+    def _priced_guard(self, monkeypatch, *, priced, active, bank=_BANK):
+        box = {"active": int(active)}
+        readings = iter(
+            [self._reading(available_gib=20.7, free_gib=8.7, compressor_gib=4.1, at_s=0.0)]
+        )
+        last = [None]
+
+        def reader():
+            try:
+                last[0] = next(readings)
+            except StopIteration:
+                pass
+            return last[0]
+
+        monkeypatch.setattr(sm, "_reader", reader)
+        monkeypatch.setattr(srv, "_PREFILL_SYSTEM_CHECK_INTERVAL_S", 0.0)
+        monkeypatch.setattr(
+            srv,
+            "_mlx_memory_stats_live",
+            lambda: {"ok": True, "active_memory_bytes": box["active"], "cache_memory_bytes": 0},
+        )
+        monkeypatch.setattr(srv, "phys_footprint_bytes", lambda *a, **k: 0)
+        monkeypatch.setattr(srv, "_shed_after_allocation_failure", lambda state: {})
+        state = SimpleNamespace(
+            dashboard=SimpleNamespace(),
+            allow_swap=False,
+            metal_memory_caps={"memory_limit_bytes": self._LIMIT},
+            sessions=SimpleNamespace(
+                bank=SimpleNamespace(total_nbytes=int(bank), queued_persistence_bytes=0)
+            ),
+        )
+        events: list = []
+        monkeypatch.setattr(
+            srv, "_record_guard_event", lambda state, payload: events.append(payload)
+        )
+        guard = srv._PrefillSystemGuard(
+            state,
+            chunk_reserve_bytes=self._CHUNK,
+            after_prefill_reserve_bytes=115_642_384,
+            priced_growth_bytes=priced,
+        )
+        guard.events = events
+        return guard, box
+
+    def test_a_restore_that_copied_what_was_priced_free_reads_as_the_gap(self, monkeypatch):
+        guard, box = self._priced_guard(
+            monkeypatch, priced=self._LEASE_PRICE, active=self._BEFORE
+        )
+        assert guard() is False
+        box["active"] = self._AT_ABORT
+        guard.note_prefill_progress({"phase": "completed", "tokens_total": 194_089})
+        assert guard() is True
+        tripped = guard.tripped
+        assert tripped["reason"] == "engine_limit"
+        assert tripped["request_grew_bytes"] == self._AT_ABORT - self._BEFORE
+        assert tripped["priced_growth_bytes"] == self._LEASE_PRICE
+        gap = guard.trajectory()["grew_past_price"]
+        assert gap["over_bytes"] == self._AT_ABORT - self._BEFORE - self._LEASE_PRICE
+        events = [e["action"] for e in guard.events]
+        assert events.count("prefill_grew_past_price") == 1
+
+    def test_the_same_copy_that_still_fits_is_said_once(self, monkeypatch):
+        # n4a4 at 131K: the clone fit under the line (+4.67 GB), unseen.
+        guard, box = self._priced_guard(
+            monkeypatch, priced=self._LEASE_PRICE, active=86_000_000_000, bank=4_600_000_000
+        )
+        assert guard() is False
+        box["active"] = 86_000_000_000 + 4_670_000_000
+        assert guard() is False
+        assert guard() is False
+        assert guard.tripped is None
+        events = [e["action"] for e in guard.events]
+        assert events == ["prefill_grew_past_price"]
+        assert guard.trajectory()["request_grew_max"]["grew_bytes"] == 4_670_000_000
+
+    def test_a_prefill_that_grows_as_priced_says_nothing(self, monkeypatch):
+        # n4l1's cold 194K prompt: billed 9.60 GB; the guard's closest
+        # reading was 92.16 GB, and MLX's peak ended 0.65 GB over the bill.
+        base, priced = 83_626_313_858, 9_600_761_856
+        guard, box = self._priced_guard(monkeypatch, priced=priced, active=base, bank=0)
+        assert guard() is False
+        box["active"] = 92_164_787_802
+        assert guard() is False
+        guard.note_prefill_progress({"phase": "completed", "tokens_total": 193_533})
+        box["active"] = base + priced + 650_000_000
+        assert guard() is False
+        trajectory = guard.trajectory()
+        assert trajectory["grew_past_price"] is None
+        assert trajectory["request_grew_max"]["grew_bytes"] == priced + 650_000_000
+        assert trajectory["priced_growth_bytes"] == priced
+        assert guard.events == []
+
+    def test_a_bank_trim_during_the_prefill_is_not_growth(self, monkeypatch):
+        guard, box = self._priced_guard(
+            monkeypatch, priced=self._LEASE_PRICE, active=self._BEFORE
+        )
+        assert guard() is False
+        box["active"] = self._BEFORE - self._BANK
+        guard.state.sessions.bank.total_nbytes = 0
+        assert guard() is False
+        assert guard.trajectory()["request_grew_max"]["grew_bytes"] == 0
+
+    def test_taking_the_conversations_lease_is_not_growth(self, monkeypatch):
+        # Window n4l2 (2026-11-12), Bare Speed follow-up at 247,590 tokens:
+        # the lease held 8.41 GB of live cache in the bank's account, the
+        # restore took it, MLX's active memory went from 83.71 to 83.82 GB,
+        # and the receipt read 8.52 GB of growth against a 1.30 GB price.
+        lease, before, after, priced = (
+            8_413_941_968, 83_712_516_774, 83_822_682_792, 1_304_672_384,
+        )
+        guard, box = self._priced_guard(monkeypatch, priced=priced, active=before, bank=lease)
+        guard.state.sessions.bank.lease_nbytes = lease
+        assert guard() is False
+        box["active"] = after
+        guard.state.sessions.bank.total_nbytes = 0
+        guard.state.sessions.bank.lease_nbytes = 0
+        guard.note_prefill_progress({"phase": "completed", "tokens_total": 247_590})
+        assert guard() is False
+        trajectory = guard.trajectory()
+        assert trajectory["request_grew_max"]["grew_bytes"] == after - before
+        assert trajectory["grew_past_price"] is None
+        assert guard.events == []
+
+    def test_a_copy_beside_a_lease_the_bank_keeps_is_growth(self, monkeypatch):
+        # n4l1's shape with the bank's entry read as the lease it was: the
+        # restore copied it and the bank kept it, so the copy is the growth.
+        guard, box = self._priced_guard(
+            monkeypatch, priced=self._LEASE_PRICE, active=self._BEFORE
+        )
+        guard.state.sessions.bank.lease_nbytes = self._BANK
+        assert guard() is False
+        box["active"] = self._AT_ABORT
+        guard.note_prefill_progress({"phase": "completed", "tokens_total": 194_089})
+        assert guard() is True
+        assert guard.tripped["request_grew_bytes"] == self._AT_ABORT - self._BEFORE
+        assert guard.trajectory()["grew_past_price"]["over_bytes"] == (
+            self._AT_ABORT - self._BEFORE - self._LEASE_PRICE
+        )
+
 
 def test_a_refusal_queued_for_the_stream_holds_no_prefill_frames():
     """The 507 raised while handling the prefill's abort chains that abort,

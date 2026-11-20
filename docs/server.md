@@ -221,6 +221,8 @@ stored once.
 | `--ssd-session-cache-max-size` | `100GB` (`32GB` on 64 GB Macs unless the disk has 150 GiB free, `24GB` on 32 GB, `16GB` on 16 GB) | Cap on the **whole** store directory as it sits on disk, orphaned files included. The effective cap is `min(this, free_disk / 4)`, and writes stop below 10 GiB free. When a write would take the store over the cap, garbage is reclaimed first and only then are the least recently used entries evicted. |
 | `MTPLX_SSD_WRITE_BUDGET_PER_HOUR` | `128G` | Rolling one-hour byte budget for SSD writes (SSD wear); writes beyond it are skipped for the hour. |
 | `MTPLX_SSD_WRITER_BACKLOG_BYTES` | `4G` | Bytes of encoded snapshots the writer may hold in RAM while waiting to write; larger single entries stream to disk instead. |
+| `MTPLX_SSD_READ_THREADS` | `8` | Threads that read a restore's blobs in parallel (1 to 64); each tensor's blocks land in one reused buffer. |
+| `MTPLX_SSD_NOCACHE` | `write` | macOS: which SSD cache blob I/O uses `F_NOCACHE`, so it does not also fill the file cache that shares memory with the model: `write` (default), `read`, `all` (`1`) or `off` (`0`). Reads stay cached by default: they are faster with the cache's read-ahead. |
 
 **Orphaned files.** A crash between a blob write and its manifest row, an
 interrupted write, or a blob whose last entry was evicted while a sibling

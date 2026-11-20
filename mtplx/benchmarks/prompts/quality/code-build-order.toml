@@ -1,0 +1,49 @@
+id = "code-build-order"
+kind = "code"
+prompt = '''
+Write a Python function `build_order(deps)` where `deps` is a dict mapping each task name (a string) to the list of task names it depends on. A name that appears only as a dependency is a task with no dependencies.
+
+Return a list of every task such that each task comes after all of its dependencies. Whenever more than one task is ready, take the alphabetically smallest one first. Raise `ValueError` if the dependencies contain a cycle (a task depending on itself counts).
+
+Reply with the complete function in one fenced Python code block.
+'''
+tests = '''
+assert build_order({}) == []
+assert build_order({"b": ["a"]}) == ["a", "b"]
+assert build_order({"c": ["a", "b"], "b": ["a"], "d": []}) == ["a", "b", "c", "d"]
+assert build_order({"z": [], "y": [], "x": ["y", "z"]}) == ["y", "z", "x"]
+assert build_order({"deploy": ["test", "build"], "test": ["build"], "build": ["fetch"], "lint": ["fetch"]}) == ["fetch", "build", "lint", "test", "deploy"]
+for cyclic in [{"a": ["b"], "b": ["a"]}, {"a": ["a"]}, {"a": ["b"], "b": ["c"], "c": ["a"], "d": []}]:
+    try:
+        build_order(cyclic)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(f"no cycle found in {cyclic!r}")
+'''
+reference = '''
+import heapq
+
+
+def build_order(deps):
+    waiting = {}
+    users = {}
+    for task, needs in deps.items():
+        waiting.setdefault(task, set()).update(needs)
+        for need in needs:
+            waiting.setdefault(need, set())
+            users.setdefault(need, set()).add(task)
+    ready = [task for task, needs in waiting.items() if not needs]
+    heapq.heapify(ready)
+    order = []
+    while ready:
+        task = heapq.heappop(ready)
+        order.append(task)
+        for user in sorted(users.get(task, ())):
+            waiting[user].discard(task)
+            if not waiting[user]:
+                heapq.heappush(ready, user)
+    if len(order) != len(waiting):
+        raise ValueError("the dependencies contain a cycle")
+    return order
+'''

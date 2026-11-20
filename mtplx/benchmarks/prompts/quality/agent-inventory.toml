@@ -1,0 +1,138 @@
+id = "agent-inventory"
+kind = "agent"
+prompt = '''
+Implement `Inventory.remove` in `inventory.py` exactly as its docstring describes, and add tests for it to `test_inventory.py`. Run the tests before you finish.
+'''
+hidden_tests = '''
+from inventory import Inventory, OutOfStock
+
+inv = Inventory()
+inv.add("bolt", 5)
+inv.remove("bolt", 2)
+assert inv.count("bolt") == 3
+inv.remove("bolt", 3)
+assert inv.count("bolt") == 0
+assert inv.items() == []
+
+inv.add("nut", 2)
+try:
+    inv.remove("nut", 3)
+except OutOfStock:
+    pass
+else:
+    raise AssertionError("removing more than the stock must raise OutOfStock")
+assert inv.count("nut") == 2
+
+try:
+    inv.remove("washer", 1)
+except OutOfStock:
+    pass
+else:
+    raise AssertionError("removing an unknown item must raise OutOfStock")
+assert inv.items() == ["nut"]
+
+for bad in [0, -1, 2.0, "1", None, True]:
+    try:
+        inv.remove("nut", bad)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(f"accepted quantity {bad!r}")
+assert inv.count("nut") == 2
+'''
+
+[files]
+"inventory.py" = '''
+class OutOfStock(Exception):
+    """Raised when more units are requested than are in stock."""
+
+
+def _check_quantity(quantity):
+    if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity <= 0:
+        raise ValueError("quantity must be a positive integer")
+
+
+class Inventory:
+    def __init__(self):
+        self._stock = {}
+
+    def add(self, item, quantity):
+        """Add ``quantity`` units of ``item``."""
+        _check_quantity(quantity)
+        self._stock[item] = self._stock.get(item, 0) + quantity
+
+    def count(self, item):
+        """Units of ``item`` in stock (0 for an unknown item)."""
+        return self._stock.get(item, 0)
+
+    def remove(self, item, quantity):
+        """Take ``quantity`` units of ``item`` out of stock.
+
+        Raises ValueError when ``quantity`` is not a positive int (a bool is
+        not accepted) and OutOfStock when fewer units are in stock; in both
+        cases the stock is left unchanged. An item whose count reaches zero
+        is forgotten, so it no longer appears in ``items()``.
+        """
+        raise NotImplementedError
+
+    def items(self):
+        """Names of the items in stock, sorted."""
+        return sorted(self._stock)
+'''
+"test_inventory.py" = '''
+import unittest
+
+from inventory import Inventory
+
+
+class InventoryTests(unittest.TestCase):
+    def test_add_and_count(self):
+        inv = Inventory()
+        inv.add("bolt", 3)
+        inv.add("bolt", 2)
+        self.assertEqual(inv.count("bolt"), 5)
+
+    def test_add_rejects_bad_quantity(self):
+        with self.assertRaises(ValueError):
+            Inventory().add("bolt", 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
+'''
+
+[reference_files]
+"inventory.py" = '''
+class OutOfStock(Exception):
+    """Raised when more units are requested than are in stock."""
+
+
+def _check_quantity(quantity):
+    if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity <= 0:
+        raise ValueError("quantity must be a positive integer")
+
+
+class Inventory:
+    def __init__(self):
+        self._stock = {}
+
+    def add(self, item, quantity):
+        _check_quantity(quantity)
+        self._stock[item] = self._stock.get(item, 0) + quantity
+
+    def count(self, item):
+        return self._stock.get(item, 0)
+
+    def remove(self, item, quantity):
+        _check_quantity(quantity)
+        have = self._stock.get(item, 0)
+        if have < quantity:
+            raise OutOfStock(f"{item}: {have} in stock, {quantity} requested")
+        if have == quantity:
+            del self._stock[item]
+        else:
+            self._stock[item] = have - quantity
+
+    def items(self):
+        return sorted(self._stock)
+'''

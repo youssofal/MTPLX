@@ -25,6 +25,15 @@ VIDEO_PAD = 98
 GRID = (1, 4, 6)  # merge 2 -> a 2 x 3 block of image tokens
 PROMPT = [5, 6, 7, PAD, PAD, PAD, PAD, PAD, PAD, 8, 9, 10, 11]
 DELTA = -3  # the 6 image tokens advance the position by max(1, 2, 3) = 3
+# ``text_args`` overrides for the MoE sibling (the 35B-A3B's layout): routed
+# and shared experts in every layer. 32 experts, top 4, as tests/a3b_tiny_synth
+# has them: with 8 experts MLX picks another expert kernel on short inputs.
+MOE_FIELDS = {
+    "num_experts": 32,
+    "num_experts_per_tok": 4,
+    "moe_intermediate_size": 32,
+    "shared_expert_intermediate_size": 32,
+}
 
 
 def rope_parameters() -> dict:

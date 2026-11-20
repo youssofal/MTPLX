@@ -104,18 +104,9 @@ enum Motion {
     static let controlHoverShadowRadius: CGFloat = 5
     static let controlHoverShadowYOffset: CGFloat = 2
 
-    // MARK: - Gauge value smoothing
-    //
-    // Mirrors the web dashboard's Motion spring
-    // (`useSpring(motionValue, { stiffness: 140, damping: 22, mass: 0.6 })`
-    // in `dashboard/src/components/TPSGauge.tsx`). The combination of
-    // smoothing the underlying value with this spring and applying
-    // `.contentTransition(.numericText())` on the headline label gives the
-    // speedtest "tick up / tick down" feel without rapid integer flicker.
-
-    static let gaugeValueSpring: Animation = .interpolatingSpring(
-        mass: 0.6, stiffness: 140, damping: 22
-    )
+    // The gauge's needle, flick and digit roll are solved on the gauge's own
+    // timeline (`GaugeView.arcSpring`, `GaugePulse`, `GaugeRoll`), not run
+    // as SwiftUI animations.
 
     /// Animation used when an arc tick label first appears in a mode.
     static let gaugeTickSpawn: Animation = .spring(response: 0.32, dampingFraction: 0.85)

@@ -142,9 +142,10 @@ struct SourceStage: View {
         }
     }
 
+    /// One example per line: as one sentence the link broke mid-path.
     @ViewBuilder
     private var helperLine: some View {
-        Text(markdown: tr("Example: `cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit` or `https://huggingface.co/Qwen/Qwen3.6-27B`."))
+        Text(markdown: tr("Example: `cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit`\nor `https://huggingface.co/Qwen/Qwen3.6-27B`."))
             .font(.caption2)
             .foregroundStyle(Brand.typeTertiary)
             .fixedSize(horizontal: false, vertical: true)

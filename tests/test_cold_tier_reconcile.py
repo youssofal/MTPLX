@@ -535,19 +535,20 @@ def test_writer_survives_a_pruned_prefix_directory(tmp_path):
     try:
         prefix = cold.base_dir / "blobs" / "ab"
         prefix.mkdir(parents=True, exist_ok=True)
-        original_write_bytes = Path.write_bytes
+        original_write_file = cold_tier_module.write_file
         pruned = [False]
 
-        def prune_then_write(self, data):
-            if not pruned[0] and self.name.startswith(".") and self.parent == prefix:
+        def prune_then_write(path, data, *args, **kwargs):
+            path = Path(path)
+            if not pruned[0] and path.name.startswith(".") and path.parent == prefix:
                 pruned[0] = True
                 prefix.rmdir()
-                raise FileNotFoundError(str(self))
-            return original_write_bytes(self, data)
+                raise FileNotFoundError(str(path))
+            return original_write_file(path, data, *args, **kwargs)
 
         from unittest import mock
 
-        with mock.patch.object(Path, "write_bytes", prune_then_write):
+        with mock.patch.object(cold_tier_module, "write_file", prune_then_write):
             assert cold._write_blob("ab" + "0" * 62, b"payload") is True
         assert (prefix / ("ab" + "0" * 62 + ".bin")).read_bytes() == b"payload"
         assert pruned[0] is True

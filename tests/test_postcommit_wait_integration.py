@@ -146,6 +146,30 @@ def test_pending_near_prefix_resolves_tool_result_waiter() -> None:
     assert manager.last_prefix_diagnostic is not None
     assert manager.last_prefix_diagnostic["reason"] == "pending_postcommit_near_prefix_match"
     assert manager.last_prefix_diagnostic["near_prefix_gap"] == 1
+    assert "pending_postcommit_tokens" not in manager.last_prefix_diagnostic
+
+    future.set_result(None)
+    session.wait_for_pending_postcommit(timeout_s=1.0)
+
+
+def test_pending_near_prefix_diagnostic_reports_commit_lag() -> None:
+    manager = EngineSessionManager()
+    session = manager.get_or_create("sess-lag")
+    session.commit_prompt_prefix(
+        prompt_ids=[1, 2, 3, 4],
+        finish_reason="tool_calls",
+        boundary_kind="tool_call_prompt_prefix",
+    )
+    future: Future = Future()
+    session.set_pending_postcommit(future, token_count=9)
+
+    manager.resolve_session_id(prompt_ids=[1, 2, 3, 99, 100])
+
+    diagnostic = manager.last_prefix_diagnostic
+    assert diagnostic is not None
+    assert diagnostic["best_prefix_len"] == 4
+    assert diagnostic["pending_postcommit_tokens"] == 9
+    assert diagnostic["committed_lag_tokens"] == 5
 
     future.set_result(None)
     session.wait_for_pending_postcommit(timeout_s=1.0)

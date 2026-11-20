@@ -96,16 +96,21 @@ struct InferenceParamsOverlay: View, Equatable {
 
     @Binding var presented: Bool
     private let presentedValue: Bool
+    /// Opens the full Settings page. Not part of `==`: it only ever does
+    /// the same thing.
+    private let openAllSettings: () -> Void
 
     init(
         backend: MTPLXBackendStore,
         snapshot: InferenceParamsSnapshot,
-        presented: Binding<Bool>
+        presented: Binding<Bool>,
+        openAllSettings: @escaping () -> Void = {}
     ) {
         self.backend = backend
         self.snapshot = snapshot
         _presented = presented
         presentedValue = presented.wrappedValue
+        self.openAllSettings = openAllSettings
     }
 
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
@@ -325,6 +330,7 @@ struct InferenceParamsOverlay: View, Equatable {
             if kvDirty || contextWindowDirty {
                 applyBar
             }
+            allSettingsFooter
         }
         .background(
             ZStack {
@@ -346,10 +352,38 @@ struct InferenceParamsOverlay: View, Equatable {
 
     // MARK: - Sections
 
+    /// The way from the quick controls to everything else: the full
+    /// Settings page, which the gear in the top bar and Cmd-, also open.
+    @ViewBuilder
+    private var allSettingsFooter: some View {
+        Divider().overlay(Brand.separator)
+        Button {
+            presented = false
+            openAllSettings()
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "gearshape")
+                    .font(.system(size: 11, weight: .semibold))
+                Text(tr("All settings…"))
+                    .font(.system(.callout))
+                Spacer(minLength: 8)
+                Text(verbatim: "⌘,")
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundStyle(Brand.typeTertiary)
+            }
+            .foregroundStyle(Brand.typeBody)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 9)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(tr("All settings…"))
+    }
+
     @ViewBuilder
     private var header: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(tr("Settings"))
+            Text(tr("Model controls"))
                 .font(.system(.callout, design: .rounded).weight(.semibold))
                 .foregroundStyle(Brand.typeBody)
             Text(modelControls?.displayName ?? fallbackDisplayName)

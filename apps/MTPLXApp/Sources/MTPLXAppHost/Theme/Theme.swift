@@ -50,6 +50,18 @@ public final class ThemeStore: ObservableObject {
 
     @AppStorage("mtplx.app.soundEnabled") public var soundEnabled: Bool = false
     @AppStorage("mtplx.app.reduceMotion") public var reduceMotionPreference: Bool = false
+    /// MTPLX in the menu bar (#692): its M, how much of a prompt is read,
+    /// the live decode speed, and the speed panel one click away
+    /// (MenuBarController). Its default is `menuBarItemDefault`.
+    @AppStorage("mtplx.app.menuBarItem") public var showMenuBarItem: Bool = ThemeStore.menuBarItemDefault
+
+    /// On for a new user: the AppKit item shows no measurable cost during a
+    /// decode. Five interleaved pairs, item on against off, main window
+    /// minimized, a decode swinging 30 to 95 tok/s (17 November): on minus off
+    /// was -4.0 ms/s of window-server CPU and -5.4 ms/s of the app's, within
+    /// the pairs' spread of 10.7 and 13.7; the SwiftUI item it replaces cost
+    /// the window server about 43 ms/s (16 November, `2f9d7cce`).
+    public static let menuBarItemDefault = true
 
     /// Appearance preference. Defaults to `dark` so a first launch renders
     /// exactly the Jet Chrome identity it always has.

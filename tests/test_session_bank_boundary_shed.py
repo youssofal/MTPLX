@@ -213,6 +213,46 @@ def test_shed_stops_at_zero_records_and_does_not_loop():
     assert nbytes == 10_000 - 4 * BOUNDARY_BYTES
 
 
+#: A base that fits its budget with no room for even one record beside it.
+BASE_WITH_NO_ROOM = BUDGET - BOUNDARY_BYTES + 1
+
+
+def test_shed_to_zero_records_stores_the_entry_without_boundaries(monkeypatch):
+    """#696: 2.05 to 2.11 GB entries against a 2 GiB budget, 45K to 70K prompts.
+
+    The base fits and no record fits beside it, so the shed keeps none. The
+    put then died building the entry, and the server reported that as a
+    stream error on an answer the client had already received in full.
+    """
+
+    monkeypatch.setenv(SESSION_BANK_SHED_BOUNDARIES_ENV, "1")
+    bank = _bank()
+
+    entry = _put(bank, boundaries=FOUR, base=BASE_WITH_NO_ROOM)
+
+    assert entry is not None
+    assert entry.gdn_boundaries == []
+    assert entry.gdn_boundary_loader is None
+    assert entry.nbytes == BASE_WITH_NO_ROOM
+    assert bank.boundary_shed_puts == 1
+    assert bank.boundary_shed_records == 4
+    assert bank.eviction_log[-1]["boundaries_kept"] == 0
+
+
+def test_shed_to_zero_records_under_a_tighter_bank_budget():
+    """The same put when the whole bank is the tighter budget (#690): that
+    route sheds without the gate, so it reached the same line."""
+
+    bank = _bank(max_bytes=BUDGET, per_session_max_bytes=10 * BUDGET)
+
+    entry = _put(bank, boundaries=FOUR, base=BASE_WITH_NO_ROOM)
+
+    assert entry is not None
+    assert entry.gdn_boundaries == []
+    assert entry.gdn_boundary_loader is None
+    assert bank.boundary_shed_records == 4
+
+
 def test_an_oversized_base_snapshot_is_still_refused(monkeypatch):
     """Shedding rescues entries whose PAYLOAD is the problem, nothing else."""
 

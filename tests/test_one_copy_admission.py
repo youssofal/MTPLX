@@ -26,7 +26,7 @@ from mlx_lm.models.cache import ArraysCache
 import mtplx.server.openai as srv
 from mtplx.graphbank import FixedM4CapacityPlan
 from mtplx.models.qwen4_exp import QSACache
-from mtplx.one_copy import anchor_nbytes, prefill_slack_rows, prompt_lease_fields
+from mtplx.one_copy import anchor_nbytes, note_anchor, prefill_slack_rows, prompt_lease_fields
 from test_memguard_admission import (  # noqa: F401  (_served_profile: autouse)
     FN_ROW,
     FN_WEIGHTS,
@@ -162,6 +162,38 @@ class TestTheRuntimeAnswers:
         [(position, snapshot, _hidden)] = fields["gdn_boundaries"]
         assert position == 10
         assert snapshot.states[1] is None
+
+    def test_a_prefill_measures_the_anchor_without_taking_one(self):
+        runtime = SimpleNamespace()
+        recurrent = ArraysCache(size=2)
+        recurrent[0] = mx.zeros((1, 3, 40), dtype=mx.bfloat16)
+        recurrent[1] = mx.zeros((1, 4, 16, 16), dtype=mx.float32)
+        attention = QSACache(4)
+        note_anchor(runtime, [recurrent, attention])
+        expected = 1 * 3 * 40 * 2 + 1 * 4 * 16 * 16 * 4
+        assert anchor_nbytes(runtime) == expected
+        # The same number a lease records, and the first measurement stays.
+        bigger = ArraysCache(size=2)
+        bigger[0] = mx.zeros((1, 3, 80), dtype=mx.bfloat16)
+        bigger[1] = mx.zeros((1, 8, 16, 16), dtype=mx.float32)
+        note_anchor(runtime, [bigger])
+        assert anchor_nbytes(runtime) == expected
+        leased = SimpleNamespace()
+        prompt_lease_fields(
+            [recurrent, attention],
+            committed_mtp_cache=None,
+            hidden=None,
+            prompt_len=10,
+            boundaries=[],
+            runtime=leased,
+        )
+        assert anchor_nbytes(leased) == expected
+
+    def test_a_cache_with_nothing_recurrent_measures_nothing(self):
+        runtime = SimpleNamespace()
+        note_anchor(runtime, [QSACache(4)])
+        assert anchor_nbytes(runtime) is None
+        note_anchor(None, [QSACache(4)])
 
     def test_the_slack_is_the_bank_rows_past_the_prompt(self, one_copy_on):
         runtime = _one_copy_runtime(_flash_next_state(_manager()).runtime)
@@ -354,3 +386,118 @@ class TestTheAnswersRoom:
         monkeypatch.setenv("MTPLX_ONE_COPY", "0")
         state, manager = self._state()
         assert self._room(monkeypatch, state, manager, base_gib=91.0, slack_rows=0) is None
+
+
+def _flash_next_recurrent_cache():
+    """Flash-Next's untrimmable state as shapes (never evaluated): 36 GDN
+    layers, each a conv tail and a 48 x 128 x 128 float32 recurrent state."""
+
+    cache = []
+    for _ in range(36):
+        layer = ArraysCache(size=2)
+        layer[0] = mx.zeros((1, 3, 10240), dtype=mx.bfloat16)
+        layer[1] = mx.zeros((1, 48, 128, 128), dtype=mx.float32)
+        cache.append(layer)
+    cache.extend(QSACache(4) for _ in range(12))
+    return cache
+
+
+GDN_ANCHOR = 36 * (3 * 10240 * 2 + 48 * 128 * 128 * 4)
+
+
+class TestTheFirstLongPrompt:
+    """The first long prompt of a process, before any lease measured an anchor.
+
+    2026-11-12, window n4a2 (128 GB M5 Max, 90 GiB engine limit, 83.63 GB
+    resident, a cold 193,533-token prompt): the bill charged the prompt's
+    publication as a second copy of the conversation (6.28 GB) though the
+    one-copy store leases the live cache and copies only the recurrent
+    anchor. Projected 96.3 GB against the 93.7 GB line, the admission shed
+    what it could. Near the full window the same bill crosses the limit
+    itself and refuses a prompt that fits. Every prefill now measures the
+    anchor (``note_anchor``; the server's boot warmup is the first), so the
+    first long prompt is billed as every later one is."""
+
+    BASE_GIB = 83_626_313_858 / GIB  # resident before the n4a2 prompt
+    SCRATCH = 2_147_483_648  # the n4a2 bill's scratch (qsa_itemized, 2,048 rows)
+
+    def _admit(self, monkeypatch, *, prompt_tokens, measured):
+        import mtplx.system_memory as sm
+
+        # The served profile's dense-decode ceiling ("auto": 15% of RAM over
+        # Flash-Next's 24,576-byte row, past 262,144 tokens on a 128 GB Mac,
+        # capped by the window), so the long prompt decodes dense as in
+        # n4a2's log ("contiguous_dense_decode"), on any machine running this.
+        monkeypatch.setenv("MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT", "262144")
+        monkeypatch.setattr(
+            srv,
+            "_admission_scratch_bytes",
+            lambda state, *, rows, prompt_tokens, geometry: (self.SCRATCH, "qsa_itemized"),
+        )
+        total = 128 * GIB
+        # The whole Mac as it was before the n4a2 prompt (32.8 GB available).
+        monkeypatch.setattr(
+            sm,
+            "_reader",
+            lambda: sm.SystemMemory(
+                available_bytes=32_766_869_504,
+                total_bytes=total,
+                level_percent=25,
+                free_bytes=2_000_000_000,
+                file_backed_bytes=30_766_869_504,
+                wired_bytes=90 * GIB,
+                compressor_bytes=6 * GIB,
+                swap_used_bytes=0,
+                monotonic_s=0.0,
+            ),
+        )
+        manager = _manager()
+        state = _flash_next_state(manager, limit_gib=96_636_764_160 / GIB)
+        _one_copy_runtime(state.runtime)
+        if measured:
+            note_anchor(state.runtime, _flash_next_recurrent_cache())
+        machine = _Machine(manager.bank, base_gib=self.BASE_GIB, cache_gib=0.0, host_gib=0.0)
+        _install(monkeypatch, machine)
+        session = manager.get_or_create("pi")
+        assert session.try_begin_generation()
+        pricing: dict = {}
+        try:
+            receipt = srv._prefill_admission_shed(
+                state,
+                prompt_ids=list(range(prompt_tokens)),
+                session_bank=manager.bank,
+                session_id="pi",
+                commit_prompt_prefix=True,
+                max_new_tokens=512,
+                pricing=pricing,
+            )
+        finally:
+            session.end_generation()
+        return receipt, pricing["growth"]
+
+    def test_the_cold_194k_prompt_is_billed_one_copy_and_its_anchor(
+        self, monkeypatch, one_copy_on
+    ):
+        _receipt, before = self._admit(monkeypatch, prompt_tokens=193_533, measured=False)
+        _receipt, after = self._admit(monkeypatch, prompt_tokens=193_533, measured=True)
+        # Before: the publication priced as the whole conversation.
+        assert before["publish_copy_bytes"] > 5 * GIB
+        assert after["publish_copy_bytes"] == GDN_ANCHOR
+        assert after["live_prefill_bytes"] == before["live_prefill_bytes"]
+        assert (
+            before["decode_start_bytes"] - after["decode_start_bytes"]
+            == before["publish_copy_bytes"] - GDN_ANCHOR
+        )
+
+    def test_a_cold_prompt_near_the_full_window_is_admitted(self, monkeypatch, one_copy_on):
+        # The n4a3 full-window cell's prompt (247,048 tokens), the first of
+        # the process.
+        refused, before = self._admit(monkeypatch, prompt_tokens=247_048, measured=False)
+        assert refused is not None and refused["refused"] is True
+        assert refused["refusal_reason"] == "projected_over_limit_after_reclamation"
+        receipt, after = self._admit(monkeypatch, prompt_tokens=247_048, measured=True)
+        assert receipt is None or receipt.get("refused") is not True
+        assert after["publish_copy_bytes"] == GDN_ANCHOR
+        # One copy of the conversation and the scratch: under the limit.
+        assert self.BASE_GIB * GIB + after["growth_bytes"] < 96_636_764_160
+

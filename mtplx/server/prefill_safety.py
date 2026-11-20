@@ -205,10 +205,14 @@ def make_prefill_system_guard(
             pass
     else:
         srv._note_guard_health(state, where="prefill_chunk_reserve", error=None)
+    priced_growth = priced.get("growth_bytes") if isinstance(priced, Mapping) else None
     return srv._PrefillSystemGuard(
         state,
         chunk_reserve_bytes=reserve,
         own_session_shed=own_session_shed,
+        priced_growth_bytes=(
+            int(priced_growth) if isinstance(priced_growth, (int, float)) else None
+        ),
         **after_forward,
     )
 

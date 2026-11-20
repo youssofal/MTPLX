@@ -3,12 +3,11 @@ import MTPLXAppCore
 
 // MARK: - BottomTabBar
 //
-// Custom bottom-edge tab bar. Renders the V1 dashboard surfaces
-// (Live / Activity / System / Forge / Settings) with a chrome
-// underline under the selected tab and a soft cross-fade rail on
-// hovered items. Items auto-derive from `AppTab.allCases` — adding or
-// removing a case in AppRouter.swift updates the bar with zero edits
-// here.
+// Custom bottom-edge tab bar. Renders the dashboard surfaces
+// (Live / Activity / System / Forge) with a chrome underline under the
+// selected tab and a soft cross-fade rail on hovered items. Items come
+// from `AppTab.barTabs`; Settings opens from the gear in the top bar,
+// and while it shows no tab here is selected.
 //
 // Jet Chrome pass: the previous whole-button scaleEffect on hover
 // scaled icon, label, and underline as one block — "the fucking text
@@ -30,7 +29,7 @@ struct BottomTabBar: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            ForEach(AppTab.allCases) { tab in
+            ForEach(AppTab.barTabs) { tab in
                 TabBarItem(
                     tab: tab,
                     isSelected: router.selection == tab,

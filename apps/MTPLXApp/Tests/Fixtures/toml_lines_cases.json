@@ -1,0 +1,269 @@
+{
+ "cases": [
+  {
+   "output": "model_dir = \"/Volumes/SSD/models\"\nmodel_dirs = [\"/Users/me/Models\", \"/Volumes/Old/llm\"]\n",
+   "text": null,
+   "updates": {
+    "model_dir": "/Volumes/SSD/models",
+    "model_dirs": [
+     "/Users/me/Models",
+     "/Volumes/Old/llm"
+    ]
+   }
+  },
+  {
+   "output": "model_dirs = [\"/x \\\"quoted\\\" \\u00e9\"]\n",
+   "text": null,
+   "updates": {
+    "model_dir": null,
+    "model_dirs": [
+     "/x \"quoted\" \u00e9"
+    ]
+   }
+  },
+  {
+   "output": "",
+   "text": null,
+   "updates": {
+    "model_dirs": null
+   }
+  },
+  {
+   "output": "",
+   "text": null,
+   "updates": {}
+  },
+  {
+   "output": "model_dir = \"/Volumes/SSD/models\"\nmodel_dirs = [\"/Users/me/Models\", \"/Volumes/Old/llm\"]\n",
+   "text": "",
+   "updates": {
+    "model_dir": "/Volumes/SSD/models",
+    "model_dirs": [
+     "/Users/me/Models",
+     "/Volumes/Old/llm"
+    ]
+   }
+  },
+  {
+   "output": "model_dirs = [\"/x \\\"quoted\\\" \\u00e9\"]\n",
+   "text": "",
+   "updates": {
+    "model_dir": null,
+    "model_dirs": [
+     "/x \"quoted\" \u00e9"
+    ]
+   }
+  },
+  {
+   "output": "",
+   "text": "",
+   "updates": {
+    "model_dirs": null
+   }
+  },
+  {
+   "output": "",
+   "text": "",
+   "updates": {}
+  },
+  {
+   "output": "# MTPLX user configuration\nmodel_dir = \"/Volumes/SSD/models\"\nmodel_dirs = [\"/Users/me/Models\", \"/Volumes/Old/llm\"]\n",
+   "text": "# MTPLX user configuration\n",
+   "updates": {
+    "model_dir": "/Volumes/SSD/models",
+    "model_dirs": [
+     "/Users/me/Models",
+     "/Volumes/Old/llm"
+    ]
+   }
+  },
+  {
+   "output": "# MTPLX user configuration\nmodel_dirs = [\"/x \\\"quoted\\\" \\u00e9\"]\n",
+   "text": "# MTPLX user configuration\n",
+   "updates": {
+    "model_dir": null,
+    "model_dirs": [
+     "/x \"quoted\" \u00e9"
+    ]
+   }
+  },
+  {
+   "output": "# MTPLX user configuration\n",
+   "text": "# MTPLX user configuration\n",
+   "updates": {
+    "model_dirs": null
+   }
+  },
+  {
+   "output": "# MTPLX user configuration\n",
+   "text": "# MTPLX user configuration\n",
+   "updates": {}
+  },
+  {
+   "output": "# MTPLX user configuration\nmodel = \"Youssofal/x\"\nprofile = \"sustained\"\nmodel_dir = \"/Volumes/SSD/models\"\nmodel_dirs = [\"/Users/me/Models\", \"/Volumes/Old/llm\"]\n",
+   "text": "# MTPLX user configuration\nmodel = \"Youssofal/x\"\nprofile = \"sustained\"\n",
+   "updates": {
+    "model_dir": "/Volumes/SSD/models",
+    "model_dirs": [
+     "/Users/me/Models",
+     "/Volumes/Old/llm"
+    ]
+   }
+  },
+  {
+   "output": "# MTPLX user configuration\nmodel = \"Youssofal/x\"\nprofile = \"sustained\"\nmodel_dirs = [\"/x \\\"quoted\\\" \\u00e9\"]\n",
+   "text": "# MTPLX user configuration\nmodel = \"Youssofal/x\"\nprofile = \"sustained\"\n",
+   "updates": {
+    "model_dir": null,
+    "model_dirs": [
+     "/x \"quoted\" \u00e9"
+    ]
+   }
+  },
+  {
+   "output": "# MTPLX user configuration\nmodel = \"Youssofal/x\"\nprofile = \"sustained\"\n",
+   "text": "# MTPLX user configuration\nmodel = \"Youssofal/x\"\nprofile = \"sustained\"\n",
+   "updates": {
+    "model_dirs": null
+   }
+  },
+  {
+   "output": "# MTPLX user configuration\nmodel = \"Youssofal/x\"\nprofile = \"sustained\"\n",
+   "text": "# MTPLX user configuration\nmodel = \"Youssofal/x\"\nprofile = \"sustained\"\n",
+   "updates": {}
+  },
+  {
+   "output": "# mine\nmodel_dir = \"/Volumes/SSD/models\"\nmodel_dirs = [\"/Users/me/Models\", \"/Volumes/Old/llm\"]\nprofile = \"sustained\"  # keep\n",
+   "text": "# mine\nmodel_dir = \"/old\"\nmodel_dirs = [\"/a\", \"/b\"]\nprofile = \"sustained\"  # keep\n",
+   "updates": {
+    "model_dir": "/Volumes/SSD/models",
+    "model_dirs": [
+     "/Users/me/Models",
+     "/Volumes/Old/llm"
+    ]
+   }
+  },
+  {
+   "output": "# mine\nmodel_dirs = [\"/x \\\"quoted\\\" \\u00e9\"]\nprofile = \"sustained\"  # keep\n",
+   "text": "# mine\nmodel_dir = \"/old\"\nmodel_dirs = [\"/a\", \"/b\"]\nprofile = \"sustained\"  # keep\n",
+   "updates": {
+    "model_dir": null,
+    "model_dirs": [
+     "/x \"quoted\" \u00e9"
+    ]
+   }
+  },
+  {
+   "output": "# mine\nmodel_dir = \"/old\"\nprofile = \"sustained\"  # keep\n",
+   "text": "# mine\nmodel_dir = \"/old\"\nmodel_dirs = [\"/a\", \"/b\"]\nprofile = \"sustained\"  # keep\n",
+   "updates": {
+    "model_dirs": null
+   }
+  },
+  {
+   "output": "# mine\nmodel_dir = \"/old\"\nmodel_dirs = [\"/a\", \"/b\"]\nprofile = \"sustained\"  # keep\n",
+   "text": "# mine\nmodel_dir = \"/old\"\nmodel_dirs = [\"/a\", \"/b\"]\nprofile = \"sustained\"  # keep\n",
+   "updates": {}
+  },
+  {
+   "output": "model_dirs = [\"/Users/me/Models\", \"/Volumes/Old/llm\"]\nmodel_dir = \"/Volumes/SSD/models\"\n\n[extra]\nmodel_dir = \"inner\"\n",
+   "text": "model_dirs = [\n  \"/a\",\n  \"/b[1]\",  # note\n]\n\n[extra]\nmodel_dir = \"inner\"\n",
+   "updates": {
+    "model_dir": "/Volumes/SSD/models",
+    "model_dirs": [
+     "/Users/me/Models",
+     "/Volumes/Old/llm"
+    ]
+   }
+  },
+  {
+   "output": "model_dirs = [\"/x \\\"quoted\\\" \\u00e9\"]\n\n[extra]\nmodel_dir = \"inner\"\n",
+   "text": "model_dirs = [\n  \"/a\",\n  \"/b[1]\",  # note\n]\n\n[extra]\nmodel_dir = \"inner\"\n",
+   "updates": {
+    "model_dir": null,
+    "model_dirs": [
+     "/x \"quoted\" \u00e9"
+    ]
+   }
+  },
+  {
+   "output": "\n[extra]\nmodel_dir = \"inner\"\n",
+   "text": "model_dirs = [\n  \"/a\",\n  \"/b[1]\",  # note\n]\n\n[extra]\nmodel_dir = \"inner\"\n",
+   "updates": {
+    "model_dirs": null
+   }
+  },
+  {
+   "output": "model_dirs = [\n  \"/a\",\n  \"/b[1]\",  # note\n]\n\n[extra]\nmodel_dir = \"inner\"\n",
+   "text": "model_dirs = [\n  \"/a\",\n  \"/b[1]\",  # note\n]\n\n[extra]\nmodel_dir = \"inner\"\n",
+   "updates": {}
+  },
+  {
+   "output": "model_dir = \"/Volumes/SSD/models\"\nmodel_dirs = [\"/Users/me/Models\", \"/Volumes/Old/llm\"]\n[only]\nx = 1\n",
+   "text": "[only]\nx = 1\n",
+   "updates": {
+    "model_dir": "/Volumes/SSD/models",
+    "model_dirs": [
+     "/Users/me/Models",
+     "/Volumes/Old/llm"
+    ]
+   }
+  },
+  {
+   "output": "model_dirs = [\"/x \\\"quoted\\\" \\u00e9\"]\n[only]\nx = 1\n",
+   "text": "[only]\nx = 1\n",
+   "updates": {
+    "model_dir": null,
+    "model_dirs": [
+     "/x \"quoted\" \u00e9"
+    ]
+   }
+  },
+  {
+   "output": "[only]\nx = 1\n",
+   "text": "[only]\nx = 1\n",
+   "updates": {
+    "model_dirs": null
+   }
+  },
+  {
+   "output": "[only]\nx = 1\n",
+   "text": "[only]\nx = 1\n",
+   "updates": {}
+  },
+  {
+   "output": "model_dir = \"/Volumes/SSD/models\"\nmodel_dirs = [\"/Users/me/Models\", \"/Volumes/Old/llm\"]\n",
+   "text": "model_dir = '/literal'\nmodel_dirs = ['/l1', \"/l2\"]\n",
+   "updates": {
+    "model_dir": "/Volumes/SSD/models",
+    "model_dirs": [
+     "/Users/me/Models",
+     "/Volumes/Old/llm"
+    ]
+   }
+  },
+  {
+   "output": "model_dirs = [\"/x \\\"quoted\\\" \\u00e9\"]\n",
+   "text": "model_dir = '/literal'\nmodel_dirs = ['/l1', \"/l2\"]\n",
+   "updates": {
+    "model_dir": null,
+    "model_dirs": [
+     "/x \"quoted\" \u00e9"
+    ]
+   }
+  },
+  {
+   "output": "model_dir = '/literal'\n",
+   "text": "model_dir = '/literal'\nmodel_dirs = ['/l1', \"/l2\"]\n",
+   "updates": {
+    "model_dirs": null
+   }
+  },
+  {
+   "output": "model_dir = '/literal'\nmodel_dirs = ['/l1', \"/l2\"]\n",
+   "text": "model_dir = '/literal'\nmodel_dirs = ['/l1', \"/l2\"]\n",
+   "updates": {}
+  }
+ ],
+ "version": 1
+}

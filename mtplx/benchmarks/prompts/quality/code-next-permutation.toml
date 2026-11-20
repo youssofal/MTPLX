@@ -1,0 +1,37 @@
+id = "code-next-permutation"
+kind = "code"
+prompt = '''
+Write a Python function `next_permutation(values)` that returns, as a new list, the next permutation of a list of integers in lexicographic order. If `values` is already the last permutation (sorted in descending order), return the first one (sorted in ascending order). Duplicate values are allowed. The input list must not be modified.
+
+Reply with the complete function in one fenced Python code block.
+'''
+tests = '''
+assert next_permutation([1, 2, 3]) == [1, 3, 2]
+assert next_permutation([1, 3, 2]) == [2, 1, 3]
+assert next_permutation([3, 2, 1]) == [1, 2, 3]
+assert next_permutation([1, 1, 5]) == [1, 5, 1]
+assert next_permutation([1, 5, 1]) == [5, 1, 1]
+assert next_permutation([5, 1, 1]) == [1, 1, 5]
+assert next_permutation([2, 3, 1]) == [3, 1, 2]
+assert next_permutation([1, 4, 3, 2]) == [2, 1, 3, 4]
+assert next_permutation([2, 2]) == [2, 2]
+assert next_permutation([7]) == [7]
+assert next_permutation([]) == []
+data = [1, 2, 3]
+next_permutation(data)
+assert data == [1, 2, 3]
+'''
+reference = '''
+def next_permutation(values):
+    out = list(values)
+    i = len(out) - 2
+    while i >= 0 and out[i] >= out[i + 1]:
+        i -= 1
+    if i >= 0:
+        j = len(out) - 1
+        while out[j] <= out[i]:
+            j -= 1
+        out[i], out[j] = out[j], out[i]
+    out[i + 1:] = reversed(out[i + 1:])
+    return out
+'''

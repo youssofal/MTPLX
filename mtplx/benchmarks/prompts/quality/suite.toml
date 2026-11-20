@@ -1,0 +1,12 @@
+# The quality instrument's fixed suite (mtplx/benchmarks/quality). Changing a
+# task changes every number measured with it: add a new task instead, and
+# bump the name when the set changes.
+name = "quality-v1"
+
+# Tokens one reply may write. No task here needs more than a few thousand; a
+# reply that reaches the budget is recorded as a runaway (a failed task whose
+# token count is shown apart), never as a normal finish.
+budget_tokens = 16384
+
+# Requests one agent task may make before it counts as unfinished.
+max_agent_turns = 16

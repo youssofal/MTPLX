@@ -1,0 +1,104 @@
+id = "agent-stats"
+kind = "agent"
+prompt = '''
+Some tests in `test_stats.py` fail. Fix `stats.py` so that every function does what its docstring says and all the tests pass.
+'''
+hidden_tests = '''
+from stats import mean, median, mode
+
+assert mean([1, 2, 3, 4]) == 2.5
+assert median([3, 1, 2]) == 2
+assert median([4, 1, 3, 2]) == 2.5
+assert median([5]) == 5
+assert median([1, 1, 2, 9]) == 1.5
+assert mode([1, 2, 2, 3, 3]) == 2
+assert mode([3, 3, 1, 1, 2]) == 1
+assert mode([5]) == 5
+assert mode([4, 4, 1]) == 4
+for empty in (median, mode):
+    try:
+        empty([])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(f"{empty.__name__}([]) must raise ValueError")
+'''
+
+[files]
+"stats.py" = '''
+def mean(values):
+    """Arithmetic mean."""
+    return sum(values) / len(values)
+
+
+def median(values):
+    """Middle value of the sorted values, or the mean of the two middle
+    values when there is an even number of them. Raises ValueError when
+    ``values`` is empty."""
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2]
+
+
+def mode(values):
+    """Most common value; on a tie, the smallest of the tied values.
+    Raises ValueError when ``values`` is empty."""
+    counts = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    return max(counts, key=counts.get)
+'''
+"test_stats.py" = '''
+import unittest
+
+from stats import mean, median, mode
+
+
+class StatsTests(unittest.TestCase):
+    def test_mean(self):
+        self.assertEqual(mean([1, 2, 3, 4]), 2.5)
+
+    def test_median_odd(self):
+        self.assertEqual(median([3, 1, 2]), 2)
+
+    def test_median_even(self):
+        self.assertEqual(median([4, 1, 3, 2]), 2.5)
+
+    def test_mode_tie_takes_smallest(self):
+        self.assertEqual(mode([3, 3, 1, 1, 2]), 1)
+
+    def test_empty(self):
+        with self.assertRaises(ValueError):
+            median([])
+        with self.assertRaises(ValueError):
+            mode([])
+
+
+if __name__ == "__main__":
+    unittest.main()
+'''
+
+[reference_files]
+"stats.py" = '''
+def mean(values):
+    return sum(values) / len(values)
+
+
+def median(values):
+    if not values:
+        raise ValueError("median of no values")
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def mode(values):
+    if not values:
+        raise ValueError("mode of no values")
+    counts = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    best = max(counts.values())
+    return min(value for value, count in counts.items() if count == best)
+'''

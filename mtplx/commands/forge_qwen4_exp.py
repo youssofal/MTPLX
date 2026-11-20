@@ -120,8 +120,10 @@ def _text_config(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def is_qwen4_exp_source(config: dict[str, Any]) -> bool:
-    types = {str(config.get("model_type") or "").lower(), str(_text_config(config).get("model_type") or "").lower()}
-    return "qwen4_exp" in types
+    """A hyper-connection trunk, by what its config contains (not by its name)."""
+    from mtplx.backends import signature
+
+    return signature.is_qwen4(config)
 
 
 # --------------------------------------------------------------------------- recipe
@@ -156,7 +158,9 @@ def recipe_params(recipe: dict[str, Any]) -> dict[str, int]:
     return {
         "body_bits": body_bits, "body_group": body_group,
         "ngram_bits": ngram_bits, "ngram_group": ngram_group,
-        "mtp_bits": mtp_bits, "mtp_group": body_group,
+        # The head follows the trunk's group unless pinned (Bare Speed's head
+        # keeps group-32 experts beside a group-64 trunk).
+        "mtp_bits": mtp_bits, "mtp_group": int(recipe.get("qwen4_mtp_group_size") or body_group),
     }
 
 
@@ -186,9 +190,25 @@ def ngram_sidecar_layout(rows: int, dim: int, *, bits: int, group: int) -> dict[
     return header
 
 
+def ngram_layer(config: dict[str, Any]) -> int | None:
+    """The zero-based layer whose n-gram table becomes the sidecar, or None
+    for a trunk without n-gram rows.  The sidecar holds one table."""
+    from mtplx.backends.geometry import Geometry
+
+    ngram = Geometry.from_config(config).ngram
+    if ngram is None:
+        return None
+    if len(ngram.layers) != 1:
+        raise Qwen4ForgeError(
+            f"n-gram rows at layers {list(ngram.layers)}: the sidecar and the runtime's gather hold one table"
+        )
+    return ngram.layers[0]
+
+
 def ngram_shards(source: Path, config: dict[str, Any]) -> list[tuple[str, Path]]:
-    text = _text_config(config)
-    layer = int((text.get("ple_layer_ids") or [2])[0]) - 1  # one-indexed in the HF config
+    layer = ngram_layer(config)
+    if layer is None:
+        return []
     weight_map = _load_json(source / "model.safetensors.index.json")["weight_map"]
     shards: list[tuple[str, Path]] = []
     index = 0
@@ -286,6 +306,29 @@ def write_ngram_sidecar(
 
 
 # --------------------------------------------------------------------------- body
+def body_rule(model: Any, recipe: dict[str, Any]) -> Callable[[str, Any], Any]:
+    """``(path, module) -> False | True | {bits, group_size, mode}`` for the
+    trunk: the recipe's ``module_overrides`` first, then the model's own
+    convert-time rule (Optimized Speed's); True is the recipe's base."""
+    model_predicate = getattr(model, "quant_predicate", None)
+    overrides = None
+    if recipe.get("module_overrides"):
+        from mtplx.commands.forge_mixed_convert import build_predicate
+
+        overrides = build_predicate(recipe)
+
+    def predicate(path: str, module: Any):
+        if not hasattr(module, "to_quantized"):
+            return False
+        if overrides is not None:
+            decision = overrides(path, module)
+            if decision is not True:
+                return decision
+        return model_predicate(path, module) if model_predicate is not None else True
+
+    return predicate
+
+
 def convert_body(
     source: Path,
     destination: Path,
@@ -304,7 +347,8 @@ def convert_body(
     from mtplx.models.qwen4_exp import Model, ModelArgs
 
     config = _load_json(source / "config.json")
-    config.setdefault("text_config", {})["ngram_sidecar"] = True
+    if ngram_layer(config) is not None:
+        config.setdefault("text_config", {})["ngram_sidecar"] = True
     config.pop("model_file", None)
     model = Model(ModelArgs.from_dict(config))
 
@@ -328,24 +372,10 @@ def convert_body(
     model.load_weights(list(weights.items()), strict=True)
     del weights
 
-    model_predicate = getattr(model, "quant_predicate", None)
-    overrides = None
-    if recipe.get("module_overrides"):
-        from mtplx.commands.forge_mixed_convert import build_predicate
-
-        overrides = build_predicate(recipe)
-
-    def predicate(path: str, module: Any):
-        if not hasattr(module, "to_quantized"):
-            return False
-        if overrides is not None:
-            decision = overrides(path, module)
-            if decision is not True:
-                return decision
-        return model_predicate(path, module) if model_predicate is not None else True
-
     progress("convert", 0.35, "quantize_body", False)
-    model, config = quantize_model(model, config, body_group, body_bits, mode="affine", quant_predicate=predicate)
+    model, config = quantize_model(
+        model, config, body_group, body_bits, mode="affine", quant_predicate=body_rule(model, recipe)
+    )
     params = tree_flatten(model.parameters())
     model.update(tree_map(lambda _: mx.array([]), model.parameters()))
     del model
@@ -401,9 +431,37 @@ def convert_body(
 
 
 # --------------------------------------------------------------------------- MTP sidecar
-def mtp_module_rule(name: str, *, mtp_bits: int, mtp_group: int, qsa_8bit: bool = False):
+#: A dense head's MLP: the same role as the routed experts, so the same bits.
+MTP_DENSE_MLP_SUFFIXES = ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+
+
+def head_overrides(recipe: dict[str, Any]) -> tuple[tuple[str, tuple[int, int] | None], ...]:
+    """The recipe's ``module_overrides`` that reach the draft head, as
+    ``(suffix, (bits, group) or None for bf16)``.  An override that names
+    trunk layers is the trunk's alone; the head mirrors every other one, so a
+    recipe that packs a module differently packs it so in both places."""
+    out = []
+    for entry in recipe.get("module_overrides") or []:
+        if not isinstance(entry, dict) or entry.get("layers") is not None:
+            continue
+        packed = None if entry.get("quantize") is False else (int(entry.get("bits") or 8), int(entry.get("group_size") or 64))
+        out.append((str(entry.get("suffix") or ""), packed))
+    return tuple(out)
+
+
+def mtp_module_rule(
+    name: str,
+    *,
+    mtp_bits: int,
+    mtp_group: int,
+    qsa_8bit: bool = False,
+    overrides: tuple[tuple[str, tuple[int, int] | None], ...] = (),
+):
     """``(bits, group)`` for a stripped (``mtp.``-less) weight key, or None for bf16."""
-    if "switch_mlp." in name:
+    for suffix, packed in overrides:
+        if suffix and name.endswith(suffix + ".weight"):
+            return packed
+    if "switch_mlp." in name or any(name.endswith(s + ".weight") for s in MTP_DENSE_MLP_SUFFIXES):
         return (mtp_bits, mtp_group) if mtp_bits else None
     if any(name.endswith(s + ".weight") for s in MTP_EIGHT_BIT_SUFFIXES):
         return (8, 64)
@@ -437,6 +495,7 @@ def write_mtp_sidecar(
     mtp_bits: int,
     mtp_group: int,
     qsa_8bit: bool = False,
+    overrides: tuple[tuple[str, tuple[int, int] | None], ...] = (),
 ) -> dict[str, Any]:
     import mlx.core as mx
 
@@ -464,7 +523,7 @@ def write_mtp_sidecar(
     packed: dict[str, Any] = {}
     modules: dict[str, str] = {}
     for key, value in tensors.items():
-        rule = mtp_module_rule(key, mtp_bits=mtp_bits, mtp_group=mtp_group, qsa_8bit=qsa_8bit)
+        rule = mtp_module_rule(key, mtp_bits=mtp_bits, mtp_group=mtp_group, qsa_8bit=qsa_8bit, overrides=overrides)
         if rule is None or value.ndim < 2:
             packed["mtp." + key] = value.astype(mx.bfloat16) if value.dtype == mx.float32 else value
             modules[key] = "bf16"
@@ -499,10 +558,15 @@ def run_lane(
         validate_bf16_source(source)
     qsa_8bit = bool(recipe.get("qwen4_qsa_8bit", False))
     report: dict[str, Any] = {"recipe": params}
-    progress("convert", 0.0, "ngram_sidecar", False)
-    report["ngram"] = write_ngram_sidecar(
-        source, destination, bits=params["ngram_bits"], group=params["ngram_group"], progress=progress
-    )
+    has_ngram = ngram_layer(_load_json(source / "config.json")) is not None
+    if has_ngram:
+        progress("convert", 0.0, "ngram_sidecar", False)
+        report["ngram"] = write_ngram_sidecar(
+            source, destination, bits=params["ngram_bits"], group=params["ngram_group"], progress=progress
+        )
+    else:
+        _log("no n-gram rows in this trunk: no table sidecar is written")
+        report["ngram"] = None
     body_recipe = dict(recipe)
     if qsa_8bit:
         body_recipe.setdefault("module_overrides", [])
@@ -516,20 +580,26 @@ def run_lane(
     )
     progress("convert", 0.97, "extract_mtp", False)
     report["mtp"] = write_mtp_sidecar(
-        source, destination, mtp_bits=params["mtp_bits"], mtp_group=params["mtp_group"], qsa_8bit=qsa_8bit
+        source,
+        destination,
+        mtp_bits=params["mtp_bits"],
+        mtp_group=params["mtp_group"],
+        qsa_8bit=qsa_8bit,
+        overrides=head_overrides(recipe),
     )
     config_path = destination / "config.json"
     config = _load_json(config_path)
-    config.setdefault("text_config", {})["ngram_sidecar"] = True
     extra = config.get("mlx_lm_extra_tensors") if isinstance(config.get("mlx_lm_extra_tensors"), dict) else {}
-    extra["ngram_file"] = NGRAM_FILE
+    if has_ngram:
+        config.setdefault("text_config", {})["ngram_sidecar"] = True
+        extra["ngram_file"] = NGRAM_FILE
     if report["mtp"].get("written"):
         extra["mtp_file"] = MTP_FILE
     config["mlx_lm_extra_tensors"] = extra
     config["mtplx_recipe"] = {
         "name": recipe.get("name"),
         "base": {"bits": params["body_bits"], "group_size": params["body_group"]},
-        "ngram": {"bits": params["ngram_bits"], "group_size": params["ngram_group"]},
+        "ngram": {"bits": params["ngram_bits"], "group_size": params["ngram_group"]} if has_ngram else None,
         "mtp": {"bits": params["mtp_bits"], "group_size": params["mtp_group"]},
         "qsa_8bit": qsa_8bit,
         "lane": "qwen4_exp",

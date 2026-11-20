@@ -215,13 +215,18 @@ public struct MTPLXAPIClient: Sendable {
         try await get("/v1/models")
     }
 
+    /// `rows=changed`: the server sends a snapshot's request rows (about 80%
+    /// of its bytes) only when they changed, and says `rows_unchanged`
+    /// otherwise; the store keeps the rows it holds. A server that predates
+    /// it ignores the item and sends them every time.
     public func metricsStreamURL(snapshotIntervalMs: Int? = nil) -> URL {
         var components = URLComponents(url: makeURL("/v1/mtplx/metrics/stream"), resolvingAgainstBaseURL: false)!
+        var items: [URLQueryItem] = []
         if let snapshotIntervalMs {
-            components.queryItems = [
-                URLQueryItem(name: "snapshot_interval_ms", value: String(snapshotIntervalMs))
-            ]
+            items.append(URLQueryItem(name: "snapshot_interval_ms", value: String(snapshotIntervalMs)))
         }
+        items.append(URLQueryItem(name: "rows", value: "changed"))
+        components.queryItems = items
         return components.url!
     }
 

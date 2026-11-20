@@ -1,0 +1,32 @@
+id = "code-merge-intervals"
+kind = "code"
+prompt = '''
+Write a Python function `merge_intervals(intervals)` that takes a list of `[start, end]` pairs of integers (each with start <= end, in any order) and returns a new list of merged intervals sorted by start. Intervals that overlap or touch (one ends exactly where another starts) merge into one. The input list and the pairs in it must not be modified.
+
+Examples: `merge_intervals([[5, 7], [1, 3], [2, 4]])` returns `[[1, 4], [5, 7]]`, `merge_intervals([[1, 2], [2, 3]])` returns `[[1, 3]]`, and `merge_intervals([])` returns `[]`.
+
+Reply with the complete function in one fenced Python code block.
+'''
+tests = '''
+assert merge_intervals([]) == []
+assert merge_intervals([[1, 3]]) == [[1, 3]]
+assert merge_intervals([[5, 7], [1, 3], [2, 4]]) == [[1, 4], [5, 7]]
+assert merge_intervals([[1, 2], [2, 3]]) == [[1, 3]]
+assert merge_intervals([[1, 10], [2, 3], [4, 5]]) == [[1, 10]]
+assert merge_intervals([[6, 8], [1, 2], [3, 4]]) == [[1, 2], [3, 4], [6, 8]]
+assert merge_intervals([[0, 0], [0, 0]]) == [[0, 0]]
+assert merge_intervals([[-5, -1], [-2, 2], [3, 3]]) == [[-5, 2], [3, 3]]
+data = [[3, 4], [1, 2], [2, 3]]
+merge_intervals(data)
+assert data == [[3, 4], [1, 2], [2, 3]]
+'''
+reference = '''
+def merge_intervals(intervals):
+    merged = []
+    for start, end in sorted(intervals):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return merged
+'''

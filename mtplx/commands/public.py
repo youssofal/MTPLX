@@ -180,8 +180,13 @@ QUICKSTART_TARGETS = {
     "opencode",
     "swival",
     "hermes",
+    "claude-code",
+    "codex",
+    "deepseek-harness",
     "dashboard",
 }
+# Start targets that open a coding agent from mtplx.agent_clients.
+AGENT_CLIENT_TARGETS = ("claude-code", "codex", "deepseek-harness")
 HERMES_PROFILE_NAME = "mtplx"
 HERMES_LOCAL_API_KEY = "mtplx-local"
 HERMES_CODING_TOOLSETS = ("terminal", "file", "web", "browser", "messaging")
@@ -288,6 +293,9 @@ from mtplx.launch_lane import cli_start_defaults as _cli_start_defaults
 OPENCODE_FAIR_BATCHING_DEFAULTS: dict[str, Any] = _cli_start_defaults("opencode")
 HERMES_LATENCY_DEFAULTS: dict[str, Any] = _cli_start_defaults("hermes")
 PI_LANE_DEFAULTS: dict[str, Any] = _cli_start_defaults("pi")
+AGENT_CLIENT_LANE_DEFAULTS: dict[str, dict[str, Any]] = {
+    client: _cli_start_defaults(client) for client in AGENT_CLIENT_TARGETS
+}
 _OPENCODE_HIGH_MEMORY_THRESHOLD_BYTES = 96 * 1024**3
 _OPENCODE_HIGH_MEMORY_MAX_BYTES = "24G"
 _OPENCODE_HIGH_MEMORY_PER_SESSION_BYTES = "16G"
@@ -6339,9 +6347,15 @@ def cmd_list_public(args: Any) -> int:
             search_dirs=getattr(args, "model_search_dirs", None),
         )
     ]
+    from mtplx.model_folders import folders_report
+
+    folders = folders_report(args.cache_dir, search_dirs=getattr(args, "model_search_dirs", None))
     payload = {
         "cache_dir": str(roots[0]),
         "model_roots": [str(root) for root in roots],
+        # Every folder, connected or not: a drive that is unplugged is listed
+        # as not connected instead of its packs silently disappearing.
+        "model_folders": folders,
         "models": models,
     }
     if getattr(args, "json", False):
@@ -6349,6 +6363,9 @@ def cmd_list_public(args: Any) -> int:
     else:
         print("MTPLX models")
         print(f"cache: {payload['cache_dir']}")
+        for row in folders:
+            if not row.get("available"):
+                print(_folder_line(row).strip())
         if not models:
             print("no cached models")
         for row in models:
@@ -6358,6 +6375,183 @@ def cmd_list_public(args: Any) -> int:
                 f"contract={str(bool(row.get('has_runtime_contract'))).lower()}"
             )
             print(f"  {row.get('path')}")
+    return 0
+
+
+_FOLDER_REASON_TEXT = {
+    "not_connected": "not connected",
+    "missing": "missing",
+    "not_a_folder": "not a folder",
+}
+
+
+def _folder_line(row: dict[str, Any]) -> str:
+    from mtplx.ui import pretty_path
+
+    role = "downloads" if row.get("role") == "downloads" else "search   "
+    if row.get("available"):
+        packs = int(row.get("packs") or 0)
+        state = f"{packs} pack{'s' if packs != 1 else ''}"
+    else:
+        state = _FOLDER_REASON_TEXT.get(str(row.get("reason")), str(row.get("reason")))
+        if row.get("reason") == "not_connected":
+            state += "; its packs show again when the drive is plugged in"
+    return f"  {role}  {pretty_path(str(row.get('path')))}  ({state})"
+
+
+def cmd_folders_public(args: Any) -> int:
+    """``mtplx folders``: the model folders the app and the CLI share."""
+
+    from mtplx import model_folders
+
+    action = getattr(args, "folders_action", "list") or "list"
+    paths = list(getattr(args, "paths", None) or [])
+    config_path = getattr(args, "config", None)
+    try:
+        if action == "add":
+            if not paths:
+                raise ValueError("mtplx folders add needs at least one folder")
+            change: dict[str, Any] = model_folders.add_folders(paths, config_path=config_path)
+        elif action == "remove":
+            if len(paths) != 1:
+                raise ValueError("mtplx folders remove takes one folder")
+            change = model_folders.remove_folder(paths[0], config_path=config_path)
+        elif action == "downloads":
+            if len(paths) != 1:
+                raise ValueError("mtplx folders downloads takes one folder")
+            change = model_folders.set_download_folder(paths[0], config_path=config_path)
+        else:
+            if paths:
+                raise ValueError("mtplx folders lists the folders; use add, remove or downloads")
+            change = model_folders.configured_folders(config_path)
+    except (OSError, ValueError) as exc:
+        if getattr(args, "json", False):
+            _print({"error": str(exc), "action": action})
+        else:
+            print(f"mtplx folders: {exc}", file=sys.stderr)
+        return 1
+    rows = model_folders.folders_report(
+        change.get("model_dir"), search_dirs=change.get("model_dirs")
+    )
+    payload = {"action": action, **change, "folders": rows}
+    if getattr(args, "json", False):
+        _print(payload)
+        return 0
+    if action == "add":
+        print(f"Added {len(change.get('added') or [])} folder(s).")
+    elif action == "remove":
+        print(f"Stopped searching {change.get('removed')}. Its files are untouched.")
+    elif action == "downloads":
+        print("Downloads and Forge builds go to the first folder from now on; nothing was moved.")
+    print(f"MTPLX model folders (shared with the app: {change.get('config_path')})")
+    for row in rows:
+        print(_folder_line(row))
+    return 0
+
+
+def cmd_clients_public(args: Any) -> int:
+    """``mtplx clients``: the client copies MTPLX keeps beside the user's own
+    apps (the Codex app's MTPLX copy), their size, and removing one."""
+
+    import shutil
+
+    from mtplx import agent_clients
+    from mtplx.ui import pretty_path
+
+    action = getattr(args, "clients_action", "list") or "list"
+    name = getattr(args, "name", None)
+    rows = agent_clients.client_copies()
+    as_json = bool(getattr(args, "json", False))
+
+    def fail(message: str) -> int:
+        if as_json:
+            _print({"action": action, "error": message, "clients": rows})
+        else:
+            print(f"mtplx clients: {message}", file=sys.stderr)
+        return 1
+
+    if action == "list":
+        from mtplx import client_opening
+
+        if name:
+            return fail("mtplx clients lists the copies; use `mtplx clients remove NAME`")
+        openings = client_opening.summary()
+        if as_json:
+            _print({"action": "list", "clients": rows, "openings": openings})
+            return 0
+        print("Where each client opens (the app's Settings shares these):")
+        name_width = max((len(row["name"]) for row in openings["clients"]), default=0) + 1
+        for row in openings["clients"]:
+            print(f"  {row['name']:<{name_width}} {row['opens_in']}")
+        example = openings["terminals"][-1]["name"] if openings["terminals"] else "terminal"
+        print(f"  change one: mtplx config set pi_opens_in {shlex.quote(example)}")
+        print(
+            "  terminals found: "
+            + (", ".join(t["name"] for t in openings["terminals"]) or "none")
+        )
+        print()
+        print("Client copies MTPLX keeps (your own apps are never changed):")
+        for row in rows:
+            if row["exists"]:
+                state = _format_bytes(row["bytes"])
+                if row["running_pids"]:
+                    state += ", open now (pid " + ", ".join(map(str, row["running_pids"])) + ")"
+            else:
+                state = "not created yet (made the first time it opens)"
+            print(f"  {row['name']}  {pretty_path(row['path'])}  ({state})")
+            print(f"    {row['description']}")
+            if row["exists"]:
+                print(f"    remove: mtplx clients remove {row['name']}")
+        return 0
+
+    row = next((item for item in rows if item["name"] == name), None)
+    if row is None:
+        return fail(
+            f"no client copy named {name!r}; one of: "
+            + ", ".join(item["name"] for item in rows)
+        )
+    if not row["exists"]:
+        return fail(f"{row['name']} has no folder to remove ({pretty_path(row['path'])})")
+    if row["running_pids"]:
+        return fail(
+            f"{row['name']} is open (pid {', '.join(map(str, row['running_pids']))}); "
+            "quit it, or stop the MTPLX server that opened it, then remove it"
+        )
+    # The folder must be MTPLX's own, directly under its clients folder.
+    target = Path(row["path"])
+    if target.is_symlink() or target.resolve().parent != agent_clients.clients_dir().resolve():
+        return fail(f"refusing to remove {target}: not a folder MTPLX made")
+    if not getattr(args, "yes", False):
+        if not sys.stdin.isatty():
+            return fail("removing deletes that copy's history; re-run with --yes to confirm")
+        answer = input(
+            f"Delete {pretty_path(str(target))} ({_format_bytes(row['bytes'])}), "
+            "including that copy's history? [y/N] "
+        )
+        if answer.strip().lower() not in {"y", "yes"}:
+            print("Nothing removed.")
+            return 1
+    try:
+        # The app unpacks some plugin folders read-only; make each folder
+        # writable (never following a link out of the copy) so it can go.
+        import stat
+
+        for root, dirs, _files in os.walk(target, followlinks=False):
+            for child in dirs:
+                path = os.path.join(root, child)
+                if not os.path.islink(path):
+                    os.chmod(path, stat.S_IMODE(os.lstat(path).st_mode) | stat.S_IRWXU)
+        shutil.rmtree(target)
+    except OSError as exc:
+        return fail(f"could not remove {target}: {exc}")
+    payload = {"action": "remove", "name": row["name"], "path": str(target), "bytes": row["bytes"]}
+    if as_json:
+        _print(payload)
+    else:
+        print(
+            f"Removed {pretty_path(str(target))} ({_format_bytes(row['bytes'])}). "
+            "It is made again the next time it opens."
+        )
     return 0
 
 
@@ -9799,7 +9993,7 @@ def cmd_serve_public(args: Any) -> int:
                 _quickstart_attach_client(
                     "opencode", args, health, model_id=str(model_id)
                 )
-                _quickstart_launch_opencode_now()
+                _quickstart_launch_opencode_now(model_id=str(model_id))
                 _print_serve_start_line(
                     "Use the existing server, or stop that terminal with Ctrl-C to restart."
                 )
@@ -9833,6 +10027,21 @@ def cmd_serve_public(args: Any) -> int:
                     "Use the existing server, or stop that terminal with Ctrl-C to restart."
                 )
                 return 0
+        agent_client = str(getattr(args, "quickstart_agent_client", "") or "").strip()
+        if agent_client:
+            base = _server_url(
+                str(getattr(args, "host", "127.0.0.1")),
+                int(getattr(args, "port", 8000)),
+            )
+            health = _http_json(base + "/health", timeout=1.5, api_key=api_key)
+            if health.get("ok"):
+                _open_agent_client_on_running_server(
+                    args, health, client=agent_client, api_key=api_key
+                )
+                _print_serve_start_line(
+                    "Use the existing server, or stop that terminal with Ctrl-C to restart."
+                )
+                return 0
         if bool(getattr(args, "quickstart_hermes", False)):
             base = _server_url(
                 str(getattr(args, "host", "127.0.0.1")),
@@ -9852,9 +10061,11 @@ def cmd_serve_public(args: Any) -> int:
                 if command:
                     from mtplx.pi import launch_pi_in_terminal
 
-                    result = launch_pi_in_terminal(command)
+                    result = launch_pi_in_terminal(command, client="hermes")
                     if result.get("ok"):
-                        _print_serve_start_line("Opening Hermes Agent in Terminal...")
+                        _print_serve_start_line(
+                            f"Opening Hermes Agent in {result.get('terminal') or 'Terminal'}..."
+                        )
                     else:
                         _print_serve_start_line(
                             f"Could not open Hermes automatically: {result.get('error')}"
@@ -10260,6 +10471,11 @@ def cmd_serve_public(args: Any) -> int:
         )
     if bool(getattr(args, "quickstart_opencode", False)):
         cmd.extend(["--launch-opencode", "--server-console"])
+        # Where OpenCode opens this once (`mtplx start opencode --cli|--app`).
+        if bool(getattr(args, "agent_client_cli", False)):
+            cmd.append("--agent-client-cli")
+        elif bool(getattr(args, "agent_client_app", False)):
+            cmd.append("--agent-client-app")
     if bool(getattr(args, "quickstart_swival", False)):
         cmd.append("--server-console")
     if bool(getattr(args, "quickstart_hermes", False)):
@@ -10269,6 +10485,16 @@ def cmd_serve_public(args: Any) -> int:
         ).strip()
         if hermes_launch_command:
             cmd.extend(["--hermes-launch-command", hermes_launch_command])
+    agent_client = str(getattr(args, "quickstart_agent_client", "") or "").strip()
+    if agent_client:
+        cmd.extend(["--launch-agent-client", agent_client, "--server-console"])
+        agent_workspace = str(getattr(args, "agent_client_workspace", "") or "").strip()
+        if agent_workspace:
+            cmd.extend(["--agent-client-workspace", agent_workspace])
+        if bool(getattr(args, "agent_client_cli", False)):
+            cmd.append("--agent-client-cli")
+        elif bool(getattr(args, "agent_client_app", False)):
+            cmd.append("--agent-client-app")
     if bool(getattr(args, "stock_ar", False)):
         cmd.append("--stock-ar")
     elif getattr(args, "load_mtp", True) is False:
@@ -10328,6 +10554,8 @@ def cmd_serve_public(args: Any) -> int:
         _apply_opencode_memory_env_defaults(child_env_base)
     if bool(getattr(args, "quickstart_hermes", False)):
         _apply_hermes_memory_env_defaults(child_env_base)
+    if agent_client:
+        _apply_agent_client_memory_env_defaults(child_env_base, agent_client)
     if fan_mode in {FAN_MODE_MAX, FAN_MODE_SMART}:
         child_env_base["MTPLX_FAN_MODE"] = fan_mode
     if fan_mode == FAN_MODE_MAX:
@@ -11402,6 +11630,7 @@ def _quickstart_choose_model(
     download = bool(getattr(args, "download", False))
     if (
         target == "openwebui"
+        or getattr(args, "_running_server_model", False)
         or getattr(args, "yes", False)
         or getattr(args, "prompt", None)
         or getattr(args, "dry_run", False)
@@ -11431,6 +11660,20 @@ def _quickstart_choose_model(
     return model, download
 
 
+def _unplugged_model_folders(
+    cache_dir: str | None, search_dirs: Iterable[str | Path] | None
+) -> list[str]:
+    """Model folders that live on a drive that is not plugged in."""
+
+    from mtplx.model_folders import folders_report
+
+    return [
+        str(row.get("path"))
+        for row in folders_report(cache_dir, search_dirs=search_dirs)
+        if row.get("reason") == "not_connected"
+    ]
+
+
 def _quickstart_resolve_model(
     model: str,
     *,
@@ -11457,7 +11700,6 @@ def _quickstart_resolve_model(
             "download_ref": None,
             "error": resolve_error,
         }
-
     download_ref = _quickstart_download_ref(model)
     try:
         inspection = inspect_model(download_ref).to_dict()
@@ -12794,6 +13036,8 @@ def _live_server_capabilities(
     served = health.get("execution_window")
     if isinstance(served, dict) and int(served.get("tokens") or 0) > 0:
         live["context_window"] = int(served["tokens"])
+    if health.get("anthropic_tool_search") is False:
+        live["anthropic_tool_search"] = False
     return live
 
 
@@ -13243,7 +13487,7 @@ def _quickstart_launch_pi_now(*, model_id: str) -> None:
     command = pi_launch_command(str(model_id))
     result = launch_pi_in_terminal(command, model_ref=model_ref)
     if result.get("ok"):
-        _print_serve_start_line("Opening Pi in Terminal...")
+        _print_serve_start_line(f"Opening Pi in {result.get('terminal') or 'Terminal'}...")
     else:
         _print_serve_start_line(
             f"Could not open Pi automatically: {result.get('error')}"
@@ -13485,12 +13729,12 @@ def _quickstart_attach_client(
     )
 
 
-def _quickstart_launch_opencode_now() -> None:
-    from mtplx.opencode import launch_opencode_app
+def _quickstart_launch_opencode_now(*, model_id: str) -> None:
+    from mtplx.opencode import open_opencode
 
-    result = launch_opencode_app()
+    result = open_opencode(model_id)
     if result.get("ok"):
-        _print_serve_start_line("Opening OpenCode Desktop...")
+        _print_serve_start_line(f"Opening {result.get('opened')}...")
     else:
         _print_serve_start_line(
             f"Could not open OpenCode automatically: {result.get('error')}"
@@ -13946,6 +14190,8 @@ def _quickstart_run_opencode(
         quickstart_openwebui=False,
         quickstart_pi=False,
         quickstart_opencode=True,
+        agent_client_cli=bool(getattr(args, "agent_client_cli", False)),
+        agent_client_app=bool(getattr(args, "agent_client_app", False)),
         open_browser=False,
         open_dashboard=bool(getattr(args, "open_dashboard", False)),
         enable_thermal_poll=bool(getattr(args, "enable_thermal_poll", False)),
@@ -14075,6 +14321,328 @@ def _quickstart_run_hermes(
     return cmd_serve_public(_with_server_policy_args(serve_args, args))
 
 
+def _apply_agent_client_memory_env_defaults(env: dict[str, str], client: str) -> None:
+    """Claude Code and Codex get the shared coding-agent block, as the app gives them."""
+
+    from mtplx.launch_lane import agent_env_block
+
+    for key, value in agent_env_block(
+        client, _detect_total_ram_bytes_for_opencode_defaults()
+    ).items():
+        env.setdefault(key, value)
+
+
+def _quickstart_agent_client_payload(
+    args: Any,
+    *,
+    client: str,
+    inspection: dict[str, Any] | None = None,
+    context_window: int | None = None,
+) -> dict[str, Any]:
+    """What ``mtplx start claude-code|codex`` opens, built by mtplx.agent_clients.
+
+    The window here is the pack's (or ``--context-window``); the server
+    replaces it with the window it actually serves right before the client
+    opens, as the app does.
+    """
+
+    from mtplx import agent_clients, client_opening
+
+    host = str(getattr(args, "host", "127.0.0.1"))
+    port = int(getattr(args, "port", 8000))
+    server_url = f"http://{_connect_host_for_bind(host)}:{port}"
+    model_id = _public_model_id_for_args(args, str(getattr(args, "model", "")))
+    window = context_window or _inspection_context_window(inspection, args=args)
+    plan = agent_clients.build_plan(
+        client,
+        base_url=server_url,
+        model_id=model_id,
+        context_window=window,
+        api_key=getattr(args, "api_key", None),
+    )
+    executable = agent_clients.resolve_executable(client)
+    desktop_app = _agent_client_desktop_app_for_start(args, client)
+    desktop = None
+    if desktop_app is not None:
+        if client == "deepseek-harness":
+            from mtplx import deepseek_harness
+
+            desktop_plan = deepseek_harness.build_web_plan(
+                base_url=server_url,
+                model_id=model_id,
+                port=0,  # a free port is taken when it opens
+                context_window=window,
+                api_key=getattr(args, "api_key", None),
+                vision=_model_vision_enabled(str(getattr(args, "model", "") or model_id)),
+            )
+        else:
+            desktop_plan = agent_clients.build_codex_desktop_plan(
+                app_path=desktop_app["path"],
+                base_url=server_url,
+                model_id=model_id,
+                context_window=window,
+                api_key=getattr(args, "api_key", None),
+            )
+        desktop = {
+            "app": desktop_app,
+            "argv": desktop_plan["argv"],
+            "files": sorted(desktop_plan["files"]),
+            "folder": str(agent_clients.desktop_copy_root(client)),
+            "separate_history": True,
+        }
+    terminal = client_opening.terminal_for(client, client_opening.saved_choice(client))
+    return {
+        "integration": client,
+        "display_name": agent_clients.DISPLAY_NAMES[client],
+        # What opens: MTPLX's own copy of the client's app, or the client's
+        # terminal program in the terminal chosen for it (the app's Start
+        # menu makes the same choice).
+        "surface": "desktop" if desktop is not None else "terminal",
+        "desktop": desktop,
+        "terminal": terminal.terminal_name,
+        "server_url": server_url,
+        "model_id": model_id,
+        "context_window": window,
+        "workspace": os.getcwd(),
+        "detected": {"installed": executable is not None, "path": executable},
+        "install_hint": agent_clients.INSTALL_HINTS[client],
+        "plan": {
+            **plan,
+            "files": sorted(plan["files"]),
+            "env": {
+                key: ("<api key>" if key in {"ANTHROPIC_AUTH_TOKEN", "MTPLX_API_KEY"}
+                      and value != agent_clients.LOCAL_API_KEY else value)
+                for key, value in plan["env"].items()
+            },
+        },
+        "display_command": agent_clients.display_command(plan),
+        "edits_user_config": False,
+        # The lane the server gets, in the flags it is started with: the same
+        # resolver (mtplx/launch_lane.py) the app's Start menu is tested on.
+        "server_command": (
+            f"mtplx start {client} --host {host} --port {port} "
+            f"--model {shlex.quote(str(getattr(args, 'model', DEFAULT_RUNTIME_MODEL_DIR)))} "
+            f"--profile {_resolved_default_profile_name(args)} "
+            f"{_fan_mode_command_suffix(args)}"
+            f"{'--no-mtp ' if _generation_mode_from_args(args) == GENERATION_MODE_AR else ''}"
+            f"--scheduler-mode {str(getattr(args, 'scheduler_mode', 'serial'))} "
+            f"--batching-preset {str(getattr(args, 'batching_preset', 'latency'))} "
+            f"{_batching_command_suffix(args)}"
+        ).strip(),
+    }
+
+
+def _agent_client_desktop_app_for_start(args: Any, client: str) -> dict[str, Any] | None:
+    """The app ``mtplx start codex|claude-code`` opens as MTPLX's own copy
+    (Codex by default when a supported one is installed; Claude Code when its
+    setting picks the copy), or None for the CLI in a terminal: ``--cli`` or
+    a terminal chosen in the client's setting."""
+
+    from mtplx import agent_clients, client_opening
+
+    if client not in agent_clients.AGENT_CLIENTS:
+        return None
+    return agent_clients.desktop_app_for(
+        client,
+        cli=bool(getattr(args, "agent_client_cli", False)),
+        app=bool(getattr(args, "agent_client_app", False)),
+        choice=client_opening.saved_choice(client),
+    )
+
+
+def _quickstart_require_agent_cli(args: Any, client: str) -> bool:
+    """True when the client is installed; otherwise say how to get it, load nothing."""
+
+    from mtplx import agent_clients
+
+    if _agent_client_desktop_app_for_start(args, client) is not None:
+        return True
+    if agent_clients.resolve_executable(client):
+        return True
+    if client == agent_clients.deepseek_harness.CLIENT_ID:
+        _quickstart_line("Setting up DeepSeek Harness for its first launch…")
+        try:
+            agent_clients.deepseek_harness.ensure_executable()
+        except (OSError, subprocess.SubprocessError) as exc:
+            _quickstart_line(str(exc))
+            return False
+        return True
+    name = agent_clients.DISPLAY_NAMES[client]
+    _quickstart_line()
+    _quickstart_line(f"[2/3] {name} is not installed")
+    _quickstart_line("      MTPLX has not loaded the model yet.")
+    _quickstart_line(f"      {agent_clients.INSTALL_HINTS[client]}")
+    _quickstart_line(f"      Then re-run: {_start_invocation(args, ' ' + client)}")
+    return False
+
+
+def _quickstart_run_agent_client(
+    args: Any, *, client: str, runtime_model: str, inspection: dict[str, Any]
+) -> int:
+    model_id = _quickstart_served_model_id(args, runtime_model)
+    payload = _quickstart_agent_client_payload(args, client=client, inspection=inspection)
+    if client == "deepseek-harness":
+        where = (
+            "its browser app"
+            if payload["surface"] == "desktop"
+            else payload["terminal"]
+        )
+        _quickstart_line(
+            f"[3/4] DeepSeek Harness opens in {where} once the model is ready, "
+            f"talking to {payload['server_url']} as {model_id}."
+        )
+        _quickstart_line(
+            "      It runs on MTPLX's own harness home with its telemetry, vendor session "
+            "log and feedback uploads off; your own ~/.dsh is not touched. "
+            + (
+                "It closes when this server stops. `--cli` opens it in the terminal instead."
+                if payload["surface"] == "desktop"
+                else "`--app` opens its browser app instead."
+            )
+        )
+    elif payload["surface"] == "desktop":
+        _quickstart_line(
+            "[3/4] Codex opens as MTPLX's own copy of the Codex app once the model "
+            f"is ready, talking to {payload['server_url']} as {model_id}."
+        )
+        _quickstart_line(
+            "      It is a separate copy with its own history (a second Codex icon in "
+            "the Dock); your own Codex app and ~/.codex are not touched. It closes "
+            f"when this server stops. `--cli` opens the Codex CLI in {payload['terminal']} instead."
+        )
+    else:
+        _quickstart_line(
+            f"[3/4] {payload['display_name']} opens in {payload['terminal']} once the "
+            f"model is ready, talking to {payload['server_url']} as {model_id}."
+        )
+        _quickstart_line(
+            "      Your own Claude Code and Codex settings are not edited; only that "
+            "session uses MTPLX."
+        )
+    serve_args = SimpleNamespace(
+        model=runtime_model,
+        cache_dir=getattr(args, "cache_dir", None),
+        profile=getattr(args, "profile", None) or DEFAULT_PROFILE_NAME,
+        model_id=model_id,
+        unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
+        yes=True,
+        host=str(getattr(args, "host", "127.0.0.1")),
+        port=int(getattr(args, "port", 8000)),
+        api_key=getattr(args, "api_key", None),
+        depth=int(getattr(args, "depth", 3)),
+        no_mtp=bool(getattr(args, "no_mtp", False)),
+        rate_limit=int(getattr(args, "rate_limit", 0)),
+        stream_interval=int(getattr(args, "stream_interval", 1)),
+        warmup_tokens=int(getattr(args, "warmup_tokens", 16)),
+        max_response_tokens=getattr(args, "max_response_tokens", None),
+        temperature=float(getattr(args, "temperature", 0.6)),
+        top_p=float(getattr(args, "top_p", 0.95)),
+        top_k=int(getattr(args, "top_k", 20)),
+        draft_temperature=getattr(args, "draft_temperature", None),
+        draft_top_p=getattr(args, "draft_top_p", None),
+        draft_top_k=getattr(args, "draft_top_k", None),
+        reasoning=getattr(args, "reasoning", None),
+        preserve_thinking=_preserve_thinking_policy(args),
+        reasoning_parser=getattr(args, "reasoning_parser", "qwen3"),
+        reasoning_effort=getattr(args, "reasoning_effort", None),
+        stats_footer=False,
+        strict_warmup=bool(getattr(args, "strict_warmup", False)),
+        quickstart_openwebui=False,
+        quickstart_pi=False,
+        quickstart_opencode=False,
+        quickstart_swival=False,
+        quickstart_hermes=False,
+        quickstart_agent_client=client,
+        agent_client_workspace=payload["workspace"],
+        agent_client_cli=bool(getattr(args, "agent_client_cli", False)),
+        agent_client_app=bool(getattr(args, "agent_client_app", False)),
+        open_browser=False,
+        open_dashboard=bool(getattr(args, "open_dashboard", False)),
+        enable_thermal_poll=bool(getattr(args, "enable_thermal_poll", False)),
+        fan_mode=getattr(args, "fan_mode", "default"),
+        max=bool(getattr(args, "max", False)),
+        max_idle_min=int(getattr(args, "max_idle_min", 15)),
+    )
+    return cmd_serve_public(_with_server_policy_args(serve_args, args))
+
+
+def _open_agent_client_on_running_server(
+    args: Any, health: dict[str, Any], *, client: str, api_key: str | None
+) -> None:
+    """``mtplx start claude-code|codex`` when MTPLX already answers on the port."""
+
+    from mtplx import agent_clients
+
+    base = _server_url(
+        str(getattr(args, "host", "127.0.0.1")), int(getattr(args, "port", 8000))
+    )
+    model_id = str(
+        health.get("model") or getattr(args, "model_id", None) or DEFAULT_PUBLIC_MODEL_ID
+    ).split("/", 1)[-1]
+    served = health.get("execution_window")
+    window = (
+        int(served.get("tokens") or 0) if isinstance(served, dict) else 0
+    ) or None
+    vision_block = health.get("vision")
+    vision = bool(vision_block.get("enabled")) if isinstance(vision_block, dict) else False
+    plan = agent_clients.build_plan(
+        client,
+        base_url=base,
+        model_id=model_id,
+        context_window=window,
+        api_key=api_key,
+        # An older server says nothing: it deferred on every template.
+        tool_search=health.get("anthropic_tool_search") is not False,
+        vision=vision,
+    )
+    workspace = str(getattr(args, "agent_client_workspace", "") or os.getcwd())
+    name = agent_clients.DISPLAY_NAMES[client]
+    _print_serve_start_line("MTPLX is already running.")
+    _print_serve_start_line(f"{name} model: {model_id}")
+    desktop_app = _agent_client_desktop_app_for_start(args, client)
+    if desktop_app is not None:
+        app_name = {"codex": "Codex"}.get(client, f"{name} browser")
+        opened = agent_clients.open_desktop_copy(
+            client,
+            desktop_app,
+            base_url=base,
+            model_id=model_id,
+            context_window=window,
+            api_key=api_key,
+            vision=vision,
+            workspace=workspace,
+        )
+        if opened.get("ok") and client == "deepseek-harness":
+            _print_serve_start_line(
+                f"Opened {name}'s browser app at {opened.get('url')} (pid {opened.get('pid')}), "
+                "with its telemetry, vendor session log and feedback uploads off. "
+                f"Stop it with: kill {opened.get('pid')}"
+            )
+            return
+        if opened.get("ok"):
+            _print_serve_start_line(
+                f"Opened {name} as MTPLX's own copy of the {app_name} app "
+                f"({agent_clients.desktop_copy_root(client)}); quit it when you are done."
+            )
+            return
+        _print_serve_start_line(
+            f"Could not open the {app_name} app: {opened.get('error')}; opening the {name} CLI."
+        )
+    if client == "deepseek-harness":
+        from mtplx import deepseek_harness
+
+        checked = deepseek_harness.check_composition(plan, profile=deepseek_harness.TERMINAL_PROFILE)
+        if not checked.get("ok"):
+            _print_serve_start_line(f"MTPLX did not open {name}: {checked.get('error')}")
+            return
+    result = agent_clients.open_in_terminal(plan, workspace=workspace)
+    if result.get("ok"):
+        _print_serve_start_line(f"Opening {name} in {result.get('terminal') or 'Terminal'}...")
+    else:
+        _print_serve_start_line(f"Could not open {name} automatically: {result.get('error')}")
+        _print_serve_start_line(f"Run it yourself: {agent_clients.display_command(plan)}")
+
+
 def _quickstart_print_dashboard_handoff(args: Any, *, runtime_model: str) -> None:
     from mtplx.ui import pretty_path
 
@@ -14145,6 +14713,72 @@ def _quickstart_run_dashboard(
 _QUICKSTART_SPAWNING_TARGETS = frozenset(
     {"openwebui", "pi", "opencode", "swival", "hermes", "dashboard"}
 )
+
+# Targets that hand a client to a server. OpenCode, Swival and Hermes listen
+# on their own ports (18083-18085) and the rest on 8000, while the app's
+# daemon sits on 8000 or the port it persisted, so `mtplx start opencode`
+# beside the running app loaded a second copy of the model.
+_CLIENT_SERVER_TARGETS = frozenset(
+    {"pi", "opencode", "swival", "hermes", "openwebui", "claude-code", "codex", "deepseek-harness"}
+)
+
+
+def _quickstart_use_running_server(
+    args: Any,
+    *,
+    target: str,
+    cli_flags: set[str],
+) -> None:
+    """Never load a second copy: hand the client to the MTPLX server running.
+
+    With no ``--port``, a healthy MTPLX server on any of the usual ports
+    (the app's persisted one, 8000, 18083-18085) becomes the target's port,
+    so the "MTPLX is already running" path in ``cmd_serve_public`` sets the
+    client up against it, as terminal chat does. A different model named
+    with ``--model`` is the user's call and still starts its own server.
+    Without ``--model``, the model checked is the one that server runs, so
+    the user is neither asked to pick a model nor offered a download of this
+    Mac's default that would not be used.
+    """
+
+    if target not in _CLIENT_SERVER_TARGETS or "port" in cli_flags:
+        return
+    host = str(getattr(args, "host", "127.0.0.1"))
+    own_port = int(getattr(args, "port", 8000))
+    try:
+        from mtplx.daemon_client import (
+            attach_probe_enabled,
+            default_probe_ports,
+            probe_running_daemons,
+        )
+
+        if not attach_probe_enabled():
+            return
+        ports = (own_port, *(port for port in default_probe_ports() if port != own_port))
+        daemons = probe_running_daemons(host=host, ports=ports)
+    except Exception:
+        return
+    if not daemons:
+        return
+    daemon = daemons[0]
+    explicit = bool(getattr(args, "_model_explicit", False))
+    if daemon.port != own_port:
+        if explicit and not _daemon_runs_model(daemon, str(getattr(args, "model", "") or "")):
+            return
+        _quickstart_line(
+            f"MTPLX is already running on port {daemon.port} (model: {daemon.model}, "
+            f"started by {daemon.owner_label})."
+        )
+        _quickstart_line(
+            f"Using it instead of loading a second copy of the model on port {own_port}."
+        )
+        args.port = daemon.port
+    model_path = str(daemon.model_path or "")
+    if not explicit and model_path and Path(model_path).is_dir():
+        args.model = model_path
+        args._model_explicit = True
+        args._cli_flags = set(getattr(args, "_cli_flags", set()) or set()) | {"model"}
+        args._running_server_model = True
 
 
 def _quickstart_autoselect_busy_port(
@@ -14890,7 +15524,8 @@ def cmd_quickstart_public(args: Any) -> int:
     if raw_target is None:
         raw_target = "cli" if has_prompt else "web"
     raw_target = str(raw_target).lower()
-    if raw_target in {"open-webui", "openwebui", "web"}:
+    if raw_target in {"open-webui", "openwebui", "web", "webui"}:
+        # "webui" is the app's name for this target ("Web UI").
         target = "openwebui"
     elif raw_target in {"cli", "terminal"}:
         target = "terminal"
@@ -14902,6 +15537,12 @@ def cmd_quickstart_public(args: Any) -> int:
         target = "swival"
     elif raw_target in {"hermes", "hermes-agent"}:
         target = "hermes"
+    elif raw_target in {"claude-code", "claude", "claudecode"}:
+        target = "claude-code"
+    elif raw_target in {"codex", "codex-cli"}:
+        target = "codex"
+    elif raw_target in {"deepseek-harness", "deepseek", "dsh"}:
+        target = "deepseek-harness"
     elif raw_target in {"dashboard", "live-dashboard", "live"}:
         target = "dashboard"
     else:
@@ -14923,7 +15564,10 @@ def cmd_quickstart_public(args: Any) -> int:
         _apply_hermes_latency_defaults(args)
     if target == "pi":
         _apply_pi_lane_defaults(args)
+    if target in AGENT_CLIENT_TARGETS:
+        _apply_client_lane_table(args, AGENT_CLIENT_LANE_DEFAULTS[target])
     if not getattr(args, "dry_run", False):
+        _quickstart_use_running_server(args, target=target, cli_flags=cli_flags)
         _quickstart_autoselect_busy_port(args, target=target, cli_flags=cli_flags)
     depth_error = _validate_public_depth(args, printer=_quickstart_line)
     if depth_error is not None:
@@ -14968,6 +15612,13 @@ def cmd_quickstart_public(args: Any) -> int:
             if target == "hermes"
             else None
         )
+        agent_client = (
+            _quickstart_agent_client_payload(
+                args, client=target, inspection=dry_run_inspection
+            )
+            if target in AGENT_CLIENT_TARGETS
+            else None
+        )
         payload = {
             "action": _start_command_name(args),
             "target": target,
@@ -14988,6 +15639,7 @@ def cmd_quickstart_public(args: Any) -> int:
             "opencode": opencode,
             "swival": swival,
             "hermes": hermes,
+            "agent_client": agent_client,
             # The dashboard target *always* opens the dashboard (that's what
             # it's for). Otherwise honor the explicit user/wizard choice,
             # but only for server-spawning targets — terminal/CLI has no
@@ -14996,7 +15648,8 @@ def cmd_quickstart_public(args: Any) -> int:
                 True
                 if target == "dashboard"
                 else bool(getattr(args, "open_dashboard", False))
-                and target in {"openwebui", "pi", "opencode", "swival", "hermes"}
+                and target
+                in {"openwebui", "pi", "opencode", "swival", "hermes", *AGENT_CLIENT_TARGETS}
             ),
             "enable_thermal_poll": bool(getattr(args, "enable_thermal_poll", False)),
             "stats_visible": bool(getattr(args, "show_stats", True)),
@@ -15011,6 +15664,8 @@ def cmd_quickstart_public(args: Any) -> int:
                 if target == "pi"
                 else _start_invocation(args, " hermes")
                 if target == "hermes"
+                else _start_invocation(args, f" {target}")
+                if target in AGENT_CLIENT_TARGETS
                 else _start_invocation(args, " cli")
             ),
         }
@@ -15058,6 +15713,17 @@ def cmd_quickstart_public(args: Any) -> int:
                 _quickstart_line(
                     f"then: write Hermes profile -> start local server -> run {hermes['launch_command']}"
                 )
+            elif target in AGENT_CLIENT_TARGETS and agent_client["surface"] == "desktop":
+                _quickstart_line(
+                    "then: start local server -> open the Codex app as MTPLX's own copy "
+                    f"({agent_client['desktop']['folder']}); `--cli` for the Codex CLI"
+                )
+            elif target in AGENT_CLIENT_TARGETS:
+                _quickstart_line(
+                    "then: start local server -> open "
+                    f"{agent_client['display_name']} in Terminal: "
+                    f"{agent_client['display_command']}"
+                )
             else:
                 _quickstart_line(
                     "then: load once -> chat in this terminal -> stream output -> show speed stats"
@@ -15065,6 +15731,8 @@ def cmd_quickstart_public(args: Any) -> int:
         return 0
 
     if target == "pi" and not _quickstart_require_pi_cli(args):
+        return 2
+    if target in AGENT_CLIENT_TARGETS and not _quickstart_require_agent_cli(args, target):
         return 2
 
     _quickstart_line(f"MTPLX {_start_command_name(args)}")
@@ -15076,12 +15744,35 @@ def cmd_quickstart_public(args: Any) -> int:
         )
     _quickstart_line(f"[1/4] Checking model: {model}")
     try:
+        # A pack the user keeps on a drive that is unplugged is not missing:
+        # an automatic pull would put a second copy on this Mac (#573's
+        # shape). Only an explicit --download, or a yes to the question
+        # below, downloads while a model folder is not connected.
+        unplugged = (
+            _unplugged_model_folders(cache_dir, _model_search_kwargs(args).get("search_dirs"))
+            if download and "download" not in (getattr(args, "_cli_flags", None) or set())
+            else []
+        )
         runtime_model, resolution = _quickstart_resolve_model(
             model,
             cache_dir=cache_dir,
             **_model_search_kwargs(args),
-            download=download,
+            download=download and not unplugged,
         )
+        if runtime_model is None and unplugged:
+            resolution = {
+                **resolution,
+                "error": {
+                    "error": "a model folder is on a drive that is not connected",
+                    "model": model,
+                    "not_connected": unplugged,
+                    "detail": (
+                        f"not connected: {', '.join(unplugged)}. Plug the drive in and "
+                        "run the command again; if the model is not on it, add "
+                        f"--download to put a copy in {cache_dir or 'the download folder'}."
+                    ),
+                },
+            }
     except KeyboardInterrupt:
         _quickstart_line("download cancelled")
         return 130
@@ -15121,6 +15812,11 @@ def cmd_quickstart_public(args: Any) -> int:
             except ValueError:
                 download_model = _select_default_model_or_exit().hf_model
                 label = "verified default"
+            for folder in _unplugged_model_folders(cache_dir, _model_search_kwargs(args).get("search_dirs")):
+                _quickstart_line(
+                    f"note: {folder} is on a drive that is not connected; if the model "
+                    "is there, plug the drive in instead of downloading a second copy."
+                )
             answer = (
                 input(
                     f"Model is missing. Download the {label} ({download_model}) now? [Y/n] "
@@ -15228,6 +15924,11 @@ def cmd_quickstart_public(args: Any) -> int:
                 return _quickstart_run_hermes(
                     args, runtime_model=runtime_model, inspection=inspection
                 )
+            if target in AGENT_CLIENT_TARGETS:
+                args.model = runtime_model
+                return _quickstart_run_agent_client(
+                    args, client=target, runtime_model=runtime_model, inspection=inspection
+                )
             if target == "dashboard":
                 args.model = runtime_model
                 return _quickstart_run_dashboard(
@@ -15309,6 +16010,11 @@ def cmd_quickstart_public(args: Any) -> int:
         return _quickstart_run_hermes(
             args, runtime_model=runtime_model, inspection=inspection
         )
+    if target in AGENT_CLIENT_TARGETS:
+        args.model = runtime_model
+        return _quickstart_run_agent_client(
+            args, client=target, runtime_model=runtime_model, inspection=inspection
+        )
     if target == "dashboard":
         args.model = runtime_model
         return _quickstart_run_dashboard(
@@ -15373,11 +16079,214 @@ def cmd_metrics_public(args: Any) -> int:
     return 0 if row.get("ok") else 1
 
 
+def _connect_codex_desktop(
+    args: Any,
+    *,
+    server_url: str,
+    model_id: str,
+    context_window: int | None,
+    live: dict[str, Any],
+) -> int:
+    """``mtplx connect codex --desktop``: the Codex desktop app, MTPLX's instance."""
+
+    from mtplx import agent_clients
+
+    app = agent_clients.find_codex_desktop_app()
+    payload: dict[str, Any] = {
+        "integration": "codex",
+        "surface": "desktop",
+        "base_url": server_url,
+        "model_id": model_id,
+        "context_window": context_window,
+        "live_server": live or None,
+        "app": app,
+        "codex_home": str(agent_clients.codex_desktop_home()),
+        "user_data": str(agent_clients.codex_desktop_user_data()),
+        "edits_user_config": False,
+    }
+    if not app or not app.get("supported"):
+        minimum = ".".join(str(part) for part in agent_clients.CODEX_DESKTOP_MIN_VERSION)
+        payload["error"] = (
+            f"the Codex desktop app {app['version']} is older than {minimum}, which "
+            "MTPLX can open as its own instance; update it, or use `mtplx connect codex`"
+            if app
+            else "the Codex desktop app is not installed; `mtplx connect codex` "
+            "prints the Codex CLI setup"
+        )
+        if getattr(args, "json", False):
+            _print(payload)
+        else:
+            print(f"mtplx connect codex --desktop: {payload['error']}", file=sys.stderr)
+        return 1
+    result = agent_clients.open_codex_desktop(
+        base_url=server_url,
+        model_id=model_id,
+        context_window=context_window,
+        api_key=os.environ.get(args.api_key_env) or None,
+        app=app,
+    )
+    payload["opened"] = bool(result.get("ok"))
+    payload["pid"] = result.get("pid")
+    payload["closed_previous"] = result.get("closed_previous") or []
+    if not result.get("ok"):
+        payload["error"] = result.get("error")
+    if getattr(args, "json", False):
+        _print(payload)
+    elif result.get("ok"):
+        print(f"Opened the Codex desktop app as MTPLX's own instance ({app['version']}).")
+        print(f"  model {model_id} at {server_url}/v1")
+        print(f"  its folders: {payload['codex_home']} and {payload['user_data']}")
+        if payload["closed_previous"]:
+            print("  The copy MTPLX had open was closed first, so this one uses these settings.")
+        print("  It is a separate copy with its own history; quit it like any app.")
+        print("  Your own Codex app, ~/.codex and its history are not touched.")
+    else:
+        print(f"mtplx connect codex --desktop: {result.get('error')}", file=sys.stderr)
+    return 0 if result.get("ok") else 1
+
+
+def _connect_deepseek_harness(
+    args: Any, *, server_url: str, model_id: str, context_window: int | None, live: dict[str, Any]
+) -> int:
+    """``mtplx connect deepseek-harness``: DeepSeek Harness on this server.
+
+    Writes MTPLX's own harness profile (``~/.mtplx/clients/deepseek-harness``;
+    the user's own ``~/.dsh`` is never read or written), checks the tree the
+    installed harness composes with it (nothing that reports to the vendor
+    may be on), and with ``--open`` opens it: its browser app (``--desktop``)
+    or the same browser app started from the chosen terminal so its log shows
+    there (``--cli``; 0.1.2 has no terminal interface), else where
+    ``deepseek_harness_opens_in`` says. The MTPLX app's Start menu opens it
+    through this command.
+    """
+
+    from mtplx import agent_clients, client_opening, deepseek_harness
+
+    api_key = os.environ.get(args.api_key_env) or None
+    vision = (
+        bool(live["vision"])
+        if "vision" in live
+        else _model_vision_enabled(str(getattr(args, "model", "") or model_id))
+    )
+    workspace = str(getattr(args, "workspace", None) or os.getcwd())
+    executable = deepseek_harness.resolve_executable()
+    setup_error = None
+    if not executable and getattr(args, "open", False):
+        try:
+            executable = deepseek_harness.ensure_executable()
+        except (OSError, subprocess.SubprocessError) as exc:
+            setup_error = f"Could not install DeepSeek Harness: {exc}"
+    choice = client_opening.saved_choice(deepseek_harness.CLIENT_ID)
+    wants_app = bool(getattr(args, "desktop", False))
+    wants_cli = bool(getattr(args, "cli", False))
+    if wants_app:
+        surface = "web"
+    elif wants_cli:
+        surface = "terminal"
+    else:
+        opening = client_opening.resolve(deepseek_harness.CLIENT_ID, choice, [])
+        surface = "web" if opening.surface == client_opening.OWN_APP else "terminal"
+    terminal_plan = agent_clients.build_plan(
+        deepseek_harness.CLIENT_ID,
+        base_url=server_url,
+        model_id=model_id,
+        context_window=context_window,
+        api_key=api_key,
+        vision=vision,
+    )
+    payload: dict[str, Any] = {
+        "integration": deepseek_harness.CLIENT_ID,
+        "base_url": server_url,
+        "model_id": model_id,
+        "context_window": context_window,
+        "vision": vision,
+        "live_server": live or None,
+        "surface": surface,
+        "detected": {"installed": executable is not None, "path": executable},
+        "install_hint": deepseek_harness.INSTALL_HINT,
+        "home": str(deepseek_harness.home_dir()),
+        "profile_overlay": str(deepseek_harness.overlay_path()),
+        "telemetry_env": dict(deepseek_harness.TELEMETRY_ENV),
+        "rows_switched_off": dict(deepseek_harness.OFF_ROWS),
+        "edits_user_config": False,
+        "shell": agent_clients.display_command(terminal_plan),
+        "server_command": f"mtplx start deepseek-harness --host {args.host} --port {args.port}",
+    }
+    if not executable:
+        payload["error"] = setup_error or deepseek_harness.INSTALL_HINT
+        payload["opened"] = False
+    elif getattr(args, "open", False) and surface == "web":
+        # Checks the composed tree itself before it starts anything.
+        result = agent_clients.open_desktop_copy(
+            deepseek_harness.CLIENT_ID,
+            {"kind": "web", "path": executable},
+            base_url=server_url,
+            model_id=model_id,
+            context_window=context_window,
+            api_key=api_key,
+            vision=vision,
+            workspace=workspace,
+        )
+        payload["audit"] = result.get("audit")
+        payload["opened"] = bool(result.get("ok"))
+        for key in ("pid", "url", "port", "log", "error"):
+            if result.get(key) is not None:
+                payload[key] = result[key]
+    else:
+        profile = deepseek_harness.WEB_PROFILE if surface == "web" else deepseek_harness.TERMINAL_PROFILE
+        audit = deepseek_harness.check_composition(terminal_plan, profile=profile, executable=executable)
+        payload["audit"] = audit
+        if not audit.get("ok"):
+            payload["error"] = audit.get("error")
+            payload["opened"] = False
+        elif getattr(args, "open", False):
+            result = agent_clients.open_in_terminal(terminal_plan, workspace=workspace)
+            payload["opened"] = bool(result.get("ok"))
+            for key in ("terminal", "note", "error"):
+                if result.get(key) is not None:
+                    payload[key] = result[key]
+    if getattr(args, "json", False):
+        _print(payload)
+    elif payload.get("error"):
+        print(f"mtplx connect deepseek-harness: {payload['error']}", file=sys.stderr)
+    else:
+        print(f"DeepSeek Harness on {server_url} as {model_id}")
+        print(f"  its MTPLX home: {payload['home']} (your own ~/.dsh is not touched)")
+        print("  telemetry, the vendor session log and feedback uploads are off")
+        if payload.get("opened") and surface == "web":
+            print(f"  opened its browser app at {payload.get('url')} (pid {payload.get('pid')})")
+        elif payload.get("opened"):
+            print(f"  opened it in {payload.get('terminal') or 'Terminal'}")
+        else:
+            print(f"  run it yourself: {payload['shell']}")
+            print(f"  or let MTPLX open it: {payload['server_command']}")
+    return 0 if not payload.get("error") else 1
+
+
 def cmd_integrate_public(args: Any) -> int:
     action = args.integration
     server_url = f"http://{args.host}:{args.port}"
     api_base_url = server_url.rstrip("/") + "/v1"
     model_id = getattr(args, "model_id", None) or DEFAULT_PUBLIC_MODEL_ID
+    if action in {"deepseek-harness", "dsh"}:
+        cli_flags = getattr(args, "_cli_flags", set()) or set()
+        live = _live_server_capabilities(
+            str(args.host), int(args.port), api_key=os.environ.get(args.api_key_env)
+        )
+        if live.get("model_id") and "model-id" not in cli_flags:
+            model_id = str(live["model_id"])
+        context_window = (
+            int(args.context_window)
+            if "context-window" in cli_flags
+            else live.get("context_window")
+        )
+        return _connect_deepseek_harness(
+            args,
+            server_url=server_url,
+            model_id=model_id,
+            context_window=context_window,
+            live=live,
+        )
     if action == "openwebui":
         docker_command = _openwebui_docker_command(
             mtplx_port=int(args.port),
@@ -15419,32 +16328,101 @@ def cmd_integrate_public(args: Any) -> int:
                 "Keep --no-stats-footer enabled for UI clients.",
             ],
         }
-    elif action == "claude-code":
+    elif action in {"claude-code", "codex"}:
+        from mtplx import agent_clients
+
+        # The daemon on this port names the model and the window it serves;
+        # a typed --model-id or --context-window wins, and with no daemon the
+        # window stays unset rather than a guess (a 262,144 claim on a Mac that
+        # serves 65,536 would make the client overflow it).
+        cli_flags = getattr(args, "_cli_flags", set()) or set()
+        live = _live_server_capabilities(
+            str(args.host), int(args.port), api_key=os.environ.get(args.api_key_env)
+        )
+        if live.get("model_id") and "model-id" not in cli_flags:
+            model_id = str(live["model_id"])
+        context_window = (
+            int(args.context_window)
+            if "context-window" in cli_flags
+            else live.get("context_window")
+        )
+        if action == "codex" and getattr(args, "desktop", False):
+            return _connect_codex_desktop(
+                args,
+                server_url=server_url,
+                model_id=model_id,
+                context_window=context_window,
+                live=live,
+            )
+        if action == "claude-code" and getattr(args, "desktop", False):
+            print(
+                "mtplx connect claude-code --desktop: Claude Code opens in a terminal; "
+                "MTPLX opens no copy of the Claude app",
+                file=sys.stderr,
+            )
+            return 2
+        # The credential is the server's key from the named variable, else
+        # MTPLX's local placeholder: Claude Code must always carry a gateway
+        # credential or it sends the user's claude.ai login to this server.
+        plan = agent_clients.build_plan(
+            action,
+            base_url=server_url,
+            model_id=model_id,
+            context_window=context_window,
+            api_key=os.environ.get(args.api_key_env) or None,
+            tool_search=live.get("anthropic_tool_search", True),
+        )
+        # Claude Code reads its MTPLX settings from a file MTPLX owns
+        # (~/.mtplx/clients/claude-code/settings.json, 0600), never from the
+        # user's own settings; Codex needs no file.
+        written = agent_clients.write_plan_files(plan)
+        masked_env = {
+            key: (
+                "<api key>"
+                if key in {"ANTHROPIC_AUTH_TOKEN", agent_clients.CODEX_API_KEY_ENV}
+                and value != agent_clients.LOCAL_API_KEY
+                else value
+            )
+            for key, value in plan["env"].items()
+        }
         payload = {
-            "integration": "claude-code",
+            "integration": action,
             "base_url": server_url,
+            "api_base_url": api_base_url,
             "model_id": model_id,
-            "environment": {
-                "ANTHROPIC_BASE_URL": server_url,
-                "ANTHROPIC_AUTH_TOKEN": f"${args.api_key_env}",
-                "ANTHROPIC_API_KEY": "",
-                "ANTHROPIC_MODEL": model_id,
-                "ANTHROPIC_DEFAULT_OPUS_MODEL": model_id,
-                "ANTHROPIC_DEFAULT_SONNET_MODEL": model_id,
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL": model_id,
-                "CLAUDE_CODE_SUBAGENT_MODEL": model_id,
-                "API_TIMEOUT_MS": "3000000",
-                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-            },
+            "context_window": context_window,
+            "live_server": live or None,
+            "environment": masked_env,
+            "unset_environment": list(plan["unset_env"]),
+            "command": plan["argv"],
+            "files_written": written,
+            "shell": agent_clients.display_command(plan),
+            "edits_user_config": False,
             "server_command": (
-                f"mtplx quickstart --profile {_resolved_default_profile_name(args)} --host {args.host} --port {args.port} "
-                "--no-stats-footer"
+                f"mtplx start {action} --host {args.host} --port {args.port}"
             ),
-            "smoke": {
+            "notes": [
+                "Nothing in your own Claude Code or Codex configuration is edited; "
+                "only the session started with these settings talks to MTPLX.",
+                "mtplx start "
+                + action
+                + " starts the server and opens this client in Terminal for you.",
+            ],
+        }
+        if action == "claude-code":
+            payload["smoke"] = {
                 "root_probe": f"curl {server_url}/",
                 "messages": f"curl {server_url}/v1/messages",
-            },
-        }
+            }
+            payload["notes"].append(
+                "--settings points at MTPLX's own file, so a gateway set in "
+                "~/.claude/settings.json cannot take this session elsewhere."
+            )
+        else:
+            payload["notes"].append(
+                "web_search is off for this session: the local server cannot run "
+                "Codex's hosted search tool."
+            )
     elif action == "opencode":
         from mtplx.opencode import (
             OPENCODE_DEFAULT_CONTEXT_WINDOW,
@@ -15613,10 +16591,14 @@ def cmd_integrate_public(args: Any) -> int:
             print("Swival:")
             print(f"  {payload.get('launch_command')}")
         else:
-            env = payload.get("environment") or {}
-            print("Claude Code environment:")
-            for key, value in env.items():
-                print(f"  {key}={value}")
+            name = "Claude Code" if action == "claude-code" else "Codex"
+            window = payload.get("context_window")
+            print(f"window: {window:,} tokens" if window else "window: start the server first to read it")
+            print(f"{name} (your own {name} settings are not edited):")
+            print(f"  {payload['shell']}")
+            for path in payload.get("files_written") or ():
+                print(f"  MTPLX settings for this session: {path}")
+            print(f"  Or let MTPLX open it for you: {payload['server_command']}")
         smoke = payload.get("smoke_result")
         if isinstance(smoke, dict):
             health = (
@@ -16425,6 +17407,13 @@ def cmd_config_public(args: Any) -> int:
             raise SystemExit(f"{key} must be a number, got {value!r}") from None
     if key in {"experimental_mtp_cohorts", "ram_session_block_prefix_restore"}:
         value = _parse_config_bool(value, key=key)
+    from mtplx import client_opening
+
+    if key in client_opening.CONFIG_KEYS:
+        try:
+            value = client_opening.validate_choice(client_opening.CONFIG_KEYS[key], value)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from None
     values[key] = value
     if not getattr(args, "dry_run", False):
         path.parent.mkdir(parents=True, exist_ok=True)

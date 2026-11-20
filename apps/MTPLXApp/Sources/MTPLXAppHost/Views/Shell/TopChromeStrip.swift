@@ -8,7 +8,7 @@ import MTPLXAppCore
 //
 //   [ WordmarkView(20) ]  [ ● Running ]  [ model name ]
 //                                                       Spacer
-//   [ Refresh ]  [ InferenceParams ]  [ LaunchButton ]
+//   [ Refresh ]  [ Settings ]  [ Model controls ]  [ LaunchButton ]
 //
 // The previous design had two competing status badges (a "RUNNING"
 // text pill and a separate green "live" dot). The pulse + label are
@@ -89,6 +89,9 @@ struct TopChromeStrip: View {
                 RefreshButton {
                     Task { await backend.refresh() }
                 }
+                // Left of the quick-settings puck so that puck, and the
+                // popover anchored under it, keep their place.
+                SettingsGearButton()
                 InferenceParamsButton(
                     performanceLock: configuration.performanceLock
                 )

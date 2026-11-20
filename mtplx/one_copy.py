@@ -311,6 +311,8 @@ def prompt_lease_fields(
     prompt_len: int,
     boundaries: Any,
     runtime: Any = None,
+    resumed_at: int = 0,
+    lease_point: tuple | None = None,
 ) -> dict[str, Any]:
     """``SessionBank.put`` arguments that bank a finished prompt as a lease.
 
@@ -324,6 +326,16 @@ def prompt_lease_fields(
     live recurrent buffers the verifier writes in place. Its size is recorded
     on ``runtime`` (``anchor_nbytes``): it is what the server's admission
     charges for publishing a prompt.
+
+    The lease also keeps a checkpoint where the prompt's prefill resumed the
+    stored conversation (``resumed_at``), for the client that cancels the
+    answer and sends another message in its place: that prompt leaves this
+    one where the last turn ended, below the anchor. ``lease_point`` is that
+    checkpoint when the restore took the conversation's only copy at its end,
+    where no checkpoint is stored (``LeaseReturn.anchor``). Without it the
+    next turn resumed at whatever older checkpoint the budget had kept, or
+    read the conversation back from SSD beside this lease (12 November: 1.83
+    s to first text and two copies for a moment, at 118K tokens).
     """
 
     import mlx.core as mx
@@ -347,25 +359,66 @@ def prompt_lease_fields(
         record for record in (boundaries or ())
         if int(record[0]) != prompt_len
     ]
+    if lease_point is not None:
+        kept.append(lease_point)
     return {
         "keep_live_ref": True,
         "mtp_history_snapshot": None,
         "mtp_history_cache_ref": committed_mtp_cache,
         "gdn_boundaries": [*kept, (prompt_len, snapshot, hidden)],
+        "resumed_at": int(resumed_at),
     }
 
 
 def anchor_nbytes(rt: Any) -> int | None:
-    """Bytes one prompt anchor holds on this runtime, once one was taken.
+    """Bytes one prompt anchor holds on this runtime, once one was measured.
 
     The recurrent state is fixed-size (115,642,384 bytes on Flash-Next), so
-    the first prompt lease measures it for every later admission. None before
-    that: the admission then prices the publication as the copy it used to
-    be, which only ever over-charges.
+    the first prefill measures it for every later admission (``note_anchor``;
+    a prompt lease measures it too). None before that: the admission then
+    prices the publication as the copy it used to be, which only ever
+    over-charges.
     """
 
     value = getattr(rt, "one_copy_anchor_nbytes", None)
     return int(value) if isinstance(value, int) and value > 0 else None
+
+
+def note_anchor(rt: Any, cache: Any) -> None:
+    """Measure, without taking one, what a prompt anchor of ``cache`` holds.
+
+    An anchor is a copy of the cache's recurrent (untrimmable) state, so its
+    size is the sum of those leaves' sizes, read from their shapes. Until a
+    prompt lease measured it, the admission priced a publication at the
+    whole conversation: the first long prompt of every process was charged a
+    second copy of its state (6.3 GB at 194K tokens, 2026-11-12 n4a2) that
+    the one-copy store never makes, which shed other sessions' banks to make
+    room and put a cold prompt near the full window over the engine's limit.
+    Every prefill measures it here, the server's boot warmup first.
+    """
+
+    if rt is None or anchor_nbytes(rt) is not None:
+        return
+    from .cache_state import _is_trimmable
+
+    import mlx.core as mx
+
+    def leaves(value: Any):
+        if isinstance(value, mx.array):
+            yield value
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                yield from leaves(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                yield from leaves(item)
+
+    total = 0
+    for entry in cache or ():
+        if _is_trimmable(entry):
+            continue
+        total += sum(int(leaf.nbytes) for leaf in leaves(getattr(entry, "state", None)))
+    _record_anchor_nbytes(rt, total)
 
 
 def prefill_slack_rows(rt: Any, prompt_tokens: int, max_tokens: int) -> int:

@@ -29,6 +29,14 @@ from typing import Any, Callable
 THERMAL_PRESSURE_LEVELS = ("nominal", "moderate", "heavy", "trapping", "sleeping")
 UNAVAILABLE = "unavailable"
 DEFAULT_INTERVAL_S = 2.0
+# Heavy pressure and worse are where macOS cuts the GPU clock (on an M5 Max
+# from about 1,450 to 700 MHz after a few minutes of decode), so a speed read
+# there is a throttled one. The app names the same three levels.
+THROTTLING_LEVELS = frozenset(THERMAL_PRESSURE_LEVELS[2:])
+
+
+def is_throttling(level: str | None) -> bool:
+    return level in THROTTLING_LEVELS
 
 
 def level_name(level: int) -> str:
@@ -223,18 +231,37 @@ def current_level() -> str:
     return UNAVAILABLE if sampler is None else sampler.current()
 
 
-def receipt_fields(request_started_s: Any) -> dict[str, str]:
-    """``thermal_pressure`` at completion and ``thermal_pressure_max`` since
-    the request arrived (``request_received_monotonic_s``, perf_counter)."""
+def _seconds(value: Any) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def prefill_level(request_started_s: Any, ttft_s: Any) -> str:
+    """The worst level while a request's prompt was read: from its arrival
+    (``request_received_monotonic_s``, perf_counter) to its first token."""
+
+    sampler = _process_sampler
+    since, ttft = _seconds(request_started_s), _seconds(ttft_s)
+    if sampler is None or since is None or ttft is None or ttft < 0:
+        return UNAVAILABLE
+    return sampler.worst_since(since, since + ttft)
+
+
+def receipt_fields(request_started_s: Any, ttft_s: Any = None) -> dict[str, str]:
+    """``thermal_pressure`` at completion, ``thermal_pressure_max`` since the
+    request arrived (``request_received_monotonic_s``, perf_counter), and
+    ``thermal_pressure_prefill_max`` while its prompt was read, when the
+    request reached a first token."""
 
     sampler = _process_sampler
     if sampler is None:
         return {"thermal_pressure": UNAVAILABLE, "thermal_pressure_max": UNAVAILABLE}
-    try:
-        since = float(request_started_s) if request_started_s is not None else None
-    except (TypeError, ValueError):
-        since = None
-    return {
+    fields = {
         "thermal_pressure": sampler.current(),
-        "thermal_pressure_max": sampler.worst_since(since),
+        "thermal_pressure_max": sampler.worst_since(_seconds(request_started_s)),
     }
+    if _seconds(ttft_s) is not None:
+        fields["thermal_pressure_prefill_max"] = prefill_level(request_started_s, ttft_s)
+    return fields

@@ -53,9 +53,12 @@ def build_mrope_positions(
     layout disagrees with the grids — never a wrong table.
     """
 
-    ids = list(int(t) for t in input_ids)
+    # The list's own scans (count, index, slices) do the per-id work: a
+    # Python step per id cost 20 ms a call on a 150K-token prompt, and every
+    # image request builds this table more than once.
+    ids = input_ids if type(input_ids) is list else list(map(int, input_ids))
     n = len(ids)
-    if video_token_id is not None and any(t == int(video_token_id) for t in ids):
+    if video_token_id is not None and ids.count(int(video_token_id)):
         return None
 
     merge = max(1, int(spatial_merge_size))
@@ -72,7 +75,7 @@ def build_mrope_positions(
         llm_h = int(h) // merge
         llm_w = int(w) // merge
         block = llm_t * llm_h * llm_w
-        if ed + block > n or any(x != pad_id for x in ids[ed : ed + block]):
+        if ed + block > n or ids[ed : ed + block] != [pad_id] * block:
             return None
 
         text_len = ed - st
@@ -90,7 +93,7 @@ def build_mrope_positions(
         next_pos += max(llm_t, llm_h, llm_w)
         st = ed + block
 
-    if any(x == pad_id for x in ids[st:]):
+    if pad_id in ids[st:]:
         # More pads than grids: layout mismatch, refuse rather than mis-rope.
         return None
     tail = n - st

@@ -1,0 +1,45 @@
+id = "code-to-roman"
+kind = "code"
+prompt = '''
+Write a Python function `to_roman(number)` that returns the Roman numeral for an integer from 1 to 3999 in standard subtractive notation (4 is `IV`, 9 is `IX`, 40 is `XL`, 90 is `XC`, 400 is `CD`, 900 is `CM`).
+
+Raise `ValueError` for an integer outside 1 to 3999, and `TypeError` for anything that is not an `int`. A `bool` does not count as an `int` here.
+
+Reply with the complete function in one fenced Python code block.
+'''
+tests = '''
+cases = {1: "I", 3: "III", 4: "IV", 9: "IX", 14: "XIV", 40: "XL", 90: "XC", 400: "CD",
+         944: "CMXLIV", 1994: "MCMXCIV", 2024: "MMXXIV", 3888: "MMMDCCCLXXXVIII", 3999: "MMMCMXCIX"}
+for number, numeral in cases.items():
+    assert to_roman(number) == numeral, (number, to_roman(number))
+for bad in [0, -1, 4000, 10**6]:
+    try:
+        to_roman(bad)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(f"accepted {bad!r}")
+for bad in [3.0, "5", None, True, False]:
+    try:
+        to_roman(bad)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError(f"accepted {bad!r}")
+'''
+reference = '''
+_SYMBOLS = [(1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"),
+            (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")]
+
+
+def to_roman(number):
+    if isinstance(number, bool) or not isinstance(number, int):
+        raise TypeError("to_roman needs an int")
+    if not 1 <= number <= 3999:
+        raise ValueError("to_roman covers 1 to 3999")
+    parts = []
+    for value, symbol in _SYMBOLS:
+        count, number = divmod(number, value)
+        parts.append(symbol * count)
+    return "".join(parts)
+'''

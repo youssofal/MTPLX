@@ -704,11 +704,16 @@ def run_kernel_selfcheck(
     *,
     prism_ternary: bool = False,
     flash_next: bool = False,
+    matmul_layout: str = "affine",
 ) -> dict[str, Any]:
     """Probe every turbo lane that can engage for this model configuration.
 
     ``prism_ternary`` adds the two Ternary Bonsai kernel lanes (a Prism load),
     ``flash_next`` the four Flash-Next prefill kernel lanes (a qwen4_exp load).
+    ``matmul_layout`` is the quantized weights' layout: the fast matmul lanes
+    read affine weights (scales and biases) only, so for any other layout
+    (mxfp8, mxfp4, nvfp4) they stay off without a probe, under one log line
+    that names the layout (#677: four "raised" lines read like a kernel bug).
 
     Returns ``{"lanes": {lane: status}, "dmax": {lane: float}, ...}`` and
     updates the process-wide disable registry: lanes reported ``fallback``
@@ -751,7 +756,16 @@ def run_kernel_selfcheck(
             lanes[lane] = _STATUS_FALLBACK
 
     nax_on = _env_on("MTPLX_NAX_VERIFY")
-    if nax_on and bits == 4:
+    qmm_lanes = ("qmm_m4", "qmm_m4_wide", "qmm_m6", "qmm_m6_wide", "qmm_m16_nax")
+    if nax_on and matmul_layout != "affine":
+        logger.warning(
+            "[mtplx] kernel selfcheck: the fast matmul kernels do not support "
+            "this pack's %s weight layout; matmuls use the stock kernels",
+            matmul_layout,
+        )
+        for lane in qmm_lanes:
+            lanes[lane] = _STATUS_FALLBACK
+    elif nax_on and bits == 4:
         # 4-bit routes (nax_verify.patched): m4 -> env-selected impl (turbo
         # ships vk_k split-K), m5..6 -> legacy m6 ksplit, m7..16 -> NAX tile.
         _record(
@@ -886,7 +900,7 @@ def run_kernel_selfcheck(
         lanes["qmm_m6_wide"] = _STATUS_SKIPPED
         lanes["qmm_m16_nax"] = _STATUS_SKIPPED  # 4-bit-only tile
     else:
-        for lane in ("qmm_m4", "qmm_m4_wide", "qmm_m6", "qmm_m6_wide", "qmm_m16_nax"):
+        for lane in qmm_lanes:
             lanes[lane] = _STATUS_SKIPPED
 
     # lm_head_topk kernels exist but are not routed on the serve path.
@@ -1063,10 +1077,7 @@ def run_kernel_selfcheck(
     return report
 
 
-def _model_quant_signature(model: Any):
-    """(dtype, bits, group_size) of the first quantized trunk projection."""
-    import mlx.core as mx
-
+def _first_quantized_trunk_projection(model: Any) -> Any | None:
     text_model = getattr(model, "language_model", model)
     inner = getattr(text_model, "model", text_model)
     for layer in getattr(inner, "layers", []) or []:
@@ -1080,18 +1091,45 @@ def _model_quant_signature(model: Any):
                 node = getattr(node, name, None)
                 if node is None:
                     break
-            bits = getattr(node, "bits", None)
-            if bits is None:
-                continue
-            group_size = int(getattr(node, "group_size", 64) or 64)
-            scales = None
-            try:
-                scales = node["scales"]
-            except Exception:
-                scales = getattr(node, "scales", None)
-            dtype = getattr(scales, "dtype", None) or mx.bfloat16
-            return dtype, int(bits), group_size
+            if getattr(node, "bits", None) is not None:
+                return node
     return None
+
+
+def _node_array(node: Any, name: str) -> Any:
+    try:
+        return node[name]
+    except Exception:
+        return getattr(node, name, None)
+
+
+def _model_quant_signature(model: Any):
+    """(dtype, bits, group_size) of the first quantized trunk projection.
+
+    ``dtype`` is the compute dtype the probe fixtures are built in: an affine
+    layer's scales carry it. A layout whose scales are not floating point
+    (mxfp8 keeps E8M0 exponents as uint8) computes in bfloat16; a uint8
+    fixture made every probe fail before reaching a kernel (#677).
+    """
+    import mlx.core as mx
+
+    node = _first_quantized_trunk_projection(model)
+    if node is None:
+        return None
+    group_size = int(getattr(node, "group_size", 64) or 64)
+    dtype = getattr(_node_array(node, "scales"), "dtype", None)
+    if dtype is None or not mx.issubdtype(dtype, mx.floating):
+        dtype = mx.bfloat16
+    return dtype, int(node.bits), group_size
+
+
+def _model_matmul_layout(model: Any) -> str:
+    """The quantized trunk's weight layout: the layer's own quantization mode
+    (MLX's "affine", "mxfp8", "mxfp4", "nvfp4"); a layer that declares none
+    (an older MLX, a custom layer) is taken as affine, as before."""
+    node = _first_quantized_trunk_projection(model)
+    mode = str(getattr(node, "mode", "") or "").strip().lower() if node is not None else ""
+    return mode or "affine"
 
 
 def _prism_ternary_model(model: Any) -> bool:
@@ -1144,6 +1182,7 @@ def maybe_run_model_selfcheck(model: Any) -> dict[str, Any] | None:
             group_size,
             prism_ternary=prism_ternary,
             flash_next=flash_next,
+            matmul_layout=_model_matmul_layout(model),
         )
         fallbacks = sorted(
             lane for lane, status in report["lanes"].items() if status == _STATUS_FALLBACK

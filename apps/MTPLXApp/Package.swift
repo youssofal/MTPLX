@@ -31,7 +31,8 @@ let package = Package(
                 .product(name: "Sparkle", package: "Sparkle"),
             ],
             path: "Sources/MTPLXAppHost",
-            exclude: ["Resources"]
+            exclude: ["Resources/Wordmark"],
+            resources: [.process("Resources/Brands")]
         ),
         .testTarget(
             name: "MTPLXAppCoreTests",

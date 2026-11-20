@@ -571,6 +571,25 @@ def _install_architectures_declared_module_alias(config: dict[str, Any]) -> bool
             target,
         )
         return True
+    # Neither its model_type nor its architectures name a class of ours. Its
+    # contents can: a hybrid trunk whose every key the module reads.
+    from .backends import signature as _signature
+
+    signed = _signature.renamed_plain_trunk(config)
+    if signed is not None:
+        try:
+            module = importlib.import_module(f"mlx_lm.models.{signed}")
+        except ImportError:
+            return False
+        sys.modules[alias_name] = module
+        logger.warning(
+            "[model-signature] model_type %r is not one this build knows; its "
+            "config has the blocks of mlx_lm.models.%s and every key in it is "
+            "read, so it loads through that module",
+            model_type,
+            signed,
+        )
+        return True
     return False
 
 

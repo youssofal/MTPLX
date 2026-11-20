@@ -151,8 +151,10 @@ struct ForgeStageShell<Content: View, Footer: View>: View {
 
     var body: some View {
         // Layout invariants:
-        //   • The progress capsule is anchored OUTSIDE the ScrollView
-        //     so it never gets clipped by tight viewports.
+        //   • Where you are in the build (step name, count, bar) sits at
+        //     the top of the card you are working in. It used to sit at
+        //     the window's foot, where it read as detached from the step
+        //     and sat behind the "Expand chat" handle.
         //   • The card lives inside a centering ScrollView. When the
         //     viewport is tall enough the spacers expand and the card
         //     is vertically centered; when it isn't, the ScrollView
@@ -162,32 +164,32 @@ struct ForgeStageShell<Content: View, Footer: View>: View {
         //     on every content slot, which gave simple stages like
         //     Source a giant empty rectangle below the form. The hero
         //     icon now carries the visual weight instead.
-        VStack(spacing: 10) {
-            ScrollView(.vertical, showsIndicators: false) {
-                VStack(spacing: 0) {
-                    Spacer(minLength: 18)
-                    card
-                    Spacer(minLength: 18)
-                }
-                .frame(maxWidth: .infinity)
-                .containerRelativeFrame(.vertical) { length, _ in length }
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(spacing: 0) {
+                Spacer(minLength: 18)
+                card
+                Spacer(minLength: 18)
             }
-            .scrollBounceBehavior(.basedOnSize)
-            progressCapsule
-                .padding(.bottom, 14)
+            .frame(maxWidth: .infinity)
+            .containerRelativeFrame(.vertical) { length, _ in length }
         }
+        .scrollBounceBehavior(.basedOnSize)
     }
 
     private var card: some View {
         VStack(alignment: .leading, spacing: 0) {
+            progressHeader
+                .padding(.top, 20)
+                .frame(width: ForgeStageLayout.contentWidth, alignment: .leading)
+                .padding(.horizontal, ForgeStageLayout.contentPadding)
             if let symbol {
                 heroChip(symbol)
-                    .padding(.top, 24)
+                    .padding(.top, 18)
                     .frame(width: ForgeStageLayout.contentWidth, alignment: .leading)
                     .padding(.horizontal, ForgeStageLayout.contentPadding)
             }
             header
-                .padding(.top, symbol == nil ? 24 : 16)
+                .padding(.top, symbol == nil ? 18 : 16)
                 .frame(width: ForgeStageLayout.contentWidth, alignment: .leading)
                 .padding(.horizontal, ForgeStageLayout.contentPadding)
             content()
@@ -272,26 +274,29 @@ struct ForgeStageShell<Content: View, Footer: View>: View {
         }
     }
 
-    private var progressCapsule: some View {
+    /// Step name and count over a thin bar the width of the card.
+    private var progressHeader: some View {
         let allCases = ForgeStep.allCases
         let stepIndex = allCases.firstIndex(of: step) ?? 0
-        return VStack(spacing: 8) {
-            ZStack(alignment: .leading) {
-                Capsule()
-                    .fill(Brand.separator.opacity(0.5))
-                    .frame(width: 240, height: 4)
-                Capsule()
-                    .fill(Brand.typeBody)
-                    .frame(width: max(8, 240 * CGFloat(Double(stepIndex + 1) / Double(allCases.count))), height: 4)
-                    .animation(.spring(response: 0.45, dampingFraction: 0.85), value: stepIndex)
-            }
-            .accessibilityHidden(true)
+        let fraction = CGFloat(Double(stepIndex + 1) / Double(allCases.count))
+        return VStack(alignment: .leading, spacing: 8) {
             Text(tr("%@  ·  Step %lld of %lld", progressLabel(for: step), stepIndex + 1, allCases.count))
-                .font(.system(size: 11, weight: .medium, design: .monospaced))
-                .tracking(0.6)
+                .textCase(.uppercase)
+                .font(.system(size: 10, weight: .heavy, design: .monospaced))
+                .tracking(1.5)
                 .foregroundStyle(Brand.typeTertiary)
                 .contentTransition(.numericText())
                 .accessibilityLabel(tr("Step %lld of %lld", stepIndex + 1, allCases.count))
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Brand.separator.opacity(0.5))
+                    .frame(width: ForgeStageLayout.contentWidth, height: 3)
+                Capsule()
+                    .fill(Brand.typeBody)
+                    .frame(width: max(8, ForgeStageLayout.contentWidth * fraction), height: 3)
+                    .animation(.spring(response: 0.45, dampingFraction: 0.85), value: stepIndex)
+            }
+            .accessibilityHidden(true)
         }
     }
 

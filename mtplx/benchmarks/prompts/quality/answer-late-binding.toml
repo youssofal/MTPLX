@@ -1,0 +1,14 @@
+id = "answer-late-binding"
+kind = "answer"
+prompt = '''
+What does this Python program print? Give the exact output on the last line of your answer.
+
+```python
+fs = [lambda x: x * i for i in range(3)]
+print([f(2) for f in fs])
+```
+'''
+
+[expect]
+type = "last_line"
+value = "[4, 4, 4]"

@@ -1,0 +1,24 @@
+id = "image-count-squares"
+kind = "image"
+prompt = '''
+How many red squares are in this picture? Give the final answer as a single number on the last line.
+'''
+
+[expect]
+type = "number"
+value = 5
+
+[image]
+width = 320
+height = 240
+background = "white"
+rects = [
+  { x = 20, y = 20, w = 40, h = 40, color = "red" },
+  { x = 100, y = 30, w = 40, h = 40, color = "blue" },
+  { x = 190, y = 20, w = 40, h = 40, color = "red" },
+  { x = 260, y = 40, w = 40, h = 40, color = "red" },
+  { x = 40, y = 120, w = 40, h = 40, color = "blue" },
+  { x = 130, y = 140, w = 40, h = 40, color = "red" },
+  { x = 220, y = 130, w = 40, h = 40, color = "blue" },
+  { x = 60, y = 190, w = 40, h = 40, color = "red" },
+]

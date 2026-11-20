@@ -32,9 +32,17 @@ from .cache_state import (
     snapshot_cache_lazy_hybrid,
 )
 from .cache_bank.codec import ColdEncodeInterrupted
-from .checkpoint_anchors import AnchorPlan, default_tail_backoff, retain_checkpoints
+from .checkpoint_anchors import (
+    AnchorPlan,
+    default_tail_backoff,
+    retain_checkpoints,
+    system_segment_end,
+    user_turn_start,
+)
 from .runtime import MTPLXRuntime
+from .token_ids import TokenTuple, as_token_tuple, token_id_bytes
 from .runtime_options import block_prefix_restore_enabled
+from .token_prefix import common_prefix_len
 
 
 def _policy_uses_committed_history(policy: str | None) -> bool:
@@ -310,18 +318,38 @@ class CacheMissReason(str, Enum):
 
 
 def token_prefix_hash(token_ids: list[int] | tuple[int, ...]) -> str:
-    h = hashlib.sha256()
-    for token in token_ids:
-        h.update(int(token).to_bytes(8, byteorder="little", signed=True))
-    return h.hexdigest()
+    return hashlib.sha256(token_id_bytes(token_ids)).hexdigest()
 
 
-def common_prefix_len(left: list[int] | tuple[int, ...], right: list[int] | tuple[int, ...]) -> int:
-    limit = min(len(left), len(right))
-    for index in range(limit):
-        if int(left[index]) != int(right[index]):
-            return index
-    return limit
+_SHARED_LEN_MEMO_MAX = 128
+_shared_len_memo: dict[tuple[int, int], tuple[Any, Any, int]] = {}
+_shared_len_memo_lock = threading.Lock()
+
+
+def shared_prefix_len(tokens: Any, prefix: Any) -> int:
+    """``common_prefix_len`` that remembers its answer per (prompt, entry).
+
+    One request asks the same question of every RAM entry several times (the
+    dominant-prefix estimate, the exact lookup, the near-prefix lane, its
+    diagnostics, the reread receipt); at 80K tokens each pass costs ~0.45 ms
+    per entry. Both inputs are immutable ``TokenTuple`` objects, so the answer
+    is keyed on their identity; the memo holds both objects, which keeps the
+    identities from being reused while an answer is stored. Anything else
+    takes the plain compare.
+    """
+    if type(tokens) is not TokenTuple or type(prefix) is not TokenTuple:
+        return common_prefix_len(tokens, prefix)
+    key = (id(tokens), id(prefix))
+    with _shared_len_memo_lock:
+        hit = _shared_len_memo.get(key)
+    if hit is not None and hit[0] is tokens and hit[1] is prefix:
+        return hit[2]
+    matched = common_prefix_len(tokens, prefix)
+    with _shared_len_memo_lock:
+        if len(_shared_len_memo) >= _SHARED_LEN_MEMO_MAX:
+            _shared_len_memo.pop(next(iter(_shared_len_memo)), None)
+        _shared_len_memo[key] = (tokens, prefix, matched)
+    return matched
 
 
 def block_aligned_prefix_len(matched_tokens: int, *, block_size: int) -> int:
@@ -476,7 +504,9 @@ def _near_prefix_candidate_len(
     """The restore point one RAM entry offers a prompt on the near-prefix
     lane, or None: the tiny-gap path (tokenizer drift at the stored end),
     else the block path (token-granular for entries that can restore at any
-    offset, block-aligned for recurrent entries without boundaries). With
+    offset, block-aligned for recurrent entries without boundaries; it needs
+    ``block_min_match`` matched tokens unless the prompt ends where one of
+    the entry's own prompts ended). With
     ``diag``, a block-lane refusal records why as ``ram_miss_reason``
     (block_prefix_skip_reason), so a RAM-lane miss is not hidden behind the
     SSD tier's later ``ssd_prefix_miss``."""
@@ -484,7 +514,7 @@ def _near_prefix_candidate_len(
     prefix = entry.token_ids
     if not prefix:
         return None
-    matched = common_prefix_len(tokens, prefix)
+    matched = shared_prefix_len(tokens, prefix)
     # An image prompt is matched in its content-keyed view: the match is
     # content-true, but a restore never cuts an image (image_safe_restore_len).
     # A cut back to an image's start is no tiny gap; the block rules judge it.
@@ -522,7 +552,14 @@ def _near_prefix_candidate_len(
         entry.gdn_boundaries or getattr(entry, "gdn_boundary_loader", None)
     )
     candidate_len = matched if exact_capable else safe_block
-    if candidate_len < block_min_match:
+    # A prompt that ends where a prompt of the stored conversation ended is
+    # that prompt asked again (a retry, a board's repeated question).
+    # Everything it needs is stored, so its length is no reason to read it
+    # again: a 76-token prompt was, at 0.23 s to first text every time (12
+    # November). A prompt that merely lies inside what the entry holds is not
+    # served by this: the rest of the entry may be text the model wrote.
+    asked_again = matched == len(tokens) and _a_prefill_ended_at(entry, matched)
+    if candidate_len < block_min_match and not asked_again:
         if diag is not None:
             diag["ram_miss_reason"] = block_prefix_skip_reason(
                 matched_tokens=matched,
@@ -534,6 +571,27 @@ def _near_prefix_candidate_len(
     if candidate_len < 2 or candidate_len > matched:
         return None
     return int(candidate_len)
+
+
+def _a_prefill_ended_at(entry: Any, length: int) -> bool:
+    """Whether a prompt of the stored conversation was ``length`` tokens long.
+
+    The entry does not record its prompts' lengths, but a prefill does leave
+    its mark: recurrent checkpoints are taken while a prompt is read, and the
+    last one of every read is one token before the prompt's end (the last
+    token's own forward gives the logits). So a checkpoint at ``length - 1``
+    says a prompt ended here. The one checkpoint not taken inside a read is
+    where a read took over the stored conversation (a lease's own end, the
+    end of an earlier finished turn): a conversation's boundary too, and the
+    state every continuation of it restores. An entry without checkpoints in
+    memory (a model with no recurrent state, or one whose checkpoints are
+    still on SSD) cannot say, and is taken not to.
+    """
+
+    return any(
+        int(record[0]) in (int(length) - 1, int(length))
+        for record in getattr(entry, "gdn_boundaries", None) or ()
+    )
 
 
 def _recurrent_restore_point(entry: Any, matched: int) -> int:
@@ -619,6 +677,15 @@ def _one_copy_cache(cache: list[Any] | None) -> bool:
     from .one_copy import one_copy_enabled, qsa_entries
 
     return one_copy_enabled() and bool(qsa_entries(cache))
+
+
+def _decoded_for_one_request(entry: Any) -> bool:
+    """Whether ``entry`` is a snapshot the SSD tier decoded for one lookup and
+    the bank never held (``_cold_near_prefix_candidate``): its arrays are
+    referenced by nothing else, so a restore may take them instead of
+    copying them. The caller checks the bank does not hold it."""
+
+    return bool(getattr(entry, "decoded_for_request", False))
 
 
 def _cache_kv_offset(cache: list[Any] | None) -> int | None:
@@ -1406,10 +1473,14 @@ class SessionBank:
         timing_out: dict[str, Any] | None = None,
         lease_kv_offset: int | None = None,
         lease_mtp_offset: int | None = None,
+        resumed_at: int | None = None,
     ) -> SessionBankEntry | None:
         # lease_kv_offset / lease_mtp_offset: where the entry's own tokens end
         # in a leased cache that already ran past them (return_lease); by
         # default, where the cache is now.
+        # resumed_at: where the prefill behind this entry resumed a stored
+        # conversation. A checkpoint there is kept ahead of the grid: it is
+        # where the next turn resumes when this one's message is replaced.
         # timing_out: optional request-local dict the CALLER owns (never
         # shared bank state — puts run concurrently across the foreground,
         # postcommit, and batched lanes). Keys are written progressively as
@@ -1418,7 +1489,7 @@ class SessionBank:
         # synchronous_serialize_elapsed_s}. Early returns leave later keys
         # absent. Deferred cold-tier serialization is never charged here —
         # only the dispatch span is; the job itself runs on the idle lane.
-        tokens = tuple(int(token) for token in token_ids)
+        tokens = as_token_tuple(token_ids)
         if not tokens:
             raise ValueError("cannot store an empty prefix")
         if mtp_snapshot_epoch is not None and int(mtp_snapshot_epoch) != int(snapshot_epoch):
@@ -1445,6 +1516,10 @@ class SessionBank:
                 file=sys.stderr,
                 flush=True,
             )
+        # The reader of records a donor still holds on disk. Only a put that
+        # supplies no records can inherit one. A put whose own records are all
+        # shed to fit its budget stores none and reads none back (#696).
+        inherited_loader = None
         if not normalized_boundaries:
             # Same-key replacement must not lose interior boundaries: the idle
             # postcommit re-put of a prompt-boundary entry (which restores
@@ -1517,14 +1592,18 @@ class SessionBank:
         if normalized_boundaries:
             # Every stored set keeps its anchors within the checkpoint budget,
             # whatever produced it (a prefill, an inheriting commit, a set
-            # read back from disk, the batched lane's plain list). A set
-            # already within it is kept whole.
+            # read back from disk, the batched lane's plain list), and the
+            # one at the end of the system prompt, where a new session of the
+            # same client resumes. A set already within it is kept whole.
             normalized_boundaries = retain_checkpoints(
                 normalized_boundaries,
                 AnchorPlan(
                     budget_bytes=self.checkpoint_budget_bytes,
                     prompt_end=len(tokens) - 1,
                     tail_backoff=default_tail_backoff(),
+                    restore_point=resumed_at or None,
+                    system_end=system_segment_end(tokens),
+                    turn_start=user_turn_start(tokens),
                 ),
             )
         def live_ref_entry(reason: str, nbytes: int) -> SessionBankEntry | None:
@@ -1722,20 +1801,32 @@ class SessionBank:
             )
         )
         entry_nbytes = int(nbytes_override if nbytes_override is not None else computed_nbytes)
+        # The budget an entry must fit to stay in RAM: its session's cap, and
+        # never more than the whole bank's. An explicit
+        # MTPLX_SESSION_BANK_MAX_BYTES below the per-session cap (2 GiB
+        # against the 8 GiB RAM-tier default in #690) left the bank the
+        # tighter one, and an entry over it was stored whole, its SSD write
+        # queued, and evicted at once by _evict_if_needed: the conversation's
+        # next turn re-read everything (67 to 106 s on an M1 Max). Such an
+        # entry sheds boundary records to fit the bank whatever
+        # MTPLX_SESSION_BANK_SHED_BOUNDARIES says (whole, it cannot stay);
+        # otherwise that gate decides, as before.
+        shed_budget = min(int(self.per_session_max_bytes), int(self.max_bytes))
+        bank_is_tighter = int(self.max_bytes) < int(self.per_session_max_bytes)
         if (
-            self.shed_gdn_boundaries_to_fit
+            (self.shed_gdn_boundaries_to_fit or bank_is_tighter)
             and nbytes_override is None
             and normalized_boundaries
-            and entry_nbytes > self.per_session_max_bytes
+            and entry_nbytes > shed_budget
         ):
             kept, shed_nbytes, shed = self._shed_boundaries_to_fit(
-                normalized_boundaries, entry_nbytes
+                normalized_boundaries, entry_nbytes, budget=shed_budget
             )
             # Only apply a shed that actually rescues the entry. When the BASE
             # snapshot alone is over budget, dropping records changes nothing
             # about the outcome, so leave the entry exactly as it was and let
-            # the unchanged refusal below report the real size.
-            if shed and shed_nbytes <= self.per_session_max_bytes:
+            # the unchanged checks below handle it.
+            if shed and shed_nbytes <= shed_budget:
                 normalized_boundaries, entry_nbytes = kept, shed_nbytes
                 self.boundary_shed_puts += 1
                 self.boundary_shed_records += shed
@@ -1746,7 +1837,7 @@ class SessionBank:
                         "prefix_len": len(tokens),
                         "token_hash": token_prefix_hash(tokens),
                         "nbytes": int(entry_nbytes),
-                        "budget": int(self.per_session_max_bytes),
+                        "budget": int(shed_budget),
                         "boundaries_shed": int(shed),
                         "boundaries_kept": len(normalized_boundaries),
                     }
@@ -1839,7 +1930,7 @@ class SessionBank:
         mtp_snapshot_epoch: int | None = None,
         nbytes_override: int | None = None,
     ) -> SessionBankEntry | None:
-        tokens = tuple(int(token) for token in token_ids)
+        tokens = as_token_tuple(token_ids)
         if not tokens:
             raise ValueError("cannot store an empty prefix")
         if mtp_snapshot_epoch is not None and int(mtp_snapshot_epoch) != int(snapshot_epoch):
@@ -1941,18 +2032,18 @@ class SessionBank:
         and calls the session compacted. One compare per entry, no cold-tier
         scan, no lookup side effects.
         """
-        tokens = tuple(int(token) for token in token_ids)
+        tokens = as_token_tuple(token_ids)
         best = 0
         for prefix, entry in self._entries.items():
             if session_id is not None and entry.session_id != session_id:
                 continue
-            matched = common_prefix_len(tokens, prefix)
+            matched = shared_prefix_len(tokens, prefix)
             if matched > best:
                 best = matched
         return best
 
     def longest_prefix(self, token_ids: list[int] | tuple[int, ...]) -> SessionBankEntry | None:
-        tokens = tuple(int(token) for token in token_ids)
+        tokens = as_token_tuple(token_ids)
         best: SessionBankEntry | None = None
         for prefix, entry in self._entries.items():
             if len(prefix) > len(tokens):
@@ -2019,7 +2110,7 @@ class SessionBank:
         if a new prompt shares a large stable token prefix, restore to the last
         full block and prefill only the changed suffix.
         """
-        tokens = tuple(int(token) for token in token_ids)
+        tokens = as_token_tuple(token_ids)
         gap_limit = max(0, int(max_token_gap))
         min_match = max(1, int(min_matched_tokens))
         block = max(1, int(block_size))
@@ -2031,7 +2122,7 @@ class SessionBank:
             prefix = entry.token_ids
             if not prefix:
                 continue
-            matched = common_prefix_len(tokens, prefix)
+            matched = shared_prefix_len(tokens, prefix)
             gap = len(prefix) - matched
             safe_block = min(
                 block_aligned_prefix_len(matched, block_size=block),
@@ -2209,7 +2300,7 @@ class SessionBank:
                 "prompt_len": len(tokens),
                 "session_id": entry.session_id,
                 "stored_prefix_len": entry.prefix_len,
-                "common_prefix_tokens": int(common_prefix_len(tokens, entry.token_ids)),
+                "common_prefix_tokens": int(shared_prefix_len(tokens, entry.token_ids)),
                 "nearest_boundary_tokens": int(matched),
                 "new_prefill_tokens": max(0, len(tokens) - int(matched)),
                 "miss_reason": None,
@@ -2309,7 +2400,7 @@ class SessionBank:
             return None
         metadata = dict(getattr(record, "metadata", {}) or {})
         entry = SessionBankEntry(
-            token_ids=tuple(int(token) for token in record.token_ids),
+            token_ids=as_token_tuple(record.token_ids),
             token_hash=metadata.get("token_hash") or token_prefix_hash(record.token_ids),
             has_recurrent=bool(
                 getattr(record, "has_recurrent", False)
@@ -2356,6 +2447,9 @@ class SessionBank:
         setattr(entry, "ssd_cache_hit", True)
         setattr(entry, "ssd_cached_tokens", matched)
         setattr(entry, "ssd_restore_s", float(getattr(record, "restore_s", 0.0) or 0.0))
+        # Decoded for this lookup alone and never put in the bank: its restore
+        # takes the arrays rather than copying them (restore_entry_prefix_cache).
+        setattr(entry, "decoded_for_request", True)
         return entry, matched
 
     def _record_oversized_skip(
@@ -2379,7 +2473,7 @@ class SessionBank:
         if record is None:
             return None
         n = int(record["prefix_len"])
-        tokens = tuple(int(token) for token in token_ids)
+        tokens = as_token_tuple(token_ids)
         if len(tokens) < n or token_prefix_hash(tokens[:n]) != record["token_hash"]:
             return None
         return record
@@ -2672,7 +2766,7 @@ class SessionBank:
             entry.last_access_s = time.time()
         self.last_restore_source = "ram"
         self.last_ssd_restore_s = 0.0
-        lookup_len = len(tuple(int(token) for token in token_ids))
+        lookup_len = len(as_token_tuple(token_ids))
         self.last_prefix_diagnostic = {
             "prompt_len": lookup_len,
             "session_id": entry.session_id,
@@ -2929,12 +3023,24 @@ class SessionBank:
             _factory_started = time.perf_counter()
             cache = cache_factory() if cache_factory is not None else runtime.make_cache()
             _install_started = time.perf_counter()
+            # A candidate the SSD tier decoded for this request alone hands its
+            # arrays to the request's cache: nothing else holds them, so a copy
+            # would only sit beside them until the entry went (window n4l2,
+            # 2026-11-12: a 247,546-token follow-up restored from SSD held the
+            # decoded 8.66 GB and a copy of it, and stopped past the engine's
+            # limit). The entry lets go of them here, so the cache's first
+            # write may take the buffers in place.
+            private = _decoded_for_one_request(entry) and (
+                self._entries.get(entry.token_ids) is not entry
+            )
             restore_cache(
                 cache,
                 entry.cache_snapshot,
                 restore_meta_state=cache_factory is None,
-                clone_states=not entry.lazy_kv,
+                clone_states=not (entry.lazy_kv or private),
             )
+            if private:
+                entry.cache_snapshot = None
             _trim_started = time.perf_counter()
             if not trim_to_target(cache):
                 self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
@@ -2996,7 +3102,14 @@ class SessionBank:
                 if mtp_cache_factory is not None
                 else runtime.make_mtp_cache()
             )
-            restore_cache(mtp_history_cache, entry.mtp_history_snapshot)
+            private = _decoded_for_one_request(entry) and (
+                self._entries.get(entry.token_ids) is not entry
+            )
+            restore_cache(
+                mtp_history_cache, entry.mtp_history_snapshot, clone_states=not private
+            )
+            if private:
+                entry.mtp_history_snapshot = None
             if not _trim_cache_ref_by_tokens(
                 mtp_history_cache,
                 mtp_history_trim_tokens,
@@ -3464,7 +3577,7 @@ class SessionBank:
         views: later cache writes cannot mutate what gets encoded — the
         lazy-snapshot COW pin covers this), and streams to disk.
         """
-        entry = self._entries.get(tuple(int(token) for token in token_ids))
+        entry = self._entries.get(as_token_tuple(token_ids))
         if entry is None or not entry.live_ref_only or entry.cache_ref is None:
             return False
         if int(entry.snapshot_epoch) != int(snapshot_epoch):
@@ -3643,7 +3756,7 @@ class SessionBank:
             return None
         metadata = dict(getattr(record, "metadata", {}) or {})
         entry = SessionBankEntry(
-            token_ids=tuple(int(token) for token in record.token_ids),
+            token_ids=as_token_tuple(record.token_ids),
             token_hash=metadata.get("token_hash") or token_prefix_hash(record.token_ids),
             has_recurrent=bool(
                 getattr(record, "has_recurrent", False)
@@ -3688,10 +3801,25 @@ class SessionBank:
         # 16 to 48 s with the default layout, 5 to 8 s with the request's). As in the RAM
         # restore, the stored meta state is not imposed on the request's cache.
         cache = cache_factory() if cache_factory is not None else runtime.make_cache()
+        # The one-copy store (mtplx/one_copy.py) keeps a conversation once: the
+        # request's cache takes the decoded arrays, and the bank does not keep
+        # them beside it, since the prefill publishes the prompt as a lease on
+        # that same cache. Kept, the decoded entry and the request's copy were
+        # the conversation twice for the whole turn: at 247K, 8.66 GB of entry
+        # beside 8.2 GB of request, past the engine's limit on a 128 GB Mac
+        # (window n4l2, 2026-11-12, the same shape in the near-prefix lane).
+        # A turn with nothing past the stored prefix inherits the entry's
+        # recurrent boundaries from the banked entry at its final commit, so
+        # there they are read now and reach the commit through the prompt
+        # state; a turn that prefills a suffix commits its own boundaries,
+        # beside which a banked entry's loader was never merged. Other caches
+        # keep the banked entry and a copy, as before.
+        one_copy = _one_copy_cache(cache)
         restore_cache(
             cache,
             entry.cache_snapshot,
             restore_meta_state=cache_factory is None,
+            clone_states=not one_copy,
         )
         # Read back from disk, the entry's floor is its restored caches'.
         entry.restore_floor_tokens = _cache_restore_floor(cache)
@@ -3703,18 +3831,29 @@ class SessionBank:
                 if mtp_cache_factory is not None
                 else runtime.make_mtp_cache()
             )
-            restore_cache(mtp_history_cache, entry.mtp_history_snapshot)
+            restore_cache(
+                mtp_history_cache, entry.mtp_history_snapshot, clone_states=not one_copy
+            )
         entry.hits += 1
         entry.last_access_s = time.time()
-        self._entries[entry.token_ids] = entry
-        # The session is being served from disk into a fresh cache: any
-        # lease it still holds pins a cache this turn is not using (#456).
-        self._release_stale_session_leases(entry)
-        self._evict_if_needed(protected_tokens=entry.token_ids)
+        if one_copy:
+            if len(as_token_tuple(token_ids)) <= entry.prefix_len:
+                entry._ensure_boundaries_loaded()
+            entry.cache_snapshot = None
+            entry.mtp_history_snapshot = None
+            # As at an insertion: a lease the session still holds pins a
+            # cache this turn is not using (#456).
+            self._release_stale_session_leases(entry)
+        else:
+            self._entries[entry.token_ids] = entry
+            # The session is being served from disk into a fresh cache: any
+            # lease it still holds pins a cache this turn is not using (#456).
+            self._release_stale_session_leases(entry)
+            self._evict_if_needed(protected_tokens=entry.token_ids)
         self.last_restore_source = "ssd"
         self.last_ssd_restore_s = float(getattr(record, "restore_s", 0.0) or 0.0)
         self.last_miss_reason = None
-        lookup_len = len(tuple(int(token) for token in token_ids))
+        lookup_len = len(as_token_tuple(token_ids))
         self.last_prefix_diagnostic = {
             "prompt_len": lookup_len,
             "session_id": entry.session_id,
@@ -3983,8 +4122,10 @@ class SessionBank:
         self,
         boundaries: list[tuple[int, CacheSnapshot, Any]],
         entry_nbytes: int,
+        budget: int | None = None,
     ) -> tuple[list[tuple[int, CacheSnapshot, Any]], int, int]:
-        """Drop boundary records until the entry fits its per-session budget.
+        """Drop boundary records until the entry fits ``budget`` (by default
+        its per-session budget).
 
         Returns ``(kept, nbytes, shed_count)``. ``kept`` keeps the input's
         ascending-position ordering, so callers see the same shape they passed.
@@ -4005,7 +4146,7 @@ class SessionBank:
         exceeds the budget is still refused by the caller, unchanged.
         """
 
-        budget = int(self.per_session_max_bytes)
+        budget = int(self.per_session_max_bytes if budget is None else budget)
         sizes = [
             _snapshot_nbytes(record[1]) + _tree_nbytes(record[2])
             for record in boundaries
@@ -4276,7 +4417,7 @@ class SessionBank:
         }
         if not prompt_tokens:
             return plan
-        tokens = tuple(int(token) for token in prompt_tokens)
+        tokens = as_token_tuple(prompt_tokens)
         identity = {
             "model_path": model_path,
             "mtp_enabled": mtp_enabled,
@@ -4405,7 +4546,7 @@ class SessionBank:
 
         if not session_id or not prompt_tokens:
             return 0
-        tokens = tuple(int(token) for token in prompt_tokens)
+        tokens = as_token_tuple(prompt_tokens)
         knobs = _near_prefix_knobs()
         best = 0
         for key, entry in list(self._entries.items()):
@@ -4450,7 +4591,7 @@ class SessionBank:
 
         if not session_id or not prompt_tokens:
             return []
-        tokens = tuple(int(token) for token in prompt_tokens)
+        tokens = as_token_tuple(prompt_tokens)
         candidates: list[tuple[SessionBankEntry, bool]] = [
             (entry, True)
             for entry in list(self._entries.values())
@@ -4468,7 +4609,7 @@ class SessionBank:
                 continue
             seen.add(id(entry))
             length = len(entry.token_ids)
-            shared = common_prefix_len(tokens, entry.token_ids)
+            shared = shared_prefix_len(tokens, entry.token_ids)
             if length <= 0 or shared <= 0 or 2 * shared < length:
                 continue
             rows.append(

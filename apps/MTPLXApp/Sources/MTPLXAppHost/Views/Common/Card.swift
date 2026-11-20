@@ -48,11 +48,16 @@ struct Card<Content: View>: View {
         VStack(alignment: .leading, spacing: 12) {
             if title != nil || subtitle != nil {
                 HStack(alignment: .firstTextBaseline) {
-                    VStack(alignment: .leading, spacing: 2) {
+                    VStack(alignment: .leading, spacing: 4) {
                         if let title {
+                            // The Live tab's card header (ACCEPTANCE, DECODE
+                            // TPS): one title style on every dashboard.
                             Text(title)
-                                .font(.headline)
-                                .foregroundStyle(.primary)
+                                .textCase(.uppercase)
+                                .font(.system(size: 11, weight: .heavy, design: .monospaced))
+                                .tracking(3)
+                                .foregroundStyle(Brand.textHighlight)
+                                .accessibilityAddTraits(.isHeader)
                         }
                         if let subtitle {
                             Text(subtitle)

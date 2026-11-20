@@ -10,6 +10,7 @@ import MTPLXAppCore
 
 struct SystemTab: View {
     @EnvironmentObject private var backend: MTPLXBackendStore
+    @EnvironmentObject private var router: AppRouter
 
     var body: some View {
         Group {
@@ -48,7 +49,10 @@ struct SystemTab: View {
 
         Card(tr("Hardware")) {
             ViewThatFits(in: .horizontal) {
-                HStack(spacing: 24) {
+                // Top-aligned so every tile's label sits on one line; the
+                // chip tile's extra caption used to push its label above
+                // the others.
+                HStack(alignment: .top, spacing: 24) {
                     hardwareTiles(
                         chip: chip,
                         model: model,
@@ -132,8 +136,12 @@ struct SystemTab: View {
         let unified = snapshot?.machine.unifiedMemoryBytes ?? health?.unifiedMemoryBytes
 
         Card(tr("Memory"),
-             subtitle: tr("What the engine is actually holding vs your Mac's total.")) {
-            if let mem, mem.ok, let total = unified, total > 0 {
+             subtitle: tr("What MTPLX holds, against the limit its memory guard works to.")) {
+            if let mem, mem.ok, let engine = backend.engineMemoryReading {
+                engineMemoryBar(mem: mem, engine: engine)
+            } else if let mem, mem.ok, let total = unified, total > 0 {
+                // Daemons that report no memory limit: MLX's own account
+                // against the Mac's RAM, as before.
                 let active = max(0, Double(mem.activeMemoryBytes ?? 0))
                 let cache = max(0, Double(mem.cacheMemoryBytes ?? 0))
                 let peak = Double(mem.peakMemoryBytes ?? 0)
@@ -146,48 +154,26 @@ struct SystemTab: View {
                 let used = active + cache
                 let headroom = max(0, Double(total) - used)
                 let hasAttribution = weights > 0
-                VStack(alignment: .leading, spacing: 14) {
-                    if hasAttribution {
-                        StackedBar(
-                            segments: [
-                                StackedBarSegment(label: tr("Model"), value: min(weights, active), tint: Brand.accent),
-                                StackedBarSegment(label: tr("Sessions"), value: bank, tint: Brand.coolChrome),
-                                StackedBarSegment(label: tr("Working"), value: working, tint: Brand.warning.opacity(0.75)),
-                                StackedBarSegment(label: tr("Reusable"), value: cache, tint: Brand.textHighlight.opacity(0.5)),
-                                StackedBarSegment(label: tr("Headroom"), value: headroom, tint: Brand.textHighlight.opacity(0.35)),
-                            ],
-                            total: Double(total),
-                            height: 22
-                        )
-                        HStack(spacing: 14) {
-                            memoryTag(color: Brand.accent, label: tr("Model"), value: Format.gigabytes(Int(min(weights, active))))
-                            memoryTag(color: Brand.coolChrome, label: tr("Sessions"), value: Format.gigabytes(Int(bank)))
-                            memoryTag(color: Brand.warning.opacity(0.75), label: tr("Working"), value: Format.gigabytes(Int(working)))
-                            memoryTag(color: Brand.textHighlight.opacity(0.6), label: tr("Reusable"), value: Format.gigabytes(Int(cache)))
-                            if peak > 0 {
-                                memoryTag(color: Brand.danger, label: tr("Peak"), value: Format.gigabytes(Int(peak)))
-                            }
-                        }
-                    } else {
-                        StackedBar(
-                            segments: [
-                                StackedBarSegment(label: tr("Active"), value: active, tint: Brand.accent),
-                                StackedBarSegment(label: tr("Cache"), value: cache, tint: Brand.coolChrome),
-                                StackedBarSegment(label: tr("Headroom"), value: headroom, tint: Brand.textHighlight.opacity(0.35)),
-                            ],
-                            total: Double(total),
-                            height: 22
-                        )
-                        HStack(spacing: 18) {
-                            memoryTag(color: Brand.accent, label: tr("Active"), value: Format.gigabytes(Int(active)))
-                            memoryTag(color: Brand.coolChrome, label: tr("Cache"), value: Format.gigabytes(Int(cache)))
-                            memoryTag(color: Brand.textHighlight.opacity(0.7), label: tr("Headroom"), value: Format.gigabytes(Int(headroom)))
-                            if peak > 0 {
-                                memoryTag(color: Brand.warning, label: tr("Peak"), value: Format.gigabytes(Int(peak)))
-                            }
-                        }
-                    }
-                }
+                // One legend: each part with its size (the bar shows the
+                // share); it used to repeat every part twice, once as a
+                // percent and once in GB.
+                StackedBar(
+                    segments: (hasAttribution
+                        ? [
+                            memorySegment(tr("Model"), min(weights, active), Brand.accent),
+                            memorySegment(tr("Sessions"), bank, Brand.coolChrome),
+                            memorySegment(tr("Working"), working, Brand.warning.opacity(0.75)),
+                            memorySegment(tr("Reusable"), cache, Brand.textHighlight.opacity(0.5)),
+                        ]
+                        : [
+                            memorySegment(tr("Active"), active, Brand.accent),
+                            memorySegment(tr("Cache"), cache, Brand.coolChrome),
+                        ])
+                        + [memorySegment(tr("Headroom"), headroom, Brand.textHighlight.opacity(0.35))],
+                    total: Double(total),
+                    height: 22,
+                    legendExtras: peakLegend(peak)
+                )
             } else if let mem, !mem.ok {
                 Text(mem.error ?? tr("Memory snapshot unavailable."))
                     .font(.callout)
@@ -200,19 +186,95 @@ struct SystemTab: View {
         }
     }
 
-    private func memoryTag(color: Color, label: String, value: String) -> some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(color)
-                .frame(width: 8, height: 8)
-            Text(label)
-                .font(.system(size: 11, weight: .medium, design: .monospaced))
-                .foregroundStyle(Brand.textHighlight.opacity(0.7))
-            Text(value)
-                .font(.system(.caption, design: .rounded).weight(.semibold))
+    /// The bar is the engine's limit, the line the memory guard trims the
+    /// warm cache and sheds work against; "Room" is what is left under it.
+    /// The Mac's whole RAM was the wrong whole: it showed 33.8% headroom
+    /// while the guard was trimming (12 November).
+    @ViewBuilder
+    private func engineMemoryBar(mem: MemSnapshot, engine: EngineMemoryReading) -> some View {
+        let active = max(0, Double(mem.activeMemoryBytes ?? 0))
+        let pool = max(0, Double(mem.cacheMemoryBytes ?? 0))
+        let weights = min(max(0, Double(mem.modelWeightsBytes ?? 0)), active)
+        let bank = max(0, Double(mem.sessionBankBytes ?? 0))
+        let hasAttribution = weights > 0
+        // Derived remainder of active, so the segments always sum to it
+        // even when the snapshot raced a prefill.
+        let working = max(0, active - weights - bank)
+        // Host memory the guard counts, shown once it is a tenth of a GB:
+        // under that it reads "0.0 GB" and only adds noise to the legend.
+        let outside = Double(engine.chargedOutsideMLXBytes)
+        let showsOutside = outside >= 0.1 * 1_073_741_824
+        let room = Double(max(0, engine.roomBytes))
+        let over = max(0, -engine.roomBytes)
+        let level = backend.memoryPressureLevel
+        let statusTint: Color = over > 0 || level >= 4
+            ? Brand.danger
+            : (level >= 2 ? Brand.warning : Brand.success)
+        let segments: [StackedBarSegment] = (hasAttribution
+            ? [
+                memorySegment(tr("Model"), weights, Brand.accent),
+                memorySegment(tr("Sessions"), bank, Brand.coolChrome),
+                memorySegment(tr("Working"), working, Brand.warning.opacity(0.75)),
+            ]
+            : [memorySegment(tr("Active"), active, Brand.accent)])
+            + [memorySegment(tr("Reusable"), pool, Brand.textHighlight.opacity(0.5))]
+            + (showsOutside
+                ? [memorySegment(tr("Host memory"), outside, Brand.danger.opacity(0.6))]
+                : [])
+            + [memorySegment(tr("Room"), room, Brand.textHighlight.opacity(0.35))]
+
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Circle()
+                    .fill(statusTint)
+                    .frame(width: 8, height: 8)
+                Text(tr(
+                    "%@ of the %@ limit",
+                    Format.gigabytes(engine.usedBytes),
+                    Format.gigabytes(engine.limitBytes)
+                ))
+                .font(.system(.callout, design: .rounded).weight(.semibold))
                 .monospacedDigit()
-                .foregroundStyle(Brand.accent)
+                .foregroundStyle(Brand.typeHi)
+                Text(over > 0
+                     ? tr("over by %@", Format.gigabytes(over))
+                     : tr("%@ room", Format.gigabytes(engine.roomBytes)))
+                    .font(.system(.caption, design: .rounded).weight(.semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(over > 0 ? Brand.danger : Brand.typeSecondary)
+                Spacer(minLength: 8)
+                if backend.memoryGuardRecentShed {
+                    PillBadge(
+                        text: tr("Guard trimming cache"),
+                        systemImage: "scissors",
+                        tint: Brand.warning,
+                        emphasized: true
+                    )
+                }
+            }
+            StackedBar(
+                segments: segments,
+                total: Double(max(engine.limitBytes, engine.usedBytes)),
+                height: 22,
+                legendExtras: peakLegend(Double(mem.peakMemoryBytes ?? 0))
+            )
         }
+    }
+
+    /// A bar part labelled with its size in GB (binary, as macOS labels memory).
+    private func memorySegment(_ label: String, _ bytes: Double, _ tint: Color) -> StackedBarSegment {
+        StackedBarSegment(label: label, value: bytes, tint: tint, valueLabel: Format.gigabytes(Int(bytes)))
+    }
+
+    /// The process's peak, named in the legend without a share of the bar.
+    private func peakLegend(_ peakBytes: Double) -> [StackedBarSegment] {
+        guard peakBytes > 0 else { return [] }
+        return [StackedBarSegment(
+            label: tr("Peak"),
+            value: 0,
+            tint: Brand.danger,
+            valueLabel: Format.gigabytes(Int(peakBytes))
+        )]
     }
 
     @ViewBuilder
@@ -253,12 +315,47 @@ struct SystemTab: View {
                 }
                 MetricRow(label: tr("Active (total in use)"), value: Format.bytes(mem?.activeMemoryBytes))
                 MetricRow(label: tr("Reusable buffer pool"), value: Format.bytes(mem?.cacheMemoryBytes))
+                // The process as macOS counts it, and the part MLX's own
+                // account does not explain (host memory: Python, the session
+                // bank's host buffers, leaks). The guard charges what passes
+                // the seat's allowance.
+                if let footprint = mem?.physFootprintBytes, footprint > 0 {
+                    MetricRow(label: tr("Process footprint (macOS)"), value: Format.bytes(footprint))
+                }
+                if let outside = mem?.hostOverhangBytes {
+                    // The bar's "Host memory" is the counted part: what is
+                    // past the allowance the guard grants every seat.
+                    let counted = backend.engineMemoryReading?.chargedOutsideMLXBytes ?? 0
+                    MetricRow(
+                        label: tr("Host memory outside MLX"),
+                        value: counted > 0
+                            ? tr("%@ (%@ counted)", Format.bytes(outside), Format.bytes(counted))
+                            : Format.bytes(outside)
+                    )
+                }
                 MetricRow(
                     label: tr("Peak"),
                     value: Format.bytes(mem?.peakMemoryBytes),
                     valueTint: (mem?.peakMemoryBytes ?? 0) > Int(Double(unified ?? 0) * 0.85)
                         ? Brand.warning : Brand.accent
                 )
+                if let engine = backend.engineMemoryReading {
+                    MetricRow(
+                        label: tr("Memory guard reading"),
+                        value: tr(
+                            "%@ (%@ of limit)",
+                            Format.bytes(engine.usedBytes),
+                            Format.percent(engine.fraction, fractionDigits: 0)
+                        ),
+                        valueTint: engine.roomBytes < 0 ? Brand.danger : Brand.accent
+                    )
+                }
+                if let limit = backend.engineMemoryLimitBytes {
+                    MetricRow(label: tr("Engine memory limit"), value: Format.bytes(limit))
+                    if let unified, unified > limit {
+                        MetricRow(label: tr("Kept for macOS and other apps"), value: Format.bytes(unified - limit))
+                    }
+                }
                 MetricRow(label: tr("Unified total"), value: Format.bytes(unified))
                 if let mem, !mem.ok {
                     MetricRow(label: tr("Error"), value: mem.error ?? "unknown", valueTint: Brand.danger)
@@ -288,8 +385,21 @@ struct SystemTab: View {
                 Text(tr("Turn on Thermal Polling in Settings to confirm. Performance Lock also calms the UI so it doesn't compete with the model."))
                     .font(.caption)
                     .foregroundStyle(Brand.textHighlight.opacity(0.65))
+                if !pollingEnabled {
+                    openCoolingSettingsButton
+                }
             }
         }
+    }
+
+    private var openCoolingSettingsButton: some View {
+        Button {
+            router.openSettings(section: .cooling)
+        } label: {
+            Label(tr("Open Cooling settings"), systemImage: "fan")
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
     }
 
     @ViewBuilder
@@ -321,7 +431,7 @@ struct SystemTab: View {
                     Text(tr("Fan monitoring is off by default so things stay quiet."))
                         .font(.callout)
                         .foregroundStyle(Brand.textHighlight)
-                    Text(tr("Turn it on in Settings → Thermal to see live fan speeds."))
+                    Text(tr("Turn it on in Settings → Cooling to see live fan speeds."))
                         .font(.caption)
                         .foregroundStyle(Brand.textHighlight.opacity(0.65))
                 }

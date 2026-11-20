@@ -1304,6 +1304,17 @@ def _trunk_weights_present(inspection: Any) -> bool:
     )
 
 
+def _mlx_lm_module_exists(name: str) -> bool:
+    import importlib.util
+
+    if not name:
+        return False
+    try:
+        return importlib.util.find_spec(f"mlx_lm.models.{name}") is not None
+    except (ImportError, ValueError):
+        return False
+
+
 def _native_construction_path(inspection: Any) -> str | None:
     """How this build would construct the trunk natively, or None.
 
@@ -1316,19 +1327,11 @@ def _native_construction_path(inspection: Any) -> str | None:
     capability gap in this build (MTPLX never executes repository code),
     not a verification policy.
     """
-    import importlib.util
-
     model_type = _text(getattr(inspection, "model_type", None))
     if model_type in _INTREE_MODEL_TYPES:
         return f"in-tree MTPLX model '{model_type}'"
 
-    def _spec_exists(name: str) -> bool:
-        if not name:
-            return False
-        try:
-            return importlib.util.find_spec(f"mlx_lm.models.{name}") is not None
-        except (ImportError, ValueError):
-            return False
+    _spec_exists = _mlx_lm_module_exists
 
     # mlx-lm serves several model_types through another family's module
     # (mistral -> llama, etc.); honor its own remapping table so the verdict

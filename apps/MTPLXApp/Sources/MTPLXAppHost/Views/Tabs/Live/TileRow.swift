@@ -135,6 +135,9 @@ struct TileRow: View {
         let latest = backend.latest
         let smoothed = backend.smoothedMetrics
         let sessionBank = backend.sessionBank
+        let engineMemory = backend.engineMemoryReading
+        let prefillSpeed = PrefillSpeedSummary(lifetime: lifetime)
+            ?? PrefillSpeedSummary(recent: snapshot?.recent ?? [])
 
         // Same warm-up gate as the gauge — until we've actually
         // observed a `.completed` SSE event, treat lifetime / rolling
@@ -184,10 +187,11 @@ struct TileRow: View {
             ),
             TileSpec(
                 label: tr("Memory"),
-                value: memoryValue(mem: mem),
-                unit: memoryUnit(machine: machine),
+                value: memoryValue(engine: engineMemory, mem: mem),
+                unit: memoryUnit(engine: engineMemory, machine: machine),
                 systemImage: "memorychip",
                 caption: memoryCaption(
+                    engine: engineMemory,
                     mem: mem,
                     machine: machine,
                     pressureLevel: backend.memoryPressureLevel,
@@ -205,10 +209,10 @@ struct TileRow: View {
             ),
             TileSpec(
                 label: tr("Avg Prefill"),
-                value: Format.tps(snapshot?.prefillRates?.averageTokS),
-                unit: "TPS",
+                value: prefillValue(speed: prefillSpeed, latest: liveLatest),
+                unit: prefillSpeed == nil ? nil : "TPS",
                 systemImage: "gauge.with.dots.needle.bottom.50percent",
-                caption: snapshot?.prefillRates?.peakTokS.map { tr("peak %@", Format.tps($0)) },
+                caption: prefillCaption(speed: prefillSpeed, latest: liveLatest),
                 liftIndex: 4
             ),
         ]
@@ -351,30 +355,59 @@ struct TileRow: View {
         return "miss"
     }
 
-    private func memoryValue(mem: MemSnapshot?) -> String {
+    // The session's prompt-read speed: every read of 2K+ new tokens since the
+    // server started, weighted by tokens. A cached turn's "rate" (19 new
+    // tokens at 153 tok/s) is a pass's fixed cost, not a speed, so it is left
+    // out; the caption counts the reads heat slowed.
+    private func prefillValue(speed: PrefillSpeedSummary?, latest: MetricsLatest?) -> String {
+        if let speed { return Format.tps(speed.averageTokS) }
+        if let cached = latest?.cachedTokens, cached > 0 { return tr("cached") }
+        return "—"
+    }
+
+    private func prefillCaption(speed: PrefillSpeedSummary?, latest: MetricsLatest?) -> String? {
+        if let speed { return speed.caption }
+        if let new = latest?.newPrefillTokens { return tr("%@ new", Format.integer(new)) }
+        return nil
+    }
+
+    // The memory guard's account against the engine's limit when the daemon
+    // reports it; MLX's own account against the Mac's RAM otherwise (older
+    // daemons).
+    private func memoryValue(engine: EngineMemoryReading?, mem: MemSnapshot?) -> String {
+        if let engine { return Format.gigabytes(engine.usedBytes) }
         let used = (mem?.activeMemoryBytes ?? 0) + (mem?.cacheMemoryBytes ?? 0)
         if used == 0 { return "—" }
         return Format.gigabytes(used)
     }
 
-    private func memoryUnit(machine: HealthPayload?) -> String? {
+    private func memoryUnit(engine: EngineMemoryReading?, machine: HealthPayload?) -> String? {
+        if let engine { return "/ \(Format.gigabytes(engine.limitBytes))" }
         guard let total = machine?.unifiedMemoryBytes, total > 0 else { return nil }
         return "/ \(Format.gigabytes(total))"
     }
 
     private func memoryCaption(
+        engine: EngineMemoryReading?,
         mem: MemSnapshot?, machine: HealthPayload?, pressureLevel: Int = 0,
         recentShed: Bool = false
     ) -> String? {
-        guard let used = mem.flatMap({ ($0.activeMemoryBytes ?? 0) + ($0.cacheMemoryBytes ?? 0) }),
-              let total = machine?.unifiedMemoryBytes,
-              total > 0
-        else { return nil }
-        let pct = Double(used) / Double(total)
+        let pct: Double
+        let base: String
+        if let engine {
+            pct = engine.fraction
+            base = tr("%@ of limit", Format.percent(pct, fractionDigits: 0))
+        } else {
+            guard let used = mem.flatMap({ ($0.activeMemoryBytes ?? 0) + ($0.cacheMemoryBytes ?? 0) }),
+                  let total = machine?.unifiedMemoryBytes,
+                  total > 0
+            else { return nil }
+            pct = Double(used) / Double(total)
+            base = tr("%@ used", Format.percent(pct, fractionDigits: 0))
+        }
         // The raw (unclamped) percentage stays — 129% is a receipt, not a
         // rendering bug — but past 100% or under pressure the caption says
         // what it means instead of leaving the user to guess (#305).
-        let base = tr("%@ used", Format.percent(pct, fractionDigits: 0))
         if pressureLevel >= 4 { return base + tr(" · critical pressure") }
         // Same contract as the banner (605a1006): a shed claim requires an
         // actual shed in the guard ring, never pressure level alone.

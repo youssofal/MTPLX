@@ -6,8 +6,8 @@ import MTPLXAppCore
 // Merged surface that replaces the V0 Cache + Requests pair. One
 // dashboard tab that answers "what is the engine doing right NOW and
 // what just happened?" — in-flight first because that's what the user
-// usually came to see, then recent completions, then SessionBank
-// state.
+// usually came to see, then why the last turn was fast or slow (speed
+// and cache truth), then recent completions, then SessionBank state.
 //
 // The original `CacheTab.swift` and `RequestsTab.swift` are kept
 // intact (no longer referenced by `AppTab` / `DashboardSurface` after
@@ -52,10 +52,13 @@ struct ActivityTab: View {
                         if shouldShowPiHandoff {
                             piHandoffCard()
                         }
-                        recentRequestsCard(recent: recent)
+                        // Why the last turn was fast or slow comes before the
+                        // history: the 32-row table used to push both truth
+                        // cards a few screens down.
                         speedTruthCard(latest: backend.latest)
-                        cacheSummaryCard(sessions: sessions, sessionBank: sessionBank)
                         cacheTruthCard(latest: backend.latest, sessionBank: sessionBank)
+                        recentRequestsCard(recent: recent)
+                        cacheSummaryCard(sessions: sessions, sessionBank: sessionBank)
                         bankCard(sessionBank: sessionBank)
                         sessionsListCard(sessions: sessions)
                     }
@@ -177,10 +180,12 @@ struct ActivityTab: View {
             }
         } content: {
             if requests.isEmpty {
+                // One line, not an 80 pt box: an idle engine is the common
+                // case and the card held the top of the tab empty.
                 Text(tr("Live requests will show up here. Hit Cancel to stop one."))
                     .font(.callout)
                     .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, minHeight: 80, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 VStack(spacing: 8) {
                     ForEach(requests) { request in
@@ -299,15 +304,17 @@ struct ActivityTab: View {
         }
     }
 
+    /// The session column takes the spare width and the figures sit at the
+    /// card's right edge, under the "live updates" badge; with fixed
+    /// columns the table filled the left 480 pt and left the rest empty.
     private var recentHeaderRow: some View {
         HStack {
-            Text(tr("Session")).frame(width: 120, alignment: .leading)
+            Text(tr("Session")).frame(minWidth: 120, maxWidth: .infinity, alignment: .leading)
             Text(tr("Decode")).frame(width: 80, alignment: .trailing)
             Text(tr("Prefill")).frame(width: 80, alignment: .trailing)
             Text(tr("TTFT")).frame(width: 70, alignment: .trailing)
             Text(tr("Tokens")).frame(width: 70, alignment: .trailing)
             Text(tr("Cache")).frame(width: 60, alignment: .trailing)
-            Spacer()
         }
         .font(.system(size: 10, weight: .semibold))
         .tracking(0.6)
@@ -316,20 +323,44 @@ struct ActivityTab: View {
     }
 
     private func recentRow(_ metric: MetricsLatest) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            recentFigures(metric)
+            // How long the turn thought before it answered, under its
+            // figures: nothing for a turn that did not think.
+            if let thinking = TurnThinking(metric) {
+                Label(thinking.summary, systemImage: "brain.head.profile")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func recentFigures(_ metric: MetricsLatest) -> some View {
         HStack {
             Text(metric.sessionId.map { String($0.prefix(12)) } ?? "—")
                 .font(.system(.caption, design: .monospaced))
-                .frame(width: 120, alignment: .leading)
+                .frame(minWidth: 120, maxWidth: .infinity, alignment: .leading)
                 .lineLimit(1)
             Text(Format.tps(metric.decodeTokS))
                 .font(.system(.caption, design: .rounded))
                 .monospacedDigit()
                 .frame(width: 80, alignment: .trailing)
-            Text(Format.tps(metric.prefillTokS))
-                .font(.system(.caption, design: .rounded))
-                .monospacedDigit()
-                .foregroundStyle(.secondary)
-                .frame(width: 80, alignment: .trailing)
+            HStack(spacing: 3) {
+                if metric.prefillThrottled, metric.readablePrefillTokS != nil {
+                    Image(systemName: "thermometer.high")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(Brand.warning)
+                        .help(Self.throttledReadNote)
+                        .accessibilityLabel(Self.throttledReadNote)
+                }
+                Text(prefillCell(metric))
+                    .font(.system(.caption, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            .frame(width: 80, alignment: .trailing)
             Text(Format.duration(metric.ttftS))
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -342,9 +373,19 @@ struct ActivityTab: View {
                 .font(.caption2)
                 .foregroundStyle(cacheVerdictTint(metric.requestCacheVerdict))
                 .frame(width: 60, alignment: .trailing)
-            Spacer()
         }
-        .padding(.vertical, 4)
+    }
+
+    private static var throttledReadNote: String {
+        tr("Read while macOS was slowing the GPU because the Mac was hot.")
+    }
+
+    /// A turn's prefill rate only when it read 2K+ new tokens; "cached" for a
+    /// cached turn that read less (its "rate" is one pass's fixed cost).
+    private func prefillCell(_ metric: MetricsLatest) -> String {
+        if let rate = metric.readablePrefillTokS { return Format.tps(rate) }
+        if let cached = metric.cachedTokens, cached > 0 { return tr("cached") }
+        return "—"
     }
 
     @ViewBuilder
@@ -366,6 +407,14 @@ struct ActivityTab: View {
                     systemImage: "speedometer",
                     tint: speedVerdict(latest).tint
                 )
+                if let thinking = latest.flatMap(TurnThinking.init) {
+                    truthRow(
+                        tr("Thinking"),
+                        thinking.summary,
+                        systemImage: "brain.head.profile",
+                        tint: Brand.accentChrome
+                    )
+                }
                 truthRow(
                     tr("Agent lane"),
                     agentLaneText(latest),
@@ -477,8 +526,10 @@ struct ActivityTab: View {
         if let ttft = latest.ttftS {
             parts.append(tr("TTFT %@", Format.duration(ttft)))
         }
-        if let prefill = latest.prefillTokS {
-            parts.append(tr("%@ tok/s", Format.tps(prefill)))
+        if let prefill = latest.readablePrefillTokS {
+            parts.append(latest.prefillThrottled
+                ? tr("%@ tok/s, throttled", Format.tps(prefill))
+                : tr("%@ tok/s", Format.tps(prefill)))
         }
         if let cached = latest.cachedTokens, cached > 0 {
             parts.append(tr("%@ cached", Format.integer(cached)))
@@ -528,7 +579,7 @@ struct ActivityTab: View {
             }
         }
         if latest.transcriptCanonicalized == true {
-            parts.append("compacted")
+            parts.append(tr("compacted"))
         }
         if let activeRead = latest.transcriptCompactedActiveReadChars,
            activeRead > 0 {
@@ -539,30 +590,30 @@ struct ActivityTab: View {
 
     private func speedVerdict(_ latest: MetricsLatest?) -> (label: String, symbol: String, tint: Color, emphasized: Bool) {
         guard let latest else {
-            return ("waiting", "clock", .secondary, false)
+            return (tr("waiting"), "clock", .secondary, false)
         }
         let userRate = latest.decodeTokS ?? latest.requestTokS
         let displayRate = latest.decodeTokS ?? latest.displayDecodeTokS
         let prompt = latest.promptTokens ?? 0
         if let userRate {
             if prompt >= 10_000 && userRate >= 25 {
-                return ("long turn healthy", "checkmark.seal.fill", Brand.success, false)
+                return (tr("long turn healthy"), "checkmark.seal.fill", Brand.success, false)
             }
             if prompt >= 10_000 && userRate < 20 {
-                return ("long turn sludge", "exclamationmark.triangle.fill", Brand.warning, true)
+                return (tr("long turn slow"), "exclamationmark.triangle.fill", Brand.warning, true)
             }
             if userRate >= 30 {
-                return ("healthy", "checkmark.seal.fill", Brand.success, false)
+                return (tr("healthy"), "checkmark.seal.fill", Brand.success, false)
             }
             if let displayRate, displayRate >= 30, userRate >= 25 {
-                return ("decode healthy", "checkmark.seal.fill", Brand.success, false)
+                return (tr("decode healthy"), "checkmark.seal.fill", Brand.success, false)
             }
             if userRate < 15 {
-                return ("slow", "exclamationmark.triangle.fill", Brand.warning, true)
+                return (tr("slow"), "exclamationmark.triangle.fill", Brand.warning, true)
             }
-            return ("watch", "gauge.medium", Brand.warning, false)
+            return (tr("watch"), "gauge.medium", Brand.warning, false)
         }
-        return ("no speed sample", "clock", .secondary, false)
+        return (tr("no speed sample"), "clock", .secondary, false)
     }
 
     private func agentLaneTint(_ latest: MetricsLatest?) -> Color {
@@ -583,6 +634,9 @@ struct ActivityTab: View {
 
     private func prefillTint(_ latest: MetricsLatest?) -> Color {
         guard let latest else { return .secondary }
+        if latest.prefillThrottled, latest.readablePrefillTokS != nil {
+            return Brand.warning
+        }
         if latest.sessionCacheHit == true || latest.cachedTokens ?? 0 > 0 {
             return Brand.success
         }
@@ -617,7 +671,7 @@ struct ActivityTab: View {
     @ViewBuilder
     private func cacheSummaryCard(sessions: SessionsPayload?, sessionBank: SessionBank?) -> some View {
         Card(tr("Cache Summary")) {
-            HStack(spacing: 24) {
+            HStack(alignment: .top, spacing: 24) {
                 StatTile(
                     label: tr("Sessions"),
                     value: Format.integer(sessions?.count ?? sessions?.sessions.count),
@@ -644,7 +698,8 @@ struct ActivityTab: View {
                     value: CacheExplanation.missReason(sessionBank?.lastMissReason) ?? "—",
                     systemImage: "questionmark.circle",
                     tint: (sessionBank?.lastMissReason).flatMap { $0.isEmpty ? nil : $0 } == nil
-                        ? .secondary : .mtplxWarning
+                        ? .secondary : .mtplxWarning,
+                    isSentence: CacheExplanation.missReason(sessionBank?.lastMissReason) != nil
                 )
             }
         }

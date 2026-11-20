@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 
 from mtplx.kpi.runtime_kpis import exact_paged_attention_env, run_exactness_smoke, summarize_decode_trace
 
@@ -46,6 +47,9 @@ def test_exact_paged_attention_env_defaults_to_vector_impl():
 
 
 def test_run_exactness_smoke_uses_vector_paged_profile(monkeypatch, tmp_path):
+    from mtplx.kpi import runtime_kpis
+
+    monkeypatch.setattr(runtime_kpis, "repo_root", lambda: Path(__file__).resolve().parents[1])
     seen = {}
 
     def fake_run(cmd, **kwargs):

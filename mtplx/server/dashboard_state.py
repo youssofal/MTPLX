@@ -411,8 +411,21 @@ def _percentile(values: list[float], pct: float) -> float | None:
 # ---- LifetimeCounters -----------------------------------------------------
 
 
+# A prompt read of fewer new tokens has no speed worth reporting: one forward
+# pass costs about as much for 19 tokens as for a few hundred, so its "rate"
+# is that pass's fixed cost over a small count. The app's
+# MetricsLatest.readablePrefillTokens is the same number.
+READABLE_PREFILL_TOKENS = 2048
+
+
 class LifetimeCounters:
-    """Process-lifetime token and request counters surfaced as a hero tile."""
+    """Process-lifetime token and request counters surfaced as a hero tile.
+
+    The prefill-read totals give the server's lifetime prompt-read speed
+    weighted by tokens (all new tokens over all the time spent reading them,
+    reads of READABLE_PREFILL_TOKENS or more), and how many of those reads
+    ran on a throttled chip, so a slow figure says why it is slow.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -422,6 +435,26 @@ class LifetimeCounters:
         self.cached_tokens_total: int = 0
         self.requests_total: int = 0
         self.cancelled_total: int = 0
+        self.prefill_reads_total: int = 0
+        self.prefill_read_tokens_total: int = 0
+        self.prefill_read_seconds_total: float = 0.0
+        self.prefill_read_peak_tok_s: float = 0.0
+        self.prefill_throttled_reads_total: int = 0
+
+    def record_prefill_read(self, *, tokens: int, tok_s: float, throttled: bool) -> bool:
+        """Count one prompt read; False when it is too short to be a speed."""
+
+        tokens = int(tokens or 0)
+        readable_rate = isinstance(tok_s, (int, float)) and math.isfinite(tok_s) and tok_s > 0
+        if tokens < READABLE_PREFILL_TOKENS or not readable_rate:
+            return False
+        with self._lock:
+            self.prefill_reads_total += 1
+            self.prefill_read_tokens_total += tokens
+            self.prefill_read_seconds_total += tokens / float(tok_s)
+            self.prefill_read_peak_tok_s = max(self.prefill_read_peak_tok_s, float(tok_s))
+            self.prefill_throttled_reads_total += int(bool(throttled))
+        return True
 
     def record_completion(
         self,
@@ -451,6 +484,11 @@ class LifetimeCounters:
                 "tokens_total": self.prompt_tokens_total + self.completion_tokens_total,
                 "requests_total": self.requests_total,
                 "cancelled_total": self.cancelled_total,
+                "prefill_reads_total": self.prefill_reads_total,
+                "prefill_read_tokens_total": self.prefill_read_tokens_total,
+                "prefill_read_seconds_total": self.prefill_read_seconds_total,
+                "prefill_read_peak_tok_s": self.prefill_read_peak_tok_s,
+                "prefill_throttled_reads_total": self.prefill_throttled_reads_total,
             }
 
 

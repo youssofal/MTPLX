@@ -1140,13 +1140,17 @@ public final class DaemonSupervisor: @unchecked Sendable {
         )
     }
 
+    /// `ownsLaunch` false holds a server this app did not start: its launch
+    /// id (another app's, or none) is not recorded, so nothing confirms its
+    /// pid as this app's and Stop never signals it.
     private func adoptCurrentLaunch(
         _ health: HealthPayload,
         healthBaseURL: URL,
         apiKey: String?,
         generation: Int,
         lifecycleEpoch: Int,
-        automaticAttempt: Int?
+        automaticAttempt: Int?,
+        ownsLaunch: Bool = true
     ) -> Bool {
         let pid = health.startup?.pid.map(pid_t.init)
         return lock.withLock {
@@ -1157,7 +1161,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
                process == nil, adoptedProcessID == nil, !launchInProgress
             else { return false }
             adoptedProcessID = pid
-            adoptedLaunchID = health.startup?.launchId
+            adoptedLaunchID = ownsLaunch ? health.startup?.launchId : nil
             heldBaseURL = healthBaseURL
             heldAPIKey = apiKey
             lastOwnedLaunch = nil
@@ -1195,6 +1199,63 @@ public final class DaemonSupervisor: @unchecked Sendable {
         requireActualFanRamp: Bool
     ) -> Bool {
         canAdopt(health, for: command, requireActualFanRamp: requireActualFanRamp)
+    }
+
+    /// Hold an MTPLX server this app did not start (`mtplx serve` in a
+    /// terminal, a server another copy of the app runs) that already serves
+    /// the model a start asked for, instead of loading that model a second
+    /// time: the app shows it and its clients use it. It is held without a
+    /// launch id, so Stop never signals it (`stop` signals only a pid that
+    /// carries this app's launch id): the app lets go and the server keeps
+    /// running. Nil when the server stopped answering or reports no pid to
+    /// watch; throws `alreadyRunning` when something is held already.
+    public func attachRunningServer(
+        healthBaseURL: URL,
+        apiKey: String? = nil
+    ) async throws -> HealthPayload? {
+        let attachment = try lock.withLock { () throws -> (generation: Int, lifecycleEpoch: Int) in
+            if process != nil || adoptedProcessID != nil || launchInProgress {
+                throw DaemonSupervisorError.alreadyRunning
+            }
+            restartGeneration &+= 1
+            cancelRestartTaskLocked()
+            lastOwnedLaunch = nil
+            ownedLaunchID = nil
+            automaticRestartEligible = false
+            automaticLaunchGeneration = nil
+            restartStatus = .idle
+            restartCount = 0
+            lifecycleEpoch &+= 1
+            state = .starting
+            return (restartGeneration, lifecycleEpoch)
+        }
+        notifyStatusObserver()
+        guard let existing = await initialHealthProbe(healthBaseURL, apiKey),
+              existing.ok,
+              existing.startup?.pid != nil,
+              adoptCurrentLaunch(
+                  existing,
+                  healthBaseURL: healthBaseURL,
+                  apiKey: apiKey,
+                  generation: attachment.generation,
+                  lifecycleEpoch: attachment.lifecycleEpoch,
+                  automaticAttempt: nil,
+                  ownsLaunch: false
+              )
+        else {
+            abortUnstartedLaunch(
+                generation: attachment.generation,
+                lifecycleEpoch: attachment.lifecycleEpoch
+            )
+            return nil
+        }
+        notifyStatusObserver()
+        await logStore.append(
+            "attached to the MTPLX server at \(healthBaseURL.absoluteString) (pid \(existing.startup?.pid.map(String.init) ?? "unknown"), model \(existing.modelPath)), "
+                + "started outside this app; it already serves this model, so no second copy is loaded, and Stop will let go of it without signalling it",
+            stream: .system
+        )
+        return existing
     }
 
     public func adoptExistingIfAppOwned(
@@ -1348,8 +1409,17 @@ public final class DaemonSupervisor: @unchecked Sendable {
             ? stopContext.adoptedLaunchID
             : stopContext.launchID
         var unconfirmedPIDs: [pid_t] = []
+        // A server held without a launch id is one this app attached to and
+        // did not start (`attachRunningServer`): let go of it, never signal it.
+        let attachedServerPID = stopContext.adoptedLaunchID == nil ? stopContext.adoptedPID : nil
+        if let attachedServerPID {
+            await logStore.append(
+                "stop: letting go of the MTPLX server pid \(attachedServerPID), started outside this app; it keeps running",
+                stream: .system
+            )
+        }
         let otherPIDs = ([stopContext.adoptedPID].compactMap { $0 } + additionalProcessIDs)
-            .filter { $0 > 1 }
+            .filter { $0 > 1 && $0 != attachedServerPID }
         for pid in otherPIDs where !rootPIDs.contains(pid) && !unconfirmedPIDs.contains(pid) {
             if let confirmingLaunchID, Self.appLaunchID(ofProcess: pid) == confirmingLaunchID {
                 rootPIDs.append(pid)

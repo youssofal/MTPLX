@@ -50,15 +50,40 @@ def _stream_attempt_totals(attempts: list[dict[str, Any]]) -> dict[str, Any]:
     return totals
 
 
+def _note_metrics_rows_changed(state: Any) -> None:
+    """A dashboard row (state.last_metrics) was added or updated in place:
+    metrics streams that send the rows only when they change send them again."""
+    state.metrics_revision = int(getattr(state, "metrics_revision", 0) or 0) + 1
+
+
+DASHBOARD_ROWS_KEPT = 100
+
+
+def _append_metrics_row(state: Any, row: dict[str, Any]) -> None:
+    """A finished request's row joins the dashboard ring: appended, the ring
+    trimmed to its last 100 rows, and the change noted for the metrics
+    streams that send the rows only when they change. The one way a row is
+    added, so no path can add one without the note."""
+    state.last_metrics.append(row)
+    state.last_metrics = state.last_metrics[-DASHBOARD_ROWS_KEPT:]
+    _note_metrics_rows_changed(state)
+
+
 def _metric_for_request(state: Any, request_id: Any) -> dict[str, Any] | None:
-    """Return the last pass of this request, never an unrelated completion."""
+    """Return the last pass of this request, never an unrelated completion.
+
+    Every caller updates the row it gets in place, so finding one counts as
+    a change of the dashboard rows."""
     if request_id is None:
         return None
-    return next(
+    row = next(
         (row for row in reversed(getattr(state, "last_metrics", ()))
          if row.get("request_id") == request_id),
         None,
     )
+    if row is not None:
+        _note_metrics_rows_changed(state)
+    return row
 
 
 def _update_recovery_metrics(state: Any, stats: dict[str, Any]) -> None:

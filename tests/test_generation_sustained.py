@@ -339,10 +339,63 @@ def test_contiguous_dense_decode_cache_layout_does_not_repage(monkeypatch):
     assert os.environ["MTPLX_BLOCK_OWNED_ATTN_KV"] == "1"
 
 
-def test_session_restore_uses_prefill_layout_cache_factory(monkeypatch):
+def test_session_restore_takes_the_lease_under_a_prefill_layout_by_default(monkeypatch):
+    # Every client, not only the coding-agent launch lane: an exact restore
+    # asks the bank for the conversation's own lease; the prefill layout's
+    # cache factory still goes along for the clone fallback.
     monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL_LAYOUT", "contiguous_dense_decode")
     monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN", "1")
+    monkeypatch.delenv("MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE", raising=False)
+    monkeypatch.delenv("MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER", raising=False)
+    model = TinyModel()
+    rt = _runtime(model, mtp_enabled=True)
+    captured: dict[str, object] = {}
+
+    class Bank:
+        last_miss_reason = None
+
+        def longest_prefix(self, _prompt_ids):
+            return SimpleNamespace(prefix_len=3)
+
+        def restore(self, _rt, _prompt_ids, **kwargs):
+            captured.update(kwargs)
+            assert callable(kwargs["cache_factory"])
+            return SimpleNamespace(
+                entry=SimpleNamespace(prefix_len=3),
+                cache=["lease-cache"],
+                logits=mx.zeros((1, 4), dtype=mx.float32),
+                hidden=mx.zeros((1, 1, 2), dtype=mx.float32),
+                mtp_history_cache=[],
+                restore_mode="reference_lease",
+            )
+
+    prompt_state = restore_or_prefill_prompt_state(
+        rt,
+        [0, 1, 2, 3, 4],
+        mtp_history_policy="committed",
+        session_bank=Bank(),
+        restore_mode="reference_lease",
+    )
+
+    assert captured["mode"] == "reference_lease"
+    assert prompt_state.cache_hit is True
+    assert prompt_state.restore_mode == "reference_lease"
+
+
+@pytest.mark.parametrize(
+    "switch",
+    ["MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE", "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER"],
+)
+def test_session_restore_uses_prefill_layout_cache_factory(monkeypatch, switch):
+    # The rollback: either switch at 0 copies the banked state into a cache
+    # of the prefill layout, as every bare-serve restore did before.
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL_LAYOUT", "contiguous_dense_decode")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN", "1")
+    monkeypatch.delenv("MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE", raising=False)
+    monkeypatch.delenv("MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER", raising=False)
+    monkeypatch.setenv(switch, "0")
     model = TinyModel()
     rt = _runtime(model, mtp_enabled=True)
     captured: dict[str, object] = {}
@@ -419,6 +472,48 @@ def test_live_frontier_reference_restore_survives_prefill_layout_factory(monkeyp
     assert captured["cache_factory"] is not None
     assert prompt_state.cache_hit is True
     assert prompt_state.restore_mode == "reference_lease"
+
+
+def test_an_explicit_clone_request_still_clones_under_a_prefill_layout(monkeypatch):
+    # A client's x-mtplx-restore-mode: clone, and OpenCode's forced clone on
+    # bare serve, reach the bank as clone whatever the default.
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL_LAYOUT", "contiguous_dense_decode")
+    monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN", "1")
+    monkeypatch.delenv("MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE", raising=False)
+    monkeypatch.delenv("MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER", raising=False)
+    model = TinyModel()
+    rt = _runtime(model, mtp_enabled=True)
+    captured: dict[str, object] = {}
+
+    class Bank:
+        last_miss_reason = None
+
+        def longest_prefix(self, _prompt_ids):
+            return SimpleNamespace(prefix_len=3)
+
+        def restore(self, _rt, _prompt_ids, **kwargs):
+            captured.update(kwargs)
+            cache_factory = kwargs["cache_factory"]
+            return SimpleNamespace(
+                entry=SimpleNamespace(prefix_len=3),
+                cache=cache_factory(),
+                logits=mx.zeros((1, 4), dtype=mx.float32),
+                hidden=mx.zeros((1, 1, 2), dtype=mx.float32),
+                mtp_history_cache=[],
+                restore_mode="clone",
+            )
+
+    prompt_state = restore_or_prefill_prompt_state(
+        rt,
+        [0, 1, 2, 3, 4],
+        mtp_history_policy="committed",
+        session_bank=Bank(),
+        restore_mode="clone",
+    )
+
+    assert captured["mode"] == "clone"
+    assert prompt_state.restore_mode == "clone"
 
 
 def test_auto_sustained_prefill_policy_keeps_dense_decode_through_128k(monkeypatch):

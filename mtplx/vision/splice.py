@@ -10,10 +10,13 @@ injection when enabled.
 
 from __future__ import annotations
 
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 import mlx.core as mx
+import numpy as np
 
 
 @dataclass
@@ -163,30 +166,70 @@ def vision_bank_key_ids(
     if not digests or not pad_counts or len(digests) != len(pad_counts):
         return None
     pad_id = splice.image_pad_token_id
-    total_pads = sum(1 for token in prompt_ids if token == pad_id)
-    if total_pads != sum(int(count) for count in pad_counts):
-        return None
     keyed = list(prompt_ids)
+    counts = [int(count) for count in pad_counts]
+    if keyed.count(pad_id) != sum(counts):
+        return None
     salts = _position_scheme_salts(splice, len(digests))
-    image_idx = 0
-    row_in_image = 0
-    for pos, token in enumerate(keyed):
-        if token != pad_id:
+    # Only the pad positions change, so only they are touched: each image's
+    # rows are found with the list's own scans and written as one slice when
+    # they are one run, as the expanded ids always lay them out (a request is
+    # served 150K ids and 18 images several times over; a Python step per id
+    # cost 20 ms a pass). Rows go to the pads in order either way.
+    position = 0
+    for index, count in enumerate(counts):
+        if count <= 0:
             continue
-        while row_in_image >= int(pad_counts[image_idx]):
-            image_idx += 1
-            row_in_image = 0
-        mixed = (
-            (
-                int(digests[image_idx])
-                ^ (row_in_image * _BANK_KEY_MIX)
-                ^ salts[image_idx]
-            )
-            & _BANK_KEY_MASK
-        )
-        keyed[pos] = _BANK_KEY_FLAG | mixed
-        row_in_image += 1
+        keys = _image_row_keys(int(digests[index]), salts[index], count)
+        position = keyed.index(pad_id, position)
+        end = position + count
+        if keyed[position:end] == [pad_id] * count:
+            keyed[position:end] = keys
+            position = end
+            continue
+        for key in keys:
+            position = keyed.index(pad_id, position)
+            keyed[position] = key
+            position += 1
     return keyed
+
+
+# Row keys of recently keyed images, by (digest, salt, rows): a conversation
+# keys the same screenshots on every request. Bounded by rows, as the
+# embedding cache is (about 1.4 MB at this bound).
+_ROW_KEYS: OrderedDict[tuple[int, int, int], tuple[int, ...]] = OrderedDict()
+_ROW_KEYS_MAX_ROWS = 32768
+_ROW_KEYS_LOCK = threading.Lock()
+
+
+def _image_row_keys(digest: int, salt: int, count: int) -> tuple[int, ...]:
+    """The surrogate of every row of one image: what ``vision_bank_key_ids``
+    writes over that image's pads."""
+
+    memo_key = (int(digest), int(salt), int(count))
+    with _ROW_KEYS_LOCK:
+        keys = _ROW_KEYS.get(memo_key)
+        if keys is not None:
+            _ROW_KEYS.move_to_end(memo_key)
+            return keys
+    keys = tuple(
+        _BANK_KEY_FLAG | ((memo_key[0] ^ (row * _BANK_KEY_MIX) ^ memo_key[1]) & _BANK_KEY_MASK)
+        for row in range(memo_key[2])
+    )
+    with _ROW_KEYS_LOCK:
+        _ROW_KEYS[memo_key] = keys
+        held = sum(key[2] for key in _ROW_KEYS)
+        while held > _ROW_KEYS_MAX_ROWS and len(_ROW_KEYS) > 1:
+            dropped, _ = _ROW_KEYS.popitem(last=False)
+            held -= dropped[2]
+    return keys
+
+
+def _as_int64(token_ids: Sequence[int]) -> np.ndarray:
+    """Token ids as one int64 array: every model id and every surrogate
+    (below 2**63) fits, so a comparison on it is the comparison on the ids."""
+
+    return np.asarray(token_ids, dtype=np.int64)
 
 
 def vision_image_spans(
@@ -208,11 +251,8 @@ def vision_image_spans(
     if not pad_counts:
         return None
     pad_id = splice.image_pad_token_id
-    positions = [
-        pos
-        for pos, token in enumerate(prompt_ids)
-        if token == pad_id or (int(token) & _BANK_KEY_FLAG)
-    ]
+    ids = _as_int64(prompt_ids)
+    positions = np.flatnonzero((ids == int(pad_id)) | ((ids & _BANK_KEY_FLAG) != 0))
     if len(positions) != sum(int(c) for c in pad_counts):
         return None
     spans: list[tuple[int, int]] = []
@@ -221,8 +261,7 @@ def vision_image_spans(
         count = int(count)
         if count <= 0:
             continue
-        run = positions[cursor : cursor + count]
-        spans.append((run[0], run[-1] + 1))
+        spans.append((int(positions[cursor]), int(positions[cursor + count - 1]) + 1))
         cursor += count
     return spans
 
@@ -265,18 +304,11 @@ def image_key_runs(keyed_ids: Sequence[int]) -> list[tuple[int, int]]:
     read as one run, which only makes every rule built on runs stricter.
     """
 
-    runs: list[tuple[int, int]] = []
-    start: int | None = None
-    for position, token in enumerate(keyed_ids):
-        if is_image_key(token):
-            if start is None:
-                start = position
-        elif start is not None:
-            runs.append((start, position))
-            start = None
-    if start is not None:
-        runs.append((start, len(keyed_ids)))
-    return runs
+    if len(keyed_ids) == 0:
+        return []
+    rows = ((_as_int64(keyed_ids) & _BANK_KEY_FLAG) != 0).astype(np.int8)
+    edges = np.flatnonzero(np.diff(rows, prepend=0, append=0))
+    return [(int(start), int(end)) for start, end in zip(edges[0::2], edges[1::2])]
 
 
 def unkeyed_ids(keyed_ids: Sequence[int], image_pad_token_id: int) -> list[int]:
@@ -286,8 +318,10 @@ def unkeyed_ids(keyed_ids: Sequence[int], image_pad_token_id: int) -> list[int]:
     tokenizer can decode.
     """
 
-    pad = int(image_pad_token_id)
-    return [pad if is_image_key(token) else int(token) for token in keyed_ids]
+    if len(keyed_ids) == 0:
+        return []
+    ids = _as_int64(keyed_ids)
+    return np.where((ids & _BANK_KEY_FLAG) != 0, int(image_pad_token_id), ids).tolist()
 
 
 def inside_image(keyed_ids: Sequence[int], position: int) -> bool:

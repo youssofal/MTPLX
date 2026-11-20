@@ -1,0 +1,53 @@
+id = "code-parse-duration"
+kind = "code"
+prompt = '''
+Write a Python function `parse_duration(text)` that converts a duration string into a whole number of seconds.
+
+A duration is one or more parts. Each part is a positive integer written without leading zeros, followed by one unit letter: `d` (days), `h` (hours), `m` (minutes) or `s` (seconds). Consecutive parts may be separated by a single space. Each unit appears at most once, and units appear in the order d, h, m, s.
+
+Examples: `parse_duration("1h30m")` returns `5400`, `parse_duration("2d 4h")` returns `187200`, `parse_duration("45s")` returns `45`.
+
+Raise `ValueError` for anything else: an empty string, a number without a unit, a unit without a number, an unknown unit, a repeated unit, units out of order, zero, leading zeros, a sign, leading or trailing whitespace, or more than one space between parts.
+
+Reply with the complete function in one fenced Python code block.
+'''
+tests = '''
+assert parse_duration("1h30m") == 5400
+assert parse_duration("2d 4h") == 187200
+assert parse_duration("45s") == 45
+assert parse_duration("1d2h3m4s") == 93784
+assert parse_duration("1h 1s") == 3601
+assert parse_duration("10m") == 600
+assert parse_duration("120s") == 120
+for bad in ["", "h", "5", "5x", "1m1h", "1h1h", "05m", "0s", "-5m", "+5m", " 5m", "5m ", "1h  2m", "1h,2m", "1.5h"]:
+    try:
+        parse_duration(bad)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(f"accepted {bad!r}")
+'''
+reference = '''
+import re
+
+_PART = re.compile(r"([1-9][0-9]*)([dhms])")
+_SECONDS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+
+
+def parse_duration(text):
+    total, last, pos = 0, -1, 0
+    while True:
+        match = _PART.match(text, pos)
+        if match is None:
+            raise ValueError(f"not a duration: {text!r}")
+        unit = "dhms".index(match.group(2))
+        if unit <= last:
+            raise ValueError(f"unit repeated or out of order: {text!r}")
+        last = unit
+        total += int(match.group(1)) * _SECONDS[match.group(2)]
+        pos = match.end()
+        if pos == len(text):
+            return total
+        if text[pos] == " ":
+            pos += 1
+'''

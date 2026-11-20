@@ -12,6 +12,8 @@ tool search) are rejected because MTPLX cannot execute them.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import re
@@ -20,6 +22,7 @@ import uuid
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Mapping
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict
 
@@ -120,6 +123,77 @@ def _text(value: Any, *, field_name: str) -> str:
     return "".join(chunks)
 
 
+def _content_to_chat(value: Any, *, field_name: str) -> str | list[dict[str, Any]]:
+    """Preserve text-only bytes; translate structured images for the vision path.
+
+    Fetching/decoding remains in the existing chat runtime, with its existing
+    limits and policy. File IDs cannot be resolved by this stateless bridge.
+    """
+    if not isinstance(value, list):
+        return _text(value, field_name=field_name)
+    parts: list[dict[str, Any]] = []
+    text_run: list[str] = []
+    saw_image = False
+
+    def flush_text() -> None:
+        if text_run:
+            parts.append({"type": "text", "text": "".join(text_run)})
+            text_run.clear()
+
+    for index, part in enumerate(value):
+        name = f"{field_name}[{index}]"
+        if not isinstance(part, Mapping):
+            raise unsupported(f"{name} must be a text or input_image part")
+        part_type = str(part.get("type") or "").strip().lower()
+        if part_type != "input_image":
+            # Use the original strict text parser, including its errors.
+            text_run.append(_text([part], field_name=name))
+            continue
+        unknown = set(part) - {"type", "image_url", "detail", "file_id"}
+        if unknown:
+            raise unsupported(f"{name} input_image has unsupported key(s): "
+                              + ", ".join(sorted(unknown)))
+        if part.get("file_id") is not None:
+            raise unsupported(f"{name}.file_id is not supported; use image_url")
+        url = part.get("image_url")
+        if not isinstance(url, str) or not url or any(c.isspace() for c in url):
+            raise unsupported(f"{name}.image_url must be a non-empty URL string without whitespace")
+        if url.startswith("data:"):
+            header, separator, payload = url.partition(",")
+            if (not separator or not re.fullmatch(r"data:image/[A-Za-z0-9.+-]+;base64", header)
+                    or not payload):
+                raise unsupported(f"{name}.image_url must be a base64 image data URL")
+            try:
+                base64.b64decode(payload, validate=True)
+            except (ValueError, binascii.Error):
+                raise unsupported(f"{name}.image_url has invalid base64 image data") from None
+        else:
+            try:
+                parsed = urlsplit(url)
+                valid = url.startswith(("http://", "https://")) and bool(parsed.hostname)
+                _ = parsed.port  # Validate numeric port/range even when unused.
+                valid = valid and parsed.username is None and parsed.password is None
+            except ValueError:
+                valid = False
+            if not valid:
+                raise unsupported(f"{name}.image_url must be an http(s) URL or base64 image data URL")
+        detail = part.get("detail")
+        if detail is not None and (
+            not isinstance(detail, str) or detail not in {"auto", "low", "high", "original"}
+        ):
+            raise unsupported(f"{name}.detail must be auto, low, high, or original")
+        image_url: dict[str, Any] = {"url": url}
+        if detail is not None:
+            image_url["detail"] = detail
+        flush_text()
+        parts.append({"type": "image_url", "image_url": image_url})
+        saw_image = True
+    if not saw_image:
+        return "".join(text_run)
+    flush_text()
+    return parts
+
+
 def _arguments(value: Any, *, field_name: str) -> str:
     if isinstance(value, str):
         return value
@@ -172,7 +246,9 @@ def _function_chat_tool(
     return {"type": "function", "function": function}
 
 
-def _custom_chat_tool(tool: Mapping[str, Any], *, field_name: str) -> dict[str, Any]:
+def _custom_chat_tool(
+    tool: Mapping[str, Any], *, field_name: str, chat_name: str | None = None
+) -> dict[str, Any]:
     unknown = sorted(set(tool) - {"type", "name", "description", "format"})
     if unknown:
         raise unsupported(
@@ -188,7 +264,7 @@ def _custom_chat_tool(tool: Mapping[str, Any], *, field_name: str) -> dict[str, 
     return {
         "type": "function",
         "function": {
-            "name": name,
+            "name": chat_name or name,
             "description": (description + "\n\n" if description else "")
             + "Return the custom tool's freeform input in the input string.",
             "parameters": {
@@ -295,10 +371,11 @@ def convert_tools(tools: list[dict[str, Any]] | None) -> ToolConversion:
                 if not isinstance(nested, Mapping):
                     raise unsupported(f"{nested_field} must be an object")
                 nested_type = str(nested.get("type") or "").strip().lower()
-                if nested_type != "function":
+                if nested_type not in {"function", "custom"}:
                     raise unsupported(
                         f"{nested_field}.type={nested_type or '<missing>'!r} is not "
-                        "supported; namespace entries must be client-executed functions"
+                        "supported; namespace entries must be client-executed "
+                        "function or custom tools"
                     )
                 nested_name = str(nested.get("name") or "").strip()
                 if not nested_name:
@@ -309,11 +386,22 @@ def convert_tools(tools: list[dict[str, Any]] | None) -> ToolConversion:
                         f"{field_name} repeats namespace function {namespace}.{nested_name}"
                     )
                 flat_name = _namespace_chat_name(namespace, nested_name, used_names)
-                converted.append(
-                    _function_chat_tool(
-                        nested, field_name=nested_field, chat_name=flat_name
+                if nested_type == "custom":
+                    # A freeform tool in a namespace (the Codex desktop app's
+                    # functions namespace has one): called back as a
+                    # custom_tool_call carrying its namespace.
+                    converted.append(
+                        _custom_chat_tool(
+                            nested, field_name=nested_field, chat_name=flat_name
+                        )
                     )
-                )
+                    custom_names.add(flat_name)
+                else:
+                    converted.append(
+                        _function_chat_tool(
+                            nested, field_name=nested_field, chat_name=flat_name
+                        )
+                    )
                 identity = NamespaceFunction(namespace=namespace, name=nested_name)
                 namespace_functions[flat_name] = identity
                 namespace_flat_names[pair] = flat_name
@@ -347,6 +435,9 @@ def _input_to_chat_messages(
         if not isinstance(item, Mapping):
             raise unsupported(f"input[{index}] must be an object")
         item_type = str(item.get("type") or "message").strip().lower()
+        if item_type == "additional_tools":
+            # Declared with the request's tools (see _additional_tools).
+            continue
         if item_type in {"function_call", "custom_tool_call"}:
             call_id = str(item.get("call_id") or "").strip()
             name = str(item.get("name") or "").strip()
@@ -413,7 +504,7 @@ def _input_to_chat_messages(
                 {
                     "role": "tool",
                     "tool_call_id": call_id,
-                    "content": _text(
+                    "content": _content_to_chat(
                         item.get("output"), field_name=f"input[{index}].output"
                     ),
                 }
@@ -429,7 +520,7 @@ def _input_to_chat_messages(
         messages.append(
             {
                 "role": role,
-                "content": _text(
+                "content": (_content_to_chat if role == "user" else _text)(
                     item.get("content"), field_name=f"input[{index}].content"
                 ),
             }
@@ -437,6 +528,39 @@ def _input_to_chat_messages(
     if not messages:
         raise unsupported("input must contain at least one supported item")
     return messages
+
+
+def _additional_tools(input_value: Any) -> list[dict[str, Any]]:
+    """Tools an ``additional_tools`` input item adds during a thread.
+
+    A client that keeps its prompt prefix stable adds tools with a developer
+    item instead of changing ``tools`` and replays that item in its place on
+    every later request (the Codex desktop app does). The chat template lists
+    every tool up front, so these join the request's tools, in item order:
+    each request of the thread declares the same list and its prefix stays
+    reusable.
+    """
+
+    if not isinstance(input_value, list):
+        return []
+    tools: list[dict[str, Any]] = []
+    for index, item in enumerate(input_value):
+        if not isinstance(item, Mapping):
+            continue
+        if str(item.get("type") or "").strip().lower() != "additional_tools":
+            continue
+        role = str(item.get("role") or "developer").strip().lower()
+        if role not in {"developer", "system"}:
+            raise unsupported(
+                f"input[{index}] additional_tools must have the developer role"
+            )
+        declared = item.get("tools")
+        if not isinstance(declared, list) or not all(
+            isinstance(tool, Mapping) for tool in declared
+        ):
+            raise unsupported(f"input[{index}].tools must be a list of tool objects")
+        tools.extend(dict(tool) for tool in declared)
+    return tools
 
 
 def _tool_choice_to_chat(tool_choice: Any, tools: ToolConversion) -> Any:
@@ -537,16 +661,21 @@ def _reasoning_to_chat(reasoning: Any) -> tuple[str | None, str | None]:
         return None, None
     if not isinstance(reasoning, Mapping):
         raise unsupported("reasoning must be an object")
-    unknown = sorted(set(reasoning) - {"effort", "summary", _SUMMARY_DELIVERY_KEY})
+    unknown = sorted(
+        set(reasoning) - {"effort", "summary", "context", _SUMMARY_DELIVERY_KEY}
+    )
     if unknown:
         raise unsupported("reasoning has unsupported key(s): " + ", ".join(unknown))
     _validate_summary_delivery(reasoning, field_name="reasoning")
-    summary = reasoning.get("summary")
-    if summary not in {None, "none", "auto"}:
-        raise unsupported(
-            "reasoning.summary supports only auto/none; MTPLX emits no separate "
-            "reasoning summary item"
-        )
+    # MTPLX writes no separate reasoning summary item, so every summary style
+    # (auto, concise, detailed, none) gets the same answer; refusing the ones
+    # other than auto/none answered every turn of the Codex desktop app, which
+    # asks for "detailed", with a 400. Which earlier turns' reasoning the model
+    # sees ("context") is the loaded family's own preserve-thinking policy.
+    for key in ("summary", "context"):
+        value = reasoning.get(key)
+        if value is not None and not isinstance(value, str):
+            raise unsupported(f"reasoning.{key} must be a string")
     raw_effort = reasoning.get("effort")
     if raw_effort is None:
         return None, None
@@ -667,7 +796,12 @@ def translate_request(request: ResponsesRequest) -> ResponsesConversion:
             "max_output_tokens, max_tokens, and max_completion_tokens disagree"
         )
 
-    tool_conversion = convert_tools(request.tools)
+    added_tools = _additional_tools(request.input)
+    tool_conversion = convert_tools(
+        [*(request.tools or []), *added_tools]
+        if added_tools
+        else request.tools
+    )
     messages = _input_to_chat_messages(
         request.input,
         namespace_flat_names=tool_conversion.namespace_flat_names,
@@ -700,6 +834,8 @@ def translate_request(request: ResponsesRequest) -> ResponsesConversion:
         metadata["responses_text_verbosity"] = verbosity
     if request.reasoning and request.reasoning.get("summary") is not None:
         metadata["responses_reasoning_summary"] = request.reasoning["summary"]
+    if request.reasoning and request.reasoning.get("context") is not None:
+        metadata["responses_reasoning_context"] = request.reasoning["context"]
     if reasoning_requested is not None:
         metadata["responses_reasoning_effort_requested"] = reasoning_requested
     if request.stream_options:

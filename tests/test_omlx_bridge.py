@@ -128,7 +128,18 @@ def test_omlx_tool_parser_accepts_name_attribute_function_shape():
     }
 
 
-def test_omlx_tool_parser_orders_opencode_read_target_before_limit():
+@pytest.mark.parametrize(
+    "exact, prefix",
+    [
+        # #691: the model's own order, so the call the client sends back
+        # renders as the tokens the model generated.
+        ("1", '{"limit":100,"filePath":"src/game/Game.ts"'),
+        # MTPLX_TOOL_ARGUMENTS_EXACT=0: the earlier path-first order.
+        ("0", '{"filePath":"src/game/Game.ts","limit":100'),
+    ],
+)
+def test_omlx_tool_parser_read_argument_order(monkeypatch, exact, prefix):
+    monkeypatch.setenv("MTPLX_TOOL_ARGUMENTS_EXACT", exact)
     extraction = parse_tool_calls(
         "<tool_call>\n"
         "<function=read>\n"
@@ -142,7 +153,7 @@ def test_omlx_tool_parser_orders_opencode_read_target_before_limit():
 
     assert extraction.status == "parsed"
     arguments = extraction.tool_calls[0]["function"]["arguments"]
-    assert arguments.startswith('{"filePath":"src/game/Game.ts","limit":100')
+    assert arguments.startswith(prefix)
     assert json.loads(arguments) == {"filePath": "src/game/Game.ts", "limit": 100}
 
 

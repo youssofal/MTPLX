@@ -127,6 +127,33 @@ def test_a_cancelled_identical_retry_keeps_the_conversation(pack, lane):
     assert list(retried.tokens) == list(_answer(rt, reference_bank, prompt, turn=1).tokens)
 
 
+def test_another_message_after_a_cancelled_answer_resumes_where_that_turn_began(
+    pack, lane
+):
+    """The client cancels an answer and sends another message in its place:
+    the new prompt leaves the cancelled one where the finished turn ended.
+    The cancelled prompt's lease keeps a checkpoint there
+    (``one_copy.prompt_lease_fields``), so only the new message is read, and
+    the answer is the one an uninterrupted conversation gets. The nearest
+    checkpoint used to be the previous prompt's end, a whole answer back
+    (tests/test_cancelled_turn_resumes_in_ram.py has the 12 November case)."""
+    lane.setenv("MTPLX_SESSION_PREFIX_BLOCK_SIZE", "8")
+    lane.setenv("MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS", "8")
+    rt, hidden_variant = _runtime(pack, lane)
+    bank, prompt = _conversation(rt, hidden_variant)
+    finished = prompt[:-40]
+    _cancelled(rt, bank, prompt)
+
+    replaced = finished + _prompt(40, salt=9)
+    answer = _answer(rt, bank, replaced, turn=2)
+    assert answer.stats.cached_tokens == len(finished)
+    assert answer.stats.session_restore_mode.endswith("reference_lease")
+
+    reference_bank, _ = _conversation(rt, hidden_variant)
+    expected = _answer(rt, reference_bank, replaced, turn=2)
+    assert list(answer.tokens) == list(expected.tokens)
+
+
 def test_a_lease_whose_offset_cannot_be_read_is_not_served(monkeypatch):
     import mtplx.session_bank as session_bank
 

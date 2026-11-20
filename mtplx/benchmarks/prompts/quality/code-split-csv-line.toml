@@ -1,0 +1,57 @@
+id = "code-split-csv-line"
+kind = "code"
+prompt = '''
+Write a Python function `split_csv_line(line)` that splits one line of CSV text into a list of field strings.
+
+Fields are separated by commas. A field may be wrapped in double quotes; inside a quoted field a comma is part of the field and two double quotes in a row stand for one double quote character. The wrapping quotes are not part of the result. Whitespace is kept as it is. An empty line gives `['']`. Raise `ValueError` if a quoted field is never closed. You may assume a double quote only appears at the very start of a field or inside a quoted field.
+
+Reply with the complete function in one fenced Python code block.
+'''
+tests = '''
+assert split_csv_line("a,b,c") == ["a", "b", "c"]
+assert split_csv_line("") == [""]
+assert split_csv_line("a,,c") == ["a", "", "c"]
+assert split_csv_line("a,") == ["a", ""]
+assert split_csv_line(",") == ["", ""]
+assert split_csv_line('"a,b",c') == ["a,b", "c"]
+assert split_csv_line('"say ""hi""",x') == ['say "hi"', "x"]
+assert split_csv_line('""') == [""]
+assert split_csv_line('"",""') == ["", ""]
+assert split_csv_line(" a , b ") == [" a ", " b "]
+assert split_csv_line('x,"1,2,3",y') == ["x", "1,2,3", "y"]
+for bad in ['"unclosed', 'x,"y', '"a""']:
+    try:
+        split_csv_line(bad)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(f"accepted {bad!r}")
+'''
+reference = '''
+def split_csv_line(line):
+    fields, field, i = [], [], 0
+    quoted = False
+    while i < len(line):
+        ch = line[i]
+        if quoted:
+            if ch == '"':
+                if i + 1 < len(line) and line[i + 1] == '"':
+                    field.append('"')
+                    i += 1
+                else:
+                    quoted = False
+            else:
+                field.append(ch)
+        elif ch == '"' and not field:
+            quoted = True
+        elif ch == ",":
+            fields.append("".join(field))
+            field = []
+        else:
+            field.append(ch)
+        i += 1
+    if quoted:
+        raise ValueError("a quoted field is not closed")
+    fields.append("".join(field))
+    return fields
+'''

@@ -15,6 +15,9 @@ struct StatTile: View {
     var systemImage: String? = nil
     var tint: Color = Brand.accentChrome
     var caption: String? = nil
+    /// The value is a short sentence, not a number: smaller type, up to
+    /// two lines, the whole text on hover (one big line cut it off).
+    var isSentence: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -32,14 +35,23 @@ struct StatTile: View {
                     .minimumScaleFactor(0.65)
             }
             HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text(value)
-                    .font(.system(.title2, design: .rounded).weight(.bold))
-                    .foregroundStyle(tint)
-                    .monospacedDigit()
-                    .contentTransition(.numericText())
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.72)
-                    .layoutPriority(1)
+                if isSentence {
+                    Text(value)
+                        .font(.system(.callout, design: .rounded).weight(.semibold))
+                        .foregroundStyle(tint)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .help(value)
+                } else {
+                    Text(value)
+                        .font(.system(.title2, design: .rounded).weight(.bold))
+                        .foregroundStyle(tint)
+                        .monospacedDigit()
+                        .contentTransition(.numericText())
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.72)
+                        .layoutPriority(1)
+                }
                 if let unit {
                     Text(unit)
                         .font(.system(size: 10, weight: .semibold, design: .monospaced))

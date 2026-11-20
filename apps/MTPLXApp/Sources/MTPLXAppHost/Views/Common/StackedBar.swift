@@ -26,6 +26,9 @@ struct StackedBar: View {
     let segments: [StackedBarSegment]
     var total: Double? = nil
     var height: CGFloat = 18
+    /// Legend-only entries drawn after the segments' own (a peak, say):
+    /// they label the bar without taking a share of it.
+    var legendExtras: [StackedBarSegment] = []
 
     private var resolvedTotal: Double {
         if let total, total > 0 { return total }
@@ -53,7 +56,7 @@ struct StackedBar: View {
             .frame(height: height)
 
             FlowLayout(spacing: 12) {
-                ForEach(segments) { segment in
+                ForEach(segments + legendExtras) { segment in
                     HStack(spacing: 6) {
                         Circle()
                             .fill(segment.tint)

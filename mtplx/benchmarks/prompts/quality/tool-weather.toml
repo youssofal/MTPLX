@@ -1,0 +1,25 @@
+id = "tool-weather"
+kind = "tool"
+prompt = '''
+Is it cold in Lyon right now? Give me the temperature in Fahrenheit.
+'''
+tools_json = '''
+[
+  {"type": "function", "function": {
+    "name": "get_weather",
+    "description": "Current weather for a city.",
+    "parameters": {"type": "object", "properties": {
+      "city": {"type": "string", "description": "City name"},
+      "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}},
+      "required": ["city", "unit"]}}},
+  {"type": "function", "function": {
+    "name": "get_local_time",
+    "description": "Current local time in a city.",
+    "parameters": {"type": "object", "properties": {
+      "city": {"type": "string"}}, "required": ["city"]}}}
+]
+'''
+
+[[expect_calls]]
+name = "get_weather"
+args = { city = { contains = "lyon" }, unit = { equals = "fahrenheit" } }

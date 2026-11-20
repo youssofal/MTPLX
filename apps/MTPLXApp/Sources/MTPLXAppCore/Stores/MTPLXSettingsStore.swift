@@ -42,19 +42,53 @@ public struct SettingsLoadResult: Sendable {
 }
 
 public struct MTPLXSettingsStore: Sendable {
+    public enum ModelFolderSharing: Sendable {
+        /// The app's real settings file shares its model folders with the
+        /// CLI; a scratch or test settings path (and any XCTest run) never
+        /// touches the shared file.
+        case automatic
+        case off
+        case at(URL)
+    }
+
     public var settingsURL: URL
     public var encoder: JSONEncoder
     public var decoder: JSONDecoder
+    /// `~/.mtplx/config.toml` (`model_dir`, `model_dirs`), the model folders
+    /// the app and `mtplx folders` share; nil when this store must not use it.
+    public var sharedModelFoldersURL: URL?
 
     public init(
         settingsURL: URL = MTPLXSettingsStore.defaultSettingsURL(),
         encoder: JSONEncoder = JSONEncoder(),
-        decoder: JSONDecoder = JSONDecoder()
+        decoder: JSONDecoder = JSONDecoder(),
+        modelFolderSharing: ModelFolderSharing = .automatic
     ) {
         self.settingsURL = settingsURL
         self.encoder = encoder
         self.decoder = decoder
         self.encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        switch modelFolderSharing {
+        case .automatic:
+            let environment = ProcessInfo.processInfo.environment
+            let isProductionSettings = Self.settingsURLOverride(
+                environment: environment,
+                arguments: CommandLine.arguments
+            ) == nil && settingsURL == Self.defaultSettingsURL()
+            let underTest = environment["XCTestConfigurationFilePath"] != nil
+                || NSClassFromString("XCTestCase") != nil
+            self.sharedModelFoldersURL = isProductionSettings && !underTest
+                ? SharedModelFolders.configURL(environment: environment)
+                : nil
+            if isProductionSettings && !underTest {
+                ModelFolderIndex.location = settingsURL.deletingLastPathComponent()
+                    .appendingPathComponent("model-folders-seen.json")
+            }
+        case .off:
+            self.sharedModelFoldersURL = nil
+        case .at(let url):
+            self.sharedModelFoldersURL = url
+        }
     }
 
     /// Absent file: defaults. Readable file: the decoded configuration, with
@@ -67,15 +101,51 @@ public struct MTPLXSettingsStore: Sendable {
     /// `load()` that also reports every field the decoder had to degrade
     /// into `issues`.
     public func load(reporting issues: SettingsDecodeIssues?) throws -> MTPLXAppConfiguration {
-        guard FileManager.default.fileExists(atPath: settingsURL.path) else {
-            return MTPLXAppConfiguration()
+        var configuration: MTPLXAppConfiguration
+        if FileManager.default.fileExists(atPath: settingsURL.path) {
+            let data = try Data(contentsOf: settingsURL)
+            if let issues {
+                decoder.userInfo[SettingsDecodeIssues.userInfoKey] = issues
+            }
+            defer { decoder.userInfo.removeValue(forKey: SettingsDecodeIssues.userInfoKey) }
+            configuration = try decoder.decode(MTPLXAppConfiguration.self, from: data)
+        } else {
+            configuration = MTPLXAppConfiguration()
         }
-        let data = try Data(contentsOf: settingsURL)
-        if let issues {
-            decoder.userInfo[SettingsDecodeIssues.userInfoKey] = issues
+        applySharedModelFolders(to: &configuration, issues: issues)
+        return configuration
+    }
+
+    /// The shared file wins once either side has named folders in it. Until
+    /// then the app's own folders stay and are written there once, so the
+    /// CLI sees what the app was already using. An unreadable shared file is
+    /// reported and left as it is.
+    func applySharedModelFolders(
+        to configuration: inout MTPLXAppConfiguration,
+        issues: SettingsDecodeIssues?
+    ) {
+        guard let url = sharedModelFoldersURL else { return }
+        do {
+            if let shared = try SharedModelFolders.read(from: url), shared.isSet {
+                configuration.adoptSharedModelFolders(shared)
+                return
+            }
+            let defaults = MTPLXAppConfiguration()
+            let library = configuration.modelLibrary
+            if library.primaryDirectory != defaults.modelLibrary.primaryDirectory
+                || !library.additionalDirectories.isEmpty {
+                try SharedModelFolders.write(
+                    primary: library.primaryDirectory.path,
+                    additional: library.additionalDirectories.map(\.path),
+                    to: url
+                )
+            }
+        } catch {
+            issues?.record(SettingsDecodeIssue(
+                path: "model folders (\(url.path))",
+                reason: String(describing: error)
+            ))
         }
-        defer { decoder.userInfo.removeValue(forKey: SettingsDecodeIssues.userInfoKey) }
-        return try decoder.decode(MTPLXAppConfiguration.self, from: data)
     }
 
     /// The app's launch-time load. Distinguishes an absent file (fresh
@@ -133,6 +203,19 @@ public struct MTPLXSettingsStore: Sendable {
         )
         let data = try encoder.encode(configuration)
         try data.write(to: settingsURL, options: [.atomic])
+        // The same folders for `mtplx folders` and every CLI command. The
+        // write is skipped when the file already says exactly this; a shared
+        // file that cannot be read is left alone (load() reports it).
+        if let url = sharedModelFoldersURL {
+            let exists = FileManager.default.fileExists(atPath: url.path)
+            guard !exists || (try? SharedModelFolders.read(from: url)) != nil else { return }
+            let library = configuration.modelLibrary
+            try SharedModelFolders.write(
+                primary: library.primaryDirectory.path,
+                additional: library.additionalDirectories.map(\.path),
+                to: url
+            )
+        }
     }
 
     public static func defaultSettingsURL(

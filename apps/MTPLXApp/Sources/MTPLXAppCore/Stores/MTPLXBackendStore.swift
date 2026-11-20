@@ -207,6 +207,17 @@ public struct ClientHandoffNotice: Equatable, Sendable {
             isWarning: true
         )
     }
+
+    /// Claude Code and Codex: a notice only when the client did not start.
+    public static func agentCLI(result: AgentCLILaunchResult) -> ClientHandoffNotice? {
+        guard result.action == .unavailable else { return nil }
+        return ClientHandoffNotice(
+            target: result.client.target,
+            status: tr("%@ did not start", result.client.displayName),
+            detail: result.detail,
+            isWarning: true
+        )
+    }
 }
 
 @MainActor
@@ -295,6 +306,25 @@ public final class MTPLXBackendStore: ObservableObject {
     /// writes the configured port back unless the user changed the port on
     /// purpose (see `persistConfiguration`).
     private var activePortFallback: (configured: Int, fallback: Int)?
+    /// The MTPLX server the next launch attaches to instead of loading the
+    /// model a second time (found by the port preflight, used once).
+    private var pendingAttach: (port: Int, health: HealthPayload)?
+    /// The engine the app shows is an MTPLX server it did not start: one that
+    /// already served this model when Start was pressed (`mtplx serve` in a
+    /// terminal, a server another copy of the app runs). The app never stops
+    /// or restarts it, never pushes launch settings into it and never drives
+    /// or restores its fans. Cleared when the app launches a daemon of its
+    /// own or Stop lets go of it.
+    @Published public private(set) var attachedToOutsideServer = false
+    /// Live-tab note about that server: that the app uses it instead of
+    /// loading the model again, and after Stop, that it keeps running.
+    @Published public private(set) var outsideServerNotice: String?
+    /// Where an MTPLX server on this Mac usually listens besides the
+    /// configured port: `mtplx serve`'s default and the ports `mtplx start`
+    /// gives its clients; the CLI probes the same set before it loads a model.
+    nonisolated static let runningServerProbePorts = [8000, 18083, 18084, 18085]
+    /// Test seam: the ports probed besides the configured one.
+    var runningServerProbePortsOverride: [Int]?
     /// One-line, dismissable banner shown when `settings.json` could not be
     /// read at launch and was set aside (see `loadPersistedSettings`).
     @Published public private(set) var settingsRecoveryNotice: SettingsRecoveryNotice?
@@ -414,6 +444,16 @@ public final class MTPLXBackendStore: ObservableObject {
     /// by a process-list scan. The PID set remains presentation-only.
     private var launchedPiHandoffLeases: [UUID: MTPLXTerminalHandoffLease] = [:]
     private var launchedHermesHandoffLeases: [UUID: MTPLXTerminalHandoffLease] = [:]
+    /// Claude Code and Codex Terminal handoffs, reaped like Pi's and Hermes's.
+    private var launchedAgentCLIHandoffLeases: [UUID: (client: AgentCLIClient, lease: MTPLXTerminalHandoffLease)] = [:]
+    /// The Codex app copies MTPLX opened, by process: Stop and a daemon exit
+    /// end exactly these, never the user's own Codex app.
+    private var launchedCodexDesktopInstances: [Int32: CodexDesktopInstance] = [:]
+    private let agentCLIIntegration: AgentCLIIntegration
+    /// The DeepSeek Harness browser-app servers (`dsh web`) MTPLX started:
+    /// Stop and a daemon exit end exactly these, never the user's own.
+    private var launchedDeepSeekHarnessServers: Set<Int32> = []
+    private let deepSeekHarnessIntegration = DeepSeekHarnessIntegration()
     private var activeClientHandoffID: UUID?
     private var streamTask: Task<Void, Never>?
     private var healthWatchTask: Task<Void, Never>?
@@ -436,6 +476,15 @@ public final class MTPLXBackendStore: ObservableObject {
     private var liveSettingsModel: String?
     private var lastProgressPublishS: TimeInterval = 0
     private var fanRestoreRequiredOnStop: Bool = false
+    /// Whether a server this app copy launched or adopted ran since the fans
+    /// were last restored. Only such a server can have set the fans for this
+    /// copy, so Stop and Quit restore them only then (or when a fan mode is
+    /// known to be set). A copy that never ran a server leaves the fans as
+    /// it found them: on 17 Nov a QA copy that never started anything reset
+    /// the Mac's fans to auto when it quit, during another tool's run, and
+    /// for a user the same quit undid another copy's cooling. Internal so
+    /// the tests can stand for a server that ran.
+    var ownServerRanSinceFanRestore = false
     private var activeLaunchID: String?
     private var cancelledLaunchIDs: Set<String> = []
     private var lastDaemonTarget: LaunchTarget?
@@ -473,6 +522,7 @@ public final class MTPLXBackendStore: ObservableObject {
         openCodeIntegration: OpenCodeIntegration = OpenCodeIntegration(),
         piIntegration: PiIntegration = PiIntegration(),
         hermesIntegration: HermesIntegration = HermesIntegration(),
+        agentCLIIntegration: AgentCLIIntegration = AgentCLIIntegration(),
         modelDownloader: ModelDownloader = ModelDownloader(),
         autoTuner: AutoTuner = AutoTuner(),
         runtimeUpdateService: MTPLXRuntimeUpdateService? = nil,
@@ -496,6 +546,7 @@ public final class MTPLXBackendStore: ObservableObject {
         self.openCodeIntegration = openCodeIntegration
         self.piIntegration = piIntegration
         self.hermesIntegration = hermesIntegration
+        self.agentCLIIntegration = agentCLIIntegration
         self.modelDownloader = modelDownloader
         self.modelUpdateChecker = modelUpdateChecker
         self.autoTuner = autoTuner
@@ -765,6 +816,28 @@ public final class MTPLXBackendStore: ObservableObject {
             return
         }
         guard shouldRestart else { return }
+        if attachedToOutsideServer {
+            // The engine the app shows was started outside it: restarting
+            // would stop a server that is not the app's and load the model
+            // beside it. The change is saved for the app's own next start.
+            let message = tr(
+                "The MTPLX server on port %@ was started outside the app, so the app cannot restart it with this change. The change is saved and applies the next time the app starts MTPLX itself.",
+                String(next.port)
+            )
+            configurationChangeFailure = message
+            await supervisor.logs.append(
+                "restart skipped: the server on port \(next.port) was started outside this app; the change is saved for the app's own next start",
+                stream: .system
+            )
+            return
+        }
+        if let message = modelDriveNotConnectedMessage(for: next) {
+            // The running daemon keeps the previous model; nothing is
+            // downloaded again onto this Mac.
+            configurationChangeFailure = message
+            await supervisor.logs.append("restart skipped: \(message)", stream: .system)
+            return
+        }
         if promptForModelDownloadIfNeeded(
             configuration: next,
             target: target,
@@ -987,8 +1060,13 @@ public final class MTPLXBackendStore: ObservableObject {
                 return
             }
             clearLiveMetricsState(target: target)
+            // A server of this copy's own that sets the fans (an unknown mode
+            // counts as one); Default leaves them to macOS.
+            let adoptedFanMode = verifiedFanMode(from: adoptedHealth)
+            ownServerRanSinceFanRestore = ownServerRanSinceFanRestore
+                || adoptedFanMode.map { MTPLXFanMode.normalized($0) != .default } ?? true
             health = adoptedHealth
-            currentFanMode = verifiedFanMode(from: adoptedHealth)
+            currentFanMode = adoptedFanMode
             fanRestoreRequiredOnStop = fanRestoreRequiredOnStop
                 || modeRequiresFanRestore(currentFanMode)
             daemonState = .running
@@ -1063,6 +1141,7 @@ public final class MTPLXBackendStore: ObservableObject {
     /// End a start that a Stop overtook before it launched anything. The
     /// Stop owns the engine state; undo only what the start itself changed.
     private func abandonStoppedStart(during step: String) async {
+        pendingAttach = nil
         if let fallback = activePortFallback {
             // The fallback port belonged to the launch that is not happening.
             var next = configuration
@@ -1115,6 +1194,7 @@ public final class MTPLXBackendStore: ObservableObject {
         }
         clientHandoffNotice = nil
         portFallbackNotice = nil
+        outsideServerNotice = nil
         if let fallback = activePortFallback {
             // Issue #503: a fallback lives for one launch. The user pressed
             // Play again, so the configured port gets another try (the
@@ -1162,6 +1242,12 @@ public final class MTPLXBackendStore: ObservableObject {
             configuration = next
             try? persistConfiguration(next)
         }
+        if let message = modelDriveNotConnectedMessage(for: configuration) {
+            daemonState = .degraded(message)
+            startupPhase = .failed(message)
+            await supervisor.logs.append("launch blocked: \(message)", stream: .system)
+            return
+        }
         if promptForModelDownloadIfNeeded(
             configuration: configuration,
             target: target,
@@ -1189,6 +1275,8 @@ public final class MTPLXBackendStore: ObservableObject {
         let launchID = UUID().uuidString
         var supersededPresentation: (DaemonState, DaemonStartupPhase)?
         var supersededLaunchID: String?
+        var attaching = false
+        var attachedBefore = false
         do {
             supervisor.setAutomaticRestartEnabled(configuration.automaticDaemonRestart)
             lastDaemonTarget = target
@@ -1257,27 +1345,65 @@ public final class MTPLXBackendStore: ObservableObject {
             daemonState = .starting
             startupPhase = .launching
             activeLaunchID = launchID
-            let startupHealth = try await supervisor.start(
-                command: command,
-                healthBaseURL: configuredBaseURL,
-                apiKey: configuration.apiKey,
-                probeHealth: true,
-                timeoutSeconds: daemonStartupTimeoutSeconds,
-                expectedLaunchID: launchID,
-                requireActualFanRamp: requiresStartupFanRamp(configuration),
-                adoptExistingAppOwnedDaemon: true,
-                onPhase: { phase in
-                    Task { @MainActor [weak self] in
-                        self?.startupPhase = phase
-                    }
+            let startupHealth: HealthPayload?
+            if let attach = pendingAttach, attach.port == configuration.port {
+                // The model is already served on this Mac: show that server
+                // and set the clients up against it. Never load a second copy;
+                // if it cannot be held, say who holds the model and stop here.
+                pendingAttach = nil
+                attaching = true
+                // From here the fans and settings are its owner's: whatever
+                // ends this attempt, the app restores no fans it never set.
+                attachedBefore = attachedToOutsideServer
+                attachedToOutsideServer = true
+                guard let attached = try await supervisor.attachRunningServer(
+                    healthBaseURL: configuredBaseURL,
+                    apiKey: configuration.apiKey
+                ) else {
+                    throw DaemonSupervisorError.portOccupied(pid: attach.health.startup?.pid, launchID: nil)
                 }
-            )
-            if let startupHealth {
-                health = startupHealth
-                currentFanMode = verifiedFanMode(from: startupHealth)
-                    ?? MTPLXFanMode.normalized(configuration.fanMode).rawValue
-                fanRestoreRequiredOnStop = fanRestoreRequiredOnStop
-                    || modeRequiresFanRestore(currentFanMode)
+                outsideServerNotice = tr(
+                    "Port %@ already serves this model from an MTPLX server started outside the app, so the app shows that server instead of loading the model a second time. Stop disconnects the app and leaves that server running.",
+                    String(configuration.port)
+                )
+                // Its scheduler is whatever its owner started it with; the
+                // flags this start would have used say nothing about it.
+                lastLaunchScheduling = nil
+                startupHealth = attached
+                health = attached
+                currentFanMode = verifiedFanMode(from: attached)
+            } else {
+                pendingAttach = nil
+                attachedToOutsideServer = false
+                // From here this copy's own server may set the fans: Max pins
+                // them, Smart raises them under load. Default leaves them to
+                // macOS, so Stop and Quit leave them too: resetting them would
+                // override whatever holds them (17 Nov: a run's keeper held
+                // them at max while a QA copy quit).
+                ownServerRanSinceFanRestore = ownServerRanSinceFanRestore
+                    || fanMode(for: configuration) != .default
+                startupHealth = try await supervisor.start(
+                    command: command,
+                    healthBaseURL: configuredBaseURL,
+                    apiKey: configuration.apiKey,
+                    probeHealth: true,
+                    timeoutSeconds: daemonStartupTimeoutSeconds,
+                    expectedLaunchID: launchID,
+                    requireActualFanRamp: requiresStartupFanRamp(configuration),
+                    adoptExistingAppOwnedDaemon: true,
+                    onPhase: { phase in
+                        Task { @MainActor [weak self] in
+                            self?.startupPhase = phase
+                        }
+                    }
+                )
+                if let startupHealth {
+                    health = startupHealth
+                    currentFanMode = verifiedFanMode(from: startupHealth)
+                        ?? MTPLXFanMode.normalized(configuration.fanMode).rawValue
+                    fanRestoreRequiredOnStop = fanRestoreRequiredOnStop
+                        || modeRequiresFanRestore(currentFanMode)
+                }
             }
             let lifecycleEpoch = supervisor.supervisionSnapshot().lifecycleEpoch
             await finishReadyDaemon(
@@ -1291,6 +1417,9 @@ public final class MTPLXBackendStore: ObservableObject {
                 activeLaunchID = nil
             }
         } catch {
+            if attaching, case DaemonSupervisorError.alreadyRunning = error {
+                attachedToOutsideServer = attachedBefore
+            }
             if case DaemonSupervisorError.alreadyRunning = error {
                 // The supervisor was claimed between this request's check
                 // and its launch (#528). The daemon that holds it is not
@@ -1309,6 +1438,37 @@ public final class MTPLXBackendStore: ObservableObject {
                     startupPhase = previousPhase
                 }
                 await reconcileHeldDaemon()
+                return
+            }
+            if attaching {
+                // Nothing was launched: no port to remediate, no fans this
+                // app set, no late daemon to wait for. The server that holds
+                // the model stays as it is; the plain message says where.
+                // The attempt's own end (a stopped snapshot) is this
+                // request's to report, so the passive cleanup stands down.
+                lastTerminalCleanupLifecycleEpoch = max(
+                    lastTerminalCleanupLifecycleEpoch,
+                    supervisor.supervisionSnapshot().lifecycleEpoch
+                )
+                attachedToOutsideServer = false
+                outsideServerNotice = nil
+                let failureDescription = Self.humanizedStartFailure(error, port: configuration.port)
+                if activeLaunchID == launchID {
+                    activeLaunchID = nil
+                }
+                if cancelledLaunchIDs.remove(launchID) != nil {
+                    daemonState = .stopped
+                    startupPhase = .idle
+                    connectionState = .idle
+                } else {
+                    daemonState = .degraded(failureDescription)
+                    startupPhase = .failed(failureDescription)
+                    await supervisor.logs.append(
+                        "attach refused: \(failureDescription) No model was loaded.",
+                        stream: .system
+                    )
+                }
+                await refreshLogs()
                 return
             }
             if !attemptedPortRemediation,
@@ -1401,6 +1561,7 @@ public final class MTPLXBackendStore: ObservableObject {
         launchID: String,
         isCurrent: () -> Bool = { true }
     ) async {
+        pendingAttach = nil
         // Issue #409: a foreign-looking occupant is re-probed over the
         // settle window before the port is moved — a draining MTPLX
         // daemon (stop/start, or the predecessor of an in-app update)
@@ -1411,10 +1572,12 @@ public final class MTPLXBackendStore: ObservableObject {
             settleTimeoutSeconds: portSettleTimeoutSeconds
         )
         guard isCurrent() else { return }
-        let occupantDescription: String
+        // Who keeps the configured port from this launch; nil once it can
+        // use it.
+        let occupantDescription: String?
         switch occupant {
         case .free:
-            return
+            occupantDescription = nil
         case .mtplxServer(let existing):
             let probeCommand = try? commandBuilder.buildServeCommand(
                 configuration: configuration,
@@ -1437,9 +1600,17 @@ public final class MTPLXBackendStore: ObservableObject {
                 )
                 guard isCurrent() else { return }
                 await supervisor.terminateExternalDaemon(rootPID: pid_t(stalePID))
+                occupantDescription = nil
+            } else if target != .benchmark,
+                      Self.servesSameModel(existing, expectedModelPath: configuration.model) {
+                // Never load a second copy of a model an MTPLX server on
+                // this Mac already serves (two Flash-Next loads do not fit
+                // in 128 GB): attach to that server instead.
+                await prepareAttach(port: configuration.port, health: existing)
                 return
+            } else {
+                occupantDescription = tr("an MTPLX server started outside the app")
             }
-            occupantDescription = tr("an MTPLX server started outside the app")
         case .unauthorized:
             occupantDescription = tr("a server requiring a different API key")
         case .foreign:
@@ -1453,6 +1624,7 @@ public final class MTPLXBackendStore: ObservableObject {
                 PortPreflight.appOwnedListener(port: port)
             }.value
             guard isCurrent() else { return }
+            var stillHeld = true
             if let wedged {
                 await supervisor.logs.append(
                     "port preflight: \(port) held by a wedged app-owned daemon "
@@ -1466,16 +1638,25 @@ public final class MTPLXBackendStore: ObservableObject {
                     bindHost: configuration.host,
                     timeoutSeconds: 5
                 ) {
-                    return
+                    stillHeld = false
+                } else {
+                    await supervisor.logs.append(
+                        "port preflight: \(port) still held after reaping pid \(wedged.pid)",
+                        stream: .system
+                    )
                 }
-                await supervisor.logs.append(
-                    "port preflight: \(port) still held after reaping pid \(wedged.pid)",
-                    stream: .system
-                )
             }
-            occupantDescription = tr("another app")
+            occupantDescription = stillHeld ? tr("another app") : nil
         }
         guard isCurrent() else { return }
+        // Before this start loads the model anywhere, look on the other
+        // ports an MTPLX server usually listens on.
+        if let server = await runningServerServingThisModel(otherThan: configuration.port, target: target) {
+            guard isCurrent() else { return }
+            await prepareAttach(port: server.port, health: server.health)
+            return
+        }
+        guard isCurrent(), let occupantDescription else { return }
         let occupiedPort = configuration.port
         guard
             let freePort = PortPreflight.nextFreePort(
@@ -1511,6 +1692,65 @@ public final class MTPLXBackendStore: ObservableObject {
             occupant,
             String(freePort)
         )
+    }
+
+    /// The next launch attaches to the MTPLX server on `port` instead of
+    /// loading the model. The port is this launch's only, as a fallback port
+    /// is: settings keep the configured one, tried again at the next start.
+    private func prepareAttach(port: Int, health: HealthPayload) async {
+        pendingAttach = (port, health)
+        if port != configuration.port {
+            let configured = configuration.port
+            var next = configuration
+            next.port = port
+            configuration = next
+            activePortFallback = (
+                configured: activePortFallback?.configured ?? configured,
+                fallback: port
+            )
+        }
+        await supervisor.logs.append(
+            "port preflight: the MTPLX server on port \(port) (pid \(health.startup?.pid.map(String.init) ?? "unknown"), "
+                + "launch \(health.startup?.launchId ?? "none")) already serves \(health.modelPath); "
+                + "attaching to it instead of loading a second copy",
+            stream: .system
+        )
+    }
+
+    /// An MTPLX server on one of the usual MTPLX ports other than
+    /// `configuredPort` that already serves the model this start would load:
+    /// `mtplx serve`'s default and the ports `mtplx start` gives its clients,
+    /// the set the CLI probes before it loads a model. The benchmark never
+    /// attaches: it runs only on the app's own daemon (#528).
+    private func runningServerServingThisModel(
+        otherThan configuredPort: Int,
+        target: LaunchTarget?
+    ) async -> (port: Int, health: HealthPayload)? {
+        guard target != .benchmark else { return nil }
+        for port in runningServerProbePortsOverride ?? Self.runningServerProbePorts
+        where port != configuredPort {
+            guard case .mtplxServer(let health) = await PortPreflight.classify(
+                baseURL: MTPLXServerURLs.baseURL(bindHost: "127.0.0.1", port: port),
+                apiKey: configuration.apiKey,
+                timeoutSeconds: 1
+            ), Self.servesSameModel(health, expectedModelPath: configuration.model)
+            else { continue }
+            return (port, health)
+        }
+        return nil
+    }
+
+    /// Whether `health` serves the model folder `expectedModelPath` names,
+    /// however either path is spelled (a `~`, a symlinked folder).
+    nonisolated static func servesSameModel(_ health: HealthPayload, expectedModelPath: String) -> Bool {
+        guard health.ok, !health.modelPath.isEmpty, !expectedModelPath.isEmpty else { return false }
+        func normalized(_ path: String) -> String {
+            URL(fileURLWithPath: NSString(string: path).expandingTildeInPath)
+                .standardizedFileURL
+                .resolvingSymlinksInPath()
+                .path
+        }
+        return normalized(health.modelPath) == normalized(expectedModelPath)
     }
 
     /// Every settings write goes through here so a port fallback never
@@ -1799,11 +2039,20 @@ public final class MTPLXBackendStore: ObservableObject {
             cancelledLaunchIDs.insert(launchID)
             activeLaunchID = nil
         }
-        let shouldWarnIfFanRestoreFails = shouldRestoreFanModeOnStop()
+        // Only fans this copy's own server may have set are restored; a copy
+        // that ran no server, or ran it with Default fans, leaves them alone
+        // (ownServerRanSinceFanRestore).
+        let shouldRestoreFans = shouldRestoreFanModeOnStop()
+        let shouldWarnIfFanRestoreFails = shouldRestoreFans
         let startupPID = heldDaemonStartupPID()
+        let attachedPort = attachedToOutsideServer ? configuration.port : nil
         portLoss = nil
         let piHandoffsToStop = Array(launchedPiHandoffLeases.values)
         let hermesHandoffsToStop = Array(launchedHermesHandoffLeases.values)
+        let agentCLIHandoffsToStop = Array(launchedAgentCLIHandoffLeases.values)
+        let codexDesktopInstancesToStop = Array(launchedCodexDesktopInstances.values)
+        let deepSeekHarnessServersToStop = Array(launchedDeepSeekHarnessServers)
+        launchedDeepSeekHarnessServers.removeAll()
         modelDownloadTask?.cancel()
         modelDownloadTask = nil
         isModelDownloading = false
@@ -1817,6 +2066,8 @@ public final class MTPLXBackendStore: ObservableObject {
         launchedPiAgentPIDs.removeAll()
         launchedPiHandoffLeases.removeAll()
         launchedHermesHandoffLeases.removeAll()
+        launchedAgentCLIHandoffLeases.removeAll()
+        launchedCodexDesktopInstances.removeAll()
         piTerminalAgentRunning = false
         piTerminalAgentProcessIDs = []
         piTerminalLaunchCommand = nil
@@ -1833,9 +2084,9 @@ public final class MTPLXBackendStore: ObservableObject {
         // disabled until the server is really gone.
         let previousTeardown = daemonTeardownTask
         daemonTeardownTask = Task { @MainActor [self] in
-            var fanRestoreSucceeded = await restoreFansLocally(
-                successLog: "fan profile restored locally on stop"
-            )
+            var fanRestoreSucceeded = shouldRestoreFans
+                ? await restoreFansLocally(successLog: "fan profile restored locally on stop")
+                : true
             if !fanRestoreSucceeded, shouldWarnIfFanRestoreFails {
                 await supervisor.logs.append(
                     "local fan restore failed before daemon stop; will retry after process teardown",
@@ -1861,11 +2112,16 @@ public final class MTPLXBackendStore: ObservableObject {
                     stream: .system
                 )
             }
+            await stopAgentCLIHandoffs(agentCLIHandoffsToStop, after: "")
+            await stopCodexDesktopInstances(codexDesktopInstancesToStop, after: "")
+            await stopDeepSeekHarnessServers(deepSeekHarnessServersToStop, after: "")
             let additionalPIDs = startupPID.map { [$0] } ?? []
             await supervisor.stop(graceSeconds: 1.5, additionalProcessIDs: additionalPIDs)
-            let localFanRestoreSucceeded = await restoreFansLocally(
-                successLog: "fan profile restored with local ThermalForge after daemon stop"
-            )
+            let localFanRestoreSucceeded = shouldRestoreFans
+                ? await restoreFansLocally(
+                    successLog: "fan profile restored with local ThermalForge after daemon stop"
+                )
+                : true
             if localFanRestoreSucceeded {
                 fanRestoreSucceeded = true
             } else if !fanRestoreSucceeded, shouldWarnIfFanRestoreFails {
@@ -1879,6 +2135,16 @@ public final class MTPLXBackendStore: ObservableObject {
             connectionState = .idle
             if !fanRestoreSucceeded, shouldWarnIfFanRestoreFails {
                 currentFanMode = nil
+            }
+            if let attachedPort {
+                // The supervisor let go of a server this app did not start;
+                // it keeps serving. Say so where the user just pressed Stop.
+                attachedToOutsideServer = false
+                outsideServerNotice = tr(
+                    "The MTPLX server on port %@ keeps running: it was started outside the app, so Stop only disconnected the app. To stop it, press Ctrl-C in its terminal or run `mtplx stop --port %@`.",
+                    String(attachedPort),
+                    String(attachedPort)
+                )
             }
             await refreshLogs()
         }
@@ -3051,6 +3317,9 @@ public final class MTPLXBackendStore: ObservableObject {
         let shouldRestoreFans = shouldRestoreFansAfterTerminalExit()
         let piHandoffsToStop = Array(launchedPiHandoffLeases.values)
         let hermesHandoffsToStop = Array(launchedHermesHandoffLeases.values)
+        let agentCLIHandoffsToStop = Array(launchedAgentCLIHandoffLeases.values)
+        let codexDesktopInstancesToStop = Array(launchedCodexDesktopInstances.values)
+        let deepSeekHarnessServersToStop = Array(launchedDeepSeekHarnessServers)
         healthWatchTask?.cancel()
         healthWatchTask = nil
         streamTask?.cancel()
@@ -3121,6 +3390,15 @@ public final class MTPLXBackendStore: ObservableObject {
             for lease in piHandoffsToStop {
                 launchedPiHandoffLeases.removeValue(forKey: lease.handoffID)
             }
+            for handoff in agentCLIHandoffsToStop {
+                launchedAgentCLIHandoffLeases.removeValue(forKey: handoff.lease.handoffID)
+            }
+            for instance in codexDesktopInstancesToStop {
+                launchedCodexDesktopInstances.removeValue(forKey: instance.processID)
+            }
+            for pid in deepSeekHarnessServersToStop {
+                launchedDeepSeekHarnessServers.remove(pid)
+            }
             let stoppedHermes = hermesHandoffsToStop.reduce(into: 0) { count, lease in
                 if hermesIntegration.cancelTerminalHandoff(lease) { count += 1 }
             }
@@ -3139,6 +3417,9 @@ public final class MTPLXBackendStore: ObservableObject {
                     stream: .system
                 )
             }
+            await stopAgentCLIHandoffs(agentCLIHandoffsToStop, after: " after daemon exit")
+            await stopCodexDesktopInstances(codexDesktopInstancesToStop, after: " after daemon exit")
+            await stopDeepSeekHarnessServers(deepSeekHarnessServersToStop, after: " after daemon exit")
             await refreshLogs()
         }
     }
@@ -3169,8 +3450,60 @@ public final class MTPLXBackendStore: ObservableObject {
         launchedHermesHandoffLeases[lease.handoffID] = lease
     }
 
+    func recordLaunchedAgentCLITerminalHandoffLease(
+        _ lease: MTPLXTerminalHandoffLease,
+        client: AgentCLIClient
+    ) {
+        launchedAgentCLIHandoffLeases[lease.handoffID] = (client, lease)
+    }
+
+    func recordLaunchedCodexDesktopInstance(_ instance: CodexDesktopInstance) {
+        launchedCodexDesktopInstances[instance.processID] = instance
+    }
+
+    var codexDesktopInstanceProcessIDsForTesting: Set<Int32> {
+        Set(launchedCodexDesktopInstances.keys)
+    }
+
+    /// Ends the Codex app copies MTPLX opened, each by its own process (off
+    /// the main actor: a copy gets a few seconds to close its databases).
+    private func stopCodexDesktopInstances(_ instances: [CodexDesktopInstance], after context: String) async {
+        guard !instances.isEmpty else { return }
+        let stopped = await Task.detached(priority: .userInitiated) {
+            instances.reduce(into: 0) { count, instance in
+                if CodexDesktopIntegration.end(instance) { count += 1 }
+            }
+        }.value
+        if stopped > 0 {
+            await supervisor.logs.append(
+                "closed \(stopped) Codex app copy (pid \(instances.map { String($0.processID) }.joined(separator: ", ")))\(context)",
+                stream: .system
+            )
+        }
+    }
+
     var terminalHandoffLeaseIDsForTesting: Set<UUID> {
-        Set(launchedPiHandoffLeases.keys).union(launchedHermesHandoffLeases.keys)
+        Set(launchedPiHandoffLeases.keys)
+            .union(launchedHermesHandoffLeases.keys)
+            .union(launchedAgentCLIHandoffLeases.keys)
+    }
+
+    /// Reaps Claude Code and Codex handoffs by their exact receipts.
+    private func stopAgentCLIHandoffs(
+        _ handoffs: [(client: AgentCLIClient, lease: MTPLXTerminalHandoffLease)],
+        after context: String
+    ) async {
+        for client in AgentCLIClient.allCases {
+            let stopped = handoffs.filter { $0.client == client }.reduce(into: 0) { count, handoff in
+                if agentCLIIntegration.cancelTerminalHandoff(handoff.lease) { count += 1 }
+            }
+            if stopped > 0 {
+                await supervisor.logs.append(
+                    "stopped \(stopped) \(client.displayName) Terminal handoff(s)\(context)",
+                    stream: .system
+                )
+            }
+        }
     }
 
     /// Package tests can exercise transport-failure policy without starting a
@@ -3684,6 +4017,7 @@ public final class MTPLXBackendStore: ObservableObject {
     /// the background.
     private func reapDaemon(reason: String) {
         let startupPID = heldDaemonStartupPID()
+        let wasAttached = attachedToOutsideServer
         // The reap stops the supervisor like Stop does; a start request
         // after it must launch rather than join a start the reap ended.
         stopGeneration &+= 1
@@ -3708,12 +4042,53 @@ public final class MTPLXBackendStore: ObservableObject {
             )
             let additionalPIDs = startupPID.map { [$0] } ?? []
             await supervisor.stop(graceSeconds: 1.0, additionalProcessIDs: additionalPIDs)
+            if wasAttached {
+                // The server the app showed is gone; nothing is attached.
+                attachedToOutsideServer = false
+                outsideServerNotice = nil
+            }
             await refreshLogs()
         }
     }
 
     public func refreshLogs() async {
         logs = await supervisor.logs.snapshot()
+    }
+
+    /// The selected pack lives on a drive that is not plugged in. It is not
+    /// missing: never offer to download it again onto this Mac (the #573
+    /// shape, a picked folder swapped for a download); say which drive to
+    /// plug in. Nil for a repo id, an available path or a plain missing one.
+    func modelDriveNotConnectedMessage(for configuration: MTPLXAppConfiguration) -> String? {
+        let selected = NSString(string: configuration.model).expandingTildeInPath
+        let volume: String
+        if selected.hasPrefix("/"),
+           case .notConnected(let pathVolume) = SharedModelFolders.availability(of: selected) {
+            volume = pathVolume
+        } else if !selected.hasPrefix("/"),
+                  let remembered = ModelFolderIndex.notConnectedPack(
+                      for: configuration.model, library: configuration.modelLibrary
+                  ),
+                  downloadableModelOption(for: configuration.model)?
+                      .installedLocalPath(in: configuration.modelLibrary) == nil {
+            // A repo id whose pack was last seen on a drive that is unplugged
+            // (and has no readable copy elsewhere).
+            volume = remembered.volume
+        } else {
+            return nil
+        }
+        let folder = (selected as NSString).lastPathComponent
+        let name = MTPLXModelOption.pickerCatalog(
+            customModels: configuration.customModels,
+            currentModel: configuration.model,
+            modelLibrary: configuration.modelLibrary
+        ).first(where: { $0.matches(configuration.model) })?.displayName
+            ?? folder.replacingOccurrences(of: "--", with: "/")
+        return tr(
+            "%@ is on the drive %@, which is not connected. Plug it in and start again, or pick another model.",
+            name,
+            (volume as NSString).lastPathComponent
+        )
     }
 
     private func promptForModelDownloadIfNeeded(
@@ -4198,11 +4573,23 @@ public final class MTPLXBackendStore: ObservableObject {
         }
     }
 
+    /// Whether Stop (and Quit, which runs Stop) restores the fans. A server
+    /// of this copy's own ran, or a fan mode is known to be set: yes, even
+    /// when the state looks default. Nothing of the kind: no, whatever the
+    /// saved preference says, because nothing here set the fans and someone
+    /// else may have (another MTPLX copy, the fan tool itself).
     private func shouldRestoreFanModeOnStop() -> Bool {
-        if fanRestoreRequiredOnStop {
+        // A server started outside the app keeps the fans its owner set.
+        if attachedToOutsideServer {
+            return false
+        }
+        if ownServerRanSinceFanRestore || fanRestoreRequiredOnStop {
             return true
         }
-        if modeRequiresFanRestore(currentFanMode) {
+        // A mode this copy knows is set. (An unknown mode is not one:
+        // `MTPLXFanMode.normalized(nil)` reads as Smart, which made every
+        // Stop restore.)
+        if let mode = currentFanMode, modeRequiresFanRestore(mode) {
             return true
         }
         if health?.thermal?.actualRampVerified == true {
@@ -4212,7 +4599,7 @@ public final class MTPLXBackendStore: ObservableObject {
            mode == "max" || mode == "performance" {
             return true
         }
-        return modeRequiresFanRestore(configuration.fanMode)
+        return false
     }
 
     private func shouldRestoreFansAfterFailedStartup(phase: DaemonStartupPhase) -> Bool {
@@ -4231,6 +4618,8 @@ public final class MTPLXBackendStore: ObservableObject {
     /// happened in that case, and a terminal callback must not create a new
     /// hardware side effect just because the app exited.
     private func shouldRestoreFansAfterTerminalExit() -> Bool {
+        // A server started outside the app keeps the fans its owner set.
+        if attachedToOutsideServer { return false }
         if fanRestoreRequiredOnStop || modeRequiresFanRestore(currentFanMode) {
             return true
         }
@@ -4252,6 +4641,10 @@ public final class MTPLXBackendStore: ObservableObject {
         isCurrent: (() -> Bool)? = nil
     ) async -> Bool {
         guard isCurrent?() ?? true else { return false }
+        if attachedToOutsideServer {
+            // Its fans belong to whoever started it; the app set nothing.
+            return true
+        }
         let restored = await localFanRestorer()
         // The physical restore may have completed while a newer daemon was
         // starting. Do not let this terminal lifecycle change its fan state,
@@ -4259,6 +4652,7 @@ public final class MTPLXBackendStore: ObservableObject {
         guard isCurrent?() ?? true else { return false }
         if restored {
             fanRestoreRequiredOnStop = false
+            ownServerRanSinceFanRestore = false
             currentFanMode = MTPLXFanMode.default.rawValue
             await supervisor.logs.append(successLog, stream: .system)
         }
@@ -4469,11 +4863,23 @@ public final class MTPLXBackendStore: ObservableObject {
             guard isCurrent() else { return false }
             await beforeClientHandoffLaunch(.openCode)
             guard isCurrent() else { return false }
-            let desktop = await openCodeIntegration.reloadDesktopAfterDaemonReady(isCurrent: isCurrent)
+            // OpenCode Desktop by default; OpenCode's terminal UI when a
+            // terminal is picked for it (Settings, or `opencode_opens_in`).
+            let inTerminal = ClientOpenings.currentSurface(.openCode) == ClientOpenings.terminalChoice
+            let desktop = inTerminal
+                ? await openCodeIntegration.launchInTerminal(configuration: configuration)
+                : await openCodeIntegration.reloadDesktopAfterDaemonReady(isCurrent: isCurrent)
             guard continueOpenCodeHandoff(desktop, handoffID: handoffID, isCurrent: isCurrent) else {
                 return false
             }
-            let notice = ClientHandoffNotice.openCode(result: desktop)
+            let notice = inTerminal
+                ? ClientHandoffNotice(
+                    target: .openCode,
+                    status: desktop.didOpen ? tr("OpenCode opened") : tr("OpenCode did not open"),
+                    detail: desktop.detail,
+                    isWarning: !desktop.didOpen
+                )
+                : ClientHandoffNotice.openCode(result: desktop)
             guard continueOpenCodeHandoff(desktop, handoffID: handoffID, isCurrent: isCurrent) else {
                 return false
             }
@@ -4483,7 +4889,7 @@ public final class MTPLXBackendStore: ObservableObject {
                 return false
             }
             await supervisor.logs.append(
-                "OpenCode Desktop handoff \(desktop.action.rawValue): \(desktop.detail)",
+                "OpenCode \(inTerminal ? "terminal" : "Desktop") handoff \(desktop.action.rawValue): \(desktop.detail)",
                 stream: .system
             )
             guard continueOpenCodeHandoff(desktop, handoffID: handoffID, isCurrent: isCurrent) else {
@@ -4499,9 +4905,99 @@ public final class MTPLXBackendStore: ObservableObject {
                 handoffID: handoffID
             ) else { return false }
         }
+        if let client = AgentCLIClient(target: target) {
+            let handoffID = UUID()
+            guard await launchAgentCLITerminalHandoff(
+                client: client,
+                configuration: configuration,
+                replaceExisting: replaceExisting,
+                isCurrent: isCurrent,
+                handoffID: handoffID
+            ) else { return false }
+        }
+        if target == .deepseekHarness {
+            guard await launchDeepSeekHarnessHandoff(
+                configuration: configuration,
+                replaceExisting: replaceExisting,
+                isCurrent: isCurrent
+            ) else { return false }
+        }
         guard isCurrent() else { return false }
         onDaemonReady?(target)
         return isCurrent()
+    }
+
+    /// DeepSeek Harness on the daemon that just came up, through `mtplx
+    /// connect deepseek-harness --open` (its browser app by default, its
+    /// terminal app when a terminal is picked for it). A browser-app server
+    /// from an earlier Start is ended first, so the new one serves this
+    /// daemon's model and window.
+    private func launchDeepSeekHarnessHandoff(
+        configuration: MTPLXAppConfiguration,
+        replaceExisting: Bool,
+        isCurrent: @escaping () -> Bool
+    ) async -> Bool {
+        guard isCurrent() else { return false }
+        let previous = Array(launchedDeepSeekHarnessServers)
+        if replaceExisting, !previous.isEmpty {
+            launchedDeepSeekHarnessServers.removeAll()
+            await stopDeepSeekHarnessServers(previous, after: " before reopening it")
+            guard isCurrent() else { return false }
+        } else if !previous.isEmpty {
+            return isCurrent()
+        }
+        await beforeClientHandoffLaunch(.deepseekHarness)
+        guard isCurrent() else { return false }
+        let handoffID = UUID()
+        let launch = await deepSeekHarnessIntegration.launch(
+            port: configuration.port,
+            apiKey: activeAPIKey,
+            workspace: PiIntegration.resolvedWorkspacePath(configuration: configuration)
+        )
+        if let pid = launch.processID {
+            launchedDeepSeekHarnessServers.insert(pid)
+        }
+        guard isCurrent() else {
+            if let pid = launch.processID {
+                launchedDeepSeekHarnessServers.remove(pid)
+                await stopDeepSeekHarnessServers([pid], after: " (launch superseded)")
+            }
+            return false
+        }
+        await supervisor.logs.append(
+            "DeepSeek Harness handoff \(launch.opened ? "launched" : "unavailable"): \(launch.detail); command: \(launch.command)",
+            stream: .system
+        )
+        guard isCurrent() else { return false }
+        clientHandoffNotice = ClientHandoffNotice(
+            target: .deepseekHarness,
+            status: launch.opened
+                ? (launch.surface == "web"
+                    ? tr("DeepSeek Harness opened in your browser")
+                    : tr("%@ opened in %@", "DeepSeek Harness", launch.terminal ?? "Terminal"))
+                : tr("DeepSeek Harness did not open"),
+            detail: launch.detail,
+            isWarning: !launch.opened
+        )
+        activeClientHandoffID = handoffID
+        return isCurrent()
+    }
+
+    /// Ends the DeepSeek Harness browser-app servers MTPLX started (off the
+    /// main actor: each gets a few seconds to close its sessions).
+    private func stopDeepSeekHarnessServers(_ pids: [Int32], after context: String) async {
+        guard !pids.isEmpty else { return }
+        let stopped = await Task.detached(priority: .userInitiated) {
+            pids.reduce(into: 0) { count, pid in
+                if DeepSeekHarnessIntegration.end(processID: pid) { count += 1 }
+            }
+        }.value
+        if stopped > 0 {
+            await supervisor.logs.append(
+                "stopped \(stopped) DeepSeek Harness browser app server(s)\(context)",
+                stream: .system
+            )
+        }
     }
 
     /// Brings Pi's or OpenCode's window to the one the running daemon
@@ -4579,19 +5075,24 @@ public final class MTPLXBackendStore: ObservableObject {
             launchID: nil,
             recoveryGeneration: recoveryGeneration
         ) else { return false }
-        do {
-            try await flushFreshLaunchLiveOnlySettingsIfNeeded(isCurrent: {
-                self.daemonSessionIsCurrent(
-                    lifecycleEpoch: lifecycleEpoch,
-                    launchID: nil,
-                    recoveryGeneration: recoveryGeneration
+        // A server the app attached to keeps the settings and fans whoever
+        // started it gave it: the app pushes no launch settings into it and
+        // checks no fan pin it never set.
+        if !attachedToOutsideServer {
+            do {
+                try await flushFreshLaunchLiveOnlySettingsIfNeeded(isCurrent: {
+                    self.daemonSessionIsCurrent(
+                        lifecycleEpoch: lifecycleEpoch,
+                        launchID: nil,
+                        recoveryGeneration: recoveryGeneration
+                    )
+                })
+            } catch {
+                await supervisor.logs.append(
+                    "post-start settings sync failed: \(String(describing: error))",
+                    stream: .system
                 )
-            })
-        } catch {
-            await supervisor.logs.append(
-                "post-start settings sync failed: \(String(describing: error))",
-                stream: .system
-            )
+            }
         }
         guard daemonSessionIsCurrent(
             lifecycleEpoch: lifecycleEpoch,
@@ -4602,28 +5103,32 @@ public final class MTPLXBackendStore: ObservableObject {
             lifecycleEpoch: lifecycleEpoch,
             recoveryGeneration: recoveryGeneration
         ) else { return false }
-        do {
-            try await verifyPinnedFansAfterStartup(
-                configuration: configuration,
-                isCurrent: {
-                    self.daemonSessionIsCurrent(
-                        lifecycleEpoch: lifecycleEpoch,
-                        launchID: nil,
-                        recoveryGeneration: recoveryGeneration
-                    )
-                }
-            )
-        } catch {
-            guard daemonSessionIsCurrent(
-                lifecycleEpoch: lifecycleEpoch,
-                launchID: nil,
-                recoveryGeneration: recoveryGeneration
-            ) else { return false }
+        if attachedToOutsideServer {
             startupPhase = .ready
-            await supervisor.logs.append(
-                "post-start fan verification failed: \(String(describing: error))",
-                stream: .system
-            )
+        } else {
+            do {
+                try await verifyPinnedFansAfterStartup(
+                    configuration: configuration,
+                    isCurrent: {
+                        self.daemonSessionIsCurrent(
+                            lifecycleEpoch: lifecycleEpoch,
+                            launchID: nil,
+                            recoveryGeneration: recoveryGeneration
+                        )
+                    }
+                )
+            } catch {
+                guard daemonSessionIsCurrent(
+                    lifecycleEpoch: lifecycleEpoch,
+                    launchID: nil,
+                    recoveryGeneration: recoveryGeneration
+                ) else { return false }
+                startupPhase = .ready
+                await supervisor.logs.append(
+                    "post-start fan verification failed: \(String(describing: error))",
+                    stream: .system
+                )
+            }
         }
         return daemonSessionIsCurrent(
             lifecycleEpoch: lifecycleEpoch,
@@ -4830,6 +5335,141 @@ public final class MTPLXBackendStore: ObservableObject {
         return true
     }
 
+    /// Claude Code or Codex in Terminal, on the daemon that just came up: its
+    /// address, its key, the model it serves and the window it executes.
+    private func launchAgentCLITerminalHandoff(
+        client: AgentCLIClient,
+        configuration: MTPLXAppConfiguration,
+        replaceExisting: Bool,
+        isCurrent: @escaping () -> Bool,
+        handoffID: UUID
+    ) async -> Bool {
+        guard isCurrent() else { return false }
+        let existing = launchedAgentCLIHandoffLeases.values.filter { $0.client == client }
+        if replaceExisting {
+            let stopped = existing.reduce(into: 0) { count, handoff in
+                if agentCLIIntegration.cancelTerminalHandoff(handoff.lease) { count += 1 }
+            }
+            for handoff in existing {
+                launchedAgentCLIHandoffLeases.removeValue(forKey: handoff.lease.handoffID)
+            }
+            if stopped > 0 {
+                guard isCurrent() else { return false }
+                await supervisor.logs.append(
+                    "stopped \(stopped) previous \(client.displayName) Terminal handoff(s)",
+                    stream: .system
+                )
+                guard isCurrent() else { return false }
+            }
+        } else if !existing.isEmpty {
+            return isCurrent()
+        }
+
+        guard isCurrent() else { return false }
+        await beforeClientHandoffLaunch(client.target)
+        guard isCurrent() else { return false }
+        // Where the user picked (Settings, or `codex_opens_in` /
+        // `claude_code_opens_in`): Codex as MTPLX's own copy of its app by
+        // default when a proven build is installed; the client's CLI in the
+        // picked terminal otherwise or if that fails.
+        var terminalNotice: ClientHandoffNotice?
+        let opensAppCopy = ClientOpenings.currentSurface(client.target) == ClientOpenings.mtplxApp
+        if client == .codex, opensAppCopy, let app = CodexDesktopIntegration.findApp() {
+            if app.supported {
+                // A copy from an earlier Start is closed and reopened on this
+                // daemon (launchCodexDesktop also closes any copy on MTPLX's
+                // folder that this store did not record).
+                let previous = Array(launchedCodexDesktopInstances.values)
+                if replaceExisting {
+                    launchedCodexDesktopInstances.removeAll()
+                    await stopCodexDesktopInstances(previous, after: " before reopening it")
+                    guard isCurrent() else { return false }
+                } else if !previous.isEmpty {
+                    return isCurrent()
+                }
+                let desktop = await agentCLIIntegration.launchCodexDesktop(
+                    app: app,
+                    configuration: configuration,
+                    baseURL: baseURL,
+                    apiKey: activeAPIKey,
+                    servedWindow: health?.executionWindow
+                )
+                await supervisor.logs.append(
+                    "Codex desktop handoff \(desktop.action.rawValue): \(desktop.detail); command: \(desktop.command)",
+                    stream: .system
+                )
+                if let instance = desktop.codexDesktopInstance {
+                    recordLaunchedCodexDesktopInstance(instance)
+                }
+                guard isCurrent() else {
+                    if let instance = desktop.codexDesktopInstance {
+                        launchedCodexDesktopInstances.removeValue(forKey: instance.processID)
+                        await stopCodexDesktopInstances([instance], after: " (launch superseded)")
+                    }
+                    return false
+                }
+                if desktop.action == .launched {
+                    return true
+                }
+                terminalNotice = ClientHandoffNotice(
+                    target: .codex,
+                    status: tr("%@ opened in %@", client.displayName, ClientOpenings.currentTerminal(.codex).terminalName),
+                    detail: tr("MTPLX could not open the Codex app: %@", desktop.detail),
+                    isWarning: true
+                )
+            } else {
+                terminalNotice = ClientHandoffNotice(
+                    target: .codex,
+                    status: tr("%@ opened in %@", client.displayName, ClientOpenings.currentTerminal(.codex).terminalName),
+                    detail: tr(
+                        "Update the Codex app to %@ or later to use it with MTPLX.",
+                        CodexDesktopIntegration.minimumVersion.map(String.init).joined(separator: ".")
+                    ),
+                    isWarning: false
+                )
+            }
+        }
+        let launch = await agentCLIIntegration.launchInTerminal(
+            client: client,
+            configuration: configuration,
+            baseURL: baseURL,
+            apiKey: activeAPIKey,
+            servedWindow: health?.executionWindow,
+            isCurrent: isCurrent
+        )
+        guard isCurrent() else {
+            reapStaleAgentCLIHandoff(launch, handoffID: handoffID)
+            return false
+        }
+        if let lease = launch.terminalHandoffLease {
+            recordLaunchedAgentCLITerminalHandoffLease(lease, client: client)
+        }
+        if let notice = ClientHandoffNotice.agentCLI(result: launch) ?? terminalNotice {
+            clientHandoffNotice = notice
+            activeClientHandoffID = handoffID
+        }
+        await supervisor.logs.append(
+            "\(client.displayName) handoff \(launch.action.rawValue): \(launch.detail); command: \(launch.command)",
+            stream: .system
+        )
+        guard isCurrent() else {
+            reapStaleAgentCLIHandoff(launch, handoffID: handoffID)
+            return false
+        }
+        return true
+    }
+
+    private func reapStaleAgentCLIHandoff(
+        _ launch: AgentCLILaunchResult,
+        handoffID: UUID
+    ) {
+        if let lease = launch.terminalHandoffLease {
+            _ = agentCLIIntegration.cancelTerminalHandoff(lease)
+            launchedAgentCLIHandoffLeases.removeValue(forKey: lease.handoffID)
+        }
+        clearClientHandoffNotice(for: handoffID)
+    }
+
     private func clearClientHandoffNotice(for handoffID: UUID) {
         guard activeClientHandoffID == handoffID else { return }
         clientHandoffNotice = nil
@@ -4997,7 +5637,8 @@ public final class MTPLXBackendStore: ObservableObject {
         }
     }
 
-    private func apply(snapshot: DashboardSnapshot) {
+    private func apply(snapshot incoming: DashboardSnapshot) {
+        let snapshot = incoming.keepingRows(of: self.snapshot)
         self.snapshot = snapshot
         // Merge the snapshot's `latest` into the existing one rather than
         // replacing it wholesale. Snapshot frames interleave with the SSE

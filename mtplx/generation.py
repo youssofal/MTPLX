@@ -38,8 +38,12 @@ from .checkpoint_anchors import (
     AnchorPlan,
     CheckpointSink,
     checkpoint_coverage,
+    configure_turn_markers,
     default_tail_backoff,
     retain_checkpoints,
+    system_segment_end,
+    turn_markers,
+    user_turn_start,
 )
 from .demotions import mark as _demotion_mark, note as _note_demotion, since as _demotions_since
 from .deepseek_v4_adaptive_width import (
@@ -80,6 +84,7 @@ from .fast_sampling import (
     BatchedSparseDistributions,
     apply_penalties_mlx,
     batched_sparse_distributions_from_mlx_logits,
+    device_sample_key,
     sample_token_ids_from_mlx_logits,
     sparse_distribution_from_mlx_logits,
     sparse_distribution_from_mlx_logits_relaxed_ties,
@@ -111,11 +116,13 @@ from .one_copy import (
     held_qsa_rows,
     layers_to_resize,
     lease_return as one_copy_lease_return,
+    note_anchor as one_copy_note_anchor,
     one_copy_runtime,
     prefill_rows_scope,
     prefill_rows_target,
     prompt_lease_fields,
     qsa_buffers_short,
+    qsa_entries,
     resize_bill,
     resize_qsa_buffers,
 )
@@ -143,6 +150,7 @@ from .sampling import (
     sample_from_distribution,
 )
 from .session_bank import _boundary_true_restore_enabled
+from .token_ids import as_token_tuple
 from .runtime_options import (
     block_prefix_restore_enabled,
     env_bool,
@@ -1824,9 +1832,18 @@ def _predicted_first_prefill_span(
         # Boundaries recorded inside the forwards: the loop runs the plain
         # grid whatever the tail looks like.
         return plain[0]
-    cold_edges: tuple[int, ...] = ()
-    if stable_prefix_len is not None and 0 < int(stable_prefix_len) < body_len:
-        cold_edges = (int(stable_prefix_len),)
+    # The same edges the cold prefill will cut: the stable prompt-prefix
+    # edge and the end of the prompt's system segment.
+    shared = _system_prompt_end(rt, prompt_ids) if rt is not None else None
+    cold_edges: tuple[int, ...] = tuple(
+        sorted(
+            {
+                int(edge)
+                for edge in (stable_prefix_len, shared)
+                if edge is not None and 0 < int(edge) < body_len
+            }
+        )
+    )
     grid = _prefill_spans_with_tail_grid(
         body_len,
         tail_interval=_gdn_boundary_tail_interval(),
@@ -2714,12 +2731,27 @@ def _session_restore_cache_factory(rt: MTPLXRuntime) -> Callable[[], Any] | None
 
 
 def _session_live_frontier_reference_restore_enabled() -> bool:
-    name = "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE"
-    if name not in os.environ:
-        name = "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER"
-    if name not in os.environ:
-        return False
-    return _env_truthy(name)
+    """Whether an exact restore under a prefill cache layout takes the lease.
+
+    On by default, for every client: a follow-up that extends its
+    conversation's banked state takes that state's live cache in place, as
+    the near-prefix lane does, instead of a copy of the whole conversation
+    in the prefill layout (4.24 GB at 131K on Flash-Next) beside the lease
+    it was copied from. The admission already prices an owned lease as
+    free, so a copy here was memory nothing accounted for. Clone stays the
+    fallback (no live cache, another session's lease) and what an explicit
+    clone request gets. Until 12 November only the coding-agent launch
+    lane set this; bare ``mtplx serve`` copied. Either variable set to 0
+    restores the copy.
+    """
+
+    for name in (
+        "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE",
+        "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER",
+    ):
+        if name in os.environ:
+            return _env_truthy(name)
+    return True
 
 
 def _eval_cache_roots(cache: Any) -> None:
@@ -4146,6 +4178,11 @@ class PromptState:
     # SessionBank.put so sub-prefix restores can land on a recurrent-true
     # boundary instead of reusing recurrent state from the stored end.
     gdn_boundaries: list = field(default_factory=list)
+    # One more of them, kept apart: the checkpoint taken where a one-copy
+    # lease was restored at its end (LeaseReturn.anchor). Only the prompt's
+    # own lease keeps it (one_copy.prompt_lease_fields); None on every other
+    # restore.
+    lease_point: tuple | None = None
     # Telemetry only: elapsed/split timings when the store-on-prefill
     # snapshot ran for this prompt state ({} when it did not run). This
     # store executes outside the prompt_eval_time_s window, so without a
@@ -4434,6 +4471,38 @@ def _trim_repeated_suffix(
     return result
 
 
+def _resize_restored_qsa_buffers(cache: Any) -> int:
+    """Give a restored cache's QSA buffers the request's rows, one layer at a
+    time, before its suffix is read. Returns the layers resized.
+
+    A restore from a snapshot (the SSD tier's, or a copy of a durable entry)
+    hands over buffers of exactly the restored rows, and the suffix's first
+    forward grows every QSA layer to the request's rows target
+    (``qwen4_exp.qsa_rows_target``) inside one evaluation: MLX allocates
+    every new buffer before the GPU lets go of the old ones, so the
+    conversation is held twice (window n4l2, 2026-11-12: a 247,546-token
+    follow-up restored from SSD stopped past the engine's limit). Resizing
+    one layer at a time holds one layer beside the conversation instead
+    (``one_copy.resize_qsa_buffers``), and the buffers the forward and the
+    verifier's bank then use are the same ones. A lease already holds the
+    bank's rows and is left as it is, as is a cache outside a rows target
+    (the dense lane, other models) or one with a layer that cannot be
+    resized in place (the forward grows it as before).
+    """
+
+    from .models.qwen4_exp import qsa_rows_target_value
+
+    rows = int(qsa_rows_target_value() or 0)
+    if rows <= 0 or not qsa_entries(cache) or not qsa_buffers_short(cache, rows):
+        return 0
+    try:
+        layers = layers_to_resize(cache, rows)
+    except ValueError:
+        return 0
+    resize_qsa_buffers(cache, rows)
+    return int(layers)
+
+
 def _prefill_restored_prompt_suffix(
     rt: MTPLXRuntime,
     restored: Any,
@@ -4465,6 +4534,7 @@ def _prefill_restored_prompt_suffix(
     if not suffix:
         raise ValueError("suffix must not be empty")
     _check_postcommit_abort(abort_check)
+    _resize_restored_qsa_buffers(restored.cache)
     target_forward_time = 0.0
     mtp_history_time = 0.0
     final_logits_only = _final_logits_prefill_enabled()
@@ -4651,16 +4721,16 @@ def _prefill_restored_prompt_suffix(
     # the fused single-forward cannot capture interior boundaries, so it
     # defers to the chunked path in that case (same tokens, one extra
     # launch; no re-evaluation).
-    _stable_edge_rel: int | None = None
-    if (
-        stable_prefix_len is not None
-        and gdn_boundary_sink is not None
-        and _sink_cuts_forwards(gdn_boundary_sink)
-        and 0 < int(stable_prefix_len) - int(cached_tokens) < max(0, len(suffix) - 1)
-    ):
-        _stable_edge_rel = int(stable_prefix_len) - int(cached_tokens)
+    # The same holds for the end of the system prompt when this prefill
+    # resumed below it (another session's state).
+    _suffix_edges = _mandatory_prefill_edges(
+        stable_prefix_len,
+        gdn_boundary_sink,
+        cached_tokens=int(cached_tokens),
+        length=max(0, len(suffix) - 1),
+    )
     fused_max = _small_suffix_fused_max()
-    if 0 < len(suffix) <= fused_max and _stable_edge_rel is None:
+    if 0 < len(suffix) <= fused_max and not _suffix_edges:
         fused_array = mx.array([suffix])
         fused_embeddings = _suffix_chunk_embeddings(fused_array)
         started = time.perf_counter()
@@ -4736,9 +4806,7 @@ def _prefill_restored_prompt_suffix(
             capture_boundaries=shape_boundaries,
             inforward=_inforward_hooks is not None,
             tail_interval=_gdn_boundary_tail_interval(),
-            mandatory_edges=(
-                (_stable_edge_rel,) if _stable_edge_rel is not None else ()
-            ),
+            mandatory_edges=_suffix_edges,
         )
     # PLE n-gram prefill lookahead (MTPLX_QWEN4_PLE_PREFILL_LOOKAHEAD, off by
     # default), wired to the warm loop exactly as to the cold one: chunk k+1's
@@ -5054,6 +5122,7 @@ def _restore_near_prefix_prompt_state(
     draft_head_identity: str | None,
     policy_fingerprint: str | None,
     min_restore_tokens: int = 0,
+    floor_on_ssd: bool = False,
     allow_block_prefix: bool | None = None,
     abort_check: Callable[[], bool] | None = None,
     chunk_callback: Callable[[dict[str, Any]], None] | None = None,
@@ -5066,7 +5135,12 @@ def _restore_near_prefix_prompt_state(
     session_id: str | None = None,
     reread: Callable[[int, str], dict[str, Any]] | None = None,
 ) -> PromptState | None:
-    """match_ids: the prompt as the bank knows it, when that differs from the
+    """min_restore_tokens: the floor a candidate must beat, what the exact
+    lane would restore. floor_on_ssd: that floor is a spilled entry's length,
+    not a resident one's; a candidate in RAM then only has to reach it (see
+    the loop).
+
+    match_ids: the prompt as the bank knows it, when that differs from the
     model ids: an image prompt's content-keyed view (vision_bank_key_ids).
 
     checkpoint_image_spans: an image prompt's image spans; the suffix prefill
@@ -5133,7 +5207,7 @@ def _restore_near_prefix_prompt_state(
     # prefill too.
     pending = list(
         candidates(
-            match_ids if image_keyed else prompt_ids,
+            match_ids if image_keyed else as_token_tuple(prompt_ids),
             max_token_gap=max_gap,
             min_matched_tokens=min_match,
             **_candidates_kwargs,
@@ -5160,13 +5234,23 @@ def _restore_near_prefix_prompt_state(
                 matched,
                 reforwards_last_token=not bool(getattr(entry, "has_recurrent", False)),
             )
+        cache_source = str(getattr(entry, "cache_source", "ram") or "ram")
+        ssd_cache_hit = bool(getattr(entry, "ssd_cache_hit", False)) or cache_source == "ssd"
+        # A candidate in RAM only has to reach a floor that stands for a
+        # spilled entry: it restores as much, reads nothing back and makes no
+        # second copy of the conversation. After a cancelled answer the next
+        # turn read 118K tokens from SSD for a point the cancelled prompt's
+        # own lease held (12 November).
+        floor = int(min_restore_tokens)
+        if floor_on_ssd and not ssd_cache_hit:
+            floor -= 1
 
         def _near_debug(reason: str) -> None:
             if os.environ.get("MTPLX_DEBUG_PREFIX_DIVERGENCE"):
                 print(
                     f"[mtplx] near-prefix reject: entry_len="
                     f"{int(getattr(entry, 'prefix_len', 0) or 0)} "
-                    f"matched={matched} min_restore={int(min_restore_tokens)} "
+                    f"matched={matched} min_restore={floor} "
                     f"reason={reason}",
                     file=sys.stderr,
                     flush=True,
@@ -5179,7 +5263,7 @@ def _restore_near_prefix_prompt_state(
                 first_reject = reason
             _near_debug(reason)
 
-        if matched <= int(min_restore_tokens):
+        if matched <= floor:
             _near_reject("matched_below_min_restore")
             continue
         if matched < 2 or matched >= int(getattr(entry, "prefix_len", 0) or 0):
@@ -5221,7 +5305,7 @@ def _restore_near_prefix_prompt_state(
                 boundary_probe = probe(matched)
                 if boundary_probe is not None:
                     achievable = int(boundary_probe[0])
-            if achievable <= int(min_restore_tokens):
+            if achievable <= floor:
                 _near_reject(f"boundary_not_better:{achievable}")
                 continue
 
@@ -5367,8 +5451,6 @@ def _restore_near_prefix_prompt_state(
                 # advance the recurrent state twice. Fail closed to the next
                 # candidate (or cold).
                 continue
-            cache_source = str(getattr(entry, "cache_source", "ram") or "ram")
-            ssd_cache_hit = bool(getattr(entry, "ssd_cache_hit", False)) or cache_source == "ssd"
             ssd_restore_s = float(getattr(entry, "ssd_restore_s", 0.0) or 0.0)
             ssd_cached_tokens = restore_point if ssd_cache_hit else 0
             total_cache_restore_time_s = (
@@ -5376,6 +5458,9 @@ def _restore_near_prefix_prompt_state(
             )
 
             _check_postcommit_abort(abort_check)
+            # Before any forward writes into it (the seed forward below
+            # included), so no forward grows every layer at once.
+            _resize_restored_qsa_buffers(cache)
             if boundary_restore:
                 # Boundary-true restore: KV and recurrent state both sit exactly
                 # at restore_point; token restore_point-1 must NOT be re-run (the
@@ -5473,7 +5558,7 @@ def _restore_near_prefix_prompt_state(
                     logits=logits[:, -1, :],
                     hidden=hidden[:, -1:, :] if hidden is not None else None,
                     committed_mtp_cache=mtp_history_cache,
-                    token_prefix=tuple(int(token) for token in prompt_ids),
+                    token_prefix=as_token_tuple(prompt_ids),
                     prompt_eval_time_s=repair_time + repage_time,
                     cache_restore_time_s=total_cache_restore_time_s,
                     mtp_history_policy=mtp_history_policy,
@@ -5500,6 +5585,8 @@ def _restore_near_prefix_prompt_state(
                     restore_point=restore_point,
                     stable_prefix_len=stable_prefix_len,
                     image_spans=checkpoint_image_spans,
+                    system_end=_system_prompt_end(rt, prompt_ids),
+                    turn_start=_user_turn_start(rt, prompt_ids),
                 )
                 if _gdn_boundary_capture_enabled()
                 else None
@@ -5557,7 +5644,7 @@ def _restore_near_prefix_prompt_state(
                 logits=suffix_logits,
                 hidden=suffix_hidden,
                 committed_mtp_cache=mtp_history_cache,
-                token_prefix=tuple(int(token) for token in prompt_ids),
+                token_prefix=as_token_tuple(prompt_ids),
                 prompt_eval_time_s=repair_time + suffix_time + mtp_history_time,
                 prompt_mtp_history_time_s=mtp_history_time,
                 cache_restore_time_s=total_cache_restore_time_s,
@@ -5651,6 +5738,121 @@ def _retain_boundary_sink(sink: list) -> None:
     )
 
 
+_NO_MARKERS_YET = object()
+
+
+def _chatml_system_markers(rt: Any) -> tuple[int, tuple[int, ...]] | None:
+    """``(<|im_start|> id, ids of "system")`` for this runtime's tokenizer,
+    read once and kept on the runtime; None when it has no ChatML markers
+    (Gemma, a test double): the capability is absent, nothing failed."""
+
+    markers = getattr(rt, "_mtplx_chatml_system_markers", _NO_MARKERS_YET)
+    if markers is not _NO_MARKERS_YET:
+        return markers
+    markers = None
+    tokenizer = getattr(rt, "tokenizer", None)
+    try:
+        start = tokenizer.convert_tokens_to_ids("<|im_start|>")
+        system = tuple(tokenizer.encode("system", add_special_tokens=False))
+        if (
+            isinstance(start, int)
+            and start >= 0
+            and system
+            and tokenizer.convert_ids_to_tokens(start) == "<|im_start|>"
+        ):
+            markers = (int(start), system)
+    except (AttributeError, TypeError, KeyError, ValueError):
+        markers = None
+    try:
+        setattr(rt, "_mtplx_chatml_system_markers", markers)
+    except AttributeError:
+        pass
+    return markers
+
+
+def _system_prompt_end(rt: Any, prompt_ids: Sequence[int]) -> int | None:
+    """``system_segment_end`` of a prompt that opens with a ChatML system
+    turn (its role read with this runtime's tokenizer): where its prefill
+    records the checkpoint a new session of the same client, a subagent or
+    a compacted conversation resumes from. None for any other prompt."""
+
+    markers = _chatml_system_markers(rt)
+    if markers is None or len(prompt_ids) < 2:
+        return None
+    start, system = markers
+    if int(prompt_ids[0]) != start or tuple(
+        int(token) for token in prompt_ids[1 : 1 + len(system)]
+    ) != system:
+        return None
+    return system_segment_end(prompt_ids)
+
+
+def _user_turn_start(rt: Any, prompt_ids: Sequence[int]) -> int | None:
+    """``user_turn_start`` of this prompt, with the chat markers read once from
+    this runtime's tokenizer and registered for the session bank (which has
+    no tokenizer). None for a tokenizer without ChatML user and tool-result
+    markers: the capability is absent, nothing failed."""
+
+    markers = getattr(rt, "_mtplx_chatml_turn_markers", _NO_MARKERS_YET)
+    if markers is _NO_MARKERS_YET:
+        markers = None
+        tokenizer = getattr(rt, "tokenizer", None)
+        try:
+            start = tokenizer.convert_tokens_to_ids("<|im_start|>")
+            tool = tokenizer.convert_tokens_to_ids("<tool_response>")
+            user = tuple(int(t) for t in tokenizer.encode("user\n", add_special_tokens=False))
+            assistant = tuple(
+                int(t) for t in tokenizer.encode("assistant\n", add_special_tokens=False)
+            )
+            if (
+                isinstance(start, int)
+                and isinstance(tool, int)
+                and start >= 0
+                and tool >= 0
+                and user
+                and assistant
+                and tokenizer.convert_ids_to_tokens(start) == "<|im_start|>"
+                and tokenizer.convert_ids_to_tokens(tool) == "<tool_response>"
+            ):
+                markers = (int(start), user, assistant, int(tool))
+        except (AttributeError, TypeError, KeyError, ValueError):
+            markers = None
+        try:
+            setattr(rt, "_mtplx_chatml_turn_markers", markers)
+        except AttributeError:
+            pass
+    if markers is None:
+        return None
+    if turn_markers() != markers:
+        configure_turn_markers(markers)
+    return user_turn_start(prompt_ids)
+
+
+def _mandatory_prefill_edges(
+    stable_prefix_len: int | None,
+    sink: Any,
+    *,
+    cached_tokens: int = 0,
+    length: int,
+) -> tuple[int, ...]:
+    """The chunk edges a prefill of ``length`` tokens after ``cached_tokens``
+    must cut (or record in-forward), relative to its start: the stable
+    prompt-prefix edge and the end of the system prompt, each only when it
+    falls strictly inside the prefill and the sink shapes its forwards."""
+
+    if sink is None or not _sink_cuts_forwards(sink):
+        return ()
+    edges: set[int] = set()
+    system_end = getattr(getattr(sink, "plan", None), "system_end", None)
+    for edge in (stable_prefix_len, system_end):
+        if edge is None:
+            continue
+        relative = int(edge) - int(cached_tokens)
+        if 0 < relative < int(length):
+            edges.add(relative)
+    return tuple(sorted(edges))
+
+
 def _checkpoint_sink(
     records: Any,
     *,
@@ -5661,11 +5863,13 @@ def _checkpoint_sink(
     ceiling: int | None = None,
     image_spans: Sequence[tuple[int, int]] = (),
     cuts_forwards: bool = True,
+    system_end: int | None = None,
+    turn_start: int | None = None,
 ) -> CheckpointSink:
     """The checkpoint list one prefill fills, with everything its retention
     needs known up front: the prompt end, the restore point, the stable edge,
-    the ceiling, an image prompt's image spans and the session bank's byte
-    budget."""
+    the end of the system prompt (``_system_prompt_end``), the ceiling, an
+    image prompt's image spans and the session bank's byte budget."""
 
     sink = CheckpointSink(
         records or (),
@@ -5681,6 +5885,8 @@ def _checkpoint_sink(
             image_spans=tuple(
                 (int(start), int(end)) for start, end in (image_spans or ())
             ),
+            system_end=None if system_end is None else int(system_end),
+            turn_start=None if turn_start is None else int(turn_start),
         ),
         cuts_forwards=cuts_forwards,
     )
@@ -6152,15 +6358,19 @@ def _inherited_gdn_boundaries(
     fully cold with `no_snapshot_coverage`).
 
     The inherited set keeps its anchors under ``budget_bytes`` (the session
-    bank's checkpoint budget; None keeps the default count). The restore
-    point is the only anchor it protects (the prefill that follows protects
-    its own prompt end): it sits at the previous prompt's end, where a later
-    turn may diverge again, and the grid covers everything before it. A set
+    bank's checkpoint budget; None keeps the default count). It protects the
+    restore point (the prefill that follows protects its own prompt end): it
+    sits at the previous prompt's end, where a later turn may diverge again,
+    and the grid covers everything before it; and the end of the system
+    prompt, read from the entry's tokens, where a new session resumes. A set
     already within the budget is kept whole. Re-thinning here was the second
     site that hollowed out mid-prefix coverage on clone/lease chains.
     """
     records = list(getattr(entry, "gdn_boundaries", None) or [])
     kept = [record for record in records if int(record[0]) <= int(restore_point)]
+    if not kept:
+        return []
+    token_ids = getattr(entry, "token_ids", None)
     return retain_checkpoints(
         kept,
         AnchorPlan(
@@ -6168,6 +6378,10 @@ def _inherited_gdn_boundaries(
             prompt_end=int(restore_point),
             tail_backoff=0,
             restore_point=int(restore_point),
+            system_end=system_segment_end(token_ids) if token_ids else None,
+            turn_start=(
+                user_turn_start(token_ids, limit=int(restore_point)) if token_ids else None
+            ),
         ),
     )
 
@@ -6606,6 +6820,9 @@ def restore_or_prefill_prompt_state(
     base_hidden_variant = _resolve_runtime_base_hidden_variant(rt, base_hidden_variant)
     mtp_hidden_variant = _resolve_runtime_mtp_hidden_variant(rt, mtp_hidden_variant)
     mtp_position_mode = _resolve_runtime_mtp_position_mode(rt)
+    # Normalized once: the bank's per-entry compares are shared across its
+    # lookups when they are handed the same tuple object.
+    prompt_tuple = as_token_tuple(prompt_ids)
     os.environ["MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS"] = str(len(prompt_ids))
     mtp_history_policy = _resolve_mtp_history_policy(
         mtp_history_policy,
@@ -6731,6 +6948,8 @@ def restore_or_prefill_prompt_state(
                     prompt_len=len(prompt_ids),
                     boundaries=boundaries,
                     runtime=rt,
+                    resumed_at=int(state.cached_tokens),
+                    lease_point=state.lease_point,
                 )
                 has_mtp = state.committed_mtp_cache is not None
             else:
@@ -6785,6 +7004,9 @@ def restore_or_prefill_prompt_state(
             }
 
     def _emit_prefill_complete(state: PromptState) -> PromptState:
+        # What a prompt anchor of this cache holds, for the next admission's
+        # bill (one_copy.note_anchor); a read of shapes, once per process.
+        one_copy_note_anchor(rt, state.trunk_cache)
         if session_bank is not None:
             state.checkpoint_coverage = checkpoint_coverage(
                 state.gdn_boundaries,
@@ -6855,7 +7077,9 @@ def restore_or_prefill_prompt_state(
         )
         # The bank only ever sees the content-keyed view of a vision prompt;
         # for text prompts the two views are the same list.
-        bank_match_ids = bank_key_ids if bank_key_ids is not None else prompt_ids
+        bank_match_ids = (
+            as_token_tuple(bank_key_ids) if bank_key_ids is not None else prompt_tuple
+        )
         exact_prefix_len = 0
         try:
             longest_prefix = getattr(session_bank, "longest_prefix", None)
@@ -6876,7 +7100,8 @@ def restore_or_prefill_prompt_state(
         # only the system prompt: 2026-10-09, a 58,529-token turn restored
         # 4,019 tokens and re-read the rest (143 s) while its own 57,989
         # tokens sat on disk, and held the hydrated copy (5.4 GB) through
-        # that prefill.
+        # that prefill. A candidate in RAM that reaches the same point is
+        # served ahead of the SSD read (``floor_on_ssd``).
         near_restore_floor = exact_prefix_len
         if exact_prefix_len == 0:
             try:
@@ -6940,7 +7165,7 @@ def restore_or_prefill_prompt_state(
             tried_larger_near_prefix = True
             near_prompt_state = _restore_near_prefix_prompt_state(
                 rt,
-                prompt_ids,
+                prompt_tuple,
                 base_hidden_variant=base_hidden_variant,
                 mtp_hidden_variant=mtp_hidden_variant,
                 mtp_history_policy=mtp_history_policy,
@@ -6949,6 +7174,7 @@ def restore_or_prefill_prompt_state(
                 draft_head_identity=draft_head_identity,
                 policy_fingerprint=policy_fingerprint,
                 min_restore_tokens=near_restore_floor,
+                floor_on_ssd=exact_prefix_len == 0 and near_restore_floor > 0,
                 allow_block_prefix=allow_block_prefix,
                 abort_check=abort_check,
                 chunk_callback=prefill_callback,
@@ -7066,7 +7292,7 @@ def restore_or_prefill_prompt_state(
                     logits=restored.logits,
                     hidden=restored.hidden,
                     committed_mtp_cache=restored.mtp_history_cache,
-                    token_prefix=tuple(int(token) for token in prompt_ids),
+                    token_prefix=prompt_tuple,
                     prompt_eval_time_s=repage_time,
                     cache_restore_time_s=restore_elapsed_s,
                     mtp_history_policy=mtp_history_policy,
@@ -7120,6 +7346,8 @@ def restore_or_prefill_prompt_state(
                         stable_prefix_len=stable_prefix_len,
                         image_spans=checkpoint_image_spans,
                         cuts_forwards=vision_splice is None,
+                        system_end=_system_prompt_end(rt, prompt_ids),
+                        turn_start=_user_turn_start(rt, prompt_ids),
                     )
                     if keep_checkpoints
                     else None
@@ -7163,7 +7391,7 @@ def restore_or_prefill_prompt_state(
                 logits=suffix_logits,
                 hidden=suffix_hidden,
                 committed_mtp_cache=restored.mtp_history_cache,
-                token_prefix=tuple(int(token) for token in prompt_ids),
+                token_prefix=prompt_tuple,
                 prompt_eval_time_s=suffix_time + mtp_history_time,
                 prompt_mtp_history_time_s=mtp_history_time,
                 cache_restore_time_s=restore_elapsed_s,
@@ -7183,6 +7411,7 @@ def restore_or_prefill_prompt_state(
                     else inherited_boundaries
                 ),
                 restore_served=exact_served,
+                lease_point=lease_back.anchor if lease_back is not None else None,
             ))
 
         near_prompt_state = _restore_near_prefix_prompt_state(
@@ -7239,6 +7468,8 @@ def restore_or_prefill_prompt_state(
             stable_prefix_len=stable_prefix_len,
             image_spans=checkpoint_image_spans,
             cuts_forwards=vision_splice is None,
+            system_end=_system_prompt_end(rt, prompt_ids),
+            turn_start=_user_turn_start(rt, prompt_ids),
         )
         if keep_checkpoints
         else None
@@ -7359,7 +7590,7 @@ def restore_or_prefill_prompt_state(
         logits=logits,
         hidden=hidden,
         committed_mtp_cache=mtp_history_cache,
-        token_prefix=tuple(int(token) for token in prompt_ids),
+        token_prefix=prompt_tuple,
         prompt_eval_time_s=prompt_eval_time,
         prompt_mtp_history_time_s=prompt_history_time,
         mtp_history_policy=mtp_history_policy,
@@ -8411,13 +8642,13 @@ def _prefill(
     if len(prompt_ids) > 1:
         body = prompt_ids[:-1]
         body_array = mx.array([body])
-        _cold_edges: tuple[int, ...] = ()
-        if (
-            stable_prefix_len is not None
-            and shape_boundaries
-            and 0 < int(stable_prefix_len) < len(body)
-        ):
-            _cold_edges = (int(stable_prefix_len),)
+        _cold_edges: tuple[int, ...] = (
+            _mandatory_prefill_edges(
+                stable_prefix_len, gdn_boundary_sink, length=len(body)
+            )
+            if shape_boundaries
+            else ()
+        )
         _inforward_hooks = (
             _resolve_inforward_boundary_hooks(rt, vision_splice=vision_splice)
             if shape_boundaries
@@ -8560,13 +8791,11 @@ def _prefill_committed_mtp_history_streaming(
             pad_prefix_counts.append(
                 pad_prefix_counts[-1] + (1 if token == pad_id else 0)
             )
-    _cold_edges: tuple[int, ...] = ()
-    if (
-        stable_prefix_len is not None
-        and shape_boundaries
-        and 0 < int(stable_prefix_len) < len(body)
-    ):
-        _cold_edges = (int(stable_prefix_len),)
+    _cold_edges: tuple[int, ...] = (
+        _mandatory_prefill_edges(stable_prefix_len, gdn_boundary_sink, length=len(body))
+        if shape_boundaries
+        else ()
+    )
     _inforward_hooks = (
         _resolve_inforward_boundary_hooks(rt, vision_splice=vision_splice)
         if shape_boundaries
@@ -9294,6 +9523,8 @@ def _commit_ar_prompt_state(
                 prompt_len=len(prompt_ids),
                 boundaries=boundaries,
                 runtime=rt,
+                resumed_at=int(prompt_state.cached_tokens),
+                lease_point=prompt_state.lease_point,
             )
         else:
             bank_fields = {
@@ -10879,11 +11110,16 @@ def generate_mtpk(
     # fall onto the compiled route hard-fails its sampler validator (solo
     # requests 500'd on the composite daemon while penalty cohorts already took
     # the batch scheduler's dense host fallback).
+    # An image request roped at its grid positions (mtplx.dense_mrope) stays
+    # off the A3B route: its fixed caches carry no rotary delta, so its rows
+    # after the prompt would rotate at the plain index. It takes the generic
+    # route, whose caches the admission below hands the delta.
     exact_a3b_target_prefix_factory = (
         rt.a3b_compiled_target_prefix_factory
         if target_prefix_verify and constraint is None
         and not _ccopy_takes_over_lane
         and not _penalty_bearing_request
+        and _dense_mrope_request is None
         else None
     )
     exact_a3b_target_prefix = exact_a3b_target_prefix_factory is not None
@@ -11264,6 +11500,8 @@ def generate_mtpk(
                     prompt_len=len(prompt_ids),
                     boundaries=prompt_boundaries,
                     runtime=rt,
+                    resumed_at=int(prompt_state.cached_tokens),
+                    lease_point=prompt_state.lease_point,
                 )
             else:
                 # This prompt cache is committed before decode continues and
@@ -11791,6 +12029,28 @@ def generate_mtpk(
     clear_cache_observed_tokens = 0
     clear_cache_events = 0
     clear_cache_time_s = 0.0
+    # A long prefill leaves its freed buffers in MLX's cache, in sizes the
+    # answer never asks for again. On a cold 130,047-token prompt (window
+    # n4a4, 12 Nov) the process held 97.7 GB for the first 120 tokens of the
+    # answer against 92.1 GB of live arrays (MLX's own peak), until an
+    # allocation made MLX give them back; a 512-token answer never reaches
+    # the cadence's first clear at 1,024 tokens. With the long-context
+    # cadence armed, the first round after a long prefill clears them.
+    # A long conversation restored from SSD leaves them too, behind a short
+    # suffix: the decode's read buffers and each layer's buffers from before
+    # it grew. In window n4k1 (12 Nov, the built candidate, the Pi turn after
+    # a cancelled one) a 118,096-token restore left 6.25 to 6.73 GB in MLX's
+    # cache for the answer's first 1,041 tokens against 88.38 GB of live
+    # arrays, until the cadence's first clear.
+    clear_after_tokens = max(1, _env_int("MTPLX_CLEAR_CACHE_EVERY_CONTEXT_THRESHOLD", 16384))
+    if clear_cache_every > 0 and (
+        int(getattr(prompt_state, "suffix_tokens", 0) or 0) >= clear_after_tokens
+        or (
+            bool(getattr(prompt_state, "ssd_cache_hit", False))
+            and int(getattr(prompt_state, "ssd_cached_tokens", 0) or 0) >= clear_after_tokens
+        )
+    ):
+        clear_cache_tokens_since = clear_cache_every
     trunk_cache_materialize_every = max(
         0,
         int(os.environ.get("MTPLX_TRUNK_CACHE_MATERIALIZE_EVERY") or 0),
@@ -14717,6 +14977,7 @@ def generate_mtpk(
                 device_draft_token = sample_token_ids_from_mlx_logits(
                     draft_logits[:, -1, :],
                     draft_sampler,
+                    key=device_sample_key(rng, draft_sampler),
                 )
                 draft_token = None
                 draft_q = None
@@ -15305,9 +15566,15 @@ def generate_mtpk(
                 target_distribution_logits = mx.stack(_guarded_rows, axis=0)[
                     None, ...
                 ]
+            # Every token this lane commits is one of these samples (a kept
+            # draft equals it, a correction and the bonus are it), so they
+            # take their key from the request's seeded generator, as the
+            # other lanes' host draws do: the seed then fixes the answer in
+            # any process (MLX seeds its own generator from the clock).
             sampled_target_ids = sample_token_ids_from_mlx_logits(
                 target_distribution_logits,
                 sampler,
+                key=device_sample_key(rng, sampler),
             )
             if a3b_target_prefix_route is not None and not a3b_k2:
                 _eval(sampled_target_ids, device_draft_token)

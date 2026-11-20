@@ -634,6 +634,33 @@ def test_a_pi_session_restores_all_but_the_new_turn_after_a_screenshot(harness):
         previous = call
 
 
+def test_every_image_turn_says_what_its_images_cost_when_the_repair_is_served(
+    harness, monkeypatch
+):
+    """The image cost fields reach the row of a turn whose repaired encode is
+    served: serving replaces the observability dict's contents with the gate's
+    copy, which was taken before the images were materialized."""
+
+    def counting(state, images, prompt_ids, *, timing=None):
+        # A test double whose images are all in the embed cache.
+        if timing is not None:
+            timing["vision_cache_hits"] = len(images)
+        return _fake_materialize(state, images, prompt_ids)
+
+    monkeypatch.setattr(openai, "_materialize_vision_splice", counting)
+    history, _committed, first = _image_turn(harness)
+    _echoed, follow = _chat(
+        harness, _second_image_request(history, IMAGE_A), SHORT_ANSWER
+    )
+    for call, images in ((first, 1), (follow, 2)):
+        observed = call["observability"]
+        assert observed["request_vision_session_restore"]["canonicalized"] is True
+        assert observed["vision_cache_hits"] == images
+        assert observed["vision_tower_misses"] == 0
+        assert observed["vision_tower_s"] == 0.0
+        assert observed["vision_materialize_s"] >= 0.0
+
+
 def test_the_splice_never_copies_across_image_rows_that_differ():
     tokenizer = SeamTokenizer()
     a = tokenizer.encode("look ") + [VISION_START, PAD, PAD, VISION_END]
@@ -683,7 +710,7 @@ def test_kill_switch_restores_the_old_image_turn(harness, monkeypatch):
     # as two), so nothing past that point can be restored: the whole text
     # history is prefilled again.
     prompt_ids = call["prompt_ids"]
-    parted_at = openai._common_prefix_len(prompt_ids, committed)
+    parted_at = openai.common_prefix_len(prompt_ids, committed)
     assert parted_at < 64
     assert call["cached_tokens"] <= parted_at
     assert call["logits"] == _cold_logits(prompt_ids, [IMAGE_A])

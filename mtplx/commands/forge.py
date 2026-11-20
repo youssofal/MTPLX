@@ -114,6 +114,10 @@ def cmd_forge_public(args: Any, *, model_root: str | Path | None = None) -> int:
     try:
         if action == "probe":
             return _cmd_probe(args)
+        if action in ("census", "day-zero"):
+            from mtplx.commands import forge_day_zero
+
+            return forge_day_zero.cmd_census(args) if action == "census" else forge_day_zero.cmd_day_zero(args)
         if action == "build":
             return _cmd_build(args, model_root=model_root)
         if action == "discover":
@@ -1464,17 +1468,29 @@ def _convert_with_mlx_lm(
     recipe: dict[str, Any],
     source_format: str,
     run: Path,
+    env: dict[str, str] | None = None,
 ) -> None:
+    """``env`` is the converter process's environment (this process's when None)."""
+
     destination.parent.mkdir(parents=True, exist_ok=True)
     _write_progress(run, "convert", progress=0.05, label="to_mlx", finished=False)
-    if recipe.get("module_overrides"):
+    renamed = _renamed_plain_trunk(source)
+    if recipe.get("module_overrides") or renamed:
+        # Our own driver: the only one that takes per-module precision, and
+        # the only one that can name the module of a trunk published under a
+        # model_type mlx-lm has not heard of.
         command = _mixed_convert_command(
             source,
             destination,
             recipe=recipe,
             source_format=source_format,
         )
-        _err("[forge] converting with mlx-lm (mixed-precision module overrides)")
+        if renamed:
+            _err(f"[forge] the source's model_type is new; its contents are a {renamed} trunk, converted as one")
+        if recipe.get("module_overrides"):
+            _err("[forge] converting with mlx-lm (mixed-precision module overrides)")
+        else:
+            _err("[forge] converting with mlx-lm")
     else:
         command = _mlx_lm_convert_command(
             source,
@@ -1493,6 +1509,7 @@ def _convert_with_mlx_lm(
             stdout=stdout,
             stderr=stderr,
             text=True,
+            env=env,
         )
         tick = 0
         while proc.poll() is None:
@@ -1518,6 +1535,20 @@ def _convert_with_mlx_lm(
         finished=True,
         elapsed_s=round(time.monotonic() - started, 3),
     )
+
+
+def _renamed_plain_trunk(source: Path) -> str | None:
+    """The family of a plain trunk published under a ``model_type`` mlx-lm has
+    no module for, or None.  A name mlx-lm knows is that module's business."""
+    from mtplx.backends import signature
+    from mtplx.backends.registry import _mlx_lm_module_exists
+
+    try:
+        config = _load_json(source / "config.json")
+    except (OSError, ValueError):
+        return None
+    model_type = str(config.get("model_type") or text_config(config).get("model_type") or "")
+    return None if _mlx_lm_module_exists(model_type) else signature.renamed_plain_trunk(config)
 
 
 def _mixed_convert_command(
@@ -1854,7 +1885,13 @@ def _should_sanitize_extracted_mtp_weights(config: dict[str, Any]) -> bool:
             elif isinstance(value, list):
                 markers.extend(str(item) for item in value)
     normalized = " ".join(markers).lower()
-    return "qwen3_5" in normalized or "qwen3next" in normalized or "qwen3_next" in normalized
+    if "qwen3_5" in normalized or "qwen3next" in normalized or "qwen3_next" in normalized:
+        return True
+    # By contents: a plain hybrid trunk published under a new name stores its
+    # head the same way, and an unshifted head drafts at a few percent.
+    from mtplx.backends import signature
+
+    return signature.family(config) in (signature.QWEN3_5, signature.QWEN3_5_MOE)
 
 
 def _extract_embedded_mtp(
@@ -3744,8 +3781,17 @@ def _verification_predates_forge(runtime: dict[str, Any] | None) -> bool:
         return False
 
 
-def _recommended_profile_stamp(model_path: Path, *, best_depth: int) -> str:
+_PROFILE_NAMES = frozenset({"stable", "sustained", "turbo"})
+
+
+def _recommended_profile_stamp(model_path: Path, *, best_depth: int, recipe: dict[str, Any] | None = None) -> str:
     """Profile per-model launch resolution will actually pick for this artifact.
+
+    A recipe may say it itself (``recommended_profile``).  The per-model
+    resolution below promotes a known list of flagship ids to turbo, so a
+    Speed pack of a model nobody has named yet would be stamped, and then
+    served, on the slower default without a word; its recipe is where the
+    profile its family's Speed packs serve under is written down.
 
     A hard-coded "sustained" stamp lied for flagship-identified rebuilds
     (drop-day forge-local builds carry first-party branded names): serve
@@ -3760,6 +3806,9 @@ def _recommended_profile_stamp(model_path: Path, *, best_depth: int) -> str:
 
     if best_depth <= 0:
         return "stable"
+    declared = str((recipe or {}).get("recommended_profile") or "").strip().lower()
+    if declared in _PROFILE_NAMES:
+        return declared
     from mtplx.commands.public import resolved_default_profile_name_for_ref
 
     return resolved_default_profile_name_for_ref(model_path)
@@ -3830,8 +3879,9 @@ def _stamp_runtime_metadata(
     metadata["mtp_depth_max"] = max(verified_depth_max, int(metadata.get("mtp_depth_max") or 0))
     metadata.setdefault(
         "recommended_profile",
-        _recommended_profile_stamp(model_path, best_depth=best_depth),
+        _recommended_profile_stamp(model_path, best_depth=best_depth, recipe=recipe),
     )
+    _stamp_verified_depth_default(metadata, best_depth=best_depth)
     # Stamp the FAMILY's sampler law, not a fixed 0.6 — the Qwen3.8/Qwen4
     # families serve at temperature 1.0, and a contract advertising 0.6
     # would mis-sample every client that honors it (the 27B misattribution
@@ -3858,6 +3908,7 @@ def _stamp_runtime_metadata(
         metadata["quality_pack"] = config["mtplx_quality"]
         metadata["min_engine_version"] = config["mtplx_quality"]["min_engine_version"]
         metadata["served_model_id"] = config["mtplx_quality"]["served_id"]
+    _stamp_forge_local_public_model_id(metadata, model_path=model_path, branded_name=branded_name)
     metadata.setdefault("exactness_baseline", {})
     speed_evidence = _speed_evidence(rows)
     artifact_fingerprint = _verification_artifact_fingerprint(model_path)
@@ -3889,6 +3940,47 @@ def _stamp_runtime_metadata(
     if isinstance(calibration, dict):
         metadata["forge_provenance"]["mtp_contract_calibration"] = dict(calibration)
     return metadata
+
+
+_FORGE_VERIFIED_DEPTH_STATUS = "forge_verified"
+_ID_CLAIM_KEYS = ("public_model_id", "served_model_id", "model_id")
+
+
+def _stamp_verified_depth_default(metadata: dict[str, Any], *, best_depth: int) -> None:
+    """Record verify's fastest depth as ``mtp_depth_default``.
+
+    Serve reads ``mtp_depth_default`` (or its historical spelling
+    ``recommended_mtp_depth``) as the launch depth and otherwise runs at the
+    ``mtp_depth_max`` ceiling, which is slower whenever acceptance decays
+    with depth. A value declared by the source is kept; a value an earlier
+    Forge verify stamped is replaced by the new measurement, or dropped when
+    no MTP depth won this time.
+    """
+
+    declared = any(metadata.get(key) is not None for key in ("mtp_depth_default", "recommended_mtp_depth"))
+    stamped_by_forge = metadata.get("mtp_depth_default_status") == _FORGE_VERIFIED_DEPTH_STATUS
+    if declared and not stamped_by_forge:
+        return
+    if best_depth > 0:
+        metadata["mtp_depth_default"] = int(best_depth)
+        metadata["mtp_depth_default_status"] = _FORGE_VERIFIED_DEPTH_STATUS
+    elif stamped_by_forge:
+        metadata.pop("mtp_depth_default", None)
+        metadata.pop("mtp_depth_default_status", None)
+
+
+def _stamp_forge_local_public_model_id(
+    metadata: dict[str, Any], *, model_path: Path, branded_name: str
+) -> None:
+    """Pin a served id on a non-first-party pack that has no id claim."""
+
+    if any(isinstance(metadata.get(key), str) and metadata[key].strip() for key in _ID_CLAIM_KEYS):
+        return
+    from mtplx.default_models import forge_local_public_model_id
+
+    public_id = forge_local_public_model_id(branded_name, model_path)
+    if public_id:
+        metadata["public_model_id"] = public_id
 
 
 def _vision_metadata_stamp(model_path: Path) -> dict[str, Any] | None:

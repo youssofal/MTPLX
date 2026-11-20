@@ -8,7 +8,12 @@ enum Format {
     /// nil/non-finite values. Pair with the "TPS" unit suffix in UI.
     static func tps(_ value: Double?) -> String {
         guard let value, value.isFinite else { return "—" }
-        if value >= 100 { return String(format: "%.0f", value) }
+        if value >= 100 {
+            // Prefill reads run into the thousands: group them like every
+            // token count beside them ("1,560", not "1560").
+            let whole = value.rounded()
+            return whole >= 1_000 ? integer(whole) : String(format: "%.0f", whole)
+        }
         if value >= 10 { return String(format: "%.1f", value) }
         return String(format: "%.2f", value)
     }

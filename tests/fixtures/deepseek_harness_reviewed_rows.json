@@ -1,0 +1,442 @@
+{
+ "profile": "web",
+ "rows": {
+  "agent": {
+   "does": "Agent interface, registry, initiator scope, and event vocabulary for the DeepSeek Harness",
+   "package": "@deepseek-ai/dsh-agent"
+  },
+  "agent-default-model": {
+   "does": "Default model selection shared by Agent entry points",
+   "package": "@deepseek-ai/dsh-agent-default-model"
+  },
+  "agent-loop": {
+   "does": "The concrete agent loop plugin for the DeepSeek Harness",
+   "package": "@deepseek-ai/dsh-agent-loop"
+  },
+  "agent-presets": {
+   "does": "Per-session agent composition from preset cordis.yml files for the DeepSeek Harness",
+   "package": "@deepseek-ai/dsh-agent-presets"
+  },
+  "api-remotes": {
+   "does": "Remote BFF assembly for application-selected Host capabilities",
+   "package": "@deepseek-ai/dsh-api-remotes"
+  },
+  "approval": {
+   "does": "User-approval seam (ctx.approval) for the DeepSeek Harness: one-shot permission decisions dispatched to composed answerers over the approval/request waterfall, fail-closed by default",
+   "package": "@deepseek-ai/dsh-user-approval"
+  },
+  "attachment-local": {
+   "does": "Private content-addressed DSH_HOME attachment storage",
+   "package": "@deepseek-ai/dsh-attachment-local"
+  },
+  "bash-sandbox": {
+   "does": "Sandbox-consuming implementation of the DeepSeek Harness bash executor seam (confines every command via ctx.sandbox, reports denial/enforcement result facts)",
+   "package": "@deepseek-ai/dsh-bash-sandbox"
+  },
+  "client-hmr": {
+   "does": "Dev-only hot-reload driver for script-loaded client entries: SSE rebuilt frames \u2192 invalidate/prefetch \u2192 fiber swap through the vendored Loader entry",
+   "package": "@deepseek-ai/dsh-client-hmr"
+  },
+  "code-runtime": {
+   "does": "Worker-thread implementation of the DeepSeek Harness code-execution seam",
+   "package": "@deepseek-ai/dsh-code-runtime-worker-thread"
+  },
+  "commands": {
+   "does": "Plugin-owned human command registry for DeepSeek Harness UIs",
+   "package": "@deepseek-ai/dsh-commands"
+  },
+  "connection": {
+   "does": "Authenticated RPC transport, generation lifecycle, and browser fixture",
+   "package": "@deepseek-ai/dsh-client-connection"
+  },
+  "cordis-client-runner": {
+   "does": "Browser half of dynamic dual-half plugin packages: event subscription, closure evaluation, guard facade, and loader entries",
+   "package": "@deepseek-ai/dsh-cordis-client-runner"
+  },
+  "cordis-host-runner": {
+   "does": "Dynamic package definition registry, host-half sandbox lifecycle, and invoke handler table for model-mounted dual-half packages",
+   "package": "@deepseek-ai/dsh-cordis-host-runner"
+  },
+  "credentials": {
+   "does": "File-backed credentials provider ($DSH_HOME/.env under the live process environment) for the DeepSeek Harness",
+   "package": "@deepseek-ai/dsh-credentials-local"
+  },
+  "deepseek-llm-api-extensions": {
+   "does": "Additive request-field registry for the official DeepSeek LLM API adapter",
+   "package": "@deepseek-ai/dsh-deepseek-llm-api-extensions"
+  },
+  "directory-picker": {
+   "does": "Adaptive chooser of the directory-picker seam: resolves the host situation at boot and mounts the native or browse backend for the DeepSeek Harness web GUI host",
+   "package": "@deepseek-ai/dsh-host-directory-picker-auto"
+  },
+  "file-reference-local": {
+   "does": "Local-filesystem ctx.fileReferences provider with bounded fuzzy indexes",
+   "package": "@deepseek-ai/dsh-file-reference-local"
+  },
+  "fs-observation-policy": {
+   "does": "File-context policy plugin for the DeepSeek Harness \u2014 observed-state, read-before-edit, and version-guarded write/edit added over the ctx.fs provider seam through the fs/* event gate (no service API)",
+   "package": "@deepseek-ai/dsh-fs-observation-policy"
+  },
+  "fs-sandbox": {
+   "does": "Sandbox-enforcing implementation of the DeepSeek Harness filesystem seam: fences write/edit by the per-call sandbox mode (read-only denies mutation, workspace-write contains it to the workspace + temp roots) while reads pass through",
+   "package": "@deepseek-ai/dsh-fs-sandbox"
+  },
+  "goal": {
+   "does": "Event-sourced same-session goal state and lifecycle service for the DeepSeek Harness",
+   "package": "@deepseek-ai/dsh-goal"
+  },
+  "goal-round-driver": {
+   "does": "Race-fenced same-session goal-round driver",
+   "package": "@deepseek-ai/dsh-goal-round-driver"
+  },
+  "jobs": {
+   "does": "Process-local implementation of the DeepSeek Harness background job registry seam",
+   "package": "@deepseek-ai/dsh-jobs-local"
+  },
+  "llm": {
+   "does": "Provider-neutral LLM service interface for the DeepSeek Harness",
+   "package": "@deepseek-ai/dsh-llm"
+  },
+  "llm-pi-ai": {
+   "does": "pi-ai-backed DeepSeek adapter for the DeepSeek Harness LLM seam (design-verification twin of dsh-llm-deepseek)",
+   "package": "@deepseek-ai/dsh-llm-pi-ai"
+  },
+  "llm-retry": {
+   "does": "Provider-routed LLM request retry policy for the DeepSeek Harness",
+   "package": "@deepseek-ai/dsh-llm-retry"
+  },
+  "locale": {
+   "does": "Locale plugin: Host-backed preference, extensible language catalog, browser fallback, and typed built-in dictionaries",
+   "package": "@deepseek-ai/dsh-client-locale"
+  },
+  "modules": {
+   "does": "Client module system, dual-face: node half composes the __DSH_BOOT__ entry graph (incremental dsh.client scan, bundle route, index tap, webPlugins service); browser half is the lazy-CJS module table the vendored cordis Loader consumes as its internal seam",
+   "package": "@deepseek-ai/dsh-client-modules"
+  },
+  "permission": {
+   "does": "User-facing permission presets (ctx.permissionPresets) for the DeepSeek Harness: one product-level Permissions select bundling the sandbox-mode and approval-policy knobs, written through to their own session events",
+   "package": "@deepseek-ai/dsh-permission-presets"
+  },
+  "plugin-inventory": {
+   "does": "Read-only Remote projection of current Cordis Loader plugin state",
+   "package": "@deepseek-ai/dsh-host-plugin-inventory"
+  },
+  "pwsh-sandbox": {
+   "does": "Sandbox-consuming implementation of the DeepSeek Harness PowerShell executor seam (confines every command via ctx.sandbox, reports denial/enforcement result facts)",
+   "package": "@deepseek-ai/dsh-pwsh-sandbox"
+  },
+  "repeat-tool-reminder": {
+   "does": "Repeat-tool-call guard plugin: advisory reminders when an agent loops on identical tool calls",
+   "package": "@deepseek-ai/dsh-repeat-tool-reminder"
+  },
+  "sandbox": {
+   "does": "Local process-sandbox backends for the DeepSeek Harness sandbox seam: bwrap, the npm-distributed landlock-run launcher, macOS Seatbelt, or the Windows ACL restricted-token runner \u2014 functionally probed, fail-closed",
+   "package": "@deepseek-ai/dsh-sandbox-local"
+  },
+  "sandbox-policy": {
+   "does": "Per-call sandbox policy resolver and current model context: deployment fallbacks plus each session's mode and workspace root, shared by every enforcing capability family",
+   "package": "@deepseek-ai/dsh-sandbox-policy"
+  },
+  "session": {
+   "does": "Event-sourced session store for the DeepSeek Harness",
+   "package": "@deepseek-ai/dsh-session"
+  },
+  "session-checkpoint-policy": {
+   "does": "Semantic session durability checkpoints before model requests and tool side effects",
+   "package": "@deepseek-ai/dsh-session-checkpoint-policy"
+  },
+  "session-controller": {
+   "does": "Session Remote commands, cold reads, and live control transport",
+   "package": "@deepseek-ai/dsh-api-session-controller"
+  },
+  "session-log-download": {
+   "does": "Web Session-log export command and shared download dialog",
+   "package": "@deepseek-ai/dsh-session-log-export"
+  },
+  "session-persistence-jsonl": {
+   "does": "JSONL durable session persistence backend for the DeepSeek Harness",
+   "package": "@deepseek-ai/dsh-session-persistence-jsonl"
+  },
+  "session-projection": {
+   "does": "Session-projection seam: the merge-extensible projection type table, the provider contract, and the ctx.sessionProjections registry serving whole current values of log-derived per-session state",
+   "package": "@deepseek-ai/dsh-session-projection"
+  },
+  "session-projection-cache": {
+   "does": "Persisted projection cache (ctx.sessionProjectionCache): durable per-session checkpoint records on the session_projcache storage domain (per-record layout), throttled write-behind, and the cached listing read",
+   "package": "@deepseek-ai/dsh-session-projection-cache"
+  },
+  "session-query-sqlite": {
+   "does": "Concrete ctx.sessionQuery backend with SQLite FTS5 search",
+   "package": "@deepseek-ai/dsh-session-query-sqlite"
+  },
+  "session-reference": {
+   "does": "Cross-session snapshot references and durable untrusted model context (ctx.sessionReferenceResolver)",
+   "package": "@deepseek-ai/dsh-session-reference"
+  },
+  "session-stats": {
+   "does": "Whole-log conversation counts and wall times projection (sessionStats) for the DeepSeek Harness",
+   "package": "@deepseek-ai/dsh-session-stats"
+  },
+  "session-title": {
+   "does": "Log-backed session title service and provider registry for the DeepSeek Harness",
+   "package": "@deepseek-ai/dsh-session-title"
+  },
+  "session-turn-outline": {
+   "does": "Whole-log turn outline projection (turnOutline) for the DeepSeek Harness",
+   "package": "@deepseek-ai/dsh-session-turn-outline"
+  },
+  "settings": {
+   "does": "File-backed settings provider (settings.yaml) for the DeepSeek Harness",
+   "package": "@deepseek-ai/dsh-settings-file"
+  },
+  "settings-controller": {
+   "does": "Remote owner for the configuration surfaces over the settings-domain seams",
+   "package": "@deepseek-ai/dsh-api-settings-controller"
+  },
+  "shell-env": {
+   "does": "Tool-independent managed DSH_* shell environment registry",
+   "package": "@deepseek-ai/dsh-shell-env"
+  },
+  "skill": {
+   "does": "Agent skill provider registry for the DeepSeek Harness",
+   "package": "@deepseek-ai/dsh-skill"
+  },
+  "spill-local": {
+   "does": "Local-filesystem implementation of the DeepSeek Harness spill storage seam (private session-scoped files)",
+   "package": "@deepseek-ai/dsh-spill-local"
+  },
+  "spill-policy": {
+   "does": "Tool-result spill policy for the DeepSeek Harness \u2014 replaces oversized plain-text tool results with a retained preview plus a spill-file path (no service API)",
+   "package": "@deepseek-ai/dsh-spill-policy"
+  },
+  "storage": {
+   "does": "Storage hub (ctx.storage): named backend registry plus mounted data-form facilities for the DeepSeek Harness",
+   "package": "@deepseek-ai/dsh-storage"
+  },
+  "storage-domain": {
+   "does": "Domain data form (ctx.storage.domain): schema-validated, event-emitting KV domains over storage backends for the DeepSeek Harness",
+   "package": "@deepseek-ai/dsh-storage-domain"
+  },
+  "storage-json": {
+   "does": "JSON file KV storage backend for the DeepSeek Harness storage hub",
+   "package": "@deepseek-ai/dsh-storage-json"
+  },
+  "subagent": {
+   "does": "Abstract subagent seam (ctx.subagents): named-provider registry for delegating to child agents",
+   "package": "@deepseek-ai/dsh-subagent"
+  },
+  "subagent-fork-in-process": {
+   "does": "In-process fork subagent backend: runs a child agent seeded with a prefix of the parent's log",
+   "package": "@deepseek-ai/dsh-subagent-fork-in-process"
+  },
+  "subagent-model-selection-settings": {
+   "does": "Model-facing subagent delegation tool over the ctx.subagents seam",
+   "package": "@deepseek-ai/dsh-tool-subagent/model-selection-settings"
+  },
+  "subagent-spawn-in-process": {
+   "does": "In-process spawn subagent backend: runs a fresh child agent on ctx.agents",
+   "package": "@deepseek-ai/dsh-subagent-spawn-in-process"
+  },
+  "subprocess": {
+   "does": "Local-subprocess implementation of the DeepSeek Harness subprocess seam",
+   "package": "@deepseek-ai/dsh-subprocess-local"
+  },
+  "system-prompt": {
+   "does": "System prompt assembly registry for the DeepSeek Harness",
+   "package": "@deepseek-ai/dsh-system-prompt"
+  },
+  "timeout-policy": {
+   "does": "Tool-call timeout policy: a tools/execute wrapper that arms a per-tool deadline on exec.signal and returns TOOL_TIMEOUT when it wins",
+   "package": "@deepseek-ai/dsh-tool-call-timeout-policy"
+  },
+  "timer": {
+   "does": "Timer service for cordis",
+   "package": "@deepseek-ai/cordis-plugin-timer"
+  },
+  "token-meter": {
+   "does": "Replay-aware token measurement service (ctx.tokenMeter) for the DeepSeek Harness",
+   "package": "@deepseek-ai/dsh-token-meter"
+  },
+  "tools": {
+   "does": "Tool registry and execution pipeline for the DeepSeek Harness",
+   "package": "@deepseek-ai/dsh-tools"
+  },
+  "typert": {
+   "does": "Runtime registry for generated package reflection and Zod schemas",
+   "package": "@deepseek-ai/dsh-typert-registry"
+  },
+  "typert-gateway": {
+   "does": "Typert Remote Host dispatcher and Client API endpoint",
+   "package": "@deepseek-ai/dsh-api-gateway"
+  },
+  "typert-loader": {
+   "does": "Loader integration for generated Typert package contributions",
+   "package": "@deepseek-ai/dsh-typert-loader"
+  },
+  "ui-agent-preset": {
+   "does": "Agent-preset surfaces: the default for later sessions, this session's seat, and the composition editor",
+   "package": "@deepseek-ai/dsh-client-ui-agent-preset"
+  },
+  "ui-approval": {
+   "does": "Approval composer takeover over the scoped Remote Event waterfall",
+   "package": "@deepseek-ai/dsh-client-ui-approval"
+  },
+  "ui-attachment": {
+   "does": "Dynamic attachment presentation plugin for conversation input, message-image, and trajectory image slots",
+   "package": "@deepseek-ai/dsh-client-ui-attachment"
+  },
+  "ui-brand-official": {
+   "does": "Official DeepSeek Harness brand occupants for the Web client's sidebar slots",
+   "package": "@deepseek-ai/dsh-client-ui-brand-official"
+  },
+  "ui-chat": {
+   "does": "Chat Conversation target, node definitions, renderers, and details surface",
+   "package": "@deepseek-ai/dsh-client-ui-chat"
+  },
+  "ui-commands": {
+   "does": "Client command surface: global directory cache, '/' source, three command UI kinds, popupSelect registry",
+   "package": "@deepseek-ai/dsh-client-ui-commands"
+  },
+  "ui-conversation": {
+   "does": "Target-neutral Conversation assembly, shell, composer, queue, and view navigation",
+   "package": "@deepseek-ai/dsh-client-ui-conversation"
+  },
+  "ui-cordis": {
+   "does": "Cordis dynamic-plugin definition card: the keyed cordis_define tool row with its run/stop switch",
+   "package": "@deepseek-ai/dsh-client-ui-cordis"
+  },
+  "ui-deliverables": {
+   "does": "Produced-files turn tail and clickable final-response file references for Web",
+   "package": "@deepseek-ai/dsh-client-ui-deliverables"
+  },
+  "ui-goal": {
+   "does": "Session goal surface: GoalBar docked above the composer, read from the goal session projection",
+   "package": "@deepseek-ai/dsh-client-ui-goal"
+  },
+  "ui-input-trigger": {
+   "does": "Input trigger pipeline: '/' and '@' detection, candidate menu, pick routing to registered sources",
+   "package": "@deepseek-ai/dsh-client-ui-input-trigger"
+  },
+  "ui-jobs": {
+   "does": "Session-header background-job list: live registry state mirrored from session/jobs frames",
+   "package": "@deepseek-ai/dsh-client-ui-jobs"
+  },
+  "ui-layout": {
+   "does": "Shell plugin: three-column AppFrame with drag handles, ctx.layout viewing-state service (navigation + panels)",
+   "package": "@deepseek-ai/dsh-client-ui-layout"
+  },
+  "ui-model-selection": {
+   "does": "Model selection over the shared model catalog, Session projection, and session.selectModel",
+   "package": "@deepseek-ai/dsh-client-ui-model-selection"
+  },
+  "ui-permission": {
+   "does": "Permission surfaces: a new-session default in General settings and a current-session /permission popup over the permissions projection",
+   "package": "@deepseek-ai/dsh-client-ui-permission-presets"
+  },
+  "ui-plan": {
+   "does": "Plan-mode composer control: the conversation.input.plan seat over the plan projection and the /plan command channel",
+   "package": "@deepseek-ai/dsh-client-ui-plan"
+  },
+  "ui-reference": {
+   "does": "Unified Web @file and @session reference source",
+   "package": "@deepseek-ai/dsh-client-ui-reference"
+  },
+  "ui-renderer": {
+   "does": "Browser UI renderer: React slot bindings, ctx.uiRenderer, and the assembled application root",
+   "package": "@deepseek-ai/dsh-client-ui-renderer"
+  },
+  "ui-session": {
+   "does": "Session Controller adapter for React and session-scoped slots",
+   "package": "@deepseek-ai/dsh-client-ui-session"
+  },
+  "ui-settings": {
+   "does": "Settings domain base plugin: the settings-namespace scope service and the canonical settings slot-type contract",
+   "package": "@deepseek-ai/dsh-client-ui-settings"
+  },
+  "ui-settings-general": {
+   "does": "Settings ownerless-copy and product onboarding plugin: the General section, shell trigger/header chrome content, settings dictionaries, and the versioned welcome notice",
+   "package": "@deepseek-ai/dsh-client-ui-settings-general"
+  },
+  "ui-settings-models": {
+   "does": "Models settings and shared product-onboarding dialogs over existing settings and credential joins",
+   "package": "@deepseek-ai/dsh-client-ui-settings-models"
+  },
+  "ui-settings-plugin-inventory": {
+   "does": "Read-only Cordis Loader inventory tab in Web Plugins settings",
+   "package": "@deepseek-ai/dsh-client-ui-settings-plugin-inventory"
+  },
+  "ui-settings-plugins": {
+   "does": "Plugins settings section with feature-owned tabs and configurable host-plane plugin cards",
+   "package": "@deepseek-ai/dsh-client-ui-settings-plugins"
+  },
+  "ui-sidebar": {
+   "does": "Sidebar plugin: session multi-level tree, search, grouping, state dots",
+   "package": "@deepseek-ai/dsh-client-ui-sidebar"
+  },
+  "ui-skill": {
+   "does": "Web skill references and the dedicated skill tool row",
+   "package": "@deepseek-ai/dsh-client-ui-skill"
+  },
+  "ui-subagent": {
+   "does": "Subagent conversation catalog, continuation routing UI, and '@' reference source",
+   "package": "@deepseek-ai/dsh-client-ui-subagent"
+  },
+  "ui-theme": {
+   "does": "Theme plugin: Host bootstrap for the pre-plugin palette; DOM-free ThemeRuntime for light/dark/system state; --dsw-* token styles and Appearance settings row",
+   "package": "@deepseek-ai/dsh-client-ui-theme"
+  },
+  "ui-tool": {
+   "does": "Client Tool call-tree renderer and keyed per-tool presentation slot",
+   "package": "@deepseek-ai/dsh-client-ui-tool"
+  },
+  "ui-trajectory": {
+   "does": "Trajectory event ledger with an interactive timing overview: pure-consumer plugin registering into the conversation ViewMap (no service)",
+   "package": "@deepseek-ai/dsh-client-ui-trajectory"
+  },
+  "ui-user-questions": {
+   "does": "Web ask_user_question composer takeover and plan-review presentation UI",
+   "package": "@deepseek-ai/dsh-client-ui-user-questions"
+  },
+  "ui-workflow-run": {
+   "does": "Durable workflow-run Conversation Node and nested member disclosure for dsh web",
+   "package": "@deepseek-ai/dsh-client-ui-workflow-run"
+  },
+  "ui-workspace": {
+   "does": "Workspace picker plugin: one WorkspacePicker registered into the sidebar and empty-state workspace slots",
+   "package": "@deepseek-ai/dsh-client-ui-workspace"
+  },
+  "user-questions": {
+   "does": "Abstract user-questions seam (ctx.userQuestions) for asking the human during agent runs",
+   "package": "@deepseek-ai/dsh-user-questions"
+  },
+  "web": {
+   "does": "Abstract web access capability seam (ctx.web) for the DeepSeek Harness \u2014 search/fetch provider registry, registration-order-independent selection, request/result vocabulary, and the WebError taxonomy",
+   "package": "@deepseek-ai/dsh-web"
+  },
+  "web-fetch-http": {
+   "does": "Anonymous public HTTP(S) fetch provider for the DeepSeek Harness web capability seam (ctx.web)",
+   "package": "@deepseek-ai/dsh-web-fetch-http"
+  },
+  "web-runtime": {
+   "does": "The dsh browser-surface bundle: the web patch layer over dsh-base plus the runtime glue plugin (frontend dist serving, web-surface prompt, bash runtime variables, URL line)",
+   "package": "@deepseek-ai/dsh-web-app"
+  },
+  "web-startup": {
+   "does": "The dsh browser-surface bundle: the web patch layer over dsh-base plus the runtime glue plugin (frontend dist serving, web-surface prompt, bash runtime variables, URL line)",
+   "package": "@deepseek-ai/dsh-web-app/startup"
+  },
+  "webserver": {
+   "does": "Web route-registration plugin: HTTP and upgrade routes, index transform taps, and static dist fallback; knows no harness concepts",
+   "package": "@deepseek-ai/dsh-host-webserver"
+  },
+  "workspace": {
+   "does": "Workspace entity registry (ctx.workspaceRegistry): durable workspace records with validated session attachment over the domain data form for the DeepSeek Harness",
+   "package": "@deepseek-ai/dsh-workspace"
+  },
+  "workspace-controller": {
+   "does": "Workspace Remote commands and reconnect-safe state transport",
+   "package": "@deepseek-ai/dsh-api-workspace-controller"
+  }
+ },
+ "version": "0.1.2-rc.1"
+}

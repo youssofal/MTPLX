@@ -1,0 +1,9 @@
+id = "answer-divisible-count"
+kind = "answer"
+prompt = '''
+How many integers from 1 to 1000 inclusive are divisible by 3 or by 5, but not by 15? Give the final answer as a single number on the last line.
+'''
+
+[expect]
+type = "number"
+value = 401

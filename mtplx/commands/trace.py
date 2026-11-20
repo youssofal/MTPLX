@@ -21,6 +21,7 @@ import json
 import os
 import re
 import sqlite3
+import statistics
 import sys
 import time
 import urllib.request
@@ -55,6 +56,10 @@ def _fmt_dur(seconds: float | None) -> str:
     if seconds < 3600:
         return f"{int(seconds // 60)}m{int(seconds % 60):02d}s"
     return f"{int(seconds // 3600)}h{int((seconds % 3600) // 60):02d}m"
+
+
+def _fmt_secs(value: Any) -> str:
+    return "-" if value is None else f"{float(value):.2f}"
 
 
 def _fmt_tok(value: Any) -> str:
@@ -576,6 +581,49 @@ def _resolve_session_arg(conn: sqlite3.Connection, ident: str | None) -> str | N
     return row["id"] if row else ident
 
 
+def _think_tokens(row: dict) -> Any:
+    """The turn's reasoning tokens: the client's count when it reports one,
+    else the server's (Pi and Hermes report none)."""
+
+    client = row.get("client_reasoning_tokens")
+    return client if client is not None else row.get("reasoning_tokens")
+
+
+def _thinking_s(row: dict) -> float | None:
+    """Thinking before the answer: from the request's arrival to its last
+    reasoning delta (0 for a turn that streamed none); None for a row from a
+    server that did not record it."""
+
+    if row.get("reasoning_s") is not None:
+        return float(row["reasoning_s"])
+    if row.get("reasoning_tokens") is not None or row.get("first_visible_s") is not None:
+        return 0.0
+    return None
+
+
+def _thinking_summary(rows: list[dict]) -> dict | None:
+    """Thinking before the answer over a session's streamed turns."""
+
+    waits = sorted(w for w in map(_thinking_s, rows) if w is not None)
+    if not waits:
+        return None
+    return {
+        "turns": len(waits),
+        "median_s": round(statistics.median(waits), 2),
+        "over_10s": sum(1 for wait in waits if wait > 10.0),
+        "longest_s": round(waits[-1], 2),
+    }
+
+
+def _fmt_thinking(summary: dict | None) -> str:
+    if not summary:
+        return "-"
+    return (
+        f"median {summary['median_s']:.1f}s, {summary['over_10s']} of"
+        f" {summary['turns']} turns over 10s (longest {_fmt_dur(summary['longest_s'])})"
+    )
+
+
 def _turn_row(turn: dict) -> dict:
     message = turn["message"]
     receipt = turn.get("receipt") or {}
@@ -610,6 +658,10 @@ def _turn_row(turn: dict) -> dict:
         "client_cache_read": tokens["cache_read"],
         "decode_tok_s": receipt.get("decode_tok_s"),
         "ttft_s": receipt.get("ttft_s"),
+        # When the reader saw the model think and answer (streamed turns).
+        "reasoning_tokens": receipt.get("reasoning_tokens"),
+        "reasoning_s": receipt.get("reasoning_s"),
+        "first_visible_s": receipt.get("first_visible_s"),
         "effort": receipt.get("resolved_reasoning_effort") or receipt.get("reasoning_effort") or receipt.get("effective_reasoning_effort"),
         "request_kind": message.get("_request_kind", "assistant"),
         "vision_images": receipt.get("request_vision_images"),
@@ -655,6 +707,7 @@ def _cmd_session(args: argparse.Namespace) -> int:
         "total_completion_tokens": sum(r["completion_tokens"] or 0 for r in rows),
         "total_client_reasoning_tokens": (None if any(r["client_reasoning_tokens"] is None for r in rows)
                                           else sum(r["client_reasoning_tokens"] for r in rows)),
+        "thinking_before_answer": _thinking_summary(rows),
         "pathologies": flags,
     }
     if args.json:
@@ -669,10 +722,12 @@ def _cmd_session(args: argparse.Namespace) -> int:
         f"  completion={_fmt_tok(summary['total_completion_tokens'])}"
         f"  client-think={_fmt_tok(summary['total_client_reasoning_tokens'])}"
     )
+    print(f"  thinking before the answer: {_fmt_thinking(summary['thinking_before_answer'])}")
     print()
     header = (
         f"{'t':>3} {'start':<15} {'wall':>8} {'st':<10} {'prompt':>8} {'cached':>8} {'+pre':>7}"
-        f" {'comp':>7} {'think':>7} {'tok/s':>6} {'ttft':>6} {'pcw':<22} {'canon':<20} tps"
+        f" {'comp':>7} {'think':>7} {'tok/s':>6} {'ttft':>6} {'thk-s':>6} {'vis-s':>6}"
+        f" {'pcw':<22} {'canon':<20} tps"
     )
     print(header)
     for row in rows:
@@ -693,8 +748,10 @@ def _cmd_session(args: argparse.Namespace) -> int:
         print(
             f"{row['turn']:>3} {_fmt_clock(row['start']):<15} {_fmt_dur(row['wall_s']):>8} {row['status']:<10}"
             f" {_fmt_tok(row['prompt_tokens']):>8} {_fmt_tok(row['cached_tokens']):>8} {_fmt_tok(row['new_prefill_tokens']):>7}"
-            f" {_fmt_tok(row['completion_tokens']):>7} {_fmt_tok(row['client_reasoning_tokens']):>7}"
-            f" {row['decode_tok_s'] or 0:>6.1f} {row['ttft_s'] or 0:>6.2f} {pcw_str:<22} {canon_str:<20} {row['tps_sparkline'] or ''}"
+            f" {_fmt_tok(row['completion_tokens']):>7} {_fmt_tok(_think_tokens(row)):>7}"
+            f" {row['decode_tok_s'] or 0:>6.1f} {row['ttft_s'] or 0:>6.2f}"
+            f" {_fmt_secs(row['reasoning_s']):>6} {_fmt_secs(row['first_visible_s']):>6}"
+            f" {pcw_str:<22} {canon_str:<20} {row['tps_sparkline'] or ''}"
         )
     if flags:
         print("\n  PATHOLOGY FLAGS")

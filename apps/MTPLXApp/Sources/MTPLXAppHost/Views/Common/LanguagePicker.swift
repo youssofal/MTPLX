@@ -158,7 +158,11 @@ struct LanguagePickerList: View {
         .onHover { hovering in
             if hovering { cursor = language }
         }
-        .accessibilityLabel(tr("%@ (%@)", language.nativeName, language.englishName))
+        .accessibilityLabel(
+            language.englishName == language.nativeName
+                ? language.nativeName
+                : tr("%@ (%@)", language.nativeName, language.englishName)
+        )
         .accessibilityAddTraits(selected ? [.isSelected] : [])
     }
 

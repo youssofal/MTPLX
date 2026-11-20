@@ -44,6 +44,31 @@ def test_every_entry_point_resolves_the_same_lane_except_the_declared_list(
             assert lane[key] == reference[key], (client, family, seat_gib, entry, key)
 
 
+@pytest.mark.parametrize("entry", ll.ENTRY_POINTS)
+@pytest.mark.parametrize("client", ll.CLIENTS)
+def test_every_client_and_entry_point_continues_in_the_conversation_lease(
+    monkeypatch, client, entry
+):
+    # 12 Nov: the coding-agent lane exported the switch that lets an exact
+    # follow-up take its conversation's lease, so the app's agents resumed in
+    # place while bare `mtplx serve`, chat and Open WebUI copied the whole
+    # conversation on every follow-up (4.24 GB at 131K). Same restore for
+    # every client from every entry point, whatever its env block says.
+    from mtplx import generation
+
+    for name in (
+        "MTPLX_SESSION_LIVE_FRONTIER_REFERENCE_RESTORE",
+        "MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    lane = ll.resolve_launch_lane(
+        client=client, family="qwen4_exp", memory_bytes=128 * ll.GIB, entry_point=entry
+    )
+    for key, value in lane["env"].items():
+        monkeypatch.setenv(key, str(value))
+    assert generation._session_live_frontier_reference_restore_enabled(), (client, entry)
+
+
 def test_the_declared_list_is_short_named_and_real():
     assert set(ll.DECLARED_ENTRY_POINT_DIFFERENCES) == {
         ("chat", "ssd_session_cache"),

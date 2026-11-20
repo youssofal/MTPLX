@@ -147,13 +147,17 @@ struct WindowSizingTuner: NSViewRepresentable {
             super.updateConstraints()
         }
 
-        // Activity-proportional re-arm: layout() runs whenever our
-        // superview lays out (every streaming flush), so the NEXT
-        // constraints pass revisits us and neutralizes any scene
-        // re-arm first.
+        // layout() runs whenever our superview lays out (every streaming
+        // flush): clear a scene re-arm here too, and ask for another
+        // constraints pass only when there was one. Asking every time
+        // (the 2026-08-17 design, kept beside the run-loop observer that
+        // superseded it) fed itself: the constraints pass laid the view
+        // out again, which asked again, so the window ran its display
+        // cycle at the screen's refresh rate for as long as the app was
+        // open, minimized and idle included.
         override func layout() {
             super.layout()
-            if !needsUpdateConstraints {
+            if applyIfNeeded(), !needsUpdateConstraints {
                 needsUpdateConstraints = true
             }
         }

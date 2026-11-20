@@ -27,15 +27,18 @@ struct GaugeView: View {
     @State private var newMaxPulse: Int = 0
     @State private var powerHovering: Bool = false
     @State private var powerPressing: Bool = false
-    /// Lagged version of `mode.scaledValue` used to drive the fill
-    /// arc. Reset to 0 on entry into running mode, then sprung up to
-    /// the live value — gives the speedometer-needle swing instead of
-    /// snapping to whatever the first decode reading was.
-    @State private var displayedScaledValue: Double = 0
+    /// The fill arc's value (0...1 of the sweep): sprung from commit to
+    /// commit with the gauge's spring, drawn on the gauge's own timeline
+    /// and at rest between moves.
+    @State private var arc = AdditiveSpringValue(spring: Self.arcSpring, pointsPerUnit: 600)
+    /// The hero number's flick on each new reading.
+    @State private var pulse = GaugePulse(pointsPerUnit: 100)
+    /// The hero number's digits, rolling from the last reading to this one.
+    @State private var roll = GaugeRoll(text: "0.00", travel: Self.fullRollTravel)
     /// Headline value as committed to the display. Updated on a fixed
     /// cadence (every `speedDisplayInterval` seconds) so the digits
-    /// roll discretely with `.contentTransition(.numericText())`
-    /// instead of blurring through a continuous spring interpolation.
+    /// roll discretely instead of blurring through a continuous spring
+    /// interpolation.
     @State private var displayedSpeed: Double = 0
     /// Latest live target value, updated on every mode change. Read by
     /// the throttled commit task so when the cadence fires we display
@@ -50,9 +53,18 @@ struct GaugeView: View {
     @State private var lastSpeedCommitAt: Date = .distantPast
     /// In-flight deferred commit task; nil when nothing is scheduled.
     @State private var pendingSpeedTask: Task<Void, Never>? = nil
-    /// Pulse trigger fired on each commit so the headline emphasises
-    /// the digit change rather than just morphing silently.
-    @State private var headlinePulse: Int = 0
+    /// Headline text waiting for the next commit (the rate, or the
+    /// prefill percent while no sane rate is known).
+    @State private var pendingLabel: String = "0.00"
+    /// Whether the arc, the flick or the digits are moving: the gauge's
+    /// timeline runs only while this is true.
+    @State private var moving = false
+    /// Ends `moving` when the last move comes to rest.
+    @State private var restTask: Task<Void, Never>? = nil
+    /// Whether the window that shows this gauge can be seen (AppKit's
+    /// occlusion state). A gauge nobody can see draws nothing: readings
+    /// wait, and the latest lands without animation once it shows again.
+    @State private var windowVisible = true
     /// Cached identity for tick spawn animation — bumping it triggers
     /// the spawn-in stagger again.
     @State private var tickModeKey: String = ""
@@ -63,6 +75,18 @@ struct GaugeView: View {
     /// same 0.5 s cadence rather than the arc continuously tracking
     /// the live value while the counter sits at a stale commit.
     private static let speedDisplayInterval: TimeInterval = 0.5
+    /// The arc's spring, the one the needle has always used (mass 0.6,
+    /// stiffness 140, damping 22, as on the web dashboard's gauge): an
+    /// interpolating spring, so overlapping moves add up.
+    static let arcSpring = DampedSpring(mass: 0.6, stiffness: 140, damping: 22)
+    /// How far a full-size digit travels as it leaves or arrives: the
+    /// height of the band the digits fill.
+    static let fullRollTravel: Double = RollingDigits.fullSizeTravel
+    /// The shortest time between two frames of the gauge's motion: every
+    /// other refresh on a 120 Hz display, every refresh at 60 Hz. Under
+    /// 1/60 s so a refresh that lands a hair early is not skipped (which
+    /// would show some frames twice as long as others).
+    private static let frameInterval: TimeInterval = 1.0 / 80
     /// Continuous arc rotation. Holds the gauge's resting angle (135°)
     /// while not loading; while loading, a `Task` increments it ~4° per
     /// frame at ~60fps. Cancelling the task is a hard stop — unlike
@@ -86,6 +110,9 @@ struct GaugeView: View {
             case .degraded: self = .degraded
             }
         }
+
+        /// Modes whose arc fills to the reading.
+        var isFill: Bool { self == .tps || self == .prefill }
     }
 
     var body: some View {
@@ -94,35 +121,55 @@ struct GaugeView: View {
         ZStack {
             arcShape(lineWidth: lineWidth)
             arcTickMarks(lineWidth: lineWidth)
-            arcFill(progress: displayedScaledValue, lineWidth: lineWidth)
-            stickyMaxTick(lineWidth: lineWidth)
-            centerStack
-                .phaseAnimator(
-                    [0, 1, 0],
-                    trigger: newMaxPulse
-                ) { content, phase in
-                    content
-                        .shadow(
-                            color: Brand.accentChrome.opacity(0.45 * phase),
-                            radius: 14 * phase,
-                            x: 0,
-                            y: 0
-                        )
-                } animation: { _ in
-                    motionEnabled ? .smooth(duration: 0.4) : nil
+            // The needle, the flick and the digit roll are drawn on this
+            // timeline: about 60 frames a second while one of them moves,
+            // the resting frame, then nothing until the next reading. Left
+            // to SwiftUI's springs they kept the whole window redrawing at
+            // 120 Hz for as long as a model decoded (the springs took longer
+            // to settle than the 0.5 s between readings).
+            TimelineView(.animation(minimumInterval: Self.frameInterval, paused: !moving)) { context in
+                // At rest, draw the resting frame whatever date the paused
+                // timeline hands over.
+                let time = moving ? context.date.timeIntervalSinceReferenceDate : motionEnd
+                ZStack {
+                    arcFill(progress: arc.value(at: time), lineWidth: lineWidth)
+                    centerStack(at: time)
+                        .phaseAnimator(
+                            [0, 1, 0],
+                            trigger: newMaxPulse
+                        ) { content, phase in
+                            content
+                                .shadow(
+                                    color: Brand.accentChrome.opacity(0.45 * phase),
+                                    radius: 14 * phase,
+                                    x: 0,
+                                    y: 0
+                                )
+                        } animation: { _ in
+                            motionEnabled ? .smooth(duration: 0.4) : nil
+                        }
+                        // Opt the center number out of the gauge-wide mode
+                        // animation below. That blanket drives the arc's trim
+                        // morph between modes, but it also used
+                        // to animate the number's *position* whenever `mode`
+                        // changed mid-window-resize — so the digits slid out of
+                        // the ring while the arc snapped. The digit roll and
+                        // flick run on the timeline, not on `mode`.
+                        .animation(nil, value: mode)
                 }
-                // Opt the center number out of the gauge-wide
-                // `.animation(value: mode)` below. That blanket drives
-                // the arc's trim morph between modes, but it also used
-                // to animate the number's *position* whenever `mode`
-                // changed mid-window-resize — so the digits slid out of
-                // the ring while the arc snapped. The digit-roll and
-                // pulse are keyed on `displayedSpeed`/`headlinePulse`,
-                // not `mode`, so nulling the mode animation here keeps
-                // them intact while pinning the number's position.
-                .animation(nil, value: mode)
+            }
+            // Out of the timeline (it does not move with it); it sits on
+            // the ring, clear of the number, so drawing it last changes
+            // nothing on screen. It glides to a new all-time max.
+            stickyMaxTick(lineWidth: lineWidth)
+                .animation(motionEnabled ? .smooth(duration: 0.55) : nil, value: stickyMax)
         }
         .frame(width: diameter, height: diameter)
+        .background(WindowVisibilityReporter { visible in
+            // Reported from AppKit while views move between windows; land
+            // the change after this update.
+            Task { @MainActor in windowVisible = visible }
+        })
         // The dial is an instrument: the arc, ticks and sticky-max dot
         // are placed by angle, and speed always grows clockwise, so the
         // ring keeps its LTR geometry even when the app runs RTL.
@@ -144,10 +191,31 @@ struct GaugeView: View {
                     if wasPressing, mode.isDim { onPowerTap?() }
                 }
         )
-        .animation(motionEnabled ? .smooth(duration: 0.55) : nil, value: mode)
+        // The morph between modes (power ring, loading snake, speedometer;
+        // their colours and the fill's fade). Keyed on the kind of mode,
+        // not on every reading: a reading arrives several times a second,
+        // and an animation on each would put the needle, which the
+        // timeline draws, back under SwiftUI's animation at full rate.
+        .animation(motionEnabled ? .smooth(duration: 0.55) : nil, value: ModeFamily(mode))
         .onChange(of: stickyMaxKey) { _, _ in
             guard motionEnabled else { return }
             newMaxPulse &+= 1
+        }
+        .onChange(of: windowVisible) { _, visible in
+            if visible {
+                // Show the latest reading at once.
+                pendingSpeedTask?.cancel()
+                pendingSpeedTask = nil
+                if ModeFamily(mode).isFill { commitHeadlineDisplay(familyChanged: false, snap: true) }
+            } else {
+                // The reading waits for the window to show again.
+                pendingSpeedTask?.cancel()
+                pendingSpeedTask = nil
+                settleMotion()
+            }
+        }
+        .onChange(of: motionEnabled) { _, enabled in
+            if !enabled { settleMotion() }
         }
         .onChange(of: mode) { old, new in
             // Both the headline number AND the arc fill ride the same
@@ -168,12 +236,13 @@ struct GaugeView: View {
             // Non-fill modes (dim/loading/degraded) reset the arc
             // immediately; the commit path handles fill modes.
             if !newIsFill {
-                displayedScaledValue = 0
+                arc.move(to: 0, at: Self.now, animated: false)
             }
 
             scheduleHeadlineCommit(
                 target: new.speedValue ?? 0,
                 targetFraction: new.scaledValue,
+                label: headlineLabel(for: new),
                 isFillMode: newIsFill,
                 familyChanged: familyChanged
             )
@@ -186,11 +255,15 @@ struct GaugeView: View {
             // Seed both the throttled headline and the arc fill on
             // first render so they don't sit at zero waiting for the
             // first commit window after the view mounts.
+            pendingLabel = headlineLabel(for: mode)
+            roll = GaugeRoll(text: pendingLabel, travel: rollTravel)
+            arc.pointsPerUnit = arcPointsPerUnit
+            pulse.pointsPerUnit = Double(heroNumberWidth) / 2
             if let initialSpeed = mode.speedValue {
                 pendingTargetSpeed = initialSpeed
                 displayedSpeed = initialSpeed
                 pendingTargetFraction = mode.scaledValue
-                displayedScaledValue = mode.scaledValue
+                arc.move(to: mode.scaledValue, at: Self.now, animated: false)
                 lastSpeedCommitAt = Date()
             }
         }
@@ -199,6 +272,8 @@ struct GaugeView: View {
             spinTask = nil
             pendingSpeedTask?.cancel()
             pendingSpeedTask = nil
+            restTask?.cancel()
+            restTask = nil
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(mode.isDim ? tr("Start MTPLX") : tr("MTPLX hero gauge"))
@@ -265,6 +340,9 @@ struct GaugeView: View {
             )
             .rotationEffect(.degrees(135))
             .padding(lineWidth / 2)
+            // A layer of its own: a frame of the needle redraws the needle,
+            // not the ring, the tick labels and the text around it.
+            .drawingGroup()
             .opacity(mode.isDim || mode.isLoading ? 0 : 1)
     }
 
@@ -307,7 +385,7 @@ struct GaugeView: View {
     /// behind the new one. Subtitle + caption appear ONLY when they
     /// carry information.
     @ViewBuilder
-    private var centerStack: some View {
+    private func centerStack(at time: Double) -> some View {
         VStack(spacing: 6) {
             ZStack {
                 if mode.isDim {
@@ -317,7 +395,7 @@ struct GaugeView: View {
                     // the loading animation.
                     Color.clear.frame(width: 1, height: 1)
                 } else {
-                    tpsNumber
+                    heroNumber(at: time)
                 }
             }
             .frame(height: 76)
@@ -357,47 +435,45 @@ struct GaugeView: View {
     }
 
     /// Running TPS number (`.tps`) or live prefill TPS (`.prefill`).
-    /// The displayed value is committed on a 2-second cadence
+    /// The displayed value is committed on a 0.5 s cadence
     /// (`speedDisplayInterval`) so each visible change is a clean,
-    /// discrete digit-roll via `.contentTransition(.numericText())` —
-    /// the rolling-digits effect SwiftUI was designed for. Between
-    /// commits the number is rock-stable, which is why this reads as
-    /// a counter and not a blur. A spring scale pulse on each commit
-    /// adds the "flick" the user asked for without disturbing the
-    /// digit roll itself.
+    /// discrete digit roll: the digits that changed slide out and in,
+    /// the others stay put. Between commits the number is rock-stable,
+    /// which is why this reads as a counter and not a blur. A spring
+    /// scale flick on each new reading adds the "flick" the user asked
+    /// for. Both run on the gauge's timeline (`roll`, `pulse`).
     @ViewBuilder
-    private var tpsNumber: some View {
-        Text(headlineLabel)
+    private func heroNumber(at time: Double) -> some View {
+        RollingDigits(roll: roll, time: time)
             .font(.system(size: 64, weight: .heavy, design: .rounded))
             .monospacedDigit()
             .foregroundStyle(centerForeground)
             .lineLimit(1)
             .minimumScaleFactor(0.5)
             .frame(width: heroNumberWidth, alignment: .center)
-            .contentTransition(.numericText())
             .shadow(
                 color: chromeHaloActive ? Brand.chromeHalo : .clear,
                 radius: chromeHaloActive ? 8 : 0
             )
-            .phaseAnimator(
-                [1.0, 1.06, 1.0],
-                trigger: headlinePulse
-            ) { content, scale in
-                content.scaleEffect(scale)
-            } animation: { _ in
-                motionEnabled ? .spring(response: 0.28, dampingFraction: 0.72) : nil
-            }
-            // Draw the number, its halo and its pulse on the GPU as one
-            // layer. Left to itself the halo's blur was redrawn on the CPU
-            // (CoreGraphics, then vImage fanned out over worker threads) on
-            // every frame of every digit roll and pulse, which is every
-            // 0.5 s while the engine decodes: about one core of app CPU for
-            // the whole decode. The inset keeps the halo, the 6% pulse and
-            // the rolling digits inside the layer; the negative inset leaves
+            // Draw the number and its halo on the GPU as one layer. Left to
+            // itself the halo's blur was redrawn on the CPU (CoreGraphics,
+            // then vImage fanned out over worker threads) on every frame of
+            // every digit roll and flick: about one core of app CPU for the
+            // whole decode. The inset keeps the halo, the 6% flick and the
+            // rolling digits inside the layer; the negative inset leaves
             // layout unchanged.
             .padding(Self.heroLayerInset)
             .drawingGroup()
             .padding(Self.heroLayerOutset)
+            // The flick scales the finished layer: its frames move the
+            // layer, they do not draw the digits again at each new size.
+            .scaleEffect(pulse.scale(at: time))
+    }
+
+    /// How far a rolling digit travels: `fullRollTravel` for the hero's
+    /// full-size digits, less where a narrow gauge shrinks them to fit.
+    private var rollTravel: Double {
+        Self.fullRollTravel * min(1, Double(heroNumberWidth) / 140)
     }
 
     /// Room around the hero number for its 8 pt halo, its 1.06 pulse and
@@ -422,15 +498,39 @@ struct GaugeView: View {
     /// `minimumScaleFactor`.
     private var heroNumberWidth: CGFloat { min(200, diameter * 0.72) }
 
-    /// Headline string driven by the throttled `displayedSpeed`. For
-    /// prefill modes where TPS is unknown but progress is known, fall
-    /// back to the mode's own label so the user sees the percent
-    /// instead of an always-zero number.
-    private var headlineLabel: String {
-        if mode.speedValue != nil {
-            return Format.tps(displayedSpeed)
+    /// Headline string for a reading. For prefill modes where TPS is
+    /// unknown but progress is known, the mode's own label, so the user
+    /// sees the percent instead of an always-zero number.
+    private func headlineLabel(for mode: GaugeMode) -> String {
+        if let speed = mode.speedValue {
+            return Format.tps(speed)
         }
         return mode.centerLabel
+    }
+
+    /// Screen points per unit of the arc's value (the 270° sweep).
+    private var arcPointsPerUnit: Double {
+        let lineWidth = max(8, diameter * 0.040)
+        return 0.75 * Double.pi * Double(diameter - lineWidth)
+    }
+
+    /// When everything in motion is at rest.
+    private var motionEnd: Double {
+        max(arc.restTime ?? 0, pulse.end, roll.end)
+    }
+
+    /// Motion runs only where someone can see it, and only when the user
+    /// has not turned it off (Performance mode, Reduce Motion).
+    private var animates: Bool { motionEnabled && windowVisible }
+
+    private static var now: Double { Date().timeIntervalSinceReferenceDate }
+
+    /// State changes the gauge draws itself: never through an implicit
+    /// animation, which would run at the display's full rate again.
+    private func withoutAnimation(_ body: () -> Void) {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction, body)
     }
 
     /// Schedule the next visible commit of BOTH the headline number
@@ -442,6 +542,7 @@ struct GaugeView: View {
     private func scheduleHeadlineCommit(
         target: Double,
         targetFraction: Double,
+        label: String,
         isFillMode: Bool,
         familyChanged: Bool
     ) {
@@ -451,14 +552,23 @@ struct GaugeView: View {
             pendingSpeedTask = nil
             pendingTargetSpeed = 0
             pendingTargetFraction = 0
+            pendingLabel = label
             displayedSpeed = 0
-            displayedScaledValue = 0
             lastSpeedCommitAt = .distantPast
+            withoutAnimation {
+                roll.roll(to: label, at: Self.now, animated: false)
+                pulse.stop()
+            }
+            scheduleRest()
             return
         }
 
         pendingTargetSpeed = target
         pendingTargetFraction = targetFraction
+        pendingLabel = label
+
+        // Nobody can see this gauge: keep the reading for when they can.
+        guard windowVisible else { return }
 
         let interval = Self.speedDisplayInterval
         let now = Date()
@@ -493,39 +603,69 @@ struct GaugeView: View {
         }
     }
 
-    /// Commit `pendingTargetSpeed` to the visible `displayedSpeed`
-    /// AND `pendingTargetFraction` to the visible
-    /// `displayedScaledValue` in the same animation transaction. The
-    /// digit roll and the arc glide therefore happen together.
+    /// Commit the pending reading to the arc and the number together: the
+    /// arc glides to it on the gauge's spring while the digits that
+    /// changed roll and the number flicks.
     ///
-    /// First commit (whether on a fresh family change or the very
-    /// first reading of a session) snaps without animation so the
-    /// gauge appears immediately at the live value — no slow ramp
-    /// from zero. Subsequent commits ride the fast
-    /// `Motion.gaugeValueSpring` so dial position glides between
-    /// 0.5 s ticks without overshooting.
-    private func commitHeadlineDisplay(familyChanged: Bool) {
+    /// The first commit (a fresh family change or the very first reading
+    /// of a session) puts the arc at the live value without a glide, so
+    /// there is no slow ramp from zero; the number still rolls and flicks,
+    /// a small "I'm alive" cue. A reading whose text did not change neither
+    /// rolls nor flicks, and an arc move under half a pixel lands at once:
+    /// a gauge whose reading holds draws nothing. `snap` lands everything
+    /// at once (a window that shows again).
+    private func commitHeadlineDisplay(familyChanged: Bool, snap: Bool = false) {
+        let now = Self.now
         let isFirstReading = lastSpeedCommitAt == .distantPast
-        let arcAnimation: Animation? = (motionEnabled && !isFirstReading)
-            ? Motion.gaugeValueSpring
-            : nil
-        if let arcAnimation {
-            withAnimation(arcAnimation) {
-                displayedScaledValue = pendingTargetFraction
+        let animated = animates && !snap
+        withoutAnimation {
+            // The window may have been resized since the last reading.
+            arc.pointsPerUnit = arcPointsPerUnit
+            pulse.pointsPerUnit = Double(heroNumberWidth) / 2
+            roll.travel = rollTravel
+            arc.move(to: pendingTargetFraction, at: now, animated: animated && !isFirstReading)
+            if pendingLabel != roll.to {
+                roll.roll(to: pendingLabel, at: now, animated: animated)
+                if animated { pulse.fire(at: now) }
             }
-        } else {
-            displayedScaledValue = pendingTargetFraction
+            if !animated {
+                roll.settle()
+                pulse.stop()
+            }
+            displayedSpeed = pendingTargetSpeed
+            lastSpeedCommitAt = Date()
+            pendingSpeedTask = nil
         }
+        scheduleRest()
+    }
 
-        // Single state-write to `displayedSpeed`. SwiftUI applies
-        // `.contentTransition(.numericText())` against this change
-        // for the digit roll and `.phaseAnimator(trigger: headlinePulse)`
-        // for the emphasis pulse. On the first reading we still
-        // bump the pulse so the gauge gives a small "I'm alive" cue.
-        displayedSpeed = pendingTargetSpeed
-        headlinePulse &+= 1
-        lastSpeedCommitAt = Date()
-        pendingSpeedTask = nil
+    /// Runs the timeline until the last move comes to rest, then stops it.
+    private func scheduleRest() {
+        restTask?.cancel()
+        restTask = nil
+        let remaining = motionEnd - Self.now
+        guard remaining > 0 else {
+            if moving { withoutAnimation { moving = false } }
+            return
+        }
+        if !moving { withoutAnimation { moving = true } }
+        restTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(remaining))
+            guard !Task.isCancelled else { return }
+            withoutAnimation { moving = false }
+            restTask = nil
+        }
+    }
+
+    /// Lands everything in flight at its resting place and stops the
+    /// timeline: the window can no longer be seen, or motion was turned off.
+    private func settleMotion() {
+        withoutAnimation {
+            arc.move(to: arc.target, at: Self.now, animated: false)
+            roll.settle()
+            pulse.stop()
+        }
+        scheduleRest()
     }
 
     private var powerGlyphColor: Color {

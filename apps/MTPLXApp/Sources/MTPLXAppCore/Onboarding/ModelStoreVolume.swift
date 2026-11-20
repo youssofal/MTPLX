@@ -25,12 +25,23 @@ public enum ModelStoreVolume {
         return url.resolvingSymlinksInPath()
     }
 
-    /// Free space, in GiB, on the volume that holds the model store.
+    /// Free space, in GiB, on the volume that holds the model store. Zero
+    /// when that store is on a drive that is not plugged in: walking up from
+    /// `/Volumes/<drive>` would otherwise measure the startup disk, which no
+    /// download can reach.
     public static func freeGiB(
         env: [String: String] = ProcessInfo.processInfo.environment,
         fileManager: FileManager = .default
     ) -> Double {
-        let root = ModelDownloader.defaultCacheRoot(env: env)
+        freeGiB(forStore: ModelDownloader.defaultCacheRoot(env: env), fileManager: fileManager)
+    }
+
+    /// Free space, in GiB, for downloads into `root` (the wizard, the
+    /// download step and Forge all ask through here).
+    public static func freeGiB(forStore root: URL, fileManager: FileManager = .default) -> Double {
+        if case .notConnected = SharedModelFolders.availability(of: root.path) {
+            return 0
+        }
         return freeGiB(at: measurementURL(for: root, fileManager: fileManager))
     }
 

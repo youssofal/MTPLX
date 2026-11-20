@@ -65,6 +65,14 @@ CONFIG_VALUE_KEYS = (
     "reranker_models",
     "retrieval_max_resident",
     "retrieval_trust_remote_code",
+    # Where each agent client opens (mtplx/client_opening.py), set from the
+    # app's Settings or `mtplx config set pi_opens_in Ghostty`.
+    "pi_opens_in",
+    "opencode_opens_in",
+    "hermes_opens_in",
+    "claude_code_opens_in",
+    "codex_opens_in",
+    "deepseek_harness_opens_in",
 )
 
 
@@ -106,6 +114,12 @@ class UserConfig:
     reranker_models: tuple[str, ...] = ()
     retrieval_max_resident: int | None = None
     retrieval_trust_remote_code: bool | None = None
+    pi_opens_in: str | None = None
+    opencode_opens_in: str | None = None
+    hermes_opens_in: str | None = None
+    claude_code_opens_in: str | None = None
+    codex_opens_in: str | None = None
+    deepseek_harness_opens_in: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -223,6 +237,12 @@ def load_user_config(path: str | Path | None = None) -> UserConfig:
         reranker_models=read("reranker_models", _str_tuple, ()),
         retrieval_max_resident=read("retrieval_max_resident", _int_or_none),
         retrieval_trust_remote_code=read("retrieval_trust_remote_code", _bool_or_none),
+        pi_opens_in=read("pi_opens_in", _str_or_none),
+        opencode_opens_in=read("opencode_opens_in", _str_or_none),
+        hermes_opens_in=read("hermes_opens_in", _str_or_none),
+        claude_code_opens_in=read("claude_code_opens_in", _str_or_none),
+        codex_opens_in=read("codex_opens_in", _str_or_none),
+        deepseek_harness_opens_in=read("deepseek_harness_opens_in", _str_or_none),
     )
 
 

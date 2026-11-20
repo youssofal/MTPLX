@@ -36,12 +36,15 @@ from .trace import (
     METRICS_DIR,
     _detect_pathologies,
     _fmt_dur,
+    _fmt_thinking,
     _fmt_tok,
     _load_flight,
     _load_joined,
     _load_receipts,
     _opencode_parts,
     _source_port,
+    _think_tokens,
+    _thinking_summary,
     _turn_row,
 )
 from .trace_analysis import load_system_log, request_diagnostics
@@ -188,7 +191,9 @@ def _sec_timeline(rows: list[dict]) -> str:
         ttft = f"{r['ttft_s']:.2f}s" if r["ttft_s"] is not None else "-"
         tip = (f"t{r['turn']} · {_hms(r['start'])} → {_hms(r['start'] + dur)}\n"
                f"wall {_fmt_dur(r['wall_s'])} · ttft {ttft} · decode {_fmt_dur(r['decode_elapsed_s'])}\n"
-               f"completion {_fmt_tok(comp)} tok · {_share(r) or 'think -'}"
+               + (f"first answer or tool call {r['first_visible_s']:.2f}s\n"
+                  if r["first_visible_s"] is not None else "")
+               + f"completion {_fmt_tok(comp)} tok · {_share(r) or 'think -'}"
                + (f"\ndecode {r['decode_tok_s']:.1f} tok/s" if r["decode_tok_s"] else "")
                + ("\nCANCELLED / ERROR" if cancelled else "")
                + ("\nno matched server receipt" if r["receipt_missing"] else ""))
@@ -520,19 +525,23 @@ def _sec_digest(digest: list[dict]) -> str:
     if not digest:
         return _card("Turn digest", _QUIET.format("no assistant turns"))
     head = ('<tr><th>t</th><th>start</th><th class="n">wall</th><th>status</th><th class="n">comp tok</th>'
-            '<th class="n">think tok</th><th class="n">ttft s</th><th class="n">tok/s</th>'
+            '<th class="n">think tok</th><th class="n">ttft s</th><th class="n">think s</th>'
+            '<th class="n">first visible s</th><th class="n">tok/s</th>'
             '<th class="n">reasoning chars</th><th class="n">output chars</th></tr>')
     body = []
     for d in digest:
         if d["prompt"]:
-            body.append(f'<tr class="up"><td colspan="10">&#8220;{_esc(d["prompt"])}&#8221;</td></tr>')
+            body.append(f'<tr class="up"><td colspan="12">&#8220;{_esc(d["prompt"])}&#8221;</td></tr>')
         r = d["row"]
         status = "ok" if r["status"] == "ok" else '<span class="crit">cancel/err</span>'
         ttft = f"{r['ttft_s']:.2f}" if r["ttft_s"] is not None else "-"
+        think_s = f"{r['reasoning_s']:.2f}" if r["reasoning_s"] is not None else "-"
+        visible = f"{r['first_visible_s']:.2f}" if r["first_visible_s"] is not None else "-"
         toks = f"{r['decode_tok_s']:.1f}" if r["decode_tok_s"] else "-"
         body.append(f'<tr><td>t{r["turn"]}</td><td>{_hms(r["start"])}</td><td class="n">{_fmt_dur(r["wall_s"])}</td>'
                     f'<td>{status}</td><td class="n">{_fmt_tok(r["completion_tokens"])}</td>'
-                    f'<td class="n">{_fmt_tok(r["client_reasoning_tokens"])}</td><td class="n">{ttft}</td>'
+                    f'<td class="n">{_fmt_tok(_think_tokens(r))}</td><td class="n">{ttft}</td>'
+                    f'<td class="n">{think_s}</td><td class="n">{visible}</td>'
                     f'<td class="n">{toks}</td><td class="n">{_fmt_tok(d["reasoning_chars"])}</td>'
                     f'<td class="n">{_fmt_tok(d["output_chars"])}</td></tr>')
     return _card("Turn digest", f'<div class="scroll"><table class="dg">{head}{"".join(body)}</table></div>')
@@ -785,6 +794,7 @@ def cmd_trace_report(args: argparse.Namespace) -> int:
         ("Wall time (turns)", _fmt_dur(None if any(r["wall_s"] is None for r in rows)
                                       else sum(r["wall_s"] for r in rows))),
         ("Mean decode", f"{mean_dec:.1f} tok/s" if mean_dec else "-"),
+        ("Thinking before the answer", _fmt_thinking(_thinking_summary(rows))),
     ]
     join_mode = joined["join_mode"]
     session = joined["session"]

@@ -63,6 +63,9 @@ final class LaunchLaneParityTests: XCTestCase {
         "opencode": .openCode,
         "pi": .pi,
         "hermes": .hermes,
+        "claude-code": .claudeCode,
+        "codex": .codex,
+        "deepseek-harness": .deepseekHarness,
         "other": .other,
         "benchmark": .benchmark,
     ]
@@ -195,7 +198,7 @@ final class LaunchLaneParityTests: XCTestCase {
                 }
             }
         }
-        // 2 families x 7 clients x 3 switch states x 7 seats.
-        XCTAssertEqual(cells, 2 * 7 * 3 * 7)
+        // 2 families x 10 clients x 3 switch states x 7 seats.
+        XCTAssertEqual(cells, 2 * 10 * 3 * 7)
     }
 }

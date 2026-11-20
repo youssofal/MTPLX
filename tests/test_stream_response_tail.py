@@ -66,10 +66,12 @@ class _Engine:
         stored: bool = False,
         hold: str | None = "schedule",
         held_session: str | None = None,
+        store_error: BaseException | None = None,
     ) -> None:
         self.stored = stored
         self.hold = hold
         self.held_session = held_session
+        self.store_error = store_error
         self.gate = Event()
         self.held = Event()
         self.scheduled: list[dict] = []
@@ -111,6 +113,8 @@ class _Engine:
 
     def store_generation_final(self, *_args, **kwargs):
         self._maybe_hold("store", kwargs.get("session_id"))
+        if self.store_error is not None:
+            raise self.store_error
         if self.stored:
             return {
                 "stored": True,
@@ -477,6 +481,106 @@ def test_the_switch_restores_the_frame_after_the_commit(monkeypatch):
         "generation_final_exact"
     )
     assert state.sessions.peek("tail-switch").last_response_tail is None
+
+
+# --- A commit that fails ----------------------------------------------------
+
+FAILED_COMMIT = {
+    "stored": False,
+    "mode": "failed",
+    "reason": "commit_error",
+    "error": "UnboundLocalError: inherited_loader",
+}
+
+
+def _failing_engine() -> _Engine:
+    return _Engine(hold=None, store_error=UnboundLocalError("inherited_loader"))
+
+
+def _error_payloads(response_text: str) -> list[dict]:
+    return [p for p in _stream_payloads(response_text) if "error" in p]
+
+
+@pytest.mark.parametrize(
+    "session_id, frame_before_commit",
+    [
+        # A session found by prompt inference: its frame waits for the commit.
+        (None, "1"),
+        # A named session with the frame held back by the switch.
+        ("tail-failed", "0"),
+    ],
+)
+def test_a_failed_commit_does_not_fail_the_finished_answer(
+    monkeypatch, session_id, frame_before_commit
+):
+    """#696: the bank write raised after the last token had been streamed, and
+    the client was sent a stream error for an answer it already held. The
+    stream ends as the finished answer it is; the request's stats say the
+    commit failed."""
+
+    monkeypatch.setenv("MTPLX_STREAM_TERMINAL_FRAME_BEFORE_COMMIT", frame_before_commit)
+    engine = _failing_engine()
+    engine.install(monkeypatch)
+    state = _fake_streaming_session_state()
+
+    with TestClient(create_app(state)) as client:
+        response = _post(client, session_id, TURN1, stream=True)
+
+    assert response.status_code == 200
+    assert not _error_payloads(response.text)
+    assert response.text.rstrip().endswith("data: [DONE]")
+    assert _final_stats(response.text)["session_postcommit_snapshot"] == FAILED_COMMIT
+
+
+def test_a_commit_that_fails_after_the_frame_lands_in_the_row(monkeypatch):
+    """With the frame already out, the failure used to stay invisible: the
+    row kept the frame's placeholder. It lands like any other outcome."""
+
+    engine = _failing_engine()
+    engine.install(monkeypatch)
+    state = _fake_streaming_session_state()
+
+    with TestClient(create_app(state)) as client:
+        response = _post(client, "tail-failed-late", TURN1, stream=True)
+        session = state.sessions.peek("tail-failed-late")
+        session.wait_for_response_tail(5.0)
+        request_id = _stream_payloads(response.text)[0]["id"]
+        deadline = time.monotonic() + 5.0
+        row: dict = {}
+        while time.monotonic() < deadline and row != FAILED_COMMIT:
+            row = next(
+                (
+                    metric.get("session_postcommit_snapshot") or {}
+                    for metric in state.last_metrics
+                    if metric.get("request_id") == request_id
+                ),
+                {},
+            )
+            time.sleep(0.02)
+
+    assert not _error_payloads(response.text)
+    assert session.last_response_tail == {"session_postcommit_snapshot": FAILED_COMMIT}
+    assert row == FAILED_COMMIT
+
+
+def test_a_failed_commit_leaves_the_session_at_its_last_good_commit(monkeypatch):
+    engine = _failing_engine()
+    engine.install(monkeypatch)
+    state = _fake_streaming_session_state()
+
+    with TestClient(create_app(state)) as client:
+        _post(client, "tail-failed-state", TURN1, stream=True)
+        session = state.sessions.peek("tail-failed-state")
+        session.wait_for_response_tail(5.0)
+        # The session is free again and holds nothing of the failed turn.
+        engine.store_error = None
+        engine.stored = True
+        retry = _post(client, "tail-failed-state", TURN1, stream=True)
+        session.wait_for_response_tail(5.0)
+
+    assert retry.status_code == 200
+    assert not _error_payloads(retry.text)
+    assert session.last_response_tail["session_postcommit_snapshot"]["stored"] is True
 
 
 # --- The session's tail primitives -----------------------------------------

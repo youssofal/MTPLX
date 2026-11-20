@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event, Lock
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, Sequence
 
 from .session_bank import (
     CacheMissReason,
@@ -34,6 +34,8 @@ from .session_bank import (
     block_aligned_prefix_len,
 )
 from .runtime_options import block_prefix_restore_enabled
+from .token_ids import as_token_tuple, token_id_bytes
+from .token_prefix import common_prefix_len
 
 
 logger = logging.getLogger(__name__)
@@ -464,10 +466,7 @@ class EngineSessionBusy(RuntimeError):
 
 
 def token_hash_short(token_ids: list[int] | tuple[int, ...]) -> str:
-    h = hashlib.sha256()
-    for token in token_ids:
-        h.update(int(token).to_bytes(8, byteorder="little", signed=True))
-    return h.hexdigest()[:16]
+    return hashlib.sha256(token_id_bytes(token_ids)).hexdigest()[:16]
 
 
 def hash_text(text: str) -> str:
@@ -551,14 +550,6 @@ def _common_prefix_reuse_threshold(prompt_len: int) -> int:
 
 def _new_anon_session_id() -> str:
     return f"anon-{secrets.token_hex(8)}"
-
-
-def common_prefix_len(left: list[int] | tuple[int, ...], right: list[int] | tuple[int, ...]) -> int:
-    limit = min(len(left), len(right))
-    for index in range(limit):
-        if int(left[index]) != int(right[index]):
-            return index
-    return limit
 
 
 def _message_role(message: Any) -> str:
@@ -761,6 +752,41 @@ _DEFAULT_POSTCOMMIT_WAIT_STALL_S = 15.0
 _DEFAULT_POSTCOMMIT_WAIT_CEILING_S = 600.0
 
 
+def _collapse_pad_runs(token_ids: Sequence[int], pad_id: int | None) -> tuple[int, ...]:
+    """``token_ids`` with every run of ``pad_id`` reduced to one token: an
+    image prompt in the text view, whether or not its images were expanded."""
+
+    if pad_id is None:
+        return tuple(int(token) for token in token_ids)
+    out: list[int] = []
+    previous_pad = False
+    for token in token_ids:
+        token = int(token)
+        is_pad = token == pad_id
+        if not (is_pad and previous_pad):
+            out.append(token)
+        previous_pad = is_pad
+    return tuple(out)
+
+
+def _postcommit_adoption_enabled() -> bool:
+    """``MTPLX_POSTCOMMIT_ADOPTION`` (on by default; 0 restores the bounded
+    arrival window for every running job).
+
+    A same-session request whose prompt starts with the running end-of-turn
+    job's target waits for the job while it keeps reaching chunk boundaries
+    instead of aborting it after the arrival window: the job's remaining work
+    is a subset of what the request would read itself. At a thinking-on user
+    turn boundary the template drops the previous turn's thinking and the job
+    is re-reading exactly the next prompt's history (17 Nov, founder's Pi task
+    on the 35B: both turn boundaries aborted such a job 2.5 s in and re-read
+    12,245 and 19,832 tokens, first text 4.85 s and 8.08 s).
+    """
+
+    raw = str(os.environ.get("MTPLX_POSTCOMMIT_ADOPTION", "1")).strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
 def _postcommit_wait_stall_s() -> float:
     """MTPLX_POSTCOMMIT_WAIT_STALL_S: heartbeat gap that means "wedged".
 
@@ -938,6 +964,37 @@ class PendingPostcommit:
     #: still prefilling from one that is wedged.
     last_progress_mono_s: float | None = None
     progress_ticks: int = 0
+    #: The prompt prefix the job builds a state for, in the text view (one pad
+    #: token per image, as a request is encoded before its images expand), and
+    #: the image pad token that view collapses. Set once the job has rendered
+    #: the history (``note_target``).
+    target_ids: tuple[int, ...] | None = None
+    target_pad_id: int | None = None
+    #: True while a same-session request waits for this job because its prompt
+    #: starts with the job's target: the job's remaining work is that
+    #: request's own, so the job does not yield to it.
+    adopted: bool = False
+
+    def note_target(self, token_ids: Sequence[int], *, image_pad_token_id: int | None = None) -> None:
+        self.target_pad_id = None if image_pad_token_id is None else int(image_pad_token_id)
+        self.target_ids = _collapse_pad_runs(token_ids, self.target_pad_id)
+
+    def builds_prefix_of(self, prompt_ids: Sequence[int] | None) -> bool:
+        """Whether ``prompt_ids`` starts with the state this job is building
+        (compared in the text view, so a request's images may be expanded or
+        not). A different image at the same place compares equal here; the
+        restore that follows is keyed by image content and simply does not
+        use the job's entry then."""
+
+        target = self.target_ids
+        if not target or prompt_ids is None:
+            return False
+        if self.target_pad_id is None:
+            if len(prompt_ids) < len(target):
+                return False
+            return tuple(int(token) for token in prompt_ids[: len(target)]) == target
+        prompt = _collapse_pad_runs(prompt_ids, self.target_pad_id)
+        return len(prompt) >= len(target) and prompt[: len(target)] == target
 
     def mark_started(self) -> None:
         if self.started_at_s is None:
@@ -1136,6 +1193,12 @@ class EngineSession:
     def has_pending_postcommit(self) -> bool:
         with self._postcommit_lock:
             return self._pending_postcommit is not None
+
+    def pending_postcommit_token_count(self) -> int:
+        """Token count of the in-flight postcommit, 0 when none or unknown."""
+        with self._postcommit_lock:
+            record = self._pending_postcommit
+            return 0 if record is None else int(record.token_count or 0)
 
     def pending_postcommit_admin(self) -> dict[str, Any] | None:
         with self._postcommit_lock:
@@ -1440,7 +1503,9 @@ class EngineSession:
             "tail": dict(self.last_response_tail or {}) if finished else None,
         }
 
-    def resolve_pending_postcommit_for_request(self) -> dict[str, Any]:
+    def resolve_pending_postcommit_for_request(
+        self, prompt_ids: Sequence[int] | None = None
+    ) -> dict[str, Any]:
         """Foreground-request policy for a prior turn's pending postcommit.
 
         Default (POSTCOMMIT_STALL_DESIGN step 2, 2026-07-17): a live user
@@ -1469,6 +1534,14 @@ class EngineSession:
 
         Operators restore the old blocking behavior by setting
         MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S explicitly.
+
+        Adoption (17 Nov 2026): a RUNNING job whose target the request's
+        ``prompt_ids`` start with is the request's own work, already under
+        way, so the request waits for it while it keeps reaching chunk
+        boundaries (``_wait_while_progressing``) and marks it ``adopted`` so
+        the job does not yield to that same request. Only a job that stops
+        making progress is aborted. ``MTPLX_POSTCOMMIT_ADOPTION=0`` turns this
+        off. See ``_postcommit_adoption_enabled``.
         """
         raw = os.environ.get("MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S")
         if raw is not None and raw.strip():
@@ -1507,7 +1580,39 @@ class EngineSession:
                 marathon_protected = True
             waited_s = 0.0
             finished_within_window = False
-            if (
+            adopted = (
+                record.started_at_s is not None
+                and hasattr(future, "result")
+                and _postcommit_adoption_enabled()
+                and record.builds_prefix_of(prompt_ids)
+            )
+            adoption_ended: str | None = None
+            if adopted:
+                # The job is building this request's own prefix: wait while
+                # it keeps reaching chunk boundaries. The first window covers
+                # a job still restoring or rendering before its first chunk.
+                record.adopted = True
+                wait_started = time.monotonic()
+                try:
+                    _wait_while_progressing(
+                        future,
+                        record,
+                        timeout_s=max(arrival_wait_s, _postcommit_wait_stall_s()),
+                    )
+                    finished_within_window = True
+                except TimeoutError:
+                    adoption_ended = "job_stopped_progressing"
+                except BaseException as exc:
+                    adoption_ended = f"job_failed:{type(exc).__name__}"
+                if not finished_within_window:
+                    finished_within_window = bool(
+                        getattr(future, "done", lambda: False)()
+                        and not getattr(future, "cancelled", lambda: False)()
+                    )
+                    if not finished_within_window:
+                        record.adopted = False
+                waited_s = time.monotonic() - wait_started
+            elif (
                 arrival_wait_s > 0.0
                 and record.started_at_s is not None
                 and hasattr(future, "result")
@@ -1549,6 +1654,11 @@ class EngineSession:
                 }
                 if marathon_protected:
                     outcome["marathon_protected"] = True
+            if adopted:
+                outcome["adopted"] = True
+                outcome["adopted_target_tokens"] = len(record.target_ids or ())
+                if adoption_ended is not None:
+                    outcome["adoption_ended"] = adoption_ended
         with self._postcommit_lock:
             if self._pending_postcommit is record:
                 self._pending_postcommit = None
@@ -1734,7 +1844,7 @@ class EngineSession:
         # assistant turn. Aborted/cancelled/error finishes stay refused.
         if finish_reason not in {"stop", "length", "tool_calls"}:
             return EngineSessionCommit(False, f"unsafe_finish:{finish_reason}", self.prefix_len)
-        tokens = tuple(int(token) for token in prompt_ids) + tuple(int(token) for token in generated_ids)
+        tokens = as_token_tuple(prompt_ids) + tuple(int(token) for token in generated_ids)
         self.note_turn_prompt_len(len(prompt_ids), generated_end=len(tokens))
         self.committed_token_ids = tokens
         self.last_commit_s = time.time()
@@ -1762,7 +1872,7 @@ class EngineSession:
         prefix gives the resolver a stable session anchor without claiming the
         assistant/tool history has landed yet.
         """
-        tokens = tuple(int(token) for token in prompt_ids)
+        tokens = as_token_tuple(prompt_ids)
         if not tokens:
             return EngineSessionCommit(False, "empty_prompt_prefix", self.prefix_len)
         current = self.committed_token_ids
@@ -1806,7 +1916,7 @@ class EngineSession:
         prevents the next OpenCode turn from resolving by a stale prompt
         boundary that can differ by one chat-template token.
         """
-        tokens = tuple(int(token) for token in token_ids)
+        tokens = as_token_tuple(token_ids)
         if not tokens:
             return EngineSessionCommit(False, "empty_retokenized_prefix", self.prefix_len)
         if expected_revision is not None and self.revision != int(expected_revision):
@@ -1868,11 +1978,30 @@ class EngineSession:
         nbytes: int = 0,
         snapshot_epoch: int | None = None,
     ) -> BoundarySnapshot:
+        return self._add_hashed_boundary(
+            kind,
+            len(token_ids),
+            token_hash_short(token_ids),
+            bank_token_hash=bank_token_hash,
+            nbytes=nbytes,
+            snapshot_epoch=snapshot_epoch,
+        )
+
+    def _add_hashed_boundary(
+        self,
+        kind: str,
+        token_len: int,
+        token_hash: str,
+        *,
+        bank_token_hash: str | None = None,
+        nbytes: int = 0,
+        snapshot_epoch: int | None = None,
+    ) -> BoundarySnapshot:
         epoch = len(self.boundaries) if snapshot_epoch is None else int(snapshot_epoch)
         boundary = BoundarySnapshot(
             kind=str(kind),
-            token_len=len(token_ids),
-            token_hash=token_hash_short(token_ids),
+            token_len=int(token_len),
+            token_hash=str(token_hash),
             bank_token_hash=bank_token_hash,
             nbytes=int(nbytes),
             snapshot_epoch=epoch,
@@ -1929,10 +2058,33 @@ class EngineSession:
         return max(candidates, key=lambda boundary: boundary.token_len)
 
     def _record_interval_boundaries(self, token_ids: tuple[int, ...], *, every: int = 512) -> None:
+        """A boundary every ``every`` tokens of the committed stream that has
+        none yet, each with the hash of the prefix it ends.
+
+        One pass: the prefix hashes extend one running hash. Hashing every
+        prefix from its first token made a commit cost O(context) per 512 new
+        tokens, on the worker that holds the response tail a tool round
+        waits on (12 Nov, window n4a7: after a 42,626-token answer at 22K
+        context the next Pi request waited 0.69 s; the 83 prefix hashes of
+        that commit took 0.32 s alone).
+        """
         existing = {boundary.token_len for boundary in self.boundaries}
-        for token_len in range(every, len(token_ids), every):
-            if token_len not in existing:
-                self.add_boundary("interval_512", token_ids[:token_len])
+        wanted = [
+            token_len
+            for token_len in range(every, len(token_ids), every)
+            if token_len not in existing
+        ]
+        if not wanted:
+            return
+        data = memoryview(token_id_bytes(token_ids[: wanted[-1]]))
+        running = hashlib.sha256()
+        hashed = 0
+        for token_len in wanted:
+            running.update(data[hashed * 8 : token_len * 8])
+            hashed = token_len
+            self._add_hashed_boundary(
+                "interval_512", token_len, running.copy().hexdigest()[:16]
+            )
 
     def to_admin_dict(self) -> dict[str, Any]:
         return {
@@ -2209,6 +2361,17 @@ class EngineSessionManager:
                         - int(matched),
                     }
                 )
+                # best_prefix_len is the last *finished* commit; under a fast
+                # agent chain the postcommit stays pending turn after turn and
+                # that length freezes while restores are served from the newer
+                # pending snapshot. Report the pending job's own size and the
+                # lag so the frozen value reads as commit lag, not a stale bank.
+                pending_tokens = pending.pending_postcommit_token_count()
+                if pending_tokens:
+                    diagnostic["pending_postcommit_tokens"] = int(pending_tokens)
+                    diagnostic["committed_lag_tokens"] = max(
+                        0, int(pending_tokens) - len(pending.committed_token_ids)
+                    )
                 record(diagnostic)
                 return pending.session_id, "pending_postcommit_near_prefix"
             best, matched = self.best_common_prefix_session(prompt_ids)
@@ -2476,7 +2639,7 @@ class EngineSessionManager:
             acquired.end_generation()
 
     def longest_prefix_session(self, token_ids: list[int] | tuple[int, ...]) -> EngineSession | None:
-        tokens = tuple(int(token) for token in token_ids)
+        tokens = as_token_tuple(token_ids)
         best: EngineSession | None = None
         for session in self._sessions_snapshot():
             prefix = session.committed_token_ids
@@ -2503,7 +2666,7 @@ class EngineSessionManager:
         is strictly better than forking. A 64-token probe rejects unrelated
         sessions before the O(prefix) compare.
         """
-        tokens = tuple(int(token) for token in token_ids)
+        tokens = as_token_tuple(token_ids)
         if not tokens:
             return None, 0
         probe = tokens[:_COMMON_PREFIX_PROBE_TOKENS]
@@ -2545,7 +2708,7 @@ class EngineSessionManager:
         min_matched_tokens: int | None = None,
     ) -> tuple[EngineSession | None, int]:
         """Return a pending-postcommit session with a near-exact prompt prefix."""
-        tokens = tuple(int(token) for token in token_ids)
+        tokens = as_token_tuple(token_ids)
         gap_limit = (
             _near_prefix_max_token_gap()
             if max_token_gap is None
@@ -2594,7 +2757,7 @@ class EngineSessionManager:
         self,
         token_ids: list[int] | tuple[int, ...],
     ) -> tuple[EngineSession | None, int]:
-        tokens = tuple(int(token) for token in token_ids)
+        tokens = as_token_tuple(token_ids)
         best: EngineSession | None = None
         best_len = 0
         for session in self._sessions_snapshot():
@@ -2614,7 +2777,7 @@ class EngineSessionManager:
         selected: EngineSession | None = None,
         exact: bool = False,
     ) -> dict[str, Any]:
-        tokens = tuple(int(token) for token in token_ids)
+        tokens = as_token_tuple(token_ids)
         session, matched = (selected, len(selected.committed_token_ids)) if selected is not None else self.nearest_prefix_session(tokens)
         if session is None:
             return {

@@ -53,6 +53,19 @@ def _srv() -> Any:
     return openai
 
 
+def _without_deferred_tools(
+    tool_specs: list[dict[str, Any]], deferred_names: frozenset[str]
+) -> list[dict[str, Any]]:
+    """The tools the prompt's tool section renders: every declared tool but
+    the ones the client loads on demand."""
+
+    if not deferred_names:
+        return tool_specs
+    return [
+        tool for tool in tool_specs if _srv()._tool_spec_name(tool) not in deferred_names
+    ]
+
+
 def _responses_reasoning_observability(
     metadata: dict[str, Any], effective_effort: str | None
 ) -> dict[str, Any]:
@@ -526,8 +539,13 @@ def resolve_request_policy(
     # schema prefix. Keep the same prompt tools on auto -> none -> auto;
     # the existing trailing no-tool contract closes the tool phase, and
     # tools_active still governs parsing/emission of calls.
+    # Tools loaded on demand (Anthropic tool search) are declared for the
+    # parser but never rendered in the tool section: the conversation carries
+    # each one's definition where the client loaded it, so a load leaves the
+    # prompt's prefix as it was.
+    deferred_tool_names = getattr(request, "deferred_tool_names", frozenset())
     prompt_tool_specs = (
-        tool_specs
+        _without_deferred_tools(tool_specs, deferred_tool_names)
         if tools_active or srv._tool_choice_disables_tools(request.tool_choice)
         else None
     )
@@ -652,7 +670,11 @@ def resolve_request_policy(
     postcommit_tool_specs = (
         prompt_tool_specs
         if prompt_tool_specs
-        else (requested_tool_specs if agent_transcript_tools_active else None)
+        else (
+            _without_deferred_tools(requested_tool_specs, deferred_tool_names)
+            if agent_transcript_tools_active
+            else None
+        )
     )
     background = bool(
         chat
@@ -800,6 +822,9 @@ def resolve_request_policy(
     observability["request_reasoning_mode"] = request_reasoning_mode
     observability["request_enable_thinking"] = bool(thinking_enabled)
     observability["request_reasoning_effort"] = reasoning_effort
+    if thinking_enabled and thinking_controls_allowed:
+        # A cap on its own thinking is one of the client's thinking controls.
+        observability.update(srv._client_thinking_budget(request))
     observability.update(
         _responses_reasoning_observability(metadata, reasoning_effort)
     )
@@ -880,6 +905,15 @@ def resolve_request_policy(
             "request_filtered_tool_names": filtered_tool_names,
             "request_hidden_tool_names": hidden_tool_names,
             "request_tools_hidden_by_bridge": bool(hidden_tool_names),
+            "request_deferred_tool_count": len(deferred_tool_names),
+            "request_loaded_tool_count": len(
+                getattr(request, "loaded_tool_names", ())
+            ),
+            # Asked to load on demand, declared up front instead: the served
+            # template does not list tools the way a loaded one is written.
+            "request_defer_loading_declined_count": len(
+                getattr(request, "defer_loading_declined_names", ())
+            ),
         }
     )
     chat_template_report = getattr(state, "chat_template_report", {}) or {}

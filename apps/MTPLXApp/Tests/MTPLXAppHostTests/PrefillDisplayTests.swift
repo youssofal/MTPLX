@@ -25,7 +25,11 @@ final class PrefillDisplayTests: XCTestCase {
             """.utf8))
         XCTAssertEqual(summary.averageTokS, 1536)
         XCTAssertEqual(summary.peakTokS, 2048)
-        XCTAssertEqual(Format.tps(summary.averageTokS), "1536")
+        // Grouped like the token counts beside it, in the user's locale.
+        XCTAssertEqual(Format.tps(summary.averageTokS), 1536.formatted(.number.grouping(.automatic)))
+        XCTAssertEqual(Format.tps(999.6), Format.integer(1000))
+        XCTAssertEqual(Format.tps(998.4), "998")
+        XCTAssertEqual(Format.tps(68.04), "68.0")
     }
 
     func testHeroGaugeKeepsDecodeFaceForShortSuffixPrefills() throws {

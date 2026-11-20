@@ -102,11 +102,12 @@ struct ReconnectFakeDaemon {
     /// from an earlier session (with a launch id) or `mtplx serve` typed in
     /// a terminal (without one).
     /// With `apiKey`, the daemon requires that key on every request (a
-    /// server whose key the app does not have answers 401).
-    func launchOutsideTheApp(launchID: String?, apiKey: String? = nil) throws -> Process {
+    /// server whose key the app does not have answers 401). It serves the
+    /// fixture's model unless `model` names another folder.
+    func launchOutsideTheApp(launchID: String?, apiKey: String? = nil, model: URL? = nil) throws -> Process {
         let process = Process()
         process.executableURL = executable
-        var arguments = ["serve", "--port", String(port), "--model", modelDirectory.path]
+        var arguments = ["serve", "--port", String(port), "--model", (model ?? modelDirectory).path]
         if let apiKey {
             let keyFile = root.appendingPathComponent("outside-key-\(UUID().uuidString)")
             try Data(apiKey.utf8).write(to: keyFile)
@@ -213,7 +214,7 @@ struct ReconnectFakeDaemon {
             "HOME": root.path,
             "MTPLX_APP_DISABLE_STANDARD_PATHS": "1",
         ]
-        return MTPLXBackendStore(
+        let store = MTPLXBackendStore(
             configuration: configuration,
             settingsStore: settingsStore,
             commandBuilder: MTPLXCommandBuilder(environment: environment),
@@ -234,6 +235,11 @@ struct ReconnectFakeDaemon {
             },
             beforeStaticStateAnswersAreRead: beforeStaticStateAnswersAreRead
         )
+        // Before it loads a model the app looks for it on the usual MTPLX
+        // ports of this Mac; no test reaches those. A test that needs another
+        // port sets its own list.
+        store.runningServerProbePortsOverride = []
+        return store
     }
 
     private func setFlag(_ name: String, _ on: Bool) throws {
@@ -883,15 +889,18 @@ final class DaemonReconnectTests: XCTestCase {
 
     // MARK: A launch on a fallback port, then the window reopens
 
-    /// The configured port is taken by `mtplx serve` from a terminal, so the
-    /// app launches on the next free port and settings keep the configured
-    /// one (#503). Reopening the window reloads settings from disk. Every
-    /// later request must still reach the daemon where it listens, not the
-    /// reloaded port, where the other server answers.
+    /// The configured port is taken by `mtplx serve` from a terminal serving
+    /// another model, so the app launches on the next free port and settings
+    /// keep the configured one (#503). Reopening the window reloads settings
+    /// from disk. Every later request must still reach the daemon where it
+    /// listens, not the reloaded port, where the other server answers.
     @MainActor
     func testFallbackPortDaemonStaysReachableAfterTheWindowReopens() async throws {
         let daemon = try ReconnectFakeDaemon.make()
-        let occupant = try daemon.launchOutsideTheApp(launchID: nil)
+        let occupant = try daemon.launchOutsideTheApp(
+            launchID: nil,
+            model: daemon.root.appendingPathComponent("another-model", isDirectory: true)
+        )
         addTeardownBlock { if occupant.isRunning { occupant.terminate() } }
         let occupantHealth = try await daemon.waitUntilHealthy()
         try daemon.settingsStore.save(daemon.configuration(fanMode: .default))
@@ -928,6 +937,214 @@ final class DaemonReconnectTests: XCTestCase {
 
         await store.stopDaemon()
         XCTAssertTrue(occupant.isRunning, "Stop never signals the server on the configured port")
+    }
+
+    // MARK: A server started outside the app already serves this model
+
+    /// `mtplx serve` from a terminal already serves the model when Play is
+    /// pressed. The app used to move to the next free port and load a second
+    /// copy (two Flash-Next loads do not fit in 128 GB). It now shows that
+    /// server: Live works, nothing is loaded, its fans are left alone, and
+    /// Stop lets go of it without signalling it and says it keeps running.
+    @MainActor
+    func testPlayBesideATerminalServerOnTheSameModelAttachesInsteadOfLoading() async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let terminalServer = try daemon.launchOutsideTheApp(launchID: nil)
+        addTeardownBlock { if terminalServer.isRunning { terminalServer.terminate() } }
+        let terminalHealth = try await daemon.waitUntilHealthy()
+        let fans = FanCallRecorder()
+        let store = daemon.makeStore(configuration: daemon.configuration(fanMode: .max), fans: fans)
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+
+        await store.startDaemon()
+
+        XCTAssertEqual(store.daemonState, .running)
+        XCTAssertEqual(daemon.spawns().count, 1, "no second model was loaded")
+        XCTAssertTrue(store.attachedToOutsideServer)
+        XCTAssertEqual(store.health?.startup?.pid, terminalHealth.startup?.pid)
+        XCTAssertEqual(store.baseURL.port, daemon.port)
+        XCTAssertNil(store.portFallbackNotice, "the port did not move")
+        let notice = try XCTUnwrap(store.outsideServerNotice)
+        XCTAssertTrue(notice.contains("already serves this model"), notice)
+        XCTAssertNil(store.lastLaunchScheduling, "Settings must not claim the scheduler of a server the app did not start")
+        try await pollUntil("live stats open") { store.connectionState == .open }
+        XCTAssertEqual(badge(store).label, "Running")
+        let modesAfterStart = await fans.modes
+        XCTAssertEqual(modesAfterStart, [], "the app drives no fans of a server it did not start")
+
+        // Play again: the app reconnects to what it holds.
+        await store.startDaemon()
+        XCTAssertEqual(daemon.spawns().count, 1)
+        XCTAssertEqual(store.daemonState, .running)
+
+        await store.stopDaemon()
+        XCTAssertEqual(store.daemonState, .stopped)
+        XCTAssertTrue(terminalServer.isRunning, "Stop lets go of the server and never signals it")
+        let stillServing = try await daemon.waitUntilHealthy(timeout: 3)
+        XCTAssertEqual(stillServing.startup?.pid, terminalHealth.startup?.pid)
+        XCTAssertFalse(store.attachedToOutsideServer)
+        let afterStop = try XCTUnwrap(store.outsideServerNotice)
+        XCTAssertTrue(afterStop.contains("keeps running"), afterStop)
+        XCTAssertTrue(afterStop.contains("mtplx stop --port \(daemon.port)"), afterStop)
+        let restores = await fans.restores
+        let modes = await fans.modes
+        XCTAssertEqual(restores, 0, "Stop restores no fans the app never set")
+        XCTAssertEqual(modes, [])
+        let logged = await logsMention(store, "letting go of the MTPLX server")
+        XCTAssertTrue(logged, "the Logs window says Stop let go of it")
+    }
+
+    /// `mtplx start opencode` left its server on one of the usual MTPLX
+    /// ports while the app's port is another: the app finds it there, as the
+    /// CLI does, and uses it for this session; settings keep their port.
+    @MainActor
+    func testPlayFindsTheModelServedOnAnotherUsualPort() async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let configuredPort = try ReconnectFakeDaemon.make().port
+        let terminalServer = try daemon.launchOutsideTheApp(launchID: nil)
+        addTeardownBlock { if terminalServer.isRunning { terminalServer.terminate() } }
+        let terminalHealth = try await daemon.waitUntilHealthy()
+        var configuration = daemon.configuration(fanMode: .default)
+        configuration.port = configuredPort
+        try daemon.settingsStore.save(configuration)
+        let store = daemon.makeStore(configuration: configuration, fans: FanCallRecorder())
+        store.runningServerProbePortsOverride = [daemon.port]
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+
+        await store.startDaemon()
+
+        XCTAssertEqual(store.daemonState, .running)
+        XCTAssertEqual(daemon.spawns().count, 1, "no second model was loaded")
+        XCTAssertEqual(store.baseURL.port, daemon.port)
+        XCTAssertEqual(store.health?.startup?.pid, terminalHealth.startup?.pid)
+        XCTAssertEqual(try daemon.settingsStore.load().port, configuredPort, "settings keep their port")
+        try await pollUntil("live stats open") { store.connectionState == .open }
+
+        await store.stopDaemon()
+        XCTAssertTrue(terminalServer.isRunning)
+    }
+
+    /// The app's own daemon from an earlier session holds the configured
+    /// port with another model, and a terminal server already serves this
+    /// model on another usual port: the stale daemon is replaced as before,
+    /// and Play attaches to the terminal server instead of loading the model
+    /// (it used to attach and leave the stale daemon running unseen).
+    @MainActor
+    func testPlayReplacesAStaleOwnDaemonAndAttachesWhereTheModelIsServed() async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let other = try ReconnectFakeDaemon.make()
+        let stale = try daemon.launchOutsideTheApp(
+            launchID: "prior-session-\(UUID().uuidString)",
+            model: daemon.root.appendingPathComponent("another-model", isDirectory: true)
+        )
+        addTeardownBlock { if stale.isRunning { stale.terminate() } }
+        _ = try await daemon.waitUntilHealthy()
+        let terminalServer = try other.launchOutsideTheApp(launchID: nil, model: daemon.modelDirectory)
+        addTeardownBlock { if terminalServer.isRunning { terminalServer.terminate() } }
+        let terminalHealth = try await other.waitUntilHealthy()
+        let store = daemon.makeStore(configuration: daemon.configuration(fanMode: .default), fans: FanCallRecorder())
+        store.runningServerProbePortsOverride = [other.port]
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+
+        await store.startDaemon()
+
+        XCTAssertEqual(store.daemonState, .running)
+        XCTAssertTrue(store.attachedToOutsideServer)
+        XCTAssertEqual(store.baseURL.port, other.port)
+        XCTAssertEqual(store.health?.startup?.pid, terminalHealth.startup?.pid)
+        try await pollUntil("the stale daemon is gone") { !stale.isRunning }
+        XCTAssertEqual(daemon.spawns().count, 1, "only the stale daemon ever ran on the configured port")
+        XCTAssertEqual(other.spawns().count, 1, "nothing was loaded beside the terminal server")
+    }
+
+    /// The server that serves the model cannot be held (it stopped answering
+    /// between the port check and the attach). The app says who holds the
+    /// port, with the message it always used, and loads nothing: no second
+    /// copy, no port move, no fan change.
+    @MainActor
+    func testAnAttachThatCannotHoldTheServerRefusesAndLoadsNothing() async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let terminalServer = try daemon.launchOutsideTheApp(launchID: nil)
+        addTeardownBlock { if terminalServer.isRunning { terminalServer.terminate() } }
+        _ = try await daemon.waitUntilHealthy()
+        let fans = FanCallRecorder()
+        let supervisor = DaemonSupervisor(initialHealthProbe: { _, _ in nil })
+        let store = daemon.makeStore(
+            configuration: daemon.configuration(fanMode: .max),
+            supervisor: supervisor,
+            fans: fans
+        )
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+
+        await store.startDaemon()
+
+        let expected = "Port \(daemon.port) is held by an MTPLX server started outside the app. "
+            + "Press Ctrl-C in its terminal or run `mtplx stop --port \(daemon.port)`, then press Play."
+        XCTAssertEqual(store.daemonState, .degraded(expected))
+        XCTAssertEqual(store.startupPhase, .failed(expected))
+        XCTAssertEqual(daemon.spawns().count, 1, "nothing was loaded beside it")
+        XCTAssertEqual(store.configuration.port, daemon.port, "no move to another port")
+        XCTAssertNil(store.portFallbackNotice)
+        XCTAssertFalse(store.attachedToOutsideServer)
+        XCTAssertFalse(supervisor.isRunning())
+        let restores = await fans.restores
+        let modes = await fans.modes
+        XCTAssertEqual(restores, 0)
+        XCTAssertEqual(modes, [])
+        XCTAssertTrue(terminalServer.isRunning)
+    }
+
+    /// A launch setting changed while the app shows a server it did not
+    /// start: restarting would stop a server that is not the app's and load
+    /// the model beside it. The change is saved and the server keeps serving.
+    @MainActor
+    func testAChangeThatNeedsARestartLeavesAnAttachedServerAlone() async throws {
+        let daemon = try ReconnectFakeDaemon.make()
+        let terminalServer = try daemon.launchOutsideTheApp(launchID: nil)
+        addTeardownBlock { if terminalServer.isRunning { terminalServer.terminate() } }
+        let terminalHealth = try await daemon.waitUntilHealthy()
+        try daemon.settingsStore.save(daemon.configuration(fanMode: .default))
+        let store = daemon.makeStore(configuration: daemon.configuration(fanMode: .default), fans: FanCallRecorder())
+        addTeardownBlock { @MainActor in await store.stopDaemon() }
+        await store.startDaemon()
+        XCTAssertTrue(store.attachedToOutsideServer)
+
+        var next = store.configuration
+        next.automaticDaemonRestart.toggle()
+        try await store.applyConfiguration(next)
+
+        XCTAssertEqual(store.daemonState, .running)
+        XCTAssertEqual(daemon.spawns().count, 1, "nothing was loaded beside it")
+        XCTAssertEqual(store.health?.startup?.pid, terminalHealth.startup?.pid)
+        let failure = try XCTUnwrap(store.configurationChangeFailure)
+        XCTAssertTrue(failure.contains("started outside the app"), failure)
+        XCTAssertEqual(try daemon.settingsStore.load().automaticDaemonRestart, next.automaticDaemonRestart)
+        XCTAssertTrue(terminalServer.isRunning)
+    }
+
+    func testTheSameModelFolderMatchesHoweverItIsSpelled() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mtplx-same-model-\(UUID().uuidString)", isDirectory: true)
+        let folder = root.appendingPathComponent("pack", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let link = root.appendingPathComponent("linked-pack")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: folder)
+        defer { try? FileManager.default.removeItem(at: root) }
+        func health(_ path: String, ok: Bool = true) throws -> HealthPayload {
+            try JSONDecoder().decode(
+                HealthPayload.self,
+                from: Data(#"""
+                {"ok": \#(ok), "model": "m", "model_path": "\#(path)", "generation_mode": "mtp",
+                 "load_mtp": true, "mtp_enabled": true, "depth": 3, "profile": {},
+                 "context_window": 4096, "active_requests": 0, "reasoning_parser": "qwen3"}
+                """#.utf8)
+            )
+        }
+        XCTAssertTrue(MTPLXBackendStore.servesSameModel(try health(folder.path), expectedModelPath: link.path))
+        XCTAssertTrue(MTPLXBackendStore.servesSameModel(try health(folder.path + "/"), expectedModelPath: folder.path))
+        XCTAssertFalse(MTPLXBackendStore.servesSameModel(try health(folder.path), expectedModelPath: root.path))
+        XCTAssertFalse(MTPLXBackendStore.servesSameModel(try health(folder.path, ok: false), expectedModelPath: folder.path))
+        XCTAssertFalse(MTPLXBackendStore.servesSameModel(try health(""), expectedModelPath: folder.path))
     }
 
     // MARK: Live stats drop while the daemon stays healthy

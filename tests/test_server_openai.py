@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import re
 import time
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -12959,7 +12959,7 @@ def test_chat_stream_hermes_suppresses_tool_call_preamble(monkeypatch, with_visi
             image_pad_token_id=999999, image_digests=[123], pad_counts=[1], total_rows=1,
         )
         monkeypatch.setattr(openai, "_vision_extract_and_flatten", lambda messages: (messages, [object()]))
-        monkeypatch.setattr(openai, "_materialize_vision_splice", lambda state, images, ids: (ids + [999999], splice))
+        monkeypatch.setattr(openai, "_materialize_vision_splice", lambda state, images, ids, **_kwargs: (ids + [999999], splice))
     commits = []
     def capture_final(*_args, **kwargs):
         commits.append(kwargs)
@@ -14867,6 +14867,188 @@ def test_thinking_guard_scope_all_is_still_opt_in(monkeypatch):
     )
     assert config is None
 
+
+# --- The client's own cap on reasoning --------------------------------------
+#
+# A contract-review benchmark of November 2026 ran 34 model turns a task with
+# a thinking cap of 2,048 tokens a request. The server read no such field on
+# either endpoint, so every turn thought as long as the model liked: 10.8
+# minutes a run where two other engines took 6.7 and 5.0 for the same score.
+
+_PLAIN_THINKING_OBS = {"request_enable_thinking": True, "request_tool_count": 0}
+
+
+def _chat_request(**body):
+    return openai.ChatCompletionRequest(
+        messages=[{"role": "user", "content": "hi"}], **body
+    )
+
+
+def _guard_config(argv=(), **observability):
+    return openai._thinking_guard_config_for_request(
+        _guard_request_state(list(argv)),
+        prompt_ids=[1, 2, 3],
+        request_observability={**_PLAIN_THINKING_OBS, **observability},
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "field"),
+    [
+        ({"thinking_budget": 2048}, "thinking_budget"),
+        ({"thinking_token_budget": 2048}, "thinking_token_budget"),
+        ({"reasoning": {"max_tokens": 2048}}, "reasoning.max_tokens"),
+        (
+            {"chat_template_kwargs": {"thinking_budget": 2048}},
+            "chat_template_kwargs.thinking_budget",
+        ),
+    ],
+)
+def test_a_clients_thinking_budget_is_read_under_every_name_clients_send(body, field):
+    assert openai._client_thinking_budget(_chat_request(**body)) == {
+        "request_thinking_budget": 2048,
+        "request_thinking_budget_field": field,
+    }
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"thinking_budget": 0},
+        {"thinking_budget": -1},
+        {"thinking_budget": True},
+        {"thinking_budget": "2048"},
+        {"thinking_budget": 2048.5},
+        {"reasoning": "on"},
+        {"reasoning": {"effort": "medium"}},
+    ],
+)
+def test_a_value_that_is_not_a_token_count_is_no_cap_and_no_error(body):
+    assert openai._client_thinking_budget(_chat_request(**body)) == {}
+
+
+def test_the_flat_name_wins_over_the_nested_ones():
+    request = _chat_request(thinking_budget=1024, reasoning={"max_tokens": 4096})
+    assert openai._client_thinking_budget(request)["request_thinking_budget"] == 1024
+
+
+def test_a_clients_cap_holds_on_plain_chat_with_no_budget_set_at_launch(monkeypatch):
+    monkeypatch.delenv("MTPLX_THINKING_BUDGET", raising=False)
+    config = _guard_config(request_thinking_budget=2048)
+    assert config is not None and config.enabled
+    assert config.budget_tokens == 2048
+
+
+def test_a_clients_cap_replaces_the_operators_agent_budget(monkeypatch):
+    monkeypatch.delenv("MTPLX_THINKING_BUDGET", raising=False)
+    config = _guard_config(
+        ["--agent-thinking-budget", "auto"],
+        request_tool_count=4,
+        request_reasoning_effort="xhigh",
+        request_thinking_budget=2048,
+    )
+    assert config.budget_tokens == 2048
+
+
+def test_a_request_that_does_not_think_gets_no_cap(monkeypatch):
+    monkeypatch.delenv("MTPLX_THINKING_BUDGET", raising=False)
+    assert _guard_config(request_enable_thinking=False, request_thinking_budget=2048) is None
+
+
+@pytest.mark.parametrize(("operator", "expected"), [("1024", 1024), ("8192", 2048)])
+def test_the_operators_setting_lowers_a_clients_cap_and_never_raises_it(
+    monkeypatch, operator, expected
+):
+    monkeypatch.setenv("MTPLX_THINKING_BUDGET", operator)
+    assert _guard_config(request_thinking_budget=2048).budget_tokens == expected
+
+
+def test_the_operator_can_switch_every_budget_off(monkeypatch):
+    monkeypatch.setenv("MTPLX_THINKING_BUDGET", "off")
+    assert _guard_config(request_thinking_budget=2048) is None
+
+
+def test_a_messages_requests_budget_tokens_is_its_chat_requests_cap():
+    request = openai.AnthropicMessagesRequest(
+        max_tokens=4096,
+        messages=[{"role": "user", "content": "hi"}],
+        thinking={"type": "enabled", "budget_tokens": 2048},
+    )
+    chat = openai._anthropic_to_chat_request(request)
+    assert chat.enable_thinking is True
+    assert openai._client_thinking_budget(chat) == {
+        "request_thinking_budget": 2048,
+        "request_thinking_budget_field": "thinking_budget",
+    }
+
+
+def _captured_observability(monkeypatch, path, body, *, headers=None):
+    from mtplx.backends.descriptors import QWEN3_8_REASONING_CODEC
+
+    state = _fake_state()
+    state.runtime.tokenizer = StreamingTokenizer()
+    state.args.reasoning = "on"
+    state.args.enable_thinking = True
+    state.args.stats_footer = False
+    captured = {}
+    monkeypatch.setattr(
+        openai, "_reasoning_codec_for_state", lambda _state: QWEN3_8_REASONING_CODEC
+    )
+
+    def generate(_state, _prompt_ids, **kwargs):
+        captured.update(kwargs["request_observability"])
+        return _fake_generation("ok")
+
+    monkeypatch.setattr(openai, "_run_generation", generate)
+    response = TestClient(create_app(state)).post(
+        path, headers={"x-mtplx-cache-mode": "bypass", **(headers or {})}, json=body
+    )
+    assert response.status_code == 200, response.text
+    return captured
+
+
+_HI = [{"role": "user", "content": "hi"}]
+
+
+def test_the_chat_route_records_the_cap_the_client_sent(monkeypatch):
+    observability = _captured_observability(
+        monkeypatch,
+        "/v1/chat/completions",
+        {"messages": _HI, "max_tokens": 16, "thinking_budget": 2048},
+    )
+    assert observability["request_thinking_budget"] == 2048
+    assert observability["request_thinking_budget_field"] == "thinking_budget"
+
+
+def test_the_messages_route_records_the_cap_the_client_sent(monkeypatch):
+    observability = _captured_observability(
+        monkeypatch,
+        "/v1/messages",
+        {
+            "model": "mtplx-test-model",
+            "max_tokens": 4096,
+            "messages": _HI,
+            "thinking": {"type": "enabled", "budget_tokens": 2048},
+        },
+    )
+    assert observability["request_thinking_budget"] == 2048
+
+
+def test_a_request_with_thinking_off_records_no_cap(monkeypatch):
+    observability = _captured_observability(
+        monkeypatch,
+        "/v1/chat/completions",
+        {
+            "messages": _HI,
+            "max_tokens": 16,
+            "enable_thinking": False,
+            "thinking_budget": 2048,
+        },
+        headers={"x-mtplx-allow-client-controls": "1"},
+    )
+    assert "request_thinking_budget" not in observability
+
 # --- parallel_tool_calls wiring ---------------------------------------------
 
 
@@ -15752,3 +15934,182 @@ def test_live_app_ownership_applies_to_actual_request_policy(monkeypatch, hint):
 
     assert client.post("/v1/mtplx/settings", json={"managed_client_controls": "typo"}).status_code == 400
     assert state.args.managed_client_controls == "app"
+
+
+def test_completions_lane_registers_in_flight_and_cancels(monkeypatch, tmp_path):
+    """The /v1/completions lane is visible to the in-flight registry.
+
+    Both branches must register the request (like the chat lane does) so
+    POST /v1/mtplx/cancel/{id} can flip the worker's cancel_event and the
+    dashboard can show the request; without that a completion runs to
+    max_tokens and the cancel route always answers cancelled: false.
+    """
+    state = _fake_streaming_session_state()
+    state.flight = openai.FlightRecorder(str(tmp_path / "flight.jsonl"))
+    started = Event()
+    release = Event()
+    # What the handler tells the engine about this response's shape, in order.
+    engine_streaming_flags: list[object] = []
+
+    def callback_driven_generation(_state, prompt_ids, **kwargs):
+        # The real serial lane never polls cancel_event during decode: its only
+        # in-decode cancellation point is the per-batch token callback, which
+        # raises _StreamCancelled once the cancel lands. Respond through that
+        # callback only, so a fake that stops itself cannot green the test.
+        assert kwargs.get("cancel_event") is not None
+        token_callback = kwargs.get("token_callback")
+        assert token_callback is not None, "decode path has no cancellation callback"
+        engine_streaming_flags.append(kwargs.get("streaming_response", "absent"))
+        started.set()
+        # Bounded so a lane that never observes the cancel finishes like a
+        # real max_tokens stop instead of hanging the test.
+        for _ in range(250):
+            token_callback([ord("x")])
+            if release.wait(0.01):
+                break
+        return _fake_generation("bye")
+
+    def wait_for_in_flight(seconds: float = 5.0) -> dict | None:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            handles = state.dashboard.in_flight.snapshot()
+            if handles:
+                return handles[0]
+            time.sleep(0.005)
+        return None
+
+    monkeypatch.setattr(openai, "_run_generation", callback_driven_generation)
+
+    with TestClient(create_app(state)) as client:
+        threads: list[Thread] = []
+        try:
+            streamed: dict = {}
+
+            def post_stream() -> None:
+                streamed["response"] = client.post(
+                    "/v1/completions",
+                    json={"prompt": "hi", "max_tokens": 8, "stream": True},
+                )
+
+            threads.append(Thread(target=post_stream, daemon=True))
+            threads[-1].start()
+            assert started.wait(5), "streaming completion never started"
+            handle = wait_for_in_flight()
+            assert handle is not None, "streaming completion never registered in flight"
+            request_id = handle["request_id"]
+            assert request_id.startswith("cmpl-")
+            cancelled = client.post(f"/v1/mtplx/cancel/{request_id}")
+            assert cancelled.json()["cancelled"] is True
+            threads[-1].join(10)
+            assert not threads[-1].is_alive()
+            assert state.dashboard.in_flight.count() == 0
+            assert streamed["response"].status_code == 200
+
+            # Both non-streaming shapes: no stop (the callback used to be
+            # absent entirely) and a configured stop monitor.
+            for body in (
+                {"prompt": "hi", "max_tokens": 8},
+                {"prompt": "hi", "max_tokens": 8, "stop": ["STOP"]},
+            ):
+                started.clear()
+                completed: dict = {}
+
+                def post_nonstream() -> None:
+                    completed["response"] = client.post("/v1/completions", json=body)
+
+                thread = Thread(target=post_nonstream, daemon=True)
+                threads.append(thread)
+                thread.start()
+                assert started.wait(5), (
+                    f"non-streaming completion never started: {body}"
+                )
+                handle = wait_for_in_flight()
+                assert handle is not None, (
+                    f"non-streaming completion never registered in flight: {body}"
+                )
+                request_id = handle["request_id"]
+                assert request_id.startswith("cmpl-")
+                flight = client.get("/v1/mtplx/flight").json()
+                assert [item["rid"] for item in flight["active"]] == [request_id]
+                cancelled = client.post(f"/v1/mtplx/cancel/{request_id}")
+                assert cancelled.json()["cancelled"] is True
+                thread.join(10)
+                assert not thread.is_alive()
+                assert completed["response"].status_code == 499, body
+                assert state.dashboard.in_flight.count() == 0
+
+            # Hard by shape: the stream lane passes no flag (its token callback
+            # already derives response_is_streaming=True), and each
+            # non-streaming shape keeps its pre-change answer — False without a
+            # stop monitor (no callback used to exist), True with one (which
+            # used to pass nonstream_stop_on_tokens).
+            assert engine_streaming_flags == ["absent", False, True]
+
+            # The streaming cancel recorded its receipt too: every cancelled
+            # completion, streamed or not, must reach cancelled_total and the
+            # request log instead of only stopping the model.
+            assert state.dashboard.lifetime.cancelled_total == 3
+            receipts = [
+                row
+                for row in state.last_metrics
+                if row.get("cancellation_reason") is not None
+            ]
+            assert [row["cancellation_reason"] for row in receipts] == [
+                "post_endpoint",
+                "post_endpoint",
+                "post_endpoint",
+            ]
+            assert all(row["request_cancelled"] is True for row in receipts)
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(10)
+
+
+def test_completions_nonstream_keeps_its_blank_retry_answer_per_shape(monkeypatch):
+    """A non-streaming completion's 200 body reports the blank-retry answer the
+    engine derived before this lane gained a cancel-aware token callback.
+
+    The engine treats a set token_callback as "this is a stream", which
+    suppresses blank retries. The lane now always passes a callback, so the
+    handler must state the shape explicitly: True with a stop monitor (the only
+    shape that used to pass a callback), False without one. Otherwise `stop`
+    requests silently regain up to --blank-retry-attempts replays and the
+    public server_blank_retry_suppressed stat flips.
+    """
+
+    state = _fake_streaming_session_state()
+    state.draft_sampler = None
+    state.requests_completed = 0
+
+    def fake_generate_mtpk(_runtime, prompt_ids, **kwargs):
+        tokens = [ord(char) for char in "OK"]
+        callback = kwargs.get("token_callback")
+        if callback is not None:
+            callback(tokens)
+        return SimpleNamespace(
+            tokens=tokens,
+            text="OK",
+            stats=SimpleNamespace(
+                to_dict=lambda: {
+                    "prompt_eval_time_s": 0.001,
+                    "generated_tokens": len(tokens),
+                    "elapsed_s": 0.01,
+                    "tok_s": 100.0,
+                }
+            ),
+            final_state=None,
+        )
+
+    monkeypatch.setattr(openai, "generate_mtpk", fake_generate_mtpk)
+
+    with TestClient(create_app(state)) as client:
+        for body, expected_suppressed in (
+            ({"prompt": "hi", "max_tokens": 2}, False),
+            ({"prompt": "hi", "max_tokens": 2, "stop": ["STOP"]}, True),
+        ):
+            response = client.post("/v1/completions", json=body)
+            assert response.status_code == 200, body
+            stats = response.json()["mtplx_stats"]
+            assert stats["server_blank_retry_suppressed"] is expected_suppressed, body
+            assert stats["server_blank_retries"] == 0, body

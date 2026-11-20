@@ -93,3 +93,90 @@ def test_sanitize_plain_weight_no_longer_shifts_mtp_norms():
     # Trunk suffixes keep their per-tensor shift.
     trunk = sanitize_plain_weight("model.layers.0.input_layernorm.weight", _gain(0.3))
     assert float(trunk.mean().item()) > 1.2
+
+
+# --- one gain that missed its +1 ------------------------------------------------
+
+
+def _unshifted_post_attention_sidecar(prefix: str = "mtp.") -> dict[str, mx.array]:
+    """The shipped 35B-A3B shape: six gains absolute, post_attention zero-centred
+    (mean about 0.87, one channel negative)."""
+
+    weights = _absolute_sidecar(prefix)
+    weights[f"{prefix}layers.0.post_attention_layernorm.weight"] = mx.array(
+        np.array([0.87, 0.87, 0.87, 0.87, 0.87, 0.87, 1.98, -0.14], dtype=np.float32)
+    )
+    return weights
+
+
+def test_a_single_unshifted_gain_alone_gets_its_plus_one(monkeypatch):
+    from mtplx import compressed_tensors as ct
+
+    monkeypatch.delenv(ct.MTP_NORM_REPAIR_ENV, raising=False)
+    weights = _unshifted_post_attention_sidecar()
+    assert mtp_sidecar_norms_are_delta(weights) is False
+    assert ct.unshifted_mtp_norms(weights) == ["mtp.layers.0.post_attention_layernorm.weight"]
+    healed = shift_delta_mtp_norms(weights)
+    key = "mtp.layers.0.post_attention_layernorm.weight"
+    assert bool(mx.array_equal(healed[key], weights[key] + 1.0))
+    for other, value in weights.items():
+        if other != key:
+            assert bool(mx.array_equal(healed[other], value)), other
+    assert [r["tensor"] for r in ct.LAST_MTP_NORM_REPAIRS] == [key]
+    assert ct.LAST_MTP_NORM_REPAIRS[0]["mean_after"] > ct.LAST_MTP_NORM_REPAIRS[0]["mean_before"] + 0.99
+    # The runtime heal (stripped namespace) repairs the same tensor.
+    stripped = _heal_raw_delta_mtp_norms(_unshifted_post_attention_sidecar(prefix=""))
+    assert float(stripped["layers.0.post_attention_layernorm.weight"].mean().item()) > 1.8
+
+
+def test_the_repair_switch_loads_every_gain_as_stored(monkeypatch):
+    from mtplx import compressed_tensors as ct
+
+    monkeypatch.setenv(ct.MTP_NORM_REPAIR_ENV, "0")
+    weights = _unshifted_post_attention_sidecar()
+    healed = shift_delta_mtp_norms(weights)
+    for key, value in weights.items():
+        assert bool(mx.array_equal(healed[key], value)), key
+    assert ct.LAST_MTP_NORM_REPAIRS == []
+
+
+def test_healthy_and_all_delta_sidecars_get_no_per_tensor_repair(monkeypatch):
+    from mtplx import compressed_tensors as ct
+
+    monkeypatch.delenv(ct.MTP_NORM_REPAIR_ENV, raising=False)
+    shift_delta_mtp_norms(_absolute_sidecar())
+    assert ct.LAST_MTP_NORM_REPAIRS == []
+    assert ct.unshifted_mtp_norms(_absolute_sidecar()) == []
+    shift_delta_mtp_norms(_delta_sidecar())  # the set-level shift of all seven, as before
+    assert ct.LAST_MTP_NORM_REPAIRS == []
+
+
+def test_every_installed_head_is_repaired_only_where_a_gain_missed_its_shift():
+    """Zero false positives over the heads on this Mac (skips where none are installed).
+
+    Only the shipped Qwen3.6-35B-A3B Speed and Balance packs (and their FP16
+    siblings) carry an unshifted gain; every other head is left as stored.
+    Extra heads to check (a forged R1, a third-party sidecar) can be named in
+    MTPLX_NORMSCAN_EXTRA, colon-separated paths to mtp safetensors files, and
+    must all be left alone.
+    """
+    import os
+    from pathlib import Path
+
+    from mtplx import compressed_tensors as ct
+
+    models = Path.home() / ".mtplx" / "models"
+    heads = sorted(models.glob("*/mtp.safetensors")) if models.is_dir() else []
+    extra = [Path(p) for p in os.environ.get("MTPLX_NORMSCAN_EXTRA", "").split(":") if p]
+    if not heads and not extra:
+        pytest.skip("no installed MTP heads on this machine")
+    for path in heads + extra:
+        weights = mx.load(str(path))
+        flagged = ct.unshifted_mtp_norms(weights) if not mtp_sidecar_norms_are_delta(weights) else []
+        name = path.parent.name
+        expected = (
+            ["mtp.layers.0.post_attention_layernorm.weight"]
+            if path in heads and "Qwen3.6-35B-A3B-MTPLX-Optimized-" in name
+            else []
+        )
+        assert flagged == expected, (str(path), flagged)

@@ -82,14 +82,14 @@ NATIVE_MTP_60_MODEL = DEFAULT_MODEL_ID
 PUBLIC_COMMANDS = (
     (
         "start",
-        "Interactive setup → chat (model · mode · web/CLI/Pi/OpenCode/Swival/Hermes/Dashboard)",
+        "Interactive setup → chat (model · mode · web/CLI/Pi/OpenCode/Hermes/Claude Code/Codex/Swival/Dashboard)",
     ),
     ("tune", "Find the fastest AR/MTP draft depth for this Mac (AR, D1-D8)"),
     ("help", "Detailed help; `help commands` / `help flags` / `help <name>`"),
     ("setup", "Prepare config and the model cache"),
     ("quickstart", "Run the local OpenAI/Anthropic server"),
     ("serve", "Start the local server with an explicit model and mode"),
-    ("connect", "Copy settings for Open WebUI, Claude Code, OpenCode, or Swival"),
+    ("connect", "Copy settings for Open WebUI, Claude Code, Codex, OpenCode, or Swival"),
     ("ask", "Ask the verified local model once"),
     ("run", "Run one verified completion from an argument, a flag, or a pipe"),
     ("chat", "Run one native-MTP chat generation as a smoke check"),
@@ -102,6 +102,8 @@ PUBLIC_COMMANDS = (
     ("forge", "Forge, verify, brand, discover, and publish MTP models"),
     ("hardware", "Inspect Apple Silicon / MLX acceleration eligibility"),
     ("models", "List models in the local MTPLX cache"),
+    ("folders", "Model folders: add an external drive, choose where downloads go"),
+    ("clients", "Where each client opens, and the client copies MTPLX keeps"),
 )
 
 ADVANCED_COMMANDS = {
@@ -241,6 +243,8 @@ def _format_public_help() -> str:
   mtplx start opencode --port 18083    Configure OpenCode Desktop for MTPLX-owned generation
   mtplx start swival --port 18084      Print Swival generic-provider command
   mtplx start hermes --port 18085      Launch Hermes Agent against MTPLX
+  mtplx start claude-code              Serve MTPLX and open Claude Code in Terminal
+  mtplx start codex                    Serve MTPLX and open Codex in Terminal
   mtplx quickstart --port 8000         API server only, no chat
 
   {footer}
@@ -282,6 +286,7 @@ def _format_start_help() -> str:
 
 Interactive end-to-end setup. On first run MTPLX walks you through three
 quick choices: model, runtime mode, and where to chat (browser, terminal, Pi, OpenCode, Swival, or Hermes).
+Claude Code and Codex are one command away: `mtplx start claude-code`, `mtplx start codex`.
 On later runs it offers "same as last time?" so the chat is one keypress away.
 
 What gets asked:
@@ -296,6 +301,8 @@ Power-user shortcuts (any of these skip the onboarding wizard):
   mtplx start opencode --port 18083   Configure OpenCode Desktop for MTPLX-owned generation
   mtplx start swival --port 18084     Serve MTPLX and print the Swival command
   mtplx start hermes --port 18085     Serve MTPLX and open Hermes Agent in Terminal
+  mtplx start claude-code             Serve MTPLX and open Claude Code in Terminal on it
+  mtplx start codex                   Serve MTPLX and open Codex in Terminal on it
   mtplx start --max                   Sustained Max: long-context mode with ThermalForge fan boost
   mtplx start --profile performance-cold --max
                                       Burst: old max-fan lane, max 8K context
@@ -328,12 +335,14 @@ Inside terminal chat:
   /exit            Quit
 
 Aliases:
-  `web` and `openwebui` -> browser chat (same as default)
+  `web`, `webui` and `openwebui` -> browser chat (same as default)
   `terminal`            -> terminal chat (same as `cli`)
   `pi`                  -> Pi coding-agent connection
   `opencode`, `oc`      -> OpenCode Desktop coding-agent connection
   `swival`, `sv`        -> Swival generic-provider connection
   `hermes`              -> Hermes Agent with terminal/file/web/browser/messaging tools
+  `claude-code`, `claude` -> Claude Code on the local server (your own setup is not edited)
+  `codex`               -> Codex CLI on the local server (your own setup is not edited)
   `dashboard`, `live`   -> live engine dashboard
   (hyphenated forms like `open-webui`, `open-code`, `hermes-agent` also work)
 """
@@ -1016,6 +1025,18 @@ def cmd_remove_public(args: argparse.Namespace) -> int:
     return handler(args)
 
 
+def cmd_folders_public(args: argparse.Namespace) -> int:
+    from .commands.public import cmd_folders_public as handler
+
+    return handler(args)
+
+
+def cmd_clients_public(args: argparse.Namespace) -> int:
+    from .commands.public import cmd_clients_public as handler
+
+    return handler(args)
+
+
 def cmd_run_public(args: argparse.Namespace) -> int:
     from .commands.public import cmd_run_public as handler
 
@@ -1315,6 +1336,16 @@ def _cmd_connect(args: argparse.Namespace) -> int:
                     "purpose": "Use MTPLX through the Anthropic-compatible Claude Code path.",
                 },
                 {
+                    "name": "codex",
+                    "command": "mtplx connect codex",
+                    "purpose": "Use MTPLX in the Codex CLI through its Responses API provider.",
+                },
+                {
+                    "name": "codex-desktop",
+                    "command": "mtplx connect codex --desktop",
+                    "purpose": "Open the Codex desktop app as MTPLX's own instance; your Codex app and ~/.codex stay as they are.",
+                },
+                {
                     "name": "opencode",
                     "command": "mtplx connect opencode",
                     "purpose": "Use MTPLX in OpenCode with MTPLX-owned reasoning and sampler policy.",
@@ -1323,6 +1354,11 @@ def _cmd_connect(args: argparse.Namespace) -> int:
                     "name": "swival",
                     "command": "mtplx connect swival",
                     "purpose": "Use MTPLX through Swival's generic OpenAI-compatible provider.",
+                },
+                {
+                    "name": "deepseek-harness",
+                    "command": "mtplx connect deepseek-harness --open",
+                    "purpose": "Open DeepSeek Harness on MTPLX with its telemetry off, in its own MTPLX home; ~/.dsh stays as it is.",
                 },
             ],
             "server": server_command,
@@ -1335,8 +1371,11 @@ def _cmd_connect(args: argparse.Namespace) -> int:
             print("2. Pick a client:")
             print("   mtplx connect openwebui")
             print("   mtplx connect claude-code")
+            print("   mtplx connect codex")
+            print("   mtplx connect codex --desktop")
             print("   mtplx connect opencode")
             print("   mtplx connect swival")
+            print("   mtplx connect deepseek-harness --open")
         return 0
     return cmd_integrate_public(args)
 
@@ -2258,15 +2297,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     start_flow_p = sub.add_parser(
         "start",
-        help="Interactive setup → chat (model · mode · web/CLI/Pi/OpenCode/Swival/Hermes/Dashboard)",
-        usage="mtplx start [cli|web|pi|opencode|swival|hermes|dashboard] [--fresh] [--max] [--profile NAME] [--model PATH_OR_REPO] [--prompt TEXT]",
-        description="Walk through model / mode / surface in three quick steps, then chat. Returning users get a 'same as last time?' prompt. Use --fresh to redo the onboarding, or pass any of --model / --profile / --max / cli|web|pi|opencode|swival|hermes|dashboard to skip it entirely.",
+        help="Interactive setup → chat (model · mode · web/CLI/Pi/OpenCode/Hermes/Claude Code/Codex/DeepSeek Harness/Swival/Dashboard)",
+        usage="mtplx start [cli|web|pi|opencode|hermes|claude-code|codex|deepseek-harness|swival|dashboard] [--cli|--app] [--fresh] [--max] [--profile NAME] [--model PATH_OR_REPO] [--prompt TEXT]",
+        description="Walk through model / mode / surface in three quick steps, then chat. Returning users get a 'same as last time?' prompt. Use --fresh to redo the onboarding, or pass any of --model / --profile / --max / cli|web|pi|opencode|hermes|claude-code|codex|deepseek-harness|swival|dashboard to skip it entirely.",
     )
     start_flow_p.add_argument(
         "target",
         nargs="?",
         choices=[
             "web",
+            "webui",
             "openwebui",
             "open-webui",
             "cli",
@@ -2280,17 +2320,44 @@ def build_parser() -> argparse.ArgumentParser:
             "sv",
             "hermes",
             "hermes-agent",
+            "claude-code",
+            "claude",
+            "codex",
+            "deepseek-harness",
+            "deepseek",
+            "dsh",
             "dashboard",
             "live-dashboard",
             "live",
         ],
         default=None,
-        help="Web chat, terminal chat, Pi, OpenCode Desktop, Swival, Hermes Agent, or the live MTPLX Dashboard. Without this argument, MTPLX runs an interactive onboarding (or the 'same as last time?' prompt) on first run.",
+        help="Web chat, terminal chat, Pi, OpenCode Desktop, Swival, Hermes Agent, Claude Code, Codex, DeepSeek Harness, or the live MTPLX Dashboard. Without this argument, MTPLX runs an interactive onboarding (or the 'same as last time?' prompt) on first run.",
     )
     start_flow_p.add_argument(
         "--fresh",
         action="store_true",
         help="Skip the 'same as last time?' prompt and walk through the full onboarding again",
+    )
+    client_surface = start_flow_p.add_mutually_exclusive_group()
+    client_surface.add_argument(
+        "--cli",
+        dest="agent_client_cli",
+        action="store_true",
+        help=(
+            "Open the client's CLI in the terminal chosen for it, this once "
+            "(Codex and DeepSeek Harness open their app by default; OpenCode and "
+            "Hermes too). `mtplx config set <client>_opens_in` keeps a choice."
+        ),
+    )
+    client_surface.add_argument(
+        "--app",
+        dest="agent_client_app",
+        action="store_true",
+        help=(
+            "Open the client's app, this once: the OpenCode and Hermes apps, "
+            "MTPLX's own copy of the Codex or Claude app, DeepSeek Harness's "
+            "browser app."
+        ),
     )
     start_flow_p.add_argument(
         "--model", help="Verified model path or Hugging Face repo id"
@@ -2841,12 +2908,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     connect_p = sub.add_parser(
         "connect",
-        help="Show client setup for Open WebUI, Claude Code, OpenCode, or Swival",
+        help=(
+            "Show client setup for Open WebUI, Claude Code, Codex, OpenCode, Swival, "
+            "or DeepSeek Harness"
+        ),
     )
     connect_p.add_argument(
         "integration",
         nargs="?",
-        choices=["openwebui", "claude-code", "opencode", "swival"],
+        choices=[
+            "openwebui",
+            "claude-code",
+            "codex",
+            "opencode",
+            "swival",
+            "deepseek-harness",
+            "dsh",
+        ],
     )
     connect_p.add_argument("--host", default="127.0.0.1")
     connect_p.add_argument("--port", type=int, default=8000)
@@ -2871,6 +2949,33 @@ def build_parser() -> argparse.ArgumentParser:
     connect_p.add_argument("--smoke", action="store_true")
     connect_p.add_argument("--timeout", type=float, default=5.0)
     connect_p.add_argument("--context-window", type=int, default=262144)
+    connect_p.add_argument(
+        "--desktop",
+        action="store_true",
+        help=(
+            "codex: open the Codex desktop app as MTPLX's own instance "
+            "(its own folders under ~/.mtplx/clients; ~/.codex is not touched). "
+            "deepseek-harness: its browser app"
+        ),
+    )
+    connect_p.add_argument(
+        "--cli",
+        action="store_true",
+        help="deepseek-harness: its terminal app, in the terminal chosen for it",
+    )
+    connect_p.add_argument(
+        "--open",
+        action="store_true",
+        help=(
+            "deepseek-harness: open it now (its browser app or terminal app, as "
+            "deepseek_harness_opens_in or --desktop / --cli say)"
+        ),
+    )
+    connect_p.add_argument(
+        "--workspace",
+        default=None,
+        help="deepseek-harness: the folder its session works in (default: this one)",
+    )
     connect_p.add_argument("--json", action="store_true")
     connect_p.set_defaults(func=_cmd_connect)
 
@@ -3304,6 +3409,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     forge_probe_p.set_defaults(func=cmd_forge_public)
 
+    forge_census_p = forge_sub.add_parser(
+        "census",
+        help="Say what a checkpoint is from its small files, and every reason not to build it",
+    )
+    forge_census_p.add_argument("source", help="Hugging Face repo, HF URL, or local path")
+    forge_census_p.add_argument("--json", action="store_true", help="Emit the whole report as JSON")
+    forge_census_p.add_argument(
+        "--reference-template", help="A chat template file to diff the checkpoint's against"
+    )
+    forge_census_p.set_defaults(func=cmd_forge_public)
+
+    forge_day_zero_p = forge_sub.add_parser(
+        "day-zero",
+        help="From a repository id to verified packs, one resumable step at a time",
+    )
+    forge_day_zero_p.add_argument("source", help="Hugging Face repo, HF URL, or local path")
+    forge_day_zero_p.add_argument("--out", required=True, help="Folder for the source, packs, receipts and texts")
+    forge_day_zero_p.add_argument("--model", required=True, help='The model as people write it, for example "Qwen 4 27B"')
+    forge_day_zero_p.add_argument(
+        "--pack",
+        action="append",
+        help='KIND=RECIPE, repeatable: a JSON object, a JSON file, or a published pack whose recorded recipe is reused',
+    )
+    forge_day_zero_p.add_argument("--plan", action="store_true", help="Print the steps for this checkpoint and run none")
+    forge_day_zero_p.add_argument("--through", help="Stop after this step")
+    forge_day_zero_p.add_argument("--owner", help="Hugging Face owner of the packs (default Youssofal)")
+    forge_day_zero_p.add_argument("--base-model", help="The upstream repository id, when the source is a local folder")
+    forge_day_zero_p.add_argument("--license", help="SPDX licence id of the base model (default apache-2.0)")
+    forge_day_zero_p.set_defaults(func=cmd_forge_public)
+
     forge_build_p = forge_sub.add_parser(
         "build",
         help="Download/convert/verify/brand a local MTPLX artifact",
@@ -3496,6 +3631,53 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit newline-delimited JSON progress events",
     )
     pull_p.set_defaults(func=cmd_pull_public)
+
+    folders_p = sub.add_parser(
+        "folders",
+        help="Model folders shared with the app: list, add, remove, choose the download folder",
+        description=(
+            "Model folders, shared with the MTPLX app (model_dir and model_dirs in "
+            "~/.mtplx/config.toml). A folder on a drive that is not plugged in stays "
+            "listed as not connected. Nothing is copied, moved or deleted."
+        ),
+    )
+    folders_p.add_argument(
+        "folders_action",
+        nargs="?",
+        default="list",
+        choices=["list", "add", "remove", "downloads"],
+        help="list (default), add PATH..., remove PATH, downloads PATH",
+    )
+    folders_p.add_argument("paths", nargs="*", metavar="PATH")
+    folders_p.add_argument("--config", help="Config file (default ~/.mtplx/config.toml)")
+    folders_p.add_argument("--json", action="store_true")
+    folders_p.set_defaults(func=cmd_folders_public)
+
+    clients_p = sub.add_parser(
+        "clients",
+        help="Where each client opens, and the client copies MTPLX keeps beside your apps",
+        description=(
+            "Where each client opens: the terminal app picked for it (Terminal, "
+            "Ghostty, iTerm, Warp, any installed) or its app, shared with the app's "
+            "Settings; `mtplx config set pi_opens_in Ghostty` changes one. "
+            "Client copies MTPLX keeps beside your own apps. `mtplx start codex` and "
+            "the app's Start menu open the Codex app as MTPLX's own copy, with its "
+            "own history and settings (about 1 GB once it has started). `remove` "
+            "deletes that copy's folder and its history; your own Codex app and "
+            "~/.codex are never touched."
+        ),
+    )
+    clients_p.add_argument(
+        "clients_action",
+        nargs="?",
+        default="list",
+        choices=["list", "remove"],
+        help="list (default), remove NAME",
+    )
+    clients_p.add_argument("name", nargs="?", metavar="NAME", help="codex-desktop")
+    clients_p.add_argument("--yes", action="store_true", help="Skip the delete confirmation prompt")
+    clients_p.add_argument("--json", action="store_true")
+    clients_p.set_defaults(func=cmd_clients_public)
 
     list_p = sub.add_parser("list", help="List locally cached MTPLX models")
     list_p.add_argument("--cache-dir")
@@ -4616,7 +4798,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     integrate_p = sub.add_parser("integrate", help="Print client integration settings")
     integrate_sub = integrate_p.add_subparsers(dest="integration", required=True)
-    for integration_name in ("openwebui", "claude-code", "opencode", "swival"):
+    for integration_name in ("openwebui", "claude-code", "codex", "opencode", "swival"):
         integration_p = integrate_sub.add_parser(integration_name)
         integration_p.add_argument("--host", default="127.0.0.1")
         integration_p.add_argument("--port", type=int, default=8000)

@@ -29,7 +29,7 @@ import mtplx.graphbank as graphbank
 from mtplx.cache_state import snapshot_untrimmable_cache
 from mtplx.graphbank import TensorOffsetQSACache
 from mtplx.models.qwen4_exp import QSACache, qsa_rows_target
-from mtplx.one_copy import held_qsa_rows, prompt_lease_fields
+from mtplx.one_copy import anchor_nbytes, held_qsa_rows, prompt_lease_fields
 from mtplx.session_bank import SessionBank, _exact_restore_serves
 from test_qwen4_fixed_m4_capacity_bucket import NATIVE, SEED, _bits, lane, pack
 
@@ -542,3 +542,39 @@ def test_one_copy_generation_matches_the_copying_path_and_holds_one_copy(pack, l
     for run in (one, two):
         assert run[1][2].stats.cached_tokens == len(run[0][1].token_ids)
     assert second.stats.session_restore_mode == "reference_lease"
+
+
+def test_a_prefill_without_a_session_measures_the_anchor_a_lease_would_hold(pack, lane):
+    """The server's boot warmup prefills a short prompt with no session, so it
+    takes no lease. Its prefill still measures the anchor, and the number is
+    the one a prompt lease records: the first long prompt of the process is
+    billed one anchor for its publication, not a second copy of itself
+    (one_copy.note_anchor)."""
+
+    from mtplx.qwen4_fixed_verify import install_qwen4_fixed_verify_route
+
+    smoke, model = pack
+    lane.setenv("MTPLX_ONE_COPY", "1")
+    lane.setenv("MTPLX_COMPILED_VERIFY", "1")
+    rt = smoke._tiny_runtime(model)
+    install_qwen4_fixed_verify_route(rt)
+    assert anchor_nbytes(rt) is None
+    result = generation.generate_mtpk(
+        rt, [(5 * i + 1) % 128 for i in range(24)], max_tokens=4, sampler=NATIVE,
+        draft_sampler=NATIVE, speculative_depth=3, seed=SEED, mtp_cache_policy="persistent",
+        mtp_history_policy="committed", verify_strategy="batched", stop_token_ids=set(),
+        capture_final_state=True,
+    )
+    measured = anchor_nbytes(rt)
+    assert measured is not None and measured > 0
+    leased = SimpleNamespace()
+    prompt_lease_fields(
+        result.final_state.final_trunk_cache,
+        committed_mtp_cache=None,
+        hidden=None,
+        prompt_len=24,
+        boundaries=[],
+        runtime=leased,
+    )
+    assert anchor_nbytes(leased) == measured
+

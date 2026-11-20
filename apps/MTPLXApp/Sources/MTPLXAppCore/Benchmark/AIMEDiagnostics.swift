@@ -86,13 +86,13 @@ public enum AIMEDiagnostics {
     public static let isEnabled: Bool =
         isEnabled(environment: ProcessInfo.processInfo.environment)
 
-    public static var renderMode: AIMERenderMode {
+    /// Cached once, like `isEnabled`: the Benchmark tab's reasoning pane
+    /// reads both on every body evaluation, once per streamed revision.
+    public static let renderMode: AIMERenderMode =
         renderMode(environment: ProcessInfo.processInfo.environment)
-    }
 
-    public static var tailBlockLimit: Int {
+    public static let tailBlockLimit: Int =
         tailBlockLimit(environment: ProcessInfo.processInfo.environment)
-    }
 
     private static let sampleGate = AIMEDiagnosticSampleGate()
 

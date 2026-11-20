@@ -92,6 +92,22 @@ def _drop_void_assistant_messages(messages: list[dict[str, Any]]) -> list[dict[s
     ]
 
 
+_SYSTEM_REMINDER_OPEN = "<system-reminder>"
+_SYSTEM_REMINDER_CLOSE = "</system-reminder>"
+
+
+def _as_system_reminder(text: str) -> str:
+    """A mid-conversation system message's text as it sits in a user turn:
+    inside ``<system-reminder>`` tags, unless it already is a reminder block.
+    The same text always gives the same bytes, so a turn renders identically
+    on every later request (the cached prefix holds)."""
+
+    stripped = text.strip()
+    if stripped.startswith(_SYSTEM_REMINDER_OPEN) and stripped.endswith(_SYSTEM_REMINDER_CLOSE):
+        return text
+    return f"{_SYSTEM_REMINDER_OPEN}\n{stripped}\n{_SYSTEM_REMINDER_CLOSE}"
+
+
 def _consolidate_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """One leading system message; later system turns stay where they are.
 
@@ -107,6 +123,17 @@ def _consolidate_system_messages(messages: list[dict[str, Any]]) -> list[dict[st
     Such a message now becomes a ``user`` turn in place, which keeps the
     template happy and keeps every earlier token byte-identical; the
     consecutive-role merge below folds it into the user turn that follows.
+
+    In that user turn it must still read as the system's, not the user's:
+    Claude Code 2.1.3xx sends its whole session context (environment, MCP
+    server instructions, the deferred tool, agent and skill listings) as one
+    unwrapped system turn after the first user message. Folded into that
+    message as plain text, every line of it read as the user's own words: on
+    16 Nov the model answered "without searching, tell me ..." by running a
+    grep, because a skill's description said "run this grep FIRST". So a late
+    system message reaches the model inside ``<system-reminder>`` tags, the
+    form Claude Code itself uses for system context inside a user turn; one
+    that already is a reminder block is left as it is.
     """
 
     leading: list[str] = []
@@ -122,7 +149,7 @@ def _consolidate_system_messages(messages: list[dict[str, Any]]) -> list[dict[st
             if in_leading_run:
                 leading.append(str(content))
             else:
-                rest.append({**msg, "role": "user", "content": str(content)})
+                rest.append({**msg, "role": "user", "content": _as_system_reminder(str(content))})
         else:
             in_leading_run = False
             rest.append(msg)
