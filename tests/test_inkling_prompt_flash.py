@@ -260,11 +260,15 @@ def test_the_stage_writes_the_layers_cache_rows_and_its_attention(monkeypatch, s
     assert _rel_rms(got, want.astype(mx.float32)) <= 4 * BOUND[dtype]
 
 
-def test_the_stage_is_off_where_set_off(monkeypatch):
+def test_the_stage_is_off_where_set_off_and_leaves_the_cache_untouched(monkeypatch):
     layer = _layer(True, mx.bfloat16, 5)
     monkeypatch.setenv("MTPLX_INKLING_PROMPT_FLASH", "off")
-    lin = [mx.zeros((1, 64, n), mx.bfloat16) for n in (3072, 384, 24, 3072, 1024, 1024)]
-    assert F.stage(layer, *lin, _caches(layer, 0, mx.bfloat16, 64)[0]) is None
+    query = mx.zeros((1, 24, 64, 128), mx.bfloat16)
+    rows = mx.zeros((1, 8, 64, 128), mx.bfloat16)
+    kv = _caches(layer, 0, mx.bfloat16, 64)[0]
+    assert F.stage(layer, query, rows, rows, mx.zeros((1, 64, 24, 1024), mx.bfloat16),
+                   mx.zeros((1, 64, 24), mx.bfloat16), kv) is None
+    assert kv.keys is None and kv.offset == 0
 
 
 def _route(monkeypatch, layer, hist, rows=96, prompt=None, seed=50):

@@ -427,163 +427,6 @@ def flash_attention(query, key, value, profiles, sink, window, *, tg_m=None, tgb
 
 
 # ----------------------------------------------------------------------------------------
-# The prompt chunk's attention inputs in one launch: what the layer computes between its
-# projections and the attention (``model.Layer.attention``), for every row of the chunk:
-#   q   = clip(q_proj * q_scale, 22.6), then on a global visit times the row's log-position
-#         factor tau = 1 + alpha * log(max(position / n_floor, 1)), rounded after each step;
-#   rel = clip(r_proj * r_scale, 8.0), the same factor on a global visit;
-#   k   = clip(k after its convolution, 22.6);  v = v after its convolution / its RMS (no gain);
-#   the bias profile rel @ rel_basis (1,024 distances a head), rounded to the query type.
-# clip(x, L) = x * min(1, L / (|x| + 1e-6)) with |x| the vector's Euclidean length, in float.
-# The length and the RMS are sums of squares over a head (128 or 16 values) in this launch's own
-# order; everything else is the layer's arithmetic in the layer's order with the library's
-# precise square root, reciprocal square root and logarithm.
-# ----------------------------------------------------------------------------------------
-
-_PREP_SOURCE = """
-    constexpr int D = 128;
-    const int row = int(threadgroup_position_in_grid.x);
-    const uint tid = thread_position_in_threadgroup.x;
-    const int sg = int(tid >> 5);
-    const int lane = int(tid & 31u);
-    const float qlim = as_type<float>(uint(QLIM));
-    const float rlim = as_type<float>(uint(RLIM));
-    const float eps = as_type<float>(uint(EPS));
-    const float alpha = as_type<float>(uint(ALPHA));
-    float tau = 1.0f;
-    if (GLOBAL) {
-        const float where = float(int(params[0]) + row + 1) / float(NFLOOR);
-        tau = 1.0f + alpha * metal::precise::log(metal::max(where, 1.0f));
-    }
-    threadgroup float relf[HQ * 16];
-
-    const device T* qrow = qp + size_t(row) * size_t(qp_strides[1]);
-    const device T* rrow = rp + size_t(row) * size_t(rp_strides[1]);
-    const device T* krow = kp + size_t(row) * size_t(kp_strides[1]);
-    const device T* vrow = vp + size_t(row) * size_t(vp_strides[1]);
-    const size_t fq = size_t(qp_strides[2]);
-    const size_t fr = size_t(rp_strides[2]);
-    const size_t fk = size_t(kp_strides[2]);
-    const size_t fv = size_t(vp_strides[2]);
-
-    // Queries: heads sg, sg + 8, sg + 16; a lane holds dimensions 4 lane .. 4 lane + 3.
-    for (int h = sg; h < HQ; h += 8) {
-        float x[4];
-        float sq = 0.0f;
-        for (int i = 0; i < 4; ++i) {
-            const int at = h * D + 4 * lane + i;
-            x[i] = float(qrow[size_t(at) * fq]) * float(qs[at]);
-            const float s2 = x[i] * x[i];
-            sq += s2;
-        }
-        sq = simd_sum(sq);
-        const float keep = metal::min(1.0f, qlim / (metal::precise::sqrt(sq) + 1e-6f));
-        for (int i = 0; i < 4; ++i) {
-            T t = T(x[i] * keep);
-            if (GLOBAL) {
-                t = T(float(t) * tau);
-            }
-            qo[(size_t(row) * HQ + h) * D + 4 * lane + i] = t;
-        }
-    }
-    // Keys and values: head sg of the KV_H key/value heads.
-    for (int h = sg; h < KV_H; h += 8) {
-        float x[4];
-        float y[4];
-        float sk = 0.0f;
-        float sv = 0.0f;
-        for (int i = 0; i < 4; ++i) {
-            const int at = h * D + 4 * lane + i;
-            x[i] = float(krow[size_t(at) * fk]);
-            y[i] = float(vrow[size_t(at) * fv]);
-            const float k2 = x[i] * x[i];
-            const float v2 = y[i] * y[i];
-            sk += k2;
-            sv += v2;
-        }
-        sk = simd_sum(sk);
-        sv = simd_sum(sv);
-        const float keep = metal::min(1.0f, qlim / (metal::precise::sqrt(sk) + 1e-6f));
-        const float unit = metal::precise::rsqrt(sv / float(D) + eps);
-        for (int i = 0; i < 4; ++i) {
-            ko[(size_t(row) * KV_H + h) * D + 4 * lane + i] = T(x[i] * keep);
-            vo[(size_t(row) * KV_H + h) * D + 4 * lane + i] = VNORM ? T(y[i] * unit) : T(y[i]);
-        }
-    }
-    // Relative heads: 16 values a head on lanes 0 .. 15, heads sg, sg + 8, sg + 16.
-    for (int h = sg; h < HQ; h += 8) {
-        const bool mine = lane < 16;
-        const float x = mine ? float(rrow[size_t(h * 16 + lane) * fr]) * float(rs[h * 16 + lane]) : 0.0f;
-        const float x2 = x * x;
-        const float sq = simd_sum(x2);
-        const float keep = metal::min(1.0f, rlim / (metal::precise::sqrt(sq) + 1e-6f));
-        if (mine) {
-            T t = T(x * keep);
-            if (GLOBAL) {
-                t = T(float(t) * tau);
-            }
-            relf[h * 16 + lane] = float(t);
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    // The profile: entry (head, distance) = sum over the 16 relative values of rel * basis.
-    for (int d = int(tid); d < EXT; d += int(threads_per_threadgroup.x)) {
-        float b[16];
-        for (int j = 0; j < 16; ++j) {
-            b[j] = float(basis[size_t(j) * size_t(basis_strides[0]) + size_t(d) * size_t(basis_strides[1])]);
-        }
-        for (int h = 0; h < HQ; ++h) {
-            float acc = 0.0f;
-            for (int j = 0; j < 16; ++j) {
-                acc += relf[h * 16 + j] * b[j];
-            }
-            po[(size_t(row) * HQ + h) * EXT + d] = T(acc);
-        }
-    }
-"""
-
-
-def _bits(value):
-    return _float_bits(float(value))
-
-
-@lru_cache(maxsize=None)
-def _prep_kernel():
-    return mx.fast.metal_kernel(
-        name="mtplx_inkling_prompt_prep",
-        input_names=["qp", "rp", "kp", "vp", "qs", "rs", "basis", "params"],
-        output_names=["qo", "ko", "vo", "po"],
-        source=_PREP_SOURCE,
-        ensure_row_contiguous=False,
-    )
-
-
-def prep(q_proj, r_proj, k_conv, v_conv, q_scale, r_scale, rel_basis, offset, *, glob, cfg):
-    """``(q (1, R, 24, 128), k (1, R, 8, 128), v (1, R, 8, 128), profiles (1, R, 24, 1024))`` from the
-    projections of a prompt chunk (``q_proj (1, R, 3072)``, ``r_proj (1, R, 384)``, and the key and
-    value rows after their convolutions, ``(1, R, 1024)``); ``offset`` is the visit's cache length
-    before the chunk (it sets the log-position factor of a global visit)."""
-    rows = q_proj.shape[1]
-    heads, extent = q_scale.shape[0], rel_basis.shape[1]
-    kv_heads = k_conv.shape[-1] // HEAD_DIM
-    dtype = q_proj.dtype
-    qo, ko, vo, po = _prep_kernel()(
-        inputs=[q_proj, r_proj, k_conv, v_conv, q_scale, r_scale, rel_basis, mx.array([int(offset)], mx.int32)],
-        template=[("T", dtype), ("HQ", heads), ("KV_H", kv_heads), ("EXT", extent),
-                  ("QLIM", _bits(cfg["qk_l2_clip_threshold"])), ("RLIM", _bits(cfg["rel_l2_clip_threshold"])),
-                  ("EPS", _bits(cfg["rms_norm_eps"])), ("ALPHA", _bits(cfg["log_scaling_alpha"])),
-                  ("NFLOOR", int(cfg["log_scaling_n_floor"])), ("GLOBAL", bool(glob)),
-                  ("VNORM", bool(cfg["use_value_norm_no_gamma"]))],
-        grid=(rows * 256, 1, 1),
-        threadgroup=(256, 1, 1),
-        output_shapes=[(1, rows, heads, HEAD_DIM), (1, rows, kv_heads, HEAD_DIM), (1, rows, kv_heads, HEAD_DIM),
-                       (1, rows, heads, extent)],
-        output_dtypes=[dtype, dtype, dtype, dtype],
-    )
-    return qo, ko, vo, po
-
-
-# ----------------------------------------------------------------------------------------
 # The caches a prompt chunk writes.
 #
 # A global visit's bank grows by the chunk's rows every chunk: the library's cache copies the
@@ -687,55 +530,6 @@ def window_update(kv, keys, values):
     return new_k, new_v
 
 
-_prep_checks = {}
-
-
-def _prep_first_use(layer, dtype, glob):
-    """Once per dtype and visit kind: the launch against the layer's own expressions (``model``'s
-    ``clip_heads``, ``norm``, the log-position factor and the profile product) on synthetic
-    projections with this layer's scales and basis: relative RMS within the query type's rounding."""
-    from .. import model as M
-
-    spec = (str(dtype), bool(glob))
-    if spec in _prep_checks:
-        return _prep_checks[spec]
-    cfg = layer.cfg
-    rows, offset = 96, (9000 if glob else 3)
-    ks = mx.random.split(mx.random.key(20261122), 4)
-    qp = (mx.random.normal((1, rows, 3072), key=ks[0]) * 0.8).astype(dtype)
-    rp = (mx.random.normal((1, rows, 384), key=ks[1]) * 1.5).astype(dtype)
-    kc = (mx.random.normal((1, rows, 1024), key=ks[2]) * 1.2).astype(dtype)
-    vc = (mx.random.normal((1, rows, 1024), key=ks[3]) * 1.2).astype(dtype)
-    width = layer.q_scale.shape[-1]
-    q = M.clip_heads(qp.reshape(1, rows, -1, width), cfg["qk_l2_clip_threshold"], layer.q_scale)
-    rel = M.clip_heads(rp.reshape(1, rows, layer.q_scale.shape[0], -1), cfg["rel_l2_clip_threshold"], layer.r_scale)
-    k = M.clip_heads(kc.reshape(1, rows, -1, width), cfg["qk_l2_clip_threshold"])
-    v = vc.reshape(1, rows, -1, width)
-    if cfg["use_value_norm_no_gamma"]:
-        v = M.norm(v, None, cfg["rms_norm_eps"]).astype(dtype)
-    if glob:
-        pos = mx.arange(rows) + offset + 1
-        tau = 1 + cfg["log_scaling_alpha"] * mx.log(mx.maximum(pos / cfg["log_scaling_n_floor"], 1))
-        q = (q.astype(mx.float32) * tau[:, None, None]).astype(q.dtype)
-        rel = (rel.astype(mx.float32) * tau[:, None, None]).astype(rel.dtype)
-    prof = rel @ layer.rel_basis.astype(rel.dtype)
-    bound = 4e-3 if dtype == mx.bfloat16 else 5e-4
-    try:
-        got = prep(qp, rp, kc, vc, layer.q_scale, layer.r_scale, layer.rel_basis, offset, glob=glob, cfg=cfg)
-        worst = 0.0
-        for a, b in zip(got, (q, k, v, prof)):
-            d = a.astype(mx.float32) - b.astype(mx.float32)
-            r = mx.sqrt(mx.mean(d * d)) / mx.maximum(mx.sqrt(mx.mean(b.astype(mx.float32) ** 2)), 1e-30)
-            ok = mx.all(mx.isfinite(a.astype(mx.float32)))
-            mx.eval(r, ok)
-            worst = max(worst, float(r.item()) if bool(ok.item()) else float("inf"))
-        reason = None if worst <= bound else "prep_first_use_numbers"
-    except (RuntimeError, ValueError, TypeError):
-        reason = "prep_first_use_error"
-    _prep_checks[spec] = reason
-    return reason
-
-
 # ----------------------------------------------------------------------------------------
 # Which prompts the stage reads. It wins where the attention's share of a chunk grows with the
 # keys, and is level or behind on short prompts, where a chunk's attention is a small part of it
@@ -802,19 +596,20 @@ def select_call(keys):
     return None
 
 
-def stage(layer, q_lin, r_lin, sink, gate_lin, k_conv, v_conv, kv):
-    """The attention of a prompt chunk (more than 32 rows, not a verify panel) from the layer's own
-    projections and convolutions, on our launches: the attention inputs and the bias profile in one
-    launch (:func:`prep`), the cache written as the layer writes it, the attention and its gate in
-    one launch. Returns the gated heads ``(1, rows, heads * 128)`` for the layer's output
-    projection, or ``None`` (counted) where the switch is off or the stage declines (a short
-    prompt, no room, the checks below); the layer then runs its own path."""
+def stage(layer, query, k_rows, v_rows, profiles, sink, kv):
+    """A prompt chunk's cache write and attention (more than 32 rows, not a verify panel) on our
+    launches: the window visit's new window in one launch (:func:`window_update`) or the global
+    visit's bank sized once for the prompt (:func:`reserve_bank`), then the attention in one launch
+    (:func:`flash_attention`). Everything around it is the layer's own: the projections, the clips,
+    value norm and position scale, the profile product, the output gate. Returns the attention
+    ``(1, heads, rows, 128)`` as ``attention.attend`` does, or ``None`` (counted) without touching the
+    cache where the switch is off or the stage declines (a short prompt, no room, the checks below)."""
     from .. import attention as A
 
     if not A.flash_switch_on():
         return None
     visit = "window" if layer.sliding else "full"
-    dtype = q_lin.dtype
+    dtype = query.dtype
     reason = None
     if os.environ.get("MTPLX_INKLING_ATTENTION", "stock") != "stock":
         reason = "attention_mode"
@@ -824,31 +619,23 @@ def stage(layer, q_lin, r_lin, sink, gate_lin, k_conv, v_conv, kv):
         reason = "no_tensor_units"
     elif dtype not in (mx.bfloat16, mx.float16):
         reason = "dtype"
-    elif (q_lin.ndim != 3 or q_lin.shape[0] != 1 or layer.q_scale.shape[-1] != HEAD_DIM
-            or layer.rel_basis.shape[0] != 16 or layer.r_scale.shape != (layer.q_scale.shape[0], 16)):
+    elif query.ndim != 4 or query.shape[0] != 1 or query.shape[3] != HEAD_DIM or k_rows.shape[3] != HEAD_DIM:
         reason = "geometry"
     if reason is None:
-        reason = _select(layer, kv, q_lin.shape[1], dtype)
-    if reason is None:
-        reason = _prep_first_use(layer, dtype, not layer.sliding)
+        reason = _select(layer, kv, query.shape[2], dtype)
     if reason is None:
         reason = A._flash_first_use(dtype, layer.sliding)
     A._note_route(f"prompt_stage.{visit}." + ("selected" if reason is None else "stock." + reason))
     if reason is not None:
         return None
-    cfg = layer.cfg
-    offset = kv.offset
-    q, k, v, prof = prep(q_lin, r_lin, k_conv, v_conv, layer.q_scale, layer.r_scale, layer.rel_basis, offset,
-                         glob=not layer.sliding, cfg=cfg)
-    k_rows, v_rows = k.transpose(0, 2, 1, 3), v.transpose(0, 2, 1, 3)
     if layer.sliding:
         keys, values = window_update(kv, k_rows, v_rows)
         keys, values = kv._temporal_order(keys), kv._temporal_order(values)
     else:
         reserve_bank(kv, k_rows)
         keys, values = kv.update_and_fetch(k_rows, v_rows)
-    window = cfg["sliding_window_size"] if layer.sliding else 0
-    return flash_attention(q.transpose(0, 2, 1, 3), keys, values, prof, sink, window, gate=gate_lin)
+    window = layer.cfg["sliding_window_size"] if layer.sliding else 0
+    return flash_attention(query, keys, values, profiles, sink, window)
 
 
 def _exact_pieces(x, n):

@@ -482,15 +482,6 @@ class Layer(nn.Module):
             (v_lin,) = shared_linear(v_input, [self.v], "value_projection", tape)
         k_conv = self.convs[0](k_lin, conv, 0, k_input, tape)
         v_conv = self.convs[1](v_lin, conv, 1, v_input, tape)
-        if tape is None and q_input.shape[1] > 32:
-            # A prompt chunk's attention on our launches, where it reads faster (fast.prompt_flash.stage:
-            # chosen per prompt, counted): the gated heads, or None for the path below.
-            from .fast.prompt_flash import stage
-
-            gated = stage(self, q_lin, r_lin, sink, gate_lin, k_conv, v_conv, kv)
-            if gated is not None:
-                (out,) = shared_linear(gated, [self.out], "output_projection", tape)
-                return out
         # A prompt chunk's clips, value norm and position scale run as one launch of ours, same bits.
         joined = (
             prompt_glue.heads(self, q_lin, r_lin, k_conv, v_conv, kv.offset)
@@ -513,19 +504,29 @@ class Layer(nn.Module):
                 )
                 q = (q.astype(mx.float32) * tau[:, None, None]).astype(q.dtype)
                 rel = (rel.astype(mx.float32) * tau[:, None, None]).astype(rel.dtype)
-        k, v = kv.update_and_fetch(k.transpose(0, 2, 1, 3), v.transpose(0, 2, 1, 3))
-        if self.sliding:
-            k, v = kv._temporal_order(k), kv._temporal_order(v)
         window = cfg["sliding_window_size"] if self.sliding else 0
-        heads_first = attend(
-            q.transpose(0, 2, 1, 3),
-            k,
-            v,
-            rel @ self.rel_basis.astype(rel.dtype),
-            sink,
-            window,
-            **({"verify": True} if tape is not None else {}),
-        )
+        query, k_rows, v_rows = q.transpose(0, 2, 1, 3), k.transpose(0, 2, 1, 3), v.transpose(0, 2, 1, 3)
+        profiles = rel @ self.rel_basis.astype(rel.dtype)
+        heads_first = None
+        if tape is None and q_input.shape[1] > 32:
+            # A prompt chunk's cache write and attention on our launches where they read faster
+            # (fast.prompt_flash.stage: chosen per prompt, counted); the inputs and the gate stay the layer's.
+            from .fast.prompt_flash import stage
+
+            heads_first = stage(self, query, k_rows, v_rows, profiles, sink, kv)
+        if heads_first is None:
+            k, v = kv.update_and_fetch(k_rows, v_rows)
+            if self.sliding:
+                k, v = kv._temporal_order(k), kv._temporal_order(v)
+            heads_first = attend(
+                query,
+                k,
+                v,
+                profiles,
+                sink,
+                window,
+                **({"verify": True} if tape is not None else {}),
+            )
         # A prompt chunk's output gate runs as one launch of ours reading attend's output in place, same bits.
         gated = prompt_glue.output_gate(heads_first, gate_lin) if tape is None else None
         if gated is None:
