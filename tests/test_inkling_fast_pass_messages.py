@@ -55,13 +55,31 @@ def test_every_visit_equals_its_own_read(rows, prior):
         assert _bits(whole[k], lane), f"visit {k}: differs from lane L1's read at {rows} rows, {prior} prior states"
 
 
+@pytest.fixture
+def engine_module(monkeypatch):
+    """The native engine module named by ``INKLING_TEST_ENGINE`` (the suite drops ``MTPLX_*``
+    variables, so the module path comes in under another name), loaded for this test only."""
+    import os
+
+    from mtplx.engine import runtime
+
+    path = os.environ.get("INKLING_TEST_ENGINE", "").strip()
+    if not path:
+        pytest.skip("INKLING_TEST_ENGINE (the native engine module) not given")
+    monkeypatch.setenv("MTPLX_NATIVE_ENGINE_MODULE", path)
+    if not runtime.available():
+        monkeypatch.setattr(runtime, "_REASON", None)
+        monkeypatch.setattr(runtime, "_NATIVE", None)
+    if not runtime.available():
+        pytest.skip(f"the native engine module does not load: {runtime.unavailable()}")
+    return runtime.native_module()
+
+
 @needs
-def test_rows_are_contiguous_slices_the_read_kernel_takes_whole():
+def test_rows_are_contiguous_slices_the_read_kernel_takes_whole(engine_module):
     from mtplx.engine import runtime
     from mtplx.models.inkling.fast.pass_messages import batched_rows
 
-    if not runtime.available():
-        pytest.skip("the native engine module (it reads an array's layout flags) is not loaded")
     stack, table = _operands(4, 2, 7)
     whole = batched_rows(stack, table)
     mx.eval(whole)

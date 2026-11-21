@@ -21,6 +21,37 @@ def _bits(a, b):
         mx.array_equal(mx.contiguous(a).view(view), mx.contiguous(b).view(view)).item())
 
 
+@pytest.fixture
+def engine_module(monkeypatch):
+    """The native engine module named by ``INKLING_TEST_ENGINE`` (the suite drops ``MTPLX_*``
+    variables, so the module path comes in under another name), loaded for this test only."""
+    import os
+
+    from mtplx.engine import runtime
+
+    path = os.environ.get("INKLING_TEST_ENGINE", "").strip()
+    if not path:
+        pytest.skip("INKLING_TEST_ENGINE (the native engine module) not given")
+    monkeypatch.setenv("MTPLX_NATIVE_ENGINE_MODULE", path)
+    if not runtime.available():
+        monkeypatch.setattr(runtime, "_REASON", None)
+        monkeypatch.setattr(runtime, "_NATIVE", None)
+    if not runtime.available():
+        pytest.skip(f"the native engine module does not load: {runtime.unavailable()}")
+    return runtime.native_module()
+
+
+@needs
+def test_the_library_plan_is_read_from_its_dispatch(engine_module, monkeypatch):
+    from mtplx.models.inkling.fast import nax_reads
+
+    monkeypatch.setattr(nax_reads, "_PLAN", {})
+    found = nax_reads.plan(3, 5, D)
+    assert found is not None, "the library's split-K plan was not read from its dispatch"
+    partitions, size = found
+    assert partitions >= 1 and size % 256 == 0 and partitions * size >= D
+
+
 def _keys(rows, count, seed):
     raw = mx.random.normal((1, rows, count, D), key=mx.random.key(seed)) * (1 + mx.arange(count).reshape(1, 1, -1, 1))
     keys = mx.fast.rms_norm(raw.astype(mx.bfloat16).astype(mx.float32), None, 1e-6)
@@ -124,15 +155,3 @@ def test_float16_keys_keep_the_library(monkeypatch):
     nax_reads.depth_read(queries, keys, lambda: mx.zeros((1, 1, 3, D), mx.float32))
     assert fast_route_counts().get("fallback.nax_reads.depth_dtype", 0) == before + 1
     assert not nax_reads._VERDICT
-
-
-@needs
-def test_the_library_plan_is_read_from_its_dispatch():
-    from mtplx.models.inkling.fast import nax_reads
-
-    nax_reads._PLAN.clear()
-    found = nax_reads.plan(3, 5, D)
-    if found is None:
-        pytest.skip("no native engine in this run (the suite drops MTPLX_* variables)")
-    partitions, size = found
-    assert partitions >= 1 and size % 256 == 0 and partitions * size >= D
