@@ -1,27 +1,26 @@
-"""Decode state of Inkling 2 Mini as rings and banks addressed by one absolute position.
+"""Decode state of Inkling 2 Mini, read in place from the reference cache objects.
 
-Every per-visit state is append-only and addressed by the absolute position of the token
-it belongs to, so a verify panel writes ahead of the committed position and accepting n
-rows is ``pos += n``. Nothing is copied, reordered or rolled back.
+The fast step reads RC6's own trunk cache (per layer visit a ``WindowCache`` or
+``KVCache`` and an ``ArraysCache`` of four convolution tails) as read-only inputs and
+returns the panel's own rows (``VisitDelta``). Nothing writes state during a round. After
+the accept decision ``commit`` writes the accepted rows into those same objects with MLX
+slice updates, which are in place while the decode path owns the arrays exclusively
+(``summary/l0/receipts/bank-append-1.json``). Rejected rows never touch state.
 
-Per layer visit (48 a token):
+Layout the kernels see (``SIGNATURES.md`` section 2), established by ``prepare``:
 
-* window visit (20 layers, window 1,024): ``keys``/``values`` of shape
-  ``(1, kv_heads, RING, head_dim)`` in the activation dtype, ``RING = window + MAX_PANEL``.
-  Position ``p`` lives in slot ``p % RING``.
-* global visit (layers 5, 11, 17, 23): ``keys``/``values`` of shape
-  ``(1, kv_heads, cap, head_dim)``; position ``p`` lives in slot ``p``. ``cap`` is shared by
-  every global visit and grows in large steps (``grow``), never per token.
-* four convolution tap rings ``(1, TAPS, width)`` float32 (key, value, attention output,
-  expert output), ``TAPS = taps - 1 + MAX_PANEL``; the input of position ``p`` lives in
-  slot ``p % TAPS``. Positions before the first token read as zeros.
+* window visit: keys/values ``(1, kv_heads, window, head_dim)`` in the ring's physical
+  order; the row of age ``a`` (0 = newest) sits at slot ``(newest - a) % window``;
+  ``count = min(pos, window)`` rows are valid. A reference ``WindowCache`` stays valid
+  throughout (``_idx`` is the slot after the newest row, ``offset`` the position).
+* global visit: keys/values ``(1, kv_heads, cap, head_dim)``, rows ``0 .. pos-1`` valid;
+  ``cap`` grows in ``BANK_STEP`` buckets at commit, never per token.
+* convolution tails ``(1, taps - 1, width)`` float32, oldest first, zeros before the
+  first token, exactly as the reference keeps them.
 
-``pos`` is a uint32 scalar array, the committed token count. ``length`` mirrors it on the
-host for growth and conversion; only ``commit`` changes either.
-
-The conversions to and from the reference cache objects (``WindowCache``, ``KVCache``,
-``ArraysCache``) are exact, so prefill, the session bank, SSD restore and compaction keep
-working on the reference layout.
+So prefill, the session bank, SSD restore and compaction keep their existing layout and
+code: there is no conversion at the edges, only ``prepare`` after anything that
+rewrote a window cache by concatenation (a prefill chunk).
 """
 
 from __future__ import annotations
@@ -29,213 +28,175 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import mlx.core as mx
-from mlx_lm.models.cache import ArraysCache, KVCache
+from mlx_lm.models.cache import RotatingKVCache
 
-from ..cache import WindowCache
-
-#: Rows one panel may write ahead of the committed position.
+#: Rows one panel may hold.
 MAX_PANEL = 32
-#: Global banks grow in steps of this many slots.
-BANK_STEP = 2048
+#: Global banks grow in steps of this many rows (128 MB of slack at most, 8 global visits).
+BANK_STEP = 4096
 
 
 def round_up(value, step):
     return -(-value // step) * step
 
 
-def _int(pos):
-    return pos.astype(mx.int32)
-
-
-def slots(pos, count, size, offset=0):
-    """Ring slots of positions ``pos + offset .. pos + offset + count - 1``, int32 ``(count,)``.
-
-    ``pos`` is the uint32 position array (or an int). Negative positions wrap like the
-    ring does (``-1`` is the last slot), which is where the zero history before the first
-    token lives.
-    """
-    base = _int(pos) if isinstance(pos, mx.array) else mx.array(pos, mx.int32)
-    return (base + (offset + size) + mx.arange(count, dtype=mx.int32)) % size
-
-
 @dataclass
-class FastState:
-    """The decode state of one stream. Lists are indexed by layer visit."""
+class VisitDelta:
+    """The panel's own rows of one visit, committed (first ``kept``) after the accept."""
 
-    pos: mx.array
-    length: int
-    keys: list
-    values: list
-    taps: list
-    local: tuple
-    window: int
-    ring: int
-    tap_slots: int
-    cap: int
-
-    # ------------------------------------------------------------------ allocation
-    @classmethod
-    def allocate(cls, model, length=0, cap=None, dtype=None):
-        cfg = model.config
-        dtype = dtype or model.embed_tokens.weight.dtype
-        heads, width = cfg["num_key_value_heads"], cfg["head_dim"]
-        window = cfg["sliding_window_size"]
-        size = cfg["sconv_kernel_size"]
-        local = tuple(model.layers[i].sliding for i in model.visit_order)
-        ring = window + MAX_PANEL
-        tap_slots = size - 1 + MAX_PANEL
-        cap = round_up(max(cap or 0, length + MAX_PANEL, 1), BANK_STEP)
-        keys, values, taps = [], [], []
-        for visit, index in enumerate(model.visit_order):
-            slots_ = ring if local[visit] else cap
-            keys.append(mx.zeros((1, heads, slots_, width), dtype))
-            values.append(mx.zeros((1, heads, slots_, width), dtype))
-            taps.append([mx.zeros((1, tap_slots, conv.weight.shape[1]), mx.float32)
-                         for conv in model.layers[index].convs])
-        return cls(mx.array(length, mx.uint32), length, keys, values, taps, local,
-                   window, ring, tap_slots, cap)
-
-    def grow(self, rows):
-        """Make room for a panel of ``rows`` (one allocation per BANK_STEP tokens)."""
-        if rows > MAX_PANEL:
-            raise ValueError(f"A panel holds at most {MAX_PANEL} rows")
-        need = self.length + MAX_PANEL
-        if need <= self.cap:
-            return False
-        cap = round_up(need, BANK_STEP)
-        for visit, local in enumerate(self.local):
-            if local:
-                continue
-            for bank in (self.keys, self.values):
-                old = bank[visit]
-                new = mx.zeros((*old.shape[:2], cap, old.shape[3]), old.dtype)
-                new[:, :, : self.length, :] = old[:, :, : self.length, :]
-                bank[visit] = new
-        self.cap = cap
-        return True
-
-    def commit(self, rows):
-        """Accept the first ``rows`` rows of the last panel: the only state change."""
-        if not 0 <= rows <= MAX_PANEL:
-            raise ValueError("commit takes 0 to MAX_PANEL rows")
-        self.length += rows
-        self.pos = mx.array(self.length, mx.uint32)
+    keys: mx.array  # (1, kv_heads, W, head_dim), the rows the reference would append
+    values: mx.array
+    taps: tuple  # four (1, W, width) float32: key, value, attention and MLP conv inputs
 
     def arrays(self):
-        """Every array of the state, for mx.eval."""
-        return [self.pos, *self.keys, *self.values, *(t for visit in self.taps for t in visit)]
+        return [self.keys, self.values, *self.taps]
 
-    @property
-    def nbytes(self):
-        return sum(a.nbytes for a in self.arrays())
 
-    # ------------------------------------------------------------------ reads
-    def window_positions(self, rows):
-        """First position and count of the keys a reference panel of ``rows`` attends to.
+class DecodeState:
+    """The fast path's view of one stream's trunk cache (2 entries a visit)."""
 
-        This is the chronological key array the reference window cache hands to attention:
-        the last ``window - 1`` committed positions (fewer near the start) and the panel.
-        """
-        first = max(0, self.length - (self.window - 1))
-        return first, self.length - first + rows
-
-    def history_keys(self, visit, rows):
-        """Keys and values in chronological order, as the reference cache returns them.
-
-        Window visits gather from the ring (a copy, as the reference reorder is); global
-        visits return a view of the bank. Host-side shape: the reference attention only.
-        """
-        if self.local[visit]:
-            first, count = self.window_positions(rows)
-            index = slots(first, count, self.ring)
-            return (mx.take(self.keys[visit], index, axis=2),
-                    mx.take(self.values[visit], index, axis=2))
-        end = self.length + rows
-        return self.keys[visit][:, :, :end, :], self.values[visit][:, :, :end, :]
-
-    def tap_history(self, visit, slot, pos=None):
-        """The float32 inputs of the three positions before ``pos``: ``(1, taps - 1, width)``."""
-        ring = self.taps[visit][slot]
-        keep = self.tap_slots - MAX_PANEL
-        return mx.take(ring, slots(self.pos if pos is None else pos, keep, self.tap_slots, -keep), axis=1)
-
-    # ------------------------------------------------------------------ writes
-    def write_kv(self, visit, keys, values, pos=None):
-        """Write a panel's key/value rows ``(1, kv_heads, rows, head_dim)`` at ``pos ..``."""
-        pos = self.pos if pos is None else pos
-        rows = keys.shape[2]
-        if self.local[visit]:
-            index = slots(pos, rows, self.ring)
-            self.keys[visit][:, :, index, :] = keys
-            self.values[visit][:, :, index, :] = values
-        else:
-            start = _int(pos).reshape(1)
-            self.keys[visit] = mx.slice_update(self.keys[visit], keys, start, (2,))
-            self.values[visit] = mx.slice_update(self.values[visit], values, start, (2,))
-
-    def write_taps(self, visit, slot, rows, pos=None):
-        """Write a panel's convolution inputs ``(1, rows, width)`` as float32 at ``pos ..``."""
-        pos = self.pos if pos is None else pos
-        index = slots(pos, rows.shape[1], self.tap_slots)
-        self.taps[visit][slot][:, index, :] = rows.astype(mx.float32)
-
-    # ------------------------------------------------------------------ conversion
-    @classmethod
-    def from_reference(cls, model, cache, cap=None):
-        """Exact copy of the reference trunk cache (2 entries a visit) into the fast layout."""
-        visits = len(model.visit_order)
-        if len(cache) < 2 * visits:
+    def __init__(self, model, cache):
+        self.model = model
+        self.cache = cache
+        cfg = model.config
+        self.window = cfg["sliding_window_size"]
+        self.keep = cfg["sconv_kernel_size"] - 1
+        self.local = tuple(model.layers[i].sliding for i in model.visit_order)
+        self.widths = tuple(
+            tuple(conv.weight.shape[1] for conv in model.layers[i].convs) for i in model.visit_order
+        )
+        self.heads, self.head_dim = cfg["num_key_value_heads"], cfg["head_dim"]
+        self.dtype = model.embed_tokens.weight.dtype
+        if len(cache) < 2 * len(self.local):
             raise ValueError("Inkling needs attention and convolution state for every visit")
-        lengths = {int(cache[2 * v].offset) for v in range(visits)}
+        self.length = self._length()
+        self.pos = mx.array(self.length, mx.uint32)
+
+    def _length(self):
+        lengths = {int(self.cache[2 * v].offset) for v in range(len(self.local))}
         if len(lengths) != 1:
             raise ValueError(f"Visits disagree on the committed length: {sorted(lengths)}")
-        length = lengths.pop()
-        state = cls.allocate(model, length=length, cap=cap)
-        for visit in range(visits):
-            kv, conv = cache[2 * visit], cache[2 * visit + 1]
-            if kv.keys is not None and length:
-                if state.local[visit]:
-                    keys, values = kv._temporal_order(kv.keys), kv._temporal_order(kv.values)
-                    count = min(keys.shape[2], state.window)
-                    keys, values = keys[:, :, -count:, :], values[:, :, -count:, :]
-                    index = slots(length - count, count, state.ring)
-                    state.keys[visit][:, :, index, :] = keys
-                    state.values[visit][:, :, index, :] = values
-                else:
-                    state.keys[visit][:, :, :length, :] = kv.keys[:, :, :length, :]
-                    state.values[visit][:, :, :length, :] = kv.values[:, :, :length, :]
-            for slot in range(len(state.taps[visit])):
-                tail = conv[slot]
-                if tail is None:
-                    continue
-                keep = tail.shape[1]
-                index = slots(length - keep, keep, state.tap_slots)
-                state.taps[visit][slot][:, index, :] = tail.astype(mx.float32)
-        return state
+        return lengths.pop()
 
-    def to_reference(self, model):
-        """The reference trunk cache this state stands for (fresh objects, exact contents)."""
-        cache = []
-        length = self.length
-        for visit in range(len(self.local)):
+    # ------------------------------------------------------------------ prepare
+    def prepare(self):
+        """Put every visit in the fixed layout. Cheap when it already is (every step)."""
+        self.length = self._length()
+        self.pos = mx.array(self.length, mx.uint32)
+        changed = []
+        for visit, local in enumerate(self.local):
+            kv, conv = self.cache[2 * visit], self.cache[2 * visit + 1]
+            if local and not self._is_ring(kv):
+                self._make_ring(kv)
+                changed.append(visit)
+            if not local and kv.keys is None:
+                shape = (1, self.heads, BANK_STEP, self.head_dim)
+                kv.keys, kv.values = mx.zeros(shape, self.dtype), mx.zeros(shape, self.dtype)
+                changed.append(visit)
+            for slot, width in enumerate(self.widths[visit]):
+                if conv[slot] is None:
+                    conv[slot] = mx.zeros((1, self.keep, width), mx.float32)
+        return changed
+
+    def _is_ring(self, kv):
+        if kv.keys is None or kv.keys.shape[2] != self.window or kv.keep:
+            return False
+        if kv.offset >= self.window:
+            return 1 <= kv._idx <= self.window
+        return kv._idx == kv.offset
+
+    def _make_ring(self, kv):
+        """The same chronological rows as a ``window``-row ring (one copy, after prefill)."""
+        shape = (1, self.heads, self.window, self.head_dim)
+        if kv.keys is None:
+            kv.keys, kv.values = mx.zeros(shape, self.dtype), mx.zeros(shape, self.dtype)
+            kv._idx = 0
+            return
+        keys, values = kv._temporal_order(kv.keys), kv._temporal_order(kv.values)
+        count = min(kv.offset, self.window)
+        if keys.shape[2] < count:
+            raise ValueError("window cache holds fewer rows than its position needs")
+        keys, values = keys[:, :, keys.shape[2] - count :], values[:, :, values.shape[2] - count :]
+        if count == self.window:
+            kv.keys, kv.values = mx.contiguous(keys), mx.contiguous(values)
+        else:
+            ring_k, ring_v = mx.zeros(shape, self.dtype), mx.zeros(shape, self.dtype)
+            ring_k[:, :, :count, :] = keys
+            ring_v[:, :, :count, :] = values
+            kv.keys, kv.values = ring_k, ring_v
+        kv._idx = count
+
+    # ------------------------------------------------------------------ reads
+    def window_view(self, visit):
+        """``(keys, values, newest, count)`` of a window visit; integers as uint32 arrays."""
+        kv = self.cache[2 * visit]
+        count = min(self.length, self.window)
+        newest = (kv._idx - 1) % self.window
+        return kv.keys, kv.values, mx.array(newest, mx.uint32), mx.array(count, mx.uint32)
+
+    def global_view(self, visit):
+        """``(keys, values, count)`` of a global visit; the count as a uint32 array."""
+        kv = self.cache[2 * visit]
+        return kv.keys, kv.values, mx.array(self.length, mx.uint32)
+
+    def tail(self, visit, slot):
+        """The three previous float32 inputs of one convolution ``(1, 3, width)``."""
+        return self.cache[2 * visit + 1][slot]
+
+    def history(self, visit, k_rows, v_rows):
+        """Keys and values in chronological order with the panel appended, exactly the
+        arrays the reference cache hands to attention (reference stage B only: host shapes)."""
+        kv = self.cache[2 * visit]
+        if self.local[visit]:
+            count = min(self.length, self.window - 1)
+            index = (mx.arange(count, dtype=mx.int32) + (kv._idx - count)) % self.window
+            keys, values = mx.take(kv.keys, index, axis=2), mx.take(kv.values, index, axis=2)
+        else:
+            keys, values = kv.keys[:, :, : self.length], kv.values[:, :, : self.length]
+        return mx.concatenate([keys, k_rows], axis=2), mx.concatenate([values, v_rows], axis=2)
+
+    # ------------------------------------------------------------------ commit
+    def commit(self, deltas, kept):
+        """Write the first ``kept`` rows of every visit's delta into the cache objects."""
+        if not 0 <= kept <= MAX_PANEL:
+            raise ValueError("commit takes 0 to MAX_PANEL rows")
+        if kept == 0:
+            return
+        end = self.length + kept
+        for visit, delta in enumerate(deltas):
+            kv, conv = self.cache[2 * visit], self.cache[2 * visit + 1]
+            keys, values = delta.keys[:, :, :kept], delta.values[:, :, :kept]
             if self.local[visit]:
-                kv = WindowCache(max_size=self.window)
-                count = min(length, self.window)
-                if count:
-                    index = slots(length - count, count, self.ring)
-                    kv.keys = mx.take(self.keys[visit], index, axis=2)
-                    kv.values = mx.take(self.values[visit], index, axis=2)
-                    kv._idx = count
-                kv.offset = length
+                index = (mx.arange(kept, dtype=mx.int32) + kv._idx) % self.window
+                kv.keys[:, :, index, :] = keys
+                kv.values[:, :, index, :] = values
+                kv._idx = (kv._idx + kept - 1) % self.window + 1
             else:
-                kv = KVCache()
-                if length:
-                    kv.keys = mx.contiguous(self.keys[visit][:, :, :length, :])
-                    kv.values = mx.contiguous(self.values[visit][:, :, :length, :])
-                kv.offset = length
-            conv = ArraysCache(len(self.taps[visit]))
-            if length:
-                for slot in range(len(self.taps[visit])):
-                    conv[slot] = self.tap_history(visit, slot, mx.array(length, mx.uint32))
-            cache.extend((kv, conv))
-        return cache
+                if end > kv.keys.shape[2]:
+                    self._grow(kv, end)
+                kv.keys[:, :, self.length : end, :] = keys
+                kv.values[:, :, self.length : end, :] = values
+            kv.offset = end
+            for slot, rows in enumerate(delta.taps):
+                conv[slot] = mx.concatenate([conv[slot], rows[:, :kept]], axis=1)[:, -self.keep :]
+        self.length = end
+        self.pos = mx.array(end, mx.uint32)
+
+    def _grow(self, kv, end):
+        cap = round_up(end, BANK_STEP)
+        shape = (1, self.heads, cap, self.head_dim)
+        keys, values = mx.zeros(shape, self.dtype), mx.zeros(shape, self.dtype)
+        keys[:, :, : self.length, :] = kv.keys[:, :, : self.length, :]
+        values[:, :, : self.length, :] = kv.values[:, :, : self.length, :]
+        kv.keys, kv.values = keys, values
+
+    def arrays(self):
+        out = []
+        for visit in range(len(self.local)):
+            kv, conv = self.cache[2 * visit], self.cache[2 * visit + 1]
+            out += [kv.keys, kv.values, *conv.cache]
+        return [a for a in out if a is not None]
+
+
+def is_window(kv):
+    return isinstance(kv, RotatingKVCache)
