@@ -2500,7 +2500,9 @@ def test_laguna_opencode_payload_uses_native_tools_and_32k_context(monkeypatch):
     assert payload["output_limit"] == 16_384
     assert payload["tool_prompt_mode"] == "native"
     assert "--tool-prompt-mode native" in payload["server_command"]
-    assert "--context-window 32768" in payload["server_command"]
+    # No window chosen: the real start passes none (the server serves the model's window as far as the Mac's
+    # memory allows and sets the client from it), so the printed command does not pin the starting 32,768.
+    assert "--context-window" not in payload["server_command"]
 
     args.context_window = 65_536
     expanded = public._quickstart_opencode_payload(args, inspection=inspection)
@@ -9402,6 +9404,29 @@ def test_model_contract_depth_clamps_declared_default_to_ceiling():
     assert public._model_contract_depth(inspection, profile=sustained, fallback=3) == 2
 
 
+def test_inkling_launch_depth_ignores_a_stamped_depth(tmp_path):
+    """Inkling's engine prices the draft depth every round, and only at the
+    family's launch depth (server ``_inkling_auto_depth``): a pack stamped by
+    ``forge verify --stamp`` (verify's fastest depth, the deepest verified)
+    must not pin it. Every other family keeps its measured default."""
+    stamp = {"mtp_depth_default": 2, "mtp_depth_max": 2}
+    (tmp_path / "mtplx_runtime.json").write_text(json.dumps(stamp))
+    sustained = public.get_profile("sustained")
+    inkling = {
+        "model_dir": str(tmp_path),
+        "recommended_backend": "inkling2_loop",
+        "mtp_arch": "inkling2-loop",
+        "compatibility": {"runtime_contract": dict(stamp)},
+    }
+    assert public.descriptor_from_inspection(inkling).backend_id == "inkling2_loop"
+    assert public._model_contract_depth(inkling, profile=sustained, fallback=3) == 3
+    other = {
+        "model_dir": str(tmp_path),
+        "compatibility": {"runtime_contract": dict(stamp, public_model_id="some-third-party-artifact")},
+    }
+    assert public._model_contract_depth(other, profile=sustained, fallback=3) == 2
+
+
 def test_qwen36_35b_a3b_defaults_to_measured_best_depth():
     """A3B measured best is D2 (M5 Max tune 145.0 tok/s, 1.54x; the reporter's
     sweep has D2 within 2% of best) while the D3 ceiling loses 9-22%."""
@@ -10357,3 +10382,55 @@ def test_hermes_sync_reads_root_config_only_when_inheriting(monkeypatch, tmp_pat
             public._sync_hermes_profile(**args)
     finally:
         root_config.chmod(0o600)
+
+
+def test_start_dry_run_says_the_server_sets_the_window(monkeypatch, tmp_path, capsys):
+    """The preview tells a user what the start does: the server sets the window when it starts (the model's,
+    as far as this Mac's memory allows) and the client is set from it, never the client's starting value."""
+    monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
+    monkeypatch.setenv("MTPLX_OPENCODE_CONFIG", str(tmp_path / "opencode.json"))
+    monkeypatch.setenv("MTPLX_OPENCODE_DESKTOP_SETTINGS_STORE", str(tmp_path / "default.dat"))
+    code = main(["start", "opencode", "--dry-run", "--json", "--model", "models/example", "--yes"])
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    window = payload["window"]
+    assert window["set_by"] == "server_at_start" and window["tokens"] is None
+    assert window["client_set_from_server"] is True
+    assert f"up to {window['model_maximum']:,} tokens" in window["note"]
+    assert "--context-window" not in payload["opencode"]["server_command"]
+    code = main(["start", "opencode", "--dry-run", "--model", "models/example", "--yes"])
+    assert code == 0
+    assert "window: The server sets the window when it starts" in capsys.readouterr().out
+
+
+
+def test_start_preview_of_a_pack_named_by_its_repository(monkeypatch, tmp_path):
+    """The dry run previews what the start serves when the model is named by its Hugging Face id: the pack on
+    disk when the start would find it, and, for an Inkling 2 Mini pack not downloaded yet, its family's serve
+    defaults (native tools, the tokenizer's template, the model's sampler), never the Qwen lane."""
+    seen = {}
+
+    def gate(path, **kw):
+        seen["gated"] = path
+        return {"model_dir": path, "recommended_backend": "inkling2_loop", "mtp_arch": "inkling2-loop"}, None
+
+    monkeypatch.setattr(public, "_model_gate", gate)
+    pack_dir = tmp_path / "Youssofal--Inkling-2-Mini-MTPLX-Bare-Speed"
+    pack_dir.mkdir()
+    monkeypatch.setattr(public, "_resolve_runtime_model_path", lambda model, **kw: (str(pack_dir), None))
+    args = SimpleNamespace(model="Youssofal/Inkling-2-Mini-MTPLX-Bare-Speed", tool_prompt_mode="hybrid",
+                           chat_template_profile="local_qwen36", temperature=0.6, top_p=0.95, top_k=20,
+                           depth=3, _cli_flags=set(), cache_dir=None)
+    inspection = public._quickstart_apply_local_model_defaults(args, model=args.model)
+    assert seen["gated"] == str(pack_dir) and inspection["model_dir"] == str(pack_dir)
+    assert (args.tool_prompt_mode, args.chat_template_profile) == ("native", "tokenizer")
+    monkeypatch.setattr(public, "_resolve_runtime_model_path",
+                        lambda model, **kw: ("", {"error": "not available locally"}))
+    args = SimpleNamespace(model="Youssofal/Inkling-2-Mini-MTPLX-Bare-Speed", tool_prompt_mode="hybrid",
+                           chat_template_profile="local_qwen36", temperature=0.6, top_p=0.95, top_k=20,
+                           depth=3, _cli_flags=set(), cache_dir=None)
+    inspection = public._quickstart_apply_local_model_defaults(args, model=args.model)
+    assert inspection["recommended_backend"] == "inkling2_loop"
+    assert (args.tool_prompt_mode, args.chat_template_profile, args.temperature) == ("native", "tokenizer", 1.0)
+    other = SimpleNamespace(model="Youssofal/Some-Other-Model", _cli_flags=set(), cache_dir=None)
+    assert public._quickstart_apply_local_model_defaults(other, model=other.model) is None

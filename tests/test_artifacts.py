@@ -3214,6 +3214,12 @@ def test_inspect_reports_vision_capability_from_metadata(tmp_path):
         "capable": False,
     }
 
+    # Newer releases (Inkling 2 Mini) keep the image processor's settings in
+    # processor_config.json; either file completes the vision path.
+    (tmp_path / "processor_config.json").write_text("{}", encoding="utf-8")
+    assert inspect_model(tmp_path).to_dict()["vision"]["capable"] is True
+    (tmp_path / "processor_config.json").unlink()
+
     (tmp_path / "preprocessor_config.json").write_text("{}", encoding="utf-8")
     assert inspect_model(tmp_path).to_dict()["vision"]["capable"] is True
 

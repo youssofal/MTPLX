@@ -13,7 +13,7 @@ from mtplx.cli import build_parser, main
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "apps" / "MTPLXApp" / "Tests" / "Fixtures" / "launch_lane_matrix.json"
-FAMILIES = ("qwen4_exp", "qwen3_8")
+FAMILIES = ll.LANE_FAMILIES
 
 
 # --- the table-driven parity test -------------------------------------------

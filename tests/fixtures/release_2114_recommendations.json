@@ -86,6 +86,7 @@
     "tier": "modern",
     "raw": [
       "bonsai-2-27b-optimized-speed",
+      "inkling2-mini-bare-speed",
       "mimo-v26-qwen-9b-optimized-speed",
       "qwen35-9b-optimized-speed",
       "qwen35-4b-optimized-speed",
@@ -93,6 +94,7 @@
     ],
     "visible": [
       "bonsai-2-27b-optimized-speed",
+      "inkling2-mini-bare-speed",
       "mimo-v26-qwen-9b-optimized-speed",
       "qwen35-9b-optimized-speed",
       "qwen35-4b-optimized-speed",

@@ -22,7 +22,13 @@ dependencies = [
   # Vision is advertised on the base install (app attachments, image_url on
   # the server) and mtplx.vision.processing imports PIL at module load, so
   # Pillow must be a base dependency, not a [server] extra (#103).
-  "pillow>=10",
+  # Exactly the major the vision gates ran on (2.13: 13.0.0 in every Inkling
+  # environment and the reference parity). Pillow 12.3 -> 13 changed the
+  # pixels of images the grid rounding enlarges (Pi's 1500x1420 screenshot:
+  # 5.5% of values, up to 11/255), so pip, Homebrew and the app install the
+  # tested major, and an app runtime on 12.x converges at its next update
+  # (pip upgrades only what fails the requirement), as the MLX pin does.
+  "pillow>=13,<14",
   # 0.32.0 exactness-gated 2026-07-11: byte-identical greedy 128-tok output
   # vs 0.31.3 on Optimized-Speed q4 turbo D3 (same 34 verify calls), and 103
   # kernel/paged-verifier/graphbank/sustained tests green under 0.32.0.

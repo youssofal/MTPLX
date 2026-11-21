@@ -125,4 +125,28 @@ final class InklingLaunchContractTests: XCTestCase {
             XCTAssertEqual(old, new, "regenerate with MTPLX_WRITE_APP_LAUNCH_FIXTURE=1, then run the CLI-side test")
         }
     }
+
+    /// Every folder of an official Inkling pack names one served id, the same one the engine serves
+    /// (default_models._public_model_id_from_name): a download (Youssofal--<repo>), a folder named like
+    /// the repository, the folder the packs were built under, the repository id and the catalog id.
+    /// A derivative folder keeps its own id.
+    func testEveryInklingFolderNamesTheServedID() throws {
+        for id in packs {
+            let option = try XCTUnwrap(MTPLXModelOption.officialCatalog.first { $0.id == id })
+            let served = "mtplx-" + id.replacingOccurrences(of: "inkling2-mini", with: "inkling-2-mini")
+            XCTAssertEqual(option.aliases.first, served)
+            let repo = String(option.hfModelID.split(separator: "/")[1])
+            XCTAssertTrue(repo.hasPrefix("Inkling-2-Mini-MTPLX-"), repo)
+            let built = "MTPLX-Inkling-2-Mini-" + repo.dropFirst("Inkling-2-Mini-MTPLX-".count)
+            for ref in [option.hfModelID, id, "/Users/u/.mtplx/models/Youssofal--\(repo)",
+                        "/Users/u/.mtplx/models/\(repo)", "/Users/u/.mtplx/models/\(built)"] {
+                XCTAssertEqual(OpenCodeIntegration.modelID(for: ref), served, ref)
+                XCTAssertEqual(MTPLXModelOption.option(matching: ref)?.id, id, ref)
+            }
+        }
+        XCTAssertEqual(
+            OpenCodeIntegration.modelID(for: "/Users/u/Models/Inkling-2-Mini-MTPLX-Native-Experts-Quality"),
+            "inkling-2-mini-mtplx-native-experts-quality"
+        )
+    }
 }

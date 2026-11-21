@@ -595,13 +595,18 @@ class ModelInspection:
 
         Capable means all three pieces the vision path needs are present: a
         ``vision_config`` in config.json, vision tower tensors in the weight
-        files, and ``preprocessor_config.json``.
+        files, and the image processor's settings: ``preprocessor_config.json``,
+        or ``processor_config.json``, the file newer releases (Inkling 2 Mini)
+        keep them in.
         """
 
         tensors = sum(
             1 for key in self.weight_keys if key.startswith(_VISION_TENSOR_PREFIXES)
         )
-        preprocessor = bool(self.sidecars.get("preprocessor_config.json"))
+        preprocessor = bool(
+            self.sidecars.get("preprocessor_config.json")
+            or self.sidecars.get("processor_config.json")
+        )
         return {
             "declared": bool(self.vision_declared),
             "tower_tensors": tensors,

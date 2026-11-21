@@ -57,8 +57,9 @@ def test_inkling_trio_follows_each_tiers_first_pick_where_the_plan_admits_it():
         ids = recommended_catalog_ids(memory_gib=ram, chip_tier=MODERN_TIER)
         assert ids[0] == "qwen38-27b-optimized-speed"
         assert ids[1:4] == inkling
-    for ram in (16, 18, 24):
+    for ram in (16, 18):
         assert not set(inkling) & set(recommended_catalog_ids(memory_gib=ram, chip_tier=MODERN_TIER))
+    assert set(inkling) & set(recommended_catalog_ids(memory_gib=24, chip_tier=MODERN_TIER)) == {inkling[0]}
     for ram in (64, 128):
         ids = recommended_catalog_ids(memory_gib=ram, chip_tier=MODERN_TIER)
         assert ids[ids.index("bonsai-2-27b-optimized-speed") + 1 :][:3] == inkling
@@ -67,17 +68,16 @@ def test_inkling_trio_follows_each_tiers_first_pick_where_the_plan_admits_it():
     for model_id in inkling:
         model = catalog_model_with_id(model_id)
         assert model.recommended_tiers == frozenset({MODERN_TIER})
-        assert model.hf_model_id == "Youssofal/MTPLX-" + model.display_name.replace(" ", "-")
+        # The house form of every MTPLX pack repository: <Model>-MTPLX-<Tier>.
+        tier = model.display_name.removeprefix("Inkling 2 Mini ").replace(" ", "-")
+        assert model.hf_model_id == f"Youssofal/Inkling-2-Mini-MTPLX-{tier}"
 
 
 
-def test_the_24_gib_inkling_offer_is_prepared_but_off(monkeypatch):
+def test_the_24_gib_inkling_offer_is_on(monkeypatch):
     import mtplx.model_catalog as catalog
 
-    assert catalog.INKLING_TIGHT_MAC_OFFER is False
-    for ram in (24, 28):
-        assert "inkling2-mini-bare-speed" not in recommended_catalog_ids(memory_gib=ram, chip_tier=MODERN_TIER)
-    monkeypatch.setattr(catalog, "INKLING_TIGHT_MAC_OFFER", True)
+    assert catalog.INKLING_TIGHT_MAC_OFFER is True
     for ram in (24, 28):
         ids = recommended_catalog_ids(memory_gib=ram, chip_tier=MODERN_TIER)
         assert ids[1] == "inkling2-mini-bare-speed"  # directly after the tier's first pick
@@ -85,6 +85,9 @@ def test_the_24_gib_inkling_offer_is_prepared_but_off(monkeypatch):
         assert "inkling2-mini-optimized-speed" not in ids and "inkling2-mini-optimized-quality" not in ids
     assert "inkling2-mini-bare-speed" not in recommended_catalog_ids(memory_gib=18, chip_tier=MODERN_TIER)
     assert "inkling2-mini-bare-speed" not in recommended_catalog_ids(memory_gib=24, chip_tier=LEGACY_TIER)
+    monkeypatch.setattr(catalog, "INKLING_TIGHT_MAC_OFFER", False)
+    for ram in (24, 28):
+        assert "inkling2-mini-bare-speed" not in recommended_catalog_ids(memory_gib=ram, chip_tier=MODERN_TIER)
 
 def test_qwen38_fp16_siblings_mirror_their_parents():
     # Same packs, same peak; only the tier, id suffix and HF repo differ.
@@ -167,6 +170,7 @@ def test_recommended_ids_mirror_app_ram_tiers():
     ]
     assert recommended_catalog_ids(memory_gib=24, chip_tier=MODERN_TIER) == [
         "bonsai-2-27b-optimized-speed",
+        "inkling2-mini-bare-speed",
         "mimo-v26-qwen-9b-optimized-speed",
         "qwen35-9b-optimized-speed",
         "qwen35-4b-optimized-speed",
@@ -279,6 +283,7 @@ def test_recommended_models_filter_by_peak_memory():
     models = recommended_models(memory_gib=24, chip_tier=MODERN_TIER)
     assert [model.id for model in models] == [
         "bonsai-2-27b-optimized-speed",
+        "inkling2-mini-bare-speed",
         "mimo-v26-qwen-9b-optimized-speed",
         "qwen35-9b-optimized-speed",
         "qwen35-4b-optimized-speed",
@@ -661,3 +666,27 @@ def test_readme_model_table_quotes_the_catalog_peak_memory():
         assert abs(float(stated.group("peak")) - peaks[repo]) <= 0.05, (
             f"README peak for {repo} drifted from the catalog"
         )
+
+
+def test_every_inkling_folder_serves_one_id():
+    """A download (Youssofal--<repo>), a folder named like the repository, the folder the packs were built under
+    and the catalog id all serve one id, and the app's twin names the same one; a derivative folder does not."""
+    from mtplx.default_models import public_model_id_for_ref
+
+    for model_id in ("inkling2-mini-bare-speed", "inkling2-mini-optimized-speed", "inkling2-mini-optimized-quality",
+                     "inkling2-mini-bare-speed-fp16", "inkling2-mini-optimized-speed-fp16",
+                     "inkling2-mini-optimized-quality-fp16"):
+        model = catalog_model_with_id(model_id)
+        served = model.aliases[0]
+        repo = model.hf_model_id.split("/")[1]
+        built = "MTPLX-Inkling-2-Mini-" + repo.removeprefix("Inkling-2-Mini-MTPLX-")
+        assert served == "mtplx-" + model_id.replace("inkling2-mini", "inkling-2-mini")
+        for ref in (model.hf_model_id, model_id, f"/Users/u/.mtplx/models/Youssofal--{repo}",
+                    f"/Users/u/.mtplx/models/{repo}", f"/Users/u/Models/mtplx/{built}"):
+            assert public_model_id_for_ref(ref) == served, ref
+            assert catalog_model_matching(ref) is model, ref
+    for derivative in ("/x/Inkling-2-Mini-MTPLX-Native-Experts-Quality", "/x/MTPLX-Inkling-2-Mini-Bare-Speed-V2"):
+        assert public_model_id_for_ref(derivative) not in {"mtplx-inkling-2-mini-bare-speed",
+                                                            "mtplx-inkling-2-mini-optimized-quality"}, derivative
+        assert catalog_model_matching(derivative) is None
+

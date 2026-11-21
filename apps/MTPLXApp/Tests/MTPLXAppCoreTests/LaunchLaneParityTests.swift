@@ -55,6 +55,7 @@ final class LaunchLaneParityTests: XCTestCase {
     private static let modelByFamily = [
         "qwen4_exp": "/models/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed",
         "qwen3_8": "/models/Qwen3.8-27B-MTPLX-Optimized-Speed",
+        "inkling2": "/models/MTPLX-Inkling-2-Mini-Bare-Speed",
     ]
 
     private static let targetByClient: [String: LaunchTarget] = [
@@ -198,7 +199,8 @@ final class LaunchLaneParityTests: XCTestCase {
                 }
             }
         }
-        // 2 families x 10 clients x 3 switch states x 7 seats.
-        XCTAssertEqual(cells, 2 * 10 * 3 * 7)
+        // 3 families (Flash-Next, Qwen 3.8, Inkling 2 Mini) x 10 clients x 3 switch states x 7 seats.
+        XCTAssertEqual(cells, Self.modelByFamily.count * 10 * 3 * 7)
+        XCTAssertEqual(Set(fixture.rows.map(\.family)), Set(Self.modelByFamily.keys))
     }
 }

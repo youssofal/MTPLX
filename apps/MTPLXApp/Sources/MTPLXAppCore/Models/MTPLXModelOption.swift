@@ -1035,12 +1035,14 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
             displayName: "Inkling 2 Mini Bare Speed",
             shortName: "Inkling 2 Mini Bare Speed",
             localizedDetailKey: "Fastest Inkling 2 Mini: 4-bit attention and output, with vision and speculative decoding.",
-            hfModelID: "Youssofal/MTPLX-Inkling-2-Mini-Bare-Speed",
+            hfModelID: "Youssofal/Inkling-2-Mini-MTPLX-Bare-Speed",
             localCandidates: [
                 "~/.mtplx/models/MTPLX-Inkling-2-Mini-Bare-Speed",
                 "~/.mtplx/models/Youssofal--MTPLX-Inkling-2-Mini-Bare-Speed",
+                "~/.mtplx/models/Youssofal--Inkling-2-Mini-MTPLX-Bare-Speed",
+                "~/.mtplx/models/Inkling-2-Mini-MTPLX-Bare-Speed",
             ],
-            aliases: ["mtplx-inkling-2-mini-bare-speed", "Inkling 2 Mini Bare Speed"],
+            aliases: ["mtplx-inkling-2-mini-bare-speed", "Inkling 2 Mini Bare Speed", "MTPLX-Inkling-2-Mini-Bare-Speed", "Inkling-2-Mini-MTPLX-Bare-Speed"],
             sizeBytes: 16_023_243_308,
             peakMemoryGiB: 18.21,
             recommendedFor: [.modernApple]
@@ -1050,12 +1052,14 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
             displayName: "Inkling 2 Mini Optimized Speed",
             shortName: "Inkling 2 Mini Optimized Speed",
             localizedDetailKey: "Closer to the original weights: 8-bit attention, with vision and speculative decoding.",
-            hfModelID: "Youssofal/MTPLX-Inkling-2-Mini-Optimized-Speed",
+            hfModelID: "Youssofal/Inkling-2-Mini-MTPLX-Optimized-Speed",
             localCandidates: [
                 "~/.mtplx/models/MTPLX-Inkling-2-Mini-Optimized-Speed",
                 "~/.mtplx/models/Youssofal--MTPLX-Inkling-2-Mini-Optimized-Speed",
+                "~/.mtplx/models/Youssofal--Inkling-2-Mini-MTPLX-Optimized-Speed",
+                "~/.mtplx/models/Inkling-2-Mini-MTPLX-Optimized-Speed",
             ],
-            aliases: ["mtplx-inkling-2-mini-optimized-speed", "Inkling 2 Mini Optimized Speed"],
+            aliases: ["mtplx-inkling-2-mini-optimized-speed", "Inkling 2 Mini Optimized Speed", "MTPLX-Inkling-2-Mini-Optimized-Speed", "Inkling-2-Mini-MTPLX-Optimized-Speed"],
             sizeBytes: 17_242_658_297,
             peakMemoryGiB: 19.92,
             recommendedFor: [.modernApple]
@@ -1065,12 +1069,14 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
             displayName: "Inkling 2 Mini Optimized Quality",
             shortName: "Inkling 2 Mini Optimized Quality",
             localizedDetailKey: "Original expert and attention weights, with vision and speculative decoding.",
-            hfModelID: "Youssofal/MTPLX-Inkling-2-Mini-Optimized-Quality",
+            hfModelID: "Youssofal/Inkling-2-Mini-MTPLX-Optimized-Quality",
             localCandidates: [
                 "~/.mtplx/models/MTPLX-Inkling-2-Mini-Optimized-Quality",
                 "~/.mtplx/models/Youssofal--MTPLX-Inkling-2-Mini-Optimized-Quality",
+                "~/.mtplx/models/Youssofal--Inkling-2-Mini-MTPLX-Optimized-Quality",
+                "~/.mtplx/models/Inkling-2-Mini-MTPLX-Optimized-Quality",
             ],
-            aliases: ["mtplx-inkling-2-mini-optimized-quality", "Inkling 2 Mini"],
+            aliases: ["mtplx-inkling-2-mini-optimized-quality", "Inkling 2 Mini", "MTPLX-Inkling-2-Mini-Optimized-Quality", "Inkling-2-Mini-MTPLX-Optimized-Quality"],
             sizeBytes: 20_191_646_421,
             peakMemoryGiB: 23.52,
             recommendedFor: [.modernApple]
@@ -1082,12 +1088,14 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
             displayName: "Inkling 2 Mini Bare Speed FP16",
             shortName: "Inkling 2 Mini Bare Speed FP16",
             localizedDetailKey: "Fastest Inkling 2 Mini: 4-bit attention and output, with vision and speculative decoding. FP16 build for M1 and M2 Macs.",
-            hfModelID: "Youssofal/MTPLX-Inkling-2-Mini-Bare-Speed-FP16",
+            hfModelID: "Youssofal/Inkling-2-Mini-MTPLX-Bare-Speed-FP16",
             localCandidates: [
                 "~/.mtplx/models/MTPLX-Inkling-2-Mini-Bare-Speed-FP16",
                 "~/.mtplx/models/Youssofal--MTPLX-Inkling-2-Mini-Bare-Speed-FP16",
+                "~/.mtplx/models/Youssofal--Inkling-2-Mini-MTPLX-Bare-Speed-FP16",
+                "~/.mtplx/models/Inkling-2-Mini-MTPLX-Bare-Speed-FP16",
             ],
-            aliases: ["mtplx-inkling-2-mini-bare-speed-fp16", "Inkling 2 Mini Bare Speed FP16"],
+            aliases: ["mtplx-inkling-2-mini-bare-speed-fp16", "Inkling 2 Mini Bare Speed FP16", "MTPLX-Inkling-2-Mini-Bare-Speed-FP16", "Inkling-2-Mini-MTPLX-Bare-Speed-FP16"],
             sizeBytes: 16_023_246_321,
             peakMemoryGiB: 18.21,
             recommendedFor: [.legacyApple]
@@ -1097,12 +1105,14 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
             displayName: "Inkling 2 Mini Optimized Speed FP16",
             shortName: "Inkling 2 Mini Optimized Speed FP16",
             localizedDetailKey: "Closer to the original weights: 8-bit attention, with vision and speculative decoding. FP16 build for M1 and M2 Macs.",
-            hfModelID: "Youssofal/MTPLX-Inkling-2-Mini-Optimized-Speed-FP16",
+            hfModelID: "Youssofal/Inkling-2-Mini-MTPLX-Optimized-Speed-FP16",
             localCandidates: [
                 "~/.mtplx/models/MTPLX-Inkling-2-Mini-Optimized-Speed-FP16",
                 "~/.mtplx/models/Youssofal--MTPLX-Inkling-2-Mini-Optimized-Speed-FP16",
+                "~/.mtplx/models/Youssofal--Inkling-2-Mini-MTPLX-Optimized-Speed-FP16",
+                "~/.mtplx/models/Inkling-2-Mini-MTPLX-Optimized-Speed-FP16",
             ],
-            aliases: ["mtplx-inkling-2-mini-optimized-speed-fp16", "Inkling 2 Mini Optimized Speed FP16"],
+            aliases: ["mtplx-inkling-2-mini-optimized-speed-fp16", "Inkling 2 Mini Optimized Speed FP16", "MTPLX-Inkling-2-Mini-Optimized-Speed-FP16", "Inkling-2-Mini-MTPLX-Optimized-Speed-FP16"],
             sizeBytes: 17_242_661_312,
             peakMemoryGiB: 19.92,
             recommendedFor: [.legacyApple]
@@ -1112,12 +1122,14 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
             displayName: "Inkling 2 Mini Optimized Quality FP16",
             shortName: "Inkling 2 Mini Optimized Quality FP16",
             localizedDetailKey: "Original expert and attention weights, with vision and speculative decoding. FP16 build for M1 and M2 Macs.",
-            hfModelID: "Youssofal/MTPLX-Inkling-2-Mini-Optimized-Quality-FP16",
+            hfModelID: "Youssofal/Inkling-2-Mini-MTPLX-Optimized-Quality-FP16",
             localCandidates: [
                 "~/.mtplx/models/MTPLX-Inkling-2-Mini-Optimized-Quality-FP16",
                 "~/.mtplx/models/Youssofal--MTPLX-Inkling-2-Mini-Optimized-Quality-FP16",
+                "~/.mtplx/models/Youssofal--Inkling-2-Mini-MTPLX-Optimized-Quality-FP16",
+                "~/.mtplx/models/Inkling-2-Mini-MTPLX-Optimized-Quality-FP16",
             ],
-            aliases: ["mtplx-inkling-2-mini-optimized-quality-fp16", "Inkling 2 Mini Optimized Quality FP16"],
+            aliases: ["mtplx-inkling-2-mini-optimized-quality-fp16", "Inkling 2 Mini Optimized Quality FP16", "MTPLX-Inkling-2-Mini-Optimized-Quality-FP16", "Inkling-2-Mini-MTPLX-Optimized-Quality-FP16"],
             sizeBytes: 20_191_648_443,
             peakMemoryGiB: 23.52,
             recommendedFor: [.legacyApple]
@@ -1282,13 +1294,12 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
     /// fp16 4B siblings exist yet, so the legacy (M1/M2) matrix keeps
     /// its fp16-only entries.
     public static let bonsaiRecommendationMinGiB: Double = 16.0
-    /// Inkling 2 Mini Bare Speed on 24 to 31 GiB Macs, directly after the tier's first pick. The
-    /// memory plan admits it there (12,288 tokens on 24 GiB with the family's measured reserve),
-    /// but in a simulated 24 GiB envelope an image turn and a 4K prompt peaked at 19.44 GiB
-    /// against its 18 GiB engine budget, and 12K tokens leave an agent client little room. Off
-    /// until the founder decides; true is the whole switch. Mirrors
+    /// Inkling 2 Mini Bare Speed on 24 to 31 GiB Macs, directly after the tier's first pick. On
+    /// (21 November): in a simulated 24 GiB envelope the memory plan serves a 32,768-token window,
+    /// a 32,173-token prompt and every follow-up, an image and a tool call, each peak inside the
+    /// 18 GiB engine budget (largest 17.78 GiB), no swap. True is the whole switch. Mirrors
     /// model_catalog.INKLING_TIGHT_MAC_OFFER.
-    public static let inklingTightMacOffer = false
+    public static let inklingTightMacOffer = true
     /// The Inkling 2 Mini FP16 siblings on M1 and M2 Macs (32 GiB and up), where the modern tier
     /// gives the trio. On by the founder's order of 21 November; their FP16 numbers are checked on
     /// an M5 and the M1-M4 rehearsal switch, not yet on an M1 or M2 itself. True is the whole

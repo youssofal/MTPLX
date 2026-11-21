@@ -50,6 +50,9 @@ CLIENTS: tuple[str, ...] = (
 # table never overrides it.
 SAMPLER_OWNING_FAMILIES = frozenset({"qwen3_8", "qwen4_exp", "inkling2"})
 SEATS_GIB: tuple[int, ...] = (16, 24, 36, 48, 64, 96, 128)
+# The families the parity matrix covers: the app, `mtplx start` and bare
+# `mtplx serve` must resolve the same lane for each (Inkling 2 Mini from 2.13).
+LANE_FAMILIES: tuple[str, ...] = ("qwen4_exp", "qwen3_8", "inkling2")
 
 # --- the constants two owners used to disagree on ---------------------------
 
@@ -86,6 +89,13 @@ SSD_SESSION_CACHE_BY_ENTRY: dict[str, dict[str, str]] = {
     "pi": {"app": "off", "start": "on", "serve": "on"},
     "benchmark": {"app": "off", "start": "off", "serve": "off"},
 }
+
+# Families whose SSD session cache is on at every entry point (the benchmark
+# excepted), whatever the client table says: Inkling 2 Mini's first turn after a
+# restart resumes from the bank (Hermes on a restart: 14 of 5,229 tokens read in
+# 0.44 s against 1,206 in 3.07 s without it), and `mtplx start` already ran it on.
+# The app's twin is in MTPLXCommandBuilder's ResolvedDaemonArgs.
+FAMILY_SSD_SESSION_CACHE: dict[str, str] = {"inkling2": "on"}
 
 # (client, choice) pairs allowed to differ between entry points, with why.
 DECLARED_ENTRY_POINT_DIFFERENCES: dict[tuple[str, str], str] = {
@@ -364,7 +374,10 @@ def resolve_launch_lane(
     # SSD session cache.
     by_entry = SSD_SESSION_CACHE_BY_ENTRY.get(client)
     ssd_mode = by_entry[entry_point] if by_entry else base.get("ssd_session_cache", "on")
-    choices["ssd_session_cache"] = _choice(ssd_mode, "default")
+    ssd_source = "default"
+    if family_key in FAMILY_SSD_SESSION_CACHE and client != "benchmark":
+        ssd_mode, ssd_source = FAMILY_SSD_SESSION_CACHE[family_key], "family"
+    choices["ssd_session_cache"] = _choice(ssd_mode, ssd_source)
     choices["ssd_session_cache_max_size"] = _choice(
         SSD_SESSION_CACHE_MAX_SIZE,
         "default",
@@ -464,7 +477,7 @@ def family_owned_sampler_overrides(family: str | None) -> bool:
 
 def lane_matrix(
     *,
-    families: tuple[str, ...] = ("qwen4_exp", "qwen3_8"),
+    families: tuple[str, ...] = LANE_FAMILIES,
     seats_gib: tuple[int, ...] = SEATS_GIB,
     clients: tuple[str, ...] = CLIENTS,
 ) -> list[dict[str, Any]]:
@@ -510,7 +523,7 @@ APP_ARGV_KEYS: tuple[str, ...] = (
 
 def app_parity_fixture(
     *,
-    families: tuple[str, ...] = ("qwen4_exp", "qwen3_8"),
+    families: tuple[str, ...] = LANE_FAMILIES,
     seats_gib: tuple[int, ...] = SEATS_GIB,
     clients: tuple[str, ...] = CLIENTS,
 ) -> dict[str, Any]:

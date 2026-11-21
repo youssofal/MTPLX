@@ -606,6 +606,17 @@ def _ref_name_components(text: str) -> set[str]:
     return components
 
 
+#: Inkling 2 Mini's catalog ids; each pack's first alias is its served id (mtplx-inkling-2-mini-<tier>).
+_INKLING_CATALOG_IDS = (
+    "inkling2-mini-bare-speed",
+    "inkling2-mini-optimized-speed",
+    "inkling2-mini-optimized-quality",
+    "inkling2-mini-bare-speed-fp16",
+    "inkling2-mini-optimized-speed-fp16",
+    "inkling2-mini-optimized-quality-fp16",
+)
+
+
 def _public_model_id_from_name(value: str) -> str | None:
     """Map exact first-party names (public ids, HF repo ids, released
     folder names) to their canonical public ids.
@@ -634,6 +645,16 @@ def _public_model_id_from_name(value: str) -> str | None:
          ("mimo-v26-qwen-9b-optimized-speed",)),
     ):
         names = {public_id, repo_id.lower(), Path(repo_id).name.lower(), *(a.lower() for a in aliases)}
+        if components & names:
+            return public_id
+    for model_id in _INKLING_CATALOG_IDS:
+        # Inkling 2 Mini's six packs: the repository (Youssofal/Inkling-2-Mini-MTPLX-<Tier>), the folder a
+        # download makes (Youssofal--<repo>), the catalog id and the folder name the packs were built under
+        # (MTPLX-Inkling-2-Mini-<Tier>) all serve one id, so a client set up for one finds the others.
+        pack = catalog_model_with_id(model_id)
+        public_id = pack.aliases[0]
+        names = {public_id, pack.id, pack.hf_model_id.lower(), Path(pack.hf_model_id).name.lower(),
+                 *(a.lower() for a in pack.aliases if " " not in a)}
         if components & names:
             return public_id
     if FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID in components:

@@ -503,6 +503,15 @@ public struct OpenCodeIntegration: Sendable {
            ].contains(option.id) {
             return "mtplx-\(option.id)"
         }
+        // Inkling 2 Mini: every folder of an official pack (the repository's name, a download's
+        // Youssofal--<repo>, the folder the packs were built under) serves one id, the pack's first
+        // alias (engine twin: default_models._public_model_id_from_name over _INKLING_CATALOG_IDS).
+        // An exact catalog match, so a derivative folder keeps its own sanitized id.
+        if let option = MTPLXModelOption.option(matching: model),
+           option.id.hasPrefix("inkling2-mini-"),
+           let servedID = option.aliases.first {
+            return servedID
+        }
         let lower = model.lowercased()
         if lower.contains("gemma4") || lower.contains("gemma-4") {
             return "gemma4-mtplx-optimized-speed"

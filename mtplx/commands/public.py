@@ -1046,6 +1046,14 @@ def _model_contract_depth(
         # fallback 0 is the missing-MTP degrade pin (AR mode); artifact
         # metadata must not resurrect a draft depth past it.
         return 0
+    if descriptor_from_inspection(inspection).backend_id == "inkling2_loop":
+        # Inkling prices its draft depth every round from this Mac's measured
+        # round costs, and runs that controller only at the family's launch
+        # depth (server ``_inkling_auto_depth``). A depth stamped into the
+        # pack's mtplx_runtime.json (``forge verify --stamp`` writes verify's
+        # fastest depth and the deepest verified one) would pin the depth
+        # instead, for every user of that pack.
+        return int(fallback)
     contract = _profile_scoped_model_runtime_contract(inspection, profile)
     if not isinstance(contract, dict):
         # A profile mismatch (artifact recommends another profile) hides the
@@ -12868,7 +12876,7 @@ def _quickstart_openwebui_payload(
             f"--profile {_resolved_default_profile_name(args)} "
             f"{_fan_mode_command_suffix(args)}"
             f"{'--no-mtp ' if _generation_mode_from_args(args) == GENERATION_MODE_AR else ''}"
-            f"--context-window {context_window} "
+            f"{_context_window_command_suffix(args, context_window)}"
             f"{_batching_command_suffix(args)} "
             f"{_server_sampler_command_suffix(args, include_draft=True)} "
             f"{_reasoning_command_suffix(args)} "
@@ -12963,7 +12971,7 @@ def _quickstart_pi_payload(
             f"--profile {_resolved_default_profile_name(args)} "
             f"{_fan_mode_command_suffix(args)}"
             f"{'--no-mtp ' if _generation_mode_from_args(args) == GENERATION_MODE_AR else ''}"
-            f"--context-window {context_window} "
+            f"{_context_window_command_suffix(args, context_window)}"
             f"{_batching_command_suffix(args)} "
             f"--default-temperature {pi_temperature} "
             f"--default-top-p {pi_top_p} --top-k {pi_top_k} "
@@ -13057,6 +13065,53 @@ def _model_vision_enabled(model_ref: str) -> bool:
         return vision_spec_for_model_dir(str(resolve_model_path(model_ref))) is not None
     except Exception:
         return False
+
+
+def _context_window_command_suffix(args: Any, context_window: int) -> str:
+    """The window flag of a printed server command: only a window the user chose. Without one the real start
+    passes no window (the server serves the model's window as far as this Mac's memory allows, and each client
+    is set from it before it opens), so the printed command does not pin the client's starting value."""
+    if getattr(args, "context_window", None) is None:
+        return ""
+    return f"--context-window {context_window} "
+
+
+#: Clients `mtplx start` sets from the server's window (``/health`` ``execution_window``) before they open.
+_CLIENTS_SET_FROM_SERVED_WINDOW = frozenset({"pi", "opencode", "claude-code", "codex"})
+
+
+def _start_window_preview(
+    inspection: dict[str, Any] | None, *, args: Any, target: str
+) -> dict[str, Any]:
+    """What a dry run says about the context window: the server sets it when it starts, the model's window
+    as far as this Mac's memory allows; the client's starting value is replaced before it opens."""
+    descriptor = descriptor_from_inspection(inspection)
+    chosen = getattr(args, "context_window", None)
+    maximum = int(descriptor.context_window_policy.maximum)
+    for key in ("model_max_length", "max_position_embeddings", "context_window"):
+        value = inspection.get(key) if isinstance(inspection, dict) else None
+        if isinstance(value, int) and value > 0:
+            maximum = min(maximum, value) if chosen is None else maximum
+            break
+    preview = {
+        "set_by": "you" if chosen is not None else "server_at_start",
+        "tokens": int(chosen) if chosen is not None else None,
+        "model_maximum": maximum,
+        "client_set_from_server": target in _CLIENTS_SET_FROM_SERVED_WINDOW,
+    }
+    if chosen is not None:
+        preview["note"] = f"The server serves the {int(chosen):,}-token window you chose."
+    elif target in _CLIENTS_SET_FROM_SERVED_WINDOW:
+        preview["note"] = (
+            f"The server sets the window when it starts: up to {maximum:,} tokens, as far as this Mac's memory "
+            "allows. The client is set from it before it opens."
+        )
+    else:
+        preview["note"] = (
+            f"The server sets the window when it starts: up to {maximum:,} tokens, as far as this Mac's memory "
+            "allows."
+        )
+    return preview
 
 
 def _inspection_context_window(
@@ -13244,7 +13299,7 @@ def _quickstart_opencode_payload(
             f"{_fan_mode_command_suffix(args)}"
             f"{'--no-mtp ' if generation_mode == GENERATION_MODE_AR else ''}"
             f"{api_key_suffix}"
-            f"--context-window {context_window} "
+            f"{_context_window_command_suffix(args, context_window)}"
             f"{_batching_command_suffix(args)} "
             f"{_adaptive_command_suffix(args)} "
             f"{sampler_suffix}"
@@ -13337,7 +13392,7 @@ def _quickstart_swival_payload(
             f"--profile {_resolved_default_profile_name(args)} "
             f"{_fan_mode_command_suffix(args)}"
             f"{'--no-mtp ' if _generation_mode_from_args(args) == GENERATION_MODE_AR else ''}"
-            f"--context-window {context_window} "
+            f"{_context_window_command_suffix(args, context_window)}"
             f"{_batching_command_suffix(args)} "
             "--no-stats"
         ),
@@ -13416,7 +13471,7 @@ def _quickstart_hermes_payload(
             f"{_fan_mode_command_suffix(args)}"
             f"{'--no-mtp ' if _generation_mode_from_args(args) == GENERATION_MODE_AR else ''}"
             f"{api_key_suffix}"
-            f"--context-window {context_window} "
+            f"{_context_window_command_suffix(args, context_window)}"
             f"--scheduler-mode {str(getattr(args, 'scheduler_mode', 'serial'))} "
             f"--batching-preset {str(getattr(args, 'batching_preset', 'latency'))} "
             f"{_batching_command_suffix(args)} "
@@ -13861,7 +13916,27 @@ def _quickstart_apply_local_model_defaults(
 ) -> dict[str, Any] | None:
     model_path = Path(str(model)).expanduser()
     if not model_path.exists():
-        return None
+        # A Hugging Face id or a catalog name is a pack on disk when the start would find it: preview that pack,
+        # as the start serves it. A pack not downloaded yet is inspected only once it is on disk; until then an
+        # Inkling 2 Mini pack (named by its catalog entry or repository) previews its family's serve defaults.
+        resolved, resolve_error = _resolve_runtime_model_path(
+            str(model), cache_dir=getattr(args, "cache_dir", None), **_model_search_kwargs(args)
+        )
+        if resolve_error is None and Path(resolved).exists():
+            model_path = Path(resolved)
+        else:
+            from mtplx.backends.descriptors import INKLING_DESCRIPTOR
+            from mtplx.model_catalog import catalog_model_matching
+
+            pack = catalog_model_matching(str(model))
+            if pack is None or not pack.id.startswith("inkling2-mini-"):
+                return None
+            inspection = {
+                "recommended_backend": INKLING_DESCRIPTOR.backend_id,
+                "mtp_arch": INKLING_DESCRIPTOR.architecture_id,
+            }
+            _apply_backend_serve_defaults(args, inspection)
+            return inspection
     inspection, gate_exit = _model_gate(
         str(model_path),
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
@@ -15632,6 +15707,7 @@ def cmd_quickstart_public(args: Any) -> int:
             "generation_mode": _generation_mode_from_args(args),
             "max": bool(getattr(args, "max", False)),
             "download_if_missing": download,
+            "window": _start_window_preview(dry_run_inspection, args=args, target=target),
             "default_model_selection": default_selection,
             "terminal_chat": target == "terminal",
             "openwebui": openwebui,
@@ -15693,6 +15769,8 @@ def cmd_quickstart_public(args: Any) -> int:
                 f"generation: {_generation_mode_label(payload['generation_mode'])}"
             )
             _quickstart_line(f"download if missing: {str(download).lower()}")
+            if target != "terminal":
+                _quickstart_line(f"window: {payload['window']['note']}")
             if target == "openwebui":
                 _quickstart_line(
                     f"then: start local server -> open browser chat at {openwebui['chat_url']}"

@@ -1731,6 +1731,576 @@
    "effective_depth": 3,
    "family": "qwen3_8",
    "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": null,
+   "agent_env": false,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "solo",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "chat",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": true,
+   "agent_env": false,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "solo",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "chat",
+   "effective_adaptive_policy": "expected_value",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": false,
+   "agent_env": false,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "solo",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "chat",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": null,
+   "agent_env": false,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "solo",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "openwebui",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": true,
+   "agent_env": false,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "solo",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "openwebui",
+   "effective_adaptive_policy": "expected_value",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": false,
+   "agent_env": false,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "solo",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "openwebui",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": null,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "opencode",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": true,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "opencode",
+   "effective_adaptive_policy": "expected_value",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": false,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "opencode",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": null,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "pi",
+   "effective_adaptive_policy": "expected_value",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": true,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "pi",
+   "effective_adaptive_policy": "expected_value",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": false,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "pi",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": null,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "hermes",
+   "effective_adaptive_policy": "expected_value",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": true,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "hermes",
+   "effective_adaptive_policy": "expected_value",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": false,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "hermes",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": null,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "claude-code",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": true,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "claude-code",
+   "effective_adaptive_policy": "expected_value",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": false,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "claude-code",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": null,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "codex",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": true,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "codex",
+   "effective_adaptive_policy": "expected_value",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": false,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "codex",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": null,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "deepseek-harness",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": true,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "deepseek-harness",
+   "effective_adaptive_policy": "expected_value",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": false,
+   "agent_env": true,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "deepseek-harness",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": null,
+   "agent_env": false,
+   "argv": {
+    "batch_wait_ms": 50,
+    "batching_preset": "agent",
+    "decode_batch_max": 4,
+    "max_active_requests": 4,
+    "scheduler_mode": "ar_batch",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "other",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": true,
+   "agent_env": false,
+   "argv": {
+    "batch_wait_ms": 50,
+    "batching_preset": "agent",
+    "decode_batch_max": 4,
+    "max_active_requests": 4,
+    "scheduler_mode": "ar_batch",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "other",
+   "effective_adaptive_policy": "expected_value",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": false,
+   "agent_env": false,
+   "argv": {
+    "batch_wait_ms": 50,
+    "batching_preset": "agent",
+    "decode_batch_max": 4,
+    "max_active_requests": 4,
+    "scheduler_mode": "ar_batch",
+    "ssd_session_cache": "on",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "other",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": null,
+   "agent_env": false,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "off",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "benchmark",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": true,
+   "agent_env": false,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "off",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "benchmark",
+   "effective_adaptive_policy": "expected_value",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
+  },
+  {
+   "adaptive_depth_switch": false,
+   "agent_env": false,
+   "argv": {
+    "batch_wait_ms": null,
+    "batching_preset": "latency",
+    "decode_batch_max": null,
+    "max_active_requests": null,
+    "scheduler_mode": "serial",
+    "ssd_session_cache": "off",
+    "ssd_session_cache_max_size": "auto",
+    "ssd_session_cache_min_prefix_tokens": 512
+   },
+   "client": "benchmark",
+   "effective_adaptive_policy": "none",
+   "effective_depth": 3,
+   "family": "inkling2",
+   "prefill_chunk_is_a_launch_flag": false
   }
  ],
  "seats_gib": [

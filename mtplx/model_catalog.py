@@ -31,12 +31,13 @@ DOWNLOAD_HEADROOM_GIB = 5.0
 # Bonsai 2 leads from this much RAM; its measured 8K-context peak is 11.80 GiB.
 BONSAI_RECOMMENDATION_MIN_GIB = 16.0
 # Inkling 2 Mini Bare Speed on 24 to 31 GiB Macs, directly after the tier's first
-# pick. The memory plan admits it there (12,288 tokens on 24 GiB with the family's
-# measured reserve), but in a simulated 24 GiB envelope an image turn and a 4K
-# prompt peaked at 19.44 GiB against its 18 GiB engine budget, and 12K tokens
-# leave an agent client little room. Off until the founder decides; True is the
-# whole switch (mirrors MTPLXModelOption.inklingTightMacOffer).
-INKLING_TIGHT_MAC_OFFER = False
+# pick. On (21 November, the lead's RC-B order): in a simulated 24 GiB envelope the
+# memory plan serves a 32,768-token window, a 32,173-token prompt and every
+# follow-up after 4K to 32K conversations, an image and a tool call, each peak
+# inside the 18 GiB engine budget (largest 17.78 GiB), no swap. A read there keeps
+# one restore point instead of two. True is the whole switch (mirrors
+# MTPLXModelOption.inklingTightMacOffer).
+INKLING_TIGHT_MAC_OFFER = True
 # The Inkling 2 Mini FP16 siblings on M1 and M2 Macs (32 GiB and up), in the places the
 # modern tier gives the trio. On by the founder's order of 21 November (M1 and M2 are offered
 # the FP16 packs); their FP16 numbers are checked on an M5 and the M1-M4 rehearsal switch,
@@ -537,31 +538,31 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         id="inkling2-mini-bare-speed",
         display_name="Inkling 2 Mini Bare Speed",
         detail="Fastest Inkling 2 Mini: 4-bit attention and output, with vision and speculative decoding.",
-        hf_model_id="Youssofal/MTPLX-Inkling-2-Mini-Bare-Speed",
+        hf_model_id="Youssofal/Inkling-2-Mini-MTPLX-Bare-Speed",
         size_bytes=16_023_243_308,
         peak_memory_gib=18.21,
         recommended_tiers=frozenset({MODERN_TIER}),
-        aliases=("mtplx-inkling-2-mini-bare-speed", "Inkling 2 Mini Bare Speed"),
+        aliases=("mtplx-inkling-2-mini-bare-speed", "Inkling 2 Mini Bare Speed", "MTPLX-Inkling-2-Mini-Bare-Speed", "Inkling-2-Mini-MTPLX-Bare-Speed"),
     ),
     CatalogModel(
         id="inkling2-mini-optimized-speed",
         display_name="Inkling 2 Mini Optimized Speed",
         detail="Closer to the original weights: 8-bit attention, with vision and speculative decoding.",
-        hf_model_id="Youssofal/MTPLX-Inkling-2-Mini-Optimized-Speed",
+        hf_model_id="Youssofal/Inkling-2-Mini-MTPLX-Optimized-Speed",
         size_bytes=17_242_658_297,
         peak_memory_gib=19.92,
         recommended_tiers=frozenset({MODERN_TIER}),
-        aliases=("mtplx-inkling-2-mini-optimized-speed", "Inkling 2 Mini Optimized Speed"),
+        aliases=("mtplx-inkling-2-mini-optimized-speed", "Inkling 2 Mini Optimized Speed", "MTPLX-Inkling-2-Mini-Optimized-Speed", "Inkling-2-Mini-MTPLX-Optimized-Speed"),
     ),
     CatalogModel(
         id="inkling2-mini-optimized-quality",
         display_name="Inkling 2 Mini Optimized Quality",
         detail="Original expert and attention weights, with vision and speculative decoding.",
-        hf_model_id="Youssofal/MTPLX-Inkling-2-Mini-Optimized-Quality",
+        hf_model_id="Youssofal/Inkling-2-Mini-MTPLX-Optimized-Quality",
         size_bytes=20_191_646_421,
         peak_memory_gib=23.52,
         recommended_tiers=frozenset({MODERN_TIER}),
-        aliases=("mtplx-inkling-2-mini-optimized-quality", "Inkling 2 Mini"),
+        aliases=("mtplx-inkling-2-mini-optimized-quality", "Inkling 2 Mini", "MTPLX-Inkling-2-Mini-Optimized-Quality", "Inkling-2-Mini-MTPLX-Optimized-Quality"),
     ),
     # FP16 siblings for M1 and M2 Macs, which have no native bfloat16: the same packs with every
     # BF16 tensor cast to FP16 (vision tower and drafter included) and every NVFP4 and 4-bit code
@@ -571,31 +572,31 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         id="inkling2-mini-bare-speed-fp16",
         display_name="Inkling 2 Mini Bare Speed FP16",
         detail="Fastest Inkling 2 Mini: 4-bit attention and output, with vision and speculative decoding. FP16 build for M1 and M2 Macs.",
-        hf_model_id="Youssofal/MTPLX-Inkling-2-Mini-Bare-Speed-FP16",
+        hf_model_id="Youssofal/Inkling-2-Mini-MTPLX-Bare-Speed-FP16",
         size_bytes=16_023_246_321,
         peak_memory_gib=18.21,
         recommended_tiers=frozenset({LEGACY_TIER}),
-        aliases=("mtplx-inkling-2-mini-bare-speed-fp16", "Inkling 2 Mini Bare Speed FP16"),
+        aliases=("mtplx-inkling-2-mini-bare-speed-fp16", "Inkling 2 Mini Bare Speed FP16", "MTPLX-Inkling-2-Mini-Bare-Speed-FP16", "Inkling-2-Mini-MTPLX-Bare-Speed-FP16"),
     ),
     CatalogModel(
         id="inkling2-mini-optimized-speed-fp16",
         display_name="Inkling 2 Mini Optimized Speed FP16",
         detail="Closer to the original weights: 8-bit attention, with vision and speculative decoding. FP16 build for M1 and M2 Macs.",
-        hf_model_id="Youssofal/MTPLX-Inkling-2-Mini-Optimized-Speed-FP16",
+        hf_model_id="Youssofal/Inkling-2-Mini-MTPLX-Optimized-Speed-FP16",
         size_bytes=17_242_661_312,
         peak_memory_gib=19.92,
         recommended_tiers=frozenset({LEGACY_TIER}),
-        aliases=("mtplx-inkling-2-mini-optimized-speed-fp16", "Inkling 2 Mini Optimized Speed FP16"),
+        aliases=("mtplx-inkling-2-mini-optimized-speed-fp16", "Inkling 2 Mini Optimized Speed FP16", "MTPLX-Inkling-2-Mini-Optimized-Speed-FP16", "Inkling-2-Mini-MTPLX-Optimized-Speed-FP16"),
     ),
     CatalogModel(
         id="inkling2-mini-optimized-quality-fp16",
         display_name="Inkling 2 Mini Optimized Quality FP16",
         detail="Original expert and attention weights, with vision and speculative decoding. FP16 build for M1 and M2 Macs.",
-        hf_model_id="Youssofal/MTPLX-Inkling-2-Mini-Optimized-Quality-FP16",
+        hf_model_id="Youssofal/Inkling-2-Mini-MTPLX-Optimized-Quality-FP16",
         size_bytes=20_191_648_443,
         peak_memory_gib=23.52,
         recommended_tiers=frozenset({LEGACY_TIER}),
-        aliases=("mtplx-inkling-2-mini-optimized-quality-fp16", "Inkling 2 Mini Optimized Quality FP16"),
+        aliases=("mtplx-inkling-2-mini-optimized-quality-fp16", "Inkling 2 Mini Optimized Quality FP16", "MTPLX-Inkling-2-Mini-Optimized-Quality-FP16", "Inkling-2-Mini-MTPLX-Optimized-Quality-FP16"),
     ),
 )
 
@@ -633,7 +634,7 @@ _MODERN_SMALL_IDS = (
 # pick (founder, 2026-11-21: recommend Bare Speed to 36 GB Macs), Bare Speed,
 # then Optimized Speed, then Optimized Quality; the peak-memory filter drops a
 # pack where it does not fit. From 48 GiB it keeps the family's slot near the
-# end. Below 32 GiB only Bare Speed, behind INKLING_TIGHT_MAC_OFFER (off).
+# end. From 24 to 31 GiB only Bare Speed, behind INKLING_TIGHT_MAC_OFFER (on).
 # Mirrors MTPLXModelOption.inklingIDs.
 _INKLING_IDS = (
     "inkling2-mini-bare-speed",
@@ -750,8 +751,8 @@ def recommended_catalog_ids(
             return small
         bonsai = "bonsai-2-27b-optimized-speed"
         leading = [bonsai, *small] if memory_gib >= BONSAI_RECOMMENDATION_MIN_GIB else [*small, bonsai]
-        # Inkling Bare Speed only behind INKLING_TIGHT_MAC_OFFER (off): a 24 GB Mac's fit is proven
-        # in a simulated envelope only.
+        # Inkling Bare Speed behind INKLING_TIGHT_MAC_OFFER (on): its 32K window on a 24 GB Mac is
+        # served in a simulated envelope.
         inkling = ["inkling2-mini-bare-speed"] if INKLING_TIGHT_MAC_OFFER and memory_gib >= 24 else []
         return [*leading[:1], *inkling, *leading[1:], *tiny_ids]
     if memory_gib < 48:
