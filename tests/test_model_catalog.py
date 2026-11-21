@@ -68,7 +68,9 @@ def test_inkling_trio_follows_each_tiers_first_pick_where_the_plan_admits_it():
     for model_id in inkling:
         model = catalog_model_with_id(model_id)
         assert model.recommended_tiers == frozenset({MODERN_TIER})
-        assert model.hf_model_id == "Youssofal/MTPLX-" + model.display_name.replace(" ", "-")
+        # The house form of every MTPLX pack repository: <Model>-MTPLX-<Tier>.
+        tier = model.display_name.removeprefix("Inkling 2 Mini ").replace(" ", "-")
+        assert model.hf_model_id == f"Youssofal/Inkling-2-Mini-MTPLX-{tier}"
 
 
 
@@ -664,3 +666,27 @@ def test_readme_model_table_quotes_the_catalog_peak_memory():
         assert abs(float(stated.group("peak")) - peaks[repo]) <= 0.05, (
             f"README peak for {repo} drifted from the catalog"
         )
+
+
+def test_every_inkling_folder_serves_one_id():
+    """A download (Youssofal--<repo>), a folder named like the repository, the folder the packs were built under
+    and the catalog id all serve one id, and the app's twin names the same one; a derivative folder does not."""
+    from mtplx.default_models import public_model_id_for_ref
+
+    for model_id in ("inkling2-mini-bare-speed", "inkling2-mini-optimized-speed", "inkling2-mini-optimized-quality",
+                     "inkling2-mini-bare-speed-fp16", "inkling2-mini-optimized-speed-fp16",
+                     "inkling2-mini-optimized-quality-fp16"):
+        model = catalog_model_with_id(model_id)
+        served = model.aliases[0]
+        repo = model.hf_model_id.split("/")[1]
+        built = "MTPLX-Inkling-2-Mini-" + repo.removeprefix("Inkling-2-Mini-MTPLX-")
+        assert served == "mtplx-" + model_id.replace("inkling2-mini", "inkling-2-mini")
+        for ref in (model.hf_model_id, model_id, f"/Users/u/.mtplx/models/Youssofal--{repo}",
+                    f"/Users/u/.mtplx/models/{repo}", f"/Users/u/Models/mtplx/{built}"):
+            assert public_model_id_for_ref(ref) == served, ref
+            assert catalog_model_matching(ref) is model, ref
+    for derivative in ("/x/Inkling-2-Mini-MTPLX-Native-Experts-Quality", "/x/MTPLX-Inkling-2-Mini-Bare-Speed-V2"):
+        assert public_model_id_for_ref(derivative) not in {"mtplx-inkling-2-mini-bare-speed",
+                                                            "mtplx-inkling-2-mini-optimized-quality"}, derivative
+        assert catalog_model_matching(derivative) is None
+

@@ -103,9 +103,9 @@ Hermes need 18 GB or more.
 
 Inkling 2 Mini is a vision and coding model with its own draft head. MTPLX runs its decode step, its draft head and its prompt read on Metal kernels written for it. The app and the CLI offer it on Macs with 32 GB or more. Three packs, each with an FP16 sibling for M1 and M2 that the app and CLI pick automatically, and each with the model's whole vision tower:
 
-- `Youssofal/MTPLX-Inkling-2-Mini-Bare-Speed`: 4-bit attention, output and embedding, NVFP4 experts. 16.0 GB, 18.2 GiB peak. The quickest build, and the first Inkling pick in the app.
-- `Youssofal/MTPLX-Inkling-2-Mini-Optimized-Speed`: 8-bit attention and head, NVFP4 experts. 17.2 GB, 19.9 GiB peak.
-- `Youssofal/MTPLX-Inkling-2-Mini-Optimized-Quality`: the official release byte for byte. 20.2 GB, 23.5 GiB peak.
+- `Youssofal/Inkling-2-Mini-MTPLX-Bare-Speed`: 4-bit attention, output and embedding, NVFP4 experts. 16.0 GB, 18.2 GiB peak. The quickest build, and the first Inkling pick in the app.
+- `Youssofal/Inkling-2-Mini-MTPLX-Optimized-Speed`: 8-bit attention and head, NVFP4 experts. 17.2 GB, 19.9 GiB peak.
+- `Youssofal/Inkling-2-Mini-MTPLX-Optimized-Quality`: the official release byte for byte. 20.2 GB, 23.5 GiB peak.
 
 The window goes up to 1,048,576 tokens, as far as the Mac's memory plan allows. Sampling follows the model's own settings: temperature 1.0 over the whole distribution. Every pack needs MTPLX 2.13 or later.
 
@@ -136,12 +136,12 @@ The catalog lists MTPLX packs under [Youssofal](https://huggingface.co/Youssofal
 | `Qwen3.8-27B-MTPLX-Bare-Speed-FP16` | 32 GB and up, peaks at 20.0 GiB | The Bare Speed pack for M1 and M2: same weights, every 16-bit tensor cast to fp16. | Turbo, depth 3 |
 | `Qwen3.8-27B-MTPLX-Optimized-Speed-FP16` | 32 GB and up, peaks at 25.0 GiB | The recommended coding model for M1 and M2. | Turbo, depth 3 |
 | `Qwen3.8-27B-MTPLX-Optimized-Quality-FP16` | 36 GB and up, peaks at 33.0 GiB | The Optimized Quality pack for M1 and M2. | Turbo, depth 3 |
-| `MTPLX-Inkling-2-Mini-Bare-Speed` | 32 GB and up, peaks at 18.2 GiB | Inkling 2 Mini at its quickest: 4-bit attention, output and embedding, with vision. | Sustained, the engine prices the draft depth each round |
-| `MTPLX-Inkling-2-Mini-Optimized-Speed` | 32 GB and up, peaks at 19.9 GiB | 8-bit attention and head, with vision. | Sustained, the engine prices the draft depth each round |
-| `MTPLX-Inkling-2-Mini-Optimized-Quality` | 32 GB and up, peaks at 23.5 GiB | The official release byte for byte, with vision. | Sustained, the engine prices the draft depth each round |
-| `MTPLX-Inkling-2-Mini-Bare-Speed-FP16` | 32 GB and up, peaks at 18.2 GiB | The Bare Speed pack for M1 and M2: same weights, every 16-bit tensor cast to fp16. | Sustained, the engine prices the draft depth each round |
-| `MTPLX-Inkling-2-Mini-Optimized-Speed-FP16` | 32 GB and up, peaks at 19.9 GiB | The Optimized Speed pack for M1 and M2. | Sustained, the engine prices the draft depth each round |
-| `MTPLX-Inkling-2-Mini-Optimized-Quality-FP16` | 32 GB and up, peaks at 23.5 GiB | The Optimized Quality pack for M1 and M2. | Sustained, the engine prices the draft depth each round |
+| `Inkling-2-Mini-MTPLX-Bare-Speed` | 32 GB and up, peaks at 18.2 GiB | Inkling 2 Mini at its quickest: 4-bit attention, output and embedding, with vision. | Sustained, the engine prices the draft depth each round |
+| `Inkling-2-Mini-MTPLX-Optimized-Speed` | 32 GB and up, peaks at 19.9 GiB | 8-bit attention and head, with vision. | Sustained, the engine prices the draft depth each round |
+| `Inkling-2-Mini-MTPLX-Optimized-Quality` | 32 GB and up, peaks at 23.5 GiB | The official release byte for byte, with vision. | Sustained, the engine prices the draft depth each round |
+| `Inkling-2-Mini-MTPLX-Bare-Speed-FP16` | 32 GB and up, peaks at 18.2 GiB | The Bare Speed pack for M1 and M2: same weights, every 16-bit tensor cast to fp16. | Sustained, the engine prices the draft depth each round |
+| `Inkling-2-Mini-MTPLX-Optimized-Speed-FP16` | 32 GB and up, peaks at 19.9 GiB | The Optimized Speed pack for M1 and M2. | Sustained, the engine prices the draft depth each round |
+| `Inkling-2-Mini-MTPLX-Optimized-Quality-FP16` | 32 GB and up, peaks at 23.5 GiB | The Optimized Quality pack for M1 and M2. | Sustained, the engine prices the draft depth each round |
 | `Qwen3.8-Flash-Next-MTPLX-Bare-Speed` | 96 GB and up, peaks at 78 GiB | The 125B MoE at flat 4-bit, the quickest Flash Next build and the Flash Next pick for 96 GB Macs. Its 32 GB n-gram table streams from SSD. | Turbo, depth 3 |
 | `Qwen3.8-Flash-Next-MTPLX-Optimized-Speed` | 128 GB and up, peaks at 87 GiB | The 125B MoE, dynamic 4-bit with 8-bit attention. Its 32 GB n-gram table streams from SSD. 125.8 tok/s on an OpenCode request on an M5 Max. The first recommendation from 256 GB. | Turbo, depth 3. This family accepts up to depth 5 |
 | `Qwen3.8-Flash-Next-MTPLX-Optimized-Quality` | 256 GB and up, peaks at 136.4 GiB | 8-bit body and MTP head, BF16 structural tensors, 4-bit n-gram table. The highest-fidelity Flash Next build, listed second from 256 GB. | Turbo, depth 3 |
