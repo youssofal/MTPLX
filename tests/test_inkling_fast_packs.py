@@ -88,9 +88,15 @@ def test_a_replayed_step_counts_the_visits_that_take_the_packs_own_product():
         "fallback.a.packed_4bit_q": 2, "fallback.bc_output.packed_6bit": 2, "fallback.d.packed_8bit": 1}
     assert fast_step.stage_fallbacks(model, "bc,e", 4) == {"fallback.bc_output.packed_6bit": 2,
                                                           "fallback.experts.cpu": 5}
-    model.unembed = packed(64, 256, 4)  # a 4-bit head: one row at a time past one row
+    model.unembed = packed(64, 256, 4)  # a 4-bit head: lane L1's row-stable launch takes it
+    assert "fallback.head.packed_rows" not in fast_step.stage_fallbacks(model, "bc", 4)
+    model.unembed = packed(64, 256, 6)  # a stored form the launch does not take: one row at a time
     assert fast_step.stage_fallbacks(model, "bc", 4)["fallback.head.packed_rows"] == 1
     assert "fallback.head.packed_rows" not in fast_step.stage_fallbacks(model, "bc", 1)
+    # A 4-bit output projection runs as the row-stable launch beside the fused output: unfused.
+    model.unembed = dense
+    model.layers[1] = layer(out=packed(64, 256, 4))
+    assert fast_step.stage_fallbacks(model, "bc", 4) == {"unfused.bc_output.packed_4bit": 2}
 
 
 def test_a_packed_product_is_batched_only_where_its_rows_prove_equal_to_one_row():

@@ -190,11 +190,9 @@ def attention_output(layer, h, gate_logits, x, state, visit, panel):
 
 def output_projection(layer, hg, x, state, visit, panel):
     """Stage C from the gated attention result: the output projection by the pack's own
-    product (16-bit or stored codes), the attention convolution and the residual.
-
-    Stored codes are projected one row at a time: MLX sends a 2 to 24 row affine product to a
-    wide kernel whose rows differ from the one-row product on M3 to M5, and the reference at
-    every width is the one-row step (lane L1, q4-check-3.json)."""
+    product (16-bit) or, for stored codes, ``packed_linear`` (MLX sends a 2 to 24 row affine
+    product to a wide kernel whose rows differ from the one-row product on M3 to M5, and the
+    reference at every width is the one-row step), the attention convolution and the residual."""
     attn = packed_linear(hg, layer.out) if isinstance(layer.out, AffineWeight) else ref.linear(hg, layer.out)
     partial = convolution(layer.convs[2], attn, state.tail(visit, 2), panel).astype(mx.float32)
     if not layer.boundary:
@@ -232,10 +230,31 @@ def proven_rows(key, batched, per_row):
     return batched() if verdict else per_row()
 
 
+def launch_serves(weight):
+    """Whether lane L1's row-stable affine launch (``qproduct.affine_product``) takes this stored
+    form (bits, group, scales); its first use per shape on a Mac still proves the rows."""
+    from .qproduct import qmv_constants
+
+    try:
+        qmv_constants(weight)
+    except RuntimeError:
+        return False
+    return True
+
+
 def packed_linear(x, weight):
-    """``x @ weight`` for stored codes, every row equal to the one-row product (``proven_rows``)."""
+    """``x @ weight`` for stored codes, every row equal to the one-row product: lane L1's
+    row-stable launch (one read of the codes for the whole panel, 2 to 32 rows, proven against
+    MLX's one-row product on this Mac's first use of each shape); where it refuses, counted,
+    ``proven_rows`` (MLX's batched product where it is row-stable here, else one row at a time)."""
     if x.shape[1] == 1:
         return ref.linear(x, weight)
+    from .qproduct import affine_product
+
+    try:
+        return affine_product(x, weight)
+    except RuntimeError:
+        count("fallback.packed.row_stable_launch_refused")
     key = ("linear", x.shape[1], tuple(weight.codes.shape), weight.bits, weight.group_size, str(x.dtype))
     return proven_rows(key, lambda: ref.linear(x, weight), lambda: per_row_linear(x, weight))
 
@@ -381,9 +400,14 @@ def stage_fallbacks(model, spec, rows, dtype=None):
             reasons.append(("experts", unserved(layer.experts, rows, dtype)))
         for stage, reason in reasons:
             if reason is not None:
-                key = f"fallback.{stage}.{reason}"
+                # A stored output projection the fused output launch cannot read runs as lane
+                # L1's row-stable launch beside it: unfused, not the stock product.
+                kind = ("unfused" if stage == "bc_output" and isinstance(layer.out, AffineWeight)
+                        and launch_serves(layer.out) else "fallback")
+                key = f"{kind}.{stage}.{reason}"
                 out[key] = out.get(key, 0) + 1
-    if rows > 1 and isinstance(getattr(model, "unembed", None), AffineWeight):
+    unembed = getattr(model, "unembed", None)
+    if rows > 1 and isinstance(unembed, AffineWeight) and not launch_serves(unembed):
         out["fallback.head.packed_rows"] = 1
     return out
 
@@ -403,7 +427,8 @@ def fused_attention(layer, a, x, state, visit, panel):
                       newest, panel.pos, layer.rel_basis, window=layer.sliding)
     reason = output_reason(layer, hg.dtype)
     if reason is not None:
-        count(f"fallback.bc_output.{reason}")
+        kind = "unfused" if isinstance(layer.out, AffineWeight) and launch_serves(layer.out) else "fallback"
+        count(f"{kind}.bc_output.{reason}")
         return output_projection(layer, hg, x, state, visit, panel)
     return panel_output(hg, layer.out, layer.convs[2].weight, state.tail(visit, 2), x,
                         boundary=layer.boundary)
@@ -506,12 +531,29 @@ def row_stable_read(panel, closed, x, queries, eps, normalize):
     return mx.concatenate(parts, axis=1)
 
 
+def affine_head(model, hidden):
+    """``Model.head`` on affine codes with the product as lane L1's row-stable launch: the same
+    cast (to the model's dtype, then float32, as ``vocabulary_logits`` feeds an affine head), the
+    same vocabulary slice and soft cap, so every row equals the one-row head. Raises
+    ``RuntimeError`` where the launch refuses (its first use per shape is proven on this Mac)."""
+    from .qproduct import affine_product
+
+    cap = model.config["final_logit_softcapping"]
+    x = hidden.astype(model.embed_tokens.weight.dtype).astype(mx.float32)
+    logits = affine_product(x, model.unembed)[..., : model.config["unpadded_vocab_size"]]
+    return mx.tanh(logits / cap) * cap if cap else logits
+
+
 def row_stable_head(model, hidden):
     """The vocabulary head of a panel, every row equal to the one-row step's (pieces of at
-    most 8 rows past 8, as ``row_stable_read``; a head stored as affine codes one row at a
-    time, as ``output_projection``, until a row-stable 4-bit head kernel serves it)."""
+    most 8 rows past 8, as ``row_stable_read``; a head stored as affine codes through lane L1's
+    row-stable launch, else one row at a time, counted)."""
     rows = hidden.shape[1]
     if rows > 1 and isinstance(model.unembed, AffineWeight):
+        try:
+            return affine_head(model, hidden)
+        except RuntimeError:
+            pass
         count("fallback.head.packed_rows")
         unembed = model.unembed
         key = ("head", rows, tuple(unembed.codes.shape), unembed.bits, unembed.group_size, str(hidden.dtype))
