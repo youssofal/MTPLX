@@ -37,6 +37,7 @@ from .. import model as ref
 from .. import short_conv
 from ..attention import attend
 from ..projection import stock_messages
+from .routes import count
 from .state import DecodeState, VisitDelta
 
 
@@ -78,6 +79,35 @@ class AttentionInput:
     v_taps: mx.array
 
 
+# --------------------------------------------------------------------------- exact under compile
+# mx.compile fuses chains of elementwise operations into one runtime-compiled kernel. Two of
+# the reference's chains change bits when fused (receipts/fusion-bits-1.json): the sigmoid,
+# whose prebuilt kernel uses the precise exponential while a runtime-compiled one gets the
+# fast one, and the scaled per-head clip. These spellings run the same operations in the same
+# order, so eagerly they give the reference's bits launch for launch, and under compile they
+# keep them: the exponential is called precisely, and the clip's scaled value and its square
+# are materialised before the reduction, exactly where the reference materialises them.
+def _materialize(a):
+    """A fusion boundary that costs no launch: a flat view and back."""
+    return a.reshape(-1).reshape(a.shape)
+
+
+def exact_sigmoid(x):
+    """``mx.sigmoid`` with the prebuilt kernel's arithmetic: 1/(1+exp(|x|)), mirrored for x >= 0."""
+    y = 1 / (1 + mx.exp(mx.abs(x)))
+    return mx.where(x < 0, y, 1 - y)
+
+
+def exact_clip_heads(x, limit, scale=None):
+    """``model.clip_heads`` with its materialisation points kept under compile."""
+    value = x.astype(mx.float32)
+    if scale is not None:
+        value = _materialize(value * scale.astype(mx.float32))
+    norm = mx.sqrt(mx.sum(_materialize(mx.square(value)), axis=-1, keepdims=True))
+    factor = mx.minimum(1.0, limit / (norm + 1e-6))
+    return (value * factor).astype(x.dtype)
+
+
 # --------------------------------------------------------------------------- reference stages
 def convolution(conv, x, tail, panel, drive=None):
     """The reference short convolution on the committed tail (same kernel, proof, bits)."""
@@ -111,17 +141,17 @@ def attention_input(layer, x, closed, message, state, visit, panel):
         ]
     shape = (*q_in.shape[:2], layer.q_scale.shape[0])
     width = layer.q_scale.shape[-1]
-    q = ref.clip_heads(
+    q = exact_clip_heads(
         ref.linear(q_in, layer.q).reshape(*shape, width), cfg["qk_l2_clip_threshold"], layer.q_scale
     )
-    rel = ref.clip_heads(
+    rel = exact_clip_heads(
         ref.linear(q_in, layer.r).reshape(*shape, -1), cfg["rel_l2_clip_threshold"], layer.r_scale
     )
     k_taps = ref.linear(k_in, layer.k)
     v_taps = ref.linear(v_in, layer.v)
     k = convolution(layer.convs[0], k_taps, state.tail(visit, 0), panel, k_in)
     v = convolution(layer.convs[1], v_taps, state.tail(visit, 1), panel, v_in)
-    k = ref.clip_heads(k.reshape(*k.shape[:2], -1, width), cfg["qk_l2_clip_threshold"])
+    k = exact_clip_heads(k.reshape(*k.shape[:2], -1, width), cfg["qk_l2_clip_threshold"])
     v = v.reshape(*v.shape[:2], -1, width)
     if cfg["use_value_norm_no_gamma"]:
         v = ref.norm(v, None, eps).astype(v_in.dtype)
@@ -139,22 +169,38 @@ def attention_input(layer, x, closed, message, state, visit, panel):
     )
 
 
-def attention(layer, a, x, state, visit, panel):
-    """Stage BC (reference). ``(partial (1, W, 2304) float32, attention conv inputs float32)``.
-    ``partial`` is the convolved attention result plus ``x``, or alone on a boundary layer."""
-    keys, values = state.history(visit, a.k_rows, a.v_rows)
+def attention_core(layer, q, profiles, sink, k_rows, v_rows, state, visit, panel):
+    """Stage B (reference half): ``(1, W, 3072)`` attention result in the activation dtype.
+    ``profiles`` is ``rel @ rel_basis``."""
+    keys, values = state.history(visit, k_rows, v_rows)
     window = layer.cfg["sliding_window_size"] if layer.sliding else 0
     h = attend(
-        a.q.transpose(0, 2, 1, 3), keys, values, a.rel @ layer.rel_basis.astype(a.rel.dtype),
-        a.sink, window, **({"verify": True} if panel.tape is not None else {}),
+        q.transpose(0, 2, 1, 3), keys, values, profiles, sink, window,
+        **({"verify": True} if panel.tape is not None else {}),
     )
-    h = h.transpose(0, 2, 1, 3).reshape(h.shape[0], panel.rows, -1)
-    gate = mx.sigmoid(a.gate_logits.astype(mx.float32))
+    return h.transpose(0, 2, 1, 3).reshape(h.shape[0], panel.rows, -1)
+
+
+def attention_output(layer, h, gate_logits, x, state, visit, panel):
+    """Stage C (reference half): ``(partial float32, attention conv inputs float32)``."""
+    gate = exact_sigmoid(gate_logits.astype(mx.float32))
     attn = ref.linear((h.astype(mx.float32) * gate).astype(h.dtype), layer.out)
     partial = convolution(layer.convs[2], attn, state.tail(visit, 2), panel).astype(mx.float32)
     if not layer.boundary:
         partial = partial + x.astype(mx.float32)
     return partial, attn.astype(mx.float32)
+
+
+def relative_profiles(layer, rel):
+    return rel @ layer.rel_basis.astype(rel.dtype)
+
+
+def attention(layer, a, x, state, visit, panel):
+    """Stage BC (reference). ``(partial (1, W, 2304) float32, attention conv inputs float32)``.
+    ``partial`` is the convolved attention result plus ``x``, or alone on a boundary layer."""
+    h = attention_core(layer, a.q, relative_profiles(layer, a.rel), a.sink, a.k_rows, a.v_rows,
+                       state, visit, panel)
+    return attention_output(layer, h, a.gate_logits, x, state, visit, panel)
 
 
 def expert_input(layer, partial, closed, message, panel):
@@ -185,6 +231,68 @@ class Stages:
 
 
 REFERENCE = Stages()
+
+
+# --------------------------------------------------------------------------- lane kernels
+# Drop-ins with the reference stages' arguments and results (SIGNATURES.md section 3). Each is
+# proven against REFERENCE on the goldens and on the model before it is named in a candidate.
+def fused_attention(layer, a, x, state, visit, panel):
+    """Stage BC on lane L2's kernels: attention over the committed history read in place plus
+    the panel's rows, gate, output projection, attention convolution, residual (class A)."""
+    from .attend import attend as panel_attend
+    from .attn_output import attention_output as panel_output
+
+    if layer.sliding:
+        keys, values, newest, valid = state.window_view(visit)
+    else:
+        keys, values, valid = state.global_view(visit)
+        newest = valid
+    hg = panel_attend(a.q, a.rel, a.sink, a.gate_logits, a.k_rows, a.v_rows, keys, values, valid,
+                      newest, panel.pos, layer.rel_basis, window=layer.sliding)
+    return panel_output(hg, layer.out, layer.convs[2].weight, state.tail(visit, 2), x,
+                        boundary=layer.boundary)
+
+
+def fused_attention_input(layer, x, closed, message, state, visit, panel):
+    """Stage A on lane L1's kernels (two launches a visit, three on loop passes 2 and 3)."""
+    from .attn_input import stage_attention_input
+
+    return stage_attention_input(layer, x, closed, message, state, visit, panel)
+
+
+def fused_expert_input(layer, partial, closed, message, panel):
+    """Stage D on lane L1's read kernel (one launch, two on loop passes 2 and 3)."""
+    from .read import stage_expert_input
+
+    return stage_expert_input(layer, partial, closed, message, panel)
+
+
+def fused_experts(layer, source, partial, dtype, state, visit, panel):
+    """Stage E on lane L3's expert block (class A); the reference serves what it declines."""
+    from .experts import expert_visit, unserved
+
+    reason = unserved(layer.experts, panel.rows, dtype)
+    if reason is not None:
+        count(f"fallback.experts.{reason}")
+        return experts(layer, source, partial, dtype, state, visit, panel)
+    return expert_visit(layer, source, partial, state.tail(visit, 3))
+
+
+LANES = {
+    "a": ("attention_input", fused_attention_input),
+    "bc": ("attention", fused_attention),
+    "d": ("expert_input", fused_expert_input),
+    "e": ("experts", fused_experts),
+}
+
+
+def stages_for(spec):
+    """Stages with the named lanes' kernels, from a comma list of a, bc, d, e ('' = reference)."""
+    chosen = {}
+    for name in filter(None, (part.strip().lower() for part in spec.split(","))):
+        field, fn = LANES[name]
+        chosen[field] = fn
+    return Stages(**chosen)
 
 
 # --------------------------------------------------------------------------- one visit, one step
@@ -257,5 +365,5 @@ def decode_panel(model, ids, state, *, embeddings=None, capture_ids=None, stages
     return model.head(hidden), captures, deltas
 
 
-__all__ = ["AttentionInput", "DecodeState", "Message", "Panel", "REFERENCE", "Stages",
-           "decode_hidden", "decode_panel", "visit_step"]
+__all__ = ["AttentionInput", "DecodeState", "LANES", "Message", "Panel", "REFERENCE", "Stages",
+           "decode_hidden", "decode_panel", "stages_for", "visit_step"]
