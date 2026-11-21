@@ -89,6 +89,133 @@ inline float l3_e4m3(uint b) {
 inline float l3_e8m0(uint b) {
     return as_type<float>(b == 0u ? 0x400000u : (b << 23));
 }
+// The same codes without MLX's final power-of-two multiply (x 2^14 for e2m1, x 256 for e4m3).
+// Products of rounded activations and codes are exact in float32, so a sum of such products
+// is exactly 2^-k times MLX's sum; multiplying the sum by 2^k restores MLX's value bit for bit.
+inline float l3_e2m1_raw(uint c) {
+    return float(as_type<half>(ushort(((c & 7u) << 9) | ((c & 8u) << 12))));
+}
+inline float l3_e4m3_raw(uint b) {
+    return float(as_type<half>(ushort(((b & 127u) << 7) | ((b & 128u) << 8))));
+}
+
+// Gate-up dot products of NM member rows with R consecutive w13 rows (gather_qmv lane slices).
+template <int NM, int R, bool NV4>
+inline void l3_gate_up_dots(const device uint* wexp, const device uchar* sexp, const device float* values,
+                            threadgroup const uint* rows_of, uint m0, uint nb, uint lane,
+                            threadgroup const float2* lut2, threadgroup const float* lut1,
+                            threadgroup const float* slut, thread float (&out)[4][R]) {
+    const device float* xm[NM];
+    for (int m = 0; m < NM; ++m) xm[m] = values + rows_of[m0 + m] * 2304 + 8 * lane;
+    float res[NM][R];
+    for (int m = 0; m < NM; ++m)
+        for (int q = 0; q < R; ++q) res[m][q] = 0.0f;
+    for (uint b = 0; b < 9; ++b) {
+        float xv[NM][8];
+        for (int m = 0; m < NM; ++m) {
+            const float4 a = *(const device float4*)(xm[m] + 256 * b);
+            const float4 c = *(const device float4*)(xm[m] + 256 * b + 4);
+            xv[m][0] = a.x; xv[m][1] = a.y; xv[m][2] = a.z; xv[m][3] = a.w;
+            xv[m][4] = c.x; xv[m][5] = c.y; xv[m][6] = c.z; xv[m][7] = c.w;
+        }
+        for (int q = 0; q < R; ++q) {
+            const uint n = nb + q;
+            if (NV4) {
+                const uint word = wexp[n * 288 + 32 * b + lane];
+                const float s = slut[sexp[n * 144 + 16 * b + lane / 2]];
+                const float2 w01 = lut2[word & 255u];
+                const float2 w23 = lut2[(word >> 8) & 255u];
+                const float2 w45 = lut2[(word >> 16) & 255u];
+                const float2 w67 = lut2[word >> 24];
+                for (int m = 0; m < NM; ++m) {
+                    float accum = 0;
+                    accum += (xv[m][0] * w01.x + xv[m][1] * w01.y + xv[m][2] * w23.x + xv[m][3] * w23.y);
+                    accum += (xv[m][4] * w45.x + xv[m][5] * w45.y + xv[m][6] * w67.x + xv[m][7] * w67.y);
+                    const float full = accum * 16384.0f;
+                    const float tt = s * full;
+                    res[m][q] = res[m][q] + tt;
+                }
+            } else {
+                const uint w0 = wexp[n * 576 + 64 * b + 2 * lane];
+                const uint w1 = wexp[n * 576 + 64 * b + 2 * lane + 1];
+                const float s = slut[sexp[n * 72 + 8 * b + lane / 4]];
+                float wv[8];
+                wv[0] = lut1[w0 & 255u]; wv[1] = lut1[(w0 >> 8) & 255u];
+                wv[2] = lut1[(w0 >> 16) & 255u]; wv[3] = lut1[w0 >> 24];
+                wv[4] = lut1[w1 & 255u]; wv[5] = lut1[(w1 >> 8) & 255u];
+                wv[6] = lut1[(w1 >> 16) & 255u]; wv[7] = lut1[w1 >> 24];
+                for (int m = 0; m < NM; ++m) {
+                    float accum = 0;
+                    for (int i = 0; i < 8; ++i) accum += xv[m][i] * wv[i];
+                    const float full = accum * 256.0f;
+                    const float tt = s * full;
+                    res[m][q] = res[m][q] + tt;
+                }
+            }
+        }
+    }
+    for (int m = 0; m < NM; ++m)
+        for (int q = 0; q < R; ++q) out[m][q] = simd_sum(res[m][q]);
+}
+
+// Down dot products of NM member inputs (lane-major in threadgroup memory) with R w2 rows.
+template <int NM, int R, bool NV4>
+inline void l3_down_dots(const device uint* wexp, const device uchar* sexp, threadgroup const float* xs,
+                         uint nb, uint lane, threadgroup const float2* lut2, threadgroup const float* lut1,
+                         threadgroup const float* slut, thread float (&out)[4][R]) {
+    float res[NM][R];
+    for (int m = 0; m < NM; ++m)
+        for (int q = 0; q < R; ++q) res[m][q] = 0.0f;
+    if (NV4) {
+        for (uint b = 0; b < 5; ++b) {
+            if (b == 4 && lane >= 16) break;
+            float xv[NM][8];
+            for (int m = 0; m < NM; ++m)
+                for (int v = 0; v < 8; ++v) xv[m][v] = xs[m * 1280 + (b * 8 + v) * 32 + lane];
+            for (int q = 0; q < R; ++q) {
+                const uint n = nb + q;
+                const uint word = wexp[n * 144 + 32 * b + lane];
+                const float s = slut[sexp[n * 72 + 16 * b + lane / 2]];
+                const float2 w01 = lut2[word & 255u];
+                const float2 w23 = lut2[(word >> 8) & 255u];
+                const float2 w45 = lut2[(word >> 16) & 255u];
+                const float2 w67 = lut2[word >> 24];
+                for (int m = 0; m < NM; ++m) {
+                    float accum = 0;
+                    accum += (xv[m][0] * w01.x + xv[m][1] * w01.y + xv[m][2] * w23.x + xv[m][3] * w23.y);
+                    accum += (xv[m][4] * w45.x + xv[m][5] * w45.y + xv[m][6] * w67.x + xv[m][7] * w67.y);
+                    const float full = accum * 16384.0f;
+                    const float tt = s * full;
+                    res[m][q] = res[m][q] + tt;
+                }
+            }
+        }
+    } else {
+        for (uint b = 0; b < 9; ++b) {
+            float xv[NM][4];
+            for (int m = 0; m < NM; ++m)
+                for (int v = 0; v < 4; ++v) xv[m][v] = xs[m * 1280 + (b * 4 + v) * 32 + lane];
+            for (int q = 0; q < R; ++q) {
+                const uint n = nb + q;
+                const uint word = wexp[n * 288 + 32 * b + lane];
+                const float s = slut[sexp[n * 36 + 4 * b + lane / 8]];
+                float wv[4];
+                wv[0] = lut1[word & 255u]; wv[1] = lut1[(word >> 8) & 255u];
+                wv[2] = lut1[(word >> 16) & 255u]; wv[3] = lut1[word >> 24];
+                for (int m = 0; m < NM; ++m) {
+                    float accum = 0;
+                    for (int i = 0; i < 4; ++i) accum += xv[m][i] * wv[i];
+                    const float full = accum * 256.0f;
+                    const float tt = s * full;
+                    res[m][q] = res[m][q] + tt;
+                }
+            }
+        }
+    }
+    for (int m = 0; m < NM; ++m)
+        for (int q = 0; q < R; ++q) out[m][q] = simd_sum(res[m][q]);
+}
+
 // RC6's fused route (expert_fusion ROUTE, fused variant) for one row on one simdgroup.
 // Lanes 0..K-1 return the k-th chosen expert and its scaled probability.
 inline void l3_route_row(const device float* z, const device float* bias, float scale,
@@ -305,6 +432,20 @@ GATE_UP = """
     const uint tid = thread_position_in_threadgroup.x;
     const uint lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
+    threadgroup float2 lut2[256];
+    threadgroup float lut1[256];
+    threadgroup float slut[256];
+    for (uint i = tid; i < 256u; i += NT) {
+#if FP4
+        lut2[i] = float2(l3_e2m1_raw(i & 15u), l3_e2m1_raw(i >> 4));
+        lut1[i] = 0.0f;
+        slut[i] = l3_e4m3(i);
+#else
+        lut2[i] = float2(0.0f);
+        lut1[i] = l3_e4m3_raw(i);
+        slut[i] = l3_e8m0(i);
+#endif
+    }
     threadgroup uint pe[W * 8];
     threadgroup float pp[W * 8];
     for (uint r = sg; r < uint(W); r += S) {
@@ -336,58 +477,22 @@ GATE_UP = """
     threadgroup uint tnan[S * MC];
     for (uint m0 = 0; m0 < M; m0 += MC) {
         const uint mc = min(uint(MC), M - m0);
-        const device float* xm[MC];
-        for (uint m = 0; m < MC; ++m) xm[m] = values + pl_row[m0 + min(m, mc - 1)] * 2304 + 8 * lane;
         float pk[MC];
         bool pn[MC];
         for (uint m = 0; m < MC; ++m) { pk[m] = 0.0f; pn[m] = false; }
         for (uint rb = 0; rb < RS; rb += R) {
             const uint nb = n_sg + rb;
-            float res[MC][R];
-            for (uint m = 0; m < MC; ++m)
+            float res[4][R];
+            for (uint m = 0; m < 4; ++m)
                 for (uint q = 0; q < R; ++q) res[m][q] = 0.0f;
-            for (uint b = 0; b < 9; ++b) {
-                float xv[MC][8];
-                for (uint m = 0; m < MC; ++m) {
-                    const float4 a = *(const device float4*)(xm[m] + 256 * b);
-                    const float4 c = *(const device float4*)(xm[m] + 256 * b + 4);
-                    xv[m][0] = a.x; xv[m][1] = a.y; xv[m][2] = a.z; xv[m][3] = a.w;
-                    xv[m][4] = c.x; xv[m][5] = c.y; xv[m][6] = c.z; xv[m][7] = c.w;
-                }
-                for (uint q = 0; q < R; ++q) {
-                    const uint n = nb + q;
-#if FP4
-                    const uint word = wexp[n * CW + 32 * b + lane];
-                    const float s = l3_e4m3(sexp[n * SW + 16 * b + lane / 2]);
-                    float wv[8];
-                    for (uint i = 0; i < 8; ++i) wv[i] = l3_e2m1(word >> (4 * i));
-                    for (uint m = 0; m < MC; ++m) {
-                        float accum = 0;
-                        accum += (xv[m][0] * wv[0] + xv[m][1] * wv[1] + xv[m][2] * wv[2] + xv[m][3] * wv[3]);
-                        accum += (xv[m][4] * wv[4] + xv[m][5] * wv[5] + xv[m][6] * wv[6] + xv[m][7] * wv[7]);
-                        const float tt = s * accum;
-                        res[m][q] = res[m][q] + tt;
-                    }
-#else
-                    const uint w0 = wexp[n * CW + 64 * b + 2 * lane];
-                    const uint w1 = wexp[n * CW + 64 * b + 2 * lane + 1];
-                    const float s = l3_e8m0(sexp[n * SW + 8 * b + lane / 4]);
-                    float wv[8];
-                    for (uint i = 0; i < 4; ++i) {
-                        wv[i] = l3_e4m3((w0 >> (8 * i)) & 255u);
-                        wv[4 + i] = l3_e4m3((w1 >> (8 * i)) & 255u);
-                    }
-                    for (uint m = 0; m < MC; ++m) {
-                        float accum = 0;
-                        for (uint i = 0; i < 8; ++i) accum += xv[m][i] * wv[i];
-                        const float tt = s * accum;
-                        res[m][q] = res[m][q] + tt;
-                    }
-#endif
-                }
-            }
-            for (uint m = 0; m < MC; ++m)
-                for (uint q = 0; q < R; ++q) res[m][q] = simd_sum(res[m][q]);
+            if (mc == 1)
+                l3_gate_up_dots<1, R, bool(FP4)>(wexp, sexp, values, pl_row, m0, nb, lane, lut2, lut1, slut, res);
+            else if (W >= 2 && mc == 2)
+                l3_gate_up_dots<2, R, bool(FP4)>(wexp, sexp, values, pl_row, m0, nb, lane, lut2, lut1, slut, res);
+            else if (W >= 3 && mc == 3)
+                l3_gate_up_dots<3, R, bool(FP4)>(wexp, sexp, values, pl_row, m0, nb, lane, lut2, lut1, slut, res);
+            else if (W >= 4)
+                l3_gate_up_dots<4, R, bool(FP4)>(wexp, sexp, values, pl_row, m0, nb, lane, lut2, lut1, slut, res);
             // Capped SwiGLU (RC6 SWIGLU statements); lane m * R/2 + jj takes member m, mid nb/2 + jj.
             float graw = 0, uraw = 0;
             uint mine = 0;
@@ -456,6 +561,20 @@ DOWN = """
     const uint tid = thread_position_in_threadgroup.x;
     const uint lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
+    threadgroup float2 lut2[256];
+    threadgroup float lut1[256];
+    threadgroup float slut[256];
+    for (uint i = tid; i < 256u; i += NT) {
+#if FP4
+        lut2[i] = float2(l3_e2m1_raw(i & 15u), l3_e2m1_raw(i >> 4));
+        lut1[i] = 0.0f;
+        slut[i] = l3_e4m3(i);
+#else
+        lut2[i] = float2(0.0f);
+        lut1[i] = l3_e4m3_raw(i);
+        slut[i] = l3_e8m0(i);
+#endif
+    }
 #define PAIR_EXPERT(i) experts_in[(i)]
 """ + _PLAN + """
 #undef PAIR_EXPERT
@@ -507,55 +626,20 @@ DOWN = """
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint rb = 0; rb < RS; rb += R) {
             const uint nb = n_sg + rb;
-            float res[MC][R];
-            for (uint m = 0; m < MC; ++m)
+            float res[4][R];
+            for (uint m = 0; m < 4; ++m)
                 for (uint q = 0; q < R; ++q) res[m][q] = 0.0f;
-#if FP4
-            for (uint b = 0; b < 5; ++b) {
-                if (b == 4 && lane >= 16) break;
-                float xv[MC][8];
-                for (uint m = 0; m < MC; ++m)
-                    for (uint v = 0; v < 8; ++v) xv[m][v] = xs[m * 1280 + (b * 8 + v) * 32 + lane];
-                for (uint q = 0; q < R; ++q) {
-                    const uint n = nb + q;
-                    const uint word = wexp[n * CW + 32 * b + lane];
-                    const float s = l3_e4m3(sexp[n * SW + 16 * b + lane / 2]);
-                    float wv[8];
-                    for (uint i = 0; i < 8; ++i) wv[i] = l3_e2m1(word >> (4 * i));
-                    for (uint m = 0; m < MC; ++m) {
-                        float accum = 0;
-                        accum += (xv[m][0] * wv[0] + xv[m][1] * wv[1] + xv[m][2] * wv[2] + xv[m][3] * wv[3]);
-                        accum += (xv[m][4] * wv[4] + xv[m][5] * wv[5] + xv[m][6] * wv[6] + xv[m][7] * wv[7]);
-                        const float tt = s * accum;
-                        res[m][q] = res[m][q] + tt;
-                    }
-                }
-            }
-#else
-            for (uint b = 0; b < 9; ++b) {
-                float xv[MC][4];
-                for (uint m = 0; m < MC; ++m)
-                    for (uint v = 0; v < 4; ++v) xv[m][v] = xs[m * 1280 + (b * 4 + v) * 32 + lane];
-                for (uint q = 0; q < R; ++q) {
-                    const uint n = nb + q;
-                    const uint word = wexp[n * CW + 32 * b + lane];
-                    const float s = l3_e8m0(sexp[n * SW + 4 * b + lane / 8]);
-                    float wv[4];
-                    for (uint i = 0; i < 4; ++i) wv[i] = l3_e4m3((word >> (8 * i)) & 255u);
-                    for (uint m = 0; m < MC; ++m) {
-                        float accum = 0;
-                        for (uint i = 0; i < 4; ++i) accum += xv[m][i] * wv[i];
-                        const float tt = s * accum;
-                        res[m][q] = res[m][q] + tt;
-                    }
-                }
-            }
-#endif
+            if (mc == 1)
+                l3_down_dots<1, R, bool(FP4)>(wexp, sexp, xs, nb, lane, lut2, lut1, slut, res);
+            else if (W >= 2 && mc == 2)
+                l3_down_dots<2, R, bool(FP4)>(wexp, sexp, xs, nb, lane, lut2, lut1, slut, res);
+            else if (W >= 3 && mc == 3)
+                l3_down_dots<3, R, bool(FP4)>(wexp, sexp, xs, nb, lane, lut2, lut1, slut, res);
+            else if (W >= 4)
+                l3_down_dots<4, R, bool(FP4)>(wexp, sexp, xs, nb, lane, lut2, lut1, slut, res);
             for (uint m = 0; m < MC; ++m)
-                for (uint q = 0; q < R; ++q) {
-                    const float total = simd_sum(res[m][q]);
-                    if (lane == q && m < mc) raw[pl_pair[m0 + m] * 2304 + nb + q] = total;
-                }
+                for (uint q = 0; q < R; ++q)
+                    if (lane == q && m < mc) raw[pl_pair[m0 + m] * 2304 + nb + q] = res[m][q];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -687,13 +771,18 @@ def _member_chunk(rows):
     return 1 if rows == 1 else 2 if rows <= 2 else 4
 
 
-def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *, eps, conv_form=0, trace=None):
+DEFAULT_TILES = {"gu_tile": TILE_GATE_UP, "gu_s": 4, "gu_r": 8, "dn_tile": TILE_DOWN, "dn_s": 4, "dn_r": 8}
+
+
+def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *, eps, conv_form=0, trace=None,
+                       tiles=None):
     """Four launches. Shapes: source/partial (1, W, 2304) float32, tail (1, 3, 2304) float32.
 
     Returns (out bf16 (1, W, 2304), conv_rows float32 (1, W, 2304)).
     """
     rows = source.shape[-2]
     fp4 = block.gate_up.mode == "nvfp4"
+    tl = DEFAULT_TILES if tiles is None else {**DEFAULT_TILES, **tiles}
     src = source.reshape(rows, HIDDEN)
     part = partial.reshape(rows, HIDDEN)
     mc = _member_chunk(rows)
@@ -709,14 +798,14 @@ def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *
 
     gu = block.gate_up
     cw13, sw13 = (HIDDEN // 8, HIDDEN // 16) if fp4 else (HIDDEN // 4, HIDDEN // 32)
-    s_gu, r_gu = 4, 8
+    s_gu, r_gu, tile_gu = tl["gu_s"], tl["gu_r"], tl["gu_tile"]
     slots = min(TOP_K * rows, EXPERTS)
-    ntile13 = 2 * MIDDLE // TILE_GATE_UP
+    ntile13 = 2 * MIDDLE // tile_gu
     caps = (("GATE_CAP", expert_fusion.mlx_literal(block.gate_cap)), ("UP_CAP", expert_fusion.mlx_literal(block.up_cap)))
     h, peaks, experts, prob = _kernel("gate_up", fp4, caps)(
         inputs=[logits, block.bias, _route_consts(float(block.scale)), values,
                 *([outer[0]] if fp4 else []), gu.codes, gu.scales, *([gu.outer] if fp4 else [])],
-        template=[*common, ("T", mx.bfloat16), ("S", s_gu), ("NT", 32 * s_gu), ("TILE", TILE_GATE_UP),
+        template=[*common, ("T", mx.bfloat16), ("S", s_gu), ("NT", 32 * s_gu), ("TILE", tile_gu),
                   ("R", r_gu), ("MC", mc), ("CW", cw13), ("SW", sw13), ("NTILE", ntile13)],
         grid=(ntile13 * 32 * s_gu, slots, 1), threadgroup=(32 * s_gu, 1, 1),
         output_shapes=[(rows * TOP_K, MIDDLE), (rows * TOP_K, ntile13), (rows * TOP_K,), (rows * TOP_K,)],
@@ -725,11 +814,11 @@ def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *
 
     dn = block.down
     cw2, sw2 = (MIDDLE // 8, MIDDLE // 16) if fp4 else (MIDDLE // 4, MIDDLE // 32)
-    s_dn, r_dn = 4, 8
-    ntile2 = HIDDEN // TILE_DOWN
+    s_dn, r_dn, tile_dn = tl["dn_s"], tl["dn_r"], tl["dn_tile"]
+    ntile2 = HIDDEN // tile_dn
     raw, *mid_outer = _kernel("down", fp4)(
         inputs=[experts, h, peaks, dn.codes, dn.scales],
-        template=[*common, ("S", s_dn), ("NT", 32 * s_dn), ("TILE", TILE_DOWN), ("R", r_dn), ("MC", mc),
+        template=[*common, ("S", s_dn), ("NT", 32 * s_dn), ("TILE", tile_dn), ("R", r_dn), ("MC", mc),
                   ("CW", cw2), ("SW", sw2), ("NTILE13", ntile13)],
         grid=(ntile2 * 32 * s_dn, slots, 1), threadgroup=(32 * s_dn, 1, 1),
         output_shapes=[(rows * TOP_K, HIDDEN), *([(rows * TOP_K,)] if fp4 else [])],
