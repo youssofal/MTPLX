@@ -9402,6 +9402,29 @@ def test_model_contract_depth_clamps_declared_default_to_ceiling():
     assert public._model_contract_depth(inspection, profile=sustained, fallback=3) == 2
 
 
+def test_inkling_launch_depth_ignores_a_stamped_depth(tmp_path):
+    """Inkling's engine prices the draft depth every round, and only at the
+    family's launch depth (server ``_inkling_auto_depth``): a pack stamped by
+    ``forge verify --stamp`` (verify's fastest depth, the deepest verified)
+    must not pin it. Every other family keeps its measured default."""
+    stamp = {"mtp_depth_default": 2, "mtp_depth_max": 2}
+    (tmp_path / "mtplx_runtime.json").write_text(json.dumps(stamp))
+    sustained = public.get_profile("sustained")
+    inkling = {
+        "model_dir": str(tmp_path),
+        "recommended_backend": "inkling2_loop",
+        "mtp_arch": "inkling2-loop",
+        "compatibility": {"runtime_contract": dict(stamp)},
+    }
+    assert public.descriptor_from_inspection(inkling).backend_id == "inkling2_loop"
+    assert public._model_contract_depth(inkling, profile=sustained, fallback=3) == 3
+    other = {
+        "model_dir": str(tmp_path),
+        "compatibility": {"runtime_contract": dict(stamp, public_model_id="some-third-party-artifact")},
+    }
+    assert public._model_contract_depth(other, profile=sustained, fallback=3) == 2
+
+
 def test_qwen36_35b_a3b_defaults_to_measured_best_depth():
     """A3B measured best is D2 (M5 Max tune 145.0 tok/s, 1.54x; the reporter's
     sweep has D2 within 2% of best) while the D3 ceiling loses 9-22%."""

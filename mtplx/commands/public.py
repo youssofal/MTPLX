@@ -1046,6 +1046,14 @@ def _model_contract_depth(
         # fallback 0 is the missing-MTP degrade pin (AR mode); artifact
         # metadata must not resurrect a draft depth past it.
         return 0
+    if descriptor_from_inspection(inspection).backend_id == "inkling2_loop":
+        # Inkling prices its draft depth every round from this Mac's measured
+        # round costs, and runs that controller only at the family's launch
+        # depth (server ``_inkling_auto_depth``). A depth stamped into the
+        # pack's mtplx_runtime.json (``forge verify --stamp`` writes verify's
+        # fastest depth and the deepest verified one) would pin the depth
+        # instead, for every user of that pack.
+        return int(fallback)
     contract = _profile_scoped_model_runtime_contract(inspection, profile)
     if not isinstance(contract, dict):
         # A profile mismatch (artifact recommends another profile) hides the
