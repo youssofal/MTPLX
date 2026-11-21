@@ -11096,7 +11096,7 @@ def generate_mtpk(
                         session_policy_fingerprint=session_policy_fingerprint, capture_final_state=capture_final_state,
                         commit_prompt_state_to_bank=commit_prompt_state_to_bank, vision_splice=vision_splice,
                         constraint=constraint, abort_check=abort_check, first_token_logprobs_top_k=first_token_logprobs_top_k,
-                        store_prefix_snapshot=store_prefix_snapshot)
+                        store_prefix_snapshot=store_prefix_snapshot, verify_strategy=verify_strategy)
     base_hidden_variant = _resolve_runtime_base_hidden_variant(rt, base_hidden_variant)
     mtp_hidden_variant = _resolve_runtime_mtp_hidden_variant(rt, mtp_hidden_variant)
     requested_speculative_depth = int(speculative_depth)
