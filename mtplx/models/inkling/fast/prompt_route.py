@@ -37,13 +37,13 @@ def prompt_fast(part):
 #: tok/s; `lanes/p1/sheet-oq-4k-2.json`, `lanes/p1/mem-bare-16k-b-20261121T162621Z.json`).
 WIDE_ROWS = 2048
 #: The longest prompt the wide width serves. The prompt attention writes bias and mask planes as tall as the
-#: chunk and as long as the context: Bare Speed's 16K read peaked 22.49 GiB at 2,048 rows against 18.31 at 512
-#: (`lanes/p1/mem-pair-bare-cand-20261121T174711Z.json`), so a longer prompt keeps 512 rows until the prompt
-#: attention stops writing them.
+#: chunk and as long as the context: a cold 16K read on Bare Speed grew MLX's memory by 5.5 GiB at 2,048 rows
+#: against 3.6 at 512 (`lanes/p1/mem-pair-bare-cand-20261121T174711Z.json`), and nothing past 16K is measured,
+#: so a longer prompt keeps 512 rows until the prompt attention stops writing them.
 WIDE_PROMPT_TOKENS = 18_432
-#: GPU memory above the loaded model a Mac needs before the wide width: the 2,048-row forward (2.0 GB in process
-#: at 4K) and the attention planes at the longest prompt it serves (4.2 GiB more than at 512 rows), with room
-#: beside them. Every 24, 32 and 36 GB Mac keeps 512 rows; the admission may still narrow any request.
+#: GPU memory above the loaded model a Mac needs before the wide width: the 2,048-row read's growth at the longest
+#: prompt it serves (5.5 GiB at 16K, 1.9 more than at 512 rows), with room beside it for the session's own state.
+#: Every 24, 32 and 36 GB Mac keeps 512 rows; the admission may still narrow any request.
 WIDE_HEADROOM_BYTES = 12 * 1024**3
 
 _headroom = {}
