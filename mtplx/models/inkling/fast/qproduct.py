@@ -10,7 +10,8 @@ bit for bit, MLX 0.32.2's one-row ``mx.quantized_matmul`` of that row (for float
 scales and biases to float32 first, two extra launches; here they are read in their 16-bit type, the
 same values). MLX's own product of 2 to 24 rows does not
 (``affine_qmv_wide`` from M3 on, another order), so a verify panel through MLX differs from the
-one-row step; through this launch it does not. One row takes MLX's own product (the reference).
+one-row step; through this launch it does not. One row takes this launch too (``_ONE_ROW``), proven
+like every width; where it refuses, MLX's product (the reference at one row), counted.
 
 Exactness: each output row repeats the one-row kernel MLX picks for the matrix's shape (its
 ``dispatch_qmv`` rule: ``qmv_fast`` when N is a multiple of 8 and K of 512 at 4 bits or 256 at 8
@@ -31,6 +32,7 @@ lane of the calling simdgroup; ``qmv_constants(weight)`` gives its template valu
 from __future__ import annotations
 
 from functools import lru_cache
+import struct
 
 import mlx.core as mx
 
@@ -48,6 +50,21 @@ _SMALL_ROWS = 16384
 #: 1,474 and 3,796 for the one-row products and 803 and 4,514 for MLX's own product of the rows).
 _RCH_SMALL = 8
 _RCH_LARGE = 4
+#: Output rows one simdgroup computes (each row's arithmetic does not depend on it). A small matrix
+#: (the output projection, 2,304 rows) takes 2: twice the simdgroups in flight, measured on the engine
+#: (GPU time of a 48-visit dependent chain, receipts/ebench-oproj-1.json, M5 Max): 2 rows 19.2 -> 10.3
+#: us, 3 rows 27.2 -> 15.8, 4 rows 41.4 -> 23.7, 6 rows 61.2 -> 32.5, 8 rows 80.3 -> 42.6.
+_NR_SMALL = 2
+_NR_LARGE = 4
+#: A single row through this launch too (it repeats MLX's one-row arithmetic; proven per shape like
+#: every width) instead of MLX's product, which for a float32 input (the head) first casts the scales
+#: and biases to float32 (two more launches). Engine-timed, receipts/ebench-head-1.json (M5 Max, head
+#: of 201,024 rows, 1 row): 1,171 -> 894 us; output projection 9.5 -> 9.0 us (ebench-oproj-1).
+_ONE_ROW = True
+#: Input totals staged once per threadgroup in threadgroup memory (SUMS) for a small matrix only. The
+#: head computes them in each simdgroup: engine-timed, receipts/ebench-head-2.json (M5 Max), 2 rows
+#: 520 -> 464 us, 3 rows 1,260 -> 1,273, 4 rows 1,779 -> 1,472, 8 rows 2,890 -> 2,424.
+_SUMS_LARGE = False
 
 QMV_ROWS = AFFINE_LANE + """
 // A lane's SPAN inputs widened to float, the values a float32 copy of the row holds (the product of a
@@ -98,7 +115,7 @@ _SOURCE = """
     constexpr int GPR = K / G;                   // groups a row
     const uint sg = simdgroup_index_in_threadgroup;
     const uint lane = thread_index_in_simdgroup;
-    const uint row0 = threadgroup_position_in_grid.x * (NSG * 4) + sg * 4;
+    const uint row0 = threadgroup_position_in_grid.x * (NSG * NR) + sg * NR;   // NR output rows a simdgroup
     // YSPLIT: each threadgroup row of the grid takes one chunk of RCH panel rows (more threadgroups
     // for a small matrix); otherwise one threadgroup loops over the chunks.
     const uint rc_begin = YSPLIT ? threadgroup_position_in_grid.y * RCH : 0;
@@ -122,16 +139,16 @@ _SOURCE = """
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (row0 >= N) return;
+    if (row0 >= OUTN) return;                // rows past the output's width are not written
 
     for (uint rc = rc_begin; rc < rc_end; rc += RCH) {
-        float acc[4][RCH];
-        for (uint ro = 0; ro < 4; ++ro)
+        float acc[NR][RCH];
+        for (uint ro = 0; ro < NR; ++ro)
             for (uint r = 0; r < RCH; ++r) acc[ro][r] = 0.0f;
         for (int b = 0; b < NB; ++b) {
             const int col = b * BLOCK + int(lane) * VPT;
-            float wf[4][VPT], sc[4], bi[4];
-            for (uint ro = 0; ro < 4; ++ro) {
+            float wf[NR][VPT], sc[NR], bi[NR];
+            for (uint ro = 0; ro < NR; ++ro) {
                 const size_t row = min(row0 + ro, uint(N - 1));
                 sc[ro] = static_cast<float>(scales[row * GPR + col / G]);
                 bi[ro] = static_cast<float>(biases[row * GPR + col / G]);
@@ -157,16 +174,16 @@ _SOURCE = """
                 } else {
                     tot = affine_lane::take<VPT, BITS>(xs, xt);
                 }
-                for (uint ro = 0; ro < 4; ++ro)
+                for (uint ro = 0; ro < NR; ++ro)
                     acc[ro][r] += affine_lane::term<VPT, BITS>(xt, wf[ro], sc[ro], bi[ro], tot);
             }
         }
-        for (uint ro = 0; ro < 4; ++ro)
+        for (uint ro = 0; ro < NR; ++ro)
             for (uint r = 0; r < RCH; ++r) acc[ro][r] = simd_sum(acc[ro][r]);
         if (lane == 0) {
             for (uint r = 0; r < RCH && rc + r < rc_end; ++r)
-                for (uint ro = 0; ro < 4; ++ro)
-                    if (row0 + ro < N) out[size_t(rc + r) * N + row0 + ro] = static_cast<O>(acc[ro][r]);
+                for (uint ro = 0; ro < NR; ++ro)
+                    if (row0 + ro < OUTN) out[size_t(rc + r) * OUTN + row0 + ro] = static_cast<O>(FINISH(acc[ro][r]));
         }
     }
 """
@@ -184,14 +201,27 @@ _PROBE = """
 """
 
 
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=None)
 def _kernel(source):
+    if source == "capped":
+        # The soft cap as the library's own elementwise operations (its Divide, Tanh and Multiply,
+        # read from the installed headers), applied to each finished value before it is written.
+        from . import library_gemm
+
+        ops, why = library_gemm.library("elementwise")
+        if ops is None:
+            raise RuntimeError(f"no soft-capped product here: {why}")
+        finish = ("#define FINISH(v) Multiply()(Tanh()(Divide()((v), as_type<float>(uint(CAP)))), "
+                  "as_type<float>(uint(CAP)))\n")
+        return mx.fast.metal_kernel(name="mtplx_inkling_fast_qproduct_capped",
+                                    input_names=["x", "codes", "scales", "biases"], output_names=["out"],
+                                    source=_SOURCE, header=ops + QMV_ROWS + finish)
     return mx.fast.metal_kernel(
         name="mtplx_inkling_fast_qproduct" if source == "product" else "mtplx_inkling_fast_qmv_rows_probe",
         input_names=["x", "codes", "scales", "biases"],
         output_names=["out"],
         source=_SOURCE if source == "product" else _PROBE,
-        header=QMV_ROWS,
+        header=QMV_ROWS + "#define FINISH(v) (v)\n",
     )
 
 
@@ -240,31 +270,38 @@ def _same(a, b):
     return a.shape == b.shape and a.dtype == b.dtype and bool(mx.array_equal(a.view(view), b.view(view)).item())
 
 
-def _launch(x2, weight, rows, n, k, bits, group, vpt, *, threads=None, rch=None, sums=None, ysplit=None, wide=False):
+def _launch(x2, weight, rows, n, k, bits, group, vpt, *, threads=None, rch=None, sums=None, ysplit=None, nr=None,
+            width=None, cap=0.0, wide=False):
     nb = k // (vpt * 32)
     small = n <= _SMALL_ROWS
     threads = threads or (_THREADS_SMALL if small else _THREADS_LARGE)
-    rch = min(rows, rch or (_RCH_SMALL if small else _RCH_LARGE))
+    # An explicit chunk may exceed the panel (rows past it are skipped): odd chunk sizes are cliff suspects.
+    rch = rch or min(rows, _RCH_SMALL if small else _RCH_LARGE)
+    nr = int(nr or (_NR_SMALL if small else _NR_LARGE))    # a partial last group: reads clamp, writes skip
     ysplit = bool(ysplit)
     lrows = rch if ysplit else rows
-    # The inputs' totals once a threadgroup pay on a small matrix; on a large one (the head) each
-    # simdgroup taking its own measured faster (headbench-*-2: Bare Speed's head at four rows 1,590
-    # against 1,934 µs, Optimized Speed's 1,228 against 1,779; eight rows 2,202 against 2,651).
-    sums = (small and lrows * nb * 32 * 4 <= 24 * 1024) if sums is None else bool(sums)
-    rows_per_group = threads // 32 * 4
-    return _kernel("product")(
+    if sums is None:
+        sums = (small or _SUMS_LARGE) and lrows * nb * 32 * 4 <= 24 * 1024
+    sums = bool(sums)
+    rows_per_group = threads // 32 * nr
+    width = int(width or n)
+    out_type = mx.float32 if wide else x2.dtype      # a widened 16-bit input gives the float32 product
+    template = [("T", x2.dtype), ("O", out_type), ("WIDE", bool(wide)), ("W", rows), ("K", k), ("N", n),
+                ("BITS", bits), ("G", group), ("VPT", vpt), ("RCH", rch), ("THREADS", threads), ("SUMS", sums),
+                ("YSPLIT", ysplit), ("NR", nr), ("OUTN", width)]
+    if cap:
+        template.append(("CAP", int.from_bytes(struct.pack("<f", float(cap)), "little")))
+    return _kernel("capped" if cap else "product")(
         inputs=[x2, weight.codes, weight.scales, weight.biases],
-        template=[("T", x2.dtype), ("O", mx.float32 if wide else x2.dtype), ("WIDE", bool(wide)), ("W", rows),
-                  ("K", k), ("N", n), ("BITS", bits), ("G", group), ("VPT", vpt), ("RCH", rch), ("THREADS", threads),
-                  ("SUMS", sums), ("YSPLIT", ysplit)],
-        grid=(-(-n // rows_per_group) * threads, -(-rows // rch) if ysplit else 1, 1),
+        template=template,
+        grid=(-(-width // rows_per_group) * threads, -(-rows // rch) if ysplit else 1, 1),
         threadgroup=(threads, 1, 1),
-        output_shapes=[(rows, n)],
-        output_dtypes=[mx.float32 if wide else x2.dtype],
+        output_shapes=[(rows, width)],
+        output_dtypes=[out_type],
     )[0]
 
 
-def affine_product(x, weight, *, prove=True, widen=False, one_row=False, **tune):
+def affine_product(x, weight, *, prove=True, widen=False, one_row=None, **tune):
     """Every row of ``x`` (``(..., K)`` of the scales' 16-bit type, or float32) times the affine matrix
     ``weight`` (transposed, as ``mx.quantized_matmul`` takes it), bit-identical to MLX's one-row product
     of that row.
@@ -272,9 +309,10 @@ def affine_product(x, weight, *, prove=True, widen=False, one_row=False, **tune)
     ``widen``: ``x`` is 16-bit and the reference takes it as float32 (the head): each input is widened
     in the launch, the result is float32, every row equal to MLX's product of ``x.astype(float32)``
     (which also widens the 16-bit scales and biases to float32 in two launches of its own; here they
-    are read in their 16-bit type, the same values). ``one_row``: a single row takes this launch too
-    (proven on its first use like a panel) instead of MLX's product. Raises ``RuntimeError`` (counted) for a stored
-    form this launch does not twin, or when this Mac's first use disagrees with MLX's one-row product."""
+    are read in their 16-bit type, the same values). ``one_row``: whether a single row takes this launch
+    too (proven on its first use like a panel) instead of MLX's product; ``None`` is ``_ONE_ROW``.
+    Raises ``RuntimeError`` (counted) for a stored form this launch does not twin, or when this Mac's
+    first use disagrees with MLX's one-row product; a single row then takes MLX's product."""
     from .attn_input import count_route
 
     codes, scales, biases = weight.codes, weight.scales, weight.biases
@@ -285,9 +323,21 @@ def affine_product(x, weight, *, prove=True, widen=False, one_row=False, **tune)
     rows = 1
     for d in lead:
         rows *= d
-    if rows == 1 and not one_row:
-        return mx.quantized_matmul(x.astype(mx.float32) if widen else x, codes, scales, biases, transpose=True,
-                                   group_size=group, bits=bits)
+    one = tune.pop("one", one_row)
+    reference = lambda: mx.quantized_matmul(x.astype(mx.float32) if widen else x, codes, scales, biases,
+                                            transpose=True, group_size=group, bits=bits)
+    if rows == 1 and not (_ONE_ROW if one is None else one):
+        return reference()
+    try:
+        return _proven_launch(x, weight, rows, lead, n, k, bits, group, prove, widen, tune, count_route)
+    except RuntimeError:
+        if rows == 1:   # one row: MLX's product is the reference itself (the refusal is counted)
+            return reference()
+        raise
+
+
+def _proven_launch(x, weight, rows, lead, n, k, bits, group, prove, widen, tune, count_route):
+    codes, scales, biases = weight.codes, weight.scales, weight.biases
     if (x.shape[-1] != k or x.dtype not in (scales.dtype, mx.float32) or x.dtype not in (*STREAM_TYPES, mx.float32)
             or (widen and x.dtype not in STREAM_TYPES)):
         count_route("refused:qproduct_input")
@@ -314,6 +364,56 @@ def affine_product(x, weight, *, prove=True, widen=False, one_row=False, **tune)
         if not verdict:
             raise RuntimeError("affine_product disagreed with MLX's one-row product on this Mac")
     return out.reshape(*lead, n)
+
+
+def affine_logits(x, weight, *, width=None, cap=0.0, prove=True, widen=False, **tune):
+    """``affine_product(x, weight)[..., :width]`` and then, with ``cap`` (the vocabulary head's soft
+    cap), ``tanh(logits / cap) * cap``, all in the product's one launch: the cap is the library's own
+    Divide, Tanh and Multiply applied to each finished value. Every value equals, bit for bit, MLX's
+    one-row product of that row sliced and capped by MLX's launches (proven per shape on this Mac's
+    first use). ``widen``: ``x`` is 16-bit and the reference takes it as float32 (the head's hidden):
+    widened in the launch, as ``affine_product`` does. Raises ``RuntimeError`` (counted) where the launch
+    refuses; ``(..., width)`` in ``x``'s type, float32 when widened."""
+    from .attn_input import count_route
+
+    codes, scales, biases = weight.codes, weight.scales, weight.biases
+    bits, group = int(weight.bits), int(weight.group_size)
+    n, words = codes.shape
+    k = words * 32 // bits
+    width = int(width or n)
+    lead = x.shape[:-1]
+    rows = 1
+    for d in lead:
+        rows *= d
+    if (x.shape[-1] != k or x.dtype not in (scales.dtype, mx.float32) or x.dtype not in (*STREAM_TYPES, mx.float32)
+            or (widen and x.dtype not in STREAM_TYPES) or not 0 < width <= n):
+        count_route("refused:qlogits_input")
+        raise RuntimeError("affine_logits serves inputs of the matrix's width in its scales' type or float32")
+    try:
+        vpt = qmv_constants(weight)["VPT"]
+    except RuntimeError as err:
+        count_route("refused:qlogits_" + str(err).rsplit(": ", 1)[-1])
+        raise
+    x2 = x.reshape(rows, k)
+    out = _launch(x2, weight, rows, n, k, bits, group, vpt, width=width, cap=cap, wide=widen, **tune)
+    if prove:
+        key = ("logits", n, k, bits, group, rows, x2.dtype, width, float(cap), bool(widen))
+        verdict = _verdicts.get(key)
+        if verdict is None:
+            picks = sorted({0, rows - 1})
+            want = []
+            for r in picks:
+                y = mx.quantized_matmul(x2[r:r + 1].astype(mx.float32) if widen else x2[r:r + 1], codes, scales,
+                                        biases, transpose=True, group_size=group, bits=bits)[..., :width]
+                want.append(mx.tanh(y / cap) * cap if cap else y)
+            mx.eval(out, want)
+            verdict = all(_same(out[r:r + 1], w) for r, w in zip(picks, want))
+            _verdicts[key] = verdict
+            count_route(("proved:" if verdict else "refused:")
+                        + f"qlogits_{n}x{k}_b{bits}_w{rows}_{width}_{x2.dtype}{'_widened' if widen else ''}")
+        if not verdict:
+            raise RuntimeError("affine_logits disagreed with MLX's launches on this Mac")
+    return out.reshape(*lead, width)
 
 
 def qmv_rows_probe(x, weight, rows_each=4, threads=64):

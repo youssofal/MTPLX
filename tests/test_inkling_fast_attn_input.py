@@ -157,3 +157,20 @@ def test_fixed_order_read_is_row_stable_and_close(visit, monkeypatch):
         panel = attend_rows(q, stack)
         for r in range(stack.shape[1]):
             assert _bits(panel[:, r:r + 1], attend_rows(q, stack[:, r:r + 1])), r
+
+
+@needs
+@pytest.mark.parametrize("visit", [5, 20, 41])
+def test_norm_first_gives_the_in_launch_norms_bits(visit, monkeypatch):
+    """An 8-row raw panel (too wide to stage whole), normed by its own launch, gives every stage A
+    output the bits of the panel normed inside the projection launch (global first, window loop and
+    global loop passes)."""
+    import mtplx.models.inkling.fast.attn_input as ai
+
+    meta, g = _golden(4142, 8, visit)
+    monkeypatch.setattr(ai, "_NORM_FIRST", False)
+    inside = _stage(g, meta)
+    monkeypatch.setattr(ai, "_NORM_FIRST", True)
+    first = _stage(g, meta)
+    for name in NAMES:
+        assert _bits(getattr(first, name), getattr(inside, name)), name

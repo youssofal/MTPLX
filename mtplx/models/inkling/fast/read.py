@@ -28,10 +28,13 @@ sequential over sources, then three shuffle steps), the controller's ``gemv`` (d
 4,608; forget/gain: ``sm8 sn4`` over 64) and
 ``precise::tanh``. RC6's three-query depth read (global visits) and four-query message read
 multiply on MLX's matrix units, whose summation order is the hardware's and differs between
-Macs, so those products are not reproduced: they run here as the very MLX calls RC6 makes, on
-the same shapes and types (scores one row at a time, as RC6's verify and one-row step do; the
-depth read's mix batched over the panel and the message mix per row, as RC6 calls them), and
-their results feed the kernels.
+Macs. On a Mac with matrix units they run in one launch (``exact_read``): the scores, RC6's
+softmax and the mix, the two products as the installed MLX's own product code compiled into the
+launch (``library_gemm``: its split-K tile loop or mat-vec, and its tile loop for the mix),
+called as MLX's launches for those shapes call them, proven on each shape's first use against
+the library's launches. Elsewhere (or refused) they run as the very MLX calls RC6 makes, on the
+same shapes and types (scores one row at a time, as RC6's verify and one-row step do; the depth
+read's mix batched over the panel and the message mix per row, as RC6 calls them).
 """
 
 from __future__ import annotations
@@ -762,6 +765,180 @@ def attend_rows(q, keys):
     )[0]
 
 
+_EXACT = """
+    // One threadgroup per (panel row r, column group g). The three products of a depth read run here as
+    // the library's own code (``fast.library_gemm``), each called the way the library's
+    // launch for that product's shape calls it, so every value is the library's:
+    //   scores  = queries . keys_r^T: the split-K product on the matrix units (each K partition one
+    //             tile loop from zero; the partitions then added in order from zero, as the library's
+    //             accumulate launch adds them), or, for a single key, the library's mat-vec;
+    //   weights = RC6's multiply by the scale, then its softmax (share_four), as the probs kernel;
+    //   mix     = weights . keys_r, for this group's 32-column chunks, one tile loop each.
+    // Results pass between the steps through device scratch inside this threadgroup.
+    using namespace mlx::steel;
+    const uint grp = threadgroup_position_in_grid.x;
+    const uint r = grp / G, g = grp % G;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const device float* kr = keys + size_t(r) * N * D;
+    device float* sk = scratch + size_t(grp) * (PARTS + 1) * Q * N;   // PARTS partials, then weights
+    device float* wt = sk + PARTS * Q * N;
+
+    if constexpr (N == 1) {
+        // The library's mat-vec, launched by it as one threadgroup of 8 x 32 threads (this one); VT
+        // query rows a thread (4, or 1 for fewer than 4 queries).
+        threadgroup float reduce[8 * (VT + VT)];
+        GEMVKernel<float, 1, 8, 1, 32, VT, 4, false, float>::run(
+            queries, kr, queries, sk, width[0], nq[0], width[0], zero[0], zero[0], nq[0], reduce,
+            uint3(0, 0, 0), uint3(lane, sg, 0), sg, lane);
+    } else {
+        // Split-K tiles of 64 x 64 over simdgroups 0-3 (2 x 2, 32 x 32 each); simdgroups 4-7 hold a tile
+        // past the last query, so they own no values but meet every barrier of the tile loop.
+        const short row0 = sg < 4 ? short(32 * (sg >> 1)) : short(64);
+        const short col0 = sg < 4 ? short(32 * (sg & 1)) : short(0);
+        const short rows_here = short(min(32, Q - int(row0)));
+        const short cols_here = short(min(32, N - int(col0)));
+        for (int part = 0; part < PARTS; ++part) {
+            const int kbeg = PART * part;
+            const int klen = min(kbeg + PART, D) - kbeg;
+            NAXTile<float, 2, 2> tile;
+            dispatch_bool(klen % KB == 0, [&](auto whole_k) {
+              dispatch_bool(rows_here == 32, [&](auto whole_m) {
+                dispatch_bool(cols_here == 32, [&](auto whole_n) {
+                  tile = gemm_loop<float, 32, 32, 32, KB, false, true, whole_m.value, whole_n.value,
+                                   whole_k.value, float>(queries + kbeg + int(row0) * D, kr + kbeg + int(col0) * D,
+                                                         D, D, klen, klen / KB, rows_here, cols_here);
+                });
+              });
+            });
+            if (rows_here > 0 && cols_here > 0)
+                tile.store_safe(sk + part * Q * N + int(row0) * N + int(col0), N, short2(cols_here, rows_here));
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    if (sg < uint(Q)) {
+        float slot[4];
+        for (uint i = 0; i < 4; ++i) {
+            const uint s = lane * 4 + i;
+            float v = -INFINITY;
+            if (s < uint(N)) {
+                float total = 0.0f;                       // the accumulate launch starts from zero
+                if constexpr (N == 1) {
+                    total = sk[sg];
+                } else {
+                    for (int part = 0; part < PARTS; ++part) total += sk[part * Q * N + sg * N + s];
+                }
+                v = total * as_type<float>(uint(SCALE));
+            }
+            slot[i] = v;
+        }
+        share_four(slot);
+        for (uint i = 0; i < 4; ++i)
+            if (lane * 4 + i < uint(N)) wt[sg * N + lane * 4 + i] = slot[i];
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    constexpr uint CHUNKS = D / 32;
+    constexpr uint PER_GROUP = CHUNKS / G;
+    for (uint c = g * PER_GROUP + sg; c < (g + 1) * PER_GROUP; c += 8) {
+        const int col = int(c) * 32;
+        NAXTile<float, 2, 2> tile = gemm_loop<float, 32, 32, 32, 256, false, false, false, true, false, float>(
+            wt, kr + col, N, D, N, 0, short(Q), short(32));
+        tile.store_safe(out + size_t(r) * Q * D + col, D, short2(32, Q));
+    }
+"""
+
+#: Threadgroups a panel row in the one-launch read (each recomputes the scores; the 72 mix chunks
+#: of 32 columns are shared): 18.4 against 19.8 us a read at one (engine, d1/receipts/proto-read-t1).
+_EXACT_GROUPS = 9
+#: The one-launch read (MTPLX_INKLING_EXACT_READ=0 turns it off: the reads then take the library's
+#: own launches, three or four a read, and the probs kernel).
+_EXACT_ON = os.environ.get("MTPLX_INKLING_EXACT_READ", "1") != "0"
+_exact_verdicts: dict = {}
+_exact_scalars: dict = {}
+
+
+@lru_cache(maxsize=1)
+def _exact_kernel():
+    from . import library_gemm
+
+    text, why = library_gemm.library("matrix_units", "matvec")
+    if text is None:
+        return None, why
+    return mx.fast.metal_kernel(name="mtplx_inkling_fast_exact_read",
+                                input_names=["queries", "keys", "width", "nq", "zero"],
+                                output_names=["out", "scratch"], header=text + _SHARE, source=_EXACT), None
+
+
+def _exact_refusal(key, why, tag):
+    from .attn_input import count_route
+
+    _exact_verdicts[key] = False
+    count_route(f"refused:exact_read_{tag}_" + "_".join(map(str, key)))
+    if os.environ.get("MTPLX_INKLING_TRACE_REFUSALS"):
+        print(f"[inkling] one-launch read {key} refused: {why}")
+
+
+def exact_read(q, keys, reference):
+    """The depth read ``softmax(q . keys_r^T * D^-1/2) . keys_r`` of every panel row in one launch, bit
+    for bit the read ``reference()`` gives (the library's products and RC6's softmax): proven on
+    this Mac's first use of each shape (counted), else ``None`` and the caller keeps its launches.
+    ``q`` ``(Q, D)`` float32, ``keys`` ``(1, W, N, D)`` float32 -> ``(1, W, Q, D)`` float32."""
+    from . import library_gemm
+
+    from .attn_input import count_route
+
+    nq, width = q.shape
+    rows, count = keys.shape[1], keys.shape[2]
+    key = (nq, count, rows, width)
+    verdict = _exact_verdicts.get(key)
+    if verdict is False or not _EXACT_ON:
+        return None
+    if library_gemm.gpu_generation() < 17:
+        # The mix runs on the matrix units on every Mac this launch serves; without them the library's
+        # products are its simdgroup-matrix forms, not twinned here yet.
+        _exact_refusal(key, "no matrix units on this GPU", "gpu")
+        return None
+    tiles, why = library_gemm.product_tiles(nq, count, width)
+    if tiles is None:
+        _exact_refusal(key, why, "tiles")
+        return None
+    if nq > 4 or count > 32 or width % (32 * _EXACT_GROUPS) or q.dtype != mx.float32 or keys.dtype != mx.float32:
+        _exact_refusal(key, "shape or type outside the one-launch read", "shape")
+        return None
+    kernel, why = _exact_kernel()
+    if kernel is None:
+        _exact_refusal(key, why, "library")
+        return None
+    scalars = _exact_scalars.get((width, nq))
+    if scalars is None:
+        scalars = _exact_scalars[(width, nq)] = (mx.array([width], mx.int32), mx.array([nq], mx.int32),
+                                                 mx.array([0.0], mx.float32))
+    parts = 1 if tiles.kind == "matvec" else tiles.partitions
+    out = kernel(
+        inputs=[q, keys, *scalars],
+        template=[("Q", nq), ("N", count), ("D", width), ("G", _EXACT_GROUPS), ("PARTS", parts),
+                  ("PART", tiles.partition or width), ("KB", tiles.block_k or 256), ("VT", 4 if nq >= 4 else 1),
+                  ("SCALE", _f32_bits(width ** -0.5))],
+        grid=(rows * _EXACT_GROUPS * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(1, rows, nq, width), (rows * _EXACT_GROUPS * (parts + 1) * nq * count,)],
+        output_dtypes=[mx.float32, mx.float32],
+    )[0]
+    if verdict is None:
+        try:
+            want = reference()
+            mx.eval(out, want)
+            verdict = _same(out, want)
+        except RuntimeError as exc:     # the library text did not build on this Mac
+            _exact_refusal(key, exc, "build")
+            return None
+        _exact_verdicts[key] = verdict
+        count_route(("proved:" if verdict else "refused:") + "exact_read_" + "_".join(map(str, key)))
+        if not verdict:
+            return None
+    return out
+
+
 def depth_read(queries, keys):
     """RC6's three-query depth read from its keys (``model.py`` ``serial_depth_dots``): the
     scores as RC6's per-row products give them (``scores``), RC6's scale and softmax here, the
@@ -771,8 +948,13 @@ def depth_read(queries, keys):
     q = queries.reshape(-1, width).astype(mx.float32)
     if fixed_order():
         return attend_rows(q, keys)
-    kw = scores(q, keys)
-    return probs(kw.get("scores"), width ** -0.5, kw.get("joined")) @ keys
+
+    def library_launches():
+        kw = scores(q, keys)
+        return probs(kw.get("scores"), width ** -0.5, kw.get("joined")) @ keys
+
+    one = exact_read(q, keys, library_launches)
+    return one if one is not None else library_launches()
 
 
 def message_rows(stack, queries):
@@ -787,14 +969,23 @@ def message_rows(stack, queries):
     rows, count, width = stack.shape[1], stack.shape[2], stack.shape[-1]
     if fixed_order():
         return attend_rows(queries, stack)
-    kw = scores(queries, stack)
-    weights = probs(kw.get("scores"), width ** -0.5, kw.get("joined"))
-    per_row = lambda: [weights[:, r:r + 1] @ stack[:, r:r + 1] for r in range(rows)]
-    batched = lambda: weights @ stack
-    key = ("mix", queries.shape[0], count, rows, width)
-    if _proven(key, per_row, batched, lambda whole: [whole[:, r:r + 1] for r in range(rows)]):
-        return batched()
-    return per_row()
+
+    def library_launches():
+        kw = scores(queries, stack)
+        weights = probs(kw.get("scores"), width ** -0.5, kw.get("joined"))
+        per_row = lambda: [weights[:, r:r + 1] @ stack[:, r:r + 1] for r in range(rows)]
+        batched = lambda: weights @ stack
+        key = ("mix", queries.shape[0], count, rows, width)
+        if _proven(key, per_row, batched, lambda whole: [whole[:, r:r + 1] for r in range(rows)]):
+            return batched()
+        return per_row()
+
+    def joined():
+        got = library_launches()
+        return got if not isinstance(got, list) else mx.concatenate(got, axis=1)
+
+    one = exact_read(queries.astype(mx.float32), stack, joined)
+    return one if one is not None else library_launches()
 
 
 _message_rows = weakref.WeakKeyDictionary()

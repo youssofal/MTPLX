@@ -266,9 +266,8 @@ def packed_linear(x, weight):
     """``x @ weight`` for stored codes, every row equal to the one-row product: lane L1's
     row-stable launch (one read of the codes for the whole panel, 2 to 32 rows, proven against
     MLX's one-row product on this Mac's first use of each shape); where it refuses, counted,
-    ``proven_rows`` (MLX's batched product where it is row-stable here, else one row at a time)."""
-    if x.shape[1] == 1:
-        return ref.linear(x, weight)
+    ``proven_rows`` (MLX's batched product where it is row-stable here, else one row at a time). One
+    row takes the launch too (``qproduct._ONE_ROW``); where it refuses, MLX's own product, the reference."""
     from .qproduct import affine_product
 
     try:
@@ -652,15 +651,20 @@ def affine_head(model, hidden):
     16-bit scales and biases: three launches that change no value), the same vocabulary slice and soft
     cap, so every row equals the one-row head. Raises ``RuntimeError`` where the launch refuses (its
     first use per shape is proven on this Mac against MLX's one-row product)."""
-    from .qproduct import STREAM_TYPES, affine_product
+    from .qproduct import STREAM_TYPES, affine_logits, affine_product
 
     cap = model.config["final_logit_softcapping"]
+    vocab = model.config["unpadded_vocab_size"]
     x = hidden.astype(model.embed_tokens.weight.dtype)
-    if x.dtype in STREAM_TYPES:
-        logits = affine_product(x, model.unembed, widen=True, one_row=True)
-    else:
-        logits = affine_product(x.astype(mx.float32), model.unembed, one_row=True)
-    logits = logits[..., : model.config["unpadded_vocab_size"]]
+    widen = x.dtype in STREAM_TYPES
+    if not widen:
+        x = x.astype(mx.float32)
+    try:
+        # The product, the vocabulary slice and the soft cap in one launch.
+        return affine_logits(x, model.unembed, width=vocab, cap=cap or 0.0, widen=widen)
+    except RuntimeError:
+        count("fallback.head.one_launch_logits_refused")
+    logits = affine_product(x, model.unembed, widen=widen, one_row=True)[..., :vocab]
     return mx.tanh(logits / cap) * cap if cap else logits
 
 
