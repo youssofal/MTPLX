@@ -18841,6 +18841,7 @@ def _metrics_envelope(
         "sampled_draft_chain_status": stats.get("sampled_draft_chain_status"),
         **({"inkling_attention": stats["inkling_attention"]} if stats.get("inkling_attention") else {}),
         **({"inkling_experts": stats["inkling_experts"]} if stats.get("inkling_experts") else {}),
+        **({"inkling_fast": stats["inkling_fast"]} if stats.get("inkling_fast") else {}),
         **({"inkling_projections": stats["inkling_projections"]} if "inkling_projections" in stats else {}),
         **({"inkling_convolution": stats["inkling_convolution"]} if stats.get("inkling_convolution") else {}),
         **({"inkling_draft_sampling": stats["inkling_draft_sampling"]} if stats.get("inkling_draft_sampling") else {}),

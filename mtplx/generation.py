@@ -1980,10 +1980,14 @@ def _with_inkling_attention_receipt(fn):
         if getattr(rt, "backend_id", None) == "inkling2_loop":
             from .models.inkling.attention import observe_attention_request
             from .models.inkling.expert_fusion import observe_expert_request
+            from .models.inkling.fast.decoder import observe_fast_request
             from .models.inkling.head import observe_projection_routes
 
+            def fast(rt, *args, **kwargs):
+                return observe_fast_request(fn, rt, *args, **kwargs)
+
             def attended(rt, *args, **kwargs):
-                return observe_attention_request(fn, rt, *args, **kwargs)
+                return observe_attention_request(fast, rt, *args, **kwargs)
 
             # The model's own prompt width, unless the request or the user named one.
             rows = getattr(rt, "prompt_chunk_rows", None)
@@ -3951,6 +3955,7 @@ class GenerationStats:
     inkling_output_ids_sha256: str | None = field(default=None, kw_only=True)
     inkling_target_draw: str | None = field(default=None, kw_only=True)
     inkling_experts: dict | None = field(default=None, kw_only=True)
+    inkling_fast: dict | None = field(default=None, kw_only=True)
 
     def to_dict(self) -> dict:
         result = asdict(self)
@@ -3971,6 +3976,8 @@ class GenerationStats:
             result.pop("inkling_target_draw")
         if self.inkling_experts is None:
             result.pop("inkling_experts")
+        if self.inkling_fast is None:
+            result.pop("inkling_fast")
         return result
 
 

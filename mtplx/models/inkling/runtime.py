@@ -10,6 +10,7 @@ from mtplx.runtime import MTPLXRuntime, _load_tokenizer_resilient
 
 from . import expert_fusion
 from .draft import Drafter
+from .fast.decoder import DECLINED, FastDecoder, FastPending
 from .layout import cache_footprint
 from .model import load_target
 from .vision import VisionTower
@@ -34,6 +35,8 @@ class InklingRuntime(MTPLXRuntime):
         self.draft_footprint = (
             cache_footprint(config["mtp_config"], draft=True) if mtp else None
         )
+        # Verify panels, commits and one-token forwards go through the fast step first.
+        self.fast = FastDecoder(self)
 
     def resident_kv_bytes_per_token(self):
         return self.target_footprint.full_bytes_per_token
@@ -155,6 +158,11 @@ class InklingRuntime(MTPLXRuntime):
         self._count(
             "forward_ar_hidden_calls" if return_hidden else "forward_ar_plain_calls"
         )
+        served = self.fast.forward_one(
+            input_ids, cache, return_hidden, emit_logits, input_embeddings
+        )
+        if served is not DECLINED:
+            return served
         captures = (
             self.model.capture_ids if return_hidden or self.drafter is not None else ()
         )
@@ -173,6 +181,9 @@ class InklingRuntime(MTPLXRuntime):
         return logits
 
     def verify(self, block, cache):
+        served = self.fast.verify(block, cache)
+        if served is not None:
+            return served
         tapes = [{} for _ in self.model.visit_order]
         ids = block if isinstance(block, mx.array) else mx.array(block)
         h, features = self.model.forward(
@@ -184,6 +195,8 @@ class InklingRuntime(MTPLXRuntime):
         return self.model.head(h)[0], features, tapes
 
     def commit(self, cache, features, tapes, kept, total):
+        if isinstance(tapes, FastPending):
+            return self.fast.commit(cache, features, tapes, kept, total)
         if not 1 <= kept <= total:
             raise ValueError(
                 "Inkling commits the anchor and a prefix of the verified block"
