@@ -176,13 +176,7 @@ def measured_route(name, shape, stock, candidate, *, work_bytes, extra_bytes=0, 
         return use
 
 
-@lru_cache(maxsize=1)
-def _project():
-    return mx.fast.metal_kernel(
-        name="mtplx_inkling_vocabulary",
-        input_names=["states", "weight"],
-        output_names=["scores"],
-        source="""
+_PROJECT = """
             uint lane = thread_index_in_simdgroup;
             uint row = thread_position_in_grid.x / 32;
             uint first = thread_position_in_grid.y * PANEL_ROWS;
@@ -196,20 +190,80 @@ def _project():
                 float score = simd_sum(sums[t]);
                 if (lane == 0) scores[(first + t) * VOCAB + row] = score;
             }
-        """,
+        """
+
+
+@lru_cache(maxsize=1)
+def _project():
+    return mx.fast.metal_kernel(
+        name="mtplx_inkling_vocabulary",
+        input_names=["states", "weight"],
+        output_names=["scores"],
+        source=_PROJECT,
     )
 
 
-def _native(h, weight, vocab, panel):
+@lru_cache(maxsize=1)
+def _project_capped():
+    # The same launch with the soft cap applied to each finished score before it is written: the
+    # library's own Divide, Tanh and Multiply, read from the installed headers (fast/library_gemm.py),
+    # so a score is tanh(score / cap) * cap as MLX's three elementwise launches give it.
+    from .fast import library_gemm
+
+    ops, why = library_gemm.library("elementwise")
+    if ops is None:
+        raise RuntimeError(f"no soft-capped head here: {why}")
+    finish = ("#define FINISH(v) Multiply()(Tanh()(Divide()((v), as_type<float>(uint(CAP)))), "
+              "as_type<float>(uint(CAP)))\n")
+    return mx.fast.metal_kernel(
+        name="mtplx_inkling_vocabulary_capped",
+        input_names=["states", "weight"],
+        output_names=["scores"],
+        source=_PROJECT.replace("= score;", "= FINISH(score);"),
+        header=ops + finish,
+    )
+
+
+def _native(h, weight, vocab, panel, cap=None):
     batch, rows, width = h.shape
-    return _project()(
+    template = [("WIDTH", width), ("VOCAB", vocab), ("PANEL_ROWS", panel)]
+    if cap:
+        template.append(("CAP", int(np.array(cap, np.float32).view(np.uint32))))
+    return (_project_capped() if cap else _project())(
         inputs=[h, weight],
-        template=[("WIDTH", width), ("VOCAB", vocab), ("PANEL_ROWS", panel)],
+        template=template,
         grid=(32 * vocab, batch * rows // panel, 1),
         threadgroup=(128, 1, 1),
         output_shapes=[(batch, rows, vocab)],
         output_dtypes=[mx.float32],
     )[0]
+
+
+_capped_verdicts: dict = {}
+
+
+def _capped(h, weight, vocab, panel, cap):
+    """The native launch with the soft cap inside it, or None where it refuses: its first use per shape
+    on this Mac must equal, value for value, the same launch uncapped and capped by MLX's operations
+    (``tanh(logits / cap) * cap``, as ``Model.head`` caps). A proof of its own, apart from the uncapped
+    route's, so a refusal here leaves that route as it was."""
+    try:
+        out = _native(h, weight, vocab, panel, cap)
+    except RuntimeError:
+        note_route("head.capped", "unavailable")
+        return None
+    key = (str(h.dtype), tuple(h.shape), tuple(weight.shape), vocab, panel, float(cap))
+    verdict = _capped_verdicts.get(key)
+    if verdict is None:
+        want = mx.tanh(_native(h, weight, vocab, panel) / cap) * cap
+        mx.eval(out, want)
+        verdict = _bits_equal(out, want)
+        _capped_verdicts[key] = verdict
+        note_route("head.capped", "proved" if verdict else "unequal")
+    if not verdict:
+        return None
+    note_route("head.capped", "served")
+    return out
 
 
 def _stock_tiles(h, weight, vocab, *, tile_bytes=64 * 1024**2):
@@ -251,11 +305,31 @@ def _singleton_proof(h, weight, vocab, actual):
 
 
 def vocabulary_logits(h, weight, vocab, *, metal=True, pack=None):
+    return _logits(h, weight, vocab, metal, pack, None)[0]
+
+
+def head_logits(h, weight, vocab, cap, *, pack=None):
+    """``Model.head``'s logits: ``vocabulary_logits`` and then the soft cap ``tanh(logits / cap) * cap``
+    (``cap`` 0 or None: none). On the native route the cap is applied inside the vocabulary launch
+    (one launch where the head takes four), every value equal to the launch capped by MLX's
+    operations (proven per shape on this Mac's first use); elsewhere MLX's operations cap.
+    Returns ``(logits, route)``: route "native" (the launch served, cap included), "capped_by_mlx"
+    (the launch served, the capped launch refused) or "stock" (MLX's product)."""
+    logits, route = _logits(h, weight, vocab, True, pack, cap or None)
+    if cap and route != "native":
+        logits = mx.tanh(logits / cap) * cap
+        route = "capped_by_mlx" if route == "uncapped" else route
+    return logits, route
+
+
+def _logits(h, weight, vocab, metal, pack, cap):
+    """``(logits, route)``: route "native" (the vocabulary launch; capped inside it when ``cap``),
+    "uncapped" (the launch served, its capped form refused: the caller caps) or "stock"."""
     from .precision import AffineWeight
 
     if isinstance(weight, AffineWeight):
         note_route("head", "affine")
-        return weight.product(h.astype(mx.float32))[..., :vocab]
+        return weight.product(h.astype(mx.float32))[..., :vocab], "stock"
     batch, rows, width = h.shape
 
     def stock(x):
@@ -284,7 +358,7 @@ def vocabulary_logits(h, weight, vocab, *, metal=True, pack=None):
         or weight.dtype != h.dtype
     ):
         note_route("head", "stock_shape_or_device")
-        return stock(h)
+        return stock(h), "stock"
     one = h[:1, :1]
     ok = measured_route(
         "head.singleton",
@@ -296,7 +370,7 @@ def vocabulary_logits(h, weight, vocab, *, metal=True, pack=None):
         pack=pack,
     )
     if not ok:
-        return stock(h)
+        return stock(h), "stock"
 
     def original():
         return _native(h, weight, vocab, 1)
@@ -304,14 +378,21 @@ def vocabulary_logits(h, weight, vocab, *, metal=True, pack=None):
     setting = os.environ.get("MTPLX_INKLING_HEAD_PANEL", "auto").lower()
     if rows == 1 or setting not in ("auto", "1", "on"):
         note_route("head.panel", "singleton")
-        return original()
-    shared = measured_route(
-        "head.panel",
-        (str(h.dtype), batch, rows, width, vocab),
-        original,
-        lambda: _native(h, weight, vocab, rows),
-        work_bytes=16 * batch * rows * vocab,
-        trial=setting in ("1", "on"),
-        pack=pack,
-    )
-    return _native(h, weight, vocab, rows) if shared else original()
+        panel = 1
+    else:
+        shared = measured_route(
+            "head.panel",
+            (str(h.dtype), batch, rows, width, vocab),
+            original,
+            lambda: _native(h, weight, vocab, rows),
+            work_bytes=16 * batch * rows * vocab,
+            trial=setting in ("1", "on"),
+            pack=pack,
+        )
+        panel = rows if shared else 1
+    if cap:
+        capped = _capped(h, weight, vocab, panel, cap)
+        if capped is not None:
+            return capped, "native"
+        return _native(h, weight, vocab, panel), "uncapped"
+    return _native(h, weight, vocab, panel), "native"

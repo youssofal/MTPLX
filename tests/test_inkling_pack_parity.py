@@ -228,21 +228,25 @@ def _head_model(unembed, dtype):
 @needs_metal
 @pytest.mark.parametrize("dtype", STREAMS, ids=str)
 @pytest.mark.parametrize("rows", [1, 2, 4, 8])
-def test_a_stored_head_takes_the_launches_of_a_16_bit_one(rows, dtype):
-    """A stored head takes the 16-bit head's launches at every width: the 16-bit rows widened inside
-    the product launch, no cast and no widened scale copies."""
+def test_every_head_form_takes_one_launch_of_ours(rows, dtype, monkeypatch):
+    """The vocabulary head, soft cap included, in one launch of ours at every width on every storage
+    form: a 16-bit matrix (the vocabulary launch with the cap inside it) and a stored one (the 16-bit
+    rows widened inside the product launch, no cast and no widened scale copies). No stock launch."""
+    from mtplx.models.inkling import head
     from mtplx.models.inkling.fast import step
 
+    # The 16-bit route's first use races MLX's product (head.measured_route) and a pack keeps the verdict
+    # on disk; parity is about the launches once the route serves, so the race is taken as won here.
+    monkeypatch.setattr(head, "measured_route", lambda *args, **kw: True)
     eng = _engine()
     hidden = mx.random.normal((1, rows, HIDDEN), key=mx.random.key(8)).astype(dtype)
     dense = (mx.random.normal((32768, HIDDEN), key=mx.random.key(9)) * 0.02).astype(dtype)
     mx.eval(hidden, dense)
-    native = _head_model(dense, dtype)
-    launches, stock = _launches(eng, lambda: step.row_stable_head(native, hidden))
-    for bits in (4, 8):
-        model = _head_model(_affine(32768, HIDDEN, bits, 9 + bits, dtype), dtype)
+    forms = {"16-bit": dense, **{f"{bits}-bit": _affine(32768, HIDDEN, bits, 9 + bits, dtype) for bits in (4, 8)}}
+    for form, unembed in forms.items():
+        model = _head_model(unembed, dtype)
         got = _launches(eng, lambda model=model: step.row_stable_head(model, hidden))
-        assert got[0] <= launches and got[1] <= stock, (bits, got, (launches, stock))
+        assert got == (1, 0), (form, got)
 
 
 @needs_metal

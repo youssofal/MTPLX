@@ -709,8 +709,23 @@ def row_stable_head(model, hidden):
         return proven_rows(key, lambda: model.head(hidden), lambda: mx.concatenate(
             [model.head(hidden[:, row : row + 1]) for row in range(rows)], axis=1))
     if rows <= ROW_STABLE_ROWS:
-        return model.head(hidden)
-    return mx.concatenate([model.head(hidden[:, start:stop]) for start, stop in row_chunks(rows)], axis=1)
+        return table_head(model, hidden)
+    return mx.concatenate([table_head(model, hidden[:, start:stop]) for start, stop in row_chunks(rows)], axis=1)
+
+
+def table_head(model, hidden):
+    """``Model.head`` on a 16-bit vocabulary matrix (Optimized Quality, its FP16 sibling) with the soft
+    cap inside the vocabulary launch (``head.head_logits``): one launch where ``Model.head`` takes four
+    (the launch, then MLX's divide, tanh and multiply), every value equal (the capped launch is proven
+    against the launch capped by MLX on this Mac's first use). Where the capped launch refuses, MLX
+    caps; where the vocabulary launch does not serve, MLX's product; both counted."""
+    from ..head import head_logits
+
+    logits, route = head_logits(hidden.astype(model.embed_tokens.weight.dtype), model.unembed,
+                                model.config["unpadded_vocab_size"], model.config["final_logit_softcapping"],
+                                pack=getattr(model, "proof_pack", None))
+    count("fused.head.table" if route == "native" else f"fallback.head.table_{route}")
+    return logits
 
 
 def embed_reason(model):
