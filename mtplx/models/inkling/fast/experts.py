@@ -118,6 +118,15 @@ inline void l3_e2m1x8(uint w, thread float* v) {
     v[0] = f04.x; v[1] = f15.x; v[2] = f26.x; v[3] = f37.x;
     v[4] = f04.y; v[5] = f15.y; v[6] = f26.y; v[7] = f37.y;
 }
+// The same eight values kept in float16 (no conversions), for the code products (CODES).
+inline void l3_e2m1x8h(uint w, thread half* v) {
+    const half2 f04 = as_type<half2>(((w & 0x00070007u) << 9) | ((w & 0x00080008u) << 12));
+    const half2 f15 = as_type<half2>(((w & 0x00700070u) << 5) | ((w & 0x00800080u) << 8));
+    const half2 f26 = as_type<half2>(((w & 0x07000700u) << 1) | ((w & 0x08000800u) << 4));
+    const half2 f37 = as_type<half2>(((w & 0x70007000u) >> 3) | (w & 0x80008000u));
+    v[0] = f04.x; v[1] = f15.x; v[2] = f26.x; v[3] = f37.x;
+    v[4] = f04.y; v[5] = f15.y; v[6] = f26.y; v[7] = f37.y;
+}
 // Four e4m3 codes of a word as the raw table values (MLX's fp8.h before its x 256).
 inline void l3_e4m3x4(uint w, thread float* v) {
     const float2 f02 = float2(as_type<half2>(((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8)));
@@ -588,6 +597,29 @@ INPUTS_ROWS = """
     }
 """
 
+# CODES (NVFP4 panels): the same roundings writing, in place of each rounded value, its e2m1 code's value
+# (exact in float16) and, once per 16-value group, the group's scale (the value is their product). The
+# group of element i is i / 16; its first lane writes the scale.
+_INPUTS_WRITE = "values[r * 2304 + i] = fused_quantize<bool(FP4)>(normed[i], peak, lane);"
+_INPUTS_ROWS_WRITE = "values[r * 2304 + i] = fused_quantize<bool(FP4)>(v, peak, lane);"
+_SWIGLU_WRITE = "values[p * W + c * THREADS + t] = fused_quantize<bool(FP4)>(h[c], peak, lane);"
+assert INPUTS.count(_INPUTS_WRITE) == 1 and INPUTS_ROWS.count(_INPUTS_ROWS_WRITE) == 1
+assert expert_fusion.SWIGLU.count(_SWIGLU_WRITE) == 1
+INPUTS_CODES = INPUTS.replace(_INPUTS_WRITE, """{
+                    float scale_;
+                    values[r * 2304 + i] = fused_quantize_code(normed[i], peak, lane, scale_);
+                    if ((lane & 15u) == 0u) xscale[r * 144 + i / 16] = scale_;
+                }""")
+INPUTS_ROWS_CODES = INPUTS_ROWS.replace(_INPUTS_ROWS_WRITE, """float scale_;
+            values[r * 2304 + i] = fused_quantize_code(v, peak, lane, scale_);
+            if ((lane & 15u) == 0u) xscale[r * 144 + i / 16] = scale_;""")
+SWIGLU_CODES = expert_fusion.SWIGLU.replace(_SWIGLU_WRITE, """{
+        float scale_;
+        const uint i_ = c * THREADS + t;
+        values[p * W + i_] = fused_quantize_code(h[c], peak, lane, scale_);
+        if ((lane & 15u) == 0u) xscale[p * (W / 16) + i_ / 16] = scale_;
+    }""")
+
 GATE_UP = """
     const uint tile = threadgroup_position_in_grid.x;
     const uint slot = threadgroup_position_in_grid.y;
@@ -967,6 +999,50 @@ PANEL = """
 #if HALF_LAST
                 if (b == NBLK - 1 && lane >= 16) break;
 #endif
+#if XC  // code products: begin
+                // NVFP4 code products (CODES): the weights decoded to float16 (MLX's fp4 values times
+                // 2^-14, no conversions), the member's 8 values as their e2m1 codes' values (float16)
+                // and its 16-value group's scale. A product of two such values is a multiple of 2^-16
+                // below 2^-7 and a lane's 8-product sum a multiple of 2^-16 below 2^-5 (|K| <= 1,152
+                // units): float16 holds every product and every partial sum exactly, in any order. The
+                // group scale times that sum (4 + 11 significant bits) is then exactly the float32 sum
+                // of the stored values times the codes (accum below), so tt and res are the same bits.
+                half wh[R][8];
+                float sv[R];
+                for (int q = 0; q < R; ++q) {
+                    const uint n = n0 + q;
+                    sv[q] = l3_e4m3(sexp[n * SW + 16 * b + lane / 2]) * SFOLD;
+                    l3_e2m1x8h(wexp[n * CW + 32 * b + lane], wh[q]);
+                }
+                for (uint m = 0; m < uint(MC); ++m) {
+                    if (m < mc) {
+                        const uint xrow = ps[XSEL + m0 + m];
+                        const uint4 u = *(const device uint4*)(xin + xrow * K + 256 * b + 8 * lane);
+                        const half2 x01 = as_type<half2>(u.x), x23 = as_type<half2>(u.y);
+                        const half2 x45 = as_type<half2>(u.z), x67 = as_type<half2>(u.w);
+                        const float xs = xscale[xrow * (K / 16) + 16 * b + lane / 2];
+                        for (int q = 0; q < R; ++q) {
+                            half k8 = 0.0h;     // from +0, as accum: a zero sum stays +0
+                            k8 = metal::fma(x01.x, wh[q][0], k8);
+                            k8 = metal::fma(x01.y, wh[q][1], k8);
+                            k8 = metal::fma(x23.x, wh[q][2], k8);
+                            k8 = metal::fma(x23.y, wh[q][3], k8);
+                            k8 = metal::fma(x45.x, wh[q][4], k8);
+                            k8 = metal::fma(x45.y, wh[q][5], k8);
+                            k8 = metal::fma(x67.x, wh[q][6], k8);
+                            k8 = metal::fma(x67.y, wh[q][7], k8);
+                            const float accum = xs * float(k8);
+#if FOLD
+                            const float tt = sv[q] * accum;
+#else
+                            const float full = accum * POW;
+                            const float tt = sv[q] * full;
+#endif
+                            res[m][q] = res[m][q] + tt;
+                        }
+                    }
+                }
+#else  // code products: else
                 float wv[R][NV];
                 float sv[R];
                 for (int q = 0; q < R; ++q) {
@@ -1020,6 +1096,7 @@ PANEL = """
                         }
                     }
                 }
+#endif  // code products: end
             }
             for (uint m = 0; m < uint(MC); ++m) {
                 if (m < mc) {
@@ -1044,7 +1121,15 @@ assert PANEL_WIDE.count("PAIRS_AT") == 1
 # Prompt chunks: the same products for pairs sorted by expert (the stock body's sort). The
 # threadgroup of expert e finds its members, a contiguous run of the sorted pairs, by binary
 # search, and writes each member's raw product at its sorted position.
-PANEL_PROMPT = (PANEL
+def _without_code_products(text):
+    """The panel text with its code-product branch (XC) removed, the stored-value body unconditional."""
+    head, rest = text.split("#if XC  // code products: begin\n")
+    _, rest = rest.split("#else  // code products: else\n")
+    body, tail = rest.split("#endif  // code products: end\n")
+    return head + body + tail
+
+
+PANEL_PROMPT = (_without_code_products(PANEL)
                 .replace("""    if (slot >= plan[0]) return;
     const device uint* ps = plan + 1 + slot * PLAN_STRIDE;
     const uint e = ps[0];
@@ -1164,8 +1249,37 @@ PANEL_GEOMETRY = {
     ("dn", False): dict(K=1152, CW=288, SW=36, NV=4, WPL=1, NBLK=9, SPL=8, POW="256.0f"),
 }
 
+_QUANTIZE_CODE = """
+// fused_quantize's NVFP4 rounding in its two parts: returns the chosen e2m1 code's value and sets
+// `scale` to its group's chosen scale (s6 or s4); fused_quantize returns their product, the same
+// multiply on the same two values. Same statements, same shuffles, so the same choice.
+inline float fused_quantize_code(float x, float peak, uint lane, thread float& scale) {
+    float outer = peak / 1536.0f;
+    uint first = lane & 16u;
+    float top = abs(x);
+    for (uint d = 1; d < 16; d *= 2)
+        top = max(top, simd_shuffle_xor(top, d));
+    float encoder = peak > 0 ? 1536.0f / peak : 0;
+    float s6 = fused_e4m3(top * (encoder / 6.0f));
+    float s4 = fused_e4m3(top * (encoder / 4.0f));
+    float ca = s6 == 0 ? 0 : fused_e2m1(x / (s6 * outer));
+    float cb = s4 == 0 ? 0 : fused_e2m1(x / (s4 * outer));
+    float a = s6 == 0 ? 0 : ca * s6;
+    float b = s4 == 0 ? 0 : cb * s4;
+    float ae = abs(a * outer - x), be = abs(b * outer - x);
+    for (uint d = 1; d < 16; d *= 2) {
+        ae += simd_shuffle_xor(ae, d);
+        be += simd_shuffle_xor(be, d);
+    }
+    const bool pick_b = simd_shuffle(be, first) < simd_shuffle(ae, first);
+    scale = pick_b ? s4 : s6;
+    return pick_b ? cb : ca;
+}
+"""
+
+
 def _header(extra=""):
-    return expert_fusion.HEADER + "constexpr constant int THREADS = 384;\n" + _HELPERS + extra
+    return expert_fusion.HEADER + "constexpr constant int THREADS = 384;\n" + _HELPERS + _QUANTIZE_CODE + extra
 
 
 @lru_cache(maxsize=None)
@@ -1181,6 +1295,10 @@ def _kernel(stage, fp4, defines=()):
         "inputs": (["source", "norm_w", "router", "consts"], ["logits", "values", *fp4_only("outer")], INPUTS, True),
         "inputs_rows": (["source", "norm_w", "router", "consts"], ["logits", "values", *fp4_only("outer")],
                         INPUTS_ROWS, True),
+        "inputs_codes": (["source", "norm_w", "router", "consts"], ["logits", "values", "outer", "xscale"],
+                         INPUTS_CODES, True),
+        "inputs_rows_codes": (["source", "norm_w", "router", "consts"], ["logits", "values", "outer", "xscale"],
+                              INPUTS_ROWS_CODES, True),
         "gate_up": (
             ["logits", "bias", "rconsts", "values", *fp4_only("row_outer"), "codes", "scales", *fp4_only("expert_outer")],
             ["h", "peaks", "experts_out", "prob_out"], GATE_UP, True,
@@ -1292,20 +1410,23 @@ PANEL_LAYOUT = {
 
 
 @lru_cache(maxsize=None)
-def _panel_kernel(product, fp4, fold, wide=False, xh=False):
+def _panel_kernel(product, fp4, fold, wide=False, xh=False, xc=False):
     g = PANEL_GEOMETRY[(product, fp4)]
     pairs_at = WIDE_PAIRS_AT if wide else 10
+    xc = bool(xc and fp4)
     defines = {"FP4": int(fp4), "NV": g["NV"], "WPL": g["WPL"], "NBLK": g["NBLK"],
                "HALF_LAST": int(product == "dn" and fp4), "CW": g["CW"], "SW": g["SW"], "SPL": g["SPL"],
                "K": g["K"], "POW": g["POW"], "XSEL": 2 if product == "gu" else pairs_at,
                "PLAN_STRIDE": PLAN_STRIDE_WIDE if wide else PLAN_STRIDE,
-               "FOLD": int(fold), "SFOLD": (g["POW"] if fold else "1.0f"), "XH": int(bool(xh and fp4))}
+               "FOLD": int(fold), "SFOLD": (g["POW"] if fold else "1.0f"), "XH": int(bool(xh and fp4)),
+               "XC": int(xc)}
     if wide:
         defines["PAIRS_AT"] = pairs_at
     extra = "".join(f"#define {k} {v}\n" for k, v in defines.items())
     name = (f"mtplx_inkling_panel_{product}_{'nvfp4' if fp4 else 'mxfp8'}_f{int(fold)}" + ("_wide" if wide else "")
-            + ("_xh" if xh and fp4 else ""))
-    return mx.fast.metal_kernel(name=name, input_names=["plan", "xin", "codes", "scales"], output_names=["raw"],
+            + ("_xc" if xc else "_xh" if xh and fp4 else ""))
+    inputs = ["plan", "xin", "xscale", "codes", "scales"] if xc else ["plan", "xin", "codes", "scales"]
+    return mx.fast.metal_kernel(name=name, input_names=inputs, output_names=["raw"],
                                 source=PANEL_WIDE if wide else PANEL, header=_header(extra), ensure_row_contiguous=True)
 
 
@@ -1360,11 +1481,13 @@ def _route_plan_kernel(wide=False):
                                 header=_header(f"#define PLAN_STRIDE {PLAN_STRIDE}\n"), ensure_row_contiguous=True)
 
 
-def _panel_raw(product, fp4, plan, xin, codes, scales, rows, layout=None):
+def _panel_raw(product, fp4, plan, xin, codes, scales, rows, layout=None, xscale=None):
+    """``xscale``: the members' group scales when ``xin`` holds their e2m1 codes' values (CODES)."""
     lay = layout or PANEL_LAYOUT[(product, fp4)]
     tgr = lay["S"] * lay["RPS"]
-    return _panel_kernel(product, fp4, lay.get("FOLD", 1), rows > PANEL_ROWS, xin.dtype == mx.float16)(
-        inputs=[plan, xin, codes, scales],
+    xc = xscale is not None
+    return _panel_kernel(product, fp4, lay.get("FOLD", 1), rows > PANEL_ROWS, xin.dtype == mx.float16, xc)(
+        inputs=[plan, xin, *([xscale] if xc else []), codes, scales],
         template=[("S", lay["S"]), ("RPS", lay["RPS"]), ("R", lay["R"]), ("MC", lay["MC"])],
         grid=((HIDDEN // tgr) * 32 * lay["S"], min(TOP_K * rows, EXPERTS), 1), threadgroup=(32 * lay["S"], 1, 1),
         output_shapes=[(rows * TOP_K, HIDDEN)], output_dtypes=[mx.float32],
@@ -1376,7 +1499,7 @@ def _pair_rows(rows):
     return mx.repeat(mx.arange(rows, dtype=mx.uint32), TOP_K)
 
 
-def _panel_products(block, fp4, rows, logits, values, outer, layouts=None, dtype=mx.bfloat16):
+def _panel_products(block, fp4, rows, logits, values, outer, layouts=None, dtype=mx.bfloat16, xscale=None):
     """Route + plan, gate-up products, RC6's SwiGLU and down-input rounding, down products
     (4 launches), each distinct expert of the panel read once."""
     pairs = rows * block.count
@@ -1388,18 +1511,31 @@ def _panel_products(block, fp4, rows, logits, values, outer, layouts=None, dtype
         output_dtypes=[mx.uint32, mx.float32, mx.uint32],
     )
     lay = layouts or {}
-    raw13 = _panel_raw("gu", fp4, plan, values, block.gate_up.codes, block.gate_up.scales, rows, lay.get("gu"))
-    mid, *mid_outer = expert_fusion._kernel("swiglu", fp4, _caps(float(block.gate_cap), float(block.up_cap)))(
+    raw13 = _panel_raw("gu", fp4, plan, values, block.gate_up.codes, block.gate_up.scales, rows, lay.get("gu"),
+                       xscale)
+    caps = _caps(float(block.gate_cap), float(block.up_cap))
+    codes = xscale is not None
+    mid, *mids = (_swiglu_codes_kernel(caps) if codes else expert_fusion._kernel("swiglu", fp4, caps))(
         inputs=[raw13, *([outer, block.gate_up.outer] if fp4 else []), experts, _pair_rows(rows)],
         template=[("T", dtype), ("W", MIDDLE), ("E", MIDDLE // expert_fusion.THREADS)],
         grid=(pairs * expert_fusion.THREADS, 1, 1), threadgroup=(expert_fusion.THREADS, 1, 1),
-        output_shapes=[(pairs, 1, MIDDLE), *([(pairs,)] if fp4 else [])],
-        # NVFP4 down inputs in float16 when the panel products read them so (exact, see PANEL's XH).
-        output_dtypes=[mx.float16 if fp4 and HALF_ACTIVATIONS else mx.float32] + ([mx.float32] if fp4 else []),
+        output_shapes=[(pairs, 1, MIDDLE), *([(pairs,)] if fp4 else []), *([(pairs, MIDDLE // 16)] if codes else [])],
+        # NVFP4 down inputs in float16 when the panel products read them so (exact, see PANEL's XH), or
+        # their codes' values and group scales (CODES).
+        output_dtypes=([mx.float16 if fp4 and (HALF_ACTIVATIONS or codes) else mx.float32]
+                       + ([mx.float32] if fp4 else []) + ([mx.float32] if codes else [])),
     )
     raw2 = _panel_raw("dn", fp4, plan, mid.reshape(pairs, MIDDLE), block.down.codes, block.down.scales, rows,
-                      lay.get("dn"))
-    return raw2, (mid_outer[0] if fp4 else None), experts, prob
+                      lay.get("dn"), mids[1] if codes else None)
+    return raw2, (mids[0] if fp4 else None), experts, prob
+
+
+@lru_cache(maxsize=None)
+def _swiglu_codes_kernel(caps):
+    """The fused SwiGLU and down-input rounding (NVFP4) writing codes' values and group scales (CODES)."""
+    name, inputs, outputs, _body, header = expert_fusion.kernel_spec("swiglu", True, caps)
+    return mx.fast.metal_kernel(name=name + "_codes", input_names=inputs, output_names=[*outputs, "xscale"],
+                                source=SWIGLU_CODES, header=header + _QUANTIZE_CODE)
 
 
 #: Which expert products serve a panel (all exact, class A):
@@ -1432,6 +1568,13 @@ def inputs_rows_at(rows):
 #: rows, gate-up 2-8%, down 2-8%, d1/receipts/ebench-e-10.json); "0" keeps float32 (the rollback).
 HALF_ACTIVATIONS = os.environ.get("MTPLX_INKLING_EXPERT_HALF_X", "1").lower() not in ("0", "off", "no")
 
+#: NVFP4 panels: the expert and down inputs written as their e2m1 codes' values (float16) with one scale per
+#: 16-value group, and each lane's 8-way product sum taken in float16 on the codes, then scaled once in
+#: float32 (PANEL's XC: every product and partial sum is exact in float16, so the float32 sum and every bit
+#: after it are the stored-value products'). Fewer operations a product: no conversions of the weights' or
+#: the activations' float16 values. "0" keeps the stored values.
+CODES = os.environ.get("MTPLX_INKLING_EXPERT_CODES", "0").lower() not in ("0", "off", "no")
+
 
 def products_for(rows):
     if PRODUCTS in ("mlx", "own"):
@@ -1458,15 +1601,20 @@ def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *
     common = (("W", rows),)
 
     rows_form = inputs_rows_at(rows)
-    half_values = fp4 and HALF_ACTIVATIONS and products == "panel"
-    logits, values, *outer = _kernel("inputs_rows" if rows_form else "inputs", fp4)(
+    codes = fp4 and CODES and products == "panel"
+    half_values = fp4 and (HALF_ACTIVATIONS or codes) and products == "panel"
+    logits, values, *outer = _kernel(("inputs_rows" if rows_form else "inputs") + ("_codes" if codes else ""), fp4)(
         inputs=[src, norm_weight, block.router, _consts(float(eps))],
         template=[*common, ("T", dtype)],
         grid=(32 * 256, 1 if rows_form else rows, 1), threadgroup=(256, 1, 1),
-        output_shapes=[(rows, EXPERTS), (rows, HIDDEN), *([(rows,)] if fp4 else [])],
-        # NVFP4 expert inputs in float16 when the panel products read them (exact, see PANEL's XH).
-        output_dtypes=[mx.float32, mx.float16 if half_values else mx.float32] + ([mx.float32] if fp4 else []),
+        output_shapes=[(rows, EXPERTS), (rows, HIDDEN), *([(rows,)] if fp4 else []),
+                       *([(rows, HIDDEN // 16)] if codes else [])],
+        # NVFP4 expert inputs in float16 when the panel products read them (exact, see PANEL's XH), or
+        # their codes' values (float16) and group scales (CODES, PANEL's XC).
+        output_dtypes=([mx.float32, mx.float16 if half_values else mx.float32] + ([mx.float32] if fp4 else [])
+                       + ([mx.float32] if codes else [])),
     )
+    xscale = outer.pop() if codes else None
 
     if stop_after == "inputs":
         return logits, values
@@ -1474,7 +1622,10 @@ def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *
     if products in ("mlx", "panel"):
         if products == "panel":
             raw, mid_outer_m, experts, prob = _panel_products(block, fp4, rows, logits, values,
-                                                              outer[0] if fp4 else None, panel_layouts, dtype)
+                                                              outer[0] if fp4 else None, panel_layouts, dtype,
+                                                              xscale)
+            if codes and trace is not None:   # the trace keeps the rounded values (codes times scales, exact)
+                values = values.astype(mx.float32) * mx.repeat(xscale, 16, axis=-1)
         else:
             raw, mid_outer_m, experts, prob = _mlx_products(block, fp4, rows, logits, values,
                                                             outer[0] if fp4 else None, dtype)
