@@ -162,7 +162,10 @@ def generate(
     target_temperature = float(sampler.temperature or 0.0)
     draft_temperature = float(draft_sampler.temperature) if draft_sampler is not None else target_temperature
     device_rounds = device_fallback_rounds = host_rounds = 0
-    depth_control = (fast_draft.DepthByYield(cost_ms=fast_draft.RC6_COST_MS_2K,
+    # No configured depth: the proposal count of each round is chosen before its draws from
+    # the yield of earlier rounds and this Mac's round costs (timed at load; RC6's table when
+    # the fast path is off), so every round stays exact.
+    depth_control = (fast_draft.DepthByYield(cost_ms=getattr(rt, "round_cost_ms", None) or fast_draft.RC6_COST_MS_2K,
                                              max_depth=rt.drafter.width - 1)
                      if depth is None else None)
     stop = (

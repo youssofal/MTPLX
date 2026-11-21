@@ -91,3 +91,30 @@ def test_public_stats_carry_the_fast_path_counters():
     from mtplx.server import openai
 
     assert "inkling_fast" in openai.PUBLIC_MTPLX_STATS_KEYS
+
+
+def _inkling_state(depth=3):
+    from mtplx.backends.descriptors import INKLING_DESCRIPTOR
+
+    return SimpleNamespace(runtime=SimpleNamespace(backend_id="inkling2_loop"), args=SimpleNamespace(depth=depth),
+                           backend_descriptor=INKLING_DESCRIPTOR)
+
+
+@pytest.mark.parametrize("depth,explicit,env,mode,auto", [
+    (3, False, None, "mtp", True),       # the launch default: the controller chooses each round
+    (3, True, None, "mtp", False),       # a client's depth wins
+    (5, False, None, "mtp", False),      # a launch depth other than the default wins
+    (3, False, "fixed", "mtp", False),   # pinned by the switch
+    (3, False, None, "ar", False),       # no drafts in AR
+])
+def test_inkling_depth_is_chosen_per_round_unless_pinned(monkeypatch, depth, explicit, env, mode, auto):
+    from mtplx.server import openai
+
+    if env:
+        monkeypatch.setenv("MTPLX_INKLING_DEPTH", env)
+    else:
+        monkeypatch.delenv("MTPLX_INKLING_DEPTH", raising=False)
+    monkeypatch.setattr(openai, "_backend_descriptor", lambda state: state.backend_descriptor)
+    state = _inkling_state(depth)
+    assert openai._inkling_auto_depth(state, mode, 0 if mode == "ar" else depth,
+                                      {"request_depth_explicit": explicit}) is auto

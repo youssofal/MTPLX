@@ -12,7 +12,7 @@ from . import expert_fusion
 from .draft import Drafter
 from .fast import engine_site
 from .fast import round as fast_round
-from .fast.decoder import DECLINED, FastDecoder, FastPending, fast_enabled
+from .fast.decoder import DECLINED, FastDecoder, FastPending, fast_enabled, measure_round_costs
 from .layout import cache_footprint
 from .model import load_target
 from .vision import VisionTower
@@ -43,6 +43,8 @@ class InklingRuntime(MTPLXRuntime):
         # the step's program for widths 1 to 8 on a synthetic state (no request touched), so
         # the first request neither compiles nor records.
         self.engine_warm, self.engine_pool_bytes = {"skipped": "fast path off"}, 0
+        # The depth controller's round costs on this Mac and pack (None: RC6's table).
+        self.round_cost_ms, self.round_cost_detail = None, "fast path off"
         if fast_enabled() and mx.default_device() == mx.gpu and mx.metal.is_available():
             # The round's kernels serve speculative rounds only: warm them where they run.
             if self.drafter is not None:
@@ -51,6 +53,15 @@ class InklingRuntime(MTPLXRuntime):
             # The executor's pool after warm-up (one pool serves every width's temporaries).
             executor = engine_site.health().get("executor") or {}
             self.engine_pool_bytes = int(executor.get("pool_bytes") or 0)
+            if self.drafter is not None:
+                try:
+                    self.round_cost_ms, self.round_cost_detail = measure_round_costs(self)
+                except Exception as exc:  # noqa: BLE001 - a timing pass must not stop the load
+                    # Said, not hidden: /health and every auto-depth request carry the reason,
+                    # and the controller prices rounds with RC6's table meanwhile.
+                    self.round_cost_ms = None
+                    self.round_cost_detail = f"round cost timing failed: {type(exc).__name__}: {exc}"
+                    print(f"[mtplx] inkling: {self.round_cost_detail}", flush=True)
 
     def resident_kv_bytes_per_token(self):
         return self.target_footprint.full_bytes_per_token

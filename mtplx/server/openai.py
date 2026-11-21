@@ -19854,8 +19854,14 @@ def _health_inkling_attention_payload(state: Any) -> dict[str, Any]:
         from mtplx.models.inkling.expert_fusion import expert_fusion_health
         from mtplx.models.inkling.head import inkling_first_use_stats
         from mtplx.models.inkling.short_conv import conv_route_counts
+        from mtplx.models.inkling.fast.decoder import fast_health
+
         blocks = [layer.experts.gate_up for layer in state.runtime.model.layers]
         return {"inkling_attention": attention_health(),
+                # The fast decode path: lane set, steps served, fallbacks, the native engine,
+                # the warm-up report and the depth controller's round costs on this Mac.
+                "inkling_fast": {**fast_health(state.runtime),
+                                 "engine_warm": getattr(state.runtime, "engine_warm", None)},
                 "inkling_convolution": conv_route_counts(),
                 "inkling_first_use": inkling_first_use_stats(),
                 "inkling_experts": {"sorted_panel_calls": sum(block.sorted_panel_calls for block in blocks),
@@ -32867,6 +32873,27 @@ def _resolve_draft_sampler_for_request(
     return effective
 
 
+def _inkling_auto_depth(
+    state: Any,
+    effective_mode: str,
+    effective_depth: int,
+    request_observability: dict[str, Any] | None,
+) -> bool:
+    """Inkling chooses each round's proposal count before its draws, from the yield of
+    earlier rounds and this Mac's round costs timed at load (exact: the choice depends only
+    on the past). A client's depth, a launch depth other than the family default, or
+    ``MTPLX_INKLING_DEPTH=fixed`` pins the depth instead."""
+    return (
+        getattr(getattr(state, "runtime", None), "backend_id", None) == "inkling2_loop"
+        and effective_mode != "ar"
+        and effective_depth > 0
+        and not bool((request_observability or {}).get("request_depth_explicit"))
+        and int(getattr(state.args, "depth", 3) or 3)
+        == _backend_descriptor(state).draft_semantics.default
+        and os.environ.get("MTPLX_INKLING_DEPTH", "auto").strip().lower() != "fixed"
+    )
+
+
 def _run_generation(
     state: ServerState,
     prompt_ids: list[int],
@@ -32968,6 +32995,20 @@ def _run_generation(
         _depth_policy = _engine_depth_policy(state.args)
         if _depth_policy["demoted"] and _depth_policy.get("depth"):
             effective_depth = min(effective_depth, int(_depth_policy["depth"]))
+    inkling_auto_depth = _inkling_auto_depth(
+        state, effective_mode, effective_depth, request_observability
+    )
+    if inkling_auto_depth:
+        drafter = getattr(state.runtime, "drafter", None)
+        # Memory and the verify width are priced at the deepest round the controller may pick.
+        effective_depth = max(effective_depth, int(getattr(drafter, "width", 8)) - 1)
+        if request_observability is not None:
+            request_observability["inkling_depth_policy"] = "auto"
+            request_observability["inkling_round_cost_ms"] = getattr(state.runtime, "round_cost_ms", None)
+            if getattr(state.runtime, "round_cost_ms", None) is None:
+                request_observability["inkling_round_cost_detail"] = getattr(
+                    state.runtime, "round_cost_detail", None
+                )
     # Include admission and pending-history waits in user-facing TTFT/wall
     # time. Decode still starts at the first produced token; throughput is
     # unaffected. Previously a 39s postcommit wait vanished from the receipt.
@@ -33344,7 +33385,7 @@ def _run_generation(
                         max_tokens=response_max,
                         sampler=sampler,
                         draft_sampler=effective_draft_sampler,
-                        speculative_depth=effective_depth,
+                        speculative_depth=None if inkling_auto_depth else effective_depth,
                         seed=generation_seed,
                         mtp_hidden_variant="post_norm",
                         mtp_cache_policy="persistent",
