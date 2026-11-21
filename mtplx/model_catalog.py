@@ -17,6 +17,7 @@ ones this machine should be offered.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -642,6 +643,74 @@ _INKLING_IDS = (
     "inkling2-mini-optimized-quality",
 )
 
+@dataclass(frozen=True)
+class PackIdentity:
+    """What a pack says about itself in its own ``mtplx-pack.json``."""
+
+    source: str
+    recipe: str
+    precision_variant: str | None = None
+
+
+_INKLING_SOURCE = "thinkingmachines/Inkling-2-Mini"
+
+# A folder that carries an Inkling pack's name is taken for that pack only when
+# its mtplx-pack.json says it is that build: the source, the recipe, and the
+# FP16 siblings' precision variant. The Mac the packs were built on kept two
+# research builds under the published repository names (20 November), and a
+# name alone served them as the catalog pack. The upstream revision is not
+# pinned: a pack rebuilt from new weights moves it, and an older app would then
+# refuse the new download. Mirrors MTPLXModelOption.packIdentities.
+PACK_IDENTITIES: dict[str, PackIdentity] = {
+    "inkling2-mini-bare-speed": PackIdentity(_INKLING_SOURCE, "bare-speed"),
+    "inkling2-mini-optimized-speed": PackIdentity(_INKLING_SOURCE, "speed"),
+    "inkling2-mini-optimized-quality": PackIdentity(_INKLING_SOURCE, "quality"),
+    "inkling2-mini-bare-speed-fp16": PackIdentity(_INKLING_SOURCE, "bare-speed", "fp16"),
+    "inkling2-mini-optimized-speed-fp16": PackIdentity(_INKLING_SOURCE, "speed", "fp16"),
+    "inkling2-mini-optimized-quality-fp16": PackIdentity(_INKLING_SOURCE, "quality", "fp16"),
+}
+
+
+def pack_identity_problem(path: str | Path, pack: CatalogModel) -> str | None:
+    """Why the folder at ``path`` is not ``pack`` although it carries its name;
+    None when it is, or when the catalog pins no identity for ``pack``."""
+
+    expected = PACK_IDENTITIES.get(pack.id)
+    if expected is None:
+        return None
+    try:
+        stamp = json.loads((Path(path) / "mtplx-pack.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return f"it has no readable mtplx-pack.json, so it cannot be shown to be {pack.display_name}"
+    if not isinstance(stamp, dict):
+        return f"its mtplx-pack.json is not a pack description, so it cannot be shown to be {pack.display_name}"
+    found = PackIdentity(
+        source=str(stamp.get("source") or ""),
+        recipe=str(stamp.get("recipe") or ""),
+        precision_variant=str(stamp.get("precision_variant") or "") or None,
+    )
+    if found == expected:
+        return None
+    built = str(stamp.get("display_name") or "").strip() or "another build"
+    precision = f", {found.precision_variant}" if found.precision_variant else ""
+    return f"its mtplx-pack.json says it is {built} (recipe {found.recipe or 'missing'}{precision}), not {pack.display_name}"
+
+
+def catalog_model_for_repo(repo_id: str) -> CatalogModel | None:
+    wanted = repo_id.strip().casefold()
+    for model in OFFICIAL_CATALOG:
+        if model.hf_model_id.casefold() == wanted:
+            return model
+    return None
+
+
+def repo_folder_identity_problem(path: str | Path, repo_id: str) -> str | None:
+    """:func:`pack_identity_problem` for the catalog pack published as ``repo_id``."""
+
+    pack = catalog_model_for_repo(repo_id)
+    return pack_identity_problem(path, pack) if pack is not None else None
+
+
 # Flash-Next options on modern chips; Optimized Speed and Quality lead from
 # 256 GiB. Mirrors MTPLXModelOption.flashNextIDs.
 _FLASH_NEXT_IDS = (
@@ -674,6 +743,7 @@ def catalog_model_matching(ref: str | Path | None) -> CatalogModel | None:
         return None
     normalized = _normalized(text)
     basename = _normalized(Path(text).name)
+    folder = Path(text).expanduser()
     for model in OFFICIAL_CATALOG:
         candidates = {
             _normalized(model.id),
@@ -682,6 +752,9 @@ def catalog_model_matching(ref: str | Path | None) -> CatalogModel | None:
             *(_normalized(alias) for alias in model.aliases),
         }
         if normalized in candidates or basename in candidates:
+            # A folder under a pack's name is that pack only if it says so (PACK_IDENTITIES).
+            if model.id in PACK_IDENTITIES and folder.is_dir() and pack_identity_problem(folder, model):
+                continue
             return model
     return None
 
@@ -943,7 +1016,7 @@ def scan_installed_models(
                     path=child,
                     name=child.name,
                     size_bytes=_directory_size_bytes(child),
-                    catalog=catalog_model_matching(child.name),
+                    catalog=catalog_model_matching(child),
                     root=root,
                     root_index=root_index,
                     is_primary=root_index == 0,

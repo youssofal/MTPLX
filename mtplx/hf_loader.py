@@ -628,9 +628,22 @@ def _cached_model_ready_for_repo(path: Path, repo_id: str) -> bool:
             _validate_pinned_laguna_files(path, repo_id)
         except RuntimeError:
             return False
-    if _repo_requires_qwen_mtplx_payload(repo_id):
-        return bool(validate_mtplx_model_files(path).get("ok"))
-    return True
+    if _repo_requires_qwen_mtplx_payload(repo_id) and not validate_mtplx_model_files(path).get("ok"):
+        return False
+    return _repo_folder_identity_problem(path, repo_id) is None
+
+
+def _repo_folder_identity_problem(path: Path, repo_id: str) -> str | None:
+    """Why a complete folder under ``repo_id``'s name is another build of it, or None.
+
+    The catalog pins what some packs must say about themselves (their own
+    mtplx-pack.json), because a name alone served a research build as the
+    published pack. Imported here because the catalog imports this module.
+    """
+
+    from mtplx.model_catalog import repo_folder_identity_problem
+
+    return repo_folder_identity_problem(path, repo_id)
 
 
 def huggingface_cache_path(repo_id: str) -> Path | None:
@@ -690,8 +703,19 @@ def resolve_model_path(
     shared = huggingface_cache_path(repo_id)
     if shared is not None and _cached_model_ready_for_repo(shared, repo_id):
         return shared
+    # A complete folder under this name that is another build was passed over:
+    # say so, so its owner knows why the download is asked for.
+    others: list[str] = []
+    for root in model_library_roots(cache_dir, search_dirs=search_dirs):
+        names = [safe_model_name(repo_id)] + ([repo_id.split("/", 1)[1]] if "/" in repo_id else [])
+        for name in dict.fromkeys(names):
+            folder = root / name
+            if cached_model_is_complete(folder):
+                problem = _repo_folder_identity_problem(folder, repo_id)
+                if problem:
+                    others.append(f"{folder} is not served: {problem}.")
     raise FileNotFoundError(
-        f"Model {repo_id} is not cached. Run: mtplx pull {repo_id}"
+        " ".join([f"Model {repo_id} is not cached.", *others, f"Run: mtplx pull {repo_id}"])
     )
 
 

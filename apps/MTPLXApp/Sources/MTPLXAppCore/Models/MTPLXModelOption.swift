@@ -239,11 +239,65 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
             let canonical = ModelLibrary.canonicalURL(for: expanded).path
             guard seen.insert(canonical).inserted else { continue }
             guard FileManager.default.fileExists(atPath: expanded) else { continue }
-            if Self.hasCompleteInstall(at: expanded) {
+            if Self.hasCompleteInstall(at: expanded), packIdentityProblem(at: expanded) == nil {
                 return canonical
             }
         }
         return nil
+    }
+
+    /// What a pack says about itself in its own `mtplx-pack.json`.
+    public struct PackIdentity: Equatable, Sendable {
+        public var source: String
+        public var recipe: String
+        public var precisionVariant: String?
+    }
+
+    /// A folder that carries an Inkling pack's name is taken for that pack only when its
+    /// mtplx-pack.json says it is that build: the source, the recipe, and the FP16 siblings'
+    /// precision variant. The Mac the packs were built on kept two research builds under the
+    /// published repository names (20 November), and a name alone served them as the catalog
+    /// pack. The upstream revision is not pinned: a pack rebuilt from new weights moves it, and an
+    /// older app would then refuse the new download. Mirrors `PACK_IDENTITIES` in
+    /// mtplx/model_catalog.py.
+    static let packIdentities: [String: PackIdentity] = {
+        let source = "thinkingmachines/Inkling-2-Mini"
+        return [
+            "inkling2-mini-bare-speed": PackIdentity(source: source, recipe: "bare-speed"),
+            "inkling2-mini-optimized-speed": PackIdentity(source: source, recipe: "speed"),
+            "inkling2-mini-optimized-quality": PackIdentity(source: source, recipe: "quality"),
+            "inkling2-mini-bare-speed-fp16": PackIdentity(source: source, recipe: "bare-speed", precisionVariant: "fp16"),
+            "inkling2-mini-optimized-speed-fp16": PackIdentity(source: source, recipe: "speed", precisionVariant: "fp16"),
+            "inkling2-mini-optimized-quality-fp16": PackIdentity(source: source, recipe: "quality", precisionVariant: "fp16"),
+        ]
+    }()
+
+    /// Why the folder at `path` is not this pack although it carries its name; nil when it is,
+    /// or when the catalog pins no identity for this pack. Mirrors `pack_identity_problem`.
+    public func packIdentityProblem(at path: String) -> String? {
+        guard let expected = Self.packIdentities[id] else { return nil }
+        let stampURL = URL(fileURLWithPath: Self.expand(path), isDirectory: true)
+            .appendingPathComponent("mtplx-pack.json")
+        guard let data = try? Data(contentsOf: stampURL) else {
+            return "it has no readable mtplx-pack.json, so it cannot be shown to be \(displayName)"
+        }
+        guard let stamp = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return "its mtplx-pack.json is not a pack description, so it cannot be shown to be \(displayName)"
+        }
+        func text(_ key: String) -> String? {
+            guard let value = stamp[key] as? String, !value.isEmpty else { return nil }
+            return value
+        }
+        let found = PackIdentity(
+            source: text("source") ?? "",
+            recipe: text("recipe") ?? "",
+            precisionVariant: text("precision_variant")
+        )
+        if found == expected { return nil }
+        let built = text("display_name")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let precision = found.precisionVariant.map { ", \($0)" } ?? ""
+        let recipe = found.recipe.isEmpty ? "missing" : found.recipe
+        return "its mtplx-pack.json says it is \(built.isEmpty ? "another build" : built) (recipe \(recipe)\(precision)), not \(displayName)"
     }
 
     public var isInstalled: Bool {
@@ -432,6 +486,17 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
     }
 
     public func matches(_ model: String) -> Bool {
+        guard nameMatches(model) else { return false }
+        // A folder under this pack's name is this pack only if it says so (packIdentities).
+        guard Self.packIdentities[id] != nil else { return true }
+        var isDirectory: ObjCBool = false
+        let path = Self.expand(model)
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+              isDirectory.boolValue else { return true }
+        return packIdentityProblem(at: path) == nil
+    }
+
+    private func nameMatches(_ model: String) -> Bool {
         let normalized = Self.normalized(model)
         let basename = Self.normalized(URL(fileURLWithPath: model).lastPathComponent)
         if normalized == Self.normalized(id) { return true }

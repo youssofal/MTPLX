@@ -149,4 +149,72 @@ final class InklingLaunchContractTests: XCTestCase {
             "inkling-2-mini-mtplx-native-experts-quality"
         )
     }
+
+    /// A folder that carries a pack's name is that pack only when its own mtplx-pack.json says so
+    /// (source, recipe, FP16 variant): the Mac the packs were built on kept research builds under the
+    /// published names, and the app launched them as the catalog pack. Mirrors
+    /// tests/test_inkling_pack_identity.py.
+    func testAFolderUnderAPackNameIsThatPackOnlyWhenItSaysSo() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        func pack(_ name: String, _ stamp: [String: Any]?) throws -> String {
+            let folder = root.appendingPathComponent(name, isDirectory: true)
+            try? FileManager.default.removeItem(at: folder)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            for file in ["config.json", "tokenizer.json"] {
+                try "{}".write(to: folder.appendingPathComponent(file), atomically: true, encoding: .utf8)
+            }
+            for file in ["model.safetensors", "mtp.safetensors"] {
+                try Data([0]).write(to: folder.appendingPathComponent(file))
+            }
+            if let stamp {
+                try JSONSerialization.data(withJSONObject: stamp).write(to: folder.appendingPathComponent("mtplx-pack.json"))
+            }
+            return ModelLibrary.canonicalURL(for: folder.path).path
+        }
+        let source = "thinkingmachines/Inkling-2-Mini"
+        let library = ModelLibrary(primaryDirectory: root.path)
+        let quality = try XCTUnwrap(MTPLXModelOption.officialCatalog.first { $0.id == "inkling2-mini-optimized-quality" })
+        let qualityFP16 = try XCTUnwrap(MTPLXModelOption.officialCatalog.first { $0.id == "inkling2-mini-optimized-quality-fp16" })
+
+        // The 20 November research build, under the name a download makes.
+        let research = try pack("Youssofal--Inkling-2-Mini-MTPLX-Optimized-Quality",
+                                ["display_name": "Inkling 2 Mini Research Q8 Experts", "recipe": "research-all-q8", "source": source])
+        XCTAssertNotEqual(quality.installedLocalPath(in: library), research)
+        XCTAssertFalse(quality.matches(research))
+        XCTAssertNil(MTPLXModelOption.option(matching: research))
+        // It keeps its own folder's name, the one the engine serves it under (public_model_id_for_ref).
+        XCTAssertEqual(OpenCodeIntegration.modelID(for: research), "youssofal-inkling-2-mini-mtplx-optimized-quality")
+        XCTAssertEqual(quality.packIdentityProblem(at: research),
+                       "its mtplx-pack.json says it is Inkling 2 Mini Research Q8 Experts (recipe research-all-q8), not Inkling 2 Mini Optimized Quality")
+
+        // No stamp at all proves nothing either.
+        let unstamped = try pack("Youssofal--Inkling-2-Mini-MTPLX-Optimized-Quality", nil)
+        XCTAssertNotEqual(quality.installedLocalPath(in: library), unstamped)
+        XCTAssertFalse(quality.matches(unstamped))
+
+        // The published pack is found and named as before.
+        let published = try pack("Youssofal--Inkling-2-Mini-MTPLX-Optimized-Quality",
+                                 ["display_name": "Inkling 2 Mini Optimized Quality", "recipe": "quality", "source": source])
+        XCTAssertEqual(quality.installedLocalPath(in: library), published)
+        XCTAssertTrue(quality.matches(published))
+        XCTAssertEqual(MTPLXModelOption.option(matching: published)?.id, quality.id)
+        XCTAssertEqual(OpenCodeIntegration.modelID(for: published), "mtplx-inkling-2-mini-optimized-quality")
+
+        // FP16: the BF16 build under the FP16 name is not the FP16 pack; the sibling is.
+        let bf16UnderFP16Name = try pack("Youssofal--Inkling-2-Mini-MTPLX-Optimized-Quality-FP16",
+                                         ["display_name": "Inkling 2 Mini Optimized Quality", "recipe": "quality", "source": source])
+        XCTAssertNotEqual(qualityFP16.installedLocalPath(in: library), bf16UnderFP16Name)
+        XCTAssertFalse(qualityFP16.matches(bf16UnderFP16Name))
+        let sibling = try pack("Youssofal--Inkling-2-Mini-MTPLX-Optimized-Quality-FP16",
+                               ["display_name": "Inkling 2 Mini Optimized Quality FP16", "recipe": "quality",
+                                "source": source, "precision_variant": "fp16"])
+        XCTAssertEqual(qualityFP16.installedLocalPath(in: library), sibling)
+        XCTAssertTrue(qualityFP16.matches(sibling))
+        XCTAssertFalse(quality.matches(sibling))
+
+        // Names that are not folders on this Mac match as before.
+        XCTAssertTrue(quality.matches("/Users/u/.mtplx/models/Inkling-2-Mini-MTPLX-Optimized-Quality"))
+        XCTAssertTrue(quality.matches("Youssofal/Inkling-2-Mini-MTPLX-Optimized-Quality"))
+    }
 }

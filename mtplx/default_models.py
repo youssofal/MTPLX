@@ -16,6 +16,7 @@ from mtplx.model_catalog import (
     MODERN_TIER,
     CatalogModel,
     catalog_model_with_id,
+    pack_identity_problem,
     recommended_models,
 )
 from mtplx.profiles import (
@@ -337,7 +338,11 @@ def _complete_local_model_ref(candidates: tuple[str, ...]) -> str | None:
 
 
 def catalog_model_ref(pack: CatalogModel) -> str:
-    """Prefer a complete copy in configured libraries, including released aliases."""
+    """Prefer a complete copy in configured libraries, including released aliases.
+
+    A folder under one of the pack's names that says it is another build
+    (``pack_identity_problem``) is passed over, never served as the pack.
+    """
     from mtplx.hf_loader import cached_model_is_complete, model_library_roots
 
     basename = Path(pack.hf_model_id).name
@@ -346,7 +351,7 @@ def catalog_model_ref(pack: CatalogModel) -> str:
     for root in model_library_roots():
         for name in names:
             candidate = root / name
-            if cached_model_is_complete(candidate):
+            if cached_model_is_complete(candidate) and pack_identity_problem(candidate, pack) is None:
                 return str(candidate)
     return pack.hf_model_id
 
@@ -656,6 +661,9 @@ def _public_model_id_from_name(value: str) -> str | None:
         names = {public_id, pack.id, pack.hf_model_id.lower(), Path(pack.hf_model_id).name.lower(),
                  *(a.lower() for a in pack.aliases if " " not in a)}
         if components & names:
+            folder = Path(text).expanduser()
+            if folder.is_dir() and pack_identity_problem(folder, pack):
+                continue  # another build under the pack's name keeps a name of its own
             return public_id
     if FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID in components:
         return FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID
