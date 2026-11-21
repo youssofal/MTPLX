@@ -118,23 +118,17 @@ def same(a, b):
     return a.shape == b.shape and a.dtype == b.dtype and bool(mx.array_equal(a.view(view), b.view(view)).item())
 
 
-#: (inputs and combine launches, NVFP4 activations in float16, NVFP4 code products): the earlier forms
-#: and the new ones.
-FORMS = [("row", False, False), ("rows", True, False), ("rows", True, True)]
-
-
-def form_id(form):
-    return f"{form[0]}-{'half' if form[1] else 'float'}" + ("-codes" if form[2] else "")
+#: (inputs and combine launches, NVFP4 activations in float16): the earlier forms and the new ones.
+FORMS = [("row", False), ("rows", True)]
 
 
 def set_form(monkeypatch, form):
     monkeypatch.setattr(fx, "GLUE", form[0])
     monkeypatch.setattr(fx, "HALF_ACTIVATIONS", form[1])
-    monkeypatch.setattr(fx, "CODES", form[2])
 
 
 @needs_gpu
-@pytest.mark.parametrize("form", FORMS, ids=form_id)
+@pytest.mark.parametrize("form", FORMS, ids=lambda f: f"{f[0]}-{'half' if f[1] else 'float'}")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16], ids=str)
 @pytest.mark.parametrize("products", ["mlx", "own", "panel"])
 @pytest.mark.parametrize("mode", ["nvfp4", "mxfp8"])
@@ -171,7 +165,7 @@ def test_bits_and_row_stability_at_every_width(mode, tie, products, dtype, form,
 
 
 @needs_gpu
-@pytest.mark.parametrize("form", FORMS, ids=form_id)
+@pytest.mark.parametrize("form", FORMS, ids=lambda f: f"{f[0]}-{'half' if f[1] else 'float'}")
 @pytest.mark.parametrize("mode", ["nvfp4", "mxfp8"])
 def test_wide_panels_give_the_gathered_products_bits_and_row_stability(mode, form, monkeypatch):
     """9 to 32 rows (a copy round's verify) on the wide plan: the bits of the gathered route they
