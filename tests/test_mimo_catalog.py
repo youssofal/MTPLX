@@ -148,7 +148,9 @@ def test_the_checkpoint_inspection_never_yields_the_mimo_family():
 @pytest.mark.parametrize("memory_gib,expected", [
     (15.9, TINY),
     (16, [BONSAI, MIMO, NINE, *TINY]),
-    (24, [BONSAI, MIMO, NINE, *TINY]),
+    # From 24 GiB Inkling 2 Mini Bare Speed rides directly after the tier's first pick
+    # (INKLING_TIGHT_MAC_OFFER, on since 1282d177).
+    (24, [BONSAI, "inkling2-mini-bare-speed", MIMO, NINE, *TINY]),
 ])
 def test_small_modern_tiers(memory_gib, expected):
     assert recommended_catalog_ids(memory_gib=memory_gib, chip_tier=MODERN_TIER) == expected
