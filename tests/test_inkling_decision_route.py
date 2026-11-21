@@ -235,6 +235,28 @@ def test_a_table_not_plausible_against_the_one_row_round_is_refused(monkeypatch)
     assert decoder.implausible((20.0, 70.0, 73.0)) and decoder.implausible((20.0, 25.0, 50.0))
 
 
+@pytest.mark.parametrize("pack, program, one_row, commit", [
+    # L5's gate item 1 on RC2 (21 November, a busy load): least squares through inflated high
+    # widths priced a 1-proposal round below the one-row round (native, Bare Speed) or gave a
+    # slope a third of the one-row round (Optimized Speed), and every round served 1 proposal.
+    ("native", {1: 25, 2: 28, 3: 32, 4: 36, 5: 45, 6: 83, 7: 86}, 30.95, 2.94),
+    ("bare", {1: 20, 2: 24, 3: 30, 4: 37, 5: 57, 6: 67, 7: 69}, 20.09, 2.05),
+    ("optimized_speed", {1: 23, 2: 27, 3: 36, 4: 50, 5: 59, 6: 58, 7: 61}, 21.05, 2.26),
+])
+def test_the_degenerate_tables_of_a_busy_load_are_refused_and_the_pieces_serve(monkeypatch, pack, program,
+                                                                              one_row, commit):
+    from mtplx.models.inkling.fast import decoder
+
+    asked = []
+    monkeypatch.setattr(decoder, "measure_round_costs", _pieces(asked, one_row=one_row, per=4.0, commit=commit))
+    monkeypatch.delenv("MTPLX_INKLING_ROUND_COMMIT", raising=False)
+    table, detail = decoder.round_costs(_cost_rt({k: float(v) for k, v in program.items()}))
+    assert detail["refused"][0]["source"] == "program_warm"
+    assert detail["source"] == "pieces" and asked == [[], None]
+    assert table[1] >= table[0] and decoder.implausible(table) is None
+    assert all(b >= a for a, b in zip(table[1:], table[2:]))
+
+
 def test_the_committing_round_switch_is_one_for_the_loop_and_the_warm_up(monkeypatch):
     from mtplx.models.inkling.fast.decoder import round_commit_enabled
 

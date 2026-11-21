@@ -33022,6 +33022,11 @@ def _run_generation(
             request_observability["inkling_round_cost_source"] = (
                 cost_detail.get("source") if isinstance(cost_detail, dict) else None
             )
+            refused = cost_detail.get("refused") if isinstance(cost_detail, dict) else None
+            if refused:
+                # A table refused at load (not plausible against the one-row round): said in every
+                # request it would have priced, beside the source that priced it instead.
+                request_observability["inkling_round_cost_refused"] = [r.get("reason") for r in refused]
             if getattr(state.runtime, "round_cost_ms", None) is None:
                 request_observability["inkling_round_cost_detail"] = cost_detail
     # Include admission and pending-history waits in user-facing TTFT/wall

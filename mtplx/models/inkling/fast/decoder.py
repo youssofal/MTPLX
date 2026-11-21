@@ -233,7 +233,9 @@ def measure_round_costs(rt, *, length=1100, reps=5, seed=20261121, proposals=Non
     for _ in range(reps):
         for w in widths:
             samples[w].append(timed(lambda w=w: step(w))[1])
-    step_ms = {w: statistics.median(samples[w]) for w in widths}
+    # The least of the samples: contention (another process, a hot GPU) only adds time, and the
+    # round program's warm-up keeps its least native call too, so the two compare like for like.
+    step_ms = {w: min(samples[w]) for w in widths}
     drafter.observe([h[:, :1] for h in outputs[1][1]], draft_cache)
     draft_ms, decide_ms, laws = {0: 0.0}, {0: 0.0}, {}
 
@@ -275,11 +277,15 @@ def measure_round_costs(rt, *, length=1100, reps=5, seed=20261121, proposals=Non
     return cost, detail
 
 
-#: A table is plausible against the one-row round timed beside it when its one-proposal round
-#: costs between half and three times the one-row round and each further proposal adds no more
-#: than one one-row round (and takes off no more than a tenth of one). Outside that, the timing
-#: caught something other than these rounds: another job, a hot GPU, a round that ran on MLX.
-PLAUSIBLE_FIRST = (0.5, 3.0)
+#: A table is plausible against the one-row round timed beside it when a round with a proposal
+#: costs at least the one-row round and at most three times it, and each further proposal adds
+#: between nothing and PER_PROPOSAL_MAX of the one-row round (tonight's fresh loads: 0.25 on Bare
+#: Speed, 0.17 on the native pack). Outside that, the timing caught something other than these
+#: rounds (another process, a hot GPU, a round on MLX), and the controller would choose depths
+#: from noise: on 21 November a 1-proposal round priced below the one-row round made every
+#: round 1 proposal on all three packs (L5, gate item 1).
+PLAUSIBLE_FIRST_MAX = 3.0
+PER_PROPOSAL_MAX = 0.3
 
 
 def fit_round_costs(raw):
@@ -322,13 +328,17 @@ def implausible(table):
     one = table[0] if table else None
     if not one or one <= 0:
         return "no one-row round"
-    low, high = PLAUSIBLE_FIRST
-    if len(table) > 1 and not low * one <= table[1] <= high * one:
-        return f"one proposal costs {table[1]} ms against the one-row round's {one} ms"
+    if len(table) > 1 and table[1] < one:
+        return f"one proposal costs {table[1]} ms, less than the one-row round's {one} ms"
+    if len(table) > 1 and table[1] > PLAUSIBLE_FIRST_MAX * one:
+        return f"one proposal costs {table[1]} ms, over {PLAUSIBLE_FIRST_MAX} times the one-row round's {one} ms"
     for k in range(2, len(table)):
         added = table[k] - table[k - 1]
-        if not -0.1 * one <= added <= one:
-            return f"proposal {k} adds {round(added, 2)} ms against the one-row round's {one} ms"
+        if added < 0:
+            return f"proposal {k} makes the round {round(-added, 2)} ms cheaper"
+        if added > PER_PROPOSAL_MAX * one:
+            return (f"proposal {k} adds {round(added, 2)} ms, over {PER_PROPOSAL_MAX} of the one-row "
+                    f"round's {one} ms")
     return None
 
 
