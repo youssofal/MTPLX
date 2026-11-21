@@ -288,6 +288,80 @@ def _chronological_verify(operands, window):
     return (out if reason is None else None), reason, ("passed" if reason is None else "declined")
 
 
+#: The one-launch prompt attention (``fast.prompt_flash``), class C against the routes below:
+#: off until the founder accepts its class; ``MTPLX_INKLING_PROMPT_FLASH=on`` serves it.
+_FLASH_ENV = "MTPLX_INKLING_PROMPT_FLASH"
+_flash_checks = {}
+
+
+def _note_route(counter):
+    with _lock:
+        active = _request.get()
+        fresh = counter not in _counts
+        _counts[counter] += 1
+        if active is not None:
+            counts = active[0]["graph_selections"]
+            counts[counter] = counts.get(counter, 0) + 1
+    if fresh:
+        _log.info("Inkling attention %s", counter)
+
+
+def _flash_first_use(dtype, window):
+    """Once per dtype and visit kind: the launch against the definition in float32 on a synthetic
+    call (200 rows; a history crossing the bias extent). Bounds: twice the rounding the query type
+    itself puts on a result (bf16 1.7e-3, fp16 2.4e-4 relative RMS measured, lanes/p2/fcheck-3)."""
+    from .fast import prompt_flash as F
+
+    spec = (str(dtype), bool(window))
+    with _lock:
+        if spec in _flash_checks:
+            return _flash_checks[spec]
+    rows, keys = 200, 2248
+    ks = mx.random.split(mx.random.key(20261121), 5)
+
+    def clipped(shape, limit, key):
+        v = mx.random.normal(shape, key=key) * 2.2
+        return (v * mx.minimum(1.0, limit / (mx.linalg.norm(v, axis=-1, keepdims=True) + 1e-6))).astype(dtype)
+
+    q = clipped((1, rows, 24, 128), 22.6, ks[0]).transpose(0, 2, 1, 3)
+    k = clipped((1, 8, keys, 128), 22.6, ks[1])
+    v = mx.fast.rms_norm(mx.random.normal((1, 8, keys, 128), key=ks[2]), None, 1e-6).astype(dtype)
+    prof = clipped((1, rows, 24, 1024), 8.0, ks[3])
+    sink = (mx.random.normal((1, rows, 24), key=ks[4]) * 3.0).astype(dtype)
+    w = 1024 if window else 0
+    bound = 3.5e-3 if dtype == mx.bfloat16 else 5e-4
+    try:
+        got = F.flash_attention(q, k, v, prof, sink, w).astype(mx.float32)
+        ref = F.reference(q, k, v, prof, sink, w)
+        d = got - ref
+        rms = mx.sqrt(mx.mean(d * d)) / mx.sqrt(mx.mean(ref * ref))
+        ok = mx.all(mx.isfinite(got)) & (rms <= bound)
+        mx.eval(ok, rms)
+        reason = None if bool(ok.item()) else "first_use_numbers"
+        if reason:
+            _log.warning("Inkling prompt flash %s first-use relative RMS %g over %g", spec, rms.item(), bound)
+    except (RuntimeError, ValueError, TypeError) as exc:
+        _log.warning("Inkling prompt flash %s first use failed: %s", spec, exc)
+        reason = "first_use_error"
+    with _lock:
+        _flash_checks[spec] = reason
+    return reason
+
+
+def _flash_route(operands, window):
+    """The prompt call in one launch, or None (counted) where the switch is off or it declines."""
+    if os.environ.get(_FLASH_ENV, "off").strip().lower() not in ("1", "on", "true", "yes"):
+        return None
+    from .fast import prompt_flash as F
+
+    scope = "window" if window else "full"
+    reason = F.decline(*operands, window)
+    if reason is None:
+        reason = _flash_first_use(operands[0].dtype, window)
+    _note_route(f"prompt_flash.{scope}." + ("selected" if reason is None else "stock." + reason))
+    return None if reason is not None else F.flash_attention(*operands, window)
+
+
 def _prompt_route(operands, window):
     """Prompt calls (more than 32 rows) on exact routes, or None where they decline (counted).
 
@@ -296,10 +370,14 @@ def _prompt_route(operands, window):
     computes the same rows bit for bit with one read of the history per 16 rows. Calls RC6
     keeps on MLX's full kernel (window visits, shorter histories): the same calls merged into
     fewer, larger ones (``merged_attention``), the same bits per row. Runs only in RC6's default
-    stock mode; an explicitly chosen trial mode keeps its own route.
+    stock mode; an explicitly chosen trial mode keeps its own route. With the one-launch route
+    switched on (``MTPLX_INKLING_PROMPT_FLASH=on``) it serves every prompt call it can.
     """
     from .fast import prefill_attend as P
 
+    flash = _flash_route(operands, window)
+    if flash is not None:
+        return flash
     forced = os.environ.get("MTPLX_INKLING_PROMPT_ATTENTION", "fused") == "stock"
     scope = "window" if window else "full"
     reason = "forced_stock" if forced else "window" if window else P.decline(*operands, window)
