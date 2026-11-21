@@ -120,10 +120,9 @@ def test_the_wide_tilings_give_the_same_bits(mode, rows, wide):
 
 def test_the_tiling_follows_rows_an_expert(monkeypatch):
     monkeypatch.delenv("MTPLX_INKLING_PROMPT_EXPERT_TILES", raising=False)
-    assert PE.tiling(40 * 8, EXPERTS) == (PE.BM, None)
-    floor, shape = PE.WIDE_PLAN[0]
-    if shape is not None:
-        assert PE.tiling(int(floor * EXPERTS), EXPERTS) == (32 * shape[0], shape)
+    for floor, shape in PE.WIDE_PLAN:
+        want = (PE.BM, None) if shape is None else (32 * shape[0], shape)
+        assert PE.tiling(max(1, int(floor * EXPERTS)), EXPERTS) == want
     monkeypatch.setenv("MTPLX_INKLING_PROMPT_EXPERT_TILES", "narrow")
     assert PE.tiling(4096 * 8, EXPERTS) == (PE.BM, None)
     monkeypatch.setenv("MTPLX_INKLING_PROMPT_EXPERT_TILES", "2x4")

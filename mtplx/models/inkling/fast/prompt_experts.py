@@ -462,8 +462,13 @@ _STORE_ROUNDED = """                if (r < live) {
 
 
 #: (SGM, SGN) of the wide tiling by average pairs an expert; None keeps the narrow kernel (64 x 64 a
-#: threadgroup, 64 deep a step). Measured, `lanes/p1/pe-wide-*.json`.
-WIDE_PLAN = ((96, (4, 2)), (0, None))
+#: threadgroup, 64 deep a step). Measured on one layer's real weights, gate-up and down together
+#: (`lanes/p1/pe-wide-2.json`, provisional): the 2 x 2 tiling (the narrow kernel's 64 x 64 block with the
+#: double-buffered 32-deep decode and four-value row loads) is the fastest or within 1.5% at every width, both
+#: formats: NVFP4 2.51 -> 2.14 ms at 512 rows, 4.38 -> 3.64 at 1,024, 11.60 -> 9.15 at 2,048, 44.0 -> 34.0 at
+#: 4,096; MXFP8 2.78 -> 2.56, 5.51 -> 4.81, 17.13 -> 14.26, 47.9 -> 38.3. Larger blocks (4 x 2, 2 x 4, 4 x 4)
+#: are slower.
+WIDE_PLAN = ((0, (2, 2)),)
 
 
 def tiling(pairs, n_experts):
