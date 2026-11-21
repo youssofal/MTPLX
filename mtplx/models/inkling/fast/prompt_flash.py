@@ -337,6 +337,25 @@ def library_text():
     return library_headers.text("tensor_tiles")
 
 
+def runs_here():
+    """Whether the stage can read prompt chunks on this Mac and settings at all, before a prompt's length and the
+    memory decide each chunk: switched on, the stock attention mode, not forced to the stock prompt attention, a
+    GPU with the tensor units, the installed library's headers. The read's width and its memory pricing
+    (``prompt_route.flash_attention_on``) assume the stage only where this holds: a Mac without the tensor units
+    (M1 to M4) reads on the stock attention, whose planes grow with width times context."""
+    from .. import attention as A
+
+    if not A.flash_switch_on():
+        return False
+    if os.environ.get("MTPLX_INKLING_ATTENTION", "stock") != "stock":
+        return False
+    if os.environ.get("MTPLX_INKLING_PROMPT_ATTENTION", "fused") == "stock":
+        return False
+    if mx.default_device() != mx.gpu or not mx.metal.is_available() or not tensor_units():
+        return False
+    return library_text()[0] is not None
+
+
 @lru_cache(maxsize=None)
 def _kernel(gated=False):
     text, why = library_text()
@@ -355,9 +374,10 @@ def _kernel(gated=False):
     )
 
 
-@lru_cache(maxsize=1)
 def tensor_units():
-    """Whether this Mac has the tensor units (and macOS) the launch is written for."""
+    """Whether this Mac has the tensor units (and macOS) the launch is written for. Read per call, like
+    ``nax_available`` (its hardware probe is cached; the M1 to M4 rehearsal switch is not, so a profile or a test
+    that sets it after import is obeyed)."""
     from mtplx.nax_detect import nax_available
 
     return bool(nax_available())
