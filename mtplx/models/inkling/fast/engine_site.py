@@ -71,16 +71,38 @@ def _output_name(index: int) -> str:
     return f"visit[{visit}].{('keys', 'values', 'k_taps', 'v_taps', 'attn_taps', 'mlp_taps')[part]}"
 
 
+def weight_tables() -> list:
+    """Arrays made once from the weights and kept for the process, which a recorded launch reads
+    as it reads a weight: lane L1's joined scales and biases (one bf16 buffer a layer of a 4-bit
+    pack, 1.2 MB each, ``attn_input.joined_scales``). They are not module parameters, so the sites
+    pin them before every recording. Unpinned, every program held all 24 as constants, snapshot
+    and kept twice (about 60 MB a program on the 4-bit packs against 2 MB on the native pack):
+    the 256 MB budget then held four programs a site, and the other widths were evicted and
+    recorded again on use (21 November: Bare Speed's round site 16 programs built, 12 evicted
+    in one served pair; the load's timing passes found their widths evicted)."""
+    from .attn_input import _joined_sb
+
+    tables = []
+    for _ref, (table, _offsets) in list(_joined_sb.values()):
+        if table is not None:
+            tables.append(table)
+    return tables
+
+
 def site(rt: Any):
     """The process's step site for this runtime (made on first use)."""
-    return sites.site_for(
-        rt, _ATTRIBUTE, NAME,
-        weights=_weights, pin_operands=True, names=_named_weights,
-        output_names=_output_name,
-        # The step only reads its inputs, so a view (a convolution tail cut from a longer
-        # array, a window right after prefill) is replayed as bound, not fenced.
-        fence_strided=False,
-    )
+    replay = getattr(rt, _ATTRIBUTE, None)
+    if replay is None:
+        replay = sites.site_for(
+            rt, _ATTRIBUTE, NAME,
+            weights=_weights, pin_operands=True, names=_named_weights,
+            output_names=_output_name,
+            # The step only reads its inputs, so a view (a convolution tail cut from a longer
+            # array, a window right after prefill) is replayed as bound, not fenced.
+            fence_strided=False,
+        )
+        replay.pin_before_each_recording(weight_tables)
+    return replay
 
 
 class RoundState:

@@ -120,8 +120,10 @@ def site(rt: Any):
             # place), so the site settles copies only when the committing round is on.
             settle_copies=_commit_enabled(),
         )
-        # The round's kept constants (sizes, per-row parameters, modes) are bound in place.
+        # The round's kept constants (sizes, per-row parameters, modes) are bound in place, and
+        # so are the tables made once from the weights (see ``engine_site.weight_tables``).
         replay.pin_before_each_recording(fast_round.constants)
+        replay.pin_before_each_recording(engine_site.weight_tables)
     return replay
 
 
