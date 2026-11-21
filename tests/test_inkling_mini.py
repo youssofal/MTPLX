@@ -66,11 +66,11 @@ def test_pack_precision_preserves_published_experts_and_loop_weights():
     head = "model.llm.unembed.weight"
     assert matrix_layout(head, "quality") is None
     assert matrix_layout(head, "native-quality") == (8, 32)
-    assert matrix_layout(head, "speed") == (4, 64)
+    assert matrix_layout(head, "speed") == (8, 64)
     assert matrix_layout("model.llm.layers.7.attn.wq_du.weight", "speed") == (8, 64)
     assert matrix_layout("model.llm.layers.22.mlp.experts.w2_weight", "speed-affine") == (4, 64)
     for recipe in ("speed", "speed-nvfp4w"):
-        assert matrix_layout(head, recipe) == (4, 64)
+        assert matrix_layout(head, recipe) == (8, 64)
         assert matrix_layout("model.llm.layers.7.attn.wq_du.weight", recipe) == (8, 64)
         assert matrix_layout("model.llm.layers.22.mlp.experts.w2_weight", recipe) == "nvfp4"
     for recipe in ("quality", "native-quality"):

@@ -67,10 +67,11 @@ def matrix_layout(name: str, recipe: str) -> tuple[int, int] | None:
     if recipe == "native-quality":
         return (8, 32) if name == HEAD else None
     if recipe in {"speed", "speed-affine", "speed-nvfp4w"}:
-        # Optimized Speed: 8-bit attention projections, a 4-bit head (it costs nothing measurable),
-        # layers 20-23 in NVFP4 as in Bare Speed; the embedding stays BF16.
+        # Optimized Speed: 8-bit attention projections and head, layers 20-23 in NVFP4 as in Bare
+        # Speed; the embedding stays BF16. A 4-bit head cost 0.0042 +/- 0.0015 nats a token on real
+        # text (6,140 positions, paired), so the head stays at 8 bits here.
         if name == HEAD:
-            return (4, 64)
+            return (8, 64)
         if _PROJECTION.fullmatch(name):
             return (8, 64)
         expert = _EXPERTS.fullmatch(name)

@@ -118,9 +118,8 @@ def _precision_sentences(manifest: dict) -> list[str]:
             "re-coded from MXFP8 to NVFP4 weights, keeping the 8-bit activation rounding they were trained with.",
         }[recipe]
         return [
-            "The attention projections of all 24 layers use 8-bit weights in groups of 64 and the output "
-            "vocabulary 4-bit weights in groups of 64, which cuts the weights read for each token from about "
-            "5.5 GB to about 3.5 GB.",
+            "The attention projections of all 24 layers and the output vocabulary use 8-bit weights in groups "
+            "of 64, which cuts the weights read for each token from about 5.5 GB to about 3.7 GB.",
             experts,
             "The routing, loop-control, normalization and convolution weights keep their published values.",
         ]
