@@ -145,8 +145,17 @@ def test_every_stage_of_every_pack_takes_its_fused_route(pack):
 
 # --------------------------------------------------------------------------- launches
 def _engine():
+    import os
+
     from mtplx.engine import runtime as engine_runtime
 
+    # The suite drops MTPLX_* variables before collection, so the built module's path comes in under
+    # INKLING_TEST_ENGINE (as the commit wiring tests take it); without it these launch counts skip.
+    path = os.environ.get("INKLING_TEST_ENGINE", "").strip()
+    if path and not engine_runtime.available():
+        os.environ[engine_runtime.MODULE_ENV] = path
+        engine_runtime._REASON = None
+        engine_runtime._NATIVE = None
     if not engine_runtime.available():
         pytest.skip(f"the native engine is not loaded: {engine_runtime.unavailable()}")
     return engine_runtime.engine()
