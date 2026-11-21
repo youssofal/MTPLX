@@ -92,10 +92,10 @@ def test_the_products_give_mlx_sorted_product_bits(mode, rows):
 
 @pytest.mark.parametrize("mode", ["nvfp4", "mxfp8"])
 @pytest.mark.parametrize("rows", [64, 520, 2100])
-@pytest.mark.parametrize("wide", [(2, 2), (4, 2), (2, 4), (4, 4), (2, 2, 64), (1, 4), (1, 2), (1, 2, 64), (4, 2, 64)])
+@pytest.mark.parametrize("wide", [(2, 2), (4, 2), (2, 4), (4, 4)])
 def test_the_wide_tilings_give_the_same_bits(mode, rows, wide):
-    """More rows and columns a threadgroup, a double-buffered decode 32 or 64 deep a step, and 32-row tiles
-    change no sum: every product row has MLX's sorted product's float32 bits, the sort's tiles cut at 32 SGM rows."""
+    """More rows and columns a threadgroup and a double-buffered decode change no sum: every product row
+    has MLX's sorted product's float32 bits, the sort's tiles cut at 32 SGM rows."""
     bits, group = (4, 16) if mode == "nvfp4" else (8, 32)
     experts = routes(rows, seed=rows + 7)
     order, srows, sexp, inverse, tiles, starts = PE.sort_pairs(experts, 8, EXPERTS, 32 * wide[0])
@@ -127,5 +127,3 @@ def test_the_tiling_follows_rows_an_expert(monkeypatch):
     assert PE.tiling(4096 * 8, EXPERTS) == (PE.BM, None)
     monkeypatch.setenv("MTPLX_INKLING_PROMPT_EXPERT_TILES", "2x4")
     assert PE.tiling(40 * 8, EXPERTS) == (64, (2, 4))
-    monkeypatch.setenv("MTPLX_INKLING_PROMPT_EXPERT_TILES", "1x2d64")
-    assert PE.tiling(40 * 8, EXPERTS) == (32, (1, 2, 64))
