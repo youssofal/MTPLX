@@ -452,31 +452,92 @@ _COPY_KERNEL = re.compile(r"^[a-z]+\d*_(?:dynamic_)?copy")
 
 
 def copies_only(shorter: ProgramIR, longer: ProgramIR) -> bool:
-    """True when ``longer`` launches exactly ``shorter``'s kernels in order,
-    plus some of MLX's copy kernels and nothing else.
+    """True when ``longer`` is ``shorter`` plus some of MLX's copy kernels and nothing else,
+    proven structurally: with the extra copies removed and every later use of a copy's
+    destination read as its source, the remaining launches are ``shorter``'s by
+    ``compare_structure`` (kernel, grid, barrier, inline bytes, binding offsets, what every
+    read holds, constants by their bytes). A pair that differs by a copy and also by anything
+    else (an operand frozen into one recording) is not one program.
 
-    MLX writes an array in place only when nothing else holds it at the moment
-    the write is encoded. Inside one evaluation it commits a command buffer
-    every few dozen launches, and a committed buffer holds the arrays it used
-    until the GPU has run it; so whether a later write into the same bank
-    finds it free depends on how far the GPU has got, and a recording can carry
-    a whole copy of a bank that another recording of the same call writes in
-    place. Such a pair is one program: the shorter is it (MLX's own in-place
-    writes), and its first-use bit check stays the proof of its bits.
+    MLX writes an array in place only when nothing else holds it at the moment the write is
+    encoded. Inside one evaluation it commits a command buffer every few dozen launches, and a
+    committed buffer holds the arrays it used until the GPU has run it; so whether a later
+    write into the same bank finds it free depends on how far the GPU has got, and a recording
+    can carry a whole copy of a bank that another recording of the same call writes in place.
+    Such a pair is one program: the shorter is it (MLX's own in-place writes), and its
+    first-use bit check stays the proof of its bits.
     """
 
-    if len(longer.steps) <= len(shorter.steps):
+    decopied = without_copies(shorter, longer)
+    if decopied is None or compare_structure(shorter, decopied, same_bytes=True) is not None:
         return False
-    extra = 0
+    # compare_structure places fresh results freely (the allocator's business); a write into a
+    # declared input is the program's own and must land at the same place in both.
+    return _input_writes(shorter) == _input_writes(decopied)
+
+
+def _input_writes(ir: ProgramIR) -> list:
+    """Per launch, its writes into declared inputs: (slot, input index, offset from the input)."""
+    by_id = {buf.id: buf for buf in ir.buffers}
+    bases = _input_bases(ir)
+    rows = []
+    for step in ir.steps:
+        rows.append(sorted(
+            (slot, by_id[b].index, offset - bases.get(b, 0))
+            for slot, b, offset, access in step.bindings
+            if access != "r" and b in by_id and by_id[b].role == "input"
+        ))
+    return rows
+
+
+def without_copies(shorter: ProgramIR, longer: ProgramIR) -> ProgramIR | None:
+    """``longer`` with the copy launches ``shorter`` does not make removed and each copy's
+    destination read as its source from then on; None when the two do not align that way
+    (a launch other than one of MLX's copies is extra, or a copy is not one read and one
+    write)."""
+
+    import dataclasses
+
+    if len(longer.steps) <= len(shorter.steps):
+        return None
+    extras = set()
     position = 0
-    for step in longer.steps:
+    for index, step in enumerate(longer.steps):
         if position < len(shorter.steps) and step.kernel_name == shorter.steps[position].kernel_name:
             position += 1
             continue
         if not _COPY_KERNEL.match(step.kernel_name or ""):
-            return False
-        extra += 1
-    return position == len(shorter.steps) and extra == len(longer.steps) - len(shorter.steps)
+            return None
+        extras.add(index)
+    if position != len(shorter.steps):
+        return None
+    moved: dict[int, tuple[int, int]] = {}  # destination buffer -> (source buffer, offset shift)
+
+    def follow(buffer_id: int, offset: int) -> tuple[int, int]:
+        if buffer_id in moved:
+            source, shift = moved[buffer_id]
+            return source, offset + shift
+        return buffer_id, offset
+
+    steps = []
+    for index, step in enumerate(longer.steps):
+        if index in extras:
+            reads = [(b, o) for _slot, b, o, access in step.bindings if access == "r"]
+            writes = [(b, o) for _slot, b, o, access in step.bindings if access != "r"]
+            if len(reads) != 1 or len(writes) != 1 or step.indirect_grid is not None:
+                return None
+            source, source_offset = follow(*reads[0])
+            destination, destination_offset = writes[0]
+            moved[destination] = (source, source_offset - destination_offset)
+            continue
+        bindings = [(slot, *follow(b, o), access) for slot, b, o, access in step.bindings]
+        grid = None if step.indirect_grid is None else follow(*step.indirect_grid)
+        steps.append(dataclasses.replace(step, bindings=bindings, indirect_grid=grid))
+    outputs = []
+    for array in longer.outputs:
+        buffer_id, offset = follow(array.buffer, array.offset)
+        outputs.append(dataclasses.replace(array, buffer=buffer_id, offset=offset))
+    return dataclasses.replace(longer, steps=steps, outputs=outputs)
 
 
 def copy_moved(first: ProgramIR, second: ProgramIR) -> str | None:

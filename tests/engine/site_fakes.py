@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 import mlx.core as mx
 
+from mtplx.engine.site import _COPY_KERNEL as _COPY_NAME
 from mtplx.engine.ir import ArrayIR, BufferIR, ProgramIR, StepIR
 from mtplx.engine.runtime import BuildRefused
 
@@ -101,16 +102,25 @@ class FakeEngine:
         names = [f"fake_kernel_{n % 2}" for n in range(launches)]
         if self.kernels_by_build is not None:
             names = list(self.kernels_by_build[min(self.builds, len(self.kernels_by_build)) - 1])
-        steps = [
-            StepIR(
-                kernel=1,
-                kernel_name=name,
-                bindings=[(0, 0, 0, "r"), (1, base, 0, "w"), (2, const_id, 0, "r")],
-                inline=[(3, inline)],
-                dispatch=("threads", (4, 1, 1), (4, 1, 1)),
+        steps = []
+        for name in names:
+            if _COPY_NAME.match(name):
+                # An MLX copy as MLX launches it: one source read, one fresh destination written
+                # (an array it could not write in place, copied aside); the program reads on as before.
+                temp = len(buffers)
+                buffers.append(BufferIR(id=temp, role="temp", nbytes=64))
+                steps.append(StepIR(kernel=1, kernel_name=name, bindings=[(0, 0, 0, "r"), (1, temp, 0, "w")],
+                                    inline=[], dispatch=("threads", (4, 1, 1), (4, 1, 1))))
+                continue
+            steps.append(
+                StepIR(
+                    kernel=1,
+                    kernel_name=name,
+                    bindings=[(0, 0, 0, "r"), (1, base, 0, "w"), (2, const_id, 0, "r")],
+                    inline=[(3, inline)],
+                    dispatch=("threads", (4, 1, 1), (4, 1, 1)),
+                )
             )
-            for name in names
-        ]
         return ProgramIR(
             name=name, buffers=buffers, steps=steps, inputs=input_arrays, outputs=output_arrays,
         )

@@ -1477,3 +1477,69 @@ def test_a_constant_and_a_seed_with_the_same_bytes_are_one_operand_only_where_a_
     assert compare_structure(const, seed) is not None
     assert compare_structure(const, seed, same_bytes=True) is None
     assert compare_structure(const, other, same_bytes=True) is not None
+
+
+def _settle_pair(shorter_steps, longer_steps, consts=()):
+    from mtplx.engine.ir import ArrayIR, BufferIR, ProgramIR
+
+    def program(steps):
+        buffers = [BufferIR(id=0, role="input", nbytes=64, index=0), BufferIR(id=1, role="temp", nbytes=64),
+                   *[BufferIR(id=10 + i, role="const", nbytes=8, data=data) for i, data in enumerate(consts)]]
+        return ProgramIR(name="p", buffers=buffers, steps=steps,
+                         inputs=[ArrayIR(buffer=0, offset=0, shape=(32,), dtype="bfloat16")], outputs=[])
+
+    return program(shorter_steps), program(longer_steps)
+
+
+def _step(name, bindings, inline=()):
+    from mtplx.engine.ir import StepIR
+
+    return StepIR(kernel=1, kernel_name=name, bindings=list(bindings), inline=list(inline),
+                  dispatch=("threads", (4, 1, 1), (4, 1, 1)))
+
+
+_VN_COPY = "vn_copybfloat16bfloat16"
+
+
+def test_a_copy_settles_only_when_the_rest_is_the_same_program():
+    """Review 2, finding 14: the settle compared launch names only, so a one-launch recording
+    that updates an input at offset 4 settled with a copy plus the same update at offset 5.
+    Now the copy is removed, its destination read as its source, and the rest compared."""
+    from mtplx.engine.site import copies_only
+
+    copy = _step(_VN_COPY, [(0, 0, 0, "r"), (1, 1, 0, "w")])
+    shorter, longer = _settle_pair([_step("k_update", [(0, 0, 4, "w")])],
+                                   [copy, _step("k_update", [(0, 1, 5, "w")])])
+    assert not copies_only(shorter, longer)
+    shorter, longer = _settle_pair([_step("k_update", [(0, 0, 4, "w")])],
+                                   [copy, _step("k_update", [(0, 1, 4, "w")])])
+    assert copies_only(shorter, longer)  # the same update, written in place in one of them
+
+
+def test_a_copy_does_not_settle_a_pair_whose_scalar_differs():
+    """An operand frozen into a recording (an inline scalar, or a constant's bytes) that differs
+    between the two recordings is not one program, copy or no copy."""
+    from mtplx.engine.site import copies_only
+
+    copy = _step(_VN_COPY, [(0, 0, 0, "r"), (1, 1, 0, "w")])
+    shorter, longer = _settle_pair([_step("k_add", [(0, 0, 0, "r")], inline=[(3, b"\x01\x00\x00\x00")])],
+                                   [copy, _step("k_add", [(0, 0, 0, "r")], inline=[(3, b"\x02\x00\x00\x00")])])
+    assert not copies_only(shorter, longer)
+    shorter, _ = _settle_pair([_step("k_add", [(0, 0, 0, "r"), (1, 10, 0, "r")])], [], consts=(b"\x01" * 8,))
+    _, longer = _settle_pair([], [copy, _step("k_add", [(0, 0, 0, "r"), (1, 10, 0, "r")])], consts=(b"\x02" * 8,))
+    assert not copies_only(shorter, longer)
+    _, same = _settle_pair([], [copy, _step("k_add", [(0, 0, 0, "r"), (1, 10, 0, "r")])], consts=(b"\x01" * 8,))
+    assert copies_only(shorter, same)
+
+
+def test_a_launch_that_reads_the_copy_reads_its_source():
+    """The longer recording reads the copy where the shorter reads the input itself: one program."""
+    from mtplx.engine.site import copies_only
+
+    copy = _step(_VN_COPY, [(0, 0, 0, "r"), (1, 1, 0, "w")])
+    shorter, longer = _settle_pair([_step("k_read", [(0, 0, 8, "r")])],
+                                   [copy, _step("k_read", [(0, 1, 8, "r")])])
+    assert copies_only(shorter, longer)
+    shorter, longer = _settle_pair([_step("k_read", [(0, 0, 8, "r")])],
+                                   [copy, _step("k_read", [(0, 1, 16, "r")])])
+    assert not copies_only(shorter, longer)
