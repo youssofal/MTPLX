@@ -159,3 +159,46 @@ def test_experts_forward_takes_the_fast_route_by_default_and_when_named_not_when
     monkeypatch.setenv("MTPLX_INKLING_PROMPT_FAST", "experts")
     mx.eval(block(hidden))
     assert fast() == before + 2
+
+
+@pytest.mark.parametrize("mode", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize("stream", ["bfloat16", "float16"])
+def test_without_the_tensor_units_the_fast_route_takes_the_sorted_product(monkeypatch, mode, stream):
+    # M1 to M4 (here: this Mac told it has no tensor units, and our launches unavailable as they are there). Unset,
+    # an MXFP8 block's gate-up leaves the one-row panel for MLX's sorted product (bfloat16 operands on a bfloat16
+    # stream, float32 on a float16 one), counted, held to the class C bound against the stock body; an NVFP4 block
+    # keeps today's route and its bits exactly. The switch turned off restores today's route.
+    import mtplx.nax_detect as nax
+
+    monkeypatch.delenv("MTPLX_INKLING_PROMPT_EXPERTS", raising=False)
+    monkeypatch.delenv("MTPLX_INKLING_PROMPT_FAST", raising=False)
+    monkeypatch.setattr(nax, "nax_available", lambda: False)
+    monkeypatch.setattr(EF, "prompt_kernels", lambda: False)
+    block = synthetic_block(mode, seed=13)
+    hidden = hidden_rows(512, seed=41).astype(getattr(mx, stream))
+    state = EF._state(block)
+    taken = lambda: sum(v for k, v in state.counts.items() if k.endswith(".without_tensor_units"))
+    before = taken()
+    got = block(hidden)
+    want = block.stock(hidden)
+    mx.eval(got, want)
+    assert got.dtype == hidden.dtype
+    expect_fast = mode == "mxfp8"
+    assert taken() == before + int(expect_fast)
+    if expect_fast:
+        # The synthetic block's MXFP8 weights are far larger than a checkpoint's and overflow a float16 stream in the
+        # stock body itself: compare where both are finite, and let at most 0.1% of elements overflow differently.
+        finite = mx.isfinite(got.astype(mx.float32)) & mx.isfinite(want.astype(mx.float32))
+        assert float(mx.mean((~finite & mx.isfinite(want.astype(mx.float32))).astype(mx.float32)).item()) <= 1e-3
+        a32, b32 = (mx.where(finite, v.astype(mx.float32), 0.0) for v in (got, want))
+        assert close(a32, b32) < 4e-3, (mode, stream, close(a32, b32))
+        trace = {}
+        EF.routed_sorted(block, hidden.reshape(-1, 2304), M.linear, trace=trace, fast=True)
+        operand = mx.bfloat16 if stream == "bfloat16" else mx.float32
+        assert trace["values13"].dtype == operand and trace["values2"].dtype == operand
+    else:
+        assert same(got, want)
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_FAST", "off")
+    mx.eval(block(hidden))
+    assert taken() == before + int(expect_fast)
+

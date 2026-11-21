@@ -168,12 +168,16 @@ def test_the_stage_counts_as_running_only_where_it_can(monkeypatch):
     assert not F.runs_here()
 
 
-def test_unset_the_experts_part_serves_only_macs_with_the_tensor_units(monkeypatch):
-    """The MXFP8 gate-up on the sorted product is measured on M5 only: unset, M1 to M4 keep the panel product
-    (the product's own rehearsal switch stands in for one); a switch that names the part still serves it."""
+def test_unset_the_experts_part_serves_every_mac_and_the_switch_still_turns_it_off(monkeypatch):
+    """Unset, the experts part serves M1 to M4 as well (there: the MXFP8 gate-up on MLX's sorted product, measured
+    under the product's own rehearsal switch); a switch that leaves it out or turns it off still does."""
     monkeypatch.delenv(PROMPT_FAST_ENV, raising=False)
     monkeypatch.setenv("MTPLX_FORCE_GPU_FAMILY_FALLBACK", "1")
-    assert prompt_fast("chunk") and not prompt_fast("experts") and not prompt_fast("invariant")
+    assert prompt_fast("chunk") and prompt_fast("experts") and not prompt_fast("invariant")
+    monkeypatch.setenv(PROMPT_FAST_ENV, "chunk")
+    assert not prompt_fast("experts")
+    monkeypatch.setenv(PROMPT_FAST_ENV, "off")
+    assert not prompt_fast("experts")
     monkeypatch.setenv(PROMPT_FAST_ENV, "chunk,experts")
     assert prompt_fast("experts")
     monkeypatch.setenv(PROMPT_FAST_ENV, "on")

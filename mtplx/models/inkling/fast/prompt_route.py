@@ -6,9 +6,11 @@ accepted for the prompt read on 21 November, with their accuracy tables. The par
 
 * ``chunk``: the prompt read takes ``WIDE_ROWS`` (2,048) rows a forward instead of 512, on a prompt the
   attention's planes allow (``WIDE_PROMPT_TOKENS``) and a Mac with the memory for it (``WIDE_HEADROOM_BYTES``);
-* ``experts``: the MXFP8 blocks' gate-up takes the sorted product on the accelerator (MLX's grouped product,
-  as the NVFP4 blocks' does) instead of the one-row panel product, both MXFP8 products on bfloat16 operands
-  (the rounded expert inputs, which bfloat16 holds exactly). NVFP4 blocks are unchanged.
+* ``experts``: on a GPU with the tensor units, the MXFP8 blocks' gate-up takes the sorted product on the
+  accelerator (as the NVFP4 blocks' does) instead of the one-row panel product, both MXFP8 products on bfloat16
+  operands (the rounded expert inputs, which bfloat16 holds exactly); NVFP4 blocks are unchanged. On a GPU
+  without them (M1 to M4), the MXFP8 gate-up takes MLX's sorted product instead of the one-row panel product
+  (bfloat16 operands on a bfloat16 stream, float32 on a float16 one); NVFP4 blocks are unchanged there too.
 * ``invariant``: the prompt read's sums do not depend on the chunk width. Every product of a prompt chunk runs
   on our launches at every row count (the projections, the router, the controllers, both expert products in
   both formats, the drafter's context heads), each output element summed in one fixed order whatever the
@@ -31,16 +33,12 @@ PROMPT_FAST_PARTS = ("chunk", "experts", "invariant")
 
 def prompt_fast(part):
     """Whether the prompt read's fast route serves ``part`` (read per call). Unset, the read width (``chunk``)
-    and the MXFP8 gate-up on the tensor units (``experts``) are on (their class accepted on 21 November, with
-    their accuracy tables) and ``invariant`` is off. Unset, ``experts`` serves only a Mac with the tensor units
-    (M5), the only Macs it is measured on: M1 to M4 keep the one-row panel product unless the switch names it."""
+    and the expert products' fast forms (``experts``) are on (their class accepted on 21 November, with their
+    accuracy tables) and ``invariant`` is off. What ``experts`` changes depends on the GPU: with the tensor
+    units (M5), the MXFP8 gate-up on our sorted product; without them (M1 to M4), on MLX's."""
     raw = os.environ.get(PROMPT_FAST_ENV, "").strip().lower()
     if not raw:
-        if part == "experts":
-            from mtplx.nax_detect import nax_available
-
-            return nax_available()
-        return part == "chunk"
+        return part in ("chunk", "experts")
     if raw in ("0", "off", "no", "false"):
         return False
     if raw in ("1", "on", "yes", "true", "all"):
