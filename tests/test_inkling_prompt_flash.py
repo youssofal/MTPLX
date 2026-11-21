@@ -71,8 +71,7 @@ def test_matches_the_definition(rows, keys, window, dtype):
 def test_every_switch_gives_the_same_numbers_within_rounding():
     ops = _call(200, 2248, 5)
     ref = F.reference(*ops, 0)
-    for kw in (dict(tg_m=2, fold=False), dict(tg_m=4, fold=False), dict(tg_m=8, fold=False), dict(tg_m=6),
-               dict(qreg=False), dict(tgbar=False), dict(psplit=True), dict(ptype=mx.float16)):
+    for kw in (dict(tg_m=6), dict(tg_m=12), dict(tgbar=False)):
         assert _rel_rms(F.flash_attention(*ops, 0, **kw), ref) <= BOUND[mx.bfloat16], kw
 
 
@@ -82,11 +81,40 @@ def test_long_history_global_visit():
     assert _rel_rms(F.flash_attention(*ops, 0), F.reference(*ops, 0)) <= BOUND[mx.bfloat16]
 
 
-def test_a_row_gets_the_same_bits_in_either_block_layout():
-    # The arithmetic of a row does not depend on which block or threadgroup holds it.
+def test_a_row_gets_the_same_bits_whichever_threadgroup_holds_it():
+    # The arithmetic of a row does not depend on which block or threadgroup holds it, nor on the
+    # barrier that keeps a threadgroup's blocks on one tile.
     ops = _call(200, 2248, 21)
-    a = F.flash_attention(*ops, 0, tg_m=3, fold=True)
-    b = F.flash_attention(*ops, 0, tg_m=4, fold=False)
+    a = F.flash_attention(*ops, 0, tg_m=3)
+    for kw in (dict(tg_m=6), dict(tg_m=12), dict(tgbar=False)):
+        b = F.flash_attention(*ops, 0, **kw)
+        assert bool(mx.array_equal(a.view(mx.uint16), b.view(mx.uint16)).item()), kw
+
+
+def test_the_products_come_from_the_installed_library():
+    # The tensor-unit pieces are read from the headers MLX installs; without them the call declines.
+    text, why = F.library_text()
+    assert why is None and "struct BaseNAXFrag" in text
+    assert "matmul2d_descriptor" not in F._SOURCE + F._HEADER     # none of our text declares a product
+
+
+def test_declines_without_the_library_headers(monkeypatch):
+    q, k, v, prof, sink = _call(64, 600, 3)
+    monkeypatch.setattr(F, "library_text", lambda: (None, "missing:steel/gemm/nax.h"))
+    assert F.decline(q, k, v, prof, sink, 0) == "library_headers"
+
+
+def test_rows_that_are_not_packed_are_read_element_by_element():
+    # Keys and values whose rows are not on 8-byte boundaries, and queries strided along the head.
+    q, k, v, prof, sink = _call(96, 1300, 9)
+    wide_k = mx.zeros((1, 8, 1300, 130), k.dtype)
+    wide_k[..., 1:129] = k
+    wide_v = mx.zeros((1, 8, 1300, 130), v.dtype)
+    wide_v[..., 1:129] = v
+    qs = mx.zeros((1, 24, 96, 256), q.dtype)
+    qs[..., ::2] = q
+    a = F.flash_attention(q, k, v, prof, sink, 0)
+    b = F.flash_attention(qs[..., ::2], wide_k[..., 1:129], wide_v[..., 1:129], prof, sink, 0)
     assert bool(mx.array_equal(a.view(mx.uint16), b.view(mx.uint16)).item())
 
 

@@ -11,15 +11,17 @@ call, the bank copied with a zero row appended for the sink, every key of the ca
 whether a row may see it or not, and past about 19,400 keys a decode-shaped kernel that has no
 matrix units. Here a launch computes it for a whole visit:
 
-* Fragment rows. The tensor units multiply 16-row blocks. By default a block is 16 consecutive
-  query rows of one head and a threadgroup holds the three heads that share a key/value head,
-  one simdgroup each, so every key and value fragment the threadgroup loads serves all three
-  (``FOLD``); the other layout puts ``RPB = 16 // G`` rows times the ``G`` heads in one block.
-  A row gets the same bits in either layout. All simdgroups of a threadgroup walk the same
-  32-key tiles.
-* Scores and products. ``q k^T`` over 32 keys and 32 dimensions at a time and ``P V`` over 32
-  keys and 32 output dimensions, both on 16 x 32 x 32 tensor products with float sums. The
-  scores, the running maximum and sum, and the output stay in float.
+* Blocks. A simdgroup holds 16 consecutive query rows of one head; a threadgroup holds the
+  three heads that share a key/value head (times ``TG_M / 3`` row blocks), so every key and
+  value piece the threadgroup loads serves all three. All simdgroups of a threadgroup walk the
+  same 32-key tiles, held together by a barrier each tile so they share them in the cache.
+* Products. The tensor-unit multiply and the register layout of its 16 x 16 pieces are the
+  installed MLX's own (``mlx::steel::BaseNAXFrag``: a 16 x 32 x 16 multiply-accumulate with
+  float sums), read from the headers MLX ships when the launch is first built
+  (``mtplx.kernels.library_headers``): none of the library's text lives in this tree. Scores
+  over the head in eight 16-wide steps; the value product over each tile in two 16-key steps,
+  the probabilities entering as float. Scores, the running maximum and sum, and the output
+  stay in float.
 * The softmax is online and opened by the sink: before the first key a row's maximum is its
   sink logit, its sum 1 and its output 0, which is the sink's own term (value zero).
 * Tiles. A threadgroup visits only the tiles one of its rows may see: from the first key of
@@ -31,14 +33,11 @@ matrix units. Here a launch computes it for a whole visit:
   is concatenated, no bias or mask tensor exists, the launch writes only its output
   ``(1, rows, heads, 128)`` in the query type.
 
-Class C against the default prompt route: the same sums in another order, all in float (the
-probabilities enter the value product as float). On the shapes a prompt read makes, 99.3 to 99.9%
-of output bits equal the default route's where it uses the library's attention (below about
-19,400 keys), and past that the result is closer to the float32 definition than the default's
-(lanes/p2/fcheck-3, fcheck-4). The simdgroups of a threadgroup are held on one tile by a barrier
-each tile so they share its keys and values in the cache (2.4x at 2,048 rows and 64K keys,
-lanes/p2/fsweep-1). Off by default (``MTPLX_INKLING_PROMPT_FLASH``); :func:`decline` names why a
-call is not served.
+Class C against the default prompt route: the same sums in another order, all in float. Against
+the exact value (float64), per call, its outputs are as often correctly rounded as the default
+route's where that uses the library's attention (below about 19,400 keys) and far more often past
+it, where the default route rounds per-block partial outputs (lanes/p2/acc-1). Off by default
+(``MTPLX_INKLING_PROMPT_FLASH``); :func:`decline` names why a call is not served.
 """
 
 from __future__ import annotations
@@ -49,160 +48,118 @@ from functools import lru_cache
 
 import mlx.core as mx
 
+from mtplx.kernels import library_headers
+
 HEAD_DIM = 128
-#: Simdgroups a threadgroup: with FOLD (the default) one per head of a key/value head, each 16
-#: rows of that head (3 for Inkling); without, TG_M blocks of 16 // G rows x G heads. Measured
-#: fastest at 512-row chunks and level at 2,048 (lanes/p2/fsweep-2).
+#: Simdgroups a threadgroup: the heads of one key/value head times row blocks of 16 (3 for
+#: Inkling: one block of each head). Measured fastest at 512-row chunks and level at 2,048
+#: (lanes/p2/fsweep-2).
 TG_M = 3
-FOLD = True
 
+# Ours, after the library's text: four consecutive elements of one row of a piece. ``step`` 0:
+# one 8-byte load (unit stride along the head and every other stride a multiple of four elements,
+# so every address formed is a multiple of four elements from the view's first element, which the
+# prompt read's views keep at the start of their array); otherwise element by element at ``step``.
+# And the store of four into the launch's own output.
 _HEADER = """
-#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
-using namespace metal;
-
-#define INK_UNROLL _Pragma("clang loop unroll(full)")
-
-// A lane's place in the tensor units' register layout of a 16-row by 16-column piece: it holds
-// rows ink_row and ink_row + 8, columns ink_col .. ink_col + 3 (a 32-column operand is two such
-// pieces side by side). Row from lane bits 4, 2, 1; column from lane bits 3, 0.
-inline short ink_row(ushort lane) {
-    return short(((lane >> 2) & 4) | ((lane >> 1) & 3));
-}
-inline short ink_col(ushort lane) {
-    return short((((lane >> 2) & 2) | (lane & 1)) << 2);
-}
-
-// Eight consecutive elements starting at p: two 8-byte loads when the stride is one element
-// (every address formed here is a multiple of four elements from an aligned first element),
-// element by element otherwise.
-template <typename E>
-struct InkEight {
-    vec<E, 4> lo;
-    vec<E, 4> hi;
-};
+// Every loop over pieces, rows or columns is unrolled whole (none runs more than 8 times): the
+// pieces are 8-wide register vectors and are only indexed with constants; a loop left rolled
+// indexes them at run time and gave wrong numbers (lanes/p2 diag-1). The first-use check against
+// the definition declines the launch if a build ever does that.
+#define INK_EVERY _Pragma("clang loop unroll_count(8)")
 
 template <typename E>
-inline InkEight<E> ink_load8(const device E* p, uint stride) {
-    InkEight<E> r;
-    if (stride == 1u) {
-        r.lo = *reinterpret_cast<const device vec<E, 4>*>(p);
-        r.hi = *reinterpret_cast<const device vec<E, 4>*>(p + 4);
-    } else {
-        INK_UNROLL for (short i = 0; i < 4; ++i) {
-            r.lo[i] = p[uint(i) * stride];
-            r.hi[i] = p[uint(i + 4) * stride];
-        }
+inline vec<E, 4> ink_four(const device E* p, uint step) {
+    if (step == 0u) {
+        return *reinterpret_cast<const device vec<E, 4>*>(p);
     }
-    return r;
+    return vec<E, 4>(p[0], p[step], p[2u * step], p[3u * step]);
+}
+
+template <typename E>
+inline void ink_put_four(device E* p, vec<E, 4> x) {
+    *reinterpret_cast<device vec<E, 4>*>(p) = x;
 }
 """
 
-# Element e of a lane's 16 x 32 destination (and of a left operand of that shape) is row
-# ink_row + 8 * ((e >> 2) & 1), column ink_col + 16 * (e >> 3) + (e & 3). The 32-wide reduction
-# of the score product is taken in a permuted order (each lane holds 8 consecutive dimensions
-# 2 * ink_col .. + 7 of every 32), the same for queries and keys, so the score is unchanged; the
-# output columns carry the same permutation, undone when the output is stored.
+# A lane holds two rows of each 16 x 16 piece (fr and fr + 8) and four consecutive columns of
+# each (fc .. fc + 3), as the library places them: element 4 rp + c is row fr + 8 rp, column fc + c.
 _SOURCE = """
+    using Piece = mlx::steel::BaseNAXFrag;
+    typedef vec<T, 8> tpiece;
+    typedef vec<float, 8> fpiece;
     constexpr int D = 128;
-    constexpr int STEPS = D / 32;
+    constexpr int DP = D / 16;                                  // pieces along a head
+    constexpr int TG_ROWS = (TG_M / G) * 16;
     const float scale_log2 = as_type<float>(uint(SCALE)) * 1.4426950408889634f;
     constexpr float LOG2E = 1.4426950408889634f;
 
     const uint tid = thread_position_in_threadgroup.x;
     const int sg = int(tid >> 5);
-    const ushort lane = ushort(tid & 31u);
-    const short fr = ink_row(lane);
-    const short fc = ink_col(lane);
+    const short2 here = Piece::get_coord();
+    const short fr = here.y;
+    const short fc = here.x;
     const int kvh = int(threadgroup_position_in_grid.y);
     const int rows = int(params[0]);
     const int total = int(params[1]);
     const int hist = total - rows;                              // position of chunk row 0
-    // A block is RPB rows x the G heads of the KV head (FOLD 0), or 16 rows of one head (FOLD 1:
-    // the threadgroup's simdgroups are its G heads x TG_M / G row blocks, every row live).
-    constexpr int TG_ROWS = FOLD ? (TG_M / G) * 16 : TG_M * RPB;
     const int tg_row0 = int(threadgroup_position_in_grid.x) * TG_ROWS;
     const int tg_row_last = min(tg_row0 + TG_ROWS, rows) - 1;
-    const int blk_row0 = tg_row0 + (FOLD ? (sg / G) * 16 : sg * RPB);
+    const int blk_row0 = tg_row0 + (sg / G) * 16;
+    const int head = kvh * G + sg % G;
 
-    // The lane's two fragment rows: query row and head, position, whether it is a real row.
+    // The lane's two rows: query row, position, whether it is a real row.
     int qrow[2];
-    int qhead[2];
     int pos[2];
     bool live[2];
-    INK_UNROLL for (short rp = 0; rp < 2; ++rp) {
-        const int m = int(fr) + 8 * rp;
-        qrow[rp] = FOLD ? blk_row0 + m : blk_row0 + m / G;
-        qhead[rp] = FOLD ? kvh * G + sg % G : kvh * G + m % G;
-        live[rp] = (FOLD || m < RPB * G) && qrow[rp] < rows;
+    INK_EVERY for (short rp = 0; rp < 2; ++rp) {
+        qrow[rp] = blk_row0 + int(fr) + 8 * rp;
+        live[rp] = qrow[rp] < rows;
         pos[rp] = hist + qrow[rp];
     }
 
-    // The two products, each on the tensor units through one simdgroup: scores (keys transposed)
-    // and the value sum. One destination of each kind is made and copied for the others.
-    namespace tops = mpp::tensor_ops;
-    constexpr auto mac = tops::matmul2d_descriptor::mode::multiply_accumulate;
-    tops::matmul2d<tops::matmul2d_descriptor(16, 32, 32, false, true, RELAX, mac), metal::execution_simdgroup> qk_op;
-    tops::matmul2d<tops::matmul2d_descriptor(16, 32, 32, false, false, RELAX, mac), metal::execution_simdgroup> pv_op;
-    auto qk_a = qk_op.template get_left_input_cooperative_tensor<T, T, float>();
-    auto qk_b = qk_op.template get_right_input_cooperative_tensor<T, T, float>();
-    auto pv_a = pv_op.template get_left_input_cooperative_tensor<PT, T, float>();
-    auto pv_b = pv_op.template get_right_input_cooperative_tensor<PT, T, float>();
-    auto qk_c = qk_op.template get_destination_cooperative_tensor<
-        metal::remove_addrspace_t<decltype(qk_a)>, metal::remove_addrspace_t<decltype(qk_b)>, float>();
-    auto acc0 = pv_op.template get_destination_cooperative_tensor<
-        metal::remove_addrspace_t<decltype(pv_a)>, metal::remove_addrspace_t<decltype(pv_b)>, float>();
-    auto acc1 = acc0;
-    auto acc2 = acc0;
-    auto acc3 = acc0;
-    INK_UNROLL for (short e = 0; e < 16; ++e) {
-        acc0[e] = 0.0f;
-        acc1[e] = 0.0f;
-        acc2[e] = 0.0f;
-        acc3[e] = 0.0f;
-    }
-
-    // Query fragments: held for the whole walk (QREG) or re-read each tile (from L1).
+    // Element strides along a head, and whether rows are packed for 8-byte loads (step 0).
     const uint q_dim = uint(q_strides[3]);
-    const device T* q_lane[2];
-    INK_UNROLL for (short rp = 0; rp < 2; ++rp) {
-        q_lane[rp] = q + (size_t(qhead[rp]) * size_t(q_strides[1]) +
-                          size_t(live[rp] ? qrow[rp] : 0) * size_t(q_strides[2]) +
-                          size_t(2 * fc) * size_t(q_dim));
-    }
-    T qf[QREG ? STEPS : 1][16];
-    if (QREG) {
-        INK_UNROLL for (short rp = 0; rp < 2; ++rp) {
-            INK_UNROLL for (short s = 0; s < (QREG ? STEPS : 1); ++s) {
-                InkEight<T> x = ink_load8(q_lane[rp] + uint(32 * s) * q_dim, q_dim);
-                INK_UNROLL for (short i = 0; i < 4; ++i) {
-                    qf[s][rp * 4 + i] = live[rp] ? x.lo[i] : T(0);
-                    qf[s][8 + rp * 4 + i] = live[rp] ? x.hi[i] : T(0);
-                }
+    const uint k_dim = uint(k_strides[3]);
+    const uint v_dim = uint(v_strides[3]);
+    const uint q_step = (q_dim == 1u && q_strides[2] % 4 == 0 && q_strides[1] % 4 == 0) ? 0u : q_dim;
+    const uint k_step = (k_dim == 1u && k_strides[2] % 4 == 0 && k_strides[1] % 4 == 0) ? 0u : k_dim;
+    const uint v_step = (v_dim == 1u && v_strides[2] % 4 == 0 && v_strides[1] % 4 == 0) ? 0u : v_dim;
+
+    // The block's queries over the whole head, held for the walk.
+    tpiece qp[DP];
+    INK_EVERY for (short rp = 0; rp < 2; ++rp) {
+        const device T* src = q + (size_t(head) * size_t(q_strides[1]) +
+                                   size_t(live[rp] ? qrow[rp] : 0) * size_t(q_strides[2]) + size_t(fc) * size_t(q_dim));
+        INK_EVERY for (short p = 0; p < DP; ++p) {
+            const vec<T, 4> x = ink_four(src + uint(16 * p) * q_dim, q_step);
+            INK_EVERY for (short col = 0; col < 4; ++col) {
+                qp[p][rp * 4 + col] = live[rp] ? x[col] : T(0);
             }
         }
     }
+    // The output, zero before the first key: eight pieces of 16 dimensions.
+    static_assert(DP == 8, "a head of 128 is eight pieces");
+    const fpiece zero8 = fpiece(0.0f);
+    fpiece acc[DP] = {zero8, zero8, zero8, zero8, zero8, zero8, zero8, zero8};
 
     // The sink opens each row: maximum its logit, sum 1, output 0.
     float run_max[2];
     float run_sum[2] = {1.0f, 1.0f};
-    INK_UNROLL for (short rp = 0; rp < 2; ++rp) {
-        run_max[rp] = live[rp]
-            ? float(sink[size_t(qrow[rp]) * size_t(sink_strides[1]) + size_t(qhead[rp]) * size_t(sink_strides[2])]) * LOG2E
-            : 0.0f;
-    }
     const device T* prof_row[2];
-    INK_UNROLL for (short rp = 0; rp < 2; ++rp) {
-        prof_row[rp] = prof + (size_t(live[rp] ? qrow[rp] : 0) * size_t(prof_strides[1]) +
-                               size_t(qhead[rp]) * size_t(prof_strides[2]));
+    INK_EVERY for (short rp = 0; rp < 2; ++rp) {
+        const int r = live[rp] ? qrow[rp] : 0;
+        run_max[rp] = live[rp]
+            ? float(sink[size_t(r) * size_t(sink_strides[1]) + size_t(head) * size_t(sink_strides[2])]) * LOG2E
+            : 0.0f;
+        prof_row[rp] = prof + (size_t(r) * size_t(prof_strides[1]) + size_t(head) * size_t(prof_strides[2]));
     }
     const uint prof_step = uint(prof_strides[3]);
 
-    // Key and value rows of this lane in a tile: 16 kh + fr + 8 rh, part = 2 kh + rh. One 64-bit
-    // base a lane, 32-bit element offsets from it (a head of 4 G elements is far beyond any bank).
-    const uint k_dim = uint(k_strides[3]);
-    const uint v_dim = uint(v_strides[3]);
-    const device T* k_lane = k + (size_t(kvh) * size_t(k_strides[1]) + size_t(2 * fc) * size_t(k_dim));
-    const device T* v_lane = v + (size_t(kvh) * size_t(v_strides[1]) + size_t(2 * fc) * size_t(v_dim));
+    // Key and value rows of this lane in a tile: base + 16 j + fr + 8 rp. One 64-bit base a
+    // lane, 32-bit element offsets from it.
+    const device T* k_lane = k + (size_t(kvh) * size_t(k_strides[1]) + size_t(fc) * size_t(k_dim));
+    const device T* v_lane = v + (size_t(kvh) * size_t(v_strides[1]) + size_t(fc) * size_t(v_dim));
     const uint k_row = uint(k_strides[2]);
     const uint v_row = uint(v_strides[2]);
 
@@ -226,66 +183,60 @@ _SOURCE = """
         }
         const int base = t * 32;
         const bool near = t >= t_near;
-        uint koff[4];
-        uint voff[4];
-        INK_UNROLL for (short part = 0; part < 4; ++part) {
-            int key = base + 16 * (part >> 1) + int(fr) + 8 * (part & 1);
-            key = key < total ? key : 0;                   // past the bank: masked below
-            koff[part] = uint(key) * k_row;
-            voff[part] = uint(key) * v_row;
+        uint koff[2][2];
+        uint voff[2][2];
+        INK_EVERY for (short j = 0; j < 2; ++j) {
+            INK_EVERY for (short rp = 0; rp < 2; ++rp) {
+                int key = base + 16 * j + int(fr) + 8 * rp;
+                key = key < total ? key : 0;               // past the bank: masked below
+                koff[j][rp] = uint(key) * k_row;
+                voff[j][rp] = uint(key) * v_row;
+            }
         }
 
-        INK_UNROLL for (short e = 0; e < 16; ++e) {
-            qk_c[e] = 0.0f;
-        }
-        INK_UNROLL for (short s = 0; s < STEPS; ++s) {
-            if (QREG) {
-                INK_UNROLL for (short e = 0; e < 16; ++e) {
-                    qk_a[e] = qf[QREG ? s : 0][e];
-                }
-            } else {
-                INK_UNROLL for (short rp = 0; rp < 2; ++rp) {
-                    InkEight<T> x = ink_load8(q_lane[rp] + uint(32 * s) * q_dim, q_dim);
-                    INK_UNROLL for (short i = 0; i < 4; ++i) {
-                        qk_a[rp * 4 + i] = live[rp] ? x.lo[i] : T(0);
-                        qk_a[8 + rp * 4 + i] = live[rp] ? x.hi[i] : T(0);
+        // Scores of the tile: keys base .. base + 15 in s[0], base + 16 .. base + 31 in s[1].
+        fpiece s[2];
+        s[0] = fpiece(0.0f);
+        s[1] = fpiece(0.0f);
+        INK_EVERY for (short p = 0; p < DP; ++p) {
+            tpiece kp[2];
+            INK_EVERY for (short j = 0; j < 2; ++j) {
+                INK_EVERY for (short rp = 0; rp < 2; ++rp) {
+                    const vec<T, 4> x = ink_four(k_lane + (koff[j][rp] + uint(16 * p) * k_dim), k_step);
+                    INK_EVERY for (short col = 0; col < 4; ++col) {
+                        kp[j][rp * 4 + col] = x[col];
                     }
                 }
             }
-            INK_UNROLL for (short part = 0; part < 4; ++part) {
-                InkEight<T> x = ink_load8(k_lane + (koff[part] + uint(32 * s) * k_dim), k_dim);
-                INK_UNROLL for (short i = 0; i < 4; ++i) {
-                    qk_b[part * 4 + i] = x.lo[i];
-                    qk_b[16 + part * 4 + i] = x.hi[i];
-                }
-            }
-            qk_op.run(qk_a, qk_b, qk_c);
+            Piece::mma(s[0], s[1], qp[p], metal::false_type{}, kp[0], kp[1], metal::true_type{});
         }
 
-        // Logits in base-2 units.
-        float lg[16];
-        INK_UNROLL for (short e = 0; e < 16; ++e) {
-            const short rp = (e >> 2) & 1;
-            float x = qk_c[e] * scale_log2;
-            if (near) {
-                const int key = base + int(fc) + 16 * (e >> 3) + (e & 3);
-                const int d = pos[rp] - key;
-                const bool seen = live[rp] && d >= 0 && (WINDOW == 0 || d < WINDOW);
-                if (!seen) {
-                    x = -INFINITY;
-                } else if (d < EXTENT) {
-                    x = fma(float(prof_row[rp][uint(d) * prof_step]), LOG2E, x);
+        // Logits in base-2 units, masked and biased where a row is near.
+        INK_EVERY for (short j = 0; j < 2; ++j) {
+            INK_EVERY for (short e = 0; e < 8; ++e) {
+                const short rp = e >> 2;
+                float x = s[j][e] * scale_log2;
+                if (near) {
+                    const int key = base + 16 * j + int(fc) + (e & 3);
+                    const int d = pos[rp] - key;
+                    const bool seen = live[rp] && d >= 0 && (WINDOW == 0 || d < WINDOW);
+                    if (!seen) {
+                        x = -INFINITY;
+                    } else if (d < EXTENT) {
+                        x = fma(float(prof_row[rp][uint(d) * prof_step]), LOG2E, x);
+                    }
                 }
+                s[j][e] = x;
             }
-            lg[e] = x;
         }
 
+        // Online softmax per row: the tile's maximum, the correction of what came before, the weights.
         float corr[2];
-        INK_UNROLL for (short rp = 0; rp < 2; ++rp) {
+        INK_EVERY for (short rp = 0; rp < 2; ++rp) {
             float m = -INFINITY;
-            INK_UNROLL for (short h = 0; h < 2; ++h) {
-                INK_UNROLL for (short i = 0; i < 4; ++i) {
-                    m = max(m, lg[h * 8 + rp * 4 + i]);
+            INK_EVERY for (short j = 0; j < 2; ++j) {
+                INK_EVERY for (short col = 0; col < 4; ++col) {
+                    m = max(m, s[j][rp * 4 + col]);
                 }
             }
             m = max(m, simd_shuffle_xor(m, ushort(1)));
@@ -293,11 +244,10 @@ _SOURCE = """
             const float nm = max(run_max[rp], m);
             corr[rp] = fast::exp2(run_max[rp] - nm);
             float sum = 0.0f;
-            INK_UNROLL for (short h = 0; h < 2; ++h) {
-                INK_UNROLL for (short i = 0; i < 4; ++i) {
-                    const short e = h * 8 + rp * 4 + i;
-                    const float w = fast::exp2(lg[e] - nm);
-                    lg[e] = w;
+            INK_EVERY for (short j = 0; j < 2; ++j) {
+                INK_EVERY for (short col = 0; col < 4; ++col) {
+                    const float w = fast::exp2(s[j][rp * 4 + col] - nm);
+                    s[j][rp * 4 + col] = w;
                     sum += w;
                 }
             }
@@ -307,99 +257,60 @@ _SOURCE = """
             run_max[rp] = nm;
         }
         if (simd_any(corr[0] != 1.0f || corr[1] != 1.0f)) {
-            INK_UNROLL for (short e = 0; e < 16; ++e) {
-                const float c = corr[(e >> 2) & 1];
-                acc0[e] *= c;
-                acc1[e] *= c;
-                acc2[e] *= c;
-                acc3[e] *= c;
+            INK_EVERY for (short p = 0; p < DP; ++p) {
+                INK_EVERY for (short e = 0; e < 8; ++e) {
+                    acc[p][e] *= corr[e >> 2];
+                }
             }
         }
-        if (!PSPLIT) {
-            INK_UNROLL for (short e = 0; e < 16; ++e) {
-                pv_a[e] = PT(lg[e]);
+
+        // Value sums: each 16-key half of the tile against the values of those keys, 32
+        // output dimensions a multiply.
+        INK_EVERY for (short j = 0; j < 2; ++j) {
+            INK_EVERY for (short g = 0; g < DP / 2; ++g) {
+                tpiece vp[2];
+                INK_EVERY for (short h = 0; h < 2; ++h) {
+                    INK_EVERY for (short rp = 0; rp < 2; ++rp) {
+                        const vec<T, 4> x = ink_four(v_lane + (voff[j][rp] + uint(32 * g + 16 * h) * v_dim), v_step);
+                        INK_EVERY for (short col = 0; col < 4; ++col) {
+                            vp[h][rp * 4 + col] = x[col];
+                        }
+                    }
+                }
+                Piece::mma(acc[2 * g], acc[2 * g + 1], s[j], metal::false_type{}, vp[0], vp[1], metal::false_type{});
             }
         }
-        INK_PV(0, acc0)
-        INK_PV(1, acc1)
-        INK_PV(2, acc2)
-        INK_PV(3, acc3)
     }
 
-    // Store: element (j >> 2) * 8 + rp * 4 + (j & 3) of group g is dimension 32 g + 2 fc + j.
-    INK_UNROLL for (short rp = 0; rp < 2; ++rp) {
+    // Store: piece p, element 4 rp + c is dimension 16 p + fc + c of row fr + 8 rp.
+    INK_EVERY for (short rp = 0; rp < 2; ++rp) {
         if (!live[rp]) {
             continue;
         }
         const float inv = 1.0f / run_sum[rp];
-        device T* o = out + (size_t(qrow[rp]) * size_t(HQ) + size_t(qhead[rp])) * size_t(D) + size_t(2 * fc);
+        device T* o = out + (size_t(qrow[rp]) * size_t(HQ) + size_t(head)) * size_t(D) + size_t(fc);
         INK_GATE_ROW
-        INK_STORE(0, acc0)
-        INK_STORE(1, acc1)
-        INK_STORE(2, acc2)
-        INK_STORE(3, acc3)
+        INK_EVERY for (short p = 0; p < DP; ++p) {
+            vec<T, 4> y;
+            INK_EVERY for (short col = 0; col < 4; ++col) {
+                INK_RESULT(y[col], acc[p][rp * 4 + col] * inv, 16 * p + col)
+            }
+            ink_put_four(o + 16 * p, y);
+        }
     }
 """
 
-# P V for output dimensions 32 g .. 32 g + 31. One piece: the probabilities of the 32 keys in
-# half precision against the values of the same keys. Two pieces: 16 keys at a time, each
-# probability as a high and a low half whose sum is the float value, against the values of
-# those 16 keys entered twice.
-_PV_ONE = """
-#define INK_PV(G_, ACC)                                                                  \\
+# The result of one element: the attention in the query type; gated, then times the sigmoid of
+# the row's gate logit as the layer applies it (``h.astype(float32) * sigmoid(gate.astype(float32))``,
+# rounded to the query type), the sigmoid in its stable form, 1 / (1 + e^|x|) mirrored at 0.
+_RESULT = "#define INK_RESULT(Y_, V_, DIM_) Y_ = T(V_);\n"
+_RESULT_GATED = """
+#define INK_RESULT(Y_, V_, DIM_)                                                         \\
     {                                                                                    \\
-        INK_UNROLL for (short part = 0; part < 4; ++part) {                              \\
-            InkEight<T> x = ink_load8(v_lane + (voff[part] + uint(32 * (G_)) * v_dim), v_dim); \\
-            const short at = (part >> 1) * 16 + (part & 1) * 4;                          \\
-            INK_UNROLL for (short i = 0; i < 4; ++i) {                                   \\
-                pv_b[at + i] = x.lo[i];                                                  \\
-                pv_b[at + 8 + i] = x.hi[i];                                              \\
-            }                                                                            \\
-        }                                                                                \\
-        pv_op.run(pv_a, pv_b, ACC);                                                      \\
-    }
-"""
-
-_PV_TWO = """
-#define INK_PV(G_, ACC)                                                                  \\
-    INK_UNROLL for (short kh = 0; kh < 2; ++kh) {                                        \\
-        INK_UNROLL for (short rh = 0; rh < 2; ++rh) {                                    \\
-            const short part = kh * 2 + rh;                                              \\
-            InkEight<T> x = ink_load8(v_lane + (voff[part] + uint(32 * (G_)) * v_dim), v_dim); \\
-            INK_UNROLL for (short i = 0; i < 4; ++i) {                                   \\
-                pv_b[rh * 4 + i] = x.lo[i];                                              \\
-                pv_b[8 + rh * 4 + i] = x.hi[i];                                          \\
-                pv_b[16 + rh * 4 + i] = x.lo[i];                                         \\
-                pv_b[24 + rh * 4 + i] = x.hi[i];                                         \\
-            }                                                                            \\
-        }                                                                                \\
-        INK_UNROLL for (short i = 0; i < 8; ++i) {                                       \\
-            const float w = lg[kh * 8 + i];                                              \\
-            const PT high = PT(w);                                                       \\
-            pv_a[i] = high;                                                              \\
-            pv_a[8 + i] = PT(w - float(high));                                           \\
-        }                                                                                \\
-        pv_op.run(pv_a, pv_b, ACC);                                                      \\
-    }
-"""
-
-_STORE = """
-#define INK_STORE(G_, ACC)                                                               \\
-    INK_UNROLL for (short j = 0; j < 8; ++j) {                                           \\
-        o[32 * (G_) + j] = T(ACC[(j >> 2) * 8 + rp * 4 + (j & 3)] * inv);                \\
-    }
-"""
-
-# The gated store: the attention result in the query type, then times the sigmoid of the row's
-# gate logit, as the layer applies it (``h.astype(float32) * sigmoid(gate.astype(float32))``,
-# rounded to the query type); the sigmoid in its stable form, 1 / (1 + e^|x|) mirrored at 0.
-_STORE_GATED = """
-#define INK_STORE(G_, ACC)                                                               \\
-    INK_UNROLL for (short j = 0; j < 8; ++j) {                                           \\
-        const T hv = T(ACC[(j >> 2) * 8 + rp * 4 + (j & 3)] * inv);                      \\
-        const float gx = float(gp[32 * (G_) + j]);                                       \\
+        const T hv = T(V_);                                                              \\
+        const float gx = float(gp[DIM_]);                                                \\
         const float tail = 1.0f / (1.0f + metal::exp(metal::abs(gx)));                   \\
-        o[32 * (G_) + j] = T(float(hv) * (gx < 0.0f ? tail : 1.0f - tail));              \\
+        Y_ = T(float(hv) * (gx < 0.0f ? tail : 1.0f - tail));                            \\
     }
 """
 
@@ -411,16 +322,24 @@ def _float_bits(value):
 SCALE_BITS = _float_bits(HEAD_DIM ** -0.5)
 
 
+def library_text():
+    """``(text, None)`` with the installed MLX's tensor-unit pieces, or ``(None, why)``."""
+    return library_headers.text("tensor_tiles")
+
+
 @lru_cache(maxsize=None)
-def _kernel(psplit, gated=False):
+def _kernel(gated=False):
+    text, why = library_text()
+    if text is None:
+        raise RuntimeError(f"library headers: {why}")
     # The gate is the gate product's own output, row-contiguous: a row is HQ * D logits.
     gate_row = ("#define INK_GATE_ROW const device T* gp = gate + (size_t(qrow[rp]) * size_t(HQ) + "
-                "size_t(qhead[rp])) * size_t(D) + size_t(2 * fc);\n") if gated else "#define INK_GATE_ROW\n"
+                "size_t(head)) * size_t(D) + size_t(fc);\n") if gated else "#define INK_GATE_ROW\n"
     return mx.fast.metal_kernel(
-        name="mtplx_inkling_prompt_flash" + ("_split" if psplit else "") + ("_gated" if gated else ""),
+        name="mtplx_inkling_prompt_flash" + ("_gated" if gated else ""),
         input_names=["q", "k", "v", "prof", "sink", "params"] + (["gate"] if gated else []),
         output_names=["out"],
-        header=_HEADER + (_PV_TWO if psplit else _PV_ONE) + (_STORE_GATED if gated else _STORE) + gate_row,
+        header=text + _HEADER + (_RESULT_GATED if gated else _RESULT) + gate_row,
         source=_SOURCE,
         ensure_row_contiguous=False,
     )
@@ -435,17 +354,11 @@ def tensor_units():
 
 
 def settings():
-    """The launch's measured choices, each overridable for measurement:
-    ``(tg_m, psplit, ptype, qreg, tgbar, relax, fold)``."""
+    """The launch's measured choices, each overridable for measurement: ``(tg_m, tgbar)``."""
     env = os.environ.get
     tg_m = int(env("MTPLX_INKLING_PROMPT_FLASH_TGM", TG_M))
-    psplit = env("MTPLX_INKLING_PROMPT_FLASH_PSPLIT", "0") in ("1", "on", "true")
-    ptype = mx.float32 if env("MTPLX_INKLING_PROMPT_FLASH_PTYPE", "float") == "float" else mx.float16
-    qreg = env("MTPLX_INKLING_PROMPT_FLASH_QREG", "1") not in ("0", "off", "false")
     tgbar = env("MTPLX_INKLING_PROMPT_FLASH_TGBAR", "1") not in ("0", "off", "false")
-    relax = env("MTPLX_INKLING_PROMPT_FLASH_RELAX", "1") not in ("0", "off", "false")
-    fold = env("MTPLX_INKLING_PROMPT_FLASH_FOLD", "1" if FOLD else "0") in ("1", "on", "true")
-    return tg_m, psplit, ptype, qreg, tgbar, relax, fold
+    return tg_m, tgbar
 
 
 def decline(query, key, value, profiles, sink, window):
@@ -466,43 +379,33 @@ def decline(query, key, value, profiles, sink, window):
             or not 0 < rows <= keys or profiles.shape[:3] != (1, rows, heads)
             or tuple(sink.shape) != (1, rows, heads) or window < 0):
         return "geometry"
-    group = heads // kv_heads
-    if 16 // group < 1:
+    if heads // kv_heads > 16 or TG_M % (heads // kv_heads):
         return "geometry"
+    if library_text()[0] is None:
+        return "library_headers"
     return None
 
 
-def flash_attention(query, key, value, profiles, sink, window, *, tg_m=None, psplit=None, ptype=None,
-                    qreg=None, tgbar=None, relax=None, fold=None, gate=None):
+def flash_attention(query, key, value, profiles, sink, window, *, tg_m=None, tgbar=None, gate=None):
     """The prompt call's attention, ``(1, heads, rows, 128)`` (a view of a ``(1, rows, heads,
     128)`` array), in one launch. With ``gate`` (the gate projection's ``(1, rows, heads * 128)``
     logits) it returns the gated result ``(1, rows, heads * 128)`` the output projection reads.
     Call only where :func:`decline` returned None."""
     d = settings()
     tg_m = d[0] if tg_m is None else tg_m
-    psplit = d[1] if psplit is None else psplit
-    ptype = d[2] if ptype is None else ptype
-    qreg = d[3] if qreg is None else qreg
-    tgbar = d[4] if tgbar is None else tgbar
-    relax = d[5] if relax is None else relax
-    fold = d[6] if fold is None else fold
-    if psplit:
-        ptype = mx.float16
+    tgbar = d[1] if tgbar is None else tgbar
     if gate is not None:
         gate = mx.contiguous(gate)
     _, heads, rows, _ = query.shape
     kv_heads, keys = key.shape[1], key.shape[2]
     group = heads // kv_heads
-    rpb = 16 // group
-    if fold and tg_m % group:
-        raise ValueError("one head a block takes a multiple of the heads a KV head serves")
-    tg_rows = (tg_m // group) * 16 if fold else tg_m * rpb
-    (out,) = _kernel(bool(psplit), gate is not None)(
+    if tg_m % group:
+        raise ValueError("a threadgroup holds whole sets of the heads a key/value head serves")
+    tg_rows = (tg_m // group) * 16
+    (out,) = _kernel(gate is not None)(
         inputs=[query, key, value, profiles, sink, mx.array([rows, keys], mx.int32)] + ([gate] if gate is not None else []),
-        template=[("T", query.dtype), ("PT", ptype), ("G", group), ("RPB", rpb), ("TG_M", tg_m),
-                  ("HQ", heads), ("WINDOW", int(window)), ("EXTENT", int(profiles.shape[3])),
-                  ("SCALE", SCALE_BITS), ("RELAX", bool(relax)), ("PSPLIT", bool(psplit)),
-                  ("QREG", bool(qreg)), ("TGBAR", bool(tgbar)), ("FOLD", bool(fold))],
+        template=[("T", query.dtype), ("G", group), ("TG_M", tg_m), ("HQ", heads), ("WINDOW", int(window)),
+                  ("EXTENT", int(profiles.shape[3])), ("SCALE", SCALE_BITS), ("TGBAR", bool(tgbar))],
         grid=(-(-rows // tg_rows) * tg_m * 32, kv_heads, 1),
         threadgroup=(tg_m * 32, 1, 1),
         output_shapes=[(1, rows, heads, HEAD_DIM)],
@@ -876,16 +779,41 @@ def stage(layer, q_input, k_input, v_input, kv, conv, linear):
     return linear(h, layer.out)
 
 
+def _exact_pieces(x, n):
+    """``x`` (float32) as ``n`` bf16-exact float32 pieces whose sum is ``x`` to about 2^-8n."""
+    out, r = [], x
+    for i in range(n):
+        piece = r.astype(mx.bfloat16).astype(mx.float32)
+        out.append(piece)
+        if i + 1 < n:
+            r = r - piece
+    return out
+
+
+def _exact_product(a, b, na, nb):
+    """``a @ b`` in float32 with every product exact. The GPU's float32 product rounds its operands
+    to about ten mantissa bits (lanes/p2/mmcheck-1: 7.7e-4 relative error against float64), but
+    multiplies bf16-exact operands exactly into float32 sums (6.6e-8)."""
+    acc = None
+    for x in _exact_pieces(a, na):
+        for y in _exact_pieces(b, nb):
+            t = x @ y
+            acc = t if acc is None else acc + t
+    return acc
+
+
 def reference(query, key, value, profiles, sink, window):
-    """The definition in float32 with MLX's own ops (for tests and checks; small calls only)."""
+    """The definition in float32 with MLX's own ops and exact products (for tests and checks;
+    small calls only): 1e-6 relative of the float64 definition (lanes/p2/acc-1)."""
     batch, heads, rows, width = query.shape
     kv_heads, keys = key.shape[1], key.shape[2]
     group = heads // kv_heads
     extent = profiles.shape[3]
+    n_in = 1 if query.dtype == mx.bfloat16 else 2
     q = query.astype(mx.float32)
     k = mx.repeat(key.astype(mx.float32), group, axis=1)
     v = mx.repeat(value.astype(mx.float32), group, axis=1)
-    scores = (q @ k.transpose(0, 1, 3, 2)) * (width ** -0.5)
+    scores = _exact_product(q, k.transpose(0, 1, 3, 2), n_in, n_in) * (width ** -0.5)
     p = (keys - rows) + mx.arange(rows)[:, None]
     d = p - mx.arange(keys)[None, :]
     prof = profiles.astype(mx.float32).transpose(0, 2, 1, 3)          # (1, heads, rows, extent)
@@ -898,4 +826,4 @@ def reference(query, key, value, profiles, sink, window):
     top = mx.maximum(mx.max(logits, axis=-1, keepdims=True), s)
     w = mx.exp(logits - top)
     denom = w.sum(axis=-1, keepdims=True) + mx.exp(s - top)
-    return (w @ v) / denom
+    return _exact_product(w, v, 3, n_in) / denom
