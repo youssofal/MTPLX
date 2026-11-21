@@ -474,6 +474,7 @@ class DraftLaw:
     rows: mx.array  # (k, V) float32 law rows, or None for point-mass proposals
     stats: mx.array  # (k, C, 2) chunk stats of ``rows``
     point_mass: bool = False
+    log_q: mx.array | None = None  # (k,) log q_i(x_i) of each drawn proposal (draft confidence)
 
 
 def race(tlaw, tstats, *, modes, positions, seed, purpose, greedy=False, dlaw=None,

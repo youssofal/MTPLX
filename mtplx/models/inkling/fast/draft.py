@@ -76,7 +76,7 @@ def propose(drafter, target, anchor, cache, count, *, position, seed, temperatur
     seed_words = seed if isinstance(seed, mx.array) else rnd._seed_words(seed)
     state = mx.zeros((1, rank), dtype)
     prev = _anchor_ids(anchor).reshape(1)
-    picks, laws, stats = [], [], []
+    picks, laws, stats, confidence = [], [], [], []
     for i in range(count):
         step_in = mx.concatenate([state, drafter.markov["markov_w1.weight"][prev]], axis=-1)
         update = (
@@ -92,14 +92,17 @@ def propose(drafter, target, anchor, cache, count, *, position, seed, temperatur
             law, st = rnd.law_rows(scores, temperature=None, cap=0.0, write=True)
         else:
             law, st = rnd.law_rows(scores, temperature=temperature, cap=cap)
-        token, _ = rnd.sample_rows(law, st, positions=(start + i).reshape(1), seed=seed_words,
-                                   purpose=rnd.PURPOSE_DRAFT, greedy=greedy)
+        token, lse = rnd.sample_rows(law, st, positions=(start + i).reshape(1), seed=seed_words,
+                                     purpose=rnd.PURPOSE_DRAFT, greedy=greedy)
         prev = token
         picks.append(token)
         laws.append(law)
         stats.append(st)
+        if not greedy:
+            confidence.append(mx.take_along_axis(law, token[:, None], axis=1)[:, 0] - lse[:, 1])
     ids = mx.concatenate(picks)
-    law = rnd.DraftLaw(mx.concatenate(laws), mx.concatenate(stats), point_mass=greedy)
+    law = rnd.DraftLaw(mx.concatenate(laws), mx.concatenate(stats), point_mass=greedy,
+                       log_q=mx.concatenate(confidence) if confidence else None)
     return ids, law
 
 
@@ -111,65 +114,67 @@ CHANNELS = {200008: "reasoning", 200004: "text", 200049: "tool", 200057: "tool",
 
 @dataclass
 class DepthByYield:
-    """Per-round proposal count from measured yield, per text channel.
+    """Per-round proposal count from the yield recent rounds actually had, per text channel.
 
-    ``cost_ms[k]`` is the round cost with k proposals (verify width k + 1, k = 0 is a
-    plain step that still keeps the draft history). The expected tokens of a round with
-    k proposals are 1 + sum_{i<=k} prod_{j<=i} a_j, where a_j is the conditional
-    acceptance at position j, kept as a decayed count per channel. The choice maximises
-    expected tokens per ms. Counts start from a prior worth ``prior_rounds`` rounds.
+    ``cost_ms[k]`` is the round cost with k proposals (verify width k + 1; k = 0 is a plain
+    step that still keeps the draft history). Measured acceptance of DSpark proposals is
+    nearly flat by position (study: 0.72, 0.68, 0.77, 0.70, 0.76, 0.80, 0.62), so each
+    channel keeps one decayed acceptance rate ``a`` over every proposal it verified, and a
+    round with k proposals is expected to yield 1 + a + ... + a^k tokens. The choice
+    maximises expected tokens per ms; ties go to the shallower depth (fewer wasted rows).
+    The state starts from ``prior`` worth ``prior_weight`` proposals. Every input is a
+    function of the token history, so a seeded request makes the same choices every time.
     """
 
     cost_ms: tuple
     max_depth: int = 7
-    prior: tuple = (0.70, 0.62, 0.58, 0.55, 0.52, 0.50, 0.48)
-    prior_rounds: float = 4.0
-    decay: float = 0.92
     min_depth: int = 1
+    prior: float = 0.70
+    prior_weight: float = 6.0
+    decay: float = 0.85
     channel: str = "text"
     _hits: dict = field(default_factory=dict)
     _tries: dict = field(default_factory=dict)
     choices: list = field(default_factory=list)
 
-    def _rates(self, channel):
-        hits = self._hits.setdefault(channel, [p * self.prior_rounds for p in self.prior])
-        tries = self._tries.setdefault(channel, [self.prior_rounds] * len(self.prior))
-        return [h / t if t > 0 else 0.0 for h, t in zip(hits, tries)]
+    def rate(self, channel=None):
+        channel = self.channel if channel is None else channel
+        hits = self._hits.get(channel, self.prior * self.prior_weight)
+        tries = self._tries.get(channel, self.prior_weight)
+        return hits / tries if tries > 0 else self.prior
 
-    def expected_tokens(self, k, rates=None):
-        rates = self._rates(self.channel) if rates is None else rates
+    def expected_tokens(self, k, rate=None):
+        a = self.rate() if rate is None else rate
         total, chain = 1.0, 1.0
-        for j in range(k):
-            chain *= rates[j]
+        for _ in range(k):
+            chain *= a
             total += chain
         return total
 
     def choose(self, remaining=None):
-        """The proposal count for the next round (deterministic in the history)."""
-        rates = self._rates(self.channel)
+        """The proposal count for the next round."""
+        a = self.rate()
         limit = min(self.max_depth, len(self.cost_ms) - 1)
         if remaining is not None:
             limit = min(limit, max(0, int(remaining) - 1))
-        best, best_rate = self.min_depth if limit >= self.min_depth else limit, -1.0
-        for k in range(min(self.min_depth, limit), limit + 1):
-            rate = self.expected_tokens(k, rates) / self.cost_ms[k]
-            if rate > best_rate * (1.0 + 1e-9):
-                best, best_rate = k, rate
+        low = min(self.min_depth, limit)
+        best, best_rate = low, -1.0
+        for k in range(low, limit + 1):
+            value = self.expected_tokens(k, a) / self.cost_ms[k]
+            if value > best_rate * (1.0 + 1e-6):
+                best, best_rate = k, value
         self.choices.append(best)
         return best
 
     def observe(self, offered, accepted, tokens=()):
-        """Record a round: ``offered`` proposals, the first ``accepted`` kept; then follow
+        """Record a round (``offered`` proposals, the first ``accepted`` kept), then follow
         the channel of the emitted tokens for the next choice."""
-        hits = self._hits.setdefault(self.channel, [p * self.prior_rounds for p in self.prior])
-        tries = self._tries.setdefault(self.channel, [self.prior_rounds] * len(self.prior))
-        for j in range(len(hits)):
-            hits[j] *= self.decay
-            tries[j] *= self.decay
-        # position j (0-based) was tried when every earlier proposal was accepted
-        for j in range(min(offered, accepted + 1)):
-            tries[j] += 1.0
-            if j < accepted:
-                hits[j] += 1.0
+        channel = self.channel
+        hits = self._hits.get(channel, self.prior * self.prior_weight) * self.decay
+        tries = self._tries.get(channel, self.prior_weight) * self.decay
+        # proposals actually tested: every accepted one plus the first rejected one
+        tested = min(offered, accepted + 1)
+        self._hits[channel] = hits + accepted
+        self._tries[channel] = tries + tested
         for token in tokens:
             self.channel = CHANNELS.get(int(token), self.channel)

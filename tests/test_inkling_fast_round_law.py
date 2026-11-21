@@ -17,6 +17,9 @@ Each is compared with the product's own law (mtplx.sampling.speculative_output_m
 residual_distribution).
 """
 
+import json
+import os
+
 import numpy as np
 import pytest
 
@@ -25,6 +28,14 @@ from mtplx.sampling import residual_distribution, speculative_output_marginal
 
 DRAWS = 1_000_000
 CHUNK = 125_000
+
+
+def _record(name, **fields):
+    """Append one result line to $INKLING_L4_LAW_RECEIPT (JSON lines) when it is set."""
+    path = os.environ.get("INKLING_L4_LAW_RECEIPT")
+    if path:
+        with open(path, "a") as out:
+            out.write(json.dumps({"test": name, "draws": DRAWS, **fields}) + "\n")
 
 
 def _q9999(df):
@@ -88,6 +99,7 @@ def test_race_draws_its_law_1e6():
         pos = np.arange(start, start + CHUNK)
         counts += np.bincount(_race(y, _logs(5, pos, rnd.PURPOSE_TARGET, vocab)), minlength=vocab)
     stat, df = _chi2(counts, p)
+    _record("race_draws_its_law", chi2=stat, df=df, q9999=_q9999(df))
     assert stat < _q9999(df), (stat, df)
 
 
@@ -127,6 +139,10 @@ def test_ratio_rule_first_token_is_p_1e6(case):
         counts += np.bincount(out, minlength=vocab)
         accepted_total += int(accept.sum())
     stat, df = _chi2(counts, p)
+    rate = accepted_total / DRAWS
+    want = (1 - 0.5 * np.abs(p - q).sum()) if q is not None else p[7]
+    _record(f"ratio_first_token_{case}", chi2=stat, df=df, q9999=_q9999(df), accept_rate=rate,
+            accept_rate_expected=float(want))
     assert stat < _q9999(df), (stat, df)
     if q is not None:
         # the product's oracle: the rule's exact marginal is p, and acceptance is 1 - TV
@@ -221,5 +237,6 @@ def test_three_tokens_over_rounds_follow_the_target_chain_1e6():
     law = P[anchor][:, None, None] * P[:, :, None] * P[None, :, :]
     law = law / law.sum()
     stat, df = _chi2(counts, law)
+    _record("three_tokens_over_rounds_chain", chi2=stat, df=df, q9999=_q9999(df))
     assert df > 300
     assert stat < _q9999(df), (stat, df)
