@@ -12734,6 +12734,91 @@ def _is_compact_simple_chitchat_key(compact: str) -> bool:
     return _collapse_repeated_simple_chitchat_text(compact) is not None
 
 
+def _first_tandem_split_by_scan(stripped: str) -> str | None:
+    """The first ``stripped[:split].strip()``, from split 8 on, whose retry
+    key equals the rest's: every split tried, two keys each (quadratic)."""
+    for split in range(8, len(stripped)):
+        first = stripped[:split].strip()
+        second = stripped[split:].strip()
+        if not first or not second:
+            continue
+        if _retry_user_key(first) == _retry_user_key(second):
+            return first
+    return None
+
+
+_PLAIN_WHITESPACE = frozenset(" \t\n\r\f\v")
+
+
+def _first_tandem_split(stripped: str) -> str | None:
+    """``_first_tandem_split_by_scan``'s answer, trying only the splits where
+    the two keys can be equal.
+
+    On text whose whitespace is ASCII and whose characters lowercase to one
+    character each, a part's key is its non-space characters plus one space
+    per gap between its words, so its length comes from prefix counts. Two
+    keys are equal only at equal lengths, or both None (both under 8): every
+    other split is skipped, and the ones left get the scan's own test. A
+    split only moves a part's edge within whitespace when the strip gives
+    the same two parts, so each pair is tested once. Claude Code's request
+    policy spent 75 to 105 ms here on every request (each user message of 1K
+    to 4K characters, two key builds per character). Any other text takes
+    the scan.
+    """
+    if any(
+        (ch.isspace() and ch not in _PLAIN_WHITESPACE) or len(ch.lower()) != 1
+        for ch in stripped
+    ):
+        return _first_tandem_split_by_scan(stripped)
+    size = len(stripped)
+    space = [ch in _PLAIN_WHITESPACE for ch in stripped]
+    # chars[j], words[j]: non-space characters and word starts in stripped[:j];
+    # ends[j]: words whose last character is in stripped[:j].
+    chars = [0] * (size + 1)
+    words = [0] * (size + 1)
+    ends = [0] * (size + 1)
+    for i in range(size):
+        starts = not space[i] and (i == 0 or space[i - 1])
+        finishes = not space[i] and (i + 1 == size or space[i + 1])
+        chars[i + 1] = chars[i] + (0 if space[i] else 1)
+        words[i + 1] = words[i] + (1 if starts else 0)
+        ends[i + 1] = ends[i] + (1 if finishes else 0)
+    total_chars, total_words = chars[size], words[size]
+    if total_chars + total_words - 1 > 4_000:
+        # Parts over the key's 4,000-character cap are None too (the caller
+        # never sends such a text: its own key would be None).
+        return _first_tandem_split_by_scan(stripped)
+    # The first part's end (after its last non-space character) and the
+    # second part's start (its first non-space character) at each split.
+    last_end = [0] * (size + 1)
+    for i in range(size):
+        last_end[i + 1] = i + 1 if not space[i] else last_end[i]
+    next_start = [size] * (size + 1)
+    for i in range(size - 1, -1, -1):
+        next_start[i] = i if not space[i] else next_start[i + 1]
+    tried: set[tuple[int, int]] = set()
+    for split in range(8, size):
+        pieces_first = words[split]
+        pieces_second = total_words - ends[split]
+        len_first = chars[split] + pieces_first - 1 if pieces_first else 0
+        len_second = (
+            total_chars - chars[split] + pieces_second - 1 if pieces_second else 0
+        )
+        if len_first != len_second and not (len_first < 8 and len_second < 8):
+            continue
+        pair = (last_end[split], next_start[split])
+        if pair in tried:
+            continue
+        tried.add(pair)
+        first = stripped[:split].strip()
+        second = stripped[split:].strip()
+        if not first or not second:
+            continue
+        if _retry_user_key(first) == _retry_user_key(second):
+            return first
+    return None
+
+
 def _collapse_repeated_user_text(text: str) -> str | None:
     raw = text or ""
     stripped = raw.strip()
@@ -12742,13 +12827,9 @@ def _collapse_repeated_user_text(text: str) -> str | None:
         # OpenCode can persist a cancelled retry as one user part like
         # "Hi, how are you?Hi, how are you?". Collapse exact tandem repeats
         # first so the user's original casing/punctuation survives.
-        for split in range(8, len(stripped)):
-            first = stripped[:split].strip()
-            second = stripped[split:].strip()
-            if not first or not second:
-                continue
-            if _retry_user_key(first) == _retry_user_key(second):
-                return first
+        first = _first_tandem_split(stripped)
+        if first is not None:
+            return first
     collapsed_chitchat = _collapse_repeated_simple_chitchat_text(stripped)
     if collapsed_chitchat is not None:
         return collapsed_chitchat
