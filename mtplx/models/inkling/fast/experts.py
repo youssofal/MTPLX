@@ -831,6 +831,93 @@ PANEL_PROMPT = (PANEL
                 .replace("const uint pair = ps[10 + m0 + m];", "const uint pair = lo + m0 + m;"))
 assert PANEL_PROMPT.count("sorted_rows[lo + m0 + m]") == 1 and "ps[" not in PANEL_PROMPT
 
+# Prompt chunks name about 32 pairs an expert. Here the loop runs blocks outside rows: each
+# block's inputs of a chunk of MC members sit in registers while every row of the simdgroup is
+# decoded once and applied to all of them, so an input slice is loaded once for RPS rows.
+PANEL_PROMPT2 = """
+    const uint tile = threadgroup_position_in_grid.x;
+    const uint e = threadgroup_position_in_grid.y;
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    uint lo = 0;
+    for (uint a = 0, z = PAIRS; a < z;) {
+        const uint mid = (a + z) / 2;
+        if (sorted_experts[mid] < e) a = mid + 1; else z = mid;
+        lo = a;
+    }
+    uint hi = lo;
+    for (uint a = lo, z = PAIRS; a < z;) {
+        const uint mid = (a + z) / 2;
+        if (sorted_experts[mid] <= e) a = mid + 1; else z = mid;
+        hi = a;
+    }
+    if (hi == lo) return;
+    const uint M = hi - lo;
+    const device uint* wexp = codes + size_t(e) * 2304 * CW;
+    const device uchar* sexp = scales + size_t(e) * 2304 * SW;
+    const uint n0 = tile * (S * RPS) + sg * RPS;
+    for (uint m0 = 0; m0 < M; m0 += MC) {
+        const uint mc = min(uint(MC), M - m0);
+        float res[MC][RPS];
+        for (int m = 0; m < MC; ++m)
+            for (int q = 0; q < RPS; ++q) res[m][q] = 0.0f;
+        for (uint b = 0; b < NBLK; ++b) {
+            float xv[MC][NV];
+            for (uint m = 0; m < uint(MC); ++m) {
+                if (m < mc) {
+                    const device float* xr = xin + sorted_rows[lo + m0 + m] * K + (32 * NV) * b + NV * lane;
+                    const float4 a = *(const device float4*)xr;
+                    xv[m][0] = a.x; xv[m][1] = a.y; xv[m][2] = a.z; xv[m][3] = a.w;
+#if NV == 8
+                    const float4 c = *(const device float4*)(xr + 4);
+                    xv[m][4] = c.x; xv[m][5] = c.y; xv[m][6] = c.z; xv[m][7] = c.w;
+#endif
+                }
+            }
+            for (int q = 0; q < RPS; ++q) {
+                const uint n = n0 + q;
+                const uint sb = sexp[n * SW + (32 / SPL) * b + lane / SPL];
+                float wv[NV];
+#if FP4
+                const float sv = l3_e4m3(sb) * SFOLD;
+                l3_e2m1x8(wexp[n * CW + 32 * b + lane], wv);
+#else
+                const float sv = l3_e8m0(sb) * SFOLD;
+                for (int j = 0; j < WPL; ++j)
+                    l3_e4m3x4(wexp[n * CW + (32 * WPL) * b + WPL * lane + j], wv + 4 * j);
+#endif
+                for (uint m = 0; m < uint(MC); ++m) {
+                    if (m < mc) {
+                        float accum = 0;
+#if FP4
+                        accum += (xv[m][0] * wv[0] + xv[m][1] * wv[1] + xv[m][2] * wv[2] + xv[m][3] * wv[3]);
+                        accum += (xv[m][4] * wv[4] + xv[m][5] * wv[5] + xv[m][6] * wv[6] + xv[m][7] * wv[7]);
+#else
+                        for (int i = 0; i < NV; ++i) accum += xv[m][i] * wv[i];
+#endif
+#if FOLD
+                        const float tt = sv * accum;
+#else
+                        const float full = accum * POW;
+                        const float tt = sv * full;
+#endif
+                        res[m][q] = res[m][q] + tt;
+                    }
+                }
+            }
+        }
+        for (uint m = 0; m < uint(MC); ++m) {
+            if (m < mc) {
+                const uint pair = lo + m0 + m;
+                for (int q = 0; q < RPS; ++q) {
+                    const float v = simd_sum(res[m][q]);
+                    if (lane == uint(q)) raw[pair * 2304 + n0 + q] = v;
+                }
+            }
+        }
+    }
+"""
+
 # Per (product, fp4): K, words a row, scale bytes a row, values a lane, words a lane, blocks,
 # lanes per scale byte, and the power of two the decoded codes leave out (MLX's dispatch:
 # gate-up NVFP4 and both MXFP8 down use `fp_qmv_impl`, gate-up MXFP8 `fp_qmv_fast_impl`).
@@ -971,19 +1058,21 @@ def _panel_kernel(product, fp4, fold):
 
 
 @lru_cache(maxsize=None)
-def _panel_prompt_kernel(fp4, fold):
+def _panel_prompt_kernel(fp4, fold, body=1):
     g = PANEL_GEOMETRY[("gu", fp4)]
     defines = {"FP4": int(fp4), "NV": g["NV"], "WPL": g["WPL"], "NBLK": g["NBLK"], "HALF_LAST": 0,
                "CW": g["CW"], "SW": g["SW"], "SPL": g["SPL"], "K": g["K"], "POW": g["POW"],
                "FOLD": int(fold), "SFOLD": (g["POW"] if fold else "1.0f")}
     extra = "".join(f"#define {k} {v}\n" for k, v in defines.items())
-    name = f"mtplx_inkling_panel_prompt_gu_{'nvfp4' if fp4 else 'mxfp8'}_f{int(fold)}"
+    name = f"mtplx_inkling_panel_prompt{body}_gu_{'nvfp4' if fp4 else 'mxfp8'}_f{int(fold)}"
     return mx.fast.metal_kernel(name=name, input_names=["sorted_experts", "sorted_rows", "xin", "codes", "scales"],
-                                output_names=["raw"], source=PANEL_PROMPT, header=_header(extra),
-                                ensure_row_contiguous=True)
+                                output_names=["raw"], source=PANEL_PROMPT if body == 1 else PANEL_PROMPT2,
+                                header=_header(extra), ensure_row_contiguous=True)
 
 
-PROMPT_LAYOUT = dict(S=4, RPS=2, R=2, MC=8, FOLD=1)
+# Measured on real layer weights at 512 rows (lanes/l6/xprefill-5.json): MXFP8 gate-up 12.9 ms
+# against 17.9 for the row-step body and 19.4 for the stock body's indexed gather.
+PROMPT_LAYOUT = dict(BODY=2, S=4, RPS=4, MC=4, FOLD=1)
 
 
 def prompt_gate_up(block, values, sorted_experts, sorted_rows, layout=None):
@@ -994,9 +1083,13 @@ def prompt_gate_up(block, values, sorted_experts, sorted_rows, layout=None):
     lay = layout or PROMPT_LAYOUT
     pairs = sorted_experts.shape[0]
     tgr = lay["S"] * lay["RPS"]
-    return _panel_prompt_kernel(fp4, lay.get("FOLD", 1))(
+    body = lay.get("BODY", 1)
+    template = [("S", lay["S"]), ("RPS", lay["RPS"]), ("MC", lay["MC"]), ("PAIRS", pairs)]
+    if body == 1:
+        template.insert(2, ("R", lay["R"]))
+    return _panel_prompt_kernel(fp4, lay.get("FOLD", 1), body)(
         inputs=[sorted_experts, sorted_rows, values.reshape(-1, HIDDEN), block.gate_up.codes, block.gate_up.scales],
-        template=[("S", lay["S"]), ("RPS", lay["RPS"]), ("R", lay["R"]), ("MC", lay["MC"]), ("PAIRS", pairs)],
+        template=template,
         grid=((HIDDEN // tgr) * 32 * lay["S"], block.gate_up.codes.shape[0], 1), threadgroup=(32 * lay["S"], 1, 1),
         output_shapes=[(pairs, HIDDEN)], output_dtypes=[mx.float32],
     )[0]
