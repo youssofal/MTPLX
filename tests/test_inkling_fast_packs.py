@@ -84,7 +84,7 @@ def test_a_replayed_step_counts_the_visits_that_take_the_packs_own_product():
         layers=[layer(q=packed(64, 256, 4)),  # 4-bit/64 over 256 columns: stage A reads it in place
                 layer(out=packed(64, 128, 6)), layer(q=packed(64, 128, 4), down3=packed(64, 128, 8))],
         visit_order=[0, 1, 2, 1, 2], start=1, end=3,  # layers 1-2 loop twice; messages on the second pass
-        embed_tokens=SimpleNamespace(weight=dense), unembed=dense)
+        embed_tokens=SimpleNamespace(weight=dense, gain=dense[0], eps=1e-6), unembed=dense)
     assert fast_step.stage_fallbacks(model, "a,bc,d", 4) == {
         "fallback.a.packed_4bit_q": 2, "fallback.bc_output.packed_6bit": 2, "fallback.d.packed_8bit": 1}
     assert fast_step.stage_fallbacks(model, "bc,e", 4) == {"fallback.bc_output.packed_6bit": 2,
@@ -140,7 +140,7 @@ def test_wide_copy_rounds_need_every_stage_a_and_mlp_read_on_the_lane_kernels():
                                convs=[SimpleNamespace(dynamic=None) for _ in range(4)], controllers=controllers)
 
     native = SimpleNamespace(layers=[layer(), layer()], visit_order=[0, 1, 1], start=1, end=2,
-                             embed_tokens=SimpleNamespace(weight=dense), unembed=dense)
+                             embed_tokens=SimpleNamespace(weight=dense, gain=dense[0], eps=1e-6), unembed=dense)
     assert fast_step.wide_rows_exact(native, "a,bc,d,e")
     assert not fast_step.wide_rows_exact(native, "bc,e")  # reference stage A reads wide panels batched
     six_bit = SimpleNamespace(**{**vars(native), "layers": [layer(), layer(v=packed(64, 256, 6))]})

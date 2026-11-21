@@ -703,34 +703,34 @@ def row_stable_head(model, hidden):
 
 
 def embed_reason(model):
-    """Why the one-launch embedding cannot serve this model's stored table, or None (a 16-bit table
-    needs no decode: one gather, as the model does it)."""
-    from .qproduct import rows_reason
+    """Why the one-launch embedding (``embedding.embed_rows``: the row gathered, decoded when stored,
+    and normed) cannot serve this model's table, or None."""
+    from .embedding import reason
 
-    packed = getattr(model.embed_tokens, "packed", None)
-    return None if packed is None else rows_reason(packed)
+    table = model.embed_tokens
+    packed = getattr(table, "packed", None)
+    return reason(packed if packed is not None else table.weight, getattr(table, "gain", None))
 
 
 def embed(model, ids):
-    """``model.embed_tokens(ids)`` with a table stored as affine codes (Bare Speed) gathered and
-    decoded in one launch (``qproduct.affine_rows``: MLX gathers codes, scales and biases, then
-    decodes, four launches) and normed as ``Embedding`` norms it; every value equal (proven on this
-    Mac's first use). A 16-bit table takes the model's own embedding; a stored table the launch does
-    not serve, or a refusal, takes it too, counted."""
+    """``model.embed_tokens(ids)`` in one launch (``embedding.embed_rows``): each id's row gathered,
+    decoded when the table is stored as affine codes (Bare Speed: MLX gathers codes, scales and
+    biases, then decodes), and normed as ``Embedding`` norms it; every value equal (proven on this
+    Mac's first use). A table the launch does not serve, or a refusal, takes the model's own
+    embedding, counted."""
+    from .embedding import embed_rows
+
     table = model.embed_tokens
     packed = getattr(table, "packed", None)
-    if packed is not None:
-        from .qproduct import affine_rows
-
-        reason = embed_reason(model)
-        if reason is None:
-            try:
-                rows = affine_rows(ids, packed)
-                count("fused.embed.stored")
-                return mx.fast.rms_norm(rows, table.gain, table.eps)
-            except RuntimeError:
-                reason = "refused"
-        count(f"fallback.embed.{reason}")
+    reason = embed_reason(model)
+    if reason is None:
+        try:
+            rows = embed_rows(ids, packed if packed is not None else table.weight, table.gain, table.eps)
+            count("fused.embed." + ("stored" if packed is not None else "table"))
+            return rows
+        except RuntimeError:
+            reason = "refused"
+    count(f"fallback.embed.{reason}")
     return table(ids)
 
 

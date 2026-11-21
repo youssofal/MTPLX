@@ -105,8 +105,10 @@ def stand_in(recipe, dtype):
             q=m["wq_du"], k=m["wk_dv"], v=m["wv_dv"], r=m["wr_du"], gate=m["gate_attn"], out=m["wo_ud"],
             sink=Meta((24, HIDDEN), dtype), convs=convs, controllers=controllers, experts=experts(index, recipe)))
     table = stored(EMBED, VOCAB, HIDDEN, recipe, dtype)
-    embed_tokens = (SimpleNamespace(weight=table, packed=None) if not isinstance(table, AffineWeight) else
-                    SimpleNamespace(weight=LogicalShape((VOCAB, HIDDEN), dtype), packed=table))
+    gain = Meta((HIDDEN,), dtype)
+    embed_tokens = (SimpleNamespace(weight=table, packed=None, gain=gain, eps=1e-6)
+                    if not isinstance(table, AffineWeight) else
+                    SimpleNamespace(weight=LogicalShape((VOCAB, HIDDEN), dtype), packed=table, gain=gain, eps=1e-6))
     return SimpleNamespace(layers=layers, visit_order=layer_visits(CONFIG), start=start, end=end,
                            embed_tokens=embed_tokens, unembed=stored(HEAD, VOCAB, HIDDEN, recipe, dtype))
 
@@ -268,4 +270,5 @@ def test_a_stored_embedding_takes_the_launches_of_a_16_bit_one(rows, dtype):
     native = SimpleNamespace(embed_tokens=Embedding(dense, gain, 1e-6))
     packed = SimpleNamespace(embed_tokens=Embedding(_affine(32768, HIDDEN, 4, 12, dtype), gain, 1e-6))
     got, want = _launches(eng, lambda: step.embed(packed, ids)), _launches(eng, lambda: step.embed(native, ids))
-    assert got[0] <= want[0] and got[1] <= want[1], (got, want)
+    # Gather, decode and norm in one launch of ours on either table: no stock launch left.
+    assert got == (1, 0) and want == (1, 0), (got, want)
