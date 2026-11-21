@@ -49,27 +49,30 @@ def served_proposals(device_ok, draft_temperature, proposals, dspark_tokens):
             "sampled_tokens": dspark_tokens if sampled else 0}
 
 
-def decision_route(sampler, *, constraint=None, draft_sampler=None, verify_strategy=None, controls=None):
+def decision_route(sampler, *, constraint=None, draft_sampler=None, verify_strategy=None):
     """``(True, None)`` when the GPU decides the rounds and draws the first token, else
-    ``(False, reason)`` for the host decision (RC6's draws), which every request can take."""
+    ``(False, reason)`` for the host decision (RC6's draws), which every request can take.
+
+    Client controls (logit_bias, min_p, repetition_penalty) ride the device round: they are
+    applied to the rows it decides from (``ClientControlledDraw.rows``), so the ratio rule and
+    the drafter's sampled proposals serve those requests too."""
     if not fast_enabled():
         # MTPLX_INKLING_FAST=off restores RC6's whole path: its forward and its host decision.
         return False, "fast_path_off"
     if verify_strategy == "target_prefix":
         return False, "target_prefix"
-    ok, reason = fast_round.supported(sampler, constraint=constraint, draft_sampler=draft_sampler)
-    if ok and controls is not None:
-        return False, "client_controls"
-    return ok, reason
+    return fast_round.supported(sampler, constraint=constraint, draft_sampler=draft_sampler)
 
 
-def checked_device_draw(row_logits, *, position, seed, temperature):
+def checked_device_draw(row_logits, *, position, seed, temperature, controls=None):
     """The GPU's draw of one token from a logits row, refused like every host draw when the row
     has NaN, or no finite maximum (+inf, or every entry -inf): one read gives the token and the
     row's status, and a bad row raises the existing numerical error before the id is counted,
-    streamed, embedded or banked (review 1, finding 3)."""
+    streamed, embedded or banked (review 1, finding 3). ``controls`` (the request's
+    ``ClientControlledDraw``) shapes the row first; the error's census reads the model's row."""
     row = row_logits.reshape(1, -1)
-    drawn = fast_round.draw_checked(row, position=position, seed=seed, temperature=temperature)
+    law = controls.rows(row) if controls is not None else row
+    drawn = fast_round.draw_checked(law, position=position, seed=seed, temperature=temperature)
     return fast_round.read_draw(drawn, rows=row, settle=settle_owner_work)[0], True
 
 
@@ -145,7 +148,9 @@ def generate(
         )
     cache, logits, hidden = prompt.trunk_cache, prompt.logits, prompt.hidden
     rng = np.random.default_rng(seed)
-    # logit_bias / repetition_penalty / min_p: applied by the host draw on every row.
+    # logit_bias / repetition_penalty / min_p on every row the request draws from: the device
+    # round's rows before its decision (ClientControlledDraw.rows) and the host draw's alike;
+    # every emitted token is observed for the repetition penalty, whichever route drew it.
     controls = ClientControlledDraw(sampler, prompt_ids) if client_controls(sampler) else None
     native_draw = (os.environ.get("MTPLX_INKLING_NATIVE_DRAW", "candidate") == "candidate"
                    and is_native_sampler(sampler) and controls is None)
@@ -153,8 +158,13 @@ def generate(
     # asks for the seed-match rule (verify strategy target_prefix: RC6's host FP64 draw) or
     # its sampling law needs the host (grammar, penalties, top-p/top-k): one small read a round.
     device_ok, device_decline = decision_route(sampler, constraint=constraint, draft_sampler=draft_sampler,
-                                               verify_strategy=verify_strategy, controls=controls)
+                                               verify_strategy=verify_strategy)
     count("decision.device" if device_ok else f"decision.host.{device_decline}")
+    if device_ok and controls is not None:
+        count("decision.device.client_controls")
+    # The one-program round has no input for a client's logit transform yet: those rounds run
+    # from the pieces below, the controls applied to the verified rows (counted per round).
+    program_decline = "client_controls" if controls is not None else None
     # MTPLX_INKLING_ROUND_PROGRAM=0 keeps every round on the replayed step and the pieces around
     # it (a diagnostic rollback; round.decline.* counts every round the program does not serve).
     round_program_on = os.environ.get("MTPLX_INKLING_ROUND_PROGRAM", "on").strip().lower() not in (
@@ -247,7 +257,8 @@ def generate(
                 # MLX graph or declined, and why (per-round attribution for the Pulse rows).
                 "engine": engine_site.last_route(),
                 # Whether the whole round ran as one native program (lane L7), and why not.
-                "round": round_program.last_route(),
+                "round": ({"route": "declined", "reason": program_decline, "proposals": total - 1}
+                          if program_decline and copied is None and device_ok else round_program.last_route()),
                 "fallback_deltas": {"prompt_copy_decline": declines} if declines else {},
                 # Host seconds. Verify includes the existing logits synchronization.
                 # Commit ends on return from the existing cache update and draft observation.
@@ -281,8 +292,10 @@ def generate(
 
     def device_draw(row_logits, position):
         token, valid = checked_device_draw(row_logits, position=position, seed=round_seed,
-                                           temperature=target_temperature)
+                                           temperature=target_temperature, controls=controls)
         counts[token] += 1
+        if controls is not None:
+            controls.observe(token)
         return token
 
     decode_start = perf_counter()
@@ -334,7 +347,9 @@ def generate(
             continue
         position = len(prompt_ids) + len(tokens)
         law = served = None
-        if copied is None and device_ok and round_program_on:
+        if copied is None and device_ok and round_program_on and program_decline:
+            count(f"round.decline.{program_decline}")
+        elif copied is None and device_ok and round_program_on:
             # The whole round (proposals, verify and decision) as one native program where one
             # is live (lane L7); otherwise the same round from the pieces below, same law.
             served = round_program.serve(rt, anchor, cache, min(selected_depth, remaining),
@@ -382,7 +397,8 @@ def generate(
             count("decision.host.wide_copy")
         elif device_ok:
             packet = (served.packet if served is not None else
-                      fast_round.decide(rows, proposed, position=position, seed=round_seed,
+                      fast_round.decide(controls.rows(rows, proposed) if controls is not None else rows,
+                                        proposed, position=position, seed=round_seed,
                                         temperature=target_temperature, draft=law))
             # The round's only read; the owner's eval keeps the stall watchdog ticking.
             decision = fast_round.read_packet(packet, width, settle=eval_rows)
@@ -406,6 +422,8 @@ def generate(
                 if len(tokens) + len(emitted) == max_tokens or (abort_check and abort_check()):
                     break
                 counts[token] += 1
+                if controls is not None:
+                    controls.observe(token)
                 emitted.append(token)
                 repeated = repetition is not None and repetition.observe(tokens, emitted) is not None
                 if pos < decision.accepted:
@@ -534,6 +552,7 @@ def generate(
             "device_round": {"rounds": device_rounds, "host_rounds": host_rounds,
                              "host_fallback_rounds": device_fallback_rounds,
                              "decline": device_decline, "rule": "ratio" if device_ok else "seed_match",
+                             "client_controls": list(controls.names) if controls is not None else [],
                              "proposals": "sampled" if device_ok and draft_temperature > 0 else "argmax",
                              "draft_temperature": draft_temperature if device_ok else None},
             "draft_clock": "host_submission",

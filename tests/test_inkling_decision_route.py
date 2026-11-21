@@ -1,8 +1,9 @@
 """Who decides an Inkling round, and the first token's guard.
 
 * MTPLX_INKLING_FAST=off restores RC6's whole path: its forward and its host decision.
-* A request with client controls (logit_bias, min_p, repetition_penalty) takes the host
-  decision, which applies them; target_prefix keeps RC6's seed-match draws.
+* A request with client controls (logit_bias, min_p, repetition_penalty) takes the device
+  round, with the controls applied to the rows it decides from; target_prefix keeps RC6's
+  seed-match draws on the host.
 * The GPU's first-token draw refuses a logits row with NaN or no finite maximum, raising the
   existing numerical error before the id is counted, streamed or banked.
 * The depth-one API forwards the verify strategy.
@@ -43,11 +44,27 @@ def test_rollback_switch_restores_the_host_decision(device_round, monkeypatch):
     assert loop.decision_route(NATIVE) == (False, "fast_path_off")
 
 
-def test_target_prefix_and_client_controls_take_the_host(device_round):
+def test_target_prefix_takes_the_host_and_client_controls_the_device(device_round):
     assert loop.decision_route(NATIVE, verify_strategy="target_prefix") == (False, "target_prefix")
-    controlled = SamplerConfig(temperature=1.0, top_p=1.0, top_k=0, min_p=0.05)
-    controls = shared.ClientControlledDraw(controlled, [1, 2])
-    assert loop.decision_route(controlled, controls=controls) == (False, "client_controls")
+    controlled = SamplerConfig(temperature=1.0, top_p=1.0, top_k=0, min_p=0.05,
+                               repetition_penalty=1.1, logit_bias=((3, -100.0),))
+    assert loop.decision_route(controlled) == (True, None)
+
+
+def test_client_controls_shape_the_first_token_row(monkeypatch):
+    # The device draw reads the shaped row; the error census would read the model's row.
+    seen = {}
+
+    def checked(row, **k):
+        seen["row"] = row
+        return mx.array([[2], [0]], mx.int32)
+
+    monkeypatch.setattr(loop.fast_round, "draw_checked", checked)
+    config = SamplerConfig(temperature=1.0, top_p=1.0, top_k=0, logit_bias=((0, -100.0),))
+    controls = shared.ClientControlledDraw(config, [])
+    row = mx.arange(4, dtype=mx.float32)[::-1].reshape(1, 4)
+    assert loop.checked_device_draw(row, position=0, seed=1, temperature=1.0, controls=controls) == (2, True)
+    assert seen["row"].tolist() == [[3.0 - 100.0, 2.0, 1.0, 0.0]]
 
 
 @pytest.mark.parametrize("bad", ["nan", "-inf", "+inf"])

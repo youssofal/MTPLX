@@ -7930,12 +7930,13 @@ class ClientControlledDraw:
         self._seen: np.ndarray | None = None
         self._bias: tuple[mx.array, mx.array] | None = None
         self._vocab: int | None = None
+        self._early: list[int] = []  # tokens observed before the first row fixed the vocabulary
 
     def _prepare(self, vocab: int) -> None:
         self._vocab = vocab
         if self.penalty != 1.0:
             seen = np.zeros(vocab, dtype=bool)
-            ids = np.asarray(list(self._prompt), dtype=np.int64)
+            ids = np.asarray(list(self._prompt) + self._early, dtype=np.int64)
             seen[ids[(ids >= 0) & (ids < vocab)]] = True
             self._seen = seen
         # A bias on an id the vocabulary does not have can change no draw.
@@ -7955,8 +7956,54 @@ class ClientControlledDraw:
             out = mx.where(mx.array(self._seen), penalised, out)
         return out.reshape(row.shape)
 
+    def rows(self, logits: mx.array, proposals: mx.array | None = None) -> mx.array:
+        """The rows a device decision draws from, with this request's controls: ``(W, V)``
+        float32, lazy, so a round with client controls is decided on the GPU by the same law
+        as one without them (the ratio rule's exactness holds for any target law).
+
+        Row ``j`` gets the bias and the repetition penalty by ``logits``' own float32
+        operations, with the panel's first ``j`` proposals counted as seen: row ``j`` is the
+        law after them, so they are part of the completion it continues. ``min_p`` (at a
+        temperature above 0) becomes a floor: a token is set to ``-inf`` when
+        ``l - max(l) < T ln(min_p)``, which is ``min_p_filter``'s test ``p >= min_p * p_max``
+        on the tempered softmax, decided in float32 (the device round's law precision). With
+        top-k or top-p the floor would not commute with their cut; the device round serves
+        neither. NaN and infinite entries are left as they are, so a row that is not a law is
+        still refused. ``observe`` must have seen every token the request emitted.
+        """
+        vocab = int(logits.shape[-1])
+        if self._vocab is None:
+            self._prepare(vocab)
+        out = logits.reshape(-1, vocab).astype(mx.float32)
+        width = int(out.shape[0])
+        if self._bias is not None:
+            out = out + mx.zeros((vocab,), mx.float32).at[self._bias[0]].add(self._bias[1])
+        if self._seen is not None:
+            seen = mx.broadcast_to(mx.array(self._seen)[None, :], (width, vocab))
+            if proposals is not None and width > 1:
+                ids = proposals.reshape(-1)[: width - 1].astype(mx.int32)
+                hits = mx.arange(vocab, dtype=mx.int32)[None, :] == ids[:, None]
+                earlier = mx.cumsum(hits.astype(mx.int32), axis=0) > 0
+                seen = mx.logical_or(seen, mx.concatenate([mx.zeros((1, vocab), mx.bool_), earlier]))
+            penalised = mx.where(out > 0, out / self.penalty, out * self.penalty)
+            out = mx.where(seen, penalised, out)
+        temperature = float(self.config.temperature or 0.0)
+        if temperature > 0 and self.config.min_p > 0:
+            # The smallest float32 at or above T ln(min_p): for a gap that float32 holds exactly
+            # (Sterbenz: every token within a factor 2 of a positive maximum) the test is exact.
+            floor = temperature * float(np.log(float(self.config.min_p)))
+            floor32 = np.float32(floor)
+            if float(floor32) < floor:
+                floor32 = np.nextafter(floor32, np.float32(np.inf))
+            keep = mx.logical_or(out - mx.max(out, axis=-1, keepdims=True) >= float(floor32),
+                                 mx.logical_not(mx.isfinite(out)))
+            out = mx.where(keep, out, -mx.inf)
+        return out
+
     def observe(self, token: int) -> None:
-        if self._seen is not None and 0 <= token < self._seen.shape[0]:
+        if self._vocab is None:
+            self._early.append(int(token))
+        elif self._seen is not None and 0 <= token < self._seen.shape[0]:
             self._seen[token] = True
 
     def draw(
