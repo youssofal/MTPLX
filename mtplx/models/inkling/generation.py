@@ -22,8 +22,10 @@ from mtplx.generation import (
     first_token_logprobs,
     restore_or_prefill_prompt_state,
 )
+from mtplx.one_copy import one_copy_store
 from mtplx.route_tape import RouteTape, counter_deltas
 from mtplx.sampling import client_controls
+from .cache import prompt_rows
 from .copy_draft import PromptCopy, SessionPromptIndexes
 from .customer_controls import ProposalSampler, RepetitionOutput
 from .fast import draft as fast_draft
@@ -35,7 +37,7 @@ from .fast.routes import count
 from .fast import round as fast_round
 from .fast import round_program
 from .protocol import completion_text
-from .sampling import draw_native, is_native_sampler
+from .sampling import NativeDrawsAhead, draw_native, is_native_sampler
 from mtplx.token_ids import token_id_bytes
 
 
@@ -111,28 +113,36 @@ def generate(
     if depth is not None and not 1 <= depth < rt.drafter.width:
         raise ValueError(f"DSpark depth must be between 1 and {rt.drafter.width - 1}")
     start = perf_counter()
-    prompt = restore_or_prefill_prompt_state(
-        rt,
-        prompt_ids,
-        mtp_history_policy="cycle",
-        session_bank=session_bank,
-        session_id=session_id,
-        restore_mode=session_restore_mode,
-        template_hash=session_template_hash,
-        draft_head_identity=session_draft_head_identity,
-        policy_fingerprint=session_policy_fingerprint,
-        prefill_callback=prefill_callback,
-        capture_hidden=session_bank is not None,
-        store_prefix_snapshot=store_prefix_snapshot,
-        vision_splice=vision_splice,
-        abort_check=abort_check,
-    )
+    # The read's global banks are allocated once, at the prompt's rows (cache.size_global_banks).
+    with prompt_rows(len(prompt_ids)):
+        prompt = restore_or_prefill_prompt_state(
+            rt,
+            prompt_ids,
+            mtp_history_policy="cycle",
+            session_bank=session_bank,
+            session_id=session_id,
+            restore_mode=session_restore_mode,
+            template_hash=session_template_hash,
+            draft_head_identity=session_draft_head_identity,
+            policy_fingerprint=session_policy_fingerprint,
+            prefill_callback=prefill_callback,
+            capture_hidden=session_bank is not None,
+            store_prefix_snapshot=store_prefix_snapshot,
+            vision_splice=vision_splice,
+            abort_check=abort_check,
+        )
     prompt_commit = {}
     if (
         commit_prompt_state_to_bank
         and session_bank is not None
         and session_id
-        and prompt.suffix_tokens
+        and (
+            prompt.suffix_tokens
+            # An identical prompt took its conversation's only copy as a lease: banked again
+            # (a lease and the prompt-end anchor, no copy) before the answer decodes into it,
+            # so a cancelled answer leaves the conversation where it was.
+            or (one_copy_store(rt) and str(prompt.restore_mode).endswith("reference_lease"))
+        )
         and not prompt.prefill_store_snapshot.get("stored")
     ):
         prompt_commit = _commit_ar_prompt_state(
@@ -173,6 +183,9 @@ def generate(
     # ids and remaining budget and writes the kept rows itself, so the host commits nothing.
     # MTPLX_INKLING_ROUND_COMMIT=0 keeps the deciding round and the stock commit (diagnostic).
     round_commit_on = round_commit_enabled()
+    # Copy rounds of 9 to 32 rows decided on the GPU by the point-mass law the 2- to 8-row copy
+    # rounds use, instead of the host's seed-match draw (class B: off until the lead decides).
+    wide_decision = fast_round.wide_decision_enabled()
     round_seed = int(seed) if seed is not None else secrets.randbits(64)
     target_temperature = float(sampler.temperature or 0.0)
     draft_temperature = float(draft_sampler.temperature) if draft_sampler is not None else target_temperature
@@ -408,11 +421,13 @@ def generate(
         verified_rows = rows
         decision = None
         width = len(block) if isinstance(block, list) else int(block.shape[0])
-        if device_ok and width > fast_round.MAX_ROWS:
+        if device_ok and width > (fast_round.WIDE_ROWS if wide_decision else fast_round.MAX_ROWS):
             # A copy round wider than the device decision's 8 rows: the host decides it
             # (exact under the seed-match rule; counted), the step stays fast.
             count("decision.host.wide_copy")
         elif device_ok:
+            if width > fast_round.MAX_ROWS:
+                count("decision.device.wide_copy")
             packet = (served.packet if served is not None else
                       fast_round.decide(controls.rows(rows, proposed) if controls is not None else rows,
                                         proposed, position=position, seed=round_seed,
@@ -454,12 +469,21 @@ def generate(
                     break
             rows = None
         # Emit the target draw on both branches. A match only lets us read the next verified row.
+        # The native draw's rows are computed ahead on worker threads while the walk draws in
+        # order (the same FP64 operations, so the same tokens): a wide copy round walks up to
+        # 32 rows of about 1 ms each on the host while the GPU waits.
+        ahead = (NativeDrawsAhead(rows) if rows is not None and native_draw and constraint is None
+                 and width > 1 else None)
         for pos, row in enumerate(rows if rows is not None else ()):
             if len(tokens) + len(emitted) == max_tokens or (
                 abort_check and abort_check()
             ):
                 break
-            token = draw(row)
+            if ahead is None:
+                token = draw(row)
+            else:
+                token = ahead.draw(pos, rng)
+                counts[token] += 1
             emitted.append(token)
             repeated = repetition is not None and repetition.observe(tokens, emitted) is not None
             if pos < len(guesses) and guesses[pos] == token:
@@ -471,6 +495,8 @@ def generate(
                 break
             if repeated or token in stop or (constraint and constraint.stopped):
                 break
+        if ahead is not None:
+            ahead.close()
         committed_in_round = served is not None and served.committed
         if committed_in_round and kept != served.kept:
             # A cut the device cannot see (a cancellation, the opt-in repetition guard): the

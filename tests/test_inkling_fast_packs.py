@@ -42,7 +42,7 @@ def test_packed_output_projection_keeps_fused_attention_and_counts(monkeypatch):
     x = (mx.random.normal((1, rows, outer), key=mx.random.key(2))).astype(mx.bfloat16)
     tail = mx.random.normal((1, 3, outer), key=mx.random.key(3))
     convs = [SimpleNamespace(weight=mx.random.normal((4, outer), key=mx.random.key(4 + i)) * 0.3,
-                             dynamic=None) for i in range(4)]
+                             dynamic=None, size=4) for i in range(4)]
     layer = SimpleNamespace(sliding=True, boundary=False, out=packed(outer, inner, 4, seed=9),
                             convs=convs, rel_basis=None)
     state = SimpleNamespace(window_view=lambda visit: (None, None, 0, 0), tail=lambda visit, slot: tail)
@@ -78,13 +78,14 @@ def test_a_replayed_step_counts_the_visits_that_take_the_packs_own_product():
     def layer(q=dense, out=dense, down3=dense):
         controllers = [SimpleNamespace(down=dense) for _ in range(3)] + [SimpleNamespace(down=down3)]
         return SimpleNamespace(q=q, k=dense, v=dense, r=dense, sink=dense, gate=dense, out=out, experts=None,
-                               convs=[SimpleNamespace(dynamic=None) for _ in range(4)], controllers=controllers)
+                               convs=[SimpleNamespace(dynamic=None, size=4) for _ in range(4)], controllers=controllers,
+                               qkv_norm=[dense])
 
     model = SimpleNamespace(
         layers=[layer(q=packed(64, 256, 4)),  # 4-bit/64 over 256 columns: stage A reads it in place
                 layer(out=packed(64, 128, 6)), layer(q=packed(64, 128, 4), down3=packed(64, 128, 8))],
         visit_order=[0, 1, 2, 1, 2], start=1, end=3,  # layers 1-2 loop twice; messages on the second pass
-        embed_tokens=SimpleNamespace(weight=dense), unembed=dense)
+        embed_tokens=SimpleNamespace(weight=dense, gain=dense[0], eps=1e-6), unembed=dense)
     assert fast_step.stage_fallbacks(model, "a,bc,d", 4) == {
         "fallback.a.packed_4bit_q": 2, "fallback.bc_output.packed_6bit": 2, "fallback.d.packed_8bit": 1}
     assert fast_step.stage_fallbacks(model, "bc,e", 4) == {"fallback.bc_output.packed_6bit": 2,
@@ -94,10 +95,16 @@ def test_a_replayed_step_counts_the_visits_that_take_the_packs_own_product():
     model.unembed = packed(64, 256, 6)  # a stored form the launch does not take: one row at a time
     assert fast_step.stage_fallbacks(model, "bc", 4)["fallback.head.packed_rows"] == 1
     assert "fallback.head.packed_rows" not in fast_step.stage_fallbacks(model, "bc", 1)
-    # A 4-bit output projection runs as the row-stable launch beside the fused output: unfused.
+    # A 4-bit output projection in whole blocks takes the one-launch stored-code stage C (product,
+    # convolution and residual): no visit leaves the fused route, at one row or a panel.
     model.unembed = dense
     model.layers[1] = layer(out=packed(64, 256, 4))
-    assert fast_step.stage_fallbacks(model, "bc", 4) == {"unfused.bc_output.packed_4bit": 2}
+    assert fast_step.stage_fallbacks(model, "bc", 4) == {}
+    assert fast_step.stage_fallbacks(model, "bc", 1) == {}
+    # One the launch does not take (a partial last block) runs the row-stable product beside the
+    # convolution and the add: unfused, counted per visit.
+    model.layers[1] = layer(out=packed(64, 128, 4))
+    assert fast_step.stage_fallbacks(model, "bc", 4) == {"fallback.bc_output.packed_4bit": 2}
 
 
 def test_a_packed_product_is_batched_only_where_its_rows_prove_equal_to_one_row():
@@ -131,10 +138,11 @@ def test_wide_copy_rounds_need_every_stage_a_and_mlp_read_on_the_lane_kernels():
     def layer(v=dense):
         controllers = [SimpleNamespace(down=dense) for _ in range(4)]
         return SimpleNamespace(q=dense, k=dense, v=v, r=dense, sink=dense, gate=dense, out=dense, experts=None,
-                               convs=[SimpleNamespace(dynamic=None) for _ in range(4)], controllers=controllers)
+                               convs=[SimpleNamespace(dynamic=None) for _ in range(4)], controllers=controllers,
+                               qkv_norm=[dense])
 
     native = SimpleNamespace(layers=[layer(), layer()], visit_order=[0, 1, 1], start=1, end=2,
-                             embed_tokens=SimpleNamespace(weight=dense), unembed=dense)
+                             embed_tokens=SimpleNamespace(weight=dense, gain=dense[0], eps=1e-6), unembed=dense)
     assert fast_step.wide_rows_exact(native, "a,bc,d,e")
     assert not fast_step.wide_rows_exact(native, "bc,e")  # reference stage A reads wide panels batched
     six_bit = SimpleNamespace(**{**vars(native), "layers": [layer(), layer(v=packed(64, 256, 6))]})

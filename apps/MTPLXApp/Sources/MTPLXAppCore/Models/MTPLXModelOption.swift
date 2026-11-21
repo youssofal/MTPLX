@@ -1076,7 +1076,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
             recommendedFor: [.modernApple]
         ),
         // FP16 siblings for M1 and M2 Macs (no native bfloat16): the same packs with every BF16
-        // tensor cast to FP16. Recommended on the legacy tier only behind inklingLegacyOffer (off).
+        // tensor cast to FP16. Recommended on the legacy tier (inklingLegacyOffer, on).
         MTPLXModelOption(
             id: "inkling2-mini-bare-speed-fp16",
             displayName: "Inkling 2 Mini Bare Speed FP16",
@@ -1290,9 +1290,10 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
     /// model_catalog.INKLING_TIGHT_MAC_OFFER.
     public static let inklingTightMacOffer = false
     /// The Inkling 2 Mini FP16 siblings on M1 and M2 Macs (32 GiB and up), where the modern tier
-    /// gives the trio. Their FP16 numbers are checked on an M5; no M1 or M2 Mac has loaded them yet.
-    /// Off until one has; true is the whole switch. Mirrors model_catalog.INKLING_LEGACY_OFFER.
-    public static let inklingLegacyOffer = false
+    /// gives the trio. On by the founder's order of 21 November; their FP16 numbers are checked on
+    /// an M5 and the M1-M4 rehearsal switch, not yet on an M1 or M2 itself. True is the whole
+    /// switch. Mirrors model_catalog.INKLING_LEGACY_OFFER.
+    public static let inklingLegacyOffer = true
 
     public static func recommendedCatalogIDs(
         for hardware: DetectedHardware?,

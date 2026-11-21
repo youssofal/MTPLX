@@ -42,6 +42,53 @@ def round_up(value, step):
     return -(-value // step) * step
 
 
+def _one_launch_tails(tails, rows):
+    """Whether a visit's four tails can be written by ``commit_launches.visit_tails`` (one launch
+    on the GPU, the stock writes' bytes): four tails of one keep length and dtype and their panel
+    rows, on a Metal device. ``MTPLX_INKLING_COMMIT_LAUNCHES=0`` keeps the stock writes."""
+    import os
+
+    if os.environ.get("MTPLX_INKLING_COMMIT_LAUNCHES", "1").strip().lower() in ("0", "off", "false", "no"):
+        return False
+    if len(tails) != 4 or len(rows) != 4 or any(t is None for t in tails):
+        return False
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return False
+    keep, dtype = tails[0].shape[1], tails[0].dtype
+    return all(t.ndim == 3 and t.shape[0] == 1 and t.shape[1] == keep and t.dtype == dtype
+               and r.ndim == 3 and r.shape[0] == 1 and r.shape[2] == t.shape[2]
+               for t, r in zip(tails, rows))
+
+
+def _row_writer(sample):
+    """The native engine's in-place row writer (``write_history_rows``: rows at an offset of a
+    ``(1, heads, rows, dim)`` 16-bit bank, one launch whatever the rows' strides), or None: no
+    engine module, a CPU run, another dtype, or ``MTPLX_INKLING_ROW_WRITER=0`` (the library's slice
+    updates then serve)."""
+    import os
+
+    if os.environ.get("MTPLX_INKLING_ROW_WRITER", "1").strip().lower() in ("0", "off", "false", "no"):
+        return None
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return None
+    if sample.dtype not in (mx.bfloat16, mx.float16) or sample.ndim != 4 or sample.shape[-1] % 4:
+        return None
+    try:
+        from mtplx.engine import runtime as engine_runtime
+
+        if not engine_runtime.available():
+            return None
+        return getattr(engine_runtime.native_module(), "write_history_rows", None)
+    except Exception:  # noqa: BLE001 - no engine module: the slice updates serve
+        return None
+
+
+def visit_tails(tails, rows, kept):
+    from .commit_launches import visit_tails as one_launch
+
+    return one_launch(tails, rows, kept)
+
+
 @dataclass
 class VisitDelta:
     """The panel's own rows of one visit, committed (first ``kept``) after the accept."""
@@ -170,26 +217,57 @@ class DecodeState:
         if kept == 0:
             return
         end = self.length + kept
+        write = _row_writer(deltas[0].keys) if deltas else None
+        offsets: dict = {}  # host offset -> its int32 array, made once a commit (every window visit shares one)
         for visit, delta in enumerate(deltas):
             kv, conv = self.cache[2 * visit], self.cache[2 * visit + 1]
             keys, values = delta.keys[:, :, :kept], delta.values[:, :, :kept]
+            if write is not None and (kv.keys.dtype != keys.dtype or kv.keys.ndim != 4):
+                write = None
             if self.local[visit]:
                 # At most two contiguous runs of ring slots: static slice updates, in place
                 # while the ring is exclusively owned, no index arrays built on the GPU.
                 first = kv._idx % self.window
                 head = min(kept, self.window - first)
-                kv.keys[:, :, first : first + head, :] = keys[:, :, :head]
-                kv.values[:, :, first : first + head, :] = values[:, :, :head]
-                if head < kept:
-                    kv.keys[:, :, : kept - head, :] = keys[:, :, head:]
-                    kv.values[:, :, : kept - head, :] = values[:, :, head:]
+                if write is not None:
+                    # Lane F1: each run in one launch of the native row writer (the same 16-bit
+                    # payloads, in place while owned), not two library copies.
+                    at = offsets.get(first)
+                    if at is None:
+                        at = offsets[first] = mx.array(first, mx.int32)
+                    kv.keys, kv.values = write(kv.keys, keys[:, :, :head], at), write(kv.values, values[:, :, :head], at)
+                    if head < kept:
+                        zero = offsets.get(0)
+                        if zero is None:
+                            zero = offsets[0] = mx.array(0, mx.int32)
+                        kv.keys = write(kv.keys, keys[:, :, head:], zero)
+                        kv.values = write(kv.values, values[:, :, head:], zero)
+                else:
+                    kv.keys[:, :, first : first + head, :] = keys[:, :, :head]
+                    kv.values[:, :, first : first + head, :] = values[:, :, :head]
+                    if head < kept:
+                        kv.keys[:, :, : kept - head, :] = keys[:, :, head:]
+                        kv.values[:, :, : kept - head, :] = values[:, :, head:]
                 kv._idx = (kv._idx + kept - 1) % self.window + 1
             else:
                 if end > kv.keys.shape[2]:
                     self._grow(kv, end)
-                kv.keys[:, :, self.length : end, :] = keys
-                kv.values[:, :, self.length : end, :] = values
+                if write is not None:
+                    at = offsets.get(("bank", self.length))
+                    if at is None:
+                        at = offsets[("bank", self.length)] = mx.array(self.length, mx.int32)
+                    kv.keys, kv.values = write(kv.keys, keys, at), write(kv.values, values, at)
+                else:
+                    kv.keys[:, :, self.length : end, :] = keys
+                    kv.values[:, :, self.length : end, :] = values
             kv.offset = end
+            tails = [conv[slot] for slot in range(len(delta.taps))]
+            if _one_launch_tails(tails, delta.taps):
+                # The visit's four new tails in one launch, the same bytes as the four slice copies
+                # or concatenations below (lane L7's ``commit_launches.visit_tails``).
+                for slot, tail in enumerate(visit_tails(tails, list(delta.taps), kept)):
+                    conv[slot] = tail
+                continue
             for slot, rows in enumerate(delta.taps):
                 tail = conv[slot]
                 if kept >= self.keep:

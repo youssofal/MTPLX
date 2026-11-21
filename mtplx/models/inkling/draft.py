@@ -9,6 +9,20 @@ from .model import linear
 from .precision import AffineWeight
 
 
+def _one_launch_mix(features):
+    """Whether ``Drafter.mix`` can take its four-tap float32 sum in one launch (lane L7's
+    ``fast.commit_launches.mix``, the stock products' and adds' bytes): four taps of one shape
+    on a Metal device. ``MTPLX_INKLING_COMMIT_LAUNCHES=0`` keeps the stock operations."""
+    import os
+
+    if os.environ.get("MTPLX_INKLING_COMMIT_LAUNCHES", "1").strip().lower() in ("0", "off", "false", "no"):
+        return False
+    if len(features) != 4 or mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return False
+    shape = features[0].shape
+    return all(h.shape == shape for h in features)
+
+
 def _context_heads(x, weight, name):
     """The context heads a prompt chunk's features feed (the drafter's KV of the prompt): on the width-independent
     prompt read (``fast/prompt_route.py``'s ``invariant`` part) our launch, whose sums do not depend on the rows
@@ -67,7 +81,15 @@ class DraftBlock(nn.Module):
             entry.offset += skip
             features = features[:, -self.window :]
         keys = self.normalize(self.heads(features, "k_ctx"), "self_attn.k_norm_ctx")
-        entry.update_and_fetch(self.rotate(keys, pos), self.heads(features, "v_ctx"))
+        keys, values = self.rotate(keys, pos), self.heads(features, "v_ctx")
+        if self.window and features.shape[1] > 1:
+            # Lane F1: several rows straight into the ring the next round rebuilds (the same
+            # arrays and counters, no host wait there); the generic path where it declines.
+            from .fast.draft_ring import observe_rows
+
+            if observe_rows(entry, keys, values):
+                return
+        entry.update_and_fetch(keys, values)
 
     def attend(self, x, entry):
         key, value = entry.state
@@ -154,6 +176,16 @@ class Drafter(nn.Module):
         ] + [ArraysCache(1)]
 
     def mix(self, features, row, weight):
+        if _one_launch_mix(features):
+            # The whole mix in one launch where it applies (lane F1's ``mix_norm``: the sum, the
+            # norm, the gain and the cast); else the four-tap float32 sum in one launch, the same
+            # bytes as the products and adds below (lane L7's ``mix``), then the same RMS norm.
+            from .fast.commit_launches import mix as one_launch_mix, mix_norm
+
+            whole = mix_norm(features, self.blend, row, weight, self.cfg["rms_norm_eps"])
+            if whole is not None:
+                return whole
+            return one_launch_mix(features, self.blend[row], weight, self.cfg["rms_norm_eps"])
         dtype = features[0].dtype
         mixed = sum(
             h.astype(mx.float32) * self.blend[row, i].astype(mx.float32)

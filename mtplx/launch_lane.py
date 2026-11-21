@@ -44,9 +44,11 @@ CLIENTS: tuple[str, ...] = (
     "other",
     "benchmark",
 )
-# Families whose sampler contract is their own (the official thinking-mode
-# sampler 1.0 / 0.95 / 20): a client table never overrides it.
-SAMPLER_OWNING_FAMILIES = frozenset({"qwen3_8", "qwen4_exp"})
+# Families whose sampler contract is their own (Qwen 3.8 and Flash-Next: the
+# official thinking-mode sampler 1.0 / 0.95 / 20; Inkling 2 Mini: its
+# generation_config's temperature 1.0 over the whole distribution): a client
+# table never overrides it.
+SAMPLER_OWNING_FAMILIES = frozenset({"qwen3_8", "qwen4_exp", "inkling2"})
 SEATS_GIB: tuple[int, ...] = (16, 24, 36, 48, 64, 96, 128)
 
 # --- the constants two owners used to disagree on ---------------------------

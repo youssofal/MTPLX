@@ -183,6 +183,58 @@ def _patch_stamp(path: Path, *, parent: Path, public_model_id: str | None) -> No
     path.write_text(json.dumps(stamp, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+_INKLING = "thinkingmachines/Inkling-2-Mini"
+_FP16_AUDIT_RULE = "every vision and drafter tensor equals the upstream tensor cast BF16 to FP16 (byte for byte where not BF16)"
+
+
+def _write_sums(root: Path) -> None:
+    """``SHA256SUMS``: every file of the pack but itself, sorted by path, "<sha256>  <path>" a line."""
+    import hashlib
+
+    lines = []
+    for item in sorted((p for p in root.rglob("*") if p.is_file() and p.name != "SHA256SUMS"),
+                       key=lambda p: p.relative_to(root).as_posix()):
+        digest = hashlib.sha256()
+        with item.open("rb") as stream:
+            for block in iter(lambda: stream.read(1 << 24), b""):
+                digest.update(block)
+        lines.append(f"{digest.hexdigest()}  {item.relative_to(root).as_posix()}\n")
+    (root / "SHA256SUMS").write_text("".join(lines))
+
+
+def _tower(root: Path) -> dict[str, str]:
+    """Vision tensor name -> dtype, from the real header of every target shard (not the index)."""
+    tower: dict[str, str] = {}
+    for shard in sorted(root.glob("*.safetensors")):
+        if shard.name == "mtp.safetensors":
+            continue
+        _, header = read_header(shard)
+        tower.update({name: entry["dtype"] for name, entry in header.items() if name.startswith("model.visual.")})
+    return tower
+
+
+def _inkling_parent_problem(parent: Path) -> str | None:
+    """Law 1 for an Inkling parent: its own audit passed against the pinned upstream, its vision_config is the
+    publisher's, and its headers carry the whole tower the audit names, in BF16. None when it holds."""
+    from .forge_inkling import VISION_CONFIG
+
+    audit_path = parent / "vision-audit.json"
+    if not audit_path.is_file():
+        return f"{parent} has no vision-audit.json: its vision tower was never checked against the upstream checkpoint"
+    audit = json.loads(audit_path.read_text())
+    if audit.get("variant") == "fp16":
+        return f"{parent} is already an FP16 pack"
+    if not audit.get("pass"):
+        return f"{parent}'s vision audit did not pass"
+    if json.loads((parent / "config.json").read_text()).get("vision_config") != VISION_CONFIG:
+        return f"{parent}'s vision_config is not the publisher's, so the tower cannot be built"
+    tower, want = _tower(parent), (audit.get("pack") or {}).get("vision_tensors")
+    if not want or len(tower) != want or any(dtype != "BF16" for dtype in tower.values()):
+        return (f"{parent}'s headers carry {len(tower)} vision tensors {sorted(set(tower.values()))}; "
+                f"its audit names {want} in BF16")
+    return None
+
+
 def derive(
     parent: Path | str,
     destination: Path | str,
@@ -201,6 +253,13 @@ def derive(
         raise Fp16SiblingError(f"{parent} is not a pack (no config.json)")
     if destination.exists():
         raise Fp16SiblingError(f"{destination} exists")
+    stamp_path = parent / "mtplx-pack.json"
+    inkling = stamp_path.is_file() and json.loads(stamp_path.read_text()).get("source") == _INKLING
+    if inkling:
+        # Law 1: an Inkling sibling is derived only from a parent whose whole tower was checked against upstream.
+        problem = _inkling_parent_problem(parent)
+        if problem:
+            raise Fp16SiblingError(problem)
     partial = destination.with_name(destination.name + ".partial")
     if partial.exists():
         shutil.rmtree(partial)
@@ -223,12 +282,19 @@ def derive(
                 _clone(item, target)
                 copied.append(str(relative))
         config_patched = _patch_config(partial / "config.json")
-        if (partial / "mtplx-pack.json").is_file():
-            from .forge_inkling import stamp_fp16_variant
+        if inkling:
+            from .forge_inkling import REVISION, stamp_fp16_variant
 
-            metadata = json.loads((partial / "mtplx-pack.json").read_text())
-            if metadata.get("source") == "thinkingmachines/Inkling-2-Mini":
-                stamp_fp16_variant(partial, metadata)
+            tower = _tower(partial)
+            if len(tower) != len(_tower(parent)) or any(dtype != "F16" for dtype in tower.values()):
+                raise Fp16SiblingError(f"the sibling's headers carry {len(tower)} vision tensors "
+                                       f"{sorted(set(tower.values()))}: Law 1 needs the whole tower, in F16")
+            # Every BF16 vision and drafter value was cast as the policy says, from a parent equal to upstream.
+            draft = sum(name != "__metadata__" for name in read_header(partial / "mtp.safetensors")[1])
+            (partial / "vision-audit.json").write_text(json.dumps(
+                {"pass": True, "variant": "fp16", "vision_tensors": len(tower), "draft_tensors": draft,
+                 "rule": _FP16_AUDIT_RULE, "upstream_revision": REVISION}, indent=2) + "\n")
+            stamp_fp16_variant(partial, json.loads((partial / "mtplx-pack.json").read_text()))
         if (partial / "mtplx_runtime.json").is_file():
             _patch_stamp(partial / "mtplx_runtime.json", parent=parent, public_model_id=public_model_id)
         manifest = {
@@ -249,6 +315,9 @@ def derive(
             },
         }
         (partial / MANIFEST).write_text(json.dumps(manifest, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+        if (parent / "SHA256SUMS").is_file():
+            # The parent's list names the parent's files: the sibling's own list, every file but itself, last.
+            _write_sums(partial)
         os.replace(partial, destination)
     except BaseException:
         shutil.rmtree(partial, ignore_errors=True)

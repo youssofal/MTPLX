@@ -539,6 +539,14 @@ _COMMON_PREFIX_PROBE_TOKENS = 64
 # probe window past it, for templates whose generation-prompt tail the
 # rendered history repeats) is that conversation's own signature at any length.
 _TURN_PROMPT_LENS_MAX = 256
+# Below the floor a match that ends on a turn's prompt is not a signature yet:
+# two conversations that open with the same system prompt and user message
+# share exactly that. A match that runs this far into the tokens the session
+# generated is one: the model's own answer, resent by the client. Hermes sends
+# no session id and re-serializes its tool calls, so its tool-result turn left
+# the generated stream 63 tokens into the answer at 4,087 shared tokens; it
+# became a new session, and the turn re-read the model's 345-token answer.
+_GENERATED_TURN_MATCH_MIN_TOKENS = 16
 
 
 def _common_prefix_reuse_threshold(prompt_len: int) -> int:
@@ -2050,6 +2058,16 @@ class EngineSession:
                 return prompt_len
         return None
 
+    def generated_tokens_matched(self, common_prefix: int) -> int:
+        """How many tokens a turn of this session generated ``common_prefix``
+        runs into: 0 unless it ends inside one turn's generated tokens."""
+        common_prefix = int(common_prefix)
+        for prompt_len in reversed(self.turn_prompt_lens):
+            generated_end = self.turn_generated_ends.get(prompt_len, 0)
+            if prompt_len <= common_prefix < generated_end:
+                return common_prefix - prompt_len
+        return 0
+
     def nearest_boundary_at_or_before(self, token_len: int) -> BoundarySnapshot | None:
         candidates = [boundary for boundary in self.boundaries if boundary.token_len <= token_len]
         if not candidates:
@@ -2130,6 +2148,7 @@ class EngineSessionManager:
         cold_tier: Any | None = None,
         model_weights_bytes: int | None = None,
         memory_plan: Any | None = None,
+        checkpoint_budget_bytes: int | None = None,
     ) -> None:
         if idle_ttl_s is None:
             idle_ttl_s = session_bank_idle_ttl_s()
@@ -2157,6 +2176,9 @@ class EngineSessionManager:
                 ),
                 idle_ttl_s=idle_ttl_s,
                 cold_tier=cold_tier,
+                # A family whose checkpoints are large sets its own budget for one entry's
+                # set (Inkling 2 Mini on a tight Mac); None keeps the shared default.
+                checkpoint_budget_bytes=checkpoint_budget_bytes,
             )
             if (
                 auto_active
@@ -2391,6 +2413,8 @@ class EngineSessionManager:
                             "fraction"
                             if int(matched) >= _common_prefix_reuse_threshold(len(prompt_ids))
                             else "turn_boundary"
+                            if int(matched) >= _COMMON_PREFIX_REUSE_MIN_TOKENS
+                            else "inside_generated_turn"
                         ),
                         "turn_boundary": best.turn_boundary_at(matched),
                     }
@@ -2685,9 +2709,13 @@ class EngineSessionManager:
                 best_common = common
                 best = session
             if (
-                common >= _COMMON_PREFIX_REUSE_MIN_TOKENS
-                and common > boundary_common
+                common > boundary_common
                 and session.turn_boundary_at(common) is not None
+                and (
+                    common >= _COMMON_PREFIX_REUSE_MIN_TOKENS
+                    or session.generated_tokens_matched(common)
+                    >= _GENERATED_TURN_MATCH_MIN_TOKENS
+                )
             ):
                 boundary_common = common
                 boundary_best = session

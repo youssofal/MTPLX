@@ -559,6 +559,7 @@ def plan_memory(
     tight_machine_measured: bool = False,
     mtp_history_bytes_per_token: int = 0,
     runtime_transients_bytes: int | None = None,
+    tight_runtime_transients_bytes: int | None = None,
 ) -> MemoryPlan:
     """Solve the machine's memory geometry.
 
@@ -584,6 +585,9 @@ def plan_memory(
     ``runtime_transients_bytes`` is the runtime reserve a family measured for
     itself (Inkling 2 Mini: its prefill working set at its own chunk width);
     every other family keeps the flat ``RUNTIME_TRANSIENTS_BYTES``.
+    ``tight_runtime_transients_bytes`` is that reserve under the tight rule,
+    for a family that keeps less on a tight machine (Inkling 2 Mini: two
+    restore checkpoints instead of eight); None keeps one reserve for both.
     """
     runtime_transients = (
         RUNTIME_TRANSIENTS_BYTES
@@ -677,7 +681,12 @@ def plan_memory(
         # tokens on 16 GiB while the 8.08 GiB Qwen3.5-9B planned 20,480).
         # Stopping at the ceiling keeps the window monotonic in pack size,
         # and a pack whose floor-funded window reaches it keeps its floor.
-        tight_transients = runtime_transients + TIGHT_MACHINE_MARGIN_BYTES
+        tight_reserve = (
+            runtime_transients
+            if tight_runtime_transients_bytes is None
+            else max(0, int(tight_runtime_transients_bytes))
+        )
+        tight_transients = tight_reserve + TIGHT_MACHINE_MARGIN_BYTES
         tight_per_token = kv_per_token + aux_pt + transient_pt + kv_copy_pt
         tight_budget = usable - weights - fixed_cache - tight_transients
         tight_ceiling = _align_down(

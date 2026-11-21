@@ -180,6 +180,11 @@ def test_recommended_ids_mirror_app_ram_tiers():
         "qwen38-27b-optimized-quality",
     ]
     trio38_fp16 = [f"{model_id}-fp16" for model_id in trio38]
+    inkling_fp16 = [
+        "inkling2-mini-bare-speed-fp16",
+        "inkling2-mini-optimized-speed-fp16",
+        "inkling2-mini-optimized-quality-fp16",
+    ]
     assert recommended_catalog_ids(memory_gib=36, chip_tier=MODERN_TIER) == [
         trio38[0],
         "inkling2-mini-bare-speed",
@@ -228,9 +233,14 @@ def test_recommended_ids_mirror_app_ram_tiers():
         "qwen36-35b-a3b-optimized-balance-fp16",
         "gemma4-optimized-speed",
         "qwen35-9b-optimized-speed-fp16",
+        # The Inkling 2 Mini FP16 siblings keep the family's slot near the end (INKLING_LEGACY_OFFER).
+        *inkling_fp16,
     ]
+    # From 32 to 47 GiB they ride directly after the tier's first pick, as the modern trio does.
     assert recommended_catalog_ids(memory_gib=36, chip_tier=LEGACY_TIER) == [
-        *trio38_fp16,
+        trio38_fp16[0],
+        *inkling_fp16,
+        *trio38_fp16[1:],
         "qwen35-9b-optimized-speed-fp16",
         "optimized-speed-fp16",
         "gemma4-optimized-speed",
@@ -282,7 +292,11 @@ def test_recommended_models_filter_by_peak_memory():
     legacy_default = default_catalog_model(memory_gib=32, chip_tier=LEGACY_TIER)
     assert legacy_default is not None and legacy_default.id == "qwen38-27b-optimized-speed-fp16"
     legacy_32 = [model.id for model in recommended_models(memory_gib=32, chip_tier=LEGACY_TIER)]
-    assert legacy_32[:2] == ["qwen38-27b-optimized-speed-fp16", "qwen38-27b-bare-speed-fp16"]
+    assert legacy_32[:3] == [
+        "qwen38-27b-optimized-speed-fp16",
+        "inkling2-mini-bare-speed-fp16",
+        "inkling2-mini-optimized-speed-fp16",
+    ]
     assert "qwen38-27b-optimized-quality-fp16" not in legacy_32
     assert "qwen38-27b-optimized-quality-fp16" in [
         model.id for model in recommended_models(memory_gib=48, chip_tier=LEGACY_TIER)

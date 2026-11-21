@@ -47,6 +47,7 @@ THREADS = 256
 PER_THREAD = 8
 CHUNK = THREADS * PER_THREAD  # vocabulary entries per threadgroup
 MAX_ROWS = 8  # anchor + 7 proposals: the trained DSpark block
+WIDE_ROWS = 32  # a prompt-copy panel: the anchor and up to 31 copied tokens (fast/state.MAX_PANEL)
 
 PURPOSE_DRAFT = 1
 PURPOSE_ACCEPT = 2
@@ -211,7 +212,7 @@ _RACE = r"""
     uint K = sizes[2];               // rows that carry a proposal
     int mode = modes[row];
     uint2 key = uint2(seed[0], seed[1]);
-    uint position = positions[row];
+    uint position = CONSECUTIVE ? positions[0] + uint(OFFSET) + row : positions[row];
     threadgroup float2 scratch[THREADS / 32];
     float2 t = l4_row_lse(tstats, row, C, tid, lane, sg, scratch);
     float2 d = float2(0.0f, 0.0f);
@@ -357,7 +358,7 @@ _DECIDE = r"""
                     } else if (diff >= 0.0f) {
                         accept[sg] = 1;
                     } else {
-                        uint4 r = l4_philox(uint4(0u, positions[sg], 2u, 0u), key);
+                        uint4 r = l4_philox(uint4(0u, positions[0] + sg, 2u, 0u), key);
                         accept[sg] = (l4_exponential(r.x, r.y) > -diff) ? 1 : 0;   // u < p/q
                     }
                 }
@@ -386,6 +387,28 @@ _DECIDE = r"""
 """
 
 
+def _rewrite_once(text, pairs):
+    for old, new in pairs:
+        if text.count(old) != 1:
+            raise AssertionError(f"expected one {old!r} in the kernel text")
+        text = text.replace(old, new)
+    return text
+
+
+# The decision for 9 to 32 rows (prompt-copy panels): the same per-row arithmetic and the same
+# walk, the 8 simdgroups each taking every eighth row and the per-row slots sized for 32. The
+# 2- to 8-row kernel's text and programs stay as they are.
+_DECIDE_WIDE = _rewrite_once(_DECIDE, [
+    ("uint sg = simdgroup_index_in_threadgroup;", "uint first = simdgroup_index_in_threadgroup;"),
+    ("threadgroup int win_r[8];", "threadgroup int win_r[32];"),
+    ("threadgroup int win_p[8];", "threadgroup int win_p[32];"),
+    ("threadgroup int accept[8];", "threadgroup int accept[32];"),
+    ("threadgroup float aprob[8];", "threadgroup float aprob[32];"),
+    ("threadgroup int bad[8];", "threadgroup int bad[32];"),
+    ("    if (sg < W) {\n", "    for (uint sg = first; sg < W; sg += L4_THREADS / 32) {\n"),
+])
+
+
 # Winner of each row's p race (one simdgroup per row).
 _FINISH = r"""
     uint row = threadgroup_position_in_grid.x;
@@ -393,6 +416,20 @@ _FINISH = r"""
     uint C = sizes[1];
     int4 w = l4_row_winner(race, row, C, lane);
     if (lane == 0) winners[row] = w.y;
+"""
+
+# The same winner with the row's status beside it (a draw's one read): drawn[row] the token,
+# drawn[W + row] STATUS_OK, or STATUS_NON_FINITE when the row's max or log-sum is not finite.
+_FINISH_CHECKED = r"""
+    uint row = threadgroup_position_in_grid.x;
+    uint lane = thread_index_in_simdgroup;
+    uint C = sizes[1];
+    uint W = sizes[2];
+    int4 w = l4_row_winner(race, row, C, lane);
+    if (lane == 0) {
+        drawn[row] = w.y;
+        drawn[W + row] = (metal::isfinite(lse[row * 4 + 0]) && metal::isfinite(lse[row * 4 + 1])) ? 0 : 1;
+    }
 """
 
 
@@ -453,16 +490,34 @@ def _kernel(name):
             source=_FINISH,
             header=_HEADER + _ROW_WINNER,
         )
-    if name == "decide":
+    if name == "finish_checked":
         return mx.fast.metal_kernel(
-            name="mtplx_inkling_l4_decide",
+            name="mtplx_inkling_l4_finish_checked",
+            input_names=["race", "lse", "sizes"],
+            output_names=["drawn"],
+            source=_FINISH_CHECKED,
+            header=_HEADER + _ROW_WINNER,
+        )
+    if name in ("decide", "decide_wide"):
+        return mx.fast.metal_kernel(
+            name="mtplx_inkling_l4_" + name,
             input_names=["race", "lse", "tlaw", "dlaw", "proposals", "modes", "positions",
                          "seed", "sizes", "offered"],
             output_names=["packet"],
-            source=_DECIDE,
+            source=_DECIDE if name == "decide" else _DECIDE_WIDE,
             header=_HEADER + _ROW_WINNER,
         )
     raise KeyError(name)
+
+
+def wide_decision_enabled():
+    """Whether prompt-copy panels of 9 to 32 rows are decided on the GPU (``decide`` with the
+    point-mass law the 2- to 8-row copy rounds already use) instead of by the host's seed-match
+    draw. Class B against the host route (each is exact; per-seed tokens differ), so it is off
+    until the lead decides: ``MTPLX_INKLING_WIDE_DECISION=1``."""
+    import os
+
+    return (os.environ.get("MTPLX_INKLING_WIDE_DECISION") or "").strip().lower() in {"1", "on", "true", "yes"}
 
 
 def law_params(rows, temperature=1.0, cap=0.0):
@@ -520,8 +575,10 @@ class DraftLaw:
 
 
 def race(tlaw, tstats, *, modes, positions, seed, purpose, greedy=False, dlaw=None,
-         dstats=None, proposals=None):
-    """Race partials and per-row (max, lse) for a panel of law rows (pure, lazy)."""
+         dstats=None, proposals=None, consecutive=False, offset=0):
+    """Race partials and per-row (max, lse) for a panel of law rows (pure, lazy).
+    ``consecutive``: ``positions`` is one base position and row r draws at base + ``offset`` + r
+    (computed in the kernel: no position array is built on the GPU)."""
     rows, vocab = tlaw.shape
     chunks = _chunks(vocab)
     k = 0 if proposals is None else int(proposals.shape[0])
@@ -534,7 +591,7 @@ def race(tlaw, tstats, *, modes, positions, seed, purpose, greedy=False, dlaw=No
         inputs=[tlaw, tstats, dlaw, dstats, proposals.astype(mx.int32), modes, positions, seed,
                 sizes],
         template=[("THREADS", THREADS), ("PER_THREAD", PER_THREAD), ("GREEDY", bool(greedy)),
-                  ("PURPOSE", int(purpose))],
+                  ("PURPOSE", int(purpose)), ("CONSECUTIVE", bool(consecutive)), ("OFFSET", int(offset))],
         grid=(chunks * THREADS, rows, 1),
         threadgroup=(THREADS, 1, 1),
         output_shapes=[(rows, chunks, 4), (rows, 4)],
@@ -565,8 +622,8 @@ def decide(target_logits, proposals, *, position, seed, temperature=1.0, draft=N
         raise ValueError("decide takes (rows, vocabulary) target logits")
     rows, vocab = target_logits.shape
     k = int(proposals.shape[0]) if proposals is not None else 0
-    if rows != k + 1 or not 1 <= rows <= MAX_ROWS:
-        raise ValueError(f"a panel of {rows} rows needs {rows - 1} proposals (at most {MAX_ROWS})")
+    if rows != k + 1 or not 1 <= rows <= WIDE_ROWS:
+        raise ValueError(f"a panel of {rows} rows needs {rows - 1} proposals (at most {WIDE_ROWS - 1})")
     greedy = (not temperature or temperature <= 0) if greedy is None else greedy
     tlaw, tstats = law_rows(target_logits, temperature=None if greedy else temperature,
                             params=None if greedy else params)
@@ -575,21 +632,21 @@ def decide(target_logits, proposals, *, position, seed, temperature=1.0, draft=N
     mode = MODE_TARGET if match else (MODE_POINT if point else MODE_RESIDUAL)
     modes = _const([mode] * k + [MODE_TARGET], mx.int32)
     base = position if isinstance(position, mx.array) else mx.array(int(position), mx.uint32)
-    positions = base.astype(mx.uint32).reshape(()) + mx.arange(rows, dtype=mx.uint32)
+    positions = base.astype(mx.uint32).reshape(1)   # row r decides position base + r (in the kernels)
     seed_words = seed if isinstance(seed, mx.array) else _seed_words(seed)
     props = proposals if proposals is not None else _const([], mx.int32)
     dlaw = None if point else draft.rows
     dstats = None if point else draft.stats
     race_parts, lse = race(tlaw, tstats, modes=modes, positions=positions, seed=seed_words,
                            purpose=PURPOSE_TARGET, greedy=greedy, dlaw=dlaw, dstats=dstats,
-                           proposals=props if k else None)
+                           proposals=props if k else None, consecutive=True)
     sizes = _const([vocab, _chunks(vocab), k, rows], mx.uint32)
     if offered is None:
         offered = _const([k], mx.uint32)
     elif not isinstance(offered, mx.array):
         offered = _const([int(offered)], mx.uint32)
     offered = offered.astype(mx.uint32).reshape(1)
-    (packet,) = _kernel("decide")(
+    (packet,) = _kernel("decide" if rows <= MAX_ROWS else "decide_wide")(
         inputs=[race_parts, lse, tlaw, dlaw if dlaw is not None else _const([0.0], mx.float32),
                 props.astype(mx.int32) if k else _const([0], mx.int32), modes, positions,
                 seed_words, sizes, offered],
@@ -647,15 +704,18 @@ def winners(race_parts):
     return out
 
 
-def sample_rows(law, stats, *, positions, seed, purpose, greedy=False):
+def sample_rows(law, stats, *, positions, seed, purpose, greedy=False, offset=None):
     """One independent draw per law row (row r at ``positions[r]``): (R,) int32 and the
     per-row (max, log-sum) the draw used, (R, 4) float32 with columns [max, log-sum, 0, 0];
-    the log-probability of token j is ``(law[j] - max) - logsum``."""
+    the log-probability of token j is ``(law[j] - max) - logsum``. With ``offset`` (an int),
+    ``positions`` is one base position and row r draws at base + ``offset`` + r, the sum made in
+    the kernel (the same uint32 sum as ``base + offset`` built on the GPU, no launch for it)."""
     rows = law.shape[0]
     modes = _const([0] * rows, mx.int32)
     seed_words = seed if isinstance(seed, mx.array) else _seed_words(seed)
     race_parts, lse = race(law, stats, modes=modes, positions=positions.astype(mx.uint32),
-                           seed=seed_words, purpose=purpose, greedy=greedy)
+                           seed=seed_words, purpose=purpose, greedy=greedy,
+                           consecutive=offset is not None, offset=int(offset or 0))
     return winners(race_parts), lse
 
 
@@ -680,12 +740,19 @@ def draw_checked(target_logits, *, position, seed, temperature=1.0):
     greedy = not temperature or temperature <= 0
     tlaw, tstats = law_rows(target_logits, temperature=None if greedy else temperature)
     base = position if isinstance(position, mx.array) else mx.array(int(position), mx.uint32)
-    positions = base.astype(mx.uint32).reshape(()) + mx.arange(rows, dtype=mx.uint32)
-    tokens, stats = sample_rows(tlaw, tstats, positions=positions, seed=seed,
-                                purpose=PURPOSE_TARGET, greedy=greedy)
-    good = mx.isfinite(stats[:, 0]) & mx.isfinite(stats[:, 1])
-    status = mx.where(good, STATUS_OK, STATUS_NON_FINITE).astype(mx.int32)
-    return mx.stack([tokens.astype(mx.int32), status])
+    seed_words = seed if isinstance(seed, mx.array) else _seed_words(seed)
+    race_parts, lse = race(tlaw, tstats, modes=_const([MODE_TARGET] * rows, mx.int32),
+                           positions=base.astype(mx.uint32).reshape(1), seed=seed_words,
+                           purpose=PURPOSE_TARGET, greedy=greedy, consecutive=True)
+    (drawn,) = _kernel("finish_checked")(
+        inputs=[race_parts, lse, _const([0, _chunks(vocab), rows], mx.uint32)],
+        template=[("THREADS", THREADS)],
+        grid=(32 * rows, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(2 * rows,)],
+        output_dtypes=[mx.int32],
+    )
+    return drawn.reshape(2, rows)
 
 
 def read_draw(drawn, rows=None, settle=None):
@@ -706,9 +773,15 @@ def read_draw(drawn, rows=None, settle=None):
     return [int(t) for t in values[0]]
 
 
-def warm(vocab=4096):
+def warm(vocab=4096, wide=False):
     """Build every kernel variant the round uses on a small vocabulary, so the first request
-    after a model load does not pay the Metal compiles (call once at load; about a second)."""
+    after a model load does not pay the Metal compiles (call once at load; about a second).
+    ``wide`` also builds the 9- to 32-row decision copy panels take (``wide_decision_enabled``)."""
+    if wide:
+        panel = mx.zeros((WIDE_ROWS, vocab), mx.float32)
+        copied = mx.arange(1, WIDE_ROWS, dtype=mx.int32)
+        mx.eval([decide(panel, copied, position=0, seed=_seed_words(1)),
+                 decide(panel, copied, position=0, seed=_seed_words(1), temperature=0)])
     rows = mx.zeros((4, vocab), mx.float32)
     draft_rows = mx.zeros((3, vocab), mx.bfloat16)
     seed = _seed_words(1)

@@ -394,7 +394,7 @@ INPUTS = """
             const float xi = xr[i];
             const float wi = float(norm_w[i]);
             const float y = wi * static_cast<float>(xi * inv);
-            const float v = float(static_cast<bfloat16_t>(y));
+            const float v = float(static_cast<T>(y));     // the stream's 16-bit type, as RC6 casts
             normed[i] = v;
             const float a = abs(v);
             nan_seen = nan_seen || isnan(a);
@@ -443,6 +443,148 @@ INPUTS = """
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+"""
+
+# The inputs launch for a panel, the router read once: threadgroup j owns router rows 4j .. 4j+3 for
+# every row of the panel (INPUTS gives each row its own 32 threadgroups, so a W-row panel read the
+# 1.2 MB router W times, and its threadgroups held a whole normed row each). A thread keeps its
+# router values in registers and computes, per panel row, the twelve normed values its router
+# columns need (the same statement as INPUTS: the weight times the input times the inverse root
+# mean square, rounded to the stream's type); the sums of squares, the router sums and the
+# rounding of each value are INPUTS's, in the same order, on the same lanes. The row peak is the
+# maximum of |normed| over all 2,304 values, taken here over the threads' router columns (the same
+# set: max is exact), with INPUTS's NaN rule.
+INPUTS_ROWS = """
+    const uint j = threadgroup_position_in_grid.x;
+    const uint t = thread_position_in_threadgroup.x;
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    constexpr uint RG = W < 4 ? W : 4;             // rows whose router sums a thread runs side by side
+    threadgroup float sums[W * 32];
+    threadgroup float inv_mean[W];
+    threadgroup float red[W * 32];
+    threadgroup float tpeak[W * 8];
+    const float eps = consts[0];
+    const int col = int(32 * sg + lane) * 4;
+    const bool in_last = 2048 + col + 4 <= 2304;
+    float wt[3][4][4];
+    for (int e = 0; e < 4; ++e) {
+        const device float* wrow = router + (4 * j + e) * 2304;
+        for (int c = 0; c < 4; ++c) {
+            wt[0][e][c] = wrow[col + c];
+            wt[1][e][c] = wrow[1024 + col + c];
+            wt[2][e][c] = in_last ? wrow[2048 + col + c] : 0.0f;
+        }
+    }
+    for (uint i = t; i < uint(W) * 32u; i += 256u) sums[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Each row's 18 sums of 32 slices of four values (INPUTS's order), spread over the simdgroups.
+    for (uint job = sg; job < uint(W) * 18u; job += 8u) {
+        const uint r = job / 18u, part = job % 18u;
+        const device float* four = source + r * 2304 + 4 * (32 * part + lane);
+        float sq = 0;
+        for (int i = 0; i < 4; i++) {
+            const float v = four[i];
+            sq += v * v;
+        }
+        sq = simd_sum(sq);
+        if (lane == 0) sums[r * 32 + part] = sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint r = sg; r < uint(W); r += 8u) {
+        const float row_sq = simd_sum(sums[r * 32 + lane]);
+        if (lane == 0) inv_mean[r] = metal::precise::rsqrt(row_sq / 2304.0f + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Router sums, RG rows side by side (independent chains; each row's sums in INPUTS's order).
+    for (uint r0 = 0; r0 < uint(W); r0 += RG) {
+        float xs[RG][3][4];
+        float local[RG];
+        bool nan_seen[RG];
+        for (uint g = 0; g < RG; ++g) {
+            local[g] = 0;
+            nan_seen[g] = false;
+            const uint r = min(r0 + g, uint(W) - 1);
+            const float inv = inv_mean[r];
+            const device float* xr = source + r * 2304;
+            for (int span = 0; span < 3; ++span) {
+                for (int c = 0; c < 4; ++c) {
+                    float v = 0.0f;
+                    if (span < 2 || in_last) {
+                        const int i = 1024 * span + col + c;
+                        const float xi = xr[i];
+                        const float wi = float(norm_w[i]);
+                        const float y = wi * static_cast<float>(xi * inv);
+                        v = float(static_cast<T>(y));
+                        const float a = abs(v);
+                        nan_seen[g] = nan_seen[g] || isnan(a);
+                        local[g] = max(local[g], a);
+                    }
+                    xs[g][span][c] = v;
+                }
+            }
+        }
+        for (uint g = 0; g < RG; ++g) {
+            const uint r = r0 + g;
+            float dot[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            for (int span = 0; span < 3; ++span)
+                for (int e = 0; e < 4; ++e)
+                    for (int c = 0; c < 4; ++c)
+                        dot[e] += wt[span][e][c] * xs[g][span][c];
+            for (int e = 0; e < 4; ++e)
+                for (ushort hop = 16; hop != 0; hop /= 2)
+                    dot[e] += simd_shuffle_down(dot[e], hop);
+            const float m = simd_max(local[g]);
+            const bool n = simd_any(nan_seen[g]);
+            if (r < uint(W) && lane == 0) {
+                for (int e = 0; e < 4; ++e) red[(r * 4 + e) * 8 + sg] = dot[e];
+                tpeak[r * 8 + sg] = n ? NAN : m;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint q = t; q < uint(W) * 4u; q += 256u) {
+        const uint r = q / 4u, e = q % 4u;
+        float total = red[(r * 4 + e) * 8];
+        for (int s = 1; s < 8; ++s) total += red[(r * 4 + e) * 8 + s];
+        logits[r * 128 + 4 * j + e] = total;
+    }
+#if FP4
+    if (j == 0)
+        for (uint r = t; r < uint(W); r += 256u) {
+            float peak = 0;
+            bool any = false;
+            for (uint s = 0; s < 8; ++s) {
+                any = any || isnan(tpeak[r * 8 + s]);
+                peak = max(peak, tpeak[r * 8 + s]);
+            }
+            outer[r] = (any ? NAN : peak) / 1536.0f;
+        }
+#endif
+    // Input rounding: this threadgroup's (row, 32-value group) jobs spread over the simdgroups.
+    for (uint job = sg; job < uint(W) * 3u; job += 8u) {
+        const uint r = job / 3u;
+        const uint g = j + 32 * (job % 3u);
+        if (g < 72) {
+#if FP4
+            float peak = 0;
+            bool any = false;
+            for (uint s = 0; s < 8; ++s) {
+                any = any || isnan(tpeak[r * 8 + s]);
+                peak = max(peak, tpeak[r * 8 + s]);
+            }
+            peak = any ? NAN : peak;
+#else
+            const float peak = 0.0f;
+#endif
+            const uint i = 32 * g + lane;
+            const float xi = source[r * 2304 + i];
+            const float wi = float(norm_w[i]);
+            const float y = wi * static_cast<float>(xi * inv_mean[r]);
+            const float v = float(static_cast<T>(y));
+            values[r * 2304 + i] = fused_quantize<bool(FP4)>(v, peak, lane);
+        }
     }
 """
 
@@ -664,6 +806,66 @@ COMBINE = """
 """
 
 
+# The combine for a panel, rows side by side: a threadgroup owns COLS columns of every row; a thread
+# makes its (row, column)'s routed value (COMBINE's ordered 8-way sum, the same statements), shares
+# it, then takes the convolution over positions r-3 .. r from its neighbours' routed values (the
+# committed tail before row 0), as COMBINE does walking the rows. COMBINE gave one thread all rows
+# of its column: 36 threadgroups whatever the width.
+COMBINE_ROWS = """
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint cl = tid % uint(COLS);
+    const uint r = tid / uint(COLS);
+    const uint c = threadgroup_position_in_grid.x * uint(COLS) + cl;
+    threadgroup float xrow[W * COLS];
+    float acc = 0;
+    for (int k = 0; k < 8; ++k) {
+        const uint p = r * 8 + k;
+        const float v = raw[p * 2304 + c];
+#if FP4
+        const float scale = mid_outer[p] * expert_outer[experts[p]];
+        const float vs = v * scale;
+        const T q = static_cast<T>(vs);
+#else
+        const T q = static_cast<T>(v);
+#endif
+        const float w = float(q) * prob[p];
+        const float u = w + 0.0f;
+        acc = u + acc;
+    }
+    const T routed = static_cast<T>(acc);
+    const float x3 = float(routed);
+    rows[r * 2304 + c] = x3;
+    xrow[r * COLS + cl] = x3;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float h[3];
+    for (int d = 0; d < 3; ++d) {
+        const int pr = int(r) - 3 + d;
+        h[d] = pr >= 0 ? xrow[uint(pr) * COLS + cl] : tail[uint(3 + pr) * tail_strides[0] + c * tail_strides[1]];
+    }
+    const float w0 = conv_w[0 * conv_w_strides[0] + c * conv_w_strides[1]];
+    const float w1 = conv_w[1 * conv_w_strides[0] + c * conv_w_strides[1]];
+    const float w2 = conv_w[2 * conv_w_strides[0] + c * conv_w_strides[1]];
+    const float w3 = conv_w[3 * conv_w_strides[0] + c * conv_w_strides[1]];
+    float cacc = 0.0f;
+#if CONV_FORM == 0
+    cacc += h[0] * w0;
+    cacc += h[1] * w1;
+    cacc += h[2] * w2;
+    cacc += x3 * w3;
+#else
+    cacc = metal::fma(h[0], w0, cacc);
+    cacc = metal::fma(h[1], w1, cacc);
+    cacc = metal::fma(h[2], w2, cacc);
+    cacc = metal::fma(x3, w3, cacc);
+#endif
+    const float total = x3 + cacc;
+    const float value = total / as_type<float>(uint(DIVISOR));
+    const T conv = static_cast<T>(value);
+    const float sum = partial[r * partial_strides[0] + c * partial_strides[1]] + float(conv);
+    out[r * 2304 + c] = static_cast<T>(sum);
+"""
+
+
 # Panels of 2 to 8 rows: each distinct expert of the panel read once. A route launch writes
 # RC6's routing and a plan (distinct experts ascending; each one's member rows and pairs in row
 # order); each product threadgroup takes one (distinct expert, tile of output rows) and computes
@@ -673,6 +875,10 @@ COMBINE = """
 # decoded straight into half bit patterns (two codes a half2), the values the byte tables hold.
 PLAN_STRIDE = 18   # per slot: expert, members, member rows[8], member pairs[8]
 PANEL_ROWS = 8     # widest panel the plan describes (an expert has at most one member a row)
+#: The plan of a wide panel (9 to MAX_ROWS rows, a copy round's verify): the same slots with room
+#: for MAX_ROWS members, member rows at 2 and member pairs at WIDE_PAIRS_AT.
+WIDE_PAIRS_AT = 2 + MAX_ROWS
+PLAN_STRIDE_WIDE = 2 + 2 * MAX_ROWS
 
 ROUTE_PLAN = """
     const uint tid = thread_position_in_threadgroup.x;
@@ -734,6 +940,11 @@ ROUTE_PLAN = """
     }
 """
 
+# A wide panel's plan: the same launch, each slot's member pairs at WIDE_PAIRS_AT (an expert may
+# have a member in every one of up to MAX_ROWS rows). The 2-8 row plan's text stays as it is.
+ROUTE_PLAN_WIDE = ROUTE_PLAN.replace("plan[base + 10 + before] = p;", "plan[base + PAIRS_AT + before] = p;")
+assert ROUTE_PLAN_WIDE.count("PAIRS_AT") == 1
+
 PANEL = """
     const uint tile = threadgroup_position_in_grid.x;
     const uint slot = threadgroup_position_in_grid.y;
@@ -772,13 +983,24 @@ PANEL = """
                 }
                 for (uint m = 0; m < uint(MC); ++m) {
                     if (m < mc) {
-                        const device float* xr = xin + ps[XSEL + m0 + m] * K + (32 * NV) * b + NV * lane;
                         float xv[NV];
+#if XH
+                        // NVFP4 activations stored as float16 (exact: e2m1 x e4m3, at most 6 significant
+                        // bits, between 2^-10 and 2,688): a lane's 8 values in one 16-byte load.
+                        const device half* xr = xin + ps[XSEL + m0 + m] * K + (32 * NV) * b + NV * lane;
+                        const uint4 u = *(const device uint4*)xr;
+                        const float2 h0 = float2(as_type<half2>(u.x)), h1 = float2(as_type<half2>(u.y));
+                        const float2 h2 = float2(as_type<half2>(u.z)), h3 = float2(as_type<half2>(u.w));
+                        xv[0] = h0.x; xv[1] = h0.y; xv[2] = h1.x; xv[3] = h1.y;
+                        xv[4] = h2.x; xv[5] = h2.y; xv[6] = h3.x; xv[7] = h3.y;
+#else
+                        const device float* xr = xin + ps[XSEL + m0 + m] * K + (32 * NV) * b + NV * lane;
                         const float4 a = *(const device float4*)xr;
                         xv[0] = a.x; xv[1] = a.y; xv[2] = a.z; xv[3] = a.w;
 #if NV == 8
                         const float4 c = *(const device float4*)(xr + 4);
                         xv[4] = c.x; xv[5] = c.y; xv[6] = c.z; xv[7] = c.w;
+#endif
 #endif
                         for (int q = 0; q < R; ++q) {
                             float accum = 0;
@@ -812,6 +1034,13 @@ PANEL = """
     }
 """
 
+# A wide panel (9 to MAX_ROWS rows): the same products over the wide plan, whose member pairs sit
+# at PAIRS_AT (XSEL is 2 for gate-up, member rows, and PAIRS_AT for down, member pairs). Each
+# member's arithmetic is the same statement sequence whatever the member count, so every pair's
+# raw product is MLX's gathered product bit for bit, as for 2 to 8 rows.
+PANEL_WIDE = PANEL.replace("const uint pair = ps[10 + m0 + m];", "const uint pair = ps[PAIRS_AT + m0 + m];")
+assert PANEL_WIDE.count("PAIRS_AT") == 1
+
 # Prompt chunks: the same products for pairs sorted by expert (the stock body's sort). The
 # threadgroup of expert e finds its members, a contiguous run of the sorted pairs, by binary
 # search, and writes each member's raw product at its sorted position.
@@ -836,7 +1065,7 @@ PANEL_PROMPT = (PANEL
     const uint M = hi - lo;""")
                 .replace("ps[XSEL + m0 + m] * K", "sorted_rows[lo + m0 + m] * K")
                 .replace("const uint pair = ps[10 + m0 + m];", "const uint pair = lo + m0 + m;"))
-assert PANEL_PROMPT.count("sorted_rows[lo + m0 + m]") == 1 and "ps[" not in PANEL_PROMPT
+assert PANEL_PROMPT.count("sorted_rows[lo + m0 + m]") == 2 and "ps[" not in PANEL_PROMPT
 
 # Prompt chunks name about 32 pairs an expert. Here the loop runs blocks outside rows: each
 # block's inputs of a chunk of MC members sit in registers while every row of the simdgroup is
@@ -950,6 +1179,8 @@ def _kernel(stage, fp4, defines=()):
     fp4_only = lambda *names: list(names) if fp4 else []
     inputs, outputs, body, contiguous = {
         "inputs": (["source", "norm_w", "router", "consts"], ["logits", "values", *fp4_only("outer")], INPUTS, True),
+        "inputs_rows": (["source", "norm_w", "router", "consts"], ["logits", "values", *fp4_only("outer")],
+                        INPUTS_ROWS, True),
         "gate_up": (
             ["logits", "bias", "rconsts", "values", *fp4_only("row_outer"), "codes", "scales", *fp4_only("expert_outer")],
             ["h", "peaks", "experts_out", "prob_out"], GATE_UP, True,
@@ -961,6 +1192,10 @@ def _kernel(stage, fp4, defines=()):
         "combine": (
             ["raw", *fp4_only("mid_outer"), "experts", "prob", *fp4_only("expert_outer"), "conv_w", "tail", "partial"],
             ["out", "rows"], COMBINE, False,
+        ),
+        "combine_rows": (
+            ["raw", *fp4_only("mid_outer"), "experts", "prob", *fp4_only("expert_outer"), "conv_w", "tail", "partial"],
+            ["out", "rows"], COMBINE_ROWS, False,
         ),
     }[stage]
     extra = f"#define FP4 {int(fp4)}\n" + "".join(f"#define {k} {v}\n" for k, v in defines)
@@ -988,11 +1223,16 @@ def _route_consts(scale):
     return mx.array([scale, 1e-20], mx.float32)
 
 
+#: The stream types the block serves: bf16, and float16 on the FP16 packs (M1 and M2 Macs). Its kernels
+#: round to the stream's type wherever RC6 casts to it (`.astype(x.dtype)`), in no other place.
+STREAM_TYPES = (mx.bfloat16, mx.float16)
+
+
 def unserved(block, rows, dtype=mx.bfloat16):
     """Why the fast path cannot serve this visit, or None. `dtype` is the visit's stream type."""
     if os.environ.get("MTPLX_INKLING_FAST_EXPERTS", "on").lower() in {"0", "off", "stock"}:
         return "disabled"
-    if dtype != mx.bfloat16:
+    if dtype not in STREAM_TYPES:
         return "dtype"
     if not (mx.default_device() == mx.gpu and mx.metal.is_available()):
         return "cpu"
@@ -1019,7 +1259,7 @@ def _member_chunk(rows):
 DEFAULT_TILES = {"gu_tile": TILE_GATE_UP, "gu_s": 8, "gu_r": 8, "dn_tile": TILE_DOWN, "dn_s": 8, "dn_r": 8}
 
 
-def _mlx_products(block, fp4, rows, logits, values, outer):
+def _mlx_products(block, fp4, rows, logits, values, outer, dtype=mx.bfloat16):
     """RC6's route kernel, MLX's gathered quantised products and RC6's SwiGLU kernel (4 launches)."""
     pairs = rows * block.count
     bits, group = (4, 16) if fp4 else (8, 32)
@@ -1029,7 +1269,7 @@ def _mlx_products(block, fp4, rows, logits, values, outer):
                           mode=block.gate_up.mode)
     mid, *mid_outer = expert_fusion._kernel("swiglu", fp4, _caps(float(block.gate_cap), float(block.up_cap)))(
         inputs=[raw13.reshape(pairs, 2 * MIDDLE), *([outer, block.gate_up.outer] if fp4 else []), experts, row_ids],
-        template=[("T", mx.bfloat16), ("W", MIDDLE), ("E", MIDDLE // expert_fusion.THREADS)],
+        template=[("T", dtype), ("W", MIDDLE), ("E", MIDDLE // expert_fusion.THREADS)],
         grid=(pairs * expert_fusion.THREADS, 1, 1), threadgroup=(expert_fusion.THREADS, 1, 1),
         output_shapes=[(pairs, 1, MIDDLE), *([(pairs,)] if fp4 else [])],
         output_dtypes=[mx.float32] * (2 if fp4 else 1),
@@ -1052,16 +1292,21 @@ PANEL_LAYOUT = {
 
 
 @lru_cache(maxsize=None)
-def _panel_kernel(product, fp4, fold):
+def _panel_kernel(product, fp4, fold, wide=False, xh=False):
     g = PANEL_GEOMETRY[(product, fp4)]
+    pairs_at = WIDE_PAIRS_AT if wide else 10
     defines = {"FP4": int(fp4), "NV": g["NV"], "WPL": g["WPL"], "NBLK": g["NBLK"],
                "HALF_LAST": int(product == "dn" and fp4), "CW": g["CW"], "SW": g["SW"], "SPL": g["SPL"],
-               "K": g["K"], "POW": g["POW"], "XSEL": 2 if product == "gu" else 10, "PLAN_STRIDE": PLAN_STRIDE,
-               "FOLD": int(fold), "SFOLD": (g["POW"] if fold else "1.0f")}
+               "K": g["K"], "POW": g["POW"], "XSEL": 2 if product == "gu" else pairs_at,
+               "PLAN_STRIDE": PLAN_STRIDE_WIDE if wide else PLAN_STRIDE,
+               "FOLD": int(fold), "SFOLD": (g["POW"] if fold else "1.0f"), "XH": int(bool(xh and fp4))}
+    if wide:
+        defines["PAIRS_AT"] = pairs_at
     extra = "".join(f"#define {k} {v}\n" for k, v in defines.items())
-    name = f"mtplx_inkling_panel_{product}_{'nvfp4' if fp4 else 'mxfp8'}_f{int(fold)}"
+    name = (f"mtplx_inkling_panel_{product}_{'nvfp4' if fp4 else 'mxfp8'}_f{int(fold)}" + ("_wide" if wide else "")
+            + ("_xh" if xh and fp4 else ""))
     return mx.fast.metal_kernel(name=name, input_names=["plan", "xin", "codes", "scales"], output_names=["raw"],
-                                source=PANEL, header=_header(extra), ensure_row_contiguous=True)
+                                source=PANEL_WIDE if wide else PANEL, header=_header(extra), ensure_row_contiguous=True)
 
 
 @lru_cache(maxsize=None)
@@ -1103,7 +1348,13 @@ def prompt_gate_up(block, values, sorted_experts, sorted_rows, layout=None):
 
 
 @lru_cache(maxsize=None)
-def _route_plan_kernel():
+def _route_plan_kernel(wide=False):
+    if wide:
+        return mx.fast.metal_kernel(
+            name="mtplx_inkling_panel_route_plan_wide", input_names=["logits", "bias", "rconsts"],
+            output_names=["experts", "prob", "plan"], source=ROUTE_PLAN_WIDE,
+            header=_header(f"#define PLAN_STRIDE {PLAN_STRIDE_WIDE}\n#define PAIRS_AT {WIDE_PAIRS_AT}\n"),
+            ensure_row_contiguous=True)
     return mx.fast.metal_kernel(name="mtplx_inkling_panel_route_plan", input_names=["logits", "bias", "rconsts"],
                                 output_names=["experts", "prob", "plan"], source=ROUTE_PLAN,
                                 header=_header(f"#define PLAN_STRIDE {PLAN_STRIDE}\n"), ensure_row_contiguous=True)
@@ -1112,7 +1363,7 @@ def _route_plan_kernel():
 def _panel_raw(product, fp4, plan, xin, codes, scales, rows, layout=None):
     lay = layout or PANEL_LAYOUT[(product, fp4)]
     tgr = lay["S"] * lay["RPS"]
-    return _panel_kernel(product, fp4, lay.get("FOLD", 1))(
+    return _panel_kernel(product, fp4, lay.get("FOLD", 1), rows > PANEL_ROWS, xin.dtype == mx.float16)(
         inputs=[plan, xin, codes, scales],
         template=[("S", lay["S"]), ("RPS", lay["RPS"]), ("R", lay["R"]), ("MC", lay["MC"])],
         grid=((HIDDEN // tgr) * 32 * lay["S"], min(TOP_K * rows, EXPERTS), 1), threadgroup=(32 * lay["S"], 1, 1),
@@ -1125,24 +1376,26 @@ def _pair_rows(rows):
     return mx.repeat(mx.arange(rows, dtype=mx.uint32), TOP_K)
 
 
-def _panel_products(block, fp4, rows, logits, values, outer, layouts=None):
+def _panel_products(block, fp4, rows, logits, values, outer, layouts=None, dtype=mx.bfloat16):
     """Route + plan, gate-up products, RC6's SwiGLU and down-input rounding, down products
     (4 launches), each distinct expert of the panel read once."""
     pairs = rows * block.count
-    experts, prob, plan = _route_plan_kernel()(
+    wide = rows > PANEL_ROWS
+    experts, prob, plan = _route_plan_kernel(wide)(
         inputs=[logits, block.bias, _route_consts(float(block.scale))],
         template=[("W", rows)], grid=(256, 1, 1), threadgroup=(256, 1, 1),
-        output_shapes=[(pairs,), (pairs,), (1 + EXPERTS * PLAN_STRIDE,)],
+        output_shapes=[(pairs,), (pairs,), (1 + EXPERTS * (PLAN_STRIDE_WIDE if wide else PLAN_STRIDE),)],
         output_dtypes=[mx.uint32, mx.float32, mx.uint32],
     )
     lay = layouts or {}
     raw13 = _panel_raw("gu", fp4, plan, values, block.gate_up.codes, block.gate_up.scales, rows, lay.get("gu"))
     mid, *mid_outer = expert_fusion._kernel("swiglu", fp4, _caps(float(block.gate_cap), float(block.up_cap)))(
         inputs=[raw13, *([outer, block.gate_up.outer] if fp4 else []), experts, _pair_rows(rows)],
-        template=[("T", mx.bfloat16), ("W", MIDDLE), ("E", MIDDLE // expert_fusion.THREADS)],
+        template=[("T", dtype), ("W", MIDDLE), ("E", MIDDLE // expert_fusion.THREADS)],
         grid=(pairs * expert_fusion.THREADS, 1, 1), threadgroup=(expert_fusion.THREADS, 1, 1),
         output_shapes=[(pairs, 1, MIDDLE), *([(pairs,)] if fp4 else [])],
-        output_dtypes=[mx.float32] * (2 if fp4 else 1),
+        # NVFP4 down inputs in float16 when the panel products read them so (exact, see PANEL's XH).
+        output_dtypes=[mx.float16 if fp4 and HALF_ACTIVATIONS else mx.float32] + ([mx.float32] if fp4 else []),
     )
     raw2 = _panel_raw("dn", fp4, plan, mid.reshape(pairs, MIDDLE), block.down.codes, block.down.scales, rows,
                       lay.get("dn"))
@@ -1150,31 +1403,53 @@ def _panel_products(block, fp4, rows, logits, values, outer, layouts=None):
 
 
 #: Which expert products serve a panel (all exact, class A):
-#:   "auto" (default): one row takes the block's own products (4 launches); 2 to 8 rows the panel
+#:   "auto" (default): one row takes the block's own products (4 launches); 2 to 32 rows the panel
 #:   products, each distinct expert read once with every member computed from the same decoded
-#:   weights (6 launches); 9 to 32 rows MLX's gathered product with fused glue (6 launches).
-#:   "mlx", "own" or "panel" pin one ("panel" for 1 to 8 rows; wider panels take "mlx").
+#:   weights (6 launches; 9 to 32 rows, a copy round's verify, over the wide plan). Before the wide
+#:   plan, 9 to 32 rows took MLX's gathered product, which reads an expert once per (row, expert)
+#:   pair: a 25-row copy panel read about twice the expert bytes of its distinct experts.
+#:   "mlx", "own" or "panel" pin one ("mlx" is the rollback for every width).
 PRODUCTS = os.environ.get("MTPLX_INKLING_FAST_EXPERT_PRODUCTS", "auto").lower()
+
+#: The inputs and combine launches: "rows" (default) reads the router once for all rows of a panel and
+#: spreads the combine over rows (INPUTS_ROWS, COMBINE_ROWS); "row" is the earlier form (one set of router
+#: threadgroups a row; one combine thread walking every row of its column) and the rollback. Both are
+#: RC6's bits. Measured (engine GPU time, M5 Max, d1/receipts/ebench-e-11.json): the rows combine is level
+#: at one row and faster from two (4 rows 4.9 -> 2.4 us a visit, 25 rows 28.2 -> 8.0); the rows inputs are
+#: faster at one row and from four (6.8 -> 5.9, 11.1 -> 9.8, 8 rows 26.0 -> 15.5) but level or slower at
+#: two and three (7.0 -> 6.9, 7.6 -> 8.6), so those two widths keep the per-row inputs (inputs_rows_at).
+GLUE = os.environ.get("MTPLX_INKLING_EXPERT_GLUE", "rows").lower()
+
+
+def inputs_rows_at(rows):
+    """Whether the rows-together inputs launch serves a panel of ``rows`` (see GLUE)."""
+    return GLUE == "rows" and (rows == 1 or rows >= 4)
+
+
+#: NVFP4 panels: expert and down inputs written and read as float16 (exact: an NVFP4-rounded activation,
+#: e2m1 times an e4m3 group scale, has at most 6 significant bits and lies in [2^-10, 2688]); the panel
+#: products then move half the activation bytes. On by default (measured faster at every width from four
+#: rows, gate-up 2-8%, down 2-8%, d1/receipts/ebench-e-10.json); "0" keeps float32 (the rollback).
+HALF_ACTIVATIONS = os.environ.get("MTPLX_INKLING_EXPERT_HALF_X", "1").lower() not in ("0", "off", "no")
 
 
 def products_for(rows):
     if PRODUCTS in ("mlx", "own"):
         return PRODUCTS
     if PRODUCTS == "panel":
-        return "panel" if rows <= PANEL_ROWS else "mlx"
-    return "own" if rows == 1 else "panel" if rows <= PANEL_ROWS else "mlx"
+        return "panel"
+    return "own" if rows == 1 else "panel"
 
 
 def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *, eps, conv_form=0, trace=None,
-                       tiles=None, stop_after=None, products=None, panel_layouts=None):
-    """Shapes: source/partial (1, W, 2304) float32, tail (1, 3, 2304) float32.
+                       tiles=None, stop_after=None, products=None, panel_layouts=None, dtype=mx.bfloat16):
+    """Shapes: source/partial (1, W, 2304) float32, tail (1, 3, 2304) float32; ``dtype`` the stream's
+    16-bit type (bf16, float16 on the FP16 packs).
 
-    Returns (out bf16 (1, W, 2304), conv_rows float32 (1, W, 2304)).
+    Returns (out (1, W, 2304) in ``dtype``, conv_rows float32 (1, W, 2304)).
     """
     products = products or products_for(source.shape[-2])
     rows = source.shape[-2]
-    if products == "panel" and rows > PANEL_ROWS:
-        products = "mlx"
     fp4 = block.gate_up.mode == "nvfp4"
     tl = DEFAULT_TILES if tiles is None else {**DEFAULT_TILES, **tiles}
     src = source.reshape(rows, HIDDEN)
@@ -1182,12 +1457,15 @@ def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *
     mc = _member_chunk(rows)
     common = (("W", rows),)
 
-    logits, values, *outer = _kernel("inputs", fp4)(
+    rows_form = inputs_rows_at(rows)
+    half_values = fp4 and HALF_ACTIVATIONS and products == "panel"
+    logits, values, *outer = _kernel("inputs_rows" if rows_form else "inputs", fp4)(
         inputs=[src, norm_weight, block.router, _consts(float(eps))],
-        template=[*common],
-        grid=(32 * 256, rows, 1), threadgroup=(256, 1, 1),
+        template=[*common, ("T", dtype)],
+        grid=(32 * 256, 1 if rows_form else rows, 1), threadgroup=(256, 1, 1),
         output_shapes=[(rows, EXPERTS), (rows, HIDDEN), *([(rows,)] if fp4 else [])],
-        output_dtypes=[mx.float32] * (3 if fp4 else 2),
+        # NVFP4 expert inputs in float16 when the panel products read them (exact, see PANEL's XH).
+        output_dtypes=[mx.float32, mx.float16 if half_values else mx.float32] + ([mx.float32] if fp4 else []),
     )
 
     if stop_after == "inputs":
@@ -1196,14 +1474,14 @@ def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *
     if products in ("mlx", "panel"):
         if products == "panel":
             raw, mid_outer_m, experts, prob = _panel_products(block, fp4, rows, logits, values,
-                                                              outer[0] if fp4 else None, panel_layouts)
+                                                              outer[0] if fp4 else None, panel_layouts, dtype)
         else:
             raw, mid_outer_m, experts, prob = _mlx_products(block, fp4, rows, logits, values,
-                                                            outer[0] if fp4 else None)
+                                                            outer[0] if fp4 else None, dtype)
         mid_outer = [mid_outer_m] if fp4 else []
         h = peaks = None
         return _combine(fp4, rows, raw, mid_outer, experts, prob, dn, conv_weight, tail, part, conv_form, source,
-                        trace, logits, values, outer, h, peaks)
+                        trace, logits, values, outer, h, peaks, dtype)
     gu = block.gate_up
     cw13, sw13 = (HIDDEN // 8, HIDDEN // 16) if fp4 else (HIDDEN // 4, HIDDEN // 32)
     s_gu, r_gu, tile_gu = tl["gu_s"], tl["gu_r"], tl["gu_tile"]
@@ -1213,11 +1491,11 @@ def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *
     h, peaks, experts, prob = _kernel("gate_up", fp4, caps)(
         inputs=[logits, block.bias, _route_consts(float(block.scale)), values,
                 *([outer[0]] if fp4 else []), gu.codes, gu.scales, *([gu.outer] if fp4 else [])],
-        template=[*common, ("T", mx.bfloat16), ("S", s_gu), ("NT", 32 * s_gu), ("TILE", tile_gu),
+        template=[*common, ("T", dtype), ("S", s_gu), ("NT", 32 * s_gu), ("TILE", tile_gu),
                   ("R", r_gu), ("MC", mc), ("CW", cw13), ("SW", sw13), ("NTILE", ntile13)],
         grid=(ntile13 * 32 * s_gu, slots, 1), threadgroup=(32 * s_gu, 1, 1),
         output_shapes=[(rows * TOP_K, MIDDLE), (rows * TOP_K, ntile13), (rows * TOP_K,), (rows * TOP_K,)],
-        output_dtypes=[mx.bfloat16, mx.float32, mx.uint32, mx.float32],
+        output_dtypes=[dtype, mx.float32, mx.uint32, mx.float32],
     )
 
     if stop_after == "gate_up":
@@ -1238,19 +1516,31 @@ def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *
     if stop_after == "down":
         return raw, experts
     return _combine(fp4, rows, raw, mid_outer, experts, prob, dn, conv_weight, tail, part, conv_form, source,
-                    trace, logits, values, outer, h, peaks)
+                    trace, logits, values, outer, h, peaks, dtype)
 
 
 def _combine(fp4, rows, raw, mid_outer, experts, prob, dn, conv_weight, tail, part, conv_form, source,
-             trace, logits, values, outer, h, peaks):
-    out, conv_rows = _kernel("combine", fp4, (("CONV_FORM", conv_form), ("DIVISOR", _divisor_bits())))(
-        inputs=[raw, *([mid_outer[0]] if fp4 else []), experts, prob, *([dn.outer] if fp4 else []),
-                conv_weight, tail.reshape(3, HIDDEN), part],
-        template=[("W", rows), ("T", mx.bfloat16)],
-        grid=(HIDDEN, 1, 1), threadgroup=(64, 1, 1),
-        output_shapes=[(rows, HIDDEN), (rows, HIDDEN)],
-        output_dtypes=[mx.bfloat16, mx.float32],
-    )
+             trace, logits, values, outer, h, peaks, dtype=mx.bfloat16):
+    defines = (("CONV_FORM", conv_form), ("DIVISOR", _divisor_bits()))
+    if GLUE == "rows":
+        cols = 64 if rows == 1 else 32
+        out, conv_rows = _kernel("combine_rows", fp4, defines)(
+            inputs=[raw, *([mid_outer[0]] if fp4 else []), experts, prob, *([dn.outer] if fp4 else []),
+                    conv_weight, tail.reshape(3, HIDDEN), part],
+            template=[("W", rows), ("T", dtype), ("COLS", cols)],
+            grid=(HIDDEN * rows, 1, 1), threadgroup=(cols * rows, 1, 1),
+            output_shapes=[(rows, HIDDEN), (rows, HIDDEN)],
+            output_dtypes=[dtype, mx.float32],
+        )
+    else:
+        out, conv_rows = _kernel("combine", fp4, defines)(
+            inputs=[raw, *([mid_outer[0]] if fp4 else []), experts, prob, *([dn.outer] if fp4 else []),
+                    conv_weight, tail.reshape(3, HIDDEN), part],
+            template=[("W", rows), ("T", dtype)],
+            grid=(HIDDEN, 1, 1), threadgroup=(64, 1, 1),
+            output_shapes=[(rows, HIDDEN), (rows, HIDDEN)],
+            output_dtypes=[dtype, mx.float32],
+        )
     if trace is not None:
         trace.update(logits=logits, values=values, outer=outer[0] if fp4 else None, h=h, peaks=peaks,
                      experts=experts, prob=prob, raw=raw, mid_outer=mid_outer[0] if fp4 else None)
@@ -1262,24 +1552,24 @@ def _zero_tail(width=HIDDEN):
     return mx.zeros((1, 3, width), mx.float32)
 
 
-def reference_visit(layer, source, partial, tail):
+def reference_visit(layer, source, partial, tail, dtype=mx.bfloat16):
     """RC6's own statements for the same edge (model.py 533-536), for fallback and proofs."""
     from mtplx.models.inkling import model as rc6
 
-    hidden = rc6.norm(source, layer.ffn_norm, layer.eps).astype(mx.bfloat16)
+    hidden = rc6.norm(source, layer.ffn_norm, layer.eps).astype(dtype)
     routed = layer.experts(hidden)
     cache = [None, None, None, tail]
     conv = layer.convs[3](routed, cache, 3, tape={} if source.shape[-2] > 1 else None)
-    return (partial + conv.astype(mx.float32)).astype(mx.bfloat16), routed.astype(mx.float32)
+    return (partial + conv.astype(mx.float32)).astype(dtype), routed.astype(mx.float32)
 
 
-def prove(layer, source, partial, tail):
+def prove(layer, source, partial, tail, dtype=mx.bfloat16):
     """(True, None) when the fast block gives RC6's bits on these operands, else (False, why).
 
     Host reads: call it outside a compiled step (at load or first use per format and width).
     """
-    want = reference_visit(layer, source, partial, tail)
-    got = expert_visit(layer, source, partial, tail)
+    want = reference_visit(layer, source, partial, tail, dtype)
+    got = expert_visit(layer, source, partial, tail, dtype)
     mx.eval(want, got)
     for name, a, b in zip(("output", "convolution rows"), got, want):
         view = {2: mx.uint16, 4: mx.uint32}[a.dtype.size]
@@ -1288,15 +1578,16 @@ def prove(layer, source, partial, tail):
     return True, None
 
 
-def expert_visit(layer, source, partial, tail):
+def expert_visit(layer, source, partial, tail, dtype=mx.bfloat16):
     """Stages D and E of one layer visit for a 1-32 row panel (SIGNATURES.md section 3).
 
     `layer` is the RC6 `model.Layer`; `source` the float32 MLP input after the depth read
     and controller, before the norm; `partial` the float32 attention-side partial sum; `tail`
     the MLP convolution's committed (1, 3, 2304) float32 tail, oldest first (zeros before
-    position 3). Returns (visit output bf16, the panel's MLP convolution input rows float32).
+    position 3); `dtype` the stream's 16-bit type. Returns (visit output in `dtype`, the panel's
+    MLP convolution input rows float32).
     """
     tail = tail if tail is not None else _zero_tail()
     _count("fast." + products_for(source.shape[-2]))
     return expert_visit_parts(layer.experts, layer.ffn_norm, layer.convs[3].weight, source, partial, tail,
-                              eps=layer.eps)
+                              eps=layer.eps, dtype=dtype)

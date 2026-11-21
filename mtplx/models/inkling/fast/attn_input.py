@@ -98,6 +98,15 @@ _GATE_ROWS = 32
 _ROW_CHUNK = 8
 #: Stage each threadgroup's input in threadgroup memory (whole panel when it fits, else in chunks).
 _STAGE = True
+#: One dynamic-tap row per simdgroup on global visits (``TSPREAD``) instead of all four on simdgroup 0
+#: after its blocks (it was the key and value units' long pole). Engine GPU time a visit, Bare Speed,
+#: M5 Max (d1/receipts/ebench-a-2.json, -4.json): global first 62.1 -> 38.6 us at 1 row, 84.7 -> 51.9
+#: at 4, 238 -> 152 at 8; global loop 58.8 -> 37.2, 81.9 -> 53.3, 242 -> 153. Window visits have no taps.
+_SPREAD = True
+
+
+#: The stream types stage A serves: bf16, and float16 on the FP16 packs (M1 and M2 Macs).
+STREAM_TYPES = (mx.bfloat16, mx.float16)
 
 
 def f32_bits(value: float) -> int:
@@ -106,10 +115,11 @@ def f32_bits(value: float) -> int:
 
 
 class Matrix(NamedTuple):
-    """One projection as the launch reads it: bf16 rows, or affine codes with scales and biases."""
+    """One projection as the launch reads it: 16-bit rows of the stream's type, or affine codes with
+    scales and biases of that type."""
 
-    data: mx.array      # (rows, cols) bf16, or (rows, cols * bits / 32) uint32 codes
-    scales: object      # (rows, cols / group) bf16, or None
+    data: mx.array      # (rows, cols) 16-bit, or (rows, cols * bits / 32) uint32 codes
+    scales: object      # (rows, cols / group) 16-bit, or None
     biases: object
     bits: int           # 16, 8 or 4
     group: int
@@ -118,7 +128,7 @@ class Matrix(NamedTuple):
 
 
 def matrix(weight):
-    """``weight``: a bf16 ``mx.array`` or an affine weight (``precision.AffineWeight``: codes,
+    """``weight``: a 16-bit ``mx.array`` or an affine weight (``precision.AffineWeight``: codes,
     scales, biases, bits, group_size)."""
     if hasattr(weight, "codes") and hasattr(weight, "group_size"):
         bits, group = int(weight.bits), int(weight.group_size)
@@ -132,7 +142,7 @@ _joined_sb: dict = {}
 
 
 def joined_scales(layer, matrices):
-    """Every affine matrix's scales then biases (q, r, gate, k, v order) in one bf16 buffer, built
+    """Every affine matrix's scales then biases (q, r, gate, k, v order) in one 16-bit buffer, built
     once per layer and kept (1.2 MB a layer at 4 bits, group 64): Metal's 31-buffer limit leaves
     the launch one slot for them. Returns (buffer or None, element offset of each matrix's scales)."""
     key = id(layer)
@@ -161,8 +171,8 @@ def affine_route(m):
         return f"bits_{m.bits}"
     if m.group not in (32, 64, 128) or m.cols % m.group or m.cols % 256:
         return f"group_{m.group}_cols_{m.cols}"
-    if m.scales is None or m.biases is None or m.scales.dtype != mx.bfloat16 or m.biases.dtype != mx.bfloat16:
-        return "scales_not_bf16"
+    if m.scales is None or m.biases is None or m.scales.dtype not in STREAM_TYPES or m.biases.dtype != m.scales.dtype:
+        return "scales_not_16bit"
     if m.bits == 4 and m.cols % 512 == 0 and m.rows % 8 == 0:
         return "qmv_fast_4bit"          # MLX would take 16 values a lane: another kernel
     if m.bits == 8 and (m.rows % 8 or m.cols % 256):
@@ -171,19 +181,29 @@ def affine_route(m):
 
 
 _HEADER = AFFINE_LANE + """
-// Four consecutive bf16 as float from one 8-byte load (float(bf16) is the bf16 bits << 16).
-#define LOAD_BF16X4(ptr, out)                                                           \\
-    {                                                                                   \\
-        const uint2 b_ = *reinterpret_cast<const device uint2*>(ptr);                   \\
-        out[0] = as_type<float>(b_.x << 16);                                            \\
-        out[1] = as_type<float>(b_.x & 0xffff0000u);                                    \\
-        out[2] = as_type<float>(b_.y << 16);                                            \\
-        out[3] = as_type<float>(b_.y & 0xffff0000u);                                    \\
-    }
+// Four consecutive values of the stream's 16-bit type as float from one 8-byte load: bf16 by its
+// bits (float(bf16) is the bf16 bits << 16), float16 through a half4 (exact either way).
+inline void load_x4(const device bfloat16_t* ptr, thread float* out) {
+    const uint2 b_ = *reinterpret_cast<const device uint2*>(ptr);
+    out[0] = as_type<float>(b_.x << 16);
+    out[1] = as_type<float>(b_.x & 0xffff0000u);
+    out[2] = as_type<float>(b_.y << 16);
+    out[3] = as_type<float>(b_.y & 0xffff0000u);
+}
 
-// Panel row r, columns col..col+3 of this threadgroup's input source, as float.
-// NORMED: the bf16 normed input. RAW: the norm applied here, as MLX's rms_single_row writes it
-// (gv holds the four gains of these columns).
+inline void load_x4(const device half* ptr, thread float* out) {
+    const half4 h_ = *reinterpret_cast<const device half4*>(ptr);
+    out[0] = static_cast<float>(h_.x);
+    out[1] = static_cast<float>(h_.y);
+    out[2] = static_cast<float>(h_.z);
+    out[3] = static_cast<float>(h_.w);
+}
+#define LOAD_X4(ptr, out) load_x4((ptr), (out))
+
+// Panel row r, columns col..col+3 of this threadgroup's input source, as float. T16 is the stream's
+// 16-bit type (bf16, or float16 on the FP16 packs).
+// NORMED: the normed input in T16. RAW: the norm applied here, as MLX's rms_single_row writes it
+// (gv holds the four gains of these columns), rounded to T16 as RC6 casts it.
 #define FETCH4(r, col, xv, gv)                                                          \\
     if (STAGE) {                                                                        \\
         for (uint t_ = 0; t_ < 4; ++t_) xv[t_] = static_cast<float>(stage_in[(r) * D + (col) + t_]); \\
@@ -193,21 +213,21 @@ _HEADER = AFFINE_LANE + """
         const float4 h_ = *reinterpret_cast<const device float4*>(hraw + base_);        \\
         for (uint t_ = 0; t_ < 4; ++t_) {                                               \\
             const float y_ = gv[t_] * (h_[t_] * inv_);                                  \\
-            xv[t_] = static_cast<float>(static_cast<bfloat16_t>(y_));                   \\
+            xv[t_] = static_cast<float>(static_cast<T16>(y_));                          \\
         }                                                                               \\
     } else {                                                                            \\
-        LOAD_BF16X4(normed + (size_t(r) * NS + src) * D + (col), xv);                   \\
+        LOAD_X4(normed + (size_t(r) * NS + src) * D + (col), xv);                       \\
     }
 
-// Four consecutive columns of panel row r of this threadgroup's source, staged as bf16 at dst.
+// Four consecutive columns of panel row r of this threadgroup's source, staged in T16 at dst.
 #define STAGE4(r, c, dst)                                                               \\
     if (RAW) {                                                                          \\
-        const device bfloat16_t* gs_ = (src == 0 ? g0 : (src == 1 ? g1 : g2)) + (c);    \\
+        const device T16* gs_ = (src == 0 ? g0 : (src == 1 ? g1 : g2)) + (c);           \\
         const float4 h4_ = *reinterpret_cast<const device float4*>(                     \\
             hraw + (size_t(r) * NS + src) * D + (c));                                   \\
         const float iv_ = inv_rows[r];                                                  \\
         for (uint j_ = 0; j_ < 4; ++j_)                                                 \\
-            (dst)[j_] = static_cast<bfloat16_t>(static_cast<float>(gs_[j_]) * (h4_[j_] * iv_)); \\
+            (dst)[j_] = static_cast<T16>(static_cast<float>(gs_[j_]) * (h4_[j_] * iv_)); \\
     } else {                                                                            \\
         *reinterpret_cast<threadgroup uint2*>(dst) =                                    \\
             *reinterpret_cast<const device uint2*>(normed + (size_t(r) * NS + src) * D + (c)); \\
@@ -215,35 +235,40 @@ _HEADER = AFFINE_LANE + """
 
 #define GAINS4(col, gv)                                                                 \\
     if (RAW && !STAGE) {                                                                \\
-        const device bfloat16_t* gp_ = (src == 0 ? g0 : (src == 1 ? g1 : g2)) + (col);  \\
+        const device T16* gp_ = (src == 0 ? g0 : (src == 1 ? g1 : g2)) + (col);         \\
         for (uint t_ = 0; t_ < 4; ++t_) gv[t_] = static_cast<float>(gp_[t_]);          \\
     }
 
 // An affine-coded matrix (MLX layout: uint32 codes, the first in the lowest bits; one bf16 scale
 // and bias per group) through affine_lane, the reference one-row product's lane arithmetic
 // (affine_lane.py). At K = 2,304 MLX 0.32.2's one-row kernel gives a lane 8 inputs per 256-column
-// block at 4 bits and at 8 bits. xv: the lane's 8 inputs, bf16 values held as float; bits: 4 or 8.
-// The inputs are scaled and totalled once per panel row, block and lane and shared by every output
-// row; the codes are unpacked once per output row and block and shared by every panel row.
-inline void lane_bf16(const float xv[8], thread bfloat16_t* v) {
-    for (uint t = 0; t < 8; ++t) v[t] = static_cast<bfloat16_t>(xv[t]);
+// block at 4 bits and at 8 bits. xv: the lane's 8 inputs, values of the stream's 16-bit type H held
+// as float; bits: 4 or 8. The inputs are scaled and totalled once per panel row, block and lane and
+// shared by every output row; the codes are unpacked once per output row and block and shared by
+// every panel row.
+template <typename H>
+inline void lane_round(const float xv[8], thread H* v) {
+    for (uint t = 0; t < 8; ++t) v[t] = static_cast<H>(xv[t]);
 }
 
+template <typename H>
 inline float lane_take(const float xv[8], thread float* xt, uint bits) {
-    bfloat16_t v[8];
-    lane_bf16(xv, v);
+    H v[8];
+    lane_round(xv, v);
     return bits == 4 ? affine_lane::take<8, 4>(v, xt) : affine_lane::take<8, 8>(v, xt);
 }
 
+template <typename H>
 inline float lane_total(const float xv[8], uint bits) {
-    bfloat16_t v[8];
-    lane_bf16(xv, v);
+    H v[8];
+    lane_round(xv, v);
     return bits == 4 ? affine_lane::total<8, 4>(v) : affine_lane::total<8, 8>(v);
 }
 
+template <typename H>
 inline void lane_scaled(const float xv[8], thread float* xt, uint bits) {
-    bfloat16_t v[8];
-    lane_bf16(xv, v);
+    H v[8];
+    lane_round(xv, v);
     if (bits == 4) {
         affine_lane::scaled<8, 4>(v, xt);
     } else {
@@ -267,8 +292,8 @@ inline float lane_term(const thread float* xt, const thread float* wf, float sca
 """
 
 _PROJECT = """
-    // One input slot holds the bf16 normed sources (NORMED) or the float32 raw ones (RAW).
-    const device bfloat16_t* normed = reinterpret_cast<const device bfloat16_t*>(xin);
+    // One input slot holds the normed sources in T16 (NORMED) or the float32 raw ones (RAW).
+    const device T16* normed = reinterpret_cast<const device T16*>(xin);
     const device float* hraw = reinterpret_cast<const device float*>(xin);
     const uint tg = threadgroup_position_in_grid.x;
     const uint sg = simdgroup_index_in_threadgroup;
@@ -282,11 +307,11 @@ _PROJECT = """
 
     threadgroup float outs[OUTS];
     threadgroup float inv_rows[W];
-    // Staged inputs, declared as uint2 so their 8-byte stores are aligned; read as bf16.
+    // Staged inputs, declared as uint2 so their 8-byte stores are aligned; read as T16.
     threadgroup uint2 stage_u2[STAGE ? W * D / 4 : 1];
     threadgroup uint2 chunk_u2[STAGE2 ? RCH * KC / 4 : 1];
-    threadgroup bfloat16_t* stage_in = reinterpret_cast<threadgroup bfloat16_t*>(stage_u2);
-    threadgroup bfloat16_t* chunk_in = reinterpret_cast<threadgroup bfloat16_t*>(chunk_u2);
+    threadgroup T16* stage_in = reinterpret_cast<threadgroup T16*>(stage_u2);
+    threadgroup T16* chunk_in = reinterpret_cast<threadgroup T16*>(chunk_u2);
 
     // Units, heaviest first: query heads (with their relative head and sink row), key heads,
     // value heads, then gate slices.
@@ -344,20 +369,20 @@ _PROJECT = """
             FETCH4(rr, col, xv, gv0);
             FETCH4(rr, col + 4, xh, gv1);
             for (uint t_ = 0; t_ < 4; ++t_) xv[4 + t_] = xh[t_];
-            asum[idx] = lane_total(xv, 4);
+            asum[idx] = lane_total<T16>(xv, 4);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     // ------------------------------------------------------------------ products
-    // Each 4-row block belongs to one matrix: its bf16 rows or its affine codes (bits 4 or 8, one
+    // Each 4-row block belongs to one matrix: its 16-bit rows or its affine codes (bits 4 or 8, one
     // scale and bias per group of gsize), per the matrix's compile-time format.
     const device uchar* mat = reinterpret_cast<const device uchar*>(wq);
     uint bits = 16, gsize = 64;
     // sb: every affine matrix's scales then biases in one buffer; XSO, the element offset of X's scales.
-    const device bfloat16_t* scl = sb;
-    const device bfloat16_t* bia = sb;
-#define AS_BF16(p) reinterpret_cast<const device bfloat16_t*>(p)
+    const device T16* scl = sb;
+    const device T16* bia = sb;
+#define AS_T16(p) reinterpret_cast<const device T16*>(p)
 #define AS_CODES(p) reinterpret_cast<const device uint32_t*>(p)
 #define SB(OFF, ROWS, G) scl = sb + (OFF); bia = sb + (OFF) + (ROWS) * (D / (G));
 #define SELECT_BLOCK(blk)                                                                         \\
@@ -398,7 +423,7 @@ _PROJECT = """
                 if (active) {
                     SELECT_BLOCK(blk);
                 }
-                const device bfloat16_t* wrow = AS_BF16(mat) + size_t(m0) * D + lane * 4;
+                const device T16* wrow = AS_T16(mat) + size_t(m0) * D + lane * 4;
                 const device uint32_t* cw = AS_CODES(mat);
                 const uint wpr = D * bits / 32;
                 const uint gpr = D / gsize;
@@ -433,10 +458,10 @@ _PROJECT = """
                                     float xt[8];
                                     float tot;
                                     if (AFFSUM && bits == 4) {
-                                        lane_scaled(xv, xt, bits);
+                                        lane_scaled<T16>(xv, xt, bits);
                                         tot = asum[((rc + r) * (D / 256) + b) * 32 + lane];
                                     } else {
-                                        tot = lane_take(xv, xt, bits);
+                                        tot = lane_take<T16>(xv, xt, bits);
                                     }
                                     for (uint ro = 0; ro < 4; ++ro)
                                         acc[ro][r] += lane_term(xt, wf[ro], sc[ro], bi[ro], tot, bits);
@@ -447,7 +472,7 @@ _PROJECT = """
                         const uint i_end = (c0 + KC < D ? c0 + KC : D) / 128;
                         for (uint i = c0 / 128; i < i_end; ++i) {
                             float wt[4][4];
-                            for (uint ro = 0; ro < 4; ++ro) LOAD_BF16X4(wrow + size_t(ro) * D + i * 128, wt[ro]);
+                            for (uint ro = 0; ro < 4; ++ro) LOAD_X4(wrow + size_t(ro) * D + i * 128, wt[ro]);
                             for (uint r = 0; r < RCH; ++r) {
                                 if (rc + r < W) {
                                     float xv[4];
@@ -474,7 +499,7 @@ _PROJECT = """
                     if (lane == 0) {
                         for (uint r = 0; r < RCH && rc + r < W; ++r) {
                             for (uint ro = 0; ro < 4; ++ro) {
-                                const bfloat16_t y = static_cast<bfloat16_t>(acc[ro][r]);
+                                const T16 y = static_cast<T16>(acc[ro][r]);
                                 if (kind == 3) {
                                     gate[size_t(rc + r) * GN + m0 + ro] = y;
                                 } else {
@@ -522,10 +547,10 @@ _PROJECT = """
                             float xt[8];
                             float tot;
                             if (AFFSUM && bits == 4) {
-                                lane_scaled(xv, xt, bits);
+                                lane_scaled<T16>(xv, xt, bits);
                                 tot = asum[((rc + r) * (D / 256) + b) * 32 + lane];
                             } else {
-                                tot = lane_take(xv, xt, bits);
+                                tot = lane_take<T16>(xv, xt, bits);
                             }
                             for (uint ro = 0; ro < 4; ++ro)
                                 acc[ro][r] += lane_term(xt, wf[ro], sc[ro], bi[ro], tot, bits);
@@ -537,7 +562,7 @@ _PROJECT = """
                 if (lane == 0) {
                     for (uint r = 0; r < RCH && rc + r < W; ++r) {
                         for (uint ro = 0; ro < 4; ++ro) {
-                            const bfloat16_t y = static_cast<bfloat16_t>(acc[ro][r]);
+                            const T16 y = static_cast<T16>(acc[ro][r]);
                             if (kind == 3) {
                                 gate[size_t(rc + r) * GN + m0 + ro] = y;
                             } else {
@@ -550,7 +575,7 @@ _PROJECT = """
             }
             continue;
         }
-        const device bfloat16_t* wrow = AS_BF16(mat) + size_t(m0) * D + lane * 4;
+        const device T16* wrow = AS_T16(mat) + size_t(m0) * D + lane * 4;
         for (uint rc = 0; rc < W; rc += RCH) {
             float acc[4][RCH];
             for (uint ro = 0; ro < 4; ++ro)
@@ -558,7 +583,7 @@ _PROJECT = """
             for (uint i = 0; i < STEPS; ++i) {
                 const uint col = i * 128 + lane * 4;
                 float wt[4][4];
-                for (uint ro = 0; ro < 4; ++ro) LOAD_BF16X4(wrow + size_t(ro) * D + i * 128, wt[ro]);
+                for (uint ro = 0; ro < 4; ++ro) LOAD_X4(wrow + size_t(ro) * D + i * 128, wt[ro]);
                 float gv[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                 GAINS4(col, gv);
                 for (uint r = 0; r < RCH; ++r) {
@@ -578,7 +603,7 @@ _PROJECT = """
             if (lane == 0) {
                 for (uint r = 0; r < RCH && rc + r < W; ++r) {
                     for (uint ro = 0; ro < 4; ++ro) {
-                        const bfloat16_t y = static_cast<bfloat16_t>(acc[ro][r]);
+                        const T16 y = static_cast<T16>(acc[ro][r]);
                         if (kind == 3) {
                             gate[size_t(rc + r) * GN + m0 + ro] = y;
                         } else {
@@ -592,12 +617,15 @@ _PROJECT = """
     }
 
     // bn8 rows: the sink row of a query unit, the four dynamic taps of a key or value unit.
+    // TSPREAD: tap row t is simdgroup t's (one row each, the same loop), instead of all of them on
+    // simdgroup 0 after its blocks (that simdgroup was the key and value units' long pole).
     const bool bn8_sink = kind == 0 && sg == NSG - 1;
-    const bool bn8_taps = (kind == 1 || kind == 2) && TAPS > 0 && sg == 0;
+    const bool bn8_taps = (kind == 1 || kind == 2) && TAPS > 0 && (TSPREAD ? sg < uint(TAPS) : sg == 0);
+    const uint tap0 = TSPREAD ? sg : 0u;      // first tap row of this simdgroup
     if (bn8_sink || bn8_taps) {
-        const device bfloat16_t* bm = bn8_sink ? wsink : (kind == 1 ? wkt : wvt);
-        const uint nr = bn8_sink ? 1u : uint(TAPS);
-        const uint b0 = bn8_sink ? h : h * uint(TAPS);
+        const device T16* bm = bn8_sink ? wsink : (kind == 1 ? wkt : wvt);
+        const uint nr = bn8_sink ? 1u : (TSPREAD ? 1u : uint(TAPS));
+        const uint b0 = bn8_sink ? h : h * uint(TAPS) + tap0;
         for (uint rc = 0; rc < W; rc += RCH) {
             float total[4][RCH];
             for (uint v = 0; v < 8; ++v) {
@@ -636,9 +664,9 @@ _PROJECT = """
             if (lane == 0) {
                 for (uint r = 0; r < RCH && rc + r < W; ++r) {
                     for (uint ro = 0; ro < nr; ++ro) {
-                        const float y = static_cast<float>(static_cast<bfloat16_t>(total[ro][r]));
+                        const float y = static_cast<float>(static_cast<T16>(total[ro][r]));
                         if (bn8_sink) outs[(rc + r) * OQ + HD + RD] = y;
-                        else outs[(rc + r) * OK + HD + ro] = y;
+                        else outs[(rc + r) * OK + HD + tap0 + ro] = y;
                     }
                 }
             }
@@ -679,8 +707,8 @@ _PROJECT = """
             const float factor = (1.0f < ratio) ? 1.0f : ratio;
             for (uint j = 0; j < 4; ++j) {
                 const uint d = lane * 4 + j;
-                bfloat16_t y = static_cast<bfloat16_t>(value[j] * factor);
-                if (GLOBAL) y = static_cast<bfloat16_t>(static_cast<float>(y) * tau);
+                T16 y = static_cast<T16>(value[j] * factor);
+                if (GLOBAL) y = static_cast<T16>(static_cast<float>(y) * tau);
                 q[(size_t(r) * QH + h) * HD + d] = y;
             }
             if (lane == 0) {
@@ -697,11 +725,11 @@ _PROJECT = """
                 const float rratio = as_type<float>(uint(REL_CLIP)) / rden;
                 const float rfactor = (1.0f < rratio) ? 1.0f : rratio;
                 for (uint j = 0; j < RD; ++j) {
-                    bfloat16_t y = static_cast<bfloat16_t>(rv[j] * rfactor);
-                    if (GLOBAL) y = static_cast<bfloat16_t>(static_cast<float>(y) * tau);
+                    T16 y = static_cast<T16>(rv[j] * rfactor);
+                    if (GLOBAL) y = static_cast<T16>(static_cast<float>(y) * tau);
                     rel[(size_t(r) * QH + h) * RD + j] = y;
                 }
-                sink[size_t(r) * QH + h] = static_cast<bfloat16_t>(outs[r * OQ + HD + RD]);
+                sink[size_t(r) * QH + h] = static_cast<T16>(outs[r * OQ + HD + RD]);
             }
         } else {
             // Key or value head: 4-tap convolution with the committed tail, then the key clip or
@@ -714,7 +742,7 @@ _PROJECT = """
             const uint cw0 = CONV_CM ? 1 : KN;
             const uint cw1 = CONV_CM ? 4 : 1;
             device float* conv_in = keys ? k_conv_in : v_conv_in;
-            device bfloat16_t* rows_out = keys ? k_rows : v_rows;
+            device T16* rows_out = keys ? k_rows : v_rows;
             float y[4];
             for (uint j = 0; j < 4; ++j) {
                 const uint c = lane * 4 + j;
@@ -746,7 +774,7 @@ _PROJECT = """
                 }
                 const float total = hh[3] + acc;
                 const float value = total / as_type<float>(uint(DIVISOR));
-                y[j] = static_cast<float>(static_cast<bfloat16_t>(value));
+                y[j] = static_cast<float>(static_cast<T16>(value));
             }
             if (keys) {
                 float square[4];
@@ -758,21 +786,86 @@ _PROJECT = """
                 const float ratio = as_type<float>(uint(QK_CLIP)) / denom;
                 const float factor = (1.0f < ratio) ? 1.0f : ratio;
                 for (uint j = 0; j < 4; ++j)
-                    rows_out[(size_t(h) * W + r) * HD + lane * 4 + j] = static_cast<bfloat16_t>(y[j] * factor);
+                    rows_out[(size_t(h) * W + r) * HD + lane * 4 + j] = static_cast<T16>(y[j] * factor);
             } else if (VNORM) {
                 float acc = 0;
                 for (uint j = 0; j < 4; ++j) acc += y[j] * y[j];
                 acc = simd_sum(acc);
                 const float inverse = metal::precise::rsqrt(acc / float(HD) + as_type<float>(uint(NORM_EPS)));
                 for (uint j = 0; j < 4; ++j)
-                    rows_out[(size_t(h) * W + r) * HD + lane * 4 + j] = static_cast<bfloat16_t>(y[j] * inverse);
+                    rows_out[(size_t(h) * W + r) * HD + lane * 4 + j] = static_cast<T16>(y[j] * inverse);
             } else {
                 for (uint j = 0; j < 4; ++j)
-                    rows_out[(size_t(h) * W + r) * HD + lane * 4 + j] = static_cast<bfloat16_t>(y[j]);
+                    rows_out[(size_t(h) * W + r) * HD + lane * 4 + j] = static_cast<T16>(y[j]);
             }
         }
     }
 """
+
+
+_NORM = """
+    // One threadgroup per (panel row, source) of a raw panel: the input norm as the projection
+    // launch computes it for raw sources (the per-128 partial sums given, or found here by one
+    // simdgroup; their simdgroup sum; precise::rsqrt), then each value gain * (h * inverse) rounded
+    // to bf16, as that launch stages it.
+    const uint g = threadgroup_position_in_grid.x;
+    const uint src = g % NS;
+    const uint lane = thread_index_in_simdgroup;
+    const device float* row = h + size_t(g) * D;
+    threadgroup float inverse[1];
+    if (simdgroup_index_in_threadgroup == 0) {
+        float part = 0.0f;
+        if (PARTS_IN) {
+            part = lane < (D / 128) ? parts[size_t(g) * (D / 128) + lane] : 0.0f;
+        } else {
+            for (uint j = 0; j < D / 128; ++j) {
+                const float4 h4 = *reinterpret_cast<const device float4*>(row + j * 128 + lane * 4);
+                float acc = 0;
+                for (uint i = 0; i < 4; ++i) acc += h4[i] * h4[i];
+                acc = simd_sum(acc);
+                if (lane == j) part = acc;
+            }
+        }
+        const float total = simd_sum(part);
+        if (lane == 0) inverse[0] = metal::precise::rsqrt(total / float(D) + as_type<float>(uint(NORM_EPS)));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float iv = inverse[0];
+    const device T16* gs = src == 0 ? g0 : (src == 1 ? g1 : g2);     // T16: the stream's 16-bit type
+    for (uint c = thread_index_in_threadgroup * 4; c < D; c += THREADS * 4) {
+        const float4 h4 = *reinterpret_cast<const device float4*>(row + c);
+        for (uint j = 0; j < 4; ++j)
+            out[size_t(g) * D + c + j] = static_cast<T16>(static_cast<float>(gs[c + j]) * (h4[j] * iv));
+    }
+"""
+
+#: Norm a raw panel that cannot stage whole in a launch of its own, then read it as a normed panel
+#: (instead of norming its inputs again for every block in every simdgroup). Off until timed.
+_NORM_FIRST = False
+
+
+@lru_cache(maxsize=1)
+def _norm_kernel():
+    return mx.fast.metal_kernel(name="mtplx_inkling_fast_norm_sources", input_names=["h", "parts", "g0", "g1", "g2"],
+                                output_names=["out"], source=_NORM)
+
+
+def norm_sources(h, parts, gains, eps):
+    """The raw panel ``h`` ``(W, NS, D)`` float32 normed exactly as the projection launch norms raw
+    sources (``parts`` the per-128 partial sums ``(W, NS, D // 128)`` or ``None``; ``gains`` one
+    weight ``(D,)`` per source, in the stream's 16-bit type): ``(W, NS, D)`` in that type, one launch."""
+    rows, ns, width = h.shape
+    g = list(gains) + [gains[-1]] * (3 - len(gains))
+    stream = g[0].dtype
+    return _norm_kernel()(
+        inputs=[h, parts if parts is not None else h, *g[:3]],
+        template=[("T16", stream), ("NS", ns), ("D", width), ("PARTS_IN", parts is not None), ("THREADS", 256),
+                  ("NORM_EPS", f32_bits(eps))],
+        grid=(rows * ns * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(rows, ns, width)],
+        output_dtypes=[stream],
+    )[0]
 
 
 @lru_cache(maxsize=1)
@@ -803,14 +896,16 @@ class Projected(NamedTuple):
 
 
 def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", threads=None, gate_rows=None,
-            stage=None, rch=None, affsum=None, stage2=None):
+            stage=None, rch=None, affsum=None, stage2=None, norm_first=None, spread=None, dtype=mx.bfloat16):
     """Every projection of one visit and its epilogues, for a panel, in one launch.
 
-    ``sources``: ``(W, NS, D)`` bf16 normed inputs (``NS`` 1: q = k = v input; 3: q, k, v
+    ``dtype``: the stream's 16-bit type (bf16, or float16 on the FP16 packs): the layer's 16-bit
+    weights, scales and gains are of it, and the outputs are rounded to it as RC6 casts them.
+    ``sources``: ``(W, NS, D)`` normed inputs in ``dtype`` (``NS`` 1: q = k = v input; 3: q, k, v
     inputs), or ``None`` with ``raw = (h, parts, gains)``: ``h`` ``(W, 3, D)`` float32
     un-normed sources, ``parts`` ``(W, 3, D // 128)`` the norm's per-128 partial sums (or
-    ``None``: computed here), ``gains`` the three ``(D,)`` bf16 norm weights (the norm then runs
-    here, as MLX writes it).
+    ``None``: computed here), ``gains`` the three ``(D,)`` norm weights in ``dtype`` (the norm then
+    runs here, as MLX writes it).
     ``k_tail``/``v_tail``: ``(1, 3, KN)`` float32 committed convolution inputs or ``None``.
     ``pos``: uint32 array, committed tokens. ``form``: short_conv's proven static form.
     """
@@ -830,7 +925,7 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
     if any(hasattr(w, "codes") for w in (layer.sink, layer.convs[0].dynamic, layer.convs[1].dynamic)
            if w is not None):
         count_route("refused:affine_sink_or_taps")
-        raise RuntimeError("projection launch reads the sink and dynamic taps as bf16")
+        raise RuntimeError("projection launch reads the sink and dynamic taps as 16-bit")
     kv_width = mk.rows
     kv_heads = kv_width // head_dim
     gate_rows = mg.rows
@@ -847,14 +942,15 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
     conv_cm = layer.convs[0].dynamic is None
     k_conv = layer.convs[0].weight.T if conv_cm else layer.convs[0].weight
     v_conv = layer.convs[1].weight.T if conv_cm else layer.convs[1].weight
-    # Stand-ins for absent operands are existing arrays (never read), so no fill launches.
-    stand_f32, stand_bf16 = k_conv, layer.q_scale
+    # Stand-ins for absent operands are existing arrays (never read), so no fill launches; a 16-bit
+    # slot's stand-in is of the stream's type (the sink: always 16-bit, checked by the step).
+    stand_f32, stand_16 = k_conv, layer.sink
     parts_in = True
     if raw is None:
         rows, ns = sources.shape[0], sources.shape[1]
         xin = sources
         parts = stand_f32
-        gain_list = [stand_bf16] * 3
+        gain_list = [stand_16] * 3
     else:
         xin, parts, gain_list = raw
         rows, ns = xin.shape[0], xin.shape[1]
@@ -865,8 +961,8 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
     sb, (qso, rso, gso, kso, vso) = joined_scales(layer, (mq, mr, mg, mk, mv))
     has_tail = k_tail is not None and v_tail is not None
     stand_in = stand_f32
-    wkt = layer.convs[0].dynamic if taps else layer.q_scale
-    wvt = layer.convs[1].dynamic if taps else layer.q_scale
+    wkt = layer.convs[0].dynamic if taps else stand_16
+    wvt = layer.convs[1].dynamic if taps else stand_16
     size = layer.convs[0].size
     divisor = math.sqrt((2 * size + 1) if taps else (size + 1))
     eps = layer.eps
@@ -888,6 +984,11 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
             affsum = False
     out_bytes += asum_bytes if affsum else 0
     stage = bool(staging and rows * width * 2 + out_bytes <= 31 * 1024)
+    # NORM_FIRST: a raw panel that cannot stage whole is normed once by a launch of its own (the same
+    # values this launch would stage) and then read as a normed panel.
+    if (_NORM_FIRST if norm_first is None else bool(norm_first)) and raw is not None and not stage:
+        xin = norm_sources(xin, parts if parts_in else None, gain_list, eps)
+        parts, gain_list, parts_in, raw = stand_f32, [stand_16] * 3, True, None
     # A wider loop-pass panel stages KC columns at a time (all simdgroups in step) rather than norm
     # its input in every simdgroup; a wider first-pass panel reads its bf16 input from device memory,
     # which measured faster than chunked staging (receipts/probe-mode-1.json: 86 vs 104 us at 8 rows).
@@ -899,6 +1000,9 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
         stage2 = not any(m.bits == 4 for m in (mq, mr, mg, mk, mv))
     stage2 = bool(raw is not None and not stage and stage2)
     chunk = rch or (_ROW_CHUNK if rows > 4 else rows)
+    # TSPREAD: one dynamic-tap row per simdgroup (needs a simdgroup per tap row).
+    spread = _SPREAD if spread is None else bool(spread)
+    spread = bool(spread and taps and threads // 32 >= taps)
     # Chunks hold whole 256-column blocks when an affine matrix reads them.
     unit = 256 if affine else 128
     kc = max(unit, min(width, ((31 * 1024 - out_bytes) // (chunk * 2)) // unit * unit))
@@ -906,12 +1010,12 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
         inputs=[
             xin, parts, *gain_list,
             mq.data, mr.data, layer.sink, mg.data, mk.data, mv.data, wkt, wvt,
-            sb if sb is not None else stand_bf16,
+            sb if sb is not None else stand_16,
             layer.q_scale, layer.r_scale, k_conv, v_conv,
             k_tail if has_tail else stand_in, v_tail if has_tail else stand_in, pos,
         ],
         template=[
-            ("W", rows), ("NS", ns), ("RAW", raw is not None), ("PARTS_IN", parts_in),
+            ("T16", dtype), ("W", rows), ("NS", ns), ("RAW", raw is not None), ("PARTS_IN", parts_in),
             ("STAGE", stage), ("STAGE2", stage2),
             ("KC", kc), ("GLOBAL", global_visit),
             ("D", width), ("QH", q_heads), ("HD", head_dim), ("RD", rel_dim),
@@ -923,6 +1027,7 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
             ("VB", mv.bits), ("VG", mv.group),
             ("QSO", qso), ("RSO", rso), ("GSO", gso), ("KSO", kso), ("VSO", vso),
             ("AFFINE", any(m.bits != 16 for m in (mq, mr, mg, mk, mv))), ("AFFSUM", affsum),
+            ("TSPREAD", spread),
             ("VNORM", bool(cfg["use_value_norm_no_gamma"])),
             ("QK_CLIP", f32_bits(cfg["qk_l2_clip_threshold"])),
             ("REL_CLIP", f32_bits(cfg["rel_l2_clip_threshold"])),
@@ -938,24 +1043,26 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
             (1, rows, gate_rows), (1, kv_heads, rows, head_dim), (1, kv_heads, rows, head_dim),
             (1, rows, kv_width), (1, rows, kv_width),
         ],
-        output_dtypes=[mx.bfloat16] * 6 + [mx.float32] * 2,
+        output_dtypes=[dtype] * 6 + [mx.float32] * 2,
     )
     return Projected(*outputs)
 
 
 @lru_cache(maxsize=8)
-def _static_form(width, size):
-    """short_conv's first-use verdict for a static bf16 convolution of this width ("float"/"fused")."""
+def _static_form(width, size, dtype=mx.bfloat16):
+    """short_conv's first-use verdict for a static convolution of this width over a stream of ``dtype``
+    (bf16, or float16 on the FP16 packs): "float" or "fused"."""
     from .. import short_conv
 
-    return short_conv._proven(mx.bfloat16, None, width, 1, size)
+    return short_conv._proven(dtype, None, width, 1, size)
 
 
 def attention_input(layer, x, closed, k_tail, v_tail, pos, messages=None, message_queries=None, *,
                     rows=None):
     """Stage A of one visit for a panel of ``W`` rows (``lanes/SIGNATURES.md`` section 3A).
 
-    ``x`` ``(1, W, D)`` bf16; ``closed`` RC6's closed blocks before this layer's append;
+    ``x`` ``(1, W, D)`` in the stream's 16-bit type (bf16, float16 on the FP16 packs); ``closed``
+    RC6's closed blocks before this layer's append;
     ``k_tail``/``v_tail`` ``(1, 3, 1024)`` f32 (or ``None``: zeros); ``pos`` uint32 committed
     tokens; on loop passes 2 and 3 ``messages`` (RC6's normalised message stack
     ``(1, W, P, D)`` f32) and ``message_queries`` (the visit's ``(4, D)`` rows), or ``rows``, the
@@ -966,14 +1073,15 @@ def attention_input(layer, x, closed, k_tail, v_tail, pos, messages=None, messag
     """
     from .read import depth_keys, depth_read, message_rows, mix, read
 
-    if x.dtype != mx.bfloat16:
-        # Every rounding this stage twins is RC6's rounding to a bf16 stream (FP16 packs: the
-        # reference serves; fast/step.py declines by the activation dtype before calling).
+    if x.dtype not in STREAM_TYPES:
+        # Every rounding this stage twins is RC6's rounding to the stream's 16-bit type
+        # (``.astype(x.dtype)``); fast/step.py declines another type before calling.
         count_route("refused:stream_dtype")
-        raise RuntimeError("fused stage A serves bf16 streams only")
+        raise RuntimeError("fused stage A serves 16-bit streams (bf16, float16)")
+    dtype = x.dtype
     form = "float"
     if layer.sliding:
-        form = _static_form(matrix(layer.k).rows, layer.convs[0].size)
+        form = _static_form(matrix(layer.k).rows, layer.convs[0].size, dtype)
         if form not in ("float", "fused"):
             count_route("refused:static_conv_unproven")
             raise RuntimeError(f"static convolution unproven on this GPU: {form}")
@@ -988,7 +1096,7 @@ def attention_input(layer, x, closed, k_tail, v_tail, pos, messages=None, messag
     if layer.sliding and not loop:
         (normed,) = read(x2, closed2, layer.attn_query, layer.eps, mode=0, gains=[layer.qkv_norm[0]],
                          f32_stand_in=layer.mlp_query)
-        return project(layer, normed, k_tail, v_tail, pos, form=form)
+        return project(layer, normed, k_tail, v_tail, pos, form=form, dtype=dtype)
     exact = None
     if not layer.sliding:
         # RC6's three-query read: keys here, products on MLX's own kernels (see read.depth_read).
@@ -996,7 +1104,7 @@ def attention_input(layer, x, closed, k_tail, v_tail, pos, messages=None, messag
         exact = depth_read(layer.attn_query, keys).reshape(count, 3, width)
         if not loop:
             return project(layer, None, k_tail, v_tail, pos, raw=(exact, None, list(layer.qkv_norm)),
-                           form=form)
+                           form=form, dtype=dtype)
     if rows is None:
         rows = message_rows(messages, message_queries)
     controllers = layer.controllers[:3]
@@ -1005,7 +1113,7 @@ def attention_input(layer, x, closed, k_tail, v_tail, pos, messages=None, messag
     h, parts = mix(state, xs, ms, [c.forget for c in controllers], [c.gain for c in controllers],
                    parts=True)
     gains = [layer.qkv_norm[0]] * 3 if layer.sliding else list(layer.qkv_norm)
-    return project(layer, None, k_tail, v_tail, pos, raw=(h, parts, gains), form=form)
+    return project(layer, None, k_tail, v_tail, pos, raw=(h, parts, gains), form=form, dtype=dtype)
 
 
 def stage_attention_input(layer, x, closed, message, state, visit, panel):

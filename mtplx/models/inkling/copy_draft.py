@@ -4,7 +4,7 @@ from collections import Counter, OrderedDict
 from threading import Lock
 from time import perf_counter
 
-from mtplx import context_copy
+from mtplx import context_copy, copy_gate
 
 
 class SessionPromptIndexes:
@@ -86,6 +86,11 @@ class PromptCopy:
         self.suspensions = 0
         self.lookup_build_s = self.copy_round_s = self.ordinary_round_s = 0.0
         self.declines, self.limits, self.verify_rows = Counter(), Counter(), Counter()
+        # The cost gate (mtplx/copy_gate.py, MTPLX_CONTEXT_COPY_GATE, off by default): it prices
+        # this request's ordinary and copy rounds from their own times and vetoes or shortens a
+        # block whose expected tokens a second lose. Class B: which rounds copy follows the clock.
+        self.gate = copy_gate.for_request() if self.disabled_reason is None else None
+        self.verify_calls = 0
 
     def decline(self, reason):
         self.declines[reason] += 1
@@ -98,6 +103,8 @@ class PromptCopy:
             return self.decline(self.disabled_reason)
         if len(tokens) < self.suspend_until:
             return self.decline("acceptance_backoff")
+        if self.gate is not None:
+            self.gate.cycle(len(tokens), self.verify_calls)
         if self.index is None:
             # Build after streaming the first target token. The corpus is the prompt only.
             start = perf_counter()
@@ -122,6 +129,13 @@ class PromptCopy:
             self.block_cap if self.seen >= 2 and self.ema >= 0.5 else self.probation_cap
         )
         length = context_copy.block_for_ext(ext, cap)
+        if self.gate is not None:
+            planned = self.gate.plan(length)
+            if planned <= 0:
+                return self.decline("cost_gate")
+            if planned < length:
+                self.limits["cost_gate"] += 1
+            length = planned
         for reason, bound in (
             ("verify_geometry", self.max_proposals),
             ("requested_output_budget", remaining),
@@ -151,6 +165,9 @@ class PromptCopy:
     def observe(self, offered, landed, emitted_tokens, wall_s):
         # Host wall covers selection, proposal, target verification and commit submission.
         # The stream callback and any later lazy-device work are outside both timers.
+        self.verify_calls += 1
+        if offered and self.gate is not None:
+            self.gate.observe_copy(offered, landed)
         if not offered:
             self.ordinary_round_s += wall_s
             return
@@ -171,6 +188,12 @@ class PromptCopy:
             self.backoff = min(self.backoff * 2, 4096)
             self.ema, self.seen = 0.5, 0
             self.suspensions += 1
+
+    def _gate_costs(self):
+        # The gate's measured prices, beside the lane's own timers (seconds; none when off).
+        stats = self.gate.stats() if self.gate is not None else {}
+        return {f"gate_{key[:-3]}_s": stats[key] / 1e3 for key in ("ordinary_ms", "copy_fixed_ms", "copy_row_ms")
+                if key in stats}
 
     def finish(self, emitted_tokens):
         if self.index is not None and self.indexes is not None:
@@ -196,5 +219,6 @@ class PromptCopy:
                 "index_build_or_extend": self.lookup_build_s,
                 "copy_rounds": self.copy_round_s,
                 "ordinary_rounds": self.ordinary_round_s,
+                **self._gate_costs(),
             },
         )

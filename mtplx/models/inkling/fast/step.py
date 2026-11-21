@@ -38,6 +38,8 @@ from .. import short_conv
 from ..precision import AffineWeight
 from ..attention import attend
 from ..projection import stock_messages
+from .frame_reads import final_hidden, pass_stack
+from .pass_messages import attach as attach_message, pass_rows
 from .routes import count
 from .state import DecodeState, VisitDelta
 
@@ -266,9 +268,8 @@ def packed_linear(x, weight):
     """``x @ weight`` for stored codes, every row equal to the one-row product: lane L1's
     row-stable launch (one read of the codes for the whole panel, 2 to 32 rows, proven against
     MLX's one-row product on this Mac's first use of each shape); where it refuses, counted,
-    ``proven_rows`` (MLX's batched product where it is row-stable here, else one row at a time)."""
-    if x.shape[1] == 1:
-        return ref.linear(x, weight)
+    ``proven_rows`` (MLX's batched product where it is row-stable here, else one row at a time). One
+    row takes the launch too (``qproduct._ONE_ROW``); where it refuses, MLX's own product, the reference."""
     from .qproduct import affine_product
 
     try:
@@ -349,32 +350,90 @@ def unreadable(dtype, *weights):
 
 
 def attention_input_reason(layer, dtype, message):
-    """Why lane L1's stage A cannot serve this visit, or None. Its projection launch reads q, r,
-    gate, k and v as 16-bit or as the affine codes it twins MLX's one-row product for (4 and 8
-    bits, ``attn_input.affine_route``), and the sink, the dynamic taps and (loop passes 2 and 3)
-    the controllers as 16-bit."""
-    from .attn_input import affine_route, matrix
+    """Why lane L1's stage A cannot serve this visit, or None. Its launches round to the stream's
+    16-bit type (bf16, or float16 on the FP16 packs) and read q, r, gate, k and v as 16-bit weights
+    of that type or as the affine codes it twins MLX's one-row product for (4 and 8 bits, scales of
+    that type, ``attn_input.affine_route``), and the sink, the dynamic taps, the input norms' gains
+    and (loop passes 2 and 3) the controllers as 16-bit of that type."""
+    from .attn_input import STREAM_TYPES, affine_route, matrix
 
-    if dtype != mx.bfloat16:
+    if dtype not in STREAM_TYPES:
         return "stream_dtype"
     for name, weight in (("q", layer.q), ("r", layer.r), ("gate", layer.gate), ("k", layer.k), ("v", layer.v)):
         if isinstance(weight, AffineWeight):
             why = affine_route(matrix(weight))
             if why:
                 return f"packed_{weight.bits}bit_{name}"
-        elif weight.dtype != mx.bfloat16:
+            if weight.scales.dtype != dtype:
+                return "scales_dtype"
+        elif weight.dtype != dtype:
             return "weight_dtype"
     packed = [layer.sink, layer.convs[0].dynamic, layer.convs[1].dynamic]
     if message:
         packed += [c.down for c in layer.controllers[:3]]
-    if not isinstance(layer.sink, AffineWeight) and layer.sink.dtype != mx.bfloat16:
-        return "weight_dtype"
-    return next((f"packed_{w.bits}bit" for w in packed if isinstance(w, AffineWeight)), None)
+    stored = next((f"packed_{w.bits}bit" for w in packed if isinstance(w, AffineWeight)), None)
+    if stored:
+        return stored
+    sixteen = [w for w in (*packed, *layer.qkv_norm) if w is not None]
+    return "weight_dtype" if any(w.dtype != dtype for w in sixteen) else None
 
 
 def output_reason(layer, dtype):
     """Why lane L2's output projection cannot serve this visit, or None."""
     return unreadable(dtype, layer.out)
+
+
+def stored_output_reason(layer, dtype, rows):
+    """Why the one-launch stage C on stored codes (``qproduct.affine_output``: the output projection
+    on the affine codes in the one-row product's order, the attention's short convolution and the
+    residual) cannot serve this visit, or None. Its first use per shape on a Mac still proves it bit
+    for bit against the step's separate launches, and refuses (counted) on a disagreement."""
+    from .qproduct import qmv_constants
+
+    from .qproduct import STREAM_TYPES
+
+    conv = layer.convs[2]
+    if not isinstance(layer.out, AffineWeight):
+        return "not_stored"
+    if dtype not in STREAM_TYPES:
+        return "stream_dtype"
+    if layer.out.scales.dtype != dtype:
+        return "scales_dtype"
+    if conv.dynamic is not None or conv.size != 4:
+        return "conv_form"
+    if not 1 <= rows <= MAX_STORED_OUTPUT_ROWS:
+        return "rows"
+    try:
+        qmv_constants(layer.out)
+    except RuntimeError as err:
+        return str(err).rsplit(": ", 1)[-1]
+    return None
+
+
+#: Panel rows the one-launch stored-code stage C takes (its bit proofs cover 1 to 8, 12, 16 and 32).
+MAX_STORED_OUTPUT_ROWS = 32
+
+
+def output_route_reason(layer, dtype, rows):
+    """Why neither fused stage C (16-bit weights: lane L2's launch; stored codes: the one-launch
+    stored-code form) serves this visit, or None."""
+    reason = output_reason(layer, dtype)
+    if reason is None or stored_output_reason(layer, dtype, rows) is None:
+        return None
+    return reason
+
+
+def stored_output(layer, hg, x, state, visit):
+    """Stage C on a stored-code output projection in one launch, or None where it refuses (counted in
+    ``attn_input.route_counts`` as ``refused:qoutput_*``)."""
+    from .attn_input import _static_form
+    from .qproduct import affine_output
+
+    try:
+        return affine_output(hg, layer.out, layer.convs[2], state.tail(visit, 2), x, layer.boundary,
+                             form=_static_form(layer.out.codes.shape[0], layer.convs[2].size, hg.dtype))
+    except RuntimeError:
+        return None
 
 
 #: The trunk's activation dtype, set by the decoder at load (one model a process), so the
@@ -400,12 +459,18 @@ def attention_reason(dtype=None):
 
 def expert_input_reason(layer, message, dtype=mx.bfloat16):
     """Why lane L1's MLP read cannot serve this visit, or None. Its read and controller round to
-    bf16 where RC6 rounds to the stream's dtype, so a float16 stream (the FP16 sibling packs)
-    takes the reference (review 2, finding 9)."""
-    if dtype != mx.bfloat16:
+    the stream's 16-bit type where RC6 rounds to the stream's dtype (bf16, or float16 on the FP16
+    packs; review 2, finding 9), with the controller's down weights of that type."""
+    from .attn_input import STREAM_TYPES
+
+    if dtype not in STREAM_TYPES:
         return "stream_dtype"
-    if message and isinstance(layer.controllers[3].down, AffineWeight):
-        return f"packed_{layer.controllers[3].down.bits}bit"
+    if message:
+        down = layer.controllers[3].down
+        if isinstance(down, AffineWeight):
+            return f"packed_{down.bits}bit"
+        if down.dtype != dtype:
+            return "weight_dtype"
     return None
 
 
@@ -438,7 +503,7 @@ def stage_fallbacks(model, spec, rows, dtype=None):
         if "a" in lanes:
             reasons.append(("a", attention_input_reason(layer, dtype, message)))
         if "bc" in lanes:
-            reasons.append(("bc_output", output_reason(layer, dtype)))
+            reasons.append(("bc_output", output_route_reason(layer, dtype, rows)))
         if "d" in lanes:
             reasons.append(("d", expert_input_reason(layer, message, dtype)))
         if "e" in lanes:
@@ -451,9 +516,11 @@ def stage_fallbacks(model, spec, rows, dtype=None):
                         and launch_serves(layer.out) else "fallback")
                 key = f"{kind}.{stage}.{reason}"
                 out[key] = out.get(key, 0) + 1
+    if embed_reason(model) is not None:
+        out[f"fallback.embed.{embed_reason(model)}"] = 1
     unembed = getattr(model, "unembed", None)
-    if rows > 1 and isinstance(unembed, AffineWeight) and not launch_serves(unembed):
-        out["fallback.head.packed_rows"] = 1
+    if isinstance(unembed, AffineWeight) and not launch_serves(unembed):
+        out["fallback.head.packed_rows" if rows > 1 else "fallback.head.packed_one_row"] = 1
     return out
 
 
@@ -479,13 +546,20 @@ def fused_attention(layer, a, x, state, visit, panel):
             newest = valid
         hg = panel_attend(a.q, a.rel, a.sink, a.gate_logits, a.k_rows, a.v_rows, keys, values, valid,
                           newest, panel.pos, layer.rel_basis, window=layer.sliding)
+        count("fused.bc_attention")
     reason = output_reason(layer, hg.dtype)
-    if reason is not None:
-        kind = "unfused" if isinstance(layer.out, AffineWeight) and launch_serves(layer.out) else "fallback"
-        count(f"{kind}.bc_output.{reason}")
-        return output_projection(layer, hg, x, state, visit, panel)
-    return panel_output(hg, layer.out, layer.convs[2].weight, state.tail(visit, 2), x,
-                        boundary=layer.boundary)
+    if reason is None:
+        count("fused.bc_output.panel")
+        return panel_output(hg, layer.out, layer.convs[2].weight, state.tail(visit, 2), x,
+                            boundary=layer.boundary)
+    if stored_output_reason(layer, hg.dtype, panel.rows) is None:
+        fused = stored_output(layer, hg, x, state, visit)
+        if fused is not None:
+            count("fused.bc_output.stored")
+            return fused
+    kind = "unfused" if isinstance(layer.out, AffineWeight) and launch_serves(layer.out) else "fallback"
+    count(f"{kind}.bc_output.{reason}")
+    return output_projection(layer, hg, x, state, visit, panel)
 
 
 def fused_attention_input(layer, x, closed, message, state, visit, panel):
@@ -496,6 +570,7 @@ def fused_attention_input(layer, x, closed, message, state, visit, panel):
     if reason is not None:
         count(f"fallback.a.{reason}")
         return attention_input(layer, x, closed, message, state, visit, panel)
+    count("fused.a")
     return stage_attention_input(layer, x, closed, message, state, visit, panel)
 
 
@@ -508,6 +583,7 @@ def fused_expert_input(layer, partial, closed, message, panel):
     if reason is not None:
         count(f"fallback.d.{reason}")
         return expert_input(layer, partial, closed, message, panel)
+    count("fused.d")
     return stage_expert_input(layer, partial, closed, message, panel)
 
 
@@ -519,7 +595,8 @@ def fused_experts(layer, source, partial, dtype, state, visit, panel):
     if reason is not None:
         count(f"fallback.experts.{reason}")
         return experts(layer, source, partial, dtype, state, visit, panel)
-    return expert_visit(layer, source, partial, state.tail(visit, 3))
+    count("fused.experts")
+    return expert_visit(layer, source, partial, state.tail(visit, 3), dtype)
 
 
 LANES = {
@@ -587,36 +664,100 @@ def row_stable_read(panel, closed, x, queries, eps, normalize):
 
 
 def affine_head(model, hidden):
-    """``Model.head`` on affine codes with the product as lane L1's row-stable launch: the same
-    cast (to the model's dtype, then float32, as ``vocabulary_logits`` feeds an affine head), the
-    same vocabulary slice and soft cap, so every row equals the one-row head. Raises
-    ``RuntimeError`` where the launch refuses (its first use per shape is proven on this Mac)."""
-    from .qproduct import affine_product
+    """``Model.head`` on affine codes with the product as lane L1's row-stable launch, one launch at
+    any width: a 16-bit hidden (bf16, float16 on the FP16 packs) is widened to float32 inside the launch
+    (``vocabulary_logits`` casts it to the model's dtype, then float32, and MLX's product then widens the
+    16-bit scales and biases: three launches that change no value), the same vocabulary slice and soft
+    cap, so every row equals the one-row head. Raises ``RuntimeError`` where the launch refuses (its
+    first use per shape is proven on this Mac against MLX's one-row product)."""
+    from .qproduct import STREAM_TYPES, affine_logits, affine_product
 
     cap = model.config["final_logit_softcapping"]
-    x = hidden.astype(model.embed_tokens.weight.dtype).astype(mx.float32)
-    logits = affine_product(x, model.unembed)[..., : model.config["unpadded_vocab_size"]]
+    vocab = model.config["unpadded_vocab_size"]
+    x = hidden.astype(model.embed_tokens.weight.dtype)
+    widen = x.dtype in STREAM_TYPES
+    if not widen:
+        x = x.astype(mx.float32)
+    try:
+        # The product, the vocabulary slice and the soft cap in one launch.
+        return affine_logits(x, model.unembed, width=vocab, cap=cap or 0.0, widen=widen)
+    except RuntimeError:
+        count("fallback.head.one_launch_logits_refused")
+    logits = affine_product(x, model.unembed, widen=widen, one_row=True)[..., :vocab]
     return mx.tanh(logits / cap) * cap if cap else logits
 
 
 def row_stable_head(model, hidden):
     """The vocabulary head of a panel, every row equal to the one-row step's (pieces of at
     most 8 rows past 8, as ``row_stable_read``; a head stored as affine codes through lane L1's
-    row-stable launch, else one row at a time, counted)."""
+    row-stable launch at every width, one row included; where it refuses, MLX's product: the
+    one-row head itself, or a panel one row at a time, counted)."""
     rows = hidden.shape[1]
-    if rows > 1 and isinstance(model.unembed, AffineWeight):
+    if isinstance(model.unembed, AffineWeight):
         try:
-            return affine_head(model, hidden)
+            logits = affine_head(model, hidden)
+            count("fused.head.stored")
+            return logits
         except RuntimeError:
             pass
+        if rows == 1:
+            count("fallback.head.packed_one_row")
+            return model.head(hidden)
         count("fallback.head.packed_rows")
         unembed = model.unembed
         key = ("head", rows, tuple(unembed.codes.shape), unembed.bits, unembed.group_size, str(hidden.dtype))
         return proven_rows(key, lambda: model.head(hidden), lambda: mx.concatenate(
             [model.head(hidden[:, row : row + 1]) for row in range(rows)], axis=1))
     if rows <= ROW_STABLE_ROWS:
-        return model.head(hidden)
-    return mx.concatenate([model.head(hidden[:, start:stop]) for start, stop in row_chunks(rows)], axis=1)
+        return table_head(model, hidden)
+    return mx.concatenate([table_head(model, hidden[:, start:stop]) for start, stop in row_chunks(rows)], axis=1)
+
+
+def table_head(model, hidden):
+    """``Model.head`` on a 16-bit vocabulary matrix (Optimized Quality, its FP16 sibling) with the soft
+    cap inside the vocabulary launch (``head.head_logits``): one launch where ``Model.head`` takes four
+    (the launch, then MLX's divide, tanh and multiply), every value equal (the capped launch is proven
+    against the launch capped by MLX on this Mac's first use). Where the capped launch refuses, MLX
+    caps; where the vocabulary launch does not serve, MLX's product; both counted."""
+    from ..head import head_logits
+
+    logits, route = head_logits(hidden.astype(model.embed_tokens.weight.dtype), model.unembed,
+                                model.config["unpadded_vocab_size"], model.config["final_logit_softcapping"],
+                                pack=getattr(model, "proof_pack", None))
+    count("fused.head.table" if route == "native" else f"fallback.head.table_{route}")
+    return logits
+
+
+def embed_reason(model):
+    """Why the one-launch embedding (``embedding.embed_rows``: the row gathered, decoded when stored,
+    and normed) cannot serve this model's table, or None."""
+    from .embedding import reason
+
+    table = model.embed_tokens
+    packed = getattr(table, "packed", None)
+    return reason(packed if packed is not None else table.weight, getattr(table, "gain", None))
+
+
+def embed(model, ids):
+    """``model.embed_tokens(ids)`` in one launch (``embedding.embed_rows``): each id's row gathered,
+    decoded when the table is stored as affine codes (Bare Speed: MLX gathers codes, scales and
+    biases, then decodes), and normed as ``Embedding`` norms it; every value equal (proven on this
+    Mac's first use). A table the launch does not serve, or a refusal, takes the model's own
+    embedding, counted."""
+    from .embedding import embed_rows
+
+    table = model.embed_tokens
+    packed = getattr(table, "packed", None)
+    reason = embed_reason(model)
+    if reason is None:
+        try:
+            rows = embed_rows(ids, packed if packed is not None else table.weight, table.gain, table.eps)
+            count("fused.embed." + ("stored" if packed is not None else "table"))
+            return rows
+        except RuntimeError:
+            reason = "refused"
+    count(f"fallback.embed.{reason}")
+    return table(ids)
 
 
 def decode_hidden(model, ids, state, *, embeddings=None, capture_ids=(), stages=REFERENCE,
@@ -629,8 +770,8 @@ def decode_hidden(model, ids, state, *, embeddings=None, capture_ids=(), stages=
     verify = (rows > 1) if tape is None else bool(tape)
     panel = Panel(rows, state.pos, True if verify else None)
     closed, captured, deltas = [], {}, []
-    x = model.embed_tokens(ids.reshape(1, rows)) if embeddings is None else embeddings
-    stack = entry = entry_blocks = None
+    x = embed(model, ids.reshape(1, rows)) if embeddings is None else embeddings
+    stack = entry = entry_blocks = pass_reads = None
     for visit, index in enumerate(model.visit_order):
         if index == model.start:
             if visit == model.start:
@@ -638,18 +779,27 @@ def decode_hidden(model, ids, state, *, embeddings=None, capture_ids=(), stages=
                 stack = None
             else:
                 prior = [*closed[len(entry_blocks) + 1 :], x]
-                stack = mx.fast.rms_norm(mx.stack(prior, axis=-2).astype(mx.float32), None, model.eps)
+                # Lane F1: one read-kernel launch for the stack's norm where proven (frame_reads.py).
+                stack = pass_stack(prior, model.eps, model.message_queries)
                 x, closed = entry, list(entry_blocks)
+                # Lane F1: the pass's twelve message reads at once (pass_messages.py), where proven.
+                pass_reads = pass_rows(stack, model.message_queries, verify)
         if visit in capture_ids:
             captured[visit] = x
         message = None
         if model.start <= index < model.end and stack is not None:
             message = Message(stack, model.message_queries[index - model.start], verify)
+            if pass_reads is not None:
+                attach_message(message, pass_reads[index - model.start])
         x, delta = visit_step(model.layers[index], x, closed, message, state, visit, panel, stages, record)
         deltas.append(delta)
-    last = row_stable_read(panel, closed, x, model.final_query, model.eps,
-                           model.config["attn_res_normalize_values"])[..., 0, :]
-    hidden = ref.norm(last, model.final_norm, model.eps).astype(x.dtype)
+    def reference_hidden():
+        last = row_stable_read(panel, closed, x, model.final_query, model.eps,
+                               model.config["attn_res_normalize_values"])[..., 0, :]
+        return ref.norm(last, model.final_norm, model.eps).astype(x.dtype)
+
+    # Lane F1: the final read and norm in one read-kernel launch where proven (frame_reads.py).
+    hidden = final_hidden(model, panel, closed, x, reference_hidden)
     if len(model.visit_order) in capture_ids:
         captured[len(model.visit_order)] = hidden
     return hidden, [captured[i] for i in capture_ids], deltas

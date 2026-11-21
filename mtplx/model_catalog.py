@@ -38,10 +38,11 @@ BONSAI_RECOMMENDATION_MIN_GIB = 16.0
 # whole switch (mirrors MTPLXModelOption.inklingTightMacOffer).
 INKLING_TIGHT_MAC_OFFER = False
 # The Inkling 2 Mini FP16 siblings on M1 and M2 Macs (32 GiB and up), in the places the
-# modern tier gives the trio. Their FP16 numbers are checked on an M5; no M1 or M2 Mac has
-# loaded them yet. Off until one has; True is the whole switch (mirrors
+# modern tier gives the trio. On by the founder's order of 21 November (M1 and M2 are offered
+# the FP16 packs); their FP16 numbers are checked on an M5 and the M1-M4 rehearsal switch,
+# not yet on an M1 or M2 itself. True is the whole switch (mirrors
 # MTPLXModelOption.inklingLegacyOffer).
-INKLING_LEGACY_OFFER = False
+INKLING_LEGACY_OFFER = True
 
 MODERN_TIER = "modern"
 LEGACY_TIER = "legacy"
@@ -565,7 +566,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
     # FP16 siblings for M1 and M2 Macs, which have no native bfloat16: the same packs with every
     # BF16 tensor cast to FP16 (vision tower and drafter included) and every NVFP4 and 4-bit code
     # byte for byte; peak carried over from the parent (same tensor bytes). Recommended on the
-    # legacy tier only behind INKLING_LEGACY_OFFER (off): no M1 or M2 Mac has run them yet.
+    # legacy tier (INKLING_LEGACY_OFFER, on).
     CatalogModel(
         id="inkling2-mini-bare-speed-fp16",
         display_name="Inkling 2 Mini Bare Speed FP16",
