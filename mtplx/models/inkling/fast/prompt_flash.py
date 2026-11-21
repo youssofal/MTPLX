@@ -543,8 +543,19 @@ def window_update(kv, keys, values):
 # default route, counted, as it does today.
 # ----------------------------------------------------------------------------------------
 
-#: The prompt length from which the stage reads a prompt faster than the default route.
+#: The prompt length from which the stage reads a prompt faster than the default route: for reads of
+#: 2,048 rows or more a forward (``SHORT_PROMPT_WIDE``; there the default route computes every masked key
+#: of a window visit and writes rows x keys bias planes, so the stage pays from shorter prompts) and for
+#: narrower reads (``SHORT_PROMPT``: a Mac without the headroom for the wide width, or a narrowed request).
 SHORT_PROMPT = 8192
+SHORT_PROMPT_WIDE = 8192
+WIDE_READ_ROWS = 2048
+
+
+def _read_width():
+    from mtplx.generation import _prefill_chunk_size
+
+    return _prefill_chunk_size()
 
 #: The most a prompt chunk on the stage holds at its peak beyond the default route's chunk:
 #: lanes/p2/decide-1.json, peak growth over the active memory, stage against stock, 0.22 GB at 4K,
@@ -552,11 +563,14 @@ SHORT_PROMPT = 8192
 EXTRA_PEAK_BYTES = 512 * 1024**2
 
 
-def short_prompt(keys):
-    """Whether the prompt a call belongs to is shorter than the crossover: its length as the prompt
-    read set it, never less than the ``keys`` the call sees."""
+def short_prompt(keys, width=None):
+    """Whether the prompt a call belongs to is shorter than the crossover for its read's width (the
+    request's rows a forward unless given): its length as the prompt read set it, never less than the
+    ``keys`` the call sees."""
     total = _prompt_tokens()
-    return max(total if total <= MAX_PROMPT else 0, keys) < SHORT_PROMPT
+    width = _read_width() if width is None else width
+    limit = SHORT_PROMPT_WIDE if width >= WIDE_READ_ROWS else SHORT_PROMPT
+    return max(total if total <= MAX_PROMPT else 0, keys) < limit
 
 
 def _bank_bytes(kv, rows, cfg, dtype):

@@ -107,7 +107,7 @@ def flash_attention_on(prompt_tokens=None):
 
     if not flash_switch_on():
         return False
-    return prompt_tokens is None or not prompt_flash.short_prompt(int(prompt_tokens))
+    return prompt_tokens is None or not prompt_flash.short_prompt(int(prompt_tokens), width=WIDE_ROWS_FLASH)
 
 
 def gpu_headroom_bytes():

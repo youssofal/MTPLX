@@ -33,6 +33,11 @@ def _clipped(shape, limit, key, dtype):
     return (v * mx.minimum(1.0, limit / (n + 1e-6))).astype(dtype)
 
 
+def _no_crossover(monkeypatch):
+    monkeypatch.setattr(F, "SHORT_PROMPT", 0)
+    monkeypatch.setattr(F, "SHORT_PROMPT_WIDE", 0)
+
+
 def _call(rows, keys, seed, dtype=mx.bfloat16):
     ks = mx.random.split(mx.random.key(seed), 5)
     q = _clipped((1, rows, 24, 128), 22.6, ks[0], dtype).transpose(0, 2, 1, 3)
@@ -127,7 +132,7 @@ def test_declines_what_it_does_not_serve():
 
 def test_route_is_on_by_default_off_where_set_off_and_counted(monkeypatch):
     ops = _call(64, 600, 9)
-    monkeypatch.setattr(F, "SHORT_PROMPT", 0)            # the route's numbers on short calls
+    _no_crossover(monkeypatch)                           # the route's numbers on short calls
     monkeypatch.setenv("MTPLX_INKLING_PROMPT_FLASH", "off")
     before = A.attention_route_counts()
     today = A.attend(*ops, 0)
@@ -160,7 +165,7 @@ def test_a_decline_runs_the_default_route_and_is_counted(monkeypatch):
 
 def test_a_failed_first_use_check_keeps_the_default_route(monkeypatch):
     ops = _call(64, 600, 17, mx.float16)
-    monkeypatch.setattr(F, "SHORT_PROMPT", 0)
+    _no_crossover(monkeypatch)
     monkeypatch.setenv("MTPLX_INKLING_PROMPT_FLASH", "on")
     monkeypatch.setattr(A, "_flash_checks", {})
 
@@ -242,7 +247,7 @@ def test_the_stage_writes_the_layers_cache_rows_and_its_attention(monkeypatch, s
     xs = [(mx.random.normal((1, rows, 2304), key=mx.random.key(40 + i)) * 0.5).astype(dtype) for i in range(3)]
     if sliding:
         xs = [xs[0]] * 3
-    monkeypatch.setattr(F, "SHORT_PROMPT", 0)            # the stage's numbers on short calls
+    _no_crossover(monkeypatch)                           # the stage's numbers on short calls
     monkeypatch.setenv("MTPLX_INKLING_PROMPT_FLASH", "off")
     kv0, conv0 = _caches(layer, hist, dtype, rows)
     want = M.Layer.attention(layer, *xs, kv0, conv0, None)
@@ -301,6 +306,23 @@ def _route(monkeypatch, layer, hist, rows=96, prompt=None, seed=50):
     return moved if len(moved) > 1 else moved[0], got, want
 
 
+def _limit():
+    return F.SHORT_PROMPT_WIDE if F._read_width() >= F.WIDE_READ_ROWS else F.SHORT_PROMPT
+
+
+def test_the_crossover_follows_the_reads_width(monkeypatch):
+    from mtplx.generation import prefill_chunk_size_override
+
+    monkeypatch.setattr(F, "SHORT_PROMPT", 6000)
+    monkeypatch.setattr(F, "SHORT_PROMPT_WIDE", 2000)
+    monkeypatch.setenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", "4000")
+    with prefill_chunk_size_override(512):
+        assert F.short_prompt(512)
+    with prefill_chunk_size_override(2048):
+        assert not F.short_prompt(512)
+    assert F.short_prompt(512, width=512) and not F.short_prompt(512, width=4096)
+
+
 def _same_bits(a, b):
     return a.shape == b.shape and bool(mx.array_equal(a.view(mx.uint16), b.view(mx.uint16)).item())
 
@@ -309,10 +331,10 @@ def _same_bits(a, b):
 def test_a_prompt_shorter_than_the_crossover_reads_on_the_default_route(monkeypatch, sliding):
     layer = _layer(sliding, mx.bfloat16, 61)
     visit = "window" if sliding else "full"
-    moved, got, want = _route(monkeypatch, layer, 0, prompt=F.SHORT_PROMPT - 1)
+    moved, got, want = _route(monkeypatch, layer, 0, prompt=_limit() - 1)
     assert moved == [f"prompt_stage.{visit}.stock.short_prompt", f"prompt_flash.{visit}.stock.short_prompt"]
     assert _same_bits(got, want)
-    moved, got, want = _route(monkeypatch, layer, 0, prompt=F.SHORT_PROMPT)
+    moved, got, want = _route(monkeypatch, layer, 0, prompt=_limit())
     assert moved == f"prompt_stage.{visit}.selected"
     assert _rel_rms(got, want.astype(mx.float32)) <= 4 * BOUND[mx.bfloat16]
 
@@ -320,7 +342,7 @@ def test_a_prompt_shorter_than_the_crossover_reads_on_the_default_route(monkeypa
 def test_the_prompt_is_never_shorter_than_the_keys_a_chunk_sees(monkeypatch):
     # no prompt length set, or a stale one: the history and the chunk are the length so far
     layer = _layer(False, mx.bfloat16, 67)
-    hist = F.SHORT_PROMPT
+    hist = _limit()
     assert _route(monkeypatch, layer, hist, prompt=None)[0] == "prompt_stage.full.selected"
     assert _route(monkeypatch, layer, hist, prompt=100)[0] == "prompt_stage.full.selected"
     assert _route(monkeypatch, layer, 0, prompt=None)[0][0] == "prompt_stage.full.stock.short_prompt"
@@ -329,7 +351,7 @@ def test_the_prompt_is_never_shorter_than_the_keys_a_chunk_sees(monkeypatch):
 def test_no_room_for_the_stage_reads_on_the_default_route(monkeypatch):
     from mtplx.models.inkling import head as H
 
-    monkeypatch.setattr(F, "SHORT_PROMPT", 0)
+    _no_crossover(monkeypatch)
     prompt = 64 * 1024
     monkeypatch.setenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", str(prompt))
     bank = F._bank_bytes(KVCache(), 96, _CFG, mx.bfloat16)

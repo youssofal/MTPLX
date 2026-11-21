@@ -106,13 +106,13 @@ def test_with_the_one_launch_attention_the_width_is_4096_and_the_fence_lifts(mon
     monkeypatch.setenv(PROMPT_FAST_ENV, "chunk")
     monkeypatch.setattr(PR, "_headroom", {"bytes": 64 * 1024**3})
     monkeypatch.delenv("MTPLX_INKLING_PROMPT_FLASH", raising=False)   # on by default
-    long_prompt = max(F.SHORT_PROMPT, 4_000)
+    long_prompt = max(F.SHORT_PROMPT_WIDE, 4_000)
     assert PR.flash_attention_on() and PR.flash_attention_on(long_prompt)
     assert PR.wide_rows(long_prompt) == PR.WIDE_ROWS_FLASH
     assert PR.wide_rows(PR.WIDE_PROMPT_TOKENS * 4) == PR.WIDE_ROWS_FLASH  # no fence
     # a prompt below the crossover reads on the stock attention: its width and fence
-    if F.SHORT_PROMPT > 1:
-        assert not PR.flash_attention_on(F.SHORT_PROMPT - 1) and PR.wide_rows(F.SHORT_PROMPT - 1) == 2048
+    if F.SHORT_PROMPT_WIDE > 1:
+        assert not PR.flash_attention_on(F.SHORT_PROMPT_WIDE - 1) and PR.wide_rows(F.SHORT_PROMPT_WIDE - 1) == 2048
     monkeypatch.setattr(PR, "_headroom", {"bytes": PR.WIDE_HEADROOM_BYTES - 1})
     assert PR.wide_rows(long_prompt) is None
     # switched off: the stock attention's width and fence
