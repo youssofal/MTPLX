@@ -708,11 +708,21 @@ def test_reasoning_effort_vocabulary_covers_every_family() -> None:
         if isinstance(value, descriptors.BackendDescriptor)
     ]
     assert codecs, "found no ReasoningCodec — this walk stopped covering anything"
+    # Inkling 2 Mini declares three levels outside the shared vocabulary. 2.13 ships them per request only: the
+    # server takes them from a client (Pi and OpenCode send them), the app's effort picker shows the shared levels
+    # alone (it keeps low to xhigh), and `--reasoning-effort`, `mtplx config set` and the live settings cannot make
+    # them a default. Widening the shared vocabulary to them is the first item after 2.13 (release list line 23,
+    # decided 21 November); this exception goes with it.
+    inkling_per_request_only = {"none", "minimal", "max"}
     for codec in codecs:
         declared = set(codec.effort_levels)
         if codec.default_effort is not None:
             declared.add(codec.default_effort)
-        assert declared <= set(REASONING_EFFORT_CHOICES), codec
+        allowed = set(REASONING_EFFORT_CHOICES)
+        if codec is descriptors.INKLING_DESCRIPTOR.reasoning_codec:
+            assert inkling_per_request_only <= declared, "the exception names a level Inkling no longer declares"
+            allowed |= inkling_per_request_only
+        assert declared <= allowed, codec
 
 
 def test_every_effort_writing_surface_accepts_the_whole_vocabulary() -> None:
