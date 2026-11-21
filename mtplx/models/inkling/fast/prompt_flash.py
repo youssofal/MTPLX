@@ -567,8 +567,13 @@ def window_update(kv, keys, values):
 #: 2,048 rows or more a forward (``SHORT_PROMPT_WIDE``; there the default route computes every masked key
 #: of a window visit and writes rows x keys bias planes, so the stage pays from shorter prompts) and for
 #: narrower reads (``SHORT_PROMPT``: a Mac without the headroom for the wide width, or a narrowed request).
+#: Wide: 4,096. Bare Speed, 4,097 tokens at 2,048 rows, in process through the product's prefill, the stage
+#: read in 1.91 s against stock's 2.57 (and 2.79 against 3.52 in an earlier run, both after the same warm-up,
+#: the stage read second; lanes/p2/posacc-bare-2.json, posacc-bare-1.json), every prompt position inside stock's
+#: own re-cut spread against the exact reference. Narrow: 8,192 until a 512-row read below it is measured
+#: (at 1,024 tokens the two tie: 0.66 against 0.65 s).
 SHORT_PROMPT = 8192
-SHORT_PROMPT_WIDE = 8192
+SHORT_PROMPT_WIDE = 4096
 WIDE_READ_ROWS = 2048
 
 
