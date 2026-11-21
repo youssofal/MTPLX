@@ -64,6 +64,8 @@ _ATTRIBUTE = "_mtplx_inkling_round_site"
 #: Proposals a round can carry: the drafter's 8-slot block holds the anchor and 7.
 MAX_PROPOSALS = 7
 _WARM_TRIES = 10
+#: Timed calls per width at load (interleaved across widths; the fastest native one is kept).
+_TIMING_PASSES = 5
 
 
 # ------------------------------------------------------------------------------- the site
@@ -1123,6 +1125,7 @@ def warm(rt, proposals=None, *, length: int = 1100, seed: int = 20261121, temper
     vocab = rt.model.embed_tokens.weight.shape[0]
     extra = {"stops": [], "remaining": 1 << 30} if commit else {}
     round_ms: dict[int, float] = {}
+    live: list[int] = []
     for k in proposals:
         entry_started = time.perf_counter()
         native = tries = 0
@@ -1140,27 +1143,43 @@ def warm(rt, proposals=None, *, length: int = 1100, seed: int = 20261121, temper
             del served
         seconds = time.perf_counter() - entry_started
         if native:
-            samples = []
-            for t in range(3):
-                mx.synchronize()
-                t0 = time.perf_counter()
-                served = serve(rt, (seed + 31 * t + k) % vocab, cache, k, position=length + 2 + 3 * t,
-                               seed=seed + k + 17 * t, temperature=temperature, draft_temperature=draft_temperature,
-                               state=None if commit else state, **extra)
-                if served is None:
-                    # A call the program declined (busy, shared state, a layout it does not take):
-                    # no timing from it, and the load carries on (the loop's pieces serve such rounds).
-                    report.setdefault("timing_declined", {})[k] = last_route().get("reason")
-                    break
-                fast_round.read_packet(served.packet, k + 1)
-                mx.eval(served.rows, served.features, [d.arrays() for d in served.pending.deltas])
-                if served.native:
-                    samples.append((time.perf_counter() - t0) * 1e3)
-                del served
-            if samples:
-                round_ms[k] = _seconds(sorted(samples)[len(samples) // 2] / 1e3) * 1e3
+            live.append(k)
         report["counts"][k] = {"calls": tries, "live": native > 0, "seconds": _seconds(seconds),
-                               "round_ms": round_ms.get(k)}
+                               "round_ms": None}
+    # The timings the depth table is fitted from: every live width timed in turn, one call per
+    # width a pass, and the fastest native call of each width kept. Timed width by width (a median
+    # of three), a busy GPU near the end of the warm-up raised only the widest rounds (83 and 86 ms
+    # at 6 and 7 proposals on the native pack in the release candidate's gate), and the table fitted
+    # through them served every round at one proposal; interleaved, a burst reaches every width
+    # alike, and the minimum is the round's cost when the GPU is the model's.
+    samples: dict[int, list[float]] = {k: [] for k in live}
+    declined: set[int] = set()
+    for t in range(_TIMING_PASSES):
+        for k in live:
+            if k in declined:
+                continue
+            mx.synchronize()
+            t0 = time.perf_counter()
+            served = serve(rt, (seed + 31 * t + k) % vocab, cache, k, position=length + 2 + 3 * t,
+                           seed=seed + k + 17 * t, temperature=temperature, draft_temperature=draft_temperature,
+                           state=None if commit else state, **extra)
+            if served is None:
+                # A call the program declined (busy, shared state, a layout it does not take):
+                # no more timing for this width, and the load carries on (the loop's pieces serve
+                # such rounds).
+                report.setdefault("timing_declined", {})[k] = last_route().get("reason")
+                declined.add(k)
+                continue
+            fast_round.read_packet(served.packet, k + 1)
+            mx.eval(served.rows, served.features, [d.arrays() for d in served.pending.deltas])
+            if served.native:
+                samples[k].append((time.perf_counter() - t0) * 1e3)
+            del served
+    for k in live:
+        if samples[k]:
+            round_ms[k] = _seconds(min(samples[k]) / 1e3) * 1e3
+            report["counts"][k]["round_ms"] = round_ms[k]
+            report["counts"][k]["timed_ms"] = [_seconds(v / 1e3) * 1e3 for v in samples[k]]
     del state, cache, target, draft
     report["round_ms"] = round_ms
     report["context_tokens"] = length

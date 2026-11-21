@@ -56,3 +56,30 @@ def test_timing_uses_only_native_samples(monkeypatch):
     rt, _ = _fakes(monkeypatch, lambda n: _Native() if n in (1, 3) else _Mlx())
     report = rp.warm(rt, (2,))
     assert report["counts"][2]["round_ms"] is not None  # one native sample of three
+
+
+def test_widths_are_timed_interleaved_and_the_fastest_call_is_kept(monkeypatch):
+    """A burst of contention while the load times its rounds must not raise one width alone:
+    every live width is timed once a pass, in turn, and its fastest native call is kept. The
+    release candidate's gate timed width by width (a median of three) and a busy GPU near the
+    end raised only the widest rounds (83 and 86 ms at 6 and 7 proposals); the depth table
+    fitted through them then served every round at one proposal."""
+    clock = {"now": 0.0}
+    timed = []
+    cost = {2: 0.020, 3: 0.030}
+    rt, _calls = _fakes(monkeypatch, lambda n: _Native())
+    inner = rp.serve
+
+    def serve_with_cost(rt_, anchor, cache, k, **kwargs):
+        timed.append(k)
+        burst = 0.050 if len(timed) <= 4 else 0.0  # contention over the first four calls
+        clock["now"] += cost[k] + burst
+        return inner(rt_, anchor, cache, k, **kwargs)
+
+    monkeypatch.setattr(rp, "serve", serve_with_cost)
+    monkeypatch.setattr(rp, "time", SimpleNamespace(perf_counter=lambda: clock["now"]))
+    report = rp.warm(rt, (2, 3))
+    assert timed[:2] == [2, 3]  # each width live on its first call
+    assert timed[2:] == [2, 3] * rp._TIMING_PASSES  # then one call per width a pass, in turn
+    assert report["round_ms"] == {2: 20.0, 3: 30.0}  # the burst in the first pass is not kept
+    assert len(report["counts"][3]["timed_ms"]) == rp._TIMING_PASSES
