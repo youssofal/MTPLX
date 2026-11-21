@@ -83,8 +83,10 @@ def reset_route_counts():
     with _lock:
         _routes.clear()
 
-#: Threads of one projection threadgroup (eight simdgroups).
-_THREADS = 256
+#: Threads of one projection threadgroup (sixteen simdgroups): with gate slices of threads / 4 rows,
+#: every unit (query head 36 four-row blocks, key or value head 32, gate slice 32) takes about two
+#: rounds of blocks, so no unit is the launch's long pole (receipts/projvisit-3.json).
+_THREADS = 512
 #: Gate rows a gate threadgroup projects.
 _GATE_ROWS = 32
 #: Panel rows one simdgroup accumulates at once (wider panels loop, re-reading cached weights).
@@ -871,8 +873,8 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
     """
     cfg = layer.cfg
     threads = threads or _THREADS
-    # A gate slice gives every simdgroup one 4-row block, as a query head gives it about 4.5.
-    gate_rows_unit = gate_rows or max(_GATE_ROWS, threads // 8)
+    # A gate slice gives every simdgroup two 4-row blocks, as a query head gives it about 2.25.
+    gate_rows_unit = gate_rows or max(_GATE_ROWS, threads // 4)
     global_visit = not layer.sliding
     q_heads, head_dim = layer.q_scale.shape
     rel_dim = layer.r_scale.shape[1]
