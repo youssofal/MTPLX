@@ -503,8 +503,8 @@ def stage_fallbacks(model, spec, rows, dtype=None):
     if embed_reason(model) is not None:
         out[f"fallback.embed.{embed_reason(model)}"] = 1
     unembed = getattr(model, "unembed", None)
-    if rows > 1 and isinstance(unembed, AffineWeight) and not launch_serves(unembed):
-        out["fallback.head.packed_rows"] = 1
+    if isinstance(unembed, AffineWeight) and not launch_serves(unembed):
+        out["fallback.head.packed_rows" if rows > 1 else "fallback.head.packed_one_row"] = 1
     return out
 
 
@@ -642,28 +642,38 @@ def row_stable_read(panel, closed, x, queries, eps, normalize):
 
 
 def affine_head(model, hidden):
-    """``Model.head`` on affine codes with the product as lane L1's row-stable launch: the same
-    cast (to the model's dtype, then float32, as ``vocabulary_logits`` feeds an affine head), the
-    same vocabulary slice and soft cap, so every row equals the one-row head. Raises
-    ``RuntimeError`` where the launch refuses (its first use per shape is proven on this Mac)."""
+    """``Model.head`` on affine codes with the product as lane L1's row-stable launch, one launch at
+    any width: a bf16 hidden is widened to float32 inside the launch (``vocabulary_logits`` casts it
+    to the model's dtype, then float32, and MLX's product then widens the bf16 scales and biases: three
+    launches that change no value), the same vocabulary slice and soft cap, so every row equals the
+    one-row head. Raises ``RuntimeError`` where the launch refuses (its first use per shape is proven
+    on this Mac against MLX's one-row product)."""
     from .qproduct import affine_product
 
     cap = model.config["final_logit_softcapping"]
-    x = hidden.astype(model.embed_tokens.weight.dtype).astype(mx.float32)
-    logits = affine_product(x, model.unembed)[..., : model.config["unpadded_vocab_size"]]
+    x = hidden.astype(model.embed_tokens.weight.dtype)
+    if x.dtype == mx.bfloat16:
+        logits = affine_product(x, model.unembed, widen=True, one_row=True)
+    else:
+        logits = affine_product(x.astype(mx.float32), model.unembed, one_row=True)
+    logits = logits[..., : model.config["unpadded_vocab_size"]]
     return mx.tanh(logits / cap) * cap if cap else logits
 
 
 def row_stable_head(model, hidden):
     """The vocabulary head of a panel, every row equal to the one-row step's (pieces of at
     most 8 rows past 8, as ``row_stable_read``; a head stored as affine codes through lane L1's
-    row-stable launch, else one row at a time, counted)."""
+    row-stable launch at every width, one row included; where it refuses, MLX's product: the
+    one-row head itself, or a panel one row at a time, counted)."""
     rows = hidden.shape[1]
-    if rows > 1 and isinstance(model.unembed, AffineWeight):
+    if isinstance(model.unembed, AffineWeight):
         try:
             return affine_head(model, hidden)
         except RuntimeError:
             pass
+        if rows == 1:
+            count("fallback.head.packed_one_row")
+            return model.head(hidden)
         count("fallback.head.packed_rows")
         unembed = model.unembed
         key = ("head", rows, tuple(unembed.codes.shape), unembed.bits, unembed.group_size, str(hidden.dtype))

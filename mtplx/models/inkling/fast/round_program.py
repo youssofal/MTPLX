@@ -477,12 +477,16 @@ def propose(drafter, target, anchor, view: DraftView, count_: int, *, position, 
     if isinstance(target.unembed, AffineWeight):
         # A packed head (Bare Speed, Optimized Speed): lane L1's launch, one read of the codes for
         # all the proposal rows (MLX's 2-to-24-row product reads them per row block, 2.7 against
-        # 1.9 ms at 8 rows); fed float32, as the verify's head is. Where it refuses (a stored form
-        # it does not take, a failed first-use proof on this Mac), MLX's product, counted.
+        # 1.9 ms at 8 rows); fed float32, as the verify's head is (a bf16 row widened inside the
+        # launch: the same values, no cast launch). Where it refuses (a stored form it does not take,
+        # a failed first-use proof on this Mac), MLX's product, counted.
         from .qproduct import affine_product
 
         try:
-            base = affine_product(h.astype(mx.float32), target.unembed)[..., : drafter.vocab]
+            if h.dtype == mx.bfloat16:
+                base = affine_product(h, target.unembed, widen=True)[..., : drafter.vocab]
+            else:
+                base = affine_product(h.astype(mx.float32), target.unembed)[..., : drafter.vocab]
         except RuntimeError:
             count("fallback.draft_head.affine_launch_refused")
     if base is None:
