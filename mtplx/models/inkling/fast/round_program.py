@@ -24,11 +24,13 @@ nothing at temperature 0 (greedy tokens are the target's argmax) or under the se
 rule (which keeps the host path).
 
 What is an input (all arrays, in this order): the anchor (1,) int32; the absolute position
-of the first proposal (uint32); the request's seed words (2,) uint32; the drafter's rope
-offset (int32), its rings' newest slot and row count (uint32) and its last mixed feature;
-each drafter block's keys and values; then the step's inputs (``engine_site.state_inputs``).
-The temperatures, the proposal count, the lane set and the pack are in the key. Nothing is
-written in place: the outputs are the packet, the block of ids, the logits, the captures
+of the first proposal (uint32); the request's seed words (2,) uint32; the law parameters of
+the target rows and of the draft rows when that side samples (``round.law_params``: the
+temperatures are data, so one program serves every temperature); the drafter's rope offset
+(int32), its rings' newest slot and row count (uint32) and its last mixed feature; each
+drafter block's keys and values; then the step's inputs (``engine_site.state_inputs``).
+The proposal count, whether each side is greedy, the lane set and the pack are in the key.
+Nothing is written in place: the outputs are the packet, the block of ids, the logits, the captures
 and every visit's delta, and the caller commits the rows the host accepts (``rt.commit``)
 exactly as after a stock round.
 """
@@ -36,6 +38,7 @@ exactly as after a stock round.
 from __future__ import annotations
 
 import time
+from functools import lru_cache
 from typing import Any
 
 import mlx.core as mx
@@ -43,6 +46,7 @@ import mlx.nn as nn
 
 from mtplx.engine import runtime as engine_runtime
 from mtplx.engine import sites
+from mtplx.engine.site import room_for_check_copies
 
 from . import engine_site
 from . import round as fast_round
@@ -244,8 +248,10 @@ def _block(block, hidden, residual, view: DraftView, index: int):
 
 
 def propose(drafter, target, anchor, view: DraftView, count_: int, *, position, seed, temperature=1.0,
-            sample=True, cap=None):
-    """``fast.draft.propose`` on the fixed-layout drafter: (ids (count,) int32, DraftLaw)."""
+            sample=True, cap=None, params=None):
+    """``fast.draft.propose`` on the fixed-layout drafter: (ids (count,) int32, DraftLaw).
+    ``params`` (``round.law_params(1, temperature, cap)``) gives a sampled law's temperature
+    as data."""
     from ..model import linear
 
     if not 1 <= count_ < drafter.width:
@@ -289,7 +295,7 @@ def propose(drafter, target, anchor, view: DraftView, count_: int, *, position, 
         if greedy:
             law, st = fast_round.law_rows(scores, temperature=None, cap=0.0, write=True)
         else:
-            law, st = fast_round.law_rows(scores, temperature=temperature, cap=cap)
+            law, st = fast_round.law_rows(scores, temperature=temperature, cap=cap, params=params)
         token, lse = fast_round.sample_rows(law, st, positions=(start + fast_round._const(i, mx.uint32)).reshape(1), seed=seed,
                                             purpose=fast_round.PURPOSE_DRAFT, greedy=greedy)
         prev = token
@@ -306,30 +312,220 @@ def propose(drafter, target, anchor, view: DraftView, count_: int, *, position, 
 
 # ------------------------------------------------------------------------------- a round
 def round_function(rt, anchor, position, seed, view: DraftView, round_state, proposals: int, *,
-                   temperature: float, draft_temperature: float, stages):
+                   temperature: float, draft_temperature: float, stages, params=None, draft_params=None,
+                   stops=None, remaining=None):
     """The round as MLX builds it (lazy): [packet, ids (W,), logits, captures..., deltas...].
-    What the program records and what serves when no program is live."""
+    What the program records and what serves when no program is live. ``params`` and
+    ``draft_params`` carry the sampled temperatures as data (``round.law_params``).
+
+    With ``stops`` ((S,) int32, padded with -2) and ``remaining`` ((1,) int32) the round also
+    commits: [packet, ids, [kept, emitted] (2,) uint32, logits, captures..., deltas..., then
+    the state the commit wrote (per visit keys, values and four tails; per drafter block keys
+    and values; the drafter's last feature), then the old rows of every ring slot it wrote]."""
     model = rt.model
     ids, law = propose(rt.drafter, model, anchor, view, proposals, position=position, seed=seed,
-                       temperature=draft_temperature)
+                       temperature=draft_temperature, params=draft_params)
     block = mx.concatenate([anchor.astype(mx.int32).reshape(1), ids])
     logits, captures, deltas = decode_panel(model, block, round_state, stages=stages)
     packet = fast_round.decide(logits[0], ids, position=position, seed=seed,
-                               temperature=temperature, draft=law)
-    return [packet, block, *engine_site.flatten(logits, captures, deltas)]
+                               temperature=temperature, draft=law, params=params)
+    if stops is None:
+        return [packet, block, *engine_site.flatten(logits, captures, deltas)]
+    # The commit, inside the round: the loop's own walk over the packet (stops, the request's
+    # remaining budget), then the kept rows written into the state and observed by the drafter.
+    rows = proposals + 1
+    kept, emitted = fast_round.commit_count(packet, rows, stops=stops, remaining=remaining)
+    kept = mx.where(packet[1] == 0, kept, mx.zeros_like(kept))  # a row that is no law: nothing kept
+    target_new, target_undo = _commit_target(round_state, deltas, kept, rows)
+    draft_new, last, draft_undo = _observe_draft(rt.drafter, view, captures, kept, rows)
+    return [packet, block, mx.stack([kept, emitted]), *engine_site.flatten(logits, captures, deltas),
+            *target_new, *draft_new, last, *target_undo, *draft_undo]
+
+
+# --------------------------------------------------------------------- the commit inside
+_TAILS = """
+    uint gid = thread_position_in_grid.x;
+    const uint n0 = KEEP * W0, n1 = KEEP * W1, n2 = KEEP * W2, n3 = KEEP * W3;
+    if (gid >= n0 + n1 + n2 + n3) return;
+    const uint k = kept[0];
+    if (gid < n0) { uint r = gid / W0, c = gid % W0, s = r + k;
+        o0[gid] = s < KEEP ? t0[s * W0 + c] : p0[(s - KEEP) * W0 + c]; return; }
+    gid -= n0;
+    if (gid < n1) { uint r = gid / W1, c = gid % W1, s = r + k;
+        o1[gid] = s < KEEP ? t1[s * W1 + c] : p1[(s - KEEP) * W1 + c]; return; }
+    gid -= n1;
+    if (gid < n2) { uint r = gid / W2, c = gid % W2, s = r + k;
+        o2[gid] = s < KEEP ? t2[s * W2 + c] : p2[(s - KEEP) * W2 + c]; return; }
+    gid -= n2;
+    { uint r = gid / W3, c = gid % W3, s = r + k;
+        o3[gid] = s < KEEP ? t3[s * W3 + c] : p3[(s - KEEP) * W3 + c]; }
+"""
+
+# Per ring slot the round writes: the panel's row where it is kept, the slot's own row where
+# it is not (so a rejected row never touches state), and the slot's old row for an undo.
+_RING_ROWS = """
+    uint gid = thread_position_in_grid.x;
+    const uint per = HEADS * ROWS * DIM;
+    if (gid >= per) return;
+    uint d = gid % DIM, i = (gid / DIM) % ROWS, h = gid / (DIM * ROWS);
+    uint slot = (newest[0] + 1 + i) % SLOTS;
+    uint src = (h * SLOTS + slot) * DIM + d;
+    auto ok = old_k_in[src]; auto ov = old_v_in[src];
+    bool keep = i < kept[0];
+    upd_k[gid] = keep ? new_k[gid] : ok;
+    upd_v[gid] = keep ? new_v[gid] : ov;
+    old_k[gid] = ok;
+    old_v[gid] = ov;
+"""
+
+
+@lru_cache(maxsize=None)
+def _tails_kernel():
+    return mx.fast.metal_kernel(
+        name="mtplx_inkling_l7_tails",
+        input_names=["t0", "t1", "t2", "t3", "p0", "p1", "p2", "p3", "kept"],
+        output_names=["o0", "o1", "o2", "o3"],
+        source=_TAILS,
+    )
+
+
+@lru_cache(maxsize=None)
+def _ring_kernel():
+    return mx.fast.metal_kernel(
+        name="mtplx_inkling_l7_ring_rows",
+        input_names=["old_k_in", "old_v_in", "new_k", "new_v", "newest", "kept"],
+        output_names=["upd_k", "upd_v", "old_k", "old_v"],
+        source=_RING_ROWS,
+    )
+
+
+def _ring_slots(newest, slots: int, rows: int):
+    """Ring slots of the round's rows, (1, 1, rows, 1) int32 (index layout of put_along_axis)."""
+    i = fast_round._const(list(range(rows)), mx.uint32)
+    at = (newest.astype(mx.uint32).reshape(()) + fast_round._const(1, mx.uint32) + i) % fast_round._const(slots, mx.uint32)
+    return at.astype(mx.int32).reshape(1, 1, rows, 1)
+
+
+def _write_ring(ring_k, ring_v, new_k, new_v, newest, kept, at):
+    """The kept rows into a ring in place (``put_along_axis`` takes the ring's buffer once
+    nothing else holds it): (ring_k', ring_v', old_k, old_v)."""
+    heads, slots, dim = ring_k.shape[1], ring_k.shape[2], ring_k.shape[3]
+    rows = new_k.shape[2]
+    upd_k, upd_v, old_k, old_v = _ring_kernel()(
+        inputs=[ring_k, ring_v, new_k, new_v, newest.astype(mx.uint32).reshape(1), kept.reshape(1)],
+        template=[("HEADS", heads), ("ROWS", rows), ("DIM", dim), ("SLOTS", slots)],
+        grid=(heads * rows * dim, 1, 1),
+        threadgroup=(min(256, heads * rows * dim), 1, 1),
+        output_shapes=[new_k.shape, new_v.shape, new_k.shape, new_v.shape],
+        output_dtypes=[ring_k.dtype, ring_v.dtype, ring_k.dtype, ring_v.dtype],
+    )
+    index = mx.broadcast_to(at, new_k.shape)
+    return (mx.put_along_axis(ring_k, index, upd_k, axis=2), mx.put_along_axis(ring_v, index, upd_v, axis=2),
+            old_k, old_v)
+
+
+def _commit_target(st, deltas, kept, rows: int):
+    """``DecodeState.commit`` of ``kept`` rows (an array), as a function of the round's arrays.
+
+    Window rings: the kept rows at their slots, other slots unchanged (old rows kept for an
+    undo). Global banks: every row at the committed length (rows past ``kept`` lie past the
+    new length, where nothing reads them; the bank has room, ``serve`` grows it first).
+    Convolution tails: the last three rows of tail + kept rows. Same bytes as the stock commit.
+    Returns (per visit [keys, values, tail0..3], per window visit [old keys, old values])."""
+    at = _ring_slots(st.newest, st.window, rows)
+    start = st.pos.astype(mx.int32).reshape(1)
+    kept_u = kept.astype(mx.uint32)
+    new, undo = [], []
+    for visit, local in enumerate(st.local):
+        delta = deltas[visit]
+        if local:
+            keys, values, newest, _count = st.window_view(visit)
+            keys, values, old_k, old_v = _write_ring(keys, values, delta.keys, delta.values, newest, kept_u, at)
+            undo += [old_k, old_v]
+        else:
+            keys, values, _count = st.global_view(visit)
+            keys = mx.slice_update(keys, delta.keys, start, axes=(2,))
+            values = mx.slice_update(values, delta.values, start, axes=(2,))
+        tails = [st.tail(visit, slot) for slot in range(4)]
+        widths = [int(t.shape[-1]) for t in tails]
+        new_tails = _tails_kernel()(
+            inputs=[*tails, *delta.taps, kept_u.reshape(1)],
+            template=[("KEEP", int(tails[0].shape[1])), ("W0", widths[0]), ("W1", widths[1]), ("W2", widths[2]),
+                      ("W3", widths[3])],
+            grid=(int(tails[0].shape[1]) * sum(widths), 1, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[t.shape for t in tails],
+            output_dtypes=[t.dtype for t in tails],
+        )
+        new += [keys, values, *new_tails]
+    return new, undo
+
+
+def _observe_draft(drafter, view, captures, kept, rows: int):
+    """``Drafter.observe`` of the first ``kept`` capture rows, as a function of arrays.
+
+    Every row's context keys and values are projected (one product of ``rows`` rows) and the
+    kept ones written: a window block's ring at its slots, the global block's bank at the
+    committed length. The projection's row count can change the product's last bits against
+    a ``kept``-row product, so the drafter's history may differ from the stock observe in the
+    last place: it changes which tokens are proposed, never the output law (class B, as the
+    drafter of this program already is). The last mixed feature is the kept rows' last one,
+    the same bytes as the stock observe. Returns ([keys, values] per block, last, undo rows)."""
+    kept_u = kept.astype(mx.uint32)
+    at = _ring_slots(view.newest, max((w for w in view.windows if w), default=1), rows)
+    start = view.length.astype(mx.int32).reshape(1)
+    new, undo = [], []
+    for index, block in enumerate(drafter.blocks):
+        features = drafter.mix(captures, index, block.w["dflare_norm.weight"])
+        keys = block.normalize(block.heads(features, "k_ctx"), "self_attn.k_norm_ctx")
+        keys = block.rotate(keys, view.offset)
+        values = block.heads(features, "v_ctx")
+        ring_k, ring_v = view.keys[index], view.values[index]
+        if block.window:
+            ring_k, ring_v, old_k, old_v = _write_ring(ring_k, ring_v, keys.astype(ring_k.dtype),
+                                                      values.astype(ring_v.dtype), view.newest, kept_u, at)
+            undo += [old_k, old_v]
+        else:
+            ring_k = mx.slice_update(ring_k, keys.astype(ring_k.dtype), start, axes=(2,))
+            ring_v = mx.slice_update(ring_v, values.astype(ring_v.dtype), start, axes=(2,))
+        new += [ring_k, ring_v]
+    mixed = drafter.mix(captures, -1, drafter.markov["dflare_norm.weight"])
+    last_row = mx.maximum(kept.astype(mx.int32), fast_round._const(1, mx.int32)) - fast_round._const(1, mx.int32)
+    last = mx.take(mixed, last_row.reshape(1), axis=1)
+    last = mx.where(kept > 0, last, view.last)
+    return new, last, undo
 
 
 class Round:
-    """What one served round hands the generation loop (the same objects a stock round has)."""
+    """What one served round hands the generation loop (the same objects a stock round has).
 
-    __slots__ = ("block", "rows", "features", "pending", "packet", "native", "route")
+    A committing round (``serve(..., stops=..., remaining=...)``) has already written its
+    kept rows: ``committed`` is True, ``kept`` and ``emitted`` are the device's walk over the
+    packet, and the loop calls ``rewind(kept)`` only when its own walk keeps another count
+    (a cancellation, the opt-in repetition guard): the round's writes are undone and the
+    stock commit writes that count instead."""
 
-    def __init__(self, block, rows, features, pending, packet, native, route):
+    __slots__ = ("block", "rows", "features", "pending", "packet", "native", "route", "committed", "kept",
+                 "emitted", "_rewind")
+
+    def __init__(self, block, rows, features, pending, packet, native, route, committed=False, kept=None,
+                 emitted=None, rewind=None):
         self.block, self.rows, self.features, self.pending = block, rows, features, pending
         self.packet, self.native, self.route = packet, native, route
+        self.committed, self.kept, self.emitted, self._rewind = committed, kept, emitted, rewind
+
+    def rewind(self, kept: int) -> None:
+        """Undo this round's commit and commit ``kept`` rows the stock way (rare, counted)."""
+        if not self.committed:
+            raise ValueError("only a committing round can be rewound")
+        if kept != self.kept:
+            self._rewind(kept)
+            self.kept = kept
 
 
 _LAST: dict[str, Any] = {"route": None, "reason": None, "proposals": 0}
+#: Stop ids a committing round takes as data (padded with -2).
+MAX_STOPS = 16
 
 
 def last_route() -> dict[str, Any]:
@@ -346,8 +542,28 @@ def _decline(reason: str, proposals: int):
     return None
 
 
+def _view_from(drafter, arrays) -> DraftView:
+    """The drafter view of a round from its inputs (``draft_inputs``' order)."""
+    offset, newest, count_rows, length, last = arrays[:5]
+    rest = arrays[5:]
+    return DraftView(list(rest[0::2]), list(rest[1::2]), offset, newest, count_rows, length, last,
+                     [b.window for b in drafter.blocks])
+
+
+def _grow_bank(entry, need: int) -> None:
+    """A global drafter bank with room for ``need`` rows (whole ``BANK_STEP`` steps)."""
+    cap = round_up(need, BANK_STEP)
+    length = int(entry.offset)
+    shape = (entry.keys.shape[0], entry.keys.shape[1], cap, entry.keys.shape[3])
+    keys, values = mx.zeros(shape, entry.keys.dtype), mx.zeros(shape, entry.values.dtype)
+    keys[:, :, :length, :] = entry.keys[:, :, :length, :]
+    values[:, :, :length, :] = entry.values[:, :, :length, :]
+    mx.eval(keys, values)
+    entry.keys, entry.values = keys, values
+
+
 def serve(rt, anchor, cache, proposals: int, *, position, seed, temperature, draft_temperature,
-          stages=None, spec=None, state=None):
+          stages=None, spec=None, state=None, stops=None, remaining=None):
     """One DSpark round (proposals, verify, decision): a ``Round``, or None (counted) when
     the stock round must serve it, with nothing changed.
 
@@ -356,11 +572,16 @@ def serve(rt, anchor, cache, proposals: int, *, position, seed, temperature, dra
     ``temperature`` the target's and ``draft_temperature`` the drafter's (0: greedy).
     The caller reads ``Round.packet`` (``fast.round.read_packet``), walks it as for a stock
     round and commits with ``rt.commit(cache, Round.features, Round.pending, kept, W)``.
+
+    With ``stops`` (the request's stop ids) and ``remaining`` (tokens it may still emit) the
+    round also commits, inside the same program: the loop then skips ``rt.commit`` and calls
+    ``Round.rewind(kept)`` only if its own walk keeps a count other than ``Round.kept``.
     """
     from .decoder import FastPending, fast_mode, stage_spec
     from .step import stages_for
 
     k = int(proposals)
+    commit = stops is not None
     if fast_mode() in ("off", "0", "stock", "reference"):
         return _decline("fast_off", k)
     if engine_runtime.mode() == "0":
@@ -369,6 +590,12 @@ def serve(rt, anchor, cache, proposals: int, *, position, seed, temperature, dra
         return _decline("no_drafter", k)
     if not 1 <= k <= MAX_PROPOSALS:
         return _decline("proposals", k)
+    if commit:
+        stop_ids = [int(t) for t in stops]
+        if len(stop_ids) > MAX_STOPS:
+            return _decline("stops", k)
+        if remaining is None or int(remaining) < 1:
+            return _decline("remaining", k)
     decoder = rt.fast
     if spec is None:
         spec = stage_spec() if mx.default_device() == mx.gpu and mx.metal.is_available() else ""
@@ -386,48 +613,203 @@ def serve(rt, anchor, cache, proposals: int, *, position, seed, temperature, dra
     if state is None:
         state = DecodeState(rt.model, cache[: rt.trunk_entries])
         state.prepare()
+    model, drafter = rt.model, rt.drafter
+    dcache = cache[rt.trunk_entries :]
+    rows = k + 1
+    if commit:
+        # Room for the round's rows in every global bank before the round (the stock commit
+        # grows after it): a growth is a new capacity step, so a new program, as for the step.
+        for visit, local in enumerate(state.local):
+            kv = state.cache[2 * visit]
+            if not local and state.length + rows > kv.keys.shape[2]:
+                state._grow(kv, state.length + rows)
     round_state, target_inputs = engine_site.state_inputs(state)
     if round_state is None:
         return _decline(target_inputs, k)
-    view, draft_in = draft_inputs(rt.drafter, cache[rt.trunk_entries :], state.length)
+    view, draft_in = draft_inputs(drafter, dcache, state.length)
     if view is None:
         return _decline(draft_in, k)
-    model = rt.model
+    if commit:
+        grown = False
+        for i, block in enumerate(drafter.blocks):
+            entry = dcache[i]
+            if not block.window and state.length + rows > entry.keys.shape[2]:
+                _grow_bank(entry, state.length + rows)
+                grown = True
+        if grown:
+            view, draft_in = draft_inputs(drafter, dcache, state.length)
     anchor_a = mx.array([int(anchor)], mx.int32)
     position_a = mx.array(int(position), mx.uint32)
     seed_a = fast_round._seed_words(seed)
-    inputs = [anchor_a, position_a, seed_a, *draft_in, *target_inputs]
-    del target_inputs, draft_in
     t_target, t_draft = float(temperature or 0.0), float(draft_temperature or 0.0)
-    geometry = ("round", k, t_target, t_draft, spec, tuple(model.capture_ids), engine_site.identity(rt))
+    greedy, draft_greedy = t_target <= 0, t_draft <= 0
+    cap = model.config.get("final_logit_softcapping") or 0.0
+    # The temperatures are data: one program per greedy/sampled pair serves every temperature.
+    params_a = None if greedy else fast_round.law_params(k + 1, t_target)
+    draft_params_a = None if draft_greedy else fast_round.law_params(1, t_draft, cap)
+    head = [anchor_a, position_a, seed_a, *(a for a in (params_a, draft_params_a) if a is not None)]
+    stops_a = remaining_a = None
+    if commit:
+        stops_a = mx.array(stop_ids + [-2] * (MAX_STOPS - len(stop_ids)), mx.int32)
+        remaining_a = mx.array([int(remaining)], mx.int32)
+        head += [stops_a, remaining_a]
+    first_draft = len(head)
+    inputs = [*head, *draft_in, *target_inputs]
+    first_target = first_draft + len(draft_in)
+    n_draft = len(draft_in)
+    del target_inputs, draft_in, head
+    geometry = ("round", k, "greedy" if greedy else "sampled", "greedy" if draft_greedy else "sampled",
+                "commit" if commit else "decide", spec, tuple(model.capture_ids), engine_site.identity(rt))
+    n_cap = len(model.capture_ids)
+    visits = len(state.local)
+    windows = None
+    before = None
+    if commit:
+        # Nothing but the cache containers and ``inputs`` may hold an array the program writes:
+        # the engine writes it in place, and MLX takes its buffer when recording.
+        del view
+        # The banks the round writes only its own rows of, checked in place (the rings are
+        # read before they are written, so their checks run on private copies).
+        out_state = 3 + 1 + n_cap + 6 * visits
+        out_draft = out_state + 6 * visits
+        windows = []
+        for visit, local in enumerate(state.local):
+            if not local:
+                at = first_target + 3 + 6 * visit
+                windows += [(at, 2, first_target, rows, out_state + 6 * visit),
+                            (at + 1, 2, first_target, rows, out_state + 6 * visit + 1)]
+        for i, block in enumerate(drafter.blocks):
+            if not block.window:
+                at = first_draft + 5 + 2 * i
+                windows += [(at, 2, first_draft + 3, rows, out_draft + 2 * i),
+                            (at + 1, 2, first_draft + 3, rows, out_draft + 2 * i + 1)]
+        # What a rewind needs: the counters and tails the round starts from.
+        before = {
+            "length": state.length,
+            "target_idx": [state.cache[2 * v]._idx if local else None for v, local in enumerate(state.local)],
+            "tails": [list(state.cache[2 * v + 1].cache) for v in range(visits)],
+            "draft_idx": [dcache[i]._idx if b.window else None for i, b in enumerate(drafter.blocks)],
+            "draft_last": dcache[len(drafter.blocks)][0],
+            "newest": int((state.cache[2 * state.local.index(True)]._idx - 1) % state.window)
+            if True in state.local else 0,
+            "draft_newest": None,
+        }
+        for i, b in enumerate(drafter.blocks):
+            if b.window:
+                before["draft_newest"] = int((dcache[i]._idx - 1) % b.window)
+                break
 
-    def mlx_round():
-        return round_function(rt, anchor_a, position_a, seed_a, view, round_state, k,
-                              temperature=t_target, draft_temperature=t_draft, stages=stages)
+    def run_mlx(arrays):
+        view_ = _view_from(drafter, arrays[first_draft:first_draft + n_draft])
+        return round_function(rt, anchor_a, position_a, seed_a, view_, round_state, k,
+                              temperature=t_target, draft_temperature=t_draft, stages=stages,
+                              params=params_a, draft_params=draft_params_a, stops=stops_a, remaining=remaining_a)
+
+    def install(outputs):
+        base = 3 + 1 + n_cap + 6 * visits
+        for visit in range(visits):
+            kv, conv = state.cache[2 * visit], state.cache[2 * visit + 1]
+            kv.keys, kv.values = outputs[base + 6 * visit], outputs[base + 6 * visit + 1]
+            for slot in range(4):
+                conv[slot] = outputs[base + 6 * visit + 2 + slot]
+        base += 6 * visits
+        for i in range(len(drafter.blocks)):
+            dcache[i].keys, dcache[i].values = outputs[base + 2 * i], outputs[base + 2 * i + 1]
+        dcache[len(drafter.blocks)][0] = outputs[base + 2 * len(drafter.blocks)]
 
     started = time.perf_counter()
     if not replay.plan(geometry, family=geometry):
         why = replay.last_decline or "declined"
-        outputs = mlx_round()
+        outputs = run_mlx(inputs)
+        if commit:
+            install(outputs)
+            inputs = None
+            mx.eval(outputs)
         native, route = False, ("mlx", why)
     else:
-        ticket = replay.begin(geometry, inputs, planned=True, started=started)
+        extra = {"extra_refs": 1, "admit": room_for_check_copies, "windows": windows} if commit else {}
+        ticket = replay.begin(geometry, inputs, planned=True, started=started, **extra)
         if ticket.native:
             outputs = ticket.outputs
+            if commit:
+                install(outputs)
+                inputs = None
             ticket.finish(outputs)
             native, route = True, ("native", None)
         else:
-            outputs = mlx_round()
+            outputs = run_mlx(inputs)
+            if commit:
+                # Every container holds the round's outputs before anything is evaluated, so
+                # the graph is the last holder of each written input and MLX writes in place.
+                install(outputs)
+                inputs = None
+                mx.eval(outputs)
             ticket.finish(outputs)
             why = ticket.reason or ticket.kind
             native = False
             route = ({"record": "recording", "verify": "verifying"}.get(ticket.kind, "mlx"), why)
-    del inputs
+    inputs = None
     packet, block = outputs[0], outputs[1]
-    logits, captures, deltas = engine_site.unflatten(outputs[2:], len(model.capture_ids))
+    offset = 3 if commit else 2
+    logits, captures, deltas = engine_site.unflatten(outputs[offset : offset + 1 + n_cap + 6 * visits], n_cap)
     count(f"round.native.k{k}" if native else f"round.mlx.{route[1]}")
     _note(route[0], route[1], k)
-    return Round(block, logits[0], captures, FastPending(state, deltas, k + 1), packet, native, route[0])
+    pending = FastPending(state, deltas, rows)
+    if not commit:
+        return Round(block, logits[0], captures, pending, packet, native, route[0])
+    import numpy as np
+
+    kept, emitted = (int(v) for v in np.asarray(outputs[2]).tolist())
+    length = before["length"]
+    for visit, local in enumerate(state.local):
+        kv = state.cache[2 * visit]
+        if local:
+            kv._idx = (before["target_idx"][visit] + kept - 1) % state.window + 1 if kept else kv._idx
+        kv.offset = length + kept
+    for i, b in enumerate(drafter.blocks):
+        entry = dcache[i]
+        if b.window and kept:
+            entry._idx = (before["draft_idx"][i] + kept - 1) % b.window + 1
+        entry.offset = length + kept
+    undo = outputs[3 + 1 + n_cap + 6 * visits + 6 * visits + 2 * len(drafter.blocks) + 1:]
+    count("round.commit")
+
+    def rewind(kept_host):
+        count("round.rewind")
+        devices = kept
+        windows_t = [v for v, local in enumerate(state.local) if local]
+        for j, visit in enumerate(windows_t):
+            kv = state.cache[2 * visit]
+            old_k, old_v = undo[2 * j], undo[2 * j + 1]
+            for i in range(devices):
+                slot = (before["newest"] + 1 + i) % state.window
+                kv.keys[:, :, slot : slot + 1, :] = old_k[:, :, i : i + 1, :]
+                kv.values[:, :, slot : slot + 1, :] = old_v[:, :, i : i + 1, :]
+            kv._idx = before["target_idx"][visit]
+        for visit in range(visits):
+            state.cache[2 * visit].offset = length
+            conv = state.cache[2 * visit + 1]
+            for slot in range(4):
+                conv[slot] = before["tails"][visit][slot]
+        draft_undo = undo[2 * len(windows_t):]
+        j = 0
+        for i, b in enumerate(drafter.blocks):
+            entry = dcache[i]
+            if b.window:
+                old_k, old_v = draft_undo[2 * j], draft_undo[2 * j + 1]
+                for r in range(devices):
+                    slot = (before["draft_newest"] + 1 + r) % b.window
+                    entry.keys[:, :, slot : slot + 1, :] = old_k[:, :, r : r + 1, :]
+                    entry.values[:, :, slot : slot + 1, :] = old_v[:, :, r : r + 1, :]
+                entry._idx = before["draft_idx"][i]
+                j += 1
+            entry.offset = length
+        dcache[len(drafter.blocks)][0] = before["draft_last"]
+        mx.eval([c.state for c in cache])
+        rt.commit(cache, captures, FastPending(state, deltas, rows), kept_host, rows)
+
+    return Round(block, logits[0], captures, pending, packet, native, route[0], committed=True, kept=kept,
+                 emitted=emitted, rewind=rewind)
 
 
 # ------------------------------------------------------------------------------- warm-up

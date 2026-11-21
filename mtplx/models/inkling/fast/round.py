@@ -465,19 +465,31 @@ def _kernel(name):
     raise KeyError(name)
 
 
-def law_rows(scores, *, temperature=1.0, cap=0.0, write=None):
+def law_params(rows, temperature=1.0, cap=0.0):
+    """The per-row law parameters ``law_rows`` keeps for ``temperature`` and ``cap``, as a
+    fresh array: an input of a recorded round, so one program serves every temperature."""
+    scale = 1.0 if not temperature or temperature <= 0 else 1.0 / float(temperature)
+    return mx.array([v for _ in range(rows) for v in (scale, float(cap or 0.0))], mx.float32)
+
+
+def law_rows(scores, *, temperature=1.0, cap=0.0, write=None, params=None):
     """Law rows ``y = cap(scores) / temperature`` (float32) and their chunk stats.
 
     ``scores`` is ``(R, V)`` in any float dtype. When no transform is needed and the input
-    is already float32 the input itself is the law row (no copy).
+    is already float32 the input itself is the law row (no copy). ``params`` (from
+    ``law_params``) replaces ``temperature`` and ``cap`` with an array read at run time; the
+    law is then always written (at scale 1 and no cap the written row equals the input).
     """
     if scores.ndim != 2:
         raise ValueError("law_rows takes (rows, vocabulary)")
     rows, vocab = scores.shape
-    scale = 1.0 if not temperature or temperature <= 0 else 1.0 / float(temperature)
-    if write is None:
-        write = not (scale == 1.0 and not cap and scores.dtype == mx.float32)
-    params = _const([v for _ in range(rows) for v in (scale, float(cap or 0.0))], mx.float32)
+    if params is not None:
+        write = True if write is None else write
+    else:
+        scale = 1.0 if not temperature or temperature <= 0 else 1.0 / float(temperature)
+        if write is None:
+            write = not (scale == 1.0 and not cap and scores.dtype == mx.float32)
+        params = _const([v for _ in range(rows) for v in (scale, float(cap or 0.0))], mx.float32)
     sizes = _const([vocab, _chunks(vocab)], mx.uint32)
     law, stats = _kernel("stats")(
         inputs=[scores, params, sizes],
@@ -531,7 +543,7 @@ def race(tlaw, tstats, *, modes, positions, seed, purpose, greedy=False, dlaw=No
 
 
 def decide(target_logits, proposals, *, position, seed, temperature=1.0, draft=None,
-           greedy=None, rule="ratio", offered=None):
+           greedy=None, rule="ratio", offered=None, params=None):
     """Decide one verify panel on the GPU and return the int32 packet (lazy).
 
     ``target_logits`` (W, V) are the verify rows as the head returns them (soft cap
@@ -544,7 +556,8 @@ def decide(target_logits, proposals, *, position, seed, temperature=1.0, draft=N
     It lets a fixed-width panel carry a depth chosen on the device (``draft.choose_depth``).
     ``rule`` "match" is the seed-match rule on the device: every row draws its own token
     from p and a proposal survives only on equality (the law RC6's target_prefix keeps;
-    the random numbers are this module's, not RC6's NumPy stream).
+    the random numbers are this module's, not RC6's NumPy stream). ``params`` (from
+    ``law_params(W, temperature)``) gives the target law's temperature as an array.
     """
     if rule not in ("ratio", "match"):
         raise ValueError(f"unknown acceptance rule {rule!r}")
@@ -555,7 +568,8 @@ def decide(target_logits, proposals, *, position, seed, temperature=1.0, draft=N
     if rows != k + 1 or not 1 <= rows <= MAX_ROWS:
         raise ValueError(f"a panel of {rows} rows needs {rows - 1} proposals (at most {MAX_ROWS})")
     greedy = (not temperature or temperature <= 0) if greedy is None else greedy
-    tlaw, tstats = law_rows(target_logits, temperature=None if greedy else temperature)
+    tlaw, tstats = law_rows(target_logits, temperature=None if greedy else temperature,
+                            params=None if greedy else params)
     match = rule == "match" and not greedy
     point = draft is None or draft.point_mass or match
     mode = MODE_TARGET if match else (MODE_POINT if point else MODE_RESIDUAL)
