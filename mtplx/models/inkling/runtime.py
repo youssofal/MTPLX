@@ -31,14 +31,25 @@ def make_weights_resident(model, drafter):
     mx.eval(model.parameters(), drafter.parameters() if drafter is not None else {})
 
 
-def engine_pool_price(measured, wide_panels):
+def widest_panel(model):
+    """The widest verify panel the fast step will be asked for: a copy round's block (the copy
+    lane's cap, 24 tokens by default) plus its anchor, up to ``MAX_PANEL``, where wide panels are
+    exact on this pack; else warm-up's widest."""
+    if not wide_rows_exact(model, stage_spec()):
+        return engine_site.MAX_WARM_WIDTH
+    from mtplx import context_copy
+
+    return max(engine_site.MAX_WARM_WIDTH, min(MAX_PANEL, context_copy.context_copy_block_k() + 1))
+
+
+def engine_pool_price(measured, widest):
     """The engine pool a request is priced at. One pool serves every program's temporaries and
-    grows to the widest program served: warm-up's widest is ``MAX_WARM_WIDTH`` rows, and with
-    wide copy panels on a copy round records up to ``MAX_PANEL`` rows (measured on the native
-    pack: 81 MB after warm-up, 231 MB once a 25-row copy round had recorded), so the pool is
-    priced at the widest panel, scaled by rows from the measured one."""
+    grows to the widest program served: warm-up's widest is ``MAX_WARM_WIDTH`` rows, and a copy
+    round records up to ``widest`` (measured on the native pack: 81 MB after warm-up, 231 MB
+    once a 25-row copy round had recorded), so the pool is priced at the widest panel, scaled by
+    rows from the measured one."""
     measured = int(measured or 0)
-    return measured * MAX_PANEL // engine_site.MAX_WARM_WIDTH if wide_panels else measured
+    return measured * max(int(widest), engine_site.MAX_WARM_WIDTH) // engine_site.MAX_WARM_WIDTH
 
 
 class InklingRuntime(MTPLXRuntime):
@@ -81,8 +92,7 @@ class InklingRuntime(MTPLXRuntime):
             # The executor's pool after warm-up (one pool serves every width's temporaries).
             executor = engine_site.health().get("executor") or {}
             self.engine_pool_bytes = int(executor.get("pool_bytes") or 0)
-            self.engine_pool_bound = engine_pool_price(self.engine_pool_bytes,
-                                                       wide_rows_exact(model, stage_spec()))
+            self.engine_pool_bound = engine_pool_price(self.engine_pool_bytes, widest_panel(model))
             if self.drafter is not None:
                 try:
                     self.round_cost_ms, self.round_cost_detail = round_costs(self)

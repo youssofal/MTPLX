@@ -120,19 +120,29 @@ def test_a_short_prompt_is_priced_at_the_decode_layout_not_its_prompt_windows():
 
 
 def test_the_engine_pool_is_priced_at_the_widest_copy_panel():
-    """Warm-up records programs up to 8 rows; a copy round on the fast step records up to 32,
-    and the one pool grows to the widest program (81 MB after warm-up, 231 MB after a 25-row
-    copy round on the native pack). With wide panels on, the price scales the measured pool
-    by rows to 32; without them it is the measured pool."""
-    from mtplx.models.inkling.runtime import engine_pool_price
+    """Warm-up records programs up to 8 rows; a copy round on the fast step records up to its
+    block cap plus the anchor (25 rows by default), and the one pool grows to the widest program
+    (81 MB after warm-up, 231 MB after a 25-row copy round on the native pack). The price scales
+    the measured pool by rows to the widest panel; never below the measured pool."""
+    import mtplx.models.inkling.runtime as runtime_module
+    from mtplx.models.inkling.runtime import engine_pool_price, widest_panel
 
     mb = 1 << 20
-    assert engine_pool_price(81 * mb, True) == 324 * mb >= 231 * mb
-    assert engine_pool_price(81 * mb, False) == 81 * mb
-    assert engine_pool_price(None, True) == 0
+    assert engine_pool_price(81 * mb, 25) == 81 * mb * 25 // 8 >= 231 * mb
+    assert engine_pool_price(81 * mb, 8) == engine_pool_price(81 * mb, 1) == 81 * mb
+    assert engine_pool_price(None, 25) == 0
     rt, row = _decode_runtime(pool_bytes=81 * mb)
-    rt.engine_pool_bound = engine_pool_price(rt.engine_pool_bytes, True)
-    assert InklingRuntime.window_cache_bytes(rt) == 1024 * 40 * row + 8 * 4096 * row + 324 * mb
+    rt.engine_pool_bound = engine_pool_price(rt.engine_pool_bytes, 25)
+    assert InklingRuntime.window_cache_bytes(rt) == 1024 * 40 * row + 8 * 4096 * row + 81 * mb * 25 // 8
+    # The widest panel: the copy cap plus its anchor where wide panels are exact, else 8.
+    original = runtime_module.wide_rows_exact
+    try:
+        runtime_module.wide_rows_exact = lambda model, spec: True
+        assert widest_panel(None) == 25
+        runtime_module.wide_rows_exact = lambda model, spec: False
+        assert widest_panel(None) == 8
+    finally:
+        runtime_module.wide_rows_exact = original
 
 
 def test_load_makes_target_and_drafter_weights_resident_but_not_the_vision_tower(monkeypatch):
