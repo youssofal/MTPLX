@@ -27,9 +27,12 @@ PROMPT_FAST_PARTS = ("chunk", "experts", "invariant")
 
 
 def prompt_fast(part):
-    """Whether the prompt read's fast route serves ``part`` (read per call)."""
+    """Whether the prompt read's fast route serves ``part`` (read per call). Unset, the read width (``chunk``)
+    is on (its class accepted on 21 November, with its accuracy table) and the other parts are off."""
     raw = os.environ.get(PROMPT_FAST_ENV, "").strip().lower()
-    if raw in ("", "0", "off", "no", "false"):
+    if not raw:
+        return part == "chunk"
+    if raw in ("0", "off", "no", "false"):
         return False
     if raw in ("1", "on", "yes", "true", "all"):
         return True
@@ -58,10 +61,10 @@ WIDE_PROMPT_TOKENS = 18_432
 WIDE_HEADROOM_BYTES = 12 * 1024**3
 
 #: With the one-launch prompt attention on (``fast/prompt_flash.py``, ``MTPLX_INKLING_PROMPT_FLASH``, lane P2) a
-#: call computes only the keys its rows may see and writes no bias or mask plane: the width is 4,096 rows and the
-#: prompt fence does not apply (the forward's own memory, 2.8 to 2.9 GB in process at 4,096 rows, is priced by
-#: the admission like any width).
-WIDE_ROWS_FLASH = 4096
+#: call computes only the keys its rows may see and writes no bias or mask plane: the prompt fence does not apply
+#: (the forward's own memory is priced by the admission like any width). 2,048 rows until 4,096 is measured faster
+#: with that attention (with today's it was slower: `lanes/p1/sheet-oq-4k-2.json`).
+WIDE_ROWS_FLASH = 2048
 
 #: The prompt read hands its work to the GPU without waiting inside a forward (``MTPLX_INKLING_PROMPT_SYNC=1`` restores
 #: the waits): a prompt call's query tiles go over as they are built with at most ``TILES_IN_FLIGHT`` unfinished, and

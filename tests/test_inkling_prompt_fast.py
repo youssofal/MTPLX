@@ -1,14 +1,16 @@
-"""The prompt read's fast route switch (`MTPLX_INKLING_PROMPT_FAST`, off by default): which parts it
-serves, and the chunk width the runtime gives a prompt read with and without it."""
+"""The prompt read's fast route switch (`MTPLX_INKLING_PROMPT_FAST`; unset, only the width is on): which parts
+it serves, and the chunk width the runtime gives a prompt read with and without it."""
 
 from mtplx.models.inkling.fast.prompt_route import PROMPT_FAST_ENV, prompt_fast
 from mtplx.models.inkling.runtime import InklingRuntime
 
 
-def test_the_switch_is_off_unless_set_and_serves_only_the_parts_it_names(monkeypatch):
+def test_unset_only_the_width_is_on_and_the_switch_serves_only_the_parts_it_names(monkeypatch):
     monkeypatch.delenv(PROMPT_FAST_ENV, raising=False)
-    assert not prompt_fast("chunk") and not prompt_fast("experts")
-    for off in ("", "0", "off", "no", "false", " Off "):
+    assert prompt_fast("chunk") and not prompt_fast("experts") and not prompt_fast("invariant")
+    monkeypatch.setenv(PROMPT_FAST_ENV, "")
+    assert prompt_fast("chunk") and not prompt_fast("experts")
+    for off in ("0", "off", "no", "false", " Off "):
         monkeypatch.setenv(PROMPT_FAST_ENV, off)
         assert not prompt_fast("chunk") and not prompt_fast("experts")
     for on in ("1", "on", "yes", "true", "all", "ON"):
@@ -57,7 +59,10 @@ def test_the_headroom_is_read_once_a_process(monkeypatch):
     monkeypatch.setattr(PR, "_headroom", {})
     first = PR.gpu_headroom_bytes()
     assert PR.gpu_headroom_bytes() == first
+    monkeypatch.setenv(PROMPT_FAST_ENV, "off")
     assert PR.wide_rows(4_000, headroom_bytes=PR.WIDE_HEADROOM_BYTES) is None  # switch off
+    monkeypatch.delenv(PROMPT_FAST_ENV, raising=False)                        # unset: the width is on
+    assert PR.wide_rows(4_000, headroom_bytes=PR.WIDE_HEADROOM_BYTES) == 2048
     monkeypatch.setenv(PROMPT_FAST_ENV, "chunk")
     assert PR.wide_rows(4_000, headroom_bytes=PR.WIDE_HEADROOM_BYTES) == 2048
     assert PR.wide_rows(4_000, headroom_bytes=PR.WIDE_HEADROOM_BYTES - 1) is None
@@ -103,8 +108,8 @@ def test_with_the_one_launch_attention_the_width_is_4096_and_the_fence_lifts(mon
     monkeypatch.delenv("MTPLX_INKLING_PROMPT_FLASH", raising=False)   # on by default
     long_prompt = max(F.SHORT_PROMPT, 4_000)
     assert PR.flash_attention_on() and PR.flash_attention_on(long_prompt)
-    assert PR.wide_rows(long_prompt) == PR.WIDE_ROWS_FLASH == 4096
-    assert PR.wide_rows(PR.WIDE_PROMPT_TOKENS * 4) == 4096
+    assert PR.wide_rows(long_prompt) == PR.WIDE_ROWS_FLASH
+    assert PR.wide_rows(PR.WIDE_PROMPT_TOKENS * 4) == PR.WIDE_ROWS_FLASH  # no fence
     # a prompt below the crossover reads on the stock attention: its width and fence
     if F.SHORT_PROMPT > 1:
         assert not PR.flash_attention_on(F.SHORT_PROMPT - 1) and PR.wide_rows(F.SHORT_PROMPT - 1) == 2048

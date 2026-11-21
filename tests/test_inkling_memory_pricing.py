@@ -36,8 +36,9 @@ def test_a_chunked_prompt_read_is_512_rows_unless_a_width_is_named(monkeypatch):
     from mtplx.generation import prefill_chunk_size_override, prefill_forward_widths
     from mtplx.server.openai import _admission_narrow_widths, _served_prefill_chunk_auto
 
-    for name in ("MTPLX_PREFILL_CHUNK_SIZE_DENSE", "MTPLX_PREFILL_CHUNK_SIZE_REPAGE", "MTPLX_INKLING_PROMPT_FAST"):
+    for name in ("MTPLX_PREFILL_CHUNK_SIZE_DENSE", "MTPLX_PREFILL_CHUNK_SIZE_REPAGE"):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_FAST", "off")  # the read's own width rule (on by default): its tests
     monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "auto")  # what every profile stamps
     rt = object.__new__(InklingRuntime)
@@ -59,9 +60,26 @@ def test_a_chunked_prompt_read_is_512_rows_unless_a_width_is_named(monkeypatch):
     assert prefill_forward_widths(rt, 30_000, None) == [None]
 
 
+def test_unset_the_read_width_is_2048_rows_on_a_mac_with_the_headroom_and_512_without(monkeypatch):
+    from mtplx.generation import prefill_forward_widths
+    from mtplx.models.inkling.fast import prompt_route as PR
+
+    for name in ("MTPLX_PREFILL_CHUNK_SIZE_DENSE", "MTPLX_PREFILL_CHUNK_SIZE_REPAGE", "MTPLX_INKLING_PROMPT_FAST"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "auto")
+    rt = object.__new__(InklingRuntime)
+    monkeypatch.setattr(PR, "_headroom", {"bytes": 64 * 1024**3})
+    assert rt.prompt_chunk_rows(30_000) == 2048
+    assert prefill_forward_widths(rt, 30_000, None) == [2048]   # the admission prices the width the read takes
+    monkeypatch.setattr(PR, "_headroom", {"bytes": PR.WIDE_HEADROOM_BYTES - 1})
+    assert rt.prompt_chunk_rows(30_000) == 512                  # a Mac without the headroom keeps 512 rows
+
+
 def test_the_request_wrapper_installs_the_models_width_and_keeps_a_named_one(monkeypatch):
     from mtplx import generation
 
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_FAST", "off")  # the 512-row width, as the model gives it
     monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "auto")
     for name in ("MTPLX_PREFILL_CHUNK_SIZE_DENSE", "MTPLX_PREFILL_CHUNK_SIZE_REPAGE"):
