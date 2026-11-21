@@ -4185,7 +4185,12 @@ class ServerState:
             # Its block drafter keeps one growing KV. Each sliding visit keeps its own ring.
             draft = self.runtime.draft_footprint
             _plan_inputs["aux_bytes_per_token"] = draft.full_bytes_per_token if draft else 0
-            _plan_inputs["fixed_cache_bytes"] = self.runtime.window_cache_bytes()
+            # The window's own fixed part: without the banks' rounding, which a request inside a window
+            # of whole bank steps never adds (``InklingRuntime.plan_fixed_bytes``).
+            _plan_fixed = getattr(self.runtime, "plan_fixed_bytes", None)
+            _plan_inputs["fixed_cache_bytes"] = int(
+                _plan_fixed() if callable(_plan_fixed) else self.runtime.window_cache_bytes()
+            )
             _plan_inputs["attention_kv_copy_bytes_per_token"] = self.runtime.attention_kv_copy_bytes_per_token()
             _plan_inputs["kv_quantization"] = "off"
             # Its measured prefill working set is its runtime reserve (not the flat 3 GiB), and
@@ -22664,20 +22669,24 @@ class _AdmissionGeometry:
 
 def _family_reserve_inputs(runtime: Any, plan_inputs: dict[str, Any], plan_fn: Callable[..., Any]) -> None:
     """The runtime reserve of a family that measured its own prefill working set (Inkling 2 Mini):
-    its forward plus the restore checkpoints its reads keep. Two where memory sets its window, on a
-    tight Mac or one with little engine budget above the weights (``keeps_few_checkpoints`` reads
-    the plan made with eight: the budget and the weights do not depend on the reserve), eight
-    elsewhere. A runtime without the hook keeps the inputs as they are."""
+    its forward plus the restore checkpoints its reads keep. One under the tight rule; two where
+    memory sets its window above it, on a Mac with little engine budget above the weights
+    (``keeps_few_checkpoints`` reads the plan made with eight: the budget and the weights do not
+    depend on the reserve); eight elsewhere. A runtime without the hook keeps the inputs as they are."""
 
     working = getattr(runtime, "prefill_working_bytes", None)
     if not callable(working):
         return
     plan_inputs["runtime_transients_bytes"] = int(working())
-    plan_inputs["tight_runtime_transients_bytes"] = int(working(few=True))
+    # Under the tight rule the reads keep the fewest checkpoints (``checkpoints_kept``).
+    plan_inputs["tight_runtime_transients_bytes"] = int(working(few=True, tight=True))
     plan_inputs["tight_machine_measured"] = True
+    window = getattr(runtime, "TIGHT_WINDOW_TOKENS", None)
+    if window:
+        plan_inputs["tight_window_tokens"] = int(window)
     few = getattr(runtime, "keeps_few_checkpoints", None)
     if callable(few) and few(plan_fn(**plan_inputs)):
-        plan_inputs["runtime_transients_bytes"] = plan_inputs["tight_runtime_transients_bytes"]
+        plan_inputs["runtime_transients_bytes"] = int(working(few=True))
 
 
 def _admission_geometry(state: Any, prefill_width: int | None = None) -> _AdmissionGeometry:
@@ -23012,9 +23021,11 @@ def _admission_scratch_bytes(
     if callable(working_fn):
         # A family that measured its own prefill working set (Inkling 2 Mini) is charged it, with
         # the restore checkpoints its reads keep under this plan (two where memory sets the window).
+        plan = getattr(state, "memory_plan", None)
         few_fn = getattr(runtime, "keeps_few_checkpoints", None)
-        few = bool(few_fn(getattr(state, "memory_plan", None))) if callable(few_fn) else False
-        return max(1, int(working_fn(rows, few=few))), "runtime_measured"
+        few = bool(few_fn(plan)) if callable(few_fn) else False
+        tight = few and bool(getattr(plan, "tight_machine", False))
+        return max(1, int(working_fn(rows, few=few, tight=tight))), "runtime_measured"
     flat = int(geometry.flat_transient_bytes)
     flat_share = max(1, flat * rows // _ADMISSION_FLAT_TRANSIENT_ROWS)
     # A backend whose attention grows with the square of one forward's rows
@@ -23069,6 +23080,22 @@ def _admission_context_transient_per_token(
         max(0, int(geometry.context_transient_bytes_per_token))
         * max(1, int(rows))
         // _ADMISSION_PLANNER_TRANSIENT_ROWS
+    )
+
+
+def _lease_continuation_copies(runtime: Any, reused_mode: str) -> bool:
+    """A follow-up of a family that opted into the one-copy store (``one_copy_store``, not the
+    fixed-M4 verifier's runtime: Inkling 2 Mini), served from its conversation's lease below the
+    lease's end, is billed as a copy of its prefix. Measured 21 November (Bare Speed, simulated 24 GB,
+    ``mtplx serve``, ``m1-t24-b``): such a turn grew 1.15 GB, about its conversation's size, before
+    its first chunk, where the bill priced a lease taken in place; admitted with 18 MB to spare, it
+    was stopped with a 507 after its stream had started. Billed as a copy, the admission frees the
+    lease when the turn would not fit beside it, and the turn restores from the SSD tier."""
+
+    return (
+        reused_mode == "near_prefix"
+        and one_copy_store(runtime)
+        and not one_copy_runtime(runtime)
     )
 
 
@@ -24527,6 +24554,8 @@ def _run_prefill_admission(
             if reused_mode in {"exact", "near_prefix"}
             else True
         )
+        if _lease_continuation_copies(runtime, reused_mode):
+            copies = True
         return {
             "reused_tokens": int(reused_tokens),
             "reused_mode": reused_mode,

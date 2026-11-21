@@ -560,6 +560,7 @@ def plan_memory(
     mtp_history_bytes_per_token: int = 0,
     runtime_transients_bytes: int | None = None,
     tight_runtime_transients_bytes: int | None = None,
+    tight_window_tokens: int | None = None,
 ) -> MemoryPlan:
     """Solve the machine's memory geometry.
 
@@ -588,6 +589,12 @@ def plan_memory(
     ``tight_runtime_transients_bytes`` is that reserve under the tight rule,
     for a family that keeps less on a tight machine (Inkling 2 Mini: two
     restore checkpoints instead of eight); None keeps one reserve for both.
+    ``tight_window_tokens``: the most context the tight rule grants a family
+    whose tight-machine reserve is measured (``tight_machine_measured``) and
+    charged to every request, in place of one block plus the bank floor net
+    of the margin (``tight_ceiling``). The floor then yields wherever keeping
+    it would leave a window under that size, never above it, so the window
+    still only grows with the budget.
     """
     runtime_transients = (
         RUNTIME_TRANSIENTS_BYTES
@@ -698,6 +705,8 @@ def plan_memory(
             )
             // tight_per_token
         )
+        if tight_machine_measured and tight_window_tokens:
+            tight_ceiling = max(tight_ceiling, _align_down(int(tight_window_tokens)))
         tight_own = _align_down(max(0, tight_budget) // tight_per_token)
         tight_fit = min(tight_own, tight_ceiling)
         if (
