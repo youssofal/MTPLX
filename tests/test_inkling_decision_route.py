@@ -189,7 +189,10 @@ def test_the_committing_round_switch_is_one_for_the_loop_and_the_warm_up(monkeyp
     from mtplx.models.inkling.fast.decoder import round_commit_enabled
 
     monkeypatch.delenv("MTPLX_INKLING_ROUND_COMMIT", raising=False)
-    assert round_commit_enabled()
+    assert not round_commit_enabled()  # off by default: the deciding round and the stock commit
     for off in ("0", "off", "false", "no", " OFF "):
         monkeypatch.setenv("MTPLX_INKLING_ROUND_COMMIT", off)
         assert not round_commit_enabled()
+    for on in ("1", "on", "true", " ON "):
+        monkeypatch.setenv("MTPLX_INKLING_ROUND_COMMIT", on)
+        assert round_commit_enabled()

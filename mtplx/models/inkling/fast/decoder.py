@@ -57,9 +57,11 @@ def stage_spec():
 
 def round_commit_enabled():
     """The committing round (lane L7: the one-program round also writes the kept rows):
-    on unless MTPLX_INKLING_ROUND_COMMIT=0 (diagnostic: the deciding round and the stock
-    commit). The served loop and the load's warm-up read the same switch."""
-    return os.environ.get("MTPLX_INKLING_ROUND_COMMIT", "on").strip().lower() not in ("0", "off", "false", "no")
+    off unless MTPLX_INKLING_ROUND_COMMIT=1. By default the program decides the round and
+    the stock commit writes the kept rows (candidate 7's served A/B, same seeds and rounds:
+    the committing round was not faster warm and slower cold). The served loop and the
+    load's warm-up read the same switch, so the load warms the variant that serves."""
+    return os.environ.get("MTPLX_INKLING_ROUND_COMMIT", "off").strip().lower() not in ("0", "off", "false", "no")
 
 
 class FastPending:
