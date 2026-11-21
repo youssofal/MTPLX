@@ -505,3 +505,109 @@ def affine_output(hg, weight, conv, tail, x, boundary, *, form, prove=True, narr
         if not verdict:
             raise RuntimeError("affine_output disagreed with the step's three launches on this Mac")
     return partial, attn
+
+
+_ROWS = """
+    // Rows of an affine-coded table gathered and decoded in one launch: output (r, col) is entry col of
+    // table row ids[r], its code times its group's scale plus its group's bias, rounded once to the
+    // table's 16-bit type (FORM 0: the product and sum in float; FORM 1: in the 16-bit type, each
+    // operation rounded on its own).
+    const uint col = thread_position_in_grid.x;
+    const uint r = thread_position_in_grid.y;
+    if (col >= uint(COLS)) return;
+    constexpr uint PER = 32 / BITS;              // codes a word
+    constexpr uint MASK = (1u << BITS) - 1u;
+    constexpr uint WPR = COLS / PER;             // code words a row
+    constexpr uint GPR = COLS / G;               // groups a row
+    const size_t id = size_t(uint(ids[r]));
+    const uint code = (codes[id * WPR + col / PER] >> (BITS * (col % PER))) & MASK;
+    const T scale = scales[id * GPR + col / G];
+    const T bias = biases[id * GPR + col / G];
+    T value;
+    if (FORM == 0) {
+        value = static_cast<T>(static_cast<float>(scale) * static_cast<float>(code) + static_cast<float>(bias));
+    } else {
+        const T scaled = scale * static_cast<T>(code);
+        value = scaled + bias;
+    }
+    out[size_t(r) * COLS + col] = value;
+"""
+#: Ways of writing the decode; a first use keeps the first whose rows equal MLX's own decode.
+ROW_FORMS = (0, 1)
+_rows_verdicts: dict = {}
+
+
+@lru_cache(maxsize=1)
+def _rows_kernel():
+    return mx.fast.metal_kernel(
+        name="mtplx_inkling_fast_affine_rows",
+        input_names=["ids", "codes", "scales", "biases"],
+        output_names=["out"],
+        source=_ROWS,
+    )
+
+
+def _rows_launch(ids, weight, form):
+    bits, group = int(weight.bits), int(weight.group_size)
+    vocab, words = weight.codes.shape
+    cols = words * 32 // bits
+    flat = ids.reshape(-1).astype(mx.int32)
+    return _rows_kernel()(
+        inputs=[flat, weight.codes, weight.scales, weight.biases],
+        template=[("T", weight.scales.dtype), ("COLS", cols), ("BITS", bits), ("G", group), ("FORM", form)],
+        grid=(cols, flat.size, 1),
+        threadgroup=(min(256, cols), 1, 1),
+        output_shapes=[(flat.size, cols)],
+        output_dtypes=[weight.scales.dtype],
+    )[0].reshape(*ids.shape, cols)
+
+
+def rows_reason(weight):
+    """Why ``affine_rows`` does not serve this stored table, or None: 4- or 8-bit codes in whole groups
+    with bf16 scales and biases (the form proven against MLX's decode on a real table: Bare Speed's
+    embedding, every value of all 201,024 rows)."""
+    bits, group = int(weight.bits), int(weight.group_size)
+    cols = weight.codes.shape[-1] * 32 // bits if bits else 0
+    if bits not in (4, 8):
+        return f"bits_{bits}"
+    if group not in (32, 64, 128) or cols % group:
+        return f"group_{group}"
+    if weight.scales.dtype != mx.bfloat16 or weight.biases.dtype != mx.bfloat16:
+        return "scales_not_bf16"
+    return None
+
+
+def affine_rows(ids, weight, *, prove=True, form=None):
+    """``mx.dequantize(codes[ids], scales[ids], biases[ids])`` for an affine weight in one launch (MLX
+    gathers the codes, the scales and the biases, then decodes: four launches), every value equal. The
+    first use per stored form on this Mac compares a decode of sample rows (the first, the last and
+    spread between) against MLX's own and keeps the first form that matches, or refuses (counted)."""
+    from .attn_input import count_route
+
+    bits, group = int(weight.bits), int(weight.group_size)
+    vocab, words = weight.codes.shape
+    cols = words * 32 // bits
+    why = rows_reason(weight)
+    if why is not None:
+        count_route(f"refused:affine_rows_{why}")
+        raise RuntimeError(f"affine_rows does not serve this table: {why}")
+    if form is not None:
+        return _rows_launch(ids, weight, form)
+    key = (vocab, cols, bits, group, str(weight.scales.dtype))
+    form = _rows_verdicts.get(key)
+    if form is None and prove:
+        sample = mx.array(sorted({0, vocab - 1, *range(1, vocab, max(1, vocab // 509))}), mx.int32)
+        want = mx.dequantize(weight.codes[sample], weight.scales[sample], weight.biases[sample], bits=bits,
+                             group_size=group)
+        form = -1
+        for candidate in ROW_FORMS:
+            got = _rows_launch(sample, weight, candidate)
+            mx.eval(got, want)
+            if _same(got, want):
+                form = candidate
+                break
+        _rows_verdicts[key] = form
+        count_route(("proved:" if form >= 0 else "refused:") + f"affine_rows_{vocab}x{cols}_b{bits}")
+    if form is None or form < 0:
+        raise RuntimeError("affine_rows did not match MLX's decode on this Mac")
+    return _rows_launch(ids, weight, form)

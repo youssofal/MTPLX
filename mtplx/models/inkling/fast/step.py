@@ -500,6 +500,8 @@ def stage_fallbacks(model, spec, rows, dtype=None):
                         and launch_serves(layer.out) else "fallback")
                 key = f"{kind}.{stage}.{reason}"
                 out[key] = out.get(key, 0) + 1
+    if embed_reason(model) is not None:
+        out[f"fallback.embed.{embed_reason(model)}"] = 1
     unembed = getattr(model, "unembed", None)
     if rows > 1 and isinstance(unembed, AffineWeight) and not launch_serves(unembed):
         out["fallback.head.packed_rows"] = 1
@@ -672,6 +674,36 @@ def row_stable_head(model, hidden):
     return mx.concatenate([model.head(hidden[:, start:stop]) for start, stop in row_chunks(rows)], axis=1)
 
 
+def embed_reason(model):
+    """Why the one-launch embedding cannot serve this model's stored table, or None (a 16-bit table
+    needs no decode: one gather, as the model does it)."""
+    from .qproduct import rows_reason
+
+    packed = getattr(model.embed_tokens, "packed", None)
+    return None if packed is None else rows_reason(packed)
+
+
+def embed(model, ids):
+    """``model.embed_tokens(ids)`` with a table stored as affine codes (Bare Speed) gathered and
+    decoded in one launch (``qproduct.affine_rows``: MLX gathers codes, scales and biases, then
+    decodes, four launches) and normed as ``Embedding`` norms it; every value equal (proven on this
+    Mac's first use). A 16-bit table takes the model's own embedding; a stored table the launch does
+    not serve, or a refusal, takes it too, counted."""
+    table = model.embed_tokens
+    packed = getattr(table, "packed", None)
+    if packed is not None:
+        from .qproduct import affine_rows
+
+        reason = embed_reason(model)
+        if reason is None:
+            try:
+                return mx.fast.rms_norm(affine_rows(ids, packed), table.gain, table.eps)
+            except RuntimeError:
+                reason = "refused"
+        count(f"fallback.embed.{reason}")
+    return table(ids)
+
+
 def decode_hidden(model, ids, state, *, embeddings=None, capture_ids=(), stages=REFERENCE,
                   record=None, tape=None):
     """The final hidden rows ``(1, W, 2304)``, the captures and the per-visit deltas.
@@ -682,7 +714,7 @@ def decode_hidden(model, ids, state, *, embeddings=None, capture_ids=(), stages=
     verify = (rows > 1) if tape is None else bool(tape)
     panel = Panel(rows, state.pos, True if verify else None)
     closed, captured, deltas = [], {}, []
-    x = model.embed_tokens(ids.reshape(1, rows)) if embeddings is None else embeddings
+    x = embed(model, ids.reshape(1, rows)) if embeddings is None else embeddings
     stack = entry = entry_blocks = None
     for visit, index in enumerate(model.visit_order):
         if index == model.start:

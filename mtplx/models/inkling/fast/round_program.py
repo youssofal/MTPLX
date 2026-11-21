@@ -58,6 +58,7 @@ from . import round as fast_round
 from .routes import capture_counts, count, stage_paths
 from .state import BANK_STEP, DecodeState, round_up
 from .step import decode_panel
+from .step import embed as fast_embed
 
 NAME = "inkling.round"
 _ATTRIBUTE = "_mtplx_inkling_round_site"
@@ -459,7 +460,7 @@ def propose(drafter, target, anchor, view: DraftView, count_: int, *, position, 
     if cap is None:
         cap = target.config.get("final_logit_softcapping") or 0.0
     anchor_ids = anchor.astype(mx.int32).reshape(1, 1)
-    embed = target.embed_tokens(anchor_ids)
+    embed = fast_embed(target, anchor_ids)
     dtype = embed.dtype
     masks = mx.broadcast_to(drafter.mask, (1, drafter.width - 1, embed.shape[-1]))
     h, residual = mx.concatenate([embed, masks], axis=1), None
