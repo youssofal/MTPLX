@@ -44,6 +44,7 @@ def test_unserved_names_each_reason(monkeypatch):
     assert fx.unserved(namespace_block(affine=object()), 1) == "affine_experts"
     assert fx.unserved(namespace_block(experts=64), 1) == "geometry"
     assert fx.unserved(namespace_block(count=4), 1) == "geometry"
+    assert fx.unserved(namespace_block(), 1, mx.float16) == "dtype"
     monkeypatch.setenv("MTPLX_INKLING_FAST_EXPERTS", "off")
     assert fx.unserved(namespace_block(), 1) == "disabled"
 
@@ -98,9 +99,11 @@ def same(a, b):
 
 
 @needs_gpu
+@pytest.mark.parametrize("products", ["mlx", "own"])
 @pytest.mark.parametrize("mode", ["nvfp4", "mxfp8"])
 @pytest.mark.parametrize("tie", [False, True])
-def test_bits_and_row_stability_at_every_width(mode, tie):
+def test_bits_and_row_stability_at_every_width(mode, tie, products, monkeypatch):
+    monkeypatch.setattr(fx, "PRODUCTS", products)
     block, conv, norm_weight = synthetic_layer(mode, tie=tie)
     keys = mx.random.split(mx.random.key(11), 3)
     source = mx.random.normal((1, 8, 2304), key=keys[0]) * 3.0

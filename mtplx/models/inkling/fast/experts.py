@@ -55,8 +55,8 @@ MIDDLE = 1152
 EXPERTS = 128
 TOP_K = 8
 MAX_ROWS = 32
-TILE_GATE_UP = 64     # w13 rows per gate-up threadgroup (32 mid outputs)
-TILE_DOWN = 64        # w2 rows per down threadgroup
+TILE_GATE_UP = 128    # w13 rows per gate-up threadgroup (64 mid outputs), 8 simdgroups
+TILE_DOWN = 128       # w2 rows per down threadgroup, 8 simdgroups
 
 _lock = Lock()
 _routes: dict[str, int] = {}
@@ -727,9 +727,11 @@ def _route_consts(scale):
 
 
 def unserved(block, rows, dtype=mx.bfloat16):
-    """Why the fast path cannot serve this visit, or None."""
+    """Why the fast path cannot serve this visit, or None. `dtype` is the visit's stream type."""
     if os.environ.get("MTPLX_INKLING_FAST_EXPERTS", "on").lower() in {"0", "off", "stock"}:
         return "disabled"
+    if dtype != mx.bfloat16:
+        return "dtype"
     if not (mx.default_device() == mx.gpu and mx.metal.is_available()):
         return "cpu"
     if not 1 <= rows <= MAX_ROWS:
@@ -752,7 +754,7 @@ def _member_chunk(rows):
     return 1 if rows == 1 else 2 if rows <= 2 else 4
 
 
-DEFAULT_TILES = {"gu_tile": TILE_GATE_UP, "gu_s": 4, "gu_r": 8, "dn_tile": TILE_DOWN, "dn_s": 4, "dn_r": 8}
+DEFAULT_TILES = {"gu_tile": TILE_GATE_UP, "gu_s": 8, "gu_r": 8, "dn_tile": TILE_DOWN, "dn_s": 8, "dn_r": 8}
 
 
 def _mlx_products(block, fp4, rows, logits, values, outer):
@@ -775,10 +777,19 @@ def _mlx_products(block, fp4, rows, logits, values, outer):
     return raw2.reshape(pairs, HIDDEN), (mid_outer[0] if fp4 else None), experts, prob
 
 
-#: "mlx" (default): fused glue around MLX's gathered product, 6 launches a visit, the fastest exact
-#: variant measured at 1, 4 and 8 rows. "own": the 4-launch block whose own products read each
-#: distinct expert once; exact too, but slower than MLX's product at 4 and 8 rows on this Mac.
-PRODUCTS = os.environ.get("MTPLX_INKLING_FAST_EXPERT_PRODUCTS", "mlx").lower()
+#: Which expert products serve a panel (all exact, class A):
+#:   "auto" (default): one row takes the block's own products (4 launches; 106 against 112 us a
+#:   visit for MLX's on FP4), two or more rows take MLX's gathered product with fused glue
+#:   (6 launches; the block's own products lose at 4 and 8 rows because the GPU cache already
+#:   absorbs the experts a panel repeats, raw/l3-bench-3.json);
+#:   "mlx" or "own" pin one for every width.
+PRODUCTS = os.environ.get("MTPLX_INKLING_FAST_EXPERT_PRODUCTS", "auto").lower()
+
+
+def products_for(rows):
+    if PRODUCTS in ("mlx", "own"):
+        return PRODUCTS
+    return "own" if rows == 1 else "mlx"
 
 
 def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *, eps, conv_form=0, trace=None,
@@ -787,7 +798,7 @@ def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *
 
     Returns (out bf16 (1, W, 2304), conv_rows float32 (1, W, 2304)).
     """
-    products = products or PRODUCTS
+    products = products or products_for(source.shape[-2])
     rows = source.shape[-2]
     fp4 = block.gate_up.mode == "nvfp4"
     tl = DEFAULT_TILES if tiles is None else {**DEFAULT_TILES, **tiles}
@@ -906,6 +917,6 @@ def expert_visit(layer, source, partial, tail):
     position 3). Returns (visit output bf16, the panel's MLP convolution input rows float32).
     """
     tail = tail if tail is not None else _zero_tail()
-    _count("fast." + PRODUCTS)
+    _count("fast." + products_for(source.shape[-2]))
     return expert_visit_parts(layer.experts, layer.ffn_norm, layer.convs[3].weight, source, partial, tail,
                               eps=layer.eps)
