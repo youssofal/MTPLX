@@ -1026,6 +1026,11 @@ def attention_input(layer, x, closed, k_tail, v_tail, pos, messages=None, messag
     """
     from .read import depth_keys, depth_read, message_rows, mix, read
 
+    if x.dtype != mx.bfloat16:
+        # Every rounding this stage twins is RC6's rounding to a bf16 stream (FP16 packs: the
+        # reference serves; fast/step.py declines by the activation dtype before calling).
+        count_route("refused:stream_dtype")
+        raise RuntimeError("fused stage A serves bf16 streams only")
     form = "float"
     if layer.sliding:
         form = _static_form(matrix(layer.k).rows, layer.convs[0].size)

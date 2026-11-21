@@ -543,7 +543,20 @@ def read(partial, closed, queries, eps, *, mode, gains=(), messages=None, read_i
     sources = len(closed) + 1
     nq = 1 if noread else (queries.shape[0] if queries.ndim == 2 else 1)
     queries = queries.reshape(-1)[: nq * width].reshape(nq, width) if noread else queries.reshape(nq, width)
+    # The kernel rounds where RC6 rounds to the stream's dtype, and it rounds to bf16: a float16
+    # stream (the FP16 sibling packs) would get the wrong bits, so it is refused, counted, and the
+    # caller serves the reference (fast/step.py declines stage A and D by the activation dtype).
+    if any(getattr(a, "dtype", mx.bfloat16) not in (mx.bfloat16, mx.float32) for a in (*gains, *downs, partial, *closed)):
+        from .attn_input import count_route
+
+        count_route("refused:read_stream_dtype")
+        raise RuntimeError("the read kernel serves bf16 streams only")
     bf16 = [a for a in (*gains, *downs, partial, *closed) if a.dtype == mx.bfloat16]
+    if not bf16:
+        from .attn_input import count_route
+
+        count_route("refused:read_stream_dtype")
+        raise RuntimeError("the read kernel needs the bf16 stream's operands")
     stand_bf16 = bf16[0]
     stand_block = partial if partial.dtype == mx.bfloat16 else closed[0] if closed else partial
     pad = closed + [stand_block] * (4 - len(closed))
@@ -824,6 +837,10 @@ def mlp_source(layer, partial, closed, messages=None, message_queries=None, *, r
     """
     from .attn_input import count_route
 
+    if any(c.dtype != mx.bfloat16 for c in closed) or partial.dtype not in (mx.bfloat16, mx.float32):
+        # RC6's read and controller round to the stream's dtype; these kernels round to bf16.
+        count_route("refused:mlp_stream_dtype")
+        raise RuntimeError("the fused MLP read serves bf16 streams only")
     width = partial.shape[-1]
     count = partial.shape[-2]
     loop = messages is not None or rows is not None
