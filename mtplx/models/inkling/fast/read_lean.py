@@ -18,7 +18,9 @@ there:
    in its own simdgroup, one barrier, then the writes.
 
 The kernel text is derived from lane L1's own (``read._READ``) by replacing those five blocks; a
-block that is not found (lane L1 changed it) leaves no lean kernel and lane L1's serves. Class A:
+block that is not found (lane L1 changed it) fails a test (``derive``) and, in serving, leaves no lean
+kernel: lane L1's serves, counted. The blocks carry the stream's 16-bit type ``T16`` (bf16, or
+float16 on the FP16 packs), so the lean read serves every pack. Class A:
 decided per launch shape on this Mac on the first call, against lane L1's kernel, every output the
 mode writes bit for bit; a shape that differs keeps lane L1's kernel, counted
 ``fallback.read_lean.differs``. ``MTPLX_INKLING_READ_LEAN=0`` turns it off.
@@ -122,10 +124,10 @@ _MIX_NEW = """                for (uint s = 0; s < S && s < 4; ++s) {
                     v1 += prob[qn][s] * key;
                 }"""
 
-_NORMS_OLD_HEAD = "        // ---- 5. Input norm(s): MLX rms_single_row with the layer's gain, then the bf16 cast.\n"
-_NORMS_OLD_TAIL = "                    o0[(size_t(r) * NQ + qn) * D + c4 + i] = static_cast<OUT0>(static_cast<bfloat16_t>(w * (out[qn][i] * iv)));\n                }\n            }\n        }\n"
+_NORMS_OLD_HEAD = "        // ---- 5. Input norm(s): MLX rms_single_row with the layer's gain, then the cast to the stream's type.\n"
+_NORMS_OLD_TAIL = "                    o0[(size_t(r) * NQ + qn) * D + c4 + i] = static_cast<OUT0>(static_cast<T16>(w * (out[qn][i] * iv)));\n                }\n            }\n        }\n"
 _NORMS_NEW = """        // ---- 5. (lane F1) Input norm(s): every query's partial sums, one barrier, each query's MLX
-        // rms_single_row total in its own simdgroup, one barrier, the gains and the bf16 casts.
+        // rms_single_row total in its own simdgroup, one barrier, the gains and the casts to T16.
         for (uint qn = 0; qn < NQ; ++qn) {
             float acc = 0;
             for (uint i = 0; i < 4; ++i) acc += out[qn][i] * out[qn][i];
@@ -141,11 +143,11 @@ _NORMS_NEW = """        // ---- 5. (lane F1) Input norm(s): every query's partia
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint qn = 0; qn < NQ; ++qn) {
             const float iv = inv[S + qn];
-            const device bfloat16_t* gain = qn == 0 ? g0 : (qn == 1 ? g1 : g2);
+            const device T16* gain = qn == 0 ? g0 : (qn == 1 ? g1 : g2);
             if (in_row) {
                 for (uint i = 0; i < 4; ++i) {
                     const float w = static_cast<float>(gain[c4 + i]);
-                    o0[(size_t(r) * NQ + qn) * D + c4 + i] = static_cast<OUT0>(static_cast<bfloat16_t>(w * (out[qn][i] * iv)));
+                    o0[(size_t(r) * NQ + qn) * D + c4 + i] = static_cast<OUT0>(static_cast<T16>(w * (out[qn][i] * iv)));
                 }
             }
         }
@@ -172,10 +174,26 @@ def _block(text, head, tail):
     return i, j + len(tail)
 
 
-def _for_stream(text):
-    """A block as lane L1's kernel spells it once the stream's 16-bit type is a template (integration:
-    lane X1's FP16 work names it T16: bf16, or float16 on the FP16 packs). Same arithmetic, same casts."""
-    return text.replace("bfloat16_t", "T16").replace("then the bf16 cast.", "then the cast to the stream's type.")
+def derive(text):
+    """``(lean text, None)`` from lane L1's kernel text, or ``(None, the first block not found)``.
+
+    The blocks are written as lane L1's text spells them today: the stream's 16-bit type is the
+    template ``T16`` (bf16, or float16 on the FP16 packs; lane X1's FP16 work), so the lean kernel
+    serves both stream types, each proven on its own key. A block that is not found exactly once
+    (lane L1 edited it, a comment included) fails ``tests/test_inkling_fast_read_lean.py``'s text
+    test, and in serving leaves lane L1's kernel (counted ``fallback.read_lean.source``)."""
+    names = ("first_pass", "keys", "mix", "sums_size", "inv_size")
+    for name, (old, new) in zip(names, (_FIRST_PASS, _KEYS, (_MIX_OLD, _MIX_NEW), *_SIZES)):
+        if text.count(old) != 1:
+            return None, name
+        text = text.replace(old, new)
+    for name, head, tail, new in (("gemv", _GEMV_OLD_HEAD, _GEMV_OLD_TAIL, _GEMV_NEW),
+                                  ("norms", _NORMS_OLD_HEAD, _NORMS_OLD_TAIL, _NORMS_NEW)):
+        span = _block(text, head, tail)
+        if span is None or text.count(head) != 1:
+            return None, name
+        text = text[: span[0]] + new + text[span[1]:]
+    return text, None
 
 
 @lru_cache(maxsize=1)
@@ -183,22 +201,7 @@ def source():
     """The lean kernel text from lane L1's, or None when a block is not found."""
     from .read import _READ
 
-    text = _READ
-    for old, new in (_FIRST_PASS, _KEYS, (_MIX_OLD, _MIX_NEW), *_SIZES):
-        if text.count(old) != 1:
-            old, new = _for_stream(old), _for_stream(new)
-            if text.count(old) != 1:
-                return None
-        text = text.replace(old, new)
-    for head, tail, new in ((_GEMV_OLD_HEAD, _GEMV_OLD_TAIL, _GEMV_NEW),
-                            (_NORMS_OLD_HEAD, _NORMS_OLD_TAIL, _NORMS_NEW)):
-        span = _block(text, head, tail)
-        if span is None:
-            span, new = _block(text, _for_stream(head), _for_stream(tail)), _for_stream(new)
-            if span is None:
-                return None
-        text = text[: span[0]] + new + text[span[1]:]
-    return text
+    return derive(_READ)[0]
 
 
 @lru_cache(maxsize=1)

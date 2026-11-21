@@ -21,12 +21,25 @@ def _bits(a, b):
         mx.array_equal(mx.contiguous(a).view(view), mx.contiguous(b).view(view)).item())
 
 
-def _operands(rows, sources, partial_dtype, seed):
+def test_every_block_is_found_in_lane_l1s_text():
+    """An edit of lane L1's read kernel (a comment included) that moves a block the lean kernel replaces
+    must fail here, not only leave lane L1's kernel serving, counted (integration 2: lane X1's T16
+    rename did exactly that until the blocks followed it)."""
+    from mtplx.models.inkling.fast import read_lean
+    from mtplx.models.inkling.fast.read import _READ
+
+    text, missing = read_lean.derive(_READ)
+    assert missing is None, f"lane L1's read kernel no longer holds the lean block {missing!r}"
+    assert "float xs[S][4];" in text and "static_cast<T16>" in text
+
+
+def _operands(rows, sources, partial_dtype, seed, stream="bfloat16"):
     keys = mx.random.split(mx.random.key(seed), sources + 5)
-    closed = [(mx.random.normal((rows, D), key=keys[i]) * (1 + i)).astype(mx.bfloat16) for i in range(sources - 1)]
+    s16 = getattr(mx, stream)
+    closed = [(mx.random.normal((rows, D), key=keys[i]) * (1 + i)).astype(s16) for i in range(sources - 1)]
     partial = mx.random.normal((rows, D), key=keys[sources - 1]).astype(getattr(mx, partial_dtype))
     queries = (mx.random.normal((3, D), key=keys[sources]) * 0.05).astype(mx.float32)
-    gains = [(1 + 0.1 * mx.random.normal((D,), key=keys[sources + 1 + j])).astype(mx.bfloat16) for j in range(3)]
+    gains = [(1 + 0.1 * mx.random.normal((D,), key=keys[sources + 1 + j])).astype(s16) for j in range(3)]
     stand_in = mx.zeros((4, D), mx.float32)
     mx.eval(closed, partial, queries, gains, stand_in)
     return closed, partial, queries, gains, stand_in
@@ -59,6 +72,27 @@ def test_lean_read_equals_lane_l1(rows, sources, mode, nq, monkeypatch):
     for a, b in zip(lean, l1):
         assert _bits(a, b)
     assert list(read_lean._VERDICT.values()) == [True], "the lean kernel did not prove on this Mac"
+
+
+@needs
+@pytest.mark.parametrize("rows", [1, 4, 8])
+@pytest.mark.parametrize("sources", [2, 5])
+@pytest.mark.parametrize("mode,nq", [(0, 1), (0, 3), (1, 1), (3, 1)])
+def test_lean_read_on_a_float16_stream(rows, sources, mode, nq, monkeypatch):
+    """The FP16 packs' stream (lane L1's kernel templated on T16 = float16): the lean blocks carry the
+    same type, proven on their own key (the stream's type is part of it), the same bytes."""
+    from mtplx.models.inkling.fast import read, read_lean
+
+    monkeypatch.setattr(read_lean, "_VERDICT", {})
+    closed, partial, queries, gains, _ = _operands(rows, sources, "float16", 17 * rows + sources, stream="float16")
+    q = queries[:nq]
+    kw = {"gains": gains[:nq]} if mode == 0 else {}
+    lean, l1, _ = _both(monkeypatch, lambda: read.read(partial, closed, q, 1e-6, mode=mode, **kw))
+    assert len(lean) == len(l1)
+    for a, b in zip(lean, l1):
+        assert _bits(a, b)
+    assert list(read_lean._VERDICT.values()) == [True], "the lean kernel did not prove on a float16 stream"
+    assert all(k[-1] == str(mx.float16) for k in read_lean._VERDICT)
 
 
 @needs

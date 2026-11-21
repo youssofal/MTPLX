@@ -332,18 +332,29 @@ _REWRITES = {
 }
 
 
-@lru_cache(maxsize=1)
-def _attend_kernels():
-    """``round_program``'s two drafter attention launches with the three layout changes, or None when
-    its kernel text no longer holds the lines they rewrite."""
+def attend_texts():
+    """``({"attend": text, "merge": text}, None)``: ``round_program``'s two drafter attention texts with
+    the three layout changes; or ``(None, the line not found)`` when its text no longer holds a line
+    they rewrite exactly once (that fails ``tests/test_inkling_fast_draft_glue.py``'s text test; in
+    serving the library's attention serves, counted ``fallback.draft_glue.attention_shape``)."""
     from . import round_program as rp
 
     texts = {"attend": rp._ATTEND, "merge": rp._MERGE}
     for name, pairs in _REWRITES.items():
         for old, new in pairs:
             if texts[name].count(old) != 1:
-                return None
+                return None, f"{name}: {old}"
             texts[name] = texts[name].replace(old, new)
+    return texts, None
+
+
+@lru_cache(maxsize=1)
+def _attend_kernels():
+    """``round_program``'s two drafter attention launches with the three layout changes, or None when
+    its kernel text no longer holds the lines they rewrite."""
+    texts, _missing = attend_texts()
+    if texts is None:
+        return None
     partials = mx.fast.metal_kernel(name="mtplx_inkling_f1_draft_attend", input_names=["q", "hk", "hv", "ok", "ov",
                                                                                       "cnt", "nw"],
                                     output_names=["pm", "pl", "pacc"], source=texts["attend"])
@@ -507,4 +518,4 @@ def propose(drafter, target, anchor, view, count_: int, *, position, seed, tempe
     return ids, law
 
 
-__all__ = ["add_norm", "attention", "block", "enabled", "gate_act", "markov_input", "markov_update", "propose"]
+__all__ = ["add_norm", "attend_texts", "attention", "block", "enabled", "gate_act", "markov_input", "markov_update", "propose"]
