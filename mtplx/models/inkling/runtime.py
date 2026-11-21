@@ -19,6 +19,16 @@ from .model import load_target
 from .vision import VisionTower
 
 
+def make_weights_resident(model, drafter):
+    """Read the target's and the drafter's weights into memory now, at load.
+
+    The loader maps the pack lazily, so without this the first forward after the server reports
+    ready (its own warm-up request) read some 15 GB of weights, and the memory guard counted that
+    load as the request's growth (``prefill_grew_past_price`` on every start). The vision tower
+    stays lazy: a text-only session never reads it."""
+    mx.eval(model.parameters(), drafter.parameters() if drafter is not None else {})
+
+
 class InklingRuntime(MTPLXRuntime):
     backend_id = "inkling2_loop"
 
@@ -38,6 +48,7 @@ class InklingRuntime(MTPLXRuntime):
         self.draft_footprint = (
             cache_footprint(config["mtp_config"], draft=True) if mtp else None
         )
+        make_weights_resident(model, self.drafter)
         # Verify panels, commits and one-token forwards go through the fast step first.
         self.fast = FastDecoder(self)
         # Before the server reports ready: build the round's kernels, then record and check

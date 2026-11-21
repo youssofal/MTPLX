@@ -117,3 +117,20 @@ def test_a_short_prompt_is_priced_at_the_decode_layout_not_its_prompt_windows():
     # A long prompt's prefill windows (window + chunk - 1 rows) are the larger figure then.
     assert InklingRuntime.prefill_window_bytes(rt, 100_000, 100_000) == max(
         (1024 + 511) * 40 * row, fixed)
+
+
+def test_load_makes_target_and_drafter_weights_resident_but_not_the_vision_tower(monkeypatch):
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+
+    import mtplx.models.inkling.runtime as runtime_module
+
+    seen = []
+    monkeypatch.setattr(runtime_module.mx, "eval", lambda *trees: seen.extend(trees))
+    target, drafter = nn.Linear(4, 3), nn.Linear(3, 2)
+    runtime_module.make_weights_resident(target, drafter)
+    names = [sorted(k for k, _ in tree_flatten(tree)) for tree in seen]
+    assert names == [["bias", "weight"], ["bias", "weight"]]
+    seen.clear()
+    runtime_module.make_weights_resident(target, None)
+    assert [sorted(k for k, _ in tree_flatten(tree)) for tree in seen] == [["bias", "weight"], []]
