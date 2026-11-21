@@ -40,6 +40,8 @@ import mlx.core as mx
 HEADS, KV_HEADS, HEAD_DIM, EXTENT, WINDOW = 24, 8, 128, 1024, 1024
 GROUP = HEADS // KV_HEADS
 MAX_ROWS = 32
+#: Panels of this many rows or more take the long-history tile order on global visits.
+LONG_MIN_ROWS = 1
 
 
 def _float_bits(value):
@@ -48,6 +50,42 @@ def _float_bits(value):
 
 #: MLX rounds the Python scale ``128 ** -0.5`` to float32 once.
 SCALE_BITS = _float_bits(HEAD_DIM ** -0.5)
+
+
+_TREE_PROOF = """
+    const uint lane = thread_index_in_simdgroup;
+    const uint base = threadgroup_position_in_grid.x * 32;
+    const float v = x[base + lane];
+    const float s = simd_sum(v);
+    if (lane == 0) {
+        float t[32];
+        for (int i = 0; i < 32; ++i) t[i] = x[base + i];
+        for (int w = 1; w < 32; w <<= 1) {
+            for (int i = 0; i + w < 32; i += 2 * w) t[i] = t[i] + t[i + w];
+        }
+        ok[threadgroup_position_in_grid.x] = as_type<uint>(s) == as_type<uint>(t[0]) ? 1u : 0u;
+    }
+"""
+
+
+@lru_cache(maxsize=1)
+def lane_tree_ok():
+    """Does this GPU's simd_sum equal the lane-order pairwise tree, bit for bit?
+
+    The exact long-history order (``LONG``) computes each key's score in one lane by that tree;
+    where the proof fails, the kernel keeps MLX's own cross-lane sum (``LONG`` off).
+    """
+    if not mx.metal.is_available():
+        return False
+    groups = 4096
+    key = mx.random.key(20261121)
+    a, b = mx.random.split(key)
+    x = (mx.random.normal((groups * 32,), key=a) * mx.exp(mx.random.uniform(-8, 8, (groups * 32,), key=b)))
+    kern = mx.fast.metal_kernel(name="mtplx_inkling_fast_lane_tree_proof", input_names=["x"],
+                                output_names=["ok"], source=_TREE_PROOF)
+    ok = kern(inputs=[x.astype(mx.float32)], grid=(32 * groups, 1, 1), threadgroup=(32, 1, 1),
+              output_shapes=[(groups,)], output_dtypes=[mx.uint32])[0]
+    return bool(mx.all(ok == 1).item())
 
 
 @lru_cache(maxsize=1)
@@ -112,6 +150,7 @@ _PARTIALS = """
     const int first = pos0 - nc;               // position of logical key 0
     const int chain = ((rho - first) % span + span) % span;
     const float scale = as_type<float>(uint(SCALE));
+    threadgroup float qsh[LONG ? ROWS * 3 * 128 : 1];
 
     float qs[3][4], o[3][4], max_score[3], sum_exp_score[3];
     for (int h3 = 0; h3 < 3; ++h3) {
@@ -129,8 +168,117 @@ _PARTIALS = """
     const device T* krg = kr + size_t(g) * kr_strides[1];
     const device T* vrg = vr + size_t(g) * vr_strides[1];
 
+    int p_from = first + chain;
+    if (LONG && two && p_from < pos0) {
+        // Exact long-history order for global visits (committed keys sit at slot = position):
+        // full tiles of 32 keys of this chain. Lane t computes key t's score itself: MLX's 32
+        // per-lane partial sums, each the same four multiply-adds, combined in simd_sum's
+        // lane-order pairwise tree (proven on this GPU at first use, `lane_tree_ok`). The
+        // running max of a tile is a prefix max (max is exact), so every key gets MLX's factor
+        // and exp_score. When no key of the tile raises a head's running max, every factor is
+        // fast::exp(0) == 1 and MLX's updates reduce exactly to sum + e and o + round(e * v)
+        // (its multiply-add form is fma(o, factor, e * v), l2/probe-contract.json); only the
+        // output update stays sequential, as MLX's.
+        threadgroup float* qr = qsh + r * 3 * 128;
+        for (int h3 = 0; h3 < 3; ++h3) {
+            for (int j = 0; j < 4; ++j) {
+                qr[h3 * 128 + 4 * lane + j] = qs[h3][j];
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        const int ncom = (pos0 - 1 - p_from) / span + 1;   // committed keys of this chain
+        const int tiles = ncom >> 5;
+        const size_t kst = size_t(kc_strides[2]);
+        const size_t vst = size_t(vc_strides[2]);
+        const size_t vstep = size_t(span) * vst;
+        for (int tix = 0; tix < tiles; ++tix) {
+            const int base = p_from + tix * 32 * span;
+            const int pt = base + lane * span;               // this lane's key, < pos0
+            const device uint4* kp = (const device uint4*)(kg + size_t(pt) * kst);
+            float sub[3][4];
+            for (int cc = 0; cc < 4; ++cc) {                 // MLX lanes 8 cc .. 8 cc + 7
+                float kf[32];
+                for (int u = 0; u < 4; ++u) {
+                    const uint4 w = kp[4 * cc + u];
+                    kf[8 * u + 0] = as_type<float>(w.x << 16); kf[8 * u + 1] = as_type<float>(w.x & 0xffff0000u);
+                    kf[8 * u + 2] = as_type<float>(w.y << 16); kf[8 * u + 3] = as_type<float>(w.y & 0xffff0000u);
+                    kf[8 * u + 4] = as_type<float>(w.z << 16); kf[8 * u + 5] = as_type<float>(w.z & 0xffff0000u);
+                    kf[8 * u + 6] = as_type<float>(w.w << 16); kf[8 * u + 7] = as_type<float>(w.w & 0xffff0000u);
+                }
+                for (int h3 = 0; h3 < 3; ++h3) {
+                    const threadgroup float* qv = qr + h3 * 128 + 32 * cc;
+                    float part[8];
+                    for (int m8 = 0; m8 < 8; ++m8) {
+                        float score = 0;
+                        for (int j = 0; j < 4; j++) {
+                            score += qv[4 * m8 + j] * kf[4 * m8 + j];
+                        }
+                        part[m8] = score;
+                    }
+                    sub[h3][cc] = ((part[0] + part[1]) + (part[2] + part[3])) + ((part[4] + part[5]) + (part[6] + part[7]));
+                }
+            }
+            const int dist = P - pt;
+            float ex[3], fac[3];
+            bool all_fast = true;
+            for (int h3 = 0; h3 < 3; ++h3) {
+                float score = (sub[h3][0] + sub[h3][1]) + (sub[h3][2] + sub[h3][3]);
+                score += dist < 1024 ? static_cast<float>(pr[h3 * 1024 + dist]) : 0.0f;
+                const float tmax = simd_max(score);
+                if (tmax <= max_score[h3]) {
+                    fac[h3] = 1.0f;                           // no key raises the max
+                    ex[h3] = metal::fast::exp(score - max_score[h3]);
+                } else {
+                    all_fast = false;
+                    float run = score;                        // inclusive prefix max over the tile
+                    for (ushort d2 = 1; d2 < 32; d2 <<= 1) {
+                        const float other = simd_shuffle_up(run, d2);
+                        if (lane >= int(d2)) run = max(run, other);
+                    }
+                    const float new_max = max(max_score[h3], run);
+                    float before = simd_shuffle_up(run, ushort(1));
+                    before = lane == 0 ? max_score[h3] : max(max_score[h3], before);
+                    fac[h3] = metal::fast::exp(before - new_max);
+                    ex[h3] = metal::fast::exp(score - new_max);
+                    max_score[h3] = simd_shuffle(new_max, ushort(31));
+                }
+            }
+            const device T* vrow = vg + size_t(base) * vst + 4 * lane;
+            if (all_fast) {
+                for (int t = 0; t < 32; ++t) {
+                    const uint2 vb = *(const device uint2*)(vrow + size_t(t) * vstep);
+                    const float vv[4] = {as_type<float>(vb.x << 16), as_type<float>(vb.x & 0xffff0000u),
+                                         as_type<float>(vb.y << 16), as_type<float>(vb.y & 0xffff0000u)};
+                    for (int h3 = 0; h3 < 3; ++h3) {
+                        const float exp_score = simd_shuffle(ex[h3], ushort(t));
+                        sum_exp_score[h3] = sum_exp_score[h3] + exp_score;
+                        for (int j = 0; j < 4; j++) {
+                            #pragma clang fp contract(off)
+                            const float ev = exp_score * vv[j];
+                            o[h3][j] = o[h3][j] + ev;
+                        }
+                    }
+                }
+            } else {
+                for (int t = 0; t < 32; ++t) {
+                    const uint2 vb = *(const device uint2*)(vrow + size_t(t) * vstep);
+                    const float vv[4] = {as_type<float>(vb.x << 16), as_type<float>(vb.x & 0xffff0000u),
+                                         as_type<float>(vb.y << 16), as_type<float>(vb.y & 0xffff0000u)};
+                    for (int h3 = 0; h3 < 3; ++h3) {
+                        const float factor = simd_shuffle(fac[h3], ushort(t));
+                        const float exp_score = simd_shuffle(ex[h3], ushort(t));
+                        sum_exp_score[h3] = sum_exp_score[h3] * factor + exp_score;
+                        for (int j = 0; j < 4; j++) {
+                            o[h3][j] = o[h3][j] * factor + exp_score * vv[j];
+                        }
+                    }
+                }
+            }
+        }
+        p_from += tiles * 32 * span;                          // the rest goes through MLX's loop
+    }
     // Keys of this residue in [first, P], ascending (key p has logical index p - first).
-    for (int p = first + chain; p <= P; p += span) {
+    for (int p = p_from; p <= P; p += span) {
         const device T* kp;
         const device T* vp;
         if (p < pos0) {
@@ -472,7 +620,7 @@ def profiles(rel, rel_basis):
 
 
 def attend(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newest, pos,
-           rel_basis, *, window, plan=None, one_launch_window=False):
+           rel_basis, *, window, plan=None, one_launch_window=False, long=None):
     """The gated attention result of a panel, ``(1, W, 3072)`` in the query dtype.
 
     ``q (1, W, 24, 128)``, ``rel (1, W, 24, 16)``, ``sink (1, W, 24)``,
@@ -481,6 +629,10 @@ def attend(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newes
     ring in physical order with ``newest``/``count``, ``window=False`` for a bank whose
     first ``count`` slots are positions ``0 .. count - 1``. ``count``, ``newest`` and
     ``pos`` are uint32 arrays (or ints, for tests); they never become shapes.
+
+    ``long`` (default: on for global visits of bf16 panels up to 8 rows) takes the exact
+    long-history tile order for the committed keys; ``long=False`` keeps MLX's per-key order
+    everywhere. Both give RC6's bits.
     """
     rows = q.shape[1]
     if not 1 <= rows <= MAX_ROWS:
@@ -492,10 +644,14 @@ def attend(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newes
         return attend_window(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newest,
                              pos, rel_basis, plan=(threshold, blocks))
     dtype = q.dtype
+    if long is None:
+        long = rows >= LONG_MIN_ROWS
     prof = profiles(rel, rel_basis)
     pos_a, count_a, newest_a = _u32(pos), _u32(count), _u32(newest)
     template = [("T", dtype), ("WINDOW", bool(window)), ("BLOCKS", blocks),
-                ("THRESH", threshold), ("SCALE", SCALE_BITS)]
+                ("THRESH", threshold), ("SCALE", SCALE_BITS),
+                ("ROWS", rows), ("LONG", bool(long and not window and rows <= 8 and dtype == mx.bfloat16
+                                               and lane_tree_ok()))]
     chains = rows * HEADS * blocks
     po, pm, ps = _kernel("mtplx_inkling_fast_attend_partials", _PARTIALS, _HEADER)(
         inputs=[q, keys, values, k_rows, v_rows, prof, sink, pos_a, count_a, newest_a],

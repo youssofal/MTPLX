@@ -195,3 +195,26 @@ def test_one_launch_window_equals_the_default_path(history, rows, rot):
     one = attend(*args, window=True, one_launch_window=True)
     mx.eval(two, one)
     assert _same(one, two)
+
+
+@pytest.mark.parametrize("history,rows", [(2100, 1), (4142, 3), (4142, 8), (8190, 5), (6000, 2)])
+def test_long_history_order_equals_mlx_order_and_rc6(history, rows):
+    """The exact long-history tile order (global visits) gives MLX's per-key order bit for bit,
+    and both give RC6's attention; every row equals its one-row call."""
+    k, v, inputs, weights = _setup(history + rows, rows, seed=history * 3 + rows)
+    q, rel, sink, gate, x, tail = inputs
+    kc, vc, count, newest = _committed(k, v, history, False, 0)
+    args = (q, rel, sink, gate, k[:, :, history:history + rows], v[:, :, history:history + rows],
+            kc, vc, count, newest, history, weights[0])
+    tiles = attend(*args, window=False, long=True)
+    mlx_order = attend(*args, window=False, long=False)
+    ref, _, _ = _rc6(k, v, history, inputs, weights, False, False)
+    mx.eval(tiles, mlx_order, ref)
+    assert _same(tiles, mlx_order), "the tile order differs from MLX's order"
+    assert _same(tiles, ref), "the tile order differs from RC6"
+    for r in range(rows):
+        kc1, vc1, c1, n1 = _committed(k, v, history + r, False, 0)
+        h1 = attend(q[:, r:r + 1], rel[:, r:r + 1], sink[:, r:r + 1], gate[:, r:r + 1],
+                    k[:, :, history + r:history + r + 1], v[:, :, history + r:history + r + 1],
+                    kc1, vc1, c1, n1, history + r, weights[0], window=False, long=True)
+        assert _same(h1, tiles[:, r:r + 1]), f"row {r} of {rows} differs from its one-row call"
