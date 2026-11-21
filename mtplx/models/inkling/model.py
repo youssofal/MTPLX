@@ -13,6 +13,7 @@ from .attention import attend
 from .cache import WindowCache
 from .activations import expert_inputs
 from . import expert_fusion
+from .fast import prompt_glue
 from .head import fits_route, measured_route, note_route, pack_proofs, vocabulary_logits
 from .layout import layer_visits
 from .precision import AffineWeight, packed_logical_shape, source_modes
@@ -487,8 +488,17 @@ class Layer(nn.Module):
 
     def __call__(self, x, closed, kv, conv, messages=None, tape=None):
         read_depth = depth_reader(tape, x.shape[1])
+        # A prompt chunk's one-query read and its norm run as one launch of ours, same bits.
+        fused_in = (
+            prompt_glue.input_norm(x, closed, self.attn_query, self.qkv_norm[0], self.eps,
+                                   "attention_input", stand_in=self.experts.router)
+            if tape is None and self.sliding and messages is None and self.cfg["attn_res_normalize_values"]
+            else None
+        )
         read = (
-            read_depth(
+            None
+            if fused_in is not None
+            else read_depth(
                 closed,
                 x,
                 self.attn_query,
@@ -498,7 +508,9 @@ class Layer(nn.Module):
             if self.attn_query is not None
             else x[..., None, :]
         )
-        if self.sliding and messages is None:
+        if fused_in is not None:
+            q = k = v = fused_in
+        elif self.sliding and messages is None:
             q = k = v = norm(read[..., 0, :], self.qkv_norm[0], self.eps).astype(
                 x.dtype
             )
@@ -521,16 +533,23 @@ class Layer(nn.Module):
             closed.append(x)
         else:
             residual = residual + x.astype(mx.float32)
-        ffn = read_depth(
-            closed,
-            residual,
-            self.mlp_query,
-            self.eps,
-            self.cfg["attn_res_normalize_values"],
-        )[..., 0, :]
-        if messages is not None:
-            ffn = self.controllers[3](ffn, messages[..., 3, :], self.eps)
-        routed = self.experts(norm(ffn, self.ffn_norm, self.eps).astype(x.dtype))
+        ffn_in = (
+            prompt_glue.input_norm(residual, closed, self.mlp_query, self.ffn_norm, self.eps, "expert_input")
+            if tape is None and messages is None and self.cfg["attn_res_normalize_values"]
+            else None
+        )
+        if ffn_in is None:
+            ffn = read_depth(
+                closed,
+                residual,
+                self.mlp_query,
+                self.eps,
+                self.cfg["attn_res_normalize_values"],
+            )[..., 0, :]
+            if messages is not None:
+                ffn = self.controllers[3](ffn, messages[..., 3, :], self.eps)
+            ffn_in = norm(ffn, self.ffn_norm, self.eps).astype(x.dtype)
+        routed = self.experts(ffn_in)
         return (
             residual + self.convs[3](routed, conv, 3, tape=tape).astype(mx.float32)
         ).astype(x.dtype)
@@ -646,14 +665,20 @@ class Model(nn.Module):
             x = self.layers[index](
                 x, closed, cache[2 * visit], cache[2 * visit + 1], message, tape
             )
-        last = depth_reader(tapes, x.shape[1])(
-            closed,
-            x,
-            self.final_query,
-            self.eps,
-            self.config["attn_res_normalize_values"],
-        )[..., 0, :]
-        hidden = norm(last, self.final_norm, self.eps).astype(x.dtype)
+        hidden = (
+            prompt_glue.input_norm(x, closed, self.final_query, self.final_norm, self.eps, "final_norm")
+            if tapes is None and self.config["attn_res_normalize_values"]
+            else None
+        )
+        if hidden is None:
+            last = depth_reader(tapes, x.shape[1])(
+                closed,
+                x,
+                self.final_query,
+                self.eps,
+                self.config["attn_res_normalize_values"],
+            )[..., 0, :]
+            hidden = norm(last, self.final_norm, self.eps).astype(x.dtype)
         if len(self.visit_order) in capture_ids:
             captured[len(self.visit_order)] = hidden
         return hidden, [captured[i] for i in capture_ids]
