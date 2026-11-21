@@ -894,8 +894,11 @@ def _u32(value):
 
 
 def profiles(rel, rel_basis):
-    """RC6's relative profile ``rel @ rel_basis`` (bf16), one MLX product for the panel."""
-    return rel @ rel_basis.astype(rel.dtype)
+    """RC6's relative profile ``rel @ rel_basis`` (bf16), one product for the panel: lane F1's launch
+    where proven (``nax_profile.py``), else the library's."""
+    from .nax_profile import profile
+
+    return profile(rel, rel_basis, lambda: rel @ rel_basis.astype(rel.dtype))
 
 
 def attend(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newest, pos,

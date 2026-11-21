@@ -38,6 +38,8 @@ from .. import short_conv
 from ..precision import AffineWeight
 from ..attention import attend
 from ..projection import stock_messages
+from .frame_reads import final_hidden, pass_stack
+from .pass_messages import attach as attach_message, pass_rows
 from .routes import count
 from .state import DecodeState, VisitDelta
 
@@ -733,7 +735,7 @@ def decode_hidden(model, ids, state, *, embeddings=None, capture_ids=(), stages=
     panel = Panel(rows, state.pos, True if verify else None)
     closed, captured, deltas = [], {}, []
     x = embed(model, ids.reshape(1, rows)) if embeddings is None else embeddings
-    stack = entry = entry_blocks = None
+    stack = entry = entry_blocks = pass_reads = None
     for visit, index in enumerate(model.visit_order):
         if index == model.start:
             if visit == model.start:
@@ -741,18 +743,27 @@ def decode_hidden(model, ids, state, *, embeddings=None, capture_ids=(), stages=
                 stack = None
             else:
                 prior = [*closed[len(entry_blocks) + 1 :], x]
-                stack = mx.fast.rms_norm(mx.stack(prior, axis=-2).astype(mx.float32), None, model.eps)
+                # Lane F1: one read-kernel launch for the stack's norm where proven (frame_reads.py).
+                stack = pass_stack(prior, model.eps, model.message_queries)
                 x, closed = entry, list(entry_blocks)
+                # Lane F1: the pass's twelve message reads at once (pass_messages.py), where proven.
+                pass_reads = pass_rows(stack, model.message_queries, verify)
         if visit in capture_ids:
             captured[visit] = x
         message = None
         if model.start <= index < model.end and stack is not None:
             message = Message(stack, model.message_queries[index - model.start], verify)
+            if pass_reads is not None:
+                attach_message(message, pass_reads[index - model.start])
         x, delta = visit_step(model.layers[index], x, closed, message, state, visit, panel, stages, record)
         deltas.append(delta)
-    last = row_stable_read(panel, closed, x, model.final_query, model.eps,
-                           model.config["attn_res_normalize_values"])[..., 0, :]
-    hidden = ref.norm(last, model.final_norm, model.eps).astype(x.dtype)
+    def reference_hidden():
+        last = row_stable_read(panel, closed, x, model.final_query, model.eps,
+                               model.config["attn_res_normalize_values"])[..., 0, :]
+        return ref.norm(last, model.final_norm, model.eps).astype(x.dtype)
+
+    # Lane F1: the final read and norm in one read-kernel launch where proven (frame_reads.py).
+    hidden = final_hidden(model, panel, closed, x, reference_hidden)
     if len(model.visit_order) in capture_ids:
         captured[len(model.visit_order)] = hidden
     return hidden, [captured[i] for i in capture_ids], deltas

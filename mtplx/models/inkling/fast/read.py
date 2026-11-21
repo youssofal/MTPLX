@@ -949,12 +949,21 @@ def depth_read(queries, keys):
     if fixed_order():
         return attend_rows(q, keys)
 
-    def library_launches():
+    def library():
         kw = scores(q, keys)
         return probs(kw.get("scores"), width ** -0.5, kw.get("joined")) @ keys
 
-    one = exact_read(q, keys, library_launches)
-    return one if one is not None else library_launches()
+    def exact():
+        # The one-launch read built from the library's product code (exact_read), else its launches.
+        one = exact_read(q, keys, library)
+        return one if one is not None else library()
+
+    # Trial integration: two one-launch reads exist (nax_reads.depth_read and exact_read above), both
+    # proven bit for bit against the library's launches on first use. The first serves; with
+    # MTPLX_INKLING_NAX_READS=0 the second does. One of them goes once both are timed in one job.
+    from .nax_reads import depth_read as one_launch
+
+    return one_launch(queries, keys, exact)
 
 
 def message_rows(stack, queries):
