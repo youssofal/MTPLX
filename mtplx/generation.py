@@ -5996,6 +5996,13 @@ def _capture_gdn_boundary(
     eroded the middle (a 16,371-token match restored at 4,096, 2026-09-29).
     A position the sink does not admit (past an image prompt's first image)
     is not snapshotted at all.
+
+    A record the retention keeps is materialized here. Its arrays are lazy
+    clones, and a clone left lazy holds the buffer it was cut from until
+    something reads it: on Inkling 2 Mini a window visit's state is the last
+    1,024 rows of a 1,535-row prefill buffer, so each kept record pinned
+    0.25 GB instead of the 0.18 GB it copies, and the eight kept records were
+    1.7 GB of a 4K prompt read (21 November, Bare Speed through `mtplx serve`).
     """
     if sink is None or tokens_done < 1:
         return
@@ -6005,10 +6012,13 @@ def _capture_gdn_boundary(
         hidden_leaf = None
         if hidden_last is not None:
             hidden_leaf = detach_array_leaf(hidden_last, mode="contiguous_eval")
-        sink.append(
-            (int(tokens_done), snapshot_untrimmable_cache(cache), hidden_leaf)
-        )
+        record = (int(tokens_done), snapshot_untrimmable_cache(cache), hidden_leaf)
+        sink.append(record)
         _retain_boundary_sink(sink)
+        if any(kept is record for kept in sink):
+            arrays = _tree_mx_arrays(getattr(record[1], "states", None))
+            if arrays:
+                mx.eval(*arrays)
     except Exception:
         # Boundary capture is an accelerator for future restores; never let it
         # break the cold prefill that is running right now.
