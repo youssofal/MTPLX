@@ -53,6 +53,10 @@ _DOWN_ROWS = 8
 _MIX_COLS = 128
 
 
+#: The stream types the read kernels serve: bf16, and float16 on the FP16 packs (M1 and M2 Macs).
+_STREAM_TYPES = (mx.bfloat16, mx.float16)
+
+
 def _f32_bits(value: float) -> int:
     return struct.unpack("<I", struct.pack("<f", value))[0]
 
@@ -107,7 +111,7 @@ _READ = """
     threadgroup float inv[(S > 2 ? S : 2) + 2];
     threadgroup float dots[4 * 5][8];                  // (query, source) x bn8 slice
     threadgroup float prob[4][8];
-    threadgroup bfloat16_t mixed[MODE == 2 ? 2 * D : 1];
+    threadgroup T16 mixed[MODE == 2 ? 2 * D : 1];        // T16: the stream's 16-bit type
     threadgroup float down_part[2][8][4];
 
     const bool in_row = t * 4 < D;                     // threads past D/4 hold no columns
@@ -238,7 +242,7 @@ _READ = """
     }
 
     if (MODE == 0) {
-        // ---- 5. Input norm(s): MLX rms_single_row with the layer's gain, then the bf16 cast.
+        // ---- 5. Input norm(s): MLX rms_single_row with the layer's gain, then the cast to the stream's type.
         for (uint qn = 0; qn < NQ; ++qn) {
             float acc = 0;
             for (uint i = 0; i < 4; ++i) acc += out[qn][i] * out[qn][i];
@@ -252,11 +256,11 @@ _READ = """
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             const float iv = inv[S + (qn & 1)];
-            const device bfloat16_t* gain = qn == 0 ? g0 : (qn == 1 ? g1 : g2);
+            const device T16* gain = qn == 0 ? g0 : (qn == 1 ? g1 : g2);
             if (in_row) {
                 for (uint i = 0; i < 4; ++i) {
                     const float w = static_cast<float>(gain[c4 + i]);
-                    o0[(size_t(r) * NQ + qn) * D + c4 + i] = static_cast<OUT0>(static_cast<bfloat16_t>(w * (out[qn][i] * iv)));
+                    o0[(size_t(r) * NQ + qn) * D + c4 + i] = static_cast<OUT0>(static_cast<T16>(w * (out[qn][i] * iv)));
                 }
             }
         }
@@ -273,7 +277,8 @@ _READ = """
     float msg[4];
     for (uint i = 0; i < 4; ++i) msg[i] = in_row ? mrow[size_t(mq) * D + c4 + i] : 0.0f;
 
-    // 5b. The controller's two gain-free norms (MLX rms_single_row), concatenated, cast to bf16.
+    // 5b. The controller's two gain-free norms (MLX rms_single_row), concatenated, cast to the down
+    // weights' type (the stream's).
     {
         float ax = 0, am = 0;
         for (uint i = 0; i < 4; ++i) ax += out[0][i] * out[0][i];
@@ -294,8 +299,8 @@ _READ = """
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (in_row) {
             for (uint i = 0; i < 4; ++i) {
-                mixed[c4 + i] = static_cast<bfloat16_t>(1.0f * (out[0][i] * inv[S]));
-                mixed[D + c4 + i] = static_cast<bfloat16_t>(1.0f * (msg[i] * inv[S + 1]));
+                mixed[c4 + i] = static_cast<T16>(1.0f * (out[0][i] * inv[S]));
+                mixed[D + c4 + i] = static_cast<T16>(1.0f * (msg[i] * inv[S + 1]));
             }
             if (chunk == 0) {
                 for (uint i = 0; i < 4; ++i) {
@@ -307,11 +312,11 @@ _READ = """
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // 5c. Rows chunk*8 .. +7 of the controller's down product (64 x 2D, bf16), MLX gemv bn8.
+    // 5c. Rows chunk*8 .. +7 of the controller's down product (64 x 2D, the stream's type), MLX gemv bn8.
     if (sg < 16) {
         const uint blk = sg / 8;           // which 4-row block of the slice
         const uint v = sg % 8;             // bn8 slice
-        const device bfloat16_t* dw = ctrl == 0 ? d0 : (ctrl == 1 ? d1 : d2);
+        const device T16* dw = ctrl == 0 ? d0 : (ctrl == 1 ? d1 : d2);
         const uint row0 = chunk * DROWS + blk * 4;
         constexpr uint K2 = 2 * D;
         constexpr uint FULL2 = K2 / 1024;
@@ -346,7 +351,7 @@ _READ = """
         float total = down_part[blk][0][ro];
         for (uint v = 1; v < 8; ++v) total += down_part[blk][v][ro];
         o0[(size_t(r) * NC + ctrl) * 64 + chunk * DROWS + t] =
-            static_cast<OUT0>(static_cast<float>(static_cast<bfloat16_t>(total)));
+            static_cast<OUT0>(static_cast<float>(static_cast<T16>(total)));
     }
 """
 
@@ -475,7 +480,7 @@ _MIX = """
 
 @lru_cache(maxsize=1)
 def _read_kernel():
-    # Outputs: mode 0 o0 = normed inputs (bf16); mode 1 o0 = the read (f32); mode 2 o0 = the
+    # Outputs: mode 0 o0 = normed inputs (the stream's type); mode 1 o0 = the read (f32); mode 2 o0 = the
     # controllers' down products, o1 = their sources, o2 = their messages; mode 3 o0 = the keys
     # of a three-query read (f32). Unused ones are tiny.
     return mx.fast.metal_kernel(
@@ -517,10 +522,11 @@ def read(partial, closed, queries, eps, *, mode, gains=(), messages=None, read_i
          msg_base=0, controllers=0, f32_stand_in=None):
     """One launch of the read kernel for a panel.
 
-    ``partial``: ``(W, D)`` bf16 or f32; ``closed``: up to four ``(W, D)`` bf16 blocks;
+    ``partial``: ``(W, D)`` of the stream's 16-bit type (bf16, float16 on the FP16 packs) or f32;
+    ``closed``: up to four ``(W, D)`` blocks of the stream's type;
     ``queries``: ``(Q, D)`` f32, or ``None`` for layer 0 (no depth read: the partial itself is
     normed; then ``f32_stand_in``, any float32 array, fills the absent query buffer).
-    ``mode`` 0: input norms with ``gains`` -> ``(W, Q, D)`` bf16; 1: the read itself ->
+    ``mode`` 0: input norms with ``gains`` -> ``(W, Q, D)`` in the stream's type; 1: the read itself ->
     ``(W, 1, D)`` f32; 2: ``controllers`` controllers (down weights ``downs``) on the panel's
     exact message rows ``messages`` (``message_rows``) from query ``msg_base``, their sources the
     one-query read or, with ``read_in`` ``(W, 3, D)`` f32, RC6's three-query read ->
@@ -547,24 +553,22 @@ def read(partial, closed, queries, eps, *, mode, gains=(), messages=None, read_i
     sources = len(closed) + 1
     nq = 1 if noread else (queries.shape[0] if queries.ndim == 2 else 1)
     queries = queries.reshape(-1)[: nq * width].reshape(nq, width) if noread else queries.reshape(nq, width)
-    # The kernel rounds where RC6 rounds to the stream's dtype, and it rounds to bf16: a float16
-    # stream (the FP16 sibling packs) would get the wrong bits, so it is refused, counted, and the
-    # caller serves the reference (fast/step.py declines stage A and D by the activation dtype).
-    if any(getattr(a, "dtype", mx.bfloat16) not in (mx.bfloat16, mx.float32) for a in (*gains, *downs, partial, *closed)):
+    # The kernel rounds where RC6 rounds to the stream's dtype (``.astype(x.dtype)``), to the
+    # stream's 16-bit type T16: bf16, or float16 on the FP16 packs. Operands of two 16-bit types, or
+    # of another type, are refused, counted, and the caller serves the reference.
+    operands = (*gains, *downs, partial, *closed)
+    sixteen = [a for a in operands if a.dtype in _STREAM_TYPES]
+    if (any(a.dtype not in (*_STREAM_TYPES, mx.float32) for a in operands) or not sixteen
+            or any(a.dtype != sixteen[0].dtype for a in sixteen)):
         from .attn_input import count_route
 
         count_route("refused:read_stream_dtype")
-        raise RuntimeError("the read kernel serves bf16 streams only")
-    bf16 = [a for a in (*gains, *downs, partial, *closed) if a.dtype == mx.bfloat16]
-    if not bf16:
-        from .attn_input import count_route
-
-        count_route("refused:read_stream_dtype")
-        raise RuntimeError("the read kernel needs the bf16 stream's operands")
-    stand_bf16 = bf16[0]
-    stand_block = partial if partial.dtype == mx.bfloat16 else closed[0] if closed else partial
+        raise RuntimeError("the read kernel serves one 16-bit stream type (bf16 or float16)")
+    stream = sixteen[0].dtype
+    stand_16 = sixteen[0]
+    stand_block = partial if partial.dtype == stream else closed[0] if closed else partial
     pad = closed + [stand_block] * (4 - len(closed))
-    g = list(gains) + [stand_bf16] * (3 - len(gains))
+    g = list(gains) + [stand_16] * (3 - len(gains))
     rin = queries if read_in is None else read_in.reshape(rows, 3, width)
     msep, m = False, [queries] * 8
     if mode == 2:
@@ -581,15 +585,15 @@ def read(partial, closed, queries, eps, *, mode, gains=(), messages=None, read_i
         shapes = [(rows, controllers, 64), (rows, controllers, width), (rows, controllers, width)]
         dtypes = [mx.float32] * 3
     else:
-        d = [stand_bf16] * 3
+        d = [stand_16] * 3
         chunks, groups = 1, rows
         out0 = {0: (rows, nq, width), 1: (rows, 1, width), 3: (rows, sources, width)}[mode]
         shapes = [out0, (1,), (1,)]
-        dtypes = [mx.bfloat16 if mode == 0 else mx.float32, mx.float32, mx.float32]
+        dtypes = [stream if mode == 0 else mx.float32, mx.float32, mx.float32]
     tpg = _threads(width)
     outs = _read_kernel()(
         inputs=[*pad, partial, queries, *g, rin, *m, *d],
-        template=[("MODE", mode), ("D", width), ("S", sources), ("NQ", nq), ("TPG", tpg),
+        template=[("T16", stream), ("MODE", mode), ("D", width), ("S", sources), ("NQ", nq), ("TPG", tpg),
                   ("NOREAD", bool(noread)), ("READ_IN", read_in is not None), ("MSEP", msep),
                   ("OUT0", dtypes[0]), ("NC", max(controllers, 1)), ("CHUNKS", chunks),
                   ("DROWS", _DOWN_ROWS), ("MSG_BASE", msg_base),
@@ -1043,10 +1047,12 @@ def mlp_source(layer, partial, closed, messages=None, message_queries=None, *, r
     """
     from .attn_input import count_route
 
-    if any(c.dtype != mx.bfloat16 for c in closed) or partial.dtype not in (mx.bfloat16, mx.float32):
-        # RC6's read and controller round to the stream's dtype; these kernels round to bf16.
+    sixteen = {c.dtype for c in closed} | ({partial.dtype} - {mx.float32})
+    if len(sixteen) > 1 or not sixteen <= set(_STREAM_TYPES) or partial.dtype not in (*_STREAM_TYPES, mx.float32):
+        # RC6's read and controller round to the stream's dtype; these kernels round to that one
+        # 16-bit type (bf16, or float16 on the FP16 packs).
         count_route("refused:mlp_stream_dtype")
-        raise RuntimeError("the fused MLP read serves bf16 streams only")
+        raise RuntimeError("the fused MLP read serves one 16-bit stream type (bf16 or float16)")
     width = partial.shape[-1]
     count = partial.shape[-2]
     loop = messages is not None or rows is not None

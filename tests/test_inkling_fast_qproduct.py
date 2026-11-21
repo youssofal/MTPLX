@@ -87,7 +87,8 @@ def test_one_row_is_mlx_own_product():
 @needs
 @pytest.mark.parametrize("bits", [4, 8])
 @pytest.mark.parametrize("boundary", [False, True])
-def test_stage_c_in_one_launch_equals_the_steps_three(bits, boundary):
+@pytest.mark.parametrize("nr", [None, 1, 2, 4])
+def test_stage_c_in_one_launch_equals_the_steps_three(bits, boundary, nr):
     from types import SimpleNamespace
 
     from mtplx.models.inkling import short_conv
@@ -104,7 +105,9 @@ def test_stage_c_in_one_launch_equals_the_steps_three(bits, boundary):
         hg = (mx.random.normal((1, width, k), key=mx.random.key(width)) * 0.5).astype(mx.bfloat16)
         x = mx.random.normal((1, width, n), key=mx.random.key(50 + width)).astype(mx.bfloat16)
         tail = mx.random.normal((1, 3, n), key=mx.random.key(90)).astype(mx.bfloat16).astype(mx.float32) if with_tail else None
-        partial, attn = affine_output(hg, m, conv, tail, x, boundary, form=form)
+        # nr: output channels a simdgroup (None: the default); each layout is proven on its own and must give
+        # the step's bits.
+        partial, attn = affine_output(hg, m, conv, tail, x, boundary, form=form, nr=nr)
         ref_attn = m.one_row(hg) if width == 1 else affine_product(hg, m, prove=False)
         ref = short_conv.convolve(ref_attn, tail, conv.weight, None, False)[0].astype(mx.float32)
         if not boundary:

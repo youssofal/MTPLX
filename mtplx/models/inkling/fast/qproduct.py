@@ -441,7 +441,8 @@ _OUTPUT = """
     // rounded to the stream's 16-bit type T as that product returns it; the attention's static short
     // convolution over the committed tail with the reference kernel's arithmetic (short_conv, FORM as
     // proven for this width and type), cast to T as it casts; the residual in float32. A simdgroup
-    // owns four output channels for the whole panel, whose rows go in chunks of RCH.
+    // owns NR output channels for the whole panel (a channel's arithmetic does not depend on NR),
+    // whose rows go in chunks of RCH.
     constexpr uint NSG = THREADS / 32;
     constexpr int BLOCK = VPT * 32;
     constexpr int NB = K / BLOCK;                // blocks a row (K is a multiple of BLOCK)
@@ -449,7 +450,7 @@ _OUTPUT = """
     constexpr int GPR = K / G;                   // groups a row
     const uint sg = simdgroup_index_in_threadgroup;
     const uint lane = thread_index_in_simdgroup;
-    const uint row0 = threadgroup_position_in_grid.x * (NSG * 4) + sg * 4;
+    const uint row0 = threadgroup_position_in_grid.x * (NSG * NR) + sg * NR;
 
     // The inputs' totals (affine_lane::total) of every panel row, block and lane, once a threadgroup.
     threadgroup float lsum[SUMS ? W * NB * 32 : 1];
@@ -463,14 +464,14 @@ _OUTPUT = """
     if (row0 >= uint(N)) return;
 
     for (uint rc = 0; rc < uint(W); rc += RCH) {
-        float acc[4][RCH];
-        for (uint ro = 0; ro < 4; ++ro)
+        float acc[NR][RCH];
+        for (uint ro = 0; ro < NR; ++ro)
             for (uint r = 0; r < RCH; ++r) acc[ro][r] = 0.0f;
         for (int b = 0; b < NB; ++b) {
             const int col = b * BLOCK + int(lane) * VPT;
             if (NARROW) {
                 // The chunk's inputs first, then one output channel's codes at a time (few rows: one
-                // channel's codes live instead of four).
+                // channel's codes live instead of NR).
                 float xt[RCH][VPT], tot[RCH];
                 for (uint r = 0; r < RCH; ++r) {
                     if (rc + r >= uint(W)) break;
@@ -482,7 +483,7 @@ _OUTPUT = """
                         tot[r] = affine_lane::take<VPT, BITS>(xs, xt[r]);
                     }
                 }
-                for (uint ro = 0; ro < 4; ++ro) {
+                for (uint ro = 0; ro < NR; ++ro) {
                     const size_t row = min(row0 + ro, uint(N - 1));
                     const float sc = static_cast<float>(scales[row * GPR + col / G]);
                     const float bi = static_cast<float>(biases[row * GPR + col / G]);
@@ -495,8 +496,8 @@ _OUTPUT = """
                 }
             } else {
                 // Each output channel's codes unpacked once for the whole chunk.
-                float wf[4][VPT], sc[4], bi[4];
-                for (uint ro = 0; ro < 4; ++ro) {
+                float wf[NR][VPT], sc[NR], bi[NR];
+                for (uint ro = 0; ro < NR; ++ro) {
                     const size_t row = min(row0 + ro, uint(N - 1));
                     sc[ro] = static_cast<float>(scales[row * GPR + col / G]);
                     bi[ro] = static_cast<float>(biases[row * GPR + col / G]);
@@ -513,14 +514,14 @@ _OUTPUT = """
                     } else {
                         tot = affine_lane::take<VPT, BITS>(xs, xt);
                     }
-                    for (uint ro = 0; ro < 4; ++ro)
+                    for (uint ro = 0; ro < NR; ++ro)
                         acc[ro][r] += affine_lane::term<VPT, BITS>(xt, wf[ro], sc[ro], bi[ro], tot);
                 }
             }
         }
-        for (uint ro = 0; ro < 4; ++ro)
+        for (uint ro = 0; ro < NR; ++ro)
             for (uint r = 0; r < RCH; ++r) acc[ro][r] = simd_sum(acc[ro][r]);
-        if (lane < 4) {
+        if (lane < NR && row0 + lane < uint(N)) {
             // Lane l convolves channel row0 + l over the chunk's rows: its three previous inputs, oldest
             // first, are the committed tail or rows this lane wrote before (attn), then the chunk's own.
             const uint c = row0 + lane;
@@ -532,7 +533,7 @@ _OUTPUT = """
             for (uint r = 0; r < RCH; ++r) {
                 if (rc + r >= uint(W)) break;
                 float v = acc[0][r];
-                for (uint ro = 1; ro < 4; ++ro) v = (ro == lane) ? acc[ro][r] : v;
+                for (uint ro = 1; ro < NR; ++ro) v = (ro == lane) ? acc[ro][r] : v;
                 const float a = static_cast<float>(static_cast<T>(v));
                 seq[3 + r] = a;
                 attn[size_t(rc + r) * N + c] = a;
@@ -569,13 +570,20 @@ def _output_kernel():
 
 _output_verdicts: dict = {}
 #: Panels of at most this many rows (by bits) take the narrow order (the chunk's inputs first, one output
-#: channel's codes live at a time); wider panels share each channel's unpacked codes across their rows.
-#: Timed on the engine's GPU clock, replays of a 24-visit chain (x1/receipts/ceng-*-1.json): at 4 bits
-#: narrow 11.9 / 14.8 / 26.0 / 30.7 µs a visit at 1 to 4 rows against 17.7 / 22.7 / 27.0 / 31.2 wide, and
-#: 45.1 against 35.9 at 5; at 8 bits wide is ahead at every width (19.6 against 21.5 at one row).
-_OUTPUT_NARROW_ROWS = {4: 4, 8: 0}
-#: Threads of one stage C threadgroup (four output channels a simdgroup).
+#: channel's codes live at a time, four channels a simdgroup); wider panels share each channel's unpacked
+#: codes across their rows, _OUTPUT_NR channels a simdgroup. Engine GPU clock, replays of a 24-visit chain
+#: (x1/receipts/cnr-2.log, M5 Max, provisional), µs a visit at 4 bits, narrow with 4 channels against wide
+#: with 2: 1 row 28.2 / 30.0 (best of 15), 2 rows 24.9 / 24.7, 3 rows 26.3 / 19.4, 4 rows 30.6 / 21.1,
+#: 8 rows 54.3 (wide, 4 channels) / 33.5; on the 16 GB M4 (m4-out/m4-cnr-4bit-2.json) 47.6 / 47.5, 53.0 /
+#: 49.0, 99.9 / 57.5, 129.4 / 65.4, 213.2 / 116.6, and 16 and 32 rows 404 / 229, 779 / 454 (wide, 4 / 2).
+#: Every layout gives the same bits (each channel's arithmetic does not depend on it).
+_OUTPUT_NARROW_ROWS = {4: 1, 8: 0}
+#: Threads of one stage C threadgroup.
 _OUTPUT_THREADS = 128
+#: Output channels one simdgroup owns in the wide order, by bits. At 8 bits 4 stays ahead or level on
+#: the M5 Max at 1 to 8 rows (cnr-2.log: 18.9 / 19.8 at one row, 31.8 / 32.3 at 8) and on the M4 past 8
+#: rows (m4-cnr-8bit-wide.json: 212 / 223 at 16).
+_OUTPUT_NR = {4: 2, 8: 4}
 #: The inputs' totals computed once a threadgroup (shared memory and a barrier) measured slower than
 #: each simdgroup taking its own (ceng-*-1: 4-bit 33.0 against 31.2 µs a visit at 4 rows, 63.4 against
 #: 54.5 at 8; 8-bit 23.8 against 21.9 and 34.8 against 31.6), so stage C takes its own by default.
@@ -583,7 +591,7 @@ _OUTPUT_SUMS = False
 
 
 def affine_output(hg, weight, conv, tail, x, boundary, *, form, prove=True, narrow=None, threads=None, sums=None,
-                  rch=None):
+                  rch=None, nr=None):
     """The step's stage C on a stored-code output projection (``fast.step.output_projection``) in
     one launch: ``(partial (1, W, N) float32, attn (1, W, N) float32)``, every bit as the step's
     three launches give it (the product, the short convolution, the residual add).
@@ -616,6 +624,7 @@ def affine_output(hg, weight, conv, tail, x, boundary, *, form, prove=True, narr
     hg2, x2 = hg.reshape(rows, k), x.reshape(rows, n)
     narrow = (rows <= _OUTPUT_NARROW_ROWS.get(c["BITS"], 0)) if narrow is None else bool(narrow)
     threads = threads or _OUTPUT_THREADS
+    nr = int(nr or (4 if narrow else _OUTPUT_NR.get(c["BITS"], 4)))
     rch = min(rows, rch or (rows if narrow else _RCH_SMALL))
     nb = k // (c["VPT"] * 32)
     sums = (_OUTPUT_SUMS and rows * nb * 32 * 4 <= 24 * 1024) if sums is None else bool(sums)
@@ -624,17 +633,20 @@ def affine_output(hg, weight, conv, tail, x, boundary, *, form, prove=True, narr
                 tail if tail is not None else conv.weight.T, x2],
         template=[("T", hg.dtype), ("W", rows), ("K", k), ("N", n), ("BITS", c["BITS"]), ("G", c["GROUP"]),
                   ("VPT", c["VPT"]),
-                  ("THREADS", threads), ("RCH", rch), ("SUMS", sums), ("NARROW", narrow),
+                  ("THREADS", threads), ("NR", nr), ("RCH", rch), ("SUMS", sums), ("NARROW", narrow),
                   ("HAS_TAIL", tail is not None), ("BOUNDARY", bool(boundary)),
                   ("FORM", 0 if form == "float" else 1), ("DIVISOR", f32_bits(5 ** 0.5))],
-        grid=(-(-n // (threads // 32 * 4)) * threads, 1, 1),
+        grid=(-(-n // (threads // 32 * nr)) * threads, 1, 1),
         threadgroup=(threads, 1, 1),
         output_shapes=[(rows, n), (rows, n)],
         output_dtypes=[mx.float32, mx.float32],
     )
     partial, attn = partial.reshape(1, rows, n), attn.reshape(1, rows, n)
     if prove:
-        key = (n, k, c["BITS"], c["GROUP"], rows, tail is not None, bool(boundary), form, str(hg.dtype))
+        # The layout is part of the key: each is proven on its own (a channel's arithmetic does not depend on
+        # it, and the proof is what says so on this Mac).
+        key = (n, k, c["BITS"], c["GROUP"], rows, tail is not None, bool(boundary), form, str(hg.dtype), nr, narrow,
+               rch, sums, threads)
         verdict = _output_verdicts.get(key)
         if verdict is None:
             from .. import short_conv
