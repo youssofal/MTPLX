@@ -30,6 +30,26 @@ class AffineWeight(nn.Module):
         )
 
 
+class LogicalShape:
+    """The shape and dtype of a packed matrix, for code that sizes buffers or casts from them.
+
+    It holds no data: indexing it or multiplying by it fails, so a caller that needs the values
+    has to read the packed weight it describes."""
+
+    def __init__(self, shape, dtype):
+        self.shape, self.dtype = tuple(int(n) for n in shape), dtype
+
+    @property
+    def ndim(self):
+        return len(self.shape)
+
+
+def packed_logical_shape(weight):
+    """(rows, columns) and dtype of an ``AffineWeight`` as its dequantized matrix."""
+    rows, words = weight.codes.shape[-2:]
+    return LogicalShape((rows, words * 32 // weight.bits), weight.scales.dtype)
+
+
 def decoded_experts(codes, scales, mode, outer=None):
     fp4 = mode == "nvfp4"
     weight = mx.dequantize(

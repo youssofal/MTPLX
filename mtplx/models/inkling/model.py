@@ -15,7 +15,7 @@ from .activations import expert_inputs
 from . import expert_fusion
 from .head import fits_route, measured_route, note_route, pack_proofs, vocabulary_logits
 from .layout import layer_visits
-from .precision import AffineWeight, source_modes
+from .precision import AffineWeight, packed_logical_shape, source_modes
 from .projection import panel_linear, serial_messages, stock_messages
 from .short_conv import convolve
 
@@ -539,10 +539,20 @@ class Layer(nn.Module):
 class Embedding(nn.Module):
     def __init__(self, weight, gain, eps):
         super().__init__()
-        self.weight, self.gain, self.eps = weight, gain, eps
+        self.gain, self.eps = gain, eps
+        # A 4-bit embedding (Bare Speed) dequantizes only the rows a step gathers; `weight` then
+        # answers .dtype and .shape for the code that sizes buffers from it, and holds no data.
+        self.packed = weight if isinstance(weight, AffineWeight) else None
+        self.weight = packed_logical_shape(weight) if self.packed is not None else weight
 
     def __call__(self, ids):
-        return mx.fast.rms_norm(self.weight[ids], self.gain, self.eps)
+        if self.packed is None:
+            return mx.fast.rms_norm(self.weight[ids], self.gain, self.eps)
+        w = self.packed
+        rows = mx.dequantize(
+            w.codes[ids], w.scales[ids], w.biases[ids], bits=w.bits, group_size=w.group_size
+        )
+        return mx.fast.rms_norm(rows, self.gain, self.eps)
 
 
 class Model(nn.Module):
