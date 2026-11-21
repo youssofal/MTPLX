@@ -116,3 +116,19 @@ def test_a_packed_product_is_batched_only_where_its_rows_prove_equal_to_one_row(
     fast_step.proven_rows(key_other, batched(rows_differ), per_row)  # refused: rows alone
     assert calls == ["batched", "rows"]
     assert fast_route_counts().get("rows_proof.test.one_at_a_time", 0) >= 1
+
+
+def test_wide_copy_rounds_need_every_stage_a_and_mlp_read_on_the_lane_kernels():
+    dense = mx.zeros((8, 256), mx.bfloat16)
+
+    def layer(v=dense):
+        controllers = [SimpleNamespace(down=dense) for _ in range(4)]
+        return SimpleNamespace(q=dense, k=dense, v=v, r=dense, sink=dense, gate=dense, out=dense, experts=None,
+                               convs=[SimpleNamespace(dynamic=None) for _ in range(4)], controllers=controllers)
+
+    native = SimpleNamespace(layers=[layer(), layer()], visit_order=[0, 1, 1], start=1, end=2,
+                             embed_tokens=SimpleNamespace(weight=dense), unembed=dense)
+    assert fast_step.wide_rows_exact(native, "a,bc,d,e")
+    assert not fast_step.wide_rows_exact(native, "bc,e")  # reference stage A reads wide panels batched
+    six_bit = SimpleNamespace(**{**vars(native), "layers": [layer(), layer(v=packed(64, 256, 6))]})
+    assert not fast_step.wide_rows_exact(six_bit, "a,bc,d,e")  # a 6-bit v: stage A falls back

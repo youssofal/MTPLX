@@ -28,10 +28,12 @@ from .copy_draft import PromptCopy, SessionPromptIndexes
 from .customer_controls import ProposalSampler, RepetitionOutput
 from .fast import draft as fast_draft
 from .fast import engine_site
-from .fast.decoder import fast_enabled
+from .fast.decoder import fast_enabled, stage_spec
+from .fast.step import wide_rows_exact
 from .fast.state import MAX_PANEL
 from .fast.routes import count
 from .fast import round as fast_round
+from .fast import round_program
 from .protocol import completion_text
 from .sampling import draw_native, is_native_sampler
 from mtplx.token_ids import token_id_bytes
@@ -153,6 +155,10 @@ def generate(
     device_ok, device_decline = decision_route(sampler, constraint=constraint, draft_sampler=draft_sampler,
                                                verify_strategy=verify_strategy, controls=controls)
     count("decision.device" if device_ok else f"decision.host.{device_decline}")
+    # MTPLX_INKLING_ROUND_PROGRAM=0 keeps every round on the replayed step and the pieces around
+    # it (a diagnostic rollback; round.decline.* counts every round the program does not serve).
+    round_program_on = os.environ.get("MTPLX_INKLING_ROUND_PROGRAM", "on").strip().lower() not in (
+        "0", "off", "false", "no")
     round_seed = int(seed) if seed is not None else secrets.randbits(64)
     target_temperature = float(sampler.temperature or 0.0)
     draft_temperature = float(draft_sampler.temperature) if draft_sampler is not None else target_temperature
@@ -173,9 +179,11 @@ def generate(
     )
     copy = PromptCopy(
         # The fast step verifies up to 32 rows, every row equal to the one-row step, so a long
-        # copied run is verified in one round; RC6's path keeps the drafter's 8-row block.
+        # copied run is verified in one round; RC6's path, and a pack whose stage A or MLP read
+        # still takes the reference product on some visit, keep the drafter's 8-row block.
         prompt_ids, session_id=session_id,
-        verify_rows=(MAX_PANEL if fast_enabled() and getattr(rt, "fast", None) is not None else rt.drafter.width),
+        verify_rows=(MAX_PANEL if fast_enabled() and getattr(rt, "fast", None) is not None
+                     and wide_rows_exact(rt.model, stage_spec()) else rt.drafter.width),
         image_pad=getattr(vision_splice, "image_pad_token_id", None),
         indexes=SessionPromptIndexes.for_runtime(rt) if session_id else None,
     )
@@ -238,6 +246,8 @@ def generate(
                 # How the verify step was served: replayed natively, recording, checking, the
                 # MLX graph or declined, and why (per-round attribution for the Pulse rows).
                 "engine": engine_site.last_route(),
+                # Whether the whole round ran as one native program (lane L7), and why not.
+                "round": round_program.last_route(),
                 "fallback_deltas": {"prompt_copy_decline": declines} if declines else {},
                 # Host seconds. Verify includes the existing logits synchronization.
                 # Commit ends on return from the existing cache update and draft observation.
@@ -323,8 +333,17 @@ def generate(
                 depth_control.observe(0, 0, [token])
             continue
         position = len(prompt_ids) + len(tokens)
-        law = None
-        if copied is None and device_ok:
+        law = served = None
+        if copied is None and device_ok and round_program_on:
+            # The whole round (proposals, verify and decision) as one native program where one
+            # is live (lane L7); otherwise the same round from the pieces below, same law.
+            served = round_program.serve(rt, anchor, cache, min(selected_depth, remaining),
+                                         position=position, seed=round_seed, temperature=target_temperature,
+                                         draft_temperature=draft_temperature)
+        if served is not None:
+            block = proposed = served.block
+            device_proposal_rounds += 1
+        elif copied is None and device_ok:
             # Proposals drawn on the GPU from the drafter's soft-capped law at the draft
             # temperature; the law comes back for the acceptance test.
             proposed, law = fast_draft.propose(
@@ -350,7 +369,10 @@ def generate(
         proposal_s = perf_counter() - round_started
         draft_s += proposal_s
         verify_started = perf_counter()
-        rows, features, tapes = rt.verify(block, cache)
+        if served is not None:
+            rows, features, tapes = served.rows, served.features, served.pending
+        else:
+            rows, features, tapes = rt.verify(block, cache)
         verified_rows = rows
         decision = None
         width = len(block) if isinstance(block, list) else int(block.shape[0])
@@ -359,8 +381,9 @@ def generate(
             # (exact under the seed-match rule; counted), the step stays fast.
             count("decision.host.wide_copy")
         elif device_ok:
-            packet = fast_round.decide(rows, proposed, position=position, seed=round_seed,
-                                       temperature=target_temperature, draft=law)
+            packet = (served.packet if served is not None else
+                      fast_round.decide(rows, proposed, position=position, seed=round_seed,
+                                        temperature=target_temperature, draft=law))
             # The round's only read; the owner's eval keeps the stall watchdog ticking.
             decision = fast_round.read_packet(packet, width, settle=eval_rows)
             if decision.status:

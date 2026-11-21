@@ -12,6 +12,7 @@ from . import expert_fusion
 from .draft import Drafter
 from .fast import engine_site
 from .fast import round as fast_round
+from .fast import round_program
 from .fast.decoder import DECLINED, FastDecoder, FastPending, fast_enabled, round_costs
 from .layout import cache_footprint
 from .model import load_target
@@ -43,6 +44,7 @@ class InklingRuntime(MTPLXRuntime):
         # the step's program for widths 1 to 8 on a synthetic state (no request touched), so
         # the first request neither compiles nor records.
         self.engine_warm, self.engine_pool_bytes = {"skipped": "fast path off"}, 0
+        self.round_warm = {"skipped": "fast path off"}
         # The depth controller's round costs on this Mac and pack (None: RC6's table).
         self.round_cost_ms, self.round_cost_detail = None, "fast path off"
         if fast_enabled() and mx.default_device() == mx.gpu and mx.metal.is_available():
@@ -50,6 +52,9 @@ class InklingRuntime(MTPLXRuntime):
             if self.drafter is not None:
                 fast_round.warm()
             self.engine_warm = engine_site.warm(self)
+            # The DSpark round as one program for 1 to 7 proposals (lane L7), recorded and checked
+            # before ready, so no request records; the pool below is read after it.
+            self.round_warm = round_program.warm(self) if self.drafter is not None else {"skipped": "no drafter"}
             # The executor's pool after warm-up (one pool serves every width's temporaries).
             executor = engine_site.health().get("executor") or {}
             self.engine_pool_bytes = int(executor.get("pool_bytes") or 0)

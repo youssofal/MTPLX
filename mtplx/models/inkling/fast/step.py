@@ -263,8 +263,17 @@ def expert_input(layer, partial, closed, message, panel):
 
 
 def experts(layer, source, partial, dtype, state, visit, panel):
-    """Stage E (reference). ``(visit output (1, W, 2304) in dtype, MLP conv inputs float32)``."""
-    routed = layer.experts(ref.norm(source, layer.ffn_norm, layer.eps).astype(dtype))
+    """Stage E (reference). ``(visit output (1, W, 2304) in dtype, MLP conv inputs float32)``.
+
+    Past 8 rows the reference block's router product is the stock product, whose rows need not
+    equal the one-row router's (Bare Speed's packed experts at 16 rows: rows 5 to 10 differed,
+    receipts/integrate-all-bare.json), so a wide panel routes in pieces of at most 8 rows."""
+    normed = ref.norm(source, layer.ffn_norm, layer.eps).astype(dtype)
+    if panel.rows > ROW_STABLE_ROWS:
+        routed = mx.concatenate([layer.experts(normed[:, start:stop]) for start, stop in row_chunks(panel.rows)],
+                                axis=1)
+    else:
+        routed = layer.experts(normed)
     out = convolution(layer.convs[3], routed, state.tail(visit, 3), panel).astype(mx.float32)
     return (partial + out).astype(dtype), routed.astype(mx.float32)
 
@@ -334,6 +343,19 @@ def expert_input_reason(layer, message):
     if message and isinstance(layer.controllers[3].down, AffineWeight):
         return f"packed_{layer.controllers[3].down.bits}bit"
     return None
+
+
+def wide_rows_exact(model, spec):
+    """Whether panels wider than 8 rows keep every row equal to the one-row step with this lane
+    set on this pack: every visit's stage A and MLP read on lane L1's kernels (the reference
+    stages read wide panels with the stock product); experts, the output projection, the final
+    read and the head are row-stable at any width (lane kernels, or pieces of 8 rows, or one row
+    at a time for stored codes)."""
+    lanes = {part.strip() for part in spec.split(",") if part.strip()}
+    if not {"a", "bc", "d"} <= lanes:
+        return False
+    found = stage_fallbacks(model, spec, ROW_STABLE_ROWS + 1)
+    return not any(key.startswith(("fallback.a.", "fallback.d.")) for key in found)
 
 
 def stage_fallbacks(model, spec, rows, dtype=None):
