@@ -305,8 +305,9 @@ def _prompt_route(operands, window):
     reason = "forced_stock" if forced else "window" if window else P.decline(*operands, window)
     serve = P.prompt_attention if reason is None else None
     counters = ["prompt_fused.full." + ("selected" if reason is None else "stock." + reason)] if not window else []
-    if reason is not None and not forced:
-        # Calls RC6 keeps on MLX's full kernel: the same rows in fewer, larger calls.
+    if reason is not None and not forced and os.environ.get("MTPLX_INKLING_PROMPT_MERGED", "on") != "off":
+        # Calls RC6 keeps on MLX's full kernel: the same rows in fewer, larger calls
+        # (MTPLX_INKLING_PROMPT_MERGED=off keeps RC6's own calls for these alone).
         merged = P.merged_decline(*operands, window)
         counters.append(f"prompt_merged.{scope}." + ("selected" if merged is None else "stock." + merged))
         serve = P.merged_attention if merged is None else None

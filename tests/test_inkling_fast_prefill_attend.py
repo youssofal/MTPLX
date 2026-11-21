@@ -137,3 +137,11 @@ def test_window_prompt_call_takes_the_merged_route(monkeypatch):
     ref = attention.attend(q, k, v, prof, sink, 1024)
     mx.eval(got, ref)
     assert bool(mx.array_equal(ref.view(mx.uint16), got.view(mx.uint16)).item())
+    # the merged calls alone can be switched off; the call then runs RC6's own tiles
+    monkeypatch.delenv("MTPLX_INKLING_PROMPT_ATTENTION", raising=False)
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_MERGED", "off")
+    still = attention.attention_route_counts().get("prompt_merged.window.selected", 0)
+    off = attention.attend(q, k, v, prof, sink, 1024)
+    mx.eval(off)
+    assert attention.attention_route_counts().get("prompt_merged.window.selected", 0) == still
+    assert bool(mx.array_equal(ref.view(mx.uint16), off.view(mx.uint16)).item())
