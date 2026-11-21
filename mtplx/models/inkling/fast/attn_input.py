@@ -4,15 +4,22 @@ RC6 spends about 55 Metal launches here on a first-pass visit and about 100 on l
 two and three (`model.py` 487-510 and 441-466): the depth read, the cross-pass controllers,
 the input norms, six or eight separate projections, the per-head clips, the value norm,
 the position scale, both short convolutions and the cache update. This module runs the
-same arithmetic in two launches (first pass) or three (passes two and three):
+same arithmetic in these launches (W panel rows):
 
-1. ``read`` (``fast/read.py``): depth read, message read, controller norms and down product,
-   input norms.
-2. passes two and three only: controller forget/gain products and the tanh mix.
-3. ``project`` (here): every projection of the visit for the whole panel in one launch,
+1. ``read`` (``fast/read.py``): one-query depth read, controller norms and down product, input
+   norms; on global visits the keys of the three-query read.
+2. RC6's three-query depth read (global visits, ``W + 2`` launches: per-row scores and the mix
+   on MLX's own products, softmax between) and four-query message read (passes 2 and 3,
+   ``2 W + 1``: per-row scores and mixes, softmax between, shared with the expert input):
+   their order is the matrix unit's, so they run as the very MLX calls RC6 makes.
+3. passes two and three only: controller forget/gain products and the tanh mix.
+4. ``project`` (here): every projection of the visit for the whole panel in one launch,
    each stored bf16 weight row read once per panel and in place, followed by the per-head
    epilogues: scaled clips of query and relative, the position scale, both convolutions
    with their committed tails, the key clip and the value norm.
+
+Launches a visit: window first pass 2; global first pass ``W + 4``; window loop pass ``2 W + 4``;
+global loop pass ``3 W + 7``.
 
 Exactness (class A, proven on first use): every output row of a product is a twin of
 MLX 0.32.2's one-row ``gemv`` for that matrix shape (``matmul.cpp`` ``gemv_axbpy``):
@@ -158,9 +165,23 @@ _PROJECT = """
     const uint src = (NS == 3) ? (kind == 1 ? 1u : (kind == 2 ? 2u : 0u)) : 0u;
 
     if (RAW) {
-        // MLX rms_single_row, second level: simd_sum of the per-128 partials, zero padded.
+        // MLX rms_single_row, second level: simd_sum of the per-128 partials, zero padded. PARTS_IN:
+        // the partials come with the input; otherwise the first level runs here, one simdgroup a
+        // row: 4 values a lane fused-multiply-added from zero, simd_sum per 128 columns.
         for (uint r = sg; r < W; r += NSG) {
-            const float part = lane < (D / 128) ? parts[(r * NS + src) * (D / 128) + lane] : 0.0f;
+            float part = 0.0f;
+            if (PARTS_IN) {
+                part = lane < (D / 128) ? parts[(r * NS + src) * (D / 128) + lane] : 0.0f;
+            } else {
+                for (uint j = 0; j < D / 128; ++j) {
+                    const float4 h4 = *reinterpret_cast<const device float4*>(
+                        hraw + (size_t(r) * NS + src) * D + j * 128 + lane * 4);
+                    float acc = 0;
+                    for (uint i = 0; i < 4; ++i) acc += h4[i] * h4[i];
+                    acc = simd_sum(acc);
+                    if (lane == j) part = acc;
+                }
+            }
             const float total = simd_sum(part);
             if (lane == 0) {
                 inv_rows[r] = metal::precise::rsqrt(total / float(D) + as_type<float>(uint(NORM_EPS)));
@@ -423,8 +444,10 @@ _PROJECT = """
             const bool keys = kind == 1;
             const device float* tail = keys ? k_tail : v_tail;
             const device float* cw = keys ? k_conv : v_conv;
-            const int64_t cw0 = keys ? k_conv_strides[0] : v_conv_strides[0];
-            const int64_t cw1 = keys ? k_conv_strides[1] : v_conv_strides[1];
+            // Tap t of channel ch: the weight arrives as stored, (KN, 4) channel-major for the
+            // window layers' static weight (CONV_CM), (4, KN) for the global layers'.
+            const uint cw0 = CONV_CM ? 1 : KN;
+            const uint cw1 = CONV_CM ? 4 : 1;
             device float* conv_in = keys ? k_conv_in : v_conv_in;
             device bfloat16_t* rows_out = keys ? k_rows : v_rows;
             float y[4];
@@ -499,8 +522,6 @@ def _project_kernel():
         output_names=["q", "rel", "sink", "gate", "k_rows", "v_rows", "k_conv_in", "v_conv_in"],
         header=_HEADER,
         source=_PROJECT,
-        # The static convolution weights are column-major views; they are read through strides.
-        ensure_row_contiguous=False,
     )
 
 
@@ -521,8 +542,9 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
 
     ``sources``: ``(W, NS, D)`` bf16 normed inputs (``NS`` 1: q = k = v input; 3: q, k, v
     inputs), or ``None`` with ``raw = (h, parts, gains)``: ``h`` ``(W, 3, D)`` float32
-    un-normed sources, ``parts`` ``(W, 3, D // 128)`` the norm's per-128 partial sums,
-    ``gains`` the three ``(D,)`` bf16 norm weights (the norm then runs here, as MLX writes it).
+    un-normed sources, ``parts`` ``(W, 3, D // 128)`` the norm's per-128 partial sums (or
+    ``None``: computed here), ``gains`` the three ``(D,)`` bf16 norm weights (the norm then runs
+    here, as MLX writes it).
     ``k_tail``/``v_tail``: ``(1, 3, KN)`` float32 committed convolution inputs or ``None``.
     ``pos``: uint32 array, committed tokens. ``form``: short_conv's proven static form.
     """
@@ -541,22 +563,30 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
     taps = 0
     if global_visit:
         taps = layer.convs[0].dynamic.shape[0] // kv_heads
+    # Every input must reach the launch row-contiguous without a copy (the kernel copies any
+    # that is not, and only those). The window layers' static convolution weight is a transposed
+    # view of its stored (KN, 4) array (model.Convolution: weight[:, 0, :].T), so it is passed
+    # back in that stored layout; the global layers' static_w is stored (4, KN).
+    conv_cm = layer.convs[0].dynamic is None
+    k_conv = layer.convs[0].weight.T if conv_cm else layer.convs[0].weight
+    v_conv = layer.convs[1].weight.T if conv_cm else layer.convs[1].weight
     # Stand-ins for absent operands are existing arrays (never read), so no fill launches.
-    stand_f32, stand_bf16 = layer.convs[0].weight, layer.q_scale
+    stand_f32, stand_bf16 = k_conv, layer.q_scale
+    parts_in = True
     if raw is None:
         rows, ns = sources.shape[0], sources.shape[1]
-        normed = mx.contiguous(sources)
+        normed = sources
         hraw = parts = stand_f32
         gain_list = [stand_bf16] * 3
     else:
         hraw, parts, gain_list = raw
         rows, ns = hraw.shape[0], hraw.shape[1]
-        hraw, parts = mx.contiguous(hraw), mx.contiguous(parts)
+        parts_in = parts is not None
+        if not parts_in:
+            parts = stand_f32
         normed = stand_bf16
         gain_list = list(gain_list) + [gain_list[-1]] * (3 - len(gain_list))
     has_tail = k_tail is not None and v_tail is not None
-    if has_tail:
-        k_tail, v_tail = mx.contiguous(k_tail), mx.contiguous(v_tail)
     stand_in = stand_f32
     wkt = layer.convs[0].dynamic if taps else layer.k
     wvt = layer.convs[1].dynamic if taps else layer.v
@@ -580,16 +610,17 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
         inputs=[
             normed, hraw, parts, *gain_list,
             layer.q, layer.r, layer.sink, layer.gate, layer.k, layer.v, wkt, wvt,
-            layer.q_scale, layer.r_scale, layer.convs[0].weight, layer.convs[1].weight,
+            layer.q_scale, layer.r_scale, k_conv, v_conv,
             k_tail if has_tail else stand_in, v_tail if has_tail else stand_in, pos,
         ],
         template=[
-            ("W", rows), ("NS", ns), ("RAW", raw is not None), ("STAGE", stage), ("STAGE2", stage2),
+            ("W", rows), ("NS", ns), ("RAW", raw is not None), ("PARTS_IN", parts_in),
+            ("STAGE", stage), ("STAGE2", stage2),
             ("KC", kc), ("GLOBAL", global_visit),
             ("D", width), ("QH", q_heads), ("HD", head_dim), ("RD", rel_dim),
             ("KH", kv_heads), ("KN", kv_width), ("GN", gate_rows), ("GROWS", gate_rows_unit),
             ("TAPS", taps), ("RCH", min(rows, _ROW_CHUNK)), ("THREADS", threads),
-            ("HAS_TAIL", has_tail), ("FORM", 0 if form == "float" else 1),
+            ("HAS_TAIL", has_tail), ("FORM", 0 if form == "float" else 1), ("CONV_CM", conv_cm),
             ("VNORM", bool(cfg["use_value_norm_no_gamma"])),
             ("QK_CLIP", f32_bits(cfg["qk_l2_clip_threshold"])),
             ("REL_CLIP", f32_bits(cfg["rel_l2_clip_threshold"])),
@@ -618,18 +649,20 @@ def _static_form(width, size):
     return short_conv._proven(mx.bfloat16, None, width, 1, size)
 
 
-def attention_input(layer, x, closed, k_tail, v_tail, pos, messages=None, message_queries=None):
+def attention_input(layer, x, closed, k_tail, v_tail, pos, messages=None, message_queries=None, *,
+                    rows=None):
     """Stage A of one visit for a panel of ``W`` rows (``lanes/SIGNATURES.md`` section 3A).
 
     ``x`` ``(1, W, D)`` bf16; ``closed`` RC6's closed blocks before this layer's append;
     ``k_tail``/``v_tail`` ``(1, 3, 1024)`` f32 (or ``None``: zeros); ``pos`` uint32 committed
     tokens; on loop passes 2 and 3 ``messages`` (RC6's normalised message stack
-    ``(1, W, P, D)`` f32) and ``message_queries`` (the visit's ``(4, D)`` rows). Returns
-    ``Projected`` (q, rel, sink, gate_logits, k_rows, v_rows, k_conv_in, v_conv_in).
-    Two launches on the first pass, three on passes 2 and 3. Raises ``RuntimeError`` when
-    this Mac's convolution proof refused the static form (the caller serves RC6's path).
+    ``(1, W, P, D)`` f32) and ``message_queries`` (the visit's ``(4, D)`` rows), or ``rows``, the
+    visit's exact message rows (``read.message_rows``) when they are already read. Returns
+    ``Projected`` (q, rel, sink, gate_logits, k_rows, v_rows, k_conv_in, v_conv_in), bit-identical
+    to RC6's one-row step for every row. Raises ``RuntimeError`` when this Mac's convolution
+    proof refused the static form (the caller serves RC6's path).
     """
-    from .read import mix, read
+    from .read import depth_keys, depth_read, message_rows, mix, read
 
     form = "float"
     if layer.sliding:
@@ -637,31 +670,42 @@ def attention_input(layer, x, closed, k_tail, v_tail, pos, messages=None, messag
         if form not in ("float", "fused"):
             count_route("refused:static_conv_unproven")
             raise RuntimeError(f"static convolution unproven on this GPU: {form}")
-    count_route("fused:" + ("window" if layer.sliding else "global") + ("_loop" if messages is not None else "_first"))
-    rows, width = x.shape[-2], x.shape[-1]
-    x2 = x.reshape(rows, width)
-    closed2 = [c.reshape(rows, width) for c in closed]
-    gains = [layer.qkv_norm[0]] if layer.sliding else list(layer.qkv_norm)
-    if messages is None:
-        (normed,) = read(x2, closed2, layer.attn_query, layer.eps, mode=0, gains=gains,
+    if not layer.cfg["attn_res_normalize_values"]:
+        count_route("refused:unnormalized_values")
+        raise RuntimeError("the fused stage serves depth reads that mix normalized sources")
+    loop = messages is not None or rows is not None
+    count_route("fused:" + ("window" if layer.sliding else "global") + ("_loop" if loop else "_first"))
+    count, width = x.shape[-2], x.shape[-1]
+    x2 = x.reshape(count, width)
+    closed2 = [c.reshape(count, width) for c in closed]
+    if layer.sliding and not loop:
+        (normed,) = read(x2, closed2, layer.attn_query, layer.eps, mode=0, gains=[layer.qkv_norm[0]],
                          f32_stand_in=layer.mlp_query)
         return project(layer, normed, k_tail, v_tail, pos, form=form)
+    exact = None
+    if not layer.sliding:
+        # RC6's three-query read: keys here, products on MLX's own kernels (see read.depth_read).
+        keys = depth_keys(x2, closed2, layer.attn_query, layer.eps)
+        exact = depth_read(layer.attn_query, keys).reshape(count, 3, width)
+        if not loop:
+            return project(layer, None, k_tail, v_tail, pos, raw=(exact, None, list(layer.qkv_norm)),
+                           form=form)
+    if rows is None:
+        rows = message_rows(messages, message_queries)
     controllers = layer.controllers[:3]
-    state, xs, ms = read(x2, closed2, layer.attn_query, layer.eps, mode=2, messages=messages,
-                         message_queries=message_queries, downs=[c.down for c in controllers],
-                         msg_base=0, controllers=3)
+    state, xs, ms = read(x2, closed2, layer.attn_query, layer.eps, mode=2, messages=rows, read_in=exact,
+                         downs=[c.down for c in controllers], msg_base=0, controllers=3)
     h, parts = mix(state, xs, ms, [c.forget for c in controllers], [c.gain for c in controllers],
                    parts=True)
-    if layer.sliding:
-        gains = gains * 3
+    gains = [layer.qkv_norm[0]] * 3 if layer.sliding else list(layer.qkv_norm)
     return project(layer, None, k_tail, v_tail, pos, raw=(h, parts, gains), form=form)
 
 
 def stage_attention_input(layer, x, closed, message, state, visit, panel):
     """Drop-in for ``fast.step.Stages.attention_input`` (L0's frame): same arguments, same result type."""
+    from .read import message_rows_of
     from .step import AttentionInput
 
     p = attention_input(layer, x, closed, state.tail(visit, 0), state.tail(visit, 1), panel.pos,
-                        None if message is None else message.stack,
-                        None if message is None else message.queries)
+                        rows=None if message is None else message_rows_of(message))
     return AttentionInput(p.q, p.rel, p.sink, p.gate_logits, p.k_rows, p.v_rows, p.k_conv_in, p.v_conv_in)

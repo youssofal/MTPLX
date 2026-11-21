@@ -8,26 +8,29 @@ operations (``model.py`` ``read_blocks``, ``serial_depth_dots``, ``Controller``,
 ``projection.py`` ``stock_messages``): about 25 launches a read on the first pass and about
 70 more on passes two and three.
 
-Two kernels here:
+Three kernels here:
 
 * ``read``: one threadgroup per panel row (and, with controllers, per source and slice of
-  the controller's down product). The depth read, the message read, the controller norms,
-  a slice of the down product, or the input norm(s).
+  the controller's down product). The one-query depth read, the controller norms, a slice of
+  the down product, the input norm(s), or the keys of a three-query read.
+* ``probs``: RC6's scale and softmax between the two products of a three- or four-query read.
 * ``mix``: the controllers' forget and gain products, the tanh mix, and the per-128 partial
   sums the following input norm needs; one threadgroup per source and 128-column slice,
   serving every panel row.
 
-Exactness. Each step repeats MLX 0.32.2's own kernel for that step, thread for thread:
-``rms_single_row`` (4 values a thread fused-multiply-added from zero, ``simd_sum``, then
-``simd_sum`` over the zero-padded simdgroup totals, ``precise::rsqrt``), the one-query
-``gemv`` (``bn8``: eight slices of 1,024-column blocks with a zero-padded tail, a tree per
-slice, slices added in order), ``block_softmax`` (``fast::exp``, ``1 / sum``), ``gemv_t``
-(``bn16 sm8 sn4``: sequential over sources, then three shuffle steps), the controller's
-``gemv`` (down: ``bn8`` over 4,608; forget/gain: ``sm8 sn4`` over 64) and ``precise::tanh``.
-One-query reads, every norm and the controllers are therefore class A. RC6's three-query
-depth read (global visits) and four-query message read go through MLX's matrix-unit GEMM,
-whose order no kernel can repeat and which differs between Macs; here each query is computed
-exactly as MLX's one-query path would (class C, fixed and row-stable, measured).
+Exactness (class A against RC6 on every Mac). Each kernel step repeats MLX 0.32.2's own kernel
+for that step, thread for thread: ``rms_single_row`` (4 values a thread fused-multiply-added
+from zero, ``simd_sum``, then ``simd_sum`` over the zero-padded simdgroup totals,
+``precise::rsqrt``), the one-query ``gemv`` (``bn8``: eight slices of 1,024-column blocks with a
+zero-padded tail, a tree per slice, slices added in order), ``block_softmax`` (``fast::exp``,
+``1 / sum``), ``gemv_t`` (``bn16 sm8 sn4``: sequential over sources, then three shuffle steps),
+the controller's ``gemv`` (down: ``bn8`` over 4,608; forget/gain: ``sm8 sn4`` over 64) and
+``precise::tanh``. RC6's three-query depth read (global visits) and four-query message read
+multiply on MLX's matrix units, whose summation order is the hardware's and differs between
+Macs, so those products are not reproduced: they run here as the very MLX calls RC6 makes, on
+the same shapes and types (scores one row at a time, as RC6's verify and one-row step do; the
+depth read's mix batched over the panel and the message mix per row, as RC6 calls them), and
+their results feed the kernels.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ from __future__ import annotations
 from functools import lru_cache
 import math
 import struct
+import weakref
 
 import mlx.core as mx
 
@@ -70,8 +74,8 @@ _READ = """
     const uint chunk = MODE == 2 ? g % CHUNKS : 0;
     const uint ctrl = MODE == 2 ? (g / CHUNKS) % NC : 0;
     const uint r = MODE == 2 ? g / (CHUNKS * NC) : g;
-    // Which read query feeds this threadgroup's output(s); which message query its controller uses.
-    const uint q_first = MODE == 2 ? (NQ == 3 ? Q_BASE + ctrl : 0) : 0;
+    // The in-kernel read is one query (window and MLP reads); mode 0 also norms NQ sources.
+    const uint q_first = 0;
     const uint q_count = MODE == 2 ? 1 : NQ;
 
     threadgroup float sums[(S > 2 ? S : 2) + 2][32];   // per-source rms partials (+2 for later norms)
@@ -88,6 +92,10 @@ _READ = """
     if (NOREAD) {
         // Layer 0 has no depth read: RC6 takes x itself (read = x[..., None, :]).
         for (uint i = 0; i < 4; ++i) out[0][i] = in_row ? SOURCE(S - 1, r, c4 + i) : 0.0f;
+    } else if (READ_IN) {
+        // Global visits on passes 2 and 3: RC6's three-query read, computed by MLX's own products
+        // outside this launch; controller ctrl takes source ctrl.
+        for (uint i = 0; i < 4; ++i) out[0][i] = in_row ? rin[(size_t(r) * 3 + ctrl) * D + c4 + i] : 0.0f;
     } else {
     // ---- 1. MLX rms_single_row over each source (closed blocks, then the partial): its inverse RMS.
     for (uint s = 0; s < S; ++s) {
@@ -112,6 +120,16 @@ _READ = """
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (MODE == 3) {
+        // The keys of a three-query read: mx.fast.rms_norm of each source without a weight
+        // (RC6 read_blocks), float32, (W, S, D) as RC6 stacks them.
+        if (in_row)
+            for (uint s = 0; s < S; ++s)
+                for (uint i = 0; i < 4; ++i)
+                    o0[(size_t(r) * S + s) * D + c4 + i] = static_cast<OUT0>(1.0f * (SOURCE(s, r, c4 + i) * inv[s]));
+        return;
+    }
 
     // ---- 2. One-query gemv (bn8) of each query with each normalized source: q . (x * inv).
     if (sg < 8) {
@@ -231,73 +249,14 @@ _READ = """
     }
 
     // ---- MODE 2: one controller (index ctrl) for this row.
-    // 5a. Its cross-pass message: one-query read of the normalized message states (class C
-    // against RC6's four-query matrix-unit product), states used as they are.
+    // 5a. Its cross-pass message: RC6's four-query message read of this row (MLX's own products,
+    // computed outside this launch), query MSG_BASE + ctrl. MSEP: one (1, 1, 4, D) array a row.
+    const device float* mrow = MSEP
+        ? (r == 0 ? m0 : r == 1 ? m1 : r == 2 ? m2 : r == 3 ? m3 : r == 4 ? m4 : r == 5 ? m5 : r == 6 ? m6 : m7)
+        : m0 + size_t(r) * 4 * D;
     const uint mq = MSG_BASE + ctrl;
-    if (sg < 8) {
-        for (uint p_ = 0; p_ < P; ++p_) {
-            float p = 0.0f;
-            for (uint b = 0; b < FULL; ++b) {
-                for (uint tn = 0; tn < 4; ++tn) {
-                    const uint c = b * 1024 + sg * 128 + lane * 4 + tn;
-                    p += mstates[(size_t(r) * P + p_) * D + c] * mqueries[mq * D + c];
-                }
-            }
-            if (LEFT > 0) {
-                const uint c0_ = FULL * 1024 + sg * 128 + lane * 4;
-                for (uint tn = 0; tn < 4; ++tn) {
-                    const uint c = c0_ + tn;
-                    const float key = (c < D) ? mstates[(size_t(r) * P + p_) * D + c] : 0.0f;
-                    const float qv = (c < D) ? mqueries[mq * D + c] : 0.0f;
-                    p += key * qv;
-                }
-            }
-            for (ushort sn = 16; sn >= 1; sn >>= 1) p += simd_shuffle_down(p, sn);
-            if (lane == 0) dots[p_][sg] = p;
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0) {
-        float ld[4];
-        for (uint i = 0; i < 4; ++i) {
-            const uint s = lane * 4 + i;
-            if (s < P) {
-                float score = dots[s][0];
-                for (uint v = 1; v < 8; ++v) score += dots[s][v];
-                ld[i] = score * as_type<float>(uint(SCALE));
-            } else {
-                ld[i] = -INFINITY;
-            }
-        }
-        float maxval = -FLT_MAX;
-        for (uint i = 0; i < 4; ++i) maxval = (maxval < ld[i]) ? ld[i] : maxval;
-        maxval = simd_max(maxval);
-        float normalizer = 0;
-        for (uint i = 0; i < 4; ++i) {
-            const float e = metal::fast::exp(ld[i] - maxval);
-            ld[i] = e;
-            normalizer += e;
-        }
-        normalizer = simd_sum(normalizer);
-        normalizer = 1 / normalizer;
-        for (uint i = 0; i < 4; ++i) {
-            const uint s = lane * 4 + i;
-            if (s < P) prob[3][s] = ld[i] * normalizer;
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
     float msg[4];
-    for (uint i = 0; i < 4; ++i) {
-        const uint c = c4 + i;
-        float v0 = 0.0f, v1 = 0.0f;
-        if (in_row) {
-            for (uint s = 0; s < P && s < 4; ++s) v0 += prob[3][s] * mstates[(size_t(r) * P + s) * D + c];
-            for (uint s = 4; s < P; ++s) v1 += prob[3][s] * mstates[(size_t(r) * P + s) * D + c];
-        }
-        const float w0 = v0 + 0.0f, w1 = v1 + 0.0f;
-        const float x0 = w0 + 0.0f, x1 = w1 + 0.0f;
-        msg[i] = x0 + x1;
-    }
+    for (uint i = 0; i < 4; ++i) msg[i] = in_row ? mrow[size_t(mq) * D + c4 + i] : 0.0f;
 
     // 5b. The controller's two gain-free norms (MLX rms_single_row), concatenated, cast to bf16.
     {
@@ -373,6 +332,54 @@ _READ = """
         for (uint v = 1; v < 8; ++v) total += down_part[blk][v][tm];
         o0[(size_t(r) * NC + ctrl) * 64 + chunk * DROWS + t] =
             static_cast<OUT0>(static_cast<float>(static_cast<bfloat16_t>(total)));
+    }
+"""
+
+_PROBS = """
+    // One simdgroup per (panel row, query): RC6's multiply by the scale (rounded on its own), then
+    // MLX block_softmax over the S scores (a 32-thread threadgroup for S <= 128).
+    // A score array under 8 values arrives in the constant address space and a larger one in device
+    // memory, so rows are read by value, never through one pointer.
+    const uint lane = thread_index_in_simdgroup;
+    const uint g = threadgroup_position_in_grid.x;
+    const uint r = g / NQ, qn = g % NQ;
+    const uint which = SEP ? r : 0;
+    float ld[4];
+    for (uint i = 0; i < 4; ++i) {
+        const uint s = lane * 4 + i;
+        if (s < S) {
+            const uint at = SEP ? qn * S + s : (r * NQ + qn) * S + s;
+            float v;
+            switch (which) {
+                case 0: v = s0[at]; break;
+                case 1: v = s1[at]; break;
+                case 2: v = s2[at]; break;
+                case 3: v = s3[at]; break;
+                case 4: v = s4[at]; break;
+                case 5: v = s5[at]; break;
+                case 6: v = s6[at]; break;
+                default: v = s7[at]; break;
+            }
+            const float scaled = v * as_type<float>(uint(SCALE));
+            ld[i] = scaled;
+        } else {
+            ld[i] = -INFINITY;
+        }
+    }
+    float maxval = -FLT_MAX;
+    for (uint i = 0; i < 4; ++i) maxval = (maxval < ld[i]) ? ld[i] : maxval;
+    maxval = simd_max(maxval);
+    float normalizer = 0;
+    for (uint i = 0; i < 4; ++i) {
+        const float e = metal::fast::exp(ld[i] - maxval);
+        ld[i] = e;
+        normalizer += e;
+    }
+    normalizer = simd_sum(normalizer);
+    normalizer = 1 / normalizer;
+    for (uint i = 0; i < 4; ++i) {
+        const uint s = lane * 4 + i;
+        if (s < S) p[(size_t(r) * NQ + qn) * S + s] = ld[i] * normalizer;
     }
 """
 
@@ -463,14 +470,25 @@ _MIX = """
 @lru_cache(maxsize=1)
 def _read_kernel():
     # Outputs: mode 0 o0 = normed inputs (bf16); mode 1 o0 = the read (f32); mode 2 o0 = the
-    # controllers' down products, o1 = their sources, o2 = their messages. Unused ones are tiny.
+    # controllers' down products, o1 = their sources, o2 = their messages; mode 3 o0 = the keys
+    # of a three-query read (f32). Unused ones are tiny.
     return mx.fast.metal_kernel(
         name="mtplx_inkling_fast_read",
-        input_names=["c0", "c1", "c2", "c3", "partial", "queries", "g0", "g1", "g2",
-                     "mstates", "mqueries", "d0", "d1", "d2"],
+        input_names=["c0", "c1", "c2", "c3", "partial", "queries", "g0", "g1", "g2", "rin",
+                     "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7", "d0", "d1", "d2"],
         output_names=["o0", "o1", "o2"],
         header=_READ_HEADER,
         source=_READ,
+    )
+
+
+@lru_cache(maxsize=1)
+def _probs_kernel():
+    return mx.fast.metal_kernel(
+        name="mtplx_inkling_fast_probs",
+        input_names=[f"s{i}" for i in range(8)],
+        output_names=["p"],
+        source=_PROBS,
     )
 
 
@@ -488,24 +506,29 @@ def _threads(width):
     return -(-(width // 4) // 32) * 32
 
 
-def read(partial, closed, queries, eps, *, mode, gains=(), messages=None, message_queries=None,
-         downs=(), msg_base=0, controllers=0, q_base=0, f32_stand_in=None):
+def read(partial, closed, queries, eps, *, mode, gains=(), messages=None, read_in=None, downs=(),
+         msg_base=0, controllers=0, f32_stand_in=None):
     """One launch of the read kernel for a panel.
 
     ``partial``: ``(W, D)`` bf16 or f32; ``closed``: up to four ``(W, D)`` bf16 blocks;
     ``queries``: ``(Q, D)`` f32, or ``None`` for layer 0 (no depth read: the partial itself is
     normed; then ``f32_stand_in``, any float32 array, fills the absent query buffer).
     ``mode`` 0: input norms with ``gains`` -> ``(W, Q, D)`` bf16; 1: the read itself ->
-    ``(W, 1, D)`` f32; 2: ``controllers`` controllers (down weights ``downs``, message states
-    ``messages`` ``(W, P, D)`` f32 and queries ``message_queries`` from row ``msg_base``) ->
-    ``state (W, C, 64)``, ``xs``, ``ms`` ``(W, C, D)`` f32.
+    ``(W, 1, D)`` f32; 2: ``controllers`` controllers (down weights ``downs``) on the panel's
+    exact message rows ``messages`` (``message_rows``) from query ``msg_base``, their sources the
+    one-query read or, with ``read_in`` ``(W, 3, D)`` f32, RC6's three-query read ->
+    ``state (W, C, 64)``, ``xs``, ``ms`` ``(W, C, D)`` f32; 3: the keys of a three-query read ->
+    ``(W, S, D)`` f32.
 
     Absent operands are filled with existing arrays of the same dtype (never read, no launch).
     """
     noread = queries is None
     rows, width = partial.shape[-2], partial.shape[-1]
-    partial = mx.contiguous(partial.reshape(rows, width))
-    closed = [mx.contiguous(c.reshape(rows, width)) for c in closed]
+    # No mx.contiguous here: the kernel copies only an input that is not row-contiguous, while
+    # mx.contiguous also copies a row-contiguous one whose buffer is 16 KB larger than the array
+    # (a slice of a larger state, or a recycled buffer): a hidden launch per input per visit.
+    partial = partial.reshape(rows, width)
+    closed = [c.reshape(rows, width) for c in closed]
     if len(closed) > 4:
         raise ValueError("the read kernel takes at most four closed blocks")
     if width % 128 or width > 4096:
@@ -522,27 +545,34 @@ def read(partial, closed, queries, eps, *, mode, gains=(), messages=None, messag
     stand_block = partial if partial.dtype == mx.bfloat16 else closed[0] if closed else partial
     pad = closed + [stand_block] * (4 - len(closed))
     g = list(gains) + [stand_bf16] * (3 - len(gains))
+    rin = queries if read_in is None else read_in.reshape(rows, 3, width)
+    msep, m = False, [queries] * 8
     if mode == 2:
-        p_states = messages.shape[-2]
-        mstates = mx.contiguous(messages.reshape(rows, p_states, width))
-        mq = message_queries
+        if isinstance(messages, (list, tuple)):
+            if len(messages) > 8:
+                messages = [mx.concatenate(list(messages), axis=1)]
+            msep = len(messages) > 1
+            m = list(messages) + [messages[0]] * (8 - len(messages))
+        else:
+            m = [messages] * 8
         d = list(downs) + [downs[-1]] * (3 - len(downs))
         chunks = 64 // _DOWN_ROWS
         groups = rows * controllers * chunks
         shapes = [(rows, controllers, 64), (rows, controllers, width), (rows, controllers, width)]
         dtypes = [mx.float32] * 3
     else:
-        p_states, mstates, mq, d = 1, queries, queries, [stand_bf16] * 3
+        d = [stand_bf16] * 3
         chunks, groups = 1, rows
-        shapes = [(rows, nq, width) if mode == 0 else (rows, 1, width), (1,), (1,)]
+        out0 = {0: (rows, nq, width), 1: (rows, 1, width), 3: (rows, sources, width)}[mode]
+        shapes = [out0, (1,), (1,)]
         dtypes = [mx.bfloat16 if mode == 0 else mx.float32, mx.float32, mx.float32]
     tpg = _threads(width)
     outs = _read_kernel()(
-        inputs=[*pad, partial, queries, *g, mstates, mq, *d],
+        inputs=[*pad, partial, queries, *g, rin, *m, *d],
         template=[("MODE", mode), ("D", width), ("S", sources), ("NQ", nq), ("TPG", tpg),
-                  ("NOREAD", bool(noread)), ("OUT0", dtypes[0]),
-                  ("NC", max(controllers, 1)), ("CHUNKS", chunks), ("DROWS", _DOWN_ROWS),
-                  ("P", p_states), ("MSG_BASE", msg_base), ("Q_BASE", q_base),
+                  ("NOREAD", bool(noread)), ("READ_IN", read_in is not None), ("MSEP", msep),
+                  ("OUT0", dtypes[0]), ("NC", max(controllers, 1)), ("CHUNKS", chunks),
+                  ("DROWS", _DOWN_ROWS), ("MSG_BASE", msg_base),
                   ("EPS", _f32_bits(eps)), ("SCALE", _f32_bits(width ** -0.5))],
         grid=(groups * tpg, 1, 1),
         threadgroup=(tpg, 1, 1),
@@ -550,6 +580,74 @@ def read(partial, closed, queries, eps, *, mode, gains=(), messages=None, messag
         output_dtypes=dtypes,
     )
     return outs if mode == 2 else outs[:1]
+
+
+def probs(scores, scale):
+    """``mx.softmax(scores * scale, axis=-1)`` for each row and query, as RC6 computes it.
+
+    ``scores``: per-row ``(1, 1, Q, S)`` float32 arrays, or one ``(1, W, Q, S)`` array. Returns
+    ``(1, W, Q, S)`` float32. One launch (more than eight separate rows are joined first).
+    """
+    scores = list(scores)
+    if len(scores) > 8:
+        scores = [mx.concatenate(scores, axis=1)]
+    rows = sum(a.shape[1] for a in scores)
+    nq, count = scores[0].shape[2], scores[0].shape[3]
+    if count > 128:
+        raise ValueError("probs serves at most 128 scores a row (one simdgroup)")
+    return _probs_kernel()(
+        inputs=scores + [scores[0]] * (8 - len(scores)),
+        template=[("SEP", len(scores) > 1), ("NQ", nq), ("S", count), ("SCALE", _f32_bits(scale))],
+        grid=(rows * nq * 32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(1, rows, nq, count)],
+        output_dtypes=[mx.float32],
+    )[0]
+
+
+def depth_keys(partial, closed, queries, eps):
+    """RC6 ``read_blocks``' keys, ``rms_norm(stack([*closed, partial], -2).astype(f32), None, eps)``:
+    ``(1, W, S, D)`` float32 in one launch (``queries``, the read's ``(Q, D)`` float32 queries,
+    only fill the kernel's query slot)."""
+    rows, width = partial.shape[-2], partial.shape[-1]
+    (keys,) = read(partial, closed, queries, eps, mode=3)
+    return keys.reshape(1, rows, len(closed) + 1, width)
+
+
+def depth_read(queries, keys):
+    """RC6's three-query depth read from its keys (``model.py`` ``serial_depth_dots``): the
+    scores one row at a time, as a one-row step takes them, on MLX's own product; RC6's scale
+    and softmax here; the mix as RC6's batched MLX product. ``(1, W, Q, D)`` float32."""
+    rows, width = keys.shape[1], keys.shape[-1]
+    q = queries.reshape(-1, width).astype(mx.float32)
+    scores = [q @ keys[:, r:r + 1].swapaxes(-1, -2) for r in range(rows)]
+    return probs(scores, width ** -0.5) @ keys
+
+
+def message_rows(stack, queries):
+    """RC6's cross-pass message read (``projection.py`` ``serial_messages``), row by row on
+    MLX's own products as RC6 calls them, with RC6's scale and softmax here.
+
+    ``stack`` ``(1, W, P, D)`` float32 (normalised prior states), ``queries`` ``(4, D)`` float32.
+    Returns one ``(1, 1, 4, D)`` float32 array a row.
+    """
+    rows, width = stack.shape[1], stack.shape[-1]
+    scores = [queries @ stack[:, r:r + 1].swapaxes(-1, -2) for r in range(rows)]
+    weights = probs(scores, width ** -0.5)
+    return [weights[:, r:r + 1] @ stack[:, r:r + 1] for r in range(rows)]
+
+
+_message_rows = weakref.WeakKeyDictionary()
+
+
+def message_rows_of(message):
+    """``message_rows`` of L0's per-visit ``Message`` (``fast/step.py``), computed once and shared
+    by the visit's attention input (controllers 0-2) and expert input (controller 3)."""
+    rows = _message_rows.get(message)
+    if rows is None:
+        rows = message_rows(message.stack, message.queries)
+        _message_rows[message] = rows
+    return rows
 
 
 def mix(state, xs, ms, forgets, gains, *, parts):
@@ -570,29 +668,32 @@ def mix(state, xs, ms, forgets, gains, *, parts):
     return outs if parts else outs[:1]
 
 
-def mlp_source(layer, partial, closed, messages=None, message_queries=None):
+def mlp_source(layer, partial, closed, messages=None, message_queries=None, *, rows=None):
     """RC6's ``ffn`` (``model.py`` 524-532): MLP depth read, then the MLP controller, before the norm.
 
     ``partial`` ``(1, W, D)`` f32 from stage B/C; ``closed`` including this layer's boundary
-    append. Returns ``(1, W, D)`` float32. One launch on the first pass, two on passes 2 and 3.
+    append; on passes 2 and 3 the message stack and queries, or the visit's exact message
+    ``rows`` (``message_rows``) when stage A already read them. Returns ``(1, W, D)`` float32.
+    One launch on the first pass, two on passes 2 and 3.
     """
     from .attn_input import count_route
 
-    rows, width = partial.shape[-2], partial.shape[-1]
-    count_route("fused:mlp_" + ("loop" if messages is not None else "first"))
-    if messages is None:
+    width = partial.shape[-1]
+    count = partial.shape[-2]
+    loop = messages is not None or rows is not None
+    count_route("fused:mlp_" + ("loop" if loop else "first"))
+    if not loop:
         out = read(partial, closed, layer.mlp_query, layer.eps, mode=1)
-        return out[0].reshape(1, rows, width)
+        return out[0].reshape(1, count, width)
+    if rows is None:
+        rows = message_rows(messages, message_queries)
     ctrl = layer.controllers[3]
-    state, xs, ms = read(partial, closed, layer.mlp_query, layer.eps, mode=2,
-                         messages=messages, message_queries=message_queries,
+    state, xs, ms = read(partial, closed, layer.mlp_query, layer.eps, mode=2, messages=rows,
                          downs=[ctrl.down], msg_base=3, controllers=1)
     (h,) = mix(state, xs, ms, [ctrl.forget], [ctrl.gain], parts=False)
-    return h.reshape(1, rows, width)
+    return h.reshape(1, count, width)
 
 
 def stage_expert_input(layer, partial, closed, message, panel):
     """Drop-in for ``fast.step.Stages.expert_input`` (L0's frame): RC6's ``ffn`` before the MLP norm."""
-    return mlp_source(layer, partial, closed,
-                      None if message is None else message.stack,
-                      None if message is None else message.queries)
+    return mlp_source(layer, partial, closed, rows=None if message is None else message_rows_of(message))
