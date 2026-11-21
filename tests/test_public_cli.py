@@ -10402,3 +10402,35 @@ def test_start_dry_run_says_the_server_sets_the_window(monkeypatch, tmp_path, ca
     assert code == 0
     assert "window: The server sets the window when it starts" in capsys.readouterr().out
 
+
+
+def test_start_preview_of_a_pack_named_by_its_repository(monkeypatch, tmp_path):
+    """The dry run previews what the start serves when the model is named by its Hugging Face id: the pack on
+    disk when the start would find it, and, for an Inkling 2 Mini pack not downloaded yet, its family's serve
+    defaults (native tools, the tokenizer's template, the model's sampler), never the Qwen lane."""
+    seen = {}
+
+    def gate(path, **kw):
+        seen["gated"] = path
+        return {"model_dir": path, "recommended_backend": "inkling2_loop", "mtp_arch": "inkling2-loop"}, None
+
+    monkeypatch.setattr(public, "_model_gate", gate)
+    pack_dir = tmp_path / "Youssofal--Inkling-2-Mini-MTPLX-Bare-Speed"
+    pack_dir.mkdir()
+    monkeypatch.setattr(public, "_resolve_runtime_model_path", lambda model, **kw: (str(pack_dir), None))
+    args = SimpleNamespace(model="Youssofal/Inkling-2-Mini-MTPLX-Bare-Speed", tool_prompt_mode="hybrid",
+                           chat_template_profile="local_qwen36", temperature=0.6, top_p=0.95, top_k=20,
+                           depth=3, _cli_flags=set(), cache_dir=None)
+    inspection = public._quickstart_apply_local_model_defaults(args, model=args.model)
+    assert seen["gated"] == str(pack_dir) and inspection["model_dir"] == str(pack_dir)
+    assert (args.tool_prompt_mode, args.chat_template_profile) == ("native", "tokenizer")
+    monkeypatch.setattr(public, "_resolve_runtime_model_path",
+                        lambda model, **kw: ("", {"error": "not available locally"}))
+    args = SimpleNamespace(model="Youssofal/Inkling-2-Mini-MTPLX-Bare-Speed", tool_prompt_mode="hybrid",
+                           chat_template_profile="local_qwen36", temperature=0.6, top_p=0.95, top_k=20,
+                           depth=3, _cli_flags=set(), cache_dir=None)
+    inspection = public._quickstart_apply_local_model_defaults(args, model=args.model)
+    assert inspection["recommended_backend"] == "inkling2_loop"
+    assert (args.tool_prompt_mode, args.chat_template_profile, args.temperature) == ("native", "tokenizer", 1.0)
+    other = SimpleNamespace(model="Youssofal/Some-Other-Model", _cli_flags=set(), cache_dir=None)
+    assert public._quickstart_apply_local_model_defaults(other, model=other.model) is None

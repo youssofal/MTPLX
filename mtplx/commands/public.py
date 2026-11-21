@@ -13916,7 +13916,27 @@ def _quickstart_apply_local_model_defaults(
 ) -> dict[str, Any] | None:
     model_path = Path(str(model)).expanduser()
     if not model_path.exists():
-        return None
+        # A Hugging Face id or a catalog name is a pack on disk when the start would find it: preview that pack,
+        # as the start serves it. A pack not downloaded yet is inspected only once it is on disk; until then an
+        # Inkling 2 Mini pack (named by its catalog entry or repository) previews its family's serve defaults.
+        resolved, resolve_error = _resolve_runtime_model_path(
+            str(model), cache_dir=getattr(args, "cache_dir", None), **_model_search_kwargs(args)
+        )
+        if resolve_error is None and Path(resolved).exists():
+            model_path = Path(resolved)
+        else:
+            from mtplx.backends.descriptors import INKLING_DESCRIPTOR
+            from mtplx.model_catalog import catalog_model_matching
+
+            pack = catalog_model_matching(str(model))
+            if pack is None or not pack.id.startswith("inkling2-mini-"):
+                return None
+            inspection = {
+                "recommended_backend": INKLING_DESCRIPTOR.backend_id,
+                "mtp_arch": INKLING_DESCRIPTOR.architecture_id,
+            }
+            _apply_backend_serve_defaults(args, inspection)
+            return inspection
     inspection, gate_exit = _model_gate(
         str(model_path),
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
