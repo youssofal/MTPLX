@@ -195,7 +195,7 @@ def output_projection(layer, hg, x, state, visit, panel):
     Stored codes are projected one row at a time: MLX sends a 2 to 24 row affine product to a
     wide kernel whose rows differ from the one-row product on M3 to M5, and the reference at
     every width is the one-row step (lane L1, q4-check-3.json)."""
-    attn = per_row_linear(hg, layer.out) if isinstance(layer.out, AffineWeight) else ref.linear(hg, layer.out)
+    attn = packed_linear(hg, layer.out) if isinstance(layer.out, AffineWeight) else ref.linear(hg, layer.out)
     partial = convolution(layer.convs[2], attn, state.tail(visit, 2), panel).astype(mx.float32)
     if not layer.boundary:
         partial = partial + x.astype(mx.float32)
@@ -208,6 +208,36 @@ def per_row_linear(x, weight):
     if x.shape[1] == 1:
         return ref.linear(x, weight)
     return mx.concatenate([ref.linear(x[:, row : row + 1], weight) for row in range(x.shape[1])], axis=1)
+
+
+#: (what, rows, shapes, dtype) -> True when the pack's multi-row product equals its one-row
+#: product on this Mac (M1 and M2 keep MLX's one-row kernel for small panels; M3 to M5 do not).
+_ROWS_PROVEN: dict = {}
+
+
+def proven_rows(key, batched, per_row):
+    """A panel product whose rows equal the one-row step's: the batched form where its first use
+    on this Mac and shape proved it bit for bit against the rows computed one at a time, else the
+    rows one at a time. The proof reads both once (first call of a shape: before the engine
+    records it); the kernel MLX picks depends on shapes and the GPU, not on values."""
+    verdict = _ROWS_PROVEN.get(key)
+    if verdict is None:
+        whole, rows = batched(), per_row()
+        mx.eval(whole, rows)
+        verdict = _ROWS_PROVEN[key] = whole.shape == rows.shape and bool(
+            mx.array_equal(whole.view(mx.uint16 if whole.dtype.size == 2 else mx.uint32),
+                           rows.view(mx.uint16 if rows.dtype.size == 2 else mx.uint32)).item())
+        count(f"rows_proof.{key[0]}.{'batched' if verdict else 'one_at_a_time'}")
+        return whole if verdict else rows
+    return batched() if verdict else per_row()
+
+
+def packed_linear(x, weight):
+    """``x @ weight`` for stored codes, every row equal to the one-row product (``proven_rows``)."""
+    if x.shape[1] == 1:
+        return ref.linear(x, weight)
+    key = ("linear", x.shape[1], tuple(weight.codes.shape), weight.bits, weight.group_size, str(x.dtype))
+    return proven_rows(key, lambda: ref.linear(x, weight), lambda: per_row_linear(x, weight))
 
 
 def relative_profiles(layer, rel):
@@ -461,7 +491,10 @@ def row_stable_head(model, hidden):
     rows = hidden.shape[1]
     if rows > 1 and isinstance(model.unembed, AffineWeight):
         count("fallback.head.packed_rows")
-        return mx.concatenate([model.head(hidden[:, row : row + 1]) for row in range(rows)], axis=1)
+        unembed = model.unembed
+        key = ("head", rows, tuple(unembed.codes.shape), unembed.bits, unembed.group_size, str(hidden.dtype))
+        return proven_rows(key, lambda: model.head(hidden), lambda: mx.concatenate(
+            [model.head(hidden[:, row : row + 1]) for row in range(rows)], axis=1))
     if rows <= ROW_STABLE_ROWS:
         return model.head(hidden)
     return mx.concatenate([model.head(hidden[:, start:stop]) for start, stop in row_chunks(rows)], axis=1)

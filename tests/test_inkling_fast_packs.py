@@ -91,3 +91,28 @@ def test_a_replayed_step_counts_the_visits_that_take_the_packs_own_product():
     model.unembed = packed(64, 256, 4)  # a 4-bit head: one row at a time past one row
     assert fast_step.stage_fallbacks(model, "bc", 4)["fallback.head.packed_rows"] == 1
     assert "fallback.head.packed_rows" not in fast_step.stage_fallbacks(model, "bc", 1)
+
+
+def test_a_packed_product_is_batched_only_where_its_rows_prove_equal_to_one_row():
+    """MLX picks its affine kernel by shape and GPU: M1 and M2 keep the one-row kernel for small
+    panels (row-stable), M3 to M5 use a wide one (not). The first use of a shape decides."""
+    calls = []
+    rows_equal = mx.arange(6, dtype=mx.float32).reshape(1, 2, 3).astype(mx.bfloat16)
+    rows_differ = rows_equal + mx.array([[[0.0], [1.0]]], mx.bfloat16)
+
+    def batched(value):
+        return lambda: (calls.append("batched"), value)[1]
+
+    def per_row():
+        return (calls.append("rows"), rows_equal)[1]
+
+    key_same, key_other = ("test", 2, "same"), ("test", 2, "other")
+    fast_step._ROWS_PROVEN.pop(key_same, None)
+    fast_step._ROWS_PROVEN.pop(key_other, None)
+    assert mx.array_equal(fast_step.proven_rows(key_same, batched(rows_equal), per_row), rows_equal).item()
+    assert mx.array_equal(fast_step.proven_rows(key_other, batched(rows_differ), per_row), rows_equal).item()
+    calls.clear()
+    fast_step.proven_rows(key_same, batched(rows_equal), per_row)   # proven: batched alone
+    fast_step.proven_rows(key_other, batched(rows_differ), per_row)  # refused: rows alone
+    assert calls == ["batched", "rows"]
+    assert fast_route_counts().get("rows_proof.test.one_at_a_time", 0) >= 1
