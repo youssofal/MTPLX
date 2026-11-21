@@ -205,3 +205,78 @@ def test_a_destination_that_exists_is_never_written_over(tmp_path):
 
     with pytest.raises(forge_fp16.Fp16SiblingError, match="exists"):
         forge_fp16.derive(parent, tmp_path / "sibling", log=lambda _line: None)
+
+
+# --------------------------------------------------------------------------- Inkling: Law 1 fails closed
+def _inkling_pack(root: Path, *, audited: bool = True, audit_count: int = 3, tower: int = 3) -> Path:
+    """A tiny Inkling pack: the publisher's vision_config, `tower` BF16 vision tensors in the real header, packed
+    words, a drafter with metadata, its stamp, and (when `audited`) a passing vision audit naming `audit_count`."""
+    from mtplx.commands.forge_inkling import REVISION, VISION_CONFIG
+
+    rng = np.random.default_rng(3)
+    target = {f"model.visual.blocks.{i}.weight": ("BF16", _bf16(rng.normal(size=(4, 8)))) for i in range(tower)}
+    target["model.llm.layers.0.attn.wq_du.weight"] = ("U32", rng.integers(0, 1 << 31, size=(4, 2), dtype=np.uint32))
+    _write(root / "model-00001-of-00001.safetensors", target)
+    _write(root / "mtp.safetensors", {"blocks.0.w": ("BF16", _bf16(rng.normal(size=(2, 8)))),
+                                      "blocks.0.b": ("BF16", _bf16(rng.normal(size=(8,))))}, metadata={"format": "pt"})
+    (root / "config.json").write_text(json.dumps({"vision_config": VISION_CONFIG, "text_config": {"dtype": "bfloat16"}}))
+    (root / "mtplx-pack.json").write_text(json.dumps({
+        "display_name": "Inkling 2 Mini Bare Speed", "recipe": "bare-speed", "source": "thinkingmachines/Inkling-2-Mini",
+        "source_revision": REVISION, "weight_bytes": 1_000, "matrix_bit_counts": {"4": 1}, "vision_tensors": tower}))
+    if audited:
+        (root / "vision-audit.json").write_text(json.dumps({"pack": {"vision_tensors": audit_count}, "problems": [], "pass": True}))
+    return root
+
+
+def test_an_inkling_sibling_carries_the_whole_tower_in_f16_and_says_so(tmp_path):
+    from mtplx.commands.forge_inkling import REVISION
+
+    parent = _inkling_pack(tmp_path / "parent")
+    forge_fp16.derive(parent, tmp_path / "sibling", log=lambda _line: None)
+
+    sibling = tmp_path / "sibling"
+    tower = {name: dtype for name, (dtype, _blob) in _tensors(sibling / "model-00001-of-00001.safetensors").items()
+             if name.startswith("model.visual.")}
+    assert len(tower) == 3 and set(tower.values()) == {"F16"}
+    assert json.loads((sibling / "vision-audit.json").read_text()) == {
+        "pass": True, "variant": "fp16", "vision_tensors": 3, "draft_tensors": 2,
+        "rule": "every vision and drafter tensor equals the upstream tensor cast BF16 to FP16 (byte for byte where not BF16)",
+        "upstream_revision": REVISION}
+    stamp = json.loads((sibling / "mtplx-pack.json").read_text())
+    assert stamp["precision_variant"] == "fp16" and stamp["display_name"] == "Inkling 2 Mini Bare Speed FP16"
+
+
+def test_a_sibling_lists_its_own_files_not_its_parents(tmp_path):
+    import hashlib
+
+    parent = _inkling_pack(tmp_path / "parent")
+    (parent / "SHA256SUMS").write_text("0" * 64 + "  config.json\n")  # the parent's list, stale for any sibling
+    forge_fp16.derive(parent, tmp_path / "sibling", log=lambda _line: None)
+
+    sibling = tmp_path / "sibling"
+    lines = (sibling / "SHA256SUMS").read_text().splitlines()
+    listed = {line.split("  ", 1)[1]: line.split("  ", 1)[0] for line in lines}
+    files = sorted(p.relative_to(sibling).as_posix() for p in sibling.rglob("*") if p.is_file() and p.name != "SHA256SUMS")
+    assert list(listed) == files
+    assert all(hashlib.sha256((sibling / name).read_bytes()).hexdigest() == digest for name, digest in listed.items())
+
+
+@pytest.mark.parametrize("parent_kwargs,why", [
+    ({"audited": False}, "never checked against the upstream checkpoint"),
+    ({"audit_count": 3, "tower": 2}, "its audit names 3 in BF16"),
+])
+def test_an_inkling_parent_without_its_whole_checked_tower_is_refused(tmp_path, parent_kwargs, why):
+    parent = _inkling_pack(tmp_path / "parent", **parent_kwargs)
+    with pytest.raises(forge_fp16.Fp16SiblingError, match=why):
+        forge_fp16.derive(parent, tmp_path / "sibling", log=lambda _line: None)
+    assert not (tmp_path / "sibling").exists() and not (tmp_path / "sibling.partial").exists()
+
+
+def test_mtplx_forge_fp16_is_a_command(tmp_path):
+    from mtplx.cli import main
+
+    parent = _inkling_pack(tmp_path / "parent")
+    assert main(["forge", "fp16", str(parent), str(tmp_path / "sibling")]) == 0
+    assert json.loads((tmp_path / "sibling" / "vision-audit.json").read_text())["variant"] == "fp16"
+    assert main(["forge", "fp16", str(_inkling_pack(tmp_path / "blind", audited=False)), str(tmp_path / "blind16")]) != 0
+    assert not (tmp_path / "blind16").exists()

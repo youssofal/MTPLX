@@ -3406,6 +3406,14 @@ def build_parser() -> argparse.ArgumentParser:
     inkling.add_argument("destination", type=Path)
     inkling.add_argument("--recipe", choices=("bare-speed", "bare-speed-affine", "bare-speed-mxfp8", "bare-speed-nvfp4", "bare-speed-nvfp4w", "speed", "speed-affine", "speed-nvfp4w", "quality", "native-quality"), required=True)
     inkling.set_defaults(func=cmd_forge_public)
+    fp16 = forge_sub.add_parser(
+        "fp16",
+        help="Derive the FP16 sibling of a finished pack for M1 and M2 Macs (BF16 tensors cast to FP16, packed weights kept)",
+    )
+    fp16.add_argument("parent", type=Path, help="Finished pack directory")
+    fp16.add_argument("destination", type=Path, help="New FP16 pack directory")
+    fp16.add_argument("--public-model-id", default=None, help="Model id stamped into mtplx_runtime.json, if the pack has one")
+    fp16.set_defaults(func=cmd_forge_public)
 
     forge_probe_p = forge_sub.add_parser(
         "probe",

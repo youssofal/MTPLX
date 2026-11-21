@@ -4,7 +4,7 @@ Prompt chunks of more than 32 rows run the stock body: its two quantized gathers
 sorted by expert, with MLX ops around them. The sorted route keeps those two gathers and the
 sort exactly and replaces the glue with the fused input, route, SwiGLU and combine kernels; it
 must give the stock body's bits at every chunk size, in both expert formats and both route
-variants, and `experts_forward` must take it for 33 to 2,048 rows only.
+variants, and `experts_forward` must take it for 33 to 4,096 rows only.
 """
 
 import pytest
@@ -55,7 +55,7 @@ def same(a, b):
 
 @pytest.mark.parametrize("mode", ["nvfp4", "mxfp8"])
 @pytest.mark.parametrize("variant", ["fused", "scores"])
-@pytest.mark.parametrize("rows", [33, 512])
+@pytest.mark.parametrize("rows", [33, 512, 2100])
 def test_sorted_prompt_route_equals_the_stock_body(mode, variant, rows):
     block = synthetic_block(mode)
     hidden = hidden_rows(rows, seed=rows)
@@ -69,7 +69,7 @@ def test_sorted_prompt_route_equals_the_stock_body(mode, variant, rows):
 
 def test_prompt_admission(monkeypatch):
     block = synthetic_block("nvfp4")
-    small, wide, huge = (mx.zeros((n, 2304), mx.bfloat16) for n in (32, 512, 2049))
+    small, wide, huge = (mx.zeros((n, 2304), mx.bfloat16) for n in (32, 512, EF.PROMPT_ROWS + 1))
     assert EF.prompt_unserved(block, small) == "prompt_rows"
     assert EF.prompt_unserved(block, wide) is None
     assert EF.prompt_unserved(block, huge) == "prompt_rows"
@@ -90,3 +90,65 @@ def test_experts_forward_takes_the_prompt_route_and_keeps_stock_bits(monkeypatch
     assert sum(v for k, v in state.counts.items() if ".prompt_fused." in k) == before + 1
     # more than PROMPT_ROWS rows keep the stock body, counted
     assert EF.prompt_unserved(block, mx.zeros((EF.PROMPT_ROWS + 1, 2304), mx.bfloat16)) == "prompt_rows"
+
+
+def close(a, b):
+    """The fast route's difference from the stock body, relative to the stock body's size."""
+    a, b = a.astype(mx.float32), b.astype(mx.float32)
+    return float((mx.sum(mx.abs(a - b)) / mx.sum(mx.abs(b))).item())
+
+
+@pytest.mark.parametrize("mode", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize("rows", [33, 2100])
+def test_the_fast_prompt_route_changes_only_the_mxfp8_gate_up_order(mode, rows):
+    # MTPLX_INKLING_PROMPT_FAST=experts: an MXFP8 block multiplied on MLX's tile kernel (from 4 pairs an
+    # expert) takes the sorted product for its gate-up, whose sums are MLX's own sorted product's on the
+    # same inputs; against the stock body (the one-row product's order) it is held to a bound. NVFP4
+    # blocks, and MXFP8 blocks below 4 pairs an expert, keep the stock body's bits.
+    block = synthetic_block(mode, seed=5)
+    hidden = hidden_rows(rows, seed=rows + 7)
+    flat = hidden.reshape(-1, 2304)
+    want = block.stock(hidden).reshape(rows, 2304)
+    got = EF.routed_sorted(block, flat, M.linear, fast=True)
+    exact = EF.routed_sorted(block, flat, M.linear)
+    mx.eval(want, got, exact)
+    assert same(exact, want)
+    tiled = rows * block.count >= EF.SORTED_TILE_PAIRS * block.router.shape[0]
+    if mode == "nvfp4" or not tiled:
+        assert same(got, want)
+        return
+    assert close(got, want) < 4e-3, (mode, rows, close(got, want))
+    # the gate-up's sums are MLX's sorted product's on the same (exactly rounded) inputs
+    fast_trace, exact_trace = {}, {}
+    EF.routed_sorted(block, flat, M.linear, trace=fast_trace, fast=True)
+    EF.routed_sorted(block, flat, M.linear, trace=exact_trace)
+    grouped = mx.gather_qmm(
+        exact_trace["values13"][fast_trace["sorted_rows"]], block.gate_up.codes, scales=block.gate_up.scales,
+        rhs_indices=fast_trace["sorted_experts"], group_size=32, bits=8, mode="mxfp8", sorted_indices=True)
+    assert bool(mx.array_equal(fast_trace["values13"].astype(mx.float32), exact_trace["values13"]).item())
+    raw = fast_trace["raw13"]
+    if raw.dtype == mx.float32:
+        assert bool(mx.array_equal(raw.view(mx.uint32), grouped.reshape(raw.shape).view(mx.uint32)).item())
+    else:  # MLX's own products (no tensor units): its bfloat16 output is the float32 sum rounded once
+        assert same(raw, grouped.astype(mx.bfloat16).reshape(raw.shape))
+
+
+def test_experts_forward_takes_the_fast_route_only_when_switched_on(monkeypatch):
+    monkeypatch.delenv("MTPLX_INKLING_PROMPT_EXPERTS", raising=False)
+    block = synthetic_block("mxfp8", seed=11)
+    hidden = hidden_rows(512, seed=31)
+    state = EF._state(block)
+    fast = lambda: sum(v for k, v in state.counts.items() if ".prompt_fast." in k)
+    monkeypatch.delenv("MTPLX_INKLING_PROMPT_FAST", raising=False)
+    before = fast()
+    mx.eval(block(hidden))
+    assert fast() == before
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_FAST", "chunk")  # the chunk part alone leaves the experts
+    mx.eval(block(hidden))
+    assert fast() == before
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_FAST", "experts")
+    got = block(hidden)
+    want = block.stock(hidden)
+    mx.eval(got, want)
+    assert fast() == before + 1
+    assert close(got, want) < 4e-3

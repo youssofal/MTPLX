@@ -29,6 +29,7 @@ from functools import lru_cache
 import mlx.core as mx
 
 from . import attend as A
+from .prompt_route import asynchronous, hand_over
 
 #: Rows a launch serves (a threadgroup holds 8 of them; partials for 16 rows at 1,024 blocks
 #: are 100 MB in bf16, so a 104K chunk stays well inside any Mac's working set).
@@ -242,7 +243,12 @@ def _prompt_attention(query, key, value, profiles, sink):
                 output_dtypes=[mx.bfloat16],
             )
             parts.append(h)
-            if len(parts) % EVAL_LAUNCHES == 0:
+            if asynchronous():
+                # each launch handed to the GPU as it is made, at most EVAL_LAUNCHES unfinished (fast/prompt_route)
+                mx.async_eval(h)
+                if len(parts) > EVAL_LAUNCHES:
+                    mx.eval(parts[-EVAL_LAUNCHES - 1])
+            elif len(parts) % EVAL_LAUNCHES == 0:
                 mx.eval(parts[-EVAL_LAUNCHES:])
     out = parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=1)
     return out.reshape(1, rows, A.HEADS, A.HEAD_DIM).transpose(0, 2, 1, 3)
@@ -308,7 +314,7 @@ def merged_attention(query, key, value, profiles, sink, window):
         part = mx.fast.scaled_dot_product_attention(query[:, :, start:end], key, value, scale=width ** -0.5,
                                                     mask=bias)
         if len(plan) > 1:
-            mx.eval(part)
+            hand_over(parts, part)
         parts.append(part)
     return parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=2)
 

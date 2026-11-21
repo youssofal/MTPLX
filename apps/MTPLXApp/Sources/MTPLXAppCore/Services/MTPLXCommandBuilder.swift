@@ -1258,6 +1258,7 @@ private enum ModelLaunchFamily {
     case gemma4
     case step
     case hy3
+    case inkling2
     case qwenDefault
 
     static func detect(_ model: String) -> ModelLaunchFamily {
@@ -1265,6 +1266,14 @@ private enum ModelLaunchFamily {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
             .replacingOccurrences(of: "_", with: "-")
+        // Inkling 2 Mini first: no Qwen launch contract applies to it (engine twin:
+        // descriptors.INKLING_DESCRIPTOR, family "inkling2").
+        if normalized.contains("inkling-2-mini")
+            || normalized.contains("inkling2-mini")
+            || MTPLXModelOption.modelFamily(for: model) == "inkling2"
+        {
+            return .inkling2
+        }
         if normalized.contains("qwen3.6-35b-a3b-mtplx-official4-cyankiwi")
             || normalized.contains("qwen3.6-35b-a3b-mtplx-optimized-speed")
             || normalized.contains("qwen3.6-35b-a3b-mtplx-flat4-cyankiwimtp")
@@ -1494,7 +1503,32 @@ private struct TargetPreset {
             return applyingStepDefaults(processEnvironment: processEnvironment)
         case .hy3:
             return applyingHy3Defaults()
+        case .inkling2:
+            return applyingInklingDefaults()
         }
+    }
+
+    /// Inkling 2 Mini's sampler, tool-call format and chat template belong to the engine's
+    /// family law (INKLING_DESCRIPTOR: temperature 1.0 over the whole distribution, its native
+    /// tool calls, the tokenizer's own template), the values bare `mtplx serve` and
+    /// `mtplx start <client>` resolve. The coding-agent presets' Qwen values do not apply:
+    /// an explicit `--tool-prompt-mode hybrid` or `--chat-template-profile local_qwen36` makes
+    /// `mtplx serve` refuse to start Inkling, and an explicit 0.6/0.95/20 replaces the model's
+    /// own sampler. So an Inkling launch passes none of them and leaves them to the engine.
+    /// The coding-agent environment stays as it is, the same block `mtplx start` exports: the
+    /// engine forwards the descriptor's tool format and template to the daemon as flags, so
+    /// the environment's Qwen defaults never reach an Inkling daemon.
+    private func applyingInklingDefaults() -> TargetPreset {
+        var preset = self
+        preset.temperature = nil
+        preset.topP = nil
+        preset.topK = nil
+        preset.draftTemperature = nil
+        preset.draftTopP = nil
+        preset.draftTopK = nil
+        preset.toolPromptMode = nil
+        preset.chatTemplateProfile = nil
+        return preset
     }
 
     private func applyingQwen36_27BOptimizedSpeedDefaults() -> TargetPreset {

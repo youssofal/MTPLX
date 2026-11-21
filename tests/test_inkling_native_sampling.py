@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from mtplx.generation import _sample_from_logits
-from mtplx.models.inkling.sampling import draw_native, is_native_sampler
+from mtplx.models.inkling.sampling import NativeDrawsAhead, _accumulated, draw_native, is_native_sampler
 from mtplx.sampling import NonFiniteLogitsError, SamplerConfig
 
 
@@ -40,3 +40,65 @@ def test_other_sampler_choices_keep_the_shared_path():
     for setting in ({"temperature": 0}, {"temperature": 0.7}, {"top_p": 0.99},
                     {"top_k": 20}, {"frequency_penalty": 0.2}, {"presence_penalty": -1}):
         assert not is_native_sampler(replace(NATIVE, **setting))
+
+
+def _reference_accumulated(row):
+    # The draw's arithmetic as it was written before rows were computed ahead (in place).
+    mass = row.astype(np.float64)
+    mass -= mass.max()
+    np.exp(mass, out=mass)
+    mass /= mass.sum()
+    mass /= mass.sum()
+    mass /= mass.sum()
+    np.cumsum(mass, out=mass)
+    return mass
+
+
+def _panel(source, rows, scale, vocab=200058):
+    values = source.normal(0, scale, (rows, vocab)).astype(np.float32)
+    values[:, ::17] = -np.inf
+    return values
+
+
+def test_accumulated_masses_keep_the_in_place_bits():
+    source = np.random.default_rng(7)
+    for scale in (0.0, 1.0, 7.0, 50.0):
+        for row in _panel(source, 3, scale):
+            got, want = _accumulated(row), _reference_accumulated(row)
+            assert np.array_equal(got.view(np.uint64), want.view(np.uint64))
+
+
+@pytest.mark.parametrize("walked", [1, 2, 9, 25, 32])
+def test_draws_ahead_equal_the_row_by_row_draw(walked):
+    source = np.random.default_rng(walked)
+    with mx.stream(mx.cpu):
+        for scale in (1.0, 7.0, 50.0):
+            panel = mx.array(_panel(source, 32, scale))
+            for seed in (3, 29):
+                one, ahead_rng = (np.random.default_rng(seed) for _ in range(2))
+                ahead = NativeDrawsAhead(panel)
+                try:
+                    got = [ahead.draw(pos, ahead_rng) for pos in range(walked)]
+                finally:
+                    ahead.close()
+                want = [draw_native(panel[pos], one) for pos in range(walked)]
+                assert got == want
+                assert ahead_rng.bit_generator.state == one.bit_generator.state
+
+
+@pytest.mark.parametrize("value", [np.nan, np.inf])
+def test_draws_ahead_raise_at_a_non_finite_row_before_its_draw(value):
+    source = np.random.default_rng(11)
+    values = _panel(source, 6, 3.0)
+    values[3, :] = value
+    rng, one = np.random.default_rng(5), np.random.default_rng(5)
+    with mx.stream(mx.cpu), np.errstate(invalid="ignore"):
+        panel = mx.array(values)
+        ahead = NativeDrawsAhead(panel)
+        try:
+            assert [ahead.draw(pos, rng) for pos in range(3)] == [draw_native(panel[pos], one) for pos in range(3)]
+            with pytest.raises(NonFiniteLogitsError):
+                ahead.draw(3, rng)
+        finally:
+            ahead.close()
+    assert rng.bit_generator.state == one.bit_generator.state

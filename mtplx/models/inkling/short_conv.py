@@ -166,7 +166,7 @@ _SOURCE = """
     }
     const float total = h[keep] + acc;
     const float value = total / as_type<float>(uint(DIVISOR));
-    out[(size_t(b) * rows + t) * width + c] = static_cast<T>(value);
+    /*OUTPUT*/
     /*TAPE_ROW*/
     if (t + 1 == rows) {
         for (uint r = 0; r < keep; ++r) {
@@ -178,49 +178,67 @@ _SOURCE = """
 # With a tape the full history is written in the parent's layout: each thread its oldest row, the last thread the tail.
 _TAPE_ROW = "tape[(size_t(b) * (rows + keep) + t) * width + c] = h[0];"
 _TAPE_TAIL = "tape[(size_t(b) * (rows + keep) + rows + r) * width + c] = h[r + 1];"
+_OUTPUT = "out[(size_t(b) * rows + t) * width + c] = static_cast<T>(value);"
+# The visit's residual step after the attention and expert convolutions (``model.Layer``): the output
+# rounded to the input's type, then to float32, plus the other residual operand read through its strides
+# (``RESIDUAL``), in the output type ``U`` (float32, or the stream's type for the visit's output).
+_OUTPUT_RESIDUAL = """{
+        float joined = static_cast<float>(static_cast<T>(value));
+        if constexpr (RESIDUAL) {
+            joined = joined + static_cast<float>(add[b * add_strides[0] + t * add_strides[1] + c * add_strides[2]]);
+        }
+        out[(size_t(b) * rows + t) * width + c] = static_cast<U>(joined);
+    }"""
 
 
-def kernel_text(tape):
-    """The kernel body; the tape's stores exist only in the kernel that has a tape output."""
-    return _SOURCE.replace("/*TAPE_ROW*/", _TAPE_ROW if tape else "").replace(
-        "/*TAPE_TAIL*/", _TAPE_TAIL if tape else ""
-    )
+def kernel_text(tape, residual=False):
+    """The kernel body; the tape's stores exist only in the kernel that has a tape output, and the residual
+    step only in the kernel that takes one."""
+    return (_SOURCE.replace("/*TAPE_ROW*/", _TAPE_ROW if tape else "")
+            .replace("/*TAPE_TAIL*/", _TAPE_TAIL if tape else "")
+            .replace("/*OUTPUT*/", _OUTPUT_RESIDUAL if residual else _OUTPUT))
 
 
-@lru_cache(maxsize=2)
-def _kernel(tape):
+@lru_cache(maxsize=4)
+def _kernel(tape, residual=False):
     return mx.fast.metal_kernel(
-        name="mtplx_inkling_short_conv_tape" if tape else "mtplx_inkling_short_conv",
-        input_names=["x", "prev", "weight", "change"],
+        name=("mtplx_inkling_short_conv_tape" if tape else "mtplx_inkling_short_conv") + ("_residual" if residual else ""),
+        input_names=["x", "prev", "weight", "change"] + (["add"] if residual else []),
         output_names=["out", "tail", "tape"] if tape else ["out", "tail"],
-        source=kernel_text(tape),
+        source=kernel_text(tape, residual),
         # Strided reads instead of a copy per call of the column-major static weight.
         ensure_row_contiguous=False,
     )
 
 
-def _launch(x, prev, weight, change, tape, form):
+def _launch(x, prev, weight, change, tape, form, add=None, out_dtype=None):
     batch, rows, width = x.shape
     size = weight.shape[0]
     dynamic = change is not None
     heads = change.shape[-1] // size if dynamic else 1
+    residual = out_dtype is not None
     shapes = [x.shape, (batch, size - 1, width)]
-    dtypes = [x.dtype, mx.float32]
+    dtypes = [out_dtype if residual else x.dtype, mx.float32]
     if tape:
         shapes.append((batch, rows + size - 1, width))
         dtypes.append(mx.float32)
-    return _kernel(bool(tape))(
+    template = [
+        ("T", x.dtype),
+        ("SIZE", size),
+        ("HEADS", heads),
+        ("DYNAMIC", dynamic),
+        ("HAS_PREV", prev is not None),
+        ("FORM", FORMS.index(form)),
+        ("DIVISOR", _divisor_bits(size, dynamic)),
+    ]
+    inputs = [x, weight if prev is None else prev, weight, change if dynamic else weight]
+    if residual:
+        template += [("U", out_dtype), ("RESIDUAL", add is not None)]
+        inputs.append(x if add is None else add)
+    return _kernel(bool(tape), residual)(
         # An absent tail or offset is never read; the weight stands in for its buffer.
-        inputs=[x, weight if prev is None else prev, weight, change if dynamic else weight],
-        template=[
-            ("T", x.dtype),
-            ("SIZE", size),
-            ("HEADS", heads),
-            ("DYNAMIC", dynamic),
-            ("HAS_PREV", prev is not None),
-            ("FORM", FORMS.index(form)),
-            ("DIVISOR", _divisor_bits(size, dynamic)),
-        ],
+        inputs=inputs,
+        template=template,
         grid=(width, rows, batch),
         threadgroup=(min(_THREADS, width), 1, 1),
         output_shapes=shapes,
@@ -329,7 +347,7 @@ def _proven(x_dtype, change_dtype, width, heads, size):
         return verdict
 
 
-def convolve(x, prev, weight, change, tape):
+def convolve(x, prev, weight, change, tape, add=None, out_dtype=None):
     """``(out, new tail, history or None)`` from one launch, or ``None`` when the parent must serve.
 
     ``x`` is the new rows ``[batch, rows, channels]``; ``prev`` the float32
@@ -337,6 +355,12 @@ def convolve(x, prev, weight, change, tape):
     ``[taps, channels]`` the module holds; ``change`` the projected dynamic
     offset ``[batch, rows, heads * taps]`` or ``None``; ``tape`` whether the
     caller keeps the full history for a partial accept.
+
+    With ``out_dtype`` the launch also takes the visit's residual step:
+    ``out`` is ``(conv.astype(float32) + add.astype(float32)).astype(out_dtype)``
+    (without ``add``, ``conv.astype(out_dtype)`` through float32), the
+    statements ``model.Layer`` writes after its attention and expert
+    convolutions, each value rounded where they round it.
     """
     route = _route()
     if route != "candidate":
@@ -377,6 +401,12 @@ def convolve(x, prev, weight, change, tape):
     if form not in FORMS:
         _count("stock:unproven")
         return None
-    _count("fused:" + ("dynamic" if change is not None else "static"))
-    result = _launch(x, prev, weight, change, tape, form)
+    if out_dtype is not None and (
+        out_dtype not in (mx.bfloat16, mx.float16, mx.float32)
+        or (add is not None and (add.shape != x.shape or add.dtype not in (mx.bfloat16, mx.float16, mx.float32)))
+    ):
+        _count("stock:residual")
+        return None
+    _count("fused:" + ("dynamic" if change is not None else "static") + (":residual" if out_dtype is not None else ""))
+    result = _launch(x, prev, weight, change, tape, form, add, out_dtype)
     return result[0], result[1], result[2] if tape else None

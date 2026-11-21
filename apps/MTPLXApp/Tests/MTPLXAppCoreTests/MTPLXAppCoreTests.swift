@@ -4014,7 +4014,9 @@ final class MTPLXAppCoreTests: XCTestCase {
             includeInstalledOverrides: false
         ).map(\.id)
 
-        // The Qwen 3.8 trio leads as its FP16 precision siblings (2026-08-15).
+        // The Qwen 3.8 trio leads as its FP16 precision siblings (2026-08-15);
+        // from 48 GiB the Inkling 2 Mini FP16 trio keeps the family's slot at
+        // the end (INKLING_LEGACY_OFFER, on from 2026-11-21).
         XCTAssertEqual(ids, [
             "qwen38-27b-optimized-speed-fp16",
             "qwen38-27b-bare-speed-fp16",
@@ -4025,7 +4027,11 @@ final class MTPLXAppCoreTests: XCTestCase {
             "qwen36-35b-a3b-optimized-balance-fp16",
             "gemma4-optimized-speed",
             "qwen35-9b-optimized-speed-fp16",
+            "inkling2-mini-bare-speed-fp16",
+            "inkling2-mini-optimized-speed-fp16",
+            "inkling2-mini-optimized-quality-fp16",
         ])
+        XCTAssertFalse(ids.contains("inkling2-mini-bare-speed"))
         XCTAssertFalse(ids.contains("optimized-quality"))
         XCTAssertFalse(ids.contains("qwen38-27b-optimized-speed"))
     }
@@ -4044,7 +4050,15 @@ final class MTPLXAppCoreTests: XCTestCase {
             includeInstalledOverrides: false
         ).map(\.id)
 
-        XCTAssertEqual(Array(ids.prefix(2)), ["qwen38-27b-optimized-speed-fp16", "qwen38-27b-bare-speed-fp16"])
+        // On 32 to 47 GiB the Inkling 2 Mini FP16 trio rides directly after the
+        // tier's first pick (INKLING_LEGACY_OFFER, on from 2026-11-21).
+        XCTAssertEqual(Array(ids.prefix(5)), [
+            "qwen38-27b-optimized-speed-fp16",
+            "inkling2-mini-bare-speed-fp16",
+            "inkling2-mini-optimized-speed-fp16",
+            "inkling2-mini-optimized-quality-fp16",
+            "qwen38-27b-bare-speed-fp16",
+        ])
         XCTAssertFalse(ids.contains("qwen38-27b-optimized-quality-fp16"))
         XCTAssertFalse(ids.contains("qwen38-27b-optimized-speed"))
     }
@@ -4148,9 +4162,13 @@ final class MTPLXAppCoreTests: XCTestCase {
         ).map(\.id)
 
         // 32 GiB: the Qwen 3.8 trio leads, minus Optimized Quality (33 GiB
-        // peak) which the peak-memory filter hides on this tier.
+        // peak) which the peak-memory filter hides on this tier; the Inkling
+        // 2 Mini trio rides directly after the first pick (2026-11-21).
         XCTAssertEqual(ids, [
             "qwen38-27b-optimized-speed",
+            "inkling2-mini-bare-speed",
+            "inkling2-mini-optimized-speed",
+            "inkling2-mini-optimized-quality",
             "qwen38-27b-bare-speed",
             "optimized-speed-v2",
             "optimized-speed",
@@ -4180,9 +4198,14 @@ final class MTPLXAppCoreTests: XCTestCase {
         ).map(\.id)
 
         // 36 GiB clears Optimized Quality's 33 GiB peak, so the whole trio
-        // leads, Optimized Speed (recommended) first, then the 3.6 V2 pair.
-        XCTAssertEqual(Array(ids.prefix(5)), [
+        // leads, Optimized Speed (recommended) first, with the Inkling 2 Mini
+        // trio directly after it (founder, 2026-11-21: recommend Bare Speed to
+        // 36 GB Macs), then the 3.6 V2 pair.
+        XCTAssertEqual(Array(ids.prefix(8)), [
             "qwen38-27b-optimized-speed",
+            "inkling2-mini-bare-speed",
+            "inkling2-mini-optimized-speed",
+            "inkling2-mini-optimized-quality",
             "qwen38-27b-bare-speed",
             "qwen38-27b-optimized-quality",
             "optimized-speed-v2",
@@ -4219,6 +4242,10 @@ final class MTPLXAppCoreTests: XCTestCase {
             "mimo-v26-qwen-9b-optimized-speed",
             "qwen35-9b-optimized-speed",
             "bonsai-2-27b-optimized-speed",
+            // From 48 GiB the Inkling 2 Mini trio keeps the family's slot near the end.
+            "inkling2-mini-bare-speed",
+            "inkling2-mini-optimized-speed",
+            "inkling2-mini-optimized-quality",
             "qwen35-4b-optimized-speed",
             "qwen35-4b-optimized-quality",
         ])

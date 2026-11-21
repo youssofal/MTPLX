@@ -11,7 +11,10 @@ simdgroup per (16-row block, 32-column tile).
 
 Class A, decided per shape on this Mac on the first call against the library product, bit for bit;
 a float16 stream (the FP16 siblings), another K or a shape that differs keeps the library's launch,
-counted ``fallback.nax_profile.<why>``. ``MTPLX_INKLING_NAX_PROFILE=0`` turns it off.
+counted ``fallback.nax_profile.<why>``. A GPU without matrix units (Apple GPU generation below 17:
+M1 to M4) keeps it too, before anything is built (``fallback.nax_profile.no_matrix_units``): the
+library's product there is its simdgroup-matrix form, which this launch does not reproduce.
+``MTPLX_INKLING_NAX_PROFILE=0`` turns it off.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ from functools import lru_cache
 
 import mlx.core as mx
 
+from .library_gemm import gpu_generation
 from .routes import count
 
 #: (rows, K, columns, basis dtype) -> True when the launch gives the library's bits on this Mac.
@@ -113,6 +117,8 @@ def profile(rel, basis, stock):
         why = "dtype"
     elif basis.ndim != 2 or rel.shape[-1] != basis.shape[0] or basis.shape[0] > 32 or basis.shape[1] % 32:
         why = "shape"
+    elif gpu_generation() < 17:
+        why = "no_matrix_units"
     elif _library()[0] is None:
         why = "library_text"
     if why is not None:

@@ -266,3 +266,47 @@ def test_a_stored_embedding_takes_the_launches_of_a_16_bit_one(rows, dtype):
     got, want = _launches(eng, lambda: step.embed(packed, ids)), _launches(eng, lambda: step.embed(native, ids))
     # Gather, decode and norm in one launch of ours on either table: no stock launch left.
     assert got == (1, 0) and want == (1, 0), (got, want)
+
+
+# --------------------------------------------------------------------------- kernels derived from another's text
+def _bits(a, b):
+    view = {2: mx.uint16, 4: mx.uint32}[a.dtype.size]
+    return a.shape == b.shape and a.dtype == b.dtype and bool(
+        mx.array_equal(mx.contiguous(a).view(view), mx.contiguous(b).view(view)).item())
+
+
+@needs_metal
+@pytest.mark.parametrize("dtype", STREAMS, ids=str)
+@pytest.mark.parametrize("rows", [1, 4, 8])
+@pytest.mark.parametrize("mode,nq,sources", [(0, 1, 2), (0, 3, 5), (1, 1, 5), (3, 1, 3), (2, 1, 4)])
+def test_the_lean_read_serves_both_stream_types(mode, nq, sources, rows, dtype, monkeypatch):
+    """Lane F1's lean read is lane L1's read kernel with five blocks replaced. When L1's text changes, a
+    block is not found and the lean read declines: the same one launch of ours, slower, invisible to the
+    counts above. On 21 November X1's float16 port renamed the stream type in L1's text and the lean read
+    declined on every Mac until the integration branch fixed it. Pinned on the bf16 and float16 streams,
+    in every read mode: the lean text derives, proves against L1's kernel and gives its bits."""
+    from mtplx.models.inkling.fast import read, read_lean
+
+    assert read_lean.source() is not None, "the lean read no longer finds its blocks in lane L1's read kernel"
+    monkeypatch.setattr(read_lean, "_VERDICT", {})
+    keys = mx.random.split(mx.random.key(97 * rows + 7 * sources + mode), sources + 8)
+    closed = [(mx.random.normal((rows, HIDDEN), key=keys[i]) * (1 + i)).astype(dtype) for i in range(sources - 1)]
+    partial = mx.random.normal((rows, HIDDEN), key=keys[sources - 1]).astype(dtype)
+    queries = (mx.random.normal((3, HIDDEN), key=keys[sources]) * 0.05).astype(mx.float32)
+    gains = [(1 + 0.1 * mx.random.normal((HIDDEN,), key=keys[sources + 1 + j])).astype(dtype) for j in range(3)]
+    kw = {"gains": gains[:nq]} if mode == 0 else {}
+    if mode == 2:  # the controllers: down products, sources and messages
+        kw = {"messages": mx.random.normal((rows, 4, HIDDEN), key=keys[sources + 4]).astype(mx.float32),
+              "downs": [(mx.random.normal((64, 2 * HIDDEN), key=keys[sources + 5 + i]) * 0.02).astype(dtype)
+                        for i in range(3)], "msg_base": 0, "controllers": 3}
+    mx.eval(closed, partial, queries, gains, kw.get("messages", queries), kw.get("downs", []))
+
+    def run(arm):
+        monkeypatch.setenv("MTPLX_INKLING_READ_LEAN", arm)
+        out = read.read(partial, closed, queries[:nq], 1e-6, mode=mode, **kw)
+        mx.eval(out)
+        return out
+
+    want, got = run("0"), run("1")
+    assert read_lean._VERDICT and all(read_lean._VERDICT.values()), f"the lean read declined on a {dtype} stream"
+    assert len(got) == len(want) and all(_bits(a, b) for a, b in zip(got, want))

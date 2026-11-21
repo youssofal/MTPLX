@@ -86,6 +86,7 @@ from mtplx.token_ids import as_token_tuple
 from mtplx.one_copy import (
     anchor_nbytes as one_copy_anchor_nbytes,
     one_copy_runtime,
+    one_copy_store,
     prefill_slack_rows as one_copy_prefill_slack_rows,
 )
 from mtplx.mtp_patch import MTPContract
@@ -4190,10 +4191,7 @@ class ServerState:
             # Its measured prefill working set is its runtime reserve (not the flat 3 GiB), and
             # those measurements stand as its tight-machine peaks: the warm cache yields fully
             # on a Mac that cannot fund the 1 GiB bank floor.
-            _working = getattr(self.runtime, "prefill_working_bytes", None)
-            if callable(_working):
-                _plan_inputs["runtime_transients_bytes"] = int(_working())
-                _plan_inputs["tight_machine_measured"] = True
+            _family_reserve_inputs(self.runtime, _plan_inputs, _plan_memory)
         _fit_plan = _plan_memory(**_plan_inputs)
         _machine_fit = _machine_fit_for_default_window(_fit_plan)
         if _fit_plan.available and not _fit_plan.model_fits and not self.allow_swap:
@@ -4280,10 +4278,16 @@ class ServerState:
                 f"sudo sysctl iogpu.wired_limit_mb={math.ceil(requested_wired / 1024**2)}"
             )
         self.session_bank_cold_tier = _session_bank_cold_tier_from_args(args)
+        # Inkling 2 Mini's restore checkpoints copy every window ring (about 180 MB each), so on a
+        # tight Mac the runtime keeps fewer of them; every other family keeps the shared default.
+        _checkpoint_budget_fn = getattr(self.runtime, "checkpoint_budget_bytes", None)
         self.sessions = EngineSessionManager(
             cold_tier=self.session_bank_cold_tier,
             model_weights_bytes=_plan_weights_bytes,
             memory_plan=self.memory_plan,
+            checkpoint_budget_bytes=(
+                _checkpoint_budget_fn(self.memory_plan) if callable(_checkpoint_budget_fn) else None
+            ),
         )
         # Keep the SSD cold-tier encode (full-KV byte conversion; post-#169
         # it runs at enqueue, never on the writer thread) off request and
@@ -6312,6 +6316,7 @@ def _vision_gate_canonicalization(
     template_observability: dict[str, Any],
     receipt: dict[str, Any],
     session_id: str | None,
+    compared_stream: Sequence[Sequence[int]] | None = None,
 ) -> tuple[list[Any], list[int], Any] | None:
     """Serve or refuse an image request's repaired prompt, and fill its
     ``request_vision_session_restore`` receipt.
@@ -6327,14 +6332,24 @@ def _vision_gate_canonicalization(
     not applied. The receipt also says what the session holds and how far the
     served ids run along it, so with first_image_pad_position and
     cached_tokens one request line reads "held N, shares M, restored K".
+    ``compared_stream`` is what the committed-reasoning gate filled in: the
+    stream it compared with when that was not the registry's (Inkling).
     """
 
     from mtplx.vision.splice import unkeyed_ids, vision_bank_key_ids
 
     committed: Sequence[int] = ()
     peek = getattr(getattr(state, "sessions", None), "peek", None)
-    if session_id is not None and callable(peek):
+    if compared_stream:
+        committed = tuple(compared_stream[0])
+    elif session_id is not None and callable(peek):
         committed = tuple(getattr(peek(session_id), "committed_token_ids", ()) or ())
+    if not committed and getattr(
+        getattr(getattr(state, "runtime", None), "tokenizer", None), "inkling_protocol", False
+    ) is True:
+        # The stream the gate compared with when the conversation was not in
+        # the registry (_maybe_canonicalize_committed_reasoning).
+        committed = _session_stream_from_bank(state, session_id, raw_keyed)
     pad_id = getattr(_server_vision_spec(state), "image_token_id", None)
     served: tuple[list[Any], list[int], Any] | None = None
     refusal: str | None = None
@@ -12723,6 +12738,91 @@ def _is_compact_simple_chitchat_key(compact: str) -> bool:
     return _collapse_repeated_simple_chitchat_text(compact) is not None
 
 
+def _first_tandem_split_by_scan(stripped: str) -> str | None:
+    """The first ``stripped[:split].strip()``, from split 8 on, whose retry
+    key equals the rest's: every split tried, two keys each (quadratic)."""
+    for split in range(8, len(stripped)):
+        first = stripped[:split].strip()
+        second = stripped[split:].strip()
+        if not first or not second:
+            continue
+        if _retry_user_key(first) == _retry_user_key(second):
+            return first
+    return None
+
+
+_PLAIN_WHITESPACE = frozenset(" \t\n\r\f\v")
+
+
+def _first_tandem_split(stripped: str) -> str | None:
+    """``_first_tandem_split_by_scan``'s answer, trying only the splits where
+    the two keys can be equal.
+
+    On text whose whitespace is ASCII and whose characters lowercase to one
+    character each, a part's key is its non-space characters plus one space
+    per gap between its words, so its length comes from prefix counts. Two
+    keys are equal only at equal lengths, or both None (both under 8): every
+    other split is skipped, and the ones left get the scan's own test. A
+    split only moves a part's edge within whitespace when the strip gives
+    the same two parts, so each pair is tested once. Claude Code's request
+    policy spent 75 to 105 ms here on every request (each user message of 1K
+    to 4K characters, two key builds per character). Any other text takes
+    the scan.
+    """
+    if any(
+        (ch.isspace() and ch not in _PLAIN_WHITESPACE) or len(ch.lower()) != 1
+        for ch in stripped
+    ):
+        return _first_tandem_split_by_scan(stripped)
+    size = len(stripped)
+    space = [ch in _PLAIN_WHITESPACE for ch in stripped]
+    # chars[j], words[j]: non-space characters and word starts in stripped[:j];
+    # ends[j]: words whose last character is in stripped[:j].
+    chars = [0] * (size + 1)
+    words = [0] * (size + 1)
+    ends = [0] * (size + 1)
+    for i in range(size):
+        starts = not space[i] and (i == 0 or space[i - 1])
+        finishes = not space[i] and (i + 1 == size or space[i + 1])
+        chars[i + 1] = chars[i] + (0 if space[i] else 1)
+        words[i + 1] = words[i] + (1 if starts else 0)
+        ends[i + 1] = ends[i] + (1 if finishes else 0)
+    total_chars, total_words = chars[size], words[size]
+    if total_chars + total_words - 1 > 4_000:
+        # Parts over the key's 4,000-character cap are None too (the caller
+        # never sends such a text: its own key would be None).
+        return _first_tandem_split_by_scan(stripped)
+    # The first part's end (after its last non-space character) and the
+    # second part's start (its first non-space character) at each split.
+    last_end = [0] * (size + 1)
+    for i in range(size):
+        last_end[i + 1] = i + 1 if not space[i] else last_end[i]
+    next_start = [size] * (size + 1)
+    for i in range(size - 1, -1, -1):
+        next_start[i] = i if not space[i] else next_start[i + 1]
+    tried: set[tuple[int, int]] = set()
+    for split in range(8, size):
+        pieces_first = words[split]
+        pieces_second = total_words - ends[split]
+        len_first = chars[split] + pieces_first - 1 if pieces_first else 0
+        len_second = (
+            total_chars - chars[split] + pieces_second - 1 if pieces_second else 0
+        )
+        if len_first != len_second and not (len_first < 8 and len_second < 8):
+            continue
+        pair = (last_end[split], next_start[split])
+        if pair in tried:
+            continue
+        tried.add(pair)
+        first = stripped[:split].strip()
+        second = stripped[split:].strip()
+        if not first or not second:
+            continue
+        if _retry_user_key(first) == _retry_user_key(second):
+            return first
+    return None
+
+
 def _collapse_repeated_user_text(text: str) -> str | None:
     raw = text or ""
     stripped = raw.strip()
@@ -12731,13 +12831,9 @@ def _collapse_repeated_user_text(text: str) -> str | None:
         # OpenCode can persist a cancelled retry as one user part like
         # "Hi, how are you?Hi, how are you?". Collapse exact tandem repeats
         # first so the user's original casing/punctuation survives.
-        for split in range(8, len(stripped)):
-            first = stripped[:split].strip()
-            second = stripped[split:].strip()
-            if not first or not second:
-                continue
-            if _retry_user_key(first) == _retry_user_key(second):
-                return first
+        first = _first_tandem_split(stripped)
+        if first is not None:
+            return first
     collapsed_chitchat = _collapse_repeated_simple_chitchat_text(stripped)
     if collapsed_chitchat is not None:
         return collapsed_chitchat
@@ -15198,6 +15294,8 @@ def _splice_committed_token_ids(
     *,
     window: int = _COMMITTED_SPLICE_WINDOW,
     max_spans: int = _COMMITTED_SPLICE_MAX_SPANS,
+    substitute_reasoning: bool = False,
+    visible_gate: Callable[[str, bool], str] | None = None,
 ) -> tuple[list[int], dict[str, Any]]:
     """Re-express ``prompt_ids`` with the session's committed ids wherever the
     two decode to the same text.
@@ -15216,7 +15314,25 @@ def _splice_committed_token_ids(
     the splice and the rest of the prompt is kept as sent. Windows whose
     text carries a replacement character (a split multi-byte character) are
     never matched. Returns the ids and a receipt.
+
+    Inkling's stream is compared one assistant turn at a time instead
+    (``mtplx.models.inkling.protocol.splice_committed``): its template
+    re-renders a turn from the parsed fields, so a model's own token split can
+    run past any window (a 60-character ``=`` banner in a written file), and
+    its control tokens frame each turn exactly. ``substitute_reasoning`` and
+    ``visible_gate`` apply there only: the gate's committed-reasoning contract.
     """
+
+    if getattr(tokenizer, "inkling_protocol", False) is True:
+        from mtplx.models.inkling.protocol import splice_committed
+
+        return splice_committed(
+            prompt_ids,
+            committed,
+            tokenizer,
+            substitute_reasoning=substitute_reasoning,
+            visible_gate=visible_gate,
+        )
 
     from mtplx.token_prefix import common_run_len
     from mtplx.vision.splice import is_image_key
@@ -15706,6 +15822,7 @@ def _maybe_canonicalize_committed_reasoning(
     strip_tool_call_preamble_text: bool = False,
     session_id: str | None = None,
     prompt_view: Callable[[Sequence[int]], list[int] | None] | None = None,
+    compared_stream: list[tuple[int, ...]] | None = None,
 ) -> tuple[list[ChatMessage], list[int]] | None:
     """Session-owned committed-think canonicalization (2.8 headline, defect B).
 
@@ -15728,6 +15845,13 @@ def _maybe_canonicalize_committed_reasoning(
     to the content-keyed view an image session commits: every encode here is
     compared with the committed stream in that view, and the ids returned are
     in it (``_vision_gate_canonicalization`` decides what is served).
+
+    ``compared_stream`` (Inkling): a list this fills with the one stream the
+    gate compared the prompt with, when that is not simply the registry's
+    (a stream from the bank after a restart, the banked branch a resent
+    history continues, or a stream found by the prefix it shares when no
+    stream is held under the conversation's id), so the image gate judges a
+    repair against the same stream.
     """
     def _declined(reason: str, **extra: Any) -> None:
         # Every early exit leaves a receipt: a warm turn that re-prefilled
@@ -15777,17 +15901,45 @@ def _maybe_canonicalize_committed_reasoning(
         session = sessions.peek(session_id)
     except Exception:
         return None
-    if session is None:
+    committed = tuple(getattr(session, "committed_token_ids", ()) or ()) if session is not None else ()
+    committed_source = "session"
+    compare_ids: list[int] | None = None
+    shared_others: list[tuple[int, ...]] = []
+    if not committed and getattr(state.runtime.tokenizer, "inkling_protocol", False) is True:
+        # The conversation is not in the registry (the server restarted, or it
+        # was evicted idle) but its entries may be in the bank. Without a
+        # stream to compare with, the history the client resends leaves every
+        # entry at the first turn whose ids the splice once served, and that
+        # turn and everything after it would be read again.
+        compare_ids = prompt_ids if prompt_view is None else prompt_view(prompt_ids)
+        if compare_ids is not None:
+            committed = _session_stream_from_bank(state, session_id, compare_ids)
+            committed_source = "bank"
+            if not committed:
+                # Nothing under this id either: a client that sends no session
+                # id (Hermes) is a new session to a registry that restarted or
+                # let it go idle, and a client that forks a conversation names
+                # a new one. The bank's streams that share the prompt into its
+                # first answer may hold it; their turns are served only where
+                # they say exactly what the client sent (strict below).
+                shared = _shared_streams_from_bank(state, compare_ids)
+                if shared:
+                    committed, shared_others = shared[0], shared[1:]
+                    committed_source = "bank_prefix"
+    if session is None and not committed:
         return None  # inert (first turn / anonymous): no receipt by contract
-    committed = tuple(getattr(session, "committed_token_ids", ()) or ())
     if not committed:
         _declined("no_committed_stream", session_id=session_id)
         return None
     # A text request compares its own ids; an image request the view.
-    compare_ids = prompt_ids if prompt_view is None else prompt_view(prompt_ids)
+    if compare_ids is None:
+        compare_ids = prompt_ids if prompt_view is None else prompt_view(prompt_ids)
     if compare_ids is None:
         _declined("image_keying_failed", session_id=session_id)
         return None
+    inkling = getattr(state.runtime.tokenizer, "inkling_protocol", False) is True
+    if inkling and compared_stream is not None:
+        compared_stream[:] = [tuple(committed)]
     cp_raw = common_prefix_len(compare_ids, committed)
     if cp_raw >= min(len(committed), len(compare_ids)):
         # already extends (or is contained in) the committed stream: the
@@ -15799,6 +15951,8 @@ def _maybe_canonicalize_committed_reasoning(
         "cp_raw": int(cp_raw),
         "committed_len": int(len(committed)),
     }
+    if committed_source != "session":
+        outcome["committed_source"] = committed_source
 
     def _record(target: dict[str, Any] | None) -> None:
         if target is not None:
@@ -15826,6 +15980,86 @@ def _maybe_canonicalize_committed_reasoning(
         _record(template_observability)
         _record(request_observability)
         return None
+    if inkling:
+        # Inkling's template renders a turn from its parsed fields (each tool
+        # argument through tojson), so the message-level substitution below
+        # cannot put the model's bytes back. The splice compares the dialect's
+        # turns instead and serves the bank's ids for each turn that says the
+        # same thing, putting back reasoning the client dropped. A stream
+        # found by its shared prefix alone may be another conversation's that
+        # began the same way, so its turns are strict: served only when they
+        # say exactly what the client sent, reasoning included, and nothing
+        # is put back.
+        strict = committed_source == "bank_prefix"
+
+        def splice_onto(
+            stream: Sequence[int], cp_before: int, record: dict[str, Any]
+        ) -> tuple[list[ChatMessage], list[int]] | None:
+            if strict:
+                return _splice_prompt_onto_committed(
+                    state, messages, compare_ids, stream, cp_before, record
+                )
+            return _splice_prompt_onto_committed(
+                state,
+                messages,
+                compare_ids,
+                stream,
+                cp_before,
+                record,
+                substitute_reasoning=True,
+                visible_gate=lambda text, has_tool_calls: _canonical_turn_gate_text(
+                    text,
+                    has_tool_calls=has_tool_calls,
+                    strip_tool_call_preamble=strip_tool_call_preamble_text,
+                ),
+            )
+
+        spliced = splice_onto(committed, cp_raw, outcome)
+        others: list[tuple[int, ...]] = []
+        if strict:
+            # The next streams that share the prompt as far: of these the
+            # one the walk carries furthest is served.
+            others = shared_others
+        elif (outcome.get("token_splice") or {}).get("stopped") == "outside_assistant_turn":
+            # The stream left this prompt at a message the client wrote, so it
+            # is another branch of the conversation: a client that went back
+            # in its history and continued elsewhere (Pi's tree), a request
+            # made on the side under the same id, an edit it undid. The bank
+            # may hold the branch this prompt continues; the walk proves each
+            # turn of it as for the registry's stream, and the branch it
+            # carries furthest is served.
+            others = _session_streams_from_bank(state, session_id, compare_ids)
+        if others:
+            reach = int(outcome.get("cp_spliced") or cp_raw)
+            branch: dict[str, Any] | None = None
+            for stream in others:
+                if stream == tuple(committed):
+                    continue
+                cp_stream = int(common_prefix_len(compare_ids, stream))
+                trial: dict[str, Any] = {
+                    "applied": False,
+                    "cp_raw": cp_stream,
+                    "committed_len": int(len(stream)),
+                    "committed_source": committed_source if strict else "bank_branch",
+                }
+                result = splice_onto(stream, cp_stream, trial)
+                if result is not None and int(trial.get("cp_spliced") or 0) > reach:
+                    spliced, reach, branch = result, int(trial["cp_spliced"]), trial
+                    if compared_stream is not None:
+                        compared_stream[:] = [stream]
+            if branch is not None:
+                if not strict:
+                    branch["left_stream"] = {
+                        "source": committed_source,
+                        "committed_len": int(len(committed)),
+                        "cp_raw": int(cp_raw),
+                        "stopped": "outside_assistant_turn",
+                    }
+                outcome.clear()
+                outcome.update(branch)
+        _record(template_observability)
+        _record(request_observability)
+        return spliced
     try:
         committed_text = state.runtime.tokenizer.decode(
             _decodable_ids(state, committed)
@@ -15935,6 +16169,73 @@ def _maybe_canonicalize_committed_reasoning(
     return canon_messages, canon_ids
 
 
+def _session_streams_from_bank(
+    state: Any,
+    session_id: str | None,
+    prompt_ids: Sequence[int],
+    limit: int = 4,
+) -> list[tuple[int, ...]]:
+    """Conversation ``session_id``'s stored entries closest to ``prompt_ids``
+    (``SessionBank.session_streams``): the branches of a resent history the
+    gate may compare with when the registry's stream is another branch. []
+    when the bank holds none."""
+    bank = getattr(getattr(state, "sessions", None), "bank", None)
+    lookup = getattr(bank, "session_streams", None)
+    model_path = getattr(getattr(state, "runtime", None), "model_path", None)
+    if not session_id or not callable(lookup) or model_path is None:
+        return []
+    return [
+        tuple(stream)
+        for stream in lookup(session_id, model_path=str(model_path), prompt=prompt_ids, limit=limit) or ()
+        if stream
+    ]
+
+
+def _shared_streams_from_bank(
+    state: Any,
+    prompt_ids: Sequence[int],
+    limit: int = 4,
+) -> list[tuple[int, ...]]:
+    """The bank's stored entries of any conversation that share ``prompt_ids``
+    into its first answer (``SessionBank.shared_streams``, Inkling's dialect
+    marks where that answer starts): the streams the gate may compare a
+    resent history with when no stream is held under its conversation's id.
+    [] for a prompt whose history holds no finished answer, or when the bank
+    holds none."""
+    from mtplx.models.inkling.protocol import answer_floor
+
+    bank = getattr(getattr(state, "sessions", None), "bank", None)
+    lookup = getattr(bank, "shared_streams", None)
+    model_path = getattr(getattr(state, "runtime", None), "model_path", None)
+    if not callable(lookup) or model_path is None:
+        return []
+    floor = answer_floor(prompt_ids, state.runtime.tokenizer)
+    if floor is None:
+        return []
+    return [
+        tuple(stream)
+        for stream in lookup(prompt_ids, model_path=str(model_path), min_shared=floor, limit=limit) or ()
+        if stream
+    ]
+
+
+def _session_stream_from_bank(
+    state: Any,
+    session_id: str | None,
+    prompt_ids: Sequence[int],
+) -> tuple[int, ...]:
+    """Conversation ``session_id``'s stored entry closest to ``prompt_ids``
+    (RAM entries, then the SSD manifest; ``SessionBank.session_stream``), the
+    stream the gate compares a resent history with when the conversation is
+    not in the session registry. () when the bank holds none."""
+    bank = getattr(getattr(state, "sessions", None), "bank", None)
+    lookup = getattr(bank, "session_stream", None)
+    model_path = getattr(getattr(state, "runtime", None), "model_path", None)
+    if not session_id or not callable(lookup) or model_path is None:
+        return ()
+    return tuple(lookup(session_id, model_path=str(model_path), prompt=prompt_ids) or ())
+
+
 def _committed_splice_reach(
     state: ServerState,
     prompt_ids: Sequence[int],
@@ -15959,15 +16260,25 @@ def _splice_prompt_onto_committed(
     committed: Sequence[int],
     cp_before: int,
     outcome: dict[str, Any],
+    *,
+    substitute_reasoning: bool = False,
+    visible_gate: Callable[[str, bool], str] | None = None,
 ) -> tuple[list[ChatMessage], list[int]] | None:
     """Serve the committed ids for text-identical spans (see
     ``_splice_committed_token_ids``); None when nothing improved."""
     if not _committed_token_splice_enabled():
         return None
     spliced_ids, receipt = _splice_committed_token_ids(
-        prompt_ids, committed, state.runtime.tokenizer
+        prompt_ids,
+        committed,
+        state.runtime.tokenizer,
+        substitute_reasoning=substitute_reasoning,
+        visible_gate=visible_gate,
     )
     if not receipt.get("spans"):
+        if receipt.get("stopped"):
+            # The turn walk names why the prompt left the bank where it did.
+            outcome["token_splice"] = receipt
         return None
     cp_after = int(receipt.get("cp_after") or 0)
     outcome["token_splice"] = receipt
@@ -22658,6 +22969,24 @@ class _AdmissionGeometry:
         return int(self.resident_bytes_per_token)
 
 
+def _family_reserve_inputs(runtime: Any, plan_inputs: dict[str, Any], plan_fn: Callable[..., Any]) -> None:
+    """The runtime reserve of a family that measured its own prefill working set (Inkling 2 Mini):
+    its forward plus the restore checkpoints its reads keep. Two where memory sets its window, on a
+    tight Mac or one with little engine budget above the weights (``keeps_few_checkpoints`` reads
+    the plan made with eight: the budget and the weights do not depend on the reserve), eight
+    elsewhere. A runtime without the hook keeps the inputs as they are."""
+
+    working = getattr(runtime, "prefill_working_bytes", None)
+    if not callable(working):
+        return
+    plan_inputs["runtime_transients_bytes"] = int(working())
+    plan_inputs["tight_runtime_transients_bytes"] = int(working(few=True))
+    plan_inputs["tight_machine_measured"] = True
+    few = getattr(runtime, "keeps_few_checkpoints", None)
+    if callable(few) and few(plan_fn(**plan_inputs)):
+        plan_inputs["runtime_transients_bytes"] = plan_inputs["tight_runtime_transients_bytes"]
+
+
 def _admission_geometry(state: Any, prefill_width: int | None = None) -> _AdmissionGeometry:
     """The request's per-token and fixed costs from the memory plan and the
     backend's own answers, for a prefill at ``prefill_width`` rows a forward
@@ -22988,8 +23317,11 @@ def _admission_scratch_bytes(
         return max(1, int(bill["transient_bytes"])), source
     working_fn = getattr(runtime, "prefill_working_bytes", None)
     if callable(working_fn):
-        # A family that measured its own prefill working set (Inkling 2 Mini) is charged it.
-        return max(1, int(working_fn(rows))), "runtime_measured"
+        # A family that measured its own prefill working set (Inkling 2 Mini) is charged it, with
+        # the restore checkpoints its reads keep under this plan (two where memory sets the window).
+        few_fn = getattr(runtime, "keeps_few_checkpoints", None)
+        few = bool(few_fn(getattr(state, "memory_plan", None))) if callable(few_fn) else False
+        return max(1, int(working_fn(rows, few=few))), "runtime_measured"
     flat = int(geometry.flat_transient_bytes)
     flat_share = max(1, flat * rows // _ADMISSION_FLAT_TRANSIENT_ROWS)
     # A backend whose attention grows with the square of one forward's rows
@@ -24280,7 +24612,7 @@ def _run_prefill_admission(
     # The one-copy store publishes a prompt as a lease plus one recurrent
     # anchor and sizes the prefill's buffers to the verifier bank's rows
     # (mtplx/one_copy.py).
-    one_copy = one_copy_runtime(runtime)
+    one_copy = one_copy_store(runtime)
     anchor_bytes = one_copy_anchor_nbytes(runtime) if one_copy else None
     slack_rows = (
         one_copy_prefill_slack_rows(runtime, prompt_tokens, max_new_tokens)
@@ -26354,7 +26686,7 @@ def _commit_prompt_prefix_for_request(
     # diverges where the assistant turn starts). Skipping it left every
     # follow-up at the first turn's prompt, re-reading one more answer each
     # turn (#291, with --ssd-session-cache off).
-    return one_copy_runtime(getattr(state, "runtime", None)) and len(prompt_ids) >= 512
+    return one_copy_store(getattr(state, "runtime", None)) and len(prompt_ids) >= 512
 
 
 def _anonymous_coding_agent_tool_request(
@@ -28571,7 +28903,7 @@ def _store_retokenized_history_snapshot(
     # at its restore point (one_copy.LeaseReturn), and one it did finish is
     # banked before any yield below, so a preempted postcommit never drops
     # the conversation.
-    one_copy = one_copy_runtime(state.runtime)
+    one_copy = one_copy_store(state.runtime)
     try:
         try:
             if _abort_requested():
@@ -34983,6 +35315,13 @@ class _ThinkingContentStreamSplitter:
         # keep-prose behavior on the non-stream path.
         self._disabled_reasoning_interior = ""
         self._reentry_count = 0
+        # How many characters of reasoning this splitter has released that the
+        # rule before 21 Nov would still hold (it kept the last `keep`
+        # characters whatever they were, so its held text began that much
+        # earlier). A reasoning tag that heads the held text is dropped; with
+        # this the tag is dropped exactly where that rule would have dropped
+        # it (see _stream_holdback).
+        self._think_lag = 0
         self._reasoning_accumulated: list[str] = []
         self._content_emitted = False
         self._content_history_tail = ""
@@ -35356,6 +35695,7 @@ class _ThinkingContentStreamSplitter:
             chunks.append((field, cleaned))
 
     def _reset_thinking_line_state(self) -> None:
+        self._think_lag = 0
         self._think_line_has_text = False
         self._think_line_prefix = ""
         self._think_fence_open = False
@@ -35676,6 +36016,45 @@ class _ThinkingContentStreamSplitter:
                 self._disabled_visible_started = True
         return chunks
 
+    def _stream_holdback(self, keep: int) -> int:
+        """How many trailing characters of pending reasoning wait for more:
+        from the first "<" on, at most the last ``keep``; none without one.
+
+        Every reasoning tag (suffixed spellings included), chat-template
+        sentinel and tool marker begins with "<", and so does everything
+        each emitted piece is cleaned of (``_clean_generated_assistant_text``
+        drops a tag or sentinel that lies whole inside one piece). Text ahead
+        of the first "<" can therefore leave at once and the bytes stay the
+        rule before 21 Nov's: that rule held the last ``keep`` characters
+        whatever they were, so on 21 Nov every answer's first 32 characters
+        of reasoning waited, seven to nine tokens, and the first visible text
+        left with the fourth round of a turn instead of the first (0.13 s of
+        a warm turn's 0.15 s, T1). From a "<" on, the old rule's own window
+        stands, so a tag is split between pieces (kept as text) or held whole
+        (cleaned away) exactly where it was before; ``_think_lag`` follows
+        where that window began for a tag at the head of the held text.
+        Reasoning only: the content channel keeps its hold, whose chunking
+        the edge trim ahead of tool markup depends on.
+        """
+        first = self._pending.find("<")
+        return 0 if first < 0 else min(keep, len(self._pending) - first)
+
+    def _follow_old_window(self, keep: int, emitted: int, *, final: bool) -> None:
+        """Track where the rule before 21 Nov would have held this step.
+
+        Its pending reasoning was this splitter's plus the last
+        ``_think_lag`` characters this one already released (plain text:
+        nothing from a "<" on leaves ahead of that rule), and it released all
+        but the last ``keep`` of that, or everything when ``final``. Called
+        with what this step releases (``emitted``, 0 where this splitter
+        waits on a partial marker the older text in front made undecided
+        there) before ``_pending`` changes.
+        """
+        held = len(self._pending)
+        old_held = self._think_lag + held
+        old_released = old_held if final else max(0, old_held - keep)
+        self._think_lag = max(0, (old_held - old_released) - (held - emitted))
+
     def _drain(self, *, final: bool) -> list[tuple[str, str]]:
         chunks: list[tuple[str, str]] = []
         sentinel_keep = max(
@@ -35699,6 +36078,8 @@ class _ThinkingContentStreamSplitter:
                 marker.lower().startswith(pending_lower)
                 for marker in CHAT_TEMPLATE_SENTINEL_MARKERS
             ):
+                if self._inside_thinking:
+                    self._follow_old_window(keep, 0, final=final)
                 break
             if self._strip_stream_sentinels_from_pending():
                 if not self._pending:
@@ -35712,6 +36093,9 @@ class _ThinkingContentStreamSplitter:
                 if opener_index >= 0 and (
                     close_index < 0 or opener_index < close_index
                 ):
+                    # Both rules release everything ahead of the opener
+                    # before judging it: from here they hold the same text.
+                    self._think_lag = 0
                     if opener_index > 0:
                         # Text ahead of the opener is reasoning whatever the
                         # opener turns out to be; emitting it first also
@@ -35750,9 +36134,14 @@ class _ThinkingContentStreamSplitter:
                     and pending_lower
                     and self._thinking_exit_opener_has_partial_prefix(pending_lower)
                 ):
+                    self._follow_old_window(keep, 0, final=final)
                     break
                 open_match_at_start = QWEN_STYLE_REASONING_OPEN_RE.match(self._pending)
-                if open_match_at_start is not None:
+                if open_match_at_start is not None and self._think_lag == 0:
+                    # A tag heading the held text (an opener the template
+                    # already opened, written again). Where the old rule's
+                    # held text began earlier, the window below splits the
+                    # tag or cleans it whole, as that rule did.
                     self._pending = self._pending[open_match_at_start.end() :]
                     self._reentry_count += 1
                     self._saw_explicit_reasoning_marker = True
@@ -35760,13 +36149,15 @@ class _ThinkingContentStreamSplitter:
                 if not final and self._reasoning_control_marker_has_partial_prefix(
                     self._pending
                 ):
+                    self._follow_old_window(keep, 0, final=final)
                     break
                 if close_match is None:
                     emit_len = (
                         len(self._pending)
                         if final
-                        else max(0, len(self._pending) - keep)
+                        else max(0, len(self._pending) - self._stream_holdback(keep))
                     )
+                    self._follow_old_window(keep, emit_len, final=final)
                     if emit_len <= 0:
                         break
                     self._emit_thinking_text(chunks, self._pending[:emit_len])
@@ -40369,6 +40760,7 @@ def create_app(state: ServerState) -> FastAPI:
                 ) != list(map(int, raw_expanded_ids)):
                     prompt_view = None
             _canonicalized = None
+            _compared_stream: list[tuple[int, ...]] = []
             if vision_session_restore is None or prompt_view is not None:
                 _canonicalized = _maybe_canonicalize_committed_reasoning(
                     state,
@@ -40390,6 +40782,7 @@ def create_app(state: ServerState) -> FastAPI:
                     strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                     session_id=resolved_session_id,
                     prompt_view=prompt_view,
+                    compared_stream=_compared_stream,
                 )
             if vision_session_restore is not None:
                 _served = (
@@ -40402,6 +40795,7 @@ def create_app(state: ServerState) -> FastAPI:
                         template_observability=template_observability,
                         receipt=vision_session_restore,
                         session_id=resolved_session_id,
+                        compared_stream=_compared_stream,
                     )
                     if prompt_view is not None
                     else None
@@ -40751,7 +41145,7 @@ def create_app(state: ServerState) -> FastAPI:
             session_source=session_source,
             session_id=session_id,
             tool_names=_tool_names(tool_specs) if tools_active else None,
-            one_copy=one_copy_runtime(getattr(state, "runtime", None)),
+            one_copy=one_copy_store(getattr(state, "runtime", None)),
         )
         live_frontier_policy = "none"
         if agent_transcript_tools_active:
