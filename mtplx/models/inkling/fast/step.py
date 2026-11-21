@@ -182,6 +182,26 @@ def attention_core(layer, q, profiles, sink, k_rows, v_rows, state, visit, panel
     return h.transpose(0, 2, 1, 3).reshape(h.shape[0], panel.rows, -1)
 
 
+def chronological_core(layer, q, profiles, sink, k_rows, v_rows, state, visit, panel):
+    """Stage B by the one-row reference, row by row: each row is the reference's one-row
+    attention call on exactly the keys the one-row step reads at that row's position (the
+    window's last 1,023 rows and the row itself, or every earlier key), so every row equals
+    the one-row step at any width. Host-side shapes that follow the live history: the step
+    takes it only where the fused attention's qualification declines, and nothing records it."""
+    keys, values = state.history(visit, k_rows, v_rows)
+    window = layer.cfg["sliding_window_size"] if layer.sliding else 0
+    rows, total = panel.rows, keys.shape[2]
+    qt = q.transpose(0, 2, 1, 3)
+    pieces = []
+    for row in range(rows):
+        stop = total - rows + row + 1
+        begin = max(0, stop - window) if window else 0
+        pieces.append(attend(qt[:, :, row:row + 1], keys[:, :, begin:stop], values[:, :, begin:stop],
+                             profiles[:, row:row + 1], sink[:, row:row + 1], window))
+    h = pieces[0] if rows == 1 else mx.concatenate(pieces, axis=2)
+    return h.transpose(0, 2, 1, 3).reshape(h.shape[0], rows, -1)
+
+
 def attention_output(layer, h, gate_logits, x, state, visit, panel):
     """Stage C (reference half): ``(partial float32, attention conv inputs float32)``."""
     gate = exact_sigmoid(gate_logits.astype(mx.float32))
@@ -357,6 +377,27 @@ def output_reason(layer, dtype):
     return unreadable(dtype, layer.out)
 
 
+#: The trunk's activation dtype, set by the decoder at load (one model a process), so the
+#: engine site and the round program ask the attention's qualification for the dtype it serves.
+_ACTIVATION = {"dtype": mx.bfloat16}
+
+
+def set_activation_dtype(dtype):
+    _ACTIVATION["dtype"] = dtype
+
+
+def attention_reason(dtype=None):
+    """Why lane L2's fused attention cannot serve on this Mac, or None. Its qualification (once
+    per dtype and reduction, at first use) declines a reduction it does not serve (for example
+    ``MLX_SDPA_BLOCKS`` past 256), bits that differ from MLX's, or a pipeline this Mac refuses.
+    The step then takes the chronological one-row reference attention, counted
+    ``fallback.bc_attention.<reason>``, and no program is recorded (its shapes follow the
+    live history)."""
+    from .attend import decline_reason
+
+    return decline_reason(dtype or _ACTIVATION["dtype"])
+
+
 def expert_input_reason(layer, message):
     """Why lane L1's MLP read cannot serve this visit, or None."""
     if message and isinstance(layer.controllers[3].down, AffineWeight):
@@ -418,13 +459,22 @@ def fused_attention(layer, a, x, state, visit, panel):
     from .attend import attend as panel_attend
     from .attn_output import attention_output as panel_output
 
-    if layer.sliding:
-        keys, values, newest, valid = state.window_view(visit)
+    declined = attention_reason(x.dtype)
+    if declined is not None:
+        # The fused attention's qualification declined on this Mac: each row by the one-row
+        # reference on its own history, gated as the reference gates; the output stays fused.
+        count(f"fallback.bc_attention.{declined}")
+        h = chronological_core(layer, a.q, relative_profiles(layer, a.rel), a.sink, a.k_rows, a.v_rows,
+                               state, visit, panel)
+        hg = (h.astype(mx.float32) * exact_sigmoid(a.gate_logits.astype(mx.float32))).astype(h.dtype)
     else:
-        keys, values, valid = state.global_view(visit)
-        newest = valid
-    hg = panel_attend(a.q, a.rel, a.sink, a.gate_logits, a.k_rows, a.v_rows, keys, values, valid,
-                      newest, panel.pos, layer.rel_basis, window=layer.sliding)
+        if layer.sliding:
+            keys, values, newest, valid = state.window_view(visit)
+        else:
+            keys, values, valid = state.global_view(visit)
+            newest = valid
+        hg = panel_attend(a.q, a.rel, a.sink, a.gate_logits, a.k_rows, a.v_rows, keys, values, valid,
+                          newest, panel.pos, layer.rel_basis, window=layer.sliding)
     reason = output_reason(layer, hg.dtype)
     if reason is not None:
         kind = "unfused" if isinstance(layer.out, AffineWeight) and launch_serves(layer.out) else "fallback"

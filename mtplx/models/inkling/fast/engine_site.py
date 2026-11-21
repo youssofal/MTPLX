@@ -39,7 +39,7 @@ from mtplx.engine import sites
 from mtplx.engine.site import load_early
 
 from .routes import count
-from .step import decode_panel
+from .step import attention_reason, decode_panel
 
 # The engine learns each Metal kernel when MLX compiles it; a kernel compiled before the
 # compiled module is in the process is unknown to it and refuses every program that
@@ -209,6 +209,12 @@ def _unfit(spec: str) -> str | None:
         # The reference attention reads the history back with host-side shapes that change
         # every token: not one program.
         return "reference_attention"
+    declined = attention_reason()
+    if declined is not None:
+        # The fused attention's qualification declined on this Mac, so the step's attention is
+        # the chronological one-row reference, whose shapes follow the live history: not one
+        # program either (the step and the round program both decline, counted).
+        return "attention_" + declined
     return None
 
 
@@ -305,8 +311,11 @@ def warm(rt, widths=None, *, length: int = 1100, seed: int = 20261121, stages=No
     """
     from .decoder import FastDecoder, stage_spec
     from .state import DecodeState
-    from .step import stages_for
+    from .step import set_activation_dtype, stages_for
 
+    # Before the load's first decline check: the attention's qualification is asked for the
+    # dtype the trunk computes in (the FP16 siblings ask float16).
+    set_activation_dtype(rt.model.embed_tokens.weight.dtype)
     report: dict[str, Any] = {"widths": {}, "mode": engine_runtime.mode()}
     if engine_runtime.mode() == "0" or not engine_runtime.available():
         report["skipped"] = engine_runtime.unavailable() or "disabled"

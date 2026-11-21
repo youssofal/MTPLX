@@ -48,6 +48,7 @@ def test_packed_output_projection_keeps_fused_attention_and_counts(monkeypatch):
     state = SimpleNamespace(window_view=lambda visit: (None, None, 0, 0), tail=lambda visit, slot: tail)
     panel = fast_step.Panel(rows, mx.array(10, mx.uint32), True)
     a = SimpleNamespace(q=None, rel=None, sink=None, gate_logits=None, k_rows=None, v_rows=None)
+    monkeypatch.setattr(fast_step, "attention_reason", lambda dtype=None: None)   # qualified
     monkeypatch.setattr(fast_attend, "attend", lambda *args, **kw: hg)
 
     def dense_only(*args, **kw):
