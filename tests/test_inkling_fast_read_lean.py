@@ -86,3 +86,30 @@ def test_switch_off_keeps_lane_l1(monkeypatch):
     closed, partial, queries, gains, _ = _operands(1, 3, "bfloat16", 1)
     read.read(partial, closed, queries[:1], 1e-6, mode=1)
     assert not read_lean._VERDICT
+
+
+@needs
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 6, 7, 8])
+@pytest.mark.parametrize("sources", [2, 3, 4, 5])
+@pytest.mark.parametrize("controllers,read_in,separate", [(3, False, False), (1, False, False), (3, True, False),
+                                                            (3, False, True)])
+def test_lean_controllers_equal_lane_l1(rows, sources, controllers, read_in, separate, monkeypatch):
+    """Mode 2: the controllers' down products, sources and messages, with the one-query read in the
+    launch or RC6's three-query read handed in, messages as one array or one a row."""
+    from mtplx.models.inkling.fast import read, read_lean
+
+    monkeypatch.setattr(read_lean, "_VERDICT", {})
+    closed, partial, queries, gains, _ = _operands(rows, sources, "bfloat16", 31 * rows + sources)
+    keys = mx.random.split(mx.random.key(rows + 100 * sources), 6)
+    messages = mx.random.normal((rows, 4, D), key=keys[0]).astype(mx.float32)
+    downs = [(mx.random.normal((64, 2 * D), key=keys[1 + i]) * 0.02).astype(mx.bfloat16) for i in range(3)]
+    exact = mx.random.normal((rows, 3, D), key=keys[4]).astype(mx.float32) if read_in else None
+    msgs = [messages[r:r + 1].reshape(1, 1, 4, D) for r in range(rows)] if separate else messages
+    mx.eval(messages, downs, *( [exact] if read_in else []))
+    lean, l1, _ = _both(monkeypatch, lambda: read.read(partial, closed, queries[:1], 1e-6, mode=2, messages=msgs,
+                                                       read_in=exact, downs=downs[:controllers], msg_base=0,
+                                                       controllers=controllers))
+    assert len(lean) == len(l1) == 3
+    for a, b in zip(lean, l1):
+        assert _bits(a, b)
+    assert read_lean._VERDICT and all(read_lean._VERDICT.values())
