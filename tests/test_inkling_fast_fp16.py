@@ -70,3 +70,18 @@ def test_fused_stage_a_declines_a_float16_stream():
     with pytest.raises(RuntimeError, match="bf16 streams"):
         attention_input(layer, x, [x], None, None, mx.array(0, mx.uint32))
     assert _counted("refused:stream_dtype") == 1
+
+
+def test_step_declines_stage_d_on_a_float16_stream_and_serves_the_reference(monkeypatch):
+    from mtplx.models.inkling.fast import step
+    from mtplx.models.inkling.fast.routes import fast_route_counts
+
+    served = []
+    monkeypatch.setattr(step, "expert_input", lambda *args: served.append(args) or "reference")
+    layer = SimpleNamespace(controllers=[None] * 4)
+    before = fast_route_counts().get("fallback.d.stream_dtype", 0)
+    out = step.fused_expert_input(layer, mx.zeros((1, 1, D), mx.float32), [mx.zeros((1, 1, D), mx.float16)], None, None)
+    assert out == "reference" and len(served) == 1
+    assert fast_route_counts().get("fallback.d.stream_dtype", 0) == before + 1
+    assert step.expert_input_reason(layer, False, mx.float16) == "stream_dtype"
+    assert step.expert_input_reason(layer, False, mx.bfloat16) is None

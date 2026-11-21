@@ -398,8 +398,12 @@ def attention_reason(dtype=None):
     return decline_reason(dtype or _ACTIVATION["dtype"])
 
 
-def expert_input_reason(layer, message):
-    """Why lane L1's MLP read cannot serve this visit, or None."""
+def expert_input_reason(layer, message, dtype=mx.bfloat16):
+    """Why lane L1's MLP read cannot serve this visit, or None. Its read and controller round to
+    bf16 where RC6 rounds to the stream's dtype, so a float16 stream (the FP16 sibling packs)
+    takes the reference (review 2, finding 9)."""
+    if dtype != mx.bfloat16:
+        return "stream_dtype"
     if message and isinstance(layer.controllers[3].down, AffineWeight):
         return f"packed_{layer.controllers[3].down.bits}bit"
     return None
@@ -436,7 +440,7 @@ def stage_fallbacks(model, spec, rows, dtype=None):
         if "bc" in lanes:
             reasons.append(("bc_output", output_reason(layer, dtype)))
         if "d" in lanes:
-            reasons.append(("d", expert_input_reason(layer, message)))
+            reasons.append(("d", expert_input_reason(layer, message, dtype)))
         if "e" in lanes:
             reasons.append(("experts", unserved(layer.experts, rows, dtype)))
         for stage, reason in reasons:
@@ -499,7 +503,8 @@ def fused_expert_input(layer, partial, closed, message, panel):
     """Stage D on lane L1's read kernel (one launch, two on loop passes 2 and 3)."""
     from .read import stage_expert_input
 
-    reason = expert_input_reason(layer, message is not None)
+    stream = closed[0].dtype if closed else _ACTIVATION["dtype"]
+    reason = expert_input_reason(layer, message is not None, stream)
     if reason is not None:
         count(f"fallback.d.{reason}")
         return expert_input(layer, partial, closed, message, panel)
