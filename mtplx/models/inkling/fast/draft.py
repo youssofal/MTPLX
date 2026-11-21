@@ -108,6 +108,12 @@ def propose(drafter, target, anchor, cache, count, *, position, seed, temperatur
 
 # ------------------------------------------------------------------ depth by yield
 
+#: Round cost (ms) by proposal count 0..7 on RC6's verify path at 2,122 tokens of context:
+#: draft(k) + verify(k + 1) + commit, from the round census (outputs/inkling-fast-20261121/
+#: summary/l4/receipts/round-census-rc6.json). Long-context and fused-path tables replace it
+#: as they are measured; only the ratios between entries steer the choice.
+RC6_COST_MS_2K = (34.3, 46.2, 54.6, 63.0, 70.4, 77.7, 85.1, 92.5)
+
 #: Protocol channel tokens of Inkling 2 Mini (tokenizer added tokens).
 CHANNELS = {200008: "reasoning", 200004: "text", 200049: "tool", 200057: "tool", 200024: "tool"}
 
