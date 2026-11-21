@@ -13,7 +13,9 @@ from .draft import Drafter
 from .fast import engine_site
 from .fast import round as fast_round
 from .fast import round_program
-from .fast.decoder import DECLINED, FastDecoder, FastPending, fast_enabled, round_costs
+from .fast.decoder import DECLINED, FastDecoder, FastPending, fast_enabled, round_costs, stage_spec
+from .fast.state import MAX_PANEL
+from .fast.step import wide_rows_exact
 from .layout import cache_footprint
 from .model import load_target
 from .vision import VisionTower
@@ -27,6 +29,16 @@ def make_weights_resident(model, drafter):
     load as the request's growth (``prefill_grew_past_price`` on every start). The vision tower
     stays lazy: a text-only session never reads it."""
     mx.eval(model.parameters(), drafter.parameters() if drafter is not None else {})
+
+
+def engine_pool_price(measured, wide_panels):
+    """The engine pool a request is priced at. One pool serves every program's temporaries and
+    grows to the widest program served: warm-up's widest is ``MAX_WARM_WIDTH`` rows, and with
+    wide copy panels on a copy round records up to ``MAX_PANEL`` rows (measured on the native
+    pack: 81 MB after warm-up, 231 MB once a 25-row copy round had recorded), so the pool is
+    priced at the widest panel, scaled by rows from the measured one."""
+    measured = int(measured or 0)
+    return measured * MAX_PANEL // engine_site.MAX_WARM_WIDTH if wide_panels else measured
 
 
 class InklingRuntime(MTPLXRuntime):
@@ -69,6 +81,8 @@ class InklingRuntime(MTPLXRuntime):
             # The executor's pool after warm-up (one pool serves every width's temporaries).
             executor = engine_site.health().get("executor") or {}
             self.engine_pool_bytes = int(executor.get("pool_bytes") or 0)
+            self.engine_pool_bound = engine_pool_price(self.engine_pool_bytes,
+                                                       wide_rows_exact(model, stage_spec()))
             if self.drafter is not None:
                 try:
                     self.round_cost_ms, self.round_cost_detail = round_costs(self)
@@ -114,7 +128,8 @@ class InklingRuntime(MTPLXRuntime):
         cfg = self.model.config
         row = 2 * cfg["num_key_value_heads"] * cfg["head_dim"] * self.model.embed_tokens.weight.dtype.size
         globals_ = sum(1 for i in self.model.visit_order if not self.model.layers[i].sliding)
-        return globals_ * BANK_STEP * row + getattr(self, "engine_pool_bytes", 0)
+        pool = getattr(self, "engine_pool_bound", None) or getattr(self, "engine_pool_bytes", 0)
+        return globals_ * BANK_STEP * row + pool
 
     #: Rows a chunked prompt forward reads when nobody names a width.
     PROMPT_CHUNK_ROWS = 512
