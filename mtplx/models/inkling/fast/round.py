@@ -212,7 +212,7 @@ _RACE = r"""
     uint K = sizes[2];               // rows that carry a proposal
     int mode = modes[row];
     uint2 key = uint2(seed[0], seed[1]);
-    uint position = CONSECUTIVE ? positions[0] + row : positions[row];
+    uint position = CONSECUTIVE ? positions[0] + uint(OFFSET) + row : positions[row];
     threadgroup float2 scratch[THREADS / 32];
     float2 t = l4_row_lse(tstats, row, C, tid, lane, sg, scratch);
     float2 d = float2(0.0f, 0.0f);
@@ -575,10 +575,10 @@ class DraftLaw:
 
 
 def race(tlaw, tstats, *, modes, positions, seed, purpose, greedy=False, dlaw=None,
-         dstats=None, proposals=None, consecutive=False):
+         dstats=None, proposals=None, consecutive=False, offset=0):
     """Race partials and per-row (max, lse) for a panel of law rows (pure, lazy).
-    ``consecutive``: ``positions`` is one base position and row r draws at base + r (computed
-    in the kernel: no position array is built on the GPU)."""
+    ``consecutive``: ``positions`` is one base position and row r draws at base + ``offset`` + r
+    (computed in the kernel: no position array is built on the GPU)."""
     rows, vocab = tlaw.shape
     chunks = _chunks(vocab)
     k = 0 if proposals is None else int(proposals.shape[0])
@@ -591,7 +591,7 @@ def race(tlaw, tstats, *, modes, positions, seed, purpose, greedy=False, dlaw=No
         inputs=[tlaw, tstats, dlaw, dstats, proposals.astype(mx.int32), modes, positions, seed,
                 sizes],
         template=[("THREADS", THREADS), ("PER_THREAD", PER_THREAD), ("GREEDY", bool(greedy)),
-                  ("PURPOSE", int(purpose)), ("CONSECUTIVE", bool(consecutive))],
+                  ("PURPOSE", int(purpose)), ("CONSECUTIVE", bool(consecutive)), ("OFFSET", int(offset))],
         grid=(chunks * THREADS, rows, 1),
         threadgroup=(THREADS, 1, 1),
         output_shapes=[(rows, chunks, 4), (rows, 4)],
@@ -704,15 +704,18 @@ def winners(race_parts):
     return out
 
 
-def sample_rows(law, stats, *, positions, seed, purpose, greedy=False):
+def sample_rows(law, stats, *, positions, seed, purpose, greedy=False, offset=None):
     """One independent draw per law row (row r at ``positions[r]``): (R,) int32 and the
     per-row (max, log-sum) the draw used, (R, 4) float32 with columns [max, log-sum, 0, 0];
-    the log-probability of token j is ``(law[j] - max) - logsum``."""
+    the log-probability of token j is ``(law[j] - max) - logsum``. With ``offset`` (an int),
+    ``positions`` is one base position and row r draws at base + ``offset`` + r, the sum made in
+    the kernel (the same uint32 sum as ``base + offset`` built on the GPU, no launch for it)."""
     rows = law.shape[0]
     modes = _const([0] * rows, mx.int32)
     seed_words = seed if isinstance(seed, mx.array) else _seed_words(seed)
     race_parts, lse = race(law, stats, modes=modes, positions=positions.astype(mx.uint32),
-                           seed=seed_words, purpose=purpose, greedy=greedy)
+                           seed=seed_words, purpose=purpose, greedy=greedy,
+                           consecutive=offset is not None, offset=int(offset or 0))
     return winners(race_parts), lse
 
 

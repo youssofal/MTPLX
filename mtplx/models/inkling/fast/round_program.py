@@ -548,8 +548,13 @@ def round_function(rt, anchor, position, seed, view: DraftView, round_state, pro
     the state the commit wrote (per visit keys, values and four tails; per drafter block keys
     and values; the drafter's last feature), then the old rows of every ring slot it wrote]."""
     model = rt.model
-    ids, law = propose(rt.drafter, model, anchor, view, proposals, position=position, seed=seed,
-                       temperature=draft_temperature, params=draft_params)
+    # Lane F1: the drafter's glue in launches of ours (fast/draft_glue.py, the same bits);
+    # MTPLX_INKLING_DRAFT_GLUE=0 serves propose below.
+    from . import draft_glue
+
+    proposer = draft_glue.propose if draft_glue.enabled() and draft_kernel_on() else propose
+    ids, law = proposer(rt.drafter, model, anchor, view, proposals, position=position, seed=seed,
+                        temperature=draft_temperature, params=draft_params)
     block = mx.concatenate([anchor.astype(mx.int32).reshape(1), ids])
     logits, captures, deltas = decode_panel(model, block, round_state, stages=stages)
     packet = fast_round.decide(logits[0], ids, position=position, seed=seed,
