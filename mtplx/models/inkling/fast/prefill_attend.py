@@ -5,7 +5,7 @@ appends a zero key/value row carrying the sink logit, writes an additive bf16 ma
 MLX's attention on query tiles of ``step = 4M // (24 * N)`` rows, N = keys + 1, evaluating
 each tile before the next. Past about 19,400 keys a tile holds 8 rows or fewer, so every call
 takes MLX 0.32.2's *vector* kernel in its two-pass form: for each query row and head, key i is
-folded into block ``i mod BLOCKS`` by MLX's per-key statements (keys the mask sets to -inf are
+taken into block ``i mod BLOCKS`` in MLX's per-key order (keys the mask sets to -inf are
 skipped), each block's output is rounded to bf16, and a second pass merges the blocks. BLOCKS
 follows MLX's rule for the call's shape: n_simds = 3 x (rows in the call).
 
@@ -60,8 +60,8 @@ def _derive_partials():
         ("    if (((P + 1 - rho) % span + span) % span == 0) {\n",
          "    if (((int(sinkpos[0]) - rho) % span + span) % span == 0) {\n"),
         # partials kept in the query type, as MLX keeps them (the values are rounded to it anyway)
-        ("            po[c * 128 + 4 * lane + j] = two ? static_cast<float>(static_cast<T>(o[h3][j])) : o[h3][j];\n",
-         "            po[c * 128 + 4 * lane + j] = static_cast<T>(o[h3][j]);\n"),
+        ("            po[c * 128 + 4 * lane + j] = two ? static_cast<float>(static_cast<T>(ch[h3].acc[j])) : ch[h3].acc[j];\n",
+         "            po[c * 128 + 4 * lane + j] = static_cast<T>(ch[h3].acc[j]);\n"),
     ):
         count = src.count(old)
         if count == 0:
@@ -76,7 +76,7 @@ def _derive_merge():
                    src.index("            hg[at] = static_cast<T>(hv * gv);\n") + len("            hg[at] = static_cast<T>(hv * gv);\n")]
     for old, new in (
         ("    const bool two = (n + 1) >= THRESH;\n", "    const bool two = true;\n"),
-        (old_gate, "            hg[at] = static_cast<T>(o[i]);   // MLX's second pass writes the query type\n"),
+        (old_gate, "            hg[at] = static_cast<T>(part[i]);   // MLX's second pass writes the query type\n"),
     ):
         if src.count(old) != 1:
             raise RuntimeError("prefill merge derivation: pattern not found")

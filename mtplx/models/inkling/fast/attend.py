@@ -42,10 +42,10 @@ HEADS, KV_HEADS, HEAD_DIM, EXTENT, WINDOW = 24, 8, 128, 1024, 1024
 GROUP = HEADS // KV_HEADS
 MAX_ROWS = 32
 #: The long-history tile order a global visit takes by panel width (measured, l2/longab-*.json):
-#: order 1 (scores by lane, exp_score by shuffle) is fastest for 1 and 2 rows, where the visit is
-#: bound by its reads; order 2 (float4 queries, 16-input key pieces, exp_score through threadgroup
-#: memory, value rows four keys ahead) is 14 to 25% faster from 3 rows, where it is bound by its
-#: arithmetic. Both give MLX's per-key order bit for bit.
+#: order 1 (logits by lane, key weights by shuffle) is fastest for 1 and 2 rows, where the visit
+#: is bound by its reads; order 2 (float4 queries, 16-input key pieces, key weights through
+#: threadgroup memory, value rows four keys ahead) is 14 to 25% faster from 3 rows, where it is
+#: bound by its arithmetic. Both give MLX's per-key order bit for bit.
 def long_order(rows):
     return 1 if rows <= 2 else 2
 
@@ -229,24 +229,46 @@ def _same_as_mlx(dtype, plan, window, history, rows, rot):
 
 
 _HEADER = """
-// One key folded into one chain: MLX 0.32.2 vector attention's statements, in its order.
-inline void fold_key(thread const float (&qs)[4], thread const float (&kv)[4],
-                     thread const float (&vv)[4], float bias, thread float& max_score,
-                     thread float& sum_exp_score, thread float (&o)[4]) {
-    float score = 0;
-    for (int j = 0; j < 4; j++) {
-        score += qs[j] * kv[j];
+// A softmax chain of one query head, the part this lane holds: the largest logit taken so far
+// (peak), the sum of exp(logit - peak) over the chain's keys (mass), and the matching weighted
+// sum of value rows over this lane's four dimensions (acc). Every operation below is the one the
+// bits require (MLX's vector attention rounds in exactly this order), so a chain ends with the
+// same peak, mass and acc as MLX's.
+struct Chain {
+    float peak;
+    float mass;
+    float acc[4];
+};
+
+inline void chain_open(thread Chain& c) {
+    c.peak = -FLT_MAX;
+    c.mass = 0;
+    for (int d = 0; d < 4; ++d) {
+        c.acc[d] = 0;
     }
-    score = simd_sum(score);
-    score += bias;
-    float new_max = max(max_score, score);
-    float factor = metal::fast::exp(max_score - new_max);
-    float exp_score = metal::fast::exp(score - new_max);
-    max_score = new_max;
-    sum_exp_score = sum_exp_score * factor + exp_score;
-    for (int j = 0; j < 4; j++) {
-        o[j] = o[j] * factor + exp_score * vv[j];
+}
+
+// One key's logit: this lane's four query-key products added in dimension order, the
+// simdgroup's total over its lanes, then the relative bias.
+inline float key_logit(thread const float (&qv)[4], thread const float (&kv)[4], float bias) {
+    float lanepart = 0;
+    for (int d = 0; d < 4; d++) {
+        lanepart += qv[d] * kv[d];
     }
+    return simd_sum(lanepart) + bias;
+}
+
+// Take one key into a chain: the key's weight at the new peak, and the share of the held sums
+// that survives the move to it.
+inline void chain_take(thread Chain& c, float logit, thread const float (&vv)[4]) {
+    const float peak = max(c.peak, logit);
+    const float w = metal::fast::exp(logit - peak);
+    const float keep = metal::fast::exp(c.peak - peak);
+    for (int d = 0; d < 4; d++) {
+        c.acc[d] = c.acc[d] * keep + w * vv[d];
+    }
+    c.mass = c.mass * keep + w;
+    c.peak = peak;
 }
 """
 
@@ -276,15 +298,14 @@ _PARTIALS = """
     threadgroup float qsh[LONG ? ROWS * 3 * 128 : 1];
     threadgroup float esh[LONG == 2 ? ROWS * 32 * 4 : 1];
 
-    float qs[3][4], o[3][4], max_score[3], sum_exp_score[3];
+    float qs[3][4];
+    Chain ch[3];
     for (int h3 = 0; h3 < 3; ++h3) {
         for (int j = 0; j < 4; ++j) {
             qs[h3][j] = static_cast<float>(scale) * static_cast<float>(
                 q[r * q_strides[1] + (3 * g + h3) * q_strides[2] + 4 * lane + j]);
-            o[h3][j] = 0;
         }
-        max_score[h3] = -FLT_MAX;
-        sum_exp_score[h3] = 0;
+        chain_open(ch[h3]);
     }
     const device T* pr = prof + (size_t(r) * 24 + size_t(3 * g)) * 1024;
     const device T* kg = kc + size_t(g) * kc_strides[1];
@@ -295,14 +316,14 @@ _PARTIALS = """
     int p_from = first + chain;
     if (LONG == 1 && two && p_from < pos0) {
         // Exact long-history order for global visits (committed keys sit at slot = position):
-        // full tiles of 32 keys of this chain. Lane t computes key t's score itself: MLX's 32
-        // per-lane partial sums, each the same four multiply-adds, combined in simd_sum's
-        // lane-order pairwise tree (proven on this GPU at first use, `lane_tree_ok`). The
-        // running max of a tile is a prefix max (max is exact), so every key gets MLX's factor
-        // and exp_score. When no key of the tile raises a head's running max, every factor is
-        // fast::exp(0) == 1 and MLX's updates reduce exactly to sum + e and o + round(e * v)
-        // (its multiply-add form is fma(o, factor, e * v), l2/probe-contract.json); only the
-        // output update stays sequential, as MLX's.
+        // full tiles of 32 keys of this chain. Lane t computes key t's logit itself: the 32
+        // per-lane partial sums of the per-key order, each the same four multiply-adds,
+        // combined in simd_sum's lane-order pairwise tree (proven on this GPU at first use,
+        // `lane_tree_ok`). The running peak of a tile is a prefix max (max is exact), so every
+        // key gets the per-key order's keep and weight. When no key of the tile raises a head's
+        // peak, every keep is fast::exp(0) == 1 and the take step reduces exactly to mass + w
+        // and acc + round(w * v) (its multiply-add form is fma(acc, keep, w * v),
+        // l2/probe-contract.json); only the value update stays sequential.
         threadgroup float* qr = qsh + r * 3 * 128;
         for (int h3 = 0; h3 < 3; ++h3) {
             for (int j = 0; j < 4; ++j) {
@@ -333,38 +354,38 @@ _PARTIALS = """
                     const threadgroup float* qv = qr + h3 * 128 + 32 * cc;
                     float part[8];
                     for (int m8 = 0; m8 < 8; ++m8) {
-                        float score = 0;
+                        float lanepart = 0;
                         for (int j = 0; j < 4; j++) {
-                            score += qv[4 * m8 + j] * kf[4 * m8 + j];
+                            lanepart += qv[4 * m8 + j] * kf[4 * m8 + j];
                         }
-                        part[m8] = score;
+                        part[m8] = lanepart;
                     }
                     sub[h3][cc] = ((part[0] + part[1]) + (part[2] + part[3])) + ((part[4] + part[5]) + (part[6] + part[7]));
                 }
             }
             const int dist = P - pt;
-            float ex[3], fac[3];
+            float wt[3], kp3[3];
             bool all_fast = true;
             for (int h3 = 0; h3 < 3; ++h3) {
-                float score = (sub[h3][0] + sub[h3][1]) + (sub[h3][2] + sub[h3][3]);
-                score += dist < 1024 ? static_cast<float>(pr[h3 * 1024 + dist]) : 0.0f;
-                const float tmax = simd_max(score);
-                if (tmax <= max_score[h3]) {
-                    fac[h3] = 1.0f;                           // no key raises the max
-                    ex[h3] = metal::fast::exp(score - max_score[h3]);
+                float logit = (sub[h3][0] + sub[h3][1]) + (sub[h3][2] + sub[h3][3]);
+                logit += dist < 1024 ? static_cast<float>(pr[h3 * 1024 + dist]) : 0.0f;
+                const float tile_top = simd_max(logit);
+                if (tile_top <= ch[h3].peak) {
+                    kp3[h3] = 1.0f;                           // no key raises the peak
+                    wt[h3] = metal::fast::exp(logit - ch[h3].peak);
                 } else {
                     all_fast = false;
-                    float run = score;                        // inclusive prefix max over the tile
+                    float run = logit;                        // inclusive prefix max over the tile
                     for (ushort d2 = 1; d2 < 32; d2 <<= 1) {
                         const float other = simd_shuffle_up(run, d2);
                         if (lane >= int(d2)) run = max(run, other);
                     }
-                    const float new_max = max(max_score[h3], run);
+                    const float at_key = max(ch[h3].peak, run);
                     float before = simd_shuffle_up(run, ushort(1));
-                    before = lane == 0 ? max_score[h3] : max(max_score[h3], before);
-                    fac[h3] = metal::fast::exp(before - new_max);
-                    ex[h3] = metal::fast::exp(score - new_max);
-                    max_score[h3] = simd_shuffle(new_max, ushort(31));
+                    before = lane == 0 ? ch[h3].peak : max(ch[h3].peak, before);
+                    kp3[h3] = metal::fast::exp(before - at_key);
+                    wt[h3] = metal::fast::exp(logit - at_key);
+                    ch[h3].peak = simd_shuffle(at_key, ushort(31));
                 }
             }
             const device T* vrow = vg + size_t(base) * vst + 4 * lane;
@@ -374,12 +395,12 @@ _PARTIALS = """
                     const float vv[4] = {as_type<float>(vb.x << 16), as_type<float>(vb.x & 0xffff0000u),
                                          as_type<float>(vb.y << 16), as_type<float>(vb.y & 0xffff0000u)};
                     for (int h3 = 0; h3 < 3; ++h3) {
-                        const float exp_score = simd_shuffle(ex[h3], ushort(t));
-                        sum_exp_score[h3] = sum_exp_score[h3] + exp_score;
+                        const float w = simd_shuffle(wt[h3], ushort(t));
+                        ch[h3].mass = ch[h3].mass + w;
                         for (int j = 0; j < 4; j++) {
                             #pragma clang fp contract(off)
-                            const float ev = exp_score * vv[j];
-                            o[h3][j] = o[h3][j] + ev;
+                            const float wv = w * vv[j];
+                            ch[h3].acc[j] = ch[h3].acc[j] + wv;
                         }
                     }
                 }
@@ -389,24 +410,23 @@ _PARTIALS = """
                     const float vv[4] = {as_type<float>(vb.x << 16), as_type<float>(vb.x & 0xffff0000u),
                                          as_type<float>(vb.y << 16), as_type<float>(vb.y & 0xffff0000u)};
                     for (int h3 = 0; h3 < 3; ++h3) {
-                        const float factor = simd_shuffle(fac[h3], ushort(t));
-                        const float exp_score = simd_shuffle(ex[h3], ushort(t));
-                        sum_exp_score[h3] = sum_exp_score[h3] * factor + exp_score;
+                        const float keep = simd_shuffle(kp3[h3], ushort(t));
+                        const float w = simd_shuffle(wt[h3], ushort(t));
                         for (int j = 0; j < 4; j++) {
-                            o[h3][j] = o[h3][j] * factor + exp_score * vv[j];
+                            ch[h3].acc[j] = ch[h3].acc[j] * keep + w * vv[j];
                         }
+                        ch[h3].mass = ch[h3].mass * keep + w;
                     }
                 }
             }
         }
-        p_from += tiles * 32 * span;                          // the rest goes through MLX's loop
+        p_from += tiles * 32 * span;                          // the rest takes the per-key loop
     }
     if (LONG == 2 && two && p_from < pos0) {
         // The same order as LONG == 1 with less work a key (3 rows or more): q read as float4,
         // keys in 16-input pieces with the lane tree kept as running partial sums (fewer live
-        // registers),
-        // exp_score handed to the lanes through threadgroup memory (one load for three heads),
-        // value rows loaded four keys ahead.
+        // registers), the key weights handed to the lanes through threadgroup memory (one load
+        // for three heads), value rows loaded four keys ahead.
         threadgroup float4* qr4 = (threadgroup float4*)(qsh + r * 3 * 128);
         threadgroup float4* es = (threadgroup float4*)(esh + r * 32 * 4);
         for (int h3 = 0; h3 < 3; ++h3) {
@@ -441,12 +461,12 @@ _PARTIALS = """
                         float part[4];
                         for (int m4 = 0; m4 < 4; ++m4) {
                             const float4 qq = qr4[h3 * 32 + 8 * cc + 4 * hh + m4];
-                            float score = 0;
-                            score += qq.x * kf[4 * m4 + 0];
-                            score += qq.y * kf[4 * m4 + 1];
-                            score += qq.z * kf[4 * m4 + 2];
-                            score += qq.w * kf[4 * m4 + 3];
-                            part[m4] = score;
+                            float lanepart = 0;
+                            lanepart += qq.x * kf[4 * m4 + 0];
+                            lanepart += qq.y * kf[4 * m4 + 1];
+                            lanepart += qq.z * kf[4 * m4 + 2];
+                            lanepart += qq.w * kf[4 * m4 + 3];
+                            part[m4] = lanepart;
                         }
                         const float s4 = (part[0] + part[1]) + (part[2] + part[3]);
                         s8[h3] = hh == 0 ? s4 : (s8[h3] + s4);
@@ -465,31 +485,31 @@ _PARTIALS = """
                 }
             }
             const int dist = P - pt;
-            float ex[3], fac[3];
+            float wt[3], kp3[3];
             bool all_fast = true;
             for (int h3 = 0; h3 < 3; ++h3) {
-                float score = sc[h3];
-                score += dist < 1024 ? static_cast<float>(pr[h3 * 1024 + dist]) : 0.0f;
-                const float tmax = simd_max(score);
-                if (tmax <= max_score[h3]) {
-                    fac[h3] = 1.0f;
-                    ex[h3] = metal::fast::exp(score - max_score[h3]);
+                float logit = sc[h3];
+                logit += dist < 1024 ? static_cast<float>(pr[h3 * 1024 + dist]) : 0.0f;
+                const float tile_top = simd_max(logit);
+                if (tile_top <= ch[h3].peak) {
+                    kp3[h3] = 1.0f;
+                    wt[h3] = metal::fast::exp(logit - ch[h3].peak);
                 } else {
                     all_fast = false;
-                    float run = score;
+                    float run = logit;
                     for (ushort d2 = 1; d2 < 32; d2 <<= 1) {
                         const float other = simd_shuffle_up(run, d2);
                         if (lane >= int(d2)) run = max(run, other);
                     }
-                    const float new_max = max(max_score[h3], run);
+                    const float at_key = max(ch[h3].peak, run);
                     float before = simd_shuffle_up(run, ushort(1));
-                    before = lane == 0 ? max_score[h3] : max(max_score[h3], before);
-                    fac[h3] = metal::fast::exp(before - new_max);
-                    ex[h3] = metal::fast::exp(score - new_max);
-                    max_score[h3] = simd_shuffle(new_max, ushort(31));
+                    before = lane == 0 ? ch[h3].peak : max(ch[h3].peak, before);
+                    kp3[h3] = metal::fast::exp(before - at_key);
+                    wt[h3] = metal::fast::exp(logit - at_key);
+                    ch[h3].peak = simd_shuffle(at_key, ushort(31));
                 }
             }
-            es[lane] = float4(ex[0], ex[1], ex[2], 0.0f);
+            es[lane] = float4(wt[0], wt[1], wt[2], 0.0f);
             simdgroup_barrier(mem_flags::mem_threadgroup);
             const device uint2* vrow = (const device uint2*)(vg + size_t(base) * size_t(vc_strides[2]) + 4 * lane);
             if (all_fast) {
@@ -499,20 +519,20 @@ _PARTIALS = """
                         vb[u] = vrow[size_t(t0 + u) * vstep2];
                     }
                     for (int u = 0; u < 4; ++u) {
-                        const float4 e4 = es[t0 + u];
+                        const float4 w4 = es[t0 + u];
                         const float vv[4] = {as_type<float>(vb[u].x << 16), as_type<float>(vb[u].x & 0xffff0000u),
                                              as_type<float>(vb[u].y << 16), as_type<float>(vb[u].y & 0xffff0000u)};
-                        sum_exp_score[0] = sum_exp_score[0] + e4.x;
-                        sum_exp_score[1] = sum_exp_score[1] + e4.y;
-                        sum_exp_score[2] = sum_exp_score[2] + e4.z;
+                        ch[0].mass = ch[0].mass + w4.x;
+                        ch[1].mass = ch[1].mass + w4.y;
+                        ch[2].mass = ch[2].mass + w4.z;
                         for (int j = 0; j < 4; j++) {
                             #pragma clang fp contract(off)
-                            const float ev0 = e4.x * vv[j];
-                            const float ev1 = e4.y * vv[j];
-                            const float ev2 = e4.z * vv[j];
-                            o[0][j] = o[0][j] + ev0;
-                            o[1][j] = o[1][j] + ev1;
-                            o[2][j] = o[2][j] + ev2;
+                            const float wv0 = w4.x * vv[j];
+                            const float wv1 = w4.y * vv[j];
+                            const float wv2 = w4.z * vv[j];
+                            ch[0].acc[j] = ch[0].acc[j] + wv0;
+                            ch[1].acc[j] = ch[1].acc[j] + wv1;
+                            ch[2].acc[j] = ch[2].acc[j] + wv2;
                         }
                     }
                 }
@@ -521,22 +541,22 @@ _PARTIALS = """
                     const uint2 vb = vrow[size_t(t) * vstep2];
                     const float vv[4] = {as_type<float>(vb.x << 16), as_type<float>(vb.x & 0xffff0000u),
                                          as_type<float>(vb.y << 16), as_type<float>(vb.y & 0xffff0000u)};
-                    const float4 e4 = es[t];
-                    const float e3[3] = {e4.x, e4.y, e4.z};
+                    const float4 w4 = es[t];
+                    const float w3[3] = {w4.x, w4.y, w4.z};
                     for (int h3 = 0; h3 < 3; ++h3) {
-                        const float factor = simd_shuffle(fac[h3], ushort(t));
-                        const float exp_score = e3[h3];
-                        sum_exp_score[h3] = sum_exp_score[h3] * factor + exp_score;
+                        const float keep = simd_shuffle(kp3[h3], ushort(t));
+                        const float w = w3[h3];
                         for (int j = 0; j < 4; j++) {
-                            o[h3][j] = o[h3][j] * factor + exp_score * vv[j];
+                            ch[h3].acc[j] = ch[h3].acc[j] * keep + w * vv[j];
                         }
+                        ch[h3].mass = ch[h3].mass * keep + w;
                     }
                 }
             }
             simdgroup_barrier(mem_flags::mem_threadgroup);
         }
         p_from += tiles * 32 * span;
-        for (int h3 = 0; h3 < 3; ++h3) {                      // q again for MLX's loop below
+        for (int h3 = 0; h3 < 3; ++h3) {                      // q again for the per-key loop below
             const float4 qq = qr4[h3 * 32 + lane];
             qs[h3][0] = qq.x; qs[h3][1] = qq.y; qs[h3][2] = qq.z; qs[h3][3] = qq.w;
         }
@@ -567,7 +587,7 @@ _PARTIALS = """
         const int dist = P - p;
         for (int h3 = 0; h3 < 3; ++h3) {
             const float bias = dist < 1024 ? static_cast<float>(pr[h3 * 1024 + dist]) : 0.0f;
-            fold_key(qs[h3], kv, vv, bias, max_score[h3], sum_exp_score[h3], o[h3]);
+            chain_take(ch[h3], key_logit(qs[h3], kv, bias), vv);
         }
     }
     // RC6's appended zero row (logical index n, virtual position P + 1) carries the sink
@@ -576,18 +596,18 @@ _PARTIALS = """
         float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         for (int h3 = 0; h3 < 3; ++h3) {
             const float bias = static_cast<float>(sink[r * sink_strides[1] + (3 * g + h3) * sink_strides[2]]);
-            fold_key(qs[h3], zero, zero, bias, max_score[h3], sum_exp_score[h3], o[h3]);
+            chain_take(ch[h3], key_logit(qs[h3], zero, bias), zero);
         }
     }
     for (int h3 = 0; h3 < 3; ++h3) {
         const size_t c = (size_t(r) * 24 + size_t(3 * g + h3)) * BLOCKS + size_t(chain);
         for (int j = 0; j < 4; ++j) {
             // Two-pass partials are stored in the query type, as MLX stores them.
-            po[c * 128 + 4 * lane + j] = two ? static_cast<float>(static_cast<T>(o[h3][j])) : o[h3][j];
+            po[c * 128 + 4 * lane + j] = two ? static_cast<float>(static_cast<T>(ch[h3].acc[j])) : ch[h3].acc[j];
         }
         if (lane == 0) {
-            pm[c] = max_score[h3];
-            ps[c] = sum_exp_score[h3];
+            pm[c] = ch[h3].peak;
+            ps[c] = ch[h3].mass;
         }
     }
 """
@@ -605,58 +625,55 @@ _MERGE = """
     const int n = nc + r + 1;
     const bool two = (n + 1) >= THRESH;
     const size_t base = (size_t(r) * 24 + size_t(h)) * BLOCKS;
-    threadgroup float outputs[32 * 32];
-    float o[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float sum_exp_score;
+    // Merging one row's chains for one head. Lane l reads chain l (and l + 32, ... on two-pass
+    // rows) for the overall peak and mass; simdgroup s sums the value parts of its chains over
+    // its lanes' four dimensions; one transposition through threadgroup memory then lets
+    // simdgroup s total dimension 4 s + d across the 32 chain groups, in lane order.
+    threadgroup float xpose[4 * 32 * 32];      // [d][chain group][simdgroup]
+    float part[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float mass;
+    float rescale = 1.0f;                      // single-pass rows rescale chain `lane` at the total
     if (two) {
-        // MLX sdpa_vector_2pass_2: blocks / 32 partials a lane.
-        float max_score = -FLT_MAX;
+        float peak = -FLT_MAX;
         for (int b = 0; b < BLOCKS / 32; ++b) {
-            max_score = max(max_score, pm[base + lane + 32 * b]);
+            peak = max(peak, pm[base + lane + 32 * b]);
         }
-        max_score = simd_max(max_score);
-        sum_exp_score = 0.0f;
+        peak = simd_max(peak);
+        mass = 0.0f;
         for (int b = 0; b < BLOCKS / 32; ++b) {
-            float factor = metal::fast::exp(pm[base + lane + 32 * b] - max_score);
-            sum_exp_score += factor * ps[base + lane + 32 * b];
+            mass += metal::fast::exp(pm[base + lane + 32 * b] - peak) * ps[base + lane + 32 * b];
         }
-        sum_exp_score = simd_sum(sum_exp_score);
+        mass = simd_sum(mass);
         for (int b = 0; b < BLOCKS / 32; ++b) {
-            float factor = metal::fast::exp(pm[base + sg + 32 * b] - max_score);
-            for (int i = 0; i < 4; ++i) {
-                o[i] += factor * po[(base + sg + 32 * b) * 128 + 4 * lane + i];
+            const size_t c = base + sg + 32 * b;
+            const float keep = metal::fast::exp(pm[c] - peak);
+            for (int d = 0; d < 4; ++d) {
+                part[d] += keep * po[c * 128 + 4 * lane + d];
             }
         }
-        for (int i = 0; i < 4; ++i) {
-            outputs[lane * 32 + sg] = o[i];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            o[i] = simd_sum(outputs[sg * 32 + lane]);
-            o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
     } else {
-        // MLX sdpa_vector's combine: simdgroup sg held chain sg; lane l reads chain l.
-        for (int i = 0; i < 4; ++i) {
-            o[i] = po[(base + sg) * 128 + 4 * lane + i];
+        for (int d = 0; d < 4; ++d) {
+            part[d] = po[(base + sg) * 128 + 4 * lane + d];
         }
-        float max_score = pm[base + lane];
-        float new_max = simd_max(max_score);
-        float factor = metal::fast::exp(max_score - new_max);
-        sum_exp_score = simd_sum(ps[base + lane] * factor);
-        for (int i = 0; i < 4; ++i) {
-            outputs[lane * 32 + sg] = o[i];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            o[i] = simd_sum(outputs[sg * 32 + lane] * factor);
-            o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
+        const float own = pm[base + lane];
+        rescale = metal::fast::exp(own - simd_max(own));
+        mass = simd_sum(ps[base + lane] * rescale);
+    }
+    for (int d = 0; d < 4; ++d) {
+        xpose[(d * 32 + lane) * 32 + sg] = part[d];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int d = 0; d < 4; ++d) {
+        const float mine = xpose[(d * 32 + sg) * 32 + lane];
+        const float total = two ? simd_sum(mine) : simd_sum(mine * rescale);
+        part[d] = mass == 0 ? total : (total / mass);
     }
     if (lane == 0) {
         for (int i = 0; i < 4; ++i) {
             const size_t at = size_t(r) * 3072 + size_t(h) * 128 + size_t(4 * sg + i);
             // The attention result in the query type, then the gate as RC6 rounds it:
             // MLX's precise sigmoid of the float32 logit, a float32 product, one cast.
-            const float hv = static_cast<float>(static_cast<T>(o[i]));
+            const float hv = static_cast<float>(static_cast<T>(part[i]));
             const float x = static_cast<float>(
                 gate[r * gate_strides[1] + (h * 128 + 4 * sg + i) * gate_strides[2]]);
             const float y = 1 / (1 + metal::precise::exp(metal::abs(x)));
@@ -668,8 +685,8 @@ _MERGE = """
 
 
 _WINDOW_ONE = """
-    // One threadgroup per (row, HPT heads): all of the row's MLX blocks for those heads,
-    // folded in registers, then MLX's own merge in threadgroup memory, then RC6's gate.
+    // One threadgroup per (row, HPT heads): all of the row's chains for those heads (MLX's
+    // block split), taken in registers, then merged in threadgroup memory, then RC6's gate.
     const int hgrp = int(threadgroup_position_in_grid.x);
     const int r = int(threadgroup_position_in_grid.y);
     const int sg = int(simdgroup_index_in_threadgroup);       // 32 simdgroups
@@ -692,16 +709,14 @@ _WINDOW_ONE = """
 
     constexpr int KMAX = BLOCKS / 32;                         // chains a simdgroup at most
     float qs[HPT][4];
-    float o[HPT][KMAX][4], mx_[HPT][KMAX], sm[HPT][KMAX];
+    Chain ch[HPT][KMAX];
     for (int j = 0; j < HPT; ++j) {
         for (int i = 0; i < 4; ++i) {
             qs[j][i] = static_cast<float>(scale) * static_cast<float>(
                 q[r * q_strides[1] + (h0 + j) * q_strides[2] + 4 * lane + i]);
         }
         for (int k = 0; k < KMAX; ++k) {
-            mx_[j][k] = -FLT_MAX;
-            sm[j][k] = 0;
-            for (int i = 0; i < 4; ++i) o[j][k][i] = 0;
+            chain_open(ch[j][k]);
         }
     }
     const device T* kg = kc + size_t(g) * kc_strides[1];
@@ -731,10 +746,10 @@ _WINDOW_ONE = """
         }
         const int dist = P - p;                               // < 1024 on a window visit
         for (int j = 0; j < HPT; ++j) {
-            const float bias = static_cast<float>(pr[j * 1024 + dist]);
+            const float logit = key_logit(qs[j], kv, static_cast<float>(pr[j * 1024 + dist]));
             for (int kk = 0; kk < KMAX; ++kk) {
                 if (kk == k) {
-                    fold_key(qs[j], kv, vv, bias, mx_[j][kk], sm[j][kk], o[j][kk]);
+                    chain_take(ch[j][kk], logit, vv);
                 }
             }
         }
@@ -745,74 +760,74 @@ _WINDOW_ONE = """
         float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         for (int j = 0; j < HPT; ++j) {
             const float bias = static_cast<float>(sink[r * sink_strides[1] + (h0 + j) * sink_strides[2]]);
+            const float logit = key_logit(qs[j], zero, bias);
             for (int kk = 0; kk < KMAX; ++kk) {
                 if (kk == k) {
-                    fold_key(qs[j], zero, zero, bias, mx_[j][kk], sm[j][kk], o[j][kk]);
+                    chain_take(ch[j][kk], logit, zero);
                 }
             }
         }
     }
-    threadgroup float tmax[HPT][128];
-    threadgroup float tsum[HPT][128];
-    threadgroup float outputs[32 * 32];
+    // Each chain's peak and mass, by chain index (chain sg + 32 k sits in simdgroup sg, slot k).
+    threadgroup float peaks[HPT][128];
+    threadgroup float masses[HPT][128];
+    threadgroup float xpose[4 * 32 * 32];      // [d][chain group][simdgroup]
     if (lane == 0) {
         for (int j = 0; j < HPT; ++j) {
             for (int k = 0; k < kps; ++k) {
-                tmax[j][sg + 32 * k] = mx_[j][k];
-                tsum[j][sg + 32 * k] = sm[j][k];
+                peaks[j][sg + 32 * k] = ch[j][k].peak;
+                masses[j][sg + 32 * k] = ch[j][k].mass;
             }
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int j = 0; j < HPT; ++j) {
-        float out4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        float sum_exp_score;
+        // The same merge as the two-launch route's second launch, reading the chains from
+        // registers and threadgroup memory instead of the stored partials.
+        float part[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float mass;
+        float rescale = 1.0f;
         if (two) {
-            // MLX sdpa_vector_2pass_2; this simdgroup's partials are blocks sg + 32 b.
-            float max_score = -FLT_MAX;
+            float peak = -FLT_MAX;
             for (int b = 0; b < BLOCKS / 32; ++b) {
-                max_score = max(max_score, tmax[j][lane + 32 * b]);
+                peak = max(peak, peaks[j][lane + 32 * b]);
             }
-            max_score = simd_max(max_score);
-            sum_exp_score = 0;
+            peak = simd_max(peak);
+            mass = 0;
             for (int b = 0; b < BLOCKS / 32; ++b) {
-                float factor = metal::fast::exp(tmax[j][lane + 32 * b] - max_score);
-                sum_exp_score += factor * tsum[j][lane + 32 * b];
+                mass += metal::fast::exp(peaks[j][lane + 32 * b] - peak) * masses[j][lane + 32 * b];
             }
-            sum_exp_score = simd_sum(sum_exp_score);
+            mass = simd_sum(mass);
             for (int b = 0; b < BLOCKS / 32; ++b) {
-                float factor = metal::fast::exp(tmax[j][sg + 32 * b] - max_score);
-                for (int i = 0; i < 4; ++i) {
-                    // Pass one writes its partials in the query type.
-                    out4[i] += factor * static_cast<float>(static_cast<T>(o[j][b][i]));
+                const float keep = metal::fast::exp(peaks[j][sg + 32 * b] - peak);
+                for (int d = 0; d < 4; ++d) {
+                    // The two-launch route stores each chain's value part in the query type.
+                    part[d] += keep * static_cast<float>(static_cast<T>(ch[j][b].acc[d]));
                 }
             }
-            for (int i = 0; i < 4; ++i) {
-                outputs[lane * 32 + sg] = out4[i];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                out4[i] = simd_sum(outputs[sg * 32 + lane]);
-                out4[i] = sum_exp_score == 0 ? out4[i] : (out4[i] / sum_exp_score);
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
         } else {
-            // MLX sdpa_vector's combine: simdgroup sg holds chain sg.
-            float max_score = tmax[j][lane];
-            float new_max = simd_max(max_score);
-            float factor = metal::fast::exp(max_score - new_max);
-            sum_exp_score = simd_sum(tsum[j][lane] * factor);
-            for (int i = 0; i < 4; ++i) {
-                outputs[lane * 32 + sg] = o[j][0][i];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                out4[i] = simd_sum(outputs[sg * 32 + lane] * factor);
-                out4[i] = sum_exp_score == 0 ? out4[i] : (out4[i] / sum_exp_score);
-                threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int d = 0; d < 4; ++d) {
+                part[d] = ch[j][0].acc[d];
             }
+            const float own = peaks[j][lane];
+            rescale = metal::fast::exp(own - simd_max(own));
+            mass = simd_sum(masses[j][lane] * rescale);
         }
+        for (int d = 0; d < 4; ++d) {
+            xpose[(d * 32 + lane) * 32 + sg] = part[d];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int d = 0; d < 4; ++d) {
+            const float mine = xpose[(d * 32 + sg) * 32 + lane];
+            const float total = two ? simd_sum(mine) : simd_sum(mine * rescale);
+            part[d] = mass == 0 ? total : (total / mass);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane == 0) {
             for (int i = 0; i < 4; ++i) {
                 const int d = 4 * sg + i;
                 const size_t at = size_t(r) * 3072 + size_t(h0 + j) * 128 + size_t(d);
-                const float hv = static_cast<float>(static_cast<T>(out4[i]));
+                const float hv = static_cast<float>(static_cast<T>(part[i]));
                 const float x = static_cast<float>(gate[r * gate_strides[1] + ((h0 + j) * 128 + d) * gate_strides[2]]);
                 const float y = 1 / (1 + metal::precise::exp(metal::abs(x)));
                 const float gv = (x < 0) ? y : 1 - y;
