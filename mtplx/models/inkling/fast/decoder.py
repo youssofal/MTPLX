@@ -190,6 +190,8 @@ def measure_round_costs(rt, *, length=1100, reps=3, seed=20261121):
         fn()  # first call: recording, checks, kernel builds
         return statistics.median(timed(fn)[1] for _ in range(reps))
 
+    routes = {}
+
     cache = _synthetic_cache(rt, length, seed)
     state = DecodeState(model, cache[: rt.trunk_entries])
     state.prepare()
@@ -203,6 +205,9 @@ def measure_round_costs(rt, *, length=1100, reps=3, seed=20261121):
         logits, captures, deltas = rt.fast.step(ids[width], state)
         mx.eval(logits, captures, [d.arrays() for d in deltas])
         outputs[width] = (logits, captures, deltas)
+        route = engine_site.last_route()
+        routes.setdefault(width, []).append(route.get("route") if route.get("reason") is None
+                                            else f"{route.get('route')}:{route.get('reason')}")
 
     step_ms = {w: median_of(lambda w=w: step(w)) for w in range(1, drafter.width + 1)}
     drafter.observe([h[:, :1] for h in outputs[1][1]], draft_cache)
@@ -231,17 +236,18 @@ def measure_round_costs(rt, *, length=1100, reps=3, seed=20261121):
         drafter.observe([h[:, :kept] for h in captures], draft_cache)
         mx.eval([c.state for c in draft_cache if c is not None and hasattr(c, "state")])
 
-    commit_ms = statistics.mean(
-        statistics.median(timed(lambda kept=kept: (step(4), commit(kept)))[1] - step_ms[4]
-                          for _ in range(reps))
-        for kept in (1, 4))
-    commit_ms = max(0.0, commit_ms)
+    def commit_once(kept):
+        step(4)  # fresh deltas, untimed
+        return timed(lambda: commit(kept))[1]
+
+    commit_ms = statistics.mean(statistics.median(commit_once(kept) for _ in range(reps)) for kept in (1, 4))
     cost = tuple(round(step_ms[k + 1] + draft_ms[k] + decide_ms[k] + commit_ms, 2)
                  for k in range(drafter.width))
     detail = {"step_ms": {w: round(v, 2) for w, v in step_ms.items()},
               "draft_ms": {k: round(v, 2) for k, v in draft_ms.items()},
               "decide_ms": {k: round(v, 2) for k, v in decide_ms.items()},
-              "commit_observe_ms": round(commit_ms, 2), "length": length, "reps": reps}
+              "commit_observe_ms": round(commit_ms, 2), "length": length, "reps": reps,
+              "step_routes": routes}
     return cost, detail
 
 
