@@ -32,15 +32,17 @@ from functools import lru_cache
 
 import mlx.core as mx
 
-#: Threads of one threadgroup (simdgroups x 4 output rows each), by output rows. A small matrix (an
-#: output projection, 2,304 rows) also splits the panel's rows over threadgroups (YSPLIT) so every
-#: GPU core has several; a large one (the head, 201,024 rows) has threadgroups enough and loops.
+#: Threads of one threadgroup (simdgroups x 4 output rows each), by output rows: a small matrix (an
+#: output projection, 2,304 rows) 128, a large one (the head, 201,024 rows) 256. YSPLIT (the panel's
+#: rows split over threadgroup rows) measured slower on the output projection (qproduct-bench-2:
+#: 58.6 against 40.7 us at 4 rows), so it stays off by default.
 _THREADS_SMALL = 128
 _THREADS_LARGE = 256
 _SMALL_ROWS = 16384
-#: Panel rows one pass accumulates (each pass decodes the codes again). 4 measured best for the
-#: head at 8 rows per clock cycle (receipts/qproduct-bench-1.json: 2.50 G-cycles against 2.72 at 8).
-_RCH_SMALL = 2
+#: Panel rows one pass accumulates (each pass decodes the codes again): 8 for a small matrix, 4 for
+#: the head (qproduct-bench-2, arms interleaved: head 856 us at 4 rows and 3,093 at 8, against
+#: 1,474 and 3,796 for the one-row products and 803 and 4,514 for MLX's own product of the rows).
+_RCH_SMALL = 8
 _RCH_LARGE = 4
 
 QMV_ROWS = """
@@ -279,7 +281,7 @@ def _launch(x2, weight, rows, n, k, bits, group, vpt, *, threads=None, rch=None,
     small = n <= _SMALL_ROWS
     threads = threads or (_THREADS_SMALL if small else _THREADS_LARGE)
     rch = min(rows, rch or (_RCH_SMALL if small else _RCH_LARGE))
-    ysplit = small if ysplit is None else bool(ysplit)
+    ysplit = bool(ysplit)
     lrows = rch if ysplit else rows
     sums = (lrows * nb * 32 * 4 <= 24 * 1024) if sums is None else bool(sums)
     rows_per_group = threads // 32 * 4
