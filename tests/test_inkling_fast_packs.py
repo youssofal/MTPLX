@@ -60,7 +60,10 @@ def test_packed_output_projection_keeps_fused_attention_and_counts(monkeypatch):
     # The pack's own product: the quantized projection of the gated result, the attention
     # convolution on the committed tail, the residual, exactly the reference's tail.
     want_partial, want_rows = fast_step.output_projection(layer, hg, x, state, 3, panel)
-    assert mx.array_equal(conv_rows, layer.out.product(hg).astype(mx.float32)).item()
+    # Stored codes are projected one row at a time, as a one-row step projects them (MLX's
+    # 2 to 24 row affine product is a different kernel on M3 and up).
+    one_row = mx.concatenate([layer.out.product(hg[:, r:r + 1]) for r in range(rows)], axis=1)
+    assert mx.array_equal(conv_rows, one_row.astype(mx.float32)).item()
     assert mx.array_equal(conv_rows, want_rows).item() and mx.array_equal(partial, want_partial).item()
     assert partial.shape == (1, rows, outer) and partial.dtype == mx.float32
 
@@ -77,10 +80,14 @@ def test_a_replayed_step_counts_the_visits_that_take_the_packs_own_product():
                                convs=[SimpleNamespace(dynamic=None) for _ in range(4)], controllers=controllers)
 
     model = SimpleNamespace(
-        layers=[layer(), layer(out=packed(64, 128, 6)), layer(q=packed(64, 128, 4), down3=packed(64, 128, 8))],
+        layers=[layer(q=packed(64, 256, 4)),  # 4-bit/64 over 256 columns: stage A reads it in place
+                layer(out=packed(64, 128, 6)), layer(q=packed(64, 128, 4), down3=packed(64, 128, 8))],
         visit_order=[0, 1, 2, 1, 2], start=1, end=3,  # layers 1-2 loop twice; messages on the second pass
-        embed_tokens=SimpleNamespace(weight=dense))
+        embed_tokens=SimpleNamespace(weight=dense), unembed=dense)
     assert fast_step.stage_fallbacks(model, "a,bc,d", 4) == {
-        "fallback.a.packed_4bit": 2, "fallback.bc_output.packed_6bit": 2, "fallback.d.packed_8bit": 1}
+        "fallback.a.packed_4bit_q": 2, "fallback.bc_output.packed_6bit": 2, "fallback.d.packed_8bit": 1}
     assert fast_step.stage_fallbacks(model, "bc,e", 4) == {"fallback.bc_output.packed_6bit": 2,
                                                           "fallback.experts.cpu": 5}
+    model.unembed = packed(64, 256, 4)  # a 4-bit head: one row at a time past one row
+    assert fast_step.stage_fallbacks(model, "bc", 4)["fallback.head.packed_rows"] == 1
+    assert "fallback.head.packed_rows" not in fast_step.stage_fallbacks(model, "bc", 1)

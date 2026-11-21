@@ -190,12 +190,24 @@ def attention_output(layer, h, gate_logits, x, state, visit, panel):
 
 def output_projection(layer, hg, x, state, visit, panel):
     """Stage C from the gated attention result: the output projection by the pack's own
-    product (16-bit or stored codes), the attention convolution and the residual."""
-    attn = ref.linear(hg, layer.out)
+    product (16-bit or stored codes), the attention convolution and the residual.
+
+    Stored codes are projected one row at a time: MLX sends a 2 to 24 row affine product to a
+    wide kernel whose rows differ from the one-row product on M3 to M5, and the reference at
+    every width is the one-row step (lane L1, q4-check-3.json)."""
+    attn = per_row_linear(hg, layer.out) if isinstance(layer.out, AffineWeight) else ref.linear(hg, layer.out)
     partial = convolution(layer.convs[2], attn, state.tail(visit, 2), panel).astype(mx.float32)
     if not layer.boundary:
         partial = partial + x.astype(mx.float32)
     return partial, attn.astype(mx.float32)
+
+
+def per_row_linear(x, weight):
+    """``x @ weight`` with each row projected alone by the stock product, as a one-row step
+    projects it (for stored codes, whose multi-row product is not row-stable on M3 and up)."""
+    if x.shape[1] == 1:
+        return ref.linear(x, weight)
+    return mx.concatenate([ref.linear(x[:, row : row + 1], weight) for row in range(x.shape[1])], axis=1)
 
 
 def relative_profiles(layer, rel):
@@ -259,17 +271,27 @@ def unreadable(dtype, *weights):
 
 
 def attention_input_reason(layer, dtype, message):
-    """Why lane L1's stage A cannot serve this visit, or None (its kernels read 16-bit
-    projections, convolution offsets and, on loop passes 2 and 3, the controllers)."""
+    """Why lane L1's stage A cannot serve this visit, or None. Its projection launch reads q, r,
+    gate, k and v as 16-bit or as the affine codes it twins MLX's one-row product for (4 and 8
+    bits, ``attn_input.affine_route``), and the sink, the dynamic taps and (loop passes 2 and 3)
+    the controllers as 16-bit."""
+    from .attn_input import affine_route, matrix
+
     if dtype != mx.bfloat16:
         return "stream_dtype"
-    reason = unreadable(mx.bfloat16, layer.q, layer.k, layer.v, layer.r, layer.sink, layer.gate)
-    if reason is None:
-        packed = [layer.convs[0].dynamic, layer.convs[1].dynamic]
-        if message:
-            packed += [c.down for c in layer.controllers[:3]]
-        reason = next((f"packed_{w.bits}bit" for w in packed if isinstance(w, AffineWeight)), None)
-    return reason
+    for name, weight in (("q", layer.q), ("r", layer.r), ("gate", layer.gate), ("k", layer.k), ("v", layer.v)):
+        if isinstance(weight, AffineWeight):
+            why = affine_route(matrix(weight))
+            if why:
+                return f"packed_{weight.bits}bit_{name}"
+        elif weight.dtype != mx.bfloat16:
+            return "weight_dtype"
+    packed = [layer.sink, layer.convs[0].dynamic, layer.convs[1].dynamic]
+    if message:
+        packed += [c.down for c in layer.controllers[:3]]
+    if not isinstance(layer.sink, AffineWeight) and layer.sink.dtype != mx.bfloat16:
+        return "weight_dtype"
+    return next((f"packed_{w.bits}bit" for w in packed if isinstance(w, AffineWeight)), None)
 
 
 def output_reason(layer, dtype):
@@ -309,6 +331,8 @@ def stage_fallbacks(model, spec, rows, dtype=None):
             if reason is not None:
                 key = f"fallback.{stage}.{reason}"
                 out[key] = out.get(key, 0) + 1
+    if rows > 1 and isinstance(getattr(model, "unembed", None), AffineWeight):
+        out["fallback.head.packed_rows"] = 1
     return out
 
 
@@ -432,8 +456,12 @@ def row_stable_read(panel, closed, x, queries, eps, normalize):
 
 def row_stable_head(model, hidden):
     """The vocabulary head of a panel, every row equal to the one-row step's (pieces of at
-    most 8 rows past 8, as ``row_stable_read``)."""
+    most 8 rows past 8, as ``row_stable_read``; a head stored as affine codes one row at a
+    time, as ``output_projection``, until a row-stable 4-bit head kernel serves it)."""
     rows = hidden.shape[1]
+    if rows > 1 and isinstance(model.unembed, AffineWeight):
+        count("fallback.head.packed_rows")
+        return mx.concatenate([model.head(hidden[:, row : row + 1]) for row in range(rows)], axis=1)
     if rows <= ROW_STABLE_ROWS:
         return model.head(hidden)
     return mx.concatenate([model.head(hidden[:, start:stop]) for start, stop in row_chunks(rows)], axis=1)
