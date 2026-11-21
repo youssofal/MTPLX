@@ -168,21 +168,71 @@ def test_round_costs_are_fitted_smooth_and_coarse():
     assert bent["model"] == "linear_with_step" and bent["step_ms_past_4"] == 16.0
 
 
-def test_round_costs_are_kept_for_the_pack_build_and_mac(tmp_path, monkeypatch):
+def _cost_rt(round_ms, width=8):
+    return SimpleNamespace(drafter=SimpleNamespace(width=width), round_warm={"round_ms": round_ms},
+                           kernel_proofs=SimpleNamespace(directory=None))
+
+
+def _pieces(asked, one_row=24.0, per=6.0, commit=1.5):
+    """A fake ``measure_round_costs``: k = 0 always, the asked counts (all when None) priced
+    from the pieces, the others None; the asked lists recorded."""
+    def measure(rt, proposals=None, **_):
+        asked.append(None if proposals is None else list(proposals))
+        timed = range(1, rt.drafter.width) if proposals is None else proposals
+        raw = tuple(one_row + per * k if k == 0 or k in timed else None for k in range(rt.drafter.width))
+        return raw, {"commit_observe_ms": commit, "reps": 5}
+    return measure
+
+
+def test_round_costs_come_from_the_programs_own_warm_rounds_this_load(monkeypatch):
     from mtplx.models.inkling.fast import decoder
 
-    timed = []
-    raw = (28.0, 38.1, 43.3, 49.6, 57.0, 63.4, 73.7, 77.0)
-    monkeypatch.setattr(decoder, "measure_round_costs", lambda rt: (timed.append(1), (raw, {"reps": 5}))[1])
-    monkeypatch.setattr(decoder.engine_site, "health", lambda rt=None: {"available": True})
-    rt = SimpleNamespace(kernel_proofs=SimpleNamespace(directory=tmp_path / "proofs-identity"),
-                         drafter=SimpleNamespace(width=8))
-    first, detail = decoder.round_costs(rt)
-    second, detail2 = decoder.round_costs(rt)  # the next load: read back, not re-timed
-    assert first == second and detail["source"] == "timed" and detail2["source"] == "kept" and len(timed) == 1
-    monkeypatch.setenv("MTPLX_INKLING_FAST_STAGES", "bc,e")  # another lane set: timed again
-    _, detail3 = decoder.round_costs(rt)
-    assert detail3["source"] == "timed" and len(timed) == 2 and detail3["replaced"]
+    asked = []
+    monkeypatch.setattr(decoder, "measure_round_costs", _pieces(asked))
+    monkeypatch.delenv("MTPLX_INKLING_ROUND_COMMIT", raising=False)  # deciding round: commit added
+    program = {1: 27.0, 2: 31.2, 3: 35.1, 4: 40.0, 5: 45.2, 6: 50.6, 7: 56.3}
+    table, detail = decoder.round_costs(_cost_rt(program))
+    assert asked == [[]]  # only the one-row round from the pieces: the program served every count
+    assert detail["source"] == "program_warm" and detail["refused"] == [] and table[0] == 24.0
+    fit = detail["fit"]
+    assert table[1:] == tuple(decoder._half_ms(fit["table"][k] + 1.5) for k in range(1, 8))
+    assert all(b > a for a, b in zip(table[1:], table[2:]))
+    # The committing round's program already commits: nothing added.
+    monkeypatch.setenv("MTPLX_INKLING_ROUND_COMMIT", "1")
+    committed, detail2 = decoder.round_costs(_cost_rt(program))
+    assert detail2["commit_added_ms"] == 0.0 and committed[1] == decoder._half_ms(fit["table"][1])
+    # Every load times again: nothing is read back from, or written to, the proof directory.
+    assert len(asked) == 2
+
+
+def test_round_costs_price_a_count_the_program_did_not_serve_from_its_pieces(monkeypatch):
+    from mtplx.models.inkling.fast import decoder
+
+    asked = []
+    monkeypatch.setattr(decoder, "measure_round_costs", _pieces(asked))
+    program = {1: 27.0, 2: 31.2, 4: 40.0, 5: 45.2, 6: 50.6, 7: 56.3}  # 3 refused at warm-up
+    table, detail = decoder.round_costs(_cost_rt(program))
+    assert asked == [[3]] and detail["source"] == "program_warm" and detail["pieces_for"] == [3]
+    assert table[3] == 24.0 + 6.0 * 3
+
+
+def test_a_table_not_plausible_against_the_one_row_round_is_refused(monkeypatch):
+    from mtplx.models.inkling.fast import decoder
+
+    # Bare Speed's kept table of 21 November: 105 ms and 3 a proposal beside a one-row round
+    # of about 24 ms. Refused, said, and the pieces' line from this load serves instead.
+    asked = []
+    monkeypatch.setattr(decoder, "measure_round_costs", _pieces(asked))
+    table, detail = decoder.round_costs(_cost_rt({k: 105.0 + 3 * k for k in range(1, 8)}))
+    assert detail["source"] == "pieces" and asked == [[], None]
+    assert detail["refused"][0]["source"] == "program_warm" and "one-row" in detail["refused"][0]["reason"]
+    assert decoder.implausible(table) is None
+    # Pieces that are not plausible either: RC6's table, with both refusals said.
+    monkeypatch.setattr(decoder, "measure_round_costs", _pieces([], one_row=24.0, per=40.0))
+    table2, detail2 = decoder.round_costs(_cost_rt({k: 105.0 + 3 * k for k in range(1, 8)}))
+    assert table2 is None and detail2["source"] == "rc6" and len(detail2["refused"]) == 2
+    assert decoder.implausible((20.0, 25.0, 30.0)) is None
+    assert decoder.implausible((20.0, 70.0, 73.0)) and decoder.implausible((20.0, 25.0, 50.0))
 
 
 def test_the_committing_round_switch_is_one_for_the_loop_and_the_warm_up(monkeypatch):

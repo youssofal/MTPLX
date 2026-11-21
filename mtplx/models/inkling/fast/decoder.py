@@ -176,15 +176,18 @@ class FastDecoder:
         return logits
 
 
-def measure_round_costs(rt, *, length=1100, reps=5, seed=20261121):
-    """The depth controller's table for this Mac and pack, timed at load on a synthetic state.
+def measure_round_costs(rt, *, length=1100, reps=5, seed=20261121, proposals=None):
+    """Round costs from the round's pieces, timed at load on a synthetic state.
 
     ``cost_ms[k]`` is the ms of a round with k proposals (k = 0 .. drafter width - 1): the
     fast step at width k + 1 as the product serves it (replayed where its program is live),
     the drafter's k proposals on the GPU, the GPU decision and its read, the commit and the
     drafter's observe. Every piece is synchronised, so the table is what a round costs on
     the dependent chain here, including host time between launches. No request is touched.
-    Returns ``(cost_ms, detail)``, or ``(None, reason)`` where the fast round does not serve.
+    ``proposals`` names the counts to time (default all); k = 0, the one-row round, is always
+    timed, and a count not timed is None. ``detail["commit_observe_ms"]`` is the commit and
+    the drafter's observe alone. Returns ``(cost_ms, detail)``, or ``(None, reason)`` where
+    the fast round does not serve.
     """
     import statistics
     import time
@@ -231,7 +234,8 @@ def measure_round_costs(rt, *, length=1100, reps=5, seed=20261121):
 
     # Widths interleaved within every repetition: the GPU clock drifts between blocks of one
     # width, which made a smooth cost look like a step at one width.
-    widths = range(1, drafter.width + 1)
+    counts = tuple(range(1, drafter.width)) if proposals is None else tuple(sorted(set(proposals)))
+    widths = sorted({1, *(k + 1 for k in counts)})
     for w in widths:
         step(w)  # first call: recording, checks, kernel builds
     samples = {w: [] for w in widths}
@@ -254,7 +258,7 @@ def measure_round_costs(rt, *, length=1100, reps=5, seed=20261121):
                                    temperature=1.0, draft=law)
         fast_round.read_packet(packet, k + 1)
 
-    for k in range(1, drafter.width):
+    for k in counts:
         draft_ms[k] = median_of(lambda k=k: propose(k))
         decide_ms[k] = median_of(lambda k=k: decide(k))
 
@@ -270,7 +274,7 @@ def measure_round_costs(rt, *, length=1100, reps=5, seed=20261121):
         return timed(lambda: commit(kept))[1]
 
     commit_ms = statistics.mean(statistics.median(commit_once(kept) for _ in range(reps)) for kept in (1, 4))
-    cost = tuple(round(step_ms[k + 1] + draft_ms[k] + decide_ms[k] + commit_ms, 2)
+    cost = tuple(round(step_ms[k + 1] + draft_ms[k] + decide_ms[k] + commit_ms, 2) if k in draft_ms else None
                  for k in range(drafter.width))
     detail = {"step_ms": {w: round(v, 2) for w, v in step_ms.items()},
               "draft_ms": {k: round(v, 2) for k, v in draft_ms.items()},
@@ -280,28 +284,34 @@ def measure_round_costs(rt, *, length=1100, reps=5, seed=20261121):
     return cost, detail
 
 
-#: The fitted table lives beside the pack's kernel proofs, whose directory is keyed by the build,
-#: the MLX version, the OS, the GPU and the pack's files: a change of any re-times it.
-ROUND_COST_FILE = "inkling-round-costs.json"
-ROUND_COST_SCHEMA = 1
+#: A table is plausible against the one-row round timed beside it when its one-proposal round
+#: costs between half and three times the one-row round and each further proposal adds no more
+#: than one one-row round (and takes off no more than a tenth of one). Outside that, the timing
+#: caught something other than these rounds: another job, a hot GPU, a round that ran on MLX.
+PLAUSIBLE_FIRST = (0.5, 3.0)
 
 
 def fit_round_costs(raw):
-    """A smooth table from noisy timings: least squares ``base + per_row * k``, and a second
-    slope past ``k = 4`` only when the timings carry a real step there (it must at least halve
-    the residual and add 2 ms a row). Coefficients are rounded coarsely (base to 1 ms, slopes to
-    0.5 ms): a re-timing lands on the same choices, and the table itself is kept across loads
-    (``round_costs``), so a seeded request makes the same choices after a restart."""
+    """``fit_round_points`` over a table indexed by proposal count (k = 0 .. len - 1)."""
+    return fit_round_points(list(enumerate(raw)), len(raw))
+
+
+def fit_round_points(points, size):
+    """A smooth table of ``size`` entries from noisy ``(k, ms)`` timings: least squares
+    ``base + per_row * k``, and a second slope past ``k = 4`` only when the timings carry a real
+    step there (it must at least halve the residual and add 2 ms a row). Coefficients are
+    rounded coarsely (base to 1 ms, slopes to 0.5 ms), so the next load's re-timing lands on the
+    same choices and a seeded request makes the same choices after a restart."""
     import numpy as np
 
-    y = np.asarray(raw, dtype=np.float64)
-    k = np.arange(len(y), dtype=np.float64)
+    k = np.asarray([p[0] for p in points], dtype=np.float64)
+    y = np.asarray([p[1] for p in points], dtype=np.float64)
     hinge = 4.0
     linear = np.stack([np.ones_like(k), k], axis=1)
     coef, *_ = np.linalg.lstsq(linear, y, rcond=None)
     rms = float(np.sqrt(np.mean((linear @ coef - y) ** 2)))
     step, model = 0.0, "linear"
-    if len(y) > hinge + 2:
+    if len(y) > hinge + 2 and int((k > hinge).sum()) >= 2:
         bent = np.stack([np.ones_like(k), k, np.maximum(0.0, k - hinge)], axis=1)
         coef3, *_ = np.linalg.lstsq(bent, y, rcond=None)
         rms3 = float(np.sqrt(np.mean((bent @ coef3 - y) ** 2)))
@@ -310,47 +320,83 @@ def fit_round_costs(raw):
     base = float(round(float(coef[0])))
     per_row = max(0.5, round(float(coef[1]) * 2) / 2)
     step = round(step * 2) / 2
-    table = tuple(round(base + per_row * i + step * max(0.0, i - hinge), 2) for i in range(len(y)))
+    table = tuple(round(base + per_row * i + step * max(0.0, i - hinge), 2) for i in range(size))
     return {"model": model, "base_ms": base, "per_row_ms": per_row, "step_ms_past_4": step,
             "residual_ms": round(rms, 2), "table": table}
 
 
-def round_costs(rt):
-    """The depth controller's table for this pack, build and Mac: read from the pack's proof
-    directory when it was timed for the same lane set and engine, else timed at load
-    (``measure_round_costs``), fitted (``fit_round_costs``) and kept there for the next load.
-    Returns ``(cost_ms, detail)``; ``(None, reason)`` where the fast round does not serve."""
-    import json
+def implausible(table):
+    """Why a round-cost table cannot be this Mac's rounds, judged against its own one-row
+    round ``table[0]``, or None."""
+    one = table[0] if table else None
+    if not one or one <= 0:
+        return "no one-row round"
+    low, high = PLAUSIBLE_FIRST
+    if len(table) > 1 and not low * one <= table[1] <= high * one:
+        return f"one proposal costs {table[1]} ms against the one-row round's {one} ms"
+    for k in range(2, len(table)):
+        added = table[k] - table[k - 1]
+        if not -0.1 * one <= added <= one:
+            return f"proposal {k} adds {round(added, 2)} ms against the one-row round's {one} ms"
+    return None
 
-    proofs = getattr(rt, "kernel_proofs", None)
-    directory = getattr(proofs, "directory", None)
-    path = None if directory is None else directory / ROUND_COST_FILE
-    key = {"schema": ROUND_COST_SCHEMA, "stages": stage_spec(),
-           "engine": bool(engine_site.health().get("available")),
-           "drafter_width": getattr(rt.drafter, "width", None)}
-    replaced = None
-    if path is not None and path.is_file():
-        try:
-            record = json.loads(path.read_text())
-            if record.get("key") == key and len(record["fit"]["table"]) == key["drafter_width"]:
-                return tuple(record["fit"]["table"]), {**record, "source": "kept", "path": str(path)}
-            replaced = "timed for another lane set, engine or drafter"
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            replaced = f"unreadable: {type(exc).__name__}: {exc}"  # timed again below, said in the record
-    raw, detail = measure_round_costs(rt)
+
+def _half_ms(value):
+    return round(float(value) * 2) / 2
+
+
+def round_costs(rt):
+    """The depth controller's table for this load: what a round with k proposals costs here.
+
+    Where the round program serves: its own whole rounds from this load's warm-up
+    (``round_program.warm``: the median of the native calls for each proposal count, the
+    variant that serves), fitted to a line, plus the stock commit and the drafter's observe
+    when the program only decides. k = 0 (the one-row round, which no program serves) and any
+    count the program did not serve are timed from the pieces (``measure_round_costs``), as
+    those rounds are served. Nothing is kept across loads: one timing taken while the machine
+    was busy must not price every later load, and the warm-up times its rounds at every load
+    anyway. A table that is not plausible against the one-row round timed beside it
+    (``implausible``) is refused and said in ``detail`` (so in /health and in the request
+    record); the pieces' line from this load then serves, and if that is refused too, RC6's
+    table. Returns ``(cost_ms, detail)``; ``(None, reason)`` where the fast round does not serve."""
+    width = getattr(getattr(rt, "drafter", None), "width", None)
+    if not width:
+        return None, "no drafter"
+    warm = getattr(rt, "round_warm", None) or {}
+    program = {int(k): float(v) for k, v in (warm.get("round_ms") or {}).items()
+               if v is not None and 1 <= int(k) < width}
+    missing = [k for k in range(1, width) if k not in program]
+    raw, timing = measure_round_costs(rt, proposals=missing)
     if raw is None:
-        return None, detail
-    record = {"key": key, "fit": fit_round_costs(raw), "raw_ms": raw, "timing": detail, "replaced": replaced}
-    if path is not None:
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(record, indent=1, default=str))
-            tmp.replace(path)
-        except OSError as exc:
-            record["kept"] = f"not kept: {exc}"
-    return tuple(record["fit"]["table"]), {**record, "source": "timed",
-                                           "path": None if path is None else str(path)}
+        return None, timing
+    commit_in_program = round_commit_enabled()
+    detail = {"one_row_ms": raw[0], "program_round_ms": program, "commit_in_program": commit_in_program,
+              "pieces_ms": {k: v for k, v in enumerate(raw) if v is not None}, "timing": timing, "refused": []}
+    if len(program) >= 2:
+        added = 0.0 if commit_in_program else float(timing.get("commit_observe_ms") or 0.0)
+        fit = fit_round_points(sorted(program.items()), width)
+        line = tuple(_half_ms(raw[0]) if k == 0 else _half_ms(fit["table"][k] + added) for k in range(width))
+        why = implausible(line)
+        if why is None:
+            # A count the program did not serve runs on the pieces: priced as it runs.
+            table = tuple(line[k] if k == 0 or k in program else _half_ms(raw[k]) for k in range(width))
+            return table, {**detail, "source": "program_warm", "fit": fit, "commit_added_ms": round(added, 2),
+                           "pieces_for": missing}
+        detail["refused"].append({"source": "program_warm", "table": line, "reason": why})
+        print(f"[mtplx] inkling: round cost table from the warm-up refused ({why}); timing the pieces", flush=True)
+    if any(v is None for v in raw):
+        raw, timing = measure_round_costs(rt)
+        if raw is None:
+            return None, {**detail, "source": "rc6", "reason": timing}
+        detail.update(pieces_ms=dict(enumerate(raw)), timing=timing)
+    fit = fit_round_costs(raw)
+    table = tuple(_half_ms(v) for v in fit["table"])
+    why = implausible(table)
+    if why is None:
+        return table, {**detail, "source": "pieces", "fit": fit}
+    detail["refused"].append({"source": "pieces", "table": table, "reason": why})
+    print(f"[mtplx] inkling: round cost table from the pieces refused ({why}); RC6's table prices rounds", flush=True)
+    return None, {**detail, "source": "rc6"}
 
 
 def observe_fast_request(fn, rt, *args, **kwargs):
