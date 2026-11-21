@@ -80,3 +80,40 @@ def test_the_request_wrapper_installs_the_models_width_and_keeps_a_named_one(mon
         read(rt)
     assert seen == [(512, [(0, 512), (512, 1024), (1024, 1100)]), (1024, [(0, 1024), (1024, 1100)])]
     assert generation.current_prefill_chunk_override() is None
+
+
+def _decode_runtime(pool_bytes=207 << 20):
+    """The pieces InklingRuntime's fixed-bytes arithmetic reads, at the catalog geometry."""
+    import mlx.core as mx
+
+    from mtplx.models.inkling.layout import CacheFootprint
+
+    rt = object.__new__(InklingRuntime)
+    row = 2 * 8 * 128 * 2  # key and value rows of one visit, BF16
+    rt.target_footprint = CacheFootprint(full_bytes_per_token=8 * row, sliding_bytes_per_token=40 * row,
+                                         window=1024, tail_bytes=0)
+    rt.draft_footprint = None
+    sliding = [True] * 5 + [False]
+    rt.model = SimpleNamespace(
+        config={"num_key_value_heads": 8, "head_dim": 128},
+        visit_order=list(range(6)) * 8,
+        layers=[SimpleNamespace(sliding=s) for s in sliding],
+        embed_tokens=SimpleNamespace(weight=SimpleNamespace(dtype=mx.bfloat16)),
+    )
+    rt.engine_pool_bytes = pool_bytes
+    rt.prompt_chunk_rows = lambda prompt_tokens=None: 512
+    return rt, row
+
+
+def test_a_short_prompt_is_priced_at_the_decode_layout_not_its_prompt_windows():
+    """A 256-token prompt's rings become 1,024 rows at the first verify and its global banks a
+    whole 4,096-row step; the request estimate holds that and the engine's pool (about 240 MiB
+    more than the prompt-sized windows at the catalog geometry)."""
+    rt, row = _decode_runtime()
+    prompt_windows = 256 * 40 * row
+    fixed = InklingRuntime.window_cache_bytes(rt)
+    assert fixed == 1024 * 40 * row + 8 * 4096 * row + (207 << 20)
+    assert InklingRuntime.prefill_window_bytes(rt, 256, 256) == fixed > prompt_windows
+    # A long prompt's prefill windows (window + chunk - 1 rows) are the larger figure then.
+    assert InklingRuntime.prefill_window_bytes(rt, 100_000, 100_000) == max(
+        (1024 + 511) * 40 * row, fixed)

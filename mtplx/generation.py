@@ -144,6 +144,8 @@ from .sampling import (
     non_finite_logits_error,
     SamplerConfig,
     SparseDistribution,
+    client_controls,
+    min_p_filter,
     acceptance_probability as compute_acceptance_probability,
     distribution_from_logits as dense_distribution_from_logits,
     residual_distribution,
@@ -7908,6 +7910,78 @@ def _sample_from_logits(
     return sample_from_distribution(probs, rng), probs
 
 
+class ClientControlledDraw:
+    """A request's ``logit_bias``, ``repetition_penalty`` and ``min_p`` on every row it draws.
+
+    Order (the common server convention): the bias on the raw logits; the repetition
+    penalty on every token of the prompt and of the completion so far (a positive logit
+    divided by the penalty, a negative one multiplied); then ``_sample_from_logits``'s
+    presence/frequency penalties, temperature and top-k/top-p; then ``min_p`` on the shaped
+    distribution. Neutral controls never construct one (``client_controls`` is empty), so
+    requests without them keep their exact draws. ``observe`` adds a token drawn elsewhere
+    to the repetition history; ``draw`` observes its own.
+    """
+
+    def __init__(self, config: SamplerConfig, prompt_ids: Sequence[int]):
+        self.config = config
+        self.names = client_controls(config)
+        self.penalty = float(config.repetition_penalty)
+        self._prompt = prompt_ids
+        self._seen: np.ndarray | None = None
+        self._bias: tuple[mx.array, mx.array] | None = None
+        self._vocab: int | None = None
+
+    def _prepare(self, vocab: int) -> None:
+        self._vocab = vocab
+        if self.penalty != 1.0:
+            seen = np.zeros(vocab, dtype=bool)
+            ids = np.asarray(list(self._prompt), dtype=np.int64)
+            seen[ids[(ids >= 0) & (ids < vocab)]] = True
+            self._seen = seen
+        # A bias on an id the vocabulary does not have can change no draw.
+        pairs = [(t, b) for t, b in self.config.logit_bias if 0 <= t < vocab]
+        if pairs:
+            self._bias = (mx.array([t for t, _ in pairs], dtype=mx.int32),
+                          mx.array([b for _, b in pairs], dtype=mx.float32))
+
+    def logits(self, row: mx.array) -> mx.array:
+        if self._vocab is None:
+            self._prepare(int(row.shape[-1]))
+        out = row.reshape(-1).astype(mx.float32)
+        if self._bias is not None:
+            out = out.at[self._bias[0]].add(self._bias[1])
+        if self._seen is not None:
+            penalised = mx.where(out > 0, out / self.penalty, out * self.penalty)
+            out = mx.where(mx.array(self._seen), penalised, out)
+        return out.reshape(row.shape)
+
+    def observe(self, token: int) -> None:
+        if self._seen is not None and 0 <= token < self._seen.shape[0]:
+            self._seen[token] = True
+
+    def draw(
+        self,
+        row: mx.array,
+        rng: np.random.Generator,
+        *,
+        token_counts: Mapping[int, int] | None = None,
+        penalty_overlay: Mapping[int, float] | None = None,
+    ) -> int:
+        row = self.logits(row)
+        if self.config.temperature > 0 and self.config.min_p > 0:
+            probs = _distribution_from_mlx_logits(
+                row, self.config, token_counts=token_counts, penalty_overlay=penalty_overlay
+            )
+            token = sample_from_distribution(min_p_filter(probs, self.config.min_p), rng)
+        else:
+            # Greedy keeps the argmax, which min_p never removes.
+            token, _ = _sample_from_logits(
+                row, self.config, rng, token_counts=token_counts, penalty_overlay=penalty_overlay
+            )
+        self.observe(token)
+        return token
+
+
 def _mx_lazy_shape(
     row: mx.array, config: SamplerConfig
 ) -> tuple[mx.array, mx.array, mx.array]:
@@ -9736,6 +9810,8 @@ def generate_ar(
     counter_start = _runtime_counter_snapshot(rt)
     first_logprobs: FirstTokenLogprobs | None = None
     rng = np.random.default_rng(seed)
+    # logit_bias / repetition_penalty / min_p, applied on every draw when a request sets them.
+    ar_client_draw = ClientControlledDraw(sampler, prompt_ids) if client_controls(sampler) else None
     stop_token_ids = (
         _default_stop_tokens(rt.tokenizer) if stop_token_ids is None else stop_token_ids
     )
@@ -10018,15 +10094,16 @@ def generate_ar(
             sync_elapsed = time.perf_counter() - sync_started
             target_eval_time += sync_elapsed
             target_decode_time += sync_elapsed
-        token, _ = _sample_from_logits(
-            logits_row,
-            sampler,
-            rng,
-            token_counts=Counter(tokens)
+        ar_draw_kwargs = {
+            "token_counts": Counter(tokens)
             if (sampler.presence_penalty or sampler.frequency_penalty)
             else None,
-            penalty_overlay=(_ar_steer_overlay(tokens) if _steer_active else None),
-        )
+            "penalty_overlay": (_ar_steer_overlay(tokens) if _steer_active else None),
+        }
+        if ar_client_draw is not None:
+            token = ar_client_draw.draw(logits_row, rng, **ar_draw_kwargs)
+        else:
+            token, _ = _sample_from_logits(logits_row, sampler, rng, **ar_draw_kwargs)
         if first_token_logprobs_top_k is not None and not tokens:
             first_logprobs = first_token_logprobs(
                 logits[0], token_id=token, top_k=first_token_logprobs_top_k
@@ -10288,9 +10365,11 @@ def generate_mtp1(
 ) -> GenerationOutput:
     reject_non_k1_a3b_whole_moe_request(rt, entrypoint="generate_mtp1")
     if getattr(rt, "backend_id", None) == "inkling2_loop":
+        # The strategy travels with the request: target_prefix keeps RC6's seeded tokens.
         return generate_mtpk(rt, prompt_ids, max_tokens=max_tokens, sampler=sampler,
                              speculative_depth=1, seed=seed, stop_token_ids=stop_token_ids,
-                             draft_sampler=draft_sampler, repetition_stop=repetition_stop)
+                             draft_sampler=draft_sampler, repetition_stop=repetition_stop,
+                             verify_strategy=verify_strategy)
     if not rt.mtp_enabled:
         raise RuntimeError("generate_mtp1 requires an MTP-enabled runtime")
     if verify_strategy not in {

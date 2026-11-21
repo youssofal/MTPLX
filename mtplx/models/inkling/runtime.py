@@ -44,7 +44,9 @@ class InklingRuntime(MTPLXRuntime):
         # the first request neither compiles nor records.
         self.engine_warm, self.engine_pool_bytes = {"skipped": "fast path off"}, 0
         if fast_enabled() and mx.default_device() == mx.gpu and mx.metal.is_available():
-            fast_round.warm()
+            # The round's kernels serve speculative rounds only: warm them where they run.
+            if self.drafter is not None:
+                fast_round.warm()
             self.engine_warm = engine_site.warm(self)
             # The executor's pool after warm-up (one pool serves every width's temporaries).
             executor = engine_site.health().get("executor") or {}
@@ -114,11 +116,15 @@ class InklingRuntime(MTPLXRuntime):
         if not new_tokens:
             return 0
         chunk = min(new_tokens, width or self.prompt_chunk_rows(prompt_tokens))
-        return sum(
+        prefill = sum(
             part.bounded_bytes(prompt_tokens, chunk)
             for part in (self.target_footprint, self.draft_footprint)
             if part is not None
         )
+        # From the first verify the fast path holds every ring at the full window and every
+        # global bank in whole capacity steps, whatever the prompt's length (prepare), plus
+        # the engine's pool: a short prompt's request holds that, not its prompt-sized windows.
+        return max(prefill, self.window_cache_bytes())
 
     def embed_tokens(self, input_ids):
         return self.model.embed_tokens(input_ids)

@@ -1889,14 +1889,18 @@ def test_vision_splice_kwargs_always_match_callee_signatures():
     import ast
 
     import mtplx.generation
+    import mtplx.models.inkling.generation
     import mtplx.runtime
     import mtplx.vision.splice
 
+    # Inkling's loop is imported where it is called (generate_mtpk), so its own module
+    # is scanned for the signature of the ``generate`` that call reaches.
     sources = [
         Path(openai.__file__),
         Path(mtplx.generation.__file__),
         Path(mtplx.runtime.__file__),
         Path(mtplx.vision.splice.__file__),
+        Path(mtplx.models.inkling.generation.__file__),
     ]
 
     defs: dict[str, tuple[bool, bool]] = {}

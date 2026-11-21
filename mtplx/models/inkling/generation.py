@@ -9,6 +9,7 @@ import mlx.core as mx
 import numpy as np
 
 from mtplx.generation import (
+    ClientControlledDraw,
     GenerationFinalState,
     GenerationOutput,
     GenerationStats,
@@ -22,14 +23,57 @@ from mtplx.generation import (
     restore_or_prefill_prompt_state,
 )
 from mtplx.route_tape import RouteTape, counter_deltas
+from mtplx.sampling import client_controls, non_finite_logits_error
 from .copy_draft import PromptCopy, SessionPromptIndexes
 from .customer_controls import ProposalSampler, RepetitionOutput
 from .fast import draft as fast_draft
 from .fast import engine_site
+from .fast.decoder import fast_enabled
+from .fast.routes import count
 from .fast import round as fast_round
 from .protocol import completion_text
 from .sampling import draw_native, is_native_sampler
 from mtplx.token_ids import token_id_bytes
+
+
+def served_proposals(device_ok, draft_temperature, proposals, dspark_tokens):
+    """The proposal method, temperature and sampled count of the route that served them."""
+    if not device_ok:
+        return {"proposal_route": "host_" + ("sampled" if proposals.sampled else "argmax")}
+    sampled = draft_temperature > 0
+    return {"proposal_route": "device_" + ("sampled" if sampled else "argmax"),
+            "method": "sampled" if sampled else "argmax", "temperature": draft_temperature,
+            "sampled_tokens": dspark_tokens if sampled else 0}
+
+
+def decision_route(sampler, *, constraint=None, draft_sampler=None, verify_strategy=None, controls=None):
+    """``(True, None)`` when the GPU decides the rounds and draws the first token, else
+    ``(False, reason)`` for the host decision (RC6's draws), which every request can take."""
+    if not fast_enabled():
+        # MTPLX_INKLING_FAST=off restores RC6's whole path: its forward and its host decision.
+        return False, "fast_path_off"
+    if verify_strategy == "target_prefix":
+        return False, "target_prefix"
+    ok, reason = fast_round.supported(sampler, constraint=constraint, draft_sampler=draft_sampler)
+    if ok and controls is not None:
+        return False, "client_controls"
+    return ok, reason
+
+
+def checked_device_draw(row_logits, *, position, seed, temperature):
+    """The GPU's draw of one token from a logits row, refused like every host draw when the row
+    has NaN, or no finite maximum (+inf, or every entry -inf): the request raises the existing
+    numerical error before the id is counted, streamed, embedded or banked. Accepts a draw that
+    returns the id alone or ``(id, valid)``."""
+    row = row_logits.reshape(1, -1)
+    drawn = fast_round.draw(row, position=position, seed=seed, temperature=temperature)
+    ids, valid = drawn if isinstance(drawn, tuple) else (drawn, None)
+    if valid is None:
+        valid = mx.logical_not(mx.logical_or(mx.any(mx.isnan(row)), mx.isinf(mx.max(row))))
+    settle_owner_work(ids, valid)
+    if not bool(np.asarray(valid).reshape(-1)[0]):
+        raise non_finite_logits_error(np.asarray(row.astype(mx.float32)).reshape(-1), "device draw")
+    return int(np.asarray(ids).reshape(-1)[0]), True
 
 
 def generate(
@@ -104,17 +148,20 @@ def generate(
         )
     cache, logits, hidden = prompt.trunk_cache, prompt.logits, prompt.hidden
     rng = np.random.default_rng(seed)
-    native_draw = os.environ.get("MTPLX_INKLING_NATIVE_DRAW", "candidate") == "candidate" and is_native_sampler(sampler)
+    # logit_bias / repetition_penalty / min_p: applied by the host draw on every row.
+    controls = ClientControlledDraw(sampler, prompt_ids) if client_controls(sampler) else None
+    native_draw = (os.environ.get("MTPLX_INKLING_NATIVE_DRAW", "candidate") == "candidate"
+                   and is_native_sampler(sampler) and controls is None)
     # The round is decided on the GPU by the product's ratio law (class B) unless the request
     # asks for the seed-match rule (verify strategy target_prefix: RC6's host FP64 draw) or
     # its sampling law needs the host (grammar, penalties, top-p/top-k): one small read a round.
-    device_ok, device_decline = fast_round.supported(sampler, constraint=constraint, draft_sampler=draft_sampler)
-    if verify_strategy == "target_prefix":
-        device_ok, device_decline = False, "target_prefix"
+    device_ok, device_decline = decision_route(sampler, constraint=constraint, draft_sampler=draft_sampler,
+                                               verify_strategy=verify_strategy, controls=controls)
+    count("decision.device" if device_ok else f"decision.host.{device_decline}")
     round_seed = int(seed) if seed is not None else secrets.randbits(64)
     target_temperature = float(sampler.temperature or 0.0)
     draft_temperature = float(draft_sampler.temperature) if draft_sampler is not None else target_temperature
-    device_rounds = device_fallback_rounds = 0
+    device_rounds = device_fallback_rounds = host_rounds = 0
     depth_control = (fast_draft.DepthByYield(cost_ms=fast_draft.RC6_COST_MS_2K,
                                              max_depth=rt.drafter.width - 1)
                      if depth is None else None)
@@ -204,6 +251,8 @@ def generate(
             row = constraint.mask_logits_row(row)
         if native_draw:
             token = draw_native(row, rng)
+        elif controls is not None:
+            token = controls.draw(row, rng, token_counts=counts)
         else:
             token, _ = _sample_from_logits(row, sampler, rng, token_counts=counts)
         if constraint is not None:
@@ -220,10 +269,8 @@ def generate(
                 token_callback(visible)
 
     def device_draw(row_logits, position):
-        token = fast_round.draw(row_logits.reshape(1, -1), position=position, seed=round_seed,
-                                temperature=target_temperature)
-        settle_owner_work(token)
-        token = int(np.asarray(token)[0])
+        token, valid = checked_device_draw(row_logits, position=position, seed=round_seed,
+                                           temperature=target_temperature)
         counts[token] += 1
         return token
 
@@ -317,6 +364,7 @@ def generate(
             else:
                 device_rounds += 1
         if decision is None:
+            host_rounds += 1
             eval_rows(rows)
             guesses = block.tolist()[1:] if copied is None else copied
         else:
@@ -448,11 +496,15 @@ def generate(
         ),
         inkling_draft_sampling={
             **proposals.stats(drafted - copy.drafted),
+            # What served the drafter's proposals: on the GPU at the draft temperature when the
+            # device round decides, else the host proposal sampler (argmax unless one is set).
+            **served_proposals(device_ok, draft_temperature, proposals, drafted - copy.drafted),
             "device_proposal_rounds": device_proposal_rounds,
             "host_copy_rounds": rounds - device_proposal_rounds,
             "depth_choices": dict(Counter(depth_control.choices)) if depth_control is not None else None,
-            # One GPU decision and one small read per round (fast/round.py), or why not.
-            "device_round": {"rounds": device_rounds, "host_fallback_rounds": device_fallback_rounds,
+            # Who decided each round: the GPU (one small read) or the host, and why.
+            "device_round": {"rounds": device_rounds, "host_rounds": host_rounds,
+                             "host_fallback_rounds": device_fallback_rounds,
                              "decline": device_decline, "rule": "ratio" if device_ok else "seed_match",
                              "proposals": "sampled" if device_ok and draft_temperature > 0 else "argmax",
                              "draft_temperature": draft_temperature if device_ok else None},

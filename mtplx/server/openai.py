@@ -26848,6 +26848,9 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "inkling_draft_sampling",
     "inkling_output_ids_sha256",
     "inkling_target_draw",
+    # Inkling's fast decode: lane set, steps served (verify.w<W>, decode.w1), engine
+    # replays, decisions by route, and every fallback with its reason.
+    "inkling_fast",
     # Grammar-constrained decoding (response_format) counters.
     "constraint_active",
     "constraint_completed",
@@ -30577,6 +30580,7 @@ def _generation_params(
     top_k: int | None,
     presence_penalty: float | None = None,
     frequency_penalty: float | None = None,
+    client_controls: dict[str, Any] | None = None,
 ) -> tuple[int, SamplerConfig, dict[str, Any]]:
     _reject_prompt_over_context(state, prompt_token_count)
     remaining_context = max(1, int(state.context_window) - int(prompt_token_count))
@@ -30669,6 +30673,8 @@ def _generation_params(
         top_k=sampler_top_k,
         presence_penalty=sampler_presence_penalty,
         frequency_penalty=sampler_frequency_penalty,
+        # logit_bias / min_p / repetition_penalty, validated by the request policy.
+        **dict(client_controls or {}),
     )
     return (
         decode_lease_tokens,
@@ -31607,6 +31613,7 @@ def _run_mtp_batch_generation_dispatched(
         top_k=kwargs.get("top_k"),
         presence_penalty=kwargs.get("presence_penalty"),
         frequency_penalty=kwargs.get("frequency_penalty"),
+        client_controls=kwargs.get("client_controls"),
     )
     # #311 batch close: cohort rows never pass through _run_generation's arm
     # site, so the literal-repetition stop must be armed here or width>=2
@@ -32503,6 +32510,13 @@ def _run_generation_dispatched(
         request_observability_for_lane["ar_batch_bypass_reason"] = (
             "constrained_decoding"
         )
+    elif kwargs.get("client_controls"):
+        # logit_bias / min_p / repetition_penalty are applied by the serial
+        # lanes' draws; the batched AR pump's per-job samplers do not apply them.
+        use_ar_batch = False
+        mtp_disabled_reason = None
+        request_observability_for_lane["scheduler_lane"] = "solo_client_controls"
+        request_observability_for_lane["ar_batch_bypass_reason"] = "client_controls"
     elif kwargs.get("first_token_logprobs_top_k") is not None:
         # The batched AR pump's per-job samplers do not report the raw
         # distribution; logprobs requests ride the serial lanes.
@@ -32547,6 +32561,7 @@ def _run_generation_dispatched(
             top_k=kwargs.get("top_k"),
             presence_penalty=kwargs.get("presence_penalty"),
             frequency_penalty=kwargs.get("frequency_penalty"),
+            client_controls=kwargs.get("client_controls"),
         )
         generation_seed, seed_is_explicit = _resolve_seed(state, kwargs.get("seed"))
         request_observability = dict(kwargs.get("request_observability") or {})
@@ -32862,6 +32877,7 @@ def _run_generation(
     top_k: int | None,
     presence_penalty: float | None = None,
     frequency_penalty: float | None = None,
+    client_controls: dict[str, Any] | None = None,
     seed: int | None,
     draft_sampler: SamplerConfig | None = None,
     generation_mode: str | None = None,
@@ -32898,6 +32914,7 @@ def _run_generation(
         top_k=top_k,
         presence_penalty=presence_penalty,
         frequency_penalty=frequency_penalty,
+        client_controls=client_controls,
     )
     # Key name is historical (pre-#311 the guard armed only for uncapped
     # responses); it now reflects the universal literal-repetition stop and
@@ -40051,6 +40068,7 @@ def create_app(state: ServerState) -> FastAPI:
         sampler_top_k = policy.sampler_top_k
         sampler_presence_penalty = policy.sampler_presence_penalty
         sampler_frequency_penalty = policy.sampler_frequency_penalty
+        sampler_client_controls = policy.sampler_client_controls
         request_draft_sampler = policy.request_draft_sampler
         defer_mtp_batch_mlx_finalize = _use_live_mtp_batch(
             state, effective_mode=request_generation_mode
@@ -40863,6 +40881,7 @@ def create_app(state: ServerState) -> FastAPI:
                         top_k=sampler_top_k,
                         presence_penalty=sampler_presence_penalty,
                         frequency_penalty=sampler_frequency_penalty,
+                        client_controls=sampler_client_controls,
                         seed=request.seed,
                         draft_sampler=request_draft_sampler,
                         generation_mode=request_generation_mode,
@@ -40907,6 +40926,7 @@ def create_app(state: ServerState) -> FastAPI:
                     top_k=sampler_top_k,
                     presence_penalty=sampler_presence_penalty,
                     frequency_penalty=sampler_frequency_penalty,
+                    client_controls=sampler_client_controls,
                     seed=request.seed,
                     draft_sampler=request_draft_sampler,
                     generation_mode=request_generation_mode,
@@ -41536,6 +41556,7 @@ def create_app(state: ServerState) -> FastAPI:
                         top_k=sampler_top_k,
                         presence_penalty=sampler_presence_penalty,
                         frequency_penalty=sampler_frequency_penalty,
+                        client_controls=sampler_client_controls,
                         seed=None,
                         draft_sampler=request_draft_sampler,
                         generation_mode=request_generation_mode,
@@ -41661,6 +41682,7 @@ def create_app(state: ServerState) -> FastAPI:
                         top_k=sampler_top_k,
                         presence_penalty=sampler_presence_penalty,
                         frequency_penalty=sampler_frequency_penalty,
+                        client_controls=sampler_client_controls,
                         seed=None,
                         draft_sampler=request_draft_sampler,
                         generation_mode=request_generation_mode,
@@ -41841,6 +41863,7 @@ def create_app(state: ServerState) -> FastAPI:
                         top_k=sampler_top_k,
                         presence_penalty=sampler_presence_penalty,
                         frequency_penalty=sampler_frequency_penalty,
+                        client_controls=sampler_client_controls,
                         seed=None,
                         draft_sampler=request_draft_sampler,
                         generation_mode=request_generation_mode,
@@ -42001,6 +42024,7 @@ def create_app(state: ServerState) -> FastAPI:
                         top_k=sampler_top_k,
                         presence_penalty=sampler_presence_penalty,
                         frequency_penalty=sampler_frequency_penalty,
+                        client_controls=sampler_client_controls,
                         seed=None,
                         draft_sampler=request_draft_sampler,
                         generation_mode=request_generation_mode,
@@ -42295,6 +42319,7 @@ def create_app(state: ServerState) -> FastAPI:
                                 top_k=sampler_top_k,
                                 presence_penalty=sampler_presence_penalty,
                                 frequency_penalty=sampler_frequency_penalty,
+                                client_controls=sampler_client_controls,
                                 seed=request.seed,
                                 draft_sampler=request_draft_sampler,
                                 generation_mode=request_generation_mode,
@@ -42342,6 +42367,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     top_k=sampler_top_k,
                                     presence_penalty=sampler_presence_penalty,
                                     frequency_penalty=sampler_frequency_penalty,
+                                    client_controls=sampler_client_controls,
                                     seed=request.seed,
                                     draft_sampler=request_draft_sampler,
                                     generation_mode=request_generation_mode,
@@ -44976,6 +45002,7 @@ def create_app(state: ServerState) -> FastAPI:
         sampler_top_k = policy.sampler_top_k
         sampler_presence_penalty = policy.sampler_presence_penalty
         sampler_frequency_penalty = policy.sampler_frequency_penalty
+        sampler_client_controls = policy.sampler_client_controls
         request_draft_sampler = policy.request_draft_sampler
         request_client_hint = _request_client_hint_from_headers(headers, metadata)
         request_observability = {
@@ -45111,6 +45138,7 @@ def create_app(state: ServerState) -> FastAPI:
                             top_k=sampler_top_k,
                             presence_penalty=sampler_presence_penalty,
                             frequency_penalty=sampler_frequency_penalty,
+                            client_controls=sampler_client_controls,
                             seed=request.seed,
                             draft_sampler=request_draft_sampler,
                             generation_mode=request_generation_mode,
@@ -45523,6 +45551,7 @@ def create_app(state: ServerState) -> FastAPI:
                     top_k=sampler_top_k,
                     presence_penalty=sampler_presence_penalty,
                     frequency_penalty=sampler_frequency_penalty,
+                    client_controls=sampler_client_controls,
                     seed=request.seed,
                     draft_sampler=request_draft_sampler,
                     generation_mode=request_generation_mode,

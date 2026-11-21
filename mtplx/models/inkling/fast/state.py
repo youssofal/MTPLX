@@ -99,7 +99,6 @@ class DecodeState:
                 # A prefill leaves 256-row steps and a restore the exact length: one copy into
                 # a whole capacity step, evaluated per visit (peak one bank more, not eight).
                 self._rebank(kv)
-                mx.eval(kv.keys, kv.values)
                 changed.append(visit)
             for slot, width in enumerate(self.widths[visit]):
                 if conv[slot] is None:
@@ -207,6 +206,9 @@ class DecodeState:
         keys, values = mx.zeros(shape, self.dtype), mx.zeros(shape, self.dtype)
         keys[:, :, : self.length, :] = kv.keys[:, :, : self.length, :]
         values[:, :, : self.length, :] = kv.values[:, :, : self.length, :]
+        # Evaluated here, one visit at a time: the old bank is released before the next visit
+        # grows, so a growth holds one extra bank at most, not eight.
+        mx.eval(keys, values)
         kv.keys, kv.values = keys, values
 
     def _rebank(self, kv):

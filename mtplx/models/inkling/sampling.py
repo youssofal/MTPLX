@@ -5,7 +5,7 @@ from bisect import bisect_right
 import mlx.core as mx
 import numpy as np
 
-from mtplx.sampling import non_finite_logits_error
+from mtplx.sampling import client_controls, non_finite_logits_error
 
 
 def is_native_sampler(config):
@@ -15,6 +15,7 @@ def is_native_sampler(config):
         and not config.top_k
         and not config.presence_penalty
         and not config.frequency_penalty
+        and not client_controls(config)
     )
 
 

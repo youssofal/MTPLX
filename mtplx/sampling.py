@@ -27,6 +27,95 @@ class SamplerConfig:
     # raw logits before temperature; counts cover completion tokens only.
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
+    # Client controls of the OpenAI and llama.cpp dialects, carried so that no
+    # backend can drop them unseen (defaults are exact no-ops): ``logit_bias``
+    # as sorted ``(token id, additive bias)`` pairs on the raw logits;
+    # ``repetition_penalty`` divides a positive and multiplies a negative raw
+    # logit of every token already in the prompt or the completion; ``min_p``
+    # drops tokens whose probability is below ``min_p`` times the most likely
+    # token's, after temperature and the top-k/top-p filters. A backend that
+    # serves a non-neutral value on a path that cannot apply it must route the
+    # request to one that can (``client_controls`` names them).
+    logit_bias: tuple[tuple[int, float], ...] = ()
+    min_p: float = 0.0
+    repetition_penalty: float = 1.0
+
+
+def client_controls(config: SamplerConfig | None) -> tuple[str, ...]:
+    """The client controls of ``config`` that are not exact no-ops."""
+    if config is None:
+        return ()
+    names = []
+    if getattr(config, "logit_bias", ()):
+        names.append("logit_bias")
+    if float(getattr(config, "min_p", 0.0) or 0.0) > 0.0:
+        names.append("min_p")
+    if float(getattr(config, "repetition_penalty", 1.0) or 1.0) != 1.0:
+        names.append("repetition_penalty")
+    return tuple(names)
+
+
+def min_p_filter(probs, min_p: float):
+    """``probs`` without the tokens below ``min_p`` times the most likely one, renormalised."""
+    if not min_p:
+        return probs
+    if isinstance(probs, SparseDistribution):
+        keep = probs.probs >= min_p * float(probs.probs.max())
+        kept = probs.probs[keep]
+        return SparseDistribution(probs.token_ids[keep], kept / kept.sum(), probs.vocab_size)
+    dense = np.asarray(probs, dtype=np.float64)
+    dense = np.where(dense >= min_p * float(dense.max()), dense, 0.0)
+    return dense / dense.sum()
+
+
+def parse_client_controls(
+    *, logit_bias=None, min_p=None, repetition_penalty=None
+) -> dict:
+    """Validated ``SamplerConfig`` fields from request values (None = not sent).
+
+    Raises ValueError naming the field for a malformed value: ``logit_bias``
+    maps token ids (integers or their decimal strings, as OpenAI sends them)
+    to biases in [-100, 100]; ``min_p`` is in [0, 1]; ``repetition_penalty``
+    is a positive finite number.
+    """
+    import math
+
+    fields: dict = {}
+    if logit_bias is not None:
+        if not isinstance(logit_bias, Mapping):
+            raise ValueError("logit_bias must map token ids to numbers")
+        pairs: dict[int, float] = {}
+        for key, value in logit_bias.items():
+            try:
+                token = int(str(key).strip())
+            except ValueError as exc:
+                raise ValueError(f"logit_bias key {key!r} is not a token id") from exc
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"logit_bias value for token {token} must be a number")
+            bias = float(value)
+            if token < 0 or not math.isfinite(bias) or not -100.0 <= bias <= 100.0:
+                raise ValueError(
+                    f"logit_bias for token {token} must be a finite number in [-100, 100]"
+                )
+            pairs[token] = bias  # "7" and "07" name one token: the later value wins
+        fields["logit_bias"] = tuple(sorted((t, b) for t, b in pairs.items() if b))
+    if min_p is not None:
+        if isinstance(min_p, bool) or not isinstance(min_p, (int, float)):
+            raise ValueError("min_p must be a number")
+        value = float(min_p)
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError("min_p must be between 0 and 1")
+        fields["min_p"] = value
+    if repetition_penalty is not None:
+        if isinstance(repetition_penalty, bool) or not isinstance(
+            repetition_penalty, (int, float)
+        ):
+            raise ValueError("repetition_penalty must be a number")
+        value = float(repetition_penalty)
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError("repetition_penalty must be a positive number")
+        fields["repetition_penalty"] = value
+    return fields
 
 
 class NonFiniteLogitsError(RuntimeError):

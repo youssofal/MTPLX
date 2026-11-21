@@ -158,6 +158,8 @@ class RequestPolicy:
     sampler_top_k: int | None = None
     sampler_presence_penalty: float | None = None
     sampler_frequency_penalty: float | None = None
+    # logit_bias / min_p / repetition_penalty, validated (SamplerConfig fields).
+    sampler_client_controls: dict[str, Any] = field(default_factory=dict)
     request_draft_sampler: SamplerConfig | None = None
 
     # Policy-owned observability entries.
@@ -213,6 +215,42 @@ class RequestPolicy:
             long_context_depth_policy=long_context_depth_policy,
             observability=observability,
         )
+
+
+def _resolve_client_controls(
+    request: Any, *, client_controls_allowed: bool, observability: dict[str, Any]
+) -> dict[str, Any]:
+    """``logit_bias``, ``min_p`` and ``repetition_penalty`` as SamplerConfig fields.
+
+    The request models accept them as extra fields; until 2.13 they were parsed and then
+    dropped before sampling. They follow the same ownership policy as the other sampler
+    fields. A malformed value is a 400 naming the field; a well-formed one is carried to
+    the sampler, and a backend whose fast path cannot apply it routes the request to a
+    path that does (counted there).
+    """
+    from fastapi import HTTPException
+
+    from mtplx.sampling import parse_client_controls
+
+    sent = {
+        name: getattr(request, name, None)
+        for name in ("logit_bias", "min_p", "repetition_penalty")
+        if getattr(request, name, None) is not None
+    }
+    if not sent:
+        return {}
+    if not client_controls_allowed:
+        ignored = list(observability.get("client_sampler_fields_ignored") or [])
+        observability["client_sampler_fields_ignored"] = ignored + sorted(sent)
+        return {}
+    try:
+        controls = parse_client_controls(**sent)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    observability["request_client_controls"] = {
+        name: (len(value) if name == "logit_bias" else value) for name, value in controls.items()
+    }
+    return controls
 
 
 def _resolve_sampler(
@@ -419,6 +457,9 @@ def _resolve_completions_policy(
         tools_active=False,
         observability=observability,
     )
+    sampler_client_controls = _resolve_client_controls(
+        request, client_controls_allowed=client_controls_allowed, observability=observability
+    )
     return RequestPolicy(
         endpoint="completions",
         client_controls_allowed=client_controls_allowed,
@@ -431,6 +472,7 @@ def _resolve_completions_policy(
         sampler_top_k=sampler_top_k,
         sampler_presence_penalty=sampler_presence_penalty,
         sampler_frequency_penalty=sampler_frequency_penalty,
+        sampler_client_controls=sampler_client_controls,
         request_draft_sampler=request_draft_sampler,
         observability=observability,
     )
@@ -946,6 +988,9 @@ def resolve_request_policy(
         tools_active=tools_active,
         observability=observability,
     )
+    sampler_client_controls = _resolve_client_controls(
+        request, client_controls_allowed=client_controls_allowed, observability=observability
+    )
     return RequestPolicy(
         endpoint=endpoint,
         opencode_client=opencode_client,
@@ -985,6 +1030,7 @@ def resolve_request_policy(
         sampler_top_k=sampler_top_k,
         sampler_presence_penalty=sampler_presence_penalty,
         sampler_frequency_penalty=sampler_frequency_penalty,
+        sampler_client_controls=sampler_client_controls,
         request_draft_sampler=request_draft_sampler,
         observability=observability,
     )
