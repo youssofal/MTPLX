@@ -598,6 +598,29 @@ def draw(target_logits, *, position, seed, temperature=1.0):
     return tokens
 
 
+def warm(vocab=4096):
+    """Build every kernel variant the round uses on a small vocabulary, so the first request
+    after a model load does not pay the Metal compiles (call once at load; about a second)."""
+    rows = mx.zeros((4, vocab), mx.float32)
+    draft_rows = mx.zeros((3, vocab), mx.bfloat16)
+    seed = _seed_words(1)
+    props = mx.array([1, 2, 3], mx.int32)
+    law, stats = law_rows(draft_rows, temperature=1.0, cap=30.0)
+    greedy_law, greedy_stats = law_rows(draft_rows, temperature=None, cap=0.0, write=True)
+    outs = [
+        sample_rows(law, stats, positions=mx.arange(3, dtype=mx.uint32), seed=seed, purpose=PURPOSE_DRAFT)[0],
+        sample_rows(greedy_law, greedy_stats, positions=mx.arange(3, dtype=mx.uint32), seed=seed,
+                    purpose=PURPOSE_DRAFT, greedy=True)[0],
+        decide(rows, props, position=0, seed=seed, draft=DraftLaw(law, stats)),
+        decide(rows, props, position=0, seed=seed),
+        decide(rows, props, position=0, seed=seed, rule="match"),
+        decide(rows, props, position=0, seed=seed, temperature=0),
+        draw(rows[:1], position=0, seed=seed),
+        draw(rows[:1], position=0, seed=seed, temperature=0),
+    ]
+    mx.eval(outs)
+
+
 def supported(sampler, *, constraint=None, draft_sampler=None):
     """(True, None) when the device round serves this request, else (False, reason).
 

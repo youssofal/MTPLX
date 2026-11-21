@@ -38,13 +38,19 @@ def _anchor_ids(anchor):
 
 
 def propose(drafter, target, anchor, cache, count, *, position, seed, temperature=1.0,
-            sample=True, cap=None):
+            sample=True, cap=None, precision="bf16"):
     """``count`` proposals (1 to 7) after ``anchor``; returns (ids (count,) int32, DraftLaw).
 
     ``position`` is the absolute position of the first proposal (the token after the
     anchor), an int or a uint32 array. ``sample`` False keeps RC6's argmax proposals (the
-    seed-match rule). ``cap`` defaults to the target's final soft cap.
+    seed-match rule). ``cap`` defaults to the target's final soft cap. ``precision`` "f32"
+    scores each Markov step in float32 (the vocabulary head's panel kernel with float32
+    output for the base row, the same kernel over [signal, 1] and the folded table for the
+    bias) instead of RC6's bfloat16 rounding; both read the same bytes, and either law is
+    exact under both acceptance rules because the decision uses the law actually drawn.
     """
+    if precision not in ("bf16", "f32"):
+        raise ValueError(f"unknown drafter precision {precision!r}")
     if not 1 <= count < drafter.width:
         raise ValueError("DSpark proposal count exceeds its trained block")
     greedy = (not sample) or (not temperature or temperature <= 0)
@@ -63,7 +69,12 @@ def propose(drafter, target, anchor, cache, count, *, position, seed, temperatur
     ).astype(dtype)[:, 1 : count + 1]
     from ..model import linear
 
-    base = linear(h, target.unembed)[..., : drafter.vocab]
+    if precision == "f32":
+        from ..head import vocabulary_logits
+
+        base = vocabulary_logits(h, target.unembed, drafter.vocab)
+    else:
+        base = linear(h, target.unembed)[..., : drafter.vocab]
     rank = drafter.cfg["markov_rank"]
     weights = drafter.markov["rnn_proj.weight"].astype(mx.float32)
     inputs = mx.concatenate([h, mx.broadcast_to(cache[-1][0], h.shape)], axis=-1)
@@ -86,7 +97,11 @@ def propose(drafter, target, anchor, cache, count, *, position, seed, temperatur
         gate = mx.sigmoid(gate.astype(mx.float32)).astype(dtype)
         state = gate * state + (1 - gate) * mx.tanh(candidate.astype(mx.float32)).astype(dtype)
         signal = mx.tanh(output.astype(mx.float32)).astype(dtype)
-        bias = mx.addmm(folded[:, -1], signal, folded[:, :-1].T)
+        if precision == "f32":
+            ext = mx.concatenate([signal, mx.ones((1, 1), dtype)], axis=-1)[None]
+            bias = vocabulary_logits(ext, folded, drafter.vocab)[0]
+        else:
+            bias = mx.addmm(folded[:, -1], signal, folded[:, :-1].T)
         scores = base[:, i] + bias
         if greedy:
             law, st = rnd.law_rows(scores, temperature=None, cap=0.0, write=True)

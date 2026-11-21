@@ -334,3 +334,8 @@ def test_device_decide_at_other_temperatures_matches_host(temperature):
                                            temperature=temperature, draft_rows=np.asarray(dlaw))
         assert d.tokens == want
         np.testing.assert_allclose(d.accept_probability[: len(probs)], probs, rtol=1e-4, atol=1e-6)
+
+
+@needs_gpu
+def test_device_warm_builds_every_variant():
+    rnd.warm()
