@@ -13,7 +13,8 @@ from .draft import Drafter
 from .fast import engine_site
 from .fast import round as fast_round
 from .fast import round_program
-from .fast.decoder import DECLINED, FastDecoder, FastPending, fast_enabled, round_costs, stage_spec
+from .fast.decoder import (DECLINED, FastDecoder, FastPending, fast_enabled, round_commit_enabled,
+                           round_costs, stage_spec)
 from .fast.state import MAX_PANEL
 from .fast.step import wide_rows_exact
 from .layout import cache_footprint
@@ -87,8 +88,10 @@ class InklingRuntime(MTPLXRuntime):
                 fast_round.warm()
             self.engine_warm = engine_site.warm(self)
             # The DSpark round as one program for 1 to 7 proposals (lane L7), recorded and checked
-            # before ready, so no request records; the pool below is read after it.
-            self.round_warm = round_program.warm(self) if self.drafter is not None else {"skipped": "no drafter"}
+            # before ready, so no request records; the pool below is read after it. The variant the
+            # served loop runs: the committing round unless MTPLX_INKLING_ROUND_COMMIT=0.
+            self.round_warm = (round_program.warm(self, commit=round_commit_enabled())
+                               if self.drafter is not None else {"skipped": "no drafter"})
             # The executor's pool after warm-up (one pool serves every width's temporaries).
             executor = engine_site.health().get("executor") or {}
             self.engine_pool_bytes = int(executor.get("pool_bytes") or 0)

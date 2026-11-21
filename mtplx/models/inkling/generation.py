@@ -28,7 +28,7 @@ from .copy_draft import PromptCopy, SessionPromptIndexes
 from .customer_controls import ProposalSampler, RepetitionOutput
 from .fast import draft as fast_draft
 from .fast import engine_site
-from .fast.decoder import fast_enabled, stage_spec
+from .fast.decoder import fast_enabled, round_commit_enabled, stage_spec
 from .fast.step import wide_rows_exact
 from .fast.state import MAX_PANEL
 from .fast.routes import count
@@ -172,8 +172,7 @@ def generate(
     # The committing round (lane L7): the program also walks its packet with the request's stop
     # ids and remaining budget and writes the kept rows itself, so the host commits nothing.
     # MTPLX_INKLING_ROUND_COMMIT=0 keeps the deciding round and the stock commit (diagnostic).
-    round_commit_on = os.environ.get("MTPLX_INKLING_ROUND_COMMIT", "on").strip().lower() not in (
-        "0", "off", "false", "no")
+    round_commit_on = round_commit_enabled()
     round_seed = int(seed) if seed is not None else secrets.randbits(64)
     target_temperature = float(sampler.temperature or 0.0)
     draft_temperature = float(draft_sampler.temperature) if draft_sampler is not None else target_temperature

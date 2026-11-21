@@ -55,6 +55,13 @@ def stage_spec():
     return os.environ.get("MTPLX_INKLING_FAST_STAGES", DEFAULT_STAGES).strip().lower()
 
 
+def round_commit_enabled():
+    """The committing round (lane L7: the one-program round also writes the kept rows):
+    on unless MTPLX_INKLING_ROUND_COMMIT=0 (diagnostic: the deciding round and the stock
+    commit). The served loop and the load's warm-up read the same switch."""
+    return os.environ.get("MTPLX_INKLING_ROUND_COMMIT", "on").strip().lower() not in ("0", "off", "false", "no")
+
+
 class FastPending:
     """What a fast verify hands to commit in place of the reference tapes."""
 
@@ -368,4 +375,5 @@ def fast_health(rt=None):
 
 
 __all__ = ["DECLINED", "FastDecoder", "FastPending", "fast_enabled", "fast_health", "fast_mode",
-           "fit_round_costs", "measure_round_costs", "observe_fast_request", "round_costs"]
+           "fit_round_costs", "measure_round_costs", "observe_fast_request", "round_commit_enabled",
+           "round_costs"]

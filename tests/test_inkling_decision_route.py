@@ -183,3 +183,13 @@ def test_round_costs_are_kept_for_the_pack_build_and_mac(tmp_path, monkeypatch):
     monkeypatch.setenv("MTPLX_INKLING_FAST_STAGES", "bc,e")  # another lane set: timed again
     _, detail3 = decoder.round_costs(rt)
     assert detail3["source"] == "timed" and len(timed) == 2 and detail3["replaced"]
+
+
+def test_the_committing_round_switch_is_one_for_the_loop_and_the_warm_up(monkeypatch):
+    from mtplx.models.inkling.fast.decoder import round_commit_enabled
+
+    monkeypatch.delenv("MTPLX_INKLING_ROUND_COMMIT", raising=False)
+    assert round_commit_enabled()
+    for off in ("0", "off", "false", "no", " OFF "):
+        monkeypatch.setenv("MTPLX_INKLING_ROUND_COMMIT", off)
+        assert not round_commit_enabled()
