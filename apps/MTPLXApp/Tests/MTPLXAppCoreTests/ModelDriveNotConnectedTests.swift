@@ -92,6 +92,41 @@ final class ModelDriveNotConnectedTests: XCTestCase {
 
     private var unplugged: String { "/Volumes/mtplx-test-unplugged-\(UUID().uuidString)" }
 
+    func testSelectedLocalPackKeepsItsRecordedNameAcrossEjectAndReconnect() throws {
+        let fm = FileManager.default
+        let folder = scratch.resolvingSymlinksInPath().appendingPathComponent("library")
+        let pack = try completePack(in: folder, named: "repo--pack")
+        let title = "Removable test pack"
+        try JSONEncoder().encode(["display_name": title]).write(to: pack.appendingPathComponent("mtplx-pack.json"))
+        ModelFolderIndex.location = scratch.appendingPathComponent("model-folders-seen.json")
+        func selectedPack() throws -> MTPLXModelOption {
+            let library = ModelLibrary(primaryDirectory: folder.path)
+            let rows = MTPLXModelOption.pickerCatalog(customModels: [], currentModel: pack.path, modelLibrary: library)
+                .filter { $0.localCandidates.contains(pack.path) }
+            XCTAssertEqual(rows.count, 1)
+            return try XCTUnwrap(rows.first)
+        }
+
+        let mounted = try selectedPack()
+        XCTAssertEqual(mounted.displayName, title)
+        XCTAssertEqual(mounted.installedLocalPath, pack.path)
+        let parked = scratch.appendingPathComponent("parked")
+        try fm.moveItem(at: folder, to: parked)
+        let drive = unplugged
+        try fm.createSymbolicLink(at: folder, withDestinationURL: URL(fileURLWithPath: drive + "/library"))
+
+        let offline = try selectedPack()
+        XCTAssertEqual(offline.id, mounted.id)
+        XCTAssertEqual(offline.displayName, title)
+        XCTAssertNil(offline.installedLocalPath)
+        XCTAssertTrue(offline.isOnDisconnectedDrive)
+        XCTAssertEqual(offline.localizedDetail, ModelFolderIndex.notConnectedDetail(driveName: (drive as NSString).lastPathComponent))
+
+        try fm.removeItem(at: folder) // The test's dangling link.
+        try fm.moveItem(at: parked, to: folder)
+        XCTAssertEqual(try selectedPack(), mounted)
+    }
+
     /// #466 through the shared setting: `mtplx folders downloads` (or the
     /// app's "Use for Downloads") writes `model_dir`; every free-space read
     /// and the downloader's own default then use that folder, not the home

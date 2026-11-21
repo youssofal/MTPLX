@@ -692,6 +692,12 @@ def load(
         path = Path(gemma4_pair["target_model"])
     config = load_config(path)
     _export_derived_model_geometry(config)
+    if config.get("model_type") == "inkling2_loop":
+        from .models.inkling.runtime import InklingRuntime
+
+        if any((mtp_adapter, merge_mtp_adapter, proj_quant, proj_requant)):
+            raise ValueError("Inkling uses its published target and DSpark precision")
+        return InklingRuntime(path, mtp=mtp, contract=contract)
     from .a3b_whole_moe import validate_a3b_whole_moe_load_options
 
     validate_a3b_whole_moe_load_options(

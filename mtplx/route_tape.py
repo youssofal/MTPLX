@@ -31,7 +31,7 @@ VERIFY_ROUTES = frozenset({
     "compiled_bank", "graphbank", "eager_capture",
     "a3b_m3_rebased", "a3b_m3", "a3b_m2_rebased", "a3b_m2",
     "compiled_bank_tp", "graphbank_plain", "eager_plain",
-    "ccopy_bank", "ccopy_block", "ar", "not_run", "unknown",
+    "ccopy_bank", "ccopy_block", "inkling_block_verify", "ar", "not_run", "unknown",
 })
 
 
@@ -130,8 +130,7 @@ class RouteTape:
 
     __slots__ = ("enabled", "request_id", "_seq", "_path", "_sink", "_dropped")
 
-    def __init__(self, request_id: str) -> None:
-        self.request_id = request_id
+    def __init__(self, request_id: str | None = None) -> None:
         self._seq = 0
         self._dropped = 0
         requested = route_tape_requested()
@@ -143,6 +142,10 @@ class RouteTape:
         )
         self._path = Path(path).expanduser() if path else None
         self.enabled = requested and (self._sink is not None or self._path is not None)
+        # Standalone callers can omit an ID. The server sink supplies its canonical ID.
+        self.request_id = request_id if request_id is not None else (
+            f"rt-{os.urandom(8).hex()}" if self.enabled else ""
+        )
 
     def emit(self, kind: str, name: str, round_id: int | None, attrs: dict[str, Any]) -> None:
         if not self.enabled:

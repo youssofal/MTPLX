@@ -17,6 +17,7 @@ _LOG = logging.getLogger(__name__)
 
 RUNTIME_CONTRACT_FILE = "mtplx_runtime.json"
 SUPPORTED_ARCH_IDS = {
+    "inkling2-loop",
     "laguna-s-2.1-ar",
     "deepseek-v4",
     "qwen4-next",
@@ -129,6 +130,12 @@ class ArchitectureSupport:
 
 
 ARCHITECTURE_CATALOG: dict[str, ArchitectureSupport] = {
+    "inkling2-loop": ArchitectureSupport(
+        arch_id="inkling2-loop", display_name="Inkling 2 Mini", family="inkling2",
+        backend="inkling2_loop", support_level="native-runtime", runtime_compatibility="native",
+        can_run_verified=True, aliases=("inkling2_loop", "Inkling2LoopForConditionalGeneration"),
+        config_markers=("mtp_config",), family_gate="fixed-loop-dspark",
+    ),
     "laguna-s-2.1-ar": ArchitectureSupport(
         arch_id="laguna-s-2.1-ar",
         display_name="Laguna-S-2.1 oQ4e (MLX)",
@@ -855,6 +862,8 @@ def _detect_arch_id(inspection: Any) -> str | None:
     architecture = _text(getattr(inspection, "architecture", None))
     model_type = _text(getattr(inspection, "model_type", None))
     combined = f"{architecture} {model_type}"
+    if model_type in {"inkling2_loop", "inkling2_loop_text"}:
+        return "inkling2-loop"
     has_config_mtp = int(getattr(inspection, "mtp_num_hidden_layers", 0) or 0) > 0
     has_explicit_mtp = has_config_mtp or "mtp" in combined or "nextn" in combined
 
@@ -1263,7 +1272,7 @@ _DECLARED_MODULES_LOWERED = {
 # deliberately absent: its runnability is decided by the pinned-artifact
 # geometry/sidecar gate on its catalog row (supply-chain fence), never by
 # model_type alone.
-_INTREE_MODEL_TYPES = {"deepseek_v4", "qwen4_exp", "qwen4_exp_text"}
+_INTREE_MODEL_TYPES = {"deepseek_v4", "inkling2_loop", "qwen4_exp", "qwen4_exp_text"}
 
 # Families whose catalog family_gate is an artifact-integrity fence (pinned
 # geometry + pinned sidecars). A gate failure here refuses outright and is
@@ -1414,6 +1423,10 @@ def _requires_remote_code(model_dir: Any) -> bool:
 
 
 def _passes_family_runtime_gate(arch_id: str, inspection: Any, tensor_gate: bool) -> bool:
+    if arch_id == "inkling2-loop":
+        return bool(tensor_gate and all(_file_present(inspection, name) for name in (
+            "model.safetensors.index.json", "hf_quant_config.json", "processor_config.json",
+            "tokenizer.json", "chat_template.jinja", "mtp.safetensors")))
     if arch_id == "qwen4-next":
         # Preview family: serve AR only when this build actually ships an
         # implementation for the trunk — otherwise the honest capability-gap

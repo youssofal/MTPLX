@@ -148,7 +148,7 @@ def _patch_config(path: Path) -> bool:
 
     config = json.loads(path.read_text(encoding="utf-8"))
     touched = False
-    for section in (config, config.get("text_config"), config.get("vision_config")):
+    for section in (config, config.get("text_config"), config.get("vision_config"), config.get("mtp_config")):
         if not isinstance(section, dict):
             continue
         for key in _FLOAT_TYPE_KEYS:
@@ -223,6 +223,12 @@ def derive(
                 _clone(item, target)
                 copied.append(str(relative))
         config_patched = _patch_config(partial / "config.json")
+        if (partial / "mtplx-pack.json").is_file():
+            from .forge_inkling import stamp_fp16_variant
+
+            metadata = json.loads((partial / "mtplx-pack.json").read_text())
+            if metadata.get("source") == "thinkingmachines/Inkling-2-Mini":
+                stamp_fp16_variant(partial, metadata)
         if (partial / "mtplx_runtime.json").is_file():
             _patch_stamp(partial / "mtplx_runtime.json", parent=parent, public_model_id=public_model_id)
         manifest = {

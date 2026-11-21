@@ -17,7 +17,7 @@ _DEFAULT_MEAN = (0.5, 0.5, 0.5)
 _DEFAULT_STD = (0.5, 0.5, 0.5)
 
 
-def decode_image(data: bytes) -> Image.Image:
+def decode_image(data: bytes, *, preserve_alpha: bool = False) -> Image.Image:
     if len(data) > MAX_IMAGE_BYTES:
         raise ValueError(
             f"image payload is {len(data)} bytes, limit is {MAX_IMAGE_BYTES}"
@@ -30,7 +30,8 @@ def decode_image(data: bytes) -> Image.Image:
                 f"image is {width}x{height}, limit is {MAX_IMAGE_DIM} per side"
             )
         image = ImageOps.exif_transpose(image)
-        return image.convert("RGB")
+        transparent = "A" in image.getbands() or "transparency" in image.info
+        return image.convert("RGBA" if preserve_alpha and transparent else "RGB")
     except (UnidentifiedImageError, Image.DecompressionBombError) as exc:
         raise ValueError(f"cannot decode image: {exc}") from exc
 

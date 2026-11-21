@@ -520,6 +520,16 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         ),
         ar_only=True,
     ),
+    CatalogModel(
+        id="inkling2-mini-optimized-quality",
+        display_name="Inkling 2 Mini Optimized Quality",
+        detail="Original expert and attention weights, with vision and speculative decoding.",
+        hf_model_id="Youssofal/MTPLX-Inkling-2-Mini-Optimized-Quality",
+        size_bytes=20_191_642_669,
+        peak_memory_gib=24.27,
+        recommended_tiers=frozenset({MODERN_TIER}),
+        aliases=("mtplx-inkling-2-mini-optimized-quality", "Inkling 2 Mini"),
+    ),
 )
 
 # Mirrors `modernTopRecommendationIDs` in MTPLXModelOption.swift: the
@@ -673,6 +683,7 @@ def recommended_catalog_ids(
             speed35,
             quality27,
             "bonsai-2-27b-optimized-speed",
+            "inkling2-mini-optimized-quality",
             *tiny_ids,
         ]
     # Offer Flash-Next from 96 GiB, Optimized Speed from 128 GiB: its wired
@@ -698,6 +709,7 @@ def recommended_catalog_ids(
         "gemma4-optimized-speed",
         *small,
         *(["bonsai-2-27b-optimized-speed"] if chip_tier != LEGACY_TIER else []),
+        *(["inkling2-mini-optimized-quality"] if chip_tier != LEGACY_TIER else []),
         *tiny_ids,
     ]
 

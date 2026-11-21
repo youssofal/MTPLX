@@ -27,6 +27,8 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
     /// whatever language is active when a picker renders.
     public var detail: String
     private var detailLocalizationKey: String?
+    /// Set from the current folder scan. This state is never persisted in a model preference.
+    public private(set) var isOnDisconnectedDrive = false
     public var hfModelID: String
     public var localCandidates: [String]
     public var aliases: [String]
@@ -116,6 +118,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
     mutating func markNotConnected(_ text: String) {
         detail = text
         detailLocalizationKey = nil
+        isOnDisconnectedDrive = true
     }
 
     /// Resolves only app-authored catalog text. Arbitrary details supplied by
@@ -1027,6 +1030,21 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
             recommendedFor: [.modernApple],
             arOnly: true
         ),
+        MTPLXModelOption(
+            id: "inkling2-mini-optimized-quality",
+            displayName: "Inkling 2 Mini Optimized Quality",
+            shortName: "Inkling 2 Mini Optimized Quality",
+            localizedDetailKey: "Original expert and attention weights, with vision and speculative decoding.",
+            hfModelID: "Youssofal/MTPLX-Inkling-2-Mini-Optimized-Quality",
+            localCandidates: [
+                "~/.mtplx/models/MTPLX-Inkling-2-Mini-Optimized-Quality",
+                "~/.mtplx/models/Youssofal--MTPLX-Inkling-2-Mini-Optimized-Quality",
+            ],
+            aliases: ["mtplx-inkling-2-mini-optimized-quality", "Inkling 2 Mini"],
+            sizeBytes: 20_191_642_669,
+            peakMemoryGiB: 24.27,
+            recommendedFor: [.modernApple]
+        ),
     ]
 
     public static func option(matching model: String) -> MTPLXModelOption? {
@@ -1126,6 +1144,12 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                     || rows[$0].matches(remembered.model.reference)
             }) {
                 if rows[index].installedLocalPath(in: modelLibrary) == nil {
+                    // A selected folder is synthesized again on each scan. Its pack metadata is now off the Mac.
+                    if rows[index].isLocalFolder, rows[index].hfModelID == remembered.model.path,
+                       !customModels.contains(where: { $0.id == rows[index].id }) {
+                        rows[index].displayName = remembered.model.displayName
+                        rows[index].shortName = remembered.model.displayName
+                    }
                     rows[index].markNotConnected(text)
                 }
                 continue
@@ -1223,6 +1247,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 ids.insert(bonsai, at: position)
             } else {
                 ids.append(bonsai)
+                ids.append("inkling2-mini-optimized-quality")
             }
             // The raw list and the peak-filtered list both mirror Python.
             if hardware.unifiedMemoryGiB >= 96,
@@ -1433,10 +1458,11 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         if folder != typed {
             aliases.append(folder)
         }
+        let displayName = ModelLibrary.packDisplayName(in: URL(fileURLWithPath: folder)) ?? name
         return MTPLXModelOption(
             id: "local-\(safeID)",
-            displayName: name,
-            shortName: name,
+            displayName: displayName,
+            shortName: displayName,
             localizedDetailKey: "Local model folder on this Mac.",
             hfModelID: folder,
             localCandidates: [folder],
@@ -1596,6 +1622,9 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         if normalized.contains("laguna") {
             return "laguna"
         }
+        if normalized.contains("inkling-2-mini") || normalized.contains("inkling2-mini") || normalized.contains("inkling2_loop") {
+            return "inkling2"
+        }
         if normalized.contains("glm") {
             return "glm"
         }
@@ -1703,6 +1732,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         guard let archID else { return nil }
         let normalized = archID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !normalized.isEmpty else { return nil }
+        if normalized == "inkling2-loop" { return "inkling2" }
         if normalized.contains("gemma") { return "gemma4" }
         if normalized.contains("step") { return "step" }
         if normalized.contains("deepseek") { return "deepseek" }
@@ -1760,6 +1790,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
 
     private static func modelFamilyFromHint(_ raw: String) -> String {
         let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalized.contains("inkling2loop") || normalized.contains("inkling2_loop") { return "inkling2" }
         if normalized.contains("gemma") { return "gemma4" }
         if normalized.contains("step") { return "step" }
         if normalized.contains("deepseek") { return "deepseek" }
@@ -1825,6 +1856,8 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
 
     public static func maxContextWindow(forFamily family: String) -> Int {
         switch family {
+        case "inkling2":
+            return 1_048_576
         case "qwen3_5", "qwen3_6", "qwen3_8", "gemma4", "step", "glm", "deepseek":
             return 262_144
         default:

@@ -3397,6 +3397,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     forge_sub = forge_p.add_subparsers(dest="forge_action", required=True)
 
+    native = forge_sub.add_parser("inkling-native", help="Stage the original Inkling 2 Mini mixed-precision pack")
+    native.add_argument("source", type=Path, help="Downloaded Inkling 2 Mini checkpoint")
+    native.add_argument("destination", type=Path, help="New local pack directory")
+    native.set_defaults(func=cmd_forge_public)
+    inkling = forge_sub.add_parser("inkling", help="Build a mixed-precision Inkling 2 Mini consumer pack")
+    inkling.add_argument("source", type=Path)
+    inkling.add_argument("destination", type=Path)
+    inkling.add_argument("--recipe", choices=("speed", "quality", "native-quality"), required=True)
+    inkling.set_defaults(func=cmd_forge_public)
+
     forge_probe_p = forge_sub.add_parser(
         "probe",
         help="Classify a Forge source without downloading full weights",

@@ -222,8 +222,9 @@ def measure(
         if step not in plan:
             plan.append(step)
 
-    info = mx.device_info()
-    mx.set_wired_limit(int(info["max_recommended_working_set_size"]))
+    if mx.default_device() == mx.gpu and mx.metal.is_available():
+        info = mx.device_info()
+        mx.set_wired_limit(int(info["max_recommended_working_set_size"]))
     mx.set_cache_limit(4 * 1024**3)
     started = time.monotonic()
     model, _ = load_model(source)

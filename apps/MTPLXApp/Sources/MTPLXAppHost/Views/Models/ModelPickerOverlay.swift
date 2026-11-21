@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Foundation
 import SwiftUI
 import MTPLXAppCore
@@ -88,10 +89,16 @@ struct ModelPickerOverlay: View, Equatable {
         ZStack(alignment: .topLeading) {
             backdrop
             if presented {
+                let volumes = NSWorkspace.shared.notificationCenter
                 popoverColumn
                     .padding(.top, topOffset)
                     .padding(.leading, leadingOffset)
                     .transition(.identity)
+                    .onReceive(volumes.publisher(for: NSWorkspace.didMountNotification)
+                        .merge(with: volumes.publisher(for: NSWorkspace.didUnmountNotification))
+                        .receive(on: RunLoop.main)) { _ in
+                        preparePickerRows()
+                    }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -106,13 +113,7 @@ struct ModelPickerOverlay: View, Equatable {
             hardwareTask?.cancel()
             hardwareTask = nil
         }
-        .onChange(of: configuration.model) { _, _ in
-            preparePickerRows()
-        }
-        .onChange(of: configuration.customModels) { _, _ in
-            preparePickerRows()
-        }
-        .onChange(of: detectedHardware) { _, _ in
+        .onChange(of: catalogSignature) { _, _ in
             preparePickerRows()
         }
         .onChange(of: presented) { _, isOn in
@@ -342,6 +343,7 @@ struct ModelPickerOverlay: View, Equatable {
             displayName: row.displayName,
             detail: row.option.localizedDetail,
             isInstalled: row.isInstalled,
+            isOnDisconnectedDrive: row.option.isOnDisconnectedDrive,
             selected: row.selected,
             applying: applyingModelID == row.id,
             removing: removingModelID == row.id,
@@ -871,12 +873,11 @@ struct ModelPickerOverlay: View, Equatable {
 
     private func runEnterChoreography() {
         errorMessage = nil
-        let signature = catalogSignature
-        guard preparedRowsSignature == signature, !preparedRows.isEmpty else {
-            preparePickerRows(startChoreographyWhenReady: true)
-            return
+        if preparedRowsSignature == catalogSignature, !preparedRows.isEmpty {
+            startEnterChoreography(rowCount: preparedRows.count + 1)
         }
-        startEnterChoreography(rowCount: preparedRows.count + 1)
+        // A drive can change while the picker is closed. Show cached rows immediately and reconcile them off-main.
+        preparePickerRows()
     }
 
     private func startEnterChoreography(rowCount: Int) {
@@ -889,27 +890,26 @@ struct ModelPickerOverlay: View, Equatable {
         )
     }
 
-    private func preparePickerRows(startChoreographyWhenReady: Bool = false) {
+    private func preparePickerRows() {
         let signature = catalogSignature
-        let customModels = signature.customModels
-        let currentModel = signature.currentModel
-        let hardware = signature.hardware
-        let modelLibrary = signature.modelLibrary
-
-        prepareRowsTask?.cancel()
+        let previous = prepareRowsTask
+        previous?.cancel()
         prepareRowsTask = Task { @MainActor in
+            // Scanning records the folder index. Finish the older scan before letting a newer one write it.
+            await previous?.value
+            guard !Task.isCancelled else { return }
             let rows = await Task.detached(priority: .userInitiated) {
                 MTPLXModelOption.pickerCatalog(
-                    customModels: customModels,
-                    currentModel: currentModel,
-                    hardware: hardware,
-                    modelLibrary: modelLibrary
+                    customModels: signature.customModels,
+                    currentModel: signature.currentModel,
+                    hardware: signature.hardware,
+                    modelLibrary: signature.modelLibrary
                 )
                 .map { option in
                     ModelPickerPreparedOption(
                         option: option,
-                        currentModel: currentModel,
-                        customModels: customModels
+                        currentModel: signature.currentModel,
+                        customModels: signature.customModels
                     )
                 }
             }.value
@@ -917,7 +917,10 @@ struct ModelPickerOverlay: View, Equatable {
             guard !Task.isCancelled else { return }
             preparedRows = rows
             preparedRowsSignature = signature
-            if startChoreographyWhenReady, presented {
+            guard presented else { return }
+            if headerVisible {
+                rowsVisibleCount = rows.count + 1
+            } else {
                 startEnterChoreography(rowCount: rows.count + 1)
             }
         }
@@ -1066,6 +1069,7 @@ struct ModelRowView: View {
     let displayName: String
     let detail: String
     let isInstalled: Bool
+    var isOnDisconnectedDrive = false
     let selected: Bool
     let applying: Bool
     let removing: Bool
@@ -1199,7 +1203,7 @@ struct ModelRowView: View {
     @ViewBuilder
     private var statusBadge: some View {
         let tint = isInstalled ? Brand.accentChrome : Brand.warning
-        let label = isInstalled ? tr("Installed") : tr("HF")
+        let label = isInstalled ? tr("Installed") : (isOnDisconnectedDrive ? tr("Not connected") : tr("HF"))
         Text(label)
             .font(.caption2.weight(.medium))
             .foregroundStyle(tint.opacity(0.9))

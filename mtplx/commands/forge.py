@@ -112,6 +112,16 @@ class ForgeError(RuntimeError):
 def cmd_forge_public(args: Any, *, model_root: str | Path | None = None) -> int:
     action = getattr(args, "forge_action", None)
     try:
+        if action == "inkling":
+            from .forge_inkling_quant import build_pack
+
+            print(json.dumps(build_pack(args.source, args.destination, args.recipe), indent=2))
+            return 0
+        if action == "inkling-native":
+            from .forge_inkling import stage_native_pack
+
+            print(json.dumps(stage_native_pack(args.source, args.destination), indent=2))
+            return 0
         if action == "probe":
             return _cmd_probe(args)
         if action in ("census", "day-zero"):
@@ -2594,6 +2604,9 @@ def _runtime_or_default_mtp_contract(
     model_path: Path | None = None,
 ) -> dict[str, Any]:
     config = _load_model_config_for_contract(model_path)
+    if config.get("model_type") == "inkling2_loop":
+        # DSpark consumes four target-layer captures. It has no Qwen hidden/embedding concat contract.
+        return {}
     if isinstance(runtime, dict) and isinstance(runtime.get("mtp_contract"), dict):
         try:
             return _normalize_mtp_contract_for_config(runtime["mtp_contract"], config)
@@ -3097,7 +3110,7 @@ def _build_requires_all_depths(model_path: Path) -> bool:
 
 def _verify_rows_lane(model_path: Path) -> str:
     """'tune' for families the tune instrument supports, 'family-serve' for
-    family-gated native backends it does not (qwen4_exp today): those
+    family-gated native backends it does not: those
     measure their rows through the real serve path, which is the only lane
     that applies their family contract (batched verify, adaptive depth,
     family sampler)."""
@@ -3106,7 +3119,7 @@ def _verify_rows_lane(model_path: Path) -> str:
     except Exception:
         return "tune"
     compatibility = getattr(inspection, "compatibility", {}) or {}
-    if str(compatibility.get("recommended_backend") or "") == "qwen4_exp":
+    if compatibility.get("recommended_backend") in {"qwen4_exp", "inkling2_loop"}:
         return "family-serve"
     return "tune"
 
@@ -3915,7 +3928,21 @@ def _stamp_runtime_metadata(
     if artifact_fingerprint is not None:
         speed_evidence["artifact_fingerprint"] = artifact_fingerprint
     metadata["speed_evidence"] = speed_evidence
-    metadata["mtp_contract"] = dict(mtp_contract)
+    if config.get("model_type") == "inkling2_loop":
+        draft = config["mtp_config"]
+        draft_contract = {"block_drafter": {
+            "type": "dspark", "block_size": draft["block_size"],
+            "target_layer_ids": draft["target_layer_ids"], "markov_rank": draft["markov_rank"],
+        }}
+        metadata.pop("mtp_contract", None)
+        pack_manifest = model_path / "mtplx-pack.json"
+        if not source_sha and pack_manifest.is_file():
+            original = _load_json(pack_manifest)
+            if original.get("source") == source_repo:
+                source_sha = original.get("source_revision") or ""
+    else:
+        draft_contract = {"mtp_contract": dict(mtp_contract)}
+    metadata.update(draft_contract)
     if inspection and inspection.mtp is not None:
         metadata["mtp_sidecar"] = inspection.mtp.sidecar_format
     else:
@@ -3930,7 +3957,7 @@ def _stamp_runtime_metadata(
         "source_sha": source_sha or None,
         "source_format": source_format if source_format in SUPPORTED_SOURCE_FORMATS else SOURCE_UNKNOWN,
         "forge_recipe": recipe,
-        "mtp_contract": dict(mtp_contract),
+        **draft_contract,
         "forge_inputs": forge_inputs,
         "forged_at": _now_iso(),
         "mtplx_version": __version__,

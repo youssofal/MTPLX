@@ -1829,3 +1829,4 @@
 "DeepSeek Harness opened in your browser at %@, with its telemetry off." = "DeepSeek Harness 已在浏览器中打开，地址 %@，遥测已关闭。";
 "DeepSeek Harness opened in %@, with its telemetry off." = "DeepSeek Harness 已在 %@ 中打开，遥测已关闭。";
 "MTPLX's command-line runtime is not installed, so DeepSeek Harness could not open." = "MTPLX 的命令行运行时未安装，因此 DeepSeek Harness 无法打开。";
+"Original expert and attention weights, with vision and speculative decoding." = "保留专家层和注意力层的原始权重，支持图像输入和推测解码。";

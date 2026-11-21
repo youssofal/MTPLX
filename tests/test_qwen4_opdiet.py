@@ -791,7 +791,7 @@ def test_text_trunk_opens_a_rope_scope_only_when_armed(monkeypatch):
 
     monkeypatch.setattr(qwen4_exp, "_rope_table_scope", rope_scope)
     monkeypatch.setattr(runtime_options, "_QWEN4_OPDIET_SELECTED", frozenset({"rope"}))
-    forward = ("forward", ("ids", "cache", None, None))
+    forward = ("forward", ("ids", "cache", None))
     for armed, expected in ((False, [forward]), (True, ["open", forward, "close"])):
         monkeypatch.setattr(runtime_options, "_QWEN4_OPDIET", armed)
         events.clear()

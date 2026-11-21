@@ -137,11 +137,20 @@ public struct ModelLibrary: Equatable, Sendable {
                 result.append(LocalModel(
                     path: canonical.path,
                     reference: reference,
-                    displayName: reference.split(separator: "/").last.map(String.init) ?? reference
+                    displayName: Self.packDisplayName(in: canonical)
+                        ?? reference.split(separator: "/").last.map(String.init) ?? reference
                 ))
             }
         }
         return result
+    }
+
+    static func packDisplayName(in directory: URL) -> String? {
+        guard let data = try? Data(contentsOf: directory.appendingPathComponent("mtplx-pack.json")),
+              let metadata = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let name = metadata["display_name"] as? String,
+              !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return name
     }
 
     public func nearestExistingDirectory(

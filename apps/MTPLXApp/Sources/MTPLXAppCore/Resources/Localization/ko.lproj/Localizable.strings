@@ -1829,3 +1829,4 @@
 "DeepSeek Harness opened in your browser at %@, with its telemetry off." = "DeepSeek Harness가 브라우저의 %@에서 열렸습니다. 텔레메트리는 꺼져 있습니다.";
 "DeepSeek Harness opened in %@, with its telemetry off." = "DeepSeek Harness가 %@에서 열렸습니다. 텔레메트리는 꺼져 있습니다.";
 "MTPLX's command-line runtime is not installed, so DeepSeek Harness could not open." = "MTPLX 명령줄 런타임이 설치되어 있지 않아 DeepSeek Harness를 열 수 없습니다.";
+"Original expert and attention weights, with vision and speculative decoding." = "전문가 및 어텐션의 원본 가중치를 유지하며, 이미지 입력과 추측 디코딩을 지원합니다.";

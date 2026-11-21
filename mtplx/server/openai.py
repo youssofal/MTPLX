@@ -1309,11 +1309,15 @@ def _served_prefill_chunk_default(args: argparse.Namespace) -> int:
     return 2048
 
 
-def _served_prefill_chunk_auto(args: argparse.Namespace) -> int:
+def _served_prefill_chunk_auto(args: argparse.Namespace, runtime: Any = None) -> int:
     """The chunk an unpinned long request plans with: the family's wide chunk
     where one is stamped (granted per request against live memory, falling back
-    to the served default), else the served default."""
+    to the served default), else the served default. A model with its own
+    chunk width (``runtime.prompt_chunk_rows``) answers for itself."""
 
+    rows = getattr(runtime, "prompt_chunk_rows", None)
+    if callable(rows):
+        return max(1, int(rows()))
     default = _served_prefill_chunk_default(args)
     try:
         from mtplx.generation import _prefill_chunk_env_is_pinned
@@ -4176,6 +4180,13 @@ class ServerState:
                 getattr(_plan_contract, "raw", None), _plan_weights_bytes
             ),
         }
+        if getattr(self.runtime, "backend_id", None) == "inkling2_loop":
+            # Its block drafter keeps one growing KV. Each sliding visit keeps its own ring.
+            draft = self.runtime.draft_footprint
+            _plan_inputs["aux_bytes_per_token"] = draft.full_bytes_per_token if draft else 0
+            _plan_inputs["fixed_cache_bytes"] = self.runtime.window_cache_bytes()
+            _plan_inputs["attention_kv_copy_bytes_per_token"] = self.runtime.attention_kv_copy_bytes_per_token()
+            _plan_inputs["kv_quantization"] = "off"
         _fit_plan = _plan_memory(**_plan_inputs)
         _machine_fit = _machine_fit_for_default_window(_fit_plan)
         if _fit_plan.available and not _fit_plan.model_fits and not self.allow_swap:
@@ -5932,6 +5943,15 @@ def _image_bytes_from_url(url: str) -> bytes:
     return raw
 
 
+def _prepare_chat_image_parts(state, messages):
+    if getattr(getattr(state, "runtime", None), "backend_id", None) == "inkling2_loop":
+        from mtplx.models.inkling.protocol import prepare_message
+
+        images = []
+        return [prepare_message(message, images, _image_bytes_from_url) for message in messages], images
+    return _vision_extract_and_flatten(messages)
+
+
 def _vision_extract_and_flatten(
     messages: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[bytes]]:
@@ -6385,11 +6405,15 @@ def _vision_rows_for_image(
                 timing["vision_cache_hits"] = int(timing.get("vision_cache_hits", 0)) + 1
             return hit
     tower_started = time.perf_counter()
-    pixel_values, grids = preprocess_images([decode_image(raw)], preprocessor_config)
-    pad_count = image_pad_token_count(grids[0])
-    grid = tuple(int(x) for x in grids[0])
-    tower = load_vision_tower(str(model_dir))
-    rows, _deepstack = tower(pixel_values, grids)
+    runtime = getattr(state, "runtime", None)
+    if getattr(runtime, "backend_id", None) == "inkling2_loop":
+        rows, pad_count, grid = runtime.vision_tower.encode(decode_image(raw, preserve_alpha=True), preprocessor_config)
+    else:
+        pixel_values, grids = preprocess_images([decode_image(raw)], preprocessor_config)
+        pad_count = image_pad_token_count(grids[0])
+        grid = tuple(int(x) for x in grids[0])
+        tower = load_vision_tower(str(model_dir))
+        rows, _deepstack = tower(pixel_values, grids)
     import mlx.core as _mx
 
     _mx.eval(rows)
@@ -6423,6 +6447,11 @@ async def _materialize_vision_splice_observed(
     timing: dict[str, Any] = {}
     started = time.perf_counter()
     try:
+        if getattr(state.runtime, "backend_id", None) == "inkling2_loop":
+            future = state.model_scheduler.submit_foreground(
+                _materialize_vision_splice, state, images, prompt_ids, timing=timing, batch_key="inkling.vision"
+            )
+            return await asyncio.wrap_future(future)
         return await asyncio.to_thread(
             _materialize_vision_splice, state, images, prompt_ids, timing=timing
         )
@@ -6451,9 +6480,10 @@ def _materialize_vision_splice(
     if spec is None:
         raise ValueError("model has no vision tower")
     model_dir = _Path(str(state.args.model))
-    preprocessor_config = _json.loads(
-        (model_dir / "preprocessor_config.json").read_text(encoding="utf-8")
-    )
+    if getattr(spec, "model_type", "") == "inkling2_loop":
+        preprocessor_config = _json.loads((model_dir / "processor_config.json").read_text())["image_processor"]
+    else:
+        preprocessor_config = _json.loads((model_dir / "preprocessor_config.json").read_text(encoding="utf-8"))
     digests: list[int] = [_image_content_digest(raw) for raw in images]
     # Every image of THIS prompt stays cached for the whole pass (#487):
     # the eviction that runs after each insert skips these keys.
@@ -16871,6 +16901,12 @@ def _encode_messages_uncached(
     template_observability: dict[str, Any] | None = None,
     allow_committed_reasoning: bool = False,
 ) -> list[int]:
+    if getattr(tokenizer, "inkling_protocol", False) is True:
+        from mtplx.models.inkling.protocol import encode
+
+        return encode(tokenizer, messages, tools=tools, effort=reasoning_effort, thinking=enable_thinking,
+                      strip_reasoning=strip_assistant_reasoning_history, add_generation_prompt=add_generation_prompt)
+
     # Scoped mode keeps reasoning_content on the normalized messages and
     # passes preserve_thinking=False so the template's own rolling checkpoint
     # governs: think blocks survive inside the active agent round (after the
@@ -18791,11 +18827,25 @@ def _metrics_envelope(
             stats.get("context_copy_capacity_growths") or 0
         ),
         "context_copy_disabled_reason": stats.get("context_copy_disabled_reason"),
+        **({"context_copy_declines": stats["context_copy_declines"]} if stats.get("context_copy_declines") else {}),
+        **({"context_copy_limits": stats["context_copy_limits"]} if stats.get("context_copy_limits") else {}),
+        **({"context_copy_verify_rows": stats["context_copy_verify_rows"]} if stats.get("context_copy_verify_rows") else {}),
+        **({"context_copy_timing_s": stats["context_copy_timing_s"]} if stats.get("context_copy_timing_s") else {}),
+        "context_copy_suspended": bool(stats.get("context_copy_suspended") or False),
+        "context_copy_backoff_tokens": int(stats.get("context_copy_backoff_tokens") or 0),
+        "context_copy_index_reused_tokens": int(stats.get("context_copy_index_reused_tokens") or 0),
         "sampled_draft_chain_rounds": int(
             stats.get("sampled_draft_chain_rounds") or 0
         ),
         "sampled_draft_chain_cuts": int(stats.get("sampled_draft_chain_cuts") or 0),
         "sampled_draft_chain_status": stats.get("sampled_draft_chain_status"),
+        **({"inkling_attention": stats["inkling_attention"]} if stats.get("inkling_attention") else {}),
+        **({"inkling_experts": stats["inkling_experts"]} if stats.get("inkling_experts") else {}),
+        **({"inkling_projections": stats["inkling_projections"]} if "inkling_projections" in stats else {}),
+        **({"inkling_convolution": stats["inkling_convolution"]} if stats.get("inkling_convolution") else {}),
+        **({"inkling_draft_sampling": stats["inkling_draft_sampling"]} if stats.get("inkling_draft_sampling") else {}),
+        **({"inkling_output_ids_sha256": stats["inkling_output_ids_sha256"]} if stats.get("inkling_output_ids_sha256") else {}),
+        **({"inkling_target_draw": stats["inkling_target_draw"]} if stats.get("inkling_target_draw") else {}),
         "verify_joint_eval_time_s": float(stats.get("verify_joint_eval_time_s") or 0.0),
         "verify_target_distribution_time_s": float(
             stats.get("verify_target_distribution_time_s") or 0.0
@@ -19797,6 +19847,36 @@ def _startup_health_payload(state: "ServerState") -> dict[str, Any]:
     }
 
 
+def _health_inkling_attention_payload(state: Any) -> dict[str, Any]:
+    if getattr(getattr(state, "runtime", None), "backend_id", None) == "inkling2_loop":
+        from mtplx.models.inkling.attention import attention_health
+        from mtplx.models.inkling.expert_fusion import expert_fusion_health
+        from mtplx.models.inkling.head import inkling_first_use_stats
+        from mtplx.models.inkling.short_conv import conv_route_counts
+        blocks = [layer.experts.gate_up for layer in state.runtime.model.layers]
+        return {"inkling_attention": attention_health(),
+                "inkling_convolution": conv_route_counts(),
+                "inkling_first_use": inkling_first_use_stats(),
+                "inkling_experts": {"sorted_panel_calls": sum(block.sorted_panel_calls for block in blocks),
+                                    "indexed_panel_calls": sum(block.indexed_panel_calls for block in blocks),
+                                    "fusion": expert_fusion_health(state.runtime.model)}}
+    return {}
+
+
+def _health_inkling_cache_payload(state: Any) -> dict[str, Any]:
+    if getattr(getattr(state, "runtime", None), "backend_id", None) != "inkling2_loop":
+        return {}
+    return {"inkling_cache": {
+        "ssd_session_snapshots_enabled": getattr(state, "session_bank_cold_tier", None) is not None,
+        "active_ssd_kv": False,
+        "active_paged_kv": False,
+        "active_kv_quantization": "off",
+        "active_kv_layout": "resident_global_kv_and_chronological_local_rings",
+        "active_ssd_kv_reason": "ssd_tier_restores_session_boundaries",
+        "active_paged_kv_reason": "inkling_relative_sink_attention_reads_chronological_keys_and_values",
+    }}
+
+
 def _health_degradation_payload(state: Any) -> dict[str, Any]:
     """Truth block for the benchmark harness gate (#F23-surface).
 
@@ -20240,7 +20320,12 @@ def _mtplx_apply_settings_payload(
                 setattr(state.args, key, value)
             applied[key] = value
         implicit_draft_updates: dict[str, Any] = {}
-        if getattr(state, "draft_sampler", None) is not None:
+        draft_fields = {"draft_temperature", "draft_top_p", "draft_top_k"}
+        explicit_draft = bool(draft_fields.intersection(applied))
+        independent_draft = backend.backend_id == "inkling2_loop" and (
+            getattr(state, "draft_sampler_pinned", False) or explicit_draft
+        )
+        if getattr(state, "draft_sampler", None) is not None and not independent_draft:
             for source, target in (
                 ("temperature", "draft_temperature"),
                 ("top_p", "draft_top_p"),
@@ -20250,9 +20335,7 @@ def _mtplx_apply_settings_payload(
                     implicit_draft_updates[target] = applied[source]
         for key, value in implicit_draft_updates.items():
             setattr(state.args, key, value)
-        if (
-            {"draft_temperature", "draft_top_p", "draft_top_k"} & set(applied)
-        ) or implicit_draft_updates:
+        if explicit_draft or implicit_draft_updates:
             current = getattr(state, "draft_sampler", None)
             draft_temperature = getattr(state.args, "draft_temperature", None)
             draft_top_p = getattr(state.args, "draft_top_p", None)
@@ -20280,7 +20363,7 @@ def _mtplx_apply_settings_payload(
                 top_p=float(draft_top_p),
                 top_k=int(draft_top_k),
             )
-            if {"draft_temperature", "draft_top_p", "draft_top_k"} & set(applied):
+            if explicit_draft:
                 # An explicit live-settings draft value pins the sampler and
                 # disables the family curve. The implicit temperature->draft
                 # mirror above deliberately does NOT pin: it is bookkeeping,
@@ -20514,7 +20597,9 @@ def _mtplx_current_settings(state: "ServerState") -> dict[str, Any]:
         # the app echo it back as a pin (2,048 on every Flash-Next launch,
         # which skipped the family's measured 4,096-row width).
         "prefill_chunk_tokens": getattr(args, "prefill_chunk_tokens", None) or None,
-        "prefill_chunk_tokens_default": _served_prefill_chunk_auto(args),
+        "prefill_chunk_tokens_default": _served_prefill_chunk_auto(
+            args, getattr(state, "runtime", None)
+        ),
         "ssd_session_cache": str(getattr(args, "ssd_session_cache", "off") or "off"),
         "ssd_session_cache_dir": str(
             getattr(args, "ssd_session_cache_dir", "~/.mtplx/session-bank")
@@ -22550,6 +22635,7 @@ class _AdmissionGeometry:
     # layers: what the quantized-KV kernels' routes are decided on. None
     # when the config does not say, which prices the route that builds most.
     attention_shape: tuple[int, int, int, int] | None = None
+    attention_kv_copy_bytes_per_token: int = 0
 
     @property
     def resident_width(self) -> int:
@@ -22609,6 +22695,7 @@ def _admission_geometry(state: Any, prefill_width: int | None = None) -> _Admiss
             getattr(plan, "prefill_transient_bytes_per_token", 0) or 0
         ),
         flat_transient_bytes=flat,
+        attention_kv_copy_bytes_per_token=int(getattr(plan, "attention_kv_copy_bytes_per_token", 0) or 0),
         weights_bytes=int(getattr(plan, "model_weights_bytes", 0) or 0),
         resident_bytes_per_token=resident,
         resident_fixed_bytes=fixed,
@@ -23413,8 +23500,9 @@ def _admission_growth(
         else context_transient_bytes_per_token
     )
     context_transient = P * max(0, int(transient_per_token)) if M > 0 else 0
+    kv_copy = P * geometry.attention_kv_copy_bytes_per_token if M > 0 else 0
     scratch = max(0, int(scratch_bytes))
-    prefill_end = live_prefill + context_transient + scratch + lease_transient
+    prefill_end = live_prefill + context_transient + kv_copy + scratch + lease_transient
     paged_copy = (P + out_rows) * paged_w if repages else 0
     repage = live_prefill + paged_copy if repages else 0
     quant = str(geometry.kv_quantization or "off").lower()
@@ -23473,7 +23561,10 @@ def _admission_growth(
         publish_copy = max(0, int(publish_bytes))
     else:
         publish_copy = live_total
-    decode_start = live_decode + publish_copy
+    # A prefix restored in full skips prefill but still attends to its
+    # history during the first decode. The phase maxima do not overlap.
+    decode_kv_copy = P * geometry.attention_kv_copy_bytes_per_token if output_tokens > 0 else 0
+    decode_start = live_decode + publish_copy + decode_kv_copy
     return {
         "layout": layout,
         "reused_tokens": int(R),
@@ -23481,6 +23572,8 @@ def _admission_growth(
         "restore_copy_bytes": int(restore_rows * row_width + restore_fixed),
         "live_prefill_bytes": int(live_prefill),
         "context_transient_bytes": int(context_transient),
+        **({"prefill_kv_copy_bytes": kv_copy, "decode_kv_copy_bytes": decode_kv_copy}
+           if geometry.attention_kv_copy_bytes_per_token else {}),
         "scratch_bytes": int(scratch),
         "repage_copy_bytes": int(paged_copy),
         "output_reserve_bytes": int(out_rows * paged_w),
@@ -26739,9 +26832,21 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "context_copy_suspended",
     "context_copy_backoff_tokens",
     "context_copy_disabled_reason",
+    "context_copy_declines",
+    "context_copy_limits",
+    "context_copy_verify_rows",
+    "context_copy_timing_s",
+    "context_copy_index_reused_tokens",
     "sampled_draft_chain_rounds",
     "sampled_draft_chain_cuts",
     "sampled_draft_chain_status",
+    "inkling_attention",
+    "inkling_experts",
+    "inkling_projections",
+    "inkling_convolution",
+    "inkling_draft_sampling",
+    "inkling_output_ids_sha256",
+    "inkling_target_draw",
     # Grammar-constrained decoding (response_format) counters.
     "constraint_active",
     "constraint_completed",
@@ -27475,6 +27580,7 @@ def _request_observability(
         "request_session_candidate_headers": candidate_headers,
         "request_generation_mode": request_generation_mode,
         "request_depth": int(request_depth),
+        "request_depth_explicit": _request_depth_value(request) is not None,
         "request_last_user_preview": user_texts[-1][:180] if user_texts else None,
         "request_last_user_chars": len(user_texts[-1]) if user_texts else 0,
         **(
@@ -28687,9 +28793,7 @@ def _history_ids_for_postcommit(
     ]
     phase_started = time.perf_counter()
     try:
-        history_messages, postcommit_vision_images = _vision_extract_and_flatten(
-            history_messages
-        )
+        history_messages, postcommit_vision_images = _prepare_chat_image_parts(state, history_messages)
     except ValueError:
         return [], None
     phase_started = _record_phase(timing, "flatten_s", phase_started)
@@ -32670,10 +32774,17 @@ def _resolve_draft_sampler_for_request(
     visible per request instead of silent.
     """
 
+    inkling = getattr(getattr(state, "runtime", None), "backend_id", None) == "inkling2_loop"
+    pinned = bool(getattr(state, "draft_sampler_pinned", False))
     if request_draft_sampler is not None:
         resolved = request_draft_sampler
         source = "request_explicit"
         policy = "request_explicit"
+    elif inkling and not pinned:
+        # DSpark's trained proposal path is a Markov argmax. App presets and
+        # an omitted launch override use that path at every target temperature.
+        resolved = None
+        source = policy = "inkling_argmax"
     else:
         base = getattr(state, "draft_sampler", None)
         if base is None:
@@ -32681,7 +32792,6 @@ def _resolve_draft_sampler_for_request(
             source = "target_mirror"
             policy = "target_mirror"
         else:
-            pinned = bool(getattr(state, "draft_sampler_pinned", False))
             curve = getattr(state, "draft_temperature_curve", None)
             if pinned or not curve:
                 resolved = base
@@ -32705,7 +32815,7 @@ def _resolve_draft_sampler_for_request(
                 policy = "curve"
     coupled = _couple_draft_sampler_to_greedy_target(
         resolved,
-        explicit_draft_sampler=request_draft_sampler is not None,
+        explicit_draft_sampler=request_draft_sampler is not None or (inkling and pinned),
         target_temperature=target_temperature,
         request_observability=request_observability,
     )
@@ -32732,7 +32842,7 @@ def _resolve_draft_sampler_for_request(
         )
         request_observability["draft_sampler_resolved_temperature"] = (
             float(getattr(effective, "temperature", 0.0))
-            if effective is not None
+            if effective is not None or source == "inkling_argmax"
             else None
         )
         request_observability["draft_head_norm_repairs"] = [
@@ -33149,9 +33259,12 @@ def _run_generation(
                     else None
                 )
                 if effective_mode == "ar":
+                    if vision_splice is not None:
+                        vision_splice.reset()
                     out = generate_ar(
                         state.runtime,
                         prompt_ids,
+                        **({"vision_splice": vision_splice} if vision_splice is not None else {}),
                         max_tokens=response_max,
                         sampler=sampler,
                         seed=generation_seed,
@@ -34570,6 +34683,11 @@ class _IncrementalTokenDecoder:
         self._tokenizer = tokenizer
         self._token_cache: list[int] = []
         self._print_len = 0
+        self._inkling_channels = None
+        if getattr(tokenizer, "inkling_protocol", False) is True:
+            from mtplx.models.inkling.protocol import Channels
+
+            self._inkling_channels = Channels(tokenizer)
 
     def _decode(self, tokens: list[int]) -> str:
         try:
@@ -34617,6 +34735,11 @@ class _IncrementalTokenDecoder:
             keep = min(keep * 2, self._CACHE_TRUNCATE_THRESHOLD)
 
     def feed(self, tokens: list[int]) -> str:
+        if self._inkling_channels is not None:
+            return self._inkling_channels.feed(tokens, self._feed_text, self._finish_text)
+        return self._feed_text(tokens)
+
+    def _feed_text(self, tokens: list[int]) -> str:
         if not tokens:
             return ""
         self._token_cache.extend(int(token) for token in tokens)
@@ -34643,6 +34766,11 @@ class _IncrementalTokenDecoder:
         return printable
 
     def finish(self) -> str:
+        if self._inkling_channels is not None:
+            return self._inkling_channels.finish(self._finish_text)
+        return self._finish_text()
+
+    def _finish_text(self) -> str:
         if not self._token_cache:
             return ""
         text = self._decode(self._token_cache)
@@ -37636,9 +37764,9 @@ def _reasoning_effort_for_state(
         else getattr(state.args, "reasoning_effort", None)
     )
     try:
-        effort = _normalize_reasoning_effort(
-            raw,
-            default=codec.default_effort or "auto",
+        declared = str(raw or "").strip().lower()
+        effort = declared if declared in levels else _normalize_reasoning_effort(
+            raw, default=codec.default_effort or "auto"
         )
     except ValueError as exc:
         if client_supplied:
@@ -38396,6 +38524,8 @@ def create_app(state: ServerState) -> FastAPI:
                 "actual_ramp_latency_s"
             ),
             "startup": _startup_health_payload(state),
+            **_health_inkling_attention_payload(state),
+            **_health_inkling_cache_payload(state),
             "thermal": _thermal_health_payload(
                 fan_mode=fan_mode,
                 smart_status=smart_status,
@@ -39961,9 +40091,7 @@ def create_app(state: ServerState) -> FastAPI:
             # Constrained requests ride the serial lanes (MTP included since
             # #186 phase 3); only the batched AR pump is bypassed.
         try:
-            messages_for_generation, vision_images = _vision_extract_and_flatten(
-                messages_for_generation
-            )
+            messages_for_generation, vision_images = _prepare_chat_image_parts(state, messages_for_generation)
         except ValueError as vision_error:
             raise HTTPException(status_code=400, detail=str(vision_error))
         vision_splice = None
@@ -39976,7 +40104,7 @@ def create_app(state: ServerState) -> FastAPI:
                         "not supported for it"
                     ),
                 )
-            if str(request_generation_mode or "") == "ar":
+            if str(request_generation_mode or "") == "ar" and getattr(state.runtime, "backend_id", None) != "inkling2_loop":
                 raise HTTPException(
                     status_code=400,
                     detail="image content requires MTP generation mode",
@@ -44775,9 +44903,7 @@ def create_app(state: ServerState) -> FastAPI:
         # Image blocks become the vision placeholder here exactly as they do
         # on the chat path, so the count covers what the prompt will carry.
         try:
-            count_messages, _count_images = _vision_extract_and_flatten(
-                policy.messages_for_generation
-            )
+            count_messages, _count_images = _prepare_chat_image_parts(state, policy.messages_for_generation)
         except ValueError as vision_error:
             raise HTTPException(status_code=400, detail=str(vision_error))
         prompt_ids = _encode_messages(
@@ -44854,6 +44980,7 @@ def create_app(state: ServerState) -> FastAPI:
         request_observability = {
             "request_client_hint": request_client_hint,
             "request_client_label": request_client_hint or "openai",
+            "request_depth_explicit": _request_depth_value(request) is not None,
         }
         request_observability.update(policy.as_observability())
         request_observability["agent_rewrites"] = _agent_rewrites_mode()

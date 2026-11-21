@@ -1972,6 +1972,44 @@ def _ple_first_gather_early_scope(
         yield early
 
 
+def _with_inkling_attention_receipt(fn):
+    from functools import wraps
+
+    @wraps(fn)
+    def run(rt, *args, **kwargs):
+        if getattr(rt, "backend_id", None) == "inkling2_loop":
+            from .models.inkling.attention import observe_attention_request
+            from .models.inkling.expert_fusion import observe_expert_request
+            from .models.inkling.head import observe_projection_routes
+
+            def attended(rt, *args, **kwargs):
+                return observe_attention_request(fn, rt, *args, **kwargs)
+
+            # The model's own prompt width, unless the request or the user named one.
+            rows = getattr(rt, "prompt_chunk_rows", None)
+            width = rows() if callable(rows) else current_prefill_chunk_override()
+            with prefill_chunk_size_override(width), observe_projection_routes() as projections:
+                output = observe_expert_request(attended, rt, *args, **kwargs)
+                output.stats.inkling_projections = dict(projections)
+                return output
+        return fn(rt, *args, **kwargs)
+
+    return run
+
+
+def _with_inkling_convolution_receipt(fn):
+    from functools import wraps
+
+    @wraps(fn)
+    def run(rt, *args, **kwargs):
+        if getattr(rt, "backend_id", None) == "inkling2_loop":
+            from .models.inkling.short_conv import observe_convolution_request
+            return observe_convolution_request(fn, rt, *args, **kwargs)
+        return fn(rt, *args, **kwargs)
+
+    return run
+
+
 def _runtime_count(rt: MTPLXRuntime, key: str, amount: int = 1) -> None:
     counters = getattr(rt, "diagnostic_counters", None)
     if counters is None:
@@ -2507,7 +2545,11 @@ def prefill_forward_widths(
         return list(own(int(prompt_tokens), requested))
     if not _sustained_prefill_enabled():
         return [None]
-    default = max(1, int(_prefill_chunk_size(prompt_tokens)))
+    # A model with its own chunk width (``rt.prompt_chunk_rows``) answers for the default.
+    rows = getattr(rt, "prompt_chunk_rows", None)
+    default = max(
+        1, int(rows(prompt_tokens) if callable(rows) else _prefill_chunk_size(prompt_tokens))
+    )
     first = max(1, int(requested)) if requested else default
     return [first, default] if default < first else [first]
 
@@ -3856,6 +3898,11 @@ class GenerationStats:
     context_copy_suspended: bool = False
     context_copy_backoff_tokens: int = 0
     context_copy_disabled_reason: str | None = None
+    context_copy_index_reused_tokens: int = field(default=0, kw_only=True)
+    context_copy_declines: dict[str, int] = field(default_factory=dict, kw_only=True)
+    context_copy_limits: dict[str, int] = field(default_factory=dict, kw_only=True)
+    context_copy_verify_rows: dict[str, int] = field(default_factory=dict, kw_only=True)
+    context_copy_timing_s: dict[str, float] = field(default_factory=dict, kw_only=True)
     # MTPLX_QWEN4_SAMPLED_DRAFT_CHAIN: rounds drafted with one eval, rounds whose
     # device prediction the host did not confirm (finished serially), and why
     # the lane stood aside when it did ("installed" when it ran).
@@ -3897,9 +3944,34 @@ class GenerationStats:
     # when the instrument is off. Schema: mtplx/forkev_telemetry.py snapshot().
     forkev: dict[str, object] = field(default_factory=dict)
     events: list[dict] = field(default_factory=list)
+    inkling_attention: dict | None = field(default=None, kw_only=True)
+    inkling_projections: dict | None = field(default=None, kw_only=True)
+    inkling_convolution: dict | None = field(default=None, kw_only=True)
+    inkling_draft_sampling: dict | None = field(default=None, kw_only=True)
+    inkling_output_ids_sha256: str | None = field(default=None, kw_only=True)
+    inkling_target_draw: str | None = field(default=None, kw_only=True)
+    inkling_experts: dict | None = field(default=None, kw_only=True)
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        result = asdict(self)
+        for key in ("context_copy_declines", "context_copy_limits", "context_copy_verify_rows", "context_copy_timing_s"):
+            if not result[key]:
+                result.pop(key)
+        if self.inkling_attention is None:
+            result.pop("inkling_attention")
+        if self.inkling_projections is None:
+            result.pop("inkling_projections")
+        if self.inkling_convolution is None:
+            result.pop("inkling_convolution")
+        if self.inkling_draft_sampling is None:
+            result.pop("inkling_draft_sampling")
+        if self.inkling_output_ids_sha256 is None:
+            result.pop("inkling_output_ids_sha256")
+        if self.inkling_target_draw is None:
+            result.pop("inkling_target_draw")
+        if self.inkling_experts is None:
+            result.pop("inkling_experts")
+        return result
 
 
 @dataclass(frozen=True)
@@ -7605,6 +7677,10 @@ def restore_or_prefill_prompt_state(
 
 
 def _decode(tokenizer, tokens: list[int]) -> str:
+    if getattr(tokenizer, "inkling_protocol", False) is True:
+        from .models.inkling.protocol import completion_text
+
+        return completion_text(tokenizer, tokens)
     return tokenizer.decode(tokens)
 
 
@@ -9493,6 +9569,7 @@ def _commit_ar_prompt_state(
     template_hash: str | None,
     draft_head_identity: str | None,
     policy_fingerprint: str | None,
+    vision_splice: Any | None = None,
 ) -> dict[str, object]:
     """Bank a plain-decoding prompt before its answer decodes, as generate_mtpk does.
 
@@ -9539,9 +9616,16 @@ def _commit_ar_prompt_state(
             }
         snapshot_done = time.perf_counter()
         put_timing: dict[str, object] = {}
+        bank_ids = list(prompt_ids)
+        if vision_splice is not None:
+            from .vision.splice import vision_bank_key_ids
+
+            bank_ids = vision_bank_key_ids(prompt_ids, vision_splice)
+            if bank_ids is None:
+                raise ValueError("An image prompt requires content-keyed cache IDs")
         entry = session_bank.put(
             runtime=rt,
-            token_ids=list(prompt_ids),
+            token_ids=bank_ids,
             cache=prompt_state.trunk_cache,
             logits=prompt_state.logits,
             hidden=prompt_state.hidden,
@@ -9588,6 +9672,8 @@ def _commit_ar_prompt_state(
         }
 
 
+@_with_inkling_attention_receipt
+@_with_inkling_convolution_receipt
 def generate_ar(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
@@ -9615,6 +9701,7 @@ def generate_ar(
     first_token_logprobs_top_k: int | None = None,
     store_prefix_snapshot: bool | None = None,
     commit_prompt_state_to_bank: bool = False,
+    vision_splice: Any | None = None,
 ) -> GenerationOutput:
     reject_non_k1_a3b_whole_moe_request(rt, entrypoint="generate_ar")
     if getattr(rt, "backend_id", None) == "gemma4_assistant":
@@ -9678,6 +9765,7 @@ def generate_ar(
         abort_check=abort_check,
         capture_hidden=ar_return_hidden,
         store_prefix_snapshot=store_prefix_snapshot,
+        vision_splice=vision_splice,
     )
     prompt_state_total_time_s = time.perf_counter() - _prompt_state_started
     # The prompt-prefix commit generate_mtpk makes, under the same conditions:
@@ -9709,6 +9797,7 @@ def generate_ar(
             template_hash=session_template_hash,
             draft_head_identity=session_draft_head_identity,
             policy_fingerprint=session_policy_fingerprint,
+            vision_splice=vision_splice,
         )
     cache = prompt_state.trunk_cache
     logits = prompt_state.logits
@@ -10191,6 +10280,10 @@ def generate_mtp1(
     repetition_stop: bool = False,
 ) -> GenerationOutput:
     reject_non_k1_a3b_whole_moe_request(rt, entrypoint="generate_mtp1")
+    if getattr(rt, "backend_id", None) == "inkling2_loop":
+        return generate_mtpk(rt, prompt_ids, max_tokens=max_tokens, sampler=sampler,
+                             speculative_depth=1, seed=seed, stop_token_ids=stop_token_ids,
+                             draft_sampler=draft_sampler, repetition_stop=repetition_stop)
     if not rt.mtp_enabled:
         raise RuntimeError("generate_mtp1 requires an MTP-enabled runtime")
     if verify_strategy not in {
@@ -10858,6 +10951,8 @@ def generate_mtp1(
 
 
 @_with_dense_mrope_request
+@_with_inkling_attention_receipt
+@_with_inkling_convolution_receipt
 def generate_mtpk(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
@@ -10982,6 +11077,19 @@ def generate_mtpk(
         )
     if not rt.mtp_enabled:
         raise RuntimeError("generate_mtpk requires an MTP-enabled runtime")
+    if getattr(rt, "backend_id", None) == "inkling2_loop":
+        from .models.inkling.generation import generate
+
+        return generate(rt, prompt_ids, max_tokens=max_tokens, sampler=sampler, depth=speculative_depth,
+                        draft_sampler=draft_sampler, repetition_stop=repetition_stop,
+                        seed=seed, stop_token_ids=stop_token_ids, token_callback=token_callback,
+                        prefill_callback=prefill_callback, session_bank=session_bank, session_id=session_id,
+                        session_restore_mode=session_restore_mode, session_template_hash=session_template_hash,
+                        session_draft_head_identity=session_draft_head_identity,
+                        session_policy_fingerprint=session_policy_fingerprint, capture_final_state=capture_final_state,
+                        commit_prompt_state_to_bank=commit_prompt_state_to_bank, vision_splice=vision_splice,
+                        constraint=constraint, abort_check=abort_check, first_token_logprobs_top_k=first_token_logprobs_top_k,
+                        store_prefix_snapshot=store_prefix_snapshot)
     base_hidden_variant = _resolve_runtime_base_hidden_variant(rt, base_hidden_variant)
     mtp_hidden_variant = _resolve_runtime_mtp_hidden_variant(rt, mtp_hidden_variant)
     requested_speculative_depth = int(speculative_depth)

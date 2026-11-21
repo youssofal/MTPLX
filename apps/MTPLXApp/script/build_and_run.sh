@@ -277,7 +277,7 @@ mkdir -p "$BUNDLE_DIR/Contents/MacOS" "$BUNDLE_DIR/Contents/Resources" "$BUNDLE_
 /usr/bin/ditto --norsrc "$EXECUTABLE" "$BUNDLE_DIR/Contents/MacOS/$APP_NAME"
 
 SPARKLE_FRAMEWORK="$(
-  /usr/bin/find "$ROOT/.build" -path '*/Sparkle.framework' -type d -prune -print 2>/dev/null | /usr/bin/head -n 1
+  /usr/bin/find -H "$ROOT/.build" -path '*/Sparkle.framework' -type d -prune -print 2>/dev/null | /usr/bin/head -n 1
 )"
 if [[ -n "$SPARKLE_FRAMEWORK" ]]; then
   /usr/bin/ditto --norsrc "$SPARKLE_FRAMEWORK" "$BUNDLE_DIR/Contents/Frameworks/Sparkle.framework"

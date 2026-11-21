@@ -26,7 +26,7 @@ final class Release2114CatalogTests: XCTestCase {
                 XCTAssertEqual(MTPLXModelOption.option(matching: MTPLXAppConfiguration.defaultLocalModelPath(for: hardware))?.id, firstID)
             }
         }
-        XCTAssertEqual(MTPLXModelOption.officialCatalog.count, 26)
+        XCTAssertEqual(MTPLXModelOption.officialCatalog.count, 27)
     }
 
     func testBonsaiBoundCanMoveWithoutDroppingTheOption() {

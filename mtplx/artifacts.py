@@ -166,6 +166,8 @@ def is_mtp_key(key: str) -> bool:
 
 
 def _num_mtp_layers(config: dict[str, Any]) -> int:
+    if config.get("model_type") == "inkling2_loop":
+        return int((config.get("mtp_config") or {}).get("num_hidden_layers") or 0)
     tcfg = text_config(config)
     return int(
         tcfg.get("mtp_num_hidden_layers")
@@ -299,6 +301,11 @@ def _mtp_expected_key_set(
     *,
     keys: tuple[str, ...] = (),
 ) -> tuple[set[str], int, str]:
+    if config.get("model_type") == "inkling2_loop":
+        from .models.inkling.layout import draft_keys
+
+        expected = draft_keys(int(config["mtp_config"]["num_hidden_layers"]))
+        return expected, len(expected), "inkling-dspark"
     mtp_quant = config.get("mtplx_mtp_quantization", {})
     prequantized = isinstance(mtp_quant, dict) and bool(mtp_quant.get("prequantized"))
     quant_policy = str(mtp_quant.get("policy") or "") if isinstance(mtp_quant, dict) else ""
@@ -1195,7 +1202,7 @@ def _inspect_hf_model(repo_id: str) -> ModelInspection:
             or tcfg.get("num_mtp_modules")
             or config.get("num_nextn_predict_layers")
             or config.get("num_mtp_modules")
-            or 0
+            or (_num_mtp_layers(config) if config.get("model_type") == "inkling2_loop" else 0)
         ),
         hidden_size=tcfg.get("hidden_size"),
         num_hidden_layers=tcfg.get("num_hidden_layers"),
@@ -1360,7 +1367,7 @@ def inspect_model(model_dir: Path | str) -> ModelInspection:
             or tcfg.get("num_mtp_modules")
             or config.get("num_nextn_predict_layers")
             or config.get("num_mtp_modules")
-            or 0
+            or (_num_mtp_layers(config) if config.get("model_type") == "inkling2_loop" else 0)
         ),
         hidden_size=tcfg.get("hidden_size"),
         num_hidden_layers=tcfg.get("num_hidden_layers"),

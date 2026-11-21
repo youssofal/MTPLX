@@ -646,6 +646,9 @@ public struct OpenCodeIntegration: Sendable {
     /// family effort dial.
     public static func reasoningEffortLevels(forModelID modelID: String) -> [String]? {
         let lower = modelID.lowercased()
+        if MTPLXModelOption.modelFamily(for: modelID) == "inkling2" {
+            return ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+        }
         if MTPLXModelOption.isBonsai2Model(modelID) {
             return ["xhigh", "medium"]
         }
@@ -672,6 +675,9 @@ public struct OpenCodeIntegration: Sendable {
 
     public static func reasoningEffort(forModelID modelID: String) -> String? {
         let lower = modelID.lowercased()
+        if MTPLXModelOption.modelFamily(for: modelID) == "inkling2" {
+            return "high"
+        }
         if lower.contains("flash-next") || lower.contains("flash_next") || lower.contains("qwen4") {
             // Agent-lane default is medium (engine codec default_agent_effort):
             // the 2026-08-28 wall-clock A/B on the identical multifile coding

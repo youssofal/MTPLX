@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import mlx.core as mx
 import numpy as np
+import pytest
 
 from mtplx.compressed_tensors import (
     mtp_sidecar_norms_are_delta,
@@ -166,7 +167,7 @@ def test_every_installed_head_is_repaired_only_where_a_gain_missed_its_shift():
     from mtplx import compressed_tensors as ct
 
     models = Path.home() / ".mtplx" / "models"
-    heads = sorted(models.glob("*/mtp.safetensors")) if models.is_dir() else []
+    heads = sorted(path for path in models.glob("*/mtp.safetensors") if path.is_file())
     extra = [Path(p) for p in os.environ.get("MTPLX_NORMSCAN_EXTRA", "").split(":") if p]
     if not heads and not extra:
         pytest.skip("no installed MTP heads on this machine")

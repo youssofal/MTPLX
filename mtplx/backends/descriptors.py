@@ -1065,7 +1065,24 @@ GEMMA4_ASSISTANT_DESCRIPTOR = BackendDescriptor(
 )
 
 
+INKLING_DESCRIPTOR = BackendDescriptor(
+    backend_id="inkling2_loop", architecture_id="inkling2-loop", model_family="inkling2",
+    display_name="Inkling 2 Mini", artifact_layout="native_mixed_precision_with_draft",
+    uses_draft_lm_head=False, mtp_history_policy="cycle",
+    runtime_capabilities=("target_logits", "vision", "target_sampled_prefix", "requires_generation_thread_affinity"),
+    sampler_defaults=SamplerDefaults(temperature=1.0, top_p=1.0, top_k=0),
+    reasoning_codec=ReasoningCodec(parser="qwen3", display_name="Inkling message channels",
+                                   default_mode="auto", effort_levels=("none", "minimal", "low", "medium", "high", "xhigh", "max"),
+                                   default_effort="high"),
+    draft_semantics=DraftSemantics("depth", "Draft depth", 3, 1, 7, "depth"),
+    kv_quant_policy=KVQuantPolicy(supported=False), default_tool_prompt_mode="native",
+    required_tool_prompt_mode="native", required_chat_template_profile="tokenizer",
+    context_window_policy=ContextWindowPolicy(maximum=1_048_576, default=32_768, source="inkling2_config"),
+    status="runtime_runnable_qa_pending", validation_status="runtime_runnable_qa_pending",
+)
+
 DESCRIPTORS_BY_BACKEND_ID: dict[str, BackendDescriptor] = {
+    INKLING_DESCRIPTOR.backend_id: INKLING_DESCRIPTOR,
     QWEN3_NEXT_DESCRIPTOR.backend_id: QWEN3_NEXT_DESCRIPTOR,
     LAGUNA_AR_DESCRIPTOR.backend_id: LAGUNA_AR_DESCRIPTOR,
     MLX_LM_AR_DESCRIPTOR.backend_id: MLX_LM_AR_DESCRIPTOR,
@@ -1259,6 +1276,8 @@ def model_family_from_inspection(
         if descriptor is not None
         else backend_id_from_inspection(inspection)
     )
+    if backend_id == "inkling2_loop" or re.search(r"inkling[-_ ]?2[-_ ]mini", text, re.IGNORECASE):
+        return "inkling2"
     if backend_id == "qwen4_exp" or _QWEN4_PREVIEW_MARKER.search(text):
         # Qwen4-generation preview (Qwen3.8-Flash-Next). Own family key so
         # sampler/draft/reasoning policy never rides the dense-27B qwen3_8
@@ -1424,6 +1443,8 @@ def reasoning_policy_for_model(
         model_ref=model_ref,
         descriptor=descriptor,
     )
+    if family == "inkling2":
+        return INKLING_DESCRIPTOR.reasoning_codec
     if family == "qwen3_8":
         text = _text_markers(model_ref, inspection)
         if model_ref:

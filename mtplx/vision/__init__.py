@@ -76,6 +76,12 @@ def vision_spec_for_model_dir(path: str | Path) -> VisionSpec | None:
         return None
 
     text_config = config.get("text_config")
+    if config.get("model_type") == "inkling2_loop":
+        return VisionSpec(model_dir=str(model_dir), image_token_id=200054, video_token_id=-1,
+                          vision_start_token_id=200005, vision_end_token_id=200010,
+                          spatial_merge_size=vision_config["adapter_merge_size"], patch_size=vision_config["native_patch_size"],
+                          temporal_patch_size=vision_config["temporal_patch_size"],
+                          out_hidden_size=text_config["hidden_size"], model_type="inkling2_loop")
     rope_parameters = (
         text_config.get("rope_parameters") if isinstance(text_config, dict) else None
     )

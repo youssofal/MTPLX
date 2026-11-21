@@ -1829,3 +1829,4 @@
 "DeepSeek Harness opened in your browser at %@, with its telemetry off." = "DeepSeek Harness se abrió en tu navegador en %@, con su telemetría desactivada.";
 "DeepSeek Harness opened in %@, with its telemetry off." = "DeepSeek Harness se abrió en %@, con su telemetría desactivada.";
 "MTPLX's command-line runtime is not installed, so DeepSeek Harness could not open." = "El entorno de línea de comandos de MTPLX no está instalado, así que DeepSeek Harness no pudo abrirse.";
+"Original expert and attention weights, with vision and speculative decoding." = "Pesos originales de los expertos y la atención, con visión y decodificación especulativa.";

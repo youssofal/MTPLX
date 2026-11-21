@@ -1829,3 +1829,4 @@
 "DeepSeek Harness opened in your browser at %@, with its telemetry off." = "DeepSeek Harness आपके ब्राउज़र में %@ पर खुल गया, उसकी टेलीमेट्री बंद है।";
 "DeepSeek Harness opened in %@, with its telemetry off." = "DeepSeek Harness %@ में खुल गया, उसकी टेलीमेट्री बंद है।";
 "MTPLX's command-line runtime is not installed, so DeepSeek Harness could not open." = "MTPLX का कमांड-लाइन रनटाइम इंस्टॉल नहीं है, इसलिए DeepSeek Harness नहीं खुल सका।";
+"Original expert and attention weights, with vision and speculative decoding." = "विशेषज्ञ और अटेंशन लेयर के मूल वेट, साथ में इमेज इनपुट और स्पेक्युलेटिव डिकोडिंग।";

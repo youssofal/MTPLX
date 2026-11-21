@@ -2886,6 +2886,14 @@ class SessionBank:
         required_cache_prefix_len = (
             restore_point if boundary_snapshot is not None else restore_point - 1
         )
+        check_boundary = getattr(runtime, "can_restore_session_boundary", None)
+        if (
+            matched < entry.prefix_len
+            and callable(check_boundary)
+            and not check_boundary(entry, boundary_snapshot)
+        ):
+            self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
+            return None
         if cache_snapshot_prefix_len < required_cache_prefix_len:
             self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
             return None

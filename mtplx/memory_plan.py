@@ -133,6 +133,13 @@ def dense_kv_bytes_per_token_from_config(config: dict | None) -> int | None:
     if not isinstance(config, dict):
         return None
     text = config.get("text_config") if isinstance(config.get("text_config"), dict) else config
+    if config.get("model_type") == "inkling2_loop":
+        from .models.inkling.layout import cache_footprint
+
+        try:
+            return cache_footprint(text).full_bytes_per_token
+        except (KeyError, TypeError, ValueError):
+            return None
     layer_types = text.get("layer_types")
     n_full: int | None = None
     if isinstance(layer_types, list) and layer_types:
@@ -432,6 +439,7 @@ class MemoryPlan:
     # MTP-head KV) and the peak prefill transient per token (the #393 terms).
     # Zero for families without them — the fit then matches the legacy solve.
     aux_bytes_per_token: int = 0
+    fixed_cache_bytes: int = 0
     prefill_transient_bytes_per_token: int = 0
     # The committed MTP-history cache per token of a non-QSA MTP family
     # (mtp_history_bytes_per_token_from_config). The request admission
@@ -480,6 +488,9 @@ class MemoryPlan:
     # "resident_floor" (the family's wired floor sits above the 75% rule, so
     # the envelope is everything outside the system reserve).
     usable_source: str = "formula"
+    # One active forward's temporary copy of historical K/V, independent
+    # of query width. Decode's persistent KV and idle bank do not own it.
+    attention_kv_copy_bytes_per_token: int = field(default=0, kw_only=True)
     notes: tuple[str, ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict[str, Any]:
@@ -499,9 +510,12 @@ class MemoryPlan:
             "kv_quantization": self.kv_quantization,
             "kv_bytes_per_token_effective": int(self.kv_bytes_per_token_effective),
             "aux_bytes_per_token": int(self.aux_bytes_per_token),
+            "fixed_cache_bytes": int(self.fixed_cache_bytes),
             "prefill_transient_bytes_per_token": int(
                 self.prefill_transient_bytes_per_token
             ),
+            **({"attention_kv_copy_bytes_per_token": self.attention_kv_copy_bytes_per_token}
+               if self.attention_kv_copy_bytes_per_token else {}),
             "mtp_history_bytes_per_token": int(self.mtp_history_bytes_per_token),
             "model_fits": self.model_fits,
             "context_window_fit": int(self.context_window_fit),
@@ -537,7 +551,9 @@ def plan_memory(
     usable_bytes_override: int | None = None,
     ngram_table_streamed_bytes: int = 0,
     aux_bytes_per_token: int = 0,
+    fixed_cache_bytes: int = 0,
     prefill_transient_bytes_per_token: int = 0,
+    attention_kv_copy_bytes_per_token: int = 0,
     usable_bytes_explicit: bool = False,
     resident_floor_bytes: int | None = None,
     tight_machine_measured: bool = False,
@@ -619,8 +635,10 @@ def plan_memory(
     # lane peaks at ~27 GB there).
     aux_pt = max(0, int(aux_bytes_per_token))
     transient_pt = max(0, int(prefill_transient_bytes_per_token))
-    per_token = kv_effective + aux_pt + transient_pt
-    kv_budget = usable - weights - RUNTIME_TRANSIENTS_BYTES - BANK_FLOOR_BYTES
+    kv_copy_pt = max(0, int(attention_kv_copy_bytes_per_token))
+    per_token = kv_effective + aux_pt + transient_pt + kv_copy_pt
+    fixed_cache = max(0, int(fixed_cache_bytes))
+    kv_budget = usable - weights - fixed_cache - RUNTIME_TRANSIENTS_BYTES - BANK_FLOOR_BYTES
     fit_raw = _align_down(max(0, kv_budget) // per_token)
     model_fits = fit_raw >= CONTEXT_FLOOR_TOKENS
     model_cap = int(model_max_context) if model_max_context else None
@@ -651,8 +669,8 @@ def plan_memory(
         # Stopping at the ceiling keeps the window monotonic in pack size,
         # and a pack whose floor-funded window reaches it keeps its floor.
         tight_transients = RUNTIME_TRANSIENTS_BYTES + TIGHT_MACHINE_MARGIN_BYTES
-        tight_per_token = kv_per_token + aux_pt + transient_pt
-        tight_budget = usable - weights - tight_transients
+        tight_per_token = kv_per_token + aux_pt + transient_pt + kv_copy_pt
+        tight_budget = usable - weights - fixed_cache - tight_transients
         tight_ceiling = _align_down(
             (
                 CONTEXT_FLOOR_TOKENS * per_token
@@ -694,7 +712,7 @@ def plan_memory(
     if not model_fits:
         notes.append(
             "model does not fit: weights + minimum runtime need "
-            f"{(weights + RUNTIME_TRANSIENTS_BYTES + BANK_FLOOR_BYTES + kv_effective * CONTEXT_FLOOR_TOKENS) / GIB:.1f}"
+            f"{(weights + fixed_cache + RUNTIME_TRANSIENTS_BYTES + BANK_FLOOR_BYTES + per_token * CONTEXT_FLOOR_TOKENS) / GIB:.1f}"
             f" GiB but the engine budget is {usable / GIB:.1f} GiB"
             + (
                 ""
@@ -739,7 +757,7 @@ def plan_memory(
     # ceiling holds the same tokens. The runtime ceiling
     # (bank_dynamic_ceiling) still reads the live working set.
     reserve_tokens = int(resolved)
-    kv_reserve = reserve_tokens * (kv_effective + aux_pt)
+    kv_reserve = fixed_cache + reserve_tokens * (kv_effective + aux_pt)
     bank_idle = usable - weights - transients
     bank_idle = max(bank_floor, min(BANK_CAP_BYTES, bank_idle))
     bank_steady = usable - weights - transients - kv_reserve
@@ -757,7 +775,9 @@ def plan_memory(
         kv_quantization=quant,
         kv_bytes_per_token_effective=kv_effective,
         aux_bytes_per_token=aux_pt,
+        fixed_cache_bytes=fixed_cache,
         prefill_transient_bytes_per_token=transient_pt,
+        attention_kv_copy_bytes_per_token=kv_copy_pt,
         mtp_history_bytes_per_token=max(0, int(mtp_history_bytes_per_token)),
         model_fits=model_fits,
         context_window_fit=context_fit,

@@ -1177,7 +1177,7 @@ class TestPerChunkSupplyCheck:
     _AT_ABORT = 97_416_433_015
     _LEASE_PRICE = 400_000_000
 
-    def _priced_guard(self, monkeypatch, *, priced, active, bank=_BANK):
+    def _priced_guard(self, monkeypatch, *, priced, active, bank=_BANK, lease=0):
         box = {"active": int(active)}
         readings = iter(
             [self._reading(available_gib=20.7, free_gib=8.7, compressor_gib=4.1, at_s=0.0)]
@@ -1205,7 +1205,7 @@ class TestPerChunkSupplyCheck:
             allow_swap=False,
             metal_memory_caps={"memory_limit_bytes": self._LIMIT},
             sessions=SimpleNamespace(
-                bank=SimpleNamespace(total_nbytes=int(bank), queued_persistence_bytes=0)
+                bank=SimpleNamespace(total_nbytes=int(bank), lease_nbytes=int(lease), queued_persistence_bytes=0)
             ),
         )
         events: list = []
@@ -1287,8 +1287,7 @@ class TestPerChunkSupplyCheck:
         lease, before, after, priced = (
             8_413_941_968, 83_712_516_774, 83_822_682_792, 1_304_672_384,
         )
-        guard, box = self._priced_guard(monkeypatch, priced=priced, active=before, bank=lease)
-        guard.state.sessions.bank.lease_nbytes = lease
+        guard, box = self._priced_guard(monkeypatch, priced=priced, active=before, bank=lease, lease=lease)
         assert guard() is False
         box["active"] = after
         guard.state.sessions.bank.total_nbytes = 0
@@ -1304,9 +1303,8 @@ class TestPerChunkSupplyCheck:
         # n4l1's shape with the bank's entry read as the lease it was: the
         # restore copied it and the bank kept it, so the copy is the growth.
         guard, box = self._priced_guard(
-            monkeypatch, priced=self._LEASE_PRICE, active=self._BEFORE
+            monkeypatch, priced=self._LEASE_PRICE, active=self._BEFORE, lease=self._BANK
         )
-        guard.state.sessions.bank.lease_nbytes = self._BANK
         assert guard() is False
         box["active"] = self._AT_ABORT
         guard.note_prefill_progress({"phase": "completed", "tokens_total": 194_089})

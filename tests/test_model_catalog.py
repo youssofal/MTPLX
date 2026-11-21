@@ -45,10 +45,10 @@ def _no_installed_qwen38(monkeypatch):
     monkeypatch.setattr(default_models_module, "_QWEN38_OPTIMIZED_SPEED_FP16_LOCAL_CANDIDATES", ())
 
 
-def test_catalog_has_twenty_six_unique_entries():
+def test_catalog_has_twenty_seven_unique_entries():
     ids = [model.id for model in OFFICIAL_CATALOG]
-    assert len(ids) == len(set(ids)) == 26
-    assert len({model.hf_model_id for model in OFFICIAL_CATALOG}) == 26
+    assert len(ids) == len(set(ids)) == 27
+    assert len({model.hf_model_id for model in OFFICIAL_CATALOG}) == 27
 
 
 def test_qwen38_fp16_siblings_mirror_their_parents():
@@ -155,6 +155,7 @@ def test_recommended_ids_mirror_app_ram_tiers():
         "qwen36-35b-a3b-optimized-speed",
         "optimized-quality",
         "bonsai-2-27b-optimized-speed",
+        "inkling2-mini-optimized-quality",
         "qwen35-4b-optimized-speed",
         "qwen35-4b-optimized-quality",
     ]
@@ -170,6 +171,7 @@ def test_recommended_ids_mirror_app_ram_tiers():
         "mimo-v26-qwen-9b-optimized-speed",
         "qwen35-9b-optimized-speed",
         "bonsai-2-27b-optimized-speed",
+        "inkling2-mini-optimized-quality",
         "qwen35-4b-optimized-speed",
         "qwen35-4b-optimized-quality",
     ]

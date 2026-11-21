@@ -294,6 +294,12 @@ def build_pi_provider_config(
     the server's ``enable_thinking``/``reasoning_effort`` request fields.
     """
 
+    from mtplx.backends.descriptors import reasoning_policy_for_model
+
+    levels = reasoning_policy_for_model(model_ref=model_id).effort_levels
+    level_map = {"minimal": "minimal" if "minimal" in levels else None, "xhigh": "xhigh"}
+    if "max" in levels:
+        level_map["max"] = "max"
     model_config: dict[str, Any] = {
         "id": str(model_id),
         "name": model_name or f"MTPLX {model_id}",
@@ -304,10 +310,7 @@ def build_pi_provider_config(
         # "minimal": null hides Pi's duplicate below-low tier; "xhigh" must be
         # mapped to appear in Pi's picker at all (Qwen 3.8's top tier); "max"
         # stays unmapped, so hidden. Unmapped levels pass through verbatim.
-        "thinkingLevelMap": {
-            "minimal": None,
-            "xhigh": "xhigh",
-        },
+        "thinkingLevelMap": level_map,
         # Engine capability, not a preference: Pi only offers/sends image
         # parts when this lists "image". A hardcoded ["text"] here kept Pi
         # text-only even for vision-enabled packs (issue #328) while the same
