@@ -460,6 +460,7 @@ INPUTS_ROWS = """
     const uint t = thread_position_in_threadgroup.x;
     const uint lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
+    constexpr uint RG = W < 4 ? W : 4;             // rows whose router sums a thread runs side by side
     threadgroup float sums[W * 32];
     threadgroup float inv_mean[W];
     threadgroup float red[W * 32];
@@ -496,41 +497,51 @@ INPUTS_ROWS = """
         if (lane == 0) inv_mean[r] = metal::precise::rsqrt(row_sq / 2304.0f + eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint r = 0; r < uint(W); ++r) {
-        const float inv = inv_mean[r];
-        const device float* xr = source + r * 2304;
-        float xs[3][4];
-        float local = 0;
-        bool nan_seen = false;
-        for (int span = 0; span < 3; ++span) {
-            for (int c = 0; c < 4; ++c) {
-                float v = 0.0f;
-                if (span < 2 || in_last) {
-                    const int i = 1024 * span + col + c;
-                    const float xi = xr[i];
-                    const float wi = float(norm_w[i]);
-                    const float y = wi * static_cast<float>(xi * inv);
-                    v = float(static_cast<T>(y));
-                    const float a = abs(v);
-                    nan_seen = nan_seen || isnan(a);
-                    local = max(local, a);
+    // Router sums, RG rows side by side (independent chains; each row's sums in INPUTS's order).
+    for (uint r0 = 0; r0 < uint(W); r0 += RG) {
+        float xs[RG][3][4];
+        float local[RG];
+        bool nan_seen[RG];
+        for (uint g = 0; g < RG; ++g) {
+            local[g] = 0;
+            nan_seen[g] = false;
+            const uint r = min(r0 + g, uint(W) - 1);
+            const float inv = inv_mean[r];
+            const device float* xr = source + r * 2304;
+            for (int span = 0; span < 3; ++span) {
+                for (int c = 0; c < 4; ++c) {
+                    float v = 0.0f;
+                    if (span < 2 || in_last) {
+                        const int i = 1024 * span + col + c;
+                        const float xi = xr[i];
+                        const float wi = float(norm_w[i]);
+                        const float y = wi * static_cast<float>(xi * inv);
+                        v = float(static_cast<T>(y));
+                        const float a = abs(v);
+                        nan_seen[g] = nan_seen[g] || isnan(a);
+                        local[g] = max(local[g], a);
+                    }
+                    xs[g][span][c] = v;
                 }
-                xs[span][c] = v;
             }
         }
-        float dot[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        for (int span = 0; span < 3; ++span)
+        for (uint g = 0; g < RG; ++g) {
+            const uint r = r0 + g;
+            float dot[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            for (int span = 0; span < 3; ++span)
+                for (int e = 0; e < 4; ++e)
+                    for (int c = 0; c < 4; ++c)
+                        dot[e] += wt[span][e][c] * xs[g][span][c];
             for (int e = 0; e < 4; ++e)
-                for (int c = 0; c < 4; ++c)
-                    dot[e] += wt[span][e][c] * xs[span][c];
-        for (int e = 0; e < 4; ++e)
-            for (ushort hop = 16; hop != 0; hop /= 2)
-                dot[e] += simd_shuffle_down(dot[e], hop);
-        if (lane == 0)
-            for (int e = 0; e < 4; ++e) red[(r * 4 + e) * 8 + sg] = dot[e];
-        const float m = simd_max(local);
-        const bool n = simd_any(nan_seen);
-        if (lane == 0) tpeak[r * 8 + sg] = n ? NAN : m;
+                for (ushort hop = 16; hop != 0; hop /= 2)
+                    dot[e] += simd_shuffle_down(dot[e], hop);
+            const float m = simd_max(local[g]);
+            const bool n = simd_any(nan_seen[g]);
+            if (r < uint(W) && lane == 0) {
+                for (int e = 0; e < 4; ++e) red[(r * 4 + e) * 8 + sg] = dot[e];
+                tpeak[r * 8 + sg] = n ? NAN : m;
+            }
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint q = t; q < uint(W) * 4u; q += 256u) {
@@ -539,29 +550,40 @@ INPUTS_ROWS = """
         for (int s = 1; s < 8; ++s) total += red[(r * 4 + e) * 8 + s];
         logits[r * 128 + 4 * j + e] = total;
     }
-    for (uint r = 0; r < uint(W); ++r) {
 #if FP4
-        float peak = 0;
-        bool any = false;
-        for (uint s = 0; s < 8; ++s) {
-            any = any || isnan(tpeak[r * 8 + s]);
-            peak = max(peak, tpeak[r * 8 + s]);
-        }
-        peak = any ? NAN : peak;
-        if (j == 0 && t == 0) outer[r] = peak / 1536.0f;
-#else
-        const float peak = 0.0f;
-#endif
-        if (sg < 3) {
-            const uint g = j + 32 * sg;
-            if (g < 72) {
-                const uint i = 32 * g + lane;
-                const float xi = source[r * 2304 + i];
-                const float wi = float(norm_w[i]);
-                const float y = wi * static_cast<float>(xi * inv_mean[r]);
-                const float v = float(static_cast<T>(y));
-                values[r * 2304 + i] = fused_quantize<bool(FP4)>(v, peak, lane);
+    if (j == 0)
+        for (uint r = t; r < uint(W); r += 256u) {
+            float peak = 0;
+            bool any = false;
+            for (uint s = 0; s < 8; ++s) {
+                any = any || isnan(tpeak[r * 8 + s]);
+                peak = max(peak, tpeak[r * 8 + s]);
             }
+            outer[r] = (any ? NAN : peak) / 1536.0f;
+        }
+#endif
+    // Input rounding: this threadgroup's (row, 32-value group) jobs spread over the simdgroups.
+    for (uint job = sg; job < uint(W) * 3u; job += 8u) {
+        const uint r = job / 3u;
+        const uint g = j + 32 * (job % 3u);
+        if (g < 72) {
+#if FP4
+            float peak = 0;
+            bool any = false;
+            for (uint s = 0; s < 8; ++s) {
+                any = any || isnan(tpeak[r * 8 + s]);
+                peak = max(peak, tpeak[r * 8 + s]);
+            }
+            peak = any ? NAN : peak;
+#else
+            const float peak = 0.0f;
+#endif
+            const uint i = 32 * g + lane;
+            const float xi = source[r * 2304 + i];
+            const float wi = float(norm_w[i]);
+            const float y = wi * static_cast<float>(xi * inv_mean[r]);
+            const float v = float(static_cast<T>(y));
+            values[r * 2304 + i] = fused_quantize<bool(FP4)>(v, peak, lane);
         }
     }
 """
@@ -961,13 +983,24 @@ PANEL = """
                 }
                 for (uint m = 0; m < uint(MC); ++m) {
                     if (m < mc) {
-                        const device float* xr = xin + ps[XSEL + m0 + m] * K + (32 * NV) * b + NV * lane;
                         float xv[NV];
+#if XH
+                        // NVFP4 activations stored as float16 (exact: e2m1 x e4m3, at most 6 significant
+                        // bits, between 2^-10 and 2,688): a lane's 8 values in one 16-byte load.
+                        const device half* xr = xin + ps[XSEL + m0 + m] * K + (32 * NV) * b + NV * lane;
+                        const uint4 u = *(const device uint4*)xr;
+                        const float2 h0 = float2(as_type<half2>(u.x)), h1 = float2(as_type<half2>(u.y));
+                        const float2 h2 = float2(as_type<half2>(u.z)), h3 = float2(as_type<half2>(u.w));
+                        xv[0] = h0.x; xv[1] = h0.y; xv[2] = h1.x; xv[3] = h1.y;
+                        xv[4] = h2.x; xv[5] = h2.y; xv[6] = h3.x; xv[7] = h3.y;
+#else
+                        const device float* xr = xin + ps[XSEL + m0 + m] * K + (32 * NV) * b + NV * lane;
                         const float4 a = *(const device float4*)xr;
                         xv[0] = a.x; xv[1] = a.y; xv[2] = a.z; xv[3] = a.w;
 #if NV == 8
                         const float4 c = *(const device float4*)(xr + 4);
                         xv[4] = c.x; xv[5] = c.y; xv[6] = c.z; xv[7] = c.w;
+#endif
 #endif
                         for (int q = 0; q < R; ++q) {
                             float accum = 0;
@@ -1032,7 +1065,7 @@ PANEL_PROMPT = (PANEL
     const uint M = hi - lo;""")
                 .replace("ps[XSEL + m0 + m] * K", "sorted_rows[lo + m0 + m] * K")
                 .replace("const uint pair = ps[10 + m0 + m];", "const uint pair = lo + m0 + m;"))
-assert PANEL_PROMPT.count("sorted_rows[lo + m0 + m]") == 1 and "ps[" not in PANEL_PROMPT
+assert PANEL_PROMPT.count("sorted_rows[lo + m0 + m]") == 2 and "ps[" not in PANEL_PROMPT
 
 # Prompt chunks name about 32 pairs an expert. Here the loop runs blocks outside rows: each
 # block's inputs of a chunk of MC members sit in registers while every row of the simdgroup is
@@ -1259,18 +1292,19 @@ PANEL_LAYOUT = {
 
 
 @lru_cache(maxsize=None)
-def _panel_kernel(product, fp4, fold, wide=False):
+def _panel_kernel(product, fp4, fold, wide=False, xh=False):
     g = PANEL_GEOMETRY[(product, fp4)]
     pairs_at = WIDE_PAIRS_AT if wide else 10
     defines = {"FP4": int(fp4), "NV": g["NV"], "WPL": g["WPL"], "NBLK": g["NBLK"],
                "HALF_LAST": int(product == "dn" and fp4), "CW": g["CW"], "SW": g["SW"], "SPL": g["SPL"],
                "K": g["K"], "POW": g["POW"], "XSEL": 2 if product == "gu" else pairs_at,
                "PLAN_STRIDE": PLAN_STRIDE_WIDE if wide else PLAN_STRIDE,
-               "FOLD": int(fold), "SFOLD": (g["POW"] if fold else "1.0f")}
+               "FOLD": int(fold), "SFOLD": (g["POW"] if fold else "1.0f"), "XH": int(bool(xh and fp4))}
     if wide:
         defines["PAIRS_AT"] = pairs_at
     extra = "".join(f"#define {k} {v}\n" for k, v in defines.items())
-    name = f"mtplx_inkling_panel_{product}_{'nvfp4' if fp4 else 'mxfp8'}_f{int(fold)}" + ("_wide" if wide else "")
+    name = (f"mtplx_inkling_panel_{product}_{'nvfp4' if fp4 else 'mxfp8'}_f{int(fold)}" + ("_wide" if wide else "")
+            + ("_xh" if xh and fp4 else ""))
     return mx.fast.metal_kernel(name=name, input_names=["plan", "xin", "codes", "scales"], output_names=["raw"],
                                 source=PANEL_WIDE if wide else PANEL, header=_header(extra), ensure_row_contiguous=True)
 
@@ -1329,7 +1363,7 @@ def _route_plan_kernel(wide=False):
 def _panel_raw(product, fp4, plan, xin, codes, scales, rows, layout=None):
     lay = layout or PANEL_LAYOUT[(product, fp4)]
     tgr = lay["S"] * lay["RPS"]
-    return _panel_kernel(product, fp4, lay.get("FOLD", 1), rows > PANEL_ROWS)(
+    return _panel_kernel(product, fp4, lay.get("FOLD", 1), rows > PANEL_ROWS, xin.dtype == mx.float16)(
         inputs=[plan, xin, codes, scales],
         template=[("S", lay["S"]), ("RPS", lay["RPS"]), ("R", lay["R"]), ("MC", lay["MC"])],
         grid=((HIDDEN // tgr) * 32 * lay["S"], min(TOP_K * rows, EXPERTS), 1), threadgroup=(32 * lay["S"], 1, 1),
@@ -1360,7 +1394,8 @@ def _panel_products(block, fp4, rows, logits, values, outer, layouts=None, dtype
         template=[("T", dtype), ("W", MIDDLE), ("E", MIDDLE // expert_fusion.THREADS)],
         grid=(pairs * expert_fusion.THREADS, 1, 1), threadgroup=(expert_fusion.THREADS, 1, 1),
         output_shapes=[(pairs, 1, MIDDLE), *([(pairs,)] if fp4 else [])],
-        output_dtypes=[mx.float32] * (2 if fp4 else 1),
+        # NVFP4 down inputs in float16 when the panel products read them so (exact, see PANEL's XH).
+        output_dtypes=[mx.float16 if fp4 and HALF_ACTIVATIONS else mx.float32] + ([mx.float32] if fp4 else []),
     )
     raw2 = _panel_raw("dn", fp4, plan, mid.reshape(pairs, MIDDLE), block.down.codes, block.down.scales, rows,
                       lay.get("dn"))
@@ -1380,6 +1415,11 @@ PRODUCTS = os.environ.get("MTPLX_INKLING_FAST_EXPERT_PRODUCTS", "auto").lower()
 #: the combine over rows (INPUTS_ROWS, COMBINE_ROWS); "row" is the earlier form (one set of router
 #: threadgroups a row; one combine thread walking every row of its column). Both are RC6's bits.
 GLUE = os.environ.get("MTPLX_INKLING_EXPERT_GLUE", "row").lower()
+
+#: NVFP4 panels: expert and down inputs written and read as float16 (exact: an NVFP4-rounded activation,
+#: e2m1 times an e4m3 group scale, has at most 6 significant bits and lies in [2^-10, 2688]); the panel
+#: products then move half the activation bytes. "0" keeps float32.
+HALF_ACTIVATIONS = os.environ.get("MTPLX_INKLING_EXPERT_HALF_X", "0").lower() not in ("0", "off", "no")
 
 
 def products_for(rows):
@@ -1407,12 +1447,14 @@ def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *
     common = (("W", rows),)
 
     rows_form = GLUE == "rows"
+    half_values = fp4 and HALF_ACTIVATIONS and products == "panel"
     logits, values, *outer = _kernel("inputs_rows" if rows_form else "inputs", fp4)(
         inputs=[src, norm_weight, block.router, _consts(float(eps))],
         template=[*common, ("T", dtype)],
         grid=(32 * 256, 1 if rows_form else rows, 1), threadgroup=(256, 1, 1),
         output_shapes=[(rows, EXPERTS), (rows, HIDDEN), *([(rows,)] if fp4 else [])],
-        output_dtypes=[mx.float32] * (3 if fp4 else 2),
+        # NVFP4 expert inputs in float16 when the panel products read them (exact, see PANEL's XH).
+        output_dtypes=[mx.float32, mx.float16 if half_values else mx.float32] + ([mx.float32] if fp4 else []),
     )
 
     if stop_after == "inputs":
