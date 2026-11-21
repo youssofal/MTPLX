@@ -71,6 +71,94 @@ def visit_tails(tails, rows, kept: int):
     )
 
 
+# Lane F1: the whole drafter mix in one launch, one threadgroup a row: the same four-tap sum (each
+# product and each sum rounded once, from 0.0), then MLX's single-row RMS norm of that float32 row
+# as lane L1's read kernel reproduces it (4 values a thread, simd_sum, the simdgroup totals summed
+# zero-padded, precise::rsqrt), the gain applied as the norm applies it (w * (x * inv)) and the bf16
+# cast; the blend row is read in the launch (no gather), the gain read as float (no cast launch).
+_MIX_NORM = """
+    constexpr uint NSG = TPG / 32;
+    const uint t = thread_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
+    const uint r = threadgroup_position_in_grid.x;
+    threadgroup float sums[32];
+    threadgroup float inv[1];
+    const uint c4 = t * 4;
+    const bool in_row = c4 < D;
+    const float b0 = float(blend[ROW * 4 + 0]), b1 = float(blend[ROW * 4 + 1]);
+    const float b2 = float(blend[ROW * 4 + 2]), b3 = float(blend[ROW * 4 + 3]);
+    float x[4];
+    for (uint i = 0; i < 4; ++i) {
+        float s = 0.0f;
+        if (in_row) {
+            const size_t at = size_t(r) * D + c4 + i;
+            s = metal::fma(s, 1.0f, metal::fma(float(h0[at]), b0, -0.0f));
+            s = metal::fma(s, 1.0f, metal::fma(float(h1[at]), b1, -0.0f));
+            s = metal::fma(s, 1.0f, metal::fma(float(h2[at]), b2, -0.0f));
+            s = metal::fma(s, 1.0f, metal::fma(float(h3[at]), b3, -0.0f));
+        }
+        x[i] = s;
+    }
+    float acc = 0;
+    for (uint i = 0; i < 4; ++i) {
+        const float xval = in_row ? x[i] : 0.0f;
+        acc += xval * xval;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) sums[sg] = acc;
+    if (sg == 0 && lane >= NSG) sums[lane] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        const float total = simd_sum(sums[lane]);
+        if (lane == 0) inv[0] = metal::precise::rsqrt(total / float(D) + as_type<float>(uint(EPS)));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float iv = inv[0];
+    if (in_row)
+        for (uint i = 0; i < 4; ++i) {
+            const float w = static_cast<float>(gain[c4 + i]);
+            out[size_t(r) * D + c4 + i] = static_cast<bfloat16_t>(w * (x[i] * iv));
+        }
+"""
+
+
+@lru_cache(maxsize=None)
+def _mix_norm_kernel():
+    return mx.fast.metal_kernel(
+        name="mtplx_inkling_f1_draft_mix",
+        input_names=["h0", "h1", "h2", "h3", "blend", "gain"],
+        output_names=["out"],
+        source=_MIX_NORM,
+    )
+
+
+def mix_norm(features, blend, row: int, norm_weight, eps: float):
+    """``Drafter.mix`` whole, one launch: ``rms_norm(sum_i(h_i.astype(f32) * blend[row, i]),
+    norm_weight, eps).astype(bfloat16)`` for four bf16 taps ``(1, R, D)`` (D a multiple of 128 up to
+    4,096), a bf16 ``blend`` ``(B, 4)`` and a bf16 gain; None where it does not apply."""
+    import struct
+
+    if (len(features) != 4 or any(h.dtype != mx.bfloat16 or h.shape != features[0].shape for h in features)
+            or blend.dtype != mx.bfloat16 or blend.ndim != 2 or blend.shape[1] != 4
+            or norm_weight.dtype != mx.bfloat16):
+        return None
+    width = int(features[0].shape[-1])
+    if width % 128 or width > 4096 or norm_weight.size != width:
+        return None
+    rows = features[0].size // width
+    row = int(row) % int(blend.shape[0])
+    tpg = -(-(width // 4) // 32) * 32
+    return _mix_norm_kernel()(
+        inputs=[*features, blend, norm_weight],
+        template=[("D", width), ("TPG", tpg), ("ROW", row),
+                  ("EPS", struct.unpack("<I", struct.pack("<f", eps))[0])],
+        grid=(rows * tpg, 1, 1),
+        threadgroup=(tpg, 1, 1),
+        output_shapes=[features[0].shape],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+
+
 def mix(features, weights, norm_weight, eps: float):
     """``Drafter.mix``: ``rms_norm(sum(h.astype(float32) * w.astype(float32)), norm_weight, eps)``
     in the taps' dtype, with the weighted sum of the four taps in one launch. ``features``: four
@@ -93,4 +181,4 @@ def mix(features, weights, norm_weight, eps: float):
     return mx.fast.rms_norm(mixed, norm_weight, eps).astype(dtype)
 
 
-__all__ = ["mix", "visit_tails"]
+__all__ = ["mix", "mix_norm", "visit_tails"]

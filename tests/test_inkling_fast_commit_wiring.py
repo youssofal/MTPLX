@@ -101,7 +101,7 @@ def test_one_launch_tails_engage_on_the_gpu():
 
 
 @needs
-@pytest.mark.parametrize("rows", [1, 4])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 6, 7, 8])
 def test_drafter_mix_one_launch_equals_the_stock_mix(rows, monkeypatch):
     from mtplx.models.inkling.draft import Drafter
 
@@ -174,3 +174,28 @@ def test_commit_with_the_row_writer_writes_the_stock_state(kept, length, monkeyp
     for a, b in zip(states["1"].arrays(), states["0"].arrays()):
         assert a.shape == b.shape and a.dtype == b.dtype
         assert bool(mx.array_equal(_bits(a), _bits(b)).item())
+
+
+@needs
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 6, 7, 8])
+def test_whole_drafter_mix_equals_the_stock_mix_at_the_model_width(rows, monkeypatch):
+    from mtplx.models.inkling.draft import Drafter
+    from mtplx.models.inkling.fast.commit_launches import mix_norm
+
+    width = 2304
+    key = mx.random.key(17 + rows)
+    k1, k2, k3 = mx.random.split(key, 3)
+    features = [(mx.random.normal((1, rows, width), key=k) * (10.0 ** (i - 1))).astype(mx.bfloat16)
+                for i, k in enumerate(mx.random.split(k1, 4))]
+    blend = mx.softmax(mx.random.normal((4, 4), key=k2), axis=-1).astype(mx.bfloat16)
+    weight = (1 + 0.1 * mx.random.normal((width,), key=k3)).astype(mx.bfloat16)
+    mx.eval(features, blend, weight)
+    drafter = SimpleNamespace(blend=blend, cfg={"rms_norm_eps": 1e-6})
+    for row in (0, 1, 2, -1):
+        monkeypatch.setenv("MTPLX_INKLING_COMMIT_LAUNCHES", "0")
+        want = Drafter.mix(drafter, features, row, weight)
+        got = mix_norm(features, blend, row, weight, 1e-6)
+        assert got is not None
+        assert bool(mx.array_equal(_bits(got), _bits(want)).item()), f"blend row {row}"
+        monkeypatch.setenv("MTPLX_INKLING_COMMIT_LAUNCHES", "1")
+        assert bool(mx.array_equal(_bits(Drafter.mix(drafter, features, row, weight)), _bits(want)).item())

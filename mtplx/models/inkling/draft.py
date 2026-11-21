@@ -149,10 +149,14 @@ class Drafter(nn.Module):
 
     def mix(self, features, row, weight):
         if _one_launch_mix(features):
-            # The four-tap float32 sum in one launch, the same bytes as the products and adds
-            # below (lane L7's ``fast.commit_launches.mix``), then the same RMS norm.
-            from .fast.commit_launches import mix as one_launch_mix
+            # The whole mix in one launch where it applies (lane F1's ``mix_norm``: the sum, the
+            # norm, the gain and the cast); else the four-tap float32 sum in one launch, the same
+            # bytes as the products and adds below (lane L7's ``mix``), then the same RMS norm.
+            from .fast.commit_launches import mix as one_launch_mix, mix_norm
 
+            whole = mix_norm(features, self.blend, row, weight, self.cfg["rms_norm_eps"])
+            if whole is not None:
+                return whole
             return one_launch_mix(features, self.blend[row], weight, self.cfg["rms_norm_eps"])
         dtype = features[0].dtype
         mixed = sum(
