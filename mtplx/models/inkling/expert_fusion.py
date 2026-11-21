@@ -37,7 +37,7 @@ the path does not serve (more than 32 rows, affine research experts, CPU, other 
 runs the stock body with its reason. Every visit is counted for its request and for the
 model. MTPLX_INKLING_EXPERT_FUSION=off restores the stock body.
 
-Prompt chunks (33 to 2,048 rows): the stock body sorts the pairs by expert and runs the two
+Prompt chunks (33 to 4,096 rows): the stock body sorts the pairs by expert and runs the two
 quantized gathers with `sorted_indices`; `routed_sorted` keeps the sort and the down gather
 exactly as the stock body makes them, takes the gate-up gather in the form the stock body's
 measured route proves equal (NVFP4: rows gathered in sorted order, one sorted product; MXFP8:
@@ -154,7 +154,11 @@ INPUTS = """
     float peak = 0.0f;
 #endif
     for (int c = 0; c < E; ++c)
+#ifdef OPERAND
+        values[row * W + c * THREADS + t] = static_cast<OPERAND>(fused_quantize<bool(FP4)>(v[c], peak, lane));
+#else
         values[row * W + c * THREADS + t] = fused_quantize<bool(FP4)>(v[c], peak, lane);
+#endif
 """
 
 ROUTE = """
@@ -272,7 +276,11 @@ SWIGLU = """
     float peak = 0.0f;
 #endif
     for (int c = 0; c < E; ++c)
+#ifdef OPERAND
+        values[p * W + c * THREADS + t] = static_cast<OPERAND>(fused_quantize<bool(FP4)>(h[c], peak, lane));
+#else
         values[p * W + c * THREADS + t] = fused_quantize<bool(FP4)>(h[c], peak, lane);
+#endif
 """
 
 COMBINE = """
@@ -306,7 +314,8 @@ COMBINE_SORTED = (COMBINE
                   .replace("mid_outer[p]", "mid_outer[s]"))
 assert COMBINE_SORTED.count("inv[p]") == 1 and "raw[s * H + c]" in COMBINE_SORTED
 
-PROMPT_ROWS = 2048  # widest prompt chunk the sorted route serves (the prompt read uses 512)
+PROMPT_ROWS = 4096  # widest prompt chunk the sorted route serves (the prompt read uses 512; a request may ask wider)
+SORTED_TILE_PAIRS = 4  # pairs an expert from which MLX's sorted product runs its tile kernel
 
 
 def mlx_literal(value):
@@ -518,10 +527,37 @@ def routed(block, flat, linear, trace=None, variant=None):
     return out
 
 
-def routed_sorted(block, flat, linear, trace=None, variant=None):
-    """Mixture of experts for a prompt chunk (33 to PROMPT_ROWS rows): the stock body's two
-    sorted quantized gathers on the same inputs and sort, around the fused input, route,
-    SwiGLU and combine kernels. Call only when `prompt_unserved` returns None.
+def prompt_kernels():
+    """Whether the prompt route's pair sort and expert products run as our launches
+    (``fast.prompt_experts``: tensor-unit GPUs with readable MLX headers), else MLX's argsorts,
+    gathers and sorted products. ``MTPLX_INKLING_PROMPT_KERNELS=mlx`` keeps MLX's."""
+    if os.environ.get("MTPLX_INKLING_PROMPT_KERNELS", "ours").strip().lower() in ("mlx", "0", "off", "stock"):
+        return False
+    from .fast import prompt_experts
+
+    return prompt_experts.available()[0]
+
+
+def routed_sorted(block, flat, linear, trace=None, variant=None, fast=False):
+    """Mixture of experts for a prompt chunk (33 to PROMPT_ROWS rows): the stock body's sort and two
+    sorted quantized products on the same inputs, around the fused input, route, SwiGLU and combine
+    kernels. Call only when `prompt_unserved` returns None.
+
+    On tensor-unit GPUs (`prompt_kernels`) the sort and both products are our launches
+    (`fast.prompt_experts`): the token rows are read in place through the sort's row map, and every
+    product row has the sums of MLX's sorted product (NVFP4 on bfloat16 operands, which hold the
+    rounded expert inputs exactly; an NVFP4 product's sums are exact, so the operand type cannot move
+    a bit). Elsewhere MLX's argsorts, gathers and sorted products run, as in the stock body.
+
+    `fast` (the prompt read's fast route, `fast.prompt_route.prompt_fast("experts")`, off by
+    default) changes the MXFP8 blocks only: their gate-up takes the sorted product on the
+    accelerator, as NVFP4's does, instead of the one-row panel product, and both MXFP8 products
+    read bfloat16 operands (the inputs and SwiGLU kernels write the rounded expert inputs in
+    bfloat16, which holds them exactly: at most 4 significant bits). An MXFP8 product's bfloat16
+    output is its float32 sum rounded once, the rounding the SwiGLU and combine kernels apply to
+    a float32 output, so the only change is the gate-up's order of summation: the sorted
+    product's (MLX's own grouped product) instead of the one-row product's (class C against the
+    default).
     """
     fp4 = block.gate_up.mode == "nvfp4"
     rows, width = flat.shape
@@ -529,31 +565,54 @@ def routed_sorted(block, flat, linear, trace=None, variant=None):
     middle = block.down.codes.shape[-1] * (8 if fp4 else 4)
     bits, group = (4, 16) if fp4 else (8, 32)
     scalars = [(rows,)] if fp4 else []
+    ours = prompt_kernels()
+    # MLX multiplies sorted pairs on its tile kernel only from 4 pairs an expert on; below that each
+    # pair is its one-row product. An NVFP4 product's sums are exact, so either is ours; an MXFP8
+    # block below that keeps MLX's products (and the fast route's MXFP8 gate-up its panel).
+    tiled = fp4 or pairs >= SORTED_TILE_PAIRS * block.router.shape[0]
+    fast = fast and not fp4 and tiled
+    # bfloat16 operands: the fast route's MXFP8 products, and NVFP4 products on our launches. MLX's
+    # products of an MXFP8 block take float32 operands, and so do ours in their place.
+    operand = mx.bfloat16 if fast or (ours and fp4) else mx.float32
 
-    router_in, values, *outer = _kernel("inputs", fp4)(
+    # Kernels writing the rounded expert inputs in bfloat16 (OPERAND); without it the kernel source is
+    # the float32 route's, unchanged.
+    narrow = (("OPERAND", "bfloat16_t"),) if operand == mx.bfloat16 else ()
+    router_in, values, *outer = _kernel("inputs", fp4, narrow)(
         inputs=[flat],
         template=[("T", flat.dtype), ("W", width), ("E", width // THREADS)],
         grid=(rows * THREADS, 1, 1),
         threadgroup=(THREADS, 1, 1),
         output_shapes=[(rows, width), (rows, 1, width), *scalars],
-        output_dtypes=[mx.float32] * (3 if fp4 else 2),
+        output_dtypes=[mx.float32, operand] + ([mx.float32] if fp4 else []),
     )
     logits = linear(router_in, block.router)
     if logits.dtype != mx.float32:
         raise TypeError("Inkling router logits must be float32 for the fused route")
     experts, _, prob = route(logits, block.bias, count, block.scale, variant)
-    # The stock body's sort: pairs ordered by expert, each pair's row its index // count.
-    order = mx.argsort(experts)
-    sorted_experts = experts[order]
-    sorted_rows = order // count
-    if fp4:
-        # The stock body's grouped form (its rows gathered in sorted order, one sorted matrix
-        # product), which its measured route proves equal to the indexed form before using it.
-        raw13 = mx.gather_qmm(
-            values[sorted_rows], block.gate_up.codes, scales=block.gate_up.scales,
-            rhs_indices=sorted_experts, group_size=group, bits=bits, mode=block.gate_up.mode,
-            sorted_indices=True,
-        )
+    if ours:
+        from .fast import prompt_experts
+
+        order, sorted_rows, sorted_experts, inverse, tiles, starts = prompt_experts.sort_pairs(
+            experts, count, block.router.shape[0])
+    else:
+        # The stock body's sort: pairs ordered by expert, each pair's row its index // count.
+        order = mx.argsort(experts)
+        sorted_experts = experts[order]
+        sorted_rows = order // count
+        inverse = None
+    if fp4 or fast:
+        if ours:
+            raw13 = prompt_experts.product(values, block.gate_up, tiles, starts, pairs, rowmap=sorted_rows)
+        else:
+            # The stock body's grouped form (its rows gathered in sorted order, one sorted matrix
+            # product), which its measured route proves equal to the indexed form before using it
+            # (NVFP4); the fast route takes it for MXFP8 too.
+            raw13 = mx.gather_qmm(
+                values[sorted_rows], block.gate_up.codes, scales=block.gate_up.scales,
+                rhs_indices=sorted_experts, group_size=group, bits=bits, mode=block.gate_up.mode,
+                sorted_indices=True,
+            )
     else:
         # The stock body's indexed form computes each pair as MLX's one-row gathered product and
         # re-reads its expert for every pair; the panel product gives each pair the same bits and
@@ -562,20 +621,23 @@ def routed_sorted(block, flat, linear, trace=None, variant=None):
 
         raw13 = prompt_gate_up(block, values, sorted_experts, sorted_rows)
     caps = (("GATE_CAP", mlx_literal(block.gate_cap)), ("UP_CAP", mlx_literal(block.up_cap)))
-    mid, *mid_outer = _kernel("swiglu", fp4, caps)(
+    mid, *mid_outer = _kernel("swiglu", fp4, caps + narrow)(
         inputs=[raw13.reshape(pairs, 2 * middle),
                 *([outer[0], block.gate_up.outer] if fp4 else []), sorted_experts, sorted_rows],
         template=[("T", flat.dtype), ("W", middle), ("E", middle // THREADS)],
         grid=(pairs * THREADS, 1, 1),
         threadgroup=(THREADS, 1, 1),
         output_shapes=[(pairs, 1, middle), *([(pairs,)] if fp4 else [])],
-        output_dtypes=[mx.float32] * (2 if fp4 else 1),
+        output_dtypes=[operand] + ([mx.float32] if fp4 else []),
     )
-    raw2 = mx.gather_qmm(
-        mid, block.down.codes, scales=block.down.scales, rhs_indices=sorted_experts,
-        group_size=group, bits=bits, mode=block.down.mode, sorted_indices=True,
-    )
-    inverse = mx.argsort(order)
+    if ours and tiled:
+        raw2 = prompt_experts.product(mid, block.down, tiles, starts, pairs)
+    else:
+        raw2 = mx.gather_qmm(
+            mid, block.down.codes, scales=block.down.scales, rhs_indices=sorted_experts,
+            group_size=group, bits=bits, mode=block.down.mode, sorted_indices=True,
+        )
+        inverse = mx.argsort(order) if inverse is None else inverse
     (out,) = _kernel("combine_sorted", fp4)(
         inputs=[raw2.reshape(pairs, width),
                 *([mid_outer[0], block.down.outer] if fp4 else []), experts, prob, inverse],
@@ -587,7 +649,8 @@ def routed_sorted(block, flat, linear, trace=None, variant=None):
     )
     if trace is not None:
         trace.update(router_in=router_in, values13=values, logits=logits, experts=experts, prob=prob,
-                     order=order, raw13=raw13, values2=mid, raw2=raw2, out=out)
+                     order=order, sorted_rows=sorted_rows, sorted_experts=sorted_experts, inverse=inverse,
+                     raw13=raw13, values2=mid, raw2=raw2, out=out)
     return out
 
 
@@ -694,6 +757,12 @@ def _decide(state, block, flat, linear, stock, variant):
         return plan, reason, (proved[0] if proved else None), checked
 
 
+def _prompt_fast(part):
+    from .fast.prompt_route import prompt_fast
+
+    return prompt_fast(part)
+
+
 def experts_forward(block, hidden, linear, stock):
     """Serve `block(hidden)` through the fused path when admitted, else the stock body."""
     flat = hidden.reshape(-1, hidden.shape[-1])
@@ -710,6 +779,11 @@ def experts_forward(block, hidden, linear, stock):
             plan, refusal, out, proof = _decide(state, block, flat, linear, stock, variant)
             proofs.append(proof)
             if plan is not None:
+                if prompt and _prompt_fast("experts"):
+                    # The prompt read's fast route (off by default, not bit-identical): the
+                    # admitted route's kernels on bfloat16 operands (see `routed_sorted`).
+                    state.record(_key(fmt, rows, "prompt_fast." + variant), *proofs)
+                    return routed_sorted(block, flat, linear, variant=variant, fast=True).reshape(hidden.shape)
                 state.record(_key(fmt, rows, ("prompt_fused." if prompt else "fused.") + variant), *proofs)
                 if out is None:
                     out = (routed_sorted if prompt else routed)(block, flat, linear, variant=variant)
