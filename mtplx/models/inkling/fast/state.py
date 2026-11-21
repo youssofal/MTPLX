@@ -42,6 +42,30 @@ def round_up(value, step):
     return -(-value // step) * step
 
 
+def _one_launch_tails(tails, rows):
+    """Whether a visit's four tails can be written by ``commit_launches.visit_tails`` (one launch
+    on the GPU, the stock writes' bytes): four tails of one keep length and dtype and their panel
+    rows, on a Metal device. ``MTPLX_INKLING_COMMIT_LAUNCHES=0`` keeps the stock writes."""
+    import os
+
+    if os.environ.get("MTPLX_INKLING_COMMIT_LAUNCHES", "1").strip().lower() in ("0", "off", "false", "no"):
+        return False
+    if len(tails) != 4 or len(rows) != 4 or any(t is None for t in tails):
+        return False
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return False
+    keep, dtype = tails[0].shape[1], tails[0].dtype
+    return all(t.ndim == 3 and t.shape[0] == 1 and t.shape[1] == keep and t.dtype == dtype
+               and r.ndim == 3 and r.shape[0] == 1 and r.shape[2] == t.shape[2]
+               for t, r in zip(tails, rows))
+
+
+def visit_tails(tails, rows, kept):
+    from .commit_launches import visit_tails as one_launch
+
+    return one_launch(tails, rows, kept)
+
+
 @dataclass
 class VisitDelta:
     """The panel's own rows of one visit, committed (first ``kept``) after the accept."""
@@ -190,6 +214,13 @@ class DecodeState:
                 kv.keys[:, :, self.length : end, :] = keys
                 kv.values[:, :, self.length : end, :] = values
             kv.offset = end
+            tails = [conv[slot] for slot in range(len(delta.taps))]
+            if _one_launch_tails(tails, delta.taps):
+                # The visit's four new tails in one launch, the same bytes as the four slice copies
+                # or concatenations below (lane L7's ``commit_launches.visit_tails``).
+                for slot, tail in enumerate(visit_tails(tails, list(delta.taps), kept)):
+                    conv[slot] = tail
+                continue
             for slot, rows in enumerate(delta.taps):
                 tail = conv[slot]
                 if kept >= self.keep:

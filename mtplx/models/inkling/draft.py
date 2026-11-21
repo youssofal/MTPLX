@@ -9,6 +9,20 @@ from .model import linear
 from .precision import AffineWeight
 
 
+def _one_launch_mix(features):
+    """Whether ``Drafter.mix`` can take its four-tap float32 sum in one launch (lane L7's
+    ``fast.commit_launches.mix``, the stock products' and adds' bytes): four taps of one shape
+    on a Metal device. ``MTPLX_INKLING_COMMIT_LAUNCHES=0`` keeps the stock operations."""
+    import os
+
+    if os.environ.get("MTPLX_INKLING_COMMIT_LAUNCHES", "1").strip().lower() in ("0", "off", "false", "no"):
+        return False
+    if len(features) != 4 or mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return False
+    shape = features[0].shape
+    return all(h.shape == shape for h in features)
+
+
 class DraftBlock(nn.Module):
     def __init__(self, weights, config, index):
         super().__init__()
@@ -134,6 +148,12 @@ class Drafter(nn.Module):
         ] + [ArraysCache(1)]
 
     def mix(self, features, row, weight):
+        if _one_launch_mix(features):
+            # The four-tap float32 sum in one launch, the same bytes as the products and adds
+            # below (lane L7's ``fast.commit_launches.mix``), then the same RMS norm.
+            from .fast.commit_launches import mix as one_launch_mix
+
+            return one_launch_mix(features, self.blend[row], weight, self.cfg["rms_norm_eps"])
         dtype = features[0].dtype
         mixed = sum(
             h.astype(mx.float32) * self.blend[row, i].astype(mx.float32)
