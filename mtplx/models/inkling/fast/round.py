@@ -615,17 +615,21 @@ def commit_count(packet, rows, *, stops, remaining):
     The next round's anchor is pending when ``emitted == n + 1``. Cancellation and the
     opt-in repetition guard stay host decisions (see ``lanes/L4.md``, "For L7 and L0").
     """
+    # Every scalar is a kept constant and every operation int32: a Python scalar here would be
+    # a fresh host array per call (a recycled buffer's stale bytes past it make two recordings
+    # of the round differ), and argmax's uint32 against int32 would promote to int64.
+    one = _const(1, mx.int32)
     n = packet[0].astype(mx.int32)
     tokens = packet[2 : 2 + rows]
     index = mx.arange(rows, dtype=mx.int32)
     if not isinstance(stops, mx.array):
         stops = mx.array([int(t) for t in stops] or [-2], mx.int32)
     hit = mx.any(tokens[:, None] == stops.astype(mx.int32)[None, :], axis=1) & (index <= n)
-    first = mx.where(mx.any(hit), mx.argmax(hit.astype(mx.int32)), rows)
+    first = mx.where(mx.any(hit), mx.argmax(hit.astype(mx.int32)).astype(mx.int32), _const(rows, mx.int32))
     if not isinstance(remaining, mx.array):
         remaining = mx.array(int(remaining), mx.int32)
-    emitted = mx.minimum(mx.minimum(n + 1, remaining.astype(mx.int32).reshape(())), first + 1)
-    kept = 1 + mx.minimum(n, emitted)
+    emitted = mx.minimum(mx.minimum(n + one, remaining.astype(mx.int32).reshape(())), first + one)
+    kept = one + mx.minimum(n, emitted)
     return kept.astype(mx.uint32), emitted.astype(mx.uint32)
 
 

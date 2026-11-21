@@ -95,6 +95,12 @@ def _output_name(index: int) -> str:
     return engine_site._output_name(index - 2)
 
 
+def _commit_enabled() -> bool:
+    from .decoder import round_commit_enabled
+
+    return bool(round_commit_enabled())
+
+
 def site(rt: Any):
     replay = getattr(rt, _ATTRIBUTE, None)
     if replay is None:
@@ -106,10 +112,11 @@ def site(rt: Any):
             # loop's previous work still holds a state array carries MLX's copy of it, and the
             # allocator can hand a constant's buffer to an array the program later writes: two
             # recordings of one round then differ by copies, or by a constant against the same
-            # bytes. Both are one program (the engine's round-program mode): the shorter, in-place
-            # recording is kept and bit-checked twice. Without it the served loop's rounds were
-            # refused (signature_unstable) where an isolated harness replayed 30 of 30.
-            settle_copies=True,
+            # bytes. Both are one program (the engine's round-program mode): with the copies
+            # removed the rest must be the same program structurally, then it is bit-checked
+            # twice. Only the committing round needs it (the deciding round writes nothing in
+            # place), so the site settles copies only when the committing round is on.
+            settle_copies=_commit_enabled(),
         )
         # The round's kept constants (sizes, per-row parameters, modes) are bound in place.
         replay.pin_before_each_recording(fast_round.constants)
@@ -483,7 +490,10 @@ def propose(drafter, target, anchor, view: DraftView, count_: int, *, position, 
     ].astype(mx.float32)
     folded = drafter.fold(target.unembed)
     start = position.astype(mx.uint32).reshape(())
-    state = mx.zeros((1, rank), dtype)
+    # Kept constants, not fresh host scalars, anywhere in the program (see round.commit_count):
+    # the same values, so the same bits.
+    state = fast_round._const([[0.0] * rank], dtype)
+    one = fast_round._const(1.0, dtype)
     prev = anchor_ids.reshape(1)
     picks, laws, stats, confidence = [], [], [], []
     for i in range(count_):
@@ -491,7 +501,7 @@ def propose(drafter, target, anchor, view: DraftView, count_: int, *, position, 
         update = (linear(step_in.astype(mx.float32), weights[:, : 2 * rank]) + conditioned[:, i]).astype(dtype)
         gate, candidate, output = mx.split(update, 3, axis=-1)
         gate = mx.sigmoid(gate.astype(mx.float32)).astype(dtype)
-        state = gate * state + (1 - gate) * mx.tanh(candidate.astype(mx.float32)).astype(dtype)
+        state = gate * state + (one - gate) * mx.tanh(candidate.astype(mx.float32)).astype(dtype)
         signal = mx.tanh(output.astype(mx.float32)).astype(dtype)
         bias = mx.addmm(folded[:, -1], signal, folded[:, :-1].T)
         scores = base[:, i] + bias
@@ -538,7 +548,8 @@ def round_function(rt, anchor, position, seed, view: DraftView, round_state, pro
     # remaining budget), then the kept rows written into the state and observed by the drafter.
     rows = proposals + 1
     kept, emitted = fast_round.commit_count(packet, rows, stops=stops, remaining=remaining)
-    kept = mx.where(packet[1] == 0, kept, mx.zeros_like(kept))  # a row that is no law: nothing kept
+    # a row that is no law: nothing kept (kept constants, not fresh host scalars: see commit_count)
+    kept = mx.where(packet[1] == fast_round._const(0, packet.dtype), kept, mx.zeros_like(kept))
     target_new, target_undo = _commit_target(round_state, deltas, kept, rows)
     draft_new, last, draft_undo = _observe_draft(rt.drafter, view, captures, kept, rows)
     return [packet, block, mx.stack([kept, emitted]), *engine_site.flatten(logits, captures, deltas),
@@ -664,6 +675,16 @@ def _commit_target(st, deltas, kept, rows: int):
     return new, undo
 
 
+def _mix(drafter, features, row, weight):
+    """``Drafter.mix`` with its sum started from a kept 0.0 (``sum()`` starts from a Python 0, a
+    fresh host scalar each call); the same operations in the same order, so the same bits."""
+    dtype = features[0].dtype
+    mixed = fast_round._const(0.0, mx.float32)
+    for i, h in enumerate(features):
+        mixed = mixed + h.astype(mx.float32) * drafter.blend[row, i].astype(mx.float32)
+    return mx.fast.rms_norm(mixed, weight, drafter.cfg["rms_norm_eps"]).astype(dtype)
+
+
 def _observe_draft(drafter, view, captures, kept, rows: int):
     """``Drafter.observe`` of the first ``kept`` capture rows, as a function of arrays.
 
@@ -679,7 +700,7 @@ def _observe_draft(drafter, view, captures, kept, rows: int):
     start = view.length.astype(mx.int32).reshape(1)
     new, undo = [], []
     for index, block in enumerate(drafter.blocks):
-        features = drafter.mix(captures, index, block.w["dflare_norm.weight"])
+        features = _mix(drafter, captures, index, block.w["dflare_norm.weight"])
         keys = block.normalize(block.heads(features, "k_ctx"), "self_attn.k_norm_ctx")
         keys = block.rotate(keys, view.offset)
         values = block.heads(features, "v_ctx")
@@ -692,10 +713,10 @@ def _observe_draft(drafter, view, captures, kept, rows: int):
             ring_k = mx.slice_update(ring_k, keys.astype(ring_k.dtype), start, axes=(2,))
             ring_v = mx.slice_update(ring_v, values.astype(ring_v.dtype), start, axes=(2,))
         new += [ring_k, ring_v]
-    mixed = drafter.mix(captures, -1, drafter.markov["dflare_norm.weight"])
+    mixed = _mix(drafter, captures, -1, drafter.markov["dflare_norm.weight"])
     last_row = mx.maximum(kept.astype(mx.int32), fast_round._const(1, mx.int32)) - fast_round._const(1, mx.int32)
     last = mx.take(mixed, last_row.reshape(1), axis=1)
-    last = mx.where(kept > 0, last, view.last)
+    last = mx.where(kept > fast_round._const(0, kept.dtype), last, view.last)
     return new, last, undo
 
 
@@ -935,9 +956,12 @@ def serve(rt, anchor, cache, proposals: int, *, position, seed, temperature, dra
         dcache[len(drafter.blocks)][0] = outputs[base + 2 * len(drafter.blocks)]
 
     started = time.perf_counter()
-    if not replay.plan(geometry, family=geometry):
-        why = replay.last_decline or "declined"
-        if why not in (WARMING, KEY_NEW):
+    # A diagnostic reference arm: the same round function served on MLX every round, never
+    # replayed (equal seeds then give equal token ids to the replayed program's).
+    reference = os.environ.get("MTPLX_INKLING_ROUND_REFERENCE", "").strip() == "1"
+    if reference or not replay.plan(geometry, family=geometry):
+        why = "reference" if reference else (replay.last_decline or "declined")
+        if not reference and why not in (WARMING, KEY_NEW):
             # Refused, record-only or strided: the round function on MLX would run the step on
             # MLX too; the loop's pieces run the replayed step (counted).
             return _decline_program(replay, why, k)
@@ -1091,9 +1115,11 @@ def warm(rt, proposals=None, *, length: int = 1100, seed: int = 20261121, temper
         native = tries = 0
         while tries < _WARM_TRIES and native < 1:
             tries += 1
-            served = serve(rt, (seed + tries * 7919 + k) % vocab, cache, k, position=length + 1, seed=seed + k,
-                           temperature=temperature, draft_temperature=draft_temperature,
-                           state=None if commit else state, **extra)
+            # Every call differs in what is an input (anchor, position, seed), so the check call
+            # after the recordings fails at load on any value a recording froze as a constant.
+            served = serve(rt, (seed + tries * 7919 + k) % vocab, cache, k, position=length + 1 + 5 * tries,
+                           seed=seed + k + 1009 * tries, temperature=temperature,
+                           draft_temperature=draft_temperature, state=None if commit else state, **extra)
             if served is None:
                 break
             mx.eval(served.packet, served.rows, served.features, [d.arrays() for d in served.pending.deltas])
@@ -1105,8 +1131,8 @@ def warm(rt, proposals=None, *, length: int = 1100, seed: int = 20261121, temper
             for t in range(3):
                 mx.synchronize()
                 t0 = time.perf_counter()
-                served = serve(rt, (seed + 31 * t + k) % vocab, cache, k, position=length + 1, seed=seed + k,
-                               temperature=temperature, draft_temperature=draft_temperature,
+                served = serve(rt, (seed + 31 * t + k) % vocab, cache, k, position=length + 2 + 3 * t,
+                               seed=seed + k + 17 * t, temperature=temperature, draft_temperature=draft_temperature,
                                state=None if commit else state, **extra)
                 if served is None:
                     # A call the program declined (busy, shared state, a layout it does not take):
