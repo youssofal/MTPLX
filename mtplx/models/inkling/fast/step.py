@@ -384,11 +384,15 @@ def stored_output_reason(layer, dtype, rows):
     for bit against the step's separate launches, and refuses (counted) on a disagreement."""
     from .qproduct import qmv_constants
 
+    from .qproduct import STREAM_TYPES
+
     conv = layer.convs[2]
     if not isinstance(layer.out, AffineWeight):
         return "not_stored"
-    if dtype != mx.bfloat16:
+    if dtype not in STREAM_TYPES:
         return "stream_dtype"
+    if layer.out.scales.dtype != dtype:
+        return "scales_dtype"
     if conv.dynamic is not None or conv.size != 4:
         return "conv_form"
     if not 1 <= rows <= MAX_STORED_OUTPUT_ROWS:
@@ -421,7 +425,7 @@ def stored_output(layer, hg, x, state, visit):
 
     try:
         return affine_output(hg, layer.out, layer.convs[2], state.tail(visit, 2), x, layer.boundary,
-                             form=_static_form(layer.out.codes.shape[0], layer.convs[2].size))
+                             form=_static_form(layer.out.codes.shape[0], layer.convs[2].size, hg.dtype))
     except RuntimeError:
         return None
 
@@ -643,16 +647,16 @@ def row_stable_read(panel, closed, x, queries, eps, normalize):
 
 def affine_head(model, hidden):
     """``Model.head`` on affine codes with the product as lane L1's row-stable launch, one launch at
-    any width: a bf16 hidden is widened to float32 inside the launch (``vocabulary_logits`` casts it
-    to the model's dtype, then float32, and MLX's product then widens the bf16 scales and biases: three
-    launches that change no value), the same vocabulary slice and soft cap, so every row equals the
-    one-row head. Raises ``RuntimeError`` where the launch refuses (its first use per shape is proven
-    on this Mac against MLX's one-row product)."""
-    from .qproduct import affine_product
+    any width: a 16-bit hidden (bf16, float16 on the FP16 packs) is widened to float32 inside the launch
+    (``vocabulary_logits`` casts it to the model's dtype, then float32, and MLX's product then widens the
+    16-bit scales and biases: three launches that change no value), the same vocabulary slice and soft
+    cap, so every row equals the one-row head. Raises ``RuntimeError`` where the launch refuses (its
+    first use per shape is proven on this Mac against MLX's one-row product)."""
+    from .qproduct import STREAM_TYPES, affine_product
 
     cap = model.config["final_logit_softcapping"]
     x = hidden.astype(model.embed_tokens.weight.dtype)
-    if x.dtype == mx.bfloat16:
+    if x.dtype in STREAM_TYPES:
         logits = affine_product(x, model.unembed, widen=True, one_row=True)
     else:
         logits = affine_product(x.astype(mx.float32), model.unembed, one_row=True)

@@ -15,8 +15,10 @@ embedding, 3; the stored head's input and scale casts, 3).
    every width the step serves. The FP16 siblings' known gaps are listed exactly (a ratchet: a new gap
    fails, and so does a closed gap left on the list).
 2. Launches (Metal and the native engine, synthetic tensors with the real shapes): the stages whose
-   weights differ by pack, stage C, the head and the embedding, take no more launches on the stored
-   forms than on the 16-bit form, counted exactly by the engine's recorder at 1, 4 and 8 rows.
+   weights differ by pack, stage C, the head and the embedding, take no more launches, and no more of
+   MLX's own kernels (stock launches: any kernel that is not one of ours), on the stored forms than on
+   the 16-bit form, on a bf16 and on a float16 stream, counted exactly by the engine's recorder. Stage C
+   takes no stock launch on any form.
 """
 
 from types import SimpleNamespace
@@ -52,17 +54,11 @@ SHIPPED = {
 }
 VISITS = len(layer_visits(CONFIG))
 # The FP16 siblings' open gaps (lanes/X1.md: lane L1's stage A and MLP read and the expert block round
-# to bf16, so a float16 stream takes the reference for those stages; their stored scales are float16,
-# which the stored-code launches do not read). Offered only behind INKLING_LEGACY_OFFER (off).
-KNOWN_FP16_GAPS = {
-    "bare-speed": {"fallback.a.stream_dtype": VISITS, "fallback.d.stream_dtype": VISITS,
-                   "fallback.experts.dtype": VISITS, "fallback.bc_output.packed_4bit": VISITS,
-                   "fallback.embed.scales_not_bf16": 1},
-    "speed": {"fallback.a.stream_dtype": VISITS, "fallback.d.stream_dtype": VISITS,
-              "fallback.experts.dtype": VISITS, "fallback.bc_output.packed_8bit": VISITS},
-    "quality": {"fallback.a.stream_dtype": VISITS, "fallback.d.stream_dtype": VISITS,
-                "fallback.experts.dtype": VISITS},
-}
+# to bf16, so a float16 stream takes the reference for those stages). Offered only behind
+# INKLING_LEGACY_OFFER (off). Stage C, the head and the embedding read float16 stored forms.
+_FP16_GAPS = {"fallback.a.stream_dtype": VISITS, "fallback.d.stream_dtype": VISITS,
+              "fallback.experts.dtype": VISITS}
+KNOWN_FP16_GAPS = {"bare-speed": _FP16_GAPS, "speed": _FP16_GAPS, "quality": _FP16_GAPS}
 WIDTHS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32)
 
 
@@ -143,8 +139,7 @@ def test_every_stage_of_every_pack_takes_its_fused_route(pack):
             if rows > 32:
                 continue
             assert gaps == want, (pack, rows, found)
-            if stream == "bfloat16":
-                assert not heads, (pack, rows, heads)
+            assert not heads, (pack, rows, heads)
     finally:
         mx.set_default_device(previous)
 
@@ -159,7 +154,10 @@ def _engine():
 
 
 def _launches(eng, fn):
-    out = fn()  # first use: the routes' proofs run here, outside the recording
+    """``(launches, stock launches)`` of one call after its first use (the routes' proofs run there,
+    outside the recording). A stock launch is one of MLX's own kernels: any kernel not built from our
+    source (``mx.fast.metal_kernel`` names ours ``custom_kernel_mtplx_...``)."""
+    out = fn()
     mx.eval(out)
     eng.record_begin(label="parity")
     try:
@@ -167,25 +165,31 @@ def _launches(eng, fn):
         mx.eval(out)
     finally:
         trace = eng.record_end()
-    return trace.launches
+    stock = sum(n for name, n in trace.kernel_counts().items() if not name.startswith("custom_kernel_mtplx_"))
+    return trace.launches, stock
 
 
-def _affine(rows, cols, bits, seed):
-    w = (mx.random.normal((rows, cols), key=mx.random.key(seed)) * 0.02).astype(mx.bfloat16)
+STREAMS = (mx.bfloat16, mx.float16)
+
+
+def _affine(rows, cols, bits, seed, dtype=mx.bfloat16):
+    """A stored matrix as the packs keep it: its scales and biases in the stream's 16-bit type."""
+    w = (mx.random.normal((rows, cols), key=mx.random.key(seed)) * 0.02).astype(dtype)
     codes, scales, biases = mx.quantize(w, group_size=64, bits=bits)
     mx.eval(codes, scales, biases)
     return AffineWeight(codes, scales, biases, bits, 64)
 
 
 @needs_metal
+@pytest.mark.parametrize("dtype", STREAMS, ids=str)
 @pytest.mark.parametrize("rows", [1, 4, 8])
-def test_stage_c_takes_one_launch_on_every_storage_form(rows, monkeypatch):
+def test_stage_c_takes_one_launch_on_every_storage_form(rows, dtype, monkeypatch):
     from mtplx.models.inkling.fast import attend as fast_attend
     from mtplx.models.inkling.fast import step
 
     eng = _engine()
-    hg = (mx.random.normal((1, rows, 3072), key=mx.random.key(1)) * 0.5).astype(mx.bfloat16)
-    x = mx.random.normal((1, rows, HIDDEN), key=mx.random.key(2)).astype(mx.bfloat16)
+    hg = (mx.random.normal((1, rows, 3072), key=mx.random.key(1)) * 0.5).astype(dtype)
+    x = mx.random.normal((1, rows, HIDDEN), key=mx.random.key(2)).astype(dtype)
     tail = mx.random.normal((1, 3, HIDDEN), key=mx.random.key(3))
     conv_weight = mx.contiguous(mx.random.normal((HIDDEN, 4), key=mx.random.key(4)) * 0.3).T
     mx.eval(hg, x, tail, conv_weight)
@@ -194,46 +198,60 @@ def test_stage_c_takes_one_launch_on_every_storage_form(rows, monkeypatch):
     a = SimpleNamespace(q=None, rel=None, sink=None, gate_logits=None, k_rows=None, v_rows=None)
     monkeypatch.setattr(step, "attention_reason", lambda dtype=None: None)
     monkeypatch.setattr(fast_attend, "attend", lambda *args, **kw: hg)
-    dense = (mx.random.normal((HIDDEN, 3072), key=mx.random.key(5)) * 0.02).astype(mx.bfloat16)
+    dense = (mx.random.normal((HIDDEN, 3072), key=mx.random.key(5)) * 0.02).astype(dtype)
     mx.eval(dense)
     counts = {}
-    for form, out in (("16-bit", dense), ("4-bit", _affine(HIDDEN, 3072, 4, 6)), ("8-bit", _affine(HIDDEN, 3072, 8, 7))):
+    for form, out in (("16-bit", dense), ("4-bit", _affine(HIDDEN, 3072, 4, 6, dtype)),
+                      ("8-bit", _affine(HIDDEN, 3072, 8, 7, dtype))):
         convs = [SimpleNamespace(dynamic=None, size=4, weight=conv_weight) for _ in range(4)]
         layer = SimpleNamespace(sliding=True, boundary=False, out=out, convs=convs, rel_basis=None)
         counts[form] = _launches(eng, lambda layer=layer: step.fused_attention(layer, a, x, state, 3, panel))
-    assert counts["4-bit"] <= counts["16-bit"] and counts["8-bit"] <= counts["16-bit"], counts
+    assert all(n <= counts["16-bit"][0] for n, _ in counts.values()), counts
+    assert all(stock == 0 for _, stock in counts.values()), counts
+
+
+def _head_model(unembed, dtype):
+    from mtplx.models.inkling.model import Model
+
+    model = SimpleNamespace(unembed=unembed, embed_tokens=SimpleNamespace(weight=Meta((32768, HIDDEN), dtype)),
+                            config={"final_logit_softcapping": 30.0, "unpadded_vocab_size": 32000})
+    model.head = lambda h: Model.head(model, h)
+    return model
 
 
 @needs_metal
+@pytest.mark.parametrize("dtype", STREAMS, ids=str)
 @pytest.mark.parametrize("rows", [1, 2, 4, 8])
-def test_a_stored_head_takes_the_launches_of_a_16_bit_one(rows):
-    """The 16-bit head is one vocabulary launch plus the soft cap's three; a stored head is the same at
-    every width (the bf16 rows widened inside the product launch, no cast and no widened scale copies)."""
+def test_a_stored_head_takes_the_launches_of_a_16_bit_one(rows, dtype):
+    """A stored head takes the 16-bit head's launches at every width: the 16-bit rows widened inside
+    the product launch, no cast and no widened scale copies."""
     from mtplx.models.inkling.fast import step
 
     eng = _engine()
-    hidden = mx.random.normal((1, rows, HIDDEN), key=mx.random.key(8)).astype(mx.bfloat16)
-    mx.eval(hidden)
-    allowed = 4
+    hidden = mx.random.normal((1, rows, HIDDEN), key=mx.random.key(8)).astype(dtype)
+    dense = (mx.random.normal((32768, HIDDEN), key=mx.random.key(9)) * 0.02).astype(dtype)
+    mx.eval(hidden, dense)
+    native = _head_model(dense, dtype)
+    launches, stock = _launches(eng, lambda: step.row_stable_head(native, hidden))
     for bits in (4, 8):
-        model = SimpleNamespace(unembed=_affine(32768, HIDDEN, bits, 9 + bits),
-                                embed_tokens=SimpleNamespace(weight=Meta((32768, HIDDEN), mx.bfloat16)),
-                                config={"final_logit_softcapping": 30.0, "unpadded_vocab_size": 32000})
-        assert _launches(eng, lambda model=model: step.row_stable_head(model, hidden)) <= allowed, bits
+        model = _head_model(_affine(32768, HIDDEN, bits, 9 + bits, dtype), dtype)
+        got = _launches(eng, lambda model=model: step.row_stable_head(model, hidden))
+        assert got[0] <= launches and got[1] <= stock, (bits, got, (launches, stock))
 
 
 @needs_metal
+@pytest.mark.parametrize("dtype", STREAMS, ids=str)
 @pytest.mark.parametrize("rows", [1, 4])
-def test_a_stored_embedding_takes_the_launches_of_a_16_bit_one(rows):
+def test_a_stored_embedding_takes_the_launches_of_a_16_bit_one(rows, dtype):
     from mtplx.models.inkling.fast import step
     from mtplx.models.inkling.model import Embedding
 
     eng = _engine()
-    gain = mx.ones((HIDDEN,), mx.bfloat16)
-    dense = (mx.random.normal((32768, HIDDEN), key=mx.random.key(11)) * 0.02).astype(mx.bfloat16)
+    gain = mx.ones((HIDDEN,), dtype)
+    dense = (mx.random.normal((32768, HIDDEN), key=mx.random.key(11)) * 0.02).astype(dtype)
     mx.eval(dense, gain)
     ids = mx.array([[5, 32767, 77, 1024][:rows]], mx.int32)
     native = SimpleNamespace(embed_tokens=Embedding(dense, gain, 1e-6))
-    packed = SimpleNamespace(embed_tokens=Embedding(_affine(32768, HIDDEN, 4, 12), gain, 1e-6))
-    assert (_launches(eng, lambda: step.embed(packed, ids))
-            <= _launches(eng, lambda: step.embed(native, ids)))
+    packed = SimpleNamespace(embed_tokens=Embedding(_affine(32768, HIDDEN, 4, 12, dtype), gain, 1e-6))
+    got, want = _launches(eng, lambda: step.embed(packed, ids)), _launches(eng, lambda: step.embed(native, ids))
+    assert got[0] <= want[0] and got[1] <= want[1], (got, want)

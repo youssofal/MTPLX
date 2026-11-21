@@ -1,12 +1,14 @@
 """Row-stable products of affine-coded matrices (the Bare Speed pack's output projection and
 vocabulary head; any 4- or 8-bit matrix in MLX's layout), one launch for a panel of rows.
 
-``affine_product(x, weight)``: ``x`` ``(..., K)`` bf16 or float32 with ``W`` rows (the head takes
-float32, as ``head.vocabulary_logits`` feeds it; the output projection bf16), ``weight`` an affine
-weight (``precision.AffineWeight``: uint32 codes ``(N, K * bits / 32)``, bf16 scales and biases
-``(N, K / group)``). Returns ``(..., N)`` in ``x``'s dtype whose every row equals, bit for bit, MLX
-0.32.2's one-row ``mx.quantized_matmul`` of that row (for float32 inputs MLX casts the scales and
-biases to float32 first, two extra launches; here they are read as bf16, the same values). MLX's own product of 2 to 24 rows does not
+``affine_product(x, weight)``: ``x`` ``(..., K)`` in the stream's 16-bit type (bf16, or float16 on
+the FP16 packs) or float32 with ``W`` rows (the head takes float32, as ``head.vocabulary_logits``
+feeds it; the output projection the stream's type), ``weight`` an affine weight
+(``precision.AffineWeight``: uint32 codes ``(N, K * bits / 32)``, 16-bit scales and biases
+``(N, K / group)`` of the stream's type). Returns ``(..., N)`` in ``x``'s dtype whose every row equals,
+bit for bit, MLX 0.32.2's one-row ``mx.quantized_matmul`` of that row (for float32 inputs MLX casts the
+scales and biases to float32 first, two extra launches; here they are read in their 16-bit type, the
+same values). MLX's own product of 2 to 24 rows does not
 (``affine_qmv_wide`` from M3 on, another order), so a verify panel through MLX differs from the
 one-row step; through this launch it does not. One row takes MLX's own product (the reference).
 
@@ -56,11 +58,12 @@ inline void widen(P v, thread float* out) {
 }
 
 // MLX's one-row affine product for output rows [row0, row0 + NROW) and W panel rows of x (row r at
-// x + r * x_stride; bf16 or float, as the reference product takes it), every lane of the calling
-// simdgroup together, through affine_lane. result[r][ro] ends in every lane.
-template <int W, int NROW, int K, int BITS, int GROUP, int VPT, typename T>
-inline void qmv_rows(const device uint32_t* codes, const device bfloat16_t* scales,
-                     const device bfloat16_t* biases, const device T* x, int x_stride, int row0,
+// x + r * x_stride; 16-bit or float, as the reference product takes it; scales and biases S, the
+// stream's 16-bit type), every lane of the calling simdgroup together, through affine_lane.
+// result[r][ro] ends in every lane.
+template <int W, int NROW, int K, int BITS, int GROUP, int VPT, typename T, typename S>
+inline void qmv_rows(const device uint32_t* codes, const device S* scales,
+                     const device S* biases, const device T* x, int x_stride, int row0,
                      uint lane, thread float (&result)[W][NROW]) {
     constexpr int BLOCK = 32 * VPT, NB = K / BLOCK, WPR = K * BITS / 32, GPR = K / GROUP;
     for (int r = 0; r < W; ++r)
@@ -213,14 +216,23 @@ def qmv_constants(weight):
     vpt, why = lane_map(bits, n, k)
     if not why and (group not in (32, 64, 128) or k % group):
         why = f"group_{group}"
-    if not why and (weight.scales.dtype != mx.bfloat16 or weight.biases.dtype != mx.bfloat16):
-        why = "scales_not_bf16"
+    if not why and not _sixteen_bit(weight):
+        why = "scales_not_16bit"
     if why:
         raise RuntimeError(f"qmv_rows does not serve this matrix: {why}")
     return {"K": k, "BITS": bits, "GROUP": group, "VPT": vpt}
 
 
 _verdicts: dict = {}
+#: The 16-bit types a stream (and so a stored matrix's scales and biases) comes in: bf16, and float16
+#: on the FP16 packs (M1 and M2 Macs).
+STREAM_TYPES = (mx.bfloat16, mx.float16)
+
+
+def _sixteen_bit(weight):
+    """Scales and biases of one 16-bit stream type (the reference reads them as such; float32 inputs
+    see them widened, the same values)."""
+    return weight.scales.dtype in STREAM_TYPES and weight.biases.dtype == weight.scales.dtype
 
 
 def _same(a, b):
@@ -253,14 +265,15 @@ def _launch(x2, weight, rows, n, k, bits, group, vpt, *, threads=None, rch=None,
 
 
 def affine_product(x, weight, *, prove=True, widen=False, one_row=False, **tune):
-    """Every row of ``x`` (``(..., K)`` bf16 or float32) times the affine matrix ``weight`` (transposed, as
-    ``mx.quantized_matmul`` takes it), bit-identical to MLX's one-row product of that row.
+    """Every row of ``x`` (``(..., K)`` of the scales' 16-bit type, or float32) times the affine matrix
+    ``weight`` (transposed, as ``mx.quantized_matmul`` takes it), bit-identical to MLX's one-row product
+    of that row.
 
-    ``widen``: ``x`` is bf16 and the reference takes it as float32 (the head): each input is widened
+    ``widen``: ``x`` is 16-bit and the reference takes it as float32 (the head): each input is widened
     in the launch, the result is float32, every row equal to MLX's product of ``x.astype(float32)``
-    (which also widens the bf16 scales and biases to float32 in two launches of its own; here they are
-    read as bf16, the same values). ``one_row``: a single row takes this launch too (proven on its
-    first use like a panel) instead of MLX's product. Raises ``RuntimeError`` (counted) for a stored
+    (which also widens the 16-bit scales and biases to float32 in two launches of its own; here they
+    are read in their 16-bit type, the same values). ``one_row``: a single row takes this launch too
+    (proven on its first use like a panel) instead of MLX's product. Raises ``RuntimeError`` (counted) for a stored
     form this launch does not twin, or when this Mac's first use disagrees with MLX's one-row product."""
     from .attn_input import count_route
 
@@ -275,9 +288,10 @@ def affine_product(x, weight, *, prove=True, widen=False, one_row=False, **tune)
     if rows == 1 and not one_row:
         return mx.quantized_matmul(x.astype(mx.float32) if widen else x, codes, scales, biases, transpose=True,
                                    group_size=group, bits=bits)
-    if x.shape[-1] != k or x.dtype not in (mx.bfloat16, mx.float32) or (widen and x.dtype != mx.bfloat16):
+    if (x.shape[-1] != k or x.dtype not in (scales.dtype, mx.float32) or x.dtype not in (*STREAM_TYPES, mx.float32)
+            or (widen and x.dtype not in STREAM_TYPES)):
         count_route("refused:qproduct_input")
-        raise RuntimeError("affine_product serves bf16 or float32 inputs of the matrix's width")
+        raise RuntimeError("affine_product serves inputs of the matrix's width in its scales' type or float32")
     try:
         vpt = qmv_constants(weight)["VPT"]
     except RuntimeError as err:
@@ -324,10 +338,10 @@ def qmv_rows_probe(x, weight, rows_each=4, threads=64):
 _OUTPUT = """
     // Stage C on stored codes in one launch (the step's output_projection): the output projection of
     // every panel row in MLX's one-row product order (affine_lane, as the product launch above),
-    // rounded to bf16 as that product returns it; the attention's static short convolution over the
-    // committed tail with the reference kernel's arithmetic (short_conv, FORM as proven for this
-    // width); the residual in float32. A simdgroup owns four output channels for the whole panel,
-    // whose rows go in chunks of RCH.
+    // rounded to the stream's 16-bit type T as that product returns it; the attention's static short
+    // convolution over the committed tail with the reference kernel's arithmetic (short_conv, FORM as
+    // proven for this width and type), cast to T as it casts; the residual in float32. A simdgroup
+    // owns four output channels for the whole panel, whose rows go in chunks of RCH.
     constexpr uint NSG = THREADS / 32;
     constexpr int BLOCK = VPT * 32;
     constexpr int NB = K / BLOCK;                // blocks a row (K is a multiple of BLOCK)
@@ -360,7 +374,7 @@ _OUTPUT = """
                 float xt[RCH][VPT], tot[RCH];
                 for (uint r = 0; r < RCH; ++r) {
                     if (rc + r >= uint(W)) break;
-                    const device bfloat16_t* xs = hg + size_t(rc + r) * K + col;
+                    const device T* xs = hg + size_t(rc + r) * K + col;
                     if (SUMS) {
                         affine_lane::scaled<VPT, BITS>(xs, xt[r]);
                         tot[r] = lsum[((rc + r) * NB + b) * 32 + lane];
@@ -390,7 +404,7 @@ _OUTPUT = """
                 }
                 for (uint r = 0; r < RCH; ++r) {
                     if (rc + r >= uint(W)) break;
-                    const device bfloat16_t* xs = hg + size_t(rc + r) * K + col;
+                    const device T* xs = hg + size_t(rc + r) * K + col;
                     float xt[VPT];
                     float tot;
                     if (SUMS) {
@@ -419,7 +433,7 @@ _OUTPUT = """
                 if (rc + r >= uint(W)) break;
                 float v = acc[0][r];
                 for (uint ro = 1; ro < 4; ++ro) v = (ro == lane) ? acc[ro][r] : v;
-                const float a = static_cast<float>(static_cast<bfloat16_t>(v));
+                const float a = static_cast<float>(static_cast<T>(v));
                 seq[3 + r] = a;
                 attn[size_t(rc + r) * N + c] = a;
             }
@@ -433,7 +447,7 @@ _OUTPUT = """
                 }
                 const float total = seq[r + 3] + conv;
                 const float value = total / as_type<float>(uint(DIVISOR));
-                const float y = static_cast<float>(static_cast<bfloat16_t>(value));
+                const float y = static_cast<float>(static_cast<T>(value));
                 const size_t at = size_t(rc + r) * N + c;
                 partial[at] = BOUNDARY ? y : y + static_cast<float>(x[at]);
             }
@@ -474,19 +488,20 @@ def affine_output(hg, weight, conv, tail, x, boundary, *, form, prove=True, narr
     one launch: ``(partial (1, W, N) float32, attn (1, W, N) float32)``, every bit as the step's
     three launches give it (the product, the short convolution, the residual add).
 
-    ``hg`` ``(1, W, K)`` bf16; ``weight`` the affine output projection; ``conv`` the attention's
+    ``hg`` ``(1, W, K)`` in the stream's 16-bit type (bf16, or float16 on the FP16 packs: the matrix's
+    scales are of the same type); ``weight`` the affine output projection; ``conv`` the attention's
     static ``Convolution`` (size 4); ``tail`` its committed ``(1, 3, N)`` float32 rows or ``None``;
-    ``x`` the stage input ``(1, W, N)`` bf16 (unused on a boundary layer); ``form`` the static
-    convolution's proven form for this width (``attn_input._static_form``). Raises ``RuntimeError``
-    (counted) for a form it does not serve or when this Mac's first use disagrees."""
+    ``x`` the stage input ``(1, W, N)`` of the stream's type (unused on a boundary layer); ``form`` the
+    static convolution's proven form for this width and type (``attn_input._static_form``). Raises
+    ``RuntimeError`` (counted) for a form it does not serve or when this Mac's first use disagrees."""
     from .attn_input import count_route, f32_bits
 
     if conv.dynamic is not None or conv.size != 4 or form not in ("float", "fused"):
         count_route("refused:qoutput_conv")
         raise RuntimeError("affine_output serves the static four-tap convolution")
-    if hg.dtype != mx.bfloat16 or x.dtype != mx.bfloat16:
+    if hg.dtype not in STREAM_TYPES or x.dtype != hg.dtype or weight.scales.dtype != hg.dtype:
         count_route("refused:qoutput_dtype")
-        raise RuntimeError("affine_output serves bf16 streams")
+        raise RuntimeError("affine_output serves 16-bit streams whose type the matrix's scales share")
     try:
         c = qmv_constants(weight)
     except RuntimeError as err:
@@ -507,7 +522,8 @@ def affine_output(hg, weight, conv, tail, x, boundary, *, form, prove=True, narr
     partial, attn = _output_kernel()(
         inputs=[hg2, weight.codes, weight.scales, weight.biases, conv.weight.T,
                 tail if tail is not None else conv.weight.T, x2],
-        template=[("W", rows), ("K", k), ("N", n), ("BITS", c["BITS"]), ("G", c["GROUP"]), ("VPT", c["VPT"]),
+        template=[("T", hg.dtype), ("W", rows), ("K", k), ("N", n), ("BITS", c["BITS"]), ("G", c["GROUP"]),
+                  ("VPT", c["VPT"]),
                   ("THREADS", threads), ("RCH", rch), ("SUMS", sums), ("NARROW", narrow),
                   ("HAS_TAIL", tail is not None), ("BOUNDARY", bool(boundary)),
                   ("FORM", 0 if form == "float" else 1), ("DIVISOR", f32_bits(5 ** 0.5))],
@@ -518,7 +534,7 @@ def affine_output(hg, weight, conv, tail, x, boundary, *, form, prove=True, narr
     )
     partial, attn = partial.reshape(1, rows, n), attn.reshape(1, rows, n)
     if prove:
-        key = (n, k, c["BITS"], c["GROUP"], rows, tail is not None, bool(boundary), form)
+        key = (n, k, c["BITS"], c["GROUP"], rows, tail is not None, bool(boundary), form, str(hg.dtype))
         verdict = _output_verdicts.get(key)
         if verdict is None:
             from .. import short_conv
@@ -536,7 +552,7 @@ def affine_output(hg, weight, conv, tail, x, boundary, *, form, prove=True, narr
                 mx.eval(partial, attn, ref_partial, ref_attn)
                 verdict = _same(partial, ref_partial) and _same(attn, ref_attn.astype(mx.float32))
             _output_verdicts[key] = verdict
-            count_route(("proved:" if verdict else "refused:") + f"qoutput_{n}x{k}_b{c['BITS']}_w{rows}")
+            count_route(("proved:" if verdict else "refused:") + f"qoutput_{n}x{k}_b{c['BITS']}_w{rows}_{hg.dtype}")
         if not verdict:
             raise RuntimeError("affine_output disagreed with the step's three launches on this Mac")
     return partial, attn
@@ -599,16 +615,16 @@ def _rows_launch(ids, weight, form):
 
 def rows_reason(weight):
     """Why ``affine_rows`` does not serve this stored table, or None: 4- or 8-bit codes in whole groups
-    with bf16 scales and biases (the form proven against MLX's decode on a real table: Bare Speed's
-    embedding, every value of all 201,024 rows)."""
+    with 16-bit scales and biases of one type (bf16, float16 on the FP16 packs; the forms are proven
+    against MLX's decode on a real table: Bare Speed's embedding, every value of all 201,024 rows)."""
     bits, group = int(weight.bits), int(weight.group_size)
     cols = weight.codes.shape[-1] * 32 // bits if bits else 0
     if bits not in (4, 8):
         return f"bits_{bits}"
     if group not in (32, 64, 128) or cols % group:
         return f"group_{group}"
-    if weight.scales.dtype != mx.bfloat16 or weight.biases.dtype != mx.bfloat16:
-        return "scales_not_bf16"
+    if not _sixteen_bit(weight):
+        return "scales_not_16bit"
     return None
 
 
@@ -642,7 +658,8 @@ def affine_rows(ids, weight, *, prove=True, form=None):
                 form = candidate
                 break
         _rows_verdicts[key] = form
-        count_route(("proved:" if form >= 0 else "refused:") + f"affine_rows_{vocab}x{cols}_b{bits}")
+        count_route(("proved:" if form >= 0 else "refused:")
+                    + f"affine_rows_{vocab}x{cols}_b{bits}_{weight.scales.dtype}")
     if form is None or form < 0:
         raise RuntimeError("affine_rows did not match MLX's decode on this Mac")
     return _rows_launch(ids, weight, form)

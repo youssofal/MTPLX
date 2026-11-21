@@ -480,10 +480,10 @@ def propose(drafter, target, anchor, view: DraftView, count_: int, *, position, 
         # 1.9 ms at 8 rows); fed float32, as the verify's head is (a bf16 row widened inside the
         # launch: the same values, no cast launch). Where it refuses (a stored form it does not take,
         # a failed first-use proof on this Mac), MLX's product, counted.
-        from .qproduct import affine_product
+        from .qproduct import STREAM_TYPES, affine_product
 
         try:
-            if h.dtype == mx.bfloat16:
+            if h.dtype in STREAM_TYPES:
                 base = affine_product(h, target.unembed, widen=True)[..., : drafter.vocab]
             else:
                 base = affine_product(h.astype(mx.float32), target.unembed)[..., : drafter.vocab]
