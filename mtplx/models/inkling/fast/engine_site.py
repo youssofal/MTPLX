@@ -118,6 +118,15 @@ def round_inputs(state, ids):
     Inputs in the program's order: ``ids`` (W,) int32; ``pos``, ``newest``, ``count``
     uint32 scalars; then per visit its keys, values and four convolution tails.
     """
+    round_state, inputs = state_inputs(state)
+    if round_state is None:
+        return None, inputs
+    return round_state, [ids, *inputs]
+
+
+def state_inputs(state):
+    """``(RoundState, inputs)`` without the ids (``pos``, ``newest``, ``count``, then per
+    visit keys, values and four tails), or ``(None, reason)``."""
     window = state.window
     newest = None
     for visit, local in enumerate(state.local):
@@ -132,7 +141,7 @@ def round_inputs(state, ids):
     pos = mx.array(length, mx.uint32)
     newest_a = mx.array(0 if newest is None else newest, mx.uint32)
     count_a = mx.array(min(length, window), mx.uint32)
-    inputs = [ids, pos, newest_a, count_a]
+    inputs = [pos, newest_a, count_a]
     for visit in range(len(state.local)):
         kv, conv = state.cache[2 * visit], state.cache[2 * visit + 1]
         tails = conv.cache if hasattr(conv, "cache") else [conv[s] for s in range(4)]
@@ -331,9 +340,12 @@ def warm(rt, widths=None, *, length: int = 1100, seed: int = 20261121, stages=No
             mx.eval(logits, captures, [d.arrays() for d in deltas])
             native += replay.counters["native"] - before
             del logits, captures, deltas
+        # The depth controller's cost table is timed once at load by
+        # ``decoder.measure_round_costs`` (whole rounds through this site): not again here.
         report["widths"][width] = {"calls": tries, "live": native > 0,
                                    "seconds": round(time.perf_counter() - entry_started, 3)}
     del state, cache
+    report["context_tokens"] = length
     report["seconds"] = round(time.perf_counter() - started, 3)
     report["site"] = replay.report()
     return report

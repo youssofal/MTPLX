@@ -400,6 +400,32 @@ def _chunks(vocab):
     return -(-vocab // CHUNK)
 
 
+_CONSTANTS: dict = {}
+
+
+def _const(values, dtype):
+    """A small array of fixed values the round's kernels read (sizes, per-row parameters,
+    modes), made once per value and kept for the process.
+
+    A fresh array per call is correct for MLX but not stable for a recording: MLX may hand
+    it a recycled buffer longer than the array, whose bytes past the array's end are left
+    from earlier work, and a recording snapshots the whole buffer, so two recordings of the
+    same round would differ and the native engine would (rightly) refuse the program. A kept
+    array lives in one buffer for good, and the replay sites pin it (``constants``)."""
+    key = (repr(values), str(dtype))
+    array = _CONSTANTS.get(key)
+    if array is None:
+        array = mx.array(values, dtype)
+        mx.eval(array)
+        _CONSTANTS[key] = array
+    return array
+
+
+def constants():
+    """Every kept constant of this module (pinned by a replay site before each recording)."""
+    return list(_CONSTANTS.values())
+
+
 @lru_cache(maxsize=None)
 def _kernel(name):
     if name == "stats":
@@ -451,8 +477,8 @@ def law_rows(scores, *, temperature=1.0, cap=0.0, write=None):
     scale = 1.0 if not temperature or temperature <= 0 else 1.0 / float(temperature)
     if write is None:
         write = not (scale == 1.0 and not cap and scores.dtype == mx.float32)
-    params = mx.array([v for _ in range(rows) for v in (scale, float(cap or 0.0))], mx.float32)
-    sizes = mx.array([vocab, _chunks(vocab)], mx.uint32)
+    params = _const([v for _ in range(rows) for v in (scale, float(cap or 0.0))], mx.float32)
+    sizes = _const([vocab, _chunks(vocab)], mx.uint32)
     law, stats = _kernel("stats")(
         inputs=[scores, params, sizes],
         template=[("THREADS", THREADS), ("PER_THREAD", PER_THREAD), ("WRITE", bool(write))],
@@ -488,10 +514,10 @@ def race(tlaw, tstats, *, modes, positions, seed, purpose, greedy=False, dlaw=No
     chunks = _chunks(vocab)
     k = 0 if proposals is None else int(proposals.shape[0])
     if dlaw is None:
-        dlaw, dstats = mx.zeros((1,), mx.float32), mx.zeros((1, 1, 2), mx.float32)
+        dlaw, dstats = _const([0.0], mx.float32), _const([[[0.0, 0.0]]], mx.float32)
     if proposals is None:
-        proposals = mx.zeros((1,), mx.int32)
-    sizes = mx.array([vocab, chunks, k], mx.uint32)
+        proposals = _const([0], mx.int32)
+    sizes = _const([vocab, chunks, k], mx.uint32)
     return _kernel("race")(
         inputs=[tlaw, tstats, dlaw, dstats, proposals.astype(mx.int32), modes, positions, seed,
                 sizes],
@@ -533,25 +559,25 @@ def decide(target_logits, proposals, *, position, seed, temperature=1.0, draft=N
     match = rule == "match" and not greedy
     point = draft is None or draft.point_mass or match
     mode = MODE_TARGET if match else (MODE_POINT if point else MODE_RESIDUAL)
-    modes = mx.array([mode] * k + [MODE_TARGET], mx.int32)
+    modes = _const([mode] * k + [MODE_TARGET], mx.int32)
     base = position if isinstance(position, mx.array) else mx.array(int(position), mx.uint32)
     positions = base.astype(mx.uint32).reshape(()) + mx.arange(rows, dtype=mx.uint32)
     seed_words = seed if isinstance(seed, mx.array) else _seed_words(seed)
-    props = proposals if proposals is not None else mx.zeros((0,), mx.int32)
+    props = proposals if proposals is not None else _const([], mx.int32)
     dlaw = None if point else draft.rows
     dstats = None if point else draft.stats
     race_parts, lse = race(tlaw, tstats, modes=modes, positions=positions, seed=seed_words,
                            purpose=PURPOSE_TARGET, greedy=greedy, dlaw=dlaw, dstats=dstats,
                            proposals=props if k else None)
-    sizes = mx.array([vocab, _chunks(vocab), k, rows], mx.uint32)
+    sizes = _const([vocab, _chunks(vocab), k, rows], mx.uint32)
     if offered is None:
-        offered = mx.array([k], mx.uint32)
+        offered = _const([k], mx.uint32)
     elif not isinstance(offered, mx.array):
-        offered = mx.array([int(offered)], mx.uint32)
+        offered = _const([int(offered)], mx.uint32)
     offered = offered.astype(mx.uint32).reshape(1)
     (packet,) = _kernel("decide")(
-        inputs=[race_parts, lse, tlaw, dlaw if dlaw is not None else mx.zeros((1,), mx.float32),
-                props.astype(mx.int32) if k else mx.zeros((1,), mx.int32), modes, positions,
+        inputs=[race_parts, lse, tlaw, dlaw if dlaw is not None else _const([0.0], mx.float32),
+                props.astype(mx.int32) if k else _const([0], mx.int32), modes, positions,
                 seed_words, sizes, offered],
         template=[("GREEDY", bool(greedy)), ("MATCH", bool(match))],
         grid=(THREADS, 1, 1),
@@ -593,7 +619,7 @@ def winners(race_parts):
     """The p-race winner of every row: (R,) int32."""
     rows, chunks, _ = race_parts.shape
     (out,) = _kernel("finish")(
-        inputs=[race_parts, mx.array([0, chunks], mx.uint32)],
+        inputs=[race_parts, _const([0, chunks], mx.uint32)],
         template=[("THREADS", THREADS)],
         grid=(32 * rows, 1, 1),
         threadgroup=(32, 1, 1),
@@ -608,7 +634,7 @@ def sample_rows(law, stats, *, positions, seed, purpose, greedy=False):
     per-row (max, log-sum) the draw used, (R, 4) float32 with columns [max, log-sum, 0, 0];
     the log-probability of token j is ``(law[j] - max) - logsum``."""
     rows = law.shape[0]
-    modes = mx.zeros((rows,), mx.int32)
+    modes = _const([0] * rows, mx.int32)
     seed_words = seed if isinstance(seed, mx.array) else _seed_words(seed)
     race_parts, lse = race(law, stats, modes=modes, positions=positions.astype(mx.uint32),
                            seed=seed_words, purpose=purpose, greedy=greedy)
