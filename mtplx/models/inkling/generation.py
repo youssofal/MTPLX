@@ -169,6 +169,11 @@ def generate(
     # it (a diagnostic rollback; round.decline.* counts every round the program does not serve).
     round_program_on = os.environ.get("MTPLX_INKLING_ROUND_PROGRAM", "on").strip().lower() not in (
         "0", "off", "false", "no")
+    # The committing round (lane L7): the program also walks its packet with the request's stop
+    # ids and remaining budget and writes the kept rows itself, so the host commits nothing.
+    # MTPLX_INKLING_ROUND_COMMIT=0 keeps the deciding round and the stock commit (diagnostic).
+    round_commit_on = os.environ.get("MTPLX_INKLING_ROUND_COMMIT", "on").strip().lower() not in (
+        "0", "off", "false", "no")
     round_seed = int(seed) if seed is not None else secrets.randbits(64)
     target_temperature = float(sampler.temperature or 0.0)
     draft_temperature = float(draft_sampler.temperature) if draft_sampler is not None else target_temperature
@@ -203,7 +208,12 @@ def generate(
     first_logprobs = None
 
     tape = RouteTape()
-    eval_rows, commit = settle_owner_work, rt.commit
+    eval_rows = settle_owner_work
+
+    def commit(cache, features, tapes, kept, total, done=False):
+        # done: a committing round already wrote its kept rows inside its program.
+        if not done:
+            rt.commit(cache, features, tapes, kept, total)
     if tape.enabled:
         tape.emit("route", "header", None, {
             "verify_core": "InklingRuntime.verify", "commit_core": "InklingRuntime.commit",
@@ -213,6 +223,7 @@ def generate(
             "mtp_history_policy": "cycle", "cache_class": type(cache[0]).__name__ if cache else None,
             "target_draw": ("device_ratio" if device_ok else ("draw_native" if native_draw else "_sample_from_logits")),
             "device_round_decline": device_decline,
+            "round_program": round_program_on, "round_commit": round_program_on and round_commit_on,
             "draft_clock": "host_submission", "verify_clock": "includes_pending_draft",
             "vision_splice": vision_splice is not None, "constraint_active": constraint is not None,
             "sampler": {"temperature": float(sampler.temperature), "top_p": float(sampler.top_p),
@@ -227,9 +238,10 @@ def generate(
             settle_owner_work(rows)
             scores_ready = perf_counter()
 
-        def commit(cache, features, tapes, kept, total):
+        def commit(cache, features, tapes, kept, total, done=False):
             commit_start = perf_counter()
-            rt.commit(cache, features, tapes, kept, total)
+            if not done:
+                rt.commit(cache, features, tapes, kept, total)
             committed = perf_counter()
             # A stop or cancellation can discard unexamined rows without rejecting a draft.
             offered, matched = total - 1, kept - 1
@@ -249,7 +261,7 @@ def generate(
                     for i in range(1, total)
                 ],
                 "bonus_token": len(emitted) > offered, "target_draws": len(emitted),
-                "commit_route": "capture_commit" if kept < total else "verify_retained",
+                "commit_route": ("in_round" if done else "capture_commit" if kept < total else "verify_retained"),
                 "committed_rows": kept, "kv_tail_rows_trimmed": total - kept,
                 "conv_tape_slots": slots, "conv_slots_restored": slots if kept < total else 0,
                 "draft_history": "Drafter.observe",
@@ -354,7 +366,8 @@ def generate(
             # is live (lane L7); otherwise the same round from the pieces below, same law.
             served = round_program.serve(rt, anchor, cache, min(selected_depth, remaining),
                                          position=position, seed=round_seed, temperature=target_temperature,
-                                         draft_temperature=draft_temperature)
+                                         draft_temperature=draft_temperature,
+                                         **({"stops": stop, "remaining": remaining} if round_commit_on else {}))
         if served is not None:
             block = proposed = served.block
             device_proposal_rounds += 1
@@ -454,7 +467,12 @@ def generate(
                 break
             if repeated or token in stop or (constraint and constraint.stopped):
                 break
-        commit(cache, features, tapes, kept, len(block))
+        committed_in_round = served is not None and served.committed
+        if committed_in_round and kept != served.kept:
+            # A cut the device cannot see (a cancellation, the opt-in repetition guard): the
+            # round's writes are undone and the stock commit writes the loop's count (counted).
+            served.rewind(kept)
+        commit(cache, features, tapes, kept, len(block), done=committed_in_round)
         if rows is not None:
             logits = rows[kept - 1][None, None]
         else:
