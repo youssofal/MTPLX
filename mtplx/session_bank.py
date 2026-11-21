@@ -2054,6 +2054,93 @@ class SessionBank:
                 best = entry
         return best
 
+    def session_streams(
+        self,
+        session_id: str | None,
+        *,
+        model_path: str,
+        prompt: list[int] | tuple[int, ...],
+        limit: int = 4,
+    ) -> list[tuple[int, ...]]:
+        """The stored entries of conversation ``session_id`` (RAM and the SSD
+        manifest) that share the longest prefix with ``prompt``, as token ids,
+        the longer first on a tie; [] when neither holds one. For a gate whose
+        conversation is not in the session registry (a restart, an idle
+        eviction) or whose registry stream is another branch of it: the ids it
+        may re-express a resent history in. Nothing is restored here.
+        """
+        if not session_id or limit < 1:
+            return []
+        tokens = as_token_tuple(prompt)
+        candidates = [
+            tuple(entry.token_ids)
+            for entry in list(self._entries.values())
+            if entry.session_id == session_id and entry.model_path == str(model_path)
+        ]
+        probe = getattr(self.cold_tier, "session_streams", None)
+        if callable(probe):
+            candidates += [
+                tuple(stream)
+                for stream in probe(session_id, model_path=str(model_path), prompt=tokens, limit=limit) or ()
+            ]
+        ranked = sorted(
+            {stream: None for stream in candidates if stream},
+            key=lambda stream: (common_prefix_len(tokens, stream), len(stream)),
+            reverse=True,
+        )
+        return ranked[:limit]
+
+    def session_stream(
+        self,
+        session_id: str | None,
+        *,
+        model_path: str,
+        prompt: list[int] | tuple[int, ...],
+    ) -> tuple[int, ...]:
+        """The first of ``session_streams``; () when there is none."""
+        streams = self.session_streams(session_id, model_path=model_path, prompt=prompt, limit=1)
+        return streams[0] if streams else ()
+
+    def shared_streams(
+        self,
+        prompt: list[int] | tuple[int, ...],
+        *,
+        model_path: str,
+        min_shared: int,
+        limit: int = 4,
+    ) -> list[tuple[int, ...]]:
+        """The stored entries of any conversation (RAM and the SSD manifest)
+        that share at least ``min_shared`` tokens with ``prompt``, as token
+        ids, the longest shared prefix first (the longer on a tie); [] when
+        none does. For a gate whose conversation has no stream under its own
+        id (``session_streams`` found none): a client that sends no session id
+        after a restart, a fork under a new id. Nothing is restored here.
+        """
+        if limit < 1:
+            return []
+        tokens = as_token_tuple(prompt)
+        floor = max(1, int(min_shared))
+        if len(tokens) < floor:
+            return []
+        candidates = [
+            tuple(entry.token_ids)
+            for entry in list(self._entries.values())
+            if entry.model_path == str(model_path) and len(entry.token_ids) >= floor
+        ]
+        probe = getattr(self.cold_tier, "shared_streams", None)
+        if callable(probe):
+            candidates += [
+                tuple(stream)
+                for stream in probe(tokens, model_path=str(model_path), min_shared=floor, limit=limit) or ()
+            ]
+        ranked = []
+        for stream in {stream: None for stream in candidates if stream}:
+            shared = common_prefix_len(tokens, stream)
+            if shared >= floor:
+                ranked.append((shared, len(stream), stream))
+        ranked.sort(key=lambda item: item[:2], reverse=True)
+        return [stream for _shared, _length, stream in ranked[:limit]]
+
     def cold_exact_prefix_len(
         self,
         token_ids: list[int] | tuple[int, ...],

@@ -1216,6 +1216,134 @@ class SessionBankColdTier:
             )
         return 0
 
+    def session_streams(
+        self,
+        session_id: str,
+        *,
+        model_path: str,
+        prompt: list[int] | tuple[int, ...],
+        limit: int = 4,
+    ) -> list[tuple[int, ...]]:
+        """This conversation's stored entries, as token ids, that share the
+        longest prefix with ``prompt`` (the longer entry first on a tie), read
+        from the manifest alone; [] when the conversation has none here.
+
+        The gate that re-expresses a resent history in the ids the model wrote
+        compares it with one of these when the session registry holds no
+        stream for the conversation (the server restarted, or it was evicted
+        idle) or holds another branch of it (a client that went back in its
+        history and continued elsewhere). Without them the history the client
+        sends leaves every stored entry at the first turn those ids differ from
+        a re-render. Only a probe: the restore that follows applies every
+        identity check of its own.
+        """
+        if self.mode in {"off", "write-only"} or not session_id or limit < 1:
+            return []
+        tokens = tuple(int(token) for token in prompt)
+        if not tokens:
+            return []
+        try:
+            with self._connect() as conn:
+                rows = list(
+                    conn.execute(
+                        "SELECT * FROM entries WHERE session_id = ? AND model_path = ? "
+                        "AND format_version = ?",
+                        (str(session_id), str(model_path), COLD_TIER_FORMAT_VERSION),
+                    ).fetchall()
+                )
+            return self._ranked_streams(rows, tokens, limit=limit)
+        except Exception as exc:
+            # A probe, like exact_prefix_len: the request goes on without it,
+            # and the restore reports its own result.
+            logger.warning(
+                "SessionBank SSD session-stream probe failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return []
+
+    def shared_streams(
+        self,
+        prompt: list[int] | tuple[int, ...],
+        *,
+        model_path: str,
+        min_shared: int,
+        limit: int = 4,
+    ) -> list[tuple[int, ...]]:
+        """Stored entries of any conversation that share at least
+        ``min_shared`` tokens with ``prompt``, as token ids, the longest shared
+        prefix first (the longer entry on a tie), read from the manifest
+        alone; [] when none does.
+
+        For a gate whose conversation has no stream under its own id: a client
+        that sends no session id (Hermes) gets a new one after a restart or an
+        idle eviction, and a client that forks a conversation names a new one.
+        Only a probe: the gate serves a turn from such a stream only where it
+        says exactly what the client sent, and the restore that follows
+        applies every identity check of its own.
+        """
+        if self.mode in {"off", "write-only"} or limit < 1:
+            return []
+        tokens = tuple(int(token) for token in prompt)
+        floor = max(1, int(min_shared))
+        if len(tokens) < floor:
+            return []
+        try:
+            with self._connect() as conn:
+                rows = list(
+                    conn.execute(
+                        "SELECT * FROM entries WHERE model_path = ? AND format_version = ? "
+                        "AND prefix_len >= ?",
+                        (str(model_path), COLD_TIER_FORMAT_VERSION, floor),
+                    ).fetchall()
+                )
+            return self._ranked_streams(rows, tokens, limit=limit, min_shared=floor)
+        except Exception as exc:
+            logger.warning(
+                "SessionBank SSD shared-stream probe failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return []
+
+    def _ranked_streams(
+        self,
+        rows: list[sqlite3.Row],
+        tokens: tuple[int, ...],
+        *,
+        limit: int,
+        min_shared: int = 0,
+    ) -> list[tuple[int, ...]]:
+        """The token ids of ``rows`` that share at least ``min_shared`` tokens
+        with ``tokens``, the longest shared prefix first, then the longer
+        entry, then the earlier row; at most ``limit``, no stream twice."""
+        ranked: list[tuple[int, int, int, array | tuple[int, ...]]] = []
+        for index, row in enumerate(rows):
+            ids = self._row_token_ids(row)
+            shared = common_prefix_len(tokens, ids)
+            if shared >= min_shared:
+                ranked.append((shared, len(ids), -index, ids))
+        ranked.sort(key=lambda item: item[:3], reverse=True)
+        streams: list[tuple[int, ...]] = []
+        for _matched, _length, _order, ids in ranked:
+            stream = tuple(ids)  # only the streams handed out are copied
+            if stream not in streams:
+                streams.append(stream)
+            if len(streams) >= limit:
+                break
+        return streams
+
+    def session_stream(
+        self,
+        session_id: str,
+        *,
+        model_path: str,
+        prompt: list[int] | tuple[int, ...],
+    ) -> tuple[int, ...]:
+        """The first of ``session_streams``; () when there is none."""
+        streams = self.session_streams(session_id, model_path=model_path, prompt=prompt, limit=1)
+        return streams[0] if streams else ()
+
     def lookup_prefix_boundary(
         self,
         token_ids: list[int] | tuple[int, ...],
@@ -3264,6 +3392,13 @@ class SessionBankColdTier:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_entries_token_hash "
                 "ON entries(token_hash)"
+            )
+            # session_stream reads one conversation's rows. session_id sits
+            # after token_ids_json in each row, so without an index the filter
+            # reads through every row's token list to reach it.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_entries_session "
+                "ON entries(session_id, model_path)"
             )
 
     def _archive_legacy_store_if_needed(self) -> None:
