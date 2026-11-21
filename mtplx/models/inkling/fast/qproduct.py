@@ -1,10 +1,12 @@
 """Row-stable products of affine-coded matrices (the Bare Speed pack's output projection and
 vocabulary head; any 4- or 8-bit matrix in MLX's layout), one launch for a panel of rows.
 
-``affine_product(x, weight)``: ``x`` ``(..., K)`` bf16 with ``W`` rows, ``weight`` an affine weight
-(``precision.AffineWeight``: uint32 codes ``(N, K * bits / 32)``, bf16 scales and biases
-``(N, K / group)``). Returns ``(..., N)`` bf16 whose every row equals, bit for bit, MLX 0.32.2's
-one-row ``mx.quantized_matmul`` of that row. MLX's own product of 2 to 24 rows does not
+``affine_product(x, weight)``: ``x`` ``(..., K)`` bf16 or float32 with ``W`` rows (the head takes
+float32, as ``head.vocabulary_logits`` feeds it; the output projection bf16), ``weight`` an affine
+weight (``precision.AffineWeight``: uint32 codes ``(N, K * bits / 32)``, bf16 scales and biases
+``(N, K / group)``). Returns ``(..., N)`` in ``x``'s dtype whose every row equals, bit for bit, MLX
+0.32.2's one-row ``mx.quantized_matmul`` of that row (for float32 inputs MLX casts the scales and
+biases to float32 first, two extra launches; here they are read as bf16, the same values). MLX's own product of 2 to 24 rows does not
 (``affine_qmv_wide`` from M3 on, another order), so a verify panel through MLX differs from the
 one-row step; through this launch it does not. One row takes MLX's own product (the reference).
 
@@ -41,8 +43,8 @@ _RCH = 8
 QMV_ROWS = """
 // MLX 0.32.2's load_vector for one lane's VPT values of a block (bf16 quartet sums in its order at
 // 4 bits, a running sum at 8; the 4-bit inputs pre-divided by 1, 16, 256, 4,096), into xt.
-template <int VPT, int BITS>
-inline float qmv_load(const device bfloat16_t* xs, thread float (&xt)[VPT]) {
+template <int VPT, int BITS, typename T>
+inline float qmv_load(const device T* xs, thread float (&xt)[VPT]) {
     float sum = 0;
     if (BITS == 4) {
         for (int i = 0; i < VPT; i += 4) {
@@ -62,8 +64,8 @@ inline float qmv_load(const device bfloat16_t* xs, thread float (&xt)[VPT]) {
 }
 
 // The same pre-scaled inputs without the sum (the caller has it).
-template <int VPT, int BITS>
-inline void qmv_inputs(const device bfloat16_t* xs, thread float (&xt)[VPT]) {
+template <int VPT, int BITS, typename T>
+inline void qmv_inputs(const device T* xs, thread float (&xt)[VPT]) {
     if (BITS == 4) {
         for (int i = 0; i < VPT; i += 4) {
             xt[i] = xs[i];
@@ -116,10 +118,11 @@ inline float qmv_term(const thread float (&xt)[VPT], float sum, const thread flo
 }
 
 // MLX's one-row affine product for output rows [row0, row0 + TM) and W panel rows of x (row r at
-// x + r * x_stride), every lane of the calling simdgroup together. result[r][tm] ends in every lane.
-template <int W, int TM, int K, int BITS, int GROUP, int VPT>
+// x + r * x_stride; bf16 or float, as the reference product takes it), every lane of the calling
+// simdgroup together. result[r][tm] ends in every lane.
+template <int W, int TM, int K, int BITS, int GROUP, int VPT, typename T>
 inline void qmv_rows(const device uint32_t* codes, const device bfloat16_t* scales,
-                     const device bfloat16_t* biases, const device bfloat16_t* x, int x_stride, int row0,
+                     const device bfloat16_t* biases, const device T* x, int x_stride, int row0,
                      uint lane, thread float (&result)[W][TM]) {
     constexpr int BLOCK = 32 * VPT, NB = K / BLOCK, WPR = K * BITS / 32, GPR = K / GROUP;
     for (int r = 0; r < W; ++r)
@@ -181,7 +184,7 @@ _SOURCE = """
             }
             for (uint r = 0; r < RCH; ++r) {
                 if (rc + r >= W) break;
-                const device bfloat16_t* xs = x + size_t(rc + r) * K + col;
+                const device T* xs = x + size_t(rc + r) * K + col;
                 float xt[VPT];
                 float sum;
                 if (SUMS) {
@@ -198,7 +201,7 @@ _SOURCE = """
         if (lane == 0) {
             for (uint r = 0; r < RCH && rc + r < W; ++r)
                 for (uint tm = 0; tm < 4; ++tm)
-                    if (row0 + tm < N) out[size_t(rc + r) * N + row0 + tm] = static_cast<bfloat16_t>(acc[tm][r]);
+                    if (row0 + tm < N) out[size_t(rc + r) * N + row0 + tm] = static_cast<T>(acc[tm][r]);
         }
     }
 """
@@ -212,7 +215,7 @@ _PROBE = """
     qmv_rows<W, TM, K, BITS, G, VPT>(codes, scales, biases, x, K, row0, lane, result);
     if (lane == 0)
         for (int r = 0; r < W; ++r)
-            for (int tm = 0; tm < TM; ++tm) out[size_t(r) * N + row0 + tm] = static_cast<bfloat16_t>(result[r][tm]);
+            for (int tm = 0; tm < TM; ++tm) out[size_t(r) * N + row0 + tm] = static_cast<T>(result[r][tm]);
 """
 
 
@@ -259,7 +262,8 @@ _verdicts: dict = {}
 
 
 def _same(a, b):
-    return a.shape == b.shape and bool(mx.array_equal(a.view(mx.uint16), b.view(mx.uint16)).item())
+    view = {2: mx.uint16, 4: mx.uint32}[a.dtype.size]
+    return a.shape == b.shape and a.dtype == b.dtype and bool(mx.array_equal(a.view(view), b.view(view)).item())
 
 
 def _launch(x2, weight, rows, n, k, bits, group, vpt, *, threads=None, rch=None, sums=None):
@@ -270,17 +274,17 @@ def _launch(x2, weight, rows, n, k, bits, group, vpt, *, threads=None, rch=None,
     rows_per_group = threads // 32 * 4
     return _kernel("product")(
         inputs=[x2, weight.codes, weight.scales, weight.biases],
-        template=[("W", rows), ("K", k), ("N", n), ("BITS", bits), ("G", group), ("VPT", vpt),
+        template=[("T", x2.dtype), ("W", rows), ("K", k), ("N", n), ("BITS", bits), ("G", group), ("VPT", vpt),
                   ("RCH", rch), ("THREADS", threads), ("SUMS", sums)],
         grid=(-(-n // rows_per_group) * threads, 1, 1),
         threadgroup=(threads, 1, 1),
         output_shapes=[(rows, n)],
-        output_dtypes=[mx.bfloat16],
+        output_dtypes=[x2.dtype],
     )[0]
 
 
 def affine_product(x, weight, *, prove=True, **tune):
-    """Every row of ``x`` (``(..., K)`` bf16) times the affine matrix ``weight`` (transposed, as
+    """Every row of ``x`` (``(..., K)`` bf16 or float32) times the affine matrix ``weight`` (transposed, as
     ``mx.quantized_matmul`` takes it), bit-identical to MLX's one-row product of that row.
     Raises ``RuntimeError`` (counted) for a stored form this launch does not twin, or when this
     Mac's first use disagrees with MLX's one-row product."""
@@ -296,9 +300,9 @@ def affine_product(x, weight, *, prove=True, **tune):
         rows *= d
     if rows == 1:
         return mx.quantized_matmul(x, codes, scales, biases, transpose=True, group_size=group, bits=bits)
-    if x.shape[-1] != k or x.dtype != mx.bfloat16:
+    if x.shape[-1] != k or x.dtype not in (mx.bfloat16, mx.float32):
         count_route("refused:qproduct_input")
-        raise RuntimeError("affine_product serves bf16 inputs of the matrix's width")
+        raise RuntimeError("affine_product serves bf16 or float32 inputs of the matrix's width")
     try:
         vpt = qmv_constants(weight)["VPT"]
     except RuntimeError as err:
@@ -307,7 +311,7 @@ def affine_product(x, weight, *, prove=True, **tune):
     x2 = x.reshape(rows, k)
     out = _launch(x2, weight, rows, n, k, bits, group, vpt, **tune)
     if prove:
-        key = (n, k, bits, group, rows)
+        key = (n, k, bits, group, rows, x2.dtype)
         verdict = _verdicts.get(key)
         if verdict is None:
             picks = sorted({0, rows - 1})
@@ -316,7 +320,7 @@ def affine_product(x, weight, *, prove=True, **tune):
             mx.eval(out, want)
             verdict = all(_same(out[r:r + 1], w) for r, w in zip(picks, want))
             _verdicts[key] = verdict
-            count_route(("proved:" if verdict else "refused:") + f"qproduct_{n}x{k}_b{bits}_w{rows}")
+            count_route(("proved:" if verdict else "refused:") + f"qproduct_{n}x{k}_b{bits}_w{rows}_{x2.dtype}")
         if not verdict:
             raise RuntimeError("affine_product disagreed with MLX's one-row product on this Mac")
     return out.reshape(*lead, n)
@@ -333,10 +337,10 @@ def qmv_rows_probe(x, weight, tm=4, threads=64):
     per_group = threads // 32 * tm
     return _kernel("probe")(
         inputs=[x, weight.codes, weight.scales, weight.biases],
-        template=[("W", rows), ("TM", tm), ("K", c["K"]), ("N", n), ("BITS", c["BITS"]), ("G", c["GROUP"]),
-                  ("VPT", c["VPT"]), ("THREADS", threads)],
+        template=[("T", x.dtype), ("W", rows), ("TM", tm), ("K", c["K"]), ("N", n), ("BITS", c["BITS"]),
+                  ("G", c["GROUP"]), ("VPT", c["VPT"]), ("THREADS", threads)],
         grid=(-(-n // per_group) * threads, 1, 1),
         threadgroup=(threads, 1, 1),
         output_shapes=[(rows, n)],
-        output_dtypes=[mx.bfloat16],
+        output_dtypes=[x.dtype],
     )[0]
