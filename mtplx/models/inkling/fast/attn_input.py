@@ -90,6 +90,9 @@ _THREADS = 512
 #: Gate rows a gate threadgroup projects.
 _GATE_ROWS = 32
 #: Panel rows one simdgroup accumulates at once (wider panels loop, re-reading cached weights).
+#: Panels of 5 to 7 rows take the full chunk too, the rows past the panel skipped: an odd or short
+#: chunk compiled to a much slower loop (7 rows: window first pass 131.6 -> 67.1 µs, loop pass
+#: 139.1 -> 85.4; 6 rows: 78.8 -> 63.8 and 89.5 -> 64.2; receipts/rch-1.json), bits unchanged.
 _ROW_CHUNK = 8
 #: Stage each threadgroup's input in threadgroup memory (whole panel when it fits, else in chunks).
 _STAGE = True
@@ -860,7 +863,7 @@ class Projected(NamedTuple):
 
 
 def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", threads=None, gate_rows=None,
-            stage=None):
+            stage=None, rch=None):
     """Every projection of one visit and its epilogues, for a panel, in one launch.
 
     ``sources``: ``(W, NS, D)`` bf16 normed inputs (``NS`` 1: q = k = v input; 3: q, k, v
@@ -941,7 +944,7 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
     # its input in every simdgroup; a wider first-pass panel reads its bf16 input from device memory,
     # which measured faster than chunked staging (receipts/probe-mode-1.json: 86 vs 104 us at 8 rows).
     stage2 = bool(raw is not None and not stage)
-    chunk = min(rows, _ROW_CHUNK)
+    chunk = rch or (_ROW_CHUNK if rows > 4 else rows)
     # Chunks hold whole 256-column blocks when an affine matrix reads them.
     unit = 256 if any(m.bits != 16 for m in (mq, mr, mg, mk, mv)) else 128
     kc = max(unit, min(width, ((31 * 1024 - out_bytes) // (chunk * 2)) // unit * unit))
@@ -959,7 +962,7 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
             ("KC", kc), ("GLOBAL", global_visit),
             ("D", width), ("QH", q_heads), ("HD", head_dim), ("RD", rel_dim),
             ("KH", kv_heads), ("KN", kv_width), ("GN", gate_rows), ("GROWS", gate_rows_unit),
-            ("TAPS", taps), ("RCH", min(rows, _ROW_CHUNK)), ("THREADS", threads),
+            ("TAPS", taps), ("RCH", chunk), ("THREADS", threads),
             ("HAS_TAIL", has_tail), ("FORM", 0 if form == "float" else 1), ("CONV_CM", conv_cm),
             ("QB", mq.bits), ("QG", mq.group), ("RB", mr.bits), ("RG", mr.group),
             ("GB", mg.bits), ("GG", mg.group), ("KB", mk.bits), ("KG", mk.group),
