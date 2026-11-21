@@ -15,8 +15,8 @@ needs = pytest.mark.skipif(not mx.metal.is_available(), reason="needs a Metal GP
 
 
 class _Affine:
-    def __init__(self, rows, cols, bits, group, seed):
-        w = mx.random.normal((rows, cols), key=mx.random.key(seed)).astype(mx.bfloat16) * 0.02
+    def __init__(self, rows, cols, bits, group, seed, dtype="bfloat16"):
+        w = mx.random.normal((rows, cols), key=mx.random.key(seed)).astype(getattr(mx, dtype)) * 0.02
         self.codes, self.scales, self.biases = mx.quantize(w, group_size=group, bits=bits)
         self.bits, self.group_size = bits, group
 
@@ -101,3 +101,22 @@ def test_head_logits_in_one_launch_equal_the_sliced_capped_product(width, cap):
         want = m.one_row(x[:, r:r + 1])[..., :vocab]
         want = mx.tanh(want / cap) * cap if cap else want
         assert _bits(got[:, r:r + 1], want), (width, r)
+
+
+@needs
+@pytest.mark.parametrize("shape", [(2304, 3072, 4, 64), (8200, 2304, 4, 64), (8192, 2304, 8, 32)])
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
+def test_fp16_packs_every_panel_row_equals_the_one_row_product(shape, dtype):
+    """The FP16 sibling packs: float16 scales and biases, float16 stream (the head takes float32)."""
+    from mtplx.models.inkling.fast.qproduct import affine_product
+
+    rows, cols, bits, group = shape
+    m = _Affine(rows, cols, bits, group, seed=rows + bits + 1, dtype="float16")
+    assert m.scales.dtype == mx.float16
+    for width in (1, 2, 4, 8):
+        x = mx.random.normal((1, width, cols), key=mx.random.key(width + 9)).astype(mx.float16)
+        x = x.astype(getattr(mx, dtype))
+        got = affine_product(x, m)
+        assert got.dtype == x.dtype and got.shape == (1, width, rows)
+        for r in range(width):
+            assert _bits(got[:, r:r + 1], m.one_row(x[:, r:r + 1])), (width, r)

@@ -1,12 +1,13 @@
 """Row-stable products of affine-coded matrices (the Bare Speed pack's output projection and
 vocabulary head; any 4- or 8-bit matrix in MLX's layout), one launch for a panel of rows.
 
-``affine_product(x, weight)``: ``x`` ``(..., K)`` bf16 or float32 with ``W`` rows (the head takes
+``affine_product(x, weight)``: ``x`` ``(..., K)`` bf16, float16 or float32 with ``W`` rows (the head takes
 float32, as ``head.vocabulary_logits`` feeds it; the output projection bf16), ``weight`` an affine
 weight (``precision.AffineWeight``: uint32 codes ``(N, K * bits / 32)``, bf16 scales and biases
 ``(N, K / group)``). Returns ``(..., N)`` in ``x``'s dtype whose every row equals, bit for bit, MLX
 0.32.2's one-row ``mx.quantized_matmul`` of that row (for float32 inputs MLX casts the scales and
-biases to float32 first, two extra launches; here they are read as bf16, the same values). MLX's own product of 2 to 24 rows does not
+biases to float32 first, two extra launches; here they are read in their stored type, bf16 or float16 (the
+FP16 sibling packs), the same values). MLX's own product of 2 to 24 rows does not
 (``affine_qmv_wide`` from M3 on, another order), so a verify panel through MLX differs from the
 one-row step; through this launch it does not. One row takes this launch too (``_ONE_ROW``), proven
 like every width; where it refuses, MLX's product (the reference at one row), counted.
@@ -219,8 +220,8 @@ def qmv_constants(weight):
     vpt, why = lane_map(bits, n, k)
     if not why and (group not in (32, 64, 128) or k % group):
         why = f"group_{group}"
-    if not why and (weight.scales.dtype != mx.bfloat16 or weight.biases.dtype != mx.bfloat16):
-        why = "scales_not_bf16"
+    if not why and (weight.scales.dtype not in (mx.bfloat16, mx.float16) or weight.biases.dtype != weight.scales.dtype):
+        why = "scales_not_bf16_or_fp16"
     if why:
         raise RuntimeError(f"qmv_rows does not serve this matrix: {why}")
     return {"K": k, "BITS": bits, "GROUP": group, "VPT": vpt}
@@ -264,7 +265,7 @@ def _launch(x2, weight, rows, n, k, bits, group, vpt, *, threads=None, rch=None,
 
 
 def affine_product(x, weight, *, prove=True, **tune):
-    """Every row of ``x`` (``(..., K)`` bf16 or float32) times the affine matrix ``weight`` (transposed, as
+    """Every row of ``x`` (``(..., K)`` bf16, float16 or float32) times the affine matrix ``weight`` (transposed, as
     ``mx.quantized_matmul`` takes it), bit-identical to MLX's one-row product of that row.
     Raises ``RuntimeError`` (counted) for a stored form this launch does not twin, or when this
     Mac's first use disagrees with MLX's one-row product; a single row then takes MLX's product."""
@@ -292,9 +293,9 @@ def affine_product(x, weight, *, prove=True, **tune):
 
 def _proven_launch(x, weight, rows, lead, n, k, bits, group, prove, tune, count_route):
     codes, scales, biases = weight.codes, weight.scales, weight.biases
-    if x.shape[-1] != k or x.dtype not in (mx.bfloat16, mx.float32):
+    if x.shape[-1] != k or x.dtype not in (mx.bfloat16, mx.float16, mx.float32):
         count_route("refused:qproduct_input")
-        raise RuntimeError("affine_product serves bf16 or float32 inputs of the matrix's width")
+        raise RuntimeError("affine_product serves bf16, float16 or float32 inputs of the matrix's width")
     try:
         vpt = qmv_constants(weight)["VPT"]
     except RuntimeError as err:
@@ -336,9 +337,9 @@ def affine_logits(x, weight, *, width=None, cap=0.0, prove=True, **tune):
     rows = 1
     for d in lead:
         rows *= d
-    if x.shape[-1] != k or x.dtype not in (mx.bfloat16, mx.float32) or not 0 < width <= n:
+    if x.shape[-1] != k or x.dtype not in (mx.bfloat16, mx.float16, mx.float32) or not 0 < width <= n:
         count_route("refused:qlogits_input")
-        raise RuntimeError("affine_logits serves bf16 or float32 inputs of the matrix's width")
+        raise RuntimeError("affine_logits serves bf16, float16 or float32 inputs of the matrix's width")
     try:
         vpt = qmv_constants(weight)["VPT"]
     except RuntimeError as err:
