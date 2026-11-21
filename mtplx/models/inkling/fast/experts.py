@@ -108,12 +108,28 @@ inline float l3_e4m3_raw(uint b) {
     return float(as_type<half>(ushort(((b & 127u) << 7) | ((b & 128u) << 8))));
 }
 
+// Eight e2m1 codes of a word (code v in bits 4v..4v+3) as the raw table values, two a half2:
+// magnitude bits moved to half bits 9-11, the sign to bit 15 (MLX's fp4.h before its x 2^14).
+inline void l3_e2m1x8(uint w, thread float* v) {
+    const float2 f04 = float2(as_type<half2>(((w & 0x00070007u) << 9) | ((w & 0x00080008u) << 12)));
+    const float2 f15 = float2(as_type<half2>(((w & 0x00700070u) << 5) | ((w & 0x00800080u) << 8)));
+    const float2 f26 = float2(as_type<half2>(((w & 0x07000700u) << 1) | ((w & 0x08000800u) << 4)));
+    const float2 f37 = float2(as_type<half2>(((w & 0x70007000u) >> 3) | (w & 0x80008000u)));
+    v[0] = f04.x; v[1] = f15.x; v[2] = f26.x; v[3] = f37.x;
+    v[4] = f04.y; v[5] = f15.y; v[6] = f26.y; v[7] = f37.y;
+}
+// Four e4m3 codes of a word as the raw table values (MLX's fp8.h before its x 256).
+inline void l3_e4m3x4(uint w, thread float* v) {
+    const float2 f02 = float2(as_type<half2>(((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8)));
+    const float2 f13 = float2(as_type<half2>(((w & 0x7F007F00u) >> 1) | (w & 0x80008000u)));
+    v[0] = f02.x; v[1] = f13.x; v[2] = f02.y; v[3] = f13.y;
+}
+
 // Gate-up dot products of NM member rows with R consecutive w13 rows (gather_qmv lane slices).
 template <int NM, int R, bool NV4>
 inline void l3_gate_up_dots(const device uint* wexp, const device uchar* sexp, const device float* values,
                             threadgroup const uint* rows_of, uint m0, uint nb, uint lane,
-                            threadgroup const float2* lut2, threadgroup const float* lut1,
-                            threadgroup const float* slut, thread float (&out)[4][R]) {
+                            thread float (&out)[4][R]) {
     const device float* xm[NM];
     for (int m = 0; m < NM; ++m) xm[m] = values + rows_of[m0 + m] * 2304 + 8 * lane;
     float res[NM][R];
@@ -131,15 +147,13 @@ inline void l3_gate_up_dots(const device uint* wexp, const device uchar* sexp, c
             const uint n = nb + q;
             if (NV4) {
                 const uint word = wexp[n * 288 + 32 * b + lane];
-                const float s = slut[sexp[n * 144 + 16 * b + lane / 2]];
-                const float2 w01 = lut2[word & 255u];
-                const float2 w23 = lut2[(word >> 8) & 255u];
-                const float2 w45 = lut2[(word >> 16) & 255u];
-                const float2 w67 = lut2[word >> 24];
+                const float s = l3_e4m3(sexp[n * 144 + 16 * b + lane / 2]);
+                float w8[8];
+                l3_e2m1x8(word, w8);
                 for (int m = 0; m < NM; ++m) {
                     float accum = 0;
-                    accum += (xv[m][0] * w01.x + xv[m][1] * w01.y + xv[m][2] * w23.x + xv[m][3] * w23.y);
-                    accum += (xv[m][4] * w45.x + xv[m][5] * w45.y + xv[m][6] * w67.x + xv[m][7] * w67.y);
+                    accum += (xv[m][0] * w8[0] + xv[m][1] * w8[1] + xv[m][2] * w8[2] + xv[m][3] * w8[3]);
+                    accum += (xv[m][4] * w8[4] + xv[m][5] * w8[5] + xv[m][6] * w8[6] + xv[m][7] * w8[7]);
                     const float full = accum * 16384.0f;
                     const float tt = s * full;
                     res[m][q] = res[m][q] + tt;
@@ -147,12 +161,10 @@ inline void l3_gate_up_dots(const device uint* wexp, const device uchar* sexp, c
             } else {
                 const uint w0 = wexp[n * 576 + 64 * b + 2 * lane];
                 const uint w1 = wexp[n * 576 + 64 * b + 2 * lane + 1];
-                const float s = slut[sexp[n * 72 + 8 * b + lane / 4]];
+                const float s = l3_e8m0(sexp[n * 72 + 8 * b + lane / 4]);
                 float wv[8];
-                wv[0] = lut1[w0 & 255u]; wv[1] = lut1[(w0 >> 8) & 255u];
-                wv[2] = lut1[(w0 >> 16) & 255u]; wv[3] = lut1[w0 >> 24];
-                wv[4] = lut1[w1 & 255u]; wv[5] = lut1[(w1 >> 8) & 255u];
-                wv[6] = lut1[(w1 >> 16) & 255u]; wv[7] = lut1[w1 >> 24];
+                l3_e4m3x4(w0, wv);
+                l3_e4m3x4(w1, wv + 4);
                 for (int m = 0; m < NM; ++m) {
                     float accum = 0;
                     for (int i = 0; i < 8; ++i) accum += xv[m][i] * wv[i];
@@ -170,8 +182,7 @@ inline void l3_gate_up_dots(const device uint* wexp, const device uchar* sexp, c
 // Down dot products of NM member inputs (lane-major in threadgroup memory) with R w2 rows.
 template <int NM, int R, bool NV4>
 inline void l3_down_dots(const device uint* wexp, const device uchar* sexp, threadgroup const float* xs,
-                         uint nb, uint lane, threadgroup const float2* lut2, threadgroup const float* lut1,
-                         threadgroup const float* slut, thread float (&out)[4][R]) {
+                         uint nb, uint lane, thread float (&out)[4][R]) {
     float res[NM][R];
     for (int m = 0; m < NM; ++m)
         for (int q = 0; q < R; ++q) res[m][q] = 0.0f;
@@ -184,15 +195,13 @@ inline void l3_down_dots(const device uint* wexp, const device uchar* sexp, thre
             for (int q = 0; q < R; ++q) {
                 const uint n = nb + q;
                 const uint word = wexp[n * 144 + 32 * b + lane];
-                const float s = slut[sexp[n * 72 + 16 * b + lane / 2]];
-                const float2 w01 = lut2[word & 255u];
-                const float2 w23 = lut2[(word >> 8) & 255u];
-                const float2 w45 = lut2[(word >> 16) & 255u];
-                const float2 w67 = lut2[word >> 24];
+                const float s = l3_e4m3(sexp[n * 72 + 16 * b + lane / 2]);
+                float w8[8];
+                l3_e2m1x8(word, w8);
                 for (int m = 0; m < NM; ++m) {
                     float accum = 0;
-                    accum += (xv[m][0] * w01.x + xv[m][1] * w01.y + xv[m][2] * w23.x + xv[m][3] * w23.y);
-                    accum += (xv[m][4] * w45.x + xv[m][5] * w45.y + xv[m][6] * w67.x + xv[m][7] * w67.y);
+                    accum += (xv[m][0] * w8[0] + xv[m][1] * w8[1] + xv[m][2] * w8[2] + xv[m][3] * w8[3]);
+                    accum += (xv[m][4] * w8[4] + xv[m][5] * w8[5] + xv[m][6] * w8[6] + xv[m][7] * w8[7]);
                     const float full = accum * 16384.0f;
                     const float tt = s * full;
                     res[m][q] = res[m][q] + tt;
@@ -207,10 +216,9 @@ inline void l3_down_dots(const device uint* wexp, const device uchar* sexp, thre
             for (int q = 0; q < R; ++q) {
                 const uint n = nb + q;
                 const uint word = wexp[n * 288 + 32 * b + lane];
-                const float s = slut[sexp[n * 36 + 4 * b + lane / 8]];
+                const float s = l3_e8m0(sexp[n * 36 + 4 * b + lane / 8]);
                 float wv[4];
-                wv[0] = lut1[word & 255u]; wv[1] = lut1[(word >> 8) & 255u];
-                wv[2] = lut1[(word >> 16) & 255u]; wv[3] = lut1[word >> 24];
+                l3_e4m3x4(word, wv);
                 for (int m = 0; m < NM; ++m) {
                     float accum = 0;
                     for (int i = 0; i < 4; ++i) accum += xv[m][i] * wv[i];
@@ -442,20 +450,6 @@ GATE_UP = """
     const uint tid = thread_position_in_threadgroup.x;
     const uint lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
-    threadgroup float2 lut2[256];
-    threadgroup float lut1[256];
-    threadgroup float slut[256];
-    for (uint i = tid; i < 256u; i += NT) {
-#if FP4
-        lut2[i] = float2(l3_e2m1_raw(i & 15u), l3_e2m1_raw(i >> 4));
-        lut1[i] = 0.0f;
-        slut[i] = l3_e4m3(i);
-#else
-        lut2[i] = float2(0.0f);
-        lut1[i] = l3_e4m3_raw(i);
-        slut[i] = l3_e8m0(i);
-#endif
-    }
     threadgroup uint pe[W * 8];
     threadgroup float pp[W * 8];
     for (uint r = sg; r < uint(W); r += S) {
@@ -491,7 +485,7 @@ GATE_UP = """
         const uint nb = tile * TILE + (it / M) * R;
         float res[4][R];
         for (uint q = 0; q < R; ++q) res[0][q] = 0.0f;
-        l3_gate_up_dots<1, R, bool(FP4)>(wexp, sexp, values, pl_row, m, nb, lane, lut2, lut1, slut, res);
+        l3_gate_up_dots<1, R, bool(FP4)>(wexp, sexp, values, pl_row, m, nb, lane, res);
         // Capped SwiGLU (RC6 SWIGLU statements); lane jj takes mid nb/2 + jj of member m.
         float graw = 0, uraw = 0;
         for (uint jj = 0; jj < R / 2; ++jj)
@@ -554,20 +548,6 @@ DOWN = """
     const uint tid = thread_position_in_threadgroup.x;
     const uint lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
-    threadgroup float2 lut2[256];
-    threadgroup float lut1[256];
-    threadgroup float slut[256];
-    for (uint i = tid; i < 256u; i += NT) {
-#if FP4
-        lut2[i] = float2(l3_e2m1_raw(i & 15u), l3_e2m1_raw(i >> 4));
-        lut1[i] = 0.0f;
-        slut[i] = l3_e4m3(i);
-#else
-        lut2[i] = float2(0.0f);
-        lut1[i] = l3_e4m3_raw(i);
-        slut[i] = l3_e8m0(i);
-#endif
-    }
 #define PAIR_EXPERT(i) experts_in[(i)]
 """ + _PLAN + """
 #undef PAIR_EXPERT
@@ -621,7 +601,7 @@ DOWN = """
             const uint nb = tile * TILE + (it / mc) * R;
             float res[4][R];
             for (uint q = 0; q < R; ++q) res[0][q] = 0.0f;
-            l3_down_dots<1, R, bool(FP4)>(wexp, sexp, xs + ml * 1280, nb, lane, lut2, lut1, slut, res);
+            l3_down_dots<1, R, bool(FP4)>(wexp, sexp, xs + ml * 1280, nb, lane, res);
             for (uint q = 0; q < R; ++q)
                 if (lane == q) raw[pl_pair[m0 + ml] * 2304 + nb + q] = res[0][q];
         }
@@ -776,22 +756,11 @@ PANEL = """
                     const uint sb = sexp[n * SW + (32 / SPL) * b + lane / SPL];
 #if FP4
                     sv[q] = l3_e4m3(sb) * SFOLD;
-                    const uint w = wexp[n * CW + 32 * b + lane];
-                    const float2 f04 = float2(as_type<half2>(((w & 0x00070007u) << 9) | ((w & 0x00080008u) << 12)));
-                    const float2 f15 = float2(as_type<half2>(((w & 0x00700070u) << 5) | ((w & 0x00800080u) << 8)));
-                    const float2 f26 = float2(as_type<half2>(((w & 0x07000700u) << 1) | ((w & 0x08000800u) << 4)));
-                    const float2 f37 = float2(as_type<half2>(((w & 0x70007000u) >> 3) | (w & 0x80008000u)));
-                    wv[q][0] = f04.x; wv[q][1] = f15.x; wv[q][2] = f26.x; wv[q][3] = f37.x;
-                    wv[q][4] = f04.y; wv[q][5] = f15.y; wv[q][6] = f26.y; wv[q][7] = f37.y;
+                    l3_e2m1x8(wexp[n * CW + 32 * b + lane], wv[q]);
 #else
                     sv[q] = l3_e8m0(sb) * SFOLD;
-                    for (int j = 0; j < WPL; ++j) {
-                        const uint w = wexp[n * CW + (32 * WPL) * b + WPL * lane + j];
-                        const float2 f02 = float2(as_type<half2>(((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8)));
-                        const float2 f13 = float2(as_type<half2>(((w & 0x7F007F00u) >> 1) | (w & 0x80008000u)));
-                        wv[q][4 * j + 0] = f02.x; wv[q][4 * j + 1] = f13.x;
-                        wv[q][4 * j + 2] = f02.y; wv[q][4 * j + 3] = f13.y;
-                    }
+                    for (int j = 0; j < WPL; ++j)
+                        l3_e4m3x4(wexp[n * CW + (32 * WPL) * b + WPL * lane + j], wv[q] + 4 * j);
 #endif
                 }
                 for (uint m = 0; m < uint(MC); ++m) {
@@ -835,6 +804,32 @@ PANEL = """
         }
     }
 """
+
+# Prompt chunks: the same products for pairs sorted by expert (the stock body's sort). The
+# threadgroup of expert e finds its members, a contiguous run of the sorted pairs, by binary
+# search, and writes each member's raw product at its sorted position.
+PANEL_PROMPT = (PANEL
+                .replace("""    if (slot >= plan[0]) return;
+    const device uint* ps = plan + 1 + slot * PLAN_STRIDE;
+    const uint e = ps[0];
+    const uint M = ps[1];""", """    const uint e = slot;
+    uint lo = 0;
+    for (uint a = 0, z = PAIRS; a < z;) {
+        const uint mid = (a + z) / 2;
+        if (sorted_experts[mid] < e) a = mid + 1; else z = mid;
+        lo = a;
+    }
+    uint hi = lo;
+    for (uint a = lo, z = PAIRS; a < z;) {
+        const uint mid = (a + z) / 2;
+        if (sorted_experts[mid] <= e) a = mid + 1; else z = mid;
+        hi = a;
+    }
+    if (hi == lo) return;
+    const uint M = hi - lo;""")
+                .replace("ps[XSEL + m0 + m] * K", "sorted_rows[lo + m0 + m] * K")
+                .replace("const uint pair = ps[10 + m0 + m];", "const uint pair = lo + m0 + m;"))
+assert PANEL_PROMPT.count("sorted_rows[lo + m0 + m]") == 1 and "ps[" not in PANEL_PROMPT
 
 # Per (product, fp4): K, words a row, scale bytes a row, values a lane, words a lane, blocks,
 # lanes per scale byte, and the power of two the decoded codes leave out (MLX's dispatch:
@@ -973,6 +968,38 @@ def _panel_kernel(product, fp4, fold):
     name = f"mtplx_inkling_panel_{product}_{'nvfp4' if fp4 else 'mxfp8'}_f{int(fold)}"
     return mx.fast.metal_kernel(name=name, input_names=["plan", "xin", "codes", "scales"], output_names=["raw"],
                                 source=PANEL, header=_header(extra), ensure_row_contiguous=True)
+
+
+@lru_cache(maxsize=None)
+def _panel_prompt_kernel(fp4, fold):
+    g = PANEL_GEOMETRY[("gu", fp4)]
+    defines = {"FP4": int(fp4), "NV": g["NV"], "WPL": g["WPL"], "NBLK": g["NBLK"], "HALF_LAST": 0,
+               "CW": g["CW"], "SW": g["SW"], "SPL": g["SPL"], "K": g["K"], "POW": g["POW"],
+               "FOLD": int(fold), "SFOLD": (g["POW"] if fold else "1.0f")}
+    extra = "".join(f"#define {k} {v}\n" for k, v in defines.items())
+    name = f"mtplx_inkling_panel_prompt_gu_{'nvfp4' if fp4 else 'mxfp8'}_f{int(fold)}"
+    return mx.fast.metal_kernel(name=name, input_names=["sorted_experts", "sorted_rows", "xin", "codes", "scales"],
+                                output_names=["raw"], source=PANEL_PROMPT, header=_header(extra),
+                                ensure_row_contiguous=True)
+
+
+PROMPT_LAYOUT = dict(S=4, RPS=2, R=2, MC=8, FOLD=1)
+
+
+def prompt_gate_up(block, values, sorted_experts, sorted_rows, layout=None):
+    """Gate-up raw products of a prompt chunk's pairs sorted by expert, (pairs, 2304) float32 at
+    their sorted positions: each pair MLX's gathered (one-row) product bit for bit, each expert
+    read once for all its members. `values` (rows, 2304) or (rows, 1, 2304) float32."""
+    fp4 = block.gate_up.mode == "nvfp4"
+    lay = layout or PROMPT_LAYOUT
+    pairs = sorted_experts.shape[0]
+    tgr = lay["S"] * lay["RPS"]
+    return _panel_prompt_kernel(fp4, lay.get("FOLD", 1))(
+        inputs=[sorted_experts, sorted_rows, values.reshape(-1, HIDDEN), block.gate_up.codes, block.gate_up.scales],
+        template=[("S", lay["S"]), ("RPS", lay["RPS"]), ("R", lay["R"]), ("MC", lay["MC"]), ("PAIRS", pairs)],
+        grid=((HIDDEN // tgr) * 32 * lay["S"], block.gate_up.codes.shape[0], 1), threadgroup=(32 * lay["S"], 1, 1),
+        output_shapes=[(pairs, HIDDEN)], output_dtypes=[mx.float32],
+    )[0]
 
 
 @lru_cache(maxsize=None)

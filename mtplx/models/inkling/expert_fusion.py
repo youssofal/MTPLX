@@ -36,6 +36,16 @@ identity it held on; a mismatch keeps the specialisation on the stock body. Ever
 the path does not serve (more than 32 rows, affine research experts, CPU, other dtypes)
 runs the stock body with its reason. Every visit is counted for its request and for the
 model. MTPLX_INKLING_EXPERT_FUSION=off restores the stock body.
+
+Prompt chunks (33 to 2,048 rows): the stock body sorts the pairs by expert and runs the two
+quantized gathers with `sorted_indices`; `routed_sorted` keeps the sort and the down gather
+exactly as the stock body makes them, takes the gate-up gather in the form the stock body's
+measured route proves equal (NVFP4: rows gathered in sorted order, one sorted product; MXFP8:
+each pair MLX's one-row product, computed by the panel product that reads each expert once
+for all its pairs instead of once a pair), and replaces the glue with the same input, route,
+SwiGLU and combine kernels, the combine reading each pair through the inverse of the sort
+(`combine_sorted`). Proven per specialisation (width "prompt") like the decode and verify
+widths; MTPLX_INKLING_PROMPT_EXPERTS=stock keeps the stock body.
 """
 
 from collections import Counter
@@ -288,6 +298,17 @@ COMBINE = """
 """
 
 
+# The combine for pairs held in sorted order: pair p (row-major, as `prob` and `experts`) reads
+# its raw product and down-input scale at its sorted position inv[p].
+COMBINE_SORTED = (COMBINE
+                  .replace("uint p = n * K + k;", "uint p = n * K + k;\n        uint s = inv[p];")
+                  .replace("raw[p * H + c]", "raw[s * H + c]")
+                  .replace("mid_outer[p]", "mid_outer[s]"))
+assert COMBINE_SORTED.count("inv[p]") == 1 and "raw[s * H + c]" in COMBINE_SORTED
+
+PROMPT_ROWS = 2048  # widest prompt chunk the sorted route serves (the prompt read uses 512)
+
+
 def mlx_literal(value):
     """The text MLX's compiler writes for a float32 scalar constant (7 significant digits)."""
     return "%.7g" % float(mx.array(value, mx.float32).item())
@@ -311,6 +332,11 @@ def kernel_spec(stage, fp4, options=()):
             ["raw", *fp4_only("mid_outer", "expert_outer"), "experts", "prob"],
             ["out"],
             COMBINE,
+        ),
+        "combine_sorted": (
+            ["raw", *fp4_only("mid_outer", "expert_outer"), "experts", "prob", "inv"],
+            ["out"],
+            COMBINE_SORTED,
         ),
     }[stage]
     header = HEADER + f"constexpr constant int THREADS = {THREADS};\n#define FP4 {int(fp4)}\n"
@@ -382,6 +408,23 @@ def unserved(block, flat, gpu=None):
     rows, width = flat.shape
     if rows > MAX_ROWS:
         return "grouped_rows"
+    return _block_reason(block, flat)
+
+
+def prompt_unserved(block, flat, gpu=None):
+    """Why the sorted prompt route cannot serve this call (33 to PROMPT_ROWS rows), or None."""
+    if fusion_mode() == "off" or os.environ.get("MTPLX_INKLING_PROMPT_EXPERTS", "fused").lower() == "stock":
+        return "disabled"
+    gpu = gpu if gpu is not None else mx.default_device() == mx.gpu and mx.metal.is_available()
+    if not gpu:
+        return "cpu"
+    if not MAX_ROWS < flat.shape[0] <= PROMPT_ROWS:
+        return "prompt_rows"
+    return _block_reason(block, flat)
+
+
+def _block_reason(block, flat):
+    rows, width = flat.shape
     if block.gate_up.mode not in {"nvfp4", "mxfp8"} or block.gate_up.mode != block.down.mode:
         return "format"
     if block.gate_up.affine is not None or block.down.affine is not None:
@@ -475,6 +518,79 @@ def routed(block, flat, linear, trace=None, variant=None):
     return out
 
 
+def routed_sorted(block, flat, linear, trace=None, variant=None):
+    """Mixture of experts for a prompt chunk (33 to PROMPT_ROWS rows): the stock body's two
+    sorted quantized gathers on the same inputs and sort, around the fused input, route,
+    SwiGLU and combine kernels. Call only when `prompt_unserved` returns None.
+    """
+    fp4 = block.gate_up.mode == "nvfp4"
+    rows, width = flat.shape
+    count, pairs = block.count, rows * block.count
+    middle = block.down.codes.shape[-1] * (8 if fp4 else 4)
+    bits, group = (4, 16) if fp4 else (8, 32)
+    scalars = [(rows,)] if fp4 else []
+
+    router_in, values, *outer = _kernel("inputs", fp4)(
+        inputs=[flat],
+        template=[("T", flat.dtype), ("W", width), ("E", width // THREADS)],
+        grid=(rows * THREADS, 1, 1),
+        threadgroup=(THREADS, 1, 1),
+        output_shapes=[(rows, width), (rows, 1, width), *scalars],
+        output_dtypes=[mx.float32] * (3 if fp4 else 2),
+    )
+    logits = linear(router_in, block.router)
+    if logits.dtype != mx.float32:
+        raise TypeError("Inkling router logits must be float32 for the fused route")
+    experts, _, prob = route(logits, block.bias, count, block.scale, variant)
+    # The stock body's sort: pairs ordered by expert, each pair's row its index // count.
+    order = mx.argsort(experts)
+    sorted_experts = experts[order]
+    sorted_rows = order // count
+    if fp4:
+        # The stock body's grouped form (its rows gathered in sorted order, one sorted matrix
+        # product), which its measured route proves equal to the indexed form before using it.
+        raw13 = mx.gather_qmm(
+            values[sorted_rows], block.gate_up.codes, scales=block.gate_up.scales,
+            rhs_indices=sorted_experts, group_size=group, bits=bits, mode=block.gate_up.mode,
+            sorted_indices=True,
+        )
+    else:
+        # The stock body's indexed form computes each pair as MLX's one-row gathered product and
+        # re-reads its expert for every pair; the panel product gives each pair the same bits and
+        # reads each expert once for all of its pairs.
+        from .fast.experts import prompt_gate_up
+
+        raw13 = prompt_gate_up(block, values, sorted_experts, sorted_rows)
+    caps = (("GATE_CAP", mlx_literal(block.gate_cap)), ("UP_CAP", mlx_literal(block.up_cap)))
+    mid, *mid_outer = _kernel("swiglu", fp4, caps)(
+        inputs=[raw13.reshape(pairs, 2 * middle),
+                *([outer[0], block.gate_up.outer] if fp4 else []), sorted_experts, sorted_rows],
+        template=[("T", flat.dtype), ("W", middle), ("E", middle // THREADS)],
+        grid=(pairs * THREADS, 1, 1),
+        threadgroup=(THREADS, 1, 1),
+        output_shapes=[(pairs, 1, middle), *([(pairs,)] if fp4 else [])],
+        output_dtypes=[mx.float32] * (2 if fp4 else 1),
+    )
+    raw2 = mx.gather_qmm(
+        mid, block.down.codes, scales=block.down.scales, rhs_indices=sorted_experts,
+        group_size=group, bits=bits, mode=block.down.mode, sorted_indices=True,
+    )
+    inverse = mx.argsort(order)
+    (out,) = _kernel("combine_sorted", fp4)(
+        inputs=[raw2.reshape(pairs, width),
+                *([mid_outer[0], block.down.outer] if fp4 else []), experts, prob, inverse],
+        template=[("T", flat.dtype), ("H", width), ("K", count)],
+        grid=(width, rows, 1),
+        threadgroup=(256 if width % 256 == 0 else 128, 1, 1),
+        output_shapes=[(rows, width)],
+        output_dtypes=[flat.dtype],
+    )
+    if trace is not None:
+        trace.update(router_in=router_in, values13=values, logits=logits, experts=experts, prob=prob,
+                     order=order, raw13=raw13, values2=mid, raw2=raw2, out=out)
+    return out
+
+
 class FusionState:
     """One model's proof cache, its memoised decisions and its visit counters."""
 
@@ -546,7 +662,9 @@ def _decline(reason):
 def _decide(state, block, flat, linear, stock, variant):
     """(plan, reason, output, proof) for this call; output is set only on the proving call."""
     fmt, rows = block.gate_up.mode, flat.shape[0]
-    spec = (fmt, str(flat.dtype).split(".")[-1], variant, "decode" if rows == 1 else "verify")
+    width = "decode" if rows == 1 else "verify" if rows <= MAX_ROWS else "prompt"
+    serve = routed_sorted if width == "prompt" else routed
+    spec = (fmt, str(flat.dtype).split(".")[-1], variant, width)
     with state.lock:
         if spec in state.decisions:
             return (*state.decisions[spec], None, None)
@@ -556,7 +674,7 @@ def _decide(state, block, flat, linear, stock, variant):
             want = stock(flat)
             mx.eval(want)
             proved.append(want)
-            got = routed(block, flat, linear, variant=variant)
+            got = serve(block, flat, linear, variant=variant)
             mx.eval(got)
             if bool(mx.all(got.view(mx.uint16) == want.view(mx.uint16)).item()):
                 proved[0] = got
@@ -582,14 +700,19 @@ def experts_forward(block, hidden, linear, stock):
     rows, fmt = flat.shape[0], getattr(block.gate_up, "mode", "unknown")
     state = _state(block)
     reason = unserved(block, flat)
+    prompt = reason == "grouped_rows"
+    if prompt:
+        reason = prompt_unserved(block, flat)
+        reason = None if reason is None else "grouped_rows" if reason == "prompt_rows" else "prompt_" + reason
     if reason is None:
         proofs, kept = [], None
         for variant in route_ladder():
             plan, refusal, out, proof = _decide(state, block, flat, linear, stock, variant)
             proofs.append(proof)
             if plan is not None:
-                state.record(_key(fmt, rows, "fused." + variant), *proofs)
-                out = routed(block, flat, linear, variant=variant) if out is None else out
+                state.record(_key(fmt, rows, ("prompt_fused." if prompt else "fused.") + variant), *proofs)
+                if out is None:
+                    out = (routed_sorted if prompt else routed)(block, flat, linear, variant=variant)
                 return out.reshape(hidden.shape)
             kept = out if out is not None else kept  # the stock body a failed proof computed
         state.record(_key(fmt, rows, "stock." + _decline(refusal)), *proofs)
