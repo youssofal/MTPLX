@@ -12,7 +12,7 @@ from . import expert_fusion
 from .draft import Drafter
 from .fast import engine_site
 from .fast import round as fast_round
-from .fast.decoder import DECLINED, FastDecoder, FastPending, fast_enabled, measure_round_costs
+from .fast.decoder import DECLINED, FastDecoder, FastPending, fast_enabled, round_costs
 from .layout import cache_footprint
 from .model import load_target
 from .vision import VisionTower
@@ -55,7 +55,7 @@ class InklingRuntime(MTPLXRuntime):
             self.engine_pool_bytes = int(executor.get("pool_bytes") or 0)
             if self.drafter is not None:
                 try:
-                    self.round_cost_ms, self.round_cost_detail = measure_round_costs(self)
+                    self.round_cost_ms, self.round_cost_detail = round_costs(self)
                 except Exception as exc:  # noqa: BLE001 - a timing pass must not stop the load
                     # Said, not hidden: /health and every auto-depth request carry the reason,
                     # and the controller prices rounds with RC6's table meanwhile.

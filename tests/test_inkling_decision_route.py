@@ -120,3 +120,49 @@ def test_inkling_depth_is_chosen_per_round_unless_pinned(monkeypatch, depth, exp
     state = _inkling_state(depth)
     assert openai._inkling_auto_depth(state, mode, 0 if mode == "ar" else depth,
                                       {"request_depth_explicit": explicit}) is auto
+
+
+def test_round_costs_are_fitted_smooth_and_coarse():
+    from mtplx.models.inkling.fast.decoder import fit_round_costs
+
+    noisy = (28.0, 38.1, 43.3, 49.6, 57.0, 63.4, 73.7, 77.0)  # increments 10.1 5.2 6.3 7.4 6.4 10.3 3.3
+    fit = fit_round_costs(noisy)
+    steps = [b - a for a, b in zip(fit["table"], fit["table"][1:])]
+    assert fit["model"] == "linear" and len(set(steps)) == 1 and steps[0] == fit["per_row_ms"]
+    assert fit["base_ms"] == int(fit["base_ms"]) and fit["per_row_ms"] * 2 == int(fit["per_row_ms"] * 2)
+    # Re-timed with noise of a few percent, the controller makes the same choice at every rate,
+    # and every proposal count is reachable (the raw timings never let it pick 4 or 6).
+    from mtplx.models.inkling.fast.draft import DepthByYield
+
+    def choices(table):
+        out = []
+        for rate in (0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95):
+            control = DepthByYield(cost_ms=table, max_depth=7, channel_prior={}, prior=rate)
+            out.append(control.choose())
+        return out
+
+    jitter = tuple(v * f for v, f in zip(noisy, (1.01, 0.99, 1.0, 1.01, 0.99, 1.0, 1.01, 0.99)))
+    assert choices(fit_round_costs(jitter)["table"]) == choices(fit["table"])
+    picked = set(choices(fit["table"]))
+    assert picked >= {2, 3, 7} and choices(fit["table"]) == sorted(choices(fit["table"]))
+    # A real step past 5 rows (the 6th to 8th rows twice the price) gets its own slope.
+    stepped = tuple(20 + 7 * k + (16 * max(0, k - 4)) for k in range(8))
+    bent = fit_round_costs(stepped)
+    assert bent["model"] == "linear_with_step" and bent["step_ms_past_4"] == 16.0
+
+
+def test_round_costs_are_kept_for_the_pack_build_and_mac(tmp_path, monkeypatch):
+    from mtplx.models.inkling.fast import decoder
+
+    timed = []
+    raw = (28.0, 38.1, 43.3, 49.6, 57.0, 63.4, 73.7, 77.0)
+    monkeypatch.setattr(decoder, "measure_round_costs", lambda rt: (timed.append(1), (raw, {"reps": 5}))[1])
+    monkeypatch.setattr(decoder.engine_site, "health", lambda rt=None: {"available": True})
+    rt = SimpleNamespace(kernel_proofs=SimpleNamespace(directory=tmp_path / "proofs-identity"),
+                         drafter=SimpleNamespace(width=8))
+    first, detail = decoder.round_costs(rt)
+    second, detail2 = decoder.round_costs(rt)  # the next load: read back, not re-timed
+    assert first == second and detail["source"] == "timed" and detail2["source"] == "kept" and len(timed) == 1
+    monkeypatch.setenv("MTPLX_INKLING_FAST_STAGES", "bc,e")  # another lane set: timed again
+    _, detail3 = decoder.round_costs(rt)
+    assert detail3["source"] == "timed" and len(timed) == 2 and detail3["replaced"]

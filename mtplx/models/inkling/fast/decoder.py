@@ -167,7 +167,7 @@ class FastDecoder:
         return logits
 
 
-def measure_round_costs(rt, *, length=1100, reps=3, seed=20261121):
+def measure_round_costs(rt, *, length=1100, reps=5, seed=20261121):
     """The depth controller's table for this Mac and pack, timed at load on a synthetic state.
 
     ``cost_ms[k]`` is the ms of a round with k proposals (k = 0 .. drafter width - 1): the
@@ -262,6 +262,79 @@ def measure_round_costs(rt, *, length=1100, reps=3, seed=20261121):
     return cost, detail
 
 
+#: The fitted table lives beside the pack's kernel proofs, whose directory is keyed by the build,
+#: the MLX version, the OS, the GPU and the pack's files: a change of any re-times it.
+ROUND_COST_FILE = "inkling-round-costs.json"
+ROUND_COST_SCHEMA = 1
+
+
+def fit_round_costs(raw):
+    """A smooth table from noisy timings: least squares ``base + per_row * k``, and a second
+    slope past ``k = 4`` only when the timings carry a real step there (it must at least halve
+    the residual and add 2 ms a row). Coefficients are rounded coarsely (base to 1 ms, slopes to
+    0.5 ms): a re-timing lands on the same choices, and the table itself is kept across loads
+    (``round_costs``), so a seeded request makes the same choices after a restart."""
+    import numpy as np
+
+    y = np.asarray(raw, dtype=np.float64)
+    k = np.arange(len(y), dtype=np.float64)
+    hinge = 4.0
+    linear = np.stack([np.ones_like(k), k], axis=1)
+    coef, *_ = np.linalg.lstsq(linear, y, rcond=None)
+    rms = float(np.sqrt(np.mean((linear @ coef - y) ** 2)))
+    step, model = 0.0, "linear"
+    if len(y) > hinge + 2:
+        bent = np.stack([np.ones_like(k), k, np.maximum(0.0, k - hinge)], axis=1)
+        coef3, *_ = np.linalg.lstsq(bent, y, rcond=None)
+        rms3 = float(np.sqrt(np.mean((bent @ coef3 - y) ** 2)))
+        if coef3[2] >= 2.0 and rms3 <= 0.5 * rms:
+            coef, step, rms, model = coef3[:2], float(coef3[2]), rms3, "linear_with_step"
+    base = float(round(float(coef[0])))
+    per_row = max(0.5, round(float(coef[1]) * 2) / 2)
+    step = round(step * 2) / 2
+    table = tuple(round(base + per_row * i + step * max(0.0, i - hinge), 2) for i in range(len(y)))
+    return {"model": model, "base_ms": base, "per_row_ms": per_row, "step_ms_past_4": step,
+            "residual_ms": round(rms, 2), "table": table}
+
+
+def round_costs(rt):
+    """The depth controller's table for this pack, build and Mac: read from the pack's proof
+    directory when it was timed for the same lane set and engine, else timed at load
+    (``measure_round_costs``), fitted (``fit_round_costs``) and kept there for the next load.
+    Returns ``(cost_ms, detail)``; ``(None, reason)`` where the fast round does not serve."""
+    import json
+
+    proofs = getattr(rt, "kernel_proofs", None)
+    directory = getattr(proofs, "directory", None)
+    path = None if directory is None else directory / ROUND_COST_FILE
+    key = {"schema": ROUND_COST_SCHEMA, "stages": stage_spec(),
+           "engine": bool(engine_site.health().get("available")),
+           "drafter_width": getattr(rt.drafter, "width", None)}
+    replaced = None
+    if path is not None and path.is_file():
+        try:
+            record = json.loads(path.read_text())
+            if record.get("key") == key and len(record["fit"]["table"]) == key["drafter_width"]:
+                return tuple(record["fit"]["table"]), {**record, "source": "kept", "path": str(path)}
+            replaced = "timed for another lane set, engine or drafter"
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            replaced = f"unreadable: {type(exc).__name__}: {exc}"  # timed again below, said in the record
+    raw, detail = measure_round_costs(rt)
+    if raw is None:
+        return None, detail
+    record = {"key": key, "fit": fit_round_costs(raw), "raw_ms": raw, "timing": detail, "replaced": replaced}
+    if path is not None:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(record, indent=1, default=str))
+            tmp.replace(path)
+        except OSError as exc:
+            record["kept"] = f"not kept: {exc}"
+    return tuple(record["fit"]["table"]), {**record, "source": "timed",
+                                           "path": None if path is None else str(path)}
+
+
 def observe_fast_request(fn, rt, *args, **kwargs):
     """Run one request with its own fast-path counters in ``stats.inkling_fast``."""
     if request_receipt.get() is not None:
@@ -286,4 +359,4 @@ def fast_health(rt=None):
 
 
 __all__ = ["DECLINED", "FastDecoder", "FastPending", "fast_enabled", "fast_health", "fast_mode",
-           "measure_round_costs", "observe_fast_request"]
+           "fit_round_costs", "measure_round_costs", "observe_fast_request", "round_costs"]
