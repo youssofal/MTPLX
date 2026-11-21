@@ -1411,15 +1411,26 @@ def _panel_products(block, fp4, rows, logits, values, outer, layouts=None, dtype
 #:   "mlx", "own" or "panel" pin one ("mlx" is the rollback for every width).
 PRODUCTS = os.environ.get("MTPLX_INKLING_FAST_EXPERT_PRODUCTS", "auto").lower()
 
-#: The inputs and combine launches: "rows" reads the router once for all rows of a panel and spreads
-#: the combine over rows (INPUTS_ROWS, COMBINE_ROWS); "row" is the earlier form (one set of router
-#: threadgroups a row; one combine thread walking every row of its column). Both are RC6's bits.
-GLUE = os.environ.get("MTPLX_INKLING_EXPERT_GLUE", "row").lower()
+#: The inputs and combine launches: "rows" (default) reads the router once for all rows of a panel and
+#: spreads the combine over rows (INPUTS_ROWS, COMBINE_ROWS); "row" is the earlier form (one set of router
+#: threadgroups a row; one combine thread walking every row of its column) and the rollback. Both are
+#: RC6's bits. Measured (engine GPU time, M5 Max, d1/receipts/ebench-e-11.json): the rows combine is level
+#: at one row and faster from two (4 rows 4.9 -> 2.4 us a visit, 25 rows 28.2 -> 8.0); the rows inputs are
+#: faster at one row and from four (6.8 -> 5.9, 11.1 -> 9.8, 8 rows 26.0 -> 15.5) but level or slower at
+#: two and three (7.0 -> 6.9, 7.6 -> 8.6), so those two widths keep the per-row inputs (inputs_rows_at).
+GLUE = os.environ.get("MTPLX_INKLING_EXPERT_GLUE", "rows").lower()
+
+
+def inputs_rows_at(rows):
+    """Whether the rows-together inputs launch serves a panel of ``rows`` (see GLUE)."""
+    return GLUE == "rows" and (rows == 1 or rows >= 4)
+
 
 #: NVFP4 panels: expert and down inputs written and read as float16 (exact: an NVFP4-rounded activation,
 #: e2m1 times an e4m3 group scale, has at most 6 significant bits and lies in [2^-10, 2688]); the panel
-#: products then move half the activation bytes. "0" keeps float32.
-HALF_ACTIVATIONS = os.environ.get("MTPLX_INKLING_EXPERT_HALF_X", "0").lower() not in ("0", "off", "no")
+#: products then move half the activation bytes. On by default (measured faster at every width from four
+#: rows, gate-up 2-8%, down 2-8%, d1/receipts/ebench-e-10.json); "0" keeps float32 (the rollback).
+HALF_ACTIVATIONS = os.environ.get("MTPLX_INKLING_EXPERT_HALF_X", "1").lower() not in ("0", "off", "no")
 
 
 def products_for(rows):
@@ -1446,7 +1457,7 @@ def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *
     mc = _member_chunk(rows)
     common = (("W", rows),)
 
-    rows_form = GLUE == "rows"
+    rows_form = inputs_rows_at(rows)
     half_values = fp4 and HALF_ACTIVATIONS and products == "panel"
     logits, values, *outer = _kernel("inputs_rows" if rows_form else "inputs", fp4)(
         inputs=[src, norm_weight, block.router, _consts(float(eps))],
