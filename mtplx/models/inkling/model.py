@@ -13,7 +13,7 @@ from .attention import attend
 from .cache import WindowCache
 from .activations import expert_inputs
 from . import expert_fusion
-from .fast import prompt_gemm, prompt_glue
+from .fast import prompt_gemm, prompt_glue, prompt_loop
 from .head import fits_route, measured_route, note_route, pack_proofs, vocabulary_logits
 from .layout import layer_visits
 from .precision import AffineWeight, packed_logical_shape, source_modes
@@ -525,9 +525,15 @@ class Layer(nn.Module):
             if tape is None and self.sliding and messages is None and self.cfg["attn_res_normalize_values"]
             else None
         )
+        # Passes two and three: the read, the three controllers and the norms as our launches, same bits.
+        looped = (
+            prompt_loop.visit_inputs(self, x, closed, messages)
+            if tape is None and fused_in is None and messages is not None
+            else None
+        )
         read = (
             None
-            if fused_in is not None
+            if fused_in is not None or looped is not None
             else read_depth(
                 closed,
                 x,
@@ -538,8 +544,17 @@ class Layer(nn.Module):
             if self.attn_query is not None
             else x[..., None, :]
         )
+        normed = (
+            prompt_loop.global_norms(self, read, x.dtype)
+            if tape is None and read is not None and not self.sliding and messages is None
+            else None
+        )
         if fused_in is not None:
             q = k = v = fused_in
+        elif looped is not None:
+            q, k, v = looped
+        elif normed is not None:
+            q, k, v = normed
         elif self.sliding and messages is None:
             q = k = v = norm(read[..., 0, :], self.qkv_norm[0], self.eps).astype(
                 x.dtype
@@ -567,6 +582,8 @@ class Layer(nn.Module):
         ffn_in = (
             prompt_glue.input_norm(residual, closed, self.mlp_query, self.ffn_norm, self.eps, "expert_input")
             if tape is None and messages is None and self.cfg["attn_res_normalize_values"]
+            else prompt_loop.expert_input(self, residual, closed, messages, x.dtype)
+            if tape is None and messages is not None
             else None
         )
         if ffn_in is None:
