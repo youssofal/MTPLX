@@ -220,7 +220,16 @@ def measure_round_costs(rt, *, length=1100, reps=5, seed=20261121):
         routes.setdefault(width, []).append(route.get("route") if route.get("reason") is None
                                             else f"{route.get('route')}:{route.get('reason')}")
 
-    step_ms = {w: median_of(lambda w=w: step(w)) for w in range(1, drafter.width + 1)}
+    # Widths interleaved within every repetition: the GPU clock drifts between blocks of one
+    # width, which made a smooth cost look like a step at one width.
+    widths = range(1, drafter.width + 1)
+    for w in widths:
+        step(w)  # first call: recording, checks, kernel builds
+    samples = {w: [] for w in widths}
+    for _ in range(reps):
+        for w in widths:
+            samples[w].append(timed(lambda w=w: step(w))[1])
+    step_ms = {w: statistics.median(samples[w]) for w in widths}
     drafter.observe([h[:, :1] for h in outputs[1][1]], draft_cache)
     draft_ms, decide_ms, laws = {0: 0.0}, {0: 0.0}, {}
 
