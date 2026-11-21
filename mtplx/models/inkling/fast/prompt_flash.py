@@ -84,6 +84,10 @@ inline void ink_put_four(device E* p, vec<E, 4> x) {
 
 # A lane holds two rows of each 16 x 16 piece (fr and fr + 8) and four consecutive columns of
 # each (fc .. fc + 3), as the library places them: element 4 rp + c is row fr + 8 rp, column fc + c.
+# INK_FENCE_NOTE: with every loop unrolled the compiler issues all of a tile's key loads (and all of
+# its value loads) before the first multiply: 64 registers of loads live at once. A simdgroup fence
+# halfway through each loop holds the second half's loads back; the numbers are unchanged and a tile
+# runs 1.4 to 1.6x faster at 16K to 128K keys (lanes/p2/fexp3-1.json).
 _SOURCE = """
     using Piece = mlx::steel::BaseNAXFrag;
     typedef vec<T, 8> tpiece;
@@ -209,6 +213,9 @@ _SOURCE = """
                 }
             }
             Piece::mma(s[0], s[1], qp[p], metal::false_type{}, kp[0], kp[1], metal::true_type{});
+            if (p == DP / 2 - 1) {
+                simdgroup_barrier(mem_flags::mem_none);     // see INK_FENCE_NOTE
+            }
         }
 
         // Logits in base-2 units, masked and biased where a row is near.
@@ -268,6 +275,9 @@ _SOURCE = """
         // output dimensions a multiply.
         INK_EVERY for (short j = 0; j < 2; ++j) {
             INK_EVERY for (short g = 0; g < DP / 2; ++g) {
+                if (g == DP / 4) {
+                    simdgroup_barrier(mem_flags::mem_none);     // see INK_FENCE_NOTE
+                }
                 tpiece vp[2];
                 INK_EVERY for (short h = 0; h < 2; ++h) {
                     INK_EVERY for (short rp = 0; rp < 2; ++rp) {
