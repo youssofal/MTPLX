@@ -28,6 +28,7 @@ def test_the_fast_chunk_is_2048_rows_where_the_prompt_and_the_mac_allow_and_a_na
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "auto")
+    monkeypatch.delenv("MTPLX_INKLING_PROMPT_FLASH", raising=False)
     monkeypatch.setattr(PR, "_headroom", {"bytes": 64 * 1024**3})
     rt = object.__new__(InklingRuntime)
     monkeypatch.setenv(PROMPT_FAST_ENV, "experts")
@@ -52,6 +53,7 @@ def test_the_fast_chunk_is_2048_rows_where_the_prompt_and_the_mac_allow_and_a_na
 def test_the_headroom_is_read_once_a_process(monkeypatch):
     from mtplx.models.inkling.fast import prompt_route as PR
 
+    monkeypatch.delenv("MTPLX_INKLING_PROMPT_FLASH", raising=False)
     monkeypatch.setattr(PR, "_headroom", {})
     first = PR.gpu_headroom_bytes()
     assert PR.gpu_headroom_bytes() == first
@@ -74,6 +76,7 @@ def test_generation_reads_the_width_for_this_prompt_as_the_admission_priced_it(m
     for name in ("MTPLX_PREFILL_CHUNK_SIZE_DENSE", "MTPLX_PREFILL_CHUNK_SIZE_REPAGE"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv(PROMPT_FAST_ENV, "chunk")
+    monkeypatch.delenv("MTPLX_INKLING_PROMPT_FLASH", raising=False)
     monkeypatch.setattr(PR, "_headroom", {"bytes": 64 * 1024**3})
     rt = object.__new__(InklingRuntime)
     rt.backend_id, rt.model_path = "inkling2_loop", None
@@ -89,3 +92,26 @@ def test_generation_reads_the_width_for_this_prompt_as_the_admission_priced_it(m
     assert seen == [2048, 512]
     assert generation.prefill_forward_widths(rt, 4_000, None) == [2048]
     assert generation.prefill_forward_widths(rt, PR.WIDE_PROMPT_TOKENS + 1, None) == [512]
+
+
+def test_with_the_one_launch_attention_the_width_is_4096_and_the_fence_lifts(monkeypatch):
+    import importlib.util
+
+    from mtplx.models.inkling.fast import prompt_route as PR
+
+    monkeypatch.setenv(PROMPT_FAST_ENV, "chunk")
+    monkeypatch.setattr(PR, "_headroom", {"bytes": 64 * 1024**3})
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_FLASH", "on")
+    real = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec",
+                        lambda name, *a: object() if name.endswith("fast.prompt_flash") else real(name, *a))
+    assert PR.flash_attention_on()
+    assert PR.wide_rows(4_000) == PR.WIDE_ROWS_FLASH == 4096
+    assert PR.wide_rows(PR.WIDE_PROMPT_TOKENS * 4) == 4096
+    monkeypatch.setattr(PR, "_headroom", {"bytes": PR.WIDE_HEADROOM_BYTES - 1})
+    assert PR.wide_rows(4_000) is None
+    # the switch without the module (a tree without the one-launch attention) changes nothing
+    monkeypatch.setattr(importlib.util, "find_spec", real)
+    monkeypatch.setattr(PR, "_headroom", {"bytes": 64 * 1024**3})
+    if real("mtplx.models.inkling.fast.prompt_flash") is None:
+        assert not PR.flash_attention_on() and PR.wide_rows(4_000) == 2048

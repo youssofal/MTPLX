@@ -46,7 +46,23 @@ WIDE_PROMPT_TOKENS = 18_432
 #: Every 24, 32 and 36 GB Mac keeps 512 rows; the admission may still narrow any request.
 WIDE_HEADROOM_BYTES = 12 * 1024**3
 
+#: With the one-launch prompt attention on (``fast/prompt_flash.py``, ``MTPLX_INKLING_PROMPT_FLASH``, lane P2) a
+#: call computes only the keys its rows may see and writes no bias or mask plane: the width is 4,096 rows and the
+#: prompt fence does not apply (the forward's own memory, 2.8 to 2.9 GB in process at 4,096 rows, is priced by
+#: the admission like any width).
+WIDE_ROWS_FLASH = 4096
+
 _headroom = {}
+
+
+def flash_attention_on():
+    """Whether the prompt chunk's attention is the one-launch route (present in this tree and switched on)."""
+    raw = os.environ.get("MTPLX_INKLING_PROMPT_FLASH", "").strip().lower()
+    if raw in ("", "0", "off", "no", "false"):
+        return False
+    import importlib.util
+
+    return importlib.util.find_spec("mtplx.models.inkling.fast.prompt_flash") is not None
 
 
 def gpu_headroom_bytes():
@@ -68,9 +84,10 @@ def wide_rows(prompt_tokens=None, headroom_bytes=None):
     """The ``chunk`` part's width for a prompt of ``prompt_tokens``, or None for the default 512 rows."""
     if not prompt_fast("chunk"):
         return None
-    if prompt_tokens is not None and int(prompt_tokens) > WIDE_PROMPT_TOKENS:
+    flash = flash_attention_on()
+    if not flash and prompt_tokens is not None and int(prompt_tokens) > WIDE_PROMPT_TOKENS:
         return None
     room = gpu_headroom_bytes() if headroom_bytes is None else headroom_bytes
     if room is None or room < WIDE_HEADROOM_BYTES:
         return None
-    return WIDE_ROWS
+    return WIDE_ROWS_FLASH if flash else WIDE_ROWS
