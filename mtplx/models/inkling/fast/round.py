@@ -746,6 +746,8 @@ def supported(sampler, *, constraint=None, draft_sampler=None):
     temperature = float(getattr(sampler, "temperature", 1.0) or 0.0)
     if not temperature_served(temperature):
         return False, "temperature_range"
+    if not repetition_served(getattr(sampler, "repetition_penalty", 1.0)):
+        return False, "repetition_penalty_range"
     if temperature > 0 and (float(getattr(sampler, "top_p", 1.0)) < 1.0
                             or int(getattr(sampler, "top_k", 0) or 0) > 0):
         return False, "filtered_sampler"
@@ -770,6 +772,22 @@ TEMPERATURE_RANGE = (0.05, 2.0)
 def temperature_served(temperature):
     t = float(temperature or 0.0)
     return t <= 0.0 or TEMPERATURE_RANGE[0] <= t <= TEMPERATURE_RANGE[1]
+
+
+#: Repetition penalties the device round serves besides 1 (none). A penalty p divides a seen
+#: positive logit by p and multiplies a seen negative one by p, so inside this range no score
+#: grows more than twofold and the law rows stay within twice the temperature range's float32
+#: scale. Far outside it they do not: at 2**-20 the logits 12.000002 and 12.000003 become
+#: 12,582,914 and 12,582,915, which the float32 scale at temperature 1.5 rounds to one value,
+#: so the device would draw a coin flip where the law gives 0.66 (review 2, finding 13). Those
+#: requests keep the host's decision, counted (``decision.host.repetition_penalty_range``).
+REPETITION_RANGE = (0.5, 2.0)
+
+
+def repetition_served(penalty):
+    # 0 and None are no penalty, as ``client_controls`` reads them; NaN is outside every range.
+    p = float(penalty or 1.0)
+    return p == 1.0 or REPETITION_RANGE[0] <= p <= REPETITION_RANGE[1]
 
 
 @dataclass(frozen=True)
