@@ -237,3 +237,76 @@ def heads(layer, q_lin, r_lin, k_conv, v_conv, offset):
     _count("heads.ours." + ("global" if glob else "window"))
     return (q.reshape(1, rows, q_heads, head_dim), rel.reshape(1, rows, q_heads, rel_dim),
             k.reshape(1, rows, kv_heads, head_dim), v.reshape(1, rows, kv_heads, head_dim))
+
+
+# --- the output gate ---------------------------------------------------------------------------------
+
+GATE = """
+    // x[r, c] = T(float(h[0, head, r, d]) * sigmoid(float(g[0, r, c]))), c = head * HD + d: Layer.attention's
+    // `(h.astype(float32) * sigmoid(gate_lin.astype(float32))).astype(h.dtype)` with h read where attend left it
+    // (heads first, at its own strides), so neither the transpose's copy nor the casts are written.
+    const uint idx = thread_position_in_grid.x;
+    const uint rows = uint(g_shape[1]);
+    const uint width = uint(QH * HD);
+    if (idx >= rows * width)
+        return;
+    const uint r = idx / width;
+    const uint c = idx - r * width;
+    const uint head = c / uint(HD);
+    const uint d = c - head * uint(HD);
+    const float z = float(g[size_t(r) * g_strides[1] + size_t(c) * g_strides[2]]);
+    const float y = 1 / (1 + metal::precise::exp(metal::abs(z)));
+    const float open = (z < 0) ? y : 1 - y;
+    const float value = float(h[size_t(head) * h_strides[1] + size_t(r) * h_strides[2] + size_t(d) * h_strides[3]]);
+    x[idx] = static_cast<T>(value * open);
+"""
+
+_gate_kernel_cache = {}
+
+
+def _gate_kernel():
+    kernel = _gate_kernel_cache.get("k")
+    if kernel is None:
+        kernel = mx.fast.metal_kernel(
+            name="mtplx_inkling_prompt_output_gate",
+            input_names=["h", "g"],
+            output_names=["x"],
+            source=GATE,
+            ensure_row_contiguous=False,
+        )
+        _gate_kernel_cache["k"] = kernel
+    return kernel
+
+
+def output_gate(h, gate_lin):
+    """``(h.transpose(0, 2, 1, 3).reshape(1, rows, -1).astype(float32) * sigmoid(gate_lin.astype(float32)))
+    .astype(h.dtype)`` as one launch, ``h`` as attend returns it ``(1, QH, rows, HD)``; or None when this call is
+    not served (counted)."""
+    reason = None
+    if h.ndim != 4 or gate_lin.ndim != 3 or h.shape[0] != 1 or gate_lin.shape[0] != 1:
+        reason = "shape"
+    elif h.shape[2] < PROMPT_MIN_ROWS:
+        reason = "rows"
+    elif not enabled():
+        reason = "disabled"
+    elif not (mx.default_device() == mx.gpu and mx.metal.is_available()):
+        reason = "cpu"
+    elif h.dtype not in (mx.bfloat16, mx.float16) or gate_lin.dtype != h.dtype:
+        reason = "stream_dtype"
+    elif gate_lin.shape[1] != h.shape[2] or gate_lin.shape[2] != h.shape[1] * h.shape[3]:
+        reason = "geometry"
+    if reason is not None:
+        _count(f"gate.mlx.{reason}")
+        return None
+    _, heads_, rows, head_dim = h.shape
+    total = rows * heads_ * head_dim
+    (x,) = _gate_kernel()(
+        inputs=[h, gate_lin],
+        template=[("T", h.dtype), ("QH", heads_), ("HD", head_dim)],
+        grid=(-(-total // 256) * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(1, rows, heads_ * head_dim)],
+        output_dtypes=[h.dtype],
+    )
+    _count("gate.ours")
+    return x

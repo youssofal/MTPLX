@@ -499,21 +499,22 @@ class Layer(nn.Module):
         if self.sliding:
             k, v = kv._temporal_order(k), kv._temporal_order(v)
         window = cfg["sliding_window_size"] if self.sliding else 0
-        h = (
-            attend(
-                q.transpose(0, 2, 1, 3),
-                k,
-                v,
-                rel @ self.rel_basis.astype(rel.dtype),
-                sink,
-                window,
-                **({"verify": True} if tape is not None else {}),
-            )
-            .transpose(0, 2, 1, 3)
-            .reshape(*q_input.shape[:2], -1)
+        heads_first = attend(
+            q.transpose(0, 2, 1, 3),
+            k,
+            v,
+            rel @ self.rel_basis.astype(rel.dtype),
+            sink,
+            window,
+            **({"verify": True} if tape is not None else {}),
         )
-        gate = mx.sigmoid(gate_lin.astype(mx.float32))
-        (out,) = shared_linear((h.astype(mx.float32) * gate).astype(h.dtype), [self.out], "output_projection", tape)
+        # A prompt chunk's output gate runs as one launch of ours reading attend's output in place, same bits.
+        gated = prompt_glue.output_gate(heads_first, gate_lin) if tape is None else None
+        if gated is None:
+            h = heads_first.transpose(0, 2, 1, 3).reshape(*q_input.shape[:2], -1)
+            gate = mx.sigmoid(gate_lin.astype(mx.float32))
+            gated = (h.astype(mx.float32) * gate).astype(h.dtype)
+        (out,) = shared_linear(gated, [self.out], "output_projection", tape)
         return out
 
     def __call__(self, x, closed, kv, conv, messages=None, tape=None):
