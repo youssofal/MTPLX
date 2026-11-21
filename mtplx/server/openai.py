@@ -15198,6 +15198,8 @@ def _splice_committed_token_ids(
     *,
     window: int = _COMMITTED_SPLICE_WINDOW,
     max_spans: int = _COMMITTED_SPLICE_MAX_SPANS,
+    substitute_reasoning: bool = False,
+    visible_gate: Callable[[str, bool], str] | None = None,
 ) -> tuple[list[int], dict[str, Any]]:
     """Re-express ``prompt_ids`` with the session's committed ids wherever the
     two decode to the same text.
@@ -15216,7 +15218,25 @@ def _splice_committed_token_ids(
     the splice and the rest of the prompt is kept as sent. Windows whose
     text carries a replacement character (a split multi-byte character) are
     never matched. Returns the ids and a receipt.
+
+    Inkling's stream is compared one assistant turn at a time instead
+    (``mtplx.models.inkling.protocol.splice_committed``): its template
+    re-renders a turn from the parsed fields, so a model's own token split can
+    run past any window (a 60-character ``=`` banner in a written file), and
+    its control tokens frame each turn exactly. ``substitute_reasoning`` and
+    ``visible_gate`` apply there only: the gate's committed-reasoning contract.
     """
+
+    if getattr(tokenizer, "inkling_protocol", False) is True:
+        from mtplx.models.inkling.protocol import splice_committed
+
+        return splice_committed(
+            prompt_ids,
+            committed,
+            tokenizer,
+            substitute_reasoning=substitute_reasoning,
+            visible_gate=visible_gate,
+        )
 
     from mtplx.token_prefix import common_run_len
     from mtplx.vision.splice import is_image_key
@@ -15826,6 +15846,29 @@ def _maybe_canonicalize_committed_reasoning(
         _record(template_observability)
         _record(request_observability)
         return None
+    if getattr(state.runtime.tokenizer, "inkling_protocol", False) is True:
+        # Inkling's template renders a turn from its parsed fields (each tool
+        # argument through tojson), so the message-level substitution below
+        # cannot put the model's bytes back. The splice compares the dialect's
+        # turns instead and serves the bank's ids for each turn that says the
+        # same thing, putting back reasoning the client dropped.
+        spliced = _splice_prompt_onto_committed(
+            state,
+            messages,
+            compare_ids,
+            committed,
+            cp_raw,
+            outcome,
+            substitute_reasoning=True,
+            visible_gate=lambda text, has_tool_calls: _canonical_turn_gate_text(
+                text,
+                has_tool_calls=has_tool_calls,
+                strip_tool_call_preamble=strip_tool_call_preamble_text,
+            ),
+        )
+        _record(template_observability)
+        _record(request_observability)
+        return spliced
     try:
         committed_text = state.runtime.tokenizer.decode(
             _decodable_ids(state, committed)
@@ -15959,15 +16002,25 @@ def _splice_prompt_onto_committed(
     committed: Sequence[int],
     cp_before: int,
     outcome: dict[str, Any],
+    *,
+    substitute_reasoning: bool = False,
+    visible_gate: Callable[[str, bool], str] | None = None,
 ) -> tuple[list[ChatMessage], list[int]] | None:
     """Serve the committed ids for text-identical spans (see
     ``_splice_committed_token_ids``); None when nothing improved."""
     if not _committed_token_splice_enabled():
         return None
     spliced_ids, receipt = _splice_committed_token_ids(
-        prompt_ids, committed, state.runtime.tokenizer
+        prompt_ids,
+        committed,
+        state.runtime.tokenizer,
+        substitute_reasoning=substitute_reasoning,
+        visible_gate=visible_gate,
     )
     if not receipt.get("spans"):
+        if receipt.get("stopped"):
+            # The turn walk names why the prompt left the bank where it did.
+            outcome["token_splice"] = receipt
         return None
     cp_after = int(receipt.get("cp_after") or 0)
     outcome["token_splice"] = receipt
