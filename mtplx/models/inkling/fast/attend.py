@@ -925,6 +925,18 @@ def _u32(value):
     return mx.array([int(value)], mx.uint32)
 
 
+#: Bank capacity (rows) from which ``MTPLX_INKLING_ATTEND_C=1`` takes the class C order: a bank
+#: grows in 4,096-row steps, so this is about 28K tokens of history and up.
+ATTEND_C_FROM = 32768
+
+
+def attend_c_enabled():
+    """The class C long-history order for global visits (``attend_c``), off unless
+    ``MTPLX_INKLING_ATTEND_C=1``: a decision for the lead (it changes RC6's bits within a measured
+    bound). Read per process, like the other stage switches."""
+    return os.environ.get("MTPLX_INKLING_ATTEND_C", "").strip().lower() in {"1", "on", "true", "yes"}
+
+
 def profiles(rel, rel_basis):
     """RC6's relative profile ``rel @ rel_basis`` (bf16), one MLX product for the panel."""
     return rel @ rel_basis.astype(rel.dtype)
@@ -950,7 +962,14 @@ def attend(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newes
     Raises ``FusedAttentionDeclined`` where ``decline_reason`` is not ``None`` (a reduction
     this route does not serve, or bits that differ from MLX's on this Mac): call
     ``decline_reason`` at warm-up and run RC6's stage, counted, instead.
+
+    With ``MTPLX_INKLING_ATTEND_C=1`` a global visit whose bank holds ``ATTEND_C_FROM`` rows or
+    more takes ``attend_c`` (class C: matrix-unit products in a fixed order, bounded rounding
+    against RC6; every width, so the one-token step and the verify rows share one law).
     """
+    if not window and attend_c_enabled() and q.dtype == mx.bfloat16 and keys.shape[2] >= ATTEND_C_FROM:
+        return attend_c(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newest, pos,
+                        rel_basis, window=False)
     plan = plan or reduction_plan()
     reason = decline_reason(q.dtype, plan)
     if reason is not None:

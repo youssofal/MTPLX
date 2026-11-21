@@ -242,6 +242,60 @@ def test_class_c_is_row_stable_capacity_free_and_close_to_rc6(history, rows):
         assert _same(h1, hg[:, r:r + 1]), f"class C row {r} of {rows} differs from its one-row call"
 
 
+@pytest.mark.parametrize("history,rows", [(4142, 9), (2100, 16), (4142, 25), (1500, 32)])
+def test_class_c_serves_copy_panels_row_stable(history, rows):
+    """Copy panels (9 to 32 rows) in the class C order: close to RC6, and rows 0, middle and last
+    equal their one-row calls bit for bit (the one-token step and the copy round share one law)."""
+    k, v, inputs, weights = _setup(history + rows, rows, seed=history + 11 * rows)
+    q, rel, sink, gate, x, tail = inputs
+    kc, vc, count, newest = _committed(k, v, history, False, 0)
+    hg = attend_c(q, rel, sink, gate, k[:, :, history:history + rows], v[:, :, history:history + rows],
+                  kc, vc, count, newest, history, weights[0], window=False)
+    ref, _, _ = _rc6(k, v, history, inputs, weights, False, False)
+    mx.eval(hg, ref)
+    d = mx.abs(hg.astype(mx.float32) - ref.astype(mx.float32))
+    assert float(mx.max(d).item()) <= 0.03 and float(mx.mean(d).item()) <= 1e-3
+    for r in (0, rows // 2, rows - 1):
+        kc1, vc1, c1, n1 = _committed(k, v, history + r, False, 0)
+        h1 = attend_c(q[:, r:r + 1], rel[:, r:r + 1], sink[:, r:r + 1], gate[:, r:r + 1],
+                      k[:, :, history + r:history + r + 1], v[:, :, history + r:history + r + 1],
+                      kc1, vc1, c1, n1, history + r, weights[0], window=False)
+        assert _same(h1, hg[:, r:r + 1]), f"class C row {r} of {rows} differs from its one-row call"
+
+
+def test_class_c_switch_takes_long_global_banks_only(monkeypatch):
+    """MTPLX_INKLING_ATTEND_C=1: a global visit whose bank holds ATTEND_C_FROM rows or more takes
+    attend_c; a shorter bank and every window visit keep the class A path; off by default."""
+    from mtplx.models.inkling.fast import attend as fast_attend
+
+    history, rows = 600, 4
+    k, v, inputs, weights = _setup(history + rows, rows, seed=99)
+    q, rel, sink, gate, x, tail = inputs
+    kc, vc, count, newest = _committed(k, v, history, False, 0)
+    long_k = mx.zeros((1, 8, fast_attend.ATTEND_C_FROM, 128), mx.bfloat16)
+    long_v = mx.zeros((1, 8, fast_attend.ATTEND_C_FROM, 128), mx.bfloat16)
+    long_k[:, :, :kc.shape[2]] = kc
+    long_v[:, :, :kc.shape[2]] = vc
+    panel = (q, rel, sink, gate, k[:, :, history:history + rows], v[:, :, history:history + rows])
+    monkeypatch.delenv("MTPLX_INKLING_ATTEND_C", raising=False)
+    assert not fast_attend.attend_c_enabled()
+    exact_long = attend(*panel, long_k, long_v, count, newest, history, weights[0], window=False)
+    exact_short = attend(*panel, kc, vc, count, newest, history, weights[0], window=False)
+    class_c = attend_c(*panel, long_k, long_v, count, newest, history, weights[0], window=False)
+    monkeypatch.setenv("MTPLX_INKLING_ATTEND_C", "1")
+    assert fast_attend.attend_c_enabled()
+    switched_long = attend(*panel, long_k, long_v, count, newest, history, weights[0], window=False)
+    switched_short = attend(*panel, kc, vc, count, newest, history, weights[0], window=False)
+    wk, wv, wcount, wnewest = _committed(k, v, history, True, 0)
+    window_off = attend(*panel, wk, wv, wcount, wnewest, history, weights[0], window=True)
+    mx.eval(exact_long, exact_short, class_c, switched_long, switched_short, window_off)
+    assert _same(switched_long, class_c) and not _same(switched_long, exact_long)
+    assert _same(switched_short, exact_short) and _same(exact_long, exact_short)
+    monkeypatch.delenv("MTPLX_INKLING_ATTEND_C")
+    window_ref = attend(*panel, wk, wv, wcount, wnewest, history, weights[0], window=True)
+    assert _same(window_off, window_ref)
+
+
 @pytest.mark.parametrize("history,rows,rot", [(300, 1, 0), (1021, 3, 700), (1500, 8, 1023)])
 def test_one_launch_window_equals_the_default_path(history, rows, rot):
     """The one-launch window kernel (3 launches a visit) gives the default path's bits."""
