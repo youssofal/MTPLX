@@ -294,9 +294,12 @@ _PLAN = """
     threadgroup uint pl_info[4];
     threadgroup uint pl_row[W];
     threadgroup uint pl_pair[W];
-    for (uint i = tid; i < 128u; i += NT) pl_used[i] = 0u;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = tid; i < uint(W) * 8u; i += NT) pl_used[PAIR_EXPERT(i)] = 1u;
+    // One writer per expert flag (review 2, F5, as in ROUTE_PLAN): thread e scans the W x 8 choices.
+    for (uint e = tid; e < 128u; e += NT) {
+        uint f = 0u;
+        for (uint i = 0; i < uint(W) * 8u; ++i) f |= PAIR_EXPERT(i) == e ? 1u : 0u;
+        pl_used[e] = f;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sg == 0) {
         uint c = pl_used[4 * lane] + pl_used[4 * lane + 1] + pl_used[4 * lane + 2] + pl_used[4 * lane + 3];
