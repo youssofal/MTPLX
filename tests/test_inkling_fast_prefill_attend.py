@@ -18,6 +18,12 @@ from mtplx.models.inkling.attention import stock_attention  # noqa: E402
 from mtplx.models.inkling.fast import prefill_attend as P  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _stock_prompt_attention(monkeypatch):
+    # These hold the stock prompt routes to RC6's bits; the one-launch route is on by default.
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_FLASH", "off")
+
+
 def _clipped(shape, limit, key):
     v = mx.random.normal(shape, key=key) * 2.2
     n = mx.linalg.norm(v, axis=-1, keepdims=True)

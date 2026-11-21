@@ -5,7 +5,7 @@ extent, the sink as the softmax's first entry, window visits) in another order o
 than the default prompt route, so it is held to the definition computed in float32, within the
 rounding the query type itself puts on a result, on the shapes the prompt read makes: the first
 chunk, a history crossing the bias extent, window visits that start at key 0 and later, a short
-last chunk. The route is off unless ``MTPLX_INKLING_PROMPT_FLASH`` is on; every selection and
+last chunk. The route is on unless ``MTPLX_INKLING_PROMPT_FLASH`` is set off; every selection and
 decline is counted.
 """
 
@@ -125,16 +125,16 @@ def test_declines_what_it_does_not_serve():
     assert F.decline(q, k, v, prof[:, :, :, :512], sink[:, :, :12], 0) == "geometry"
 
 
-def test_route_is_off_by_default_and_counted_when_on(monkeypatch):
+def test_route_is_on_by_default_off_where_set_off_and_counted(monkeypatch):
     ops = _call(64, 600, 9)
     monkeypatch.setattr(F, "SHORT_PROMPT", 0)            # the route's numbers on short calls
-    monkeypatch.delenv("MTPLX_INKLING_PROMPT_FLASH", raising=False)
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_FLASH", "off")
     before = A.attention_route_counts()
     today = A.attend(*ops, 0)
     after = A.attention_route_counts()
     assert not any(k.startswith("prompt_flash.") and after[k] != before.get(k, 0) for k in after)
 
-    monkeypatch.setenv("MTPLX_INKLING_PROMPT_FLASH", "on")
+    monkeypatch.delenv("MTPLX_INKLING_PROMPT_FLASH", raising=False)
     before = A.attention_route_counts()
     on = A.attend(*ops, 0)
     on_window = A.attend(*ops, 1024)
@@ -243,10 +243,10 @@ def test_the_stage_writes_the_layers_cache_rows_and_its_attention(monkeypatch, s
     if sliding:
         xs = [xs[0]] * 3
     monkeypatch.setattr(F, "SHORT_PROMPT", 0)            # the stage's numbers on short calls
-    monkeypatch.delenv("MTPLX_INKLING_PROMPT_FLASH", raising=False)
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_FLASH", "off")
     kv0, conv0 = _caches(layer, hist, dtype, rows)
     want = M.Layer.attention(layer, *xs, kv0, conv0, None)
-    monkeypatch.setenv("MTPLX_INKLING_PROMPT_FLASH", "on")
+    monkeypatch.delenv("MTPLX_INKLING_PROMPT_FLASH", raising=False)   # on by default
     kv1, conv1 = _caches(layer, hist, dtype, rows)
     before = A.attention_route_counts()
     got = M.Layer.attention(layer, *xs, kv1, conv1, None)
@@ -260,10 +260,11 @@ def test_the_stage_writes_the_layers_cache_rows_and_its_attention(monkeypatch, s
     assert _rel_rms(got, want.astype(mx.float32)) <= 4 * BOUND[dtype]
 
 
-def test_the_stage_is_off_by_default(monkeypatch):
+def test_the_stage_is_off_where_set_off(monkeypatch):
     layer = _layer(True, mx.bfloat16, 5)
-    monkeypatch.delenv("MTPLX_INKLING_PROMPT_FLASH", raising=False)
-    assert F.stage(layer, *([mx.zeros((1, 64, 2304), mx.bfloat16)] * 3), *_caches(layer, 0, mx.bfloat16, 64), M.linear) is None
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_FLASH", "off")
+    lin = [mx.zeros((1, 64, n), mx.bfloat16) for n in (3072, 384, 24, 3072, 1024, 1024)]
+    assert F.stage(layer, *lin, _caches(layer, 0, mx.bfloat16, 64)[0]) is None
 
 
 def _route(monkeypatch, layer, hist, rows=96, prompt=None, seed=50):
@@ -276,10 +277,10 @@ def _route(monkeypatch, layer, hist, rows=96, prompt=None, seed=50):
         monkeypatch.delenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", raising=False)
     else:
         monkeypatch.setenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", str(prompt))
-    monkeypatch.delenv("MTPLX_INKLING_PROMPT_FLASH", raising=False)
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_FLASH", "off")
     kv0, conv0 = _caches(layer, hist, mx.bfloat16, rows)
     want = M.Layer.attention(layer, *xs, kv0, conv0, None)
-    monkeypatch.setenv("MTPLX_INKLING_PROMPT_FLASH", "on")
+    monkeypatch.delenv("MTPLX_INKLING_PROMPT_FLASH", raising=False)   # on by default
     kv1, conv1 = _caches(layer, hist, mx.bfloat16, rows)
     before = A.attention_route_counts()
     got = M.Layer.attention(layer, *xs, kv1, conv1, None)

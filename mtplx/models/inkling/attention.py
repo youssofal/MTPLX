@@ -348,9 +348,14 @@ def _flash_first_use(dtype, window):
     return reason
 
 
+def flash_switch_on():
+    """``MTPLX_INKLING_PROMPT_FLASH``: the one-launch prompt attention, off only where set off."""
+    return os.environ.get(_FLASH_ENV, "on").strip().lower() not in ("0", "off", "false", "no")
+
+
 def _flash_route(operands, window):
     """The prompt call in one launch, or None (counted) where the switch is off or it declines."""
-    if os.environ.get(_FLASH_ENV, "off").strip().lower() not in ("1", "on", "true", "yes"):
+    if not flash_switch_on():
         return None
     from .fast import prompt_flash as F
 

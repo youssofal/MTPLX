@@ -802,19 +802,19 @@ def select_call(keys):
     return None
 
 
-def stage(layer, q_input, k_input, v_input, kv, conv, linear):
-    """``Layer.attention`` for a prompt chunk (more than 32 rows, not a verify panel) on our
-    launches around the layer's own projections and convolutions: the attention inputs and the
-    bias profile in one launch (:func:`prep`), the cache written as the layer writes it, the
-    attention and its gate in one launch, the output projection. ``None`` (counted) where the
-    switch is off or the stage declines (a short prompt, no room, the checks below); the caller
-    then runs the layer's own path."""
+def stage(layer, q_lin, r_lin, sink, gate_lin, k_conv, v_conv, kv):
+    """The attention of a prompt chunk (more than 32 rows, not a verify panel) from the layer's own
+    projections and convolutions, on our launches: the attention inputs and the bias profile in one
+    launch (:func:`prep`), the cache written as the layer writes it, the attention and its gate in
+    one launch. Returns the gated heads ``(1, rows, heads * 128)`` for the layer's output
+    projection, or ``None`` (counted) where the switch is off or the stage declines (a short
+    prompt, no room, the checks below); the layer then runs its own path."""
     from .. import attention as A
 
-    if os.environ.get(A._FLASH_ENV, "off").strip().lower() not in ("1", "on", "true", "yes"):
+    if not A.flash_switch_on():
         return None
     visit = "window" if layer.sliding else "full"
-    dtype = q_input.dtype
+    dtype = q_lin.dtype
     reason = None
     if os.environ.get("MTPLX_INKLING_ATTENTION", "stock") != "stock":
         reason = "attention_mode"
@@ -824,11 +824,11 @@ def stage(layer, q_input, k_input, v_input, kv, conv, linear):
         reason = "no_tensor_units"
     elif dtype not in (mx.bfloat16, mx.float16):
         reason = "dtype"
-    elif (q_input.ndim != 3 or q_input.shape[0] != 1 or layer.q_scale.shape[-1] != HEAD_DIM
+    elif (q_lin.ndim != 3 or q_lin.shape[0] != 1 or layer.q_scale.shape[-1] != HEAD_DIM
             or layer.rel_basis.shape[0] != 16 or layer.r_scale.shape != (layer.q_scale.shape[0], 16)):
         reason = "geometry"
     if reason is None:
-        reason = _select(layer, kv, q_input.shape[1], dtype)
+        reason = _select(layer, kv, q_lin.shape[1], dtype)
     if reason is None:
         reason = _prep_first_use(layer, dtype, not layer.sliding)
     if reason is None:
@@ -838,11 +838,7 @@ def stage(layer, q_input, k_input, v_input, kv, conv, linear):
         return None
     cfg = layer.cfg
     offset = kv.offset
-    qp = linear(q_input, layer.q)
-    rp = linear(q_input, layer.r)
-    kc = layer.convs[0](linear(k_input, layer.k), conv, 0, k_input, None)
-    vc = layer.convs[1](linear(v_input, layer.v), conv, 1, v_input, None)
-    q, k, v, prof = prep(qp, rp, kc, vc, layer.q_scale, layer.r_scale, layer.rel_basis, offset,
+    q, k, v, prof = prep(q_lin, r_lin, k_conv, v_conv, layer.q_scale, layer.r_scale, layer.rel_basis, offset,
                          glob=not layer.sliding, cfg=cfg)
     k_rows, v_rows = k.transpose(0, 2, 1, 3), v.transpose(0, 2, 1, 3)
     if layer.sliding:
@@ -852,10 +848,7 @@ def stage(layer, q_input, k_input, v_input, kv, conv, linear):
         reserve_bank(kv, k_rows)
         keys, values = kv.update_and_fetch(k_rows, v_rows)
     window = cfg["sliding_window_size"] if layer.sliding else 0
-    sink = linear(q_input, layer.sink)
-    gate = linear(q_input, layer.gate)
-    h = flash_attention(q.transpose(0, 2, 1, 3), keys, values, prof, sink, window, gate=gate)
-    return linear(h, layer.out)
+    return flash_attention(q.transpose(0, 2, 1, 3), keys, values, prof, sink, window, gate=gate_lin)
 
 
 def _exact_pieces(x, n):
