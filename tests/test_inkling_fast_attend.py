@@ -23,7 +23,12 @@ if not mx.metal.is_available():  # pragma: no cover - CPU-only machines
 
 from mtplx.models.inkling import short_conv  # noqa: E402
 from mtplx.models.inkling.attention import stock_attention  # noqa: E402
-from mtplx.models.inkling.fast.attend import attend, reduction_plan  # noqa: E402
+from mtplx.models.inkling.fast.attend import (  # noqa: E402
+    FusedAttentionDeclined,
+    attend,
+    decline_reason,
+    reduction_plan,
+)
 from mtplx.models.inkling.fast.attn_output import attention_output  # noqa: E402
 
 
@@ -137,9 +142,63 @@ def test_bits_against_rc6_and_row_stability(window, boundary, history, rows, rot
             f"row {r} of a {rows}-row panel differs from its one-row step"
 
 
-def test_plan_matches_this_gpu_family():
-    threshold, blocks = reduction_plan()
-    assert (threshold, blocks) in ((1024, 64), (1024, 128), (4096, 32))
+def _expected_plan():
+    tail = str(mx.device_info()["architecture"])[-1:]
+    return {"s": (1024, 64), "d": (1024, 128)}.get(tail, (4096, 32))
+
+
+def test_plan_is_mlx_s_own_for_this_device_and_override(monkeypatch):
+    """MLX 0.32.2's rule for RC6's call (3 simdgroups): one tuple per GPU family, replaced by
+    MLX_SDPA_BLOCKS > 0 rounded up to a multiple of 32, parsed with atoi on every call."""
+    monkeypatch.delenv("MLX_SDPA_BLOCKS", raising=False)
+    expected = _expected_plan()
+    assert reduction_plan() == expected
+    for text, blocks in (("128", 128), ("100", 128), ("32", 32), ("1", 32), (" 64x", 64), ("+96", 96)):
+        monkeypatch.setenv("MLX_SDPA_BLOCKS", text)
+        assert reduction_plan() == (expected[0], blocks), text
+    for text in ("0", "-64", "abc", ""):
+        monkeypatch.setenv("MLX_SDPA_BLOCKS", text)
+        assert reduction_plan() == expected, text
+
+
+def test_fused_route_qualifies_here_and_declines_a_reduction_it_does_not_serve(monkeypatch):
+    monkeypatch.delenv("MLX_SDPA_BLOCKS", raising=False)
+    assert decline_reason(mx.bfloat16) is None
+    monkeypatch.setenv("MLX_SDPA_BLOCKS", "512")
+    assert decline_reason(mx.bfloat16) == "blocks_512"
+    k, v, inputs, weights = _setup(40, 1, seed=2)
+    q, rel, sink, gate, x, tail = inputs
+    with pytest.raises(FusedAttentionDeclined):
+        attend(q, rel, sink, gate, k[:, :, 39:], v[:, :, 39:], k[:, :, :39], v[:, :, :39], 39, 0, 39,
+               weights[0], window=False)
+
+
+def test_block_override_changes_bits_and_the_fused_route_follows_it(monkeypatch):
+    """The review's case: 4,096 equal logits (sink included), one value component 1, 1/256,
+    1/256 at positions 0, 1, 64. Where keys 0 and 64 share a block their bf16 partial drops
+    the 1/256; with a block each it survives. The fused route equals RC6 under both."""
+    history, rows = 4094, 1
+    k, v, inputs, weights = _setup(history + rows, rows, seed=4)
+    q, rel, sink, gate, x, tail = inputs
+    q, rel, sink = mx.zeros_like(q), mx.zeros_like(rel), mx.zeros_like(sink)
+    gate = mx.full(gate.shape, 30.0, gate.dtype)
+    v = mx.zeros_like(v)
+    v[0, 0, 0, 0] = 1.0
+    v[0, 0, 1, 0] = 1.0 / 256
+    v[0, 0, 64, 0] = 1.0 / 256
+    case = (q, rel, sink, gate, x, tail)
+    default_blocks = _expected_plan()[1]
+    outs = []
+    for blocks in (None, 64 if default_blocks == 128 else 128):
+        if blocks is None:
+            monkeypatch.delenv("MLX_SDPA_BLOCKS", raising=False)
+        else:
+            monkeypatch.setenv("MLX_SDPA_BLOCKS", str(blocks))
+        hg, _, _ = _fast(k, v, history, case, weights, False, False, 0)
+        ref, _, _ = _rc6(k, v, history, case, weights, False, False)
+        assert _same(hg, ref), f"fused attention differs from RC6 with MLX_SDPA_BLOCKS={blocks}"
+        outs.append(hg)
+    assert not _same(outs[0], outs[1]), "the example no longer separates the two reductions"
 
 
 def test_rejects_panels_outside_the_served_widths():

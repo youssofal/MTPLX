@@ -32,6 +32,7 @@ them) and ``merge`` (one threadgroup per row and head: MLX's reduction, then the
 from __future__ import annotations
 
 import math
+import os
 import struct
 from functools import lru_cache
 
@@ -88,21 +89,137 @@ def lane_tree_ok():
     return bool(mx.all(ok == 1).item())
 
 
-@lru_cache(maxsize=1)
-def reduction_plan():
-    """``(threshold, blocks)`` of MLX 0.32.2's vector attention for RC6's one-row call.
+def _atoi(text):
+    """C ``atoi``: leading blanks, an optional sign, then digits; 0 when there are none."""
+    t = (text or "").lstrip(" \t\n\r\f\v")
+    sign = -1 if t[:1] == "-" else 1
+    t = t[1:] if t[:1] in ("+", "-") else t
+    digits = len(t) - len(t.lstrip("0123456789"))
+    return sign * int(t[:digits]) if digits else 0
 
-    RC6 calls it with one query row, 24 query heads over 8 key/value heads and a float
-    mask. Two-pass when (architecture ends in ``d`` or ``s``) and N >= 1024, or (grouped
-    heads and N >= 4096); blocks for 3 simdgroups: 64 on ``s``, 128 on ``d``, 32 elsewhere.
-    """
+
+@lru_cache(maxsize=1)
+def _family():
     arch = str(mx.device_info().get("architecture", ""))
-    tail = arch[-1:] if arch else ""
-    if tail == "s":
-        return 1024, 64
-    if tail == "d":
-        return 1024, 128
-    return 4096, 32
+    return arch[-1:] if arch else ""
+
+
+def reduction_plan():
+    """``(threshold, blocks)`` MLX 0.32.2's vector attention uses for RC6's one-row call here.
+
+    RC6 calls it with one query row, 24 query heads over 8 key/value heads (3 simdgroups a
+    threadgroup) and a float mask. Two-pass when (architecture ends in ``d`` or ``s``) and
+    N >= 1024, or (grouped heads and N >= 4096); blocks for 3 simdgroups: 64 on ``s``, 128 on
+    ``d``, 32 elsewhere, and ``MLX_SDPA_BLOCKS`` > 0 replaces them, rounded up to a multiple of
+    32 (MLX reads it on every call with ``atoi``, so this does too).
+    """
+    tail = _family()
+    threshold, blocks = (1024, 64) if tail == "s" else (1024, 128) if tail == "d" else (4096, 32)
+    override = _atoi(os.environ.get("MLX_SDPA_BLOCKS"))
+    if override > 0:
+        blocks = ((override + 31) // 32) * 32
+    return threshold, blocks
+
+
+#: Largest reduction the fused route serves (MLX's own choices for RC6's call are 32 to 128).
+MAX_BLOCKS = 256
+
+
+class FusedAttentionDeclined(RuntimeError):
+    """The fused attention would not give MLX's bits here; the caller runs RC6's stage."""
+
+
+#: (dtype, plan) -> (reason, detail) of every declined qualification in this process.
+DECLINED = {}
+
+
+def decline_reason(dtype=mx.bfloat16, plan=None):
+    """``None`` when the fused attention gives MLX's own bits on this Mac and setting, else a
+    short reason for the caller's fallback counter. Qualified once per (dtype, plan), at first
+    use (warm-up): the reduction must be one this module serves, and the fused kernels must
+    equal RC6's attention (MLX's kernel, called as RC6 calls it) bit for bit on synthetic
+    windows and banks covering both reductions, the long-history order and the widest panel.
+    """
+    return _qualify(str(dtype), plan or reduction_plan())
+
+
+@lru_cache(maxsize=16)
+def _qualify(dtype_name, plan):
+    threshold, blocks = plan
+    if blocks > MAX_BLOCKS or blocks % 32:
+        return _decline(dtype_name, plan, f"blocks_{blocks}", "reduction outside the fused route")
+    dtype = getattr(mx, dtype_name.split(".")[-1])
+    try:
+        for window, history, rows, rot in _qualification_cases(plan):
+            if not _same_as_mlx(dtype, plan, window, history, rows, rot):
+                return _decline(dtype_name, plan, "bits_" + ("window" if window else "global"),
+                                f"history {history}, {rows} rows")
+    except (RuntimeError, ValueError) as exc:          # a pipeline this Mac refuses
+        return _decline(dtype_name, plan, "kernel_refused", str(exc)[:300])
+    return None
+
+
+def _decline(dtype_name, plan, reason, detail):
+    DECLINED[(dtype_name, plan)] = (reason, detail)
+    return reason
+
+
+def _qualification_cases(plan):
+    threshold, blocks = plan
+    tiles = max(threshold, 32 * blocks) + 160          # two-pass rows with full key tiles
+    return [
+        # (window, committed history, rows, ring rotation)
+        (True, 300, 1, 0),        # window before fill: single pass
+        (True, 1500, 2, 517),     # full, wrapped ring: two-pass on d and s families
+        (False, 300, 32, 0),      # widest panel: 1,024-thread threadgroups
+        (False, tiles, 3, 0),     # long-history tile order
+    ]
+
+
+def _same_as_mlx(dtype, plan, window, history, rows, rot):
+    from ..attention import stock_attention
+
+    length = history + rows
+    keys = mx.random.split(mx.random.key(20261121 + 7 * history + rows), 8)
+
+    def clipped(shape, limit, key):
+        v = mx.random.normal(shape, key=key) * 2.2
+        n = mx.linalg.norm(v, axis=-1, keepdims=True)
+        return (v * mx.minimum(1.0, limit / (n + 1e-6))).astype(dtype)
+
+    k = clipped((1, KV_HEADS, length, HEAD_DIM), 22.6, keys[0])
+    v = mx.fast.rms_norm(mx.random.normal((1, KV_HEADS, length, HEAD_DIM), key=keys[1]), None, 1e-6).astype(dtype)
+    q = clipped((1, rows, HEADS, HEAD_DIM), 22.6, keys[2])
+    rel = clipped((1, rows, HEADS, 16), 8.0, keys[3])
+    sink = (mx.random.normal((1, rows, HEADS), key=keys[4]) * 3.0).astype(dtype)
+    gate = (mx.random.normal((1, rows, HEADS * HEAD_DIM), key=keys[5]) * 2.0).astype(dtype)
+    basis = (mx.random.normal((16, EXTENT), key=keys[6]) * 0.3).astype(dtype)
+    if window:
+        count = min(history, WINDOW)
+        kc = mx.zeros((1, KV_HEADS, WINDOW, HEAD_DIM), dtype)
+        vc = mx.zeros((1, KV_HEADS, WINDOW, HEAD_DIM), dtype)
+        if count:
+            slots = mx.array([(p + rot) % WINDOW for p in range(history - count, history)], mx.int32)
+            kc[:, :, slots, :] = k[:, :, history - count:history]
+            vc[:, :, slots, :] = v[:, :, history - count:history]
+        newest = (history - 1 + rot) % WINDOW if count else 0
+    else:
+        count, newest = history, 0
+        kc, vc = k[:, :, :history], v[:, :, :history]
+    fast = _attend(q, rel, sink, gate, k[:, :, history:], v[:, :, history:], kc, vc, count, newest,
+                   history, basis, window=window, plan=plan)
+    prof = rel @ basis.astype(rel.dtype)
+    heads = []
+    for r in range(rows):
+        P = history + r
+        begin = max(0, P - (WINDOW - 1)) if window else 0
+        h = stock_attention(q[:, r:r + 1].transpose(0, 2, 1, 3), k[:, :, begin:P + 1], v[:, :, begin:P + 1],
+                            prof[:, r:r + 1], sink[:, r:r + 1], WINDOW if window else 0)
+        heads.append(h.transpose(0, 2, 1, 3).reshape(1, 1, -1))
+    h = mx.concatenate(heads, axis=1)
+    ref = (h.astype(mx.float32) * mx.sigmoid(gate.astype(mx.float32))).astype(h.dtype)
+    word = mx.uint16 if dtype.size == 2 else mx.uint32
+    return bool(mx.array_equal(fast.view(word), ref.view(word)).item())
 
 
 _HEADER = """
@@ -633,7 +750,21 @@ def attend(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newes
     ``long`` (default: on for global visits of bf16 panels up to 8 rows) takes the exact
     long-history tile order for the committed keys; ``long=False`` keeps MLX's per-key order
     everywhere. Both give RC6's bits.
+
+    Raises ``FusedAttentionDeclined`` where ``decline_reason`` is not ``None`` (a reduction
+    this route does not serve, or bits that differ from MLX's on this Mac): call
+    ``decline_reason`` at warm-up and run RC6's stage, counted, instead.
     """
+    plan = plan or reduction_plan()
+    reason = decline_reason(q.dtype, plan)
+    if reason is not None:
+        raise FusedAttentionDeclined(f"fused attention declined on this Mac: {reason} ({DECLINED[(str(q.dtype), plan)][1]})")
+    return _attend(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newest, pos,
+                   rel_basis, window=window, plan=plan, one_launch_window=one_launch_window, long=long)
+
+
+def _attend(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newest, pos,
+            rel_basis, *, window, plan, one_launch_window=False, long=None):
     rows = q.shape[1]
     if not 1 <= rows <= MAX_ROWS:
         raise ValueError(f"A panel holds 1 to {MAX_ROWS} rows, got {rows}")
