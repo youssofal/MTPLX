@@ -102,16 +102,24 @@ def batched_rows(stack, table):
     visits = table.shape[0]
     if count_ > 128:
         raise ValueError("the pass softmax serves at most 128 prior states (one simdgroup a row)")
-    scores = table.reshape(visits * QUERIES, width) @ stack.reshape(rows * count_, width).T
-    weights = _kernel()(
-        inputs=[scores],
-        template=[("W", rows), ("S", count_), ("NQ", QUERIES), ("SCALE", _f32_bits(width ** -0.5))],
-        grid=(visits * rows * QUERIES * 32, 1, 1),
-        threadgroup=(32, 1, 1),
-        output_shapes=[(visits, rows, QUERIES, count_)],
-        output_dtypes=[mx.float32],
-    )[0]
-    mixed = weights @ stack  # (visits, W, 4, P) @ (1, W, P, D): batched over visits and rows
+
+    def library():
+        scores = table.reshape(visits * QUERIES, width) @ stack.reshape(rows * count_, width).T
+        weights = _kernel()(
+            inputs=[scores],
+            template=[("W", rows), ("S", count_), ("NQ", QUERIES), ("SCALE", _f32_bits(width ** -0.5))],
+            grid=(visits * rows * QUERIES * 32, 1, 1),
+            threadgroup=(32, 1, 1),
+            output_shapes=[(visits, rows, QUERIES, count_)],
+            output_dtypes=[mx.float32],
+        )[0]
+        return weights @ stack  # (visits, W, 4, P) @ (1, W, P, D): batched over visits and rows
+
+    # The scores, softmax and mix as our launches where proven (nax_reads.py), else the library's
+    # two products around the softmax.
+    from .nax_reads import message_read
+
+    mixed = message_read(table, stack, library)
     return [mixed[k : k + 1] for k in range(visits)]
 
 

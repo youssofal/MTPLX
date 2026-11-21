@@ -771,8 +771,15 @@ def depth_read(queries, keys):
     q = queries.reshape(-1, width).astype(mx.float32)
     if fixed_order():
         return attend_rows(q, keys)
-    kw = scores(q, keys)
-    return probs(kw.get("scores"), width ** -0.5, kw.get("joined")) @ keys
+
+    def library():
+        kw = scores(q, keys)
+        return probs(kw.get("scores"), width ** -0.5, kw.get("joined")) @ keys
+
+    # Lane F1: the scores, softmax and mix in one launch of ours where proven (nax_reads.py).
+    from .nax_reads import depth_read as one_launch
+
+    return one_launch(queries, keys, library)
 
 
 def message_rows(stack, queries):
