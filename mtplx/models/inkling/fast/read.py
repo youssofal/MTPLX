@@ -584,18 +584,23 @@ def read(partial, closed, queries, eps, *, mode, gains=(), messages=None, read_i
         shapes = [out0, (1,), (1,)]
         dtypes = [mx.bfloat16 if mode == 0 else mx.float32, mx.float32, mx.float32]
     tpg = _threads(width)
-    outs = _read_kernel()(
-        inputs=[*pad, partial, queries, *g, rin, *m, *d],
-        template=[("MODE", mode), ("D", width), ("S", sources), ("NQ", nq), ("TPG", tpg),
-                  ("NOREAD", bool(noread)), ("READ_IN", read_in is not None), ("MSEP", msep),
-                  ("OUT0", dtypes[0]), ("NC", max(controllers, 1)), ("CHUNKS", chunks),
-                  ("DROWS", _DOWN_ROWS), ("MSG_BASE", msg_base),
-                  ("EPS", _f32_bits(eps)), ("SCALE", _f32_bits(width ** -0.5))],
-        grid=(groups * tpg, 1, 1),
-        threadgroup=(tpg, 1, 1),
-        output_shapes=shapes,
-        output_dtypes=dtypes,
-    )
+    template = [("MODE", mode), ("D", width), ("S", sources), ("NQ", nq), ("TPG", tpg),
+                ("NOREAD", bool(noread)), ("READ_IN", read_in is not None), ("MSEP", msep),
+                ("OUT0", dtypes[0]), ("NC", max(controllers, 1)), ("CHUNKS", chunks),
+                ("DROWS", _DOWN_ROWS), ("MSG_BASE", msg_base),
+                ("EPS", _f32_bits(eps)), ("SCALE", _f32_bits(width ** -0.5))]
+    inputs = [*pad, partial, queries, *g, rin, *m, *d]
+
+    def launch(kernel):
+        return kernel(inputs=inputs, template=template, grid=(groups * tpg, 1, 1), threadgroup=(tpg, 1, 1),
+                      output_shapes=shapes, output_dtypes=dtypes)
+
+    # Lane F1: the same arithmetic in fewer dependent steps where proven (read_lean.py).
+    from .read_lean import launch_read
+
+    key = (mode, sources, nq, rows, width, bool(noread), read_in is not None, msep, controllers, msg_base,
+           str(partial.dtype), str(queries.dtype), str(dtypes[0]))
+    outs = launch_read(key, launch, _read_kernel, mode)
     return outs if mode == 2 else outs[:1]
 
 
