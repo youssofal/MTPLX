@@ -951,11 +951,12 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
     # A wider loop-pass panel stages KC columns at a time (all simdgroups in step) rather than norm
     # its input in every simdgroup; a wider first-pass panel reads its bf16 input from device memory,
     # which measured faster than chunked staging (receipts/probe-mode-1.json: 86 vs 104 us at 8 rows).
-    # Affine panels too wide to stage read their sources from device memory in every simdgroup:
+    # 4-bit panels too wide to stage read their sources from device memory in every simdgroup:
     # chunked staging measured 2.2 times slower there (7 rows: loop pass 286 -> 108 µs, global
-    # passes 404 -> 188; 8 rows 329 -> 145 and 472 -> 220; receipts/q4forms-1.json).
+    # passes 404 -> 188; 8 rows 329 -> 145 and 472 -> 220; receipts/q4forms-1.json). 8-bit and
+    # bf16 panels keep chunked staging (8-bit loop pass at 8 rows 122 against 151 direct, -2).
     if stage2 is None:
-        stage2 = not affine
+        stage2 = not any(m.bits == 4 for m in (mq, mr, mg, mk, mv))
     stage2 = bool(raw is not None and not stage and stage2)
     chunk = rch or (_ROW_CHUNK if rows > 4 else rows)
     # Chunks hold whole 256-column blocks when an affine matrix reads them.
