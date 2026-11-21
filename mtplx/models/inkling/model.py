@@ -344,10 +344,12 @@ class Convolution(nn.Module):
         ).astype(mx.float32)
         self.size = self.weight.shape[0]
 
-    def __call__(self, x, cache, slot, drive=None, tape=None):
+    def __call__(self, x, cache, slot, drive=None, tape=None, add=None, out_dtype=None):
+        """The convolution's output; with ``out_dtype`` also the visit's residual step after it:
+        ``(out.astype(float32) + add.astype(float32)).astype(out_dtype)`` (``add`` optional)."""
         size = self.size
         change = None if self.dynamic is None else linear(drive, self.dynamic)
-        fused = convolve(x, cache[slot], self.weight, change, tape is not None)
+        fused = convolve(x, cache[slot], self.weight, change, tape is not None, add, out_dtype)
         if fused is not None:
             out, cache[slot], history = fused
             if tape is not None:
@@ -387,7 +389,13 @@ class Convolution(nn.Module):
                 weighted = weighted + current * coefficients
             weighted = weighted.reshape(x.shape)
             divisor = math.sqrt(2 * size + 1)
-        return ((xf + weighted) / divisor).astype(x.dtype)
+        out = ((xf + weighted) / divisor).astype(x.dtype)
+        if out_dtype is None:
+            return out
+        joined = out.astype(mx.float32)
+        if add is not None:
+            joined = joined + add.astype(mx.float32)
+        return joined.astype(out_dtype)
 
 
 class Layer(nn.Module):
@@ -528,11 +536,12 @@ class Layer(nn.Module):
                 for i, h in enumerate(sources)
             ]
         attn = self.attention(q, k, v, kv, conv, tape)
-        residual = self.convs[2](attn, conv, 2, tape=tape).astype(mx.float32)
+        # The attention convolution and the residual join in one launch where the convolution is ours.
+        residual = self.convs[2](
+            attn, conv, 2, tape=tape, add=None if self.boundary else x, out_dtype=mx.float32
+        )
         if self.boundary:
             closed.append(x)
-        else:
-            residual = residual + x.astype(mx.float32)
         ffn_in = (
             prompt_glue.input_norm(residual, closed, self.mlp_query, self.ffn_norm, self.eps, "expert_input")
             if tape is None and messages is None and self.cfg["attn_res_normalize_values"]
@@ -550,9 +559,7 @@ class Layer(nn.Module):
                 ffn = self.controllers[3](ffn, messages[..., 3, :], self.eps)
             ffn_in = norm(ffn, self.ffn_norm, self.eps).astype(x.dtype)
         routed = self.experts(ffn_in)
-        return (
-            residual + self.convs[3](routed, conv, 3, tape=tape).astype(mx.float32)
-        ).astype(x.dtype)
+        return self.convs[3](routed, conv, 3, tape=tape, add=residual, out_dtype=x.dtype)
 
 
 class Embedding(nn.Module):
