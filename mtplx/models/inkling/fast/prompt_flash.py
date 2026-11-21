@@ -736,12 +736,79 @@ def _prep_first_use(layer, dtype, glob):
     return reason
 
 
+# ----------------------------------------------------------------------------------------
+# Which prompts the stage reads. It wins where the attention's share of a chunk grows with the
+# keys, and is level or behind on short prompts, where a chunk's attention is a small part of it
+# and the default route's launches are as fast. So a prompt shorter than SHORT_PROMPT reads on the
+# default route, every chunk of it: the length is the whole prompt's (set by the prompt read
+# before its first chunk, restored prefix included), never less than the keys this chunk sees,
+# so one prompt reads on one route. And a chunk takes the stage only if the Mac's working set has
+# room for what the stage holds beyond the default route: its chunk peak is higher by up to
+# EXTRA_PEAK_BYTES, and a global visit's first chunk sizes the visit's bank for the whole prompt
+# at once (the default route grows it chunk by chunk). Without the room the chunk reads on the
+# default route, counted, as it does today.
+# ----------------------------------------------------------------------------------------
+
+#: The prompt length from which the stage reads a prompt faster than the default route.
+SHORT_PROMPT = 8192
+
+#: The most a prompt chunk on the stage holds at its peak beyond the default route's chunk:
+#: lanes/p2/decide-1.json, peak growth over the active memory, stage against stock, 0.22 GB at 4K,
+#: 0.41 GB at 16K, 0.12 GB at 64K on Optimized Quality.
+EXTRA_PEAK_BYTES = 512 * 1024**2
+
+
+def short_prompt(keys):
+    """Whether the prompt a call belongs to is shorter than the crossover: its length as the prompt
+    read set it, never less than the ``keys`` the call sees."""
+    total = _prompt_tokens()
+    return max(total if total <= MAX_PROMPT else 0, keys) < SHORT_PROMPT
+
+
+def _bank_bytes(kv, rows, cfg, dtype):
+    """What :func:`reserve_bank` allocates for this chunk of a global visit (0 where it does not)."""
+    keys = kv.keys
+    need = kv.offset + rows
+    if keys is not None and need <= keys.shape[2]:
+        return 0
+    total = _prompt_tokens()
+    if not need <= total <= MAX_PROMPT:
+        return 0
+    step = getattr(kv, "step", 256)
+    return 2 * (-(-total // step) * step) * cfg["num_key_value_heads"] * cfg["head_dim"] * dtype.size
+
+
+def _select(layer, kv, rows, dtype):
+    """``None`` where the stage reads this chunk, else why the default route does."""
+    from ..head import fits_route
+
+    if short_prompt(kv.offset + rows):
+        return "short_prompt"
+    extra = EXTRA_PEAK_BYTES + (0 if layer.sliding else _bank_bytes(kv, rows, layer.cfg, dtype))
+    if not fits_route(extra):
+        return "memory"
+    return None
+
+
+def select_call(keys):
+    """The same choice for one attention call of a prompt (``attention.attend``'s one-launch route,
+    which serves prompt calls the stage did not take): it holds no bank of its own."""
+    from ..head import fits_route
+
+    if short_prompt(keys):
+        return "short_prompt"
+    if not fits_route(EXTRA_PEAK_BYTES):
+        return "memory"
+    return None
+
+
 def stage(layer, q_input, k_input, v_input, kv, conv, linear):
     """``Layer.attention`` for a prompt chunk (more than 32 rows, not a verify panel) on our
     launches around the layer's own projections and convolutions: the attention inputs and the
     bias profile in one launch (:func:`prep`), the cache written as the layer writes it, the
     attention and its gate in one launch, the output projection. ``None`` (counted) where the
-    switch is off or the stage declines; the caller then runs the layer's own path."""
+    switch is off or the stage declines (a short prompt, no room, the checks below); the caller
+    then runs the layer's own path."""
     from .. import attention as A
 
     if os.environ.get(A._FLASH_ENV, "off").strip().lower() not in ("1", "on", "true", "yes"):
@@ -760,6 +827,8 @@ def stage(layer, q_input, k_input, v_input, kv, conv, linear):
     elif (q_input.ndim != 3 or q_input.shape[0] != 1 or layer.q_scale.shape[-1] != HEAD_DIM
             or layer.rel_basis.shape[0] != 16 or layer.r_scale.shape != (layer.q_scale.shape[0], 16)):
         reason = "geometry"
+    if reason is None:
+        reason = _select(layer, kv, q_input.shape[1], dtype)
     if reason is None:
         reason = _prep_first_use(layer, dtype, not layer.sliding)
     if reason is None:

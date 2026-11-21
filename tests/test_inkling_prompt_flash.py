@@ -127,6 +127,7 @@ def test_declines_what_it_does_not_serve():
 
 def test_route_is_off_by_default_and_counted_when_on(monkeypatch):
     ops = _call(64, 600, 9)
+    monkeypatch.setattr(F, "SHORT_PROMPT", 0)            # the route's numbers on short calls
     monkeypatch.delenv("MTPLX_INKLING_PROMPT_FLASH", raising=False)
     before = A.attention_route_counts()
     today = A.attend(*ops, 0)
@@ -159,6 +160,7 @@ def test_a_decline_runs_the_default_route_and_is_counted(monkeypatch):
 
 def test_a_failed_first_use_check_keeps_the_default_route(monkeypatch):
     ops = _call(64, 600, 17, mx.float16)
+    monkeypatch.setattr(F, "SHORT_PROMPT", 0)
     monkeypatch.setenv("MTPLX_INKLING_PROMPT_FLASH", "on")
     monkeypatch.setattr(A, "_flash_checks", {})
 
@@ -188,7 +190,7 @@ from mtplx.models.inkling.cache import WindowCache  # noqa: E402
 
 _CFG = {"qk_l2_clip_threshold": 22.627416997969522, "rel_l2_clip_threshold": 8.0, "rms_norm_eps": 1e-6,
         "log_scaling_alpha": 0.1, "log_scaling_n_floor": 8192, "use_value_norm_no_gamma": True,
-        "sliding_window_size": 1024}
+        "sliding_window_size": 1024, "num_key_value_heads": 8, "head_dim": 128}
 
 
 def _layer(sliding, dtype, seed):
@@ -240,6 +242,7 @@ def test_the_stage_writes_the_layers_cache_rows_and_its_attention(monkeypatch, s
     xs = [(mx.random.normal((1, rows, 2304), key=mx.random.key(40 + i)) * 0.5).astype(dtype) for i in range(3)]
     if sliding:
         xs = [xs[0]] * 3
+    monkeypatch.setattr(F, "SHORT_PROMPT", 0)            # the stage's numbers on short calls
     monkeypatch.delenv("MTPLX_INKLING_PROMPT_FLASH", raising=False)
     kv0, conv0 = _caches(layer, hist, dtype, rows)
     want = M.Layer.attention(layer, *xs, kv0, conv0, None)
@@ -261,6 +264,103 @@ def test_the_stage_is_off_by_default(monkeypatch):
     layer = _layer(True, mx.bfloat16, 5)
     monkeypatch.delenv("MTPLX_INKLING_PROMPT_FLASH", raising=False)
     assert F.stage(layer, *([mx.zeros((1, 64, 2304), mx.bfloat16)] * 3), *_caches(layer, 0, mx.bfloat16, 64), M.linear) is None
+
+
+def _route(monkeypatch, layer, hist, rows=96, prompt=None, seed=50):
+    """The layer's attention for one chunk with the switch on: (counter that moved, output, the
+    default route's output on the same inputs)."""
+    xs = [(mx.random.normal((1, rows, 2304), key=mx.random.key(seed + i)) * 0.5).astype(mx.bfloat16) for i in range(3)]
+    if layer.sliding:
+        xs = [xs[0]] * 3
+    if prompt is None:
+        monkeypatch.delenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", raising=False)
+    else:
+        monkeypatch.setenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", str(prompt))
+    monkeypatch.delenv("MTPLX_INKLING_PROMPT_FLASH", raising=False)
+    kv0, conv0 = _caches(layer, hist, mx.bfloat16, rows)
+    want = M.Layer.attention(layer, *xs, kv0, conv0, None)
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_FLASH", "on")
+    kv1, conv1 = _caches(layer, hist, mx.bfloat16, rows)
+    before = A.attention_route_counts()
+    got = M.Layer.attention(layer, *xs, kv1, conv1, None)
+    after = A.attention_route_counts()
+    moved = [k for k in after if k.startswith("prompt_stage.") and after[k] != before.get(k, 0)]
+    assert len(moved) == 1 and after[moved[0]] == before.get(moved[0], 0) + 1
+    calls = [k for k in after if k.startswith("prompt_flash.") and after[k] != before.get(k, 0)]
+    if moved[0].endswith(".selected"):
+        assert not calls                                    # the stage's attention is its own
+    else:
+        assert len(calls) == 1                              # the layer's own path asked attend's route
+        moved.append(calls[0])
+    mx.eval(want, got)
+    return moved if len(moved) > 1 else moved[0], got, want
+
+
+def _same_bits(a, b):
+    return a.shape == b.shape and bool(mx.array_equal(a.view(mx.uint16), b.view(mx.uint16)).item())
+
+
+@pytest.mark.parametrize("sliding", [False, True])
+def test_a_prompt_shorter_than_the_crossover_reads_on_the_default_route(monkeypatch, sliding):
+    layer = _layer(sliding, mx.bfloat16, 61)
+    visit = "window" if sliding else "full"
+    moved, got, want = _route(monkeypatch, layer, 0, prompt=F.SHORT_PROMPT - 1)
+    assert moved == [f"prompt_stage.{visit}.stock.short_prompt", f"prompt_flash.{visit}.stock.short_prompt"]
+    assert _same_bits(got, want)
+    moved, got, want = _route(monkeypatch, layer, 0, prompt=F.SHORT_PROMPT)
+    assert moved == f"prompt_stage.{visit}.selected"
+    assert _rel_rms(got, want.astype(mx.float32)) <= 4 * BOUND[mx.bfloat16]
+
+
+def test_the_prompt_is_never_shorter_than_the_keys_a_chunk_sees(monkeypatch):
+    # no prompt length set, or a stale one: the history and the chunk are the length so far
+    layer = _layer(False, mx.bfloat16, 67)
+    hist = F.SHORT_PROMPT
+    assert _route(monkeypatch, layer, hist, prompt=None)[0] == "prompt_stage.full.selected"
+    assert _route(monkeypatch, layer, hist, prompt=100)[0] == "prompt_stage.full.selected"
+    assert _route(monkeypatch, layer, 0, prompt=None)[0][0] == "prompt_stage.full.stock.short_prompt"
+
+
+def test_no_room_for_the_stage_reads_on_the_default_route(monkeypatch):
+    from mtplx.models.inkling import head as H
+
+    monkeypatch.setattr(F, "SHORT_PROMPT", 0)
+    prompt = 64 * 1024
+    monkeypatch.setenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", str(prompt))
+    bank = F._bank_bytes(KVCache(), 96, _CFG, mx.bfloat16)
+    assert bank == 2 * prompt * 8 * 128 * 2
+    margin = 128 * 1024**2
+
+    def room(n):
+        monkeypatch.setattr(H, "_working_set", lambda device: mx.get_active_memory() + margin + n)
+
+    window, full = _layer(True, mx.bfloat16, 71), _layer(False, mx.bfloat16, 73)
+    room(F.EXTRA_PEAK_BYTES // 2)                                    # not even the chunk's extra
+    for layer, visit in ((window, "window"), (full, "full")):
+        moved, got, want = _route(monkeypatch, layer, 0, prompt=prompt)
+        assert moved == [f"prompt_stage.{visit}.stock.memory", f"prompt_flash.{visit}.stock.memory"]
+        assert _same_bits(got, want)
+    room(F.EXTRA_PEAK_BYTES + bank // 2)                             # the chunk, not the whole bank
+    assert _route(monkeypatch, window, 0, prompt=prompt)[0] == "prompt_stage.window.selected"
+    moved, got, want = _route(monkeypatch, full, 0, prompt=prompt)
+    # the stage declines (the bank); attend's one-launch route, which grows no bank, takes the call
+    assert moved == ["prompt_stage.full.stock.memory", "prompt_flash.full.selected"]
+    assert _rel_rms(got, want.astype(mx.float32)) <= 4 * BOUND[mx.bfloat16]
+    room(F.EXTRA_PEAK_BYTES + 2 * bank)
+    assert _route(monkeypatch, full, 0, prompt=prompt)[0] == "prompt_stage.full.selected"
+
+
+def test_the_bank_bytes_are_what_the_bank_takes(monkeypatch):
+    for total, hist in ((5000, 0), (5000, 1000), (70000, 4096)):
+        monkeypatch.setenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", str(total))
+        kv = KVCache()
+        if hist:
+            kv.update_and_fetch(*_rows(hist, 400))
+        k, _ = _rows(512, 401)
+        want = F._bank_bytes(kv, 512, _CFG, mx.bfloat16)
+        assert F.reserve_bank(kv, k)
+        assert want == kv.keys.nbytes + kv.values.nbytes
+        assert F._bank_bytes(kv, 512, _CFG, mx.bfloat16) == 0          # sized: nothing more to take
 
 
 def test_the_gated_store_applies_the_layers_gate():

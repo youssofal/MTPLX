@@ -357,6 +357,8 @@ def _flash_route(operands, window):
     scope = "window" if window else "full"
     reason = F.decline(*operands, window)
     if reason is None:
+        reason = F.select_call(operands[1].shape[2])
+    if reason is None:
         reason = _flash_first_use(operands[0].dtype, window)
     _note_route(f"prompt_flash.{scope}." + ("selected" if reason is None else "stock." + reason))
     return None if reason is not None else F.flash_attention(*operands, window)
