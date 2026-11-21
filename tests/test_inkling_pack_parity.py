@@ -208,12 +208,18 @@ def test_stage_c_takes_one_launch_on_every_storage_form(rows, dtype, monkeypatch
     monkeypatch.setattr(fast_attend, "attend", lambda *args, **kw: hg)
     dense = (mx.random.normal((HIDDEN, 3072), key=mx.random.key(5)) * 0.02).astype(dtype)
     mx.eval(dense)
+    from mtplx.models.inkling.fast.routes import capture_counts, stage_paths
+
     counts = {}
     for form, out in (("16-bit", dense), ("4-bit", _affine(HIDDEN, 3072, 4, 6, dtype)),
                       ("8-bit", _affine(HIDDEN, 3072, 8, 7, dtype))):
         convs = [SimpleNamespace(dynamic=None, size=4, weight=conv_weight) for _ in range(4)]
         layer = SimpleNamespace(sliding=True, boundary=False, out=out, convs=convs, rel_basis=None)
-        counts[form] = _launches(eng, lambda layer=layer: step.fused_attention(layer, a, x, state, 3, panel))
+        with capture_counts() as served:
+            counts[form] = _launches(eng, lambda layer=layer: step.fused_attention(layer, a, x, state, 3, panel))
+        # The route is read from its own counter (what a request's log shows), not inferred.
+        route = "fused.bc_output.panel" if form == "16-bit" else "fused.bc_output.stored"
+        assert served.get(route) == 2 and not stage_paths(served).keys() - {route, "fused.bc_attention"}, served
     assert all(n <= counts["16-bit"][0] for n, _ in counts.values()), counts
     assert all(stock == 0 for _, stock in counts.values()), counts
 

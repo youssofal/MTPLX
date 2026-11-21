@@ -535,13 +535,16 @@ def fused_attention(layer, a, x, state, visit, panel):
             newest = valid
         hg = panel_attend(a.q, a.rel, a.sink, a.gate_logits, a.k_rows, a.v_rows, keys, values, valid,
                           newest, panel.pos, layer.rel_basis, window=layer.sliding)
+        count("fused.bc_attention")
     reason = output_reason(layer, hg.dtype)
     if reason is None:
+        count("fused.bc_output.panel")
         return panel_output(hg, layer.out, layer.convs[2].weight, state.tail(visit, 2), x,
                             boundary=layer.boundary)
     if stored_output_reason(layer, hg.dtype, panel.rows) is None:
         fused = stored_output(layer, hg, x, state, visit)
         if fused is not None:
+            count("fused.bc_output.stored")
             return fused
     kind = "unfused" if isinstance(layer.out, AffineWeight) and launch_serves(layer.out) else "fallback"
     count(f"{kind}.bc_output.{reason}")
@@ -556,6 +559,7 @@ def fused_attention_input(layer, x, closed, message, state, visit, panel):
     if reason is not None:
         count(f"fallback.a.{reason}")
         return attention_input(layer, x, closed, message, state, visit, panel)
+    count("fused.a")
     return stage_attention_input(layer, x, closed, message, state, visit, panel)
 
 
@@ -568,6 +572,7 @@ def fused_expert_input(layer, partial, closed, message, panel):
     if reason is not None:
         count(f"fallback.d.{reason}")
         return expert_input(layer, partial, closed, message, panel)
+    count("fused.d")
     return stage_expert_input(layer, partial, closed, message, panel)
 
 
@@ -579,6 +584,7 @@ def fused_experts(layer, source, partial, dtype, state, visit, panel):
     if reason is not None:
         count(f"fallback.experts.{reason}")
         return experts(layer, source, partial, dtype, state, visit, panel)
+    count("fused.experts")
     return expert_visit(layer, source, partial, state.tail(visit, 3), dtype)
 
 
@@ -678,7 +684,9 @@ def row_stable_head(model, hidden):
     rows = hidden.shape[1]
     if isinstance(model.unembed, AffineWeight):
         try:
-            return affine_head(model, hidden)
+            logits = affine_head(model, hidden)
+            count("fused.head.stored")
+            return logits
         except RuntimeError:
             pass
         if rows == 1:
@@ -717,7 +725,9 @@ def embed(model, ids):
         reason = embed_reason(model)
         if reason is None:
             try:
-                return mx.fast.rms_norm(affine_rows(ids, packed), table.gain, table.eps)
+                rows = affine_rows(ids, packed)
+                count("fused.embed.stored")
+                return mx.fast.rms_norm(rows, table.gain, table.eps)
             except RuntimeError:
                 reason = "refused"
         count(f"fallback.embed.{reason}")
