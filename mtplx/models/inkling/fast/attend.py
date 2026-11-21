@@ -255,6 +255,187 @@ _MERGE = """
 """
 
 
+_WINDOW_ONE = """
+    // One threadgroup per (row, HPT heads): all of the row's MLX blocks for those heads,
+    // folded in registers, then MLX's own merge in threadgroup memory, then RC6's gate.
+    const int hgrp = int(threadgroup_position_in_grid.x);
+    const int r = int(threadgroup_position_in_grid.y);
+    const int sg = int(simdgroup_index_in_threadgroup);       // 32 simdgroups
+    const int lane = int(thread_index_in_simdgroup);
+    const int g = HPT == 3 ? hgrp : hgrp / 3;                 // key/value head
+    const int h0 = HPT == 3 ? 3 * hgrp : hgrp;                // first query head
+    const int cap = int(kc_shape[2]);
+    const int pos0 = int(pos[0]);
+    const int cnt = int(count[0]);
+    const int nw = int(newest[0]);
+    const int P = pos0 + r;
+    int nc = min(cnt, 1023 - r);
+    nc = max(nc, 0);
+    const int n = nc + r + 1;
+    const bool two = (n + 1) >= THRESH;
+    const int span = two ? BLOCKS : 32;
+    const int kps = two ? BLOCKS / 32 : 1;                    // chains of this simdgroup
+    const int first = pos0 - nc;
+    const float scale = as_type<float>(uint(SCALE));
+
+    constexpr int KMAX = BLOCKS / 32;                         // chains a simdgroup at most
+    float qs[HPT][4];
+    float o[HPT][KMAX][4], mx_[HPT][KMAX], sm[HPT][KMAX];
+    for (int j = 0; j < HPT; ++j) {
+        for (int i = 0; i < 4; ++i) {
+            qs[j][i] = static_cast<float>(scale) * static_cast<float>(
+                q[r * q_strides[1] + (h0 + j) * q_strides[2] + 4 * lane + i]);
+        }
+        for (int k = 0; k < KMAX; ++k) {
+            mx_[j][k] = -FLT_MAX;
+            sm[j][k] = 0;
+            for (int i = 0; i < 4; ++i) o[j][k][i] = 0;
+        }
+    }
+    const device T* kg = kc + size_t(g) * kc_strides[1];
+    const device T* vg = vc + size_t(g) * vc_strides[1];
+    const device T* krg = kr + size_t(g) * kr_strides[1];
+    const device T* vrg = vr + size_t(g) * vr_strides[1];
+    const device T* pr = prof + (size_t(r) * 24 + size_t(h0)) * 1024;
+    // Keys of logical index i = sg + 32 m, i.e. chains sg, sg + 32, ... in turn.
+    for (int i = sg; i < n; i += 32) {
+        const int k = two ? (i / 32) % kps : 0;
+        const int p = first + i;
+        const device T* kp;
+        const device T* vp;
+        if (p < pos0) {
+            int slot = nw - (pos0 - 1 - p);
+            if (slot < 0) slot += cap;
+            kp = kg + size_t(slot) * kc_strides[2];
+            vp = vg + size_t(slot) * vc_strides[2];
+        } else {
+            kp = krg + size_t(p - pos0) * kr_strides[2];
+            vp = vrg + size_t(p - pos0) * vr_strides[2];
+        }
+        float kv[4], vv[4];
+        for (int t = 0; t < 4; ++t) {
+            kv[t] = static_cast<float>(kp[4 * lane + t]);
+            vv[t] = static_cast<float>(vp[4 * lane + t]);
+        }
+        const int dist = P - p;                               // < 1024 on a window visit
+        for (int j = 0; j < HPT; ++j) {
+            const float bias = static_cast<float>(pr[j * 1024 + dist]);
+            for (int kk = 0; kk < KMAX; ++kk) {
+                if (kk == k) {
+                    fold_key(qs[j], kv, vv, bias, mx_[j][kk], sm[j][kk], o[j][kk]);
+                }
+            }
+        }
+    }
+    // RC6's appended zero row: logical index n, last in its chain.
+    if ((n % 32) == sg) {
+        const int k = two ? (n / 32) % kps : 0;
+        float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int j = 0; j < HPT; ++j) {
+            const float bias = static_cast<float>(sink[r * sink_strides[1] + (h0 + j) * sink_strides[2]]);
+            for (int kk = 0; kk < KMAX; ++kk) {
+                if (kk == k) {
+                    fold_key(qs[j], zero, zero, bias, mx_[j][kk], sm[j][kk], o[j][kk]);
+                }
+            }
+        }
+    }
+    threadgroup float tmax[HPT][128];
+    threadgroup float tsum[HPT][128];
+    threadgroup float outputs[32 * 32];
+    if (lane == 0) {
+        for (int j = 0; j < HPT; ++j) {
+            for (int k = 0; k < kps; ++k) {
+                tmax[j][sg + 32 * k] = mx_[j][k];
+                tsum[j][sg + 32 * k] = sm[j][k];
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int j = 0; j < HPT; ++j) {
+        float out4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float sum_exp_score;
+        if (two) {
+            // MLX sdpa_vector_2pass_2; this simdgroup's partials are blocks sg + 32 b.
+            float max_score = -FLT_MAX;
+            for (int b = 0; b < BLOCKS / 32; ++b) {
+                max_score = max(max_score, tmax[j][lane + 32 * b]);
+            }
+            max_score = simd_max(max_score);
+            sum_exp_score = 0;
+            for (int b = 0; b < BLOCKS / 32; ++b) {
+                float factor = metal::fast::exp(tmax[j][lane + 32 * b] - max_score);
+                sum_exp_score += factor * tsum[j][lane + 32 * b];
+            }
+            sum_exp_score = simd_sum(sum_exp_score);
+            for (int b = 0; b < BLOCKS / 32; ++b) {
+                float factor = metal::fast::exp(tmax[j][sg + 32 * b] - max_score);
+                for (int i = 0; i < 4; ++i) {
+                    // Pass one writes its partials in the query type.
+                    out4[i] += factor * static_cast<float>(static_cast<T>(o[j][b][i]));
+                }
+            }
+            for (int i = 0; i < 4; ++i) {
+                outputs[lane * 32 + sg] = out4[i];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                out4[i] = simd_sum(outputs[sg * 32 + lane]);
+                out4[i] = sum_exp_score == 0 ? out4[i] : (out4[i] / sum_exp_score);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        } else {
+            // MLX sdpa_vector's combine: simdgroup sg holds chain sg.
+            float max_score = tmax[j][lane];
+            float new_max = simd_max(max_score);
+            float factor = metal::fast::exp(max_score - new_max);
+            sum_exp_score = simd_sum(tsum[j][lane] * factor);
+            for (int i = 0; i < 4; ++i) {
+                outputs[lane * 32 + sg] = o[j][0][i];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                out4[i] = simd_sum(outputs[sg * 32 + lane] * factor);
+                out4[i] = sum_exp_score == 0 ? out4[i] : (out4[i] / sum_exp_score);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+        if (lane == 0) {
+            for (int i = 0; i < 4; ++i) {
+                const int d = 4 * sg + i;
+                const size_t at = size_t(r) * 3072 + size_t(h0 + j) * 128 + size_t(d);
+                const float hv = static_cast<float>(static_cast<T>(out4[i]));
+                const float x = static_cast<float>(gate[r * gate_strides[1] + ((h0 + j) * 128 + d) * gate_strides[2]]);
+                const float y = 1 / (1 + metal::precise::exp(metal::abs(x)));
+                const float gv = (x < 0) ? y : 1 - y;
+                hg[at] = static_cast<T>(hv * gv);
+            }
+        }
+    }
+"""
+
+
+
+def attend_window(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newest, pos,
+                  rel_basis, *, plan=None):
+    """Exact window attention in one launch (plus RC6's profile product): same output as
+    ``attend(..., window=True)``, bit for bit."""
+    rows = q.shape[1]
+    if not 1 <= rows <= MAX_ROWS:
+        raise ValueError(f"A panel holds 1 to {MAX_ROWS} rows, got {rows}")
+    threshold, blocks = plan or reduction_plan()
+    if blocks > 128:
+        raise ValueError("window attention keeps at most 4 MLX blocks a simdgroup")
+    dtype = q.dtype
+    prof = profiles(rel, rel_basis)
+    hpt = 1 if rows <= 2 else 3                 # heads a threadgroup: parallelism vs key reuse
+    (hg,) = _kernel("mtplx_inkling_fast_attend_window", _WINDOW_ONE, _HEADER)(
+        inputs=[q, keys, values, k_rows, v_rows, prof, sink, gate_logits, _u32(pos), _u32(count), _u32(newest)],
+        template=[("T", dtype), ("HPT", hpt), ("BLOCKS", blocks), ("THRESH", threshold), ("SCALE", SCALE_BITS)],
+        grid=(1024 * (HEADS // hpt), rows, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(1, rows, HEADS * HEAD_DIM)],
+        output_dtypes=[dtype],
+    )
+    return hg
+
+
 @lru_cache(maxsize=None)
 def _kernel(name, source, header=""):
     return mx.fast.metal_kernel(
@@ -275,6 +456,8 @@ _OUTPUTS = {
     "mtplx_inkling_fast_attend_partials": ["po", "pm", "ps"],
     "mtplx_inkling_fast_attend_merge": ["hg"],
 }
+_INPUTS["mtplx_inkling_fast_attend_window"] = ["q", "kc", "vc", "kr", "vr", "prof", "sink", "gate", "pos", "count", "newest"]
+_OUTPUTS["mtplx_inkling_fast_attend_window"] = ["hg"]
 
 
 def _u32(value):
@@ -289,7 +472,7 @@ def profiles(rel, rel_basis):
 
 
 def attend(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newest, pos,
-           rel_basis, *, window, plan=None):
+           rel_basis, *, window, plan=None, one_launch_window=False):
     """The gated attention result of a panel, ``(1, W, 3072)`` in the query dtype.
 
     ``q (1, W, 24, 128)``, ``rel (1, W, 24, 16)``, ``sink (1, W, 24)``,
@@ -303,6 +486,11 @@ def attend(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newes
     if not 1 <= rows <= MAX_ROWS:
         raise ValueError(f"A panel holds 1 to {MAX_ROWS} rows, got {rows}")
     threshold, blocks = plan or reduction_plan()
+    # One launch for a window visit is exact too, but measured slower than two at 1 to 8 rows
+    # (lanes/l2/bench-window-1launch.json): too little parallelism per threadgroup.
+    if window and blocks <= 128 and one_launch_window:
+        return attend_window(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newest,
+                             pos, rel_basis, plan=(threshold, blocks))
     dtype = q.dtype
     prof = profiles(rel, rel_basis)
     pos_a, count_a, newest_a = _u32(pos), _u32(count), _u32(newest)

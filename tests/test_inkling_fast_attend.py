@@ -181,3 +181,17 @@ def test_class_c_is_row_stable_capacity_free_and_close_to_rc6(history, rows):
                       k[:, :, history + r:history + r + 1], v[:, :, history + r:history + r + 1],
                       kc1, vc1, c1, n1, history + r, weights[0], window=False)
         assert _same(h1, hg[:, r:r + 1]), f"class C row {r} of {rows} differs from its one-row call"
+
+
+@pytest.mark.parametrize("history,rows,rot", [(300, 1, 0), (1021, 3, 700), (1500, 8, 1023)])
+def test_one_launch_window_equals_the_default_path(history, rows, rot):
+    """The one-launch window kernel (3 launches a visit) gives the default path's bits."""
+    k, v, inputs, weights = _setup(history + rows, rows, seed=history + rows)
+    q, rel, sink, gate, x, tail = inputs
+    kc, vc, count, newest = _committed(k, v, history, True, rot)
+    args = (q, rel, sink, gate, k[:, :, history:history + rows], v[:, :, history:history + rows],
+            kc, vc, count, newest, history, weights[0])
+    two = attend(*args, window=True)
+    one = attend(*args, window=True, one_launch_window=True)
+    mx.eval(two, one)
+    assert _same(one, two)
