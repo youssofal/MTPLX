@@ -148,3 +148,36 @@ def test_rejects_panels_outside_the_served_widths():
     with pytest.raises(ValueError):
         attend(mx.zeros((1, 33, 24, 128), mx.bfloat16), rel, sink, gate, k, v, k, v, 0, 0, 0, weights[0],
                window=True)
+
+
+# ---------------------------------------------------------------- class C global attention
+
+from mtplx.models.inkling.fast.attend import attend_c  # noqa: E402
+
+
+@pytest.mark.parametrize("history,rows", [(300, 1), (1500, 3), (2100, 5), (4142, 8), (2047, 6), (1023, 7)])
+def test_class_c_is_row_stable_capacity_free_and_close_to_rc6(history, rows):
+    """Bounded rounding against RC6, but every row equals its one-row call bit for bit and
+    the bits do not depend on the bank's capacity."""
+    k, v, inputs, weights = _setup(history + rows, rows, seed=history + 7 * rows)
+    q, rel, sink, gate, x, tail = inputs
+    kc, vc, count, newest = _committed(k, v, history, False, 0)
+    hg = attend_c(q, rel, sink, gate, k[:, :, history:history + rows], v[:, :, history:history + rows],
+                  kc, vc, count, newest, history, weights[0], window=False)
+    ref, _, _ = _rc6(k, v, history, inputs, weights, False, False)
+    mx.eval(hg, ref)
+    d = mx.abs(hg.astype(mx.float32) - ref.astype(mx.float32))
+    assert float(mx.max(d).item()) <= 0.03 and float(mx.mean(d).item()) <= 1e-3
+    big_k = mx.zeros((1, 8, kc.shape[2] + 4096, 128), mx.bfloat16)
+    big_v = mx.zeros((1, 8, kc.shape[2] + 4096, 128), mx.bfloat16)
+    big_k[:, :, :kc.shape[2]] = kc
+    big_v[:, :, :kc.shape[2]] = vc
+    hb = attend_c(q, rel, sink, gate, k[:, :, history:history + rows], v[:, :, history:history + rows],
+                  big_k, big_v, count, newest, history, weights[0], window=False)
+    assert _same(hb, hg), "class C bits depend on the bank capacity"
+    for r in range(rows):
+        kc1, vc1, c1, n1 = _committed(k, v, history + r, False, 0)
+        h1 = attend_c(q[:, r:r + 1], rel[:, r:r + 1], sink[:, r:r + 1], gate[:, r:r + 1],
+                      k[:, :, history + r:history + r + 1], v[:, :, history + r:history + r + 1],
+                      kc1, vc1, c1, n1, history + r, weights[0], window=False)
+        assert _same(h1, hg[:, r:r + 1]), f"class C row {r} of {rows} differs from its one-row call"

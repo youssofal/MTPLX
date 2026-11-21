@@ -326,3 +326,307 @@ def attend(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newes
         output_dtypes=[dtype],
     )
     return hg
+
+
+# ----------------------------------------------------------------------------------------
+# Class C variant for long histories (bounded rounding against RC6, row-stable by design).
+#
+# The exact path repeats MLX's per-key arithmetic: a cross-lane sum per key and query and a
+# rescale of the running output after every key. With 4 to 8 rows that order is compute
+# bound (about 50 instructions per key and query). This variant reads the same bytes once
+# per panel and changes only the order of additions: the history is cut into fixed chunks
+# of CHUNK absolute positions (so the order depends neither on the panel width nor on the
+# bank capacity); one threadgroup per (chunk, key/value head, group of 8 rows) stages 32-key
+# tiles of keys and values in threadgroup memory once for its rows and the three query heads
+# that share them; each simdgroup owns three query vectors from scores to weighted sum, so
+# only the tile loads need a threadgroup barrier; the running output is rescaled once per
+# tile. A second launch merges the chunks in ascending order, adds the sink, and applies
+# RC6's gate. Every per-(row, head) order is fixed by absolute positions, so a row's bits do
+# not depend on how many rows share the launch.
+# ----------------------------------------------------------------------------------------
+
+CHUNK = 1024
+
+# One simdgroup per block of 8 query vectors (the panel's rows x 3 heads, packed: query
+# qq = 3 * row + head). Matrix products on 8x8 simdgroup matrices: scores S^T = K . Q^T over
+# 16 blocks of 8 dims, weighted sum O += P . V over 16 blocks of 8 dims. This GPU's matrix
+# product gives each element the same arithmetic wherever its row and column sit
+# (`l2/probe-mma.json`), so packing rows does not break row stability. No fragment layout is
+# assumed: per-element work (bias, mask, softmax) goes through a small threadgroup tile, and
+# the per-row rescale is loaded as a matrix with constant rows, so it lands in the
+# accumulator's own lane layout.
+_PARTIALS_C = """
+    const int c = int(threadgroup_position_in_grid.x);     // chunk of CHUNK positions
+    const int g = int(threadgroup_position_in_grid.y);     // key/value head
+    const int sgi = int(simdgroup_index_in_threadgroup);
+    const int qb = QB * int(threadgroup_position_in_grid.z) + sgi;   // block of 8 query vectors
+    const int lane = int(thread_index_in_simdgroup);
+    const int tid = int(thread_index_in_threadgroup);
+    const int nthreads = 32 * QB;
+    const int rows = int(q_shape[1]);
+    const int nq = 3 * rows;
+    const int pos0 = int(pos[0]);
+    const int cnt = int(count[0]);
+    const int nw = int(newest[0]);
+    const int cap = int(kc_shape[2]);
+    const int last = pos0 + rows - 1;
+    const int lo_pos = c * CHUNK;
+    if (lo_pos > last) {
+        return;                                // the whole threadgroup leaves together
+    }
+    const int hi_pos = min(lo_pos + CHUNK - 1, last);
+    const int lo_any = WINDOW ? pos0 - max(min(cnt, 1023), 0) : 0;
+    const float scale = as_type<float>(uint(SCALE));
+    const bool block_live = 8 * qb < nq;       // padding simdgroups still join the barriers
+
+    threadgroup float ks[8 * 128];             // the tile's keys, shared by the query blocks
+    threadgroup float vs[8 * 128];             // the tile's values
+    threadgroup float tile_all[QB][64];
+    threadgroup float prob_all[QB][64];
+    threadgroup float fac_all[QB][64];
+    threadgroup float* tl = tile_all[sgi];
+    threadgroup float* pt = prob_all[sgi];
+    threadgroup float* fc = fac_all[sgi];
+
+    // Softmax lanes: query (lane / 4) of the block, keys 2 * (lane % 4) and the next.
+    const int qi = lane / 4, kp2 = 2 * (lane % 4);
+    const int qq = 8 * qb + qi;
+    const bool live = block_live && qq < nq;
+    const int qrow = qq / 3, qhead = 3 * g + qq % 3;
+    int first_q = 0, last_q = -1;
+    if (live) {
+        int nc = WINDOW ? min(cnt, 1023 - qrow) : cnt;
+        nc = max(nc, 0);
+        first_q = pos0 - nc;
+        last_q = pos0 + qrow;
+    }
+    const device T* pr = prof + (size_t(min(qrow, rows - 1)) * 24 + size_t(qhead)) * 1024;
+    float m_run = -INFINITY, l_run = 0.0f;
+
+    // Q^T blocks (dims x queries), scaled as MLX scales the query; staged through ks.
+    simdgroup_float8x8 qt[16];
+    for (int s2 = 0; s2 < QB; ++s2) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int i = tid; i < 8 * 128; i += nthreads) {
+            const int qi2 = i / 128, d = i % 128;
+            const int q2 = 8 * (QB * int(threadgroup_position_in_grid.z) + s2) + qi2;
+            ks[i] = q2 < nq ? scale * static_cast<float>(
+                q[(q2 / 3) * q_strides[1] + (3 * g + q2 % 3) * q_strides[2] + d]) : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (s2 == sgi) {
+            for (int b = 0; b < 16; ++b) {
+                simdgroup_load(qt[b], ks + 8 * b, 128, ulong2(0, 0), true);
+            }
+        }
+    }
+    simdgroup_float8x8 acc_o[16];
+    for (int b = 0; b < 16; ++b) {
+        acc_o[b] = simdgroup_float8x8(0.0f);
+    }
+    const device T* kg = kc + size_t(g) * kc_strides[1];
+    const device T* vg = vc + size_t(g) * vc_strides[1];
+    const device T* krg = kr + size_t(g) * kr_strides[1];
+    const device T* vrg = vr + size_t(g) * vr_strides[1];
+
+    // A tile is 256 sixteen-byte pieces (8 keys x 16 of keys, then of values), spread over
+    // the threadgroup; each thread keeps its next pieces in flight while the tile computes.
+    constexpr int PIECES = 256;
+    constexpr int PER = (PIECES + 32 * QB - 1) / (32 * QB);
+    uint4 pre[PER];
+    #define FETCH(T0)                                                                     \\
+    for (int u = 0; u < PER; ++u) {                                                       \\
+        const int piece = tid + u * nthreads;                                             \\
+        pre[u] = uint4(0);                                                                \\
+        if (piece < PIECES) {                                                             \\
+            const int is_v = piece >> 7, key = (piece >> 4) & 7, part = piece & 15;       \\
+            const int p = (T0) + key;                                                     \\
+            if (p <= last && p >= lo_any && p >= 0) {                                     \\
+                const device T* src;                                                      \\
+                if (p < pos0) {                                                           \\
+                    int slot = p;                                                         \\
+                    if (WINDOW) { slot = nw - (pos0 - 1 - p); if (slot < 0) slot += cap; } \\
+                    src = (is_v ? vg : kg) + size_t(slot) * (is_v ? vc_strides[2] : kc_strides[2]); \\
+                } else {                                                                  \\
+                    src = (is_v ? vrg : krg) + size_t(p - pos0) * (is_v ? vr_strides[2] : kr_strides[2]); \\
+                }                                                                         \\
+                pre[u] = *(const device uint4*)(src + 8 * part);                          \\
+            }                                                                             \\
+        }                                                                                 \\
+    }
+
+    FETCH(lo_pos)
+    for (int t0 = lo_pos; t0 <= hi_pos; t0 += 8) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int u = 0; u < PER; ++u) {
+            const int piece = tid + u * nthreads;
+            if (piece < PIECES) {
+                const int is_v = piece >> 7, key = (piece >> 4) & 7, part = piece & 15;
+                threadgroup float* dst = (is_v ? vs : ks) + key * 128 + 8 * part;
+                const uint4 w = pre[u];
+                dst[0] = as_type<float>(w.x << 16); dst[1] = as_type<float>(w.x & 0xffff0000u);
+                dst[2] = as_type<float>(w.y << 16); dst[3] = as_type<float>(w.y & 0xffff0000u);
+                dst[4] = as_type<float>(w.z << 16); dst[5] = as_type<float>(w.z & 0xffff0000u);
+                dst[6] = as_type<float>(w.w << 16); dst[7] = as_type<float>(w.w & 0xffff0000u);
+            }
+        }
+        if (t0 + 8 <= hi_pos) {
+            FETCH(t0 + 8)                     // next tile in flight while this one computes
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (!block_live) {
+            continue;
+        }
+        // Scores S^T (8 keys x 8 queries) on the matrix units, 16 blocks of 8 dims in order.
+        simdgroup_float8x8 s_t = simdgroup_float8x8(0.0f);
+        for (int b = 0; b < 16; ++b) {
+            simdgroup_float8x8 kb;
+            simdgroup_load(kb, ks + 8 * b, 128);
+            simdgroup_multiply_accumulate(s_t, kb, qt[b], s_t);
+        }
+        simdgroup_store(s_t, tl, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        // Tile softmax: 4 lanes a query, 2 keys a lane, lanes combined pairwise (xor 1, 2).
+        float e0 = -INFINITY, e1 = -INFINITY;
+        {
+            const int p0 = t0 + kp2, p1 = p0 + 1;
+            if (live && p0 >= first_q && p0 <= last_q) {
+                const int dist = last_q - p0;
+                e0 = tl[kp2 * 8 + qi] + (dist < 1024 ? static_cast<float>(pr[dist]) : 0.0f);
+            }
+            if (live && p1 >= first_q && p1 <= last_q) {
+                const int dist = last_q - p1;
+                e1 = tl[(kp2 + 1) * 8 + qi] + (dist < 1024 ? static_cast<float>(pr[dist]) : 0.0f);
+            }
+        }
+        float tile_max = max(e0, e1);
+        tile_max = max(tile_max, simd_shuffle_xor(tile_max, ushort(1)));
+        tile_max = max(tile_max, simd_shuffle_xor(tile_max, ushort(2)));
+        const float m_new = max(m_run, tile_max);
+        const float alpha = m_new == -INFINITY ? 1.0f : metal::fast::exp(m_run - m_new);
+        e0 = e0 == -INFINITY ? 0.0f : metal::fast::exp(e0 - m_new);
+        e1 = e1 == -INFINITY ? 0.0f : metal::fast::exp(e1 - m_new);
+        float part_sum = e0 + e1;
+        part_sum = part_sum + simd_shuffle_xor(part_sum, ushort(1));
+        part_sum = part_sum + simd_shuffle_xor(part_sum, ushort(2));
+        l_run = l_run * alpha + part_sum;
+        m_run = m_new;
+        pt[qi * 8 + kp2] = e0;                 // P (queries x keys), row-major
+        pt[qi * 8 + kp2 + 1] = e1;
+        fc[qi * 8 + kp2] = alpha;              // constant rows: the accumulator's own layout
+        fc[qi * 8 + kp2 + 1] = alpha;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 p8, f8;
+        simdgroup_load(p8, pt, 8);
+        simdgroup_load(f8, fc, 8);
+        // O = O * alpha + P . V on the matrix units, 16 blocks of 8 dims.
+        for (int b = 0; b < 16; ++b) {
+            simdgroup_float8x8 vb;
+            simdgroup_load(vb, vs + 8 * b, 128);
+            acc_o[b].thread_elements()[0] *= f8.thread_elements()[0];
+            acc_o[b].thread_elements()[1] *= f8.thread_elements()[1];
+            simdgroup_multiply_accumulate(acc_o[b], p8, vb, acc_o[b]);
+        }
+    }
+    #undef FETCH
+    if (!block_live) {
+        return;
+    }
+    // Partials, layout [chunk][key/value head][query of the head][dim]: the block's 8 query
+    // rows are contiguous, so each output block is one strided store to device memory.
+    const int nqpad = 8 * ((nq + 7) / 8);
+    const size_t row0 = (size_t(c) * 8 + size_t(g)) * size_t(nqpad) + size_t(8 * qb);
+    for (int b = 0; b < 16; ++b) {
+        simdgroup_store(acc_o[b], po + row0 * 128 + 8 * b, 128);
+    }
+    if (live && (lane % 4) == 0) {
+        pm[row0 + qi] = m_run;
+        pl[row0 + qi] = l_run;
+    }
+"""
+
+
+_MERGE_C = """
+    const int h = int(threadgroup_position_in_grid.x);
+    const int r = int(threadgroup_position_in_grid.y);
+    const int d = int(thread_position_in_threadgroup.x);   // 128 threads: one dim each
+    const int rows = int(gate_shape[1]);
+    const int nqpad = 8 * ((3 * rows + 7) / 8);
+    const int g = h / 3;
+    const int q2 = 3 * r + h % 3;
+    const int pos0 = int(pos[0]);
+    const int cnt = int(count[0]);
+    int nc = WINDOW ? min(cnt, 1023 - r) : cnt;
+    nc = max(nc, 0);
+    const int first = pos0 - nc;
+    const int P = pos0 + r;
+    const int c_lo = first / CHUNK, c_hi = P / CHUNK;
+    const float sink_logit = static_cast<float>(sink[r * sink_strides[1] + h * sink_strides[2]]);
+    float big = sink_logit;
+    for (int c = c_lo; c <= c_hi; ++c) {
+        big = max(big, pm[(size_t(c) * 8 + size_t(g)) * size_t(nqpad) + size_t(q2)]);
+    }
+    float denom = 0.0f, acc = 0.0f;
+    for (int c = c_lo; c <= c_hi; ++c) {
+        const size_t at = (size_t(c) * 8 + size_t(g)) * size_t(nqpad) + size_t(q2);
+        const float mc = pm[at];
+        const float w = mc == -INFINITY ? 0.0f : metal::fast::exp(mc - big);
+        denom = metal::fma(pl[at], w, denom);
+        acc = metal::fma(po[at * 128 + d], w, acc);
+    }
+    denom += metal::fast::exp(sink_logit - big);   // the sink: mass, no value
+    const float hv = static_cast<float>(static_cast<T>(acc / denom));
+    const size_t at = size_t(r) * 3072 + size_t(h) * 128 + size_t(d);
+    const float x = static_cast<float>(gate[r * gate_strides[1] + (h * 128 + d) * gate_strides[2]]);
+    const float y = 1 / (1 + metal::precise::exp(metal::abs(x)));
+    const float gv = (x < 0) ? y : 1 - y;
+    hg[at] = static_cast<T>(hv * gv);
+"""
+
+_INPUTS["mtplx_inkling_fast_attend_partials_c"] = ["q", "kc", "vc", "kr", "vr", "prof", "pos", "count", "newest"]
+_OUTPUTS["mtplx_inkling_fast_attend_partials_c"] = ["po", "pm", "pl"]
+_INPUTS["mtplx_inkling_fast_attend_merge_c"] = ["po", "pm", "pl", "sink", "gate", "pos", "count"]
+_OUTPUTS["mtplx_inkling_fast_attend_merge_c"] = ["hg"]
+
+
+def attend_c(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newest, pos,
+             rel_basis, *, window):
+    """Class C sibling of ``attend`` for global visits: same inputs and output.
+
+    Bounded rounding against RC6 (a different, fixed order of additions); row-stable by
+    construction (every per-(row, head) order is set by absolute key positions: chunks of
+    ``CHUNK``, tiles of 32, dims in order, butterfly lane sums), independent of the panel
+    width and of the bank capacity.
+    """
+    if window:
+        raise NotImplementedError("attend_c serves global visits; window visits use attend")
+    rows = q.shape[1]
+    if not 1 <= rows <= MAX_ROWS:
+        raise ValueError(f"A panel holds 1 to {MAX_ROWS} rows, got {rows}")
+    dtype = q.dtype
+    if dtype != mx.bfloat16:
+        raise ValueError("attend_c reads bf16 keys and values")
+    prof = profiles(rel, rel_basis)
+    pos_a, count_a, newest_a = _u32(pos), _u32(count), _u32(newest)
+    nch = -(-(keys.shape[2] + 32) // CHUNK)     # every position the bank can hold
+    qblocks = -(-(GROUP * rows) // 8)          # blocks of 8 query vectors
+    per_group = min(qblocks, 3)                 # simdgroups a threadgroup (threadgroup memory)
+    groups = -(-qblocks // per_group)
+    chains = nch * KV_HEADS * 8 * qblocks       # [chunk][kv head][query of the head, padded]
+    po, pm, pl = _kernel("mtplx_inkling_fast_attend_partials_c", _PARTIALS_C, "#include <metal_simdgroup_matrix>\n")(
+        inputs=[q, keys, values, k_rows, v_rows, prof, pos_a, count_a, newest_a],
+        template=[("T", dtype), ("WINDOW", False), ("CHUNK", CHUNK), ("SCALE", SCALE_BITS), ("QB", per_group)],
+        grid=(32 * per_group * nch, KV_HEADS, groups),
+        threadgroup=(32 * per_group, 1, 1),
+        output_shapes=[(chains * HEAD_DIM,), (chains,), (chains,)],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+    )
+    (hg,) = _kernel("mtplx_inkling_fast_attend_merge_c", _MERGE_C)(
+        inputs=[po, pm, pl, sink, gate_logits, pos_a, count_a],
+        template=[("T", dtype), ("WINDOW", False), ("CHUNK", CHUNK)],
+        grid=(128 * HEADS, rows, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(1, rows, HEADS * HEAD_DIM)],
+        output_dtypes=[dtype],
+    )
+    return hg
