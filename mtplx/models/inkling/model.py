@@ -451,29 +451,32 @@ class Layer(nn.Module):
         cfg = self.cfg
         shape = (*q_input.shape[:2], self.q_scale.shape[0])
         width = self.q_scale.shape[-1]
-        q = clip_heads(
-            linear(q_input, self.q).reshape(*shape, width),
-            cfg["qk_l2_clip_threshold"],
-            self.q_scale,
+        q_lin = linear(q_input, self.q)
+        r_lin = linear(q_input, self.r)
+        k_conv = self.convs[0](linear(k_input, self.k), conv, 0, k_input, tape)
+        v_conv = self.convs[1](linear(v_input, self.v), conv, 1, v_input, tape)
+        # A prompt chunk's clips, value norm and position scale run as one launch of ours, same bits.
+        joined = (
+            prompt_glue.heads(self, q_lin, r_lin, k_conv, v_conv, kv.offset)
+            if tape is None
+            else None
         )
-        rel = clip_heads(
-            linear(q_input, self.r).reshape(*shape, -1),
-            cfg["rel_l2_clip_threshold"],
-            self.r_scale,
-        )
-        k = self.convs[0](linear(k_input, self.k), conv, 0, k_input, tape)
-        v = self.convs[1](linear(v_input, self.v), conv, 1, v_input, tape)
-        k = clip_heads(k.reshape(*k.shape[:2], -1, width), cfg["qk_l2_clip_threshold"])
-        v = v.reshape(*v.shape[:2], -1, width)
-        if cfg["use_value_norm_no_gamma"]:
-            v = norm(v, None, self.eps).astype(v_input.dtype)
-        if not self.sliding:
-            pos = mx.arange(q_input.shape[1]) + kv.offset + 1
-            tau = 1 + cfg["log_scaling_alpha"] * mx.log(
-                mx.maximum(pos / cfg["log_scaling_n_floor"], 1)
-            )
-            q = (q.astype(mx.float32) * tau[:, None, None]).astype(q.dtype)
-            rel = (rel.astype(mx.float32) * tau[:, None, None]).astype(rel.dtype)
+        if joined is not None:
+            q, rel, k, v = joined
+        else:
+            q = clip_heads(q_lin.reshape(*shape, width), cfg["qk_l2_clip_threshold"], self.q_scale)
+            rel = clip_heads(r_lin.reshape(*shape, -1), cfg["rel_l2_clip_threshold"], self.r_scale)
+            k = clip_heads(k_conv.reshape(*k_conv.shape[:2], -1, width), cfg["qk_l2_clip_threshold"])
+            v = v_conv.reshape(*v_conv.shape[:2], -1, width)
+            if cfg["use_value_norm_no_gamma"]:
+                v = norm(v, None, self.eps).astype(v_input.dtype)
+            if not self.sliding:
+                pos = mx.arange(q_input.shape[1]) + kv.offset + 1
+                tau = 1 + cfg["log_scaling_alpha"] * mx.log(
+                    mx.maximum(pos / cfg["log_scaling_n_floor"], 1)
+                )
+                q = (q.astype(mx.float32) * tau[:, None, None]).astype(q.dtype)
+                rel = (rel.astype(mx.float32) * tau[:, None, None]).astype(rel.dtype)
         k, v = kv.update_and_fetch(k.transpose(0, 2, 1, 3), v.transpose(0, 2, 1, 3))
         if self.sliding:
             k, v = kv._temporal_order(k), kv._temporal_order(v)
