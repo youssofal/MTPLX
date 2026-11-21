@@ -1741,7 +1741,7 @@
     "decode_batch_max": null,
     "max_active_requests": null,
     "scheduler_mode": "serial",
-    "ssd_session_cache": "off",
+    "ssd_session_cache": "on",
     "ssd_session_cache_max_size": "auto",
     "ssd_session_cache_min_prefix_tokens": 512
    },
@@ -1760,7 +1760,7 @@
     "decode_batch_max": null,
     "max_active_requests": null,
     "scheduler_mode": "serial",
-    "ssd_session_cache": "off",
+    "ssd_session_cache": "on",
     "ssd_session_cache_max_size": "auto",
     "ssd_session_cache_min_prefix_tokens": 512
    },
@@ -1779,7 +1779,7 @@
     "decode_batch_max": null,
     "max_active_requests": null,
     "scheduler_mode": "serial",
-    "ssd_session_cache": "off",
+    "ssd_session_cache": "on",
     "ssd_session_cache_max_size": "auto",
     "ssd_session_cache_min_prefix_tokens": 512
    },
@@ -1798,7 +1798,7 @@
     "decode_batch_max": null,
     "max_active_requests": null,
     "scheduler_mode": "serial",
-    "ssd_session_cache": "off",
+    "ssd_session_cache": "on",
     "ssd_session_cache_max_size": "auto",
     "ssd_session_cache_min_prefix_tokens": 512
    },
@@ -1817,7 +1817,7 @@
     "decode_batch_max": null,
     "max_active_requests": null,
     "scheduler_mode": "serial",
-    "ssd_session_cache": "off",
+    "ssd_session_cache": "on",
     "ssd_session_cache_max_size": "auto",
     "ssd_session_cache_min_prefix_tokens": 512
    },
@@ -1836,7 +1836,7 @@
     "decode_batch_max": null,
     "max_active_requests": null,
     "scheduler_mode": "serial",
-    "ssd_session_cache": "off",
+    "ssd_session_cache": "on",
     "ssd_session_cache_max_size": "auto",
     "ssd_session_cache_min_prefix_tokens": 512
    },
@@ -1912,7 +1912,7 @@
     "decode_batch_max": null,
     "max_active_requests": null,
     "scheduler_mode": "serial",
-    "ssd_session_cache": "off",
+    "ssd_session_cache": "on",
     "ssd_session_cache_max_size": "auto",
     "ssd_session_cache_min_prefix_tokens": 512
    },
@@ -1931,7 +1931,7 @@
     "decode_batch_max": null,
     "max_active_requests": null,
     "scheduler_mode": "serial",
-    "ssd_session_cache": "off",
+    "ssd_session_cache": "on",
     "ssd_session_cache_max_size": "auto",
     "ssd_session_cache_min_prefix_tokens": 512
    },
@@ -1950,7 +1950,7 @@
     "decode_batch_max": null,
     "max_active_requests": null,
     "scheduler_mode": "serial",
-    "ssd_session_cache": "off",
+    "ssd_session_cache": "on",
     "ssd_session_cache_max_size": "auto",
     "ssd_session_cache_min_prefix_tokens": 512
    },

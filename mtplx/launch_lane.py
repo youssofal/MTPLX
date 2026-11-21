@@ -90,6 +90,13 @@ SSD_SESSION_CACHE_BY_ENTRY: dict[str, dict[str, str]] = {
     "benchmark": {"app": "off", "start": "off", "serve": "off"},
 }
 
+# Families whose SSD session cache is on at every entry point (the benchmark
+# excepted), whatever the client table says: Inkling 2 Mini's first turn after a
+# restart resumes from the bank (Hermes on a restart: 14 of 5,229 tokens read in
+# 0.44 s against 1,206 in 3.07 s without it), and `mtplx start` already ran it on.
+# The app's twin is in MTPLXCommandBuilder's ResolvedDaemonArgs.
+FAMILY_SSD_SESSION_CACHE: dict[str, str] = {"inkling2": "on"}
+
 # (client, choice) pairs allowed to differ between entry points, with why.
 DECLARED_ENTRY_POINT_DIFFERENCES: dict[tuple[str, str], str] = {
     ("chat", "ssd_session_cache"): "app chat ships it off, the CLI on: unmeasured, cell P3.1",
@@ -367,7 +374,10 @@ def resolve_launch_lane(
     # SSD session cache.
     by_entry = SSD_SESSION_CACHE_BY_ENTRY.get(client)
     ssd_mode = by_entry[entry_point] if by_entry else base.get("ssd_session_cache", "on")
-    choices["ssd_session_cache"] = _choice(ssd_mode, "default")
+    ssd_source = "default"
+    if family_key in FAMILY_SSD_SESSION_CACHE and client != "benchmark":
+        ssd_mode, ssd_source = FAMILY_SSD_SESSION_CACHE[family_key], "family"
+    choices["ssd_session_cache"] = _choice(ssd_mode, ssd_source)
     choices["ssd_session_cache_max_size"] = _choice(
         SSD_SESSION_CACHE_MAX_SIZE,
         "default",

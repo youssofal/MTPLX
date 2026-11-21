@@ -875,13 +875,21 @@ struct ResolvedDaemonArgs {
         target: LaunchTarget?,
         processEnvironment: [String: String] = ProcessInfo.processInfo.environment
     ) {
-        let preset = TargetPreset.preset(
+        var preset = TargetPreset.preset(
             for: target,
             processEnvironment: processEnvironment
         ).applyingModelDefaults(
             for: configuration.model,
             processEnvironment: processEnvironment
         )
+        // Inkling 2 Mini keeps its SSD session cache on every serving target
+        // but the benchmark, as `mtplx start` does: its first turn after a
+        // restart resumes from the bank instead of reading the conversation
+        // again (Hermes on a restart: 14 of 5,229 tokens in 0.44 s against
+        // 1,206 in 3.07 s). Engine twin: launch_lane.FAMILY_SSD_SESSION_CACHE.
+        if ModelLaunchFamily.detect(configuration.model) == .inkling2, target != .benchmark {
+            preset.ssdSessionCache = "on"
+        }
 
         // Issue #325: Settings' Performance mode promises "use it
         // everywhere", so every serving target honors an EXPLICIT
