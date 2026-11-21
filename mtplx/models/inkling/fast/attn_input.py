@@ -775,6 +775,70 @@ _PROJECT = """
 """
 
 
+_NORM = """
+    // One threadgroup per (panel row, source) of a raw panel: the input norm as the projection
+    // launch computes it for raw sources (the per-128 partial sums given, or found here by one
+    // simdgroup; their simdgroup sum; precise::rsqrt), then each value gain * (h * inverse) rounded
+    // to bf16, as that launch stages it.
+    const uint g = threadgroup_position_in_grid.x;
+    const uint src = g % NS;
+    const uint lane = thread_index_in_simdgroup;
+    const device float* row = h + size_t(g) * D;
+    threadgroup float inverse[1];
+    if (simdgroup_index_in_threadgroup == 0) {
+        float part = 0.0f;
+        if (PARTS_IN) {
+            part = lane < (D / 128) ? parts[size_t(g) * (D / 128) + lane] : 0.0f;
+        } else {
+            for (uint j = 0; j < D / 128; ++j) {
+                const float4 h4 = *reinterpret_cast<const device float4*>(row + j * 128 + lane * 4);
+                float acc = 0;
+                for (uint i = 0; i < 4; ++i) acc += h4[i] * h4[i];
+                acc = simd_sum(acc);
+                if (lane == j) part = acc;
+            }
+        }
+        const float total = simd_sum(part);
+        if (lane == 0) inverse[0] = metal::precise::rsqrt(total / float(D) + as_type<float>(uint(NORM_EPS)));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float iv = inverse[0];
+    const device bfloat16_t* gs = src == 0 ? g0 : (src == 1 ? g1 : g2);
+    for (uint c = thread_index_in_threadgroup * 4; c < D; c += THREADS * 4) {
+        const float4 h4 = *reinterpret_cast<const device float4*>(row + c);
+        for (uint j = 0; j < 4; ++j)
+            out[size_t(g) * D + c + j] = static_cast<bfloat16_t>(static_cast<float>(gs[c + j]) * (h4[j] * iv));
+    }
+"""
+
+#: Norm a raw panel that cannot stage whole in a launch of its own, then read it as a normed panel
+#: (instead of norming its inputs again for every block in every simdgroup). Off until timed.
+_NORM_FIRST = False
+
+
+@lru_cache(maxsize=1)
+def _norm_kernel():
+    return mx.fast.metal_kernel(name="mtplx_inkling_fast_norm_sources", input_names=["h", "parts", "g0", "g1", "g2"],
+                                output_names=["out"], source=_NORM)
+
+
+def norm_sources(h, parts, gains, eps):
+    """The raw panel ``h`` ``(W, NS, D)`` float32 normed exactly as the projection launch norms raw
+    sources (``parts`` the per-128 partial sums ``(W, NS, D // 128)`` or ``None``; ``gains`` one
+    bf16 weight ``(D,)`` per source): ``(W, NS, D)`` bf16, one launch."""
+    rows, ns, width = h.shape
+    g = list(gains) + [gains[-1]] * (3 - len(gains))
+    return _norm_kernel()(
+        inputs=[h, parts if parts is not None else h, *g[:3]],
+        template=[("NS", ns), ("D", width), ("PARTS_IN", parts is not None), ("THREADS", 256),
+                  ("NORM_EPS", f32_bits(eps))],
+        grid=(rows * ns * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(rows, ns, width)],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+
+
 @lru_cache(maxsize=1)
 def _project_kernel():
     return mx.fast.metal_kernel(
@@ -803,7 +867,7 @@ class Projected(NamedTuple):
 
 
 def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", threads=None, gate_rows=None,
-            stage=None, rch=None, affsum=None, stage2=None):
+            stage=None, rch=None, affsum=None, stage2=None, norm_first=None):
     """Every projection of one visit and its epilogues, for a panel, in one launch.
 
     ``sources``: ``(W, NS, D)`` bf16 normed inputs (``NS`` 1: q = k = v input; 3: q, k, v
@@ -888,6 +952,11 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
             affsum = False
     out_bytes += asum_bytes if affsum else 0
     stage = bool(staging and rows * width * 2 + out_bytes <= 31 * 1024)
+    # NORM_FIRST: a raw panel that cannot stage whole is normed once by a launch of its own (the same
+    # values this launch would stage) and then read as a normed panel.
+    if (_NORM_FIRST if norm_first is None else bool(norm_first)) and raw is not None and not stage:
+        xin = norm_sources(xin, parts if parts_in else None, gain_list, eps)
+        parts, gain_list, parts_in, raw = stand_f32, [stand_bf16] * 3, True, None
     # A wider loop-pass panel stages KC columns at a time (all simdgroups in step) rather than norm
     # its input in every simdgroup; a wider first-pass panel reads its bf16 input from device memory,
     # which measured faster than chunked staging (receipts/probe-mode-1.json: 86 vs 104 us at 8 rows).
