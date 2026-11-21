@@ -8000,6 +8000,25 @@ class ClientControlledDraw:
             out = mx.where(keep, out, -mx.inf)
         return out
 
+    def shape_scores(self, scores: mx.array, temperature: float) -> mx.array:
+        """A drafter's capped score rows ``(R, V)`` with this request's bias and min-p floor
+        (relative to each row's own maximum at ``temperature``), float32, lazy: proposals drawn
+        from the shaped law skip tokens the target law excludes (a banned id, the min-p tail).
+        Efficiency only: the ratio rule is exact for any proposal law, and the device round
+        decides with the law the proposals were drawn from. No repetition penalty here."""
+        vocab = int(scores.shape[-1])
+        if self._vocab is None:
+            self._prepare(vocab)
+        out = scores.astype(mx.float32)
+        if self._bias is not None:
+            out = out + mx.zeros((vocab,), mx.float32).at[self._bias[0]].add(self._bias[1])
+        if temperature and temperature > 0 and self.config.min_p > 0:
+            floor = float(temperature) * float(np.log(float(self.config.min_p)))
+            keep = mx.logical_or(out - mx.max(out, axis=-1, keepdims=True) >= floor,
+                                 mx.logical_not(mx.isfinite(out)))
+            out = mx.where(keep, out, -mx.inf)
+        return out
+
     def observe(self, token: int) -> None:
         if self._vocab is None:
             self._early.append(int(token))

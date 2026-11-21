@@ -377,6 +377,8 @@ def generate(
             proposed, law = fast_draft.propose(
                 rt.drafter, rt.model, anchor, cache[rt.trunk_entries :], min(selected_depth, remaining),
                 position=position, seed=round_seed, temperature=draft_temperature,
+                shape=(None if controls is None else
+                       (lambda scores: controls.shape_scores(scores, draft_temperature))),
             )
             block = mx.concatenate((mx.array([anchor], mx.int32), proposed))
             mx.async_eval(block)

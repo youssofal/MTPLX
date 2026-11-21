@@ -38,7 +38,7 @@ def _anchor_ids(anchor):
 
 
 def propose(drafter, target, anchor, cache, count, *, position, seed, temperature=1.0,
-            sample=True, cap=None, precision="bf16"):
+            sample=True, cap=None, precision="bf16", shape=None):
     """``count`` proposals (1 to 7) after ``anchor``; returns (ids (count,) int32, DraftLaw).
 
     ``position`` is the absolute position of the first proposal (the token after the
@@ -48,6 +48,9 @@ def propose(drafter, target, anchor, cache, count, *, position, seed, temperatur
     output for the base row, the same kernel over [signal, 1] and the folded table for the
     bias) instead of RC6's bfloat16 rounding; both read the same bytes, and either law is
     exact under both acceptance rules because the decision uses the law actually drawn.
+    ``shape`` (a request's ``ClientControlledDraw.shape_scores`` at the draft temperature) is
+    applied to each step's soft-capped scores before its law: a client's bias and min-p floor
+    on the proposals too (efficiency; the law returned is the shaped law the draws used).
     """
     if precision not in ("bf16", "f32"):
         raise ValueError(f"unknown drafter precision {precision!r}")
@@ -103,10 +106,15 @@ def propose(drafter, target, anchor, cache, count, *, position, seed, temperatur
         else:
             bias = mx.addmm(folded[:, -1], signal, folded[:, :-1].T)
         scores = base[:, i] + bias
+        row_cap = cap
+        if shape is not None:
+            scores = scores.astype(mx.float32)
+            scores = shape(mx.tanh(scores / cap) * cap if cap else scores)
+            row_cap = 0.0
         if greedy:
             law, st = rnd.law_rows(scores, temperature=None, cap=0.0, write=True)
         else:
-            law, st = rnd.law_rows(scores, temperature=temperature, cap=cap)
+            law, st = rnd.law_rows(scores, temperature=temperature, cap=row_cap)
         token, lse = rnd.sample_rows(law, st, positions=(start + i).reshape(1), seed=seed_words,
                                      purpose=rnd.PURPOSE_DRAFT, greedy=greedy)
         prev = token

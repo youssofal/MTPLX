@@ -171,3 +171,49 @@ def test_device_first_token_follows_the_host_min_p_law():
     chi2 = float(((counts[support] - expected) ** 2 / expected).sum())
     # chi-square with (support - 1) degrees of freedom, far tail
     assert chi2 < 3.0 * support.sum() + 30, (chi2, support.sum())
+
+
+# ------------------------------------------------------------------ the drafter's shaped law
+
+def test_shape_scores_bans_and_floors_the_drafter_rows(cpu):
+    config = SamplerConfig(temperature=0.7, top_p=1.0, top_k=0, min_p=0.05, logit_bias=((5, -100.0), (7, 2.0)))
+    scores = _logits(np.random.default_rng(13), 4, 64)
+    got = np.asarray(ClientControlledDraw(config, []).shape_scores(mx.array(scores), 0.7))
+    biased = scores.copy()
+    biased[:, 5] += np.float32(-100.0)
+    biased[:, 7] += np.float32(2.0)
+    keep = biased - biased.max(axis=1, keepdims=True) >= 0.7 * np.log(0.05)
+    np.testing.assert_array_equal(got[keep], biased[keep])
+    assert np.all(got[~keep] == -np.inf) and np.all(got[:, 5] == -np.inf)
+    # greedy drafts: the bias only
+    got0 = np.asarray(ClientControlledDraw(config, []).shape_scores(mx.array(scores), 0.0))
+    np.testing.assert_array_equal(got0, biased)
+
+
+@needs_gpu
+def test_device_round_with_a_shaped_draft_law_matches_the_host_reference():
+    mx.set_default_device(mx.gpu)
+    rng = np.random.default_rng(77)
+    vocab, k = 32_768, 3
+    config = SamplerConfig(temperature=1.0, top_p=1.0, top_k=0, min_p=0.02, logit_bias=((5, -100.0),))
+    disagreements = 0
+    for trial in range(30):
+        target = _logits(rng, k + 1, vocab)
+        draft = target[:k] + rng.normal(size=(k, vocab)).astype(np.float32) * 0.6
+        seed = int(rng.integers(0, 2**63))
+        position = int(rng.integers(0, 2**31))
+        controls = ClientControlledDraw(config, [])
+        shaped = controls.shape_scores(mx.array(draft), 1.0)
+        dlaw, dstats = rnd.law_rows(shaped, temperature=1.0, cap=0.0)
+        positions = mx.array(position, mx.uint32) + mx.arange(k, dtype=mx.uint32)
+        props, _ = rnd.sample_rows(dlaw, dstats, positions=positions, seed=seed, purpose=rnd.PURPOSE_DRAFT)
+        assert all(int(t) != 5 for t in np.asarray(props))
+        rows = controls.rows(mx.array(target), props)
+        d = rnd.read_packet(rnd.decide(rows, props, position=position, seed=seed,
+                                       draft=rnd.DraftLaw(dlaw, dstats)), k + 1)
+        assert d.status == 0
+        want, probs = rnd.reference_decide(np.asarray(rows), np.asarray(props), position=position,
+                                           seed=seed, draft_rows=np.asarray(dlaw))
+        disagreements += int(d.tokens != want)
+        np.testing.assert_allclose(d.accept_probability[: len(probs)], probs, rtol=1e-4, atol=1e-6)
+    assert disagreements == 0, disagreements
