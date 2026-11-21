@@ -52,8 +52,6 @@ SORT_THREADS = 1024
 PRODUCT_THREADS = 128
 
 #: The installed MLX's tensor-unit tile header (and the headers it includes).
-_TILE_HEADER = "mlx/backend/metal/kernels/steel/gemm/nax.h"
-
 
 def counts():
     with _lock:
@@ -68,9 +66,10 @@ def _count(key):
 @lru_cache(maxsize=1)
 def _installed_tile_header():
     """(text, None) with the installed MLX's tensor-unit tile and fragment templates, or (None, why)."""
-    from .installed_headers import text
+    from mtplx.kernels.library_headers import text
 
-    return text((_TILE_HEADER,), ("struct NAXTile", "tile_matmad_nax", "struct BaseNAXFrag", "get_coord"))
+    header, why = text("tensor_tiles")
+    return (None, why) if header is None else (header + "using namespace mlx::steel;\n", None)
 
 
 @lru_cache(maxsize=1)

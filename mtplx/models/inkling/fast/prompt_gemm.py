@@ -4,8 +4,8 @@ A prompt chunk's visit multiplies the same normed input by up to six stored 16-b
 sink, gate, key, value) and each expert block multiplies its router input by the router: one MLX matrix
 product each. ``project`` runs every matrix that shares an input in one launch: a threadgroup owns 64 rows by
 128 columns of one matrix's output, and each of its eight simdgroups computes a 32 by 32 tile with the
-installed MLX's own tensor-unit GEMM loop (read from its headers when the launch is first built; nothing of it
-lives in this tree): the same 16-deep fragments in the same order into float32, rounded once to the operand
+installed MLX's own tensor-unit GEMM loop (read from its headers by ``mtplx/kernels/library_headers.py`` when the
+launch is first built; nothing of it lives in this tree): the same 16-deep fragments in the same order into float32, rounded once to the operand
 type as MLX's product stores it.
 
 MLX's own product splits the reduction into parts on shapes with few output tiles (a narrow matrix at a short
@@ -38,7 +38,6 @@ BLOCK_ROWS = 64
 BLOCK_COLS = 128
 THREADS = 256
 PROMPT_MIN_ROWS = 33
-_GEMM_HEADER = "mlx/backend/metal/kernels/steel/gemm/gemm_nax.h"
 
 PROJECT = """
     // T: the operands' type; MATS: matrices sharing the input; K: the depth; FULL_DEPTH: K is a multiple of 256.
@@ -98,9 +97,9 @@ def available():
             return False, "no_tensor_units"
     except Exception as exc:  # noqa: BLE001
         return False, f"nax_detect: {type(exc).__name__}"
-    from .installed_headers import text
+    from mtplx.kernels.library_headers import text
 
-    header, why = text((_GEMM_HEADER,), ("gemm_loop", "struct NAXTile"))
+    header, why = text("tensor_gemm")
     if header is None:
         _log.warning("Inkling prompt projections keep MLX's products: %s", why)
         return False, "headers"
@@ -109,15 +108,15 @@ def available():
 
 @lru_cache(maxsize=1)
 def _kernel():
-    from .installed_headers import text
+    from mtplx.kernels.library_headers import text
 
-    header, _ = text((_GEMM_HEADER,), ("gemm_loop", "struct NAXTile"))
+    header, _ = text("tensor_gemm")
     return mx.fast.metal_kernel(
         name="mtplx_inkling_prompt_project",
         input_names=["x"] + ["w%d" % i for i in range(MAX_MATRICES)] + ["layout"],
         output_names=["y%d" % i for i in range(MAX_MATRICES)],
         source=PROJECT,
-        header=header,
+        header=header + "using namespace mlx::steel;\n",
     )
 
 
