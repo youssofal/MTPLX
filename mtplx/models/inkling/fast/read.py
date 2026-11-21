@@ -348,7 +348,9 @@ _PROBS = """
     for (uint i = 0; i < 4; ++i) {
         const uint s = lane * 4 + i;
         if (s < S) {
-            const uint at = SEP ? qn * S + s : (r * NQ + qn) * S + s;
+            // SEP: one (1, 1, Q, S) array a row; JOINED: one (Q, W * S) array (rows' keys as columns);
+            // otherwise one (1, W, Q, S) array.
+            const uint at = SEP ? qn * S + s : (JOINED ? qn * (W * S) + r * S + s : (r * NQ + qn) * S + s);
             float v;
             switch (which) {
                 case 0: v = s0[at]; break;
@@ -582,22 +584,29 @@ def read(partial, closed, queries, eps, *, mode, gains=(), messages=None, read_i
     return outs if mode == 2 else outs[:1]
 
 
-def probs(scores, scale):
+def probs(scores, scale, joined=None):
     """``mx.softmax(scores * scale, axis=-1)`` for each row and query, as RC6 computes it.
 
-    ``scores``: per-row ``(1, 1, Q, S)`` float32 arrays, or one ``(1, W, Q, S)`` array. Returns
-    ``(1, W, Q, S)`` float32. One launch (more than eight separate rows are joined first).
+    ``scores``: per-row ``(1, 1, Q, S)`` float32 arrays, or one ``(1, W, Q, S)`` array; or
+    ``joined = (array (Q, W * S), W, S)``, the stacked product's layout. Returns ``(1, W, Q, S)``
+    float32. One launch (more than eight separate rows are joined first).
     """
-    scores = list(scores)
-    if len(scores) > 8:
-        scores = [mx.concatenate(scores, axis=1)]
-    rows = sum(a.shape[1] for a in scores)
-    nq, count = scores[0].shape[2], scores[0].shape[3]
+    if joined is not None:
+        array, rows, count = joined
+        scores, nq, sep, flat = [array], array.shape[0], False, True
+    else:
+        scores = list(scores)
+        if len(scores) > 8:
+            scores = [mx.concatenate(scores, axis=1)]
+        rows = sum(a.shape[1] for a in scores)
+        nq, count = scores[0].shape[2], scores[0].shape[3]
+        sep, flat = len(scores) > 1, False
     if count > 128:
         raise ValueError("probs serves at most 128 scores a row (one simdgroup)")
     return _probs_kernel()(
         inputs=scores + [scores[0]] * (8 - len(scores)),
-        template=[("SEP", len(scores) > 1), ("NQ", nq), ("S", count), ("SCALE", _f32_bits(scale))],
+        template=[("SEP", sep), ("JOINED", flat), ("W", rows), ("NQ", nq), ("S", count),
+                  ("SCALE", _f32_bits(scale))],
         grid=(rows * nq * 32, 1, 1),
         threadgroup=(32, 1, 1),
         output_shapes=[(1, rows, nq, count)],
@@ -614,27 +623,76 @@ def depth_keys(partial, closed, queries, eps):
     return keys.reshape(1, rows, len(closed) + 1, width)
 
 
+# First-use verdicts on this Mac, per shape: does one MLX product give RC6's per-row bits?
+_one_launch: dict = {}
+
+
+def _same(a, b):
+    view = {2: mx.uint16, 4: mx.uint32}[a.dtype.size]
+    return a.shape == b.shape and bool(mx.array_equal(a.view(view), b.view(view)).item())
+
+
+def _proven(key, per_row, joined, slices):
+    """``slices(joined)`` must equal ``per_row`` bit for bit; decided once per shape on real
+    operands (a host sync on that first call only) and counted."""
+    from .attn_input import count_route
+
+    verdict = _one_launch.get(key)
+    if verdict is None:
+        rows = per_row()
+        whole = joined()
+        mx.eval(rows, whole)
+        verdict = all(_same(mx.contiguous(got), want) for got, want in zip(slices(whole), rows))
+        _one_launch[key] = verdict
+        count_route(("proved:" if verdict else "refused:") + "one_launch_" + "_".join(map(str, key)))
+    return verdict
+
+
+def scores(q, keys):
+    """RC6's score products for every row (``q @ keys[:, r:r+1].swapaxes(-1, -2)``, one MLX call
+    a row, as RC6 takes them): as one MLX product with the rows' keys as columns where a first-use
+    proof on this Mac shows the same bits (an M3 to M5 measurement: always, for 3 and 4 queries,
+    2 to 5 sources, 1 to 32 rows; receipts/probe-batch-1.json), else the per-row calls.
+    Returns ``probs`` keyword arguments."""
+    rows, count, width = keys.shape[1], keys.shape[2], keys.shape[3]
+    nq = q.shape[0]
+    per_row = lambda: [q @ keys[:, r:r + 1].swapaxes(-1, -2) for r in range(rows)]
+    joined = lambda: q @ keys.reshape(rows * count, width).T
+    key = ("scores", nq, count, rows, width)
+    if _proven(key, per_row, joined,
+               lambda whole: [whole[:, r * count:(r + 1) * count].reshape(1, 1, nq, count) for r in range(rows)]):
+        return {"joined": (joined(), rows, count)}
+    return {"scores": per_row()}
+
+
 def depth_read(queries, keys):
     """RC6's three-query depth read from its keys (``model.py`` ``serial_depth_dots``): the
-    scores one row at a time, as a one-row step takes them, on MLX's own product; RC6's scale
-    and softmax here; the mix as RC6's batched MLX product. ``(1, W, Q, D)`` float32."""
-    rows, width = keys.shape[1], keys.shape[-1]
+    scores as RC6's per-row products give them (``scores``), RC6's scale and softmax here, the
+    mix as RC6's batched MLX product. ``(1, W, Q, D)`` float32."""
+    width = keys.shape[-1]
     q = queries.reshape(-1, width).astype(mx.float32)
-    scores = [q @ keys[:, r:r + 1].swapaxes(-1, -2) for r in range(rows)]
-    return probs(scores, width ** -0.5) @ keys
+    kw = scores(q, keys)
+    return probs(kw.get("scores"), width ** -0.5, kw.get("joined")) @ keys
 
 
 def message_rows(stack, queries):
-    """RC6's cross-pass message read (``projection.py`` ``serial_messages``), row by row on
-    MLX's own products as RC6 calls them, with RC6's scale and softmax here.
+    """RC6's cross-pass message read (``projection.py`` ``serial_messages``): scores as RC6's
+    per-row products give them (``scores``), RC6's scale and softmax here, then the mix: one
+    batched MLX product where a first-use proof shows RC6's per-row bits (always on the M5 Max,
+    receipts/probe-rowstable-1.json), else one product a row as RC6 calls it.
 
     ``stack`` ``(1, W, P, D)`` float32 (normalised prior states), ``queries`` ``(4, D)`` float32.
-    Returns one ``(1, 1, 4, D)`` float32 array a row.
+    Returns one ``(1, W, 4, D)`` float32 array, or one ``(1, 1, 4, D)`` array a row.
     """
-    rows, width = stack.shape[1], stack.shape[-1]
-    scores = [queries @ stack[:, r:r + 1].swapaxes(-1, -2) for r in range(rows)]
-    weights = probs(scores, width ** -0.5)
-    return [weights[:, r:r + 1] @ stack[:, r:r + 1] for r in range(rows)]
+    rows, count, width = stack.shape[1], stack.shape[2], stack.shape[-1]
+    kw = scores(queries, stack)
+    weights = probs(kw.get("scores"), width ** -0.5, kw.get("joined"))
+    per_row = lambda: [weights[:, r:r + 1] @ stack[:, r:r + 1] for r in range(rows)]
+    batched = lambda: weights @ stack
+    key = ("mix", queries.shape[0], count, rows, width)
+    if _proven(key, per_row, batched, lambda whole: [whole[:, r:r + 1] for r in range(rows)]):
+        return batched()
+    return per_row()
 
 
 _message_rows = weakref.WeakKeyDictionary()

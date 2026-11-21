@@ -8,18 +8,21 @@ same arithmetic in these launches (W panel rows):
 
 1. ``read`` (``fast/read.py``): one-query depth read, controller norms and down product, input
    norms; on global visits the keys of the three-query read.
-2. RC6's three-query depth read (global visits, ``W + 2`` launches: per-row scores and the mix
-   on MLX's own products, softmax between) and four-query message read (passes 2 and 3,
-   ``2 W + 1``: per-row scores and mixes, softmax between, shared with the expert input):
-   their order is the matrix unit's, so they run as the very MLX calls RC6 makes.
+2. RC6's three-query depth read (global visits) and four-query message read (passes 2 and 3,
+   shared with the expert input): their products sum in the matrix unit's order, so they run on
+   MLX's own products, the scores of every row as one product (the rows' keys as columns) and
+   the mix batched, each admitted per shape by a first-use proof that it gives RC6's per-row
+   bits on this Mac (else one MLX call a row, as RC6 makes them), with RC6's scale and softmax in
+   one launch between: 5 launches for a depth read (keys included), 4 for a message read.
 3. passes two and three only: controller forget/gain products and the tanh mix.
 4. ``project`` (here): every projection of the visit for the whole panel in one launch,
    each stored bf16 weight row read once per panel and in place, followed by the per-head
    epilogues: scaled clips of query and relative, the position scale, both convolutions
    with their committed tails, the key clip and the value norm.
 
-Launches a visit: window first pass 2; global first pass ``W + 4``; window loop pass ``2 W + 4``;
-global loop pass ``3 W + 7``.
+Launches a visit, any panel width: window first pass 2; global first pass 6; window loop pass 7;
+global loop pass 12 (where a first-use proof refused the one-launch products: ``W + 4``,
+``2 W + 4``, ``3 W + 7``).
 
 Exactness (class A, proven on first use): every output row of a product is a twin of
 MLX 0.32.2's one-row ``gemv`` for that matrix shape (``matmul.cpp`` ``gemv_axbpy``):
