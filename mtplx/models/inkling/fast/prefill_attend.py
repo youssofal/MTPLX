@@ -34,6 +34,12 @@ from . import attend as A
 #: are 100 MB in bf16, so a 104K chunk stays well inside any Mac's working set).
 LAUNCH_ROWS = 16
 GROUP_ROWS = 8
+#: Launches evaluated together. A visit's launches stay lazy until something evaluates them,
+#: and MLX then keeps about ten command buffers in flight, so a 512-row visit held about 20
+#: launches' partials at once (1.04 GB at 32K keys, 2.08 GB at 64K against RC6's 0.19 and
+#: 0.31; lanes/l6/probe-prompt-memory-1.json). Evaluating each group of EVAL_LAUNCHES as it is
+#: made holds a few launches' partials; the evaluation boundary changes no arithmetic.
+EVAL_LAUNCHES = 4
 
 _SRC_ROW = "    const int r = int(simdgroup_index_in_threadgroup);     // panel row\n"
 _DST_ROW = ("    const int sg = int(simdgroup_index_in_threadgroup);\n"
@@ -236,6 +242,8 @@ def _prompt_attention(query, key, value, profiles, sink):
                 output_dtypes=[mx.bfloat16],
             )
             parts.append(h)
+            if len(parts) % EVAL_LAUNCHES == 0:
+                mx.eval(parts[-EVAL_LAUNCHES:])
     out = parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=1)
     return out.reshape(1, rows, A.HEADS, A.HEAD_DIM).transpose(0, 2, 1, 3)
 

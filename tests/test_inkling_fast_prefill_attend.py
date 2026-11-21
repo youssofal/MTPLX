@@ -66,10 +66,11 @@ def test_declines_what_it_cannot_serve():
     assert P.decline(q, k, v, prof, sink, 0) in ("full_kernel_tiles", "single_pass")
 
 
-@pytest.mark.parametrize("hist,rows", [(20000, 40), (20001, 37), (33000, 21)])
+@pytest.mark.parametrize("hist,rows", [(20000, 40), (20001, 37), (33000, 21), (20000, 100)])
 def test_prompt_attention_equals_rc6_call_bit_for_bit(hist, rows):
     """Tiles of 8 rows (256 blocks); a short last tile; 5-row tiles at 512 blocks with a 1-row
-    last tile at 64 blocks (its own reduction)."""
+    last tile at 64 blocks (its own reduction); 100 rows: 7 launches, the first 4 evaluated as
+    a group (EVAL_LAUNCHES) before the rest are made."""
     q, k, v, prof, sink = _chunk(hist, rows, seed=hist + rows)
     assert P.decline(q, k, v, prof, sink, 0) is None
     ref = stock_attention(q, k, v, prof, sink, 0)
