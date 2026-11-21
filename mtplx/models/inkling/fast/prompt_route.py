@@ -100,12 +100,12 @@ _headroom = {}
 
 
 def flash_attention_on(prompt_tokens=None):
-    """Whether the prompt chunk's attention is the one-launch route: switched on (the default) and, for a
+    """Whether the prompt chunk's attention is the one-launch route: switched on (the default), able to run on
+    this Mac (``prompt_flash.runs_here``: tensor units, library headers, the stock attention mode) and, for a
     prompt of ``prompt_tokens``, one the route reads (not shorter than its crossover)."""
-    from ..attention import flash_switch_on
     from . import prompt_flash
 
-    if not flash_switch_on():
+    if not prompt_flash.runs_here():
         return False
     return prompt_tokens is None or not prompt_flash.short_prompt(int(prompt_tokens), width=WIDE_ROWS_FLASH)
 

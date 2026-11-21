@@ -106,6 +106,8 @@ def test_with_the_one_launch_attention_the_width_is_4096_and_the_fence_lifts(mon
     monkeypatch.setenv(PROMPT_FAST_ENV, "chunk")
     monkeypatch.setattr(PR, "_headroom", {"bytes": 64 * 1024**3})
     monkeypatch.delenv("MTPLX_INKLING_PROMPT_FLASH", raising=False)   # on by default
+    monkeypatch.setattr(F, "tensor_units", lambda: True)              # a Mac it runs on (M5)
+    monkeypatch.setattr(F, "library_text", lambda: ("text", None))
     long_prompt = max(F.SHORT_PROMPT_WIDE, 4_000)
     assert PR.flash_attention_on() and PR.flash_attention_on(long_prompt)
     assert PR.wide_rows(long_prompt) == PR.WIDE_ROWS_FLASH
@@ -119,3 +121,45 @@ def test_with_the_one_launch_attention_the_width_is_4096_and_the_fence_lifts(mon
     monkeypatch.setattr(PR, "_headroom", {"bytes": 64 * 1024**3})
     monkeypatch.setenv("MTPLX_INKLING_PROMPT_FLASH", "off")
     assert not PR.flash_attention_on() and PR.wide_rows(long_prompt) == 2048
+
+
+def test_without_the_tensor_units_a_long_prompt_keeps_the_stock_attentions_width_and_price(monkeypatch):
+    """M1 to M4 cannot run the one-launch attention, so a long prompt keeps the stock attention's width rule (its
+    bias and mask planes grow with width times context) and is priced with those planes; it does not take the
+    2,048 rows the one launch reads at any length."""
+    from mtplx.models.inkling.fast import prompt_flash as F
+    from mtplx.models.inkling.fast import prompt_route as PR
+
+    monkeypatch.setenv(PROMPT_FAST_ENV, "chunk")
+    monkeypatch.setattr(PR, "_headroom", {"bytes": 64 * 1024**3})
+    monkeypatch.delenv("MTPLX_INKLING_PROMPT_FLASH", raising=False)
+    monkeypatch.setenv("MTPLX_FORCE_GPU_FAMILY_FALLBACK", "1")       # the product's M1 to M4 rehearsal switch
+    long_prompt = PR.WIDE_PROMPT_TOKENS * 4
+    assert not F.runs_here() and not PR.flash_attention_on(long_prompt)
+    assert PR.wide_rows(long_prompt) is None                          # 512 rows past the stock fence
+    assert PR.wide_rows(PR.WIDE_PROMPT_TOKENS) == PR.WIDE_ROWS        # 2,048 inside it
+    assert PR.forward_bytes(2048, long_prompt) == PR.forward_bytes(2048, long_prompt, flash=False)
+
+
+def test_the_stage_counts_as_running_only_where_it_can(monkeypatch):
+    import mlx.core as mx
+
+    from mtplx.models.inkling.fast import prompt_flash as F
+
+    for name in ("MTPLX_INKLING_PROMPT_FLASH", "MTPLX_INKLING_ATTENTION", "MTPLX_INKLING_PROMPT_ATTENTION",
+                 "MTPLX_FORCE_GPU_FAMILY_FALLBACK"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(F, "tensor_units", lambda: True)
+    monkeypatch.setattr(F, "library_text", lambda: ("text", None))
+    gpu = mx.default_device() == mx.gpu and mx.metal.is_available()
+    assert F.runs_here() == gpu
+    for name, value in (("MTPLX_INKLING_PROMPT_FLASH", "off"), ("MTPLX_INKLING_ATTENTION", "exact"),
+                        ("MTPLX_INKLING_PROMPT_ATTENTION", "stock")):
+        monkeypatch.setenv(name, value)
+        assert not F.runs_here(), name
+        monkeypatch.delenv(name)
+    monkeypatch.setattr(F, "tensor_units", lambda: False)
+    assert not F.runs_here()
+    monkeypatch.setattr(F, "tensor_units", lambda: True)
+    monkeypatch.setattr(F, "library_text", lambda: (None, "no headers"))
+    assert not F.runs_here()
