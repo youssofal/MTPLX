@@ -212,7 +212,7 @@ _RACE = r"""
     uint K = sizes[2];               // rows that carry a proposal
     int mode = modes[row];
     uint2 key = uint2(seed[0], seed[1]);
-    uint position = positions[row];
+    uint position = CONSECUTIVE ? positions[0] + row : positions[row];
     threadgroup float2 scratch[THREADS / 32];
     float2 t = l4_row_lse(tstats, row, C, tid, lane, sg, scratch);
     float2 d = float2(0.0f, 0.0f);
@@ -358,7 +358,7 @@ _DECIDE = r"""
                     } else if (diff >= 0.0f) {
                         accept[sg] = 1;
                     } else {
-                        uint4 r = l4_philox(uint4(0u, positions[sg], 2u, 0u), key);
+                        uint4 r = l4_philox(uint4(0u, positions[0] + sg, 2u, 0u), key);
                         accept[sg] = (l4_exponential(r.x, r.y) > -diff) ? 1 : 0;   // u < p/q
                     }
                 }
@@ -418,6 +418,20 @@ _FINISH = r"""
     if (lane == 0) winners[row] = w.y;
 """
 
+# The same winner with the row's status beside it (a draw's one read): drawn[row] the token,
+# drawn[W + row] STATUS_OK, or STATUS_NON_FINITE when the row's max or log-sum is not finite.
+_FINISH_CHECKED = r"""
+    uint row = threadgroup_position_in_grid.x;
+    uint lane = thread_index_in_simdgroup;
+    uint C = sizes[1];
+    uint W = sizes[2];
+    int4 w = l4_row_winner(race, row, C, lane);
+    if (lane == 0) {
+        drawn[row] = w.y;
+        drawn[W + row] = (metal::isfinite(lse[row * 4 + 0]) && metal::isfinite(lse[row * 4 + 1])) ? 0 : 1;
+    }
+"""
+
 
 def _chunks(vocab):
     return -(-vocab // CHUNK)
@@ -474,6 +488,14 @@ def _kernel(name):
             input_names=["race", "sizes"],
             output_names=["winners"],
             source=_FINISH,
+            header=_HEADER + _ROW_WINNER,
+        )
+    if name == "finish_checked":
+        return mx.fast.metal_kernel(
+            name="mtplx_inkling_l4_finish_checked",
+            input_names=["race", "lse", "sizes"],
+            output_names=["drawn"],
+            source=_FINISH_CHECKED,
             header=_HEADER + _ROW_WINNER,
         )
     if name in ("decide", "decide_wide"):
@@ -553,8 +575,10 @@ class DraftLaw:
 
 
 def race(tlaw, tstats, *, modes, positions, seed, purpose, greedy=False, dlaw=None,
-         dstats=None, proposals=None):
-    """Race partials and per-row (max, lse) for a panel of law rows (pure, lazy)."""
+         dstats=None, proposals=None, consecutive=False):
+    """Race partials and per-row (max, lse) for a panel of law rows (pure, lazy).
+    ``consecutive``: ``positions`` is one base position and row r draws at base + r (computed
+    in the kernel: no position array is built on the GPU)."""
     rows, vocab = tlaw.shape
     chunks = _chunks(vocab)
     k = 0 if proposals is None else int(proposals.shape[0])
@@ -567,7 +591,7 @@ def race(tlaw, tstats, *, modes, positions, seed, purpose, greedy=False, dlaw=No
         inputs=[tlaw, tstats, dlaw, dstats, proposals.astype(mx.int32), modes, positions, seed,
                 sizes],
         template=[("THREADS", THREADS), ("PER_THREAD", PER_THREAD), ("GREEDY", bool(greedy)),
-                  ("PURPOSE", int(purpose))],
+                  ("PURPOSE", int(purpose)), ("CONSECUTIVE", bool(consecutive))],
         grid=(chunks * THREADS, rows, 1),
         threadgroup=(THREADS, 1, 1),
         output_shapes=[(rows, chunks, 4), (rows, 4)],
@@ -608,14 +632,14 @@ def decide(target_logits, proposals, *, position, seed, temperature=1.0, draft=N
     mode = MODE_TARGET if match else (MODE_POINT if point else MODE_RESIDUAL)
     modes = _const([mode] * k + [MODE_TARGET], mx.int32)
     base = position if isinstance(position, mx.array) else mx.array(int(position), mx.uint32)
-    positions = base.astype(mx.uint32).reshape(()) + mx.arange(rows, dtype=mx.uint32)
+    positions = base.astype(mx.uint32).reshape(1)   # row r decides position base + r (in the kernels)
     seed_words = seed if isinstance(seed, mx.array) else _seed_words(seed)
     props = proposals if proposals is not None else _const([], mx.int32)
     dlaw = None if point else draft.rows
     dstats = None if point else draft.stats
     race_parts, lse = race(tlaw, tstats, modes=modes, positions=positions, seed=seed_words,
                            purpose=PURPOSE_TARGET, greedy=greedy, dlaw=dlaw, dstats=dstats,
-                           proposals=props if k else None)
+                           proposals=props if k else None, consecutive=True)
     sizes = _const([vocab, _chunks(vocab), k, rows], mx.uint32)
     if offered is None:
         offered = _const([k], mx.uint32)
@@ -713,12 +737,19 @@ def draw_checked(target_logits, *, position, seed, temperature=1.0):
     greedy = not temperature or temperature <= 0
     tlaw, tstats = law_rows(target_logits, temperature=None if greedy else temperature)
     base = position if isinstance(position, mx.array) else mx.array(int(position), mx.uint32)
-    positions = base.astype(mx.uint32).reshape(()) + mx.arange(rows, dtype=mx.uint32)
-    tokens, stats = sample_rows(tlaw, tstats, positions=positions, seed=seed,
-                                purpose=PURPOSE_TARGET, greedy=greedy)
-    good = mx.isfinite(stats[:, 0]) & mx.isfinite(stats[:, 1])
-    status = mx.where(good, STATUS_OK, STATUS_NON_FINITE).astype(mx.int32)
-    return mx.stack([tokens.astype(mx.int32), status])
+    seed_words = seed if isinstance(seed, mx.array) else _seed_words(seed)
+    race_parts, lse = race(tlaw, tstats, modes=_const([MODE_TARGET] * rows, mx.int32),
+                           positions=base.astype(mx.uint32).reshape(1), seed=seed_words,
+                           purpose=PURPOSE_TARGET, greedy=greedy, consecutive=True)
+    (drawn,) = _kernel("finish_checked")(
+        inputs=[race_parts, lse, _const([0, _chunks(vocab), rows], mx.uint32)],
+        template=[("THREADS", THREADS)],
+        grid=(32 * rows, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(2 * rows,)],
+        output_dtypes=[mx.int32],
+    )
+    return drawn.reshape(2, rows)
 
 
 def read_draw(drawn, rows=None, settle=None):
