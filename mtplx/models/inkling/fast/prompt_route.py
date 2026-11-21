@@ -7,6 +7,11 @@
 * ``experts``: the MXFP8 blocks' gate-up takes the sorted product on the accelerator (MLX's grouped product,
   as the NVFP4 blocks' does) instead of the one-row panel product, both MXFP8 products on bfloat16 operands
   (the rounded expert inputs, which bfloat16 holds exactly). NVFP4 blocks are unchanged.
+* ``invariant``: the prompt read's sums do not depend on the chunk width. Every product of a prompt chunk runs
+  on our launches at every row count (the projections, the router, the controllers, both expert products in
+  both formats, the drafter's context heads), each output element summed in one fixed order whatever the
+  rows around it; the glue kernels serve every row count; with ``chunk`` the width is then the widest that
+  the Mac's memory allows (``wide_rows``), and every width gives the same cache. Implies ``experts``.
 
 Neither part is bit-identical to the default prompt read: the MXFP8 gate-up sums in the sorted product's order
 instead of the one-row product's, and a chunk boundary moves rounding in the attention calls. So the route
@@ -18,7 +23,7 @@ from __future__ import annotations
 import os
 
 PROMPT_FAST_ENV = "MTPLX_INKLING_PROMPT_FAST"
-PROMPT_FAST_PARTS = ("chunk", "experts")
+PROMPT_FAST_PARTS = ("chunk", "experts", "invariant")
 
 
 def prompt_fast(part):
@@ -28,7 +33,13 @@ def prompt_fast(part):
         return False
     if raw in ("1", "on", "yes", "true", "all"):
         return True
-    return part in {word.strip() for word in raw.split(",")}
+    words = {word.strip() for word in raw.split(",")}
+    return part in words or (part == "experts" and "invariant" in words)
+
+
+def invariant_sums():
+    """Whether the prompt read's sums are width-independent (the ``invariant`` part, read per call)."""
+    return prompt_fast("invariant")
 
 
 #: Rows a forward the ``chunk`` part reads. Not 4,096 while the prompt attention computes every key of its call:
@@ -80,14 +91,45 @@ def gpu_headroom_bytes():
     return _headroom["bytes"]
 
 
+#: Widths the invariant read may take, widest first: every one gives the same cache, so the widest that fits wins.
+INVARIANT_WIDTHS = (4096, 2048, 1024, 512, 256)
+#: One prompt forward's working memory beyond its KV, in process (OQ and Bare Speed, 4K): 1.03 to 1.13 GB at 512
+#: rows, 2.03 at 2,048, 2.8 to 2.9 at 4,096 (`lanes/p1/sheet-*-4k-*.json`): about 0.6 GB plus 0.55 MB a row.
+FORWARD_FIXED_BYTES = 640 * 1024**2
+FORWARD_ROW_BYTES = 576 * 1024
+#: The attention's bias and mask planes at today's route: 24 heads x rows x keys of 16-bit values, about three
+#: alive at once (a cold 16K read grew 1.9 GiB more at 2,048 rows than at 512: `lanes/p1/mem-pair-bare-cand-*`).
+PLANE_COPIES = 3
+#: What the width may use of the GPU headroom: the rest stays for the session's own state and the admission.
+HEADROOM_SHARE = 0.5
+
+
+def forward_bytes(rows, keys, flash=None):
+    """A prompt forward's working memory at ``rows`` rows against ``keys`` keys (arithmetic from measured rows)."""
+    flash = flash_attention_on() if flash is None else flash
+    planes = 0 if flash else PLANE_COPIES * 24 * int(rows) * max(int(keys), int(rows)) * 2
+    return FORWARD_FIXED_BYTES + FORWARD_ROW_BYTES * int(rows) + planes
+
+
 def wide_rows(prompt_tokens=None, headroom_bytes=None):
     """The ``chunk`` part's width for a prompt of ``prompt_tokens``, or None for the default 512 rows."""
     if not prompt_fast("chunk"):
         return None
     flash = flash_attention_on()
+    room = gpu_headroom_bytes() if headroom_bytes is None else headroom_bytes
+    if invariant_sums():
+        # every width gives the same cache: the widest whose forward fits in its share of the headroom
+        if room is None:
+            return None
+        # (no wider than the attention pays for: 2,048 rows while it computes every key of its call)
+        keys = int(prompt_tokens) if prompt_tokens is not None else 0
+        widest = WIDE_ROWS_FLASH if flash else WIDE_ROWS
+        for rows in (w for w in INVARIANT_WIDTHS if w <= widest):
+            if forward_bytes(rows, keys, flash) <= HEADROOM_SHARE * room:
+                return rows
+        return min(INVARIANT_WIDTHS)
     if not flash and prompt_tokens is not None and int(prompt_tokens) > WIDE_PROMPT_TOKENS:
         return None
-    room = gpu_headroom_bytes() if headroom_bytes is None else headroom_bytes
     if room is None or room < WIDE_HEADROOM_BYTES:
         return None
     return WIDE_ROWS_FLASH if flash else WIDE_ROWS

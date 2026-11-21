@@ -226,7 +226,9 @@ def served(rows, width, dtype, *arrays):
     """Why the loop glue cannot serve this call, or None."""
     import os
 
-    if rows < 33:
+    from .prompt_glue import min_rows
+
+    if rows < min_rows():
         return "rows"
     if os.environ.get("MTPLX_INKLING_PROMPT_KERNELS", "ours").strip().lower() in ("mlx", "0", "off", "stock"):
         return "disabled"

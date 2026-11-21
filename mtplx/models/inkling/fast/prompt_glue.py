@@ -43,8 +43,16 @@ def enabled():
     return os.environ.get("MTPLX_INKLING_PROMPT_KERNELS", "ours").strip().lower() not in ("mlx", "0", "off", "stock")
 
 
+def min_rows():
+    """Rows a call needs before these launches serve it: every row count under the prompt read's width-independent
+    part (each row's result is its own, whatever the rows around it), else prompt chunks of more than 32 rows."""
+    from .prompt_route import invariant_sums
+
+    return 1 if invariant_sums() else PROMPT_MIN_ROWS
+
+
 def _unserved(partial, closed, gain, where):
-    if partial.ndim != 3 or partial.shape[1] < PROMPT_MIN_ROWS:
+    if partial.ndim != 3 or partial.shape[1] < min_rows():
         return "rows"
     if not enabled():
         return "disabled"
@@ -200,7 +208,7 @@ def heads(layer, q_lin, r_lin, k_conv, v_conv, offset):
     rel_dim = layer.r_scale.shape[1]
     kv_heads = k_conv.shape[-1] // head_dim
     reason = None
-    if rows < PROMPT_MIN_ROWS:
+    if rows < min_rows():
         reason = "rows"
     elif not enabled():
         reason = "disabled"
@@ -285,7 +293,7 @@ def output_gate(h, gate_lin):
     reason = None
     if h.ndim != 4 or gate_lin.ndim != 3 or h.shape[0] != 1 or gate_lin.shape[0] != 1:
         reason = "shape"
-    elif h.shape[2] < PROMPT_MIN_ROWS:
+    elif h.shape[2] < min_rows():
         reason = "rows"
     elif not enabled():
         reason = "disabled"

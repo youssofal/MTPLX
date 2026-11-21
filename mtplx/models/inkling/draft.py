@@ -9,6 +9,21 @@ from .model import linear
 from .precision import AffineWeight
 
 
+def _context_heads(x, weight, name):
+    """The context heads a prompt chunk's features feed (the drafter's KV of the prompt): on the width-independent
+    prompt read (``fast/prompt_route.py``'s ``invariant`` part) our launch, whose sums do not depend on the rows
+    around a row; else the model's product."""
+    from .fast.prompt_route import invariant_sums
+
+    if invariant_sums() and isinstance(weight, mx.array) and weight.ndim == 2 and weight.dtype == x.dtype:
+        from .fast import prompt_gemm
+
+        flat = x.reshape(-1, x.shape[-1])
+        (out,) = prompt_gemm.project(flat, [weight], "drafter_" + name)
+        return out.reshape(*x.shape[:-1], weight.shape[0])
+    return linear(x, weight)
+
+
 class DraftBlock(nn.Module):
     def __init__(self, weights, config, index):
         super().__init__()
@@ -24,7 +39,12 @@ class DraftBlock(nn.Module):
         return mx.fast.rms_norm(x, self.w[name + ".weight"], self.cfg["rms_norm_eps"])
 
     def heads(self, x, name):
-        projected = linear(x, self.w["self_attn." + name + "_proj.weight"])
+        weight = self.w["self_attn." + name + "_proj.weight"]
+        projected = (
+            _context_heads(x, weight, name)
+            if name.endswith("_ctx")
+            else linear(x, weight)
+        )
         return projected.reshape(*x.shape[:2], -1, self.cfg["head_dim"]).transpose(
             0, 2, 1, 3
         )

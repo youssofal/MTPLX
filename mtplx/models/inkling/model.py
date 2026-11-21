@@ -14,6 +14,7 @@ from .cache import WindowCache
 from .activations import expert_inputs
 from . import expert_fusion
 from .fast import prompt_gemm, prompt_glue, prompt_loop
+from .fast.prompt_route import invariant_sums
 from .head import fits_route, measured_route, note_route, pack_proofs, vocabulary_logits
 from .layout import layer_visits
 from .precision import AffineWeight, packed_logical_shape, source_modes
@@ -109,7 +110,7 @@ cross_pass_message = (
 def shared_linear(x, weights, where, tape=None):
     """``[linear(x, w) for w in weights]``. At a prompt chunk the stored 16-bit matrices among them run as one
     launch of ours with MLX's sums (``fast/prompt_gemm.py``, admitted per shape); the rest as before."""
-    if tape is not None or x.size // x.shape[-1] < prompt_gemm.PROMPT_MIN_ROWS:
+    if tape is not None or (x.size // x.shape[-1] < prompt_gemm.PROMPT_MIN_ROWS and not invariant_sums()):
         return [linear(x, w) for w in weights]
     plain = [i for i, w in enumerate(weights) if isinstance(w, mx.array) and w.dtype == x.dtype]
     got = dict(zip(plain, prompt_gemm.project(x, [weights[i] for i in plain], where))) if plain else {}
@@ -310,10 +311,11 @@ class Experts(nn.Module):
         self.gate_cap = config["mlp_gate_softcap"]
         self.up_cap = config["mlp_up_softcap"]
 
-    def __call__(self, hidden):
+    def __call__(self, hidden, prompt=False):
         # 1-32 rows take four fused kernels around the same router matmul, sigmoid and
         # quantized gathers once proven on this Mac (class A); the rest runs the stock body.
-        return expert_fusion.experts_forward(self, hidden, linear, self.stock)
+        # `prompt`: a prompt chunk's call (the width-independent prompt read serves every row count).
+        return expert_fusion.experts_forward(self, hidden, linear, self.stock, prompt=prompt)
 
     def stock(self, hidden):
         flat = hidden.reshape(-1, hidden.shape[-1])
@@ -598,7 +600,7 @@ class Layer(nn.Module):
             if messages is not None:
                 ffn = self.controllers[3](ffn, messages[..., 3, :], self.eps)
             ffn_in = norm(ffn, self.ffn_norm, self.eps).astype(x.dtype)
-        routed = self.experts(ffn_in)
+        routed = self.experts(ffn_in, prompt=tape is None)
         return self.convs[3](routed, conv, 3, tape=tape, add=residual, out_dtype=x.dtype)
 
 

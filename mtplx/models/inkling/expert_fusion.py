@@ -465,6 +465,15 @@ def prompt_unserved(block, flat, gpu=None):
     return _block_reason(block, flat)
 
 
+def _invariant_unserved(block, flat):
+    """Why the width-independent prompt route cannot serve this call, or None."""
+    if not prompt_kernels():
+        return "no_prompt_kernels"
+    if not 1 <= flat.shape[0] <= PROMPT_ROWS:
+        return "prompt_rows"
+    return _block_reason(block, flat)
+
+
 def _block_reason(block, flat):
     rows, width = flat.shape
     if block.gate_up.mode not in {"nvfp4", "mxfp8"} or block.gate_up.mode != block.down.mode:
@@ -571,7 +580,7 @@ def prompt_kernels():
     return prompt_experts.available()[0]
 
 
-def routed_sorted(block, flat, linear, trace=None, variant=None, fast=False):
+def routed_sorted(block, flat, linear, trace=None, variant=None, fast=False, invariant=False):
     """Mixture of experts for a prompt chunk (33 to PROMPT_ROWS rows): the stock body's sort and two
     sorted quantized products on the same inputs, around the fused input, route, SwiGLU and combine
     kernels. Call only when `prompt_unserved` returns None.
@@ -591,6 +600,10 @@ def routed_sorted(block, flat, linear, trace=None, variant=None, fast=False):
     a float32 output, so the only change is the gate-up's order of summation: the sorted
     product's (MLX's own grouped product) instead of the one-row product's (class C against the
     default).
+
+    `invariant` (the prompt read's ``invariant`` part, off by default; requires our launches): every
+    product is ours at every row count, the MXFP8 gate-up included and both products below 4 pairs an
+    expert, so a pair's sums do not depend on how many rows the chunk holds.
     """
     fp4 = block.gate_up.mode == "nvfp4"
     rows, width = flat.shape
@@ -602,8 +615,8 @@ def routed_sorted(block, flat, linear, trace=None, variant=None, fast=False):
     # MLX multiplies sorted pairs on its tile kernel only from 4 pairs an expert on; below that each
     # pair is its one-row product. An NVFP4 product's sums are exact, so either is ours; an MXFP8
     # block below that keeps MLX's products (and the fast route's MXFP8 gate-up its panel).
-    tiled = fp4 or pairs >= SORTED_TILE_PAIRS * block.router.shape[0]
-    fast = fast and not fp4 and tiled
+    tiled = fp4 or invariant or pairs >= SORTED_TILE_PAIRS * block.router.shape[0]
+    fast = (fast or invariant) and not fp4 and tiled
     # bfloat16 operands: the fast route's MXFP8 products, and NVFP4 products on our launches. MLX's
     # products of an MXFP8 block take float32 operands, and so do ours in their place.
     operand = mx.bfloat16 if fast or (ours and fp4) else mx.float32
@@ -816,11 +829,20 @@ def _prompt_fast(part):
     return prompt_fast(part)
 
 
-def experts_forward(block, hidden, linear, stock):
-    """Serve `block(hidden)` through the fused path when admitted, else the stock body."""
+def experts_forward(block, hidden, linear, stock, prompt=False):
+    """Serve `block(hidden)` through the fused path when admitted, else the stock body. `prompt`: the call is a
+    prompt chunk's (``model.Layer`` without a verify tape)."""
     flat = hidden.reshape(-1, hidden.shape[-1])
     rows, fmt = flat.shape[0], getattr(block.gate_up, "mode", "unknown")
     state = _state(block)
+    if prompt and _prompt_fast("invariant"):
+        # The width-independent prompt read (off by default, class C): our sort and products at every row count.
+        reason = _invariant_unserved(block, flat)
+        if reason is None:
+            state.record(_key(fmt, rows, "prompt_invariant." + route_variant()))
+            return routed_sorted(block, flat, linear, variant=route_variant(), fast=True,
+                                 invariant=True).reshape(hidden.shape)
+        state.record(_key(fmt, rows, "prompt_invariant.declined." + reason))
     reason = unserved(block, flat)
     prompt = reason == "grouped_rows"
     if prompt:

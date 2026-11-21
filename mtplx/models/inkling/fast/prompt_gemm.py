@@ -17,6 +17,10 @@ float32 sum usually round to the same 16-bit value, and on a small output every 
 MLX's product, counted. ``MTPLX_INKLING_PROMPT_KERNELS=mlx`` keeps MLX's products everywhere.
 
 Tensor-unit GPUs, bf16 or float32 operands, row-major matrices whose depth is a multiple of 32.
+
+With the prompt read's ``invariant`` part (``fast/prompt_route.py``, off by default) every shape and every row
+count takes the launch, without the comparison: each output element is then summed in the same order whatever
+the rows around it, so a row's projection does not depend on the chunk width (MLX's split sums do).
 """
 
 from __future__ import annotations
@@ -172,13 +176,19 @@ def _same(got, want, dtype):
     return all(bool(mx.array_equal(a.view(word), b.view(word)).item()) for a, b in zip(got, want))
 
 
-def _unserved(x, matrices):
+def _invariant():
+    from .prompt_route import invariant_sums
+
+    return invariant_sums()
+
+
+def _unserved(x, matrices, invariant=False):
     import os
 
     if os.environ.get("MTPLX_INKLING_PROMPT_KERNELS", "ours").strip().lower() in ("mlx", "0", "off", "stock"):
         return "disabled"
     rows = x.size // x.shape[-1]
-    if rows < PROMPT_MIN_ROWS:
+    if rows < (1 if invariant else PROMPT_MIN_ROWS):
         return "rows"
     if not available()[0]:
         return "unavailable"
@@ -195,12 +205,17 @@ def _unserved(x, matrices):
 def project(x, matrices, where):
     """``[x @ w.T for w in matrices]`` (each ``(…, N_i)`` in x's type), as one launch where every shape has been
     admitted, else as MLX's products (counted under ``where``). ``x``: ``(…, K)``; ``matrices``: ``(N_i, K)``."""
-    reason = _unserved(x, matrices)
+    invariant = _invariant()
+    reason = _unserved(x, matrices, invariant)
     if reason is not None:
         _count(f"{where}.mlx.{reason}")
         return [x @ w.T for w in matrices]
     lead = x.shape[:-1]
     flat = x.reshape(-1, x.shape[-1])
+    if invariant:
+        # one order for every row count: no comparison with MLX's product, whose order moves with the shape
+        _count(f"{where}.ours.invariant")
+        return [o.reshape(*lead, o.shape[-1]) for o in _launch(flat, matrices)]
     key = (flat.shape[0], flat.shape[1], str(x.dtype), tuple(w.shape[0] for w in matrices))
     with _lock:
         verdict = _admitted.get(key)
