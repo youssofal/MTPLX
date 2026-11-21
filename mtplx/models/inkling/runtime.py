@@ -45,13 +45,17 @@ def widest_panel(model):
     return max(engine_site.MAX_WARM_WIDTH, min(MAX_PANEL, context_copy.context_copy_block_k() + 1))
 
 
-def engine_pool_price(measured, widest):
+def engine_pool_price(measured, widest, *, widest_recorded=False):
     """The engine pool a request is priced at. One pool serves every program's temporaries and
-    grows to the widest program served: warm-up's widest is ``MAX_WARM_WIDTH`` rows, and a copy
-    round records up to ``widest`` (measured on the native pack: 81 MB after warm-up, 231 MB
-    once a 25-row copy round had recorded), so the pool is priced at the widest panel, scaled by
-    rows from the measured one."""
+    grows to the widest program served. When the load recorded the widest panel's program
+    (``widest_recorded``), the pool it measured is the most the engine holds: priced as measured.
+    Otherwise warm-up's widest is ``MAX_WARM_WIDTH`` rows and a copy round records up to
+    ``widest`` later, so the pool is priced at the widest panel, scaled by rows from the measured
+    one (on the native pack 81 MB after warm-up and 231 MB once a 25-row copy round recorded; on
+    Bare Speed 248 and 403 MB, where the scaling priced 775)."""
     measured = int(measured or 0)
+    if widest_recorded:
+        return measured
     return measured * max(int(widest), engine_site.MAX_WARM_WIDTH) // engine_site.MAX_WARM_WIDTH
 
 
@@ -92,6 +96,15 @@ class InklingRuntime(MTPLXRuntime):
             if self.drafter is not None:
                 fast_round.warm()
             self.engine_warm = engine_site.warm(self)
+            # The copy lane's widest panel too, where wide panels are exact: its program holds the
+            # pool's largest temporaries, so the pool read below is the most the engine holds and
+            # is priced as measured (not scaled from warm-up's widest), and a session's first copy
+            # round replays instead of recording.
+            widest = widest_panel(model)
+            if widest > engine_site.MAX_WARM_WIDTH:
+                wide = engine_site.warm(self, widths=(widest,))
+                self.engine_warm.setdefault("widths", {}).update(wide.get("widths") or {})
+                self.engine_warm["widest_seconds"] = wide.get("seconds")
             # The DSpark round as one program for 1 to 7 proposals (lane L7), recorded and checked
             # before ready, so no request records; the pool below is read after it. The variant the
             # served loop runs: the committing round unless MTPLX_INKLING_ROUND_COMMIT=0.
@@ -100,7 +113,9 @@ class InklingRuntime(MTPLXRuntime):
             # The executor's pool after warm-up (one pool serves every width's temporaries).
             executor = engine_site.health().get("executor") or {}
             self.engine_pool_bytes = int(executor.get("pool_bytes") or 0)
-            self.engine_pool_bound = engine_pool_price(self.engine_pool_bytes, widest_panel(model))
+            widest_live = bool(((self.engine_warm.get("widths") or {}).get(widest) or {}).get("live"))
+            self.engine_pool_bound = engine_pool_price(self.engine_pool_bytes, widest,
+                                                       widest_recorded=widest_live)
             if self.drafter is not None:
                 try:
                     self.round_cost_ms, self.round_cost_detail = round_costs(self)
@@ -112,6 +127,28 @@ class InklingRuntime(MTPLXRuntime):
                     print(f"[mtplx] inkling: {self.round_cost_detail}", flush=True)
         # The table against the rounds it prices, whatever made it (DepthTableCheck).
         self.depth_table_check = DepthTableCheck(self.round_cost_ms or fast_draft.RC6_COST_MS_2K)
+        # What the load leaves resident beside the weights and the engine's pool (the float32
+        # router and controller copies, the kernels' tables), measured once everything is built.
+        self.load_extra_bytes = self.measure_load_extra_bytes()
+
+    def measure_load_extra_bytes(self):
+        """MLX's active memory now, less the target's and the drafter's weights and the engine's
+        pool: the arrays the load built beside them. The memory plan prices them with the pool
+        (``fast_fixed_bytes``); the admission does not, MLX's active memory already holds them."""
+        import gc
+
+        from mlx.utils import tree_flatten
+
+        gc.collect()
+        seen, weights = set(), 0
+        for module in (self.model, self.drafter):
+            if module is None:
+                continue
+            for _name, value in tree_flatten(module.parameters()):
+                if isinstance(value, mx.array) and id(value) not in seen:
+                    seen.add(id(value))
+                    weights += int(value.nbytes)
+        return max(0, int(mx.get_active_memory()) - weights - int(self.engine_pool_bytes or 0))
 
     def resident_kv_bytes_per_token(self):
         return self.target_footprint.full_bytes_per_token
@@ -133,23 +170,54 @@ class InklingRuntime(MTPLXRuntime):
         return "contiguous_dense_decode"
 
     def window_cache_bytes(self, width=None):
-        """The fixed part of what decode keeps besides per-token KV: the sliding rings, the
-        global banks' rounding to whole capacity steps, and the native engine's working pool."""
+        """The fixed part of what decode keeps besides the weights and per-token KV: the sliding
+        rings, the global banks' rounding to whole capacity steps, and what the load leaves
+        resident beside the weights (the native engine's pool at its widest program, the arrays
+        built at load). The memory plan prices all of it; a request adds only part of it to what
+        MLX already holds (``admission_fixed_bytes``)."""
+        return self.ring_bytes(width) + self.fast_fixed_bytes()
+
+    def ring_bytes(self, width=None):
+        """The sliding rings and convolution tails at ``width`` rows a forward."""
         rows = max(1, width or 1)
         return sum(
             part.bounded_bytes(part.window + rows - 1, rows)
             for part in (self.target_footprint, self.draft_footprint)
             if part is not None
-        ) + self.fast_fixed_bytes()
+        )
 
-    def fast_fixed_bytes(self):
+    def bank_rounding_bytes(self):
+        """The global banks' rounding up to a whole capacity step: one step a global visit."""
         from .fast.state import BANK_STEP
 
         cfg = self.model.config
         row = 2 * cfg["num_key_value_heads"] * cfg["head_dim"] * self.model.embed_tokens.weight.dtype.size
         globals_ = sum(1 for i in self.model.visit_order if not self.model.layers[i].sliding)
+        return globals_ * BANK_STEP * row
+
+    def fast_fixed_bytes(self):
         pool = getattr(self, "engine_pool_bound", None) or getattr(self, "engine_pool_bytes", 0)
-        return globals_ * BANK_STEP * row + pool
+        return self.bank_rounding_bytes() + int(pool) + int(getattr(self, "load_extra_bytes", 0) or 0)
+
+    def engine_pool_now(self):
+        """Bytes the native engine's pool holds now (allocated through MLX: inside its active
+        memory); 0 when the engine was never warmed or cannot say."""
+        if not getattr(self, "engine_pool_bytes", 0):
+            return 0
+        try:
+            # The process report reads the executor only where a site already made it.
+            executor = engine_site.health().get("executor") or {}
+            return int(executor.get("pool_bytes") or 0)
+        except Exception:  # noqa: BLE001 - an engine that cannot answer leaves the full price
+            return 0
+
+    def admission_fixed_bytes(self, width=None):
+        """What a request's fixed part adds to MLX's active memory, which already holds the weights,
+        the load's arrays and the engine's pool as it is now: the rings at ``width`` rows, the
+        banks' rounding, and what the pool can still grow by to its priced bound."""
+        bound = getattr(self, "engine_pool_bound", None) or getattr(self, "engine_pool_bytes", 0)
+        headroom = max(0, int(bound) - self.engine_pool_now())
+        return self.ring_bytes(width) + self.bank_rounding_bytes() + headroom
 
     #: Rows a chunked prompt forward reads when nobody names a width.
     PROMPT_CHUNK_ROWS = 512
@@ -252,9 +320,11 @@ class InklingRuntime(MTPLXRuntime):
             if part is not None
         )
         # From the first verify the fast path holds every ring at the full window and every
-        # global bank in whole capacity steps, whatever the prompt's length (prepare), plus
-        # the engine's pool: a short prompt's request holds that, not its prompt-sized windows.
-        return max(prefill, self.window_cache_bytes())
+        # global bank in whole capacity steps, whatever the prompt's length (prepare), and the
+        # engine's pool at what it grows to: a short prompt's request holds that, not its
+        # prompt-sized windows. What the pool and the load already hold is in MLX's active
+        # memory, which the admission measures: only the rest is new (admission_fixed_bytes).
+        return max(prefill, self.admission_fixed_bytes())
 
     def embed_tokens(self, input_ids):
         return self.model.embed_tokens(input_ids)

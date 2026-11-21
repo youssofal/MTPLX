@@ -110,6 +110,7 @@ def test_a_short_prompt_is_priced_at_the_decode_layout_not_its_prompt_windows():
     whole 4,096-row step; the request estimate holds that and the engine's pool (about 240 MiB
     more than the prompt-sized windows at the catalog geometry)."""
     rt, row = _decode_runtime()
+    rt.engine_pool_now = lambda: 0  # an engine that cannot say: the whole pool is charged
     prompt_windows = 256 * 40 * row
     fixed = InklingRuntime.window_cache_bytes(rt)
     assert fixed == 1024 * 40 * row + 8 * 4096 * row + (207 << 20)
@@ -117,6 +118,24 @@ def test_a_short_prompt_is_priced_at_the_decode_layout_not_its_prompt_windows():
     # A long prompt's prefill windows (window + chunk - 1 rows) are the larger figure then.
     assert InklingRuntime.prefill_window_bytes(rt, 100_000, 100_000) == max(
         (1024 + 511) * 40 * row, fixed)
+
+
+def test_the_plan_prices_the_resident_pool_and_load_arrays_and_a_request_only_what_is_new():
+    """The engine's pool is allocated through MLX, so it is inside the active memory the admission
+    measures (21 November, Bare Speed: a 12,322-token prompt refused at 24 GB because its bill
+    charged the 775 MB pool price on top of the 341 MB pool already resident). The plan prices the
+    pool at its bound and the arrays the load built beside the weights; a request is charged the
+    rings, the banks' rounding and what the pool can still grow by."""
+    rt, row = _decode_runtime(pool_bytes=403 << 20)
+    rt.engine_pool_bound = 403 << 20
+    rt.load_extra_bytes = 172 << 20
+    rings, rounding = 1024 * 40 * row, 8 * 4096 * row
+    assert InklingRuntime.window_cache_bytes(rt) == rings + rounding + (403 << 20) + (172 << 20)
+    rt.engine_pool_now = lambda: 341 << 20
+    assert InklingRuntime.admission_fixed_bytes(rt) == rings + rounding + (62 << 20)
+    rt.engine_pool_now = lambda: 403 << 20  # at its bound: nothing more
+    assert InklingRuntime.admission_fixed_bytes(rt) == rings + rounding
+    assert InklingRuntime.prefill_window_bytes(rt, 256, 256) == rings + rounding
 
 
 def test_the_engine_pool_is_priced_at_the_widest_copy_panel():
@@ -131,6 +150,9 @@ def test_the_engine_pool_is_priced_at_the_widest_copy_panel():
     assert engine_pool_price(81 * mb, 25) == 81 * mb * 25 // 8 >= 231 * mb
     assert engine_pool_price(81 * mb, 8) == engine_pool_price(81 * mb, 1) == 81 * mb
     assert engine_pool_price(None, 25) == 0
+    # The load recorded the widest panel's program: its pool is the most the engine holds (Bare
+    # Speed: 403 MB after 14 rounds of 25-row copy panels, where the scaling priced 775).
+    assert engine_pool_price(403 * mb, 25, widest_recorded=True) == 403 * mb
     rt, row = _decode_runtime(pool_bytes=81 * mb)
     rt.engine_pool_bound = engine_pool_price(rt.engine_pool_bytes, 25)
     assert InklingRuntime.window_cache_bytes(rt) == 1024 * 40 * row + 8 * 4096 * row + 81 * mb * 25 // 8
