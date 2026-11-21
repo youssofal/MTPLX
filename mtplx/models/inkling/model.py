@@ -13,7 +13,7 @@ from .attention import attend
 from .cache import WindowCache
 from .activations import expert_inputs
 from . import expert_fusion
-from .fast import prompt_glue
+from .fast import prompt_gemm, prompt_glue
 from .head import fits_route, measured_route, note_route, pack_proofs, vocabulary_logits
 from .layout import layer_visits
 from .precision import AffineWeight, packed_logical_shape, source_modes
@@ -106,6 +106,16 @@ cross_pass_message = (
 )
 
 
+def shared_linear(x, weights, where, tape=None):
+    """``[linear(x, w) for w in weights]``. At a prompt chunk the stored 16-bit matrices among them run as one
+    launch of ours with MLX's sums (``fast/prompt_gemm.py``, admitted per shape); the rest as before."""
+    if tape is not None or x.size // x.shape[-1] < prompt_gemm.PROMPT_MIN_ROWS:
+        return [linear(x, w) for w in weights]
+    plain = [i for i, w in enumerate(weights) if isinstance(w, mx.array) and w.dtype == x.dtype]
+    got = dict(zip(plain, prompt_gemm.project(x, [weights[i] for i in plain], where))) if plain else {}
+    return [got[i] if i in got else linear(x, w) for i, w in enumerate(weights)]
+
+
 def norm(x, weight, eps):
     return mx.fast.rms_norm(x.astype(mx.float32), weight, eps)
 
@@ -169,10 +179,10 @@ class Controller(nn.Module):
         x = x.astype(mx.float32)
         message = message.astype(mx.float32)
         mixed = mx.concatenate([norm(x, None, eps), norm(message, None, eps)], axis=-1)
-        state = linear(mixed.astype(self.down.dtype), self.down).astype(mx.float32)
-        return (1 - mx.tanh(linear(state, self.forget))) * x + mx.tanh(
-            linear(state, self.gain)
-        ) * message
+        (state,) = shared_linear(mixed.astype(self.down.dtype), [self.down], "controller_down")
+        state = state.astype(mx.float32)
+        forget, gain = shared_linear(state, [self.forget, self.gain], "controller_mix")
+        return (1 - mx.tanh(forget)) * x + mx.tanh(gain) * message
 
 
 def use_sorted_expert_inputs():
@@ -451,10 +461,18 @@ class Layer(nn.Module):
         cfg = self.cfg
         shape = (*q_input.shape[:2], self.q_scale.shape[0])
         width = self.q_scale.shape[-1]
-        q_lin = linear(q_input, self.q)
-        r_lin = linear(q_input, self.r)
-        k_conv = self.convs[0](linear(k_input, self.k), conv, 0, k_input, tape)
-        v_conv = self.convs[1](linear(v_input, self.v), conv, 1, v_input, tape)
+        if q_input is k_input and k_input is v_input:
+            q_lin, r_lin, sink, gate_lin, k_lin, v_lin = shared_linear(
+                q_input, [self.q, self.r, self.sink, self.gate, self.k, self.v], "visit_projections", tape
+            )
+        else:
+            q_lin, r_lin, sink, gate_lin = shared_linear(
+                q_input, [self.q, self.r, self.sink, self.gate], "query_projections", tape
+            )
+            (k_lin,) = shared_linear(k_input, [self.k], "key_projection", tape)
+            (v_lin,) = shared_linear(v_input, [self.v], "value_projection", tape)
+        k_conv = self.convs[0](k_lin, conv, 0, k_input, tape)
+        v_conv = self.convs[1](v_lin, conv, 1, v_input, tape)
         # A prompt chunk's clips, value norm and position scale run as one launch of ours, same bits.
         joined = (
             prompt_glue.heads(self, q_lin, r_lin, k_conv, v_conv, kv.offset)
@@ -487,15 +505,16 @@ class Layer(nn.Module):
                 k,
                 v,
                 rel @ self.rel_basis.astype(rel.dtype),
-                linear(q_input, self.sink),
+                sink,
                 window,
                 **({"verify": True} if tape is not None else {}),
             )
             .transpose(0, 2, 1, 3)
             .reshape(*q_input.shape[:2], -1)
         )
-        gate = mx.sigmoid(linear(q_input, self.gate).astype(mx.float32))
-        return linear((h.astype(mx.float32) * gate).astype(h.dtype), self.out)
+        gate = mx.sigmoid(gate_lin.astype(mx.float32))
+        (out,) = shared_linear((h.astype(mx.float32) * gate).astype(h.dtype), [self.out], "output_projection", tape)
+        return out
 
     def __call__(self, x, closed, kv, conv, messages=None, tape=None):
         read_depth = depth_reader(tape, x.shape[1])

@@ -586,7 +586,13 @@ def routed_sorted(block, flat, linear, trace=None, variant=None, fast=False):
         output_shapes=[(rows, width), (rows, 1, width), *scalars],
         output_dtypes=[mx.float32, operand] + ([mx.float32] if fp4 else []),
     )
-    logits = linear(router_in, block.router)
+    if ours:
+        # The router's product as our launch with MLX's sums where the shape is admitted (fast/prompt_gemm.py).
+        from .fast import prompt_gemm
+
+        (logits,) = prompt_gemm.project(router_in, [block.router], "router")
+    else:
+        logits = linear(router_in, block.router)
     if logits.dtype != mx.float32:
         raise TypeError("Inkling router logits must be float32 for the fused route")
     experts, _, prob = route(logits, block.bias, count, block.scale, variant)
