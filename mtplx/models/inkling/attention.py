@@ -289,34 +289,40 @@ def _chronological_verify(operands, window):
 
 
 def _prompt_route(operands, window):
-    """Full-history prompt calls past the vector kernel's threshold, on the fused exact kernel.
+    """Prompt calls (more than 32 rows) on exact routes, or None where they decline (counted).
 
-    RC6 tiles such a call into MLX vector-kernel calls of 8 rows or fewer, each reading every
-    key; ``fast.prefill_attend`` computes the same rows bit for bit with one read of the history
-    per 16 rows. Returns the result, or None where it declines (counted with its reason).
-    Runs only in RC6's default stock mode; an explicitly chosen trial mode keeps its own route.
+    Full-history calls past the vector kernel's threshold: RC6 tiles them into MLX vector-kernel
+    calls of 8 rows or fewer, each reading every key; ``fast.prefill_attend.prompt_attention``
+    computes the same rows bit for bit with one read of the history per 16 rows. Calls RC6
+    keeps on MLX's full kernel (window visits, shorter histories): the same calls merged into
+    fewer, larger ones (``merged_attention``), the same bits per row. Runs only in RC6's default
+    stock mode; an explicitly chosen trial mode keeps its own route.
     """
-    if os.environ.get("MTPLX_INKLING_PROMPT_ATTENTION", "fused") == "stock":
-        reason = "forced_stock"
-    else:
-        from .fast.prefill_attend import decline
+    from .fast import prefill_attend as P
 
-        reason = decline(*operands, window)
-    counter = "prompt_fused.full." + ("selected" if reason is None else "stock." + reason)
+    forced = os.environ.get("MTPLX_INKLING_PROMPT_ATTENTION", "fused") == "stock"
+    scope = "window" if window else "full"
+    reason = "forced_stock" if forced else "window" if window else P.decline(*operands, window)
+    serve = P.prompt_attention if reason is None else None
+    counters = ["prompt_fused.full." + ("selected" if reason is None else "stock." + reason)] if not window else []
+    if reason is not None and not forced:
+        # Calls RC6 keeps on MLX's full kernel: the same rows in fewer, larger calls.
+        merged = P.merged_decline(*operands, window)
+        counters.append(f"prompt_merged.{scope}." + ("selected" if merged is None else "stock." + merged))
+        serve = P.merged_attention if merged is None else None
     with _lock:
-        first = counter not in _counts
-        _counts[counter] += 1
         active = _request.get()
-        if active is not None:
-            counts = active[0]["graph_selections"]
-            counts[counter] = counts.get(counter, 0) + 1
-    if first:
+        fresh = []
+        for counter in counters:
+            if counter not in _counts:
+                fresh.append(counter)
+            _counts[counter] += 1
+            if active is not None:
+                counts = active[0]["graph_selections"]
+                counts[counter] = counts.get(counter, 0) + 1
+    for counter in fresh:
         _log.info("Inkling attention %s", counter)
-    if reason is not None:
-        return None
-    from .fast.prefill_attend import prompt_attention
-
-    return prompt_attention(*operands, window)
+    return None if serve is None else serve(*operands, window)
 
 
 def attend(query, key, value, profiles, sink, window, *, verify=False):
@@ -324,7 +330,7 @@ def attend(query, key, value, profiles, sink, window, *, verify=False):
     route = "grouped_sink" if query.shape[2] <= 9 else "streamed"
     active = _request.get()
     mode = active[0]["mode"] if active is not None else os.environ.get("MTPLX_INKLING_ATTENTION", "stock")
-    if mode == "stock" and not verify and not window and query.shape[2] > 32:
+    if mode == "stock" and not verify and query.shape[2] > 32:
         result = _prompt_route(operands, window)
         if result is not None:
             return result

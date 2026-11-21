@@ -96,3 +96,44 @@ def test_prompt_read_takes_the_fused_route_and_keeps_rc6s_bits(monkeypatch):
     small = attention.attention_route_counts().get("prompt_fused.full.selected", 0)
     attention.attend(q[:, :, :8], k[:, :, :-32], v[:, :, :-32], prof[:, :8], sink[:, :8], 0, verify=True)
     assert attention.attention_route_counts().get("prompt_fused.full.selected", 0) == small
+
+
+def test_merged_tiles_cover_rc6s_rows_and_keep_its_vector_tail():
+    for keys, rows in ((4097, 512), (16385, 512), (1536, 512), (12289, 512), (8193, 37)):
+        plan = P.merged_tiles(rows, keys)
+        rc6 = P.tiles(rows, keys)
+        assert plan is not None and len(plan) < len(rc6)
+        assert plan[0][0] == 0 and plan[-1][1] == rows
+        assert all(a[1] == b[0] for a, b in zip(plan, plan[1:]))
+        if rc6[-1][2] <= 8:  # RC6's vector-kernel tail stays its own call
+            assert plan[-1] == (rc6[-1][0], rc6[-1][1])
+            assert all(e - s > 8 for s, e in plan[:-1])
+        else:
+            assert all(e - s > 8 for s, e in plan)
+    assert P.merged_tiles(512, 20001) is None      # vector regime: the fused kernel's
+    assert P.merged_tiles(100, 101) is None        # one call already
+
+
+@pytest.mark.parametrize("hist,rows,window", [(3584, 512, 0), (15872, 512, 0), (1023, 512, 1024), (7000, 45, 0)])
+def test_merged_calls_equal_rc6s_tiles_bit_for_bit(hist, rows, window):
+    q, k, v, prof, sink = _chunk(hist, rows, seed=hist + rows + window)
+    assert P.merged_decline(q, k, v, prof, sink, window) is None
+    ref = stock_attention(q, k, v, prof, sink, window)
+    got = P.merged_attention(q, k, v, prof, sink, window)
+    mx.eval(ref, got)
+    assert got.shape == ref.shape and got.dtype == ref.dtype
+    assert bool(mx.array_equal(ref.view(mx.uint16), got.view(mx.uint16)).item())
+
+
+def test_window_prompt_call_takes_the_merged_route(monkeypatch):
+    from mtplx.models.inkling import attention
+
+    q, k, v, prof, sink = _chunk(1023, 512, seed=77)
+    monkeypatch.delenv("MTPLX_INKLING_PROMPT_ATTENTION", raising=False)
+    before = attention.attention_route_counts().get("prompt_merged.window.selected", 0)
+    got = attention.attend(q, k, v, prof, sink, 1024)
+    assert attention.attention_route_counts().get("prompt_merged.window.selected", 0) == before + 1
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_ATTENTION", "stock")
+    ref = attention.attend(q, k, v, prof, sink, 1024)
+    mx.eval(got, ref)
+    assert bool(mx.array_equal(ref.view(mx.uint16), got.view(mx.uint16)).item())

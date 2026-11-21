@@ -238,3 +238,94 @@ def _prompt_attention(query, key, value, profiles, sink):
             parts.append(h)
     out = parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=1)
     return out.reshape(1, rows, A.HEADS, A.HEAD_DIM).transpose(0, 2, 1, 3)
+
+
+# ----------------------------------------------------------------------------------------
+# Prompt calls on MLX's full attention kernel (window visits, and full-history visits below the
+# vector regime): the same calls as RC6's, merged into fewer and larger ones. MLX's full kernel
+# gives a row the same bits whatever call it sits in, aligned to its query block or not
+# (lanes/l6/probe-full-tiles*.json: 2,048 to 16,384 keys and window visits, calls of 32 to 512
+# rows, every row equal), so only the call boundaries change: fewer calls each read the bank
+# once and pad less to the kernel's 32-row query blocks. Rows RC6 sends to the vector kernel
+# (a last tile of 8 rows or fewer) keep RC6's own call.
+# ----------------------------------------------------------------------------------------
+
+#: Largest relative-bias tensor one merged call writes (bf16: 32 MB; RC6 writes 8 MB a call).
+MERGED_ELEMENTS = 16 * 1024 * 1024
+
+
+def merged_tiles(rows, n_keys, heads=24):
+    """RC6's tiles regrouped, [(first row, end row)], or None when merging saves no call."""
+    rc6 = tiles(rows, n_keys, heads)
+    step = rc6[0][2]
+    if step <= 8:
+        return None
+    full_end = rows if rc6[-1][2] > 8 else rc6[-1][0]
+    big = max(step, MERGED_ELEMENTS // (heads * n_keys))
+    calls = [(s, min(full_end, s + big)) for s in range(0, full_end, big)]
+    if len(calls) > 1 and calls[-1][1] - calls[-1][0] <= 8:
+        last = calls.pop()
+        calls[-1] = (calls[-1][0], last[1])
+    if len(calls) >= sum(1 for t in rc6 if t[2] > 8):
+        return None
+    return calls + ([] if full_end == rows else [(full_end, rows)])
+
+
+def merged_decline(query, key, value, profiles, sink, window):
+    """None when this prompt call can run as merged full-kernel calls, else why not."""
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return "device"
+    if query.dtype not in (mx.bfloat16, mx.float16) or any(x.dtype != query.dtype for x in (key, value, profiles, sink)):
+        return "dtype"
+    if merged_tiles(query.shape[2], key.shape[2] + 1, query.shape[1]) is None:
+        return "no_merge"
+    if not _merged_qualified(str(query.dtype), bool(window)):
+        return "bits"
+    return None
+
+
+def merged_attention(query, key, value, profiles, sink, window):
+    """RC6's `stock_attention` result for a prompt call, from fewer full-kernel calls."""
+    from mtplx.models.inkling.attention import relative_bias
+
+    batch, heads, rows, width = query.shape
+    keys = key.shape[2]
+    plan = merged_tiles(rows, keys + 1, heads)
+    zero = mx.zeros((batch, key.shape[1], 1, width), key.dtype)
+    key = mx.concatenate([key, zero], axis=2)
+    value = mx.concatenate([value, zero], axis=2)
+    parts = []
+    for start, end in plan:
+        bias = relative_bias(profiles[:, start:end], sink[:, start:end], keys, keys - rows + start, window)
+        part = mx.fast.scaled_dot_product_attention(query[:, :, start:end], key, value, scale=width ** -0.5,
+                                                    mask=bias)
+        if len(plan) > 1:
+            mx.eval(part)
+        parts.append(part)
+    return parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=2)
+
+
+@lru_cache(maxsize=8)
+def _merged_qualified(dtype_name, window):
+    """First use, per dtype and visit kind: merged calls against RC6's own tiles on a synthetic
+    chunk of 200 rows (RC6: 77-row calls; merged: one call), every row bit for bit."""
+    from mtplx.models.inkling.attention import stock_attention
+
+    dtype = getattr(mx, dtype_name.split(".")[-1])
+    hist, rows = (1023, 200) if window else (2048, 200)
+    keys = hist + rows
+    ks = mx.random.split(mx.random.key(1729), 5)
+    q = (mx.random.normal((1, 24, rows, 128), key=ks[0]) * 0.6).astype(dtype)
+    k = (mx.random.normal((1, 8, keys, 128), key=ks[1]) * 0.6).astype(dtype)
+    v = mx.random.normal((1, 8, keys, 128), key=ks[2]).astype(dtype)
+    prof = (mx.random.normal((1, rows, 24, 1024), key=ks[3]) * 0.5).astype(dtype)
+    sink = mx.random.normal((1, rows, 24), key=ks[4]).astype(dtype)
+    w = 1024 if window else 0
+    try:
+        ref = stock_attention(q, k, v, prof, sink, w)
+        got = merged_attention(q, k, v, prof, sink, w)
+        mx.eval(ref, got)
+    except (RuntimeError, ValueError):
+        return False
+    view = mx.uint16
+    return bool(mx.array_equal(ref.view(view), got.view(view)).item())
