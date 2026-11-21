@@ -344,7 +344,8 @@ INPUTS = """
     }
     if (t < 32) sums[t] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint r = 0; r < uint(W); ++r) {
+    {
+        const uint r = threadgroup_position_in_grid.y;
         const device float* xr = source + r * 2304;
         // MLX rms_single_row: 576 threads of 4 values; this threadgroup plays its 18 simdgroups.
         for (uint s = sg; s < 18; s += 8) {
@@ -471,87 +472,70 @@ GATE_UP = """
 #if FP4
     const float eo = expert_outer[e];
 #endif
-    constexpr uint RS = TILE / S;
-    const uint n_sg = tile * TILE + sg * RS;
-    threadgroup float tpk[S * MC];
-    threadgroup uint tnan[S * MC];
-    for (uint m0 = 0; m0 < M; m0 += MC) {
-        const uint mc = min(uint(MC), M - m0);
-        float pk[MC];
-        bool pn[MC];
-        for (uint m = 0; m < MC; ++m) { pk[m] = 0.0f; pn[m] = false; }
-        for (uint rb = 0; rb < RS; rb += R) {
-            const uint nb = n_sg + rb;
-            float res[4][R];
-            for (uint m = 0; m < 4; ++m)
-                for (uint q = 0; q < R; ++q) res[m][q] = 0.0f;
-            if (mc == 1)
-                l3_gate_up_dots<1, R, bool(FP4)>(wexp, sexp, values, pl_row, m0, nb, lane, lut2, lut1, slut, res);
-            else if (W >= 2 && mc == 2)
-                l3_gate_up_dots<2, R, bool(FP4)>(wexp, sexp, values, pl_row, m0, nb, lane, lut2, lut1, slut, res);
-            else if (W >= 3 && mc == 3)
-                l3_gate_up_dots<3, R, bool(FP4)>(wexp, sexp, values, pl_row, m0, nb, lane, lut2, lut1, slut, res);
-            else if (W >= 4)
-                l3_gate_up_dots<4, R, bool(FP4)>(wexp, sexp, values, pl_row, m0, nb, lane, lut2, lut1, slut, res);
-            // Capped SwiGLU (RC6 SWIGLU statements); lane m * R/2 + jj takes member m, mid nb/2 + jj.
-            float graw = 0, uraw = 0;
-            uint mine = 0;
-            for (uint m = 0; m < MC; ++m)
-                for (uint jj = 0; jj < R / 2; ++jj)
-                    if (lane == m * (R / 2) + jj) { graw = res[m][2 * jj]; uraw = res[m][2 * jj + 1]; mine = m; }
-            const bool active = lane < MC * (R / 2) && mine < mc;
-            float hv = 0.0f;
-            if (active) {
-                const uint jj = lane % (R / 2);
-                const uint pair = pl_pair[m0 + mine];
+    threadgroup float tpk[S * 32];
+    threadgroup uint tnan[S * 32];
+    for (uint i = tid; i < S * 32u; i += NT) { tpk[i] = 0.0f; tnan[i] = 0u; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    constexpr uint NB = TILE / R;
+    for (uint it = sg; it < M * NB; it += S) {
+        const uint m = it % M;
+        const uint nb = tile * TILE + (it / M) * R;
+        float res[4][R];
+        for (uint q = 0; q < R; ++q) res[0][q] = 0.0f;
+        l3_gate_up_dots<1, R, bool(FP4)>(wexp, sexp, values, pl_row, m, nb, lane, lut2, lut1, slut, res);
+        // Capped SwiGLU (RC6 SWIGLU statements); lane jj takes mid nb/2 + jj of member m.
+        float graw = 0, uraw = 0;
+        for (uint jj = 0; jj < R / 2; ++jj)
+            if (lane == jj) { graw = res[0][2 * jj]; uraw = res[0][2 * jj + 1]; }
+        const bool active = lane < R / 2;
+        float hv = 0.0f;
+        if (active) {
+            const uint pair = pl_pair[m];
 #if FP4
-                const float scale = row_outer[pl_row[m0 + mine]] * eo;
-                const float gs = graw * scale;
-                const float us = uraw * scale;
-                const T gq = static_cast<T>(gs);
-                const T uq = static_cast<T>(us);
+            const float scale = row_outer[pl_row[m]] * eo;
+            const float gs = graw * scale;
+            const float us = uraw * scale;
+            const T gq = static_cast<T>(gs);
+            const T uq = static_cast<T>(us);
 #else
-                const T gq = static_cast<T>(graw);
-                const T uq = static_cast<T>(uraw);
+            const T gq = static_cast<T>(graw);
+            const T uq = static_cast<T>(uraw);
 #endif
-                const float gate = float(gq);
-                const float up = float(uq);
-                const float gcap = static_cast<float>(GATE_CAP);
-                const float ucap = static_cast<float>(UP_CAP);
-                const float t1 = gate / gcap;
-                const float t2 = metal::precise::tanh(t1);
-                const float t3 = gcap * t2;
-                const float y = 1 / (1 + metal::exp(metal::abs(gate)));
-                const float t4 = (gate < 0) ? y : 1 - y;
-                const float t5 = t3 * t4;
-                const float t6 = up / ucap;
-                const float t7 = metal::precise::tanh(t6);
-                const float t8 = ucap * t7;
-                const float t9 = t5 * t8;
-                const T mid = static_cast<T>(t9);
-                h[pair * 1152 + nb / 2 + jj] = mid;
-                hv = float(mid);
-            }
-            for (uint m = 0; m < MC; ++m) {
-                const bool mm = active && mine == m;
-                const float a = mm ? abs(hv) : 0.0f;
-                pk[m] = max(pk[m], simd_max(a));
-                pn[m] = pn[m] || simd_any(mm && isnan(a));
-            }
+            const float gate = float(gq);
+            const float up = float(uq);
+            const float gcap = static_cast<float>(GATE_CAP);
+            const float ucap = static_cast<float>(UP_CAP);
+            const float t1 = gate / gcap;
+            const float t2 = metal::precise::tanh(t1);
+            const float t3 = gcap * t2;
+            const float y = 1 / (1 + metal::exp(metal::abs(gate)));
+            const float t4 = (gate < 0) ? y : 1 - y;
+            const float t5 = t3 * t4;
+            const float t6 = up / ucap;
+            const float t7 = metal::precise::tanh(t6);
+            const float t8 = ucap * t7;
+            const float t9 = t5 * t8;
+            const T mid = static_cast<T>(t9);
+            h[pair * 1152 + nb / 2 + lane] = mid;
+            hv = float(mid);
         }
-        if (lane == 0)
-            for (uint m = 0; m < MC; ++m) { tpk[sg * MC + m] = pk[m]; tnan[sg * MC + m] = pn[m] ? 1u : 0u; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid < mc) {
-            float best = 0.0f;
-            bool any = false;
-            for (uint s2 = 0; s2 < S; ++s2) {
-                best = max(best, tpk[s2 * MC + tid]);
-                any = any || tnan[s2 * MC + tid] != 0u;
-            }
-            peaks[pl_pair[m0 + tid] * NTILE + tile] = any ? NAN : best;
+        const float a = active ? abs(hv) : 0.0f;
+        const float top = simd_max(a);
+        const bool bad = simd_any(active && isnan(a));
+        if (lane == 0) {
+            tpk[sg * 32 + m] = max(tpk[sg * 32 + m], top);
+            tnan[sg * 32 + m] = tnan[sg * 32 + m] | (bad ? 1u : 0u);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint m = tid; m < M; m += NT) {
+        float best = 0.0f;
+        bool any = false;
+        for (uint s2 = 0; s2 < S; ++s2) {
+            best = max(best, tpk[s2 * 32 + m]);
+            any = any || tnan[s2 * 32 + m] != 0u;
+        }
+        peaks[pl_pair[m] * NTILE + tile] = any ? NAN : best;
     }
 """
 
@@ -582,8 +566,6 @@ DOWN = """
     const device uchar* sexp = scales + size_t(e) * 2304 * SW;
     threadgroup float xs[MC * 1280];
     threadgroup float tpeak[MC];
-    constexpr uint RS = TILE / S;
-    const uint n_sg = tile * TILE + sg * RS;
     for (uint m0 = 0; m0 < M; m0 += MC) {
         const uint mc = min(uint(MC), M - m0);
         if (tid < mc) {
@@ -624,22 +606,15 @@ DOWN = """
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint rb = 0; rb < RS; rb += R) {
-            const uint nb = n_sg + rb;
+        constexpr uint NB = TILE / R;
+        for (uint it = sg; it < mc * NB; it += S) {
+            const uint ml = it % mc;
+            const uint nb = tile * TILE + (it / mc) * R;
             float res[4][R];
-            for (uint m = 0; m < 4; ++m)
-                for (uint q = 0; q < R; ++q) res[m][q] = 0.0f;
-            if (mc == 1)
-                l3_down_dots<1, R, bool(FP4)>(wexp, sexp, xs, nb, lane, lut2, lut1, slut, res);
-            else if (W >= 2 && mc == 2)
-                l3_down_dots<2, R, bool(FP4)>(wexp, sexp, xs, nb, lane, lut2, lut1, slut, res);
-            else if (W >= 3 && mc == 3)
-                l3_down_dots<3, R, bool(FP4)>(wexp, sexp, xs, nb, lane, lut2, lut1, slut, res);
-            else if (W >= 4)
-                l3_down_dots<4, R, bool(FP4)>(wexp, sexp, xs, nb, lane, lut2, lut1, slut, res);
-            for (uint m = 0; m < MC; ++m)
-                for (uint q = 0; q < R; ++q)
-                    if (lane == q && m < mc) raw[pl_pair[m0 + m] * 2304 + nb + q] = res[m][q];
+            for (uint q = 0; q < R; ++q) res[0][q] = 0.0f;
+            l3_down_dots<1, R, bool(FP4)>(wexp, sexp, xs + ml * 1280, nb, lane, lut2, lut1, slut, res);
+            for (uint q = 0; q < R; ++q)
+                if (lane == q) raw[pl_pair[m0 + ml] * 2304 + nb + q] = res[0][q];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -736,6 +711,12 @@ def _kernel(stage, fp4, defines=()):
 
 
 @lru_cache(maxsize=None)
+def _caps(gate_cap, up_cap):
+    """The SwiGLU caps as MLX's compiler writes them, computed once per value (one host read each)."""
+    return (("GATE_CAP", expert_fusion.mlx_literal(gate_cap)), ("UP_CAP", expert_fusion.mlx_literal(up_cap)))
+
+
+@lru_cache(maxsize=None)
 def _consts(eps):
     return mx.array([eps], mx.float32)
 
@@ -774,12 +755,39 @@ def _member_chunk(rows):
 DEFAULT_TILES = {"gu_tile": TILE_GATE_UP, "gu_s": 4, "gu_r": 8, "dn_tile": TILE_DOWN, "dn_s": 4, "dn_r": 8}
 
 
+def _mlx_products(block, fp4, rows, logits, values, outer):
+    """RC6's route kernel, MLX's gathered quantised products and RC6's SwiGLU kernel (4 launches)."""
+    pairs = rows * block.count
+    bits, group = (4, 16) if fp4 else (8, 32)
+    experts, row_ids, prob = expert_fusion.route(logits, block.bias, block.count, block.scale, "fused")
+    raw13 = mx.gather_qmm(values.reshape(rows, 1, HIDDEN), block.gate_up.codes, scales=block.gate_up.scales,
+                          lhs_indices=row_ids, rhs_indices=experts, group_size=group, bits=bits,
+                          mode=block.gate_up.mode)
+    mid, *mid_outer = expert_fusion._kernel("swiglu", fp4, _caps(float(block.gate_cap), float(block.up_cap)))(
+        inputs=[raw13.reshape(pairs, 2 * MIDDLE), *([outer, block.gate_up.outer] if fp4 else []), experts, row_ids],
+        template=[("T", mx.bfloat16), ("W", MIDDLE), ("E", MIDDLE // expert_fusion.THREADS)],
+        grid=(pairs * expert_fusion.THREADS, 1, 1), threadgroup=(expert_fusion.THREADS, 1, 1),
+        output_shapes=[(pairs, 1, MIDDLE), *([(pairs,)] if fp4 else [])],
+        output_dtypes=[mx.float32] * (2 if fp4 else 1),
+    )
+    raw2 = mx.gather_qmm(mid, block.down.codes, scales=block.down.scales, lhs_indices=expert_fusion._pair_ids(pairs),
+                         rhs_indices=experts, group_size=group, bits=bits, mode=block.down.mode)
+    return raw2.reshape(pairs, HIDDEN), (mid_outer[0] if fp4 else None), experts, prob
+
+
+#: "mlx" (default): fused glue around MLX's gathered product, 6 launches a visit, the fastest exact
+#: variant measured at 1, 4 and 8 rows. "own": the 4-launch block whose own products read each
+#: distinct expert once; exact too, but slower than MLX's product at 4 and 8 rows on this Mac.
+PRODUCTS = os.environ.get("MTPLX_INKLING_FAST_EXPERT_PRODUCTS", "mlx").lower()
+
+
 def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *, eps, conv_form=0, trace=None,
-                       tiles=None):
-    """Four launches. Shapes: source/partial (1, W, 2304) float32, tail (1, 3, 2304) float32.
+                       tiles=None, stop_after=None, products=None):
+    """Shapes: source/partial (1, W, 2304) float32, tail (1, 3, 2304) float32.
 
     Returns (out bf16 (1, W, 2304), conv_rows float32 (1, W, 2304)).
     """
+    products = products or PRODUCTS
     rows = source.shape[-2]
     fp4 = block.gate_up.mode == "nvfp4"
     tl = DEFAULT_TILES if tiles is None else {**DEFAULT_TILES, **tiles}
@@ -791,17 +799,26 @@ def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *
     logits, values, *outer = _kernel("inputs", fp4)(
         inputs=[src, norm_weight, block.router, _consts(float(eps))],
         template=[*common],
-        grid=(32 * 256, 1, 1), threadgroup=(256, 1, 1),
+        grid=(32 * 256, rows, 1), threadgroup=(256, 1, 1),
         output_shapes=[(rows, EXPERTS), (rows, HIDDEN), *([(rows,)] if fp4 else [])],
         output_dtypes=[mx.float32] * (3 if fp4 else 2),
     )
 
+    if stop_after == "inputs":
+        return logits, values
+    dn = block.down
+    if products == "mlx":
+        raw, mid_outer_m, experts, prob = _mlx_products(block, fp4, rows, logits, values, outer[0] if fp4 else None)
+        mid_outer = [mid_outer_m] if fp4 else []
+        h = peaks = None
+        return _combine(fp4, rows, raw, mid_outer, experts, prob, dn, conv_weight, tail, part, conv_form, source,
+                        trace, logits, values, outer, h, peaks)
     gu = block.gate_up
     cw13, sw13 = (HIDDEN // 8, HIDDEN // 16) if fp4 else (HIDDEN // 4, HIDDEN // 32)
     s_gu, r_gu, tile_gu = tl["gu_s"], tl["gu_r"], tl["gu_tile"]
     slots = min(TOP_K * rows, EXPERTS)
     ntile13 = 2 * MIDDLE // tile_gu
-    caps = (("GATE_CAP", expert_fusion.mlx_literal(block.gate_cap)), ("UP_CAP", expert_fusion.mlx_literal(block.up_cap)))
+    caps = _caps(float(block.gate_cap), float(block.up_cap))
     h, peaks, experts, prob = _kernel("gate_up", fp4, caps)(
         inputs=[logits, block.bias, _route_consts(float(block.scale)), values,
                 *([outer[0]] if fp4 else []), gu.codes, gu.scales, *([gu.outer] if fp4 else [])],
@@ -812,6 +829,8 @@ def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *
         output_dtypes=[mx.bfloat16, mx.float32, mx.uint32, mx.float32],
     )
 
+    if stop_after == "gate_up":
+        return h, peaks
     dn = block.down
     cw2, sw2 = (MIDDLE // 8, MIDDLE // 16) if fp4 else (MIDDLE // 4, MIDDLE // 32)
     s_dn, r_dn, tile_dn = tl["dn_s"], tl["dn_r"], tl["dn_tile"]
@@ -825,10 +844,18 @@ def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *
         output_dtypes=[mx.float32] * (2 if fp4 else 1),
     )
 
+    if stop_after == "down":
+        return raw, experts
+    return _combine(fp4, rows, raw, mid_outer, experts, prob, dn, conv_weight, tail, part, conv_form, source,
+                    trace, logits, values, outer, h, peaks)
+
+
+def _combine(fp4, rows, raw, mid_outer, experts, prob, dn, conv_weight, tail, part, conv_form, source,
+             trace, logits, values, outer, h, peaks):
     out, conv_rows = _kernel("combine", fp4, (("CONV_FORM", conv_form), ("DIVISOR", _divisor_bits())))(
         inputs=[raw, *([mid_outer[0]] if fp4 else []), experts, prob, *([dn.outer] if fp4 else []),
                 conv_weight, tail.reshape(3, HIDDEN), part],
-        template=[*common, ("T", mx.bfloat16)],
+        template=[("W", rows), ("T", mx.bfloat16)],
         grid=(HIDDEN, 1, 1), threadgroup=(64, 1, 1),
         output_shapes=[(rows, HIDDEN), (rows, HIDDEN)],
         output_dtypes=[mx.bfloat16, mx.float32],
@@ -839,6 +866,37 @@ def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *
     return out.reshape(source.shape), conv_rows.reshape(source.shape)
 
 
+@lru_cache(maxsize=4)
+def _zero_tail(width=HIDDEN):
+    return mx.zeros((1, 3, width), mx.float32)
+
+
+def reference_visit(layer, source, partial, tail):
+    """RC6's own statements for the same edge (model.py 533-536), for fallback and proofs."""
+    from mtplx.models.inkling import model as rc6
+
+    hidden = rc6.norm(source, layer.ffn_norm, layer.eps).astype(mx.bfloat16)
+    routed = layer.experts(hidden)
+    cache = [None, None, None, tail]
+    conv = layer.convs[3](routed, cache, 3, tape={} if source.shape[-2] > 1 else None)
+    return (partial + conv.astype(mx.float32)).astype(mx.bfloat16), routed.astype(mx.float32)
+
+
+def prove(layer, source, partial, tail):
+    """(True, None) when the fast block gives RC6's bits on these operands, else (False, why).
+
+    Host reads: call it outside a compiled step (at load or first use per format and width).
+    """
+    want = reference_visit(layer, source, partial, tail)
+    got = expert_visit(layer, source, partial, tail)
+    mx.eval(want, got)
+    for name, a, b in zip(("output", "convolution rows"), got, want):
+        view = {2: mx.uint16, 4: mx.uint32}[a.dtype.size]
+        if a.shape != b.shape or a.dtype != b.dtype or not bool(mx.array_equal(a.view(view), b.view(view)).item()):
+            return False, f"{name} differs from RC6 at {source.shape[-2]} rows"
+    return True, None
+
+
 def expert_visit(layer, source, partial, tail):
     """Stages D and E of one layer visit for a 1-32 row panel (SIGNATURES.md section 3).
 
@@ -847,7 +905,7 @@ def expert_visit(layer, source, partial, tail):
     the MLP convolution's committed (1, 3, 2304) float32 tail, oldest first (zeros before
     position 3). Returns (visit output bf16, the panel's MLP convolution input rows float32).
     """
-    tail = tail if tail is not None else mx.zeros((1, 3, HIDDEN), mx.float32)
-    _count("fast")
+    tail = tail if tail is not None else _zero_tail()
+    _count("fast." + PRODUCTS)
     return expert_visit_parts(layer.experts, layer.ffn_norm, layer.convs[3].weight, source, partial, tail,
                               eps=layer.eps)
