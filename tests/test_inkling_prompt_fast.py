@@ -1,15 +1,15 @@
-"""The prompt read's fast route switch (`MTPLX_INKLING_PROMPT_FAST`; unset, only the width is on): which parts
+"""The prompt read's fast route switch (`MTPLX_INKLING_PROMPT_FAST`; unset, the width and the MXFP8 experts are on): which parts
 it serves, and the chunk width the runtime gives a prompt read with and without it."""
 
 from mtplx.models.inkling.fast.prompt_route import PROMPT_FAST_ENV, prompt_fast
 from mtplx.models.inkling.runtime import InklingRuntime
 
 
-def test_unset_only_the_width_is_on_and_the_switch_serves_only_the_parts_it_names(monkeypatch):
+def test_unset_the_width_and_the_experts_are_on_and_the_switch_serves_only_the_parts_it_names(monkeypatch):
     monkeypatch.delenv(PROMPT_FAST_ENV, raising=False)
-    assert prompt_fast("chunk") and not prompt_fast("experts") and not prompt_fast("invariant")
+    assert prompt_fast("chunk") and prompt_fast("experts") and not prompt_fast("invariant")
     monkeypatch.setenv(PROMPT_FAST_ENV, "")
-    assert prompt_fast("chunk") and not prompt_fast("experts")
+    assert prompt_fast("chunk") and prompt_fast("experts") and not prompt_fast("invariant")
     for off in ("0", "off", "no", "false", " Off "):
         monkeypatch.setenv(PROMPT_FAST_ENV, off)
         assert not prompt_fast("chunk") and not prompt_fast("experts")
