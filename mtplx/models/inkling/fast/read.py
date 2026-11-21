@@ -37,6 +37,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 import math
+import os
 import struct
 import weakref
 
@@ -665,12 +666,97 @@ def scores(q, keys):
     return {"scores": per_row()}
 
 
+_ATTEND = """
+    // softmax(q . keys^T * SCALE) @ keys for one panel row and one query, in this kernel's own
+    // fixed order (the same on every Mac): per-thread float4 partial dots, simd_sum, the simdgroup
+    // totals added in order; max-subtracted softmax in one simdgroup; the mix per column.
+    constexpr uint NSG = TPG / 32;
+    const uint g = threadgroup_position_in_grid.x;
+    const uint r = g / NQ, qn = g % NQ;
+    const uint t = thread_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
+    threadgroup float red[NSG * S];
+    threadgroup float p[S];
+    const device float* krow = keys + size_t(r) * S * D;
+    const uint c = t * 4;
+    float part[S];
+    for (uint s = 0; s < S; ++s) part[s] = 0.0f;
+    if (c < D) {
+        const float4 qv = *reinterpret_cast<const device float4*>(q + size_t(qn) * D + c);
+        for (uint s = 0; s < S; ++s) {
+            const float4 kv = *reinterpret_cast<const device float4*>(krow + s * D + c);
+            part[s] = ((qv[0] * kv[0] + qv[1] * kv[1]) + qv[2] * kv[2]) + qv[3] * kv[3];
+        }
+    }
+    for (uint s = 0; s < S; ++s) {
+        const float v = simd_sum(part[s]);
+        if (lane == 0) red[sg * S + s] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        float v = -INFINITY;
+        if (lane < S) {
+            float total = 0.0f;
+            for (uint k = 0; k < NSG; ++k) total += red[k * S + lane];
+            v = total * as_type<float>(uint(SCALE));
+        }
+        const float m = simd_max(v);
+        const float e = lane < S ? metal::precise::exp(v - m) : 0.0f;
+        const float z = simd_sum(e);
+        if (lane < S) p[lane] = e / z;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (c < D) {
+        float4 acc = float4(0.0f);
+        for (uint s = 0; s < S; ++s) acc += p[s] * *reinterpret_cast<const device float4*>(krow + s * D + c);
+        *reinterpret_cast<device float4*>(out + (size_t(r) * NQ + qn) * D + c) = acc;
+    }
+"""
+
+
+@lru_cache(maxsize=1)
+def _attend_kernel():
+    return mx.fast.metal_kernel(name="mtplx_inkling_fast_attend_rows", input_names=["q", "keys"],
+                                output_names=["out"], source=_ATTEND)
+
+
+def fixed_order():
+    """``MTPLX_INKLING_DEPTH_READ=fixed``: the three- and four-query reads in one launch each, in this
+    lane's own order on every Mac (class C against RC6, whose scores and mix go to MLX's matrix
+    products: another order per GPU family). Off by default: the founder decides."""
+    return os.environ.get("MTPLX_INKLING_DEPTH_READ", "exact") == "fixed"
+
+
+def attend_rows(q, keys):
+    """``softmax(q @ keys[r].T / sqrt(D)) @ keys[r]`` for every row ``r``, one launch, fixed order.
+    ``q`` ``(Q, D)`` float32, ``keys`` ``(1, W, S, D)`` float32 -> ``(1, W, Q, D)`` float32."""
+    from .attn_input import count_route
+
+    nq, width = q.shape
+    rows, count = keys.shape[1], keys.shape[2]
+    if width % 4 or count > 32:
+        raise ValueError("attend_rows serves widths that are multiples of 4 and up to 32 keys")
+    tpg = _threads(width)
+    count_route(f"fixed:attend_rows_q{nq}_s{count}")
+    return _attend_kernel()(
+        inputs=[q.astype(mx.float32), keys],
+        template=[("NQ", nq), ("S", count), ("D", width), ("TPG", tpg), ("SCALE", _f32_bits(width ** -0.5))],
+        grid=(rows * nq * tpg, 1, 1),
+        threadgroup=(tpg, 1, 1),
+        output_shapes=[(1, rows, nq, width)],
+        output_dtypes=[mx.float32],
+    )[0]
+
+
 def depth_read(queries, keys):
     """RC6's three-query depth read from its keys (``model.py`` ``serial_depth_dots``): the
     scores as RC6's per-row products give them (``scores``), RC6's scale and softmax here, the
-    mix as RC6's batched MLX product. ``(1, W, Q, D)`` float32."""
+    mix as RC6's batched MLX product. ``(1, W, Q, D)`` float32. With ``fixed_order()``, one launch
+    in this lane's own order instead (``attend_rows``)."""
     width = keys.shape[-1]
     q = queries.reshape(-1, width).astype(mx.float32)
+    if fixed_order():
+        return attend_rows(q, keys)
     kw = scores(q, keys)
     return probs(kw.get("scores"), width ** -0.5, kw.get("joined")) @ keys
 
@@ -685,6 +771,8 @@ def message_rows(stack, queries):
     Returns one ``(1, W, 4, D)`` float32 array, or one ``(1, 1, 4, D)`` array a row.
     """
     rows, count, width = stack.shape[1], stack.shape[2], stack.shape[-1]
+    if fixed_order():
+        return attend_rows(queries, stack)
     kw = scores(queries, stack)
     weights = probs(kw.get("scores"), width ** -0.5, kw.get("joined"))
     per_row = lambda: [weights[:, r:r + 1] @ stack[:, r:r + 1] for r in range(rows)]
