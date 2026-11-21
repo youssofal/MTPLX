@@ -6,3 +6,9 @@ recursive-include scripts *.py *.sh
 prune scripts/ocspeed-20260703
 prune scripts/prodqa-20260703
 exclude scripts/streamscope_run.py
+
+# Sources of the native executor (mtplx._engine). Platform wheels carry the
+# built module; Apple Silicon source installs compile the same executor.
+include native/CMakeLists.txt native/VERSION native/build.sh native/package.py
+recursive-include native/engine *.h *.mm *.cpp
+recursive-include native/bindings *.mm

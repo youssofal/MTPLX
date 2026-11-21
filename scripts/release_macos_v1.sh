@@ -203,7 +203,7 @@ echo "Building Python artifacts for mtplx==$VERSION"
 rm -rf "$ROOT/mtplx.egg-info"
 python3 -m venv "$PYTOOLS_VENV"
 "$PYTOOLS_VENV/bin/python" -m pip install --upgrade pip build twine markdown
-"$PYTOOLS_VENV/bin/python" -m build "$ROOT" --outdir "$PYTHON_DIST"
+MTPLX_BUILD_BASE_WHEEL=1 "$PYTOOLS_VENV/bin/python" -m build "$ROOT" --outdir "$PYTHON_DIST"
 "$PYTOOLS_VENV/bin/python" -m twine check "$PYTHON_DIST"/*
 PYTHON_WHEEL="$PYTHON_DIST/mtplx-$VERSION-py3-none-any.whl"
 if [[ ! -f "$PYTHON_WHEEL" ]]; then
@@ -243,8 +243,8 @@ if [[ ! -x "$PBS_EXTRACT_DIR/bin/python3" ]]; then
 fi
 
 # Build the optional sparse-prefill consumer for the exact bundled Python.
-# Keep the pure wheel beside it: pip/app tag selection declines this binary
-# on older macOS or a different Python ABI rather than breaking installation.
+# The bundled interpreter selects the baseline executor on macOS 14 and the
+# executor with the optional sparse-prefill extension on macOS 15 or newer.
 NATIVE_BUILD_VENV="$OUT_ROOT/native-build-venv"
 NATIVE_DIST="$OUT_ROOT/native-wheels"
 NATIVE_MLX_DIST="$OUT_ROOT/native-mlx-macos15-wheels"
@@ -269,7 +269,22 @@ fi
 NATIVE_RUNTIME_WHEEL="$("$NATIVE_BUILD_VENV/bin/python" \
   "$ROOT/scripts/bundle_native_runtime_wheel.py" "$PYTHON_WHEEL" \
   "${NATIVE_WHEELS[0]}" --out "$PYTHON_DIST" --codesign-identity "$CODESIGN_IDENTITY")"
-"$PYTOOLS_VENV/bin/python" -m twine check "$NATIVE_RUNTIME_WHEEL"
+# Build against the oldest supported MLX library. The same executor can be
+# bundled with the optional macOS 15 kernels without raising the baseline.
+ENGINE_MLX_DIST="$OUT_ROOT/native-mlx-macos14-wheels"
+mkdir -p "$ENGINE_MLX_DIST"
+"$NATIVE_BUILD_VENV/bin/python" -m pip download --only-binary=:all: --platform macosx_14_0_arm64 \
+  --dest "$ENGINE_MLX_DIST" 'mlx==0.32.2'
+"$NATIVE_BUILD_VENV/bin/python" -m pip install --force-reinstall --no-deps "$ENGINE_MLX_DIST"/*.whl
+EXECUTOR="$(MACOSX_DEPLOYMENT_TARGET=14.0 "$NATIVE_BUILD_VENV/bin/python" \
+  "$ROOT/native/package.py" build --out "$OUT_ROOT/executor")"
+BASE_RUNTIME_WHEEL="$("$NATIVE_BUILD_VENV/bin/python" "$ROOT/native/package.py" wheel \
+  "$PYTHON_WHEEL" "$EXECUTOR" --out "$NATIVE_DIST" --codesign-identity "$CODESIGN_IDENTITY")"
+"$NATIVE_BUILD_VENV/bin/python" "$ROOT/native/package.py" wheel "$NATIVE_RUNTIME_WHEEL" "$EXECUTOR" \
+  --replace --codesign-identity "$CODESIGN_IDENTITY"
+"$NATIVE_BUILD_VENV/bin/python" "$ROOT/native/package.py" check "$BASE_RUNTIME_WHEEL"
+"$NATIVE_BUILD_VENV/bin/python" "$ROOT/native/package.py" check "$NATIVE_RUNTIME_WHEEL"
+"$PYTOOLS_VENV/bin/python" -m twine check "$BASE_RUNTIME_WHEEL" "$NATIVE_RUNTIME_WHEEL"
 
 # Notarization gate: every Mach-O inside the runtime wheel must carry the
 # Developer ID and a secure timestamp. The app's signing pass cannot reach
@@ -289,8 +304,8 @@ while IFS= read -r member; do
   fi
   NATIVE_SIGNED=$((NATIVE_SIGNED + 1))
 done < <(/usr/bin/find "$NATIVE_CHECK_DIR" \( -name '*.so' -o -name '*.dylib' \) -type f)
-if [[ "$NATIVE_SIGNED" -lt 2 ]]; then
-  echo "error: expected the QSA extension and its kernel library inside $NATIVE_RUNTIME_WHEEL, found $NATIVE_SIGNED signed Mach-O files" >&2
+if [[ "$NATIVE_SIGNED" -lt 3 ]]; then
+  echo "error: expected the executor, QSA extension and kernel library inside $NATIVE_RUNTIME_WHEEL, found $NATIVE_SIGNED signed Mach-O files" >&2
   exit 1
 fi
 echo "Native runtime wheel: $NATIVE_SIGNED Mach-O members Developer ID signed with secure timestamps"
@@ -301,7 +316,7 @@ MTPLX_APP_VERSION="$VERSION" \
 MTPLX_APP_BUILD="$APP_BUILD" \
 MTPLX_APP_BUNDLE_DIR="$APP_BUNDLE" \
 MTPLX_APP_EMBED_LOCAL_RUNTIME_WRAPPER=0 \
-MTPLX_RUNTIME_WHEEL="$PYTHON_WHEEL" \
+MTPLX_RUNTIME_WHEEL="$BASE_RUNTIME_WHEEL" \
 MTPLX_NATIVE_RUNTIME_WHEEL="$NATIVE_RUNTIME_WHEEL" \
 MTPLX_REQUIRE_RUNTIME_WHEEL_RESOURCE=1 \
 MTPLX_BUNDLED_PYTHON_DIR="$PBS_EXTRACT_DIR" \
