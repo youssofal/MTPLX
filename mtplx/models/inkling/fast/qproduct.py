@@ -285,3 +285,123 @@ def qmv_rows_probe(x, weight, rows_each=4, threads=64):
         output_shapes=[(rows, n)],
         output_dtypes=[x.dtype],
     )[0]
+
+_OUTPUT = """
+    // Stage C on stored codes in one launch (the step's output_projection): the output projection
+    // in MLX's one-row product order (QMV_ROWS), rounded to bf16 as that product returns it; the
+    // attention's static short convolution over the committed tail, with the reference kernel's
+    // arithmetic (short_conv, FORM as proven for this width); the residual in float32. One
+    // simdgroup: output channels [n0, n0 + 4) for every panel row.
+    constexpr uint NSG = THREADS / 32;
+    const uint lane = thread_index_in_simdgroup;
+    const int n0 = int(threadgroup_position_in_grid.x * NSG + simdgroup_index_in_threadgroup) * 4;
+    if (n0 >= N) return;
+    float result[W][4];
+    qmv_rows<W, 4, K, BITS, G, VPT>(codes, scales, biases, hg, K, n0, lane, result);
+    if (lane < 4) {
+        const uint n = uint(n0) + lane;
+        float seq[W + 3];
+        for (uint t = 0; t < 3; ++t) seq[t] = HAS_TAIL ? tail[t * N + n] : 0.0f;
+        for (uint r = 0; r < W; ++r) {
+            float v = result[r][0];
+            for (uint tm = 1; tm < 4; ++tm) v = (tm == lane) ? result[r][tm] : v;
+            const float a = static_cast<float>(static_cast<bfloat16_t>(v));
+            seq[3 + r] = a;
+            attn[size_t(r) * N + n] = a;
+        }
+        for (uint r = 0; r < W; ++r) {
+            float acc = 0.0f;
+            for (uint j = 0; j < 4; ++j) {
+                const float w = cw[n * 4 + j];      // the stored (channels, taps) layout
+                if (FORM == 0) acc += seq[r + j] * w;
+                else acc = metal::fma(seq[r + j], w, acc);
+            }
+            const float total = seq[r + 3] + acc;
+            const float value = total / as_type<float>(uint(DIVISOR));
+            const float y = static_cast<float>(static_cast<bfloat16_t>(value));
+            partial[size_t(r) * N + n] = BOUNDARY ? y : y + static_cast<float>(x[size_t(r) * N + n]);
+        }
+    }
+"""
+
+
+@lru_cache(maxsize=1)
+def _output_kernel():
+    return mx.fast.metal_kernel(
+        name="mtplx_inkling_fast_qoutput",
+        input_names=["hg", "codes", "scales", "biases", "cw", "tail", "x"],
+        output_names=["partial", "attn"],
+        source=_OUTPUT,
+        header=QMV_ROWS,
+    )
+
+
+_output_verdicts: dict = {}
+
+
+def affine_output(hg, weight, conv, tail, x, boundary, *, form, prove=True):
+    """The step's stage C on a stored-code output projection (``fast.step.output_projection``) in
+    one launch: ``(partial (1, W, N) float32, attn (1, W, N) float32)``, every bit as the step's
+    three launches give it (the product, the short convolution, the residual add).
+
+    ``hg`` ``(1, W, K)`` bf16; ``weight`` the affine output projection; ``conv`` the attention's
+    static ``Convolution`` (size 4); ``tail`` its committed ``(1, 3, N)`` float32 rows or ``None``;
+    ``x`` the stage input ``(1, W, N)`` bf16 (unused on a boundary layer); ``form`` the static
+    convolution's proven form for this width (``attn_input._static_form``). Raises ``RuntimeError``
+    (counted) for a form it does not serve or when this Mac's first use disagrees."""
+    from .attn_input import count_route, f32_bits
+
+    if conv.dynamic is not None or conv.size != 4 or form not in ("float", "fused"):
+        count_route("refused:qoutput_conv")
+        raise RuntimeError("affine_output serves the static four-tap convolution")
+    if hg.dtype != mx.bfloat16 or x.dtype != mx.bfloat16:
+        count_route("refused:qoutput_dtype")
+        raise RuntimeError("affine_output serves bf16 streams")
+    try:
+        c = qmv_constants(weight)
+    except RuntimeError as err:
+        count_route("refused:qoutput_" + str(err).rsplit(": ", 1)[-1])
+        raise
+    n = weight.codes.shape[0]
+    rows = hg.shape[-2]
+    k = c["K"]
+    if rows > 32 or hg.shape[-1] != k:
+        count_route("refused:qoutput_shape")
+        raise RuntimeError("affine_output serves panels of up to 32 rows of the matrix's width")
+    hg2, x2 = hg.reshape(rows, k), x.reshape(rows, n)
+    threads = 128
+    partial, attn = _output_kernel()(
+        inputs=[hg2, weight.codes, weight.scales, weight.biases, conv.weight.T,
+                tail if tail is not None else conv.weight.T, x2],
+        template=[("W", rows), ("K", k), ("N", n), ("BITS", c["BITS"]), ("G", c["GROUP"]), ("VPT", c["VPT"]),
+                  ("THREADS", threads), ("HAS_TAIL", tail is not None), ("BOUNDARY", bool(boundary)),
+                  ("FORM", 0 if form == "float" else 1), ("DIVISOR", f32_bits(5 ** 0.5))],
+        grid=(-(-n // (threads // 32 * 4)) * threads, 1, 1),
+        threadgroup=(threads, 1, 1),
+        output_shapes=[(rows, n), (rows, n)],
+        output_dtypes=[mx.float32, mx.float32],
+    )
+    partial, attn = partial.reshape(1, rows, n), attn.reshape(1, rows, n)
+    if prove:
+        key = (n, k, c["BITS"], c["GROUP"], rows, tail is not None, bool(boundary), form)
+        verdict = _output_verdicts.get(key)
+        if verdict is None:
+            from .. import short_conv
+
+            ref_attn = (mx.quantized_matmul(hg, weight.codes, weight.scales, weight.biases, transpose=True,
+                                            group_size=c["GROUP"], bits=c["BITS"]) if rows == 1
+                        else affine_product(hg, weight, prove=False))
+            fused = short_conv.convolve(ref_attn, tail, conv.weight, None, False)
+            if fused is None:
+                verdict = False
+            else:
+                ref_partial = fused[0].astype(mx.float32)
+                if not boundary:
+                    ref_partial = ref_partial + x.astype(mx.float32)
+                mx.eval(partial, attn, ref_partial, ref_attn)
+                verdict = _same(partial, ref_partial) and _same(attn, ref_attn.astype(mx.float32))
+            _output_verdicts[key] = verdict
+            count_route(("proved:" if verdict else "refused:") + f"qoutput_{n}x{k}_b{c['BITS']}_w{rows}")
+        if not verdict:
+            raise RuntimeError("affine_output disagreed with the step's three launches on this Mac")
+    return partial, attn
