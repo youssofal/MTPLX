@@ -6,7 +6,10 @@ from mtplx.models.inkling.runtime import InklingRuntime
 
 
 def test_unset_the_width_and_the_experts_are_on_and_the_switch_serves_only_the_parts_it_names(monkeypatch):
+    import mtplx.nax_detect as nax
+
     monkeypatch.delenv(PROMPT_FAST_ENV, raising=False)
+    monkeypatch.setattr(nax, "nax_available", lambda: True)            # a Mac with the tensor units (M5)
     assert prompt_fast("chunk") and prompt_fast("experts") and not prompt_fast("invariant")
     monkeypatch.setenv(PROMPT_FAST_ENV, "")
     assert prompt_fast("chunk") and prompt_fast("experts") and not prompt_fast("invariant")
@@ -163,3 +166,15 @@ def test_the_stage_counts_as_running_only_where_it_can(monkeypatch):
     monkeypatch.setattr(F, "tensor_units", lambda: True)
     monkeypatch.setattr(F, "library_text", lambda: (None, "no headers"))
     assert not F.runs_here()
+
+
+def test_unset_the_experts_part_serves_only_macs_with_the_tensor_units(monkeypatch):
+    """The MXFP8 gate-up on the sorted product is measured on M5 only: unset, M1 to M4 keep the panel product
+    (the product's own rehearsal switch stands in for one); a switch that names the part still serves it."""
+    monkeypatch.delenv(PROMPT_FAST_ENV, raising=False)
+    monkeypatch.setenv("MTPLX_FORCE_GPU_FAMILY_FALLBACK", "1")
+    assert prompt_fast("chunk") and not prompt_fast("experts") and not prompt_fast("invariant")
+    monkeypatch.setenv(PROMPT_FAST_ENV, "chunk,experts")
+    assert prompt_fast("experts")
+    monkeypatch.setenv(PROMPT_FAST_ENV, "on")
+    assert prompt_fast("experts")

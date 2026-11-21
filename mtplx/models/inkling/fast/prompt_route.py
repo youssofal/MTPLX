@@ -32,10 +32,15 @@ PROMPT_FAST_PARTS = ("chunk", "experts", "invariant")
 def prompt_fast(part):
     """Whether the prompt read's fast route serves ``part`` (read per call). Unset, the read width (``chunk``)
     and the MXFP8 gate-up on the tensor units (``experts``) are on (their class accepted on 21 November, with
-    their accuracy tables) and ``invariant`` is off."""
+    their accuracy tables) and ``invariant`` is off. Unset, ``experts`` serves only a Mac with the tensor units
+    (M5), the only Macs it is measured on: M1 to M4 keep the one-row panel product unless the switch names it."""
     raw = os.environ.get(PROMPT_FAST_ENV, "").strip().lower()
     if not raw:
-        return part in ("chunk", "experts")
+        if part == "experts":
+            from mtplx.nax_detect import nax_available
+
+            return nax_available()
+        return part == "chunk"
     if raw in ("0", "off", "no", "false"):
         return False
     if raw in ("1", "on", "yes", "true", "all"):

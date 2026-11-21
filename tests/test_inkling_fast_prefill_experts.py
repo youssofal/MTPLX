@@ -140,6 +140,10 @@ def test_experts_forward_takes_the_fast_route_by_default_and_when_named_not_when
     state = EF._state(block)
     fast = lambda: sum(v for k, v in state.counts.items() if ".prompt_fast." in k)
     monkeypatch.delenv("MTPLX_INKLING_PROMPT_FAST", raising=False)  # unset: on (class accepted 21 November)
+    monkeypatch.delenv("MTPLX_FORCE_GPU_FAMILY_FALLBACK", raising=False)
+    import mtplx.nax_detect as nax
+
+    monkeypatch.setattr(nax, "nax_available", lambda: True)  # unset, it serves the Macs with the tensor units
     before = fast()
     got = block(hidden)
     want = block.stock(hidden)
