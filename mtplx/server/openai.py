@@ -30545,6 +30545,32 @@ def _uncapped_response_lease_tokens_from_env() -> int | None:
         return None
 
 
+def _context_window_advice(state: Any, context_window: int) -> str:
+    """What the user can do about a prompt past the served window (the second half of the 400's
+    message; the first keeps OpenAI's wording, which clients match to compact a conversation).
+
+    A window served below this Mac's memory-plan fit can be raised to the fit. A window this Mac's
+    memory sets (the fit, below what the model supports) cannot: a larger ``--context-window`` would
+    swap or be stopped mid-stream, so the conversation has to shrink. Otherwise the model's own
+    maximum or an explicit override set the window, and the prompt has to shrink.
+    """
+
+    plan = getattr(state, "memory_plan", None)
+    fit = int(getattr(plan, "context_window_fit", 0) or 0) if plan is not None else 0
+    if fit <= 0:
+        return "Reduce the prompt or serve with a larger --context-window."
+    if context_window < fit:
+        return (
+            "Reduce the prompt or serve with a larger --context-window "
+            f"(this Mac's memory fits {fit} tokens)."
+        )
+    if bool(getattr(plan, "context_machine_bound", False)) and not bool(
+        getattr(plan, "context_overcommitted", False)
+    ):
+        return "This Mac's memory sets the window: shorten or compact the conversation."
+    return "Reduce the prompt."
+
+
 def _reject_prompt_over_context(state: ServerState, prompt_token_count: int) -> None:
     """Refuse prompts the serve cannot hold (400) or honestly fit (507).
 
@@ -30575,8 +30601,7 @@ def _reject_prompt_over_context(state: ServerState, prompt_token_count: int) -> 
                     f"This model's maximum context length is {context_window} "
                     f"tokens, but the prompt alone has "
                     f"{int(prompt_token_count)} tokens, leaving no room to "
-                    "generate. Reduce the prompt or serve with a larger "
-                    "--context-window."
+                    "generate. " + _context_window_advice(state, context_window)
                 ),
                 "code": "context_length_exceeded",
             },
