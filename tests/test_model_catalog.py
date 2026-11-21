@@ -57,8 +57,9 @@ def test_inkling_trio_follows_each_tiers_first_pick_where_the_plan_admits_it():
         ids = recommended_catalog_ids(memory_gib=ram, chip_tier=MODERN_TIER)
         assert ids[0] == "qwen38-27b-optimized-speed"
         assert ids[1:4] == inkling
-    for ram in (16, 18, 24):
+    for ram in (16, 18):
         assert not set(inkling) & set(recommended_catalog_ids(memory_gib=ram, chip_tier=MODERN_TIER))
+    assert set(inkling) & set(recommended_catalog_ids(memory_gib=24, chip_tier=MODERN_TIER)) == {inkling[0]}
     for ram in (64, 128):
         ids = recommended_catalog_ids(memory_gib=ram, chip_tier=MODERN_TIER)
         assert ids[ids.index("bonsai-2-27b-optimized-speed") + 1 :][:3] == inkling
@@ -71,13 +72,10 @@ def test_inkling_trio_follows_each_tiers_first_pick_where_the_plan_admits_it():
 
 
 
-def test_the_24_gib_inkling_offer_is_prepared_but_off(monkeypatch):
+def test_the_24_gib_inkling_offer_is_on(monkeypatch):
     import mtplx.model_catalog as catalog
 
-    assert catalog.INKLING_TIGHT_MAC_OFFER is False
-    for ram in (24, 28):
-        assert "inkling2-mini-bare-speed" not in recommended_catalog_ids(memory_gib=ram, chip_tier=MODERN_TIER)
-    monkeypatch.setattr(catalog, "INKLING_TIGHT_MAC_OFFER", True)
+    assert catalog.INKLING_TIGHT_MAC_OFFER is True
     for ram in (24, 28):
         ids = recommended_catalog_ids(memory_gib=ram, chip_tier=MODERN_TIER)
         assert ids[1] == "inkling2-mini-bare-speed"  # directly after the tier's first pick
@@ -85,6 +83,9 @@ def test_the_24_gib_inkling_offer_is_prepared_but_off(monkeypatch):
         assert "inkling2-mini-optimized-speed" not in ids and "inkling2-mini-optimized-quality" not in ids
     assert "inkling2-mini-bare-speed" not in recommended_catalog_ids(memory_gib=18, chip_tier=MODERN_TIER)
     assert "inkling2-mini-bare-speed" not in recommended_catalog_ids(memory_gib=24, chip_tier=LEGACY_TIER)
+    monkeypatch.setattr(catalog, "INKLING_TIGHT_MAC_OFFER", False)
+    for ram in (24, 28):
+        assert "inkling2-mini-bare-speed" not in recommended_catalog_ids(memory_gib=ram, chip_tier=MODERN_TIER)
 
 def test_qwen38_fp16_siblings_mirror_their_parents():
     # Same packs, same peak; only the tier, id suffix and HF repo differ.
@@ -167,6 +168,7 @@ def test_recommended_ids_mirror_app_ram_tiers():
     ]
     assert recommended_catalog_ids(memory_gib=24, chip_tier=MODERN_TIER) == [
         "bonsai-2-27b-optimized-speed",
+        "inkling2-mini-bare-speed",
         "mimo-v26-qwen-9b-optimized-speed",
         "qwen35-9b-optimized-speed",
         "qwen35-4b-optimized-speed",
@@ -279,6 +281,7 @@ def test_recommended_models_filter_by_peak_memory():
     models = recommended_models(memory_gib=24, chip_tier=MODERN_TIER)
     assert [model.id for model in models] == [
         "bonsai-2-27b-optimized-speed",
+        "inkling2-mini-bare-speed",
         "mimo-v26-qwen-9b-optimized-speed",
         "qwen35-9b-optimized-speed",
         "qwen35-4b-optimized-speed",
