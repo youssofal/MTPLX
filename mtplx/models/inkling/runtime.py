@@ -56,6 +56,9 @@ def engine_pool_price(measured, widest):
 
 class InklingRuntime(MTPLXRuntime):
     backend_id = "inkling2_loop"
+    #: The one-copy conversation store banks this runtime's prompts and answers as leases on the
+    #: live cache with a recurrent anchor (``mtplx.one_copy.one_copy_store``; ``WindowCache``).
+    one_copy_store = True
 
     def __init__(self, path: Path, *, mtp: bool, contract=None):
         model, vision, config = load_target(path)

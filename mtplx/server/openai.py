@@ -86,6 +86,7 @@ from mtplx.token_ids import as_token_tuple
 from mtplx.one_copy import (
     anchor_nbytes as one_copy_anchor_nbytes,
     one_copy_runtime,
+    one_copy_store,
     prefill_slack_rows as one_copy_prefill_slack_rows,
 )
 from mtplx.mtp_patch import MTPContract
@@ -24304,7 +24305,7 @@ def _run_prefill_admission(
     # The one-copy store publishes a prompt as a lease plus one recurrent
     # anchor and sizes the prefill's buffers to the verifier bank's rows
     # (mtplx/one_copy.py).
-    one_copy = one_copy_runtime(runtime)
+    one_copy = one_copy_store(runtime)
     anchor_bytes = one_copy_anchor_nbytes(runtime) if one_copy else None
     slack_rows = (
         one_copy_prefill_slack_rows(runtime, prompt_tokens, max_new_tokens)
@@ -26378,7 +26379,7 @@ def _commit_prompt_prefix_for_request(
     # diverges where the assistant turn starts). Skipping it left every
     # follow-up at the first turn's prompt, re-reading one more answer each
     # turn (#291, with --ssd-session-cache off).
-    return one_copy_runtime(getattr(state, "runtime", None)) and len(prompt_ids) >= 512
+    return one_copy_store(getattr(state, "runtime", None)) and len(prompt_ids) >= 512
 
 
 def _anonymous_coding_agent_tool_request(
@@ -28595,7 +28596,7 @@ def _store_retokenized_history_snapshot(
     # at its restore point (one_copy.LeaseReturn), and one it did finish is
     # banked before any yield below, so a preempted postcommit never drops
     # the conversation.
-    one_copy = one_copy_runtime(state.runtime)
+    one_copy = one_copy_store(state.runtime)
     try:
         try:
             if _abort_requested():
@@ -40775,7 +40776,7 @@ def create_app(state: ServerState) -> FastAPI:
             session_source=session_source,
             session_id=session_id,
             tool_names=_tool_names(tool_specs) if tools_active else None,
-            one_copy=one_copy_runtime(getattr(state, "runtime", None)),
+            one_copy=one_copy_store(getattr(state, "runtime", None)),
         )
         live_frontier_policy = "none"
         if agent_transcript_tools_active:

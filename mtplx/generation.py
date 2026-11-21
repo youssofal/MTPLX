@@ -118,6 +118,7 @@ from .one_copy import (
     lease_return as one_copy_lease_return,
     note_anchor as one_copy_note_anchor,
     one_copy_runtime,
+    one_copy_store,
     prefill_rows_scope,
     prefill_rows_target,
     prompt_lease_fields,
@@ -7029,7 +7030,7 @@ def restore_or_prefill_prompt_state(
         snapshot_done = store_started
         try:
             boundaries = list(getattr(state, "gdn_boundaries", None) or [])
-            if one_copy_runtime(rt):
+            if one_copy_store(rt):
                 # One-copy store: a lease plus a prompt-end anchor, never a
                 # snapshot of views the decode would then have to copy.
                 bank_fields = prompt_lease_fields(
@@ -9749,7 +9750,7 @@ def _commit_ar_prompt_state(
     try:
         boundaries = list(getattr(prompt_state, "gdn_boundaries", None) or [])
         committed_mtp_cache = prompt_state.committed_mtp_cache
-        if one_copy_runtime(rt):
+        if one_copy_store(rt):
             bank_fields = prompt_lease_fields(
                 prompt_state.trunk_cache,
                 committed_mtp_cache=committed_mtp_cache,
@@ -9942,7 +9943,7 @@ def generate_ar(
             # lease: banked again before the answer decodes into it, so a
             # cancelled answer leaves the conversation where it was.
             or (
-                one_copy_runtime(rt)
+                one_copy_store(rt)
                 and str(prompt_state.restore_mode).endswith("reference_lease")
             )
         )

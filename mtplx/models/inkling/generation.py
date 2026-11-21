@@ -22,6 +22,7 @@ from mtplx.generation import (
     first_token_logprobs,
     restore_or_prefill_prompt_state,
 )
+from mtplx.one_copy import one_copy_store
 from mtplx.route_tape import RouteTape, counter_deltas
 from mtplx.sampling import client_controls
 from .copy_draft import PromptCopy, SessionPromptIndexes
@@ -132,7 +133,13 @@ def generate(
         commit_prompt_state_to_bank
         and session_bank is not None
         and session_id
-        and prompt.suffix_tokens
+        and (
+            prompt.suffix_tokens
+            # An identical prompt took its conversation's only copy as a lease: banked again
+            # (a lease and the prompt-end anchor, no copy) before the answer decodes into it,
+            # so a cancelled answer leaves the conversation where it was.
+            or (one_copy_store(rt) and str(prompt.restore_mode).endswith("reference_lease"))
+        )
         and not prompt.prefill_store_snapshot.get("stored")
     ):
         prompt_commit = _commit_ar_prompt_state(

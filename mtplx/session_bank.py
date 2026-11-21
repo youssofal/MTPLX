@@ -674,9 +674,9 @@ def _one_copy_cache(cache: list[Any] | None) -> bool:
     turn in place and would copy the whole history (mtplx/one_copy.py).
     """
 
-    from .one_copy import one_copy_enabled, qsa_entries
+    from .one_copy import one_copy_store_cache
 
-    return one_copy_enabled() and bool(qsa_entries(cache))
+    return one_copy_store_cache(cache)
 
 
 def _decoded_for_one_request(entry: Any) -> bool:
