@@ -98,6 +98,11 @@ _GATE_ROWS = 32
 _ROW_CHUNK = 8
 #: Stage each threadgroup's input in threadgroup memory (whole panel when it fits, else in chunks).
 _STAGE = True
+#: One dynamic-tap row per simdgroup on global visits (``TSPREAD``) instead of all four on simdgroup 0
+#: after its blocks (it was the key and value units' long pole). Engine GPU time a visit, Bare Speed,
+#: M5 Max (d1/receipts/ebench-a-2.json, -4.json): global first 62.1 -> 38.6 us at 1 row, 84.7 -> 51.9
+#: at 4, 238 -> 152 at 8; global loop 58.8 -> 37.2, 81.9 -> 53.3, 242 -> 153. Window visits have no taps.
+_SPREAD = True
 
 
 def f32_bits(value: float) -> int:
@@ -592,12 +597,15 @@ _PROJECT = """
     }
 
     // bn8 rows: the sink row of a query unit, the four dynamic taps of a key or value unit.
+    // TSPREAD: tap row t is simdgroup t's (one row each, the same loop), instead of all of them on
+    // simdgroup 0 after its blocks (that simdgroup was the key and value units' long pole).
     const bool bn8_sink = kind == 0 && sg == NSG - 1;
-    const bool bn8_taps = (kind == 1 || kind == 2) && TAPS > 0 && sg == 0;
+    const bool bn8_taps = (kind == 1 || kind == 2) && TAPS > 0 && (TSPREAD ? sg < uint(TAPS) : sg == 0);
+    const uint tap0 = TSPREAD ? sg : 0u;      // first tap row of this simdgroup
     if (bn8_sink || bn8_taps) {
         const device bfloat16_t* bm = bn8_sink ? wsink : (kind == 1 ? wkt : wvt);
-        const uint nr = bn8_sink ? 1u : uint(TAPS);
-        const uint b0 = bn8_sink ? h : h * uint(TAPS);
+        const uint nr = bn8_sink ? 1u : (TSPREAD ? 1u : uint(TAPS));
+        const uint b0 = bn8_sink ? h : h * uint(TAPS) + tap0;
         for (uint rc = 0; rc < W; rc += RCH) {
             float total[4][RCH];
             for (uint v = 0; v < 8; ++v) {
@@ -638,7 +646,7 @@ _PROJECT = """
                     for (uint ro = 0; ro < nr; ++ro) {
                         const float y = static_cast<float>(static_cast<bfloat16_t>(total[ro][r]));
                         if (bn8_sink) outs[(rc + r) * OQ + HD + RD] = y;
-                        else outs[(rc + r) * OK + HD + ro] = y;
+                        else outs[(rc + r) * OK + HD + tap0 + ro] = y;
                     }
                 }
             }
@@ -867,7 +875,7 @@ class Projected(NamedTuple):
 
 
 def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", threads=None, gate_rows=None,
-            stage=None, rch=None, affsum=None, stage2=None, norm_first=None):
+            stage=None, rch=None, affsum=None, stage2=None, norm_first=None, spread=None):
     """Every projection of one visit and its epilogues, for a panel, in one launch.
 
     ``sources``: ``(W, NS, D)`` bf16 normed inputs (``NS`` 1: q = k = v input; 3: q, k, v
@@ -968,6 +976,9 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
         stage2 = not any(m.bits == 4 for m in (mq, mr, mg, mk, mv))
     stage2 = bool(raw is not None and not stage and stage2)
     chunk = rch or (_ROW_CHUNK if rows > 4 else rows)
+    # TSPREAD: one dynamic-tap row per simdgroup (needs a simdgroup per tap row).
+    spread = _SPREAD if spread is None else bool(spread)
+    spread = bool(spread and taps and threads // 32 >= taps)
     # Chunks hold whole 256-column blocks when an affine matrix reads them.
     unit = 256 if affine else 128
     kc = max(unit, min(width, ((31 * 1024 - out_bytes) // (chunk * 2)) // unit * unit))
@@ -992,6 +1003,7 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
             ("VB", mv.bits), ("VG", mv.group),
             ("QSO", qso), ("RSO", rso), ("GSO", gso), ("KSO", kso), ("VSO", vso),
             ("AFFINE", any(m.bits != 16 for m in (mq, mr, mg, mk, mv))), ("AFFSUM", affsum),
+            ("TSPREAD", spread),
             ("VNORM", bool(cfg["use_value_norm_no_gamma"])),
             ("QK_CLIP", f32_bits(cfg["qk_l2_clip_threshold"])),
             ("REL_CLIP", f32_bits(cfg["rel_l2_clip_threshold"])),
