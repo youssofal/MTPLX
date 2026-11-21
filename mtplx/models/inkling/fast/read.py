@@ -973,17 +973,11 @@ def depth_read(queries, keys):
         kw = scores(q, keys)
         return probs(kw.get("scores"), width ** -0.5, kw.get("joined")) @ keys
 
-    def exact():
-        # The one-launch read built from the library's product code (exact_read), else its launches.
-        one = exact_read(q, keys, library)
-        return one if one is not None else library()
-
-    # exact_read serves (the lead's call after the trial census, 17:25 UTC). The other one-launch read,
-    # nax_reads.depth_read, serves only under MTPLX_INKLING_NAX_READS=1, until one job has timed both
-    # (lanes/F1.md): then one of them goes.
-    from .nax_reads import depth_read as one_launch
-
-    return one_launch(queries, keys, exact)
+    # The one-launch read built from the library's product code (exact_read), else its launches.
+    # (Lane F1's other one-launch read was timed against it in one job per pack, f1/receipts/c2-*,
+    # and removed: about 60 against 40 us a launch.)
+    one = exact_read(q, keys, library)
+    return one if one is not None else library()
 
 
 def message_rows(stack, queries):

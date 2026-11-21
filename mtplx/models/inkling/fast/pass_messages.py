@@ -115,18 +115,13 @@ def batched_rows(stack, table):
         )[0]
         return weights @ stack  # (visits, W, 4, P) @ (1, W, P, D): batched over visits and rows
 
-    def one_launch():
-        # Every visit's read in one launch on the library's own tile loop (read.exact_read with the
-        # visits side by side), proven on first use per shape; else the library's two products.
-        from .read import exact_read
+    # Every visit's read in one launch on the library's own tile loop (read.exact_read with the visits
+    # side by side), proven on first use per shape; else the library's two products.
+    from .read import exact_read
 
-        one = exact_read(table.reshape(visits * QUERIES, width), stack, library, visits=visits)
-        return one if one is not None else library()
-
-    # nax_reads.message_read serves first only under MTPLX_INKLING_NAX_READS=1 (off by default).
-    from .nax_reads import message_read
-
-    mixed = message_read(table, stack, one_launch)
+    mixed = exact_read(table.reshape(visits * QUERIES, width), stack, library, visits=visits)
+    if mixed is None:
+        mixed = library()
     return [mixed[k : k + 1] for k in range(visits)]
 
 
