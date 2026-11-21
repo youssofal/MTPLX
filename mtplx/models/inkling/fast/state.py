@@ -60,6 +60,29 @@ def _one_launch_tails(tails, rows):
                for t, r in zip(tails, rows))
 
 
+def _row_writer(sample):
+    """The native engine's in-place row writer (``write_history_rows``: rows at an offset of a
+    ``(1, heads, rows, dim)`` 16-bit bank, one launch whatever the rows' strides), or None: no
+    engine module, a CPU run, another dtype, or ``MTPLX_INKLING_ROW_WRITER=0`` (the library's slice
+    updates then serve)."""
+    import os
+
+    if os.environ.get("MTPLX_INKLING_ROW_WRITER", "1").strip().lower() in ("0", "off", "false", "no"):
+        return None
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return None
+    if sample.dtype not in (mx.bfloat16, mx.float16) or sample.ndim != 4 or sample.shape[-1] % 4:
+        return None
+    try:
+        from mtplx.engine import runtime as engine_runtime
+
+        if not engine_runtime.available():
+            return None
+        return getattr(engine_runtime.native_module(), "write_history_rows", None)
+    except Exception:  # noqa: BLE001 - no engine module: the slice updates serve
+        return None
+
+
 def visit_tails(tails, rows, kept):
     from .commit_launches import visit_tails as one_launch
 
@@ -194,25 +217,42 @@ class DecodeState:
         if kept == 0:
             return
         end = self.length + kept
+        write = _row_writer(deltas[0].keys) if deltas else None
         for visit, delta in enumerate(deltas):
             kv, conv = self.cache[2 * visit], self.cache[2 * visit + 1]
             keys, values = delta.keys[:, :, :kept], delta.values[:, :, :kept]
+            if write is not None and (kv.keys.dtype != keys.dtype or kv.keys.ndim != 4):
+                write = None
             if self.local[visit]:
                 # At most two contiguous runs of ring slots: static slice updates, in place
                 # while the ring is exclusively owned, no index arrays built on the GPU.
                 first = kv._idx % self.window
                 head = min(kept, self.window - first)
-                kv.keys[:, :, first : first + head, :] = keys[:, :, :head]
-                kv.values[:, :, first : first + head, :] = values[:, :, :head]
-                if head < kept:
-                    kv.keys[:, :, : kept - head, :] = keys[:, :, head:]
-                    kv.values[:, :, : kept - head, :] = values[:, :, head:]
+                if write is not None:
+                    # Lane F1: each run in one launch of the native row writer (the same 16-bit
+                    # payloads, in place while owned), not two library copies.
+                    at = mx.array(first, mx.int32)
+                    kv.keys, kv.values = write(kv.keys, keys[:, :, :head], at), write(kv.values, values[:, :, :head], at)
+                    if head < kept:
+                        zero = mx.array(0, mx.int32)
+                        kv.keys = write(kv.keys, keys[:, :, head:], zero)
+                        kv.values = write(kv.values, values[:, :, head:], zero)
+                else:
+                    kv.keys[:, :, first : first + head, :] = keys[:, :, :head]
+                    kv.values[:, :, first : first + head, :] = values[:, :, :head]
+                    if head < kept:
+                        kv.keys[:, :, : kept - head, :] = keys[:, :, head:]
+                        kv.values[:, :, : kept - head, :] = values[:, :, head:]
                 kv._idx = (kv._idx + kept - 1) % self.window + 1
             else:
                 if end > kv.keys.shape[2]:
                     self._grow(kv, end)
-                kv.keys[:, :, self.length : end, :] = keys
-                kv.values[:, :, self.length : end, :] = values
+                if write is not None:
+                    at = mx.array(self.length, mx.int32)
+                    kv.keys, kv.values = write(kv.keys, keys, at), write(kv.values, values, at)
+                else:
+                    kv.keys[:, :, self.length : end, :] = keys
+                    kv.values[:, :, self.length : end, :] = values
             kv.offset = end
             tails = [conv[slot] for slot in range(len(delta.taps))]
             if _one_launch_tails(tails, delta.taps):

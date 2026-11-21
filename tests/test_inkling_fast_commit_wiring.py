@@ -119,3 +119,58 @@ def test_drafter_mix_one_launch_equals_the_stock_mix(rows, monkeypatch):
         mx.eval(got[arm])
     for a, b in zip(got["1"], got["0"]):
         assert bool(mx.array_equal(_bits(a), _bits(b)).item())
+
+
+@pytest.fixture
+def engine_module(monkeypatch):
+    """The native engine module named by ``INKLING_TEST_ENGINE`` (the suite drops ``MTPLX_*``
+    variables, so the module path comes in under another name), loaded for this test only."""
+    import os
+
+    from mtplx.engine import runtime
+
+    path = os.environ.get("INKLING_TEST_ENGINE", "").strip()
+    if not path:
+        pytest.skip("INKLING_TEST_ENGINE (the native engine module) not given")
+    monkeypatch.setenv("MTPLX_NATIVE_ENGINE_MODULE", path)
+    if not runtime.available():
+        monkeypatch.setattr(runtime, "_REASON", None)
+        monkeypatch.setattr(runtime, "_NATIVE", None)
+    if not runtime.available():
+        pytest.skip(f"the native engine module does not load: {runtime.unavailable()}")
+    return runtime.native_module()
+
+
+@needs
+@pytest.mark.parametrize("kept", [1, 2, 3, 4, 5, 6, 7, 8])
+@pytest.mark.parametrize("length", [11, 14])  # 14 + 8 crosses the 16-row window
+def test_commit_with_the_row_writer_writes_the_stock_state(kept, length, monkeypatch, engine_module):
+    from mtplx.models.inkling.fast import state as state_mod
+
+    calls = []
+    real = state_mod._row_writer
+
+    def counted(sample):
+        write = real(sample)
+        if write is None:
+            return None
+        def wrapped(history, rows, offset):
+            calls.append(int(rows.shape[2]))
+            return write(history, rows, offset)
+        return wrapped
+
+    monkeypatch.setattr(state_mod, "_row_writer", counted)
+    model = _model()
+    states = {}
+    for arm in ("1", "0"):
+        monkeypatch.setenv("MTPLX_INKLING_ROW_WRITER", arm)
+        st = _state(model, length, seed=5)
+        st.commit(_deltas(model, 8, seed=9), kept)
+        mx.eval(st.arrays())
+        states[arm] = st
+        if arm == "1":
+            assert calls, "the row writer did not engage"
+            assert sum(calls) == 2 * kept * len(model.layers)  # keys and values, every visit, every row
+    for a, b in zip(states["1"].arrays(), states["0"].arrays()):
+        assert a.shape == b.shape and a.dtype == b.dtype
+        assert bool(mx.array_equal(_bits(a), _bits(b)).item())
