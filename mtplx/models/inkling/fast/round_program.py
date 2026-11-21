@@ -77,10 +77,6 @@ def _weights(rt: Any) -> list:
         arrays += sites.module_weights(drafter)
         # The folded Markov table is built once per process; the program reads it in place.
         arrays.append(drafter.fold(rt.model.unembed))
-        # So are the drafter glue's float32 Markov projection tables (lane F1, draft_glue.markov_tables).
-        from . import draft_glue
-
-        arrays += draft_glue.markov_tables(drafter)
     return arrays
 
 
