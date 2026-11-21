@@ -788,9 +788,14 @@ _EXACT = """
         // The library's mat-vec, launched by it as one threadgroup of 8 x 32 threads (this one); VT
         // query rows a thread (4, or 1 for fewer than 4 queries).
         threadgroup float reduce[8 * (VT + VT)];
-        GEMVKernel<float, 1, 8, 1, 32, VT, 4, false, float>::run(
-            queries, kr, queries, sk, width[0], nq[0], width[0], zero[0], zero[0], nq[0], reduce,
-            uint3(0, 0, 0), uint3(lane, sg, 0), sg, lane);
+        using MatVec = GEMVKernel<float, 1, 8, 1, 32, VT, 4, false, float>;
+        const constant int& k_len = width[0];       // the keys' width: the mat-vec's input length
+        const constant int& q_len = nq[0];          // the queries: its output length
+        const constant float& none = zero[0];       // no bias term (alpha, beta unused)
+        const uint3 first_group = uint3(0, 0, 0);
+        const uint3 thread_at = uint3(lane, sg, 0);
+        MatVec::run(queries, kr, queries /* no bias */, sk, k_len, q_len, k_len /* row stride */, none, none,
+                    q_len, &reduce[0], first_group, thread_at, uint(sg), uint(lane));
     } else {
         // Split-K tiles of 64 x 64 over simdgroups 0-3 (2 x 2, 32 x 32 each); simdgroups 4-7 hold a tile
         // past the last query, so they own no values but meet every barrier of the tile loop.

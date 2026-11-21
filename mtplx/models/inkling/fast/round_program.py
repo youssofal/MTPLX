@@ -498,6 +498,8 @@ def propose(drafter, target, anchor, view: DraftView, count_: int, *, position, 
         "rnn_proj.bias"
     ].astype(mx.float32)
     folded = drafter.fold(target.unembed)
+    from .matvec import matvec
+
     start = position.astype(mx.uint32).reshape(())
     # Kept constants, not fresh host scalars, anywhere in the program (see round.commit_count):
     # the same values, so the same bits.
@@ -507,12 +509,13 @@ def propose(drafter, target, anchor, view: DraftView, count_: int, *, position, 
     picks, laws, stats, confidence = [], [], [], []
     for i in range(count_):
         step_in = mx.concatenate([state, drafter.markov["markov_w1.weight"][prev]], axis=-1)
-        update = (linear(step_in.astype(mx.float32), weights[:, : 2 * rank]) + conditioned[:, i]).astype(dtype)
+        # The drafter's products as the library's mat-vec in launches of ours (fast/matvec.py), bit for bit.
+        update = (matvec(step_in.astype(mx.float32), weights, cols=2 * rank) + conditioned[:, i]).astype(dtype)
         gate, candidate, output = mx.split(update, 3, axis=-1)
         gate = mx.sigmoid(gate.astype(mx.float32)).astype(dtype)
         state = gate * state + (one - gate) * mx.tanh(candidate.astype(mx.float32)).astype(dtype)
         signal = mx.tanh(output.astype(mx.float32)).astype(dtype)
-        bias = mx.addmm(folded[:, -1], signal, folded[:, :-1].T)
+        bias = matvec(signal, folded, cols=folded.shape[1] - 1, bias_col=folded.shape[1] - 1)
         scores = base[:, i] + bias
         if greedy:
             law, st = fast_round.law_rows(scores, temperature=None, cap=0.0, write=True)
