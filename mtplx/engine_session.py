@@ -2130,6 +2130,7 @@ class EngineSessionManager:
         cold_tier: Any | None = None,
         model_weights_bytes: int | None = None,
         memory_plan: Any | None = None,
+        checkpoint_budget_bytes: int | None = None,
     ) -> None:
         if idle_ttl_s is None:
             idle_ttl_s = session_bank_idle_ttl_s()
@@ -2157,6 +2158,9 @@ class EngineSessionManager:
                 ),
                 idle_ttl_s=idle_ttl_s,
                 cold_tier=cold_tier,
+                # A family whose checkpoints are large sets its own budget for one entry's
+                # set (Inkling 2 Mini on a tight Mac); None keeps the shared default.
+                checkpoint_budget_bytes=checkpoint_budget_bytes,
             )
             if (
                 auto_active

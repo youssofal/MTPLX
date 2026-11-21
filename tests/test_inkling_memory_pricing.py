@@ -188,3 +188,86 @@ def test_admission_charges_a_family_its_measured_prefill_working_set():
     state = SimpleNamespace(runtime=rt)
     geometry = _AdmissionGeometry(40960, 40960, 0, 3 * 2**30, 4096)
     assert _admission_scratch_bytes(state, rows=512, prompt_tokens=4142, geometry=geometry) == (2 * 2**30, "runtime_measured")
+
+
+_CATALOG_TEXT = {"num_hidden_layers": 24, "loop_config": {"core_start": 6, "core_end": 18, "num_passes": 3},
+                 "local_layer_ids": [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22],
+                 "num_key_value_heads": 8, "head_dim": 128, "hidden_size": 2304, "sconv_kernel_size": 4,
+                 "sliding_window_size": 1024}
+_CATALOG_DRAFT = {"num_hidden_layers": 3, "local_layer_ids": [0, 2], "num_key_value_heads": 8, "head_dim": 128,
+                  "hidden_size": 2304, "sliding_window_size": 1024}
+
+
+def _checkpoint_runtime(text, draft):
+    from mtplx.models.inkling.layout import cache_footprint
+
+    rt = object.__new__(InklingRuntime)
+    rt.target_footprint = cache_footprint(text)
+    rt.draft_footprint = cache_footprint(draft, draft=True)
+    return rt
+
+
+def test_a_checkpoint_is_priced_at_what_its_snapshot_copies():
+    """Real target and drafter caches after a read longer than the window: a checkpoint copies every ring's
+    last window and every convolution tail, and none of the global KV (trimmed instead). Its price is exactly
+    those bytes; at the catalog geometry 180 MB (40 rings and 48 tails of the target, two drafter rings and
+    the drafter's feature)."""
+    import mlx.core as mx
+
+    from mtplx.cache_state import snapshot_untrimmable_cache
+    from mtplx.checkpoint_anchors import record_nbytes
+    from mtplx.models.inkling.draft import Drafter
+    from mtplx.models.inkling.layout import layer_visits
+    from mtplx.models.inkling.model import Model
+
+    text = {**_CATALOG_TEXT, "num_hidden_layers": 4, "loop_config": {"core_start": 1, "core_end": 3, "num_passes": 2},
+            "local_layer_ids": [0, 1, 3], "num_key_value_heads": 2, "head_dim": 8, "hidden_size": 16,
+            "sliding_window_size": 8}
+    draft = {**_CATALOG_DRAFT, "num_key_value_heads": 2, "head_dim": 8, "hidden_size": 16, "sliding_window_size": 8}
+    local = set(text["local_layer_ids"])
+    target = Model.make_cache(SimpleNamespace(
+        visit_order=layer_visits(text), config=text,
+        layers=[SimpleNamespace(sliding=i in local) for i in range(text["num_hidden_layers"])]))
+    drafter = Drafter.make_cache(SimpleNamespace(blocks=[
+        SimpleNamespace(window=draft["sliding_window_size"] if i in draft["local_layer_ids"] else None)
+        for i in range(draft["num_hidden_layers"])]))
+    rows, heads, dim, hidden, taps = 20, 2, 8, 16, text["sconv_kernel_size"] - 1
+
+    def kv(n):
+        return mx.ones((1, heads, n, dim), dtype=mx.bfloat16)
+
+    for attention, conv in zip(target[0::2], target[1::2]):
+        attention.update_and_fetch(kv(rows), kv(rows))  # one chunk wider than the window
+        for slot, width in enumerate((heads * dim, heads * dim, hidden, hidden)):
+            conv[slot] = mx.zeros((1, taps, width), mx.float32)
+    for attention in drafter[:-1]:
+        attention.update_and_fetch(kv(8), kv(8))  # the drafter observes at most a window at a time
+    drafter[-1][0] = mx.zeros((1, 1, hidden), mx.bfloat16)
+    snapshot = snapshot_untrimmable_cache(target + drafter)
+    rt = _checkpoint_runtime(text, draft)
+    assert record_nbytes((rows, snapshot, None)) == InklingRuntime.checkpoint_record_bytes(rt) == 7712
+    assert InklingRuntime.checkpoint_record_bytes(_checkpoint_runtime(_CATALOG_TEXT, _CATALOG_DRAFT)) == 179_999_232
+
+
+def test_a_tight_mac_keeps_two_restore_checkpoints_and_a_mac_with_room_the_shared_default():
+    from mtplx.checkpoint_anchors import AnchorPlan, retain_checkpoints
+    from mtplx.engine_session import EngineSessionManager
+
+    rt = _checkpoint_runtime(_CATALOG_TEXT, _CATALOG_DRAFT)
+    record = InklingRuntime.checkpoint_record_bytes(rt)
+    assert InklingRuntime.checkpoint_budget_bytes(rt) is None
+    assert InklingRuntime.checkpoint_budget_bytes(rt, SimpleNamespace(tight_machine=False)) is None
+    budget = InklingRuntime.checkpoint_budget_bytes(rt, SimpleNamespace(tight_machine=True))
+    assert 2 * record < budget < 3 * record
+    # A cold read of a 16,430-token prompt: every 512-row chunk edge, the tail ladder's top rung 64 tokens
+    # before the prompt end, and the prompt end.
+    records = [(p, SimpleNamespace(nbytes=record), None) for p in (*range(512, 16_129, 512), 16_365, 16_429)]
+    kept = lambda plan: [r[0] for r in retain_checkpoints(records, plan)]  # noqa: E731
+    tight = AnchorPlan(budget_bytes=budget, prompt_end=16_429)
+    assert kept(tight) == [16_365, 16_429]  # the prompt-end anchor and the newest
+    # A read that resumed at 4,096 keeps that restore point over the newest.
+    assert kept(AnchorPlan(budget_bytes=budget, prompt_end=16_429, restore_point=4096)) == [4096, 16_365]
+    assert len(kept(AnchorPlan(prompt_end=16_429))) == 8  # no budget: the shared eight
+    # The server hands the budget to the bank every prefill reads it from.
+    assert EngineSessionManager(checkpoint_budget_bytes=budget).bank.checkpoint_budget_bytes == budget
+    assert EngineSessionManager().bank.checkpoint_budget_bytes is None

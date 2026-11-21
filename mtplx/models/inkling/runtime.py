@@ -184,6 +184,32 @@ class InklingRuntime(MTPLXRuntime):
         rows = self.PROMPT_CHUNK_ROWS if rows is None else max(1, int(rows))
         return self.PREFILL_WORKING_BYTES * max(rows, self.PROMPT_CHUNK_ROWS) // self.PROMPT_CHUNK_ROWS
 
+    #: Restore checkpoints one session-bank entry keeps on a tight Mac (the plan's tight rule: the warm cache
+    #: yields fully to live KV and restores come from SSD). A checkpoint copies every window ring and every
+    #: convolution tail of the target and the drafter, about 180 MB on every pack, where a recurrent family's
+    #: is a few MB; the shared default of eight was 1.7 GB of a cold 4K prompt read and 2.0 GB of a 16K one on
+    #: Bare Speed (21 November, `mtplx serve`, with checkpoints off 1.33 and 1.97 GB of growth against 3.02 and
+    #: 3.93). Two keep the prompt-end anchor and the point the read resumed from; a Mac with room keeps the
+    #: shared default and its deeper coverage.
+    TIGHT_CHECKPOINTS = 2
+
+    def checkpoint_record_bytes(self):
+        """Bytes of one restore checkpoint: every window ring at its full window and every convolution tail,
+        target and drafter. ``snapshot_untrimmable_cache`` copies exactly these; global KV is trimmed instead."""
+        return sum(
+            part.bounded_bytes(part.window)
+            for part in (self.target_footprint, self.draft_footprint)
+            if part is not None
+        )
+
+    def checkpoint_budget_bytes(self, plan=None):
+        """The session bank's byte budget for one entry's checkpoints: ``TIGHT_CHECKPOINTS`` records (and half
+        of one, so a third never fits) on a tight Mac, else None, the shared default."""
+        if plan is None or not getattr(plan, "tight_machine", False):
+            return None
+        record = self.checkpoint_record_bytes()
+        return self.TIGHT_CHECKPOINTS * record + record // 2
+
     def prefill_window_bytes(self, prompt_tokens, new_tokens, width=None):
         if not new_tokens:
             return 0

@@ -4280,10 +4280,16 @@ class ServerState:
                 f"sudo sysctl iogpu.wired_limit_mb={math.ceil(requested_wired / 1024**2)}"
             )
         self.session_bank_cold_tier = _session_bank_cold_tier_from_args(args)
+        # Inkling 2 Mini's restore checkpoints copy every window ring (about 180 MB each), so on a
+        # tight Mac the runtime keeps fewer of them; every other family keeps the shared default.
+        _checkpoint_budget_fn = getattr(self.runtime, "checkpoint_budget_bytes", None)
         self.sessions = EngineSessionManager(
             cold_tier=self.session_bank_cold_tier,
             model_weights_bytes=_plan_weights_bytes,
             memory_plan=self.memory_plan,
+            checkpoint_budget_bytes=(
+                _checkpoint_budget_fn(self.memory_plan) if callable(_checkpoint_budget_fn) else None
+            ),
         )
         # Keep the SSD cold-tier encode (full-KV byte conversion; post-#169
         # it runs at enqueue, never on the writer thread) off request and
