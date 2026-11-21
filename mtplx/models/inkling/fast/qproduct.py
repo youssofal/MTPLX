@@ -46,11 +46,6 @@ _SMALL_ROWS = 16384
 #: 1,474 and 3,796 for the one-row products and 803 and 4,514 for MLX's own product of the rows).
 _RCH_SMALL = 8
 _RCH_LARGE = 4
-#: A bf16 panel of up to this many rows is widened to float32 inside the launch (``widen``); a wider one
-#: is cast by one launch first and read as float32, because widening in every simdgroup costs more than
-#: the cast past two rows (x1/receipts/headbench-*-2.json, Bare Speed's head: 333 against 711 µs at
-#: one row, 404 against 506 at two; level at three; slower from four rows on).
-_WIDEN_ROWS = 2
 
 QMV_ROWS = AFFINE_LANE + """
 // A lane's SPAN inputs widened to float, the values a float32 copy of the row holds (the product of a
@@ -280,8 +275,6 @@ def affine_product(x, weight, *, prove=True, widen=False, one_row=False, **tune)
     if rows == 1 and not one_row:
         return mx.quantized_matmul(x.astype(mx.float32) if widen else x, codes, scales, biases, transpose=True,
                                    group_size=group, bits=bits)
-    if widen and rows > _WIDEN_ROWS and x.dtype == mx.bfloat16:
-        x, widen = x.astype(mx.float32), False
     if x.shape[-1] != k or x.dtype not in (mx.bfloat16, mx.float32) or (widen and x.dtype != mx.bfloat16):
         count_route("refused:qproduct_input")
         raise RuntimeError("affine_product serves bf16 or float32 inputs of the matrix's width")
