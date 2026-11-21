@@ -35,6 +35,7 @@ import mlx.core as mx
 
 from .. import model as ref
 from .. import short_conv
+from ..precision import AffineWeight
 from ..attention import attend
 from ..projection import stock_messages
 from .routes import count
@@ -184,7 +185,13 @@ def attention_core(layer, q, profiles, sink, k_rows, v_rows, state, visit, panel
 def attention_output(layer, h, gate_logits, x, state, visit, panel):
     """Stage C (reference half): ``(partial float32, attention conv inputs float32)``."""
     gate = exact_sigmoid(gate_logits.astype(mx.float32))
-    attn = ref.linear((h.astype(mx.float32) * gate).astype(h.dtype), layer.out)
+    return output_projection(layer, (h.astype(mx.float32) * gate).astype(h.dtype), x, state, visit, panel)
+
+
+def output_projection(layer, hg, x, state, visit, panel):
+    """Stage C from the gated attention result: the output projection by the pack's own
+    product (16-bit or stored codes), the attention convolution and the residual."""
+    attn = ref.linear(hg, layer.out)
     partial = convolution(layer.convs[2], attn, state.tail(visit, 2), panel).astype(mx.float32)
     if not layer.boundary:
         partial = partial + x.astype(mx.float32)
@@ -236,6 +243,21 @@ REFERENCE = Stages()
 # --------------------------------------------------------------------------- lane kernels
 # Drop-ins with the reference stages' arguments and results (SIGNATURES.md section 3). Each is
 # proven against REFERENCE on the goldens and on the model before it is named in a candidate.
+# Every pack takes the same stages: where a visit's weights are a format a lane kernel does not
+# read (stored codes of an affine pack, another 16-bit type), that visit's stage runs the
+# pack's own reference product and the step counts ``fallback.<stage>.<reason>``.
+def unreadable(dtype, *weights):
+    """Why a 16-bit lane kernel cannot read these weights for a ``dtype`` stream, or None."""
+    for weight in weights:
+        if weight is None:
+            continue
+        if isinstance(weight, AffineWeight):
+            return f"packed_{weight.bits}bit"
+        if weight.dtype != dtype:
+            return "weight_dtype"
+    return None
+
+
 def fused_attention(layer, a, x, state, visit, panel):
     """Stage BC on lane L2's kernels: attention over the committed history read in place plus
     the panel's rows, gate, output projection, attention convolution, residual (class A)."""
@@ -249,6 +271,10 @@ def fused_attention(layer, a, x, state, visit, panel):
         newest = valid
     hg = panel_attend(a.q, a.rel, a.sink, a.gate_logits, a.k_rows, a.v_rows, keys, values, valid,
                       newest, panel.pos, layer.rel_basis, window=layer.sliding)
+    reason = unreadable(hg.dtype, layer.out)
+    if reason is not None:
+        count(f"fallback.bc_output.{reason}")
+        return output_projection(layer, hg, x, state, visit, panel)
     return panel_output(hg, layer.out, layer.convs[2].weight, state.tail(visit, 2), x,
                         boundary=layer.boundary)
 
@@ -257,6 +283,15 @@ def fused_attention_input(layer, x, closed, message, state, visit, panel):
     """Stage A on lane L1's kernels (two launches a visit, three on loop passes 2 and 3)."""
     from .attn_input import stage_attention_input
 
+    reason = unreadable(mx.bfloat16, x, layer.q, layer.k, layer.v, layer.r, layer.sink, layer.gate)
+    if reason is None:
+        packed = [layer.convs[0].dynamic, layer.convs[1].dynamic]
+        if message is not None:
+            packed += [c.down for c in layer.controllers[:3]]
+        reason = next((f"packed_{w.bits}bit" for w in packed if isinstance(w, AffineWeight)), None)
+    if reason is not None:
+        count(f"fallback.a.{reason}")
+        return attention_input(layer, x, closed, message, state, visit, panel)
     return stage_attention_input(layer, x, closed, message, state, visit, panel)
 
 
@@ -264,6 +299,9 @@ def fused_expert_input(layer, partial, closed, message, panel):
     """Stage D on lane L1's read kernel (one launch, two on loop passes 2 and 3)."""
     from .read import stage_expert_input
 
+    if message is not None and isinstance(layer.controllers[3].down, AffineWeight):
+        count(f"fallback.d.packed_{layer.controllers[3].down.bits}bit")
+        return expert_input(layer, partial, closed, message, panel)
     return stage_expert_input(layer, partial, closed, message, panel)
 
 

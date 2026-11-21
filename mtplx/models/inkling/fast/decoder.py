@@ -12,8 +12,13 @@ per request (``stats.inkling_fast`` in the request log), so coverage is read fro
     stages.<spec>        steps served with that set of lane kernels (``reference`` = none)
     fallback.<reason>    calls the reference code served, and why
 
+    engine.native.w<W>   steps replayed by the native engine (one command buffer)
+    engine.mlx.<reason>  steps the MLX graph served while a program records, checks or
+                         is refused; engine.decline.<reason> steps the engine never saw
+
 MTPLX_INKLING_FAST=off returns every call to the reference code (a tool, not a default).
 MTPLX_INKLING_FAST_STAGES (a comma list of a, bc, d, e) overrides the proven default set.
+MTPLX_NATIVE_ENGINE=0 serves the fast step from the MLX graph (a diagnostic rollback).
 """
 
 from __future__ import annotations
@@ -24,19 +29,26 @@ import mlx.core as mx
 from mlx_lm.models.cache import ArraysCache, KVCache
 
 from ..cache import WindowCache
+# First: the engine's compiled module loads before the weights and before any Metal kernel.
+from . import engine_site
 from .routes import count, fast_route_counts, request_receipt
 from .state import MAX_PANEL, DecodeState
-from .step import REFERENCE, decode_panel, stages_for
+from .step import REFERENCE, stages_for
 
 ENV = "MTPLX_INKLING_FAST"
-#: The lane kernels the product uses, each proven against the reference step (lanes/L0.md).
-DEFAULT_STAGES = "bc,e"
+#: The lane kernels the product uses, each proven bit for bit against the reference step
+#: (lanes/L0.md): stage A and the expert input (L1), attention core and output (L2), experts (L3).
+DEFAULT_STAGES = "a,bc,d,e"
 #: forward_one's answer when the reference forward must serve the call.
 DECLINED = object()
 
 
 def fast_mode():
     return os.environ.get(ENV, "on").strip().lower()
+
+
+def fast_enabled():
+    return fast_mode() not in ("off", "0", "stock", "reference")
 
 
 def stage_spec():
@@ -64,18 +76,18 @@ class FastDecoder:
         self._stages = {}
 
     def step(self, ids, state):
-        """The eager fast step with the proven lane kernels (reference stages off the GPU)."""
+        """The fast step with the proven lane kernels (reference stages off the GPU): replayed
+        by the native engine where a program is live, the MLX graph otherwise (same bits)."""
         spec = stage_spec() if mx.default_device() == mx.gpu and mx.metal.is_available() else ""
         stages = self._stages.get(spec)
         if stages is None:
             stages = self._stages[spec] = stages_for(spec) if spec else REFERENCE
         count(f"stages.{spec or 'reference'}")
-        return decode_panel(self.model, ids, state, stages=stages)
+        return engine_site.decode(self, ids, state, stages, spec)
 
     # ------------------------------------------------------------------ eligibility
     def decline(self, rows, cache, embeddings=None):
-        mode = fast_mode()
-        if mode in ("off", "0", "stock", "reference"):
+        if not fast_enabled():
             return "disabled"
         if embeddings is not None:
             return "embeddings"
@@ -159,7 +171,9 @@ def observe_fast_request(fn, rt, *args, **kwargs):
 
 
 def fast_health():
-    return {"mode": fast_mode(), "stages": stage_spec() or "reference", "process": fast_route_counts()}
+    return {"mode": fast_mode(), "stages": stage_spec() or "reference", "process": fast_route_counts(),
+            "engine": engine_site.health()}
 
 
-__all__ = ["DECLINED", "FastDecoder", "FastPending", "fast_health", "fast_mode", "observe_fast_request"]
+__all__ = ["DECLINED", "FastDecoder", "FastPending", "fast_enabled", "fast_health", "fast_mode",
+           "observe_fast_request"]

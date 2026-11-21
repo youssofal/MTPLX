@@ -10,7 +10,9 @@ from mtplx.runtime import MTPLXRuntime, _load_tokenizer_resilient
 
 from . import expert_fusion
 from .draft import Drafter
-from .fast.decoder import DECLINED, FastDecoder, FastPending
+from .fast import engine_site
+from .fast import round as fast_round
+from .fast.decoder import DECLINED, FastDecoder, FastPending, fast_enabled
 from .layout import cache_footprint
 from .model import load_target
 from .vision import VisionTower
@@ -37,6 +39,16 @@ class InklingRuntime(MTPLXRuntime):
         )
         # Verify panels, commits and one-token forwards go through the fast step first.
         self.fast = FastDecoder(self)
+        # Before the server reports ready: build the round's kernels, then record and check
+        # the step's program for widths 1 to 8 on a synthetic state (no request touched), so
+        # the first request neither compiles nor records.
+        self.engine_warm, self.engine_pool_bytes = {"skipped": "fast path off"}, 0
+        if fast_enabled() and mx.default_device() == mx.gpu and mx.metal.is_available():
+            fast_round.warm()
+            self.engine_warm = engine_site.warm(self)
+            # The executor's pool after warm-up (one pool serves every width's temporaries).
+            executor = engine_site.health().get("executor") or {}
+            self.engine_pool_bytes = int(executor.get("pool_bytes") or 0)
 
     def resident_kv_bytes_per_token(self):
         return self.target_footprint.full_bytes_per_token
@@ -58,12 +70,22 @@ class InklingRuntime(MTPLXRuntime):
         return "contiguous_dense_decode"
 
     def window_cache_bytes(self, width=None):
+        """The fixed part of what decode keeps besides per-token KV: the sliding rings, the
+        global banks' rounding to whole capacity steps, and the native engine's working pool."""
         rows = max(1, width or 1)
         return sum(
             part.bounded_bytes(part.window + rows - 1, rows)
             for part in (self.target_footprint, self.draft_footprint)
             if part is not None
-        )
+        ) + self.fast_fixed_bytes()
+
+    def fast_fixed_bytes(self):
+        from .fast.state import BANK_STEP
+
+        cfg = self.model.config
+        row = 2 * cfg["num_key_value_heads"] * cfg["head_dim"] * self.model.embed_tokens.weight.dtype.size
+        globals_ = sum(1 for i in self.model.visit_order if not self.model.layers[i].sliding)
+        return globals_ * BANK_STEP * row + getattr(self, "engine_pool_bytes", 0)
 
     #: Rows a chunked prompt forward reads when nobody names a width.
     PROMPT_CHUNK_ROWS = 512

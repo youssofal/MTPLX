@@ -14,7 +14,9 @@ Layout the kernels see (``SIGNATURES.md`` section 2), established by ``prepare``
   ``count = min(pos, window)`` rows are valid. A reference ``WindowCache`` stays valid
   throughout (``_idx`` is the slot after the newest row, ``offset`` the position).
 * global visit: keys/values ``(1, kv_heads, cap, head_dim)``, rows ``0 .. pos-1`` valid;
-  ``cap`` grows in ``BANK_STEP`` buckets at commit, never per token.
+  ``cap`` is a whole number of ``BANK_STEP`` rows (``prepare`` rounds a prefill's or a
+  restore's bank up once; the commit grows it a step at a time, never per token), so the
+  engine keys one program per width and capacity step, not per prompt length.
 * convolution tails ``(1, taps - 1, width)`` float32, oldest first, zeros before the
   first token, exactly as the reference keeps them.
 
@@ -92,6 +94,12 @@ class DecodeState:
             if not local and kv.keys is None:
                 shape = (1, self.heads, BANK_STEP, self.head_dim)
                 kv.keys, kv.values = mx.zeros(shape, self.dtype), mx.zeros(shape, self.dtype)
+                changed.append(visit)
+            elif not local and kv.keys.shape[2] % BANK_STEP:
+                # A prefill leaves 256-row steps and a restore the exact length: one copy into
+                # a whole capacity step, evaluated per visit (peak one bank more, not eight).
+                self._rebank(kv)
+                mx.eval(kv.keys, kv.values)
                 changed.append(visit)
             for slot, width in enumerate(self.widths[visit]):
                 if conv[slot] is None:
@@ -200,6 +208,12 @@ class DecodeState:
         keys[:, :, : self.length, :] = kv.keys[:, :, : self.length, :]
         values[:, :, : self.length, :] = kv.values[:, :, : self.length, :]
         kv.keys, kv.values = keys, values
+
+    def _rebank(self, kv):
+        """The committed rows of a global visit in a bank of whole capacity steps."""
+        if kv.keys.shape[2] < self.length:
+            raise ValueError("global cache holds fewer rows than its position needs")
+        self._grow(kv, max(self.length, 1))
 
     def arrays(self):
         out = []

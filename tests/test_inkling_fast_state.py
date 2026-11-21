@@ -135,3 +135,23 @@ def test_global_bank_grows_in_steps_and_keeps_history():
     assert mx.array_equal(kv.keys[:, :, :5], kv_rows(0, 5)[0]).item()
     with pytest.raises(ValueError):
         state.commit([delta(0, 1)], 33)
+
+
+@pytest.mark.parametrize("capacity", [None, 5, 256, BANK_STEP + 256])
+def test_prepare_rounds_global_banks_to_whole_capacity_steps(capacity):
+    """A prefill leaves 256-row steps and a restore the exact length; the engine keys programs
+    by the banks' shape, so prepare copies each bank once into whole BANK_STEP rows."""
+    model = fake_model((False, True))
+    cache = reference_cache(model, (5,))
+    kv = cache[0]
+    if capacity is not None:  # a restored bank of another capacity, same five rows
+        keys, values = kv.keys[:, :, :5], kv.values[:, :, :5]
+        kv.keys = mx.zeros((*keys.shape[:2], capacity, keys.shape[3]), keys.dtype)
+        kv.values = mx.zeros((*values.shape[:2], capacity, values.shape[3]), values.dtype)
+        kv.keys[:, :, :5], kv.values[:, :, :5] = keys, values
+    state = DecodeState(model, cache)
+    changed = state.prepare()
+    assert 0 in changed and kv.keys.shape[2] % BANK_STEP == 0 and kv.keys.shape[2] >= 5
+    assert mx.array_equal(kv.keys[:, :, :5], kv_rows(0, 5)[0]).item()
+    assert mx.array_equal(kv.values[:, :, :5], kv_rows(0, 5)[1]).item()
+    assert kv.offset == 5 and not state.prepare()

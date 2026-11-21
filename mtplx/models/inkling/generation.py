@@ -25,6 +25,7 @@ from mtplx.route_tape import RouteTape, counter_deltas
 from .copy_draft import PromptCopy, SessionPromptIndexes
 from .customer_controls import ProposalSampler, RepetitionOutput
 from .fast import draft as fast_draft
+from .fast import engine_site
 from .fast import round as fast_round
 from .protocol import completion_text
 from .sampling import draw_native, is_native_sampler
@@ -186,6 +187,9 @@ def generate(
                 "committed_rows": kept, "kv_tail_rows_trimmed": total - kept,
                 "conv_tape_slots": slots, "conv_slots_restored": slots if kept < total else 0,
                 "draft_history": "Drafter.observe",
+                # How the verify step was served: replayed natively, recording, checking, the
+                # MLX graph or declined, and why (per-round attribution for the Pulse rows).
+                "engine": engine_site.last_route(),
                 "fallback_deltas": {"prompt_copy_decline": declines} if declines else {},
                 # Host seconds. Verify includes the existing logits synchronization.
                 # Commit ends on return from the existing cache update and draft observation.
