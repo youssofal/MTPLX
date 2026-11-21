@@ -1108,11 +1108,18 @@ def warm(rt, proposals=None, *, length: int = 1100, seed: int = 20261121, temper
                 served = serve(rt, (seed + 31 * t + k) % vocab, cache, k, position=length + 1, seed=seed + k,
                                temperature=temperature, draft_temperature=draft_temperature,
                                state=None if commit else state, **extra)
+                if served is None:
+                    # A call the program declined (busy, shared state, a layout it does not take):
+                    # no timing from it, and the load carries on (the loop's pieces serve such rounds).
+                    report.setdefault("timing_declined", {})[k] = last_route().get("reason")
+                    break
                 fast_round.read_packet(served.packet, k + 1)
                 mx.eval(served.rows, served.features, [d.arrays() for d in served.pending.deltas])
-                samples.append((time.perf_counter() - t0) * 1e3)
+                if served.native:
+                    samples.append((time.perf_counter() - t0) * 1e3)
                 del served
-            round_ms[k] = _seconds(sorted(samples)[1] / 1e3) * 1e3
+            if samples:
+                round_ms[k] = _seconds(sorted(samples)[len(samples) // 2] / 1e3) * 1e3
         report["counts"][k] = {"calls": tries, "live": native > 0, "seconds": _seconds(seconds),
                                "round_ms": round_ms.get(k)}
     del state, cache, target, draft
