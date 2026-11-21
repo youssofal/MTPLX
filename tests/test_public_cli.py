@@ -2500,7 +2500,9 @@ def test_laguna_opencode_payload_uses_native_tools_and_32k_context(monkeypatch):
     assert payload["output_limit"] == 16_384
     assert payload["tool_prompt_mode"] == "native"
     assert "--tool-prompt-mode native" in payload["server_command"]
-    assert "--context-window 32768" in payload["server_command"]
+    # No window chosen: the real start passes none (the server serves the model's window as far as the Mac's
+    # memory allows and sets the client from it), so the printed command does not pin the starting 32,768.
+    assert "--context-window" not in payload["server_command"]
 
     args.context_window = 65_536
     expanded = public._quickstart_opencode_payload(args, inspection=inspection)
@@ -10380,3 +10382,23 @@ def test_hermes_sync_reads_root_config_only_when_inheriting(monkeypatch, tmp_pat
             public._sync_hermes_profile(**args)
     finally:
         root_config.chmod(0o600)
+
+
+def test_start_dry_run_says_the_server_sets_the_window(monkeypatch, tmp_path, capsys):
+    """The preview tells a user what the start does: the server sets the window when it starts (the model's,
+    as far as this Mac's memory allows) and the client is set from it, never the client's starting value."""
+    monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
+    monkeypatch.setenv("MTPLX_OPENCODE_CONFIG", str(tmp_path / "opencode.json"))
+    monkeypatch.setenv("MTPLX_OPENCODE_DESKTOP_SETTINGS_STORE", str(tmp_path / "default.dat"))
+    code = main(["start", "opencode", "--dry-run", "--json", "--model", "models/example", "--yes"])
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    window = payload["window"]
+    assert window["set_by"] == "server_at_start" and window["tokens"] is None
+    assert window["client_set_from_server"] is True
+    assert f"up to {window['model_maximum']:,} tokens" in window["note"]
+    assert "--context-window" not in payload["opencode"]["server_command"]
+    code = main(["start", "opencode", "--dry-run", "--model", "models/example", "--yes"])
+    assert code == 0
+    assert "window: The server sets the window when it starts" in capsys.readouterr().out
+
