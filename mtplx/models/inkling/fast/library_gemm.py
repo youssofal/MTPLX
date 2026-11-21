@@ -18,6 +18,8 @@ and what it includes) are left out. Parts:
   units, the K axis in order), ``NAXTile`` and ``dispatch_bool``: what the library's split-K and
   regular products run inside each simdgroup on Macs with matrix units.
 * ``"matvec"``: ``GEMVKernel`` (the library's mat-vec, ``run`` a static device function).
+* ``"elementwise"``: the library's elementwise operations (``Divide``, ``Multiply``, ``Tanh``, ...),
+  as its unary and binary launches apply them.
 
 ``product_tiles(m, n, k)`` states the library's choice of kernel and tiles for a float32 product of an
 ``(m, k)`` matrix with an ``(n, k)`` matrix transposed on this Mac's GPU family, as its dispatch makes
@@ -44,9 +46,10 @@ def _root() -> Path:
 
 
 _PARTS = {
-    "matrix_units": ("steel/gemm/gemm_nax.h",
+    "matrix_units": (("steel/gemm/gemm_nax.h",),
                      ("auto gemm_loop(", "struct NAXTile", "dispatch_bool", "MetalPerformancePrimitives")),
-    "matvec": ("gemv.h", ("struct GEMVKernel", "static METAL_FUNC void run(")),
+    "matvec": (("gemv.h",), ("struct GEMVKernel", "static METAL_FUNC void run(")),
+    "elementwise": (("binary_ops.h", "unary_ops.h"), ("struct Divide", "struct Multiply", "struct Tanh")),
 }
 
 
@@ -73,7 +76,7 @@ def _joined(entries) -> str:
 def library(*names: str) -> tuple[Optional[str], Optional[str]]:
     """The joined text of the named parts (``_PARTS``), or the reason it cannot serve."""
     try:
-        entries = [_BASE + _PARTS[name][0] for name in names]
+        entries = [_BASE + entry for name in names for entry in _PARTS[name][0]]
         text = _joined(entries)
     except KeyError as exc:
         return None, f"no library part {exc}"

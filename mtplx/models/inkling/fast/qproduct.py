@@ -30,6 +30,7 @@ lane of the calling simdgroup; ``qmv_constants(weight)`` gives its template valu
 from __future__ import annotations
 
 from functools import lru_cache
+import struct
 
 import mlx.core as mx
 
@@ -120,7 +121,7 @@ _SOURCE = """
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (row0 >= N) return;
+    if (row0 >= OUTN) return;                // rows past the output's width are not written
 
     for (uint rc = rc_begin; rc < rc_end; rc += RCH) {
         float acc[NR][RCH];
@@ -155,7 +156,7 @@ _SOURCE = """
         if (lane == 0) {
             for (uint r = 0; r < RCH && rc + r < rc_end; ++r)
                 for (uint ro = 0; ro < NR; ++ro)
-                    if (row0 + ro < N) out[size_t(rc + r) * N + row0 + ro] = static_cast<T>(acc[ro][r]);
+                    if (row0 + ro < OUTN) out[size_t(rc + r) * OUTN + row0 + ro] = static_cast<T>(FINISH(acc[ro][r]));
         }
     }
 """
@@ -173,14 +174,27 @@ _PROBE = """
 """
 
 
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=None)
 def _kernel(source):
+    if source == "capped":
+        # The soft cap as the library's own elementwise operations (its Divide, Tanh and Multiply,
+        # read from the installed headers), applied to each finished value before it is written.
+        from . import library_gemm
+
+        ops, why = library_gemm.library("elementwise")
+        if ops is None:
+            raise RuntimeError(f"no soft-capped product here: {why}")
+        finish = ("#define FINISH(v) Multiply()(Tanh()(Divide()((v), as_type<float>(uint(CAP)))), "
+                  "as_type<float>(uint(CAP)))\n")
+        return mx.fast.metal_kernel(name="mtplx_inkling_fast_qproduct_capped",
+                                    input_names=["x", "codes", "scales", "biases"], output_names=["out"],
+                                    source=_SOURCE, header=ops + QMV_ROWS + finish)
     return mx.fast.metal_kernel(
         name="mtplx_inkling_fast_qproduct" if source == "product" else "mtplx_inkling_fast_qmv_rows_probe",
         input_names=["x", "codes", "scales", "biases"],
         output_names=["out"],
         source=_SOURCE if source == "product" else _PROBE,
-        header=QMV_ROWS,
+        header=QMV_ROWS + "#define FINISH(v) (v)\n",
     )
 
 
@@ -220,7 +234,8 @@ def _same(a, b):
     return a.shape == b.shape and a.dtype == b.dtype and bool(mx.array_equal(a.view(view), b.view(view)).item())
 
 
-def _launch(x2, weight, rows, n, k, bits, group, vpt, *, threads=None, rch=None, sums=None, ysplit=None, nr=None):
+def _launch(x2, weight, rows, n, k, bits, group, vpt, *, threads=None, rch=None, sums=None, ysplit=None, nr=None,
+            width=None, cap=0.0):
     nb = k // (vpt * 32)
     small = n <= _SMALL_ROWS
     threads = threads or (_THREADS_SMALL if small else _THREADS_LARGE)
@@ -233,13 +248,17 @@ def _launch(x2, weight, rows, n, k, bits, group, vpt, *, threads=None, rch=None,
         sums = (small or _SUMS_LARGE) and lrows * nb * 32 * 4 <= 24 * 1024
     sums = bool(sums)
     rows_per_group = threads // 32 * nr
-    return _kernel("product")(
+    width = int(width or n)
+    template = [("T", x2.dtype), ("W", rows), ("K", k), ("N", n), ("BITS", bits), ("G", group), ("VPT", vpt),
+                ("RCH", rch), ("THREADS", threads), ("SUMS", sums), ("YSPLIT", ysplit), ("NR", nr), ("OUTN", width)]
+    if cap:
+        template.append(("CAP", int.from_bytes(struct.pack("<f", float(cap)), "little")))
+    return _kernel("capped" if cap else "product")(
         inputs=[x2, weight.codes, weight.scales, weight.biases],
-        template=[("T", x2.dtype), ("W", rows), ("K", k), ("N", n), ("BITS", bits), ("G", group), ("VPT", vpt),
-                  ("RCH", rch), ("THREADS", threads), ("SUMS", sums), ("YSPLIT", ysplit), ("NR", nr)],
-        grid=(-(-n // rows_per_group) * threads, -(-rows // rch) if ysplit else 1, 1),
+        template=template,
+        grid=(-(-width // rows_per_group) * threads, -(-rows // rch) if ysplit else 1, 1),
         threadgroup=(threads, 1, 1),
-        output_shapes=[(rows, n)],
+        output_shapes=[(rows, width)],
         output_dtypes=[x2.dtype],
     )[0]
 
@@ -297,6 +316,53 @@ def _proven_launch(x, weight, rows, lead, n, k, bits, group, prove, tune, count_
         if not verdict:
             raise RuntimeError("affine_product disagreed with MLX's one-row product on this Mac")
     return out.reshape(*lead, n)
+
+
+def affine_logits(x, weight, *, width=None, cap=0.0, prove=True, **tune):
+    """``affine_product(x, weight)[..., :width]`` and then, with ``cap`` (the vocabulary head's soft
+    cap), ``tanh(logits / cap) * cap``, all in the product's one launch: the cap is the library's own
+    Divide, Tanh and Multiply applied to each finished value. Every value equals, bit for bit, MLX's
+    one-row product of that row sliced and capped by MLX's launches (proven per shape on this Mac's
+    first use). Raises ``RuntimeError`` (counted) where the launch refuses; ``(..., width)`` float32
+    or bf16 as ``x``."""
+    from .attn_input import count_route
+
+    codes, scales, biases = weight.codes, weight.scales, weight.biases
+    bits, group = int(weight.bits), int(weight.group_size)
+    n, words = codes.shape
+    k = words * 32 // bits
+    width = int(width or n)
+    lead = x.shape[:-1]
+    rows = 1
+    for d in lead:
+        rows *= d
+    if x.shape[-1] != k or x.dtype not in (mx.bfloat16, mx.float32) or not 0 < width <= n:
+        count_route("refused:qlogits_input")
+        raise RuntimeError("affine_logits serves bf16 or float32 inputs of the matrix's width")
+    try:
+        vpt = qmv_constants(weight)["VPT"]
+    except RuntimeError as err:
+        count_route("refused:qlogits_" + str(err).rsplit(": ", 1)[-1])
+        raise
+    x2 = x.reshape(rows, k)
+    out = _launch(x2, weight, rows, n, k, bits, group, vpt, width=width, cap=cap, **tune)
+    if prove:
+        key = ("logits", n, k, bits, group, rows, x2.dtype, width, float(cap))
+        verdict = _verdicts.get(key)
+        if verdict is None:
+            picks = sorted({0, rows - 1})
+            want = []
+            for r in picks:
+                y = mx.quantized_matmul(x2[r:r + 1], codes, scales, biases, transpose=True, group_size=group,
+                                        bits=bits)[..., :width]
+                want.append(mx.tanh(y / cap) * cap if cap else y)
+            mx.eval(out, want)
+            verdict = all(_same(out[r:r + 1], w) for r, w in zip(picks, want))
+            _verdicts[key] = verdict
+            count_route(("proved:" if verdict else "refused:") + f"qlogits_{n}x{k}_b{bits}_w{rows}_{width}")
+        if not verdict:
+            raise RuntimeError("affine_logits disagreed with MLX's launches on this Mac")
+    return out.reshape(*lead, width)
 
 
 def qmv_rows_probe(x, weight, rows_each=4, threads=64):

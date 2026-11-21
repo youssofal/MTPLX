@@ -82,3 +82,22 @@ def test_one_row_is_mlx_own_product():
     m = _Affine(2304, 3072, 4, 64, seed=2)
     x = mx.random.normal((1, 1, 3072), key=mx.random.key(9)).astype(mx.bfloat16)
     assert _bits(affine_product(x, m), m.one_row(x))
+
+
+@needs
+@pytest.mark.parametrize("width", [1, 3, 4, 8])
+@pytest.mark.parametrize("cap", [0.0, 30.0])
+def test_head_logits_in_one_launch_equal_the_sliced_capped_product(width, cap):
+    """affine_logits: the product, the vocabulary slice and the soft cap in one launch, each value as
+    MLX's one-row product sliced and capped by MLX's own divide, tanh and multiply."""
+    from mtplx.models.inkling.fast.qproduct import affine_logits
+
+    m = _Affine(8200, 2304, 4, 64, seed=5)
+    vocab = 8137
+    x = mx.random.normal((1, width, 2304), key=mx.random.key(40 + width)).astype(mx.bfloat16).astype(mx.float32)
+    got = affine_logits(x, m, width=vocab, cap=cap)
+    assert got.shape == (1, width, vocab) and got.dtype == mx.float32
+    for r in range(width):
+        want = m.one_row(x[:, r:r + 1])[..., :vocab]
+        want = mx.tanh(want / cap) * cap if cap else want
+        assert _bits(got[:, r:r + 1], want), (width, r)
