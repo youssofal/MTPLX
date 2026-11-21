@@ -591,7 +591,7 @@ def routed_sorted(block, flat, linear, trace=None, variant=None, fast=False, inv
     rounded expert inputs exactly; an NVFP4 product's sums are exact, so the operand type cannot move
     a bit). Elsewhere MLX's argsorts, gathers and sorted products run, as in the stock body.
 
-    `fast` (the prompt read's fast route, `fast.prompt_route.prompt_fast("experts")`, off by
+    `fast` (the prompt read's fast route, `fast.prompt_route.prompt_fast("experts")`, on by
     default) changes the MXFP8 blocks only: their gate-up takes the sorted product on the
     accelerator, as NVFP4's does, instead of the one-row panel product, and both MXFP8 products
     read bfloat16 operands (the inputs and SwiGLU kernels write the rounded expert inputs in
@@ -854,9 +854,10 @@ def experts_forward(block, hidden, linear, stock, prompt=False):
             plan, refusal, out, proof = _decide(state, block, flat, linear, stock, variant)
             proofs.append(proof)
             if plan is not None:
-                if prompt and _prompt_fast("experts"):
-                    # The prompt read's fast route (off by default, not bit-identical): the
-                    # admitted route's kernels on bfloat16 operands (see `routed_sorted`).
+                if prompt and fmt == "mxfp8" and _prompt_fast("experts"):
+                    # The prompt read's fast route (on by default, class C: the MXFP8 gate-up's order
+                    # of summation): the admitted route's kernels on bfloat16 operands (see `routed_sorted`).
+                    # It changes MXFP8 blocks only, so NVFP4 blocks keep their own route and its counter.
                     state.record(_key(fmt, rows, "prompt_fast." + variant), *proofs)
                     return routed_sorted(block, flat, linear, variant=variant, fast=True).reshape(hidden.shape)
                 state.record(_key(fmt, rows, ("prompt_fused." if prompt else "fused.") + variant), *proofs)

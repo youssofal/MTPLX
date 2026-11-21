@@ -133,22 +133,29 @@ def test_the_fast_prompt_route_changes_only_the_mxfp8_gate_up_order(mode, rows):
         assert same(raw, grouped.astype(mx.bfloat16).reshape(raw.shape))
 
 
-def test_experts_forward_takes_the_fast_route_only_when_switched_on(monkeypatch):
+def test_experts_forward_takes_the_fast_route_by_default_and_when_named_not_when_left_out(monkeypatch):
     monkeypatch.delenv("MTPLX_INKLING_PROMPT_EXPERTS", raising=False)
     block = synthetic_block("mxfp8", seed=11)
     hidden = hidden_rows(512, seed=31)
     state = EF._state(block)
     fast = lambda: sum(v for k, v in state.counts.items() if ".prompt_fast." in k)
-    monkeypatch.delenv("MTPLX_INKLING_PROMPT_FAST", raising=False)
+    monkeypatch.delenv("MTPLX_INKLING_PROMPT_FAST", raising=False)  # unset: on (class accepted 21 November)
+    monkeypatch.delenv("MTPLX_FORCE_GPU_FAMILY_FALLBACK", raising=False)
+    import mtplx.nax_detect as nax
+
+    monkeypatch.setattr(nax, "nax_available", lambda: True)  # unset, it serves the Macs with the tensor units
     before = fast()
-    mx.eval(block(hidden))
-    assert fast() == before
-    monkeypatch.setenv("MTPLX_INKLING_PROMPT_FAST", "chunk")  # the chunk part alone leaves the experts
-    mx.eval(block(hidden))
-    assert fast() == before
-    monkeypatch.setenv("MTPLX_INKLING_PROMPT_FAST", "experts")
     got = block(hidden)
     want = block.stock(hidden)
     mx.eval(got, want)
     assert fast() == before + 1
     assert close(got, want) < 4e-3
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_FAST", "chunk")  # the chunk part alone leaves the experts
+    mx.eval(block(hidden))
+    assert fast() == before + 1
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_FAST", "off")
+    mx.eval(block(hidden))
+    assert fast() == before + 1
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_FAST", "experts")
+    mx.eval(block(hidden))
+    assert fast() == before + 2

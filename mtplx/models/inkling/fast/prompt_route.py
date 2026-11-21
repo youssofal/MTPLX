@@ -1,6 +1,8 @@
 """The prompt read's fast route for Inkling: wider chunks and the expert products on bfloat16 operands.
 
-``MTPLX_INKLING_PROMPT_FAST`` (off by default) is ``on`` (every part) or a comma list of:
+``MTPLX_INKLING_PROMPT_FAST`` is ``on`` (every part), ``off`` (none) or a comma list of the parts below. Unset,
+``chunk`` and ``experts`` serve: their class (the prompt read rounds differently from the one-row products) was
+accepted for the prompt read on 21 November, with their accuracy tables. The parts:
 
 * ``chunk``: the prompt read takes ``WIDE_ROWS`` (2,048) rows a forward instead of 512, on a prompt the
   attention's planes allow (``WIDE_PROMPT_TOKENS``) and a Mac with the memory for it (``WIDE_HEADROOM_BYTES``);
@@ -13,9 +15,10 @@
   rows around it; the glue kernels serve every row count; with ``chunk`` the width is then the widest that
   the Mac's memory allows (``wide_rows``), and every width gives the same cache. Implies ``experts``.
 
-Neither part is bit-identical to the default prompt read: the MXFP8 gate-up sums in the sorted product's order
-instead of the one-row product's, and a chunk boundary moves rounding in the attention calls. So the route
-stays off until its exactness class is accepted; its rows are in the lane's records.
+No part is bit-identical to the one-row products' read: the MXFP8 gate-up sums in the sorted product's order
+instead of the one-row product's (Optimized Quality's layers 20 to 23: its 2,048-row visit 8.6 ms against 63.5
+on the one-row panel kernel, `lanes/p1/pe-bench-b3ff.json`), and a chunk boundary moves rounding in the attention
+calls. ``invariant`` stays off: its class is not accepted.
 """
 
 from __future__ import annotations
@@ -28,9 +31,15 @@ PROMPT_FAST_PARTS = ("chunk", "experts", "invariant")
 
 def prompt_fast(part):
     """Whether the prompt read's fast route serves ``part`` (read per call). Unset, the read width (``chunk``)
-    is on (its class accepted on 21 November, with its accuracy table) and the other parts are off."""
+    and the MXFP8 gate-up on the tensor units (``experts``) are on (their class accepted on 21 November, with
+    their accuracy tables) and ``invariant`` is off. Unset, ``experts`` serves only a Mac with the tensor units
+    (M5), the only Macs it is measured on: M1 to M4 keep the one-row panel product unless the switch names it."""
     raw = os.environ.get(PROMPT_FAST_ENV, "").strip().lower()
     if not raw:
+        if part == "experts":
+            from mtplx.nax_detect import nax_available
+
+            return nax_available()
         return part == "chunk"
     if raw in ("0", "off", "no", "false"):
         return False
