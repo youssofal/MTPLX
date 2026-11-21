@@ -2,7 +2,8 @@
 
 ``MTPLX_INKLING_PROMPT_FAST`` (off by default) is ``on`` (every part) or a comma list of:
 
-* ``chunk``: the prompt read takes 4,096 rows a forward instead of 512;
+* ``chunk``: the prompt read takes ``WIDE_ROWS`` (2,048) rows a forward instead of 512, on a prompt the
+  attention's planes allow (``WIDE_PROMPT_TOKENS``) and a Mac with the memory for it (``WIDE_HEADROOM_BYTES``);
 * ``experts``: the MXFP8 blocks' gate-up takes the sorted product on the accelerator (MLX's grouped product,
   as the NVFP4 blocks' does) instead of the one-row panel product, both MXFP8 products on bfloat16 operands
   (the rounded expert inputs, which bfloat16 holds exactly). NVFP4 blocks are unchanged.
@@ -28,3 +29,48 @@ def prompt_fast(part):
     if raw in ("1", "on", "yes", "true", "all"):
         return True
     return part in {word.strip() for word in raw.split(",")}
+
+
+#: Rows a forward the ``chunk`` part reads. Not 4,096 while the prompt attention computes every key of its call:
+#: a window visit at 4,096 rows computes 5,119 keys a row for at most 1,024 visible, and the read is slower than
+#: at 2,048 (Optimized Quality, 4K in process: 4.77 s against 4.12 s; Bare Speed, 16K served: 805 against 965
+#: tok/s; `lanes/p1/sheet-oq-4k-2.json`, `lanes/p1/mem-bare-16k-b-20261121T162621Z.json`).
+WIDE_ROWS = 2048
+#: The longest prompt the wide width serves. The prompt attention writes bias and mask planes as tall as the
+#: chunk and as long as the context: Bare Speed's 16K read peaked 22.49 GiB at 2,048 rows against 18.31 at 512
+#: (`lanes/p1/mem-pair-bare-cand-20261121T174711Z.json`), so a longer prompt keeps 512 rows until the prompt
+#: attention stops writing them.
+WIDE_PROMPT_TOKENS = 18_432
+#: GPU memory above the loaded model a Mac needs before the wide width: the 2,048-row forward (2.0 GB in process
+#: at 4K) and the attention planes at the longest prompt it serves (4.2 GiB more than at 512 rows), with room
+#: beside them. Every 24, 32 and 36 GB Mac keeps 512 rows; the admission may still narrow any request.
+WIDE_HEADROOM_BYTES = 12 * 1024**3
+
+_headroom = {}
+
+
+def gpu_headroom_bytes():
+    """The GPU memory limit less what MLX holds, read once per process (at the first prompt read, when it holds
+    the model), so every later call (the admission's pricing and the read itself) gets the same answer."""
+    if "bytes" not in _headroom:
+        try:
+            import mlx.core as mx
+
+            info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
+            limit = int(info.get("max_recommended_working_set_size", 0))
+            _headroom["bytes"] = limit - int(mx.get_active_memory()) if limit else None
+        except Exception:  # noqa: BLE001 - no Metal device: no wide width
+            _headroom["bytes"] = None
+    return _headroom["bytes"]
+
+
+def wide_rows(prompt_tokens=None, headroom_bytes=None):
+    """The ``chunk`` part's width for a prompt of ``prompt_tokens``, or None for the default 512 rows."""
+    if not prompt_fast("chunk"):
+        return None
+    if prompt_tokens is not None and int(prompt_tokens) > WIDE_PROMPT_TOKENS:
+        return None
+    room = gpu_headroom_bytes() if headroom_bytes is None else headroom_bytes
+    if room is None or room < WIDE_HEADROOM_BYTES:
+        return None
+    return WIDE_ROWS
