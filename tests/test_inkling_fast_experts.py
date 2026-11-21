@@ -50,8 +50,19 @@ def test_unserved_names_each_reason(monkeypatch):
 
 
 def test_both_product_kernels_carry_both_formats():
-    for text in (fx.GATE_UP, fx.DOWN, fx.COMBINE, fx.INPUTS):
+    for text in (fx.GATE_UP, fx.DOWN, fx.COMBINE, fx.INPUTS, fx.PANEL):
         assert "#if FP4" in text
+    assert set(fx.PANEL_LAYOUT) == set(fx.PANEL_GEOMETRY) == {(p, f) for p in ("gu", "dn") for f in (True, False)}
+
+
+def test_panel_products_serve_two_to_eight_rows(monkeypatch):
+    monkeypatch.setattr(fx, "PRODUCTS", "auto")
+    assert [fx.products_for(w) for w in (1, 2, 4, 8, 9, 32)] == ["own", "panel", "panel", "panel", "mlx", "mlx"]
+    monkeypatch.setattr(fx, "PRODUCTS", "panel")
+    assert [fx.products_for(w) for w in (1, 8, 9)] == ["panel", "panel", "mlx"]
+    for pinned in ("mlx", "own"):
+        monkeypatch.setattr(fx, "PRODUCTS", pinned)
+        assert {fx.products_for(w) for w in (1, 4, 8)} == {pinned}
 
 
 EXPERTS = 16
@@ -99,7 +110,7 @@ def same(a, b):
 
 
 @needs_gpu
-@pytest.mark.parametrize("products", ["mlx", "own"])
+@pytest.mark.parametrize("products", ["mlx", "own", "panel"])
 @pytest.mark.parametrize("mode", ["nvfp4", "mxfp8"])
 @pytest.mark.parametrize("tie", [False, True])
 def test_bits_and_row_stability_at_every_width(mode, tie, products, monkeypatch):

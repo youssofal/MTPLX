@@ -36,6 +36,15 @@ launch carries.
 
 Kernels are pure: state is read, never written. The caller passes the MLP convolution's
 committed tail and gets back the panel's convolution input rows beside the visit output.
+
+Which products serve a width (`products_for`): one row the four launches above; 2 to 8 rows the
+panel products (`PANEL`): a route launch writes RC6's routing and a plan of the panel's distinct
+experts, then each product threadgroup takes one distinct expert and a tile of output rows and
+computes every member pair from the same decoded weights, so each distinct expert is read once
+per panel instead of once per pair (a 4-row decode panel names about 19 distinct experts for its
+32 pairs). Per pair the arithmetic is MLX's gathered product exactly, so each pair's raw product
+is MLX's bit for bit; RC6's SwiGLU and down-input rounding and the combine above are unchanged.
+9 to 32 rows take MLX's gathered product with the same glue.
 """
 
 from __future__ import annotations
@@ -673,6 +682,170 @@ COMBINE = """
 """
 
 
+# Panels of 2 to 8 rows: each distinct expert of the panel read once. A route launch writes
+# RC6's routing and a plan (distinct experts ascending; each one's member rows and pairs in row
+# order); each product threadgroup takes one (distinct expert, tile of output rows) and computes
+# every member from the same decoded weights. Per (pair, output) the arithmetic is MLX 0.32.2's
+# gathered product exactly (`fp_qmv_impl` / `fp_qmv_fast_impl` lane slices, statement forms,
+# simd_sum), so each pair's raw product equals the gathered product's bit for bit; codes are
+# decoded straight into half bit patterns (two codes a half2), the values the byte tables hold.
+PLAN_STRIDE = 18   # per slot: expert, members, member rows[8], member pairs[8]
+PANEL_ROWS = 8     # widest panel the plan describes (an expert has at most one member a row)
+
+ROUTE_PLAN = """
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    threadgroup uint pe[W * 8];
+    threadgroup uint used[128];
+    threadgroup uint slot_of[128];
+    for (uint i = tid; i < 128u; i += 256u) used[i] = 0u;
+    for (uint r = sg; r < uint(W); r += 8u) {
+        uint ex;
+        float pr;
+        l3_route_row(logits + r * 128, bias, rconsts[0], rconsts[1], lane, ex, pr);
+        if (lane < 8u) {
+            pe[r * 8 + lane] = ex;
+            experts[r * 8 + lane] = ex;
+            prob[r * 8 + lane] = pr;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < uint(W) * 8u; i += 256u) used[pe[i]] = 1u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        uint c[4];
+        uint mine = 0;
+        for (int q = 0; q < 4; ++q) {
+            c[q] = used[4 * lane + q];
+            mine += c[q];
+        }
+        uint at = simd_prefix_exclusive_sum(mine);
+        const uint total = simd_sum(mine);
+        for (int q = 0; q < 4; ++q) {
+            if (c[q] != 0u) {
+                slot_of[4 * lane + q] = at;
+                plan[1 + at * PLAN_STRIDE] = 4 * lane + q;
+                at += 1u;
+            }
+        }
+        if (lane == 0) plan[0] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint p = tid; p < uint(W) * 8u; p += 256u) {
+        const uint e = pe[p];
+        uint before = 0, after = 0;
+        for (uint q = 0; q < uint(W) * 8u; ++q) {
+            const uint same = pe[q] == e ? 1u : 0u;
+            before += q < p ? same : 0u;
+            after += q > p ? same : 0u;
+        }
+        const uint base = 1 + slot_of[e] * PLAN_STRIDE;
+        plan[base + 2 + before] = p / 8u;
+        plan[base + 10 + before] = p;
+        if (after == 0u) plan[base + 1] = before + 1u;
+    }
+"""
+
+PANEL = """
+    const uint tile = threadgroup_position_in_grid.x;
+    const uint slot = threadgroup_position_in_grid.y;
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    if (slot >= plan[0]) return;
+    const device uint* ps = plan + 1 + slot * PLAN_STRIDE;
+    const uint e = ps[0];
+    const uint M = ps[1];
+    const device uint* wexp = codes + size_t(e) * 2304 * CW;
+    const device uchar* sexp = scales + size_t(e) * 2304 * SW;
+    for (uint st = 0; st < RPS / R; ++st) {
+        const uint n0 = tile * (S * RPS) + sg * RPS + st * R;
+        for (uint m0 = 0; m0 < M; m0 += MC) {
+            const uint mc = min(uint(MC), M - m0);
+            float res[MC][R];
+            for (int m = 0; m < MC; ++m)
+                for (int q = 0; q < R; ++q) res[m][q] = 0.0f;
+            for (uint b = 0; b < NBLK; ++b) {
+#if HALF_LAST
+                if (b == NBLK - 1 && lane >= 16) break;
+#endif
+                float wv[R][NV];
+                float sv[R];
+                for (int q = 0; q < R; ++q) {
+                    const uint n = n0 + q;
+                    const uint sb = sexp[n * SW + (32 / SPL) * b + lane / SPL];
+#if FP4
+                    sv[q] = l3_e4m3(sb) * SFOLD;
+                    const uint w = wexp[n * CW + 32 * b + lane];
+                    const float2 f04 = float2(as_type<half2>(((w & 0x00070007u) << 9) | ((w & 0x00080008u) << 12)));
+                    const float2 f15 = float2(as_type<half2>(((w & 0x00700070u) << 5) | ((w & 0x00800080u) << 8)));
+                    const float2 f26 = float2(as_type<half2>(((w & 0x07000700u) << 1) | ((w & 0x08000800u) << 4)));
+                    const float2 f37 = float2(as_type<half2>(((w & 0x70007000u) >> 3) | (w & 0x80008000u)));
+                    wv[q][0] = f04.x; wv[q][1] = f15.x; wv[q][2] = f26.x; wv[q][3] = f37.x;
+                    wv[q][4] = f04.y; wv[q][5] = f15.y; wv[q][6] = f26.y; wv[q][7] = f37.y;
+#else
+                    sv[q] = l3_e8m0(sb) * SFOLD;
+                    for (int j = 0; j < WPL; ++j) {
+                        const uint w = wexp[n * CW + (32 * WPL) * b + WPL * lane + j];
+                        const float2 f02 = float2(as_type<half2>(((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8)));
+                        const float2 f13 = float2(as_type<half2>(((w & 0x7F007F00u) >> 1) | (w & 0x80008000u)));
+                        wv[q][4 * j + 0] = f02.x; wv[q][4 * j + 1] = f13.x;
+                        wv[q][4 * j + 2] = f02.y; wv[q][4 * j + 3] = f13.y;
+                    }
+#endif
+                }
+                for (uint m = 0; m < uint(MC); ++m) {
+                    if (m < mc) {
+                        const device float* xr = xin + ps[XSEL + m0 + m] * K + (32 * NV) * b + NV * lane;
+                        float xv[NV];
+                        const float4 a = *(const device float4*)xr;
+                        xv[0] = a.x; xv[1] = a.y; xv[2] = a.z; xv[3] = a.w;
+#if NV == 8
+                        const float4 c = *(const device float4*)(xr + 4);
+                        xv[4] = c.x; xv[5] = c.y; xv[6] = c.z; xv[7] = c.w;
+#endif
+                        for (int q = 0; q < R; ++q) {
+                            float accum = 0;
+#if FP4
+                            accum += (xv[0] * wv[q][0] + xv[1] * wv[q][1] + xv[2] * wv[q][2] + xv[3] * wv[q][3]);
+                            accum += (xv[4] * wv[q][4] + xv[5] * wv[q][5] + xv[6] * wv[q][6] + xv[7] * wv[q][7]);
+#else
+                            for (int i = 0; i < NV; ++i) accum += xv[i] * wv[q][i];
+#endif
+#if FOLD
+                            const float tt = sv[q] * accum;
+#else
+                            const float full = accum * POW;
+                            const float tt = sv[q] * full;
+#endif
+                            res[m][q] = res[m][q] + tt;
+                        }
+                    }
+                }
+            }
+            for (uint m = 0; m < uint(MC); ++m) {
+                if (m < mc) {
+                    const uint pair = ps[10 + m0 + m];
+                    for (int q = 0; q < R; ++q) {
+                        const float v = simd_sum(res[m][q]);
+                        if (lane == uint(q)) raw[pair * 2304 + n0 + q] = v;
+                    }
+                }
+            }
+        }
+    }
+"""
+
+# Per (product, fp4): K, words a row, scale bytes a row, values a lane, words a lane, blocks,
+# lanes per scale byte, and the power of two the decoded codes leave out (MLX's dispatch:
+# gate-up NVFP4 and both MXFP8 down use `fp_qmv_impl`, gate-up MXFP8 `fp_qmv_fast_impl`).
+PANEL_GEOMETRY = {
+    ("gu", True): dict(K=2304, CW=288, SW=144, NV=8, WPL=1, NBLK=9, SPL=2, POW="16384.0f"),
+    ("gu", False): dict(K=2304, CW=576, SW=72, NV=8, WPL=2, NBLK=9, SPL=4, POW="256.0f"),
+    ("dn", True): dict(K=1152, CW=144, SW=72, NV=8, WPL=1, NBLK=5, SPL=2, POW="16384.0f"),
+    ("dn", False): dict(K=1152, CW=288, SW=36, NV=4, WPL=1, NBLK=9, SPL=8, POW="256.0f"),
+}
+
 def _header(extra=""):
     return expert_fusion.HEADER + "constexpr constant int THREADS = 384;\n" + _HELPERS + extra
 
@@ -777,29 +950,104 @@ def _mlx_products(block, fp4, rows, logits, values, outer):
     return raw2.reshape(pairs, HIDDEN), (mid_outer[0] if fp4 else None), experts, prob
 
 
+# Threadgroup layout of the panel products per (product, fp4): S simdgroups, RPS output rows a
+# simdgroup, R rows a step, MC members a pass, FOLD the scale times the codes' left-out power of
+# two (one multiply fewer a product; the same real product, rounded once). Measured on real
+# routing, cold weights (lanes/l2/xbench-*.json).
+PANEL_LAYOUT = {
+    ("gu", True): dict(S=4, RPS=2, R=2, MC=4, FOLD=1),
+    ("dn", True): dict(S=4, RPS=2, R=2, MC=4, FOLD=1),
+    ("gu", False): dict(S=4, RPS=2, R=2, MC=4, FOLD=1),
+    ("dn", False): dict(S=4, RPS=2, R=2, MC=4, FOLD=1),
+}
+
+
+@lru_cache(maxsize=None)
+def _panel_kernel(product, fp4, fold):
+    g = PANEL_GEOMETRY[(product, fp4)]
+    defines = {"FP4": int(fp4), "NV": g["NV"], "WPL": g["WPL"], "NBLK": g["NBLK"],
+               "HALF_LAST": int(product == "dn" and fp4), "CW": g["CW"], "SW": g["SW"], "SPL": g["SPL"],
+               "K": g["K"], "POW": g["POW"], "XSEL": 2 if product == "gu" else 10, "PLAN_STRIDE": PLAN_STRIDE,
+               "FOLD": int(fold), "SFOLD": (g["POW"] if fold else "1.0f")}
+    extra = "".join(f"#define {k} {v}\n" for k, v in defines.items())
+    name = f"mtplx_inkling_panel_{product}_{'nvfp4' if fp4 else 'mxfp8'}_f{int(fold)}"
+    return mx.fast.metal_kernel(name=name, input_names=["plan", "xin", "codes", "scales"], output_names=["raw"],
+                                source=PANEL, header=_header(extra), ensure_row_contiguous=True)
+
+
+@lru_cache(maxsize=None)
+def _route_plan_kernel():
+    return mx.fast.metal_kernel(name="mtplx_inkling_panel_route_plan", input_names=["logits", "bias", "rconsts"],
+                                output_names=["experts", "prob", "plan"], source=ROUTE_PLAN,
+                                header=_header(f"#define PLAN_STRIDE {PLAN_STRIDE}\n"), ensure_row_contiguous=True)
+
+
+def _panel_raw(product, fp4, plan, xin, codes, scales, rows, layout=None):
+    lay = layout or PANEL_LAYOUT[(product, fp4)]
+    tgr = lay["S"] * lay["RPS"]
+    return _panel_kernel(product, fp4, lay.get("FOLD", 1))(
+        inputs=[plan, xin, codes, scales],
+        template=[("S", lay["S"]), ("RPS", lay["RPS"]), ("R", lay["R"]), ("MC", lay["MC"])],
+        grid=((HIDDEN // tgr) * 32 * lay["S"], min(TOP_K * rows, EXPERTS), 1), threadgroup=(32 * lay["S"], 1, 1),
+        output_shapes=[(rows * TOP_K, HIDDEN)], output_dtypes=[mx.float32],
+    )[0]
+
+
+@lru_cache(maxsize=None)
+def _pair_rows(rows):
+    return mx.repeat(mx.arange(rows, dtype=mx.uint32), TOP_K)
+
+
+def _panel_products(block, fp4, rows, logits, values, outer, layouts=None):
+    """Route + plan, gate-up products, RC6's SwiGLU and down-input rounding, down products
+    (4 launches), each distinct expert of the panel read once."""
+    pairs = rows * block.count
+    experts, prob, plan = _route_plan_kernel()(
+        inputs=[logits, block.bias, _route_consts(float(block.scale))],
+        template=[("W", rows)], grid=(256, 1, 1), threadgroup=(256, 1, 1),
+        output_shapes=[(pairs,), (pairs,), (1 + EXPERTS * PLAN_STRIDE,)],
+        output_dtypes=[mx.uint32, mx.float32, mx.uint32],
+    )
+    lay = layouts or {}
+    raw13 = _panel_raw("gu", fp4, plan, values, block.gate_up.codes, block.gate_up.scales, rows, lay.get("gu"))
+    mid, *mid_outer = expert_fusion._kernel("swiglu", fp4, _caps(float(block.gate_cap), float(block.up_cap)))(
+        inputs=[raw13, *([outer, block.gate_up.outer] if fp4 else []), experts, _pair_rows(rows)],
+        template=[("T", mx.bfloat16), ("W", MIDDLE), ("E", MIDDLE // expert_fusion.THREADS)],
+        grid=(pairs * expert_fusion.THREADS, 1, 1), threadgroup=(expert_fusion.THREADS, 1, 1),
+        output_shapes=[(pairs, 1, MIDDLE), *([(pairs,)] if fp4 else [])],
+        output_dtypes=[mx.float32] * (2 if fp4 else 1),
+    )
+    raw2 = _panel_raw("dn", fp4, plan, mid.reshape(pairs, MIDDLE), block.down.codes, block.down.scales, rows,
+                      lay.get("dn"))
+    return raw2, (mid_outer[0] if fp4 else None), experts, prob
+
+
 #: Which expert products serve a panel (all exact, class A):
-#:   "auto" (default): one row takes the block's own products (4 launches; 106 against 112 us a
-#:   visit for MLX's on FP4), two or more rows take MLX's gathered product with fused glue
-#:   (6 launches; the block's own products lose at 4 and 8 rows because the GPU cache already
-#:   absorbs the experts a panel repeats, raw/l3-bench-3.json);
-#:   "mlx" or "own" pin one for every width.
+#:   "auto" (default): one row takes the block's own products (4 launches); 2 to 8 rows the panel
+#:   products, each distinct expert read once with every member computed from the same decoded
+#:   weights (6 launches); 9 to 32 rows MLX's gathered product with fused glue (6 launches).
+#:   "mlx", "own" or "panel" pin one ("panel" for 1 to 8 rows; wider panels take "mlx").
 PRODUCTS = os.environ.get("MTPLX_INKLING_FAST_EXPERT_PRODUCTS", "auto").lower()
 
 
 def products_for(rows):
     if PRODUCTS in ("mlx", "own"):
         return PRODUCTS
-    return "own" if rows == 1 else "mlx"
+    if PRODUCTS == "panel":
+        return "panel" if rows <= PANEL_ROWS else "mlx"
+    return "own" if rows == 1 else "panel" if rows <= PANEL_ROWS else "mlx"
 
 
 def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *, eps, conv_form=0, trace=None,
-                       tiles=None, stop_after=None, products=None):
+                       tiles=None, stop_after=None, products=None, panel_layouts=None):
     """Shapes: source/partial (1, W, 2304) float32, tail (1, 3, 2304) float32.
 
     Returns (out bf16 (1, W, 2304), conv_rows float32 (1, W, 2304)).
     """
     products = products or products_for(source.shape[-2])
     rows = source.shape[-2]
+    if products == "panel" and rows > PANEL_ROWS:
+        products = "mlx"
     fp4 = block.gate_up.mode == "nvfp4"
     tl = DEFAULT_TILES if tiles is None else {**DEFAULT_TILES, **tiles}
     src = source.reshape(rows, HIDDEN)
@@ -818,8 +1066,13 @@ def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *
     if stop_after == "inputs":
         return logits, values
     dn = block.down
-    if products == "mlx":
-        raw, mid_outer_m, experts, prob = _mlx_products(block, fp4, rows, logits, values, outer[0] if fp4 else None)
+    if products in ("mlx", "panel"):
+        if products == "panel":
+            raw, mid_outer_m, experts, prob = _panel_products(block, fp4, rows, logits, values,
+                                                              outer[0] if fp4 else None, panel_layouts)
+        else:
+            raw, mid_outer_m, experts, prob = _mlx_products(block, fp4, rows, logits, values,
+                                                            outer[0] if fp4 else None)
         mid_outer = [mid_outer_m] if fp4 else []
         h = peaks = None
         return _combine(fp4, rows, raw, mid_outer, experts, prob, dn, conv_weight, tail, part, conv_form, source,
