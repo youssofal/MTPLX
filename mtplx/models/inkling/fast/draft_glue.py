@@ -178,11 +178,12 @@ def add_norm(a, b, gain, eps: float):
 
 # --------------------------------------------------------------------------- the MLP's gate
 _GATE = """
-    const uint i = thread_position_in_grid.x;
-    if (i >= N) return;
-    const float g = static_cast<float>(gate[i]);
-    const float u = static_cast<float>(up[i]);
-    out[i] = static_cast<T>(Multiply{}(Multiply{}(g, Sigmoid{}(g)), u));
+    // silu(g) * u in float32 (the library's Sigmoid and Multiply), rounded once to the drafter's type.
+    const uint e = thread_position_in_grid.x;
+    if (e >= N) return;
+    const float g = static_cast<float>(gate[e]), u = static_cast<float>(up[e]);
+    const float act = Multiply{}(Multiply{}(g, Sigmoid{}(g)), u);
+    gated[e] = static_cast<T>(act);
 """
 
 
@@ -190,7 +191,7 @@ _GATE = """
 def _gate_kernel():
     text, _why = _library()
     return mx.fast.metal_kernel(name="mtplx_inkling_f1_gate_act", input_names=["gate", "up"],
-                                output_names=["out"], source=_GATE, header=text)
+                                output_names=["gated"], source=_GATE, header=text)
 
 
 def gate_act(gate, up):
