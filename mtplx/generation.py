@@ -1992,9 +1992,12 @@ def _with_inkling_attention_receipt(fn):
             def attended(rt, *args, **kwargs):
                 return observe_attention_request(fast, rt, *args, **kwargs)
 
-            # The model's own prompt width, unless the request or the user named one.
+            # The model's own prompt width for this prompt (its length decides it, as it did when the
+            # admission priced the request), unless the request or the user named one.
             rows = getattr(rt, "prompt_chunk_rows", None)
-            width = rows() if callable(rows) else current_prefill_chunk_override()
+            prompt = args[0] if args else kwargs.get("prompt_ids")
+            prompt_tokens = len(prompt) if hasattr(prompt, "__len__") else None
+            width = rows(prompt_tokens) if callable(rows) else current_prefill_chunk_override()
             with prefill_chunk_size_override(width), observe_projection_routes() as projections:
                 output = observe_expert_request(attended, rt, *args, **kwargs)
                 output.stats.inkling_projections = dict(projections)

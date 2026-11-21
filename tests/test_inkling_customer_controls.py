@@ -98,8 +98,10 @@ class InklingCustomerControls(TestCase):
                           stats.repetition_stop_block_tokens, stats.repetition_stop_repeats), (10, 9, 1, 9))
 
     def test_the_request_stats_carry_the_prompt_width_in_force(self):
-        self.rt.prompt_chunk_rows = lambda: 512  # the model's own width
+        lengths = []  # the model's own width, which it picks from the prompt's length
+        self.rt.prompt_chunk_rows = lambda prompt_tokens=None: lengths.append(prompt_tokens) or 512
         self.assertEqual(self.decode().stats.prefill_chunk_size, 512)
+        self.assertEqual(lengths, [1])  # decode() sends a one-token prompt
         del self.rt.prompt_chunk_rows
         with api.prefill_chunk_size_override(1024):  # a width the request carries
             self.assertEqual(self.decode().stats.prefill_chunk_size, 1024)

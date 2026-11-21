@@ -266,13 +266,16 @@ class InklingRuntime(MTPLXRuntime):
             current_prefill_chunk_override,
         )
 
+        from .fast.prompt_route import wide_rows
+
         if (
             current_prefill_chunk_override() is not None
             or _prefill_chunk_env_is_pinned()
             or not _sustained_prefill_enabled()
         ):
             return _prefill_chunk_size(prompt_tokens)
-        return self.PROMPT_CHUNK_ROWS
+        # The prompt read's fast route (off by default) reads 2,048 rows a chunk where the prompt and the Mac allow.
+        return wide_rows(prompt_tokens) or self.PROMPT_CHUNK_ROWS
 
     #: One 512-row prompt forward's working memory beyond what decode keeps and the read's restore checkpoints,
     #: measured through `mtplx serve` on Bare Speed under a simulated 24 GB budget (21 November, `m1-new-a`, the

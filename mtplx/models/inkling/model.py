@@ -13,6 +13,8 @@ from .attention import attend
 from .cache import WindowCache
 from .activations import expert_inputs
 from . import expert_fusion
+from .fast import prompt_gemm, prompt_glue, prompt_loop
+from .fast.prompt_route import HAND_OVER_VISITS, asynchronous, invariant_sums
 from .head import fits_route, measured_route, note_route, pack_proofs, vocabulary_logits
 from .layout import layer_visits
 from .precision import AffineWeight, packed_logical_shape, source_modes
@@ -105,6 +107,23 @@ cross_pass_message = (
 )
 
 
+def shared_linear(x, weights, where, tape=None):
+    """``[linear(x, w) for w in weights]``. At a prompt chunk the stored 16-bit matrices among them run as one
+    launch of ours with MLX's sums (``fast/prompt_gemm.py``, admitted per shape); the rest as before."""
+    if tape is not None or (x.size // x.shape[-1] < prompt_gemm.PROMPT_MIN_ROWS and not invariant_sums()):
+        return [linear(x, w) for w in weights]
+    plain = [i for i, w in enumerate(weights) if isinstance(w, mx.array) and w.dtype == x.dtype]
+    got = dict(zip(plain, prompt_gemm.project(x, [weights[i] for i in plain], where))) if plain else {}
+    if invariant_sums():
+        # the width-independent read: stored-code matrices on our launch too (MLX's splits its sums on some shapes)
+        from .fast import prompt_experts
+
+        for i, w in enumerate(weights):
+            if i not in got and isinstance(w, AffineWeight) and prompt_experts.affine_unserved(x, w) is None:
+                got[i] = prompt_experts.affine_product(x, w)
+    return [got[i] if i in got else linear(x, w) for i, w in enumerate(weights)]
+
+
 def norm(x, weight, eps):
     return mx.fast.rms_norm(x.astype(mx.float32), weight, eps)
 
@@ -168,10 +187,10 @@ class Controller(nn.Module):
         x = x.astype(mx.float32)
         message = message.astype(mx.float32)
         mixed = mx.concatenate([norm(x, None, eps), norm(message, None, eps)], axis=-1)
-        state = linear(mixed.astype(self.down.dtype), self.down).astype(mx.float32)
-        return (1 - mx.tanh(linear(state, self.forget))) * x + mx.tanh(
-            linear(state, self.gain)
-        ) * message
+        (state,) = shared_linear(mixed.astype(self.down.dtype), [self.down], "controller_down")
+        state = state.astype(mx.float32)
+        forget, gain = shared_linear(state, [self.forget, self.gain], "controller_mix")
+        return (1 - mx.tanh(forget)) * x + mx.tanh(gain) * message
 
 
 def use_sorted_expert_inputs():
@@ -299,10 +318,11 @@ class Experts(nn.Module):
         self.gate_cap = config["mlp_gate_softcap"]
         self.up_cap = config["mlp_up_softcap"]
 
-    def __call__(self, hidden):
+    def __call__(self, hidden, prompt=False):
         # 1-32 rows take four fused kernels around the same router matmul, sigmoid and
         # quantized gathers once proven on this Mac (class A); the rest runs the stock body.
-        return expert_fusion.experts_forward(self, hidden, linear, self.stock)
+        # `prompt`: a prompt chunk's call (the width-independent prompt read serves every row count).
+        return expert_fusion.experts_forward(self, hidden, linear, self.stock, prompt=prompt)
 
     def stock(self, hidden):
         flat = hidden.reshape(-1, hidden.shape[-1])
@@ -343,10 +363,12 @@ class Convolution(nn.Module):
         ).astype(mx.float32)
         self.size = self.weight.shape[0]
 
-    def __call__(self, x, cache, slot, drive=None, tape=None):
+    def __call__(self, x, cache, slot, drive=None, tape=None, add=None, out_dtype=None):
+        """The convolution's output; with ``out_dtype`` also the visit's residual step after it:
+        ``(out.astype(float32) + add.astype(float32)).astype(out_dtype)`` (``add`` optional)."""
         size = self.size
         change = None if self.dynamic is None else linear(drive, self.dynamic)
-        fused = convolve(x, cache[slot], self.weight, change, tape is not None)
+        fused = convolve(x, cache[slot], self.weight, change, tape is not None, add, out_dtype)
         if fused is not None:
             out, cache[slot], history = fused
             if tape is not None:
@@ -386,7 +408,13 @@ class Convolution(nn.Module):
                 weighted = weighted + current * coefficients
             weighted = weighted.reshape(x.shape)
             divisor = math.sqrt(2 * size + 1)
-        return ((xf + weighted) / divisor).astype(x.dtype)
+        out = ((xf + weighted) / divisor).astype(x.dtype)
+        if out_dtype is None:
+            return out
+        joined = out.astype(mx.float32)
+        if add is not None:
+            joined = joined + add.astype(mx.float32)
+        return joined.astype(out_dtype)
 
 
 class Layer(nn.Module):
@@ -442,53 +470,91 @@ class Layer(nn.Module):
         cfg = self.cfg
         shape = (*q_input.shape[:2], self.q_scale.shape[0])
         width = self.q_scale.shape[-1]
-        q = clip_heads(
-            linear(q_input, self.q).reshape(*shape, width),
-            cfg["qk_l2_clip_threshold"],
-            self.q_scale,
-        )
-        rel = clip_heads(
-            linear(q_input, self.r).reshape(*shape, -1),
-            cfg["rel_l2_clip_threshold"],
-            self.r_scale,
-        )
-        k = self.convs[0](linear(k_input, self.k), conv, 0, k_input, tape)
-        v = self.convs[1](linear(v_input, self.v), conv, 1, v_input, tape)
-        k = clip_heads(k.reshape(*k.shape[:2], -1, width), cfg["qk_l2_clip_threshold"])
-        v = v.reshape(*v.shape[:2], -1, width)
-        if cfg["use_value_norm_no_gamma"]:
-            v = norm(v, None, self.eps).astype(v_input.dtype)
-        if not self.sliding:
-            pos = mx.arange(q_input.shape[1]) + kv.offset + 1
-            tau = 1 + cfg["log_scaling_alpha"] * mx.log(
-                mx.maximum(pos / cfg["log_scaling_n_floor"], 1)
+        if q_input is k_input and k_input is v_input:
+            q_lin, r_lin, sink, gate_lin, k_lin, v_lin = shared_linear(
+                q_input, [self.q, self.r, self.sink, self.gate, self.k, self.v], "visit_projections", tape
             )
-            q = (q.astype(mx.float32) * tau[:, None, None]).astype(q.dtype)
-            rel = (rel.astype(mx.float32) * tau[:, None, None]).astype(rel.dtype)
-        k, v = kv.update_and_fetch(k.transpose(0, 2, 1, 3), v.transpose(0, 2, 1, 3))
-        if self.sliding:
-            k, v = kv._temporal_order(k), kv._temporal_order(v)
+        else:
+            q_lin, r_lin, sink, gate_lin = shared_linear(
+                q_input, [self.q, self.r, self.sink, self.gate], "query_projections", tape
+            )
+            (k_lin,) = shared_linear(k_input, [self.k], "key_projection", tape)
+            (v_lin,) = shared_linear(v_input, [self.v], "value_projection", tape)
+        k_conv = self.convs[0](k_lin, conv, 0, k_input, tape)
+        v_conv = self.convs[1](v_lin, conv, 1, v_input, tape)
+        # A prompt chunk's clips, value norm and position scale run as one launch of ours, same bits.
+        joined = (
+            prompt_glue.heads(self, q_lin, r_lin, k_conv, v_conv, kv.offset)
+            if tape is None
+            else None
+        )
+        if joined is not None:
+            q, rel, k, v = joined
+        else:
+            q = clip_heads(q_lin.reshape(*shape, width), cfg["qk_l2_clip_threshold"], self.q_scale)
+            rel = clip_heads(r_lin.reshape(*shape, -1), cfg["rel_l2_clip_threshold"], self.r_scale)
+            k = clip_heads(k_conv.reshape(*k_conv.shape[:2], -1, width), cfg["qk_l2_clip_threshold"])
+            v = v_conv.reshape(*v_conv.shape[:2], -1, width)
+            if cfg["use_value_norm_no_gamma"]:
+                v = norm(v, None, self.eps).astype(v_input.dtype)
+            if not self.sliding:
+                pos = mx.arange(q_input.shape[1]) + kv.offset + 1
+                tau = 1 + cfg["log_scaling_alpha"] * mx.log(
+                    mx.maximum(pos / cfg["log_scaling_n_floor"], 1)
+                )
+                q = (q.astype(mx.float32) * tau[:, None, None]).astype(q.dtype)
+                rel = (rel.astype(mx.float32) * tau[:, None, None]).astype(rel.dtype)
         window = cfg["sliding_window_size"] if self.sliding else 0
-        h = (
-            attend(
-                q.transpose(0, 2, 1, 3),
+        query, k_rows, v_rows = q.transpose(0, 2, 1, 3), k.transpose(0, 2, 1, 3), v.transpose(0, 2, 1, 3)
+        profiles = rel @ self.rel_basis.astype(rel.dtype)
+        heads_first = None
+        if tape is None and q_input.shape[1] > 32:
+            # A prompt chunk's cache write and attention on our launches where they read faster
+            # (fast.prompt_flash.stage: chosen per prompt, counted); the inputs and the gate stay the layer's.
+            from .fast.prompt_flash import stage
+
+            heads_first = stage(self, query, k_rows, v_rows, profiles, sink, kv)
+        if heads_first is None:
+            k, v = kv.update_and_fetch(k_rows, v_rows)
+            if self.sliding:
+                k, v = kv._temporal_order(k), kv._temporal_order(v)
+            heads_first = attend(
+                query,
                 k,
                 v,
-                rel @ self.rel_basis.astype(rel.dtype),
-                linear(q_input, self.sink),
+                profiles,
+                sink,
                 window,
                 **({"verify": True} if tape is not None else {}),
             )
-            .transpose(0, 2, 1, 3)
-            .reshape(*q_input.shape[:2], -1)
-        )
-        gate = mx.sigmoid(linear(q_input, self.gate).astype(mx.float32))
-        return linear((h.astype(mx.float32) * gate).astype(h.dtype), self.out)
+        # A prompt chunk's output gate runs as one launch of ours reading attend's output in place, same bits.
+        gated = prompt_glue.output_gate(heads_first, gate_lin) if tape is None else None
+        if gated is None:
+            h = heads_first.transpose(0, 2, 1, 3).reshape(*q_input.shape[:2], -1)
+            gate = mx.sigmoid(gate_lin.astype(mx.float32))
+            gated = (h.astype(mx.float32) * gate).astype(h.dtype)
+        (out,) = shared_linear(gated, [self.out], "output_projection", tape)
+        return out
 
     def __call__(self, x, closed, kv, conv, messages=None, tape=None):
         read_depth = depth_reader(tape, x.shape[1])
+        # A prompt chunk's one-query read and its norm run as one launch of ours, same bits.
+        fused_in = (
+            prompt_glue.input_norm(x, closed, self.attn_query, self.qkv_norm[0], self.eps,
+                                   "attention_input", stand_in=self.experts.router)
+            if tape is None and self.sliding and messages is None and self.cfg["attn_res_normalize_values"]
+            else None
+        )
+        # Passes two and three: the read, the three controllers and the norms as our launches, same bits.
+        looped = (
+            prompt_loop.visit_inputs(self, x, closed, messages)
+            if tape is None and fused_in is None and messages is not None
+            else None
+        )
         read = (
-            read_depth(
+            None
+            if fused_in is not None or looped is not None
+            else read_depth(
                 closed,
                 x,
                 self.attn_query,
@@ -498,7 +564,18 @@ class Layer(nn.Module):
             if self.attn_query is not None
             else x[..., None, :]
         )
-        if self.sliding and messages is None:
+        normed = (
+            prompt_loop.global_norms(self, read, x.dtype)
+            if tape is None and read is not None and not self.sliding and messages is None
+            else None
+        )
+        if fused_in is not None:
+            q = k = v = fused_in
+        elif looped is not None:
+            q, k, v = looped
+        elif normed is not None:
+            q, k, v = normed
+        elif self.sliding and messages is None:
             q = k = v = norm(read[..., 0, :], self.qkv_norm[0], self.eps).astype(
                 x.dtype
             )
@@ -516,24 +593,32 @@ class Layer(nn.Module):
                 for i, h in enumerate(sources)
             ]
         attn = self.attention(q, k, v, kv, conv, tape)
-        residual = self.convs[2](attn, conv, 2, tape=tape).astype(mx.float32)
+        # The attention convolution and the residual join in one launch where the convolution is ours.
+        residual = self.convs[2](
+            attn, conv, 2, tape=tape, add=None if self.boundary else x, out_dtype=mx.float32
+        )
         if self.boundary:
             closed.append(x)
-        else:
-            residual = residual + x.astype(mx.float32)
-        ffn = read_depth(
-            closed,
-            residual,
-            self.mlp_query,
-            self.eps,
-            self.cfg["attn_res_normalize_values"],
-        )[..., 0, :]
-        if messages is not None:
-            ffn = self.controllers[3](ffn, messages[..., 3, :], self.eps)
-        routed = self.experts(norm(ffn, self.ffn_norm, self.eps).astype(x.dtype))
-        return (
-            residual + self.convs[3](routed, conv, 3, tape=tape).astype(mx.float32)
-        ).astype(x.dtype)
+        ffn_in = (
+            prompt_glue.input_norm(residual, closed, self.mlp_query, self.ffn_norm, self.eps, "expert_input")
+            if tape is None and messages is None and self.cfg["attn_res_normalize_values"]
+            else prompt_loop.expert_input(self, residual, closed, messages, x.dtype)
+            if tape is None and messages is not None
+            else None
+        )
+        if ffn_in is None:
+            ffn = read_depth(
+                closed,
+                residual,
+                self.mlp_query,
+                self.eps,
+                self.cfg["attn_res_normalize_values"],
+            )[..., 0, :]
+            if messages is not None:
+                ffn = self.controllers[3](ffn, messages[..., 3, :], self.eps)
+            ffn_in = norm(ffn, self.ffn_norm, self.eps).astype(x.dtype)
+        routed = self.experts(ffn_in, prompt=tape is None)
+        return self.convs[3](routed, conv, 3, tape=tape, add=residual, out_dtype=x.dtype)
 
 
 class Embedding(nn.Module):
@@ -624,6 +709,9 @@ class Model(nn.Module):
             )
         closed, captured = [], {}
         x = self.embed_tokens(ids) if embeddings is None else embeddings
+        # A prompt chunk hands its work to the GPU every few visits, so the GPU starts while Python builds the rest
+        # (fast/prompt_route: same graph and kernels; MTPLX_INKLING_PROMPT_SYNC=1 keeps one evaluation at the end).
+        every = HAND_OVER_VISITS if tapes is None and x.shape[1] > 32 and asynchronous() else 0
         for visit, index in enumerate(self.visit_order):
             if index == self.start:
                 if visit == self.start:
@@ -646,14 +734,22 @@ class Model(nn.Module):
             x = self.layers[index](
                 x, closed, cache[2 * visit], cache[2 * visit + 1], message, tape
             )
-        last = depth_reader(tapes, x.shape[1])(
-            closed,
-            x,
-            self.final_query,
-            self.eps,
-            self.config["attn_res_normalize_values"],
-        )[..., 0, :]
-        hidden = norm(last, self.final_norm, self.eps).astype(x.dtype)
+            if every and (visit + 1) % every == 0 and visit + 1 < len(self.visit_order):
+                mx.async_eval(x)
+        hidden = (
+            prompt_glue.input_norm(x, closed, self.final_query, self.final_norm, self.eps, "final_norm")
+            if tapes is None and self.config["attn_res_normalize_values"]
+            else None
+        )
+        if hidden is None:
+            last = depth_reader(tapes, x.shape[1])(
+                closed,
+                x,
+                self.final_query,
+                self.eps,
+                self.config["attn_res_normalize_values"],
+            )[..., 0, :]
+            hidden = norm(last, self.final_norm, self.eps).astype(x.dtype)
         if len(self.visit_order) in capture_ids:
             captured[len(self.visit_order)] = hidden
         return hidden, [captured[i] for i in capture_ids]
