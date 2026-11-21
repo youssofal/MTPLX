@@ -43,7 +43,7 @@ def test_reuse_is_scoped_and_edits_rebuild():
 
 
 def test_bounds_and_nonmutating_grammar():
-    p = PromptCopy(list(range(24)), session_id=None, verify_rows=50, image_pad=8)
+    p = PromptCopy(list(range(24)), session_id=None, verify_rows=8, image_pad=8)
     assert p.propose([1, 2, 3], 25) == [4, 5, 6, 7]
     assert p.propose([6, 7], 25) is None
     assert p.declines == {"image_embedding_position": 1}
@@ -305,3 +305,18 @@ def test_public_receipts_expose_copy_declines_and_distinguish_active_kv_from_ssd
     assert not _health_inkling_cache_payload(state)["inkling_cache"][
         "ssd_session_snapshots_enabled"
     ]
+
+
+def test_the_fast_steps_width_verifies_longer_copied_runs():
+    """RC6's verify path covers an anchor plus seven proposals; the fast step verifies up to
+    32 rows with every row equal to the one-row step, so a proven copy run is offered whole
+    (up to the copy lane's own block cap) instead of in pieces of seven."""
+    prompt = list(range(200))
+    narrow = PromptCopy(prompt, session_id=None, verify_rows=8)
+    wide = PromptCopy(prompt, session_id=None, verify_rows=32)
+    for lane in (narrow, wide):
+        for _ in range(3):  # three fully accepted rounds lift the probation cap
+            lane.observe(8, 8, 50, 0.0)
+    history = list(range(40))  # the prompt's own continuation: a long match
+    assert len(narrow.propose(history, 100)) == 7 and narrow.limits["verify_geometry"] == 1
+    assert len(wide.propose(history, 100)) > 7 and not wide.limits["verify_geometry"]

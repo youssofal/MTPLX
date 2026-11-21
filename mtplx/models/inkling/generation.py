@@ -23,12 +23,13 @@ from mtplx.generation import (
     restore_or_prefill_prompt_state,
 )
 from mtplx.route_tape import RouteTape, counter_deltas
-from mtplx.sampling import client_controls, non_finite_logits_error
+from mtplx.sampling import client_controls
 from .copy_draft import PromptCopy, SessionPromptIndexes
 from .customer_controls import ProposalSampler, RepetitionOutput
 from .fast import draft as fast_draft
 from .fast import engine_site
 from .fast.decoder import fast_enabled
+from .fast.state import MAX_PANEL
 from .fast.routes import count
 from .fast import round as fast_round
 from .protocol import completion_text
@@ -171,7 +172,10 @@ def generate(
         RepetitionOutput(token_callback, stop) if repetition_stop and constraint is None else None
     )
     copy = PromptCopy(
-        prompt_ids, session_id=session_id, verify_rows=rt.drafter.width,
+        # The fast step verifies up to 32 rows, every row equal to the one-row step, so a long
+        # copied run is verified in one round; RC6's path keeps the drafter's 8-row block.
+        prompt_ids, session_id=session_id,
+        verify_rows=(MAX_PANEL if fast_enabled() and getattr(rt, "fast", None) is not None else rt.drafter.width),
         image_pad=getattr(vision_splice, "image_pad_token_id", None),
         indexes=SessionPromptIndexes.for_runtime(rt) if session_id else None,
     )
@@ -349,8 +353,12 @@ def generate(
         rows, features, tapes = rt.verify(block, cache)
         verified_rows = rows
         decision = None
-        if device_ok:
-            width = len(block) if isinstance(block, list) else int(block.shape[0])
+        width = len(block) if isinstance(block, list) else int(block.shape[0])
+        if device_ok and width > fast_round.MAX_ROWS:
+            # A copy round wider than the device decision's 8 rows: the host decides it
+            # (exact under the seed-match rule; counted), the step stays fast.
+            count("decision.host.wide_copy")
+        elif device_ok:
             packet = fast_round.decide(rows, proposed, position=position, seed=round_seed,
                                        temperature=target_temperature, draft=law)
             # The round's only read; the owner's eval keeps the stall watchdog ticking.

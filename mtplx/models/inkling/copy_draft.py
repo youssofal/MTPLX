@@ -52,9 +52,10 @@ class PromptCopy:
         self.prompt = prompt_ids
         self.session_id = session_id
         self.image_pad = image_pad
-        # The target and rollback path covers an anchor plus seven proposals.
-        # A future wider head needs its own geometry proof before widening this lane.
-        self.max_proposals = min(8, verify_rows) - 1
+        # The verify path's width: RC6's target and rollback path covers an anchor plus seven
+        # proposals; the fast step verifies up to 32 rows with every row equal to the one-row
+        # step (l0/receipts/wide-probe-2.json), so the loop passes its own width.
+        self.max_proposals = verify_rows - 1
         self.ng_min = context_copy.context_copy_ng_min()
         self.ng_max = context_copy.context_copy_ng_max()
         self.min_ext = context_copy.context_copy_min_ext()
