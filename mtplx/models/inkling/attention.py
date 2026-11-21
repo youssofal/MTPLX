@@ -288,11 +288,46 @@ def _chronological_verify(operands, window):
     return (out if reason is None else None), reason, ("passed" if reason is None else "declined")
 
 
+def _prompt_route(operands, window):
+    """Full-history prompt calls past the vector kernel's threshold, on the fused exact kernel.
+
+    RC6 tiles such a call into MLX vector-kernel calls of 8 rows or fewer, each reading every
+    key; ``fast.prefill_attend`` computes the same rows bit for bit with one read of the history
+    per 16 rows. Returns the result, or None where it declines (counted with its reason).
+    Runs only in RC6's default stock mode; an explicitly chosen trial mode keeps its own route.
+    """
+    if os.environ.get("MTPLX_INKLING_PROMPT_ATTENTION", "fused") == "stock":
+        reason = "forced_stock"
+    else:
+        from .fast.prefill_attend import decline
+
+        reason = decline(*operands, window)
+    counter = "prompt_fused.full." + ("selected" if reason is None else "stock." + reason)
+    with _lock:
+        first = counter not in _counts
+        _counts[counter] += 1
+        active = _request.get()
+        if active is not None:
+            counts = active[0]["graph_selections"]
+            counts[counter] = counts.get(counter, 0) + 1
+    if first:
+        _log.info("Inkling attention %s", counter)
+    if reason is not None:
+        return None
+    from .fast.prefill_attend import prompt_attention
+
+    return prompt_attention(*operands, window)
+
+
 def attend(query, key, value, profiles, sink, window, *, verify=False):
     operands = (query, key, value, profiles, sink)
     route = "grouped_sink" if query.shape[2] <= 9 else "streamed"
     active = _request.get()
     mode = active[0]["mode"] if active is not None else os.environ.get("MTPLX_INKLING_ATTENTION", "stock")
+    if mode == "stock" and not verify and not window and query.shape[2] > 32:
+        result = _prompt_route(operands, window)
+        if result is not None:
+            return result
     verify_mode = (active[0]["verify_mode"] if active is not None else
                    os.environ.get("MTPLX_INKLING_VERIFY_ATTENTION", "chronological")) if verify else "auto"
     rows = query.shape[2]
