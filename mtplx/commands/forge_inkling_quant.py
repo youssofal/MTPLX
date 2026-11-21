@@ -10,10 +10,10 @@ Recipes (``matrix_layout`` is the single source of which matrix gets which bits)
   keep their trained format; routers, norms, clip scales, convolutions, controllers and the
   relative basis keep their source values. ``bare-speed-mxfp8`` keeps layers 20 to 23 trained
   (the comparator it was measured against).
-- ``speed`` (Optimized Speed): the same matrices as Bare Speed at 8 bits in groups of 64, the four
-  MXFP8 expert layers re-coded to 4-bit codes as in Bare Speed. On L5's 4K control the 8-bit
-  projections and head measure KL 0.0188 against native, at the noise floor of that measurement
-  (MLX 0.32.4 on the native weights: 0.0196), against 0.0283 at 4 bits.
+- ``speed`` (Optimized Speed): the attention projections at 8 bits in groups of 64 (the matrices this
+  looped model notices: short-prompt KL against native 0.0067 at 8 bits against 0.0134 at 4), the
+  vocabulary head at 4 bits in groups of 64 (it does not notice: 0.0067 with it at 4 bits against
+  0.0067 at 8), the four MXFP8 expert layers re-coded as in Bare Speed.
 - ``native-quality``: the vocabulary head at 8 bits, everything else published (a research control).
 
 The writer streams: unchanged tensors are copied byte ranges of the source file, and one matrix at a
@@ -22,6 +22,7 @@ the pinned upstream before it is moved into place: the vision tower (count, dtyp
 every tensor, ``vision_config``) and the drafter file. A failed audit leaves no pack behind.
 """
 
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -48,7 +49,14 @@ _PROJECTION = re.compile(
     r"model\.llm\.layers\.(\d+)\.attn\.(" + "|".join(PROJECTIONS) + r")\.weight"
 )
 _EXPERTS = re.compile(r"model\.llm\.layers\.(\d+)\.mlp\.experts\.(w13_weight|w2_weight)")
-RECIPES = ("bare-speed", "bare-speed-mxfp8", "speed", "quality", "native-quality")
+RECIPES = ("bare-speed", "bare-speed-affine", "bare-speed-mxfp8", "bare-speed-nvfp4", "bare-speed-nvfp4w", "speed",
+           "speed-affine", "speed-nvfp4w", "quality", "native-quality")
+# Layers 20-23 stored in the NVFP4 format of layers 0-19. A ``-nvfp4`` recipe also rounds their
+# activations as NVFP4 (the layers become NVFP4 layers in every respect: the pack's quant config says
+# so and every path serves them natively); a ``-nvfp4w`` recipe keeps their trained MXFP8 activation
+# rounding and records the weight storage separately (``mtplx_inkling_expert_storage``), which the
+# loader and both fused expert paths must read before such a pack can load.
+NVFP4 = "nvfp4"
 SHARD_BYTES = 5 * 1000**3
 # A recipe may move the four trained-MXFP8 expert layers (20 to 23) to affine codes.
 _FP8_EXPERT_LAYERS = range(20, 24)
@@ -58,19 +66,32 @@ def matrix_layout(name: str, recipe: str) -> tuple[int, int] | None:
     """(bits, group size) of the affine codes a recipe stores for ``name``; None keeps the source tensor."""
     if recipe == "native-quality":
         return (8, 32) if name == HEAD else None
-    if recipe == "speed":
-        if name == HEAD or _PROJECTION.fullmatch(name):
+    if recipe in {"speed", "speed-affine", "speed-nvfp4w"}:
+        # Optimized Speed: 8-bit attention projections, a 4-bit head (it costs nothing measurable),
+        # layers 20-23 in NVFP4 as in Bare Speed; the embedding stays BF16.
+        if name == HEAD:
+            return (4, 64)
+        if _PROJECTION.fullmatch(name):
             return (8, 64)
         expert = _EXPERTS.fullmatch(name)
         if expert and int(expert.group(1)) in _FP8_EXPERT_LAYERS:
-            return (4, 64)
+            return (4, 64) if recipe == "speed-affine" else NVFP4
         return None
-    if recipe in {"bare-speed", "bare-speed-mxfp8"}:
+    if recipe in {"bare-speed", "bare-speed-affine", "bare-speed-mxfp8", "bare-speed-nvfp4", "bare-speed-nvfp4w"}:
+        # Bare Speed: every attention projection and the head at 4 bits; the four trained-MXFP8
+        # expert layers in the NVFP4 format of the other twenty (activation rounding as theirs,
+        # so every expert path serves them natively); the embedding at 4 bits, gathered a row at
+        # a time. The other recipes are the comparators it was chosen against.
         if name == HEAD or _PROJECTION.fullmatch(name):
             return (4, 64)
+        if name == EMBED:
+            return (4, 64) if recipe == "bare-speed" else None
         expert = _EXPERTS.fullmatch(name)
-        if recipe == "bare-speed" and expert and int(expert.group(1)) in _FP8_EXPERT_LAYERS:
-            return (4, 64)
+        if expert and int(expert.group(1)) in _FP8_EXPERT_LAYERS:
+            if recipe == "bare-speed-affine":
+                return (4, 64)
+            if recipe in {"bare-speed", "bare-speed-nvfp4", "bare-speed-nvfp4w"}:
+                return NVFP4
         return None
     if recipe == "quality":
         return None
@@ -193,6 +214,73 @@ def affine_quantize(w: np.ndarray, bits: int, group_size: int, rounding: str = "
         biases.reshape(*lead, -1),
         stats,
     )
+
+
+# --------------------------------------------------------------------------- NVFP4
+_E2M1 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], np.float32)
+_E2M1_MID = np.array([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], np.float32)
+_E4M3_CODES = np.arange(127)
+_E4M3 = np.where(
+    _E4M3_CODES >> 3 == 0,
+    (_E4M3_CODES & 7) / 8.0 * 2.0**-6,
+    (1 + (_E4M3_CODES & 7) / 8.0) * 2.0 ** ((_E4M3_CODES >> 3) - 7),
+).astype(np.float32)
+NVFP4_DENOMINATOR = 6.0 * 448.0  # the checkpoint's own outer-scale denominator (2688)
+
+
+def nvfp4_quantize(w: np.ndarray, *, workers: int | None = None):
+    """``w`` (experts, rows, columns) float32 -> the checkpoint's NVFP4 tensors for it.
+
+    Per expert the outer scale is amax / 2688, as the checkpoint stores it. Per block of 16 the E4M3
+    scale is the one with the smallest squared error among the four codes around amax(block) / 6 (the
+    max-based choice is always among them), and each value takes the nearest E2M1 code. Returns codes
+    (uint8, two a byte, the first in the low nibble), scales (E4M3 bytes), amax (float32) and stats,
+    the layout MLX's ``mode="nvfp4"`` reads. Experts are independent, so they are encoded on
+    ``workers`` threads (NumPy releases the GIL in these array operations); every expert's bytes are
+    the same whatever the count, and the error sums are added in expert order.
+    """
+    experts, rows, columns = w.shape
+    amax = np.abs(w.reshape(experts, -1)).max(axis=1).astype(np.float32)
+    codes = np.empty((experts, rows, columns // 2), np.uint8)
+    scales = np.empty((experts, rows, columns // 16), np.uint8)
+    errors = [(0.0, 0.0)] * experts
+
+    def encode(e):
+        outer = np.float32(amax[e] / NVFP4_DENOMINATOR)
+        blocks = (w[e] / outer if outer > 0 else np.zeros_like(w[e])).reshape(rows, columns // 16, 16)
+        top = np.abs(blocks).max(axis=-1)
+        first = np.searchsorted(_E4M3, top / 6.0)
+        best_err = best_code = best_q = best_neg = None
+        for step in (-2, -1, 0, 1):
+            code = np.clip(first + step, 0, 126)
+            scale = _E4M3[code][..., None]
+            v = blocks / np.where(scale > 0, scale, 1.0)
+            q = np.minimum(np.searchsorted(_E2M1_MID, np.abs(v)), 7)
+            err = np.square(np.where(v < 0, -1.0, 1.0) * _E2M1[q] * scale - blocks).sum(axis=-1)
+            if best_err is None:
+                best_err, best_code, best_q, best_neg = err, code, q, v < 0
+                continue
+            better = err < best_err
+            best_err = np.where(better, err, best_err)
+            best_code = np.where(better, code, best_code)
+            best_q = np.where(better[..., None], q, best_q)
+            best_neg = np.where(better[..., None], v < 0, best_neg)
+        nibble = (best_q | ((best_neg & (best_q > 0)) << 3)).astype(np.uint8).reshape(rows, columns)
+        codes[e] = nibble[:, 0::2] | (nibble[:, 1::2] << 4)
+        scales[e] = best_code.astype(np.uint8)
+        errors[e] = (float(best_err.sum(dtype=np.float64)) * float(outer) ** 2,
+                     float(np.square(w[e], dtype=np.float64).sum()))
+
+    count = workers if workers is not None else min(4, os.cpu_count() or 1)
+    if count <= 1:
+        for e in range(experts):
+            encode(e)
+    else:
+        with ThreadPoolExecutor(max_workers=count) as pool:
+            list(pool.map(encode, range(experts)))
+    sq_err = sum(err for err, _ in errors)
+    sq_norm = sum(norm for _, norm in errors)
+    return codes, scales, amax, {"relative_rms_error": (sq_err / sq_norm) ** 0.5 if sq_norm else 0.0}
 
 
 # --------------------------------------------------------------------------- safetensors streaming
@@ -379,10 +467,12 @@ def build_pack(source: Path, destination: Path, recipe: str, *, rounding: str = 
     data_start = 8 + header_size
     layouts = {key: matrix_layout(key, recipe) for key in header}
     layouts = {key: layout for key, layout in layouts.items() if layout is not None}
+    fp4_layouts = {key for key, layout in layouts.items() if layout == NVFP4}
+    layouts = {key: layout for key, layout in layouts.items() if layout != NVFP4}
     # Removed with the expert codes they scale when a recipe stores those experts as affine codes.
     dropped = {
         key + suffix
-        for key in layouts
+        for key in (*layouts, *fp4_layouts)
         if _EXPERTS.fullmatch(key)
         for suffix in ("_scale", "_amax", "_outer_scale_denominator")
         if key + suffix in header
@@ -425,11 +515,43 @@ def build_pack(source: Path, destination: Path, recipe: str, *, rounding: str = 
             (key + ".mtplx_biases", "BF16", [*lead, columns // group], part("biases")),
         ]
 
+    def nvfp4_producers(key):
+        state = {}
+
+        def compute():
+            if "codes" not in state:
+                entry = header[key]
+                if entry["dtype"] != "F8_E4M3":
+                    raise ValueError(f"{key}: NVFP4 re-code expects the trained MXFP8 experts")
+                codes, scales, amax, info = nvfp4_quantize(_decoded_fp8_experts(source_target, data_start, header, key))
+                stats[key] = {"format": NVFP4, "source_dtype": entry["dtype"], "shape": entry["shape"], **info}
+                state.update(codes=codes, scales=scales, amax=amax,
+                             denominator=np.array([NVFP4_DENOMINATOR], np.float32))
+            return state
+
+        def part(field):
+            def produce():
+                data = compute()[field]
+                yield data.tobytes()
+                if field == "denominator":
+                    state.clear()
+            return produce
+
+        experts, rows, columns = header[key]["shape"]
+        return [
+            (key, "U8", [experts, rows, columns // 2], part("codes")),
+            (key + "_amax", "F32", [experts], part("amax")),
+            (key + "_outer_scale_denominator", "F32", [1], part("denominator")),
+            (key + "_scale", "F8_E4M3", [experts, rows, columns // 16], part("scales")),
+        ]
+
     entries = []
     for key in sorted(header, key=_order):
         if key in dropped:
             continue
-        if key in layouts:
+        if key in fp4_layouts:
+            entries.extend(nvfp4_producers(key))
+        elif key in layouts:
             entries.extend(quantized_producers(key))
         else:
             entry = header[key]
@@ -437,7 +559,9 @@ def build_pack(source: Path, destination: Path, recipe: str, *, rounding: str = 
     shards, current, size = [], [], 0
     for item in entries:
         item_size = _nbytes(item[1], item[2])
-        if current and size + item_size > SHARD_BYTES and not item[0].endswith((".mtplx_scales", ".mtplx_biases")):
+        if current and size + item_size > SHARD_BYTES and not item[0].endswith(
+            (".mtplx_scales", ".mtplx_biases", "_amax", "_outer_scale_denominator", "_scale")
+        ):
             shards.append(current)
             current, size = [], 0
         current.append(item)
@@ -455,6 +579,9 @@ def build_pack(source: Path, destination: Path, recipe: str, *, rounding: str = 
         config["mtplx_inkling_precision"] = {
             key: {"bits": bits, "group_size": group} for key, (bits, group) in sorted(layouts.items())
         }
+        fp4_layers = sorted({int(_EXPERTS.fullmatch(key).group(1)) for key in fp4_layouts})
+        if recipe.endswith("-nvfp4w") and fp4_layers:
+            config["mtplx_inkling_expert_storage"] = {str(layer): NVFP4 for layer in fp4_layers}
         (staged / "config.json").write_text(json.dumps(config, indent=2) + "\n")
         (staged / "model.safetensors.index.json").write_text(
             json.dumps({"metadata": {"total_size": sum(_nbytes(i[1], i[2]) for i in entries)}, "weight_map": index},
@@ -467,6 +594,17 @@ def build_pack(source: Path, destination: Path, recipe: str, *, rounding: str = 
             dst = staged / ("UPSTREAM.md" if name == "README.md" else name)
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source / name, dst)
+        if (recipe in {"bare-speed", "speed"} or recipe.endswith("-nvfp4")) and fp4_layers:
+            # Those layers' experts are NVFP4 layers now, weights and activation rounding alike.
+            quant = json.loads((staged / "hf_quant_config.json").read_text())
+            groups = quant["model"]["parameter_groups"]
+            fp4_group = next(g for g in groups if g["compute_dtype"] == NVFP4)
+            moved = sorted(fp4_layouts)
+            for group in groups:
+                group["tensors"] = [t for t in group["tensors"] if t not in fp4_layouts]
+            fp4_group["tensors"] = sorted(fp4_group["tensors"] + moved)
+            quant["model"]["parameter_groups"] = [g for g in groups if g["tensors"]]
+            (staged / "hf_quant_config.json").write_text(json.dumps(quant, indent=2) + "\n")
         manifest = write_pack_metadata(staged, recipe)
         audit = audit_pack(staged, source)
         (staged / "vision-audit.json").write_text(json.dumps(audit, indent=2) + "\n")

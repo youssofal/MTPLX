@@ -14,6 +14,7 @@ from mtplx.commands.forge_inkling_quant import (
     bf16_to_f32,
     f32_to_bf16,
     matrix_layout,
+    nvfp4_quantize,
 )
 
 PROJECTIONS = ("wq_du", "wk_dv", "wv_dv", "wr_du", "gate_attn", "wo_ud")
@@ -35,7 +36,10 @@ def test_bare_speed_converts_every_projection_and_the_head_and_nothing_that_stee
         ):
             assert matrix_layout(f"model.llm.layers.{layer}.{kept}", "bare-speed") is None
     assert matrix_layout(HEAD, "bare-speed") == (4, 64)
-    assert matrix_layout("model.llm.embed.weight", "bare-speed") is None
+    # The embedding is 4-bit in the final recipe only; the comparators keep it BF16.
+    assert matrix_layout("model.llm.embed.weight", "bare-speed") == (4, 64)
+    for comparator in ("bare-speed-affine", "bare-speed-mxfp8", "bare-speed-nvfp4", "bare-speed-nvfp4w"):
+        assert matrix_layout("model.llm.embed.weight", comparator) is None
     assert matrix_layout("model.visual.proj_in.weight", "bare-speed") is None
 
 
@@ -43,8 +47,11 @@ def test_bare_speed_recodes_only_the_trained_mxfp8_experts_and_the_comparator_ke
     for layer in range(24):
         for name in ("w13_weight", "w2_weight"):
             key = f"model.llm.layers.{layer}.mlp.experts.{name}"
-            assert matrix_layout(key, "bare-speed") == ((4, 64) if layer >= 20 else None)
+            assert matrix_layout(key, "bare-speed-affine") == ((4, 64) if layer >= 20 else None)
             assert matrix_layout(key, "bare-speed-mxfp8") is None
+            assert matrix_layout(key, "speed-affine") == ((4, 64) if layer >= 20 else None)
+            for recipe in ("bare-speed", "bare-speed-nvfp4", "bare-speed-nvfp4w", "speed", "speed-nvfp4w"):
+                assert matrix_layout(key, recipe) == ("nvfp4" if layer >= 20 else None)
     assert matrix_layout("model.llm.layers.21.mlp.experts.w13_weight_scale", "bare-speed") is None
     for layer in range(24):
         assert matrix_layout(f"model.llm.layers.{layer}.attn.wo_ud.weight", "bare-speed-mxfp8") == (4, 64)
@@ -95,6 +102,19 @@ def test_refined_rounding_never_loses_to_plain_rounding():
     plain = affine_quantize(w, 4, 64, "mlx")[3]["relative_rms_error"]
     refined = affine_quantize(w, 4, 64, "mse")[3]["relative_rms_error"]
     assert refined <= plain
+
+
+
+def test_nvfp4_encoder_writes_the_same_bytes_on_any_number_of_threads():
+    rng = np.random.default_rng(5)
+    w = rng.standard_normal((6, 32, 128)).astype(np.float32) * 0.03
+    w[2] = 0.0  # an all-zero expert keeps a zero outer scale
+    w[4, 3, :16] = 0.5
+    serial = nvfp4_quantize(w, workers=1)
+    threaded = nvfp4_quantize(w, workers=4)
+    for a, b in zip(serial[:3], threaded[:3]):
+        assert a.dtype == b.dtype and np.array_equal(a, b)
+    assert serial[3] == threaded[3]
 
 
 def _safetensors(path: Path, tensors: dict):

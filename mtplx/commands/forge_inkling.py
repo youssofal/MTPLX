@@ -34,7 +34,12 @@ PACK_NAMES = {
     "quality": "Optimized Quality",
     "speed": "Optimized Speed",
     "bare-speed": "Bare Speed",
+    "bare-speed-affine": "Bare Speed Affine Experts",
     "bare-speed-mxfp8": "Bare Speed MXFP8 Experts",
+    "bare-speed-nvfp4": "Bare Speed NVFP4 Experts",
+    "bare-speed-nvfp4w": "Bare Speed NVFP4 Expert Weights",
+    "speed-affine": "Optimized Speed Affine Experts",
+    "speed-nvfp4w": "Optimized Speed NVFP4 Expert Weights",
     "native-quality": "Native Experts Quality",
 }
 
@@ -84,13 +89,15 @@ def verify_source(source: Path):
 
 def _precision_sentences(manifest: dict) -> list[str]:
     recipe = manifest["recipe"]
-    if recipe in {"bare-speed", "bare-speed-mxfp8"}:
-        experts = (
-            "The first 20 expert layers keep their published NVFP4 weights and the last four are re-coded to "
-            "4-bit weights in groups of 64."
-            if recipe == "bare-speed"
-            else "The experts keep their published NVFP4 and MXFP8 weights."
-        )
+    if recipe in {"bare-speed", "bare-speed-affine", "bare-speed-mxfp8"}:
+        experts = {
+            "bare-speed": "The first 20 expert layers keep their published NVFP4 weights and the last four are "
+            "re-coded from MXFP8 to NVFP4, the format of the first 20. The input embedding is stored as 4-bit "
+            "weights in groups of 64 and read one row per token.",
+            "bare-speed-affine": "The first 20 expert layers keep their published NVFP4 weights and the last four "
+            "are re-coded to 4-bit weights in groups of 64.",
+            "bare-speed-mxfp8": "The experts keep their published NVFP4 and MXFP8 weights.",
+        }[recipe]
         return [
             "The attention projections of all 24 layers and the output vocabulary use 4-bit weights in groups "
             "of 64, which cuts the weights read for each token from about 5.5 GB to about 3 GB.",
@@ -101,12 +108,20 @@ def _precision_sentences(manifest: dict) -> list[str]:
         "The first 20 expert layers use their published NVFP4 weights and the last four use MXFP8.",
         "The FP32 routing and loop-control weights keep their source values.",
     ]
-    if recipe == "speed":
+    if recipe in {"speed", "speed-affine", "speed-nvfp4w"}:
+        experts = {
+            "speed": "The first 20 expert layers keep their published NVFP4 weights and the last four are "
+            "re-coded from MXFP8 to NVFP4, the format of the first 20.",
+            "speed-affine": "The first 20 expert layers keep their published NVFP4 weights and the last four are "
+            "re-coded to 4-bit weights in groups of 64.",
+            "speed-nvfp4w": "The first 20 expert layers keep their published NVFP4 weights and the last four are "
+            "re-coded from MXFP8 to NVFP4 weights, keeping the 8-bit activation rounding they were trained with.",
+        }[recipe]
         return [
-            "The attention projections of all 24 layers and the output vocabulary use 8-bit weights in groups "
-            "of 64, which cuts the weights read for each token from about 5.5 GB to about 3.7 GB.",
-            "The first 20 expert layers keep their published NVFP4 weights and the last four are re-coded to "
-            "4-bit weights in groups of 64.",
+            "The attention projections of all 24 layers use 8-bit weights in groups of 64 and the output "
+            "vocabulary 4-bit weights in groups of 64, which cuts the weights read for each token from about "
+            "5.5 GB to about 3.5 GB.",
+            experts,
             "The routing, loop-control, normalization and convolution weights keep their published values.",
         ]
     if recipe == "native-quality" and manifest.get("matrix_bit_counts") == {"8": 1}:
