@@ -86,7 +86,7 @@ class InklingRuntime(MTPLXRuntime):
         if fast_enabled() and mx.default_device() == mx.gpu and mx.metal.is_available():
             # The round's kernels serve speculative rounds only: warm them where they run.
             if self.drafter is not None:
-                fast_round.warm()
+                fast_round.warm(wide=fast_round.wide_decision_enabled())
             self.engine_warm = engine_site.warm(self)
             # The DSpark round as one program for 1 to 7 proposals (lane L7), recorded and checked
             # before ready, so no request records; the pool below is read after it. The variant the
