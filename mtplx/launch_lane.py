@@ -50,6 +50,9 @@ CLIENTS: tuple[str, ...] = (
 # table never overrides it.
 SAMPLER_OWNING_FAMILIES = frozenset({"qwen3_8", "qwen4_exp", "inkling2"})
 SEATS_GIB: tuple[int, ...] = (16, 24, 36, 48, 64, 96, 128)
+# The families the parity matrix covers: the app, `mtplx start` and bare
+# `mtplx serve` must resolve the same lane for each (Inkling 2 Mini from 2.13).
+LANE_FAMILIES: tuple[str, ...] = ("qwen4_exp", "qwen3_8", "inkling2")
 
 # --- the constants two owners used to disagree on ---------------------------
 
@@ -464,7 +467,7 @@ def family_owned_sampler_overrides(family: str | None) -> bool:
 
 def lane_matrix(
     *,
-    families: tuple[str, ...] = ("qwen4_exp", "qwen3_8"),
+    families: tuple[str, ...] = LANE_FAMILIES,
     seats_gib: tuple[int, ...] = SEATS_GIB,
     clients: tuple[str, ...] = CLIENTS,
 ) -> list[dict[str, Any]]:
@@ -510,7 +513,7 @@ APP_ARGV_KEYS: tuple[str, ...] = (
 
 def app_parity_fixture(
     *,
-    families: tuple[str, ...] = ("qwen4_exp", "qwen3_8"),
+    families: tuple[str, ...] = LANE_FAMILIES,
     seats_gib: tuple[int, ...] = SEATS_GIB,
     clients: tuple[str, ...] = CLIENTS,
 ) -> dict[str, Any]:
