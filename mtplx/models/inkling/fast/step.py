@@ -268,9 +268,8 @@ def packed_linear(x, weight):
     """``x @ weight`` for stored codes, every row equal to the one-row product: lane L1's
     row-stable launch (one read of the codes for the whole panel, 2 to 32 rows, proven against
     MLX's one-row product on this Mac's first use of each shape); where it refuses, counted,
-    ``proven_rows`` (MLX's batched product where it is row-stable here, else one row at a time)."""
-    if x.shape[1] == 1:
-        return ref.linear(x, weight)
+    ``proven_rows`` (MLX's batched product where it is row-stable here, else one row at a time). One
+    row takes the launch too (``qproduct._ONE_ROW``); where it refuses, MLX's own product, the reference."""
     from .qproduct import affine_product
 
     try:
@@ -379,6 +378,59 @@ def output_reason(layer, dtype):
     return unreadable(dtype, layer.out)
 
 
+def stored_output_reason(layer, dtype, rows):
+    """Why the one-launch stage C on stored codes (``qproduct.affine_output``: the output projection
+    on the affine codes in the one-row product's order, the attention's short convolution and the
+    residual) cannot serve this visit, or None. Its first use per shape on a Mac still proves it bit
+    for bit against the step's separate launches, and refuses (counted) on a disagreement."""
+    from .qproduct import qmv_constants
+
+    from .qproduct import STREAM_TYPES
+
+    conv = layer.convs[2]
+    if not isinstance(layer.out, AffineWeight):
+        return "not_stored"
+    if dtype not in STREAM_TYPES:
+        return "stream_dtype"
+    if layer.out.scales.dtype != dtype:
+        return "scales_dtype"
+    if conv.dynamic is not None or conv.size != 4:
+        return "conv_form"
+    if not 1 <= rows <= MAX_STORED_OUTPUT_ROWS:
+        return "rows"
+    try:
+        qmv_constants(layer.out)
+    except RuntimeError as err:
+        return str(err).rsplit(": ", 1)[-1]
+    return None
+
+
+#: Panel rows the one-launch stored-code stage C takes (its bit proofs cover 1 to 8, 12, 16 and 32).
+MAX_STORED_OUTPUT_ROWS = 32
+
+
+def output_route_reason(layer, dtype, rows):
+    """Why neither fused stage C (16-bit weights: lane L2's launch; stored codes: the one-launch
+    stored-code form) serves this visit, or None."""
+    reason = output_reason(layer, dtype)
+    if reason is None or stored_output_reason(layer, dtype, rows) is None:
+        return None
+    return reason
+
+
+def stored_output(layer, hg, x, state, visit):
+    """Stage C on a stored-code output projection in one launch, or None where it refuses (counted in
+    ``attn_input.route_counts`` as ``refused:qoutput_*``)."""
+    from .attn_input import _static_form
+    from .qproduct import affine_output
+
+    try:
+        return affine_output(hg, layer.out, layer.convs[2], state.tail(visit, 2), x, layer.boundary,
+                             form=_static_form(layer.out.codes.shape[0], layer.convs[2].size, hg.dtype))
+    except RuntimeError:
+        return None
+
+
 #: The trunk's activation dtype, set by the decoder at load (one model a process), so the
 #: engine site and the round program ask the attention's qualification for the dtype it serves.
 _ACTIVATION = {"dtype": mx.bfloat16}
@@ -440,7 +492,7 @@ def stage_fallbacks(model, spec, rows, dtype=None):
         if "a" in lanes:
             reasons.append(("a", attention_input_reason(layer, dtype, message)))
         if "bc" in lanes:
-            reasons.append(("bc_output", output_reason(layer, dtype)))
+            reasons.append(("bc_output", output_route_reason(layer, dtype, rows)))
         if "d" in lanes:
             reasons.append(("d", expert_input_reason(layer, message, dtype)))
         if "e" in lanes:
@@ -453,9 +505,11 @@ def stage_fallbacks(model, spec, rows, dtype=None):
                         and launch_serves(layer.out) else "fallback")
                 key = f"{kind}.{stage}.{reason}"
                 out[key] = out.get(key, 0) + 1
+    if embed_reason(model) is not None:
+        out[f"fallback.embed.{embed_reason(model)}"] = 1
     unembed = getattr(model, "unembed", None)
-    if rows > 1 and isinstance(unembed, AffineWeight) and not launch_serves(unembed):
-        out["fallback.head.packed_rows"] = 1
+    if isinstance(unembed, AffineWeight) and not launch_serves(unembed):
+        out["fallback.head.packed_rows" if rows > 1 else "fallback.head.packed_one_row"] = 1
     return out
 
 
@@ -482,12 +536,16 @@ def fused_attention(layer, a, x, state, visit, panel):
         hg = panel_attend(a.q, a.rel, a.sink, a.gate_logits, a.k_rows, a.v_rows, keys, values, valid,
                           newest, panel.pos, layer.rel_basis, window=layer.sliding)
     reason = output_reason(layer, hg.dtype)
-    if reason is not None:
-        kind = "unfused" if isinstance(layer.out, AffineWeight) and launch_serves(layer.out) else "fallback"
-        count(f"{kind}.bc_output.{reason}")
-        return output_projection(layer, hg, x, state, visit, panel)
-    return panel_output(hg, layer.out, layer.convs[2].weight, state.tail(visit, 2), x,
-                        boundary=layer.boundary)
+    if reason is None:
+        return panel_output(hg, layer.out, layer.convs[2].weight, state.tail(visit, 2), x,
+                            boundary=layer.boundary)
+    if stored_output_reason(layer, hg.dtype, panel.rows) is None:
+        fused = stored_output(layer, hg, x, state, visit)
+        if fused is not None:
+            return fused
+    kind = "unfused" if isinstance(layer.out, AffineWeight) and launch_serves(layer.out) else "fallback"
+    count(f"{kind}.bc_output.{reason}")
+    return output_projection(layer, hg, x, state, visit, panel)
 
 
 def fused_attention_input(layer, x, closed, message, state, visit, panel):
@@ -521,7 +579,7 @@ def fused_experts(layer, source, partial, dtype, state, visit, panel):
     if reason is not None:
         count(f"fallback.experts.{reason}")
         return experts(layer, source, partial, dtype, state, visit, panel)
-    return expert_visit(layer, source, partial, state.tail(visit, 3))
+    return expert_visit(layer, source, partial, state.tail(visit, 3), dtype)
 
 
 LANES = {
@@ -589,28 +647,43 @@ def row_stable_read(panel, closed, x, queries, eps, normalize):
 
 
 def affine_head(model, hidden):
-    """``Model.head`` on affine codes with the product as lane L1's row-stable launch: the same
-    cast (to the model's dtype, then float32, as ``vocabulary_logits`` feeds an affine head), the
-    same vocabulary slice and soft cap, so every row equals the one-row head. Raises
-    ``RuntimeError`` where the launch refuses (its first use per shape is proven on this Mac)."""
-    from .qproduct import affine_product
+    """``Model.head`` on affine codes with the product as lane L1's row-stable launch, one launch at
+    any width: a 16-bit hidden (bf16, float16 on the FP16 packs) is widened to float32 inside the launch
+    (``vocabulary_logits`` casts it to the model's dtype, then float32, and MLX's product then widens the
+    16-bit scales and biases: three launches that change no value), the same vocabulary slice and soft
+    cap, so every row equals the one-row head. Raises ``RuntimeError`` where the launch refuses (its
+    first use per shape is proven on this Mac against MLX's one-row product)."""
+    from .qproduct import STREAM_TYPES, affine_logits, affine_product
 
     cap = model.config["final_logit_softcapping"]
-    x = hidden.astype(model.embed_tokens.weight.dtype).astype(mx.float32)
-    logits = affine_product(x, model.unembed)[..., : model.config["unpadded_vocab_size"]]
+    vocab = model.config["unpadded_vocab_size"]
+    x = hidden.astype(model.embed_tokens.weight.dtype)
+    widen = x.dtype in STREAM_TYPES
+    if not widen:
+        x = x.astype(mx.float32)
+    try:
+        # The product, the vocabulary slice and the soft cap in one launch.
+        return affine_logits(x, model.unembed, width=vocab, cap=cap or 0.0, widen=widen)
+    except RuntimeError:
+        count("fallback.head.one_launch_logits_refused")
+    logits = affine_product(x, model.unembed, widen=widen, one_row=True)[..., :vocab]
     return mx.tanh(logits / cap) * cap if cap else logits
 
 
 def row_stable_head(model, hidden):
     """The vocabulary head of a panel, every row equal to the one-row step's (pieces of at
     most 8 rows past 8, as ``row_stable_read``; a head stored as affine codes through lane L1's
-    row-stable launch, else one row at a time, counted)."""
+    row-stable launch at every width, one row included; where it refuses, MLX's product: the
+    one-row head itself, or a panel one row at a time, counted)."""
     rows = hidden.shape[1]
-    if rows > 1 and isinstance(model.unembed, AffineWeight):
+    if isinstance(model.unembed, AffineWeight):
         try:
             return affine_head(model, hidden)
         except RuntimeError:
             pass
+        if rows == 1:
+            count("fallback.head.packed_one_row")
+            return model.head(hidden)
         count("fallback.head.packed_rows")
         unembed = model.unembed
         key = ("head", rows, tuple(unembed.codes.shape), unembed.bits, unembed.group_size, str(hidden.dtype))
@@ -619,6 +692,36 @@ def row_stable_head(model, hidden):
     if rows <= ROW_STABLE_ROWS:
         return model.head(hidden)
     return mx.concatenate([model.head(hidden[:, start:stop]) for start, stop in row_chunks(rows)], axis=1)
+
+
+def embed_reason(model):
+    """Why the one-launch embedding cannot serve this model's stored table, or None (a 16-bit table
+    needs no decode: one gather, as the model does it)."""
+    from .qproduct import rows_reason
+
+    packed = getattr(model.embed_tokens, "packed", None)
+    return None if packed is None else rows_reason(packed)
+
+
+def embed(model, ids):
+    """``model.embed_tokens(ids)`` with a table stored as affine codes (Bare Speed) gathered and
+    decoded in one launch (``qproduct.affine_rows``: MLX gathers codes, scales and biases, then
+    decodes, four launches) and normed as ``Embedding`` norms it; every value equal (proven on this
+    Mac's first use). A 16-bit table takes the model's own embedding; a stored table the launch does
+    not serve, or a refusal, takes it too, counted."""
+    table = model.embed_tokens
+    packed = getattr(table, "packed", None)
+    if packed is not None:
+        from .qproduct import affine_rows
+
+        reason = embed_reason(model)
+        if reason is None:
+            try:
+                return mx.fast.rms_norm(affine_rows(ids, packed), table.gain, table.eps)
+            except RuntimeError:
+                reason = "refused"
+        count(f"fallback.embed.{reason}")
+    return table(ids)
 
 
 def decode_hidden(model, ids, state, *, embeddings=None, capture_ids=(), stages=REFERENCE,
@@ -631,7 +734,7 @@ def decode_hidden(model, ids, state, *, embeddings=None, capture_ids=(), stages=
     verify = (rows > 1) if tape is None else bool(tape)
     panel = Panel(rows, state.pos, True if verify else None)
     closed, captured, deltas = [], {}, []
-    x = model.embed_tokens(ids.reshape(1, rows)) if embeddings is None else embeddings
+    x = embed(model, ids.reshape(1, rows)) if embeddings is None else embeddings
     stack = entry = entry_blocks = pass_reads = None
     for visit, index in enumerate(model.visit_order):
         if index == model.start:

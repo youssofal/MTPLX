@@ -320,3 +320,57 @@ def test_the_fast_steps_width_verifies_longer_copied_runs():
     history = list(range(40))  # the prompt's own continuation: a long match
     assert len(narrow.propose(history, 100)) == 7 and narrow.limits["verify_geometry"] == 1
     assert len(wide.propose(history, 100)) > 7 and not wide.limits["verify_geometry"]
+
+
+def _rewrite_prompt():
+    # A long run with no internal repeats, so any suffix of it matches one place.
+    return list(range(1000, 1400))
+
+
+def test_the_cost_gate_is_off_by_default_and_leaves_the_lane_alone(monkeypatch):
+    monkeypatch.delenv("MTPLX_CONTEXT_COPY_GATE", raising=False)
+    lane = PromptCopy(_rewrite_prompt(), session_id=None, verify_rows=32)
+    assert lane.gate is None
+    assert lane.propose([1000, 1001], 100) == list(range(1002, 1010))
+    stats = lane.finish(2)
+    assert "cost_gate" not in stats["context_copy_declines"]
+    assert not any(k.startswith("gate_") for k in stats["context_copy_timing_s"])
+
+
+def _drive(lane, prompt, rounds, landed_of, cost_s):
+    """Drive the lane as the generation loop does: ordinary rounds of 3 tokens while nothing
+    matches, then copy rounds whose first `landed_of(offered)` tokens land; returns the copy
+    rounds run and the gate's vetoes."""
+    tokens = [7, 8]  # not in the prompt: the first rounds are ordinary
+    copies = 0
+    for i in range(rounds):
+        offered = lane.propose(tokens, 10_000)
+        if offered is None:
+            lane.observe(0, 0, len(tokens) + 3, 0.05)
+            tokens = tokens + [7, 8, 9] if i < 3 else tokens + [prompt[10 * i % 300], prompt[10 * i % 300 + 1]]
+            continue
+        landed = landed_of(len(offered))
+        copies += 1
+        lane.observe(len(offered), landed, len(tokens) + landed + 1, cost_s(len(offered) + 1))
+        at = prompt.index(offered[0])
+        tokens = tokens + offered[:landed] + [7] + [prompt[(at + 50) % 300], prompt[(at + 51) % 300]]
+    return copies, lane.declines["cost_gate"]
+
+
+def test_the_cost_gate_vetoes_copy_rounds_that_lose_and_keeps_those_that_pay(monkeypatch):
+    """Q1's session: probation blocks landing 5 of 8 at about 18 ms a verify row (162 ms a round)
+    against 50 ms ordinary rounds of 3 tokens: the lane's own rules keep them (share 0.6), the
+    gate vetoes them. Blocks that land whole at 4 ms a row keep running."""
+    monkeypatch.setenv("MTPLX_CONTEXT_COPY_GATE", "1")
+    prompt = _rewrite_prompt()
+    monkeypatch.setenv("MTPLX_CONTEXT_COPY_GATE_COSTS", "50,0,18")
+    losing = PromptCopy(prompt, session_id=None, verify_rows=32)
+    copies, vetoed = _drive(losing, prompt, 40, lambda n: min(5, n), lambda rows: 0.018 * rows)
+    assert vetoed > 0 and copies < 40 - 3 - vetoed + 1, (copies, vetoed, losing.declines)
+    monkeypatch.setenv("MTPLX_CONTEXT_COPY_GATE_COSTS", "50,0,4")
+    paying = PromptCopy(prompt, session_id=None, verify_rows=32)
+    copies, vetoed = _drive(paying, prompt, 40, lambda n: n, lambda rows: 0.004 * rows)
+    assert vetoed == 0 and copies > 20, (copies, paying.declines)
+    stats = paying.finish(100)
+    assert stats["context_copy_timing_s"]["gate_ordinary_s"] == pytest.approx(0.05)
+    assert stats["context_copy_timing_s"]["gate_copy_row_s"] == pytest.approx(0.004)

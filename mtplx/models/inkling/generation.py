@@ -173,6 +173,9 @@ def generate(
     # ids and remaining budget and writes the kept rows itself, so the host commits nothing.
     # MTPLX_INKLING_ROUND_COMMIT=0 keeps the deciding round and the stock commit (diagnostic).
     round_commit_on = round_commit_enabled()
+    # Copy rounds of 9 to 32 rows decided on the GPU by the point-mass law the 2- to 8-row copy
+    # rounds use, instead of the host's seed-match draw (class B: off until the lead decides).
+    wide_decision = fast_round.wide_decision_enabled()
     round_seed = int(seed) if seed is not None else secrets.randbits(64)
     target_temperature = float(sampler.temperature or 0.0)
     draft_temperature = float(draft_sampler.temperature) if draft_sampler is not None else target_temperature
@@ -408,11 +411,13 @@ def generate(
         verified_rows = rows
         decision = None
         width = len(block) if isinstance(block, list) else int(block.shape[0])
-        if device_ok and width > fast_round.MAX_ROWS:
+        if device_ok and width > (fast_round.WIDE_ROWS if wide_decision else fast_round.MAX_ROWS):
             # A copy round wider than the device decision's 8 rows: the host decides it
             # (exact under the seed-match rule; counted), the step stays fast.
             count("decision.host.wide_copy")
         elif device_ok:
+            if width > fast_round.MAX_ROWS:
+                count("decision.device.wide_copy")
             packet = (served.packet if served is not None else
                       fast_round.decide(controls.rows(rows, proposed) if controls is not None else rows,
                                         proposed, position=position, seed=round_seed,

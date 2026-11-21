@@ -15,8 +15,8 @@ needs = pytest.mark.skipif(not mx.metal.is_available(), reason="needs a Metal GP
 
 
 class _Affine:
-    def __init__(self, rows, cols, bits, group, seed):
-        w = mx.random.normal((rows, cols), key=mx.random.key(seed)).astype(mx.bfloat16) * 0.02
+    def __init__(self, rows, cols, bits, group, seed, dtype="bfloat16"):
+        w = mx.random.normal((rows, cols), key=mx.random.key(seed)).astype(getattr(mx, dtype)) * 0.02
         self.codes, self.scales, self.biases = mx.quantize(w, group_size=group, bits=bits)
         self.bits, self.group_size = bits, group
 
@@ -82,3 +82,88 @@ def test_one_row_is_mlx_own_product():
     m = _Affine(2304, 3072, 4, 64, seed=2)
     x = mx.random.normal((1, 1, 3072), key=mx.random.key(9)).astype(mx.bfloat16)
     assert _bits(affine_product(x, m), m.one_row(x))
+
+
+@needs
+@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("boundary", [False, True])
+def test_stage_c_in_one_launch_equals_the_steps_three(bits, boundary):
+    from types import SimpleNamespace
+
+    from mtplx.models.inkling import short_conv
+    from mtplx.models.inkling.fast.attn_input import _static_form
+    from mtplx.models.inkling.fast.qproduct import affine_output, affine_product
+
+    n, k = 2304, 3072
+    m = _Affine(n, k, bits, 64, seed=31 + bits)
+    # The model's static weight: a float32 transposed view of the stored (channels, taps) array.
+    conv = SimpleNamespace(dynamic=None, size=4,
+                           weight=(mx.random.normal((n, 4), key=mx.random.key(4)) * 0.3).T.astype(mx.float32))
+    form = _static_form(n, 4)
+    for width, with_tail in ((1, True), (4, True), (7, False), (8, True)):
+        hg = (mx.random.normal((1, width, k), key=mx.random.key(width)) * 0.5).astype(mx.bfloat16)
+        x = mx.random.normal((1, width, n), key=mx.random.key(50 + width)).astype(mx.bfloat16)
+        tail = mx.random.normal((1, 3, n), key=mx.random.key(90)).astype(mx.bfloat16).astype(mx.float32) if with_tail else None
+        partial, attn = affine_output(hg, m, conv, tail, x, boundary, form=form)
+        ref_attn = m.one_row(hg) if width == 1 else affine_product(hg, m, prove=False)
+        ref = short_conv.convolve(ref_attn, tail, conv.weight, None, False)[0].astype(mx.float32)
+        if not boundary:
+            ref = ref + x.astype(mx.float32)
+        assert _bits(partial, ref), width
+        assert _bits(attn, ref_attn.astype(mx.float32)), width
+
+
+@needs
+@pytest.mark.parametrize("width", [1, 3, 4, 8])
+@pytest.mark.parametrize("cap", [0.0, 30.0])
+def test_head_logits_in_one_launch_equal_the_sliced_capped_product(width, cap):
+    """affine_logits: the product, the vocabulary slice and the soft cap in one launch, each value as
+    MLX's one-row product sliced and capped by MLX's own divide, tanh and multiply."""
+    from mtplx.models.inkling.fast.qproduct import affine_logits
+
+    m = _Affine(8200, 2304, 4, 64, seed=5)
+    vocab = 8137
+    x = mx.random.normal((1, width, 2304), key=mx.random.key(40 + width)).astype(mx.bfloat16).astype(mx.float32)
+    got = affine_logits(x, m, width=vocab, cap=cap)
+    assert got.shape == (1, width, vocab) and got.dtype == mx.float32
+    for r in range(width):
+        want = m.one_row(x[:, r:r + 1])[..., :vocab]
+        want = mx.tanh(want / cap) * cap if cap else want
+        assert _bits(got[:, r:r + 1], want), (width, r)
+
+
+@needs
+@pytest.mark.parametrize("shape", [(2304, 3072, 4, 64), (8200, 2304, 4, 64), (8192, 2304, 8, 32)])
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
+def test_fp16_packs_every_panel_row_equals_the_one_row_product(shape, dtype):
+    """The FP16 sibling packs: float16 scales and biases, float16 stream (the head takes float32)."""
+    from mtplx.models.inkling.fast.qproduct import affine_product
+
+    rows, cols, bits, group = shape
+    m = _Affine(rows, cols, bits, group, seed=rows + bits + 1, dtype="float16")
+    assert m.scales.dtype == mx.float16
+    for width in (1, 2, 4, 8):
+        x = mx.random.normal((1, width, cols), key=mx.random.key(width + 9)).astype(mx.float16)
+        x = x.astype(getattr(mx, dtype))
+        got = affine_product(x, m)
+        assert got.dtype == x.dtype and got.shape == (1, width, rows)
+        for r in range(width):
+            assert _bits(got[:, r:r + 1], m.one_row(x[:, r:r + 1])), (width, r)
+
+
+@needs
+@pytest.mark.parametrize("width", [1, 4, 8])
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_head_logits_from_the_16_bit_hidden_equal_the_float32_reference(width, dtype):
+    """affine_logits(widen=True): the head's 16-bit hidden widened inside the launch, each value as MLX's
+    one-row product of the float32 copy, sliced and capped by MLX's own launches."""
+    from mtplx.models.inkling.fast.qproduct import affine_logits
+
+    m = _Affine(8200, 2304, 4, 64, seed=7, dtype=dtype)
+    vocab, cap = 8137, 30.0
+    x = mx.random.normal((1, width, 2304), key=mx.random.key(60 + width)).astype(getattr(mx, dtype))
+    got = affine_logits(x, m, width=vocab, cap=cap, widen=True)
+    assert got.shape == (1, width, vocab) and got.dtype == mx.float32
+    for r in range(width):
+        want = m.one_row(x[:, r:r + 1].astype(mx.float32))[..., :vocab]
+        assert _bits(got[:, r:r + 1], mx.tanh(want / cap) * cap), (width, r)

@@ -58,6 +58,7 @@ from . import round as fast_round
 from .routes import capture_counts, count, stage_paths
 from .state import BANK_STEP, DecodeState, round_up
 from .step import decode_panel
+from .step import embed as fast_embed
 
 NAME = "inkling.round"
 _ATTRIBUTE = "_mtplx_inkling_round_site"
@@ -459,7 +460,7 @@ def propose(drafter, target, anchor, view: DraftView, count_: int, *, position, 
     if cap is None:
         cap = target.config.get("final_logit_softcapping") or 0.0
     anchor_ids = anchor.astype(mx.int32).reshape(1, 1)
-    embed = target.embed_tokens(anchor_ids)
+    embed = fast_embed(target, anchor_ids)
     dtype = embed.dtype
     masks = mx.broadcast_to(drafter.mask, (1, drafter.width - 1, embed.shape[-1]))
     h, residual = mx.concatenate([embed, masks], axis=1), None
@@ -476,12 +477,16 @@ def propose(drafter, target, anchor, view: DraftView, count_: int, *, position, 
     if isinstance(target.unembed, AffineWeight):
         # A packed head (Bare Speed, Optimized Speed): lane L1's launch, one read of the codes for
         # all the proposal rows (MLX's 2-to-24-row product reads them per row block, 2.7 against
-        # 1.9 ms at 8 rows); fed float32, as the verify's head is. Where it refuses (a stored form
-        # it does not take, a failed first-use proof on this Mac), MLX's product, counted.
-        from .qproduct import affine_product
+        # 1.9 ms at 8 rows); fed float32, as the verify's head is (a bf16 row widened inside the
+        # launch: the same values, no cast launch). Where it refuses (a stored form it does not take,
+        # a failed first-use proof on this Mac), MLX's product, counted.
+        from .qproduct import STREAM_TYPES, affine_product
 
         try:
-            base = affine_product(h.astype(mx.float32), target.unembed)[..., : drafter.vocab]
+            if h.dtype in STREAM_TYPES:
+                base = affine_product(h, target.unembed, widen=True)[..., : drafter.vocab]
+            else:
+                base = affine_product(h.astype(mx.float32), target.unembed)[..., : drafter.vocab]
         except RuntimeError:
             count("fallback.draft_head.affine_launch_refused")
     if base is None:
@@ -493,6 +498,8 @@ def propose(drafter, target, anchor, view: DraftView, count_: int, *, position, 
         "rnn_proj.bias"
     ].astype(mx.float32)
     folded = drafter.fold(target.unembed)
+    from .matvec import matvec
+
     start = position.astype(mx.uint32).reshape(())
     # Kept constants, not fresh host scalars, anywhere in the program (see round.commit_count):
     # the same values, so the same bits.
@@ -502,12 +509,13 @@ def propose(drafter, target, anchor, view: DraftView, count_: int, *, position, 
     picks, laws, stats, confidence = [], [], [], []
     for i in range(count_):
         step_in = mx.concatenate([state, drafter.markov["markov_w1.weight"][prev]], axis=-1)
-        update = (linear(step_in.astype(mx.float32), weights[:, : 2 * rank]) + conditioned[:, i]).astype(dtype)
+        # The drafter's products as the library's mat-vec in launches of ours (fast/matvec.py), bit for bit.
+        update = (matvec(step_in.astype(mx.float32), weights, cols=2 * rank) + conditioned[:, i]).astype(dtype)
         gate, candidate, output = mx.split(update, 3, axis=-1)
         gate = mx.sigmoid(gate.astype(mx.float32)).astype(dtype)
         state = gate * state + (one - gate) * mx.tanh(candidate.astype(mx.float32)).astype(dtype)
         signal = mx.tanh(output.astype(mx.float32)).astype(dtype)
-        bias = mx.addmm(folded[:, -1], signal, folded[:, :-1].T)
+        bias = matvec(signal, folded, cols=folded.shape[1] - 1, bias_col=folded.shape[1] - 1)
         scores = base[:, i] + bias
         if greedy:
             law, st = fast_round.law_rows(scores, temperature=None, cap=0.0, write=True)

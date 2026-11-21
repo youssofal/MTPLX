@@ -47,6 +47,7 @@ THREADS = 256
 PER_THREAD = 8
 CHUNK = THREADS * PER_THREAD  # vocabulary entries per threadgroup
 MAX_ROWS = 8  # anchor + 7 proposals: the trained DSpark block
+WIDE_ROWS = 32  # a prompt-copy panel: the anchor and up to 31 copied tokens (fast/state.MAX_PANEL)
 
 PURPOSE_DRAFT = 1
 PURPOSE_ACCEPT = 2
@@ -386,6 +387,28 @@ _DECIDE = r"""
 """
 
 
+def _rewrite_once(text, pairs):
+    for old, new in pairs:
+        if text.count(old) != 1:
+            raise AssertionError(f"expected one {old!r} in the kernel text")
+        text = text.replace(old, new)
+    return text
+
+
+# The decision for 9 to 32 rows (prompt-copy panels): the same per-row arithmetic and the same
+# walk, the 8 simdgroups each taking every eighth row and the per-row slots sized for 32. The
+# 2- to 8-row kernel's text and programs stay as they are.
+_DECIDE_WIDE = _rewrite_once(_DECIDE, [
+    ("uint sg = simdgroup_index_in_threadgroup;", "uint first = simdgroup_index_in_threadgroup;"),
+    ("threadgroup int win_r[8];", "threadgroup int win_r[32];"),
+    ("threadgroup int win_p[8];", "threadgroup int win_p[32];"),
+    ("threadgroup int accept[8];", "threadgroup int accept[32];"),
+    ("threadgroup float aprob[8];", "threadgroup float aprob[32];"),
+    ("threadgroup int bad[8];", "threadgroup int bad[32];"),
+    ("    if (sg < W) {\n", "    for (uint sg = first; sg < W; sg += L4_THREADS / 32) {\n"),
+])
+
+
 # Winner of each row's p race (one simdgroup per row).
 _FINISH = r"""
     uint row = threadgroup_position_in_grid.x;
@@ -453,16 +476,26 @@ def _kernel(name):
             source=_FINISH,
             header=_HEADER + _ROW_WINNER,
         )
-    if name == "decide":
+    if name in ("decide", "decide_wide"):
         return mx.fast.metal_kernel(
-            name="mtplx_inkling_l4_decide",
+            name="mtplx_inkling_l4_" + name,
             input_names=["race", "lse", "tlaw", "dlaw", "proposals", "modes", "positions",
                          "seed", "sizes", "offered"],
             output_names=["packet"],
-            source=_DECIDE,
+            source=_DECIDE if name == "decide" else _DECIDE_WIDE,
             header=_HEADER + _ROW_WINNER,
         )
     raise KeyError(name)
+
+
+def wide_decision_enabled():
+    """Whether prompt-copy panels of 9 to 32 rows are decided on the GPU (``decide`` with the
+    point-mass law the 2- to 8-row copy rounds already use) instead of by the host's seed-match
+    draw. Class B against the host route (each is exact; per-seed tokens differ), so it is off
+    until the lead decides: ``MTPLX_INKLING_WIDE_DECISION=1``."""
+    import os
+
+    return (os.environ.get("MTPLX_INKLING_WIDE_DECISION") or "").strip().lower() in {"1", "on", "true", "yes"}
 
 
 def law_params(rows, temperature=1.0, cap=0.0):
@@ -565,8 +598,8 @@ def decide(target_logits, proposals, *, position, seed, temperature=1.0, draft=N
         raise ValueError("decide takes (rows, vocabulary) target logits")
     rows, vocab = target_logits.shape
     k = int(proposals.shape[0]) if proposals is not None else 0
-    if rows != k + 1 or not 1 <= rows <= MAX_ROWS:
-        raise ValueError(f"a panel of {rows} rows needs {rows - 1} proposals (at most {MAX_ROWS})")
+    if rows != k + 1 or not 1 <= rows <= WIDE_ROWS:
+        raise ValueError(f"a panel of {rows} rows needs {rows - 1} proposals (at most {WIDE_ROWS - 1})")
     greedy = (not temperature or temperature <= 0) if greedy is None else greedy
     tlaw, tstats = law_rows(target_logits, temperature=None if greedy else temperature,
                             params=None if greedy else params)
@@ -589,7 +622,7 @@ def decide(target_logits, proposals, *, position, seed, temperature=1.0, draft=N
     elif not isinstance(offered, mx.array):
         offered = _const([int(offered)], mx.uint32)
     offered = offered.astype(mx.uint32).reshape(1)
-    (packet,) = _kernel("decide")(
+    (packet,) = _kernel("decide" if rows <= MAX_ROWS else "decide_wide")(
         inputs=[race_parts, lse, tlaw, dlaw if dlaw is not None else _const([0.0], mx.float32),
                 props.astype(mx.int32) if k else _const([0], mx.int32), modes, positions,
                 seed_words, sizes, offered],
@@ -706,9 +739,15 @@ def read_draw(drawn, rows=None, settle=None):
     return [int(t) for t in values[0]]
 
 
-def warm(vocab=4096):
+def warm(vocab=4096, wide=False):
     """Build every kernel variant the round uses on a small vocabulary, so the first request
-    after a model load does not pay the Metal compiles (call once at load; about a second)."""
+    after a model load does not pay the Metal compiles (call once at load; about a second).
+    ``wide`` also builds the 9- to 32-row decision copy panels take (``wide_decision_enabled``)."""
+    if wide:
+        panel = mx.zeros((WIDE_ROWS, vocab), mx.float32)
+        copied = mx.arange(1, WIDE_ROWS, dtype=mx.int32)
+        mx.eval([decide(panel, copied, position=0, seed=_seed_words(1)),
+                 decide(panel, copied, position=0, seed=_seed_words(1), temperature=0)])
     rows = mx.zeros((4, vocab), mx.float32)
     draft_rows = mx.zeros((3, vocab), mx.bfloat16)
     seed = _seed_words(1)
