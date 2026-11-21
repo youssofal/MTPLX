@@ -46,8 +46,10 @@ _VERDICT: dict = {}
 _PLAN: dict = {}
 #: Simdgroups of the launch.
 SIMDGROUPS = 8
-#: Score-product steps whose operands are read ahead of their multiply.
-AHEAD = 4
+#: Score-product steps whose operands are read ahead of their multiply. One: a deeper ring is
+#: indexed by the loop and leaves registers (f1-naxbench-1: 210 us a read at four, against 13-31 us
+#: at one and the library's 57-60 us).
+AHEAD = 1
 #: Threadgroup memory the launch may take (the partials and the softmax weights), bytes.
 _TG_BYTES = 28 * 1024
 

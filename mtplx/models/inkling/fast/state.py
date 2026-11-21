@@ -218,6 +218,7 @@ class DecodeState:
             return
         end = self.length + kept
         write = _row_writer(deltas[0].keys) if deltas else None
+        offsets: dict = {}  # host offset -> its int32 array, made once a commit (every window visit shares one)
         for visit, delta in enumerate(deltas):
             kv, conv = self.cache[2 * visit], self.cache[2 * visit + 1]
             keys, values = delta.keys[:, :, :kept], delta.values[:, :, :kept]
@@ -231,10 +232,14 @@ class DecodeState:
                 if write is not None:
                     # Lane F1: each run in one launch of the native row writer (the same 16-bit
                     # payloads, in place while owned), not two library copies.
-                    at = mx.array(first, mx.int32)
+                    at = offsets.get(first)
+                    if at is None:
+                        at = offsets[first] = mx.array(first, mx.int32)
                     kv.keys, kv.values = write(kv.keys, keys[:, :, :head], at), write(kv.values, values[:, :, :head], at)
                     if head < kept:
-                        zero = mx.array(0, mx.int32)
+                        zero = offsets.get(0)
+                        if zero is None:
+                            zero = offsets[0] = mx.array(0, mx.int32)
                         kv.keys = write(kv.keys, keys[:, :, head:], zero)
                         kv.values = write(kv.values, values[:, :, head:], zero)
                 else:
@@ -248,7 +253,9 @@ class DecodeState:
                 if end > kv.keys.shape[2]:
                     self._grow(kv, end)
                 if write is not None:
-                    at = mx.array(self.length, mx.int32)
+                    at = offsets.get(("bank", self.length))
+                    if at is None:
+                        at = offsets[("bank", self.length)] = mx.array(self.length, mx.int32)
                     kv.keys, kv.values = write(kv.keys, keys, at), write(kv.values, values, at)
                 else:
                     kv.keys[:, :, self.length : end, :] = keys
