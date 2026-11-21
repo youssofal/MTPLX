@@ -55,6 +55,31 @@ def test_every_visit_equals_its_own_read(rows, prior):
         assert _bits(whole[k], lane), f"visit {k}: differs from lane L1's read at {rows} rows, {prior} prior states"
 
 
+@needs
+@pytest.mark.parametrize("rows", [1, 4, 8, 16])
+@pytest.mark.parametrize("prior", [2, 3])
+def test_the_pass_reads_take_one_launch(rows, prior, monkeypatch):
+    """By default a pass's twelve message reads are one launch (read.exact_read with the visits side by
+    side), proven against the library's two products around the softmax; on a GPU without matrix
+    units the read refuses (counted) and the library's launches give the rows."""
+    from mtplx.models.inkling.fast import library_gemm
+    from mtplx.models.inkling.fast import read as R
+    from mtplx.models.inkling.fast.attn_input import route_counts
+    from mtplx.models.inkling.fast.pass_messages import batched_rows
+
+    monkeypatch.delenv("MTPLX_INKLING_NAX_READS", raising=False)
+    stack, table = _operands(rows, prior, 20261122 + 7 * rows + prior)
+    whole = batched_rows(stack, table)
+    mx.eval(whole)
+    key = (4, prior, rows, D, VISITS)
+    tag = "exact_read_" + "_".join(map(str, key))
+    if library_gemm.gpu_generation() >= 17:
+        assert R._exact_verdicts.get(key) is True, f"the batched read was not proven: {route_counts()}"
+    else:
+        assert any(k.startswith("refused:exact_read_") and k.endswith(tag[len("exact_read_"):])
+                   for k in route_counts())
+
+
 @pytest.fixture
 def engine_module(monkeypatch):
     """The native engine module named by ``INKLING_TEST_ENGINE`` (the suite drops ``MTPLX_*``

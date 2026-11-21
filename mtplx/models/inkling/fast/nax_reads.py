@@ -25,7 +25,8 @@ that product shape when no recording is running, else the plan the library takes
 every recording so far (two partitions, 2,048 rows of K) is tried; either way the proof decides. A
 shape that differs, a Mac whose MLX does not put these products on the matrix units, an MLX whose
 headers do not read, or a CPU run keeps the library's launches, counted
-``fallback.nax_reads.<why>``. ``MTPLX_INKLING_NAX_READS=0`` turns it off.
+``fallback.nax_reads.<why>``. Off by default (``read.exact_read`` serves the same reads in one launch);
+``MTPLX_INKLING_NAX_READS=1`` turns it on.
 """
 
 from __future__ import annotations
@@ -61,7 +62,10 @@ _SPLIT_K = "steel_gemm_splitk_nax_nt_float32_float32_bm64_bn64_bk256_wm2_wn2"
 
 
 def enabled():
-    return os.environ.get("MTPLX_INKLING_NAX_READS", "1").strip().lower() not in ("0", "off", "false", "no")
+    """Off by default since 17:25 UTC: the reads take ``read.exact_read`` (one launch on the library's
+    own tile loop); ``MTPLX_INKLING_NAX_READS=1`` puts these launches first, for the A/B that decides
+    which of the two stays."""
+    return os.environ.get("MTPLX_INKLING_NAX_READS", "0").strip().lower() not in ("0", "off", "false", "no", "")
 
 
 @lru_cache(maxsize=1)

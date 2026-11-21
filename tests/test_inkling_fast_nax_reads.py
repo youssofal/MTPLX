@@ -21,6 +21,13 @@ def _bits(a, b):
         mx.array_equal(mx.contiguous(a).view(view), mx.contiguous(b).view(view)).item())
 
 
+@pytest.fixture(autouse=True)
+def nax_reads_on(monkeypatch):
+    """These launches are off by default (``read.exact_read`` serves the reads); this file proves them
+    with their switch on (a test that turns it off sets it again)."""
+    monkeypatch.setenv("MTPLX_INKLING_NAX_READS", "1")
+
+
 @pytest.fixture
 def engine_module(monkeypatch):
     """The native engine module named by ``INKLING_TEST_ENGINE`` (the suite drops ``MTPLX_*``

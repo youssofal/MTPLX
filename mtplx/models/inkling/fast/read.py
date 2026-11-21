@@ -771,7 +771,9 @@ def attend_rows(q, keys):
 
 
 _EXACT = """
-    // One threadgroup per (panel row r, column group g). The three products of a depth read run here as
+    // One threadgroup per (visit v, panel row r, column group g); a depth read is one visit (V = 1), a
+    // loop pass's message reads are its V visits' queries against the same stack. The three products of a
+    // read run here as
     // the library's own code (``fast.library_gemm``), each called the way the library's
     // launch for that product's shape calls it, so every value is the library's:
     //   scores  = queries . keys_r^T: the split-K product on the matrix units (each K partition one
@@ -782,10 +784,11 @@ _EXACT = """
     // Results pass between the steps through device scratch inside this threadgroup.
     using namespace mlx::steel;
     const uint grp = threadgroup_position_in_grid.x;
-    const uint r = grp / G, g = grp % G;
+    const uint v = grp / (ROWS * G), r = (grp / G) % ROWS, g = grp % G;
     const uint sg = simdgroup_index_in_threadgroup;
     const uint lane = thread_index_in_simdgroup;
     const device float* kr = keys + size_t(r) * N * D;
+    const device float* qs = queries + size_t(v) * Q * D;          // this visit's Q queries
     device float* sk = scratch + size_t(grp) * (PARTS + 1) * Q * N;   // PARTS partials, then weights
     device float* wt = sk + PARTS * Q * N;
 
@@ -799,7 +802,7 @@ _EXACT = """
         const constant float& none = zero[0];       // no bias term (alpha, beta unused)
         const uint3 first_group = uint3(0, 0, 0);
         const uint3 thread_at = uint3(lane, sg, 0);
-        MatVec::run(queries, kr, queries /* no bias */, sk, k_len, q_len, k_len /* row stride */, none, none,
+        MatVec::run(qs, kr, qs /* no bias */, sk, k_len, q_len, k_len /* row stride */, none, none,
                     q_len, &reduce[0], first_group, thread_at, uint(sg), uint(lane));
     } else {
         // Split-K tiles of 64 x 64 over simdgroups 0-3 (2 x 2, 32 x 32 each); simdgroups 4-7 hold a tile
@@ -816,7 +819,7 @@ _EXACT = """
               dispatch_bool(rows_here == 32, [&](auto whole_m) {
                 dispatch_bool(cols_here == 32, [&](auto whole_n) {
                   tile = gemm_loop<float, 32, 32, 32, KB, false, true, whole_m.value, whole_n.value,
-                                   whole_k.value, float>(queries + kbeg + int(row0) * D, kr + kbeg + int(col0) * D,
+                                   whole_k.value, float>(qs + kbeg + int(row0) * D, kr + kbeg + int(col0) * D,
                                                          D, D, klen, klen / KB, rows_here, cols_here);
                 });
               });
@@ -853,7 +856,7 @@ _EXACT = """
         const int col = int(c) * 32;
         NAXTile<float, 2, 2> tile = gemm_loop<float, 32, 32, 32, 256, false, false, false, true, false, float>(
             wt, kr + col, N, D, N, 0, short(Q), short(32));
-        tile.store_safe(out + size_t(r) * Q * D + col, D, short2(32, Q));
+        tile.store_safe(out + (size_t(v) * ROWS + r) * Q * D + col, D, short2(32, Q));
     }
 """
 
@@ -888,18 +891,23 @@ def _exact_refusal(key, why, tag):
         print(f"[inkling] one-launch read {key} refused: {why}")
 
 
-def exact_read(q, keys, reference):
+def exact_read(q, keys, reference, visits=1):
     """The depth read ``softmax(q . keys_r^T * D^-1/2) . keys_r`` of every panel row in one launch, bit
     for bit the read ``reference()`` gives (the library's products and RC6's softmax): proven on
     this Mac's first use of each shape (counted), else ``None`` and the caller keeps its launches.
-    ``q`` ``(Q, D)`` float32, ``keys`` ``(1, W, N, D)`` float32 -> ``(1, W, Q, D)`` float32."""
+    ``q`` ``(Q, D)`` float32, ``keys`` ``(1, W, N, D)`` float32 -> ``(1, W, Q, D)`` float32.
+
+    ``visits`` > 1: ``q`` is ``(visits * Q, D)``, ``visits`` groups of ``Q`` queries each read the same
+    ``keys`` (a loop pass's message reads: every visit's four queries against the pass's stack), in
+    the same launch, -> ``(visits, W, Q, D)``; each visit's rows are the read of its own ``Q`` queries."""
     from . import library_gemm
 
     from .attn_input import count_route
 
-    nq, width = q.shape
+    width = q.shape[1]
+    nq = q.shape[0] // visits
     rows, count = keys.shape[1], keys.shape[2]
-    key = (nq, count, rows, width)
+    key = (nq, count, rows, width) if visits == 1 else (nq, count, rows, width, visits)
     verdict = _exact_verdicts.get(key)
     if verdict is False or not _EXACT_ON:
         return None
@@ -912,7 +920,8 @@ def exact_read(q, keys, reference):
     if tiles is None:
         _exact_refusal(key, why, "tiles")
         return None
-    if nq > 4 or count > 32 or width % (32 * _EXACT_GROUPS) or q.dtype != mx.float32 or keys.dtype != mx.float32:
+    if (nq > 4 or count > 32 or width % (32 * _EXACT_GROUPS) or nq * visits != q.shape[0]
+            or q.dtype != mx.float32 or keys.dtype != mx.float32):
         _exact_refusal(key, "shape or type outside the one-launch read", "shape")
         return None
     kernel, why = _exact_kernel()
@@ -924,14 +933,15 @@ def exact_read(q, keys, reference):
         scalars = _exact_scalars[(width, nq)] = (mx.array([width], mx.int32), mx.array([nq], mx.int32),
                                                  mx.array([0.0], mx.float32))
     parts = 1 if tiles.kind == "matvec" else tiles.partitions
+    groups = visits * rows * _EXACT_GROUPS
     out = kernel(
         inputs=[q, keys, *scalars],
-        template=[("Q", nq), ("N", count), ("D", width), ("G", _EXACT_GROUPS), ("PARTS", parts),
+        template=[("Q", nq), ("N", count), ("D", width), ("G", _EXACT_GROUPS), ("ROWS", rows), ("PARTS", parts),
                   ("PART", tiles.partition or width), ("KB", tiles.block_k or 256), ("VT", 4 if nq >= 4 else 1),
                   ("SCALE", _f32_bits(width ** -0.5))],
-        grid=(rows * _EXACT_GROUPS * 256, 1, 1),
+        grid=(groups * 256, 1, 1),
         threadgroup=(256, 1, 1),
-        output_shapes=[(1, rows, nq, width), (rows * _EXACT_GROUPS * (parts + 1) * nq * count,)],
+        output_shapes=[(visits, rows, nq, width), (groups * (parts + 1) * nq * count,)],
         output_dtypes=[mx.float32, mx.float32],
     )[0]
     if verdict is None:
@@ -968,9 +978,9 @@ def depth_read(queries, keys):
         one = exact_read(q, keys, library)
         return one if one is not None else library()
 
-    # Trial integration: two one-launch reads exist (nax_reads.depth_read and exact_read above), both
-    # proven bit for bit against the library's launches on first use. The first serves; with
-    # MTPLX_INKLING_NAX_READS=0 the second does. One of them goes once both are timed in one job.
+    # exact_read serves (the lead's call after the trial census, 17:25 UTC). The other one-launch read,
+    # nax_reads.depth_read, serves only under MTPLX_INKLING_NAX_READS=1, until one job has timed both
+    # (lanes/F1.md): then one of them goes.
     from .nax_reads import depth_read as one_launch
 
     return one_launch(queries, keys, exact)
