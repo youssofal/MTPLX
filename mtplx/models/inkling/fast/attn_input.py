@@ -36,21 +36,42 @@ only; the panel's key/value rows and convolution inputs are returned for L0 to c
 
 from __future__ import annotations
 
+from collections import Counter
 from functools import lru_cache
 import math
 import struct
+from threading import Lock
 from typing import NamedTuple
 
 import mlx.core as mx
 
+_routes: Counter = Counter()
+_lock = Lock()
+
+
+def count_route(name):
+    with _lock:
+        _routes[name] += 1
+
+
+def route_counts():
+    """Stage-A and MLP-source selections since the last reset: ``fused:<kind>`` or ``refused:<why>``."""
+    with _lock:
+        return dict(_routes)
+
+
+def reset_route_counts():
+    with _lock:
+        _routes.clear()
+
 #: Threads of one projection threadgroup (eight simdgroups).
 _THREADS = 256
 #: Gate rows a gate threadgroup projects.
-_GATE_ROWS = 64
+_GATE_ROWS = 32
 #: Panel rows one simdgroup accumulates at once (wider panels loop, re-reading cached weights).
 _ROW_CHUNK = 8
-#: Loop-pass inputs are normalized once per threadgroup into threadgroup memory when they fit.
-_STAGE_RAW = True
+#: Stage each threadgroup's input in threadgroup memory (whole panel when it fits, else in chunks).
+_STAGE = True
 
 
 def f32_bits(value: float) -> int:
@@ -87,6 +108,20 @@ _HEADER = """
         LOAD_BF16X4(normed + (size_t(r) * NS + src) * D + (col), xv);                   \\
     }
 
+// Four consecutive columns of panel row r of this threadgroup's source, staged as bf16 at dst.
+#define STAGE4(r, c, dst)                                                               \\
+    if (RAW) {                                                                          \\
+        const device bfloat16_t* gs_ = (src == 0 ? g0 : (src == 1 ? g1 : g2)) + (c);    \\
+        const float4 h4_ = *reinterpret_cast<const device float4*>(                     \\
+            hraw + (size_t(r) * NS + src) * D + (c));                                   \\
+        const float iv_ = inv_rows[r];                                                  \\
+        for (uint j_ = 0; j_ < 4; ++j_)                                                 \\
+            (dst)[j_] = static_cast<bfloat16_t>(static_cast<float>(gs_[j_]) * (h4_[j_] * iv_)); \\
+    } else {                                                                            \\
+        *reinterpret_cast<threadgroup uint2*>(dst) =                                    \\
+            *reinterpret_cast<const device uint2*>(normed + (size_t(r) * NS + src) * D + (c)); \\
+    }
+
 #define GAINS4(col, gv)                                                                 \\
     if (RAW && !STAGE) {                                                                \\
         const device bfloat16_t* gp_ = (src == 0 ? g0 : (src == 1 ? g1 : g2)) + (col);  \\
@@ -107,7 +142,11 @@ _PROJECT = """
 
     threadgroup float outs[OUTS];
     threadgroup float inv_rows[W];
-    threadgroup bfloat16_t stage_in[STAGE ? W * D : 1];
+    // Staged inputs, declared as uint2 so their 8-byte stores are aligned; read as bf16.
+    threadgroup uint2 stage_u2[STAGE ? W * D / 4 : 1];
+    threadgroup uint2 chunk_u2[STAGE2 ? RCH * KC / 4 : 1];
+    threadgroup bfloat16_t* stage_in = reinterpret_cast<threadgroup bfloat16_t*>(stage_u2);
+    threadgroup bfloat16_t* chunk_in = reinterpret_cast<threadgroup bfloat16_t*>(chunk_u2);
 
     // Units, heaviest first: query heads (with their relative head and sink row), key heads,
     // value heads, then gate slices.
@@ -128,19 +167,14 @@ _PROJECT = """
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (STAGE) {
-            const device bfloat16_t* gsrc = src == 0 ? g0 : (src == 1 ? g1 : g2);
-            for (uint idx = thread_index_in_threadgroup; idx < W * (D / 4); idx += THREADS) {
-                const uint rr = idx / (D / 4), c = (idx % (D / 4)) * 4;
-                const float4 h4 = *reinterpret_cast<const device float4*>(hraw + (size_t(rr) * NS + src) * D + c);
-                const float iv = inv_rows[rr];
-                for (uint j = 0; j < 4; ++j) {
-                    const float gj = static_cast<float>(gsrc[c + j]);
-                    stage_in[rr * D + c + j] = static_cast<bfloat16_t>(gj * (h4[j] * iv));
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (STAGE) {
+        // The whole panel's input in threadgroup memory: every simdgroup then reads it from there.
+        for (uint idx = thread_index_in_threadgroup; idx < W * (D / 4); idx += THREADS) {
+            const uint rr = idx / (D / 4), c = (idx % (D / 4)) * 4;
+            STAGE4(rr, c, &stage_in[rr * D + c]);
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     // ------------------------------------------------------------------ products
@@ -150,7 +184,78 @@ _PROJECT = """
     else if (kind == 3) nblocks = GROWS / 4;
     else nblocks = HD / 4;
 
-    for (uint blk = sg; blk < nblocks; blk += NSG) {
+    if (STAGE2) {
+        // Panels too wide to stage whole: all simdgroups advance block by block in step and the
+        // input is staged KC columns at a time (each value written once per round instead of read
+        // or normed once per simdgroup). Same values, same per-row order as below.
+        const uint rounds = (nblocks + NSG - 1) / NSG;
+        for (uint rc = 0; rc < W; rc += RCH) {
+            for (uint round = 0; round < rounds; ++round) {
+                const uint blk = round * NSG + sg;
+                const bool active = blk < nblocks;
+                uint m0 = 0, slot = 0;
+                if (active) {
+                    if (kind == 0) {
+                        if (blk < HD / 4) { mat = wq; m0 = h * HD + 4 * blk; slot = 4 * blk; }
+                        else { mat = wr; m0 = h * RD + 4 * (blk - HD / 4); slot = HD + 4 * (blk - HD / 4); }
+                    } else if (kind == 1) { mat = wk; m0 = h * HD + 4 * blk; slot = 4 * blk; }
+                    else if (kind == 2) { mat = wv; m0 = h * HD + 4 * blk; slot = 4 * blk; }
+                    else { mat = wg; m0 = h * GROWS + 4 * blk; slot = 0; }
+                }
+                const device bfloat16_t* wrow = mat + size_t(m0) * D + lane * 4;
+                float acc[4][RCH];
+                for (uint tm = 0; tm < 4; ++tm)
+                    for (uint r = 0; r < RCH; ++r) acc[tm][r] = 0.0f;
+                for (uint c0 = 0; c0 < D; c0 += KC) {
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (uint idx = thread_index_in_threadgroup; idx < RCH * (KC / 4); idx += THREADS) {
+                        const uint rr = idx / (KC / 4), c = (idx % (KC / 4)) * 4;
+                        if (rc + rr < W && c0 + c < D) {
+                            STAGE4(rc + rr, c0 + c, &chunk_in[rr * KC + c]);
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (active) {
+                        const uint i_end = (c0 + KC < D ? c0 + KC : D) / 128;
+                        for (uint i = c0 / 128; i < i_end; ++i) {
+                            float wt[4][4];
+                            for (uint tm = 0; tm < 4; ++tm) LOAD_BF16X4(wrow + size_t(tm) * D + i * 128, wt[tm]);
+                            for (uint r = 0; r < RCH; ++r) {
+                                if (rc + r < W) {
+                                    float xv[4];
+                                    for (uint t_ = 0; t_ < 4; ++t_)
+                                        xv[t_] = static_cast<float>(chunk_in[r * KC + (i * 128 - c0) + lane * 4 + t_]);
+                                    for (uint tm = 0; tm < 4; ++tm)
+                                        for (uint tn = 0; tn < 4; ++tn)
+                                            acc[tm][r] += wt[tm][tn] * xv[tn];
+                                }
+                            }
+                        }
+                    }
+                }
+                if (active) {
+                    for (uint tm = 0; tm < 4; ++tm)
+                        for (uint r = 0; r < RCH; ++r)
+                            for (ushort sn = 16; sn >= 1; sn >>= 1)
+                                acc[tm][r] += simd_shuffle_down(acc[tm][r], sn);
+                    if (lane == 0) {
+                        for (uint r = 0; r < RCH && rc + r < W; ++r) {
+                            for (uint tm = 0; tm < 4; ++tm) {
+                                const bfloat16_t y = static_cast<bfloat16_t>(acc[tm][r]);
+                                if (kind == 3) {
+                                    gate[size_t(rc + r) * GN + m0 + tm] = y;
+                                } else {
+                                    const uint stride = kind == 0 ? OQ : OK;
+                                    outs[(rc + r) * stride + slot + tm] = static_cast<float>(y);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (uint blk = sg; !STAGE2 && blk < nblocks; blk += NSG) {
         uint m0;        // first matrix row of this block
         uint slot;      // where row tm of the block lands in outs, per panel row
         if (kind == 0) {
@@ -462,10 +567,15 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
     if pos.dtype != mx.uint32:
         pos = pos.astype(mx.uint32)
     groups = q_heads + 2 * kv_heads + gate_rows // gate_rows_unit
-    # Normalize a loop pass's inputs once per threadgroup when the panel fits threadgroup memory.
-    if stage is None:
-        stage = _STAGE_RAW
-    stage = bool(stage and raw is not None and rows * width * 2 + (head_dim + rel_dim + 1) * rows * 4 <= 31 * 1024)
+    out_bytes = (head_dim + rel_dim + 1) * rows * 4
+    staging = _STAGE if stage is None else bool(stage)
+    stage = bool(staging and rows * width * 2 + out_bytes <= 31 * 1024)
+    # A wider loop-pass panel stages KC columns at a time (all simdgroups in step) rather than norm
+    # its input in every simdgroup; a wider first-pass panel reads its bf16 input from device memory,
+    # which measured faster than chunked staging (receipts/probe-mode-1.json: 86 vs 104 us at 8 rows).
+    stage2 = bool(raw is not None and not stage)
+    chunk = min(rows, _ROW_CHUNK)
+    kc = max(128, min(width, ((31 * 1024 - out_bytes) // (chunk * 2)) // 128 * 128))
     outputs = _project_kernel()(
         inputs=[
             normed, hraw, parts, *gain_list,
@@ -474,7 +584,8 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
             k_tail if has_tail else stand_in, v_tail if has_tail else stand_in, pos,
         ],
         template=[
-            ("W", rows), ("NS", ns), ("RAW", raw is not None), ("STAGE", stage), ("GLOBAL", global_visit),
+            ("W", rows), ("NS", ns), ("RAW", raw is not None), ("STAGE", stage), ("STAGE2", stage2),
+            ("KC", kc), ("GLOBAL", global_visit),
             ("D", width), ("QH", q_heads), ("HD", head_dim), ("RD", rel_dim),
             ("KH", kv_heads), ("KN", kv_width), ("GN", gate_rows), ("GROWS", gate_rows_unit),
             ("TAPS", taps), ("RCH", min(rows, _ROW_CHUNK)), ("THREADS", threads),
@@ -524,7 +635,9 @@ def attention_input(layer, x, closed, k_tail, v_tail, pos, messages=None, messag
     if layer.sliding:
         form = _static_form(layer.k.shape[0], layer.convs[0].size)
         if form not in ("float", "fused"):
+            count_route("refused:static_conv_unproven")
             raise RuntimeError(f"static convolution unproven on this GPU: {form}")
+    count_route("fused:" + ("window" if layer.sliding else "global") + ("_loop" if messages is not None else "_first"))
     rows, width = x.shape[-2], x.shape[-1]
     x2 = x.reshape(rows, width)
     closed2 = [c.reshape(rows, width) for c in closed]

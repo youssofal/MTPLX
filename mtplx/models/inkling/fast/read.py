@@ -576,7 +576,10 @@ def mlp_source(layer, partial, closed, messages=None, message_queries=None):
     ``partial`` ``(1, W, D)`` f32 from stage B/C; ``closed`` including this layer's boundary
     append. Returns ``(1, W, D)`` float32. One launch on the first pass, two on passes 2 and 3.
     """
+    from .attn_input import count_route
+
     rows, width = partial.shape[-2], partial.shape[-1]
+    count_route("fused:mlp_" + ("loop" if messages is not None else "first"))
     if messages is None:
         out = read(partial, closed, layer.mlp_query, layer.eps, mode=1)
         return out[0].reshape(1, rows, width)
