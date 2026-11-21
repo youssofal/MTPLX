@@ -1609,6 +1609,7 @@ class ReplaySite:
         ticket._key = key
         ticket._started = time.perf_counter()
         in_place: _InPlace | None = None
+        live_written = False  # the replay ran on live banks: from here an error cannot fall back
         try:
             if not protect_banks and _env_flag(DIAGNOSE_ENV) and _runtime.dump_dir() is not None:
                 # Agent A's diagnosis: every input copied before anything runs
@@ -1668,12 +1669,14 @@ class ReplaySite:
                 self._in_place_before(engine, in_place, replay_inputs)
             # The private copies are held by this list alone; a bank checked
             # in place is held as the live path holds it, and by this list.
+            live_written = bool(kept)
             replayed, illegal = engine.try_run(
                 entry.program, replay_inputs, extra_refs=(extra_refs + 1) if kept else 0
             )
             if not illegal:
                 self._relax_tails(engine, entry, replay_inputs, marks)
             if illegal:
+                live_written = False  # refused before anything ran: nothing was touched
                 del replay_inputs
                 # Nothing was touched. A reason that belongs to this call
                 # alone lets a later call try again, a few times.
@@ -1713,6 +1716,16 @@ class ReplaySite:
                 self._refuse(entry, f"replay_lost_{exc.code}", repr(exc))
             raise
         except Exception as exc:
+            if live_written:
+                # Review 2, finding 3: the replay already wrote the live banks, and an error
+                # after it (the digests, the copies, the comparison's setup) leaves their
+                # content unknown. MLX must not continue on them: the request ends, as for a
+                # replay lost on the GPU, and the key is refused.
+                self._refuse(entry, "check_error_after_live_replay", repr(exc))
+                self._count("replay_lost")
+                raise _runtime.ReplayLost(
+                    f"failed:check_error_after_live_replay: {exc!r}", wrote_inputs=True
+                ) from exc
             self._refuse(entry, "check_error", repr(exc))
             refused = f"refused:{entry.refused}"
             self._count(refused)

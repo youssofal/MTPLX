@@ -273,6 +273,50 @@ def test_a_replay_that_writes_outside_its_named_rows_ends_the_request():
     assert site.counters["native"] == 0
 
 
+def test_an_error_after_a_check_replayed_on_the_live_banks_ends_the_request(monkeypatch):
+    """Review 2, finding 3: once a check has replayed on the live banks, an error after it
+    (here an injected failure of the after-digest) must end the request as a lost replay
+    with its inputs written, never fall back to MLX on buffers the replay wrote."""
+
+    engine = runtime.engine()
+    site = ReplaySite("long.check.digest", engine=engine, log=lambda line: None)
+    talk = _Conversation(site, engine, room=0)
+
+    def failing_digest(*args, **kwargs):
+        raise RuntimeError("injected digest failure")
+
+    monkeypatch.setattr(site, "_in_place_after", failing_digest)
+    lost = None
+    for n in range(10):
+        try:
+            talk.round(n, admit=_no_room_for_a_bank, windows=WINDOWS)
+        except runtime.ReplayLost as exc:
+            lost = exc
+            break
+    assert lost is not None and lost.wrote_inputs, lost
+    assert "injected digest failure" in str(lost), lost
+    assert site.counters["programs_refused"].get("check_error_after_live_replay") == 1, site.counters
+    assert site.counters["native"] == 0
+
+
+def test_an_error_in_a_check_on_private_copies_still_falls_back(monkeypatch):
+    """The same failure on a check that ran on private copies only (room for the copy):
+    nothing the caller holds was written, so MLX serves and the key is refused."""
+
+    engine = runtime.engine()
+    site = ReplaySite("long.check.digest.copies", engine=engine, log=lambda line: None)
+    talk = _Conversation(site, engine, room=0)
+
+    def failing_tails(*args, **kwargs):
+        raise RuntimeError("injected failure")
+
+    monkeypatch.setattr(site, "_relax_tails", failing_tails)
+    for n in range(10):
+        talk.round(n)  # no windows: every check runs on copies
+    assert site.counters["programs_refused"].get("check_error") == 1, site.counters
+    assert "check_error_after_live_replay" not in site.counters["programs_refused"]
+
+
 def test_first_use_preserves_inputs_recycled_for_another_layers_output(monkeypatch):
     engine = runtime.engine()
     site = ReplaySite("bank.relocated", engine=engine, log=lambda line: None)
