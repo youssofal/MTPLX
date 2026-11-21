@@ -350,27 +350,32 @@ def unreadable(dtype, *weights):
 
 
 def attention_input_reason(layer, dtype, message):
-    """Why lane L1's stage A cannot serve this visit, or None. Its projection launch reads q, r,
-    gate, k and v as 16-bit or as the affine codes it twins MLX's one-row product for (4 and 8
-    bits, ``attn_input.affine_route``), and the sink, the dynamic taps and (loop passes 2 and 3)
-    the controllers as 16-bit."""
-    from .attn_input import affine_route, matrix
+    """Why lane L1's stage A cannot serve this visit, or None. Its launches round to the stream's
+    16-bit type (bf16, or float16 on the FP16 packs) and read q, r, gate, k and v as 16-bit weights
+    of that type or as the affine codes it twins MLX's one-row product for (4 and 8 bits, scales of
+    that type, ``attn_input.affine_route``), and the sink, the dynamic taps, the input norms' gains
+    and (loop passes 2 and 3) the controllers as 16-bit of that type."""
+    from .attn_input import STREAM_TYPES, affine_route, matrix
 
-    if dtype != mx.bfloat16:
+    if dtype not in STREAM_TYPES:
         return "stream_dtype"
     for name, weight in (("q", layer.q), ("r", layer.r), ("gate", layer.gate), ("k", layer.k), ("v", layer.v)):
         if isinstance(weight, AffineWeight):
             why = affine_route(matrix(weight))
             if why:
                 return f"packed_{weight.bits}bit_{name}"
-        elif weight.dtype != mx.bfloat16:
+            if weight.scales.dtype != dtype:
+                return "scales_dtype"
+        elif weight.dtype != dtype:
             return "weight_dtype"
     packed = [layer.sink, layer.convs[0].dynamic, layer.convs[1].dynamic]
     if message:
         packed += [c.down for c in layer.controllers[:3]]
-    if not isinstance(layer.sink, AffineWeight) and layer.sink.dtype != mx.bfloat16:
-        return "weight_dtype"
-    return next((f"packed_{w.bits}bit" for w in packed if isinstance(w, AffineWeight)), None)
+    stored = next((f"packed_{w.bits}bit" for w in packed if isinstance(w, AffineWeight)), None)
+    if stored:
+        return stored
+    sixteen = [w for w in (*packed, *layer.qkv_norm) if w is not None]
+    return "weight_dtype" if any(w.dtype != dtype for w in sixteen) else None
 
 
 def output_reason(layer, dtype):
@@ -454,12 +459,18 @@ def attention_reason(dtype=None):
 
 def expert_input_reason(layer, message, dtype=mx.bfloat16):
     """Why lane L1's MLP read cannot serve this visit, or None. Its read and controller round to
-    bf16 where RC6 rounds to the stream's dtype, so a float16 stream (the FP16 sibling packs)
-    takes the reference (review 2, finding 9)."""
-    if dtype != mx.bfloat16:
+    the stream's 16-bit type where RC6 rounds to the stream's dtype (bf16, or float16 on the FP16
+    packs; review 2, finding 9), with the controller's down weights of that type."""
+    from .attn_input import STREAM_TYPES
+
+    if dtype not in STREAM_TYPES:
         return "stream_dtype"
-    if message and isinstance(layer.controllers[3].down, AffineWeight):
-        return f"packed_{layer.controllers[3].down.bits}bit"
+    if message:
+        down = layer.controllers[3].down
+        if isinstance(down, AffineWeight):
+            return f"packed_{down.bits}bit"
+        if down.dtype != dtype:
+            return "weight_dtype"
     return None
 
 
