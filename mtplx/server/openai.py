@@ -35843,6 +35843,23 @@ class _ThinkingContentStreamSplitter:
                 self._disabled_visible_started = True
         return chunks
 
+    def _stream_holdback(self, keep: int) -> int:
+        """How many trailing characters of pending reasoning wait for more:
+        the last ``keep`` while one of them is "<", none otherwise.
+
+        Every reasoning tag (suffixed spellings included), chat-template
+        sentinel and tool marker begins with "<", so a window without one can
+        neither start a marker nor finish one that began earlier (that one
+        would be longer than ``keep``, which the window already does not
+        cover). Holding such text only delays it: on 21 Nov it kept every
+        answer's first 32 characters of reasoning back, seven to nine tokens,
+        so the first visible text left with the fourth round of a turn
+        instead of the first (0.13 s of a warm turn's 0.15 s, T1). Reasoning
+        only: the content channel keeps its hold, whose chunking the edge
+        trim ahead of tool markup depends on.
+        """
+        return keep if "<" in self._pending[-keep:] else 0
+
     def _drain(self, *, final: bool) -> list[tuple[str, str]]:
         chunks: list[tuple[str, str]] = []
         sentinel_keep = max(
@@ -35932,7 +35949,7 @@ class _ThinkingContentStreamSplitter:
                     emit_len = (
                         len(self._pending)
                         if final
-                        else max(0, len(self._pending) - keep)
+                        else max(0, len(self._pending) - self._stream_holdback(keep))
                     )
                     if emit_len <= 0:
                         break
