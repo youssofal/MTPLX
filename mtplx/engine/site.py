@@ -2429,9 +2429,10 @@ class ReplaySite:
             self._refuse(entry, "seal_error", repr(exc))
         else:
             entry.state = "recorded"
-            from mtplx.kernels.launch_cuts import replay_counts
-
-            entry.cut_dispatches = replay_counts(entry.ir.steps)
+            # Dispatches the program makes of the kernels a model family wants
+            # counted in the report: none named on this line, so only the
+            # indirect ones (their grids are written by the GPU).
+            entry.cut_dispatches = {}
             indirect = sum(step.indirect_grid is not None for step in entry.ir.steps)
             if indirect:
                 entry.cut_dispatches["indirect_dispatches"] = indirect
