@@ -402,6 +402,43 @@ def visit_step(layer, x, closed, message, state, visit, panel, stages=REFERENCE,
     return out, VisitDelta(a.k_rows, a.v_rows, (a.k_taps, a.v_taps, attn_taps, mlp_taps))
 
 
+#: Rows RC6's own panel products are proven row-stable for (each row equals the one-row step).
+ROW_STABLE_ROWS = 8
+
+
+def row_chunks(rows):
+    """``(start, stop)`` pieces of at most ``ROW_STABLE_ROWS`` rows covering a panel."""
+    return [(start, min(rows, start + ROW_STABLE_ROWS)) for start in range(0, rows, ROW_STABLE_ROWS)]
+
+
+def row_stable_read(panel, closed, x, queries, eps, normalize):
+    """The final depth read of a panel, every row equal to the one-row step's read.
+
+    Up to 8 rows this is RC6's own reader. Past 8 rows RC6 switches to a batched read whose
+    rows need not equal the one-row read; the reference at every width is the one-row step
+    (TARGETS, 06:33), so a wide panel (the copy lane) is read in pieces of at most 8 rows,
+    each a proven row-stable read (a last single row is the one-row read itself)."""
+    rows = panel.rows
+    if rows <= ROW_STABLE_ROWS:
+        return ref.depth_reader(panel.tape, rows)(closed, x, queries, eps, normalize)
+    parts = []
+    for start, stop in row_chunks(rows):
+        width = stop - start
+        reader = ref.depth_reader(panel.tape if width > 1 else None, width)
+        parts.append(reader([block[:, start:stop] for block in closed], x[:, start:stop], queries, eps,
+                            normalize))
+    return mx.concatenate(parts, axis=1)
+
+
+def row_stable_head(model, hidden):
+    """The vocabulary head of a panel, every row equal to the one-row step's (pieces of at
+    most 8 rows past 8, as ``row_stable_read``)."""
+    rows = hidden.shape[1]
+    if rows <= ROW_STABLE_ROWS:
+        return model.head(hidden)
+    return mx.concatenate([model.head(hidden[:, start:stop]) for start, stop in row_chunks(rows)], axis=1)
+
+
 def decode_hidden(model, ids, state, *, embeddings=None, capture_ids=(), stages=REFERENCE,
                   record=None, tape=None):
     """The final hidden rows ``(1, W, 2304)``, the captures and the per-visit deltas.
@@ -430,9 +467,8 @@ def decode_hidden(model, ids, state, *, embeddings=None, capture_ids=(), stages=
             message = Message(stack, model.message_queries[index - model.start], verify)
         x, delta = visit_step(model.layers[index], x, closed, message, state, visit, panel, stages, record)
         deltas.append(delta)
-    last = ref.depth_reader(panel.tape, rows)(
-        closed, x, model.final_query, model.eps, model.config["attn_res_normalize_values"]
-    )[..., 0, :]
+    last = row_stable_read(panel, closed, x, model.final_query, model.eps,
+                           model.config["attn_res_normalize_values"])[..., 0, :]
     hidden = ref.norm(last, model.final_norm, model.eps).astype(x.dtype)
     if len(model.visit_order) in capture_ids:
         captured[len(model.visit_order)] = hidden
@@ -450,7 +486,7 @@ def decode_panel(model, ids, state, *, embeddings=None, capture_ids=None, stages
         model, ids, state, embeddings=embeddings, capture_ids=capture_ids, stages=stages,
         record=record, tape=tape,
     )
-    return model.head(hidden), captures, deltas
+    return row_stable_head(model, hidden), captures, deltas
 
 
 __all__ = ["AttentionInput", "DecodeState", "LANES", "Message", "Panel", "REFERENCE", "Stages",
