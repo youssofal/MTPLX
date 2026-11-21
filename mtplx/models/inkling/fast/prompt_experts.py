@@ -317,8 +317,8 @@ PRODUCT = """
 #: Every output element is still its 16-deep fragments in ascending order into float32, so the sums are the
 #: narrow kernel's and MLX's sorted product's.
 PRODUCT_WIDE = """
-    enum : short { BMW = 32 * SGM, BNW = 32 * SGN, DEEPW = 32, STRIDEW = DEEPW + 16 / short(sizeof(W)),
-                   PER = 32 / SGM };   // weights a thread decodes a step: one column's PER consecutive weights
+    enum : short { BMW = 32 * SGM, BNW = 32 * SGN, DEEPW = DEEP, STRIDEW = DEEPW + 16 / short(sizeof(W)),
+                   PER = DEEPW / SGM };   // weights a thread decodes a step: one column's PER consecutive weights
     threadgroup W decoded[2][BNW * STRIDEW];
 
     const int tile = int(threadgroup_position_in_grid.y);
@@ -376,31 +376,34 @@ PRODUCT_WIDE = """
     SumTile total;
     total.clear();
     constexpr int steps = K / DEEPW;
-    mtplx_decode_part<W, bool(FP4), PER>(my_codes, my_scales[(my_part * PER) / (FP4 ? 16 : 32)], my_run[0]);
+    mtplx_decode_span<W, bool(FP4), PER>(my_codes, my_scales + (my_part * PER) / (FP4 ? 16 : 32), my_run[0]);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int step = 0; step < steps; ++step) {
         if (step + 1 < steps) {
             const int next = (step + 1) * DEEPW;
-            mtplx_decode_part<W, bool(FP4), PER>(my_codes + (FP4 ? next / 2 : next),
-                                                 my_scales[(next + int(my_part) * PER) / (FP4 ? 16 : 32)],
+            mtplx_decode_span<W, bool(FP4), PER>(my_codes + (FP4 ? next / 2 : next),
+                                                 my_scales + (next + int(my_part) * PER) / (FP4 ? 16 : 32),
                                                  my_run[(step + 1) & 1]);
         }
         if (busy) {
-            WeightTile weights_in;
-            weights_in.template load<W, STRIDEW, 1>(decoded[step & 1] + own_col * STRIDEW);
-            RowTile rows_in;
-            const int column = step * DEEPW;
-            for (short f = 0; f < 4; ++f) {
-                thread auto& frag = rows_in.frag_at(f >> 1, f & 1);
-                for (short pair_row = 0; pair_row < 2; ++pair_row) {
-                    const short q = (f >> 1) * 2 + pair_row;
-                    const four_t v = real[q] ? reinterpret_cast<const device four_t*>(feed[q] + column + (f & 1) * 16)[0]
-                                             : four_t(0);
-                    for (short e = 0; e < 4; ++e)
-                        frag[pair_row * 4 + e] = v[e];
+            // DEEPW / 32 sub-steps of 32 in ascending depth: the same fragments in the same order at any DEEPW
+            for (short sub = 0; sub < DEEPW / 32; ++sub) {
+                WeightTile weights_in;
+                weights_in.template load<W, STRIDEW, 1>(decoded[step & 1] + own_col * STRIDEW + sub * 32);
+                RowTile rows_in;
+                const int column = step * DEEPW + sub * 32;
+                for (short f = 0; f < 4; ++f) {
+                    thread auto& frag = rows_in.frag_at(f >> 1, f & 1);
+                    for (short pair_row = 0; pair_row < 2; ++pair_row) {
+                        const short q = (f >> 1) * 2 + pair_row;
+                        const four_t v = real[q] ? reinterpret_cast<const device four_t*>(feed[q] + column + (f & 1) * 16)[0]
+                                                 : four_t(0);
+                        for (short e = 0; e < 4; ++e)
+                            frag[pair_row * 4 + e] = v[e];
+                    }
                 }
+                tile_matmad_nax(total, rows_in, as_stored, weights_in, transposed);
             }
-            tile_matmad_nax(total, rows_in, as_stored, weights_in, transposed);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -437,6 +440,16 @@ inline void mtplx_decode_part(const device uint8_t* codes, uint8_t scale_code, t
                 to[b * 4 + e] = W(scale * mtplx_e4m3((word >> (8 * e)) & 0xFFu));
         }
     }
+}
+
+// PER consecutive weights of one output column from `scales` (the scale code of the span's first group on): each
+// group of 16 (NVFP4) or 32 (MXFP8) weights decoded as mtplx_decode_part decodes it, with its own scale.
+template <typename W, bool NV, short PER>
+inline void mtplx_decode_span(const device uint8_t* codes, const device uint8_t* scales, threadgroup W* to) {
+    constexpr short GROUP = NV ? 16 : 32;
+    constexpr short RUN = PER < GROUP ? PER : GROUP;
+    for (short g = 0; g < PER / RUN; ++g)
+        mtplx_decode_part<W, NV, RUN>(codes + g * (NV ? RUN / 2 : RUN), scales[g], to + g * RUN);
 }
 """
 
@@ -488,7 +501,24 @@ inline void mtplx_decode_affine(const device uint8_t* codes, float scale, float 
 """
 
 
-PRODUCT_WIDE_AFFINE = (PRODUCT_WIDE.replace('    const device uint8_t* my_codes = (const device uint8_t*)w + weight_row * (FP4 ? K / 2 : K)\n                                     + my_part * (FP4 ? PER / 2 : PER);\n    const device uint8_t* my_scales = s + weight_row * (K / (FP4 ? 16 : 32));', _AFFINE_SETUP).replace('    mtplx_decode_part<W, bool(FP4), PER>(my_codes, my_scales[(my_part * PER) / (FP4 ? 16 : 32)], my_run[0]);', _AFFINE_FIRST).replace('            mtplx_decode_part<W, bool(FP4), PER>(my_codes + (FP4 ? next / 2 : next),\n                                                 my_scales[(next + int(my_part) * PER) / (FP4 ? 16 : 32)],\n                                                 my_run[(step + 1) & 1]);', _AFFINE_LOOP))
+def _derive_affine():
+    src = PRODUCT_WIDE
+    for old, new in (
+            ("    const device uint8_t* my_codes = (const device uint8_t*)w + weight_row * (FP4 ? K / 2 : K)\n"
+             "                                     + my_part * (FP4 ? PER / 2 : PER);\n"
+             "    const device uint8_t* my_scales = s + weight_row * (K / (FP4 ? 16 : 32));", _AFFINE_SETUP),
+            ("    mtplx_decode_span<W, bool(FP4), PER>(my_codes, my_scales + (my_part * PER) / (FP4 ? 16 : 32), my_run[0]);",
+             _AFFINE_FIRST),
+            ("            mtplx_decode_span<W, bool(FP4), PER>(my_codes + (FP4 ? next / 2 : next),\n"
+             "                                                 my_scales + (next + int(my_part) * PER) / (FP4 ? 16 : 32),\n"
+             "                                                 my_run[(step + 1) & 1]);", _AFFINE_LOOP)):
+        if src.count(old) != 1:
+            raise RuntimeError(f"stored-code product derivation: pattern not found: {old.strip()[:60]}")
+        src = src.replace(old, new)
+    return src
+
+
+PRODUCT_WIDE_AFFINE = _derive_affine()
 
 
 #: (SGM, SGN) of the wide tiling by average pairs an expert; None keeps the narrow kernel (64 x 64 a
@@ -509,8 +539,9 @@ def tiling(pairs, n_experts):
     if forced in ("narrow", "64"):
         return BM, None
     if forced.count("x") == 1:
-        sgm, sgn = (int(v) for v in forced.split("x"))
-        return 32 * sgm, (sgm, sgn)
+        shape, _, deep = forced.partition("d")
+        sgm, sgn = (int(v) for v in shape.split("x"))
+        return 32 * sgm, ((sgm, sgn, int(deep)) if deep else (sgm, sgn))
     per_expert = pairs / max(1, n_experts)
     for floor, shape in WIDE_PLAN:
         if per_expert >= floor:
@@ -531,7 +562,8 @@ def _product_kernel(mapped, wide=None, rounded=None):
             inputs += ["outer", "expert_outer"]
     return mx.fast.metal_kernel(
         name="mtplx_inkling_prompt_expert_product" + ("_mapped" if mapped else "")
-             + (f"_w{wide[0]}x{wide[1]}" if wide else "") + (f"_{rounded}" if rounded else ""),
+             + (f"_w{wide[0]}x{wide[1]}" if wide else "") + (f"d{wide[2]}" if wide and len(wide) > 2 else "")
+             + (f"_{rounded}" if rounded else ""),
         input_names=inputs,
         output_names=["y"],
         source=source,
@@ -580,7 +612,7 @@ def affine_product(x, weight):
         inputs=[flat, weight.codes.view(mx.uint8), weight.scales, weight.biases,
                 mx.array([0, tiles_n], dtype=mx.int32), mx.array([0, rows], dtype=mx.int32)],
         template=[("T", flat.dtype), ("W", mx.bfloat16 if flat.dtype == mx.bfloat16 else mx.float16), ("FP4", True),
-                  ("K", depth), ("N", n_out), ("E", 1), ("SGM", 2), ("SGN", 2), ("O", flat.dtype)],
+                  ("K", depth), ("N", n_out), ("E", 1), ("SGM", 2), ("SGN", 2), ("DEEP", 32), ("O", flat.dtype)],
         grid=((n_out // 64) * 128, tiles_n + 1, 1),
         threadgroup=(128, 1, 1),
         output_shapes=[(rows, n_out)],
@@ -592,10 +624,11 @@ def affine_product(x, weight):
 def product(x, packed, tiles, starts, pairs, rowmap=None, weights=mx.bfloat16, wide=None, rounded=None):
     """float32 ``(pairs, N)``: every sorted pair's row of ``x`` (through ``rowmap`` when given, else the
     pair's own row) times its expert's ``packed`` weight (``model.PackedExperts``, NVFP4 or MXFP8).
-    ``wide``: ``(SGM, SGN)`` from ``tiling`` (the sort's tiles must be cut at ``32 SGM`` rows), else the
-    narrow kernel (64-row tiles). ``rounded``: ``(dtype, outer, expert_outer)`` returns ``dtype`` values instead
-    of the float32 sums: ``outer[i] * expert_outer[e]`` times each sum (``i`` the pair's row through ``rowmap``,
-    else its sorted position; ``e`` its expert), rounded once; with ``outer`` None, the sums rounded."""
+    ``wide``: ``(SGM, SGN)`` or ``(SGM, SGN, DEEP)`` from ``tiling`` (the sort's tiles must be cut at ``32 SGM``
+    rows; DEEP, the depth a step decodes, 32 or 64, changes no sum), else the narrow kernel (64-row tiles).
+    ``rounded``: ``(dtype, outer, expert_outer)`` returns ``dtype`` values instead of the float32 sums:
+    ``outer[i] * expert_outer[e]`` times each sum (``i`` the pair's row through ``rowmap``, else its sorted
+    position; ``e`` its expert), rounded once; with ``outer`` None, the sums rounded."""
     fp4 = packed.mode == "nvfp4"
     n_experts, n_out, words = packed.codes.shape
     depth = words * (8 if fp4 else 4)
@@ -603,14 +636,18 @@ def product(x, packed, tiles, starts, pairs, rowmap=None, weights=mx.bfloat16, w
     if depth % BK or n_out % cols or x.shape[-1] != depth:
         raise ValueError(f"prompt expert product: shape {x.shape} against {packed.codes.shape}")
     _count(f"{packed.mode}.{'mapped' if rowmap is not None else 'sorted'}.{str(x.dtype).split('.')[-1]}"
-           + (f".w{wide[0]}x{wide[1]}" if wide else ""))
+           + (f".w{wide[0]}x{wide[1]}" if wide else "") + (f"d{wide[2]}" if wide and len(wide) > 2 else ""))
     rows_a_tile = 32 * wide[0] if wide else BM
     threads = 32 * wide[0] * wide[1] if wide else PRODUCT_THREADS
     tiles_bound = -(-pairs // rows_a_tile) + n_experts
     inputs = [x.reshape(-1, depth)] + ([rowmap] if rowmap is not None else [])
     template = [("T", x.dtype), ("W", weights), ("FP4", fp4), ("K", depth), ("N", n_out), ("E", n_experts)]
     if wide:
-        template += [("SGM", wide[0]), ("SGN", wide[1])]
+        deep = wide[2] if len(wide) > 2 else 32
+        # a thread decodes at least one 32-bit word of codes; the two decode buffers fit 32 KB of threadgroup memory
+        if deep not in (32, 64) or deep // wide[0] < 8 or 2 * 32 * wide[1] * (deep + 8) * 2 > 32768:
+            raise ValueError(f"prompt expert product: tiling {wide}")
+        template += [("SGM", wide[0]), ("SGN", wide[1]), ("DEEP", deep)]
     extra, form, out_dtype = [], None, mx.float32
     if rounded is not None:
         out_dtype, outer, expert_outer = rounded
