@@ -149,6 +149,8 @@ class InklingRuntime(MTPLXRuntime):
 
     #: Rows a chunked prompt forward reads when nobody names a width.
     PROMPT_CHUNK_ROWS = 512
+    #: Rows a chunk with the prompt read's fast route on (``MTPLX_INKLING_PROMPT_FAST``).
+    PROMPT_FAST_CHUNK_ROWS = 4096
 
     def prompt_chunk_rows(self, prompt_tokens=None):
         """512 rows a prompt forward where the prompt read is chunked, unless a request
@@ -162,13 +164,16 @@ class InklingRuntime(MTPLXRuntime):
             current_prefill_chunk_override,
         )
 
+        from .fast.prompt_route import prompt_fast
+
         if (
             current_prefill_chunk_override() is not None
             or _prefill_chunk_env_is_pinned()
             or not _sustained_prefill_enabled()
         ):
             return _prefill_chunk_size(prompt_tokens)
-        return self.PROMPT_CHUNK_ROWS
+        # The prompt read's fast route (off by default) reads 4,096 rows a chunk.
+        return self.PROMPT_FAST_CHUNK_ROWS if prompt_fast("chunk") else self.PROMPT_CHUNK_ROWS
 
     #: The prefill's working memory beyond the request's own KV, measured through `mtplx serve` on
     #: Bare Speed at 512-row chunks (each request's growth less its KV, from the request log):

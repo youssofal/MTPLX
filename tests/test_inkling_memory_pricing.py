@@ -36,7 +36,7 @@ def test_a_chunked_prompt_read_is_512_rows_unless_a_width_is_named(monkeypatch):
     from mtplx.generation import prefill_chunk_size_override, prefill_forward_widths
     from mtplx.server.openai import _admission_narrow_widths, _served_prefill_chunk_auto
 
-    for name in ("MTPLX_PREFILL_CHUNK_SIZE_DENSE", "MTPLX_PREFILL_CHUNK_SIZE_REPAGE"):
+    for name in ("MTPLX_PREFILL_CHUNK_SIZE_DENSE", "MTPLX_PREFILL_CHUNK_SIZE_REPAGE", "MTPLX_INKLING_PROMPT_FAST"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "auto")  # what every profile stamps
