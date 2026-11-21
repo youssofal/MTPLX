@@ -33016,10 +33016,14 @@ def _run_generation(
         if request_observability is not None:
             request_observability["inkling_depth_policy"] = "auto"
             request_observability["inkling_round_cost_ms"] = getattr(state.runtime, "round_cost_ms", None)
+            cost_detail = getattr(state.runtime, "round_cost_detail", None)
+            # Where this load's table came from (the program's warm rounds, the pieces, or
+            # RC6's table after a refusal), so every request says what priced its depth.
+            request_observability["inkling_round_cost_source"] = (
+                cost_detail.get("source") if isinstance(cost_detail, dict) else None
+            )
             if getattr(state.runtime, "round_cost_ms", None) is None:
-                request_observability["inkling_round_cost_detail"] = getattr(
-                    state.runtime, "round_cost_detail", None
-                )
+                request_observability["inkling_round_cost_detail"] = cost_detail
     # Include admission and pending-history waits in user-facing TTFT/wall
     # time. Decode still starts at the first produced token; throughput is
     # unaffected. Previously a 39s postcommit wait vanished from the receipt.
