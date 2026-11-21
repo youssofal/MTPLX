@@ -29,8 +29,16 @@ MLX 0.32.2's one-row ``gemv`` for that matrix shape (``matmul.cpp`` ``gemv_axbpy
 * sink and the dynamic taps (``K >= 16 N``): ``bm1 bn8``: eight slices of 1,024-column blocks
   plus a zero-padded tail, a tree per slice, then the eight slice totals in order.
 
+* affine-coded matrices (the Bare Speed pack: 4-bit codes, bf16 scales and biases in groups of
+  64, MLX's layout, read in place): MLX's one-row quantized product, ``affine_qmv`` at 4 bits and
+  ``affine_qmv_fast`` at 8 bits for K = 2,304 (lane ``l`` takes 8 values of each 256-column block;
+  ``load_vector``'s bf16 quartet sums and pre-scaled inputs, once per panel row and block;
+  ``qdot``'s masked products in its expression tree; ``scale * accum + sum * bias``; ``simd_sum``).
+  A matrix whose stored form this launch cannot twin is refused, counted, never approximated.
+
 A panel row's arithmetic never depends on the panel width, so every row of a W-row panel
-gets the bits of a one-row step (rule 2). Products of two bf16 values are exact in float32,
+gets the bits of a one-row step (rule 2). (MLX's own product does not have that property for
+affine matrices: from 2 rows on M3 and newer it switches to ``affine_qmv_wide``, another order.) Products of two bf16 values are exact in float32,
 so the compiler's choice between a fused and a separate multiply-add cannot move a bit.
 Epilogues repeat RC6's statements one by one, each rounded where RC6 rounds:
 ``clip_heads`` (square, the library's row-reduce order, precise sqrt, ``+ 1e-6``, divide,
@@ -49,6 +57,7 @@ import math
 import struct
 from threading import Lock
 from typing import NamedTuple
+import weakref
 
 import mlx.core as mx
 
@@ -84,6 +93,71 @@ _STAGE = True
 def f32_bits(value: float) -> int:
     """The float32 MLX rounds a Python float to, as raw bits for a template constant."""
     return struct.unpack("<I", struct.pack("<f", value))[0]
+
+
+class Matrix(NamedTuple):
+    """One projection as the launch reads it: bf16 rows, or affine codes with scales and biases."""
+
+    data: mx.array      # (rows, cols) bf16, or (rows, cols * bits / 32) uint32 codes
+    scales: object      # (rows, cols / group) bf16, or None
+    biases: object
+    bits: int           # 16, 8 or 4
+    group: int
+    rows: int
+    cols: int
+
+
+def matrix(weight):
+    """``weight``: a bf16 ``mx.array`` or an affine weight (``precision.AffineWeight``: codes,
+    scales, biases, bits, group_size)."""
+    if hasattr(weight, "codes") and hasattr(weight, "group_size"):
+        bits, group = int(weight.bits), int(weight.group_size)
+        rows, words = weight.codes.shape
+        return Matrix(weight.codes, weight.scales, weight.biases, bits, group, rows, words * 32 // bits)
+    return Matrix(weight, None, None, 16, 64, weight.shape[0], weight.shape[1])
+
+
+# Layers are MLX modules (dicts, unhashable): keyed by id, dropped when the layer is collected.
+_joined_sb: dict = {}
+
+
+def joined_scales(layer, matrices):
+    """Every affine matrix's scales then biases (q, r, gate, k, v order) in one bf16 buffer, built
+    once per layer and kept (1.2 MB a layer at 4 bits, group 64): Metal's 31-buffer limit leaves
+    the launch one slot for them. Returns (buffer or None, element offset of each matrix's scales)."""
+    key = id(layer)
+    hit = _joined_sb.get(key)
+    if hit is not None and hit[0]() is layer:
+        return hit[1]
+    pieces, offsets, at = [], [], 0
+    for m in matrices:
+        offsets.append(at)
+        if m.bits != 16:
+            pieces += [m.scales.reshape(-1), m.biases.reshape(-1)]
+            at += m.scales.size + m.biases.size
+    entry = (mx.concatenate(pieces) if pieces else None, offsets)
+    _joined_sb[key] = (weakref.ref(layer, lambda _ref, k=key: _joined_sb.pop(k, None)), entry)
+    return entry
+
+
+def affine_route(m):
+    """Whether this launch twins MLX 0.32.2's one-row product for an affine matrix: the lane map
+    here is 8 values a lane per 256 columns, which is ``qmv`` at 4 bits when the row is not a
+    multiple of 512 wide (or the rows are not a multiple of 8), and ``qmv_fast`` at 8 bits when the
+    rows are a multiple of 8 and the row a multiple of 256. ``''`` when served, else why not."""
+    if m.bits == 16:
+        return ""
+    if m.bits not in (4, 8):
+        return f"bits_{m.bits}"
+    if m.group not in (32, 64, 128) or m.cols % m.group or m.cols % 256:
+        return f"group_{m.group}_cols_{m.cols}"
+    if m.scales is None or m.biases is None or m.scales.dtype != mx.bfloat16 or m.biases.dtype != mx.bfloat16:
+        return "scales_not_bf16"
+    if m.bits == 4 and m.cols % 512 == 0 and m.rows % 8 == 0:
+        return "qmv_fast_4bit"          # MLX would take 16 values a lane: another kernel
+    if m.bits == 8 and (m.rows % 8 or m.cols % 256):
+        return "qmv_8bit"
+    return ""
 
 
 _HEADER = """
@@ -134,9 +208,119 @@ _HEADER = """
         const device bfloat16_t* gp_ = (src == 0 ? g0 : (src == 1 ? g1 : g2)) + (col);  \\
         for (uint t_ = 0; t_ < 4; ++t_) gv[t_] = static_cast<float>(gp_[t_]);          \\
     }
+
+// An affine-coded matrix (MLX layout: uint32 codes, the first in the lowest bits; one bf16 scale
+// and bias per group), as MLX 0.32.2's one-row product takes it when K = 2,304: qmv at 4 bits,
+// qmv_fast at 8 bits, both 8 values a lane per 256-column block. affine_prep is its load_vector
+// (once per panel row, block and lane, shared by every output row, as MLX shares it by 4); affine_dot
+// is its qdot for one output row; the caller adds each block's term to the row's running total and
+// ends with simd_sum. xv: the lane's 8 input values (bf16 values held as float).
+inline float affine_prep(const float xv[8], thread float xt[8], uint bits) {
+    float sum = 0;
+    if (bits == 4) {
+        for (uint i = 0; i < 8; i += 4) {
+            const bfloat16_t a0 = static_cast<bfloat16_t>(xv[i]);
+            const bfloat16_t a1 = static_cast<bfloat16_t>(xv[i + 1]);
+            const bfloat16_t a2 = static_cast<bfloat16_t>(xv[i + 2]);
+            const bfloat16_t a3 = static_cast<bfloat16_t>(xv[i + 3]);
+            sum += a0 + a1 + a2 + a3;
+            xt[i] = a0;
+            xt[i + 1] = a1 / 16.0f;
+            xt[i + 2] = a2 / 256.0f;
+            xt[i + 3] = a3 / 4096.0f;
+        }
+    } else {
+        for (uint i = 0; i < 8; i++) {
+            const bfloat16_t a = static_cast<bfloat16_t>(xv[i]);
+            sum += a;
+            xt[i] = a;
+        }
+    }
+    return sum;
+}
+
+inline float affine_dot(const thread float xt[8], float sum, const device uint32_t* code, float scale, float bias,
+                        uint bits) {
+    float accum = 0;
+    if (bits == 4) {
+        const uint word = code[0];
+        const ushort w16[2] = {ushort(word & 0xffffu), ushort(word >> 16)};
+        for (uint i = 0; i < 2; ++i) {
+            accum +=
+                (xt[4 * i] * (w16[i] & 0x000f) +
+                 xt[4 * i + 1] * (w16[i] & 0x00f0) +
+                 xt[4 * i + 2] * (w16[i] & 0x0f00) +
+                 xt[4 * i + 3] * (w16[i] & 0xf000));
+        }
+    } else {
+        const uint words[2] = {code[0], code[1]};
+        for (uint i = 0; i < 8; i++) {
+            const uchar w = uchar((words[i / 4] >> (8 * (i % 4))) & 0xffu);
+            accum += xt[i] * w;
+        }
+    }
+    return scale * accum + sum * bias;
+}
+
+// The lane's 8 codes of one output row as the floats MLX's qdot multiplies by: at 4 bits the masked
+// 16-bit words (q, q << 4, q << 8, q << 12, each exact in float), at 8 bits the bytes. Decoded once a
+// block and shared by every panel row.
+inline void affine_decode(const device uint32_t* code, thread float wf[8], uint bits) {
+    if (bits == 4) {
+        const uint word = code[0];
+        const ushort w16[2] = {ushort(word & 0xffffu), ushort(word >> 16)};
+        for (uint i = 0; i < 2; ++i) {
+            wf[4 * i] = float(w16[i] & 0x000f);
+            wf[4 * i + 1] = float(w16[i] & 0x00f0);
+            wf[4 * i + 2] = float(w16[i] & 0x0f00);
+            wf[4 * i + 3] = float(w16[i] & 0xf000);
+        }
+    } else {
+        const uint words[2] = {code[0], code[1]};
+        for (uint i = 0; i < 8; i++) wf[i] = float(uchar((words[i / 4] >> (8 * (i % 4))) & 0xffu));
+    }
+}
+
+// MLX's pre-scaled inputs alone (load_vector without its sum), 4 bits.
+inline void affine_xt4(const float xv[8], thread float xt[8]) {
+    for (uint i = 0; i < 8; i += 4) {
+        xt[i] = static_cast<float>(static_cast<bfloat16_t>(xv[i]));
+        xt[i + 1] = static_cast<bfloat16_t>(xv[i + 1]) / 16.0f;
+        xt[i + 2] = static_cast<bfloat16_t>(xv[i + 2]) / 256.0f;
+        xt[i + 3] = static_cast<bfloat16_t>(xv[i + 3]) / 4096.0f;
+    }
+}
+
+// qdot on decoded codes: the same products (exact) in the same expression tree.
+inline float affine_dotf(const thread float xt[8], float sum, const thread float wf[8], float scale, float bias,
+                         uint bits) {
+    float accum = 0;
+    if (bits == 4) {
+        for (uint i = 0; i < 2; ++i) {
+            accum +=
+                (xt[4 * i] * wf[4 * i] +
+                 xt[4 * i + 1] * wf[4 * i + 1] +
+                 xt[4 * i + 2] * wf[4 * i + 2] +
+                 xt[4 * i + 3] * wf[4 * i + 3]);
+        }
+    } else {
+        for (uint i = 0; i < 8; i++) accum += xt[i] * wf[i];
+    }
+    return scale * accum + sum * bias;
+}
+
+// One block term in one call (the bench kernels' form): affine_prep then affine_dot.
+inline float affine_term(const float xv[8], const device uint32_t* code, float scale, float bias, uint bits) {
+    float xt[8];
+    const float sum = affine_prep(xv, xt, bits);
+    return affine_dot(xt, sum, code, scale, bias, bits);
+}
 """
 
 _PROJECT = """
+    // One input slot holds the bf16 normed sources (NORMED) or the float32 raw ones (RAW).
+    const device bfloat16_t* normed = reinterpret_cast<const device bfloat16_t*>(xin);
+    const device float* hraw = reinterpret_cast<const device float*>(xin);
     const uint tg = threadgroup_position_in_grid.x;
     const uint sg = simdgroup_index_in_threadgroup;
     const uint lane = thread_index_in_simdgroup;
@@ -197,9 +381,57 @@ _PROJECT = """
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    // AFFSUM: the 4-bit load_vector sum (bf16 quartets, MLX's order) of every panel row, 256-column
+    // block and lane, once per threadgroup instead of once per output row.
+    threadgroup float asum[AFFSUM ? W * (D / 256) * 32 : 1];
+    if (AFFSUM) {
+        for (uint idx = thread_index_in_threadgroup; idx < W * (D / 256) * 32; idx += THREADS) {
+            const uint rr = idx / ((D / 256) * 32), cb = (idx / 32) % (D / 256), ll = idx % 32;
+            const uint col = cb * 256 + ll * 8;
+            float gv0[4] = {0.0f, 0.0f, 0.0f, 0.0f}, gv1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            GAINS4(col, gv0);
+            GAINS4(col + 4, gv1);
+            float xv[8], xh[4];
+            FETCH4(rr, col, xv, gv0);
+            FETCH4(rr, col + 4, xh, gv1);
+            for (uint t_ = 0; t_ < 4; ++t_) xv[4 + t_] = xh[t_];
+            float xt[8];
+            asum[idx] = affine_prep(xv, xt, 4);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 
     // ------------------------------------------------------------------ products
-    const device bfloat16_t* mat = wq;
+    // Each 4-row block belongs to one matrix: its bf16 rows or its affine codes (bits 4 or 8, one
+    // scale and bias per group of gsize), per the matrix's compile-time format.
+    const device uchar* mat = reinterpret_cast<const device uchar*>(wq);
+    uint bits = 16, gsize = 64;
+    // sb: every affine matrix's scales then biases in one buffer; XSO, the element offset of X's scales.
+    const device bfloat16_t* scl = sb;
+    const device bfloat16_t* bia = sb;
+#define AS_BF16(p) reinterpret_cast<const device bfloat16_t*>(p)
+#define AS_CODES(p) reinterpret_cast<const device uint32_t*>(p)
+#define SB(OFF, ROWS, G) scl = sb + (OFF); bia = sb + (OFF) + (ROWS) * (D / (G));
+#define SELECT_BLOCK(blk)                                                                         \\
+    if (kind == 0) {                                                                              \\
+        if ((blk) < HD / 4) {                                                                     \\
+            mat = reinterpret_cast<const device uchar*>(wq); bits = QB; gsize = QG;              \\
+            SB(QSO, QH * HD, QG); m0 = h * HD + 4 * (blk); slot = 4 * (blk);                      \\
+        } else {                                                                                  \\
+            mat = reinterpret_cast<const device uchar*>(wr); bits = RB; gsize = RG;              \\
+            SB(RSO, QH * RD, RG); m0 = h * RD + 4 * ((blk) - HD / 4);                             \\
+            slot = HD + 4 * ((blk) - HD / 4);                                                     \\
+        }                                                                                         \\
+    } else if (kind == 1) {                                                                       \\
+        mat = reinterpret_cast<const device uchar*>(wk); bits = KB; gsize = KG;                  \\
+        SB(KSO, KN, KG); m0 = h * HD + 4 * (blk); slot = 4 * (blk);                               \\
+    } else if (kind == 2) {                                                                       \\
+        mat = reinterpret_cast<const device uchar*>(wv); bits = VB; gsize = VG;                  \\
+        SB(VSO, KN, VG); m0 = h * HD + 4 * (blk); slot = 4 * (blk);                               \\
+    } else {                                                                                      \\
+        mat = reinterpret_cast<const device uchar*>(wg); bits = GB; gsize = GG;                  \\
+        SB(GSO, GN, GG); m0 = h * GROWS + 4 * (blk); slot = 0;                                    \\
+    }
     uint nblocks = 0;
     if (kind == 0) nblocks = HD / 4 + RD / 4;
     else if (kind == 3) nblocks = GROWS / 4;
@@ -216,14 +448,12 @@ _PROJECT = """
                 const bool active = blk < nblocks;
                 uint m0 = 0, slot = 0;
                 if (active) {
-                    if (kind == 0) {
-                        if (blk < HD / 4) { mat = wq; m0 = h * HD + 4 * blk; slot = 4 * blk; }
-                        else { mat = wr; m0 = h * RD + 4 * (blk - HD / 4); slot = HD + 4 * (blk - HD / 4); }
-                    } else if (kind == 1) { mat = wk; m0 = h * HD + 4 * blk; slot = 4 * blk; }
-                    else if (kind == 2) { mat = wv; m0 = h * HD + 4 * blk; slot = 4 * blk; }
-                    else { mat = wg; m0 = h * GROWS + 4 * blk; slot = 0; }
+                    SELECT_BLOCK(blk);
                 }
-                const device bfloat16_t* wrow = mat + size_t(m0) * D + lane * 4;
+                const device bfloat16_t* wrow = AS_BF16(mat) + size_t(m0) * D + lane * 4;
+                const device uint32_t* cw = AS_CODES(mat);
+                const uint wpr = D * bits / 32;
+                const uint gpr = D / gsize;
                 float acc[4][RCH];
                 for (uint tm = 0; tm < 4; ++tm)
                     for (uint r = 0; r < RCH; ++r) acc[tm][r] = 0.0f;
@@ -236,7 +466,36 @@ _PROJECT = """
                         }
                     }
                     threadgroup_barrier(mem_flags::mem_threadgroup);
-                    if (active) {
+                    if (AFFINE && active && bits != 16) {
+                        // Affine-coded matrix: blocks of 256 columns (KC is a multiple of 256 then).
+                        const uint b_end = (c0 + KC < D ? c0 + KC : D) / 256;
+                        for (uint b = c0 / 256; b < b_end; ++b) {
+                            const uint col = b * 256 + lane * 8;
+                            float sc[4], bi[4], wf[4][8];
+                            for (uint tm = 0; tm < 4; ++tm) {
+                                sc[tm] = static_cast<float>(scl[size_t(m0 + tm) * gpr + col / gsize]);
+                                bi[tm] = static_cast<float>(bia[size_t(m0 + tm) * gpr + col / gsize]);
+                                affine_decode(cw + size_t(m0 + tm) * wpr + col * bits / 32, wf[tm], bits);
+                            }
+                            for (uint r = 0; r < RCH; ++r) {
+                                if (rc + r < W) {
+                                    float xv[8];
+                                    for (uint t_ = 0; t_ < 8; ++t_)
+                                        xv[t_] = static_cast<float>(chunk_in[r * KC + (col - c0) + t_]);
+                                    float xt[8];
+                                    float sum;
+                                    if (AFFSUM && bits == 4) {
+                                        affine_xt4(xv, xt);
+                                        sum = asum[((rc + r) * (D / 256) + b) * 32 + lane];
+                                    } else {
+                                        sum = affine_prep(xv, xt, bits);
+                                    }
+                                    for (uint tm = 0; tm < 4; ++tm)
+                                        acc[tm][r] += affine_dotf(xt, sum, wf[tm], sc[tm], bi[tm], bits);
+                                }
+                            }
+                        }
+                    } else if (active) {
                         const uint i_end = (c0 + KC < D ? c0 + KC : D) / 128;
                         for (uint i = c0 / 128; i < i_end; ++i) {
                             float wt[4][4];
@@ -256,9 +515,14 @@ _PROJECT = """
                 }
                 if (active) {
                     for (uint tm = 0; tm < 4; ++tm)
-                        for (uint r = 0; r < RCH; ++r)
-                            for (ushort sn = 16; sn >= 1; sn >>= 1)
-                                acc[tm][r] += simd_shuffle_down(acc[tm][r], sn);
+                        for (uint r = 0; r < RCH; ++r) {
+                            if (AFFINE && bits != 16) {
+                                acc[tm][r] = simd_sum(acc[tm][r]);
+                            } else {
+                                for (ushort sn = 16; sn >= 1; sn >>= 1)
+                                    acc[tm][r] += simd_shuffle_down(acc[tm][r], sn);
+                            }
+                        }
                     if (lane == 0) {
                         for (uint r = 0; r < RCH && rc + r < W; ++r) {
                             for (uint tm = 0; tm < 4; ++tm) {
@@ -279,13 +543,66 @@ _PROJECT = """
     for (uint blk = sg; !STAGE2 && blk < nblocks; blk += NSG) {
         uint m0;        // first matrix row of this block
         uint slot;      // where row tm of the block lands in outs, per panel row
-        if (kind == 0) {
-            if (blk < HD / 4) { mat = wq; m0 = h * HD + 4 * blk; slot = 4 * blk; }
-            else { mat = wr; m0 = h * RD + 4 * (blk - HD / 4); slot = HD + 4 * (blk - HD / 4); }
-        } else if (kind == 1) { mat = wk; m0 = h * HD + 4 * blk; slot = 4 * blk; }
-        else if (kind == 2) { mat = wv; m0 = h * HD + 4 * blk; slot = 4 * blk; }
-        else { mat = wg; m0 = h * GROWS + 4 * blk; slot = 0; }
-        const device bfloat16_t* wrow = mat + size_t(m0) * D + lane * 4;
+        SELECT_BLOCK(blk);
+        if (AFFINE && bits != 16) {
+            // Affine-coded matrix: MLX's one-row product per panel row (see affine_prep, affine_dot).
+            const device uint32_t* cw = AS_CODES(mat);
+            const uint wpr = D * bits / 32;          // code words a row
+            const uint gpr = D / gsize;              // groups a row
+            for (uint rc = 0; rc < W; rc += RCH) {
+                float acc[4][RCH];
+                for (uint tm = 0; tm < 4; ++tm)
+                    for (uint r = 0; r < RCH; ++r) acc[tm][r] = 0.0f;
+                for (uint b = 0; b < D / 256; ++b) {
+                    const uint col = b * 256 + lane * 8;
+                    float sc[4], bi[4], wf[4][8];
+                    for (uint tm = 0; tm < 4; ++tm) {
+                        sc[tm] = static_cast<float>(scl[size_t(m0 + tm) * gpr + col / gsize]);
+                        bi[tm] = static_cast<float>(bia[size_t(m0 + tm) * gpr + col / gsize]);
+                        affine_decode(cw + size_t(m0 + tm) * wpr + col * bits / 32, wf[tm], bits);
+                    }
+                    float gv0[4] = {0.0f, 0.0f, 0.0f, 0.0f}, gv1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                    GAINS4(col, gv0);
+                    GAINS4(col + 4, gv1);
+                    for (uint r = 0; r < RCH; ++r) {
+                        if (rc + r < W) {
+                            float xv[8];
+                            FETCH4(rc + r, col, xv, gv0);
+                            float xh[4];
+                            FETCH4(rc + r, col + 4, xh, gv1);
+                            for (uint t_ = 0; t_ < 4; ++t_) xv[4 + t_] = xh[t_];
+                            float xt[8];
+                            float sum;
+                            if (AFFSUM && bits == 4) {
+                                affine_xt4(xv, xt);
+                                sum = asum[((rc + r) * (D / 256) + b) * 32 + lane];
+                            } else {
+                                sum = affine_prep(xv, xt, bits);
+                            }
+                            for (uint tm = 0; tm < 4; ++tm)
+                                acc[tm][r] += affine_dotf(xt, sum, wf[tm], sc[tm], bi[tm], bits);
+                        }
+                    }
+                }
+                for (uint tm = 0; tm < 4; ++tm)
+                    for (uint r = 0; r < RCH; ++r) acc[tm][r] = simd_sum(acc[tm][r]);
+                if (lane == 0) {
+                    for (uint r = 0; r < RCH && rc + r < W; ++r) {
+                        for (uint tm = 0; tm < 4; ++tm) {
+                            const bfloat16_t y = static_cast<bfloat16_t>(acc[tm][r]);
+                            if (kind == 3) {
+                                gate[size_t(rc + r) * GN + m0 + tm] = y;
+                            } else {
+                                const uint stride = kind == 0 ? OQ : OK;
+                                outs[(rc + r) * stride + slot + tm] = static_cast<float>(y);
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        const device bfloat16_t* wrow = AS_BF16(mat) + size_t(m0) * D + lane * 4;
         for (uint rc = 0; rc < W; rc += RCH) {
             float acc[4][RCH];
             for (uint tm = 0; tm < 4; ++tm)
@@ -514,9 +831,10 @@ _PROJECT = """
 def _project_kernel():
     return mx.fast.metal_kernel(
         name="mtplx_inkling_fast_project",
+        # Metal allows 31 buffers a launch: 21 inputs and 8 outputs.
         input_names=[
-            "normed", "hraw", "parts", "g0", "g1", "g2",
-            "wq", "wr", "wsink", "wg", "wk", "wv", "wkt", "wvt",
+            "xin", "parts", "g0", "g1", "g2",
+            "wq", "wr", "wsink", "wg", "wk", "wv", "wkt", "wvt", "sb",
             "q_scale", "r_scale", "k_conv", "v_conv", "k_tail", "v_tail", "pos",
         ],
         output_names=["q", "rel", "sink", "gate", "k_rows", "v_rows", "k_conv_in", "v_conv_in"],
@@ -550,14 +868,25 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
     """
     cfg = layer.cfg
     threads = threads or _THREADS
-    gate_rows_unit = gate_rows or _GATE_ROWS
+    # A gate slice gives every simdgroup one 4-row block, as a query head gives it about 4.5.
+    gate_rows_unit = gate_rows or max(_GATE_ROWS, threads // 8)
     global_visit = not layer.sliding
     q_heads, head_dim = layer.q_scale.shape
     rel_dim = layer.r_scale.shape[1]
-    kv_width = layer.k.shape[0]
+    mq, mr, mg, mk, mv = (matrix(w) for w in (layer.q, layer.r, layer.gate, layer.k, layer.v))
+    for name, m in (("q", mq), ("r", mr), ("gate", mg), ("k", mk), ("v", mv)):
+        why = affine_route(m)
+        if why:
+            count_route(f"refused:{name}_{why}")
+            raise RuntimeError(f"projection launch does not serve {name} as stored: {why}")
+    if any(hasattr(w, "codes") for w in (layer.sink, layer.convs[0].dynamic, layer.convs[1].dynamic)
+           if w is not None):
+        count_route("refused:affine_sink_or_taps")
+        raise RuntimeError("projection launch reads the sink and dynamic taps as bf16")
+    kv_width = mk.rows
     kv_heads = kv_width // head_dim
-    gate_rows = layer.gate.shape[0]
-    width = layer.q.shape[1]
+    gate_rows = mg.rows
+    width = mq.cols
     if width % 128 or head_dim % 4 or rel_dim % 4 or gate_rows % gate_rows_unit:
         raise ValueError("project serves widths that are multiples of 128 (Inkling: 2,304)")
     taps = 0
@@ -575,21 +904,21 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
     parts_in = True
     if raw is None:
         rows, ns = sources.shape[0], sources.shape[1]
-        normed = sources
-        hraw = parts = stand_f32
+        xin = sources
+        parts = stand_f32
         gain_list = [stand_bf16] * 3
     else:
-        hraw, parts, gain_list = raw
-        rows, ns = hraw.shape[0], hraw.shape[1]
+        xin, parts, gain_list = raw
+        rows, ns = xin.shape[0], xin.shape[1]
         parts_in = parts is not None
         if not parts_in:
             parts = stand_f32
-        normed = stand_bf16
         gain_list = list(gain_list) + [gain_list[-1]] * (3 - len(gain_list))
+    sb, (qso, rso, gso, kso, vso) = joined_scales(layer, (mq, mr, mg, mk, mv))
     has_tail = k_tail is not None and v_tail is not None
     stand_in = stand_f32
-    wkt = layer.convs[0].dynamic if taps else layer.k
-    wvt = layer.convs[1].dynamic if taps else layer.v
+    wkt = layer.convs[0].dynamic if taps else layer.q_scale
+    wvt = layer.convs[1].dynamic if taps else layer.q_scale
     size = layer.convs[0].size
     divisor = math.sqrt((2 * size + 1) if taps else (size + 1))
     eps = layer.eps
@@ -598,6 +927,9 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
         pos = pos.astype(mx.uint32)
     groups = q_heads + 2 * kv_heads + gate_rows // gate_rows_unit
     out_bytes = (head_dim + rel_dim + 1) * rows * 4
+    # 4-bit sums once per threadgroup (MLX's load_vector per row, block and lane) when they fit.
+    affsum = any(m.bits == 4 for m in (mq, mr, mg, mk, mv)) and rows <= 16
+    out_bytes += rows * (width // 256) * 32 * 4 if affsum else 0
     staging = _STAGE if stage is None else bool(stage)
     stage = bool(staging and rows * width * 2 + out_bytes <= 31 * 1024)
     # A wider loop-pass panel stages KC columns at a time (all simdgroups in step) rather than norm
@@ -605,11 +937,14 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
     # which measured faster than chunked staging (receipts/probe-mode-1.json: 86 vs 104 us at 8 rows).
     stage2 = bool(raw is not None and not stage)
     chunk = min(rows, _ROW_CHUNK)
-    kc = max(128, min(width, ((31 * 1024 - out_bytes) // (chunk * 2)) // 128 * 128))
+    # Chunks hold whole 256-column blocks when an affine matrix reads them.
+    unit = 256 if any(m.bits != 16 for m in (mq, mr, mg, mk, mv)) else 128
+    kc = max(unit, min(width, ((31 * 1024 - out_bytes) // (chunk * 2)) // unit * unit))
     outputs = _project_kernel()(
         inputs=[
-            normed, hraw, parts, *gain_list,
-            layer.q, layer.r, layer.sink, layer.gate, layer.k, layer.v, wkt, wvt,
+            xin, parts, *gain_list,
+            mq.data, mr.data, layer.sink, mg.data, mk.data, mv.data, wkt, wvt,
+            sb if sb is not None else stand_bf16,
             layer.q_scale, layer.r_scale, k_conv, v_conv,
             k_tail if has_tail else stand_in, v_tail if has_tail else stand_in, pos,
         ],
@@ -621,6 +956,11 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
             ("KH", kv_heads), ("KN", kv_width), ("GN", gate_rows), ("GROWS", gate_rows_unit),
             ("TAPS", taps), ("RCH", min(rows, _ROW_CHUNK)), ("THREADS", threads),
             ("HAS_TAIL", has_tail), ("FORM", 0 if form == "float" else 1), ("CONV_CM", conv_cm),
+            ("QB", mq.bits), ("QG", mq.group), ("RB", mr.bits), ("RG", mr.group),
+            ("GB", mg.bits), ("GG", mg.group), ("KB", mk.bits), ("KG", mk.group),
+            ("VB", mv.bits), ("VG", mv.group),
+            ("QSO", qso), ("RSO", rso), ("GSO", gso), ("KSO", kso), ("VSO", vso),
+            ("AFFINE", any(m.bits != 16 for m in (mq, mr, mg, mk, mv))), ("AFFSUM", affsum),
             ("VNORM", bool(cfg["use_value_norm_no_gamma"])),
             ("QK_CLIP", f32_bits(cfg["qk_l2_clip_threshold"])),
             ("REL_CLIP", f32_bits(cfg["rel_l2_clip_threshold"])),
@@ -666,7 +1006,7 @@ def attention_input(layer, x, closed, k_tail, v_tail, pos, messages=None, messag
 
     form = "float"
     if layer.sliding:
-        form = _static_form(layer.k.shape[0], layer.convs[0].size)
+        form = _static_form(matrix(layer.k).rows, layer.convs[0].size)
         if form not in ("float", "fused"):
             count_route("refused:static_conv_unproven")
             raise RuntimeError(f"static convolution unproven on this GPU: {form}")
