@@ -311,7 +311,7 @@ _DECIDE = r"""
     uint sg = simdgroup_index_in_threadgroup;
     uint V = sizes[0];
     uint C = sizes[1];
-    uint K = sizes[2];
+    uint K = metal::min(sizes[2], offered[0]);   // proposals this round verifies
     uint W = sizes[3];
     uint2 key = uint2(seed[0], seed[1]);
     threadgroup int win_r[8];
@@ -377,7 +377,7 @@ _DECIDE = r"""
         for (uint g = 0; g < W; ++g) {
             packet[2 + g] = g < n ? proposals[g] : (g == n ? token : -1);
         }
-        for (uint g = 0; g < K; ++g) packet[2 + W + g] = as_type<int>(aprob[g]);
+        for (uint g = 0; g < sizes[2]; ++g) packet[2 + W + g] = as_type<int>(g < K ? aprob[g] : 0.0f);
     }
 """
 
@@ -427,7 +427,7 @@ def _kernel(name):
         return mx.fast.metal_kernel(
             name="mtplx_inkling_l4_decide",
             input_names=["race", "lse", "tlaw", "dlaw", "proposals", "modes", "positions",
-                         "seed", "sizes"],
+                         "seed", "sizes", "offered"],
             output_names=["packet"],
             source=_DECIDE,
             header=_HEADER + _ROW_WINNER,
@@ -501,7 +501,7 @@ def race(tlaw, tstats, *, modes, positions, seed, purpose, greedy=False, dlaw=No
 
 
 def decide(target_logits, proposals, *, position, seed, temperature=1.0, draft=None,
-           greedy=None, rule="ratio"):
+           greedy=None, rule="ratio", offered=None):
     """Decide one verify panel on the GPU and return the int32 packet (lazy).
 
     ``target_logits`` (W, V) are the verify rows as the head returns them (soft cap
@@ -509,6 +509,9 @@ def decide(target_logits, proposals, *, position, seed, temperature=1.0, draft=N
     ``proposals`` (k,) int32 with k = W - 1, ``draft`` their law (``DraftLaw``), or None
     for point-mass proposals (prompt copy). ``position`` is the absolute position of the
     token row 0 decides (an int or a uint32 array). ``temperature`` 0 selects greedy.
+    ``offered`` (an int or a uint32 array, possibly lazy) limits the round to its first
+    ``offered`` proposals: rows past it are ignored and the bonus comes from row ``offered``.
+    It lets a fixed-width panel carry a depth chosen on the device (``draft.choose_depth``).
     ``rule`` "match" is the seed-match rule on the device: every row draws its own token
     from p and a proposal survives only on equality (the law RC6's target_prefix keeps;
     the random numbers are this module's, not RC6's NumPy stream).
@@ -537,10 +540,15 @@ def decide(target_logits, proposals, *, position, seed, temperature=1.0, draft=N
                            purpose=PURPOSE_TARGET, greedy=greedy, dlaw=dlaw, dstats=dstats,
                            proposals=props if k else None)
     sizes = mx.array([vocab, _chunks(vocab), k, rows], mx.uint32)
+    if offered is None:
+        offered = mx.array([k], mx.uint32)
+    elif not isinstance(offered, mx.array):
+        offered = mx.array([int(offered)], mx.uint32)
+    offered = offered.astype(mx.uint32).reshape(1)
     (packet,) = _kernel("decide")(
         inputs=[race_parts, lse, tlaw, dlaw if dlaw is not None else mx.zeros((1,), mx.float32),
                 props.astype(mx.int32) if k else mx.zeros((1,), mx.int32), modes, positions,
-                seed_words, sizes],
+                seed_words, sizes, offered],
         template=[("GREEDY", bool(greedy)), ("MATCH", bool(match))],
         grid=(THREADS, 1, 1),
         threadgroup=(THREADS, 1, 1),

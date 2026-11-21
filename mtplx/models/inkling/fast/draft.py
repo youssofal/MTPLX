@@ -106,6 +106,34 @@ def propose(drafter, target, anchor, cache, count, *, position, seed, temperatur
     return ids, law
 
 
+# ------------------------------------------------------------------ depth on the device
+
+#: Acceptance of a tested proposal by the drafter's own probability of it, q_i(x_i), on the
+#: real-history study (outputs/inkling-fast-20261121/summary/l4/receipts/acceptance-study-2.json,
+#: 813 ratio rounds, made monotone): bin edges and acceptance per bin.
+CONFIDENCE_EDGES = (0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 0.99)
+CONFIDENCE_ACCEPT = (0.26, 0.26, 0.45, 0.565, 0.59, 0.59, 0.81, 0.95)
+
+
+def choose_depth(log_q, cost_ms, *, edges=CONFIDENCE_EDGES, accept=CONFIDENCE_ACCEPT, min_depth=1):
+    """How many of the drafted proposals to verify, chosen on the device from the drafter's
+    confidence: (1,) uint32, lazy. Each position's acceptance is read from the calibration
+    by its q_i(x_i); the count maximises expected tokens per ms with ``cost_ms[k]`` the
+    round cost at k proposals. Pair it with ``round.decide(..., offered=k)`` on a panel of
+    fixed width whose expensive per-row work is skipped past k (no host read either way).
+    """
+    conf = mx.exp(log_q.astype(mx.float32))
+    bins = mx.sum(conf[:, None] >= mx.array(edges, mx.float32)[None, :], axis=1)
+    rate = mx.take(mx.array(accept, mx.float32), bins)
+    expected = 1.0 + mx.cumsum(mx.cumprod(rate))
+    k = int(log_q.shape[0])
+    cost = mx.array([float(c) for c in cost_ms[1 : k + 1]], mx.float32)
+    value = expected / cost
+    if min_depth > 1:
+        value = mx.where(mx.arange(k) + 1 < min_depth, -1.0, value)
+    return (mx.argmax(value) + 1).astype(mx.uint32).reshape(1)
+
+
 # ------------------------------------------------------------------ depth by yield
 
 #: Round cost (ms) by proposal count 0..7 on RC6's verify path at 2,122 tokens of context:

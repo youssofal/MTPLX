@@ -281,3 +281,36 @@ def test_device_match_rule_matches_host_reference():
                                            rule="match")
         assert d.tokens == want
         np.testing.assert_allclose(d.accept_probability[: len(probs)], probs, rtol=1e-4, atol=1e-7)
+
+
+@needs_gpu
+def test_device_offered_count_equals_the_truncated_panel():
+    # a panel of 8 rows deciding only its first k proposals gives the packet of the k+1-row panel
+    rng = np.random.default_rng(41)
+    vocab = 32_768
+    for trial in range(24):
+        k = 1 + trial % 7
+        target, draft = _panel(rng, 7, vocab, closeness=0.5)
+        seed = int(rng.integers(0, 2**63))
+        dlaw, dstats = rnd.law_rows(mx.array(draft))
+        positions = mx.array(500, mx.uint32) + mx.arange(7, dtype=mx.uint32)
+        props, _ = rnd.sample_rows(dlaw, dstats, positions=positions, seed=seed, purpose=rnd.PURPOSE_DRAFT)
+        full = rnd.read_packet(rnd.decide(mx.array(target), props, position=500, seed=seed,
+                                          draft=rnd.DraftLaw(dlaw, dstats),
+                                          offered=mx.array([k], mx.uint32)), 8)
+        _, part_stats = rnd.law_rows(dlaw[:k])
+        part = rnd.read_packet(rnd.decide(mx.array(target[: k + 1]), props[:k], position=500,
+                                          seed=seed, draft=rnd.DraftLaw(dlaw[:k], part_stats)), k + 1)
+        assert full.tokens == part.tokens and full.accepted == part.accepted
+
+
+@needs_gpu
+def test_device_choose_depth_follows_confidence():
+    from mtplx.models.inkling.fast import draft as fdraft
+    cost = fdraft.RC6_COST_MS_2K
+    sure = mx.log(mx.array([0.999] * 7, mx.float32))
+    unsure = mx.log(mx.array([0.1] * 7, mx.float32))
+    mixed = mx.log(mx.array([0.999, 0.999, 0.999, 0.1, 0.999, 0.999, 0.999], mx.float32))
+    assert int(np.asarray(fdraft.choose_depth(sure, cost))[0]) == 7
+    assert int(np.asarray(fdraft.choose_depth(unsure, cost))[0]) == 1
+    assert int(np.asarray(fdraft.choose_depth(mixed, cost))[0]) == 3
