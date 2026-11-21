@@ -150,9 +150,13 @@ def test_the_engine_pool_is_priced_at_the_widest_copy_panel():
     assert engine_pool_price(81 * mb, 25) == 81 * mb * 25 // 8 >= 231 * mb
     assert engine_pool_price(81 * mb, 8) == engine_pool_price(81 * mb, 1) == 81 * mb
     assert engine_pool_price(None, 25) == 0
-    # The load recorded the widest panel's program: its pool is the most the engine holds (Bare
-    # Speed: 403 MB after 14 rounds of 25-row copy panels, where the scaling priced 775).
-    assert engine_pool_price(403 * mb, 25, widest_recorded=True) == 403 * mb
+    # The load recorded the widest panel's program: its pool holds every width inside the first
+    # capacity step, and a longer conversation adds a measured part (Bare Speed through `mtplx serve`,
+    # 21 November: 322 MB at ready, 410 MB after the first 4K read, 413 MB after a 20K one, where the
+    # scaling priced 1,007).
+    ready = 322_495_208
+    assert engine_pool_price(ready, 25, widest_recorded=True) == ready + (96 << 20) >= 413_000_000
+    assert engine_pool_price(0, 25, widest_recorded=True) == 0
     rt, row = _decode_runtime(pool_bytes=81 * mb)
     rt.engine_pool_bound = engine_pool_price(rt.engine_pool_bytes, 25)
     assert InklingRuntime.window_cache_bytes(rt) == 1024 * 40 * row + 8 * 4096 * row + 81 * mb * 25 // 8
@@ -192,11 +196,14 @@ def test_the_family_reserve_is_its_forward_and_its_checkpoints_and_admits_a_tigh
     assert InklingRuntime.prefill_working_bytes(rt, few=True) == forward + 2 * record  # where memory sets the window
     assert InklingRuntime.prefill_working_bytes(rt, 256, few=True) == forward + 2 * record  # narrower: same charge
     assert InklingRuntime.prefill_working_bytes(rt, 1024, few=True) == 2 * forward + 2 * record  # wider: in proportion
-    # Bare Speed (15.99 GB of weights with its vision tower) on a 24 GB Mac, at the server's fixed term (rings,
-    # bank rounding and the engine pool priced at 0.72 GiB): the flat reserve refuses it, one 2 GiB reserve for
-    # both rules leaves the 4,096-token floor, the forward and two checkpoints under the tight rule admit 16K.
+    # Bare Speed (15.99 GB of weights with its vision tower) on a 24 GB Mac, at the server's fixed term as served
+    # (21 November: rings at the full window 180 MB, bank rounding 134 MB, the pool at ready 322 MB plus its
+    # growth past the first capacity step, the load's 33 MB and the warm-up's arrays): the flat reserve refuses
+    # it, one 2 GiB reserve for both rules leaves the 4,096-token floor, the forward and two checkpoints under the
+    # tight rule admit the rule's shared ceiling (20,480; its own room is 24,576 tokens).
+    fixed = 179_999_232 + 134_217_728 + 322_495_208 + (96 << 20) + 32_996_786 + InklingRuntime.WARMUP_ARRAYS_BYTES
     args = dict(total_ram_bytes=24 * gib, model_weights_bytes=15_993_374_536, kv_bytes_per_token=32768,
-                aux_bytes_per_token=4096, attention_kv_copy_bytes_per_token=4096, fixed_cache_bytes=1_088_788_347,
+                aux_bytes_per_token=4096, attention_kv_copy_bytes_per_token=4096, fixed_cache_bytes=fixed,
                 tight_machine_measured=True)
     assert not plan_memory(**{**args, "tight_machine_measured": False}).model_fits
     one = plan_memory(**args, runtime_transients_bytes=2 * gib)
@@ -205,7 +212,7 @@ def test_the_family_reserve_is_its_forward_and_its_checkpoints_and_admits_a_tigh
                         tight_runtime_transients_bytes=InklingRuntime.prefill_working_bytes(rt, few=True))
     assert split.model_fits and split.tight_machine
     assert split.runtime_transients_bytes == forward + 2 * record + 256 * 2**20
-    assert split.context_window_fit == 16384
+    assert split.context_window_fit == 20480
     # Two checkpoints wherever memory sets the window: a tight Mac, or under 16 GiB of engine budget above the
     # weights (every 24 to 36 GB Mac with these packs); from 48 GB the shared eight.
     for ram, few in ((24, True), (32, True), (36, True), (48, False), (128, False)):

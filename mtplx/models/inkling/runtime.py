@@ -45,17 +45,25 @@ def widest_panel(model):
     return max(engine_site.MAX_WARM_WIDTH, min(MAX_PANEL, context_copy.context_copy_block_k() + 1))
 
 
+#: What a conversation past the first 4,096-row capacity step adds to the engine's pool beyond the
+#: programs the load records (its warm-up state is inside the first step): through `mtplx serve` on Bare
+#: Speed under a simulated 24 GB budget (21 November, `m1-new-a`), 322 MB at ready with the widest panel
+#: recorded, 410 MB after the first 4K read, 413 MB after a 20K one.
+POOL_PAST_FIRST_STEP_BYTES = 96 << 20
+
+
 def engine_pool_price(measured, widest, *, widest_recorded=False):
     """The engine pool a request is priced at. One pool serves every program's temporaries and
     grows to the widest program served. When the load recorded the widest panel's program
-    (``widest_recorded``), the pool it measured is the most the engine holds: priced as measured.
-    Otherwise warm-up's widest is ``MAX_WARM_WIDTH`` rows and a copy round records up to
-    ``widest`` later, so the pool is priced at the widest panel, scaled by rows from the measured
-    one (on the native pack 81 MB after warm-up and 231 MB once a 25-row copy round recorded; on
-    Bare Speed 248 and 403 MB, where the scaling priced 775)."""
+    (``widest_recorded``), the pool it measured holds every width's temporaries inside the first
+    capacity step: priced as measured plus what a longer conversation adds
+    (``POOL_PAST_FIRST_STEP_BYTES``). Otherwise warm-up's widest is ``MAX_WARM_WIDTH`` rows and a
+    copy round records up to ``widest`` later, so the pool is priced at the widest panel, scaled by
+    rows from the measured one (on the native pack 81 MB after warm-up and 231 MB once a 25-row
+    copy round recorded; on Bare Speed 248 and 403 MB, where the scaling priced 775)."""
     measured = int(measured or 0)
     if widest_recorded:
-        return measured
+        return measured + POOL_PAST_FIRST_STEP_BYTES if measured else 0
     return measured * max(int(widest), engine_site.MAX_WARM_WIDTH) // engine_site.MAX_WARM_WIDTH
 
 
@@ -97,9 +105,9 @@ class InklingRuntime(MTPLXRuntime):
                 fast_round.warm()
             self.engine_warm = engine_site.warm(self)
             # The copy lane's widest panel too, where wide panels are exact: its program holds the
-            # pool's largest temporaries, so the pool read below is the most the engine holds and
-            # is priced as measured (not scaled from warm-up's widest), and a session's first copy
-            # round replays instead of recording.
+            # pool's largest temporaries inside the first capacity step, so the pool read below is
+            # priced as measured plus what a longer conversation adds (``engine_pool_price``), not
+            # scaled from warm-up's widest.
             widest = widest_panel(model)
             if widest > engine_site.MAX_WARM_WIDTH:
                 wide = engine_site.warm(self, widths=(widest,))
@@ -128,8 +136,15 @@ class InklingRuntime(MTPLXRuntime):
         # The table against the rounds it prices, whatever made it (DepthTableCheck).
         self.depth_table_check = DepthTableCheck(self.round_cost_ms or fast_draft.RC6_COST_MS_2K)
         # What the load leaves resident beside the weights and the engine's pool (the float32
-        # router and controller copies, the kernels' tables), measured once everything is built.
-        self.load_extra_bytes = self.measure_load_extra_bytes()
+        # router and controller copies, the kernels' tables), measured once everything is built,
+        # and what the server's warm-up forwards add after it (WARMUP_ARRAYS_BYTES).
+        self.load_extra_bytes = self.measure_load_extra_bytes() + self.WARMUP_ARRAYS_BYTES
+
+    #: Arrays the server's own warm-up forwards build and keep beside the weights after the load measured
+    #: its own: through `mtplx serve` on Bare Speed (21 November, `m1-new-a`), MLX active at ready with the
+    #: bank empty was 148 MB above the resident weights, the pool and the load's 33 MB, and stayed there
+    #: through requests from 4K to 20K. Priced with the load's arrays until the load builds them itself.
+    WARMUP_ARRAYS_BYTES = 160 << 20
 
     def measure_load_extra_bytes(self):
         """MLX's active memory now, less the target's and the drafter's weights and the engine's
@@ -242,17 +257,18 @@ class InklingRuntime(MTPLXRuntime):
             return _prefill_chunk_size(prompt_tokens)
         return self.PROMPT_CHUNK_ROWS
 
-    #: One 512-row prompt forward's working memory beyond the prompt's own state and its restore checkpoints,
-    #: measured through `mtplx serve` on Bare Speed (21 November): a cold 4K read's peak less MLX active before
-    #: it, less the state the prompt holds at the read's end (global KV at 256-row steps, the window rings at
-    #: 1,535 rows, the drafter's), less its checkpoints: 0.906 GB with checkpoints off, 0.732 with two kept,
-    #: 0.614 with eight. Rounded up to 7/8 GiB. With the checkpoints the read keeps (``checkpoints_kept``
-    #: records of ``checkpoint_record_bytes``) it replaces the flat 3 GiB runtime reserve in this family's
-    #: memory plan, and it is what the admission charges a forward. Against the served peaks the plan then
-    #: leaves 0.9 GB of room at 4K and 0.6 GB at 16K on a tight Mac, a room that shrinks by 32 KB a token:
-    #: the decode start's second copy of the global KV (the bank's prompt snapshot keeps the read's buffers
-    #: while the fast path copies them into whole 4,096-row banks), which the per-token rate leaves out.
-    FORWARD_WORKING_BYTES = 7 * 1024**3 // 8
+    #: One 512-row prompt forward's working memory beyond what decode keeps and the read's restore checkpoints,
+    #: measured through `mtplx serve` on Bare Speed under a simulated 24 GB budget (21 November, `m1-new-a`, the
+    #: one-copy store and banks allocated once per read): a cold read's peak less MLX active before it, less the
+    #: state it holds at its end (global KV in whole 4,096-row banks, rings, the drafter's, tails), its two
+    #: checkpoints, the attention copy and the pool's growth: the forward's temporaries 0.49 / 0.55 / 0.54 GB at
+    #: 4K / 16K / 20K, flat with the context, plus the 511 extra rows every ring holds during a 512-row forward
+    #: (88 MB) that the plan's rings at the full window leave out. Rounded up to 5/8 GiB. With the checkpoints
+    #: the read keeps (``checkpoints_kept`` records of ``checkpoint_record_bytes``) it replaces the flat 3 GiB
+    #: runtime reserve in this family's memory plan, and it is what the admission charges a forward. (The 7/8 GiB
+    #: before it was measured while the decode start copied the global KV beside the bank's views and every chunk
+    #: copied each global visit's history: `424f4a92`, `004bf6ae`.)
+    FORWARD_WORKING_BYTES = 5 * 1024**3 // 8
 
     #: Restore checkpoints a read keeps where memory sets the context window (``keeps_few_checkpoints``). A
     #: checkpoint copies every window ring and every convolution tail of the target and the drafter, 180 MB on
