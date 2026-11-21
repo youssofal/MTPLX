@@ -1830,3 +1830,8 @@
 "DeepSeek Harness opened in %@, with its telemetry off." = "DeepSeek Harness を %@ で開きました。テレメトリーはオフです。";
 "MTPLX's command-line runtime is not installed, so DeepSeek Harness could not open." = "MTPLX のコマンドライン実行環境がインストールされていないため、DeepSeek Harness を開けませんでした。";
 "Original expert and attention weights, with vision and speculative decoding." = "エキスパートとアテンションの元の重みを保持。画像入力と投機的デコーディングに対応。";
+"Original expert and attention weights, with vision and speculative decoding. FP16 build for M1 and M2 Macs." = "エキスパートとアテンションの元の重みを保持。画像入力と投機的デコーディングに対応。M1およびM2 Mac向けのFP16ビルド。";
+"Fastest Inkling 2 Mini: 4-bit attention and output, with vision and speculative decoding." = "最速の Inkling 2 Mini。アテンションと出力層は 4 ビット。画像入力と投機的デコーディングに対応。";
+"Fastest Inkling 2 Mini: 4-bit attention and output, with vision and speculative decoding. FP16 build for M1 and M2 Macs." = "最速の Inkling 2 Mini。アテンションと出力層は 4 ビット。画像入力と投機的デコーディングに対応。M1およびM2 Mac向けのFP16ビルド。";
+"Closer to the original weights: 8-bit attention, with vision and speculative decoding." = "元の重みにより近い。アテンションは 8 ビット。画像入力と投機的デコーディングに対応。";
+"Closer to the original weights: 8-bit attention, with vision and speculative decoding. FP16 build for M1 and M2 Macs." = "元の重みにより近い。アテンションは 8 ビット。画像入力と投機的デコーディングに対応。M1およびM2 Mac向けのFP16ビルド。";

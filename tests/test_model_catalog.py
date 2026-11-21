@@ -45,11 +45,46 @@ def _no_installed_qwen38(monkeypatch):
     monkeypatch.setattr(default_models_module, "_QWEN38_OPTIMIZED_SPEED_FP16_LOCAL_CANDIDATES", ())
 
 
-def test_catalog_has_twenty_seven_unique_entries():
+def test_catalog_has_thirty_two_unique_entries():
     ids = [model.id for model in OFFICIAL_CATALOG]
-    assert len(ids) == len(set(ids)) == 27
-    assert len({model.hf_model_id for model in OFFICIAL_CATALOG}) == 27
+    assert len(ids) == len(set(ids)) == 32
+    assert len({model.hf_model_id for model in OFFICIAL_CATALOG}) == 32
 
+
+def test_inkling_trio_follows_each_tiers_first_pick_where_the_plan_admits_it():
+    inkling = ["inkling2-mini-bare-speed", "inkling2-mini-optimized-speed", "inkling2-mini-optimized-quality"]
+    for ram in (32, 36, 40):
+        ids = recommended_catalog_ids(memory_gib=ram, chip_tier=MODERN_TIER)
+        assert ids[0] == "qwen38-27b-optimized-speed"
+        assert ids[1:4] == inkling
+    for ram in (16, 18, 24):
+        assert not set(inkling) & set(recommended_catalog_ids(memory_gib=ram, chip_tier=MODERN_TIER))
+    for ram in (64, 128):
+        ids = recommended_catalog_ids(memory_gib=ram, chip_tier=MODERN_TIER)
+        assert ids[ids.index("bonsai-2-27b-optimized-speed") + 1 :][:3] == inkling
+    for ram in (32, 64):
+        assert not set(inkling) & set(recommended_catalog_ids(memory_gib=ram, chip_tier=LEGACY_TIER))
+    for model_id in inkling:
+        model = catalog_model_with_id(model_id)
+        assert model.recommended_tiers == frozenset({MODERN_TIER})
+        assert model.hf_model_id == "Youssofal/MTPLX-" + model.display_name.replace(" ", "-")
+
+
+
+def test_the_24_gib_inkling_offer_is_prepared_but_off(monkeypatch):
+    import mtplx.model_catalog as catalog
+
+    assert catalog.INKLING_TIGHT_MAC_OFFER is False
+    for ram in (24, 28):
+        assert "inkling2-mini-bare-speed" not in recommended_catalog_ids(memory_gib=ram, chip_tier=MODERN_TIER)
+    monkeypatch.setattr(catalog, "INKLING_TIGHT_MAC_OFFER", True)
+    for ram in (24, 28):
+        ids = recommended_catalog_ids(memory_gib=ram, chip_tier=MODERN_TIER)
+        assert ids[1] == "inkling2-mini-bare-speed"  # directly after the tier's first pick
+        assert ids[0] == "bonsai-2-27b-optimized-speed"  # first pick unchanged
+        assert "inkling2-mini-optimized-speed" not in ids and "inkling2-mini-optimized-quality" not in ids
+    assert "inkling2-mini-bare-speed" not in recommended_catalog_ids(memory_gib=18, chip_tier=MODERN_TIER)
+    assert "inkling2-mini-bare-speed" not in recommended_catalog_ids(memory_gib=24, chip_tier=LEGACY_TIER)
 
 def test_qwen38_fp16_siblings_mirror_their_parents():
     # Same packs, same peak; only the tier, id suffix and HF repo differ.
@@ -146,7 +181,11 @@ def test_recommended_ids_mirror_app_ram_tiers():
     ]
     trio38_fp16 = [f"{model_id}-fp16" for model_id in trio38]
     assert recommended_catalog_ids(memory_gib=36, chip_tier=MODERN_TIER) == [
-        *trio38,
+        trio38[0],
+        "inkling2-mini-bare-speed",
+        "inkling2-mini-optimized-speed",
+        "inkling2-mini-optimized-quality",
+        *trio38[1:],
         "optimized-speed-v2",
         "optimized-speed",
         "mimo-v26-qwen-9b-optimized-speed",
@@ -155,11 +194,10 @@ def test_recommended_ids_mirror_app_ram_tiers():
         "qwen36-35b-a3b-optimized-speed",
         "optimized-quality",
         "bonsai-2-27b-optimized-speed",
-        "inkling2-mini-optimized-quality",
         "qwen35-4b-optimized-speed",
         "qwen35-4b-optimized-quality",
     ]
-    assert recommended_catalog_ids(memory_gib=32, chip_tier=MODERN_TIER)[:3] == trio38
+    assert recommended_catalog_ids(memory_gib=32, chip_tier=MODERN_TIER)[0] == trio38[0]
     assert recommended_catalog_ids(memory_gib=64, chip_tier=MODERN_TIER) == [
         *trio38,
         "optimized-speed-v2",
@@ -171,6 +209,8 @@ def test_recommended_ids_mirror_app_ram_tiers():
         "mimo-v26-qwen-9b-optimized-speed",
         "qwen35-9b-optimized-speed",
         "bonsai-2-27b-optimized-speed",
+        "inkling2-mini-bare-speed",
+        "inkling2-mini-optimized-speed",
         "inkling2-mini-optimized-quality",
         "qwen35-4b-optimized-speed",
         "qwen35-4b-optimized-quality",

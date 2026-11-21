@@ -58,6 +58,9 @@ public enum ModelPickChoice: Equatable, Sendable, Hashable {
     case curatedQwen35BBalance
     case curatedQuality
     case curatedGemmaSpeed
+    case curatedInklingBareSpeed
+    case curatedInklingOptimizedSpeed
+    case curatedInklingOptimizedQuality
     case curatedStepFlash
     case other(hfRepo: String)
     case local(path: String)
@@ -239,6 +242,13 @@ public struct OnboardingFeatureState: Equatable, Sendable {
             return catalog.first { $0.id == id }
         case .curatedGemmaSpeed:
             return catalog.first { $0.id == "gemma4-optimized-speed" }
+        case .curatedInklingBareSpeed:
+            // The Inkling trio is modern-tier only with no FP16 sibling, so it passes through.
+            return catalog.first { $0.id == "inkling2-mini-bare-speed" }
+        case .curatedInklingOptimizedSpeed:
+            return catalog.first { $0.id == "inkling2-mini-optimized-speed" }
+        case .curatedInklingOptimizedQuality:
+            return catalog.first { $0.id == "inkling2-mini-optimized-quality" }
         case .curatedStepFlash:
             return nil
         case .other, .local:
@@ -271,6 +281,9 @@ public struct OnboardingFeatureState: Equatable, Sendable {
              .curatedQwen35BBalance,
              .curatedQuality,
              .curatedGemmaSpeed,
+             .curatedInklingBareSpeed,
+             .curatedInklingOptimizedSpeed,
+             .curatedInklingOptimizedQuality,
              .curatedStepFlash:
             return resolvedModel?.hfModelID
         case .other(let repo):
@@ -358,6 +371,9 @@ public struct OnboardingFeatureState: Equatable, Sendable {
                  .curatedQwen35BBalance,
                  .curatedQuality,
                  .curatedGemmaSpeed,
+                 .curatedInklingBareSpeed,
+                 .curatedInklingOptimizedSpeed,
+                 .curatedInklingOptimizedQuality,
                  .curatedStepFlash:
                 return resolvedModel != nil
             case .other:

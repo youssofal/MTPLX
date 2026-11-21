@@ -1830,3 +1830,8 @@
 "DeepSeek Harness opened in %@, with its telemetry off." = "DeepSeek Harness 已在 %@ 中打开，遥测已关闭。";
 "MTPLX's command-line runtime is not installed, so DeepSeek Harness could not open." = "MTPLX 的命令行运行时未安装，因此 DeepSeek Harness 无法打开。";
 "Original expert and attention weights, with vision and speculative decoding." = "保留专家层和注意力层的原始权重，支持图像输入和推测解码。";
+"Original expert and attention weights, with vision and speculative decoding. FP16 build for M1 and M2 Macs." = "保留专家层和注意力层的原始权重，支持图像输入和推测解码。适用于 M1 和 M2 Mac 的 FP16 构建。";
+"Fastest Inkling 2 Mini: 4-bit attention and output, with vision and speculative decoding." = "最快的 Inkling 2 Mini：4 位注意力层和输出层，支持图像输入和推测解码。";
+"Fastest Inkling 2 Mini: 4-bit attention and output, with vision and speculative decoding. FP16 build for M1 and M2 Macs." = "最快的 Inkling 2 Mini：4 位注意力层和输出层，支持图像输入和推测解码。适用于 M1 和 M2 Mac 的 FP16 构建。";
+"Closer to the original weights: 8-bit attention, with vision and speculative decoding." = "更接近原始权重：8 位注意力层，支持图像输入和推测解码。";
+"Closer to the original weights: 8-bit attention, with vision and speculative decoding. FP16 build for M1 and M2 Macs." = "更接近原始权重：8 位注意力层，支持图像输入和推测解码。适用于 M1 和 M2 Mac 的 FP16 构建。";

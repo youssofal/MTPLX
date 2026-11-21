@@ -1830,3 +1830,8 @@
 "DeepSeek Harness opened in %@, with its telemetry off." = "DeepSeek Harness %@ में खुल गया, उसकी टेलीमेट्री बंद है।";
 "MTPLX's command-line runtime is not installed, so DeepSeek Harness could not open." = "MTPLX का कमांड-लाइन रनटाइम इंस्टॉल नहीं है, इसलिए DeepSeek Harness नहीं खुल सका।";
 "Original expert and attention weights, with vision and speculative decoding." = "विशेषज्ञ और अटेंशन लेयर के मूल वेट, साथ में इमेज इनपुट और स्पेक्युलेटिव डिकोडिंग।";
+"Original expert and attention weights, with vision and speculative decoding. FP16 build for M1 and M2 Macs." = "विशेषज्ञ और अटेंशन लेयर के मूल वेट, साथ में इमेज इनपुट और स्पेक्युलेटिव डिकोडिंग। M1 और M2 Mac के लिए FP16 बिल्ड।";
+"Fastest Inkling 2 Mini: 4-bit attention and output, with vision and speculative decoding." = "सबसे तेज़ Inkling 2 Mini: 4-बिट अटेंशन और आउटपुट, साथ में इमेज इनपुट और स्पेक्युलेटिव डिकोडिंग।";
+"Fastest Inkling 2 Mini: 4-bit attention and output, with vision and speculative decoding. FP16 build for M1 and M2 Macs." = "सबसे तेज़ Inkling 2 Mini: 4-बिट अटेंशन और आउटपुट, साथ में इमेज इनपुट और स्पेक्युलेटिव डिकोडिंग। M1 और M2 Mac के लिए FP16 बिल्ड।";
+"Closer to the original weights: 8-bit attention, with vision and speculative decoding." = "मूल वेट के अधिक करीब: 8-बिट अटेंशन, साथ में इमेज इनपुट और स्पेक्युलेटिव डिकोडिंग।";
+"Closer to the original weights: 8-bit attention, with vision and speculative decoding. FP16 build for M1 and M2 Macs." = "मूल वेट के अधिक करीब: 8-बिट अटेंशन, साथ में इमेज इनपुट और स्पेक्युलेटिव डिकोडिंग। M1 और M2 Mac के लिए FP16 बिल्ड।";

@@ -1830,3 +1830,8 @@
 "DeepSeek Harness opened in %@, with its telemetry off." = "O DeepSeek Harness abriu no %@, com a telemetria desligada.";
 "MTPLX's command-line runtime is not installed, so DeepSeek Harness could not open." = "O runtime de linha de comando do MTPLX não está instalado, então o DeepSeek Harness não pôde abrir.";
 "Original expert and attention weights, with vision and speculative decoding." = "Pesos originais dos especialistas e da atenção, com visão e decodificação especulativa.";
+"Original expert and attention weights, with vision and speculative decoding. FP16 build for M1 and M2 Macs." = "Pesos originais dos especialistas e da atenção, com visão e decodificação especulativa. Build FP16 para Macs M1 e M2.";
+"Fastest Inkling 2 Mini: 4-bit attention and output, with vision and speculative decoding." = "O Inkling 2 Mini mais rápido: atenção e saída em 4 bits, com visão e decodificação especulativa.";
+"Fastest Inkling 2 Mini: 4-bit attention and output, with vision and speculative decoding. FP16 build for M1 and M2 Macs." = "O Inkling 2 Mini mais rápido: atenção e saída em 4 bits, com visão e decodificação especulativa. Build FP16 para Macs M1 e M2.";
+"Closer to the original weights: 8-bit attention, with vision and speculative decoding." = "Mais próximo dos pesos originais: atenção em 8 bits, com visão e decodificação especulativa.";
+"Closer to the original weights: 8-bit attention, with vision and speculative decoding. FP16 build for M1 and M2 Macs." = "Mais próximo dos pesos originais: atenção em 8 bits, com visão e decodificação especulativa. Build FP16 para Macs M1 e M2.";
