@@ -1071,6 +1071,11 @@ class ReplaySite:
                 report[name] = round(value, 6)
         if self.last_refusal is not None:
             report["last_refusal"] = self.last_refusal
+        refused = [{"program": e.digest, "code": e.refused, "detail": e.detail}
+                   for e in self._entries.values() if e.state == "refused"]
+        if refused:
+            # Every refused program's facts (the launch where its recordings differed), newest last.
+            report["refusals"] = refused[-8:]
         abandoned = delta("abandoned")
         if abandoned:
             report["abandoned"] = abandoned

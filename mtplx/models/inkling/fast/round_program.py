@@ -51,7 +51,7 @@ import mlx.nn as nn
 
 from mtplx.engine import runtime as engine_runtime
 from mtplx.engine import sites
-from mtplx.engine.site import room_for_check_copies
+from mtplx.engine.site import KEY_NEW, WARMING, room_for_check_copies
 
 from . import engine_site
 from . import round as fast_round
@@ -102,6 +102,14 @@ def site(rt: Any):
             rt, _ATTRIBUTE, NAME,
             weights=_weights, pin_operands=True, names=_named_weights,
             output_names=_output_name, fence_strided=False,
+            # The committing round writes its state in place, so a recording made while the
+            # loop's previous work still holds a state array carries MLX's copy of it, and the
+            # allocator can hand a constant's buffer to an array the program later writes: two
+            # recordings of one round then differ by copies, or by a constant against the same
+            # bytes. Both are one program (the engine's round-program mode): the shorter, in-place
+            # recording is kept and bit-checked twice. Without it the served loop's rounds were
+            # refused (signature_unstable) where an isolated harness replayed 30 of 30.
+            settle_copies=True,
         )
         # The round's kept constants (sizes, per-row parameters, modes) are bound in place.
         replay.pin_before_each_recording(fast_round.constants)
@@ -729,6 +737,17 @@ def last_route() -> dict[str, Any]:
 
 def _note(route: str, reason: str | None, proposals: int) -> None:
     _LAST["route"], _LAST["reason"], _LAST["proposals"] = route, reason, proposals
+    _LAST.pop("refusal", None)
+
+
+def _decline_program(replay, reason: str, proposals: int):
+    """A program that will not serve or record this round: the loop's pieces serve it, counted
+    ``round.decline.program_<reason>``; the route carries the program's last refusal (its code
+    and the launch where its recordings differed)."""
+    out = _decline("program_" + reason.replace(":", "_"), proposals)
+    if replay.last_refusal is not None:
+        _LAST["refusal"] = dict(replay.last_refusal)
+    return out
 
 
 def _decline(reason: str, proposals: int):
@@ -918,6 +937,10 @@ def serve(rt, anchor, cache, proposals: int, *, position, seed, temperature, dra
     started = time.perf_counter()
     if not replay.plan(geometry, family=geometry):
         why = replay.last_decline or "declined"
+        if why not in (WARMING, KEY_NEW):
+            # Refused, record-only or strided: the round function on MLX would run the step on
+            # MLX too; the loop's pieces run the replayed step (counted).
+            return _decline_program(replay, why, k)
         outputs = run_mlx(inputs)
         if commit:
             install(outputs)
@@ -927,6 +950,10 @@ def serve(rt, anchor, cache, proposals: int, *, position, seed, temperature, dra
     else:
         extra = {"extra_refs": 1, "admit": room_for_check_copies, "windows": windows} if commit else {}
         ticket = replay.begin(geometry, inputs, planned=True, started=started, **extra)
+        if ticket.kind == "fallback":
+            # Resting after recordings that disagreed, or a call the executor would not take:
+            # the pieces serve it with the replayed step, not the round function on MLX.
+            return _decline_program(replay, ticket.reason or "fallback", k)
         if ticket.native:
             outputs = ticket.outputs
             if commit:
