@@ -35,5 +35,15 @@ def test_a_package_without_headers_is_refused_and_counted(monkeypatch, tmp_path)
     assert LH.read(("no_such_part",), tmp_path) == (None, "unknown_part:no_such_part")
 
 
+def test_every_part_reads_on_the_installed_library_and_all_parts_join_once():
+    for part in LH.PARTS:
+        body, why = LH.text(part)
+        if body is None and why.startswith("missing:"):  # pragma: no cover - an MLX build without these headers
+            pytest.skip(why)
+        assert why is None, why
+    joined, why = LH.text(*LH.PARTS)
+    assert why is None and joined.count("struct BaseNAXFrag") == 1 and joined.count("struct GEMVKernel") == 1
+
+
 def test_the_gpu_generation_is_a_number():
     assert isinstance(LH.generation(), int) and LH.generation() >= 0

@@ -36,9 +36,10 @@ _ONCE = re.compile(r"^\s*#\s*pragma\s+once\s*$")
 PARTS = {
     # one simdgroup's tensor-unit fragments, tiles and tile multiply-accumulate
     "tensor_tiles": (("steel/gemm/nax.h",),
-                     ("struct BaseNAXFrag", "struct NAXTile", "tile_matmad_nax", "get_coord", "matmul2d_descriptor")),
+                     ("struct BaseNAXFrag", "struct NAXTile", "tile_matmad_nax", "get_coord", "matmul2d_descriptor",
+                      "void mma(")),
     # the tensor-unit GEMM loop over the reduction (each simdgroup's tile of a product, K in order)
-    "tensor_gemm": (("steel/gemm/gemm_nax.h",), ("gemm_loop(", "struct NAXTile", "dispatch_bool")),
+    "tensor_gemm": (("steel/gemm/gemm_nax.h",), ("gemm_loop(", "struct NAXTile", "tile_matmad_nax", "dispatch_bool")),
     # the matrix-vector product
     "matvec": (("gemv.h",), ("struct GEMVKernel", "static METAL_FUNC void run(")),
     # the elementwise operations the unary and binary launches apply
