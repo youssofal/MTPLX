@@ -330,6 +330,9 @@ def generate(
             break
         anchor = tokens[-1]
         round_started = perf_counter()
+        # This round's routes only: a copy, host or program round must not carry the last call's.
+        engine_site.reset_route()
+        round_program.reset_route()
         remaining = max_tokens - len(tokens)
         copied = copy.propose(tokens, remaining, constraint)
         selected_depth = depth_control.choose(remaining) if depth_control is not None else depth

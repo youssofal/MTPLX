@@ -33,7 +33,7 @@ from ..cache import WindowCache
 from . import engine_site
 from .routes import count, fast_route_counts, request_receipt
 from .state import MAX_PANEL, DecodeState
-from .step import REFERENCE, stage_fallbacks, stages_for
+from .step import REFERENCE, stages_for
 
 ENV = "MTPLX_INKLING_FAST"
 #: The lane kernels the product uses, each proven bit for bit against the reference step
@@ -83,7 +83,6 @@ class FastDecoder:
         self.model = rt.model
         self.trunk = rt.trunk_entries
         self._stages = {}
-        self._fallbacks = {}
 
     def step(self, ids, state):
         """The fast step with the proven lane kernels (reference stages off the GPU): replayed
@@ -93,17 +92,9 @@ class FastDecoder:
         if stages is None:
             stages = self._stages[spec] = stages_for(spec) if spec else REFERENCE
         count(f"stages.{spec or 'reference'}")
-        out = engine_site.decode(self, ids, state, stages, spec)
-        if spec and engine_site.last_route().get("route") == "native":
-            # A replayed step runs no stage function, so nothing counted its visits that took
-            # the pack's own product: count them as the stages would have.
-            key = (spec, int(ids.shape[-1]))
-            profile = self._fallbacks.get(key)
-            if profile is None:
-                profile = self._fallbacks[key] = stage_fallbacks(self.model, spec, key[1])
-            for name, visits in profile.items():
-                count(name, visits)
-        return out
+        # A replayed step runs no stage function: the site counts again the stage paths its
+        # record call took (the verdicts its stages reached, not format eligibility).
+        return engine_site.decode(self, ids, state, stages, spec)
 
     # ------------------------------------------------------------------ eligibility
     def decline(self, rows, cache, embeddings=None):

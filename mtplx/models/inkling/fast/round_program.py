@@ -55,7 +55,7 @@ from mtplx.engine.site import KEY_NEW, WARMING, room_for_check_copies
 
 from . import engine_site
 from . import round as fast_round
-from .routes import count
+from .routes import capture_counts, count, stage_paths
 from .state import BANK_STEP, DecodeState, round_up
 from .step import decode_panel
 
@@ -748,6 +748,9 @@ class Round:
 
 
 _LAST: dict[str, Any] = {"route": None, "reason": None, "proposals": 0}
+#: geometry -> the stage-path counts its record call took, counted again on each native replay
+#: (a replayed round runs no stage function; review 2, finding 11).
+_PATHS: dict = {}
 #: Stop ids a committing round takes as data (padded with -2).
 MAX_STOPS = 32
 
@@ -759,6 +762,11 @@ def last_route() -> dict[str, Any]:
 def _note(route: str, reason: str | None, proposals: int) -> None:
     _LAST["route"], _LAST["reason"], _LAST["proposals"] = route, reason, proposals
     _LAST.pop("refusal", None)
+
+
+def reset_route() -> None:
+    """A round this program did not serve records no program route (not the last one)."""
+    _note(None, None, 0)
 
 
 def _decline_program(replay, reason: str, proposals: int):
@@ -985,8 +993,13 @@ def serve(rt, anchor, cache, proposals: int, *, position, seed, temperature, dra
                 inputs = None
             ticket.finish(outputs)
             native, route = True, ("native", None)
+            for name, n in _PATHS.get(geometry, {}).items():
+                count(name, n)
         else:
-            outputs = run_mlx(inputs)
+            with capture_counts() as box:
+                outputs = run_mlx(inputs)
+            if ticket.kind == "record":
+                _PATHS[geometry] = stage_paths(box)
             if commit:
                 # Every container holds the round's outputs before anything is evaluated, so
                 # the graph is the last holder of each written input and MLX writes in place.

@@ -38,7 +38,7 @@ from mtplx.engine import runtime as engine_runtime
 from mtplx.engine import sites
 from mtplx.engine.site import load_early
 
-from .routes import count
+from .routes import capture_counts, count, stage_paths
 from .step import attention_reason, decode_panel
 
 # The engine learns each Metal kernel when MLX compiles it; a kernel compiled before the
@@ -191,6 +191,9 @@ def identity(rt: Any) -> tuple:
 
 #: How the last call of this process was served (per-round attribution for the route tape).
 _LAST: dict[str, Any] = {"route": None, "reason": None, "rows": 0}
+#: geometry -> the stage-path counts its record call took (``routes.stage_paths``), counted
+#: again on each native replay: a replayed step runs no stage function (review 2, finding 11).
+_PATHS: dict = {}
 
 
 def last_route() -> dict[str, Any]:
@@ -201,6 +204,11 @@ def last_route() -> dict[str, Any]:
 
 def _note(route: str, reason: str | None, rows: int) -> None:
     _LAST["route"], _LAST["reason"], _LAST["rows"] = route, reason, rows
+
+
+def reset_route() -> None:
+    """A round that serves no step through this site records no step route (not the last one)."""
+    _note(None, None, 0)
 
 
 def _unfit(spec: str) -> str | None:
@@ -256,9 +264,14 @@ def decode(decoder, ids, state, stages, spec):
         outputs = ticket.outputs
         ticket.finish(outputs)
         count(f"engine.native.w{rows}")
+        for name, n in _PATHS.get(geometry, {}).items():
+            count(name, n)
         _note("native", None, rows)
         return unflatten(outputs, len(model.capture_ids))
-    logits, captures, deltas = decode_panel(model, ids, round_state, stages=stages)
+    with capture_counts() as box:
+        logits, captures, deltas = decode_panel(model, ids, round_state, stages=stages)
+    if ticket.kind == "record":
+        _PATHS[geometry] = stage_paths(box)
     # A recorded or checked call evaluates the MLX path here and closes; others do nothing.
     ticket.finish(flatten(logits, captures, deltas))
     reason = ticket.reason or ticket.kind
