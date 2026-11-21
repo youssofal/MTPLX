@@ -314,3 +314,23 @@ def test_device_choose_depth_follows_confidence():
     assert int(np.asarray(fdraft.choose_depth(sure, cost))[0]) == 7
     assert int(np.asarray(fdraft.choose_depth(unsure, cost))[0]) == 1
     assert int(np.asarray(fdraft.choose_depth(mixed, cost))[0]) == 3
+
+
+@needs_gpu
+@pytest.mark.parametrize("temperature", [0.6, 1.3])
+def test_device_decide_at_other_temperatures_matches_host(temperature):
+    # a client temperature scales both laws; the draft is drawn at the same temperature
+    rng = np.random.default_rng(int(temperature * 100))
+    vocab = 32_768
+    for trial in range(20):
+        target, draft = _panel(rng, 3, vocab, closeness=0.6)
+        seed = int(rng.integers(0, 2**63))
+        dlaw, dstats = rnd.law_rows(mx.array(draft), temperature=temperature)
+        positions = mx.array(900, mx.uint32) + mx.arange(3, dtype=mx.uint32)
+        props, _ = rnd.sample_rows(dlaw, dstats, positions=positions, seed=seed, purpose=rnd.PURPOSE_DRAFT)
+        d = rnd.read_packet(rnd.decide(mx.array(target), props, position=900, seed=seed,
+                                       temperature=temperature, draft=rnd.DraftLaw(dlaw, dstats)), 4)
+        want, probs = rnd.reference_decide(target, np.asarray(props), position=900, seed=seed,
+                                           temperature=temperature, draft_rows=np.asarray(dlaw))
+        assert d.tokens == want
+        np.testing.assert_allclose(d.accept_probability[: len(probs)], probs, rtol=1e-4, atol=1e-6)
