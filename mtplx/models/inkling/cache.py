@@ -83,6 +83,10 @@ class WindowCache(RotatingKVCache):
     # banked snapshot made that write copy every global visit's whole history: 32 KB a token
     # held twice at the decode start of a prompt and through every follow-up turn.
     one_copy_store = True
+    # During a chunked prompt read the ring's state is the last window of a window + chunk - 1 row
+    # buffer: a checkpoint left lazy pins that whole buffer (``generation._capture_gdn_boundary``
+    # materializes a kept one).
+    materialize_checkpoints = True
 
     def is_trimmable(self):
         # A short prefix is still present now, but may be overwritten by the time it is restored.

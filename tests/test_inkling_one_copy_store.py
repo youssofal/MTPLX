@@ -205,13 +205,21 @@ def test_the_prompt_anchor_is_the_reads_own_checkpoint_at_the_prompts_end(monkey
     hidden = mx.ones((1, 1, 8))
     early = (12, snapshot_untrimmable_cache(cache), None)
     at_end = (20, snapshot_untrimmable_cache(cache), None)
+    inkling = SimpleNamespace(one_copy_store=True)  # opted in; not the fixed-M4 verifier's runtime
     fields = prompt_lease_fields(cache, committed_mtp_cache=None, hidden=hidden, prompt_len=20,
-                                 boundaries=[early, at_end])
+                                 boundaries=[early, at_end], runtime=inkling)
     records = fields["gdn_boundaries"]
     assert [int(r[0]) for r in records] == [12, 20]
     assert records[-1][1] is at_end[1] and records[-1][2] is hidden
     # Without one at the end, the anchor is copied from the cache as before.
     fresh = prompt_lease_fields(cache, committed_mtp_cache=None, hidden=hidden, prompt_len=20,
-                                boundaries=[early])
+                                boundaries=[early], runtime=inkling)
     anchor = fresh["gdn_boundaries"][-1][1]
     assert anchor is not at_end[1] and anchor.states[2] is None and anchor.states[0] is not None
+    # The fixed-M4 verifier's runtime keeps its own copy whatever the read kept: its path is the base's.
+    verifier = SimpleNamespace(qwen4_fixed_m4_compiled_verify=True)
+    assert one_copy_runtime(verifier)
+    own = prompt_lease_fields(cache, committed_mtp_cache=None, hidden=hidden, prompt_len=20,
+                              boundaries=[early, at_end], runtime=verifier)
+    assert [int(r[0]) for r in own["gdn_boundaries"]] == [12, 20]
+    assert own["gdn_boundaries"][-1][1] is not at_end[1]

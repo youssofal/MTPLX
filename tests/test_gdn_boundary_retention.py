@@ -254,3 +254,28 @@ def test_a_kept_checkpoint_lets_go_of_the_wider_buffer_it_was_cut_from():
     keys_copy, values_copy = sink[0][1].states[0]
     assert mx.array_equal(keys_copy, mx.ones((1, heads, window, dim), dtype=mx.bfloat16)).item()
     assert mx.array_equal(values_copy, mx.full((1, heads, window, dim), 2, dtype=mx.bfloat16)).item()
+
+
+def test_a_whole_array_state_is_captured_as_before(monkeypatch):
+    """Only a cache whose checkpoint is cut from a wider buffer (``materialize_checkpoints``: Inkling's
+    window rings) is evaluated at capture; a whole-array recurrent state (GDN) stays a lazy clone, as on
+    the base, so the Qwen families' prefill runs the base's capture."""
+    import mlx.core as mx
+    from mlx_lm.models.cache import ArraysCache
+
+    import mtplx.generation as generation
+    from mtplx.models.inkling.cache import WindowCache
+
+    assert WindowCache.materialize_checkpoints is True
+    assert not getattr(ArraysCache(2), "materialize_checkpoints", False)
+    calls = []
+    real_eval = mx.eval
+    monkeypatch.setattr(generation.mx, "eval", lambda *a: (calls.append(len(a)), real_eval(*a))[1])
+    state = ArraysCache(2)
+    state[0] = mx.ones((1, 4, 8))
+    state[1] = mx.ones((1, 4, 8)) * 3
+    sink: list = []
+    generation._capture_gdn_boundary(sink, 512, [state])
+    assert [record[0] for record in sink] == [512]
+    assert calls == []
+

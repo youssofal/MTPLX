@@ -372,12 +372,16 @@ def prompt_lease_fields(
     from .cache_state import snapshot_untrimmable_cache
 
     prompt_len = int(prompt_len)
-    # The read's own checkpoint at the prompt's end, when its retention kept one, is this state
-    # already copied and evaluated (``generation._capture_gdn_boundary``): the anchor is that
-    # record, not a second copy beside it for the whole answer (180 MB on Inkling 2 Mini).
-    at_end = next(
-        (record for record in (boundaries or ()) if int(record[0]) == prompt_len), None
-    )
+    # For a runtime that opted into the store (``one_copy_store``; Inkling 2 Mini), the read's own
+    # checkpoint at the prompt's end, when its retention kept one, is this state already copied and
+    # evaluated (``generation._capture_gdn_boundary``): the anchor is that record, not a second
+    # copy beside it for the whole answer (180 MB). The fixed-M4 verifier's runtime keeps its own
+    # copy, as it always has.
+    at_end = None
+    if runtime is not None and not one_copy_runtime(runtime):
+        at_end = next(
+            (record for record in (boundaries or ()) if int(record[0]) == prompt_len), None
+        )
     snapshot = at_end[1] if at_end is not None else snapshot_untrimmable_cache(cache)
     leaves = [
         leaf
