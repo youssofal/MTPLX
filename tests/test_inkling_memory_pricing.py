@@ -162,32 +162,59 @@ def test_load_makes_target_and_drafter_weights_resident_but_not_the_vision_tower
     assert [sorted(k for k, _ in tree_flatten(tree)) for tree in seen] == [["bias", "weight"], []]
 
 
-def test_the_family_reserve_replaces_the_flat_three_gib_and_admits_a_tight_mac():
+def test_the_family_reserve_is_its_forward_and_its_checkpoints_and_admits_a_tight_mac():
     gib = 2**30
-    rt = object.__new__(InklingRuntime)
-    assert InklingRuntime.prefill_working_bytes(rt) == 2 * gib  # 512-row chunks, measured
-    assert InklingRuntime.prefill_working_bytes(rt, 256) == 2 * gib  # narrower: not measured, same charge
-    assert InklingRuntime.prefill_working_bytes(rt, 1024) == 4 * gib  # wider: in proportion
-    # Bare Speed with a 4-bit embedding (16.0 GB of weights) on a 24 GB Mac: the flat reserve and the
-    # 1 GiB bank floor refuse it; the measured reserve with the tight-machine rule admits it.
-    args = dict(total_ram_bytes=24 * gib, model_weights_bytes=15_997_000_000, kv_bytes_per_token=32768,
-                aux_bytes_per_token=4096, attention_kv_copy_bytes_per_token=4096, fixed_cache_bytes=314_572_800)
-    flat = plan_memory(**args)
-    measured = plan_memory(**args, runtime_transients_bytes=2 * gib, tight_machine_measured=True)
-    assert not flat.model_fits
-    assert measured.model_fits and measured.tight_machine and measured.runtime_transients_bytes == 2 * gib + 256 * 2**20
-    assert measured.context_window_fit == 12288
-    # Every other family keeps the flat reserve: the default is unchanged.
-    assert plan_memory(**{**args, "total_ram_bytes": 48 * gib}).runtime_transients_bytes == 3 * gib
+    rt = _checkpoint_runtime(_CATALOG_TEXT, _CATALOG_DRAFT)
+    forward, record = InklingRuntime.FORWARD_WORKING_BYTES, 179_999_232
+    assert InklingRuntime.prefill_working_bytes(rt) == forward + 8 * record  # the shared eight checkpoints
+    assert InklingRuntime.prefill_working_bytes(rt, few=True) == forward + 2 * record  # where memory sets the window
+    assert InklingRuntime.prefill_working_bytes(rt, 256, few=True) == forward + 2 * record  # narrower: same charge
+    assert InklingRuntime.prefill_working_bytes(rt, 1024, few=True) == 2 * forward + 2 * record  # wider: in proportion
+    # Bare Speed (15.99 GB of weights with its vision tower) on a 24 GB Mac, at the server's fixed term (rings,
+    # bank rounding and the engine pool priced at 0.72 GiB): the flat reserve refuses it, one 2 GiB reserve for
+    # both rules leaves the 4,096-token floor, the forward and two checkpoints under the tight rule admit 16K.
+    args = dict(total_ram_bytes=24 * gib, model_weights_bytes=15_993_374_536, kv_bytes_per_token=32768,
+                aux_bytes_per_token=4096, attention_kv_copy_bytes_per_token=4096, fixed_cache_bytes=1_088_788_347,
+                tight_machine_measured=True)
+    assert not plan_memory(**{**args, "tight_machine_measured": False}).model_fits
+    one = plan_memory(**args, runtime_transients_bytes=2 * gib)
+    assert not one.model_fits and one.context_window_fit == 4096
+    split = plan_memory(**args, runtime_transients_bytes=InklingRuntime.prefill_working_bytes(rt),
+                        tight_runtime_transients_bytes=InklingRuntime.prefill_working_bytes(rt, few=True))
+    assert split.model_fits and split.tight_machine
+    assert split.runtime_transients_bytes == forward + 2 * record + 256 * 2**20
+    assert split.context_window_fit == 16384
+    # Two checkpoints wherever memory sets the window: a tight Mac, or under 16 GiB of engine budget above the
+    # weights (every 24 to 36 GB Mac with these packs); from 48 GB the shared eight.
+    for ram, few in ((24, True), (32, True), (36, True), (48, False), (128, False)):
+        plan = plan_memory(**{**args, "total_ram_bytes": ram * gib}, runtime_transients_bytes=forward + 8 * record,
+                           tight_runtime_transients_bytes=forward + 2 * record)
+        assert InklingRuntime.keeps_few_checkpoints(rt, plan) is few, ram
+    assert InklingRuntime.keeps_few_checkpoints(rt, None) is False
+    # The plan itself: a Mac with room plans with the reserve it is given (the tight one plays no part there),
+    # and every other family keeps the flat reserve: the defaults are unchanged.
+    roomy = plan_memory(**{**args, "total_ram_bytes": 36 * gib}, runtime_transients_bytes=forward + 8 * record,
+                        tight_runtime_transients_bytes=forward + 2 * record)
+    assert not roomy.tight_machine and roomy.runtime_transients_bytes == forward + 8 * record
+    assert roomy.context_window_fit == plan_memory(**{**args, "total_ram_bytes": 36 * gib},
+                                                   runtime_transients_bytes=forward + 8 * record).context_window_fit
+    assert plan_memory(**{**args, "total_ram_bytes": 48 * gib,
+                          "tight_machine_measured": False}).runtime_transients_bytes == 3 * gib
 
 
 def test_admission_charges_a_family_its_measured_prefill_working_set():
     from mtplx.server.openai import _admission_scratch_bytes
 
-    rt = object.__new__(InklingRuntime)
-    state = SimpleNamespace(runtime=rt)
+    rt = _checkpoint_runtime(_CATALOG_TEXT, _CATALOG_DRAFT)
+    forward, record = InklingRuntime.FORWARD_WORKING_BYTES, 179_999_232
     geometry = _AdmissionGeometry(40960, 40960, 0, 3 * 2**30, 4096)
-    assert _admission_scratch_bytes(state, rows=512, prompt_tokens=4142, geometry=geometry) == (2 * 2**30, "runtime_measured")
+    weights = 15_993_374_536
+    for plan, kept in ((None, 8), (SimpleNamespace(tight_machine=False), 8), (SimpleNamespace(tight_machine=True), 2),
+                       (SimpleNamespace(tight_machine=False, usable_bytes=27 * 2**30, model_weights_bytes=weights), 2),
+                       (SimpleNamespace(tight_machine=False, usable_bytes=96 * 2**30, model_weights_bytes=weights), 8)):
+        state = SimpleNamespace(runtime=rt, memory_plan=plan)
+        assert _admission_scratch_bytes(state, rows=512, prompt_tokens=4142, geometry=geometry) == (
+            forward + kept * record, "runtime_measured")
 
 
 _CATALOG_TEXT = {"num_hidden_layers": 24, "loop_config": {"core_start": 6, "core_end": 18, "num_passes": 3},
@@ -249,7 +276,7 @@ def test_a_checkpoint_is_priced_at_what_its_snapshot_copies():
     assert InklingRuntime.checkpoint_record_bytes(_checkpoint_runtime(_CATALOG_TEXT, _CATALOG_DRAFT)) == 179_999_232
 
 
-def test_a_tight_mac_keeps_two_restore_checkpoints_and_a_mac_with_room_the_shared_default():
+def test_a_mac_whose_window_memory_sets_keeps_two_restore_checkpoints_and_a_roomy_one_eight():
     from mtplx.checkpoint_anchors import AnchorPlan, retain_checkpoints
     from mtplx.engine_session import EngineSessionManager
 
@@ -257,8 +284,12 @@ def test_a_tight_mac_keeps_two_restore_checkpoints_and_a_mac_with_room_the_share
     record = InklingRuntime.checkpoint_record_bytes(rt)
     assert InklingRuntime.checkpoint_budget_bytes(rt) is None
     assert InklingRuntime.checkpoint_budget_bytes(rt, SimpleNamespace(tight_machine=False)) is None
+    roomy = SimpleNamespace(tight_machine=False, usable_bytes=96 * 2**30, model_weights_bytes=15_993_374_536)
+    assert InklingRuntime.checkpoint_budget_bytes(rt, roomy) is None
     budget = InklingRuntime.checkpoint_budget_bytes(rt, SimpleNamespace(tight_machine=True))
     assert 2 * record < budget < 3 * record
+    tier36 = SimpleNamespace(tight_machine=False, usable_bytes=27 * 2**30, model_weights_bytes=15_993_374_536)
+    assert InklingRuntime.checkpoint_budget_bytes(rt, tier36) == budget
     # A cold read of a 16,430-token prompt: every 512-row chunk edge, the tail ladder's top rung 64 tokens
     # before the prompt end, and the prompt end.
     records = [(p, SimpleNamespace(nbytes=record), None) for p in (*range(512, 16_129, 512), 16_365, 16_429)]
@@ -271,3 +302,25 @@ def test_a_tight_mac_keeps_two_restore_checkpoints_and_a_mac_with_room_the_share
     # The server hands the budget to the bank every prefill reads it from.
     assert EngineSessionManager(checkpoint_budget_bytes=budget).bank.checkpoint_budget_bytes == budget
     assert EngineSessionManager().bank.checkpoint_budget_bytes is None
+
+
+def test_the_server_plans_with_the_checkpoints_the_reads_keep():
+    """The server's plan inputs for Inkling: the forward plus two checkpoints wherever memory sets the window
+    (24, 32 and 36 GB with Bare Speed), plus eight from 48 GB; the tight rule always has the two."""
+    from mtplx.server.openai import _family_reserve_inputs
+
+    gib = 2**30
+    rt = _checkpoint_runtime(_CATALOG_TEXT, _CATALOG_DRAFT)
+    forward, record = InklingRuntime.FORWARD_WORKING_BYTES, 179_999_232
+    for ram, kept in ((24, 2), (32, 2), (36, 2), (48, 8), (128, 8)):
+        inputs = dict(total_ram_bytes=ram * gib, model_weights_bytes=15_993_374_536, kv_bytes_per_token=32768,
+                      aux_bytes_per_token=4096, attention_kv_copy_bytes_per_token=4096,
+                      fixed_cache_bytes=1_088_788_347)
+        _family_reserve_inputs(rt, inputs, plan_memory)
+        assert inputs["runtime_transients_bytes"] == forward + kept * record, ram
+        assert inputs["tight_runtime_transients_bytes"] == forward + 2 * record
+        assert inputs["tight_machine_measured"] is True
+    # A runtime without the hook (every other family) keeps its inputs.
+    untouched = {"total_ram_bytes": 24 * gib}
+    _family_reserve_inputs(SimpleNamespace(), untouched, plan_memory)
+    assert untouched == {"total_ram_bytes": 24 * gib}

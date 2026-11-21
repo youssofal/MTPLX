@@ -170,28 +170,56 @@ class InklingRuntime(MTPLXRuntime):
             return _prefill_chunk_size(prompt_tokens)
         return self.PROMPT_CHUNK_ROWS
 
-    #: The prefill's working memory beyond the request's own KV, measured through `mtplx serve` on
-    #: Bare Speed at 512-row chunks (each request's growth less its KV, from the request log):
-    #: 1.76 GiB at a 4K prompt, 1.53 at 16K, 1.47 at 32K, 1.83 at a fresh 48K. Rounded up to 2 GiB.
-    #: It replaces the flat 3 GiB runtime reserve in this family's memory plan, and it is what the
-    #: admission charges a forward (the generic share charged 0.75 GiB at 512 rows, 0.8 GB short).
-    PREFILL_WORKING_BYTES = 2 * 1024**3
+    #: One 512-row prompt forward's working memory beyond the prompt's own state and its restore checkpoints,
+    #: measured through `mtplx serve` on Bare Speed (21 November): a cold 4K read's peak less MLX active before
+    #: it, less the state the prompt holds at the read's end (global KV at 256-row steps, the window rings at
+    #: 1,535 rows, the drafter's), less its checkpoints: 0.906 GB with checkpoints off, 0.732 with two kept,
+    #: 0.614 with eight. Rounded up to 7/8 GiB. With the checkpoints the read keeps (``checkpoints_kept``
+    #: records of ``checkpoint_record_bytes``) it replaces the flat 3 GiB runtime reserve in this family's
+    #: memory plan, and it is what the admission charges a forward. Against the served peaks the plan then
+    #: leaves 0.9 GB of room at 4K and 0.6 GB at 16K on a tight Mac, a room that shrinks by 32 KB a token:
+    #: the decode start's second copy of the global KV (the bank's prompt snapshot keeps the read's buffers
+    #: while the fast path copies them into whole 4,096-row banks), which the per-token rate leaves out.
+    FORWARD_WORKING_BYTES = 7 * 1024**3 // 8
 
-    def prefill_working_bytes(self, rows=None):
-        """The working memory of one prompt forward of ``rows`` rows (default: the chunk width).
-        Only the 512-row width is measured: a narrower forward is charged the same, a wider one
-        in proportion to its rows."""
+    #: Restore checkpoints a read keeps where memory sets the context window (``keeps_few_checkpoints``). A
+    #: checkpoint copies every window ring and every convolution tail of the target and the drafter, 180 MB on
+    #: every pack where a recurrent family's is a few MB: 4,400 tokens of context each. The shared default of
+    #: eight was 1.7 GB of a cold 4K read and 2.0 GB of a 16K one on Bare Speed (21 November, `mtplx serve`;
+    #: with checkpoints off the reads grew 1.33 and 1.97 GB against 3.02 and 3.93). Two keep the prompt-end
+    #: anchor, where an agent's next turn resumes (the template keeps every reasoning block, so the history
+    #: before it does not change), and the point the read resumed from.
+    FEW_CHECKPOINTS = 2
+    #: Below this much engine budget above the weights a Mac keeps FEW_CHECKPOINTS: every 24, 32 and 36 GB Mac
+    #: with any of the three packs, where the six others would cost about 26K tokens of a 16K to 230K window.
+    #: From 48 GB the window passes 400K tokens, and the deeper coverage (an 8K grid, for clients that rewrite
+    #: history mid-conversation) costs a few percent of it.
+    FEW_CHECKPOINTS_BELOW_BYTES = 16 * 1024**3
+
+    def keeps_few_checkpoints(self, plan):
+        """Whether reads under ``plan`` keep FEW_CHECKPOINTS: a tight Mac (the plan's tight rule), or less
+        than FEW_CHECKPOINTS_BELOW_BYTES of engine budget above the weights. The plan's reserve, the session
+        bank's budget and the admission all read this one rule."""
+        if plan is None:
+            return False
+        if getattr(plan, "tight_machine", False):
+            return True
+        usable, weights = getattr(plan, "usable_bytes", 0), getattr(plan, "model_weights_bytes", 0)
+        return bool(usable and weights and int(usable) - int(weights) < self.FEW_CHECKPOINTS_BELOW_BYTES)
+
+    def checkpoints_kept(self, few=False):
+        """Restore checkpoints a prompt read keeps: FEW_CHECKPOINTS, else the shared default (eight)."""
+        from mtplx.checkpoint_anchors import default_checkpoint_count
+
+        return self.FEW_CHECKPOINTS if few else default_checkpoint_count()
+
+    def prefill_working_bytes(self, rows=None, *, few=False):
+        """The working memory of one prompt forward of ``rows`` rows (default: the chunk width) with the
+        restore checkpoints the read keeps (``few``: ``keeps_few_checkpoints``). Only the 512-row forward is
+        measured: a narrower one is charged the same, a wider one in proportion to its rows."""
         rows = self.PROMPT_CHUNK_ROWS if rows is None else max(1, int(rows))
-        return self.PREFILL_WORKING_BYTES * max(rows, self.PROMPT_CHUNK_ROWS) // self.PROMPT_CHUNK_ROWS
-
-    #: Restore checkpoints one session-bank entry keeps on a tight Mac (the plan's tight rule: the warm cache
-    #: yields fully to live KV and restores come from SSD). A checkpoint copies every window ring and every
-    #: convolution tail of the target and the drafter, about 180 MB on every pack, where a recurrent family's
-    #: is a few MB; the shared default of eight was 1.7 GB of a cold 4K prompt read and 2.0 GB of a 16K one on
-    #: Bare Speed (21 November, `mtplx serve`, with checkpoints off 1.33 and 1.97 GB of growth against 3.02 and
-    #: 3.93). Two keep the prompt-end anchor and the point the read resumed from; a Mac with room keeps the
-    #: shared default and its deeper coverage.
-    TIGHT_CHECKPOINTS = 2
+        forward = self.FORWARD_WORKING_BYTES * max(rows, self.PROMPT_CHUNK_ROWS) // self.PROMPT_CHUNK_ROWS
+        return forward + self.checkpoints_kept(few) * self.checkpoint_record_bytes()
 
     def checkpoint_record_bytes(self):
         """Bytes of one restore checkpoint: every window ring at its full window and every convolution tail,
@@ -203,12 +231,12 @@ class InklingRuntime(MTPLXRuntime):
         )
 
     def checkpoint_budget_bytes(self, plan=None):
-        """The session bank's byte budget for one entry's checkpoints: ``TIGHT_CHECKPOINTS`` records (and half
-        of one, so a third never fits) on a tight Mac, else None, the shared default."""
-        if plan is None or not getattr(plan, "tight_machine", False):
+        """The session bank's byte budget for one entry's checkpoints: FEW_CHECKPOINTS records (and half of
+        one, so a third never fits) where ``keeps_few_checkpoints``, else None, the shared default."""
+        if not self.keeps_few_checkpoints(plan):
             return None
         record = self.checkpoint_record_bytes()
-        return self.TIGHT_CHECKPOINTS * record + record // 2
+        return self.FEW_CHECKPOINTS * record + record // 2
 
     def prefill_window_bytes(self, prompt_tokens, new_tokens, width=None):
         if not new_tokens:

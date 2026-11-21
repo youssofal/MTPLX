@@ -4190,10 +4190,7 @@ class ServerState:
             # Its measured prefill working set is its runtime reserve (not the flat 3 GiB), and
             # those measurements stand as its tight-machine peaks: the warm cache yields fully
             # on a Mac that cannot fund the 1 GiB bank floor.
-            _working = getattr(self.runtime, "prefill_working_bytes", None)
-            if callable(_working):
-                _plan_inputs["runtime_transients_bytes"] = int(_working())
-                _plan_inputs["tight_machine_measured"] = True
+            _family_reserve_inputs(self.runtime, _plan_inputs, _plan_memory)
         _fit_plan = _plan_memory(**_plan_inputs)
         _machine_fit = _machine_fit_for_default_window(_fit_plan)
         if _fit_plan.available and not _fit_plan.model_fits and not self.allow_swap:
@@ -22664,6 +22661,24 @@ class _AdmissionGeometry:
         return int(self.resident_bytes_per_token)
 
 
+def _family_reserve_inputs(runtime: Any, plan_inputs: dict[str, Any], plan_fn: Callable[..., Any]) -> None:
+    """The runtime reserve of a family that measured its own prefill working set (Inkling 2 Mini):
+    its forward plus the restore checkpoints its reads keep. Two where memory sets its window, on a
+    tight Mac or one with little engine budget above the weights (``keeps_few_checkpoints`` reads
+    the plan made with eight: the budget and the weights do not depend on the reserve), eight
+    elsewhere. A runtime without the hook keeps the inputs as they are."""
+
+    working = getattr(runtime, "prefill_working_bytes", None)
+    if not callable(working):
+        return
+    plan_inputs["runtime_transients_bytes"] = int(working())
+    plan_inputs["tight_runtime_transients_bytes"] = int(working(few=True))
+    plan_inputs["tight_machine_measured"] = True
+    few = getattr(runtime, "keeps_few_checkpoints", None)
+    if callable(few) and few(plan_fn(**plan_inputs)):
+        plan_inputs["runtime_transients_bytes"] = plan_inputs["tight_runtime_transients_bytes"]
+
+
 def _admission_geometry(state: Any, prefill_width: int | None = None) -> _AdmissionGeometry:
     """The request's per-token and fixed costs from the memory plan and the
     backend's own answers, for a prefill at ``prefill_width`` rows a forward
@@ -22994,8 +23009,11 @@ def _admission_scratch_bytes(
         return max(1, int(bill["transient_bytes"])), source
     working_fn = getattr(runtime, "prefill_working_bytes", None)
     if callable(working_fn):
-        # A family that measured its own prefill working set (Inkling 2 Mini) is charged it.
-        return max(1, int(working_fn(rows))), "runtime_measured"
+        # A family that measured its own prefill working set (Inkling 2 Mini) is charged it, with
+        # the restore checkpoints its reads keep under this plan (two where memory sets the window).
+        few_fn = getattr(runtime, "keeps_few_checkpoints", None)
+        few = bool(few_fn(getattr(state, "memory_plan", None))) if callable(few_fn) else False
+        return max(1, int(working_fn(rows, few=few))), "runtime_measured"
     flat = int(geometry.flat_transient_bytes)
     flat_share = max(1, flat * rows // _ADMISSION_FLAT_TRANSIENT_ROWS)
     # A backend whose attention grows with the square of one forward's rows
