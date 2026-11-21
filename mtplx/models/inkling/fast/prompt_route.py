@@ -63,6 +63,36 @@ WIDE_HEADROOM_BYTES = 12 * 1024**3
 #: the admission like any width).
 WIDE_ROWS_FLASH = 4096
 
+#: The prompt read hands its work to the GPU without waiting inside a forward (``MTPLX_INKLING_PROMPT_SYNC=1`` restores
+#: the waits): a prompt call's query tiles go over as they are built with at most ``TILES_IN_FLIGHT`` unfinished, and
+#: the forward hands over its residual stream every ``HAND_OVER_VISITS`` visits, so the GPU starts a chunk while
+#: Python builds the rest of it. The waits were the attention's: one per query tile (about 110 a 512-row chunk, 500
+#: a 2,048-row chunk), each draining the GPU and leaving it idle while the host built the next tile. Same graph,
+#: same kernels, same inputs to every kernel: only when the host waits changes, so every bit is unchanged.
+SYNC_ENV = "MTPLX_INKLING_PROMPT_SYNC"
+TILES_IN_FLIGHT = 2
+HAND_OVER_VISITS = 4
+
+
+def asynchronous():
+    """Whether the prompt read hands work over without waiting (read per call; on unless the switch says sync)."""
+    return os.environ.get(SYNC_ENV, "").strip().lower() not in ("1", "on", "yes", "true", "sync")
+
+
+def hand_over(parts, part):
+    """Evaluate ``part``, a prompt call's next query tile (``parts``: its earlier tiles, kept alive by the caller).
+    Synchronous: wait for it, as the attention did. Otherwise start it and wait only for the tile
+    ``TILES_IN_FLIGHT`` places back: the same few tiles alive, the GPU never drained between them."""
+    import mlx.core as mx
+
+    if not asynchronous():
+        mx.eval(part)
+        return
+    mx.async_eval(part)
+    if len(parts) >= TILES_IN_FLIGHT:
+        mx.eval(parts[-TILES_IN_FLIGHT])
+
+
 _headroom = {}
 
 

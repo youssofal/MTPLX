@@ -14,7 +14,7 @@ from .cache import WindowCache
 from .activations import expert_inputs
 from . import expert_fusion
 from .fast import prompt_gemm, prompt_glue, prompt_loop
-from .fast.prompt_route import invariant_sums
+from .fast.prompt_route import HAND_OVER_VISITS, asynchronous, invariant_sums
 from .head import fits_route, measured_route, note_route, pack_proofs, vocabulary_logits
 from .layout import layer_visits
 from .precision import AffineWeight, packed_logical_shape, source_modes
@@ -708,6 +708,9 @@ class Model(nn.Module):
             )
         closed, captured = [], {}
         x = self.embed_tokens(ids) if embeddings is None else embeddings
+        # A prompt chunk hands its work to the GPU every few visits, so the GPU starts while Python builds the rest
+        # (fast/prompt_route: same graph and kernels; MTPLX_INKLING_PROMPT_SYNC=1 keeps one evaluation at the end).
+        every = HAND_OVER_VISITS if tapes is None and x.shape[1] > 32 and asynchronous() else 0
         for visit, index in enumerate(self.visit_order):
             if index == self.start:
                 if visit == self.start:
@@ -730,6 +733,8 @@ class Model(nn.Module):
             x = self.layers[index](
                 x, closed, cache[2 * visit], cache[2 * visit + 1], message, tape
             )
+            if every and (visit + 1) % every == 0 and visit + 1 < len(self.visit_order):
+                mx.async_eval(x)
         hidden = (
             prompt_glue.input_norm(x, closed, self.final_query, self.final_norm, self.eps, "final_norm")
             if tapes is None and self.config["attn_res_normalize_values"]

@@ -165,7 +165,10 @@ def stock_attention(query, key, value, profiles, sink, window):
             query[:, :, start:end], key, value, scale=width**-0.5, mask=bias
         )
         if rows > step:
-            mx.eval(part)
+            # each tile handed to the GPU as it is built, a bounded few in flight (fast/prompt_route.hand_over)
+            from .fast.prompt_route import hand_over
+
+            hand_over(parts, part)
         parts.append(part)
     return parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=2)
 
