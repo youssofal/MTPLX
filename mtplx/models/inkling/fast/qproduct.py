@@ -287,39 +287,121 @@ def qmv_rows_probe(x, weight, rows_each=4, threads=64):
     )[0]
 
 _OUTPUT = """
-    // Stage C on stored codes in one launch (the step's output_projection): the output projection
-    // in MLX's one-row product order (QMV_ROWS), rounded to bf16 as that product returns it; the
-    // attention's static short convolution over the committed tail, with the reference kernel's
-    // arithmetic (short_conv, FORM as proven for this width); the residual in float32. One
-    // simdgroup: output channels [n0, n0 + 4) for every panel row.
+    // Stage C on stored codes in one launch (the step's output_projection): the output projection of
+    // every panel row in MLX's one-row product order (affine_lane, as the product launch above),
+    // rounded to bf16 as that product returns it; the attention's static short convolution over the
+    // committed tail with the reference kernel's arithmetic (short_conv, FORM as proven for this
+    // width); the residual in float32. A simdgroup owns four output channels for the whole panel,
+    // whose rows go in chunks of RCH.
     constexpr uint NSG = THREADS / 32;
+    constexpr int BLOCK = VPT * 32;
+    constexpr int NB = K / BLOCK;                // blocks a row (K is a multiple of BLOCK)
+    constexpr int WPR = K * BITS / 32;           // code words a row
+    constexpr int GPR = K / G;                   // groups a row
+    const uint sg = simdgroup_index_in_threadgroup;
     const uint lane = thread_index_in_simdgroup;
-    const int n0 = int(threadgroup_position_in_grid.x * NSG + simdgroup_index_in_threadgroup) * 4;
-    if (n0 >= N) return;
-    float result[W][4];
-    qmv_rows<W, 4, K, BITS, G, VPT>(codes, scales, biases, hg, K, n0, lane, result);
-    if (lane < 4) {
-        const uint n = uint(n0) + lane;
-        float seq[W + 3];
-        for (uint t = 0; t < 3; ++t) seq[t] = HAS_TAIL ? tail[t * N + n] : 0.0f;
-        for (uint r = 0; r < W; ++r) {
-            float v = result[r][0];
-            for (uint tm = 1; tm < 4; ++tm) v = (tm == lane) ? result[r][tm] : v;
-            const float a = static_cast<float>(static_cast<bfloat16_t>(v));
-            seq[3 + r] = a;
-            attn[size_t(r) * N + n] = a;
+    const uint row0 = threadgroup_position_in_grid.x * (NSG * 4) + sg * 4;
+
+    // The inputs' totals (affine_lane::total) of every panel row, block and lane, once a threadgroup.
+    threadgroup float lsum[SUMS ? W * NB * 32 : 1];
+    if (SUMS) {
+        for (uint idx = thread_index_in_threadgroup; idx < uint(W * NB * 32); idx += THREADS) {
+            const uint r = idx / (NB * 32), b = (idx / 32) % NB, l = idx % 32;
+            lsum[idx] = affine_lane::total<VPT, BITS>(hg + size_t(r) * K + b * BLOCK + l * VPT);
         }
-        for (uint r = 0; r < W; ++r) {
-            float acc = 0.0f;
-            for (uint j = 0; j < 4; ++j) {
-                const float w = cw[n * 4 + j];      // the stored (channels, taps) layout
-                if (FORM == 0) acc += seq[r + j] * w;
-                else acc = metal::fma(seq[r + j], w, acc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (row0 >= uint(N)) return;
+
+    for (uint rc = 0; rc < uint(W); rc += RCH) {
+        float acc[4][RCH];
+        for (uint ro = 0; ro < 4; ++ro)
+            for (uint r = 0; r < RCH; ++r) acc[ro][r] = 0.0f;
+        for (int b = 0; b < NB; ++b) {
+            const int col = b * BLOCK + int(lane) * VPT;
+            if (NARROW) {
+                // The chunk's inputs first, then one output channel's codes at a time (few rows: one
+                // channel's codes live instead of four).
+                float xt[RCH][VPT], tot[RCH];
+                for (uint r = 0; r < RCH; ++r) {
+                    if (rc + r >= uint(W)) break;
+                    const device bfloat16_t* xs = hg + size_t(rc + r) * K + col;
+                    if (SUMS) {
+                        affine_lane::scaled<VPT, BITS>(xs, xt[r]);
+                        tot[r] = lsum[((rc + r) * NB + b) * 32 + lane];
+                    } else {
+                        tot[r] = affine_lane::take<VPT, BITS>(xs, xt[r]);
+                    }
+                }
+                for (uint ro = 0; ro < 4; ++ro) {
+                    const size_t row = min(row0 + ro, uint(N - 1));
+                    const float sc = static_cast<float>(scales[row * GPR + col / G]);
+                    const float bi = static_cast<float>(biases[row * GPR + col / G]);
+                    float wf[VPT];
+                    affine_lane::unpack<VPT, BITS>(codes + row * WPR + col * BITS / 32, wf);
+                    for (uint r = 0; r < RCH; ++r) {
+                        if (rc + r >= uint(W)) break;
+                        acc[ro][r] += affine_lane::term<VPT, BITS>(xt[r], wf, sc, bi, tot[r]);
+                    }
+                }
+            } else {
+                // Each output channel's codes unpacked once for the whole chunk.
+                float wf[4][VPT], sc[4], bi[4];
+                for (uint ro = 0; ro < 4; ++ro) {
+                    const size_t row = min(row0 + ro, uint(N - 1));
+                    sc[ro] = static_cast<float>(scales[row * GPR + col / G]);
+                    bi[ro] = static_cast<float>(biases[row * GPR + col / G]);
+                    affine_lane::unpack<VPT, BITS>(codes + row * WPR + col * BITS / 32, wf[ro]);
+                }
+                for (uint r = 0; r < RCH; ++r) {
+                    if (rc + r >= uint(W)) break;
+                    const device bfloat16_t* xs = hg + size_t(rc + r) * K + col;
+                    float xt[VPT];
+                    float tot;
+                    if (SUMS) {
+                        affine_lane::scaled<VPT, BITS>(xs, xt);
+                        tot = lsum[((rc + r) * NB + b) * 32 + lane];
+                    } else {
+                        tot = affine_lane::take<VPT, BITS>(xs, xt);
+                    }
+                    for (uint ro = 0; ro < 4; ++ro)
+                        acc[ro][r] += affine_lane::term<VPT, BITS>(xt, wf[ro], sc[ro], bi[ro], tot);
+                }
             }
-            const float total = seq[r + 3] + acc;
-            const float value = total / as_type<float>(uint(DIVISOR));
-            const float y = static_cast<float>(static_cast<bfloat16_t>(value));
-            partial[size_t(r) * N + n] = BOUNDARY ? y : y + static_cast<float>(x[size_t(r) * N + n]);
+        }
+        for (uint ro = 0; ro < 4; ++ro)
+            for (uint r = 0; r < RCH; ++r) acc[ro][r] = simd_sum(acc[ro][r]);
+        if (lane < 4) {
+            // Lane l convolves channel row0 + l over the chunk's rows: its three previous inputs, oldest
+            // first, are the committed tail or rows this lane wrote before (attn), then the chunk's own.
+            const uint c = row0 + lane;
+            float seq[RCH + 3];
+            for (uint t = 0; t < 3; ++t) {
+                const int at = int(rc) - 3 + int(t);
+                seq[t] = at >= 0 ? attn[size_t(at) * N + c] : (HAS_TAIL ? tail[uint(at + 3) * N + c] : 0.0f);
+            }
+            for (uint r = 0; r < RCH; ++r) {
+                if (rc + r >= uint(W)) break;
+                float v = acc[0][r];
+                for (uint ro = 1; ro < 4; ++ro) v = (ro == lane) ? acc[ro][r] : v;
+                const float a = static_cast<float>(static_cast<bfloat16_t>(v));
+                seq[3 + r] = a;
+                attn[size_t(rc + r) * N + c] = a;
+            }
+            for (uint r = 0; r < RCH; ++r) {
+                if (rc + r >= uint(W)) break;
+                float conv = 0.0f;
+                for (uint j = 0; j < 4; ++j) {
+                    const float w = cw[c * 4 + j];      // the stored (channels, taps) layout
+                    if (FORM == 0) conv += seq[r + j] * w;
+                    else conv = metal::fma(seq[r + j], w, conv);
+                }
+                const float total = seq[r + 3] + conv;
+                const float value = total / as_type<float>(uint(DIVISOR));
+                const float y = static_cast<float>(static_cast<bfloat16_t>(value));
+                const size_t at = size_t(rc + r) * N + c;
+                partial[at] = BOUNDARY ? y : y + static_cast<float>(x[at]);
+            }
         }
     }
 """
@@ -332,14 +414,27 @@ def _output_kernel():
         input_names=["hg", "codes", "scales", "biases", "cw", "tail", "x"],
         output_names=["partial", "attn"],
         source=_OUTPUT,
-        header=QMV_ROWS,
+        header=AFFINE_LANE,
     )
 
 
 _output_verdicts: dict = {}
+#: Panels of at most this many rows (by bits) take the narrow order (the chunk's inputs first, one output
+#: channel's codes live at a time); wider panels share each channel's unpacked codes across their rows.
+#: Timed on the engine's GPU clock, replays of a 24-visit chain (x1/receipts/ceng-*-1.json): at 4 bits
+#: narrow 11.9 / 14.8 / 26.0 / 30.7 µs a visit at 1 to 4 rows against 17.7 / 22.7 / 27.0 / 31.2 wide, and
+#: 45.1 against 35.9 at 5; at 8 bits wide is ahead at every width (19.6 against 21.5 at one row).
+_OUTPUT_NARROW_ROWS = {4: 4, 8: 0}
+#: Threads of one stage C threadgroup (four output channels a simdgroup).
+_OUTPUT_THREADS = 128
+#: The inputs' totals computed once a threadgroup (shared memory and a barrier) measured slower than
+#: each simdgroup taking its own (ceng-*-1: 4-bit 33.0 against 31.2 µs a visit at 4 rows, 63.4 against
+#: 54.5 at 8; 8-bit 23.8 against 21.9 and 34.8 against 31.6), so stage C takes its own by default.
+_OUTPUT_SUMS = False
 
 
-def affine_output(hg, weight, conv, tail, x, boundary, *, form, prove=True):
+def affine_output(hg, weight, conv, tail, x, boundary, *, form, prove=True, narrow=None, threads=None, sums=None,
+                  rch=None):
     """The step's stage C on a stored-code output projection (``fast.step.output_projection``) in
     one launch: ``(partial (1, W, N) float32, attn (1, W, N) float32)``, every bit as the step's
     three launches give it (the product, the short convolution, the residual add).
@@ -369,12 +464,17 @@ def affine_output(hg, weight, conv, tail, x, boundary, *, form, prove=True):
         count_route("refused:qoutput_shape")
         raise RuntimeError("affine_output serves panels of up to 32 rows of the matrix's width")
     hg2, x2 = hg.reshape(rows, k), x.reshape(rows, n)
-    threads = 128
+    narrow = (rows <= _OUTPUT_NARROW_ROWS.get(c["BITS"], 0)) if narrow is None else bool(narrow)
+    threads = threads or _OUTPUT_THREADS
+    rch = min(rows, rch or (rows if narrow else _RCH_SMALL))
+    nb = k // (c["VPT"] * 32)
+    sums = (_OUTPUT_SUMS and rows * nb * 32 * 4 <= 24 * 1024) if sums is None else bool(sums)
     partial, attn = _output_kernel()(
         inputs=[hg2, weight.codes, weight.scales, weight.biases, conv.weight.T,
                 tail if tail is not None else conv.weight.T, x2],
         template=[("W", rows), ("K", k), ("N", n), ("BITS", c["BITS"]), ("G", c["GROUP"]), ("VPT", c["VPT"]),
-                  ("THREADS", threads), ("HAS_TAIL", tail is not None), ("BOUNDARY", bool(boundary)),
+                  ("THREADS", threads), ("RCH", rch), ("SUMS", sums), ("NARROW", narrow),
+                  ("HAS_TAIL", tail is not None), ("BOUNDARY", bool(boundary)),
                   ("FORM", 0 if form == "float" else 1), ("DIVISOR", f32_bits(5 ** 0.5))],
         grid=(-(-n // (threads // 32 * 4)) * threads, 1, 1),
         threadgroup=(threads, 1, 1),

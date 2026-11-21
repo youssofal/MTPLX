@@ -377,6 +377,55 @@ def output_reason(layer, dtype):
     return unreadable(dtype, layer.out)
 
 
+def stored_output_reason(layer, dtype, rows):
+    """Why the one-launch stage C on stored codes (``qproduct.affine_output``: the output projection
+    on the affine codes in the one-row product's order, the attention's short convolution and the
+    residual) cannot serve this visit, or None. Its first use per shape on a Mac still proves it bit
+    for bit against the step's separate launches, and refuses (counted) on a disagreement."""
+    from .qproduct import qmv_constants
+
+    conv = layer.convs[2]
+    if not isinstance(layer.out, AffineWeight):
+        return "not_stored"
+    if dtype != mx.bfloat16:
+        return "stream_dtype"
+    if conv.dynamic is not None or conv.size != 4:
+        return "conv_form"
+    if not 1 <= rows <= MAX_STORED_OUTPUT_ROWS:
+        return "rows"
+    try:
+        qmv_constants(layer.out)
+    except RuntimeError as err:
+        return str(err).rsplit(": ", 1)[-1]
+    return None
+
+
+#: Panel rows the one-launch stored-code stage C takes (its bit proofs cover 1 to 8, 12, 16 and 32).
+MAX_STORED_OUTPUT_ROWS = 32
+
+
+def output_route_reason(layer, dtype, rows):
+    """Why neither fused stage C (16-bit weights: lane L2's launch; stored codes: the one-launch
+    stored-code form) serves this visit, or None."""
+    reason = output_reason(layer, dtype)
+    if reason is None or stored_output_reason(layer, dtype, rows) is None:
+        return None
+    return reason
+
+
+def stored_output(layer, hg, x, state, visit):
+    """Stage C on a stored-code output projection in one launch, or None where it refuses (counted in
+    ``attn_input.route_counts`` as ``refused:qoutput_*``)."""
+    from .attn_input import _static_form
+    from .qproduct import affine_output
+
+    try:
+        return affine_output(hg, layer.out, layer.convs[2], state.tail(visit, 2), x, layer.boundary,
+                             form=_static_form(layer.out.codes.shape[0], layer.convs[2].size))
+    except RuntimeError:
+        return None
+
+
 #: The trunk's activation dtype, set by the decoder at load (one model a process), so the
 #: engine site and the round program ask the attention's qualification for the dtype it serves.
 _ACTIVATION = {"dtype": mx.bfloat16}
@@ -438,7 +487,7 @@ def stage_fallbacks(model, spec, rows, dtype=None):
         if "a" in lanes:
             reasons.append(("a", attention_input_reason(layer, dtype, message)))
         if "bc" in lanes:
-            reasons.append(("bc_output", output_reason(layer, dtype)))
+            reasons.append(("bc_output", output_route_reason(layer, dtype, rows)))
         if "d" in lanes:
             reasons.append(("d", expert_input_reason(layer, message, dtype)))
         if "e" in lanes:
@@ -480,12 +529,16 @@ def fused_attention(layer, a, x, state, visit, panel):
         hg = panel_attend(a.q, a.rel, a.sink, a.gate_logits, a.k_rows, a.v_rows, keys, values, valid,
                           newest, panel.pos, layer.rel_basis, window=layer.sliding)
     reason = output_reason(layer, hg.dtype)
-    if reason is not None:
-        kind = "unfused" if isinstance(layer.out, AffineWeight) and launch_serves(layer.out) else "fallback"
-        count(f"{kind}.bc_output.{reason}")
-        return output_projection(layer, hg, x, state, visit, panel)
-    return panel_output(hg, layer.out, layer.convs[2].weight, state.tail(visit, 2), x,
-                        boundary=layer.boundary)
+    if reason is None:
+        return panel_output(hg, layer.out, layer.convs[2].weight, state.tail(visit, 2), x,
+                            boundary=layer.boundary)
+    if stored_output_reason(layer, hg.dtype, panel.rows) is None:
+        fused = stored_output(layer, hg, x, state, visit)
+        if fused is not None:
+            return fused
+    kind = "unfused" if isinstance(layer.out, AffineWeight) and launch_serves(layer.out) else "fallback"
+    count(f"{kind}.bc_output.{reason}")
+    return output_projection(layer, hg, x, state, visit, panel)
 
 
 def fused_attention_input(layer, x, closed, message, state, visit, panel):
