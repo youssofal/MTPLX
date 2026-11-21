@@ -157,3 +157,13 @@ def test_switch_off_serves_the_round_programs_propose(monkeypatch):
     assert not draft_glue.enabled()
     monkeypatch.delenv("MTPLX_INKLING_DRAFT_GLUE")
     assert draft_glue.enabled()
+
+
+def test_the_attention_rewrites_find_their_lines():
+    """An edit of round_program's drafter attention text (a comment included) that moves a line the
+    glue rewrites must fail here, not only send the glue's attention back to the library in serving."""
+    from mtplx.models.inkling.fast import draft_glue
+
+    texts, missing = draft_glue.attend_texts()
+    assert missing is None, f"round_program's drafter attention text no longer holds the line {missing!r}"
+    assert "const uint count = cnt, newest = nw;" in texts["attend"]
