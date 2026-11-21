@@ -673,6 +673,10 @@ COMBINE = """
 # decoded straight into half bit patterns (two codes a half2), the values the byte tables hold.
 PLAN_STRIDE = 18   # per slot: expert, members, member rows[8], member pairs[8]
 PANEL_ROWS = 8     # widest panel the plan describes (an expert has at most one member a row)
+#: The plan of a wide panel (9 to MAX_ROWS rows, a copy round's verify): the same slots with room
+#: for MAX_ROWS members, member rows at 2 and member pairs at WIDE_PAIRS_AT.
+WIDE_PAIRS_AT = 2 + MAX_ROWS
+PLAN_STRIDE_WIDE = 2 + 2 * MAX_ROWS
 
 ROUTE_PLAN = """
     const uint tid = thread_position_in_threadgroup.x;
@@ -733,6 +737,11 @@ ROUTE_PLAN = """
         if (after == 0u) plan[base + 1] = before + 1u;
     }
 """
+
+# A wide panel's plan: the same launch, each slot's member pairs at WIDE_PAIRS_AT (an expert may
+# have a member in every one of up to MAX_ROWS rows). The 2-8 row plan's text stays as it is.
+ROUTE_PLAN_WIDE = ROUTE_PLAN.replace("plan[base + 10 + before] = p;", "plan[base + PAIRS_AT + before] = p;")
+assert ROUTE_PLAN_WIDE.count("PAIRS_AT") == 1
 
 PANEL = """
     const uint tile = threadgroup_position_in_grid.x;
@@ -811,6 +820,13 @@ PANEL = """
         }
     }
 """
+
+# A wide panel (9 to MAX_ROWS rows): the same products over the wide plan, whose member pairs sit
+# at PAIRS_AT (XSEL is 2 for gate-up, member rows, and PAIRS_AT for down, member pairs). Each
+# member's arithmetic is the same statement sequence whatever the member count, so every pair's
+# raw product is MLX's gathered product bit for bit, as for 2 to 8 rows.
+PANEL_WIDE = PANEL.replace("const uint pair = ps[10 + m0 + m];", "const uint pair = ps[PAIRS_AT + m0 + m];")
+assert PANEL_WIDE.count("PAIRS_AT") == 1
 
 # Prompt chunks: the same products for pairs sorted by expert (the stock body's sort). The
 # threadgroup of expert e finds its members, a contiguous run of the sorted pairs, by binary
@@ -1052,16 +1068,20 @@ PANEL_LAYOUT = {
 
 
 @lru_cache(maxsize=None)
-def _panel_kernel(product, fp4, fold):
+def _panel_kernel(product, fp4, fold, wide=False):
     g = PANEL_GEOMETRY[(product, fp4)]
+    pairs_at = WIDE_PAIRS_AT if wide else 10
     defines = {"FP4": int(fp4), "NV": g["NV"], "WPL": g["WPL"], "NBLK": g["NBLK"],
                "HALF_LAST": int(product == "dn" and fp4), "CW": g["CW"], "SW": g["SW"], "SPL": g["SPL"],
-               "K": g["K"], "POW": g["POW"], "XSEL": 2 if product == "gu" else 10, "PLAN_STRIDE": PLAN_STRIDE,
+               "K": g["K"], "POW": g["POW"], "XSEL": 2 if product == "gu" else pairs_at,
+               "PLAN_STRIDE": PLAN_STRIDE_WIDE if wide else PLAN_STRIDE,
                "FOLD": int(fold), "SFOLD": (g["POW"] if fold else "1.0f")}
+    if wide:
+        defines["PAIRS_AT"] = pairs_at
     extra = "".join(f"#define {k} {v}\n" for k, v in defines.items())
-    name = f"mtplx_inkling_panel_{product}_{'nvfp4' if fp4 else 'mxfp8'}_f{int(fold)}"
+    name = f"mtplx_inkling_panel_{product}_{'nvfp4' if fp4 else 'mxfp8'}_f{int(fold)}" + ("_wide" if wide else "")
     return mx.fast.metal_kernel(name=name, input_names=["plan", "xin", "codes", "scales"], output_names=["raw"],
-                                source=PANEL, header=_header(extra), ensure_row_contiguous=True)
+                                source=PANEL_WIDE if wide else PANEL, header=_header(extra), ensure_row_contiguous=True)
 
 
 @lru_cache(maxsize=None)
@@ -1103,7 +1123,13 @@ def prompt_gate_up(block, values, sorted_experts, sorted_rows, layout=None):
 
 
 @lru_cache(maxsize=None)
-def _route_plan_kernel():
+def _route_plan_kernel(wide=False):
+    if wide:
+        return mx.fast.metal_kernel(
+            name="mtplx_inkling_panel_route_plan_wide", input_names=["logits", "bias", "rconsts"],
+            output_names=["experts", "prob", "plan"], source=ROUTE_PLAN_WIDE,
+            header=_header(f"#define PLAN_STRIDE {PLAN_STRIDE_WIDE}\n#define PAIRS_AT {WIDE_PAIRS_AT}\n"),
+            ensure_row_contiguous=True)
     return mx.fast.metal_kernel(name="mtplx_inkling_panel_route_plan", input_names=["logits", "bias", "rconsts"],
                                 output_names=["experts", "prob", "plan"], source=ROUTE_PLAN,
                                 header=_header(f"#define PLAN_STRIDE {PLAN_STRIDE}\n"), ensure_row_contiguous=True)
@@ -1112,7 +1138,7 @@ def _route_plan_kernel():
 def _panel_raw(product, fp4, plan, xin, codes, scales, rows, layout=None):
     lay = layout or PANEL_LAYOUT[(product, fp4)]
     tgr = lay["S"] * lay["RPS"]
-    return _panel_kernel(product, fp4, lay.get("FOLD", 1))(
+    return _panel_kernel(product, fp4, lay.get("FOLD", 1), rows > PANEL_ROWS)(
         inputs=[plan, xin, codes, scales],
         template=[("S", lay["S"]), ("RPS", lay["RPS"]), ("R", lay["R"]), ("MC", lay["MC"])],
         grid=((HIDDEN // tgr) * 32 * lay["S"], min(TOP_K * rows, EXPERTS), 1), threadgroup=(32 * lay["S"], 1, 1),
@@ -1129,10 +1155,11 @@ def _panel_products(block, fp4, rows, logits, values, outer, layouts=None):
     """Route + plan, gate-up products, RC6's SwiGLU and down-input rounding, down products
     (4 launches), each distinct expert of the panel read once."""
     pairs = rows * block.count
-    experts, prob, plan = _route_plan_kernel()(
+    wide = rows > PANEL_ROWS
+    experts, prob, plan = _route_plan_kernel(wide)(
         inputs=[logits, block.bias, _route_consts(float(block.scale))],
         template=[("W", rows)], grid=(256, 1, 1), threadgroup=(256, 1, 1),
-        output_shapes=[(pairs,), (pairs,), (1 + EXPERTS * PLAN_STRIDE,)],
+        output_shapes=[(pairs,), (pairs,), (1 + EXPERTS * (PLAN_STRIDE_WIDE if wide else PLAN_STRIDE),)],
         output_dtypes=[mx.uint32, mx.float32, mx.uint32],
     )
     lay = layouts or {}
@@ -1150,10 +1177,12 @@ def _panel_products(block, fp4, rows, logits, values, outer, layouts=None):
 
 
 #: Which expert products serve a panel (all exact, class A):
-#:   "auto" (default): one row takes the block's own products (4 launches); 2 to 8 rows the panel
+#:   "auto" (default): one row takes the block's own products (4 launches); 2 to 32 rows the panel
 #:   products, each distinct expert read once with every member computed from the same decoded
-#:   weights (6 launches); 9 to 32 rows MLX's gathered product with fused glue (6 launches).
-#:   "mlx", "own" or "panel" pin one ("panel" for 1 to 8 rows; wider panels take "mlx").
+#:   weights (6 launches; 9 to 32 rows, a copy round's verify, over the wide plan). Before the wide
+#:   plan, 9 to 32 rows took MLX's gathered product, which reads an expert once per (row, expert)
+#:   pair: a 25-row copy panel read about twice the expert bytes of its distinct experts.
+#:   "mlx", "own" or "panel" pin one ("mlx" is the rollback for every width).
 PRODUCTS = os.environ.get("MTPLX_INKLING_FAST_EXPERT_PRODUCTS", "auto").lower()
 
 
@@ -1161,8 +1190,8 @@ def products_for(rows):
     if PRODUCTS in ("mlx", "own"):
         return PRODUCTS
     if PRODUCTS == "panel":
-        return "panel" if rows <= PANEL_ROWS else "mlx"
-    return "own" if rows == 1 else "panel" if rows <= PANEL_ROWS else "mlx"
+        return "panel"
+    return "own" if rows == 1 else "panel"
 
 
 def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *, eps, conv_form=0, trace=None,
@@ -1173,8 +1202,6 @@ def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *
     """
     products = products or products_for(source.shape[-2])
     rows = source.shape[-2]
-    if products == "panel" and rows > PANEL_ROWS:
-        products = "mlx"
     fp4 = block.gate_up.mode == "nvfp4"
     tl = DEFAULT_TILES if tiles is None else {**DEFAULT_TILES, **tiles}
     src = source.reshape(rows, HIDDEN)
