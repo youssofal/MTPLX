@@ -446,6 +446,126 @@ INPUTS = """
     }
 """
 
+# The inputs launch for a panel, the router read once: threadgroup j owns router rows 4j .. 4j+3 for
+# every row of the panel (INPUTS gives each row its own 32 threadgroups, so a W-row panel read the
+# 1.2 MB router W times, and its threadgroups held a whole normed row each). A thread keeps its
+# router values in registers and computes, per panel row, the twelve normed values its router
+# columns need (the same statement as INPUTS: the weight times the input times the inverse root
+# mean square, rounded to the stream's type); the sums of squares, the router sums and the
+# rounding of each value are INPUTS's, in the same order, on the same lanes. The row peak is the
+# maximum of |normed| over all 2,304 values, taken here over the threads' router columns (the same
+# set: max is exact), with INPUTS's NaN rule.
+INPUTS_ROWS = """
+    const uint j = threadgroup_position_in_grid.x;
+    const uint t = thread_position_in_threadgroup.x;
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    threadgroup float sums[W * 32];
+    threadgroup float inv_mean[W];
+    threadgroup float red[W * 32];
+    threadgroup float tpeak[W * 8];
+    const float eps = consts[0];
+    const int col = int(32 * sg + lane) * 4;
+    const bool in_last = 2048 + col + 4 <= 2304;
+    float wt[3][4][4];
+    for (int e = 0; e < 4; ++e) {
+        const device float* wrow = router + (4 * j + e) * 2304;
+        for (int c = 0; c < 4; ++c) {
+            wt[0][e][c] = wrow[col + c];
+            wt[1][e][c] = wrow[1024 + col + c];
+            wt[2][e][c] = in_last ? wrow[2048 + col + c] : 0.0f;
+        }
+    }
+    for (uint i = t; i < uint(W) * 32u; i += 256u) sums[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Each row's 18 sums of 32 slices of four values (INPUTS's order), spread over the simdgroups.
+    for (uint job = sg; job < uint(W) * 18u; job += 8u) {
+        const uint r = job / 18u, part = job % 18u;
+        const device float* four = source + r * 2304 + 4 * (32 * part + lane);
+        float sq = 0;
+        for (int i = 0; i < 4; i++) {
+            const float v = four[i];
+            sq += v * v;
+        }
+        sq = simd_sum(sq);
+        if (lane == 0) sums[r * 32 + part] = sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint r = sg; r < uint(W); r += 8u) {
+        const float row_sq = simd_sum(sums[r * 32 + lane]);
+        if (lane == 0) inv_mean[r] = metal::precise::rsqrt(row_sq / 2304.0f + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint r = 0; r < uint(W); ++r) {
+        const float inv = inv_mean[r];
+        const device float* xr = source + r * 2304;
+        float xs[3][4];
+        float local = 0;
+        bool nan_seen = false;
+        for (int span = 0; span < 3; ++span) {
+            for (int c = 0; c < 4; ++c) {
+                float v = 0.0f;
+                if (span < 2 || in_last) {
+                    const int i = 1024 * span + col + c;
+                    const float xi = xr[i];
+                    const float wi = float(norm_w[i]);
+                    const float y = wi * static_cast<float>(xi * inv);
+                    v = float(static_cast<T>(y));
+                    const float a = abs(v);
+                    nan_seen = nan_seen || isnan(a);
+                    local = max(local, a);
+                }
+                xs[span][c] = v;
+            }
+        }
+        float dot[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int span = 0; span < 3; ++span)
+            for (int e = 0; e < 4; ++e)
+                for (int c = 0; c < 4; ++c)
+                    dot[e] += wt[span][e][c] * xs[span][c];
+        for (int e = 0; e < 4; ++e)
+            for (ushort hop = 16; hop != 0; hop /= 2)
+                dot[e] += simd_shuffle_down(dot[e], hop);
+        if (lane == 0)
+            for (int e = 0; e < 4; ++e) red[(r * 4 + e) * 8 + sg] = dot[e];
+        const float m = simd_max(local);
+        const bool n = simd_any(nan_seen);
+        if (lane == 0) tpeak[r * 8 + sg] = n ? NAN : m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint q = t; q < uint(W) * 4u; q += 256u) {
+        const uint r = q / 4u, e = q % 4u;
+        float total = red[(r * 4 + e) * 8];
+        for (int s = 1; s < 8; ++s) total += red[(r * 4 + e) * 8 + s];
+        logits[r * 128 + 4 * j + e] = total;
+    }
+    for (uint r = 0; r < uint(W); ++r) {
+#if FP4
+        float peak = 0;
+        bool any = false;
+        for (uint s = 0; s < 8; ++s) {
+            any = any || isnan(tpeak[r * 8 + s]);
+            peak = max(peak, tpeak[r * 8 + s]);
+        }
+        peak = any ? NAN : peak;
+        if (j == 0 && t == 0) outer[r] = peak / 1536.0f;
+#else
+        const float peak = 0.0f;
+#endif
+        if (sg < 3) {
+            const uint g = j + 32 * sg;
+            if (g < 72) {
+                const uint i = 32 * g + lane;
+                const float xi = source[r * 2304 + i];
+                const float wi = float(norm_w[i]);
+                const float y = wi * static_cast<float>(xi * inv_mean[r]);
+                const float v = float(static_cast<T>(y));
+                values[r * 2304 + i] = fused_quantize<bool(FP4)>(v, peak, lane);
+            }
+        }
+    }
+"""
+
 GATE_UP = """
     const uint tile = threadgroup_position_in_grid.x;
     const uint slot = threadgroup_position_in_grid.y;
@@ -661,6 +781,66 @@ COMBINE = """
         h1 = h2;
         h2 = x3;
     }
+"""
+
+
+# The combine for a panel, rows side by side: a threadgroup owns COLS columns of every row; a thread
+# makes its (row, column)'s routed value (COMBINE's ordered 8-way sum, the same statements), shares
+# it, then takes the convolution over positions r-3 .. r from its neighbours' routed values (the
+# committed tail before row 0), as COMBINE does walking the rows. COMBINE gave one thread all rows
+# of its column: 36 threadgroups whatever the width.
+COMBINE_ROWS = """
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint cl = tid % uint(COLS);
+    const uint r = tid / uint(COLS);
+    const uint c = threadgroup_position_in_grid.x * uint(COLS) + cl;
+    threadgroup float xrow[W * COLS];
+    float acc = 0;
+    for (int k = 0; k < 8; ++k) {
+        const uint p = r * 8 + k;
+        const float v = raw[p * 2304 + c];
+#if FP4
+        const float scale = mid_outer[p] * expert_outer[experts[p]];
+        const float vs = v * scale;
+        const T q = static_cast<T>(vs);
+#else
+        const T q = static_cast<T>(v);
+#endif
+        const float w = float(q) * prob[p];
+        const float u = w + 0.0f;
+        acc = u + acc;
+    }
+    const T routed = static_cast<T>(acc);
+    const float x3 = float(routed);
+    rows[r * 2304 + c] = x3;
+    xrow[r * COLS + cl] = x3;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float h[3];
+    for (int d = 0; d < 3; ++d) {
+        const int pr = int(r) - 3 + d;
+        h[d] = pr >= 0 ? xrow[uint(pr) * COLS + cl] : tail[uint(3 + pr) * tail_strides[0] + c * tail_strides[1]];
+    }
+    const float w0 = conv_w[0 * conv_w_strides[0] + c * conv_w_strides[1]];
+    const float w1 = conv_w[1 * conv_w_strides[0] + c * conv_w_strides[1]];
+    const float w2 = conv_w[2 * conv_w_strides[0] + c * conv_w_strides[1]];
+    const float w3 = conv_w[3 * conv_w_strides[0] + c * conv_w_strides[1]];
+    float cacc = 0.0f;
+#if CONV_FORM == 0
+    cacc += h[0] * w0;
+    cacc += h[1] * w1;
+    cacc += h[2] * w2;
+    cacc += x3 * w3;
+#else
+    cacc = metal::fma(h[0], w0, cacc);
+    cacc = metal::fma(h[1], w1, cacc);
+    cacc = metal::fma(h[2], w2, cacc);
+    cacc = metal::fma(x3, w3, cacc);
+#endif
+    const float total = x3 + cacc;
+    const float value = total / as_type<float>(uint(DIVISOR));
+    const T conv = static_cast<T>(value);
+    const float sum = partial[r * partial_strides[0] + c * partial_strides[1]] + float(conv);
+    out[r * 2304 + c] = static_cast<T>(sum);
 """
 
 
@@ -966,6 +1146,8 @@ def _kernel(stage, fp4, defines=()):
     fp4_only = lambda *names: list(names) if fp4 else []
     inputs, outputs, body, contiguous = {
         "inputs": (["source", "norm_w", "router", "consts"], ["logits", "values", *fp4_only("outer")], INPUTS, True),
+        "inputs_rows": (["source", "norm_w", "router", "consts"], ["logits", "values", *fp4_only("outer")],
+                        INPUTS_ROWS, True),
         "gate_up": (
             ["logits", "bias", "rconsts", "values", *fp4_only("row_outer"), "codes", "scales", *fp4_only("expert_outer")],
             ["h", "peaks", "experts_out", "prob_out"], GATE_UP, True,
@@ -977,6 +1159,10 @@ def _kernel(stage, fp4, defines=()):
         "combine": (
             ["raw", *fp4_only("mid_outer"), "experts", "prob", *fp4_only("expert_outer"), "conv_w", "tail", "partial"],
             ["out", "rows"], COMBINE, False,
+        ),
+        "combine_rows": (
+            ["raw", *fp4_only("mid_outer"), "experts", "prob", *fp4_only("expert_outer"), "conv_w", "tail", "partial"],
+            ["out", "rows"], COMBINE_ROWS, False,
         ),
     }[stage]
     extra = f"#define FP4 {int(fp4)}\n" + "".join(f"#define {k} {v}\n" for k, v in defines)
@@ -1190,6 +1376,11 @@ def _panel_products(block, fp4, rows, logits, values, outer, layouts=None, dtype
 #:   "mlx", "own" or "panel" pin one ("mlx" is the rollback for every width).
 PRODUCTS = os.environ.get("MTPLX_INKLING_FAST_EXPERT_PRODUCTS", "auto").lower()
 
+#: The inputs and combine launches: "rows" reads the router once for all rows of a panel and spreads
+#: the combine over rows (INPUTS_ROWS, COMBINE_ROWS); "row" is the earlier form (one set of router
+#: threadgroups a row; one combine thread walking every row of its column). Both are RC6's bits.
+GLUE = os.environ.get("MTPLX_INKLING_EXPERT_GLUE", "row").lower()
+
 
 def products_for(rows):
     if PRODUCTS in ("mlx", "own"):
@@ -1215,10 +1406,11 @@ def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *
     mc = _member_chunk(rows)
     common = (("W", rows),)
 
-    logits, values, *outer = _kernel("inputs", fp4)(
+    rows_form = GLUE == "rows"
+    logits, values, *outer = _kernel("inputs_rows" if rows_form else "inputs", fp4)(
         inputs=[src, norm_weight, block.router, _consts(float(eps))],
         template=[*common, ("T", dtype)],
-        grid=(32 * 256, rows, 1), threadgroup=(256, 1, 1),
+        grid=(32 * 256, 1 if rows_form else rows, 1), threadgroup=(256, 1, 1),
         output_shapes=[(rows, EXPERTS), (rows, HIDDEN), *([(rows,)] if fp4 else [])],
         output_dtypes=[mx.float32] * (3 if fp4 else 2),
     )
@@ -1276,14 +1468,26 @@ def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *
 
 def _combine(fp4, rows, raw, mid_outer, experts, prob, dn, conv_weight, tail, part, conv_form, source,
              trace, logits, values, outer, h, peaks, dtype=mx.bfloat16):
-    out, conv_rows = _kernel("combine", fp4, (("CONV_FORM", conv_form), ("DIVISOR", _divisor_bits())))(
-        inputs=[raw, *([mid_outer[0]] if fp4 else []), experts, prob, *([dn.outer] if fp4 else []),
-                conv_weight, tail.reshape(3, HIDDEN), part],
-        template=[("W", rows), ("T", dtype)],
-        grid=(HIDDEN, 1, 1), threadgroup=(64, 1, 1),
-        output_shapes=[(rows, HIDDEN), (rows, HIDDEN)],
-        output_dtypes=[dtype, mx.float32],
-    )
+    defines = (("CONV_FORM", conv_form), ("DIVISOR", _divisor_bits()))
+    if GLUE == "rows":
+        cols = 64 if rows == 1 else 32
+        out, conv_rows = _kernel("combine_rows", fp4, defines)(
+            inputs=[raw, *([mid_outer[0]] if fp4 else []), experts, prob, *([dn.outer] if fp4 else []),
+                    conv_weight, tail.reshape(3, HIDDEN), part],
+            template=[("W", rows), ("T", dtype), ("COLS", cols)],
+            grid=(HIDDEN * rows, 1, 1), threadgroup=(cols * rows, 1, 1),
+            output_shapes=[(rows, HIDDEN), (rows, HIDDEN)],
+            output_dtypes=[dtype, mx.float32],
+        )
+    else:
+        out, conv_rows = _kernel("combine", fp4, defines)(
+            inputs=[raw, *([mid_outer[0]] if fp4 else []), experts, prob, *([dn.outer] if fp4 else []),
+                    conv_weight, tail.reshape(3, HIDDEN), part],
+            template=[("W", rows), ("T", dtype)],
+            grid=(HIDDEN, 1, 1), threadgroup=(64, 1, 1),
+            output_shapes=[(rows, HIDDEN), (rows, HIDDEN)],
+            output_dtypes=[dtype, mx.float32],
+        )
     if trace is not None:
         trace.update(logits=logits, values=values, outer=outer[0] if fp4 else None, h=h, peaks=peaks,
                      experts=experts, prob=prob, raw=raw, mid_outer=mid_outer[0] if fp4 else None)
