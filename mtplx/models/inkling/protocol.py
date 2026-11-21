@@ -395,6 +395,23 @@ def _turn_end(stream, start, words, *, open_ok):
     return end
 
 
+def answer_floor(prompt_ids, tokenizer):
+    """One past the first `<|message_model|>` of a prompt whose history holds a finished
+    assistant turn, or None when it holds none (a conversation's first request, whose only
+    model header is the one the template opens the new answer with). A stored stream can stand
+    for one of the prompt's answers only if it shares at least this many tokens with it."""
+    words = dialect(tokenizer)
+    prompt = prompt_ids if isinstance(prompt_ids, (list, tuple)) else list(prompt_ids)
+    try:
+        finished = prompt.index(words.turn_end)
+    except ValueError:
+        return None
+    try:
+        return prompt.index(words.model, 0, finished) + 1
+    except ValueError:
+        return None
+
+
 def splice_committed(prompt_ids, committed, tokenizer, *, substitute_reasoning=False, visible_gate=None):
     """Re-express `prompt_ids` with the bank's ids for every assistant turn that says the same
     thing, and return the ids and a receipt.

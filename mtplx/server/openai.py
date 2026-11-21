@@ -15763,9 +15763,10 @@ def _maybe_canonicalize_committed_reasoning(
 
     ``compared_stream`` (Inkling): a list this fills with the one stream the
     gate compared the prompt with, when that is not simply the registry's
-    (a stream from the bank after a restart, or the banked branch a resent
-    history continues), so the image gate judges a repair against the same
-    stream.
+    (a stream from the bank after a restart, the banked branch a resent
+    history continues, or a stream found by the prefix it shares when no
+    stream is held under the conversation's id), so the image gate judges a
+    repair against the same stream.
     """
     def _declined(reason: str, **extra: Any) -> None:
         # Every early exit leaves a receipt: a warm turn that re-prefilled
@@ -15818,6 +15819,7 @@ def _maybe_canonicalize_committed_reasoning(
     committed = tuple(getattr(session, "committed_token_ids", ()) or ()) if session is not None else ()
     committed_source = "session"
     compare_ids: list[int] | None = None
+    shared_others: list[tuple[int, ...]] = []
     if not committed and getattr(state.runtime.tokenizer, "inkling_protocol", False) is True:
         # The conversation is not in the registry (the server restarted, or it
         # was evicted idle) but its entries may be in the bank. Without a
@@ -15828,6 +15830,17 @@ def _maybe_canonicalize_committed_reasoning(
         if compare_ids is not None:
             committed = _session_stream_from_bank(state, session_id, compare_ids)
             committed_source = "bank"
+            if not committed:
+                # Nothing under this id either: a client that sends no session
+                # id (Hermes) is a new session to a registry that restarted or
+                # let it go idle, and a client that forks a conversation names
+                # a new one. The bank's streams that share the prompt into its
+                # first answer may hold it; their turns are served only where
+                # they say exactly what the client sent (strict below).
+                shared = _shared_streams_from_bank(state, compare_ids)
+                if shared:
+                    committed, shared_others = shared[0], shared[1:]
+                    committed_source = "bank_prefix"
     if session is None and not committed:
         return None  # inert (first turn / anonymous): no receipt by contract
     if not committed:
@@ -15887,10 +15900,20 @@ def _maybe_canonicalize_committed_reasoning(
         # argument through tojson), so the message-level substitution below
         # cannot put the model's bytes back. The splice compares the dialect's
         # turns instead and serves the bank's ids for each turn that says the
-        # same thing, putting back reasoning the client dropped.
+        # same thing, putting back reasoning the client dropped. A stream
+        # found by its shared prefix alone may be another conversation's that
+        # began the same way, so its turns are strict: served only when they
+        # say exactly what the client sent, reasoning included, and nothing
+        # is put back.
+        strict = committed_source == "bank_prefix"
+
         def splice_onto(
             stream: Sequence[int], cp_before: int, record: dict[str, Any]
         ) -> tuple[list[ChatMessage], list[int]] | None:
+            if strict:
+                return _splice_prompt_onto_committed(
+                    state, messages, compare_ids, stream, cp_before, record
+                )
             return _splice_prompt_onto_committed(
                 state,
                 messages,
@@ -15907,7 +15930,12 @@ def _maybe_canonicalize_committed_reasoning(
             )
 
         spliced = splice_onto(committed, cp_raw, outcome)
-        if (outcome.get("token_splice") or {}).get("stopped") == "outside_assistant_turn":
+        others: list[tuple[int, ...]] = []
+        if strict:
+            # The next streams that share the prompt as far: of these the
+            # one the walk carries furthest is served.
+            others = shared_others
+        elif (outcome.get("token_splice") or {}).get("stopped") == "outside_assistant_turn":
             # The stream left this prompt at a message the client wrote, so it
             # is another branch of the conversation: a client that went back
             # in its history and continued elsewhere (Pi's tree), a request
@@ -15915,9 +15943,11 @@ def _maybe_canonicalize_committed_reasoning(
             # may hold the branch this prompt continues; the walk proves each
             # turn of it as for the registry's stream, and the branch it
             # carries furthest is served.
+            others = _session_streams_from_bank(state, session_id, compare_ids)
+        if others:
             reach = int(outcome.get("cp_spliced") or cp_raw)
             branch: dict[str, Any] | None = None
-            for stream in _session_streams_from_bank(state, session_id, compare_ids):
+            for stream in others:
                 if stream == tuple(committed):
                     continue
                 cp_stream = int(common_prefix_len(compare_ids, stream))
@@ -15925,7 +15955,7 @@ def _maybe_canonicalize_committed_reasoning(
                     "applied": False,
                     "cp_raw": cp_stream,
                     "committed_len": int(len(stream)),
-                    "committed_source": "bank_branch",
+                    "committed_source": committed_source if strict else "bank_branch",
                 }
                 result = splice_onto(stream, cp_stream, trial)
                 if result is not None and int(trial.get("cp_spliced") or 0) > reach:
@@ -15933,12 +15963,13 @@ def _maybe_canonicalize_committed_reasoning(
                     if compared_stream is not None:
                         compared_stream[:] = [stream]
             if branch is not None:
-                branch["left_stream"] = {
-                    "source": committed_source,
-                    "committed_len": int(len(committed)),
-                    "cp_raw": int(cp_raw),
-                    "stopped": "outside_assistant_turn",
-                }
+                if not strict:
+                    branch["left_stream"] = {
+                        "source": committed_source,
+                        "committed_len": int(len(committed)),
+                        "cp_raw": int(cp_raw),
+                        "stopped": "outside_assistant_turn",
+                    }
                 outcome.clear()
                 outcome.update(branch)
         _record(template_observability)
@@ -16071,6 +16102,34 @@ def _session_streams_from_bank(
     return [
         tuple(stream)
         for stream in lookup(session_id, model_path=str(model_path), prompt=prompt_ids, limit=limit) or ()
+        if stream
+    ]
+
+
+def _shared_streams_from_bank(
+    state: Any,
+    prompt_ids: Sequence[int],
+    limit: int = 4,
+) -> list[tuple[int, ...]]:
+    """The bank's stored entries of any conversation that share ``prompt_ids``
+    into its first answer (``SessionBank.shared_streams``, Inkling's dialect
+    marks where that answer starts): the streams the gate may compare a
+    resent history with when no stream is held under its conversation's id.
+    [] for a prompt whose history holds no finished answer, or when the bank
+    holds none."""
+    from mtplx.models.inkling.protocol import answer_floor
+
+    bank = getattr(getattr(state, "sessions", None), "bank", None)
+    lookup = getattr(bank, "shared_streams", None)
+    model_path = getattr(getattr(state, "runtime", None), "model_path", None)
+    if not callable(lookup) or model_path is None:
+        return []
+    floor = answer_floor(prompt_ids, state.runtime.tokenizer)
+    if floor is None:
+        return []
+    return [
+        tuple(stream)
+        for stream in lookup(prompt_ids, model_path=str(model_path), min_shared=floor, limit=limit) or ()
         if stream
     ]
 

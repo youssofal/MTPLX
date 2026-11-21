@@ -1242,7 +1242,6 @@ class SessionBankColdTier:
         tokens = tuple(int(token) for token in prompt)
         if not tokens:
             return []
-        ranked: list[tuple[int, int, int, array | tuple[int, ...]]] = []
         try:
             with self._connect() as conn:
                 rows = list(
@@ -1252,9 +1251,7 @@ class SessionBankColdTier:
                         (str(session_id), str(model_path), COLD_TIER_FORMAT_VERSION),
                     ).fetchall()
                 )
-            for index, row in enumerate(rows):
-                ids = self._row_token_ids(row)
-                ranked.append((common_prefix_len(tokens, ids), len(ids), -index, ids))
+            return self._ranked_streams(rows, tokens, limit=limit)
         except Exception as exc:
             # A probe, like exact_prefix_len: the request goes on without it,
             # and the restore reports its own result.
@@ -1264,6 +1261,68 @@ class SessionBankColdTier:
                 exc,
             )
             return []
+
+    def shared_streams(
+        self,
+        prompt: list[int] | tuple[int, ...],
+        *,
+        model_path: str,
+        min_shared: int,
+        limit: int = 4,
+    ) -> list[tuple[int, ...]]:
+        """Stored entries of any conversation that share at least
+        ``min_shared`` tokens with ``prompt``, as token ids, the longest shared
+        prefix first (the longer entry on a tie), read from the manifest
+        alone; [] when none does.
+
+        For a gate whose conversation has no stream under its own id: a client
+        that sends no session id (Hermes) gets a new one after a restart or an
+        idle eviction, and a client that forks a conversation names a new one.
+        Only a probe: the gate serves a turn from such a stream only where it
+        says exactly what the client sent, and the restore that follows
+        applies every identity check of its own.
+        """
+        if self.mode in {"off", "write-only"} or limit < 1:
+            return []
+        tokens = tuple(int(token) for token in prompt)
+        floor = max(1, int(min_shared))
+        if len(tokens) < floor:
+            return []
+        try:
+            with self._connect() as conn:
+                rows = list(
+                    conn.execute(
+                        "SELECT * FROM entries WHERE model_path = ? AND format_version = ? "
+                        "AND prefix_len >= ?",
+                        (str(model_path), COLD_TIER_FORMAT_VERSION, floor),
+                    ).fetchall()
+                )
+            return self._ranked_streams(rows, tokens, limit=limit, min_shared=floor)
+        except Exception as exc:
+            logger.warning(
+                "SessionBank SSD shared-stream probe failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return []
+
+    def _ranked_streams(
+        self,
+        rows: list[sqlite3.Row],
+        tokens: tuple[int, ...],
+        *,
+        limit: int,
+        min_shared: int = 0,
+    ) -> list[tuple[int, ...]]:
+        """The token ids of ``rows`` that share at least ``min_shared`` tokens
+        with ``tokens``, the longest shared prefix first, then the longer
+        entry, then the earlier row; at most ``limit``, no stream twice."""
+        ranked: list[tuple[int, int, int, array | tuple[int, ...]]] = []
+        for index, row in enumerate(rows):
+            ids = self._row_token_ids(row)
+            shared = common_prefix_len(tokens, ids)
+            if shared >= min_shared:
+                ranked.append((shared, len(ids), -index, ids))
         ranked.sort(key=lambda item: item[:3], reverse=True)
         streams: list[tuple[int, ...]] = []
         for _matched, _length, _order, ids in ranked:
