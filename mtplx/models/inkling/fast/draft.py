@@ -164,6 +164,9 @@ class DepthByYield:
     max_depth: int = 7
     min_depth: int = 1
     prior: float = 0.70
+    #: per-channel starting rates, from the real-history study (acceptance-study-2: 1,609
+    #: rounds; reasoning 0.63-0.65, code and calls inside tool calls 0.81-0.85)
+    channel_prior: dict = field(default_factory=lambda: {"reasoning": 0.64, "tool": 0.84, "text": 0.70})
     prior_weight: float = 6.0
     decay: float = 0.85
     channel: str = "text"
@@ -171,11 +174,14 @@ class DepthByYield:
     _tries: dict = field(default_factory=dict)
     choices: list = field(default_factory=list)
 
+    def _prior(self, channel):
+        return self.channel_prior.get(channel, self.prior) if self.channel_prior else self.prior
+
     def rate(self, channel=None):
         channel = self.channel if channel is None else channel
-        hits = self._hits.get(channel, self.prior * self.prior_weight)
+        hits = self._hits.get(channel, self._prior(channel) * self.prior_weight)
         tries = self._tries.get(channel, self.prior_weight)
-        return hits / tries if tries > 0 else self.prior
+        return hits / tries if tries > 0 else self._prior(channel)
 
     def expected_tokens(self, k, rate=None):
         a = self.rate() if rate is None else rate
@@ -204,7 +210,7 @@ class DepthByYield:
         """Record a round (``offered`` proposals, the first ``accepted`` kept), then follow
         the channel of the emitted tokens for the next choice."""
         channel = self.channel
-        hits = self._hits.get(channel, self.prior * self.prior_weight) * self.decay
+        hits = self._hits.get(channel, self._prior(channel) * self.prior_weight) * self.decay
         tries = self._tries.get(channel, self.prior_weight) * self.decay
         # proposals actually tested: every accepted one plus the first rejected one
         tested = min(offered, accepted + 1)
