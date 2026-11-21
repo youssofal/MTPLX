@@ -13,8 +13,9 @@ from .draft import Drafter
 from .fast import engine_site
 from .fast import round as fast_round
 from .fast import round_program
-from .fast.decoder import (DECLINED, FastDecoder, FastPending, fast_enabled, round_commit_enabled,
-                           round_costs, stage_spec)
+from .fast import draft as fast_draft
+from .fast.decoder import (DECLINED, DepthTableCheck, FastDecoder, FastPending, fast_enabled,
+                           round_commit_enabled, round_costs, stage_spec)
 from .fast.state import MAX_PANEL
 from .fast.step import wide_rows_exact
 from .layout import cache_footprint
@@ -105,6 +106,8 @@ class InklingRuntime(MTPLXRuntime):
                     self.round_cost_ms = None
                     self.round_cost_detail = f"round cost timing failed: {type(exc).__name__}: {exc}"
                     print(f"[mtplx] inkling: {self.round_cost_detail}", flush=True)
+        # The table against the rounds it prices, whatever made it (DepthTableCheck).
+        self.depth_table_check = DepthTableCheck(self.round_cost_ms or fast_draft.RC6_COST_MS_2K)
 
     def resident_kv_bytes_per_token(self):
         return self.target_footprint.full_bytes_per_token

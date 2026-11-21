@@ -227,10 +227,12 @@ def test_a_table_not_plausible_against_the_one_row_round_is_refused(monkeypatch)
     assert detail["source"] == "pieces" and asked == [[], None]
     assert detail["refused"][0]["source"] == "program_warm" and "one-row" in detail["refused"][0]["reason"]
     assert decoder.implausible(table) is None
-    # Pieces that are not plausible either: RC6's table, with both refusals said.
+    # Pieces that are not plausible either: the fixed shape from the one-row round (a fifth of
+    # it a proposal), with both refusals said.
     monkeypatch.setattr(decoder, "measure_round_costs", _pieces([], one_row=24.0, per=40.0))
     table2, detail2 = decoder.round_costs(_cost_rt({k: 105.0 + 3 * k for k in range(1, 8)}))
-    assert table2 is None and detail2["source"] == "rc6" and len(detail2["refused"]) == 2
+    assert detail2["source"] == "fixed_shape" and len(detail2["refused"]) == 2
+    assert table2 == decoder.fixed_shape(24.0, 8) and table2[:3] == (24.0, 29.0, 33.5)
     assert decoder.implausible((20.0, 25.0, 30.0)) is None
     assert decoder.implausible((20.0, 70.0, 73.0)) and decoder.implausible((20.0, 25.0, 50.0))
 
@@ -255,6 +257,35 @@ def test_the_degenerate_tables_of_a_busy_load_are_refused_and_the_pieces_serve(m
     assert detail["source"] == "pieces" and asked == [[], None]
     assert table[1] >= table[0] and decoder.implausible(table) is None
     assert all(b >= a for a, b in zip(table[1:], table[2:]))
+
+
+def test_a_fresh_loads_table_is_accepted(monkeypatch):
+    from mtplx.models.inkling.fast import decoder
+
+    # Bare Speed's fresh load on 93afa7f8 (l0/receipts/depth-93afa7f8.json): served as fitted.
+    monkeypatch.setattr(decoder, "measure_round_costs", _pieces([], one_row=16.12, per=4.0, commit=1.87))
+    monkeypatch.delenv("MTPLX_INKLING_ROUND_COMMIT", raising=False)
+    program = {1: 20.0, 2: 24.0, 3: 28.0, 4: 31.0, 5: 35.0, 6: 40.0, 7: 44.0}
+    table, detail = decoder.round_costs(_cost_rt(program))
+    assert detail["source"] == "program_warm" and detail["refused"] == []
+    assert table == (16.0, 22.0, 26.0, 30.0, 34.0, 38.0, 42.0, 46.0)
+
+
+def test_served_rounds_off_the_table_are_said_once():
+    from mtplx.models.inkling.fast import decoder, routes
+
+    table = (21.0, 28.5, 32.0, 35.5, 39.0, 42.5, 46.0, 49.5)
+    near = decoder.DepthTableCheck(table)
+    for _ in range(decoder.DepthTableCheck.ROUNDS):
+        near.observe(3, 0.0337)            # 33.7 ms against 35.5: within a quarter
+    assert near.verdict["off"] == {} and near.verdict["by_count"][3]["rounds"] == 300
+    far = decoder.DepthTableCheck((31.0, 18.0, 29.0, 40.0, 51.0, 62.0, 73.0, 84.0))
+    with routes.capture_counts() as seen:
+        for _ in range(decoder.DepthTableCheck.ROUNDS):
+            far.observe(1, 0.030)          # every round at 1 proposal, 30 ms against a table's 18
+        far.observe(1, 0.030)              # judged once: later rounds change nothing
+    assert seen == {"depth_table.off_by": 1}
+    assert far.verdict["off"][1]["ratio"] == 1.667 and far.report()["rounds"] == 300
 
 
 def test_the_committing_round_switch_is_one_for_the_loop_and_the_warm_up(monkeypatch):

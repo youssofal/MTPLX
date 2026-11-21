@@ -484,10 +484,15 @@ def generate(
         if capture_final_state and not pending:
             hidden = mx.concatenate([h[:, kept - 1 : kept] for h in features], axis=-1)
         tokens.extend(emitted)
-        copy.observe(len(copied) if copied is not None else 0, kept - 1, len(tokens), perf_counter()-round_started)
+        round_s = perf_counter() - round_started
+        copy.observe(len(copied) if copied is not None else 0, kept - 1, len(tokens), round_s)
         if depth_control is not None:
             if copied is None:
                 depth_control.observe(len(block) - 1, kept - 1, emitted)
+                # The table's price for this round against what it took (DepthTableCheck).
+                table_check = getattr(rt, "depth_table_check", None)
+                if table_check is not None:
+                    table_check.observe(len(block) - 1, round_s)
             else:
                 depth_control.observe(0, 0, emitted)  # copy rounds only move the channel
         stream(emitted)

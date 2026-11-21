@@ -278,14 +278,18 @@ def measure_round_costs(rt, *, length=1100, reps=5, seed=20261121, proposals=Non
 
 
 #: A table is plausible against the one-row round timed beside it when a round with a proposal
-#: costs at least the one-row round and at most three times it, and each further proposal adds
-#: between nothing and PER_PROPOSAL_MAX of the one-row round (tonight's fresh loads: 0.25 on Bare
-#: Speed, 0.17 on the native pack). Outside that, the timing caught something other than these
-#: rounds (another process, a hot GPU, a round on MLX), and the controller would choose depths
-#: from noise: on 21 November a 1-proposal round priced below the one-row round made every
-#: round 1 proposal on all three packs (L5, gate item 1).
-PLAUSIBLE_FIRST_MAX = 3.0
-PER_PROPOSAL_MAX = 0.3
+#: costs between one and two one-row rounds and each further proposal adds between
+#: PER_PROPOSAL_BAND of the one-row round (tonight's fresh loads: 0.25 on Bare Speed, 0.17 on the
+#: native pack; the busy load's Optimized Speed fit, 0.33, served mostly 1 and 2 proposals).
+#: Outside that the timing caught something other than these rounds (another process, a hot GPU,
+#: a round on MLX) and the controller would choose depths from noise: on 21 November a
+#: 1-proposal round priced below the one-row round made every round 1 proposal on all three
+#: packs (L5, gate item 1).
+PLAUSIBLE_FIRST_MAX = 2.0
+PER_PROPOSAL_BAND = (0.1, 0.3)
+#: The shape served when neither timing is plausible: the one-row round plus a fifth of it a
+#: proposal (lead, 11:04), said in /health and in every request.
+FIXED_SHAPE_PER_PROPOSAL = 0.2
 
 
 def fit_round_costs(raw):
@@ -332,14 +336,18 @@ def implausible(table):
         return f"one proposal costs {table[1]} ms, less than the one-row round's {one} ms"
     if len(table) > 1 and table[1] > PLAUSIBLE_FIRST_MAX * one:
         return f"one proposal costs {table[1]} ms, over {PLAUSIBLE_FIRST_MAX} times the one-row round's {one} ms"
+    low, high = PER_PROPOSAL_BAND
     for k in range(2, len(table)):
         added = table[k] - table[k - 1]
-        if added < 0:
-            return f"proposal {k} makes the round {round(-added, 2)} ms cheaper"
-        if added > PER_PROPOSAL_MAX * one:
-            return (f"proposal {k} adds {round(added, 2)} ms, over {PER_PROPOSAL_MAX} of the one-row "
+        if not low * one <= added <= high * one:
+            return (f"proposal {k} adds {round(added, 2)} ms, outside {low} to {high} of the one-row "
                     f"round's {one} ms")
     return None
+
+
+def fixed_shape(one_row_ms, size):
+    """The one-row round plus FIXED_SHAPE_PER_PROPOSAL of it a proposal, ``size`` entries."""
+    return tuple(_half_ms(one_row_ms * (1 + FIXED_SHAPE_PER_PROPOSAL * k)) for k in range(size))
 
 
 def _half_ms(value):
@@ -358,8 +366,10 @@ def round_costs(rt):
     was busy must not price every later load, and the warm-up times its rounds at every load
     anyway. A table that is not plausible against the one-row round timed beside it
     (``implausible``) is refused and said in ``detail`` (so in /health and in the request
-    record); the pieces' line from this load then serves, and if that is refused too, RC6's
-    table. Returns ``(cost_ms, detail)``; ``(None, reason)`` where the fast round does not serve."""
+    record); the pieces' line from this load then serves, and if that is refused too, the fixed
+    shape from the one-row round (``fixed_shape``). Every load also checks its table against the
+    rounds it serves (``DepthTableCheck``). Returns ``(cost_ms, detail)``; ``(None, reason)`` where
+    the fast round does not serve.""" 
     width = getattr(getattr(rt, "drafter", None), "width", None)
     if not width:
         return None, "no drafter"
@@ -396,8 +406,50 @@ def round_costs(rt):
     if why is None:
         return table, {**detail, "source": "pieces", "fit": fit}
     detail["refused"].append({"source": "pieces", "table": table, "reason": why})
-    print(f"[mtplx] inkling: round cost table from the pieces refused ({why}); RC6's table prices rounds", flush=True)
-    return None, {**detail, "source": "rc6"}
+    shape = fixed_shape(detail["one_row_ms"], width)
+    print(f"[mtplx] inkling: round cost table from the pieces refused ({why}); the fixed shape {shape} "
+          f"prices rounds", flush=True)
+    return shape, {**detail, "source": "fixed_shape"}
+
+
+class DepthTableCheck:
+    """The depth table against the rounds it prices, whatever made the table: over the first
+    ROUNDS served rounds the controller chose, the mean ms a round at each proposal count; a
+    count with at least MIN_ROUNDS rounds more than OFF_BY off its table entry is said once
+    (logged, counted ``depth_table.off_by`` in the process and the request that saw it, kept for
+    /health), so a wrong table shows in the first session, not in a review of receipts."""
+
+    ROUNDS = 300
+    MIN_ROUNDS = 20
+    OFF_BY = 0.25
+
+    def __init__(self, table):
+        self.table = tuple(table) if table else None
+        self.ms, self.rounds, self.seen, self.verdict = {}, {}, 0, None
+
+    def observe(self, proposals, seconds):
+        if self.table is None or self.verdict is not None or not 0 <= proposals < len(self.table):
+            return
+        self.ms[proposals] = self.ms.get(proposals, 0.0) + seconds * 1e3
+        self.rounds[proposals] = self.rounds.get(proposals, 0) + 1
+        self.seen += 1
+        if self.seen >= self.ROUNDS:
+            self.judge()
+
+    def judge(self):
+        by_count = {k: {"served_ms": round(self.ms[k] / n, 2), "table_ms": self.table[k], "rounds": n,
+                        "ratio": round(self.ms[k] / n / self.table[k], 3)}
+                    for k, n in sorted(self.rounds.items()) if n >= self.MIN_ROUNDS and self.table[k] > 0}
+        off = {k: row for k, row in by_count.items() if abs(row["ratio"] - 1) > self.OFF_BY}
+        self.verdict = {"rounds": self.seen, "by_count": by_count, "off": off}
+        if off:
+            count("depth_table.off_by")
+            print(f"[mtplx] inkling: served rounds are more than {int(self.OFF_BY * 100)}% off the depth "
+                  f"table: {off}", flush=True)
+        return self.verdict
+
+    def report(self):
+        return {"rounds": self.seen, "verdict": self.verdict, "table": self.table}
 
 
 def observe_fast_request(fn, rt, *args, **kwargs):
@@ -420,9 +472,11 @@ def fast_health(rt=None):
     if rt is not None:
         report["round_cost_ms"] = getattr(rt, "round_cost_ms", None)
         report["round_cost_detail"] = getattr(rt, "round_cost_detail", None)
+        check = getattr(rt, "depth_table_check", None)
+        report["depth_table_check"] = check.report() if check is not None else None
     return report
 
 
-__all__ = ["DECLINED", "FastDecoder", "FastPending", "fast_enabled", "fast_health", "fast_mode",
+__all__ = ["DECLINED", "DepthTableCheck", "FastDecoder", "FastPending", "fast_enabled", "fast_health", "fast_mode",
            "fit_round_costs", "measure_round_costs", "observe_fast_request", "round_commit_enabled",
            "round_costs"]
