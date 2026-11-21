@@ -141,3 +141,45 @@ def test_bits_and_row_stability_at_every_width(mode, tie, products, monkeypatch)
                                        history[:, r:r + 3], eps=1e-6)
         assert same(single[0][0, 0], panel[0][0, r]), (mode, r)
         assert same(single[1][0, 0], panel[1][0, r]), (mode, r)
+
+
+def _plan_reference(pe, rows):
+    """The plan the route kernel must write, from its own expert choices: distinct experts in
+    ascending order, each with its members (pair p = row * 8 + k) in pair order."""
+    distinct = sorted(set(pe))
+    out = []
+    for e in distinct:
+        members = [p for p in range(rows * 8) if pe[p] == e]
+        out.append((e, len(members), [p // 8 for p in members], members))
+    return out
+
+
+@needs_gpu
+@pytest.mark.parametrize("rows", [3, 8])
+@pytest.mark.parametrize("pattern", ["shared", "disjoint"])
+def test_route_plan_with_every_row_on_the_same_experts_or_on_disjoint_ones(rows, pattern):
+    """Review 2, F5: every row choosing the same eight experts (the case where several threads
+    once stored one flag) and rows choosing disjoint experts, at an odd and the full width."""
+    shared = [3, 17, 40, 41, 77, 90, 100, 127]
+    z = mx.random.normal((rows, 128), key=mx.random.key(rows)) * 0.01
+    hot = mx.zeros((rows, 128))
+    for r in range(rows):
+        for k, e in enumerate(shared if pattern == "shared" else range(8 * r, 8 * r + 8)):
+            hot[r, e] = 5.0 + 0.1 * k
+    logits = (z + hot).astype(mx.float32)
+    experts, prob, plan = fx._route_plan_kernel()(
+        inputs=[logits, mx.zeros((128,), mx.float32), fx._route_consts(8.0)],
+        template=[("W", rows)], grid=(256, 1, 1), threadgroup=(256, 1, 1),
+        output_shapes=[(rows * 8,), (rows * 8,), (1 + 128 * fx.PLAN_STRIDE,)],
+        output_dtypes=[mx.uint32, mx.float32, mx.uint32],
+    )
+    mx.eval(experts, plan)
+    pe, plan = experts.tolist(), plan.tolist()
+    want = _plan_reference(pe, rows)
+    assert len(want) == (8 if pattern == "shared" else 8 * rows)
+    assert plan[0] == len(want)
+    for slot, (e, m, member_rows, pairs) in enumerate(want):
+        base = 1 + slot * fx.PLAN_STRIDE
+        assert plan[base] == e and plan[base + 1] == m
+        assert plan[base + 2: base + 2 + m] == member_rows
+        assert plan[base + 10: base + 10 + m] == pairs

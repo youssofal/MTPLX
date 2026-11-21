@@ -679,7 +679,6 @@ ROUTE_PLAN = """
     threadgroup uint pe[W * 8];
     threadgroup uint used[128];
     threadgroup uint slot_of[128];
-    for (uint i = tid; i < 128u; i += 256u) used[i] = 0u;
     for (uint r = sg; r < uint(W); r += 8u) {
         uint ex;
         float pr;
@@ -691,7 +690,13 @@ ROUTE_PLAN = """
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = tid; i < uint(W) * 8u; i += 256u) used[pe[i]] = 1u;
+    // One writer per expert flag (thread e scans the panel's W x 8 choices for e), so no
+    // two threads store to one flag, even when every row picks the same experts.
+    for (uint e = tid; e < 128u; e += 256u) {
+        uint f = 0u;
+        for (uint i = 0; i < uint(W) * 8u; ++i) f |= pe[i] == e ? 1u : 0u;
+        used[e] = f;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sg == 0) {
         uint c[4];
