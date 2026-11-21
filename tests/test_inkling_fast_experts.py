@@ -56,14 +56,22 @@ def test_both_product_kernels_carry_both_formats():
     assert set(fx.PANEL_LAYOUT) == set(fx.PANEL_GEOMETRY) == {(p, f) for p in ("gu", "dn") for f in (True, False)}
 
 
-def test_panel_products_serve_two_to_eight_rows(monkeypatch):
+def test_panel_products_serve_two_to_thirty_two_rows(monkeypatch):
     monkeypatch.setattr(fx, "PRODUCTS", "auto")
-    assert [fx.products_for(w) for w in (1, 2, 4, 8, 9, 32)] == ["own", "panel", "panel", "panel", "mlx", "mlx"]
+    assert [fx.products_for(w) for w in (1, 2, 4, 8, 9, 25, 32)] == ["own"] + ["panel"] * 6
     monkeypatch.setattr(fx, "PRODUCTS", "panel")
-    assert [fx.products_for(w) for w in (1, 8, 9)] == ["panel", "panel", "mlx"]
+    assert [fx.products_for(w) for w in (1, 8, 9, 32)] == ["panel"] * 4
     for pinned in ("mlx", "own"):
         monkeypatch.setattr(fx, "PRODUCTS", pinned)
-        assert {fx.products_for(w) for w in (1, 4, 8)} == {pinned}
+        assert {fx.products_for(w) for w in (1, 4, 8, 9, 32)} == {pinned}
+
+
+def test_the_wide_plan_leaves_the_narrow_kernels_text_alone():
+    # 2 to 8 rows keep their recorded programs: the narrow plan and panel kernels are unchanged.
+    assert "PAIRS_AT" not in fx.ROUTE_PLAN and "PAIRS_AT" not in fx.PANEL
+    assert fx.ROUTE_PLAN_WIDE.replace("plan[base + PAIRS_AT + before] = p;", "plan[base + 10 + before] = p;") == fx.ROUTE_PLAN
+    assert fx.PANEL_WIDE.replace("ps[PAIRS_AT + m0 + m]", "ps[10 + m0 + m]") == fx.PANEL
+    assert fx.PLAN_STRIDE_WIDE == 2 + 2 * fx.MAX_ROWS and fx.WIDE_PAIRS_AT == 2 + fx.MAX_ROWS
 
 
 EXPERTS = 16
@@ -143,6 +151,66 @@ def test_bits_and_row_stability_at_every_width(mode, tie, products, dtype, monke
                                        history[:, r:r + 3], eps=1e-6, dtype=dtype)
         assert same(single[0][0, 0], panel[0][0, r]), (mode, r)
         assert same(single[1][0, 0], panel[1][0, r]), (mode, r)
+
+
+@needs_gpu
+@pytest.mark.parametrize("mode", ["nvfp4", "mxfp8"])
+def test_wide_panels_give_the_gathered_products_bits_and_row_stability(mode, monkeypatch):
+    """9 to 32 rows (a copy round's verify) on the wide plan: the bits of the gathered route they
+    replace, and every row equal to a one-row call on its own state (past 8 rows RC6's batched body
+    is not the criterion: its rows differ from its own one-row step; a copy round's rows must each
+    be the one-token step's). 16 experts in play, so an expert has members in most rows (up to 32
+    members a slot)."""
+    block, conv, norm_weight = synthetic_layer(mode)
+    keys = mx.random.split(mx.random.key(29), 3)
+    source = mx.random.normal((1, 32, 2304), key=keys[0]) * 3.0
+    partial = mx.random.normal((1, 32, 2304), key=keys[1])
+    tail = mx.random.normal((1, 3, 2304), key=keys[2])
+    for W in (9, 13, 16, 24, 25, 32):
+        monkeypatch.setattr(fx, "PRODUCTS", "mlx")
+        gathered = fx.expert_visit_parts(block, norm_weight, conv.weight, source[:, :W], partial[:, :W], tail, eps=1e-6)
+        monkeypatch.setattr(fx, "PRODUCTS", "auto")
+        assert fx.products_for(W) == "panel"
+        got = fx.expert_visit_parts(block, norm_weight, conv.weight, source[:, :W], partial[:, :W], tail, eps=1e-6)
+        for i, name in enumerate(("output", "convolution rows")):
+            assert same(got[i], gathered[i]), (mode, W, name, "gathered")
+    panel = fx.expert_visit_parts(block, norm_weight, conv.weight, source, partial, tail, eps=1e-6)
+    history = mx.concatenate([tail, panel[1]], axis=1)
+    for r in range(32):
+        single = fx.expert_visit_parts(block, norm_weight, conv.weight, source[:, r:r + 1], partial[:, r:r + 1],
+                                       history[:, r:r + 3], eps=1e-6)
+        assert same(single[0][0, 0], panel[0][0, r]), (mode, r)
+        assert same(single[1][0, 0], panel[1][0, r]), (mode, r)
+
+
+@needs_gpu
+@pytest.mark.parametrize("rows", [9, 25, 32])
+@pytest.mark.parametrize("pattern", ["shared", "spread"])
+def test_wide_route_plan_names_every_member(rows, pattern):
+    """The wide plan: every row on the same eight experts (32 members a slot at 32 rows) and rows
+    spread over all 128 experts."""
+    shared = [3, 17, 40, 41, 77, 90, 100, 127]
+    z = mx.random.normal((rows, 128), key=mx.random.key(100 + rows)) * 0.01
+    hot = mx.zeros((rows, 128))
+    for r in range(rows):
+        for k, e in enumerate(shared if pattern == "shared" else [(8 * r + k * 5) % 128 for k in range(8)]):
+            hot[r, e] = 5.0 + 0.1 * k
+    logits = (z + hot).astype(mx.float32)
+    experts, prob, plan = fx._route_plan_kernel(True)(
+        inputs=[logits, mx.zeros((128,), mx.float32), fx._route_consts(8.0)],
+        template=[("W", rows)], grid=(256, 1, 1), threadgroup=(256, 1, 1),
+        output_shapes=[(rows * 8,), (rows * 8,), (1 + 128 * fx.PLAN_STRIDE_WIDE,)],
+        output_dtypes=[mx.uint32, mx.float32, mx.uint32],
+    )
+    mx.eval(experts, plan)
+    pe, plan = experts.tolist(), plan.tolist()
+    want = _plan_reference(pe, rows)
+    assert plan[0] == len(want)
+    for slot, (e, m, member_rows, pairs) in enumerate(want):
+        base = 1 + slot * fx.PLAN_STRIDE_WIDE
+        assert plan[base] == e and plan[base + 1] == m
+        assert plan[base + 2: base + 2 + m] == member_rows
+        assert plan[base + fx.WIDE_PAIRS_AT: base + fx.WIDE_PAIRS_AT + m] == pairs
 
 
 def _plan_reference(pe, rows):

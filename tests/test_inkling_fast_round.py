@@ -470,6 +470,86 @@ def test_device_decide_at_other_temperatures_matches_host(temperature):
         np.testing.assert_allclose(d.accept_probability[: len(probs)], probs, rtol=1e-4, atol=1e-6)
 
 
+def test_the_wide_decision_leaves_the_narrow_kernel_alone():
+    # 2 to 8 rows keep their kernel text (and so their recorded programs); 9 to 32 rows take a
+    # copy whose only changes are the row loop and the per-row slots.
+    assert "    if (sg < W) {\n" in rnd._DECIDE and "threadgroup int win_r[8];" in rnd._DECIDE
+    assert "for (uint sg = first; sg < W; sg += L4_THREADS / 32) {" in rnd._DECIDE_WIDE
+    assert "[8]" not in rnd._DECIDE_WIDE and rnd._DECIDE_WIDE.count("[32];") == 5
+    with pytest.raises(ValueError):
+        rnd.decide(mx.zeros((rnd.WIDE_ROWS + 1, 16)), mx.arange(rnd.WIDE_ROWS, dtype=mx.int32),
+                   position=0, seed=1)
+
+
+def _copy_panel(rng, rows, vocab, margin=7.0):
+    """A prompt-copy panel: each copied token is the row's likeliest by ``margin`` logits (most
+    of the mass), so walks run long and cross the 8-row kernel's reach."""
+    target = _rows(rng, rows, vocab)
+    copied = rng.integers(0, vocab, size=rows - 1).astype(np.int32)
+    target[np.arange(rows - 1), copied] = target[: rows - 1].max(axis=1) + margin
+    return target.astype(np.float32), copied
+
+
+@needs_gpu
+@pytest.mark.parametrize("rows", [9, 13, 17, 25, 32])
+def test_device_decides_wide_copy_panels_like_the_host_reference(rows):
+    rng = np.random.default_rng(700 + rows)
+    vocab = 32_768
+    longest = 0
+    for trial in range(12):
+        target, copied = _copy_panel(rng, rows, vocab)
+        if trial % 4 == 3:
+            copied[int(rng.integers(0, rows - 1))] = int(rng.integers(0, vocab))  # text it would not copy
+        seed = int(rng.integers(0, 2**63))
+        position = int(rng.integers(0, 2**31))
+        d = rnd.read_packet(rnd.decide(mx.array(target), mx.array(copied), position=position, seed=seed), rows)
+        assert d.status == rnd.STATUS_OK
+        want, probs = rnd.reference_decide(target, copied, position=position, seed=seed)
+        assert d.tokens == want, (trial, d.tokens, want)
+        np.testing.assert_allclose(d.accept_probability[: len(probs)], probs, rtol=1e-4, atol=1e-6)
+        longest = max(longest, d.accepted)
+    assert longest >= rnd.MAX_ROWS  # the walk used row 8 or later: past the 8-row kernel's reach
+
+
+@needs_gpu
+def test_wide_decision_greedy_match_and_offered_equal_the_narrow_panels():
+    rng = np.random.default_rng(77)
+    vocab = 32_768
+    rows = 25
+    target, copied = _copy_panel(rng, rows, vocab)
+    best = np.argmax(target, axis=1).astype(np.int32)
+    # greedy: the walk stops at the first copied token that is not the argmax
+    props = best[: rows - 1].copy()
+    props[19] = (props[19] + 1) % vocab
+    d = rnd.read_packet(rnd.decide(mx.array(target), mx.array(props), position=3, seed=1, temperature=0), rows)
+    assert d.accepted == 19 and d.tokens == best[:20].tolist()
+    d = rnd.read_packet(rnd.decide(mx.array(target), mx.array(best[: rows - 1]), position=3, seed=1,
+                                   temperature=0), rows)
+    assert d.accepted == rows - 1 and d.tokens == best.tolist()
+    # the seed-match rule on a wide panel against the host reference
+    for trial in range(8):
+        target, copied = _copy_panel(rng, rows, vocab, margin=6.0)
+        seed = int(rng.integers(0, 2**63))
+        d = rnd.read_packet(rnd.decide(mx.array(target), mx.array(copied), position=trial * 40, seed=seed,
+                                       rule="match"), rows)
+        want, probs = rnd.reference_decide(target, copied, position=trial * 40, seed=seed, rule="match")
+        assert d.tokens == want
+        np.testing.assert_allclose(d.accept_probability[: len(probs)], probs, rtol=1e-4, atol=1e-7)
+    # a 25-row panel deciding its first k proposals gives the (k + 1)-row panel's packet, bit for
+    # bit: for k up to 7 that is the 8-row kernel's own answer
+    for k in (1, 3, 7, 8, 12, 16, 24):
+        target, copied = _copy_panel(rng, rows, vocab)
+        seed = int(rng.integers(0, 2**63))
+        full = np.asarray(rnd.decide(mx.array(target), mx.array(copied), position=1000, seed=seed,
+                                     offered=mx.array([k], mx.uint32)))
+        part = np.asarray(rnd.decide(mx.array(target[: k + 1]), mx.array(copied[:k]), position=1000,
+                                     seed=seed))
+        n = int(part[0])
+        assert int(full[0]) == n and full[1] == part[1]
+        assert full[2: 3 + n].tolist() == part[2: 3 + n].tolist()
+        assert full[2 + rows: 2 + rows + k].tolist() == part[2 + k + 1: 2 + k + 1 + k].tolist()
+
+
 @needs_gpu
 def test_device_warm_builds_every_variant():
     rnd.warm()
