@@ -114,6 +114,13 @@ def shared_linear(x, weights, where, tape=None):
         return [linear(x, w) for w in weights]
     plain = [i for i, w in enumerate(weights) if isinstance(w, mx.array) and w.dtype == x.dtype]
     got = dict(zip(plain, prompt_gemm.project(x, [weights[i] for i in plain], where))) if plain else {}
+    if invariant_sums():
+        # the width-independent read: stored-code matrices on our launch too (MLX's splits its sums on some shapes)
+        from .fast import prompt_experts
+
+        for i, w in enumerate(weights):
+            if i not in got and isinstance(w, AffineWeight) and prompt_experts.affine_unserved(x, w) is None:
+                got[i] = prompt_experts.affine_product(x, w)
     return [got[i] if i in got else linear(x, w) for i, w in enumerate(weights)]
 
 
@@ -360,7 +367,9 @@ class Convolution(nn.Module):
         """The convolution's output; with ``out_dtype`` also the visit's residual step after it:
         ``(out.astype(float32) + add.astype(float32)).astype(out_dtype)`` (``add`` optional)."""
         size = self.size
-        change = None if self.dynamic is None else linear(drive, self.dynamic)
+        # the dynamic offsets' product with the visit's other projections' rules (our launch where it gives MLX's
+        # sums, everywhere under the width-independent read)
+        change = None if self.dynamic is None else shared_linear(drive, [self.dynamic], "conv_offset", tape)[0]
         fused = convolve(x, cache[slot], self.weight, change, tape is not None, add, out_dtype)
         if fused is not None:
             out, cache[slot], history = fused

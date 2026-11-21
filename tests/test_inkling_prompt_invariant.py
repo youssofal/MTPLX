@@ -90,3 +90,29 @@ def test_a_rows_expert_block_does_not_depend_on_its_chunk(invariant, mode):
         assert same(part, whole[:, a:b]), (mode, a, b)
     selections = dict(EF._state(block).counts)
     assert any("prompt_invariant." in key for key in selections), selections
+
+
+def test_a_rows_stored_code_projection_does_not_depend_on_its_chunk_and_matches_mlx(invariant):
+    from mtplx.models.inkling.precision import AffineWeight
+
+    k = iter(mx.random.split(mx.random.key(9), 4))
+    dense = (mx.random.normal((1024, 2304), key=next(k)) * 0.05).astype(mx.bfloat16)
+    codes, scales, biases = mx.quantize(dense, group_size=64, bits=4)
+    weight = AffineWeight(codes, scales, biases, 4, 64)
+    assert PE.affine_unserved(mx.zeros((4, 2304), mx.bfloat16), weight) is None
+    x = (mx.random.normal((2100, 2304), key=next(k)) * 0.5).astype(mx.bfloat16)
+    whole = PE.affine_product(x, weight)
+    stock = weight.product(x)
+    mx.eval(whole, stock)
+    # the same product as MLX's to bfloat16 rounding (its weights are decoded the same way, its sums in another order)
+    err = mx.max(mx.abs(whole.astype(mx.float32) - stock.astype(mx.float32))).item()
+    scale = mx.max(mx.abs(stock.astype(mx.float32))).item()
+    assert err <= 0.02 * scale, (err, scale)
+    for a, b in SLICES:
+        part = PE.affine_product(x[a:b], weight)
+        mx.eval(part)
+        assert same(part, whole[a:b]), (a, b)
+    # the visit's shared projections take it under the width-independent read
+    out = M.shared_linear(x[None, :40], [weight], "test_affine")[0]
+    mx.eval(out)
+    assert same(out[0], whole[:40])

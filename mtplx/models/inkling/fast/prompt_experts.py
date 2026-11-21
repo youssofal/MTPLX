@@ -461,6 +461,36 @@ _STORE_ROUNDED = """                if (r < live) {
                 }"""
 
 
+#: The same tiling over one dense stored-code matrix (4-bit codes, a 16-bit scale and bias per 64 weights, the
+#: Bare Speed and Optimized Speed projections): the matrix is one expert whose run is every row of the input.
+#: Each weight is decoded as scale x code + bias in float32 and rounded to W; each output element is still its
+#: 16-deep fragments in ascending order into float32, whatever the rows around it. Used by the width-independent
+#: prompt read only (MLX's own stored-code product splits its sums on some shapes).
+_AFFINE_SETUP = """    const device uint8_t* my_codes = (const device uint8_t*)w + weight_row * (K / 2) + my_part * (PER / 2);
+    const device T* my_scales = s + weight_row * (K / 64);
+    const device T* my_biases = b + weight_row * (K / 64);"""
+_AFFINE_FIRST = """    mtplx_decode_affine<W, PER>(my_codes, float(my_scales[(my_part * PER) / 64]),
+                                float(my_biases[(my_part * PER) / 64]), my_run[0]);"""
+_AFFINE_LOOP = """            mtplx_decode_affine<W, PER>(my_codes + next / 2, float(my_scales[(next + int(my_part) * PER) / 64]),
+                                        float(my_biases[(next + int(my_part) * PER) / 64]), my_run[(step + 1) & 1]);"""
+DECODE_AFFINE = """
+// PER consecutive weights of one output column inside one 64-weight group: 4-bit codes (eight a 32-bit word,
+// the lowest first) times the group's scale plus its bias, in float32, rounded to W.
+template <typename W, short PER>
+inline void mtplx_decode_affine(const device uint8_t* codes, float scale, float bias, threadgroup W* to) {
+    const device uint* words = (const device uint*)codes;
+    for (short b = 0; b < PER / 8; ++b) {
+        const uint word = words[b];
+        for (short e = 0; e < 8; ++e)
+            to[b * 8 + e] = W(scale * float((word >> (4 * e)) & 0xFu) + bias);
+    }
+}
+"""
+
+
+PRODUCT_WIDE_AFFINE = (PRODUCT_WIDE.replace('    const device uint8_t* my_codes = (const device uint8_t*)w + weight_row * (FP4 ? K / 2 : K)\n                                     + my_part * (FP4 ? PER / 2 : PER);\n    const device uint8_t* my_scales = s + weight_row * (K / (FP4 ? 16 : 32));', _AFFINE_SETUP).replace('    mtplx_decode_part<W, bool(FP4), PER>(my_codes, my_scales[(my_part * PER) / (FP4 ? 16 : 32)], my_run[0]);', _AFFINE_FIRST).replace('            mtplx_decode_part<W, bool(FP4), PER>(my_codes + (FP4 ? next / 2 : next),\n                                                 my_scales[(next + int(my_part) * PER) / (FP4 ? 16 : 32)],\n                                                 my_run[(step + 1) & 1]);', _AFFINE_LOOP))
+
+
 #: (SGM, SGN) of the wide tiling by average pairs an expert; None keeps the narrow kernel (64 x 64 a
 #: threadgroup, 64 deep a step). Measured on one layer's real weights, gate-up and down together
 #: (`lanes/p1/pe-wide-2.json`, provisional): the 2 x 2 tiling (the narrow kernel's 64 x 64 block with the
@@ -508,6 +538,55 @@ def _product_kernel(mapped, wide=None, rounded=None):
         header=header + DECODE + (DECODE_PART if wide else "") + f"#define PROMPT_ROWMAP {int(mapped)}\n"
                + (f"#define ROUNDED_SCALED {int(rounded == 'scaled')}\n" if rounded else ""),
     )
+
+
+@lru_cache(maxsize=None)
+def _affine_kernel():
+    header, _ = _installed_tile_header()
+    return mx.fast.metal_kernel(
+        name="mtplx_inkling_prompt_affine_product",
+        input_names=["x", "w", "s", "b", "tiles", "starts"],
+        output_names=["y"],
+        source=PRODUCT_WIDE_AFFINE.replace(_STORE, _STORE_ROUNDED),
+        header=header + DECODE + DECODE_PART + DECODE_AFFINE + "#define PROMPT_ROWMAP 0\n#define ROUNDED_SCALED 0\n",
+    )
+
+
+def affine_unserved(x, weight):
+    """Why ``affine_product`` cannot serve ``x @ weight`` (an ``AffineWeight``), or None."""
+    if not available()[0]:
+        return "unavailable"
+    if getattr(weight, "bits", None) != 4 or getattr(weight, "group_size", None) != 64:
+        return "format"
+    n_out, words = weight.codes.shape
+    depth = words * 8
+    if x.shape[-1] != depth or depth % 64 or n_out % 64 or x.dtype not in (mx.bfloat16, mx.float16):
+        return "geometry"
+    if weight.scales.dtype != x.dtype or weight.biases.dtype != x.dtype:
+        return "scale_dtype"
+    return None
+
+
+def affine_product(x, weight):
+    """``x @ dequantize(weight).T`` for a 4-bit, 64-group ``AffineWeight`` as one launch of the 2 x 2 tiling, in x's
+    type: every output element summed in one order whatever the rows around it (width-independent)."""
+    lead = x.shape[:-1]
+    flat = x.reshape(-1, x.shape[-1])
+    rows, depth = flat.shape
+    n_out = weight.codes.shape[0]
+    tiles_n = -(-rows // BM)
+    _count("affine.dense")
+    (y,) = _affine_kernel()(
+        inputs=[flat, weight.codes.view(mx.uint8), weight.scales, weight.biases,
+                mx.array([0, tiles_n], dtype=mx.int32), mx.array([0, rows], dtype=mx.int32)],
+        template=[("T", flat.dtype), ("W", mx.bfloat16 if flat.dtype == mx.bfloat16 else mx.float16), ("FP4", True),
+                  ("K", depth), ("N", n_out), ("E", 1), ("SGM", 2), ("SGN", 2), ("O", flat.dtype)],
+        grid=((n_out // 64) * 128, tiles_n + 1, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(rows, n_out)],
+        output_dtypes=[flat.dtype],
+    )
+    return y.reshape(*lead, n_out)
 
 
 def product(x, packed, tiles, starts, pairs, rowmap=None, weights=mx.bfloat16, wide=None, rounded=None):
