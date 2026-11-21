@@ -2054,6 +2054,39 @@ class SessionBank:
                 best = entry
         return best
 
+    def session_stream(
+        self,
+        session_id: str | None,
+        *,
+        model_path: str,
+        prompt: list[int] | tuple[int, ...],
+    ) -> tuple[int, ...]:
+        """The stored entry of conversation ``session_id`` (RAM first, then
+        the SSD manifest) that shares the longest prefix with ``prompt``, as
+        token ids; () when neither holds one. For a gate whose conversation is
+        no longer in the session registry (a restart, an idle eviction): the
+        ids it re-expresses a resent history in. Nothing is restored here.
+        """
+        if not session_id:
+            return ()
+        tokens = as_token_tuple(prompt)
+        best: tuple[int, ...] = ()
+        best_matched = -1
+        for entry in list(self._entries.values()):
+            if entry.session_id != session_id or entry.model_path != str(model_path):
+                continue
+            matched = common_prefix_len(tokens, entry.token_ids)
+            if matched > best_matched or (matched == best_matched and len(entry.token_ids) > len(best)):
+                best, best_matched = tuple(entry.token_ids), matched
+        probe = getattr(self.cold_tier, "session_stream", None)
+        if callable(probe):
+            cold = tuple(probe(session_id, model_path=str(model_path), prompt=tokens) or ())
+            if cold:
+                matched = common_prefix_len(tokens, cold)
+                if matched > best_matched or (matched == best_matched and len(cold) > len(best)):
+                    best = cold
+        return best
+
     def cold_exact_prefix_len(
         self,
         token_ids: list[int] | tuple[int, ...],

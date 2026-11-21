@@ -1216,6 +1216,56 @@ class SessionBankColdTier:
             )
         return 0
 
+    def session_stream(
+        self,
+        session_id: str,
+        *,
+        model_path: str,
+        prompt: list[int] | tuple[int, ...],
+    ) -> tuple[int, ...]:
+        """The token ids of this conversation's stored entry that shares the
+        longest prefix with ``prompt`` (the longer entry on a tie), read from
+        the manifest alone; () when the conversation has none here.
+
+        A server that restarted holds no conversation in RAM, so the gate that
+        re-expresses a resent history in the ids the model wrote has nothing
+        to compare with, and the history the client sends leaves every stored
+        entry at the first turn those ids differ from a re-render. This is the
+        stream the gate compares with instead. Only a probe: the restore that
+        follows applies every identity check of its own.
+        """
+        if self.mode in {"off", "write-only"} or not session_id:
+            return ()
+        tokens = tuple(int(token) for token in prompt)
+        if not tokens:
+            return ()
+        best: array | tuple[int, ...] = ()
+        best_matched = -1
+        try:
+            with self._connect() as conn:
+                rows = list(
+                    conn.execute(
+                        "SELECT * FROM entries WHERE session_id = ? AND model_path = ? "
+                        "AND format_version = ? ORDER BY prefix_len DESC",
+                        (str(session_id), str(model_path), COLD_TIER_FORMAT_VERSION),
+                    ).fetchall()
+                )
+            for row in rows:
+                ids = self._row_token_ids(row)
+                matched = common_prefix_len(tokens, ids)
+                if matched > best_matched:
+                    best, best_matched = ids, matched
+        except Exception as exc:
+            # A probe, like exact_prefix_len: the request goes on without it,
+            # and the restore reports its own result.
+            logger.warning(
+                "SessionBank SSD session-stream probe failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return ()
+        return tuple(best)
+
     def lookup_prefix_boundary(
         self,
         token_ids: list[int] | tuple[int, ...],
@@ -3264,6 +3314,13 @@ class SessionBankColdTier:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_entries_token_hash "
                 "ON entries(token_hash)"
+            )
+            # session_stream reads one conversation's rows. session_id sits
+            # after token_ids_json in each row, so without an index the filter
+            # reads through every row's token list to reach it.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_entries_session "
+                "ON entries(session_id, model_path)"
             )
 
     def _archive_legacy_store_if_needed(self) -> None:

@@ -6335,6 +6335,12 @@ def _vision_gate_canonicalization(
     peek = getattr(getattr(state, "sessions", None), "peek", None)
     if session_id is not None and callable(peek):
         committed = tuple(getattr(peek(session_id), "committed_token_ids", ()) or ())
+    if not committed and getattr(
+        getattr(getattr(state, "runtime", None), "tokenizer", None), "inkling_protocol", False
+    ) is True:
+        # The stream the gate compared with when the conversation was not in
+        # the registry (_maybe_canonicalize_committed_reasoning).
+        committed = _session_stream_from_bank(state, session_id, raw_keyed)
     pad_id = getattr(_server_vision_spec(state), "image_token_id", None)
     served: tuple[list[Any], list[int], Any] | None = None
     refusal: str | None = None
@@ -15797,14 +15803,27 @@ def _maybe_canonicalize_committed_reasoning(
         session = sessions.peek(session_id)
     except Exception:
         return None
-    if session is None:
+    committed = tuple(getattr(session, "committed_token_ids", ()) or ()) if session is not None else ()
+    committed_source = "session"
+    compare_ids: list[int] | None = None
+    if not committed and getattr(state.runtime.tokenizer, "inkling_protocol", False) is True:
+        # The conversation is not in the registry (the server restarted, or it
+        # was evicted idle) but its entries may be in the bank. Without a
+        # stream to compare with, the history the client resends leaves every
+        # entry at the first turn whose ids the splice once served, and that
+        # turn and everything after it would be read again.
+        compare_ids = prompt_ids if prompt_view is None else prompt_view(prompt_ids)
+        if compare_ids is not None:
+            committed = _session_stream_from_bank(state, session_id, compare_ids)
+            committed_source = "bank"
+    if session is None and not committed:
         return None  # inert (first turn / anonymous): no receipt by contract
-    committed = tuple(getattr(session, "committed_token_ids", ()) or ())
     if not committed:
         _declined("no_committed_stream", session_id=session_id)
         return None
     # A text request compares its own ids; an image request the view.
-    compare_ids = prompt_ids if prompt_view is None else prompt_view(prompt_ids)
+    if compare_ids is None:
+        compare_ids = prompt_ids if prompt_view is None else prompt_view(prompt_ids)
     if compare_ids is None:
         _declined("image_keying_failed", session_id=session_id)
         return None
@@ -15819,6 +15838,8 @@ def _maybe_canonicalize_committed_reasoning(
         "cp_raw": int(cp_raw),
         "committed_len": int(len(committed)),
     }
+    if committed_source != "session":
+        outcome["committed_source"] = committed_source
 
     def _record(target: dict[str, Any] | None) -> None:
         if target is not None:
@@ -15976,6 +15997,23 @@ def _maybe_canonicalize_committed_reasoning(
     if spliced is not None:
         return spliced
     return canon_messages, canon_ids
+
+
+def _session_stream_from_bank(
+    state: Any,
+    session_id: str | None,
+    prompt_ids: Sequence[int],
+) -> tuple[int, ...]:
+    """Conversation ``session_id``'s stored entry closest to ``prompt_ids``
+    (RAM entries, then the SSD manifest; ``SessionBank.session_stream``), the
+    stream the gate compares a resent history with when the conversation is
+    not in the session registry. () when the bank holds none."""
+    bank = getattr(getattr(state, "sessions", None), "bank", None)
+    lookup = getattr(bank, "session_stream", None)
+    model_path = getattr(getattr(state, "runtime", None), "model_path", None)
+    if not session_id or not callable(lookup) or model_path is None:
+        return ()
+    return tuple(lookup(session_id, model_path=str(model_path), prompt=prompt_ids) or ())
 
 
 def _committed_splice_reach(
