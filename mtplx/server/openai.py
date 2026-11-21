@@ -24504,7 +24504,12 @@ def _admission_narrow_widths(runtime: Any, widths: Sequence[int | None]) -> list
     16 and 32 GB Macs that a 1,024-row chunk fits). None for Flash-Next,
     which keeps its own ladder, a backend that answers for its own widths,
     or a prompt forwarded whole; 1,024 only for a family with routed
-    experts, whose 512-row chunks were not measured."""
+    experts, whose 512-row chunks were not measured, unless the family
+    prices its own forward at every width (``prefill_working_bytes``:
+    Inkling 2 Mini, whose measured default is 512 rows). Its memory plan
+    reserves a 512-row forward at the window's end, so where it reads
+    2,048 rows (a Mac with 12 GiB of GPU headroom) a prompt near the
+    window's end fits at 512 rows and not at 1,024."""
 
     if (
         runtime is None
@@ -24515,7 +24520,9 @@ def _admission_narrow_widths(runtime: Any, widths: Sequence[int | None]) -> list
     ):
         return []
     rungs = _ADMISSION_NARROW_PREFILL_WIDTHS
-    if _dense_prefill_bill(_runtime_text_args(runtime), 1) is None:
+    if _dense_prefill_bill(_runtime_text_args(runtime), 1) is None and not callable(
+        getattr(runtime, "prefill_working_bytes", None)
+    ):
         rungs = tuple(w for w in rungs if w >= _DENSE_PREFILL_FLAT_WIDTH)
     return [w for w in rungs if w < int(widths[-1])]
 

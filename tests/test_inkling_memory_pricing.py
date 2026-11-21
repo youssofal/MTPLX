@@ -48,6 +48,10 @@ def test_a_chunked_prompt_read_is_512_rows_unless_a_width_is_named(monkeypatch):
     assert prefill_forward_widths(rt, 30_000, 4096) == [4096, 512]
     assert prefill_forward_widths(rt, 30_000, 256) == [256]
     assert _admission_narrow_widths(rt, [512]) == []
+    # Where the read is wider (2,048 rows on a Mac with the GPU headroom), the admission may narrow it down to the
+    # 512 rows the plan reserves at the window's end, not only to 1,024 as for a family that does not price itself.
+    assert _admission_narrow_widths(rt, [2048]) == [1024, 512]
+    assert _admission_narrow_widths(rt, [1024]) == [512]
     with prefill_chunk_size_override(256):  # a warming read, or the width the admission chose
         assert rt.prompt_chunk_rows(30_000) == 256
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "2048")  # the user's own width
