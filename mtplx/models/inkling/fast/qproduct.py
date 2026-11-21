@@ -21,8 +21,8 @@ row. A first use on each shape proves the result against MLX's one-row product o
 operands; a disagreement refuses the route (counted) and the caller keeps MLX's product.
 
 ``QMV_ROWS`` is the same arithmetic as a Metal device function for another lane's launch (the
-fused attention output): ``qmv_rows<W, TM, K, BITS, GROUP, VPT>(codes, scales, biases, x, x_stride,
-row0, lane, result)`` leaves ``result[r][tm]`` (output row ``row0 + tm``, panel row ``r``) in every
+fused attention output): ``qmv_rows<W, NROW, K, BITS, GROUP, VPT>(codes, scales, biases, x, x_stride,
+row0, lane, result)`` leaves ``result[r][ro]`` (output row ``row0 + ro``, panel row ``r``) in every
 lane of the calling simdgroup; ``qmv_constants(weight)`` gives its template values.
 """
 
@@ -48,35 +48,35 @@ _RCH_SMALL = 8
 _RCH_LARGE = 4
 
 QMV_ROWS = AFFINE_LANE + """
-// MLX's one-row affine product for output rows [row0, row0 + TM) and W panel rows of x (row r at
+// MLX's one-row affine product for output rows [row0, row0 + NROW) and W panel rows of x (row r at
 // x + r * x_stride; bf16 or float, as the reference product takes it), every lane of the calling
-// simdgroup together, through affine_lane. result[r][tm] ends in every lane.
-template <int W, int TM, int K, int BITS, int GROUP, int VPT, typename T>
+// simdgroup together, through affine_lane. result[r][ro] ends in every lane.
+template <int W, int NROW, int K, int BITS, int GROUP, int VPT, typename T>
 inline void qmv_rows(const device uint32_t* codes, const device bfloat16_t* scales,
                      const device bfloat16_t* biases, const device T* x, int x_stride, int row0,
-                     uint lane, thread float (&result)[W][TM]) {
+                     uint lane, thread float (&result)[W][NROW]) {
     constexpr int BLOCK = 32 * VPT, NB = K / BLOCK, WPR = K * BITS / 32, GPR = K / GROUP;
     for (int r = 0; r < W; ++r)
-        for (int tm = 0; tm < TM; ++tm) result[r][tm] = 0.0f;
+        for (int ro = 0; ro < NROW; ++ro) result[r][ro] = 0.0f;
     for (int b = 0; b < NB; ++b) {
         const int col = b * BLOCK + int(lane) * VPT;
-        float wf[TM][VPT], sc[TM], bi[TM];
-        for (int tm = 0; tm < TM; ++tm) {
-            const size_t row = size_t(row0 + tm);
-            sc[tm] = static_cast<float>(scales[row * GPR + col / GROUP]);
-            bi[tm] = static_cast<float>(biases[row * GPR + col / GROUP]);
-            affine_lane::unpack<VPT, BITS>(codes + row * WPR + col * BITS / 32, wf[tm]);
+        float wf[NROW][VPT], sc[NROW], bi[NROW];
+        for (int ro = 0; ro < NROW; ++ro) {
+            const size_t row = size_t(row0 + ro);
+            sc[ro] = static_cast<float>(scales[row * GPR + col / GROUP]);
+            bi[ro] = static_cast<float>(biases[row * GPR + col / GROUP]);
+            affine_lane::unpack<VPT, BITS>(codes + row * WPR + col * BITS / 32, wf[ro]);
         }
         for (int r = 0; r < W; ++r) {
             const device T* xs = x + size_t(r) * x_stride + col;
             float xt[VPT];
             const float tot = affine_lane::take<VPT, BITS>(xs, xt);
-            for (int tm = 0; tm < TM; ++tm)
-                result[r][tm] += affine_lane::term<VPT, BITS>(xt, wf[tm], sc[tm], bi[tm], tot);
+            for (int ro = 0; ro < NROW; ++ro)
+                result[r][ro] += affine_lane::term<VPT, BITS>(xt, wf[ro], sc[ro], bi[ro], tot);
         }
     }
     for (int r = 0; r < W; ++r)
-        for (int tm = 0; tm < TM; ++tm) result[r][tm] = simd_sum(result[r][tm]);
+        for (int ro = 0; ro < NROW; ++ro) result[r][ro] = simd_sum(result[r][ro]);
 }
 """
 
@@ -108,16 +108,16 @@ _SOURCE = """
 
     for (uint rc = rc_begin; rc < rc_end; rc += RCH) {
         float acc[4][RCH];
-        for (uint tm = 0; tm < 4; ++tm)
-            for (uint r = 0; r < RCH; ++r) acc[tm][r] = 0.0f;
+        for (uint ro = 0; ro < 4; ++ro)
+            for (uint r = 0; r < RCH; ++r) acc[ro][r] = 0.0f;
         for (int b = 0; b < NB; ++b) {
             const int col = b * BLOCK + int(lane) * VPT;
             float wf[4][VPT], sc[4], bi[4];
-            for (uint tm = 0; tm < 4; ++tm) {
-                const size_t row = min(row0 + tm, uint(N - 1));
-                sc[tm] = static_cast<float>(scales[row * GPR + col / G]);
-                bi[tm] = static_cast<float>(biases[row * GPR + col / G]);
-                affine_lane::unpack<VPT, BITS>(codes + row * WPR + col * BITS / 32, wf[tm]);
+            for (uint ro = 0; ro < 4; ++ro) {
+                const size_t row = min(row0 + ro, uint(N - 1));
+                sc[ro] = static_cast<float>(scales[row * GPR + col / G]);
+                bi[ro] = static_cast<float>(biases[row * GPR + col / G]);
+                affine_lane::unpack<VPT, BITS>(codes + row * WPR + col * BITS / 32, wf[ro]);
             }
             for (uint r = 0; r < RCH; ++r) {
                 if (rc + r >= rc_end) break;
@@ -130,30 +130,30 @@ _SOURCE = """
                 } else {
                     tot = affine_lane::take<VPT, BITS>(xs, xt);
                 }
-                for (uint tm = 0; tm < 4; ++tm)
-                    acc[tm][r] += affine_lane::term<VPT, BITS>(xt, wf[tm], sc[tm], bi[tm], tot);
+                for (uint ro = 0; ro < 4; ++ro)
+                    acc[ro][r] += affine_lane::term<VPT, BITS>(xt, wf[ro], sc[ro], bi[ro], tot);
             }
         }
-        for (uint tm = 0; tm < 4; ++tm)
-            for (uint r = 0; r < RCH; ++r) acc[tm][r] = simd_sum(acc[tm][r]);
+        for (uint ro = 0; ro < 4; ++ro)
+            for (uint r = 0; r < RCH; ++r) acc[ro][r] = simd_sum(acc[ro][r]);
         if (lane == 0) {
             for (uint r = 0; r < RCH && rc + r < rc_end; ++r)
-                for (uint tm = 0; tm < 4; ++tm)
-                    if (row0 + tm < N) out[size_t(rc + r) * N + row0 + tm] = static_cast<T>(acc[tm][r]);
+                for (uint ro = 0; ro < 4; ++ro)
+                    if (row0 + ro < N) out[size_t(rc + r) * N + row0 + ro] = static_cast<T>(acc[ro][r]);
         }
     }
 """
 
 _PROBE = """
-    // qmv_rows as another lane calls it: each simdgroup takes TM output rows for the whole panel.
+    // qmv_rows as another lane calls it: each simdgroup takes NROW output rows for the whole panel.
     const uint lane = thread_index_in_simdgroup;
-    const int row0 = int(threadgroup_position_in_grid.x * (THREADS / 32) + simdgroup_index_in_threadgroup) * TM;
-    if (row0 + TM > N) return;
-    float result[W][TM];
-    qmv_rows<W, TM, K, BITS, G, VPT>(codes, scales, biases, x, K, row0, lane, result);
+    const int row0 = int(threadgroup_position_in_grid.x * (THREADS / 32) + simdgroup_index_in_threadgroup) * NROW;
+    if (row0 + NROW > N) return;
+    float result[W][NROW];
+    qmv_rows<W, NROW, K, BITS, G, VPT>(codes, scales, biases, x, K, row0, lane, result);
     if (lane == 0)
         for (int r = 0; r < W; ++r)
-            for (int tm = 0; tm < TM; ++tm) out[size_t(r) * N + row0 + tm] = static_cast<T>(result[r][tm]);
+            for (int ro = 0; ro < NROW; ++ro) out[size_t(r) * N + row0 + ro] = static_cast<T>(result[r][ro]);
 """
 
 
@@ -267,18 +267,18 @@ def affine_product(x, weight, *, prove=True, **tune):
     return out.reshape(*lead, n)
 
 
-def qmv_rows_probe(x, weight, tm=4, threads=64):
-    """``QMV_ROWS`` called as another lane's launch would call it (each simdgroup ``tm`` output
+def qmv_rows_probe(x, weight, rows_each=4, threads=64):
+    """``QMV_ROWS`` called as another lane's launch would call it (each simdgroup ``rows_each`` output
     rows, the whole panel): for the bit checks of the device function itself."""
     c = qmv_constants(weight)
     n = weight.codes.shape[0]
     rows = x.shape[0]
-    if n % tm:
-        raise ValueError("probe takes output rows in whole groups of tm")
-    per_group = threads // 32 * tm
+    if n % rows_each:
+        raise ValueError("probe takes output rows in whole groups of rows_each")
+    per_group = threads // 32 * rows_each
     return _kernel("probe")(
         inputs=[x, weight.codes, weight.scales, weight.biases],
-        template=[("T", x.dtype), ("W", rows), ("TM", tm), ("K", c["K"]), ("N", n), ("BITS", c["BITS"]),
+        template=[("T", x.dtype), ("W", rows), ("NROW", rows_each), ("K", c["K"]), ("N", n), ("BITS", c["BITS"]),
                   ("G", c["GROUP"]), ("VPT", c["VPT"]), ("THREADS", threads)],
         grid=(-(-n // per_group) * threads, 1, 1),
         threadgroup=(threads, 1, 1),

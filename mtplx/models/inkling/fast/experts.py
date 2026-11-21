@@ -350,16 +350,17 @@ INPUTS = """
     threadgroup float scratch[32];
     threadgroup float inv_mean[1];
     const float eps = consts[0];
-    // This threadgroup's four router rows, in the one-row gemv's per-thread slices.
-    const int bn = int(32 * sg + lane) * 4;
-    const bool tail_ok = 2048 + bn + 4 <= 2304;
-    float wr0[4][4], wr1[4][4], wr2[4][4];
-    for (int tm = 0; tm < 4; ++tm) {
-        const device float* row = router + (4 * j + tm) * 2304;
-        for (int tn = 0; tn < 4; ++tn) {
-            wr0[tm][tn] = row[bn + tn];
-            wr1[tm][tn] = row[1024 + bn + tn];
-            wr2[tm][tn] = tail_ok ? row[2048 + bn + tn] : 0.0f;
+    // This threadgroup's four router rows. A thread owns four columns in each 1,024-wide span of
+    // the 2,304; the last span holds 256, so only the first 64 threads reach into it.
+    const int col = int(32 * sg + lane) * 4;
+    const bool in_last = 2048 + col + 4 <= 2304;
+    float wt[3][4][4];
+    for (int e = 0; e < 4; ++e) {
+        const device float* wrow = router + (4 * j + e) * 2304;
+        for (int c = 0; c < 4; ++c) {
+            wt[0][e][c] = wrow[col + c];
+            wt[1][e][c] = wrow[1024 + col + c];
+            wt[2][e][c] = in_last ? wrow[2048 + col + c] : 0.0f;
         }
     }
     if (t < 32) sums[t] = 0.0f;
@@ -367,22 +368,23 @@ INPUTS = """
     {
         const uint r = threadgroup_position_in_grid.y;
         const device float* xr = source + r * 2304;
-        // MLX rms_single_row: 576 threads of 4 values; this threadgroup plays its 18 simdgroups.
-        for (uint s = sg; s < 18; s += 8) {
-            float thread_x[4];
-            float acc = 0;
-            const uint base = 4 * (32 * s + lane);
+        // The row's sum of squares in the reference norm's order: 576 slices of four values, each
+        // summed in index order from zero, 18 sums of 32 slices, then one sum of those (zeros past
+        // the 18). This threadgroup has 8 simdgroups, so each takes the partials 8 apart.
+        for (uint part = sg; part < 18; part += 8) {
+            const device float* four = xr + 4 * (32 * part + lane);
+            float sq = 0;
             for (int i = 0; i < 4; i++) {
-                thread_x[i] = xr[base + i];
-                acc += thread_x[i] * thread_x[i];
+                const float v = four[i];
+                sq += v * v;
             }
-            acc = simd_sum(acc);
-            if (lane == 0) sums[s] = acc;
+            sq = simd_sum(sq);
+            if (lane == 0) sums[part] = sq;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
-            float acc = simd_sum(sums[lane]);
-            if (lane == 0) inv_mean[0] = metal::precise::rsqrt(acc / 2304.0f + eps);
+            const float row_sq = simd_sum(sums[lane]);
+            if (lane == 0) inv_mean[0] = metal::precise::rsqrt(row_sq / 2304.0f + eps);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const float inv = inv_mean[0];
@@ -399,34 +401,31 @@ INPUTS = """
             local = max(local, a);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        // Router logits: MLX one-row gemv, bm1 bn8 sm1 sn32 tm4 tn4.
-        float v0[4], v1[4], v2[4];
-        for (int tn = 0; tn < 4; ++tn) {
-            v0[tn] = normed[bn + tn];
-            v1[tn] = normed[1024 + bn + tn];
-            v2[tn] = tail_ok ? normed[2048 + bn + tn] : 0.0f;
+        // Router logits, bit for bit the one-row product's: a thread's sum starts at zero and takes
+        // its three spans in order, one product a statement; the 32 lanes meet by halving (16, 8, 4,
+        // 2, 1); the eight simdgroups' sums are added in order onto the first.
+        float xs[3][4];
+        for (int c = 0; c < 4; ++c) {
+            xs[0][c] = normed[col + c];
+            xs[1][c] = normed[1024 + col + c];
+            xs[2][c] = in_last ? normed[2048 + col + c] : 0.0f;
         }
-        float res[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        for (int tm = 0; tm < 4; ++tm)
-            for (int tn = 0; tn < 4; ++tn)
-                res[tm] += wr0[tm][tn] * v0[tn];
-        for (int tm = 0; tm < 4; ++tm)
-            for (int tn = 0; tn < 4; ++tn)
-                res[tm] += wr1[tm][tn] * v1[tn];
-        for (int tm = 0; tm < 4; ++tm)
-            for (int tn = 0; tn < 4; ++tn)
-                res[tm] += wr2[tm][tn] * v2[tn];
-        for (int tm = 0; tm < 4; ++tm)
-            for (ushort sn = 16; sn >= 1; sn >>= 1)
-                res[tm] += simd_shuffle_down(res[tm], sn);
+        float dot[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int span = 0; span < 3; ++span)
+            for (int e = 0; e < 4; ++e)
+                for (int c = 0; c < 4; ++c)
+                    dot[e] += wt[span][e][c] * xs[span][c];
+        for (int e = 0; e < 4; ++e)
+            for (ushort hop = 16; hop != 0; hop /= 2)
+                dot[e] += simd_shuffle_down(dot[e], hop);
         if (lane == 0)
-            for (int tm = 0; tm < 4; ++tm) red[sg * 8 + tm] = res[tm];
+            for (int e = 0; e < 4; ++e) red[sg * 8 + e] = dot[e];
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (t == 0) {
-            for (int tm = 0; tm < 4; ++tm) {
-                float acc = res[tm];
-                for (int s = 1; s < 8; ++s) acc += red[s * 8 + tm];
-                logits[r * 128 + 4 * j + tm] = acc;
+            for (int e = 0; e < 4; ++e) {
+                float total = dot[e];
+                for (int s = 1; s < 8; ++s) total += red[s * 8 + e];
+                logits[r * 128 + 4 * j + e] = total;
             }
         }
         // Expert input rounding: RC6's per-lane quantiser on 32 consecutive values a simdgroup.

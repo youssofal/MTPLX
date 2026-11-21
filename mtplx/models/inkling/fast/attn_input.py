@@ -403,8 +403,8 @@ _PROJECT = """
                 const uint wpr = D * bits / 32;
                 const uint gpr = D / gsize;
                 float acc[4][RCH];
-                for (uint tm = 0; tm < 4; ++tm)
-                    for (uint r = 0; r < RCH; ++r) acc[tm][r] = 0.0f;
+                for (uint ro = 0; ro < 4; ++ro)
+                    for (uint r = 0; r < RCH; ++r) acc[ro][r] = 0.0f;
                 for (uint c0 = 0; c0 < D; c0 += KC) {
                     threadgroup_barrier(mem_flags::mem_threadgroup);
                     for (uint idx = thread_index_in_threadgroup; idx < RCH * (KC / 4); idx += THREADS) {
@@ -420,10 +420,10 @@ _PROJECT = """
                         for (uint b = c0 / 256; b < b_end; ++b) {
                             const uint col = b * 256 + lane * 8;
                             float sc[4], bi[4], wf[4][8];
-                            for (uint tm = 0; tm < 4; ++tm) {
-                                sc[tm] = static_cast<float>(scl[size_t(m0 + tm) * gpr + col / gsize]);
-                                bi[tm] = static_cast<float>(bia[size_t(m0 + tm) * gpr + col / gsize]);
-                                lane_unpack(cw + size_t(m0 + tm) * wpr + col * bits / 32, wf[tm], bits);
+                            for (uint ro = 0; ro < 4; ++ro) {
+                                sc[ro] = static_cast<float>(scl[size_t(m0 + ro) * gpr + col / gsize]);
+                                bi[ro] = static_cast<float>(bia[size_t(m0 + ro) * gpr + col / gsize]);
+                                lane_unpack(cw + size_t(m0 + ro) * wpr + col * bits / 32, wf[ro], bits);
                             }
                             for (uint r = 0; r < RCH; ++r) {
                                 if (rc + r < W) {
@@ -438,8 +438,8 @@ _PROJECT = """
                                     } else {
                                         tot = lane_take(xv, xt, bits);
                                     }
-                                    for (uint tm = 0; tm < 4; ++tm)
-                                        acc[tm][r] += lane_term(xt, wf[tm], sc[tm], bi[tm], tot, bits);
+                                    for (uint ro = 0; ro < 4; ++ro)
+                                        acc[ro][r] += lane_term(xt, wf[ro], sc[ro], bi[ro], tot, bits);
                                 }
                             }
                         }
@@ -447,39 +447,39 @@ _PROJECT = """
                         const uint i_end = (c0 + KC < D ? c0 + KC : D) / 128;
                         for (uint i = c0 / 128; i < i_end; ++i) {
                             float wt[4][4];
-                            for (uint tm = 0; tm < 4; ++tm) LOAD_BF16X4(wrow + size_t(tm) * D + i * 128, wt[tm]);
+                            for (uint ro = 0; ro < 4; ++ro) LOAD_BF16X4(wrow + size_t(ro) * D + i * 128, wt[ro]);
                             for (uint r = 0; r < RCH; ++r) {
                                 if (rc + r < W) {
                                     float xv[4];
                                     for (uint t_ = 0; t_ < 4; ++t_)
                                         xv[t_] = static_cast<float>(chunk_in[r * KC + (i * 128 - c0) + lane * 4 + t_]);
-                                    for (uint tm = 0; tm < 4; ++tm)
-                                        for (uint tn = 0; tn < 4; ++tn)
-                                            acc[tm][r] += wt[tm][tn] * xv[tn];
+                                    for (uint ro = 0; ro < 4; ++ro)
+                                        for (uint co = 0; co < 4; ++co)
+                                            acc[ro][r] += wt[ro][co] * xv[co];
                                 }
                             }
                         }
                     }
                 }
                 if (active) {
-                    for (uint tm = 0; tm < 4; ++tm)
+                    for (uint ro = 0; ro < 4; ++ro)
                         for (uint r = 0; r < RCH; ++r) {
                             if (AFFINE && bits != 16) {
-                                acc[tm][r] = simd_sum(acc[tm][r]);
+                                acc[ro][r] = simd_sum(acc[ro][r]);
                             } else {
-                                for (ushort sn = 16; sn >= 1; sn >>= 1)
-                                    acc[tm][r] += simd_shuffle_down(acc[tm][r], sn);
+                                for (ushort hop = 16; hop != 0; hop /= 2)
+                                    acc[ro][r] += simd_shuffle_down(acc[ro][r], hop);
                             }
                         }
                     if (lane == 0) {
                         for (uint r = 0; r < RCH && rc + r < W; ++r) {
-                            for (uint tm = 0; tm < 4; ++tm) {
-                                const bfloat16_t y = static_cast<bfloat16_t>(acc[tm][r]);
+                            for (uint ro = 0; ro < 4; ++ro) {
+                                const bfloat16_t y = static_cast<bfloat16_t>(acc[ro][r]);
                                 if (kind == 3) {
-                                    gate[size_t(rc + r) * GN + m0 + tm] = y;
+                                    gate[size_t(rc + r) * GN + m0 + ro] = y;
                                 } else {
                                     const uint stride = kind == 0 ? OQ : OK;
-                                    outs[(rc + r) * stride + slot + tm] = static_cast<float>(y);
+                                    outs[(rc + r) * stride + slot + ro] = static_cast<float>(y);
                                 }
                             }
                         }
@@ -490,7 +490,7 @@ _PROJECT = """
     }
     for (uint blk = sg; !STAGE2 && blk < nblocks; blk += NSG) {
         uint m0;        // first matrix row of this block
-        uint slot;      // where row tm of the block lands in outs, per panel row
+        uint slot;      // where row ro of the block lands in outs, per panel row
         SELECT_BLOCK(blk);
         if (AFFINE && bits != 16) {
             // Affine-coded matrix: MLX's one-row product per panel row (see lane_total, lane_term).
@@ -499,15 +499,15 @@ _PROJECT = """
             const uint gpr = D / gsize;              // groups a row
             for (uint rc = 0; rc < W; rc += RCH) {
                 float acc[4][RCH];
-                for (uint tm = 0; tm < 4; ++tm)
-                    for (uint r = 0; r < RCH; ++r) acc[tm][r] = 0.0f;
+                for (uint ro = 0; ro < 4; ++ro)
+                    for (uint r = 0; r < RCH; ++r) acc[ro][r] = 0.0f;
                 for (uint b = 0; b < D / 256; ++b) {
                     const uint col = b * 256 + lane * 8;
                     float sc[4], bi[4], wf[4][8];
-                    for (uint tm = 0; tm < 4; ++tm) {
-                        sc[tm] = static_cast<float>(scl[size_t(m0 + tm) * gpr + col / gsize]);
-                        bi[tm] = static_cast<float>(bia[size_t(m0 + tm) * gpr + col / gsize]);
-                        lane_unpack(cw + size_t(m0 + tm) * wpr + col * bits / 32, wf[tm], bits);
+                    for (uint ro = 0; ro < 4; ++ro) {
+                        sc[ro] = static_cast<float>(scl[size_t(m0 + ro) * gpr + col / gsize]);
+                        bi[ro] = static_cast<float>(bia[size_t(m0 + ro) * gpr + col / gsize]);
+                        lane_unpack(cw + size_t(m0 + ro) * wpr + col * bits / 32, wf[ro], bits);
                     }
                     float gv0[4] = {0.0f, 0.0f, 0.0f, 0.0f}, gv1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                     GAINS4(col, gv0);
@@ -527,22 +527,22 @@ _PROJECT = """
                             } else {
                                 tot = lane_take(xv, xt, bits);
                             }
-                            for (uint tm = 0; tm < 4; ++tm)
-                                acc[tm][r] += lane_term(xt, wf[tm], sc[tm], bi[tm], tot, bits);
+                            for (uint ro = 0; ro < 4; ++ro)
+                                acc[ro][r] += lane_term(xt, wf[ro], sc[ro], bi[ro], tot, bits);
                         }
                     }
                 }
-                for (uint tm = 0; tm < 4; ++tm)
-                    for (uint r = 0; r < RCH; ++r) acc[tm][r] = simd_sum(acc[tm][r]);
+                for (uint ro = 0; ro < 4; ++ro)
+                    for (uint r = 0; r < RCH; ++r) acc[ro][r] = simd_sum(acc[ro][r]);
                 if (lane == 0) {
                     for (uint r = 0; r < RCH && rc + r < W; ++r) {
-                        for (uint tm = 0; tm < 4; ++tm) {
-                            const bfloat16_t y = static_cast<bfloat16_t>(acc[tm][r]);
+                        for (uint ro = 0; ro < 4; ++ro) {
+                            const bfloat16_t y = static_cast<bfloat16_t>(acc[ro][r]);
                             if (kind == 3) {
-                                gate[size_t(rc + r) * GN + m0 + tm] = y;
+                                gate[size_t(rc + r) * GN + m0 + ro] = y;
                             } else {
                                 const uint stride = kind == 0 ? OQ : OK;
-                                outs[(rc + r) * stride + slot + tm] = static_cast<float>(y);
+                                outs[(rc + r) * stride + slot + ro] = static_cast<float>(y);
                             }
                         }
                     }
@@ -553,37 +553,37 @@ _PROJECT = """
         const device bfloat16_t* wrow = AS_BF16(mat) + size_t(m0) * D + lane * 4;
         for (uint rc = 0; rc < W; rc += RCH) {
             float acc[4][RCH];
-            for (uint tm = 0; tm < 4; ++tm)
-                for (uint r = 0; r < RCH; ++r) acc[tm][r] = 0.0f;
+            for (uint ro = 0; ro < 4; ++ro)
+                for (uint r = 0; r < RCH; ++r) acc[ro][r] = 0.0f;
             for (uint i = 0; i < STEPS; ++i) {
                 const uint col = i * 128 + lane * 4;
                 float wt[4][4];
-                for (uint tm = 0; tm < 4; ++tm) LOAD_BF16X4(wrow + size_t(tm) * D + i * 128, wt[tm]);
+                for (uint ro = 0; ro < 4; ++ro) LOAD_BF16X4(wrow + size_t(ro) * D + i * 128, wt[ro]);
                 float gv[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                 GAINS4(col, gv);
                 for (uint r = 0; r < RCH; ++r) {
                     if (rc + r < W) {
                         float xv[4];
                         FETCH4(rc + r, col, xv, gv);
-                        for (uint tm = 0; tm < 4; ++tm)
-                            for (uint tn = 0; tn < 4; ++tn)
-                                acc[tm][r] += wt[tm][tn] * xv[tn];
+                        for (uint ro = 0; ro < 4; ++ro)
+                            for (uint co = 0; co < 4; ++co)
+                                acc[ro][r] += wt[ro][co] * xv[co];
                     }
                 }
             }
-            for (uint tm = 0; tm < 4; ++tm)
+            for (uint ro = 0; ro < 4; ++ro)
                 for (uint r = 0; r < RCH; ++r)
-                    for (ushort sn = 16; sn >= 1; sn >>= 1)
-                        acc[tm][r] += simd_shuffle_down(acc[tm][r], sn);
+                    for (ushort hop = 16; hop != 0; hop /= 2)
+                        acc[ro][r] += simd_shuffle_down(acc[ro][r], hop);
             if (lane == 0) {
                 for (uint r = 0; r < RCH && rc + r < W; ++r) {
-                    for (uint tm = 0; tm < 4; ++tm) {
-                        const bfloat16_t y = static_cast<bfloat16_t>(acc[tm][r]);
+                    for (uint ro = 0; ro < 4; ++ro) {
+                        const bfloat16_t y = static_cast<bfloat16_t>(acc[ro][r]);
                         if (kind == 3) {
-                            gate[size_t(rc + r) * GN + m0 + tm] = y;
+                            gate[size_t(rc + r) * GN + m0 + ro] = y;
                         } else {
                             const uint stride = kind == 0 ? OQ : OK;
-                            outs[(rc + r) * stride + slot + tm] = static_cast<float>(y);
+                            outs[(rc + r) * stride + slot + ro] = static_cast<float>(y);
                         }
                     }
                 }
@@ -602,16 +602,16 @@ _PROJECT = """
             float total[4][RCH];
             for (uint v = 0; v < 8; ++v) {
                 float p[4][RCH];
-                for (uint tm = 0; tm < 4; ++tm)
-                    for (uint r = 0; r < RCH; ++r) p[tm][r] = 0.0f;
+                for (uint ro = 0; ro < 4; ++ro)
+                    for (uint r = 0; r < RCH; ++r) p[ro][r] = 0.0f;
                 for (uint b = 0; b <= FULL; ++b) {
                     const uint col = b * 1024 + v * 128 + lane * 4;
                     if (b == FULL && D == FULL * 1024) break;      // no leftover block
-                    for (uint tm = 0; tm < 4; ++tm) {
-                        if (tm >= nr) break;
+                    for (uint ro = 0; ro < 4; ++ro) {
+                        if (ro >= nr) break;
                         float wt[4];
-                        for (uint tn = 0; tn < 4; ++tn)
-                            wt[tn] = (col + tn < D) ? static_cast<float>(bm[size_t(b0 + tm) * D + col + tn]) : 0.0f;
+                        for (uint co = 0; co < 4; ++co)
+                            wt[co] = (col + co < D) ? static_cast<float>(bm[size_t(b0 + ro) * D + col + co]) : 0.0f;
                         for (uint r = 0; r < RCH; ++r) {
                             if (rc + r < W) {
                                 float xv[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -620,25 +620,25 @@ _PROJECT = """
                                     GAINS4(col, gv);
                                     FETCH4(rc + r, col, xv, gv);
                                 }
-                                for (uint tn = 0; tn < 4; ++tn) p[tm][r] += wt[tn] * xv[tn];
+                                for (uint co = 0; co < 4; ++co) p[ro][r] += wt[co] * xv[co];
                             }
                         }
                     }
                 }
-                for (uint tm = 0; tm < 4; ++tm)
+                for (uint ro = 0; ro < 4; ++ro)
                     for (uint r = 0; r < RCH; ++r)
-                        for (ushort sn = 16; sn >= 1; sn >>= 1)
-                            p[tm][r] += simd_shuffle_down(p[tm][r], sn);
-                for (uint tm = 0; tm < 4; ++tm)
+                        for (ushort hop = 16; hop != 0; hop /= 2)
+                            p[ro][r] += simd_shuffle_down(p[ro][r], hop);
+                for (uint ro = 0; ro < 4; ++ro)
                     for (uint r = 0; r < RCH; ++r)
-                        total[tm][r] = (v == 0) ? p[tm][r] : total[tm][r] + p[tm][r];
+                        total[ro][r] = (v == 0) ? p[ro][r] : total[ro][r] + p[ro][r];
             }
             if (lane == 0) {
                 for (uint r = 0; r < RCH && rc + r < W; ++r) {
-                    for (uint tm = 0; tm < nr; ++tm) {
-                        const float y = static_cast<float>(static_cast<bfloat16_t>(total[tm][r]));
+                    for (uint ro = 0; ro < nr; ++ro) {
+                        const float y = static_cast<float>(static_cast<bfloat16_t>(total[ro][r]));
                         if (bn8_sink) outs[(rc + r) * OQ + HD + RD] = y;
-                        else outs[(rc + r) * OK + HD + tm] = y;
+                        else outs[(rc + r) * OK + HD + ro] = y;
                     }
                 }
             }

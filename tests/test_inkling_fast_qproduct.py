@@ -58,7 +58,7 @@ def test_device_function_gives_the_same_bits(tm):
     m = _Affine(2304, 3072, 4, 64, seed=11)
     assert qmv_constants(m) == {"K": 3072, "BITS": 4, "GROUP": 64, "VPT": 16}
     x = mx.random.normal((5, 3072), key=mx.random.key(3)).astype(mx.bfloat16)
-    got = qmv_rows_probe(x, m, tm=tm)
+    got = qmv_rows_probe(x, m, rows_each=tm)
     for r in range(5):
         assert _bits(got[r:r + 1], m.one_row(x[r:r + 1])), r
 

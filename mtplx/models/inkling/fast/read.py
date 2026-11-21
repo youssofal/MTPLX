@@ -123,8 +123,8 @@ _READ = """
     for (uint s = 0; s < S; ++s) {
         float acc = 0;
         for (uint i = 0; i < 4; ++i) {
-            const float xi = in_row ? SOURCE(s, r, c4 + i) : 0.0f;
-            acc += xi * xi;
+            const float xval = in_row ? SOURCE(s, r, c4 + i) : 0.0f;
+            acc += xval * xval;
         }
         acc = simd_sum(acc);
         if (lane == 0) sums[s][sg] = acc;
@@ -160,22 +160,22 @@ _READ = """
                 const float is = inv[s];
                 float p = 0.0f;
                 for (uint b = 0; b < FULL; ++b) {
-                    for (uint tn = 0; tn < 4; ++tn) {
-                        const uint c = b * 1024 + sg * 128 + lane * 4 + tn;
+                    for (uint co = 0; co < 4; ++co) {
+                        const uint c = b * 1024 + sg * 128 + lane * 4 + co;
                         const float key = 1.0f * (SOURCE(s, r, c) * is);
                         p += key * queries[qi * D + c];
                     }
                 }
                 if (LEFT > 0) {
                     const uint c0_ = FULL * 1024 + sg * 128 + lane * 4;
-                    for (uint tn = 0; tn < 4; ++tn) {
-                        const uint c = c0_ + tn;
+                    for (uint co = 0; co < 4; ++co) {
+                        const uint c = c0_ + co;
                         const float key = (c < D) ? 1.0f * (SOURCE(s, r, c) * is) : 0.0f;
                         const float qv = (c < D) ? queries[qi * D + c] : 0.0f;
                         p += key * qv;
                     }
                 }
-                for (ushort sn = 16; sn >= 1; sn >>= 1) p += simd_shuffle_down(p, sn);
+                for (ushort hop = 16; hop != 0; hop /= 2) p += simd_shuffle_down(p, hop);
                 if (lane == 0) dots[(qi - q_first) * S + s][sg] = p;
             }
         }
@@ -281,11 +281,11 @@ _READ = """
         if (sg == 0 && lane >= NSG) { sums[S][lane] = 0.0f; sums[S + 1][lane] = 0.0f; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0) {
-            const float tx = simd_sum(sums[S][lane]);
-            const float tm = simd_sum(sums[S + 1][lane]);
+            const float sum_x = simd_sum(sums[S][lane]);
+            const float sum_m = simd_sum(sums[S + 1][lane]);
             if (lane == 0) {
-                inv[S] = metal::precise::rsqrt(tx / float(D) + as_type<float>(uint(EPS)));
-                inv[S + 1] = metal::precise::rsqrt(tm / float(D) + as_type<float>(uint(EPS)));
+                inv[S] = metal::precise::rsqrt(sum_x / float(D) + as_type<float>(uint(EPS)));
+                inv[S + 1] = metal::precise::rsqrt(sum_m / float(D) + as_type<float>(uint(EPS)));
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -317,31 +317,31 @@ _READ = """
         for (uint b = 0; b < FULL2; ++b) {
             const uint c = b * 1024 + v * 128 + lane * 4;
             float xv[4];
-            for (uint tn = 0; tn < 4; ++tn) xv[tn] = static_cast<float>(mixed[c + tn]);
-            for (uint tm = 0; tm < 4; ++tm)
-                for (uint tn = 0; tn < 4; ++tn)
-                    p[tm] += static_cast<float>(dw[size_t(row0 + tm) * K2 + c + tn]) * xv[tn];
+            for (uint co = 0; co < 4; ++co) xv[co] = static_cast<float>(mixed[c + co]);
+            for (uint ro = 0; ro < 4; ++ro)
+                for (uint co = 0; co < 4; ++co)
+                    p[ro] += static_cast<float>(dw[size_t(row0 + ro) * K2 + c + co]) * xv[co];
         }
         if (LEFT2 > 0) {
             const uint c = FULL2 * 1024 + v * 128 + lane * 4;
             float xv[4];
-            for (uint tn = 0; tn < 4; ++tn) xv[tn] = (c + tn < K2) ? static_cast<float>(mixed[c + tn]) : 0.0f;
-            for (uint tm = 0; tm < 4; ++tm)
-                for (uint tn = 0; tn < 4; ++tn) {
-                    const float w = (c + tn < K2) ? static_cast<float>(dw[size_t(row0 + tm) * K2 + c + tn]) : 0.0f;
-                    p[tm] += w * xv[tn];
+            for (uint co = 0; co < 4; ++co) xv[co] = (c + co < K2) ? static_cast<float>(mixed[c + co]) : 0.0f;
+            for (uint ro = 0; ro < 4; ++ro)
+                for (uint co = 0; co < 4; ++co) {
+                    const float w = (c + co < K2) ? static_cast<float>(dw[size_t(row0 + ro) * K2 + c + co]) : 0.0f;
+                    p[ro] += w * xv[co];
                 }
         }
-        for (uint tm = 0; tm < 4; ++tm)
-            for (ushort sn = 16; sn >= 1; sn >>= 1) p[tm] += simd_shuffle_down(p[tm], sn);
+        for (uint ro = 0; ro < 4; ++ro)
+            for (ushort hop = 16; hop != 0; hop /= 2) p[ro] += simd_shuffle_down(p[ro], hop);
         if (lane == 0)
-            for (uint tm = 0; tm < 4; ++tm) down_part[blk][v][tm] = p[tm];
+            for (uint ro = 0; ro < 4; ++ro) down_part[blk][v][ro] = p[ro];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (t < DROWS) {
-        const uint blk = t / 4, tm = t % 4;
-        float total = down_part[blk][0][tm];
-        for (uint v = 1; v < 8; ++v) total += down_part[blk][v][tm];
+        const uint blk = t / 4, ro = t % 4;
+        float total = down_part[blk][0][ro];
+        for (uint v = 1; v < 8; ++v) total += down_part[blk][v][ro];
         o0[(size_t(r) * NC + ctrl) * 64 + chunk * DROWS + t] =
             static_cast<OUT0>(static_cast<float>(static_cast<bfloat16_t>(total)));
     }
@@ -399,40 +399,40 @@ _MIX = """
     const uint col0 = (g % SLICES) * 128;
     threadgroup float fg[2][RC][128];
 
-    const uint thrM = lane / 4, thrN = lane % 4;
+    const uint lane_row = lane / 4, lane_col = lane % 4;
     const bool gain_rows = sg >= 4;
-    const uint row0 = col0 + (sg % 4) * 32 + thrM * 4;
+    const uint row0 = col0 + (sg % 4) * 32 + lane_row * 4;
     const device float* fw32 = ctrl == 0 ? f0 : (ctrl == 1 ? f1 : f2);
     const device float* gw32 = ctrl == 0 ? h0 : (ctrl == 1 ? h1 : h2);
     const device float* mat = gain_rows ? gw32 : fw32;
 
     for (uint rc = 0; rc < W; rc += RC) {
-        // MLX gemv sm8 sn4 (K = 64): a simdgroup covers 32 rows, lane (thrM, thrN) rows 4 thrM..+3,
-        // columns 16 i + 4 thrN + tn; then shuffles by 2 and 1 across thrN.
+        // MLX gemv sm8 sn4 (K = 64): a simdgroup covers 32 rows, lane (lane_row, lane_col) rows 4 lane_row..+3,
+        // columns 16 i + 4 lane_col + co; then shuffles by 2 and 1 across lane_col.
         float acc[4][RC];
-        for (uint tm = 0; tm < 4; ++tm)
-            for (uint rr = 0; rr < RC; ++rr) acc[tm][rr] = 0.0f;
+        for (uint ro = 0; ro < 4; ++ro)
+            for (uint rr = 0; rr < RC; ++rr) acc[ro][rr] = 0.0f;
         for (uint i = 0; i < 4; ++i) {
-            const uint c = 16 * i + 4 * thrN;
+            const uint c = 16 * i + 4 * lane_col;
             float wt[4][4];
-            for (uint tm = 0; tm < 4; ++tm)
-                for (uint tn = 0; tn < 4; ++tn) wt[tm][tn] = mat[size_t(row0 + tm) * 64 + c + tn];
+            for (uint ro = 0; ro < 4; ++ro)
+                for (uint co = 0; co < 4; ++co) wt[ro][co] = mat[size_t(row0 + ro) * 64 + c + co];
             for (uint rr = 0; rr < RC; ++rr) {
                 if (rc + rr < W) {
                     float sv[4];
-                    for (uint tn = 0; tn < 4; ++tn) sv[tn] = state[(size_t(rc + rr) * NC + ctrl) * 64 + c + tn];
-                    for (uint tm = 0; tm < 4; ++tm)
-                        for (uint tn = 0; tn < 4; ++tn) acc[tm][rr] += wt[tm][tn] * sv[tn];
+                    for (uint co = 0; co < 4; ++co) sv[co] = state[(size_t(rc + rr) * NC + ctrl) * 64 + c + co];
+                    for (uint ro = 0; ro < 4; ++ro)
+                        for (uint co = 0; co < 4; ++co) acc[ro][rr] += wt[ro][co] * sv[co];
                 }
             }
         }
-        for (uint tm = 0; tm < 4; ++tm)
+        for (uint ro = 0; ro < 4; ++ro)
             for (uint rr = 0; rr < RC; ++rr)
-                for (ushort sn = 2; sn >= 1; sn >>= 1) acc[tm][rr] += simd_shuffle_down(acc[tm][rr], sn);
-        if (thrN == 0)
-            for (uint tm = 0; tm < 4; ++tm)
+                for (ushort hop = 2; hop != 0; hop /= 2) acc[ro][rr] += simd_shuffle_down(acc[ro][rr], hop);
+        if (lane_col == 0)
+            for (uint ro = 0; ro < 4; ++ro)
                 for (uint rr = 0; rr < RC; ++rr)
-                    fg[gain_rows ? 1 : 0][rr][(sg % 4) * 32 + thrM * 4 + tm] = acc[tm][rr];
+                    fg[gain_rows ? 1 : 0][rr][(sg % 4) * 32 + lane_row * 4 + ro] = acc[ro][rr];
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // (1 - tanh(f)) * x + tanh(g) * message, each operation rounded on its own as RC6's launches are.

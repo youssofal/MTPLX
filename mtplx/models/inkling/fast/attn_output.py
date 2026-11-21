@@ -38,48 +38,51 @@ import mlx.core as mx
 from .attend import MAX_ROWS
 
 _SOURCE = """
-    const int tg = int(threadgroup_position_in_grid.x);
+    const int group = int(threadgroup_position_in_grid.x);
     const int sg = int(simdgroup_index_in_threadgroup);
     const int lane = int(thread_index_in_simdgroup);
-    const int in_size = int(wo_shape[1]);          // 3072
-    const int out_size = int(wo_shape[0]);         // 2304
-    const int out_row = tg * 16 + sg * 4;          // blockM = 16, TM = 4
-    const device T* mat = wo + size_t(out_row) * wo_strides[0];
-    const size_t ld = wo_strides[0];
+    const int hidden = int(wo_shape[1]);           // 3072 gated values a row
+    const int width = int(wo_shape[0]);            // 2304 outputs
+    const int first = group * 16 + sg * 4;         // this simdgroup's four outputs
+    const size_t pitch = wo_strides[0];
+    const device T* weights = wo + size_t(first) * pitch;
 
-    // MLX gemv: thread-local accumulation over blocks of 128 inputs, 4 a lane.
-    float result[W][4];
+    // The projection of every panel row at once. A lane holds four consecutive gated values of
+    // each 128-wide span and walks the spans in order; a sum starts at zero and takes one product
+    // a statement, so each row repeats the one-row product's sequence while every weight is read
+    // once for the whole panel.
+    float sum[W][4];
     for (int w = 0; w < W; ++w) {
-        for (int tm = 0; tm < 4; ++tm) {
-            result[w][tm] = 0;
+        for (int o = 0; o < 4; ++o) {
+            sum[w][o] = 0;
         }
     }
-    const int n_iter = in_size / 128;
-    int bn = 4 * lane;
-    for (int i = 0; i < n_iter; ++i) {
-        float v_coeff[W][4];
+    for (int span = 0; span < hidden / 128; ++span) {
+        const int col = span * 128 + 4 * lane;
+        float gated[W][4];
         for (int w = 0; w < W; ++w) {
-            for (int tn = 0; tn < 4; ++tn) {
-                v_coeff[w][tn] = static_cast<float>(hg[w * hg_strides[1] + bn + tn]);
+            for (int k = 0; k < 4; ++k) {
+                gated[w][k] = static_cast<float>(hg[w * hg_strides[1] + col + k]);
             }
         }
-        for (int tm = 0; tm < 4; ++tm) {
-            T inter[4];
-            for (int tn = 0; tn < 4; ++tn) {
-                inter[tn] = mat[tm * ld + bn + tn];
+        for (int o = 0; o < 4; ++o) {
+            T wt[4];
+            for (int k = 0; k < 4; ++k) {
+                wt[k] = weights[o * pitch + col + k];
             }
             for (int w = 0; w < W; ++w) {
-                for (int tn = 0; tn < 4; ++tn) {
-                    result[w][tm] += inter[tn] * v_coeff[w][tn];
+                for (int k = 0; k < 4; ++k) {
+                    sum[w][o] += wt[k] * gated[w][k];
                 }
             }
         }
-        bn += 128;
     }
+    // The 32 lanes' sums meet in lane 0 by halving: a lane adds the lane 16 above it, then 8, 4,
+    // 2 and 1.
     for (int w = 0; w < W; ++w) {
-        for (int tm = 0; tm < 4; ++tm) {
-            for (ushort sn = 16; sn >= 1; sn >>= 1) {
-                result[w][tm] += simd_shuffle_down(result[w][tm], sn);
+        for (int o = 0; o < 4; ++o) {
+            for (ushort hop = 16; hop != 0; hop /= 2) {
+                sum[w][o] += simd_shuffle_down(sum[w][o], hop);
             }
         }
     }
@@ -87,21 +90,21 @@ _SOURCE = """
         return;
     }
     const float divisor = as_type<float>(uint(DIVISOR));
-    for (int tm = 0; tm < 4; ++tm) {
-        const int c = out_row + tm;
+    for (int o = 0; o < 4; ++o) {
+        const int c = first + o;
         float hist[W + 3];
         for (int t = 0; t < 3; ++t) {
             hist[t] = tail[t * tail_strides[1] + c * tail_strides[2]];
         }
         for (int w = 0; w < W; ++w) {
-            hist[3 + w] = static_cast<float>(static_cast<T>(result[w][tm]));
+            hist[3 + w] = static_cast<float>(static_cast<T>(sum[w][o]));
         }
         const float w0 = cw[0 * cw_strides[0] + c * cw_strides[1]];
         const float w1 = cw[1 * cw_strides[0] + c * cw_strides[1]];
         const float w2 = cw[2 * cw_strides[0] + c * cw_strides[1]];
         const float w3 = cw[3 * cw_strides[0] + c * cw_strides[1]];
         for (int w = 0; w < W; ++w) {
-            const size_t at = size_t(w) * size_t(out_size) + size_t(c);
+            const size_t at = size_t(w) * size_t(width) + size_t(c);
             rows[at] = hist[3 + w];
             float acc = 0.0f;
             acc += hist[w + 0] * w0;
