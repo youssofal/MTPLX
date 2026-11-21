@@ -170,7 +170,11 @@ _STATS = r"""
     }
 """
 
-# Reduce one row's chunk stats to (max, lse), by one fixed tree over a whole threadgroup.
+# Reduce one row's chunk stats to (max, log-sum), by one fixed tree over a whole threadgroup.
+# The log-sum is log(sum exp(y - max)), kept apart from the maximum: a log-probability is
+# (y - max) - logsum, never y - (max + logsum). At a large scale (a small temperature) the
+# maximum dwarfs the log-sum and float32 would round max + logsum back to max, turning a
+# 50% token into a certain one (review 1, finding 4).
 _ROW_LSE = r"""
 template <typename P>
 inline float2 l4_row_lse(P stats, uint row, uint C, uint tid,
@@ -188,8 +192,8 @@ inline float2 l4_row_lse(P stats, uint row, uint C, uint tid,
     float2 total = scratch[0];
     for (uint g = 1; g < L4_THREADS / 32; ++g) total = l4_lse_merge(total, scratch[g]);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    // (max, log-sum-exp); a non-finite max propagates as a non-finite lse
-    return float2(total.x, total.x + metal::log(total.y));
+    // (max, log-sum relative to it); a non-finite max propagates through total.y
+    return float2(total.x, metal::log(total.y));
 }
 """
 
@@ -239,11 +243,11 @@ _RACE = r"""
         if (GREEDY) continue;
         float kr = -INFINITY;
         if (residual) {
-            float lp = yt - t.y;
-            float lq = dlaw[row * V + j] - d.y;
+            float lp = (yt - t.x) - t.y;
+            float lq = (dlaw[row * V + j] - d.x) - d.y;
             if (lq < lp) kr = lp + metal::log(-l4_expm1(lq - lp)) - g;
         } else if (mode == 2 && row < K) {
-            if (int(j) != proposal) kr = (yt - t.y) - g;
+            if (int(j) != proposal) kr = ((yt - t.x) - t.y) - g;
         }
         if (kr > -INFINITY && l4_better(kr, int(j), best_r, idx_r)) { best_r = kr; idx_r = int(j); }
     }
@@ -324,8 +328,8 @@ _DECIDE = r"""
         if (lane == 0) {
             win_r[sg] = w.x;
             win_p[sg] = w.y;
-            float tmax = lse[sg * 4 + 0], tl = lse[sg * 4 + 1];
-            bad[sg] = (metal::isfinite(tmax) && metal::isfinite(tl)) ? 0 : 1;
+            float tmax = lse[sg * 4 + 0], tls = lse[sg * 4 + 1];
+            bad[sg] = (metal::isfinite(tmax) && metal::isfinite(tls)) ? 0 : 1;
             accept[sg] = 0;
             aprob[sg] = 0.0f;
             if (sg < K) {
@@ -337,14 +341,14 @@ _DECIDE = r"""
                 } else if (MATCH) {
                     // seed-match: the target draws its own token; a proposal survives on equality
                     accept[sg] = (x == w.y) ? 1 : 0;
-                    aprob[sg] = (x >= 0 && uint(x) < V) ? metal::exp(tlaw[sg * V + uint(x)] - tl) : 0.0f;
+                    aprob[sg] = (x >= 0 && uint(x) < V) ? metal::exp((tlaw[sg * V + uint(x)] - tmax) - tls) : 0.0f;
                 } else if (x >= 0 && uint(x) < V) {
-                    float lp = tlaw[sg * V + uint(x)] - tl;
+                    float lp = (tlaw[sg * V + uint(x)] - tmax) - tls;
                     float lq = 0.0f;
                     if (mode == 1) {
-                        float dl = lse[sg * 4 + 3];
-                        if (!metal::isfinite(dl)) bad[sg] = 1;
-                        lq = dlaw[sg * V + uint(x)] - dl;
+                        float dmax = lse[sg * 4 + 2], dls = lse[sg * 4 + 3];
+                        if (!(metal::isfinite(dmax) && metal::isfinite(dls))) bad[sg] = 1;
+                        lq = (dlaw[sg * V + uint(x)] - dmax) - dls;
                     }
                     float diff = lp - lq;          // log(p/q)
                     aprob[sg] = diff >= 0.0f ? 1.0f : metal::exp(diff);
@@ -558,6 +562,33 @@ def decide(target_logits, proposals, *, position, seed, temperature=1.0, draft=N
     return packet
 
 
+def commit_count(packet, rows, *, stops, remaining):
+    """The generation loop's walk over a packet, as device data (pure, lazy, no host read).
+
+    For a round whose commit runs before the host reads the packet (the whole round as one
+    program): ``stops`` the request's stop ids ((S,) int32 array or a list; request constant),
+    ``remaining`` the tokens the request may still emit (max_tokens - len(tokens), at least 1;
+    an int or a uint32 array). Returns (kept, emitted) as uint32 scalars:
+    ``emitted = min(n + 1, remaining, first stop + 1)`` tokens of the packet, with ``n`` the
+    accepted proposals, and ``kept = 1 + min(n, emitted)`` verify rows to commit (the anchor
+    and the emitted proposals), exactly what the loop computes after reading the packet.
+    The next round's anchor is pending when ``emitted == n + 1``. Cancellation and the
+    opt-in repetition guard stay host decisions (see ``lanes/L4.md``, "For L7 and L0").
+    """
+    n = packet[0].astype(mx.int32)
+    tokens = packet[2 : 2 + rows]
+    index = mx.arange(rows, dtype=mx.int32)
+    if not isinstance(stops, mx.array):
+        stops = mx.array([int(t) for t in stops] or [-2], mx.int32)
+    hit = mx.any(tokens[:, None] == stops.astype(mx.int32)[None, :], axis=1) & (index <= n)
+    first = mx.where(mx.any(hit), mx.argmax(hit.astype(mx.int32)), rows)
+    if not isinstance(remaining, mx.array):
+        remaining = mx.array(int(remaining), mx.int32)
+    emitted = mx.minimum(mx.minimum(n + 1, remaining.astype(mx.int32).reshape(())), first + 1)
+    kept = 1 + mx.minimum(n, emitted)
+    return kept.astype(mx.uint32), emitted.astype(mx.uint32)
+
+
 def winners(race_parts):
     """The p-race winner of every row: (R,) int32."""
     rows, chunks, _ = race_parts.shape
@@ -574,7 +605,8 @@ def winners(race_parts):
 
 def sample_rows(law, stats, *, positions, seed, purpose, greedy=False):
     """One independent draw per law row (row r at ``positions[r]``): (R,) int32 and the
-    per-row (max, lse) the draw used, (R, 4) float32 with columns [max, lse, 0, 0]."""
+    per-row (max, log-sum) the draw used, (R, 4) float32 with columns [max, log-sum, 0, 0];
+    the log-probability of token j is ``(law[j] - max) - logsum``."""
     rows = law.shape[0]
     modes = mx.zeros((rows,), mx.int32)
     seed_words = seed if isinstance(seed, mx.array) else _seed_words(seed)
@@ -584,7 +616,19 @@ def sample_rows(law, stats, *, positions, seed, purpose, greedy=False):
 
 
 def draw(target_logits, *, position, seed, temperature=1.0):
-    """Draw one token per row from the target law (plain decode, first token): (W,) int32.
+    """The tokens of ``draw_checked`` alone, (W,) int32: kept for callers that check the
+    rows themselves. The product's loop calls ``draw_checked`` and ``read_draw``, which
+    refuse a row that is not a law instead of streaming its meaningless token."""
+    return draw_checked(target_logits, position=position, seed=seed, temperature=temperature)[0]
+
+
+def draw_checked(target_logits, *, position, seed, temperature=1.0):
+    """Draw one token per row from the target law (plain decode, the first token after a
+    prefill or a restore): (2, W) int32, row 0 the tokens, row 1 each row's status
+    (``STATUS_OK``, or ``STATUS_NON_FINITE`` for a row with a NaN or no finite maximum,
+    whose token is meaningless). One read gives both; ``read_draw`` raises the product's
+    numerical error on a bad row, before the token is counted, streamed or banked
+    (review 1, finding 3).
 
     Row r is the token at absolute position ``position + r``.
     """
@@ -593,9 +637,29 @@ def draw(target_logits, *, position, seed, temperature=1.0):
     tlaw, tstats = law_rows(target_logits, temperature=None if greedy else temperature)
     base = position if isinstance(position, mx.array) else mx.array(int(position), mx.uint32)
     positions = base.astype(mx.uint32).reshape(()) + mx.arange(rows, dtype=mx.uint32)
-    tokens, _ = sample_rows(tlaw, tstats, positions=positions, seed=seed,
-                            purpose=PURPOSE_TARGET, greedy=greedy)
-    return tokens
+    tokens, stats = sample_rows(tlaw, tstats, positions=positions, seed=seed,
+                                purpose=PURPOSE_TARGET, greedy=greedy)
+    good = mx.isfinite(stats[:, 0]) & mx.isfinite(stats[:, 1])
+    status = mx.where(good, STATUS_OK, STATUS_NON_FINITE).astype(mx.int32)
+    return mx.stack([tokens.astype(mx.int32), status])
+
+
+def read_draw(drawn, rows=None, settle=None):
+    """The tokens of a ``draw_checked`` (one read), or the product's ``NonFiniteLogitsError``
+    when a row was not a law (``rows`` are the logits it drew from, for the error's census).
+    ``settle`` is the owner's eval (keeps the stall watchdog ticking)."""
+    if settle is not None:
+        settle(drawn)
+    values = np.asarray(drawn)
+    if values.ndim != 2 or values.shape[0] != 2:
+        raise ValueError("read_draw takes the (2, W) result of draw_checked")
+    if (values[1] != STATUS_OK).any():
+        from mtplx.sampling import non_finite_logits_error
+
+        bad = int(np.flatnonzero(values[1] != STATUS_OK)[0])
+        row = np.asarray(rows[bad].astype(mx.float32)) if rows is not None else np.array([np.nan])
+        raise non_finite_logits_error(row, "device draw")
+    return [int(t) for t in values[0]]
 
 
 def warm(vocab=4096):
@@ -636,6 +700,8 @@ def supported(sampler, *, constraint=None, draft_sampler=None):
     if getattr(sampler, "presence_penalty", 0) or getattr(sampler, "frequency_penalty", 0):
         return False, "penalties"
     temperature = float(getattr(sampler, "temperature", 1.0) or 0.0)
+    if not temperature_served(temperature):
+        return False, "temperature_range"
     if temperature > 0 and (float(getattr(sampler, "top_p", 1.0)) < 1.0
                             or int(getattr(sampler, "top_k", 0) or 0) > 0):
         return False, "filtered_sampler"
@@ -646,7 +712,20 @@ def supported(sampler, *, constraint=None, draft_sampler=None):
         or getattr(draft_sampler, "frequency_penalty", 0)
     ):
         return False, "filtered_draft_sampler"
+    if draft_sampler is not None and not temperature_served(float(getattr(draft_sampler, "temperature", 0.0) or 0.0)):
+        return False, "draft_temperature_range"
     return True, None
+
+
+#: Temperatures the device round serves besides 0 (greedy). Outside it the law rows' scale
+#: is so large that float32 spacing at the scaled maximum is a visible share of the gaps
+#: between logits, so those requests keep the host's float64 decision, counted.
+TEMPERATURE_RANGE = (0.05, 2.0)
+
+
+def temperature_served(temperature):
+    t = float(temperature or 0.0)
+    return t <= 0.0 or TEMPERATURE_RANGE[0] <= t <= TEMPERATURE_RANGE[1]
 
 
 @dataclass(frozen=True)

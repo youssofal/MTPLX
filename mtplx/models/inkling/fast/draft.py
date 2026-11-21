@@ -114,7 +114,7 @@ def propose(drafter, target, anchor, cache, count, *, position, seed, temperatur
         laws.append(law)
         stats.append(st)
         if not greedy:
-            confidence.append(mx.take_along_axis(law, token[:, None], axis=1)[:, 0] - lse[:, 1])
+            confidence.append((mx.take_along_axis(law, token[:, None], axis=1)[:, 0] - lse[:, 0]) - lse[:, 1])
     ids = mx.concatenate(picks)
     law = rnd.DraftLaw(mx.concatenate(laws), mx.concatenate(stats), point_mass=greedy,
                        log_q=mx.concatenate(confidence) if confidence else None)
@@ -136,6 +136,12 @@ def choose_depth(log_q, cost_ms, *, edges=CONFIDENCE_EDGES, accept=CONFIDENCE_AC
     by its q_i(x_i); the count maximises expected tokens per ms with ``cost_ms[k]`` the
     round cost at k proposals. Pair it with ``round.decide(..., offered=k)`` on a panel of
     fixed width whose expensive per-row work is skipped past k (no host read either way).
+
+    Not wired into the round, and not to be: it chooses how many positions to offer after
+    seeing the tokens drawn there, which biases the output law (review 1: with target and
+    draft agreeing on A 0.9 / B 0.1 at the second position, A is emitted with probability
+    0.99). A depth rule may read only committed history (``DepthByYield`` does) or the
+    draft distribution at a position before its token is drawn.
     """
     conf = mx.exp(log_q.astype(mx.float32))
     bins = mx.sum(conf[:, None] >= mx.array(edges, mx.float32)[None, :], axis=1)
@@ -221,6 +227,17 @@ class DepthByYield:
         self.choices.append(best)
         return best
 
+    def follow(self, tokens):
+        """Move to the channel of the last protocol channel token in ``tokens``: the prompt
+        once at the start of a request (a generation prompt usually opens the reasoning
+        channel itself), then each round's emitted tokens."""
+        for token in reversed(tokens):
+            channel = CHANNELS.get(int(token))
+            if channel is not None:
+                self.channel = channel
+                break
+        return self.channel
+
     def observe(self, offered, accepted, tokens=()):
         """Record a round (``offered`` proposals, the first ``accepted`` kept), then follow
         the channel of the emitted tokens for the next choice."""
@@ -231,5 +248,4 @@ class DepthByYield:
         tested = min(offered, accepted + 1)
         self._hits[channel] = hits + accepted
         self._tries[channel] = tries + tested
-        for token in tokens:
-            self.channel = CHANNELS.get(int(token), self.channel)
+        self.follow(tokens)

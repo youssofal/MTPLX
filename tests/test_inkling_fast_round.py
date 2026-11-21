@@ -94,6 +94,78 @@ def test_reference_decision_law_matches_the_oracle_on_small_vocabulary():
     assert abs(accepted.mean() - (1 - tv)) < 5 * np.sqrt((1 - tv) * tv / draws) + 1e-3
 
 
+# ------------------------------------------------------------------ CPU: commit count, depth
+
+
+def _loop_walk(tokens, accepted, stops, remaining):
+    """The generation loop's walk over a decided packet (budget, stop), as the host runs it."""
+    emitted, kept = [], 1
+    for pos, token in enumerate(tokens):
+        if len(emitted) == remaining:
+            break
+        emitted.append(token)
+        if pos < accepted:
+            kept += 1
+        else:
+            break
+        if token in stops:
+            break
+    return kept, len(emitted)
+
+
+def test_commit_count_equals_the_loop_walk():
+    rng = np.random.default_rng(5)
+    with mx.stream(mx.cpu):
+        for case in range(3000):
+            rows = int(rng.integers(1, rnd.MAX_ROWS + 1))
+            k = rows - 1
+            n = int(rng.integers(0, k + 1))
+            emitted = [int(t) for t in rng.integers(0, 12, size=n + 1)]
+            packet = np.zeros(2 + rows + k, np.int32)
+            packet[0] = n
+            packet[2: 2 + rows] = emitted + [-1] * (rows - n - 1)
+            stops = [int(t) for t in rng.choice(12, size=int(rng.integers(0, 4)), replace=False)]
+            remaining = int(rng.integers(1, 10))
+            as_array = case % 2 == 0
+            kept, count = rnd.commit_count(
+                mx.array(packet), rows,
+                stops=mx.array(stops or [-2], mx.int32) if as_array else stops,
+                remaining=mx.array(remaining, mx.uint32) if as_array else remaining)
+            mx.eval(kept, count)
+            assert (int(kept), int(count)) == _loop_walk(emitted, n, set(stops), remaining), (
+                rows, n, emitted, stops, remaining)
+
+
+def test_depth_controller_follows_the_prompt_channel_and_is_deterministic():
+    from mtplx.models.inkling.fast import draft as fdraft
+
+    reasoning, tool = 200008, 200049
+    ctl = fdraft.DepthByYield(cost_ms=fdraft.RC6_COST_MS_2K)
+    assert ctl.follow([5, tool, 7, reasoning, 9, 11]) == "reasoning"
+    assert ctl.follow([1, 2, 3]) == "reasoning"  # no channel token: stays
+    assert ctl.rate() == pytest.approx(ctl.channel_prior["reasoning"])
+    # code in a tool call yields more than reasoning: the controller goes deeper there
+    shallow = ctl.choose()
+    ctl.follow([tool])
+    deep = ctl.choose()
+    assert deep > shallow
+    # a run of fully accepted rounds raises the depth; the budget caps it
+    for _ in range(8):
+        ctl.observe(deep, deep, [])
+    assert ctl.choose() == 7 and ctl.choose(remaining=3) == 2 and ctl.choose(remaining=1) == 0
+    # the same history gives the same choices
+    def replay():
+        c = fdraft.DepthByYield(cost_ms=fdraft.RC6_COST_MS_2K)
+        c.follow([reasoning])
+        out = []
+        for accepted in (0, 1, 3, 0, 7, 7, 2, 0, 1, 5):
+            k = c.choose()
+            out.append(k)
+            c.observe(k, min(accepted, k), [tool] if accepted == 7 else [])
+        return out
+    assert replay() == replay()
+
+
 # ------------------------------------------------------------------ device
 
 
@@ -145,9 +217,10 @@ def test_device_lse_matches_host(vocab):
                       purpose=rnd.PURPOSE_TARGET)
     y = np.tanh(x.astype(np.float64) / 30.0) * 30.0 / 0.7
     m = y.max(axis=1, keepdims=True)
-    want = (m + np.log(np.exp(y - m).sum(axis=1, keepdims=True)))[:, 0]
-    got = np.asarray(lse)[:, 1]
-    np.testing.assert_allclose(got, want, rtol=2e-6, atol=2e-5)
+    # columns: the row maximum and the log-sum relative to it, kept apart (review 1, finding 4)
+    got = np.asarray(lse)
+    np.testing.assert_allclose(got[:, 0], m[:, 0], rtol=2e-6, atol=2e-5)
+    np.testing.assert_allclose(got[:, 1], np.log(np.exp(y - m).sum(axis=1)), rtol=2e-6, atol=2e-6)
     np.testing.assert_allclose(np.asarray(law), y, rtol=2e-6, atol=2e-5)
 
 
@@ -157,14 +230,75 @@ def test_device_draw_matches_host_race():
     vocab = 200_058
     x = _rows(rng, 8, vocab)
     seed = 0x1234_5678_9ABC_DEF0
-    got = np.asarray(rnd.draw(mx.array(x), position=1000, seed=seed))
+    drawn = np.asarray(rnd.draw_checked(mx.array(x), position=1000, seed=seed))
+    assert drawn.shape == (2, 8) and (drawn[1] == rnd.STATUS_OK).all()
+    got = drawn[0]
+    np.testing.assert_array_equal(np.asarray(rnd.draw(mx.array(x), position=1000, seed=seed)), got)
     for r in range(8):
         logs = rnd.log_exponentials_np(seed, 1000 + r, rnd.PURPOSE_TARGET, vocab)
         y = x[r].astype(np.float64)
         keys = (y - y.max()) - logs
         assert int(got[r]) == int(np.argmax(keys)), r
-    greedy = np.asarray(rnd.draw(mx.array(x), position=0, seed=seed, temperature=0))
-    np.testing.assert_array_equal(greedy, np.argmax(x, axis=1))
+    greedy = np.asarray(rnd.draw_checked(mx.array(x), position=0, seed=seed, temperature=0))
+    np.testing.assert_array_equal(greedy[0], np.argmax(x, axis=1))
+    assert rnd.read_draw(rnd.draw_checked(mx.array(x[:1]), position=3, seed=seed)) == [int(np.asarray(
+        rnd.draw(mx.array(x[:1]), position=3, seed=seed))[0])]
+
+
+@needs_gpu
+def test_device_draw_reports_rows_that_are_not_a_law():
+    """Review 1, finding 3: an all-NaN row, an all minus-infinity row, a single NaN or a +inf
+    must not stream a token; the status says so and read_draw raises the product's error."""
+    from mtplx.sampling import NonFiniteLogitsError
+
+    rng = np.random.default_rng(3)
+    vocab = 4096
+    good = rng.normal(size=vocab).astype(np.float32)
+    rows = np.stack([good, np.full(vocab, np.nan, np.float32), np.full(vocab, -np.inf, np.float32),
+                     good.copy(), good.copy(), good.copy()])
+    rows[3, 1234] = np.nan
+    rows[4, 7] = np.inf
+    rows[5, :4000] = -np.inf  # legitimate masking: still a law over the rest
+    for temperature in (1.0, 0.0):
+        drawn = np.asarray(rnd.draw_checked(mx.array(rows), position=10, seed=5, temperature=temperature))
+        np.testing.assert_array_equal(drawn[1], [0, 1, 1, 1, 1, 0])
+        assert 4000 <= drawn[0, 5] < vocab
+    with pytest.raises(NonFiniteLogitsError):
+        rnd.read_draw(rnd.draw_checked(mx.array(rows[1:2]), position=10, seed=5), rows=mx.array(rows[1:2]))
+    assert rnd.read_draw(rnd.draw_checked(mx.array(rows[:1]), position=10, seed=5)) == [
+        int(np.asarray(rnd.draw(mx.array(rows[:1]), position=10, seed=5))[0])]
+
+
+@needs_gpu
+def test_device_tiny_temperature_tie_keeps_half_the_mass():
+    """Review 1, finding 4, pinned against float64: two tied logits at temperature 1e-7 each
+    carry half the mass. With an absolute log normaliser float32 rounded 1e8 + log 2 to 1e8
+    and accepted a point-mass proposal for one of them with certainty."""
+    vocab = 4096
+    logits = np.full((2, vocab), -10.0, np.float32)
+    logits[:, 17] = 10.0
+    logits[:, 99] = 10.0
+    y = logits.astype(np.float64) / 1e-7
+    m = y.max(axis=1, keepdims=True)
+    p64 = np.exp(y - m) / np.exp(y - m).sum(axis=1, keepdims=True)
+    assert abs(p64[0, 17] - 0.5) < 1e-12
+    accepted, probs = 0, []
+    trials = 4000
+    for trial in range(trials):
+        packet = rnd.decide(mx.array(logits), mx.array([17], mx.int32), position=1000 + 3 * trial,
+                            seed=0xC0FFEE, temperature=1e-7)
+        decision = rnd.read_packet(packet, 2)
+        assert decision.status == rnd.STATUS_OK
+        accepted += decision.accepted
+        probs.append(decision.accept_probability[0])
+        if decision.accepted == 0:
+            assert decision.tokens == [99]  # the residual is the other tied token
+    assert abs(np.mean(probs) - p64[0, 17]) < 1e-6, np.mean(probs)
+    sigma = np.sqrt(0.25 / trials)
+    assert abs(accepted / trials - 0.5) < 5 * sigma, accepted / trials
+    # and the product does not serve such a temperature on the device in the first place
+    assert not rnd.temperature_served(1e-7) and not rnd.temperature_served(2.5)
+    assert all(rnd.temperature_served(t) for t in (0.0, 0.05, 0.6, 1.0, 2.0))
 
 
 def _panel(rng, k, vocab, closeness):
