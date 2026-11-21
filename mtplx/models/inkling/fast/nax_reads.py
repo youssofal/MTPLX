@@ -46,6 +46,8 @@ _VERDICT: dict = {}
 _PLAN: dict = {}
 #: Simdgroups of the launch.
 SIMDGROUPS = 8
+#: Score-product steps whose operands are read ahead of their multiply.
+AHEAD = 4
 #: Threadgroup memory the launch may take (the partials and the softmax weights), bytes.
 _TG_BYTES = 28 * 1024
 
@@ -139,14 +141,33 @@ _SCORES = """
             ka[i] = (av[i] ? n : 0) * D + uint(at[i].x);
             kb[i] = (bv[i] ? n + 16 : 0) * D + uint(at[i].x);
         }
-        for (uint k = k_lo; k < k_hi; k += 16) {
-            frag_t a, b0, b1;
+        // Operands read AHEAD steps before their multiply (a ring of fragments), the multiplies
+        // themselves in K order: the same multiplies on the same operands as the library's loop.
+        frag_t ra[AHEAD], rb0[AHEAD], rb1[AHEAD];
+        for (uint d = 0; d < AHEAD; ++d) {
+            const uint k = k_lo + 16 * d;
             for (short i = 0; i < 8; ++i) {
-                a[i] = qv[i] ? static_cast<float>(q[qa[i] + k]) : 0.0f;
-                b0[i] = av[i] ? keys[ka[i] + k] : 0.0f;
-                b1[i] = bv[i] ? keys[kb[i] + k] : 0.0f;
+                const bool in_k = k < k_hi;
+                ra[d][i] = (in_k && qv[i]) ? static_cast<float>(q[qa[i] + k]) : 0.0f;
+                rb0[d][i] = (in_k && av[i]) ? keys[ka[i] + k] : 0.0f;
+                rb1[d][i] = (in_k && bv[i]) ? keys[kb[i] + k] : 0.0f;
             }
-            Frag::mma(lo, hi, a, metal::bool_constant<false>{}, b0, b1, metal::bool_constant<true>{});
+        }
+        for (uint k0 = k_lo; k0 < k_hi; k0 += 16 * AHEAD) {
+            for (uint d = 0; d < AHEAD; ++d) {
+                const uint k = k0 + 16 * d;
+                if (k < k_hi) {
+                    Frag::mma(lo, hi, ra[d], metal::bool_constant<false>{}, rb0[d], rb1[d],
+                              metal::bool_constant<true>{});
+                    const uint kn = k + 16 * AHEAD;
+                    const bool in_k = kn < k_hi;
+                    for (short i = 0; i < 8; ++i) {
+                        ra[d][i] = (in_k && qv[i]) ? static_cast<float>(q[qa[i] + kn]) : 0.0f;
+                        rb0[d][i] = (in_k && av[i]) ? keys[ka[i] + kn] : 0.0f;
+                        rb1[d][i] = (in_k && bv[i]) ? keys[kb[i] + kn] : 0.0f;
+                    }
+                }
+            }
         }
         for (short i = 0; i < 8; ++i) {
             const uint m = qb * 16 + uint(at[i].y);
@@ -331,7 +352,7 @@ def _launch(q, keys, groups, partitions, size):
     items = visits * rows * (width // 32)
     template = [("V", visits), ("G", groups), ("S", count_), ("W", rows), ("D", width), ("NSG", SIMDGROUPS),
                 ("GB", 1), ("TILES", width // 32), ("ITEMS", items)]
-    scores = template + [("P", partitions), ("PS", size), ("SCALE", _f32_bits(width ** -0.5))]
+    scores = template + [("P", partitions), ("PS", size), ("SCALE", _f32_bits(width ** -0.5)), ("AHEAD", AHEAD)]
     tg = (SIMDGROUPS * 32, 1, 1)
     if items <= FUSED_ITEMS:
         return _kernel("fused")(inputs=[q, keys], template=scores, grid=tg, threadgroup=tg,
