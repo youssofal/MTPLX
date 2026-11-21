@@ -37,7 +37,8 @@ def _reference(q, hk, hv, ok, ov, valid):
     ],
 )
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-def test_draft_attention_equals_masked_attention(slots, ring, count, newest, dtype):
+@pytest.mark.parametrize("chunk", [None, 64, 128])
+def test_draft_attention_equals_masked_attention(slots, ring, count, newest, dtype, chunk):
     rows = 8
     keys = mx.random.split(mx.random.key(slots + count + rows), 5)
     q = mx.random.normal((1, HQ, rows, D), key=keys[0]).astype(dtype)
@@ -52,7 +53,7 @@ def test_draft_attention_equals_masked_attention(slots, ring, count, newest, dty
     else:
         valid = j < count_a
     want = np.array(_reference(q, hk, hv, ok, ov, valid).astype(mx.float32))
-    out = draft_attention(q, hk, hv, ok, ov, count_a, newest_a, ring=ring)
+    out = draft_attention(q, hk, hv, ok, ov, count_a, newest_a, ring=ring, chunk=chunk)
     assert out.dtype == dtype
     got = np.array(out.astype(mx.float32))
     assert got.shape == want.shape
@@ -82,3 +83,11 @@ def test_a_query_count_the_simdgroups_cannot_share_is_refused():
     own = mx.zeros((1, HK, 4, D), mx.bfloat16)
     with pytest.raises(ValueError):
         draft_attention(q, kv, kv, own, own, mx.array(10, mx.uint32), mx.array(9, mx.uint32), ring=True)
+
+
+def test_a_chunk_that_is_not_whole_tiles_is_refused():
+    q = mx.zeros((1, HQ, 8, D), mx.bfloat16)
+    kv = mx.zeros((1, HK, 1024, D), mx.bfloat16)
+    own = mx.zeros((1, HK, 8, D), mx.bfloat16)
+    with pytest.raises(ValueError):
+        draft_attention(q, kv, kv, own, own, mx.array(10, mx.uint32), mx.array(9, mx.uint32), ring=True, chunk=48)

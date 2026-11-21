@@ -327,8 +327,18 @@ _MERGE = """
     }
     out[((h * G + qv / R) * R + qv % R) * D + d] = static_cast<T>(o / lsum);
 """
-_CHUNK = 256
 _TILE = 32
+
+
+def _chunk(slots: int, ring: bool) -> int:
+    """History rows a threadgroup reads: 64 for a 1,024-slot ring (more threadgroups for a short
+    history), 128 for a bank up to 32K rows, then doubling so a bank never has more than 257
+    chunks (their float32 partials, 12 KiB a chunk and key head, stay under 26 MB at any context).
+    Engine profile, per block (`l7/receipts/draft-chunks-1.json`): ring 372 -> 223 us at 64 (MLX
+    334), bank 8K 728 -> 641 at 128 (MLX 1,303), bank 64K 1,692 at 256, 1,696 at 128 (MLX 3,076)."""
+    if ring:
+        return 64
+    return max(128, 1 << (max(int(slots) - 1, 1).bit_length() - 8))
 
 
 @lru_cache(maxsize=None)
@@ -348,7 +358,7 @@ def _attend_kernels():
     return partials, merge
 
 
-def draft_attention(q, keys, values, own_k, own_v, count, newest, *, ring: bool):
+def draft_attention(q, keys, values, own_k, own_v, count, newest, *, ring: bool, chunk: int | None = None):
     """Softmax attention of a drafter block: ``q`` (1, Hq, R, D) against the history ``keys``,
     ``values`` (1, Hk, S, D) (a ring when ``ring``, else a bank) and the block's own rows
     ``own_k``, ``own_v`` (1, Hk, R, D), scale ``D ** -0.5``. Float32 inside; bfloat16 or float16
@@ -360,8 +370,11 @@ def draft_attention(q, keys, values, own_k, own_v, count, newest, *, ring: bool)
     if (group * rows % 8 or dim % 32 or q.dtype not in (mx.bfloat16, mx.float16) or keys.dtype != q.dtype
             or values.dtype != q.dtype):
         raise ValueError("draft_attention: 8 simdgroups share the query vectors (bf16 or f16, D a multiple of 32)")
-    chunks = -(-slots // _CHUNK) + 1
-    template = [("T", q.dtype), ("G", group), ("R", rows), ("D", dim), ("S", slots), ("CHUNK", _CHUNK),
+    chunk = int(chunk or _chunk(slots, ring))
+    if chunk % _TILE:
+        raise ValueError("draft_attention: the chunk is a whole number of tiles")
+    chunks = -(-slots // chunk) + 1
+    template = [("T", q.dtype), ("G", group), ("R", rows), ("D", dim), ("S", slots), ("CHUNK", chunk),
                 ("TK", _TILE), ("QPS", qps), ("RING", bool(ring))]
     meta = mx.stack([count.astype(mx.uint32).reshape(()), newest.astype(mx.uint32).reshape(())])
     partials, merge = _attend_kernels()
