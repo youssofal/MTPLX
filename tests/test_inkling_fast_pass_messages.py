@@ -56,12 +56,55 @@ def test_every_visit_equals_its_own_read(rows, prior):
 
 
 @needs
-def test_rows_are_contiguous_slices_the_read_kernel_takes_whole():
+@pytest.mark.parametrize("rows", [1, 4, 8, 16])
+@pytest.mark.parametrize("prior", [2, 3])
+def test_the_pass_reads_take_one_launch(rows, prior, monkeypatch):
+    """By default a pass's twelve message reads are one launch (read.exact_read with the visits side by
+    side), proven against the library's two products around the softmax; on a GPU without matrix
+    units the read refuses (counted) and the library's launches give the rows."""
+    from mtplx.models.inkling.fast import library_gemm
+    from mtplx.models.inkling.fast import read as R
+    from mtplx.models.inkling.fast.attn_input import route_counts
+    from mtplx.models.inkling.fast.pass_messages import batched_rows
+
+    monkeypatch.delenv("MTPLX_INKLING_NAX_READS", raising=False)
+    stack, table = _operands(rows, prior, 20261122 + 7 * rows + prior)
+    whole = batched_rows(stack, table)
+    mx.eval(whole)
+    key = (4, prior, rows, D, VISITS)
+    tag = "exact_read_" + "_".join(map(str, key))
+    if library_gemm.gpu_generation() >= 17:
+        assert R._exact_verdicts.get(key) is True, f"the batched read was not proven: {route_counts()}"
+    else:
+        assert any(k.startswith("refused:exact_read_") and k.endswith(tag[len("exact_read_"):])
+                   for k in route_counts())
+
+
+@pytest.fixture
+def engine_module(monkeypatch):
+    """The native engine module named by ``INKLING_TEST_ENGINE`` (the suite drops ``MTPLX_*``
+    variables, so the module path comes in under another name), loaded for this test only."""
+    import os
+
+    from mtplx.engine import runtime
+
+    path = os.environ.get("INKLING_TEST_ENGINE", "").strip()
+    if not path:
+        pytest.skip("INKLING_TEST_ENGINE (the native engine module) not given")
+    monkeypatch.setenv("MTPLX_NATIVE_ENGINE_MODULE", path)
+    if not runtime.available():
+        monkeypatch.setattr(runtime, "_REASON", None)
+        monkeypatch.setattr(runtime, "_NATIVE", None)
+    if not runtime.available():
+        pytest.skip(f"the native engine module does not load: {runtime.unavailable()}")
+    return runtime.native_module()
+
+
+@needs
+def test_rows_are_contiguous_slices_the_read_kernel_takes_whole(engine_module):
     from mtplx.engine import runtime
     from mtplx.models.inkling.fast.pass_messages import batched_rows
 
-    if not runtime.available():
-        pytest.skip("the native engine module (it reads an array's layout flags) is not loaded")
     stack, table = _operands(4, 2, 7)
     whole = batched_rows(stack, table)
     mx.eval(whole)

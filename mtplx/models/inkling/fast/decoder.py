@@ -55,6 +55,26 @@ def stage_spec():
     return os.environ.get("MTPLX_INKLING_FAST_STAGES", DEFAULT_STAGES).strip().lower()
 
 
+def commit_async():
+    """The stock commit's graph handed to the GPU as soon as it is built (``mx.async_eval``), so it
+    runs under the host's work before the next round; ``MTPLX_INKLING_COMMIT_ASYNC=0`` leaves it to
+    the next round's first evaluation, as before."""
+    return os.environ.get("MTPLX_INKLING_COMMIT_ASYNC", "1").strip().lower() not in ("0", "off", "false", "no", "")
+
+
+def _arrays(tree):
+    """The arrays in a nest of lists and tuples (cache states hold None for empty slots)."""
+    out = []
+    stack = [tree]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, mx.array):
+            out.append(item)
+        elif isinstance(item, (list, tuple)):
+            stack.extend(item)
+    return out
+
+
 def round_commit_enabled():
     """The committing round (lane L7: the one-program round also writes the kept rows):
     off unless MTPLX_INKLING_ROUND_COMMIT=1. By default the program decides the round and
@@ -142,6 +162,11 @@ class FastDecoder:
         count("committed_rows", kept)
         if self.rt.drafter is not None:
             self.rt.drafter.observe([h[:, :kept] for h in features], cache[self.trunk:])
+        if commit_async():
+            # Lane F1: the commit's launches start now, under the host's work before the next
+            # round (the walk's bookkeeping, the stream, the next round's inputs), not when the
+            # next round first evaluates its inputs. The same graph, so the same bits.
+            mx.async_eval(pending.state.arrays(), _arrays([c.state for c in cache[self.trunk:]]))
 
     # ------------------------------------------------------------------ single token
     def forward_one(self, input_ids, cache, return_hidden, emit_logits, input_embeddings):

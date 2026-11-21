@@ -5,7 +5,7 @@ RC6 multiplies each visit's relative queries ``rel`` ``(1, W, 24, 16)`` bf16 by 
 single remainder step of the library's tile loop (K = 16, padded to its 32), accumulated in float32
 and stored as bf16. This launch issues the same two matrix-unit multiplies per 16 rows and 32
 columns (the installed MLX's own fragment layout and multiply-accumulate, ``steel/gemm/nax.h``,
-read from the installed package when the launch is built, as ``nax_reads.py`` does), with the same
+read from the installed package when the launch is built, ``library_gemm.library``), with the same
 zero padding and the same float32-to-bf16 store, so its outputs carry the library's bits; one
 simdgroup per (16-row block, 32-column tile).
 
@@ -21,7 +21,6 @@ from functools import lru_cache
 
 import mlx.core as mx
 
-from .nax_reads import library
 from .routes import count
 
 #: (rows, K, columns, basis dtype) -> True when the launch gives the library's bits on this Mac.
@@ -68,8 +67,17 @@ def enabled():
 
 
 @lru_cache(maxsize=1)
+def _library():
+    # The installed MLX's matrix-unit fragment and multiply (steel/gemm/nax.h, with the tile loop
+    # that includes it): library_gemm's reader, shared with the exact read.
+    from .library_gemm import library
+
+    return library("matrix_units")
+
+
+@lru_cache(maxsize=1)
 def _kernel():
-    text, _why = library()
+    text, _why = _library()
     return mx.fast.metal_kernel(name="mtplx_inkling_nax_profile", input_names=["rel", "basis"],
                                 output_names=["out"], source=_SOURCE,
                                 header=text + "\nusing namespace mlx::steel;\n")
@@ -105,8 +113,8 @@ def profile(rel, basis, stock):
         why = "dtype"
     elif basis.ndim != 2 or rel.shape[-1] != basis.shape[0] or basis.shape[0] > 32 or basis.shape[1] % 32:
         why = "shape"
-    elif library()[0] is None:
-        why = library()[1]
+    elif _library()[0] is None:
+        why = "library_text"
     if why is not None:
         count(f"fallback.nax_profile.{why}")
         return stock()

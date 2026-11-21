@@ -33,9 +33,6 @@ def _both(fn):
 @pytest.mark.parametrize("queries,sources", [(3, 2), (3, 5), (4, 1), (4, 2)])
 @pytest.mark.parametrize("rows", [1, 4, 8])
 def test_exact_read_equals_library_launches(queries, sources, rows, monkeypatch):
-    # This file proves read.exact_read; the other one-launch read (nax_reads, its own test file) would
-    # serve the depth read first.
-    monkeypatch.setenv("MTPLX_INKLING_NAX_READS", "0")
     mx.random.seed(17 * queries + 3 * sources + rows)
     q = mx.random.normal((queries, D)).astype(mx.float32)
     keys = mx.random.normal((1, rows, sources, D)).astype(mx.float32)

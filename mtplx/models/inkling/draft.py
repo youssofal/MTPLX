@@ -61,7 +61,15 @@ class DraftBlock(nn.Module):
             entry.offset += skip
             features = features[:, -self.window :]
         keys = self.normalize(self.heads(features, "k_ctx"), "self_attn.k_norm_ctx")
-        entry.update_and_fetch(self.rotate(keys, pos), self.heads(features, "v_ctx"))
+        keys, values = self.rotate(keys, pos), self.heads(features, "v_ctx")
+        if self.window and features.shape[1] > 1:
+            # Lane F1: several rows straight into the ring the next round rebuilds (the same
+            # arrays and counters, no host wait there); the generic path where it declines.
+            from .fast.draft_ring import observe_rows
+
+            if observe_rows(entry, keys, values):
+                return
+        entry.update_and_fetch(keys, values)
 
     def attend(self, x, entry):
         key, value = entry.state
