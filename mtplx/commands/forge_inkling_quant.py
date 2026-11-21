@@ -39,6 +39,7 @@ from .forge_inkling import (
     _copy_weight,
     stage_native_pack,
     verify_source,
+    vision_config_problem,
     write_pack_metadata,
 )
 
@@ -420,9 +421,10 @@ def audit_pack(pack: Path, source: Path) -> dict:
         matched += 1
     src_config = json.loads((source / "config.json").read_text())
     pack_config = json.loads((pack / "config.json").read_text())
-    vision_config_equal = src_config.get("vision_config") == pack_config.get("vision_config")
-    if not vision_config_equal:
-        problems.append("vision_config differs from upstream")
+    # Both must carry the pinned configuration: two missing values are not "equal" (Law 1, fail closed).
+    vision_problems = [p for p in (vision_config_problem(src_config, "source"), vision_config_problem(pack_config, "pack")) if p]
+    vision_config_equal = not vision_problems
+    problems.extend(vision_problems)
     with (pack / draft_name).open("rb") as handle:
         draft_sha = hashlib.file_digest(handle, "sha256").hexdigest()
     if draft_sha != WEIGHTS[draft_name]:

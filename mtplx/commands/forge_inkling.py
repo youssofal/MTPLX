@@ -16,6 +16,23 @@ WEIGHTS = {
     "model-00001-of-00001.safetensors": "65e60f51aa1284d4fb022584908c315270334d991828bb774af60584523539d1",
     "mtp.safetensors": "7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2",
 }
+# The publisher's vision configuration at REVISION (config.json "vision_config"). The loader builds the tower from it
+# (models/inkling/runtime.py), so a source or a pack without it, or with any other one, is never staged (Law 1).
+VISION_CONFIG = {
+    "adapter_merge_size": 2,
+    "hidden_size": 1024,
+    "layer_norm_eps": 1e-05,
+    "mlp_ratio": 4.0,
+    "model_type": "inkling2_vision",
+    "native_patch_size": 20,
+    "num_attention_heads": 16,
+    "num_hidden_layers": 23,
+    "posemb_grid_size": 32,
+    "projection_hidden_dim": 4096,
+    "projector_bias": False,
+    "temporal_patch_size": 2,
+    "text_hidden_size": 2304,
+}
 SIDECARS = (
     "config.json",
     "model.safetensors.index.json",
@@ -53,6 +70,17 @@ def _copy_weight(source: Path, destination: Path) -> None:
         shutil.copyfile(source, destination)
 
 
+def vision_config_problem(config: dict, where: str) -> str | None:
+    """Why ``config`` does not carry the publisher's pinned vision configuration, or None when it does."""
+    vision = config.get("vision_config")
+    if not isinstance(vision, dict):
+        return f"{where} config.json has no vision_config, so the vision tower cannot be built"
+    differ = sorted(k for k in set(vision) | set(VISION_CONFIG) if vision.get(k) != VISION_CONFIG.get(k))
+    if differ:
+        return f"{where} vision_config differs from {SOURCE} at {REVISION[:12]} in {differ}"
+    return None
+
+
 def verify_source(source: Path):
     config = json.loads((source / "config.json").read_text())
     if (
@@ -60,6 +88,10 @@ def verify_source(source: Path):
         or config["text_config"]["loop_config"]["is_varloop"]
     ):
         raise ValueError("Expected the fixed-depth Inkling 2 Mini release")
+    # Checked before any weight is read or any recipe stages a file (native Quality included).
+    problem = vision_config_problem(config, "source")
+    if problem:
+        raise ValueError(problem)
     target, draft = WEIGHTS
     header_size, header = _read_safetensors_header(source / target)
     _, draft_header = _read_safetensors_header(source / draft)

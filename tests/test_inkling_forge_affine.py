@@ -134,8 +134,10 @@ def test_audit_fails_closed_when_a_vision_tensor_changes(tmp_path, monkeypatch):
     tampered["model.visual.block1.weight"] = ("BF16", np.full((4, 4), 9, np.uint16))
     _safetensors(pack / "model-00001-of-00001.safetensors", tampered)
     (pack / "draft.safetensors").write_bytes((source / "draft.safetensors").read_bytes())
+    from mtplx.commands.forge_inkling import VISION_CONFIG
+
     for directory in (source, pack):
-        (directory / "config.json").write_text(json.dumps({"vision_config": {"depth": 3}}))
+        (directory / "config.json").write_text(json.dumps({"vision_config": VISION_CONFIG}))
     (pack / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": dict.fromkeys(vision, "model-00001-of-00001.safetensors")})
     )
