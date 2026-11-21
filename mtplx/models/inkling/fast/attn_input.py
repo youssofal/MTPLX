@@ -863,7 +863,7 @@ class Projected(NamedTuple):
 
 
 def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", threads=None, gate_rows=None,
-            stage=None, rch=None):
+            stage=None, rch=None, affsum=None, stage2=None):
     """Every projection of one visit and its epilogues, for a panel, in one launch.
 
     ``sources``: ``(W, NS, D)`` bf16 normed inputs (``NS`` 1: q = k = v input; 3: q, k, v
@@ -935,18 +935,31 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
         pos = pos.astype(mx.uint32)
     groups = q_heads + 2 * kv_heads + gate_rows // gate_rows_unit
     out_bytes = (head_dim + rel_dim + 1) * rows * 4
-    # 4-bit sums once per threadgroup (MLX's load_vector per row, block and lane) when they fit.
-    affsum = any(m.bits == 4 for m in (mq, mr, mg, mk, mv)) and rows <= 16
-    out_bytes += rows * (width // 256) * 32 * 4 if affsum else 0
     staging = _STAGE if stage is None else bool(stage)
+    affine = any(m.bits != 16 for m in (mq, mr, mg, mk, mv))
+    # 4-bit sums once per threadgroup (MLX's load_vector per row, block and lane) when they fit, and
+    # not when they alone keep the panel from staging whole: Bare Speed at 6 rows, loop pass 251 ->
+    # 61 µs, global passes 355 -> 95 (receipts/q4forms-1.json).
+    asum_bytes = rows * (width // 256) * 32 * 4
+    if affsum is None:
+        affsum = any(m.bits == 4 for m in (mq, mr, mg, mk, mv)) and rows <= 16
+        panel_bytes = rows * width * 2 + out_bytes
+        if affsum and staging and panel_bytes + asum_bytes > 31 * 1024 >= panel_bytes:
+            affsum = False
+    out_bytes += asum_bytes if affsum else 0
     stage = bool(staging and rows * width * 2 + out_bytes <= 31 * 1024)
     # A wider loop-pass panel stages KC columns at a time (all simdgroups in step) rather than norm
     # its input in every simdgroup; a wider first-pass panel reads its bf16 input from device memory,
     # which measured faster than chunked staging (receipts/probe-mode-1.json: 86 vs 104 us at 8 rows).
-    stage2 = bool(raw is not None and not stage)
+    # Affine panels too wide to stage read their sources from device memory in every simdgroup:
+    # chunked staging measured 2.2 times slower there (7 rows: loop pass 286 -> 108 µs, global
+    # passes 404 -> 188; 8 rows 329 -> 145 and 472 -> 220; receipts/q4forms-1.json).
+    if stage2 is None:
+        stage2 = not affine
+    stage2 = bool(raw is not None and not stage and stage2)
     chunk = rch or (_ROW_CHUNK if rows > 4 else rows)
     # Chunks hold whole 256-column blocks when an affine matrix reads them.
-    unit = 256 if any(m.bits != 16 for m in (mq, mr, mg, mk, mv)) else 128
+    unit = 256 if affine else 128
     kc = max(unit, min(width, ((31 * 1024 - out_bytes) // (chunk * 2)) // unit * unit))
     outputs = _project_kernel()(
         inputs=[
