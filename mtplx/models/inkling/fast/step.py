@@ -258,6 +258,60 @@ def unreadable(dtype, *weights):
     return None
 
 
+def attention_input_reason(layer, dtype, message):
+    """Why lane L1's stage A cannot serve this visit, or None (its kernels read 16-bit
+    projections, convolution offsets and, on loop passes 2 and 3, the controllers)."""
+    if dtype != mx.bfloat16:
+        return "stream_dtype"
+    reason = unreadable(mx.bfloat16, layer.q, layer.k, layer.v, layer.r, layer.sink, layer.gate)
+    if reason is None:
+        packed = [layer.convs[0].dynamic, layer.convs[1].dynamic]
+        if message:
+            packed += [c.down for c in layer.controllers[:3]]
+        reason = next((f"packed_{w.bits}bit" for w in packed if isinstance(w, AffineWeight)), None)
+    return reason
+
+
+def output_reason(layer, dtype):
+    """Why lane L2's output projection cannot serve this visit, or None."""
+    return unreadable(dtype, layer.out)
+
+
+def expert_input_reason(layer, message):
+    """Why lane L1's MLP read cannot serve this visit, or None."""
+    if message and isinstance(layer.controllers[3].down, AffineWeight):
+        return f"packed_{layer.controllers[3].down.bits}bit"
+    return None
+
+
+def stage_fallbacks(model, spec, rows, dtype=None):
+    """``{"fallback.<stage>.<reason>": visits}`` one step of ``rows`` takes with lane set
+    ``spec``: the same decisions the stages make per visit, for a step the native engine
+    replays (its stage functions do not run, so they cannot count)."""
+    from .experts import unserved
+
+    dtype = model.embed_tokens.weight.dtype if dtype is None else dtype
+    lanes = {part.strip() for part in spec.split(",") if part.strip()}
+    out = {}
+    for visit, index in enumerate(model.visit_order):
+        layer = model.layers[index]
+        message = model.start <= index < model.end and visit != index
+        reasons = []
+        if "a" in lanes:
+            reasons.append(("a", attention_input_reason(layer, dtype, message)))
+        if "bc" in lanes:
+            reasons.append(("bc_output", output_reason(layer, dtype)))
+        if "d" in lanes:
+            reasons.append(("d", expert_input_reason(layer, message)))
+        if "e" in lanes:
+            reasons.append(("experts", unserved(layer.experts, rows, dtype)))
+        for stage, reason in reasons:
+            if reason is not None:
+                key = f"fallback.{stage}.{reason}"
+                out[key] = out.get(key, 0) + 1
+    return out
+
+
 def fused_attention(layer, a, x, state, visit, panel):
     """Stage BC on lane L2's kernels: attention over the committed history read in place plus
     the panel's rows, gate, output projection, attention convolution, residual (class A)."""
@@ -271,7 +325,7 @@ def fused_attention(layer, a, x, state, visit, panel):
         newest = valid
     hg = panel_attend(a.q, a.rel, a.sink, a.gate_logits, a.k_rows, a.v_rows, keys, values, valid,
                       newest, panel.pos, layer.rel_basis, window=layer.sliding)
-    reason = unreadable(hg.dtype, layer.out)
+    reason = output_reason(layer, hg.dtype)
     if reason is not None:
         count(f"fallback.bc_output.{reason}")
         return output_projection(layer, hg, x, state, visit, panel)
@@ -283,12 +337,7 @@ def fused_attention_input(layer, x, closed, message, state, visit, panel):
     """Stage A on lane L1's kernels (two launches a visit, three on loop passes 2 and 3)."""
     from .attn_input import stage_attention_input
 
-    reason = unreadable(mx.bfloat16, x, layer.q, layer.k, layer.v, layer.r, layer.sink, layer.gate)
-    if reason is None:
-        packed = [layer.convs[0].dynamic, layer.convs[1].dynamic]
-        if message is not None:
-            packed += [c.down for c in layer.controllers[:3]]
-        reason = next((f"packed_{w.bits}bit" for w in packed if isinstance(w, AffineWeight)), None)
+    reason = attention_input_reason(layer, x.dtype, message is not None)
     if reason is not None:
         count(f"fallback.a.{reason}")
         return attention_input(layer, x, closed, message, state, visit, panel)
@@ -299,8 +348,9 @@ def fused_expert_input(layer, partial, closed, message, panel):
     """Stage D on lane L1's read kernel (one launch, two on loop passes 2 and 3)."""
     from .read import stage_expert_input
 
-    if message is not None and isinstance(layer.controllers[3].down, AffineWeight):
-        count(f"fallback.d.packed_{layer.controllers[3].down.bits}bit")
+    reason = expert_input_reason(layer, message is not None)
+    if reason is not None:
+        count(f"fallback.d.{reason}")
         return expert_input(layer, partial, closed, message, panel)
     return stage_expert_input(layer, partial, closed, message, panel)
 

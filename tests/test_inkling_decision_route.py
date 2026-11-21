@@ -52,7 +52,12 @@ def test_target_prefix_and_client_controls_take_the_host(device_round):
 
 @pytest.mark.parametrize("bad", ["nan", "-inf", "+inf"])
 def test_first_token_refuses_an_invalid_row(monkeypatch, bad):
-    monkeypatch.setattr(loop.fast_round, "draw", lambda row, **k: mx.array([7], mx.int32))
+    # The draw's own status row (round.draw_checked): a row with NaN or no finite maximum.
+    def checked(row, **k):
+        finite = bool(mx.logical_not(mx.logical_or(mx.any(mx.isnan(row)), mx.isinf(mx.max(row)))).item())
+        return mx.array([[7], [0 if finite else 1]], mx.int32)
+
+    monkeypatch.setattr(loop.fast_round, "draw_checked", checked)
     row = mx.zeros((1, 16), mx.float32)
     row = {"nan": mx.where(mx.arange(16) == 3, mx.nan, row),
            "-inf": mx.full((1, 16), -mx.inf),
@@ -61,13 +66,10 @@ def test_first_token_refuses_an_invalid_row(monkeypatch, bad):
         loop.checked_device_draw(row, position=0, seed=1, temperature=1.0)
 
 
-def test_first_token_of_a_finite_row_and_a_reported_validity(monkeypatch):
+def test_first_token_of_a_finite_row(monkeypatch):
     row = mx.arange(16, dtype=mx.float32).reshape(1, 16)
-    monkeypatch.setattr(loop.fast_round, "draw", lambda r, **k: mx.array([7], mx.int32))
+    monkeypatch.setattr(loop.fast_round, "draw_checked", lambda r, **k: mx.array([[7], [0]], mx.int32))
     assert loop.checked_device_draw(row, position=0, seed=1, temperature=1.0) == (7, True)
-    monkeypatch.setattr(loop.fast_round, "draw", lambda r, **k: (mx.array([7], mx.int32), mx.array([False])))
-    with pytest.raises(NonFiniteLogitsError):
-        loop.checked_device_draw(row, position=0, seed=1, temperature=1.0)
 
 
 def test_depth_one_api_forwards_the_verify_strategy(monkeypatch):

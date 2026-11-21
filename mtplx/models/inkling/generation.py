@@ -62,18 +62,12 @@ def decision_route(sampler, *, constraint=None, draft_sampler=None, verify_strat
 
 def checked_device_draw(row_logits, *, position, seed, temperature):
     """The GPU's draw of one token from a logits row, refused like every host draw when the row
-    has NaN, or no finite maximum (+inf, or every entry -inf): the request raises the existing
-    numerical error before the id is counted, streamed, embedded or banked. Accepts a draw that
-    returns the id alone or ``(id, valid)``."""
+    has NaN, or no finite maximum (+inf, or every entry -inf): one read gives the token and the
+    row's status, and a bad row raises the existing numerical error before the id is counted,
+    streamed, embedded or banked (review 1, finding 3)."""
     row = row_logits.reshape(1, -1)
-    drawn = fast_round.draw(row, position=position, seed=seed, temperature=temperature)
-    ids, valid = drawn if isinstance(drawn, tuple) else (drawn, None)
-    if valid is None:
-        valid = mx.logical_not(mx.logical_or(mx.any(mx.isnan(row)), mx.isinf(mx.max(row))))
-    settle_owner_work(ids, valid)
-    if not bool(np.asarray(valid).reshape(-1)[0]):
-        raise non_finite_logits_error(np.asarray(row.astype(mx.float32)).reshape(-1), "device draw")
-    return int(np.asarray(ids).reshape(-1)[0]), True
+    drawn = fast_round.draw_checked(row, position=position, seed=seed, temperature=temperature)
+    return fast_round.read_draw(drawn, rows=row, settle=settle_owner_work)[0], True
 
 
 def generate(

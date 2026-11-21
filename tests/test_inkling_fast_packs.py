@@ -63,3 +63,24 @@ def test_packed_output_projection_keeps_fused_attention_and_counts(monkeypatch):
     assert mx.array_equal(conv_rows, layer.out.product(hg).astype(mx.float32)).item()
     assert mx.array_equal(conv_rows, want_rows).item() and mx.array_equal(partial, want_partial).item()
     assert partial.shape == (1, rows, outer) and partial.dtype == mx.float32
+
+
+def test_a_replayed_step_counts_the_visits_that_take_the_packs_own_product():
+    """The native engine replays a recorded step without running the stage functions, so the
+    decoder counts, per replayed step, the visits each stage serves with the pack's product:
+    the same per-visit rules as the stages (stage_fallbacks)."""
+    dense = mx.zeros((8, 128), mx.bfloat16)
+
+    def layer(q=dense, out=dense, down3=dense):
+        controllers = [SimpleNamespace(down=dense) for _ in range(3)] + [SimpleNamespace(down=down3)]
+        return SimpleNamespace(q=q, k=dense, v=dense, r=dense, sink=dense, gate=dense, out=out, experts=None,
+                               convs=[SimpleNamespace(dynamic=None) for _ in range(4)], controllers=controllers)
+
+    model = SimpleNamespace(
+        layers=[layer(), layer(out=packed(64, 128, 6)), layer(q=packed(64, 128, 4), down3=packed(64, 128, 8))],
+        visit_order=[0, 1, 2, 1, 2], start=1, end=3,  # layers 1-2 loop twice; messages on the second pass
+        embed_tokens=SimpleNamespace(weight=dense))
+    assert fast_step.stage_fallbacks(model, "a,bc,d", 4) == {
+        "fallback.a.packed_4bit": 2, "fallback.bc_output.packed_6bit": 2, "fallback.d.packed_8bit": 1}
+    assert fast_step.stage_fallbacks(model, "bc,e", 4) == {"fallback.bc_output.packed_6bit": 2,
+                                                          "fallback.experts.cpu": 5}
