@@ -9,8 +9,11 @@ lives in this tree): the same 16-deep fragments in the same order into float32, 
 type as MLX's product stores it.
 
 MLX's own product splits the reduction into parts on shapes with few output tiles (a narrow matrix at a short
-chunk), and a split sum is not the same sum. So a shape (rows, columns, depth, type) is admitted only after
-the launch has given MLX's product's bits on its first call's own operands; a shape that does not match keeps
+chunk), and a split sum is not the same sum. So a shape (rows, columns, depth, type) is admitted only after the
+launch has given MLX's product's bits twice: on operands built so that the order of the sum shows in its result
+(``_ordered_operands``), and on its first call's own operands. The first alone is not enough: two orders of a
+float32 sum usually round to the same 16-bit value, and on a small output every value can agree by chance (a
+45-row key projection did so once and then differed on 22 of 28 later calls). A shape that does not match keeps
 MLX's product, counted. ``MTPLX_INKLING_PROMPT_KERNELS=mlx`` keeps MLX's products everywhere.
 
 Tensor-unit GPUs, bf16 or float32 operands, row-major matrices whose depth is a multiple of 32.
@@ -140,6 +143,36 @@ def _launch(x, matrices):
     return list(outs[: len(matrices)])
 
 
+#: A value the float32 sum absorbs a 1 into (its spacing there is 2): +HUGE and -HUGE in one column of a matrix
+#: cancel exactly, and the 1s summed while one of them is held are lost or rounded, so the result counts them in
+#: the order and grouping the product sums them.
+_HUGE = float(2**24)
+
+
+def _ordered_operands(rows, depth, widths, dtype):
+    """``x`` of ones and one matrix per width whose products reveal the reduction's grouping over the depth:
+    each matrix row holds 1s at a random few percent of its columns and three +HUGE/-HUGE pairs at random
+    columns of its own, so its exact sum is a small count of 1s and each grouping of the sum loses a different
+    subset of them. Small integers, exact in 16-bit floats; two products that sum in different orders differ on
+    many of the outputs."""
+    key = mx.random.key(0x1A2B3C4D)
+    x = mx.ones((rows, depth), dtype=dtype)
+    signs = mx.array([1.0, -1.0, 1.0, -1.0, 1.0, -1.0]) * _HUGE
+    matrices = []
+    for width in widths:
+        k_ones, k_places, key = mx.random.split(key, 3)
+        ones = (mx.random.uniform(shape=(width, depth), key=k_ones) < max(0.04, 16.0 / depth)).astype(mx.float32)
+        places = mx.argsort(mx.random.uniform(shape=(width, depth), key=k_places), axis=1)[:, : min(6, depth)]
+        huge = mx.broadcast_to(signs[: places.shape[1]], places.shape)
+        matrices.append(mx.put_along_axis(ones, places, huge, axis=1).astype(dtype))
+    return x, matrices
+
+
+def _same(got, want, dtype):
+    word = mx.uint32 if dtype == mx.float32 else mx.uint16
+    return all(bool(mx.array_equal(a.view(word), b.view(word)).item()) for a, b in zip(got, want))
+
+
 def _unserved(x, matrices):
     import os
 
@@ -173,15 +206,19 @@ def project(x, matrices, where):
     with _lock:
         verdict = _admitted.get(key)
     if verdict is None:
+        px, pm = _ordered_operands(flat.shape[0], flat.shape[1], [w.shape[0] for w in matrices], x.dtype)
+        p_want = [px @ w.T for w in pm]
+        p_got = _launch(px, pm)
         want = [flat @ w.T for w in matrices]
         got = _launch(flat, matrices)
-        mx.eval(want, got)
-        word = mx.uint32 if x.dtype == mx.float32 else mx.uint16
-        verdict = all(bool(mx.array_equal(a.view(word), b.view(word)).item()) for a, b in zip(got, want))
+        mx.eval(p_want, p_got, want, got)
+        ordered = _same(p_got, p_want, x.dtype)
+        verdict = ordered and _same(got, want, x.dtype)
         with _lock:
             _admitted[key] = verdict
         if not verdict:
-            _log.info("Inkling prompt projection %s keeps MLX's product: its sums differ there", key)
+            _log.info("Inkling prompt projection %s keeps MLX's product: its sums differ there (%s)", key,
+                      "own operands" if ordered else "order")
         out = got if verdict else want
     elif verdict:
         out = _launch(flat, matrices)
