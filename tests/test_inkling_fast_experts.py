@@ -44,7 +44,8 @@ def test_unserved_names_each_reason(monkeypatch):
     assert fx.unserved(namespace_block(affine=object()), 1) == "affine_experts"
     assert fx.unserved(namespace_block(experts=64), 1) == "geometry"
     assert fx.unserved(namespace_block(count=4), 1) == "geometry"
-    assert fx.unserved(namespace_block(), 1, mx.float16) == "dtype"
+    assert fx.unserved(namespace_block(), 1, mx.float16) is None     # the FP16 packs' stream
+    assert fx.unserved(namespace_block(), 1, mx.float32) == "dtype"
     monkeypatch.setenv("MTPLX_INKLING_FAST_EXPERTS", "off")
     assert fx.unserved(namespace_block(), 1) == "disabled"
 
@@ -68,7 +69,7 @@ def test_panel_products_serve_two_to_eight_rows(monkeypatch):
 EXPERTS = 16
 
 
-def synthetic_layer(mode, seed=7, tie=False):
+def synthetic_layer(mode, seed=7, tie=False, dtype=mx.bfloat16):
     fp4 = mode == "nvfp4"
     keys = iter(mx.random.split(mx.random.key(seed), 16))
     rnd = lambda shape, lo, hi: mx.random.randint(lo, hi, shape, key=next(keys)).astype(mx.uint8)
@@ -91,17 +92,17 @@ def synthetic_layer(mode, seed=7, tie=False):
             w[name + "_scale"] = rnd((EXPERTS, out, k // 32), 118, 126)
     cfg = {"num_experts_per_tok": 8, "route_scale": 8.0, "mlp_gate_softcap": 4.0, "mlp_up_softcap": 25.0}
     block = M.Experts(w, cfg, mode)
-    conv = M.Convolution({"mlp_sconv.weight": (mx.random.normal((2304, 1, 4), key=next(keys)) * 0.5).astype(mx.bfloat16)},
+    conv = M.Convolution({"mlp_sconv.weight": (mx.random.normal((2304, 1, 4), key=next(keys)) * 0.5).astype(dtype)},
                          "mlp_sconv")
-    norm_weight = (1 + 0.1 * mx.random.normal((2304,), key=next(keys))).astype(mx.bfloat16)
+    norm_weight = (1 + 0.1 * mx.random.normal((2304,), key=next(keys))).astype(dtype)
     return block, conv, norm_weight
 
 
-def reference(block, conv, norm_weight, source, partial, tail):
-    hidden = M.norm(source, norm_weight, 1e-6).astype(mx.bfloat16)
+def reference(block, conv, norm_weight, source, partial, tail, dtype=mx.bfloat16):
+    hidden = M.norm(source, norm_weight, 1e-6).astype(dtype)
     routed = block(hidden)
     out = conv(routed, [None, None, None, tail], 3, tape={} if source.shape[1] > 1 else None)
-    return (partial + out.astype(mx.float32)).astype(mx.bfloat16), routed.astype(mx.float32)
+    return (partial + out.astype(mx.float32)).astype(dtype), routed.astype(mx.float32)
 
 
 def same(a, b):
@@ -110,21 +111,22 @@ def same(a, b):
 
 
 @needs_gpu
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16], ids=str)
 @pytest.mark.parametrize("products", ["mlx", "own", "panel"])
 @pytest.mark.parametrize("mode", ["nvfp4", "mxfp8"])
 @pytest.mark.parametrize("tie", [False, True])
-def test_bits_and_row_stability_at_every_width(mode, tie, products, monkeypatch):
+def test_bits_and_row_stability_at_every_width(mode, tie, products, dtype, monkeypatch):
     monkeypatch.setattr(fx, "PRODUCTS", products)
-    block, conv, norm_weight = synthetic_layer(mode, tie=tie)
+    block, conv, norm_weight = synthetic_layer(mode, tie=tie, dtype=dtype)
     keys = mx.random.split(mx.random.key(11), 3)
     source = mx.random.normal((1, 8, 2304), key=keys[0]) * 3.0
     partial = mx.random.normal((1, 8, 2304), key=keys[1])
     tail = mx.random.normal((1, 3, 2304), key=keys[2])
     for W in range(1, 9):
-        want = reference(block, conv, norm_weight, source[:, :W], partial[:, :W], tail)
+        want = reference(block, conv, norm_weight, source[:, :W], partial[:, :W], tail, dtype)
         trace = {}
         got = fx.expert_visit_parts(block, norm_weight, conv.weight, source[:, :W], partial[:, :W], tail,
-                                    eps=1e-6, trace=trace)
+                                    eps=1e-6, trace=trace, dtype=dtype)
         assert same(got[0], want[0]), (mode, W, "output")
         assert same(got[1], want[1]), (mode, W, "convolution rows")
         if tie:
@@ -134,11 +136,11 @@ def test_bits_and_row_stability_at_every_width(mode, tie, products, monkeypatch)
                 if 3 in row and 5 in row:
                     assert row.index(3) < row.index(5)
     # Row stability: row r of the 8-row panel equals a one-row call on that row's own state.
-    panel = fx.expert_visit_parts(block, norm_weight, conv.weight, source, partial, tail, eps=1e-6)
+    panel = fx.expert_visit_parts(block, norm_weight, conv.weight, source, partial, tail, eps=1e-6, dtype=dtype)
     history = mx.concatenate([tail, panel[1]], axis=1)
     for r in range(8):
         single = fx.expert_visit_parts(block, norm_weight, conv.weight, source[:, r:r + 1], partial[:, r:r + 1],
-                                       history[:, r:r + 3], eps=1e-6)
+                                       history[:, r:r + 3], eps=1e-6, dtype=dtype)
         assert same(single[0][0, 0], panel[0][0, r]), (mode, r)
         assert same(single[1][0, 0], panel[1][0, r]), (mode, r)
 

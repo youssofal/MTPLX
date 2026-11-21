@@ -944,11 +944,12 @@ def project(layer, sources, k_tail, v_tail, pos, *, raw=None, form="float", thre
 
 
 @lru_cache(maxsize=8)
-def _static_form(width, size):
-    """short_conv's first-use verdict for a static bf16 convolution of this width ("float"/"fused")."""
+def _static_form(width, size, dtype=mx.bfloat16):
+    """short_conv's first-use verdict for a static convolution of this width over a stream of ``dtype``
+    (bf16, or float16 on the FP16 packs): "float" or "fused"."""
     from .. import short_conv
 
-    return short_conv._proven(mx.bfloat16, None, width, 1, size)
+    return short_conv._proven(dtype, None, width, 1, size)
 
 
 def attention_input(layer, x, closed, k_tail, v_tail, pos, messages=None, message_queries=None, *,

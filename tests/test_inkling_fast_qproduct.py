@@ -82,3 +82,32 @@ def test_one_row_is_mlx_own_product():
     m = _Affine(2304, 3072, 4, 64, seed=2)
     x = mx.random.normal((1, 1, 3072), key=mx.random.key(9)).astype(mx.bfloat16)
     assert _bits(affine_product(x, m), m.one_row(x))
+
+
+@needs
+@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("boundary", [False, True])
+def test_stage_c_in_one_launch_equals_the_steps_three(bits, boundary):
+    from types import SimpleNamespace
+
+    from mtplx.models.inkling import short_conv
+    from mtplx.models.inkling.fast.attn_input import _static_form
+    from mtplx.models.inkling.fast.qproduct import affine_output, affine_product
+
+    n, k = 2304, 3072
+    m = _Affine(n, k, bits, 64, seed=31 + bits)
+    # The model's static weight: a float32 transposed view of the stored (channels, taps) array.
+    conv = SimpleNamespace(dynamic=None, size=4,
+                           weight=(mx.random.normal((n, 4), key=mx.random.key(4)) * 0.3).T.astype(mx.float32))
+    form = _static_form(n, 4)
+    for width, with_tail in ((1, True), (4, True), (7, False), (8, True)):
+        hg = (mx.random.normal((1, width, k), key=mx.random.key(width)) * 0.5).astype(mx.bfloat16)
+        x = mx.random.normal((1, width, n), key=mx.random.key(50 + width)).astype(mx.bfloat16)
+        tail = mx.random.normal((1, 3, n), key=mx.random.key(90)).astype(mx.bfloat16).astype(mx.float32) if with_tail else None
+        partial, attn = affine_output(hg, m, conv, tail, x, boundary, form=form)
+        ref_attn = m.one_row(hg) if width == 1 else affine_product(hg, m, prove=False)
+        ref = short_conv.convolve(ref_attn, tail, conv.weight, None, False)[0].astype(mx.float32)
+        if not boundary:
+            ref = ref + x.astype(mx.float32)
+        assert _bits(partial, ref), width
+        assert _bits(attn, ref_attn.astype(mx.float32)), width

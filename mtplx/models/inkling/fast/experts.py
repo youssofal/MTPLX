@@ -394,7 +394,7 @@ INPUTS = """
             const float xi = xr[i];
             const float wi = float(norm_w[i]);
             const float y = wi * static_cast<float>(xi * inv);
-            const float v = float(static_cast<bfloat16_t>(y));
+            const float v = float(static_cast<T>(y));     // the stream's 16-bit type, as RC6 casts
             normed[i] = v;
             const float a = abs(v);
             nan_seen = nan_seen || isnan(a);
@@ -988,11 +988,16 @@ def _route_consts(scale):
     return mx.array([scale, 1e-20], mx.float32)
 
 
+#: The stream types the block serves: bf16, and float16 on the FP16 packs (M1 and M2 Macs). Its kernels
+#: round to the stream's type wherever RC6 casts to it (`.astype(x.dtype)`), in no other place.
+STREAM_TYPES = (mx.bfloat16, mx.float16)
+
+
 def unserved(block, rows, dtype=mx.bfloat16):
     """Why the fast path cannot serve this visit, or None. `dtype` is the visit's stream type."""
     if os.environ.get("MTPLX_INKLING_FAST_EXPERTS", "on").lower() in {"0", "off", "stock"}:
         return "disabled"
-    if dtype != mx.bfloat16:
+    if dtype not in STREAM_TYPES:
         return "dtype"
     if not (mx.default_device() == mx.gpu and mx.metal.is_available()):
         return "cpu"
@@ -1019,7 +1024,7 @@ def _member_chunk(rows):
 DEFAULT_TILES = {"gu_tile": TILE_GATE_UP, "gu_s": 8, "gu_r": 8, "dn_tile": TILE_DOWN, "dn_s": 8, "dn_r": 8}
 
 
-def _mlx_products(block, fp4, rows, logits, values, outer):
+def _mlx_products(block, fp4, rows, logits, values, outer, dtype=mx.bfloat16):
     """RC6's route kernel, MLX's gathered quantised products and RC6's SwiGLU kernel (4 launches)."""
     pairs = rows * block.count
     bits, group = (4, 16) if fp4 else (8, 32)
@@ -1029,7 +1034,7 @@ def _mlx_products(block, fp4, rows, logits, values, outer):
                           mode=block.gate_up.mode)
     mid, *mid_outer = expert_fusion._kernel("swiglu", fp4, _caps(float(block.gate_cap), float(block.up_cap)))(
         inputs=[raw13.reshape(pairs, 2 * MIDDLE), *([outer, block.gate_up.outer] if fp4 else []), experts, row_ids],
-        template=[("T", mx.bfloat16), ("W", MIDDLE), ("E", MIDDLE // expert_fusion.THREADS)],
+        template=[("T", dtype), ("W", MIDDLE), ("E", MIDDLE // expert_fusion.THREADS)],
         grid=(pairs * expert_fusion.THREADS, 1, 1), threadgroup=(expert_fusion.THREADS, 1, 1),
         output_shapes=[(pairs, 1, MIDDLE), *([(pairs,)] if fp4 else [])],
         output_dtypes=[mx.float32] * (2 if fp4 else 1),
@@ -1125,7 +1130,7 @@ def _pair_rows(rows):
     return mx.repeat(mx.arange(rows, dtype=mx.uint32), TOP_K)
 
 
-def _panel_products(block, fp4, rows, logits, values, outer, layouts=None):
+def _panel_products(block, fp4, rows, logits, values, outer, layouts=None, dtype=mx.bfloat16):
     """Route + plan, gate-up products, RC6's SwiGLU and down-input rounding, down products
     (4 launches), each distinct expert of the panel read once."""
     pairs = rows * block.count
@@ -1139,7 +1144,7 @@ def _panel_products(block, fp4, rows, logits, values, outer, layouts=None):
     raw13 = _panel_raw("gu", fp4, plan, values, block.gate_up.codes, block.gate_up.scales, rows, lay.get("gu"))
     mid, *mid_outer = expert_fusion._kernel("swiglu", fp4, _caps(float(block.gate_cap), float(block.up_cap)))(
         inputs=[raw13, *([outer, block.gate_up.outer] if fp4 else []), experts, _pair_rows(rows)],
-        template=[("T", mx.bfloat16), ("W", MIDDLE), ("E", MIDDLE // expert_fusion.THREADS)],
+        template=[("T", dtype), ("W", MIDDLE), ("E", MIDDLE // expert_fusion.THREADS)],
         grid=(pairs * expert_fusion.THREADS, 1, 1), threadgroup=(expert_fusion.THREADS, 1, 1),
         output_shapes=[(pairs, 1, MIDDLE), *([(pairs,)] if fp4 else [])],
         output_dtypes=[mx.float32] * (2 if fp4 else 1),
@@ -1166,10 +1171,11 @@ def products_for(rows):
 
 
 def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *, eps, conv_form=0, trace=None,
-                       tiles=None, stop_after=None, products=None, panel_layouts=None):
-    """Shapes: source/partial (1, W, 2304) float32, tail (1, 3, 2304) float32.
+                       tiles=None, stop_after=None, products=None, panel_layouts=None, dtype=mx.bfloat16):
+    """Shapes: source/partial (1, W, 2304) float32, tail (1, 3, 2304) float32; ``dtype`` the stream's
+    16-bit type (bf16, float16 on the FP16 packs).
 
-    Returns (out bf16 (1, W, 2304), conv_rows float32 (1, W, 2304)).
+    Returns (out (1, W, 2304) in ``dtype``, conv_rows float32 (1, W, 2304)).
     """
     products = products or products_for(source.shape[-2])
     rows = source.shape[-2]
@@ -1184,7 +1190,7 @@ def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *
 
     logits, values, *outer = _kernel("inputs", fp4)(
         inputs=[src, norm_weight, block.router, _consts(float(eps))],
-        template=[*common],
+        template=[*common, ("T", dtype)],
         grid=(32 * 256, rows, 1), threadgroup=(256, 1, 1),
         output_shapes=[(rows, EXPERTS), (rows, HIDDEN), *([(rows,)] if fp4 else [])],
         output_dtypes=[mx.float32] * (3 if fp4 else 2),
@@ -1196,14 +1202,14 @@ def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *
     if products in ("mlx", "panel"):
         if products == "panel":
             raw, mid_outer_m, experts, prob = _panel_products(block, fp4, rows, logits, values,
-                                                              outer[0] if fp4 else None, panel_layouts)
+                                                              outer[0] if fp4 else None, panel_layouts, dtype)
         else:
             raw, mid_outer_m, experts, prob = _mlx_products(block, fp4, rows, logits, values,
-                                                            outer[0] if fp4 else None)
+                                                            outer[0] if fp4 else None, dtype)
         mid_outer = [mid_outer_m] if fp4 else []
         h = peaks = None
         return _combine(fp4, rows, raw, mid_outer, experts, prob, dn, conv_weight, tail, part, conv_form, source,
-                        trace, logits, values, outer, h, peaks)
+                        trace, logits, values, outer, h, peaks, dtype)
     gu = block.gate_up
     cw13, sw13 = (HIDDEN // 8, HIDDEN // 16) if fp4 else (HIDDEN // 4, HIDDEN // 32)
     s_gu, r_gu, tile_gu = tl["gu_s"], tl["gu_r"], tl["gu_tile"]
@@ -1213,11 +1219,11 @@ def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *
     h, peaks, experts, prob = _kernel("gate_up", fp4, caps)(
         inputs=[logits, block.bias, _route_consts(float(block.scale)), values,
                 *([outer[0]] if fp4 else []), gu.codes, gu.scales, *([gu.outer] if fp4 else [])],
-        template=[*common, ("T", mx.bfloat16), ("S", s_gu), ("NT", 32 * s_gu), ("TILE", tile_gu),
+        template=[*common, ("T", dtype), ("S", s_gu), ("NT", 32 * s_gu), ("TILE", tile_gu),
                   ("R", r_gu), ("MC", mc), ("CW", cw13), ("SW", sw13), ("NTILE", ntile13)],
         grid=(ntile13 * 32 * s_gu, slots, 1), threadgroup=(32 * s_gu, 1, 1),
         output_shapes=[(rows * TOP_K, MIDDLE), (rows * TOP_K, ntile13), (rows * TOP_K,), (rows * TOP_K,)],
-        output_dtypes=[mx.bfloat16, mx.float32, mx.uint32, mx.float32],
+        output_dtypes=[dtype, mx.float32, mx.uint32, mx.float32],
     )
 
     if stop_after == "gate_up":
@@ -1238,18 +1244,18 @@ def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *
     if stop_after == "down":
         return raw, experts
     return _combine(fp4, rows, raw, mid_outer, experts, prob, dn, conv_weight, tail, part, conv_form, source,
-                    trace, logits, values, outer, h, peaks)
+                    trace, logits, values, outer, h, peaks, dtype)
 
 
 def _combine(fp4, rows, raw, mid_outer, experts, prob, dn, conv_weight, tail, part, conv_form, source,
-             trace, logits, values, outer, h, peaks):
+             trace, logits, values, outer, h, peaks, dtype=mx.bfloat16):
     out, conv_rows = _kernel("combine", fp4, (("CONV_FORM", conv_form), ("DIVISOR", _divisor_bits())))(
         inputs=[raw, *([mid_outer[0]] if fp4 else []), experts, prob, *([dn.outer] if fp4 else []),
                 conv_weight, tail.reshape(3, HIDDEN), part],
-        template=[("W", rows), ("T", mx.bfloat16)],
+        template=[("W", rows), ("T", dtype)],
         grid=(HIDDEN, 1, 1), threadgroup=(64, 1, 1),
         output_shapes=[(rows, HIDDEN), (rows, HIDDEN)],
-        output_dtypes=[mx.bfloat16, mx.float32],
+        output_dtypes=[dtype, mx.float32],
     )
     if trace is not None:
         trace.update(logits=logits, values=values, outer=outer[0] if fp4 else None, h=h, peaks=peaks,
@@ -1262,24 +1268,24 @@ def _zero_tail(width=HIDDEN):
     return mx.zeros((1, 3, width), mx.float32)
 
 
-def reference_visit(layer, source, partial, tail):
+def reference_visit(layer, source, partial, tail, dtype=mx.bfloat16):
     """RC6's own statements for the same edge (model.py 533-536), for fallback and proofs."""
     from mtplx.models.inkling import model as rc6
 
-    hidden = rc6.norm(source, layer.ffn_norm, layer.eps).astype(mx.bfloat16)
+    hidden = rc6.norm(source, layer.ffn_norm, layer.eps).astype(dtype)
     routed = layer.experts(hidden)
     cache = [None, None, None, tail]
     conv = layer.convs[3](routed, cache, 3, tape={} if source.shape[-2] > 1 else None)
-    return (partial + conv.astype(mx.float32)).astype(mx.bfloat16), routed.astype(mx.float32)
+    return (partial + conv.astype(mx.float32)).astype(dtype), routed.astype(mx.float32)
 
 
-def prove(layer, source, partial, tail):
+def prove(layer, source, partial, tail, dtype=mx.bfloat16):
     """(True, None) when the fast block gives RC6's bits on these operands, else (False, why).
 
     Host reads: call it outside a compiled step (at load or first use per format and width).
     """
-    want = reference_visit(layer, source, partial, tail)
-    got = expert_visit(layer, source, partial, tail)
+    want = reference_visit(layer, source, partial, tail, dtype)
+    got = expert_visit(layer, source, partial, tail, dtype)
     mx.eval(want, got)
     for name, a, b in zip(("output", "convolution rows"), got, want):
         view = {2: mx.uint16, 4: mx.uint32}[a.dtype.size]
@@ -1288,15 +1294,16 @@ def prove(layer, source, partial, tail):
     return True, None
 
 
-def expert_visit(layer, source, partial, tail):
+def expert_visit(layer, source, partial, tail, dtype=mx.bfloat16):
     """Stages D and E of one layer visit for a 1-32 row panel (SIGNATURES.md section 3).
 
     `layer` is the RC6 `model.Layer`; `source` the float32 MLP input after the depth read
     and controller, before the norm; `partial` the float32 attention-side partial sum; `tail`
     the MLP convolution's committed (1, 3, 2304) float32 tail, oldest first (zeros before
-    position 3). Returns (visit output bf16, the panel's MLP convolution input rows float32).
+    position 3); `dtype` the stream's 16-bit type. Returns (visit output in `dtype`, the panel's
+    MLP convolution input rows float32).
     """
     tail = tail if tail is not None else _zero_tail()
     _count("fast." + products_for(source.shape[-2]))
     return expert_visit_parts(layer.experts, layer.ffn_norm, layer.convs[3].weight, source, partial, tail,
-                              eps=layer.eps)
+                              eps=layer.eps, dtype=dtype)
