@@ -38,6 +38,7 @@ from collections import Counter
 from functools import lru_cache
 import logging
 from pathlib import Path
+import re
 from threading import Lock
 
 import mlx.core as mx
@@ -66,19 +67,37 @@ def _count(key):
         _counts[key] += 1
 
 
+_QUOTED_INCLUDE = re.compile(r'^\s*#\s*include\s+"([^"]+)"\s*$')
+_ONCE = re.compile(r"^\s*#\s*pragma\s+once\s*$")
+#: Every custom kernel's source already starts with this header (and what it includes).
+_KERNEL_PRELUDE = "mlx/backend/metal/kernels/utils.h"
+
+
+def _header_lines(root, name, done, out):
+    """``name``'s lines with each quoted include it reaches expanded once, in order; ``done`` holds the
+    headers already present (they and their includes are skipped)."""
+    if name in done:
+        return
+    done.add(name)
+    for line in (root / name).read_text().splitlines():
+        found = _QUOTED_INCLUDE.match(line)
+        if found:
+            _header_lines(root, found.group(1), done, out)
+        elif out is not None and not _ONCE.match(line):
+            out.append(line)
+
+
 @lru_cache(maxsize=1)
 def _installed_tile_header():
     """(text, None) with the installed MLX's tensor-unit tile and fragment templates, or (None, why)."""
     try:
-        from mtplx.kernels.moe_sorted_gather_nax import _PREAMBLE_HEADER, _closure, _inline
-
         root = Path(mx.__file__).resolve().parent / "include"
-        if not (root / _TILE_HEADER).is_file() or not (root / _PREAMBLE_HEADER).is_file():
+        if not (root / _TILE_HEADER).is_file() or not (root / _KERNEL_PRELUDE).is_file():
             return None, "the installed MLX ships no tensor-unit tile header"
-        seen = set()
-        _closure(root, _PREAMBLE_HEADER, seen)  # every custom kernel already includes it
+        done = set()
+        _header_lines(root, _KERNEL_PRELUDE, done, None)  # present already: only mark it and its includes
         out = []
-        _inline(root, _TILE_HEADER, seen, out)
+        _header_lines(root, _TILE_HEADER, done, out)
     except Exception as exc:  # noqa: BLE001 - an unreadable install keeps MLX's own products
         return None, f"{type(exc).__name__}: {exc}"
     text = "\n".join(out)
