@@ -18,6 +18,7 @@ from .fast.decoder import (DECLINED, DepthTableCheck, FastDecoder, FastPending, 
                            round_commit_enabled, round_costs, stage_spec)
 from .fast.state import MAX_PANEL
 from .fast.step import wide_rows_exact
+from .cache import settle_bank_steps, size_global_banks
 from .layout import cache_footprint
 from .model import load_target
 from .vision import VisionTower
@@ -323,11 +324,14 @@ class InklingRuntime(MTPLXRuntime):
         captures = (
             self.model.capture_ids if return_hidden or self.drafter is not None else ()
         )
+        # The global visits' banks at the rows the read reaches, allocated once (cache.prompt_rows).
+        size_global_banks(cache, int(input_ids.shape[-1]))
         h, features = self.model.forward(
             input_ids, cache[: self.trunk_entries], input_embeddings, captures
         )
         if self.drafter:
             self.drafter.observe(features, cache[self.trunk_entries :])
+        settle_bank_steps(cache)
         logits = (
             self.model.head(h if logits_keep is None else h[:, -max(1, logits_keep) :])
             if emit_logits
