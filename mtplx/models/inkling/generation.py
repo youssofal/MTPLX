@@ -37,7 +37,7 @@ from .fast.routes import count
 from .fast import round as fast_round
 from .fast import round_program
 from .protocol import completion_text
-from .sampling import draw_native, is_native_sampler
+from .sampling import NativeDrawsAhead, draw_native, is_native_sampler
 from mtplx.token_ids import token_id_bytes
 
 
@@ -469,12 +469,21 @@ def generate(
                     break
             rows = None
         # Emit the target draw on both branches. A match only lets us read the next verified row.
+        # The native draw's rows are computed ahead on worker threads while the walk draws in
+        # order (the same FP64 operations, so the same tokens): a wide copy round walks up to
+        # 32 rows of about 1 ms each on the host while the GPU waits.
+        ahead = (NativeDrawsAhead(rows) if rows is not None and native_draw and constraint is None
+                 and width > 1 else None)
         for pos, row in enumerate(rows if rows is not None else ()):
             if len(tokens) + len(emitted) == max_tokens or (
                 abort_check and abort_check()
             ):
                 break
-            token = draw(row)
+            if ahead is None:
+                token = draw(row)
+            else:
+                token = ahead.draw(pos, rng)
+                counts[token] += 1
             emitted.append(token)
             repeated = repetition is not None and repetition.observe(tokens, emitted) is not None
             if pos < len(guesses) and guesses[pos] == token:
@@ -486,6 +495,8 @@ def generate(
                 break
             if repeated or token in stop or (constraint and constraint.stopped):
                 break
+        if ahead is not None:
+            ahead.close()
         committed_in_round = served is not None and served.committed
         if committed_in_round and kept != served.kept:
             # A cut the device cannot see (a cancellation, the opt-in repetition guard): the
