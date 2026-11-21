@@ -32,13 +32,16 @@ from functools import lru_cache
 
 import mlx.core as mx
 
-#: Threads of one threadgroup (simdgroups x 4 output rows each), by output rows: a small matrix
-#: (an output projection) gets more, smaller threadgroups so every GPU core has several.
-_THREADS_SMALL = 64
+#: Threads of one threadgroup (simdgroups x 4 output rows each), by output rows. A small matrix (an
+#: output projection, 2,304 rows) also splits the panel's rows over threadgroups (YSPLIT) so every
+#: GPU core has several; a large one (the head, 201,024 rows) has threadgroups enough and loops.
+_THREADS_SMALL = 128
 _THREADS_LARGE = 256
 _SMALL_ROWS = 16384
-#: Panel rows a pass accumulates at once (wider panels loop; each pass decodes the codes again).
-_RCH = 8
+#: Panel rows one pass accumulates (each pass decodes the codes again). 4 measured best for the
+#: head at 8 rows per clock cycle (receipts/qproduct-bench-1.json: 2.50 G-cycles against 2.72 at 8).
+_RCH_SMALL = 2
+_RCH_LARGE = 4
 
 QMV_ROWS = """
 // MLX 0.32.2's load_vector for one lane's VPT values of a block (bf16 quartet sums in its order at
@@ -156,20 +159,25 @@ _SOURCE = """
     const uint sg = simdgroup_index_in_threadgroup;
     const uint lane = thread_index_in_simdgroup;
     const uint row0 = threadgroup_position_in_grid.x * (NSG * 4) + sg * 4;
+    // YSPLIT: each threadgroup row of the grid takes one chunk of RCH panel rows (more threadgroups
+    // for a small matrix); otherwise one threadgroup loops over the chunks.
+    const uint rc_begin = YSPLIT ? threadgroup_position_in_grid.y * RCH : 0;
+    const uint rc_end = YSPLIT ? min(rc_begin + RCH, uint(W)) : uint(W);
+    constexpr uint LROWS = YSPLIT ? RCH : W;
 
-    // load_vector's sum (MLX's order) for every panel row, block and lane, once per threadgroup.
-    threadgroup float lsum[SUMS ? W * NB * 32 : 1];
+    // load_vector's sum (MLX's order) for this threadgroup's panel rows, every block and lane.
+    threadgroup float lsum[SUMS ? LROWS * NB * 32 : 1];
     if (SUMS) {
-        for (uint idx = thread_index_in_threadgroup; idx < W * NB * 32; idx += THREADS) {
-            const uint r = idx / (NB * 32), b = (idx / 32) % NB, l = idx % 32;
+        for (uint idx = thread_index_in_threadgroup; idx < LROWS * NB * 32; idx += THREADS) {
+            const uint r = rc_begin + idx / (NB * 32), b = (idx / 32) % NB, l = idx % 32;
             float xt[VPT];
-            lsum[idx] = qmv_load<VPT, BITS>(x + size_t(r) * K + b * BLOCK + l * VPT, xt);
+            if (r < rc_end) lsum[idx] = qmv_load<VPT, BITS>(x + size_t(r) * K + b * BLOCK + l * VPT, xt);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (row0 >= N) return;
 
-    for (uint rc = 0; rc < W; rc += RCH) {
+    for (uint rc = rc_begin; rc < rc_end; rc += RCH) {
         float acc[4][RCH];
         for (uint tm = 0; tm < 4; ++tm)
             for (uint r = 0; r < RCH; ++r) acc[tm][r] = 0.0f;
@@ -183,13 +191,13 @@ _SOURCE = """
                 qmv_decode<VPT, BITS>(codes + row * WPR + col * BITS / 32, wf[tm]);
             }
             for (uint r = 0; r < RCH; ++r) {
-                if (rc + r >= W) break;
+                if (rc + r >= rc_end) break;
                 const device T* xs = x + size_t(rc + r) * K + col;
                 float xt[VPT];
                 float sum;
                 if (SUMS) {
                     qmv_inputs<VPT, BITS>(xs, xt);
-                    sum = lsum[((rc + r) * NB + b) * 32 + lane];
+                    sum = lsum[((rc + r - rc_begin) * NB + b) * 32 + lane];
                 } else {
                     sum = qmv_load<VPT, BITS>(xs, xt);
                 }
@@ -199,7 +207,7 @@ _SOURCE = """
         for (uint tm = 0; tm < 4; ++tm)
             for (uint r = 0; r < RCH; ++r) acc[tm][r] = simd_sum(acc[tm][r]);
         if (lane == 0) {
-            for (uint r = 0; r < RCH && rc + r < W; ++r)
+            for (uint r = 0; r < RCH && rc + r < rc_end; ++r)
                 for (uint tm = 0; tm < 4; ++tm)
                     if (row0 + tm < N) out[size_t(rc + r) * N + row0 + tm] = static_cast<T>(acc[tm][r]);
         }
@@ -266,17 +274,20 @@ def _same(a, b):
     return a.shape == b.shape and a.dtype == b.dtype and bool(mx.array_equal(a.view(view), b.view(view)).item())
 
 
-def _launch(x2, weight, rows, n, k, bits, group, vpt, *, threads=None, rch=None, sums=None):
+def _launch(x2, weight, rows, n, k, bits, group, vpt, *, threads=None, rch=None, sums=None, ysplit=None):
     nb = k // (vpt * 32)
-    threads = threads or (_THREADS_SMALL if n <= _SMALL_ROWS else _THREADS_LARGE)
-    rch = min(rows, rch or _RCH)
-    sums = (rows * nb * 32 * 4 <= 24 * 1024) if sums is None else bool(sums)
+    small = n <= _SMALL_ROWS
+    threads = threads or (_THREADS_SMALL if small else _THREADS_LARGE)
+    rch = min(rows, rch or (_RCH_SMALL if small else _RCH_LARGE))
+    ysplit = small if ysplit is None else bool(ysplit)
+    lrows = rch if ysplit else rows
+    sums = (lrows * nb * 32 * 4 <= 24 * 1024) if sums is None else bool(sums)
     rows_per_group = threads // 32 * 4
     return _kernel("product")(
         inputs=[x2, weight.codes, weight.scales, weight.biases],
         template=[("T", x2.dtype), ("W", rows), ("K", k), ("N", n), ("BITS", bits), ("G", group), ("VPT", vpt),
-                  ("RCH", rch), ("THREADS", threads), ("SUMS", sums)],
-        grid=(-(-n // rows_per_group) * threads, 1, 1),
+                  ("RCH", rch), ("THREADS", threads), ("SUMS", sums), ("YSPLIT", ysplit)],
+        grid=(-(-n // rows_per_group) * threads, -(-rows // rch) if ysplit else 1, 1),
         threadgroup=(threads, 1, 1),
         output_shapes=[(rows, n)],
         output_dtypes=[x2.dtype],
