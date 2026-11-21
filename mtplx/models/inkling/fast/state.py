@@ -167,9 +167,15 @@ class DecodeState:
             kv, conv = self.cache[2 * visit], self.cache[2 * visit + 1]
             keys, values = delta.keys[:, :, :kept], delta.values[:, :, :kept]
             if self.local[visit]:
-                index = (mx.arange(kept, dtype=mx.int32) + kv._idx) % self.window
-                kv.keys[:, :, index, :] = keys
-                kv.values[:, :, index, :] = values
+                # At most two contiguous runs of ring slots: static slice updates, in place
+                # while the ring is exclusively owned, no index arrays built on the GPU.
+                first = kv._idx % self.window
+                head = min(kept, self.window - first)
+                kv.keys[:, :, first : first + head, :] = keys[:, :, :head]
+                kv.values[:, :, first : first + head, :] = values[:, :, :head]
+                if head < kept:
+                    kv.keys[:, :, : kept - head, :] = keys[:, :, head:]
+                    kv.values[:, :, : kept - head, :] = values[:, :, head:]
                 kv._idx = (kv._idx + kept - 1) % self.window + 1
             else:
                 if end > kv.keys.shape[2]:
@@ -178,7 +184,12 @@ class DecodeState:
                 kv.values[:, :, self.length : end, :] = values
             kv.offset = end
             for slot, rows in enumerate(delta.taps):
-                conv[slot] = mx.concatenate([conv[slot], rows[:, :kept]], axis=1)[:, -self.keep :]
+                tail = conv[slot]
+                if kept >= self.keep:
+                    # The whole tail is replaced: one in-place write of the last three rows.
+                    tail[:, :, :] = rows[:, kept - self.keep : kept]
+                else:
+                    conv[slot] = mx.concatenate([tail[:, kept:], rows[:, :kept]], axis=1)
         self.length = end
         self.pos = mx.array(end, mx.uint32)
 
