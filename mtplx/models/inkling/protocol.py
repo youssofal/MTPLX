@@ -397,9 +397,10 @@ def _turn_end(stream, start, words, *, open_ok):
 
 def answer_floor(prompt_ids, tokenizer):
     """One past the first `<|message_model|>` of a prompt whose history holds a finished
-    assistant turn, or None when it holds none (a conversation's first request, whose only
-    model header is the one the template opens the new answer with). A stored stream can stand
-    for one of the prompt's answers only if it shares at least this many tokens with it."""
+    assistant turn (the first token the model wrote), or None when it holds none: a
+    conversation's first request ends with the user's message, and the model writes its answer's
+    header itself. A stored stream can stand for one of the prompt's answers only if it shares
+    at least this many tokens with it."""
     words = dialect(tokenizer)
     prompt = prompt_ids if isinstance(prompt_ids, (list, tuple)) else list(prompt_ids)
     try:

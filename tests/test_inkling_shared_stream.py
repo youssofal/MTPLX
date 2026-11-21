@@ -100,10 +100,11 @@ def test_a_first_request_never_probes_the_bank(monkeypatch):
     """No finished answer in the history: nothing a stored stream could stand for."""
     monkeypatch.setattr(oa, "_reasoning_history_scoped_active", lambda state: False)
     calls: list = []
-    first = PREFIX + [protocol.dialect(InklingTokenizer()).model]  # the template opens the answer
-    result, outcome = _gate(_state([BANKED], calls=calls), first)
+    result, outcome = _gate(_state([BANKED], calls=calls), PREFIX)
     assert result is None and outcome is None and calls == []
-    assert protocol.answer_floor(first, InklingTokenizer()) is None
+    assert protocol.answer_floor(PREFIX, InklingTokenizer()) is None
+    # An answer still open (no closing marker) is not a finished one either.
+    assert protocol.answer_floor(PREFIX + [protocol.dialect(InklingTokenizer()).model], InklingTokenizer()) is None
     assert protocol.answer_floor(RESENT, InklingTokenizer()) == len(PREFIX) + 1
 
 
@@ -163,8 +164,9 @@ def test_the_bank_ranks_every_conversations_streams_by_shared_prefix(tmp_path):
 
 
 def test_the_real_template_marks_where_the_first_answer_starts():
-    """With the pack's own tokenizer and template: a first request (its only model header opens
-    the new answer) has no floor; the next request's floor is just inside its first answer."""
+    """With the pack's own tokenizer and template: a first request has no floor (the template ends
+    it with the user's message; the model writes the answer's header itself), and the next
+    request's floor is one past that header, the first token the model wrote."""
     import json
 
     import pytest
@@ -177,16 +179,17 @@ def test_the_real_template_marks_where_the_first_answer_starts():
 
     tok = _load_tokenizer_resilient(PACK, json.loads((PACK / "config.json").read_text()))
     tok.inkling_protocol = True
+    tools = [{"type": "function", "function": {"name": "write", "description": "Write a file",
+              "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}}}}]
     call = {"id": "c1", "type": "function", "function": {"name": "write", "arguments": json.dumps(FILE)}}
     turn = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Make the game."}]
-    before = protocol.encode(tok, turn, effort="xhigh", thinking=True, strip_reasoning=False,
+    before = protocol.encode(tok, turn, tools=tools, effort="xhigh", thinking=True, strip_reasoning=False,
                              add_generation_prompt=True)
     history = turn + [{"role": "assistant", "content": None, "reasoning_content": "Write it.", "tool_calls": [call]},
                       {"role": "tool", "content": "Wrote it.", "tool_call_id": "c1"}]
-    after = protocol.encode(tok, history, effort="xhigh", thinking=True, strip_reasoning=False,
+    after = protocol.encode(tok, history, tools=tools, effort="xhigh", thinking=True, strip_reasoning=False,
                             add_generation_prompt=True)
     model = tok.convert_tokens_to_ids("<|message_model|>")
     assert protocol.answer_floor(before, tok) is None
     floor = protocol.answer_floor(after, tok)
-    assert floor is not None and after[floor - 1] == model and floor <= len(before)
-    assert model not in after[: floor - 1]
+    assert after[: len(before)] == before and floor == len(before) + 1 and after[floor - 1] == model
