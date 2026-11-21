@@ -14,8 +14,9 @@ vocabulary head over the proposal rows, the low-rank Markov walk on the folded t
 draws of ``round.sample_rows``), with one change that makes it one program: each block
 attends to its cache **in place** with the row count as data, a window block to its ring
 of ``window`` slots in physical order and the global block to its bank of a fixed capacity
-(a multiple of ``state.BANK_STEP``), each with a mask of the valid slots, and the rope
-offset is an array. RC6 instead reads the history back in temporal order at its exact
+(a multiple of ``state.BANK_STEP``), reading only the valid slots (``draft_attention``: each
+key and value read once for all the query rows that share it, nothing concatenated), and the
+rope offset is an array. RC6 instead reads the history back in temporal order at its exact
 length, a shape that changes every token. The keys and values are the same; the order of
 the softmax sums is not, so the drafter's bits differ from the stock drafter's in the last
 place. That changes which tokens a seed draws under ratio acceptance (class B already: the
@@ -30,13 +31,17 @@ temperatures are data, so one program serves every temperature); the drafter's r
 (int32), its rings' newest slot and row count (uint32) and its last mixed feature; each
 drafter block's keys and values; then the step's inputs (``engine_site.state_inputs``).
 The proposal count, whether each side is greedy, the lane set and the pack are in the key.
-Nothing is written in place: the outputs are the packet, the block of ids, the logits, the captures
-and every visit's delta, and the caller commits the rows the host accepts (``rt.commit``)
-exactly as after a stock round.
+A deciding round writes nothing in place: its outputs are the packet, the block of ids, the
+logits, the captures and every visit's delta, and the caller commits the rows the host accepts
+(``rt.commit``) exactly as after a stock round. A committing round (``stops`` and ``remaining``
+given) also walks the packet as the loop does and writes the kept rows into the target's rings,
+banks and tails and the drafter's history in place (``Round.rewind`` undoes them for a cut the
+device cannot see).
 """
 
 from __future__ import annotations
 
+import os
 import time
 from functools import lru_cache
 from typing import Any
@@ -209,8 +214,15 @@ def draft_inputs(drafter, dcache, length: int):
 
 
 # --------------------------------------------------------------------- the fixed drafter
+def draft_kernel_on() -> bool:
+    """The drafter's key-sharing attention below, on unless ``MTPLX_INKLING_DRAFT_ATTENTION=0``
+    (MLX's masked attention over the concatenated history: the A/B base and a rollback). The
+    choice is in the program key, so a process can hold both."""
+    return os.environ.get("MTPLX_INKLING_DRAFT_ATTENTION", "on").strip().lower() not in ("0", "off", "false", "no")
+
+
 def _valid(view: DraftView, index: int, rows: int) -> mx.array:
-    """Which history slots of block ``index`` a proposal row reads, then the block's own rows."""
+    """MLX path: which history slots of block ``index`` a proposal row reads, then its own rows."""
     window = view.windows[index]
     slots = view.keys[index].shape[2]
     j = mx.arange(slots, dtype=mx.uint32)
@@ -224,19 +236,174 @@ def _valid(view: DraftView, index: int, rows: int) -> mx.array:
     return mx.concatenate([history, own]).reshape(1, 1, 1, slots + rows)
 
 
+# The drafter's attention: every query row of a block (3 query heads of each key head times 8
+# rows) against the history and the block's own rows, reading each key and value once for all
+# 24 of them (MLX's vector kernel reads them once per query: 24 times, which at a long context
+# made the drafter's global block cost more than the rest of the drafter). Two launches: chunk
+# partials (online softmax in float32), then their merge. The history is a ring (a slot is valid
+# when its age is under the count) or a bank (a row is valid below the count); the block's own
+# rows are a chunk of their own, so nothing is concatenated and no bank is copied.
+_ATTEND = """
+    uint c = threadgroup_position_in_grid.x;
+    uint h = threadgroup_position_in_grid.y;
+    uint tid = thread_position_in_threadgroup.x;
+    uint sg = tid / 32, lane = tid % 32;
+    const uint QV = G * R;
+    const uint NHIST = (S + CHUNK - 1) / CHUNK;
+    const uint C = NHIST + 1;
+    threadgroup float qs[QV * D];
+    threadgroup T kt[TK * D];
+    threadgroup T vt[TK * D];
+    const float scale = metal::rsqrt(float(D));
+    for (uint i = tid; i < QV * D; i += 256) {
+        uint qv = i / D, d = i % D;
+        qs[i] = float(q[((h * G + qv / R) * R + qv % R) * D + d]) * scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint count = meta[0], newest = meta[1];
+    const bool own = c == NHIST;
+    const uint start = own ? 0 : c * CHUNK;
+    // a bank's rows past the count are not history: a chunk wholly past it reads nothing
+    const uint end = own ? R : metal::min(metal::min(start + CHUNK, (uint)S), RING ? (uint)S : metal::max(count, start));
+    float m[QPS], l[QPS], acc[QPS][D / 32];
+    for (uint a = 0; a < QPS; ++a) {
+        m[a] = -INFINITY; l[a] = 0.0f;
+        for (uint e = 0; e < D / 32; ++e) acc[a][e] = 0.0f;
+    }
+    for (uint base = start; base < end; base += TK) {
+        uint n = metal::min((uint)TK, end - base);
+        for (uint i = tid; i < n * D; i += 256) {
+            uint j = base + i / D, d = i % D;
+            kt[i] = own ? ok[(h * R + j) * D + d] : hk[(h * S + j) * D + d];
+            vt[i] = own ? ov[(h * R + j) * D + d] : hv[(h * S + j) * D + d];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint t = 0; t < n; ++t) {
+            uint j = base + t;
+            bool valid = own || (RING ? (((newest + S - j) % S) < count) : (j < count));
+            if (!valid) continue;
+            float kd[D / 32], vd[D / 32];
+            for (uint e = 0; e < D / 32; ++e) {
+                kd[e] = float(kt[t * D + lane * (D / 32) + e]);
+                vd[e] = float(vt[t * D + lane * (D / 32) + e]);
+            }
+            for (uint a = 0; a < QPS; ++a) {
+                uint qv = sg * QPS + a;
+                float part = 0.0f;
+                for (uint e = 0; e < D / 32; ++e) part += qs[qv * D + lane * (D / 32) + e] * kd[e];
+                float sc = simd_sum(part);
+                float mn = metal::max(m[a], sc);
+                float corr = metal::exp(m[a] - mn);
+                float p = metal::exp(sc - mn);
+                l[a] = l[a] * corr + p;
+                for (uint e = 0; e < D / 32; ++e) acc[a][e] = acc[a][e] * corr + p * vd[e];
+                m[a] = mn;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint a = 0; a < QPS; ++a) {
+        uint qv = sg * QPS + a;
+        uint pi = (h * C + c) * QV + qv;
+        if (lane == 0) { pm[pi] = m[a]; pl[pi] = l[a]; }
+        for (uint e = 0; e < D / 32; ++e) pacc[pi * D + lane * (D / 32) + e] = acc[a][e];
+    }
+"""
+
+_MERGE = """
+    uint qv = threadgroup_position_in_grid.x;
+    uint h = threadgroup_position_in_grid.y;
+    uint d = thread_position_in_threadgroup.x;
+    const uint QV = G * R;
+    const uint C = (S + CHUNK - 1) / CHUNK + 1;
+    float mx_ = -INFINITY;
+    for (uint c = 0; c < C; ++c) mx_ = metal::max(mx_, pm[(h * C + c) * QV + qv]);
+    float lsum = 0.0f, o = 0.0f;
+    for (uint c = 0; c < C; ++c) {
+        uint pi = (h * C + c) * QV + qv;
+        float w = metal::exp(pm[pi] - mx_);
+        lsum += pl[pi] * w;
+        o += pacc[pi * D + d] * w;
+    }
+    out[((h * G + qv / R) * R + qv % R) * D + d] = static_cast<T>(o / lsum);
+"""
+_CHUNK = 256
+_TILE = 32
+
+
+@lru_cache(maxsize=None)
+def _attend_kernels():
+    partials = mx.fast.metal_kernel(
+        name="mtplx_inkling_l7_draft_attend",
+        input_names=["q", "hk", "hv", "ok", "ov", "meta"],
+        output_names=["pm", "pl", "pacc"],
+        source=_ATTEND,
+    )
+    merge = mx.fast.metal_kernel(
+        name="mtplx_inkling_l7_draft_merge",
+        input_names=["pm", "pl", "pacc"],
+        output_names=["out"],
+        source=_MERGE,
+    )
+    return partials, merge
+
+
+def draft_attention(q, keys, values, own_k, own_v, count, newest, *, ring: bool):
+    """Softmax attention of a drafter block: ``q`` (1, Hq, R, D) against the history ``keys``,
+    ``values`` (1, Hk, S, D) (a ring when ``ring``, else a bank) and the block's own rows
+    ``own_k``, ``own_v`` (1, Hk, R, D), scale ``D ** -0.5``. Float32 inside; bfloat16 or float16
+    in and out (the drafter's own type: the FP16 siblings for M1 and M2 keep float16)."""
+    _, hq, rows, dim = q.shape
+    hk, slots = keys.shape[1], keys.shape[2]
+    group = hq // hk
+    qps = group * rows // 8
+    if (group * rows % 8 or dim % 32 or q.dtype not in (mx.bfloat16, mx.float16) or keys.dtype != q.dtype
+            or values.dtype != q.dtype):
+        raise ValueError("draft_attention: 8 simdgroups share the query vectors (bf16 or f16, D a multiple of 32)")
+    chunks = -(-slots // _CHUNK) + 1
+    template = [("T", q.dtype), ("G", group), ("R", rows), ("D", dim), ("S", slots), ("CHUNK", _CHUNK),
+                ("TK", _TILE), ("QPS", qps), ("RING", bool(ring))]
+    meta = mx.stack([count.astype(mx.uint32).reshape(()), newest.astype(mx.uint32).reshape(())])
+    partials, merge = _attend_kernels()
+    pm, pl, pacc = partials(
+        inputs=[q, keys, values, own_k.astype(keys.dtype), own_v.astype(values.dtype), meta],
+        template=template,
+        grid=(256 * chunks, hk, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(hk * chunks * group * rows,), (hk * chunks * group * rows,),
+                       (hk * chunks * group * rows * dim,)],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+    )
+    (out,) = merge(
+        inputs=[pm, pl, pacc],
+        template=template,
+        grid=(group * rows * dim, hk, 1),
+        threadgroup=(dim, 1, 1),
+        output_shapes=[q.shape],
+        output_dtypes=[q.dtype],
+    )
+    return out
+
+
 def _block(block, hidden, residual, view: DraftView, index: int):
     """``DraftBlock.__call__`` with its attention read in place (see the module docstring)."""
     summed = hidden if residual is None else hidden.astype(mx.float32) + residual.astype(mx.float32)
     x = block.normalize(summed, "input_layernorm").astype(hidden.dtype)
     q = block.rotate(block.normalize(block.heads(x, "q"), "self_attn.q_norm"), view.offset)
     k = block.rotate(block.normalize(block.heads(x, "k"), "self_attn.k_norm"), view.offset)
-    out = mx.fast.scaled_dot_product_attention(
-        q,
-        mx.concatenate([view.keys[index], k], axis=2),
-        mx.concatenate([view.values[index], block.heads(x, "v")], axis=2),
-        scale=block.cfg["head_dim"] ** -0.5,
-        mask=_valid(view, index, x.shape[1]),
-    )
+    v = block.heads(x, "v")
+    window = view.windows[index]
+    if draft_kernel_on():
+        out = draft_attention(q, view.keys[index], view.values[index], k, v,
+                              view.count if window else view.length, view.newest, ring=bool(window))
+    else:
+        out = mx.fast.scaled_dot_product_attention(
+            q,
+            mx.concatenate([view.keys[index], k], axis=2),
+            mx.concatenate([view.values[index], v], axis=2),
+            scale=block.cfg["head_dim"] ** -0.5,
+            mask=_valid(view, index, x.shape[1]),
+        )
     from ..model import linear
 
     attn = linear(out.transpose(0, 2, 1, 3).reshape(*x.shape[:2], -1), block.w["self_attn.o_proj.weight"])
@@ -271,7 +438,22 @@ def propose(drafter, target, anchor, view: DraftView, count_: int, *, position, 
         drafter.output_norm,
         drafter.cfg["rms_norm_eps"],
     ).astype(dtype)[:, 1 : count_ + 1]
-    base = linear(h, target.unembed)[..., : drafter.vocab]
+    from ..precision import AffineWeight
+
+    base = None
+    if isinstance(target.unembed, AffineWeight):
+        # A packed head (Bare Speed, Optimized Speed): lane L1's launch, one read of the codes for
+        # all the proposal rows (MLX's 2-to-24-row product reads them per row block, 2.7 against
+        # 1.9 ms at 8 rows); fed float32, as the verify's head is. Where it refuses (a stored form
+        # it does not take, a failed first-use proof on this Mac), MLX's product, counted.
+        from .qproduct import affine_product
+
+        try:
+            base = affine_product(h.astype(mx.float32), target.unembed)[..., : drafter.vocab]
+        except RuntimeError:
+            count("fallback.draft_head.affine_launch_refused")
+    if base is None:
+        base = linear(h, target.unembed)[..., : drafter.vocab]
     rank = drafter.cfg["markov_rank"]
     weights = drafter.markov["rnn_proj.weight"].astype(mx.float32)
     inputs = mx.concatenate([h, mx.broadcast_to(view.last, h.shape)], axis=-1)
@@ -525,7 +707,7 @@ class Round:
 
 _LAST: dict[str, Any] = {"route": None, "reason": None, "proposals": 0}
 #: Stop ids a committing round takes as data (padded with -2).
-MAX_STOPS = 16
+MAX_STOPS = 32
 
 
 def last_route() -> dict[str, Any]:
@@ -591,11 +773,13 @@ def serve(rt, anchor, cache, proposals: int, *, position, seed, temperature, dra
     if not 1 <= k <= MAX_PROPOSALS:
         return _decline("proposals", k)
     if commit:
-        stop_ids = [int(t) for t in stops]
-        if len(stop_ids) > MAX_STOPS:
-            return _decline("stops", k)
-        if remaining is None or int(remaining) < 1:
-            return _decline("remaining", k)
+        stop_ids = sorted({int(t) for t in stops})
+        if len(stop_ids) > MAX_STOPS or remaining is None or int(remaining) < 1:
+            # More stop ids than the program takes: the round is served without its commit
+            # (the caller commits, as for a deciding round), counted.
+            count("round.commit_declined.stops" if len(stop_ids) > MAX_STOPS else "round.commit_declined.remaining")
+            commit = False
+            stops = remaining = None
     decoder = rt.fast
     if spec is None:
         spec = stage_spec() if mx.default_device() == mx.gpu and mx.metal.is_available() else ""
@@ -659,7 +843,8 @@ def serve(rt, anchor, cache, proposals: int, *, position, seed, temperature, dra
     n_draft = len(draft_in)
     del target_inputs, draft_in, head
     geometry = ("round", k, "greedy" if greedy else "sampled", "greedy" if draft_greedy else "sampled",
-                "commit" if commit else "decide", spec, tuple(model.capture_ids), engine_site.identity(rt))
+                "commit" if commit else "decide", "dattn" if draft_kernel_on() else "sdpa", spec,
+                tuple(model.capture_ids), engine_site.identity(rt))
     n_cap = len(model.capture_ids)
     visits = len(state.local)
     windows = None
@@ -841,9 +1026,10 @@ def _synthetic_draft_cache(rt, length: int, seed: int):
 
 
 def warm(rt, proposals=None, *, length: int = 1100, seed: int = 20261121, temperature: float = 1.0,
-         draft_temperature: float | None = None) -> dict:
+         draft_temperature: float | None = None, commit: bool = False) -> dict:
     """Record and check the round program for each proposal count before the first request
-    (synthetic state, nothing of a request touched)."""
+    (synthetic state, nothing of a request touched). ``commit`` warms the committing round
+    (each warm round then commits its rows into the synthetic state, which only grows)."""
     report: dict[str, Any] = {"counts": {}, "mode": engine_runtime.mode()}
     if engine_runtime.mode() == "0" or not engine_runtime.available() or rt.drafter is None:
         report["skipped"] = engine_runtime.unavailable() or ("no_drafter" if rt.drafter is None else "disabled")
@@ -858,6 +1044,7 @@ def warm(rt, proposals=None, *, length: int = 1100, seed: int = 20261121, temper
     state.prepare()
     replay = site(rt)
     vocab = rt.model.embed_tokens.weight.shape[0]
+    extra = {"stops": [], "remaining": 1 << 30} if commit else {}
     round_ms: dict[int, float] = {}
     for k in proposals:
         entry_started = time.perf_counter()
@@ -865,7 +1052,8 @@ def warm(rt, proposals=None, *, length: int = 1100, seed: int = 20261121, temper
         while tries < _WARM_TRIES and native < 1:
             tries += 1
             served = serve(rt, (seed + tries * 7919 + k) % vocab, cache, k, position=length + 1, seed=seed + k,
-                           temperature=temperature, draft_temperature=draft_temperature, state=state)
+                           temperature=temperature, draft_temperature=draft_temperature,
+                           state=None if commit else state, **extra)
             if served is None:
                 break
             mx.eval(served.packet, served.rows, served.features, [d.arrays() for d in served.pending.deltas])
@@ -878,7 +1066,8 @@ def warm(rt, proposals=None, *, length: int = 1100, seed: int = 20261121, temper
                 mx.synchronize()
                 t0 = time.perf_counter()
                 served = serve(rt, (seed + 31 * t + k) % vocab, cache, k, position=length + 1, seed=seed + k,
-                               temperature=temperature, draft_temperature=draft_temperature, state=state)
+                               temperature=temperature, draft_temperature=draft_temperature,
+                               state=None if commit else state, **extra)
                 fast_round.read_packet(served.packet, k + 1)
                 mx.eval(served.rows, served.features, [d.arrays() for d in served.pending.deltas])
                 samples.append((time.perf_counter() - t0) * 1e3)
