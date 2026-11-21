@@ -367,9 +367,7 @@ class Convolution(nn.Module):
         """The convolution's output; with ``out_dtype`` also the visit's residual step after it:
         ``(out.astype(float32) + add.astype(float32)).astype(out_dtype)`` (``add`` optional)."""
         size = self.size
-        # the dynamic offsets' product with the visit's other projections' rules (our launch where it gives MLX's
-        # sums, everywhere under the width-independent read)
-        change = None if self.dynamic is None else shared_linear(drive, [self.dynamic], "conv_offset", tape)[0]
+        change = None if self.dynamic is None else linear(drive, self.dynamic)
         fused = convolve(x, cache[slot], self.weight, change, tape is not None, add, out_dtype)
         if fused is not None:
             out, cache[slot], history = fused
