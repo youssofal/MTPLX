@@ -24,6 +24,9 @@ from .ir import ArrayIR, BufferIR, ProgramIR, StepIR  # noqa: F401  (re-exported
 SWITCH_ENV = "MTPLX_NATIVE_ENGINE"
 DUMP_ENV = "MTPLX_NATIVE_ENGINE_DUMP"
 MODULE_ENV = "MTPLX_NATIVE_ENGINE_MODULE"  # developer override: path to a built module
+# Test aid, off unless set: the module's start check reports a failure, as a broken build's
+# would, so a release gate can drive the fallback on an installed wheel without touching it.
+TEST_FAIL_START_ENV = "MTPLX_NATIVE_ENGINE_TEST_FAIL_START"
 
 # What this file expects from the compiled module.  A module that reports a
 # different number is refused, so a stale build can never serve.
@@ -157,6 +160,8 @@ def _check_module(module: Any) -> str:
             # The module reads MLX's array layout directly.
             return f"built for mlx {built}, running mlx {mx.__version__}"
         problem = module.self_check()
+        if not problem and os.environ.get(TEST_FAIL_START_ENV, "").strip() not in ("", "0"):
+            problem = f"self check failed (forced by {TEST_FAIL_START_ENV})"
         if problem:
             return str(problem)
         try:
