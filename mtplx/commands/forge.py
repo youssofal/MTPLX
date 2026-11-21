@@ -122,6 +122,16 @@ def cmd_forge_public(args: Any, *, model_root: str | Path | None = None) -> int:
 
             print(json.dumps(stage_native_pack(args.source, args.destination), indent=2))
             return 0
+        if action == "fp16":
+            from .forge_fp16 import Fp16SiblingError, derive
+
+            try:
+                manifest = derive(Path(args.parent).expanduser(), Path(args.destination).expanduser(),
+                                  public_model_id=args.public_model_id)
+            except Fp16SiblingError as error:
+                raise ForgeError(str(error)) from error
+            print(json.dumps(manifest["summary"], indent=2))
+            return 0
         if action == "probe":
             return _cmd_probe(args)
         if action in ("census", "day-zero"):
