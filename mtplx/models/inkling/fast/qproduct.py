@@ -23,7 +23,7 @@ row. A first use on each shape proves the result against MLX's one-row product o
 operands; a disagreement refuses the route (counted) and the caller keeps MLX's product.
 
 ``QMV_ROWS`` is the same arithmetic as a Metal device function for another lane's launch (the
-fused attention output): ``qmv_rows<W, NROW, K, BITS, GROUP, VPT>(codes, scales, biases, x, x_stride,
+fused attention output): ``qmv_rows<W, NROW, K, BITS, GROUP, VPT>(codes, scales, biases, panel, panel_stride,
 row0, lane, result)`` leaves ``result[r][ro]`` (output row ``row0 + ro``, panel row ``r``) in every
 lane of the calling simdgroup; ``qmv_constants(weight)`` gives its template values.
 """
@@ -66,12 +66,13 @@ _ONE_ROW = True
 _SUMS_LARGE = False
 
 QMV_ROWS = AFFINE_LANE + """
-// MLX's one-row affine product for output rows [row0, row0 + NROW) and W panel rows of x (row r at
-// x + r * x_stride; bf16 or float, as the reference product takes it), every lane of the calling
-// simdgroup together, through affine_lane. result[r][ro] ends in every lane.
-template <int W, int NROW, int K, int BITS, int GROUP, int VPT, typename T>
-inline void qmv_rows(const device uint32_t* codes, const device bfloat16_t* scales,
-                     const device bfloat16_t* biases, const device T* x, int x_stride, int row0,
+// MLX's one-row affine product for output rows [row0, row0 + NROW) and W panel rows (row r at
+// panel + r * panel_stride; bf16, float16 or float, as the reference product takes it), every lane of
+// the calling simdgroup together, through affine_lane; scales and biases bf16 or float16 (S).
+// result[r][ro] ends in every lane.
+template <int W, int NROW, int K, int BITS, int GROUP, int VPT, typename T, typename S>
+inline void qmv_rows(const device uint32_t* codes, const device S* scales, const device S* biases,
+                     const device T* panel, int panel_stride, int row0,
                      uint lane, thread float (&result)[W][NROW]) {
     constexpr int BLOCK = 32 * VPT, NB = K / BLOCK, WPR = K * BITS / 32, GPR = K / GROUP;
     for (int r = 0; r < W; ++r)
@@ -86,7 +87,7 @@ inline void qmv_rows(const device uint32_t* codes, const device bfloat16_t* scal
             affine_lane::unpack<VPT, BITS>(codes + row * WPR + col * BITS / 32, wf[ro]);
         }
         for (int r = 0; r < W; ++r) {
-            const device T* xs = x + size_t(r) * x_stride + col;
+            const device T* xs = panel + size_t(r) * panel_stride + col;
             float xt[VPT];
             const float tot = affine_lane::take<VPT, BITS>(xs, xt);
             for (int ro = 0; ro < NROW; ++ro)
