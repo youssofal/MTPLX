@@ -2002,14 +2002,23 @@ class SessionBankColdTier:
                     )
             except Exception as exc:
                 self._inc("write_failures")
+                # The message, not the exception: a log record that kept the exception would keep
+                # its traceback, and through the writer's frames this write's bytes.
                 logger.warning(
                     "SessionBank SSD write failed entry_id=%s: %s: %s",
                     pending.entry_id,
                     type(exc).__name__,
-                    exc,
+                    str(exc),
                 )
             finally:
                 self._release_pending(pending.pinned_nbytes)
+                # The loop variable would keep this write, and with it every encoded tensor's
+                # bytes (as large as the entry), alive while the writer waits for the next one:
+                # the server's malloc heap held 1.8 GB after an Inkling 2 Mini 4K turn and 2.2 GB
+                # after a 16K one, 0.14 GB with the SSD tier off (21 November, Bare Speed through
+                # `mtplx serve`). Drop it before the write is counted done, so a flush means the
+                # bytes are gone too.
+                del pending
                 self._queue.task_done()
 
     def _admit_write(self, estimated_nbytes: int) -> bool:

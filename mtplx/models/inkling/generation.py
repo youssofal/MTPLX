@@ -22,8 +22,10 @@ from mtplx.generation import (
     first_token_logprobs,
     restore_or_prefill_prompt_state,
 )
+from mtplx.one_copy import one_copy_store
 from mtplx.route_tape import RouteTape, counter_deltas
 from mtplx.sampling import client_controls
+from .cache import prompt_rows
 from .copy_draft import PromptCopy, SessionPromptIndexes
 from .customer_controls import ProposalSampler, RepetitionOutput
 from .fast import draft as fast_draft
@@ -111,28 +113,36 @@ def generate(
     if depth is not None and not 1 <= depth < rt.drafter.width:
         raise ValueError(f"DSpark depth must be between 1 and {rt.drafter.width - 1}")
     start = perf_counter()
-    prompt = restore_or_prefill_prompt_state(
-        rt,
-        prompt_ids,
-        mtp_history_policy="cycle",
-        session_bank=session_bank,
-        session_id=session_id,
-        restore_mode=session_restore_mode,
-        template_hash=session_template_hash,
-        draft_head_identity=session_draft_head_identity,
-        policy_fingerprint=session_policy_fingerprint,
-        prefill_callback=prefill_callback,
-        capture_hidden=session_bank is not None,
-        store_prefix_snapshot=store_prefix_snapshot,
-        vision_splice=vision_splice,
-        abort_check=abort_check,
-    )
+    # The read's global banks are allocated once, at the prompt's rows (cache.size_global_banks).
+    with prompt_rows(len(prompt_ids)):
+        prompt = restore_or_prefill_prompt_state(
+            rt,
+            prompt_ids,
+            mtp_history_policy="cycle",
+            session_bank=session_bank,
+            session_id=session_id,
+            restore_mode=session_restore_mode,
+            template_hash=session_template_hash,
+            draft_head_identity=session_draft_head_identity,
+            policy_fingerprint=session_policy_fingerprint,
+            prefill_callback=prefill_callback,
+            capture_hidden=session_bank is not None,
+            store_prefix_snapshot=store_prefix_snapshot,
+            vision_splice=vision_splice,
+            abort_check=abort_check,
+        )
     prompt_commit = {}
     if (
         commit_prompt_state_to_bank
         and session_bank is not None
         and session_id
-        and prompt.suffix_tokens
+        and (
+            prompt.suffix_tokens
+            # An identical prompt took its conversation's only copy as a lease: banked again
+            # (a lease and the prompt-end anchor, no copy) before the answer decodes into it,
+            # so a cancelled answer leaves the conversation where it was.
+            or (one_copy_store(rt) and str(prompt.restore_mode).endswith("reference_lease"))
+        )
         and not prompt.prefill_store_snapshot.get("stored")
     ):
         prompt_commit = _commit_ar_prompt_state(
