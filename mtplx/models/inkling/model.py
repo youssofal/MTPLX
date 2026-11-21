@@ -124,6 +124,46 @@ def shared_linear(x, weights, where, tape=None):
     return [got[i] if i in got else linear(x, w) for i, w in enumerate(weights)]
 
 
+#: A prompt chunk's forward hands the GPU its graph every PROMPT_HANDOFF_VISITS visits with
+#: ``mx.async_eval``, so the GPU runs the first visits while Python builds the rest, instead of
+#: idling until the chunk's one evaluation at the end (and dropping its clock while it waits).
+#: Same graph, same kernels, same inputs to every kernel: only when work reaches the GPU changes,
+#: so every bit is the same. The cache rows a visit wrote are handed over with it, so the streams
+#: they slice die with their visit. ``MTPLX_INKLING_PROMPT_HANDOFF=0`` keeps the single
+#: evaluation at the end of the chunk; a number sets the visits between handoffs.
+PROMPT_HANDOFF_VISITS = 4
+
+
+def prompt_handoff_visits(rows, tapes):
+    """Visits between handoffs for a forward of ``rows`` rows (0: none; decode, verify and short
+    forwards never take them)."""
+    if tapes is not None or rows <= 32:
+        return 0
+    raw = os.environ.get("MTPLX_INKLING_PROMPT_HANDOFF", "").strip().lower()
+    if not raw:
+        return PROMPT_HANDOFF_VISITS
+    if raw in ("off", "no", "false"):
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return PROMPT_HANDOFF_VISITS
+
+
+def _state_arrays(entries):
+    """The arrays a run of visits left on its cache entries: attention rows and convolution tails."""
+    found = []
+    for entry in entries:
+        for name in ("keys", "values"):
+            value = getattr(entry, name, None)
+            if isinstance(value, mx.array):
+                found.append(value)
+        for value in getattr(entry, "cache", None) or ():
+            if isinstance(value, mx.array):
+                found.append(value)
+    return found
+
+
 def norm(x, weight, eps):
     return mx.fast.rms_norm(x.astype(mx.float32), weight, eps)
 
@@ -708,6 +748,7 @@ class Model(nn.Module):
             )
         closed, captured = [], {}
         x = self.embed_tokens(ids) if embeddings is None else embeddings
+        handoff = prompt_handoff_visits(x.shape[1], tapes)
         for visit, index in enumerate(self.visit_order):
             if index == self.start:
                 if visit == self.start:
@@ -730,6 +771,9 @@ class Model(nn.Module):
             x = self.layers[index](
                 x, closed, cache[2 * visit], cache[2 * visit + 1], message, tape
             )
+            if handoff and (visit + 1) % handoff == 0 and visit + 1 < len(self.visit_order):
+                # the GPU runs these visits while Python builds the next ones (same graph, same bits)
+                mx.async_eval(x, *closed, *_state_arrays(cache[2 * (visit + 1 - handoff) : 2 * (visit + 1)]))
         hidden = (
             prompt_glue.input_norm(x, closed, self.final_query, self.final_norm, self.eps, "final_norm")
             if tapes is None and self.config["attn_res_normalize_values"]
