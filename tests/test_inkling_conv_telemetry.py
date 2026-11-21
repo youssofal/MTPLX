@@ -16,6 +16,14 @@ from mtplx.models.inkling import model as inkling_model  # noqa: E402
 from mtplx.models.inkling import short_conv  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _route_switch_restored(monkeypatch):
+    # The tests below set the convolution route they need (os.environ, as an operator would); the
+    # switch must not outlive the test: left at "stock" it sent every later test in the session to
+    # MLX's convolution, and the stored stage C proof (its reference convolves) refused on every pack.
+    monkeypatch.setenv(short_conv.ROUTE_ENV, "candidate")
+
+
 @dataclass
 class _Stats:
     inkling_convolution: dict | None = None

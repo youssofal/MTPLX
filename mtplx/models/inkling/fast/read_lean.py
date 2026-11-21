@@ -172,6 +172,12 @@ def _block(text, head, tail):
     return i, j + len(tail)
 
 
+def _for_stream(text):
+    """A block as lane L1's kernel spells it once the stream's 16-bit type is a template (integration:
+    lane X1's FP16 work names it T16: bf16, or float16 on the FP16 packs). Same arithmetic, same casts."""
+    return text.replace("bfloat16_t", "T16").replace("then the bf16 cast.", "then the cast to the stream's type.")
+
+
 @lru_cache(maxsize=1)
 def source():
     """The lean kernel text from lane L1's, or None when a block is not found."""
@@ -180,13 +186,17 @@ def source():
     text = _READ
     for old, new in (_FIRST_PASS, _KEYS, (_MIX_OLD, _MIX_NEW), *_SIZES):
         if text.count(old) != 1:
-            return None
+            old, new = _for_stream(old), _for_stream(new)
+            if text.count(old) != 1:
+                return None
         text = text.replace(old, new)
     for head, tail, new in ((_GEMV_OLD_HEAD, _GEMV_OLD_TAIL, _GEMV_NEW),
                             (_NORMS_OLD_HEAD, _NORMS_OLD_TAIL, _NORMS_NEW)):
         span = _block(text, head, tail)
         if span is None:
-            return None
+            span, new = _block(text, _for_stream(head), _for_stream(tail)), _for_stream(new)
+            if span is None:
+                return None
         text = text[: span[0]] + new + text[span[1]:]
     return text
 

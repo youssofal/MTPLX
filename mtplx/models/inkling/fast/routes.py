@@ -16,10 +16,12 @@ _counts: Counter = Counter()
 request_receipt = ContextVar("inkling_fast_request", default=None)
 _captures = ContextVar("inkling_fast_captures", default=())
 
-#: Counts that name the path a stage took inside one step (the pack's own product, an unfused
-#: launch, the reference attention): a replayed program runs no stage function, so its site
-#: counts again the paths its record call took.
-STAGE_PATHS = ("fallback.", "unfused.")
+#: Counts that name the path a stage took inside one step (``fused.<stage>``: the stage's own
+#: launches served it; ``fallback.``/``unfused.``: the pack's own product, an unfused launch, the
+#: reference attention): a replayed program runs no stage function, so its site counts again the
+#: paths its record call took. The positive counts make coverage read, not inferred: a request's
+#: ``fused.bc_output.stored`` equals its visits on a stored-code pack when every one took the route.
+STAGE_PATHS = ("fused.", "fallback.", "unfused.")
 
 
 def count(name, n=1):

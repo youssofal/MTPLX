@@ -16,6 +16,15 @@ if os.environ.get("MTPLX_TEST_CPU_ONLY") == "1":
 from mtplx.models.inkling import model as inkling_model  # noqa: E402
 from mtplx.models.inkling import short_conv  # noqa: E402
 
+
+@pytest.fixture(autouse=True)
+def _route_switch_restored(monkeypatch):
+    # The tests below set the convolution route they need (os.environ, as an operator would); the
+    # switch must not outlive the test: left at "stock" it sent every later test in the session to
+    # MLX's convolution, and the stored stage C proof (its reference convolves) refused on every pack.
+    monkeypatch.setenv(short_conv.ROUTE_ENV, "candidate")
+
+
 GPU = mx.default_device() == mx.gpu and mx.metal.is_available()
 needs_gpu = pytest.mark.skipif(not GPU, reason="the fused kernel runs on the GPU only")
 

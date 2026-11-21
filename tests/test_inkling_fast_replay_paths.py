@@ -59,9 +59,12 @@ def test_a_native_replay_counts_the_stage_paths_its_record_call_took(monkeypatch
 
     def stages_ran(model, ids, state, stages=None):
         # What the stages counted while the program was recorded: a head whose first-use test
-        # failed (the pack's own product), an unfused output launch, a one-off proof.
+        # failed (the pack's own product), an unfused output launch, the stages their own launches
+        # served (counted again on every replay: coverage read, not inferred), a one-off proof.
         routes.count("fallback.head.packed_rows")
         routes.count("unfused.bc_output.packed_4bit", 4)
+        routes.count("fused.a", 48)
+        routes.count("fused.embed.stored")
         routes.count("rows_proof.head.one_at_a_time")
         return "logits", "captures", "deltas"
 
@@ -73,6 +76,7 @@ def test_a_native_replay_counts_the_stage_paths_its_record_call_took(monkeypatch
     with routes.capture_counts() as replayed:
         engine_site.decode(decoder, ids, "state", None, "a,bc,d,e")  # replays: no stage runs
     assert engine_site.last_route()["route"] == "native"
-    assert replayed == {"engine.native.w4": 1, "fallback.head.packed_rows": 1, "unfused.bc_output.packed_4bit": 4}
+    assert replayed == {"engine.native.w4": 1, "fallback.head.packed_rows": 1, "unfused.bc_output.packed_4bit": 4,
+                        "fused.a": 48, "fused.embed.stored": 1}
     engine_site.reset_route()
     assert engine_site.last_route()["route"] is None

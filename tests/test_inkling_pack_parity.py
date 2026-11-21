@@ -12,8 +12,7 @@ embedding, 3; the stored head's input and scale casts, 3).
    and the storage its recipe gives it (``forge_inkling_quant.matrix_layout``, the definition the
    packs were built from), and the step's own per-visit rules (``fast.step.stage_fallbacks``, the same
    reasons every stage function asks) must report no visit of any stage leaving its fused route, at
-   every width the step serves. The FP16 siblings' known gaps are listed exactly (a ratchet: a new gap
-   fails, and so does a closed gap left on the list).
+   every width the step serves, on the bf16 packs and on the FP16 siblings alike.
 2. Launches (Metal and the native engine, synthetic tensors with the real shapes): the stages whose
    weights differ by pack, stage C, the head and the embedding, take no more launches, and no more of
    MLX's own kernels (stock launches: any kernel that is not one of ours), on the stored forms than on
@@ -53,11 +52,6 @@ SHIPPED = {
     "inkling2-mini-optimized-quality-fp16": ("quality", "float16"),
 }
 VISITS = len(layer_visits(CONFIG))
-# The FP16 siblings' open gaps (lanes/X1.md: lane L1's stage A and MLP read round to bf16, so a float16
-# stream takes the reference for those stages). Offered only behind INKLING_LEGACY_OFFER (off). Stage C,
-# the head, the embedding and the expert block serve float16 streams.
-_FP16_GAPS = {"fallback.a.stream_dtype": VISITS, "fallback.d.stream_dtype": VISITS}
-KNOWN_FP16_GAPS = {"bare-speed": _FP16_GAPS, "speed": _FP16_GAPS, "quality": _FP16_GAPS}
 WIDTHS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32)
 
 
@@ -100,13 +94,17 @@ def stand_in(recipe, dtype):
                  for i, width in enumerate((1024, 1024, HIDDEN, HIDDEN))]
         controllers = ([SimpleNamespace(down=Meta((64, 2 * HIDDEN), dtype)) for _ in range(4)]
                        if start <= index < end else None)
+        norms = [Meta((HIDDEN,), dtype) for _ in range(1 if index in local else 3)]
         layers.append(SimpleNamespace(
             sliding=index in local, boundary=index % CONFIG["n_layers_per_attn_res_block"] == 0,
             q=m["wq_du"], k=m["wk_dv"], v=m["wv_dv"], r=m["wr_du"], gate=m["gate_attn"], out=m["wo_ud"],
-            sink=Meta((24, HIDDEN), dtype), convs=convs, controllers=controllers, experts=experts(index, recipe)))
+            sink=Meta((24, HIDDEN), dtype), convs=convs, controllers=controllers, experts=experts(index, recipe),
+            qkv_norm=norms))
     table = stored(EMBED, VOCAB, HIDDEN, recipe, dtype)
-    embed_tokens = (SimpleNamespace(weight=table, packed=None) if not isinstance(table, AffineWeight) else
-                    SimpleNamespace(weight=LogicalShape((VOCAB, HIDDEN), dtype), packed=table))
+    gain = Meta((HIDDEN,), dtype)
+    embed_tokens = (SimpleNamespace(weight=table, packed=None, gain=gain, eps=1e-6)
+                    if not isinstance(table, AffineWeight) else
+                    SimpleNamespace(weight=LogicalShape((VOCAB, HIDDEN), dtype), packed=table, gain=gain, eps=1e-6))
     return SimpleNamespace(layers=layers, visit_order=layer_visits(CONFIG), start=start, end=end,
                            embed_tokens=embed_tokens, unembed=stored(HEAD, VOCAB, HIDDEN, recipe, dtype))
 
@@ -132,13 +130,7 @@ def test_every_stage_of_every_pack_takes_its_fused_route(pack):
         for rows in WIDTHS:
             found = step.stage_fallbacks(model, "a,bc,d,e", rows, dtype)
             # The head's rule names a one-row and a panel key; neither may appear.
-            gaps = {k: v for k, v in found.items() if not k.startswith("fallback.head.")}
-            heads = {k: v for k, v in found.items() if k.startswith("fallback.head.")}
-            want = KNOWN_FP16_GAPS[recipe] if stream == "float16" else {}
-            if rows > 32:
-                continue
-            assert gaps == want, (pack, rows, found)
-            assert not heads, (pack, rows, heads)
+            assert found == {}, (pack, rows, found)
     finally:
         mx.set_default_device(previous)
 
@@ -208,12 +200,18 @@ def test_stage_c_takes_one_launch_on_every_storage_form(rows, dtype, monkeypatch
     monkeypatch.setattr(fast_attend, "attend", lambda *args, **kw: hg)
     dense = (mx.random.normal((HIDDEN, 3072), key=mx.random.key(5)) * 0.02).astype(dtype)
     mx.eval(dense)
+    from mtplx.models.inkling.fast.routes import capture_counts, stage_paths
+
     counts = {}
     for form, out in (("16-bit", dense), ("4-bit", _affine(HIDDEN, 3072, 4, 6, dtype)),
                       ("8-bit", _affine(HIDDEN, 3072, 8, 7, dtype))):
         convs = [SimpleNamespace(dynamic=None, size=4, weight=conv_weight) for _ in range(4)]
         layer = SimpleNamespace(sliding=True, boundary=False, out=out, convs=convs, rel_basis=None)
-        counts[form] = _launches(eng, lambda layer=layer: step.fused_attention(layer, a, x, state, 3, panel))
+        with capture_counts() as served:
+            counts[form] = _launches(eng, lambda layer=layer: step.fused_attention(layer, a, x, state, 3, panel))
+        # The route is read from its own counter (what a request's log shows), not inferred.
+        route = "fused.bc_output.panel" if form == "16-bit" else "fused.bc_output.stored"
+        assert served.get(route) == 2 and not stage_paths(served).keys() - {route, "fused.bc_attention"}, served
     assert all(n <= counts["16-bit"][0] for n, _ in counts.values()), counts
     assert all(stock == 0 for _, stock in counts.values()), counts
 
@@ -230,21 +228,25 @@ def _head_model(unembed, dtype):
 @needs_metal
 @pytest.mark.parametrize("dtype", STREAMS, ids=str)
 @pytest.mark.parametrize("rows", [1, 2, 4, 8])
-def test_a_stored_head_takes_the_launches_of_a_16_bit_one(rows, dtype):
-    """A stored head takes the 16-bit head's launches at every width: the 16-bit rows widened inside
-    the product launch, no cast and no widened scale copies."""
+def test_every_head_form_takes_one_launch_of_ours(rows, dtype, monkeypatch):
+    """The vocabulary head, soft cap included, in one launch of ours at every width on every storage
+    form: a 16-bit matrix (the vocabulary launch with the cap inside it) and a stored one (the 16-bit
+    rows widened inside the product launch, no cast and no widened scale copies). No stock launch."""
+    from mtplx.models.inkling import head
     from mtplx.models.inkling.fast import step
 
+    # The 16-bit route's first use races MLX's product (head.measured_route) and a pack keeps the verdict
+    # on disk; parity is about the launches once the route serves, so the race is taken as won here.
+    monkeypatch.setattr(head, "measured_route", lambda *args, **kw: True)
     eng = _engine()
     hidden = mx.random.normal((1, rows, HIDDEN), key=mx.random.key(8)).astype(dtype)
     dense = (mx.random.normal((32768, HIDDEN), key=mx.random.key(9)) * 0.02).astype(dtype)
     mx.eval(hidden, dense)
-    native = _head_model(dense, dtype)
-    launches, stock = _launches(eng, lambda: step.row_stable_head(native, hidden))
-    for bits in (4, 8):
-        model = _head_model(_affine(32768, HIDDEN, bits, 9 + bits, dtype), dtype)
+    forms = {"16-bit": dense, **{f"{bits}-bit": _affine(32768, HIDDEN, bits, 9 + bits, dtype) for bits in (4, 8)}}
+    for form, unembed in forms.items():
+        model = _head_model(unembed, dtype)
         got = _launches(eng, lambda model=model: step.row_stable_head(model, hidden))
-        assert got[0] <= launches and got[1] <= stock, (bits, got, (launches, stock))
+        assert got == (1, 0), (form, got)
 
 
 @needs_metal
@@ -262,4 +264,5 @@ def test_a_stored_embedding_takes_the_launches_of_a_16_bit_one(rows, dtype):
     native = SimpleNamespace(embed_tokens=Embedding(dense, gain, 1e-6))
     packed = SimpleNamespace(embed_tokens=Embedding(_affine(32768, HIDDEN, 4, 12, dtype), gain, 1e-6))
     got, want = _launches(eng, lambda: step.embed(packed, ids)), _launches(eng, lambda: step.embed(native, ids))
-    assert got[0] <= want[0] and got[1] <= want[1], (got, want)
+    # Gather, decode and norm in one launch of ours on either table: no stock launch left.
+    assert got == (1, 0) and want == (1, 0), (got, want)
