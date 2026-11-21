@@ -88,3 +88,43 @@ def test_the_products_give_mlx_sorted_product_bits(mode, rows):
         mx.eval(want13, want2, got13, got2)
         assert same(got13, want13.reshape(pairs, 2304)), (mode, rows, operand)
         assert same(got2, want2.reshape(pairs, 2304)), (mode, rows, operand)
+
+
+@pytest.mark.parametrize("mode", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize("rows", [64, 520, 2100])
+@pytest.mark.parametrize("wide", [(2, 2), (4, 2), (2, 4), (4, 4)])
+def test_the_wide_tilings_give_the_same_bits(mode, rows, wide):
+    """More rows and columns a threadgroup and a double-buffered decode change no sum: every product row
+    has MLX's sorted product's float32 bits, the sort's tiles cut at 32 SGM rows."""
+    bits, group = (4, 16) if mode == "nvfp4" else (8, 32)
+    experts = routes(rows, seed=rows + 7)
+    order, srows, sexp, inverse, tiles, starts = PE.sort_pairs(experts, 8, EXPERTS, 32 * wide[0])
+    pairs = experts.size
+    sizes = mx.zeros((EXPERTS,), mx.int32).at[experts.astype(mx.int32)].add(1)
+    assert bool(mx.array_equal(tiles[1:] - tiles[:-1], (sizes + 32 * wide[0] - 1) // (32 * wide[0])).item())
+    gate_up = weights(mode, 2304, 2304, seed=5)
+    down = weights(mode, 2304, 1152, seed=6)
+    values = inputs(rows, 2304, mode, seed=7)
+    mid = inputs(pairs, 1152, mode, seed=8)
+    want13 = mx.gather_qmm(values[srows].reshape(-1, 1, 2304), gate_up.codes, scales=gate_up.scales,
+                           rhs_indices=sexp, group_size=group, bits=bits, mode=mode, sorted_indices=True)
+    want2 = mx.gather_qmm(mid.reshape(-1, 1, 1152), down.codes, scales=down.scales, rhs_indices=sexp,
+                          group_size=group, bits=bits, mode=mode, sorted_indices=True)
+    for operand in (mx.bfloat16, mx.float32):
+        got13 = PE.product(values.astype(operand), gate_up, tiles, starts, pairs, rowmap=srows, wide=wide)
+        got2 = PE.product(mid.astype(operand), down, tiles, starts, pairs, wide=wide)
+        mx.eval(want13, want2, got13, got2)
+        assert same(got13, want13.reshape(pairs, 2304).astype(mx.float32)), (mode, rows, wide, operand)
+        assert same(got2, want2.reshape(pairs, 2304).astype(mx.float32)), (mode, rows, wide, operand)
+
+
+def test_the_tiling_follows_rows_an_expert(monkeypatch):
+    monkeypatch.delenv("MTPLX_INKLING_PROMPT_EXPERT_TILES", raising=False)
+    assert PE.tiling(40 * 8, EXPERTS) == (PE.BM, None)
+    floor, shape = PE.WIDE_PLAN[0]
+    if shape is not None:
+        assert PE.tiling(int(floor * EXPERTS), EXPERTS) == (32 * shape[0], shape)
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_EXPERT_TILES", "narrow")
+    assert PE.tiling(4096 * 8, EXPERTS) == (PE.BM, None)
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_EXPERT_TILES", "2x4")
+    assert PE.tiling(40 * 8, EXPERTS) == (64, (2, 4))

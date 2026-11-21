@@ -314,6 +314,37 @@ COMBINE_SORTED = (COMBINE
                   .replace("mid_outer[p]", "mid_outer[s]"))
 assert COMBINE_SORTED.count("inv[p]") == 1 and "raw[s * H + c]" in COMBINE_SORTED
 
+# The SwiGLU and the sorted combine reading products the product launch has already scaled and rounded
+# (``fast.prompt_experts.product(..., rounded=...)``): the value each pair's stage would compute from the float32
+# sum (its outer scale times the sum, rounded to T; or the sum rounded to T) arrives as T, half the bytes, and the
+# rest of the stage is the same text.
+_SWIGLU_SCALE = """        float graw = raw[p * (2 * W) + 2 * j];
+        float uraw = raw[p * (2 * W) + 2 * j + 1];
+#if FP4
+        float gs = graw * scale;
+        float us = uraw * scale;
+        T gq = static_cast<T>(gs);
+        T uq = static_cast<T>(us);
+#else
+        T gq = static_cast<T>(graw);
+        T uq = static_cast<T>(uraw);
+#endif"""
+_SWIGLU_ROUNDED = """        T gq = raw[p * (2 * W) + 2 * j];
+        T uq = raw[p * (2 * W) + 2 * j + 1];"""
+assert SWIGLU.count(_SWIGLU_SCALE) == 1
+SWIGLU_ROUNDED = SWIGLU.replace(_SWIGLU_SCALE, _SWIGLU_ROUNDED).replace(
+    "    float scale = row_outer[rows[p]] * expert_outer[experts[p]];\n", "")
+_COMBINE_SCALE = """        float v = raw[s * H + c];
+#if FP4
+        float scale = mid_outer[s] * expert_outer[experts[p]];
+        float vs = v * scale;
+        T q = static_cast<T>(vs);
+#else
+        T q = static_cast<T>(v);
+#endif"""
+assert COMBINE_SORTED.count(_COMBINE_SCALE) == 1
+COMBINE_SORTED_ROUNDED = COMBINE_SORTED.replace(_COMBINE_SCALE, "        T q = raw[s * H + c];")
+
 PROMPT_ROWS = 4096  # widest prompt chunk the sorted route serves (the prompt read uses 512; a request may ask wider)
 SORTED_TILE_PAIRS = 4  # pairs an expert from which MLX's sorted product runs its tile kernel
 
@@ -347,6 +378,8 @@ def kernel_spec(stage, fp4, options=()):
             ["out"],
             COMBINE_SORTED,
         ),
+        "swiglu_rounded": (["raw", "experts", "rows"], ["values", *fp4_only("mid_outer")], SWIGLU_ROUNDED),
+        "combine_sorted_rounded": (["raw", "experts", "prob", "inv"], ["out"], COMBINE_SORTED_ROUNDED),
     }[stage]
     header = HEADER + f"constexpr constant int THREADS = {THREADS};\n#define FP4 {int(fp4)}\n"
     header += "".join(f"#define {key} {value}\n" for key, value in options)
@@ -599,17 +632,26 @@ def routed_sorted(block, flat, linear, trace=None, variant=None, fast=False):
     if ours:
         from .fast import prompt_experts
 
+        rows_a_tile, wide = prompt_experts.tiling(pairs, block.router.shape[0])
         order, sorted_rows, sorted_experts, inverse, tiles, starts = prompt_experts.sort_pairs(
-            experts, count, block.router.shape[0])
+            experts, count, block.router.shape[0], rows_a_tile)
     else:
         # The stock body's sort: pairs ordered by expert, each pair's row its index // count.
         order = mx.argsort(experts)
         sorted_experts = experts[order]
         sorted_rows = order // count
         inverse = None
+    # Our products scale and round each sum in their epilogue as the SwiGLU and the combine would (half the
+    # bytes, the same values); a traced call keeps the float32 sums it records.
+    rounded = ours and trace is None
+    rounded13 = False
     if fp4 or fast:
         if ours:
-            raw13 = prompt_experts.product(values, block.gate_up, tiles, starts, pairs, rowmap=sorted_rows)
+            raw13 = prompt_experts.product(
+                values, block.gate_up, tiles, starts, pairs, rowmap=sorted_rows, wide=wide,
+                rounded=((flat.dtype, outer[0], block.gate_up.outer) if fp4 else (flat.dtype, None, None))
+                if rounded else None)
+            rounded13 = rounded
         else:
             # The stock body's grouped form (its rows gathered in sorted order, one sorted matrix
             # product), which its measured route proves equal to the indexed form before using it
@@ -627,26 +669,31 @@ def routed_sorted(block, flat, linear, trace=None, variant=None, fast=False):
 
         raw13 = prompt_gate_up(block, values, sorted_experts, sorted_rows)
     caps = (("GATE_CAP", mlx_literal(block.gate_cap)), ("UP_CAP", mlx_literal(block.up_cap)))
-    mid, *mid_outer = _kernel("swiglu", fp4, caps + narrow)(
+    mid, *mid_outer = _kernel("swiglu_rounded" if rounded13 else "swiglu", fp4, caps + narrow)(
         inputs=[raw13.reshape(pairs, 2 * middle),
-                *([outer[0], block.gate_up.outer] if fp4 else []), sorted_experts, sorted_rows],
+                *([outer[0], block.gate_up.outer] if fp4 and not rounded13 else []), sorted_experts, sorted_rows],
         template=[("T", flat.dtype), ("W", middle), ("E", middle // THREADS)],
         grid=(pairs * THREADS, 1, 1),
         threadgroup=(THREADS, 1, 1),
         output_shapes=[(pairs, 1, middle), *([(pairs,)] if fp4 else [])],
         output_dtypes=[operand] + ([mx.float32] if fp4 else []),
     )
+    rounded2 = False
     if ours and tiled:
-        raw2 = prompt_experts.product(mid, block.down, tiles, starts, pairs)
+        raw2 = prompt_experts.product(
+            mid, block.down, tiles, starts, pairs, wide=wide,
+            rounded=((flat.dtype, mid_outer[0], block.down.outer) if fp4 else (flat.dtype, None, None))
+            if rounded else None)
+        rounded2 = rounded
     else:
         raw2 = mx.gather_qmm(
             mid, block.down.codes, scales=block.down.scales, rhs_indices=sorted_experts,
             group_size=group, bits=bits, mode=block.down.mode, sorted_indices=True,
         )
         inverse = mx.argsort(order) if inverse is None else inverse
-    (out,) = _kernel("combine_sorted", fp4)(
+    (out,) = _kernel("combine_sorted_rounded" if rounded2 else "combine_sorted", fp4)(
         inputs=[raw2.reshape(pairs, width),
-                *([mid_outer[0], block.down.outer] if fp4 else []), experts, prob, inverse],
+                *([mid_outer[0], block.down.outer] if fp4 and not rounded2 else []), experts, prob, inverse],
         template=[("T", flat.dtype), ("H", width), ("K", count)],
         grid=(width, rows, 1),
         threadgroup=(256 if width % 256 == 0 else 128, 1, 1),
