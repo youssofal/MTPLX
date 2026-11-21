@@ -578,7 +578,7 @@ def fused_experts(layer, source, partial, dtype, state, visit, panel):
     if reason is not None:
         count(f"fallback.experts.{reason}")
         return experts(layer, source, partial, dtype, state, visit, panel)
-    return expert_visit(layer, source, partial, state.tail(visit, 3))
+    return expert_visit(layer, source, partial, state.tail(visit, 3), dtype)
 
 
 LANES = {

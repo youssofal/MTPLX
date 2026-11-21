@@ -53,11 +53,10 @@ SHIPPED = {
     "inkling2-mini-optimized-quality-fp16": ("quality", "float16"),
 }
 VISITS = len(layer_visits(CONFIG))
-# The FP16 siblings' open gaps (lanes/X1.md: lane L1's stage A and MLP read and the expert block round
-# to bf16, so a float16 stream takes the reference for those stages). Offered only behind
-# INKLING_LEGACY_OFFER (off). Stage C, the head and the embedding read float16 stored forms.
-_FP16_GAPS = {"fallback.a.stream_dtype": VISITS, "fallback.d.stream_dtype": VISITS,
-              "fallback.experts.dtype": VISITS}
+# The FP16 siblings' open gaps (lanes/X1.md: lane L1's stage A and MLP read round to bf16, so a float16
+# stream takes the reference for those stages). Offered only behind INKLING_LEGACY_OFFER (off). Stage C,
+# the head, the embedding and the expert block serve float16 streams.
+_FP16_GAPS = {"fallback.a.stream_dtype": VISITS, "fallback.d.stream_dtype": VISITS}
 KNOWN_FP16_GAPS = {"bare-speed": _FP16_GAPS, "speed": _FP16_GAPS, "quality": _FP16_GAPS}
 WIDTHS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32)
 
