@@ -257,5 +257,10 @@ def stage_native_pack(
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source / name, dst)
         manifest = write_pack_metadata(staged, recipe)
+        # Law 1, as for every built recipe: the copied tower and drafter checked against the pinned upstream
+        # before the pack is moved into place (a failure raises and leaves no pack behind).
+        from .forge_inkling_quant import audit_pack
+
+        (staged / "vision-audit.json").write_text(json.dumps(audit_pack(staged, source), indent=2) + "\n")
         os.rename(staged, destination)
     return manifest
