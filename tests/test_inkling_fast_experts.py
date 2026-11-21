@@ -118,13 +118,24 @@ def same(a, b):
     return a.shape == b.shape and a.dtype == b.dtype and bool(mx.array_equal(a.view(view), b.view(view)).item())
 
 
+#: (inputs and combine launches, NVFP4 activations in float16): the earlier forms and the new ones.
+FORMS = [("row", False), ("rows", True)]
+
+
+def set_form(monkeypatch, form):
+    monkeypatch.setattr(fx, "GLUE", form[0])
+    monkeypatch.setattr(fx, "HALF_ACTIVATIONS", form[1])
+
+
 @needs_gpu
+@pytest.mark.parametrize("form", FORMS, ids=lambda f: f"{f[0]}-{'half' if f[1] else 'float'}")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16], ids=str)
 @pytest.mark.parametrize("products", ["mlx", "own", "panel"])
 @pytest.mark.parametrize("mode", ["nvfp4", "mxfp8"])
 @pytest.mark.parametrize("tie", [False, True])
-def test_bits_and_row_stability_at_every_width(mode, tie, products, dtype, monkeypatch):
+def test_bits_and_row_stability_at_every_width(mode, tie, products, dtype, form, monkeypatch):
     monkeypatch.setattr(fx, "PRODUCTS", products)
+    set_form(monkeypatch, form)
     block, conv, norm_weight = synthetic_layer(mode, tie=tie, dtype=dtype)
     keys = mx.random.split(mx.random.key(11), 3)
     source = mx.random.normal((1, 8, 2304), key=keys[0]) * 3.0
@@ -154,13 +165,15 @@ def test_bits_and_row_stability_at_every_width(mode, tie, products, dtype, monke
 
 
 @needs_gpu
+@pytest.mark.parametrize("form", FORMS, ids=lambda f: f"{f[0]}-{'half' if f[1] else 'float'}")
 @pytest.mark.parametrize("mode", ["nvfp4", "mxfp8"])
-def test_wide_panels_give_the_gathered_products_bits_and_row_stability(mode, monkeypatch):
+def test_wide_panels_give_the_gathered_products_bits_and_row_stability(mode, form, monkeypatch):
     """9 to 32 rows (a copy round's verify) on the wide plan: the bits of the gathered route they
     replace, and every row equal to a one-row call on its own state (past 8 rows RC6's batched body
     is not the criterion: its rows differ from its own one-row step; a copy round's rows must each
     be the one-token step's). 16 experts in play, so an expert has members in most rows (up to 32
     members a slot)."""
+    set_form(monkeypatch, form)
     block, conv, norm_weight = synthetic_layer(mode)
     keys = mx.random.split(mx.random.key(29), 3)
     source = mx.random.normal((1, 32, 2304), key=keys[0]) * 3.0
@@ -174,6 +187,13 @@ def test_wide_panels_give_the_gathered_products_bits_and_row_stability(mode, mon
         got = fx.expert_visit_parts(block, norm_weight, conv.weight, source[:, :W], partial[:, :W], tail, eps=1e-6)
         for i, name in enumerate(("output", "convolution rows")):
             assert same(got[i], gathered[i]), (mode, W, name, "gathered")
+        if form != FORMS[0]:  # the rows-together launches give the earlier launches' bits at every width
+            set_form(monkeypatch, FORMS[0])
+            earlier = fx.expert_visit_parts(block, norm_weight, conv.weight, source[:, :W], partial[:, :W], tail,
+                                            eps=1e-6)
+            set_form(monkeypatch, form)
+            for i, name in enumerate(("output", "convolution rows")):
+                assert same(got[i], earlier[i]), (mode, W, name, "earlier launches")
     panel = fx.expert_visit_parts(block, norm_weight, conv.weight, source, partial, tail, eps=1e-6)
     history = mx.concatenate([tail, panel[1]], axis=1)
     for r in range(32):

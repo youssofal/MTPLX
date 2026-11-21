@@ -473,8 +473,12 @@ def propose(drafter, target, anchor, view: DraftView, count_: int, *, position, 
     ).astype(dtype)[:, 1 : count_ + 1]
     from ..precision import AffineWeight
 
+    from . import draft_table
+
+    table = draft_table.bind(drafter, target)       # class B, MTPLX_INKLING_DRAFT_TABLE (off by default)
+    head = target.unembed if table is None else table.head
     base = None
-    if isinstance(target.unembed, AffineWeight):
+    if isinstance(head, AffineWeight):
         # A packed head (Bare Speed, Optimized Speed): lane L1's launch, one read of the codes for
         # all the proposal rows (MLX's 2-to-24-row product reads them per row block, 2.7 against
         # 1.9 ms at 8 rows); fed float32, as the verify's head is (a bf16 row widened inside the
@@ -482,22 +486,23 @@ def propose(drafter, target, anchor, view: DraftView, count_: int, *, position, 
         # a failed first-use proof on this Mac), MLX's product, counted.
         from .qproduct import STREAM_TYPES, affine_product
 
+        width = drafter.vocab if table is None else None
         try:
             if h.dtype in STREAM_TYPES:
-                base = affine_product(h, target.unembed, widen=True)[..., : drafter.vocab]
+                base = affine_product(h, head, widen=True)[..., :width]
             else:
-                base = affine_product(h.astype(mx.float32), target.unembed)[..., : drafter.vocab]
+                base = affine_product(h.astype(mx.float32), head)[..., :width]
         except RuntimeError:
             count("fallback.draft_head.affine_launch_refused")
     if base is None:
-        base = linear(h, target.unembed)[..., : drafter.vocab]
+        base = linear(h, head)[..., : (drafter.vocab if table is None else None)]
     rank = drafter.cfg["markov_rank"]
     weights = drafter.markov["rnn_proj.weight"].astype(mx.float32)
     inputs = mx.concatenate([h, mx.broadcast_to(view.last, h.shape)], axis=-1)
     conditioned = linear(inputs.astype(mx.float32), weights[:, 2 * rank :]) + drafter.markov[
         "rnn_proj.bias"
     ].astype(mx.float32)
-    folded = drafter.fold(target.unembed)
+    folded = drafter.fold(target.unembed) if table is None else table.folded
     from .matvec import matvec
 
     start = position.astype(mx.uint32).reshape(())
@@ -517,6 +522,8 @@ def propose(drafter, target, anchor, view: DraftView, count_: int, *, position, 
         signal = mx.tanh(output.astype(mx.float32)).astype(dtype)
         bias = matvec(signal, folded, cols=folded.shape[1] - 1, bias_col=folded.shape[1] - 1)
         scores = base[:, i] + bias
+        if table is not None:
+            scores = draft_table.expand(table, scores)
         if greedy:
             law, st = fast_round.law_rows(scores, temperature=None, cap=0.0, write=True)
         else:
