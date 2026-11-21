@@ -6312,6 +6312,7 @@ def _vision_gate_canonicalization(
     template_observability: dict[str, Any],
     receipt: dict[str, Any],
     session_id: str | None,
+    compared_stream: Sequence[Sequence[int]] | None = None,
 ) -> tuple[list[Any], list[int], Any] | None:
     """Serve or refuse an image request's repaired prompt, and fill its
     ``request_vision_session_restore`` receipt.
@@ -6327,13 +6328,17 @@ def _vision_gate_canonicalization(
     not applied. The receipt also says what the session holds and how far the
     served ids run along it, so with first_image_pad_position and
     cached_tokens one request line reads "held N, shares M, restored K".
+    ``compared_stream`` is what the committed-reasoning gate filled in: the
+    stream it compared with when that was not the registry's (Inkling).
     """
 
     from mtplx.vision.splice import unkeyed_ids, vision_bank_key_ids
 
     committed: Sequence[int] = ()
     peek = getattr(getattr(state, "sessions", None), "peek", None)
-    if session_id is not None and callable(peek):
+    if compared_stream:
+        committed = tuple(compared_stream[0])
+    elif session_id is not None and callable(peek):
         committed = tuple(getattr(peek(session_id), "committed_token_ids", ()) or ())
     if not committed and getattr(
         getattr(getattr(state, "runtime", None), "tokenizer", None), "inkling_protocol", False
@@ -15732,6 +15737,7 @@ def _maybe_canonicalize_committed_reasoning(
     strip_tool_call_preamble_text: bool = False,
     session_id: str | None = None,
     prompt_view: Callable[[Sequence[int]], list[int] | None] | None = None,
+    compared_stream: list[tuple[int, ...]] | None = None,
 ) -> tuple[list[ChatMessage], list[int]] | None:
     """Session-owned committed-think canonicalization (2.8 headline, defect B).
 
@@ -15754,6 +15760,12 @@ def _maybe_canonicalize_committed_reasoning(
     to the content-keyed view an image session commits: every encode here is
     compared with the committed stream in that view, and the ids returned are
     in it (``_vision_gate_canonicalization`` decides what is served).
+
+    ``compared_stream`` (Inkling): a list this fills with the one stream the
+    gate compared the prompt with, when that is not simply the registry's
+    (a stream from the bank after a restart, or the banked branch a resent
+    history continues), so the image gate judges a repair against the same
+    stream.
     """
     def _declined(reason: str, **extra: Any) -> None:
         # Every early exit leaves a receipt: a warm turn that re-prefilled
@@ -15827,6 +15839,9 @@ def _maybe_canonicalize_committed_reasoning(
     if compare_ids is None:
         _declined("image_keying_failed", session_id=session_id)
         return None
+    inkling = getattr(state.runtime.tokenizer, "inkling_protocol", False) is True
+    if inkling and compared_stream is not None:
+        compared_stream[:] = [tuple(committed)]
     cp_raw = common_prefix_len(compare_ids, committed)
     if cp_raw >= min(len(committed), len(compare_ids)):
         # already extends (or is contained in) the committed stream: the
@@ -15867,26 +15882,65 @@ def _maybe_canonicalize_committed_reasoning(
         _record(template_observability)
         _record(request_observability)
         return None
-    if getattr(state.runtime.tokenizer, "inkling_protocol", False) is True:
+    if inkling:
         # Inkling's template renders a turn from its parsed fields (each tool
         # argument through tojson), so the message-level substitution below
         # cannot put the model's bytes back. The splice compares the dialect's
         # turns instead and serves the bank's ids for each turn that says the
         # same thing, putting back reasoning the client dropped.
-        spliced = _splice_prompt_onto_committed(
-            state,
-            messages,
-            compare_ids,
-            committed,
-            cp_raw,
-            outcome,
-            substitute_reasoning=True,
-            visible_gate=lambda text, has_tool_calls: _canonical_turn_gate_text(
-                text,
-                has_tool_calls=has_tool_calls,
-                strip_tool_call_preamble=strip_tool_call_preamble_text,
-            ),
-        )
+        def splice_onto(
+            stream: Sequence[int], cp_before: int, record: dict[str, Any]
+        ) -> tuple[list[ChatMessage], list[int]] | None:
+            return _splice_prompt_onto_committed(
+                state,
+                messages,
+                compare_ids,
+                stream,
+                cp_before,
+                record,
+                substitute_reasoning=True,
+                visible_gate=lambda text, has_tool_calls: _canonical_turn_gate_text(
+                    text,
+                    has_tool_calls=has_tool_calls,
+                    strip_tool_call_preamble=strip_tool_call_preamble_text,
+                ),
+            )
+
+        spliced = splice_onto(committed, cp_raw, outcome)
+        if (outcome.get("token_splice") or {}).get("stopped") == "outside_assistant_turn":
+            # The stream left this prompt at a message the client wrote, so it
+            # is another branch of the conversation: a client that went back
+            # in its history and continued elsewhere (Pi's tree), a request
+            # made on the side under the same id, an edit it undid. The bank
+            # may hold the branch this prompt continues; the walk proves each
+            # turn of it as for the registry's stream, and the branch it
+            # carries furthest is served.
+            reach = int(outcome.get("cp_spliced") or cp_raw)
+            branch: dict[str, Any] | None = None
+            for stream in _session_streams_from_bank(state, session_id, compare_ids):
+                if stream == tuple(committed):
+                    continue
+                cp_stream = int(common_prefix_len(compare_ids, stream))
+                trial: dict[str, Any] = {
+                    "applied": False,
+                    "cp_raw": cp_stream,
+                    "committed_len": int(len(stream)),
+                    "committed_source": "bank_branch",
+                }
+                result = splice_onto(stream, cp_stream, trial)
+                if result is not None and int(trial.get("cp_spliced") or 0) > reach:
+                    spliced, reach, branch = result, int(trial["cp_spliced"]), trial
+                    if compared_stream is not None:
+                        compared_stream[:] = [stream]
+            if branch is not None:
+                branch["left_stream"] = {
+                    "source": committed_source,
+                    "committed_len": int(len(committed)),
+                    "cp_raw": int(cp_raw),
+                    "stopped": "outside_assistant_turn",
+                }
+                outcome.clear()
+                outcome.update(branch)
         _record(template_observability)
         _record(request_observability)
         return spliced
@@ -15997,6 +16051,28 @@ def _maybe_canonicalize_committed_reasoning(
     if spliced is not None:
         return spliced
     return canon_messages, canon_ids
+
+
+def _session_streams_from_bank(
+    state: Any,
+    session_id: str | None,
+    prompt_ids: Sequence[int],
+    limit: int = 4,
+) -> list[tuple[int, ...]]:
+    """Conversation ``session_id``'s stored entries closest to ``prompt_ids``
+    (``SessionBank.session_streams``): the branches of a resent history the
+    gate may compare with when the registry's stream is another branch. []
+    when the bank holds none."""
+    bank = getattr(getattr(state, "sessions", None), "bank", None)
+    lookup = getattr(bank, "session_streams", None)
+    model_path = getattr(getattr(state, "runtime", None), "model_path", None)
+    if not session_id or not callable(lookup) or model_path is None:
+        return []
+    return [
+        tuple(stream)
+        for stream in lookup(session_id, model_path=str(model_path), prompt=prompt_ids, limit=limit) or ()
+        if stream
+    ]
 
 
 def _session_stream_from_bank(
@@ -40460,6 +40536,7 @@ def create_app(state: ServerState) -> FastAPI:
                 ) != list(map(int, raw_expanded_ids)):
                     prompt_view = None
             _canonicalized = None
+            _compared_stream: list[tuple[int, ...]] = []
             if vision_session_restore is None or prompt_view is not None:
                 _canonicalized = _maybe_canonicalize_committed_reasoning(
                     state,
@@ -40481,6 +40558,7 @@ def create_app(state: ServerState) -> FastAPI:
                     strip_tool_call_preamble_text=strip_tool_call_preamble_text,
                     session_id=resolved_session_id,
                     prompt_view=prompt_view,
+                    compared_stream=_compared_stream,
                 )
             if vision_session_restore is not None:
                 _served = (
@@ -40493,6 +40571,7 @@ def create_app(state: ServerState) -> FastAPI:
                         template_observability=template_observability,
                         receipt=vision_session_restore,
                         session_id=resolved_session_id,
+                        compared_stream=_compared_stream,
                     )
                     if prompt_view is not None
                     else None

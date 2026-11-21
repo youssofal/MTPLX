@@ -2054,6 +2054,42 @@ class SessionBank:
                 best = entry
         return best
 
+    def session_streams(
+        self,
+        session_id: str | None,
+        *,
+        model_path: str,
+        prompt: list[int] | tuple[int, ...],
+        limit: int = 4,
+    ) -> list[tuple[int, ...]]:
+        """The stored entries of conversation ``session_id`` (RAM and the SSD
+        manifest) that share the longest prefix with ``prompt``, as token ids,
+        the longer first on a tie; [] when neither holds one. For a gate whose
+        conversation is not in the session registry (a restart, an idle
+        eviction) or whose registry stream is another branch of it: the ids it
+        may re-express a resent history in. Nothing is restored here.
+        """
+        if not session_id or limit < 1:
+            return []
+        tokens = as_token_tuple(prompt)
+        candidates = [
+            tuple(entry.token_ids)
+            for entry in list(self._entries.values())
+            if entry.session_id == session_id and entry.model_path == str(model_path)
+        ]
+        probe = getattr(self.cold_tier, "session_streams", None)
+        if callable(probe):
+            candidates += [
+                tuple(stream)
+                for stream in probe(session_id, model_path=str(model_path), prompt=tokens, limit=limit) or ()
+            ]
+        ranked = sorted(
+            {stream: None for stream in candidates if stream},
+            key=lambda stream: (common_prefix_len(tokens, stream), len(stream)),
+            reverse=True,
+        )
+        return ranked[:limit]
+
     def session_stream(
         self,
         session_id: str | None,
@@ -2061,31 +2097,9 @@ class SessionBank:
         model_path: str,
         prompt: list[int] | tuple[int, ...],
     ) -> tuple[int, ...]:
-        """The stored entry of conversation ``session_id`` (RAM first, then
-        the SSD manifest) that shares the longest prefix with ``prompt``, as
-        token ids; () when neither holds one. For a gate whose conversation is
-        no longer in the session registry (a restart, an idle eviction): the
-        ids it re-expresses a resent history in. Nothing is restored here.
-        """
-        if not session_id:
-            return ()
-        tokens = as_token_tuple(prompt)
-        best: tuple[int, ...] = ()
-        best_matched = -1
-        for entry in list(self._entries.values()):
-            if entry.session_id != session_id or entry.model_path != str(model_path):
-                continue
-            matched = common_prefix_len(tokens, entry.token_ids)
-            if matched > best_matched or (matched == best_matched and len(entry.token_ids) > len(best)):
-                best, best_matched = tuple(entry.token_ids), matched
-        probe = getattr(self.cold_tier, "session_stream", None)
-        if callable(probe):
-            cold = tuple(probe(session_id, model_path=str(model_path), prompt=tokens) or ())
-            if cold:
-                matched = common_prefix_len(tokens, cold)
-                if matched > best_matched or (matched == best_matched and len(cold) > len(best)):
-                    best = cold
-        return best
+        """The first of ``session_streams``; () when there is none."""
+        streams = self.session_streams(session_id, model_path=model_path, prompt=prompt, limit=1)
+        return streams[0] if streams else ()
 
     def cold_exact_prefix_len(
         self,

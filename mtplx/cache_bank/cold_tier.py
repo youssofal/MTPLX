@@ -1216,45 +1216,45 @@ class SessionBankColdTier:
             )
         return 0
 
-    def session_stream(
+    def session_streams(
         self,
         session_id: str,
         *,
         model_path: str,
         prompt: list[int] | tuple[int, ...],
-    ) -> tuple[int, ...]:
-        """The token ids of this conversation's stored entry that shares the
-        longest prefix with ``prompt`` (the longer entry on a tie), read from
-        the manifest alone; () when the conversation has none here.
+        limit: int = 4,
+    ) -> list[tuple[int, ...]]:
+        """This conversation's stored entries, as token ids, that share the
+        longest prefix with ``prompt`` (the longer entry first on a tie), read
+        from the manifest alone; [] when the conversation has none here.
 
-        A server that restarted holds no conversation in RAM, so the gate that
-        re-expresses a resent history in the ids the model wrote has nothing
-        to compare with, and the history the client sends leaves every stored
-        entry at the first turn those ids differ from a re-render. This is the
-        stream the gate compares with instead. Only a probe: the restore that
-        follows applies every identity check of its own.
+        The gate that re-expresses a resent history in the ids the model wrote
+        compares it with one of these when the session registry holds no
+        stream for the conversation (the server restarted, or it was evicted
+        idle) or holds another branch of it (a client that went back in its
+        history and continued elsewhere). Without them the history the client
+        sends leaves every stored entry at the first turn those ids differ from
+        a re-render. Only a probe: the restore that follows applies every
+        identity check of its own.
         """
-        if self.mode in {"off", "write-only"} or not session_id:
-            return ()
+        if self.mode in {"off", "write-only"} or not session_id or limit < 1:
+            return []
         tokens = tuple(int(token) for token in prompt)
         if not tokens:
-            return ()
-        best: array | tuple[int, ...] = ()
-        best_matched = -1
+            return []
+        ranked: list[tuple[int, int, int, array | tuple[int, ...]]] = []
         try:
             with self._connect() as conn:
                 rows = list(
                     conn.execute(
                         "SELECT * FROM entries WHERE session_id = ? AND model_path = ? "
-                        "AND format_version = ? ORDER BY prefix_len DESC",
+                        "AND format_version = ?",
                         (str(session_id), str(model_path), COLD_TIER_FORMAT_VERSION),
                     ).fetchall()
                 )
-            for row in rows:
+            for index, row in enumerate(rows):
                 ids = self._row_token_ids(row)
-                matched = common_prefix_len(tokens, ids)
-                if matched > best_matched:
-                    best, best_matched = ids, matched
+                ranked.append((common_prefix_len(tokens, ids), len(ids), -index, ids))
         except Exception as exc:
             # A probe, like exact_prefix_len: the request goes on without it,
             # and the restore reports its own result.
@@ -1263,8 +1263,27 @@ class SessionBankColdTier:
                 type(exc).__name__,
                 exc,
             )
-            return ()
-        return tuple(best)
+            return []
+        ranked.sort(key=lambda item: item[:3], reverse=True)
+        streams: list[tuple[int, ...]] = []
+        for _matched, _length, _order, ids in ranked:
+            stream = tuple(ids)  # only the streams handed out are copied
+            if stream not in streams:
+                streams.append(stream)
+            if len(streams) >= limit:
+                break
+        return streams
+
+    def session_stream(
+        self,
+        session_id: str,
+        *,
+        model_path: str,
+        prompt: list[int] | tuple[int, ...],
+    ) -> tuple[int, ...]:
+        """The first of ``session_streams``; () when there is none."""
+        streams = self.session_streams(session_id, model_path=model_path, prompt=prompt, limit=1)
+        return streams[0] if streams else ()
 
     def lookup_prefix_boundary(
         self,
