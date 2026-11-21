@@ -34,7 +34,7 @@ PACK_NAMES = {
     "quality": "Optimized Quality",
     "speed": "Optimized Speed",
     "bare-speed": "Bare Speed",
-    "bare-speed-e4": "Bare Speed E4",
+    "bare-speed-mxfp8": "Bare Speed MXFP8 Experts",
     "native-quality": "Native Experts Quality",
 }
 
@@ -84,11 +84,11 @@ def verify_source(source: Path):
 
 def _precision_sentences(manifest: dict) -> list[str]:
     recipe = manifest["recipe"]
-    if recipe in {"bare-speed", "bare-speed-e4"}:
+    if recipe in {"bare-speed", "bare-speed-mxfp8"}:
         experts = (
             "The first 20 expert layers keep their published NVFP4 weights and the last four are re-coded to "
             "4-bit weights in groups of 64."
-            if recipe == "bare-speed-e4"
+            if recipe == "bare-speed"
             else "The experts keep their published NVFP4 and MXFP8 weights."
         )
         return [
@@ -101,7 +101,15 @@ def _precision_sentences(manifest: dict) -> list[str]:
         "The first 20 expert layers use their published NVFP4 weights and the last four use MXFP8.",
         "The FP32 routing and loop-control weights keep their source values.",
     ]
-    if recipe in {"speed", "native-quality"} and manifest.get("matrix_bit_counts") == {"8": 1}:
+    if recipe == "speed":
+        return [
+            "The attention projections of all 24 layers and the output vocabulary use 8-bit weights in groups "
+            "of 64, which cuts the weights read for each token from about 5.5 GB to about 3.7 GB.",
+            "The first 20 expert layers keep their published NVFP4 weights and the last four are re-coded to "
+            "4-bit weights in groups of 64.",
+            "The routing, loop-control, normalization and convolution weights keep their published values.",
+        ]
+    if recipe == "native-quality" and manifest.get("matrix_bit_counts") == {"8": 1}:
         return [*native, "The output vocabulary uses 8-bit weights in groups of 32."]
     return native
 

@@ -3404,7 +3404,7 @@ def build_parser() -> argparse.ArgumentParser:
     inkling = forge_sub.add_parser("inkling", help="Build a mixed-precision Inkling 2 Mini consumer pack")
     inkling.add_argument("source", type=Path)
     inkling.add_argument("destination", type=Path)
-    inkling.add_argument("--recipe", choices=("bare-speed", "bare-speed-e4", "speed", "quality", "native-quality"), required=True)
+    inkling.add_argument("--recipe", choices=("bare-speed", "bare-speed-mxfp8", "speed", "quality", "native-quality"), required=True)
     inkling.set_defaults(func=cmd_forge_public)
 
     forge_probe_p = forge_sub.add_parser(

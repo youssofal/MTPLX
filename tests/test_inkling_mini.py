@@ -65,8 +65,11 @@ def test_native_image_parts_preserve_order_and_escape_user_placeholders():
 def test_pack_precision_preserves_published_experts_and_loop_weights():
     head = "model.llm.unembed.weight"
     assert matrix_layout(head, "quality") is None
-    assert matrix_layout(head, "speed") == (8, 32)
-    for recipe in ("quality", "speed"):
+    assert matrix_layout(head, "native-quality") == (8, 32)
+    assert matrix_layout(head, "speed") == (8, 64)
+    assert matrix_layout("model.llm.layers.7.attn.wq_du.weight", "speed") == (8, 64)
+    assert matrix_layout("model.llm.layers.22.mlp.experts.w2_weight", "speed") == (4, 64)
+    for recipe in ("quality", "native-quality"):
         for layer in range(24):
             for suffix in (
                 "mlp.experts.w13_weight",

@@ -4,10 +4,16 @@ Recipes (``matrix_layout`` is the single source of which matrix gets which bits)
 
 - ``quality``: the published checkpoint, byte for byte (``stage_native_pack``).
 - ``bare-speed``: every large 16-bit matrix a token reads (the six attention projections of all
-  24 layers and the vocabulary head) as 4-bit affine codes in groups of 64; experts keep their
-  trained NVFP4 and MXFP8 formats; routers, norms, clip scales, convolutions, controllers and the
-  relative basis keep their source values.
-- ``speed``: the mixed recipe (4 bits where the model does not notice, 8 where it does).
+  24 layers and the vocabulary head) as 4-bit affine codes in groups of 64, and the four trained
+  MXFP8 expert layers (20 to 23) re-coded to the same 4-bit codes (measured: KL against native
+  0.0287 against 0.0283 with them kept, for 1.91 GB less); the NVFP4 experts of layers 0 to 19
+  keep their trained format; routers, norms, clip scales, convolutions, controllers and the
+  relative basis keep their source values. ``bare-speed-mxfp8`` keeps layers 20 to 23 trained
+  (the comparator it was measured against).
+- ``speed`` (Optimized Speed): the same matrices as Bare Speed at 8 bits in groups of 64, the four
+  MXFP8 expert layers re-coded to 4-bit codes as in Bare Speed. On L5's 4K control the 8-bit
+  projections and head measure KL 0.0188 against native, at the noise floor of that measurement
+  (MLX 0.32.4 on the native weights: 0.0196), against 0.0283 at 4 bits.
 - ``native-quality``: the vocabulary head at 8 bits, everything else published (a research control).
 
 The writer streams: unchanged tensors are copied byte ranges of the source file, and one matrix at a
@@ -42,7 +48,7 @@ _PROJECTION = re.compile(
     r"model\.llm\.layers\.(\d+)\.attn\.(" + "|".join(PROJECTIONS) + r")\.weight"
 )
 _EXPERTS = re.compile(r"model\.llm\.layers\.(\d+)\.mlp\.experts\.(w13_weight|w2_weight)")
-RECIPES = ("bare-speed", "bare-speed-e4", "speed", "quality", "native-quality")
+RECIPES = ("bare-speed", "bare-speed-mxfp8", "speed", "quality", "native-quality")
 SHARD_BYTES = 5 * 1000**3
 # A recipe may move the four trained-MXFP8 expert layers (20 to 23) to affine codes.
 _FP8_EXPERT_LAYERS = range(20, 24)
@@ -50,13 +56,20 @@ _FP8_EXPERT_LAYERS = range(20, 24)
 
 def matrix_layout(name: str, recipe: str) -> tuple[int, int] | None:
     """(bits, group size) of the affine codes a recipe stores for ``name``; None keeps the source tensor."""
-    if recipe in {"speed", "native-quality"}:
+    if recipe == "native-quality":
         return (8, 32) if name == HEAD else None
-    if recipe in {"bare-speed", "bare-speed-e4"}:
+    if recipe == "speed":
+        if name == HEAD or _PROJECTION.fullmatch(name):
+            return (8, 64)
+        expert = _EXPERTS.fullmatch(name)
+        if expert and int(expert.group(1)) in _FP8_EXPERT_LAYERS:
+            return (4, 64)
+        return None
+    if recipe in {"bare-speed", "bare-speed-mxfp8"}:
         if name == HEAD or _PROJECTION.fullmatch(name):
             return (4, 64)
         expert = _EXPERTS.fullmatch(name)
-        if recipe == "bare-speed-e4" and expert and int(expert.group(1)) in _FP8_EXPERT_LAYERS:
+        if recipe == "bare-speed" and expert and int(expert.group(1)) in _FP8_EXPERT_LAYERS:
             return (4, 64)
         return None
     if recipe == "quality":

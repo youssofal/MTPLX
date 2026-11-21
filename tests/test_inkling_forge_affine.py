@@ -20,6 +20,7 @@ PROJECTIONS = ("wq_du", "wk_dv", "wv_dv", "wr_du", "gate_attn", "wo_ud")
 
 
 def test_bare_speed_converts_every_projection_and_the_head_and_nothing_that_steers():
+    # Layers 0-19 keep their trained NVFP4 experts in every Bare Speed recipe.
     for layer in range(24):
         for name in PROJECTIONS:
             assert matrix_layout(f"model.llm.layers.{layer}.attn.{name}.weight", "bare-speed") == (4, 64)
@@ -29,8 +30,6 @@ def test_bare_speed_converts_every_projection_and_the_head_and_nothing_that_stee
             "attn.rel_logits_proj.proj",
             "attn.q_l2_clip.scale",
             "mlp.gate.weight",
-            "mlp.experts.w13_weight",
-            "mlp.experts.w2_weight",
             "controllers.k.down_weight",
             "attn_norm.weight",
         ):
@@ -40,12 +39,15 @@ def test_bare_speed_converts_every_projection_and_the_head_and_nothing_that_stee
     assert matrix_layout("model.visual.proj_in.weight", "bare-speed") is None
 
 
-def test_the_e4_comparator_moves_only_the_trained_mxfp8_experts():
+def test_bare_speed_recodes_only_the_trained_mxfp8_experts_and_the_comparator_keeps_them():
     for layer in range(24):
         for name in ("w13_weight", "w2_weight"):
-            want = (4, 64) if layer >= 20 else None
-            assert matrix_layout(f"model.llm.layers.{layer}.mlp.experts.{name}", "bare-speed-e4") == want
-    assert matrix_layout("model.llm.layers.21.mlp.experts.w13_weight_scale", "bare-speed-e4") is None
+            key = f"model.llm.layers.{layer}.mlp.experts.{name}"
+            assert matrix_layout(key, "bare-speed") == ((4, 64) if layer >= 20 else None)
+            assert matrix_layout(key, "bare-speed-mxfp8") is None
+    assert matrix_layout("model.llm.layers.21.mlp.experts.w13_weight_scale", "bare-speed") is None
+    for layer in range(24):
+        assert matrix_layout(f"model.llm.layers.{layer}.attn.wo_ud.weight", "bare-speed-mxfp8") == (4, 64)
 
 
 def test_unknown_recipe_is_refused():
