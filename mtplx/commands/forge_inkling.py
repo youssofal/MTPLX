@@ -33,6 +33,9 @@ PACK_NAMES = {
     "native": "Native",
     "quality": "Optimized Quality",
     "speed": "Optimized Speed",
+    "bare-speed": "Bare Speed",
+    "bare-speed-e4": "Bare Speed E4",
+    "native-quality": "Native Experts Quality",
 }
 
 
@@ -79,17 +82,39 @@ def verify_source(source: Path):
     return config, header_size, header
 
 
+def _precision_sentences(manifest: dict) -> list[str]:
+    recipe = manifest["recipe"]
+    if recipe in {"bare-speed", "bare-speed-e4"}:
+        experts = (
+            "The first 20 expert layers keep their published NVFP4 weights and the last four are re-coded to "
+            "4-bit weights in groups of 64."
+            if recipe == "bare-speed-e4"
+            else "The experts keep their published NVFP4 and MXFP8 weights."
+        )
+        return [
+            "The attention projections of all 24 layers and the output vocabulary use 4-bit weights in groups "
+            "of 64, which cuts the weights read for each token from about 5.5 GB to about 3 GB.",
+            experts,
+            "The routing, loop-control, normalization and convolution weights keep their published values.",
+        ]
+    native = [
+        "The first 20 expert layers use their published NVFP4 weights and the last four use MXFP8.",
+        "The FP32 routing and loop-control weights keep their source values.",
+    ]
+    if recipe in {"speed", "native-quality"} and manifest.get("matrix_bit_counts") == {"8": 1}:
+        return [*native, "The output vocabulary uses 8-bit weights in groups of 32."]
+    return native
+
+
 def _write_model_card(staged: Path, manifest: dict) -> None:
     fp16 = manifest.get("precision_variant") == "fp16"
-    speed = manifest["recipe"] == "speed"
-    sentences = []
-    if speed:
-        sentences.append("The output vocabulary uses 8-bit weights in groups of 32.")
+    sentences = _precision_sentences(manifest)
+    converted = bool(manifest.get("matrix_bit_counts"))
     if fp16:
         sentences.append("BF16 tensors, including the vision tower and drafter, are converted to FP16. "
                          "The conversion manifest records rounding and the largest change.")
-    elif speed:
-        sentences.append("Every other tensor keeps its published values.")
+    elif converted:
+        sentences.append("The vision tower and the drafter keep their published values.")
     else:
         sentences.append("Both weight files are byte-for-byte copies of the published checkpoint.")
     precision = " ".join(sentences)
@@ -105,7 +130,7 @@ tags: [mtplx, mlx, apple-silicon, macos, vision, coding, speculative-decoding]
 
 Inkling 2 Mini is a vision and coding model for local use on Apple silicon. The middle 12 layers run three times per token. This pack carries the vision tower, tool-call template and DSpark block drafter. Its model weights occupy {size:.2f} GB.
 
-The first 20 expert layers use their published NVFP4 weights and the last four use MXFP8. The FP32 routing and loop-control weights keep their source values. {precision}
+{precision}
 
 ## Run locally
 
@@ -139,7 +164,10 @@ def write_pack_metadata(staged: Path, recipe: str) -> dict:
         "weight_bytes": sum(
             file.stat().st_size for file in staged.glob("*.safetensors")
         ),
-        "matrix_bit_counts": {"8": len(precision)} if precision else {},
+        "matrix_bit_counts": {
+            str(bits): sum(layout["bits"] == bits for layout in precision.values())
+            for bits in sorted({layout["bits"] for layout in precision.values()})
+        },
     }
     _write_model_card(staged, manifest)
     (staged / "mtplx-pack.json").write_text(json.dumps(manifest, indent=2) + "\n")
