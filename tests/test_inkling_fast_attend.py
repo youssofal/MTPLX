@@ -278,3 +278,29 @@ def test_long_history_order_equals_mlx_order_and_rc6(history, rows, order):
                     k[:, :, history + r:history + r + 1], v[:, :, history + r:history + r + 1],
                     kc1, vc1, c1, n1, history + r, weights[0], window=False, long=True)
         assert _same(h1, tiles[:, r:r + 1]), f"row {r} of {rows} differs from its one-row call"
+
+
+@pytest.mark.parametrize("history,rows", [(4142, 9), (2100, 16), (8190, 25), (4142, 32), (20000, 25), (300, 12)])
+def test_copy_panels_take_the_tile_order_in_row_groups(history, rows):
+    """Global visits of 9 to 32 rows (a copy round's verify) in row groups: the tile order, the
+    per-key order in one threadgroup (the route they replace) and RC6's attention give the same
+    bits, and every row equals its one-row call."""
+    k, v, inputs, weights = _setup(history + rows, rows, seed=history * 7 + rows)
+    q, rel, sink, gate, x, tail = inputs
+    kc, vc, count, newest = _committed(k, v, history, False, 0)
+    args = (q, rel, sink, gate, k[:, :, history:history + rows], v[:, :, history:history + rows],
+            kc, vc, count, newest, history, weights[0])
+    grouped = attend(*args, window=False)
+    one_group = attend(*args, window=False, grouped=False)
+    grouped_per_key = attend(*args, window=False, long=False)
+    ref, _, _ = _rc6(k, v, history, inputs, weights, False, False)
+    mx.eval(grouped, one_group, grouped_per_key, ref)
+    assert _same(grouped, one_group), "row groups differ from the one-threadgroup panel"
+    assert _same(grouped, grouped_per_key), "the grouped tile order differs from the grouped per-key order"
+    assert _same(grouped, ref), "the grouped panel differs from RC6"
+    for r in (0, rows // 2, rows - 1):
+        kc1, vc1, c1, n1 = _committed(k, v, history + r, False, 0)
+        h1 = attend(q[:, r:r + 1], rel[:, r:r + 1], sink[:, r:r + 1], gate[:, r:r + 1],
+                    k[:, :, history + r:history + r + 1], v[:, :, history + r:history + r + 1],
+                    kc1, vc1, c1, n1, history + r, weights[0], window=False)
+        assert _same(h1, grouped[:, r:r + 1]), f"row {r} of {rows} differs from its one-row call"

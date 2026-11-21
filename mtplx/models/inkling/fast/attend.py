@@ -179,6 +179,7 @@ def _qualification_cases(plan):
         (False, 300, 32, 0),      # widest panel: 1,024-thread threadgroups
         (False, tiles, 2, 0),     # long-history tile order 1
         (False, tiles, 3, 0),     # long-history tile order 2
+        (False, tiles, 25, 0),    # a copy panel: tile order 2 in row groups (rows past 8)
     ]
 
 
@@ -613,6 +614,35 @@ _PARTIALS = """
 """
 
 
+# The same partials for a panel of more than 8 rows (a copy round's verify), in row groups of RG
+# rows a threadgroup: the long-history order's queries and key weights take threadgroup memory a
+# row (2 KB a row for order 2), so a 25-row threadgroup could not hold them and those panels took
+# the per-key order, at twice the work a key (census c1-census-bare-b: a 25-row step's attention
+# 11 ms at 4K, 112 ms at 102K). Each row's chain loop is the same code on the same keys as in
+# _PARTIALS, so every row keeps its bits; the NG groups of one residue sit side by side in the
+# grid, so they read that residue's keys while they are in the cache. The narrow text is unchanged.
+_PARTIALS_WIDE = (_PARTIALS
+    .replace("    const int rho = int(threadgroup_position_in_grid.x);   // physical position residue\n",
+             "    const int rho = int(threadgroup_position_in_grid.x) / NG;   // physical position residue\n"
+             "    const int rgroup = int(threadgroup_position_in_grid.x) % NG;\n")
+    .replace("    const int r = int(simdgroup_index_in_threadgroup);     // panel row\n",
+             "    const int rl = int(simdgroup_index_in_threadgroup);    // row of the group\n"
+             "    const int r = RG * rgroup + rl;                         // panel row\n"
+             "    if (r >= ROWS) {\n"
+             "        return;\n"
+             "    }\n")
+    .replace("threadgroup float qsh[LONG ? ROWS * 3 * 128 : 1];", "threadgroup float qsh[LONG ? RG * 3 * 128 : 1];")
+    .replace("threadgroup float esh[LONG == 2 ? ROWS * 32 * 4 : 1];", "threadgroup float esh[LONG == 2 ? RG * 32 * 4 : 1];")
+    .replace("threadgroup float* qr = qsh + r * 3 * 128;", "threadgroup float* qr = qsh + rl * 3 * 128;")
+    .replace("threadgroup float4* qr4 = (threadgroup float4*)(qsh + r * 3 * 128);",
+             "threadgroup float4* qr4 = (threadgroup float4*)(qsh + rl * 3 * 128);")
+    .replace("threadgroup float4* es = (threadgroup float4*)(esh + r * 32 * 4);",
+             "threadgroup float4* es = (threadgroup float4*)(esh + rl * 32 * 4);"))
+assert _PARTIALS_WIDE.count("rl * ") == 3 and "ROWS * 3" not in _PARTIALS_WIDE and "/ NG" in _PARTIALS_WIDE
+#: Rows a threadgroup of the wide partials holds.
+WIDE_GROUP = 8
+
+
 _MERGE = """
     const int h = int(threadgroup_position_in_grid.x);
     const int r = int(threadgroup_position_in_grid.y);
@@ -885,6 +915,8 @@ _OUTPUTS = {
 }
 _INPUTS["mtplx_inkling_fast_attend_window"] = ["q", "kc", "vc", "kr", "vr", "prof", "sink", "gate", "pos", "count", "newest"]
 _OUTPUTS["mtplx_inkling_fast_attend_window"] = ["hg"]
+_INPUTS["mtplx_inkling_fast_attend_partials_wide"] = _INPUTS["mtplx_inkling_fast_attend_partials"]
+_OUTPUTS["mtplx_inkling_fast_attend_partials_wide"] = _OUTPUTS["mtplx_inkling_fast_attend_partials"]
 
 
 def _u32(value):
@@ -899,7 +931,7 @@ def profiles(rel, rel_basis):
 
 
 def attend(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newest, pos,
-           rel_basis, *, window, plan=None, one_launch_window=False, long=None):
+           rel_basis, *, window, plan=None, one_launch_window=False, long=None, grouped=None):
     """The gated attention result of a panel, ``(1, W, 3072)`` in the query dtype.
 
     ``q (1, W, 24, 128)``, ``rel (1, W, 24, 16)``, ``sink (1, W, 24)``,
@@ -909,9 +941,11 @@ def attend(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newes
     first ``count`` slots are positions ``0 .. count - 1``. ``count``, ``newest`` and
     ``pos`` are uint32 arrays (or ints, for tests); they never become shapes.
 
-    ``long`` (default: on for global visits of bf16 panels up to 8 rows, the order by
-    ``long_order``; 1 or 2 to choose) takes the exact long-history tile order for the committed
-    keys; ``long=False`` keeps MLX's per-key order everywhere. All give RC6's bits.
+    ``long`` (default: on for global visits of bf16 panels, the order by ``long_order``; 1 or 2
+    to choose) takes the exact long-history tile order for the committed keys; ``long=False``
+    keeps MLX's per-key order everywhere. All give RC6's bits. ``grouped`` (default: global
+    visits of more than ``WIDE_GROUP`` rows) takes the row-grouped partials; ``False`` keeps one
+    threadgroup for the whole panel (which holds the tile order only up to 8 rows).
 
     Raises ``FusedAttentionDeclined`` where ``decline_reason`` is not ``None`` (a reduction
     this route does not serve, or bits that differ from MLX's on this Mac): call
@@ -922,11 +956,12 @@ def attend(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newes
     if reason is not None:
         raise FusedAttentionDeclined(f"fused attention declined on this Mac: {reason} ({DECLINED[(str(q.dtype), plan)][1]})")
     return _attend(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newest, pos,
-                   rel_basis, window=window, plan=plan, one_launch_window=one_launch_window, long=long)
+                   rel_basis, window=window, plan=plan, one_launch_window=one_launch_window, long=long,
+                   grouped=grouped)
 
 
 def _attend(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newest, pos,
-            rel_basis, *, window, plan, one_launch_window=False, long=None):
+            rel_basis, *, window, plan, one_launch_window=False, long=None, grouped=None):
     rows = q.shape[1]
     if not 1 <= rows <= MAX_ROWS:
         raise ValueError(f"A panel holds 1 to {MAX_ROWS} rows, got {rows}")
@@ -941,19 +976,33 @@ def _attend(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newe
         long = long_order(rows)
     prof = profiles(rel, rel_basis)
     pos_a, count_a, newest_a = _u32(pos), _u32(count), _u32(newest)
+    # Global visits of a panel wider than WIDE_GROUP rows take the row-grouped partials, which
+    # hold the long-history order at every width (the same bits as the per-key order).
+    wide = (not window and rows > WIDE_GROUP) if grouped is None else bool(grouped)
     template = [("T", dtype), ("WINDOW", bool(window)), ("BLOCKS", blocks),
                 ("THRESH", threshold), ("SCALE", SCALE_BITS),
-                ("ROWS", rows), ("LONG", int(long) if (long and not window and rows <= 8 and dtype == mx.bfloat16
-                                                    and lane_tree_ok()) else 0)]
+                ("ROWS", rows), ("LONG", int(long) if (long and not window and (rows <= 8 or wide)
+                                                    and dtype == mx.bfloat16 and lane_tree_ok()) else 0)]
     chains = rows * HEADS * blocks
-    po, pm, ps = _kernel("mtplx_inkling_fast_attend_partials", _PARTIALS, _HEADER)(
-        inputs=[q, keys, values, k_rows, v_rows, prof, sink, pos_a, count_a, newest_a],
-        template=template,
-        grid=(32 * rows * blocks, KV_HEADS, 1),
-        threadgroup=(32 * rows, 1, 1),
-        output_shapes=[(chains * HEAD_DIM,), (chains,), (chains,)],
-        output_dtypes=[mx.float32, mx.float32, mx.float32],
-    )
+    if wide:
+        groups = -(-rows // WIDE_GROUP)
+        po, pm, ps = _kernel("mtplx_inkling_fast_attend_partials_wide", _PARTIALS_WIDE, _HEADER)(
+            inputs=[q, keys, values, k_rows, v_rows, prof, sink, pos_a, count_a, newest_a],
+            template=[*template, ("RG", WIDE_GROUP), ("NG", groups)],
+            grid=(32 * WIDE_GROUP * blocks * groups, KV_HEADS, 1),
+            threadgroup=(32 * WIDE_GROUP, 1, 1),
+            output_shapes=[(chains * HEAD_DIM,), (chains,), (chains,)],
+            output_dtypes=[mx.float32, mx.float32, mx.float32],
+        )
+    else:
+        po, pm, ps = _kernel("mtplx_inkling_fast_attend_partials", _PARTIALS, _HEADER)(
+            inputs=[q, keys, values, k_rows, v_rows, prof, sink, pos_a, count_a, newest_a],
+            template=template,
+            grid=(32 * rows * blocks, KV_HEADS, 1),
+            threadgroup=(32 * rows, 1, 1),
+            output_shapes=[(chains * HEAD_DIM,), (chains,), (chains,)],
+            output_dtypes=[mx.float32, mx.float32, mx.float32],
+        )
     (hg,) = _kernel("mtplx_inkling_fast_attend_merge", _MERGE)(
         inputs=[po, pm, ps, gate_logits, pos_a, count_a],
         template=[("T", dtype), ("WINDOW", bool(window)), ("BLOCKS", blocks), ("THRESH", threshold)],
