@@ -414,6 +414,27 @@ def attention(q, keys, values, own_k, own_v_rows, count_rows, newest, *, ring: b
     return _decided(("attention", hq, hk, rows, dim, slots, bool(ring), str(q.dtype)), ours, stock)
 
 
+# ------------------------------------------------------------------------------ the Markov tables
+def markov_tables(drafter) -> list:
+    """The drafter's Markov projection in float32, made once a process: its recurrent columns
+    ``(3R, 2R)`` and its conditioning columns ``(3R, rest)``, each contiguous, and its bias ``(3R,)``.
+    The round used to make them every round with the library (a cast of the whole 768 x 5,120
+    projection and a copy of its strided conditioning columns: two launches and about 45 MB moved,
+    about 0.1 ms a round on the census profile); the values are the cast's, exactly. The round
+    program reads them as it reads a weight (``round_program._weights`` pins them). Kept on the
+    drafter as an instance attribute, not a parameter (``object.__setattr__``), so nothing that walks
+    its parameters sees them."""
+    tables = getattr(drafter, "_f1_markov32", None)
+    if tables is None:
+        rank = drafter.cfg["markov_rank"]
+        weights = drafter.markov["rnn_proj.weight"].astype(mx.float32)
+        tables = (mx.contiguous(weights[:, : 2 * rank]), mx.contiguous(weights[:, 2 * rank:]),
+                  drafter.markov["rnn_proj.bias"].astype(mx.float32))
+        mx.eval(*tables)
+        object.__setattr__(drafter, "_f1_markov32", tables)
+    return list(tables)
+
+
 # ------------------------------------------------------------------------------ block, propose
 def block(blk, hidden, residual, view, index: int):
     """``round_program._block`` with the glue above: the same values in fewer launches."""
@@ -481,11 +502,16 @@ def propose(drafter, target, anchor, view, count_: int, *, position, seed, tempe
     if base is None:
         base = linear(h, target.unembed)[..., : drafter.vocab]
     rank = drafter.cfg["markov_rank"]
-    weights = drafter.markov["rnn_proj.weight"].astype(mx.float32)
-    inputs = mx.concatenate([h, mx.broadcast_to(view.last, h.shape)], axis=-1)
-    conditioned = linear(inputs.astype(mx.float32), weights[:, 2 * rank :]) + drafter.markov[
-        "rnn_proj.bias"
-    ].astype(mx.float32)
+    recurrent, conditioning, bias32 = markov_tables(drafter)
+    inputs = mx.concatenate([h, mx.broadcast_to(view.last, h.shape)], axis=-1).astype(mx.float32)
+
+    def stock_weights():
+        return drafter.markov["rnn_proj.weight"].astype(mx.float32)
+
+    conditioned = _decided(
+        ("conditioned", inputs.shape[1], inputs.shape[2], str(h.dtype)),
+        lambda: linear(inputs, conditioning) + bias32,
+        lambda: linear(inputs, stock_weights()[:, 2 * rank:]) + drafter.markov["rnn_proj.bias"].astype(mx.float32))
     folded = drafter.fold(target.unembed)
 
     start = position.astype(mx.uint32).reshape(())
@@ -496,7 +522,8 @@ def propose(drafter, target, anchor, view, count_: int, *, position, seed, tempe
     picks, laws, stats, confidence = [], [], [], []
     for i in range(count_):
         step_in = markov_input(state, table, prev)
-        update = matvec(step_in, weights, cols=2 * rank)
+        update = _decided(("recurrent", rank, str(dtype)), lambda: matvec(step_in, recurrent, cols=2 * rank),
+                          lambda: matvec(step_in, stock_weights(), cols=2 * rank))
         state, signal = markov_update(update, conditioned[:, i], state, one)
         bias = matvec(signal, folded, cols=folded.shape[1] - 1, bias_col=folded.shape[1] - 1)
         scores = base[:, i] + bias
@@ -518,4 +545,4 @@ def propose(drafter, target, anchor, view, count_: int, *, position, seed, tempe
     return ids, law
 
 
-__all__ = ["add_norm", "attend_texts", "attention", "block", "enabled", "gate_act", "markov_input", "markov_update", "propose"]
+__all__ = ["add_norm", "attend_texts", "attention", "block", "markov_tables", "enabled", "gate_act", "markov_input", "markov_update", "propose"]
