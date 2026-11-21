@@ -243,12 +243,19 @@ public struct OnboardingFeatureState: Equatable, Sendable {
         case .curatedGemmaSpeed:
             return catalog.first { $0.id == "gemma4-optimized-speed" }
         case .curatedInklingBareSpeed:
-            // The Inkling trio is modern-tier only with no FP16 sibling, so it passes through.
-            return catalog.first { $0.id == "inkling2-mini-bare-speed" }
+            // The Inkling trio has FP16 precision siblings, offered on M1/M2 Macs
+            // (MTPLXModelOption.inklingLegacyOffer), as the Qwen 3.8 trio does.
+            let useFP16 = hardware?.tier == .legacyApple
+            let id = useFP16 ? "inkling2-mini-bare-speed-fp16" : "inkling2-mini-bare-speed"
+            return catalog.first { $0.id == id }
         case .curatedInklingOptimizedSpeed:
-            return catalog.first { $0.id == "inkling2-mini-optimized-speed" }
+            let useFP16 = hardware?.tier == .legacyApple
+            let id = useFP16 ? "inkling2-mini-optimized-speed-fp16" : "inkling2-mini-optimized-speed"
+            return catalog.first { $0.id == id }
         case .curatedInklingOptimizedQuality:
-            return catalog.first { $0.id == "inkling2-mini-optimized-quality" }
+            let useFP16 = hardware?.tier == .legacyApple
+            let id = useFP16 ? "inkling2-mini-optimized-quality-fp16" : "inkling2-mini-optimized-quality"
+            return catalog.first { $0.id == id }
         case .curatedStepFlash:
             return nil
         case .other, .local:

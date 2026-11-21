@@ -203,8 +203,11 @@ struct ModelPickStep: View {
         } else if row.choice == .curatedQwen38OptimizedSpeed
             || row.choice == .curatedQwen38BareSpeed
             || row.choice == .curatedQwen38OptimizedQuality
+            || row.choice == .curatedInklingBareSpeed
+            || row.choice == .curatedInklingOptimizedSpeed
+            || row.choice == .curatedInklingOptimizedQuality
         {
-            // Qwen 3.8 trio: legacy (M1/M2) Macs get the FP16 precision sibling.
+            // Qwen 3.8 and Inkling 2 Mini trios: legacy (M1/M2) Macs get the FP16 precision sibling.
             id = hardware?.tier == .legacyApple ? "\(row.modelID)-fp16" : row.modelID
         } else if row.choice == .curatedQwen35BSpeed {
             id = hardware?.tier == .legacyApple
@@ -845,11 +848,11 @@ struct RecommendedModelRow: Identifiable, Sendable {
             return .qwen27Quality
         case "gemma4-optimized-speed":
             return .gemma31
-        case "inkling2-mini-bare-speed":
+        case "inkling2-mini-bare-speed", "inkling2-mini-bare-speed-fp16":
             return .inklingBareSpeed
-        case "inkling2-mini-optimized-speed":
+        case "inkling2-mini-optimized-speed", "inkling2-mini-optimized-speed-fp16":
             return .inklingOptimizedSpeed
-        case "inkling2-mini-optimized-quality":
+        case "inkling2-mini-optimized-quality", "inkling2-mini-optimized-quality-fp16":
             return .inklingOptimizedQuality
         default:
             return nil
