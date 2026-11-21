@@ -13,12 +13,12 @@ one-row step; through this launch it does not. One row takes MLX's own product (
 Exactness: each output row repeats the one-row kernel MLX picks for the matrix's shape (its
 ``dispatch_qmv`` rule: ``qmv_fast`` when N is a multiple of 8 and K of 512 at 4 bits or 256 at 8
 bits, else ``qmv``), lane for lane: lane ``l`` takes ``VPT`` consecutive values of each block of
-``32 VPT`` columns (4 bits: 8 values in ``qmv``, 16 in ``qmv_fast``; 8 bits: 4 and 8); per block
-``load_vector`` (bf16 quartet sums, inputs pre-divided by 16, 256, 4,096 at 4 bits), ``qdot`` (masked
-products in its expression tree), ``scale * accum + sum * bias`` added to the lane's total;
-``simd_sum`` over the 32 lanes. The codes of an output row are decoded once per block and shared
-by every panel row. A first use on each shape proves the result against MLX's one-row product on
-the real operands; a disagreement refuses the route (counted) and the caller keeps MLX's product.
+``32 VPT`` columns (4 bits: 8 values in ``qmv``, 16 in ``qmv_fast``; 8 bits: 4 and 8), with the
+reference's per-lane arithmetic as ``affine_lane.AFFINE_LANE`` writes it (scaled inputs and their
+total, the codes in place, one term a block), the terms added in block order, then summed across
+the simdgroup. The codes of an output row are unpacked once per block and shared by every panel
+row. A first use on each shape proves the result against MLX's one-row product on the real
+operands; a disagreement refuses the route (counted) and the caller keeps MLX's product.
 
 ``QMV_ROWS`` is the same arithmetic as a Metal device function for another lane's launch (the
 fused attention output): ``qmv_rows<W, TM, K, BITS, GROUP, VPT>(codes, scales, biases, x, x_stride,
@@ -31,6 +31,8 @@ from __future__ import annotations
 from functools import lru_cache
 
 import mlx.core as mx
+
+from .affine_lane import AFFINE_LANE
 
 #: Threads of one threadgroup (simdgroups x 4 output rows each), by output rows: a small matrix (an
 #: output projection, 2,304 rows) 128, a large one (the head, 201,024 rows) 256. YSPLIT (the panel's
@@ -45,86 +47,10 @@ _SMALL_ROWS = 16384
 _RCH_SMALL = 8
 _RCH_LARGE = 4
 
-QMV_ROWS = """
-// MLX 0.32.2's load_vector for one lane's VPT values of a block (bf16 quartet sums in its order at
-// 4 bits, a running sum at 8; the 4-bit inputs pre-divided by 1, 16, 256, 4,096), into xt.
-template <int VPT, int BITS, typename T>
-inline float qmv_load(const device T* xs, thread float (&xt)[VPT]) {
-    float sum = 0;
-    if (BITS == 4) {
-        for (int i = 0; i < VPT; i += 4) {
-            sum += xs[i] + xs[i + 1] + xs[i + 2] + xs[i + 3];
-            xt[i] = xs[i];
-            xt[i + 1] = xs[i + 1] / 16.0f;
-            xt[i + 2] = xs[i + 2] / 256.0f;
-            xt[i + 3] = xs[i + 3] / 4096.0f;
-        }
-    } else {
-        for (int i = 0; i < VPT; i++) {
-            sum += xs[i];
-            xt[i] = xs[i];
-        }
-    }
-    return sum;
-}
-
-// The same pre-scaled inputs without the sum (the caller has it).
-template <int VPT, int BITS, typename T>
-inline void qmv_inputs(const device T* xs, thread float (&xt)[VPT]) {
-    if (BITS == 4) {
-        for (int i = 0; i < VPT; i += 4) {
-            xt[i] = xs[i];
-            xt[i + 1] = xs[i + 1] / 16.0f;
-            xt[i + 2] = xs[i + 2] / 256.0f;
-            xt[i + 3] = xs[i + 3] / 4096.0f;
-        }
-    } else {
-        for (int i = 0; i < VPT; i++) xt[i] = xs[i];
-    }
-}
-
-// One output row's VPT codes of a block as the floats qdot multiplies by (4 bits: the masked 16-bit
-// words, exact in float; 8 bits: the bytes).
-template <int VPT, int BITS>
-inline void qmv_decode(const device uint32_t* cw, thread float (&wf)[VPT]) {
-    if (BITS == 4) {
-        for (int p = 0; p < VPT / 8; ++p) {
-            const uint word = cw[p];
-            const ushort w16[2] = {ushort(word & 0xffffu), ushort(word >> 16)};
-            for (int h = 0; h < 2; ++h) {
-                wf[8 * p + 4 * h] = float(w16[h] & 0x000f);
-                wf[8 * p + 4 * h + 1] = float(w16[h] & 0x00f0);
-                wf[8 * p + 4 * h + 2] = float(w16[h] & 0x0f00);
-                wf[8 * p + 4 * h + 3] = float(w16[h] & 0xf000);
-            }
-        }
-    } else {
-        for (int i = 0; i < VPT; i++) wf[i] = float(uchar((cw[i / 4] >> (8 * (i % 4))) & 0xffu));
-    }
-}
-
-// qdot on decoded codes, in its expression tree; returns scale * accum + sum * bias.
-template <int VPT, int BITS>
-inline float qmv_term(const thread float (&xt)[VPT], float sum, const thread float (&wf)[VPT], float scale,
-                      float bias) {
-    float accum = 0;
-    if (BITS == 4) {
-        for (int i = 0; i < VPT / 4; ++i) {
-            accum +=
-                (xt[4 * i] * wf[4 * i] +
-                 xt[4 * i + 1] * wf[4 * i + 1] +
-                 xt[4 * i + 2] * wf[4 * i + 2] +
-                 xt[4 * i + 3] * wf[4 * i + 3]);
-        }
-    } else {
-        for (int i = 0; i < VPT; i++) accum += xt[i] * wf[i];
-    }
-    return scale * accum + sum * bias;
-}
-
+QMV_ROWS = AFFINE_LANE + """
 // MLX's one-row affine product for output rows [row0, row0 + TM) and W panel rows of x (row r at
 // x + r * x_stride; bf16 or float, as the reference product takes it), every lane of the calling
-// simdgroup together. result[r][tm] ends in every lane.
+// simdgroup together, through affine_lane. result[r][tm] ends in every lane.
 template <int W, int TM, int K, int BITS, int GROUP, int VPT, typename T>
 inline void qmv_rows(const device uint32_t* codes, const device bfloat16_t* scales,
                      const device bfloat16_t* biases, const device T* x, int x_stride, int row0,
@@ -139,12 +65,14 @@ inline void qmv_rows(const device uint32_t* codes, const device bfloat16_t* scal
             const size_t row = size_t(row0 + tm);
             sc[tm] = static_cast<float>(scales[row * GPR + col / GROUP]);
             bi[tm] = static_cast<float>(biases[row * GPR + col / GROUP]);
-            qmv_decode<VPT, BITS>(codes + row * WPR + col * BITS / 32, wf[tm]);
+            affine_lane::unpack<VPT, BITS>(codes + row * WPR + col * BITS / 32, wf[tm]);
         }
         for (int r = 0; r < W; ++r) {
+            const device T* xs = x + size_t(r) * x_stride + col;
             float xt[VPT];
-            const float sum = qmv_load<VPT, BITS>(x + size_t(r) * x_stride + col, xt);
-            for (int tm = 0; tm < TM; ++tm) result[r][tm] += qmv_term<VPT, BITS>(xt, sum, wf[tm], sc[tm], bi[tm]);
+            const float tot = affine_lane::take<VPT, BITS>(xs, xt);
+            for (int tm = 0; tm < TM; ++tm)
+                result[r][tm] += affine_lane::term<VPT, BITS>(xt, wf[tm], sc[tm], bi[tm], tot);
         }
     }
     for (int r = 0; r < W; ++r)
@@ -167,13 +95,12 @@ _SOURCE = """
     const uint rc_end = YSPLIT ? min(rc_begin + RCH, uint(W)) : uint(W);
     constexpr uint LROWS = YSPLIT ? RCH : W;
 
-    // load_vector's sum (MLX's order) for this threadgroup's panel rows, every block and lane.
+    // The inputs' totals (affine_lane::total) for this threadgroup's panel rows, every block and lane.
     threadgroup float lsum[SUMS ? LROWS * NB * 32 : 1];
     if (SUMS) {
         for (uint idx = thread_index_in_threadgroup; idx < LROWS * NB * 32; idx += THREADS) {
             const uint r = rc_begin + idx / (NB * 32), b = (idx / 32) % NB, l = idx % 32;
-            float xt[VPT];
-            if (r < rc_end) lsum[idx] = qmv_load<VPT, BITS>(x + size_t(r) * K + b * BLOCK + l * VPT, xt);
+            if (r < rc_end) lsum[idx] = affine_lane::total<VPT, BITS>(x + size_t(r) * K + b * BLOCK + l * VPT);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -190,20 +117,21 @@ _SOURCE = """
                 const size_t row = min(row0 + tm, uint(N - 1));
                 sc[tm] = static_cast<float>(scales[row * GPR + col / G]);
                 bi[tm] = static_cast<float>(biases[row * GPR + col / G]);
-                qmv_decode<VPT, BITS>(codes + row * WPR + col * BITS / 32, wf[tm]);
+                affine_lane::unpack<VPT, BITS>(codes + row * WPR + col * BITS / 32, wf[tm]);
             }
             for (uint r = 0; r < RCH; ++r) {
                 if (rc + r >= rc_end) break;
                 const device T* xs = x + size_t(rc + r) * K + col;
                 float xt[VPT];
-                float sum;
+                float tot;
                 if (SUMS) {
-                    qmv_inputs<VPT, BITS>(xs, xt);
-                    sum = lsum[((rc + r - rc_begin) * NB + b) * 32 + lane];
+                    affine_lane::scaled<VPT, BITS>(xs, xt);
+                    tot = lsum[((rc + r - rc_begin) * NB + b) * 32 + lane];
                 } else {
-                    sum = qmv_load<VPT, BITS>(xs, xt);
+                    tot = affine_lane::take<VPT, BITS>(xs, xt);
                 }
-                for (uint tm = 0; tm < 4; ++tm) acc[tm][r] += qmv_term<VPT, BITS>(xt, sum, wf[tm], sc[tm], bi[tm]);
+                for (uint tm = 0; tm < 4; ++tm)
+                    acc[tm][r] += affine_lane::term<VPT, BITS>(xt, wf[tm], sc[tm], bi[tm], tot);
             }
         }
         for (uint tm = 0; tm < 4; ++tm)
@@ -248,7 +176,7 @@ def lane_map(bits, rows, cols):
     fast = rows % 8 == 0 and cols % (pack * 2 * 32) == 0
     vpt = pack * 2 if fast else pack
     if cols % (vpt * 32):
-        return 0, f"cols_{cols}_not_whole_blocks"     # MLX's qmv tail (load_vector_safe) not served
+        return 0, f"cols_{cols}_not_whole_blocks"     # a partial last block (MLX's tail path) is not served
     return vpt, ""
 
 

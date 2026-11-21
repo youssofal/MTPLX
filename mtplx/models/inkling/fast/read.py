@@ -22,9 +22,10 @@ Exactness (class A against RC6 on every Mac). Each kernel step repeats MLX 0.32.
 for that step, thread for thread: ``rms_single_row`` (4 values a thread fused-multiply-added
 from zero, ``simd_sum``, then ``simd_sum`` over the zero-padded simdgroup totals,
 ``precise::rsqrt``), the one-query ``gemv`` (``bn8``: eight slices of 1,024-column blocks with a
-zero-padded tail, a tree per slice, slices added in order), ``block_softmax`` (``fast::exp``,
-``1 / sum``), ``gemv_t`` (``bn16 sm8 sn4``: sequential over sources, then three shuffle steps),
-the controller's ``gemv`` (down: ``bn8`` over 4,608; forget/gain: ``sm8 sn4`` over 64) and
+zero-padded tail, a tree per slice, slices added in order), its softmax for rows of up to 128
+values (``share_four``: ``fast::exp``, one reciprocal of the sum), ``gemv_t`` (``bn16 sm8 sn4``:
+sequential over sources, then three shuffle steps), the controller's ``gemv`` (down: ``bn8`` over
+4,608; forget/gain: ``sm8 sn4`` over 64) and
 ``precise::tanh``. RC6's three-query depth read (global visits) and four-query message read
 multiply on MLX's matrix units, whose summation order is the hardware's and differs between
 Macs, so those products are not reproduced: they run here as the very MLX calls RC6 makes, on
@@ -53,7 +54,27 @@ def _f32_bits(value: float) -> int:
     return struct.unpack("<I", struct.pack("<f", value))[0]
 
 
-_READ_HEADER = """
+_SHARE = """
+// Softmax over a row of up to 128 scores held four to a lane across one simdgroup (slots past the
+// row's end hold -inf), with MLX's arithmetic for rows that short: the largest score by comparison
+// from -FLT_MAX, then the simdgroup's largest; each slot's weight fast::exp(score - top), added up
+// in slot order and summed across the simdgroup; every weight times one reciprocal of that sum.
+// The weights replace the scores.
+inline void share_four(thread float (&slot)[4]) {
+    float top = -FLT_MAX;
+    for (uint k = 0; k < 4; ++k) top = slot[k] > top ? slot[k] : top;
+    top = simd_max(top);
+    float mass = 0.0f;
+    for (uint k = 0; k < 4; ++k) {
+        slot[k] = metal::fast::exp(slot[k] - top);
+        mass = mass + slot[k];
+    }
+    const float inv = 1.0f / simd_sum(mass);
+    for (uint k = 0; k < 4; ++k) slot[k] = slot[k] * inv;
+}
+"""
+
+_READ_HEADER = _SHARE + """
 // One closed block or the partial, element c of panel row r, as float.
 #define SOURCE(s, r, c)                                                                    \\
     ((s) == S - 1 ? static_cast<float>(partial[size_t(r) * D + (c)])                      \\
@@ -161,34 +182,24 @@ _READ = """
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ---- 3. Scale and MLX block_softmax over the sources, one simdgroup per query.
+    // ---- 3. Scale and softmax over the sources (share_four), one simdgroup per query.
     if (sg < q_count) {
         const uint qn = sg;
-        float ld[4];
+        float slot[4];
         for (uint i = 0; i < 4; ++i) {
             const uint s = lane * 4 + i;
             if (s < S) {
                 float score = dots[qn * S + s][0];
                 for (uint v = 1; v < 8; ++v) score += dots[qn * S + s][v];
-                ld[i] = score * as_type<float>(uint(SCALE));
+                slot[i] = score * as_type<float>(uint(SCALE));
             } else {
-                ld[i] = -INFINITY;
+                slot[i] = -INFINITY;
             }
         }
-        float maxval = -FLT_MAX;
-        for (uint i = 0; i < 4; ++i) maxval = (maxval < ld[i]) ? ld[i] : maxval;
-        maxval = simd_max(maxval);
-        float normalizer = 0;
-        for (uint i = 0; i < 4; ++i) {
-            const float e = metal::fast::exp(ld[i] - maxval);
-            ld[i] = e;
-            normalizer += e;
-        }
-        normalizer = simd_sum(normalizer);
-        normalizer = 1 / normalizer;
+        share_four(slot);
         for (uint i = 0; i < 4; ++i) {
             const uint s = lane * 4 + i;
-            if (s < S) prob[qn][s] = ld[i] * normalizer;
+            if (s < S) prob[qn][s] = slot[i];
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -338,14 +349,14 @@ _READ = """
 
 _PROBS = """
     // One simdgroup per (panel row, query): RC6's multiply by the scale (rounded on its own), then
-    // MLX block_softmax over the S scores (a 32-thread threadgroup for S <= 128).
+    // the softmax over the S scores (share_four; MLX takes one 32-thread threadgroup for S <= 128).
     // A score array under 8 values arrives in the constant address space and a larger one in device
     // memory, so rows are read by value, never through one pointer.
     const uint lane = thread_index_in_simdgroup;
     const uint g = threadgroup_position_in_grid.x;
     const uint r = g / NQ, qn = g % NQ;
     const uint which = SEP ? r : 0;
-    float ld[4];
+    float slot[4];
     for (uint i = 0; i < 4; ++i) {
         const uint s = lane * 4 + i;
         if (s < S) {
@@ -363,26 +374,15 @@ _PROBS = """
                 case 6: v = s6[at]; break;
                 default: v = s7[at]; break;
             }
-            const float scaled = v * as_type<float>(uint(SCALE));
-            ld[i] = scaled;
+            slot[i] = v * as_type<float>(uint(SCALE));
         } else {
-            ld[i] = -INFINITY;
+            slot[i] = -INFINITY;
         }
     }
-    float maxval = -FLT_MAX;
-    for (uint i = 0; i < 4; ++i) maxval = (maxval < ld[i]) ? ld[i] : maxval;
-    maxval = simd_max(maxval);
-    float normalizer = 0;
-    for (uint i = 0; i < 4; ++i) {
-        const float e = metal::fast::exp(ld[i] - maxval);
-        ld[i] = e;
-        normalizer += e;
-    }
-    normalizer = simd_sum(normalizer);
-    normalizer = 1 / normalizer;
+    share_four(slot);
     for (uint i = 0; i < 4; ++i) {
         const uint s = lane * 4 + i;
-        if (s < S) p[(size_t(r) * NQ + qn) * S + s] = ld[i] * normalizer;
+        if (s < S) p[(size_t(r) * NQ + qn) * S + s] = slot[i];
     }
 """
 
@@ -491,6 +491,7 @@ def _probs_kernel():
         name="mtplx_inkling_fast_probs",
         input_names=[f"s{i}" for i in range(8)],
         output_names=["p"],
+        header=_SHARE,
         source=_PROBS,
     )
 
