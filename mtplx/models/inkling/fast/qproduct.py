@@ -8,7 +8,8 @@ weight (``precision.AffineWeight``: uint32 codes ``(N, K * bits / 32)``, bf16 sc
 0.32.2's one-row ``mx.quantized_matmul`` of that row (for float32 inputs MLX casts the scales and
 biases to float32 first, two extra launches; here they are read as bf16, the same values). MLX's own product of 2 to 24 rows does not
 (``affine_qmv_wide`` from M3 on, another order), so a verify panel through MLX differs from the
-one-row step; through this launch it does not. One row takes MLX's own product (the reference).
+one-row step; through this launch it does not. One row takes this launch too (``_ONE_ROW``), proven
+like every width; where it refuses, MLX's product (the reference at one row), counted.
 
 Exactness: each output row repeats the one-row kernel MLX picks for the matrix's shape (its
 ``dispatch_qmv`` rule: ``qmv_fast`` when N is a multiple of 8 and K of 512 at 4 bits or 256 at 8
@@ -46,6 +47,21 @@ _SMALL_ROWS = 16384
 #: 1,474 and 3,796 for the one-row products and 803 and 4,514 for MLX's own product of the rows).
 _RCH_SMALL = 8
 _RCH_LARGE = 4
+#: Output rows one simdgroup computes (each row's arithmetic does not depend on it). A small matrix
+#: (the output projection, 2,304 rows) takes 2: twice the simdgroups in flight, measured on the engine
+#: (GPU time of a 48-visit dependent chain, receipts/ebench-oproj-1.json, M5 Max): 2 rows 19.2 -> 10.3
+#: us, 3 rows 27.2 -> 15.8, 4 rows 41.4 -> 23.7, 6 rows 61.2 -> 32.5, 8 rows 80.3 -> 42.6.
+_NR_SMALL = 2
+_NR_LARGE = 4
+#: A single row through this launch too (it repeats MLX's one-row arithmetic; proven per shape like
+#: every width) instead of MLX's product, which for a float32 input (the head) first casts the scales
+#: and biases to float32 (two more launches). Engine-timed, receipts/ebench-head-1.json (M5 Max, head
+#: of 201,024 rows, 1 row): 1,171 -> 894 us; output projection 9.5 -> 9.0 us (ebench-oproj-1).
+_ONE_ROW = True
+#: Input totals staged once per threadgroup in threadgroup memory (SUMS) for a small matrix only. The
+#: head computes them in each simdgroup: engine-timed, receipts/ebench-head-2.json (M5 Max), 2 rows
+#: 520 -> 464 us, 3 rows 1,260 -> 1,273, 4 rows 1,779 -> 1,472, 8 rows 2,890 -> 2,424.
+_SUMS_LARGE = False
 
 QMV_ROWS = AFFINE_LANE + """
 // MLX's one-row affine product for output rows [row0, row0 + NROW) and W panel rows of x (row r at
@@ -88,7 +104,7 @@ _SOURCE = """
     constexpr int GPR = K / G;                   // groups a row
     const uint sg = simdgroup_index_in_threadgroup;
     const uint lane = thread_index_in_simdgroup;
-    const uint row0 = threadgroup_position_in_grid.x * (NSG * 4) + sg * 4;
+    const uint row0 = threadgroup_position_in_grid.x * (NSG * NR) + sg * NR;   // NR output rows a simdgroup
     // YSPLIT: each threadgroup row of the grid takes one chunk of RCH panel rows (more threadgroups
     // for a small matrix); otherwise one threadgroup loops over the chunks.
     const uint rc_begin = YSPLIT ? threadgroup_position_in_grid.y * RCH : 0;
@@ -107,13 +123,13 @@ _SOURCE = """
     if (row0 >= N) return;
 
     for (uint rc = rc_begin; rc < rc_end; rc += RCH) {
-        float acc[4][RCH];
-        for (uint ro = 0; ro < 4; ++ro)
+        float acc[NR][RCH];
+        for (uint ro = 0; ro < NR; ++ro)
             for (uint r = 0; r < RCH; ++r) acc[ro][r] = 0.0f;
         for (int b = 0; b < NB; ++b) {
             const int col = b * BLOCK + int(lane) * VPT;
-            float wf[4][VPT], sc[4], bi[4];
-            for (uint ro = 0; ro < 4; ++ro) {
+            float wf[NR][VPT], sc[NR], bi[NR];
+            for (uint ro = 0; ro < NR; ++ro) {
                 const size_t row = min(row0 + ro, uint(N - 1));
                 sc[ro] = static_cast<float>(scales[row * GPR + col / G]);
                 bi[ro] = static_cast<float>(biases[row * GPR + col / G]);
@@ -130,15 +146,15 @@ _SOURCE = """
                 } else {
                     tot = affine_lane::take<VPT, BITS>(xs, xt);
                 }
-                for (uint ro = 0; ro < 4; ++ro)
+                for (uint ro = 0; ro < NR; ++ro)
                     acc[ro][r] += affine_lane::term<VPT, BITS>(xt, wf[ro], sc[ro], bi[ro], tot);
             }
         }
-        for (uint ro = 0; ro < 4; ++ro)
+        for (uint ro = 0; ro < NR; ++ro)
             for (uint r = 0; r < RCH; ++r) acc[ro][r] = simd_sum(acc[ro][r]);
         if (lane == 0) {
             for (uint r = 0; r < RCH && rc + r < rc_end; ++r)
-                for (uint ro = 0; ro < 4; ++ro)
+                for (uint ro = 0; ro < NR; ++ro)
                     if (row0 + ro < N) out[size_t(rc + r) * N + row0 + ro] = static_cast<T>(acc[ro][r]);
         }
     }
@@ -204,19 +220,23 @@ def _same(a, b):
     return a.shape == b.shape and a.dtype == b.dtype and bool(mx.array_equal(a.view(view), b.view(view)).item())
 
 
-def _launch(x2, weight, rows, n, k, bits, group, vpt, *, threads=None, rch=None, sums=None, ysplit=None):
+def _launch(x2, weight, rows, n, k, bits, group, vpt, *, threads=None, rch=None, sums=None, ysplit=None, nr=None):
     nb = k // (vpt * 32)
     small = n <= _SMALL_ROWS
     threads = threads or (_THREADS_SMALL if small else _THREADS_LARGE)
-    rch = min(rows, rch or (_RCH_SMALL if small else _RCH_LARGE))
+    # An explicit chunk may exceed the panel (rows past it are skipped): odd chunk sizes are cliff suspects.
+    rch = rch or min(rows, _RCH_SMALL if small else _RCH_LARGE)
+    nr = int(nr or (_NR_SMALL if small else _NR_LARGE))    # a partial last group: reads clamp, writes skip
     ysplit = bool(ysplit)
     lrows = rch if ysplit else rows
-    sums = (lrows * nb * 32 * 4 <= 24 * 1024) if sums is None else bool(sums)
-    rows_per_group = threads // 32 * 4
+    if sums is None:
+        sums = (small or _SUMS_LARGE) and lrows * nb * 32 * 4 <= 24 * 1024
+    sums = bool(sums)
+    rows_per_group = threads // 32 * nr
     return _kernel("product")(
         inputs=[x2, weight.codes, weight.scales, weight.biases],
         template=[("T", x2.dtype), ("W", rows), ("K", k), ("N", n), ("BITS", bits), ("G", group), ("VPT", vpt),
-                  ("RCH", rch), ("THREADS", threads), ("SUMS", sums), ("YSPLIT", ysplit)],
+                  ("RCH", rch), ("THREADS", threads), ("SUMS", sums), ("YSPLIT", ysplit), ("NR", nr)],
         grid=(-(-n // rows_per_group) * threads, -(-rows // rch) if ysplit else 1, 1),
         threadgroup=(threads, 1, 1),
         output_shapes=[(rows, n)],
@@ -228,7 +248,7 @@ def affine_product(x, weight, *, prove=True, **tune):
     """Every row of ``x`` (``(..., K)`` bf16 or float32) times the affine matrix ``weight`` (transposed, as
     ``mx.quantized_matmul`` takes it), bit-identical to MLX's one-row product of that row.
     Raises ``RuntimeError`` (counted) for a stored form this launch does not twin, or when this
-    Mac's first use disagrees with MLX's one-row product."""
+    Mac's first use disagrees with MLX's one-row product; a single row then takes MLX's product."""
     from .attn_input import count_route
 
     codes, scales, biases = weight.codes, weight.scales, weight.biases
@@ -239,8 +259,20 @@ def affine_product(x, weight, *, prove=True, **tune):
     rows = 1
     for d in lead:
         rows *= d
-    if rows == 1:
-        return mx.quantized_matmul(x, codes, scales, biases, transpose=True, group_size=group, bits=bits)
+    one = tune.pop("one", None)
+    reference = lambda: mx.quantized_matmul(x, codes, scales, biases, transpose=True, group_size=group, bits=bits)
+    if rows == 1 and not (_ONE_ROW if one is None else one):
+        return reference()
+    try:
+        return _proven_launch(x, weight, rows, lead, n, k, bits, group, prove, tune, count_route)
+    except RuntimeError:
+        if rows == 1:   # one row: MLX's product is the reference itself (the refusal is counted)
+            return reference()
+        raise
+
+
+def _proven_launch(x, weight, rows, lead, n, k, bits, group, prove, tune, count_route):
+    codes, scales, biases = weight.codes, weight.scales, weight.biases
     if x.shape[-1] != k or x.dtype not in (mx.bfloat16, mx.float32):
         count_route("refused:qproduct_input")
         raise RuntimeError("affine_product serves bf16 or float32 inputs of the matrix's width")
