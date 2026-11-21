@@ -558,6 +558,7 @@ def plan_memory(
     resident_floor_bytes: int | None = None,
     tight_machine_measured: bool = False,
     mtp_history_bytes_per_token: int = 0,
+    runtime_transients_bytes: int | None = None,
 ) -> MemoryPlan:
     """Solve the machine's memory geometry.
 
@@ -580,7 +581,15 @@ def plan_memory(
     whose floor leaves it less context than that rule grants a heavier
     one yields its floor too, so a lighter pack never plans a smaller
     window than a heavier pack of the same geometry.
+    ``runtime_transients_bytes`` is the runtime reserve a family measured for
+    itself (Inkling 2 Mini: its prefill working set at its own chunk width);
+    every other family keeps the flat ``RUNTIME_TRANSIENTS_BYTES``.
     """
+    runtime_transients = (
+        RUNTIME_TRANSIENTS_BYTES
+        if runtime_transients_bytes is None
+        else max(0, int(runtime_transients_bytes))
+    )
     if total_ram_bytes is None or int(total_ram_bytes) <= 0:
         return _unavailable("total_ram_unknown")
     if model_weights_bytes is None or int(model_weights_bytes) <= 0:
@@ -638,11 +647,11 @@ def plan_memory(
     kv_copy_pt = max(0, int(attention_kv_copy_bytes_per_token))
     per_token = kv_effective + aux_pt + transient_pt + kv_copy_pt
     fixed_cache = max(0, int(fixed_cache_bytes))
-    kv_budget = usable - weights - fixed_cache - RUNTIME_TRANSIENTS_BYTES - BANK_FLOOR_BYTES
+    kv_budget = usable - weights - fixed_cache - runtime_transients - BANK_FLOOR_BYTES
     fit_raw = _align_down(max(0, kv_budget) // per_token)
     model_fits = fit_raw >= CONTEXT_FLOOR_TOKENS
     model_cap = int(model_max_context) if model_max_context else None
-    transients = RUNTIME_TRANSIENTS_BYTES
+    transients = runtime_transients
     bank_floor = BANK_FLOOR_BYTES
     tight_machine = False
     if tight_machine_measured or weights <= TIGHT_MACHINE_MAX_WEIGHTS_BYTES:
@@ -668,7 +677,7 @@ def plan_memory(
         # tokens on 16 GiB while the 8.08 GiB Qwen3.5-9B planned 20,480).
         # Stopping at the ceiling keeps the window monotonic in pack size,
         # and a pack whose floor-funded window reaches it keeps its floor.
-        tight_transients = RUNTIME_TRANSIENTS_BYTES + TIGHT_MACHINE_MARGIN_BYTES
+        tight_transients = runtime_transients + TIGHT_MACHINE_MARGIN_BYTES
         tight_per_token = kv_per_token + aux_pt + transient_pt + kv_copy_pt
         tight_budget = usable - weights - fixed_cache - tight_transients
         tight_ceiling = _align_down(
@@ -712,7 +721,7 @@ def plan_memory(
     if not model_fits:
         notes.append(
             "model does not fit: weights + minimum runtime need "
-            f"{(weights + fixed_cache + RUNTIME_TRANSIENTS_BYTES + BANK_FLOOR_BYTES + per_token * CONTEXT_FLOOR_TOKENS) / GIB:.1f}"
+            f"{(weights + fixed_cache + runtime_transients + BANK_FLOOR_BYTES + per_token * CONTEXT_FLOOR_TOKENS) / GIB:.1f}"
             f" GiB but the engine budget is {usable / GIB:.1f} GiB"
             + (
                 ""

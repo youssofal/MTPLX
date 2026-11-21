@@ -134,3 +134,31 @@ def test_load_makes_target_and_drafter_weights_resident_but_not_the_vision_tower
     seen.clear()
     runtime_module.make_weights_resident(target, None)
     assert [sorted(k for k, _ in tree_flatten(tree)) for tree in seen] == [["bias", "weight"], []]
+
+
+def test_the_family_reserve_replaces_the_flat_three_gib_and_admits_a_tight_mac():
+    gib = 2**30
+    rt = object.__new__(InklingRuntime)
+    assert InklingRuntime.prefill_working_bytes(rt) == 2 * gib  # 512-row chunks, measured
+    assert InklingRuntime.prefill_working_bytes(rt, 256) == 2 * gib  # narrower: not measured, same charge
+    assert InklingRuntime.prefill_working_bytes(rt, 1024) == 4 * gib  # wider: in proportion
+    # Bare Speed with a 4-bit embedding (16.0 GB of weights) on a 24 GB Mac: the flat reserve and the
+    # 1 GiB bank floor refuse it; the measured reserve with the tight-machine rule admits it.
+    args = dict(total_ram_bytes=24 * gib, model_weights_bytes=15_997_000_000, kv_bytes_per_token=32768,
+                aux_bytes_per_token=4096, attention_kv_copy_bytes_per_token=4096, fixed_cache_bytes=314_572_800)
+    flat = plan_memory(**args)
+    measured = plan_memory(**args, runtime_transients_bytes=2 * gib, tight_machine_measured=True)
+    assert not flat.model_fits
+    assert measured.model_fits and measured.tight_machine and measured.runtime_transients_bytes == 2 * gib + 256 * 2**20
+    assert measured.context_window_fit == 12288
+    # Every other family keeps the flat reserve: the default is unchanged.
+    assert plan_memory(**{**args, "total_ram_bytes": 48 * gib}).runtime_transients_bytes == 3 * gib
+
+
+def test_admission_charges_a_family_its_measured_prefill_working_set():
+    from mtplx.server.openai import _admission_scratch_bytes
+
+    rt = object.__new__(InklingRuntime)
+    state = SimpleNamespace(runtime=rt)
+    geometry = _AdmissionGeometry(40960, 40960, 0, 3 * 2**30, 4096)
+    assert _admission_scratch_bytes(state, rows=512, prompt_tokens=4142, geometry=geometry) == (2 * 2**30, "runtime_measured")

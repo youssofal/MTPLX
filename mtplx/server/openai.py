@@ -4187,6 +4187,13 @@ class ServerState:
             _plan_inputs["fixed_cache_bytes"] = self.runtime.window_cache_bytes()
             _plan_inputs["attention_kv_copy_bytes_per_token"] = self.runtime.attention_kv_copy_bytes_per_token()
             _plan_inputs["kv_quantization"] = "off"
+            # Its measured prefill working set is its runtime reserve (not the flat 3 GiB), and
+            # those measurements stand as its tight-machine peaks: the warm cache yields fully
+            # on a Mac that cannot fund the 1 GiB bank floor.
+            _working = getattr(self.runtime, "prefill_working_bytes", None)
+            if callable(_working):
+                _plan_inputs["runtime_transients_bytes"] = int(_working())
+                _plan_inputs["tight_machine_measured"] = True
         _fit_plan = _plan_memory(**_plan_inputs)
         _machine_fit = _machine_fit_for_default_window(_fit_plan)
         if _fit_plan.available and not _fit_plan.model_fits and not self.allow_swap:
@@ -22979,6 +22986,10 @@ def _admission_scratch_bytes(
         )
         source = "qsa_itemized" if "forward_bytes" in bill else "qsa_flat_bill"
         return max(1, int(bill["transient_bytes"])), source
+    working_fn = getattr(runtime, "prefill_working_bytes", None)
+    if callable(working_fn):
+        # A family that measured its own prefill working set (Inkling 2 Mini) is charged it.
+        return max(1, int(working_fn(rows))), "runtime_measured"
     flat = int(geometry.flat_transient_bytes)
     flat_share = max(1, flat * rows // _ADMISSION_FLAT_TRANSIENT_ROWS)
     # A backend whose attention grows with the square of one forward's rows

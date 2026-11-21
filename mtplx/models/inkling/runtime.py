@@ -139,6 +139,20 @@ class InklingRuntime(MTPLXRuntime):
             return _prefill_chunk_size(prompt_tokens)
         return self.PROMPT_CHUNK_ROWS
 
+    #: The prefill's working memory beyond the request's own KV, measured through `mtplx serve` on
+    #: Bare Speed at 512-row chunks (each request's growth less its KV, from the request log):
+    #: 1.76 GiB at a 4K prompt, 1.53 at 16K, 1.47 at 32K, 1.83 at a fresh 48K. Rounded up to 2 GiB.
+    #: It replaces the flat 3 GiB runtime reserve in this family's memory plan, and it is what the
+    #: admission charges a forward (the generic share charged 0.75 GiB at 512 rows, 0.8 GB short).
+    PREFILL_WORKING_BYTES = 2 * 1024**3
+
+    def prefill_working_bytes(self, rows=None):
+        """The working memory of one prompt forward of ``rows`` rows (default: the chunk width).
+        Only the 512-row width is measured: a narrower forward is charged the same, a wider one
+        in proportion to its rows."""
+        rows = self.PROMPT_CHUNK_ROWS if rows is None else max(1, int(rows))
+        return self.PREFILL_WORKING_BYTES * max(rows, self.PROMPT_CHUNK_ROWS) // self.PROMPT_CHUNK_ROWS
+
     def prefill_window_bytes(self, prompt_tokens, new_tokens, width=None):
         if not new_tokens:
             return 0
