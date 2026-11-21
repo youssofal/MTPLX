@@ -27,7 +27,7 @@ class SamplerConfig:
     # raw logits before temperature; counts cover completion tokens only.
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
-    # Client controls of the OpenAI and llama.cpp dialects, carried so that no
+    # Client controls of the OpenAI dialect and its common extensions, carried so that no
     # backend can drop them unseen (defaults are exact no-ops): ``logit_bias``
     # as sorted ``(token id, additive bias)`` pairs on the raw logits;
     # ``repetition_penalty`` divides a positive and multiplies a negative raw
