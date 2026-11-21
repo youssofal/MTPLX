@@ -439,6 +439,13 @@ class Layer(nn.Module):
             )
 
     def attention(self, q_input, k_input, v_input, kv, conv, tape):
+        if tape is None and q_input.shape[1] > 32:
+            # A prompt chunk on our launches when MTPLX_INKLING_PROMPT_FLASH is on (counted).
+            from .fast.prompt_flash import stage
+
+            staged = stage(self, q_input, k_input, v_input, kv, conv, linear)
+            if staged is not None:
+                return staged
         cfg = self.cfg
         shape = (*q_input.shape[:2], self.q_scale.shape[0])
         width = self.q_scale.shape[-1]
