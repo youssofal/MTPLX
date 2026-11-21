@@ -35209,6 +35209,13 @@ class _ThinkingContentStreamSplitter:
         # keep-prose behavior on the non-stream path.
         self._disabled_reasoning_interior = ""
         self._reentry_count = 0
+        # How many characters of reasoning this splitter has released that the
+        # rule before 21 Nov would still hold (it kept the last `keep`
+        # characters whatever they were, so its held text began that much
+        # earlier). A reasoning tag that heads the held text is dropped; with
+        # this the tag is dropped exactly where that rule would have dropped
+        # it (see _stream_holdback).
+        self._think_lag = 0
         self._reasoning_accumulated: list[str] = []
         self._content_emitted = False
         self._content_history_tail = ""
@@ -35582,6 +35589,7 @@ class _ThinkingContentStreamSplitter:
             chunks.append((field, cleaned))
 
     def _reset_thinking_line_state(self) -> None:
+        self._think_lag = 0
         self._think_line_has_text = False
         self._think_line_prefix = ""
         self._think_fence_open = False
@@ -35904,20 +35912,42 @@ class _ThinkingContentStreamSplitter:
 
     def _stream_holdback(self, keep: int) -> int:
         """How many trailing characters of pending reasoning wait for more:
-        the last ``keep`` while one of them is "<", none otherwise.
+        from the first "<" on, at most the last ``keep``; none without one.
 
         Every reasoning tag (suffixed spellings included), chat-template
-        sentinel and tool marker begins with "<", so a window without one can
-        neither start a marker nor finish one that began earlier (that one
-        would be longer than ``keep``, which the window already does not
-        cover). Holding such text only delays it: on 21 Nov it kept every
-        answer's first 32 characters of reasoning back, seven to nine tokens,
-        so the first visible text left with the fourth round of a turn
-        instead of the first (0.13 s of a warm turn's 0.15 s, T1). Reasoning
-        only: the content channel keeps its hold, whose chunking the edge
-        trim ahead of tool markup depends on.
+        sentinel and tool marker begins with "<", and so does everything
+        each emitted piece is cleaned of (``_clean_generated_assistant_text``
+        drops a tag or sentinel that lies whole inside one piece). Text ahead
+        of the first "<" can therefore leave at once and the bytes stay the
+        rule before 21 Nov's: that rule held the last ``keep`` characters
+        whatever they were, so on 21 Nov every answer's first 32 characters
+        of reasoning waited, seven to nine tokens, and the first visible text
+        left with the fourth round of a turn instead of the first (0.13 s of
+        a warm turn's 0.15 s, T1). From a "<" on, the old rule's own window
+        stands, so a tag is split between pieces (kept as text) or held whole
+        (cleaned away) exactly where it was before; ``_think_lag`` follows
+        where that window began for a tag at the head of the held text.
+        Reasoning only: the content channel keeps its hold, whose chunking
+        the edge trim ahead of tool markup depends on.
         """
-        return keep if "<" in self._pending[-keep:] else 0
+        first = self._pending.find("<")
+        return 0 if first < 0 else min(keep, len(self._pending) - first)
+
+    def _follow_old_window(self, keep: int, emitted: int, *, final: bool) -> None:
+        """Track where the rule before 21 Nov would have held this step.
+
+        Its pending reasoning was this splitter's plus the last
+        ``_think_lag`` characters this one already released (plain text:
+        nothing from a "<" on leaves ahead of that rule), and it released all
+        but the last ``keep`` of that, or everything when ``final``. Called
+        with what this step releases (``emitted``, 0 where this splitter
+        waits on a partial marker the older text in front made undecided
+        there) before ``_pending`` changes.
+        """
+        held = len(self._pending)
+        old_held = self._think_lag + held
+        old_released = old_held if final else max(0, old_held - keep)
+        self._think_lag = max(0, (old_held - old_released) - (held - emitted))
 
     def _drain(self, *, final: bool) -> list[tuple[str, str]]:
         chunks: list[tuple[str, str]] = []
@@ -35942,6 +35972,8 @@ class _ThinkingContentStreamSplitter:
                 marker.lower().startswith(pending_lower)
                 for marker in CHAT_TEMPLATE_SENTINEL_MARKERS
             ):
+                if self._inside_thinking:
+                    self._follow_old_window(keep, 0, final=final)
                 break
             if self._strip_stream_sentinels_from_pending():
                 if not self._pending:
@@ -35955,6 +35987,9 @@ class _ThinkingContentStreamSplitter:
                 if opener_index >= 0 and (
                     close_index < 0 or opener_index < close_index
                 ):
+                    # Both rules release everything ahead of the opener
+                    # before judging it: from here they hold the same text.
+                    self._think_lag = 0
                     if opener_index > 0:
                         # Text ahead of the opener is reasoning whatever the
                         # opener turns out to be; emitting it first also
@@ -35993,9 +36028,14 @@ class _ThinkingContentStreamSplitter:
                     and pending_lower
                     and self._thinking_exit_opener_has_partial_prefix(pending_lower)
                 ):
+                    self._follow_old_window(keep, 0, final=final)
                     break
                 open_match_at_start = QWEN_STYLE_REASONING_OPEN_RE.match(self._pending)
-                if open_match_at_start is not None:
+                if open_match_at_start is not None and self._think_lag == 0:
+                    # A tag heading the held text (an opener the template
+                    # already opened, written again). Where the old rule's
+                    # held text began earlier, the window below splits the
+                    # tag or cleans it whole, as that rule did.
                     self._pending = self._pending[open_match_at_start.end() :]
                     self._reentry_count += 1
                     self._saw_explicit_reasoning_marker = True
@@ -36003,6 +36043,7 @@ class _ThinkingContentStreamSplitter:
                 if not final and self._reasoning_control_marker_has_partial_prefix(
                     self._pending
                 ):
+                    self._follow_old_window(keep, 0, final=final)
                     break
                 if close_match is None:
                     emit_len = (
@@ -36010,6 +36051,7 @@ class _ThinkingContentStreamSplitter:
                         if final
                         else max(0, len(self._pending) - self._stream_holdback(keep))
                     )
+                    self._follow_old_window(keep, emit_len, final=final)
                     if emit_len <= 0:
                         break
                     self._emit_thinking_text(chunks, self._pending[:emit_len])

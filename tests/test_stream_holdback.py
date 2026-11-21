@@ -4,9 +4,11 @@ It used to hold the last 32 characters of reasoning whatever they were, so every
 first visible text waited for its first 32 characters: seven to nine tokens, the fourth round of a
 turn (T1, 21 Nov: 0.13 s of a warm Inkling turn's 0.15 s to the first visible text, on every
 family's thinking stream). Every reasoning tag, chat-template sentinel and tool marker begins with
-"<", so the reasoning window now waits only while it holds one (the content channel keeps its
-hold). The bytes each channel carries are unchanged, proven against the old rule over random token
-splits, except for one case the old rule already decided by token boundaries (below).
+"<", and so does everything an emitted piece is cleaned of, so reasoning now waits only from its
+first "<" on, and from there exactly as before (the content channel keeps its hold). The bytes each
+channel carries are unchanged, proven against the old rule over random token splits, including a
+reasoning tag the model writes inside its own thinking: it is split between pieces (kept as text),
+held whole (cleaned away) or dropped at the head of the held text exactly where the old rule did.
 """
 
 from __future__ import annotations
@@ -33,6 +35,12 @@ CORPUS = {
     "cjk_emoji": "模型正在思考这个问题并且不包含任何空格 🚀✅ " * 4 + "</think>回答 🎉",
     "whitespace_edges": "\n\n" + PROSE + "\n\n</think>\n\n  Answer with spaces.  \n\n",
     "no_close": PROSE * 4,
+    "reopened": PROSE + "<think>more thought " * 3 + "</think>Answer.",
+    "reopened_spellings": PROSE + "Tags: <think> then <thinking> and <reason>; also <THINK>." * 2 + "</think>Ok.",
+    "reopened_adjacent": PROSE + "<think><think>x</think>Done.",
+    "reopened_after_opener_text": PROSE + "\n<tool_call quoted <think> inside " * 2 + "</think>Ok.",
+    "reopened_near_sentinel": PROSE + "end<|im_end|><think>after" + PROSE + "</think>Ok.",
+    "reopened_unclosed": PROSE + "<think>" + PROSE + "<think>" * 2,
 }
 MODES = {
     "inside_thinking_no_tools": dict(thinking_enabled=True, start_inside_thinking=True,
@@ -72,25 +80,30 @@ def runs(sp, feeds):
     return merged, first
 
 
-def feeds_of(text: str, rng: random.Random) -> list[str]:
+def feeds_of(text: str, rng: random.Random, *, cut_before_angle: float = 0.0) -> list[str]:
+    """Random token splits of 1 to 6 characters; with `cut_before_angle`, a token also starts at
+    each "<" with that probability (the splits that once decided a written tag differently)."""
     out, i = [], 0
     while i < len(text):
         step = rng.randint(1, 6)
+        angle = text.find("<", i + 1, i + step)
+        if angle > 0 and rng.random() < cut_before_angle:
+            step = angle - i
         out.append(text[i : i + step])
         i += step
     return out
 
 
-REOPENED = PROSE + "<think>more thought " * 3 + "</think>Answer."
 OPEN_TAG = re.compile(r"<\s*(?:" + "|".join(QWEN_STYLE_REASONING_TAG_NAMES) + r")\b[^>\n]*>", re.IGNORECASE)
 
 
 @pytest.mark.parametrize("mode", sorted(MODES))
-def test_every_channel_carries_the_same_bytes_as_under_the_old_rule(mode):
+@pytest.mark.parametrize("cut_before_angle", [0.0, 0.8])
+def test_every_channel_carries_the_same_bytes_as_under_the_old_rule(mode, cut_before_angle):
     rng = random.Random(20261121)
     for name, text in CORPUS.items():
         for _ in range(60):
-            feeds = feeds_of(text, rng)
+            feeds = feeds_of(text, rng, cut_before_angle=cut_before_angle)
             old, old_first = runs(splitter(True, MODES[mode]), feeds)
             new, new_first = runs(splitter(False, MODES[mode]), feeds)
             assert new == old, (mode, name, feeds)
@@ -99,18 +112,21 @@ def test_every_channel_carries_the_same_bytes_as_under_the_old_rule(mode):
 
 
 @pytest.mark.parametrize("mode", sorted(MODES))
-def test_an_opening_tag_written_inside_open_thinking_is_the_one_difference(mode):
-    """The splitter drops an opening reasoning tag only when it heads the held text, so a
-    literal `<think>` the model writes inside its own thinking was kept or dropped by token
-    boundaries before, and still is (at other boundaries). The answer, tool calls and every
-    other byte of the reasoning are unchanged."""
+def test_a_tag_written_inside_thinking_is_dropped_exactly_where_the_old_rule_dropped_it(mode):
+    """A tag that starts a token (the case 21 Nov's first version dropped where the old rule had
+    kept it): dropped or kept as the old rule did, at every split, and both outcomes occur."""
     rng = random.Random(7)
-    for _ in range(200):
-        feeds = feeds_of(REOPENED, rng)
+    text = CORPUS["reopened"]
+    outcomes = set()
+    for _ in range(400):
+        feeds = feeds_of(text, rng, cut_before_angle=1.0)
         old, _ = runs(splitter(True, MODES[mode]), feeds)
         new, _ = runs(splitter(False, MODES[mode]), feeds)
-        strip = lambda merged: [[c, OPEN_TAG.sub("", t) if c == "reasoning_content" else t] for c, t in merged]  # noqa: E731
-        assert strip(new) == strip(old), feeds
+        assert new == old, feeds
+        reasoning = "".join(t for c, t in new if c == "reasoning_content")
+        outcomes.add(len(OPEN_TAG.findall(reasoning)))
+    if MODES[mode]["thinking_enabled"] and MODES[mode]["start_inside_thinking"]:
+        assert len(outcomes) > 1, outcomes  # the old rule itself kept some tags and dropped others
 
 
 def test_the_first_reasoning_words_leave_with_the_token_that_carries_them():
