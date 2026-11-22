@@ -104,6 +104,19 @@ def test_first_launch_of_a_pipeline_is_evaluated_at_the_call_once():
 
 
 @needs_gpu
+def test_each_input_type_is_its_own_pipeline():
+    """MLX compiles a pipeline per template and input and output types, and the limit belongs to the pipeline: a
+    verdict for float32 inputs must not stand for float16 ones."""
+    kernel = _kernel("x_issue706_types")
+    kernel(**_args(512))
+    half = _args(512)
+    half["inputs"] = [half["inputs"][0].astype(mx.float16)]
+    kernel(**half)
+    kernel(**half)
+    assert ll.report()["probes"] == 2 and ll.report()["pipelines_checked"] == 2
+
+
+@needs_gpu
 def test_a_group_no_apple_gpu_runs_is_read_from_mlx_and_mlx_carries_on():
     """2,048 threads is above every Apple GPU's limit: MLX's own error gives this pipeline's limit, the launch
     raises GroupRefused at the call, and launches and plain operations after it run."""

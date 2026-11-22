@@ -873,9 +873,10 @@ _WINDOW_ONE = """
 
 
 def attend_window(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newest, pos,
-                  rel_basis, *, plan=None):
+                  rel_basis, *, plan=None, or_none=False):
     """Exact window attention in one launch (plus RC6's profile product): same output as
-    ``attend(..., window=True)``, bit for bit."""
+    ``attend(..., window=True)``, bit for bit. ``or_none``: ``None`` where this GPU cannot run the
+    launch's 1,024-thread group (issue #706), for a caller whose two-launch path gives the same bits."""
     rows = q.shape[1]
     if not 1 <= rows <= MAX_ROWS:
         raise ValueError(f"A panel holds 1 to {MAX_ROWS} rows, got {rows}")
@@ -885,7 +886,8 @@ def attend_window(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count
     dtype = q.dtype
     prof = profiles(rel, rel_basis)
     hpt = 1 if rows <= 2 else 3                 # heads a threadgroup: parallelism vs key reuse
-    (hg,) = _kernel("mtplx_inkling_fast_attend_window", _WINDOW_ONE, _HEADER)(
+    kernel = _kernel("mtplx_inkling_fast_attend_window", _WINDOW_ONE, _HEADER)
+    launch = dict(
         inputs=[q, keys, values, k_rows, v_rows, prof, sink, gate_logits, _u32(pos), _u32(count), _u32(newest)],
         template=[("T", dtype), ("HPT", hpt), ("BLOCKS", blocks), ("THRESH", threshold), ("SCALE", SCALE_BITS)],
         grid=(1024 * (HEADS // hpt), rows, 1),
@@ -893,6 +895,9 @@ def attend_window(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count
         output_shapes=[(1, rows, HEADS * HEAD_DIM)],
         output_dtypes=[dtype],
     )
+    if or_none and not kernel.runs("the two-launch window attention serves (the same bits)", **launch):
+        return None
+    (hg,) = kernel(**launch)
     return hg
 
 
@@ -994,8 +999,10 @@ def _attend(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newe
     # One launch for a window visit is exact too, but measured slower than two at 1 to 8 rows
     # (lanes/l2/bench-window-1launch.json): too little parallelism per threadgroup.
     if window and blocks <= 128 and one_launch_window:
-        return attend_window(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newest,
-                             pos, rel_basis, plan=(threshold, blocks))
+        hg = attend_window(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newest,
+                           pos, rel_basis, plan=(threshold, blocks), or_none=True)
+        if hg is not None:
+            return hg
     dtype = q.dtype
     if long is None or long is True:
         long = long_order(rows)

@@ -11,17 +11,17 @@ them at 1,024. MLX evaluates lazily, so the error used to surface at some later
 
 Every Inkling kernel is made through ``kernel()`` here. The first launch of
 more than ``PROBE_ABOVE`` threads of each pipeline (kernel name, template,
-thread group) in a process is evaluated at the call, on the call's own operands,
-as issue #400's fix proves a kernel by dispatching the real pipeline: its result
-is the launch's result, so the check costs no extra launch, only that first
-call's wait. A launch whose group this GPU cannot run raises ``GroupRefused`` at
-the call itself, before anything lazy depends on it, so the stage that made it
-serves its reference route for that shape instead (counted
-``fallback.<stage>.threadgroup``). Where a caller has a form with the same bits
-in smaller groups (``Kernel.runs``), it takes that form instead (counted
-``fused.split.<kernel>.<group>``). Either is printed once and listed by
-``report()`` in /health and ``mtplx doctor``. Only MLX's thread-group error is
-caught; every other error still raises.
+input and output types, thread group) in a process is evaluated at the call,
+on the call's own operands, as issue #400's fix proves a kernel by dispatching
+the real pipeline: its result is the launch's result, so the check costs no
+extra launch, only that first call's wait. A launch whose group this GPU cannot
+run raises ``GroupRefused`` at the call itself, before anything lazy depends on
+it, so the stage that made it serves its reference route for that shape
+instead (counted ``fallback.<stage>.threadgroup``). Where a caller has a form
+with the same bits in smaller groups (``Kernel.runs``), it takes that form
+instead (counted ``fused.split.<kernel>.<group>``). Either is printed once and
+listed by ``report()`` in /health and ``mtplx doctor``. Only MLX's thread-group
+error is caught; every other error still raises.
 
 ``MTPLX_INKLING_TEST_THREADGROUP_LIMIT`` (tests and replays only) makes launches
 above a limit refused without dispatching them, so these paths run on a GPU that
@@ -42,8 +42,9 @@ import mlx.core as mx
 #: Launches of this many threads or fewer are not checked (checking every launch would add a wait at the first
 #: use of each of several hundred launch shapes). No Inkling kernel of 256 threads or fewer has been refused on
 #: any Mac on record: the M1 Max in issue #706 refused 800 threads against a limit of 704 and ran the 576- and
-#: 1,024-thread kernels of its first warm-up; the M1 runner job and the M4 gate dispatch every kernel at its
-#: real widths.
+#: 1,024-thread kernels of its first warm-up; GitHub's M1 runner refuses only the attention partials above 704
+#: (768 for one float16 form) and the one-launch window attention's 1,024; the M1 runner job and the M4 gate
+#: dispatch every kernel at its real widths.
 PROBE_ABOVE = 256
 TEST_LIMIT_ENV = "MTPLX_INKLING_TEST_THREADGROUP_LIMIT"
 
@@ -52,7 +53,7 @@ _ERROR = re.compile(
 )
 
 _lock = threading.Lock()
-#: (kernel, group, template) -> this pipeline's limit when it refuses the group, else 0.
+#: (kernel, group, template, input and output types) -> this pipeline's limit when it refuses the group, else 0.
 _verdicts: dict[tuple, int] = {}
 #: (kernel, group) -> what was refused and what served instead, for report() and the one printed line.
 _refused: dict[tuple, dict[str, Any]] = {}
@@ -102,8 +103,14 @@ def _group(threadgroup) -> int:
     return total
 
 
-def _template_key(template) -> tuple:
-    return tuple((str(name), str(value)) for name, value in (template or ()))
+def _pipeline_key(name: str, group: int, kw: dict) -> tuple:
+    """What makes a compiled pipeline: MLX builds one per kernel, template and input and output types (its
+    pipeline names carry them), and the thread-group limit belongs to that pipeline."""
+    template = tuple((str(k), str(v)) for k, v in (kw.get("template") or ()))
+    inputs = tuple((str(a.dtype), a.ndim) if isinstance(a, mx.array) else type(a).__name__
+                   for a in kw.get("inputs") or ())
+    outputs = tuple(str(d) for d in kw.get("output_dtypes") or ())
+    return name, group, template, inputs, outputs
 
 
 def _first(launch, kw: dict):
@@ -131,7 +138,7 @@ def _limit(launch, name: str, kw: dict):
         return group, cap, "test hook", None
     if group <= PROBE_ABOVE:
         return group, 0, "", None
-    key = (name, group, _template_key(kw.get("template")))
+    key = _pipeline_key(name, group, kw)
     limit = _verdicts.get(key)
     outs = None
     if limit is None:
