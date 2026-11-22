@@ -72,7 +72,7 @@ dependencies = [
   # test Mac: 380 of 380 cases), with the same tokenizer type for
   # llguidance (tokenizers 0.23.3 both sides). 5.23 is not verified, so the
   # ceiling stays below it.
-  "transformers>=5.10.0,!=5.13.0,<5.23; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "transformers>=5.10.0,!=5.13.0,<5.24; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "nanobind>=2; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "numpy>=2",
   "pydantic>=2",
