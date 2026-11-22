@@ -12882,7 +12882,6 @@ def _quickstart_openwebui_payload(
             f"--profile {_resolved_default_profile_name(args)} "
             f"{_fan_mode_command_suffix(args)}"
             f"{'--no-mtp ' if _generation_mode_from_args(args) == GENERATION_MODE_AR else ''}"
-            f"{_context_window_command_suffix(args, context_window)}"
             f"{_batching_command_suffix(args)} "
             f"{_server_sampler_command_suffix(args, include_draft=True)} "
             f"{_reasoning_command_suffix(args)} "
@@ -12977,7 +12976,6 @@ def _quickstart_pi_payload(
             f"--profile {_resolved_default_profile_name(args)} "
             f"{_fan_mode_command_suffix(args)}"
             f"{'--no-mtp ' if _generation_mode_from_args(args) == GENERATION_MODE_AR else ''}"
-            f"{_context_window_command_suffix(args, context_window)}"
             f"{_batching_command_suffix(args)} "
             f"--default-temperature {pi_temperature} "
             f"--default-top-p {pi_top_p} --top-k {pi_top_k} "
@@ -13071,15 +13069,6 @@ def _model_vision_enabled(model_ref: str) -> bool:
         return vision_spec_for_model_dir(str(resolve_model_path(model_ref))) is not None
     except Exception:
         return False
-
-
-def _context_window_command_suffix(args: Any, context_window: int) -> str:
-    """The window flag of a printed server command: only a window the user chose. Without one the real start
-    passes no window (the server serves the model's window as far as this Mac's memory allows, and each client
-    is set from it before it opens), so the printed command does not pin the client's starting value."""
-    if getattr(args, "context_window", None) is None:
-        return ""
-    return f"--context-window {context_window} "
 
 
 #: Clients `mtplx start` sets from the server's window (``/health`` ``execution_window``) before they open.
@@ -13305,7 +13294,6 @@ def _quickstart_opencode_payload(
             f"{_fan_mode_command_suffix(args)}"
             f"{'--no-mtp ' if generation_mode == GENERATION_MODE_AR else ''}"
             f"{api_key_suffix}"
-            f"{_context_window_command_suffix(args, context_window)}"
             f"{_batching_command_suffix(args)} "
             f"{_adaptive_command_suffix(args)} "
             f"{sampler_suffix}"
@@ -13398,7 +13386,6 @@ def _quickstart_swival_payload(
             f"--profile {_resolved_default_profile_name(args)} "
             f"{_fan_mode_command_suffix(args)}"
             f"{'--no-mtp ' if _generation_mode_from_args(args) == GENERATION_MODE_AR else ''}"
-            f"{_context_window_command_suffix(args, context_window)}"
             f"{_batching_command_suffix(args)} "
             "--no-stats"
         ),
@@ -13477,7 +13464,6 @@ def _quickstart_hermes_payload(
             f"{_fan_mode_command_suffix(args)}"
             f"{'--no-mtp ' if _generation_mode_from_args(args) == GENERATION_MODE_AR else ''}"
             f"{api_key_suffix}"
-            f"{_context_window_command_suffix(args, context_window)}"
             f"--scheduler-mode {str(getattr(args, 'scheduler_mode', 'serial'))} "
             f"--batching-preset {str(getattr(args, 'batching_preset', 'latency'))} "
             f"{_batching_command_suffix(args)} "

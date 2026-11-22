@@ -2510,7 +2510,9 @@ def test_laguna_opencode_payload_uses_native_tools_and_32k_context(monkeypatch):
     assert expanded["context_window"] == 65_536
     # Capped at the 32,000 OpenCode injects on large windows.
     assert expanded["output_limit"] == 32_000
-    assert "--context-window 65536" in expanded["server_command"]
+    # A chosen window sets the client; the printed `mtplx start` command never carries it: `mtplx start` and
+    # `mtplx quickstart` take no window flag (`mtplx serve` does), so it would stop with "unrecognized arguments".
+    assert "--context-window" not in expanded["server_command"]
     assert "--max-response-tokens 32768" in expanded["server_command"]
 
 
