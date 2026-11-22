@@ -1452,7 +1452,7 @@ class TestReleasedMemoryLeavesTheFootprint:
 
 class TestRefusedBeforeTheStream:
     """A request the admission is sure to refuse gets its 507 before the stream opens. 2.13.1 on a simulated 24 GB
-    Mac, Bare Speed, another app holding a Q3 GGUF's 13.7 GB: HTTP 200, then the admission's 507 as an error event
+    Mac, Bare Speed, another app holding a 13.7 GB model: HTTP 200, then the admission's 507 as an error event
     15 ms later, no token (`x1-fix-24gb-hog`). Sure: nothing in flight, and the Mac's free memory plus all the engine
     could give back (its pool, its bank, the snapshots queued SSD writes hold) is under the abort floor (here
     18 GiB wired / 16 = 1.125 GiB) before the request adds a byte."""

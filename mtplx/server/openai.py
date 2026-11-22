@@ -31256,8 +31256,8 @@ def _reject_memory_short_before_stream(state: ServerState, prompt_token_count: i
     inside the generation still prices every request and refuses the rest;
     this only moves its certain refusals ahead of the response, so every
     client shows the message instead of an error event after HTTP 200.
-    2.13.1 on a simulated 24 GB Mac, Bare Speed, another app holding a Q3
-    GGUF's 13.7 GB: the admission's 507 ("the other apps on this Mac leave
+    2.13.1 on a simulated 24 GB Mac, Bare Speed, another app holding a
+    13.7 GB model: the admission's 507 ("the other apps on this Mac leave
     0.0 GiB free") reached the client 15 ms into an open stream, no token
     (`x1-fix-24gb-hog`). Read only; never raises anything but the 507.
     """
