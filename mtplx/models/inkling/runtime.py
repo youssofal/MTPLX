@@ -74,6 +74,7 @@ class InklingRuntime(MTPLXRuntime):
     #: The one-copy conversation store banks this runtime's prompts and answers as leases on the
     #: live cache with a recurrent anchor (``mtplx.one_copy.one_copy_store``; ``WindowCache``).
     one_copy_store = True
+    session_restore_uses_bank_boundary = True
 
     def __init__(self, path: Path, *, mtp: bool, contract=None):
         model, vision, config = load_target(path)
@@ -460,10 +461,14 @@ class InklingRuntime(MTPLXRuntime):
         target = self.model.make_cache()
         return target + (self.drafter.make_cache() if self.drafter else [])
 
-    def session_snapshot_matches_prefix(self, snapshot, tokens):
-        """A saved ring's absolute offset and every saved global KV must match the token key."""
+    @staticmethod
+    def note_session_restore_decline(reason):
         from .fast.routes import count
 
+        count(f"restore.decline.{reason}")
+
+    def session_snapshot_matches_prefix(self, snapshot, tokens):
+        """A saved ring's absolute offset and every saved global KV must match the token key."""
         target = (
             (2 * i, self.model.layers[layer].sliding)
             for i, layer in enumerate(self.model.visit_order)
@@ -473,7 +478,7 @@ class InklingRuntime(MTPLXRuntime):
         expected_offset = str(tokens)
         for slot, window in chain(target, draft):
             if slot >= len(snapshot.states) or slot >= len(snapshot.meta_states):
-                count("restore.decline.snapshot_layout")
+                self.note_session_restore_decline("snapshot_layout")
                 return False
             state = snapshot.states[slot]
             if state is None:  # Interior checkpoints omit the trimmable KV.
@@ -486,7 +491,7 @@ class InklingRuntime(MTPLXRuntime):
                     v is not None and v.ndim == 4 and v.shape[2] == tokens for v in state
                 )
             if not aligned:
-                count("restore.decline.snapshot_length")
+                self.note_session_restore_decline("snapshot_length")
                 return False
         return True
 

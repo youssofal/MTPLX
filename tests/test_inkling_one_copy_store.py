@@ -225,7 +225,8 @@ def test_the_prompt_anchor_is_the_reads_own_checkpoint_at_the_prompts_end(monkey
     assert own["gdn_boundaries"][-1][1] is not at_end[1]
 
 
-def test_partial_restore_consumes_each_prompt_token_once():
+@pytest.mark.parametrize("inkling", [True, False], ids=["inkling", "runtime_without_hook"])
+def test_partial_restore_consumes_the_seed_according_to_the_runtime(inkling):
     from mtplx.generation import _restore_near_prefix_prompt_state
 
     prefix = list(range(64))
@@ -247,6 +248,9 @@ def test_partial_restore_consumes_each_prompt_token_once():
         return mx.zeros((1, 1, 16)), cache[1][0][:, -1:, :]
 
     runtime = SimpleNamespace(**vars(RUNTIME), forward_ar=forward)
+    if inkling:
+        runtime.session_restore_uses_bank_boundary = InklingRuntime.session_restore_uses_bank_boundary
+        runtime.note_session_restore_decline = InklingRuntime.note_session_restore_decline
     prompt = prefix + [101]
     state = _restore_near_prefix_prompt_state(
         runtime, prompt, session_bank=bank, base_hidden_variant="post_norm",
@@ -254,12 +258,15 @@ def test_partial_restore_consumes_each_prompt_token_once():
         draft_head_identity=None, policy_fingerprint=None,
     )
     assert state is not None and state.cached_tokens == len(prefix)
-    assert forwarded == [101]
+    expected_ids = [101] if inkling else [63, 101]
+    assert forwarded == expected_ids
+    assert state.restore_served["boundary_restore"] is inkling
     expected = _conversation(len(prefix))
-    _decode(expected, 1, seed=101)
+    for token in expected_ids:
+        _decode(expected, 1, seed=token)
     for actual, wanted in zip(state.trunk_cache, expected, strict=True):
         if hasattr(wanted, "offset"):
-            assert actual.offset == wanted.offset == len(prompt)
+            assert actual.offset == wanted.offset == len(prefix) + len(expected_ids)
         for a, b in zip(actual.state, wanted.state, strict=True):
             np.testing.assert_array_equal(_bits(a), _bits(b))
 
@@ -294,3 +301,40 @@ def test_mislabeled_saved_rows_are_refused_but_an_earlier_checkpoint_can_restore
         assert restored is not None
         assert restored[0][0].offset == restored[0][2].offset == 63
     assert counts["restore.decline.snapshot_length"] == 2
+
+
+@pytest.mark.parametrize(
+    ("policy", "reason"),
+    [("cycle", "missing_boundary_logits"), ("committed", "missing_boundary_hidden")],
+)
+def test_boundary_refusal_is_counted_in_the_request_log(policy, reason):
+    from mtplx.cache_state import snapshot_cache
+    from mtplx.generation import _restore_near_prefix_prompt_state
+    from mtplx.models.inkling.fast.decoder import observe_fast_request
+
+    runtime = SimpleNamespace(
+        **vars(RUNTIME), session_restore_uses_bank_boundary=True,
+        note_session_restore_decline=InklingRuntime.note_session_restore_decline,
+    )
+    prefix = list(range(512))
+    cache = _conversation(len(prefix))
+    boundary = snapshot_untrimmable_cache(cache)
+    _decode(cache, 1)
+    bank = _bank()
+    bank.put(
+        runtime=runtime, token_ids=prefix + [999], cache=cache, logits=mx.zeros((1, 16)),
+        hidden=None, hidden_variant="post_norm", mtp_history_policy=policy,
+        mtp_history_snapshot=snapshot_cache([]) if policy == "committed" else None,
+        gdn_boundaries=[(len(prefix), boundary, None)],
+    )
+
+    def restore(rt):
+        state = _restore_near_prefix_prompt_state(
+            rt, prefix, session_bank=bank, base_hidden_variant="post_norm",
+            mtp_hidden_variant="post_norm", mtp_history_policy=policy, template_hash=None,
+            draft_head_identity=None, policy_fingerprint=None,
+        )
+        assert state is None
+        return SimpleNamespace(stats=SimpleNamespace())
+
+    assert observe_fast_request(restore, runtime).stats.inkling_fast[f"restore.decline.{reason}"] == 1
