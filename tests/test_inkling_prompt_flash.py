@@ -34,7 +34,7 @@ def _clipped(shape, limit, key, dtype):
 
 
 def _no_crossover(monkeypatch):
-    for name in ("SHORT_PROMPT", "SHORT_PROMPT_WIDE", "SHORT_PROMPT_SIMD", "SHORT_PROMPT_WIDE_SIMD"):
+    for name in ("SHORT_PROMPT", "SHORT_PROMPT_512", "SHORT_PROMPT_WIDE", "SHORT_PROMPT_SIMD", "SHORT_PROMPT_WIDE_SIMD"):
         monkeypatch.setattr(F, name, 0)
 
 
@@ -406,12 +406,30 @@ def _limit():
     wide = F._read_width() >= F.WIDE_READ_ROWS
     if F.form() == "simd":
         return F.SHORT_PROMPT_WIDE_SIMD if wide else F.SHORT_PROMPT_SIMD
+    if F._read_width() == 512:
+        return F.SHORT_PROMPT_512
     return F.SHORT_PROMPT_WIDE if wide else F.SHORT_PROMPT
+
+
+@pytest.mark.parametrize("ram_gib", [18, 24, 36, 128])
+def test_512_row_tensor_crossover_follows_width_on_every_mac(monkeypatch, ram_gib):
+    monkeypatch.setattr(F, "form", lambda: "tensor")
+    monkeypatch.setattr(mx, "device_info", lambda *args: {"memory_size": ram_gib * 1024**3})
+    for length in (1024, 2047, 2048, 4096, 6144):
+        monkeypatch.setenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", str(length))
+        assert F.short_prompt(512, width=512) == (length < 2048)
+
+    monkeypatch.setenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", "2048")
+    assert F.short_prompt(512, width=1024)
+    assert F.short_prompt(512, width=2048)
+    monkeypatch.setattr(F, "form", lambda: "simd")
+    assert F.short_prompt(512, width=512)
 
 
 def test_the_crossover_follows_the_reads_width(monkeypatch):
     from mtplx.generation import prefill_chunk_size_override
 
+    monkeypatch.setattr(F, "SHORT_PROMPT_512", 6000)
     for narrow, wide in (("SHORT_PROMPT", "SHORT_PROMPT_WIDE"), ("SHORT_PROMPT_SIMD", "SHORT_PROMPT_WIDE_SIMD")):
         monkeypatch.setattr(F, narrow, 6000)                         # both forms' knobs (X1, 01:03: an M4 reads the
         monkeypatch.setattr(F, wide, 2000)                           # plain form's)
