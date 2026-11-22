@@ -16,7 +16,7 @@ on:
         required: true
         default: false
       publish_release_wheels:
-        description: "Publish the macOS 14 arm64 wheels attached to the GitHub release of `ref` (a version tag) to PyPI, keeping files PyPI already has"
+        description: "Publish the sdist and the macOS 14 arm64 wheels attached to the GitHub release of `ref` (a version tag) to PyPI, keeping files PyPI already has"
         type: boolean
         required: false
         default: false
@@ -88,7 +88,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - name: Download the release's macOS 14 arm64 wheels
+      - name: Download the release's sdist and macOS 14 arm64 wheels
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.ref }}
@@ -96,15 +96,27 @@ jobs:
           case "$TAG" in
             v*) ;;
             *)
-              echo "Publishing release wheels requires a version tag ref, not '$TAG'." >&2
+              echo "Publishing release files requires a version tag ref, not '$TAG'." >&2
               exit 1
               ;;
           esac
           mkdir -p dist
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dist \
-            --pattern "mtplx-${TAG#v}-cp3*-cp3*-macosx_14_0_arm64.whl"
+            --pattern "mtplx-${TAG#v}-cp3*-cp3*-macosx_14_0_arm64.whl" \
+            --pattern "mtplx-${TAG#v}.tar.gz"
           ls -la dist
           test "$(find dist -name '*.whl' | wc -l)" -ge 1
+      # 2.13.0 first reached PyPI with a wheel that had no executor. Every wheel published here must carry the
+      # compiled executor for its own Python.
+      - name: Refuse a wheel without the native executor
+        run: |
+          for wheel in dist/*.whl; do
+            tag="$(basename "$wheel" | cut -d- -f3)"
+            if ! unzip -Z1 "$wheel" | grep -qx "mtplx/_engine.cpython-${tag#cp}-darwin.so"; then
+              echo "$wheel does not carry mtplx/_engine for $tag" >&2
+              exit 1
+            fi
+          done
       - uses: pypa/gh-action-pypi-publish@v1.14.3
         with:
           packages-dir: dist/
