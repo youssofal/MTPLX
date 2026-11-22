@@ -4,6 +4,11 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [2.13.1] - 2026-11-22
+
+Inkling 2 Mini loads on M1 Macs (#706), and a source install builds MTPLX's engine with older
+Xcode tools. The full notes: [docs/releases/v2.13.1.md](docs/releases/v2.13.1.md).
+
 ## [2.13.0] - 2026-11-22
 
 Inkling 2 Mini, a new Settings window, the decode speed in the menu bar, and prompt cache, memory and
