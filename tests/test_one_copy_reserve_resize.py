@@ -1006,7 +1006,11 @@ def test_a_resize_stopped_between_layers_keeps_the_conversation_and_finishes_nex
     snapshot = demotions.snapshot()
     refused = parent.turn([5, 6], room=300_000)
 
-    assert calls["n"] == 2
+    # The restore's resize asks for layer one (admitted) and layer two
+    # (refused); the verifier's resize asks for layer two again, idle bank
+    # entries giving way, and is refused too: the turn verifies eagerly, as
+    # 2.12.3's single ask did.
+    assert calls["n"] == 3
     _eager(stopped)
     assert stopped.admission["promotion"] == "resized"
     assert stopped.admission["resize_layers_left"] == 1
@@ -1021,7 +1025,9 @@ def test_a_resize_stopped_between_layers_keeps_the_conversation_and_finishes_nex
     back_new, back_parent = new.turn([9, 10, 11, 12]), parent.turn([9, 10, 11, 12])
     _compiled(back_new)
     assert back_new.promotions == [("adopted", 1024)] * 2
-    assert back_new.admission["promotion"] == "resized"
+    # The next turn's restore resizes the second layer before the admission
+    # reads the held buffers, so the admission finds the bank's rows there.
+    assert back_new.admission["promotion"] == "adopted"
     _same_rounds(back_new.rounds, back_parent.rounds)
     _same_turn(back_new, back_parent)
 
@@ -1051,21 +1057,23 @@ def test_a_resize_that_fails_keeps_the_only_copy_and_the_retry_is_the_same_turn(
     prompt = list(new.tokens) + [5, 6]
     with pytest.raises(_Interrupted):
         new.turn([5, 6], patches=[fails_on_the_second_layer])
-    # The prompt's lease (banked before decode) is the conversation's only
-    # copy: one layer resized, the other as it was, both holding the prompt.
+    # The resize runs at the restore, before the turn's new tokens are read:
+    # the previous turn's lease is the conversation's only copy, one layer
+    # resized, the other as it was, both holding that turn's tokens.
+    held = len(prompt) - 2
     lease = new.bank.longest_prefix(prompt)
-    assert lease is not None and lease.prefix_len == len(prompt) and lease.cache_ref is not None
+    assert lease is not None and lease.prefix_len == held and lease.cache_ref is not None
     layers = [e for e in lease.cache_ref if isinstance(e, QSACache)]
     assert [TensorOffsetQSACache.held_rows(e) for e in layers] == [1024, 512]
-    assert [e.offset for e in layers] == [len(prompt)] * 2
+    assert [e.offset for e in layers] == [held] * 2
 
     retry = new.turn([], prompt=prompt, seed=SEED + len(prompt))
     uninterrupted = parent.turn([5, 6])
     assert retry.stats.session_restore_mode == "reference_lease"
-    assert retry.stats.cached_tokens == len(prompt)
+    assert retry.stats.cached_tokens == held
     _compiled(retry)
     assert retry.promotions == [("adopted", 1024)] * 2
-    assert retry.admission["promotion"] == "resized" and retry.admission["held_rows"] is None
+    assert retry.admission["promotion"] == "adopted"
     _same_rounds(retry.rounds, uninterrupted.rounds)
     _same_turn(retry, uninterrupted)
     after_new, after_parent = new.turn([9, 10, 11, 12]), parent.turn([9, 10, 11, 12])
@@ -1124,11 +1132,12 @@ def test_a_resize_the_memory_refuses_answers_on_the_eager_verifier(tiny, lane):
     # the eager decode then grew its own way. The answer is the eager one.
     assert failed.held == [(1024, 1024, 256), (766, 1024, 256)]
     _same_turn(failed, eager, capacity=False)
-    # The next turn resizes the second layer and is compiled again.
+    # The next turn's restore resizes the second layer and the turn is
+    # compiled again.
     back_new, back_parent = new.turn([9, 10, 11, 12]), parent.turn([9, 10, 11, 12])
     _compiled(back_new)
     assert back_new.promotions == [("adopted", 1024)] * 2
-    assert back_new.admission["promotion"] == "resized"
+    assert back_new.admission["promotion"] == "adopted"
     _same_rounds(back_new.rounds, back_parent.rounds)
     _same_turn(back_new, back_parent)
 
@@ -1154,13 +1163,16 @@ def test_other_failures_in_a_resize_reach_the_caller_and_the_retry_is_the_same_t
     with pytest.raises(type(error)):
         new.turn([5, 6], patches=[_second_layer_write_raises(error, calls)])
     assert calls == [1024, 1024]
+    # Raised by the restore's resize, before the turn's new tokens are read:
+    # the previous turn's lease stays the only copy, whole.
+    held = len(prompt) - 2
     lease = new.bank.longest_prefix(prompt)
-    assert lease is not None and lease.prefix_len == len(prompt)
+    assert lease is not None and lease.prefix_len == held
     layers = [e for e in lease.cache_ref if isinstance(e, QSACache)]
     assert [TensorOffsetQSACache.held_rows(e) for e in layers] == [1024, 512]
     retry = new.turn([], prompt=prompt, seed=SEED + len(prompt))
     uninterrupted = parent.turn([5, 6])
-    assert retry.stats.cached_tokens == len(prompt)
+    assert retry.stats.cached_tokens == held
     _compiled(retry)
     _same_rounds(retry.rounds, uninterrupted.rounds)
     _same_turn(retry, uninterrupted)

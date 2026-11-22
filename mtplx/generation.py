@@ -15,6 +15,7 @@ import inspect
 import json
 import os
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from pathlib import Path
@@ -929,9 +930,25 @@ def _qwen4_fixed_m4_resize_held(
     has, and the next request resizes the rest.
     """
 
+    restore_failure = _take_restore_resize_failure(cache)
     rows = int(plan.resize_rows or 0)
     if rows <= 0:
         return True
+    if restore_failure is not None and layers_to_resize(cache, rows):
+        # The restore's own resize met an allocation the memory refused, this
+        # request (``_resize_restored_qsa_buffers``): the turn verifies
+        # eagerly, as a failed resize here always has, and the next request
+        # resizes the rest.
+        left = layers_to_resize(cache, rows)
+        receipt.update(
+            engaged=False, reason="memory_gate", resize_layers_left=int(left),
+            resize_error=restore_failure,
+        )
+        _announce_qwen4_fixed_m4_skip(
+            f"resizing the conversation's QSA buffers to {rows} rows failed to "
+            f"allocate a layer ({left} left to resize): {restore_failure}"
+        )
+        return False
     failure = None
     try:
         left = resize_qsa_buffers(
@@ -4556,7 +4573,40 @@ def _trim_repeated_suffix(
     return result
 
 
-def _resize_restored_qsa_buffers(cache: Any) -> int:
+#: An allocation the memory refused during a restore's QSA resize, this request: (the restored cache's QSA layers,
+#: the error). Set by ``_resize_restored_qsa_buffers``, read once by the verifier's resize, cleared when a request
+#: starts its restore. Model work runs on one thread; the record is per thread all the same.
+_RESTORE_RESIZE = threading.local()
+
+
+def _clear_restore_resize_failure() -> None:
+    _RESTORE_RESIZE.failure = None
+
+
+def _note_restore_resize_failure(cache: Any, error: str) -> None:
+    _RESTORE_RESIZE.failure = (tuple(id(entry) for entry in qsa_entries(cache)), str(error))
+
+
+def _restore_resize_failure(cache: Any) -> str | None:
+    held = getattr(_RESTORE_RESIZE, "failure", None)
+    if held is None or held[0] != tuple(id(entry) for entry in qsa_entries(cache)):
+        return None
+    return held[1]
+
+
+def _take_restore_resize_failure(cache: Any) -> str | None:
+    error = _restore_resize_failure(cache)
+    _RESTORE_RESIZE.failure = None
+    return error
+
+
+def _resize_restored_qsa_buffers(
+    cache: Any,
+    rt: Any = None,
+    *,
+    session_bank: Any | None = None,
+    protect_ids: Sequence[int] | None = None,
+) -> int:
     """Give a restored cache's QSA buffers the request's rows, one layer at a
     time, before its suffix is read. Returns the layers resized.
 
@@ -4573,6 +4623,16 @@ def _resize_restored_qsa_buffers(cache: Any) -> int:
     bank's rows and is left as it is, as is a cache outside a rows target
     (the dense lane, other models) or one with a layer that cannot be
     resized in place (the forward grows it as before).
+
+    It asks and fails as the verifier's resize does (``_qwen4_fixed_m4_resize_held``):
+    with ``rt``, each layer asks for its new bytes first
+    (``_qwen4_fixed_m4_layer_fits``), and an allocation the memory refuses
+    while a layer is written is kept, not raised. Either stop leaves every
+    layer whole, at its old rows or the bank's, and the rest to the forward,
+    which grows a short layer its own way, as before. After a refusal the
+    verifier's resize asks again (idle bank entries giving way); after a
+    refused allocation the turn verifies eagerly and the next request resizes
+    the rest. 2.12.3 answered both on the eager verifier, and so does this.
     """
 
     from .models.qwen4_exp import qsa_rows_target_value
@@ -4580,12 +4640,33 @@ def _resize_restored_qsa_buffers(cache: Any) -> int:
     rows = int(qsa_rows_target_value() or 0)
     if rows <= 0 or not qsa_entries(cache) or not qsa_buffers_short(cache, rows):
         return 0
+    if _restore_resize_failure(cache) is not None:
+        # This request's restore already met a refused allocation on these
+        # layers: the verifier answers the turn eagerly; nothing is retried.
+        return 0
     try:
         layers = layers_to_resize(cache, rows)
     except ValueError:
         return 0
-    resize_qsa_buffers(cache, rows)
-    return int(layers)
+    admit = None
+    if rt is not None:
+        admit = lambda need: _qwen4_fixed_m4_layer_fits(  # noqa: E731
+            rt, need, session_bank=session_bank, protect_ids=protect_ids,
+        )
+    try:
+        left = resize_qsa_buffers(cache, rows, admit=admit)
+    except Exception as exc:
+        # As the verifier's resize: an allocation the memory refuses while a
+        # layer is written leaves that layer as it was. Anything else is not
+        # the resize's to absorb.
+        if not is_allocation_failure(exc):
+            raise
+        failure = f"{type(exc).__name__}: {exc}"
+        mx.synchronize()
+        _mlx_release_allocator_cache()
+        left = layers_to_resize(cache, rows)
+        _note_restore_resize_failure(cache, failure)
+    return int(layers) - int(left)
 
 
 def _prefill_restored_prompt_suffix(
@@ -4619,7 +4700,7 @@ def _prefill_restored_prompt_suffix(
     if not suffix:
         raise ValueError("suffix must not be empty")
     _check_postcommit_abort(abort_check)
-    _resize_restored_qsa_buffers(restored.cache)
+    _resize_restored_qsa_buffers(restored.cache, rt)
     target_forward_time = 0.0
     mtp_history_time = 0.0
     final_logits_only = _final_logits_prefill_enabled()
@@ -5545,7 +5626,7 @@ def _restore_near_prefix_prompt_state(
             _check_postcommit_abort(abort_check)
             # Before any forward writes into it (the seed forward below
             # included), so no forward grows every layer at once.
-            _resize_restored_qsa_buffers(cache)
+            _resize_restored_qsa_buffers(cache, rt)
             if boundary_restore:
                 # Boundary-true restore: KV and recurrent state both sit exactly
                 # at restore_point; token restore_point-1 must NOT be re-run (the
@@ -6878,6 +6959,7 @@ def restore_or_prefill_prompt_state(
     here — the only cost is the bank's snapshot copy, taken only when the
     new-prefill suffix is large enough to have been a real miss.
     """
+    _clear_restore_resize_failure()
     bank_key_ids: list[int] | None = None
     vision_restore_spans: list[tuple[int, int]] | None = None
     if vision_splice is not None and session_bank is not None:
