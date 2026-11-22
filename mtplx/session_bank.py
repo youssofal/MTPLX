@@ -827,6 +827,11 @@ def _lease_view_snapshot(entry: Any) -> tuple[CacheSnapshot, CacheSnapshot | Non
     return snapshot, mtp_snapshot
 
 
+def _session_snapshot_matches_prefix(runtime, snapshot, tokens: int) -> bool:
+    check = getattr(runtime, "session_snapshot_matches_prefix", None)
+    return snapshot is None or check is None or check(snapshot, tokens)
+
+
 def _cache_ref_trimmable_to(cache: list[Any] | None, target_offset: int) -> bool:
     """Whether every offset-bearing entry of ``cache`` can trim to ``target_offset``.
 
@@ -2734,6 +2739,9 @@ class SessionBank:
             # position: it serves prompts that extend it, never its own.
             self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
             return cold_fallback()
+        if not _session_snapshot_matches_prefix(runtime, entry.cache_snapshot, entry.prefix_len):
+            self.last_miss_reason = CacheMissReason.SNAPSHOT_DESYNC.value
+            return cold_fallback()
         actual_restore_mode = "clone"
         rewind_anchor: Any = False
         # A lease is taken in place only by its own conversation; any other
@@ -2770,6 +2778,7 @@ class SessionBank:
             mtp_ref = entry.mtp_history_cache_ref
             if (
                 rewind_anchor is None
+                or (rewind_anchor and not _session_snapshot_matches_prefix(runtime, rewind_anchor[1], target))
                 or not _cache_ref_trimmable_to(cache, target)
                 or (
                     mtp_ref is not None
@@ -2980,6 +2989,9 @@ class SessionBank:
             and not check_boundary(entry, boundary_snapshot)
         ):
             self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
+            return None
+        if not _session_snapshot_matches_prefix(runtime, boundary_snapshot, restore_point):
+            self.last_miss_reason = CacheMissReason.SNAPSHOT_DESYNC.value
             return None
         if cache_snapshot_prefix_len < required_cache_prefix_len:
             self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
@@ -3887,6 +3899,9 @@ class SessionBank:
             entry.mtp_snapshot_epoch is not None
             and int(entry.mtp_snapshot_epoch) != int(entry.snapshot_epoch)
         ):
+            self.last_miss_reason = CacheMissReason.SNAPSHOT_DESYNC.value
+            return None
+        if not _session_snapshot_matches_prefix(runtime, entry.cache_snapshot, entry.prefix_len):
             self.last_miss_reason = CacheMissReason.SNAPSHOT_DESYNC.value
             return None
         # The request's cache layout, exactly as a RAM restore builds it (restore() above).

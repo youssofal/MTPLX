@@ -223,3 +223,74 @@ def test_the_prompt_anchor_is_the_reads_own_checkpoint_at_the_prompts_end(monkey
                               boundaries=[early, at_end], runtime=verifier)
     assert [int(r[0]) for r in own["gdn_boundaries"]] == [12, 20]
     assert own["gdn_boundaries"][-1][1] is not at_end[1]
+
+
+def test_partial_restore_consumes_each_prompt_token_once():
+    from mtplx.generation import _restore_near_prefix_prompt_state
+
+    prefix = list(range(64))
+    cache = _conversation(len(prefix))
+    boundary = snapshot_untrimmable_cache(cache)
+    _decode(cache, 1, seed=100)
+    bank = _bank()
+    bank.put(
+        runtime=RUNTIME, token_ids=prefix + [100], cache=cache, logits=mx.zeros((1, 16)),
+        hidden=None, hidden_variant="post_norm", mtp_history_policy="cycle",
+        gdn_boundaries=[(len(prefix), boundary, None)],
+    )
+    forwarded = []
+
+    def forward(ids, *, cache, **kwargs):
+        for token in ids.tolist()[0]:
+            forwarded.append(token)
+            _decode(cache, 1, seed=token)
+        return mx.zeros((1, 1, 16)), cache[1][0][:, -1:, :]
+
+    runtime = SimpleNamespace(**vars(RUNTIME), forward_ar=forward)
+    prompt = prefix + [101]
+    state = _restore_near_prefix_prompt_state(
+        runtime, prompt, session_bank=bank, base_hidden_variant="post_norm",
+        mtp_hidden_variant="post_norm", mtp_history_policy="cycle", template_hash=None,
+        draft_head_identity=None, policy_fingerprint=None,
+    )
+    assert state is not None and state.cached_tokens == len(prefix)
+    assert forwarded == [101]
+    expected = _conversation(len(prefix))
+    _decode(expected, 1, seed=101)
+    for actual, wanted in zip(state.trunk_cache, expected, strict=True):
+        if hasattr(wanted, "offset"):
+            assert actual.offset == wanted.offset == len(prompt)
+        for a, b in zip(actual.state, wanted.state, strict=True):
+            np.testing.assert_array_equal(_bits(a), _bits(b))
+
+
+def test_mislabeled_saved_rows_are_refused_but_an_earlier_checkpoint_can_restore():
+    from mtplx.models.inkling.fast.routes import capture_counts
+
+    runtime = object.__new__(InklingRuntime)
+    runtime.model_path = RUNTIME.model_path
+    runtime.mtp_enabled = False
+    runtime.trunk_entries = 4
+    runtime.drafter = None
+    runtime.model = SimpleNamespace(
+        config={"sliding_window_size": WINDOW}, visit_order=(0, 1), make_cache=RUNTIME.make_cache,
+        layers=[SimpleNamespace(sliding=True), SimpleNamespace(sliding=False)],
+    )
+    cache = _conversation(63)
+    good = snapshot_untrimmable_cache(cache)
+    _decode(cache, 2)
+    bad = snapshot_untrimmable_cache(cache)  # The released writer labeled 65 rows as 64.
+    _decode(cache, 1)
+    bank = _bank()
+    tokens = list(range(65))
+    entry = bank.put(
+        runtime=runtime, token_ids=tokens, cache=cache, logits=mx.zeros((1, 16)), hidden=None,
+        gdn_boundaries=[(63, good, None), (64, bad, None)],
+    )
+    with capture_counts() as counts:
+        assert bank.restore(runtime, tokens) is None
+        assert bank.restore_entry_prefix_cache(runtime, entry, 64) is None
+        restored = bank.restore_entry_prefix_cache(runtime, entry, 63)
+        assert restored is not None
+        assert restored[0][0].offset == restored[0][2].offset == 63
+    assert counts["restore.decline.snapshot_length"] == 2

@@ -1,5 +1,6 @@
 """Target and speculative state share the conversation cache and live on the generation stream."""
 
+from itertools import chain
 from pathlib import Path
 
 import mlx.core as mx
@@ -458,6 +459,36 @@ class InklingRuntime(MTPLXRuntime):
     def make_cache(self):
         target = self.model.make_cache()
         return target + (self.drafter.make_cache() if self.drafter else [])
+
+    def session_snapshot_matches_prefix(self, snapshot, tokens):
+        """A saved ring's absolute offset and every saved global KV must match the token key."""
+        from .fast.routes import count
+
+        target = (
+            (2 * i, self.model.layers[layer].sliding)
+            for i, layer in enumerate(self.model.visit_order)
+        )
+        blocks = self.drafter.blocks if self.drafter else ()
+        draft = ((self.trunk_entries + i, block.window) for i, block in enumerate(blocks))
+        expected_offset = str(tokens)
+        for slot, window in chain(target, draft):
+            if slot >= len(snapshot.states) or slot >= len(snapshot.meta_states):
+                count("restore.decline.snapshot_layout")
+                return False
+            state = snapshot.states[slot]
+            if state is None:  # Interior checkpoints omit the trimmable KV.
+                continue
+            if window:
+                meta = snapshot.meta_states[slot]
+                aligned = isinstance(meta, (tuple, list)) and len(meta) == 4 and str(meta[2]) == expected_offset
+            else:
+                aligned = len(state) == 2 and all(
+                    v is not None and v.ndim == 4 and v.shape[2] == tokens for v in state
+                )
+            if not aligned:
+                count("restore.decline.snapshot_length")
+                return False
+        return True
 
     def can_restore_session_boundary(self, entry, snapshot):
         count = self.trunk_entries + (

@@ -5476,6 +5476,7 @@ def _restore_near_prefix_prompt_state(
                 continue
 
         prefix_restore = None
+        bank_served: dict[str, Any] = {}
         cache_restore_time_s = 0.0
         restore_entry_prefix_cache = getattr(
             session_bank, "restore_entry_prefix_cache", None
@@ -5492,7 +5493,6 @@ def _restore_near_prefix_prompt_state(
                 if getattr(entry, "cache_ref", None) is not None
                 else ["clone"]
             )
-            bank_served: dict[str, Any] = {}
             for restore_mode in restore_modes:
                 # Fresh dict per attempt: a failed reference attempt must not
                 # pollute the successful clone attempt's telemetry. Only the
@@ -5559,7 +5559,11 @@ def _restore_near_prefix_prompt_state(
             cache, mtp_history_cache, storage_restore_mode = prefix_restore
             restore_point = matched
         restore_point = int(restore_point)
-        boundary_restore = boundary_hidden is not None or restore_point < matched
+        # A recurrent checkpoint already consumed its last token, even when the read
+        # kept no hidden tensor. Only a cache trimmed to the seed slot needs that token.
+        boundary_restore = bank_served.get(
+            "boundary_used", boundary_hidden is not None or restore_point < matched
+        )
         served_truth: dict[str, Any] = {
             "entry_prefix_len": int(getattr(entry, "prefix_len", 0) or 0),
             "entry_token_hash": str(getattr(entry, "token_hash", "") or ""),
@@ -5600,7 +5604,7 @@ def _restore_near_prefix_prompt_state(
                     budget_bytes=getattr(session_bank, "checkpoint_budget_bytes", None),
                 ),
             )
-            if boundary_hidden is not None
+            if boundary_restore and storage_restore_mode == "reference_lease"
             else None
         )
         served = False
@@ -5616,6 +5620,7 @@ def _restore_near_prefix_prompt_state(
                 # cannot resume exactly at b; running a seed forward instead would
                 # advance the recurrent state twice. Fail closed to the next
                 # candidate (or cold).
+                _near_reject("missing_boundary_hidden")
                 continue
             ssd_restore_s = float(getattr(entry, "ssd_restore_s", 0.0) or 0.0)
             ssd_cached_tokens = restore_point if ssd_cache_hit else 0
@@ -5682,6 +5687,7 @@ def _restore_near_prefix_prompt_state(
                     # A boundary restore has no seed logits; decode cannot start from
                     # an empty suffix. (Only reachable when a boundary coincides with
                     # a fully-contained prompt — fall through to other candidates.)
+                    _near_reject("missing_boundary_logits")
                     continue
                 logits = boundary_logits[1][:, None]
             inherited_boundaries = _inherited_gdn_boundaries(
@@ -5702,7 +5708,7 @@ def _restore_near_prefix_prompt_state(
                 tokens_total=len(prompt_ids),
                 cached_tokens=restore_point,
                 new_prefill_tokens=len(suffix),
-                started_s=chunk_started_s if chunk_started_s is not None else started,
+                started_s=chunk_started_s if chunk_started_s is not None else restore_started,
                 cache_source=cache_source,
                 ssd_cache_hit=ssd_cache_hit,
                 ssd_cached_tokens=ssd_cached_tokens,
