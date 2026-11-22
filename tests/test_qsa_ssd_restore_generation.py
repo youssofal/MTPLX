@@ -4,9 +4,10 @@ The request lane of #592 and #635 in miniature, on the tiny Flash-Next pack
 with two QSA layers (GPU): an older, longer conversation is saved to the SSD
 tier; a new conversation shares its first 1,100 tokens (a system prompt and
 tools, or a compacted history) and goes on with its own. The bank restores the
-older entry's prefix at its recurrent boundary, the turn prefills its own
-tokens, and the one-copy store resizes the conversation's QSA buffers to the
-compiled verifier's rows.
+older entry's prefix at its recurrent boundary, the restore resizes the
+conversation's QSA buffers to the prefill's rows (the compiled verifier's
+bank) one layer at a time, the turn prefills its own tokens, and the bank
+adopts the buffers.
 
 On 2.12.2 that turn failed before its first token ("QSA pooled hold ... would
 cut them"): the restore handed the cache the older entry's pooled block count,
@@ -94,10 +95,12 @@ def test_a_turn_restored_below_a_longer_conversation_is_served_and_decodes_as_co
         assert stats.cache_source == "ssd"
         assert str(stats.session_restore_mode).startswith("ssd_block_prefix")
         assert 0 < stats.cached_tokens <= SHARED
-        # The resize ran and the compiled verifier took the turn.
+        # The restore's resize ran, to the bank's rows, and the compiled
+        # verifier took the turn on the bank that adopted its buffers.
         admission = dict(stats.fixed_m4_admission or {})
         assert admission.get("engaged") is True, admission
-        assert admission.get("promotion") == "resized", admission
+        assert admission.get("promotion") == "adopted", admission
+        assert admission["held_rows"] == admission["promotion_rows"], admission
         # The saved conversation's block count was past the bank's blocks.
         assert len(saved) // 4 > admission["promotion_rows"] // 4
         verifier = dict((stats.graphbank or {}).get("compiled_verify") or {})

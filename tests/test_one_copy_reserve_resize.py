@@ -10,8 +10,12 @@ After an eager turn the stock buffers also grew their own way (keys and values
 by 256 rows, the index keys by doubling), so no later turn could adopt them.
 
 Now the held buffers are resized to the bank's rows one layer at a time before
-the bank adopts them, and the admission prices exactly that: the rows they
-gain plus one layer's new buffers beside its old ones. This file pins it:
+the bank adopts them: at the restore, before the turn's suffix is read
+(``generation._resize_restored_qsa_buffers``, to the prefill's rows), each
+layer asking for its own new buffers first; and where the restore did not (an
+identical prompt reads no suffix, or the memory refused a layer), by the
+verifier, whose admission prices exactly that: the rows they gain plus one
+layer's new buffers beside its old ones. This file pins it:
 
 - the bill on the recorded geometry of that turn, and the copying store still
   reproducing the refusal the request log recorded;
@@ -639,9 +643,33 @@ def _squeeze(patch, room: int) -> None:
 
 
 def _parent(patch) -> None:
-    """The parent path: buffers the bank cannot adopt are copied into a padded bank."""
+    """The parent path: buffers the bank cannot adopt are copied into a padded bank.
+
+    The copying store: a cache the bank cannot resize (``resize_bill`` None)
+    is not resized at the restore either (``layers_to_resize`` raises and the
+    restore resizes nothing), so the parent's buffers reach the admission as
+    the turn's forwards left them.
+    """
 
     patch.setattr(generation, "resize_bill", lambda cache, rows: None)
+    patch.setattr(generation, "_resize_restored_qsa_buffers", lambda *args, **kwargs: 0)
+
+
+def _asks(needs: list[int]):
+    """A patch: every layer-at-a-time ask for room (``_qwen4_fixed_m4_layer_fits``:
+    the restore's resize, the verifier's, a bank's growth) recorded in
+    ``needs``, then answered as before."""
+
+    def apply(patch):
+        real = generation._qwen4_fixed_m4_layer_fits
+
+        def asking(rt, need, **kwargs):
+            needs.append(int(need))
+            return real(rt, need, **kwargs)
+
+        patch.setattr(generation, "_qwen4_fixed_m4_layer_fits", asking)
+
+    return apply
 
 
 def _leaf_bits(cache, *, valid_only: bool = False) -> dict[str, np.ndarray]:
@@ -806,30 +834,31 @@ def test_the_transition_turn_resizes_where_the_copy_was_refused(tiny, lane):
     new, refused, roomy = (_Session(tiny, lane, parent=p) for p in (False, True, True))
     for session in (new, refused, roomy):
         session.opening()
-    turn_new = new.turn([5, 6], room=400_000)
+    asks: list[int] = []
+    turn_new = new.turn([5, 6], room=400_000, patches=[_asks(asks)])
     turn_refused = refused.turn([5, 6], room=400_000)
     turn_roomy = roomy.turn([5, 6])
 
-    # Now: the turn keeps the compiled verifier, and the bank adopts the
-    # resized buffers.
+    # Now: the restore gives the buffers the prefill's 1,024 rows (the bucket
+    # kept) before the suffix is read, one layer at a time, each layer asking
+    # for its own new buffers first (344,064 bytes, under the 400,000 of
+    # room). The bank finds the rows held and adopts them, allocating
+    # nothing, and the turn keeps the compiled verifier.
+    assert asks == [1024 * TINY_ROW // 2] * 2 == [344_064] * 2
     _compiled(turn_new)
-    assert turn_new.promotions == [("adopted", 768)] * 2
-    assert turn_new.held == [(768, 768, 192)] * 2
+    assert turn_new.promotions == [("adopted", 1024)] * 2
+    assert turn_new.held == [(1024, 1024, 256)] * 2
+    assert turn_new.admission["promotion"] == "adopted"
+    assert turn_new.admission["held_rows"] == turn_new.admission["promotion_rows"] == 1024
+    assert turn_new.admission["capacity_bucket"] == 512
+    assert turn_new.admission["promotion_bytes"] == 0
     # Today: the padded copy (1,024 rows, then 768 without the bucket) is
     # over the line, and the turn verifies eagerly.
     _eager(turn_refused)
     assert turn_refused.admission["promotion"] == "copied"
     assert turn_refused.admission["promotion_bytes"] == 768 * TINY_ROW == 516_096
-    # The resize costs the rows the layers gain plus one layer beside its old
-    # buffers.
-    assert turn_new.admission["promotion"] == "resized"
-    assert turn_new.admission["held_rows"] == 512
-    assert turn_new.admission["promotion_rows"] == 768
-    assert turn_new.admission["capacity_bucket"] == 0
-    layer_new, layer_old = 768 * TINY_ROW // 2, 512 * TINY_ROW // 2
-    assert turn_new.admission["promotion_bytes"] == (layer_new - layer_old) + layer_new == 344_064
     # The parent with room copies 1,024 rows; the rows-gather lane gives the
-    # same tokens at both widths, and the same as the eager verifier.
+    # same tokens, and the same as the eager verifier.
     assert turn_roomy.promotions == [("copied", 1024)] * 2
     _same_turn(turn_new, turn_roomy, capacity=False)
     _same_turn(turn_new, turn_refused, capacity=False)
@@ -855,7 +884,11 @@ def test_the_resized_bank_is_the_copied_bank(tiny, lane, suffix):
     _compiled(turn_parent)
     assert turn_new.promotions == [("adopted", 1024)] * 2
     assert turn_parent.promotions == [("copied", 1024)] * 2
-    assert turn_new.admission["promotion"] == "resized"
+    # A suffix is read after the restore, which first resizes the buffers to
+    # the prefill's 1,024 rows: the bank finds them held and adopts them. An
+    # identical prompt reads nothing: the verifier's resize gives the bank its
+    # rows.
+    assert turn_new.admission["promotion"] == ("adopted" if suffix else "resized")
     assert turn_new.admission["promotion_rows"] == 1024
     assert turn_new.admission["capacity_bucket"] == 512
     if not suffix:
@@ -896,15 +929,21 @@ def test_a_turn_refused_for_memory_does_not_keep_later_turns_eager(tiny, lane):
     # past 512 rows cut the keys and values to the 510 the prompt held and
     # added the 256-row step; the index keys doubled.
     assert refused_new.held == [(766, 1024, 256)] * 2
-    # The next turn resizes that layout and returns to the compiled lane.
-    back_new, back_parent = new.turn([9, 10, 11, 12]), parent.turn([9, 10, 11, 12])
+    # The next turn's restore resizes that layout before the suffix is read
+    # (the keys and values to the prefill's 1,024 rows, a layer at a time;
+    # the index keys already hold them), and the turn returns to the compiled
+    # lane on the bank that adopts them. The parent copies, as it always has.
+    asks: list[int] = []
+    back_new = new.turn([9, 10, 11, 12], patches=[_asks(asks)])
+    back_parent = parent.turn([9, 10, 11, 12])
     _compiled(back_new)
     assert back_new.promotions == [("adopted", 1024)] * 2
     assert back_parent.promotions == [("copied", 1024)] * 2
-    assert back_new.admission["promotion"] == "resized"
-    assert back_new.admission["held_rows"] is None
     kv = 2 * (2 * 32 * 2)  # keys and values: bytes per row of one layer
-    assert back_new.admission["promotion_bytes"] == (1024 - 766) * kv + 1024 * kv
+    assert asks == [1024 * kv] * 2
+    assert back_new.admission["promotion"] == "adopted"
+    assert back_new.admission["held_rows"] == 1024
+    assert back_new.admission["promotion_bytes"] == 0
     _same_rounds(back_new.rounds, back_parent.rounds)
     _same_turn(back_new, back_parent)
 
@@ -920,10 +959,16 @@ def test_index_keys_an_eager_turn_doubled_are_cut_for_a_bank_without_the_bucket(
         _eager(refused)
         assert refused.held == [(766, 1024, 256)] * 2
     # Room for the 768-row bank (the bucket dropped) and not the 1,024-row
-    # one: the keys and values grow to 768 rows, the index keys are cut to
-    # 768 and the pooled blocks to 192. The parent gets the same 768-row bank
-    # by copying, with room for that copy.
-    back_new = new.turn([9, 10, 11, 12], room=300_000)
+    # one, nor for one layer of the restore's resize to the prefill's 1,024
+    # rows (its keys and values, 262,144 bytes): the restore asks for its
+    # first layer and is refused, and the buffers reach the admission as the
+    # eager turn left them. The verifier's resize then grows the keys and
+    # values to 768 rows and cuts the index keys to 768 and the pooled blocks
+    # to 192. The parent gets the same 768-row bank by copying, with room for
+    # that copy. (With room for the restore's layers it resizes them to 1,024
+    # rows and nothing is cut: the next turn of the test above.)
+    asks: list[int] = []
+    back_new = new.turn([9, 10, 11, 12], room=260_000, patches=[_asks(asks)])
     back_parent = parent.turn([9, 10, 11, 12], room=600_000)
     _compiled(back_new)
     _compiled(back_parent)
@@ -939,16 +984,26 @@ def test_index_keys_an_eager_turn_doubled_are_cut_for_a_bank_without_the_bucket(
     old_layer = 766 * 2 * (2 * 32 * 2) + 1024 * 32 * 2 + 256 * 32 * 2
     assert new_layer < old_layer
     assert back_new.admission["promotion_bytes"] == new_layer == 258_048
+    # The restore's one refused ask, then the verifier's two admitted ones.
+    assert asks == [1024 * 2 * (2 * 32 * 2), new_layer, new_layer] == [262_144, 258_048, 258_048]
     _same_rounds(back_new.rounds, back_parent.rounds)
     _same_turn(back_new, back_parent)
 
 
 @gpu
-def test_pooled_keys_a_suffix_left_short_are_resized_before_the_bank_adopts(tiny, lane):
+@pytest.mark.parametrize("room", [None, 300_000], ids=["restore", "verifier"])
+def test_pooled_keys_a_suffix_left_short_are_resized_before_the_bank_adopts(tiny, lane, room):
     """The review's counterexample: 508 held tokens and five more reach 513.
     The prefill grew the keys, values and raw index keys to the bank's 1,024
     rows; the pooled index keys still held every completed block in 128 and
-    stayed there, and the bank grew them as it was built, billed 0."""
+    stayed there, and the bank grew them as it was built, billed 0.
+
+    Now the restore resizes all four to the prefill's 1,024 rows (256 pooled
+    blocks) before the suffix is read, and the bank adopts them ("restore").
+    Where the memory refuses the restore's first layer (344,064 bytes against
+    300,000 of room), the buffers reach the verifier as the review found
+    them, and its resize gives the pooled index keys their blocks, billed,
+    before the bank adopts them ("verifier")."""
 
     pools: list[tuple] = []
 
@@ -966,16 +1021,26 @@ def test_pooled_keys_a_suffix_left_short_are_resized_before_the_bank_adopts(tiny
     new, parent = _Session(tiny, lane), _Session(tiny, lane, parent=True)
     for session in (new, parent):
         session.opening()
-    turn_new = new.turn([5, 6, 7, 8, 9], patches=[observe])
+    asks: list[int] = []
+    turn_new = new.turn([5, 6, 7, 8, 9], room=room, patches=[observe, _asks(asks)])
     turn_parent = parent.turn([5, 6, 7, 8, 9])
 
     _compiled(turn_new)
     _compiled(turn_parent)
-    assert turn_new.admission["promotion"] == "resized"
     assert turn_new.admission["held_rows"] == 1024
-    # Pooled blocks are 32 x bf16: 256 new against 128 old, layer by layer.
-    assert turn_new.admission["promotion_bytes"] == 256 * 64 + (256 - 128) * 64 == 24_576
-    # The bank takes the resized pooled buffers as they are.
+    if room is None:
+        # All four buffers, a layer at a time; the bank allocates nothing.
+        assert asks == [344_064] * 2
+        assert turn_new.admission["promotion"] == "adopted"
+        assert turn_new.admission["promotion_bytes"] == 0
+    else:
+        # The restore's refused ask, then the verifier's resize of the pooled
+        # blocks alone, a layer at a time. Pooled blocks are 32 x bf16: 256
+        # new against 128 old, layer by layer.
+        assert asks == [344_064, 256 * 64, 256 * 64]
+        assert turn_new.admission["promotion"] == "resized"
+        assert turn_new.admission["promotion_bytes"] == 256 * 64 + (256 - 128) * 64 == 24_576
+    # Either way the bank takes the resized pooled buffers as they are.
     assert pools == [((1, 256, 32), (1, 256, 32), True)] * 2
     assert turn_new.promotions == [("adopted", 1024)] * 2
     # The parent's bank grew them itself: the same bits everywhere.
@@ -1221,7 +1286,9 @@ def test_an_image_conversation_keeps_its_positions_through_the_resize(tiny, lane
         assert record.admission["rope_delta"] == 4 - IMAGE_TOKENS
         assert record.bank["fixed_m4"]["rope_delta"] == 4 - IMAGE_TOKENS
         assert record.stats.session_restore_mode == "reference_lease"
-    assert turn_new.admission["promotion"] == "resized"
+    # The restore resized the buffers to the bank's 1,024 rows before the
+    # suffix was read, and the bank adopted them, positions and all.
+    assert turn_new.admission["promotion"] == "adopted"
     _same_rounds(turn_new.rounds, turn_parent.rounds)
     _same_turn(turn_new, turn_parent)
 
@@ -1292,7 +1359,8 @@ def test_compiled_copy_windows_run_on_the_resized_bank(tiny, lane):
     assert turn_new.admission["engaged"] is True and turn_new.bank["fixed_m4"]["installed"]
     assert turn_new.promotions == [("adopted", 1024)] * 2
     assert turn_parent.promotions == [("copied", 1024)] * 2
-    assert turn_new.admission["promotion"] == "resized"
+    # Resized at the restore, before the quoted suffix was read; adopted.
+    assert turn_new.admission["promotion"] == "adopted"
     assert turn_new.admission["promotion_rows"] == 1024
     windows = turn_new.bank["fixed_m4_copy_windows"]
     assert sum(windows["compiled"].values()) > 0
