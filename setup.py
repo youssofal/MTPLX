@@ -27,6 +27,9 @@ class NativeExecutor(build_ext):
             if os.environ.get("MTPLX_REQUIRE_NATIVE") == "1":
                 raise
             print(f"warning: mtplx native executor not built ({exc}); MTPLX runs without it", file=sys.stderr)
+            # Nothing was built, so nothing may be expected: an editable install copies every
+            # listed extension's output and would otherwise fail where the normal install succeeds.
+            self.extensions = [other for other in self.extensions if other is not ext]
             return
         output = stage / sysconfig.get_config_var("SOABI") / "out" / ("_engine" + sysconfig.get_config_var("EXT_SUFFIX"))
         destination = Path(self.get_ext_fullpath(ext.name))

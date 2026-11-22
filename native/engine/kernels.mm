@@ -244,7 +244,17 @@ KernelInfo* kernel_for_pipeline(void* pso) {
     id<MTLComputePipelineState> state = (__bridge id<MTLComputePipelineState>)pso;
     MTLComputePipelineReflection* reflection = nil;
     if (@available(macOS 26.0, *)) {
+#if defined(__MAC_26_0) && __MAC_OS_X_VERSION_MAX_ALLOWED >= __MAC_26_0
       reflection = state.reflection;
+#else
+      // Built with an SDK older than macOS 26 (a source install with older
+      // Xcode tools): the property is not declared there, so the same getter
+      // is called by name, and only where the running system has it.
+      SEL getter = NSSelectorFromString(@"reflection");
+      if ([(id)state respondsToSelector:getter]) {
+        reflection = ((MTLComputePipelineReflection * (*)(id, SEL)) objc_msgSend)((id)state, getter);
+      }
+#endif
     }
     return file_pipeline(state, state.label, reflection);
   }
