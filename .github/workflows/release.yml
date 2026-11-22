@@ -15,12 +15,18 @@ on:
         type: boolean
         required: true
         default: false
+      publish_release_wheels:
+        description: "Publish the macOS 14 arm64 wheels attached to the GitHub release of `ref` (a version tag) to PyPI, keeping files PyPI already has"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   build-artifacts:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.publish_release_wheels) }}
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7.0.1
@@ -68,3 +74,38 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@v1.14.3
         with:
           packages-dir: dist/
+
+  # The wheels that carry the native executor are built on a Mac by the release assembler
+  # (native/package.py, one per Python, macOS 14 and newer) and attached to the GitHub release;
+  # this publishes those files to PyPI under the same trusted publisher.
+  publish-release-wheels:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release_wheels }}
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mtplx
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download the release's macOS 14 arm64 wheels
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.ref }}
+        run: |
+          case "$TAG" in
+            v*) ;;
+            *)
+              echo "Publishing release wheels requires a version tag ref, not '$TAG'." >&2
+              exit 1
+              ;;
+          esac
+          mkdir -p dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dist \
+            --pattern "mtplx-${TAG#v}-cp3*-cp3*-macosx_14_0_arm64.whl"
+          ls -la dist
+          test "$(find dist -name '*.whl' | wc -l)" -ge 1
+      - uses: pypa/gh-action-pypi-publish@v1.14.3
+        with:
+          packages-dir: dist/
+          skip-existing: true
