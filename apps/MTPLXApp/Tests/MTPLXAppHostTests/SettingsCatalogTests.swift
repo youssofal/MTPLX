@@ -33,8 +33,18 @@ final class SettingsCatalogTests: XCTestCase {
         for item in SettingsItem.allCases {
             XCTAssertFalse(item.label.isEmpty, "\(item) has no label")
             XCTAssertEqual(item.section, item.group.section)
-            XCTAssertTrue(item.section.items.contains(item))
+            // A row this release does not offer (a client of MTPLX 3) is in no section or group.
+            XCTAssertEqual(item.section.items.contains(item), item.isOffered, "\(item)")
+            XCTAssertEqual(item.group.items.contains(item), item.isOffered, "\(item)")
         }
+    }
+
+    func testTheOpeningsOfMTPLX3ClientsAreNotShown() {
+        // Claude Code, Codex and DeepSeek Harness arrive in MTPLX 3 (LaunchTarget.v3AgentClients).
+        for item in [SettingsItem.claudeCodeOpensIn, .codexOpensIn, .deepseekHarnessOpensIn] {
+            XCTAssertFalse(item.isOffered, "\(item)")
+        }
+        XCTAssertEqual(SettingsGroupID.openIn.items, [.piOpensIn, .openCodeOpensIn, .hermesOpensIn])
     }
 
     func testEmptySearchShowsEverything() {

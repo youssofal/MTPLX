@@ -124,7 +124,7 @@ struct LaunchOverlay: View, Equatable {
             if otherExpanded {
                 customClientForm
             } else {
-                ForEach(Array(LaunchTarget.allCases.enumerated()), id: \.element.id) { idx, target in
+                ForEach(Array(LaunchTarget.offered().enumerated()), id: \.element.id) { idx, target in
                     if idx > 0 {
                         rowDivider(precedesRow: idx)
                     }
@@ -371,7 +371,7 @@ struct LaunchOverlay: View, Equatable {
     private func runEnterChoreography() {
         OverlayChoreography.runEnter(
             motionEnabled: motionEnabled,
-            rowCount: LaunchTarget.allCases.count,
+            rowCount: LaunchTarget.offered().count,
             borderProgress: $borderProgress,
             headerVisible: $headerVisible,
             rowsVisibleCount: $rowsVisibleCount

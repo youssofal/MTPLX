@@ -238,6 +238,29 @@ final class SettingsRecoveryTests: XCTestCase {
     }
 
     @MainActor
+    func testASavedTargetThisReleaseDoesNotOfferResumesAtChat() throws {
+        // Claude Code, Codex and DeepSeek Harness arrive in MTPLX 3; a settings file from a build that offered
+        // them must not leave the Start button (or "launch on open") on one.
+        for hidden in [LaunchTarget.claudeCode, .codex, .deepseekHarness] {
+            let settingsStore = makeStore()
+            try write("""
+            {"last_launch_target": "\(hidden.rawValue)", "onboarding_completed_at": \(onboardingStamp)}
+            """, to: settingsStore)
+            let backend = MTPLXBackendStore(settingsStore: settingsStore)
+            backend.loadPersistedSettings()
+            XCTAssertEqual(backend.configuration.lastLaunchTarget, LaunchTarget.chat.rawValue, hidden.rawValue)
+            XCTAssertEqual(try settingsStore.load().lastLaunchTarget, LaunchTarget.chat.rawValue)
+        }
+        let settingsStore = makeStore()
+        try write("""
+        {"last_launch_target": "pi", "onboarding_completed_at": \(onboardingStamp)}
+        """, to: settingsStore)
+        let backend = MTPLXBackendStore(settingsStore: settingsStore)
+        backend.loadPersistedSettings()
+        XCTAssertEqual(backend.configuration.lastLaunchTarget, LaunchTarget.pi.rawValue)
+    }
+
+    @MainActor
     func testBackendStoreLoadsAFileWithOneBadFieldWithoutResettingOnboarding() async throws {
         let settingsStore = makeStore()
         try write("""

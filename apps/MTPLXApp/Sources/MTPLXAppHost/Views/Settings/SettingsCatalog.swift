@@ -67,7 +67,7 @@ enum SettingsSection: String, CaseIterable, Identifiable, Hashable, Sendable {
     }
 
     var items: [SettingsItem] {
-        SettingsItem.allCases.filter { $0.group.section == self }
+        SettingsItem.allCases.filter { $0.group.section == self && $0.isOffered }
     }
 }
 
@@ -121,7 +121,7 @@ enum SettingsGroupID: String, CaseIterable, Hashable, Sendable {
     }
 
     var items: [SettingsItem] {
-        SettingsItem.allCases.filter { $0.group == self }
+        SettingsItem.allCases.filter { $0.group == self && $0.isOffered }
     }
 }
 
@@ -156,6 +156,17 @@ enum SettingsItem: String, CaseIterable, Hashable, Sendable {
     case executablePath, streamCadence, stallWatchdog
     case embeddingModels, rerankerModels, retrievalIdle, retrievalResident
     case logs, settingsFile
+
+    /// Whether this release shows the setting: the opening of a client that arrives in MTPLX 3 does not
+    /// (`LaunchTarget.v3AgentClients`).
+    var isOffered: Bool {
+        switch self {
+        case .claudeCodeOpensIn: return LaunchTarget.claudeCode.isOffered()
+        case .codexOpensIn: return LaunchTarget.codex.isOffered()
+        case .deepseekHarnessOpensIn: return LaunchTarget.deepseekHarness.isOffered()
+        default: return true
+        }
+    }
 
     var group: SettingsGroupID {
         switch self {

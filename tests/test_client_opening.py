@@ -20,6 +20,13 @@ FIXTURE = ROOT / "apps" / "MTPLXApp" / "Tests" / "Fixtures" / "client_opening_ca
 TERMINAL, GHOSTTY, WARP = co.FIXTURE_TERMINALS
 
 
+@pytest.fixture(autouse=True)
+def _mtplx3_agent_clients_on(monkeypatch):
+    """This file covers the agent clients that arrive in MTPLX 3, with their release switch on
+    (mtplx/release_gates.py); tests/test_release_gates.py covers the release with it off."""
+    monkeypatch.setattr("mtplx.release_gates.V3_AGENT_CLIENTS", True)
+
+
 def _bundle(root: Path, name: str, info: dict) -> Path:
     bundle = root / f"{name}.app"
     (bundle / "Contents").mkdir(parents=True)

@@ -17,9 +17,9 @@ struct LaunchPopover: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
-            ForEach(LaunchTarget.allCases) { target in
+            ForEach(LaunchTarget.offered()) { target in
                 row(target: target)
-                if target != LaunchTarget.allCases.last {
+                if target != LaunchTarget.offered().last {
                     Divider().padding(.leading, 40)
                 }
             }

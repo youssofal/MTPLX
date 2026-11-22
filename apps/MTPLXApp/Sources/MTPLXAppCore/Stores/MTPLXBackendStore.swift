@@ -589,6 +589,12 @@ public final class MTPLXBackendStore: ObservableObject {
             loaded.lastLaunchTarget = LaunchTarget.openCode.rawValue
             try? settingsStore.save(loaded)
         }
+        if let saved = LaunchTarget(rawValue: loaded.lastLaunchTarget), !saved.isOffered() {
+            // A target this release does not offer (Claude Code, Codex and DeepSeek Harness arrive in
+            // MTPLX 3), saved by a build that did: the Start button resumes at Chat instead.
+            loaded.lastLaunchTarget = LaunchTarget.chat.rawValue
+            try? settingsStore.save(loaded)
+        }
         configuration = loaded
         seedLiveSettingsFromConfiguration(loaded)
         supervisor.setAutomaticRestartEnabled(loaded.automaticDaemonRestart)

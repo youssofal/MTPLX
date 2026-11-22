@@ -6466,9 +6466,12 @@ def cmd_clients_public(args: Any) -> int:
     from mtplx import agent_clients
     from mtplx.ui import pretty_path
 
+    from mtplx import release_gates
+
     action = getattr(args, "clients_action", "list") or "list"
     name = getattr(args, "name", None)
-    rows = agent_clients.client_copies()
+    # A copy of a client that arrives in MTPLX 3 is listed only if one is on disk, so it can still be removed.
+    rows = [row for row in agent_clients.client_copies() if row["exists"] or release_gates.offered(row["name"])]
     as_json = bool(getattr(args, "json", False))
 
     def fail(message: str) -> int:
@@ -6484,6 +6487,7 @@ def cmd_clients_public(args: Any) -> int:
         if name:
             return fail("mtplx clients lists the copies; use `mtplx clients remove NAME`")
         openings = client_opening.summary()
+        openings["clients"] = [row for row in openings["clients"] if release_gates.offered(row["client"])]
         if as_json:
             _print({"action": "list", "clients": rows, "openings": openings})
             return 0
@@ -6497,6 +6501,8 @@ def cmd_clients_public(args: Any) -> int:
             "  terminals found: "
             + (", ".join(t["name"] for t in openings["terminals"]) or "none")
         )
+        if not rows:
+            return 0
         print()
         print("Client copies MTPLX keeps (your own apps are never changed):")
         for row in rows:
@@ -15627,6 +15633,12 @@ def cmd_quickstart_public(args: Any) -> int:
         _quickstart_line(f"try: {_start_invocation(args)}")
         _quickstart_line(f"try: {_start_invocation(args, ' cli')}")
         return 2
+    from mtplx import release_gates
+
+    if not release_gates.offered(target):
+        # Claude Code, Codex and DeepSeek Harness arrive in MTPLX 3: one line, nothing started.
+        _quickstart_line(release_gates.arrives_in_v3(target))
+        return 2
     if target == "opencode" and "port" not in cli_flags:
         args.port = 18083
     if target == "opencode":
@@ -16343,6 +16355,12 @@ def _connect_deepseek_harness(
 
 def cmd_integrate_public(args: Any) -> int:
     action = args.integration
+    from mtplx import release_gates
+
+    if not release_gates.offered(action, connect=True):
+        # Codex and DeepSeek Harness arrive in MTPLX 3; Claude Code's connect (2.12.3's) stays.
+        print(release_gates.arrives_in_v3(action))
+        return 2
     server_url = f"http://{args.host}:{args.port}"
     api_base_url = server_url.rstrip("/") + "/v1"
     model_id = getattr(args, "model_id", None) or DEFAULT_PUBLIC_MODEL_ID
@@ -16476,15 +16494,21 @@ def cmd_integrate_public(args: Any) -> int:
             "files_written": written,
             "shell": agent_clients.display_command(plan),
             "edits_user_config": False,
+            # `mtplx start <client>` arrives in MTPLX 3 (release_gates); until then the server command is 2.12.3's.
             "server_command": (
                 f"mtplx start {action} --host {args.host} --port {args.port}"
+                if release_gates.offered(action)
+                else f"mtplx quickstart --profile {_resolved_default_profile_name(args)} "
+                f"--host {args.host} --port {args.port} --no-stats-footer"
             ),
             "notes": [
                 "Nothing in your own Claude Code or Codex configuration is edited; "
                 "only the session started with these settings talks to MTPLX.",
-                "mtplx start "
-                + action
-                + " starts the server and opens this client in Terminal for you.",
+                *(
+                    ["mtplx start " + action + " starts the server and opens this client in Terminal for you."]
+                    if release_gates.offered(action)
+                    else []
+                ),
             ],
         }
         if action == "claude-code":
@@ -16676,7 +16700,8 @@ def cmd_integrate_public(args: Any) -> int:
             print(f"  {payload['shell']}")
             for path in payload.get("files_written") or ():
                 print(f"  MTPLX settings for this session: {path}")
-            print(f"  Or let MTPLX open it for you: {payload['server_command']}")
+            if release_gates.offered(action):
+                print(f"  Or let MTPLX open it for you: {payload['server_command']}")
         smoke = payload.get("smoke_result")
         if isinstance(smoke, dict):
             health = (

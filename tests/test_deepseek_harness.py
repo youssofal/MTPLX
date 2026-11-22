@@ -34,6 +34,13 @@ REVIEWED_ROWS_FILE = Path(__file__).parent / "fixtures" / "deepseek_harness_revi
 REVIEWED_ROWS = frozenset(json.loads(REVIEWED_ROWS_FILE.read_text())["rows"])
 
 
+@pytest.fixture(autouse=True)
+def _mtplx3_agent_clients_on(monkeypatch):
+    """This file covers the agent clients that arrive in MTPLX 3, with their release switch on
+    (mtplx/release_gates.py); tests/test_release_gates.py covers the release with it off."""
+    monkeypatch.setattr("mtplx.release_gates.V3_AGENT_CLIENTS", True)
+
+
 def _rows(**overrides):
     kwargs = {"base_url": BASE, "model_id": MODEL, "context_window": 262144, "vision": True}
     kwargs.update(overrides)

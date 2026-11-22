@@ -38,7 +38,7 @@ struct ClientOpeningRows: View {
 
     var body: some View {
         Group {
-            ForEach(Self.rows) { row in
+            ForEach(Self.rows.filter { $0.target.isOffered() }) { row in
                 if let client = ClientOpenings.client(for: row.target) {
                     SettingsRow(item: row.item) {
                         picker(client: client, target: row.target)

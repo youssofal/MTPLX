@@ -31,6 +31,27 @@ public enum LaunchTarget: String, Codable, CaseIterable, Identifiable, Sendable 
 
     public var id: String { rawValue }
 
+    // MARK: Release switch
+
+    /// Claude Code, Codex and DeepSeek Harness arrive in MTPLX 3 (the founder, 22 November 2026). Off, the
+    /// Start button, the client-opening settings and the settings search show none of them, and a saved choice
+    /// of one falls back to Chat; their code stays. The CLI's twin is `V3_AGENT_CLIENTS` in
+    /// mtplx/release_gates.py: turn both on together.
+    public static let v3AgentClients = false
+
+    /// Whether this release offers the target to pick (tests pass the switch to cover both states).
+    public func isOffered(v3AgentClients: Bool = LaunchTarget.v3AgentClients) -> Bool {
+        switch self {
+        case .claudeCode, .codex, .deepseekHarness: return v3AgentClients
+        default: return true
+        }
+    }
+
+    /// The targets the Start button lists, in their order.
+    public static func offered(v3AgentClients: Bool = LaunchTarget.v3AgentClients) -> [LaunchTarget] {
+        allCases.filter { $0.isOffered(v3AgentClients: v3AgentClients) }
+    }
+
     public var title: String {
         switch self {
         case .chat: return tr("Chat")
