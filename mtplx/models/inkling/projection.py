@@ -2,6 +2,7 @@
 
 from functools import lru_cache
 import mlx.core as mx
+from . import launch_limits
 
 from .precision import AffineWeight
 
@@ -29,7 +30,7 @@ inline void rp_load4(const device bfloat16_t* p, thread float* o) {
 def _panel_kernel():
     # A lane's four consecutive columns come from one load per row (its weight row and every state
     # row); the multiply-adds keep their order: column by column, each row's sum in turn.
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_row_projection",
         input_names=["states", "weight"],
         output_names=["result"],

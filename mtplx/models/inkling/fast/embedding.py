@@ -28,6 +28,7 @@ from __future__ import annotations
 from functools import lru_cache
 
 import mlx.core as mx
+from .. import launch_limits
 
 from ..precision import AffineWeight
 
@@ -101,7 +102,7 @@ _EMBED = """
 
 @lru_cache(maxsize=2)
 def _kernel(stored):
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_fast_embed" + ("_stored" if stored else ""),
         input_names=["ids", "codes", "scales", "biases", "table", "gain"],
         output_names=["out"],

@@ -44,6 +44,7 @@ from threading import Lock
 import time
 
 import mlx.core as mx
+from . import launch_limits
 
 ROUTE_ENV = "MTPLX_INKLING_CONV"
 #: Ways of writing the static four-tap sum; the first-use proof keeps the first that matches.
@@ -201,7 +202,7 @@ def kernel_text(tape, residual=False):
 
 @lru_cache(maxsize=4)
 def _kernel(tape, residual=False):
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name=("mtplx_inkling_short_conv_tape" if tape else "mtplx_inkling_short_conv") + ("_residual" if residual else ""),
         input_names=["x", "prev", "weight", "change"] + (["add"] if residual else []),
         output_names=["out", "tail", "tape"] if tape else ["out", "tail"],

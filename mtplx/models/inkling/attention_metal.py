@@ -3,11 +3,12 @@
 from functools import lru_cache
 
 import mlx.core as mx
+from . import launch_limits
 
 
 @lru_cache(maxsize=1)
 def _prompt_kernel():
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_streamed_attention",
         input_names=["q", "k", "v", "profiles", "sinks"],
         output_names=["out"],
@@ -156,7 +157,7 @@ def streamed_attention(query, key, value, profiles, sink, window):
 
 @lru_cache(maxsize=1)
 def _grouped_mask_kernel():
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_grouped_sink_mask",
         input_names=["profiles", "keys"],
         output_names=["mask"],

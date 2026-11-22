@@ -27,6 +27,7 @@ import os
 from functools import lru_cache
 
 import mlx.core as mx
+from .. import launch_limits
 
 from .routes import count
 
@@ -64,7 +65,7 @@ def enabled() -> bool:
 
 @lru_cache(maxsize=1)
 def _kernel():
-    return mx.fast.metal_kernel(name="mtplx_inkling_f1_draft_ring", input_names=["old_k", "old_v", "new_k", "new_v",
+    return launch_limits.kernel(name="mtplx_inkling_f1_draft_ring", input_names=["old_k", "old_v", "new_k", "new_v",
                                                                                  "meta"],
                                 output_names=["out_k", "out_v"], source=_SOURCE)
 

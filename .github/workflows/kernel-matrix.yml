@@ -2,7 +2,7 @@ name: kernel-matrix
 
 # Real-hardware validation for the turbo Metal kernels. macos-15 runners are
 # Apple Silicon M1 (7 GB RAM) — the exact GPU family the 2.0.1 turbo-default
-# promotion must not break. Two jobs:
+# promotion must not break. Three jobs:
 #
 # 1. kernel-exactness: every turbo kernel lane x {bf16, fp16} x {4, 6, 8}-bit
 #    synthetic shapes vs stock MLX, plus the load-time selfcheck suite.
@@ -10,6 +10,13 @@ name: kernel-matrix
 # 2. small-model-smoke: download the 4B q4 artifact (~3.3 GB, fits 7 GB RAM),
 #    boot `--profile turbo`, assert the selfcheck reports every engaged lane
 #    ok in /health, and run a short generation through the OpenAI API.
+# 3. inkling-launch-limits (also on pull requests): every Inkling launch above
+#    256 threads at the widths a Mac serves, on synthetic operands, with
+#    2.13.0's code and with this tree's (issue #706: an M1 Max refused the copy
+#    lane's 800-thread attention partials, so no Inkling pack loaded). This
+#    tree must run every launch, in a same-bits form or declined at the call.
+#    The runner's GPU is a paravirtual device: the summary says plainly whether
+#    it refuses what the M1 Max refused.
 
 on:
   workflow_dispatch:
@@ -22,7 +29,18 @@ on:
       - "mtplx/kernel_selfcheck.py"
       - "mtplx/packed_concats.py"
       - "mtplx/gdn_capture.py"
+      - "mtplx/models/inkling/**"
+      - "native/**"
       - "tests/test_exactness_320_319.py"
+      - "tests/test_inkling_launch_limits.py"
+      - "tests/inkling_launch_census.py"
+      - ".github/workflows/kernel-matrix.yml"
+  pull_request:
+    paths:
+      - "mtplx/models/inkling/**"
+      - "native/**"
+      - "tests/test_inkling_launch_limits.py"
+      - "tests/inkling_launch_census.py"
       - ".github/workflows/kernel-matrix.yml"
 
 permissions:
@@ -30,6 +48,7 @@ permissions:
 
 jobs:
   kernel-exactness:
+    if: github.event_name != 'pull_request'
     runs-on: macos-15
     timeout-minutes: 30
     steps:
@@ -77,6 +96,7 @@ jobs:
           EOF
 
   small-model-smoke:
+    if: github.event_name != 'pull_request'
     runs-on: macos-15
     timeout-minutes: 45
     steps:
@@ -145,3 +165,35 @@ jobs:
       - name: Show server log on failure
         if: failure()
         run: cat serve.log || true
+
+  inkling-launch-limits:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: "3.11"
+      - run: python -m pip install -U pip
+      - run: python -m pip install -e ".[dev]"
+      - name: This runner's GPU
+        run: python -c "import json, mlx.core as mx; print(json.dumps(mx.device_info(), default=str))"
+      - name: 2.13.0's Inkling launches on this GPU (a refusal here is issue 706)
+        continue-on-error: true
+        run: |
+          mkdir -p "$RUNNER_TEMP/v2130"
+          git archive v2.13.0 mtplx | tar -x -C "$RUNNER_TEMP/v2130"
+          PYTHONPATH="$RUNNER_TEMP/v2130" python tests/inkling_launch_census.py census-2130.json
+      - name: This tree's Inkling launches on this GPU (every one must run)
+        run: python tests/inkling_launch_census.py census-tree.json
+      - name: Launch-limit and same-bits tests
+        run: |
+          python -m pytest -p no:warnings -q -rs \
+            tests/test_inkling_launch_limits.py \
+            tests/test_inkling_fast_attend.py \
+            tests/test_inkling_fast_experts.py
+      - name: Summary
+        if: always()
+        run: python tests/inkling_launch_census.py --summary census-2130.json census-tree.json >> "$GITHUB_STEP_SUMMARY"

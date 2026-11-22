@@ -44,6 +44,7 @@ import struct
 from functools import lru_cache
 
 import mlx.core as mx
+from .. import launch_limits
 
 from .routes import count
 
@@ -141,7 +142,7 @@ _ADD_NORM = """
 @lru_cache(maxsize=None)
 def _add_norm_kernel():
     text, _why = _library()
-    return mx.fast.metal_kernel(name="mtplx_inkling_f1_add_norm", input_names=["a", "b", "gain"],
+    return launch_limits.kernel(name="mtplx_inkling_f1_add_norm", input_names=["a", "b", "gain"],
                                 output_names=["normed", "summed"], source=_ADD_NORM, header=text)
 
 
@@ -190,7 +191,7 @@ _GATE = """
 @lru_cache(maxsize=None)
 def _gate_kernel():
     text, _why = _library()
-    return mx.fast.metal_kernel(name="mtplx_inkling_f1_gate_act", input_names=["gate", "up"],
+    return launch_limits.kernel(name="mtplx_inkling_f1_gate_act", input_names=["gate", "up"],
                                 output_names=["gated"], source=_GATE, header=text)
 
 
@@ -247,9 +248,9 @@ _MARKOV_UPDATE = """
 @lru_cache(maxsize=None)
 def _markov_kernels():
     text, _why = _library()
-    first = mx.fast.metal_kernel(name="mtplx_inkling_f1_markov_input", input_names=["state", "table", "prev"],
+    first = launch_limits.kernel(name="mtplx_inkling_f1_markov_input", input_names=["state", "table", "prev"],
                                  output_names=["out"], source=_MARKOV_INPUT, header=text)
-    second = mx.fast.metal_kernel(name="mtplx_inkling_f1_markov_update", input_names=["mv", "cond", "state"],
+    second = launch_limits.kernel(name="mtplx_inkling_f1_markov_update", input_names=["mv", "cond", "state"],
                                   output_names=["state_out", "signal"], source=_MARKOV_UPDATE, header=text)
     return first, second
 
@@ -355,10 +356,10 @@ def _attend_kernels():
     texts, _missing = attend_texts()
     if texts is None:
         return None
-    partials = mx.fast.metal_kernel(name="mtplx_inkling_f1_draft_attend", input_names=["q", "hk", "hv", "ok", "ov",
+    partials = launch_limits.kernel(name="mtplx_inkling_f1_draft_attend", input_names=["q", "hk", "hv", "ok", "ov",
                                                                                       "cnt", "nw"],
                                     output_names=["pm", "pl", "pacc"], source=texts["attend"])
-    merge = mx.fast.metal_kernel(name="mtplx_inkling_f1_draft_merge", input_names=["pm", "pl", "pacc"],
+    merge = launch_limits.kernel(name="mtplx_inkling_f1_draft_merge", input_names=["pm", "pl", "pacc"],
                                  output_names=["out"], source=texts["merge"])
     return partials, merge
 

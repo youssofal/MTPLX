@@ -32,6 +32,7 @@ import os
 from functools import lru_cache
 
 import mlx.core as mx
+from .. import launch_limits
 
 from .routes import count
 
@@ -211,7 +212,7 @@ def _kernel():
     text = source()
     if text is None:
         return None
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_f1_read_lean",
         input_names=["c0", "c1", "c2", "c3", "partial", "queries", "g0", "g1", "g2", "rin",
                      "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7", "d0", "d1", "d2"],

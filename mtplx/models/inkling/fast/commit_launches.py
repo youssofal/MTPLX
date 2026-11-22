@@ -25,6 +25,7 @@ from __future__ import annotations
 from functools import lru_cache
 
 import mlx.core as mx
+from .. import launch_limits
 
 from . import round as fast_round
 from .round_program import _tails_kernel
@@ -43,7 +44,7 @@ _MIX = """
 
 @lru_cache(maxsize=None)
 def _mix_kernel():
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_l7_mix4",
         input_names=["h0", "h1", "h2", "h3", "w"],
         output_names=["out"],
@@ -124,7 +125,7 @@ _MIX_NORM = """
 
 @lru_cache(maxsize=None)
 def _mix_norm_kernel():
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_f1_draft_mix",
         input_names=["h0", "h1", "h2", "h3", "blend", "gain"],
         output_names=["out"],
@@ -148,15 +149,18 @@ def mix_norm(features, blend, row: int, norm_weight, eps: float):
     rows = features[0].size // width
     row = int(row) % int(blend.shape[0])
     tpg = -(-(width // 4) // 32) * 32
-    return _mix_norm_kernel()(
-        inputs=[*features, blend, norm_weight],
-        template=[("D", width), ("TPG", tpg), ("ROW", row),
-                  ("EPS", struct.unpack("<I", struct.pack("<f", eps))[0])],
-        grid=(rows * tpg, 1, 1),
-        threadgroup=(tpg, 1, 1),
-        output_shapes=[features[0].shape],
-        output_dtypes=[mx.bfloat16],
-    )[0]
+    try:
+        return _mix_norm_kernel()(
+            inputs=[*features, blend, norm_weight],
+            template=[("D", width), ("TPG", tpg), ("ROW", row),
+                      ("EPS", struct.unpack("<I", struct.pack("<f", eps))[0])],
+            grid=(rows * tpg, 1, 1),
+            threadgroup=(tpg, 1, 1),
+            output_shapes=[features[0].shape],
+            output_dtypes=[mx.bfloat16],
+        )[0]
+    except launch_limits.GroupRefused:  # issue #706: the caller's four-tap mix and norm serve instead
+        return None
 
 
 def mix(features, weights, norm_weight, eps: float):

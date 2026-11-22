@@ -40,6 +40,7 @@ import logging
 from threading import Lock
 
 import mlx.core as mx
+from .. import launch_limits
 
 _log = logging.getLogger(__name__)
 _lock = Lock()
@@ -137,7 +138,7 @@ SORT = """
 
 @lru_cache(maxsize=None)
 def _sort_kernel():
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_prompt_pair_sort",
         input_names=["experts"],
         output_names=["order", "rows", "sorted_experts", "inverse", "tiles", "starts"],
@@ -529,7 +530,7 @@ def _product_kernel(mapped, wide=None, rounded=None):
         source = source.replace(_STORE, _STORE_ROUNDED)
         if rounded == "scaled":
             inputs += ["outer", "expert_outer"]
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_prompt_expert_product" + ("_mapped" if mapped else "")
              + (f"_w{wide[0]}x{wide[1]}" if wide else "") + (f"_{rounded}" if rounded else ""),
         input_names=inputs,
@@ -543,7 +544,7 @@ def _product_kernel(mapped, wide=None, rounded=None):
 @lru_cache(maxsize=None)
 def _affine_kernel():
     header, _ = _installed_tile_header()
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_prompt_affine_product",
         input_names=["x", "w", "s", "b", "tiles", "starts"],
         output_names=["y"],

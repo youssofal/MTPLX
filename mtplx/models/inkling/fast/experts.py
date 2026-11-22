@@ -56,6 +56,7 @@ import struct
 from threading import Lock
 
 import mlx.core as mx
+from .. import launch_limits
 
 from mtplx.models.inkling import expert_fusion
 
@@ -1201,7 +1202,7 @@ def _kernel(stage, fp4, defines=()):
     extra = f"#define FP4 {int(fp4)}\n" + "".join(f"#define {k} {v}\n" for k, v in defines)
     tag = "_".join(f"{k.lower()}{v}" for k, v in defines)
     name = f"mtplx_inkling_l3_{stage}_{'nvfp4' if fp4 else 'mxfp8'}" + (f"_{tag}" if tag else "")
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name=name, input_names=inputs, output_names=outputs, source=body,
         header=_header(extra), ensure_row_contiguous=contiguous,
     )
@@ -1305,7 +1306,7 @@ def _panel_kernel(product, fp4, fold, wide=False, xh=False):
     extra = "".join(f"#define {k} {v}\n" for k, v in defines.items())
     name = (f"mtplx_inkling_panel_{product}_{'nvfp4' if fp4 else 'mxfp8'}_f{int(fold)}" + ("_wide" if wide else "")
             + ("_xh" if xh and fp4 else ""))
-    return mx.fast.metal_kernel(name=name, input_names=["plan", "xin", "codes", "scales"], output_names=["raw"],
+    return launch_limits.kernel(name=name, input_names=["plan", "xin", "codes", "scales"], output_names=["raw"],
                                 source=PANEL_WIDE if wide else PANEL, header=_header(extra), ensure_row_contiguous=True)
 
 
@@ -1317,7 +1318,7 @@ def _panel_prompt_kernel(fp4, fold, body=1):
                "FOLD": int(fold), "SFOLD": (g["POW"] if fold else "1.0f")}
     extra = "".join(f"#define {k} {v}\n" for k, v in defines.items())
     name = f"mtplx_inkling_panel_prompt{body}_gu_{'nvfp4' if fp4 else 'mxfp8'}_f{int(fold)}"
-    return mx.fast.metal_kernel(name=name, input_names=["sorted_experts", "sorted_rows", "xin", "codes", "scales"],
+    return launch_limits.kernel(name=name, input_names=["sorted_experts", "sorted_rows", "xin", "codes", "scales"],
                                 output_names=["raw"], source=PANEL_PROMPT if body == 1 else PANEL_PROMPT2,
                                 header=_header(extra), ensure_row_contiguous=True)
 
@@ -1350,12 +1351,12 @@ def prompt_gate_up(block, values, sorted_experts, sorted_rows, layout=None):
 @lru_cache(maxsize=None)
 def _route_plan_kernel(wide=False):
     if wide:
-        return mx.fast.metal_kernel(
+        return launch_limits.kernel(
             name="mtplx_inkling_panel_route_plan_wide", input_names=["logits", "bias", "rconsts"],
             output_names=["experts", "prob", "plan"], source=ROUTE_PLAN_WIDE,
             header=_header(f"#define PLAN_STRIDE {PLAN_STRIDE_WIDE}\n#define PAIRS_AT {WIDE_PAIRS_AT}\n"),
             ensure_row_contiguous=True)
-    return mx.fast.metal_kernel(name="mtplx_inkling_panel_route_plan", input_names=["logits", "bias", "rconsts"],
+    return launch_limits.kernel(name="mtplx_inkling_panel_route_plan", input_names=["logits", "bias", "rconsts"],
                                 output_names=["experts", "prob", "plan"], source=ROUTE_PLAN,
                                 header=_header(f"#define PLAN_STRIDE {PLAN_STRIDE}\n"), ensure_row_contiguous=True)
 
@@ -1522,17 +1523,23 @@ def expert_visit_parts(block, norm_weight, conv_weight, source, partial, tail, *
 def _combine(fp4, rows, raw, mid_outer, experts, prob, dn, conv_weight, tail, part, conv_form, source,
              trace, logits, values, outer, h, peaks, dtype=mx.bfloat16):
     defines = (("CONV_FORM", conv_form), ("DIVISOR", _divisor_bits()))
-    if GLUE == "rows":
+    glue = GLUE
+    if glue == "rows":
         cols = 64 if rows == 1 else 32
-        out, conv_rows = _kernel("combine_rows", fp4, defines)(
-            inputs=[raw, *([mid_outer[0]] if fp4 else []), experts, prob, *([dn.outer] if fp4 else []),
-                    conv_weight, tail.reshape(3, HIDDEN), part],
-            template=[("W", rows), ("T", dtype), ("COLS", cols)],
-            grid=(HIDDEN * rows, 1, 1), threadgroup=(cols * rows, 1, 1),
-            output_shapes=[(rows, HIDDEN), (rows, HIDDEN)],
-            output_dtypes=[dtype, mx.float32],
-        )
-    else:
+        launch = dict(inputs=[raw, *([mid_outer[0]] if fp4 else []), experts, prob, *([dn.outer] if fp4 else []),
+                              conv_weight, tail.reshape(3, HIDDEN), part],
+                      template=[("W", rows), ("T", dtype), ("COLS", cols)],
+                      grid=(HIDDEN * rows, 1, 1), threadgroup=(cols * rows, 1, 1),
+                      output_shapes=[(rows, HIDDEN), (rows, HIDDEN)],
+                      output_dtypes=[dtype, mx.float32])
+        rows_combine = _kernel("combine_rows", fp4, defines)
+        if rows_combine.runs(f"a {rows}-row panel's combine runs as the column combine (the same bits)", **launch):
+            out, conv_rows = rows_combine(**launch)
+        else:
+            # Issue #706: this GPU cannot run cols x rows threads in one group for this pipeline (a copy
+            # round's 25-row panel asks 800). The column combine is RC6's bits too (see GLUE).
+            glue = "row"
+    if glue != "rows":
         out, conv_rows = _kernel("combine", fp4, defines)(
             inputs=[raw, *([mid_outer[0]] if fp4 else []), experts, prob, *([dn.outer] if fp4 else []),
                     conv_weight, tail.reshape(3, HIDDEN), part],

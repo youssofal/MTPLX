@@ -13,6 +13,7 @@ from threading import RLock
 from time import perf_counter
 
 import mlx.core as mx
+from . import launch_limits
 import numpy as np
 from mtplx.kernels.first_use import GpuRace, Incomplete, Mismatch, ProofCache
 
@@ -195,7 +196,7 @@ _PROJECT = """
 
 @lru_cache(maxsize=1)
 def _project():
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_vocabulary",
         input_names=["states", "weight"],
         output_names=["scores"],
@@ -215,7 +216,7 @@ def _project_capped():
         raise RuntimeError(f"no soft-capped head here: {why}")
     finish = ("#define FINISH(v) Multiply()(Tanh()(Divide()((v), as_type<float>(uint(CAP)))), "
               "as_type<float>(uint(CAP)))\n")
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_vocabulary_capped",
         input_names=["states", "weight"],
         output_names=["scores"],

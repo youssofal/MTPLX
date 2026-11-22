@@ -57,6 +57,7 @@ import re
 from threading import RLock
 
 import mlx.core as mx
+from . import launch_limits
 
 from mtplx import moe_sorted_gather
 from mtplx.kernels.first_use import Mismatch, ProofCache
@@ -392,7 +393,7 @@ def kernel_spec(stage, fp4, options=()):
 @lru_cache(maxsize=None)
 def _kernel(stage, fp4, options=()):
     name, inputs, outputs, body, header = kernel_spec(stage, fp4, options)
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name=name, input_names=inputs, output_names=outputs, source=body, header=header
     )
 
@@ -860,6 +861,17 @@ def _prompt_fast(part):
 def experts_forward(block, hidden, linear, stock, prompt=False):
     """Serve `block(hidden)` through the fused path when admitted, else the stock body. `prompt`: the call is a
     prompt chunk's (``model.Layer`` without a verify tape)."""
+    try:
+        return _experts_forward(block, hidden, linear, stock, prompt)
+    except launch_limits.GroupRefused:
+        # Issue #706: one of the fused path's launches is above this GPU's thread-group limit for its
+        # pipeline; the stock body serves this call (counted, and said once by launch_limits).
+        flat = hidden.reshape(-1, hidden.shape[-1])
+        _state(block).record(_key(getattr(block.gate_up, "mode", "unknown"), flat.shape[0], "stock.threadgroup"))
+        return stock(hidden)
+
+
+def _experts_forward(block, hidden, linear, stock, prompt=False):
     flat = hidden.reshape(-1, hidden.shape[-1])
     rows, fmt = flat.shape[0], getattr(block.gate_up, "mode", "unknown")
     state = _state(block)
