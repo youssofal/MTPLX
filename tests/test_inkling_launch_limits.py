@@ -130,6 +130,22 @@ def test_a_group_no_apple_gpu_runs_is_read_from_mlx_and_mlx_carries_on():
     assert (mx.arange(16) * 2).sum().item() == 240
 
 
+def test_a_refused_stage_a_or_d_keeps_copy_rounds_at_8_rows():
+    """Stage A's and D's references read wide panels with the stock product, which does not keep every row equal
+    to the one-row step: where this GPU refused one of their launches, copy rounds verify 8 rows (the drafter's
+    block), as on a pack whose stage A takes the reference. Stage BC's reference is row-stable: no cap for it."""
+    from mtplx.models.inkling.fast import step
+
+    key = ("a", 1, "mlx.core.bfloat16", False, 0)
+    step._GROUP_REFUSED.add(key)
+    try:
+        with routes.capture_counts() as box:
+            assert step.wide_rows_exact(None, "a,bc,d,e") is False
+        assert box == {"fallback.wide_panels.threadgroup": 1}
+    finally:
+        step._GROUP_REFUSED.discard(key)
+
+
 def test_kernels_are_made_through_the_guard():
     """Every Inkling kernel is made through ``launch_limits.kernel`` (a direct ``mx.fast.metal_kernel`` would
     escape the check)."""

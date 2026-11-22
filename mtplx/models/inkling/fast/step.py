@@ -478,14 +478,32 @@ def expert_input_reason(layer, message, dtype=mx.bfloat16):
 def wide_rows_exact(model, spec):
     """Whether panels wider than 8 rows keep every row equal to the one-row step with this lane
     set on this pack: every visit's stage A and MLP read on lane L1's kernels (the reference
-    stages read wide panels with the stock product); experts, the output projection, the final
-    read and the head are row-stable at any width (lane kernels, or pieces of 8 rows, or one row
-    at a time for stored codes)."""
+    stages read wide panels with the stock product), none of them refused for its thread group on
+    this GPU (issue #706); experts, the output projection, the final read and the head are
+    row-stable at any width (lane kernels, or pieces of 8 rows, or one row at a time for stored
+    codes), and so is stage BC's reference (each row on its own history)."""
     lanes = {part.strip() for part in spec.split(",") if part.strip()}
     if not {"a", "bc", "d"} <= lanes:
         return False
+    if any(key[0] in ("a", "d") for key in tuple(_GROUP_REFUSED)):
+        # Issue #706: this GPU refused a stage A or stage D launch for its thread group, so those visits take
+        # the reference stages, which read wide panels with the stock product: copy rounds verify 8 rows.
+        _note_wide_panels_capped()
+        return False
     found = stage_fallbacks(model, spec, ROW_STABLE_ROWS + 1)
     return not any(key.startswith(("fallback.a.", "fallback.d.")) for key in found)
+
+
+_WIDE_CAP_SAID: list = []
+
+
+def _note_wide_panels_capped():
+    count("fallback.wide_panels.threadgroup")
+    if not _WIDE_CAP_SAID:
+        _WIDE_CAP_SAID.append(True)
+        print("[mtplx] inkling: this GPU cannot run a stage A or stage D launch at its thread-group size, so "
+              f"copy rounds verify {ROW_STABLE_ROWS} rows at a time (wider panels would not keep every row equal "
+              "to the one-row step)", flush=True)
 
 
 def stage_fallbacks(model, spec, rows, dtype=None):
