@@ -632,13 +632,14 @@ def routed_sorted(block, flat, linear, trace=None, variant=None, fast=False, inv
     # pair is its one-row product. An NVFP4 product's sums are exact, so either is ours; an MXFP8
     # block below that keeps MLX's products (and the fast route's MXFP8 gate-up its panel).
     tiled = fp4 or invariant or pairs >= SORTED_TILE_PAIRS * block.router.shape[0]
-    # On a GPU without the tensor units (M1 to M4) the fast route's MXFP8 gate-up takes MLX's sorted product
-    # (not the one-row panel), on bfloat16 operands where the stream is bfloat16 (exact for the rounded inputs,
-    # and MLX's bfloat16 output is the float32 sum rounded once, as the SwiGLU rounds it) and float32 operands
-    # on a float16 stream (the M1 and M2 packs). NVFP4 blocks keep float32 operands there: a bfloat16 sum
-    # rounded before its outer scale moved the block's output by 3.7% on the test's synthetic block, for 2%
-    # of the products' time. Class C, the prompt read's.
-    without = fast and tiled and not fp4 and not ours and _without_tensor_units()
+    # Wherever MLX's products serve the fast route (every GPU without the tensor units, M1 to M4; an M5 whose
+    # launches are declined or switched off) its MXFP8 gate-up takes MLX's sorted product (not the one-row panel)
+    # on bfloat16 operands where the stream is bfloat16 (exact for the rounded inputs, and MLX's bfloat16 output
+    # is the float32 sum rounded once, as the SwiGLU rounds it) and float32 operands on a float16 stream (the FP16
+    # packs): a bfloat16 output there would round every sum to bfloat16 before the float16 stream. NVFP4 blocks
+    # keep float32 operands with MLX's products: a bfloat16 sum rounded before its outer scale moved real blocks'
+    # output by 3.5%, for 2% of the products' time. Class C, the prompt read's.
+    without = fast and tiled and not fp4 and not ours
     fast = (fast or invariant) and not fp4 and tiled
     # bfloat16 operands: the fast route's MXFP8 products, and NVFP4 products on our launches. MLX's
     # products of an MXFP8 block take float32 operands, and so do ours in their place.
@@ -883,9 +884,9 @@ def experts_forward(block, hidden, linear, stock, prompt=False):
                 without = _without_tensor_units() and not prompt_kernels()
                 if prompt and fmt == "mxfp8" and _prompt_fast("experts"):
                     # The prompt read's fast route (on by default, class C): the MXFP8 gate-up on the sorted
-                    # product instead of the one-row panel: with the tensor units (M5) ours on bfloat16
-                    # operands, without them (M1 to M4) MLX's (see `routed_sorted`). NVFP4 blocks keep their
-                    # own route and counter.
+                    # product instead of the one-row panel: ours on bfloat16 operands where our launches serve
+                    # (M5), else MLX's (M1 to M4, or an M5 with them declined; see `routed_sorted`). NVFP4 blocks
+                    # keep their own route and counter.
                     state.record(_key(fmt, rows, "prompt_fast." + variant + (".without_tensor_units" if without else "")),
                                  *proofs)
                     return routed_sorted(block, flat, linear, variant=variant, fast=True).reshape(hidden.shape)

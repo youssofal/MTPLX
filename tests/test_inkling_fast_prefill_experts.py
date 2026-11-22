@@ -163,21 +163,26 @@ def test_experts_forward_takes_the_fast_route_by_default_and_when_named_not_when
 
 @pytest.mark.parametrize("mode", ["nvfp4", "mxfp8"])
 @pytest.mark.parametrize("stream", ["bfloat16", "float16"])
-def test_without_the_tensor_units_the_fast_route_takes_the_sorted_product(monkeypatch, mode, stream):
-    # M1 to M4 (here: this Mac told it has no tensor units, and our launches unavailable as they are there). Unset,
-    # an MXFP8 block's gate-up leaves the one-row panel for MLX's sorted product (bfloat16 operands on a bfloat16
-    # stream, float32 on a float16 one), counted, held to the class C bound against the stock body; an NVFP4 block
+@pytest.mark.parametrize("units", ["absent", "declined"])
+def test_without_the_tensor_units_the_fast_route_takes_the_sorted_product(monkeypatch, mode, stream, units):
+    # Wherever MLX's products serve: M1 to M4 ("absent": this Mac told it has no tensor units, and our launches
+    # unavailable as they are there) and an M5 whose launches are declined ("declined": MTPLX_INKLING_PROMPT_KERNELS=mlx,
+    # or MLX headers it cannot read). Unset, an MXFP8 block's gate-up leaves the one-row panel for MLX's sorted product
+    # (bfloat16 operands on a bfloat16 stream, float32 on a float16 one: a bfloat16 product there would round every sum
+    # to bfloat16 before the float16 stream), counted, held to the class C bound against the stock body; an NVFP4 block
     # keeps today's route and its bits exactly. The switch turned off restores today's route.
     import mtplx.nax_detect as nax
 
     monkeypatch.delenv("MTPLX_INKLING_PROMPT_EXPERTS", raising=False)
     monkeypatch.delenv("MTPLX_INKLING_PROMPT_FAST", raising=False)
-    monkeypatch.setattr(nax, "nax_available", lambda: False)
+    monkeypatch.setattr(nax, "nax_available", lambda: units == "declined")
     monkeypatch.setattr(EF, "prompt_kernels", lambda: False)
     block = synthetic_block(mode, seed=13)
     hidden = hidden_rows(512, seed=41).astype(getattr(mx, stream))
     state = EF._state(block)
-    taken = lambda: sum(v for k, v in state.counts.items() if k.endswith(".without_tensor_units"))
+    # M1 to M4 count the route with the GPU family; an M5 counts it as the fast route it is.
+    taken = lambda: sum(v for k, v in state.counts.items()
+                        if ".prompt_fast." in k and k.endswith(".without_tensor_units") == (units == "absent"))
     before = taken()
     got = block(hidden)
     want = block.stock(hidden)
