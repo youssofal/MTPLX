@@ -136,7 +136,10 @@ class VisionTower(nn.Module):
 
     @property
     def nbytes(self):
-        return sum(int(value.nbytes) for _, value in tree_flatten(self.parameters()))
+        # Shapes and types only (nothing is read); counted once, the early memory check asks on every request.
+        if getattr(self, "_nbytes", None) is None:
+            self._nbytes = sum(int(value.nbytes) for _, value in tree_flatten(self.parameters()))
+        return self._nbytes
 
     def encode(self, image, processor):
         self.resident = True
