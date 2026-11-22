@@ -15845,12 +15845,10 @@ def generate_mtpk(
                     None, ...
                 ]
             # Every token this lane commits is one of these samples (a kept
-            # draft equals it, a correction and the bonus are it). With
-            # MTPLX_SEEDED_DEVICE_DRAW on they take their key from the
-            # request's seeded generator, as the other lanes' host draws do,
-            # and the seed fixes the answer in any process; off (the default)
-            # they follow MLX's own generator, seeded from the clock, as in
-            # 2.12.3.
+            # draft equals it, a correction and the bonus are it), so they
+            # take their key from the request's seeded generator, as the
+            # other lanes' host draws do: the seed then fixes the answer in
+            # any process (MLX seeds its own generator from the clock).
             sampled_target_ids = sample_token_ids_from_mlx_logits(
                 target_distribution_logits,
                 sampler,
