@@ -532,7 +532,7 @@ struct InferenceParamsOverlay: View, Equatable {
                         commitReasoning()
                     }
                 )) {
-                    ForEach(reasoningEffortLevels, id: \.self) { effort in
+                    ForEach(reasoningEffortDisplayLevels, id: \.self) { effort in
                         Text(effort.capitalized).tag(effort)
                     }
                 }
@@ -889,6 +889,21 @@ struct InferenceParamsOverlay: View, Equatable {
             }
             seen.insert(level)
             return level
+        }
+    }
+    /// The effort picker's segments, left to right. Families declare their
+    /// levels in their chat template's own order (Qwen 3.8, Flash-Next and
+    /// Bonsai 2 list xhigh first; Inkling and Step list low first), so the
+    /// picker read high-to-low on some models and low-to-high on others.
+    /// Display only: the values, the family default and the fallback in
+    /// `normalizedReasoningEffort` still come from `reasoningEffortLevels`.
+    private var reasoningEffortDisplayLevels: [String] {
+        Self.effortLevelsLowToHigh(reasoningEffortLevels)
+    }
+    static func effortLevelsLowToHigh(_ levels: [String]) -> [String] {
+        let rank = ["low", "medium", "high", "xhigh"]
+        return levels.sorted {
+            (rank.firstIndex(of: $0) ?? rank.count) < (rank.firstIndex(of: $1) ?? rank.count)
         }
     }
     private var reasoningEffortSupported: Bool {
