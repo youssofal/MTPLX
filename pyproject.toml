@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mtplx"
 version = "2.13.0"
-description = "Native MTP speculative decoding for Qwen3-Next on Apple Silicon."
+description = "The fastest way to run Inkling 2 Mini and Qwen 3.8 on a Mac: native MTP speculative decoding on Apple Silicon, exact at any temperature."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -92,11 +92,15 @@ classifiers = [
   "Programming Language :: Python :: 3.14",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-keywords = ["mlx", "apple-silicon", "speculative-decoding", "qwen", "mtp", "local-ai"]
+keywords = ["mlx", "apple-silicon", "macos", "speculative-decoding", "mtp", "inkling", "inkling-2-mini", "qwen", "local-llm", "local-ai", "llm-inference", "openai-compatible"]
 
 [project.urls]
-Homepage = "https://github.com/youssofal/mtplx"
-Documentation = "https://github.com/youssofal/mtplx/tree/main/docs"
+Homepage = "https://mtplx.com"
+Repository = "https://github.com/youssofal/MTPLX"
+Documentation = "https://mtplx.com/docs/"
+"Run Inkling 2 Mini on a Mac" = "https://mtplx.com/docs/run-inkling-2-mini-on-a-mac/"
+Benchmarks = "https://mtplx.com/benchmarks/"
+Changelog = "https://github.com/youssofal/MTPLX/releases"
 Issues = "https://github.com/youssofal/mtplx/issues"
 Citation = "https://github.com/youssofal/mtplx/blob/main/CITATION.cff"
 
