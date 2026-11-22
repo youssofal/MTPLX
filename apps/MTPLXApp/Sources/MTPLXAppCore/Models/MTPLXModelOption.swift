@@ -1360,10 +1360,10 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
     /// its fp16-only entries.
     public static let bonsaiRecommendationMinGiB: Double = 16.0
     /// Inkling 2 Mini Bare Speed on 24 to 31 GiB Macs, directly after the tier's first pick. On
-    /// (21 November): in a simulated 24 GiB envelope the memory plan serves a 32,768-token window,
-    /// a 32,173-token prompt and every follow-up, an image and a tool call, each peak inside the
-    /// 18 GiB engine budget (largest 17.78 GiB), no swap. True is the whole switch. Mirrors
-    /// model_catalog.INKLING_TIGHT_MAC_OFFER.
+    /// (21 November). In a simulated 24 GiB envelope the memory plan serves a 24,576-token window,
+    /// one in which every conversation can take its next turn (22 November): a 20K prompt, turns of
+    /// 532 and 3,729 new tokens, an image, inside the 18 GiB engine budget (peak 17.92 GiB), no swap.
+    /// True is the whole switch. Mirrors model_catalog.INKLING_TIGHT_MAC_OFFER.
     public static let inklingTightMacOffer = true
     /// The Inkling 2 Mini FP16 siblings on M1 and M2 Macs (32 GiB and up), where the modern tier
     /// gives the trio. On by the founder's order of 21 November; their FP16 numbers are checked on

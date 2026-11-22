@@ -32,12 +32,13 @@ DOWNLOAD_HEADROOM_GIB = 5.0
 # Bonsai 2 leads from this much RAM; its measured 8K-context peak is 11.80 GiB.
 BONSAI_RECOMMENDATION_MIN_GIB = 16.0
 # Inkling 2 Mini Bare Speed on 24 to 31 GiB Macs, directly after the tier's first
-# pick. On (21 November, the lead's RC-B order): in a simulated 24 GiB envelope the
-# memory plan serves a 32,768-token window, a 32,173-token prompt and every
-# follow-up after 4K to 32K conversations, an image and a tool call, each peak
-# inside the 18 GiB engine budget (largest 17.78 GiB), no swap. A read there keeps
-# one restore point instead of two. True is the whole switch (mirrors
-# MTPLXModelOption.inklingTightMacOffer).
+# pick. On (21 November, the lead's RC-B order). In a simulated 24 GiB envelope the
+# memory plan serves a 24,576-token window, one in which every conversation can take
+# its next turn (22 November: 32,768 refused a follow-up after its stream opened, and
+# 28,672 a 4K tool result): a 20K prompt, turns of 532 and 3,729 new tokens, an
+# image, a cold 24,369-token prompt and its turn, inside the 18 GiB engine budget
+# (peak 17.92 GiB), no swap. A read there keeps one restore point instead of two.
+# True is the whole switch (mirrors MTPLXModelOption.inklingTightMacOffer).
 INKLING_TIGHT_MAC_OFFER = True
 # The Inkling 2 Mini FP16 siblings on M1 and M2 Macs (32 GiB and up), in the places the
 # modern tier gives the trio. On by the founder's order of 21 November (M1 and M2 are offered
@@ -824,8 +825,8 @@ def recommended_catalog_ids(
             return small
         bonsai = "bonsai-2-27b-optimized-speed"
         leading = [bonsai, *small] if memory_gib >= BONSAI_RECOMMENDATION_MIN_GIB else [*small, bonsai]
-        # Inkling Bare Speed behind INKLING_TIGHT_MAC_OFFER (on): its 32K window on a 24 GB Mac is
-        # served in a simulated envelope.
+        # Inkling Bare Speed behind INKLING_TIGHT_MAC_OFFER (on): its 24,576-token window on a 24 GB Mac
+        # is served in a simulated envelope, every next turn included.
         inkling = ["inkling2-mini-bare-speed"] if INKLING_TIGHT_MAC_OFFER and memory_gib >= 24 else []
         return [*leading[:1], *inkling, *leading[1:], *tiny_ids]
     if memory_gib < 48:
