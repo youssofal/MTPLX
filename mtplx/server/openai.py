@@ -31164,6 +31164,88 @@ def _reject_prompt_over_context(state: ServerState, prompt_token_count: int) -> 
         )
 
 
+def _reject_memory_short_before_stream(state: ServerState, prompt_token_count: int) -> None:
+    """Refuse (507) before any stream opens a request the admission is sure to refuse.
+
+    Sure means: no request is running (whose end would give memory back), and
+    the Mac's free and reclaimable memory, plus everything this engine could
+    give back (its allocator pool and every byte the session bank holds), is
+    already under the Mac's abort floor before the request adds a byte. The
+    admission inside the generation still prices every request and refuses
+    the rest; this only moves its certain refusals ahead of the response, so
+    every client shows the message instead of an error event after HTTP 200.
+    2.13.1 on a simulated 24 GB Mac, Bare Speed, another app holding a Q3
+    GGUF's 13.7 GB: the admission's 507 ("the other apps on this Mac leave
+    0.0 GiB free") reached the client 15 ms into an open stream, no token
+    (`x1-fix-24gb-hog`). Read only; never raises anything but the 507.
+    """
+
+    if bool(getattr(state, "allow_swap", False)) or not _prefill_admission_shed_enabled():
+        return None
+    try:
+        in_flight = getattr(getattr(state, "dashboard", None), "in_flight", None)
+        if in_flight is not None and int(in_flight.count()) > 0:
+            return None
+        reading = _read_system_memory()
+        if reading is None:
+            return None
+        stats = _mlx_memory_stats_live()
+        if _allocator_reading_failure(stats) is not None:
+            return None
+        pool = int(stats.get("cache_memory_bytes") or 0)
+        bank = getattr(getattr(state, "sessions", None), "bank", None)
+        banked = int(getattr(bank, "total_nbytes", 0) or 0) if bank is not None else 0
+        _shed, abort = _system_admission_floors(reading, 0)
+        if int(reading.available_bytes) + pool + banked >= int(abort):
+            return None
+        # Memory MLX has just given back may still be leaving the footprint.
+        if _settle_released_memory(_STEADY_OVERHANG["bytes"]) is not None:
+            reading = _read_system_memory()
+            if reading is None:
+                return None
+            _shed, abort = _system_admission_floors(reading, 0)
+            if int(reading.available_bytes) + pool + banked >= int(abort):
+                return None
+    except Exception:  # noqa: BLE001 - a reading that fails leaves the admission to decide
+        return None
+    gib = float(1024**3)
+    available = int(reading.available_bytes)
+    receipt = {
+        "action": "memory_refused_before_stream",
+        "refusal_reason": "system_memory_short_before_request",
+        "prompt_tokens": int(prompt_token_count),
+        "system_available_bytes": available,
+        "system_abort_floor_bytes": int(abort),
+        "allocator_pool_bytes": pool,
+        "session_bank_bytes": banked,
+        "system_memory": reading.to_dict(),
+    }
+    _record_guard_event(state, receipt)
+    try:
+        print("[mtplx] memory guard " + json.dumps(receipt, default=str), flush=True)
+    except Exception:
+        pass
+    raise HTTPException(
+        status_code=507,
+        detail={
+            "message": (
+                "insufficient memory: the other apps on this Mac leave "
+                f"{available / gib:.1f} GiB free, under the {int(abort) / gib:.1f} GiB "
+                "this Mac must keep free, before this prompt "
+                f"({int(prompt_token_count)} tokens) adds anything, and nothing this "
+                "engine holds would make up the difference. Close some apps (another "
+                "model or engine that is still loaded holds the most) and try again. "
+                "Refused before the response started instead of pushing the Mac into "
+                "swap; --allow-swap admits it anyway."
+            ),
+            "code": "insufficient_memory",
+            "memory": _json_safe(
+                {k: v for k, v in receipt.items() if k not in ("action", "system_memory")}
+            ),
+        },
+    )
+
+
 def _generation_params(
     state: ServerState,
     *,
@@ -41143,6 +41225,7 @@ def create_app(state: ServerState) -> FastAPI:
                 resolved_mtp_depth=effective_request_depth,
             )
         _reject_prompt_over_context(state, len(prompt_ids))
+        _reject_memory_short_before_stream(state, len(prompt_ids))
         current_system_hash = system_prompt_hash(messages_for_generation)
         if current_system_hash is not None and not background:
             state.main_system_prompt_hash = current_system_hash
@@ -45669,6 +45752,7 @@ def create_app(state: ServerState) -> FastAPI:
             # endpoint-discovery probes printed it as "python errors".
             raise HTTPException(status_code=400, detail="prompt must not be empty")
         _reject_prompt_over_context(state, len(prompt_ids))
+        _reject_memory_short_before_stream(state, len(prompt_ids))
         # Same admission-time yield as chat: a completions request holds no
         # session, so every pending idle commit is a stranger's — none can
         # help this request and any can stall it. Failures surface exactly
