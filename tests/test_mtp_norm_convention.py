@@ -110,10 +110,25 @@ def _unshifted_post_attention_sidecar(prefix: str = "mtp.") -> dict[str, mx.arra
     return weights
 
 
-def test_a_single_unshifted_gain_alone_gets_its_plus_one(monkeypatch):
+def test_by_default_the_shipped_gain_loads_as_stored(monkeypatch):
+    # 2.12.3's load: the repair is off until its class is accepted, so the
+    # shipped 35B head loads exactly as stored and nothing is reported.
     from mtplx import compressed_tensors as ct
 
     monkeypatch.delenv(ct.MTP_NORM_REPAIR_ENV, raising=False)
+    weights = _unshifted_post_attention_sidecar()
+    healed = shift_delta_mtp_norms(weights)
+    for key, value in weights.items():
+        assert bool(mx.array_equal(healed[key], value)), key
+    assert ct.LAST_MTP_NORM_REPAIRS == []
+    stripped = _heal_raw_delta_mtp_norms(_unshifted_post_attention_sidecar(prefix=""))
+    assert float(stripped["layers.0.post_attention_layernorm.weight"].mean().item()) < 1.0
+
+
+def test_a_single_unshifted_gain_alone_gets_its_plus_one(monkeypatch):
+    from mtplx import compressed_tensors as ct
+
+    monkeypatch.setenv(ct.MTP_NORM_REPAIR_ENV, "1")
     weights = _unshifted_post_attention_sidecar()
     assert mtp_sidecar_norms_are_delta(weights) is False
     assert ct.unshifted_mtp_norms(weights) == ["mtp.layers.0.post_attention_layernorm.weight"]
@@ -144,7 +159,7 @@ def test_the_repair_switch_loads_every_gain_as_stored(monkeypatch):
 def test_healthy_and_all_delta_sidecars_get_no_per_tensor_repair(monkeypatch):
     from mtplx import compressed_tensors as ct
 
-    monkeypatch.delenv(ct.MTP_NORM_REPAIR_ENV, raising=False)
+    monkeypatch.setenv(ct.MTP_NORM_REPAIR_ENV, "1")
     shift_delta_mtp_norms(_absolute_sidecar())
     assert ct.LAST_MTP_NORM_REPAIRS == []
     assert ct.unshifted_mtp_norms(_absolute_sidecar()) == []
