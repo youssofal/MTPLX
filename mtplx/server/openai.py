@@ -11384,9 +11384,18 @@ def _stream_tool_call_deltas(
     tool_calls: list[dict[str, Any]],
     *,
     argument_chunk_chars: int,
+    first_index: int = 0,
 ):
+    """OpenAI ``tool_calls`` deltas for complete calls.
+
+    ``first_index`` is the response-wide index of the first call: a client
+    (and the Anthropic stream translator) assembles calls by ``index``, so a
+    second ``<tool_call>`` block parsed on its own must continue the
+    numbering, not restart at 0 (issue #709: two Read calls streamed as one
+    ``tool_use`` block with two JSON objects back to back).
+    """
     chunk_size = max(1, int(argument_chunk_chars))
-    for index, tool_call in enumerate(tool_calls):
+    for index, tool_call in enumerate(tool_calls, start=max(0, int(first_index))):
         function = tool_call.get("function") if isinstance(tool_call, dict) else None
         if not isinstance(function, dict):
             continue
@@ -11482,10 +11491,12 @@ class _SuffixedNativeToolCallStreamParser(_ToolCallStreamParser):
         tools: list[dict[str, Any]],
         tokenizer: Any | None,
         argument_chunk_chars: int,
+        first_index: int = 0,
     ) -> None:
         self._tools = tools
         self._tokenizer = tokenizer
         self._argument_chunk_chars = max(1, int(argument_chunk_chars))
+        self._first_index = max(0, int(first_index))
         self._raw = ""
         self._done = False
         self._tool_calls: list[dict[str, Any]] | None = None
@@ -11611,6 +11622,7 @@ class _SuffixedNativeToolCallStreamParser(_ToolCallStreamParser):
             _stream_tool_call_deltas(
                 normalized_calls,
                 argument_chunk_chars=self._argument_chunk_chars,
+                first_index=self._first_index,
             )
         )
 
@@ -12024,11 +12036,13 @@ class _BufferedFallbackToolCallParser(_ToolCallStreamParser):
         argument_chunk_chars: int,
         tokenizer: Any | None = None,
         repair_unclosed_complete: bool = True,
+        first_index: int = 0,
     ) -> None:
         self._tools = tools
         self._argument_chunk_chars = max(1, int(argument_chunk_chars))
         self._tokenizer = tokenizer
         self._repair_unclosed_complete = bool(repair_unclosed_complete)
+        self._first_index = max(0, int(first_index))
         self._raw = ""
         self._tool_calls: list[dict[str, Any]] | None = None
         self._fallback_reason: str | None = None
@@ -12066,6 +12080,7 @@ class _BufferedFallbackToolCallParser(_ToolCallStreamParser):
             _stream_tool_call_deltas(
                 tool_calls,
                 argument_chunk_chars=self._argument_chunk_chars,
+                first_index=self._first_index,
             )
         )
 
@@ -12466,12 +12481,14 @@ class _ToolAwareContentStreamTranslator:
                 tools=self._tools,
                 tokenizer=self._tokenizer,
                 argument_chunk_chars=self._argument_chunk_chars,
+                first_index=len(self.tool_calls or []),
             )
         if lowered.startswith("<tool_call:") or lowered.startswith("<tool_calls:"):
             return _SuffixedNativeToolCallStreamParser(
                 tools=self._tools,
                 tokenizer=self._tokenizer,
                 argument_chunk_chars=self._argument_chunk_chars,
+                first_index=len(self.tool_calls or []),
             )
         return _QwenXMLToolCallStreamParser(
             tools=self._tools,
@@ -12573,6 +12590,7 @@ class _ToolAwareContentStreamTranslator:
                 argument_chunk_chars=self._argument_chunk_chars,
                 tokenizer=self._tokenizer,
                 repair_unclosed_complete=self._repair_unclosed_complete,
+                first_index=len(self.tool_calls or []),
             )
             self.tool_parser_dialect = buffered.dialect
             buffered.feed(self._tool_parser.raw_text)
@@ -12603,12 +12621,28 @@ class _ToolAwareContentStreamTranslator:
         *,
         emitted_tool_deltas: bool,
     ) -> list[dict[str, Any]]:
-        """Parse a closed non-XML tool block at the stream protocol boundary."""
+        """Parse a closed non-XML tool block at the stream protocol boundary.
+
+        Its calls continue the response's numbering (issue #709): Inkling's
+        channels commit each call's JSON at its own delimiter, so a second
+        ``<tool_call>`` block arrives in a later chunk and is parsed here on
+        its own.
+        """
+        # The chunk that closed this block may already hold the start of the
+        # next one ("</tool_call><" when a model streams its calls token by
+        # token): parse up to the last close and keep the rest, so the next
+        # block is not lost (it streamed as plain content before).
+        close_at = raw_text.lower().rfind(self._CLOSE_MARKER.lower())
+        tail = ""
+        if close_at >= 0:
+            end = close_at + len(self._CLOSE_MARKER)
+            raw_text, tail = raw_text[:end], raw_text[end:]
         buffered = _BufferedFallbackToolCallParser(
             tools=self._tools,
             argument_chunk_chars=self._argument_chunk_chars,
             tokenizer=self._tokenizer,
             repair_unclosed_complete=self._repair_unclosed_complete,
+            first_index=len(self.tool_calls or []),
         )
         self.tool_parser_dialect = buffered.dialect
         buffered.feed(raw_text)
@@ -12619,6 +12653,14 @@ class _ToolAwareContentStreamTranslator:
             if self._suppress_tool_call_preamble:
                 self._deferred_content = ""
             self._mode = "done"
+            if tail:
+                self._trailing += tail
+                idx = self._find_tool_start(self._trailing)
+                if idx >= 0 and not self._trailing[:idx].strip():
+                    self._pending = self._trailing[idx:]
+                    self._trailing = ""
+                    self._mode = "tool"
+                    return buffered_deltas + self._tool_deltas_if_complete(final=False)
             return buffered_deltas
         if buffered.fallback_reason:
             self.fallback_reason = buffered.fallback_reason
