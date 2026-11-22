@@ -110,9 +110,11 @@ def test_the_final_commit_of_a_snapshot_only_turn_banks_a_resumable_entry(monkey
     assert restored is not None and restored.mtp_history_cache is not None
 
 
-def _snapshot_only_turns(pack, monkeypatch, *, one_copy: bool):
+def _snapshot_only_turns(pack, monkeypatch, *, one_copy: bool, keep_live_ref: bool = False):
     """Two agent turns on the tiny fixed-M4 lane, banked the way the server
-    banks a turn that keeps no live reference (keep_live_ref off)."""
+    banks a turn that keeps no live reference (keep_live_ref off), or, with
+    ``keep_live_ref``, the way it banks an anonymous session's turn on a
+    one-copy runtime since 12 Nov (a lease)."""
 
     smoke, model = pack
     monkeypatch.setenv("MTPLX_ONE_COPY", "1" if one_copy else "0")
@@ -148,8 +150,9 @@ def _snapshot_only_turns(pack, monkeypatch, *, one_copy: bool):
         metadata["hidden_variant"] = hidden_variant
         entry = bank.put(
             runtime=rt, token_ids=tokens, cache=final.final_trunk_cache,
-            logits=final.final_logits, hidden=final.final_hidden, keep_live_ref=False,
-            session_id="anon-t", snapshot_epoch=len(tokens), **metadata,
+            logits=final.final_logits, hidden=final.final_hidden,
+            keep_live_ref=keep_live_ref, session_id="anon-t", snapshot_epoch=len(tokens),
+            **metadata,
         )
         assert entry is not None
         results.append((list(result.tokens), entry, result))
