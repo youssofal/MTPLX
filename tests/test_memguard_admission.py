@@ -1775,6 +1775,48 @@ class TestPressureLoop:
         _run_loop(_loop_state(bank), monkeypatch, seconds=0.05)
         assert bank.calls == [(0, "memory_pressure_critical")]
 
+    def test_the_sustained_abort_counts_the_engines_pool_as_the_per_chunk_check_does(self, monkeypatch):
+        """A 24 GB Mac mid-read: free pages 0.2 GiB under the 1.25 GiB abort floor, 0.8 GiB in the engine's
+        pool, which MLX reuses before it asks the Mac for more. Every chunk's check passes with the pool
+        counted; on free pages alone the abort armed after three ticks and stopped the read
+        (`x1-fix-24gb-proof2`: a 24K read at its 43rd of 49 chunks). With an empty pool it still arms, and a
+        death signature still arms whatever the pool holds."""
+
+        monkeypatch.setattr(srv, "_engine_busy_signal", lambda state: True)
+        monkeypatch.setattr(srv, "_SYSTEM_SHORT_INTERVAL_S", 0.01)
+
+        def short(compressor_gib=1.0, at_s=0.0):
+            return sm.SystemMemory(
+                available_bytes=int(1.05 * GIB), total_bytes=24 * GIB, level_percent=4,
+                free_bytes=int(1.05 * GIB), file_backed_bytes=0, wired_bytes=20 * GIB,
+                compressor_bytes=int(compressor_gib * GIB), swap_used_bytes=0, monotonic_s=at_s,
+            )
+
+        def pool(gib):
+            monkeypatch.setattr(
+                srv, "_mlx_memory_stats_live",
+                lambda: {"ok": True, "active_memory_bytes": 15 * GIB, "cache_memory_bytes": int(gib * GIB)},
+            )
+
+        for pool_gib, armed in ((0.8, False), (0.0, True)):
+            pool(pool_gib)
+            monkeypatch.setattr(sm, "_reader", short)
+            state = _loop_state(_LoopBank(total=0, max_bytes=8 * GIB))
+            _run_loop(state, monkeypatch, seconds=0.15, interval_s=0.01)
+            assert srv._pressure_abort_requested(state) is armed, pool_gib
+        # The compressor growing fast while free pages are under the floor: critical with the pool full.
+        pool(0.8)
+        ticks = iter(range(10_000))
+
+        def thrashing():
+            i = next(ticks)
+            return short(compressor_gib=1.0 + 0.5 * i, at_s=0.25 * i)
+
+        monkeypatch.setattr(sm, "_reader", thrashing)
+        state = _loop_state(_LoopBank(total=0, max_bytes=8 * GIB))
+        _run_loop(state, monkeypatch, seconds=0.15, interval_s=0.01)
+        assert srv._pressure_abort_requested(state) is True
+
 
 class TestPlannerReserve:
     def test_the_steady_reserve_covers_the_committed_window_with_aux(self):

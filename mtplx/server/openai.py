@@ -26089,6 +26089,36 @@ async def _memory_pressure_loop(
                 system_memory, earlier_system_memory
             )
             system_window.add(system_memory)
+            # The sustained abort (below) reads the Mac's supply as the
+            # per-chunk check and the admission read it: the engine's own
+            # allocator pool counts, because MLX reuses it before it asks the
+            # Mac for more. On free pages alone, a 24 GB Mac's pool (up to its
+            # 2 GiB cache limit) held them under the abort floor while every
+            # chunk's check passed with the pool counted, and the abort
+            # stopped reads the check had admitted: a 24K read at its 43rd of
+            # 49 chunks (simulated 24 GB, 4.5 GiB of other apps,
+            # `x1-fix-24gb-proof2`), a 16K read of the FP16 pack on the M1 to
+            # M4 path (`x1-fix-24gb-m1m4`). The death signature and a full
+            # compressor stay critical as they are; trims still act on the
+            # free pages.
+            abort_level = level
+            system_abort_level = system_level
+            if (
+                system_level >= 4
+                and system_memory is not None
+                and not system_thrashing
+                and not system_compressor_full
+            ):
+                pool_stats = _mlx_memory_stats_live()
+                pool = (
+                    0
+                    if _allocator_reading_failure(pool_stats) is not None
+                    else int(pool_stats.get("cache_memory_bytes") or 0)
+                )
+                _shed_floor, abort_floor = _system_reading_floors(system_memory)
+                if int(system_memory.available_bytes) + pool >= int(abort_floor):
+                    system_abort_level = 2
+            abort_level = max(abort_level, system_abort_level)
             if system_level > level:
                 level = system_level
                 level_source = "system_available"
@@ -26155,11 +26185,11 @@ async def _memory_pressure_loop(
             # (CRITICAL trims never defer); the abort tracker needs it there.
             critical_busy = (
                 await asyncio.to_thread(_engine_busy_signal, state)
-                if level >= 4
+                if abort_level >= 4
                 else False
             )
             abort_streak = _note_critical_pressure_tick(
-                state, level, critical_busy, abort_streak
+                state, abort_level, critical_busy, abort_streak
             )
             deferred_s = guard.deferred_for_s(time.monotonic())
             if guard.decide(level, time.monotonic(), busy):
