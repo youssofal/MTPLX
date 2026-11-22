@@ -114,6 +114,31 @@ def test_the_help_names_none_of_them(argv):
                     or "{openwebui,claude-code,opencode,swival}" in line), (argv, line)
 
 
+@pytest.mark.parametrize("client", ("claude-code", "codex", "deepseek-harness"))
+def test_the_server_answers_a_direct_launch_in_one_line_and_opens_nothing(client, capsys):
+    """The server's own `--launch-agent-client` (what `mtplx start <client>` passes, and a direct call of the
+    server module) is refused before the model loads, in one line."""
+
+    from mtplx.server import openai as server
+
+    with pytest.raises(SystemExit) as exc:
+        server.parse_args(["--launch-agent-client", client])
+    assert exc.value.code == 2
+    out = capsys.readouterr().out
+    assert out.strip().count("\n") == 0, out
+    assert "arrives in MTPLX 3" in out
+
+
+def test_the_servers_help_names_none_of_them(capsys):
+    from mtplx.server import openai as server
+
+    with pytest.raises(SystemExit):
+        server.parse_args(["--help"])
+    lowered = capsys.readouterr().out.lower()
+    for word in ("agent-client", "codex", "deepseek"):
+        assert word not in lowered, word
+
+
 def test_the_switch_offers_them_again(monkeypatch):
     monkeypatch.setattr(release_gates, "V3_AGENT_CLIENTS", True)
     for name in (*V3_STARTS, *V3_CONNECTS):
@@ -122,3 +147,6 @@ def test_the_switch_offers_them_again(monkeypatch):
     code, out = _run(["connect", "--json"])
     names = [item["name"] for item in json.loads(out)["integrations"]]
     assert {"codex", "codex-desktop", "deepseek-harness"} <= set(names)
+    from mtplx.server import openai as server
+
+    assert server.parse_args(["--launch-agent-client", "codex"]).launch_agent_client == "codex"

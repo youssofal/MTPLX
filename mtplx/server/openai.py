@@ -47462,35 +47462,46 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="",
         help="Hermes command to open when --launch-hermes is set.",
     )
+    # Claude Code, Codex and DeepSeek Harness arrive in MTPLX 3 (mtplx/release_gates.py): with the switch off
+    # these flags are left out of the help, and a direct --launch-agent-client answers in one line below.
+    from mtplx import release_gates
+
     parser.add_argument(
         "--launch-agent-client",
         choices=["claude-code", "codex", "deepseek-harness"],
         default=None,
-        help=(
+        help=release_gates.v3_text(
             "Open Claude Code (Terminal), Codex (the Codex app as MTPLX's own copy, "
             "else Terminal) or DeepSeek Harness (its browser app, else Terminal) on "
             "this server once it is ready."
-        ),
+        ) or argparse.SUPPRESS,
     )
     parser.add_argument(
         "--agent-client-workspace",
         default="",
-        help="Folder the client opens in (default: the server's working folder).",
+        help=release_gates.v3_text(
+            "Folder the client opens in (default: the server's working folder)."
+        ) or argparse.SUPPRESS,
     )
     parser.add_argument(
         "--agent-client-cli",
         action="store_true",
-        help=(
+        help=release_gates.v3_text(
             "Open the client's CLI in its terminal even when its app is the "
             "saved choice (Codex opens MTPLX's own copy of its app by default)."
-        ),
+        ) or argparse.SUPPRESS,
     )
     parser.add_argument(
         "--agent-client-app",
         action="store_true",
-        help="Open the client's app even when a terminal is the saved choice.",
+        help=release_gates.v3_text(
+            "Open the client's app even when a terminal is the saved choice."
+        ) or argparse.SUPPRESS,
     )
     args = parser.parse_args(raw_args)
+    if args.launch_agent_client and not release_gates.offered(args.launch_agent_client):
+        print(release_gates.arrives_in_v3(args.launch_agent_client))
+        raise SystemExit(2)
     args._raw_args = list(raw_args)
     args._cli_flags = canonicalize_flag_tokens(
         _explicit_server_flags(raw_args), parser, args
