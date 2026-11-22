@@ -38,6 +38,8 @@ PARTS = {
     "tensor_tiles": (("steel/gemm/nax.h",),
                      ("struct BaseNAXFrag", "struct NAXTile", "tile_matmad_nax", "get_coord", "matmul2d_descriptor",
                       "void mma(")),
+    # one simdgroup's 8 x 8 matrix fragments and their multiply-accumulate (the GPUs without tensor units: M1 to M4)
+    "simd_tiles": (("steel/attn/mma.h",), ("struct BaseMMAFrag", "get_coord", "simdgroup_multiply_accumulate")),
     # the tensor-unit GEMM loop over the reduction (each simdgroup's tile of a product, K in order)
     "tensor_gemm": (("steel/gemm/gemm_nax.h",), ("gemm_loop(", "struct NAXTile", "tile_matmad_nax", "dispatch_bool")),
     # the matrix-vector product

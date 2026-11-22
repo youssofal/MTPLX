@@ -1,6 +1,8 @@
 """The prompt read's fast route switch (`MTPLX_INKLING_PROMPT_FAST`; unset, the width and the MXFP8 experts are on): which parts
 it serves, and the chunk width the runtime gives a prompt read with and without it."""
 
+import pytest
+
 from mtplx.models.inkling.fast.prompt_route import PROMPT_FAST_ENV, prompt_fast
 from mtplx.models.inkling.runtime import InklingRuntime
 
@@ -126,10 +128,9 @@ def test_with_the_one_launch_attention_the_width_is_4096_and_the_fence_lifts(mon
     assert not PR.flash_attention_on() and PR.wide_rows(long_prompt) == 2048
 
 
-def test_without_the_tensor_units_a_long_prompt_keeps_the_stock_attentions_width_and_price(monkeypatch):
-    """M1 to M4 cannot run the one-launch attention, so a long prompt keeps the stock attention's width rule (its
-    bias and mask planes grow with width times context) and is priced with those planes; it does not take the
-    2,048 rows the one launch reads at any length."""
+def test_without_the_tensor_units_the_plain_form_runs_and_takes_the_wide_width(monkeypatch):
+    """M1 to M4 run the one-launch attention's plain form (8 x 8 simdgroup matrices): from its own crossover a long
+    prompt takes the 2,048 rows the one launch reads at any length, priced without the stock attention's planes."""
     from mtplx.models.inkling.fast import prompt_flash as F
     from mtplx.models.inkling.fast import prompt_route as PR
 
@@ -137,8 +138,36 @@ def test_without_the_tensor_units_a_long_prompt_keeps_the_stock_attentions_width
     monkeypatch.setattr(PR, "_headroom", {"bytes": 64 * 1024**3})
     monkeypatch.delenv("MTPLX_INKLING_PROMPT_FLASH", raising=False)
     monkeypatch.setenv("MTPLX_FORCE_GPU_FAMILY_FALLBACK", "1")       # the product's M1 to M4 rehearsal switch
+    monkeypatch.delenv(F.SIMD_ENV, raising=False)                     # the plain form: on by default there
+    import mlx.core as mx
+    from mtplx.models.inkling import attention as A
+
+    if not mx.metal.is_available() or F.simd_text()[0] is None:  # pragma: no cover
+        pytest.skip("the plain form's first-use proof needs a Metal GPU and the 8 x 8 fragment header")
+    monkeypatch.setattr(A, "_flash_checks", {})                       # nothing proven yet: the stock fence holds
+    monkeypatch.setattr(F, "_model_dtype", {"dtype": None})
+    long_prompt = max(PR.WIDE_PROMPT_TOKENS * 4, F.SHORT_PROMPT_WIDE_SIMD)
+    assert F.form() == "simd" and F.runs_here() and not PR.flash_attention_on(long_prompt)
+    assert PR.wide_rows(long_prompt) is None
+    assert F.prove_at_load() is True                                  # the runtime's load runs the real proofs
+    assert PR.flash_attention_on(long_prompt)
+    assert PR.wide_rows(long_prompt) == PR.WIDE_ROWS_FLASH
+    assert not PR.flash_attention_on(F.SHORT_PROMPT_WIDE_SIMD - 1)    # below its crossover: the stock attention
+
+
+def test_without_either_form_a_long_prompt_keeps_the_stock_attentions_width_and_price(monkeypatch):
+    """A Mac where neither form can be built (no tensor units and no 8 x 8 fragment header): the stock attention's
+    width rule (its bias and mask planes grow with width times context) and its price."""
+    from mtplx.models.inkling.fast import prompt_flash as F
+    from mtplx.models.inkling.fast import prompt_route as PR
+
+    monkeypatch.setenv(PROMPT_FAST_ENV, "chunk")
+    monkeypatch.setattr(PR, "_headroom", {"bytes": 64 * 1024**3})
+    monkeypatch.delenv("MTPLX_INKLING_PROMPT_FLASH", raising=False)
+    monkeypatch.setenv("MTPLX_FORCE_GPU_FAMILY_FALLBACK", "1")
+    monkeypatch.setattr(F, "simd_text", lambda: (None, "no header"))
     long_prompt = PR.WIDE_PROMPT_TOKENS * 4
-    assert not F.runs_here() and not PR.flash_attention_on(long_prompt)
+    assert F.form() is None and not F.runs_here() and not PR.flash_attention_on(long_prompt)
     assert PR.wide_rows(long_prompt) is None                          # 512 rows past the stock fence
     assert PR.wide_rows(PR.WIDE_PROMPT_TOKENS) == PR.WIDE_ROWS        # 2,048 inside it
     assert PR.forward_bytes(2048, long_prompt) == PR.forward_bytes(2048, long_prompt, flash=False)
@@ -147,10 +176,13 @@ def test_without_the_tensor_units_a_long_prompt_keeps_the_stock_attentions_width
 def test_the_stage_counts_as_running_only_where_it_can(monkeypatch):
     import mlx.core as mx
 
+    from mtplx.models.inkling import attention as A
     from mtplx.models.inkling.fast import prompt_flash as F
 
+    monkeypatch.setattr(A, "_flash_checks", {})
+
     for name in ("MTPLX_INKLING_PROMPT_FLASH", "MTPLX_INKLING_ATTENTION", "MTPLX_INKLING_PROMPT_ATTENTION",
-                 "MTPLX_FORCE_GPU_FAMILY_FALLBACK"):
+                 "MTPLX_FORCE_GPU_FAMILY_FALLBACK", F.SIMD_ENV):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(F, "tensor_units", lambda: True)
     monkeypatch.setattr(F, "library_text", lambda: ("text", None))
@@ -161,11 +193,105 @@ def test_the_stage_counts_as_running_only_where_it_can(monkeypatch):
         monkeypatch.setenv(name, value)
         assert not F.runs_here(), name
         monkeypatch.delenv(name)
-    monkeypatch.setattr(F, "tensor_units", lambda: False)
+    monkeypatch.setattr(F, "tensor_units", lambda: False)             # M1 to M4: the plain form where its header is
+    monkeypatch.setattr(F, "simd_text", lambda: ("text", None))
+    assert F.runs_here() == gpu                                       # on by default
+    monkeypatch.setenv(F.SIMD_ENV, "0")
+    assert not F.runs_here()                                          # the switch keeps the stock attention
+    monkeypatch.setenv(F.SIMD_ENV, "1")
+    assert F.runs_here() == gpu
+    monkeypatch.delenv(F.SIMD_ENV)
+    monkeypatch.setattr(F, "simd_text", lambda: (None, "no header"))
     assert not F.runs_here()
     monkeypatch.setattr(F, "tensor_units", lambda: True)
     monkeypatch.setattr(F, "library_text", lambda: (None, "no headers"))
     assert not F.runs_here()
+
+
+def test_a_failed_first_use_on_m1_to_m4_keeps_the_stock_fence_and_its_price(monkeypatch):
+    """F1's F-8: on a Mac without the tensor units a plain form whose first-use proof fails must not lift the stock
+    attention's 18,432-token fence. The runtime's load runs the proof for the model's type on both visits (a prompt's
+    width is chosen before its first chunk), and once a proof failed the stage counts as not running: a long prompt
+    reads 512 rows and its forward is priced with the stock attention's planes."""
+    import mlx.core as mx
+
+    from mtplx.models.inkling import attention as A
+    from mtplx.models.inkling.fast import prompt_flash as F
+    from mtplx.models.inkling.fast import prompt_route as PR
+
+    if not mx.metal.is_available():  # pragma: no cover
+        pytest.skip("the first-use proof needs a Metal GPU")
+    monkeypatch.setenv(PROMPT_FAST_ENV, "chunk")
+    monkeypatch.delenv("MTPLX_INKLING_PROMPT_FLASH", raising=False)
+    monkeypatch.setenv("MTPLX_FORCE_GPU_FAMILY_FALLBACK", "1")
+    monkeypatch.delenv(F.SIMD_ENV, raising=False)
+    if F.simd_text()[0] is None:  # pragma: no cover
+        pytest.skip("no 8 x 8 fragment header")
+    monkeypatch.setattr(A, "_flash_checks", {})
+    refused = mx.fast.metal_kernel(name="mtplx_test_f8_refused_simd", input_names=["q", "k", "v", "p", "s", "g"],
+                                   output_names=["out"], source="this is not Metal;")
+    monkeypatch.setattr(F, "_kernel_simd", lambda gated: refused)
+    monkeypatch.setattr(F, "_model_dtype", {"dtype": None})
+    assert F.runs_here()                                              # nothing known yet
+    assert F.prove_at_load() is False                                 # the load's proof fails
+    assert PR.wide_rows(64_000, headroom_bytes=16 * 1024**3) is None  # 512 rows
+    assert not F.runs_here() and not PR.flash_attention_on(64_000)
+    assert PR.forward_bytes(2048, 64_000) == PR.forward_bytes(2048, 64_000, flash=False)   # the planes priced
+    assert PR.wide_rows(PR.WIDE_PROMPT_TOKENS, headroom_bytes=16 * 1024**3) == PR.WIDE_ROWS   # inside the fence
+
+
+def test_the_width_rule_reads_the_proof_and_never_runs_it(monkeypatch):
+    """F1's F-9: the app's settings and dashboard requests ask the width rule from their own threads. On a Mac without
+    the tensor units it reads the first-use verdicts the runtime's load recorded and builds or runs nothing: with none
+    recorded the stock attention's fence holds. The load's proof then lifts it, and later asks still run nothing."""
+    import threading
+
+    import mlx.core as mx
+
+    from mtplx.models.inkling import attention as A
+    from mtplx.models.inkling.fast import prompt_flash as F
+    from mtplx.models.inkling.fast import prompt_route as PR
+
+    if not mx.metal.is_available():  # pragma: no cover
+        pytest.skip("the first-use proof needs a Metal GPU")
+    monkeypatch.setenv(PROMPT_FAST_ENV, "chunk")
+    monkeypatch.delenv("MTPLX_INKLING_PROMPT_FLASH", raising=False)
+    monkeypatch.setenv("MTPLX_FORCE_GPU_FAMILY_FALLBACK", "1")
+    monkeypatch.delenv(F.SIMD_ENV, raising=False)
+    if F.simd_text()[0] is None:  # pragma: no cover
+        pytest.skip("no 8 x 8 fragment header")
+    monkeypatch.setattr(A, "_flash_checks", {})
+    monkeypatch.setattr(F, "_model_dtype", {"dtype": None})
+    builds, proofs = [], []
+    kernel, proof = F._kernel_simd, A._flash_first_use
+    monkeypatch.setattr(F, "_kernel_simd", lambda gated=False: builds.append(gated) or kernel(gated))
+    monkeypatch.setattr(A, "_flash_first_use", lambda dtype, window: proofs.append(window) or proof(dtype, window))
+    asked = {}
+
+    def request():                                                    # a settings request's thread
+        asked.update(width=PR.wide_rows(64_000, headroom_bytes=16 * 1024**3), on=PR.flash_attention_on(64_000))
+
+    worker = threading.Thread(target=request)
+    worker.start()
+    worker.join()
+    assert asked == {"width": None, "on": False} and builds == [] and proofs == []
+    assert F.prove_at_load() is True and sorted(proofs) == [False, True]   # the load: both visits
+    assert PR.wide_rows(64_000, headroom_bytes=16 * 1024**3) == PR.WIDE_ROWS_FLASH and len(proofs) == 2
+
+
+def test_on_an_m5_the_load_proves_nothing_and_the_width_does_not_wait_for_it(monkeypatch):
+    from mtplx.models.inkling import attention as A
+    from mtplx.models.inkling.fast import prompt_flash as F
+    from mtplx.models.inkling.fast import prompt_route as PR
+
+    for name in ("MTPLX_INKLING_PROMPT_FLASH", "MTPLX_FORCE_GPU_FAMILY_FALLBACK", F.SIMD_ENV):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(F, "tensor_units", lambda: True)
+    monkeypatch.setattr(A, "_flash_checks", {})
+    proofs = []
+    monkeypatch.setattr(A, "_flash_first_use", lambda *args: proofs.append(args))
+    assert F.prove_at_load() is None
+    assert PR.flash_attention_on() == F.runs_here() and proofs == []
 
 
 def test_unset_the_experts_part_serves_every_mac_and_the_switch_still_turns_it_off(monkeypatch):

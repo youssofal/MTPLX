@@ -19,8 +19,8 @@ if not mx.metal.is_available():  # pragma: no cover - CPU-only machines
 from mtplx.models.inkling import attention as A  # noqa: E402
 from mtplx.models.inkling.fast import prompt_flash as F  # noqa: E402
 
-if not F.tensor_units():  # pragma: no cover - Macs without tensor units
-    pytest.skip("the launch is written for the tensor units", allow_module_level=True)
+if F.form() is None:  # pragma: no cover - an MLX without the headers either form needs
+    pytest.skip("the launch needs the installed MLX's fragment headers", allow_module_level=True)
 
 # Relative RMS against the float32 definition: the query type's own rounding of a result is
 # 1.7e-3 (bf16) and 2.4e-4 (fp16) relative RMS on these distributions (lanes/p2/fcheck-3).
@@ -34,8 +34,8 @@ def _clipped(shape, limit, key, dtype):
 
 
 def _no_crossover(monkeypatch):
-    monkeypatch.setattr(F, "SHORT_PROMPT", 0)
-    monkeypatch.setattr(F, "SHORT_PROMPT_WIDE", 0)
+    for name in ("SHORT_PROMPT", "SHORT_PROMPT_WIDE", "SHORT_PROMPT_SIMD", "SHORT_PROMPT_WIDE_SIMD"):
+        monkeypatch.setattr(F, name, 0)
 
 
 def _call(rows, keys, seed, dtype=mx.bfloat16):
@@ -73,6 +73,97 @@ def test_matches_the_definition(rows, keys, window, dtype):
     assert _rel_rms(got, ref) <= BOUND[dtype]
 
 
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("rows,keys,window", [
+    (64, 64, 0), (64, 64, 1024), (64, 600, 1024), (200, 2248, 0), (200, 2248, 1024),
+    (37, 1100, 0), (46, 1069, 1024), (512, 1535, 1024), (1, 1, 0), (17, 17, 1024),
+])
+def test_the_plain_form_for_m1_to_m4_matches_the_definition(rows, keys, window, dtype, monkeypatch):
+    """The 8 x 8 simdgroup-matrix form a GPU without tensor units runs (the product's own M1 to M4 rehearsal switch
+    selects it here): the same calls, the same bounds."""
+    monkeypatch.setenv("MTPLX_FORCE_GPU_FAMILY_FALLBACK", "1")
+    monkeypatch.setenv(F.SIMD_ENV, "1")
+    if F.form() != "simd":  # pragma: no cover - an MLX without the 8 x 8 fragment header
+        pytest.skip("no 8 x 8 fragment header")
+    ops = _call(rows, keys, rows * 11 + keys + window + 3, dtype)
+    assert F.decline(*ops, window) is None
+    got = F.flash_attention(*ops, window)
+    ref = F.reference(*ops, window)
+    assert got.shape == (1, 24, rows, 128) and got.dtype == dtype
+    assert bool(mx.all(mx.isfinite(got)).item())
+    assert _rel_rms(got, ref) <= BOUND[dtype]
+
+
+def test_the_plain_form_gates_like_the_tensor_form(monkeypatch):
+    monkeypatch.setenv("MTPLX_FORCE_GPU_FAMILY_FALLBACK", "1")
+    monkeypatch.setenv(F.SIMD_ENV, "1")
+    if F.form() != "simd":  # pragma: no cover
+        pytest.skip("no 8 x 8 fragment header")
+    ops = _call(200, 2248, 9)
+    gate = (mx.random.normal((1, 200, 24 * 128), key=mx.random.key(3)) * 2.0).astype(mx.bfloat16)
+    plain = F.flash_attention(*ops, 0)
+    gated = F.flash_attention(*ops, 0, gate=gate)
+    want = (plain.transpose(0, 2, 1, 3).reshape(1, 200, -1).astype(mx.float32)
+            * mx.sigmoid(gate.astype(mx.float32))).astype(mx.bfloat16)
+    assert gated.shape == (1, 200, 3072)
+    assert _rel_rms(gated, want.astype(mx.float32)) <= 1e-3
+
+
+def test_a_plain_form_the_compiler_refuses_leaves_the_stock_attention_serving(monkeypatch):
+    # As F1's F-1 asks of the projections: on a Mac whose compiler refuses the plain form, its first use fails inside
+    # the stage's check, and the stage keeps the stock attention for the process (counted
+    # prompt_stage.<visit>.stock.first_use_error), with no build attempted again.
+    from mtplx.models.inkling import attention as A
+
+    monkeypatch.setenv("MTPLX_FORCE_GPU_FAMILY_FALLBACK", "1")
+    monkeypatch.setenv(F.SIMD_ENV, "1")
+    if F.form() != "simd":  # pragma: no cover
+        pytest.skip("no 8 x 8 fragment header")
+    broken = mx.fast.metal_kernel(name="mtplx_test_refused_flash_simd", input_names=["q", "k", "v", "p", "s", "g"],
+                                  output_names=["out"], source="this is not Metal;")
+    built = []
+    monkeypatch.setattr(F, "_kernel_simd", lambda gated: built.append(gated) or broken)
+    monkeypatch.setattr(A, "_flash_checks", {})
+    for window in (True, False):
+        assert A._flash_first_use(mx.bfloat16, window) == "first_use_error"
+    tries = len(built)
+    assert A._flash_first_use(mx.bfloat16, True) == "first_use_error" and len(built) == tries
+
+
+def test_an_m5s_selection_and_bits_do_not_move_with_the_plain_forms_default(monkeypatch):
+    # The plain form's default reaches only GPUs without the tensor units: on an M5 the form, the counter word, the
+    # crossovers and the launch's output bits are the same whatever the plain form's switch says.
+    if not F.tensor_units():  # pragma: no cover - runs on the tensor units only
+        pytest.skip("an M5 check")
+    monkeypatch.delenv("MTPLX_FORCE_GPU_FAMILY_FALLBACK", raising=False)
+    ops = _call(200, 2248, 17)
+    outs = []
+    for value in (None, "0", "1"):
+        if value is None:
+            monkeypatch.delenv(F.SIMD_ENV, raising=False)
+        else:
+            monkeypatch.setenv(F.SIMD_ENV, value)
+        assert F.form() == "tensor" and F.selected() == "selected" and F.runs_here()
+        assert (F.SHORT_PROMPT, F.SHORT_PROMPT_WIDE) == (8192, 4096)
+        outs.append(F.flash_attention(*ops, 1024))
+    mx.eval(outs)
+    assert all(_same_bits(outs[0], o) for o in outs[1:])
+
+
+def test_without_the_tensor_units_the_plain_form_is_on_by_default_and_counted(monkeypatch):
+    # M1 to M4 (here: the product's own rehearsal switch): the plain form is chosen from the GPU family unless switched
+    # off, its calls are counted simd.selected, and the switch keeps the stock attention, counted plain_form_off.
+    monkeypatch.setenv("MTPLX_FORCE_GPU_FAMILY_FALLBACK", "1")
+    monkeypatch.delenv(F.SIMD_ENV, raising=False)
+    if F.simd_text()[0] is None:  # pragma: no cover - an MLX without the 8 x 8 fragment header
+        pytest.skip("no 8 x 8 fragment header")
+    assert F.form() == "simd" and F.selected() == "simd.selected" and F.runs_here()
+    ops = _call(64, 600, 23)
+    assert F.decline(*ops, 1024) is None
+    monkeypatch.setenv(F.SIMD_ENV, "0")
+    assert F.form() is None and not F.runs_here() and F.decline(*ops, 1024) == "plain_form_off"
+
+
 def test_every_switch_gives_the_same_numbers_within_rounding():
     ops = _call(200, 2248, 5)
     ref = F.reference(*ops, 0)
@@ -104,9 +195,12 @@ def test_the_products_come_from_the_installed_library():
 
 
 def test_declines_without_the_library_headers(monkeypatch):
+    # Whichever form this Mac runs (X1, 01:03: on an M4 the plain form reads the 8 x 8 header, not the tensor one).
     q, k, v, prof, sink = _call(64, 600, 3)
     monkeypatch.setattr(F, "library_text", lambda: (None, "missing:steel/gemm/nax.h"))
-    assert F.decline(q, k, v, prof, sink, 0) == "library_headers"
+    monkeypatch.setattr(F, "simd_text", lambda: (None, "missing:steel/attn/mma.h"))
+    assert F.decline(q, k, v, prof, sink, 0) in ("library_headers", "no_tensor_units")
+    assert F.form() is None
 
 
 def test_rows_that_are_not_packed_are_read_element_by_element():
@@ -144,8 +238,9 @@ def test_route_is_on_by_default_off_where_set_off_and_counted(monkeypatch):
     on = A.attend(*ops, 0)
     on_window = A.attend(*ops, 1024)
     after = A.attention_route_counts()
-    assert after.get("prompt_flash.full.selected", 0) == before.get("prompt_flash.full.selected", 0) + 1
-    assert after.get("prompt_flash.window.selected", 0) == before.get("prompt_flash.window.selected", 0) + 1
+    sel = F.selected()
+    assert after.get(f"prompt_flash.full.{sel}", 0) == before.get(f"prompt_flash.full.{sel}", 0) + 1
+    assert after.get(f"prompt_flash.window.{sel}", 0) == before.get(f"prompt_flash.window.{sel}", 0) + 1
     ref = F.reference(*ops, 0)
     assert _rel_rms(on, ref) <= BOUND[mx.bfloat16]
     assert _rel_rms(today, ref) <= BOUND[mx.bfloat16]
@@ -257,7 +352,8 @@ def test_the_stage_writes_the_layers_cache_rows_and_its_attention(monkeypatch, s
     got = M.Layer.attention(layer, *xs, kv1, conv1, None)
     after = A.attention_route_counts()
     visit = "window" if sliding else "full"
-    assert after.get(f"prompt_stage.{visit}.selected", 0) == before.get(f"prompt_stage.{visit}.selected", 0) + 1
+    sel = F.selected()
+    assert after.get(f"prompt_stage.{visit}.{sel}", 0) == before.get(f"prompt_stage.{visit}.{sel}", 0) + 1
     mx.eval(want, got, kv0.state, kv1.state)
     for a, b in zip(kv1.state, kv0.state):           # the cache rows: the layer's own bits
         assert bool(mx.array_equal(a.view(mx.uint16), b.view(mx.uint16)).item())
@@ -307,14 +403,18 @@ def _route(monkeypatch, layer, hist, rows=96, prompt=None, seed=50):
 
 
 def _limit():
-    return F.SHORT_PROMPT_WIDE if F._read_width() >= F.WIDE_READ_ROWS else F.SHORT_PROMPT
+    wide = F._read_width() >= F.WIDE_READ_ROWS
+    if F.form() == "simd":
+        return F.SHORT_PROMPT_WIDE_SIMD if wide else F.SHORT_PROMPT_SIMD
+    return F.SHORT_PROMPT_WIDE if wide else F.SHORT_PROMPT
 
 
 def test_the_crossover_follows_the_reads_width(monkeypatch):
     from mtplx.generation import prefill_chunk_size_override
 
-    monkeypatch.setattr(F, "SHORT_PROMPT", 6000)
-    monkeypatch.setattr(F, "SHORT_PROMPT_WIDE", 2000)
+    for narrow, wide in (("SHORT_PROMPT", "SHORT_PROMPT_WIDE"), ("SHORT_PROMPT_SIMD", "SHORT_PROMPT_WIDE_SIMD")):
+        monkeypatch.setattr(F, narrow, 6000)                         # both forms' knobs (X1, 01:03: an M4 reads the
+        monkeypatch.setattr(F, wide, 2000)                           # plain form's)
     monkeypatch.setenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", "4000")
     with prefill_chunk_size_override(512):
         assert F.short_prompt(512)
@@ -335,7 +435,7 @@ def test_a_prompt_shorter_than_the_crossover_reads_on_the_default_route(monkeypa
     assert moved == [f"prompt_stage.{visit}.stock.short_prompt", f"prompt_flash.{visit}.stock.short_prompt"]
     assert _same_bits(got, want)
     moved, got, want = _route(monkeypatch, layer, 0, prompt=_limit())
-    assert moved == f"prompt_stage.{visit}.selected"
+    assert moved == f"prompt_stage.{visit}.{F.selected()}"
     assert _rel_rms(got, want.astype(mx.float32)) <= 4 * BOUND[mx.bfloat16]
 
 
@@ -343,8 +443,8 @@ def test_the_prompt_is_never_shorter_than_the_keys_a_chunk_sees(monkeypatch):
     # no prompt length set, or a stale one: the history and the chunk are the length so far
     layer = _layer(False, mx.bfloat16, 67)
     hist = _limit()
-    assert _route(monkeypatch, layer, hist, prompt=None)[0] == "prompt_stage.full.selected"
-    assert _route(monkeypatch, layer, hist, prompt=100)[0] == "prompt_stage.full.selected"
+    assert _route(monkeypatch, layer, hist, prompt=None)[0] == f"prompt_stage.full.{F.selected()}"
+    assert _route(monkeypatch, layer, hist, prompt=100)[0] == f"prompt_stage.full.{F.selected()}"
     assert _route(monkeypatch, layer, 0, prompt=None)[0][0] == "prompt_stage.full.stock.short_prompt"
 
 
@@ -368,13 +468,13 @@ def test_no_room_for_the_stage_reads_on_the_default_route(monkeypatch):
         assert moved == [f"prompt_stage.{visit}.stock.memory", f"prompt_flash.{visit}.stock.memory"]
         assert _same_bits(got, want)
     room(F.EXTRA_PEAK_BYTES + bank // 2)                             # the chunk, not the whole bank
-    assert _route(monkeypatch, window, 0, prompt=prompt)[0] == "prompt_stage.window.selected"
+    assert _route(monkeypatch, window, 0, prompt=prompt)[0] == f"prompt_stage.window.{F.selected()}"
     moved, got, want = _route(monkeypatch, full, 0, prompt=prompt)
     # the stage declines (the bank); attend's one-launch route, which grows no bank, takes the call
-    assert moved == ["prompt_stage.full.stock.memory", "prompt_flash.full.selected"]
+    assert moved == ["prompt_stage.full.stock.memory", f"prompt_flash.full.{F.selected()}"]
     assert _rel_rms(got, want.astype(mx.float32)) <= 4 * BOUND[mx.bfloat16]
     room(F.EXTRA_PEAK_BYTES + 2 * bank)
-    assert _route(monkeypatch, full, 0, prompt=prompt)[0] == "prompt_stage.full.selected"
+    assert _route(monkeypatch, full, 0, prompt=prompt)[0] == f"prompt_stage.full.{F.selected()}"
 
 
 def test_the_bank_bytes_are_what_the_bank_takes(monkeypatch):

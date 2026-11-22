@@ -315,7 +315,7 @@ def _flash_first_use(dtype, window):
     itself puts on a result (bf16 1.7e-3, fp16 2.4e-4 relative RMS measured, lanes/p2/fcheck-3)."""
     from .fast import prompt_flash as F
 
-    spec = (str(dtype), bool(window))
+    spec = (str(dtype), bool(window), F.form())      # the form this Mac runs (tensor units or 8 x 8 matrices)
     with _lock:
         if spec in _flash_checks:
             return _flash_checks[spec]
@@ -368,7 +368,7 @@ def _flash_route(operands, window):
         reason = F.select_call(operands[1].shape[2])
     if reason is None:
         reason = _flash_first_use(operands[0].dtype, window)
-    _note_route(f"prompt_flash.{scope}." + ("selected" if reason is None else "stock." + reason))
+    _note_route(f"prompt_flash.{scope}." + (F.selected() if reason is None else "stock." + reason))
     return None if reason is not None else F.flash_attention(*operands, window)
 
 

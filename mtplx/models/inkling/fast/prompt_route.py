@@ -114,6 +114,8 @@ def flash_attention_on(prompt_tokens=None):
 
     if not prompt_flash.runs_here():
         return False
+    if not prompt_flash.tensor_units() and not prompt_flash.proven():
+        return False                       # M1 to M4: proven at load (read here, never run) before the fence lifts
     return prompt_tokens is None or not prompt_flash.short_prompt(int(prompt_tokens), width=WIDE_ROWS_FLASH)
 
 

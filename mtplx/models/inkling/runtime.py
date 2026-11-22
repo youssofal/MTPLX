@@ -11,6 +11,7 @@ from mtplx.runtime import MTPLXRuntime, _load_tokenizer_resilient
 from . import expert_fusion
 from .draft import Drafter
 from .fast import engine_site
+from .fast import prompt_flash
 from .fast import round as fast_round
 from .fast import round_program
 from .fast import draft as fast_draft
@@ -75,6 +76,9 @@ class InklingRuntime(MTPLXRuntime):
 
     def __init__(self, path: Path, *, mtp: bool, contract=None):
         model, vision, config = load_target(path)
+        prompt_flash.set_model_dtype(model.embed_tokens.weight.dtype)   # the type the width rule's proof checks
+        # M1 to M4: the plain form's first-use proofs, here before ready; the width rule only reads their verdicts.
+        self.prompt_flash_proof = prompt_flash.prove_at_load()
         # One proof cache for this pack: the vocabulary panel, the sorted expert read and
         # expert fusion all record through the cache the model's resolver owns.
         self.kernel_proofs = model.proof_pack(str(mx.default_device()))[0]
