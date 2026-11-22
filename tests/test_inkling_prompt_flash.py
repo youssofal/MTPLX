@@ -480,38 +480,40 @@ def test_no_room_for_the_stage_reads_on_the_default_route(monkeypatch):
 def test_the_room_line_is_the_engines_limit_where_the_server_set_it_above_the_working_set(monkeypatch):
     """A 24 GB Mac: macOS recommends 16 GiB to the GPU, the server holds the engine to 18 GiB. 2.13.1 read
     against the working set and declined the one-launch attention on nearly every call past a read's first
-    chunk (a simulated 24 GB Mac, `x1-fix-24gb-causes`); the line is the engine's limit there. MLX's own
-    default limit (1.5 working sets, more than this share of RAM) is no limit a server set."""
+    chunk (a simulated 24 GB Mac, `x1-fix-24gb-causes`); the line is the engine's limit there, as the server
+    stamps it after the load. Where the working set is the larger (this 128 GB Mac: 120 GiB against a 90 GiB
+    limit) it stays the line, and with no limit stamped (a harness, a test) the line is the working set."""
     from mtplx.models.inkling import head as H
+    from mtplx.models.inkling.runtime import InklingRuntime
 
     gib = 1024**3
+    monkeypatch.setattr(H, "_engine_limit", {"bytes": None})
     monkeypatch.setattr(H, "_working_set", lambda device: 16 * gib)
-    monkeypatch.setattr(H, "_memory_size", lambda device: 24 * gib)
-    monkeypatch.setattr(H.mx, "get_memory_limit", lambda: 18 * gib)
-    assert H.room_line() == 18 * gib
-    monkeypatch.setattr(H.mx, "get_memory_limit", lambda: 24 * gib)
     assert H.room_line() == 16 * gib
-    monkeypatch.setattr(H, "_working_set", lambda device: 96 * gib)
-    monkeypatch.setattr(H, "_memory_size", lambda device: 128 * gib)
-    monkeypatch.setattr(H.mx, "get_memory_limit", lambda: 90 * gib)
-    assert H.room_line() == 96 * gib
+    InklingRuntime.note_metal_memory_limit(object(), 18 * gib)
+    assert H.room_line() == 18 * gib
+    monkeypatch.setattr(H, "_working_set", lambda device: 120 * gib)
+    H.set_engine_limit(90 * gib)
+    assert H.room_line() == 120 * gib
+    H.set_engine_limit(0)
+    assert H.room_line() == 120 * gib
 
 
 def test_a_24gb_mac_reads_on_the_stage_up_to_its_engine_limit(monkeypatch):
     """The chunk the working set refused: MLX holds the working set less 0.3 GiB, the engine's limit is 2 GiB
-    above the working set. The stage reads it; with the limit at the working set it reads on the default
+    above the working set. The stage reads it; with no limit above the working set it reads on the default
     route, counted ``memory``, as in 2.13.1."""
     from mtplx.models.inkling import head as H
 
     _no_crossover(monkeypatch)
     gib = 1024**3
     window = _layer(True, mx.bfloat16, 71)
+    monkeypatch.setattr(H, "_engine_limit", {"bytes": None})
 
     def mac(limit_above):
         ws = mx.get_active_memory() + int(0.3 * gib)
         monkeypatch.setattr(H, "_working_set", lambda device: ws)
-        monkeypatch.setattr(H, "_memory_size", lambda device: 10 * ws)
-        monkeypatch.setattr(H.mx, "get_memory_limit", lambda: ws + limit_above)
+        H.set_engine_limit(ws + limit_above if limit_above else 0)
 
     mac(2 * gib)
     assert _route(monkeypatch, window, 0, prompt=32 * 1024)[0] == f"prompt_stage.window.{F.selected()}"

@@ -3868,6 +3868,11 @@ class ServerState:
         pinned_limit = self.metal_memory_caps.get("memory_limit_bytes")
         if isinstance(pinned_limit, int) and pinned_limit > 0:
             self.runtime.metal_memory_limit_bytes = int(pinned_limit)
+            # A family whose routes weigh their own extra memory reads the
+            # same line (Inkling: head.room_line).
+            note_limit = getattr(self.runtime, "note_metal_memory_limit", None)
+            if callable(note_limit):
+                note_limit(int(pinned_limit))
         self.backend_descriptor = descriptor_from_runtime(self.runtime, args)
         args.backend_id = self.backend_descriptor.backend_id
         if self.backend_descriptor.uses_draft_lm_head:

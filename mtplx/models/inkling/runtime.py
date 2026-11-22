@@ -150,6 +150,14 @@ class InklingRuntime(MTPLXRuntime):
     #: through requests from 4K to 20K. Priced with the load's arrays until the load builds them itself.
     WARMUP_ARRAYS_BYTES = 160 << 20
 
+    def note_metal_memory_limit(self, limit):
+        """The server's Metal memory limit, stamped after the load: the room line of the routes that weigh
+        their extra memory (``head.room_line``), so a 24 to 36 GB Mac's reads use the limit the engine is held
+        to rather than the GPU's recommended working set below it."""
+        from .head import set_engine_limit
+
+        set_engine_limit(limit)
+
     def measure_load_extra_bytes(self):
         """MLX's active memory now, less the target's and the drafter's weights and the engine's
         pool: the arrays the load built beside them. The memory plan prices them with the pool

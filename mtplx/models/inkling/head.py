@@ -30,14 +30,14 @@ def _working_set(device):
     return int(info.get("max_recommended_working_set_size") or 0.7 * int(memory))
 
 
-@lru_cache(maxsize=8)
-def _memory_size(device):
-    info = mx.device_info(mx.default_device())
-    return int(info.get("memory_size") or info.get("total_memory") or 0)
+#: The memory limit the server applied to MLX in this process (``set_engine_limit``; MLX 0.32 has no getter).
+_engine_limit = {"bytes": None}
 
 
-#: An engine limit above this share of RAM is not one the server set (MLX's own default is 1.5 working sets).
-_SET_LIMIT_SHARE = 0.8
+def set_engine_limit(limit):
+    """Record the memory limit the server holds the engine to (its Metal limit, the line of the admission and
+    of the per-chunk check). Called once the model is loaded (``InklingRuntime.note_metal_memory_limit``)."""
+    _engine_limit["bytes"] = int(limit) if limit and int(limit) > 0 else None
 
 
 def room_line():
@@ -49,16 +49,9 @@ def room_line():
     8K read on a simulated 24 GB Mac served 36 of 144 calls on it, 16K and 24K 16 and 14 of 48 in the first
     chunk and none after; this Mac as itself, every call). The plan's own reads go above the working set by
     design (the 2.13.1 24 GB read peaks at 16.8 GiB), so the line is the limit the engine is held to."""
-    device = str(mx.default_device())
-    line = _working_set(device)
-    try:
-        limit = int(mx.get_memory_limit())
-    except Exception:  # noqa: BLE001 - an MLX without the call keeps the working set
-        return line
-    memory = _memory_size(device)
-    if memory and limit <= _SET_LIMIT_SHARE * memory:
-        return max(line, limit)
-    return line
+    line = _working_set(str(mx.default_device()))
+    limit = _engine_limit["bytes"]
+    return max(line, limit) if limit else line
 
 
 def fits_route(extra):
