@@ -415,9 +415,9 @@ def _limit():
 def test_512_row_tensor_crossover_follows_width_on_every_mac(monkeypatch, ram_gib):
     monkeypatch.setattr(F, "form", lambda: "tensor")
     monkeypatch.setattr(mx, "device_info", lambda *args: {"memory_size": ram_gib * 1024**3})
-    for length in (1024, 2047, 2048, 4096, 6144):
+    for length in (1024, 2048, 4095, 4096, 6144):
         monkeypatch.setenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", str(length))
-        assert F.short_prompt(512, width=512) == (length < 2048)
+        assert F.short_prompt(512, width=512) == (length < 4096)
 
     monkeypatch.setenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", "2048")
     assert F.short_prompt(512, width=1024)

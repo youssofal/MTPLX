@@ -937,9 +937,10 @@ def window_update(kv, keys, values):
 #: the stage read second; lanes/p2/posacc-bare-2.json, posacc-bare-1.json), every prompt position inside stock's
 #: own re-cut spread against the exact reference. Narrow: 8,192, except for the 512-row tensor read below.
 SHORT_PROMPT = 8192
-#: At 512 rows the tensor stage tied stock at 1K and won at 2K, 4K and 6K in both orders, with lower footprint.
-#: Simulated 24 GB, Heavy thermal pressure: inkling-fast-20261121/summary/a3/short-{forward,reverse}.md.
-SHORT_PROMPT_512 = 2048
+#: At 512 rows, 4K and 6K reached the first token sooner with a lower peak in both Nominal orders.
+#: At 2K one order took longer and peaked higher. See the inkling-fast-20261121 A3 receipts
+#: bytes-a3-g24-width-20261122T182702Z.json and bytes-a3-g24-width-paired-20261122T183216Z.json.
+SHORT_PROMPT_512 = 4096
 SHORT_PROMPT_WIDE = 4096
 #: The plain form on a GPU without tensor units (M1 to M4). Wide: from 4,096 tokens, as on M5, measured on that path
 #: (the M1 to M4 rehearsal switch, Optimized Quality, official weights, Nominal; P1's `lanes/p1/m4-table.md`, jobs
