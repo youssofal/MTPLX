@@ -91,9 +91,8 @@ MTP_LAYER_NORM_REPAIR_SUFFIXES = (
     "post_attention_layernorm.weight",
 )
 MTP_LAYER_NORM_ABSOLUTE_MEAN_MIN = 1.0
-#: The repair's switch, off by default until its class (B: the drafts change,
-#: the output's distribution does not) is accepted: the head loads as stored,
-#: as in 2.12.3. MTPLX_DRAFT_HEAD_NORM_REPAIR=1 turns the repair on.
+#: The repair's switch (on by default): MTPLX_DRAFT_HEAD_NORM_REPAIR=0 loads
+#: every gain as stored, to compare.
 MTP_NORM_REPAIR_ENV = "MTPLX_DRAFT_HEAD_NORM_REPAIR"
 #: What the last sidecar load repaired: [{"tensor", "mean_before",
 #: "mean_after", "min_before"}]; the runtime stamps it on the model and the
@@ -857,7 +856,7 @@ def mtp_sidecar_norms_are_delta(weights: dict[str, Any]) -> bool:
 
 
 def draft_head_norm_repair_enabled() -> bool:
-    return os.environ.get(MTP_NORM_REPAIR_ENV, "0").strip().lower() not in {"0", "false", "no", "off"}
+    return os.environ.get(MTP_NORM_REPAIR_ENV, "1").strip().lower() not in {"0", "false", "no", "off"}
 
 
 def unshifted_mtp_norms(weights: dict[str, Any]) -> list[str]:
@@ -880,7 +879,7 @@ def unshifted_mtp_norms(weights: dict[str, Any]) -> list[str]:
 
 def _repair_unshifted_mtp_norms(weights: dict[str, Any]) -> dict[str, Any]:
     """An absolute sidecar with each gain that missed its +1 given it, recorded
-    in LAST_MTP_NORM_REPAIRS and logged. Only under MTPLX_DRAFT_HEAD_NORM_REPAIR=1."""
+    in LAST_MTP_NORM_REPAIRS and logged. Off under MTPLX_DRAFT_HEAD_NORM_REPAIR=0."""
 
     keys = unshifted_mtp_norms(weights) if draft_head_norm_repair_enabled() else []
     if not keys:
