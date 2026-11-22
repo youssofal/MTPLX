@@ -9,7 +9,7 @@ from typing import Callable, NamedTuple
 import mlx.core as mx
 import numpy as np
 
-from .runtime_options import qwen4_opdiet_enabled
+from .runtime_options import env_bool, qwen4_opdiet_enabled
 from .sampling import (
     PENALTY_MAX,
     PENALTY_MIN,
@@ -870,10 +870,11 @@ def sample_token_ids_from_mlx_logits(
     ids, not p/q residual distributions. It keeps the small-support sampling on
     MLX and returns one token id per input row.
 
-    ``key`` is the draw's MLX random key. A decode loop passes one made from
-    its request's seeded generator (``device_sample_key``): without it the
-    draw comes from MLX's process-wide generator, which MLX seeds from the
-    clock, so two processes never draw the same tokens for the same seed.
+    ``key`` is the draw's MLX random key. A decode loop passes what
+    ``device_sample_key`` gives: with ``MTPLX_SEEDED_DEVICE_DRAW`` on, a key
+    from its request's seeded generator; otherwise None, and the draw comes
+    from MLX's process-wide generator, which MLX seeds from the clock, so two
+    processes never draw the same tokens for the same seed (2.12.3's draw).
     """
 
     if config.temperature <= 0:
@@ -914,11 +915,25 @@ def sample_token_ids_from_mlx_logits(
     return mx.take_along_axis(top_idx, sampled_offsets[..., None], axis=-1)[..., 0]
 
 
+#: The request's seed on the target-prefix lane's device draws (the default lane
+#: of Qwen 3.6 35B-A3B Optimized Speed and its FP16 sibling, and any
+#: ``--verify-strategy target_prefix``). Off by default: those draws follow MLX's
+#: process-wide generator, as in 2.12.3. On, their keys come from the request's
+#: seeded generator, so one seed gives one answer in any process. Class B: the
+#: same distribution, other tokens for a given seed than 2.12.3 drew.
+SEEDED_DEVICE_DRAW_ENV = "MTPLX_SEEDED_DEVICE_DRAW"
+
+
 def device_sample_key(rng: np.random.Generator, config: SamplerConfig) -> mx.array | None:
-    """The MLX key for one on-device draw, taken from a request's seeded host
-    generator, so a request's seed fixes its device-sampled tokens in any
-    process; None for a greedy sampler, which draws nothing."""
+    """The MLX key for one on-device draw. With ``MTPLX_SEEDED_DEVICE_DRAW`` on,
+    one taken from a request's seeded host generator, so a request's seed fixes
+    its device-sampled tokens in any process. Otherwise None, and nothing is
+    taken from ``rng``: the draw follows MLX's process-wide generator and the
+    host generator's stream is 2.12.3's. None for a greedy sampler, which draws
+    nothing."""
 
     if config.temperature <= 0:
+        return None
+    if not env_bool(SEEDED_DEVICE_DRAW_ENV, default=False):
         return None
     return mx.random.key(int(rng.integers(0, 2**31 - 1)))

@@ -13,6 +13,11 @@ the request's seeded generator, as the other lanes' host draws do.
 Class B: each draw is still one categorical draw from the same top-k/top-p
 support, so the answer's distribution is unchanged; which tokens a seed gives
 changed. Greedy draws nothing and is unchanged.
+
+The seeded draw is behind ``MTPLX_SEEDED_DEVICE_DRAW`` (off by default) until
+its class is accepted: off, both device draws (the A3B route's draft and the
+target rows) take no key and nothing from the host generator, which is 2.12.3's
+draw. Both are pinned here.
 """
 
 from __future__ import annotations
@@ -23,7 +28,11 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from mtplx.fast_sampling import device_sample_key, sample_token_ids_from_mlx_logits
+from mtplx.fast_sampling import (
+    SEEDED_DEVICE_DRAW_ENV,
+    device_sample_key,
+    sample_token_ids_from_mlx_logits,
+)
 from mtplx.sampling import SamplerConfig
 
 FAMILY = SamplerConfig(temperature=0.6, top_p=0.95, top_k=20)
@@ -43,7 +52,35 @@ def _ids(array: mx.array) -> list[int]:
     return [int(token) for token in np.asarray(array).reshape(-1)]
 
 
-def test_the_key_comes_from_the_seeded_generator():
+@pytest.fixture
+def seeded(monkeypatch):
+    monkeypatch.setenv(SEEDED_DEVICE_DRAW_ENV, "1")
+
+
+@pytest.fixture
+def unseeded(monkeypatch):
+    monkeypatch.delenv(SEEDED_DEVICE_DRAW_ENV, raising=False)
+
+
+def test_by_default_a_draw_takes_no_key_and_nothing_from_the_generator(unseeded):
+    # 2.12.3's draw: MLX's process-wide generator, and the host generator's
+    # stream exactly as if the device draw had not happened.
+    rng = np.random.default_rng(17)
+    assert device_sample_key(rng, FAMILY) is None
+    assert device_sample_key(rng, NO_TOP_K) is None
+    assert rng.integers(0, 2**31 - 1) == np.random.default_rng(17).integers(0, 2**31 - 1)
+
+
+def test_the_switch_reads_only_a_boolean(monkeypatch):
+    rng = np.random.default_rng(17)
+    monkeypatch.setenv(SEEDED_DEVICE_DRAW_ENV, "0")
+    assert device_sample_key(rng, FAMILY) is None
+    monkeypatch.setenv(SEEDED_DEVICE_DRAW_ENV, "maybe")
+    with pytest.raises(ValueError):
+        device_sample_key(rng, FAMILY)
+
+
+def test_the_key_comes_from_the_seeded_generator(seeded):
     first = device_sample_key(np.random.default_rng(17), FAMILY)
     again = device_sample_key(np.random.default_rng(17), FAMILY)
     other = device_sample_key(np.random.default_rng(18), FAMILY)
@@ -129,7 +166,22 @@ def _answer(rt, *, seed: int, sampler=FAMILY, depth: int = 1):
 
 @gpu
 @pytest.mark.parametrize("depth", [1, 2])
-def test_one_seed_gives_one_answer_on_the_target_prefix_lane(runtime, depth):
+def test_by_default_the_target_prefix_lane_draws_from_mlx_generator(runtime, depth, unseeded):
+    # 2.12.3's behaviour: MLX's process-wide generator decides the draws, so
+    # reseeding it to one value repeats the answer and another value moves it.
+    mx.random.seed(1)
+    first = _answer(runtime, seed=17, depth=depth)
+    mx.random.seed(1)
+    again = _answer(runtime, seed=17, depth=depth)
+    assert len(first.tokens) == 48
+    assert again.tokens == first.tokens
+    mx.random.seed(2)
+    assert _answer(runtime, seed=17, depth=depth).tokens != first.tokens
+
+
+@gpu
+@pytest.mark.parametrize("depth", [1, 2])
+def test_one_seed_gives_one_answer_on_the_target_prefix_lane(runtime, depth, seeded):
     first = _answer(runtime, seed=17, depth=depth)
     # Whatever the process generator did in between (another request, a
     # kernel self-check reseeding it), the seed alone decides the answer.
