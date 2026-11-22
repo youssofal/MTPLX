@@ -5,6 +5,7 @@ import math
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from mlx.utils import tree_flatten
 from PIL import Image
 
 from .model import linear
@@ -130,8 +131,15 @@ class VisionTower(nn.Module):
         )
         if weights:
             raise ValueError(f"Unknown Inkling vision tensors: {sorted(weights)}")
+        #: True once an image ran: the pack's mapped tensors are then read into memory (0.59 GiB on the packs).
+        self.resident = False
+
+    @property
+    def nbytes(self):
+        return sum(int(value.nbytes) for _, value in tree_flatten(self.parameters()))
 
     def encode(self, image, processor):
+        self.resident = True
         pixels, grid = patchify(image, self.cfg, processor)
         _, rows, cols = grid
         m, p = self.cfg["adapter_merge_size"], self.cfg["native_patch_size"]

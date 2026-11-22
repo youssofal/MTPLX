@@ -1459,8 +1459,8 @@ class TestRefusedBeforeTheStream:
 
     RAM = 24 * GIB
 
-    def _mac(self, monkeypatch, *, available_gib, pool_gib=0.0, bank_gib=0.0, queued_gib=0.0, in_flight=0,
-             limit=18 * GIB):
+    def _mac(self, monkeypatch, *, available_gib, pool_gib=0.0, bank_gib=0.0, queued_gib=0.0, vision_gib=0.0,
+             in_flight=0, limit=18 * GIB):
         import time as _time
 
         available = int(available_gib * GIB)
@@ -1486,6 +1486,7 @@ class TestRefusedBeforeTheStream:
             metal_memory_caps={"memory_limit_bytes": limit} if limit else None,
             dashboard=SimpleNamespace(in_flight=SimpleNamespace(count=lambda: in_flight)),
             sessions=SimpleNamespace(bank=bank),
+            runtime=SimpleNamespace(idle_vision_bytes=lambda: int(vision_gib * GIB)),
         )
         return state, events
 
@@ -1515,6 +1516,10 @@ class TestRefusedBeforeTheStream:
         state, events = self._mac(monkeypatch, available_gib=0.3, pool_gib=0.3, bank_gib=0.3, queued_gib=0.3)
         assert srv._reject_memory_short_before_stream(state, 300) is None
         assert events == []
+        # The idle vision tower an image turn read in, which the admission gives back last: left to it too.
+        state, events = self._mac(monkeypatch, available_gib=0.3, pool_gib=0.3, bank_gib=0.3, vision_gib=0.59)
+        assert srv._reject_memory_short_before_stream(state, 300) is None
+        assert events == []
 
     def test_every_other_case_is_left_to_the_admission(self, monkeypatch):
         for kwargs in (
@@ -1534,30 +1539,11 @@ class TestRefusedBeforeTheStream:
         the admission, after giving back the pool and the idle conversation, refuses too."""
 
         from fastapi import HTTPException
-        import time as _time
 
         verdicts = []
         # The hog replay's 4K turn: 0.32 GiB banked from the short prompt before it, an empty pool, 0.0 GiB free.
         for others_gib in (6.0, 9.0, 9.8, 10.3, 10.6, 11.5):
-            manager = _manager()
-            _put(manager.bank, range(10_000), session_id="anon-idle", row_bytes=FN_ROW)  # 0.30 GiB
-            machine = _Machine(manager.bank, base_gib=12.0, cache_gib=0.1, host_gib=0.8)
-            _install(monkeypatch, machine)
-            others = int(others_gib * GIB)
-
-            def reader(machine=machine, others=others):
-                fp = machine.footprint()
-                available = max(0, self.RAM - fp - others)
-                return sm.SystemMemory(
-                    available_bytes=available, total_bytes=self.RAM, level_percent=2, free_bytes=available,
-                    file_backed_bytes=0, wired_bytes=min(self.RAM, fp + 2 * GIB), compressor_bytes=GIB,
-                    swap_used_bytes=0, monotonic_s=_time.monotonic(),
-                )
-
-            monkeypatch.setattr(sm, "_reader", reader)
-            monkeypatch.setitem(srv._STEADY_OVERHANG, "bytes", None)
-            state = _flash_next_state(manager, limit_gib=18)
-            state.dashboard = SimpleNamespace(in_flight=SimpleNamespace(count=lambda: 0))
+            state, manager = self._real(monkeypatch, others_gib=others_gib)
             try:
                 srv._reject_memory_short_before_stream(state, 300)
                 early = False
@@ -1578,6 +1564,61 @@ class TestRefusedBeforeTheStream:
         assert any(early for _, early, _ in verdicts), verdicts
         assert any(refused and not early for _, early, refused in verdicts), verdicts
         assert any(not refused for _, _, refused in verdicts), verdicts
+
+    def _real(self, monkeypatch, *, others_gib, tower_gib=0.0, releasable=False):
+        """The real bank and admission on a simulated 24 GB Mac: 12 GiB of the engine's own (plus an image
+        turn's vision tower, ``tower_gib``, given back on request when ``releasable``), 0.1 GiB pooled, 0.30 GiB
+        banked by an idle conversation, 0.8 GiB of host memory, and ``others_gib`` held by other apps."""
+        import time as _time
+
+        manager = _manager()
+        _put(manager.bank, range(10_000), session_id="anon-idle", row_bytes=FN_ROW)  # 0.30 GiB
+        machine = _Machine(manager.bank, base_gib=12.0 + tower_gib, cache_gib=0.1, host_gib=0.8)
+        _install(monkeypatch, machine)
+        others = int(others_gib * GIB)
+
+        def reader():
+            fp = machine.footprint()
+            available = max(0, self.RAM - fp - others)
+            return sm.SystemMemory(
+                available_bytes=available, total_bytes=self.RAM, level_percent=2, free_bytes=available,
+                file_backed_bytes=0, wired_bytes=min(self.RAM, fp + 2 * GIB), compressor_bytes=GIB,
+                swap_used_bytes=0, monotonic_s=_time.monotonic(),
+            )
+
+        monkeypatch.setattr(sm, "_reader", reader)
+        monkeypatch.setitem(srv._STEADY_OVERHANG, "bytes", None)
+        state = _flash_next_state(manager, limit_gib=18)
+        state.dashboard = SimpleNamespace(in_flight=SimpleNamespace(count=lambda: 0))
+        if releasable:
+            tower = {"bytes": int(tower_gib * GIB)}
+
+            def release_idle_vision():
+                held, tower["bytes"] = tower["bytes"], 0
+                machine.base -= held
+                return held
+
+            state.runtime.idle_vision_bytes = lambda: tower["bytes"]
+            state.runtime.release_idle_vision = release_idle_vision
+        return state, manager
+
+    def test_an_idle_vision_tower_goes_before_a_refusal(self, monkeypatch):
+        """The admission's last step: the tower an image turn read in (0.59 GiB on the packs) leaves before a
+        refusal. Here the request is 0.2 to 0.3 GiB short without it, as the 24K after `x1-fix-24gb-turns2`'s
+        image turn was."""
+
+        receipts = {}
+        for releasable in (False, True):
+            state, manager = self._real(monkeypatch, others_gib=8.7, tower_gib=0.59, releasable=releasable)
+            assert srv._reject_memory_short_before_stream(state, 300) is None
+            receipts[releasable] = srv._prefill_admission_shed(
+                state, prompt_ids=list(range(2_000_000, 2_000_300)), session_bank=manager.bank,
+                session_id="anon-new",
+            )
+        assert receipts[False]["refused"] is True
+        assert receipts[True].get("refused") is not True, receipts[True]
+        assert receipts[True]["reclamation_steps"][-1] == "idle_vision_tower"
+        assert receipts[True]["vision_tower_released_bytes"] == int(0.59 * GIB)
 
 
 class _LoopBank:

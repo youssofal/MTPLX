@@ -22619,6 +22619,23 @@ class _PrefillSystemGuard:
                     _release_allocator_pool()
                 except Exception:
                     pass
+        # Still short: the idle vision tower, the admission's last step too
+        # (this request's images were encoded before its read began).
+        short = target is None or int(receipt["released_bytes"]) < int(target)
+        release_vision = getattr(getattr(self.state, "runtime", None), "release_idle_vision", None)
+        if short and callable(release_vision):
+            try:
+                vision_bytes = int(release_vision() or 0)
+            except Exception as exc:  # noqa: BLE001
+                vision_bytes = 0
+                receipt["vision_tower_error"] = repr(exc)
+            if vision_bytes > 0:
+                receipt["vision_tower_released_bytes"] = vision_bytes
+                receipt["released_bytes"] = int(receipt["released_bytes"]) + vision_bytes
+                try:
+                    _release_allocator_pool()
+                except Exception:
+                    pass
         return receipt
 
 
@@ -25642,6 +25659,29 @@ def _run_prefill_admission(
                 replan("same_conversation_released_no_ssd", released.get("entries"))
         except Exception as exc:
             receipt["kept_session_entries_release_error"] = repr(exc)
+            step_errors.append(exc)
+
+    # 10. Still refused: the vision tower an earlier image turn read in
+    # (Inkling 2 Mini: 0.59 GiB) leaves memory. This request's images are
+    # already encoded; the next new image reads the tower from the pack
+    # again. On a simulated 24 GB Mac with 4.5 GiB of other apps, a cold 24K
+    # text prompt after an image turn was refused 0.20 GiB short while the
+    # tower sat idle (`x1-fix-24gb-turns2`).
+    release_vision = getattr(runtime, "release_idle_vision", None)
+    if (
+        chosen is _ADMISSION_NO_FIT
+        and callable(release_vision)
+        and refusal_deficit(now, current) > 0
+    ):
+        try:
+            vision_released = int(release_vision() or 0)
+            if vision_released > 0:
+                receipt["vision_tower_released_bytes"] = vision_released
+                clear_pool()
+                now = measure()
+                steps.append("idle_vision_tower")
+        except Exception as exc:
+            receipt["vision_tower_release_error"] = repr(exc)
             step_errors.append(exc)
 
     if chosen is _ADMISSION_NO_FIT:
@@ -31174,12 +31214,13 @@ def _reject_memory_short_before_stream(state: ServerState, prompt_token_count: i
 
     Sure means: no request is running (whose end would give memory back), and
     the Mac's free and reclaimable memory, plus everything this engine could
-    give back (its allocator pool, every byte the session bank holds and the
-    snapshots its queued SSD writes hold), is already under the Mac's abort
-    floor before the request adds a byte. The admission reclaims at most
-    those and holds the request to that floor with its growth counted, so it
-    refuses every request this refuses; it returns early in the same cases
-    (no engine limit, nothing loaded, an unreadable Mac). The admission
+    give back (its allocator pool, every byte the session bank holds, the
+    snapshots its queued SSD writes hold and an idle vision tower), is already
+    under the Mac's abort floor before the request adds a byte. The admission
+    reclaims at most those and holds the request to that floor with its
+    growth counted, so it refuses every request this refuses; it returns
+    early in the same cases (no engine limit, nothing loaded, an unreadable
+    Mac). The admission
     inside the generation still prices every request and refuses the rest;
     this only moves its certain refusals ahead of the response, so every
     client shows the message instead of an error event after HTTP 200.
@@ -31207,15 +31248,19 @@ def _reject_memory_short_before_stream(state: ServerState, prompt_token_count: i
             return None
         if int(stats.get("active_memory_bytes") or 0) <= 0:
             return None
-        pool = int(stats.get("cache_memory_bytes") or 0)
         bank = getattr(getattr(state, "sessions", None), "bank", None)
-        banked = 0
-        if bank is not None:
-            banked = int(getattr(bank, "total_nbytes", 0) or 0) + int(
-                getattr(bank, "queued_persistence_bytes", 0) or 0
-            )
+        idle_vision = getattr(getattr(state, "runtime", None), "idle_vision_bytes", None)
+        engine = {
+            "allocator_pool_bytes": int(stats.get("cache_memory_bytes") or 0),
+            "session_bank_bytes": int(getattr(bank, "total_nbytes", 0) or 0) if bank is not None else 0,
+            "queued_persistence_bytes": (
+                int(getattr(bank, "queued_persistence_bytes", 0) or 0) if bank is not None else 0
+            ),
+            "idle_vision_tower_bytes": int(idle_vision() or 0) if callable(idle_vision) else 0,
+        }
+        reclaimable = sum(engine.values())
         _shed, abort = _system_admission_floors(reading, 0)
-        if int(reading.available_bytes) + pool + banked >= int(abort):
+        if int(reading.available_bytes) + reclaimable >= int(abort):
             return None
         # Memory MLX has just given back may still be leaving the footprint.
         if _settle_released_memory(_STEADY_OVERHANG["bytes"]) is not None:
@@ -31223,7 +31268,7 @@ def _reject_memory_short_before_stream(state: ServerState, prompt_token_count: i
             if reading is None:
                 return None
             _shed, abort = _system_admission_floors(reading, 0)
-            if int(reading.available_bytes) + pool + banked >= int(abort):
+            if int(reading.available_bytes) + reclaimable >= int(abort):
                 return None
     except Exception:  # noqa: BLE001 - a reading that fails leaves the admission to decide
         return None
@@ -31235,8 +31280,7 @@ def _reject_memory_short_before_stream(state: ServerState, prompt_token_count: i
         "prompt_tokens": int(prompt_token_count),
         "system_available_bytes": available,
         "system_abort_floor_bytes": int(abort),
-        "allocator_pool_bytes": pool,
-        "session_bank_bytes": banked,
+        **engine,
         "system_memory": reading.to_dict(),
     }
     _record_guard_event(state, receipt)
