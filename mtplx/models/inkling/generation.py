@@ -29,7 +29,7 @@ from .cache import prompt_rows
 from .copy_draft import PromptCopy, SessionPromptIndexes
 from .customer_controls import ProposalSampler, RepetitionOutput
 from .fast import draft as fast_draft
-from .fast import engine_site
+from .fast import engine_site, nucleus
 from .fast.decoder import fast_enabled, round_commit_enabled, stage_spec
 from .fast.step import wide_rows_exact
 from .fast.state import MAX_PANEL
@@ -41,14 +41,19 @@ from .sampling import NativeDrawsAhead, draw_native, is_native_sampler
 from mtplx.token_ids import token_id_bytes
 
 
-def served_proposals(device_ok, draft_temperature, proposals, dspark_tokens):
+def served_proposals(device_ok, draft_temperature, proposals, dspark_tokens, *, draft_config=None):
     """The proposal method, temperature and sampled count of the route that served them."""
     if not device_ok:
         return {"proposal_route": "host_" + ("sampled" if proposals.sampled else "argmax")}
     sampled = draft_temperature > 0
-    return {"proposal_route": "device_" + ("sampled" if sampled else "argmax"),
-            "method": "sampled" if sampled else "argmax", "temperature": draft_temperature,
-            "sampled_tokens": dspark_tokens if sampled else 0}
+    result = {"proposal_route": "device_" + ("sampled" if sampled else "argmax"),
+              "method": "sampled" if sampled else "argmax", "temperature": draft_temperature,
+              "sampled_tokens": dspark_tokens if sampled else 0}
+    if sampled and draft_config is not None:
+        # The host's implicit argmax reports k=1. The device actually drew
+        # from this configured proposal law, including a mirrored target cut.
+        result.update(top_p=float(draft_config.top_p), top_k=int(draft_config.top_k or 0))
+    return result
 
 
 def decision_route(sampler, *, constraint=None, draft_sampler=None, verify_strategy=None):
@@ -66,16 +71,20 @@ def decision_route(sampler, *, constraint=None, draft_sampler=None, verify_strat
     return fast_round.supported(sampler, constraint=constraint, draft_sampler=draft_sampler)
 
 
-def checked_device_draw(row_logits, *, position, seed, temperature, controls=None):
+def checked_device_draw(row_logits, *, position, seed, temperature, controls=None, filters=None):
     """The GPU's draw of one token from a logits row, refused like every host draw when the row
     has NaN, or no finite maximum (+inf, or every entry -inf): one read gives the token and the
     row's status, and a bad row raises the existing numerical error before the id is counted,
     streamed, embedded or banked (review 1, finding 3). ``controls`` (the request's
     ``ClientControlledDraw``) shapes the row first; the error's census reads the model's row."""
     row = row_logits.reshape(1, -1)
-    law = controls.rows(row) if controls is not None else row
-    drawn = fast_round.draw_checked(law, position=position, seed=seed, temperature=temperature)
-    return fast_round.read_draw(drawn, rows=row, settle=settle_owner_work)[0], True
+    law = controls.rows(row, defer_min_p=filters is not None) if controls is not None else row
+    drawn = fast_round.draw_checked(law, position=position, seed=seed, temperature=temperature, filters=filters)
+    try:
+        return fast_round.read_draw(drawn, rows=row, settle=settle_owner_work)[0], True
+    except nucleus.FilterRefused as refusal:
+        count(f"draw.host.{refusal.reason}")
+        return None, False
 
 
 def generate(
@@ -166,15 +175,12 @@ def generate(
                    and is_native_sampler(sampler) and controls is None)
     # The round is decided on the GPU by the product's ratio law (class B) unless the request
     # asks for the seed-match rule (verify strategy target_prefix: RC6's host FP64 draw) or
-    # its sampling law needs the host (grammar, penalties, top-p/top-k): one small read a round.
+    # its sampling law needs the host (grammar, penalties): one small read a round.
     device_ok, device_decline = decision_route(sampler, constraint=constraint, draft_sampler=draft_sampler,
                                                verify_strategy=verify_strategy)
     count("decision.device" if device_ok else f"decision.host.{device_decline}")
     if device_ok and controls is not None:
         count("decision.device.client_controls")
-    # The one-program round has no input for a client's logit transform yet: those rounds run
-    # from the pieces below, the controls applied to the verified rows (counted per round).
-    program_decline = "client_controls" if controls is not None else None
     # MTPLX_INKLING_ROUND_PROGRAM=0 keeps every round on the replayed step and the pieces around
     # it (a diagnostic rollback; round.decline.* counts every round the program does not serve).
     round_program_on = os.environ.get("MTPLX_INKLING_ROUND_PROGRAM", "on").strip().lower() not in (
@@ -189,6 +195,18 @@ def generate(
     round_seed = int(seed) if seed is not None else secrets.randbits(64)
     target_temperature = float(sampler.temperature or 0.0)
     draft_temperature = float(draft_sampler.temperature) if draft_sampler is not None else target_temperature
+    filters = nucleus.request_words(sampler) if device_ok else None
+    # The old wide-copy policy applies to unfiltered requests. A filtered copy
+    # panel uses the same certified point-mass decision at every panel width.
+    wide_decision = wide_decision or filters is not None
+    draft_config = draft_sampler if draft_sampler is not None else sampler
+    draft_filters = (nucleus.request_words(draft_config, min_p=draft_config.min_p or sampler.min_p)
+                     if device_ok else None)
+    # A filtered law includes its min-p floor. Bias, repetition history and
+    # standalone floors still need the shaped rows of the piecewise round.
+    inline_floor = (controls is not None and controls.names == ("min_p",) and filters is not None
+                    and (draft_filters is not None or draft_temperature <= 0))
+    program_decline = "client_controls" if controls is not None and not inline_floor else None
     device_rounds = device_fallback_rounds = host_rounds = 0
     # No configured depth: the proposal count of each round is chosen before its draws from
     # the yield of earlier rounds and this Mac's round costs (timed at load; RC6's table when
@@ -316,7 +334,9 @@ def generate(
 
     def device_draw(row_logits, position):
         token, valid = checked_device_draw(row_logits, position=position, seed=round_seed,
-                                           temperature=target_temperature, controls=controls)
+                                           temperature=target_temperature, controls=controls, filters=filters)
+        if not valid:
+            return draw(row_logits)
         counts[token] += 1
         if controls is not None:
             controls.observe(token)
@@ -381,7 +401,7 @@ def generate(
             # is live (lane L7); otherwise the same round from the pieces below, same law.
             served = round_program.serve(rt, anchor, cache, min(selected_depth, remaining),
                                          position=position, seed=round_seed, temperature=target_temperature,
-                                         draft_temperature=draft_temperature,
+                                         draft_temperature=draft_temperature, filters=filters, draft_filters=draft_filters,
                                          **({"stops": stop, "remaining": remaining} if round_commit_on else {}))
         if served is not None:
             block = proposed = served.block
@@ -393,7 +413,9 @@ def generate(
                 rt.drafter, rt.model, anchor, cache[rt.trunk_entries :], min(selected_depth, remaining),
                 position=position, seed=round_seed, temperature=draft_temperature,
                 shape=(None if controls is None else
-                       (lambda scores: controls.shape_scores(scores, draft_temperature))),
+                       (lambda scores: controls.shape_scores(scores, draft_temperature,
+                                                             defer_min_p=draft_filters is not None))),
+                filters=draft_filters,
             )
             block = mx.concatenate((mx.array([anchor], mx.int32), proposed))
             mx.async_eval(block)
@@ -429,12 +451,19 @@ def generate(
             if width > fast_round.MAX_ROWS:
                 count("decision.device.wide_copy")
             packet = (served.packet if served is not None else
-                      fast_round.decide(controls.rows(rows, proposed) if controls is not None else rows,
+                      fast_round.decide(controls.rows(rows, proposed, defer_min_p=filters is not None)
+                                        if controls is not None else rows,
                                         proposed, position=position, seed=round_seed,
-                                        temperature=target_temperature, draft=law))
+                                        temperature=target_temperature, draft=law, filters=filters))
             # The round's only read; the owner's eval keeps the stall watchdog ticking.
             decision = fast_round.read_packet(packet, width, settle=eval_rows)
-            if decision.status:
+            if decision.status in nucleus.REFUSALS:
+                # The GPU accepted this prefix. The first uncertain target law
+                # starts the host walk. A later proposal cannot undo an earlier draw.
+                count(f"decision.host.{nucleus.REFUSALS[decision.status]}")
+                device_fallback_rounds += 1
+                host_rounds += 1
+            elif decision.status:
                 decision = None  # non-finite rows: the host draw below raises the product's error
                 device_fallback_rounds += 1
             else:
@@ -450,7 +479,9 @@ def generate(
         pending = False
         if decision is not None:
             offered = width - 1
-            for pos, token in enumerate(decision.tokens):
+            host_suffix = decision.status in nucleus.REFUSALS
+            decided_tokens = decision.tokens[:decision.accepted] if host_suffix else decision.tokens
+            for pos, token in enumerate(decided_tokens):
                 if len(tokens) + len(emitted) == max_tokens or (abort_check and abort_check()):
                     break
                 counts[token] += 1
@@ -467,7 +498,14 @@ def generate(
                     break
                 if repeated or token in stop:
                     break
-            rows = None
+            if host_suffix and len(emitted) == decision.accepted and not (
+                emitted and (emitted[-1] in stop or (repetition is not None and repetition.result is not None))
+            ):
+                rows = verified_rows[decision.accepted:]
+                eval_rows(rows)
+                guesses = block.tolist()[1 + decision.accepted:] if copied is None else copied[decision.accepted:]
+            else:
+                rows = None
         # Emit the target draw on both branches. A match only lets us read the next verified row.
         # The native draw's rows are computed ahead on worker threads while the walk draws in
         # order (the same FP64 operations, so the same tokens): a wide copy round walks up to
@@ -503,10 +541,7 @@ def generate(
             # round's writes are undone and the stock commit writes the loop's count (counted).
             served.rewind(kept)
         commit(cache, features, tapes, kept, len(block), done=committed_in_round)
-        if rows is not None:
-            logits = rows[kept - 1][None, None]
-        else:
-            logits = verified_rows[kept - 1][None, None]
+        logits = verified_rows[kept - 1][None, None]
         if capture_final_state and not pending:
             hidden = mx.concatenate([h[:, kept - 1 : kept] for h in features], axis=-1)
         tokens.extend(emitted)
@@ -597,7 +632,7 @@ def generate(
             **proposals.stats(drafted - copy.drafted),
             # What served the drafter's proposals: on the GPU at the draft temperature when the
             # device round decides, else the host proposal sampler (argmax unless one is set).
-            **served_proposals(device_ok, draft_temperature, proposals, drafted - copy.drafted),
+            **served_proposals(device_ok, draft_temperature, proposals, drafted - copy.drafted, draft_config=draft_config),
             "device_proposal_rounds": device_proposal_rounds,
             "host_copy_rounds": rounds - device_proposal_rounds,
             "depth_choices": dict(Counter(depth_control.choices)) if depth_control is not None else None,

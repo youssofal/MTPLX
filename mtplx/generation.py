@@ -8056,7 +8056,7 @@ class ClientControlledDraw:
             out = mx.where(mx.array(self._seen), penalised, out)
         return out.reshape(row.shape)
 
-    def rows(self, logits: mx.array, proposals: mx.array | None = None) -> mx.array:
+    def rows(self, logits: mx.array, proposals: mx.array | None = None, *, defer_min_p=False) -> mx.array:
         """The rows a device decision draws from, with this request's controls: ``(W, V)``
         float32, lazy, so a round with client controls is decided on the GPU by the same law
         as one without them (the ratio rule's exactness holds for any target law).
@@ -8067,9 +8067,8 @@ class ClientControlledDraw:
         temperature above 0) becomes a floor: a token is set to ``-inf`` when
         ``l - max(l) < T ln(min_p)``, which is ``min_p_filter``'s test ``p >= min_p * p_max``
         on the tempered softmax, decided in float32 (the device round's law precision). With
-        top-k or top-p the floor would not commute with their cut; the device round serves
-        neither. NaN and infinite entries are left as they are, so a row that is not a law is
-        still refused. ``observe`` must have seen every token the request emitted.
+        top-k or top-p the caller defers the floor to the kernel that applies their cut.
+        NaN and infinite entries are left as they are, so an invalid row is still refused. ``observe`` must have seen every token the request emitted.
         """
         vocab = int(logits.shape[-1])
         if self._vocab is None:
@@ -8088,7 +8087,7 @@ class ClientControlledDraw:
             penalised = mx.where(out > 0, out / self.penalty, out * self.penalty)
             out = mx.where(seen, penalised, out)
         temperature = float(self.config.temperature or 0.0)
-        if temperature > 0 and self.config.min_p > 0:
+        if not defer_min_p and temperature > 0 and self.config.min_p > 0:
             # The smallest float32 at or above T ln(min_p): for a gap that float32 holds exactly
             # (Sterbenz: every token within a factor 2 of a positive maximum) the test is exact.
             floor = temperature * float(np.log(float(self.config.min_p)))
@@ -8100,7 +8099,7 @@ class ClientControlledDraw:
             out = mx.where(keep, out, -mx.inf)
         return out
 
-    def shape_scores(self, scores: mx.array, temperature: float) -> mx.array:
+    def shape_scores(self, scores: mx.array, temperature: float, *, defer_min_p=False) -> mx.array:
         """A drafter's capped score rows ``(R, V)`` with this request's bias and min-p floor
         (relative to each row's own maximum at ``temperature``), float32, lazy: proposals drawn
         from the shaped law skip tokens the target law excludes (a banned id, the min-p tail).
@@ -8112,7 +8111,7 @@ class ClientControlledDraw:
         out = scores.astype(mx.float32)
         if self._bias is not None:
             out = out + mx.zeros((vocab,), mx.float32).at[self._bias[0]].add(self._bias[1])
-        if temperature and temperature > 0 and self.config.min_p > 0:
+        if not defer_min_p and temperature and temperature > 0 and self.config.min_p > 0:
             floor = float(temperature) * float(np.log(float(self.config.min_p)))
             keep = mx.logical_or(out - mx.max(out, axis=-1, keepdims=True) >= floor,
                                  mx.logical_not(mx.isfinite(out)))

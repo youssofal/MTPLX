@@ -449,7 +449,7 @@ def _block(block, hidden, residual, view: DraftView, index: int):
 
 
 def propose(drafter, target, anchor, view: DraftView, count_: int, *, position, seed, temperature=1.0,
-            sample=True, cap=None, params=None):
+            sample=True, cap=None, params=None, filters=None):
     """``fast.draft.propose`` on the fixed-layout drafter: (ids (count,) int32, DraftLaw).
     ``params`` (``round.law_params(1, temperature, cap)``) gives a sampled law's temperature
     as data."""
@@ -528,7 +528,8 @@ def propose(drafter, target, anchor, view: DraftView, count_: int, *, position, 
         if greedy:
             law, st = fast_round.law_rows(scores, temperature=None, cap=0.0, write=True)
         else:
-            law, st = fast_round.law_rows(scores, temperature=temperature, cap=cap, params=params)
+            law, st, _ = fast_round.sampled_rows(scores, temperature=temperature, cap=cap,
+                                                 params=params, filters=filters)
         token, lse = fast_round.sample_rows(law, st, positions=(start + fast_round._const(i, mx.uint32)).reshape(1), seed=seed,
                                             purpose=fast_round.PURPOSE_DRAFT, greedy=greedy)
         prev = token
@@ -546,7 +547,7 @@ def propose(drafter, target, anchor, view: DraftView, count_: int, *, position, 
 # ------------------------------------------------------------------------------- a round
 def round_function(rt, anchor, position, seed, view: DraftView, round_state, proposals: int, *,
                    temperature: float, draft_temperature: float, stages, params=None, draft_params=None,
-                   stops=None, remaining=None):
+                   stops=None, remaining=None, filters=None, draft_filters=None):
     """The round as MLX builds it (lazy): [packet, ids (W,), logits, captures..., deltas...].
     What the program records and what serves when no program is live. ``params`` and
     ``draft_params`` carry the sampled temperatures as data (``round.law_params``).
@@ -562,11 +563,11 @@ def round_function(rt, anchor, position, seed, view: DraftView, round_state, pro
 
     proposer = draft_glue.propose if draft_glue.enabled() and draft_kernel_on() else propose
     ids, law = proposer(rt.drafter, model, anchor, view, proposals, position=position, seed=seed,
-                        temperature=draft_temperature, params=draft_params)
+                        temperature=draft_temperature, params=draft_params, filters=draft_filters)
     block = mx.concatenate([anchor.astype(mx.int32).reshape(1), ids])
     logits, captures, deltas = decode_panel(model, block, round_state, stages=stages)
     packet = fast_round.decide(logits[0], ids, position=position, seed=seed,
-                               temperature=temperature, draft=law, params=params)
+                               temperature=temperature, draft=law, params=params, filters=filters)
     if stops is None:
         return [packet, block, *engine_site.flatten(logits, captures, deltas)]
     # The commit, inside the round: the loop's own walk over the packet (stops, the request's
@@ -831,7 +832,7 @@ def _grow_bank(entry, need: int) -> None:
 
 
 def serve(rt, anchor, cache, proposals: int, *, position, seed, temperature, draft_temperature,
-          stages=None, spec=None, state=None, stops=None, remaining=None):
+          stages=None, spec=None, state=None, stops=None, remaining=None, filters=None, draft_filters=None):
     """One DSpark round (proposals, verify, decision): a ``Round``, or None (counted) when
     the stock round must serve it, with nothing changed.
 
@@ -918,6 +919,7 @@ def serve(rt, anchor, cache, proposals: int, *, position, seed, temperature, dra
     params_a = None if greedy else fast_round.law_params(k + 1, t_target)
     draft_params_a = None if draft_greedy else fast_round.law_params(1, t_draft, cap)
     head = [anchor_a, position_a, seed_a, *(a for a in (params_a, draft_params_a) if a is not None)]
+    head.extend(a for a in (filters, draft_filters) if a is not None)
     stops_a = remaining_a = None
     if commit:
         stops_a = mx.array(stop_ids + [-2] * (MAX_STOPS - len(stop_ids)), mx.int32)
@@ -931,6 +933,8 @@ def serve(rt, anchor, cache, proposals: int, *, position, seed, temperature, dra
     geometry = ("round", k, "greedy" if greedy else "sampled", "greedy" if draft_greedy else "sampled",
                 "commit" if commit else "decide", "dattn" if draft_kernel_on() else "sdpa", spec,
                 tuple(model.capture_ids), engine_site.identity(rt))
+    if filters is not None or draft_filters is not None:
+        geometry += (("filtered", filters is not None, draft_filters is not None),)
     n_cap = len(model.capture_ids)
     visits = len(state.local)
     windows = None
@@ -974,7 +978,8 @@ def serve(rt, anchor, cache, proposals: int, *, position, seed, temperature, dra
         view_ = _view_from(drafter, arrays[first_draft:first_draft + n_draft])
         return round_function(rt, anchor_a, position_a, seed_a, view_, round_state, k,
                               temperature=t_target, draft_temperature=t_draft, stages=stages,
-                              params=params_a, draft_params=draft_params_a, stops=stops_a, remaining=remaining_a)
+                              params=params_a, draft_params=draft_params_a, stops=stops_a, remaining=remaining_a,
+                              filters=filters, draft_filters=draft_filters)
 
     def install(outputs):
         base = 3 + 1 + n_cap + 6 * visits

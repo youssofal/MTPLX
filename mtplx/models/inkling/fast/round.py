@@ -558,6 +558,18 @@ def law_rows(scores, *, temperature=1.0, cap=0.0, write=None, params=None):
     return (law if write else scores.astype(mx.float32)), stats
 
 
+def sampled_rows(scores, *, temperature, cap=0.0, params=None, filters=None):
+    """The actual sampling law, its stats and the certificate for a filtered target."""
+    if filters is None:
+        law, stats = law_rows(scores, temperature=temperature, cap=cap, params=params)
+        return law, stats, None
+    from . import nucleus
+
+    if params is None:
+        params = law_params(scores.shape[0], temperature, cap)
+    return nucleus.filtered(scores, None, params, filters, store_cap=bool(cap))
+
+
 def _seed_words(seed):
     if seed is None:
         seed = secrets.randbits(64)
@@ -601,7 +613,7 @@ def race(tlaw, tstats, *, modes, positions, seed, purpose, greedy=False, dlaw=No
 
 
 def decide(target_logits, proposals, *, position, seed, temperature=1.0, draft=None,
-           greedy=None, rule="ratio", offered=None, params=None):
+           greedy=None, rule="ratio", offered=None, params=None, filters=None):
     """Decide one verify panel on the GPU and return the int32 packet (lazy).
 
     ``target_logits`` (W, V) are the verify rows as the head returns them (soft cap
@@ -626,8 +638,8 @@ def decide(target_logits, proposals, *, position, seed, temperature=1.0, draft=N
     if rows != k + 1 or not 1 <= rows <= WIDE_ROWS:
         raise ValueError(f"a panel of {rows} rows needs {rows - 1} proposals (at most {WIDE_ROWS - 1})")
     greedy = (not temperature or temperature <= 0) if greedy is None else greedy
-    tlaw, tstats = law_rows(target_logits, temperature=None if greedy else temperature,
-                            params=None if greedy else params)
+    tlaw, tstats, bound = sampled_rows(target_logits, temperature=None if greedy else temperature,
+                                       params=None if greedy else params, filters=None if greedy else filters)
     match = rule == "match" and not greedy
     point = draft is None or draft.point_mass or match
     mode = MODE_TARGET if match else (MODE_POINT if point else MODE_RESIDUAL)
@@ -657,6 +669,10 @@ def decide(target_logits, proposals, *, position, seed, temperature=1.0, draft=N
         output_shapes=[(2 + rows + k,)],
         output_dtypes=[mx.int32],
     )
+    if bound is not None:
+        from . import nucleus
+
+        return nucleus.merge_status(packet, bound, rows)
     return packet
 
 
@@ -727,7 +743,7 @@ def draw(target_logits, *, position, seed, temperature=1.0):
     return draw_checked(target_logits, position=position, seed=seed, temperature=temperature)[0]
 
 
-def draw_checked(target_logits, *, position, seed, temperature=1.0):
+def draw_checked(target_logits, *, position, seed, temperature=1.0, filters=None):
     """Draw one token per row from the target law (plain decode, the first token after a
     prefill or a restore): (2, W) int32, row 0 the tokens, row 1 each row's status
     (``STATUS_OK``, or ``STATUS_NON_FINITE`` for a row with a NaN or no finite maximum,
@@ -739,7 +755,8 @@ def draw_checked(target_logits, *, position, seed, temperature=1.0):
     """
     rows, vocab = target_logits.shape
     greedy = not temperature or temperature <= 0
-    tlaw, tstats = law_rows(target_logits, temperature=None if greedy else temperature)
+    tlaw, tstats, bound = sampled_rows(target_logits, temperature=None if greedy else temperature,
+                                       filters=None if greedy else filters)
     base = position if isinstance(position, mx.array) else mx.array(int(position), mx.uint32)
     seed_words = seed if isinstance(seed, mx.array) else _seed_words(seed)
     race_parts, lse = race(tlaw, tstats, modes=_const([MODE_TARGET] * rows, mx.int32),
@@ -753,7 +770,11 @@ def draw_checked(target_logits, *, position, seed, temperature=1.0):
         output_shapes=[(2 * rows,)],
         output_dtypes=[mx.int32],
     )
-    return drawn.reshape(2, rows)
+    drawn = drawn.reshape(2, rows)
+    if bound is not None:
+        status = mx.where(drawn[1] == STATUS_OK, bound[:, 2].astype(mx.int32), drawn[1])
+        return mx.stack([drawn[0], status])
+    return drawn
 
 
 def read_draw(drawn, rows=None, settle=None):
@@ -769,6 +790,11 @@ def read_draw(drawn, rows=None, settle=None):
         from mtplx.sampling import non_finite_logits_error
 
         bad = int(np.flatnonzero(values[1] != STATUS_OK)[0])
+        from . import nucleus
+
+        status = int(values[1, bad])
+        if status in nucleus.REFUSALS:
+            raise nucleus.FilterRefused(status)
         row = np.asarray(rows[bad].astype(mx.float32)) if rows is not None else np.array([np.nan])
         raise non_finite_logits_error(row, "device draw")
     return [int(t) for t in values[0]]
@@ -806,10 +832,8 @@ def warm(vocab=4096, wide=False):
 def supported(sampler, *, constraint=None, draft_sampler=None):
     """(True, None) when the device round serves this request, else (False, reason).
 
-    The device round implements the tempered softmax over the full vocabulary (any
-    temperature > 0, or greedy at 0) with no top-p, top-k or penalties, and no grammar
-    mask. Everything else keeps the host path, counted under the returned reason:
-    those laws depend on the accepted history or need a sort the round does not do.
+    Sampled requests use the filtered target and proposal laws where a cut is
+    active. An uncertified target row falls back at its own position.
     """
     if not mx.metal.is_available() or mx.default_device() != mx.gpu:
         return False, "device"
@@ -822,16 +846,9 @@ def supported(sampler, *, constraint=None, draft_sampler=None):
         return False, "temperature_range"
     if not repetition_served(getattr(sampler, "repetition_penalty", 1.0)):
         return False, "repetition_penalty_range"
-    if temperature > 0 and (float(getattr(sampler, "top_p", 1.0)) < 1.0
-                            or int(getattr(sampler, "top_k", 0) or 0) > 0):
-        return False, "filtered_sampler"
-    if draft_sampler is not None and (
-        float(getattr(draft_sampler, "top_p", 1.0)) < 1.0
-        or int(getattr(draft_sampler, "top_k", 0) or 0) > 0
-        or getattr(draft_sampler, "presence_penalty", 0)
-        or getattr(draft_sampler, "frequency_penalty", 0)
-    ):
-        return False, "filtered_draft_sampler"
+    if draft_sampler is not None and (getattr(draft_sampler, "presence_penalty", 0)
+                                      or getattr(draft_sampler, "frequency_penalty", 0)):
+        return False, "draft_penalties"
     if draft_sampler is not None and not temperature_served(float(getattr(draft_sampler, "temperature", 0.0) or 0.0)):
         return False, "draft_temperature_range"
     return True, None

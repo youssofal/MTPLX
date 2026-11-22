@@ -137,6 +137,11 @@ class InklingRuntime(MTPLXRuntime):
                     self.round_cost_ms = None
                     self.round_cost_detail = f"round cost timing failed: {type(exc).__name__}: {exc}"
                     print(f"[mtplx] inkling: {self.round_cost_detail}", flush=True)
+                # Compile the extra sampling pipelines after calibration. They need no
+                # model forward and do not participate in the native width measurements.
+                from .fast import nucleus
+
+                nucleus.warm(self.model.embed_tokens.weight.dtype)
         # The table against the rounds it prices, whatever made it (DepthTableCheck).
         self.depth_table_check = DepthTableCheck(self.round_cost_ms or fast_draft.RC6_COST_MS_2K)
         # What the load leaves resident beside the weights and the engine's pool (the float32

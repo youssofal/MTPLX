@@ -38,7 +38,7 @@ def _anchor_ids(anchor):
 
 
 def propose(drafter, target, anchor, cache, count, *, position, seed, temperature=1.0,
-            sample=True, cap=None, precision="bf16", shape=None):
+            sample=True, cap=None, precision="bf16", shape=None, filters=None):
     """``count`` proposals (1 to 7) after ``anchor``; returns (ids (count,) int32, DraftLaw).
 
     ``position`` is the absolute position of the first proposal (the token after the
@@ -114,7 +114,7 @@ def propose(drafter, target, anchor, cache, count, *, position, seed, temperatur
         if greedy:
             law, st = rnd.law_rows(scores, temperature=None, cap=0.0, write=True)
         else:
-            law, st = rnd.law_rows(scores, temperature=temperature, cap=row_cap)
+            law, st, _ = rnd.sampled_rows(scores, temperature=temperature, cap=row_cap, filters=filters)
         token, lse = rnd.sample_rows(law, st, positions=(start + i).reshape(1), seed=seed_words,
                                      purpose=rnd.PURPOSE_DRAFT, greedy=greedy)
         prev = token

@@ -445,7 +445,7 @@ def block(blk, hidden, residual, view, index: int):
 
 
 def propose(drafter, target, anchor, view, count_: int, *, position, seed, temperature=1.0, sample=True,
-            cap=None, params=None):
+            cap=None, params=None, filters=None):
     """``round_program.propose`` with the drafter's glue in launches of ours (see the module docstring):
     the same ``(ids, DraftLaw)``, bit for bit."""
     from ..model import linear
@@ -504,7 +504,8 @@ def propose(drafter, target, anchor, view, count_: int, *, position, seed, tempe
         if greedy:
             law, st = fast_round.law_rows(scores, temperature=None, cap=0.0, write=True)
         else:
-            law, st = fast_round.law_rows(scores, temperature=temperature, cap=cap, params=params)
+            law, st, _ = fast_round.sampled_rows(scores, temperature=temperature, cap=cap,
+                                                 params=params, filters=filters)
         token, lse = fast_round.sample_rows(law, st, positions=start.reshape(1), seed=seed,
                                             purpose=fast_round.PURPOSE_DRAFT, greedy=greedy, offset=i)
         prev = token

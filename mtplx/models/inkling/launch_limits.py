@@ -129,14 +129,14 @@ def _first(launch, kw: dict):
     return 0, outs
 
 
-def _limit(launch, name: str, kw: dict):
+def _limit(launch, name: str, kw: dict, *, probe_group=False):
     """``(group, limit, source, outputs)``: this GPU's limit for the launch's pipeline when it refuses the group
     (else 0), and the launch's evaluated outputs when this call was its pipeline's first (else None)."""
     group = _group(kw.get("threadgroup"))
     cap = test_limit(name)
     if cap is not None and group > cap:
         return group, cap, "test hook", None
-    if group <= PROBE_ABOVE:
+    if group <= PROBE_ABOVE and not probe_group:
         return group, 0, "", None
     key = _pipeline_key(name, group, kw)
     limit = _verdicts.get(key)
@@ -166,12 +166,12 @@ def _note(name: str, group: int, limit: int, source: str, served_by: str, counte
               f"{'; test hook' if source == 'test hook' else ''}); {served_by}", flush=True)
 
 
-def runs(launch, name: str, kw: dict, instead: str | None = None) -> bool:
+def runs(launch, name: str, kw: dict, instead: str | None = None, *, probe_group=False) -> bool:
     """Whether this GPU runs this launch's thread group for its pipeline (decided once per pipeline and group;
     deciding it runs the launch once). With ``instead`` (what the caller runs in its place, with the same bits)
     a refusal is recorded, counted ``fused.split.<kernel>.<group>`` (a stage path: replayed programs count it
     again) and said once."""
-    group, limit, source, _ = _limit(launch, name, kw)
+    group, limit, source, _ = _limit(launch, name, kw, probe_group=probe_group)
     if not limit:
         return True
     if instead:
@@ -179,11 +179,11 @@ def runs(launch, name: str, kw: dict, instead: str | None = None) -> bool:
     return False
 
 
-def check(launch, name: str, kw: dict):
+def check(launch, name: str, kw: dict, *, probe_group=False):
     """The launch's evaluated outputs when this call decided its pipeline (else None); raises ``GroupRefused``
     (recorded, counted ``threadgroup.refused.<kernel>.<group>``, said once) when this GPU cannot run its group.
     The stage that catches it counts ``fallback.<stage>.threadgroup`` for every call it serves instead."""
-    group, limit, source, outs = _limit(launch, name, kw)
+    group, limit, source, outs = _limit(launch, name, kw, probe_group=probe_group)
     if limit:
         _note(name, group, limit, source, STAGE_ROUTE, f"threadgroup.refused.{name}.{group}")
         raise GroupRefused(name, group, limit, source)
@@ -193,25 +193,26 @@ def check(launch, name: str, kw: dict):
 class Kernel:
     """An ``mx.fast.metal_kernel`` whose launches are checked against this GPU's limit first (``check``)."""
 
-    __slots__ = ("_launch", "name")
+    __slots__ = ("_launch", "name", "_probe_group")
 
-    def __init__(self, launch, name: str):
+    def __init__(self, launch, name: str, probe_group=False):
         self._launch = launch
         self.name = name
+        self._probe_group = probe_group
 
     def __call__(self, **kw):
-        outs = check(self._launch, self.name, kw)
+        outs = check(self._launch, self.name, kw, probe_group=self._probe_group)
         return self._launch(**kw) if outs is None else outs
 
     def runs(self, instead: str | None = None, **kw) -> bool:
         """Whether this GPU runs the launch ``kw``; ``instead`` names the same-bits form the caller runs if not."""
-        return runs(self._launch, self.name, kw, instead)
+        return runs(self._launch, self.name, kw, instead, probe_group=self._probe_group)
 
 
-def kernel(*args, **kwargs) -> Kernel:
+def kernel(*args, probe_group=False, **kwargs) -> Kernel:
     """``mx.fast.metal_kernel(...)``, its launches checked against this GPU's per-pipeline thread-group limit."""
     name = kwargs.get("name", args[0] if args else "kernel")
-    return Kernel(mx.fast.metal_kernel(*args, **kwargs), str(name))
+    return Kernel(mx.fast.metal_kernel(*args, **kwargs), str(name), probe_group)
 
 
 def report() -> dict[str, Any]:
