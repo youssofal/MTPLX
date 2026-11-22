@@ -21872,6 +21872,126 @@ _PREFILL_SYSTEM_CHECK_INTERVAL_S = 0.2
 # conversation is several GB (6.5 GB at 194K, 4.67 GB at 131K).
 _PREFILL_GROWTH_OVER_PRICE_BYTES = 2 * 1024**3
 
+# Memory MLX has just given back stays in the process's footprint for a
+# moment: macOS drops the pages a few tens of milliseconds later. MLX gives
+# its pool back on its own when an allocation would cross its limit, and the
+# guard does when it sheds; a reading taken in that moment finds the bytes in
+# neither the pool (MLX already counts them as returned) nor the Mac's free
+# pages (macOS has not taken them yet). Inkling 2 Mini Bare Speed on a
+# simulated 24 GB Mac (2.13.1, `x1-fix-24gb-mem`, the process's own
+# footprint read every 20 ms): 2.45 GiB of footprint beyond MLX's account
+# 30 ms after its 1.85 GiB pool went back, against 0.83 GiB at every other
+# reading of the read, and the steady 0.83 GiB again 30 ms later. The
+# per-chunk check stopped that read, and every cold prompt from 8K up, on
+# exactly such readings (2.4 to 2.6 GiB beyond MLX's account, `released_bytes
+# 0`). So before a line over the Mac's supply decides, the reading waits for
+# the footprint to come back within ``_RELEASE_SETTLE_SLACK_BYTES`` of the
+# process's steady overhang, at most ``_RELEASE_SETTLE_MAX_S``.
+_RELEASE_SETTLE_MAX_S = 0.25
+_RELEASE_SETTLE_POLL_S = 0.01
+_RELEASE_SETTLE_SLACK_BYTES = 128 * 1024**2
+
+
+def _footprint_overhang_now() -> int | None:
+    """The process's footprint beyond MLX's own account (active + pool), or
+    None when either cannot be read."""
+
+    stats = _mlx_memory_stats_live()
+    if _allocator_reading_failure(stats) is not None:
+        return None
+    footprint = phys_footprint_bytes()
+    if not footprint:
+        return None
+    return int(footprint) - int(stats.get("active_memory_bytes") or 0) - int(
+        stats.get("cache_memory_bytes") or 0
+    )
+
+
+#: The least footprint beyond MLX's account the last prefill check read: this
+#: process's steady host memory, for a reading that has no request of its own
+#: to learn it from (the admission's first one, which can follow the previous
+#: request's pool release by milliseconds).
+_STEADY_OVERHANG: dict[str, int | None] = {"bytes": None}
+
+
+def _note_steady_overhang(value: int | None) -> None:
+    if isinstance(value, int) and value >= 0:
+        _STEADY_OVERHANG["bytes"] = int(value)
+
+
+def _release_allocator_pool() -> dict[str, Any]:
+    """Give MLX's pool back to the Mac and wait until it has left the
+    footprint (``_RELEASE_SETTLE_MAX_S`` at most), so the next reading of the
+    Mac counts it as free. Returns the pool's bytes and the wait; raises what
+    ``mx.clear_cache`` raises."""
+
+    import mlx.core as _mx
+
+    stats = _mlx_memory_stats_live()
+    pool = 0 if _allocator_reading_failure(stats) is not None else int(
+        stats.get("cache_memory_bytes") or 0
+    )
+    before = phys_footprint_bytes() if pool else None
+    _mx.clear_cache()
+    receipt: dict[str, Any] = {"pool_bytes": pool}
+    if not pool or not before:
+        return receipt
+    started = time.monotonic()
+    line = int(before) - pool + _RELEASE_SETTLE_SLACK_BYTES
+    try:
+        while True:
+            now = phys_footprint_bytes()
+            if not now or now <= line:
+                break
+            if time.monotonic() - started >= _RELEASE_SETTLE_MAX_S:
+                receipt["settle_timed_out"] = True
+                break
+            time.sleep(_RELEASE_SETTLE_POLL_S)
+    except Exception:  # noqa: BLE001 - the wait must never cost a request
+        pass
+    receipt["settle_s"] = round(time.monotonic() - started, 3)
+    return receipt
+
+
+def _settle_released_memory(steady_overhang: int | None) -> dict[str, Any] | None:
+    """Wait until memory MLX gave back has left the footprint.
+
+    Returns None when there is nothing to wait for (no steady figure, an
+    unreadable process, or a footprint already within the slack), else what
+    was waited: seconds, the overhang before and after, and whether the wait
+    ran out. Never raises; never waits longer than ``_RELEASE_SETTLE_MAX_S``.
+    """
+
+    if steady_overhang is None:
+        return None
+    try:
+        before = _footprint_overhang_now()
+        line = int(steady_overhang) + _RELEASE_SETTLE_SLACK_BYTES
+        if before is None or before <= line:
+            return None
+        started = time.monotonic()
+        now = before
+        while now is not None and now > line:
+            if time.monotonic() - started >= _RELEASE_SETTLE_MAX_S:
+                return {
+                    "waited_s": round(time.monotonic() - started, 3),
+                    "overhang_before_bytes": int(before),
+                    "overhang_after_bytes": int(now),
+                    "steady_overhang_bytes": int(steady_overhang),
+                    "timed_out": True,
+                }
+            time.sleep(_RELEASE_SETTLE_POLL_S)
+            now = _footprint_overhang_now()
+        return {
+            "waited_s": round(time.monotonic() - started, 3),
+            "overhang_before_bytes": int(before),
+            "overhang_after_bytes": None if now is None else int(now),
+            "steady_overhang_bytes": int(steady_overhang),
+            "timed_out": False,
+        }
+    except Exception:  # noqa: BLE001 - a measurement wait must never cost a request
+        return None
+
 
 def _generation_call_site(max_depth: int = 12) -> str | None:
     """``function:line`` of the generation frame that asked the per-chunk
@@ -22029,10 +22149,18 @@ class _PrefillSystemGuard:
         # What the request holds before its restore and prefill: the base of
         # the one-forward witness below and of the growth against the price.
         self.base_held: int | None = None
+        # The least footprint beyond MLX's account this request has read
+        # (``_settle_released_memory``), and what the waits for memory MLX gave
+        # back cost it.
+        self.steady_overhang: int | None = None
+        self.settles = 0
+        self.settle_s = 0.0
+        self.settle_last: dict[str, Any] | None = None
         if not self.allow_swap:
             stats = _mlx_memory_stats_live()
             if _allocator_reading_failure(stats) is None:
                 self.base_held = self._request_held(stats)
+            self.steady_overhang = _footprint_overhang_now()
 
     def _request_held(self, stats: Mapping[str, Any]) -> int:
         """MLX's active memory less what the bank's durable entries and its
@@ -22090,13 +22218,14 @@ class _PrefillSystemGuard:
             return False
         self.last_read_s = now_s
         self.checks += 1
-        verdict = self._evaluate()
+        verdict = self._settled(self._evaluate())
         if verdict["reason"] is not None and self.shed is None:
             # The engine's own reusable memory goes back before a request is
-            # refused, and the Mac is read again.
+            # refused, and the Mac is read again once it has left the
+            # footprint.
             self.shed = self._shed_reusable_memory(verdict)
             if self.shed.get("released_bytes") or self.shed.get("pool_bytes"):
-                verdict = self._evaluate()
+                verdict = self._settled(self._evaluate())
             self.shed["request_continued"] = verdict["reason"] is None
             self.shed["reason_before"] = self.shed.pop("_reason_before", None)
             _record_guard_event(self.state, dict(self.shed))
@@ -22137,6 +22266,8 @@ class _PrefillSystemGuard:
                 else None
             ),
             "checks": int(self.checks),
+            "footprint_settles": int(self.settles),
+            "footprint_settle_last": dict(self.settle_last) if self.settle_last else None,
             "shed_before_abort": dict(self.shed) if self.shed is not None else None,
             # What this request grew by since the check was made, against its
             # price: a copy the admission did not expect reads as the gap.
@@ -22144,6 +22275,30 @@ class _PrefillSystemGuard:
             "priced_growth_bytes": self.priced_growth_bytes,
         }
         return True
+
+    def _settled(self, verdict: dict[str, Any]) -> dict[str, Any]:
+        """The verdict again, once memory MLX has just given back has left the
+        footprint, where the Mac's supply line is the one crossed and the
+        footprint sits above this request's steady overhang
+        (``_settle_released_memory``). Counted; at most a quarter second a
+        check."""
+
+        if verdict.get("reason") != "under_abort_floor":
+            return verdict
+        waited = _settle_released_memory(self.steady_overhang)
+        if waited is None:
+            return verdict
+        if waited.get("timed_out") and waited.get("overhang_after_bytes") is not None:
+            # Still there after the wait: memory this process holds, not memory
+            # on its way out. Later checks read it as the steady figure and do
+            # not wait for it again.
+            self.steady_overhang = int(waited["overhang_after_bytes"])
+        verdict = self._evaluate()
+        waited["reason_after"] = verdict.get("reason")
+        self.settles += 1
+        self.settle_s += float(waited.get("waited_s") or 0.0)
+        self.settle_last = waited
+        return verdict
 
     def _evaluate(self) -> dict[str, Any]:
         """Read the engine and the Mac once and name the line crossed, if any."""
@@ -22180,6 +22335,12 @@ class _PrefillSystemGuard:
             engine = int(live) - pool
             if engine + reserve > self.limit:
                 reason = "engine_limit"
+            overhang = fields.get("host_overhang_bytes")
+            if isinstance(overhang, int) and (
+                self.steady_overhang is None or overhang < self.steady_overhang
+            ):
+                self.steady_overhang = overhang
+                _note_steady_overhang(overhang)
         reading = _read_system_memory()
         earlier = self.window.readings()
         base = None
@@ -22356,6 +22517,9 @@ class _PrefillSystemGuard:
             "grew_past_price": (
                 dict(self.grew_past_price) if self.grew_past_price else None
             ),
+            "footprint_settles": int(self.settles),
+            "footprint_settle_s": round(float(self.settle_s), 3),
+            "footprint_settle_last": dict(self.settle_last) if self.settle_last else None,
         }
 
     def _shed_reusable_memory(self, verdict: Mapping[str, Any]) -> dict[str, Any]:
@@ -22373,9 +22537,9 @@ class _PrefillSystemGuard:
             "released_sessions": [],
         }
         try:
-            import mlx.core as _mx
-
-            _mx.clear_cache()
+            released_pool = _release_allocator_pool()
+            if released_pool.get("settle_s") is not None:
+                receipt["pool_settle_s"] = released_pool["settle_s"]
         except Exception as exc:
             receipt["pool_error"] = repr(exc)
         # A line with a size (the engine limit, the Mac's abort floor)
@@ -22425,9 +22589,7 @@ class _PrefillSystemGuard:
                     if isinstance(row, dict)
                 ]
             try:
-                import mlx.core as _mx
-
-                _mx.clear_cache()
+                _release_allocator_pool()
             except Exception:
                 pass
         # This request's own conversation is in flight, so the release above
@@ -22449,9 +22611,7 @@ class _PrefillSystemGuard:
             receipt["released_bytes"] = int(receipt["released_bytes"]) + own_bytes
             if own_bytes > 0:
                 try:
-                    import mlx.core as _mx
-
-                    _mx.clear_cache()
+                    _release_allocator_pool()
                 except Exception:
                     pass
         return receipt
@@ -24797,6 +24957,20 @@ def _run_prefill_admission(
     # prompt, so when it clears both lines the request is admitted without
     # probing the bank.
     cheap = growth(0, True, None, widths[0])
+    if (
+        now["system"] is not None
+        and system_short(now, int(cheap["growth_bytes"]), "shed") > 0
+    ):
+        # The Mac's line looks short: memory the previous request (or MLX at
+        # its own limit) gave back may still be in the footprint for a few
+        # milliseconds. Read the Mac again once it has left
+        # (``_settle_released_memory``); memory that stays is this process's,
+        # and the next request does not wait for it again.
+        waited = _settle_released_memory(_STEADY_OVERHANG["bytes"])
+        if waited is not None:
+            if waited.get("timed_out"):
+                _note_steady_overhang(waited.get("overhang_after_bytes"))
+            now = measure()
     if shed_deficit(now, cheap) <= 0:
         settle(cheap)
         return None
@@ -24962,9 +25136,7 @@ def _run_prefill_admission(
         # only the Mac's line asks for it.
         cache_before = int(now["cache"])
         try:
-            import mlx.core as _mx
-
-            _mx.clear_cache()
+            _release_allocator_pool()
             now = measure()
             chosen = widest_fit(now, models)
             early_pool_clear = {
@@ -24996,9 +25168,7 @@ def _run_prefill_admission(
         )
         if own_moved is not None and int(own_moved.get("entries") or 0) > 0:
             try:
-                import mlx.core as _mx
-
-                _mx.clear_cache()
+                _release_allocator_pool()
             except Exception:
                 pass
             now = measure()
@@ -25115,11 +25285,11 @@ def _run_prefill_admission(
 
     def clear_pool() -> None:
         # Freed buffers sit in the allocator pool until it is cleared; only
-        # then do they reach the free pages the next measurement reads.
+        # then do they reach the free pages the next measurement reads, a few
+        # tens of milliseconds after the clear (``_release_allocator_pool``
+        # waits for them).
         try:
-            import mlx.core as _mx
-
-            _mx.clear_cache()
+            _release_allocator_pool()
             receipt.setdefault("cache_cleared", True)
         except Exception as exc:
             receipt["cache_cleared"] = False

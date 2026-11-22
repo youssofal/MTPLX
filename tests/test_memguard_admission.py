@@ -1376,6 +1376,80 @@ def test_a_detached_refusal_drops_both_of_its_chained_exceptions():
     assert first.__context__ is None
 
 
+class TestReleasedMemoryLeavesTheFootprint:
+    """MLX gives its pool back (on its own at its limit, or when the guard sheds) and the process's footprint
+    keeps those pages for a few tens of milliseconds. 2.13.1 on a simulated 24 GB Mac, Bare Speed, the process
+    read every 20 ms (`x1-fix-24gb-mem`): 2.45 GiB beyond MLX's account 30 ms after a 1.85 GiB pool went back,
+    0.83 GiB (the steady figure) before and 30 ms after. The per-chunk check stopped a cold 8K read on such a
+    reading: the bytes were in neither the pool nor the Mac's free pages."""
+
+    RAM, OTHER_APPS, HOST, ACTIVE = 24 * GIB, int(4.5 * GIB), int(0.83 * GIB), int(15.6 * GIB)
+
+    def _mac(self, monkeypatch, lingering):
+        """``lingering``: footprint beyond the steady host memory at each successive read of the process."""
+        import time as _time
+
+        left = list(lingering)
+        reads = {"n": 0}
+
+        def footprint(*args, **kwargs):
+            reads["n"] += 1
+            extra = left.pop(0) if left else 0
+            return self.ACTIVE + self.HOST + extra
+
+        def reader():
+            fp = self.ACTIVE + self.HOST + (left[0] if left else 0)
+            available = self.RAM - fp - self.OTHER_APPS
+            return sm.SystemMemory(
+                available_bytes=available, total_bytes=self.RAM, level_percent=10, free_bytes=available,
+                file_backed_bytes=0, wired_bytes=18 * GIB, compressor_bytes=GIB, swap_used_bytes=0,
+                monotonic_s=_time.monotonic(),
+            )
+
+        monkeypatch.setattr(sm, "_reader", reader)
+        monkeypatch.setattr(srv, "_PREFILL_SYSTEM_CHECK_INTERVAL_S", 0.0)
+        monkeypatch.setattr(srv, "_RELEASE_SETTLE_POLL_S", 0.0)
+        monkeypatch.setattr(
+            srv, "_mlx_memory_stats_live",
+            lambda: {"ok": True, "active_memory_bytes": self.ACTIVE, "cache_memory_bytes": 0},
+        )
+        monkeypatch.setattr(srv, "phys_footprint_bytes", footprint)
+        state = SimpleNamespace(dashboard=SimpleNamespace(), allow_swap=False,
+                                metal_memory_caps={"memory_limit_bytes": 18 * GIB})
+        return state, reads
+
+    def test_a_read_taken_while_the_pool_leaves_waits_for_it(self, monkeypatch):
+        # The guard learns the steady figure at the request's start, then reads while 1.6 GiB is on its way out.
+        state, _ = self._mac(monkeypatch, [0, int(1.6 * GIB), int(1.6 * GIB), int(0.8 * GIB), 0])
+        guard = srv._PrefillSystemGuard(state, chunk_reserve_bytes=int(0.81 * GIB))
+        assert guard() is False
+        assert guard.settles == 1
+        assert guard.settle_last["timed_out"] is False
+        assert guard.settle_last["reason_after"] is None
+        assert guard.trajectory()["footprint_settles"] == 1
+
+    def test_memory_that_stays_still_stops_the_read(self, monkeypatch):
+        # Held, not leaving: the wait runs out (a quarter second at most) and the Mac's floor stops the read.
+        monkeypatch.setattr(srv, "_RELEASE_SETTLE_MAX_S", 0.02)
+        state, _ = self._mac(monkeypatch, [0] + [int(1.6 * GIB)] * 100000)
+        guard = srv._PrefillSystemGuard(state, chunk_reserve_bytes=int(0.81 * GIB))
+        assert guard() is True
+        assert guard.tripped["reason"] == "under_abort_floor"
+        assert guard.tripped["footprint_settles"] >= 1
+        assert guard.tripped["footprint_settle_last"]["timed_out"] is True
+        # What stayed is this process's: later checks do not wait for it again.
+        assert guard.steady_overhang >= self.HOST + int(1.6 * GIB) - srv._RELEASE_SETTLE_SLACK_BYTES
+
+    def test_a_steady_footprint_is_read_once(self, monkeypatch):
+        # Nothing on its way out: the check reads once, as before.
+        state, reads = self._mac(monkeypatch, [])
+        guard = srv._PrefillSystemGuard(state, chunk_reserve_bytes=int(0.81 * GIB))
+        before = reads["n"]
+        assert guard() is False
+        assert guard.settles == 0
+        assert reads["n"] - before <= 2
+
+
 class _LoopBank:
     def __init__(self, total, max_bytes):
         self.total_nbytes = total

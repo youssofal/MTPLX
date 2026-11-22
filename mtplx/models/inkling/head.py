@@ -30,8 +30,39 @@ def _working_set(device):
     return int(info.get("max_recommended_working_set_size") or 0.7 * int(memory))
 
 
+@lru_cache(maxsize=8)
+def _memory_size(device):
+    info = mx.device_info(mx.default_device())
+    return int(info.get("memory_size") or info.get("total_memory") or 0)
+
+
+#: An engine limit above this share of RAM is not one the server set (MLX's own default is 1.5 working sets).
+_SET_LIMIT_SHARE = 0.8
+
+
+def room_line():
+    """What MLX may hold before a route's extra memory is declined: the GPU's recommended working set, or the
+    engine's memory limit where the server set it higher. macOS recommends two thirds of RAM to the GPU up to
+    36 GB and the memory plan gives the engine three quarters, so on a 24 GB Mac with Bare Speed (15.5 GiB
+    resident at a read) the working set left no room for the one-launch prompt attention past a read's first
+    chunk, though the plan, the admission and the per-chunk check all hold the engine to its 18 GiB (a cold
+    8K read on a simulated 24 GB Mac served 36 of 144 calls on it, 16K and 24K 16 and 14 of 48 in the first
+    chunk and none after; this Mac as itself, every call). The plan's own reads go above the working set by
+    design (the 2.13.1 24 GB read peaks at 16.8 GiB), so the line is the limit the engine is held to."""
+    device = str(mx.default_device())
+    line = _working_set(device)
+    try:
+        limit = int(mx.get_memory_limit())
+    except Exception:  # noqa: BLE001 - an MLX without the call keeps the working set
+        return line
+    memory = _memory_size(device)
+    if memory and limit <= _SET_LIMIT_SHARE * memory:
+        return max(line, limit)
+    return line
+
+
 def fits_route(extra):
-    return mx.get_active_memory() + extra + 128 * 1024**2 < _working_set(str(mx.default_device()))
+    return mx.get_active_memory() + extra + 128 * 1024**2 < room_line()
 
 
 def pack_proofs(path):
