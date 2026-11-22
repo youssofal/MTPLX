@@ -31174,11 +31174,15 @@ def _reject_memory_short_before_stream(state: ServerState, prompt_token_count: i
 
     Sure means: no request is running (whose end would give memory back), and
     the Mac's free and reclaimable memory, plus everything this engine could
-    give back (its allocator pool and every byte the session bank holds), is
-    already under the Mac's abort floor before the request adds a byte. The
-    admission inside the generation still prices every request and refuses
-    the rest; this only moves its certain refusals ahead of the response, so
-    every client shows the message instead of an error event after HTTP 200.
+    give back (its allocator pool, every byte the session bank holds and the
+    snapshots its queued SSD writes hold), is already under the Mac's abort
+    floor before the request adds a byte. The admission reclaims at most
+    those and holds the request to that floor with its growth counted, so it
+    refuses every request this refuses; it returns early in the same cases
+    (no engine limit, nothing loaded, an unreadable Mac). The admission
+    inside the generation still prices every request and refuses the rest;
+    this only moves its certain refusals ahead of the response, so every
+    client shows the message instead of an error event after HTTP 200.
     2.13.1 on a simulated 24 GB Mac, Bare Speed, another app holding a Q3
     GGUF's 13.7 GB: the admission's 507 ("the other apps on this Mac leave
     0.0 GiB free") reached the client 15 ms into an open stream, no token
@@ -31188,6 +31192,10 @@ def _reject_memory_short_before_stream(state: ServerState, prompt_token_count: i
     if bool(getattr(state, "allow_swap", False)) or not _prefill_admission_shed_enabled():
         return None
     try:
+        caps = getattr(state, "metal_memory_caps", None)
+        limit = caps.get("memory_limit_bytes") if isinstance(caps, dict) else None
+        if not isinstance(limit, int) or limit <= 0:
+            return None
         in_flight = getattr(getattr(state, "dashboard", None), "in_flight", None)
         if in_flight is not None and int(in_flight.count()) > 0:
             return None
@@ -31197,9 +31205,15 @@ def _reject_memory_short_before_stream(state: ServerState, prompt_token_count: i
         stats = _mlx_memory_stats_live()
         if _allocator_reading_failure(stats) is not None:
             return None
+        if int(stats.get("active_memory_bytes") or 0) <= 0:
+            return None
         pool = int(stats.get("cache_memory_bytes") or 0)
         bank = getattr(getattr(state, "sessions", None), "bank", None)
-        banked = int(getattr(bank, "total_nbytes", 0) or 0) if bank is not None else 0
+        banked = 0
+        if bank is not None:
+            banked = int(getattr(bank, "total_nbytes", 0) or 0) + int(
+                getattr(bank, "queued_persistence_bytes", 0) or 0
+            )
         _shed, abort = _system_admission_floors(reading, 0)
         if int(reading.available_bytes) + pool + banked >= int(abort):
             return None

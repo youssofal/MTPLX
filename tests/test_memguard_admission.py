@@ -1450,6 +1450,136 @@ class TestReleasedMemoryLeavesTheFootprint:
         assert reads["n"] - before <= 2
 
 
+class TestRefusedBeforeTheStream:
+    """A request the admission is sure to refuse gets its 507 before the stream opens. 2.13.1 on a simulated 24 GB
+    Mac, Bare Speed, another app holding a Q3 GGUF's 13.7 GB: HTTP 200, then the admission's 507 as an error event
+    15 ms later, no token (`x1-fix-24gb-hog`). Sure: nothing in flight, and the Mac's free memory plus all the engine
+    could give back (its pool, its bank, the snapshots queued SSD writes hold) is under the abort floor (here
+    18 GiB wired / 16 = 1.125 GiB) before the request adds a byte."""
+
+    RAM = 24 * GIB
+
+    def _mac(self, monkeypatch, *, available_gib, pool_gib=0.0, bank_gib=0.0, queued_gib=0.0, in_flight=0,
+             limit=18 * GIB):
+        import time as _time
+
+        available = int(available_gib * GIB)
+
+        def reader():
+            return sm.SystemMemory(
+                available_bytes=available, total_bytes=self.RAM, level_percent=2, free_bytes=available,
+                file_backed_bytes=0, wired_bytes=18 * GIB, compressor_bytes=GIB, swap_used_bytes=0,
+                monotonic_s=_time.monotonic(),
+            )
+
+        monkeypatch.setattr(sm, "_reader", reader)
+        monkeypatch.setitem(srv._STEADY_OVERHANG, "bytes", None)
+        monkeypatch.setattr(
+            srv, "_mlx_memory_stats_live",
+            lambda: {"ok": True, "active_memory_bytes": 15 * GIB, "cache_memory_bytes": int(pool_gib * GIB)},
+        )
+        events: list[dict] = []
+        monkeypatch.setattr(srv, "_record_guard_event", lambda state, payload: events.append(payload))
+        bank = SimpleNamespace(total_nbytes=int(bank_gib * GIB), queued_persistence_bytes=int(queued_gib * GIB))
+        state = SimpleNamespace(
+            allow_swap=False,
+            metal_memory_caps={"memory_limit_bytes": limit} if limit else None,
+            dashboard=SimpleNamespace(in_flight=SimpleNamespace(count=lambda: in_flight)),
+            sessions=SimpleNamespace(bank=bank),
+        )
+        return state, events
+
+    def test_a_mac_already_under_its_floor_is_refused_before_the_stream(self, monkeypatch):
+        from fastapi import HTTPException
+
+        state, events = self._mac(monkeypatch, available_gib=0.0)
+        with pytest.raises(HTTPException) as caught:
+            srv._reject_memory_short_before_stream(state, 4049)
+        assert caught.value.status_code == 507
+        detail = caught.value.detail
+        assert detail["code"] == "insufficient_memory"
+        assert "0.0 GiB free" in detail["message"] and "Close some apps" in detail["message"]
+        assert detail["memory"]["refusal_reason"] == "system_memory_short_before_request"
+        assert detail["memory"]["prompt_tokens"] == 4049
+        [event] = events
+        assert event["action"] == "memory_refused_before_stream"
+
+    def test_everything_the_engine_could_give_back_counts(self, monkeypatch):
+        from fastapi import HTTPException
+
+        # 0.3 free + 0.3 pool + 0.3 banked = 0.9 GiB, under 1.125: refused.
+        state, _ = self._mac(monkeypatch, available_gib=0.3, pool_gib=0.3, bank_gib=0.3)
+        with pytest.raises(HTTPException):
+            srv._reject_memory_short_before_stream(state, 300)
+        # 0.3 GiB more held by queued SSD writes, which the admission can cancel: 1.2 GiB, left to the admission.
+        state, events = self._mac(monkeypatch, available_gib=0.3, pool_gib=0.3, bank_gib=0.3, queued_gib=0.3)
+        assert srv._reject_memory_short_before_stream(state, 300) is None
+        assert events == []
+
+    def test_every_other_case_is_left_to_the_admission(self, monkeypatch):
+        for kwargs in (
+            {"in_flight": 1},  # a request running now gives memory back when it ends
+            {"limit": None},  # no engine limit: the admission admits without pricing
+            {"available_gib": 2.0},  # over the floor: the admission prices the request's growth
+        ):
+            state, events = self._mac(monkeypatch, **{"available_gib": 0.0, **kwargs})
+            assert srv._reject_memory_short_before_stream(state, 4049) is None, kwargs
+            assert events == []
+        state, _ = self._mac(monkeypatch, available_gib=0.0)
+        state.allow_swap = True
+        assert srv._reject_memory_short_before_stream(state, 4049) is None
+
+    def test_the_admission_refuses_every_request_it_refuses(self, monkeypatch):
+        """On the real bank and admission: as another app takes more of the Mac, the early 507 starts only where
+        the admission, after giving back the pool and the idle conversation, refuses too."""
+
+        from fastapi import HTTPException
+        import time as _time
+
+        verdicts = []
+        # The hog replay's 4K turn: 0.32 GiB banked from the short prompt before it, an empty pool, 0.0 GiB free.
+        for others_gib in (6.0, 9.0, 9.8, 10.3, 10.6, 11.5):
+            manager = _manager()
+            _put(manager.bank, range(10_000), session_id="anon-idle", row_bytes=FN_ROW)  # 0.30 GiB
+            machine = _Machine(manager.bank, base_gib=12.0, cache_gib=0.1, host_gib=0.8)
+            _install(monkeypatch, machine)
+            others = int(others_gib * GIB)
+
+            def reader(machine=machine, others=others):
+                fp = machine.footprint()
+                available = max(0, self.RAM - fp - others)
+                return sm.SystemMemory(
+                    available_bytes=available, total_bytes=self.RAM, level_percent=2, free_bytes=available,
+                    file_backed_bytes=0, wired_bytes=min(self.RAM, fp + 2 * GIB), compressor_bytes=GIB,
+                    swap_used_bytes=0, monotonic_s=_time.monotonic(),
+                )
+
+            monkeypatch.setattr(sm, "_reader", reader)
+            monkeypatch.setitem(srv._STEADY_OVERHANG, "bytes", None)
+            state = _flash_next_state(manager, limit_gib=18)
+            state.dashboard = SimpleNamespace(in_flight=SimpleNamespace(count=lambda: 0))
+            try:
+                srv._reject_memory_short_before_stream(state, 300)
+                early = False
+            except HTTPException as exc:
+                assert exc.status_code == 507
+                early = True
+            receipt = srv._prefill_admission_shed(
+                state, prompt_ids=list(range(2_000_000, 2_000_300)), session_bank=manager.bank,
+                session_id="anon-new",
+            )
+            refused = bool(receipt and receipt.get("refused"))
+            verdicts.append((others_gib, early, refused))
+            if early:
+                assert refused, verdicts
+                assert receipt["refusal_reason"] == "system_memory_short_after_reclamation"
+        # Not vacuous: some early refusals, a band the admission alone refuses (the request's own growth), and
+        # requests both admit.
+        assert any(early for _, early, _ in verdicts), verdicts
+        assert any(refused and not early for _, early, refused in verdicts), verdicts
+        assert any(not refused for _, _, refused in verdicts), verdicts
+
+
 class _LoopBank:
     def __init__(self, total, max_bytes):
         self.total_nbytes = total
