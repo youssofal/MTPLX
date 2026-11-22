@@ -47,6 +47,7 @@
  "context_copy_capacity_growths": 0,
  "context_copy_disabled_reason": null,
  "context_copy_drafted_tokens": 0,
+ "context_copy_index_reused_tokens": 0,
  "context_copy_probes": 0,
  "context_copy_rounds": 0,
  "context_copy_suspended": false,
