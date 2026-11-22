@@ -95,3 +95,72 @@ def test_an_admitted_shape_keeps_mlx_bits_on_later_calls(monkeypatch, rows, shap
         want = x @ w.T
         mx.eval(got, want)
         assert same(got, want), (rows, shape, draw)
+
+
+def _fresh(monkeypatch):
+    """A process in which the launch has not been built, broken or admitted yet (restored after the test)."""
+    monkeypatch.delenv("MTPLX_INKLING_PROMPT_KERNELS", raising=False)
+    monkeypatch.setattr(PG, "_built", set())
+    monkeypatch.setattr(PG, "_broken", {})
+    monkeypatch.setattr(PG, "_admitted", {})
+
+
+def _serves_mlx_products(where, rows=512):
+    ws = matrices(rows + 3)
+    x = mx.random.normal((1, rows, 2304), key=mx.random.key(rows + 4)).astype(mx.bfloat16)
+    got = PG.project(x, ws, where)
+    want = [x @ w.T for w in ws]
+    mx.eval(got, want)
+    return all(same(a, b) for a, b in zip(got, want))
+
+
+def test_a_launch_the_compiler_refuses_leaves_mlx_products_serving_for_the_process(monkeypatch):
+    # F1's F-1: the launch is built at run time from the installed MLX's headers. On a Mac whose compiler refuses
+    # it, a prompt chunk's projections take MLX's products and the request is served: counted, logged once, and
+    # every later call keeps MLX's products without building again.
+    _fresh(monkeypatch)
+    broken = mx.fast.metal_kernel(
+        name="mtplx_test_refused_projection", input_names=["x"] + ["w%d" % i for i in range(PG.MAX_MATRICES)]
+        + ["layout"], output_names=["y%d" % i for i in range(PG.MAX_MATRICES)], source="this is not Metal;")
+    monkeypatch.setattr(PG, "_kernel", lambda: broken)
+    before = PG.counts().get("refused.mlx.launch_error", 0)
+    assert _serves_mlx_products("refused")
+    assert PG._broken and PG.counts().get("refused.mlx.launch_error", 0) == before + 1
+    assert _serves_mlx_products("refused", rows=2048)
+    assert PG.counts().get("refused.mlx.launch_error", 0) == before + 2
+    assert PG._built == set()
+
+
+def test_a_launch_that_fails_when_called_is_contained_too(monkeypatch):
+    _fresh(monkeypatch)
+
+    def fails(x, matrices):
+        raise RuntimeError("forced launch failure")
+
+    monkeypatch.setattr(PG, "_launch", fails)
+    before = PG.counts().get("failed.mlx.launch_error", 0)
+    assert _serves_mlx_products("failed", rows=96)
+    assert PG.counts().get("failed.mlx.launch_error", 0) == before + 1
+    assert "forced launch failure" in PG._broken["why"]
+
+
+def test_a_built_launch_is_built_once_per_variant_and_keeps_mlx_bits(monkeypatch):
+    _fresh(monkeypatch)
+    assert _serves_mlx_products("built", rows=2048)
+    assert PG._built == {(str(mx.bfloat16), len(SHAPES), 2304)} and not PG._broken
+
+
+def test_declines_reach_the_requests_attention_receipt_and_health(monkeypatch):
+    # F1's F-3: a projection that keeps MLX's product is counted where the attention's own declines are: the
+    # request's receipt (the request row's inkling_attention) and the process totals (/health).
+    from mtplx.models.inkling import attention as A
+
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_KERNELS", "mlx")
+    receipt = {"graph_selections": {}}
+    token = A._request.set((receipt, None))
+    try:
+        PG.project(mx.zeros((64, 2304), mx.bfloat16), matrices(4)[:1], "seen")
+    finally:
+        A._request.reset(token)
+    assert receipt["graph_selections"].get("prompt_projection.seen.mlx.disabled") == 1
+    assert A.attention_health()["process_graph_selections"].get("prompt_projection.seen.mlx.disabled", 0) >= 1

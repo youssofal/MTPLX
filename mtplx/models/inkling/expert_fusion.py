@@ -576,15 +576,20 @@ def _without_tensor_units():
     return not nax_available()
 
 
-def prompt_kernels():
-    """Whether the prompt route's pair sort and expert products run as our launches
-    (``fast.prompt_experts``: tensor-unit GPUs with readable MLX headers), else MLX's argsorts,
-    gathers and sorted products. ``MTPLX_INKLING_PROMPT_KERNELS=mlx`` keeps MLX's."""
+def prompt_kernels_unserved():
+    """None where the prompt route's pair sort and expert products run as our launches
+    (``fast.prompt_experts``: tensor-unit GPUs with readable MLX headers), else why MLX's argsorts,
+    gathers and sorted products run. ``MTPLX_INKLING_PROMPT_KERNELS=mlx`` keeps MLX's."""
     if os.environ.get("MTPLX_INKLING_PROMPT_KERNELS", "ours").strip().lower() in ("mlx", "0", "off", "stock"):
-        return False
+        return "disabled"
     from .fast import prompt_experts
 
-    return prompt_experts.available()[0]
+    ok, why = prompt_experts.available()
+    return None if ok else (why or "unavailable")
+
+
+def prompt_kernels():
+    return prompt_kernels_unserved() is None
 
 
 def routed_sorted(block, flat, linear, trace=None, variant=None, fast=False, invariant=False):
@@ -619,6 +624,10 @@ def routed_sorted(block, flat, linear, trace=None, variant=None, fast=False, inv
     bits, group = (4, 16) if fp4 else (8, 32)
     scalars = [(rows,)] if fp4 else []
     ours = prompt_kernels()
+    if not ours:  # MLX's sort and products: counted in the request's attention receipt and /health
+        from .attention import _note_route
+
+        _note_route(f"prompt_experts.products.mlx.{prompt_kernels_unserved() or 'unavailable'}")
     # MLX multiplies sorted pairs on its tile kernel only from 4 pairs an expert on; below that each
     # pair is its one-row product. An NVFP4 product's sums are exact, so either is ours; an MXFP8
     # block below that keeps MLX's products (and the fast route's MXFP8 gate-up its panel).

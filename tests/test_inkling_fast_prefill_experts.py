@@ -202,3 +202,23 @@ def test_without_the_tensor_units_the_fast_route_takes_the_sorted_product(monkey
     mx.eval(block(hidden))
     assert taken() == before + int(expect_fast)
 
+
+
+def test_mlx_products_in_the_prompt_route_are_counted_in_the_request(monkeypatch):
+    # F1's F-3: where the sort and products are MLX's (no tensor units, or the switch), the prompt route says so
+    # in the request's attention receipt and /health, beside the expert block's own route counters.
+    from mtplx.models.inkling import attention as A
+
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_KERNELS", "mlx")
+    block = synthetic_block("nvfp4", seed=13)
+    flat = hidden_rows(512, seed=41).reshape(-1, 2304)
+    receipt = {"graph_selections": {}}
+    token = A._request.set((receipt, None))
+    try:
+        got = EF.routed_sorted(block, flat, M.linear)
+    finally:
+        A._request.reset(token)
+    want = block.stock(flat.reshape(1, 512, 2304)).reshape(512, 2304)
+    mx.eval(got, want)
+    assert same(got, want)
+    assert receipt["graph_selections"] == {"prompt_experts.products.mlx.disabled": 1}

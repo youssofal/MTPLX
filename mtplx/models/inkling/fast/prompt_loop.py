@@ -48,6 +48,10 @@ def counts():
 def _count(key):
     with _lock:
         _counts[key] += 1
+    if ".mlx." in key:  # a decline: also in the request's attention receipt and /health
+        from .. import attention
+
+        attention._note_route("prompt_loop." + key)
 
 
 def _f32_bits(value):

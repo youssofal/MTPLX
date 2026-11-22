@@ -16,7 +16,12 @@ float32 sum usually round to the same 16-bit value, and on a small output every 
 45-row key projection did so once and then differed on 22 of 28 later calls). A shape that does not match keeps
 MLX's product, counted. ``MTPLX_INKLING_PROMPT_KERNELS=mlx`` keeps MLX's products everywhere.
 
-Tensor-unit GPUs, bf16 or float32 operands, row-major matrices whose depth is a multiple of 32.
+Tensor-unit GPUs, bf16 or float32 operands, row-major matrices whose depth is a multiple of 32. The launch is
+built at run time from the installed MLX's headers: each variant (type, matrices, depth) is built and run once on
+one row before its first real use, and a launch that fails to build or run on this Mac (or fails its first use)
+turns the launch off for the life of the process: MLX's products serve every later call, counted
+``<where>.mlx.launch_error`` and logged once, and the request is served. Declines are also counted into the
+request's attention receipt and ``/health`` (``prompt_projection.*``).
 
 With the prompt read's ``invariant`` part (``fast/prompt_route.py``, off by default) every shape and every row
 count takes the launch, without the comparison: each output element is then summed in the same order whatever
@@ -36,6 +41,8 @@ _log = logging.getLogger(__name__)
 _lock = Lock()
 _counts: Counter = Counter()
 _admitted: dict = {}
+_built: set = set()      # launch variants (type, matrices, depth) built and run once on this Mac
+_broken: dict = {}       # set once a launch failed to build or run: MLX's products for the life of the process
 
 MAX_MATRICES = 6
 BLOCK_ROWS = 64
@@ -87,6 +94,10 @@ def counts():
 def _count(key):
     with _lock:
         _counts[key] += 1
+    if ".mlx." in key:
+        from .. import attention
+
+        attention._note_route("prompt_projection." + key)
 
 
 @lru_cache(maxsize=1)
@@ -192,6 +203,8 @@ def _unserved(x, matrices, invariant=False):
         return "rows"
     if not available()[0]:
         return "unavailable"
+    if _broken:
+        return "launch_error"
     if not 1 <= len(matrices) <= MAX_MATRICES:
         return "matrices"
     if x.dtype not in (mx.bfloat16, mx.float32) or x.shape[-1] % 32:
@@ -202,14 +215,43 @@ def _unserved(x, matrices, invariant=False):
     return None
 
 
+def _variant_built(dtype, mats, depth):
+    """Build and run this launch variant once, on one row, before its first real use: a compiler or GPU that
+    refuses it fails here, outside the forward's own graph."""
+    spec = (str(dtype), mats, depth)
+    with _lock:
+        if spec in _built:
+            return
+    one = mx.zeros((1, depth), dtype=dtype)
+    mx.eval(_launch(one, [one] * mats))
+    with _lock:
+        _built.add(spec)
+
+
 def project(x, matrices, where):
     """``[x @ w.T for w in matrices]`` (each ``(…, N_i)`` in x's type), as one launch where every shape has been
-    admitted, else as MLX's products (counted under ``where``). ``x``: ``(…, K)``; ``matrices``: ``(N_i, K)``."""
+    admitted, else as MLX's products (counted under ``where``). ``x``: ``(…, K)``; ``matrices``: ``(N_i, K)``.
+    A launch that fails to build, run or pass its first use leaves MLX's products serving for the process."""
     invariant = _invariant()
     reason = _unserved(x, matrices, invariant)
     if reason is not None:
         _count(f"{where}.mlx.{reason}")
         return [x @ w.T for w in matrices]
+    try:
+        _variant_built(x.dtype, len(matrices), x.shape[-1])
+        return _project(x, matrices, where, invariant)
+    except (RuntimeError, ValueError, TypeError) as exc:
+        with _lock:
+            first = not _broken
+            _broken.setdefault("why", f"{type(exc).__name__}: {exc}"[:400])
+        if first:
+            _log.warning("Inkling prompt projections keep MLX's products for this process: the launch failed (%s)",
+                         _broken["why"])
+        _count(f"{where}.mlx.launch_error")
+        return [x @ w.T for w in matrices]
+
+
+def _project(x, matrices, where, invariant):
     lead = x.shape[:-1]
     flat = x.reshape(-1, x.shape[-1])
     if invariant:

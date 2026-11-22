@@ -450,3 +450,26 @@ def test_a_restored_prefix_is_copied_once_into_the_sized_bank(monkeypatch):
     want_k = mx.concatenate([k0, k1], axis=2)
     assert bool(mx.array_equal(keys.view(mx.uint16), want_k.view(mx.uint16)).item())
     assert kv.keys.shape[2] == 3072
+
+
+def test_a_rotated_window_takes_the_librarys_write_and_says_so():
+    # F1's F-3: once an answer has wrapped a window ring, the next chunk's write is the library's update (same
+    # values), counted in the request's attention receipt instead of passing silently.
+    from mtplx.models.inkling import attention as A
+
+    kv, lib = WindowCache(max_size=1024), WindowCache(max_size=1024)
+    for cache in (kv, lib):
+        cache.update_and_fetch(*_rows(1100, 300))
+        for step in range(3):                                      # three decode steps wrap the ring
+            cache.update_and_fetch(*_rows(1, 310 + step))
+    assert kv._idx != kv.keys.shape[2]
+    receipt = {"graph_selections": {}}
+    token = A._request.set((receipt, None))
+    try:
+        k, v = _rows(64, 320)
+        got, want = F.window_update(kv, k, v), lib.update_and_fetch(k, v)
+    finally:
+        A._request.reset(token)
+    mx.eval(got, want)
+    assert all(bool(mx.array_equal(a.view(mx.uint16), b.view(mx.uint16)).item()) for a, b in zip(got, want))
+    assert receipt["graph_selections"] == {"prompt_stage.window.write.library.rotated": 1}

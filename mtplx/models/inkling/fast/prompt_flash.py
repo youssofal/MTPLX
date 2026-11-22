@@ -529,8 +529,14 @@ def window_update(kv, keys, values):
     window built by one launch; the library's own update where its window is not in time order
     (a ring rotated by decode) or it keeps leading rows."""
     old = kv.keys
-    if (old is None or keys.shape[2] < 2 or getattr(kv, "keep", 0) != 0 or kv._idx != old.shape[2]
-            or kv.values.shape != old.shape or old.dtype != keys.dtype):
+    library = (None if old is None else "rows" if keys.shape[2] < 2 else "keep" if getattr(kv, "keep", 0) != 0
+               else "rotated" if kv._idx != old.shape[2] else "layout" if kv.values.shape != old.shape
+               else "dtype" if old.dtype != keys.dtype else "")
+    if library != "":
+        if library is not None:  # a window with history written by the library's update: counted, same values
+            from .. import attention as A
+
+            A._note_route("prompt_stage.window.write.library." + library)
         return kv.update_and_fetch(keys, values)
     start = max(0, kv._idx - kv.max_size + 1)
     rows = keys.shape[2]
