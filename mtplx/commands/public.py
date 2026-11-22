@@ -956,6 +956,28 @@ def _model_draft_lm_head_spec(
         return fallback
 
 
+def _draft_lm_head_spec_for_runtime(
+    spec: dict[str, Any] | None,
+    rt: Any,
+    args: Any,
+) -> dict[str, Any] | None:
+    """The draft-head spec a loaded model takes: none when its backend drafts on its own.
+
+    The profile names a quantized draft head for every model; the server installs it only
+    when the loaded backend's descriptor uses one (`mtplx/server/openai.py`). The in-process
+    paths (`mtplx run`, `ask`, `chat`, quickstart's terminal chat) installed it on every
+    model, so on Inkling 2 Mini, which drafts with its own drafter and has no `lm_head` to
+    quantize, they stopped with "model has no lm_head and does not tie output projection
+    to embeddings" before the first token.
+    """
+
+    if spec is None:
+        return None
+    from mtplx.backends.descriptors import descriptor_from_runtime
+
+    return spec if descriptor_from_runtime(rt, args).uses_draft_lm_head else None
+
+
 def _model_draft_sampler_spec(
     inspection: dict[str, Any],
     profile: Any,
@@ -11084,6 +11106,7 @@ def _generate_one_shot_public(
 
     try:
         rt = load(runtime_model, mtp=getattr(args, "load_mtp", True) is not False)
+        draft_lm_head = _draft_lm_head_spec_for_runtime(draft_lm_head, rt, args)
         draft_report = None
         if (
             draft_lm_head is not None
@@ -15158,6 +15181,7 @@ def _quickstart_run_terminal_chat_body(
         progress.set_subtitle("ready")
     _quickstart_line(f"Model ready in {time.perf_counter() - started:.1f}s")
     _quickstart_line(f"Generation mode: {_generation_mode_label(generation_mode)}")
+    draft_lm_head = _draft_lm_head_spec_for_runtime(draft_lm_head, rt, args)
     draft_report = None
     if draft_lm_head is not None:
         _quickstart_line(

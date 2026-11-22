@@ -1024,6 +1024,43 @@ def test_one_shot_never_drains_an_interactive_stdin(monkeypatch):
         public._generate_one_shot_public(_one_shot_args(), command="run")
 
 
+@pytest.mark.parametrize("backend_id,installs", [("inkling2_loop", False), ("qwen3_next", True)])
+def test_one_shot_installs_the_draft_head_only_where_the_backend_uses_one(monkeypatch, backend_id, installs):
+    """`mtplx run` on Inkling 2 Mini stopped before its first token (22 November 2026, the 2.13 wheel):
+    the one-shot path installed the profile's quantized draft head on every model it loaded, and Inkling
+    drafts with its own drafter and has no `lm_head` ("model has no lm_head and does not tie output
+    projection to embeddings"). The server installs the head only where the backend's descriptor uses one;
+    `run`, `ask` and `chat` now follow the same descriptor."""
+
+    _stub_one_shot_generation(monkeypatch)
+    loaded = SimpleNamespace(tokenizer=object(), model=object(), mtp_enabled=True, backend_id=backend_id)
+    monkeypatch.setattr(sys.modules["mtplx.runtime"], "load", lambda *a, **kw: loaded)
+    import mtplx.draft_lm_head as draft_lm_head
+
+    calls: list[dict] = []
+
+    def _install(rt, **kwargs):
+        assert rt is loaded
+        calls.append(kwargs)
+        return {"installed": True}
+
+    monkeypatch.setattr(draft_lm_head, "_install_draft_lm_head", _install)
+    code, _payload, _validations = public._generate_one_shot_public(
+        _one_shot_args(prompt="hi"), command="run"
+    )
+    assert code == 0
+    assert bool(calls) is installs
+
+
+def test_the_draft_head_spec_follows_the_loaded_backend():
+    spec = {"bits": 4, "group_size": 64, "mode": "affine"}
+    args = SimpleNamespace()
+    helper = getattr(public, "_draft_lm_head_spec_for_runtime")
+    assert helper(spec, SimpleNamespace(backend_id="inkling2_loop"), args) is None
+    assert helper(spec, SimpleNamespace(backend_id="qwen3_next"), args) == spec
+    assert helper(None, SimpleNamespace(backend_id="qwen3_next"), args) is None
+
+
 def test_piped_prompt_text_survives_an_unreadable_stdin(monkeypatch):
     """A captured or detached stdin means "no piped prompt", not a crash."""
 
