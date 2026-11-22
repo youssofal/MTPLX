@@ -9,6 +9,8 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.cache import ArraysCache, KVCache
 
+from mtplx import moe_sorted_gather
+
 from .attention import attend
 from .cache import WindowCache
 from .activations import expert_inputs
@@ -232,7 +234,7 @@ class PackedExperts(nn.Module):
         inputs, row_scales = expert_inputs(rows, self.mode)
         if self.affine is not None:
             w = self.affine
-            result = mx.gather_qmm(
+            result = moe_sorted_gather.gather_qmm(
                 inputs,
                 w.codes,
                 w.scales,
@@ -250,7 +252,7 @@ class PackedExperts(nn.Module):
             return result.astype(rows.dtype)
 
         def product(grouped):
-            return mx.gather_qmm(
+            return moe_sorted_gather.gather_qmm(
                 inputs[row_ids] if grouped else inputs,
                 self.codes,
                 scales=self.scales,

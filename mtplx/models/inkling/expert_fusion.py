@@ -58,6 +58,7 @@ from threading import RLock
 
 import mlx.core as mx
 
+from mtplx import moe_sorted_gather
 from mtplx.kernels.first_use import Mismatch, ProofCache
 
 NAME = "inkling_expert_fusion"
@@ -696,7 +697,7 @@ def routed_sorted(block, flat, linear, trace=None, variant=None, fast=False, inv
             # The stock body's grouped form (its rows gathered in sorted order, one sorted matrix
             # product), which its measured route proves equal to the indexed form before using it
             # (NVFP4); the fast route takes it for MXFP8 too.
-            raw13 = mx.gather_qmm(
+            raw13 = moe_sorted_gather.gather_qmm(
                 values[sorted_rows], block.gate_up.codes, scales=block.gate_up.scales,
                 rhs_indices=sorted_experts, group_size=group, bits=bits, mode=block.gate_up.mode,
                 sorted_indices=True,
@@ -726,7 +727,7 @@ def routed_sorted(block, flat, linear, trace=None, variant=None, fast=False, inv
             if rounded else None)
         rounded2 = rounded
     else:
-        raw2 = mx.gather_qmm(
+        raw2 = moe_sorted_gather.gather_qmm(
             mid, block.down.codes, scales=block.down.scales, rhs_indices=sorted_experts,
             group_size=group, bits=bits, mode=block.down.mode, sorted_indices=True,
         )
