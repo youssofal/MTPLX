@@ -355,6 +355,26 @@ def _checkpoint_runtime(text, draft):
     return rt
 
 
+def _catalog_runtime():
+    """The catalog geometry with the model fields the banks' rounding reads; no pool, no load arrays."""
+    import mlx.core as mx
+
+    from mtplx.models.inkling.layout import layer_visits
+
+    rt = _checkpoint_runtime(_CATALOG_TEXT, _CATALOG_DRAFT)
+    local = set(_CATALOG_TEXT["local_layer_ids"])
+    rt.model = SimpleNamespace(
+        config=_CATALOG_TEXT,
+        visit_order=layer_visits(_CATALOG_TEXT),
+        layers=[SimpleNamespace(sliding=i in local) for i in range(_CATALOG_TEXT["num_hidden_layers"])],
+        embed_tokens=SimpleNamespace(weight=SimpleNamespace(dtype=mx.bfloat16)),
+    )
+    rt.engine_pool_bytes = 0
+    rt.load_extra_bytes = 0
+    rt.prompt_chunk_rows = lambda prompt_tokens=None: 512
+    return rt
+
+
 def test_a_checkpoint_is_priced_at_what_its_snapshot_copies():
     """Real target and drafter caches after a read longer than the window: a checkpoint copies every ring's
     last window and every convolution tail, and none of the global KV (trimmed instead). Its price is exactly
@@ -431,12 +451,14 @@ def test_a_tight_mac_keeps_one_restore_checkpoint_one_whose_window_memory_sets_t
 
 def test_the_server_plans_with_the_checkpoints_the_reads_keep():
     """The server's plan inputs for Inkling: the forward plus two checkpoints wherever memory sets the window
-    (24, 32 and 36 GB with Bare Speed), plus eight from 48 GB; the tight rule always has one."""
+    (24, 32 and 36 GB with Bare Speed), plus eight from 48 GB; the tight rule always has one. The next turn's
+    reserve follows the same checkpoints: what the conversation keeps is what its next turn is billed again."""
     from mtplx.server.openai import _family_reserve_inputs
 
     gib = 2**30
-    rt = _checkpoint_runtime(_CATALOG_TEXT, _CATALOG_DRAFT)
+    rt = _catalog_runtime()
     forward, record = InklingRuntime.FORWARD_WORKING_BYTES, 179_999_232
+    held = 179_999_232 + 134_217_728 + 4095 * 36864  # rings, banks' rounding, one bank step less a row
     for ram, kept in ((24, 2), (32, 2), (36, 2), (48, 8), (128, 8)):
         inputs = dict(total_ram_bytes=ram * gib, model_weights_bytes=15_993_374_536, kv_bytes_per_token=32768,
                       aux_bytes_per_token=4096, attention_kv_copy_bytes_per_token=4096,
@@ -446,7 +468,73 @@ def test_the_server_plans_with_the_checkpoints_the_reads_keep():
         assert inputs["tight_runtime_transients_bytes"] == forward + record
         assert inputs["tight_machine_measured"] is True
         assert inputs["tight_window_tokens"] == InklingRuntime.TIGHT_WINDOW_TOKENS == 32768
+        assert inputs["turn_reserve_bytes"] == held + kept * record, ram
+        assert inputs["tight_turn_reserve_bytes"] == held + record
     # A runtime without the hook (every other family) keeps its inputs.
     untouched = {"total_ram_bytes": 24 * gib}
     _family_reserve_inputs(SimpleNamespace(), untouched, plan_memory)
     assert untouched == {"total_ram_bytes": 24 * gib}
+
+
+def test_every_conversation_inside_the_window_can_take_its_next_turn():
+    """A turn that continues its conversation in place is billed state the conversation already holds: the
+    windows term (rings, the banks' rounding), a second set of checkpoints, and new rows its last bank step may
+    already hold. On a simulated 24 GB budget (22 November, `mtplx serve`) a 20-token turn after a 32,233-token
+    conversation was 111 MB over the engine limit and refused after its stream opened. The plan now keeps that
+    turn's bill (``turn_reserve_bytes``), so the window is one every conversation in it can take its next turn in."""
+    from mtplx.server.openai import _family_reserve_inputs
+
+    gib = 2**30
+    rt = _catalog_runtime()
+    record, live, copy = 179_999_232, 36864, 4096
+    geometry = _AdmissionGeometry(live, live, 0, 3 * gib, 15_993_374_536, resident_bytes_per_token=live,
+                                  resident_fixed_bytes=InklingRuntime.window_cache_bytes(rt),
+                                  prefill_fixed_bytes=InklingRuntime.window_cache_bytes(rt),
+                                  prefill_windows=lambda prompt, new: InklingRuntime.prefill_window_bytes(rt, prompt, new),
+                                  aux_bytes_per_token=4096, attention_kv_copy_bytes_per_token=copy)
+    window = 24576
+    for few, tight in ((True, True), (True, False), (False, False)):
+        kept = InklingRuntime.checkpoints_kept(rt, few, tight)
+        working = InklingRuntime.prefill_working_bytes(rt, few=few, tight=tight)
+        # What the plan commits at the window: its fixed part, the per-token price, the read's reserve.
+        committed = InklingRuntime.plan_fixed_bytes(rt) + window * (live + copy) + working
+
+        def projected(conversation, new):
+            # MLX active once the conversation ends (its banks in whole steps, its rings, its checkpoints), plus
+            # the admission's bill for a turn that continues it in place.
+            held = -(-conversation // 4096) * 4096 * live + InklingRuntime.ring_bytes(rt) + kept * record
+            growth = _admission_growth(geometry, prompt_tokens=conversation + new, reused_tokens=conversation,
+                                       restore_copies_prefix=False, layout="contiguous_dense_decode",
+                                       source_layout="contiguous_dense_decode", output_tokens=64, publish=True,
+                                       scratch_bytes=InklingRuntime.prefill_working_bytes(rt, 512, few=few, tight=tight),
+                                       publish_bytes=record)
+            return held + growth["growth_bytes"]
+
+        worst = projected(window - 4095, 4094)  # just past a bank step, then a tool result that fills the window
+        short = projected(window - 21, 20)
+        reserve = InklingRuntime.turn_reserve_bytes(rt, few=few, tight=tight)
+        assert short < worst > committed, (few, tight)  # the read's reserve alone does not cover the turn
+        assert committed + reserve - worst == live + copy, (few, tight)  # the reserve covers it, to one token
+    # The windows this gives the served inputs (the plan's fixed part as served on Bare Speed): 24 GB stops at
+    # 24,576 (32,768 before), 48 and 64 GB a few percent lower, 32, 36, 96 and 128 GB unchanged.
+    fixed = 179_999_232 + 322_495_208 + (96 << 20) + 32_996_786 + InklingRuntime.WARMUP_ARRAYS_BYTES
+    expected = {24: (32768, 24576), 32: (163840, 163840), 36: (245760, 245760), 48: (454656, 434176),
+                64: (770048, 749568), 96: (1048576, 1048576), 128: (1048576, 1048576)}
+    last = 0
+    for ram, (before, after) in expected.items():
+        inputs = dict(total_ram_bytes=ram * gib, model_weights_bytes=15_993_374_536, kv_bytes_per_token=32768,
+                      aux_bytes_per_token=4096, attention_kv_copy_bytes_per_token=4096, fixed_cache_bytes=fixed,
+                      model_max_context=1_048_576)
+        _family_reserve_inputs(rt, inputs, plan_memory)
+        plan = plan_memory(**inputs)
+        old = plan_memory(**{k: v for k, v in inputs.items() if "turn_reserve" not in k})
+        assert (old.context_window_fit, plan.context_window_fit) == (before, after), ram
+        assert plan.tight_machine is (ram == 24), ram
+        assert any("next turn" in note for note in plan.notes) is (after < before), ram
+        assert plan.context_window_fit >= last, ram  # the window still grows with the Mac
+        last = plan.context_window_fit
+    # Every other family plans as it did: no turn reserve, no change.
+    for ram in (16, 24, 32, 48, 128):
+        args = dict(total_ram_bytes=ram * gib, model_weights_bytes=8 * gib, kv_bytes_per_token=65536,
+                    model_max_context=262144)
+        assert plan_memory(**args).to_dict() == plan_memory(**args, turn_reserve_bytes=0).to_dict(), ram

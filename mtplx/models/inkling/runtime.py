@@ -310,7 +310,8 @@ class InklingRuntime(MTPLXRuntime):
     #: reserve is a guess; this family's is measured and every request is charged what it measured, so its
     #: window is what that reserve leaves, up to 32K tokens, the smallest window an agent session works in (a
     #: client's system prompt and tools are 10K to 15K of it). Only a 24 GB Mac with Bare Speed is that tight:
-    #: from 32 GB the floor-funded window is past 100K tokens and the plan is unchanged.
+    #: from 32 GB the floor-funded window is past 100K tokens and the plan is unchanged. The next turn's bill
+    #: (``turn_reserve_bytes``) stops it lower there: 24,576 tokens.
     TIGHT_WINDOW_TOKENS = 32_768
 
     def keeps_few_checkpoints(self, plan):
@@ -349,6 +350,34 @@ class InklingRuntime(MTPLXRuntime):
         rows = self.PROMPT_CHUNK_ROWS if rows is None else max(1, int(rows))
         forward = self.FORWARD_WORKING_BYTES * max(rows, self.PROMPT_CHUNK_ROWS) // self.PROMPT_CHUNK_ROWS
         return forward + self.checkpoints_kept(few, tight) * self.checkpoint_record_bytes()
+
+    def turn_reserve_bytes(self, *, few=False, tight=False):
+        """What the admission bills the next turn of a conversation that fills the window, beyond the read's
+        reserve (``prefill_working_bytes``) and the per-token price: state the conversation already holds,
+        counted again. The bill's windows term (``admission_fixed_bytes``: the rings and the global banks'
+        rounding); the restore checkpoints the conversation kept, beside the set the turn is billed for its own
+        read; and the rows its last bank step already holds that the bill counts as new, up to one step less
+        a row (a conversation just past a step that takes a tool result filling the window). The memory plan
+        stops the window where that turn is still admitted (``memory_plan.plan_memory``).
+
+        Bare Speed on a simulated 24 GB budget (22 November, `mtplx serve`, `m1-rcb-cap`): this arithmetic
+        gives every admission line of the run to the byte. At a 28,672-token window a 20-token turn fitted
+        by 55 MB; by the same bill a conversation of 24,577 tokens taking 4,094 more would be 96 MB over and
+        refused after its stream opened. The reserve stops that window at 24,576. Pricing a turn from the
+        rows it adds (a measured true peak first) gives these tokens back."""
+        from .fast.state import BANK_STEP
+
+        row = sum(
+            part.full_bytes_per_token
+            for part in (self.target_footprint, self.draft_footprint)
+            if part is not None
+        )
+        return (
+            self.ring_bytes()
+            + self.bank_rounding_bytes()
+            + self.checkpoints_kept(few, tight) * self.checkpoint_record_bytes()
+            + (BANK_STEP - 1) * row
+        )
 
     def checkpoint_record_bytes(self):
         """Bytes of one restore checkpoint: every window ring at its full window and every convolution tail,

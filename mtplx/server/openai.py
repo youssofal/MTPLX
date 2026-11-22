@@ -22979,7 +22979,10 @@ def _family_reserve_inputs(runtime: Any, plan_inputs: dict[str, Any], plan_fn: C
     its forward plus the restore checkpoints its reads keep. One under the tight rule; two where
     memory sets its window above it, on a Mac with little engine budget above the weights
     (``keeps_few_checkpoints`` reads the plan made with eight: the budget and the weights do not
-    depend on the reserve); eight elsewhere. A runtime without the hook keeps the inputs as they are."""
+    depend on the reserve); eight elsewhere. With it, what the admission bills the next turn of a
+    conversation that fills the window beyond that reserve (``turn_reserve_bytes``), so the window
+    is one every conversation in it can take its next turn in. A runtime without the hook keeps the
+    inputs as they are."""
 
     working = getattr(runtime, "prefill_working_bytes", None)
     if not callable(working):
@@ -22991,9 +22994,15 @@ def _family_reserve_inputs(runtime: Any, plan_inputs: dict[str, Any], plan_fn: C
     window = getattr(runtime, "TIGHT_WINDOW_TOKENS", None)
     if window:
         plan_inputs["tight_window_tokens"] = int(window)
+    turn = getattr(runtime, "turn_reserve_bytes", None)
+    if callable(turn):
+        plan_inputs["turn_reserve_bytes"] = int(turn())
+        plan_inputs["tight_turn_reserve_bytes"] = int(turn(few=True, tight=True))
     few = getattr(runtime, "keeps_few_checkpoints", None)
     if callable(few) and few(plan_fn(**plan_inputs)):
         plan_inputs["runtime_transients_bytes"] = int(working(few=True))
+        if callable(turn):
+            plan_inputs["turn_reserve_bytes"] = int(turn(few=True))
 
 
 def _admission_geometry(state: Any, prefill_width: int | None = None) -> _AdmissionGeometry:

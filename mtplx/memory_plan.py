@@ -561,6 +561,8 @@ def plan_memory(
     runtime_transients_bytes: int | None = None,
     tight_runtime_transients_bytes: int | None = None,
     tight_window_tokens: int | None = None,
+    turn_reserve_bytes: int = 0,
+    tight_turn_reserve_bytes: int | None = None,
 ) -> MemoryPlan:
     """Solve the machine's memory geometry.
 
@@ -595,6 +597,16 @@ def plan_memory(
     of the margin (``tight_ceiling``). The floor then yields wherever keeping
     it would leave a window under that size, never above it, so the window
     still only grows with the budget.
+    ``turn_reserve_bytes``: what the server's admission bills the next turn of
+    a conversation that fills the window, beyond the read's reserve and the
+    per-token price (Inkling 2 Mini: state the conversation already holds,
+    which the bill counts again). The window then stops where that turn is
+    still admitted, against the engine budget itself as the admission
+    compares, so the bank floor and the tight margin are room the turn may
+    use: a window is one every conversation in it can take its next turn
+    in. ``tight_turn_reserve_bytes`` is that bill under the tight rule; None
+    keeps one for both. Zero, the default, leaves every other family's plan
+    as it was.
     """
     runtime_transients = (
         RUNTIME_TRANSIENTS_BYTES
@@ -660,6 +672,18 @@ def plan_memory(
     fixed_cache = max(0, int(fixed_cache_bytes))
     kv_budget = usable - weights - fixed_cache - runtime_transients - BANK_FLOOR_BYTES
     fit_raw = _align_down(max(0, kv_budget) // per_token)
+    # The next turn of a conversation that fills the window must be admitted
+    # too (``turn_reserve_bytes``): where its bill is more than the bank floor
+    # leaves, the window stops lower.
+    turn_reserve = max(0, int(turn_reserve_bytes or 0))
+    turn_bound = False
+    if turn_reserve:
+        turn_fit = _align_down(
+            max(0, usable - weights - fixed_cache - runtime_transients - turn_reserve)
+            // per_token
+        )
+        if turn_fit < fit_raw:
+            fit_raw, turn_bound = turn_fit, True
     model_fits = fit_raw >= CONTEXT_FLOOR_TOKENS
     model_cap = int(model_max_context) if model_max_context else None
     transients = runtime_transients
@@ -708,6 +732,21 @@ def plan_memory(
         if tight_machine_measured and tight_window_tokens:
             tight_ceiling = max(tight_ceiling, _align_down(int(tight_window_tokens)))
         tight_own = _align_down(max(0, tight_budget) // tight_per_token)
+        # The next turn under this rule: with no floor and no margin kept, as
+        # the admission compares, only its own bill counts.
+        tight_turn = (
+            turn_reserve
+            if tight_turn_reserve_bytes is None
+            else max(0, int(tight_turn_reserve_bytes))
+        )
+        tight_turn_bound = False
+        if tight_turn:
+            turn_own = _align_down(
+                max(0, usable - weights - fixed_cache - tight_reserve - tight_turn)
+                // tight_per_token
+            )
+            tight_turn_bound = turn_own < min(tight_own, tight_ceiling)
+            tight_own = min(tight_own, turn_own)
         tight_fit = min(tight_own, tight_ceiling)
         if (
             tight_fit >= CONTEXT_FLOOR_TOKENS
@@ -717,6 +756,7 @@ def plan_memory(
             model_fits = True
             tight_machine = True
             fit_raw = tight_fit
+            turn_bound, turn_reserve = tight_turn_bound, tight_turn
             transients = tight_transients
             bank_floor = 0
             # The reserve and the server's admission arithmetic read this
@@ -736,6 +776,12 @@ def plan_memory(
                     else ""
                 )
             )
+    if turn_bound and model_fits and (model_cap is None or fit_raw < model_cap):
+        notes.append(
+            f"context window {fit_raw} leaves room for the next turn of a "
+            "conversation that fills it (the admission bills that turn "
+            f"{turn_reserve / GIB:.2f} GiB of state the conversation holds)"
+        )
     if not model_fits:
         notes.append(
             "model does not fit: weights + minimum runtime need "
