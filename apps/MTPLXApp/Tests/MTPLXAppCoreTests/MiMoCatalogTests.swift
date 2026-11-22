@@ -130,7 +130,19 @@ final class MiMoCatalogTests: XCTestCase {
         let expectedSmall = [bonsaiID, mimoID, nineID] + tinyIDs
         XCTAssertEqual(MTPLXModelOption.recommendedCatalogIDs(for: mac("m5", gib: 15.9)), tinyIDs)
         XCTAssertEqual(MTPLXModelOption.recommendedCatalogIDs(for: mac("m5", gib: 16)), expectedSmall)
-        XCTAssertEqual(MTPLXModelOption.recommendedCatalogIDs(for: mac("m5", gib: 24)), expectedSmall)
+        // From 24 GiB Inkling 2 Mini Bare Speed rides second (inklingTightMacOffer, on since
+        // 2026-11-21); MiMo stays right ahead of the Qwen 3.5 9B and Bonsai 2 stays first.
+        XCTAssertEqual(
+            MTPLXModelOption.recommendedCatalogIDs(for: mac("m5", gib: 24)),
+            [bonsaiID, "inkling2-mini-bare-speed", mimoID, nineID] + tinyIDs
+        )
+        // A 16 GB Mac is never recommended, offered or pre-selected an Inkling pack: the offer
+        // starts at 24 GiB and Bare Speed's 18.21 GiB peak is over the machine anyway.
+        let sixteen = mac("m5", gib: 16)
+        let offeredAt16 = MTPLXModelOption.hardwareAwareOfficialCatalog(hardware: sixteen, includeInstalledOverrides: false).map(\.id)
+        XCTAssertFalse(MTPLXModelOption.recommendedCatalogIDs(for: sixteen).contains { $0.hasPrefix("inkling") })
+        XCTAssertFalse(offeredAt16.contains { $0.hasPrefix("inkling") })
+        XCTAssertEqual(offeredAt16.first, bonsaiID)
         for gib in [16.0, 24, 32, 48, 64, 96, 128, 256] {
             let hardware = mac("m5", gib: gib)
             let raw = MTPLXModelOption.recommendedCatalogIDs(for: hardware)
