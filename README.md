@@ -2,7 +2,7 @@
 
 <img src="docs/assets/readme/hero.svg" alt="MTPLX" width="100%" />
 
-# The fastest way to run Qwen 3.8 on a Mac.
+# The fastest way to run Inkling 2 Mini and Qwen 3.8 on a Mac.
 
 [![PyPI](https://img.shields.io/pypi/v/mtplx?label=PyPI)](https://pypi.org/project/mtplx/)
 [![CI](https://github.com/youssofal/MTPLX/actions/workflows/ci.yml/badge.svg)](https://github.com/youssofal/MTPLX/actions/workflows/ci.yml)
