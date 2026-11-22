@@ -35,6 +35,7 @@ import struct
 from threading import Lock
 
 import mlx.core as mx
+from .. import launch_limits
 
 _lock = Lock()
 _counts: Counter = Counter()
@@ -165,7 +166,7 @@ def _kernel(which):
         "mix": (["forget", "gain", "x", "msg"], ["h"], CONTROLLER_MIX, ""),
         "norms": (["h0", "h1", "h2", "g0", "g1", "g2"], ["out0", "out1", "out2"], INPUT_NORMS, _RMS),
     }[which]
-    return mx.fast.metal_kernel(name=f"mtplx_inkling_prompt_loop_{which}", input_names=spec[0], output_names=spec[1],
+    return launch_limits.kernel(name=f"mtplx_inkling_prompt_loop_{which}", input_names=spec[0], output_names=spec[1],
                                 source=spec[2], header=spec[3])
 
 
@@ -270,11 +271,16 @@ def _one_query_read(partial, closed, query, gain, eps, where):
     rows, width = partial.shape[1], partial.shape[-1]
     reason = prompt_glue._unserved(partial, closed, gain, where)
     if reason is None:
+        from ..launch_limits import GroupRefused
         from .read import read
 
-        (out,) = read(partial, closed, query, eps, mode=1)
-        _count(f"{where}.read.ours")
-        return out
+        try:
+            (out,) = read(partial, closed, query, eps, mode=1)
+        except GroupRefused:  # issue #706: above this GPU's thread-group limit for the read's pipeline
+            reason = "threadgroup"
+        else:
+            _count(f"{where}.read.ours")
+            return out
     from ..model import read_blocks
 
     _count(f"{where}.read.mlx.{reason}")
@@ -295,18 +301,24 @@ def visit_inputs(layer, x, closed, message):
     if reason is not None:
         _count(f"attention_sources.mlx.{reason}")
         return None
-    ms = message.reshape(rows, message.shape[-2], width)
-    if layer.sliding:
-        xs = _one_query_read(x, closed, layer.attn_query, layer.qkv_norm[0], layer.eps, "attention_sources")
-        picks, gains = (0, 0, 0), [layer.qkv_norm[0]] * 3
-    else:
-        # the three-query read stays MLX's products (``read_blocks``); its output feeds the controllers
-        from ..model import read_blocks
+    from ..launch_limits import GroupRefused
 
-        xs = read_blocks(closed, x, layer.attn_query, layer.eps, True).reshape(rows, 3, width)
-        picks, gains = (0, 1, 2), list(layer.qkv_norm)
-    hs = [controller(layer.controllers[i], xs, picks[i], ms, i, layer.eps) for i in range(3)]
-    outs = input_norms(hs, gains, layer.eps, x.dtype)
+    ms = message.reshape(rows, message.shape[-2], width)
+    try:
+        if layer.sliding:
+            xs = _one_query_read(x, closed, layer.attn_query, layer.qkv_norm[0], layer.eps, "attention_sources")
+            picks, gains = (0, 0, 0), [layer.qkv_norm[0]] * 3
+        else:
+            # the three-query read stays MLX's products (``read_blocks``); its output feeds the controllers
+            from ..model import read_blocks
+
+            xs = read_blocks(closed, x, layer.attn_query, layer.eps, True).reshape(rows, 3, width)
+            picks, gains = (0, 1, 2), list(layer.qkv_norm)
+        hs = [controller(layer.controllers[i], xs, picks[i], ms, i, layer.eps) for i in range(3)]
+        outs = input_norms(hs, gains, layer.eps, x.dtype)
+    except GroupRefused:  # issue #706: a launch above this GPU's thread-group limit for its pipeline
+        _count("attention_sources.mlx.threadgroup")
+        return None
     _count("attention_sources.ours." + ("window" if layer.sliding else "global"))
     return [o.reshape(1, rows, width) for o in outs]
 
@@ -323,10 +335,16 @@ def expert_input(layer, residual, closed, message, dtype):
     if reason is not None:
         _count(f"expert_source.mlx.{reason}")
         return None
+    from ..launch_limits import GroupRefused
+
     ms = message.reshape(rows, message.shape[-2], width)
-    xs = _one_query_read(residual, closed, layer.mlp_query, layer.ffn_norm, layer.eps, "expert_source")
-    h = controller(layer.controllers[3], xs, 0, ms, 3, layer.eps)
-    (out,) = input_norms([h], [layer.ffn_norm], layer.eps, dtype)
+    try:
+        xs = _one_query_read(residual, closed, layer.mlp_query, layer.ffn_norm, layer.eps, "expert_source")
+        h = controller(layer.controllers[3], xs, 0, ms, 3, layer.eps)
+        (out,) = input_norms([h], [layer.ffn_norm], layer.eps, dtype)
+    except GroupRefused:  # issue #706: a launch above this GPU's thread-group limit for its pipeline
+        _count("expert_source.mlx.threadgroup")
+        return None
     _count("expert_source.ours")
     return out.reshape(1, rows, width)
 
@@ -341,6 +359,12 @@ def global_norms(layer, read, dtype):
     if reason is not None:
         _count(f"global_norms.mlx.{reason}")
         return None
-    outs = input_norms(read.reshape(rows, 3, width), list(layer.qkv_norm), layer.eps, dtype)
+    from ..launch_limits import GroupRefused
+
+    try:
+        outs = input_norms(read.reshape(rows, 3, width), list(layer.qkv_norm), layer.eps, dtype)
+    except GroupRefused:  # issue #706: above this GPU's thread-group limit for the norms' pipeline
+        _count("global_norms.mlx.threadgroup")
+        return None
     _count("global_norms.ours")
     return [o.reshape(1, rows, width) for o in outs]

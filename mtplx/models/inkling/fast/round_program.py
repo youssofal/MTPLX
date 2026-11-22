@@ -47,6 +47,7 @@ from functools import lru_cache
 from typing import Any
 
 import mlx.core as mx
+from .. import launch_limits
 import mlx.nn as nn
 
 from mtplx.engine import runtime as engine_runtime
@@ -363,13 +364,13 @@ def _chunk(slots: int, ring: bool) -> int:
 
 @lru_cache(maxsize=None)
 def _attend_kernels():
-    partials = mx.fast.metal_kernel(
+    partials = launch_limits.kernel(
         name="mtplx_inkling_l7_draft_attend",
         input_names=["q", "hk", "hv", "ok", "ov", "meta"],
         output_names=["pm", "pl", "pacc"],
         source=_ATTEND,
     )
-    merge = mx.fast.metal_kernel(
+    merge = launch_limits.kernel(
         name="mtplx_inkling_l7_draft_merge",
         input_names=["pm", "pl", "pacc"],
         output_names=["out"],
@@ -619,7 +620,7 @@ _RING_ROWS = """
 
 @lru_cache(maxsize=None)
 def _tails_kernel():
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_l7_tails",
         input_names=["t0", "t1", "t2", "t3", "p0", "p1", "p2", "p3", "kept"],
         output_names=["o0", "o1", "o2", "o3"],
@@ -629,7 +630,7 @@ def _tails_kernel():
 
 @lru_cache(maxsize=None)
 def _ring_kernel():
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_l7_ring_rows",
         input_names=["old_k_in", "old_v_in", "new_k", "new_v", "newest", "kept"],
         output_names=["upd_k", "upd_v", "old_k", "old_v"],

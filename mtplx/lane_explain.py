@@ -146,6 +146,9 @@ def build_explain_report(
     served_lane = payload.get("resolved_lane")
     if isinstance(served_lane, dict):
         report["served_lane"] = served_lane
+    limits = payload.get("inkling_launch_limits")
+    if isinstance(limits, dict):
+        report["inkling_launch_limits"] = limits
     return report
 
 
@@ -236,4 +239,33 @@ def render_explain_lines(report: dict[str, Any]) -> list[str]:
         lines.extend("  " + line for line in demotions.explain_lines(ledger))
     else:
         lines.append(f"demotions: {report.get('demotions_note')}")
+    lines.extend(_launch_limit_lines(report.get("inkling_launch_limits")))
+    return lines
+
+
+def _launch_limit_lines(limits: Any) -> list[str]:
+    """Inkling kernels this GPU refused for their thread-group size (issue #706), and what served
+    instead; nothing when the server does not report them."""
+
+    if not isinstance(limits, dict):
+        return []
+    refused = [row for row in limits.get("refused") or () if isinstance(row, dict)]
+    lines: list[str] = []
+    if limits.get("test_limit"):
+        lines.append(
+            "inkling launch limits: TEST HOOK ON (MTPLX_INKLING_TEST_THREADGROUP_LIMIT="
+            f"{limits['test_limit']}: launches above it are treated as refused)"
+        )
+    if not refused:
+        lines.append(
+            "inkling launch limits: every Inkling kernel checked so far runs on this GPU "
+            f"({limits.get('pipelines_checked', 0)} launch shapes checked)"
+        )
+        return lines
+    lines.append("inkling launch limits (kernels this GPU cannot run at their thread-group size):")
+    for row in refused:
+        lines.append(
+            f"  {row.get('kernel')}: {row.get('group')} threads, the pipeline allows "
+            f"{row.get('limit')} ({row.get('source')}); {row.get('served_by') or 'the route underneath serves'}"
+        )
     return lines

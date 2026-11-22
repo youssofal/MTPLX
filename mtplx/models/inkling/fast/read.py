@@ -46,6 +46,7 @@ import struct
 import weakref
 
 import mlx.core as mx
+from .. import launch_limits
 
 #: Down-product rows one controller threadgroup computes (two blocks of MLX's four).
 _DOWN_ROWS = 8
@@ -483,7 +484,7 @@ def _read_kernel():
     # Outputs: mode 0 o0 = normed inputs (the stream's type); mode 1 o0 = the read (f32); mode 2 o0 = the
     # controllers' down products, o1 = their sources, o2 = their messages; mode 3 o0 = the keys
     # of a three-query read (f32). Unused ones are tiny.
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_fast_read",
         input_names=["c0", "c1", "c2", "c3", "partial", "queries", "g0", "g1", "g2", "rin",
                      "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7", "d0", "d1", "d2"],
@@ -495,7 +496,7 @@ def _read_kernel():
 
 @lru_cache(maxsize=1)
 def _probs_kernel():
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_fast_probs",
         input_names=[f"s{i}" for i in range(8)],
         output_names=["p"],
@@ -506,7 +507,7 @@ def _probs_kernel():
 
 @lru_cache(maxsize=1)
 def _mix_kernel():
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_fast_mix",
         input_names=["state", "xs", "ms", "f0", "f1", "f2", "h0", "h1", "h2"],
         output_names=["hout", "parts"],
@@ -744,7 +745,7 @@ _ATTEND = """
 
 @lru_cache(maxsize=1)
 def _attend_kernel():
-    return mx.fast.metal_kernel(name="mtplx_inkling_fast_attend_rows", input_names=["q", "keys"],
+    return launch_limits.kernel(name="mtplx_inkling_fast_attend_rows", input_names=["q", "keys"],
                                 output_names=["out"], source=_ATTEND)
 
 
@@ -883,7 +884,7 @@ def _exact_kernel():
     text, why = library_gemm.library("matrix_units", "matvec")
     if text is None:
         return None, why
-    return mx.fast.metal_kernel(name="mtplx_inkling_fast_exact_read",
+    return launch_limits.kernel(name="mtplx_inkling_fast_exact_read",
                                 input_names=["queries", "keys", "width", "nq", "zero"],
                                 output_names=["out", "scratch"], header=text + _SHARE, source=_EXACT), None
 

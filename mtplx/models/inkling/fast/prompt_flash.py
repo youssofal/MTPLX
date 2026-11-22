@@ -47,6 +47,7 @@ import struct
 from functools import lru_cache
 
 import mlx.core as mx
+from .. import launch_limits
 
 from mtplx.kernels import library_headers
 
@@ -703,7 +704,7 @@ def _kernel_simd(gated=False):
         raise RuntimeError(f"library headers: {why}")
     gate_row = ("#define INK_GATE_ROW const device T* gp = gate + (size_t(qrow[rp]) * size_t(HQ) + "
                 "size_t(head)) * size_t(D) + size_t(fc);\n") if gated else "#define INK_GATE_ROW\n"
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_prompt_flash_simd" + ("_gated" if gated else ""),
         input_names=["q", "k", "v", "prof", "sink", "params"] + (["gate"] if gated else []),
         output_names=["out"],
@@ -721,7 +722,7 @@ def _kernel(gated=False):
     # The gate is the gate product's own output, row-contiguous: a row is HQ * D logits.
     gate_row = ("#define INK_GATE_ROW const device T* gp = gate + (size_t(qrow[rp]) * size_t(HQ) + "
                 "size_t(head)) * size_t(D) + size_t(fc);\n") if gated else "#define INK_GATE_ROW\n"
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_prompt_flash" + ("_gated" if gated else ""),
         input_names=["q", "k", "v", "prof", "sink", "params"] + (["gate"] if gated else []),
         output_names=["out"],
@@ -873,7 +874,7 @@ _WINDOW_SOURCE = """
 
 @lru_cache(maxsize=1)
 def _window_kernel():
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_window_rows",
         input_names=["kold", "vold", "knew", "vnew", "params"],
         output_names=["ko", "vo"],

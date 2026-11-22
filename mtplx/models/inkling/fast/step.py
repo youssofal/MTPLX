@@ -35,6 +35,7 @@ import mlx.core as mx
 
 from .. import model as ref
 from .. import short_conv
+from ..launch_limits import GroupRefused
 from ..precision import AffineWeight
 from ..attention import attend
 from ..projection import stock_messages
@@ -531,22 +532,32 @@ def fused_attention(layer, a, x, state, visit, panel):
     from .attn_output import attention_output as panel_output
 
     declined = attention_reason(x.dtype)
-    if declined is not None:
-        # The fused attention's qualification declined on this Mac: each row by the one-row
-        # reference on its own history, gated as the reference gates; the output stays fused.
-        count(f"fallback.bc_attention.{declined}")
-        h = chronological_core(layer, a.q, relative_profiles(layer, a.rel), a.sink, a.k_rows, a.v_rows,
-                               state, visit, panel)
-        hg = (h.astype(mx.float32) * exact_sigmoid(a.gate_logits.astype(mx.float32))).astype(h.dtype)
-    else:
+    group_key = ("bc_attention", _panel_rows(panel, x), str(x.dtype), bool(layer.sliding))
+    if declined is None and group_key in _GROUP_REFUSED:
+        declined = "threadgroup"
+    hg = None
+    if declined is None:
         if layer.sliding:
             keys, values, newest, valid = state.window_view(visit)
         else:
             keys, values, valid = state.global_view(visit)
             newest = valid
-        hg = panel_attend(a.q, a.rel, a.sink, a.gate_logits, a.k_rows, a.v_rows, keys, values, valid,
-                          newest, panel.pos, layer.rel_basis, window=layer.sliding)
-        count("fused.bc_attention")
+        try:
+            hg = panel_attend(a.q, a.rel, a.sink, a.gate_logits, a.k_rows, a.v_rows, keys, values, valid,
+                              newest, panel.pos, layer.rel_basis, window=layer.sliding)
+            count("fused.bc_attention")
+        except GroupRefused:
+            # Issue #706: a launch of this panel's attention is above this GPU's limit for its pipeline.
+            _GROUP_REFUSED.add(group_key)
+            declined = "threadgroup"
+    if hg is None:
+        # The fused attention's qualification declined on this Mac (or this GPU cannot run one of its
+        # launches at this width): each row by the one-row reference on its own history, gated as the
+        # reference gates; the output stays fused.
+        count(f"fallback.bc_attention.{declined}")
+        h = chronological_core(layer, a.q, relative_profiles(layer, a.rel), a.sink, a.k_rows, a.v_rows,
+                               state, visit, panel)
+        hg = (h.astype(mx.float32) * exact_sigmoid(a.gate_logits.astype(mx.float32))).astype(h.dtype)
     reason = output_reason(layer, hg.dtype)
     if reason is None:
         count("fused.bc_output.panel")
@@ -567,11 +578,20 @@ def fused_attention_input(layer, x, closed, message, state, visit, panel):
     from .attn_input import stage_attention_input
 
     reason = attention_input_reason(layer, x.dtype, message is not None)
-    if reason is not None:
-        count(f"fallback.a.{reason}")
-        return attention_input(layer, x, closed, message, state, visit, panel)
-    count("fused.a")
-    return stage_attention_input(layer, x, closed, message, state, visit, panel)
+    group_key = ("a", _panel_rows(panel, x), str(x.dtype), message is not None, len(closed))
+    if reason is None and group_key in _GROUP_REFUSED:
+        reason = "threadgroup"
+    if reason is None:
+        try:
+            out = stage_attention_input(layer, x, closed, message, state, visit, panel)
+        except GroupRefused:
+            _GROUP_REFUSED.add(group_key)
+            reason = "threadgroup"
+        else:
+            count("fused.a")
+            return out
+    count(f"fallback.a.{reason}")
+    return attention_input(layer, x, closed, message, state, visit, panel)
 
 
 def fused_expert_input(layer, partial, closed, message, panel):
@@ -580,11 +600,20 @@ def fused_expert_input(layer, partial, closed, message, panel):
 
     stream = closed[0].dtype if closed else _ACTIVATION["dtype"]
     reason = expert_input_reason(layer, message is not None, stream)
-    if reason is not None:
-        count(f"fallback.d.{reason}")
-        return expert_input(layer, partial, closed, message, panel)
-    count("fused.d")
-    return stage_expert_input(layer, partial, closed, message, panel)
+    group_key = ("d", _panel_rows(panel, partial), str(stream), message is not None, len(closed))
+    if reason is None and group_key in _GROUP_REFUSED:
+        reason = "threadgroup"
+    if reason is None:
+        try:
+            out = stage_expert_input(layer, partial, closed, message, panel)
+        except GroupRefused:
+            _GROUP_REFUSED.add(group_key)
+            reason = "threadgroup"
+        else:
+            count("fused.d")
+            return out
+    count(f"fallback.d.{reason}")
+    return expert_input(layer, partial, closed, message, panel)
 
 
 def fused_experts(layer, source, partial, dtype, state, visit, panel):
@@ -592,11 +621,31 @@ def fused_experts(layer, source, partial, dtype, state, visit, panel):
     from .experts import expert_visit, unserved
 
     reason = unserved(layer.experts, panel.rows, dtype)
-    if reason is not None:
-        count(f"fallback.experts.{reason}")
-        return experts(layer, source, partial, dtype, state, visit, panel)
-    count("fused.experts")
-    return expert_visit(layer, source, partial, state.tail(visit, 3), dtype)
+    group_key = ("experts", _panel_rows(panel, source), str(dtype), id(layer.experts))
+    if reason is None and group_key in _GROUP_REFUSED:
+        reason = "threadgroup"
+    if reason is None:
+        try:
+            out = expert_visit(layer, source, partial, state.tail(visit, 3), dtype)
+        except GroupRefused:
+            _GROUP_REFUSED.add(group_key)
+            reason = "threadgroup"
+        else:
+            count("fused.experts")
+            return out
+    count(f"fallback.experts.{reason}")
+    return experts(layer, source, partial, dtype, state, visit, panel)
+
+
+#: Issue #706: (stage, panel rows, dtype, ...) whose fused launches this GPU refused for their thread group
+#: (``launch_limits.GroupRefused``): those calls serve the stage's reference, counted ``fallback.<stage>.threadgroup``.
+_GROUP_REFUSED: set = set()
+
+
+def _panel_rows(panel, rows_of):
+    """The panel's rows, for a stage's thread-group decline key; ``rows_of`` (an input with the rows on its
+    second-to-last axis) gives them where a reference call passes no panel."""
+    return panel.rows if panel is not None else int(rows_of.shape[-2])
 
 
 LANES = {

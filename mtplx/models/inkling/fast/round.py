@@ -41,6 +41,7 @@ from functools import lru_cache
 import secrets
 
 import mlx.core as mx
+from .. import launch_limits
 import numpy as np
 
 THREADS = 256
@@ -466,7 +467,7 @@ def constants():
 @lru_cache(maxsize=None)
 def _kernel(name):
     if name == "stats":
-        return mx.fast.metal_kernel(
+        return launch_limits.kernel(
             name="mtplx_inkling_l4_stats",
             input_names=["scores", "params", "sizes"],
             output_names=["law", "stats"],
@@ -474,7 +475,7 @@ def _kernel(name):
             header=_HEADER,
         )
     if name == "race":
-        return mx.fast.metal_kernel(
+        return launch_limits.kernel(
             name="mtplx_inkling_l4_race",
             input_names=["tlaw", "tstats", "dlaw", "dstats", "proposals", "modes",
                          "positions", "seed", "sizes"],
@@ -483,7 +484,7 @@ def _kernel(name):
             header=_HEADER + _ROW_LSE,
         )
     if name == "finish":
-        return mx.fast.metal_kernel(
+        return launch_limits.kernel(
             name="mtplx_inkling_l4_finish",
             input_names=["race", "sizes"],
             output_names=["winners"],
@@ -491,7 +492,7 @@ def _kernel(name):
             header=_HEADER + _ROW_WINNER,
         )
     if name == "finish_checked":
-        return mx.fast.metal_kernel(
+        return launch_limits.kernel(
             name="mtplx_inkling_l4_finish_checked",
             input_names=["race", "lse", "sizes"],
             output_names=["drawn"],
@@ -499,7 +500,7 @@ def _kernel(name):
             header=_HEADER + _ROW_WINNER,
         )
     if name in ("decide", "decide_wide"):
-        return mx.fast.metal_kernel(
+        return launch_limits.kernel(
             name="mtplx_inkling_l4_" + name,
             input_names=["race", "lse", "tlaw", "dlaw", "proposals", "modes", "positions",
                          "seed", "sizes", "offered"],

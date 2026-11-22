@@ -12,6 +12,7 @@ from pathlib import Path
 from threading import RLock
 
 import mlx.core as mx
+from . import launch_limits
 
 from .attention_metal import grouped_sink_attention, streamed_attention
 
@@ -91,7 +92,7 @@ def _metal_identity():
 
 @lru_cache(maxsize=1)
 def _bias_kernel():
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_relative_bias",
         input_names=["profiles", "sink", "geometry"],
         output_names=["bias"],
@@ -420,7 +421,13 @@ def attend(query, key, value, profiles, sink, window, *, verify=False):
     active = _request.get()
     mode = active[0]["mode"] if active is not None else os.environ.get("MTPLX_INKLING_ATTENTION", "stock")
     if mode == "stock" and not verify and query.shape[2] > 32:
-        result = _prompt_route(operands, window)
+        try:
+            result = _prompt_route(operands, window)
+        except launch_limits.GroupRefused:
+            # Issue #706: a launch of the prompt route is above this GPU's thread-group limit for its
+            # pipeline; the call takes RC6's own route below.
+            _note_route("prompt.stock.threadgroup")
+            result = None
         if result is not None:
             return result
     verify_mode = (active[0]["verify_mode"] if active is not None else
@@ -444,7 +451,10 @@ def attend(query, key, value, profiles, sink, window, *, verify=False):
         if reason is None:
             reason = _first_use(route, operands, window)
         if reason is None:
-            result = _ROUTES[route](*operands, window)
+            try:
+                result = _ROUTES[route](*operands, window)
+            except launch_limits.GroupRefused:  # issue #706: above this GPU's limit for the route's pipeline
+                reason = "threadgroup"
     if reason is None:
         outcome = "selected"
     else:

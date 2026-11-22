@@ -20,6 +20,7 @@ import os
 from functools import lru_cache
 
 import mlx.core as mx
+from .. import launch_limits
 
 _SOURCE = """
     // One threadgroup of the library's mat-vec: BM simdgroups, each TM output rows over the whole input.
@@ -49,7 +50,7 @@ def _kernel():
     text, why = library_gemm.library("matvec")
     if text is None:
         return None, why
-    return mx.fast.metal_kernel(name="mtplx_inkling_fast_draft_matvec", input_names=["mat", "vec", "sizes", "unit"],
+    return launch_limits.kernel(name="mtplx_inkling_fast_draft_matvec", input_names=["mat", "vec", "sizes", "unit"],
                                 output_names=["out"], header=text, source=_SOURCE), None
 
 
@@ -87,15 +88,22 @@ def matvec(vec, mat, *, cols, bias_col=None):
     if sizes is None:
         sizes = _sizes[(cols, out_len, width)] = (mx.array([cols, out_len, width], mx.int32),
                                                   mx.array([1.0], mx.float32))
-    out = kernel(
-        inputs=[mat, vec, *sizes],
-        template=[("T", mat.dtype), ("BM", bm), ("TM", tm), ("AXPBY", bias_col is not None),
-                  ("BIAS_AT", 0 if bias_col is None else bias_col)],
-        grid=(-(-out_len // (bm * tm)) * bm * 32, 1, 1),
-        threadgroup=(bm * 32, 1, 1),
-        output_shapes=[(1, out_len)],
-        output_dtypes=[mat.dtype],
-    )[0]
+    from ..launch_limits import GroupRefused
+
+    try:
+        out = kernel(
+            inputs=[mat, vec, *sizes],
+            template=[("T", mat.dtype), ("BM", bm), ("TM", tm), ("AXPBY", bias_col is not None),
+                      ("BIAS_AT", 0 if bias_col is None else bias_col)],
+            grid=(-(-out_len // (bm * tm)) * bm * 32, 1, 1),
+            threadgroup=(bm * 32, 1, 1),
+            output_shapes=[(1, out_len)],
+            output_dtypes=[mat.dtype],
+        )[0]
+    except GroupRefused:  # issue #706: above this GPU's thread-group limit for the pipeline
+        _verdicts[key] = False
+        count_route("refused:matvec_threadgroup_" + "_".join(map(str, key[:4])))
+        return reference()
     if verdict is None:
         try:
             want = reference()

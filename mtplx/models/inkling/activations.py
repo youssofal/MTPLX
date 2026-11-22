@@ -7,6 +7,7 @@ so rounding its product into a BF16 activation does not change the expert.
 from functools import lru_cache
 
 import mlx.core as mx
+from . import launch_limits
 
 
 def _e4m3(x):
@@ -35,7 +36,7 @@ def _e2m1(x):
 
 @lru_cache(maxsize=1)
 def _quantizer():
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_expert_inputs",
         input_names=["input", "peaks"],
         output_names=["values"],

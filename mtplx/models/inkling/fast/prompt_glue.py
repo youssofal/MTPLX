@@ -23,6 +23,7 @@ import os
 from threading import Lock
 
 import mlx.core as mx
+from .. import launch_limits
 
 PROMPT_MIN_ROWS = 33
 _lock = Lock()
@@ -84,9 +85,14 @@ def input_norm(partial, closed, query, gain, eps, where, stand_in=None):
     if reason is not None:
         _count(f"{where}.mlx.{reason}")
         return None
+    from ..launch_limits import GroupRefused
     from .read import read
 
-    (out,) = read(partial, closed, query, eps, mode=0, gains=[gain], f32_stand_in=stand_in)
+    try:
+        (out,) = read(partial, closed, query, eps, mode=0, gains=[gain], f32_stand_in=stand_in)
+    except GroupRefused:  # issue #706: the read's thread group is above this GPU's limit for its pipeline
+        _count(f"{where}.mlx.threadgroup")
+        return None
     _count(f"{where}.ours")
     return out.reshape(partial.shape)
 
@@ -192,7 +198,7 @@ _heads_kernel_cache = {}
 def _heads_kernel():
     kernel = _heads_kernel_cache.get("k")
     if kernel is None:
-        kernel = mx.fast.metal_kernel(
+        kernel = launch_limits.kernel(
             name="mtplx_inkling_prompt_heads",
             input_names=["qlin", "rlin", "kc", "vc", "qscale", "rscale", "offset"],
             output_names=["q", "rel", "k", "v"],
@@ -279,7 +285,7 @@ _gate_kernel_cache = {}
 def _gate_kernel():
     kernel = _gate_kernel_cache.get("k")
     if kernel is None:
-        kernel = mx.fast.metal_kernel(
+        kernel = launch_limits.kernel(
             name="mtplx_inkling_prompt_output_gate",
             input_names=["h", "g"],
             output_names=["x"],

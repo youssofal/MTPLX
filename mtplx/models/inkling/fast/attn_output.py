@@ -34,6 +34,7 @@ import struct
 from functools import lru_cache
 
 import mlx.core as mx
+from .. import launch_limits
 
 from .attend import MAX_ROWS
 
@@ -134,7 +135,7 @@ DIVISOR_BITS = _float_bits(math.sqrt(5))
 
 @lru_cache(maxsize=1)
 def _kernel():
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_fast_attn_output",
         input_names=["hg", "wo", "cw", "tail", "x"],
         output_names=["partial", "rows"],

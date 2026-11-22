@@ -37,6 +37,7 @@ import struct
 from functools import lru_cache
 
 import mlx.core as mx
+from .. import launch_limits
 
 HEADS, KV_HEADS, HEAD_DIM, EXTENT, WINDOW = 24, 8, 128, 1024, 1024
 GROUP = HEADS // KV_HEADS
@@ -87,7 +88,7 @@ def lane_tree_ok():
     key = mx.random.key(20261121)
     a, b = mx.random.split(key)
     x = (mx.random.normal((groups * 32,), key=a) * mx.exp(mx.random.uniform(-8, 8, (groups * 32,), key=b)))
-    kern = mx.fast.metal_kernel(name="mtplx_inkling_fast_lane_tree_proof", input_names=["x"],
+    kern = launch_limits.kernel(name="mtplx_inkling_fast_lane_tree_proof", input_names=["x"],
                                 output_names=["ok"], source=_TREE_PROOF)
     ok = kern(inputs=[x.astype(mx.float32)], grid=(32 * groups, 1, 1), threadgroup=(32, 1, 1),
               output_shapes=[(groups,)], output_dtypes=[mx.uint32])[0]
@@ -176,6 +177,8 @@ def _qualification_cases(plan):
         # (window, committed history, rows, ring rotation)
         (True, 300, 1, 0),        # window before fill: single pass
         (True, 1500, 2, 517),     # full, wrapped ring: two-pass on d and s families
+        (True, 1500, 25, 517),    # a copy round's window panel: 800 threads in one group, or row groups of 8
+                                  # where this GPU refuses that (issue #706: an M1 Max allows 704)
         (False, 300, 32, 0),      # widest panel: 1,024-thread threadgroups
         (False, tiles, 2, 0),     # long-history tile order 1
         (False, tiles, 3, 0),     # long-history tile order 2
@@ -895,7 +898,7 @@ def attend_window(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count
 
 @lru_cache(maxsize=None)
 def _kernel(name, source, header=""):
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name=name,
         input_names=_INPUTS[name],
         output_names=_OUTPUTS[name],
@@ -1006,6 +1009,17 @@ def _attend(q, rel, sink, gate_logits, k_rows, v_rows, keys, values, count, newe
                 ("ROWS", rows), ("LONG", int(long) if (long and not window and (rows <= 8 or wide)
                                                     and dtype == mx.bfloat16 and lane_tree_ok()) else 0)]
     chains = rows * HEADS * blocks
+    if not wide and rows > WIDE_GROUP:
+        narrow = dict(inputs=[q, keys, values, k_rows, v_rows, prof, sink, pos_a, count_a, newest_a],
+                      template=template, grid=(32 * rows * blocks, KV_HEADS, 1), threadgroup=(32 * rows, 1, 1),
+                      output_shapes=[(chains * HEAD_DIM,), (chains,), (chains,)],
+                      output_dtypes=[mx.float32, mx.float32, mx.float32])
+        instead = f"a {rows}-row panel's partials run in row groups of {WIDE_GROUP} (the same bits)"
+        if not _kernel("mtplx_inkling_fast_attend_partials", _PARTIALS, _HEADER).runs(instead, **narrow):
+            # Issue #706: this GPU cannot run the whole panel in one threadgroup of 32 x rows threads for this
+            # pipeline (an M1 Max allows 704, 22 rows, where a copy round's panel takes 25). The row-grouped
+            # partials run every row's chain loop as the same code on the same keys, so the same bits.
+            wide = True
     if wide:
         groups = -(-rows // WIDE_GROUP)
         po, pm, ps = _kernel("mtplx_inkling_fast_attend_partials_wide", _PARTIALS_WIDE, _HEADER)(

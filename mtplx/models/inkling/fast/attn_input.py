@@ -63,6 +63,7 @@ from typing import NamedTuple
 import weakref
 
 import mlx.core as mx
+from .. import launch_limits
 
 from .affine_lane import AFFINE_LANE
 
@@ -846,7 +847,7 @@ _NORM_FIRST = False
 
 @lru_cache(maxsize=1)
 def _norm_kernel():
-    return mx.fast.metal_kernel(name="mtplx_inkling_fast_norm_sources", input_names=["h", "parts", "g0", "g1", "g2"],
+    return launch_limits.kernel(name="mtplx_inkling_fast_norm_sources", input_names=["h", "parts", "g0", "g1", "g2"],
                                 output_names=["out"], source=_NORM)
 
 
@@ -870,7 +871,7 @@ def norm_sources(h, parts, gains, eps):
 
 @lru_cache(maxsize=1)
 def _project_kernel():
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_fast_project",
         # Metal allows 31 buffers a launch: 21 inputs and 8 outputs.
         input_names=[

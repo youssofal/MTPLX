@@ -36,6 +36,7 @@ import logging
 from threading import Lock
 
 import mlx.core as mx
+from .. import launch_limits
 
 _log = logging.getLogger(__name__)
 _lock = Lock()
@@ -126,7 +127,7 @@ def _kernel():
     from mtplx.kernels.library_headers import text
 
     header, _ = text("tensor_gemm")
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_prompt_project",
         input_names=["x"] + ["w%d" % i for i in range(MAX_MATRICES)] + ["layout"],
         output_names=["y%d" % i for i in range(MAX_MATRICES)],

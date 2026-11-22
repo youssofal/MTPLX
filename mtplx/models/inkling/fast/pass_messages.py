@@ -38,6 +38,7 @@ import os
 import struct
 
 import mlx.core as mx
+from .. import launch_limits
 
 from .routes import count
 
@@ -83,7 +84,7 @@ _SOURCE = """
 def _kernel():
     from .read import _SHARE
 
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_pass_message_weights",
         input_names=["scores"],
         output_names=["weights"],

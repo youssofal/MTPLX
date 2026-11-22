@@ -35,6 +35,7 @@ from functools import lru_cache
 import struct
 
 import mlx.core as mx
+from .. import launch_limits
 
 from .affine_lane import AFFINE_LANE
 
@@ -213,10 +214,10 @@ def _kernel(source):
             raise RuntimeError(f"no soft-capped product here: {why}")
         finish = ("#define FINISH(v) Multiply()(Tanh()(Divide()((v), as_type<float>(uint(CAP)))), "
                   "as_type<float>(uint(CAP)))\n")
-        return mx.fast.metal_kernel(name="mtplx_inkling_fast_qproduct_capped",
+        return launch_limits.kernel(name="mtplx_inkling_fast_qproduct_capped",
                                     input_names=["x", "codes", "scales", "biases"], output_names=["out"],
                                     source=_SOURCE, header=ops + QMV_ROWS + finish)
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_fast_qproduct" if source == "product" else "mtplx_inkling_fast_qmv_rows_probe",
         input_names=["x", "codes", "scales", "biases"],
         output_names=["out"],
@@ -559,7 +560,7 @@ _OUTPUT = """
 
 @lru_cache(maxsize=1)
 def _output_kernel():
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_fast_qoutput",
         input_names=["hg", "codes", "scales", "biases", "cw", "tail", "x"],
         output_names=["partial", "attn"],
@@ -702,7 +703,7 @@ _rows_verdicts: dict = {}
 
 @lru_cache(maxsize=1)
 def _rows_kernel():
-    return mx.fast.metal_kernel(
+    return launch_limits.kernel(
         name="mtplx_inkling_fast_affine_rows",
         input_names=["ids", "codes", "scales", "biases"],
         output_names=["out"],

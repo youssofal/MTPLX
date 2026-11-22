@@ -20178,6 +20178,7 @@ def _health_inkling_attention_payload(state: Any) -> dict[str, Any]:
         from mtplx.models.inkling.head import inkling_first_use_stats
         from mtplx.models.inkling.short_conv import conv_route_counts
         from mtplx.models.inkling.fast.decoder import fast_health
+        from mtplx.models.inkling.launch_limits import report as launch_limit_report
 
         blocks = [layer.experts.gate_up for layer in state.runtime.model.layers]
         return {"inkling_attention": attention_health(),
@@ -20185,6 +20186,10 @@ def _health_inkling_attention_payload(state: Any) -> dict[str, Any]:
                 # the warm-up report and the depth controller's round costs on this Mac.
                 "inkling_fast": {**fast_health(state.runtime),
                                  "engine_warm": getattr(state.runtime, "engine_warm", None)},
+                # Issue #706: launches this GPU cannot run for their kernel's pipeline, what it allows, what
+                # served instead (a same-bits form in smaller groups, or the stage's reference), and how many
+                # pipelines were checked.
+                "inkling_launch_limits": launch_limit_report(),
                 "inkling_convolution": conv_route_counts(),
                 "inkling_first_use": inkling_first_use_stats(),
                 "inkling_experts": {"sorted_panel_calls": sum(block.sorted_panel_calls for block in blocks),

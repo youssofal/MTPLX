@@ -23,6 +23,7 @@ import os
 from functools import lru_cache
 
 import mlx.core as mx
+from .. import launch_limits
 
 from .library_gemm import gpu_generation
 from .routes import count
@@ -82,7 +83,7 @@ def _library():
 @lru_cache(maxsize=1)
 def _kernel():
     text, _why = _library()
-    return mx.fast.metal_kernel(name="mtplx_inkling_nax_profile", input_names=["rel", "basis"],
+    return launch_limits.kernel(name="mtplx_inkling_nax_profile", input_names=["rel", "basis"],
                                 output_names=["out"], source=_SOURCE,
                                 header=text + "\nusing namespace mlx::steel;\n")
 
