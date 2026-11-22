@@ -1533,6 +1533,18 @@ class TestRefusedBeforeTheStream:
         state, _ = self._mac(monkeypatch, available_gib=0.0)
         state.allow_swap = True
         assert srv._reject_memory_short_before_stream(state, 4049) is None
+        # An engine job holding the generation lock (an idle commit, a warm-up): the admission runs after it.
+        import threading
+
+        state, events = self._mac(monkeypatch, available_gib=0.0)
+        state.lock = threading.Lock()
+        with state.lock:
+            assert srv._reject_memory_short_before_stream(state, 4049) is None
+        assert events == []
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException):
+            srv._reject_memory_short_before_stream(state, 4049)
 
     def test_the_admission_refuses_every_request_it_refuses(self, monkeypatch):
         """On the real bank and admission: as another app takes more of the Mac, the early 507 starts only where

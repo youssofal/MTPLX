@@ -31242,7 +31242,9 @@ def _reject_prompt_over_context(state: ServerState, prompt_token_count: int) -> 
 def _reject_memory_short_before_stream(state: ServerState, prompt_token_count: int) -> None:
     """Refuse (507) before any stream opens a request the admission is sure to refuse.
 
-    Sure means: no request is running (whose end would give memory back), and
+    Sure means: no request or engine job is running (whose end would give
+    memory back), the session's own pending commit is settled (the call sits
+    after the prologue that waits for it), and
     the Mac's free and reclaimable memory, plus everything this engine could
     give back (its allocator pool, every byte the session bank holds, the
     snapshots its queued SSD writes hold and an idle vision tower), is already
@@ -31267,8 +31269,12 @@ def _reject_memory_short_before_stream(state: ServerState, prompt_token_count: i
         limit = caps.get("memory_limit_bytes") if isinstance(caps, dict) else None
         if not isinstance(limit, int) or limit <= 0:
             return None
-        in_flight = getattr(getattr(state, "dashboard", None), "in_flight", None)
-        if in_flight is not None and int(in_flight.count()) > 0:
+        # A request or engine job running now gives memory back (or banks it)
+        # when it ends; the admission runs after it, on what it leaves.
+        if _engine_busy_signal(state):
+            return None
+        locked = getattr(getattr(state, "lock", None), "locked", None)
+        if callable(locked) and locked():
             return None
         reading = _read_system_memory()
         if reading is None:
@@ -41318,7 +41324,6 @@ def create_app(state: ServerState) -> FastAPI:
                 resolved_mtp_depth=effective_request_depth,
             )
         _reject_prompt_over_context(state, len(prompt_ids))
-        _reject_memory_short_before_stream(state, len(prompt_ids))
         current_system_hash = system_prompt_hash(messages_for_generation)
         if current_system_hash is not None and not background:
             state.main_system_prompt_hash = current_system_hash
@@ -42106,6 +42111,10 @@ def create_app(state: ServerState) -> FastAPI:
                 except BaseException:
                     pass
 
+        # After the prologue: the session's pending commit is settled and the
+        # previous response's tail is out, so the Mac is read as the
+        # admission will read it.
+        _reject_memory_short_before_stream(state, len(prompt_ids))
         ttft_clock.mark("prologue")
         if request.stream:
 
@@ -45845,7 +45854,6 @@ def create_app(state: ServerState) -> FastAPI:
             # endpoint-discovery probes printed it as "python errors".
             raise HTTPException(status_code=400, detail="prompt must not be empty")
         _reject_prompt_over_context(state, len(prompt_ids))
-        _reject_memory_short_before_stream(state, len(prompt_ids))
         # Same admission-time yield as chat: a completions request holds no
         # session, so every pending idle commit is a stranger's — none can
         # help this request and any can stall it. Failures surface exactly
@@ -45862,6 +45870,7 @@ def create_app(state: ServerState) -> FastAPI:
                 except_session_id=None,
             )
         ttft_clock.mark("postcommit_sweep")
+        _reject_memory_short_before_stream(state, len(prompt_ids))
         policy = resolve_request_policy(
             state,
             request,
