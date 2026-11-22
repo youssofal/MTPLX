@@ -129,13 +129,15 @@ def _inkling_state(depth=3):
 
 
 @pytest.mark.parametrize("depth,explicit,env,mode,auto", [
-    (3, False, None, "mtp", True),       # the launch default: the controller chooses each round
+    (3, False, None, "mtp", False),      # the family default serves three proposals
+    (3, False, "auto", "mtp", True),     # the existing selector enables per-round choice
+    (3, True, "auto", "mtp", False),     # an explicit request still wins
     (3, True, None, "mtp", False),       # a client's depth wins
     (5, False, None, "mtp", False),      # a launch depth other than the default wins
     (3, False, "fixed", "mtp", False),   # pinned by the switch
     (3, False, None, "ar", False),       # no drafts in AR
 ])
-def test_inkling_depth_is_chosen_per_round_unless_pinned(monkeypatch, depth, explicit, env, mode, auto):
+def test_inkling_auto_depth_requires_the_selector_and_an_unpinned_request(monkeypatch, depth, explicit, env, mode, auto):
     from mtplx.server import openai
 
     if env:

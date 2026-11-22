@@ -97,6 +97,16 @@ class InklingCustomerControls(TestCase):
         self.assertEqual((stats.repetition_stop_raw_tokens, stats.repetition_stop_trimmed_tokens,
                           stats.repetition_stop_block_tokens, stats.repetition_stop_repeats), (10, 9, 1, 9))
 
+    def test_unset_draft_depth_runs_the_same_rounds_as_explicit_three(self):
+        with patch.dict(os.environ, {"MTPLX_INKLING_DEPTH": ""}):
+            default = self.decode(depth=None, limit=8)
+            fixed = self.decode(depth=3, limit=8)
+            two = self.decode(depth=2, limit=8)
+        self.assertEqual(default.stats.speculative_depth, 3)
+        self.assertIsNone(default.stats.inkling_draft_sampling["depth_choices"])
+        self.assertEqual((default.tokens, default.stats.drafted_tokens), (fixed.tokens, fixed.stats.drafted_tokens))
+        self.assertEqual(two.stats.speculative_depth, 2)
+
     def test_the_request_stats_carry_the_prompt_width_in_force(self):
         lengths = []  # the model's own width, which it picks from the prompt's length
         self.rt.prompt_chunk_rows = lambda prompt_tokens=None: lengths.append(prompt_tokens) or 512

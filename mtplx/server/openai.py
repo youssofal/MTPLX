@@ -33690,10 +33690,9 @@ def _inkling_auto_depth(
     effective_depth: int,
     request_observability: dict[str, Any] | None,
 ) -> bool:
-    """Inkling chooses each round's proposal count before its draws, from the yield of
-    earlier rounds and this Mac's round costs timed at load (exact: the choice depends only
-    on the past). A client's depth, a launch depth other than the family default, or
-    ``MTPLX_INKLING_DEPTH=fixed`` pins the depth instead."""
+    """An explicit client or launch depth takes precedence over per-round choice."""
+    from mtplx.models.inkling import default_draft_depth
+
     return (
         getattr(getattr(state, "runtime", None), "backend_id", None) == "inkling2_loop"
         and effective_mode != "ar"
@@ -33701,7 +33700,7 @@ def _inkling_auto_depth(
         and not bool((request_observability or {}).get("request_depth_explicit"))
         and int(getattr(state.args, "depth", 3) or 3)
         == _backend_descriptor(state).draft_semantics.default
-        and os.environ.get("MTPLX_INKLING_DEPTH", "auto").strip().lower() != "fixed"
+        and default_draft_depth() is None
     )
 
 
@@ -33829,6 +33828,11 @@ def _run_generation(
                 request_observability["inkling_round_cost_refused"] = [r.get("reason") for r in refused]
             if getattr(state.runtime, "round_cost_ms", None) is None:
                 request_observability["inkling_round_cost_detail"] = cost_detail
+    elif (request_observability is not None and effective_mode != "ar" and effective_depth > 0
+          and getattr(state.runtime, "backend_id", None) == "inkling2_loop"):
+        family_depth = _backend_descriptor(state).draft_semantics.default
+        fixed = request_observability.get("request_depth_explicit") or effective_depth != family_depth
+        request_observability["inkling_depth_policy"] = "fixed" if fixed else "default"
     # Include admission and pending-history waits in user-facing TTFT/wall
     # time. Decode still starts at the first produced token; throughput is
     # unaffected. Previously a 39s postcommit wait vanished from the receipt.

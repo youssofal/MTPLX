@@ -39,6 +39,7 @@ from .fast import round_program
 from .protocol import completion_text
 from .sampling import NativeDrawsAhead, draw_native, is_native_sampler
 from mtplx.token_ids import token_id_bytes
+from . import default_draft_depth
 
 
 def served_proposals(device_ok, draft_temperature, proposals, dspark_tokens, *, draft_config=None):
@@ -117,8 +118,8 @@ def generate(
 ):
     if rt.drafter is None:
         raise RuntimeError("DSpark requires the Inkling draft weights")
-    # depth None (no explicit depth from the operator or the client) = the per-round choice
-    # by measured yield; an explicit depth is kept exactly.
+    if depth is None:
+        depth = default_draft_depth()
     if depth is not None and not 1 <= depth < rt.drafter.width:
         raise ValueError(f"DSpark depth must be between 1 and {rt.drafter.width - 1}")
     start = perf_counter()
@@ -208,7 +209,7 @@ def generate(
                     and (draft_filters is not None or draft_temperature <= 0))
     program_decline = "client_controls" if controls is not None and not inline_floor else None
     device_rounds = device_fallback_rounds = host_rounds = 0
-    # No configured depth: the proposal count of each round is chosen before its draws from
+    # With per-round depth selected, the proposal count is chosen before its draws from
     # the yield of earlier rounds and this Mac's round costs (timed at load; RC6's table when
     # the fast path is off), so every round stays exact.
     depth_control = (fast_draft.DepthByYield(cost_ms=getattr(rt, "round_cost_ms", None) or fast_draft.RC6_COST_MS_2K,
