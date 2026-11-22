@@ -327,6 +327,16 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
     /// prompt sheet — and stamped no matter how the sheet was closed.
     /// `nil` means "never asked". Never cleared by the runtime.
     public var languagePromptCompletedAt: Date?
+    /// Launches of the app's own server that reached a loaded, ready model
+    /// (`MTPLXBackendStore.finishReadyDaemon`), counted up to
+    /// `starPromptLoadThreshold` for the one-time GitHub star prompt.
+    /// Adopting a server at app open, an automatic restart after a crash
+    /// and the embedding and reranker helpers do not count.
+    public var successfulModelLoads: Int
+    /// When the star prompt was answered: the star button, the issue
+    /// button, the close button or Escape. `nil` means never answered.
+    /// Never cleared by the runtime, so the prompt shows at most once.
+    public var starPromptCompletedAt: Date?
     /// Depth picked by onboarding or the most recent `mtplx tune` run
     /// on this Mac. Threaded into `mtplx serve --depth N` so every
     /// daemon launch honours the selected value. `nil` means the app
@@ -437,6 +447,8 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         lastHermesSessionTitle: String? = nil,
         onboardingCompletedAt: Date? = nil,
         languagePromptCompletedAt: Date? = nil,
+        successfulModelLoads: Int = 0,
+        starPromptCompletedAt: Date? = nil,
         lastTunedDepth: Int? = nil,
         lastTunedAt: Date? = nil,
         tunedControlRecord: TunedControlRecord? = nil,
@@ -517,6 +529,8 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         self.lastHermesSessionTitle = lastHermesSessionTitle
         self.onboardingCompletedAt = onboardingCompletedAt
         self.languagePromptCompletedAt = languagePromptCompletedAt
+        self.successfulModelLoads = max(0, successfulModelLoads)
+        self.starPromptCompletedAt = starPromptCompletedAt
         self.lastTunedDepth = lastTunedDepth
         self.lastTunedAt = lastTunedAt
         self.tunedControlRecord = tunedControlRecord
@@ -539,6 +553,20 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
     /// whose Language step is the prompt) and nobody has asked yet.
     public var shouldOfferLanguagePrompt: Bool {
         onboardingCompletedAt != nil && languagePromptCompletedAt == nil
+    }
+
+    /// The star prompt asks after this many successful model loads.
+    public static let starPromptLoadThreshold = 3
+
+    /// Whether the app owes the user the one-time GitHub star prompt:
+    /// onboarding is done, the third successful model load has happened
+    /// and the prompt was never answered. When it actually appears is the
+    /// app's call (a quiet moment: no sheet, popover, download, benchmark
+    /// or request in flight).
+    public var shouldOfferStarPrompt: Bool {
+        onboardingCompletedAt != nil
+            && starPromptCompletedAt == nil
+            && successfulModelLoads >= Self.starPromptLoadThreshold
     }
 
     /// Fresh installs must be portable. Installed local copies are discovered
@@ -790,6 +818,8 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         case lastHermesSessionTitle = "last_hermes_session_title"
         case onboardingCompletedAt = "onboarding_completed_at"
         case languagePromptCompletedAt = "language_prompt_completed_at"
+        case successfulModelLoads = "successful_model_loads"
+        case starPromptCompletedAt = "star_prompt_completed_at"
         case lastTunedDepth = "last_tuned_depth"
         case lastTunedAt = "last_tuned_at"
         case tunedControlRecord = "tuned_control_record"
@@ -903,6 +933,8 @@ public struct MTPLXAppConfiguration: Codable, Equatable, Sendable {
         lastHermesSessionTitle = field(String.self, .lastHermesSessionTitle)
         onboardingCompletedAt = field(Date.self, .onboardingCompletedAt)
         languagePromptCompletedAt = field(Date.self, .languagePromptCompletedAt)
+        successfulModelLoads = max(0, field(Int.self, .successfulModelLoads) ?? 0)
+        starPromptCompletedAt = field(Date.self, .starPromptCompletedAt)
         lastTunedDepth = field(Int.self, .lastTunedDepth)
         lastTunedAt = field(Date.self, .lastTunedAt)
         // A tune record with a missing or mistyped field carries nothing

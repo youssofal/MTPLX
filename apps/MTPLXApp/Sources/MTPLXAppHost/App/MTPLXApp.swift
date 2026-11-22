@@ -102,6 +102,9 @@ struct MTPLXApp: App {
     /// backend, not as a StateObject: nothing in this Scene observes it, so
     /// a new reading writes the item's title and never re-evaluates the Scene.
     @State private var menuBarController: MenuBarController
+    /// The one-time GitHub star prompt after the third model load. Held
+    /// like the backend: only `StarPromptLayer` observes it.
+    @State private var starPrompt = StarPromptPresenter()
     private let chatContainer: ModelContainer
     private let memoryPressureMonitor = AppMemoryPressureMonitor()
 
@@ -237,6 +240,7 @@ struct MTPLXApp: App {
                 .environmentObject(forgeOrchestrator)
                 .environmentObject(benchmarkOrchestrator)
                 .environmentObject(chatStoreRecovery)
+                .environmentObject(starPrompt)
                 .modelContainer(chatContainer)
                 .task {
                     // Wire the benchmark orchestrator to read the
@@ -297,6 +301,12 @@ struct MTPLXApp: App {
                             break
                         }
                     }
+                    starPrompt.attach(
+                        backend: backend,
+                        router: router,
+                        benchmark: benchmarkOrchestrator,
+                        forge: forgeOrchestrator
+                    )
                     // No auto-start during onboarding — the user hasn't
                     // even picked a model yet. After onboarding, the
                     // launch-on-open preference still applies for power

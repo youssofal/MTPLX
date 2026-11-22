@@ -633,10 +633,58 @@ public final class MTPLXBackendStore: ObservableObject {
     }
 
     public func saveSettings(_ next: MTPLXAppConfiguration) throws {
+        let next = keepingStarPromptRecord(next)
         configuration = next
         seedLiveSettingsFromConfiguration(next)
         supervisor.setAutomaticRestartEnabled(next.automaticDaemonRestart)
         try persistConfiguration(next)
+    }
+
+    /// One more launch reached a loaded, ready model. Counted for the
+    /// one-time star prompt until it is due, then never again: at most
+    /// `starPromptLoadThreshold` settings writes per install. Touches no
+    /// live setting and nothing the server reads.
+    func recordSuccessfulModelLoad() {
+        guard configuration.starPromptCompletedAt == nil,
+              configuration.successfulModelLoads < MTPLXAppConfiguration.starPromptLoadThreshold
+        else { return }
+        var next = configuration
+        next.successfulModelLoads += 1
+        persistStarPromptRecord(next)
+    }
+
+    /// The star prompt was answered (the star button, the issue button, the
+    /// close button or Escape): stamped so it never shows again.
+    public func markStarPromptCompleted(at date: Date = Date()) {
+        guard configuration.starPromptCompletedAt == nil else { return }
+        var next = configuration
+        next.starPromptCompletedAt = date
+        persistStarPromptRecord(next)
+    }
+
+    private func persistStarPromptRecord(_ next: MTPLXAppConfiguration) {
+        configuration = next
+        do {
+            try persistConfiguration(next)
+        } catch {
+            Task { [supervisor] in
+                await supervisor.logs.append(
+                    "settings: could not save the star prompt record (\(error.localizedDescription)); it is kept for this session",
+                    stream: .system
+                )
+            }
+        }
+    }
+
+    /// The star prompt's record is the app's, not the user's: a Settings
+    /// draft or any other copy taken before a load was counted, or before
+    /// the prompt was answered, must not wind it back (which would show the
+    /// prompt again). The count only grows and the stamp only appears.
+    private func keepingStarPromptRecord(_ next: MTPLXAppConfiguration) -> MTPLXAppConfiguration {
+        var kept = next
+        kept.successfulModelLoads = max(next.successfulModelLoads, configuration.successfulModelLoads)
+        kept.starPromptCompletedAt = next.starPromptCompletedAt ?? configuration.starPromptCompletedAt
+        return kept
     }
 
     /// Whether a live daemon may still be reading the entry. The daemon
@@ -803,6 +851,7 @@ public final class MTPLXBackendStore: ObservableObject {
         _ next: MTPLXAppConfiguration,
         restartIfRunning: Bool = true
     ) async throws {
+        let next = keepingStarPromptRecord(next)
         let previousModel = configuration.model
         let wasDegraded: Bool
         if case .degraded = daemonState { wasDegraded = true } else { wasDegraded = false }
@@ -4812,6 +4861,7 @@ public final class MTPLXBackendStore: ObservableObject {
         ) else { return }
         daemonState = .running
         startupPhase = .ready
+        recordSuccessfulModelLoad()
         let handoffCompleted = await launchClientHandoff(
             target: target,
             configuration: configuration,

@@ -1835,3 +1835,13 @@
 "Fastest Inkling 2 Mini: 4-bit attention and output, with vision and speculative decoding. FP16 build for M1 and M2 Macs." = "Inkling 2 Mini tercepat: atensi dan keluaran 4-bit, dengan dukungan gambar dan dekode spekulatif. Build FP16 untuk Mac M1 dan M2.";
 "Closer to the original weights: 8-bit attention, with vision and speculative decoding." = "Lebih dekat ke bobot asli: atensi 8-bit, dengan dukungan gambar dan dekode spekulatif.";
 "Closer to the original weights: 8-bit attention, with vision and speculative decoding. FP16 build for M1 and M2 Macs." = "Lebih dekat ke bobot asli: atensi 8-bit, dengan dukungan gambar dan dekode spekulatif. Build FP16 untuk Mac M1 dan M2.";
+
+/* The one-time GitHub star prompt after the third model load. */
+"Is everything working well?" = "Apakah semuanya berjalan dengan baik?";
+"If you like MTPLX, a star on GitHub would help the project a lot. Stars are how other Mac users find it." = "Jika Anda menyukai MTPLX, satu bintang di GitHub akan sangat membantu proyek ini. Dari bintang itulah pengguna Mac lain menemukannya.";
+"If something is not right, tell us and we will fix it." = "Jika ada yang tidak beres, beri tahu kami dan kami akan memperbaikinya.";
+"File an issue" = "Laporkan masalah";
+"Star on GitHub" = "Beri bintang di GitHub";
+"Opens a new issue on GitHub in your browser." = "Membuka laporan masalah baru di GitHub pada browser Anda.";
+"Opens the MTPLX page on GitHub in your browser." = "Membuka halaman MTPLX di GitHub pada browser Anda.";
+"Closes this message. It will not appear again." = "Menutup pesan ini. Pesan ini tidak akan muncul lagi.";

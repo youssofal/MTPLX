@@ -1835,3 +1835,13 @@
 "Fastest Inkling 2 Mini: 4-bit attention and output, with vision and speculative decoding. FP16 build for M1 and M2 Macs." = "最速の Inkling 2 Mini。アテンションと出力層は 4 ビット。画像入力と投機的デコーディングに対応。M1およびM2 Mac向けのFP16ビルド。";
 "Closer to the original weights: 8-bit attention, with vision and speculative decoding." = "元の重みにより近い。アテンションは 8 ビット。画像入力と投機的デコーディングに対応。";
 "Closer to the original weights: 8-bit attention, with vision and speculative decoding. FP16 build for M1 and M2 Macs." = "元の重みにより近い。アテンションは 8 ビット。画像入力と投機的デコーディングに対応。M1およびM2 Mac向けのFP16ビルド。";
+
+/* The one-time GitHub star prompt after the third model load. */
+"Is everything working well?" = "問題なく動いていますか？";
+"If you like MTPLX, a star on GitHub would help the project a lot. Stars are how other Mac users find it." = "MTPLXを気に入っていただけたら、GitHubでスターを付けていただけるとプロジェクトの大きな助けになります。スターは、ほかのMacユーザーがMTPLXを見つけるきっかけになります。";
+"If something is not right, tell us and we will fix it." = "うまく動かないところがあれば、お知らせください。修正します。";
+"File an issue" = "問題を報告";
+"Star on GitHub" = "GitHubでスターを付ける";
+"Opens a new issue on GitHub in your browser." = "ブラウザでGitHubの新しいIssueを開きます。";
+"Opens the MTPLX page on GitHub in your browser." = "ブラウザでGitHubのMTPLXページを開きます。";
+"Closes this message. It will not appear again." = "このメッセージを閉じます。今後は表示されません。";

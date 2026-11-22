@@ -362,6 +362,11 @@ struct ContentView: View {
             )
                 .equatable()
                 .zIndex(20)
+
+            // The one-time GitHub star prompt, above everything in the
+            // window; it waits for a quiet moment (StarPromptPresenter).
+            StarPromptLayer(performanceLock: snapshot.configuration.performanceLock)
+                .zIndex(30)
         }
         .animation(.smooth(duration: 0.32), value: router.benchmarkOverlayPresented)
     }
