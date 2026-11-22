@@ -30,8 +30,32 @@ def _working_set(device):
     return int(info.get("max_recommended_working_set_size") or 0.7 * int(memory))
 
 
+#: The memory limit the server applied to MLX in this process (``set_engine_limit``; MLX 0.32 has no getter).
+_engine_limit = {"bytes": None}
+
+
+def set_engine_limit(limit):
+    """Record the memory limit the server holds the engine to (its Metal limit, the line of the admission and
+    of the per-chunk check). Called once the model is loaded (``InklingRuntime.note_metal_memory_limit``)."""
+    _engine_limit["bytes"] = int(limit) if limit and int(limit) > 0 else None
+
+
+def room_line():
+    """What MLX may hold before a route's extra memory is declined: the GPU's recommended working set, or the
+    engine's memory limit where the server set it higher. macOS recommends two thirds of RAM to the GPU up to
+    36 GB and the memory plan gives the engine three quarters, so on a 24 GB Mac with Bare Speed (15.5 GiB
+    resident at a read) the working set left no room for the one-launch prompt attention past a read's first
+    chunk, though the plan, the admission and the per-chunk check all hold the engine to its 18 GiB (a cold
+    8K read on a simulated 24 GB Mac served 36 of 144 calls on it, 16K and 24K 16 and 14 of 48 in the first
+    chunk and none after; this Mac as itself, every call). The plan's own reads go above the working set by
+    design (the 2.13.1 24 GB read peaks at 16.8 GiB), so the line is the limit the engine is held to."""
+    line = _working_set(str(mx.default_device()))
+    limit = _engine_limit["bytes"]
+    return max(line, limit) if limit else line
+
+
 def fits_route(extra):
-    return mx.get_active_memory() + extra + 128 * 1024**2 < _working_set(str(mx.default_device()))
+    return mx.get_active_memory() + extra + 128 * 1024**2 < room_line()
 
 
 def pack_proofs(path):

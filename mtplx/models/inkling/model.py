@@ -819,3 +819,24 @@ def load_target(directory):
     for layer in model.layers:
         layer.experts.gate_up.proof_pack = layer.experts.down.proof_pack = model.proof_pack
     return model, vision, config
+
+
+def load_vision_weights(directory):
+    """The vision tower's tensors, mapped from the pack again as ``load_target`` maps them: nothing is read
+    until the tower runs. A tower an image turn read in gives its memory back by being replaced with these
+    (``InklingRuntime.release_idle_vision``)."""
+    path = Path(directory)
+    config = json.loads((path / "config.json").read_text())
+    prefix = "model.visual."
+    if any(key.startswith(prefix) for key in config.get("mtplx_inkling_precision", {})):
+        raise ValueError("Inkling vision tower tensors are stored at the source precision")
+    index = json.loads((path / "model.safetensors.index.json").read_text())["weight_map"]
+    wanted = {key for key in index if key.startswith(prefix)}
+    vision = {}
+    for shard in sorted({index[key] for key in wanted}):
+        for key, value in mx.load(str(path / shard)).items():
+            if key in wanted and index[key] == shard:
+                vision[key.removeprefix(prefix)] = value
+    if not vision or len(vision) != len(wanted):
+        raise ValueError("Missing tensors in Inkling vision tower")
+    return vision

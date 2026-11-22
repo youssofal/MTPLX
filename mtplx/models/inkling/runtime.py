@@ -21,7 +21,7 @@ from .fast.state import MAX_PANEL
 from .fast.step import wide_rows_exact
 from .cache import settle_bank_steps, size_global_banks
 from .layout import cache_footprint
-from .model import load_target
+from .model import load_target, load_vision_weights
 from .vision import VisionTower
 
 
@@ -154,6 +154,35 @@ class InklingRuntime(MTPLXRuntime):
     #: bank empty was 148 MB above the resident weights, the pool and the load's 33 MB, and stayed there
     #: through requests from 4K to 20K. Priced with the load's arrays until the load builds them itself.
     WARMUP_ARRAYS_BYTES = 160 << 20
+
+    def note_metal_memory_limit(self, limit):
+        """The server's Metal memory limit, stamped after the load: the room line of the routes that weigh
+        their extra memory (``head.room_line``), so a 24 to 36 GB Mac's reads use the limit the engine is held
+        to rather than the GPU's recommended working set below it."""
+        from .head import set_engine_limit
+
+        set_engine_limit(limit)
+
+    def idle_vision_bytes(self):
+        """What ``release_idle_vision`` would give back now: the tower's bytes once an image has run, else 0."""
+        tower = self.vision_tower
+        return int(tower.nbytes) if tower.resident else 0
+
+    def release_idle_vision(self):
+        """Give back the vision tower's memory: the memory guard's last step before refusing a request (the
+        admission's, and the per-chunk check's before it stops a read). The request's own images are already
+        encoded by then. A new tower mapped from the pack replaces this one whole, so an encode running beside
+        it finishes on the tower it started with, and the next new image reads the same weights from the pack
+        (0.59 GiB on Bare Speed). Returns the bytes let go, 0 when the tower held none. On a simulated 24 GB
+        Mac with 4.5 GiB of other apps, a cold 24K text prompt after an image turn was refused 0.20 GiB short
+        while the tower sat idle (`x1-fix-24gb-turns2`)."""
+        held = self.idle_vision_bytes()
+        if held <= 0:
+            return 0
+        tower = self.vision_tower
+        self.vision_tower = VisionTower(tower.cfg, load_vision_weights(self.model_path))
+        self.vision_tower_releases = int(getattr(self, "vision_tower_releases", 0)) + 1
+        return held
 
     def measure_load_extra_bytes(self):
         """MLX's active memory now, less the target's and the drafter's weights and the engine's

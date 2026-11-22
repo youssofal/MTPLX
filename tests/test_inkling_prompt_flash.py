@@ -34,7 +34,7 @@ def _clipped(shape, limit, key, dtype):
 
 
 def _no_crossover(monkeypatch):
-    for name in ("SHORT_PROMPT", "SHORT_PROMPT_WIDE", "SHORT_PROMPT_SIMD", "SHORT_PROMPT_WIDE_SIMD"):
+    for name in ("SHORT_PROMPT", "SHORT_PROMPT_512", "SHORT_PROMPT_WIDE", "SHORT_PROMPT_SIMD", "SHORT_PROMPT_WIDE_SIMD"):
         monkeypatch.setattr(F, name, 0)
 
 
@@ -406,12 +406,30 @@ def _limit():
     wide = F._read_width() >= F.WIDE_READ_ROWS
     if F.form() == "simd":
         return F.SHORT_PROMPT_WIDE_SIMD if wide else F.SHORT_PROMPT_SIMD
+    if F._read_width() == 512:
+        return F.SHORT_PROMPT_512
     return F.SHORT_PROMPT_WIDE if wide else F.SHORT_PROMPT
+
+
+@pytest.mark.parametrize("ram_gib", [18, 24, 36, 128])
+def test_512_row_tensor_crossover_follows_width_on_every_mac(monkeypatch, ram_gib):
+    monkeypatch.setattr(F, "form", lambda: "tensor")
+    monkeypatch.setattr(mx, "device_info", lambda *args: {"memory_size": ram_gib * 1024**3})
+    for length in (1024, 2048, 4095, 4096, 6144):
+        monkeypatch.setenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", str(length))
+        assert F.short_prompt(512, width=512) == (length < 4096)
+
+    monkeypatch.setenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", "2048")
+    assert F.short_prompt(512, width=1024)
+    assert F.short_prompt(512, width=2048)
+    monkeypatch.setattr(F, "form", lambda: "simd")
+    assert F.short_prompt(512, width=512)
 
 
 def test_the_crossover_follows_the_reads_width(monkeypatch):
     from mtplx.generation import prefill_chunk_size_override
 
+    monkeypatch.setattr(F, "SHORT_PROMPT_512", 6000)
     for narrow, wide in (("SHORT_PROMPT", "SHORT_PROMPT_WIDE"), ("SHORT_PROMPT_SIMD", "SHORT_PROMPT_WIDE_SIMD")):
         monkeypatch.setattr(F, narrow, 6000)                         # both forms' knobs (X1, 01:03: an M4 reads the
         monkeypatch.setattr(F, wide, 2000)                           # plain form's)
@@ -475,6 +493,52 @@ def test_no_room_for_the_stage_reads_on_the_default_route(monkeypatch):
     assert _rel_rms(got, want.astype(mx.float32)) <= 4 * BOUND[mx.bfloat16]
     room(F.EXTRA_PEAK_BYTES + 2 * bank)
     assert _route(monkeypatch, full, 0, prompt=prompt)[0] == f"prompt_stage.full.{F.selected()}"
+
+
+def test_the_room_line_is_the_engines_limit_where_the_server_set_it_above_the_working_set(monkeypatch):
+    """A 24 GB Mac: macOS recommends 16 GiB to the GPU, the server holds the engine to 18 GiB. 2.13.1 read
+    against the working set and declined the one-launch attention on nearly every call past a read's first
+    chunk (a simulated 24 GB Mac, `x1-fix-24gb-causes`); the line is the engine's limit there, as the server
+    stamps it after the load. Where the working set is the larger (this 128 GB Mac: 120 GiB against a 90 GiB
+    limit) it stays the line, and with no limit stamped (a harness, a test) the line is the working set."""
+    from mtplx.models.inkling import head as H
+    from mtplx.models.inkling.runtime import InklingRuntime
+
+    gib = 1024**3
+    monkeypatch.setattr(H, "_engine_limit", {"bytes": None})
+    monkeypatch.setattr(H, "_working_set", lambda device: 16 * gib)
+    assert H.room_line() == 16 * gib
+    InklingRuntime.note_metal_memory_limit(object(), 18 * gib)
+    assert H.room_line() == 18 * gib
+    monkeypatch.setattr(H, "_working_set", lambda device: 120 * gib)
+    H.set_engine_limit(90 * gib)
+    assert H.room_line() == 120 * gib
+    H.set_engine_limit(0)
+    assert H.room_line() == 120 * gib
+
+
+def test_a_24gb_mac_reads_on_the_stage_up_to_its_engine_limit(monkeypatch):
+    """The chunk the working set refused: MLX holds the working set less 0.3 GiB, the engine's limit is 2 GiB
+    above the working set. The stage reads it; with no limit above the working set it reads on the default
+    route, counted ``memory``, as in 2.13.1."""
+    from mtplx.models.inkling import head as H
+
+    _no_crossover(monkeypatch)
+    gib = 1024**3
+    window = _layer(True, mx.bfloat16, 71)
+    monkeypatch.setattr(H, "_engine_limit", {"bytes": None})
+
+    def mac(limit_above):
+        ws = mx.get_active_memory() + int(0.3 * gib)
+        monkeypatch.setattr(H, "_working_set", lambda device: ws)
+        H.set_engine_limit(ws + limit_above if limit_above else 0)
+
+    mac(2 * gib)
+    assert _route(monkeypatch, window, 0, prompt=32 * 1024)[0] == f"prompt_stage.window.{F.selected()}"
+    mac(0)
+    moved, got, want = _route(monkeypatch, window, 0, prompt=32 * 1024)
+    assert moved == ["prompt_stage.window.stock.memory", "prompt_flash.window.stock.memory"]
+    assert _same_bits(got, want)
 
 
 def test_the_bank_bytes_are_what_the_bank_takes(monkeypatch):

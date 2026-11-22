@@ -935,9 +935,12 @@ def window_update(kv, keys, values):
 #: Wide: 4,096. Bare Speed, 4,097 tokens at 2,048 rows, in process through the product's prefill, the stage
 #: read in 1.91 s against stock's 2.57 (and 2.79 against 3.52 in an earlier run, both after the same warm-up,
 #: the stage read second; lanes/p2/posacc-bare-2.json, posacc-bare-1.json), every prompt position inside stock's
-#: own re-cut spread against the exact reference. Narrow: 8,192 until a 512-row read below it is measured
-#: (at 1,024 tokens the two tie: 0.66 against 0.65 s).
+#: own re-cut spread against the exact reference. Narrow: 8,192, except for the 512-row tensor read below.
 SHORT_PROMPT = 8192
+#: At 512 rows, 4K and 6K reached the first token sooner with a lower peak in both Nominal orders.
+#: At 2K one order took longer and peaked higher. See the inkling-fast-20261121 A3 receipts
+#: bytes-a3-g24-width-20261122T182702Z.json and bytes-a3-g24-width-paired-20261122T183216Z.json.
+SHORT_PROMPT_512 = 4096
 SHORT_PROMPT_WIDE = 4096
 #: The plain form on a GPU without tensor units (M1 to M4). Wide: from 4,096 tokens, as on M5, measured on that path
 #: (the M1 to M4 rehearsal switch, Optimized Quality, official weights, Nominal; P1's `lanes/p1/m4-table.md`, jobs
@@ -966,8 +969,11 @@ def short_prompt(keys, width=None):
     total = _prompt_tokens()
     width = _read_width() if width is None else width
     wide = width >= WIDE_READ_ROWS
-    if form() == "simd":
+    launch = form()
+    if launch == "simd":
         limit = SHORT_PROMPT_WIDE_SIMD if wide else SHORT_PROMPT_SIMD
+    elif launch == "tensor" and width == 512:
+        limit = SHORT_PROMPT_512
     else:
         limit = SHORT_PROMPT_WIDE if wide else SHORT_PROMPT
     return max(total if total <= MAX_PROMPT else 0, keys) < limit

@@ -1376,6 +1376,263 @@ def test_a_detached_refusal_drops_both_of_its_chained_exceptions():
     assert first.__context__ is None
 
 
+class TestReleasedMemoryLeavesTheFootprint:
+    """MLX gives its pool back (on its own at its limit, or when the guard sheds) and the process's footprint
+    keeps those pages for a few tens of milliseconds. 2.13.1 on a simulated 24 GB Mac, Bare Speed, the process
+    read every 20 ms (`x1-fix-24gb-mem`): 2.45 GiB beyond MLX's account 30 ms after a 1.85 GiB pool went back,
+    0.83 GiB (the steady figure) before and 30 ms after. The per-chunk check stopped a cold 8K read on such a
+    reading: the bytes were in neither the pool nor the Mac's free pages."""
+
+    RAM, OTHER_APPS, HOST, ACTIVE = 24 * GIB, int(4.5 * GIB), int(0.83 * GIB), int(15.6 * GIB)
+
+    def _mac(self, monkeypatch, lingering):
+        """``lingering``: footprint beyond the steady host memory at each successive read of the process."""
+        import time as _time
+
+        left = list(lingering)
+        reads = {"n": 0}
+
+        def footprint(*args, **kwargs):
+            reads["n"] += 1
+            extra = left.pop(0) if left else 0
+            return self.ACTIVE + self.HOST + extra
+
+        def reader():
+            fp = self.ACTIVE + self.HOST + (left[0] if left else 0)
+            available = self.RAM - fp - self.OTHER_APPS
+            return sm.SystemMemory(
+                available_bytes=available, total_bytes=self.RAM, level_percent=10, free_bytes=available,
+                file_backed_bytes=0, wired_bytes=18 * GIB, compressor_bytes=GIB, swap_used_bytes=0,
+                monotonic_s=_time.monotonic(),
+            )
+
+        monkeypatch.setattr(sm, "_reader", reader)
+        monkeypatch.setattr(srv, "_PREFILL_SYSTEM_CHECK_INTERVAL_S", 0.0)
+        monkeypatch.setattr(srv, "_RELEASE_SETTLE_POLL_S", 0.0)
+        monkeypatch.setattr(
+            srv, "_mlx_memory_stats_live",
+            lambda: {"ok": True, "active_memory_bytes": self.ACTIVE, "cache_memory_bytes": 0},
+        )
+        monkeypatch.setattr(srv, "phys_footprint_bytes", footprint)
+        state = SimpleNamespace(dashboard=SimpleNamespace(), allow_swap=False,
+                                metal_memory_caps={"memory_limit_bytes": 18 * GIB})
+        return state, reads
+
+    def test_a_read_taken_while_the_pool_leaves_waits_for_it(self, monkeypatch):
+        # The guard learns the steady figure at the request's start, then reads while 1.6 GiB is on its way out.
+        state, _ = self._mac(monkeypatch, [0, int(1.6 * GIB), int(1.6 * GIB), int(0.8 * GIB), 0])
+        guard = srv._PrefillSystemGuard(state, chunk_reserve_bytes=int(0.81 * GIB))
+        assert guard() is False
+        assert guard.settles == 1
+        assert guard.settle_last["timed_out"] is False
+        assert guard.settle_last["reason_after"] is None
+        assert guard.trajectory()["footprint_settles"] == 1
+
+    def test_memory_that_stays_still_stops_the_read(self, monkeypatch):
+        # Held, not leaving: the wait runs out (a quarter second at most) and the Mac's floor stops the read.
+        monkeypatch.setattr(srv, "_RELEASE_SETTLE_MAX_S", 0.02)
+        state, _ = self._mac(monkeypatch, [0] + [int(1.6 * GIB)] * 100000)
+        guard = srv._PrefillSystemGuard(state, chunk_reserve_bytes=int(0.81 * GIB))
+        assert guard() is True
+        assert guard.tripped["reason"] == "under_abort_floor"
+        assert guard.tripped["footprint_settles"] >= 1
+        assert guard.tripped["footprint_settle_last"]["timed_out"] is True
+        # What stayed is this process's: later checks do not wait for it again.
+        assert guard.steady_overhang >= self.HOST + int(1.6 * GIB) - srv._RELEASE_SETTLE_SLACK_BYTES
+
+    def test_a_steady_footprint_is_read_once(self, monkeypatch):
+        # Nothing on its way out: the check reads once, as before.
+        state, reads = self._mac(monkeypatch, [])
+        guard = srv._PrefillSystemGuard(state, chunk_reserve_bytes=int(0.81 * GIB))
+        before = reads["n"]
+        assert guard() is False
+        assert guard.settles == 0
+        assert reads["n"] - before <= 2
+
+
+class TestRefusedBeforeTheStream:
+    """A request the admission is sure to refuse gets its 507 before the stream opens. 2.13.1 on a simulated 24 GB
+    Mac, Bare Speed, another app holding a 13.7 GB model: HTTP 200, then the admission's 507 as an error event
+    15 ms later, no token (`x1-fix-24gb-hog`). Sure: nothing in flight, and the Mac's free memory plus all the engine
+    could give back (its pool, its bank, the snapshots queued SSD writes hold) is under the abort floor (here
+    18 GiB wired / 16 = 1.125 GiB) before the request adds a byte."""
+
+    RAM = 24 * GIB
+
+    def _mac(self, monkeypatch, *, available_gib, pool_gib=0.0, bank_gib=0.0, queued_gib=0.0, vision_gib=0.0,
+             in_flight=0, limit=18 * GIB):
+        import time as _time
+
+        available = int(available_gib * GIB)
+
+        def reader():
+            return sm.SystemMemory(
+                available_bytes=available, total_bytes=self.RAM, level_percent=2, free_bytes=available,
+                file_backed_bytes=0, wired_bytes=18 * GIB, compressor_bytes=GIB, swap_used_bytes=0,
+                monotonic_s=_time.monotonic(),
+            )
+
+        monkeypatch.setattr(sm, "_reader", reader)
+        monkeypatch.setitem(srv._STEADY_OVERHANG, "bytes", None)
+        monkeypatch.setattr(
+            srv, "_mlx_memory_stats_live",
+            lambda: {"ok": True, "active_memory_bytes": 15 * GIB, "cache_memory_bytes": int(pool_gib * GIB)},
+        )
+        events: list[dict] = []
+        monkeypatch.setattr(srv, "_record_guard_event", lambda state, payload: events.append(payload))
+        bank = SimpleNamespace(total_nbytes=int(bank_gib * GIB), queued_persistence_bytes=int(queued_gib * GIB))
+        state = SimpleNamespace(
+            allow_swap=False,
+            metal_memory_caps={"memory_limit_bytes": limit} if limit else None,
+            dashboard=SimpleNamespace(in_flight=SimpleNamespace(count=lambda: in_flight)),
+            sessions=SimpleNamespace(bank=bank),
+            runtime=SimpleNamespace(idle_vision_bytes=lambda: int(vision_gib * GIB)),
+        )
+        return state, events
+
+    def test_a_mac_already_under_its_floor_is_refused_before_the_stream(self, monkeypatch):
+        from fastapi import HTTPException
+
+        state, events = self._mac(monkeypatch, available_gib=0.0)
+        with pytest.raises(HTTPException) as caught:
+            srv._reject_memory_short_before_stream(state, 4049)
+        assert caught.value.status_code == 507
+        detail = caught.value.detail
+        assert detail["code"] == "insufficient_memory"
+        assert "0.0 GiB free" in detail["message"] and "Close some apps" in detail["message"]
+        assert detail["memory"]["refusal_reason"] == "system_memory_short_before_request"
+        assert detail["memory"]["prompt_tokens"] == 4049
+        [event] = events
+        assert event["action"] == "memory_refused_before_stream"
+
+    def test_everything_the_engine_could_give_back_counts(self, monkeypatch):
+        from fastapi import HTTPException
+
+        # 0.3 free + 0.3 pool + 0.3 banked = 0.9 GiB, under 1.125: refused.
+        state, _ = self._mac(monkeypatch, available_gib=0.3, pool_gib=0.3, bank_gib=0.3)
+        with pytest.raises(HTTPException):
+            srv._reject_memory_short_before_stream(state, 300)
+        # 0.3 GiB more held by queued SSD writes, which the admission can cancel: 1.2 GiB, left to the admission.
+        state, events = self._mac(monkeypatch, available_gib=0.3, pool_gib=0.3, bank_gib=0.3, queued_gib=0.3)
+        assert srv._reject_memory_short_before_stream(state, 300) is None
+        assert events == []
+        # The idle vision tower an image turn read in, which the admission gives back last: left to it too.
+        state, events = self._mac(monkeypatch, available_gib=0.3, pool_gib=0.3, bank_gib=0.3, vision_gib=0.59)
+        assert srv._reject_memory_short_before_stream(state, 300) is None
+        assert events == []
+
+    def test_every_other_case_is_left_to_the_admission(self, monkeypatch):
+        for kwargs in (
+            {"in_flight": 1},  # a request running now gives memory back when it ends
+            {"limit": None},  # no engine limit: the admission admits without pricing
+            {"available_gib": 2.0},  # over the floor: the admission prices the request's growth
+        ):
+            state, events = self._mac(monkeypatch, **{"available_gib": 0.0, **kwargs})
+            assert srv._reject_memory_short_before_stream(state, 4049) is None, kwargs
+            assert events == []
+        state, _ = self._mac(monkeypatch, available_gib=0.0)
+        state.allow_swap = True
+        assert srv._reject_memory_short_before_stream(state, 4049) is None
+        # An engine job holding the generation lock (an idle commit, a warm-up): the admission runs after it.
+        import threading
+
+        state, events = self._mac(monkeypatch, available_gib=0.0)
+        state.lock = threading.Lock()
+        with state.lock:
+            assert srv._reject_memory_short_before_stream(state, 4049) is None
+        assert events == []
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException):
+            srv._reject_memory_short_before_stream(state, 4049)
+
+    def test_the_admission_refuses_every_request_it_refuses(self, monkeypatch):
+        """On the real bank and admission: as another app takes more of the Mac, the early 507 starts only where
+        the admission, after giving back the pool and the idle conversation, refuses too."""
+
+        from fastapi import HTTPException
+
+        verdicts = []
+        # The hog replay's 4K turn: 0.32 GiB banked from the short prompt before it, an empty pool, 0.0 GiB free.
+        for others_gib in (6.0, 9.0, 9.8, 10.3, 10.6, 11.5):
+            state, manager = self._real(monkeypatch, others_gib=others_gib)
+            try:
+                srv._reject_memory_short_before_stream(state, 300)
+                early = False
+            except HTTPException as exc:
+                assert exc.status_code == 507
+                early = True
+            receipt = srv._prefill_admission_shed(
+                state, prompt_ids=list(range(2_000_000, 2_000_300)), session_bank=manager.bank,
+                session_id="anon-new",
+            )
+            refused = bool(receipt and receipt.get("refused"))
+            verdicts.append((others_gib, early, refused))
+            if early:
+                assert refused, verdicts
+                assert receipt["refusal_reason"] == "system_memory_short_after_reclamation"
+        # Not vacuous: some early refusals, a band the admission alone refuses (the request's own growth), and
+        # requests both admit.
+        assert any(early for _, early, _ in verdicts), verdicts
+        assert any(refused and not early for _, early, refused in verdicts), verdicts
+        assert any(not refused for _, _, refused in verdicts), verdicts
+
+    def _real(self, monkeypatch, *, others_gib, tower_gib=0.0, releasable=False):
+        """The real bank and admission on a simulated 24 GB Mac: 12 GiB of the engine's own (plus an image
+        turn's vision tower, ``tower_gib``, given back on request when ``releasable``), 0.1 GiB pooled, 0.30 GiB
+        banked by an idle conversation, 0.8 GiB of host memory, and ``others_gib`` held by other apps."""
+        import time as _time
+
+        manager = _manager()
+        _put(manager.bank, range(10_000), session_id="anon-idle", row_bytes=FN_ROW)  # 0.30 GiB
+        machine = _Machine(manager.bank, base_gib=12.0 + tower_gib, cache_gib=0.1, host_gib=0.8)
+        _install(monkeypatch, machine)
+        others = int(others_gib * GIB)
+
+        def reader():
+            fp = machine.footprint()
+            available = max(0, self.RAM - fp - others)
+            return sm.SystemMemory(
+                available_bytes=available, total_bytes=self.RAM, level_percent=2, free_bytes=available,
+                file_backed_bytes=0, wired_bytes=min(self.RAM, fp + 2 * GIB), compressor_bytes=GIB,
+                swap_used_bytes=0, monotonic_s=_time.monotonic(),
+            )
+
+        monkeypatch.setattr(sm, "_reader", reader)
+        monkeypatch.setitem(srv._STEADY_OVERHANG, "bytes", None)
+        state = _flash_next_state(manager, limit_gib=18)
+        state.dashboard = SimpleNamespace(in_flight=SimpleNamespace(count=lambda: 0))
+        if releasable:
+            tower = {"bytes": int(tower_gib * GIB)}
+
+            def release_idle_vision():
+                held, tower["bytes"] = tower["bytes"], 0
+                machine.base -= held
+                return held
+
+            state.runtime.idle_vision_bytes = lambda: tower["bytes"]
+            state.runtime.release_idle_vision = release_idle_vision
+        return state, manager
+
+    def test_an_idle_vision_tower_goes_before_a_refusal(self, monkeypatch):
+        """The admission's last step: the tower an image turn read in (0.59 GiB on the packs) leaves before a
+        refusal. Here the request is 0.2 to 0.3 GiB short without it, as the 24K after `x1-fix-24gb-turns2`'s
+        image turn was."""
+
+        receipts = {}
+        for releasable in (False, True):
+            state, manager = self._real(monkeypatch, others_gib=8.7, tower_gib=0.59, releasable=releasable)
+            assert srv._reject_memory_short_before_stream(state, 300) is None
+            receipts[releasable] = srv._prefill_admission_shed(
+                state, prompt_ids=list(range(2_000_000, 2_000_300)), session_bank=manager.bank,
+                session_id="anon-new",
+            )
+        assert receipts[False]["refused"] is True
+        assert receipts[True].get("refused") is not True, receipts[True]
+        assert receipts[True]["reclamation_steps"][-1] == "idle_vision_tower"
+        assert receipts[True]["vision_tower_released_bytes"] == int(0.59 * GIB)
+
+
 class _LoopBank:
     def __init__(self, total, max_bytes):
         self.total_nbytes = total
@@ -1529,6 +1786,48 @@ class TestPressureLoop:
         bank = _LoopBank(total=8 * GIB, max_bytes=8 * GIB)
         _run_loop(_loop_state(bank), monkeypatch, seconds=0.05)
         assert bank.calls == [(0, "memory_pressure_critical")]
+
+    def test_the_sustained_abort_counts_the_engines_pool_as_the_per_chunk_check_does(self, monkeypatch):
+        """A 24 GB Mac mid-read: free pages 0.2 GiB under the 1.25 GiB abort floor, 0.8 GiB in the engine's
+        pool, which MLX reuses before it asks the Mac for more. Every chunk's check passes with the pool
+        counted; on free pages alone the abort armed after three ticks and stopped the read
+        (`x1-fix-24gb-proof2`: a 24K read at its 43rd of 49 chunks). With an empty pool it still arms, and a
+        death signature still arms whatever the pool holds."""
+
+        monkeypatch.setattr(srv, "_engine_busy_signal", lambda state: True)
+        monkeypatch.setattr(srv, "_SYSTEM_SHORT_INTERVAL_S", 0.01)
+
+        def short(compressor_gib=1.0, at_s=0.0):
+            return sm.SystemMemory(
+                available_bytes=int(1.05 * GIB), total_bytes=24 * GIB, level_percent=4,
+                free_bytes=int(1.05 * GIB), file_backed_bytes=0, wired_bytes=20 * GIB,
+                compressor_bytes=int(compressor_gib * GIB), swap_used_bytes=0, monotonic_s=at_s,
+            )
+
+        def pool(gib):
+            monkeypatch.setattr(
+                srv, "_mlx_memory_stats_live",
+                lambda: {"ok": True, "active_memory_bytes": 15 * GIB, "cache_memory_bytes": int(gib * GIB)},
+            )
+
+        for pool_gib, armed in ((0.8, False), (0.0, True)):
+            pool(pool_gib)
+            monkeypatch.setattr(sm, "_reader", short)
+            state = _loop_state(_LoopBank(total=0, max_bytes=8 * GIB))
+            _run_loop(state, monkeypatch, seconds=0.15, interval_s=0.01)
+            assert srv._pressure_abort_requested(state) is armed, pool_gib
+        # The compressor growing fast while free pages are under the floor: critical with the pool full.
+        pool(0.8)
+        ticks = iter(range(10_000))
+
+        def thrashing():
+            i = next(ticks)
+            return short(compressor_gib=1.0 + 0.5 * i, at_s=0.25 * i)
+
+        monkeypatch.setattr(sm, "_reader", thrashing)
+        state = _loop_state(_LoopBank(total=0, max_bytes=8 * GIB))
+        _run_loop(state, monkeypatch, seconds=0.15, interval_s=0.01)
+        assert srv._pressure_abort_requested(state) is True
 
 
 class TestPlannerReserve:

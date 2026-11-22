@@ -538,3 +538,84 @@ def test_every_conversation_inside_the_window_can_take_its_next_turn():
         args = dict(total_ram_bytes=ram * gib, model_weights_bytes=8 * gib, kv_bytes_per_token=65536,
                     model_max_context=262144)
         assert plan_memory(**args).to_dict() == plan_memory(**args, turn_reserve_bytes=0).to_dict(), ram
+
+
+def _tiny_vision_pack(path):
+    """A pack directory holding a one-block vision tower and one text tensor beside it in the same shard."""
+    import json
+
+    import mlx.core as mx
+
+    tensors = {
+        "model.visual.backbone.layers.0.ln_1.weight": mx.arange(8, dtype=mx.bfloat16),
+        "model.visual.backbone.layers.0.ln_1.bias": mx.ones((8,), dtype=mx.bfloat16),
+        "model.visual.backbone.embeddings.patch_embedding.weight": mx.arange(32, dtype=mx.bfloat16).reshape(4, 8),
+        "model.visual.backbone.embeddings.position_embedding": mx.ones((4, 8), dtype=mx.bfloat16),
+        "model.visual.backbone.embeddings.class_embedding": mx.ones((8,), dtype=mx.bfloat16),
+        "model.visual.backbone.embeddings.cls_position_embedding": mx.zeros((8,), dtype=mx.bfloat16),
+        "model.visual.backbone.ln_pre.weight": mx.ones((8,), dtype=mx.bfloat16),
+        "model.visual.backbone.ln_pre.bias": mx.zeros((8,), dtype=mx.bfloat16),
+        "model.visual.proj_in.weight": mx.ones((8, 8), dtype=mx.bfloat16),
+        "model.visual.proj_out.weight": mx.ones((8, 8), dtype=mx.bfloat16),
+        "model.llm.embed_tokens.weight": mx.ones((16, 8), dtype=mx.bfloat16),
+    }
+    shard = "model-00001-of-00001.safetensors"
+    mx.save_safetensors(str(path / shard), tensors)
+    (path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {k: shard for k in tensors}}))
+    vision_config = {"num_hidden_layers": 1, "num_attention_heads": 1, "layer_norm_eps": 1e-6}
+    (path / "config.json").write_text(json.dumps({"model_type": "inkling2_loop", "vision_config": vision_config}))
+    return tensors, vision_config
+
+
+def test_an_idle_vision_tower_gives_its_memory_back_and_maps_the_same_weights_again(tmp_path):
+    """The memory guard's last step before refusing (`x1-fix-24gb-turns2`: a cold 24K text prompt after an image
+    turn, refused 0.20 GiB short beside the idle 0.59 GiB tower). Bit-identical: the new tower maps the pack's
+    bytes."""
+    import mlx.core as mx
+
+    from mtplx.models.inkling.model import load_vision_weights
+    from mtplx.models.inkling.vision import VisionTower
+
+    tensors, vision_config = _tiny_vision_pack(tmp_path)
+
+    class Runtime:
+        idle_vision_bytes = InklingRuntime.idle_vision_bytes
+        release_idle_vision = InklingRuntime.release_idle_vision
+
+    runtime = Runtime()
+    runtime.model_path = tmp_path
+    runtime.vision_tower = VisionTower(vision_config, load_vision_weights(tmp_path))
+    # Never ran an image: nothing read in, nothing to give back.
+    assert runtime.idle_vision_bytes() == 0
+    assert runtime.release_idle_vision() == 0
+    first = runtime.vision_tower
+    first.resident = True  # what encode() sets as an image runs
+    # The tower's own arrays: the class and class-position embeddings are one array once it is built.
+    held = sum(int(v.nbytes) for k, v in tensors.items() if k.startswith("model.visual.")) - int(
+        tensors["model.visual.backbone.embeddings.cls_position_embedding"].nbytes)
+    assert first.nbytes == held
+    assert runtime.idle_vision_bytes() == held
+    assert runtime.release_idle_vision() == held
+    second = runtime.vision_tower
+    assert second is not first and second.resident is False
+    assert runtime.idle_vision_bytes() == 0 and runtime.vision_tower_releases == 1
+    for name in ("patch", "pos", "cls", "norm_weight", "norm_bias", "project_in", "project_out"):
+        assert mx.array_equal(getattr(first, name), getattr(second, name)).item()
+    assert sorted(first.blocks[0].w) == sorted(second.blocks[0].w)
+    for key, value in first.blocks[0].w.items():
+        assert mx.array_equal(value, second.blocks[0].w[key]).item()
+
+
+def test_a_vision_tower_stored_below_its_source_precision_is_never_remapped(tmp_path):
+    import json
+
+    import pytest
+
+    from mtplx.models.inkling.model import load_vision_weights
+
+    _tiny_vision_pack(tmp_path)
+    config = json.loads((tmp_path / "config.json").read_text())
+    config["mtplx_inkling_precision"] = {"model.visual.proj_in.weight": {"bits": 4, "group_size": 64}}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    with pytest.raises(ValueError):
+        load_vision_weights(tmp_path)
