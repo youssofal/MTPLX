@@ -11917,9 +11917,36 @@ class _QuickstartIncrementalTokenDecoder:
         )
 
 
+class _InklingTerminalDecoder:
+    """Inkling 2 Mini's turn, streamed the way its final text reads (``protocol.completion_text``).
+
+    Inkling writes its channels with control tokens (``<|message_model|>``,
+    ``<|content_thinking|>``, ``<|content_text|>``, ``<|end_message|>``), and a plain decode
+    printed them into the terminal chat around the answer. Its thinking now streams between
+    ``<think>`` and ``</think>``, its answer as text and a tool call as ``<tool_call>``, as
+    ``mtplx run`` and the server render them.
+    """
+
+    def __init__(self, tokenizer: Any) -> None:
+        from mtplx.models.inkling.protocol import Channels
+
+        self._channels = Channels(tokenizer)
+        self._text = _QuickstartIncrementalTokenDecoder(tokenizer)
+
+    def feed(self, tokens: list[int]) -> str:
+        return self._channels.feed(tokens, self._text.feed, self._text.finish)
+
+    def finish(self) -> str:
+        return self._channels.finish(self._text.finish)
+
+
 class _QuickstartTerminalStreamer:
-    def __init__(self, tokenizer: Any, *, label: str) -> None:
-        self._decoder = _QuickstartIncrementalTokenDecoder(tokenizer)
+    def __init__(self, tokenizer: Any, *, label: str, inkling: bool = False) -> None:
+        self._decoder = (
+            _InklingTerminalDecoder(tokenizer)
+            if inkling
+            else _QuickstartIncrementalTokenDecoder(tokenizer)
+        )
         self._label = label
         self.started = False
         self._console: Any = None
@@ -12084,7 +12111,11 @@ def _quickstart_generate(
     request_started_s = time.perf_counter()
     token_times: list[float] = []
     terminal_streamer = (
-        _QuickstartTerminalStreamer(rt.tokenizer, label=stream_label)
+        _QuickstartTerminalStreamer(
+            rt.tokenizer,
+            label=stream_label,
+            inkling=getattr(rt, "backend_id", None) == "inkling2_loop",
+        )
         if stream_label
         else None
     )
