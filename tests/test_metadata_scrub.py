@@ -190,3 +190,72 @@ def test_scrub_json_documents_returns_only_leaking_documents(tmp_path):
     assert documents[0].document == {"base_trunk": f"{REDACTED_PATH}/Owner--Trunk"}
     assert json.loads(documents[0].payload) == documents[0].document
     assert runtime_metadata_leaks(documents[0].document) == []
+
+
+def _tokenizer_with_tilde_merges() -> dict:
+    """A tokenizer.json shaped like the one the scrubber broke on 22 November: seven merges built from ``~``."""
+
+    return {
+        "version": "1.0",
+        "added_tokens": [{"id": 0, "content": "~", "special": False}],
+        "model": {
+            "type": "BPE",
+            "vocab": {"~": 0, "~~": 1, "~~~~": 2, "~/": 3, "a": 4},
+            "merges": ["~ ~", "~~ ~~", "~ ~~", "~~ ~", "~~~ ~", "~ ~~~", "~/ a"],
+        },
+    }
+
+
+def test_tilde_tokens_are_text_not_home_paths():
+    payload = {"content": "~", "merges": ["~ ~", "~~ ~~", "~~~~"], "home": "~/models/y", "user": "~ann/m"}
+
+    scrubbed = scrub_runtime_metadata(payload)
+
+    assert scrubbed["content"] == "~"
+    assert scrubbed["merges"] == ["~ ~", "~~ ~~", "~~~~"]
+    assert scrubbed["home"] == f"{REDACTED_PATH}/y"
+    assert scrubbed["user"] == f"{REDACTED_PATH}/m"
+    assert runtime_metadata_leaks(payload) == ["~/models/y", "~ann/m"]
+
+
+def test_a_packs_tokenizer_is_never_scanned_or_rewritten(tmp_path):
+    import json
+
+    from mtplx.metadata_scrub import scrub_json_documents
+
+    tokenizer = json.dumps(_tokenizer_with_tilde_merges())
+    (tmp_path / "tokenizer.json").write_text(tokenizer, encoding="utf-8")
+    (tmp_path / "vocab.json").write_text(json.dumps({"/Users/": 7, "~": 8}), encoding="utf-8")
+    (tmp_path / "tokenizer_config.json").write_text(
+        json.dumps({"name_or_path": "/Users/someone/models/Trunk", "added_tokens_decoder": {"0": {"content": "~"}}}),
+        encoding="utf-8",
+    )
+
+    documents = {document.name: document for document in scrub_json_documents(tmp_path)}
+
+    assert sorted(documents) == ["tokenizer_config.json"]
+    assert documents["tokenizer_config.json"].document == {
+        "name_or_path": f"{REDACTED_PATH}/Trunk",
+        "added_tokens_decoder": {"0": {"content": "~"}},
+    }
+    assert (tmp_path / "tokenizer.json").read_text(encoding="utf-8") == tokenizer
+
+
+def test_publish_check_scrub_leaves_the_tokenizer_byte_for_byte(tmp_path, capsys):
+    import json
+
+    from mtplx.cli import main
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    tokenizer = json.dumps(_tokenizer_with_tilde_merges())
+    (staging / "tokenizer.json").write_text(tokenizer, encoding="utf-8")
+    (staging / "mtplx_runtime.json").write_text(
+        json.dumps({"base_trunk": "/Users/someone/.mtplx/models/Owner--Trunk"}), encoding="utf-8"
+    )
+
+    main(["model", "publish-check", "--staging-dir", str(staging), "--repo-id", "x/y", "--scrub"])
+    report = json.loads(capsys.readouterr().out)
+
+    assert report["scrubbed"] == ["mtplx_runtime.json"]
+    assert (staging / "tokenizer.json").read_text(encoding="utf-8") == tokenizer

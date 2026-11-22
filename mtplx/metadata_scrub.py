@@ -29,13 +29,22 @@ _PATH_KEY_RE = re.compile(r"(^|_)(path|dir|directory|file|root|location)s?$")
 
 #: Prefixes that name a machine: a home directory or a per-user temp folder.
 _MACHINE_PREFIX_RE = re.compile(r"^(/Users/|/home/|/var/folders/|/private/var/folders/)")
+
+#: A home-relative path: ``~/...`` or ``~user/...``. A bare ``~``, ``~~`` or a tokenizer merge such as ``~ ~`` is
+#: text: read as a home path it was rewritten to ``<redacted>/~`` (22 November: seven merges of a pack's
+#: tokenizer.json, which then no longer encoded ``~``).
+_HOME_RELATIVE_RE = re.compile(r"^~[A-Za-z0-9._-]*/")
+
+#: Pack documents that hold the model's vocabulary, never provenance. The tokenizer library writes them, and a
+#: token may look like a path (``~/``, ``/Users/``), so they are never scanned or rewritten.
+VOCABULARY_DOCUMENTS = frozenset({"tokenizer.json", "vocab.json", "added_tokens.json"})
 _MACHINE_PATH_IN_TEXT_RE = re.compile(
     r"(?:/Users/|/home/|/private/var/folders/|/var/folders/)[^\s\"';,)]*"
 )
 
 
 def _is_absolute_path(value: str) -> bool:
-    return value.startswith("/") or value.startswith("~")
+    return value.startswith("/") or value == "~" or bool(_HOME_RELATIVE_RE.match(value))
 
 
 def _is_machine_path(value: str) -> bool:
@@ -43,7 +52,7 @@ def _is_machine_path(value: str) -> bool:
 
     if not value:
         return False
-    return value.startswith("~") or bool(_MACHINE_PREFIX_RE.match(value))
+    return bool(_HOME_RELATIVE_RE.match(value)) or bool(_MACHINE_PREFIX_RE.match(value))
 
 
 def _is_local_path(key: str | None, value: str) -> bool:
@@ -166,11 +175,13 @@ def scrub_json_documents(directory: Path | str) -> list[ScrubbedDocument]:
     index and sometimes a conversion manifest. Every one that leaks comes
     back scrubbed, with what it leaked; a clean directory yields an empty
     list. Documents that do not parse are skipped, they are another gate's
-    concern.
+    concern, and so are the vocabulary documents (``VOCABULARY_DOCUMENTS``).
     """
 
     documents: list[ScrubbedDocument] = []
     for path in sorted(Path(directory).glob("*.json")):
+        if path.name in VOCABULARY_DOCUMENTS:
+            continue
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
