@@ -46629,6 +46629,9 @@ def create_app(state: ServerState) -> FastAPI:
                     # from the catch-all below would raise "async generator
                     # ignored GeneratorExit". Re-raise untouched (#F36).
                     completion_client_disconnected = True
+                    _cancel_stream_generation(
+                        cancel_event, generation_future, origin="client_disconnect"
+                    )
                     raise
                 except BaseException as exc:
                     stream_error_item = exc
@@ -46646,7 +46649,9 @@ def create_app(state: ServerState) -> FastAPI:
                     # Snapshot before teardown trips the event on every exit,
                     # and record before deregistering: the dashboard, request
                     # log and bus event are what prove the Stop reached us.
-                    cancelled = cancel_event.is_set() and generated is None
+                    cancelled = (
+                        cancel_event.is_set() or completion_client_disconnected
+                    ) and generated is None
                     cancel_reason = (
                         "client_disconnected"
                         if completion_client_disconnected
