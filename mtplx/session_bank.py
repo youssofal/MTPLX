@@ -840,7 +840,7 @@ def _cache_ref_trimmable_to(cache: list[Any] | None, target_offset: int) -> bool
     the cache half-trimmed, dropping the only live copy of the conversation.
     """
 
-    if cache is None:
+    if not cache:
         return False
     target_offset = max(0, int(target_offset))
     for entry in cache:
@@ -855,7 +855,7 @@ def _cache_ref_trimmable_to(cache: list[Any] | None, target_offset: int) -> bool
 def _cache_ref_trimmable_by(cache: list[Any] | None, tokens: int) -> bool:
     """Whether every entry of ``cache`` can trim ``tokens`` rows (validation)."""
 
-    if cache is None:
+    if not cache:
         return False
     tokens = max(0, int(tokens))
     if tokens == 0:
@@ -2331,7 +2331,14 @@ class SessionBank:
                     _achievable = 0
                     if callable(_probe):
                         _boundary = _probe(_cand)
-                        if _boundary is not None:
+                        if (
+                            _boundary is not None
+                            and _boundary[1] is not None
+                            and (
+                                not committed_required
+                                or (len(_boundary) > 2 and _boundary[2] is not None)
+                            )
+                        ):
                             _achievable = int(_boundary[0])
                     if _achievable <= floor or _achievable < 1:
                         continue
@@ -2344,7 +2351,7 @@ class SessionBank:
                         # suffix, so generation requires boundary_logits at
                         # restore_point (missing_boundary_logits otherwise).
                         _bl = getattr(_entry, "boundary_logits", None)
-                        if _bl is None or int(_bl[0]) != _achievable:
+                        if _bl is None or int(_bl[0]) != _achievable or _bl[1] is None:
                             continue
                     if _entry.live_ref_only:
                         if not _cache_ref_trimmable_to(

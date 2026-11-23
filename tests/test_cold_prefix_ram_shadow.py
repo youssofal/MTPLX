@@ -546,3 +546,67 @@ def test_non_recurrent_live_lease_stays_fail_open_to_cold(tmp_path, monkeypatch)
         assert any(getattr(m[0], "cache_source", None) == "ssd" for m in matches)
     finally:
         cold.close()
+
+
+def test_unservable_live_lease_payloads_do_not_shadow_cold(tmp_path, monkeypatch):
+    """B3 guards: missing boundary_snapshot, missing boundary_hidden under
+    committed_required, empty boundary_logits payload, or empty cache_ref=[]
+    must never shadow a valid SSD candidate."""
+    cold = _tier(tmp_path)
+    try:
+        bank = _bank(cold)
+        stored_50 = list(range(1, 51))
+        entry = bank.put_snapshot(
+            runtime=_runtime(),
+            token_ids=stored_50,
+            cache_snapshot=CacheSnapshot(states=(), meta_states=()),
+            logits=None,
+            hidden=None,
+            mtp_history_snapshot=CacheSnapshot(states=(), meta_states=()),
+            mtp_history_policy="committed",
+            snapshot_epoch=len(stored_50),
+            nbytes_override=128,
+        )
+        assert entry is not None
+        assert cold.flush(timeout_s=5.0) is True
+        entry.live_ref_only = True
+        entry.has_recurrent = True
+        calls = _spy_restore_row(cold, monkeypatch)
+
+        # 1) boundary_snapshot is None
+        entry.cache_ref = [_DummyTrimmableCache(len(stored_50))]
+        entry.lease_kv_offset = len(stored_50)
+        entry.gdn_boundaries = [(40, None, "hidden")]
+        entry.boundary_logits = (40, "logits")
+        matches = _candidates(bank, mtp_history_policy="committed")
+        assert calls == [1] and any(getattr(m[0], "cache_source", None) == "ssd" for m in matches)
+
+        # 2) boundary_hidden is None when committed_required=True
+        calls.clear()
+        entry.gdn_boundaries = [(40, CacheSnapshot(states=(), meta_states=()), None)]
+        matches = _candidates(bank, mtp_history_policy="committed")
+        assert calls == [1] and any(getattr(m[0], "cache_source", None) == "ssd" for m in matches)
+
+        # 3) exact-repeat boundary_logits has None payload
+        calls.clear()
+        entry.gdn_boundaries = [(40, CacheSnapshot(states=(), meta_states=()), "hidden")]
+        entry.boundary_logits = (40, None)
+        matches = bank.near_prefix_candidates(
+            tuple(range(1, 41)),
+            min_matched_tokens=4,
+            block_size=8,
+            block_min_matched_tokens=8,
+            model_path=MODEL,
+            mtp_enabled=True,
+            mtp_history_policy="committed",
+        )
+        assert calls == [1] and any(getattr(m[0], "cache_source", None) == "ssd" for m in matches)
+
+        # 4) empty cache_ref=[]
+        calls.clear()
+        entry.cache_ref = []
+        entry.boundary_logits = (40, "logits")
+        matches = _candidates(bank, mtp_history_policy="committed")
+        assert calls == [1] and any(getattr(m[0], "cache_source", None) == "ssd" for m in matches)
+    finally:
+        cold.close()
