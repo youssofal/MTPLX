@@ -22,8 +22,10 @@ from mtplx.retrieval import (
     RetrievalSpec,
     _JinaEmbedBackend,
     _JinaRerankBackend,
+    _backbone_module,
     _is_jina_embedding_checkpoint,
     _is_jina_reranker_checkpoint,
+    _logits_module,
     _plan_batches,
     default_served_id,
     parse_model_flag,
@@ -1611,3 +1613,128 @@ def test_rerank_answers_a_structured_404_for_a_missing_checkpoint(monkeypatch):
     )
     assert response.status_code == 404
     assert "mtplx pull org/gone" in response.json()["error"]["message"]
+
+
+# ---- #712: nested language_model.model backbone support -------------------
+
+
+def test_backbone_module_resolves_standard_and_nested_layouts():
+    standard_backbone = lambda x: x
+    standard = SimpleNamespace(model=standard_backbone)
+    assert _backbone_module(standard) is standard_backbone
+
+    nested_backbone = lambda x: x
+    nested = SimpleNamespace(language_model=SimpleNamespace(model=nested_backbone))
+    assert _backbone_module(nested) is nested_backbone
+
+    model_none_but_nested = SimpleNamespace(
+        model=None, language_model=SimpleNamespace(model=nested_backbone)
+    )
+    assert _backbone_module(model_none_but_nested) is nested_backbone
+
+    with pytest.raises(AttributeError, match="language_model.model"):
+        _backbone_module(SimpleNamespace(language_model=SimpleNamespace()))
+
+    with pytest.raises(TypeError, match="language_model"):
+        _logits_module(SimpleNamespace())
+
+
+def test_embed_supports_nested_language_model_backbone(monkeypatch):
+    """Models like mlx_lm.models.qwen3_5.Model expose .language_model.model, not .model."""
+    mx = pytest.importorskip("mlx.core")
+
+    class _NestedTextModel:
+        def __init__(self):
+            self.model = _EchoModel().model
+
+        def __call__(self, _inputs):
+            raise AssertionError("embedding must call .language_model.model, not language_model()")
+
+    class _NestedWrapperModel:
+        def __init__(self):
+            self.language_model = _NestedTextModel()
+
+        def __call__(self, _inputs):
+            raise AssertionError("embedding must call .language_model.model, not model()")
+
+    class _LastTokenTokenizer(_IdentityTokenizer):
+        def convert_tokens_to_ids(self, token: str) -> int:
+            return 9 if token == "<|endoftext|>" else 0
+
+    monkeypatch.setattr(
+        "mtplx.hf_loader.resolve_model_path",
+        lambda ref, cache_dir=None: Path("/models") / str(ref).rsplit("/", 1)[-1],
+    )
+
+    prev = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        registry = RetrievalRegistry()
+        mean_spec = RetrievalSpec("nested-mean", "org/nested-mean", "embedding", pooling="mean")
+        last_spec = RetrievalSpec("nested-last", "org/nested-last", "embedding", pooling="last")
+        registry.register(mean_spec)
+        registry.register(last_spec)
+        for spec, tok in ((mean_spec, _IdentityTokenizer()), (last_spec, _LastTokenTokenizer())):
+            backend = registry._backend(spec)
+            backend._model = _NestedWrapperModel()
+            backend._tokenizer = tok
+
+        vectors, used, tokens = registry.embed(["2x4", "3x2"], model="nested-mean")
+        assert used.served_id == "nested-mean"
+        assert tokens == 8
+        for vector, (marker, count) in zip(vectors, [(2, 4), (3, 2)]):
+            expected = _expected_vector(marker, count)
+            assert vector[0] == pytest.approx(expected[0], rel=1e-4)
+            assert vector[1] == pytest.approx(expected[1], rel=1e-4)
+
+        last_vectors, _used_last, _tok_last = registry.embed(["5x3"], model="nested-last")
+        norm = (9.0**2 + 1.0) ** 0.5
+        assert last_vectors[0][0] == pytest.approx(9.0 / norm, rel=1e-4)
+        assert last_vectors[0][1] == pytest.approx(1.0 / norm, rel=1e-4)
+    finally:
+        mx.set_default_device(prev)
+
+
+def test_rerank_supports_nested_language_model_wrapper(monkeypatch):
+    """Reranking accepts both callable Model (delegating to language_model) and non-callable wrappers."""
+    mx = pytest.importorskip("mlx.core")
+    import math
+
+    class _CallableNestedReranker:
+        def __init__(self):
+            self.language_model = _EchoReranker()
+
+        def __call__(self, inputs):
+            return self.language_model(inputs)
+
+    class _WrapperOnlyReranker:
+        def __init__(self):
+            self.language_model = _EchoReranker()
+
+    monkeypatch.setattr(
+        "mtplx.hf_loader.resolve_model_path",
+        lambda ref, cache_dir=None: Path("/models") / str(ref).rsplit("/", 1)[-1],
+    )
+
+    prev = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        registry = RetrievalRegistry()
+        for served_id, model_obj in (
+            ("rank-callable", _CallableNestedReranker()),
+            ("rank-wrapper", _WrapperOnlyReranker()),
+        ):
+            spec = RetrievalSpec(served_id, f"org/{served_id}", "rerank")
+            registry.register(spec)
+            backend = registry._backend(spec)
+            backend._model = model_obj
+            backend._tokenizer = _MarkerRerankTokenizer()
+
+            scores, used, _tokens = registry.rerank(
+                "query", ["2x5", "6x3"], model=served_id
+            )
+            assert used.served_id == served_id
+            assert scores[0] == pytest.approx(1.0 / (1.0 + math.exp(-2)), rel=1e-4)
+            assert scores[1] == pytest.approx(1.0 / (1.0 + math.exp(-6)), rel=1e-4)
+    finally:
+        mx.set_default_device(prev)

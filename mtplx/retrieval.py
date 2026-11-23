@@ -486,6 +486,41 @@ class _Backend:
         return int(token)
 
 
+def _backbone_module(model_obj: Any) -> Any:
+    """Return the transformer backbone that emits hidden states for embeddings.
+
+    Standard causal LMs in mlx_lm expose ``model_obj.model``; VLM/multimodal
+    wrappers such as ``mlx_lm.models.qwen3_5.Model`` nest the text backbone at
+    ``model_obj.language_model.model`` while ``model_obj(...)`` and
+    ``model_obj.language_model(...)`` return vocabulary logits instead.
+    """
+    backbone = getattr(model_obj, "model", None)
+    if callable(backbone):
+        return backbone
+    language_model = getattr(model_obj, "language_model", None)
+    if language_model is not None:
+        nested = getattr(language_model, "model", None)
+        if callable(nested):
+            return nested
+    raise AttributeError(
+        f"{type(model_obj).__name__} exposes neither a callable '.model' nor "
+        "'.language_model.model' backbone for hidden-state extraction"
+    )
+
+
+def _logits_module(model_obj: Any) -> Any:
+    """Return the callable model wrapper that produces vocabulary logits for reranking."""
+    if callable(model_obj):
+        return model_obj
+    language_model = getattr(model_obj, "language_model", None)
+    if callable(language_model):
+        return language_model
+    raise TypeError(
+        f"{type(model_obj).__name__} is neither callable nor exposes a callable "
+        "'.language_model' for logit scoring"
+    )
+
+
 class RetrievalRegistry:
     """Serves every configured embedding and reranking model.
 
@@ -886,6 +921,7 @@ class RetrievalRegistry:
                 import mlx.core as mx
 
                 with backend.lock:
+                    backbone = _backbone_module(model_obj)
                     # Tokenise everything before batching. A batch costs
                     # rows * longest-row token positions, so the lengths have to
                     # be known before the batch boundaries can be drawn — a
@@ -903,7 +939,7 @@ class RetrievalRegistry:
                         inputs, lengths = _right_padded(
                             [sequences[index] for index in group], pad_id
                         )
-                        hidden = model_obj.model(inputs)
+                        hidden = backbone(inputs)
                         if spec.pooling == "mean":
                             pooled = mx.stack(
                                 [hidden[row, :length, :].mean(axis=0) for row, length in enumerate(lengths)]
@@ -986,6 +1022,7 @@ class RetrievalRegistry:
                 import mlx.core as mx
 
                 with backend.lock:
+                    scorer = _logits_module(model_obj)
                     # Same padding trap as embed(), and tighter here: every row
                     # carries the query as well as its document, so one long
                     # document inflates the whole batch.
@@ -1002,7 +1039,7 @@ class RetrievalRegistry:
                         inputs, lengths = _right_padded(
                             [sequences[index] for index in group], pad_id
                         )
-                        logits = model_obj(inputs)
+                        logits = scorer(inputs)
                         pairs = mx.stack(
                             [
                                 mx.stack(
