@@ -646,29 +646,208 @@ def _repo_folder_identity_problem(path: Path, repo_id: str) -> str | None:
     return repo_folder_identity_problem(path, repo_id)
 
 
+def _hf_home_reuse_disabled() -> bool:
+    return (os.environ.get("MTPLX_DISABLE_HF_HOME_REUSE") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _hf_home_env_set() -> bool:
+    return any(
+        bool((os.environ.get(name) or "").strip())
+        for name in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_HOME")
+    )
+
+
+def hf_hub_cache_dir() -> Path:
+    """Resolve the shared Hugging Face hub cache root dynamically."""
+    for env_name in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        raw = (os.environ.get(env_name) or "").strip()
+        if raw:
+            return Path(raw).expanduser()
+    hf_home = (os.environ.get("HF_HOME") or "").strip()
+    if hf_home:
+        return Path(hf_home).expanduser() / "hub"
+    try:
+        from huggingface_hub import constants
+
+        hub_cache = getattr(constants, "HF_HUB_CACHE", None)
+        if hub_cache:
+            return Path(hub_cache).expanduser()
+    except Exception:
+        pass
+    return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def _hf_cache_overridden() -> bool:
+    if _hf_home_env_set():
+        return True
+    try:
+        from huggingface_hub import constants
+
+        default = str((Path.home() / ".cache" / "huggingface" / "hub").expanduser())
+        current = str(Path(getattr(constants, "HF_HUB_CACHE", "")).expanduser())
+        return bool(current) and os.path.normcase(current) != os.path.normcase(default)
+    except Exception:
+        return False
+
+
+def _should_scan_hf_hub_cache(cache_dir: str | Path | None) -> bool:
+    if _hf_home_reuse_disabled():
+        return False
+    if cache_dir is None or _hf_cache_overridden():
+        return True
+    try:
+        return (
+            Path(cache_dir).expanduser().resolve(strict=False)
+            == model_cache_dir(None).expanduser().resolve(strict=False)
+        )
+    except OSError:
+        return False
+
+
+def _resolve_hf_dir_snapshot(
+    repo_root: Path,
+    repo_id: str | None = None,
+    *,
+    require_complete: bool = True,
+) -> Path | None:
+    if not repo_root.is_dir():
+        return None
+    snapshots_dir = repo_root / "snapshots"
+    if not snapshots_dir.is_dir():
+        return None
+    candidates: list[Path] = []
+    seen: set[str] = set()
+    refs_dir = repo_root / "refs"
+    ref_files: list[Path] = []
+    if refs_dir.is_dir():
+        main_ref = refs_dir / "main"
+        if main_ref.is_file():
+            ref_files.append(main_ref)
+        ref_files.extend(
+            p for p in sorted(refs_dir.iterdir()) if p.is_file() and p.name != "main"
+        )
+    for ref_file in ref_files:
+        try:
+            rev = ref_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not rev or "/" in rev or "\\" in rev or rev in {".", ".."}:
+            continue
+        snap = snapshots_dir / rev
+        key = os.path.normcase(str(snap))
+        if key not in seen:
+            seen.add(key)
+            candidates.append(snap)
+    try:
+        snapshot_dirs = sorted(
+            (p for p in snapshots_dir.iterdir() if p.is_dir() and not p.name.startswith(".")),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        snapshot_dirs = []
+    for snap in snapshot_dirs:
+        key = os.path.normcase(str(snap))
+        if key not in seen:
+            seen.add(key)
+            candidates.append(snap)
+
+    for snap in candidates:
+        if not snap.is_dir():
+            continue
+        if not require_complete:
+            return snap
+        if repo_id is not None:
+            if _cached_model_ready_for_repo(snap, repo_id):
+                return snap
+        elif cached_model_is_complete(snap):
+            return snap
+    return None
+
+
+def resolve_hf_repo_snapshot(
+    repo_id: str,
+    hub_cache: str | Path | None = None,
+    *,
+    require_complete: bool = True,
+) -> Path | None:
+    """Resolve ``repo_id`` inside a Hugging Face hub cache (`models--Org--Repo/snapshots/<rev>`)."""
+    root = Path(hub_cache).expanduser() if hub_cache is not None else hf_hub_cache_dir()
+    repo_dir = root / f"models--{safe_model_name(repo_id)}"
+    return _resolve_hf_dir_snapshot(repo_dir, repo_id, require_complete=require_complete)
+
+
+def hf_repo_id_from_cache_dir(repo_root: Path, snapshot: Path | None = None) -> str | None:
+    if snapshot is not None:
+        marker = read_source_marker(snapshot)
+        recorded = (marker or {}).get("repo_id")
+        if isinstance(recorded, str) and "/" in recorded:
+            return recorded
+    name = repo_root.name
+    if not name.startswith("models--"):
+        return None
+    rest = name[len("models--") :]
+    if "--" not in rest:
+        return None
+    org, repo = rest.split("--", 1)
+    if not org or not repo:
+        return None
+    return f"{org}/{repo}"
+
+
+def iter_hf_cache_models(
+    hub_cache: str | Path | None = None,
+    *,
+    require_complete: bool = True,
+) -> list[tuple[str, Path]]:
+    """Return ``(repo_id, snapshot_path)`` pairs discovered under a Hugging Face hub cache."""
+    root = Path(hub_cache).expanduser() if hub_cache is not None else hf_hub_cache_dir()
+    if not root.is_dir():
+        return []
+    found: list[tuple[str, Path]] = []
+    try:
+        children = sorted(root.iterdir())
+    except OSError:
+        return []
+    for child in children:
+        if not child.is_dir() or not child.name.startswith("models--"):
+            continue
+        snap = _resolve_hf_dir_snapshot(child, require_complete=require_complete)
+        if snap is None:
+            continue
+        repo_id = hf_repo_id_from_cache_dir(child, snap)
+        if not repo_id:
+            continue
+        if require_complete and not _cached_model_ready_for_repo(snap, repo_id):
+            continue
+        found.append((repo_id, snap))
+    return found
+
+
 def huggingface_cache_path(repo_id: str) -> Path | None:
     """Locate ``repo_id`` in the shared Hugging Face cache, or return ``None``.
 
-    ``snapshot_download(local_files_only=True)`` is the hub's own local
-    lookup, so it honours HF_HOME, HF_HUB_CACHE and HF_HUB_OFFLINE exactly the
-    way every other Hugging Face tool on the machine does, resolves the ref to
-    the right snapshot directory, and raises when the repo is not cached. It
-    never touches the network. A user who already downloaded a model with
-    `hf download`, mlx-lm, or transformers should not have to download the
-    same bytes a second time into MTPLX's private cache.
+    Honors ``HF_HUB_CACHE``, ``HUGGINGFACE_HUB_CACHE``, ``HF_HOME``, and
+    ``~/.cache/huggingface/hub`` dynamically without network access.
     """
 
+    if _hf_home_reuse_disabled():
+        return None
+    direct = resolve_hf_repo_snapshot(repo_id)
+    if direct is not None:
+        return direct
     try:
         from huggingface_hub import snapshot_download
     except Exception:
-        # An install without huggingface_hub (or one too old for this call)
-        # keeps resolving exactly as it did before this step existed.
         return None
     try:
         resolved = Path(snapshot_download(repo_id, local_files_only=True))
     except Exception:
-        # Not cached, or the hub refused the lookup. Either way the caller
-        # falls through to the download hint.
         return None
     return resolved if resolved.is_dir() else None
 
@@ -696,6 +875,9 @@ def resolve_model_path(
             branded = root / repo_id.split("/", 1)[1]
             if branded != cached and _cached_model_ready_for_repo(branded, repo_id):
                 return branded
+        hf_in_root = resolve_hf_repo_snapshot(repo_id, hub_cache=root)
+        if hf_in_root is not None:
+            return hf_in_root
     # Last local step before the download hint: the machine-wide Hugging Face
     # cache. MTPLX's own library roots stay first so existing installs resolve
     # where they always did, and the shared snapshot is held to the same
@@ -1635,33 +1817,69 @@ def list_cached_models(
     *,
     cache_dir: str | Path | None = None,
     search_dirs: Iterable[str | Path] | None = None,
+    include_hf_cache: bool | None = None,
 ) -> list[CachedModel]:
     rows: list[CachedModel] = []
     seen: set[str] = set()
-    for root_index, root in enumerate(
-        model_library_roots(cache_dir, search_dirs=search_dirs)
-    ):
+    roots = model_library_roots(cache_dir, search_dirs=search_dirs)
+    for root_index, root in enumerate(roots):
         if not root.is_dir():
             continue
         for child in sorted(root.iterdir()):
             if not child.is_dir() or child.name.startswith("."):
                 continue
-            identity = os.path.normcase(str(child.resolve(strict=False)))
+            if child.name.startswith("models--"):
+                snap = _resolve_hf_dir_snapshot(child, require_complete=True)
+                if snap is None:
+                    continue
+                repo_id = hf_repo_id_from_cache_dir(child, snap)
+                if not repo_id:
+                    continue
+                target = snap
+            else:
+                target = child
+                repo_id = child.name.replace("--", "/")
+            identity = os.path.normcase(str(target.resolve(strict=False)))
             if identity in seen:
                 continue
             seen.add(identity)
-            repo_id = child.name.replace("--", "/")
             rows.append(
                 CachedModel(
                     repo_id=repo_id,
-                    path=child,
-                    size_bytes=directory_size_bytes(child),
-                    has_runtime_contract=(child / "mtplx_runtime.json").exists(),
-                    has_config=(child / "config.json").exists(),
-                    validation=validate_mtplx_model_files(child),
+                    path=target,
+                    size_bytes=directory_size_bytes(target),
+                    has_runtime_contract=(target / "mtplx_runtime.json").exists(),
+                    has_config=(target / "config.json").exists(),
+                    validation=validate_mtplx_model_files(target),
                     root=root,
                     root_index=root_index,
                     is_primary=root_index == 0,
+                )
+            )
+    scan_hf = (
+        (cache_dir is None and not _hf_home_reuse_disabled())
+        if include_hf_cache is None
+        else (include_hf_cache and not _hf_home_reuse_disabled())
+    )
+    if scan_hf:
+        hf_hub = hf_hub_cache_dir()
+        hf_index = len(roots)
+        for repo_id, snap in iter_hf_cache_models(hf_hub, require_complete=True):
+            identity = os.path.normcase(str(snap.resolve(strict=False)))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            rows.append(
+                CachedModel(
+                    repo_id=repo_id,
+                    path=snap,
+                    size_bytes=directory_size_bytes(snap),
+                    has_runtime_contract=(snap / "mtplx_runtime.json").exists(),
+                    has_config=(snap / "config.json").exists(),
+                    validation=validate_mtplx_model_files(snap),
+                    root=hf_hub,
+                    root_index=hf_index,
+                    is_primary=False,
                 )
             )
     return rows
@@ -1716,6 +1934,8 @@ def pull_model(
         raise ValueError(f"pull requires a Hugging Face repo id or URL, got: {model_ref}")
     # Before the first request of any kind (the freshness query below is one).
     use_system_trust_store()
+    raw_cache_dir = cache_dir
+    explicit_destination = destination is not None
     revision = _effective_model_revision(repo_id, revision)
     root = ensure_model_root(model_cache_dir(cache_dir).expanduser().absolute())
     if destination is None:
@@ -1741,52 +1961,84 @@ def pull_model(
             remote_sha, remote_files = _query_repo_snapshot(repo_id, revision=revision)
             snapshot_resolved = True
 
-    def _fresh_against_remote() -> bool:
+    def _fresh_against_remote(path: Path, path_marker: dict[str, Any] | None) -> bool:
         # A pull is a stated intent to sync. Prefer the exact commit-sha
         # compare against the pull marker — it sees every changed file,
         # including sidecars the weight index never lists (mtp.safetensors
         # head swaps were invisible to the index-only check). Legacy caches
         # without a sha marker keep the index-byte compare. Network failures
         # err on reuse so offline pulls keep working.
-        local_sha = (marker or {}).get("resolved_sha")
+        local_sha = (path_marker or {}).get("resolved_sha")
         if isinstance(local_sha, str) and local_sha:
             _resolve_remote_snapshot()
             return remote_sha is None or remote_sha == local_sha
-        return _local_matches_remote_index(destination, repo_id, revision)
+        return _local_matches_remote_index(path, repo_id, revision)
 
-    if (
-        not force_sync
-        and destination.exists()
-        and _cached_model_ready_for_repo(destination, repo_id)
-        and _source_marker_matches(
-            destination,
-            repo_id=repo_id,
-            revision=revision,
-        )
-        and _fresh_against_remote()
-    ):
-        resolved = destination
-        reused_existing = True
-        resumed_existing = False
-        # A complete pack with a transfer marker finished its last file and
-        # then lost the marker cleanup; the marker means nothing now.
-        (resolved / TRANSFER_MARKER_FILE).unlink(missing_ok=True)
-        validation = validate_mtplx_model_files(resolved)
-        _validate_pinned_laguna_files(resolved, repo_id)
+    def _try_reuse(candidate: Path, path_marker: dict[str, Any] | None, *, writable: bool) -> dict[str, Any] | None:
+        if not (
+            candidate.exists()
+            and _cached_model_ready_for_repo(candidate, repo_id)
+            and _source_marker_matches(
+                candidate,
+                repo_id=repo_id,
+                revision=revision,
+            )
+            and _fresh_against_remote(candidate, path_marker)
+        ):
+            return None
+        if writable:
+            (candidate / TRANSFER_MARKER_FILE).unlink(missing_ok=True)
+        validation = validate_mtplx_model_files(candidate)
+        _validate_pinned_laguna_files(candidate, repo_id)
         if repo_id.lower().startswith("youssofal/qwen3.6-27b-mtplx") and not validation["ok"]:
             raise RuntimeError(
                 "cached MTPLX model is incomplete: "
                 + ", ".join(validation["missing_files"] or [str(validation.get("contract_error"))])
             )
-        reuse_manifest = _repo_files_from_snapshot((marker or {}).get("files"))
+        reuse_manifest = _repo_files_from_snapshot((path_marker or {}).get("files"))
         model_bytes = (
-            manifest_bytes_on_disk(resolved, reuse_manifest)
+            manifest_bytes_on_disk(candidate, reuse_manifest)
             if reuse_manifest
-            else _model_bytes_without_transients(resolved)
+            else _model_bytes_without_transients(candidate)
         )
-        started_size = model_bytes
-        disk_bytes = directory_size_bytes(resolved)
-        stale_bytes, stale_files = stale_transient_bytes(resolved, reuse_manifest)
+        disk = directory_size_bytes(candidate)
+        stale_b, stale_f = stale_transient_bytes(candidate, reuse_manifest)
+        return {
+            "resolved": candidate,
+            "marker": path_marker,
+            "model_bytes": model_bytes,
+            "started_size": model_bytes,
+            "disk_bytes": disk,
+            "stale_bytes": stale_b,
+            "stale_files": stale_f,
+        }
+
+    reused_info: dict[str, Any] | None = None
+    if not force_sync:
+        reused_info = _try_reuse(destination, marker, writable=True)
+        if (
+            reused_info is None
+            and not explicit_destination
+            and _should_scan_hf_hub_cache(raw_cache_dir)
+        ):
+            hf_candidate = huggingface_cache_path(repo_id)
+            if hf_candidate is not None and hf_candidate != destination:
+                reused_info = _try_reuse(
+                    hf_candidate,
+                    read_source_marker(hf_candidate),
+                    writable=False,
+                )
+
+    if reused_info is not None:
+        resolved = reused_info["resolved"]
+        marker = reused_info["marker"]
+        model_bytes = reused_info["model_bytes"]
+        started_size = reused_info["started_size"]
+        disk_bytes = reused_info["disk_bytes"]
+        stale_bytes = reused_info["stale_bytes"]
+        stale_files = reused_info["stale_files"]
+        reused_existing = True
+        resumed_existing = False
         _emit_download_progress(
             progress_callback,
             {
@@ -2135,7 +2387,11 @@ def hf_cache_report(
         "disk_free_bytes": free_bytes,
         "disk_free_gb": round(free_bytes / 1_000_000_000, 3) if free_bytes is not None else None,
         "cached_models": len(
-            list_cached_models(cache_dir=root, search_dirs=roots[1:])
+            list_cached_models(
+                cache_dir=root,
+                search_dirs=roots[1:],
+                include_hf_cache=False,
+            )
         ),
         "token_present": token_present,
         "token_source": token_source,

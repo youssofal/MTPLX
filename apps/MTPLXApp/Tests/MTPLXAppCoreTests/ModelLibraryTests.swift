@@ -390,6 +390,103 @@ final class ModelLibraryTests: XCTestCase {
         XCTAssertEqual(rows.filter { $0.localCandidates.contains(folder.path) }.count, 1)
     }
 
+    func testHFHomeAndHFHubCacheLayoutsReuseExistingCompleteSnapshots() throws {
+        let root = temporaryDirectory()
+        let primary = root.appendingPathComponent("primary", isDirectory: true)
+        let hfHome = root.appendingPathComponent("hf-home", isDirectory: true)
+        try FileManager.default.createDirectory(at: primary, withIntermediateDirectories: true)
+
+        let repo = "Youssofal/Inkling-2-Mini-MTPLX-Bare-Speed"
+        let sha = "112233445566"
+        let snap = hfHome
+            .appendingPathComponent("hub", isDirectory: true)
+            .appendingPathComponent("models--Youssofal--Inkling-2-Mini-MTPLX-Bare-Speed", isDirectory: true)
+            .appendingPathComponent("snapshots", isDirectory: true)
+            .appendingPathComponent(sha, isDirectory: true)
+        let refs = hfHome
+            .appendingPathComponent("hub", isDirectory: true)
+            .appendingPathComponent("models--Youssofal--Inkling-2-Mini-MTPLX-Bare-Speed", isDirectory: true)
+            .appendingPathComponent("refs", isDirectory: true)
+        try FileManager.default.createDirectory(at: snap, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: refs, withIntermediateDirectories: true)
+        try sha.write(to: refs.appendingPathComponent("main"), atomically: true, encoding: .utf8)
+        try "{}".write(to: snap.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+        try "{}".write(to: snap.appendingPathComponent("tokenizer.json"), atomically: true, encoding: .utf8)
+        try Data([0]).write(to: snap.appendingPathComponent("model.safetensors"))
+        try Data([0]).write(to: snap.appendingPathComponent("mtp.safetensors"))
+        try JSONSerialization.data(withJSONObject: [
+            "source": "thinkingmachines/Inkling-2-Mini",
+            "recipe": "bare-speed",
+            "display_name": "Inkling 2 Mini Bare Speed",
+        ]).write(to: snap.appendingPathComponent("mtplx-pack.json"))
+
+        let customRepo = "Vendor/HFReuseTestModel"
+        let customSnap = hfHome
+            .appendingPathComponent("hub", isDirectory: true)
+            .appendingPathComponent("models--Vendor--HFReuseTestModel", isDirectory: true)
+            .appendingPathComponent("snapshots", isDirectory: true)
+            .appendingPathComponent(sha, isDirectory: true)
+        let customRefs = hfHome
+            .appendingPathComponent("hub", isDirectory: true)
+            .appendingPathComponent("models--Vendor--HFReuseTestModel", isDirectory: true)
+            .appendingPathComponent("refs", isDirectory: true)
+        try FileManager.default.createDirectory(at: customSnap, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: customRefs, withIntermediateDirectories: true)
+        try sha.write(to: customRefs.appendingPathComponent("main"), atomically: true, encoding: .utf8)
+        try "{}".write(to: customSnap.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+        try "{}".write(to: customSnap.appendingPathComponent("tokenizer.json"), atomically: true, encoding: .utf8)
+        try Data([0]).write(to: customSnap.appendingPathComponent("model.safetensors"))
+
+        let library = ModelLibrary(
+            primaryDirectory: primary.path,
+            environment: ["HF_HOME": hfHome.path],
+            includeHuggingFaceCache: true
+        )
+        let resolvedSnap = ModelLibrary.canonicalURL(for: snap.path).path
+        XCTAssertTrue(library.candidatePaths(for: repo).contains(resolvedSnap))
+
+        let resolvedCustomSnap = ModelLibrary.canonicalURL(for: customSnap.path).path
+        let option = MTPLXModelOption(
+            id: "custom-hf-reuse",
+            displayName: "HF Reuse Model",
+            shortName: "HF Reuse",
+            localizedDetailKey: "Custom",
+            hfModelID: customRepo,
+            localCandidates: []
+        )
+        XCTAssertEqual(option.installedLocalPath(in: library), resolvedCustomSnap)
+
+        let discovered = library.discoverCompleteModels()
+        XCTAssertTrue(discovered.contains { $0.reference == repo && $0.path == resolvedSnap })
+
+        // Incomplete HF snapshots must never count as installed.
+        try FileManager.default.removeItem(at: customSnap.appendingPathComponent("model.safetensors"))
+        XCTAssertNil(option.installedLocalPath(in: library))
+    }
+
+    func testHFLayoutInsideAddedModelDirIsDiscoveredAndCounted() throws {
+        let root = temporaryDirectory()
+        let primary = root.appendingPathComponent("primary", isDirectory: true)
+        let sharedHF = root.appendingPathComponent("shared-hf", isDirectory: true)
+        try FileManager.default.createDirectory(at: primary, withIntermediateDirectories: true)
+        let snap = sharedHF
+            .appendingPathComponent("models--Vendor--SampleModel", isDirectory: true)
+            .appendingPathComponent("snapshots", isDirectory: true)
+            .appendingPathComponent("mainsha", isDirectory: true)
+        try FileManager.default.createDirectory(at: snap, withIntermediateDirectories: true)
+        try "{}".write(to: snap.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+        try "{}".write(to: snap.appendingPathComponent("tokenizer.json"), atomically: true, encoding: .utf8)
+        try Data([0]).write(to: snap.appendingPathComponent("model.safetensors"))
+
+        XCTAssertEqual(SharedModelFolders.packCount(in: sharedHF.path), 1)
+        let library = ModelLibrary(
+            primaryDirectory: primary.path,
+            additionalDirectories: [sharedHF.path]
+        )
+        let discovered = library.discoverCompleteModels()
+        XCTAssertEqual(discovered.map(\.reference), ["Vendor/SampleModel"])
+    }
+
     /// The provenance block Forge writes into mtplx_runtime.json, complete
     /// enough for MTPLXRuntimeMetadata to decode (a partial block decodes to
     /// nil and would hide the naming path under test).

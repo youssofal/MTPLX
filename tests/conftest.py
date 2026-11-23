@@ -128,6 +128,9 @@ def _hermetic_mtplx_state(monkeypatch, tmp_path_factory):
         "MTPLX_APP_SETTINGS_PATH", str(isolated / "app-settings.json")
     )
     monkeypatch.setenv("MTPLX_MODEL_DIR", str(isolated / "models"))
+    monkeypatch.setenv("HF_HOME", str(isolated / "hf"))
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
     # `mtplx start` saves its setup to ~/.mtplx/quickstart.json and offers it
     # again on the next start; a test that reaches save_state without its own
     # path must not rewrite the developer's.

@@ -6479,10 +6479,19 @@ _FOLDER_REASON_TEXT = {
 def _folder_line(row: dict[str, Any]) -> str:
     from mtplx.ui import pretty_path
 
-    role = "downloads" if row.get("role") == "downloads" else "search   "
+    role_key = str(row.get("role") or "")
+    role = (
+        "downloads"
+        if role_key == "downloads"
+        else "hf cache "
+        if role_key == "huggingface_cache"
+        else "search   "
+    )
     if row.get("available"):
         packs = int(row.get("packs") or 0)
         state = f"{packs} pack{'s' if packs != 1 else ''}"
+        if role_key == "huggingface_cache":
+            state += ", read-only"
     else:
         state = _FOLDER_REASON_TEXT.get(str(row.get("reason")), str(row.get("reason")))
         if row.get("reason") == "not_connected":
@@ -6524,7 +6533,10 @@ def cmd_folders_public(args: Any) -> int:
     rows = model_folders.folders_report(
         change.get("model_dir"), search_dirs=change.get("model_dirs")
     )
+    hf_row = model_folders.hf_cache_folder_row()
     payload = {"action": action, **change, "folders": rows}
+    if hf_row is not None:
+        payload["huggingface_cache"] = hf_row
     if getattr(args, "json", False):
         _print(payload)
         return 0
@@ -6537,6 +6549,8 @@ def cmd_folders_public(args: Any) -> int:
     print(f"MTPLX model folders (shared with the app: {change.get('config_path')})")
     for row in rows:
         print(_folder_line(row))
+    if hf_row is not None:
+        print(_folder_line(hf_row))
     return 0
 
 

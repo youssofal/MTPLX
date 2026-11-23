@@ -24,6 +24,7 @@ struct ModelFoldersView: View {
         var id: String { path }
         let path: String
         let isDownloads: Bool
+        let isHuggingFaceCache: Bool
         let availability: ModelFolderAvailability
         let packs: Int
     }
@@ -31,7 +32,10 @@ struct ModelFoldersView: View {
     @State private var rows: [Row] = []
 
     private var folderKey: [String] {
-        [configuration.primaryModelDirectory] + configuration.additionalModelDirectories
+        [
+            configuration.primaryModelDirectory,
+            SharedModelFolders.huggingfaceHubCacheURL().path,
+        ] + configuration.additionalModelDirectories
     }
 
     var body: some View {
@@ -82,6 +86,13 @@ struct ModelFoldersView: View {
                             .padding(.horizontal, 5)
                             .padding(.vertical, 1)
                             .background(Capsule().stroke(Brand.accent.opacity(0.6), lineWidth: 0.75))
+                    } else if row.isHuggingFaceCache {
+                        Text(tr("Hugging Face"))
+                            .font(.system(size: 9, weight: .heavy, design: .rounded))
+                            .foregroundStyle(Brand.typeSecondary)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Capsule().stroke(Brand.typeTertiary.opacity(0.6), lineWidth: 0.75))
                     }
                     status(row)
                 }
@@ -94,13 +105,17 @@ struct ModelFoldersView: View {
             }
             Spacer(minLength: 8)
             Menu {
-                Button(tr("Use for Downloads")) { useForDownloads(row.path) }
-                    .disabled(row.isDownloads || row.availability != .available)
+                if !row.isHuggingFaceCache {
+                    Button(tr("Use for Downloads")) { useForDownloads(row.path) }
+                        .disabled(row.isDownloads || row.availability != .available)
+                }
                 Button(tr("Show in Finder")) { showInFinder(row.path) }
                     .disabled(row.availability != .available)
-                Divider()
-                Button(tr("Remove"), role: .destructive) { remove(row.path) }
-                    .disabled(row.isDownloads)
+                if !row.isHuggingFaceCache {
+                    Divider()
+                    Button(tr("Remove"), role: .destructive) { remove(row.path) }
+                        .disabled(row.isDownloads)
+                }
             } label: {
                 Image(systemName: "ellipsis.circle")
             }
@@ -147,18 +162,31 @@ struct ModelFoldersView: View {
     private func refresh() async {
         let primary = configuration.modelLibrary.primaryDirectory.path
         let additional = configuration.modelLibrary.additionalDirectories.map(\.path)
+        let hfHub = configuration.modelLibrary.huggingfaceHubCacheDirectory?.path
         // File checks off the main actor: a slow or sleeping drive must never
         // stall Settings.
         let computed = await Task.detached(priority: .utility) { () -> [Row] in
-            ([primary] + additional).enumerated().map { index, path in
+            var result = ([primary] + additional).enumerated().map { index, path in
                 let availability = SharedModelFolders.availability(of: path)
                 return Row(
                     path: path,
                     isDownloads: index == 0,
+                    isHuggingFaceCache: false,
                     availability: availability,
                     packs: availability == .available ? SharedModelFolders.packCount(in: path) : 0
                 )
             }
+            if let hfHub,
+               SharedModelFolders.availability(of: hfHub) == .available {
+                result.append(Row(
+                    path: hfHub,
+                    isDownloads: false,
+                    isHuggingFaceCache: true,
+                    availability: .available,
+                    packs: SharedModelFolders.packCount(in: hfHub)
+                ))
+            }
+            return result
         }.value
         rows = computed
     }

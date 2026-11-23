@@ -988,6 +988,7 @@ def scan_installed_models(
     cache_dir: str | Path | None = None,
     *,
     search_dirs: Iterable[str | Path] | None = None,
+    include_hf_cache: bool | None = None,
 ) -> list[InstalledModel]:
     """Complete installs under the model cache, official catalog first.
 
@@ -995,32 +996,83 @@ def scan_installed_models(
     follow alphabetically. Partial downloads are excluded outright so the
     picker never offers a model that cannot load.
     """
+    from mtplx.hf_loader import (
+        _hf_home_reuse_disabled,
+        _resolve_hf_dir_snapshot,
+        hf_hub_cache_dir,
+        hf_repo_id_from_cache_dir,
+        iter_hf_cache_models,
+    )
+
+    def _catalog_for_install(target: Path, repo_ref: str | None = None) -> CatalogModel | None:
+        if repo_ref:
+            match = catalog_model_matching(repo_ref)
+            if match is not None and not (
+                match.id in PACK_IDENTITIES and pack_identity_problem(target, match)
+            ):
+                return match
+        return catalog_model_matching(target)
 
     installed: list[InstalledModel] = []
     seen: set[str] = set()
-    for root_index, root in enumerate(
-        model_library_roots(cache_dir, search_dirs=search_dirs)
-    ):
+    roots = model_library_roots(cache_dir, search_dirs=search_dirs)
+    for root_index, root in enumerate(roots):
         if not root.is_dir():
             continue
         for child in sorted(root.iterdir()):
             if not child.is_dir() or child.name.startswith("."):
                 continue
-            identity = os.path.normcase(str(child.resolve(strict=False)))
+            repo_ref: str | None = None
+            target = child
+            display_name = child.name
+            if child.name.startswith("models--"):
+                snap = _resolve_hf_dir_snapshot(child, require_complete=True)
+                if snap is None:
+                    continue
+                target = snap
+                repo_ref = hf_repo_id_from_cache_dir(child, snap)
+                display_name = repo_ref or child.name
+            identity = os.path.normcase(str(target.resolve(strict=False)))
             if identity in seen:
                 continue
             seen.add(identity)
-            if not _is_complete_install(child):
+            if not _is_complete_install(target):
                 continue
             installed.append(
                 InstalledModel(
-                    path=child,
-                    name=child.name,
-                    size_bytes=_directory_size_bytes(child),
-                    catalog=catalog_model_matching(child),
+                    path=target,
+                    name=display_name,
+                    size_bytes=_directory_size_bytes(target),
+                    catalog=_catalog_for_install(target, repo_ref),
                     root=root,
                     root_index=root_index,
                     is_primary=root_index == 0,
+                )
+            )
+    scan_hf = (
+        (cache_dir is None and not _hf_home_reuse_disabled())
+        if include_hf_cache is None
+        else (include_hf_cache and not _hf_home_reuse_disabled())
+    )
+    if scan_hf:
+        hf_hub = hf_hub_cache_dir()
+        hf_index = len(roots)
+        for repo_id, snap in iter_hf_cache_models(hf_hub, require_complete=True):
+            identity = os.path.normcase(str(snap.resolve(strict=False)))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if not _is_complete_install(snap):
+                continue
+            installed.append(
+                InstalledModel(
+                    path=snap,
+                    name=repo_id,
+                    size_bytes=_directory_size_bytes(snap),
+                    catalog=_catalog_for_install(snap, repo_id),
+                    root=hf_hub,
+                    root_index=hf_index,
+                    is_primary=False,
                 )
             )
 

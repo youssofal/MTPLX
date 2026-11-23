@@ -136,8 +136,43 @@ public enum SharedModelFolders {
         return .missing
     }
 
-    /// Model folders directly inside a folder: a child with a config.json or
-    /// a pair manifest, as `mtplx folders` counts them (0 when unreadable).
+    public static func huggingfaceHubCacheURL(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> URL {
+        for key in ["HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"] {
+            if let raw = environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !raw.isEmpty {
+                return URL(fileURLWithPath: (raw as NSString).expandingTildeInPath, isDirectory: true)
+                    .standardizedFileURL
+            }
+        }
+        if let hfHome = environment["HF_HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !hfHome.isEmpty {
+            return URL(fileURLWithPath: (hfHome as NSString).expandingTildeInPath, isDirectory: true)
+                .appendingPathComponent("hub", isDirectory: true)
+                .standardizedFileURL
+        }
+        let home = environment["HOME"].flatMap { $0.isEmpty ? nil : $0 } ?? NSHomeDirectory()
+        return URL(fileURLWithPath: home, isDirectory: true)
+            .appendingPathComponent(".cache", isDirectory: true)
+            .appendingPathComponent("huggingface", isDirectory: true)
+            .appendingPathComponent("hub", isDirectory: true)
+            .standardizedFileURL
+    }
+
+    public static func huggingfaceCacheConfigured(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        ["HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_HOME"].contains { key in
+            guard let raw = environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                return false
+            }
+            return !raw.isEmpty
+        }
+    }
+
+    /// Model folders directly inside a folder: direct pack children or HF hub
+    /// cache `models--Org--Repo/snapshots/<rev>` entries (0 when unreadable).
     public static func packCount(in path: String, fileManager: FileManager = .default) -> Int {
         let root = URL(fileURLWithPath: (path as NSString).expandingTildeInPath, isDirectory: true)
         guard let children = try? fileManager.contentsOfDirectory(
@@ -145,11 +180,19 @@ public enum SharedModelFolders {
             includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles]
         ) else { return 0 }
-        return children.filter { child in
-            ["config.json", "mtplx_pair.json"].contains { marker in
-                fileManager.fileExists(atPath: child.appendingPathComponent(marker).path)
+        let markers = ["config.json", "mtplx_pair.json"]
+        var count = 0
+        for child in children {
+            if child.lastPathComponent.hasPrefix("models--") {
+                if let snap = ModelLibrary.resolveAnyHFSnapshot(inRepoDirectory: child, fileManager: fileManager),
+                   markers.contains(where: { fileManager.fileExists(atPath: snap.appendingPathComponent($0).path) }) {
+                    count += 1
+                }
+            } else if markers.contains(where: { fileManager.fileExists(atPath: child.appendingPathComponent($0).path) }) {
+                count += 1
             }
-        }.count
+        }
+        return count
     }
 }
 
