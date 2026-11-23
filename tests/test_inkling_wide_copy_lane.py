@@ -241,3 +241,59 @@ def test_inkling_runtime_warms_all_wide_copy_widths(monkeypatch):
     monkeypatch.setattr(runtime_module, "wide_rows_exact", lambda model, spec: True)
     assert runtime_module.wide_copy_widths(None) == (16, 24)
     assert runtime_module.widest_panel(None) == 24
+
+
+
+def test_inkling_runtime_init_warm_up_defines_widest_and_prices_pool(monkeypatch, tmp_path):
+    """Regression: InklingRuntime.__init__ fast-path warm-up must keep `widest` defined for pool pricing."""
+    from types import SimpleNamespace
+
+    fake_model = SimpleNamespace(
+        embed_tokens=SimpleNamespace(weight=SimpleNamespace(dtype=mx.bfloat16)),
+        visit_order=(),
+        proof_pack=lambda _dev: ({}, None),
+        parameters=lambda: {},
+    )
+    fake_cfg = {
+        "vision_config": {},
+        "text_config": {},
+        "mtp_config": {},
+    }
+    monkeypatch.setattr(runtime_module, "load_target", lambda _p: (fake_model, {}, fake_cfg))
+    monkeypatch.setattr(runtime_module.prompt_flash, "set_model_dtype", lambda _dt: None)
+    monkeypatch.setattr(runtime_module.prompt_flash, "prove_at_load", lambda: {"ok": True})
+    monkeypatch.setattr(runtime_module.expert_fusion, "bind", lambda _m, _p: None)
+    monkeypatch.setattr(runtime_module, "_load_tokenizer_resilient", lambda _p, _c: SimpleNamespace())
+    monkeypatch.setattr(runtime_module, "VisionTower", lambda _vc, _v: SimpleNamespace())
+    monkeypatch.setattr(runtime_module, "cache_footprint", lambda _c, **_kw: SimpleNamespace(window=1024, full_bytes_per_token=1024))
+    monkeypatch.setattr(runtime_module, "make_weights_resident", lambda _m, _d: None)
+    monkeypatch.setattr(runtime_module, "FastDecoder", lambda _rt: SimpleNamespace())
+    monkeypatch.setattr(runtime_module, "fast_enabled", lambda: True)
+    monkeypatch.setattr(runtime_module.mx, "default_device", lambda: mx.gpu)
+    monkeypatch.setattr(runtime_module.mx.metal, "is_available", lambda: True)
+
+    warm_calls = []
+
+    def _fake_warm(_rt, widths=None):
+        warm_calls.append(widths)
+        if widths:
+            return {"widths": {w: {"live": True} for w in widths}, "seconds": 0.1}
+        return {"widths": {8: {"live": True}}, "seconds": 0.1}
+
+    monkeypatch.setattr(runtime_module.engine_site, "warm", _fake_warm)
+    monkeypatch.setattr(runtime_module.engine_site, "health", lambda: {"executor": {"pool_bytes": 128 << 20}})
+    monkeypatch.setattr(runtime_module, "measure_load_extra_bytes", lambda _self: 0, raising=False)
+    monkeypatch.setattr(runtime_module.InklingRuntime, "measure_load_extra_bytes", lambda _self: 0)
+
+    # Case 1: wide_copy_widths returns (16, 24)
+    monkeypatch.setattr(runtime_module, "wide_rows_exact", lambda _m, _s: True)
+    rt_wide = runtime_module.InklingRuntime(tmp_path, mtp=False)
+    assert warm_calls == [None, (16, 24)]
+    assert rt_wide.engine_pool_bound == (128 << 20) + runtime_module.POOL_PAST_FIRST_STEP_BYTES
+
+    # Case 2: wide_copy_widths returns ()
+    warm_calls.clear()
+    monkeypatch.setattr(runtime_module, "wide_rows_exact", lambda _m, _s: False)
+    rt_narrow = runtime_module.InklingRuntime(tmp_path, mtp=False)
+    assert warm_calls == [None]
+    assert rt_narrow.engine_pool_bound == (128 << 20) + runtime_module.POOL_PAST_FIRST_STEP_BYTES

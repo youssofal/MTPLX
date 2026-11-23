@@ -124,6 +124,7 @@ class InklingRuntime(MTPLXRuntime):
             # priced as measured plus what a longer conversation adds (``engine_pool_price``), not
             # scaled from warm-up's widest.
             wide_widths = wide_copy_widths(model)
+            widest = wide_widths[-1] if wide_widths else engine_site.MAX_WARM_WIDTH
             if wide_widths:
                 wide = engine_site.warm(self, widths=wide_widths)
                 self.engine_warm.setdefault("widths", {}).update(wide.get("widths") or {})
