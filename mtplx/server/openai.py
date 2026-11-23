@@ -798,7 +798,20 @@ def _detach_exception_frames(exc: BaseException) -> BaseException:
 
 
 def _stream_error_queue_item(exc: BaseException) -> tuple[str, BaseException]:
-    return ("error", _detach_exception_frames(exc))
+    # Capture plain-text stack trace before detaching live traceback frames so
+    # mid-stream server logs still include the call stack without pinning any
+    # frame-local GPU caches (#422 / #415).
+    tb_text = ""
+    if exc.__traceback__ is not None:
+        with suppress(Exception):
+            tb_text = "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            ).rstrip()
+    detached = _detach_exception_frames(exc)
+    if tb_text:
+        with suppress(Exception):
+            setattr(detached, "_mtplx_traceback_text", tb_text)
+    return ("error", detached)
 
 
 def _raise_if_stream_cancelled(
@@ -7688,6 +7701,11 @@ async def _anthropic_stream_from_openai_sse(body_iterator: Any, *, model: str):
             try:
                 payload = json.loads(data)
             except json.JSONDecodeError as exc:
+                _log_stream_error(
+                    exc,
+                    request_id=message_id,
+                    path="/v1/messages",
+                )
                 yield _anthropic_sse(
                     "error",
                     {
@@ -7852,6 +7870,25 @@ async def _anthropic_stream_from_openai_sse(body_iterator: Any, *, model: str):
                             {"mtplx_stats": mtplx_stats}
                         ),
                     )
+    except (asyncio.CancelledError, GeneratorExit):
+        raise
+    except Exception as exc:
+        _log_stream_error(
+            exc,
+            request_id=message_id,
+            path="/v1/messages",
+        )
+        yield _anthropic_sse(
+            "error",
+            {
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": str(exc),
+                },
+            },
+        )
+        return
     finally:
         if hasattr(body_iterator, "aclose"):
             try:
@@ -28109,6 +28146,51 @@ def _stream_error_detail(error: BaseException) -> str:
     return text[:400]
 
 
+def _log_stream_error(
+    exc: BaseException,
+    *,
+    request_id: str,
+    path: str,
+    session_id: str | None = None,
+    streamed_tokens: int = 0,
+) -> None:
+    """Log mid-stream exceptions with stack/context after SSE has started."""
+
+    tb_text = (
+        getattr(exc, "_mtplx_traceback_text", None)
+        if exc.__traceback__ is None
+        else None
+    )
+    if tb_text:
+        logging.getLogger("mtplx.server").error(
+            "unhandled streaming error request_id=%s path=%s session_id=%s "
+            "streamed_tokens=%d: %s: %s\n%s",
+            request_id,
+            path,
+            session_id or "-",
+            int(streamed_tokens),
+            type(exc).__name__,
+            exc,
+            tb_text,
+        )
+        return
+    logging.getLogger("mtplx.server").error(
+        "unhandled streaming error request_id=%s path=%s session_id=%s "
+        "streamed_tokens=%d: %s: %s",
+        request_id,
+        path,
+        session_id or "-",
+        int(streamed_tokens),
+        type(exc).__name__,
+        exc,
+        exc_info=(
+            (type(exc), exc, exc.__traceback__)
+            if exc.__traceback__ is not None
+            else None
+        ),
+    )
+
+
 def _record_stream_error_metric(
     state: ServerState,
     *,
@@ -28186,6 +28268,24 @@ def _record_stream_error_metric(
     _record_request_metrics(state, envelope)
     if not bool(envelope.get("warmup")):
         state.last_request_at = time.time()
+    if not bool(envelope.get("warmup")) and not _server_console_enabled(state):
+        _safe_stdout_print(
+            json.dumps(
+                {
+                    "event": "mtplx_openai_generation",
+                    "request_id": response_id,
+                    "mode": mode,
+                    "prompt_tokens": int(prompt_tokens),
+                    "completion_tokens": streamed_tokens,
+                    "finish_reason": "error",
+                    "error_kind": error_kind,
+                    "error_status": error_status,
+                    "error_detail": envelope["error_detail"],
+                    "elapsed_s": round(elapsed_s, 6),
+                },
+                ensure_ascii=False,
+            )
+        )
     try:
         state.dashboard.bus.publish(
             {
@@ -44063,6 +44163,10 @@ def create_app(state: ServerState) -> FastAPI:
                 stream_cancelled_by_client = False
                 cancelled_metric_recorded = False
                 stream_error_item: BaseException | None = None
+                stream_path = str(
+                    getattr(getattr(raw_request, "url", None), "path", None)
+                    or "/v1/chat/completions"
+                )
                 try:
                     for field, text in splitter.start():
                         if text:
@@ -44994,6 +45098,36 @@ def create_app(state: ServerState) -> FastAPI:
                                         "session_postcommit_snapshot"
                                     ] = commit_item
                                 elif commit_kind == "error":
+                                    commit_err = (
+                                        commit_item
+                                        if isinstance(commit_item, BaseException)
+                                        else RuntimeError(str(commit_item))
+                                    )
+                                    _log_stream_error(
+                                        commit_err,
+                                        request_id=response_id,
+                                        path=stream_path,
+                                        session_id=session_id,
+                                        streamed_tokens=streamed_progress_tokens,
+                                    )
+                                    if not cancelled_metric_recorded:
+                                        _record_stream_error_metric(
+                                            state,
+                                            response_id=response_id,
+                                            session_id=session_id,
+                                            prompt_tokens=len(prompt_ids),
+                                            streamed_completion_tokens=(
+                                                streamed_progress_tokens
+                                            ),
+                                            stream_started_s=stream_started_s,
+                                            error=commit_err,
+                                            request_observability=request_observability,
+                                            client_disconnected=(
+                                                stream_cancelled_by_client
+                                            ),
+                                            token_times=streamed_token_times,
+                                        )
+                                        cancelled_metric_recorded = True
                                     yield mark_sse_sent(error_chunk(commit_item))
                                     yield mark_sse_sent("data: [DONE]\n\n")
                                     return
@@ -45017,13 +45151,35 @@ def create_app(state: ServerState) -> FastAPI:
                                         assistant_tool_calls=assistant_tool_calls,
                                     )
                                 else:
-                                    yield mark_sse_sent(
-                                        error_chunk(
-                                            RuntimeError(
-                                                f"unexpected commit event: {commit_kind}"
-                                            )
-                                        )
+                                    commit_err = RuntimeError(
+                                        f"unexpected commit event: {commit_kind}"
                                     )
+                                    _log_stream_error(
+                                        commit_err,
+                                        request_id=response_id,
+                                        path=stream_path,
+                                        session_id=session_id,
+                                        streamed_tokens=streamed_progress_tokens,
+                                    )
+                                    if not cancelled_metric_recorded:
+                                        _record_stream_error_metric(
+                                            state,
+                                            response_id=response_id,
+                                            session_id=session_id,
+                                            prompt_tokens=len(prompt_ids),
+                                            streamed_completion_tokens=(
+                                                streamed_progress_tokens
+                                            ),
+                                            stream_started_s=stream_started_s,
+                                            error=commit_err,
+                                            request_observability=request_observability,
+                                            client_disconnected=(
+                                                stream_cancelled_by_client
+                                            ),
+                                            token_times=streamed_token_times,
+                                        )
+                                        cancelled_metric_recorded = True
+                                    yield mark_sse_sent(error_chunk(commit_err))
                                     yield mark_sse_sent("data: [DONE]\n\n")
                                     return
                             generated = attach_response_observability(generated)
@@ -45136,6 +45292,15 @@ def create_app(state: ServerState) -> FastAPI:
                         elif kind == "error":
                             if isinstance(item, BaseException):
                                 stream_error_item = item
+                            else:
+                                stream_error_item = RuntimeError(str(item))
+                            _log_stream_error(
+                                stream_error_item,
+                                request_id=response_id,
+                                path=stream_path,
+                                session_id=session_id,
+                                streamed_tokens=streamed_progress_tokens,
+                            )
                             yield mark_sse_sent(error_chunk(item))
                             yield mark_sse_sent("data: [DONE]\n\n")
                             return
@@ -45234,11 +45399,18 @@ def create_app(state: ServerState) -> FastAPI:
                                 yield mark_sse_sent("data: [DONE]\n\n")
                             return
                         else:
-                            yield mark_sse_sent(
-                                error_chunk(
-                                    RuntimeError(f"unexpected stream event: {kind}")
-                                )
+                            unexpected_err = RuntimeError(
+                                f"unexpected stream event: {kind}"
                             )
+                            stream_error_item = unexpected_err
+                            _log_stream_error(
+                                unexpected_err,
+                                request_id=response_id,
+                                path=stream_path,
+                                session_id=session_id,
+                                streamed_tokens=streamed_progress_tokens,
+                            )
+                            yield mark_sse_sent(error_chunk(unexpected_err))
                             yield mark_sse_sent("data: [DONE]\n\n")
                             return
                 except asyncio.CancelledError:
@@ -45258,6 +45430,14 @@ def create_app(state: ServerState) -> FastAPI:
                     stream_cancelled_by_client = True
                     raise
                 except BaseException as exc:
+                    stream_error_item = exc
+                    _log_stream_error(
+                        exc,
+                        request_id=response_id,
+                        path=stream_path,
+                        session_id=session_id,
+                        streamed_tokens=streamed_progress_tokens,
+                    )
                     yield mark_sse_sent(error_chunk(exc))
                     yield mark_sse_sent("data: [DONE]\n\n")
                     return
@@ -45342,9 +45522,29 @@ def create_app(state: ServerState) -> FastAPI:
                     )
 
                 if generated is None:
-                    yield mark_sse_sent(
-                        error_chunk(RuntimeError("generation ended without a result"))
+                    missing_err = RuntimeError("generation ended without a result")
+                    _log_stream_error(
+                        missing_err,
+                        request_id=response_id,
+                        path=stream_path,
+                        session_id=session_id,
+                        streamed_tokens=streamed_progress_tokens,
                     )
+                    if not cancelled_metric_recorded:
+                        _record_stream_error_metric(
+                            state,
+                            response_id=response_id,
+                            session_id=session_id,
+                            prompt_tokens=len(prompt_ids),
+                            streamed_completion_tokens=streamed_progress_tokens,
+                            stream_started_s=stream_started_s,
+                            error=missing_err,
+                            request_observability=request_observability,
+                            client_disconnected=stream_cancelled_by_client,
+                            token_times=streamed_token_times,
+                        )
+                        cancelled_metric_recorded = True
+                    yield mark_sse_sent(error_chunk(missing_err))
                     yield mark_sse_sent("data: [DONE]\n\n")
                     return
                 finish_reason = generated.get("finish_reason") or "stop"
@@ -46033,6 +46233,12 @@ def create_app(state: ServerState) -> FastAPI:
                 streamed_completion_tokens = 0
                 stream_started_s = time.perf_counter()
                 completion_client_disconnected = False
+                stream_error_item: BaseException | None = None
+                stream_error_metric_recorded = False
+                stream_path = str(
+                    getattr(getattr(raw_request, "url", None), "path", None)
+                    or "/v1/completions"
+                )
                 generated: dict[str, Any] | None = None
                 stop_hit = False
                 owner_stall_probe = _OwnerStallProbe(deadline_s=STREAM_STALL_DEADLINE_S)
@@ -46317,13 +46523,34 @@ def create_app(state: ServerState) -> FastAPI:
                                 yield "data: [DONE]\n\n"
                             return
                         elif kind == "error":
+                            stream_error_item = (
+                                item
+                                if isinstance(item, BaseException)
+                                else RuntimeError(str(item))
+                            )
+                            _log_stream_error(
+                                stream_error_item,
+                                request_id=response_id,
+                                path=stream_path,
+                                session_id=None,
+                                streamed_tokens=streamed_completion_tokens,
+                            )
                             yield error_chunk(item)
                             yield "data: [DONE]\n\n"
                             return
                         else:
-                            yield error_chunk(
-                                RuntimeError(f"unexpected stream event: {kind}")
+                            unexpected_err = RuntimeError(
+                                f"unexpected stream event: {kind}"
                             )
+                            stream_error_item = unexpected_err
+                            _log_stream_error(
+                                unexpected_err,
+                                request_id=response_id,
+                                path=stream_path,
+                                session_id=None,
+                                streamed_tokens=streamed_completion_tokens,
+                            )
+                            yield error_chunk(unexpected_err)
                             yield "data: [DONE]\n\n"
                             return
                 except asyncio.CancelledError:
@@ -46339,6 +46566,14 @@ def create_app(state: ServerState) -> FastAPI:
                     completion_client_disconnected = True
                     raise
                 except BaseException as exc:
+                    stream_error_item = exc
+                    _log_stream_error(
+                        exc,
+                        request_id=response_id,
+                        path=stream_path,
+                        session_id=None,
+                        streamed_tokens=streamed_completion_tokens,
+                    )
                     yield error_chunk(exc)
                     yield "data: [DONE]\n\n"
                     return
@@ -46358,7 +46593,21 @@ def create_app(state: ServerState) -> FastAPI:
                     _cancel_stream_generation(
                         cancel_event, generation_future, origin="stream_teardown"
                     )
-                    if cancelled:
+                    if stream_error_item is not None and generated is None:
+                        if not stream_error_metric_recorded:
+                            _record_stream_error_metric(
+                                state,
+                                response_id=response_id,
+                                session_id=None,
+                                prompt_tokens=len(prompt_ids),
+                                streamed_completion_tokens=streamed_completion_tokens,
+                                stream_started_s=stream_started_s,
+                                error=stream_error_item,
+                                request_observability=request_observability,
+                                client_disconnected=completion_client_disconnected,
+                            )
+                            stream_error_metric_recorded = True
+                    elif cancelled:
                         state.dashboard.lifetime.record_cancellation()
                         _record_stream_cancellation_metric(
                             state,
@@ -46376,7 +46625,28 @@ def create_app(state: ServerState) -> FastAPI:
                     _flight(state).sweep(response_id)
 
                 if generated is None:
-                    yield error_chunk(RuntimeError("generation ended without a result"))
+                    missing_err = RuntimeError("generation ended without a result")
+                    _log_stream_error(
+                        missing_err,
+                        request_id=response_id,
+                        path=stream_path,
+                        session_id=None,
+                        streamed_tokens=streamed_completion_tokens,
+                    )
+                    if not stream_error_metric_recorded:
+                        _record_stream_error_metric(
+                            state,
+                            response_id=response_id,
+                            session_id=None,
+                            prompt_tokens=len(prompt_ids),
+                            streamed_completion_tokens=streamed_completion_tokens,
+                            stream_started_s=stream_started_s,
+                            error=missing_err,
+                            request_observability=request_observability,
+                            client_disconnected=completion_client_disconnected,
+                        )
+                        stream_error_metric_recorded = True
+                    yield error_chunk(missing_err)
                     yield "data: [DONE]\n\n"
                     return
                 finish_reason = str(generated.get("finish_reason") or "stop")

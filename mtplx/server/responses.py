@@ -12,10 +12,12 @@ tool search) are rejected because MTPLX cannot execute them.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
 import json
+import logging
 import re
 import time
 import uuid
@@ -1166,6 +1168,13 @@ async def stream_from_chat_sse(
             try:
                 chat_chunk = json.loads(data)
             except json.JSONDecodeError as exc:
+                logging.getLogger("mtplx.server").error(
+                    "unhandled streaming error request_id=%s path=/v1/responses: %s: %s",
+                    response_id,
+                    type(exc).__name__,
+                    exc,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
                 message = f"failed to parse MTPLX SSE: {exc}"
                 yield _sse(
                     "error",
@@ -1336,6 +1345,25 @@ async def stream_from_chat_sse(
                     item["arguments"] = ""
                 elif item["custom"]:
                     item["arguments"] = ""
+    except (asyncio.CancelledError, GeneratorExit):
+        raise
+    except Exception as exc:
+        logging.getLogger("mtplx.server").error(
+            "unhandled streaming error request_id=%s path=/v1/responses: %s: %s",
+            response_id,
+            type(exc).__name__,
+            exc,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        message = str(exc)
+        yield _sse(
+            "error",
+            event_payload("error", code="server_error", message=message, param=None),
+        )
+        failed = base("failed")
+        failed["error"] = {"code": "server_error", "message": message}
+        yield _sse("response.failed", event_payload("response.failed", response=failed))
+        return
     finally:
         if hasattr(body_iterator, "aclose"):
             with suppress(Exception):
@@ -1343,6 +1371,11 @@ async def stream_from_chat_sse(
 
     if final_chat is None:
         message = "MTPLX stream ended without a terminal chat chunk"
+        logging.getLogger("mtplx.server").error(
+            "unhandled streaming error request_id=%s path=/v1/responses: %s",
+            response_id,
+            message,
+        )
         yield _sse(
             "error",
             event_payload("error", code="server_error", message=message, param=None),
