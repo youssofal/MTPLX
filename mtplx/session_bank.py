@@ -2287,9 +2287,19 @@ class SessionBank:
             if _cand < 2 or _cand >= int(_entry.prefix_len):
                 continue
             if _entry.live_ref_only:
-                # Leases are single-use; only durable snapshot twins may
-                # suppress a cold hydration.
-                continue
+                # One-copy recurrent leases serve their own session in place
+                # and other sessions via read-only prefix views
+                # (_lease_view_snapshot), so a live, rewindable,
+                # boundary-backed lease is serve-equivalent to its cold twin.
+                # Non-recurrent leases cannot be cross-session copied without
+                # a boundary snapshot (restore_entry_prefix_cache), so keep
+                # them fail-open to cold recovery.
+                if (
+                    _entry.cache_ref is None
+                    or not _entry.has_recurrent
+                    or _lease_rewind_anchor(_entry) is None
+                ):
+                    continue
             if not _restore_identity_compatible(
                 _entry,
                 model_path=model_path,
@@ -2314,7 +2324,7 @@ class SessionBank:
                 continue
             if _entry.has_recurrent:
                 _gap = int(_entry.prefix_len) - _cand
-                if _gap > gap_limit:
+                if _entry.live_ref_only or _gap > gap_limit:
                     _probe = getattr(
                         _entry, "recurrent_boundary_at_or_below", None
                     )
@@ -2323,8 +2333,33 @@ class SessionBank:
                         _boundary = _probe(_cand)
                         if _boundary is not None:
                             _achievable = int(_boundary[0])
-                    if _achievable <= floor:
+                    if _achievable <= floor or _achievable < 1:
                         continue
+                    if _achievable < int(
+                        getattr(_entry, "restore_floor_tokens", 0) or 0
+                    ):
+                        continue
+                    if _achievable == len(tokens):
+                        # An exact-length boundary restore leaves an empty
+                        # suffix, so generation requires boundary_logits at
+                        # restore_point (missing_boundary_logits otherwise).
+                        _bl = getattr(_entry, "boundary_logits", None)
+                        if _bl is None or int(_bl[0]) != _achievable:
+                            continue
+                    if _entry.live_ref_only:
+                        if not _cache_ref_trimmable_to(
+                            _entry.cache_ref, _achievable
+                        ):
+                            continue
+                        _mtp_ref = getattr(
+                            _entry, "mtp_history_cache_ref", None
+                        )
+                        if _mtp_ref is not None and not _cache_ref_trimmable_by(
+                            _mtp_ref,
+                            _mtp_lease_advance(_entry)
+                            + max(0, int(_entry.prefix_len) - _achievable),
+                        ):
+                            continue
             if resident_duplicates is None:
                 resident_duplicates = {}
             resident_duplicates[str(_entry.token_hash)] = {
@@ -2344,7 +2379,7 @@ class SessionBank:
         # so a cold row with strictly smaller matched can never win against
         # an entry that can actually serve this request — hydrating it (a
         # multi-GB disk read + decode on the request thread) is pure waste.
-        # The bar deliberately ignores incompatible/lease-only RAM entries
+        # The bar deliberately ignores incompatible or unservable RAM entries
         # (they cannot serve, so they must not shadow a valid cold row).
         ram_best_matched = int(serve_compatible_best_matched)
         if floor > 0:

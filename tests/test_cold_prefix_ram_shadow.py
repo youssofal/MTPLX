@@ -325,3 +325,224 @@ def test_a_cold_row_strictly_past_the_floor_still_hydrates(tmp_path, monkeypatch
         assert any(getattr(m[0], "cache_source", None) == "ssd" for m in matches)
     finally:
         cold.close()
+
+
+class _DummyTrimmableCache:
+    def __init__(self, offset: int) -> None:
+        self.offset = int(offset)
+
+    def is_trimmable(self) -> bool:
+        return True
+
+    def trim(self, n: int) -> int:
+        n = min(int(n), self.offset)
+        self.offset -= n
+        return n
+
+
+def test_live_recurrent_lease_shadows_cold_on_exact_length_repeat(
+    tmp_path, monkeypatch
+):
+    """A healthy one-copy recurrent lease with boundary_logits at the exact
+    repeat length serves the repeat in RAM and must not hydrate its SSD twin."""
+    cold = _tier(tmp_path)
+    try:
+        bank = _bank(cold)
+        stored = list(range(1, 51))
+        _put(bank, stored)
+        assert cold.flush(timeout_s=5.0) is True
+        entry = next(iter(bank._entries.values()))
+        entry.live_ref_only = True
+        entry.has_recurrent = True
+        entry.cache_ref = [_DummyTrimmableCache(len(stored))]
+        entry.lease_kv_offset = len(stored)
+        entry.gdn_boundaries = [
+            (40, CacheSnapshot(states=(), meta_states=()), None)
+        ]
+        entry.boundary_logits = (40, "logits")
+        calls = _spy_restore_row(cold, monkeypatch)
+        matches = bank.near_prefix_candidates(
+            tuple(range(1, 41)),
+            min_matched_tokens=4,
+            block_size=8,
+            block_min_matched_tokens=8,
+            model_path=MODEL,
+            mtp_enabled=True,
+        )
+        assert calls == [], "live recurrent lease must shadow its SSD twin"
+        assert matches and matches[0][1] == 40
+        assert str(getattr(matches[0][0], "cache_source", "ram") or "ram") == "ram"
+        assert cold.stats().get("prefix_lookups_shadowed_by_ram") == 1
+    finally:
+        cold.close()
+
+
+def test_live_recurrent_lease_shadows_cold_on_followup_with_nonempty_suffix(
+    tmp_path, monkeypatch
+):
+    """A follow-up prompt leaves a non-empty suffix after the recurrent boundary
+    and needs no boundary_logits, so the live lease shadows its SSD twin."""
+    cold = _tier(tmp_path)
+    try:
+        bank = _bank(cold)
+        stored = list(range(1, 51))
+        _put(bank, stored)
+        assert cold.flush(timeout_s=5.0) is True
+        entry = next(iter(bank._entries.values()))
+        entry.live_ref_only = True
+        entry.has_recurrent = True
+        entry.cache_ref = [_DummyTrimmableCache(len(stored))]
+        entry.lease_kv_offset = len(stored)
+        entry.gdn_boundaries = [
+            (40, CacheSnapshot(states=(), meta_states=()), None)
+        ]
+        entry.boundary_logits = None
+        calls = _spy_restore_row(cold, monkeypatch)
+        matches = _candidates(bank)
+        assert calls == []
+        assert matches and matches[0][1] == 40
+        assert str(getattr(matches[0][0], "cache_source", "ram") or "ram") == "ram"
+        assert cold.stats().get("prefix_lookups_shadowed_by_ram") == 1
+    finally:
+        cold.close()
+
+
+def test_live_recurrent_lease_missing_boundary_logits_on_exact_repeat_does_not_shadow_cold(
+    tmp_path, monkeypatch
+):
+    """A live recurrent lease without boundary_logits at an exact-length repeat
+    is declined by generation and must not suppress cold rows — while a sibling
+    resident lease that DOES carry boundary_logits still blocks shorter SSD rows."""
+    cold = _tier(tmp_path)
+    try:
+        bank = _bank(cold)
+        stored_50 = list(range(1, 51))
+        _put(bank, stored_50)
+        assert cold.flush(timeout_s=5.0) is True
+        entry_50 = next(iter(bank._entries.values()))
+        entry_50.live_ref_only = True
+        entry_50.has_recurrent = True
+        entry_50.cache_ref = [_DummyTrimmableCache(len(stored_50))]
+        entry_50.lease_kv_offset = len(stored_50)
+        entry_50.gdn_boundaries = [
+            (40, CacheSnapshot(states=(), meta_states=()), None)
+        ]
+        entry_50.boundary_logits = None
+        calls = _spy_restore_row(cold, monkeypatch)
+        matches = bank.near_prefix_candidates(
+            tuple(range(1, 41)),
+            min_matched_tokens=4,
+            block_size=8,
+            block_min_matched_tokens=8,
+            model_path=MODEL,
+            mtp_enabled=True,
+        )
+        assert calls == [1], "lease missing boundary_logits must not shadow SSD"
+        assert any(getattr(m[0], "cache_source", None) == "ssd" for m in matches)
+
+        # Now add a second live recurrent lease (RAM-only) that covers 41 tokens
+        # WITH boundary_logits at 41: it outranks the 40-token block-aligned SSD
+        # row, so SSD must stay unhydrated even while entry_50 lacks logits at 41.
+        bank.cold_tier = None
+        stored_45 = list(range(1, 46))
+        entry_45 = _put(bank, stored_45)
+        assert entry_45 is not None
+        entry_45.live_ref_only = True
+        entry_45.has_recurrent = True
+        entry_45.cache_ref = [_DummyTrimmableCache(len(stored_45))]
+        entry_45.lease_kv_offset = len(stored_45)
+        entry_45.gdn_boundaries = [
+            (41, CacheSnapshot(states=(), meta_states=()), None)
+        ]
+        entry_45.boundary_logits = (41, "logits")
+        entry_50.gdn_boundaries = [
+            (41, CacheSnapshot(states=(), meta_states=()), None)
+        ]
+        bank.cold_tier = cold
+        calls.clear()
+        matches_with_sibling = bank.near_prefix_candidates(
+            tuple(range(1, 42)),
+            min_matched_tokens=4,
+            block_size=8,
+            block_min_matched_tokens=8,
+            model_path=MODEL,
+            mtp_enabled=True,
+        )
+        assert calls == [], "valid sibling lease matching 41 > SSD block 40 suppresses SSD"
+        assert [m[0] for m in matches_with_sibling] == [entry_50, entry_45]
+        assert not any(
+            getattr(m[0], "cache_source", None) == "ssd"
+            for m in matches_with_sibling
+        )
+        assert cold.stats().get("prefix_lookups_not_better_than_ram") == 1
+    finally:
+        cold.close()
+
+
+def test_consumed_live_lease_does_not_shadow_cold(tmp_path, monkeypatch):
+    cold = _tier(tmp_path)
+    try:
+        bank = _bank(cold)
+        stored = list(range(1, 51))
+        _put(bank, stored)
+        assert cold.flush(timeout_s=5.0) is True
+        entry = next(iter(bank._entries.values()))
+        entry.live_ref_only = True
+        entry.has_recurrent = True
+        entry.cache_ref = None
+        entry.gdn_boundaries = [
+            (40, CacheSnapshot(states=(), meta_states=()), None)
+        ]
+        entry.boundary_logits = (40, "logits")
+        calls = _spy_restore_row(cold, monkeypatch)
+        matches = _candidates(bank)
+        assert calls == [1]
+        assert any(getattr(m[0], "cache_source", None) == "ssd" for m in matches)
+    finally:
+        cold.close()
+
+
+def test_advanced_live_lease_without_rewind_anchor_does_not_shadow_cold(
+    tmp_path, monkeypatch
+):
+    cold = _tier(tmp_path)
+    try:
+        bank = _bank(cold)
+        stored = list(range(1, 51))
+        _put(bank, stored)
+        assert cold.flush(timeout_s=5.0) is True
+        entry = next(iter(bank._entries.values()))
+        entry.live_ref_only = True
+        entry.has_recurrent = True
+        entry.cache_ref = [_DummyTrimmableCache(len(stored) + 5)]
+        entry.lease_kv_offset = len(stored)
+        # Anchor only at 40, missing at entry.prefix_len (50) -> unrewindable.
+        entry.gdn_boundaries = [
+            (40, CacheSnapshot(states=(), meta_states=()), None)
+        ]
+        entry.boundary_logits = (40, "logits")
+        calls = _spy_restore_row(cold, monkeypatch)
+        matches = _candidates(bank)
+        assert calls == [1]
+        assert any(getattr(m[0], "cache_source", None) == "ssd" for m in matches)
+    finally:
+        cold.close()
+
+
+def test_non_recurrent_live_lease_stays_fail_open_to_cold(tmp_path, monkeypatch):
+    cold = _tier(tmp_path)
+    try:
+        bank = _bank(cold)
+        _put(bank, PREFIX)
+        assert cold.flush(timeout_s=5.0) is True
+        entry = next(iter(bank._entries.values()))
+        entry.live_ref_only = True
+        entry.has_recurrent = False
+        entry.cache_ref = [_DummyTrimmableCache(len(PREFIX))]
+        entry.lease_kv_offset = len(PREFIX)
+        calls = _spy_restore_row(cold, monkeypatch)
+        matches = _candidates(bank)
+        assert calls == [1]
+        assert any(getattr(m[0], "cache_source", None) == "ssd" for m in matches)
+    finally:
+        cold.close()
