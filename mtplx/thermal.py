@@ -1769,6 +1769,8 @@ class SmartFanController:
         self._active_requests: set[str] = set()
         self._cleanup: Any | None = None
         self._generation = 0
+        self._detach_epoch = 0
+        self._hw_op_in_flight = False
         self._current_level = 0
         self._current_target_rpm: int | None = None
         self._active_started_at: float | None = None
@@ -1915,7 +1917,12 @@ class SmartFanController:
             self._cond.notify_all()
             if not became_idle:
                 return self._status_locked()
-            if not self._commanded_max and self._current_level == 0 and self._cleanup is None:
+            if (
+                not self._commanded_max
+                and self._current_level == 0
+                and self._cleanup is None
+                and not self._hw_op_in_flight
+            ):
                 return self._status_locked()
         if wait_for_restore:
             self._wait_until_restored()
@@ -1938,6 +1945,7 @@ class SmartFanController:
         with self._cond:
             self._active_requests.clear()
             self._generation += 1
+            self._detach_epoch += 1
             self._current_level = 0
             self._current_target_rpm = None
             self._active_started_at = None
@@ -2040,7 +2048,10 @@ class SmartFanController:
         deadline = time.monotonic() + self._WAIT_FOR_RESTORE_TIMEOUT_S
         with self._cond:
             while (
-                self._commanded_max or self._current_level > 0 or self._cleanup is not None
+                self._commanded_max
+                or self._current_level > 0
+                or self._cleanup is not None
+                or self._hw_op_in_flight
             ) and not self._active_requests:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -2168,9 +2179,13 @@ class SmartFanController:
             or not self._active_requests
         )
 
+    def _is_detached_locked(self, detach_epoch: int) -> bool:
+        return self._detach_epoch != detach_epoch or self._shutdown
+
     def _do_step_active(self) -> None:
         with self._lock:
             generation = self._generation
+            detach_epoch = self._detach_epoch
             current_level = self._current_level
             active_started_at = self._active_started_at or time.monotonic()
             self._active_started_at = active_started_at
@@ -2218,103 +2233,121 @@ class SmartFanController:
                 rpm = self._target_rpm_for_level(target_level)
                 res: dict[str, Any] = {"ok": False}
                 err: str | None = None
-                for _attempt in range(2):
-                    with self._lock:
-                        if self._is_stale_generation_locked(generation):
-                            return
-                    try:
-                        res = set_fan_rpm(rpm)
-                    except Exception as exc:
-                        res = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-                    if res.get("ok"):
-                        err = None
-                        break
-                    err = str(res.get("message") or res.get("error") or "set_fan_rpm failed")
+                with self._lock:
+                    if self._is_stale_generation_locked(generation):
+                        return
+                    self._hw_op_in_flight = True
+                try:
+                    for _attempt in range(2):
+                        with self._lock:
+                            if self._is_stale_generation_locked(generation):
+                                break
+                        try:
+                            res = set_fan_rpm(rpm)
+                        except Exception as exc:
+                            res = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                        if res.get("ok"):
+                            err = None
+                            break
+                        err = str(res.get("message") or res.get("error") or "set_fan_rpm failed")
+                        if res.get("unsupported_controller"):
+                            break
                     if res.get("unsupported_controller"):
-                        break
-                if res.get("unsupported_controller"):
-                    with self._lock:
-                        if self._is_stale_generation_locked(generation):
+                        with self._lock:
+                            if self._is_stale_generation_locked(generation):
+                                return
+                            self._last_active_temp_c = temp_c
+                            self._last_active_sensor = sensor
+                        self._do_ramp()
+                        with self._cond:
+                            if self._is_stale_generation_locked(generation):
+                                return
+                            self._step_evaluated_generation = max(
+                                self._step_evaluated_generation, generation
+                            )
+                            self._next_temp_probe_at = (
+                                time.monotonic() + self._ACTIVE_TEMP_POLL_S
+                            )
+                            self._cond.notify_all()
+                        return
+                    if res.get("ok"):
+                        with self._lock:
+                            if self._is_detached_locked(detach_epoch):
+                                return
+                        self._ensure_lifecycle_hooks()
+                    now = time.monotonic()
+                    with self._cond:
+                        if res.get("ok"):
+                            if self._is_detached_locked(detach_epoch):
+                                return
+                        elif self._is_stale_generation_locked(generation):
                             return
                         self._last_active_temp_c = temp_c
                         self._last_active_sensor = sensor
-                    self._do_ramp()
-                    with self._cond:
-                        if self._is_stale_generation_locked(generation):
-                            return
+                        self._last_result = res
+                        self._last_transition_at = time.time()
+                        if res.get("ok"):
+                            self._current_level = target_level
+                            self._current_target_rpm = rpm
+                            self._commanded_max = False
+                            self._target_verified = True
+                            self._last_error = None
+                            self._emit(
+                                f"[smart-fan] stepped to level {target_level} "
+                                f"({rpm} RPM at {temp_c:.1f}C)"
+                            )
+                        else:
+                            self._last_error = err
+                            self._ramp_failed_generation = generation
                         self._step_evaluated_generation = max(
                             self._step_evaluated_generation, generation
                         )
-                        self._next_temp_probe_at = (
-                            time.monotonic() + self._ACTIVE_TEMP_POLL_S
-                        )
+                        self._next_temp_probe_at = now + self._ACTIVE_TEMP_POLL_S
                         self._cond.notify_all()
                     return
-                if res.get("ok"):
-                    with self._lock:
-                        if self._is_stale_generation_locked(generation):
-                            return
-                    self._ensure_lifecycle_hooks()
+                finally:
+                    with self._cond:
+                        self._hw_op_in_flight = False
+                        self._cond.notify_all()
+            # Step down to quiet auto (target_level == 0 and current_level > 0)
+            with self._lock:
+                if self._is_stale_generation_locked(generation):
+                    return
+                self._hw_op_in_flight = True
+            try:
+                try:
+                    res = set_thermal_profile("silent")
+                except Exception as exc:
+                    res = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
                 now = time.monotonic()
                 with self._cond:
-                    if self._is_stale_generation_locked(generation):
+                    if self._is_detached_locked(detach_epoch):
                         return
                     self._last_active_temp_c = temp_c
                     self._last_active_sensor = sensor
                     self._last_result = res
                     self._last_transition_at = time.time()
                     if res.get("ok"):
-                        self._current_level = target_level
-                        self._current_target_rpm = rpm
+                        self._current_level = 0
+                        self._current_target_rpm = None
                         self._commanded_max = False
-                        self._target_verified = True
+                        self._target_verified = False
+                        self._actual_ramp_verified = False
                         self._last_error = None
-                        self._emit(
-                            f"[smart-fan] stepped to level {target_level} "
-                            f"({rpm} RPM at {temp_c:.1f}C)"
-                        )
                     else:
-                        self._last_error = err
-                        self._ramp_failed_generation = generation
+                        self._last_error = str(
+                            res.get("message") or res.get("error") or "step-down auto failed"
+                        )
                     self._step_evaluated_generation = max(
                         self._step_evaluated_generation, generation
                     )
                     self._next_temp_probe_at = now + self._ACTIVE_TEMP_POLL_S
                     self._cond.notify_all()
                 return
-            # Step down to quiet auto (target_level == 0 and current_level > 0)
-            with self._lock:
-                if self._is_stale_generation_locked(generation):
-                    return
-            try:
-                res = set_thermal_profile("silent")
-            except Exception as exc:
-                res = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-            now = time.monotonic()
-            with self._cond:
-                if self._is_stale_generation_locked(generation):
-                    return
-                self._last_active_temp_c = temp_c
-                self._last_active_sensor = sensor
-                self._last_result = res
-                self._last_transition_at = time.time()
-                if res.get("ok"):
-                    self._current_level = 0
-                    self._current_target_rpm = None
-                    self._commanded_max = False
-                    self._target_verified = False
-                    self._actual_ramp_verified = False
-                    self._last_error = None
-                else:
-                    self._last_error = str(
-                        res.get("message") or res.get("error") or "step-down auto failed"
-                    )
-                self._step_evaluated_generation = max(
-                    self._step_evaluated_generation, generation
-                )
-                self._next_temp_probe_at = now + self._ACTIVE_TEMP_POLL_S
-                self._cond.notify_all()
-            return
+            finally:
+                with self._cond:
+                    self._hw_op_in_flight = False
+                    self._cond.notify_all()
 
         # Sensorless fallback: stay quiet on short turns, ramp after sensorless_delay_s.
         if now - active_started_at >= self._sensorless_delay_s:
@@ -2377,64 +2410,76 @@ class SmartFanController:
     def _do_ramp(self) -> None:
         with self._lock:
             generation = self._generation
+            detach_epoch = self._detach_epoch
             if self._is_stale_generation_locked(generation):
                 return
             requested_at = self._ramp_requested_at or time.monotonic()
-        self._ensure_lifecycle_hooks()
-        result: dict[str, Any] | None = None
-        error: str | None = None
-        ok = False
-        attempts = 0
-        for _attempt in range(2):
-            with self._lock:
-                if self._is_stale_generation_locked(generation):
+            self._hw_op_in_flight = True
+        try:
+            self._ensure_lifecycle_hooks()
+            result: dict[str, Any] | None = None
+            error: str | None = None
+            ok = False
+            attempts = 0
+            for _attempt in range(2):
+                with self._lock:
+                    if self._is_stale_generation_locked(generation):
+                        break
+                attempts += 1
+                try:
+                    result = set_thermal_profile("performance")
+                except Exception as exc:
+                    result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                if not result.get("ok"):
+                    error = str(result.get("message") or result.get("error") or "max command failed")
+                    continue
+                try:
+                    summary = fan_summary()
+                except Exception as exc:
+                    summary = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                if _summary_indicates_max(summary):
+                    ok = True
+                    error = None
+                    break
+                error = "daemon accepted the command but is not commanding max target RPM"
+            now = time.monotonic()
+            with self._cond:
+                if ok:
+                    if self._is_detached_locked(detach_epoch):
+                        return
+                elif self._is_stale_generation_locked(generation):
                     return
-            attempts += 1
-            try:
-                result = set_thermal_profile("performance")
-            except Exception as exc:
-                result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-            if not result.get("ok"):
-                error = str(result.get("message") or result.get("error") or "max command failed")
-                continue
-            try:
-                summary = fan_summary()
-            except Exception as exc:
-                summary = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-            if _summary_indicates_max(summary):
-                ok = True
-                error = None
-                break
-            error = "daemon accepted the command but is not commanding max target RPM"
-        now = time.monotonic()
-        with self._cond:
-            if self._is_stale_generation_locked(generation):
-                return
-            self._ramp_attempts += attempts
-            self._last_result = result
-            self._last_transition_at = time.time()
-            self._commanded_max = ok
-            self._target_verified = ok
-            if ok:
-                self._current_level = 3
-                self._current_target_rpm = None
-                self._last_error = None
-                self._ramp_latency_s = now - requested_at
-                self._actual_ramp_verified = False
-                self._actual_poll_deadline = now + self._ACTUAL_RAMP_TIMEOUT_S
-                self._next_actual_probe_at = now
-                self._emit(
-                    "[smart-fan] max commanded and target verified in "
-                    f"{self._ramp_latency_s:.2f}s (attempt {attempts})"
-                )
-            else:
-                self._last_error = error
-                self._ramp_failed_generation = generation
-                self._emit(
-                    f"[smart-fan] ramp FAILED after {attempts} attempt(s): {error} "
-                    "— run `mtplx max --status` to check ThermalForge"
-                )
-            self._cond.notify_all()
+                if not attempts:
+                    return
+                self._ramp_attempts += attempts
+                self._last_result = result
+                self._last_transition_at = time.time()
+                self._commanded_max = ok
+                self._target_verified = ok
+                if ok:
+                    self._current_level = 3
+                    self._current_target_rpm = None
+                    self._last_error = None
+                    self._ramp_latency_s = now - requested_at
+                    self._actual_ramp_verified = False
+                    self._actual_poll_deadline = now + self._ACTUAL_RAMP_TIMEOUT_S
+                    self._next_actual_probe_at = now
+                    self._emit(
+                        "[smart-fan] max commanded and target verified in "
+                        f"{self._ramp_latency_s:.2f}s (attempt {attempts})"
+                    )
+                else:
+                    self._last_error = error
+                    self._ramp_failed_generation = generation
+                    self._emit(
+                        f"[smart-fan] ramp FAILED after {attempts} attempt(s): {error} "
+                        "— run `mtplx max --status` to check ThermalForge"
+                    )
+                self._cond.notify_all()
+        finally:
+            with self._cond:
+                self._hw_op_in_flight = False
+                self._cond.notify_all()
 
     def _do_probe_actual(self) -> None:
         try:
