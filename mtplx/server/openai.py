@@ -20524,7 +20524,9 @@ def _thermal_health_payload(
     actual_ramp_verified = os.environ.get("MTPLX_MAX_ACTUAL_RAMP_VERIFIED") == "1"
     smart = smart_status or {}
     smart_boost_active = fan_mode == FAN_MODE_SMART and bool(
-        smart.get("commanded_max") or smart.get("active")
+        smart.get("commanded_max")
+        or smart.get("active")
+        or int(smart.get("current_level") or 0) > 0
     )
     return {
         "max_requested": fan_mode == FAN_MODE_MAX
@@ -39534,7 +39536,11 @@ def create_app(state: ServerState) -> FastAPI:
         smart_status = _smart_fan_status(state)
         fan_boost_active = fan_mode == FAN_MODE_MAX or (
             fan_mode == FAN_MODE_SMART
-            and bool(smart_status.get("commanded_max") or smart_status.get("active"))
+            and bool(
+                smart_status.get("commanded_max")
+                or smart_status.get("active")
+                or int(smart_status.get("current_level") or 0) > 0
+            )
         )
         runtime_mode = _health_runtime_mode_label(
             state.profile.name,

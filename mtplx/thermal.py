@@ -1543,6 +1543,7 @@ class MaxSession:
 
 
 _DESKTOP_MAC_MODEL_PREFIXES = ("MacStudio", "MacPro", "Macmini", "iMac")
+_LAPTOP_MAC_MODEL_PREFIXES = ("MacBook",)
 _DESKTOP_MAC_MODELS = frozenset(
     {
         "Mac13,1",
@@ -1560,7 +1561,36 @@ _DESKTOP_MAC_MODELS = frozenset(
         "Mac16,9",
         "Mac16,10",
         "Mac16,11",
+    }
+)
+_LAPTOP_MAC_MODELS = frozenset(
+    {
+        "Mac14,2",
+        "Mac14,5",
+        "Mac14,6",
+        "Mac14,7",
+        "Mac14,9",
+        "Mac14,10",
+        "Mac14,15",
+        "Mac15,3",
+        "Mac15,6",
+        "Mac15,7",
+        "Mac15,8",
+        "Mac15,9",
+        "Mac15,10",
+        "Mac15,11",
+        "Mac15,12",
+        "Mac15,13",
+        "Mac16,1",
+        "Mac16,5",
+        "Mac16,6",
+        "Mac16,7",
+        "Mac16,8",
         "Mac16,12",
+        "Mac16,13",
+        "Mac17,2",
+        "Mac17,6",
+        "Mac17,7",
     }
 )
 
@@ -1570,6 +1600,16 @@ def _sysctl_hw_model() -> str:
         return ""
     probe = _run_probe(["/usr/sbin/sysctl", "-n", "hw.model"], timeout_s=1.0)
     return str(probe.get("stdout") or "").strip() if probe.get("ok") else ""
+
+
+def _has_internal_battery() -> bool | None:
+    if sys.platform != "darwin":
+        return None
+    probe = _run_probe(["/usr/bin/pmset", "-g", "batt"], timeout_s=1.0)
+    stdout = str(probe.get("stdout") or "")
+    if not probe.get("ok") or not stdout.strip():
+        return None
+    return "InternalBattery" in stdout
 
 
 def is_desktop_mac() -> bool:
@@ -1582,9 +1622,16 @@ def is_desktop_mac() -> bool:
     model = _sysctl_hw_model()
     if not model:
         return False
-    return model in _DESKTOP_MAC_MODELS or any(
+    if model in _DESKTOP_MAC_MODELS or any(
         model.startswith(prefix) for prefix in _DESKTOP_MAC_MODEL_PREFIXES
-    )
+    ):
+        return True
+    if model in _LAPTOP_MAC_MODELS or any(
+        model.startswith(prefix) for prefix in _LAPTOP_MAC_MODEL_PREFIXES
+    ):
+        return False
+    has_batt = _has_internal_battery()
+    return has_batt is False
 
 
 def _verify_rpm_target(summary: dict[str, Any], target_rpm: int) -> bool:
@@ -1608,6 +1655,7 @@ def set_fan_rpm(rpm: int, *, dry_run: bool = False) -> dict[str, Any]:
     if not selected or str(selected.get("kind")) != "thermalforge":
         return {
             "ok": False,
+            "unsupported_controller": True,
             "rpm": target_rpm,
             "dry_run": dry_run,
             "detection": detection,
@@ -1648,14 +1696,17 @@ def set_fan_rpm(rpm: int, *, dry_run: bool = False) -> dict[str, Any]:
         result = _run_probe(command, timeout_s=15.0)
         attempts.append(result)
         if result.get("ok"):
-            return {
-                "ok": True,
-                "rpm": target_rpm,
-                "dry_run": False,
-                "detection": detection,
-                "command": command,
-                "attempts": attempts,
-            }
+            verified = _verify_rpm_target(fan_summary(), target_rpm)
+            result["verified"] = verified
+            if verified:
+                return {
+                    "ok": True,
+                    "rpm": target_rpm,
+                    "dry_run": False,
+                    "detection": detection,
+                    "command": command,
+                    "attempts": attempts,
+                }
     return {
         "ok": False,
         "rpm": target_rpm,
@@ -2110,6 +2161,13 @@ class SmartFanController:
             return "probe"
         return "hold"
 
+    def _is_stale_generation_locked(self, generation: int) -> bool:
+        return (
+            self._generation != generation
+            or self._shutdown
+            or not self._active_requests
+        )
+
     def _do_step_active(self) -> None:
         with self._lock:
             generation = self._generation
@@ -2121,12 +2179,17 @@ class SmartFanController:
         except Exception:
             reading = {"ok": False, "celsius": None, "sensor": None}
         now = time.monotonic()
+        with self._lock:
+            if self._is_stale_generation_locked(generation):
+                return
         if reading.get("ok") and reading.get("celsius") is not None:
             temp_c = float(reading["celsius"])
             sensor = reading.get("sensor")
             target_level = self._desired_level_for_temp(temp_c, current_level)
             if target_level == current_level:
                 with self._cond:
+                    if self._is_stale_generation_locked(generation):
+                        return
                     self._last_active_temp_c = temp_c
                     self._last_active_sensor = sensor
                     self._step_evaluated_generation = max(
@@ -2137,10 +2200,14 @@ class SmartFanController:
                 return
             if target_level == 3:
                 with self._lock:
+                    if self._is_stale_generation_locked(generation):
+                        return
                     self._last_active_temp_c = temp_c
                     self._last_active_sensor = sensor
                 self._do_ramp()
                 with self._cond:
+                    if self._is_stale_generation_locked(generation):
+                        return
                     self._step_evaluated_generation = max(
                         self._step_evaluated_generation, generation
                     )
@@ -2148,11 +2215,13 @@ class SmartFanController:
                     self._cond.notify_all()
                 return
             if target_level in (1, 2):
-                self._ensure_lifecycle_hooks()
                 rpm = self._target_rpm_for_level(target_level)
                 res: dict[str, Any] = {"ok": False}
                 err: str | None = None
                 for _attempt in range(2):
+                    with self._lock:
+                        if self._is_stale_generation_locked(generation):
+                            return
                     try:
                         res = set_fan_rpm(rpm)
                     except Exception as exc:
@@ -2161,8 +2230,35 @@ class SmartFanController:
                         err = None
                         break
                     err = str(res.get("message") or res.get("error") or "set_fan_rpm failed")
+                    if res.get("unsupported_controller"):
+                        break
+                if res.get("unsupported_controller"):
+                    with self._lock:
+                        if self._is_stale_generation_locked(generation):
+                            return
+                        self._last_active_temp_c = temp_c
+                        self._last_active_sensor = sensor
+                    self._do_ramp()
+                    with self._cond:
+                        if self._is_stale_generation_locked(generation):
+                            return
+                        self._step_evaluated_generation = max(
+                            self._step_evaluated_generation, generation
+                        )
+                        self._next_temp_probe_at = (
+                            time.monotonic() + self._ACTIVE_TEMP_POLL_S
+                        )
+                        self._cond.notify_all()
+                    return
+                if res.get("ok"):
+                    with self._lock:
+                        if self._is_stale_generation_locked(generation):
+                            return
+                    self._ensure_lifecycle_hooks()
                 now = time.monotonic()
                 with self._cond:
+                    if self._is_stale_generation_locked(generation):
+                        return
                     self._last_active_temp_c = temp_c
                     self._last_active_sensor = sensor
                     self._last_result = res
@@ -2179,6 +2275,7 @@ class SmartFanController:
                         )
                     else:
                         self._last_error = err
+                        self._ramp_failed_generation = generation
                     self._step_evaluated_generation = max(
                         self._step_evaluated_generation, generation
                     )
@@ -2186,12 +2283,17 @@ class SmartFanController:
                     self._cond.notify_all()
                 return
             # Step down to quiet auto (target_level == 0 and current_level > 0)
+            with self._lock:
+                if self._is_stale_generation_locked(generation):
+                    return
             try:
                 res = set_thermal_profile("silent")
             except Exception as exc:
                 res = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
             now = time.monotonic()
             with self._cond:
+                if self._is_stale_generation_locked(generation):
+                    return
                 self._last_active_temp_c = temp_c
                 self._last_active_sensor = sensor
                 self._last_result = res
@@ -2219,6 +2321,8 @@ class SmartFanController:
             if current_level < 3:
                 self._do_ramp()
             with self._cond:
+                if self._is_stale_generation_locked(generation):
+                    return
                 self._step_evaluated_generation = max(
                     self._step_evaluated_generation, generation
                 )
@@ -2226,6 +2330,8 @@ class SmartFanController:
                 self._cond.notify_all()
             return
         with self._cond:
+            if self._is_stale_generation_locked(generation):
+                return
             self._step_evaluated_generation = max(
                 self._step_evaluated_generation, generation
             )
@@ -2271,6 +2377,8 @@ class SmartFanController:
     def _do_ramp(self) -> None:
         with self._lock:
             generation = self._generation
+            if self._is_stale_generation_locked(generation):
+                return
             requested_at = self._ramp_requested_at or time.monotonic()
         self._ensure_lifecycle_hooks()
         result: dict[str, Any] | None = None
@@ -2278,6 +2386,9 @@ class SmartFanController:
         ok = False
         attempts = 0
         for _attempt in range(2):
+            with self._lock:
+                if self._is_stale_generation_locked(generation):
+                    return
             attempts += 1
             try:
                 result = set_thermal_profile("performance")
@@ -2297,6 +2408,8 @@ class SmartFanController:
             error = "daemon accepted the command but is not commanding max target RPM"
         now = time.monotonic()
         with self._cond:
+            if self._is_stale_generation_locked(generation):
+                return
             self._ramp_attempts += attempts
             self._last_result = result
             self._last_transition_at = time.time()
