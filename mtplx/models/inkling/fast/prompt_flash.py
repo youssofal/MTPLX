@@ -43,6 +43,7 @@ it, where the default route rounds per-block partial outputs (lanes/p2/acc-1). O
 from __future__ import annotations
 
 import os
+import re
 import struct
 from functools import lru_cache
 
@@ -714,6 +715,175 @@ def _kernel_simd(gated=False):
     )
 
 
+def _derive_simd_partial():
+    """Derive the key-slice partial-output SIMD kernel from ``_SOURCE_SIMD``.
+
+    Emits unnormalized float32 ``out_acc`` alongside base-2 online-softmax
+    statistics ``(out_max, out_sum)`` for a contiguous tile range ``[t_lo, t_hi)``.
+    """
+    src = _SOURCE_SIMD
+    replacements = (
+        (
+            "    const int rows = int(params[0]);\n"
+            "    const int total = int(params[1]);\n"
+            "    const int hist = total - rows;\n",
+            "    const int rows = int(params[0]);\n"
+            "    const int total = int(params[1]);\n"
+            "    const int hist = total - rows;\n"
+            "    const int t_lo = int(params[2]);\n"
+            "    const int t_hi = int(params[3]);\n"
+            "    const bool include_sink = int(params[4]) != 0;\n",
+        ),
+        (
+            "    float run_max[2];\n"
+            "    float run_sum[2] = {1.0f, 1.0f};\n"
+            "    const device T* prof_row[2];\n"
+            "    INK_EVERY for (short rp = 0; rp < 2; ++rp) {\n"
+            "        const int r = live[rp] ? qrow[rp] : 0;\n"
+            "        run_max[rp] = live[rp]\n"
+            "            ? float(sink[size_t(r) * size_t(sink_strides[1]) + size_t(head) * size_t(sink_strides[2])]) * LOG2E\n"
+            "            : 0.0f;\n",
+            "    float run_max[2];\n"
+            "    float run_sum[2] = {include_sink ? 1.0f : 0.0f, include_sink ? 1.0f : 0.0f};\n"
+            "    const device T* prof_row[2];\n"
+            "    INK_EVERY for (short rp = 0; rp < 2; ++rp) {\n"
+            "        const int r = live[rp] ? qrow[rp] : 0;\n"
+            "        run_max[rp] = (live[rp] && include_sink)\n"
+            "            ? float(sink[size_t(r) * size_t(sink_strides[1]) + size_t(head) * size_t(sink_strides[2])]) * LOG2E\n"
+            "            : -INFINITY;\n",
+        ),
+        (
+            "    const int t_end = pos_hi / 32 + 1;\n"
+            "    int t_begin = 0;\n"
+            "    int t_near = 0;\n"
+            "    if (WINDOW > 0) {\n"
+            "        t_begin = max(0, pos_lo - (WINDOW - 1)) / 32;\n"
+            "        t_near = t_begin;\n"
+            "    } else {\n"
+            "        const int clear = pos_lo - EXTENT + 1;\n"
+            "        t_near = clear > 0 ? min(clear / 32, t_end) : 0;\n"
+            "    }\n",
+            "    const int t_end_all = pos_hi / 32 + 1;\n"
+            "    int t_begin = 0;\n"
+            "    int t_near = 0;\n"
+            "    if (WINDOW > 0) {\n"
+            "        t_begin = max(0, pos_lo - (WINDOW - 1)) / 32;\n"
+            "        t_near = t_begin;\n"
+            "    } else {\n"
+            "        const int clear = pos_lo - EXTENT + 1;\n"
+            "        t_near = clear > 0 ? min(clear / 32, t_end_all) : 0;\n"
+            "    }\n"
+            "    t_begin = max(t_begin, t_lo);\n"
+            "    const int t_end = min(t_end_all, t_hi);\n",
+        ),
+        (
+            "            const float nm = max(run_max[rp], m);\n"
+            "            corr[rp] = fast::exp2(run_max[rp] - nm);\n"
+            "            float sum = 0.0f;\n"
+            "            INK_EVERY for (short j = 0; j < 2; ++j) {\n"
+            "                INK_EVERY for (short col = 0; col < 4; ++col) {\n"
+            "                    const float w = fast::exp2(s[j][rp * 4 + col] - nm);\n"
+            "                    s[j][rp * 4 + col] = w;\n"
+            "                    sum += w;\n"
+            "                }\n"
+            "            }\n"
+            "            sum += simd_shuffle_xor(sum, ushort(1));\n"
+            "            sum += simd_shuffle_xor(sum, ushort(8));\n"
+            "            run_sum[rp] = run_sum[rp] * corr[rp] + sum;\n"
+            "            run_max[rp] = nm;\n",
+            "            const float nm = max(run_max[rp], m);\n"
+            "            if (nm > -INFINITY) {\n"
+            "                corr[rp] = (run_max[rp] > -INFINITY) ? fast::exp2(run_max[rp] - nm) : 0.0f;\n"
+            "                float sum = 0.0f;\n"
+            "                INK_EVERY for (short j = 0; j < 2; ++j) {\n"
+            "                    INK_EVERY for (short col = 0; col < 4; ++col) {\n"
+            "                        const float w = fast::exp2(s[j][rp * 4 + col] - nm);\n"
+            "                        s[j][rp * 4 + col] = w;\n"
+            "                        sum += w;\n"
+            "                    }\n"
+            "                }\n"
+            "                sum += simd_shuffle_xor(sum, ushort(1));\n"
+            "                sum += simd_shuffle_xor(sum, ushort(8));\n"
+            "                run_sum[rp] = run_sum[rp] * corr[rp] + sum;\n"
+            "                run_max[rp] = nm;\n"
+            "            } else {\n"
+            "                corr[rp] = 1.0f;\n"
+            "                INK_EVERY for (short j = 0; j < 2; ++j) {\n"
+            "                    INK_EVERY for (short col = 0; col < 4; ++col) {\n"
+            "                        s[j][rp * 4 + col] = 0.0f;\n"
+            "                    }\n"
+            "                }\n"
+            "            }\n",
+        ),
+        (
+            "    // Store: piece p, element 4 rp + 2 h + i is dimension 16 p + 8 h + fc + i of row fr + 8 rp.\n"
+            "    INK_EVERY for (short rp = 0; rp < 2; ++rp) {\n"
+            "        if (!live[rp]) {\n"
+            "            continue;\n"
+            "        }\n"
+            "        const float inv = 1.0f / run_sum[rp];\n"
+            "        device T* o = out + (size_t(qrow[rp]) * size_t(HQ) + size_t(head)) * size_t(D) + size_t(fc);\n"
+            "        INK_GATE_ROW\n"
+            "        INK_EVERY for (short p = 0; p < DP; ++p) {\n"
+            "            INK_EVERY for (short h = 0; h < 2; ++h) {\n"
+            "                vec<T, 2> y;\n"
+            "                INK_EVERY for (short i = 0; i < 2; ++i) {\n"
+            "                    INK_RESULT(y[i], acc[p][rp * 4 + 2 * h + i] * inv, 16 * p + 8 * h + i)\n"
+            "                }\n"
+            "                ink_put_two(o + 16 * p + 8 * h, y);\n"
+            "            }\n"
+            "        }\n"
+            "    }\n",
+            "    // Store unnormalized float32 accumulators and online-softmax stats per row/head.\n"
+            "    INK_EVERY for (short rp = 0; rp < 2; ++rp) {\n"
+            "        if (!live[rp]) {\n"
+            "            continue;\n"
+            "        }\n"
+            "        const size_t stat_at = size_t(qrow[rp]) * size_t(HQ) + size_t(head);\n"
+            "        device float* o = out_acc + stat_at * size_t(D) + size_t(fc);\n"
+            "        INK_EVERY for (short p = 0; p < DP; ++p) {\n"
+            "            INK_EVERY for (short h = 0; h < 2; ++h) {\n"
+            "                const vec<float, 2> y(\n"
+            "                    acc[p][rp * 4 + 2 * h],\n"
+            "                    acc[p][rp * 4 + 2 * h + 1]\n"
+            "                );\n"
+            "                ink_put_two(o + 16 * p + 8 * h, y);\n"
+            "            }\n"
+            "        }\n"
+            "        if (fc == 0) {\n"
+            "            out_max[stat_at] = run_max[rp];\n"
+            "            out_sum[stat_at] = run_sum[rp];\n"
+            "        }\n"
+            "    }\n",
+        ),
+    )
+    for old, new in replacements:
+        if src.count(old) != 1:
+            raise RuntimeError(
+                f"prompt_flash partial kernel derivation mismatch for: {old.splitlines()[0].strip()}"
+            )
+        src = src.replace(old, new)
+    return src
+
+
+_SOURCE_SIMD_PARTIAL = _derive_simd_partial()
+
+
+@lru_cache(maxsize=None)
+def _kernel_simd_partial():
+    text, why = simd_text()
+    if text is None:
+        raise RuntimeError(f"library headers: {why}")
+    return launch_limits.kernel(
+        name="mtplx_inkling_prompt_flash_simd_partial",
+        input_names=["q", "k", "v", "prof", "sink", "params"],
+        output_names=["out_acc", "out_max", "out_sum"],
+        header=text + _HEADER_SIMD,
+        source=_SOURCE_SIMD_PARTIAL,
+        ensure_row_contiguous=False,
+    )
+
+
 @lru_cache(maxsize=None)
 def _kernel(gated=False):
     text, why = library_text()
@@ -774,9 +944,180 @@ def decline(query, key, value, profiles, sink, window):
     return None
 
 
-def flash_attention(query, key, value, profiles, sink, window, *, tg_m=None, tgbar=None, gate=None):
+KEY_SPLIT_ENV = "MTPLX_INKLING_FLASH_MAX_KEYS_PER_DISPATCH"
+WORK_BUDGET_ENV = "MTPLX_INKLING_FLASH_WORK_BUDGET"
+# Watchdog-safe per-dispatch caps on non-tensor GPUs (#422). M1/M2 simd matrix
+# throughput is lower than M3/M4/M5, so long full-attention prefills split the
+# key axis into bounded command buffers to stay well under macOS's ~5s display
+# watchdog while M5+ tensor units keep the single-launch path untouched.
+SIMD_WORK_BUDGET_M1_M2 = 4 * 1024 * 1024
+SIMD_MAX_KEYS_M1_M2 = 8192
+SIMD_WORK_BUDGET_M3_M4 = 16 * 1024 * 1024
+SIMD_MAX_KEYS_M3_M4 = 16384
+MIN_SLICE_KEYS = 1024
+TILE_KEYS = 32
+_ARCH_GEN_RE = re.compile(r"(\d{2})[pgsd]$")
+
+
+def gpu_generation(architecture: str | None = None) -> int:
+    """Return Apple GPU generation number (e.g. 14 for M2, 17 for M5), or 0."""
+    if architecture is None:
+        from mtplx.nax_detect import gpu_architecture
+
+        architecture = gpu_architecture()
+    if not isinstance(architecture, str):
+        return 0
+    match = _ARCH_GEN_RE.search(architecture.strip().lower())
+    return int(match.group(1)) if match else 0
+
+
+def _positive_env_int(name: str) -> int | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def key_split_plan(
+    rows: int,
+    keys: int,
+    window: int,
+    *,
+    launch_form: str | None = None,
+    architecture: str | None = None,
+) -> list[tuple[int, int]]:
+    """Return contiguous 32-key tile ranges ``[(t_lo, t_hi), ...]`` for one attention call.
+
+    Sliding-window calls and tensor-unit (M5+) dispatches stay single-launch.
+    Non-tensor (``simd``) full-attention dispatches whose ``rows * keys`` work
+    or total ``keys`` exceed the generation's watchdog budget split along the
+    key axis so each Metal dispatch and command buffer finishes promptly (#422).
+    """
+    total_tiles = max(1, (int(keys) + TILE_KEYS - 1) // TILE_KEYS)
+    if int(window) > 0:
+        return [(0, total_tiles)]
+    effective_form = form() if launch_form is None else launch_form
+    if effective_form == "tensor":
+        return [(0, total_tiles)]
+    raw_split = os.environ.get(KEY_SPLIT_ENV, "").strip().lower()
+    if raw_split in ("0", "off", "false", "no"):
+        return [(0, total_tiles)]
+
+    gen = gpu_generation(architecture)
+    if 0 < gen <= 14:
+        work_budget, max_keys = SIMD_WORK_BUDGET_M1_M2, SIMD_MAX_KEYS_M1_M2
+    else:
+        work_budget, max_keys = SIMD_WORK_BUDGET_M3_M4, SIMD_MAX_KEYS_M3_M4
+
+    env_max_keys = _positive_env_int(KEY_SPLIT_ENV)
+    if env_max_keys is not None:
+        max_keys = env_max_keys
+    env_work = _positive_env_int(WORK_BUDGET_ENV)
+    if env_work is not None:
+        work_budget = env_work
+
+    if int(rows) * int(keys) <= work_budget and int(keys) <= max_keys:
+        return [(0, total_tiles)]
+
+    by_work = work_budget // max(1, int(rows))
+    slice_keys = min(max_keys, max(MIN_SLICE_KEYS, by_work))
+    slice_tiles = max(MIN_SLICE_KEYS // TILE_KEYS, slice_keys // TILE_KEYS)
+    return [(t0, min(total_tiles, t0 + slice_tiles)) for t0 in range(0, total_tiles, slice_tiles)]
+
+
+_LN2 = 0.6931471805599453
+
+
+def merge_online_softmax(acc_a, max_a, sum_a, acc_b, max_b, sum_b):
+    """Merge two base-2 online-softmax accumulators ``(acc, max_log2, sum)`` cleanly."""
+    new_max = mx.maximum(max_a, max_b)
+    finite = mx.isfinite(new_max)
+    safe_max = mx.where(finite, new_max, 0.0)
+    a_ok = mx.isfinite(max_a)
+    b_ok = mx.isfinite(max_b)
+    corr_a = mx.where(
+        a_ok, mx.exp((mx.where(a_ok, max_a, safe_max) - safe_max) * _LN2), 0.0
+    )
+    corr_b = mx.where(
+        b_ok, mx.exp((mx.where(b_ok, max_b, safe_max) - safe_max) * _LN2), 0.0
+    )
+    new_sum = sum_a * corr_a + sum_b * corr_b
+    new_acc = acc_a * corr_a[..., None] + acc_b * corr_b[..., None]
+    return new_acc, new_max, new_sum
+
+
+def _flash_attention_split(
+    query,
+    key,
+    value,
+    profiles,
+    sink,
+    window,
+    splits,
+    *,
+    tg_m,
+    tgbar,
+    gate=None,
+):
+    _, heads, rows, _ = query.shape
+    kv_heads, keys = key.shape[1], key.shape[2]
+    group = heads // kv_heads
+    tg_rows = (tg_m // group) * 16
+    kernel = _kernel_simd_partial()
+    acc = run_max = run_sum = None
+    for idx, (t_lo, t_hi) in enumerate(splits):
+        include_sink = 1 if idx == 0 else 0
+        part_acc, part_max, part_sum = kernel(
+            inputs=[
+                query,
+                key,
+                value,
+                profiles,
+                sink,
+                mx.array([rows, keys, int(t_lo), int(t_hi), include_sink], mx.int32),
+            ],
+            template=[
+                ("T", query.dtype),
+                ("G", group),
+                ("TG_M", tg_m),
+                ("HQ", heads),
+                ("WINDOW", int(window)),
+                ("EXTENT", int(profiles.shape[3])),
+                ("SCALE", SCALE_BITS),
+                ("TGBAR", bool(tgbar)),
+            ],
+            grid=(-(-rows // tg_rows) * tg_m * 32, kv_heads, 1),
+            threadgroup=(tg_m * 32, 1, 1),
+            output_shapes=[(1, rows, heads, HEAD_DIM), (1, rows, heads), (1, rows, heads)],
+            output_dtypes=[mx.float32, mx.float32, mx.float32],
+        )
+        if acc is None:
+            acc, run_max, run_sum = part_acc, part_max, part_sum
+        else:
+            acc, run_max, run_sum = merge_online_softmax(
+                acc, run_max, run_sum, part_acc, part_max, part_sum
+            )
+        # Flush each slice's Metal command buffer before queueing the next slice
+        # so slow-prefill GPUs stay well under the interactivity watchdog (#422).
+        mx.eval(acc, run_max, run_sum)
+        del part_acc, part_max, part_sum
+    out = (acc / run_sum[..., None]).astype(query.dtype)
+    if gate is not None:
+        return (
+            out.reshape(1, rows, heads * HEAD_DIM).astype(mx.float32)
+            * mx.sigmoid(gate.astype(mx.float32))
+        ).astype(query.dtype)
+    return out.transpose(0, 2, 1, 3)
+
+
+def flash_attention(query, key, value, profiles, sink, window, *, tg_m=None, tgbar=None, gate=None, key_splits=None):
     """The prompt call's attention, ``(1, heads, rows, 128)`` (a view of a ``(1, rows, heads,
-    128)`` array), in one launch. With ``gate`` (the gate projection's ``(1, rows, heads * 128)``
+    128)`` array), in one launch (or bounded key slices on slow-prefill GPUs for long full-attention
+    prefills). With ``gate`` (the gate projection's ``(1, rows, heads * 128)``
     logits) it returns the gated result ``(1, rows, heads * 128)`` the output projection reads.
     Call only where :func:`decline` returned None."""
     d = settings()
@@ -790,7 +1131,22 @@ def flash_attention(query, key, value, profiles, sink, window, *, tg_m=None, tgb
     if tg_m % group:
         raise ValueError("a threadgroup holds whole sets of the heads a key/value head serves")
     tg_rows = (tg_m // group) * 16
-    build = _kernel if form() == "tensor" else _kernel_simd
+    launch_form = form()
+    splits = key_split_plan(rows, keys, window, launch_form=launch_form) if key_splits is None else list(key_splits)
+    if len(splits) > 1 and launch_form != "tensor":
+        return _flash_attention_split(
+            query,
+            key,
+            value,
+            profiles,
+            sink,
+            window,
+            splits,
+            tg_m=tg_m,
+            tgbar=tgbar,
+            gate=gate,
+        )
+    build = _kernel if launch_form == "tensor" else _kernel_simd
     (out,) = build(gate is not None)(
         inputs=[query, key, value, profiles, sink, mx.array([rows, keys], mx.int32)] + ([gate] if gate is not None else []),
         template=[("T", query.dtype), ("G", group), ("TG_M", tg_m), ("HQ", heads), ("WINDOW", int(window)),
