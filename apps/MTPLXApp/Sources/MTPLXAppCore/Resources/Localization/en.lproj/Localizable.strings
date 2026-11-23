@@ -579,7 +579,7 @@
 "fan ramp verified" = "fan ramp verified";
 "Fan-control install failed." = "Fan-control install failed.";
 "Fans" = "Fans";
-"Fans boost during generation, then return to auto." = "Fans boost during generation, then return to auto.";
+"Fans stay quiet on short turns, ramp gently as heat builds, then return to auto." = "Fans stay quiet on short turns, ramp gently as heat builds, then return to auto.";
 "Fans not monitored" = "Fans not monitored";
 "Fans pin to verified max until you change mode or stop." = "Fans pin to verified max until you change mode or stop.";
 "Fast local AI for Apple Silicon." = "Fast local AI for Apple Silicon.";

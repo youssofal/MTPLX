@@ -579,7 +579,7 @@
 "fan ramp verified" = "Lüfterhochlauf verifiziert";
 "Fan-control install failed." = "Installation der Lüftersteuerung fehlgeschlagen.";
 "Fans" = "Lüfter";
-"Fans boost during generation, then return to auto." = "Lüfter drehen während der Generierung hoch und kehren dann zu Auto zurück.";
+"Fans stay quiet on short turns, ramp gently as heat builds, then return to auto." = "Lüfter bleiben bei kurzen Durchgängen leise, drehen bei steigender Wärme sanft hoch und kehren dann zu Auto zurück.";
 "Fans not monitored" = "Lüfter nicht überwacht";
 "Fans pin to verified max until you change mode or stop." = "Lüfter bleiben auf dem verifizierten Maximum fixiert, bis du den Modus wechselst oder stoppst.";
 "Fast local AI for Apple Silicon." = "Schnelle lokale KI für Apple Silicon.";

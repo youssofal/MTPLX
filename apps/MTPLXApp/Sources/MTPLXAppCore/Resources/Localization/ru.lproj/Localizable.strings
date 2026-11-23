@@ -577,7 +577,7 @@
 "fan ramp verified" = "разгон вентиляторов проверен";
 "Fan-control install failed." = "Не удалось установить управление вентиляторами.";
 "Fans" = "Вентиляторы";
-"Fans boost during generation, then return to auto." = "Вентиляторы ускоряются во время генерации, затем возвращаются в режим «Авто».";
+"Fans stay quiet on short turns, ramp gently as heat builds, then return to auto." = "Вентиляторы остаются тихими на коротких шагах, плавно ускоряются при нагреве, затем возвращаются в режим «Авто».";
 "Fans not monitored" = "Вентиляторы не отслеживаются";
 "Fans pin to verified max until you change mode or stop." = "Вентиляторы удерживаются на проверенном максимуме, пока вы не смените режим или не остановите движок.";
 "Fast local AI for Apple Silicon." = "Быстрый локальный ИИ для Apple Silicon.";

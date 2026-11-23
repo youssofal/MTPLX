@@ -577,7 +577,7 @@
 "fan ramp verified" = "aceleração das ventoinhas verificada";
 "Fan-control install failed." = "Falha na instalação do controle de ventoinhas.";
 "Fans" = "Ventoinhas";
-"Fans boost during generation, then return to auto." = "As ventoinhas aceleram durante a geração e depois voltam ao automático.";
+"Fans stay quiet on short turns, ramp gently as heat builds, then return to auto." = "As ventoinhas ficam silenciosas em turnos curtos, sobem suavemente conforme o calor aumenta e depois voltam ao automático.";
 "Fans not monitored" = "Ventoinhas não monitoradas";
 "Fans pin to verified max until you change mode or stop." = "As ventoinhas ficam fixas no máximo verificado até você mudar o modo ou parar.";
 "Fast local AI for Apple Silicon." = "IA local rápida para Apple Silicon.";

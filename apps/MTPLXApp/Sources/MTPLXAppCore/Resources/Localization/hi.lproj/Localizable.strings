@@ -579,7 +579,7 @@
 "fan ramp verified" = "फ़ैन रैंप सत्यापित";
 "Fan-control install failed." = "फ़ैन-नियंत्रण इंस्टॉल विफल रहा।";
 "Fans" = "पंखे";
-"Fans boost during generation, then return to auto." = "जनरेशन के दौरान पंखे तेज़ होते हैं, फिर ऑटो पर लौट आते हैं।";
+"Fans stay quiet on short turns, ramp gently as heat builds, then return to auto." = "छोटे टर्न में पंखे शांत रहते हैं, गर्मी बढ़ने पर धीरे-धीरे तेज़ होते हैं, फिर ऑटो पर लौट आते हैं।";
 "Fans not monitored" = "पंखों की निगरानी नहीं की जा रही है";
 "Fans pin to verified max until you change mode or stop." = "जब तक आप मोड नहीं बदलते या रोकते नहीं, तब तक पंखे सत्यापित अधिकतम पर रहते हैं।";
 "Fast local AI for Apple Silicon." = "Apple Silicon के लिए तेज़ स्थानीय AI।";

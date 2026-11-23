@@ -579,7 +579,7 @@
 "fan ramp verified" = "تم التحقق من تسارع المروحة";
 "Fan-control install failed." = "فشل تثبيت أداة التحكم في المروحة.";
 "Fans" = "المراوح";
-"Fans boost during generation, then return to auto." = "تتسارع المراوح أثناء التوليد، ثم تعود إلى الوضع التلقائي.";
+"Fans stay quiet on short turns, ramp gently as heat builds, then return to auto." = "تبقى المراوح هادئة في الأدوار القصيرة، وتتسارع تدريجيًا مع ارتفاع الحرارة، ثم تعود إلى الوضع التلقائي.";
 "Fans not monitored" = "المراوح غير مراقبة";
 "Fans pin to verified max until you change mode or stop." = "تثبت المراوح عند الحد الأقصى المتحقق منه حتى تغير الوضع أو توقفه.";
 "Fast local AI for Apple Silicon." = "ذكاء اصطناعي محلي سريع لأجهزة Apple Silicon.";

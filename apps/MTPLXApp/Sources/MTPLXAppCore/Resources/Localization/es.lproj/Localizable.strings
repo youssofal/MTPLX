@@ -577,7 +577,7 @@
 "fan ramp verified" = "aceleración de ventiladores verificada";
 "Fan-control install failed." = "Error al instalar el control de ventiladores.";
 "Fans" = "Ventiladores";
-"Fans boost during generation, then return to auto." = "Los ventiladores aceleran durante la generación y luego vuelven a automático.";
+"Fans stay quiet on short turns, ramp gently as heat builds, then return to auto." = "Los ventiladores se mantienen silenciosos en turnos cortos, suben suavemente al calentarse y luego vuelven a automático.";
 "Fans not monitored" = "Ventiladores sin monitorizar";
 "Fans pin to verified max until you change mode or stop." = "Los ventiladores se fijan al máximo verificado hasta que cambies de modo o detengas el motor.";
 "Fast local AI for Apple Silicon." = "IA local rápida para Apple Silicon.";

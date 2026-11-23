@@ -579,7 +579,7 @@
 "fan ramp verified" = "风扇升速已验证";
 "Fan-control install failed." = "风扇控制安装失败。";
 "Fans" = "风扇";
-"Fans boost during generation, then return to auto." = "风扇在生成期间提升转速，随后恢复自动。";
+"Fans stay quiet on short turns, ramp gently as heat builds, then return to auto." = "短轮次时风扇保持静音，温度升高时平滑提速，随后恢复自动。";
 "Fans not monitored" = "未监控风扇";
 "Fans pin to verified max until you change mode or stop." = "风扇锁定在已验证的最大转速，直到你更改模式或停止。";
 "Fast local AI for Apple Silicon." = "适用于 Apple Silicon 的快速本地 AI。";

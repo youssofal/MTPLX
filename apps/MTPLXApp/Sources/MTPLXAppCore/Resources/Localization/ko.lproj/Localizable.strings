@@ -579,7 +579,7 @@
 "fan ramp verified" = "팬 가속 검증됨";
 "Fan-control install failed." = "팬 제어 도구 설치에 실패했습니다.";
 "Fans" = "팬";
-"Fans boost during generation, then return to auto." = "팬은 생성 중에 가속된 후 자동으로 돌아갑니다.";
+"Fans stay quiet on short turns, ramp gently as heat builds, then return to auto." = "짧은 턴에서는 팬이 조용히 유지되고 열이 올라가면 완만하게 가속된 뒤 자동으로 돌아갑니다.";
 "Fans not monitored" = "팬 모니터링 안 됨";
 "Fans pin to verified max until you change mode or stop." = "모드를 변경하거나 중지할 때까지 팬이 검증된 최대 속도로 고정됩니다.";
 "Fast local AI for Apple Silicon." = "Apple Silicon을 위한 빠른 온디바이스 AI.";

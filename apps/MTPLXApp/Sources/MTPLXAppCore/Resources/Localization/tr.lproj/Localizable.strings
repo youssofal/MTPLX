@@ -579,7 +579,7 @@
 "fan ramp verified" = "fan yükselişi doğrulandı";
 "Fan-control install failed." = "Fan denetimi kurulumu başarısız.";
 "Fans" = "Fanlar";
-"Fans boost during generation, then return to auto." = "Fanlar üretim sırasında hızlanır, sonra otomatiğe döner.";
+"Fans stay quiet on short turns, ramp gently as heat builds, then return to auto." = "Fanlar kısa turlarda sessiz kalır, sıcaklık arttıkça yumuşak biçimde hızlanır ve sonra otomatiğe döner.";
 "Fans not monitored" = "Fanlar izlenmiyor";
 "Fans pin to verified max until you change mode or stop." = "Modu değiştirene ya da durdurana kadar fanlar doğrulanmış en yüksekte sabitlenir.";
 "Fast local AI for Apple Silicon." = "Apple Silicon için hızlı yerel yapay zeka.";

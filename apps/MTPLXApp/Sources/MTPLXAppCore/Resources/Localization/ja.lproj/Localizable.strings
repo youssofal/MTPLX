@@ -579,7 +579,7 @@
 "fan ramp verified" = "ファンの立ち上がり確認済み";
 "Fan-control install failed." = "ファン制御のインストールに失敗しました。";
 "Fans" = "ファン";
-"Fans boost during generation, then return to auto." = "生成中にファンをブーストし、終了後に自動に戻します。";
+"Fans stay quiet on short turns, ramp gently as heat builds, then return to auto." = "短いターンではファンは静かなまま、温度の上昇に応じて緩やかに回転数を上げ、終了後に自動に戻します。";
 "Fans not monitored" = "ファンは監視されていません";
 "Fans pin to verified max until you change mode or stop." = "モード変更または停止まで、ファンを確認済み最大速度に固定します。";
 "Fast local AI for Apple Silicon." = "Apple Silicon向けの高速ローカルAI。";

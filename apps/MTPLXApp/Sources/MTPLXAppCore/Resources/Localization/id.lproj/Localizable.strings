@@ -579,7 +579,7 @@
 "fan ramp verified" = "peningkatan kipas terverifikasi";
 "Fan-control install failed." = "Pemasangan kontrol kipas gagal.";
 "Fans" = "Kipas";
-"Fans boost during generation, then return to auto." = "Kipas meningkat selama pembuatan, lalu kembali ke otomatis.";
+"Fans stay quiet on short turns, ramp gently as heat builds, then return to auto." = "Kipas tetap senyap pada giliran singkat, naik perlahan saat panas meningkat, lalu kembali ke otomatis.";
 "Fans not monitored" = "Kipas tidak dipantau";
 "Fans pin to verified max until you change mode or stop." = "Kipas dipatok ke maksimum terverifikasi hingga Anda mengubah mode atau berhenti.";
 "Fast local AI for Apple Silicon." = "AI lokal cepat untuk Apple Silicon.";
