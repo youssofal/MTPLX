@@ -477,7 +477,8 @@ def propose(drafter, target, anchor, view: DraftView, count_: int, *, position, 
     from . import draft_table
 
     table = draft_table.bind(drafter, target)       # class B, MTPLX_INKLING_DRAFT_TABLE (off by default)
-    head = target.unembed if table is None else table.head
+    draft_head = drafter.draft_head(target) if hasattr(drafter, "draft_head") else target.unembed
+    head = draft_head if table is None else table.head
     base = None
     if isinstance(head, AffineWeight):
         # A packed head (Bare Speed, Optimized Speed): lane L1's launch, one read of the codes for
@@ -935,6 +936,9 @@ def serve(rt, anchor, cache, proposals: int, *, position, seed, temperature, dra
                 tuple(model.capture_ids), engine_site.identity(rt))
     if filters is not None or draft_filters is not None:
         geometry += (("filtered", filters is not None, draft_filters is not None),)
+    draft_unembed = getattr(drafter, "draft_unembed", None)
+    if draft_unembed is not None:
+        geometry += (("draft_head", int(draft_unembed.bits), int(draft_unembed.group_size)),)
     n_cap = len(model.capture_ids)
     visits = len(state.local)
     windows = None

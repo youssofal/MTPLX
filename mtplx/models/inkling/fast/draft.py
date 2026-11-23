@@ -72,12 +72,13 @@ def propose(drafter, target, anchor, cache, count, *, position, seed, temperatur
     ).astype(dtype)[:, 1 : count + 1]
     from ..model import linear
 
+    head = drafter.draft_head(target) if hasattr(drafter, "draft_head") else target.unembed
     if precision == "f32":
         from ..head import vocabulary_logits
 
-        base = vocabulary_logits(h, target.unembed, drafter.vocab)
+        base = vocabulary_logits(h, head, drafter.vocab)
     else:
-        base = linear(h, target.unembed)[..., : drafter.vocab]
+        base = linear(h, head)[..., : drafter.vocab]
     rank = drafter.cfg["markov_rank"]
     weights = drafter.markov["rnn_proj.weight"].astype(mx.float32)
     inputs = mx.concatenate([h, mx.broadcast_to(cache[-1][0], h.shape)], axis=-1)

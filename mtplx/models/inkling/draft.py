@@ -1,5 +1,7 @@
 """The bundled diffusion drafter attends to committed target features and predicts a token chain."""
 
+import os
+
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.cache import ArraysCache, KVCache
@@ -7,6 +9,82 @@ from mlx_lm.models.cache import ArraysCache, KVCache
 from .cache import WindowCache
 from .model import linear
 from .precision import AffineWeight
+
+DRAFT_HEAD_BITS_ENV = "MTPLX_INKLING_DRAFT_HEAD_BITS"
+_DRAFT_HEAD_VALID_BITS = (4, 6, 8)
+_DRAFT_HEAD_GROUP_SIZES = (64, 32)
+_DRAFT_HEAD_OFF_VALUES = ("", "0", "off", "false", "no", "none")
+
+
+def draft_head_bits() -> int | None:
+    """Configured bit-width for the opt-in draft-only quantized vocabulary head.
+
+    Controlled by ``MTPLX_INKLING_DRAFT_HEAD_BITS`` (default unset/off).
+    Accepts ``4``, ``6``, or ``8`` when enabled; leaves the target vocabulary
+    head untouched and changes only draft proposal scoring.
+    """
+    raw = os.environ.get(DRAFT_HEAD_BITS_ENV, "").strip().lower()
+    if raw in _DRAFT_HEAD_OFF_VALUES:
+        return None
+    try:
+        bits = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{DRAFT_HEAD_BITS_ENV} must be off or one of {_DRAFT_HEAD_VALID_BITS}; got {raw!r}"
+        ) from exc
+    if bits not in _DRAFT_HEAD_VALID_BITS:
+        raise ValueError(
+            f"{DRAFT_HEAD_BITS_ENV} must be off or one of {_DRAFT_HEAD_VALID_BITS}; got {bits}"
+        )
+    return bits
+
+
+def draft_head_group_size(width: int, preferred: int = 64) -> int | None:
+    """Largest valid affine quantization group size dividing ``width``."""
+    width = int(width)
+    if width <= 0:
+        return None
+    if preferred in (32, 64, 128) and width % preferred == 0:
+        return int(preferred)
+    for size in _DRAFT_HEAD_GROUP_SIZES:
+        if width % size == 0:
+            return size
+    return None
+
+
+def quantize_draft_head(weight, *, bits: int | None = None, group_size: int = 64) -> AffineWeight | None:
+    """Build a draft-only affine-quantized copy of a dense 16-bit vocabulary head.
+
+    Returns ``None`` when the opt-in env flag is off, when ``weight`` is already
+    quantized (``AffineWeight`` or ``nn.QuantizedLinear``), when its dtype is
+    not BF16/FP16, or when its input width has no valid affine group divisor.
+    Never mutates ``weight``.
+    """
+    target_bits = draft_head_bits() if bits is None else int(bits)
+    if target_bits is None:
+        return None
+    if target_bits not in _DRAFT_HEAD_VALID_BITS:
+        raise ValueError(
+            f"Draft head bits must be one of {_DRAFT_HEAD_VALID_BITS}; got {target_bits}"
+        )
+    if isinstance(weight, (AffineWeight, nn.QuantizedLinear)):
+        return None
+    matrix = weight.weight if isinstance(weight, nn.Linear) else weight
+    if (
+        not isinstance(matrix, mx.array)
+        or matrix.ndim != 2
+        or matrix.dtype not in (mx.bfloat16, mx.float16)
+        or matrix.shape[0] <= 0
+        or matrix.shape[1] <= 0
+    ):
+        return None
+    gs = draft_head_group_size(int(matrix.shape[1]), preferred=group_size)
+    if gs is None:
+        return None
+    codes, scales, biases = mx.quantize(matrix, group_size=gs, bits=target_bits)
+    head = AffineWeight(codes, scales, biases, bits=target_bits, group_size=gs)
+    mx.eval(head.codes, head.scales, head.biases)
+    return head
 
 
 def _one_launch_mix(features):
@@ -168,6 +246,12 @@ class Drafter(nn.Module):
         self.width = config["block_size"]
         self.vocab = target.config["unpadded_vocab_size"]
         self.folded = None
+        self.draft_unembed = quantize_draft_head(target.unembed)
+
+    def draft_head(self, target):
+        """Vocabulary matrix for draft proposal scoring only; target.unembed stays untouched."""
+        head = getattr(self, "draft_unembed", None)
+        return target.unembed if head is None else head
 
     def make_cache(self):
         return [
@@ -235,7 +319,7 @@ class Drafter(nn.Module):
             self.output_norm,
             self.cfg["rms_norm_eps"],
         ).astype(dtype)[:, 1 : count + 1]
-        base = linear(h, target.unembed)[..., : self.vocab]
+        base = linear(h, self.draft_head(target))[..., : self.vocab]
         rank = self.cfg["markov_rank"]
         weights = self.markov["rnn_proj.weight"].astype(mx.float32)
         inputs = mx.concatenate([h, mx.broadcast_to(cache[-1][0], h.shape)], axis=-1)

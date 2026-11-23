@@ -63,7 +63,7 @@ def bind(drafter, target) -> Optional[Table]:
         ranking = json.load(handle)["ranking"]
     keep = [int(t) for t in ranking if 0 <= int(t) < drafter.vocab][:size]
     ids = mx.array(sorted(set(keep)), dtype=mx.int32)
-    head = target.unembed
+    head = drafter.draft_head(target) if hasattr(drafter, "draft_head") else target.unembed
     if isinstance(head, AffineWeight):
         rows = AffineWeight(mx.take(head.codes, ids, axis=0), mx.take(head.scales, ids, axis=0),
                             mx.take(head.biases, ids, axis=0), head.bits, head.group_size)
@@ -71,7 +71,7 @@ def bind(drafter, target) -> Optional[Table]:
     else:
         rows = mx.take(head, ids, axis=0)
         mx.eval(rows)
-    folded = mx.take(drafter.fold(head), ids, axis=0)
+    folded = mx.take(drafter.fold(target.unembed), ids, axis=0)
     outside = mx.full((1, drafter.vocab), _OUTSIDE, dtype=mx.float32)
     mx.eval(folded, outside)
     table = Table(ids, rows, folded, outside)
