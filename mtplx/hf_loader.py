@@ -714,6 +714,7 @@ def _resolve_hf_dir_snapshot(
     repo_id: str | None = None,
     *,
     require_complete: bool = True,
+    revision: str | None = None,
 ) -> Path | None:
     if not repo_root.is_dir():
         return None
@@ -723,39 +724,61 @@ def _resolve_hf_dir_snapshot(
     candidates: list[Path] = []
     seen: set[str] = set()
     refs_dir = repo_root / "refs"
-    ref_files: list[Path] = []
-    if refs_dir.is_dir():
-        main_ref = refs_dir / "main"
-        if main_ref.is_file():
-            ref_files.append(main_ref)
-        ref_files.extend(
-            p for p in sorted(refs_dir.iterdir()) if p.is_file() and p.name != "main"
-        )
-    for ref_file in ref_files:
+    requested_rev = str(revision).strip() if revision is not None else ""
+    if requested_rev:
+        if "/" in requested_rev or "\\" in requested_rev or requested_rev in {".", ".."}:
+            return None
+        ref_file = refs_dir / requested_rev
+        if ref_file.is_file():
+            try:
+                rev = ref_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                rev = ""
+            if rev and "/" not in rev and "\\" not in rev and rev not in {".", ".."}:
+                snap = snapshots_dir / rev
+                key = os.path.normcase(str(snap))
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append(snap)
+        direct_snap = snapshots_dir / requested_rev
+        key = os.path.normcase(str(direct_snap))
+        if key not in seen:
+            seen.add(key)
+            candidates.append(direct_snap)
+    else:
+        ref_files: list[Path] = []
+        if refs_dir.is_dir():
+            main_ref = refs_dir / "main"
+            if main_ref.is_file():
+                ref_files.append(main_ref)
+            ref_files.extend(
+                p for p in sorted(refs_dir.iterdir()) if p.is_file() and p.name != "main"
+            )
+        for ref_file in ref_files:
+            try:
+                rev = ref_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if not rev or "/" in rev or "\\" in rev or rev in {".", ".."}:
+                continue
+            snap = snapshots_dir / rev
+            key = os.path.normcase(str(snap))
+            if key not in seen:
+                seen.add(key)
+                candidates.append(snap)
         try:
-            rev = ref_file.read_text(encoding="utf-8").strip()
+            snapshot_dirs = sorted(
+                (p for p in snapshots_dir.iterdir() if p.is_dir() and not p.name.startswith(".")),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
         except OSError:
-            continue
-        if not rev or "/" in rev or "\\" in rev or rev in {".", ".."}:
-            continue
-        snap = snapshots_dir / rev
-        key = os.path.normcase(str(snap))
-        if key not in seen:
-            seen.add(key)
-            candidates.append(snap)
-    try:
-        snapshot_dirs = sorted(
-            (p for p in snapshots_dir.iterdir() if p.is_dir() and not p.name.startswith(".")),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-    except OSError:
-        snapshot_dirs = []
-    for snap in snapshot_dirs:
-        key = os.path.normcase(str(snap))
-        if key not in seen:
-            seen.add(key)
-            candidates.append(snap)
+            snapshot_dirs = []
+        for snap in snapshot_dirs:
+            key = os.path.normcase(str(snap))
+            if key not in seen:
+                seen.add(key)
+                candidates.append(snap)
 
     for snap in candidates:
         if not snap.is_dir():
@@ -775,11 +798,17 @@ def resolve_hf_repo_snapshot(
     hub_cache: str | Path | None = None,
     *,
     require_complete: bool = True,
+    revision: str | None = None,
 ) -> Path | None:
     """Resolve ``repo_id`` inside a Hugging Face hub cache (`models--Org--Repo/snapshots/<rev>`)."""
     root = Path(hub_cache).expanduser() if hub_cache is not None else hf_hub_cache_dir()
     repo_dir = root / f"models--{safe_model_name(repo_id)}"
-    return _resolve_hf_dir_snapshot(repo_dir, repo_id, require_complete=require_complete)
+    return _resolve_hf_dir_snapshot(
+        repo_dir,
+        repo_id,
+        require_complete=require_complete,
+        revision=revision,
+    )
 
 
 def hf_repo_id_from_cache_dir(repo_root: Path, snapshot: Path | None = None) -> str | None:
@@ -817,7 +846,8 @@ def iter_hf_cache_models(
     for child in children:
         if not child.is_dir() or not child.name.startswith("models--"):
             continue
-        snap = _resolve_hf_dir_snapshot(child, require_complete=require_complete)
+        inferred_repo = hf_repo_id_from_cache_dir(child)
+        snap = _resolve_hf_dir_snapshot(child, inferred_repo, require_complete=require_complete)
         if snap is None:
             continue
         repo_id = hf_repo_id_from_cache_dir(child, snap)
@@ -829,7 +859,7 @@ def iter_hf_cache_models(
     return found
 
 
-def huggingface_cache_path(repo_id: str) -> Path | None:
+def huggingface_cache_path(repo_id: str, *, revision: str | None = None) -> Path | None:
     """Locate ``repo_id`` in the shared Hugging Face cache, or return ``None``.
 
     Honors ``HF_HUB_CACHE``, ``HUGGINGFACE_HUB_CACHE``, ``HF_HOME``, and
@@ -838,7 +868,7 @@ def huggingface_cache_path(repo_id: str) -> Path | None:
 
     if _hf_home_reuse_disabled():
         return None
-    direct = resolve_hf_repo_snapshot(repo_id)
+    direct = resolve_hf_repo_snapshot(repo_id, revision=revision)
     if direct is not None:
         return direct
     try:
@@ -846,7 +876,9 @@ def huggingface_cache_path(repo_id: str) -> Path | None:
     except Exception:
         return None
     try:
-        resolved = Path(snapshot_download(repo_id, local_files_only=True))
+        resolved = Path(
+            snapshot_download(repo_id, revision=revision, local_files_only=True)
+        )
     except Exception:
         return None
     return resolved if resolved.is_dir() else None
@@ -1969,9 +2001,16 @@ def pull_model(
         # without a sha marker keep the index-byte compare. Network failures
         # err on reuse so offline pulls keep working.
         local_sha = (path_marker or {}).get("resolved_sha")
+        if (
+            not (isinstance(local_sha, str) and local_sha)
+            and path.parent.name == "snapshots"
+            and len(path.name) == 40
+            and all(ch in "0123456789abcdefABCDEF" for ch in path.name)
+        ):
+            local_sha = path.name.lower()
         if isinstance(local_sha, str) and local_sha:
             _resolve_remote_snapshot()
-            return remote_sha is None or remote_sha == local_sha
+            return remote_sha is None or remote_sha.lower() == local_sha.lower()
         return _local_matches_remote_index(path, repo_id, revision)
 
     def _try_reuse(candidate: Path, path_marker: dict[str, Any] | None, *, writable: bool) -> dict[str, Any] | None:
@@ -2021,7 +2060,11 @@ def pull_model(
             and not explicit_destination
             and _should_scan_hf_hub_cache(raw_cache_dir)
         ):
-            hf_candidate = huggingface_cache_path(repo_id)
+            hf_candidate = (
+                huggingface_cache_path(repo_id)
+                if revision is None
+                else huggingface_cache_path(repo_id, revision=revision)
+            )
             if hf_candidate is not None and hf_candidate != destination:
                 reused_info = _try_reuse(
                     hf_candidate,

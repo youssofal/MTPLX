@@ -143,7 +143,8 @@ public struct ModelLibrary: Equatable, Sendable {
 
     static func resolveAnyHFSnapshot(
         inRepoDirectory repoDir: URL,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        requireComplete: Bool = true
     ) -> URL? {
         let snapshotsDir = repoDir.appendingPathComponent("snapshots", isDirectory: true)
         var isDir: ObjCBool = false
@@ -192,7 +193,10 @@ public struct ModelLibrary: Equatable, Sendable {
                 }
             }
         }
-        return ordered.first { Self.isAvailable($0, fileManager: fileManager) }
+        return ordered.first {
+            Self.isAvailable($0, fileManager: fileManager)
+                && (!requireComplete || MTPLXModelOption.hasCompleteInstall(at: $0.path))
+        }
     }
 
     public static func resolveHFSnapshot(
@@ -203,36 +207,11 @@ public struct ModelLibrary: Equatable, Sendable {
         let safeName = repoID.replacingOccurrences(of: "/", with: "--")
         let repoDir = hubCache.appendingPathComponent("models--\(safeName)", isDirectory: true)
         guard Self.isAvailable(repoDir, fileManager: fileManager) else { return nil }
-        let snapshotsDir = repoDir.appendingPathComponent("snapshots", isDirectory: true)
-        var candidates: [URL] = []
-        var seen = Set<String>()
-        let mainRef = repoDir.appendingPathComponent("refs", isDirectory: true)
-            .appendingPathComponent("main")
-        if let rev = try? String(contentsOf: mainRef, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           !rev.isEmpty, !rev.contains("/"), !rev.contains("\\") {
-            let snap = snapshotsDir.appendingPathComponent(rev, isDirectory: true).standardizedFileURL
-            if seen.insert(snap.path).inserted { candidates.append(snap) }
-        }
-        if let snapDirs = try? fileManager.contentsOfDirectory(
-            at: snapshotsDir,
-            includingPropertiesForKeys: [.contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        ) {
-            let byDate = snapDirs.sorted { a, b in
-                let dA = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                let dB = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                return dA > dB
-            }
-            for snap in byDate {
-                let std = snap.standardizedFileURL
-                if seen.insert(std.path).inserted { candidates.append(std) }
-            }
-        }
-        return candidates.first { snap in
-            Self.isAvailable(snap, fileManager: fileManager)
-                && MTPLXModelOption.hasCompleteInstall(at: snap.path)
-        }
+        return Self.resolveAnyHFSnapshot(
+            inRepoDirectory: repoDir,
+            fileManager: fileManager,
+            requireComplete: true
+        )
     }
 
     static func hfRepoID(fromRepoDirectory repoDir: URL, snapshot: URL) -> String? {

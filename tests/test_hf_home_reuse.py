@@ -147,3 +147,69 @@ def test_hf_home_models_appear_in_list_and_scan_and_folders_command(tmp_path, mo
     assert payload["huggingface_cache"]["role"] == "huggingface_cache"
     assert payload["huggingface_cache"]["packs"] == 1
     assert payload["huggingface_cache"]["read_only"] is True
+
+
+def test_pull_model_respects_revision_and_40hex_sha_freshness(tmp_path, monkeypatch):
+    hf_home = tmp_path / "hf_home"
+    hub = hf_home / "hub"
+    mtplx_cache = tmp_path / "mtplx_models"
+    mtplx_cache.mkdir()
+    repo = "someone/rev-model"
+    sha_main = "a" * 40
+    sha_v2 = "b" * 40
+    snap_main = _write_hf_snapshot(hub, repo, sha=sha_main)
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+
+    # 1) Explicit revision="v2" must not reuse refs/main snapshot when v2 isn't local.
+    assert hf_loader.huggingface_cache_path(repo, revision="v2") is None
+
+    # 2) Exact 40-hex snapshots/<sha> compares commit SHA against remote:
+    #    matching SHA or offline (remote_sha=None) reuses HF_HOME cleanly.
+    monkeypatch.setattr(hf_loader, "_query_repo_snapshot", lambda _r, revision=None: (sha_main, None))
+    reused = hf_loader.pull_model(repo, cache_dir=mtplx_cache)
+    assert reused["reused_existing"] is True
+    assert Path(reused["path"]).resolve() == snap_main.resolve()
+
+    monkeypatch.setattr(hf_loader, "_query_repo_snapshot", lambda _r, revision=None: (None, None))
+    reused_offline = hf_loader.pull_model(repo, cache_dir=mtplx_cache)
+    assert reused_offline["reused_existing"] is True
+
+    # 3) Explicit revision pointing to a 40-hex local snapshot can reuse matching remote SHA
+    #    without falling back to main; stale SHA does NOT reuse HF_HOME.
+    snap_v2 = _write_hf_snapshot(hub, repo, sha=sha_v2, write_ref=False)
+    (hub / "models--someone--rev-model" / "refs" / "v2").write_text(sha_v2, encoding="utf-8")
+    monkeypatch.setattr(hf_loader, "_query_repo_snapshot", lambda _r, revision=None: (sha_v2, None))
+    reused_v2 = hf_loader.pull_model(repo, cache_dir=mtplx_cache, revision="v2")
+    assert reused_v2["reused_existing"] is True
+    assert Path(reused_v2["path"]).resolve() == snap_v2.resolve()
+
+
+def test_iter_hf_cache_models_skips_incomplete_sidecar_snapshot_for_older_complete(tmp_path, monkeypatch):
+    import os
+
+    hf_home = tmp_path / "hf_home"
+    hub = hf_home / "hub"
+    repo = "Youssofal/Inkling-2-Mini-MTPLX-Bare-Speed"
+    old_snap = _write_hf_snapshot(
+        hub,
+        repo,
+        sha="1" * 40,
+        write_ref=False,
+        pack_meta={"source": "thinkingmachines/Inkling-2-Mini", "recipe": "bare-speed"},
+    )
+    (old_snap / "mtp.safetensors").write_bytes(b"mtp")
+    new_partial_snap = _write_hf_snapshot(
+        hub,
+        repo,
+        sha="2" * 40,
+        write_ref=True,  # refs/main points at newer snapshot missing mtp.safetensors
+    )
+    os.utime(old_snap, (1000, 1000))
+    os.utime(new_partial_snap, (2000, 2000))
+
+    found = hf_loader.iter_hf_cache_models(hub, require_complete=True)
+    assert len(found) == 1
+    assert found[0][0] == repo
+    assert found[0][1].resolve() == old_snap.resolve()

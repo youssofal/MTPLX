@@ -487,6 +487,46 @@ final class ModelLibraryTests: XCTestCase {
         XCTAssertEqual(discovered.map(\.reference), ["Vendor/SampleModel"])
     }
 
+    func testResolveAnyHFSnapshotSkipsPartialMainToFindOlderCompleteSnapshot() throws {
+        let root = temporaryDirectory()
+        let primary = root.appendingPathComponent("primary", isDirectory: true)
+        let hfHome = root.appendingPathComponent("hf_home", isDirectory: true)
+        try FileManager.default.createDirectory(at: primary, withIntermediateDirectories: true)
+
+        let partialHub = root.appendingPathComponent("partial-only-hub", isDirectory: true)
+        let partialOnlySnap = partialHub
+            .appendingPathComponent("models--Vendor--PartialOnly", isDirectory: true)
+            .appendingPathComponent("snapshots", isDirectory: true)
+            .appendingPathComponent("partialsha", isDirectory: true)
+        try FileManager.default.createDirectory(at: partialOnlySnap, withIntermediateDirectories: true)
+        try "{}".write(to: partialOnlySnap.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+        XCTAssertEqual(SharedModelFolders.packCount(in: partialHub.path), 0)
+
+        let repoDir = hfHome
+            .appendingPathComponent("hub", isDirectory: true)
+            .appendingPathComponent("models--Vendor--MixedSnapshots", isDirectory: true)
+        let oldComplete = repoDir.appendingPathComponent("snapshots/oldcomplete", isDirectory: true)
+        let newPartial = repoDir.appendingPathComponent("snapshots/newpartial", isDirectory: true)
+        let refs = repoDir.appendingPathComponent("refs", isDirectory: true)
+        try FileManager.default.createDirectory(at: oldComplete, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: newPartial, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: refs, withIntermediateDirectories: true)
+        try "newpartial".write(to: refs.appendingPathComponent("main"), atomically: true, encoding: .utf8)
+        try "{}".write(to: newPartial.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+        try "{}".write(to: oldComplete.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+        try "{}".write(to: oldComplete.appendingPathComponent("tokenizer.json"), atomically: true, encoding: .utf8)
+        try Data([0]).write(to: oldComplete.appendingPathComponent("model.safetensors"))
+
+        let library = ModelLibrary(
+            primaryDirectory: primary.path,
+            environment: ["HF_HOME": hfHome.path],
+            includeHuggingFaceCache: true
+        )
+        let discovered = library.discoverCompleteModels()
+        let canonicalOld = ModelLibrary.canonicalURL(for: oldComplete.path).path
+        XCTAssertTrue(discovered.contains { $0.reference == "Vendor/MixedSnapshots" && $0.path == canonicalOld })
+    }
+
     /// The provenance block Forge writes into mtplx_runtime.json, complete
     /// enough for MTPLXRuntimeMetadata to decode (a partial block decodes to
     /// nil and would hide the naming path under test).
