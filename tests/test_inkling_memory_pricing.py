@@ -205,12 +205,14 @@ def test_the_engine_pool_is_priced_at_the_widest_copy_panel():
     rt, row = _decode_runtime(pool_bytes=81 * mb)
     rt.engine_pool_bound = engine_pool_price(rt.engine_pool_bytes, 25)
     assert InklingRuntime.window_cache_bytes(rt) == 1024 * 40 * row + 8 * 4096 * row + 81 * mb * 25 // 8
-    # The widest panel: the copy cap plus its anchor where wide panels are exact, else 8.
+    # The widest panel: aligned to warmed 8-row tiles where wide panels are exact, else 8.
     original = runtime_module.wide_rows_exact
     try:
         runtime_module.wide_rows_exact = lambda model, spec: True
-        assert widest_panel(None) == 25
+        assert runtime_module.wide_copy_widths(None) == (16, 24)
+        assert widest_panel(None) == 24
         runtime_module.wide_rows_exact = lambda model, spec: False
+        assert runtime_module.wide_copy_widths(None) == ()
         assert widest_panel(None) == 8
     finally:
         runtime_module.wide_rows_exact = original

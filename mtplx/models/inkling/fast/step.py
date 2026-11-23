@@ -775,9 +775,32 @@ def row_stable_head(model, hidden):
         key = ("head", rows, tuple(unembed.codes.shape), unembed.bits, unembed.group_size, str(hidden.dtype))
         return proven_rows(key, lambda: model.head(hidden), lambda: mx.concatenate(
             [model.head(hidden[:, row : row + 1]) for row in range(rows)], axis=1))
+    from ..head import MAX_PANEL_ROWS
+
     if rows <= ROW_STABLE_ROWS:
         return table_head(model, hidden)
+    if rows <= MAX_PANEL_ROWS:
+        logits, route = _table_head_call(model, hidden)
+        if route != "stock":
+            _count_table_head(route)
+            return logits
     return mx.concatenate([table_head(model, hidden[:, start:stop]) for start, stop in row_chunks(rows)], axis=1)
+
+
+def _table_head_call(model, hidden):
+    from ..head import head_logits
+
+    return head_logits(
+        hidden.astype(model.embed_tokens.weight.dtype),
+        model.unembed,
+        model.config["unpadded_vocab_size"],
+        model.config["final_logit_softcapping"],
+        pack=getattr(model, "proof_pack", None),
+    )
+
+
+def _count_table_head(route):
+    count("fused.head.table" if route == "native" else f"fallback.head.table_{route}")
 
 
 def table_head(model, hidden):
@@ -786,12 +809,8 @@ def table_head(model, hidden):
     (the launch, then MLX's divide, tanh and multiply), every value equal (the capped launch is proven
     against the launch capped by MLX on this Mac's first use). Where the capped launch refuses, MLX
     caps; where the vocabulary launch does not serve, MLX's product; both counted."""
-    from ..head import head_logits
-
-    logits, route = head_logits(hidden.astype(model.embed_tokens.weight.dtype), model.unembed,
-                                model.config["unpadded_vocab_size"], model.config["final_logit_softcapping"],
-                                pack=getattr(model, "proof_pack", None))
-    count("fused.head.table" if route == "native" else f"fallback.head.table_{route}")
+    logits, route = _table_head_call(model, hidden)
+    _count_table_head(route)
     return logits
 
 

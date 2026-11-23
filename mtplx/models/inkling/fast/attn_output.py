@@ -52,73 +52,87 @@ _SOURCE = """
     // each 128-wide span and walks the spans in order; a sum starts at zero and takes one product
     // a statement, so each row repeats the one-row product's sequence while every weight is read
     // once for the whole panel.
-    float sum[W][4];
-    for (int w = 0; w < W; ++w) {
+    float prev[4][3];
+    if (lane == 0) {
         for (int o = 0; o < 4; ++o) {
-            sum[w][o] = 0;
+            const int c = first + o;
+            for (int t = 0; t < 3; ++t) {
+                prev[o][t] = tail[t * tail_strides[1] + c * tail_strides[2]];
+            }
         }
     }
-    for (int span = 0; span < hidden / 128; ++span) {
-        const int col = span * 128 + 4 * lane;
-        float gated[W][4];
-        for (int w = 0; w < W; ++w) {
-            for (int k = 0; k < 4; ++k) {
-                gated[w][k] = static_cast<float>(hg[w * hg_strides[1] + col + k]);
+    const float divisor = as_type<float>(uint(DIVISOR));
+    for (int r0 = 0; r0 < W; r0 += RCH) {
+        const int cnt = (r0 + RCH <= W) ? RCH : (W - r0);
+        float sum[RCH][4];
+        for (int w = 0; w < cnt; ++w) {
+            for (int o = 0; o < 4; ++o) {
+                sum[w][o] = 0;
             }
         }
-        for (int o = 0; o < 4; ++o) {
-            T wt[4];
-            for (int k = 0; k < 4; ++k) {
-                wt[k] = weights[o * pitch + col + k];
-            }
-            for (int w = 0; w < W; ++w) {
+        for (int span = 0; span < hidden / 128; ++span) {
+            const int col = span * 128 + 4 * lane;
+            float gated[RCH][4];
+            for (int w = 0; w < cnt; ++w) {
                 for (int k = 0; k < 4; ++k) {
-                    sum[w][o] += wt[k] * gated[w][k];
+                    gated[w][k] = static_cast<float>(hg[(r0 + w) * hg_strides[1] + col + k]);
+                }
+            }
+            for (int o = 0; o < 4; ++o) {
+                T wt[4];
+                for (int k = 0; k < 4; ++k) {
+                    wt[k] = weights[o * pitch + col + k];
+                }
+                for (int w = 0; w < cnt; ++w) {
+                    for (int k = 0; k < 4; ++k) {
+                        sum[w][o] += wt[k] * gated[w][k];
+                    }
                 }
             }
         }
-    }
-    // The 32 lanes' sums meet in lane 0 by halving: a lane adds the lane 16 above it, then 8, 4,
-    // 2 and 1.
-    for (int w = 0; w < W; ++w) {
-        for (int o = 0; o < 4; ++o) {
-            for (ushort hop = 16; hop != 0; hop /= 2) {
-                sum[w][o] += simd_shuffle_down(sum[w][o], hop);
+        // The 32 lanes' sums meet in lane 0 by halving: a lane adds the lane 16 above it, then 8, 4,
+        // 2 and 1.
+        for (int w = 0; w < cnt; ++w) {
+            for (int o = 0; o < 4; ++o) {
+                for (ushort hop = 16; hop != 0; hop /= 2) {
+                    sum[w][o] += simd_shuffle_down(sum[w][o], hop);
+                }
             }
         }
-    }
-    if (lane != 0) {
-        return;
-    }
-    const float divisor = as_type<float>(uint(DIVISOR));
-    for (int o = 0; o < 4; ++o) {
-        const int c = first + o;
-        float hist[W + 3];
-        for (int t = 0; t < 3; ++t) {
-            hist[t] = tail[t * tail_strides[1] + c * tail_strides[2]];
-        }
-        for (int w = 0; w < W; ++w) {
-            hist[3 + w] = static_cast<float>(static_cast<T>(sum[w][o]));
-        }
-        const float w0 = cw[0 * cw_strides[0] + c * cw_strides[1]];
-        const float w1 = cw[1 * cw_strides[0] + c * cw_strides[1]];
-        const float w2 = cw[2 * cw_strides[0] + c * cw_strides[1]];
-        const float w3 = cw[3 * cw_strides[0] + c * cw_strides[1]];
-        for (int w = 0; w < W; ++w) {
-            const size_t at = size_t(w) * size_t(width) + size_t(c);
-            rows[at] = hist[3 + w];
-            float acc = 0.0f;
-            acc += hist[w + 0] * w0;
-            acc += hist[w + 1] * w1;
-            acc += hist[w + 2] * w2;
-            acc += hist[w + 3] * w3;
-            const float total = hist[w + 3] + acc;
-            const float value = total / divisor;
-            const float conv = static_cast<float>(static_cast<T>(value));
-            if (BOUNDARY) {
-                partial[at] = conv;
-            } else {
-                partial[at] = conv + static_cast<float>(x[w * x_strides[1] + c * x_strides[2]]);
+        if (lane == 0) {
+            for (int o = 0; o < 4; ++o) {
+                const int c = first + o;
+                float hist[RCH + 3];
+                for (int t = 0; t < 3; ++t) {
+                    hist[t] = prev[o][t];
+                }
+                for (int w = 0; w < cnt; ++w) {
+                    hist[3 + w] = static_cast<float>(static_cast<T>(sum[w][o]));
+                }
+                const float w0 = cw[0 * cw_strides[0] + c * cw_strides[1]];
+                const float w1 = cw[1 * cw_strides[0] + c * cw_strides[1]];
+                const float w2 = cw[2 * cw_strides[0] + c * cw_strides[1]];
+                const float w3 = cw[3 * cw_strides[0] + c * cw_strides[1]];
+                for (int w = 0; w < cnt; ++w) {
+                    const size_t at = size_t(r0 + w) * size_t(width) + size_t(c);
+                    rows[at] = hist[3 + w];
+                    float acc = 0.0f;
+                    acc += hist[w + 0] * w0;
+                    acc += hist[w + 1] * w1;
+                    acc += hist[w + 2] * w2;
+                    acc += hist[w + 3] * w3;
+                    const float total = hist[w + 3] + acc;
+                    const float value = total / divisor;
+                    const float conv = static_cast<float>(static_cast<T>(value));
+                    if (BOUNDARY) {
+                        partial[at] = conv;
+                    } else {
+                        partial[at] = conv + static_cast<float>(x[(r0 + w) * x_strides[1] + c * x_strides[2]]);
+                    }
+                }
+                for (int t = 0; t < 3; ++t) {
+                    prev[o][t] = hist[cnt + t];
+                }
             }
         }
     }
@@ -160,7 +174,7 @@ def attention_output(hg, out_weight, conv_weight, tail, x, *, boundary):
         raise ValueError("attention_output serves the 2304 x 3072 projection with four taps")
     partial, conv_rows = _kernel()(
         inputs=[hg, out_weight, conv_weight, tail, x],
-        template=[("T", hg.dtype), ("W", rows), ("BOUNDARY", bool(boundary)), ("DIVISOR", DIVISOR_BITS)],
+        template=[("T", hg.dtype), ("W", rows), ("RCH", max(1, min(rows, 8))), ("BOUNDARY", bool(boundary)), ("DIVISOR", DIVISOR_BITS)],
         grid=((out_size // 16) * 128, 1, 1),
         threadgroup=(128, 1, 1),
         output_shapes=[(1, rows, out_size), (1, rows, out_size)],

@@ -36,15 +36,24 @@ def make_weights_resident(model, drafter):
     mx.eval(model.parameters(), drafter.parameters() if drafter is not None else {})
 
 
-def widest_panel(model):
-    """The widest verify panel the fast step will be asked for: a copy round's block (the copy
-    lane's cap, 24 tokens by default) plus its anchor, up to ``MAX_PANEL``, where wide panels are
-    exact on this pack; else warm-up's widest."""
+def wide_copy_widths(model):
+    """Warmed 8-row-aligned wide copy verify widths for packs supporting wide panels."""
     if not wide_rows_exact(model, stage_spec()):
-        return engine_site.MAX_WARM_WIDTH
+        return ()
     from mtplx import context_copy
 
-    return max(engine_site.MAX_WARM_WIDTH, min(MAX_PANEL, context_copy.context_copy_block_k() + 1))
+    limit = min(MAX_PANEL, context_copy.context_copy_block_k() + 1)
+    snapped = (limit // engine_site.MAX_WARM_WIDTH) * engine_site.MAX_WARM_WIDTH
+    if snapped <= engine_site.MAX_WARM_WIDTH:
+        return ()
+    return tuple(range(engine_site.MAX_WARM_WIDTH * 2, snapped + 1, engine_site.MAX_WARM_WIDTH))
+
+
+def widest_panel(model):
+    """The widest verify panel the fast step will be asked for: aligned to warmed 8-row tiles where
+    wide panels are exact on this pack; else warm-up's widest."""
+    widths = wide_copy_widths(model)
+    return widths[-1] if widths else engine_site.MAX_WARM_WIDTH
 
 
 #: What a conversation past the first 4,096-row capacity step adds to the engine's pool beyond the
@@ -114,9 +123,9 @@ class InklingRuntime(MTPLXRuntime):
             # pool's largest temporaries inside the first capacity step, so the pool read below is
             # priced as measured plus what a longer conversation adds (``engine_pool_price``), not
             # scaled from warm-up's widest.
-            widest = widest_panel(model)
-            if widest > engine_site.MAX_WARM_WIDTH:
-                wide = engine_site.warm(self, widths=(widest,))
+            wide_widths = wide_copy_widths(model)
+            if wide_widths:
+                wide = engine_site.warm(self, widths=wide_widths)
                 self.engine_warm.setdefault("widths", {}).update(wide.get("widths") or {})
                 self.engine_warm["widest_seconds"] = wide.get("seconds")
             # The DSpark round as one program for 1 to 7 proposals (lane L7), recorded and checked

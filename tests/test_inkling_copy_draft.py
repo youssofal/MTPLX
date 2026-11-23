@@ -331,7 +331,8 @@ def test_the_cost_gate_is_off_by_default_and_leaves_the_lane_alone(monkeypatch):
     monkeypatch.delenv("MTPLX_CONTEXT_COPY_GATE", raising=False)
     lane = PromptCopy(_rewrite_prompt(), session_id=None, verify_rows=32)
     assert lane.gate is None
-    assert lane.propose([1000, 1001], 100) == list(range(1002, 1010))
+    # Probation cap 8 snaps verify_rows 9 -> 8 (7 proposals + anchor) to stay on warmed tiles.
+    assert lane.propose([1000, 1001], 100) == list(range(1002, 1009))
     stats = lane.finish(2)
     assert "cost_gate" not in stats["context_copy_declines"]
     assert not any(k.startswith("gate_") for k in stats["context_copy_timing_s"])

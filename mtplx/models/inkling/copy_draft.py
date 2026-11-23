@@ -160,7 +160,22 @@ class PromptCopy:
             if legal < len(guesses):
                 guesses = guesses[:legal]
                 self.limits["grammar_prefix"] += 1
+        aligned = self.align_verify_proposals(len(guesses), self.max_proposals)
+        if aligned < len(guesses):
+            guesses = guesses[:aligned]
         return guesses
+
+    @staticmethod
+    def align_verify_proposals(length: int, max_proposals: int, tile: int = 8) -> int:
+        if length <= 0:
+            return 0
+        if tile <= 1 or max_proposals < tile:
+            return length
+        verify_rows = length + 1
+        if verify_rows <= tile:
+            return length
+        snapped_rows = (verify_rows // tile) * tile
+        return max(0, snapped_rows - 1)
 
     def observe(self, offered, landed, emitted_tokens, wall_s):
         # Host wall covers selection, proposal, target verification and commit submission.
