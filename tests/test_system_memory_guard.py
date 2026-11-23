@@ -19,6 +19,7 @@ import mtplx.system_memory as sm
 from ctypes import sizeof as ctypes_sizeof
 
 GIB = 1024**3
+MIB = 1024**2
 RAM = 128 * GIB
 LIMIT = 96 * GIB
 KV_PER_TOKEN = 24576
@@ -187,8 +188,8 @@ class TestFloorsAndLevel:
         assert abort == int(128 * GIB * 0.025)
         assert shed == 2 * abort
         shed_small, abort_small = sm.system_memory_floors(16 * GIB)
-        assert abort_small == 1 * GIB
-        assert shed_small == 2 * GIB
+        assert abort_small == 512 * MIB
+        assert shed_small == 1 * GIB
 
     def test_floor_overrides(self, monkeypatch):
         monkeypatch.setenv("MTPLX_SYSTEM_MEMORY_ABORT_FLOOR_BYTES", "4G")
@@ -268,8 +269,8 @@ class TestWiredFloorsAndDeathSignature:
         # 48 GB Mac with the 27B wired: barely above the old 2.5 percent line.
         _shed48, abort48 = sm.system_memory_floors(48 * GIB, wired_bytes=21 * GIB)
         assert abort48 == 21 * GIB // 16
-        # 16 GB Mac: the 1 GiB minimum still rules, unchanged.
-        assert sm.system_memory_floors(16 * GIB, wired_bytes=10 * GIB) == (2 * GIB, GIB)
+        # Below 48 GiB (including 16 GB): 512 MiB minimum rules and wired // 16 is omitted.
+        assert sm.system_memory_floors(16 * GIB, wired_bytes=10 * GIB) == (1 * GIB, 512 * MIB)
         # No wired reading: the shipped 2.5 percent rule, unchanged.
         assert sm.system_memory_floors(128 * GIB) == (
             2 * int(128 * GIB * 0.025),
@@ -764,3 +765,62 @@ class TestGuardLoop:
         assert state.dashboard.last_memory_pressure_level == 1
         assert state.dashboard.last_system_available_bytes == 40 * GIB
         assert bank.calls == []
+
+
+
+class TestSmallMacGuardFloors:
+    def test_macs_below_48gb_use_half_gib_min_and_omit_wired_floor(self, monkeypatch):
+        monkeypatch.delenv("MTPLX_SYSTEM_MEMORY_ABORT_FLOOR_BYTES", raising=False)
+        monkeypatch.delenv("MTPLX_SYSTEM_MEMORY_SHED_FLOOR_BYTES", raising=False)
+
+        assert sm.system_memory_floors(8 * GIB, wired_bytes=6 * GIB) == (1 * GIB, 512 * MIB)
+        assert sm.system_memory_floors(16 * GIB, wired_bytes=10 * GIB) == (1 * GIB, 512 * MIB)
+
+        abort_24 = int(24 * GIB * 0.025)
+        assert sm.system_memory_floors(24 * GIB, wired_bytes=19 * GIB) == (2 * abort_24, abort_24)
+        assert abort_24 < 19 * GIB // 16
+
+        abort_32 = int(32 * GIB * 0.025)
+        assert sm.system_memory_floors(32 * GIB, wired_bytes=20 * GIB) == (2 * abort_32, abort_32)
+
+        abort_36 = int(36 * GIB * 0.025)
+        assert sm.system_memory_floors(36 * GIB, wired_bytes=25 * GIB) == (2 * abort_36, abort_36)
+
+    def test_macs_48gb_and_above_keep_wired_divisor_and_1gib_min(self, monkeypatch):
+        monkeypatch.delenv("MTPLX_SYSTEM_MEMORY_ABORT_FLOOR_BYTES", raising=False)
+        monkeypatch.delenv("MTPLX_SYSTEM_MEMORY_SHED_FLOOR_BYTES", raising=False)
+
+        assert sm.system_memory_floors(48 * GIB, wired_bytes=24 * GIB) == (
+            3 * GIB,
+            24 * GIB // 16,
+        )
+        assert sm.system_memory_floors(128 * GIB, wired_bytes=88 * GIB) == (11 * GIB, int(5.5 * GIB))
+
+    def test_hard_crash_guards_still_fire_on_24gb_mac_under_swap_or_compressor_pressure(self, monkeypatch):
+        monkeypatch.delenv("MTPLX_SYSTEM_MEMORY_ABORT_FLOOR_BYTES", raising=False)
+        monkeypatch.delenv("MTPLX_SYSTEM_MEMORY_SHED_FLOOR_BYTES", raising=False)
+
+        before = sm.SystemMemory(
+            available_bytes=2 * GIB,
+            total_bytes=24 * GIB,
+            level_percent=40,
+            free_bytes=900 * MIB,
+            file_backed_bytes=1 * GIB,
+            wired_bytes=19 * GIB,
+            compressor_bytes=8 * GIB,
+            swap_used_bytes=100 * MIB,
+            monotonic_s=100.0,
+        )
+        thrashing = sm.SystemMemory(
+            available_bytes=700 * MIB,
+            total_bytes=24 * GIB,
+            level_percent=20,
+            free_bytes=200 * MIB,
+            file_backed_bytes=500 * MIB,
+            wired_bytes=19 * GIB,
+            compressor_bytes=9 * GIB,
+            swap_used_bytes=600 * MIB,
+            monotonic_s=101.0,
+        )
+        assert sm.thrashing_base(thrashing, before) is before
+        assert sm.compressor_full(thrashing, before) is True

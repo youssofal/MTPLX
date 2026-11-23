@@ -55,17 +55,21 @@ GIB = 1024**3
 MIB = 1024**2
 
 # Below the abort floor the desktop is one allocation away from a swap storm.
-# Three terms, the largest wins: 1 GiB (a small Mac's absolute minimum), 2.5
+# On Macs >= 48 GiB three terms race (the largest wins): 1 GiB minimum, 2.5
 # percent of RAM (the shipped 2026-09-20 rule), and a sixteenth of what is
-# wired system-wide. The wired term is the new one: 83 GiB wired did not
-# recover from 3 GiB free, and a sixteenth of it is 5.2 GiB. 16 GB Mac: 1 GiB;
-# 48 GB Mac with the 27B (about 21 GiB wired): 1.3 GiB; 128 GB Mac with
-# Flash-Next (about 88 GiB wired): 5.5 GiB. The shed floor is twice that: the
-# engine gives back its own reusable memory (allocator pool, idle session
-# snapshots) before anyone is refused.
+# wired system-wide (83 GiB wired did not recover from 3 GiB free, and a
+# sixteenth of it is 5.2 GiB; 48 GB Mac with the 27B: 1.3 GiB; 128 GB Mac
+# with Flash-Next: 5.5 GiB). Macs under 48 GiB omit the wired // 16 term and
+# use a 512 MiB minimum (8/16 GB: 512 MiB, 24 GB: 0.60 GiB instead of 1.2 GiB
+# when Bare Speed wires 18-19 GiB) while keeping every death-signature and
+# compressor crash guard intact. The shed floor is twice that: the engine gives
+# back its own reusable memory (allocator pool, idle session snapshots) before
+# anyone is refused.
 _ABORT_FLOOR_FRACTION = 0.025
 _ABORT_FLOOR_MIN_BYTES = 1 * GIB
 _ABORT_FLOOR_WIRED_DIVISOR = 16
+_SMALL_MAC_RAM_CUTOFF_BYTES = 48 * GIB
+_SMALL_MAC_ABORT_FLOOR_MIN_BYTES = 512 * MIB
 _SHED_FLOOR_MULTIPLE = 2
 
 # The death signature from the machine's own crash receipts (2026-09-03 and
@@ -439,11 +443,17 @@ def system_memory_floors(total_bytes: int, wired_bytes: int = 0) -> tuple[int, i
 
     abort = _parse_bytes(os.environ.get("MTPLX_SYSTEM_MEMORY_ABORT_FLOOR_BYTES", ""))
     if abort is None or abort <= 0:
-        abort = max(
-            _ABORT_FLOOR_MIN_BYTES,
-            int(total_bytes * _ABORT_FLOOR_FRACTION),
-            max(0, int(wired_bytes)) // _ABORT_FLOOR_WIRED_DIVISOR,
-        )
+        if total_bytes < _SMALL_MAC_RAM_CUTOFF_BYTES:
+            abort = max(
+                _SMALL_MAC_ABORT_FLOOR_MIN_BYTES,
+                int(total_bytes * _ABORT_FLOOR_FRACTION),
+            )
+        else:
+            abort = max(
+                _ABORT_FLOOR_MIN_BYTES,
+                int(total_bytes * _ABORT_FLOOR_FRACTION),
+                max(0, int(wired_bytes)) // _ABORT_FLOOR_WIRED_DIVISOR,
+            )
     shed = _parse_bytes(os.environ.get("MTPLX_SYSTEM_MEMORY_SHED_FLOOR_BYTES", ""))
     if shed is None or shed <= 0:
         shed = abort * _SHED_FLOOR_MULTIPLE

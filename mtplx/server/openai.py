@@ -23313,7 +23313,12 @@ def _admission_geometry(state: Any, prefill_width: int | None = None) -> _Admiss
         windows_fn = getattr(runtime, "prefill_window_bytes", None)
         if callable(windows_fn):
 
-            def prefill_windows(prompt: int, new: int) -> int:
+            def prefill_windows(prompt: int, new: int, *, leased: bool = False) -> int:
+                if leased:
+                    try:
+                        return int(windows_fn(prompt, new, prefill_width, leased=True) or 0)
+                    except TypeError:
+                        pass
                 return int(windows_fn(prompt, new, prefill_width) or 0)
     return _AdmissionGeometry(
         live_bytes_per_token=kv_live + aux,
@@ -24004,6 +24009,15 @@ def _admission_quant_working(
     }
 
 
+def _call_prefill_windows(fn: Any, prompt: int, new: int, *, leased: bool = False) -> int:
+    if leased:
+        try:
+            return int(fn(prompt, new, leased=True) or 0)
+        except TypeError:
+            pass
+    return int(fn(prompt, new) or 0)
+
+
 def _admission_growth(
     geometry: _AdmissionGeometry,
     *,
@@ -24128,7 +24142,12 @@ def _admission_growth(
         # the larger of the two is held.
         row_width = geometry.resident_width
         own_windows = geometry.prefill_windows is not None
-        new_fixed = int(geometry.prefill_windows(P, M)) if own_windows and M else 0
+        leased_in_place = bool(R > 0 and not restore_copies_prefix)
+        new_fixed = (
+            _call_prefill_windows(geometry.prefill_windows, P, M, leased=leased_in_place)
+            if own_windows and M
+            else 0
+        )
         restore_fixed = 0
         if restore_rows:
             restore_fixed = int(geometry.resident_fixed_bytes)
@@ -24199,7 +24218,7 @@ def _admission_growth(
             # What the pre-decode clone keeps: the prefill's windows, or the
             # restored entry's when nothing was prefilled.
             if M:
-                windows_after = int(geometry.prefill_windows(P, M))
+                windows_after = _call_prefill_windows(geometry.prefill_windows, P, M)
             elif restore_rows and restore_fixed_bytes is not None:
                 windows_after = int(restore_fixed_bytes)
         live_total = P * geometry.resident_width + windows_after

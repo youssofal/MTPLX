@@ -447,7 +447,7 @@ class InklingRuntime(MTPLXRuntime):
         tight = bool(getattr(plan, "tight_machine", False))
         return self.checkpoints_kept(few=True, tight=tight) * record + record // 2
 
-    def prefill_window_bytes(self, prompt_tokens, new_tokens, width=None):
+    def prefill_window_bytes(self, prompt_tokens, new_tokens, width=None, *, leased=False):
         if not new_tokens:
             return 0
         chunk = min(new_tokens, width or self.prompt_chunk_rows(prompt_tokens))
@@ -461,7 +461,12 @@ class InklingRuntime(MTPLXRuntime):
         # engine's pool at what it grows to: a short prompt's request holds that, not its
         # prompt-sized windows. What the pool and the load already hold is in MLX's active
         # memory, which the admission measures: only the rest is new (admission_fixed_bytes).
-        return max(prefill, self.admission_fixed_bytes())
+        total = max(prefill, self.admission_fixed_bytes())
+        if leased:
+            # A warm turn leasing the live cache continues with the sliding rings and conv
+            # tails already active in MLX; don't double-bill ``ring_bytes()`` against new growth.
+            return max(0, total - self.ring_bytes())
+        return total
 
     def embed_tokens(self, input_ids):
         return self.model.embed_tokens(input_ids)
