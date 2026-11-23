@@ -249,6 +249,23 @@ final class ForgeFeatureStateTests: XCTestCase {
         XCTAssertFalse(s.canAdvance, "Converted-but-not-accelerated artifacts cannot reach Registered")
     }
 
+    func testDiscoveryQueryDefaultsTo500AndMatchesMultiTokenQueries() {
+        let query = ForgeDiscoveryService.Query()
+        XCTAssertEqual(query.limit, 500)
+
+        let inkling = DiscoveryEntry(
+            repo: "Youssofal/MTPLX-Inkling-2-Mini-Bare-Speed",
+            owner: "Youssofal",
+            brandedName: "MTPLX-Inkling-2-Mini-Bare-Speed",
+            downloads: 420
+        )
+        XCTAssertTrue(inkling.matchesSearchQuery(""))
+        XCTAssertTrue(inkling.matchesSearchQuery("inkling 2 mini"))
+        XCTAssertTrue(inkling.matchesSearchQuery("youssofal inkling"))
+        XCTAssertTrue(inkling.matchesSearchQuery("inkling2mini"))
+        XCTAssertFalse(inkling.matchesSearchQuery("bonsai 27b"))
+    }
+
     func testBuildOutcomeParserHandlesFailedSpeedPayload() {
         let payload: [String: Any] = [
             "converted_path": "/tmp/Qwen-Qwen3.5-9B-MTPLX-Speed",

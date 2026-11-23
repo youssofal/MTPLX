@@ -1473,6 +1473,9 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         "mimo-v26-qwen-9b-optimized-speed",
         "qwen35-9b-optimized-speed",
         "bonsai-2-27b-optimized-speed",
+        "inkling2-mini-bare-speed",
+        "inkling2-mini-optimized-speed",
+        "inkling2-mini-optimized-quality",
     ]
 
     /// The 9B-class speed picks on modern chips. MiMo V2.6 Qwen 9B rides

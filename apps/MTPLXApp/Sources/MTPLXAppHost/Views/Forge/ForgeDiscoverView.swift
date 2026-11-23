@@ -315,11 +315,7 @@ struct ForgeDiscoverView: View {
     /// Case-insensitive substring match over the model's display name,
     /// creator handle, and repo slug. Empty query matches everything.
     private func matchesSearch(_ entry: DiscoveryEntry) -> Bool {
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !query.isEmpty else { return true }
-        return entry.brandedName.lowercased().contains(query)
-            || entry.owner.lowercased().contains(query)
-            || entry.repo.lowercased().contains(query)
+        entry.matchesSearchQuery(searchText)
     }
 
     private func partitionByVerification(

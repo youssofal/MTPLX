@@ -147,3 +147,61 @@ def test_discover_offset_pages_over_matching_rows(monkeypatch):
     # Offset counts MATCHING repos (the padding rows are not cards), so
     # page 2 starts at the third matching repo.
     assert [card["repo"] for card in cards] == [repo for repo, _ in CAPTURED_LIVE_ROWS[2:5]]
+
+
+
+def test_cmd_discover_accepts_up_to_500_limit(monkeypatch, capsys):
+    captured: list[tuple[str, int, int]] = []
+
+    def _fake_discover(*, query: str, limit: int, offset: int = 0):
+        captured.append((query, limit, offset))
+        return []
+
+    monkeypatch.setattr(forge, "discover_models", _fake_discover)
+    rc = forge._cmd_discover(SimpleNamespace(query="MTPLX", limit=500, offset=0))
+    assert rc == 0
+    assert captured == [("MTPLX", 500, 0)]
+
+    rc_capped = forge._cmd_discover(SimpleNamespace(query="MTPLX", limit=900, offset=0))
+    assert rc_capped == 0
+    assert captured[-1] == ("MTPLX", 500, 0)
+
+
+def test_discover_multi_token_query_searches_mtplx_and_matches_all_tokens(monkeypatch):
+    rows = [
+        _row("Youssofal/MTPLX-Inkling-2-Mini-Bare-Speed", 420),
+        _row("Youssofal/MTPLX-Qwen3.8-27B-Optimized-Speed", 9000),
+        _row("community/SomeOther-Inkling-Repo", 5000),  # lacks MTPLX in repo name
+    ]
+    api = _FakeApi(rows, expected_search="MTPLX")
+    monkeypatch.setattr(forge, "_make_hf_api", lambda: api)
+
+    assert [c["repo"] for c in forge.discover_models(query="youssofal inkling", limit=50)] == [
+        "Youssofal/MTPLX-Inkling-2-Mini-Bare-Speed"
+    ]
+    assert [c["repo"] for c in forge.discover_models(query="inkling2 mini", limit=50)] == [
+        "Youssofal/MTPLX-Inkling-2-Mini-Bare-Speed"
+    ]
+
+
+def test_discover_limit_500_reaches_official_repos_past_rank_100(monkeypatch):
+    rows = [_row(f"community/Model-{i}-MTPLX", 10_000 - i) for i in range(150)]
+    rows.append(_row("Youssofal/MTPLX-Inkling-2-Mini-Bare-Speed", 120))
+    api = _FakeApi(rows, expected_search="MTPLX")
+    monkeypatch.setattr(forge, "_make_hf_api", lambda: api)
+
+    cards = forge.discover_models(query="MTPLX", limit=500, offset=0)
+    repos = [c["repo"] for c in cards]
+    assert len(repos) == 151
+    assert "Youssofal/MTPLX-Inkling-2-Mini-Bare-Speed" in repos
+
+
+def test_modern_top_recommendation_ids_include_inkling2_mini():
+    from mtplx import model_catalog
+
+    for model_id in (
+        "inkling2-mini-bare-speed",
+        "inkling2-mini-optimized-speed",
+        "inkling2-mini-optimized-quality",
+    ):
+        assert model_id in model_catalog._MODERN_TOP_RECOMMENDATION_IDS
