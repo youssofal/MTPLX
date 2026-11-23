@@ -178,29 +178,105 @@ def _opencode_connect(db_path: Path) -> sqlite3.Connection | None:
     return conn
 
 
-def _opencode_sessions(conn: sqlite3.Connection, limit: int = 15) -> list[dict]:
+def _opencode_tables(conn: sqlite3.Connection) -> set[str]:
     rows = conn.execute(
-        "SELECT id, title, directory, time_created, time_updated,"
-        " tokens_input, tokens_output, tokens_reasoning, tokens_cache_read"
-        " FROM session ORDER BY time_updated DESC LIMIT ?",
-        (limit,),
+        "SELECT name FROM sqlite_master WHERE type='table'"
     ).fetchall()
-    return [dict(r) for r in rows]
+    return {row[0] for row in rows}
+
+
+def _inline_parts_from_data(message_id: str, data: dict) -> list[dict]:
+    content = data.get("content")
+    parts: list[dict] = []
+    if isinstance(content, list):
+        for idx, item in enumerate(content):
+            if isinstance(item, dict):
+                part = dict(item)
+                part.setdefault("_id", f"{message_id}:{idx}")
+                parts.append(part)
+            elif isinstance(item, str) and item:
+                parts.append({"_id": f"{message_id}:{idx}", "type": "text", "text": item})
+    if not parts and isinstance(data.get("text"), str) and data["text"]:
+        parts.append({"_id": f"{message_id}:0", "type": "text", "text": data["text"]})
+    return parts
+
+
+def _opencode_sessions(conn: sqlite3.Connection, limit: int = 15) -> list[dict]:
+    tables = _opencode_tables(conn)
+    for table in ("session_v2", "session"):
+        if table not in tables:
+            continue
+        rows = conn.execute(
+            f"SELECT id, title, directory, time_created, time_updated,"
+            f" tokens_input, tokens_output, tokens_reasoning, tokens_cache_read"
+            f" FROM {table} ORDER BY time_updated DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        if rows:
+            return [dict(r) for r in rows]
+    return []
 
 
 def _opencode_session_row(conn: sqlite3.Connection, session_id: str) -> dict | None:
-    row = conn.execute("SELECT * FROM session WHERE id = ?", (session_id,)).fetchone()
-    return dict(row) if row else None
+    tables = _opencode_tables(conn)
+    for table in ("session_v2", "session"):
+        if table not in tables:
+            continue
+        row = conn.execute(f"SELECT * FROM {table} WHERE id = ?", (session_id,)).fetchone()
+        if row:
+            return dict(row)
+    return None
 
 
 def _latest_opencode_session(conn: sqlite3.Connection) -> str | None:
-    row = conn.execute(
-        "SELECT id FROM session ORDER BY time_updated DESC LIMIT 1"
-    ).fetchone()
-    return row["id"] if row else None
+    tables = _opencode_tables(conn)
+    for table in ("session_v2", "session"):
+        if table not in tables:
+            continue
+        row = conn.execute(
+            f"SELECT id FROM {table} ORDER BY time_updated DESC LIMIT 1"
+        ).fetchone()
+        if row:
+            return row["id"]
+    return None
 
 
 def _opencode_messages(conn: sqlite3.Connection, session_id: str) -> list[dict]:
+    tables = _opencode_tables(conn)
+    if "session_message" in tables:
+        rows = conn.execute(
+            "SELECT id, type, seq, time_created, data FROM session_message"
+            " WHERE session_id = ? ORDER BY seq ASC, time_created ASC",
+            (session_id,),
+        ).fetchall()
+        if rows:
+            part_ids: set[str] = set()
+            if "session_part" in tables:
+                part_ids = {
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT DISTINCT message_id FROM session_part WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchall()
+                }
+            messages = []
+            for row in rows:
+                try:
+                    data = json.loads(row["data"])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if row["type"]:
+                    data.setdefault("role", row["type"])
+                data["_id"] = row["id"]
+                data["_time_created_s"] = (row["time_created"] or 0) / 1000.0
+                if row["id"] not in part_ids:
+                    inline = _inline_parts_from_data(row["id"], data)
+                    if inline:
+                        data.setdefault("_parts", inline)
+                messages.append(data)
+            return messages
+    if "message" not in tables:
+        return []
     rows = conn.execute(
         "SELECT id, time_created, data FROM message WHERE session_id = ?"
         " ORDER BY time_created ASC",
@@ -218,7 +294,55 @@ def _opencode_messages(conn: sqlite3.Connection, session_id: str) -> list[dict]:
     return messages
 
 
-def _opencode_parts(conn: sqlite3.Connection, message_id: str) -> list[dict]:
+def _opencode_parts(
+    conn: sqlite3.Connection,
+    message_id: str,
+    *,
+    message: dict | None = None,
+) -> list[dict]:
+    tables = _opencode_tables(conn)
+    if "session_part" in tables:
+        rows = conn.execute(
+            "SELECT message_id, ordinal, type, call_id, time_created, data FROM session_part"
+            " WHERE message_id = ? ORDER BY ordinal ASC, time_created ASC",
+            (message_id,),
+        ).fetchall()
+        if rows:
+            parts = []
+            for row in rows:
+                try:
+                    data = json.loads(row["data"])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                data["_id"] = f"{row['message_id']}:{row['ordinal']}"
+                if row["type"]:
+                    data.setdefault("type", row["type"])
+                if row["call_id"]:
+                    data.setdefault("callID", row["call_id"])
+                parts.append(data)
+            return parts
+    if message is not None:
+        if "_parts" in message and isinstance(message["_parts"], list):
+            return list(message["_parts"])
+        inline = _inline_parts_from_data(message_id, message)
+        if inline:
+            return inline
+    if "session_message" in tables:
+        row = conn.execute(
+            "SELECT data FROM session_message WHERE id = ?",
+            (message_id,),
+        ).fetchone()
+        if row:
+            try:
+                data = json.loads(row["data"])
+            except (TypeError, json.JSONDecodeError):
+                data = None
+            if isinstance(data, dict):
+                inline = _inline_parts_from_data(message_id, data)
+                if inline:
+                    return inline
+    if "part" not in tables:
+        return []
     rows = conn.execute(
         "SELECT id, time_created, data FROM part WHERE message_id = ?"
         " ORDER BY time_created ASC",
@@ -571,14 +695,23 @@ def _cmd_sessions(args: argparse.Namespace) -> int:
 def _resolve_session_arg(conn: sqlite3.Connection, ident: str | None) -> str | None:
     if not ident or ident == "latest":
         return _latest_opencode_session(conn)
-    exact = conn.execute("SELECT id FROM session WHERE id = ?", (ident,)).fetchone()
-    if exact:
-        return exact["id"]
-    row = conn.execute(
-        "SELECT id FROM session WHERE id LIKE ? ORDER BY time_updated DESC LIMIT 1",
-        (f"%{ident}%",),
-    ).fetchone()
-    return row["id"] if row else ident
+    tables = _opencode_tables(conn)
+    for table in ("session_v2", "session"):
+        if table not in tables:
+            continue
+        exact = conn.execute(f"SELECT id FROM {table} WHERE id = ?", (ident,)).fetchone()
+        if exact:
+            return exact["id"]
+    for table in ("session_v2", "session"):
+        if table not in tables:
+            continue
+        row = conn.execute(
+            f"SELECT id FROM {table} WHERE id LIKE ? ORDER BY time_updated DESC LIMIT 1",
+            (f"%{ident}%",),
+        ).fetchone()
+        if row:
+            return row["id"]
+    return ident
 
 
 def _think_tokens(row: dict) -> Any:
@@ -907,7 +1040,7 @@ def _cmd_autopsy(args: argparse.Namespace) -> int:
         # command exists for — so ranking by message.tokens would skip them.
         sized = []
         for i, message in enumerate(messages):
-            parts = _opencode_parts(conn, message["_id"])
+            parts = _opencode_parts(conn, message["_id"], message=message)
             chars = sum(
                 len(p.get("text") or "") for p in parts if p.get("type") == "reasoning"
             )
@@ -917,7 +1050,7 @@ def _cmd_autopsy(args: argparse.Namespace) -> int:
 
     results = []
     for turn_no, message in targets:
-        parts = _opencode_parts(conn, message["_id"])
+        parts = _opencode_parts(conn, message["_id"], message=message)
         reasoning = "\n\n".join(p.get("text") or "" for p in parts if p.get("type") == "reasoning")
         text = "\n\n".join(p.get("text") or "" for p in parts if p.get("type") == "text")
         words = reasoning.split()
