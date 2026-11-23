@@ -587,6 +587,7 @@ def generate(
             tuple(tokens),
             True,
             finish,
+            prompt_boundary_logits=prompt.logits,
             prompt_gdn_boundaries=tuple(prompt.gdn_boundaries or ()),
         )
     decode_s, elapsed = perf_counter() - decode_start, perf_counter() - start

@@ -1479,6 +1479,7 @@ class SessionBank:
         lease_kv_offset: int | None = None,
         lease_mtp_offset: int | None = None,
         resumed_at: int | None = None,
+        boundary_logits: tuple[int, Any] | None = None,
     ) -> SessionBankEntry | None:
         # lease_kv_offset / lease_mtp_offset: where the entry's own tokens end
         # in a leased cache that already ran past them (return_lease); by
@@ -1611,6 +1612,21 @@ class SessionBank:
                     turn_start=user_turn_start(tokens),
                 ),
             )
+        def _valid_boundary_logits(
+            boundaries: list[Any],
+        ) -> tuple[int, Any] | None:
+            if boundary_logits is None:
+                return None
+            pos, bl_val = boundary_logits
+            pos = int(pos)
+            if (
+                bl_val is None
+                or not (0 < pos < len(tokens))
+                or not any(int(r[0]) == pos for r in boundaries)
+            ):
+                return None
+            return (pos, _clone_tree(bl_val))
+
         def live_ref_entry(reason: str, nbytes: int) -> SessionBankEntry | None:
             if not keep_live_ref or not cache:
                 return None
@@ -1634,6 +1650,7 @@ class SessionBank:
                 if mtp_history_cache_ref is not None
                 else _clone_tree(mtp_history_snapshot)
             )
+            kept_boundary_logits = _valid_boundary_logits(normalized_boundaries)
             entry = SessionBankEntry(
                 token_ids=tokens,
                 token_hash=token_prefix_hash(tokens),
@@ -1656,11 +1673,17 @@ class SessionBank:
                     _tree_nbytes(logits)
                     + _tree_nbytes(hidden)
                     + _tree_nbytes(kept_mtp_history)
+                    + (
+                        _tree_nbytes(kept_boundary_logits[1])
+                        if kept_boundary_logits is not None
+                        else 0
+                    )
                     + sum(
                         _snapshot_nbytes(r[1]) + _tree_nbytes(r[2])
                         for r in normalized_boundaries
                     )
                 ),
+                boundary_logits=kept_boundary_logits,
                 session_id=session_id,
                 template_hash=template_hash,
                 mtp_history_policy=mtp_history_policy,
@@ -1795,11 +1818,18 @@ class SessionBank:
         trunk_snapshot_done = time.perf_counter()
         if timing_out is not None:
             timing_out["trunk_snapshot_s"] = trunk_snapshot_done - trunk_snapshot_started
+        kept_boundary_logits = _valid_boundary_logits(normalized_boundaries)
+        boundary_logits_nbytes = (
+            _tree_nbytes(kept_boundary_logits[1])
+            if kept_boundary_logits is not None
+            else 0
+        )
         computed_nbytes = (
             _snapshot_nbytes(snapshot)
             + _tree_nbytes(logits)
             + _tree_nbytes(hidden)
             + _tree_nbytes(mtp_history_snapshot)
+            + boundary_logits_nbytes
             + sum(
                 _snapshot_nbytes(r[1]) + _tree_nbytes(r[2])
                 for r in normalized_boundaries
@@ -1833,6 +1863,11 @@ class SessionBank:
             # the unchanged checks below handle it.
             if shed and shed_nbytes <= shed_budget:
                 normalized_boundaries, entry_nbytes = kept, shed_nbytes
+                if kept_boundary_logits is not None and not any(
+                    int(r[0]) == kept_boundary_logits[0] for r in normalized_boundaries
+                ):
+                    kept_boundary_logits = None
+                    entry_nbytes = max(0, int(entry_nbytes) - boundary_logits_nbytes)
                 self.boundary_shed_puts += 1
                 self.boundary_shed_records += shed
                 self.eviction_log.append(
@@ -1898,6 +1933,7 @@ class SessionBank:
             has_recurrent=cache_has_recurrent,
             restore_floor_tokens=cache_restore_floor,
             window_nbytes=cache_window_nbytes,
+            boundary_logits=kept_boundary_logits,
             gdn_boundaries=list(normalized_boundaries),
             gdn_boundary_loader=(
                 inherited_loader if not normalized_boundaries else None
@@ -4170,6 +4206,7 @@ class SessionBank:
         for entry in stale:
             if (
                 newest.live_ref_only
+                and newest.boundary_logits is None
                 and entry.cache_ref is newest.cache_ref
                 and entry.logits is not None
                 and newest.token_ids[: entry.prefix_len] == entry.token_ids

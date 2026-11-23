@@ -30201,7 +30201,39 @@ def _generation_final_bank_values(
     )
     if boundaries:
         values["gdn_boundaries"] = boundaries
+    boundary_logits = _generation_final_prompt_boundary_logits(
+        final_state, prompt_ids=prompt_ids, final_token_ids=values["token_ids"]
+    )
+    if boundary_logits is not None:
+        values["boundary_logits"] = boundary_logits
     return values
+
+
+def _generation_final_prompt_boundary_logits(
+    final_state: Any,
+    *,
+    prompt_ids: Sequence[int],
+    final_token_ids: Sequence[int],
+) -> tuple[int, Any] | None:
+    """Prompt-end logits carried into the generation-final entry.
+
+    Clone-restored turns with zero suffix tokens skip the prompt-prefix bank
+    commit before decode, so the generation-final entry has no superseded
+    prompt lease to inherit prompt-end logits from. Carrying the prompt
+    boundary logits here keeps a subsequent repeat of the same prompt on the
+    boundary-restore path without declining for missing boundary logits.
+    """
+
+    prompt_logits = getattr(final_state, "prompt_boundary_logits", None)
+    prompt_len = len(prompt_ids)
+    if prompt_logits is None or prompt_len <= 0 or len(final_token_ids) <= prompt_len:
+        return None
+    if any(
+        int(prompt_token) != int(final_token)
+        for prompt_token, final_token in zip(prompt_ids, final_token_ids)
+    ):
+        return None
+    return (prompt_len, prompt_logits)
 
 
 def _generation_final_prompt_boundaries(
@@ -30499,6 +30531,10 @@ def _store_generation_final_history_snapshot(
             **bank_values,
             **bank_metadata,
         )
+        if "boundary_logits" in put_kwargs and not _callable_accepts_keyword(
+            bank.put, "boundary_logits"
+        ):
+            put_kwargs.pop("boundary_logits", None)
         # The bank's own per-phase receipt (trunk snapshot, entry build,
         # cold-tier dispatch, settle dispatch); test doubles without the
         # keyword keep their exact contract.
@@ -34507,6 +34543,10 @@ def _run_generation(
                 final_state,
                 token_count=len(bank_token_ids),
             )
+            if "boundary_logits" in bank_values and not _callable_accepts_keyword(
+                session_bank.put, "boundary_logits"
+            ):
+                bank_values.pop("boundary_logits", None)
             final_entry = session_bank.put(
                 runtime=state.runtime,
                 token_ids=bank_token_ids,
