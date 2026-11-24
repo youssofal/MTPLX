@@ -234,8 +234,8 @@ def generate(
         indexes=SessionPromptIndexes.for_runtime(rt) if session_id else None,
     )
     accepted = drafted = rounds = rejects = 0
-    device_proposal_rounds = 0
-    draft_s = verify_s = 0.0
+    device_proposal_rounds = fused_rounds = 0
+    draft_s = verify_s = verify_forward_s = 0.0
     first_logprobs = None
 
     tape = RouteTape()
@@ -305,10 +305,19 @@ def generate(
                 "fallback_deltas": {"prompt_copy_decline": declines} if declines else {},
                 # Host seconds. Verify includes the existing logits synchronization.
                 # Commit ends on return from the existing cache update and draft observation.
-                "timing_s": {"proposal": proposal_s, "verify_forward": verify_submitted - verify_started,
-                             "verify_logits_eval": scores_ready - verify_submitted,
-                             "target_draw_accept": commit_start - scores_ready,
-                             "commit": committed - commit_start},
+                "timing_s": (
+                    {"proposal": proposal_s, "verify_forward": round_verify_forward_s,
+                     "verify_logits_eval": round_eval_s,
+                     "target_draw_accept": max(0.0, commit_start - eval_done),
+                     "commit": committed - commit_start}
+                    if served is not None
+                    else {"proposal": proposal_s,
+                          "verify_forward": (verify_forward_done - verify_started) if verify_sync
+                                            else (verify_submitted - verify_started),
+                          "verify_logits_eval": scores_ready - verify_submitted,
+                          "target_draw_accept": commit_start - scores_ready,
+                          "commit": committed - commit_start}
+                ),
             })
 
     def draw(row):
@@ -434,13 +443,17 @@ def generate(
             block = [anchor, *copied]
             proposed = mx.array(copied, mx.int32)
         drafted += len(block) - 1
-        proposal_s = perf_counter() - round_started
-        draft_s += proposal_s
-        verify_started = perf_counter()
+        t_after_propose = perf_counter()
+        verify_started = t_after_propose
+        verify_forward_done = t_after_propose
+        verify_sync = False
         if served is not None:
             rows, features, tapes = served.rows, served.features, served.pending
         else:
+            proposal_s = max(0.0, t_after_propose - round_started)
             rows, features, tapes = rt.verify(block, cache)
+            verify_forward_done = perf_counter()
+            verify_sync = engine_site.last_route().get("route") in ("native", "recording", "verifying")
         verified_rows = rows
         decision = None
         width = len(block) if isinstance(block, list) else int(block.shape[0])
@@ -475,6 +488,30 @@ def generate(
             guesses = block.tolist()[1:] if copied is None else copied
         else:
             guesses = decision.tokens[: decision.accepted]
+        eval_done = perf_counter()
+        if served is not None:
+            # A fused round_program executes draft, verify forward, and decision in one command
+            # buffer (or lazily through read_packet). Split its wall span with load-calibrated
+            # stage shares so Speed Truth and Verify Waterfall stay accurate without per-round syncs.
+            fused_s = max(0.0, eval_done - round_started)
+            d_share = getattr(served, "draft_share", None)
+            vf_share = getattr(served, "verify_forward_share", None)
+            if d_share is None or vf_share is None:
+                d_share, vf_share = round_program.stage_shares(
+                    rt, width - 1, committed=bool(getattr(served, "committed", False)),
+                )
+            else:
+                d_share, vf_share = round_program._clamp_stage_shares(d_share, vf_share)
+            proposal_s = fused_s * d_share
+            round_verify_forward_s = fused_s * vf_share
+            round_eval_s = max(0.0, fused_s - proposal_s - round_verify_forward_s)
+        else:
+            round_verify_forward_s = (
+                max(0.0, verify_forward_done - verify_started)
+                if verify_sync
+                else max(0.0, eval_done - verify_started)
+            )
+            round_eval_s = max(0.0, eval_done - verify_forward_done) if verify_sync else 0.0
         rounds += 1
         emitted, kept = [], 1
         pending = False
@@ -558,7 +595,14 @@ def generate(
             else:
                 depth_control.observe(0, 0, emitted)  # copy rounds only move the channel
         stream(emitted)
-        verify_s += perf_counter() - verify_started
+        round_end = perf_counter()
+        draft_s += proposal_s
+        verify_forward_s += round_verify_forward_s
+        if served is not None:
+            verify_s += max(0.0, (eval_done - round_started) - proposal_s) + max(0.0, round_end - eval_done)
+            fused_rounds += 1
+        else:
+            verify_s += max(0.0, round_end - verify_started)
     if repetition is not None:
         repetition.stream(tokens, flush=True)
     control_stats = repetition.stats() if repetition is not None else {}
@@ -606,6 +650,7 @@ def generate(
         rejected_drafts=rejects,
         draft_time_s=draft_s,
         verify_time_s=verify_s,
+        verify_forward_time_s=verify_forward_s,
         verify_calls=rounds,
         speculative_depth=depth if depth is not None else 0,
         prompt_eval_time_s=prompt.prompt_eval_time_s,
@@ -645,8 +690,8 @@ def generate(
                              "client_controls": list(controls.names) if controls is not None else [],
                              "proposals": "sampled" if device_ok and draft_temperature > 0 else "argmax",
                              "draft_temperature": draft_temperature if device_ok else None},
-            "draft_clock": "host_submission",
-            "verify_clock": "includes_pending_draft",
+            "draft_clock": "calibrated_fused_split" if fused_rounds else "host_submission",
+            "verify_clock": "calibrated_fused_split" if fused_rounds else "includes_pending_draft",
         },
         constraint_active=constraint is not None,
         constraint_completed=getattr(constraint, "completed", None),

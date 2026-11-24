@@ -60,7 +60,14 @@ struct LiveTab: View {
                     DecodeChart()
                     VerifyWaterfallExpander()
                 }
-                .padding(20)
+                .padding(.top, 20)
+                .padding(.horizontal, 20)
+                .padding(
+                    .bottom,
+                    DashboardLayout.scrollBottomPadding(
+                        daemonRunning: backend.daemonState.kind == .running
+                    )
+                )
                 .frame(width: geo.size.width, alignment: .topLeading)
             }
             .scrollIndicators(.hidden)
@@ -73,8 +80,9 @@ struct LiveTab: View {
     @ViewBuilder
     private func heroSection(availableWidth: CGFloat) -> some View {
         let mode = currentMode()
-        let rolling = backend.rolling
-        let stickyMax = rolling?.stickyAllTimeMax ?? 0
+        let hasRealRequest = backend.observedCompletionCount > 0
+        let decodeSummary = DecodeChartSummary(rolling: hasRealRequest ? backend.rolling : nil)
+        let stickyMax = decodeSummary.allTimeMax
         // Shrink the hero gauge on narrow windows so it never clips the
         // ring; the canonical 280pt hero holds on normal/wide layouts.
         let diameter = min(280, max(150, availableWidth - 16))
@@ -141,22 +149,39 @@ struct LiveTab: View {
                     .multilineTextAlignment(.center)
                 }
             }
-        } else {
+        } else if case .tps = mode {
             // Same warm-up gate as `currentMode()` — don't show the
             // ALL-TIME MAX badge until a real user request has landed,
             // or the first thing the user sees is a misleading "30.9 TPS
             // max" from the model's warm-up snapshot.
             let hasRealRequest = backend.observedCompletionCount > 0
-            let rolling = backend.rolling
-            if hasRealRequest, let max = rolling?.stickyAllTimeMax, max > 0 {
-                HStack(spacing: 6) {
-                    Image(systemName: "bolt.fill")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(Brand.warning)
-                    Text(tr("ALL-TIME MAX %@ TPS", Format.tps(max)))
-                        .font(.system(size: 11, weight: .heavy, design: .monospaced))
-                        .tracking(2)
-                        .chromeText()
+            let isLiveDecode = backend.headlineDecode.isLive
+                && backend.inFlight.contains { $0.hasDecodeProgress }
+            let heroInfo = HeroDecodeCaption(
+                headlineDecode: backend.headlineDecode,
+                isLiveDecode: isLiveDecode,
+                hasRealRequest: hasRealRequest,
+                rolling: backend.rolling
+            )
+            VStack(spacing: 6) {
+                if let statusSubtitle = heroInfo.statusSubtitle {
+                    Text(statusSubtitle)
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .tracking(0.8)
+                        .foregroundStyle(Brand.textHighlight.opacity(0.68))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.85)
+                }
+                if let max = heroInfo.allTimeMax {
+                    HStack(spacing: 6) {
+                        Image(systemName: "bolt.fill")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(Brand.warning)
+                        Text(tr("ALL-TIME MAX %@ TPS", Format.tps(max)))
+                            .font(.system(size: 11, weight: .heavy, design: .monospaced))
+                            .tracking(2)
+                            .chromeText()
+                    }
                 }
             }
         }

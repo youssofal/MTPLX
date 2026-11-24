@@ -3,81 +3,46 @@ import MTPLXAppCore
 
 // MARK: - FanModeToggle
 //
-// Segmented Default | Smart | Max control wired to `backend.currentFanMode` +
-// `backend.setFanMode(_:)`. Hidden only when the daemon is not running.
-//
-// Loading spinner shows during the async POST.
+// Single authoritative segmented Default | Smart | Max control. Works
+// consistently whether the daemon is stopped (persists immediately for the
+// next launch) or running (applies live through `/v1/mtplx/thermal/fan_mode`
+// and persists). Reserves a fixed-width spinner slot so applying a live
+// change never shifts the picker or triggers a parent reflow.
 
 struct FanModeToggle: View {
-    @EnvironmentObject private var backend: MTPLXBackendStore
-
-    @State private var pending: Bool = false
+    let activeMode: MTPLXFanMode
+    let pending: Bool
+    let onSelect: (MTPLXFanMode) -> Void
 
     var body: some View {
-        if !shouldShow {
-            EmptyView()
-        } else {
-            HStack(spacing: 6) {
-                Image(systemName: "fan.fill")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(active == MTPLXFanMode.max.rawValue ? Brand.coolChrome : Brand.textHighlight.opacity(0.55))
-                ForEach(MTPLXFanMode.allCases, id: \.self) { mode in
-                    segment(mode.title.uppercased(), value: mode.rawValue)
-                }
+        HStack(spacing: 8) {
+            // Fixed-size slot so toggling `pending` never shifts the
+            // segmented control horizontally.
+            ZStack {
                 if pending {
-                    ProgressView().controlSize(.mini)
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.72)
                 }
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(
-                Capsule(style: .continuous)
-                    .stroke(Brand.separator, lineWidth: 0.75)
-            )
-            .help(tr("Default uses Apple's fan curve, Smart boosts during generation, Max pins verified max."))
-        }
-    }
+            .frame(width: 14, height: 14)
 
-    /// Feature gate: must have a running daemon because live fan-mode changes
-    /// are applied through the daemon endpoint.
-    private var shouldShow: Bool {
-        switch backend.daemonState.kind {
-        case .running, .stopping, .warming: return true
-        default: return false
+            Picker(tr("Fan Mode"), selection: Binding(
+                get: { activeMode },
+                set: { next in
+                    guard next != activeMode, !pending else { return }
+                    onSelect(next)
+                }
+            )) {
+                ForEach(MTPLXFanMode.allCases, id: \.self) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fixedSize()
+            .disabled(pending)
         }
-    }
-
-    private var active: String {
-        MTPLXFanMode.normalized(backend.currentFanMode ?? backend.configuration.fanMode).rawValue
-    }
-
-    @ViewBuilder
-    private func segment(_ label: String, value: String) -> some View {
-        Button {
-            apply(value)
-        } label: {
-            Text(label)
-                .font(.system(size: 10, weight: .heavy, design: .monospaced))
-                .tracking(1)
-                .foregroundStyle(active == value ? Brand.bgOuter : Brand.textHighlight)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
-                .background(
-                    Capsule(style: .continuous)
-                        .fill(active == value ? AnyShapeStyle(Brand.chromeFill) : AnyShapeStyle(Color.clear))
-                )
-        }
-        .buttonStyle(.plain)
-        .disabled(pending)
-    }
-
-    private func apply(_ mode: String) {
-        let canonical = MTPLXFanMode.normalized(mode).rawValue
-        guard canonical != active, !pending else { return }
-        pending = true
-        Task {
-            defer { Task { @MainActor in pending = false } }
-            try? await backend.setFanMode(canonical)
-        }
+        .help(tr("Default uses Apple's fan curve, Smart boosts during generation, Max pins verified max."))
     }
 }

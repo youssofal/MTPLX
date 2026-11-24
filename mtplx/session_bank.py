@@ -436,17 +436,39 @@ def _live_cache_nbytes(cache: list[Any] | None) -> int:
     included, which is what a live-reference lease pins (a paged KV reserves
     ``prompt + 16384`` tokens). Every real cache class implements it (mlx-lm's
     and MTPLX's paged and tensor-offset ones), and none of them materialize
-    arrays to answer, unlike ``state`` on the paged classes. An object without
-    the property, or mlx-lm's base class saying a subclass never implemented
-    it, reports 0 and the caller falls back to the refused snapshot's size.
+    arrays to answer, unlike ``state`` on the paged classes. For custom cache
+    objects that hold MLX arrays without exposing ``nbytes``, falls back to
+    summing non-materializing tensor attributes (never ``state``). An opaque
+    object reports 0 and the caller falls back to the refused snapshot's size.
     """
 
     total = 0
     for item in cache or ():
+        item_nbytes = 0
         try:
-            total += int(getattr(item, "nbytes", 0) or 0)
+            item_nbytes = int(getattr(item, "nbytes", 0) or 0)
         except NotImplementedError:
+            item_nbytes = 0
+        if item_nbytes > 0:
+            total += item_nbytes
             continue
+        for attr in (
+            "keys",
+            "values",
+            "key_cache",
+            "value_cache",
+            "cache",
+            "raw_keys",
+            "pooled",
+        ):
+            val = getattr(item, attr, None)
+            if val is not None:
+                item_nbytes += _tree_nbytes(val)
+        if item_nbytes == 0:
+            kv = getattr(item, "kv", None)
+            if kv is not None and kv is not item:
+                item_nbytes += _live_cache_nbytes([kv])
+        total += item_nbytes
     return total
 
 
@@ -940,6 +962,7 @@ class SessionBankEntry:
     created_at_s: float = field(default_factory=time.time)
     last_access_s: float = field(default_factory=time.time)
     hits: int = 0
+    _bank_counted_hits: int = field(default=0, repr=False, compare=False)
     nbytes: int = 0
     session_id: str | None = None
     template_hash: str | None = None
@@ -1266,6 +1289,12 @@ class SessionBank:
         # health snapshots only ever read the newest entries, so an unbounded
         # list is pure retention on long-running agent servers.
         self.eviction_log: deque[dict[str, Any]] = deque(maxlen=256)
+        # Cumulative prefix restore counters (RAM and SSD) and routine
+        # same-session lease handoffs, kept distinct from real evictions.
+        self.ram_hits: int = 0
+        self.ssd_hits: int = 0
+        self.lease_handoffs: int = 0
+        self._session_hits: dict[str, int] = {}
         self.active_pin_ttl_s = _active_session_pin_ttl_s()
         self._session_last_active: dict[str, float] = {}
         self.per_session_max_entries = _per_session_max_entries()
@@ -1353,6 +1382,88 @@ class SessionBank:
             for entry in list(self._entries.values())
             if entry.live_ref_only
         )
+
+    def _sync_entry_hits(self, entry: SessionBankEntry) -> None:
+        """Fold direct ``entry.hits += 1`` increments from near-prefix or
+        batched callers into the bank's cumulative hit counters once."""
+        current = int(getattr(entry, "hits", 0) or 0)
+        counted = int(getattr(entry, "_bank_counted_hits", 0) or 0)
+        delta = current - counted
+        if delta <= 0:
+            return
+        entry._bank_counted_hits = current
+        source = (
+            "ssd"
+            if bool(getattr(entry, "ssd_cache_hit", False))
+            or str(getattr(entry, "cache_source", "ram") or "ram") == "ssd"
+            else "ram"
+        )
+        if source == "ssd":
+            self.ssd_hits += delta
+        else:
+            self.ram_hits += delta
+        if entry.session_id:
+            sid = str(entry.session_id)
+            self._session_hits[sid] = int(self._session_hits.get(sid, 0)) + delta
+
+    def _record_entry_hit(
+        self, entry: SessionBankEntry, *, source: str = "ram"
+    ) -> None:
+        """Increment hit counters on ``entry`` and bank-wide cumulative totals."""
+        self._sync_entry_hits(entry)
+        entry.hits = int(getattr(entry, "hits", 0) or 0) + 1
+        entry._bank_counted_hits = int(entry.hits)
+        if source == "ssd":
+            self.ssd_hits += 1
+        else:
+            self.ram_hits += 1
+        if entry.session_id:
+            sid = str(entry.session_id)
+            self._session_hits[sid] = int(self._session_hits.get(sid, 0)) + 1
+
+    def mark_prefix_hit(
+        self, entry: SessionBankEntry, *, source: str = "ram"
+    ) -> None:
+        """Public helper for callers recording a restore hit on an entry."""
+        self._record_entry_hit(entry, source=source)
+
+    def _inherit_entry_hits(
+        self, target: SessionBankEntry, donor: SessionBankEntry
+    ) -> None:
+        """Carry hit counts from a replaced/superseded same-session entry onto
+        its successor without double-counting in cumulative bank totals."""
+        self._sync_entry_hits(donor)
+        self._sync_entry_hits(target)
+        donor_hits = int(getattr(donor, "hits", 0) or 0)
+        if donor_hits > 0:
+            target.hits = int(getattr(target, "hits", 0) or 0) + donor_hits
+            target._bank_counted_hits = (
+                int(getattr(target, "_bank_counted_hits", 0) or 0) + donor_hits
+            )
+
+    def _seed_entry_hits_on_insert(
+        self, tokens: tuple[int, ...], entry: SessionBankEntry
+    ) -> None:
+        """Preserve per-session hit continuity on same-key replacement or when
+        a session re-enters RAM after an unbanked one-copy SSD restore."""
+        prior = self._entries.get(tokens)
+        if prior is not None and prior is not entry and prior.session_id == entry.session_id:
+            self._inherit_entry_hits(entry, prior)
+            return
+        if entry.session_id:
+            sid = str(entry.session_id)
+            prior_session_hits = int(self._session_hits.get(sid, 0) or 0)
+            if prior_session_hits > int(getattr(entry, "hits", 0) or 0) and not any(
+                existing.session_id == sid for existing in self._entries.values()
+            ):
+                entry.hits = prior_session_hits
+                entry._bank_counted_hits = prior_session_hits
+
+    @property
+    def total_hits(self) -> int:
+        for entry in list(self._entries.values()):
+            self._sync_entry_hits(entry)
+        return int(self.ram_hits + self.ssd_hits)
 
     def effective_max_bytes(self) -> int:
         """The byte budget in force right now.
@@ -1731,6 +1842,7 @@ class SessionBank:
                         "fallback": "live_reference_lease",
                     }
                 )
+            self._seed_entry_hits_on_insert(tokens, entry)
             self._entries[tokens] = entry
             self._release_stale_session_leases(entry)
             self._supersede_contained_prefixes(tokens)
@@ -1944,6 +2056,7 @@ class SessionBank:
         if lazy_kv:
             self._schedule_snapshot_settle(entry, timing_out=timing_out)
         self._enqueue_cold_entry(entry, timing_out=timing_out)
+        self._seed_entry_hits_on_insert(tokens, entry)
         self._entries[tokens] = entry
         self._release_stale_session_leases(entry)
         self._supersede_contained_prefixes(tokens)
@@ -2030,6 +2143,7 @@ class SessionBank:
             ),
         )
         self._enqueue_cold_entry(entry)
+        self._seed_entry_hits_on_insert(tokens, entry)
         self._entries[tokens] = entry
         self._release_stale_session_leases(entry)
         self._supersede_contained_prefixes(tokens)
@@ -2569,6 +2683,19 @@ class SessionBank:
         if record is None or matched <= 0:
             return None
         metadata = dict(getattr(record, "metadata", {}) or {})
+        record_boundaries = list(getattr(record, "gdn_boundaries", None) or [])
+        record_nbytes = int(getattr(record, "nbytes", 0) or 0)
+        if record_nbytes <= 0:
+            record_nbytes = (
+                _snapshot_nbytes(record.cache_snapshot)
+                + _tree_nbytes(record.logits)
+                + _tree_nbytes(record.hidden)
+                + _tree_nbytes(record.mtp_history_snapshot)
+                + sum(
+                    _snapshot_nbytes(r[1]) + _tree_nbytes(r[2] if len(r) > 2 else None)
+                    for r in record_boundaries
+                )
+            )
         entry = SessionBankEntry(
             token_ids=as_token_tuple(record.token_ids),
             token_hash=metadata.get("token_hash") or token_prefix_hash(record.token_ids),
@@ -2576,7 +2703,7 @@ class SessionBank:
                 getattr(record, "has_recurrent", False)
                 or metadata.get("has_recurrent", False)
             ),
-            gdn_boundaries=list(getattr(record, "gdn_boundaries", None) or []),
+            gdn_boundaries=record_boundaries,
             gdn_boundary_loader=getattr(record, "gdn_boundary_loader", None),
             model_path=str(metadata.get("model_path") or model_path),
             mtp_enabled=bool(metadata.get("mtp_enabled", mtp_enabled)),
@@ -2584,7 +2711,7 @@ class SessionBank:
             cache_snapshot=record.cache_snapshot,
             logits=_clone_tree(record.logits),
             hidden=_clone_tree(record.hidden),
-            nbytes=int(getattr(record, "nbytes", 0) or 0),
+            nbytes=int(record_nbytes),
             session_id=metadata.get("session_id"),
             template_hash=metadata.get("template_hash"),
             mtp_history_policy=metadata.get("mtp_history_policy"),
@@ -2935,7 +3062,7 @@ class SessionBank:
         elif entry.live_ref_only and entry.mtp_snapshot_epoch is not None:
             self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
             return cold_fallback()
-        entry.hits += 1
+        self._record_entry_hit(entry, source="ram")
         if not getattr(self._maintenance, "depth", 0):
             entry.last_access_s = time.time()
         self.last_restore_source = "ram"
@@ -2956,7 +3083,12 @@ class SessionBank:
             cache=cache,
             logits=_clone_tree(entry.logits),
             hidden=_clone_tree(entry.hidden),
-            restored_nbytes=entry.nbytes,
+            restored_nbytes=int(
+                entry.nbytes
+                or entry.lease_pinned_nbytes
+                + entry.lease_aux_nbytes
+                or entry.oversized_nbytes
+            ),
             restore_mode=actual_restore_mode,
             mtp_history_snapshot=_clone_tree(entry.mtp_history_snapshot),
             mtp_history_cache=mtp_history_cache,
@@ -3307,6 +3439,13 @@ class SessionBank:
             self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
             return None
 
+        if (
+            bool(getattr(entry, "ssd_cache_hit", False))
+            or str(getattr(entry, "cache_source", "ram") or "ram") == "ssd"
+        ):
+            # SSD near-prefix candidates are ephemeral per-request entries that
+            # generation drops before suffix prefill, so record their hit here.
+            self._record_entry_hit(entry, source="ssd")
         if served_out is not None:
             served_out["restore_point"] = int(restore_point)
             served_out["boundary_used"] = boundary_snapshot is not None
@@ -3326,8 +3465,10 @@ class SessionBank:
         if session_id is None:
             count = len(self._entries)
             for entry in list(self._entries.values()):
+                self._sync_entry_hits(entry)
                 entry.release_live_refs()
             self._entries.clear()
+            self._session_hits.clear()
             return count
         victims = [
             tokens
@@ -3337,7 +3478,9 @@ class SessionBank:
         for tokens in victims:
             entry = self._entries.pop(tokens, None)
             if entry is not None:
+                self._sync_entry_hits(entry)
                 entry.release_live_refs()
+        self._session_hits.pop(str(session_id), None)
         return len(victims)
 
     def archive_cold_tier(self) -> dict[str, Any]:
@@ -3357,6 +3500,9 @@ class SessionBank:
         return bool(flush(timeout_s=timeout_s))
 
     def to_dict(self) -> dict[str, Any]:
+        entries = list(self._entries.values())
+        for entry in entries:
+            self._sync_entry_hits(entry)
         return {
             "max_entries": self.max_entries,
             "max_bytes": self.max_bytes,
@@ -3376,8 +3522,14 @@ class SessionBank:
             "boundary_shed_records": int(self.boundary_shed_records),
             "per_session_max_bytes": self.per_session_max_bytes,
             "idle_ttl_s": self.idle_ttl_s,
-            "entries": len(self._entries),
+            "entries": len(entries),
             "total_nbytes": self.total_nbytes,
+            "held_nbytes": self.total_nbytes,
+            "hits": int(self.ram_hits + self.ssd_hits),
+            "cumulative_hits": int(self.ram_hits + self.ssd_hits),
+            "ram_hits": int(self.ram_hits),
+            "ssd_hits": int(self.ssd_hits),
+            "lease_handoffs": int(self.lease_handoffs),
             # #456: leases were invisible here ("entries: 4, total_nbytes: 0"
             # was the only outside sign of a pinned paged KV per turn).
             "lease_entries": self.lease_entries,
@@ -3412,9 +3564,13 @@ class SessionBank:
                     "mtp_history_policy": entry.mtp_history_policy,
                     "draft_head_identity": entry.draft_head_identity,
                     "policy_fingerprint": entry.policy_fingerprint,
-                    "hits": entry.hits,
-                    "nbytes": entry.nbytes,
-                    "held_nbytes": entry.held_nbytes,
+                    "hits": int(entry.hits),
+                    "cumulative_hits": int(entry.hits),
+                    "nbytes": int(
+                        entry.held_nbytes if entry.live_ref_only else entry.nbytes
+                    ),
+                    "snapshot_nbytes": int(entry.nbytes),
+                    "held_nbytes": int(entry.held_nbytes),
                     "created_at_s": entry.created_at_s,
                     "last_access_s": entry.last_access_s,
                     "has_live_ref": entry.cache_ref is not None,
@@ -3429,9 +3585,7 @@ class SessionBank:
                         for record in (getattr(entry, "gdn_boundaries", None) or [])
                     ],
                 }
-                for entry in sorted(
-                    list(self._entries.values()), key=lambda item: item.prefix_len
-                )
+                for entry in sorted(entries, key=lambda item: item.prefix_len)
             ],
             "eviction_log": list(self.eviction_log)[-16:],
         }
@@ -3940,6 +4094,19 @@ class SessionBank:
             self.last_miss_reason = "ssd_missing_mtp_history"
             return None
         metadata = dict(getattr(record, "metadata", {}) or {})
+        record_boundaries = list(getattr(record, "gdn_boundaries", None) or [])
+        record_nbytes = int(getattr(record, "nbytes", 0) or 0)
+        if record_nbytes <= 0:
+            record_nbytes = (
+                _snapshot_nbytes(record.cache_snapshot)
+                + _tree_nbytes(record.logits)
+                + _tree_nbytes(record.hidden)
+                + _tree_nbytes(record.mtp_history_snapshot)
+                + sum(
+                    _snapshot_nbytes(r[1]) + _tree_nbytes(r[2] if len(r) > 2 else None)
+                    for r in record_boundaries
+                )
+            )
         entry = SessionBankEntry(
             token_ids=as_token_tuple(record.token_ids),
             token_hash=metadata.get("token_hash") or token_prefix_hash(record.token_ids),
@@ -3947,7 +4114,7 @@ class SessionBank:
                 getattr(record, "has_recurrent", False)
                 or metadata.get("has_recurrent", False)
             ),
-            gdn_boundaries=list(getattr(record, "gdn_boundaries", None) or []),
+            gdn_boundaries=record_boundaries,
             gdn_boundary_loader=getattr(record, "gdn_boundary_loader", None),
             model_path=str(metadata.get("model_path") or runtime.model_path),
             mtp_enabled=bool(metadata.get("mtp_enabled", runtime.mtp_enabled)),
@@ -3955,7 +4122,7 @@ class SessionBank:
             cache_snapshot=record.cache_snapshot,
             logits=_clone_tree(record.logits),
             hidden=_clone_tree(record.hidden),
-            nbytes=int(getattr(record, "nbytes", 0) or 0),
+            nbytes=int(record_nbytes),
             session_id=session_id or metadata.get("session_id"),
             template_hash=metadata.get("template_hash"),
             mtp_history_policy=metadata.get("mtp_history_policy"),
@@ -4022,7 +4189,7 @@ class SessionBank:
             restore_cache(
                 mtp_history_cache, entry.mtp_history_snapshot, clone_states=not one_copy
             )
-        entry.hits += 1
+        self._record_entry_hit(entry, source="ssd")
         entry.last_access_s = time.time()
         if one_copy:
             if len(as_token_tuple(token_ids)) <= entry.prefix_len:
@@ -4033,6 +4200,7 @@ class SessionBank:
             # cache this turn is not using (#456).
             self._release_stale_session_leases(entry)
         else:
+            self._seed_entry_hits_on_insert(entry.token_ids, entry)
             self._entries[entry.token_ids] = entry
             # The session is being served from disk into a fresh cache: any
             # lease it still holds pins a cache this turn is not using (#456).
@@ -4203,6 +4371,7 @@ class SessionBank:
             and entry.live_ref_only
             and entry.session_id == session_id
         ]
+        newest_is_resident = self._entries.get(newest.token_ids) is newest
         for entry in stale:
             if (
                 newest.live_ref_only
@@ -4214,7 +4383,41 @@ class SessionBank:
             ):
                 newest.boundary_logits = (entry.prefix_len, entry.logits)
                 newest.lease_aux_nbytes += _tree_nbytes(entry.logits)
-            self._evict_entry(entry, reason="superseded_session_lease")
+            if newest_is_resident:
+                self._inherit_entry_hits(newest, entry)
+            else:
+                self._sync_entry_hits(entry)
+            # Routine same-session handoffs (a lease already consumed by this
+            # turn's restore, a prompt lease advancing to generation-final on
+            # the same live cache, or a prefix strictly extended by the next
+            # turn) are normal turn progression, not capacity/memory evictions.
+            # Keep them out of eviction_log and count them in lease_handoffs;
+            # abandoning an unconsumed distinct cache (prompt divergence or
+            # refused lease fallback) still records a real eviction.
+            is_routine_handoff = (
+                entry.cache_ref is None
+                or entry.cache_ref is newest.cache_ref
+                or (
+                    newest.prefix_len >= entry.prefix_len
+                    and newest.token_ids[: entry.prefix_len] == entry.token_ids
+                )
+            )
+            if is_routine_handoff:
+                self._retire_superseded_lease(entry)
+            else:
+                self._evict_entry(entry, reason="superseded_session_lease")
+
+    def _retire_superseded_lease(self, entry: SessionBankEntry) -> None:
+        """Retire a superseded same-session lease without logging a false eviction."""
+        entry.eviction_reason = "superseded_session_lease"
+        self._sync_entry_hits(entry)
+        if self._entries.pop(entry.token_ids, None) is None:
+            for key, value in list(self._entries.items()):
+                if value is entry:
+                    self._entries.pop(key, None)
+                    break
+        entry.release_live_refs()
+        self.lease_handoffs += 1
 
     def _supersede_contained_prefixes(self, tokens: tuple[int, ...]) -> None:
         """Evict RAM entries that are strict token-prefixes of a new entry.
@@ -4274,6 +4477,8 @@ class SessionBank:
                     for point in points
                 ):
                     continue
+            if entry.session_id == container.session_id:
+                self._inherit_entry_hits(container, entry)
             self._evict_entry(entry, reason="superseded_by_longer_prefix")
         self._enforce_session_entry_retention(
             container.session_id, protected_tokens=tokens
@@ -5544,6 +5749,7 @@ class SessionBank:
         entry; ``queued_persistence`` accounts for what those jobs hold."""
 
         entry.eviction_reason = reason
+        self._sync_entry_hits(entry)
         # Read before the references go: this is what the eviction gives back.
         held_nbytes = int(entry.held_nbytes)
         if self._entries.pop(entry.token_ids, None) is None:

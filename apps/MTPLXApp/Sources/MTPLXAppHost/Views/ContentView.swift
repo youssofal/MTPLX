@@ -430,6 +430,15 @@ struct DashboardSurface: View {
         router.primaryMode == .dashboard && backend.daemonState.kind == .running
     }
 
+    /// Tabs that reserve their own bottom scroll padding inside their
+    /// `ScrollView` so their backgrounds extend cleanly behind the pill.
+    private var tabManagesOwnBottomClearance: Bool {
+        switch router.selection {
+        case .live, .activity, .system: return true
+        case .forge, .settings: return false
+        }
+    }
+
     var body: some View {
         Group {
             switch router.selection {
@@ -442,8 +451,8 @@ struct DashboardSurface: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            if expandChatPillVisible {
-                Color.clear.frame(height: 52)
+            if expandChatPillVisible && !tabManagesOwnBottomClearance {
+                Color.clear.frame(height: DashboardLayout.expandChatBottomClearance)
             }
         }
     }

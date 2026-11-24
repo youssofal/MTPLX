@@ -70,12 +70,9 @@ extension MetricsLatest {
     var meanAcceptByDepth: [Double]? { doubleArray("mean_accept_probability_by_depth") }
 
     // --- verify-decomposition ---
-    var verifyTimeS: Double? { doubleValue("verify_time_s") }
-    var draftTimeS: Double? { doubleValue("draft_time_s") }
     var acceptTimeS: Double? { doubleValue("accept_time_s") }
     var repairTimeS: Double? { doubleValue("repair_time_s") }
     var targetForwardTimeS: Double? { doubleValue("target_forward_time_s") }
-    var verifyForwardTimeS: Double? { doubleValue("verify_forward_time_s") }
     var verifyEvalTimeS: Double? { doubleValue("verify_eval_time_s") }
     var verifyLogitsEvalTimeS: Double? { doubleValue("verify_logits_eval_time_s") }
     var verifyHiddenEvalTimeS: Double? { doubleValue("verify_hidden_eval_time_s") }

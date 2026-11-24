@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mtplx"
-version = "2.13.2"
+version = "2.13.3"
 description = "The fastest way to run Inkling 2 Mini and Qwen 3.8 on a Mac: native MTP speculative decoding on Apple Silicon, exact at any temperature."
 readme = "README.md"
 requires-python = ">=3.11"

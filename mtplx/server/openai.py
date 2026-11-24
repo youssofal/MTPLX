@@ -18012,6 +18012,14 @@ def _record_request_metrics(state: "ServerState", record: dict[str, Any]) -> Non
         outcomes = getattr(state.dashboard, "prefill_outcomes", None)
         if outcomes is not None:
             outcomes.pop(str(record["request_id"]))
+    if "resolved_reasoning_effort" not in record:
+        req_effort = record.get("request_reasoning_effort")
+        if isinstance(req_effort, str) and req_effort.strip():
+            record["resolved_reasoning_effort"] = req_effort.strip().lower()
+        elif record.get("request_enable_thinking") is True:
+            resolved_effort = _resolved_reasoning_effort_for_state(state)
+            if resolved_effort is not None:
+                record["resolved_reasoning_effort"] = resolved_effort
     safe = _json_safe(record)
     # Warmup generations (startup pass and the idle background ladder) are
     # not user requests: keep them out of the RAM ring that feeds the
@@ -20003,6 +20011,7 @@ DASHBOARD_READ_ONLY_SETTINGS_KEYS: tuple[str, ...] = (
     "preserve_thinking_effective",
     "reasoning_history_mode",
     "reasoning_policy",
+    "resolved_reasoning_effort",
     "restart_required_settings",
     "sampling_defaults",
     "support_level",
@@ -20833,8 +20842,12 @@ def _effective_ram_session_cache_settings(
     bank = getattr(getattr(state, "sessions", None), "bank", None)
     if bank is not None:
         entries = int(getattr(bank, "max_entries", entries))
-        max_bytes = f"{int(bank.max_bytes) / 2**30:.1f}G"
-        per_session_bytes = f"{int(bank.per_session_max_bytes) / 2**30:.1f}G"
+        bank_max_bytes = getattr(bank, "max_bytes", None)
+        if bank_max_bytes is not None:
+            max_bytes = f"{int(bank_max_bytes) / 2**30:.1f}G"
+        bank_per_session_bytes = getattr(bank, "per_session_max_bytes", None)
+        if bank_per_session_bytes is not None:
+            per_session_bytes = f"{int(bank_per_session_bytes) / 2**30:.1f}G"
     return {
         "ram_session_cache_policy": policy,
         "ram_session_block_prefix_restore": block_prefix_restore,
@@ -20997,6 +21010,7 @@ def _mtplx_current_settings(state: "ServerState") -> dict[str, Any]:
         "api_key_source": str(getattr(args, "api_key_source", "none") or "none"),
         "reasoning_parser": str(getattr(args, "reasoning_parser", "qwen3")),
         "reasoning_effort": str(getattr(args, "reasoning_effort", "auto") or "auto"),
+        "resolved_reasoning_effort": _resolved_reasoning_effort_for_state(state),
         "managed_client_controls": _managed_client_controls(state),
         "draft_temperature": (
             float(getattr(state.draft_sampler, "temperature"))
@@ -21257,6 +21271,165 @@ def _mtplx_scheduler_state(state: "ServerState") -> dict[str, Any]:
     }
 
 
+def _non_zero_session_nbytes(*candidates: Any) -> int:
+    """Return the first positive byte count from ``candidates``, else 0."""
+    for value in candidates:
+        try:
+            n = int(value or 0)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            return n
+    return 0
+
+
+def _session_bank_held_bytes_for_session(bank: Any, session_id: str | None) -> int:
+    """Active RAM bytes currently held in ``bank`` for ``session_id``."""
+    if bank is None or not session_id:
+        return 0
+    held_fn = getattr(bank, "held_by_session", None)
+    if callable(held_fn):
+        try:
+            total = sum(
+                int(row.get("held_bytes") or 0)
+                for row in (held_fn() or ())
+                if row.get("session_id") == session_id
+            )
+            if total > 0:
+                return total
+        except Exception:
+            pass
+    return 0
+
+
+def _enrich_sessions_bytes_from_bank(
+    sessions_dict: dict[str, Any], bank_dict: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Backfill zero-byte session rows and hits from active SessionBank prefixes."""
+    sessions = sessions_dict.get("sessions")
+    prefixes = bank_dict.get("prefixes") if isinstance(bank_dict, Mapping) else None
+    if not isinstance(sessions, list) or not isinstance(prefixes, list):
+        return sessions_dict
+    held_by_sid: dict[str, int] = {}
+    hits_by_sid: dict[str, int] = {}
+    for prefix in prefixes:
+        if not isinstance(prefix, Mapping):
+            continue
+        sid = prefix.get("session_id")
+        if not sid:
+            continue
+        sid_key = str(sid)
+        entry_bytes = _non_zero_session_nbytes(
+            prefix.get("held_nbytes"),
+            prefix.get("nbytes"),
+        )
+        if entry_bytes > 0:
+            held_by_sid[sid_key] = held_by_sid.get(sid_key, 0) + entry_bytes
+        entry_hits = max(
+            int(prefix.get("cumulative_hits") or 0),
+            int(prefix.get("hits") or 0),
+        )
+        if entry_hits > 0:
+            hits_by_sid[sid_key] = hits_by_sid.get(sid_key, 0) + entry_hits
+    if not held_by_sid and not hits_by_sid:
+        return sessions_dict
+    for row in sessions:
+        if not isinstance(row, dict):
+            continue
+        sid = row.get("session_id")
+        if not sid:
+            continue
+        sid_key = str(sid)
+        held = held_by_sid.get(sid_key, 0)
+        if held > 0:
+            if int(row.get("bytes") or 0) <= 0:
+                row["bytes"] = held
+            if int(row.get("held_nbytes") or 0) < held:
+                row["held_nbytes"] = held
+        hits = hits_by_sid.get(sid_key, 0)
+        if hits > 0:
+            if int(row.get("hits") or 0) < hits:
+                row["hits"] = hits
+            if int(row.get("cumulative_hits") or 0) < hits:
+                row["cumulative_hits"] = hits
+    return sessions_dict
+
+
+def _resolved_reasoning_effort_for_state(state: "ServerState") -> str | None:
+    """Effective default reasoning effort currently served by ``state``."""
+    args = getattr(state, "args", None)
+    if not bool(getattr(args, "enable_thinking", True)):
+        return None
+    try:
+        return _reasoning_effort_for_state(
+            state,
+            thinking_enabled=True,
+            request_effort=None,
+            allow_client_controls=False,
+        )
+    except Exception:
+        raw = getattr(args, "reasoning_effort", None)
+        if isinstance(raw, str) and raw.strip() and raw.strip().lower() != "auto":
+            return raw.strip().lower()
+        return None
+
+
+def _snapshot_profile_payload(state: "ServerState") -> dict[str, Any]:
+    """Build the live profile block for ``/v1/mtplx/snapshot``.
+
+    ``state.profile`` holds the static launch preset defaults (which point at
+    the default Qwen model and temp 0.6). Override model identity, family,
+    live default sampler values, and resolved reasoning effort with what the
+    loaded server actually serves.
+    """
+    profile_obj = getattr(state, "profile", None)
+    if hasattr(profile_obj, "to_dict"):
+        payload = dict(profile_obj.to_dict())
+    else:
+        payload = {"name": getattr(profile_obj, "name", "unknown")}
+
+    args = getattr(state, "args", None)
+    backend = _backend_descriptor(state)
+    model_id = str(getattr(state, "model_id", None) or getattr(args, "model", "") or "")
+    profile_default_model_id = payload.get("model_id")
+    if model_id and profile_default_model_id != model_id:
+        if profile_default_model_id is not None:
+            payload["profile_default_model_id"] = profile_default_model_id
+        payload["model_id"] = model_id
+
+    model_ref = str(getattr(args, "model", None) or model_id or "")
+    stripped_ref = model_ref.rstrip("/\\")
+    if stripped_ref and ("/" in stripped_ref or "\\" in stripped_ref):
+        model_name = Path(stripped_ref).name
+    else:
+        model_name = stripped_ref or getattr(backend, "display_name", None) or model_id
+    payload["model_name"] = model_name
+    payload["model_family"] = _model_family_for_state(state)
+
+    def _opt_float(attr: str, default: float) -> float:
+        val = getattr(args, attr, None)
+        return default if val is None else float(val)
+
+    def _opt_int(attr: str, default: int) -> int:
+        val = getattr(args, attr, None)
+        return default if val is None else int(val)
+
+    active_sampler = {
+        "temperature": _opt_float("temperature", 0.6),
+        "top_p": _opt_float("top_p", 0.95),
+        "top_k": _opt_int("top_k", 20),
+        "presence_penalty": _opt_float("default_presence_penalty", 0.0),
+    }
+    profile_default_sampler = payload.get("sampler")
+    if profile_default_sampler != active_sampler:
+        if profile_default_sampler is not None:
+            payload["profile_default_sampler"] = profile_default_sampler
+        payload["sampler"] = active_sampler
+
+    payload["resolved_reasoning_effort"] = _resolved_reasoning_effort_for_state(state)
+    return payload
+
+
 def _mtplx_dashboard_snapshot(
     state: "ServerState", *, rows: bool = True
 ) -> dict[str, Any]:
@@ -21275,6 +21448,7 @@ def _mtplx_dashboard_snapshot(
     try:
         sessions_dict = state.sessions.list_sessions()
         bank_dict = sessions_dict.get("session_bank") or {}
+        sessions_dict = _enrich_sessions_bytes_from_bank(sessions_dict, bank_dict)
     except Exception as exc:
         sessions_dict = {
             "sessions": [],
@@ -21284,15 +21458,15 @@ def _mtplx_dashboard_snapshot(
         }
         bank_dict = {}
     retrieval = getattr(state, "retrieval", None)
+    resolved_effort = _resolved_reasoning_effort_for_state(state)
     snapshot = {
         "ts": time.time(),
         "model_id": state.model_id,
         # Always present, so a client can tell "no retrieval configured" apart
         # from "this build has no retrieval support".
         "retrieval": retrieval.status() if retrieval is not None else {"enabled": False, "models": []},
-        "profile": state.profile.to_dict()
-        if hasattr(state.profile, "to_dict")
-        else {"name": getattr(state.profile, "name", "unknown")},
+        "profile": _snapshot_profile_payload(state),
+        "resolved_reasoning_effort": resolved_effort,
         "context_window": state.context_window,
         "active_requests": state.dashboard.in_flight.count(),
         "in_flight": dashboard.in_flight.snapshot(),
@@ -27700,6 +27874,7 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "request_enable_thinking_override",
     "request_reasoning_mode",
     "request_reasoning_parser",
+    "resolved_reasoning_effort",
     "request_temperature",
     "request_top_p",
     "request_top_k",
@@ -27754,6 +27929,10 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "cache_memory_bytes",
     "reasoning_reentries",
     "reasoning_tokens",
+    "reasoning_s",
+    "first_visible_s",
+    "first_visible_kind",
+    "first_answer_s",
     "answer_tokens",
     # Stamped only when finish=length cut the turn inside reasoning and left
     # content empty (#F3), so quiet envelopes stay byte-stable.
@@ -28035,6 +28214,10 @@ def _merge_final_bridge_stats_into_latest_metrics(
         "read_only_force_answer_visible_tokens",
         "session_prompt_prefix_commit",
         "session_postcommit_snapshot",
+        "first_visible_s",
+        "first_visible_kind",
+        "first_answer_s",
+        "resolved_reasoning_effort",
         "finish_reason",
     ):
         if key in stats:
@@ -29287,7 +29470,11 @@ def _store_retokenized_history_snapshot(
                     commit = session.commit_retokenized_prefix(
                         token_ids=history_bank_ids,
                         expected_revision=expected_session_revision,
-                        nbytes=0,
+                        nbytes=_non_zero_session_nbytes(
+                            estimated_nbytes,
+                            best_prefix_nbytes,
+                            getattr(session, "bytes_estimate", 0),
+                        ),
                     )
                     outcome["session_commit"] = {
                         "committed": bool(commit.committed),
@@ -29487,7 +29674,12 @@ def _store_retokenized_history_snapshot(
             commit = session.commit_retokenized_prefix(
                 token_ids=history_bank_ids,
                 expected_revision=expected_session_revision,
-                nbytes=int(entry.nbytes),
+                nbytes=_non_zero_session_nbytes(
+                    getattr(entry, "held_nbytes", 0),
+                    getattr(entry, "nbytes", 0),
+                    oversized_nbytes_override,
+                    getattr(session, "bytes_estimate", 0),
+                ),
             )
             session_commit = {
                 "committed": bool(commit.committed),
@@ -29505,6 +29697,7 @@ def _store_retokenized_history_snapshot(
         "mode": "retokenized_history",
         "prefix_len": entry.prefix_len,
         "nbytes": entry.nbytes,
+        "held_nbytes": int(getattr(entry, "held_nbytes", 0) or entry.nbytes),
         "elapsed_s": time.perf_counter() - started,
         "token_hash": entry.token_hash,
         # Observability for the prefix-reuse shortcut: lets operators tell
@@ -30575,6 +30768,7 @@ def _store_generation_final_history_snapshot(
         ),
         "prefix_len": entry.prefix_len,
         "nbytes": entry.nbytes,
+        "held_nbytes": int(getattr(entry, "held_nbytes", 0) or entry.nbytes),
         "elapsed_s": time.perf_counter() - started,
         "history_suffix_tokens": (
             0
@@ -30675,21 +30869,36 @@ class _StreamVisibility:
     answer text or tool call, the end of the wait a user watches the model
     think through (12 Nov: Pi at xhigh had its first token at a median 0.74 s
     and its first answer or tool call at a median 5.5 s, 34.6 s at 88K; the
-    request log said only the first). None when the stream sent none.
+    request log said only the first). ``first_visible_kind`` distinguishes
+    ``"text"`` from ``"tool_call"`` (or ``None`` when neither was emitted),
+    and ``first_answer_s`` records the first user-visible text delta only.
     """
 
-    __slots__ = ("origin_s", "last_reasoning_s", "first_visible_s")
+    __slots__ = (
+        "origin_s",
+        "last_reasoning_s",
+        "first_visible_s",
+        "first_visible_kind",
+        "first_answer_s",
+    )
 
     def __init__(self, origin_s: float) -> None:
         self.origin_s = float(origin_s)
         self.last_reasoning_s: float | None = None
         self.first_visible_s: float | None = None
+        self.first_visible_kind: str | None = None
+        self.first_answer_s: float | None = None
 
     def saw(self, channel: str | None, sent_s: float) -> None:
         if channel == "reasoning":
             self.last_reasoning_s = sent_s
-        elif channel is not None and self.first_visible_s is None:
-            self.first_visible_s = sent_s
+        elif channel is not None:
+            kind = "text" if channel == "answer" else channel
+            if self.first_visible_s is None:
+                self.first_visible_s = sent_s
+                self.first_visible_kind = kind
+            if channel == "answer" and self.first_answer_s is None:
+                self.first_answer_s = sent_s
 
     def fields(self, reasoning_tokens: Any) -> dict[str, Any]:
         def since_arrival(sent_s: float | None) -> float | None:
@@ -30701,6 +30910,8 @@ class _StreamVisibility:
             ),
             "reasoning_s": since_arrival(self.last_reasoning_s),
             "first_visible_s": since_arrival(self.first_visible_s),
+            "first_visible_kind": self.first_visible_kind,
+            "first_answer_s": since_arrival(self.first_answer_s),
         }
 
 
@@ -32441,7 +32652,11 @@ def _build_mtp_batch_session_hooks(
                     or not min_restore_tokens <= restore_point < len(tokens)
                 ):
                     continue
-                entry.hits += 1
+                mark_hit = getattr(session_bank, "mark_prefix_hit", None)
+                if callable(mark_hit):
+                    mark_hit(entry, source="ram")
+                else:
+                    entry.hits += 1
                 entry.last_access_s = time.time()
                 outcome.update(
                     {
@@ -40760,7 +40975,10 @@ def create_app(state: ServerState) -> FastAPI:
 
     @app.get("/admin/sessions")
     def admin_sessions() -> dict[str, Any]:
-        return state.sessions.list_sessions()
+        sessions_dict = state.sessions.list_sessions()
+        return _enrich_sessions_bytes_from_bank(
+            sessions_dict, sessions_dict.get("session_bank") or {}
+        )
 
     @app.post("/admin/sessions/{session_id}/clear")
     def admin_clear_session(session_id: str) -> dict[str, Any]:
@@ -42052,6 +42270,15 @@ def create_app(state: ServerState) -> FastAPI:
                         prompt_ids=frontier_prompt_ids,
                         generated_ids=generated_result["tokens"],
                         finish_reason=generated_result.get("finish_reason", "stop"),
+                        nbytes=_non_zero_session_nbytes(
+                            (generated_result.get("stats") or {}).get(
+                                "sessionbank_snapshot_bytes"
+                            ),
+                            _session_bank_held_bytes_for_session(
+                                session_bank_for_generation, session_id
+                            ),
+                            getattr(session, "bytes_estimate", 0),
+                        ),
                     )
                 return generated_result
 
@@ -43246,6 +43473,18 @@ def create_app(state: ServerState) -> FastAPI:
                             ),
                             boundary_kind=prompt_prefix_boundary_kind,
                         )
+                        if int(getattr(session, "bytes_estimate", 0) or 0) <= 0:
+                            held_bytes = _non_zero_session_nbytes(
+                                (generated.get("stats") or {}).get(
+                                    "sessionbank_snapshot_bytes"
+                                ),
+                                _session_bank_held_bytes_for_session(
+                                    getattr(state.sessions, "bank", None),
+                                    session_id,
+                                ),
+                            )
+                            if held_bytes > 0:
+                                session.bytes_estimate = held_bytes
                         prompt_prefix_commit_info = {
                             "committed": bool(
                                 prompt_prefix_commit.committed
@@ -43629,7 +43868,18 @@ def create_app(state: ServerState) -> FastAPI:
                                             finish_reason=generated.get(
                                                 "finish_reason", "stop"
                                             ),
-                                            nbytes=int(postcommit.get("nbytes") or 0),
+                                            nbytes=_non_zero_session_nbytes(
+                                                postcommit.get("held_nbytes"),
+                                                postcommit.get("nbytes"),
+                                                (generated.get("stats") or {}).get(
+                                                    "sessionbank_snapshot_bytes"
+                                                ),
+                                                _session_bank_held_bytes_for_session(
+                                                    getattr(state.sessions, "bank", None),
+                                                    session_id,
+                                                ),
+                                                getattr(session, "bytes_estimate", 0),
+                                            ),
                                         )
                                     hand_off_commit("committed", generated, postcommit)
                                 else:
@@ -45848,12 +46098,15 @@ def create_app(state: ServerState) -> FastAPI:
                 response_id=response_id,
                 stream=False,
             )
-            _merge_final_bridge_stats_into_latest_metrics(state, generated["stats"])
             assistant_content = (
                 extraction.cleaned_text.strip()
                 if extraction is not None and extraction.cleaned_text
                 else ""
             )
+            generated["stats"]["first_visible_kind"] = (
+                "text" if assistant_content else "tool_call"
+            )
+            _merge_final_bridge_stats_into_latest_metrics(state, generated["stats"])
             await store_postcommit_snapshot(
                 generated,
                 assistant_content=assistant_content,
@@ -45969,6 +46222,9 @@ def create_app(state: ServerState) -> FastAPI:
                     generated["stats"]["finish_reason"] = "stop"
                     generated["stats"]["stop_sequence_hit"] = True
                     generated["stats"]["stop_sequence_matched"] = matched_stop
+            generated["stats"]["first_visible_kind"] = (
+                "text" if display_text else None
+            )
             _merge_final_bridge_stats_into_latest_metrics(state, generated["stats"])
             await store_postcommit_snapshot(
                 generated,

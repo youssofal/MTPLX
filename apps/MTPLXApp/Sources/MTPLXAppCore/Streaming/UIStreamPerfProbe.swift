@@ -78,6 +78,20 @@ public final class UIStreamPerfProbe: ObservableObject {
 
     // MARK: Turn ledger
 
+    public struct TurnSummarySnapshot: Equatable, Sendable {
+        public var flushes: Int
+        public var lagMsP50: Double
+        public var lagMsP95: Double
+        public var lagMsMax: Double
+        public var backlogCharsMax: Int
+        public var swiftUIItemsPublishes: Int
+    }
+
+    /// Snapshot of the most recently completed turn's lag/churn summary,
+    /// primarily for deterministic unit-test verification without waiting
+    /// on detached JSONL disk flushes.
+    public private(set) var lastTurnSummary: TurnSummarySnapshot?
+
     private struct FlushRecord {
         var t: Double            // uptime seconds
         var gapMs: Double        // since previous flush apply
@@ -86,6 +100,8 @@ public final class UIStreamPerfProbe: ObservableObject {
         var blocksAfter: Int
         var linesFinalized: Int  // lines finalized BY this flush
         var merges: Int          // segment merges performed by this flush
+        var backlogChars: Int    // unrevealed content characters still queued
+        var lagMs: Double        // arrival-to-paint latency of oldest revealed char
     }
 
     private struct StallRecord {
@@ -106,6 +122,7 @@ public final class UIStreamPerfProbe: ObservableObject {
     private var stalls: [StallRecord] = []
     private var scrollTicks = 0
     private var scrollPins = 0
+    private var swiftUIItemsPublishes = 0
     private var lastFlushAt: Double?
     private var lastLinesTotal = 0
     private var lastMergesTotal = 0
@@ -215,6 +232,7 @@ public final class UIStreamPerfProbe: ObservableObject {
         stalls = []
         scrollTicks = 0
         scrollPins = 0
+        swiftUIItemsPublishes = 0
         lastFlushAt = nil
         lastLinesTotal = 0
         lastMergesTotal = 0
@@ -245,7 +263,9 @@ public final class UIStreamPerfProbe: ObservableObject {
         applyMs: Double,
         blocksAfter: Int,
         linesFinalizedTotal: Int = 0,
-        mergesTotal: Int = 0
+        mergesTotal: Int = 0,
+        backlogChars: Int = 0,
+        lagMs: Double = 0
     ) {
         guard enabled, turnActive else { return }
         let now = ProcessInfo.processInfo.systemUptime
@@ -255,6 +275,8 @@ public final class UIStreamPerfProbe: ObservableObject {
         let mergeDelta = max(0, mergesTotal - lastMergesTotal)
         lastLinesTotal = max(lastLinesTotal, linesFinalizedTotal)
         lastMergesTotal = max(lastMergesTotal, mergesTotal)
+        let clampedLagMs = max(0, lagMs)
+        let clampedBacklog = max(0, backlogChars)
         flushes.append(FlushRecord(
             t: now,
             gapMs: gapMs,
@@ -262,7 +284,9 @@ public final class UIStreamPerfProbe: ObservableObject {
             applyMs: applyMs,
             blocksAfter: blocksAfter,
             linesFinalized: lineDelta,
-            merges: mergeDelta
+            merges: mergeDelta,
+            backlogChars: clampedBacklog,
+            lagMs: clampedLagMs
         ))
         hud.documentBlocks = blocksAfter
         // The founder-reported failure shape is "freezes on NEW LINES":
@@ -317,6 +341,19 @@ public final class UIStreamPerfProbe: ObservableObject {
         guard enabled else { return }
         scrollPins += 1
         os_signpost(.event, log: Self.renderSignpostLog, name: "ScrollPin")
+    }
+
+    /// Count one SwiftUI `@Published items` update from
+    /// `StreamingRichRenderModel` so turn summaries track SwiftUI graph churn.
+    public func swiftUIItemsPublished() {
+        guard enabled, turnActive else { return }
+        swiftUIItemsPublishes += 1
+    }
+
+    @MainActor
+    public static func noteSwiftUIItemsPublished() {
+        guard renderProbeEnabled else { return }
+        shared?.swiftUIItemsPublished()
     }
 
     // MARK: Render-layer probe (2026-08-19 streamwar)
@@ -447,8 +484,9 @@ public final class UIStreamPerfProbe: ObservableObject {
         // the app's lifetime (owned by the chat view model), so the cycle
         // is moot and the link never needs invalidation.
         let link = screen.displayLink(target: self, selector: #selector(paintTick(_:)))
+        let maxFPS = Float(max(60, screen.maximumFramesPerSecond))
         link.preferredFrameRateRange = CAFrameRateRange(
-            minimum: 30, maximum: 120, preferred: 60
+            minimum: 60, maximum: maxFPS, preferred: maxFPS
         )
         link.add(to: .main, forMode: .common)
         paintLink = link
@@ -511,7 +549,20 @@ public final class UIStreamPerfProbe: ObservableObject {
         let wallS = now - turnStartedAt
         let flushGaps = flushes.dropFirst().map(\.gapMs)
         let applies = flushes.map(\.applyMs)
+        let lags = flushes.map(\.lagMs)
+        let lagP50 = Self.percentile(lags, 50)
+        let lagP95 = Self.percentile(lags, 95)
+        let lagMax = ((lags.max() ?? 0) * 10).rounded() / 10
+        let backlogMax = flushes.map(\.backlogChars).max() ?? 0
         let turnStalls = stalls.filter { $0.streaming }
+        lastTurnSummary = TurnSummarySnapshot(
+            flushes: flushes.count,
+            lagMsP50: lagP50,
+            lagMsP95: lagP95,
+            lagMsMax: lagMax,
+            backlogCharsMax: backlogMax,
+            swiftUIItemsPublishes: swiftUIItemsPublishes
+        )
         var fields: [String: AIMEDiagnosticValue] = [
             "request_id": .string(requestId ?? ""),
             "wall_s": .double((wallS * 100).rounded() / 100),
@@ -527,6 +578,11 @@ public final class UIStreamPerfProbe: ObservableObject {
             "apply_ms_p50": .double(Self.percentile(applies, 50)),
             "apply_ms_p95": .double(Self.percentile(applies, 95)),
             "apply_ms_max": .double(applies.max() ?? 0),
+            "lag_ms_p50": .double(lagP50),
+            "lag_ms_p95": .double(lagP95),
+            "lag_ms_max": .double(lagMax),
+            "backlog_chars_max": .int(backlogMax),
+            "swiftui_items_publishes": .int(swiftUIItemsPublishes),
             "stalls_over_50ms": .int(turnStalls.count),
             "stall_ms_max": .double(turnStalls.map(\.ms).max() ?? 0),
             "stall_ms_total": .double(turnStalls.map(\.ms).reduce(0, +)),
@@ -596,9 +652,9 @@ public final class UIStreamPerfProbe: ObservableObject {
             ))
             for r in records {
                 lines.append(String(
-                    format: #"{"kind":"flush","t":%.4f,"gap_ms":%.1f,"drained_bytes":%d,"apply_ms":%.2f,"blocks":%d,"lines":%d,"merges":%d}"#,
+                    format: #"{"kind":"flush","t":%.4f,"gap_ms":%.1f,"drained_bytes":%d,"apply_ms":%.2f,"blocks":%d,"lines":%d,"merges":%d,"backlog_chars":%d,"lag_ms":%.1f}"#,
                     r.t, r.gapMs, r.drainedBytes, r.applyMs, r.blocksAfter,
-                    r.linesFinalized, r.merges
+                    r.linesFinalized, r.merges, r.backlogChars, r.lagMs
                 ))
             }
             for s in stallRecords {

@@ -397,8 +397,10 @@ struct SettingsSearchField: View {
 
 // MARK: - Save bar
 
-/// Pinned under the Settings content while there are edits to save. One
-/// place to save, whichever section the edits were made in.
+/// Floating bottom bar overlaid above the Settings scroll view while there
+/// are edits to save (or an error to display). Overlay placement keeps
+/// ScrollView geometry constant so dirtying a setting never shifts or jumps
+/// page content.
 struct SettingsSaveBar: View {
     let running: Bool
     let applying: Bool
@@ -441,13 +443,19 @@ struct SettingsSaveBar: View {
             .disabled(applying)
             .keyboardShortcut("s", modifiers: [.command])
         }
-        .padding(.horizontal, 18)
+        .padding(.horizontal, 16)
         .padding(.vertical, 12)
         .background {
-            Brand.bgInner
-                .overlay(alignment: .top) {
-                    Rectangle().fill(Brand.separator).frame(height: Brand.hairline)
+            RoundedRectangle(cornerRadius: Brand.Radii.m, style: .continuous)
+                .fill(Brand.raisedSurface)
+                .overlay {
+                    RoundedRectangle(cornerRadius: Brand.Radii.m, style: .continuous)
+                        .strokeBorder(
+                            error == nil ? Brand.separatorStrong : Brand.danger.opacity(0.45),
+                            lineWidth: Brand.hairline
+                        )
                 }
+                .shadow(color: Brand.shade.opacity(0.32), radius: 14, x: 0, y: 6)
         }
     }
 }

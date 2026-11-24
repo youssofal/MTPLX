@@ -26,6 +26,7 @@ final class LiveTailTextSurface: NSView {
 
     private let layoutManager = NSLayoutManager()
     private let textContainer = NSTextContainer(size: .zero)
+    private var cachedTextHeight: CGFloat?
 
     override var isFlipped: Bool { true }
 
@@ -38,6 +39,7 @@ final class LiveTailTextSurface: NSView {
         // this layer is exactly the visible 72pt/420pt surface.
         wantsLayer = true
         layer?.masksToBounds = true
+        layer?.drawsAsynchronously = false
         layerContentsRedrawPolicy = .onSetNeedsDisplay
         textContainer.lineFragmentPadding = 0
         textContainer.lineBreakMode = .byCharWrapping
@@ -64,6 +66,7 @@ final class LiveTailTextSurface: NSView {
         // cycle and that path lays out the tail once before reading its line
         // fragment. Doing both here and in `draw` doubled TextKit work for
         // every streamed append.
+        cachedTextHeight = nil
         needsDisplay = true
     }
 
@@ -72,8 +75,15 @@ final class LiveTailTextSurface: NSView {
         guard textStorage.length > 0 else { return }
 
         UIStreamPerfProbe.renderTimed(.draw, size: textStorage.length) {
-            ensureTailLayout()
-            let textHeight = laidOutTextHeight()
+            let textHeight: CGFloat
+            if let cached = cachedTextHeight {
+                textHeight = cached
+            } else {
+                ensureTailLayout()
+                let measured = laidOutTextHeight()
+                cachedTextHeight = measured
+                textHeight = measured
+            }
             let bottomAnchoredY = bounds.height - contentInsets.height - textHeight
             let origin = NSPoint(
                 x: contentInsets.width,
@@ -87,7 +97,7 @@ final class LiveTailTextSurface: NSView {
                 in: textContainer
             )
             NSGraphicsContext.saveGraphicsState()
-            NSBezierPath(rect: bounds).addClip()
+            NSGraphicsContext.current?.cgContext.clip(to: bounds)
             layoutManager.drawBackground(forGlyphRange: glyphRange, at: origin)
             layoutManager.drawGlyphs(forGlyphRange: glyphRange, at: origin)
             NSGraphicsContext.restoreGraphicsState()
@@ -99,6 +109,7 @@ final class LiveTailTextSurface: NSView {
         let size = NSSize(width: width, height: .greatestFiniteMagnitude)
         guard textContainer.containerSize != size else { return }
         textContainer.containerSize = size
+        cachedTextHeight = nil
         layoutManager.invalidateLayout(
             forCharacterRange: NSRange(location: 0, length: textStorage.length),
             actualCharacterRange: nil
@@ -107,7 +118,8 @@ final class LiveTailTextSurface: NSView {
     }
 
     private func ensureTailLayout() {
-        guard textStorage.length > 0 else { return }
+        guard textStorage.length > 0,
+              layoutManager.firstUnlaidCharacterIndex() < textStorage.length else { return }
         layoutManager.ensureLayout(
             forCharacterRange: NSRange(location: textStorage.length - 1, length: 1)
         )

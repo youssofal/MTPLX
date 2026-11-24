@@ -97,4 +97,66 @@ final class SettingsDraftStoreTests: XCTestCase {
         XCTAssertEqual(drafts.draft.memoryLimitGB, 64)
         XCTAssertFalse(drafts.hasUnsavedChanges)
     }
+
+    func testImmediateFanModeCommitNeverMarksDraftDirtyAndPreservesOtherEdits() {
+        let drafts = SettingsDraftStore()
+        let initial = persisted()
+        TabScoped(drafts: drafts).appear(with: initial)
+
+        drafts.commitImmediateFanMode(.max)
+        XCTAssertEqual(drafts.draft.fanMode, "max")
+        XCTAssertTrue(drafts.draft.pinFansAtMaxOnStart)
+        XCTAssertEqual(drafts.lastSynced.fanMode, "max")
+        XCTAssertTrue(drafts.lastSynced.pinFansAtMaxOnStart)
+        XCTAssertFalse(drafts.hasUnsavedChanges)
+
+        // An unrelated edit in Settings remains dirty when Fan Mode changes.
+        drafts.draft.memoryLimitGB = 96
+        XCTAssertTrue(drafts.hasUnsavedChanges)
+        drafts.commitImmediateFanMode(.smart)
+        XCTAssertEqual(drafts.draft.memoryLimitGB, 96)
+        XCTAssertEqual(drafts.draft.fanMode, "smart")
+        XCTAssertFalse(drafts.draft.pinFansAtMaxOnStart)
+        XCTAssertTrue(drafts.hasUnsavedChanges)
+    }
+
+    func testMergedForSavePreservesExternalFanModeReasoningAndModelPickOverStaleDraft() {
+        let drafts = SettingsDraftStore()
+        let initial = persisted()
+        TabScoped(drafts: drafts).appear(with: initial)
+
+        // User edits a Settings-only field without saving yet.
+        drafts.draft.port = 9002
+        XCTAssertTrue(drafts.hasUnsavedChanges)
+
+        // Elsewhere in the app, the user selects Max fans, switches to Inkling,
+        // and sets reasoning/effort via Model Controls.
+        var external = initial
+        external.fanMode = "max"
+        external.pinFansAtMaxOnStart = true
+        external.model = "inkling2-mini-optimized-speed"
+        external.liveSettingsModelFamily = "inkling2"
+        external.reasoning = "off"
+        external.reasoningEffort = "low"
+
+        drafts.syncNonDraftedFields(from: external)
+        XCTAssertEqual(drafts.draft.port, 9002, "pending Settings edit stays intact")
+        XCTAssertEqual(drafts.draft.fanMode, "max")
+        XCTAssertEqual(drafts.draft.reasoning, "off")
+        XCTAssertEqual(drafts.draft.reasoningEffort, "low")
+
+        let merged = drafts.mergedForSave(against: external)
+        XCTAssertEqual(merged.port, 9002)
+        XCTAssertEqual(merged.fanMode, "max")
+        XCTAssertTrue(merged.pinFansAtMaxOnStart)
+        XCTAssertEqual(merged.model, "inkling2-mini-optimized-speed")
+        XCTAssertEqual(merged.liveSettingsModelFamily, "inkling2")
+        XCTAssertEqual(merged.reasoning, "off")
+        XCTAssertEqual(merged.reasoningEffort, "low")
+
+        // Explicit edits to the Model field inside Settings still win over external.model.
+        drafts.draft.model = "/models/custom-override"
+        let mergedManualModel = drafts.mergedForSave(against: external)
+        XCTAssertEqual(mergedManualModel.model, "/models/custom-override")
+    }
 }

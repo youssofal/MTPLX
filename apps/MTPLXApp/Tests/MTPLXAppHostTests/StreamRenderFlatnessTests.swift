@@ -262,4 +262,183 @@ final class StreamRenderFlatnessTests: XCTestCase {
         }
         XCTAssertEqual(previous, 24, "40 lines must saturate the cap")
     }
+
+    // MARK: Rich streaming prose — bounded SwiftUI churn & zero mid-line relayouts
+
+    @MainActor
+    func testRichMarkdown200LinesPublishesBoundedSwiftUIItems() {
+        let store = StreamingDocumentStore(mode: .plainLines)
+        let model = StreamingRichRenderModel(document: store)
+
+        var objectWillChangeCount = 0
+        var cancellables: Set<AnyCancellable> = []
+        model.objectWillChange.sink { _ in objectWillChangeCount += 1 }.store(in: &cancellables)
+
+        // Stream 200 lines of mixed Markdown prose + an interleaved code
+        // fence in sub-line chunks (simulating 120 Hz typewriter reveals).
+        for line in 1...200 {
+            if line == 95 {
+                store.append("```swift\n")
+                for c in 1...12 {
+                    store.append("let step\(c) = \(c) * 2\n")
+                }
+                store.append("```\n")
+                continue
+            }
+            let content: String
+            switch line % 7 {
+            case 0: content = "## Section \(line)"
+            case 1: content = "Paragraph with **bold**, *italic*, and `inlineCode(\(line))`."
+            case 2: content = "- Bullet item **\(line)** with [reference](https://example.com)"
+            case 3: content = "\(line). Ordered item with ~~old~~ and $x^2 + 1$"
+            case 4: content = "> Quoted commentary on line \(line)"
+            case 5: content = "---"
+            default: content = "Plain body sentence continuing across line \(line)."
+            }
+            // Deliver each line in two sub-line chunks to mimic mid-line ticks.
+            let mid = content.index(content.startIndex, offsetBy: content.count / 2)
+            store.append(String(content[..<mid]))
+            store.append(String(content[mid...]) + "\n")
+        }
+
+        // Before StreamingProseTextSurface, 200 lines produced ~54 separate
+        // `.plain` blocks and 400+ SwiftUI `@Published items` publishes.
+        // With bounded `.prose` chunks fed over `perRevision`, publishes
+        // only happen on chunk boundaries and code-fence open/close.
+        XCTAssertLessThanOrEqual(
+            model.itemsPublishCount, 12,
+            "SwiftUI @Published items churned \(model.itemsPublishCount) times over 200 rich markdown lines"
+        )
+        XCTAssertLessThanOrEqual(
+            model.items.count, 8,
+            "Render item count (\(model.items.count)) grew unbounded instead of grouping prose runs"
+        )
+        XCTAssertLessThanOrEqual(
+            objectWillChangeCount, 16,
+            "StreamingRichRenderModel fired objectWillChange \(objectWillChangeCount) times"
+        )
+    }
+
+    @MainActor
+    func testStreamingProseSurfaceDoesNotInvalidateIntrinsicSizeMidLine() {
+        let surface = StreamingProseNSView(frame: NSRect(x: 0, y: 0, width: 548, height: 100))
+        surface.layout()
+        let coordinator = StreamingProseTextSurface.Coordinator()
+
+        // First character establishes the initial line height.
+        let initialBlock = StreamingDocumentBlock(id: 0, text: "H", kind: .unfinished, finalized: false)
+        StreamingProseTextSurface.apply(blocks: [initialBlock], to: surface, coordinator: coordinator)
+        let initialHeight = surface.measuredHeight
+        let invalidationsAfterFirstChar = surface.intrinsicSizeInvalidationCount
+
+        // Append characters along the same single visual line — height does
+        // not change, so intrinsic content size MUST NOT invalidate.
+        var growing = "H"
+        for ch in "ello streaming prose at 120 Hz!" {
+            growing.append(ch)
+            let block = StreamingDocumentBlock(id: 0, text: growing, kind: .unfinished, finalized: false)
+            StreamingProseTextSurface.apply(blocks: [block], to: surface, coordinator: coordinator)
+        }
+        XCTAssertEqual(
+            surface.measuredHeight, initialHeight,
+            "single-line typing should keep the same measured height"
+        )
+        XCTAssertEqual(
+            surface.intrinsicSizeInvalidationCount, invalidationsAfterFirstChar,
+            "mid-line character appends must trigger ZERO intrinsic size invalidations"
+        )
+
+        // Adding a second line grows height and MUST invalidate once so
+        // SwiftUI expands the bubble and pins the scroll view synchronously.
+        let blocksTwoLines = [
+            StreamingDocumentBlock(id: 0, text: growing, kind: .plain, finalized: true),
+            StreamingDocumentBlock(id: 1, text: "Second line arrives", kind: .unfinished, finalized: false),
+        ]
+        StreamingProseTextSurface.apply(blocks: blocksTwoLines, to: surface, coordinator: coordinator)
+        XCTAssertGreaterThan(surface.measuredHeight, initialHeight)
+        XCTAssertEqual(
+            surface.intrinsicSizeInvalidationCount,
+            invalidationsAfterFirstChar + 1,
+            "new line should invalidate intrinsic size exactly once"
+        )
+    }
+
+    @MainActor
+    func testStreamingProseFormatterStylesMarkdownIncrementallyWithoutPartialFlicker() {
+        // Unclosed bold stays literal while streaming; closed bold strips markers and bolds.
+        let partial = StreamingProseMarkdownFormatter.formatLine("Hello **wor", finalized: false)
+        XCTAssertEqual(partial.string, "Hello **wor")
+
+        let closed = StreamingProseMarkdownFormatter.formatLine("Hello **world** and `code`", finalized: true)
+        XCTAssertEqual(closed.string, "Hello world and code")
+        let worldRange = (closed.string as NSString).range(of: "world")
+        let worldFont = closed.attribute(.font, at: worldRange.location, effectiveRange: nil) as? NSFont
+        XCTAssertNotNil(worldFont)
+        XCTAssertTrue(
+            NSFontManager.shared.traits(of: worldFont!).contains(.boldFontMask)
+                || (worldFont?.fontDescriptor.symbolicTraits.contains(.bold) ?? false)
+                || (worldFont?.fontName.lowercased().contains("semibold") ?? false)
+                || (worldFont?.fontName.lowercased().contains("bold") ?? false)
+        )
+        let codeRange = (closed.string as NSString).range(of: "code")
+        let codeFont = closed.attribute(.font, at: codeRange.location, effectiveRange: nil) as? NSFont
+        XCTAssertTrue(codeFont?.isFixedPitch ?? false, "inline code must use a monospace font")
+
+        // Heading strips # markers and enlarges font.
+        let heading = StreamingProseMarkdownFormatter.formatLine("# Big Title", finalized: true)
+        XCTAssertEqual(heading.string, "Big Title")
+        let headingFont = heading.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        XCTAssertGreaterThanOrEqual(headingFont?.pointSize ?? 0, 20)
+
+        // Bullet replaces leading '-' with '•\t'.
+        let bullet = StreamingProseMarkdownFormatter.formatLine("- Item one", finalized: true)
+        XCTAssertTrue(bullet.string.hasPrefix("•\tItem one"))
+
+        // Intra-word underscores stay untouched (snake_case).
+        let snake = StreamingProseMarkdownFormatter.formatLine("use foo_bar_baz here", finalized: true)
+        XCTAssertEqual(snake.string, "use foo_bar_baz here")
+    }
+
+    @MainActor
+    func testStreamingProseApplyPlusDrawCostStaysFlatAcross240Lines() {
+        let store = StreamingDocumentStore(mode: .plainLines)
+        let model = StreamingRichRenderModel(document: store)
+        var surfaces: [Int: (StreamingProseNSView, StreamingProseTextSurface.Coordinator)] = [:]
+        let image = NSImage(size: NSSize(width: 548, height: 1200))
+
+        func syncAndDrawActive() -> Double {
+            let started = ProcessInfo.processInfo.systemUptime
+            if case let .prose(id, blocks)? = model.latestItems.last {
+                let pair = surfaces[id] ?? {
+                    let v = StreamingProseNSView(frame: NSRect(x: 0, y: 0, width: 548, height: 1200))
+                    v.layout()
+                    let c = StreamingProseTextSurface.Coordinator()
+                    surfaces[id] = (v, c)
+                    return (v, c)
+                }()
+                StreamingProseTextSurface.apply(blocks: blocks, to: pair.0, coordinator: pair.1)
+                image.lockFocus()
+                pair.0.draw(NSRect(x: 0, y: 0, width: 548, height: min(1200, pair.0.measuredHeight)))
+                image.unlockFocus()
+            }
+            return (ProcessInfo.processInfo.systemUptime - started) * 1000
+        }
+
+        var costAt30: [Double] = []
+        var costAt220: [Double] = []
+        for line in 1...240 {
+            store.append("Line \(line) with **bold** and `code_\(line)` streaming smoothly.\n")
+            let ms = syncAndDrawActive()
+            if (26...34).contains(line) { costAt30.append(ms) }
+            if (216...224).contains(line) { costAt220.append(ms) }
+        }
+
+        let early = costAt30.sorted()[costAt30.count / 2]
+        let late = costAt220.sorted()[costAt220.count / 2]
+        XCTAssertLessThanOrEqual(
+            late,
+            max(early * 2.0, early + 1.5),
+            "prose apply+draw grew with document length (line 220: \(late) ms vs line 30: \(early) ms)"
+        )
+    }
 }

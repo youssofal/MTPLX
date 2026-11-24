@@ -31,6 +31,7 @@ struct LiveTile: View {
     var systemImage: String? = nil
     var tint: Color = Brand.typeHi
     var caption: String? = nil
+    var helpText: String? = nil
     var lifted: Bool = false
     var liftDelay: TimeInterval = 0
     var liftAnimation: Animation? = Motion.surfaceLiftSpring
@@ -74,9 +75,10 @@ struct LiveTile: View {
             // read as a jagged stair-step.
             Text(caption ?? " ")
                 .font(.system(size: 10, weight: .medium, design: .monospaced))
-                .tracking(1)
+                .tracking(0.5)
                 .foregroundStyle(Brand.typeTertiary)
                 .lineLimit(1)
+                .minimumScaleFactor(0.85)
                 .opacity(caption == nil ? 0 : 1)
                 .contentTransition(.numericText())
         }
@@ -94,6 +96,7 @@ struct LiveTile: View {
                 delay: liftDelay
             )
         }
+        .help(helpText ?? "")
     }
 }
 
@@ -122,6 +125,7 @@ struct TileRow: View {
         var unit: String? = nil
         let systemImage: String
         var caption: String? = nil
+        var helpText: String? = nil
         let liftIndex: Int
         var id: String { label }
     }
@@ -136,8 +140,6 @@ struct TileRow: View {
         let smoothed = backend.smoothedMetrics
         let sessionBank = backend.sessionBank
         let engineMemory = backend.engineMemoryReading
-        let prefillSpeed = PrefillSpeedSummary(lifetime: lifetime)
-            ?? PrefillSpeedSummary(recent: snapshot?.recent ?? [])
 
         // Same warm-up gate as the gauge — until we've actually
         // observed a `.completed` SSE event, treat lifetime / rolling
@@ -149,6 +151,15 @@ struct TileRow: View {
         let liveRolling = hasRealRequest ? rolling : nil
         let liveLatest = hasRealRequest ? latest : nil
         let liveSmoothed = hasRealRequest ? smoothed : SmoothedMetrics()
+        let decodeSummary = DecodeChartSummary(rolling: liveRolling)
+        let prefillSpeed = PrefillSpeedSummary(lifetime: liveLifetime)
+            ?? PrefillSpeedSummary(recent: hasRealRequest ? (snapshot?.recent ?? []) : [])
+        let cachedReadout = CachedTileReadout(
+            smoothed: liveSmoothed,
+            latest: liveLatest,
+            lifetime: liveLifetime,
+            sessionBank: hasRealRequest ? sessionBank : nil
+        )
 
         // `lifted` is true only once the daemon has actually reached
         // `.running` — `.starting` and `.warming` keep the row flat
@@ -170,19 +181,10 @@ struct TileRow: View {
             ),
             TileSpec(
                 label: tr("Cached"),
-                value: cacheValue(
-                    smoothed: liveSmoothed,
-                    latest: liveLatest,
-                    lifetime: liveLifetime,
-                    sessionBank: sessionBank
-                ),
-                unit: "tok",
+                value: cachedReadout.value,
+                unit: cachedReadout.unit,
                 systemImage: "tray.full",
-                caption: cacheHitCaption(
-                    latest: liveLatest,
-                    lifetime: liveLifetime,
-                    sessionBank: sessionBank
-                ),
+                caption: cachedReadout.caption,
                 liftIndex: 1
             ),
             TileSpec(
@@ -201,10 +203,10 @@ struct TileRow: View {
             ),
             TileSpec(
                 label: tr("5-min Min/Max"),
-                value: minMaxValue(rolling: liveRolling),
+                value: minMaxValue(summary: decodeSummary),
                 unit: "TPS",
                 systemImage: "chart.bar.xaxis",
-                caption: liveRolling?.mean.map { tr("avg %@", Format.tps($0)) },
+                caption: decodeSummary.mean.map { tr("avg %@", Format.tps($0)) },
                 liftIndex: 3
             ),
             TileSpec(
@@ -213,6 +215,7 @@ struct TileRow: View {
                 unit: prefillSpeed == nil ? nil : "TPS",
                 systemImage: "gauge.with.dots.needle.bottom.50percent",
                 caption: prefillCaption(speed: prefillSpeed, latest: liveLatest),
+                helpText: prefillSpeed?.helpText,
                 liftIndex: 4
             ),
         ]
@@ -233,6 +236,7 @@ struct TileRow: View {
                     unit: spec.unit,
                     systemImage: spec.systemImage,
                     caption: spec.caption,
+                    helpText: spec.helpText,
                     lifted: isRunning,
                     liftDelay: liftDelay(forIndex: spec.liftIndex),
                     liftAnimation: liftAnimation
@@ -258,8 +262,8 @@ struct TileRow: View {
         return Double(index) * Motion.surfaceLiftStaggerStep
     }
 
-    private func minMaxValue(rolling: RollingMetrics?) -> String {
-        guard let rolling, let min = rolling.min, let max = rolling.max else { return "—" }
+    private func minMaxValue(summary: DecodeChartSummary) -> String {
+        guard let min = summary.min, let max = summary.max else { return "—" }
         return "\(Format.tps(min)) / \(Format.tps(max))"
     }
 
@@ -305,55 +309,6 @@ struct TileRow: View {
     }
 
     // MARK: Computed helpers
-
-    private func cacheValue(
-        smoothed: SmoothedMetrics,
-        latest: MetricsLatest?,
-        lifetime: LifetimeSnapshot?,
-        sessionBank: SessionBank?
-    ) -> String {
-        // Prefer the smoothed live cached-token count when available so
-        // the headline doesn't strobe between two close integers per
-        // progress frame. Falls through to SessionBank restore evidence
-        // because AR/OpenCode requests can reuse a restored prefix even
-        // when the request envelope reports a cold prefill.
-        if let smoothedCached = smoothed.cachedTokens, smoothedCached >= 0.5 {
-            return Format.integer(Int(smoothedCached.rounded()))
-        }
-        if let cached = latest?.cachedTokens, cached > 0 {
-            return Format.integer(cached)
-        }
-        if let total = lifetime?.cachedTokensTotal, total > 0 {
-            return Format.integer(total)
-        }
-        return Format.integer(sessionBank?.lastEffectiveCachedTokens)
-    }
-
-    private func cacheHitCaption(
-        latest: MetricsLatest?,
-        lifetime: LifetimeSnapshot?,
-        sessionBank: SessionBank?
-    ) -> String? {
-        if latest?.sessionCacheHit == true {
-            if let total = lifetime?.cachedTokensTotal, total > 0 {
-                return tr("hit · total %@ tok", Format.integer(total))
-            }
-            return "hit"
-        }
-        if sessionBank?.hasEffectiveCacheHit == true {
-            let source = sessionBank?.lastEffectiveCacheSource ?? "cache"
-            let hits = sessionBank?.restoreHitCount ?? 0
-            if hits > 0 {
-                return tr("%@ hit", source)
-            }
-            return tr("%@ hit", source)
-        }
-        if let total = lifetime?.tokensTotal, let cached = lifetime?.cachedTokensTotal, total > 0 {
-            let rate = Double(cached) / Double(total)
-            return tr("rate %@", Format.percent(rate))
-        }
-        return "miss"
-    }
 
     // The session's prompt-read speed: every read of 2K+ new tokens since the
     // server started, weighted by tokens. A cached turn's "rate" (19 new

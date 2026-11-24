@@ -633,11 +633,29 @@ public final class MTPLXBackendStore: ObservableObject {
     }
 
     public func saveSettings(_ next: MTPLXAppConfiguration) throws {
-        let next = keepingStarPromptRecord(next)
+        let next = normalizedFanModeConfiguration(keepingStarPromptRecord(next))
         configuration = next
-        seedLiveSettingsFromConfiguration(next)
+        // Only seed live settings from configuration while no daemon is running;
+        // doing so while live would wipe the running daemon's `modelControls`,
+        // `reasoningPolicy`, and `samplingDefaults` on every Fan Mode,
+        // Performance Lock, or Scheduling save.
+        if daemonState != .running && !supervisor.isRunning() {
+            seedLiveSettingsFromConfiguration(next)
+        }
         supervisor.setAutomaticRestartEnabled(next.automaticDaemonRestart)
         try persistConfiguration(next)
+    }
+
+    /// Keep `fanMode` canonical and `pinFansAtMaxOnStart` strictly synchronized
+    /// so saved settings and launch commands never drift apart.
+    private func normalizedFanModeConfiguration(
+        _ source: MTPLXAppConfiguration
+    ) -> MTPLXAppConfiguration {
+        var next = source
+        let normalized = MTPLXFanMode.normalized(source.fanMode)
+        next.fanMode = normalized.rawValue
+        next.pinFansAtMaxOnStart = normalized == .max
+        return next
     }
 
     /// One more launch reached a loaded, ready model. Counted for the
@@ -851,7 +869,7 @@ public final class MTPLXBackendStore: ObservableObject {
         _ next: MTPLXAppConfiguration,
         restartIfRunning: Bool = true
     ) async throws {
-        let next = keepingStarPromptRecord(next)
+        let next = normalizedFanModeConfiguration(keepingStarPromptRecord(next))
         let previousModel = configuration.model
         let wasDegraded: Bool
         if case .degraded = daemonState { wasDegraded = true } else { wasDegraded = false }
@@ -860,6 +878,9 @@ public final class MTPLXBackendStore: ObservableObject {
         configuration = next
         try persistConfiguration(next)
         supervisor.setAutomaticRestartEnabled(next.automaticDaemonRestart)
+        if !shouldRestart {
+            seedLiveSettingsFromConfiguration(next)
+        }
         if !shouldRestart, restartIfRunning, wasDegraded {
             // Degraded chrome means the user believes MTPLX is (or should
             // be) running, but the supervisor no longer tracks a process —
@@ -977,6 +998,9 @@ public final class MTPLXBackendStore: ObservableObject {
             )
             startupPhase = .launching
             activeLaunchID = launchID
+            // Drop any stale fan mode from the prior daemon or Stop restore so
+            // startup reflects the newly launched daemon's real mode.
+            currentFanMode = nil
             let startupHealth = try await supervisor.restart(
                 command: command,
                 healthBaseURL: configuredBaseURL,
@@ -1121,7 +1145,7 @@ public final class MTPLXBackendStore: ObservableObject {
             ownServerRanSinceFanRestore = ownServerRanSinceFanRestore
                 || adoptedFanMode.map { MTPLXFanMode.normalized($0) != .default } ?? true
             health = adoptedHealth
-            currentFanMode = adoptedFanMode
+            currentFanMode = adoptedFanMode ?? MTPLXFanMode.normalized(configuration.fanMode).rawValue
             fanRestoreRequiredOnStop = fanRestoreRequiredOnStop
                 || modeRequiresFanRestore(currentFanMode)
             daemonState = .running
@@ -1430,6 +1454,10 @@ public final class MTPLXBackendStore: ObservableObject {
             } else {
                 pendingAttach = nil
                 attachedToOutsideServer = false
+                // Drop any stale `"default"` left behind by a prior Stop fan
+                // restore so UI controls and health probes during launch read
+                // the new launch's configured fan mode until verified.
+                currentFanMode = nil
                 // From here this copy's own server may set the fans: Max pins
                 // them, Smart raises them under load. Default leaves them to
                 // macOS, so Stop and Quit leave them too: resetting them would
@@ -2703,24 +2731,23 @@ public final class MTPLXBackendStore: ObservableObject {
             liveSettingsModel = configuration.model
             pendingLiveSettings = merged
             pendingLiveSettingsModel = configuration.model
-            try? persistLiveSettings(merged, depthIsExplicitSelection: depthIsExplicitSelection)
+            try? persistLiveSettings(next, depthIsExplicitSelection: depthIsExplicitSelection)
+            return
         }
         do {
             settings = try await apiClient.updateSettings(livePatch)
             liveSettingsModel = configuration.model
             pendingLiveSettings = nil
             pendingLiveSettingsModel = nil
-            try? persistLiveSettings(merged, depthIsExplicitSelection: depthIsExplicitSelection)
+            try? persistLiveSettings(next, depthIsExplicitSelection: depthIsExplicitSelection)
         } catch {
-            if daemonIsRunning {
-                if let daemonSettings = try? await apiClient.settings() {
-                    settings = daemonSettings
-                    liveSettingsModel = configuration.model
-                }
-                pendingLiveSettings = nil
-                pendingLiveSettingsModel = nil
-                throw error
+            if let daemonSettings = try? await apiClient.settings() {
+                settings = daemonSettings
+                liveSettingsModel = configuration.model
             }
+            pendingLiveSettings = nil
+            pendingLiveSettingsModel = nil
+            throw error
         }
     }
 
@@ -2730,14 +2757,17 @@ public final class MTPLXBackendStore: ObservableObject {
     }
 
     private func adoptDaemonSettings(_ daemonSettings: MutableSettings, persist: Bool) {
-        let previous = settings
-        settings = daemonSettings
+        _ = persist
+        // Passive reads from SSE snapshots or `/v1/mtplx/settings` update the
+        // in-memory live view only. They must never write daemon defaults,
+        // per-target presets, AR-only fallback modes, or an attached outside
+        // server's flags back over the user's saved `configuration`.
+        if settings != daemonSettings {
+            settings = daemonSettings
+        }
         liveSettingsModel = configuration.model
         pendingLiveSettings = nil
         pendingLiveSettingsModel = nil
-        if persist && previous != daemonSettings {
-            try? persistLiveSettings(daemonSettings)
-        }
     }
 
     /// The patch a direct live update posts. It is the carried patch plus
@@ -2849,11 +2879,17 @@ public final class MTPLXBackendStore: ObservableObject {
     }
 
     private func seedLiveSettingsFromConfiguration(_ configuration: MTPLXAppConfiguration) {
-        guard let persisted = persistedLiveSettings(from: configuration) else { return }
-        settings = persisted
-        pendingLiveSettings = persisted
-        pendingLiveSettingsModel = configuration.model
-        liveSettingsModel = configuration.model
+        if let persisted = persistedLiveSettings(from: configuration) {
+            settings = persisted
+            pendingLiveSettings = persisted
+            pendingLiveSettingsModel = configuration.model
+            liveSettingsModel = configuration.model
+        } else {
+            settings = nil
+            pendingLiveSettings = nil
+            pendingLiveSettingsModel = nil
+            liveSettingsModel = nil
+        }
     }
 
     private func persistLiveSettings(
@@ -3963,14 +3999,21 @@ public final class MTPLXBackendStore: ObservableObject {
                     }
                     tracker.recordAnswer()
                     loggedBusy = false
-                    self.daemonUnresponsiveFor = nil
-                    self.health = health
+                    if self.daemonUnresponsiveFor != nil {
+                        self.daemonUnresponsiveFor = nil
+                    }
+                    if self.health != health {
+                        self.health = health
+                    }
                     // Keep the last-known mode when a probe can't verify:
                     // blanking here flipped the fan toggle to the "smart"
                     // nil-default every 3 s on daemons without a receipt.
-                    self.currentFanMode = self.verifiedFanMode(from: health)
+                    let resolvedFanMode = self.verifiedFanMode(from: health)
                         ?? self.currentFanMode
                         ?? MTPLXFanMode.normalized(self.configuration.fanMode).rawValue
+                    if self.currentFanMode != resolvedFanMode {
+                        self.currentFanMode = resolvedFanMode
+                    }
                     continue
                 case .healthy:
                     // Answered but self-reported not-ok: treat as a miss so a
@@ -4559,34 +4602,46 @@ public final class MTPLXBackendStore: ObservableObject {
         }
     }
 
-    /// POST `/v1/mtplx/thermal/fan_mode {"mode": mode}` and update
-    /// `currentFanMode` to whatever the daemon verified. Optimistically
-    /// pre-set the mode so the UI flips immediately; on failure
-    /// `currentFanMode` is rolled back to the previous state.
-    public func setFanMode(_ mode: String) async throws {
-        try await setFanMode(mode, isCurrent: nil)
+    /// Authoritative fan mode for UI controls: the live daemon's active mode
+    /// while running or warming, otherwise the persisted launch preference in
+    /// `configuration` (never the `"default"` hardware restore state written on
+    /// Stop).
+    public var effectiveFanMode: MTPLXFanMode {
+        if canApplyFanModeLive {
+            return MTPLXFanMode.normalized(currentFanMode ?? configuration.fanMode)
+        }
+        return MTPLXFanMode.normalized(configuration.fanMode)
     }
 
-    /// Lifecycle-scoped variant used only by post-start verification.  The
-    /// public fan control intentionally remains usable outside a daemon
-    /// lifecycle; this path must instead discard a late API result rather
-    /// than persisting or rolling back over newer settings.
+    /// POST `/v1/mtplx/thermal/fan_mode {"mode": mode}` and update
+    /// `currentFanMode` to whatever the daemon verified. On failure
+    /// `currentFanMode` rolls back to the previous live value without
+    /// clobbering concurrent `configuration` edits.
+    public func setFanMode(_ mode: String) async throws {
+        try await setFanMode(mode, isCurrent: nil, persistSelection: true)
+    }
+
+    /// Lifecycle-scoped variant used by post-start verification and tests.
+    /// When `persistSelection` is `false`, the daemon is brought in line with
+    /// the saved startup pin without ever rewriting `configuration.fanMode`.
     func setFanMode(
         _ mode: String,
-        isCurrent: (() -> Bool)?
+        isCurrent: (() -> Bool)?,
+        persistSelection: Bool = true
     ) async throws {
         guard isCurrent?() ?? true else { return }
         let previous = currentFanMode
-        let previousConfiguration = configuration
         let fanMode = MTPLXFanMode.normalized(mode)
         let canonicalMode = fanMode.rawValue
         if !canApplyFanModeLive {
             guard isCurrent?() ?? true else { return }
-            var next = configuration
-            next.fanMode = canonicalMode
-            next.pinFansAtMaxOnStart = fanMode == .max
-            guard isCurrent?() ?? true else { return }
-            try saveSettings(next)
+            if persistSelection {
+                var next = configuration
+                next.fanMode = canonicalMode
+                next.pinFansAtMaxOnStart = fanMode == .max
+                guard isCurrent?() ?? true else { return }
+                try saveSettings(next)
+            }
             guard isCurrent?() ?? true else { return }
             currentFanMode = nil
             fanRestoreRequiredOnStop = false
@@ -4600,30 +4655,48 @@ public final class MTPLXBackendStore: ObservableObject {
                 fanMode == .max ? 25 : nil
             )
             guard isCurrent?() ?? true else { return }
-            currentFanMode = MTPLXFanMode.normalized(result.currentMode ?? canonicalMode).rawValue
-            fanRestoreRequiredOnStop = modeRequiresFanRestore(currentFanMode)
-            var next = configuration
-            next.fanMode = currentFanMode ?? canonicalMode
-            next.pinFansAtMaxOnStart = MTPLXFanMode.normalized(next.fanMode) == .max
-            guard isCurrent?() ?? true else { return }
-            try saveSettings(next)
+            let reportedMode = result.currentMode.map { MTPLXFanMode.normalized($0) }
+            if result.verified {
+                let applied = reportedMode ?? fanMode
+                currentFanMode = applied.rawValue
+                fanRestoreRequiredOnStop = modeRequiresFanRestore(currentFanMode)
+            } else if let reportedMode {
+                currentFanMode = reportedMode.rawValue
+                fanRestoreRequiredOnStop = fanRestoreRequiredOnStop || modeRequiresFanRestore(currentFanMode)
+            } else {
+                currentFanMode = previous
+            }
+            if persistSelection {
+                // Keep the user's requested choice rather than letting an
+                // unverified daemon fallback silently rewrite `fan_mode` to
+                // `"default"` in settings.json.
+                let modeToPersist = result.verified ? (reportedMode ?? fanMode) : fanMode
+                var next = configuration
+                next.fanMode = modeToPersist.rawValue
+                next.pinFansAtMaxOnStart = modeToPersist == .max
+                guard isCurrent?() ?? true else { return }
+                try saveSettings(next)
+            }
         } catch {
             guard isCurrent?() ?? true else { return }
             currentFanMode = previous
-            configuration = previousConfiguration
             throw error
         }
     }
 
-    /// Pull thermal detection + current mode + fan summary. Used after
-    /// daemon start so `FanModeToggle` can decide whether to render.
+    /// Pull thermal detection + current mode + fan summary.
     public func refreshThermalStatus(isCurrent: (() -> Bool)? = nil) async {
         await beforeThermalStatusRefresh()
         let fetchedThermalStatus = try? await apiClient.thermalStatus()
         guard isCurrent?() ?? true else { return }
-        thermalStatus = fetchedThermalStatus
+        if thermalStatus != fetchedThermalStatus {
+            thermalStatus = fetchedThermalStatus
+        }
         if let mode = fetchedThermalStatus?.values["current_mode"]?.stringValue, !mode.isEmpty {
-            currentFanMode = MTPLXFanMode.normalized(mode).rawValue
+            let normalized = MTPLXFanMode.normalized(mode).rawValue
+            if currentFanMode != normalized {
+                currentFanMode = normalized
+            }
             fanRestoreRequiredOnStop = modeRequiresFanRestore(currentFanMode)
         }
     }
@@ -5164,7 +5237,7 @@ public final class MTPLXBackendStore: ObservableObject {
         } else {
             do {
                 try await verifyPinnedFansAfterStartup(
-                    configuration: configuration,
+                    configuration: self.configuration,
                     isCurrent: {
                         self.daemonSessionIsCurrent(
                             lifecycleEpoch: lifecycleEpoch,
@@ -5256,7 +5329,11 @@ public final class MTPLXBackendStore: ObservableObject {
         guard requiresStartupFanRamp(configuration) else { return }
         guard isCurrent() else { return }
         startupPhase = .rampingFans
-        try await setFanMode(MTPLXFanMode.max.rawValue, isCurrent: isCurrent)
+        try await setFanMode(
+            MTPLXFanMode.max.rawValue,
+            isCurrent: isCurrent,
+            persistSelection: false
+        )
         guard isCurrent() else { return }
         await refreshThermalStatus(isCurrent: isCurrent)
         guard isCurrent() else { return }
@@ -5744,7 +5821,7 @@ public final class MTPLXBackendStore: ObservableObject {
             now: Date().timeIntervalSince1970
         )
         if daemonState == .running || supervisor.isRunning() {
-            adoptDaemonSettings(snapshot.settings, persist: true)
+            adoptDaemonSettings(snapshot.settings, persist: false)
         } else {
             settings = carryableLiveSettingsForCurrentModel() ?? snapshot.settings
             liveSettingsModel = settings == nil ? nil : configuration.model

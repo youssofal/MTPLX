@@ -53,4 +53,94 @@ public final class SettingsDraftStore: ObservableObject {
             lastSynced = configuration
         }
     }
+
+    /// Commit an immediate-apply Fan Mode selection into both halves of the
+    /// draft store so choosing a fan mode never marks Settings dirty or
+    /// conflicts with pending edits in other sections.
+    public func commitImmediateFanMode(_ mode: MTPLXFanMode) {
+        let canonical = mode.rawValue
+        let pinned = mode == .max
+        if draft.fanMode != canonical || draft.pinFansAtMaxOnStart != pinned {
+            var nextDraft = draft
+            nextDraft.fanMode = canonical
+            nextDraft.pinFansAtMaxOnStart = pinned
+            draft = nextDraft
+        }
+        if lastSynced.fanMode != canonical || lastSynced.pinFansAtMaxOnStart != pinned {
+            var nextSynced = lastSynced
+            nextSynced.fanMode = canonical
+            nextSynced.pinFansAtMaxOnStart = pinned
+            lastSynced = nextSynced
+        }
+    }
+
+    /// Synchronize fields that are not edited via the Settings tab's draft/save
+    /// bar (immediate-apply controls like Fan Mode & Scheduling Mode, live
+    /// inference/reasoning settings from Model Controls, and app metadata) into
+    /// both `draft` and `lastSynced`. That way a pending edit to e.g. memory
+    /// limit or port never reverts a newer Fan Mode, reasoning choice, or
+    /// custom-model list when Save is pressed.
+    public func syncNonDraftedFields(from persisted: MTPLXAppConfiguration) {
+        let nextDraft = Self.copyingNonDraftedFields(from: persisted, into: draft)
+        let nextSynced = Self.copyingNonDraftedFields(from: persisted, into: lastSynced)
+        if nextDraft != draft {
+            draft = nextDraft
+        }
+        if nextSynced != lastSynced {
+            lastSynced = nextSynced
+        }
+    }
+
+    /// Produce the configuration to compare/save against `persisted`: starts
+    /// from `draft`, refreshes all non-drafted/immediate fields from
+    /// `persisted`, and keeps `persisted.model` if the user did not edit the
+    /// Model text field in Settings (e.g. they switched models in the top-bar
+    /// model picker while another Settings section had an unsaved edit).
+    public func mergedForSave(against persisted: MTPLXAppConfiguration) -> MTPLXAppConfiguration {
+        var merged = Self.copyingNonDraftedFields(from: persisted, into: draft)
+        if draft.model == lastSynced.model {
+            merged.model = persisted.model
+        }
+        return merged
+    }
+
+    private static func copyingNonDraftedFields(
+        from source: MTPLXAppConfiguration,
+        into target: MTPLXAppConfiguration
+    ) -> MTPLXAppConfiguration {
+        var result = target
+        let fanMode = MTPLXFanMode.normalized(source.fanMode)
+        result.fanMode = fanMode.rawValue
+        result.pinFansAtMaxOnStart = fanMode == .max
+        result.schedulingPreset = source.schedulingPreset
+        result.schedulerMode = source.schedulerMode
+        result.batchingPreset = source.batchingPreset
+        result.temperature = source.temperature
+        result.topP = source.topP
+        result.topK = source.topK
+        result.presencePenalty = source.presencePenalty
+        result.reasoning = source.reasoning
+        result.reasoningEffort = source.reasoningEffort
+        result.controlClientSettings = source.controlClientSettings
+        result.liveSettingsModelFamily = source.liveSettingsModelFamily
+        result.prefillChunkTokens = source.prefillChunkTokens
+        result.adaptiveDepth = source.adaptiveDepth
+        result.performanceLock = source.performanceLock
+        result.hermesAutoApprove = source.hermesAutoApprove
+        result.lastLaunchTarget = source.lastLaunchTarget
+        result.lastHermesProfile = source.lastHermesProfile
+        result.lastHermesSessionID = source.lastHermesSessionID
+        result.lastHermesSessionTitle = source.lastHermesSessionTitle
+        result.onboardingCompletedAt = source.onboardingCompletedAt
+        result.languagePromptCompletedAt = source.languagePromptCompletedAt
+        result.successfulModelLoads = max(target.successfulModelLoads, source.successfulModelLoads)
+        result.starPromptCompletedAt = target.starPromptCompletedAt ?? source.starPromptCompletedAt
+        result.lastTunedDepth = source.lastTunedDepth
+        result.lastTunedAt = source.lastTunedAt
+        result.tunedControlRecord = source.tunedControlRecord
+        result.tunedControlRecordsByModel = source.tunedControlRecordsByModel
+        result.customModels = source.customModels
+        result.huggingFaceHandle = source.huggingFaceHandle
+        return result
+    }
 }
